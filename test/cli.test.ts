@@ -222,6 +222,48 @@ test('list tolerates a workflow whose definition is no longer available (done: n
   assert.equal(list[0].done, null, 'done is null when the def is missing, not a crash');
 });
 
+// ---- status --all (the fleet read) ------------------------------------------
+
+test('status --all returns one full status entry per instance, with identity + task key', () => {
+  const { run } = makeCli();
+  assert.deepEqual(run('status', '--all').json(), [], 'empty fleet is an empty array');
+
+  const a = run('create', 'delivery', '--title', 'A', '--provide', `proposal=${J({ text: 'x' })}`, '--param', 'task=t_aaa').json().workflow;
+  const b = run('create', 'research', '--title', 'B', '--provide', `question=${J({})}`).json().workflow;
+
+  const all = run('status', '--all').json();
+  assert.equal(all.length, 2);
+  const byWf: Record<string, any> = Object.fromEntries(all.map((e: any) => [e.workflow, e]));
+
+  // identity + join key + the full derived status, all in one call
+  const ea = byWf[a];
+  assert.equal(ea.def, 'delivery');
+  assert.equal(ea.title, 'A');
+  assert.equal(ea.task, 't_aaa', 'the --param task is surfaced as the join key');
+  assert.equal(typeof ea.done, 'boolean');
+  assert.ok(Array.isArray(ea.debts) && Array.isArray(ea.eligible) && Array.isArray(ea.blocked));
+
+  // an instance created without --param task reports a null join key
+  assert.equal(byWf[b].task, null);
+  assert.equal(byWf[b].def, 'research');
+});
+
+test('status --all isolates an instance whose definition is missing (error field, no crash)', () => {
+  const { run, db, home } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  // re-open against a defs dir without 'delivery' — status can't be derived
+  const noDefs = mkdtempSync(join(tmpdir(), 'oweflow-nodefs-'));
+  const out: string[] = [];
+  const code = main(['status', '--all'], { cwd: home, env: { OWEFLOW_DB: db, OWEFLOW_DEFS: noDefs }, out: (s) => out.push(s), err: () => {} });
+  const all = JSON.parse(out.join('\n'));
+  assert.equal(code, 0, 'the fleet read still succeeds');
+  assert.equal(all.length, 1);
+  assert.equal(all[0].workflow, wf, 'identity is still reported from the stored row');
+  assert.match(all[0].error, /unknown workflow definition/, 'status failure degrades to an error field');
+  assert.equal(all[0].done, undefined, 'no derived status when the def is missing');
+});
+
 // ---- store/path defaulting --------------------------------------------------
 
 test('with no --db or OWEFLOW_DB, the store defaults under cwd/.oweflow', () => {
