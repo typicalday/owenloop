@@ -180,6 +180,56 @@ test('§6 stall: a judgment-rejected output stops re-arming at the cap, until re
   assert.equal(engine.status(wf).done, true);
 });
 
+// ---- crash-loop: consecutive failed-run counter -----------------------------
+
+test('crash-loop: status surfaces a producer that keeps closing failed without greening', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery');
+
+  // planner crashes three times: claim a run, close it `failed`, never green.
+  // The plan stays `owed`, so it never bumps judgmentRejects → §6 never stalls
+  // it. The only signal is the failed-run streak.
+  let now = 1000;
+  for (let i = 1; i <= 3; i++) {
+    const planner = fire(engine, wf, 'planner', now++);
+    engine.close(wf, planner.run, 'failed');
+    assert.equal(store.recentFailedRuns(wf, 'planner'), i);
+  }
+
+  const s = engine.status(wf);
+  const plan = s.debts.find((d) => d.path === 'plan');
+  assert.equal(plan?.failedRuns, 3, 'the owed plan carries its producer crash streak');
+  assert.equal(plan?.stalled, false, 'a crash-loop is not a §6 judgment stall');
+  assert.equal(s.done, false);
+
+  // a clean close breaks the streak and the pipeline proceeds
+  complete(engine, wf, fire(engine, wf, 'planner', now++), { plan: 'v1' });
+  assert.equal(store.recentFailedRuns(wf, 'planner'), 0, 'an ok close resets the streak');
+  // plan is green now — no longer a debt, so it carries no failedRuns
+  assert.equal(engine.status(wf).debts.find((d) => d.path === 'plan'), undefined);
+});
+
+test('recentFailedRuns: only the consecutive trailing failures count', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery');
+
+  // ok, then two failures: the ok is older, so the trailing streak is 2
+  complete(engine, wf, fire(engine, wf, 'planner', 1000), { plan: 'v1' });
+  assert.equal(store.recentFailedRuns(wf, 'planner'), 0);
+
+  // re-arm the plan so the planner fires again, then crash twice
+  engine.reject(wf, 'plan', 'human', 'redo');
+  for (let i = 1; i <= 2; i++) {
+    const planner = fire(engine, wf, 'planner', 1000 + i);
+    engine.close(wf, planner.run, 'failed');
+  }
+  assert.equal(store.recentFailedRuns(wf, 'planner'), 2, 'older ok does not extend the streak');
+
+  // a fresh ok close zeroes it again
+  complete(engine, wf, fire(engine, wf, 'planner', 2000), { plan: 'v2' });
+  assert.equal(store.recentFailedRuns(wf, 'planner'), 0);
+});
+
 // ---- forward cascade through the engine -------------------------------------
 
 test('forward cascade: re-deciding plan structurally re-rejects the green pr', () => {

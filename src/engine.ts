@@ -599,7 +599,17 @@ export class Engine {
 
   status(workflow: string): WorkflowStatus {
     const def = this.defFor(workflow);
-    return workflowStatus(def, this.artMap(workflow));
+    const arts = this.artMap(workflow);
+    const st = workflowStatus(def, arts);
+    // Enrich each debt with its producer's crash-loop signal (run log; the pure
+    // layer has no store). Plain-loop key is '' — exact for linear workflows.
+    for (const d of st.debts) {
+      const a = arts.get(d.path);
+      if (!a) continue;
+      const fr = this.store.recentFailedRuns(workflow, a.producer);
+      if (fr > 0) d.failedRuns = fr;
+    }
+    return st;
   }
 
   // ---- internals -------------------------------------------------------------

@@ -264,6 +264,30 @@ test('status --all isolates an instance whose definition is missing (error field
   assert.equal(all[0].done, undefined, 'no derived status when the def is missing');
 });
 
+test('status --all surfaces a producer crash loop (consecutive failedRuns) per debt', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  // the planner claims and closes `failed` three times without greening — a
+  // crash loop that §6 never stalls (judgmentRejects stays 0)
+  for (let i = 0; i < 3; i++) {
+    const order = run('tick', wf).json().orders.find((o: any) => o.loop === 'planner');
+    assert.ok(order, `planner order on attempt ${i + 1}`);
+    run('close', wf, order.run, '--outcome', 'failed');
+  }
+
+  const entry = run('status', '--all').json().find((e: any) => e.workflow === wf);
+  const plan = entry.debts.find((d: any) => d.path === 'plan');
+  assert.equal(plan.failedRuns, 3, 'the bulk fleet read carries the crash-loop streak');
+  assert.equal(plan.stalled, false, 'a crash loop is not a §6 judgment stall');
+  // a clean close clears it on the next read
+  const order = run('tick', wf).json().orders.find((o: any) => o.loop === 'planner');
+  run('green', wf, order.run, 'plan', '--value', J({ plan: 'v1' }));
+  run('close', wf, order.run);
+  const after = run('status', '--all').json().find((e: any) => e.workflow === wf);
+  assert.equal(after.debts.find((d: any) => d.path === 'plan'), undefined, 'plan is green — no longer a debt');
+});
+
 // ---- store/path defaulting --------------------------------------------------
 
 test('with no --db or OWEFLOW_DB, the store defaults under cwd/.oweflow', () => {

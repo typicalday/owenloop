@@ -432,6 +432,12 @@ export interface WorkflowStatus {
     /** §6/§18: rejected past its producer's cap — the engine won't re-arm it */
     stalled: boolean;
     reason?: string;
+    /**
+     * Consecutive trailing `failed` runs for this debt's producer (crash-loop
+     * signal). Enriched by `engine.status()` from the run log — `workflowStatus`
+     * is pure and never sets it. Absent when zero or unknown.
+     */
+    failedRuns?: number;
   }>;
   eligible: Firing[];
   blocked: Blocker[];

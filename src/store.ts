@@ -509,6 +509,25 @@ export class Store {
       .get(workflow, loop) as RunRowRaw | undefined;
     return r ? mapRun(r) : undefined;
   }
+
+  /**
+   * Count of consecutive trailing `failed` runs for this loop+key — the
+   * crash-loop signal. Any closed run that is NOT `failed` (ok/no_work/skipped)
+   * breaks the streak; still-open runs (outcome NULL) are ignored.
+   */
+  recentFailedRuns(workflow: string, loop: string, key: string = ''): number {
+    const rows = this.db
+      .prepare(
+        'SELECT outcome FROM run WHERE workflow = ? AND loop = ? AND key = ? AND outcome IS NOT NULL ORDER BY created_at DESC',
+      )
+      .all(workflow, loop, key) as Array<{ outcome: string }>;
+    let n = 0;
+    for (const r of rows) {
+      if (r.outcome === 'failed') n++;
+      else break;
+    }
+    return n;
+  }
 }
 
 /** Open (creating if needed) a store at `path`. */
