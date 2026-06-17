@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { main } from '../src/cli.ts';
@@ -327,4 +327,55 @@ test('with no --db or OWEFLOW_DB, the store defaults under cwd/.oweflow', () => 
   const r = run('list'); // any command that opens the store
   assert.equal(r.code, 0);
   assert.ok(existsSync(join(home, '.oweflow', 'state.db')), 'created the default db path');
+});
+
+// ---- oweflow lint ------------------------------------------------------------
+
+test('oweflow lint exits 0 for clean definitions and prints JSON', () => {
+  const { run } = makeCli();
+  const r = run('lint');
+  assert.equal(r.code, 0);
+  const results = r.json();
+  assert.ok(Array.isArray(results));
+  assert.ok(results.every((x: any) => 'def' in x && Array.isArray(x.errors) && Array.isArray(x.warnings)));
+  assert.ok(results.every((x: any) => x.errors.length === 0), 'example defs should have no errors');
+});
+
+test('oweflow lint <name> exits 0 and returns a single object', () => {
+  const { run } = makeCli();
+  const r = run('lint', 'delivery');
+  assert.equal(r.code, 0);
+  const result = r.json();
+  assert.equal(result.def, 'delivery');
+  assert.deepEqual(result.errors, []);
+});
+
+test('oweflow lint exits non-zero when a definition has wiring errors', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oweflow-lint-bad-'));
+  writeFileSync(
+    join(dir, 'broken.yaml'),
+    'name: broken\ninputs:\n  - name: seed\nloops:\n  - name: a\n    consumes: [seed]\n    produces: [mid]\n  - name: b\n    consumes: [ghost]\n    produces: [out]\n    terminal: true\n',
+  );
+  const { run } = makeCli({ defs: dir });
+  const r = run('lint');
+  assert.equal(r.code, 1, 'exits non-zero when errors are present');
+  const results = r.json();
+  const broken = results.find((x: any) => x.def === 'broken');
+  assert.ok(broken, 'broken def is in the output');
+  assert.ok(broken.errors.length > 0, 'broken def has errors');
+});
+
+test('oweflow lint exits 0 when a def has warnings but no errors', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'oweflow-lint-warn-'));
+  writeFileSync(
+    join(dir, 'warned.yaml'),
+    'name: warned\ninputs:\n  - name: seed\nloops:\n  - name: a\n    consumes: [seed]\n    produces: [useful, orphan]\n  - name: b\n    consumes: [useful]\n    produces: [done]\n    terminal: true\n',
+  );
+  const { run } = makeCli({ defs: dir });
+  const r = run('lint');
+  assert.equal(r.code, 0, 'exits 0 when only warnings');
+  const results = r.json();
+  const warned = results.find((x: any) => x.def === 'warned');
+  assert.ok(warned.warnings.length > 0, 'has at least one warning');
+  assert.deepEqual(warned.errors, []);
 });

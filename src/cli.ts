@@ -33,7 +33,7 @@ import { dirname, join } from 'node:path';
 import { Engine } from './engine.ts';
 import { openStore } from './store.ts';
 import type { Store, WorkflowRow } from './store.ts';
-import { DefError, loadDefs } from './defs.ts';
+import { DefError, lintDef, loadDefs, loadDefsRaw } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 
 export interface CliIO {
@@ -181,6 +181,7 @@ Usage: oweflow <command> [args] [--db <path>] [--defs <dir>]
 
 Commands:
   defs                                   list available workflow definitions
+  lint [<def-name>]                      check def(s) for wiring problems
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
   tick <wf> [--now <ms>]                 pull eligible orders
@@ -201,9 +202,34 @@ Commands:
 Environment: OWEFLOW_DB, OWEFLOW_DEFS`;
 
 function dispatch(command: string, io: CliIO, args: Args): void {
-  // help needs no store
+  // help and lint need no store
   if (command === 'help' || command === '--help' || command === '-h') {
     io.out(USAGE);
+    return;
+  }
+
+  if (command === 'lint') {
+    const defsDir = last(args, 'defs') ?? io.env.OWEFLOW_DEFS ?? join(io.cwd, 'workflows');
+    const defs = existsSync(defsDir) ? loadDefsRaw(defsDir) : new Map<string, WorkflowDef>();
+    const defName = args.positionals[1];
+    let hasErrors = false;
+
+    if (defName !== undefined) {
+      const def = defs.get(defName);
+      if (!def) throw new CliError(`unknown workflow definition '${defName}' (looked in ${defsDir})`);
+      const result = lintDef(def);
+      if (result.errors.length) hasErrors = true;
+      print(io, { def: def.name, errors: result.errors, warnings: result.warnings });
+    } else {
+      const results = [...defs.values()].map((def) => {
+        const result = lintDef(def);
+        if (result.errors.length) hasErrors = true;
+        return { def: def.name, errors: result.errors, warnings: result.warnings };
+      });
+      print(io, results);
+    }
+
+    if (hasErrors) throw new CliError('one or more definitions have errors (see above)');
     return;
   }
 

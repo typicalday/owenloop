@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, DefError, loadDefFile, loadDefs, parseDef, validateDef } from '../src/defs.ts';
+import { buildDef, DefError, lintDef, loadDefFile, loadDefs, parseDef, validateDef } from '../src/defs.ts';
 
 const delivery = {
   name: 'delivery',
@@ -356,4 +356,91 @@ test('loadDefFile and loadDefs read YAML from disk', () => {
 
   const all = loadDefs(dir);
   assert.deepEqual([...all.keys()], ['delivery']);
+});
+
+// ---- lintDef -----------------------------------------------------------------
+
+test('lintDef has no errors for a fully reachable linear chain', () => {
+  const { errors, warnings } = lintDef(buildDef({
+    name: 'linear',
+    inputs: [{ name: 'seed' }],
+    loops: [
+      { name: 'a', consumes: ['seed'], produces: ['mid'] },
+      { name: 'b', consumes: ['mid'], produces: ['out'], terminal: true },
+    ],
+  }));
+  assert.deepEqual(errors, []);
+  assert.deepEqual(warnings, []);
+});
+
+test('lintDef flags an unreachable loop (its consumed stem has a producer that is unreachable)', () => {
+  // 'a' is reachable from input 'start'. 'c' consumes 'ghost' (no producer) — dangling.
+  // 'b' consumes 'other' which 'c' produces, but 'c' is dangling/unreachable.
+  // 'b' should be reported as unreachable; 'c' should NOT be double-reported.
+  const def = buildDef({
+    name: 'island',
+    inputs: [{ name: 'start' }],
+    loops: [
+      { name: 'a', consumes: ['start'], produces: ['mid', 'out'], terminal: true },
+      { name: 'c', consumes: ['ghost'], produces: ['other'] },  // dangling: 'ghost' has no producer
+      { name: 'b', consumes: ['other'], produces: ['result'] }, // unreachable: 'other' produced by unreachable 'c'
+    ],
+  });
+  const { errors } = lintDef(def);
+  // 'c' triggers dangling-consume (ghost has no producer)
+  assert.ok(errors.some((e) => e.includes("nothing produces 'ghost'")), errors.join('; '));
+  // 'b' triggers reachability (other is produced by unreachable 'c')
+  assert.ok(errors.some((e) => /loop 'b' is unreachable/.test(e)), errors.join('; '));
+  // 'c' must NOT also produce a reachability error (it is suppressed because it already has dangling)
+  assert.ok(!errors.some((e) => /loop 'c' is unreachable/.test(e)), 'c should not be double-reported');
+});
+
+test('lintDef warns about a non-terminal loop whose output nothing consumes', () => {
+  const def = buildDef({
+    name: 'deadend',
+    inputs: [{ name: 'seed' }],
+    loops: [
+      { name: 'a', consumes: ['seed'], produces: ['useful', 'orphan'] },
+      { name: 'b', consumes: ['useful'], produces: ['final'], terminal: true },
+    ],
+  });
+  const { errors, warnings } = lintDef(def);
+  assert.deepEqual(errors, []);
+  assert.ok(warnings.some((w) => w.includes("loop 'a' produces 'orphan' but nothing consumes it")), warnings.join('; '));
+  assert.equal(warnings.filter((w) => w.includes('orphan')).length, 1, 'exactly one warning for orphan');
+});
+
+test('lintDef does not warn about unconsumed outputs on a terminal loop', () => {
+  const def = buildDef({
+    name: 'terminal-sink',
+    inputs: [{ name: 'seed' }],
+    loops: [
+      { name: 'a', consumes: ['seed'], produces: ['plan'] },
+      { name: 'b', consumes: ['plan'], produces: ['done'], terminal: true },
+    ],
+  });
+  const { warnings } = lintDef(def);
+  assert.deepEqual(warnings, []);
+});
+
+test('lintDef does not double-report: a dangling-consume loop is not also reported as unreachable', () => {
+  const def = buildDef({
+    name: 'dangle-not-double',
+    inputs: [{ name: 'seed' }],
+    loops: [
+      { name: 'a', consumes: ['seed'], produces: ['mid'] },
+      { name: 'b', consumes: ['nope'], produces: ['out'], terminal: true }, // dangling: 'nope' has no producer
+    ],
+  });
+  const { errors } = lintDef(def);
+  const danglingErrors = errors.filter((e) => e.includes("nothing produces 'nope'"));
+  const reachErrors = errors.filter((e) => /loop 'b' is unreachable/.test(e));
+  assert.equal(danglingErrors.length, 1, 'exactly one dangling-consume error');
+  assert.equal(reachErrors.length, 0, 'no reachability error for the same loop');
+});
+
+test('lintDef on the delivery example: no errors, no warnings', () => {
+  const { errors, warnings } = lintDef(parseDef(delivery));
+  assert.deepEqual(errors, []);
+  assert.deepEqual(warnings, []);
 });

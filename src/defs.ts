@@ -284,6 +284,21 @@ export function validateDef(def: WorkflowDef): string[] {
     }
   }
 
+  // Collect loops already reported as dangling-consume (to avoid double-report
+  // with the reachability check below, which catches the subtler case of a
+  // producer that exists but is itself unreachable).
+  const danglingLoops = new Set<string>();
+  for (const l of def.loops) {
+    for (const c of l.consumes) {
+      if (c.mode === 'plain' && !producerOf.has(c.stem)) {
+        danglingLoops.add(l.name);
+      } else if (c.mode !== 'plain' && !collectionStems.has(c.stem)) {
+        danglingLoops.add(l.name);
+      }
+    }
+  }
+  errors.push(...reachabilityErrors(def, danglingLoops));
+
   errors.push(...detectCycles(def, producerOf, collectionStems));
   return errors;
 }
@@ -336,6 +351,92 @@ function detectCycles(
   return cycles;
 }
 
+/**
+ * Forward reachability from the seeded inputs. Returns error strings for any
+ * loop that can never fire because one of its consumed stems is not transitively
+ * reachable from the workflow inputs, even though a producer exists (a dead
+ * island). Does NOT double-report when a dangling-consume error already fired
+ * for the same loop (caller passes `danglingLoops` to suppress).
+ */
+function reachabilityErrors(
+  def: WorkflowDef,
+  danglingLoops: Set<string>,
+): string[] {
+  const reachable = new Set<string>(def.inputs.map((i) => i.name));
+  const reachedLoop = new Set<string>();
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const l of def.loops) {
+      if (reachedLoop.has(l.name)) continue;
+      const allReachable = l.consumes.every((c) => reachable.has(c.stem));
+      if (allReachable) {
+        reachedLoop.add(l.name);
+        changed = true;
+        for (const p of l.produces) {
+          reachable.add(p.stem);
+        }
+      }
+    }
+  }
+
+  const errors: string[] = [];
+  for (const l of def.loops) {
+    if (reachedLoop.has(l.name)) continue;
+    if (danglingLoops.has(l.name)) continue; // already reported as dangling-consume
+    // find the first unreachable consumed stem
+    const blocker = l.consumes.find((c) => !reachable.has(c.stem));
+    const stem = blocker?.stem ?? '(unknown)';
+    errors.push(
+      `loop '${l.name}' is unreachable: it can never fire (consumes '${stem}' which nothing reachable produces)`,
+    );
+  }
+  return errors;
+}
+
+/**
+ * Returns warning strings for any singleton or collection stem that nothing
+ * consumes, on a non-terminal loop. Map outputs are excluded (they are
+ * per-element children, not consumed as top-level stems). Terminal loops are
+ * explicitly intended sinks.
+ */
+function deadEndWarnings(def: WorkflowDef): string[] {
+  // all stems consumed by any loop
+  const consumed = new Set<string>(
+    def.loops.flatMap((l) => l.consumes.map((c) => c.stem)),
+  );
+
+  const warnings: string[] = [];
+  for (const l of def.loops) {
+    if (l.terminal) continue; // terminal loops are intended sinks
+    for (const p of l.produces) {
+      if (p.kind === 'map') continue; // per-element outputs are not top-level stems
+      if (!consumed.has(p.stem)) {
+        warnings.push(
+          `loop '${l.name}' produces '${p.stem}' but nothing consumes it (dead-end output; mark the loop terminal: true if this is an intended sink)`,
+        );
+      }
+    }
+  }
+  return warnings;
+}
+
+/**
+ * Static lint over a workflow definition. Returns both the hard errors from
+ * `validateDef` (which `parseDef` / `loadDefFile` would throw on) and
+ * non-fatal warnings (dead-end outputs). Warnings never block loading — this
+ * function is the right surface for author tooling / CI checks.
+ *
+ * Dead-end warnings are suppressed when there are hard errors: a broken graph
+ * may have spurious orphan stems that will resolve once the errors are fixed.
+ */
+export function lintDef(def: WorkflowDef): { errors: string[]; warnings: string[] } {
+  const errors = validateDef(def);
+  const warnings = errors.length === 0 ? deadEndWarnings(def) : [];
+  return { errors, warnings };
+}
+
 // ---- filesystem loading ------------------------------------------------------
 
 /** Load and validate a single workflow definition from a YAML file. */
@@ -370,6 +471,38 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
       }
     } else if (/\.ya?ml$/.test(entry) && entry !== 'workflow.yaml') {
       add(loadDefFile(full));
+    }
+  }
+  return out;
+}
+
+/**
+ * Like `loadDefs` but uses `buildDef` (not `parseDef`) so wiring errors are
+ * returned in the lint result rather than thrown. Used by `oweflow lint`.
+ * Silently skips files that fail shape-parsing (malformed YAML or bad types).
+ */
+export function loadDefsRaw(dir: string): Map<string, WorkflowDef> {
+  const out = new Map<string, WorkflowDef>();
+  const add = (def: WorkflowDef): void => {
+    if (out.has(def.name)) throw new DefError(`duplicate workflow name '${def.name}' under ${dir}`);
+    out.set(def.name, def);
+  };
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    const st = statSync(full);
+    if (st.isDirectory()) {
+      const wf = join(full, 'workflow.yaml');
+      try {
+        if (statSync(wf).isFile()) {
+          const text = readFileSync(wf, 'utf8');
+          add(buildDef(parseYaml(text), basename(wf)));
+        }
+      } catch { /* no workflow.yaml or buildDef failed shape-check — skip */ }
+    } else if (/\.ya?ml$/.test(entry) && entry !== 'workflow.yaml') {
+      try {
+        const text = readFileSync(full, 'utf8');
+        add(buildDef(parseYaml(text), basename(full)));
+      } catch { /* malformed YAML or shape error — skip */ }
     }
   }
   return out;
