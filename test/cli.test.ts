@@ -441,3 +441,62 @@ test('trace exits 1 when workflow argument is missing', () => {
   assert.equal(r.code, 1);
   assert.match(r.err, /missing required argument: workflow/);
 });
+
+// ---- graph command ----------------------------------------------------------
+
+test('graph <def-name> emits DOT containing digraph and node ids', () => {
+  const { run } = makeCli();
+  const r = run('graph', 'delivery');
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /digraph/);
+  assert.match(r.out, /planner/);
+  assert.match(r.out, /proposal/);
+});
+
+test('graph --format mermaid emits flowchart', () => {
+  const { run } = makeCli();
+  const r = run('graph', 'delivery', '--format', 'mermaid');
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /flowchart/);
+  assert.match(r.out, /-->/);
+});
+
+test('graph <wf-id> emits overlay-colored DOT', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+  // Drive planner to green so at least one node is colored
+  const order = run('tick', wf).json().orders[0];
+  run('green', wf, order.run, 'plan', '--value', J({ plan: 'v1' }));
+  run('close', wf, order.run);
+
+  const r = run('graph', wf);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /digraph/);
+  assert.match(r.out, /fillcolor/, 'overlay colors present');
+});
+
+test('graph --format json emits the structured WorkflowGraph', () => {
+  const { run } = makeCli();
+  const r = run('graph', 'delivery', '--format', 'json');
+  assert.equal(r.code, 0, r.err);
+  const g = r.json();
+  assert.equal(g.def, 'delivery');
+  assert.ok(Array.isArray(g.nodes), 'has nodes array');
+  assert.ok(Array.isArray(g.edges), 'has edges array');
+  assert.equal(typeof g.hasOverlay, 'boolean');
+});
+
+test('graph with an unknown arg exits 1 with a helpful message listing known defs', () => {
+  const { run } = makeCli();
+  const r = run('graph', 'no-such-thing');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /neither a known workflow definition/);
+  assert.match(r.err, /delivery/, 'error lists known def names');
+});
+
+test('graph missing arg exits 1 with labelled error', () => {
+  const { run } = makeCli();
+  const r = run('graph');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /missing required argument/);
+});

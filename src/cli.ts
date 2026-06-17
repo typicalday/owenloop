@@ -31,9 +31,9 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Engine } from './engine.ts';
-import { buildTrace } from './model.ts';
+import { buildGraph, buildTrace, graphToDot, graphToMermaid } from './model.ts';
 import { openStore } from './store.ts';
-import type { Store, WorkflowRow } from './store.ts';
+import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import { DefError, lintDef, loadDefs, loadDefsRaw } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 
@@ -190,6 +190,7 @@ Commands:
   status --all                           every instance's status in one call (fleet read)
   show <wf>                              dump raw artifacts
   trace <wf> [--format text]             causal timeline + artifact biographies
+  graph <def-or-wf> [--format dot|mermaid|json]   wiring graph (+ live overlay if wf id)
   list                                   list workflow instances
   green <wf> <run> <path> [--value json] [--terminal]
   emit <wf> <run> --items '[{...}]'      accrete collection elements
@@ -421,6 +422,49 @@ function dispatch(command: string, io: CliIO, args: Args): void {
         const wf = need(args, 1, 'workflow');
         store.deleteWorkflow(wf);
         print(io, { ok: true, deleted: wf });
+        return;
+      }
+      case 'graph': {
+        const arg = need(args, 1, 'def-name or workflow-id');
+        const format = last(args, 'format') ?? 'dot';
+
+        let def: WorkflowDef;
+        let artifacts: ArtifactRow[] | undefined;
+
+        if (ctx.defs.has(arg)) {
+          // static mode: arg is a def name
+          def = ctx.defs.get(arg)!;
+          artifacts = undefined;
+        } else {
+          // live mode: arg is a workflow instance id
+          const wfRow = store.getWorkflow(arg);
+          if (!wfRow) {
+            throw new CliError(
+              `'${arg}' is neither a known workflow definition nor a workflow instance id.\n` +
+              `Known definitions: ${[...ctx.defs.keys()].sort().join(', ') || '(none)'}`,
+            );
+          }
+          const defName = wfRow.def;
+          const resolvedDef = ctx.defs.get(defName);
+          if (!resolvedDef) {
+            throw new CliError(
+              `workflow instance '${arg}' uses definition '${defName}' which is not available (looked in ${ctx.defsDir})`,
+            );
+          }
+          def = resolvedDef;
+          artifacts = store.listArtifacts(arg);
+        }
+
+        const graph = buildGraph(def, artifacts);
+
+        if (format === 'json') {
+          print(io, graph);
+        } else if (format === 'mermaid') {
+          io.out(graphToMermaid(graph));
+        } else {
+          // default: dot
+          io.out(graphToDot(graph));
+        }
         return;
       }
       default:

@@ -273,3 +273,48 @@ export interface WorkflowTrace {
    */
   inferenceNote: string;
 }
+
+// ---- graph types (§spatial view: wiring + live-state overlay) ----------------
+
+/** The "color" of a node in a live-overlay graph. Derived from artifact acceptance + stall state. */
+export type GraphNodeState =
+  | 'green'      // all outputs are green
+  | 'owed'       // at least one output is owed (in-flight or unbuilt)
+  | 'rejected'   // at least one rejected, none stalled
+  | 'stalled'    // at least one rejected AND past its producer cap
+  | 'skipped'    // all outputs are skipped (dead branch)
+  | 'retracted'  // all outputs are retracted
+  | 'none';      // no artifact data (static view or no artifacts yet)
+
+/** One node in the wiring graph: either a loop or an external input. */
+export interface GraphNode {
+  id: string;              // stable identifier: loop name or input name
+  kind: 'loop' | 'input';
+  label: string;           // display label (same as id for now)
+  terminal?: boolean;      // loops only: declared terminal
+  parallel?: number;       // loops only: parallelism setting
+  model?: string;          // loops only: model hint
+  /** Overlay: present only when artifacts were supplied to buildGraph */
+  state?: GraphNodeState;
+  /** Overlay: true when any output artifact is stalled */
+  stalled?: boolean;
+}
+
+/** One directed edge: producer → consumer. */
+export interface GraphEdge {
+  from: string;            // node id (loop name or input name)
+  to: string;              // loop node id
+  stem: string;            // the artifact stem crossing this edge
+  mode: 'plain' | 'map' | 'reduce'; // consume mode at the to-node
+  /** For map: the binder name (e.g. "i") — used for label generation */
+  binder?: string;
+}
+
+/** The complete wiring graph for one workflow definition. */
+export interface WorkflowGraph {
+  def: string;             // workflow definition name
+  nodes: GraphNode[];      // sorted by id for determinism
+  edges: GraphEdge[];      // sorted by (from, to, stem) for determinism
+  /** true when artifacts were provided (overlay mode) */
+  hasOverlay: boolean;
+}

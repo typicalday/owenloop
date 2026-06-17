@@ -18,6 +18,7 @@ export interface LoopSpec {
   model?: string;
   workdir?: string;
   body?: string;
+  terminal?: boolean;
 }
 
 export function loop(spec: LoopSpec): LoopDef {
@@ -35,6 +36,7 @@ export function loop(spec: LoopSpec): LoopDef {
     maxAttempts: spec.maxAttempts ?? 3,
     maxSchemaFailures: spec.maxSchemaFailures ?? 5,
     ...(spec.model !== undefined ? { model: spec.model } : {}),
+    ...(spec.terminal !== undefined ? { terminal: spec.terminal } : {}),
     workdir: spec.workdir ?? 'main',
     body: spec.body ?? `run ${spec.name}`,
   };

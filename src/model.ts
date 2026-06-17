@@ -24,11 +24,15 @@ import type {
   ArtifactData,
   ConsumePattern,
   Fingerprint,
+  GraphEdge,
+  GraphNode,
+  GraphNodeState,
   LoopDef,
   ProducePattern,
   RunData,
   TimelineEvent,
   WorkflowDef,
+  WorkflowGraph,
   WorkflowTrace,
 } from './types.ts';
 
@@ -637,4 +641,344 @@ export function buildTrace(
       "output stems. This is a heuristic — no stored FK exists (by design, " +
       "to avoid schema changes).",
   };
+}
+
+// ---- graph builder (§spatial view: wiring + live-state overlay) ---------------
+
+/**
+ * Build a structural wiring graph for a workflow definition.
+ * When `artifacts` are provided, annotate each node with the live acceptance
+ * state derived from the artifact set (overlay mode).
+ *
+ * Pure — no IO, no clock, no DB. Same purity contract as buildTrace.
+ *
+ * Edge derivation replicates validateDef's producerOf map exactly:
+ *   inputs → input node id (= input name)
+ *   singleton/collection produces → the loop that produces them
+ *   map produces (per-element) are NOT registered in producerOf —
+ *     they live under the collection they annotate
+ *
+ * A dangling consume (nothing produces the stem) yields an edge with
+ * from = '__dangling__' + stem — it renders visually (shows the missing
+ * wiring) and never crashes. This can only occur on an invalid def that
+ * lint already errors on; graph never validates.
+ */
+export function buildGraph(
+  def: WorkflowDef,
+  artifacts?: ReadonlyArray<ArtifactData>,
+): WorkflowGraph {
+  // --- 1. Build producerOf exactly as validateDef does ---
+  const producerOf = new Map<string, string>(); // stem → node id (input name or loop name)
+  const collectionStems = new Set<string>();
+
+  for (const inp of def.inputs) {
+    producerOf.set(inp.name, inp.name); // input node id = input name
+  }
+  for (const l of def.loops) {
+    for (const p of l.produces) {
+      if (p.kind === 'collection') {
+        collectionStems.add(p.stem);
+        if (!producerOf.has(p.stem)) producerOf.set(p.stem, l.name);
+      } else if (p.kind === 'singleton') {
+        if (!producerOf.has(p.stem)) producerOf.set(p.stem, l.name);
+      }
+      // map produces (p.kind === 'map') are per-element children; not registered
+    }
+  }
+
+  // --- 2. Build nodes ---
+  const nodes: GraphNode[] = [];
+
+  // Input nodes
+  for (const inp of def.inputs) {
+    nodes.push({ id: inp.name, kind: 'input', label: inp.name });
+  }
+
+  // Loop nodes — overlay state computed below
+  for (const l of def.loops) {
+    const node: GraphNode = {
+      id: l.name,
+      kind: 'loop',
+      label: l.name,
+    };
+    if (l.terminal) node.terminal = true;
+    if (l.parallel !== undefined) node.parallel = l.parallel;
+    if (l.model !== undefined) node.model = l.model;
+    nodes.push(node);
+  }
+
+  // --- 3. Build edges ---
+  const edges: GraphEdge[] = [];
+
+  for (const l of def.loops) {
+    for (const c of l.consumes) {
+      // Resolve producer: look up c.stem in producerOf
+      const producerNode = producerOf.get(c.stem) ?? `__dangling__${c.stem}`;
+
+      // Skip self-edges (should never occur in a valid def, but guard gracefully)
+      if (producerNode === l.name) continue;
+
+      const edge: GraphEdge = {
+        from: producerNode,
+        to: l.name,
+        stem: c.stem,
+        mode: c.mode,
+      };
+      if (c.binder !== undefined) edge.binder = c.binder;
+      edges.push(edge);
+    }
+  }
+
+  // --- 4. Overlay: annotate nodes with live artifact state ---
+  const hasOverlay = artifacts !== undefined && artifacts.length > 0;
+  if (artifacts && artifacts.length > 0) {
+    // Build a loop name → LoopDef map for cap lookup
+    const loopMap = new Map<string, LoopDef>(def.loops.map((l) => [l.name, l]));
+    // Build a set of input names for membership test
+    const inputNames = new Set<string>(def.inputs.map((i) => i.name));
+
+    // Group artifacts for node lookup:
+    //   - loop nodes:  match by a.producer (= loop name)
+    //   - input nodes: match by a.path (= input name), since inputs have producer = 'human'
+    const byProducer = new Map<string, ArtifactData[]>();
+    const byPath = new Map<string, ArtifactData>();
+    for (const a of artifacts) {
+      const existing = byProducer.get(a.producer) ?? [];
+      existing.push(a);
+      byProducer.set(a.producer, existing);
+      byPath.set(a.path, a);
+    }
+
+    for (const node of nodes) {
+      // For input nodes, look up by path; for loop nodes, look up by producer name.
+      const nodeArts: ArtifactData[] =
+        node.kind === 'input'
+          ? (inputNames.has(node.id) && byPath.has(node.id) ? [byPath.get(node.id)!] : [])
+          : (byProducer.get(node.id) ?? []);
+      if (nodeArts.length === 0) {
+        node.state = 'none';
+        continue;
+      }
+
+      const loop = loopMap.get(node.id);
+      const maxAttempts = loop?.maxAttempts ?? 3;
+      const maxSchema = loop?.maxSchemaFailures ?? 5;
+
+      // Determine worst-state using priority: stalled > rejected > owed > skipped/retracted > green
+      let worstState: GraphNodeState = 'green';
+      let anyStalled = false;
+
+      for (const a of nodeArts) {
+        const stallJ = isStalled(a, maxAttempts);
+        const stallS = isSchemaStalled(a, maxSchema);
+        if (stallJ || stallS) {
+          anyStalled = true;
+          worstState = 'stalled';
+          break; // stalled is the worst; short-circuit
+        }
+      }
+
+      if (!anyStalled) {
+        for (const a of nodeArts) {
+          if (a.acceptance === 'rejected') {
+            worstState = 'rejected';
+            break;
+          }
+        }
+        if (worstState !== 'rejected') {
+          for (const a of nodeArts) {
+            if (a.acceptance === 'owed') {
+              worstState = 'owed';
+              break;
+            }
+          }
+          if (worstState !== 'owed') {
+            const allSkipped = nodeArts.every((a) => a.acceptance === 'skipped');
+            const allRetracted = nodeArts.every((a) => a.acceptance === 'retracted');
+            if (allSkipped) worstState = 'skipped';
+            else if (allRetracted) worstState = 'retracted';
+            // else: all green
+          }
+        }
+      }
+
+      node.state = worstState;
+      if (anyStalled) node.stalled = true;
+    }
+  }
+
+  // --- 5. Sort for determinism ---
+  nodes.sort((a, b) => a.id.localeCompare(b.id));
+  edges.sort((a, b) => {
+    const f = a.from.localeCompare(b.from);
+    if (f !== 0) return f;
+    const t = a.to.localeCompare(b.to);
+    if (t !== 0) return t;
+    return a.stem.localeCompare(b.stem);
+  });
+
+  return { def: def.name, nodes, edges, hasOverlay };
+}
+
+// ---- graph renderers ----------------------------------------------------------
+
+const STATE_FILL_COLORS: Record<string, string> = {
+  green: '#c8e6c9',
+  owed: '#e0e0e0',
+  rejected: '#ffcc80',
+  stalled: '#ef9a9a',
+  skipped: '#f5f5f5',
+  retracted: '#eeeeee',
+};
+
+function dotEscape(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/**
+ * Render a WorkflowGraph as a Graphviz DOT string.
+ * Pure — no IO, no side effects. Deterministic (nodes/edges already sorted).
+ */
+export function graphToDot(g: WorkflowGraph): string {
+  const lines: string[] = [];
+  lines.push(`digraph "${dotEscape(g.def)}" {`);
+  lines.push('  rankdir=LR;');
+  lines.push('  node [fontname="Helvetica"];');
+  lines.push('');
+
+  // Collect dangling node ids from edges
+  const danglingIds = new Set(
+    g.edges
+      .filter((e) => e.from.startsWith('__dangling__'))
+      .map((e) => e.from),
+  );
+
+  // Emit dangling phantom nodes (before real nodes)
+  for (const id of [...danglingIds].sort()) {
+    const stem = id.slice('__dangling__'.length);
+    lines.push(`  "${dotEscape(id)}" [label="(missing: ${dotEscape(stem)})", shape=plaintext, color=red];`);
+  }
+
+  // Emit real nodes
+  for (const node of g.nodes) {
+    const shape =
+      node.kind === 'input' ? 'ellipse' : node.terminal ? 'doublecircle' : 'box';
+    const attrs: string[] = [`shape=${shape}`, `label="${dotEscape(node.label)}"`];
+    if (g.hasOverlay && node.state && node.state !== 'none') {
+      const fillcolor = STATE_FILL_COLORS[node.state];
+      const style =
+        node.state === 'skipped' || node.state === 'retracted'
+          ? '"filled,dashed"'
+          : 'filled';
+      attrs.push(`style=${style}`);
+      if (fillcolor) attrs.push(`fillcolor="${fillcolor}"`);
+    }
+    lines.push(`  "${dotEscape(node.id)}" [${attrs.join(', ')}];`);
+  }
+
+  lines.push('');
+
+  // Emit edges
+  for (const edge of g.edges) {
+    const edgeAttrs: string[] = [];
+    if (edge.mode === 'map') {
+      edgeAttrs.push(`label="map [${dotEscape(edge.binder ?? '$i')}]"`);
+      edgeAttrs.push('style=dashed');
+    } else if (edge.mode === 'reduce') {
+      edgeAttrs.push('label="reduce [*]"');
+      edgeAttrs.push('style=bold');
+    } else {
+      edgeAttrs.push('style=solid');
+    }
+    const attrStr = edgeAttrs.length ? ` [${edgeAttrs.join(', ')}]` : '';
+    lines.push(`  "${dotEscape(edge.from)}" -> "${dotEscape(edge.to)}"${attrStr};`);
+  }
+
+  lines.push('}');
+  return lines.join('\n');
+}
+
+function mmdSafeId(id: string): string {
+  if (id.startsWith('__dangling__')) {
+    return 'dangling_' + id.slice('__dangling__'.length).replace(/[^a-zA-Z0-9]/g, '_');
+  }
+  return id.replace(/[^a-zA-Z0-9_]/g, '_');
+}
+
+function mmdEscape(s: string): string {
+  return s.replace(/"/g, '#quot;');
+}
+
+/**
+ * Render a WorkflowGraph as a Mermaid flowchart string.
+ * Pure — no IO, no side effects. Deterministic (nodes/edges already sorted).
+ */
+export function graphToMermaid(g: WorkflowGraph): string {
+  const lines: string[] = [];
+  lines.push('flowchart LR');
+
+  // Collect dangling ids
+  const danglingIds = new Set(
+    g.edges.filter((e) => e.from.startsWith('__dangling__')).map((e) => e.from),
+  );
+
+  // Emit dangling phantom nodes
+  for (const id of [...danglingIds].sort()) {
+    const stem = id.slice('__dangling__'.length);
+    const mid = mmdSafeId(id);
+    lines.push(`  ${mid}["(missing: ${mmdEscape(stem)})"]`);
+    lines.push(`  style ${mid} stroke:red`);
+  }
+
+  // Emit real nodes
+  for (const node of g.nodes) {
+    const mid = mmdSafeId(node.id);
+    const lbl = mmdEscape(node.label);
+    if (node.kind === 'input') {
+      lines.push(`  ${mid}(("${lbl}"))`);
+    } else if (node.terminal) {
+      lines.push(`  ${mid}(["${lbl}"])`);
+    } else {
+      lines.push(`  ${mid}["${lbl}"]`);
+    }
+  }
+
+  lines.push('');
+
+  // Emit classDefs (only when overlay present)
+  if (g.hasOverlay) {
+    lines.push('  classDef green fill:#c8e6c9,stroke:#333;');
+    lines.push('  classDef owed fill:#e0e0e0,stroke:#333;');
+    lines.push('  classDef rejected fill:#ffcc80,stroke:#333;');
+    lines.push('  classDef stalled fill:#ef9a9a,stroke:#333;');
+    lines.push('  classDef skipped fill:#f5f5f5,stroke:#333,stroke-dasharray:5 5;');
+    lines.push('  classDef retracted fill:#eeeeee,stroke:#333,stroke-dasharray:5 5;');
+    lines.push('');
+  }
+
+  // Emit edges
+  for (const edge of g.edges) {
+    const from = mmdSafeId(edge.from);
+    const to = mmdSafeId(edge.to);
+    if (edge.mode === 'map') {
+      lines.push(`  ${from} -->|"map [${mmdEscape(edge.binder ?? '$i')}]"| ${to}`);
+    } else if (edge.mode === 'reduce') {
+      lines.push(`  ${from} -->|"reduce [*]"| ${to}`);
+    } else {
+      lines.push(`  ${from} --> ${to}`);
+    }
+  }
+
+  lines.push('');
+
+  // Emit class assignments
+  if (g.hasOverlay) {
+    for (const node of g.nodes) {
+      if (node.state && node.state !== 'none') {
+        lines.push(`  class ${mmdSafeId(node.id)} ${node.state}`);
+      }
+    }
+  }
+
+  return lines.join('\n');
 }

@@ -33,9 +33,12 @@ export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
 export { buildDef, DefError, lintDef, loadDefFile, loadDefs, parseDef, validateDef } from './defs.ts';
 
 export {
+  buildGraph,
   buildTrace,
   collectionProduces,
   eligibleFirings,
+  graphToDot,
+  graphToMermaid,
   isSchemaStalled,
   isStalled,
   maintainDecisions,
@@ -61,6 +64,9 @@ export type {
   Author,
   ConsumePattern,
   Fingerprint,
+  GraphEdge,
+  GraphNode,
+  GraphNodeState,
   InputDef,
   JsonSchema,
   LoopDef,
@@ -71,5 +77,6 @@ export type {
   TaskData,
   TimelineEvent,
   WorkflowDef,
+  WorkflowGraph,
   WorkflowTrace,
 } from './types.ts';
