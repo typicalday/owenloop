@@ -720,6 +720,25 @@ const deliveryViolatedInvDef: WorkflowDef = {
   ] satisfies InvariantDef[],
 };
 
+// A 1-loop def where the worker can skip its output. Reaching `done` via skip
+// leaves `result` skipped (not green), violating "when done, result must be green".
+// The violation is at BFS depth >= 1 (you must fire worker/skip to reach it), so a
+// re-drive of its counterexample path actually executes — unlike a depth-0 violation.
+const skipDoneInvDef: WorkflowDef = {
+  ...def(
+    'skip-done',
+    [input('start', { seedOwed: false })],
+    [loop({ name: 'worker', consumes: ['start'], produces: ['result'], maxSchemaFailures: 0 })],
+  ),
+  invariants: [
+    {
+      name: 'result-green-when-done',
+      when: { state: 'done' as const },
+      requires: { path: 'result', is: 'green' as const },
+    },
+  ] satisfies InvariantDef[],
+};
+
 // §3.3 test 23: invariant that holds everywhere → invariantViolations empty
 test('modelCheck: invariant that holds everywhere → invariantViolations empty', () => {
   const report = modelCheck(deliveryInvDef, { maxStates: 500 });
@@ -736,16 +755,18 @@ test('modelCheck: violated invariant → exactly one violation with correct name
 
 // §3.3 test 25: real-witness re-drive (trustworthiness)
 test('modelCheck: real-witness re-drive — counterexample path is genuinely executable', () => {
-  const report = modelCheck(deliveryViolatedInvDef, { maxStates: 500 });
-  assert.equal(report.invariantViolations.length, 1, 'need at least one violation to re-drive');
+  const report = modelCheck(skipDoneInvDef, { maxStates: 500 });
+  assert.equal(report.invariantViolations.length, 1, 'need exactly one violation to re-drive');
   const violation = report.invariantViolations[0]!;
+  // The violation must be reached by firing at least one step (not a depth-0 seed
+  // violation) — otherwise the re-drive loop below would be vacuous.
+  assert.ok(violation.path.length >= 1, 'counterexample must require >= 1 firing (non-vacuous re-drive)');
 
-  // Re-drive the counterexample path from the seed state
-  // Seed the initial state the same way modelCheck does: proposal green (seedOwed=false)
+  // Seed the initial state the same way modelCheck does: `start` green (seedOwed=false).
   let memMap = new Map<string, ArtifactData>();
-  memMap.set('proposal', {
+  memMap.set('start', {
     workflow: '',
-    path: 'proposal',
+    path: 'start',
     producer: 'human',
     acceptance: 'green',
     version: 1,
@@ -753,54 +774,52 @@ test('modelCheck: real-witness re-drive — counterexample path is genuinely exe
     judgmentRejects: 0,
     schemaRejects: 0,
   });
-  memMap = settleInMemory(deliveryViolatedInvDef, memMap);
+  memMap = settleInMemory(skipDoneInvDef, memMap);
 
-  // Walk each step in the counterexample path
+  // Walk each step in the counterexample path through the real in-memory transitions.
   for (const step of violation.path) {
-    const firings = eligibleFirings(deliveryViolatedInvDef, memMap);
+    const firings = eligibleFirings(skipDoneInvDef, memMap);
     const firing = firings.find((f) => f.loop === step.loop && f.key === step.key);
     assert.ok(firing, `expected a firing for ${step.loop}/${step.key} at this step`);
-    const successors = applyOutcome(deliveryViolatedInvDef, memMap, firing, step.outcome, { maxCollectionSize: 2 });
+    const successors = applyOutcome(skipDoneInvDef, memMap, firing, step.outcome, { maxCollectionSize: 2 });
     assert.ok(successors.length > 0, 'applyOutcome must return at least one successor');
     memMap = successors[0]!;
   }
-  // Now memMap is the state at the end of the violation path.
-  // Assert the predicate is genuinely violated here.
-  const finalStatus = workflowStatus(deliveryViolatedInvDef, memMap);
-  const inv = deliveryViolatedInvDef.invariants![0]!;
+  // memMap is now the state at the end of the violation path. Prove it genuinely violates.
+  const finalStatus = workflowStatus(skipDoneInvDef, memMap);
+  const inv = skipDoneInvDef.invariants![0]!;
   const ALWAYS_TRUE: InvariantPredicate = { all: [] };
   const whenHolds = evalInvariantPredicate(inv.when ?? ALWAYS_TRUE, memMap, finalStatus);
   const requiresHolds = evalInvariantPredicate(inv.requires, memMap, finalStatus);
-  assert.equal(whenHolds, true, 'when-guard must be true (always active)');
-  assert.equal(requiresHolds, false, 'requires must be FALSE in the violated state — proving the counterexample is real');
+  assert.equal(whenHolds, true, 'when-guard (state:done) must be true in the reached state');
+  assert.equal(requiresHolds, false, 'requires (result green) must be FALSE — proving the counterexample is real');
 });
 
-// §3.3 test 26: invariant with `when` guard that holds (when done AND proposal present)
-test('modelCheck: when-guarded invariant that holds everywhere → no violations', () => {
-  // proposal is always present and green (seedOwed=false) — this invariant always holds.
-  const report = modelCheck(deliveryInvDef, { maxStates: 500 });
-  assert.deepEqual(report.invariantViolations, []);
+// §3.3 test 26: a `when:{state:'done'}`-guarded invariant that HOLDS everywhere.
+// proposal is seeded and never removed, so "when done, proposal must be present"
+// holds in every reachable done state — exercising the when-guard in the holding
+// direction (test 27 exercises the same guard shape in the violated direction).
+test('modelCheck: when:state-done guarded invariant that holds → no violations', () => {
+  const deliveryDoneGuardedInvDef: WorkflowDef = {
+    ...deliveryProvidedNoSchemaStall,
+    name: 'delivery-done-guarded',
+    invariants: [
+      {
+        name: 'proposal-present-when-done',
+        when: { state: 'done' as const },
+        requires: { path: 'proposal', is: 'present' as const },
+      },
+    ] satisfies InvariantDef[],
+  };
+  const report = modelCheck(deliveryDoneGuardedInvDef, { maxStates: 500 });
+  assert.deepEqual(report.invariantViolations, [], 'when-guarded invariant should hold in all done states');
 });
 
 // §3.3 test 27: {state:'done'} invariant violated (1-loop def where done is reachable with output skipped)
 test('modelCheck: state:done invariant violated when done-state has wrong acceptance', () => {
-  // A 1-loop def where the worker can skip its output. When done via skip,
-  // the output is skipped not green → violates "when done, result is green".
-  const skipDef: WorkflowDef = {
-    ...def(
-      'skip-done',
-      [input('start', { seedOwed: false })],
-      [loop({ name: 'worker', consumes: ['start'], produces: ['result'], maxSchemaFailures: 0 })],
-    ),
-    invariants: [
-      {
-        name: 'result-green-when-done',
-        when: { state: 'done' as const },
-        requires: { path: 'result', is: 'green' as const },
-      },
-    ] satisfies InvariantDef[],
-  };
-  const report = modelCheck(skipDef, { maxStates: 500 });
+  // Reuses the module-level skipDoneInvDef: a 1-loop def where the worker can skip its output.
+  // When done via skip, the output is skipped not green → violates "when done, result is green".
+  const report = modelCheck(skipDoneInvDef, { maxStates: 500 });
   // The workflow can reach done via skip (result=skipped), violating the invariant
   assert.ok(report.invariantViolations.length >= 1, 'expected at least one violation when done via skip');
   assert.equal(report.invariantViolations[0]!.invariant, 'result-green-when-done');
@@ -846,24 +865,6 @@ const violatedInvYaml = [
   '    requires:',
   '      path: result',
   '      is: green',
-].join('\n');
-
-const holdingInvYaml = [
-  'name: inv-holds',
-  'inputs:',
-  '  - name: start',
-  '    seedOwed: false',
-  'loops:',
-  '  - name: worker',
-  '    consumes: [start]',
-  '    produces: [result]',
-  '    maxSchemaFailures: 0',
-  '    body: run',
-  'invariants:',
-  '  - name: result-not-absent',
-  '    requires:',
-  '      path: result',
-  '      is: present',
 ].join('\n');
 
 // §3.4 test 29: YAML def with violated invariant → code=1, /DEFECTS FOUND/, /Invariant violations/, name
