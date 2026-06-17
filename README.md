@@ -258,13 +258,16 @@ engine.status(wf);   // a typed WorkflowStatus: done / debts / eligible / blocke
 store.close();        // on shutdown
 ```
 
+Prefer to **react** instead of poll? `engine.subscribe(listener)` (or
+`createEngine({ onEvent })`) pushes a typed `EngineEvent` the instant a mutation
+commits — re-`tick` only when there's new eligible work, or resolve a promise
+when the workflow is `done`. See [`examples/events.ts`](examples/events.ts).
+
 The `engine`/`store` are meant to be long-lived (one per database). Concurrency
 is the store's: better-sqlite3 is synchronous and single-writer-per-process,
 with cross-process advancement made safe by the commit-fingerprint CAS — a good
 fit for an embedded control-plane. See [`docs/embedding.md`](docs/embedding.md)
-for the full surface, lifecycle, and trade-offs. (This is the in-process API;
-packaging it as a built/published artifact, and adding push-style event hooks,
-are deliberately separate follow-ups.)
+for the full surface, lifecycle, events, and trade-offs.
 
 ---
 

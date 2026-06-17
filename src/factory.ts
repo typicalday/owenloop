@@ -14,15 +14,15 @@
  * better-sqlite3 is synchronous and single-writer-per-process; cross-process
  * advancement is made safe by the commit-fingerprint CAS (see `src/store.ts`).
  *
- * This is evaluation option **A** (a blessed, documented in-process API with no
- * packaging change). Publishing a built package (B) and push/event hooks (C)
- * are deliberately out of scope here.
+ * A host that wants to react to engine changes without polling can pass
+ * `onEvent` (and optionally `onListenerError`) here — the same registration as
+ * `engine.subscribe`, wired at construction. See `docs/embedding.md`.
  */
 
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Engine } from './engine.ts';
-import type { DefResolver } from './engine.ts';
+import type { DefResolver, EngineEvent, EngineListener } from './engine.ts';
 import { openStore } from './store.ts';
 import type { Store } from './store.ts';
 import { loadDefs } from './defs.ts';
@@ -49,6 +49,14 @@ export interface CreateEngineOpts {
   defsDir?: string;
   /** Forwarded to the `Engine` — the stranded-lease reap TTL in milliseconds. */
   reapTtlMs?: number;
+  /**
+   * A push-style observer registered up front, equivalent to calling
+   * `engine.subscribe` immediately after construction. Fires synchronously
+   * after each committed mutation. See {@link Engine.subscribe}.
+   */
+  onEvent?: EngineListener;
+  /** Where a throwing `onEvent`/subscriber's error goes (default: swallowed). */
+  onListenerError?: (err: unknown, event: EngineEvent) => void;
 }
 
 export interface CreatedEngine {
@@ -82,10 +90,15 @@ export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
     return d;
   };
 
-  const engine = new Engine(
-    store,
-    resolveDef,
-    opts.reapTtlMs !== undefined ? { reapTtlMs: opts.reapTtlMs } : {},
-  );
+  const engineOpts: {
+    reapTtlMs?: number;
+    onEvent?: EngineListener;
+    onListenerError?: (err: unknown, event: EngineEvent) => void;
+  } = {};
+  if (opts.reapTtlMs !== undefined) engineOpts.reapTtlMs = opts.reapTtlMs;
+  if (opts.onEvent !== undefined) engineOpts.onEvent = opts.onEvent;
+  if (opts.onListenerError !== undefined) engineOpts.onListenerError = opts.onListenerError;
+
+  const engine = new Engine(store, resolveDef, engineOpts);
   return { engine, store, defs };
 }

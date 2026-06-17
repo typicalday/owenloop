@@ -101,15 +101,72 @@ export interface CreateOpts {
 
 export type DefResolver = (defName: string) => WorkflowDef;
 
+/**
+ * A push notification of a committed engine change, delivered to observers
+ * registered via {@link Engine.subscribe}. Lets an in-process host react the
+ * instant the graph advances instead of polling `tick`/`status`.
+ *
+ * - `instance`  — a new workflow was created (and its inputs seeded).
+ * - `commit`    — a state-changing verb landed on `path` (`outcome` is present
+ *                 for the producer verbs green/emit/seal, including a refusal).
+ * - `closed`    — a run's lease was released.
+ * - `settled`   — the derived view AFTER the cascade: a host re-`tick`s only
+ *                 when `eligible` is non-empty, and learns completion via `done`.
+ *   A state-changing verb fires its specific event followed by a `settled`.
+ */
+export type EngineEvent =
+  | { type: 'instance'; workflow: string; def: string }
+  | {
+      type: 'commit';
+      workflow: string;
+      run?: string;
+      path: string;
+      action: 'green' | 'emit' | 'seal' | 'reject' | 'retract' | 'skip' | 'retry' | 'provide';
+      outcome?: CommitResult['outcome'] | EmitResult['outcome'];
+    }
+  | { type: 'closed'; workflow: string; run: string; outcome: 'ok' | 'no_work' | 'failed' | 'skipped' }
+  | { type: 'settled'; workflow: string; done: boolean; eligible: string[] };
+
+/** A synchronous observer of {@link EngineEvent}s. */
+export type EngineListener = (event: EngineEvent) => void;
+
 export class Engine {
   readonly store: Store;
   private readonly resolveDef: DefResolver;
   private readonly reapTtlMs: number;
+  private readonly listeners = new Set<EngineListener>();
+  private readonly onListenerError?: (err: unknown, event: EngineEvent) => void;
 
-  constructor(store: Store, resolveDef: DefResolver, opts: { reapTtlMs?: number } = {}) {
+  constructor(
+    store: Store,
+    resolveDef: DefResolver,
+    opts: {
+      reapTtlMs?: number;
+      /** A listener registered up front, equivalent to a `subscribe` call. */
+      onEvent?: EngineListener;
+      /** Where a throwing listener's error goes (default: swallowed). */
+      onListenerError?: (err: unknown, event: EngineEvent) => void;
+    } = {},
+  ) {
     this.store = store;
     this.resolveDef = resolveDef;
     this.reapTtlMs = opts.reapTtlMs ?? DEFAULT_REAP_TTL_MS;
+    if (opts.onEvent) this.listeners.add(opts.onEvent);
+    this.onListenerError = opts.onListenerError;
+  }
+
+  /**
+   * Register a synchronous observer of engine changes; returns an idempotent
+   * unsubscribe. Listeners fire AFTER a mutation's transaction commits, so they
+   * observe fully-committed, settled state. A throwing listener is isolated
+   * (routed to `onListenerError`) and never rolls back the commit or starves
+   * its siblings. See {@link EngineEvent}.
+   */
+  subscribe(listener: EngineListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   // ---- instance lifecycle ----------------------------------------------------
@@ -118,7 +175,7 @@ export class Engine {
   createInstance(defName: string, opts: CreateOpts = {}): string {
     const def = this.resolveDef(defName);
     const id = randId('wf');
-    return this.store.tx(() => {
+    this.store.tx(() => {
       const wfData: { def: string; title?: string; params?: Record<string, string> } = { def: defName };
       if (opts.title !== undefined) wfData.title = opts.title;
       if (opts.params !== undefined) wfData.params = opts.params;
@@ -149,6 +206,9 @@ export class Engine {
       this.settle(id, def);
       return id;
     });
+    this.fire({ type: 'instance', workflow: id, def: defName });
+    this.fireSettled(id);
+    return id;
   }
 
   /** A human/external producer supplies (greens) an owed input. */
@@ -175,6 +235,8 @@ export class Engine {
       });
       this.settle(workflow, def);
     });
+    this.fire({ type: 'commit', workflow, path: name, action: 'provide' });
+    this.fireSettled(workflow);
   }
 
   // ---- the tick (maintain → reap → eligible → cadence/budget → claim) --------
@@ -315,7 +377,7 @@ export class Engine {
     opts: { terminal?: boolean } = {},
   ): CommitResult {
     const def = this.defFor(workflow);
-    return this.store.tx(() => {
+    const result = this.store.tx((): CommitResult => {
       const r = this.openRun(workflow, run);
       const arts = this.artMap(workflow);
       const art = arts.get(path);
@@ -365,6 +427,9 @@ export class Engine {
       this.settle(workflow, def);
       return { path, outcome: 'green' };
     });
+    this.fire({ type: 'commit', workflow, run, path: result.path, action: 'green', outcome: result.outcome });
+    this.fireSettled(workflow);
+    return result;
   }
 
   /**
@@ -374,11 +439,13 @@ export class Engine {
    */
   emit(workflow: string, run: string, items: Array<{ value: Record<string, unknown> }>): EmitResult {
     const def = this.defFor(workflow);
-    return this.store.tx(() => {
+    let stem = '';
+    const result = this.store.tx((): EmitResult => {
       const r = this.openRun(workflow, run);
       const loop = this.loop(def, r.loop);
-      const stem = collectionStem(loop);
-      if (!stem) throw new Error(`loop ${r.loop} does not produce a collection`);
+      const s = collectionStem(loop);
+      if (!s) throw new Error(`loop ${r.loop} does not produce a collection`);
+      stem = s;
       const arts = this.artMap(workflow);
 
       const req = plainConsumes(loop).map((c) => c.stem);
@@ -440,12 +507,15 @@ export class Engine {
       this.settle(workflow, def);
       return { outcome: 'emitted', created };
     });
+    this.fire({ type: 'commit', workflow, run, path: stem, action: 'emit', outcome: result.outcome });
+    this.fireSettled(workflow);
+    return result;
   }
 
   /** Green a collection's seal — the producer's "I am done emitting" signal. */
   seal(workflow: string, run: string, value: Record<string, unknown> = {}): CommitResult {
     const def = this.defFor(workflow);
-    return this.store.tx(() => {
+    const result = this.store.tx((): CommitResult => {
       const r = this.openRun(workflow, run);
       const loop = this.loop(def, r.loop);
       const stem = collectionStem(loop);
@@ -472,6 +542,9 @@ export class Engine {
       this.settle(workflow, def);
       return { path: sealP, outcome: 'green' };
     });
+    this.fire({ type: 'commit', workflow, run, path: result.path, action: 'seal', outcome: result.outcome });
+    this.fireSettled(workflow);
+    return result;
   }
 
   // ---- consumer invalidation -------------------------------------------------
@@ -491,6 +564,8 @@ export class Engine {
       });
       this.settle(workflow, def);
     });
+    this.fire({ type: 'commit', workflow, path, action: 'reject' });
+    this.fireSettled(workflow);
   }
 
   /** Retract a collection member (§11.3): drop it, terminally; abandon the index. */
@@ -508,6 +583,8 @@ export class Engine {
       });
       this.settle(workflow, def);
     });
+    this.fire({ type: 'commit', workflow, path, action: 'retract' });
+    this.fireSettled(workflow);
   }
 
   /** A producer skips its own owed output on a dead branch (§16.1 routing). */
@@ -531,6 +608,8 @@ export class Engine {
       });
       this.settle(workflow, def);
     });
+    this.fire({ type: 'commit', workflow, path, action: 'skip' });
+    this.fireSettled(workflow);
   }
 
   /**
@@ -554,6 +633,8 @@ export class Engine {
       });
       this.settle(workflow, def);
     });
+    this.fire({ type: 'commit', workflow, path, action: 'retry' });
+    this.fireSettled(workflow);
   }
 
   // ---- run lifecycle ---------------------------------------------------------
@@ -571,6 +652,9 @@ export class Engine {
         this.store.putTask({ workflow, loop: r.loop, key: r.key ?? '', status: 'idle', attempts: task.attempts });
       }
     });
+    // Closing releases a lease; it touches no artifact state, so there is no
+    // forward cascade and no `settled` to derive — just the lifecycle signal.
+    this.fire({ type: 'closed', workflow, run, outcome });
   }
 
   /** Release stranded leases (claimed by a dead/closed run, or past the TTL). */
@@ -618,6 +702,41 @@ export class Engine {
   }
 
   // ---- internals -------------------------------------------------------------
+
+  /**
+   * Deliver `event` to every subscriber synchronously, in registration order.
+   * The set is snapshotted so a listener that (un)subscribes mid-dispatch does
+   * not mutate the loop. A throwing listener is isolated — its error is routed
+   * to `onListenerError` (default: swallowed) and never rethrown — so one bad
+   * subscriber can neither roll back the already-committed write nor starve its
+   * siblings. A no-subscriber engine short-circuits to zero cost.
+   */
+  private fire(event: EngineEvent): void {
+    if (this.listeners.size === 0) return;
+    for (const listener of [...this.listeners]) {
+      try {
+        listener(event);
+      } catch (err) {
+        this.onListenerError?.(err, event);
+      }
+    }
+  }
+
+  /**
+   * Emit the post-commit `settled` event — `done` plus the eligible loop names,
+   * the no-poll signal a host watches to decide whether to re-`tick`. Guarded on
+   * having a listener: deriving it runs a full `workflowStatus` artifact scan, so
+   * a subscriber-free engine (the CLI and every non-observing caller) must pay
+   * nothing — the hook stays strictly additive. Called only after a verb's tx has
+   * committed (and thus already settled), so the read reflects the fixpoint.
+   */
+  private fireSettled(workflow: string): void {
+    if (this.listeners.size === 0) return;
+    const def = this.defFor(workflow);
+    const arts = this.artMap(workflow);
+    const st = workflowStatus(def, arts);
+    this.fire({ type: 'settled', workflow, done: st.done, eligible: st.eligible.map((e) => e.loop) });
+  }
 
   /** Materialize owed outputs + run the cascade to a fixpoint (inside a tx). */
   private settle(workflow: string, def: WorkflowDef): void {

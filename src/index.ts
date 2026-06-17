@@ -13,7 +13,16 @@
  */
 
 export { Engine } from './engine.ts';
-export type { CommitResult, CreateOpts, DefResolver, EmitResult, Order, TickResult } from './engine.ts';
+export type {
+  CommitResult,
+  CreateOpts,
+  DefResolver,
+  EmitResult,
+  EngineEvent,
+  EngineListener,
+  Order,
+  TickResult,
+} from './engine.ts';
 
 export { createEngine } from './factory.ts';
 export type { CreateEngineOpts, CreatedEngine } from './factory.ts';
