@@ -211,6 +211,51 @@ model) before the engine stalls the artifact.
 
 ---
 
+## Programmatic / embedding
+
+The CLI is a thin adapter — it maps `argv` to engine calls and prints JSON. The
+engine itself is an ordinary class, so you can drive it **in-process** and get
+the same lifecycle back as typed objects (`Order`, `CommitResult`,
+`WorkflowStatus`) instead of JSON on stdout — no subprocess, no parsing. The
+[`oweflow`](package.json) package's entry point exports everything you need.
+
+`createEngine` bundles the store + definition wiring into one call:
+
+```ts
+import { createEngine } from 'oweflow';
+
+const { engine, store } = createEngine({
+  db: '.oweflow/state.db',          // or ':memory:' for an ephemeral instance
+  defsDir: 'workflows',             // load YAML defs from a dir … or pass `defs: [myDef]`
+});
+
+// start an instance (proposal is a seedOwed input, so provide it up front)
+const wf = engine.createInstance('delivery', {
+  provide: { proposal: { text: 'add dark mode' } },
+});
+
+// the wiring/worker loop: tick → run → report
+const { orders } = engine.tick(wf);
+for (const order of orders) {
+  const result = await runYourWorker(order);            // ← your domain
+  engine.green(wf, order.run, order.outputs[0], result); // typed CommitResult back
+  engine.close(wf, order.run);
+}
+
+engine.status(wf);   // a typed WorkflowStatus: done / debts / eligible / blocked
+store.close();        // on shutdown
+```
+
+The `engine`/`store` are meant to be long-lived (one per database). Concurrency
+is the store's: better-sqlite3 is synchronous and single-writer-per-process,
+with cross-process advancement made safe by the commit-fingerprint CAS — a good
+fit for an embedded control-plane. See [`docs/embedding.md`](docs/embedding.md)
+for the full surface, lifecycle, and trade-offs. (This is the in-process API;
+packaging it as a built/published artifact, and adding push-style event hooks,
+are deliberately separate follow-ups.)
+
+---
+
 ## Workflow definition format
 
 A workflow is one self-contained YAML file under the `--defs` directory (either

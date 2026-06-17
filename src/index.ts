@@ -15,6 +15,9 @@
 export { Engine } from './engine.ts';
 export type { CommitResult, CreateOpts, DefResolver, EmitResult, Order, TickResult } from './engine.ts';
 
+export { createEngine } from './factory.ts';
+export type { CreateEngineOpts, CreatedEngine } from './factory.ts';
+
 export { Store, openStore } from './store.ts';
 export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
 
