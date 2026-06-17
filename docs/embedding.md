@@ -6,10 +6,9 @@ on an `Engine` and prints the results as JSON. Everything it does, a host
 process can do **in-process** — and get the lifecycle back as typed objects
 rather than JSON on stdout.
 
-This document covers option **A** of the engine's productization: a blessed,
-documented in-process API. Two follow-ups are intentionally out of scope here —
-packaging/publishing a built artifact (B), and push-style event hooks so a host
-reacts without polling (C).
+This document covers the in-process API: the one-call factory, the worker loop,
+in-memory definitions, lifecycle/concurrency, and **push-style events** so a host
+can react the instant the graph advances instead of polling.
 
 ## The one-call factory
 
@@ -30,6 +29,8 @@ const { engine, store } = createEngine({
 | `defs`      | In-memory definitions as a `Map<string, WorkflowDef>` or an array of `WorkflowDef` (de-duped by name). Takes precedence over `defsDir`. |
 | `defsDir`   | Directory of `*.yaml` definitions, loaded via `loadDefs`. A missing dir yields no defs (lenient, like the CLI), not an error. |
 | `reapTtlMs` | Forwarded to the `Engine` — the stranded-lease reap TTL. |
+| `onEvent`   | A push-style observer registered at construction (equivalent to `engine.subscribe`). See [Events](#events). |
+| `onListenerError` | Where a throwing listener's error is routed (default: swallowed). |
 
 It mirrors exactly what the CLI's `openCtx` wires up, so the binary and an
 embedder drive the *same* engine the same way.
@@ -84,6 +85,72 @@ A runnable version of this lives at [`examples/embed.ts`](../examples/embed.ts):
 node examples/embed.ts
 ```
 
+## Events
+
+The worker loop above pulls work with `tick`. A host can instead **react** to
+changes: `engine.subscribe(listener)` registers a synchronous observer and
+returns an idempotent unsubscribe. Each listener is handed a typed `EngineEvent`
+the instant a mutation commits — so a host re-`tick`s only when there is new
+eligible work, resolves a promise when the terminal seals, or streams progress,
+without ever polling `status` on a timer.
+
+```ts
+const off = engine.subscribe((event) => {
+  switch (event.type) {
+    case 'instance':  /* a new workflow was created */ break;
+    case 'commit':    /* a verb landed on event.path (event.action / event.outcome) */ break;
+    case 'closed':    /* a run's lease was released */ break;
+    case 'settled':   // the derived post-cascade view — the no-poll signal:
+      if (event.done) resolveComplete();
+      else if (event.eligible.length) engine.tick(event.workflow);
+      break;
+  }
+});
+// …later…
+off();   // stop receiving events
+```
+
+Or register one up front via the factory — equivalent to subscribing immediately:
+
+```ts
+const { engine } = createEngine({ db: ':memory:', defsDir: 'workflows', onEvent: (e) => log(e) });
+```
+
+The event union (exported as `EngineEvent`):
+
+| `type`     | fields | fired when |
+|------------|--------|-----------|
+| `instance` | `workflow`, `def` | a workflow instance was created and seeded |
+| `commit`   | `workflow`, `path`, `action`, `run?`, `outcome?` | a state-changing verb landed — `action` is one of `green`/`emit`/`seal`/`reject`/`retract`/`skip`/`retry`/`provide`; `outcome` is present for the producer verbs (`green`/`emit`/`seal`), and carries a refusal (`born-rejected`/`schema-rejected`) too |
+| `closed`   | `workflow`, `run`, `outcome` | a run's lease was released by `close` |
+| `settled`  | `workflow`, `done`, `eligible` | the derived state **after** the forward cascade — `eligible` is the loop names with work to do; `done` is workflow completion |
+
+**Guarantees.**
+
+- **After-commit ordering.** Events fire *after* the mutation's transaction
+  commits (and the cascade has already settled inside that tx), so a listener
+  that calls `status`/`tick`/`green` observes fully-committed, settled state —
+  there is no open transaction to corrupt. A state-changing verb fires its
+  specific `commit`/`instance` event followed by a `settled`; `close` fires only
+  `closed` (it releases a lease, it doesn't touch artifact state); `tick` fires
+  nothing (it hands you orders directly).
+- **Synchronous, registration order.** The engine is single-writer and
+  synchronous; listeners fire in the order they subscribed, on the calling
+  thread. This is an in-process observer, not an async/cross-process bus —
+  cross-process hosts still coordinate through the CAS and their own reads.
+- **Error isolation.** A throwing listener cannot roll back the already-committed
+  write or starve its siblings: each listener call is wrapped, and a throw is
+  routed to `onListenerError(err, event)` (default: swallowed, never rethrown).
+- **Backwards compatible.** With no subscribers the engine does zero extra work
+  and behaves identically — the hook is purely additive.
+
+A runnable, poll-free worker driven entirely by events lives at
+[`examples/events.ts`](../examples/events.ts):
+
+```sh
+node examples/events.ts
+```
+
 ## In-memory definitions
 
 Defs don't have to come from disk. Build them in code and pass `defs` — useful
@@ -121,5 +188,5 @@ The package entry ([`src/index.ts`](../src/index.ts)) re-exports the engine
 loaders (`loadDefs`, `parseDef`, `buildDef`, …), the pure model functions
 (`eligibleFirings`, `workflowStatus`, `isStalled`, …), the schema helpers, and
 all the shared types (`Order`, `CommitResult`, `WorkflowStatus`, `WorkflowDef`,
-…). For most hosts, `createEngine` + the engine methods + the `Order` /
+`EngineEvent`, `EngineListener`, …). For most hosts, `createEngine` + the engine methods + the `Order` /
 `CommitResult` / `WorkflowStatus` types are the whole surface you need.
