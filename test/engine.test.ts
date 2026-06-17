@@ -664,3 +664,122 @@ test('schema: provideInput rejects a value that violates the input schema', () =
   engine.provideInput(wf, 'proposal', { goal: 'ship' });
   assert.equal(store.getArtifact(wf, 'proposal')?.acceptance, 'green');
 });
+
+// ---- deferred channel (tick observability) -----------------------------------
+
+test('deferred: always present — empty on a normal order-emitting tick and on an idle tick', () => {
+  const { engine } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery');
+
+  // normal tick: one planner order, deferred is empty
+  const t1 = engine.tick(wf, { now: 1000 });
+  assert.equal(t1.orders.length, 1);
+  assert.deepEqual(t1.deferred, []);
+
+  // drive all the way to done
+  complete(engine, wf, t1.orders[0]!, { plan: 'v1' });
+  complete(engine, wf, fire(engine, wf, 'builder', 2000), { pr: 1 });
+  complete(engine, wf, fire(engine, wf, 'reviewer', 3000), { ok: true });
+  complete(engine, wf, fire(engine, wf, 'merger', 4000), { merged: true }, { terminal: true });
+
+  // idle tick: nothing to do
+  const t2 = engine.tick(wf, { now: 5000 });
+  assert.deepEqual(t2.orders, []);
+  assert.deepEqual(t2.deferred, []);
+});
+
+test('deferred: in-flight — a second tick while a run is open produces a deferred in-flight entry', () => {
+  const { engine } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery');
+
+  // tick once to open a planner run — do NOT close it
+  const t1 = engine.tick(wf, { now: 1000 });
+  assert.equal(t1.orders.length, 1);
+  assert.equal(t1.orders[0]!.loop, 'planner');
+
+  // tick again — the run is still open, so planner should be deferred in-flight
+  const t2 = engine.tick(wf, { now: 2000 });
+  assert.deepEqual(t2.orders, []);
+  assert.equal(t2.deferred.length, 1);
+  assert.deepEqual(t2.deferred[0], {
+    loop: 'planner',
+    key: '',
+    inputs: ['proposal'],
+    outputs: ['plan'],
+    reason: 'in-flight',
+  });
+  assert.equal(t2.deferred[0]!.index, undefined);
+});
+
+test('deferred: cadence — a tick before the cadence interval elapses defers with reason cadence', () => {
+  const cadenced = def(
+    'cadenced',
+    [input('seed')],
+    [loop({ name: 'watch', consumes: ['seed'], produces: ['report'], cadenceSecs: 60 })],
+  );
+  const { engine } = makeEngine([cadenced]);
+  const wf = engine.createInstance('cadenced');
+
+  // fire and close one run at t=10000
+  const first = fire(engine, wf, 'watch', 10_000);
+  engine.close(wf, first.run, 'no_work');
+
+  // tick at t=40000 — only 30s have elapsed, cadence is 60s
+  const t = engine.tick(wf, { now: 40_000 });
+  assert.deepEqual(t.orders, []);
+  assert.equal(t.deferred.length, 1);
+  assert.equal(t.deferred[0]!.reason, 'cadence');
+  assert.equal(t.deferred[0]!.loop, 'watch');
+});
+
+test('deferred: daily-budget — once the budget is spent, subsequent ticks defer with reason daily-budget', () => {
+  const budgeted = def(
+    'budgeted',
+    [input('seed')],
+    [loop({ name: 'watch', consumes: ['seed'], produces: ['report'], cadenceSecs: 0, maxRunsPerDay: 1 })],
+  );
+  const { engine } = makeEngine([budgeted]);
+  const wf = engine.createInstance('budgeted');
+
+  // use the one allowed run
+  const first = fire(engine, wf, 'watch', 10_000);
+  engine.close(wf, first.run, 'no_work');
+
+  // next tick — budget exhausted for the day
+  const t = engine.tick(wf, { now: 20_000 });
+  assert.deepEqual(t.orders, []);
+  assert.equal(t.deferred.length, 1);
+  assert.equal(t.deferred[0]!.reason, 'daily-budget');
+  assert.equal(t.deferred[0]!.loop, 'watch');
+});
+
+test('deferred: parallel-cap — a map loop with parallel:2 and 4 elements defers 2 with reason parallel-cap', () => {
+  const fan = def(
+    'fan2',
+    [input('q')],
+    [
+      loop({ name: 'gather', consumes: ['q'], produces: ['gather.item[]'] }),
+      loop({
+        name: 'work',
+        consumes: ['gather.item[$i]'],
+        produces: ['gather.item[$i].done'],
+        parallel: 2,
+      }),
+    ],
+  );
+  const { engine } = makeEngine([fan]);
+  const wf = engine.createInstance('fan2');
+
+  const g = fire(engine, wf, 'gather', 1000);
+  engine.emit(wf, g.run, [{ value: {} }, { value: {} }, { value: {} }, { value: {} }]);
+  engine.seal(wf, g.run, {});
+  engine.close(wf, g.run);
+
+  // 4 eligible elements, parallel cap is 2 → 2 orders, 2 deferred
+  const t = engine.tick(wf, { now: 2000 });
+  const workOrders = t.orders.filter((o) => o.loop === 'work');
+  const workDeferred = t.deferred.filter((d) => d.loop === 'work');
+  assert.equal(workOrders.length, 2);
+  assert.equal(workDeferred.length, 2);
+  assert.ok(workDeferred.every((d) => d.reason === 'parallel-cap'));
+});

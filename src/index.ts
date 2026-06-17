@@ -17,6 +17,8 @@ export type {
   CommitResult,
   CreateOpts,
   DefResolver,
+  DeferredFiring,
+  DeferredReason,
   EmitResult,
   EngineEvent,
   EngineListener,

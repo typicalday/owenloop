@@ -69,10 +69,30 @@ export interface Order {
   }>;
 }
 
+/**
+ * §tick-deferred: an eligible firing the tick did NOT promote to an order, tagged
+ * with why. `'in-flight'` — the loop's task is already claimed by an open run;
+ * `'cadence'` — the loop's inter-run gap has not elapsed; `'daily-budget'` — the
+ * loop's daily run allowance is exhausted (binding over parallel); `'parallel-cap'`
+ * — the loop's concurrency cap is the binding constraint. Always emitted by
+ * `applySchedule` or `tick`; never alters which firings are selected or claimed.
+ */
+export type DeferredReason = 'in-flight' | 'cadence' | 'daily-budget' | 'parallel-cap';
+
+export interface DeferredFiring {
+  loop: string;
+  key: string;
+  index?: number;
+  inputs: string[];
+  outputs: string[];
+  reason: DeferredReason;
+}
+
 export interface TickResult {
   workflow: string;
   orders: Order[];
   reaped: number;
+  deferred: DeferredFiring[];
 }
 
 export interface CommitResult {
@@ -250,14 +270,21 @@ export class Engine {
 
       const arts = this.artMap(workflow);
       const firings = eligibleFirings(def, arts);
-      const selected = this.applySchedule(workflow, def, firings, now);
+      const { selected, deferred } = this.applySchedule(workflow, def, firings, now);
 
       const orders: Order[] = [];
+      const allDeferred: DeferredFiring[] = [...deferred];
       for (const f of selected) {
-        const order = this.claim(workflow, def, f, arts, now);
-        if (order) orders.push(order);
+        const result = this.claim(workflow, def, f, arts, now);
+        if (result === 'in-flight') {
+          const d: DeferredFiring = { loop: f.loop, key: f.key, inputs: f.inputs, outputs: f.outputs, reason: 'in-flight' };
+          if (f.index !== undefined) d.index = f.index;
+          allDeferred.push(d);
+        } else if (result) {
+          orders.push(result);
+        }
       }
-      return { workflow, orders, reaped };
+      return { workflow, orders, reaped, deferred: allDeferred };
     });
   }
 
@@ -267,22 +294,40 @@ export class Engine {
     def: WorkflowDef,
     firings: Firing[],
     now: number,
-  ): Firing[] {
+  ): { selected: Firing[]; deferred: DeferredFiring[] } {
     const midnight = localMidnightMs(now);
     const selected: Firing[] = [];
+    const deferred: DeferredFiring[] = [];
+
+    const defer = (f: Firing, reason: DeferredReason): void => {
+      const d: DeferredFiring = { loop: f.loop, key: f.key, inputs: f.inputs, outputs: f.outputs, reason };
+      if (f.index !== undefined) d.index = f.index;
+      deferred.push(d);
+    };
+
     for (const loop of def.loops) {
       const loopFirings = firings.filter((f) => f.loop === loop.name);
       if (loopFirings.length === 0) continue;
 
       const latest = this.store.latestRun(workflow, loop.name);
-      if (latest && now - latest.createdAt < loop.cadenceSecs * 1000) continue; // not due
+      if (latest && now - latest.createdAt < loop.cadenceSecs * 1000) {
+        for (const f of loopFirings) defer(f, 'cadence');
+        continue;
+      }
 
       const used = this.store.countRuns(workflow, loop.name, midnight);
       const budget = Math.max(0, loop.maxRunsPerDay - used);
       const slots = Math.min(loop.parallel, budget);
+
+      // binding constraint for firings beyond the slots: budget is tighter (incl.
+      // budget === 0) → daily-budget; otherwise the concurrency cap → parallel-cap.
+      const beyondReason: DeferredReason = budget < loop.parallel ? 'daily-budget' : 'parallel-cap';
+
       for (const f of loopFirings.slice(0, slots)) selected.push(f);
+      for (const f of loopFirings.slice(slots)) defer(f, beyondReason);
     }
-    return selected;
+
+    return { selected, deferred };
   }
 
   /** Claim a firing's lease via CAS, snapshot the fingerprint, open a run. */
@@ -292,7 +337,7 @@ export class Engine {
     f: Firing,
     arts: ArtifactMap,
     now: number,
-  ): Order | null {
+  ): Order | 'in-flight' | null {
     const existing = this.store.getTask(workflow, f.loop, f.key);
     if (existing && existing.status === 'claimed') {
       const run = existing.run ? this.store.getRun(existing.run) : undefined;
@@ -300,7 +345,7 @@ export class Engine {
         !!run &&
         run.outcome === undefined &&
         (existing.claimedAt === undefined || now - existing.claimedAt <= this.reapTtlMs);
-      if (fresh) return null; // genuinely in flight — don't double-claim
+      if (fresh) return 'in-flight'; // genuinely in flight — don't double-claim
     }
 
     const runId = randId('run');
