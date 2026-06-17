@@ -318,3 +318,50 @@ export interface WorkflowGraph {
   /** true when artifacts were provided (overlay mode) */
   hasOverlay: boolean;
 }
+
+// ---- model-checker types (§check) -------------------------------------------
+
+/** One step on a BFS path: a loop fired, on which key, with which outcome. */
+export interface CheckStep {
+  loop: string;
+  key: string;      // "" for plain/reduce; element path for map
+  outcome: 'green' | 'judgment-reject' | 'schema-reject' | 'skip' | 'retract' | 'emit-seal';
+}
+
+/** A finding with its shortest witness path from the initial state. */
+export interface CheckFinding {
+  path: CheckStep[];
+}
+
+/** Options for modelCheck — all optional; sane defaults apply. */
+export interface CheckOptions {
+  maxDepth?: number;         // default 50
+  maxStates?: number;        // default 5000
+  maxCollectionSize?: number; // default 2 — max members when fan-out from an emit
+}
+
+/** The structured report produced by modelCheck. */
+export interface CheckReport {
+  def: string;
+  /** True when any BFS bound was hit — verdicts are "within bounds", not global. */
+  bounded: boolean;
+  /** Which bounds were hit, for honest reporting. */
+  boundsHit: ('maxDepth' | 'maxStates')[];
+  /** Reachable states where done=false and eligibleFirings=[]: a genuine deadlock. */
+  deadlocks: CheckFinding[];
+  /** Reachable states that have a stalled debt (judgmentRejects >= cap). */
+  stuck: CheckFinding[];
+  /** Whether any explored state is done, and (when true) one example path to it. */
+  completable: boolean;
+  completePath?: CheckStep[];
+  /**
+   * Loop names that never appear as the firing loop in any explored transition
+   * (dynamically dead within the bounded search).
+   */
+  deadLoops: string[];
+  /** Metadata about the search. */
+  stats: {
+    statesExplored: number;
+    depthReached: number;
+  };
+}

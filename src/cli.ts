@@ -31,7 +31,7 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Engine } from './engine.ts';
-import { buildGraph, buildTrace, graphToDot, graphToMermaid } from './model.ts';
+import { buildGraph, buildTrace, graphToDot, graphToMermaid, modelCheck } from './model.ts';
 import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import { DefError, lintDef, loadDefs, loadDefsRaw } from './defs.ts';
@@ -183,6 +183,8 @@ Usage: oweflow <command> [args] [--db <path>] [--defs <dir>]
 Commands:
   defs                                   list available workflow definitions
   lint [<def-name>]                      check def(s) for wiring problems
+  check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N]
+                                         bounded reachability check (deadlocks, stuck, dead loops)
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
   tick <wf> [--now <ms>]                 pull eligible orders
@@ -233,6 +235,80 @@ function dispatch(command: string, io: CliIO, args: Args): void {
     }
 
     if (hasErrors) throw new CliError('one or more definitions have errors (see above)');
+    return;
+  }
+
+  if (command === 'check') {
+    const defsDir = last(args, 'defs') ?? io.env.OWEFLOW_DEFS ?? join(io.cwd, 'workflows');
+    const defs = existsSync(defsDir) ? loadDefsRaw(defsDir) : new Map<string, WorkflowDef>();
+    const defName = need(args, 1, 'def');
+    const def = defs.get(defName);
+    if (!def) {
+      throw new CliError(
+        `unknown workflow definition '${defName}' (looked in ${defsDir}).\n` +
+        `Known definitions: ${[...defs.keys()].sort().join(', ') || '(none)'}`,
+      );
+    }
+
+    const format = last(args, 'format') ?? 'text';
+    const maxDepth = last(args, 'max-depth') !== undefined ? Number(last(args, 'max-depth')) : undefined;
+    const maxStates = last(args, 'max-states') !== undefined ? Number(last(args, 'max-states')) : undefined;
+    const maxCollection = last(args, 'max-collection') !== undefined ? Number(last(args, 'max-collection')) : undefined;
+
+    const report = modelCheck(def, {
+      ...(maxDepth !== undefined ? { maxDepth } : {}),
+      ...(maxStates !== undefined ? { maxStates } : {}),
+      ...(maxCollection !== undefined ? { maxCollectionSize: maxCollection } : {}),
+    });
+
+    if (format === 'json') {
+      print(io, report);
+    } else {
+      // text format
+      const clean = report.deadlocks.length === 0 && report.stuck.length === 0;
+      const status = clean && report.completable ? 'OK' : clean ? 'INCOMPLETE' : 'DEFECTS FOUND';
+      io.out(`=== oweflow check: ${def.name} ===`);
+      io.out(`Status: ${status}`);
+      io.out(`Completable: ${report.completable ? 'yes' : 'no'}`);
+      io.out(`States explored: ${report.stats.statesExplored}, max depth: ${report.stats.depthReached}`);
+      if (report.bounded) {
+        io.out('');
+        io.out(`SEARCH INCOMPLETE — bounds hit: ${report.boundsHit.join(', ')}`);
+        io.out('Verdicts apply only within the explored region.');
+      }
+      if (report.deadlocks.length > 0) {
+        io.out('');
+        io.out(`Deadlocks (${report.deadlocks.length}):`);
+        for (const d of report.deadlocks) {
+          io.out(`  path: ${d.path.map((s) => `${s.loop}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
+        }
+      }
+      if (report.stuck.length > 0) {
+        io.out('');
+        io.out(`Stuck states (${report.stuck.length}):`);
+        for (const s of report.stuck) {
+          io.out(`  path: ${s.path.map((p) => `${p.loop}/${p.outcome}`).join(' -> ') || '(initial state)'}`);
+        }
+      }
+      if (report.deadLoops.length > 0) {
+        io.out('');
+        io.out(`Dead loops (never fire in explored space): ${report.deadLoops.join(', ')}`);
+      }
+      if (report.completePath) {
+        io.out('');
+        io.out(`Example completion path:`);
+        io.out(`  ${report.completePath.map((s) => `${s.loop}/${s.outcome}`).join(' -> ') || '(already done)'}`);
+      }
+    }
+
+    // Exit codes:
+    // - definite defect (deadlock or stuck and search was EXHAUSTIVE, i.e. !bounded) → nonzero
+    // - truncated (bounded=true) regardless of findings → 0 (truncation is not a defect)
+    // - clean exhaustive search → 0
+    const hasDefiniteDefect = !report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0);
+    if (hasDefiniteDefect) {
+      throw new CliError(`definite defects found (${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`);
+    }
     return;
   }
 

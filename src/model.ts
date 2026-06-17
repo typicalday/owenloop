@@ -22,6 +22,9 @@ import type {
   Acceptance,
   ArtifactBiography,
   ArtifactData,
+  CheckOptions,
+  CheckReport,
+  CheckStep,
   ConsumePattern,
   Fingerprint,
   GraphEdge,
@@ -981,4 +984,443 @@ export function graphToMermaid(g: WorkflowGraph): string {
   }
 
   return lines.join('\n');
+}
+
+// ---- model checker (§check) ---------------------------------------------------
+//
+// A pure bounded BFS over the workflow state space. No store, no engine, no IO.
+// A differential conformance test (test/check.test.ts) pins settleInMemory and
+// applyOutcome to the real Engine field-by-field.
+
+/**
+ * Internal helper — mirrors Engine.applyOp field-spread EXACTLY.
+ * The `reasons` thread is NOT maintained (irrelevant to reachability).
+ * born-rejected (CAS race) omitted — single-threaded exploration.
+ */
+function applyOpInMemory(
+  arts: Map<string, ArtifactData>,
+  def: WorkflowDef,
+  op: CascadeOp,
+): void {
+  const art = arts.get(op.path);
+  if (!art) return;
+  if (op.kind === 'rearm') {
+    // mirrors Engine.applyOp rearm branch: acceptance → 'owed'
+    arts.set(op.path, { ...art, acceptance: 'owed' });
+    return;
+  }
+  if (op.kind === 'skip') {
+    // mirrors Engine.applyOp skip branch: acceptance → 'skipped' + fingerprint
+    arts.set(op.path, {
+      ...art,
+      acceptance: 'skipped',
+      fingerprint: computeFingerprint(arts, requiredInputs(def, arts, art)),
+    });
+    return;
+  }
+  // reject and retract
+  const acceptance: Acceptance = op.kind === 'reject' ? 'rejected' : 'retracted';
+  arts.set(op.path, { ...art, acceptance });
+}
+
+/**
+ * Pure in-memory fixpoint: mirror Engine.settle() without any store or IO.
+ * Clones `arts`, materializes pendingOwed, applies every maintainDecisions op,
+ * repeats until no more changes. Throws on non-convergence (>1000 iterations),
+ * matching the engine's guard. The conformance test pins this to the real Engine.
+ */
+export function settleInMemory(
+  def: WorkflowDef,
+  arts: Map<string, ArtifactData>,
+): Map<string, ArtifactData> {
+  const limit = 1000;
+  for (let i = 0; i < limit; i++) {
+    const owed = pendingOwed(def, arts);
+    for (const a of owed) arts.set(a.path, a);
+
+    const ops = maintainDecisions(def, arts);
+    if (owed.length === 0 && ops.length === 0) return arts;
+    for (const op of ops) {
+      applyOpInMemory(arts, def, op);
+    }
+  }
+  throw new Error(`settleInMemory did not converge (possible cascade cycle)`);
+}
+
+/** Internal: seed the initial artifact map exactly as Engine.createInstance does. */
+function seedArts(def: WorkflowDef): Map<string, ArtifactData> {
+  const arts = new Map<string, ArtifactData>();
+  for (const input of def.inputs) {
+    // seedOwed=false → seed green (version 1); seedOwed=true → seed owed (version 0)
+    // The checker has no runtime `provide` values, so seedOwed inputs start owed.
+    const seedGreen = !input.seedOwed;
+    arts.set(input.name, {
+      workflow: '',
+      path: input.name,
+      producer: input.producer,
+      acceptance: seedGreen ? 'green' : 'owed',
+      version: seedGreen ? 1 : 0,
+      reasons: [],
+      judgmentRejects: 0,
+      schemaRejects: 0,
+    });
+  }
+  return settleInMemory(def, arts);
+}
+
+/** Internal: the eligible outcomes for a given firing. */
+function eligibleOutcomes(
+  def: WorkflowDef,
+  arts: Map<string, ArtifactData>,
+  firing: Firing,
+): CheckStep['outcome'][] {
+  const loop = def.loops.find((l) => l.name === firing.loop);
+  if (!loop) return ['green'];
+  const stem = collectionStem(loop);
+  const outPath = firing.outputs[0] ?? '';
+  const el = parseElement(outPath);
+  const isMember = !!el && el.suffix === '';
+
+  const outcomes: CheckStep['outcome'][] = [];
+  if (stem && !el) {
+    // collection producer (plain loop with collection output) — emit-seal path
+    outcomes.push('emit-seal');
+    return outcomes;
+  }
+
+  outcomes.push('green');
+
+  // judgment-reject is only valid when the firing has at least one consumed input
+  // from a loop producer (not 'human'). A loop can only invalidate artifacts it
+  // didn't originally seed — rejecting a human-provided input is not modeled here
+  // (the engine's assertAuthority enforces this at runtime).
+  const hasRejectableInput = firing.inputs.some((p) => {
+    const a = arts.get(p);
+    return a && a.producer !== 'human' && a.acceptance === 'green';
+  });
+  if (hasRejectableInput) {
+    outcomes.push('judgment-reject');
+  }
+
+  outcomes.push('schema-reject');
+  // skip is valid for any non-retracted output (producer can route dead branch)
+  outcomes.push('skip');
+  // retract only for bare collection members
+  if (isMember) outcomes.push('retract');
+  return outcomes;
+}
+
+/** Internal: emit-seal branches — one map per element count 0..maxCollectionSize. */
+function applyEmitSeal(
+  def: WorkflowDef,
+  arts: Map<string, ArtifactData>,
+  firing: Firing,
+  maxCollectionSize: number,
+): Array<Map<string, ArtifactData>> {
+  const loop = def.loops.find((l) => l.name === firing.loop);
+  if (!loop) return [];
+  const stem = collectionStem(loop);
+  if (!stem) return [];
+  const sealP = sealPath(stem);
+  const sealArt = arts.get(sealP);
+  if (!sealArt) return [];
+
+  const fp = computeFingerprint(arts, firing.inputs);
+  const results: Array<Map<string, ArtifactData>> = [];
+
+  for (let count = 0; count <= maxCollectionSize; count++) {
+    const next = new Map(arts);
+    // determine starting index from existing members
+    let nextIdx = 0;
+    for (const a of arts.values()) {
+      const el = parseElement(a.path);
+      if (el && el.stem === stem && el.suffix === '') nextIdx = Math.max(nextIdx, el.index + 1);
+    }
+    for (let j = 0; j < count; j++) {
+      const p = elementPath(stem, nextIdx + j);
+      next.set(p, {
+        workflow: '',
+        path: p,
+        producer: firing.loop,
+        acceptance: 'green',
+        version: 1,
+        fingerprint: fp,
+        reasons: [],
+        judgmentRejects: 0,
+        schemaRejects: 0,
+      });
+    }
+    // seal it
+    next.set(sealP, {
+      ...sealArt,
+      acceptance: 'green',
+      version: sealArt.version + 1,
+      fingerprint: fp,
+    });
+    results.push(settleInMemory(def, next));
+  }
+  return results;
+}
+
+/**
+ * Given a firing and a nondeterministic outcome, produce the post-commit
+ * in-memory state (cloned from arts) then run settleInMemory.
+ *
+ * Outcomes modeled (single-threaded; born-rejected CAS races omitted):
+ *   'green'           — singleton/map output: acceptance green, version+1,
+ *                       fingerprint = computeFingerprint(arts, firing.inputs)
+ *   'judgment-reject' — reject the primary consumed input (the green artifact
+ *                       the loop consumes that it has authority to invalidate),
+ *                       bumping judgmentRejects+1
+ *   'schema-reject'   — acceptance rejected, schemaRejects+1 on the output
+ *   'skip'            — acceptance skipped + fingerprint of requiredInputs
+ *   'retract'         — acceptance retracted (collection member only)
+ *   'emit-seal'       — collection producer: emit 1..maxCollectionSize green elements,
+ *                       then seal; forks into (maxCollectionSize+1) successor states
+ *
+ * Returns an array of successor states (>1 only for emit-seal). Each successor
+ * is already settled.
+ */
+export function applyOutcome(
+  def: WorkflowDef,
+  arts: Map<string, ArtifactData>,
+  firing: Firing,
+  outcome: CheckStep['outcome'],
+  opts: { maxCollectionSize: number },
+): Array<Map<string, ArtifactData>> {
+  // emit-seal branches: return one map per element count 0..maxCollectionSize
+  if (outcome === 'emit-seal') {
+    return applyEmitSeal(def, arts, firing, opts.maxCollectionSize);
+  }
+
+  // all other outcomes: single successor
+  const next = new Map(arts);
+  const outPath = firing.outputs[0];
+
+  if (outcome === 'judgment-reject') {
+    // judgment-reject is a CONSUMER action on a CONSUMED artifact, not on the output.
+    // Identify the "reject target" — the primary consumed artifact that this
+    // firing loop can invalidate. This is the first input that has a loop producer
+    // (not 'human') and is currently green. If no such input exists, this outcome
+    // is a no-op (eligibleOutcomes guards against this case).
+    const rejectTarget = firing.inputs.find((p) => {
+      const a = next.get(p);
+      return a && a.producer !== 'human' && a.acceptance === 'green';
+    });
+
+    if (rejectTarget !== undefined) {
+      const targetArt = next.get(rejectTarget);
+      if (targetArt) {
+        next.set(rejectTarget, {
+          ...targetArt,
+          acceptance: 'rejected',
+          judgmentRejects: targetArt.judgmentRejects + 1,
+        });
+      }
+    }
+    return [settleInMemory(def, next)];
+  }
+
+  if (!outPath) return [settleInMemory(def, next)];
+  const art = next.get(outPath);
+  if (!art) return [settleInMemory(def, next)];
+
+  const loop = def.loops.find((l) => l.name === firing.loop);
+
+  if (outcome === 'green') {
+    const fp = computeFingerprint(arts, firing.inputs);
+    const updated: ArtifactData = {
+      ...art,
+      acceptance: 'green',
+      version: art.version + 1,
+      fingerprint: fp,
+    };
+    if (loop?.terminal) updated.terminal = true;
+    next.set(outPath, updated);
+  } else if (outcome === 'schema-reject') {
+    next.set(outPath, {
+      ...art,
+      acceptance: 'rejected',
+      schemaRejects: art.schemaRejects + 1,
+    });
+  } else if (outcome === 'skip') {
+    next.set(outPath, {
+      ...art,
+      acceptance: 'skipped',
+      fingerprint: computeFingerprint(arts, requiredInputs(def, arts, art)),
+    });
+  } else if (outcome === 'retract') {
+    next.set(outPath, { ...art, acceptance: 'retracted' });
+  }
+
+  return [settleInMemory(def, next)];
+}
+
+/**
+ * Canonical key for a state map — used by the BFS visited-set.
+ *
+ * Normalization rules (so equivalent states deduplicate):
+ *   acceptance: stored as-is (5 values)
+ *   version: NORMALIZED to rank:
+ *     0 = never-green (version 0, acceptance != green)
+ *     1 = currently green (version >= 1, acceptance == green)
+ *     2 = was-green-now-moved (version >= 1, acceptance != green)
+ *   judgmentRejects: BUCKETED to min(count, maxAttempts) so that e.g. 0, 1, 2
+ *     are distinct but anything >= cap is the same (frozen state)
+ *   schemaRejects: BUCKETED to min(count, maxSchemaFailures) similarly
+ *
+ * For 'skipped' artifacts, the fingerprint is encoded as sorted "inputPath:versionRank"
+ * pairs to capture rearm eligibility correctly.
+ */
+function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string {
+  const parts: string[] = [];
+  const loopMap = new Map(def.loops.map((l) => [l.name, l]));
+
+  for (const [path, art] of [...arts.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const loop = loopMap.get(art.producer);
+    const maxAttempts = loop?.maxAttempts ?? 3;
+    const maxSchema = loop?.maxSchemaFailures ?? 5;
+
+    const vRank = art.version === 0 ? 0 : art.acceptance === 'green' ? 1 : 2;
+    const jBucket = Math.min(art.judgmentRejects, maxAttempts);
+    const sBucket = Math.min(art.schemaRejects, maxSchema);
+
+    let entry = `${path}:${art.acceptance}:${vRank}:${jBucket}:${sBucket}`;
+
+    // For skipped: encode fingerprint as sorted "fPath:fRank" pairs
+    if (art.acceptance === 'skipped' && art.fingerprint) {
+      const fpParts = Object.entries(art.fingerprint)
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([k, v]) => {
+          const dep = arts.get(k);
+          const depRank = v === 0 ? 0 : dep?.acceptance === 'green' ? 1 : 2;
+          return `${k}@${depRank}`;
+        })
+        .join(',');
+      entry += `|fp:${fpParts}`;
+    }
+    parts.push(entry);
+  }
+  return parts.join(';');
+}
+
+/**
+ * Bounded reachability / liveness checker over a workflow definition.
+ *
+ * Explores the full (or depth/state-bounded) state space via BFS to find:
+ * - deadlocks: reachable states that are not done and have no eligible firings
+ * - stuck states: reachable states with a stalled debt
+ * - completability: whether any reachable state is done (with an example path)
+ * - dead loops: loops whose name never appears as a firing in any explored transition
+ *
+ * Pure — no store, no engine, no IO.
+ */
+export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckReport {
+  const maxDepth = opts.maxDepth ?? 50;
+  const maxStates = opts.maxStates ?? 5000;
+  const maxCollectionSize = opts.maxCollectionSize ?? 2;
+
+  const initial = seedArts(def);
+  const initialKey = canonicalKey(def, initial);
+
+  type StateNode = {
+    arts: Map<string, ArtifactData>;
+    path: CheckStep[];
+    depth: number;
+  };
+
+  const visited = new Map<string, CheckStep[]>(); // key → path to reach it
+  visited.set(initialKey, []);
+  const queue: StateNode[] = [{ arts: initial, path: [], depth: 0 }];
+
+  const report: CheckReport = {
+    def: def.name,
+    bounded: false,
+    boundsHit: [],
+    deadlocks: [],
+    stuck: [],
+    completable: false,
+    completePath: undefined,
+    deadLoops: [],
+    stats: { statesExplored: 0, depthReached: 0 },
+  };
+
+  const firedLoops = new Set<string>();
+  let depthReached = 0;
+  const boundsHit = new Set<'maxDepth' | 'maxStates'>();
+
+  while (queue.length > 0) {
+    const node = queue.shift()!;
+    report.stats.statesExplored++;
+    if (node.depth > depthReached) depthReached = node.depth;
+
+    const status = workflowStatus(def, node.arts);
+
+    // Check done
+    if (status.done) {
+      if (!report.completable) {
+        report.completable = true;
+        report.completePath = node.path;
+      }
+      continue; // done states have no successors
+    }
+
+    // Check stuck (any debt.stalled)
+    if (status.debts.some((d) => d.stalled)) {
+      report.stuck.push({ path: node.path });
+      // continue exploring (there may be other paths)
+    }
+
+    const firings = status.eligible;
+
+    // Check deadlock: non-done, no eligible firings
+    if (firings.length === 0 && !status.done) {
+      report.deadlocks.push({ path: node.path });
+      continue;
+    }
+
+    // Respect maxDepth
+    if (node.depth >= maxDepth) {
+      boundsHit.add('maxDepth');
+      continue;
+    }
+
+    // Expand successors
+    outer: for (const firing of firings) {
+      firedLoops.add(firing.loop);
+      const outcomes = eligibleOutcomes(def, node.arts, firing);
+
+      for (const outcome of outcomes) {
+        // Check state count before expanding
+        if (visited.size >= maxStates) {
+          boundsHit.add('maxStates');
+          break outer;
+        }
+
+        const step: CheckStep = { loop: firing.loop, key: firing.key, outcome };
+        const successors = applyOutcome(def, node.arts, firing, outcome, { maxCollectionSize });
+
+        for (const suc of successors) {
+          const key = canonicalKey(def, suc);
+          if (!visited.has(key)) {
+            const newPath = [...node.path, step];
+            visited.set(key, newPath);
+            queue.push({ arts: suc, path: newPath, depth: node.depth + 1 });
+          }
+        }
+      }
+    }
+    if (boundsHit.has('maxStates')) break;
+  }
+
+  report.stats.depthReached = depthReached;
+  report.boundsHit = [...boundsHit];
+  report.bounded = boundsHit.size > 0;
+
+  // Dead loops: loops in the def that never appeared as a firing.loop
+  report.deadLoops = def.loops
+    .filter((l) => !firedLoops.has(l.name))
+    .map((l) => l.name);
+
+  return report;
 }

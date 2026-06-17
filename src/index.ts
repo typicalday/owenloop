@@ -33,6 +33,7 @@ export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
 export { buildDef, DefError, lintDef, loadDefFile, loadDefs, parseDef, validateDef } from './defs.ts';
 
 export {
+  applyOutcome,
   buildGraph,
   buildTrace,
   collectionProduces,
@@ -43,6 +44,8 @@ export {
   isStalled,
   maintainDecisions,
   mapProduce,
+  modelCheck,
+  settleInMemory,
   singletonProduces,
   workflowStatus,
 } from './model.ts';
@@ -62,6 +65,10 @@ export type {
   ArtifactBiography,
   ArtifactData,
   Author,
+  CheckFinding,
+  CheckOptions,
+  CheckReport,
+  CheckStep,
   ConsumePattern,
   Fingerprint,
   GraphEdge,
