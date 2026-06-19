@@ -313,15 +313,7 @@ function buildLoop(rl: RawLoop, i: number): LoopDef {
     }
     if (rawEffect['onInvalidate'] !== undefined) {
       const oi = asString(rawEffect['onInvalidate'], `loop '${name}'.effect.onInvalidate`);
-      if (oi !== 'pin' && oi !== 'escalate') {
-        // Named-handler routing is not yet supported; throw immediately (consistent
-        // with how parseDurationSecs throws on bad cadence strings in buildLoop).
-        throw new DefError(
-          `loop '${name}': effect.onInvalidate must be 'pin' or 'escalate'; ` +
-          `named-handler routing ('${oi}') is not yet supported and is a planned follow-up`,
-        );
-      }
-      effectDef.onInvalidate = oi;
+      effectDef.onInvalidate = oi; // any string accepted here; D-D checks in validateDef
     }
     loop.effect = effectDef;
   }
@@ -470,15 +462,18 @@ export function validateDef(def: WorkflowDef): string[] {
         `effect: is the forward spelling — remove terminal: true`,
       );
     }
-    // onInvalidate validation: only 'pin' and 'escalate' are valid
-    // (Named-handler strings are caught in buildLoop via DefError throw, so this
-    //  branch is a belt-and-suspenders guard for any value that bypasses buildLoop.)
+    // onInvalidate validation (D-D cross-reference checks for named-handler strings)
     const oi = l.effect.onInvalidate;
     if (oi !== undefined && oi !== 'pin' && oi !== 'escalate') {
-      errors.push(
-        `loop '${l.name}': effect.onInvalidate must be 'pin' or 'escalate'; ` +
-        `named-handler routing ('${oi}') is not yet supported and is a planned follow-up`,
-      );
+      // Named handler: cross-reference checks
+      const handlerLoop = def.loops.find((h) => h.name === oi);
+      if (!handlerLoop) {
+        errors.push(`loop '${l.name}': effect.onInvalidate '${oi}' names a loop that does not exist in this workflow`);
+      } else if (oi === l.name) {
+        errors.push(`loop '${l.name}': effect.onInvalidate '${oi}' names itself; a loop cannot be its own handler`);
+      } else if (handlerLoop.produces.length === 0) {
+        errors.push(`loop '${l.name}': effect.onInvalidate handler '${oi}' produces no outputs; a handler must produce at least one output`);
+      }
     }
   }
 

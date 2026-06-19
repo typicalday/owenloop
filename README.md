@@ -402,7 +402,31 @@ structural regardless of `effect:` — only the moved-version re-arm path routes
 | _(none)_ or `effect: { idempotent: true }` | true | — | re-arm (structural reject) as today |
 | `effect: { idempotent: false, onInvalidate: 'pin' }` | false | pin | stay green, re-point fingerprint |
 | `effect: { idempotent: false, onInvalidate: 'escalate' }` | false | escalate | reject-and-hold; stalled |
+| `effect: { idempotent: false, onInvalidate: '<loopName>' }` | false | loopName | pin original + arm named handler |
 | `terminal: true` | false | pin | stay green + lint-exempt (legacy) |
+
+**`onInvalidate: '<loopName>'`** (named-handler routing) pins the original artifact
+green and arms the named handler loop — materializing its outputs as `owed` so it becomes
+eligible next tick. The handler is an ordinary forward-producer loop; the engine sequences
+nothing beyond making it eligible. Example:
+
+```yaml
+loops:
+  - name: merger
+    consumes: [pr]
+    produces: [merge]
+    effect:
+      idempotent: false
+      onInvalidate: reverter    # arms the 'reverter' loop on invalidation
+  - name: reverter
+    consumes: [merge]           # reverter consumes whatever it needs to undo
+    produces: [revert]          # normal forward producer
+```
+
+The handler is dormant at instance creation (its outputs are not seeded `owed` until L is
+first invalidated). If the input moves again after the handler has greened, the handler is
+re-armed automatically. This does NOT auto-redo the irreversible step — it routes a
+compensating forward action (§6.6).
 
 ### `on:` — the loop firing trigger
 

@@ -60,7 +60,8 @@ export type CascadeOp =
   | { kind: 'retract'; path: string; reason: string } // tombstone a map child of a retracted element
   | { kind: 'skip'; path: string; reason: string } // cascade skip down a dead branch
   | { kind: 'rearm'; path: string; reason: string } // skipped→owed when the branch revives
-  | { kind: 'pin'; path: string; reason: string }; // stays green, fingerprint re-pointed to current inputs
+  | { kind: 'pin'; path: string; reason: string } // stays green, fingerprint re-pointed to current inputs
+  | { kind: 'arm'; handlerLoop: string; reason: string; path?: undefined }; // arm a handler loop on invalidation of L
 
 // ---- loop shape classification ----------------------------------------------
 
@@ -143,7 +144,7 @@ function frozen(a: ArtifactData | undefined, loop: LoopDef): boolean {
 }
 
 /** Resolve the effective effect contract for a loop. Defaults: idempotent=true. */
-function resolvedEffect(loop: LoopDef | undefined): { idempotent: boolean; onInvalidate: 'pin' | 'escalate' } {
+function resolvedEffect(loop: LoopDef | undefined): { idempotent: boolean; onInvalidate: 'pin' | 'escalate' | string } {
   const idempotent = loop?.effect?.idempotent ?? true;
   const onInvalidate = loop?.effect?.onInvalidate ?? 'escalate';
   return { idempotent, onInvalidate };
@@ -268,7 +269,16 @@ export function pendingOwed(def: WorkflowDef, arts: ArtifactMap): ArtifactData[]
     out.push(a);
   };
 
+  // D-A: handler loops are dormant at creation — exclude their outputs from normal seeding.
+  // A loop H is a handler iff some other loop L declares effect.onInvalidate === H.name.
+  const handlerLoopNames = new Set<string>();
   for (const loop of def.loops) {
+    const oi = loop.effect?.onInvalidate;
+    if (oi && oi !== 'pin' && oi !== 'escalate') handlerLoopNames.add(oi);
+  }
+
+  for (const loop of def.loops) {
+    if (handlerLoopNames.has(loop.name)) continue; // handler: dormant, skip normal seeding
     const mode = loopMode(loop);
     if (mode === 'map') {
       const mc = mapConsume(loop);
@@ -482,6 +492,11 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap): CascadeO
       } else if (effect.onInvalidate === 'pin') {
         // Pin: keep green, re-point fingerprint to current input versions. Producer does not re-fire.
         ops.push({ kind: 'pin', path: art.path, reason: `pinned: ${moved ?? 'an input'} moved; held green per effect.onInvalidate=pin` });
+      } else if (effect.onInvalidate !== 'escalate') {
+        // Named handler (D-B): pin the original L + arm the handler H.
+        // Pin re-points fingerprint so the next pass sees invariant holds (no thrash, D-C).
+        ops.push({ kind: 'pin', path: art.path, reason: `pinned: ${moved ?? 'an input'} moved; original kept green, handler '${effect.onInvalidate}' armed` });
+        ops.push({ kind: 'arm', handlerLoop: effect.onInvalidate, reason: `handler '${effect.onInvalidate}' armed: L='${art.producer}' artifact pinned on input move` });
       } else {
         // Escalate: reject-and-hold — producer must not auto-fire; surfaces as stalled.
         ops.push({ kind: 'reject', path: art.path, held: true, reason: `held: ${moved ?? 'an input'} moved; irreversible — escalate to human (effect.onInvalidate=escalate)` });
@@ -1150,6 +1165,52 @@ function applyOpInMemory(
   def: WorkflowDef,
   op: CascadeOp,
 ): void {
+  if (op.kind === 'arm') {
+    // Arm the handler: materialize each of its singleton/collection outputs as owed
+    // if absent, or re-arm to owed if currently green (re-invalidation, D-C re-arm).
+    const handlerLoop = def.loops.find((l) => l.name === op.handlerLoop);
+    if (!handlerLoop) return;
+    for (const p of handlerLoop.produces.filter((pp) => pp.kind === 'singleton')) {
+      const existing = arts.get(p.stem);
+      if (!existing) {
+        arts.set(p.stem, {
+          workflow: '',
+          path: p.stem,
+          producer: handlerLoop.name,
+          acceptance: 'owed',
+          version: 0,
+          reasons: [],
+          judgmentRejects: 0,
+          schemaRejects: 0,
+        });
+      } else if (existing.acceptance === 'green') {
+        // Re-invalidation: H already fired once; re-arm it.
+        arts.set(p.stem, { ...existing, acceptance: 'owed' });
+      }
+      // If owed or rejected already, no change needed (already a debt).
+    }
+    // Collection seals: same pattern on sealPath(stem).
+    for (const p of handlerLoop.produces.filter((pp) => pp.kind === 'collection')) {
+      const sealKey = p.stem + '.sealed';
+      const existing = arts.get(sealKey);
+      if (!existing) {
+        arts.set(sealKey, {
+          workflow: '',
+          path: sealKey,
+          producer: handlerLoop.name,
+          acceptance: 'owed',
+          version: 0,
+          reasons: [],
+          judgmentRejects: 0,
+          schemaRejects: 0,
+          sealOf: p.stem,
+        });
+      } else if (existing.acceptance === 'green') {
+        arts.set(sealKey, { ...existing, acceptance: 'owed' });
+      }
+    }
+    return;
+  }
   const art = arts.get(op.path);
   if (!art) return;
   if (op.kind === 'rearm') {

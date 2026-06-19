@@ -817,6 +817,59 @@ export class Engine {
   }
 
   private applyOp(workflow: string, def: WorkflowDef, arts: ArtifactMap, op: CascadeOp): void {
+    if (op.kind === 'arm') {
+      const handlerLoop = def.loops.find((l) => l.name === op.handlerLoop);
+      if (!handlerLoop) return;
+      // Singleton outputs
+      for (const p of handlerLoop.produces.filter((pp) => pp.kind === 'singleton')) {
+        const existing = arts.get(p.stem);
+        if (!existing) {
+          this.store.putArtifact({
+            workflow,
+            path: p.stem,
+            producer: handlerLoop.name,
+            acceptance: 'owed',
+            version: 0,
+            reasons: [reason('reopen', 'structural', 'engine', op.reason, 0)],
+            judgmentRejects: 0,
+            schemaRejects: 0,
+          });
+        } else if (existing.acceptance === 'green') {
+          // Re-arm: H fired before; re-invalidation re-arms it.
+          this.store.putArtifact({
+            ...existing,
+            acceptance: 'owed',
+            reasons: [...existing.reasons, reason('reopen', 'structural', 'engine', op.reason, existing.version)],
+          });
+        }
+        // owed/rejected: already a debt, no change.
+      }
+      // Collection seals
+      for (const p of handlerLoop.produces.filter((pp) => pp.kind === 'collection')) {
+        const sealKey = p.stem + '.sealed';
+        const existing = arts.get(sealKey);
+        if (!existing) {
+          this.store.putArtifact({
+            workflow,
+            path: sealKey,
+            producer: handlerLoop.name,
+            acceptance: 'owed',
+            version: 0,
+            reasons: [reason('reopen', 'structural', 'engine', op.reason, 0)],
+            judgmentRejects: 0,
+            schemaRejects: 0,
+            sealOf: p.stem,
+          });
+        } else if (existing.acceptance === 'green') {
+          this.store.putArtifact({
+            ...existing,
+            acceptance: 'owed',
+            reasons: [...existing.reasons, reason('reopen', 'structural', 'engine', op.reason, existing.version)],
+          });
+        }
+      }
+      return;
+    }
     const art = arts.get(op.path);
     if (!art) return;
     if (op.kind === 'rearm') {

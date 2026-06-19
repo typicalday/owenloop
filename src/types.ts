@@ -162,12 +162,11 @@ export interface EffectDef {
    *  When false, the artifact must not silently re-fire. */
   idempotent?: boolean;
   /** Routing when idempotent:false and an input moves.
-   *  'pin'      — keep the artifact green, re-point fingerprint to current inputs.
-   *  'escalate' — reject the artifact as held; producer not auto-re-eligible.
-   *  Defaults to 'escalate' when idempotent:false and omitted.
-   *  Named-handler routing ('onInvalidate: <loopName>') is a planned follow-up;
-   *  any non-pin/escalate string is a hard validateDef error. */
-  onInvalidate?: 'pin' | 'escalate';
+   *  'pin'        — keep the artifact green, re-point fingerprint to current inputs.
+   *  'escalate'   — reject the artifact as held; producer not auto-re-eligible.
+   *  '<loopName>' — pin the original AND arm the named handler loop (D-A/D-B).
+   *  Defaults to 'escalate' when idempotent:false and omitted. */
+  onInvalidate?: 'pin' | 'escalate' | string;
 }
 
 /** A loop (step) definition. */

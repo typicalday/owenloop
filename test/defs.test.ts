@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildDef, DefError, lintDef, loadDefFile, loadDefs, parseDef, validateDef } from '../src/defs.ts';
+import { def, input, loop } from './helpers.ts';
 
 const delivery = {
   name: 'delivery',
@@ -1036,4 +1037,76 @@ test('parseDef: on: omitted → valid, on is undefined', () => {
     loops: [{ name: 'a', consumes: ['seed'], produces: ['out'] }],
   });
   assert.equal(d.loops[0]!.on, undefined);
+});
+
+// ---- D-D named-handler validateDef tests -------------------------------------
+
+test('D-D: non-existent handler → validateDef error', () => {
+  const d = def('test', [input('x')], [
+    loop({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'nonexistent' } }),
+  ]);
+  const errors = validateDef(d);
+  assert.ok(errors.some((e) => e.includes('does not exist') || e.includes('nonexistent')),
+    `expected error about non-existent handler; errors: ${errors.join('; ')}`);
+});
+
+test('D-D: self-handler → validateDef error', () => {
+  const d = def('test', [input('x')], [
+    loop({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'worker' } }),
+  ]);
+  const errors = validateDef(d);
+  assert.ok(errors.some((e) => e.includes('cannot be its own handler') || e.includes('names itself')),
+    `expected error about self-handler; errors: ${errors.join('; ')}`);
+});
+
+test('D-D: handler produces nothing → validateDef error', () => {
+  // Construct a handler loop with no produces by using the helper and overriding produces
+  const handlerLoop = { ...loop({ name: 'noop', consumes: [], produces: [] }), produces: [] };
+  const d = def('test', [input('x')], [
+    loop({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'noop' } }),
+    handlerLoop,
+  ]);
+  const errors = validateDef(d);
+  assert.ok(errors.some((e) => e.includes('produces no outputs') || e.includes('at least one output')),
+    `expected error about handler producing no outputs; errors: ${errors.join('; ')}`);
+});
+
+test('D-D: pin still valid (no error from named-handler check)', () => {
+  const d = def('test', [input('x')], [
+    loop({ name: 'w', consumes: ['x'], produces: ['y'], effect: { idempotent: false, onInvalidate: 'pin' } }),
+  ]);
+  // pin is a built-in, must produce no error from D-D check
+  const errors = validateDef(d).filter((e) => e.includes('onInvalidate') && !e.includes('terminal'));
+  assert.deepEqual(errors, [], `pin must produce no onInvalidate error; errors: ${errors.join('; ')}`);
+});
+
+test('D-D: escalate still valid (no error from named-handler check)', () => {
+  const d = def('test', [input('x')], [
+    loop({ name: 'w', consumes: ['x'], produces: ['y'], effect: { idempotent: false, onInvalidate: 'escalate' } }),
+  ]);
+  const errors = validateDef(d).filter((e) => e.includes('onInvalidate') && !e.includes('terminal'));
+  assert.deepEqual(errors, [], `escalate must produce no onInvalidate error; errors: ${errors.join('; ')}`);
+});
+
+test('D-D: valid named-handler → no validateDef error for onInvalidate', () => {
+  const d = def('test', [input('x')], [
+    loop({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'handler' } }),
+    loop({ name: 'handler', consumes: ['out'], produces: ['done'] }),
+  ]);
+  const errors = validateDef(d).filter((e) => e.includes('onInvalidate'));
+  assert.deepEqual(errors, [], `valid named handler must produce no onInvalidate error; errors: ${errors.join('; ')}`);
+});
+
+test('D-D: buildDef with valid named-handler passes (no throw)', () => {
+  // buildDef no longer throws for named-handler strings; defers to validateDef.
+  assert.doesNotThrow(() => {
+    buildDef({
+      name: 'test',
+      inputs: [{ name: 'x' }],
+      loops: [
+        { name: 'worker', consumes: ['x'], produces: ['out'], effect: { onInvalidate: 'handler' } },
+        { name: 'handler', consumes: ['out'], produces: ['done'] },
+      ],
+    });
+  }, 'buildDef must not throw for a valid named-handler string');
 });

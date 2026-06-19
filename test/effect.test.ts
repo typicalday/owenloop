@@ -20,7 +20,7 @@ import {
   settleInMemory,
   workflowStatus,
 } from '../src/model.ts';
-import { buildDef, DefError, validateDef } from '../src/defs.ts';
+import { buildDef, validateDef } from '../src/defs.ts';
 import { arts, def, input, loop } from './helpers.ts';
 import type { ArtifactData } from '../src/types.ts';
 
@@ -211,23 +211,20 @@ test('(e) non-idempotent + escalate: rejected-and-held, not eligible, surfaces a
 
 // ---- (f) Def validation hard errors -----------------------------------------
 
-test('(f) def validation: unknown onInvalidate string is a hard error', () => {
-  // buildDef throws DefError for invalid onInvalidate string in buildLoop
-  assert.throws(
-    () => {
-      buildDef({
-        name: 'bad',
-        inputs: [{ name: 'x' }],
-        loops: [
-          { name: 'foo', consumes: ['x'], produces: ['y'], effect: { onInvalidate: 'frobnicate' } },
-        ],
-      });
-    },
-    (err: unknown) => {
-      const msg = (err as Error).message;
-      return msg.includes('not yet supported') || msg.includes('named-handler');
-    },
-    'should throw mentioning named-handler / not yet supported',
+test('(f) def validation: unknown onInvalidate loop name is a validateDef error', () => {
+  // buildDef no longer throws for named-handler strings in buildLoop;
+  // validateDef (D-D) reports an error when the handler loop doesn't exist.
+  const d = buildDef({
+    name: 'bad',
+    inputs: [{ name: 'x' }],
+    loops: [
+      { name: 'foo', consumes: ['x'], produces: ['y'], effect: { onInvalidate: 'frobnicate' } },
+    ],
+  });
+  const errors = validateDef(d);
+  assert.ok(
+    errors.some((e) => e.includes('does not exist') || e.includes('frobnicate')),
+    `expected error mentioning non-existent handler; errors: ${errors.join('; ')}`,
   );
 });
 
@@ -248,18 +245,19 @@ test('(f) def validation: terminal:true and effect: are mutually exclusive', () 
 
 // ---- Alternative (f) tests using direct imports for cleaner coverage --------
 
-test('(f) buildDef: onInvalidate=frobnicate throws DefError', () => {
-  // buildDef throws DefError immediately for an unknown onInvalidate string.
-  assert.throws(
-    () => buildDef({
-      name: 'test',
-      inputs: [{ name: 'src' }],
-      loops: [
-        { name: 'worker', consumes: ['src'], produces: ['out'], effect: { onInvalidate: 'frobnicate' } },
-      ],
-    }),
-    DefError,
-    'buildDef must throw DefError for unknown onInvalidate string',
+test('(f) validateDef: onInvalidate=frobnicate → error mentioning non-existent handler', () => {
+  // buildDef no longer throws for named-handler strings; validateDef (D-D) catches them.
+  const d = buildDef({
+    name: 'test',
+    inputs: [{ name: 'src' }],
+    loops: [
+      { name: 'worker', consumes: ['src'], produces: ['out'], effect: { onInvalidate: 'frobnicate' } },
+    ],
+  });
+  const errors = validateDef(d);
+  assert.ok(
+    errors.some((e) => e.includes('does not exist') || e.includes('frobnicate')),
+    `expected error mentioning non-existent handler; errors: ${errors.join('; ')}`,
   );
 });
 
@@ -318,4 +316,250 @@ test('(g) dead-input cascade for non-idempotent loop is unconditionally structur
     `expected an op for gather.source[0].check; got: ${JSON.stringify(ops)}`);
   assert.equal(checkOp!.kind, 'retract',
     `expected retract (structural dead-input cascade), not pin; got: ${checkOp!.kind}`);
+});
+
+// ---- (h) Back-compat: pin/escalate/idempotent unchanged by named-handler code ---
+
+test('(h) back-compat: pin still pins (not armed) when onInvalidate=pin', () => {
+  const d = def(
+    'delivery',
+    [input('proposal')],
+    [
+      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      loop({ name: 'builder', consumes: ['plan'], produces: ['pr'], effect: { idempotent: false, onInvalidate: 'pin' } }),
+    ],
+  );
+
+  // pr is green built on plan v1; plan has moved to v2
+  const a = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
+    { path: 'plan', producer: 'planner', acceptance: 'green', version: 2, fingerprint: { proposal: 1 } },
+    { path: 'pr', producer: 'builder', acceptance: 'green', version: 1, fingerprint: { plan: 1 } },
+  ]);
+
+  const ops = maintainDecisions(d, a);
+  // Must produce a pin op for pr — not an arm op
+  assert.ok(ops.some((op) => op.kind === 'pin' && op.path === 'pr'),
+    `expected pin op for 'pr'; got: ${JSON.stringify(ops)}`);
+  assert.ok(!ops.some((op) => op.kind === 'arm'),
+    `should not produce any arm op for pin behavior; got: ${JSON.stringify(ops)}`);
+});
+
+test('(h) back-compat: escalate still rejects-and-holds (not armed) when onInvalidate=escalate', () => {
+  const d = def(
+    'delivery',
+    [input('proposal')],
+    [
+      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      loop({ name: 'builder', consumes: ['plan'], produces: ['pr'], effect: { idempotent: false, onInvalidate: 'escalate' } }),
+    ],
+  );
+
+  // pr is green built on plan v1; plan has moved to v2
+  const a = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
+    { path: 'plan', producer: 'planner', acceptance: 'green', version: 2, fingerprint: { proposal: 1 } },
+    { path: 'pr', producer: 'builder', acceptance: 'green', version: 1, fingerprint: { plan: 1 } },
+  ]);
+
+  const ops = maintainDecisions(d, a);
+  assert.ok(
+    ops.some((op) => op.kind === 'reject' && op.path === 'pr' && 'held' in op && (op as { held?: boolean }).held === true),
+    `expected reject+held op for 'pr'; got: ${JSON.stringify(ops)}`,
+  );
+  assert.ok(!ops.some((op) => op.kind === 'arm'),
+    `should not produce any arm op for escalate behavior; got: ${JSON.stringify(ops)}`);
+});
+
+// ---- (i) Dormancy: handler has no owed output at creation, not eligible -------
+
+test('(i) dormancy: handler output absent at creation, not eligible', () => {
+  // def: proposal → planner → plan; planner → pr (effect.onInvalidate: 'reverter'); reverter → revert
+  const d = def(
+    'delivery',
+    [input('proposal')],
+    [
+      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      loop({
+        name: 'builder',
+        consumes: ['plan'],
+        produces: ['pr'],
+        effect: { idempotent: false, onInvalidate: 'reverter' },
+      }),
+      loop({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
+    ],
+  );
+
+  // Only proposal is green; settle from seed
+  const a: Map<string, ArtifactData> = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
+  ]) as Map<string, ArtifactData>;
+  const settled = settleInMemory(d, a);
+
+  // 'revert' must NOT be in arts as owed — handler output dormant at creation
+  const revert = settled.get('revert');
+  assert.ok(!revert || revert.acceptance !== 'owed',
+    `handler output 'revert' must not be owed at creation; got: ${JSON.stringify(revert)}`);
+
+  // No firing eligible for 'reverter'
+  const ef = eligibleFirings(d, settled);
+  assert.ok(!ef.some((f) => f.loop === 'reverter'),
+    `reverter must not be eligible at creation; eligible: ${ef.map((f) => f.loop).join(', ')}`);
+});
+
+// ---- (j) Arm-on-invalidation: L pinned + H owed + H eligible after input moves ---
+
+test('(j) arm-on-invalidation: L pinned, H owed, H eligible after input moves; green H → done', () => {
+  // plan is green built on proposal v1; proposal moves to v2
+  const d = def(
+    'delivery',
+    [input('proposal')],
+    [
+      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      loop({
+        name: 'builder',
+        consumes: ['plan'],
+        produces: ['pr'],
+        effect: { idempotent: false, onInvalidate: 'reverter' },
+      }),
+      loop({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
+    ],
+  );
+
+  // pr is green built on plan v1; plan has since moved to v2 (proposal changed, planner re-fired)
+  const artMap: Map<string, ArtifactData> = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 2 },
+    { path: 'plan', producer: 'planner', acceptance: 'green', version: 2, fingerprint: { proposal: 2 } },
+    { path: 'pr', producer: 'builder', acceptance: 'green', version: 1, fingerprint: { plan: 1 } },
+  ]) as Map<string, ArtifactData>;
+
+  // maintainDecisions: expect a pin op for pr AND an arm op with handlerLoop='reverter'
+  const ops = maintainDecisions(d, artMap);
+  assert.ok(ops.some((op) => op.kind === 'pin' && op.path === 'pr'),
+    `expected pin op for 'pr'; got: ${JSON.stringify(ops)}`);
+  assert.ok(ops.some((op) => op.kind === 'arm' && op.handlerLoop === 'reverter'),
+    `expected arm op for 'reverter'; got: ${JSON.stringify(ops)}`);
+
+  // settleInMemory: plan stays green, revert is owed
+  const settled = settleInMemory(d, artMap);
+
+  assert.equal(settled.get('pr')!.acceptance, 'green', 'pr must remain green after pin');
+  assert.equal(settled.get('revert')?.acceptance, 'owed', `revert must be owed after arm; got: ${JSON.stringify(settled.get('revert'))}`);
+
+  // eligibleFirings: reverter appears; builder does not (pr is green)
+  const ef = eligibleFirings(d, settled);
+  assert.ok(ef.some((f) => f.loop === 'reverter'),
+    `reverter must be eligible after arm; eligible: ${ef.map((f) => f.loop).join(', ')}`);
+  assert.ok(!ef.some((f) => f.loop === 'builder'),
+    `builder must not be eligible (pr is green); eligible: ${ef.map((f) => f.loop).join(', ')}`);
+});
+
+// ---- (k) No-thrash: second pass yields no new op, H not re-armed twice --------
+
+test('(k) no-thrash: second maintainDecisions pass yields no new arm op', () => {
+  const d = def(
+    'delivery',
+    [input('proposal')],
+    [
+      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      loop({
+        name: 'builder',
+        consumes: ['plan'],
+        produces: ['pr'],
+        effect: { idempotent: false, onInvalidate: 'reverter' },
+      }),
+      loop({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
+    ],
+  );
+
+  // Start from state after first invalidation + pin (pr pinned with updated fingerprint, revert owed)
+  const artMap: Map<string, ArtifactData> = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 2 },
+    { path: 'plan', producer: 'planner', acceptance: 'green', version: 2, fingerprint: { proposal: 2 } },
+    { path: 'pr', producer: 'builder', acceptance: 'green', version: 1, fingerprint: { plan: 2 } }, // pinned: fp updated to plan v2
+    { path: 'revert', producer: 'reverter', acceptance: 'owed', version: 0 },
+  ]) as Map<string, ArtifactData>;
+
+  const settled = settleInMemory(d, artMap);
+
+  // Second pass on settled map: no op for pr, no arm for reverter
+  const ops2 = maintainDecisions(d, settled);
+  assert.ok(!ops2.some((op) => op.path === 'pr'),
+    `second pass must yield no op for pr (no-thrash); got: ${JSON.stringify(ops2)}`);
+  assert.ok(!ops2.some((op) => op.kind === 'arm'),
+    `second pass must yield no arm op (no-thrash); got: ${JSON.stringify(ops2)}`);
+});
+
+// ---- (l) Re-invalidation: input moves to new version → pin again + H re-arms ---
+
+test('(l) re-invalidation: input moves to v3 → pin again + H re-armed from green', () => {
+  const d = def(
+    'delivery',
+    [input('proposal')],
+    [
+      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      loop({
+        name: 'builder',
+        consumes: ['plan'],
+        produces: ['pr'],
+        effect: { idempotent: false, onInvalidate: 'reverter' },
+      }),
+      loop({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
+    ],
+  );
+
+  // State: pr was built on plan v1, plan has since moved to v3 (re-invalidation scenario).
+  // Revert fired once (green v1 on pr v1). pr.fingerprint still points to plan v1 → stale.
+  const artMap: Map<string, ArtifactData> = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 3 },
+    { path: 'plan', producer: 'planner', acceptance: 'green', version: 3, fingerprint: { proposal: 3 } },
+    { path: 'pr', producer: 'builder', acceptance: 'green', version: 1, fingerprint: { plan: 1 } },
+    { path: 'revert', producer: 'reverter', acceptance: 'green', version: 1, fingerprint: { pr: 1 } },
+  ]) as Map<string, ArtifactData>;
+
+  // maintainDecisions: expect pin for pr AND arm for reverter
+  const ops = maintainDecisions(d, artMap);
+  assert.ok(ops.some((op) => op.kind === 'pin' && op.path === 'pr'),
+    `expected pin op for 'pr'; got: ${JSON.stringify(ops)}`);
+  assert.ok(ops.some((op) => op.kind === 'arm' && op.handlerLoop === 'reverter'),
+    `expected arm op for 'reverter'; got: ${JSON.stringify(ops)}`);
+
+  // After settleInMemory: revert re-armed to owed from green
+  const settled = settleInMemory(d, artMap);
+  assert.equal(settled.get('revert')?.acceptance, 'owed',
+    `revert must be re-armed to owed after re-invalidation; got: ${JSON.stringify(settled.get('revert'))}`);
+});
+
+// ---- (m) Green H → workflow reaches done ---------------------------------------
+
+test('(m) green H → workflow reaches done', () => {
+  const d = def(
+    'delivery',
+    [input('proposal')],
+    [
+      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      loop({
+        name: 'builder',
+        consumes: ['plan'],
+        produces: ['pr'],
+        effect: { idempotent: false, onInvalidate: 'reverter' },
+      }),
+      loop({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
+    ],
+  );
+
+  // All artifacts green (after reverter fired and revert greened)
+  const artMap: Map<string, ArtifactData> = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 2 },
+    { path: 'plan', producer: 'planner', acceptance: 'green', version: 1, fingerprint: { proposal: 2 } },
+    { path: 'pr', producer: 'builder', acceptance: 'green', version: 1, fingerprint: { plan: 1 } },
+    { path: 'revert', producer: 'reverter', acceptance: 'green', version: 1, fingerprint: { pr: 1 } },
+  ]) as Map<string, ArtifactData>;
+
+  const settled = settleInMemory(d, artMap);
+
+  // No debts remain
+  const status = workflowStatus(d, settled);
+  assert.equal(status.done, true,
+    `workflow must be done when all artifacts are green; debts: ${JSON.stringify(status.debts)}`);
 });

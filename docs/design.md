@@ -301,9 +301,43 @@ version (§7).
   true for that artifact, so no op is generated — the cascade is stable after
   a single pass.
 
-- **§20.6 named-handler routing** — `onInvalidate: <loopName>` is a planned
-  follow-up; any non-pin/escalate string is currently a hard `validateDef` error
-  (and thrown immediately in `buildLoop`).
+- **§20.6 named-handler routing** — `onInvalidate: <loopName>` routes
+  invalidation to a compensating forward-action loop. When L's green artifact's
+  input moves and L declares `effect: { idempotent: false, onInvalidate: 'H' }`:
+  1. **Pin L** — L's artifact stays green; its fingerprint is re-pointed to the
+     current input versions (exactly as `onInvalidate: 'pin'`). L does not
+     re-fire.
+  2. **Arm H** — H's produced outputs are materialized as `owed` if absent, or
+     re-armed from `green` to `owed` if H has already fired once (D-C
+     re-invalidation). H is a normal forward-producer loop — no new acceptance
+     state; the engine sequences nothing beyond making H eligible.
+
+  - **Armed-on-demand dormancy (D-A)** — H's outputs are NOT seeded `owed` at
+    instance creation (`pendingOwed` skips handler loops). H is invisible to
+    `eligibleFirings` until L is first invalidated. This avoids spurious firings
+    on fresh instances where L's artifact has never greened.
+  - **No-thrash (D-C)** — the `pin` op re-points L's fingerprint. On the very
+    next `maintainDecisions` pass, `fingerprintMatches` returns true for L →
+    no new pin, no new arm. `settle()` converges in at most two iterations.
+  - **Re-invalidation (D-C re-arm)** — if the input moves again after H has
+    greened, L's new fingerprint mismatches → pin L again + arm H again. The
+    `arm` op finds H's output green and re-arms it to `owed`. H re-fires.
+  - **D-D validation** — `validateDef` enforces: the handler loop must exist in
+    the same workflow; the handler must not be the same loop (no self-handler);
+    the handler must produce at least one output (otherwise `arm` would write
+    no artifact to the store, creating no debt and no eligibility).
+  - **§20 table extension**:
+
+  | key | idempotent | onInvalidate | cascade behavior on input move |
+  |---|---|---|---|
+  | _(none)_ or `effect: { idempotent: true }` | true | — | re-arm (structural reject) |
+  | `effect: { idempotent: false, onInvalidate: 'pin' }` | false | pin | stay green, re-point fingerprint |
+  | `effect: { idempotent: false, onInvalidate: 'escalate' }` | false | escalate | reject-and-hold; stalled |
+  | `effect: { idempotent: false, onInvalidate: '<H>' }` | false | loopName | pin original + arm H (D-A/D-B) |
+  | `terminal: true` | false | pin | stay green + lint-exempt (legacy) |
+
+  Cross-reference: §6.1 resolution 2; §6.6 (this is forward-action
+  compensation, not auto-redo of the irreversible step).
 
 ## §21 Firing rules and the completion evaluator (`on:`)
 
