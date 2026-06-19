@@ -33,8 +33,11 @@ export type Author = 'engine' | 'human' | string; // a loop name, or these speci
  *  - `structural`: engine bookkeeping (cascade / born-rejected / re-arm) — does NOT count.
  *  - `validation`: a produced value failed its declared JSON Schema (§19) — counts
  *    toward a *separate* per-artifact stall bounded by the loop's `maxSchemaFailures`.
+ *  - `invalidated-irreversible`: the artifact was rejected-and-held because its inputs
+ *    moved and its producer loop declared `effect: { idempotent: false, onInvalidate: 'escalate' }`.
+ *    The producer is NOT auto-eligible to re-fire; a human must intervene (retry / fix upstream).
  */
-export type RejectKind = 'judgment' | 'structural' | 'validation';
+export type RejectKind = 'judgment' | 'structural' | 'validation' | 'invalidated-irreversible';
 
 export type ReasonAction =
   | 'reject'
@@ -43,7 +46,8 @@ export type ReasonAction =
   | 'reopen'
   | 'retry'
   | 'born-rejected'
-  | 'schema-reject';
+  | 'schema-reject'
+  | 'pinned';
 
 /** A JSON Schema, as authored in a definition: an object, or a boolean (allow/deny all). */
 export type JsonSchema = Record<string, unknown> | boolean;
@@ -139,6 +143,23 @@ export interface ProducePattern {
   schema?: JsonSchema;
 }
 
+/**
+ * Declared per-loop effect contract (design §6.5). Controls forward-cascade routing
+ * when the loop's green artifact's inputs move to a new version.
+ */
+export interface EffectDef {
+  /** If true (default), re-deriving the artifact after inputs move is safe.
+   *  When false, the artifact must not silently re-fire. */
+  idempotent?: boolean;
+  /** Routing when idempotent:false and an input moves.
+   *  'pin'      — keep the artifact green, re-point fingerprint to current inputs.
+   *  'escalate' — reject the artifact as held; producer not auto-re-eligible.
+   *  Defaults to 'escalate' when idempotent:false and omitted.
+   *  Named-handler routing ('onInvalidate: <loopName>') is a planned follow-up;
+   *  any non-pin/escalate string is a hard validateDef error. */
+  onInvalidate?: 'pin' | 'escalate';
+}
+
 /** A loop (step) definition. */
 export interface LoopDef {
   name: string;
@@ -160,6 +181,8 @@ export interface LoopDef {
   workdir: string;
   /** the loop's output is a destructive completion (e.g. a merge): green is terminal (§15.2) */
   terminal?: boolean;
+  /** Loop-level effect contract (§6.5). Only consulted for non-terminal greens whose inputs move. */
+  effect?: EffectDef;
   body: string; // prompt body
 }
 

@@ -834,12 +834,26 @@ export class Engine {
       });
       return;
     }
+    if (op.kind === 'pin') {
+      // Pin: artifact stays green; fingerprint re-pointed to current input versions.
+      // Does NOT change acceptance, does NOT bump version, does NOT reset stall counters.
+      const req = requiredInputs(def, arts, art);
+      this.store.putArtifact({
+        ...art,
+        fingerprint: computeFingerprint(arts, req),
+        reasons: [...art.reasons, reason('pinned', 'structural', 'engine', op.reason, art.version)],
+      });
+      return;
+    }
     const acceptance = op.kind === 'reject' ? 'rejected' : 'retracted';
     const action: ReasonAction = op.kind === 'reject' ? 'reject' : 'retract';
+    // For held rejects (effect.onInvalidate=escalate), use 'invalidated-irreversible' kind
+    // so isHeld() can detect them and suppress auto-re-eligibility.
+    const rejectKind = op.kind === 'reject' && op.held ? 'invalidated-irreversible' : 'structural';
     this.store.putArtifact({
       ...art,
       acceptance,
-      reasons: [...art.reasons, reason(action, 'structural', 'engine', op.reason, art.version)],
+      reasons: [...art.reasons, reason(action, rejectKind, 'engine', op.reason, art.version)],
     });
   }
 

@@ -26,7 +26,7 @@ import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from './paths.ts';
 import { parseDurationSecs } from './util.ts';
 import { assertValidSchema } from './schema.ts';
-import type { Acceptance, InputDef, InvariantDef, InvariantPredicate, JsonSchema, LoopDef, ProducePattern, WorkflowDef } from './types.ts';
+import type { Acceptance, EffectDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, LoopDef, ProducePattern, WorkflowDef } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
 
@@ -55,6 +55,7 @@ interface RawLoop {
   model?: unknown;
   workdir?: unknown;
   terminal?: unknown;
+  effect?: unknown;
   body?: unknown;
 }
 interface RawDef {
@@ -300,6 +301,29 @@ function buildLoop(rl: RawLoop, i: number): LoopDef {
   if (rl.model !== undefined) loop.model = asString(rl.model, `loop '${name}'.model`);
   if (asBool(rl.terminal, false, `loop '${name}'.terminal`)) loop.terminal = true;
   if (generatesPatterns.length > 0) loop.generates = generatesPatterns; // kept for lint only
+  if (rl.effect !== undefined) {
+    if (typeof rl.effect !== 'object' || rl.effect === null || Array.isArray(rl.effect)) {
+      throw new DefError(`loop '${name}'.effect must be an object`);
+    }
+    const rawEffect = rl.effect as Record<string, unknown>;
+    const effectDef: EffectDef = {};
+    if (rawEffect['idempotent'] !== undefined) {
+      effectDef.idempotent = asBool(rawEffect['idempotent'], true, `loop '${name}'.effect.idempotent`);
+    }
+    if (rawEffect['onInvalidate'] !== undefined) {
+      const oi = asString(rawEffect['onInvalidate'], `loop '${name}'.effect.onInvalidate`);
+      if (oi !== 'pin' && oi !== 'escalate') {
+        // Named-handler routing is not yet supported; throw immediately (consistent
+        // with how parseDurationSecs throws on bad cadence strings in buildLoop).
+        throw new DefError(
+          `loop '${name}': effect.onInvalidate must be 'pin' or 'escalate'; ` +
+          `named-handler routing ('${oi}') is not yet supported and is a planned follow-up`,
+        );
+      }
+      effectDef.onInvalidate = oi;
+    }
+    loop.effect = effectDef;
+  }
   return loop;
 }
 
@@ -418,6 +442,28 @@ export function validateDef(def: WorkflowDef): string[] {
   errors.push(...reachabilityErrors(def, danglingLoops));
 
   errors.push(...detectCycles(def, producerOf, collectionStems));
+
+  // effect: validation
+  for (const l of def.loops) {
+    if (!l.effect) continue;
+    // terminal: true and effect: are mutually exclusive (effect: is the forward spelling)
+    if (l.terminal && l.effect) {
+      errors.push(
+        `loop '${l.name}': terminal: true and effect: are mutually exclusive; ` +
+        `effect: is the forward spelling — remove terminal: true`,
+      );
+    }
+    // onInvalidate validation: only 'pin' and 'escalate' are valid
+    // (Named-handler strings are caught in buildLoop via DefError throw, so this
+    //  branch is a belt-and-suspenders guard for any value that bypasses buildLoop.)
+    const oi = l.effect.onInvalidate;
+    if (oi !== undefined && oi !== 'pin' && oi !== 'escalate') {
+      errors.push(
+        `loop '${l.name}': effect.onInvalidate must be 'pin' or 'escalate'; ` +
+        `named-handler routing ('${oi}') is not yet supported and is a planned follow-up`,
+      );
+    }
+  }
 
   // Semantic invariant validation: unknown stem references and duplicate names.
   if (def.invariants && def.invariants.length > 0) {

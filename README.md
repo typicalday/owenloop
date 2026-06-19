@@ -318,6 +318,13 @@ loops:
     parallel: 1                # max concurrent runs (raise it to fan out a map)
     terminal: false            # true → a green output is a destructive completion,
                                #        never re-armed by the cascade (§15.2)
+    effect:                    # optional; loop-level effect contract (§20)
+      idempotent: true         #   true (default): safe to re-derive if inputs move → re-arms normally
+                               #   false: loop fires irreversible side effects; do not re-fire silently
+      onInvalidate: escalate   #   consulted only when idempotent: false
+                               #   'pin'      → keep green, re-point fingerprint (stays up-to-date)
+                               #   'escalate' → reject-and-hold; stall requires human intervention
+                               #   Named-handler strings are a planned follow-up (hard error today)
     invalidates: [plan]        # which input stems this loop may invalidate
                                #   (default: its consumed stems)
     cadence: "0s"              # min spacing between runs (e.g. "30m")
@@ -350,6 +357,38 @@ unlike `terminal:` it stays re-armable.
 
 Validation: every stem in `outputs:` must be produced by at least one loop (stems under
 `generates:` count, since they are unioned into `produces` at build time).
+
+### `effect:` — the loop effect contract
+
+A loop may declare `effect: { idempotent?, onInvalidate? }` to control how the engine
+routes when the loop's green artifact's inputs move to a newer version (§20):
+
+- **`idempotent: true` (default)** — re-deriving the artifact is safe; the engine
+  re-arms it as a normal structural reject, exactly as today. Any loop without an `effect:`
+  field behaves as if `idempotent: true` were declared — no existing def or test is
+  affected.
+- **`idempotent: false`** — the loop fires an irreversible side effect (a deploy, a publish,
+  an external API mutation). The engine must not silently re-fire it when upstream inputs
+  move. `onInvalidate` specifies what happens instead:
+  - **`onInvalidate: 'pin'`** — the artifact stays green; its fingerprint is re-pointed to
+    the current input versions so the cascade sees it as up-to-date. The producer does not
+    re-fire. Use when stale-but-shipped is acceptable.
+  - **`onInvalidate: 'escalate'` (default when `idempotent: false`)** — the artifact is
+    rejected-and-held (`isHeld`). The producer does not auto-re-fire; the debt surfaces as
+    `stalled: true` with `kind: 'invalidated-irreversible'` in `oweflow status`, requiring
+    human intervention (`oweflow retry` / fix upstream / accept-as-is).
+
+`terminal: true` is the legacy spelling for `effect: { idempotent: false, onInvalidate: 'pin' }`
+plus the dead-end lint exemption. The two coexist on the same engine version and are mutually
+exclusive on the same loop. Dead-input cascade (a retracted or skipped input) is always
+structural regardless of `effect:` — only the moved-version re-arm path routes on it.
+
+| key | idempotent | onInvalidate | cascade behavior on input move |
+|---|---|---|---|
+| _(none)_ or `effect: { idempotent: true }` | true | — | re-arm (structural reject) as today |
+| `effect: { idempotent: false, onInvalidate: 'pin' }` | false | pin | stay green, re-point fingerprint |
+| `effect: { idempotent: false, onInvalidate: 'escalate' }` | false | escalate | reject-and-hold; stalled |
+| `terminal: true` | false | pin | stay green + lint-exempt (legacy) |
 
 ### Consume / produce grammar
 

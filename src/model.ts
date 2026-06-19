@@ -53,10 +53,11 @@ export interface Firing {
 
 /** A structural maintenance op the engine should apply (level-triggered). */
 export type CascadeOp =
-  | { kind: 'reject'; path: string; reason: string } // green→rejected, value kept
+  | { kind: 'reject'; path: string; reason: string; held?: true } // green→rejected, value kept; held=true for escalate
   | { kind: 'retract'; path: string; reason: string } // tombstone a map child of a retracted element
   | { kind: 'skip'; path: string; reason: string } // cascade skip down a dead branch
-  | { kind: 'rearm'; path: string; reason: string }; // skipped→owed when the branch revives
+  | { kind: 'rearm'; path: string; reason: string } // skipped→owed when the branch revives
+  | { kind: 'pin'; path: string; reason: string }; // stays green, fingerprint re-pointed to current inputs
 
 // ---- loop shape classification ----------------------------------------------
 
@@ -122,10 +123,29 @@ export function isStalled(a: ArtifactData | undefined, cap: number): boolean {
 export function isSchemaStalled(a: ArtifactData | undefined, cap: number): boolean {
   return !!a && cap > 0 && a.acceptance === 'rejected' && a.schemaRejects >= cap;
 }
-/** An artifact is frozen (no firing re-arms it) when either stall trips. */
-function frozen(a: ArtifactData | undefined, loop: LoopDef): boolean {
-  return isStalled(a, loop.maxAttempts) || isSchemaStalled(a, loop.maxSchemaFailures);
+/**
+ * True if the artifact is held (non-idempotent escalate) — rejected-and-held,
+ * producer not auto-eligible to re-fire. Detected by the last reasons entry
+ * having kind='invalidated-irreversible'. A retry call appends a 'structural'
+ * entry, which clears the held condition automatically.
+ */
+export function isHeld(a: ArtifactData | undefined): boolean {
+  if (!a || a.acceptance !== 'rejected') return false;
+  return a.reasons.length > 0 && a.reasons[a.reasons.length - 1]!.kind === 'invalidated-irreversible';
 }
+
+/** An artifact is frozen (no firing re-arms it) when either stall trips or it is held. */
+function frozen(a: ArtifactData | undefined, loop: LoopDef): boolean {
+  return isStalled(a, loop.maxAttempts) || isSchemaStalled(a, loop.maxSchemaFailures) || isHeld(a);
+}
+
+/** Resolve the effective effect contract for a loop. Defaults: idempotent=true. */
+function resolvedEffect(loop: LoopDef | undefined): { idempotent: boolean; onInvalidate: 'pin' | 'escalate' } {
+  const idempotent = loop?.effect?.idempotent ?? true;
+  const onInvalidate = loop?.effect?.onInvalidate ?? 'escalate';
+  return { idempotent, onInvalidate };
+}
+
 function isSettledOut(a: ArtifactData): boolean {
   // retracted/skipped members drop out of a set; they don't block a reduce.
   return a.acceptance === 'retracted' || a.acceptance === 'skipped';
@@ -389,12 +409,29 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap): CascadeO
     if (art.acceptance === 'green' && !art.terminal) {
       const versionsOk = fingerprintMatches(arts, req, art.fingerprint ?? {});
       if (!offender && versionsOk) continue; // invariant holds
+
+      // Dead/settled input: structural cascade (retract or skip). NOT gated by effect:
+      // (§17.5 — dead-input cascade for non-idempotent loops is unconditionally structural).
       if (offender && offenderPath) {
         ops.push(cascadeFromDeadInput(art.path, offender, offenderPath, isMapChild));
         continue;
       }
+
+      // All inputs are green but at least one moved (version changed). Route on effect:.
       const moved = req.find((p) => (arts.get(p)?.version ?? -1) !== (art.fingerprint ?? {})[p]);
-      ops.push({ kind: 'reject', path: art.path, reason: `auto-invalidated: ${moved ?? 'an input'} moved version` });
+      const producerLoop = loopByName(def, art.producer);
+      const effect = resolvedEffect(producerLoop);
+
+      if (effect.idempotent) {
+        // Default (idempotent=true): re-arm as before. No behavior change for existing defs.
+        ops.push({ kind: 'reject', path: art.path, reason: `auto-invalidated: ${moved ?? 'an input'} moved version` });
+      } else if (effect.onInvalidate === 'pin') {
+        // Pin: keep green, re-point fingerprint to current input versions. Producer does not re-fire.
+        ops.push({ kind: 'pin', path: art.path, reason: `pinned: ${moved ?? 'an input'} moved; held green per effect.onInvalidate=pin` });
+      } else {
+        // Escalate: reject-and-hold — producer must not auto-fire; surfaces as stalled.
+        ops.push({ kind: 'reject', path: art.path, held: true, reason: `held: ${moved ?? 'an input'} moved; irreversible — escalate to human (effect.onInvalidate=escalate)` });
+      }
       continue;
     }
 
@@ -440,8 +477,8 @@ export interface WorkflowStatus {
   debts: Array<{
     path: string;
     acceptance: Acceptance;
-    kind: 'judgment' | 'structural' | 'validation' | 'unbuilt';
-    /** §6/§18: rejected past its producer's cap — the engine won't re-arm it */
+    kind: 'judgment' | 'structural' | 'validation' | 'unbuilt' | 'invalidated-irreversible';
+    /** §6/§18/held: rejected past its producer's cap, or held — the engine won't re-arm it */
     stalled: boolean;
     reason?: string;
     /**
@@ -461,16 +498,19 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
   for (const a of arts.values()) {
     if (!DEBT_STATES.has(a.acceptance)) continue;
     const last = a.reasons[a.reasons.length - 1];
-    const kind: 'judgment' | 'structural' | 'validation' | 'unbuilt' = last
+    const kind: 'judgment' | 'structural' | 'validation' | 'unbuilt' | 'invalidated-irreversible' = last
       ? last.kind === 'judgment'
         ? 'judgment'
         : last.kind === 'validation'
           ? 'validation'
-          : 'structural'
+          : last.kind === 'invalidated-irreversible'
+            ? 'invalidated-irreversible'
+            : 'structural'
       : 'unbuilt';
     const prod = loopByName(def, a.producer);
+    // Held artifacts (isHeld) surface as stalled: true — they require human intervention.
     const stalled =
-      !!prod && (isStalled(a, prod.maxAttempts) || isSchemaStalled(a, prod.maxSchemaFailures));
+      !!prod && (isStalled(a, prod.maxAttempts) || isSchemaStalled(a, prod.maxSchemaFailures) || isHeld(a));
     const entry: WorkflowStatus['debts'][number] = { path: a.path, acceptance: a.acceptance, kind, stalled };
     if (last) entry.reason = last.text;
     debts.push(entry);
@@ -1045,9 +1085,46 @@ function applyOpInMemory(
     });
     return;
   }
+  if (op.kind === 'pin') {
+    // Pin: artifact stays green; fingerprint re-pointed to current input versions.
+    // Does NOT change acceptance, does NOT bump version, does NOT reset stall counters.
+    const req = requiredInputs(def, arts, art);
+    arts.set(op.path, {
+      ...art,
+      fingerprint: computeFingerprint(arts, req),
+      reasons: [
+        ...art.reasons,
+        {
+          at: Date.now(),
+          action: 'pinned',
+          kind: 'structural',
+          by: 'engine',
+          text: op.reason,
+          fromVersion: art.version,
+        },
+      ],
+    });
+    return;
+  }
   // reject and retract
   const acceptance: Acceptance = op.kind === 'reject' ? 'rejected' : 'retracted';
-  arts.set(op.path, { ...art, acceptance });
+  const newArt: ArtifactData = { ...art, acceptance };
+  if (op.kind === 'reject' && op.held) {
+    // Append a reason entry with kind='invalidated-irreversible' to mark this as held.
+    // The held condition is detected by isHeld() via the last reasons entry's kind.
+    newArt.reasons = [
+      ...art.reasons,
+      {
+        at: Date.now(),
+        action: 'reject',
+        kind: 'invalidated-irreversible',
+        by: 'engine',
+        text: op.reason,
+        fromVersion: art.version,
+      },
+    ];
+  }
+  arts.set(op.path, newArt);
 }
 
 /**

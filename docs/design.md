@@ -73,6 +73,8 @@ Three reject **kinds** (§11.9) are tracked:
   counter.
 - **structural** — engine bookkeeping (a forward-cascade re-arm, a born-rejected
   commit). Bumps **neither** counter.
+- **invalidated-irreversible** — the artifact was rejected-and-held because its
+  inputs moved and its producer declared `effect: { idempotent: false, onInvalidate: 'escalate' }` (§20). The producer does not auto-re-fire; a human must intervene.
 
 A counter rides on the *judged artifact*. Once `judgmentRejects ≥ maxAttempts`
 (or `schemaRejects ≥ maxSchemaFailures`, §19) the artifact is **stalled**: it
@@ -82,10 +84,17 @@ rebuild it. The loop has demonstrably failed; a human must intervene.
 `status.debts[].stalled` surfaces either; `blocked` deliberately excludes a
 stalled loop (it isn't waiting on an input — it's out of attempts).
 
+Held artifacts (`isHeld`, §20) also surface as `stalled: true` in
+`workflowStatus.debts`. A held loop is not waiting on an input — it fired an
+irreversible side effect and must not silently re-fire; a human must `retry` or
+fix the upstream cause.
+
 Clearing a stall:
 - **`retry`** — reset *both* counters to 0 and re-owe the artifact (optionally
   with fresh guidance appended as a `retry` reason). The only path that resets
-  the counters.
+  the counters. Also clears the held condition: a `retry` appends a `'retry'`
+  reason entry, so the last entry's `kind` is no longer `'invalidated-irreversible'`
+  and `isHeld` returns false.
 - **`retract`** — drop the member (collection elements).
 
 ## §7 The forward cascade (level-triggered)
@@ -133,7 +142,8 @@ order-independent — re-running `settle()` on a healthy graph yields no ops.
   output whose green is irreversible (a merge, a publish). Once green it is never
   re-armed by the forward cascade, even if an upstream input later moves. This is
   the one place the level-trigger is deliberately overridden, because the side
-  effect cannot be taken back.
+  effect cannot be taken back. See §20 for `effect:`, the forward spelling for
+  this contract that adds the `escalate` routing option and finer-grained control.
 
 ## §16 Generated outputs (`generates:`)
 
@@ -250,3 +260,47 @@ single-threaded engine on an adversarial value), not an attacker lever. Keep
 `pattern`s linear. Worker-supplied *values* need no such trust: a malformed value
 is just a schema-reject, bounded by `maxSchemaFailures`, and CLI values are
 additionally bounded by the OS argument limit.
+
+## §20 The effect contract (`effect:`)
+
+A loop may declare `effect: { idempotent?, onInvalidate? }` to control how the
+forward cascade routes when the loop's green artifact's inputs move to a new
+version (§7).
+
+- **§20.1 idempotent (default `true`)** — when `true`, re-deriving the artifact
+  after inputs move is safe; the engine re-arms it (structural reject) exactly as
+  it does for any non-terminal green today. When `false`, re-running the loop
+  would cause an unretractable side effect (a publish, an external API mutation)
+  and must not proceed silently.
+
+- **§20.2 onInvalidate (consulted only when `idempotent: false`)** — defaults to
+  `'escalate'`. Two values:
+  - **`'pin'`** — the artifact stays green; its fingerprint is re-pointed to
+    current input versions (the *pinned* condition). The producer does not
+    re-fire. Use when the side effect is acceptable even with stale inputs (e.g.,
+    a deployed artifact that does not need to track every upstream change).
+  - **`'escalate'`** — the artifact is rejected-and-held (the *held* condition,
+    `isHeld`, §6). The producer does not auto-re-fire; the debt surfaces as
+    `stalled: true` with `kind: 'invalidated-irreversible'` in
+    `workflowStatus.debts`, requiring human intervention (retry / accept-as-is /
+    fix upstream).
+
+- **§20.3 `terminal:` vs `effect:`** — `terminal: true` is the legacy spelling
+  for `effect: { idempotent: false, onInvalidate: 'pin' }` plus the dead-end lint
+  exemption. The two coexist on the same engine version; migration of `terminal:`
+  to `effect:` is deferred. They are mutually exclusive on the same loop
+  (`validateDef` hard-errors if both are set).
+
+- **§20.4 dead-input cascade is not gated by `effect:`** — when a non-idempotent
+  artifact's input becomes settled-dead (retracted or skipped), the structural
+  cascade (retract/skip) applies regardless of `effect:`. Only the moved-version
+  re-arm path routes on `effect:`.
+
+- **§20.5 convergence** — a `pin` op re-points the fingerprint to current input
+  versions. On the next `maintainDecisions` pass, `fingerprintMatches` returns
+  true for that artifact, so no op is generated — the cascade is stable after
+  a single pass.
+
+- **§20.6 named-handler routing** — `onInvalidate: <loopName>` is a planned
+  follow-up; any non-pin/escalate string is currently a hard `validateDef` error
+  (and thrown immediately in `buildLoop`).
