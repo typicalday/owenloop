@@ -7,6 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { eligibleFirings, maintainDecisions } from '../src/model.ts';
+import type { TimeFacts } from '../src/model.ts';
 import { arts, def, input, loop } from './helpers.ts';
 
 // ---- (a) back-compat: a loop with no on: fires exactly as inputsGreen --------
@@ -205,4 +206,237 @@ test('(e) trigger-cause is threaded onto the Firing', () => {
   assert.equal(completionFiring!.cause, 'allGreen', 'firing must carry cause=allGreen');
   // inputs must be empty (no consumed inputs for allGreen loop)
   assert.deepEqual(completionFiring!.inputs, []);
+});
+
+// ============================================================
+// (b)-(i) idle trigger tests (§21.8 — PR3b)
+// ============================================================
+
+// A minimal 3-loop workflow: planner → builder → completion(idle)
+function makeIdleDef(idleAfterMs: number) {
+  return def('idle-wf', [input('proposal')], [
+    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    loop({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+    loop({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs }),
+  ]);
+}
+
+function makeTimeFacts(overrides: Partial<TimeFacts> = {}): TimeFacts {
+  return {
+    now: 0,
+    lastProgressMs: 0,
+    inFlight: false,
+    alarms: new Map(),
+    ...overrides,
+  };
+}
+
+// ---- (b) idle NOT eligible before threshold, eligible at/after threshold ------
+
+test('(b) idle NOT eligible before threshold; IS eligible at/after threshold', () => {
+  const IDLE_AFTER_MS = 30 * 60 * 1000; // 30 minutes
+  const d = makeIdleDef(IDLE_AFTER_MS);
+
+  // State: plan owed (workflow has debt), outcome owed
+  const state = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
+    { path: 'plan', producer: 'planner', acceptance: 'owed', version: 0 },
+    { path: 'pr', producer: 'builder', acceptance: 'owed', version: 0 },
+    { path: 'outcome', producer: 'completion', acceptance: 'owed', version: 0 },
+  ]);
+
+  const T = 1_000_000; // arbitrary epoch base
+  const lastProgressMs = T;
+
+  // Before threshold: now = T + 5min, threshold = T + 30min
+  const timeBefore = makeTimeFacts({ now: T + 5 * 60 * 1000, lastProgressMs, inFlight: false });
+  const firingsBefore = eligibleFirings(d, state, timeBefore).filter((f) => f.loop === 'completion');
+  assert.equal(firingsBefore.length, 0, 'idle must NOT be eligible before the threshold');
+
+  // Exactly at threshold: now = T + 30min
+  const timeAt = makeTimeFacts({ now: T + IDLE_AFTER_MS, lastProgressMs, inFlight: false });
+  const firingsAt = eligibleFirings(d, state, timeAt).filter((f) => f.loop === 'completion');
+  assert.equal(firingsAt.length, 1, 'idle IS eligible at exactly the threshold');
+  assert.equal(firingsAt[0]!.cause, 'idle');
+  assert.deepEqual(firingsAt[0]!.inputs, []);
+
+  // After threshold: now = T + 60min
+  const timeAfter = makeTimeFacts({ now: T + 60 * 60 * 1000, lastProgressMs, inFlight: false });
+  const firingsAfter = eligibleFirings(d, state, timeAfter).filter((f) => f.loop === 'completion');
+  assert.equal(firingsAfter.length, 1, 'idle IS eligible after the threshold');
+  assert.equal(firingsAfter[0]!.cause, 'idle');
+});
+
+// ---- (c) SLIDING window: advancing lastProgressMs pushes the threshold forward ---
+
+test('(c) sliding window: advancing lastProgressMs resets the idle threshold', () => {
+  const IDLE_AFTER_MS = 30 * 60 * 1000;
+  const d = makeIdleDef(IDLE_AFTER_MS);
+
+  const state = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
+    { path: 'plan', producer: 'planner', acceptance: 'owed', version: 0 },
+    { path: 'pr', producer: 'builder', acceptance: 'owed', version: 0 },
+    { path: 'outcome', producer: 'completion', acceptance: 'owed', version: 0 },
+  ]);
+
+  const T = 1_000_000;
+  const now = T + 29 * 60 * 1000; // 29 minutes after T
+
+  // With lastProgressMs = T (29min ago), idle is not eligible (29m < 30m)
+  const time1 = makeTimeFacts({ now, lastProgressMs: T, inFlight: false });
+  const f1 = eligibleFirings(d, state, time1).filter((f) => f.loop === 'completion');
+  assert.equal(f1.length, 0, 'idle NOT eligible when 29m since last progress (threshold is 30m)');
+
+  // Simulate progress at T+1min (lastProgressMs advances to T+1min).
+  // New threshold = T+1min + 30min = T+31min. now = T+29min < T+31min → still not eligible.
+  const time2 = makeTimeFacts({ now, lastProgressMs: T + 60 * 1000, inFlight: false });
+  const f2 = eligibleFirings(d, state, time2).filter((f) => f.loop === 'completion');
+  assert.equal(f2.length, 0, 'idle NOT eligible after sliding window advances (threshold pushed forward)');
+});
+
+// ---- (d) ABSOLUTE alarm override -------------------------------------------------
+
+test('(d) absolute alarm_at overrides the relative lastProgress + idleAfter threshold', () => {
+  const IDLE_AFTER_MS = 30 * 60 * 1000;
+  const d = makeIdleDef(IDLE_AFTER_MS);
+
+  const state = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
+    { path: 'plan', producer: 'planner', acceptance: 'owed', version: 0 },
+    { path: 'outcome', producer: 'completion', acceptance: 'owed', version: 0 },
+  ]);
+
+  const T = 1_000_000;
+  const lastProgressMs = T;
+  // alarm_at set to T+5min (earlier than lastProgressMs+30min = T+30min)
+  const alarmAt = T + 5 * 60 * 1000;
+
+  // At exactly alarm_at: idle IS eligible (absolute override wins)
+  const timeAtAlarm = makeTimeFacts({
+    now: alarmAt,
+    lastProgressMs,
+    inFlight: false,
+    alarms: new Map([['completion', alarmAt]]),
+  });
+  const firings = eligibleFirings(d, state, timeAtAlarm).filter((f) => f.loop === 'completion');
+  assert.equal(firings.length, 1, 'idle IS eligible when alarm_at threshold is reached');
+  assert.equal(firings[0]!.cause, 'idle');
+
+  // Before alarm_at (5 min before): NOT eligible even though lastProgress+idleAfter would be in future
+  const timeBefore = makeTimeFacts({
+    now: alarmAt - 1,
+    lastProgressMs,
+    inFlight: false,
+    alarms: new Map([['completion', alarmAt]]),
+  });
+  const firingsBefore = eligibleFirings(d, state, timeBefore).filter((f) => f.loop === 'completion');
+  assert.equal(firingsBefore.length, 0, 'idle NOT eligible 1ms before alarm_at');
+});
+
+// ---- (e) IN-FLIGHT ≠ idle (R12) -----------------------------------------------
+
+test('(e) idle is NOT eligible when any run is in-flight', () => {
+  const IDLE_AFTER_MS = 30 * 60 * 1000;
+  const d = makeIdleDef(IDLE_AFTER_MS);
+
+  const state = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
+    { path: 'plan', producer: 'planner', acceptance: 'owed', version: 0 },
+    { path: 'outcome', producer: 'completion', acceptance: 'owed', version: 0 },
+  ]);
+
+  const T = 1_000_000;
+  // Well past threshold so idle would be eligible if not for inFlight
+  const timeInFlight = makeTimeFacts({
+    now: T + 60 * 60 * 1000,
+    lastProgressMs: T,
+    inFlight: true, // a run is claimed and fresh
+  });
+  const firings = eligibleFirings(d, state, timeInFlight).filter((f) => f.loop === 'completion');
+  assert.equal(firings.length, 0, 'idle must NOT be eligible when any run is in-flight');
+});
+
+// ---- (f) NOT-done gate: idle fires only when workflow has non-evaluator debts ---
+
+test('(f) idle is NOT eligible when the workflow is all-green (allGreen owns it)', () => {
+  const IDLE_AFTER_MS = 30 * 60 * 1000;
+  const d = makeIdleDef(IDLE_AFTER_MS);
+
+  // Workflow all-green (excluding evaluator's outcome): proposal green, plan green, pr green
+  // outcome is owed (the evaluator's own output — excluded from all-green check)
+  const state = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
+    { path: 'plan', producer: 'planner', acceptance: 'green', version: 1 },
+    { path: 'pr', producer: 'builder', acceptance: 'green', version: 1 },
+    { path: 'outcome', producer: 'completion', acceptance: 'owed', version: 0 },
+  ]);
+
+  const T = 1_000_000;
+  // Past threshold
+  const time = makeTimeFacts({ now: T + 60 * 60 * 1000, lastProgressMs: T, inFlight: false });
+  const firings = eligibleFirings(d, state, time);
+  const idleFirings = firings.filter((f) => f.loop === 'completion' && f.cause === 'idle');
+  assert.equal(idleFirings.length, 0, 'idle must NOT be eligible when workflow is all-green');
+});
+
+// ---- (g) HEARTBEAT re-arm: idle re-arm when alarm elapsed and outcome is green ---
+
+test('(g) heartbeat re-arm: maintainDecisions emits idle-rearm when alarm elapsed and outcome is green', () => {
+  const IDLE_AFTER_MS = 30 * 60 * 1000;
+  const d = makeIdleDef(IDLE_AFTER_MS);
+
+  const T = 1_000_000;
+
+  // State: outcome is green (idle fired once), plan is still owed (not done)
+  const stateGreenOutcome = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
+    { path: 'plan', producer: 'planner', acceptance: 'owed', version: 0 },
+    { path: 'outcome', producer: 'completion', acceptance: 'green', version: 1 },
+  ]);
+
+  // No alarm, now < lastProgressMs + idleAfterMs → idleEligible = false → no re-arm
+  const timeNoAlarm = makeTimeFacts({ now: T + 5 * 60 * 1000, lastProgressMs: T, inFlight: false });
+  const opsNoAlarm = maintainDecisions(d, stateGreenOutcome, timeNoAlarm);
+  const rearmOpsNoAlarm = opsNoAlarm.filter(
+    (op) => op.kind === 'reject' && op.path === 'outcome' && op.reason.includes('idle-rearm'),
+  );
+  assert.equal(rearmOpsNoAlarm.length, 0, 'no idle-rearm when threshold not reached (no thrash)');
+
+  // Alarm set to T+5min, now = T+5min → idleEligible = true → idle-rearm op emitted
+  const timeAlarmElapsed = makeTimeFacts({
+    now: T + 5 * 60 * 1000,
+    lastProgressMs: T,
+    inFlight: false,
+    alarms: new Map([['completion', T + 5 * 60 * 1000]]),
+  });
+  const opsAlarmElapsed = maintainDecisions(d, stateGreenOutcome, timeAlarmElapsed);
+  const rearmOps = opsAlarmElapsed.filter(
+    (op) => op.kind === 'reject' && op.path === 'outcome' && op.reason.includes('idle-rearm'),
+  );
+  assert.equal(rearmOps.length, 1, 'idle-rearm op emitted when alarm elapsed and outcome is green');
+});
+
+// ---- (h) PURITY: eligibleFirings is idempotent for fixed (arts, timeFacts) ----
+
+test('(h) purity: eligibleFirings is idempotent for identical (arts, timeFacts)', () => {
+  const IDLE_AFTER_MS = 30 * 60 * 1000;
+  const d = makeIdleDef(IDLE_AFTER_MS);
+
+  const state = arts([
+    { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
+    { path: 'plan', producer: 'planner', acceptance: 'owed', version: 0 },
+    { path: 'outcome', producer: 'completion', acceptance: 'owed', version: 0 },
+  ]);
+
+  const T = 1_000_000;
+  const time = makeTimeFacts({ now: T + 60 * 60 * 1000, lastProgressMs: T, inFlight: false });
+
+  const result1 = eligibleFirings(d, state, time);
+  const result2 = eligibleFirings(d, state, time);
+
+  assert.equal(result1.length, result2.length, 'eligibleFirings must be idempotent');
+  for (let i = 0; i < result1.length; i++) {
+    assert.deepEqual(result1[i], result2[i], `firing[${i}] must be identical across calls`);
+  }
 });

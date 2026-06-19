@@ -783,3 +783,103 @@ test('deferred: parallel-cap — a map loop with parallel:2 and 4 elements defer
   assert.equal(workDeferred.length, 2);
   assert.ok(workDeferred.every((d) => d.reason === 'parallel-cap'));
 });
+
+// ---- idle trigger + nextAlarm + setAlarm/clearAlarm integration (PR3b) -------
+
+test('(i) nextAlarm: dueAt computed from lastProgressMs + idleAfterMs when no alarm_at set', () => {
+  const IDLE_AFTER_MS = 30 * 60 * 1000; // 30 minutes
+  const idleDef = def('idle', [input('proposal')], [
+    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    loop({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: IDLE_AFTER_MS }),
+  ]);
+  const { engine } = makeEngine([idleDef]);
+  const wf = engine.createInstance('idle');
+
+  // Tick at T=1000 to settle the workflow (creates artifacts with updated_at ≈ 1000ms real)
+  engine.tick(wf, { now: 1000 });
+
+  // nextAlarm: dueAt = lastProgressMs + idleAfterMs
+  const result = engine.nextAlarm(wf, { now: 1000 });
+  assert.ok(result.dueAt !== null, 'dueAt must be set for a workflow with idle loops');
+  assert.ok(result.dueAt! > 0, 'dueAt must be positive');
+
+  // isDue at now=dueAt
+  const result2 = engine.nextAlarm(wf, { now: result.dueAt! });
+  assert.equal(result2.isDue, true, 'isDue must be true when now >= dueAt');
+
+  // isDue before dueAt
+  const result3 = engine.nextAlarm(wf, { now: result.dueAt! - 1 });
+  assert.equal(result3.isDue, false, 'isDue must be false when now < dueAt');
+});
+
+test('(i) setAlarm / clearAlarm on engine; nextAlarm reflects alarm_at override', () => {
+  const IDLE_AFTER_MS = 30 * 60 * 1000;
+  const idleDef = def('idle2', [input('proposal')], [
+    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    loop({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: IDLE_AFTER_MS }),
+  ]);
+  const { engine } = makeEngine([idleDef]);
+  const wf = engine.createInstance('idle2');
+
+  const customAlarm = 9999;
+  engine.setAlarm(wf, 'completion', customAlarm);
+
+  const r1 = engine.nextAlarm(wf, { now: customAlarm - 1 });
+  assert.equal(r1.dueAt, customAlarm, 'dueAt should equal the set alarm');
+  assert.equal(r1.isDue, false, 'isDue=false before alarm');
+
+  const r2 = engine.nextAlarm(wf, { now: customAlarm });
+  assert.equal(r2.isDue, true, 'isDue=true at alarm time');
+
+  engine.clearAlarm(wf, 'completion');
+  // After clear, dueAt falls back to lastProgressMs + idleAfterMs
+  const r3 = engine.nextAlarm(wf, { now: customAlarm });
+  // r3.dueAt is now lastProgressMs + IDLE_AFTER_MS, which is >= customAlarm
+  // (we just know it changed — it's no longer customAlarm)
+  assert.notEqual(r3.dueAt, customAlarm, 'dueAt should no longer be customAlarm after clearAlarm');
+});
+
+test('idle trigger fires the evaluator loop when alarm is set and threshold is reached', () => {
+  // Use setAlarm to bypass the lastProgressMs-based threshold, since lastProgressMs
+  // uses the real clock (putArtifact stamps updated_at with nowMs()) and tests use
+  // explicit now. The absolute alarm_at override is the reliable path for integration tests.
+  const IDLE_AFTER_MS = 30 * 60 * 1000;
+  const idleDef = def('idle3', [input('proposal')], [
+    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    loop({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: IDLE_AFTER_MS }),
+  ]);
+  const { engine } = makeEngine([idleDef]);
+  const wf = engine.createInstance('idle3');
+
+  // Tick at T=1000: planner fires (inputsGreen)
+  const t1 = engine.tick(wf, { now: 1000 });
+  assert.ok(t1.orders.some((o) => o.loop === 'planner'), 'planner order expected on first tick');
+
+  // Close the planner run so no task is in-flight
+  const plannerRun = t1.orders.find((o) => o.loop === 'planner')!.run;
+  engine.close(wf, plannerRun, 'no_work');
+
+  // Set an explicit alarm at T=5000 so we control the threshold
+  const alarmAt = 5000;
+  engine.setAlarm(wf, 'completion', alarmAt);
+
+  // Tick BEFORE alarm: completion must NOT fire
+  const tBefore = engine.tick(wf, { now: alarmAt - 1 });
+  const completionBefore = tBefore.orders.filter((o) => o.loop === 'completion');
+  assert.equal(completionBefore.length, 0, 'completion must NOT fire before alarm threshold');
+
+  // Close any new planner run so no task is in-flight for the next tick
+  for (const o of tBefore.orders.filter((o) => o.loop === 'planner')) {
+    engine.close(wf, o.run, 'no_work');
+  }
+
+  // Tick AT alarm: completion MUST fire (alarm_at threshold reached, workflow has debts)
+  const tAt = engine.tick(wf, { now: alarmAt });
+  const completionAt = tAt.orders.filter((o) => o.loop === 'completion');
+  assert.equal(completionAt.length, 1, 'completion MUST fire when alarm threshold is reached');
+  assert.equal(completionAt[0]!.cause, 'idle', 'order must carry cause=idle');
+
+  // TickResult.dueAt must be a number (idle loop exists)
+  assert.ok(tAt.dueAt !== undefined, 'dueAt field must be present when idle loops exist');
+  assert.equal(typeof tAt.dueAt, 'number', 'dueAt must be a number');
+});

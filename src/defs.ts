@@ -57,6 +57,7 @@ interface RawLoop {
   terminal?: unknown;
   effect?: unknown;
   on?: unknown;
+  idleAfter?: unknown;
   body?: unknown;
 }
 interface RawDef {
@@ -323,15 +324,18 @@ function buildLoop(rl: RawLoop, i: number): LoopDef {
       throw new DefError(`loop '${name}'.on must not be empty; a loop must have at least one firing trigger`);
     }
     for (const tok of rawOn) {
-      if (tok !== 'inputsGreen' && tok !== 'allGreen') {
+      if (tok !== 'inputsGreen' && tok !== 'allGreen' && tok !== 'idle') {
         throw new DefError(
-          `loop '${name}': on: token '${tok}' is not supported; ` +
-          `supported tokens now: 'inputsGreen', 'allGreen'. ` +
-          `The 'idle' trigger (and any time/alarm machinery) is a planned follow-up (PR3b).`,
+          `loop '${name}': on: token '${tok}' is not supported; supported: 'inputsGreen', 'allGreen', 'idle'`,
         );
       }
     }
     loop.on = rawOn as FiringTrigger[];
+  }
+  if (rl.idleAfter !== undefined) {
+    const idleAfterStr = asString(rl.idleAfter, `loop '${name}'.idleAfter`);
+    loop.idleAfter = idleAfterStr;
+    loop.idleAfterMs = parseDurationSecs(idleAfterStr) * 1000;
   }
   return loop;
 }
@@ -484,13 +488,23 @@ export function validateDef(def: WorkflowDef): string[] {
       errors.push(`loop '${l.name}': on: must not be empty; a loop must have at least one firing trigger`);
     }
     for (const tok of l.on) {
-      if (tok !== 'inputsGreen' && tok !== 'allGreen') {
+      if (tok !== 'inputsGreen' && tok !== 'allGreen' && tok !== 'idle') {
         errors.push(
           `loop '${l.name}': on: token '${tok}' is not supported; ` +
-          `supported now: 'inputsGreen', 'allGreen'. ` +
-          `The 'idle' trigger is a planned follow-up (PR3b).`,
+          `supported: 'inputsGreen', 'allGreen', 'idle'.`,
         );
       }
+    }
+  }
+
+  // idle/idleAfter cross-checks
+  for (const l of def.loops) {
+    const hasIdle = l.on?.includes('idle') ?? false;
+    if (hasIdle && l.idleAfterMs === undefined) {
+      errors.push(`loop '${l.name}': on: includes 'idle' but idleAfter is not set; idleAfter is required for the idle trigger`);
+    }
+    if (!hasIdle && l.idleAfterMs !== undefined) {
+      errors.push(`loop '${l.name}': idleAfter is set but 'idle' is not in on:; idleAfter is only meaningful with the idle trigger`);
     }
   }
 

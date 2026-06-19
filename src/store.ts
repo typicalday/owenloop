@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS task (
   run         TEXT,
   claimed_at  INTEGER,
   attempts    INTEGER NOT NULL DEFAULT 0,
+  alarm_at    INTEGER,
   updated_at  INTEGER NOT NULL,
   UNIQUE (workflow, loop, key)
 );
@@ -186,6 +187,7 @@ interface TaskRowRaw {
   run: string | null;
   claimed_at: number | null;
   attempts: number;
+  alarm_at: number | null;
   updated_at: number;
 }
 
@@ -201,6 +203,7 @@ function mapTask(r: TaskRowRaw): TaskRow {
   };
   if (r.run !== null) out.run = r.run;
   if (r.claimed_at !== null) out.claimedAt = r.claimed_at;
+  if (r.alarm_at !== null) out.alarmAt = r.alarm_at;
   return out;
 }
 
@@ -290,6 +293,10 @@ export class Store {
     const runCols = this.db.prepare(`PRAGMA table_info(run)`).all() as Array<{ name: string }>;
     if (!runCols.some((c) => c.name === 'cause')) {
       this.db.exec(`ALTER TABLE run ADD COLUMN cause TEXT`);
+    }
+    const taskCols = this.db.prepare(`PRAGMA table_info(task)`).all() as Array<{ name: string }>;
+    if (!taskCols.some((c) => c.name === 'alarm_at')) {
+      this.db.exec(`ALTER TABLE task ADD COLUMN alarm_at INTEGER`);
     }
   }
 
@@ -442,13 +449,14 @@ export class Store {
     const at = nowMs();
     this.db
       .prepare(
-        `INSERT INTO task (id, workflow, loop, key, status, run, claimed_at, attempts, updated_at)
-         VALUES (@id, @workflow, @loop, @key, @status, @run, @claimed_at, @attempts, @updated_at)
+        `INSERT INTO task (id, workflow, loop, key, status, run, claimed_at, attempts, alarm_at, updated_at)
+         VALUES (@id, @workflow, @loop, @key, @status, @run, @claimed_at, @attempts, @alarm_at, @updated_at)
          ON CONFLICT(id) DO UPDATE SET
            status = excluded.status,
            run = excluded.run,
            claimed_at = excluded.claimed_at,
            attempts = excluded.attempts,
+           alarm_at = excluded.alarm_at,
            updated_at = excluded.updated_at`,
       )
       .run({
@@ -460,9 +468,47 @@ export class Store {
         run: data.run ?? null,
         claimed_at: data.claimedAt ?? null,
         attempts: data.attempts,
+        alarm_at: data.alarmAt ?? null,
         updated_at: at,
       });
     return this.getTask(data.workflow, data.loop, data.key) as TaskRow;
+  }
+
+  /** Read the stored alarm_at for (workflow, loop), or undefined if not set. */
+  getAlarm(workflow: string, loop: string): number | undefined {
+    const t = this.getTask(workflow, loop, '');
+    return t?.alarmAt;
+  }
+
+  /** Persist an absolute alarm time for an idle evaluator loop. */
+  setAlarm(workflow: string, loop: string, at: number): void {
+    const id = taskId(workflow, loop, '');
+    const existing = this.getTask(workflow, loop, '');
+    if (existing) {
+      this.db.prepare('UPDATE task SET alarm_at = ?, updated_at = ? WHERE id = ?')
+        .run(at, nowMs(), id);
+    } else {
+      // Rare: evaluator loop has never been ticked. Insert a minimal idle row.
+      this.putTask({ workflow, loop, key: '', status: 'idle', attempts: 0, alarmAt: at });
+    }
+  }
+
+  /** Clear the alarm (set alarm_at = NULL). */
+  clearAlarm(workflow: string, loop: string): void {
+    const id = taskId(workflow, loop, '');
+    this.db.prepare('UPDATE task SET alarm_at = NULL, updated_at = ? WHERE id = ?')
+      .run(nowMs(), id);
+  }
+
+  /**
+   * Derive last_progress as MAX(artifact.updated_at) for the workflow.
+   * Returns 0 if no artifacts exist yet.
+   */
+  lastProgressMs(workflow: string): number {
+    const row = this.db
+      .prepare('SELECT MAX(updated_at) AS t FROM artifact WHERE workflow = ?')
+      .get(workflow) as { t: number | null };
+    return row.t ?? 0;
   }
 
   // -- run ---------------------------------------------------------------------

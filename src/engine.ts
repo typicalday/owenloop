@@ -27,7 +27,7 @@ import {
   requiredInputs,
   workflowStatus,
 } from './model.ts';
-import type { ArtifactMap, CascadeOp, Firing, WorkflowStatus } from './model.ts';
+import type { ArtifactMap, CascadeOp, Firing, TimeFacts, WorkflowStatus } from './model.ts';
 import { summarizeIssues, validateValue } from './schema.ts';
 import type { SchemaIssue } from './schema.ts';
 import { localMidnightMs, nowMs, randId } from './util.ts';
@@ -96,6 +96,12 @@ export interface TickResult {
   orders: Order[];
   reaped: number;
   deferred: DeferredFiring[];
+  /**
+   * The earliest pending time-trigger (ms epoch) among idle evaluators, if any.
+   * Absent when the workflow has no idle loops. An external scheduler uses this
+   * to decide when to next wake the instance.
+   */
+  dueAt?: number;
 }
 
 export interface CommitResult {
@@ -268,12 +274,23 @@ export class Engine {
     const def = this.defFor(workflow);
     const now = opts.now ?? nowMs();
     return this.store.tx(() => {
-      this.settle(workflow, def);
+      this.settle(workflow, def, now);
       const reaped = this.reap(workflow, now);
 
       const arts = this.artMap(workflow);
-      const firings = eligibleFirings(def, arts);
+
+      // Compute time facts for idle eligibility (clock-read boundary).
+      const timeFacts = this.computeTimeFacts(def, workflow, arts, now);
+
+      const firings = eligibleFirings(def, arts, timeFacts);
       const { selected, deferred } = this.applySchedule(workflow, def, firings, now);
+
+      // Clear alarm_at for any idle firing that was selected (consume the alarm).
+      for (const f of selected) {
+        if (f.cause === 'idle') {
+          this.store.clearAlarm(workflow, f.loop);
+        }
+      }
 
       const orders: Order[] = [];
       const allDeferred: DeferredFiring[] = [...deferred];
@@ -287,7 +304,13 @@ export class Engine {
           orders.push(result);
         }
       }
-      return { workflow, orders, reaped, deferred: allDeferred };
+
+      // E-DUE: compute earliest pending time-trigger for the result.
+      const dueAt = this.computeDueAt(def, workflow, now);
+
+      const result: TickResult = { workflow, orders, reaped, deferred: allDeferred };
+      if (dueAt !== null) result.dueAt = dueAt;
+      return result;
     });
   }
 
@@ -762,6 +785,42 @@ export class Engine {
     return st;
   }
 
+  // ---- alarm API (E-SETALARM / E-DUE) ----------------------------------------
+
+  /** Set a persistent alarm for an idle evaluator loop. Survives restart. */
+  setAlarm(workflow: string, loop: string, at: number): void {
+    this.store.setAlarm(workflow, loop, at);
+  }
+
+  /** Clear the alarm for an idle evaluator loop. */
+  clearAlarm(workflow: string, loop: string): void {
+    this.store.clearAlarm(workflow, loop);
+  }
+
+  /**
+   * Returns the earliest pending time-trigger among idle evaluators for this workflow,
+   * and whether it is due at `now`. Used by an external scheduler to decide when to
+   * wake this instance.
+   */
+  nextAlarm(workflow: string, opts: { now?: number } = {}): { dueAt: number | null; isDue: boolean } {
+    const now = opts.now ?? nowMs();
+    const def = this.defFor(workflow);
+    const lastProgressMs = this.store.lastProgressMs(workflow);
+    let earliest: number | null = null;
+
+    for (const loop of def.loops) {
+      if (!loop.on?.includes('idle')) continue;
+      const alarmAt = this.store.getAlarm(workflow, loop.name);
+      const threshold = alarmAt ?? (lastProgressMs + (loop.idleAfterMs ?? 0));
+      if (earliest === null || threshold < earliest) earliest = threshold;
+    }
+
+    return {
+      dueAt: earliest,
+      isDue: earliest !== null && now >= earliest,
+    };
+  }
+
   // ---- internals -------------------------------------------------------------
 
   /**
@@ -799,8 +858,55 @@ export class Engine {
     this.fire({ type: 'settled', workflow, done: st.done, eligible: st.eligible.map((e) => e.loop) });
   }
 
+  /** Compute the TimeFacts bag for idle eligibility from the current store state. */
+  private computeTimeFacts(
+    def: WorkflowDef,
+    workflow: string,
+    arts: ArtifactMap,
+    now: number,
+  ): TimeFacts {
+    const lastProgressMs = this.store.lastProgressMs(workflow);
+    const inFlight = this.isInFlight(workflow, now);
+    const alarms = new Map<string, number>();
+    for (const loop of def.loops) {
+      if (!loop.on?.includes('idle')) continue;
+      const alarmAt = this.store.getAlarm(workflow, loop.name);
+      if (alarmAt !== undefined) alarms.set(loop.name, alarmAt);
+    }
+    void arts; // arts not needed here but passed for consistency
+    return { now, lastProgressMs, inFlight, alarms };
+  }
+
+  /** Returns true if any fresh claimed task exists for this workflow. */
+  private isInFlight(workflow: string, now: number): boolean {
+    for (const task of this.store.listTasks(workflow)) {
+      if (task.status !== 'claimed') continue;
+      const run = task.run ? this.store.getRun(task.run) : undefined;
+      const fresh =
+        !!run &&
+        run.outcome === undefined &&
+        (task.claimedAt === undefined || now - task.claimedAt <= this.reapTtlMs);
+      if (fresh) return true;
+    }
+    return false;
+  }
+
+  /** Compute the earliest pending idle time-trigger (ms epoch), or null. */
+  private computeDueAt(def: WorkflowDef, workflow: string, now: number): number | null {
+    const lastProgressMs = this.store.lastProgressMs(workflow);
+    let earliest: number | null = null;
+    for (const loop of def.loops) {
+      if (!loop.on?.includes('idle')) continue;
+      const alarmAt = this.store.getAlarm(workflow, loop.name);
+      const threshold = alarmAt ?? (lastProgressMs + (loop.idleAfterMs ?? 0));
+      if (earliest === null || threshold < earliest) earliest = threshold;
+    }
+    void now; // for future use (filtering due vs pending)
+    return earliest;
+  }
+
   /** Materialize owed outputs + run the cascade to a fixpoint (inside a tx). */
-  private settle(workflow: string, def: WorkflowDef): void {
+  private settle(workflow: string, def: WorkflowDef, now?: number): void {
     const limit = 1000;
     for (let i = 0; i < limit; i++) {
       let arts = this.artMap(workflow);
@@ -808,7 +914,14 @@ export class Engine {
       for (const a of owed) this.store.putArtifact({ ...a, workflow });
       if (owed.length) arts = this.artMap(workflow);
 
-      const ops = maintainDecisions(def, arts);
+      // Only pass TimeFacts when we have a clock reading (tick path).
+      // Non-tick settles (green, reject, etc.) never trigger idle re-arm.
+      let timeFacts: TimeFacts | undefined;
+      if (now !== undefined) {
+        timeFacts = this.computeTimeFacts(def, workflow, arts, now);
+      }
+
+      const ops = maintainDecisions(def, arts, timeFacts);
       for (const op of ops) this.applyOp(workflow, def, arts, op);
 
       if (owed.length === 0 && ops.length === 0) return;

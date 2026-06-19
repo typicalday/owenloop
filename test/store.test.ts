@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Store, artifactId, taskId } from '../src/store.ts';
 import { randId } from '../src/util.ts';
 import type { ArtifactData } from '../src/types.ts';
@@ -240,4 +243,113 @@ test('listRuns returns all runs for a workflow ordered by created_at, rowid', ()
   assert.equal(runs[1]!.outcome, undefined, 'open run has undefined outcome');
 
   s.close();
+});
+
+// ---- alarm_at round-trip (PR3b: idle trigger) --------------------------------
+
+test('setAlarm / getAlarm / clearAlarm round-trip', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const loop = 'completion';
+  const alarmTime = 9999;
+
+  // No alarm yet — getAlarm returns undefined
+  assert.equal(s.getAlarm(wf, loop), undefined);
+
+  // setAlarm creates the task row and sets alarm_at
+  s.setAlarm(wf, loop, alarmTime);
+  assert.equal(s.getAlarm(wf, loop), alarmTime, 'getAlarm returns the stored alarm_at');
+
+  // clearAlarm sets alarm_at to null → getAlarm returns undefined
+  s.clearAlarm(wf, loop);
+  assert.equal(s.getAlarm(wf, loop), undefined, 'getAlarm returns undefined after clearAlarm');
+
+  s.close();
+});
+
+test('setAlarm updates an existing task row (upsert path)', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const loop = 'completion';
+
+  // Create the task row via putTask first
+  s.putTask({ workflow: wf, loop, key: '', status: 'idle', attempts: 0 });
+
+  // setAlarm on existing row
+  s.setAlarm(wf, loop, 12345);
+  assert.equal(s.getAlarm(wf, loop), 12345);
+
+  // Update alarm
+  s.setAlarm(wf, loop, 99999);
+  assert.equal(s.getAlarm(wf, loop), 99999, 'setAlarm updates alarm_at on existing row');
+
+  s.close();
+});
+
+test('lastProgressMs returns 0 when no artifacts exist', () => {
+  const s = mem();
+  const wf = randId('wf');
+  assert.equal(s.lastProgressMs(wf), 0);
+  s.close();
+});
+
+test('lastProgressMs returns MAX(updated_at) of artifacts for the workflow', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const wf2 = randId('wf');
+
+  const base: ArtifactData = {
+    workflow: wf,
+    path: 'plan',
+    producer: 'planner',
+    acceptance: 'owed',
+    version: 0,
+    reasons: [],
+    judgmentRejects: 0,
+    schemaRejects: 0,
+  };
+
+  // Insert an artifact; lastProgressMs should return its updated_at
+  s.putArtifact(base);
+  const t1 = s.lastProgressMs(wf);
+  assert.ok(t1 > 0, 'lastProgressMs > 0 after first artifact');
+
+  // Insert another artifact for a different workflow — must not affect wf
+  s.putArtifact({ ...base, workflow: wf2, path: 'plan' });
+  const t2 = s.lastProgressMs(wf);
+  assert.equal(t2, t1, 'lastProgressMs is scoped to the workflow');
+
+  s.close();
+});
+
+// ---- alarm_at restart persistence (PR3b: E-ALARM contract) -------------------
+
+test('alarm_at survives a process restart (file-backed round-trip)', () => {
+  // Open a Store on a real file, setAlarm, CLOSE it, REOPEN a new Store on the
+  // same file (so migrate() runs again), and assert getAlarm returns the stored
+  // value. This verifies that alarm_at persists across process restarts.
+  const dir = mkdtempSync(join(tmpdir(), 'oweflow-store-test-'));
+  const dbPath = join(dir, 'test.db');
+  const wf = randId('wf');
+  const loop = 'completion';
+  const alarmTime = 1_700_000_000_000; // a plausible ms-epoch value
+
+  try {
+    // First process lifetime: open, set alarm, close.
+    const s1 = new Store(dbPath);
+    s1.setAlarm(wf, loop, alarmTime);
+    assert.equal(s1.getAlarm(wf, loop), alarmTime, 'alarm readable before close');
+    s1.close();
+
+    // Second process lifetime: open the same file (migrate() runs), read alarm.
+    const s2 = new Store(dbPath);
+    assert.equal(
+      s2.getAlarm(wf, loop),
+      alarmTime,
+      'alarm_at survives Store close+reopen (restart persistence)',
+    );
+    s2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

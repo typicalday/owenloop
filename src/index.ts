@@ -52,7 +52,7 @@ export {
   singletonProduces,
   workflowStatus,
 } from './model.ts';
-export type { ArtifactMap, Blocker, CascadeOp, Firing, WorkflowStatus } from './model.ts';
+export type { ArtifactMap, Blocker, CascadeOp, Firing, TimeFacts, WorkflowStatus } from './model.ts';
 
 export {
   parseConsume,
@@ -73,6 +73,7 @@ export type {
   CheckReport,
   CheckStep,
   ConsumePattern,
+  FiringTrigger,
   Fingerprint,
   GraphEdge,
   GraphNode,

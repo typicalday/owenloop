@@ -328,7 +328,9 @@ loops:
     on: [inputsGreen]          # optional; firing trigger (§21). Values:
                                #   'inputsGreen' (default) — fire when consumed inputs are green
                                #   'allGreen'               — fire when workflow is done (completion evaluator)
+                               #   'idle'                   — fire when quiescent past idleAfter threshold (§21.8)
                                #   Omit for classic inputsGreen behaviour; on:[] is a hard error.
+    idleAfter: 30m             # required when 'idle' is in on:; duration string (e.g. "30m", "2h")
     invalidates: [plan]        # which input stems this loop may invalidate
                                #   (default: its consumed stems)
     cadence: "0s"              # min spacing between runs (e.g. "30m")
@@ -435,14 +437,36 @@ By default, a loop fires when its consumed inputs are all green (`inputsGreen`).
 - **`on:` omitted** — equivalent to `on: ['inputsGreen']`. All existing defs behave exactly as before.
 - **`on: ['inputsGreen']`** — explicit default. Fire when consumed inputs are green.
 - **`on: ['allGreen']`** — completion evaluator mode (§21). The loop fires when the workflow is "all-green" — no outstanding debts among all artifacts except the evaluator's own produced outputs (bootstrap exclusion). Use for a loop that inspects the completed workflow and emits an `outcome` artifact.
+- **`on: ['idle']`** — idle trigger (§21.8). The loop fires when the workflow is quiescent and no progress has been made for longer than `idleAfter`. Use for a watchdog, a stuck-detector, or a timeout handler. Requires `idleAfter` (hard error if absent).
+- **`on: ['allGreen', 'idle']`** — combined evaluator. Fires on completion (`allGreen`) and also fires if the workflow has been stuck past the idle threshold. A worker reads `order.cause` (`'allGreen'` or `'idle'`) to branch behaviour.
 - **`on: []`** — hard error: a loop must have at least one firing trigger.
-- **`idle` and time-based triggers** — planned for PR3b; any other `on:` token is a hard error.
+
+**`idleAfter`:** required when `'idle'` is in `on:`. A duration string (same format as `cadence`, e.g. `"30m"`, `"2h"`, `"1d"`). The loop fires when no artifact in the workflow has been updated for this long. Progress resets the clock: every state change (green, reject, owed) advances `last_progress`.
+
+```yaml
+- name: completion
+  on: [allGreen, idle]
+  idleAfter: 30m           # fire if the workflow is stuck for 30 minutes
+  generates: [outcome]
+  body: |
+    # order.cause is 'allGreen' when done, 'idle' when stuck past 30m
+```
+
+**Alarm (absolute override):** a worker that needs a recurring heartbeat or a deadline can call `engine.setAlarm(workflow, loop, at)` with an absolute ms-epoch timestamp. The alarm overrides the relative `idleAfter` window and survives process restart (persisted in SQLite). The engine clears the alarm when idle fires; the worker must call `setAlarm` again inside its body to re-arm:
+
+```typescript
+// inside an idle-trigger worker body:
+engine.setAlarm(workflowId, 'completion', Date.now() + 3_600_000); // re-arm in 1 hour
+await oweflow.green(order.run, { /* ... */ });
+```
+
+**`engine.nextAlarm(workflow)`** returns `{ dueAt: number | null; isDue: boolean }` — the earliest pending idle threshold across all idle loops in the workflow. An external scheduler uses this to decide when to wake the instance.
 
 **Bootstrap exclusion:** the evaluator's own `outcome` is excluded from the all-green check so that "all other artifacts are done" can be true before the evaluator runs.
 
 **Re-arm:** once `outcome` is green, if the workflow later falls back out of all-green (e.g. an upstream input is re-provided), `maintainDecisions` detects that `outcome` is green but the workflow is no longer all-green, and emits a structural reject to re-arm `outcome`. The evaluator re-fires automatically when the workflow returns to all-green.
 
-**`cause` in the order:** the engine threads the trigger onto `order.cause` (e.g. `'allGreen'`). A worker can read `order.cause` to branch behaviour — for example, a completion evaluator may inspect status, green `outcome`, and message a human.
+**`cause` in the order:** the engine threads the trigger onto `order.cause` (e.g. `'allGreen'` or `'idle'`). A worker can read `order.cause` to branch behaviour — for example, a completion evaluator may inspect status, green `outcome`, and message a human.
 
 ### Consume / produce grammar
 

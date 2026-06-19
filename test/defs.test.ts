@@ -962,19 +962,18 @@ test('lintDef: dead-end warning message mentions outputs:', () => {
 
 // ---- (f) on: firing-trigger validation ----------------------------------------
 
-// (f1) on: ['idle'] → hard error mentioning PR3b
-test('parseDef: on: [idle] is a hard error mentioning PR3b', () => {
-  assert.throws(
-    () => parseDef({
-      name: 'wf',
-      inputs: [{ name: 'seed' }],
-      loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['idle'] }],
-    }),
-    (e: unknown) => {
-      assert.ok(e instanceof DefError);
-      assert.ok((e as Error).message.includes('idle') || (e as Error).message.includes('PR3b'));
-      return true;
-    },
+// (f1) on: ['idle'] without idleAfter → hard error (idleAfter is required for idle trigger)
+test('parseDef: on: [idle] without idleAfter is a hard validateDef error', () => {
+  // buildDef succeeds (no throw from buildLoop) but validateDef reports the cross-check error
+  const d = buildDef({
+    name: 'wf',
+    inputs: [{ name: 'seed' }],
+    loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['idle'] }],
+  });
+  const errors = validateDef(d);
+  assert.ok(
+    errors.some((e) => e.includes('idle') && e.includes('idleAfter')),
+    `expected error about idle missing idleAfter; errors: ${errors.join('; ')}`,
   );
 });
 
@@ -1037,6 +1036,75 @@ test('parseDef: on: omitted → valid, on is undefined', () => {
     loops: [{ name: 'a', consumes: ['seed'], produces: ['out'] }],
   });
   assert.equal(d.loops[0]!.on, undefined);
+});
+
+// (f7) on: ['idle'] without idleAfter → validateDef error
+test('parseDef: on: [idle] without idleAfter → validateDef error', () => {
+  const d = buildDef({
+    name: 'wf',
+    inputs: [{ name: 'seed' }],
+    loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['idle'] }],
+  });
+  const errors = validateDef(d);
+  assert.ok(
+    errors.some((e) => e.includes('idle') && e.includes('idleAfter')),
+    `expected cross-check error about idle missing idleAfter; errors: ${errors.join('; ')}`,
+  );
+});
+
+// (f8) idleAfter set without idle in on: → validateDef error
+test('parseDef: idleAfter set but idle not in on: → validateDef error', () => {
+  const d = buildDef({
+    name: 'wf',
+    inputs: [{ name: 'seed' }],
+    loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], idleAfter: '30m' }],
+  });
+  const errors = validateDef(d);
+  assert.ok(
+    errors.some((e) => e.includes('idleAfter') && e.includes('idle')),
+    `expected cross-check error about idleAfter without idle; errors: ${errors.join('; ')}`,
+  );
+});
+
+// (f9) on: ['idle'], idleAfter: '30m' → valid (no error)
+test('parseDef: on: [idle] with idleAfter is valid', () => {
+  const d = parseDef({
+    name: 'wf',
+    inputs: [{ name: 'seed' }],
+    loops: [
+      { name: 'planner', consumes: ['seed'], produces: ['plan'] },
+      { name: 'eval', on: ['idle'], idleAfter: '30m', generates: ['outcome'], consumes: [], body: '' },
+    ],
+  });
+  assert.deepEqual(d.loops[1]!.on, ['idle']);
+  assert.equal(d.loops[1]!.idleAfter, '30m');
+  assert.equal(d.loops[1]!.idleAfterMs, 30 * 60 * 1000);
+});
+
+// (f10) on: ['allGreen', 'idle'], idleAfter: '2h' → valid (combined evaluator)
+test('parseDef: on: [allGreen, idle] with idleAfter is valid', () => {
+  const d = parseDef({
+    name: 'wf',
+    inputs: [{ name: 'seed' }],
+    loops: [
+      { name: 'planner', consumes: ['seed'], produces: ['plan'] },
+      { name: 'eval', on: ['allGreen', 'idle'], idleAfter: '2h', generates: ['outcome'], consumes: [], body: '' },
+    ],
+  });
+  assert.deepEqual(d.loops[1]!.on, ['allGreen', 'idle']);
+  assert.equal(d.loops[1]!.idleAfterMs, 2 * 60 * 60 * 1000);
+});
+
+// (f11) on: ['unknown_token'] → hard DefError from buildLoop (unchanged)
+test('parseDef: on: [unknown_token] is a hard error (unchanged)', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'wf',
+      inputs: [{ name: 'seed' }],
+      loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['totally_unknown'] }],
+    }),
+    DefError,
+  );
 });
 
 // ---- D-D named-handler validateDef tests -------------------------------------

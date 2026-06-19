@@ -43,6 +43,21 @@ import type {
 
 export type ArtifactMap = ReadonlyMap<string, ArtifactData>;
 
+/**
+ * Clock and quiescence facts needed for idle-trigger eligibility.
+ * Passed as an explicit parameter — model.ts is pure (no Date, no nowMs).
+ */
+export interface TimeFacts {
+  /** Current time (ms since epoch). */
+  now: number;
+  /** Timestamp of the most recent artifact state change for this workflow. */
+  lastProgressMs: number;
+  /** Whether any run is genuinely in flight (claimed + lease fresh). */
+  inFlight: boolean;
+  /** Per-loop alarm_at values: loop name → alarm_at in ms (if set). */
+  alarms: Map<string, number>;
+}
+
 /** A candidate run: a loop bound to a particular key, with its concrete edges. */
 export interface Firing {
   loop: string;
@@ -301,18 +316,51 @@ export function pendingOwed(def: WorkflowDef, arts: ArtifactMap): ArtifactData[]
 // ---- eligibility (§3 / §11.4) ------------------------------------------------
 
 /**
+ * Returns true if the idle trigger is eligible for this loop.
+ * Pure — takes only explicit parameters; no Date, no nowMs.
+ *
+ * Eligibility: now >= (alarm_at ?? last_progress + idleAfterMs)
+ *   AND workflow is NOT done (has debts excluding evaluator outputs)
+ *   AND no run is in-flight for this loop
+ */
+function idleEligible(
+  loop: LoopDef,
+  arts: ArtifactMap,
+  time: TimeFacts,
+): boolean {
+  const { now, lastProgressMs, inFlight, alarms } = time;
+  if (inFlight) return false; // R12: in-flight ≠ idle
+
+  const idleAfterMs = loop.idleAfterMs!; // validated: idle requires idleAfter
+  const alarmAt = alarms.get(loop.name);
+  const threshold = alarmAt ?? (lastProgressMs + idleAfterMs);
+  if (now < threshold) return false;
+
+  // Compute evaluator's own outputs to exclude from all-green check.
+  const evaluatorOutputs = new Set<string>(plainOutputs(loop));
+
+  // Not-done gate: idle fires only when there ARE non-evaluator debts.
+  // (If the workflow is all-green → allGreen fires, not idle.)
+  const wfAllGreen = allArtifactsGreen(arts, evaluatorOutputs);
+  if (wfAllGreen) return false; // allGreen owns this condition
+
+  return true;
+}
+
+/**
  * Every firing eligible *right now* — inputs satisfied AND an owed/rejected
  * output to discharge. This is the scheduling gate (§11.4): necessary, not
  * sufficient; the commit fingerprint (§12.2) is the correctness boundary.
  * Assumes `pendingOwed` has already been materialized into `arts`.
  */
-export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap): Firing[] {
+export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: TimeFacts): Firing[] {
   const firings: Firing[] = [];
 
   for (const loop of def.loops) {
     const triggers = resolvedTriggers(loop);
     const hasInputsGreen = triggers.includes('inputsGreen');
     const hasAllGreen = triggers.includes('allGreen');
+    const hasIdle = triggers.includes('idle');
 
     if (hasInputsGreen) {
       const mode = loopMode(loop);
@@ -405,6 +453,24 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap): Firing[] {
         }
       }
     }
+
+    if (hasIdle && time) {
+      if (idleEligible(loop, arts, time)) {
+        const outs = plainOutputs(loop).filter((p) => {
+          const a = arts.get(p);
+          return isDebt(a) && !frozen(a, loop);
+        });
+        if (outs.length > 0) {
+          firings.push({
+            loop: loop.name,
+            key: '',
+            inputs: [],
+            outputs: outs,
+            cause: 'idle',
+          });
+        }
+      }
+    }
   }
 
   return firings;
@@ -428,7 +494,7 @@ function plainOutputs(loop: LoopDef): string[] {
  * tombstoning of map children, skip-propagation down dead branches, and the
  * re-arm of a skipped subtree when its branch revives.
  */
-export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap): CascadeOp[] {
+export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: TimeFacts): CascadeOp[] {
   const ops: CascadeOp[] = [];
 
   for (const art of arts.values()) {
@@ -539,6 +605,27 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap): CascadeO
         path,
         reason: 'allGreen-rearm: workflow fell out of done — re-evaluating',
       });
+    }
+  }
+
+  // idle heartbeat re-arm: if an idle evaluator's outcome is green AND the idle
+  // threshold has elapsed again (alarm set by the evaluator), re-arm outcome.
+  if (time) {
+    for (const loop of def.loops) {
+      const triggers = resolvedTriggers(loop);
+      if (!triggers.includes('idle')) continue;
+      if (!idleEligible(loop, arts, time)) continue; // threshold not reached
+
+      const evaluatorOutputPaths = plainOutputs(loop);
+      for (const path of evaluatorOutputPaths) {
+        const art = arts.get(path);
+        if (!art || art.acceptance !== 'green' || art.terminal) continue;
+        ops.push({
+          kind: 'reject',
+          path,
+          reason: 'idle-rearm: alarm elapsed again — re-evaluating idle condition',
+        });
+      }
     }
   }
 
@@ -1237,7 +1324,11 @@ function applyOpInMemory(
       reasons: [
         ...art.reasons,
         {
-          at: Date.now(),
+          // E-PURITY: the pure in-memory twin (applyOpInMemory / settleInMemory) must not
+          // read wall-clock time.  reason.at is non-semantic in the model layer — the
+          // conformance test compares cascade state (acceptance/version/fingerprint), not
+          // reasons — so a deterministic sentinel (0) keeps model.ts clock-free.
+          at: 0,
           action: 'pinned',
           kind: 'structural',
           by: 'engine',
@@ -1257,7 +1348,9 @@ function applyOpInMemory(
     newArt.reasons = [
       ...art.reasons,
       {
-        at: Date.now(),
+        // E-PURITY sentinel — same reasoning as the pin case above: reason.at is
+        // non-semantic in the model layer; 0 keeps model.ts clock-free.
+        at: 0,
         action: 'reject',
         kind: 'invalidated-irreversible',
         by: 'engine',

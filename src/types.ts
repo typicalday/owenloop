@@ -97,6 +97,8 @@ export interface TaskData {
   run?: string; // run uid holding the lease
   claimedAt?: number;
   attempts: number; // reaper strikes (lease churn), distinct from artifact judgmentRejects
+  /** Persisted alarm time (ms epoch) for idle evaluator loops. Stored in task row. */
+  alarmAt?: number;
 }
 
 /** A run node — audit/budget trail, and the holder of a claim's fingerprint. */
@@ -149,9 +151,9 @@ export interface ProducePattern {
  * A loop-level trigger token that controls when the loop is eligible to fire.
  * - 'inputsGreen' (default) — classic behaviour: fire when consumed inputs are green.
  * - 'allGreen' — fire when the workflow is all-green (no debts among non-evaluator artifacts).
- * Extend with 'idle' in PR3b.
+ * - 'idle' — fire when the workflow is quiescent past the idleAfter threshold (§21.8).
  */
-export type FiringTrigger = 'inputsGreen' | 'allGreen';
+export type FiringTrigger = 'inputsGreen' | 'allGreen' | 'idle';
 
 /**
  * Declared per-loop effect contract (design §6.5). Controls forward-cascade routing
@@ -194,6 +196,10 @@ export interface LoopDef {
   effect?: EffectDef;
   /** Loop-level firing trigger (§21). Omitted = ['inputsGreen'] (default behaviour). */
   on?: FiringTrigger[];
+  /** Duration string for the idle threshold (e.g. "30m"). Required when 'idle' is in on:. */
+  idleAfter?: string;
+  /** Parsed idleAfter in milliseconds. */
+  idleAfterMs?: number;
   body: string; // prompt body
 }
 
