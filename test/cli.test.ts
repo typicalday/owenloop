@@ -69,7 +69,7 @@ test('an unknown command exits 1 and echoes usage', () => {
 test('a full delivery happy path runs end to end through main()', () => {
   const { run } = makeCli();
 
-  assert.deepEqual(run('defs').json().map((d: any) => d.name).sort(), ['delivery', 'full-cycle', 'intake', 'onboarding', 'provisioned-delivery', 'research', 'routing']);
+  assert.deepEqual(run('defs').json().map((d: any) => d.name).sort(), ['delivery', 'full-cycle', 'intake', 'onboarding', 'provisioned-delivery', 'research', 'routing', 'sla-watchdog']);
   assert.deepEqual(run('list').json(), []);
 
   const wf = run('create', 'delivery', '--title', 'Dark mode', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;

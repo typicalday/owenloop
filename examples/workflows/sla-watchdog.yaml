@@ -1,0 +1,173 @@
+# Contract-approval SLA watchdog — demonstrates the §21 idle/completion-evaluator
+# and alarm machinery, the only feature family not shown in the other examples.
+#
+# New concepts in this file:
+#   on: [allGreen, idle]   — combined completion-evaluator + idle-watchdog trigger
+#   idleAfter: 2h          — fire the monitor if nothing moves for 2 hours
+#   generates: [outcome]   — intentionally unconsumed output (lint-exempt); correct
+#                            for a repeatedly re-armed evaluator whose value changes
+#   order.cause            — 'allGreen' (done) or 'idle' (stuck past idleAfter)
+#   engine.setAlarm        — re-arm the monitor for a specific absolute timestamp
+#   engine.nextAlarm       — let an external scheduler ask "when should I wake this?"
+#
+# Domain: a contract draft is submitted; it must be reviewed and approved within an
+# SLA deadline.  If the workflow completes cleanly, the monitor finalises the record.
+# If the workflow stalls past the threshold, the monitor sends an escalation nudge,
+# re-arms its own alarm, and waits another hour.
+#
+# Dataflow:
+#
+#   contract (input, seedOwed)
+#       │
+#       ▼
+#   [review]  ──produces──▶  verdict
+#                                │
+#                                ▼
+#                           [approve]  ──produces──▶  approval  (terminal)
+#
+#   [monitor]  on: [allGreen, idle] · idleAfter: 2h · generates: [outcome]
+#       └─ fires when all other artifacts are done (allGreen) or stuck (idle)
+#
+# Why `generates:` not `produces:` for outcome?
+#   The monitor fires repeatedly (once on allGreen, once per idle re-arm cycle).
+#   Its `outcome` is a leaf that no downstream loop consumes.  `generates: [outcome]`
+#   is the correct declaration for a side-effectful ephemeral output that is
+#   intentionally unconsumed — it suppresses the dead-end lint warning.
+#   Using workflow-level `outputs: [outcome]` would also suppress the warning but
+#   implies a stable public interface artifact, which is inappropriate here.
+#
+# Bootstrap exclusion: `outcome` is excluded from the all-green check automatically
+#   because the `monitor` loop generates it.  This lets "all other artifacts are done"
+#   be true before the evaluator has even run.
+#
+# Drive it — happy path (contract approved within SLA):
+#   wf=$(oweflow create sla-watchdog \
+#          --provide contract='{"title":"MSA with Acme","submitted_at":"2026-06-20"}' \
+#          | jq -r .workflow)
+#   run=$(oweflow tick $wf | jq -r '.orders[0].run')              # -> order for `review`
+#   oweflow green $wf $run verdict --value '{"approved":true,"reviewer":"alice"}'
+#   run=$(oweflow tick $wf | jq -r '.orders[0].run')              # -> order for `approve`
+#   oweflow green $wf $run approval --value '{"signed":true}' --terminal
+#   run=$(oweflow tick $wf | jq -r '.orders[0].run')              # -> order for `monitor` (cause: allGreen)
+#   oweflow green $wf $run outcome --value '{"status":"approved","cause":"allGreen"}'
+#   oweflow status $wf            # done
+#
+# Idle path (contract stuck past 2 h — illustrative; omit --now in real use):
+#   # After idleAfter elapses with no progress, tick returns a `monitor` order:
+#   #   run=$(oweflow tick $wf --now $(date -d '+2h1m' +%s)000 | jq -r '.orders[0].run')
+#   #   # order.cause === 'idle' — worker sends escalation nudge and re-arms alarm:
+#   #   #   see the engine.setAlarm snippet below
+#   #   oweflow green $wf $run outcome \
+#   #     --value '{"status":"escalated","escalated_at":"2026-06-20T14:00:00Z","cause":"idle"}'
+#   #   # engine re-arms the monitor via idle-rearm; tick after another hour yields a new order
+#
+# Using engine.setAlarm / engine.nextAlarm from the Node API
+# (the CLI has no direct equivalent; use the embedded engine for alarm control):
+#
+# ```ts
+# // examples/sla-watchdog-alarm.ts
+# import { join } from 'node:path';
+# import { createEngine } from '../src/index.ts';
+#
+# const { engine, store } = createEngine({
+#   db: ':memory:',
+#   defsDir: join(import.meta.dirname, 'workflows'),
+# });
+#
+# // Create a contract-approval instance.
+# const wf = engine.createInstance('sla-watchdog', {
+#   provide: { contract: { title: 'MSA with Acme', submitted_at: '2026-06-20' } },
+# });
+#
+# // Simulate the review loop greening verdict.
+# const { orders: r1 } = engine.tick(wf);
+# engine.green(wf, r1[0].run, 'verdict', { approved: true, reviewer: 'alice' });
+# engine.close(wf, r1[0].run);
+#
+# // Simulate the idle trigger firing (pass a far-future `now` so idleAfter is exceeded).
+# const futureNow = Date.now() + 3 * 60 * 60 * 1000; // 3 h from now
+# const { orders: r2 } = engine.tick(wf, { now: futureNow });
+# const monitorOrder = r2[0]; // cause === 'idle'
+# console.log('cause:', monitorOrder?.cause); // 'idle'
+#
+# if (monitorOrder?.cause === 'idle') {
+#   // Re-arm the alarm: wake again in 1 hour.
+#   engine.setAlarm(wf, 'monitor', futureNow + 3_600_000);
+#   console.log('alarm re-armed');
+# }
+#
+# // Green the monitor's outcome (escalation details).
+# engine.green(wf, monitorOrder.run, 'outcome', {
+#   status: 'escalated',
+#   escalated_at: new Date(futureNow).toISOString(),
+#   cause: 'idle',
+# });
+# engine.close(wf, monitorOrder.run);
+#
+# // nextAlarm tells an external scheduler when to wake this instance.
+# const alarm = engine.nextAlarm(wf);
+# console.log('next alarm due at:', alarm.dueAt, '| is due now:', alarm.isDue);
+#
+# store.close();
+# ```
+
+name: sla-watchdog
+title: Contract approval with SLA watchdog
+description: |
+  Review and approve a contract within an SLA deadline.
+  The monitor loop fires on completion (allGreen) or when stuck past idleAfter (idle).
+
+inputs:
+  - name: contract
+    seedOwed: true
+    schema:
+      type: object
+      required: [title, submitted_at]
+      properties:
+        title: { type: string, minLength: 1 }
+        submitted_at: { type: string }
+      additionalProperties: false
+
+loops:
+  - name: review
+    consumes: [contract]
+    produces:
+      - name: verdict
+        schema:
+          type: object
+          required: [approved, reviewer]
+          properties:
+            approved: { type: boolean }
+            reviewer: { type: string, minLength: 1 }
+          additionalProperties: false
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Read `contract` and produce `verdict` (approved: true/false, reviewer name).
+
+  - name: approve
+    consumes: [verdict]
+    terminal: true              # finishing approval is a destructive terminal act
+    produces: [approval]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      The verdict is in. Countersign the contract and green `approval` (terminal).
+
+  - name: monitor
+    # §21 completion-evaluator + idle-watchdog combined trigger.
+    # Fires when the workflow is all-green (cause === 'allGreen') — every artifact
+    # except `outcome` is done — OR when the workflow is stuck for 2 h (cause === 'idle').
+    # Because this is a repeated evaluator, its output is declared under `generates:`
+    # rather than `produces:`, making it lint-exempt (no downstream consumer required).
+    on: [allGreen, idle]
+    idleAfter: 2h
+    generates: [outcome]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Read order.cause:
+        allGreen → the contract was processed on time; finalize the record.
+                   Green `outcome` with status "approved" and a summary timestamp.
+        idle     → the SLA threshold was exceeded; send an escalation nudge to the
+                   reviewer's manager. Call engine.setAlarm(wf, 'monitor', Date.now() +
+                   3_600_000) to re-arm the watchdog for another check in 1 hour. Then
+                   green `outcome` with status "escalated" and escalation details —
+                   the engine re-arms the monitor via idle-rearm when the alarm elapses.

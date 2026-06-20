@@ -126,8 +126,10 @@ import { createEngine } from 'oweflow';   // see "Programmatic / embedding" belo
 The bundled examples live in [`examples/workflows`](examples/workflows), each
 demonstrating one idea: [`delivery`](examples/workflows/delivery.yaml)
 (knock-backs), [`research`](examples/workflows/research.yaml) (collections),
-[`routing`](examples/workflows/routing.yaml) (skip-cascade), and
-[`intake`](examples/workflows/intake.yaml) (schema validation, §19). Point
+[`routing`](examples/workflows/routing.yaml) (skip-cascade),
+[`intake`](examples/workflows/intake.yaml) (schema validation, §19), and
+[`sla-watchdog`](examples/workflows/sla-watchdog.yaml) (idle trigger, completion
+evaluator, alarm — §21). Point
 oweflow at them and drive one end to end. Every data command prints JSON, so the
 snippet below pipes through `jq`.
 
