@@ -174,6 +174,12 @@ export interface EffectDef {
 /** A loop (step) definition. */
 export interface LoopDef {
   name: string;
+  /** Inputs this loop reads — and, by the same declaration, the artifacts it has
+   *  authority to judgment-`reject` (§4.1). Consuming is dual-purpose: it gates and
+   *  fingerprints the loop's firing (§3/§7) AND confers the right to send that
+   *  artifact back. To let a step invalidate an artifact, make it consume that
+   *  artifact — even when the step only *judges* the artifact (e.g. the merger
+   *  consuming `pr` to judge its mergeability) rather than transforming it. */
   consumes: ConsumePattern[];
   produces: ProducePattern[];
   /** Artifacts this loop generates that are intentionally NOT consumed downstream.

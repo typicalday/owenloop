@@ -49,6 +49,29 @@ Every invalidating action (`reject`, `schema-reject`, `retract`, `skip`,
 to the artifact. The thread is append-only and travels with the artifact, so the
 next order to (re)produce it carries the full feedback history in `owes[].reasons`.
 
+### §4.1 Invalidation authority
+
+A `reject` is an exercise of authority, and authority follows the consume edge:
+**only a loop that consumes an artifact's stem (or a human/engine) may
+judgment-reject it** (`assertAuthority`). A loop cannot dirty an artifact it has no
+relationship with — this keeps a many-loop graph's feedback aligned with its
+dataflow, and it is a one-line rule.
+
+The consequence for *authoring* is that `consumes` is **dual-purpose**. It declares a
+loop's inputs (the firing gate and fingerprint, §3/§7) **and** the set of artifacts
+the loop may send back. So to give a step the power to invalidate an artifact, make
+it consume that artifact — *even when the step only judges the artifact rather than
+transforming it*. The merger consuming `pr` is the canonical case: it lands the PR
+and judges its mergeability, so a merge conflict is a legitimate judgment-`reject` of
+`pr`, and the authority to issue it comes from the consume edge. A consume edge
+declared only for authority is harmless to the firing rule: an input that is always
+green by the time the loop fires (because it is upstream of the loop's other inputs)
+never changes when the loop becomes eligible.
+
+This governs *judgment* rejects only. The engine's own **structural** re-arm when a
+consumed input moves version (§7) is mechanical propagation, not a judgment, and is
+performed by the engine without an authority check.
+
 ## §5 Lifecycle states
 
 The five `acceptance` states (§11.3) partition into:

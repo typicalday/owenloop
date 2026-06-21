@@ -1272,7 +1272,12 @@ export class Engine {
     return r;
   }
 
-  /** Authority (§4): only a loop that consumes `path`'s stem (or a human) may judgment-reject it. */
+  /**
+   * Authority (§4.1): only a loop that consumes `path`'s stem (or a human/engine)
+   * may judgment-reject it. Consuming is dual-purpose — it is also how a loop is
+   * granted the right to invalidate an artifact (so a step that must send an
+   * artifact back, even one it only judges, must declare it in `consumes`).
+   */
   private assertAuthority(def: WorkflowDef, by: Author, path: string, _action: string): void {
     if (by === 'human' || by === 'engine') return;
     const el = parseElement(path);
@@ -1281,7 +1286,10 @@ export class Engine {
     if (!loop) throw new Error(`unknown actor: ${by}`);
     const consumesIt = loop.consumes.some((c) => c.stem === stem || c.stem === path);
     if (!consumesIt) {
-      throw new Error(`${by} has no authority to invalidate ${path} (it does not consume it)`);
+      throw new Error(
+        `${by} has no authority to invalidate ${path} (it does not consume it). ` +
+          `Authority follows the consume edge (§4.1): add \`${stem}\` to ${by}'s \`consumes\` to grant it.`,
+      );
     }
   }
 }
