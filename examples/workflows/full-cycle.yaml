@@ -10,7 +10,7 @@
 # The engine sees one graph; cascade crosses the seam for free.
 #
 # Load with:
-#   oweflow --defs examples/workflows defs
+#   liveloop --defs examples/workflows defs
 
 name: full-cycle
 title: Provision + delivery + teardown (Mode 1 compile-time inline)

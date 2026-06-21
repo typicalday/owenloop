@@ -313,7 +313,7 @@ test('buildDef rejects a produce schema with an unresolved $ref (gross error at 
 });
 
 test('loadDefs discovers a workflow.yaml inside a subdirectory', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-defs-sub-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-defs-sub-'));
   // a flat file...
   writeFileSync(
     join(dir, 'flat.yaml'),
@@ -334,7 +334,7 @@ test('loadDefs discovers a workflow.yaml inside a subdirectory', () => {
 });
 
 test('loadDefFile and loadDefs read YAML from disk', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-defs-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-defs-'));
   writeFileSync(
     join(dir, 'delivery.yaml'),
     [
@@ -1252,7 +1252,7 @@ test('validateDef: calls: loop callsInputs value must be a real parent artifact'
 });
 
 test('loadDefs: calls target must exist in resolver namespace', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-defs-test-'));
   try {
     writeFileSync(
       join(dir, 'parent.yaml'),
@@ -1288,7 +1288,7 @@ test('loadDefs: calls target must exist in resolver namespace', () => {
 });
 
 test('loadDefs: calls: inputs key must be a declared child input', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-defs-test-'));
   try {
     // Write child def with no inputs
     writeFileSync(
@@ -1338,7 +1338,7 @@ test('loadDefs: calls: inputs key must be a declared child input', () => {
 });
 
 test('detectCallsCycles: A calls B calls A errors with cycle message', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-defs-test-'));
   try {
     writeFileSync(
       join(dir, 'a.yaml'),
@@ -1379,7 +1379,7 @@ test('detectCallsCycles: A calls B calls A errors with cycle message', () => {
 });
 
 test('detectCallsCycles: A calls B (acyclic) passes without error', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-defs-test-'));
   try {
     writeFileSync(
       join(dir, 'b.yaml'),
@@ -1415,7 +1415,7 @@ test('detectCallsCycles: A calls B (acyclic) passes without error', () => {
 
 test('include cycle and calls cycle are detected independently', () => {
   // Calls cycle: a calls b calls a
-  const callsDir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  const callsDir = mkdtempSync(join(tmpdir(), 'liveloop-defs-test-'));
   try {
     writeFileSync(
       join(callsDir, 'a.yaml'),
@@ -1435,7 +1435,7 @@ test('include cycle and calls cycle are detected independently', () => {
   }
 
   // Include cycle: a includes b includes a — must produce a different error
-  const includeDir = mkdtempSync(join(tmpdir(), 'oweflow-defs-test-'));
+  const includeDir = mkdtempSync(join(tmpdir(), 'liveloop-defs-test-'));
   try {
     writeFileSync(
       join(includeDir, 'a.yaml'),

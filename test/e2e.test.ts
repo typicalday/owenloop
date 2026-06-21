@@ -1,5 +1,5 @@
 /**
- * End-to-end tests: drive the real `bin/oweflow.mjs` binary as a subprocess,
+ * End-to-end tests: drive the real `bin/liveloop.mjs` binary as a subprocess,
  * against a real on-disk SQLite database and the shipped example workflows.
  * Nothing here imports the engine directly — it goes argv → JSON → SQLite → JSON,
  * exactly as a wiring (the worker that runs orders) would.
@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
-const BIN = join(ROOT, 'bin', 'oweflow.mjs');
+const BIN = join(ROOT, 'bin', 'liveloop.mjs');
 const DEFS = join(ROOT, 'examples', 'workflows');
 
 interface RawResult {
@@ -34,7 +34,7 @@ function makeCli(db: string) {
   return (...args: string[]): any => {
     const r = raw(db, args);
     if (r.status !== 0) {
-      throw new Error(`oweflow ${args.join(' ')} exited ${r.status}: ${r.stderr.trim()}`);
+      throw new Error(`liveloop ${args.join(' ')} exited ${r.status}: ${r.stderr.trim()}`);
     }
     const out = r.stdout.trim();
     return out ? JSON.parse(out) : null;
@@ -42,7 +42,7 @@ function makeCli(db: string) {
 }
 
 function tmpDb(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-e2e-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-e2e-'));
   return join(dir, 'state.db');
 }
 

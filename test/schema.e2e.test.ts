@@ -1,7 +1,7 @@
 /**
  * End-to-end battery for JSON Schema validation (design §18).
  *
- * Drives the real `oweflow` binary as a subprocess against real SQLite, using
+ * Drives the real `liveloop` binary as a subprocess against real SQLite, using
  * the `schemacheck` fixture (test/fixtures/schema.yaml): a `spec` input, a `plan`
  * singleton, and a `source[]` collection all carry a `schema:`. We exercise the
  * full surface a wiring sees — a malformed commit is *schema-rejected* (not
@@ -17,18 +17,18 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
-const BIN = join(ROOT, 'bin', 'oweflow.mjs');
+const BIN = join(ROOT, 'bin', 'liveloop.mjs');
 const FIXTURES = join(ROOT, 'test', 'fixtures');
 const EXAMPLES = join(ROOT, 'examples', 'workflows');
 
 /** A throwing CLI bound to a fresh temp db + a defs dir (fixtures by default), plus `.raw`. */
 function harness(defsDir: string = FIXTURES) {
-  const db = join(mkdtempSync(join(tmpdir(), 'oweflow-schema-')), 'state.db');
+  const db = join(mkdtempSync(join(tmpdir(), 'liveloop-schema-')), 'state.db');
   const run = (...args: string[]) =>
     spawnSync(process.execPath, [BIN, ...args, '--db', db, '--defs', defsDir], { encoding: 'utf8' });
   const ow = (...args: string[]): any => {
     const r = run(...args);
-    if (r.status !== 0) throw new Error(`oweflow ${args.join(' ')} exited ${r.status}: ${r.stderr.trim()}`);
+    if (r.status !== 0) throw new Error(`liveloop ${args.join(' ')} exited ${r.status}: ${r.stderr.trim()}`);
     const out = r.stdout.trim();
     return out ? JSON.parse(out) : null;
   };

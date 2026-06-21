@@ -1,4 +1,4 @@
-# oweflow — design
+# liveloop — design
 
 A self-contained distillation of the dataflow-workflow-engine spec, restricted to
 what the engine actually implements. The `§N` markers match the references in the

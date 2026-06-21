@@ -19,15 +19,15 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
-const BIN = join(ROOT, 'bin', 'oweflow.mjs');
+const BIN = join(ROOT, 'bin', 'liveloop.mjs');
 const EXAMPLES = join(ROOT, 'examples', 'workflows');
 const FIXTURES = join(ROOT, 'test', 'fixtures');
 
 function harness(defsDir: string = EXAMPLES) {
-  const db = join(mkdtempSync(join(tmpdir(), 'oweflow-scn-')), 'state.db');
+  const db = join(mkdtempSync(join(tmpdir(), 'liveloop-scn-')), 'state.db');
   const ow = (...args: string[]): any => {
     const r = spawnSync(process.execPath, [BIN, ...args, '--db', db, '--defs', defsDir], { encoding: 'utf8' });
-    if (r.status !== 0) throw new Error(`oweflow ${args.join(' ')} exited ${r.status}: ${r.stderr.trim()}`);
+    if (r.status !== 0) throw new Error(`liveloop ${args.join(' ')} exited ${r.status}: ${r.stderr.trim()}`);
     const out = r.stdout.trim();
     return out ? JSON.parse(out) : null;
   };

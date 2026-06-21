@@ -10,13 +10,13 @@
 # `route` and the skipped subtree re-arms.
 #
 # Drive it:
-#   wf=$(oweflow create routing --provide ticket='{"kind":"refund"}' | jq -r .workflow)
-#   oweflow tick $wf                                   # -> order for `triage`
-#   oweflow green $wf <run> route --value '{"branch":"refund"}'
-#   oweflow tick $wf                                   # -> orders for BOTH refund & deny
-#   oweflow green $wf <refund-run> refund_done --value '{"refunded":true}'
-#   oweflow skip  $wf denial --by deny --text "route=refund, deny branch is dead"
-#   oweflow status $wf                                 # done: notice auto-skipped
+#   wf=$(liveloop create routing --provide ticket='{"kind":"refund"}' | jq -r .workflow)
+#   liveloop tick $wf                                   # -> order for `triage`
+#   liveloop green $wf <run> route --value '{"branch":"refund"}'
+#   liveloop tick $wf                                   # -> orders for BOTH refund & deny
+#   liveloop green $wf <refund-run> refund_done --value '{"refunded":true}'
+#   liveloop skip  $wf denial --by deny --text "route=refund, deny branch is dead"
+#   liveloop status $wf                                 # done: notice auto-skipped
 
 name: routing
 title: Conditional routing

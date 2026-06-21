@@ -35,7 +35,7 @@ test('npm pack includes everything a consumer needs', () => {
     'src/engine.ts',
     'src/factory.ts',
     'src/store.ts',
-    'bin/oweflow.mjs',
+    'bin/liveloop.mjs',
     'examples/embed.ts',
   ]) {
     assert.ok(files.includes(needed), `tarball should include ${needed}`);
@@ -45,7 +45,7 @@ test('npm pack includes everything a consumer needs', () => {
 test('npm pack excludes local state, scaffolding, and repo-only files', () => {
   const files = packedFiles();
   // Exact local-state paths that must never be published.
-  for (const forbidden of ['graph.sqlite', '.dev', '.oweflow']) {
+  for (const forbidden of ['graph.sqlite', '.dev', '.liveloop']) {
     assert.ok(
       !files.some((f) => f === forbidden || f.startsWith(`${forbidden}/`)),
       `tarball must not include ${forbidden}`,

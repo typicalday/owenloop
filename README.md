@@ -1,6 +1,6 @@
-# oweflow
+# liveloop
 
-[![CI](https://github.com/typicalday/oweflow/actions/workflows/ci.yml/badge.svg)](https://github.com/typicalday/oweflow/actions/workflows/ci.yml)
+[![CI](https://github.com/typicalday/liveloop/actions/workflows/ci.yml/badge.svg)](https://github.com/typicalday/liveloop/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 A generic **dataflow workflow engine**. Steps don't have a status — they have
@@ -13,13 +13,13 @@ of the same rule instead of being special-cased.
 The engine is **domain-neutral**. It doesn't know what a "PR" or a "source" or a
 "report" is. A concrete process — software delivery, research synthesis, triage
 — is just a *wiring*: a set of workflow definitions (YAML) plus a worker that
-executes the orders the engine hands out. The `oweflow` CLI is the seam between
+executes the orders the engine hands out. The `liveloop` CLI is the seam between
 the two: it speaks JSON on stdout so any worker can drive it.
 
 ```
                  wiring (YAML defs + a worker)
    ────────────────────────────────────────────────────────
-   oweflow CLI   ──tick──►  orders  ──run──►  green / reject
+   liveloop CLI   ──tick──►  orders  ──run──►  green / reject
    ────────────────────────────────────────────────────────
                  engine (debt model + forward cascade + CAS)
                  store  (better-sqlite3, WAL + commit CAS)
@@ -79,8 +79,8 @@ Three things make this more than a topological sort:
 - **Stalls (liveness, §6/§19).** If an artifact is judgment-rejected more than
   its loop's `maxAttempts` — or schema-rejected more than its `maxSchemaFailures`
   — the engine **stops re-arming it**. It stays a debt but no longer produces
-  orders — the loop has demonstrably failed and a human is needed. `oweflow
-  retry` resets both counters (optionally with new guidance); `oweflow retract`
+  orders — the loop has demonstrably failed and a human is needed. `liveloop
+  retry` resets both counters (optionally with new guidance); `liveloop retract`
   drops it (for collection members).
 
 Collections add fan-out/fan-in:
@@ -95,28 +95,28 @@ Collections add fan-out/fan-in:
 
 ## Requirements
 
-- **Node ≥ 22.6** — oweflow runs TypeScript directly via Node's native type
+- **Node ≥ 22.6** — liveloop runs TypeScript directly via Node's native type
   stripping. There is no build step. (Developed on Node 25.)
 - Runtime deps: `better-sqlite3` (storage), `yaml` (defs), and
   `@cfworker/json-schema` (artifact schema validation, §19) — all
   zero- or low-transitive.
 
 ```sh
-git clone <repo> oweflow && cd oweflow
+git clone <repo> liveloop && cd liveloop
 npm install
 npm run check     # typecheck + full test suite
 ```
 
-Or consume it as a dependency — oweflow ships its TypeScript source (no build
+Or consume it as a dependency — liveloop ships its TypeScript source (no build
 step), so the importing project just needs a Node ≥ 22.6 ESM host with
 type-stripping (on by default in 23.6+):
 
 ```sh
-npm install oweflow
+npm install liveloop
 ```
 
 ```ts
-import { createEngine } from 'oweflow';   // see "Programmatic / embedding" below
+import { createEngine } from 'liveloop';   // see "Programmatic / embedding" below
 ```
 
 ---
@@ -130,38 +130,38 @@ demonstrating one idea: [`delivery`](examples/workflows/delivery.yaml)
 [`intake`](examples/workflows/intake.yaml) (schema validation, §19), and
 [`sla-watchdog`](examples/workflows/sla-watchdog.yaml) (idle trigger, completion
 evaluator, alarm — §21). Point
-oweflow at them and drive one end to end. Every data command prints JSON, so the
+liveloop at them and drive one end to end. Every data command prints JSON, so the
 snippet below pipes through `jq`.
 
 ```sh
-export OWEFLOW_DEFS=examples/workflows
-export OWEFLOW_DB=/tmp/oweflow-demo.db
+export LIVELOOP_DEFS=examples/workflows
+export LIVELOOP_DB=/tmp/liveloop-demo.db
 
-oweflow defs                                  # what workflows are available
+liveloop defs                                  # what workflows are available
 
 # start an instance; `proposal` is a seedOwed input so we provide it up front
-wf=$(oweflow create delivery \
+wf=$(liveloop create delivery \
        --provide proposal='{"text":"add dark mode"}' | jq -r .workflow)
 
 # the wiring/worker loop: tick → run → report
-run=$(oweflow tick $wf | jq -r '.orders[0].run')   # claim the `planner` order
-oweflow green  $wf $run plan --value '{"plan":"…"}' # report its output
+run=$(liveloop tick $wf | jq -r '.orders[0].run')   # claim the `planner` order
+liveloop green  $wf $run plan --value '{"plan":"…"}' # report its output
 
-oweflow status $wf                            # debts / eligible / blocked / done
+liveloop status $wf                            # debts / eligible / blocked / done
 ```
 
-`oweflow` here is `node bin/oweflow.mjs` — either run that directly, use the
-`npm run oweflow --` script, or `npm link` to put `oweflow` on your PATH.
+`liveloop` here is `node bin/liveloop.mjs` — either run that directly, use the
+`npm run liveloop --` script, or `npm link` to put `liveloop` on your PATH.
 
 A **knock-back**: when an order for `reviewer` comes up, instead of greening its
 `verdict` you can reject the PR —
 
 ```sh
-oweflow reject $wf pr --by reviewer --text "tests are missing"
+liveloop reject $wf pr --by reviewer --text "tests are missing"
 ```
 
 — which re-arms `builder` with that reason attached to its next order's `owes`.
-Do it past `builder`'s `maxAttempts` and `pr` **stalls**; `oweflow retry $wf pr
+Do it past `builder`'s `maxAttempts` and `pr` **stalls**; `liveloop retry $wf pr
 --text "use the new fixture"` clears it.
 
 The [`research`](examples/workflows/research.yaml) example demonstrates the
@@ -174,8 +174,8 @@ is refused at commit. Each example's header comment walks through the commands.
 
 ## CLI reference
 
-Global: `--db <path>` (env `OWEFLOW_DB`, default `.oweflow/state.db`) and
-`--defs <dir>` (env `OWEFLOW_DEFS`, default `./workflows`).
+Global: `--db <path>` (env `LIVELOOP_DB`, default `.liveloop/state.db`) and
+`--defs <dir>` (env `LIVELOOP_DEFS`, default `./workflows`).
 
 | command | what it does |
 |---|---|
@@ -231,15 +231,15 @@ The CLI is a thin adapter — it maps `argv` to engine calls and prints JSON. Th
 engine itself is an ordinary class, so you can drive it **in-process** and get
 the same lifecycle back as typed objects (`Order`, `CommitResult`,
 `WorkflowStatus`) instead of JSON on stdout — no subprocess, no parsing. The
-[`oweflow`](package.json) package's entry point exports everything you need.
+[`liveloop`](package.json) package's entry point exports everything you need.
 
 `createEngine` bundles the store + definition wiring into one call:
 
 ```ts
-import { createEngine } from 'oweflow';
+import { createEngine } from 'liveloop';
 
 const { engine, store } = createEngine({
-  db: '.oweflow/state.db',          // or ':memory:' for an ephemeral instance
+  db: '.liveloop/state.db',          // or ':memory:' for an ephemeral instance
   defsDir: 'workflows',             // load YAML defs from a dir … or pass `defs: [myDef]`
 });
 
@@ -353,7 +353,7 @@ loops:
 
 ### `produces:` vs `generates:`
 
-A stem under `produces:` is expected to be consumed downstream; oweflow lint warns if it
+A stem under `produces:` is expected to be consumed downstream; liveloop lint warns if it
 isn't. A stem under `generates:` is intentionally consumed by nothing (an audit log, an
 external artifact, or a dev-branch stub); lint leaves it alone. Generated artifacts are
 identical to produced ones in every other respect: schema-validated, fingerprinted,
@@ -510,8 +510,8 @@ routes when the loop's green artifact's inputs move to a newer version (§20):
     re-fire. Use when stale-but-shipped is acceptable.
   - **`onInvalidate: 'escalate'` (default when `idempotent: false`)** — the artifact is
     rejected-and-held (`isHeld`). The producer does not auto-re-fire; the debt surfaces as
-    `stalled: true` with `kind: 'invalidated-irreversible'` in `oweflow status`, requiring
-    human intervention (`oweflow retry` / fix upstream / accept-as-is).
+    `stalled: true` with `kind: 'invalidated-irreversible'` in `liveloop status`, requiring
+    human intervention (`liveloop retry` / fix upstream / accept-as-is).
 
 `terminal: true` is the legacy spelling for `effect: { idempotent: false, onInvalidate: 'pin' }`
 plus the dead-end lint exemption. The two coexist on the same engine version and are mutually
@@ -576,7 +576,7 @@ By default, a loop fires when its consumed inputs are all green (`inputsGreen`).
 ```typescript
 // inside an idle-trigger worker body:
 engine.setAlarm(workflowId, 'completion', Date.now() + 3_600_000); // re-arm in 1 hour
-await oweflow.green(order.run, { /* ... */ });
+await liveloop.green(order.run, { /* ... */ });
 ```
 
 **`engine.nextAlarm(workflow)`** returns `{ dueAt: number | null; isDue: boolean }` — the earliest pending idle threshold across all idle loops in the workflow. An external scheduler uses this to decide when to wake the instance.
@@ -605,7 +605,7 @@ rules are enforced by the validator, not left to runtime surprise.
 
 ## The wiring concept
 
-oweflow deliberately stops at "here is an order; tell me the outcome." A
+liveloop deliberately stops at "here is an order; tell me the outcome." A
 **wiring** supplies the two things the engine refuses to assume:
 
 1. **What the steps mean** — the YAML definitions (the `delivery`/`research`
@@ -614,12 +614,12 @@ oweflow deliberately stops at "here is an order; tell me the outcome." A
 
    ```
    for each workflow:
-     { orders } = oweflow tick $wf
+     { orders } = liveloop tick $wf
      for each order:
        result = run(order.prompt, order.consumes, order.owes)   # ← your domain
-       if result.ok:        oweflow green   $wf $order.run $output --value …
-       else if rejected:    oweflow reject  $wf $artifact --by $loop --text …
-       oweflow close $wf $order.run --outcome …
+       if result.ok:        liveloop green   $wf $order.run $output --value …
+       else if rejected:    liveloop reject  $wf $artifact --by $loop --text …
+       liveloop close $wf $order.run --outcome …
    ```
 
 A coding agent that opens PRs is one such worker; a research bot that fetches and
@@ -671,7 +671,7 @@ npm run check     # both
 The suite (172 tests) spans unit tests (`paths`, `store`, `model`, `defs`,
 `schema`, `util`, `cli`), engine integration tests (the cascade, the §6 stall,
 schema validation/§19, concurrency/CAS), and **47 end-to-end tests** that spawn
-the real `bin/oweflow.mjs` binary and drive the example workflows through their
+the real `bin/liveloop.mjs` binary and drive the example workflows through their
 full lifecycles.
 
 Two e2e files carry most of that weight, by opposite intent.
@@ -701,7 +701,7 @@ input is refused at `create` with a non-zero exit.
 
 ## Design reference
 
-oweflow is a faithful, decoupled implementation of an internal dataflow-engine
+liveloop is a faithful, decoupled implementation of an internal dataflow-engine
 spec. [`docs/design.md`](docs/design.md) is a self-contained distillation —
 the lifecycle, firing rule, forward cascade, the two reject kinds, §6 liveness,
 and the concurrency model — cross-referenced from the source as `§N`.

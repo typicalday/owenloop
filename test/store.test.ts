@@ -328,7 +328,7 @@ test('alarm_at survives a process restart (file-backed round-trip)', () => {
   // Open a Store on a real file, setAlarm, CLOSE it, REOPEN a new Store on the
   // same file (so migrate() runs again), and assert getAlarm returns the stored
   // value. This verifies that alarm_at persists across process restarts.
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-store-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-store-test-'));
   const dbPath = join(dir, 'test.db');
   const wf = randId('wf');
   const loop = 'completion';

@@ -1,16 +1,16 @@
 # New-hire onboarding wiring — a long-running, pause/resume coordinator.
 #
 # A re-creation of Google's ADK "long-running agent that pauses, resumes, and
-# never loses context" onboarding example, expressed in oweflow's dataflow
+# never loses context" onboarding example, expressed in liveloop's dataflow
 # model. The ADK version is a six-state machine (START → WELCOME_SENT →
 # DOCUMENTS_SIGNED → IT_PROVISIONED → HARDWARE_DELIVERED → COMPLETED) whose
 # whole point is the *idle time*: long dormant waits for a human signature and
 # for a shipping confirmation.
 #
-# oweflow needs no state column for that. Each external wait is just an
+# liveloop needs no state column for that. Each external wait is just an
 # artifact *owed by an external producer* — a `seedOwed` input. The loop that
 # consumes it sits as a debt ("dormant") and produces no orders until a webhook
-# fulfills the input with `oweflow provide`. That is the pause; the next `tick`
+# fulfills the input with `liveloop provide`. That is the pause; the next `tick`
 # is the resume. Context never replays — the new-hire details live in the
 # `hire` artifact and every order carries its captured `consumes` (§ store).
 #
@@ -28,26 +28,26 @@
 # webhook arrives those loops are blocked debts that emit no work.
 #
 # Drive it (the worker loop; webhooks are the two `provide` calls):
-#   wf=$(oweflow create onboarding \
+#   wf=$(liveloop create onboarding \
 #          --provide hire='{"name":"Ada Lovelace","email":"ada@corp.com","start_date":"2026-07-01"}' \
 #          | jq -r .workflow)
-#   run=$(oweflow tick $wf | jq -r '.orders[0].run')              # -> order for `send_welcome`
-#   oweflow green $wf $run welcome_packet --value '{"sent":true,"packet_url":"https://hr/welcome/ada"}'
-#   oweflow status $wf            # `provision_it` is blocked: dormant, awaiting the signature webhook
+#   run=$(liveloop tick $wf | jq -r '.orders[0].run')              # -> order for `send_welcome`
+#   liveloop green $wf $run welcome_packet --value '{"sent":true,"packet_url":"https://hr/welcome/ada"}'
+#   liveloop status $wf            # `provision_it` is blocked: dormant, awaiting the signature webhook
 #
 #   # … hours/days later, the HR portal POSTs /webhooks/document_signed → the worker runs:
-#   oweflow provide $wf signed_documents --value '{"contract_id":"C-1029","signed_at":"2026-06-20"}'
-#   run=$(oweflow tick $wf | jq -r '.orders[0].run')              # -> order for `provision_it` (it_agent)
-#   oweflow green $wf $run it_accounts --value '{"email_provisioned":true,"laptop_ordered":true}'
-#   oweflow status $wf            # `confirm_hardware` is now the dormant debt
+#   liveloop provide $wf signed_documents --value '{"contract_id":"C-1029","signed_at":"2026-06-20"}'
+#   run=$(liveloop tick $wf | jq -r '.orders[0].run')              # -> order for `provision_it` (it_agent)
+#   liveloop green $wf $run it_accounts --value '{"email_provisioned":true,"laptop_ordered":true}'
+#   liveloop status $wf            # `confirm_hardware` is now the dormant debt
 #
 #   # … shipping POSTs the hardware-delivered webhook → the worker runs:
-#   oweflow provide $wf hardware_delivered --value '{"tracking":"1Z999","delivered_at":"2026-06-28"}'
-#   run=$(oweflow tick $wf | jq -r '.orders[0].run')              # -> order for `confirm_hardware`
-#   oweflow green $wf $run hardware_ready --value '{"asset_tag":"LT-4471","verified":true}'
-#   run=$(oweflow tick $wf | jq -r '.orders[0].run')              # -> order for `send_day_one`
-#   oweflow green $wf $run day_one_schedule --value '{"sent":true,"first_meeting":"09:30"}' --terminal
-#   oweflow status $wf            # done
+#   liveloop provide $wf hardware_delivered --value '{"tracking":"1Z999","delivered_at":"2026-06-28"}'
+#   run=$(liveloop tick $wf | jq -r '.orders[0].run')              # -> order for `confirm_hardware`
+#   liveloop green $wf $run hardware_ready --value '{"asset_tag":"LT-4471","verified":true}'
+#   run=$(liveloop tick $wf | jq -r '.orders[0].run')              # -> order for `send_day_one`
+#   liveloop green $wf $run day_one_schedule --value '{"sent":true,"first_meeting":"09:30"}' --terminal
+#   liveloop status $wf            # done
 
 name: onboarding
 title: New-hire onboarding coordinator

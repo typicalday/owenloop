@@ -6,23 +6,23 @@
 # *schema-rejected* (reject kind `validation`), NOT greened — the artifact stays
 # a debt, the violations ride its reason thread, and the worker can correct and
 # re-green on the same open run. Repeated schema failures past `maxSchemaFailures`
-# stall the producer the same way a §6 judgment stall does; `oweflow retry`
+# stall the producer the same way a §6 judgment stall does; `liveloop retry`
 # resets the counter and re-arms it. Shape is the engine's business; *meaning*
 # stays a consumer's `reject`.
 #
 # Drive it — every value below conforms; the commented one is refused on purpose:
-#   wf=$(oweflow create intake \
+#   wf=$(liveloop create intake \
 #          --provide request='{"source":"https://example.com/feed","format":"json"}' | jq -r .workflow)
-#   oweflow tick  $wf                                     # -> order for `parse`
-#   oweflow green $wf <run> spec --value '{"endpoint":"https://example.com/feed","limit":50}'
+#   liveloop tick  $wf                                     # -> order for `parse`
+#   liveloop green $wf <run> spec --value '{"endpoint":"https://example.com/feed","limit":50}'
 #   # a malformed value is schema-rejected, not greened (endpoint fails ^https?://):
-#   #   oweflow green $wf <run> spec --value '{"endpoint":"not-a-url"}'   # -> {"outcome":"schema-rejected", ...}
-#   oweflow tick  $wf                                     # -> order for `fetch` (collection)
-#   oweflow emit  $wf <run> --items '[{"id":"a1","title":"First"},{"id":"a2","title":"Second"}]'
-#   oweflow seal  $wf <run>                               # done emitting
-#   oweflow tick  $wf                                     # -> order for `index` (reduce)
-#   oweflow green $wf <run> report --value '{"count":2}'
-#   oweflow status $wf                                    # done
+#   #   liveloop green $wf <run> spec --value '{"endpoint":"not-a-url"}'   # -> {"outcome":"schema-rejected", ...}
+#   liveloop tick  $wf                                     # -> order for `fetch` (collection)
+#   liveloop emit  $wf <run> --items '[{"id":"a1","title":"First"},{"id":"a2","title":"Second"}]'
+#   liveloop seal  $wf <run>                               # done emitting
+#   liveloop tick  $wf                                     # -> order for `index` (reduce)
+#   liveloop green $wf <run> report --value '{"count":2}'
+#   liveloop status $wf                                    # done
 
 name: intake
 title: Schema-validated intake
@@ -30,7 +30,7 @@ description: Validate a request, derive a fetch spec, gather records, index them
 
 inputs:
   - name: request
-    seedOwed: true            # required: supply with --provide or `oweflow provide`
+    seedOwed: true            # required: supply with --provide or `liveloop provide`
     # the external request is refused unless it carries a URL source and a known
     # format — a `provide`/`create` with a bad value exits non-zero (§18).
     schema:

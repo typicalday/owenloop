@@ -11,8 +11,8 @@
 #   - Cross-def calls: cycle check prevents delivery calling back to provisioned-delivery.
 #
 # Drive it (once PR5b lands):
-#   wf=$(oweflow create provisioned-delivery | jq -r .workflow)
-#   oweflow tick $wf   # -> orders: provision
+#   wf=$(liveloop create provisioned-delivery | jq -r .workflow)
+#   liveloop tick $wf   # -> orders: provision
 #   ...
 
 name: provisioned-delivery

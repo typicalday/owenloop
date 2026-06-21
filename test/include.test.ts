@@ -422,7 +422,7 @@ test('(g) validateDef on expanded def: valid parent+child passes; bad input mapp
 
 test('(h) loadDefs: examples/workflows dir loads both delivery and full-cycle correctly', () => {
   // Use a temp dir with our two YAML files to avoid depending on the full examples dir layout.
-  const tmp = mkdtempSync(join(tmpdir(), 'oweflow-include-test-'));
+  const tmp = mkdtempSync(join(tmpdir(), 'liveloop-include-test-'));
 
   const deliveryYaml = `
 name: delivery

@@ -1,5 +1,5 @@
 /**
- * oweflow — a generic dataflow workflow engine.
+ * liveloop — a generic dataflow workflow engine.
  *
  * Loops owe and consume artifacts; a loop's eligibility to run is a pure
  * function of artifact state (debts + dependency satisfaction), not a status

@@ -11,7 +11,7 @@
  *
  * Validation is delegated to `@cfworker/json-schema` — full JSON Schema draft
  * 2020-12 and, unlike ajv, zero transitive dependencies and no code generation,
- * which keeps oweflow's dependency tree tiny. We keep our own surface minimal:
+ * which keeps liveloop's dependency tree tiny. We keep our own surface minimal:
  * validate a value, summarize the failures for a reason thread, and assert a
  * schema is itself well-formed (so a bad schema fails at load, not at commit).
  */

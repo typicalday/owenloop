@@ -62,7 +62,7 @@ test('createEngine: a missing defsDir yields no defs (lenient, like the CLI)', (
 });
 
 test('createEngine: a file db path creates parent directories', () => {
-  const base = mkdtempSync(join(tmpdir(), 'oweflow-factory-'));
+  const base = mkdtempSync(join(tmpdir(), 'liveloop-factory-'));
   const dbPath = join(base, 'nested', 'deep', 'state.db');
   const { engine, store } = createEngine({ db: dbPath, defs: [tiny] });
   assert.ok(existsSync(dbPath), 'db file (and its parent dirs) were created');

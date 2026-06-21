@@ -1,5 +1,5 @@
 {
-  "name": "oweflow",
+  "name": "liveloop",
   "version": "0.1.0",
   "description": "A generic dataflow workflow engine — steps that owe and consume artifacts, advanced by debt and reason-carrying invalidation. Direct better-sqlite3 (WAL + commit-fingerprint CAS).",
   "license": "Apache-2.0",
@@ -7,11 +7,11 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/typicalday/oweflow.git"
+    "url": "git+https://github.com/typicalday/liveloop.git"
   },
-  "homepage": "https://github.com/typicalday/oweflow#readme",
+  "homepage": "https://github.com/typicalday/liveloop#readme",
   "bugs": {
-    "url": "https://github.com/typicalday/oweflow/issues"
+    "url": "https://github.com/typicalday/liveloop/issues"
   },
   "keywords": [
     "workflow",
@@ -23,7 +23,7 @@
     "state-machine"
   ],
   "bin": {
-    "oweflow": "bin/oweflow.mjs"
+    "liveloop": "bin/liveloop.mjs"
   },
   "exports": {
     ".": {
@@ -41,7 +41,7 @@
     "access": "public"
   },
   "scripts": {
-    "oweflow": "node bin/oweflow.mjs",
+    "liveloop": "node bin/liveloop.mjs",
     "test": "node --test --test-reporter=spec test/*.test.ts",
     "test:quiet": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit",

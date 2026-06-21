@@ -1143,7 +1143,7 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
 
 /**
  * Like `loadDefs` but uses `buildDef` (not `parseDef`) so wiring errors are
- * returned in the lint result rather than thrown. Used by `oweflow lint`.
+ * returned in the lint result rather than thrown. Used by `liveloop lint`.
  * Silently skips files that fail shape-parsing (malformed YAML or bad types).
  *
  * Two-phase: Phase 1 collects all defs. Phase 2 expands includes best-effort

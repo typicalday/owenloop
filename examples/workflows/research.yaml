@@ -8,13 +8,13 @@
 # — it drops out of the reduce without blocking it.
 #
 # Drive it:
-#   wf=$(oweflow create research --provide question='{"q":"why is the sky blue"}' | jq -r .workflow)
-#   oweflow tick $wf                                   # -> order for `gather`
-#   oweflow emit $wf <run> --items '[{"url":"a"},{"url":"b"}]'
-#   oweflow seal $wf <run>                             # done emitting
-#   oweflow tick $wf                                   # -> per-element `check` orders
+#   wf=$(liveloop create research --provide question='{"q":"why is the sky blue"}' | jq -r .workflow)
+#   liveloop tick $wf                                   # -> order for `gather`
+#   liveloop emit $wf <run> --items '[{"url":"a"},{"url":"b"}]'
+#   liveloop seal $wf <run>                             # done emitting
+#   liveloop tick $wf                                   # -> per-element `check` orders
 #   ...
-#   oweflow retract $wf 'gather.source[1]' --by human --text "paywalled"
+#   liveloop retract $wf 'gather.source[1]' --by human --text "paywalled"
 
 name: research
 title: Research synthesis
@@ -22,7 +22,7 @@ description: Gather sources (collection), fact-check each (map), synthesize (red
 
 inputs:
   - name: question
-    seedOwed: true          # required: supply with --provide or `oweflow provide`
+    seedOwed: true          # required: supply with --provide or `liveloop provide`
 
 loops:
   - name: gather

@@ -388,7 +388,7 @@ test('calls: (f) gate re-arm — cascade re-arms delivered, maintainCalls re-pro
 // ---- defs validation tests (outputs: check) ----------------------------------
 
 test('loadDefs: calls target with no outputs: throws DefError', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-calls-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-calls-test-'));
   try {
     writeFileSync(
       join(dir, 'child.yaml'),
@@ -428,7 +428,7 @@ test('loadDefs: calls target with no outputs: throws DefError', () => {
 });
 
 test('loadDefs: calls target with 2 outputs: throws DefError', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-calls-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-calls-test-'));
   try {
     writeFileSync(
       join(dir, 'child.yaml'),
@@ -473,7 +473,7 @@ test('loadDefs: calls target with 2 outputs: throws DefError', () => {
 });
 
 test('loadDefs: calls target with exactly 1 output is valid', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'oweflow-calls-test-'));
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-calls-test-'));
   try {
     writeFileSync(
       join(dir, 'child.yaml'),
