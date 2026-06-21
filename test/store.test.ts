@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { Store, artifactId, taskId } from '../src/store.ts';
 import { randId } from '../src/util.ts';
 import type { ArtifactData } from '../src/types.ts';
@@ -404,4 +405,93 @@ test('findChildByParent returns undefined when no match', () => {
   const found = s.findChildByParent('wf_does_not_exist', 'deliver');
   assert.equal(found, undefined);
   s.close();
+});
+
+// ---- concurrent-writer CAS tests (node:sqlite BEGIN IMMEDIATE) ---------------
+
+test('tx() CAS: second writer detects fingerprint change and does not commit', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-cas-'));
+  const dbPath = join(dir, 'cas.db');
+  try {
+    const s1 = new Store(dbPath);
+    const wf = 'wf_cas';
+    const base: ArtifactData = {
+      workflow: wf, path: 'plan', producer: 'planner',
+      acceptance: 'green', version: 1,
+      fingerprint: { plan: 1 },
+      reasons: [], judgmentRejects: 0, schemaRejects: 0,
+    };
+    s1.putArtifact(base);
+    const s2 = new Store(dbPath);
+
+    // Both read fingerprint before any tx() — both see { plan: 1 }
+    const fp1 = s1.getArtifact(wf, 'plan')!.fingerprint;
+    const fp2 = s2.getArtifact(wf, 'plan')!.fingerprint;
+    assert.deepEqual(fp1, { plan: 1 });
+    assert.deepEqual(fp2, { plan: 1 });
+
+    // s1 wins: commits with new fingerprint
+    let s1Won = false;
+    s1.tx(() => {
+      const cur = s1.getArtifact(wf, 'plan')!.fingerprint;
+      assert.deepEqual(cur, { plan: 1 });
+      s1.putArtifact({ ...base, fingerprint: { plan: 2 }, version: 2 });
+      s1Won = true;
+    });
+
+    // s2 loses: fingerprint no longer matches its stale read
+    let s2Won = false;
+    let s2Err: unknown;
+    try {
+      s2.tx(() => {
+        const cur = s2.getArtifact(wf, 'plan')!.fingerprint;
+        if (JSON.stringify(cur) !== JSON.stringify(fp2)) {
+          throw new Error('CAS conflict');
+        }
+        s2.putArtifact({ ...base, fingerprint: { plan: 3 }, version: 3 });
+        s2Won = true;
+      });
+    } catch (e) { s2Err = e; }
+
+    assert.ok(s1Won, 's1 must have committed');
+    assert.ok(!s2Won, 's2 must not have committed');
+    assert.ok(s2Err instanceof Error, 's2 must have thrown');
+    // Only s1 commit visible
+    assert.deepEqual(s1.getArtifact(wf, 'plan')!.fingerprint, { plan: 2 });
+
+    s1.close();
+    s2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('tx() BEGIN IMMEDIATE: second connection is blocked at BEGIN, not mid-write', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'liveloop-imm-'));
+  const dbPath = join(dir, 'imm.db');
+  try {
+    const db1 = new DatabaseSync(dbPath);
+    const db2 = new DatabaseSync(dbPath);
+    db1.exec('PRAGMA journal_mode = WAL');
+    db2.exec('PRAGMA journal_mode = WAL');
+    db1.exec('PRAGMA busy_timeout = 100');
+    db2.exec('PRAGMA busy_timeout = 100');
+    db1.exec('CREATE TABLE t (x INTEGER)');
+
+    // db1 acquires write lock via BEGIN IMMEDIATE
+    db1.exec('BEGIN IMMEDIATE');
+
+    // db2 must fail at BEGIN IMMEDIATE (not silently proceed to write time)
+    assert.throws(
+      () => db2.exec('BEGIN IMMEDIATE'),
+      /database is locked|SQLITE_BUSY/i,
+      'second BEGIN IMMEDIATE must fail while first holds the write lock'
+    );
+
+    db1.exec('ROLLBACK');
+    db1.close();
+    db2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
