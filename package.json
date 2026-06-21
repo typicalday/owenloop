@@ -1,7 +1,7 @@
 {
   "name": "liveloop",
   "version": "0.1.0",
-  "description": "A generic dataflow workflow engine — steps that owe and consume artifacts, advanced by debt and reason-carrying invalidation. Direct better-sqlite3 (WAL + commit-fingerprint CAS).",
+  "description": "A generic dataflow workflow engine — steps that owe and consume artifacts, advanced by debt and reason-carrying invalidation. Direct node:sqlite (WAL + commit-fingerprint CAS).",
   "license": "Apache-2.0",
   "author": "typicalday",
   "type": "module",
@@ -50,11 +50,9 @@
   },
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",
-    "better-sqlite3": "^12.2.0",
     "yaml": "^2.5.0"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.9.3",
     "typescript": "^5.8.0"
   },

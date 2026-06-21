@@ -11,7 +11,7 @@
  *
  * Lifecycle: the returned `engine`/`store` are meant to be long-lived (one per
  * database). Call `store.close()` on shutdown. Concurrency is the store's:
- * better-sqlite3 is synchronous and single-writer-per-process; cross-process
+ * node:sqlite (DatabaseSync) is synchronous and single-writer-per-process; cross-process
  * advancement is made safe by the commit-fingerprint CAS (see `src/store.ts`).
  *
  * A host that wants to react to engine changes without polling can pass

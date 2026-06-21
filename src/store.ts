@@ -1,19 +1,19 @@
 /**
- * Persistence layer — a thin, typed wrapper over SQLite (better-sqlite3).
+ * Persistence layer — a thin, typed wrapper over SQLite (node:sqlite).
  *
  * The store knows nothing about eligibility, firing, or cascades; it is pure
  * data access. The engine performs read-modify-write *inside* `tx()`, which
- * runs the callback in a `BEGIN IMMEDIATE` transaction. Because better-sqlite3
- * is synchronous and single-connection-per-process, everything inside that
- * callback is atomic; across processes, `BEGIN IMMEDIATE` takes the write lock
- * up front so the commit-fingerprint CAS (design §12) is serialized — no torn
- * reads between a claim and its commit.
+ * runs the callback in a `BEGIN IMMEDIATE` transaction. Because node:sqlite
+ * (DatabaseSync) is synchronous and single-connection-per-process, everything
+ * inside that callback is atomic; across processes, `BEGIN IMMEDIATE` takes the
+ * write lock up front so the commit-fingerprint CAS (design §12) is serialized
+ * — no torn reads between a claim and its commit.
  *
  * JSON-shaped fields (value, fingerprint, reasons, params) are stored as TEXT
  * and (de)serialized at the boundary so callers always see real objects.
  */
 
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import { detId, nowMs } from './util.ts';
 import type {
   Acceptance,
@@ -24,8 +24,6 @@ import type {
   TaskData,
   WorkflowData,
 } from './types.ts';
-
-type DB = Database.Database;
 
 // ---- row-shaped records (data + identity + timestamps) ----------------------
 
@@ -268,14 +266,14 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
 // ---- the store ---------------------------------------------------------------
 
 export class Store {
-  readonly db: DB;
+  readonly db: DatabaseSync;
 
   constructor(path: string) {
-    this.db = new Database(path);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('busy_timeout = 5000');
-    this.db.pragma('foreign_keys = ON');
-    this.db.pragma('synchronous = NORMAL');
+    this.db = new DatabaseSync(path);
+    this.db.exec('PRAGMA journal_mode = WAL');
+    this.db.exec('PRAGMA busy_timeout = 5000');
+    this.db.exec('PRAGMA foreign_keys = ON');
+    this.db.exec('PRAGMA synchronous = NORMAL');
     this.db.exec(SCHEMA);
     this.migrate();
     const cur = this.getMeta('schema_version');
@@ -319,11 +317,21 @@ export class Store {
 
   /**
    * Run `fn` in a `BEGIN IMMEDIATE` transaction (write lock acquired up front).
-   * Returns fn's result; rolls back if it throws. This is the only correct way
-   * to do the engine's read-modify-write so concurrent ticks serialize.
+   * Returns fn's result; rolls back and rethrows if fn throws.
+   * This is the only correct way to do the engine's read-modify-write so
+   * concurrent ticks serialize. Never call tx() re-entrantly — node:sqlite
+   * does not support nested transactions.
    */
   tx<T>(fn: () => T): T {
-    return this.db.transaction(fn).immediate();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = fn();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
   }
 
   // -- meta --------------------------------------------------------------------
@@ -368,7 +376,7 @@ export class Store {
   listWorkflows(): WorkflowRow[] {
     const rows = this.db
       .prepare('SELECT * FROM workflow ORDER BY created_at')
-      .all() as WorkflowRowRaw[];
+      .all() as unknown as WorkflowRowRaw[];
     return rows.map(mapWorkflow);
   }
 
@@ -396,7 +404,7 @@ export class Store {
   listChildrenByParent(parentWf: string): WorkflowRow[] {
     const rows = this.db
       .prepare('SELECT * FROM workflow WHERE produced_by_wf = ? ORDER BY created_at')
-      .all(parentWf) as WorkflowRowRaw[];
+      .all(parentWf) as unknown as WorkflowRowRaw[];
     return rows.map(mapWorkflow);
   }
 
@@ -416,7 +424,7 @@ export class Store {
   listArtifacts(workflow: string): ArtifactRow[] {
     const rows = this.db
       .prepare('SELECT * FROM artifact WHERE workflow = ? ORDER BY path')
-      .all(workflow) as ArtifactRowRaw[];
+      .all(workflow) as unknown as ArtifactRowRaw[];
     return rows.map(mapArtifact);
   }
 
@@ -479,14 +487,14 @@ export class Store {
   listTasks(workflow: string): TaskRow[] {
     const rows = this.db
       .prepare('SELECT * FROM task WHERE workflow = ? ORDER BY loop, key')
-      .all(workflow) as TaskRowRaw[];
+      .all(workflow) as unknown as TaskRowRaw[];
     return rows.map(mapTask);
   }
 
   listClaimedTasks(): TaskRow[] {
     const rows = this.db
       .prepare("SELECT * FROM task WHERE status = 'claimed' ORDER BY claimed_at")
-      .all() as TaskRowRaw[];
+      .all() as unknown as TaskRowRaw[];
     return rows.map(mapTask);
   }
 
@@ -646,7 +654,7 @@ export class Store {
       .prepare(
         'SELECT * FROM run WHERE workflow = ? ORDER BY created_at, rowid',
       )
-      .all(workflow) as RunRowRaw[];
+      .all(workflow) as unknown as RunRowRaw[];
     return rows.map(mapRun);
   }
 }
