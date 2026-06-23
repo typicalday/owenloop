@@ -44,6 +44,20 @@ const research = def(
   ],
 );
 
+// A chained map (§11): `research` maps the bare members into a per-element
+// `.dossier`; `acquire` maps over those *dossiers* (a suffixed map consume) into
+// a per-element `.assets`. Exercises that a map gating on another map's output
+// gates on the suffixed child, not the bare member.
+const chained = def(
+  'chained',
+  [input('brief')],
+  [
+    loop({ name: 'scope', consumes: ['brief'], produces: ['scope.target[]'] }),
+    loop({ name: 'research', consumes: ['scope.target[$i]'], produces: ['scope.target[$i].dossier'] }),
+    loop({ name: 'acquire', consumes: ['scope.target[$i].dossier'], produces: ['scope.target[$i].assets'] }),
+  ],
+);
+
 test('loopMode classifies plain / map / reduce', () => {
   assert.equal(loopMode(delivery.loops[0]!), 'plain');
   assert.equal(loopMode(research.loops[1]!), 'map');
@@ -129,6 +143,45 @@ test('map eligibility — one firing per green element with an owed child', () =
   const f = eligibleFirings(research, a).filter((x) => x.loop === 'formatcheck');
   assert.deepEqual(f.map((x) => x.key).sort(), ['gather.source[1]', 'gather.source[2]']);
   assert.deepEqual(f.find((x) => x.index === 1)!.outputs, ['gather.source[1].formatcheck']);
+});
+
+test('chained map — gates on the suffixed per-element child, not the bare member', () => {
+  // scope sealed, both targets green; research has produced dossier[0] only.
+  const a = arts([
+    { path: 'brief', producer: 'human', acceptance: 'green', version: 1 },
+    { path: 'scope.target.sealed', producer: 'scope', acceptance: 'green', version: 1, sealOf: 'scope.target' },
+    { path: 'scope.target[0]', producer: 'scope', acceptance: 'green', version: 1 },
+    { path: 'scope.target[1]', producer: 'scope', acceptance: 'green', version: 1 },
+    { path: 'scope.target[0].dossier', producer: 'research', acceptance: 'green', version: 1 },
+    { path: 'scope.target[1].dossier', producer: 'research', acceptance: 'owed' },
+  ]);
+
+  // pendingOwed materializes element 0's assets (dossier[0] green) but NOT
+  // element 1's (dossier[1] still owed). dossier[1] already exists, so it isn't
+  // re-listed; the point is scope.target[1].assets must be absent.
+  const owed = pendingOwed(chained, a).map((x) => x.path).sort();
+  assert.deepEqual(owed, ['scope.target[0].assets']);
+
+  // acquire is eligible for element 0 ONLY (the bug: it used to fire for both,
+  // because the bare member scope.target[1] is green even though its dossier isn't).
+  const acq = eligibleFirings(chained, arts([
+    ...[...a.values()],
+    { path: 'scope.target[0].assets', producer: 'acquire', acceptance: 'owed' },
+  ])).filter((x) => x.loop === 'acquire');
+  assert.deepEqual(acq.map((x) => x.key), ['scope.target[0]']);
+  // and it fingerprints on the dossier it actually consumed, not the bare member
+  assert.deepEqual(acq[0]!.inputs, ['scope.target[0].dossier']);
+  assert.deepEqual(acq[0]!.outputs, ['scope.target[0].assets']);
+
+  // requiredInputs: the assets child rests on its dossier (so a stale dossier cascades)
+  const full = arts([
+    ...[...a.values()],
+    { path: 'scope.target[0].assets', producer: 'acquire', acceptance: 'green', version: 1 },
+  ]);
+  assert.deepEqual(
+    requiredInputs(chained, full, full.get('scope.target[0].assets')!),
+    ['scope.target[0].dossier'],
+  );
 });
 
 test('reduce eligibility — needs seal green AND every live member green', () => {

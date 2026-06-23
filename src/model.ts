@@ -100,6 +100,17 @@ export function loopMode(loop: LoopDef): LoopMode {
 export function mapProduce(loop: LoopDef): ProducePattern | undefined {
   return loop.produces.find((p) => p.kind === 'map');
 }
+/**
+ * The concrete input artifact a map element binds on for index `i`. Normally the
+ * bare collection member `stem[i]`. But when the map consume carries a suffix
+ * (`stem[$i].sub` — the loop chains off *another* map's per-element output), the
+ * gate is that suffixed per-element child `stem[i].sub`, not the bare member.
+ * The bare member set still fixes the index space (cardinality, §11.1); the
+ * suffix only moves where the greenness/fingerprint gate points.
+ */
+export function mapInputPath(mc: ConsumePattern, index: number): string {
+  return elementPath(mc.stem, index, mc.suffix);
+}
 /** The collection stem a loop produces (`gather.source` for `gather.source[]`), if any. */
 export function collectionStem(loop: LoopDef): string | undefined {
   return loop.produces.find((p) => p.kind === 'collection')?.stem;
@@ -219,11 +230,14 @@ export function requiredInputs(def: WorkflowDef, arts: ArtifactMap, art: Artifac
   const el = parseElement(art.path);
   if (el && el.suffix === '') return plain;
 
-  // a map child (src[i].suffix) rests on its bound element + plain gates
+  // a map child (src[i].suffix) rests on its actual consumed per-element input
+  // + plain gates. With a bare map consume (`src[$i]`) that input is the bare
+  // member; with a suffixed map consume (`src[$i].dossier`, chaining off another
+  // map) it is that suffixed child — so a stale dossier cascades to its assets.
   if (el && el.suffix !== '') {
     const mc = mapConsume(loop);
-    const stem = mc ? mc.stem : el.stem;
-    return [elementPath(stem, el.index), ...plain];
+    if (mc) return [mapInputPath(mc, el.index), ...plain];
+    return [elementPath(el.stem, el.index), ...plain];
   }
 
   // a singleton: a reduce output rests on the whole live set + seal; a plain
@@ -299,10 +313,12 @@ export function pendingOwed(def: WorkflowDef, arts: ArtifactMap): ArtifactData[]
       const mc = mapConsume(loop);
       const mp = mapProduce(loop);
       if (!mc || !mp) continue;
+      // the bare members fix the index space; a child is owed only once that
+      // index's actual consumed input (bare member, or its suffixed child) greens
       for (const m of members(arts, mc.stem)) {
-        if (!isGreen(m)) continue;
         const el = parseElement(m.path);
         if (!el) continue;
+        if (!isGreen(arts.get(mapInputPath(mc, el.index)))) continue;
         ensure(bindProduce(mp, el.index), loop.name);
       }
     } else {
@@ -387,9 +403,12 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
           const mp = mapProduce(loop);
           if (mc && mp) {
             for (const m of members(arts, mc.stem)) {
-              if (!isGreen(m)) continue;
               const el = parseElement(m.path);
               if (!el) continue;
+              // gate on the actual per-element input: the bare member, or its
+              // suffixed child when this map chains off another map's output.
+              const inPath = mapInputPath(mc, el.index);
+              if (!isGreen(arts.get(inPath))) continue;
               const outPath = bindProduce(mp, el.index);
               const outArt = arts.get(outPath);
               if (!isDebt(outArt) || frozen(outArt, loop)) continue;
@@ -397,7 +416,7 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
                 loop: loop.name,
                 key: m.path,
                 index: el.index,
-                inputs: [m.path, ...plainPaths],
+                inputs: [inPath, ...plainPaths],
                 outputs: [outPath],
               });
             }
@@ -755,6 +774,19 @@ function blockingInputs(def: WorkflowDef, loop: LoopDef, arts: ArtifactMap): str
     if (!isGreen(arts.get(seal))) out.push(seal);
     for (const m of members(arts, rc.stem)) {
       if (!isSettledOut(m) && !isGreen(m)) out.push(m.path);
+    }
+  }
+  // a map child that owes but can't fire is blocked on its per-element input
+  // (its bare member, or — for a chained map — the suffixed child upstream owes)
+  const mc = mapConsume(loop);
+  const mp = mapProduce(loop);
+  if (mc && mp) {
+    for (const m of members(arts, mc.stem)) {
+      const el = parseElement(m.path);
+      if (!el) continue;
+      if (!isDebt(arts.get(bindProduce(mp, el.index)))) continue;
+      const inPath = mapInputPath(mc, el.index);
+      if (!isGreen(arts.get(inPath))) out.push(inPath);
     }
   }
   return out;
