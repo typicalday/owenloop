@@ -6,7 +6,7 @@ on an `Engine` and prints the results as JSON. Everything it does, a host
 process can do **in-process** — and get the lifecycle back as typed objects
 rather than JSON on stdout.
 
-This document covers the in-process API: the one-call factory, the worker loop,
+This document covers the in-process API: the one-call factory, the worker step,
 in-memory definitions, lifecycle/concurrency, and **push-style events** so a host
 can react the instant the graph advances instead of polling.
 
@@ -50,7 +50,7 @@ const engine = new Engine(store, (name) => {
 });
 ```
 
-## The worker loop
+## The worker step
 
 The shape is the same as a CLI wiring — `tick` to pull orders, run them, then
 report with `green` / `emit` / `seal` / `reject`, and `close` the run:
@@ -87,7 +87,7 @@ node examples/embed.ts
 
 ## Events
 
-The worker loop above pulls work with `tick`. A host can instead **react** to
+The worker step above pulls work with `tick`. A host can instead **react** to
 changes: `engine.subscribe(listener)` registers a synchronous observer and
 returns an idempotent unsubscribe. Each listener is handed a typed `EngineEvent`
 the instant a mutation commits — so a host re-`tick`s only when there is new
@@ -123,7 +123,7 @@ The event union (exported as `EngineEvent`):
 | `instance` | `workflow`, `def` | a workflow instance was created and seeded |
 | `commit`   | `workflow`, `path`, `action`, `run?`, `outcome?` | a state-changing verb landed — `action` is one of `green`/`emit`/`seal`/`reject`/`retract`/`skip`/`retry`/`provide`; `outcome` is present for the producer verbs (`green`/`emit`/`seal`), and carries a refusal (`born-rejected`/`schema-rejected`) too |
 | `closed`   | `workflow`, `run`, `outcome` | a run's lease was released by `close` |
-| `settled`  | `workflow`, `done`, `eligible` | the derived state **after** the forward cascade — `eligible` is the loop names with work to do; `done` is workflow completion |
+| `settled`  | `workflow`, `done`, `eligible` | the derived state **after** the forward cascade — `eligible` is the step names with work to do; `done` is workflow completion |
 
 **Guarantees.**
 

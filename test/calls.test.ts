@@ -14,33 +14,33 @@ import { join } from 'node:path';
 import { Engine } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
-import type { ArtifactData, LoopDef, WorkflowDef } from '../src/types.ts';
+import type { ArtifactData, StepDef, WorkflowDef } from '../src/types.ts';
 import { DefError, loadDefs } from '../src/defs.ts';
-import { def, input, loop } from './helpers.ts';
+import { def, input, step } from './helpers.ts';
 
 // ---- fixture defs ------------------------------------------------------------
 
 /**
  * childDef: a simple workflow with outputs: [result], one seedOwed input `data`,
- * one loop `worker` that produces `result`.
+ * one step `worker` that produces `result`.
  */
 const childDef: WorkflowDef = {
   ...def(
     'childDef',
     [input('data', { seedOwed: true })],
-    [loop({ name: 'worker', consumes: ['data'], produces: ['result'] })],
+    [step({ name: 'worker', consumes: ['data'], produces: ['result'] })],
   ),
   outputs: ['result'],
 };
 
 /**
- * parentDef: has inputs: [proposal] (seedOwed), loops:
+ * parentDef: has inputs: [proposal] (seedOwed), steps:
  *   provision (consumes proposal, produces sandbox)
  *   deliver (calls: childDef, inputs: {data: sandbox}, produces: delivered)
  *   teardown (consumes delivered, produces done)
  */
-const deliverLoop: LoopDef = {
-  ...loop({ name: 'deliver', produces: ['delivered'] }),
+const deliverStep: StepDef = {
+  ...step({ name: 'deliver', produces: ['delivered'] }),
   calls: 'childDef',
   callsInputs: { data: 'sandbox' },
   consumes: [],
@@ -50,21 +50,21 @@ const parentDef: WorkflowDef = def(
   'parentDef',
   [input('proposal', { seedOwed: true })],
   [
-    loop({ name: 'provision', consumes: ['proposal'], produces: ['sandbox'] }),
-    deliverLoop,
-    loop({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
+    step({ name: 'provision', consumes: ['proposal'], produces: ['sandbox'] }),
+    deliverStep,
+    step({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
   ],
 );
 
 /**
- * failingChildDef: a workflow with outputs: [outcome], one loop `evaluator`
+ * failingChildDef: a workflow with outputs: [outcome], one step `evaluator`
  * that produces `outcome` (carries {status: 'failed'}).
  */
 const failingChildDef: WorkflowDef = {
   ...def(
     'failingChildDef',
     [],
-    [loop({ name: 'evaluator', produces: ['outcome'] })],
+    [step({ name: 'evaluator', produces: ['outcome'] })],
   ),
   outputs: ['outcome'],
 };
@@ -73,8 +73,8 @@ const failingChildDef: WorkflowDef = {
  * parentFailDef: like parentDef but calls: failingChildDef with no input wiring.
  * teardown consumes delivered.
  */
-const failDeliverLoop: LoopDef = {
-  ...loop({ name: 'deliver', produces: ['delivered'] }),
+const failDeliverStep: StepDef = {
+  ...step({ name: 'deliver', produces: ['delivered'] }),
   calls: 'failingChildDef',
   callsInputs: {},
   consumes: [],
@@ -84,8 +84,8 @@ const parentFailDef: WorkflowDef = def(
   'parentFailDef',
   [],
   [
-    failDeliverLoop,
-    loop({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
+    failDeliverStep,
+    step({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
   ],
 );
 
@@ -117,7 +117,7 @@ test('calls: (a) happy path end-to-end — spawn, cascade-up, teardown', () => {
   // Tick 1 → provision order
   const tick1 = engine.tick(parentWf);
   assert.equal(tick1.orders.length, 1);
-  assert.equal(tick1.orders[0]!.loop, 'provision');
+  assert.equal(tick1.orders[0]!.step, 'provision');
   const provRun = tick1.orders[0]!.run;
 
   // No child should exist yet (sandbox not green)
@@ -129,7 +129,7 @@ test('calls: (a) happy path end-to-end — spawn, cascade-up, teardown', () => {
 
   // Tick 2 → maintainCalls runs → child spawned (no worker order for deliver)
   const tick2 = engine.tick(parentWf);
-  assert.ok(tick2.orders.every((o) => o.loop !== 'deliver'), 'deliver must not produce worker orders');
+  assert.ok(tick2.orders.every((o) => o.step !== 'deliver'), 'deliver must not produce worker orders');
 
   // Child should exist now
   const childRow = store.findChildByParent(parentWf, 'delivered');
@@ -143,7 +143,7 @@ test('calls: (a) happy path end-to-end — spawn, cascade-up, teardown', () => {
   // Drive the child: tick → worker order → green result → close
   const childTick1 = engine.tick(childRow!.id);
   assert.equal(childTick1.orders.length, 1);
-  assert.equal(childTick1.orders[0]!.loop, 'worker');
+  assert.equal(childTick1.orders[0]!.step, 'worker');
   const workerRun = childTick1.orders[0]!.run;
   engine.green(childRow!.id, workerRun, 'result', { value: 'done' });
   engine.close(childRow!.id, workerRun);
@@ -154,7 +154,7 @@ test('calls: (a) happy path end-to-end — spawn, cascade-up, teardown', () => {
   assert.equal(deliveredArt?.acceptance, 'green');
   assert.deepEqual(deliveredArt?.value, { value: 'done' });
   // Teardown should be eligible in this same tick (cascade fired before firings check)
-  const teardownOrder = tick3.orders.find((o) => o.loop === 'teardown');
+  const teardownOrder = tick3.orders.find((o) => o.step === 'teardown');
   assert.ok(teardownOrder !== undefined, 'teardown should be eligible after delivered is green');
 
   // Complete teardown → parent done
@@ -270,7 +270,7 @@ test('calls: (d) failure branch — status-bearing outcome propagates, teardown 
   assert.deepEqual(deliveredArt?.value, { status: 'failed' });
 
   // Teardown becomes eligible (consumes 'delivered' which is now green)
-  const teardownOrder = tick3.orders.find((o) => o.loop === 'teardown');
+  const teardownOrder = tick3.orders.find((o) => o.step === 'teardown');
   assert.ok(teardownOrder !== undefined, 'teardown should fire even on failure branch');
 
   // Complete teardown → parent done
@@ -388,12 +388,12 @@ test('calls: (f) gate re-arm — cascade re-arms delivered, maintainCalls re-pro
 // ---- test (g): provideInput cascades to calls: child without extra tick -------
 
 /**
- * parentProvideDef: input(data2 seedOwed) feeds directly into the deliver loop's
+ * parentProvideDef: input(data2 seedOwed) feeds directly into the deliver step's
  * callsInputs so that engine.provideInput(parentWf, 'data2', ...) must cascade
  * immediately to the child's 'data' artifact — no extra tick required.
  */
-const parentProvideLoop: LoopDef = {
-  ...loop({ name: 'deliver', produces: ['delivered'] }),
+const parentProvideStep: StepDef = {
+  ...step({ name: 'deliver', produces: ['delivered'] }),
   calls: 'childDef',
   callsInputs: { data: 'data2' },
   consumes: [],
@@ -401,7 +401,7 @@ const parentProvideLoop: LoopDef = {
 const parentProvideDef: WorkflowDef = def(
   'parentProvideDef',
   [input('data2', { seedOwed: true })],
-  [parentProvideLoop],
+  [parentProvideStep],
 );
 
 test('calls: (g) provideInput cascades to calls: child without extra tick', () => {
@@ -436,7 +436,7 @@ test('loadDefs: calls target with no outputs: throws DefError', () => {
       join(dir, 'child.yaml'),
       [
         'name: child',
-        'loops:',
+        'steps:',
         '  - name: worker',
         '    produces: [result]',
         '    body: do work',
@@ -447,7 +447,7 @@ test('loadDefs: calls target with no outputs: throws DefError', () => {
       [
         'name: parent',
         'outputs: [delivered]',
-        'loops:',
+        'steps:',
         '  - name: deliver',
         '    calls: child',
         '    produces: [delivered]',
@@ -477,7 +477,7 @@ test('loadDefs: calls target with 2 outputs: throws DefError', () => {
       [
         'name: child',
         'outputs: [result, report]',
-        'loops:',
+        'steps:',
         '  - name: worker',
         '    produces: [result]',
         '    body: do work',
@@ -492,7 +492,7 @@ test('loadDefs: calls target with 2 outputs: throws DefError', () => {
       [
         'name: parent',
         'outputs: [delivered]',
-        'loops:',
+        'steps:',
         '  - name: deliver',
         '    calls: child',
         '    produces: [delivered]',
@@ -522,7 +522,7 @@ test('loadDefs: calls target with exactly 1 output is valid', () => {
       [
         'name: child',
         'outputs: [result]',
-        'loops:',
+        'steps:',
         '  - name: worker',
         '    produces: [result]',
         '    body: do work',
@@ -533,7 +533,7 @@ test('loadDefs: calls target with exactly 1 output is valid', () => {
       [
         'name: parent',
         'outputs: [delivered]',
-        'loops:',
+        'steps:',
         '  - name: deliver',
         '    calls: child',
         '    produces: [delivered]',

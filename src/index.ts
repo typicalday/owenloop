@@ -1,7 +1,7 @@
 /**
  * owenloop — a generic dataflow workflow engine.
  *
- * Loops owe and consume artifacts; a loop's eligibility to run is a pure
+ * Steps owe and consume artifacts; a step's eligibility to run is a pure
  * function of artifact state (debts + dependency satisfaction), not a status
  * enum. Rejection carries a reason thread; a forward cascade keeps the graph
  * honest ("an artifact is green only while every artifact it consumed is
@@ -83,7 +83,7 @@ export type {
   InvariantPredicate,
   InvariantViolation,
   JsonSchema,
-  LoopDef,
+  StepDef,
   ProducePattern,
   ReasonEntry,
   RejectKind,

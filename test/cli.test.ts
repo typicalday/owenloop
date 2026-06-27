@@ -82,9 +82,9 @@ test('a full delivery happy path runs end to end through main()', () => {
     ['reviewer', 'verdict', { ok: true }],
     ['merger', 'merge', { sha: 'abc' }, true],
   ];
-  for (const [loop, out, value, terminal] of steps) {
-    const order = run('tick', wf).json().orders.find((o: any) => o.loop === loop);
-    assert.ok(order, `order for ${loop}`);
+  for (const [step, out, value, terminal] of steps) {
+    const order = run('tick', wf).json().orders.find((o: any) => o.step === step);
+    assert.ok(order, `order for ${step}`);
     const argv = ['green', wf, order.run, out, '--value', J(value)];
     if (terminal) argv.push('--terminal');
     assert.equal(run(...argv).json().outcome, 'green');
@@ -139,7 +139,7 @@ test('--provide rejects a malformed pair and malformed JSON', () => {
 test('emit rejects malformed and non-array --items', () => {
   const { run } = makeCli();
   const wf = run('create', 'research', '--provide', `question=${J({})}`).json().workflow;
-  const gatherRun = run('tick', wf).json().orders.find((o: any) => o.loop === 'gather').run;
+  const gatherRun = run('tick', wf).json().orders.find((o: any) => o.step === 'gather').run;
 
   const notJson = run('emit', wf, gatherRun, '--items', '[{bad');
   assert.equal(notJson.code, 1);
@@ -188,7 +188,7 @@ test('a bare retry (no --by/--text) clears a stall with default guidance', () =>
   // knock pr back until the builder stops being re-armed (stalled at the cap)
   let guard = 0;
   for (;;) {
-    const order = run('tick', wf).json().orders.find((o: any) => o.loop === 'builder');
+    const order = run('tick', wf).json().orders.find((o: any) => o.step === 'builder');
     if (!order || guard++ > 10) break;
     run('green', wf, order.run, 'pr', '--value', J({ pr: '#x' }));
     run('close', wf, order.run); // close so the builder re-arms on the next reject
@@ -264,24 +264,24 @@ test('status --all isolates an instance whose definition is missing (error field
   assert.equal(all[0].done, undefined, 'no derived status when the def is missing');
 });
 
-test('status --all surfaces a producer crash loop (consecutive failedRuns) per debt', () => {
+test('status --all surfaces a producer crash step (consecutive failedRuns) per debt', () => {
   const { run } = makeCli();
   const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
 
   // the planner claims and closes `failed` three times without greening — a
-  // crash loop that §6 never stalls (judgmentRejects stays 0)
+  // crash step that §6 never stalls (judgmentRejects stays 0)
   for (let i = 0; i < 3; i++) {
-    const order = run('tick', wf).json().orders.find((o: any) => o.loop === 'planner');
+    const order = run('tick', wf).json().orders.find((o: any) => o.step === 'planner');
     assert.ok(order, `planner order on attempt ${i + 1}`);
     run('close', wf, order.run, '--outcome', 'failed');
   }
 
   const entry = run('status', '--all').json().find((e: any) => e.workflow === wf);
   const plan = entry.debts.find((d: any) => d.path === 'plan');
-  assert.equal(plan.failedRuns, 3, 'the bulk fleet read carries the crash-loop streak');
-  assert.equal(plan.stalled, false, 'a crash loop is not a §6 judgment stall');
+  assert.equal(plan.failedRuns, 3, 'the bulk fleet read carries the crash-step streak');
+  assert.equal(plan.stalled, false, 'a crash step is not a §6 judgment stall');
   // a clean close clears it on the next read
-  const order = run('tick', wf).json().orders.find((o: any) => o.loop === 'planner');
+  const order = run('tick', wf).json().orders.find((o: any) => o.step === 'planner');
   run('green', wf, order.run, 'plan', '--value', J({ plan: 'v1' }));
   run('close', wf, order.run);
   const after = run('status', '--all').json().find((e: any) => e.workflow === wf);
@@ -301,9 +301,9 @@ test('status --all reports a finished instance as done with no debts', () => {
   const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
 
   // drive the whole pipeline to its terminal merge
-  const step = (loop: string, path: string, terminal = false) => {
-    const order = run('tick', wf).json().orders.find((o: any) => o.loop === loop);
-    assert.ok(order, `${loop} order`);
+  const step = (step: string, path: string, terminal = false) => {
+    const order = run('tick', wf).json().orders.find((o: any) => o.step === step);
+    assert.ok(order, `${step} order`);
     const args = ['green', wf, order.run, path, '--value', J({ ok: true })];
     if (terminal) args.push('--terminal');
     run(...args);
@@ -354,7 +354,7 @@ test('owenloop lint exits non-zero when a definition has wiring errors', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-lint-bad-'));
   writeFileSync(
     join(dir, 'broken.yaml'),
-    'name: broken\ninputs:\n  - name: seed\nloops:\n  - name: a\n    consumes: [seed]\n    produces: [mid]\n  - name: b\n    consumes: [ghost]\n    produces: [out]\n    terminal: true\n',
+    'name: broken\ninputs:\n  - name: seed\nsteps:\n  - name: a\n    consumes: [seed]\n    produces: [mid]\n  - name: b\n    consumes: [ghost]\n    produces: [out]\n    terminal: true\n',
   );
   const { run } = makeCli({ defs: dir });
   const r = run('lint');
@@ -369,7 +369,7 @@ test('owenloop lint exits 0 when a def has warnings but no errors', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-lint-warn-'));
   writeFileSync(
     join(dir, 'warned.yaml'),
-    'name: warned\ninputs:\n  - name: seed\nloops:\n  - name: a\n    consumes: [seed]\n    produces: [useful, orphan]\n  - name: b\n    consumes: [useful]\n    produces: [done]\n    terminal: true\n',
+    'name: warned\ninputs:\n  - name: seed\nsteps:\n  - name: a\n    consumes: [seed]\n    produces: [useful, orphan]\n  - name: b\n    consumes: [useful]\n    produces: [done]\n    terminal: true\n',
   );
   const { run } = makeCli({ defs: dir });
   const r = run('lint');
@@ -399,12 +399,12 @@ test('trace outputs valid JSON with timeline and artifacts fields', () => {
   assert.ok(Array.isArray(trace.timeline), 'has timeline array');
   assert.ok(Array.isArray(trace.artifacts), 'has artifacts array');
   assert.ok(trace.timeline.length >= 1, 'timeline has at least one event');
-  assert.equal(trace.timeline[0].loop, 'planner');
+  assert.equal(trace.timeline[0].step, 'planner');
   assert.equal(trace.timeline[0].seq, 1);
   assert.ok(typeof trace.summary.done === 'boolean');
 });
 
-test('trace --format text is non-empty and contains a loop name and outcome', () => {
+test('trace --format text is non-empty and contains a step name and outcome', () => {
   const { run } = makeCli();
 
   const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
@@ -415,7 +415,7 @@ test('trace --format text is non-empty and contains a loop name and outcome', ()
   const r = run('trace', wf, '--format', 'text');
   assert.equal(r.code, 0, r.err);
   assert.ok(r.out.length > 0, 'text output is non-empty');
-  assert.match(r.out, /planner/, 'output contains loop name "planner"');
+  assert.match(r.out, /planner/, 'output contains step name "planner"');
   assert.match(r.out, /ok/, 'output contains outcome "ok"');
   assert.match(r.out, /Timeline/, 'output contains Timeline header');
   assert.match(r.out, /Artifacts/, 'output contains Artifacts header');
@@ -517,11 +517,11 @@ test('green: born-rejected exits non-zero and still prints result JSON', () => {
   const { run } = makeCli();
   const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
   // Drive planner: green plan, close run
-  const planRun = run('tick', wf).json().orders.find((o: any) => o.loop === 'planner').run;
+  const planRun = run('tick', wf).json().orders.find((o: any) => o.step === 'planner').run;
   assert.equal(run('green', wf, planRun, 'plan', '--value', J({ plan: 'v1' })).code, 0);
   run('close', wf, planRun);
   // Claim builder (fingerprints plan@v1)
-  const builderRun = run('tick', wf).json().orders.find((o: any) => o.loop === 'builder').run;
+  const builderRun = run('tick', wf).json().orders.find((o: any) => o.step === 'builder').run;
   // Reject plan from builder's perspective (builder consumes plan, so has authority)
   run('reject', wf, 'plan', '--by', 'builder', '--text', 'changed my mind');
   // Green pr from builder — plan no longer green => CAS mismatch => born-rejected

@@ -8,17 +8,17 @@ import assert from 'node:assert/strict';
 import { Store } from '../src/store.ts';
 import { Engine } from '../src/engine.ts';
 import { buildTrace } from '../src/model.ts';
-import { def, input, loop } from './helpers.ts';
+import { def, input, step } from './helpers.ts';
 
 // The software-delivery wiring (§9), matching model.test.ts exactly.
 const delivery = def(
   'delivery',
   [input('proposal')],
   [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-    loop({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
-    loop({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
-    loop({ name: 'merger', consumes: ['verdict'], produces: ['merge'] }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+    step({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
+    step({ name: 'merger', consumes: ['verdict'], produces: ['merge'] }),
   ],
 );
 
@@ -34,13 +34,13 @@ test('buildTrace: timeline order, consumedInputs, producedStems, and biography e
   const tick1 = engine.tick(wf);
   assert.equal(tick1.orders.length, 1);
   const plannerOrder = tick1.orders[0]!;
-  assert.equal(plannerOrder.loop, 'planner');
+  assert.equal(plannerOrder.step, 'planner');
   engine.green(wf, plannerOrder.run, 'plan', { plan: 'v1' });
   engine.close(wf, plannerOrder.run, 'ok');
 
   // 2. Builder fires, produces pr
   const tick2 = engine.tick(wf);
-  const builderOrder1 = tick2.orders.find((o) => o.loop === 'builder')!;
+  const builderOrder1 = tick2.orders.find((o) => o.step === 'builder')!;
   assert.ok(builderOrder1, 'builder has an order');
   engine.green(wf, builderOrder1.run, 'pr', { pr: '#1' });
   engine.close(wf, builderOrder1.run, 'ok');
@@ -50,7 +50,7 @@ test('buildTrace: timeline order, consumedInputs, producedStems, and biography e
 
   // Builder fires again (retry)
   const tick3 = engine.tick(wf);
-  const builderOrder2 = tick3.orders.find((o) => o.loop === 'builder')!;
+  const builderOrder2 = tick3.orders.find((o) => o.step === 'builder')!;
   assert.ok(builderOrder2, 'builder has a second order after reject');
   engine.green(wf, builderOrder2.run, 'pr', { pr: '#2' });
   engine.close(wf, builderOrder2.run, 'ok');
@@ -71,7 +71,7 @@ test('buildTrace: timeline order, consumedInputs, producedStems, and biography e
     assert.ok(trace.timeline[i]!.at >= trace.timeline[i - 1]!.at, 'timeline is chronological');
   }
   // The planner event has consumedInputs with proposal version
-  const plannerEv = trace.timeline.find((e) => e.loop === 'planner')!;
+  const plannerEv = trace.timeline.find((e) => e.step === 'planner')!;
   assert.ok(plannerEv, 'planner event exists');
   assert.ok(plannerEv.consumedInputs !== undefined, 'planner has a fingerprint');
   assert.ok('proposal' in (plannerEv.consumedInputs!), 'planner consumed proposal');
@@ -79,7 +79,7 @@ test('buildTrace: timeline order, consumedInputs, producedStems, and biography e
   assert.deepEqual(plannerEv.producedStems, ['plan'], 'planner produces plan');
 
   // Builder's producedStems
-  const builderEvs = trace.timeline.filter((e) => e.loop === 'builder');
+  const builderEvs = trace.timeline.filter((e) => e.step === 'builder');
   assert.ok(builderEvs.length >= 2, 'two builder firings');
   for (const ev of builderEvs) {
     assert.deepEqual(ev.producedStems, ['pr'], 'builder produces pr');

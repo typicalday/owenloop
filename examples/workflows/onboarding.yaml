@@ -8,7 +8,7 @@
 # for a shipping confirmation.
 #
 # owenloop needs no state column for that. Each external wait is just an
-# artifact *owed by an external producer* — a `seedOwed` input. The loop that
+# artifact *owed by an external producer* — a `seedOwed` input. The step that
 # consumes it sits as a debt ("dormant") and produces no orders until a webhook
 # fulfills the input with `owenloop provide`. That is the pause; the next `tick`
 # is the resume. Context never replays — the new-hire details live in the
@@ -16,18 +16,18 @@
 #
 # State-machine → dataflow mapping:
 #   START             → `hire` input (seedOwed, producer: human)
-#   WELCOME_SENT      → `send_welcome` loop produces `welcome_packet`   (send_welcome_packet)
+#   WELCOME_SENT      → `send_welcome` step produces `welcome_packet`   (send_welcome_packet)
 #   DOCUMENTS_SIGNED  → `signed_documents` input (seedOwed, hr_portal webhook)
-#   IT_PROVISIONED    → `provision_it` loop produces `it_accounts`      (the it_agent sub-agent)
+#   IT_PROVISIONED    → `provision_it` step produces `it_accounts`      (the it_agent sub-agent)
 #   HARDWARE_DELIVERED→ `hardware_delivered` input (seedOwed, shipping webhook)
-#   COMPLETED         → `send_day_one` loop produces `day_one_schedule` (terminal; send_day_one_schedule)
+#   COMPLETED         → `send_day_one` step produces `day_one_schedule` (terminal; send_day_one_schedule)
 #
 # The two pauses fall out of the wiring: `provision_it` cannot fire until both
 # the welcome went out AND `signed_documents` is provided; `confirm_hardware`
 # cannot fire until IT is set up AND `hardware_delivered` is provided. Until the
-# webhook arrives those loops are blocked debts that emit no work.
+# webhook arrives those steps are blocked debts that emit no work.
 #
-# Drive it (the worker loop; webhooks are the two `provide` calls):
+# Drive it (the worker step; webhooks are the two `provide` calls):
 #   wf=$(owenloop create onboarding \
 #          --provide hire='{"name":"Ada Lovelace","email":"ada@corp.com","start_date":"2026-07-01"}' \
 #          | jq -r .workflow)
@@ -88,7 +88,7 @@ inputs:
         delivered_at: { type: string }
       additionalProperties: false
 
-loops:
+steps:
   - name: send_welcome          # WELCOME_SENT — the send_welcome_packet tool
     consumes: [hire]
     produces:
@@ -108,7 +108,7 @@ loops:
 
   - name: provision_it          # IT_PROVISIONED — the it_agent sub-agent
     # Fires only once the welcome went out AND the signature webhook fulfilled
-    # `signed_documents`. Until then this loop is a blocked, dormant debt — the
+    # `signed_documents`. Until then this step is a blocked, dormant debt — the
     # ADK pause, with no polling and no replayed history.
     consumes: [welcome_packet, signed_documents]
     produces:

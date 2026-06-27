@@ -1,13 +1,13 @@
 # Software-delivery wiring.
 #
-# A linear pipeline where each loop consumes the previous one's output and owes
+# A linear pipeline where each step consumes the previous one's output and owes
 # the next. The interesting dynamics are the *knock-backs*: the reviewer can
 # reject the PR (re-arming the builder), and any upstream change cascades
 # forward — a re-planned `plan` invalidates the `pr`, its `verdict`, and the
 # `merge` automatically (the forward cascade, §7). The `merge` is terminal: once
 # green it is a destructive completion and can never be re-armed (§15.2).
 #
-# Drive it (the "wiring" / worker loop):
+# Drive it (the "wiring" / worker step):
 #   wf=$(owenloop create delivery --provide proposal='{"text":"add dark mode"}' | jq -r .workflow)
 #   owenloop tick $wf          # -> an order for `planner`
 #   owenloop green $wf <run> plan --value '{"plan":"..."}'
@@ -24,7 +24,7 @@ inputs:
   - name: proposal          # required: the workflow stays blocked until supplied
     seedOwed: true          # `--provide proposal=...` at create, or `owenloop provide`
 
-loops:
+steps:
   - name: planner
     consumes: [proposal]
     produces: [plan]

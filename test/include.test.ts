@@ -24,7 +24,7 @@ const deliveryRaw = {
   name: 'delivery',
   title: 'Software delivery',
   inputs: [{ name: 'proposal', seedOwed: true }],
-  loops: [
+  steps: [
     { name: 'planner', consumes: ['proposal'], produces: ['plan'], body: 'plan it' },
     { name: 'builder', consumes: ['plan'], produces: ['pr'], body: 'build it' },
     { name: 'reviewer', consumes: ['pr'], produces: ['verdict'], body: 'review it' },
@@ -36,7 +36,7 @@ const deliveryRaw = {
 const parentWithMappedRaw = {
   name: 'full-cycle',
   inputs: [{ name: 'proposal', seedOwed: true }],
-  loops: [
+  steps: [
     { name: 'provision', consumes: ['proposal'], produces: ['environment'], body: 'provision' },
     { include: 'delivery', as: 'deliver', inputs: { proposal: 'proposal' } },
     {
@@ -50,15 +50,15 @@ const parentWithMappedRaw = {
   outputs: ['torn_down'],
 };
 
-// ---- (a) Basic expansion: prefixed loops, prefixed produces, parent can consume child artifact ---
+// ---- (a) Basic expansion: prefixed steps, prefixed produces, parent can consume child artifact ---
 
-test('(a) expandIncludes: basic expansion — loop names prefixed, stems prefixed, terminal preserved', () => {
+test('(a) expandIncludes: basic expansion — step names prefixed, stems prefixed, terminal preserved', () => {
   const deliveryDef = buildDef(deliveryRaw);
   const parentDef = buildDef(parentWithMappedRaw);
   const expanded = expandIncludes(parentDef, makeResolver([deliveryDef]));
 
-  const loopNames = expanded.loops.map((l) => l.name);
-  assert.deepEqual(loopNames, [
+  const stepNames = expanded.steps.map((l) => l.name);
+  assert.deepEqual(stepNames, [
     'provision',
     'deliver.planner',
     'deliver.builder',
@@ -67,7 +67,7 @@ test('(a) expandIncludes: basic expansion — loop names prefixed, stems prefixe
     'teardown',
   ]);
 
-  const deliverPlanner = expanded.loops.find((l) => l.name === 'deliver.planner')!;
+  const deliverPlanner = expanded.steps.find((l) => l.name === 'deliver.planner')!;
   assert.ok(deliverPlanner, 'deliver.planner must exist');
 
   // Mapped input: deliver.planner's first consume stem is outer 'proposal' (not prefixed)
@@ -77,11 +77,11 @@ test('(a) expandIncludes: basic expansion — loop names prefixed, stems prefixe
   // produce stem is prefixed
   assert.equal(deliverPlanner.produces[0]!.stem, 'deliver.plan');
 
-  const deliverBuilder = expanded.loops.find((l) => l.name === 'deliver.builder')!;
+  const deliverBuilder = expanded.steps.find((l) => l.name === 'deliver.builder')!;
   // Internal consume: deliver.builder consumes deliver.plan (prefixed)
   assert.equal(deliverBuilder.consumes[0]!.stem, 'deliver.plan');
 
-  const deliverMerger = expanded.loops.find((l) => l.name === 'deliver.merger')!;
+  const deliverMerger = expanded.steps.find((l) => l.name === 'deliver.merger')!;
   assert.equal(deliverMerger.produces[0]!.stem, 'deliver.merge');
   assert.equal(deliverMerger.terminal, true, 'terminal must be preserved after prefixing');
 
@@ -106,7 +106,7 @@ test('(b) expandIncludes: mapped input is not hoisted — parent inputs unchange
   assert.equal(hoisted, undefined, 'deliver.proposal must NOT be hoisted when mapped');
 
   // deliver.planner consumes the outer 'proposal', not 'deliver.proposal'
-  const deliverPlanner = expanded.loops.find((l) => l.name === 'deliver.planner')!;
+  const deliverPlanner = expanded.steps.find((l) => l.name === 'deliver.planner')!;
   assert.equal(deliverPlanner.consumes[0]!.stem, 'proposal');
 });
 
@@ -118,7 +118,7 @@ test('(c) expandIncludes: unmapped input is hoisted with prefix and seedOwed pre
   const parentNoMapRaw = {
     name: 'no-map-parent',
     inputs: [] as unknown[],
-    loops: [
+    steps: [
       { include: 'delivery', as: 'deliver' },
     ],
   };
@@ -131,17 +131,17 @@ test('(c) expandIncludes: unmapped input is hoisted with prefix and seedOwed pre
   assert.equal(hoisted.seedOwed, true, 'seedOwed must be preserved when hoisting');
 
   // deliver.planner must consume 'deliver.proposal' (prefixed)
-  const deliverPlanner = expanded.loops.find((l) => l.name === 'deliver.planner')!;
+  const deliverPlanner = expanded.steps.find((l) => l.name === 'deliver.planner')!;
   assert.equal(deliverPlanner.consumes[0]!.stem, 'deliver.proposal');
 });
 
-// ---- (d) Collection child — map/reduce loop under prefix keeps correct seal paths ------
+// ---- (d) Collection child — map/reduce step under prefix keeps correct seal paths ------
 
-test('(d) expandIncludes: collection child loops keep correct prefixed stems and seal paths', () => {
+test('(d) expandIncludes: collection child steps keep correct prefixed stems and seal paths', () => {
   const collectionChildRaw = {
     name: 'collector',
     inputs: [{ name: 'seed' }],
-    loops: [
+    steps: [
       { name: 'gatherer', consumes: ['seed'], produces: ['source[]'], body: 'gather' },
       { name: 'fmt', consumes: ['source[$i]'], produces: ['source[$i].check'], body: 'format' },
       { name: 'synth', consumes: ['source[*]'], produces: ['report'], body: 'synth' },
@@ -150,7 +150,7 @@ test('(d) expandIncludes: collection child loops keep correct prefixed stems and
   const parentRaw = {
     name: 'parent-collector',
     inputs: [{ name: 'outer_seed' }],
-    loops: [
+    steps: [
       { include: 'collector', as: 'child', inputs: { seed: 'outer_seed' } },
     ],
     outputs: ['child.report'],
@@ -160,12 +160,12 @@ test('(d) expandIncludes: collection child loops keep correct prefixed stems and
   const parentDef = buildDef(parentRaw);
   const expanded = expandIncludes(parentDef, makeResolver([childDef]));
 
-  const gatherer = expanded.loops.find((l) => l.name === 'child.gatherer')!;
+  const gatherer = expanded.steps.find((l) => l.name === 'child.gatherer')!;
   assert.ok(gatherer, 'child.gatherer must exist');
   assert.equal(gatherer.produces[0]!.stem, 'child.source');
   assert.equal(gatherer.produces[0]!.kind, 'collection');
 
-  const fmt = expanded.loops.find((l) => l.name === 'child.fmt')!;
+  const fmt = expanded.steps.find((l) => l.name === 'child.fmt')!;
   assert.ok(fmt, 'child.fmt must exist');
   assert.equal(fmt.consumes[0]!.stem, 'child.source');
   assert.equal(fmt.consumes[0]!.mode, 'map');
@@ -173,7 +173,7 @@ test('(d) expandIncludes: collection child loops keep correct prefixed stems and
   assert.equal(fmt.produces[0]!.kind, 'map');
   assert.equal(fmt.produces[0]!.suffix, '.check');
 
-  const synth = expanded.loops.find((l) => l.name === 'child.synth')!;
+  const synth = expanded.steps.find((l) => l.name === 'child.synth')!;
   assert.ok(synth, 'child.synth must exist');
   assert.equal(synth.consumes[0]!.stem, 'child.source');
   assert.equal(synth.consumes[0]!.mode, 'reduce');
@@ -192,7 +192,7 @@ test('(e) expandIncludes: nested includes (A->B->C) fully expand with correct na
   const cRaw = {
     name: 'c',
     inputs: [{ name: 'seed' }],
-    loops: [
+    steps: [
       { name: 'c1', consumes: ['seed'], produces: ['mid'], body: 'c1' },
       { name: 'c2', consumes: ['mid'], produces: ['cresult'], body: 'c2' },
     ],
@@ -201,16 +201,16 @@ test('(e) expandIncludes: nested includes (A->B->C) fully expand with correct na
   const bRaw = {
     name: 'b',
     inputs: [{ name: 'bseed' }],
-    loops: [
+    steps: [
       { include: 'c', as: 'c', inputs: { seed: 'bseed' } },
-      { name: 'ownloop', consumes: ['c.cresult'], produces: ['bresult'], body: 'b' },
+      { name: 'ownstep', consumes: ['c.cresult'], produces: ['bresult'], body: 'b' },
     ],
     outputs: ['bresult'],
   };
   const aRaw = {
     name: 'a',
     inputs: [{ name: 'aseed' }],
-    loops: [
+    steps: [
       { include: 'b', as: 'b', inputs: { bseed: 'aseed' } },
       { name: 'ownA', consumes: ['b.bresult'], produces: ['aresult'], body: 'a' },
     ],
@@ -223,17 +223,17 @@ test('(e) expandIncludes: nested includes (A->B->C) fully expand with correct na
   const resolver = makeResolver([cDef, bDef, aDef]);
   const expanded = expandIncludes(aDef, resolver);
 
-  const loopNames = expanded.loops.map((l) => l.name);
-  // Order: b.c.c1, b.c.c2, b.ownloop, ownA
-  assert.ok(loopNames.includes('b.c.c1'), `expected b.c.c1, got: ${loopNames.join(', ')}`);
-  assert.ok(loopNames.includes('b.c.c2'), `expected b.c.c2, got: ${loopNames.join(', ')}`);
-  assert.ok(loopNames.includes('b.ownloop'), `expected b.ownloop, got: ${loopNames.join(', ')}`);
-  assert.ok(loopNames.includes('ownA'), `expected ownA, got: ${loopNames.join(', ')}`);
+  const stepNames = expanded.steps.map((l) => l.name);
+  // Order: b.c.c1, b.c.c2, b.ownstep, ownA
+  assert.ok(stepNames.includes('b.c.c1'), `expected b.c.c1, got: ${stepNames.join(', ')}`);
+  assert.ok(stepNames.includes('b.c.c2'), `expected b.c.c2, got: ${stepNames.join(', ')}`);
+  assert.ok(stepNames.includes('b.ownstep'), `expected b.ownstep, got: ${stepNames.join(', ')}`);
+  assert.ok(stepNames.includes('ownA'), `expected ownA, got: ${stepNames.join(', ')}`);
 
-  // Order: b.c.c1 before b.c.c2 before b.ownloop before ownA
-  assert.ok(loopNames.indexOf('b.c.c1') < loopNames.indexOf('b.c.c2'));
-  assert.ok(loopNames.indexOf('b.c.c2') < loopNames.indexOf('b.ownloop'));
-  assert.ok(loopNames.indexOf('b.ownloop') < loopNames.indexOf('ownA'));
+  // Order: b.c.c1 before b.c.c2 before b.ownstep before ownA
+  assert.ok(stepNames.indexOf('b.c.c1') < stepNames.indexOf('b.c.c2'));
+  assert.ok(stepNames.indexOf('b.c.c2') < stepNames.indexOf('b.ownstep'));
+  assert.ok(stepNames.indexOf('b.ownstep') < stepNames.indexOf('ownA'));
 
   const errors = validateDef(expanded);
   assert.deepEqual(errors, []);
@@ -246,7 +246,7 @@ test('(f1) buildDef: missing as: throws DefError', () => {
     () => buildDef({
       name: 'parent',
       inputs: [],
-      loops: [{ include: 'delivery' }],
+      steps: [{ include: 'delivery' }],
     }),
     (e: unknown) => {
       assert.ok(e instanceof DefError);
@@ -261,7 +261,7 @@ test('(f2) buildDef: bad as: pattern (starts with digit) throws DefError', () =>
     () => buildDef({
       name: 'parent',
       inputs: [],
-      loops: [{ include: 'delivery', as: '123bad' }],
+      steps: [{ include: 'delivery', as: '123bad' }],
     }),
     (e: unknown) => {
       assert.ok(e instanceof DefError);
@@ -276,7 +276,7 @@ test('(f3) buildDef: as: with leading uppercase throws DefError', () => {
     () => buildDef({
       name: 'parent',
       inputs: [],
-      loops: [{ include: 'delivery', as: 'Deliver' }],
+      steps: [{ include: 'delivery', as: 'Deliver' }],
     }),
     (e: unknown) => {
       assert.ok(e instanceof DefError);
@@ -291,7 +291,7 @@ test('(f4) buildDef: duplicate as: throws DefError', () => {
     () => buildDef({
       name: 'parent',
       inputs: [{ name: 'x' }],
-      loops: [
+      steps: [
         { include: 'delivery', as: 'deliver' },
         { include: 'other', as: 'deliver' },
       ],
@@ -304,19 +304,19 @@ test('(f4) buildDef: duplicate as: throws DefError', () => {
   );
 });
 
-test('(f5) buildDef: as: collides with sibling loop name throws DefError', () => {
+test('(f5) buildDef: as: collides with sibling step name throws DefError', () => {
   assert.throws(
     () => buildDef({
       name: 'parent',
       inputs: [{ name: 'x' }],
-      loops: [
+      steps: [
         { name: 'deliver', consumes: ['x'], produces: ['y'], body: 'x' },
         { include: 'delivery', as: 'deliver' },
       ],
     }),
     (e: unknown) => {
       assert.ok(e instanceof DefError);
-      assert.match(e.message, /collides with sibling loop name/);
+      assert.match(e.message, /collides with sibling step name/);
       return true;
     },
   );
@@ -326,7 +326,7 @@ test('(f6) expandIncludes: include of non-existent def throws DefError', () => {
   const parentRaw = {
     name: 'parent',
     inputs: [],
-    loops: [{ include: 'nonexistent', as: 'x' }],
+    steps: [{ include: 'nonexistent', as: 'x' }],
   };
   const parentDef = buildDef(parentRaw);
   assert.throws(
@@ -344,7 +344,7 @@ test('(f7) expandIncludes: inputs map references non-input key throws DefError',
   const parentRaw = {
     name: 'parent',
     inputs: [{ name: 'outer' }],
-    loops: [
+    steps: [
       { include: 'delivery', as: 'deliver', inputs: { nonexistent_key: 'outer' } },
     ],
   };
@@ -364,13 +364,13 @@ test('(f8) expandIncludes: include cycle throws DefError', () => {
   const aRaw = {
     name: 'cycleA',
     inputs: [{ name: 'x' }],
-    loops: [{ include: 'cycleB', as: 'b' }],
+    steps: [{ include: 'cycleB', as: 'b' }],
     outputs: [] as string[],
   };
   const bRaw = {
     name: 'cycleB',
     inputs: [{ name: 'x' }],
-    loops: [{ include: 'cycleA', as: 'a' }],
+    steps: [{ include: 'cycleA', as: 'a' }],
     outputs: [] as string[],
   };
   const aDef = buildDef(aRaw);
@@ -401,7 +401,7 @@ test('(g) validateDef on expanded def: valid parent+child passes; bad input mapp
   const badParentRaw = {
     name: 'bad-parent',
     inputs: [{ name: 'outer' }],
-    loops: [
+    steps: [
       { name: 'provision', consumes: ['outer'], produces: ['environment'], body: 'x' },
       // map delivery's 'proposal' to 'nonexistent_outer' — will cause dangling consume
       { include: 'delivery', as: 'deliver', inputs: { proposal: 'nonexistent_outer' } },
@@ -430,7 +430,7 @@ title: Software delivery
 inputs:
   - name: proposal
     seedOwed: true
-loops:
+steps:
   - name: planner
     consumes: [proposal]
     produces: [plan]
@@ -457,7 +457,7 @@ inputs:
     seedOwed: true
 outputs:
   - torn_down
-loops:
+steps:
   - name: provision
     consumes: [proposal]
     produces: [environment]
@@ -486,13 +486,13 @@ loops:
   const delivery = all.get('delivery')!;
   assert.equal(delivery._includes, undefined, 'delivery must have no _includes after loading');
 
-  // full-cycle has expanded loops
+  // full-cycle has expanded steps
   const fullCycle = all.get('full-cycle')!;
   assert.equal(fullCycle._includes, undefined, 'full-cycle must have no _includes after expansion');
-  const loopNames = fullCycle.loops.map((l) => l.name);
-  assert.ok(loopNames.includes('deliver.planner'), `expected deliver.planner in ${loopNames.join(', ')}`);
-  assert.ok(loopNames.includes('deliver.merger'), `expected deliver.merger in ${loopNames.join(', ')}`);
-  assert.ok(loopNames.includes('teardown'), `expected teardown in ${loopNames.join(', ')}`);
+  const stepNames = fullCycle.steps.map((l) => l.name);
+  assert.ok(stepNames.includes('deliver.planner'), `expected deliver.planner in ${stepNames.join(', ')}`);
+  assert.ok(stepNames.includes('deliver.merger'), `expected deliver.merger in ${stepNames.join(', ')}`);
+  assert.ok(stepNames.includes('teardown'), `expected teardown in ${stepNames.join(', ')}`);
 
   // Both pass validateDef
   assert.deepEqual(validateDef(delivery), []);

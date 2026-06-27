@@ -8,7 +8,7 @@ title: Map concurrency cap
 inputs:
   - name: seed
     seedOwed: true
-loops:
+steps:
   - name: spawn
     consumes: [seed]
     produces: ["item[]"]

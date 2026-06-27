@@ -26,7 +26,7 @@ inputs:
   - name: ticket
     seedOwed: true
 
-loops:
+steps:
   - name: triage
     consumes: [ticket]
     produces: [route]

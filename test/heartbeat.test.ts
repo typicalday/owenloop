@@ -1,6 +1,6 @@
 /**
  * Heartbeat liveness tests — covering Engine.heartbeat(), unified isClaimFresh,
- * per-loop TTL override, and status() attempts enrichment.
+ * per-step TTL override, and status() attempts enrichment.
  */
 
 import { test } from 'node:test';
@@ -9,7 +9,7 @@ import { Engine } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { WorkflowDef } from '../src/types.ts';
-import { def, input, loop } from './helpers.ts';
+import { def, input, step } from './helpers.ts';
 
 // ---- harness ------------------------------------------------------------------
 
@@ -33,7 +33,7 @@ const deliveryDef = def(
   'delivery',
   [input('proposal')],
   [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
   ],
 );
 
@@ -90,7 +90,7 @@ test('heartbeat: beat from superseded run throws', () => {
   engine.close(wf, R1, 'ok');
 
   // Green the output so planner becomes re-eligible only if needed — but actually
-  // after ok close without greening, the task goes idle and the loop can re-fire.
+  // after ok close without greening, the task goes idle and the step can re-fire.
   // R2 claimed on next tick
   const t100 = engine.tick(wf, { now: 100 });
   assert.equal(t100.orders.length, 1, 'should have a new run R2');
@@ -117,14 +117,14 @@ test('heartbeat: non-beating run past TTL is reaped', () => {
   assert.equal(t200.reaped, 1, 'run should be reaped after TTL without heartbeats');
 });
 
-// ---- Test 5: per-loop TTL override shorter than engine default ---------------
+// ---- Test 5: per-step TTL override shorter than engine default ---------------
 
-test('heartbeat: per-loop TTL shorter than engine default — reaped at loop TTL', () => {
+test('heartbeat: per-step TTL shorter than engine default — reaped at step TTL', () => {
   const shortTtlDef = def(
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'], reapTtlMs: 500 }),
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'], reapTtlMs: 500 }),
     ],
   );
   const store = openStore(':memory:');
@@ -134,19 +134,19 @@ test('heartbeat: per-loop TTL shorter than engine default — reaped at loop TTL
   const t0 = engine.tick(wf, { now: 0 });
   assert.equal(t0.orders.length, 1);
 
-  // t=800: past loop TTL (500ms) but before engine TTL (2000ms)
+  // t=800: past step TTL (500ms) but before engine TTL (2000ms)
   const t800 = engine.tick(wf, { now: 800 });
-  assert.equal(t800.reaped, 1, 'run should be reaped at loop TTL (500ms), not engine TTL (2000ms)');
+  assert.equal(t800.reaped, 1, 'run should be reaped at step TTL (500ms), not engine TTL (2000ms)');
 });
 
-// ---- Test 6: per-loop TTL override longer than engine default ----------------
+// ---- Test 6: per-step TTL override longer than engine default ----------------
 
-test('heartbeat: per-loop TTL longer than engine default — not reaped before loop TTL', () => {
+test('heartbeat: per-step TTL longer than engine default — not reaped before step TTL', () => {
   const longTtlDef = def(
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'], reapTtlMs: 2000 }),
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'], reapTtlMs: 2000 }),
     ],
   );
   const store = openStore(':memory:');
@@ -156,9 +156,9 @@ test('heartbeat: per-loop TTL longer than engine default — not reaped before l
   const t0 = engine.tick(wf, { now: 0 });
   assert.equal(t0.orders.length, 1);
 
-  // t=800: past engine TTL (500ms) but before loop TTL (2000ms)
+  // t=800: past engine TTL (500ms) but before step TTL (2000ms)
   const t800 = engine.tick(wf, { now: 800 });
-  assert.equal(t800.reaped, 0, 'run should NOT be reaped at engine TTL (500ms) when loop TTL is 2000ms');
+  assert.equal(t800.reaped, 0, 'run should NOT be reaped at engine TTL (500ms) when step TTL is 2000ms');
 });
 
 // ---- Test 7: status() exposes attempts and increments after each reap --------

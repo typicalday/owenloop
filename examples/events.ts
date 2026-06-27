@@ -4,21 +4,21 @@
  * `subscribe` (or `createEngine({ onEvent })`) pushes a typed `EngineEvent` the
  * instant a mutation commits. So an in-process host advances the graph by
  * *reacting* to events instead of polling `tick`/`status` on a timer: each
- * `settled` event reports whether the workflow is `done` and which loops are
+ * `settled` event reports whether the workflow is `done` and which steps are
  * `eligible` — the no-poll signal.
  *
  * Run it:  node examples/events.ts
  *
  * It wires an event-driven worker over the bundled `delivery` pipeline. One
  * external kick — providing the `proposal` — cascades through plan → build →
- * review → merge entirely via events; there is no polling loop anywhere.
+ * review → merge entirely via events; there is no polling step anywhere.
  */
 
 import { join } from 'node:path';
 import { createEngine } from '../src/index.ts';
 import type { EngineEvent } from '../src/index.ts';
 
-// What a real worker would compute for each loop's owed output.
+// What a real worker would compute for each step's owed output.
 const OUTPUTS: Record<string, Record<string, unknown>> = {
   planner: { plan: 'do the thing' },
   builder: { pr: 'https://example.com/pr/1' },
@@ -45,7 +45,7 @@ let wf = '';
 // The event-driven worker: every `settled` carries the eligible set, so we pull
 // and green exactly the work it reports — no `status` poll, no timer. Greening
 // an output commits and re-settles synchronously, which re-enters this handler
-// for the next loop, walking the pipeline to `done`.
+// for the next step, walking the pipeline to `done`.
 engine.subscribe((e) => {
   if (e.type !== 'settled' || e.workflow !== wf) return;
   if (e.done) {
@@ -54,7 +54,7 @@ engine.subscribe((e) => {
   }
   if (e.eligible.length === 0) return;
   for (const order of engine.tick(wf).orders) {
-    const value = OUTPUTS[order.loop];
+    const value = OUTPUTS[order.step];
     if (!value) continue;
     engine.green(wf, order.run, order.owes[0]!.path, value);
     engine.close(wf, order.run);

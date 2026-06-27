@@ -3,7 +3,7 @@
  *
  * A workflow is authored as a single self-contained YAML file. The engine is
  * domain-neutral, so a definition is *just wiring*: declared inputs, plus a set
- * of loops connected by the artifacts they `consumes` / `produces`. This module
+ * of steps connected by the artifacts they `consumes` / `produces`. This module
  * turns that YAML into a validated `WorkflowDef` — parsing the path patterns
  * (paths.ts), filling defaults, and rejecting mis-wired graphs (dangling
  * consumes, two writers for one artifact, map/reduce mismatches, dependency
@@ -12,7 +12,7 @@
  *   name: delivery
  *   inputs:
  *     - name: proposal
- *   loops:
+ *   steps:
  *     - name: planner
  *       consumes: [proposal]
  *       produces: [plan]
@@ -26,7 +26,7 @@ import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from './paths.ts';
 import { parseDurationMs, parseDurationSecs } from './util.ts';
 import { assertValidSchema } from './schema.ts';
-import type { Acceptance, EffectDef, FiringTrigger, InputDef, InvariantDef, InvariantPredicate, JsonSchema, LoopDef, ProducePattern, WorkflowDef } from './types.ts';
+import type { Acceptance, EffectDef, FiringTrigger, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
 
@@ -41,7 +41,7 @@ interface RawProduce {
   name?: unknown;
   schema?: unknown;
 }
-interface RawLoop {
+interface RawStep {
   name?: unknown;
   consumes?: unknown;
   produces?: unknown;
@@ -59,7 +59,7 @@ interface RawLoop {
   on?: unknown;
   idleAfter?: unknown;
   body?: unknown;
-  /** M2-GRAMMAR: if present, this entry is a calls: loop (Mode 2 runtime composition). */
+  /** M2-GRAMMAR: if present, this entry is a calls: step (Mode 2 runtime composition). */
   calls?: unknown;
   reapTtl?: unknown;
 }
@@ -81,7 +81,7 @@ interface RawDef {
   title?: unknown;
   description?: unknown;
   inputs?: unknown;
-  loops?: unknown;
+  steps?: unknown;
   outputs?: unknown;
   invariants?: unknown;
 }
@@ -131,7 +131,7 @@ function asSchema(v: unknown, ctx: string): JsonSchema {
 }
 
 /**
- * Parse a loop's `produces` list. Each entry is either a bare pattern string
+ * Parse a step's `produces` list. Each entry is either a bare pattern string
  * (`plan`, `gather.source[]`) or a mapping `{ name, schema }` attaching a JSON
  * Schema the produced value must satisfy at commit time (§19).
  */
@@ -155,12 +155,12 @@ export class DefError extends Error {}
 
 // ---- Mode 1 include-directive helpers (M1-GRAMMAR) ---------------------------
 
-/** Duck-check: does this raw loop-list entry look like an include directive? */
+/** Duck-check: does this raw step-list entry look like an include directive? */
 function isIncludeDirective(v: unknown): boolean {
   return typeof v === 'object' && v !== null && 'include' in v;
 }
 
-/** Duck-check: does this raw loop-list entry look like a calls: directive (M2-GRAMMAR)? */
+/** Duck-check: does this raw step-list entry look like a calls: directive (M2-GRAMMAR)? */
 function isCallsDirective(v: unknown): boolean {
   return typeof v === 'object' && v !== null && 'calls' in v && !('include' in v);
 }
@@ -174,16 +174,16 @@ function parseIncludeDirective(
   const obj = raw as RawInclude;
   // include: must be a non-empty string
   if (typeof obj.include !== 'string' || obj.include.trim() === '') {
-    throw new DefError(`loop entry [${i}] 'include:' must be a workflow name string`);
+    throw new DefError(`step entry [${i}] 'include:' must be a workflow name string`);
   }
   const defName = obj.include.trim();
   // as: is required
   if (obj.as === undefined) {
-    throw new DefError(`loop entry [${i}] include directive is missing 'as:'`);
+    throw new DefError(`step entry [${i}] include directive is missing 'as:'`);
   }
   // as: must be a string
   if (typeof obj.as !== 'string') {
-    throw new DefError(`loop entry [${i}] include 'as:' must be a string`);
+    throw new DefError(`step entry [${i}] include 'as:' must be a string`);
   }
   const as = obj.as;
   // as: must be a valid identifier token
@@ -297,7 +297,7 @@ function parseInvariants(v: unknown, ctx: string): InvariantDef[] {
 /**
  * Build a `WorkflowDef` from a parsed YAML object, coercing types and filling
  * defaults — but WITHOUT the static wiring checks. Throws DefError only on
- * malformed shapes (wrong types, missing name/loops). Use `parseDef` for the
+ * malformed shapes (wrong types, missing name/steps). Use `parseDef` for the
  * full build-and-validate; this is exposed mainly so the validator can be
  * exercised on a built-but-invalid graph.
  */
@@ -323,42 +323,42 @@ export function buildDef(raw: unknown, source?: string): WorkflowDef {
     return input;
   });
 
-  if (!Array.isArray(r.loops) || r.loops.length === 0) {
-    throw new DefError(`workflow '${name}' must declare at least one loop`);
+  if (!Array.isArray(r.steps) || r.steps.length === 0) {
+    throw new DefError(`workflow '${name}' must declare at least one step`);
   }
 
-  // Parse the loop list, splitting normal loops from include directives (M1-GRAMMAR).
+  // Parse the step list, splitting normal steps from include directives (M1-GRAMMAR).
   const includes: NonNullable<WorkflowDef['_includes']> = [];
-  const loops: LoopDef[] = [];
-  for (const [i, rl] of (r.loops as unknown[]).entries()) {
+  const steps: StepDef[] = [];
+  for (const [i, rl] of (r.steps as unknown[]).entries()) {
     if (isIncludeDirective(rl)) {
       const inc = parseIncludeDirective(rl, i, name);
-      includes.push({ pos: loops.length, ...inc });
+      includes.push({ pos: steps.length, ...inc });
     } else {
-      loops.push(buildLoop(rl as RawLoop, i));
+      steps.push(buildStep(rl as RawStep, i));
     }
   }
 
-  // M1-GRAMMAR post-parse cross-checks: duplicate as: and as:/loop-name collision.
+  // M1-GRAMMAR post-parse cross-checks: duplicate as: and as:/step-name collision.
   if (includes.length > 0) {
     const asSeen = new Set<string>();
-    const loopNameSet = new Set(loops.map((l) => l.name));
+    const stepNameSet = new Set(steps.map((l) => l.name));
     for (const inc of includes) {
       if (asSeen.has(inc.as)) {
         throw new DefError(`include 'as:' value '${inc.as}' is used more than once in workflow '${name}'`);
       }
       asSeen.add(inc.as);
-      if (loopNameSet.has(inc.as)) {
-        throw new DefError(`include 'as:' value '${inc.as}' collides with sibling loop name '${inc.as}' in workflow '${name}'`);
+      if (stepNameSet.has(inc.as)) {
+        throw new DefError(`include 'as:' value '${inc.as}' collides with sibling step name '${inc.as}' in workflow '${name}'`);
       }
     }
   }
 
-  // Require at least one loop OR at least one include directive.
-  // (The loops array above may be empty if ALL entries are includes — that is fine
+  // Require at least one step OR at least one include directive.
+  // (The steps array above may be empty if ALL entries are includes — that is fine
   //  once expanded. But we still need the workflow to have some work.)
 
-  const def: WorkflowDef = { name, inputs, loops };
+  const def: WorkflowDef = { name, inputs, steps };
   if (includes.length > 0) def._includes = includes;
   if (r.title !== undefined) def.title = asString(r.title, 'title');
   if (r.description !== undefined) def.description = asString(r.description, 'description');
@@ -374,14 +374,14 @@ export function buildDef(raw: unknown, source?: string): WorkflowDef {
 // ---- Mode 1 expand helpers (M1-EXPAND) ----------------------------------------
 
 /**
- * Prefix all names/stems in a LoopDef with `${prefix}.`. Pure — returns a new LoopDef.
- * Rewrites: loop name, consume stems, produce stems, generates stems, invalidates, and
- * effect.onInvalidate loop-name strings (but not 'pin'/'escalate').
+ * Prefix all names/stems in a StepDef with `${prefix}.`. Pure — returns a new StepDef.
+ * Rewrites: step name, consume stems, produce stems, generates stems, invalidates, and
+ * effect.onInvalidate step-name strings (but not 'pin'/'escalate').
  */
-function prefixLoop(loop: LoopDef, prefix: string): LoopDef {
+function prefixStep(step: StepDef, prefix: string): StepDef {
   const prefixStem = (stem: string): string => `${prefix}.${stem}`;
 
-  const newConsumes = loop.consumes.map((c) => {
+  const newConsumes = step.consumes.map((c) => {
     const stem = prefixStem(c.stem);
     let raw: string;
     if (c.mode === 'plain') {
@@ -409,19 +409,19 @@ function prefixLoop(loop: LoopDef, prefix: string): LoopDef {
     return { ...p, stem, raw };
   };
 
-  const newProduces = loop.produces.map(prefixProduce);
-  const newGenerates = loop.generates ? loop.generates.map(prefixProduce) : undefined;
+  const newProduces = step.produces.map(prefixProduce);
+  const newGenerates = step.generates ? step.generates.map(prefixProduce) : undefined;
 
-  const newInvalidates = loop.invalidates.map(prefixStem);
+  const newInvalidates = step.invalidates.map(prefixStem);
 
-  let newEffect = loop.effect;
-  if (loop.effect?.onInvalidate && loop.effect.onInvalidate !== 'pin' && loop.effect.onInvalidate !== 'escalate') {
-    newEffect = { ...loop.effect, onInvalidate: prefixStem(loop.effect.onInvalidate) };
+  let newEffect = step.effect;
+  if (step.effect?.onInvalidate && step.effect.onInvalidate !== 'pin' && step.effect.onInvalidate !== 'escalate') {
+    newEffect = { ...step.effect, onInvalidate: prefixStem(step.effect.onInvalidate) };
   }
 
-  const result: LoopDef = {
-    ...loop,
-    name: prefixStem(loop.name),
+  const result: StepDef = {
+    ...step,
+    name: prefixStem(step.name),
     consumes: newConsumes,
     produces: newProduces,
     invalidates: newInvalidates,
@@ -433,7 +433,7 @@ function prefixLoop(loop: LoopDef, prefix: string): LoopDef {
 
 /**
  * Expand all `_includes` directives in a `WorkflowDef`, returning a new def with
- * the child loops spliced in (prefixed + inputs rewired). Pure — never mutates input.
+ * the child steps spliced in (prefixed + inputs rewired). Pure — never mutates input.
  *
  * `resolve` maps a def name to its un-expanded `WorkflowDef` (or undefined if unknown).
  * `stack` tracks the include chain for cycle detection (defaults to `[def.name]`).
@@ -447,22 +447,22 @@ export function expandIncludes(
 
   const currentStack = stack ?? [def.name];
 
-  // Build the ordered slot list: interleave normal loops and include directives by pos.
-  // Each include has a `pos` = index in the original loops array where it is inserted.
+  // Build the ordered slot list: interleave normal steps and include directives by pos.
+  // Each include has a `pos` = index in the original steps array where it is inserted.
   // We reconstruct the full ordered list in a single pass.
   const sortedIncludes = [...def._includes].sort((a, b) => a.pos - b.pos);
 
-  const resultLoops: LoopDef[] = [];
+  const resultSteps: StepDef[] = [];
   const resultInputs: import('./types.ts').InputDef[] = [...def.inputs];
   const resultOutputs: string[] = [...(def.outputs ?? [])];
 
-  // Walk the original loops interspersed with includes.
-  let loopIdx = 0;
+  // Walk the original steps interspersed with includes.
+  let stepIdx = 0;
   let incIdx = 0;
 
-  while (loopIdx < def.loops.length || incIdx < sortedIncludes.length) {
-    // Emit all include directives whose pos <= current loop index.
-    while (incIdx < sortedIncludes.length && sortedIncludes[incIdx]!.pos <= loopIdx) {
+  while (stepIdx < def.steps.length || incIdx < sortedIncludes.length) {
+    // Emit all include directives whose pos <= current step index.
+    while (incIdx < sortedIncludes.length && sortedIncludes[incIdx]!.pos <= stepIdx) {
       const inc = sortedIncludes[incIdx]!;
       incIdx++;
 
@@ -490,8 +490,8 @@ export function expandIncludes(
         }
       }
 
-      // (e) prefix child loops
-      const prefixedLoops = child.loops.map((l) => prefixLoop(l, inc.as));
+      // (e) prefix child steps
+      const prefixedSteps = child.steps.map((l) => prefixStep(l, inc.as));
 
       // (f) handle inputs: mapped inputs become internal edges; unmapped are hoisted
       const inputRewrites = new Map<string, string>(); // prefixed-stem -> outer artifact
@@ -506,8 +506,8 @@ export function expandIncludes(
         }
       }
 
-      // Apply input rewrites to prefixed loops
-      const rewrittenLoops = prefixedLoops.map((l) => {
+      // Apply input rewrites to prefixed steps
+      const rewrittenSteps = prefixedSteps.map((l) => {
         const rewrittenConsumes = l.consumes.map((c) => {
           const outer = inputRewrites.get(c.stem);
           if (outer !== undefined) {
@@ -519,7 +519,7 @@ export function expandIncludes(
         return { ...l, consumes: rewrittenConsumes };
       });
 
-      resultLoops.push(...rewrittenLoops);
+      resultSteps.push(...rewrittenSteps);
 
       // (g) merge child outputs
       for (const stem of child.outputs ?? []) {
@@ -530,16 +530,16 @@ export function expandIncludes(
       }
     }
 
-    // Emit the next normal loop (if any remain)
-    if (loopIdx < def.loops.length) {
-      resultLoops.push(def.loops[loopIdx]!);
-      loopIdx++;
+    // Emit the next normal step (if any remain)
+    if (stepIdx < def.steps.length) {
+      resultSteps.push(def.steps[stepIdx]!);
+      stepIdx++;
     }
   }
 
   return {
     ...def,
-    loops: resultLoops,
+    steps: resultSteps,
     inputs: resultInputs,
     outputs: resultOutputs.length > 0 ? resultOutputs : def.outputs,
     _includes: undefined,
@@ -558,30 +558,30 @@ export function parseDef(raw: unknown, source?: string): WorkflowDef {
   return def;
 }
 
-function buildLoop(rl: RawLoop, i: number): LoopDef {
-  // M2-GRAMMAR: if this entry carries a 'calls' key, parse it as a calls: loop (Mode 2).
+function buildStep(rl: RawStep, i: number): StepDef {
+  // M2-GRAMMAR: if this entry carries a 'calls' key, parse it as a calls: step (Mode 2).
   if (typeof rl.calls !== 'undefined') {
     const rawCalls = rl as RawCalls;
-    const name = asString(rawCalls.name, `loops[${i}].name`);
-    const callsTarget = asString(rawCalls.calls, `loop '${name}'.calls`);
+    const name = asString(rawCalls.name, `steps[${i}].name`);
+    const callsTarget = asString(rawCalls.calls, `step '${name}'.calls`);
     // parse inputs: optional mapping of child input name -> parent artifact name
     const callsInputs: Record<string, string> = {};
     if (rawCalls.inputs !== undefined) {
       if (typeof rawCalls.inputs !== 'object' || rawCalls.inputs === null || Array.isArray(rawCalls.inputs)) {
-        throw new DefError(`loop '${name}'.inputs: must be an object mapping child input names to parent artifact names`);
+        throw new DefError(`step '${name}'.inputs: must be an object mapping child input names to parent artifact names`);
       }
       for (const [k, v] of Object.entries(rawCalls.inputs as Record<string, unknown>)) {
-        if (typeof v !== 'string') throw new DefError(`loop '${name}'.inputs: value for key '${k}' must be a string`);
+        if (typeof v !== 'string') throw new DefError(`step '${name}'.inputs: value for key '${k}' must be a string`);
         callsInputs[k] = v;
       }
     }
     // parse produces: (required; exactly one — enforced by validateDef)
-    const producesPatterns = parseProduces(rawCalls.produces, `loop '${name}'.produces`);
-    const loop: LoopDef = {
+    const producesPatterns = parseProduces(rawCalls.produces, `step '${name}'.produces`);
+    const step: StepDef = {
       name,
       calls: callsTarget,
       callsInputs,
-      consumes: [],          // calls: loops have no consumes in LoopDef (eligibility is engine-managed)
+      consumes: [],          // calls: steps have no consumes in StepDef (eligibility is engine-managed)
       produces: producesPatterns,
       invalidates: [],
       cadence: DEFAULTS.cadence,
@@ -593,72 +593,72 @@ function buildLoop(rl: RawLoop, i: number): LoopDef {
       workdir: DEFAULTS.workdir,
       body: '',              // machine-handled: no prompt body
     };
-    return loop;
+    return step;
   }
 
-  const name = asString(rl.name, `loops[${i}].name`);
-  const consumes = asStringArray(rl.consumes, `loop '${name}'.consumes`).map(parseConsume);
-  const producesPatterns = parseProduces(rl.produces, `loop '${name}'.produces`);
-  const generatesPatterns = parseProduces(rl.generates, `loop '${name}'.generates`);
-  const cadence = rl.cadence === undefined ? DEFAULTS.cadence : asString(rl.cadence, `loop '${name}'.cadence`);
-  const loop: LoopDef = {
+  const name = asString(rl.name, `steps[${i}].name`);
+  const consumes = asStringArray(rl.consumes, `step '${name}'.consumes`).map(parseConsume);
+  const producesPatterns = parseProduces(rl.produces, `step '${name}'.produces`);
+  const generatesPatterns = parseProduces(rl.generates, `step '${name}'.generates`);
+  const cadence = rl.cadence === undefined ? DEFAULTS.cadence : asString(rl.cadence, `step '${name}'.cadence`);
+  const step: StepDef = {
     name,
     consumes,
     produces: [...producesPatterns, ...generatesPatterns], // engine reads this unified array
     invalidates: rl.invalidates === undefined
       ? consumes.map((c) => c.stem)
-      : asStringArray(rl.invalidates, `loop '${name}'.invalidates`),
+      : asStringArray(rl.invalidates, `step '${name}'.invalidates`),
     cadence,
     cadenceSecs: parseDurationSecs(cadence),
-    maxRunsPerDay: asNumber(rl.maxRunsPerDay, DEFAULTS.maxRunsPerDay, `loop '${name}'.maxRunsPerDay`),
-    parallel: asNumber(rl.parallel, DEFAULTS.parallel, `loop '${name}'.parallel`),
-    maxAttempts: asNumber(rl.maxAttempts, DEFAULTS.maxAttempts, `loop '${name}'.maxAttempts`),
-    maxSchemaFailures: asNumber(rl.maxSchemaFailures, DEFAULTS.maxSchemaFailures, `loop '${name}'.maxSchemaFailures`),
-    workdir: rl.workdir === undefined ? DEFAULTS.workdir : asString(rl.workdir, `loop '${name}'.workdir`),
-    body: rl.body === undefined ? '' : asString(rl.body, `loop '${name}'.body`),
+    maxRunsPerDay: asNumber(rl.maxRunsPerDay, DEFAULTS.maxRunsPerDay, `step '${name}'.maxRunsPerDay`),
+    parallel: asNumber(rl.parallel, DEFAULTS.parallel, `step '${name}'.parallel`),
+    maxAttempts: asNumber(rl.maxAttempts, DEFAULTS.maxAttempts, `step '${name}'.maxAttempts`),
+    maxSchemaFailures: asNumber(rl.maxSchemaFailures, DEFAULTS.maxSchemaFailures, `step '${name}'.maxSchemaFailures`),
+    workdir: rl.workdir === undefined ? DEFAULTS.workdir : asString(rl.workdir, `step '${name}'.workdir`),
+    body: rl.body === undefined ? '' : asString(rl.body, `step '${name}'.body`),
   };
-  if (rl.model !== undefined) loop.model = asString(rl.model, `loop '${name}'.model`);
-  if (asBool(rl.terminal, false, `loop '${name}'.terminal`)) loop.terminal = true;
-  if (generatesPatterns.length > 0) loop.generates = generatesPatterns; // kept for lint only
+  if (rl.model !== undefined) step.model = asString(rl.model, `step '${name}'.model`);
+  if (asBool(rl.terminal, false, `step '${name}'.terminal`)) step.terminal = true;
+  if (generatesPatterns.length > 0) step.generates = generatesPatterns; // kept for lint only
   if (rl.effect !== undefined) {
     if (typeof rl.effect !== 'object' || rl.effect === null || Array.isArray(rl.effect)) {
-      throw new DefError(`loop '${name}'.effect must be an object`);
+      throw new DefError(`step '${name}'.effect must be an object`);
     }
     const rawEffect = rl.effect as Record<string, unknown>;
     const effectDef: EffectDef = {};
     if (rawEffect['idempotent'] !== undefined) {
-      effectDef.idempotent = asBool(rawEffect['idempotent'], true, `loop '${name}'.effect.idempotent`);
+      effectDef.idempotent = asBool(rawEffect['idempotent'], true, `step '${name}'.effect.idempotent`);
     }
     if (rawEffect['onInvalidate'] !== undefined) {
-      const oi = asString(rawEffect['onInvalidate'], `loop '${name}'.effect.onInvalidate`);
+      const oi = asString(rawEffect['onInvalidate'], `step '${name}'.effect.onInvalidate`);
       effectDef.onInvalidate = oi; // any string accepted here; D-D checks in validateDef
     }
-    loop.effect = effectDef;
+    step.effect = effectDef;
   }
   if (rl.on !== undefined) {
-    const rawOn = asStringArray(rl.on, `loop '${name}'.on`);
+    const rawOn = asStringArray(rl.on, `step '${name}'.on`);
     if (rawOn.length === 0) {
-      throw new DefError(`loop '${name}'.on must not be empty; a loop must have at least one firing trigger`);
+      throw new DefError(`step '${name}'.on must not be empty; a step must have at least one firing trigger`);
     }
     for (const tok of rawOn) {
       if (tok !== 'inputsGreen' && tok !== 'allGreen' && tok !== 'idle') {
         throw new DefError(
-          `loop '${name}': on: token '${tok}' is not supported; supported: 'inputsGreen', 'allGreen', 'idle'`,
+          `step '${name}': on: token '${tok}' is not supported; supported: 'inputsGreen', 'allGreen', 'idle'`,
         );
       }
     }
-    loop.on = rawOn as FiringTrigger[];
+    step.on = rawOn as FiringTrigger[];
   }
   if (rl.idleAfter !== undefined) {
-    const idleAfterStr = asString(rl.idleAfter, `loop '${name}'.idleAfter`);
-    loop.idleAfter = idleAfterStr;
-    loop.idleAfterMs = parseDurationSecs(idleAfterStr) * 1000;
+    const idleAfterStr = asString(rl.idleAfter, `step '${name}'.idleAfter`);
+    step.idleAfter = idleAfterStr;
+    step.idleAfterMs = parseDurationSecs(idleAfterStr) * 1000;
   }
   if (rl.reapTtl !== undefined) {
-    const reapTtlStr = asString(rl.reapTtl, `loop '${name}'.reapTtl`);
-    loop.reapTtlMs = parseDurationMs(reapTtlStr);
+    const reapTtlStr = asString(rl.reapTtl, `step '${name}'.reapTtl`);
+    step.reapTtlMs = parseDurationMs(reapTtlStr);
   }
-  return loop;
+  return step;
 }
 
 // ---- validation --------------------------------------------------------------
@@ -671,31 +671,31 @@ function buildLoop(rl: RawLoop, i: number): LoopDef {
 export function validateDef(def: WorkflowDef): string[] {
   const errors: string[] = [];
 
-  // unique loop names
-  const loopNames = new Set<string>();
-  for (const l of def.loops) {
-    if (loopNames.has(l.name)) errors.push(`duplicate loop name '${l.name}'`);
-    loopNames.add(l.name);
+  // unique step names
+  const stepNames = new Set<string>();
+  for (const l of def.steps) {
+    if (stepNames.has(l.name)) errors.push(`duplicate step name '${l.name}'`);
+    stepNames.add(l.name);
   }
 
-  // an input name may not collide with a loop name or a produced artifact
+  // an input name may not collide with a step name or a produced artifact
   const inputNames = new Set(def.inputs.map((i) => i.name));
-  for (const dup of [...inputNames].filter((n) => loopNames.has(n))) {
-    errors.push(`'${dup}' is both an input and a loop name`);
+  for (const dup of [...inputNames].filter((n) => stepNames.has(n))) {
+    errors.push(`'${dup}' is both an input and a step name`);
   }
 
   // one writer per artifact: map produced singleton/collection stems to producers
-  const producerOf = new Map<string, string>(); // stem -> loop name
+  const producerOf = new Map<string, string>(); // stem -> step name
   const collectionStems = new Set<string>();
   for (const name of inputNames) producerOf.set(name, 'human');
-  for (const l of def.loops) {
-    // a loop must consume in exactly one mode (plain-only, or one map, or one reduce)
+  for (const l of def.steps) {
+    // a step must consume in exactly one mode (plain-only, or one map, or one reduce)
     const maps = l.consumes.filter((c) => c.mode === 'map');
     const reduces = l.consumes.filter((c) => c.mode === 'reduce');
-    if (maps.length > 1) errors.push(`loop '${l.name}' has more than one map consume`);
-    if (reduces.length > 1) errors.push(`loop '${l.name}' has more than one reduce consume`);
+    if (maps.length > 1) errors.push(`step '${l.name}' has more than one map consume`);
+    if (reduces.length > 1) errors.push(`step '${l.name}' has more than one reduce consume`);
     if (maps.length && reduces.length) {
-      errors.push(`loop '${l.name}' mixes a map and a reduce consume (pick one shape)`);
+      errors.push(`step '${l.name}' mixes a map and a reduce consume (pick one shape)`);
     }
 
     for (const p of l.produces) {
@@ -709,17 +709,17 @@ export function validateDef(def: WorkflowDef): string[] {
       // collection they live under is owned by whoever produces the bare elements.
     }
 
-    // map/reduce loops must produce the matching output shape
+    // map/reduce steps must produce the matching output shape
     if (maps.length && !l.produces.some((p) => p.kind === 'map')) {
-      errors.push(`loop '${l.name}' maps an element but produces no per-element (\$i) output`);
+      errors.push(`step '${l.name}' maps an element but produces no per-element (\$i) output`);
     }
     if (l.produces.some((p) => p.kind === 'map') && !maps.length) {
-      errors.push(`loop '${l.name}' produces a per-element output but has no map (\$i) consume to bind it`);
+      errors.push(`step '${l.name}' produces a per-element output but has no map (\$i) consume to bind it`);
     }
   }
 
-  // same stem in both produces: and generates: on the same loop is a hard error
-  for (const l of def.loops) {
+  // same stem in both produces: and generates: on the same step is a hard error
+  for (const l of def.steps) {
     if (!l.generates || l.generates.length === 0) continue;
     const generatedStems = new Set(l.generates.map((p) => p.stem));
     // produces-only patterns are those NOT in generates (using object identity since generates
@@ -727,63 +727,63 @@ export function validateDef(def: WorkflowDef): string[] {
     const producesOnly = l.produces.filter((p) => !l.generates!.includes(p));
     for (const p of producesOnly) {
       if (generatedStems.has(p.stem)) {
-        errors.push(`loop '${l.name}': stem '${p.stem}' appears in both produces: and generates: (remove it from one)`);
+        errors.push(`step '${l.name}': stem '${p.stem}' appears in both produces: and generates: (remove it from one)`);
       }
     }
   }
 
-  // outputs: entries must name stems produced by some loop
+  // outputs: entries must name stems produced by some step
   if (def.outputs && def.outputs.length > 0) {
     const allProducedStems = new Set<string>(
-      def.loops.flatMap((l) => l.produces.map((p) => p.stem)),
+      def.steps.flatMap((l) => l.produces.map((p) => p.stem)),
     );
     for (const stem of def.outputs) {
       if (!allProducedStems.has(stem)) {
-        errors.push(`outputs: entry '${stem}' is not produced by any loop`);
+        errors.push(`outputs: entry '${stem}' is not produced by any step`);
       }
     }
   }
 
-  // every consumed stem must have a producer (an input or a loop output)
-  for (const l of def.loops) {
+  // every consumed stem must have a producer (an input or a step output)
+  for (const l of def.steps) {
     for (const c of l.consumes) {
       if (c.mode === 'plain') {
         if (!producerOf.has(c.stem)) {
-          errors.push(`loop '${l.name}' consumes '${c.raw}' but nothing produces '${c.stem}'`);
+          errors.push(`step '${l.name}' consumes '${c.raw}' but nothing produces '${c.stem}'`);
         }
       } else {
         // map/reduce: the stem must be a collection produced somewhere
         if (!collectionStems.has(c.stem)) {
-          errors.push(`loop '${l.name}' consumes collection '${c.raw}' but no loop produces '${c.stem}[]'`);
+          errors.push(`step '${l.name}' consumes collection '${c.raw}' but no step produces '${c.stem}[]'`);
         }
       }
     }
   }
 
-  // Collect loops already reported as dangling-consume (to avoid double-report
+  // Collect steps already reported as dangling-consume (to avoid double-report
   // with the reachability check below, which catches the subtler case of a
   // producer that exists but is itself unreachable).
-  const danglingLoops = new Set<string>();
-  for (const l of def.loops) {
+  const danglingSteps = new Set<string>();
+  for (const l of def.steps) {
     for (const c of l.consumes) {
       if (c.mode === 'plain' && !producerOf.has(c.stem)) {
-        danglingLoops.add(l.name);
+        danglingSteps.add(l.name);
       } else if (c.mode !== 'plain' && !collectionStems.has(c.stem)) {
-        danglingLoops.add(l.name);
+        danglingSteps.add(l.name);
       }
     }
   }
-  errors.push(...reachabilityErrors(def, danglingLoops));
+  errors.push(...reachabilityErrors(def, danglingSteps));
 
   errors.push(...detectCycles(def, producerOf, collectionStems));
 
   // effect: validation
-  for (const l of def.loops) {
+  for (const l of def.steps) {
     if (!l.effect) continue;
     // terminal: true and effect: are mutually exclusive (effect: is the forward spelling)
     if (l.terminal && l.effect) {
       errors.push(
-        `loop '${l.name}': terminal: true and effect: are mutually exclusive; ` +
+        `step '${l.name}': terminal: true and effect: are mutually exclusive; ` +
         `effect: is the forward spelling — remove terminal: true`,
       );
     }
@@ -791,27 +791,27 @@ export function validateDef(def: WorkflowDef): string[] {
     const oi = l.effect.onInvalidate;
     if (oi !== undefined && oi !== 'pin' && oi !== 'escalate') {
       // Named handler: cross-reference checks
-      const handlerLoop = def.loops.find((h) => h.name === oi);
-      if (!handlerLoop) {
-        errors.push(`loop '${l.name}': effect.onInvalidate '${oi}' names a loop that does not exist in this workflow`);
+      const handlerStep = def.steps.find((h) => h.name === oi);
+      if (!handlerStep) {
+        errors.push(`step '${l.name}': effect.onInvalidate '${oi}' names a step that does not exist in this workflow`);
       } else if (oi === l.name) {
-        errors.push(`loop '${l.name}': effect.onInvalidate '${oi}' names itself; a loop cannot be its own handler`);
-      } else if (handlerLoop.produces.length === 0) {
-        errors.push(`loop '${l.name}': effect.onInvalidate handler '${oi}' produces no outputs; a handler must produce at least one output`);
+        errors.push(`step '${l.name}': effect.onInvalidate '${oi}' names itself; a step cannot be its own handler`);
+      } else if (handlerStep.produces.length === 0) {
+        errors.push(`step '${l.name}': effect.onInvalidate handler '${oi}' produces no outputs; a handler must produce at least one output`);
       }
     }
   }
 
-  // on: token validation — belt-and-suspenders over buildLoop's throw
-  for (const l of def.loops) {
+  // on: token validation — belt-and-suspenders over buildStep's throw
+  for (const l of def.steps) {
     if (!l.on) continue;
     if (l.on.length === 0) {
-      errors.push(`loop '${l.name}': on: must not be empty; a loop must have at least one firing trigger`);
+      errors.push(`step '${l.name}': on: must not be empty; a step must have at least one firing trigger`);
     }
     for (const tok of l.on) {
       if (tok !== 'inputsGreen' && tok !== 'allGreen' && tok !== 'idle') {
         errors.push(
-          `loop '${l.name}': on: token '${tok}' is not supported; ` +
+          `step '${l.name}': on: token '${tok}' is not supported; ` +
           `supported: 'inputsGreen', 'allGreen', 'idle'.`,
         );
       }
@@ -819,31 +819,31 @@ export function validateDef(def: WorkflowDef): string[] {
   }
 
   // idle/idleAfter cross-checks
-  for (const l of def.loops) {
+  for (const l of def.steps) {
     const hasIdle = l.on?.includes('idle') ?? false;
     if (hasIdle && l.idleAfterMs === undefined) {
-      errors.push(`loop '${l.name}': on: includes 'idle' but idleAfter is not set; idleAfter is required for the idle trigger`);
+      errors.push(`step '${l.name}': on: includes 'idle' but idleAfter is not set; idleAfter is required for the idle trigger`);
     }
     if (!hasIdle && l.idleAfterMs !== undefined) {
-      errors.push(`loop '${l.name}': idleAfter is set but 'idle' is not in on:; idleAfter is only meaningful with the idle trigger`);
+      errors.push(`step '${l.name}': idleAfter is set but 'idle' is not in on:; idleAfter is only meaningful with the idle trigger`);
     }
   }
 
-  // M2-VALIDATE: calls: loop per-def rules.
+  // M2-VALIDATE: calls: step per-def rules.
   // Note: cross-def checks (target-def existence, child input-key validity) cannot be done here
   // because validateDef is a pure per-def function with no resolver. Those checks live in loadDefs
   // Phase 2, analogous to how expandIncludes validates include input-key mappings.
-  for (const l of def.loops) {
+  for (const l of def.steps) {
     if (!l.calls) continue;
-    // (a) calls: loop must produce exactly one output (one child, one outcome path — v1)
+    // (a) calls: step must produce exactly one output (one child, one outcome path — v1)
     if (l.produces.length !== 1) {
-      errors.push(`calls: loop '${l.name}' must produce exactly one output (got ${l.produces.length})`);
+      errors.push(`calls: step '${l.name}' must produce exactly one output (got ${l.produces.length})`);
     }
-    // (b) callsInputs VALUES must be real parent artifacts (inputs or loop-produced stems)
+    // (b) callsInputs VALUES must be real parent artifacts (inputs or step-produced stems)
     for (const [, parentArtifact] of Object.entries(l.callsInputs ?? {})) {
       if (!producerOf.has(parentArtifact)) {
         errors.push(
-          `calls: loop '${l.name}' maps to parent artifact '${parentArtifact}' which is not produced by any loop or input`,
+          `calls: step '${l.name}' maps to parent artifact '${parentArtifact}' which is not produced by any step or input`,
         );
       }
     }
@@ -870,12 +870,12 @@ export function validateDef(def: WorkflowDef): string[] {
   return errors;
 }
 
-function register(map: Map<string, string>, stem: string, loop: string, errors: string[]): void {
+function register(map: Map<string, string>, stem: string, step: string, errors: string[]): void {
   const existing = map.get(stem);
-  if (existing && existing !== loop) {
-    errors.push(`artifact '${stem}' has two producers: '${existing}' and '${loop}'`);
+  if (existing && existing !== step) {
+    errors.push(`artifact '${stem}' has two producers: '${existing}' and '${step}'`);
   }
-  map.set(stem, loop);
+  map.set(stem, step);
 }
 
 /** Detect a dependency cycle in the consume→produce graph (a deadlock). */
@@ -884,10 +884,10 @@ function detectCycles(
   producerOf: Map<string, string>,
   collectionStems: Set<string>,
 ): string[] {
-  // edges: loop -> producer-of-each-consumed-stem (excluding human inputs)
+  // edges: step -> producer-of-each-consumed-stem (excluding human inputs)
   const deps = new Map<string, Set<string>>();
-  for (const l of def.loops) deps.set(l.name, new Set());
-  for (const l of def.loops) {
+  for (const l of def.steps) deps.set(l.name, new Set());
+  for (const l of def.steps) {
     for (const c of l.consumes) {
       const producer = producerOf.get(c.stem) ?? (collectionStems.has(c.stem) ? producerOf.get(c.stem) : undefined);
       if (producer && producer !== 'human' && producer !== l.name) deps.get(l.name)!.add(producer);
@@ -920,26 +920,26 @@ function detectCycles(
 
 /**
  * Forward reachability from the seeded inputs. Returns error strings for any
- * loop that can never fire because one of its consumed stems is not transitively
+ * step that can never fire because one of its consumed stems is not transitively
  * reachable from the workflow inputs, even though a producer exists (a dead
  * island). Does NOT double-report when a dangling-consume error already fired
- * for the same loop (caller passes `danglingLoops` to suppress).
+ * for the same step (caller passes `danglingSteps` to suppress).
  */
 function reachabilityErrors(
   def: WorkflowDef,
-  danglingLoops: Set<string>,
+  danglingSteps: Set<string>,
 ): string[] {
   const reachable = new Set<string>(def.inputs.map((i) => i.name));
-  const reachedLoop = new Set<string>();
+  const reachedStep = new Set<string>();
 
   let changed = true;
   while (changed) {
     changed = false;
-    for (const l of def.loops) {
-      if (reachedLoop.has(l.name)) continue;
+    for (const l of def.steps) {
+      if (reachedStep.has(l.name)) continue;
       const allReachable = l.consumes.every((c) => reachable.has(c.stem));
       if (allReachable) {
-        reachedLoop.add(l.name);
+        reachedStep.add(l.name);
         changed = true;
         for (const p of l.produces) {
           reachable.add(p.stem);
@@ -949,14 +949,14 @@ function reachabilityErrors(
   }
 
   const errors: string[] = [];
-  for (const l of def.loops) {
-    if (reachedLoop.has(l.name)) continue;
-    if (danglingLoops.has(l.name)) continue; // already reported as dangling-consume
+  for (const l of def.steps) {
+    if (reachedStep.has(l.name)) continue;
+    if (danglingSteps.has(l.name)) continue; // already reported as dangling-consume
     // find the first unreachable consumed stem
     const blocker = l.consumes.find((c) => !reachable.has(c.stem));
     const stem = blocker?.stem ?? '(unknown)';
     errors.push(
-      `loop '${l.name}' is unreachable: it can never fire (consumes '${stem}' which nothing reachable produces)`,
+      `step '${l.name}' is unreachable: it can never fire (consumes '${stem}' which nothing reachable produces)`,
     );
   }
   return errors;
@@ -964,35 +964,35 @@ function reachabilityErrors(
 
 /**
  * Returns warning strings for any singleton or collection stem that nothing
- * consumes, on a non-terminal loop. Map outputs are excluded (they are
- * per-element children, not consumed as top-level stems). Terminal loops are
+ * consumes, on a non-terminal step. Map outputs are excluded (they are
+ * per-element children, not consumed as top-level stems). Terminal steps are
  * explicitly intended sinks. Stems declared under generates: are exempt.
  */
 function deadEndWarnings(def: WorkflowDef): string[] {
-  // all stems consumed by any loop
+  // all stems consumed by any step
   const consumed = new Set<string>(
-    def.loops.flatMap((l) => l.consumes.map((c) => c.stem)),
+    def.steps.flatMap((l) => l.consumes.map((c) => c.stem)),
   );
   // stems declared under generates: are intentionally unconsumed — lint-exempt
   const generatedStems = new Set<string>(
-    def.loops.flatMap((l) => (l.generates ?? []).map((p) => p.stem)),
+    def.steps.flatMap((l) => (l.generates ?? []).map((p) => p.stem)),
   );
   // stems declared in workflow outputs: are intentional public leaves — lint-exempt
   const workflowOutputStems = new Set<string>(def.outputs ?? []);
 
   const warnings: string[] = [];
-  for (const l of def.loops) {
-    if (l.terminal) continue; // terminal loops are intended sinks
+  for (const l of def.steps) {
+    if (l.terminal) continue; // terminal steps are intended sinks
     for (const p of l.produces) {
       if (p.kind === 'map') continue; // per-element outputs are not top-level stems
       if (generatedStems.has(p.stem)) continue; // generates: exempt
       if (workflowOutputStems.has(p.stem)) continue; // workflow outputs: exempt
       if (!consumed.has(p.stem)) {
         warnings.push(
-          `loop '${l.name}' produces '${p.stem}' but nothing consumes it ` +
+          `step '${l.name}' produces '${p.stem}' but nothing consumes it ` +
           `(dead-end output; declare it under generates: if no consumer is expected, ` +
           `list it in the workflow outputs: if it is a public interface leaf, ` +
-          `or mark the loop terminal: true if this is an intended sink)`,
+          `or mark the step terminal: true if this is an intended sink)`,
         );
       }
     }
@@ -1033,8 +1033,8 @@ function detectCallsCycles(defs: Map<string, WorkflowDef>): void {
     color.set(name, GREY);
     stack.push(name);
     const def = defs.get(name);
-    // Unique calls: edges from this def (multiple loops might call the same child)
-    const callsEdges = new Set((def?.loops ?? []).filter((l) => l.calls).map((l) => l.calls!));
+    // Unique calls: edges from this def (multiple steps might call the same child)
+    const callsEdges = new Set((def?.steps ?? []).filter((l) => l.calls).map((l) => l.calls!));
     for (const child of callsEdges) {
       if (!defs.has(child)) continue; // missing-def error is reported separately in loadDefs
       const c = color.get(child) ?? WHITE;
@@ -1109,7 +1109,7 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
 
     // M2-VALIDATE cross-def: target-def existence + child input-key validity.
     // These cannot live in validateDef (pure per-def, no resolver) — same split as expandIncludes.
-    for (const l of expanded.loops) {
+    for (const l of expanded.steps) {
       if (!l.calls) continue;
       const childDef = resolver(l.calls);
       if (!childDef) {

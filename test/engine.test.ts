@@ -5,7 +5,7 @@ import type { Order } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { WorkflowDef } from '../src/types.ts';
-import { def, input, loop } from './helpers.ts';
+import { def, input, step } from './helpers.ts';
 
 // ---- fixtures & harness ------------------------------------------------------
 
@@ -13,10 +13,10 @@ const delivery = def(
   'delivery',
   [input('proposal')],
   [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-    loop({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
-    loop({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
-    loop({ name: 'merger', consumes: ['verdict'], produces: ['merge'] }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+    step({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
+    step({ name: 'merger', consumes: ['verdict'], produces: ['merge'] }),
   ],
 );
 
@@ -24,13 +24,13 @@ const research = def(
   'research',
   [input('question')],
   [
-    loop({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
-    loop({
+    step({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
+    step({
       name: 'formatcheck',
       consumes: ['gather.source[$i]'],
       produces: ['gather.source[$i].formatcheck'],
     }),
-    loop({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
+    step({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
   ],
 );
 
@@ -52,19 +52,19 @@ function makeEngine(defs: WorkflowDef[], opts: { reapTtlMs?: number } = {}): {
   return { engine, store };
 }
 
-/** Tick and return the single order for `loop`, asserting exactly one exists. */
-function fire(engine: Engine, wf: string, loopName: string, now: number): Order {
+/** Tick and return the single order for `step`, asserting exactly one exists. */
+function fire(engine: Engine, wf: string, stepName: string, now: number): Order {
   const t = engine.tick(wf, { now });
-  const matching = t.orders.filter((o) => o.loop === loopName);
+  const matching = t.orders.filter((o) => o.step === stepName);
   assert.equal(
     matching.length,
     1,
-    `expected exactly one ${loopName} order at t=${now}, got [${t.orders.map((o) => o.loop)}]`,
+    `expected exactly one ${stepName} order at t=${now}, got [${t.orders.map((o) => o.step)}]`,
   );
   return matching[0]!;
 }
 
-/** Drive a plain loop's order to green and close it. */
+/** Drive a plain step's order to green and close it. */
 function complete(engine: Engine, wf: string, o: Order, value: Record<string, unknown> = {}, opts: { terminal?: boolean } = {}): void {
   for (const out of o.outputs) engine.green(wf, o.run, out, value, opts);
   engine.close(wf, o.run);
@@ -118,7 +118,7 @@ test('knock-back: a judgment reject re-arms the producer and carries feedback', 
   assert.equal(pr?.acceptance, 'rejected');
   assert.equal(pr?.kind, 'judgment');
   // reviewer is no longer eligible (its input is non-green), builder is re-armed
-  assert.deepEqual(s.eligible.map((e) => e.loop), ['builder']);
+  assert.deepEqual(s.eligible.map((e) => e.step), ['builder']);
 
   // the re-fired builder sees the reviewer's feedback on the owed pr
   const builder2 = fire(engine, wf, 'builder', 4000);
@@ -162,8 +162,8 @@ test('§6 stall: a judgment-rejected output stops re-arming at the cap, until re
   assert.equal(stalled?.stalled, true);
   assert.equal(stalled?.kind, 'judgment');
   assert.equal(s.done, false);
-  // a stalled loop is stuck, not "blocked on inputs" (its inputs are green)
-  assert.equal(s.blocked.find((b) => b.loop === 'builder'), undefined);
+  // a stalled step is stuck, not "blocked on inputs" (its inputs are green)
+  assert.equal(s.blocked.find((b) => b.step === 'builder'), undefined);
 
   // the human clears the stall with a line of guidance
   engine.retry(wf, 'pr', 'human', 'switch to the new fixture');
@@ -180,9 +180,9 @@ test('§6 stall: a judgment-rejected output stops re-arming at the cap, until re
   assert.equal(engine.status(wf).done, true);
 });
 
-// ---- crash-loop: consecutive failed-run counter -----------------------------
+// ---- crash-step: consecutive failed-run counter -----------------------------
 
-test('crash-loop: status surfaces a producer that keeps closing failed without greening', () => {
+test('crash-step: status surfaces a producer that keeps closing failed without greening', () => {
   const { engine, store } = makeEngine([delivery]);
   const wf = engine.createInstance('delivery');
 
@@ -199,7 +199,7 @@ test('crash-loop: status surfaces a producer that keeps closing failed without g
   const s = engine.status(wf);
   const plan = s.debts.find((d) => d.path === 'plan');
   assert.equal(plan?.failedRuns, 3, 'the owed plan carries its producer crash streak');
-  assert.equal(plan?.stalled, false, 'a crash-loop is not a §6 judgment stall');
+  assert.equal(plan?.stalled, false, 'a crash-step is not a §6 judgment stall');
   assert.equal(s.done, false);
 
   // a clean close breaks the streak and the pipeline proceeds
@@ -230,7 +230,7 @@ test('recentFailedRuns: only the consecutive trailing failures count', () => {
   assert.equal(store.recentFailedRuns(wf, 'planner'), 0);
 });
 
-test('crash-loop on a map element: failedRuns is keyed by the element path, not ""', () => {
+test('crash-step on a map element: failedRuns is keyed by the element path, not ""', () => {
   // A map producer fires once per element, its run keyed by the consumed
   // element path (model.ts: `key: m.path`). status() must recover that firing
   // key from the debt path — otherwise it queries the run log with key "" and
@@ -251,7 +251,7 @@ test('crash-loop on a map element: failedRuns is keyed by the element path, not 
   let now = 2000;
   for (let i = 1; i <= 2; i++) {
     const t = engine.tick(wf, { now: now++ });
-    const fc0 = t.orders.find((o) => o.loop === 'formatcheck' && o.key === 'gather.source[0]');
+    const fc0 = t.orders.find((o) => o.step === 'formatcheck' && o.key === 'gather.source[0]');
     assert.ok(fc0, `formatcheck[0] order on crash ${i}`);
     for (const o of t.orders) if (o.run !== fc0.run) complete(engine, wf, o, { ok: true });
     engine.close(wf, fc0.run, 'failed');
@@ -264,7 +264,7 @@ test('crash-loop on a map element: failedRuns is keyed by the element path, not 
   const d0 = s.debts.find((d) => d.path === 'gather.source[0].formatcheck');
   assert.ok(d0, 'the owed source[0].formatcheck is a debt');
   assert.equal(d0.failedRuns, 2, 'failedRuns counted per element via the recovered firing key');
-  assert.equal(d0.stalled, false, 'a crash loop is not a §6 judgment stall');
+  assert.equal(d0.stalled, false, 'a crash step is not a §6 judgment stall');
   // a sibling element that never crashed carries no streak
   const d1 = s.debts.find((d) => d.path === 'gather.source[1].formatcheck');
   assert.equal(d1, undefined, 'source[1] greened — not a debt, no failedRuns');
@@ -290,7 +290,7 @@ test('forward cascade: re-deciding plan structurally re-rejects the green pr', (
   // structural rejects do NOT count toward the §6 stall cap
   assert.equal(store.getArtifact(wf, 'pr')?.judgmentRejects, 0);
   // only planner is eligible now (builder's input went non-green)
-  assert.deepEqual(s.eligible.map((e) => e.loop), ['planner']);
+  assert.deepEqual(s.eligible.map((e) => e.step), ['planner']);
 
   // re-green the plan; builder re-arms and we can proceed
   complete(engine, wf, fire(engine, wf, 'planner', 3000), { plan: 'v2' });
@@ -319,8 +319,8 @@ test('collection: gather emits a set, formatcheck maps it, synthesize reduces it
   // the map now has one firing per element; the reduce is also unblocked (it
   // consumes the bare members + seal, which are all green)
   const t = engine.tick(wf, { now: 2000 });
-  const fcs = t.orders.filter((o) => o.loop === 'formatcheck');
-  const syn = t.orders.filter((o) => o.loop === 'synthesize');
+  const fcs = t.orders.filter((o) => o.step === 'formatcheck');
+  const syn = t.orders.filter((o) => o.step === 'synthesize');
   assert.deepEqual(
     fcs.map((o) => o.key).sort(),
     ['gather.source[0]', 'gather.source[1]', 'gather.source[2]'],
@@ -350,9 +350,9 @@ test('collection: a retracted member drops out of the reduce', () => {
 
   // process whatever's eligible — the surviving formatcheck and the reduce
   const t = engine.tick(wf, { now: 2000 });
-  const fcKeys = t.orders.filter((o) => o.loop === 'formatcheck').map((o) => o.key);
+  const fcKeys = t.orders.filter((o) => o.step === 'formatcheck').map((o) => o.key);
   assert.deepEqual(fcKeys, ['gather.source[0]']); // only the live member maps
-  const syn = t.orders.find((o) => o.loop === 'synthesize');
+  const syn = t.orders.find((o) => o.step === 'synthesize');
   assert.deepEqual(syn?.inputs.sort(), ['gather.source.sealed', 'gather.source[0]']);
 
   for (const o of t.orders) complete(engine, wf, o, { ok: true });
@@ -365,9 +365,9 @@ const routed = def(
   'routed',
   [input('ticket')],
   [
-    loop({ name: 'triage', consumes: ['ticket'], produces: ['route'] }),
-    loop({ name: 'escalate', consumes: ['route'], produces: ['escalation'] }),
-    loop({ name: 'notify', consumes: ['escalation'], produces: ['notice'] }),
+    step({ name: 'triage', consumes: ['ticket'], produces: ['route'] }),
+    step({ name: 'escalate', consumes: ['route'], produces: ['escalation'] }),
+    step({ name: 'notify', consumes: ['escalation'], produces: ['notice'] }),
   ],
 );
 
@@ -395,7 +395,7 @@ test('routing: a producer-skipped branch settles, cascades skip, and re-arms on 
 
   // escalate is re-armed (its skip was fingerprinted at the old route version)
   s = engine.status(wf);
-  assert.deepEqual(s.eligible.map((e) => e.loop), ['escalate']);
+  assert.deepEqual(s.eligible.map((e) => e.step), ['escalate']);
   const escalation = engine.store.getArtifact(wf, 'escalation');
   assert.equal(escalation?.acceptance, 'owed');
 
@@ -458,7 +458,7 @@ test('a reaped run cannot commit (lease check)', () => {
   // never closed; a later tick past the TTL reaps the lease and re-claims it
   const t = engine.tick(wf, { now: 1000 + 200 });
   assert.equal(t.reaped, 1);
-  assert.deepEqual(t.orders.map((o) => o.loop), ['planner']);
+  assert.deepEqual(t.orders.map((o) => o.step), ['planner']);
   assert.notEqual(t.orders[0]!.run, planner.run); // a fresh lease
 
   // the stranded original run may no longer green anything
@@ -484,7 +484,7 @@ test('cadence gates re-runs and the daily budget caps them', () => {
   const poll = def(
     'poll',
     [input('seed')],
-    [loop({ name: 'watch', consumes: ['seed'], produces: ['report'], cadenceSecs: 60, maxRunsPerDay: 2 })],
+    [step({ name: 'watch', consumes: ['seed'], produces: ['report'], cadenceSecs: 60, maxRunsPerDay: 2 })],
   );
   const { engine } = makeEngine([poll]);
   const wf = engine.createInstance('poll');
@@ -509,8 +509,8 @@ test('parallel cap limits concurrent claims of a fanned-out map', () => {
     'fan',
     [input('q')],
     [
-      loop({ name: 'gather', consumes: ['q'], produces: ['gather.item[]'] }),
-      loop({
+      step({ name: 'gather', consumes: ['q'], produces: ['gather.item[]'] }),
+      step({
         name: 'work',
         consumes: ['gather.item[$i]'],
         produces: ['gather.item[$i].done'],
@@ -528,14 +528,14 @@ test('parallel cap limits concurrent claims of a fanned-out map', () => {
 
   // four elements are eligible, but parallel:2 caps the tick to two claims
   const t = engine.tick(wf, { now: 2000 });
-  assert.equal(t.orders.filter((o) => o.loop === 'work').length, 2);
+  assert.equal(t.orders.filter((o) => o.step === 'work').length, 2);
 });
 
 // ---- schema validation (§18) -------------------------------------------------
 
 /** A delivery whose planner output `plan` must match a JSON Schema. */
 function schemaOut(maxSchemaFailures = 3): WorkflowDef {
-  const planner = loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'], maxSchemaFailures });
+  const planner = step({ name: 'planner', consumes: ['proposal'], produces: ['plan'], maxSchemaFailures });
   planner.produces[0]!.schema = {
     type: 'object',
     required: ['plan'],
@@ -544,7 +544,7 @@ function schemaOut(maxSchemaFailures = 3): WorkflowDef {
   };
   return def('schemad', [input('proposal')], [
     planner,
-    loop({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+    step({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
   ]);
 }
 
@@ -576,7 +576,7 @@ test('schema: a non-conforming green is schema-rejected, not greened', () => {
   assert.equal(store.getArtifact(wf, 'plan')?.judgmentRejects, 0);
 });
 
-test('schema: the worker can correct and re-green on the same open run (inner-loop retry)', () => {
+test('schema: the worker can correct and re-green on the same open run (inner-step retry)', () => {
   const { engine, store } = makeEngine([schemaOut()]);
   const wf = engine.createInstance('schemad');
   const o = fire(engine, wf, 'planner', 1000);
@@ -585,7 +585,7 @@ test('schema: the worker can correct and re-green on the same open run (inner-lo
   assert.equal(engine.green(wf, o.run, 'plan', { plan: 'fixed' }).outcome, 'green');
   assert.equal(store.getArtifact(wf, 'plan')?.acceptance, 'green');
   engine.close(wf, o.run);
-  assert.deepEqual(engine.tick(wf, { now: 2000 }).orders.map((x) => x.loop), ['builder']);
+  assert.deepEqual(engine.tick(wf, { now: 2000 }).orders.map((x) => x.step), ['builder']);
 });
 
 test('schema: repeated failures stall the producer after maxSchemaFailures', () => {
@@ -599,7 +599,7 @@ test('schema: repeated failures stall the producer after maxSchemaFailures', () 
   engine.close(wf, o.run, 'no_work');
 
   // stalled: the engine will not re-arm the producer
-  assert.equal(engine.tick(wf, { now: 2000 }).orders.filter((x) => x.loop === 'planner').length, 0);
+  assert.equal(engine.tick(wf, { now: 2000 }).orders.filter((x) => x.step === 'planner').length, 0);
   const plan = engine.status(wf).debts.find((d) => d.path === 'plan');
   assert.equal(plan?.stalled, true);
   assert.equal(plan?.kind, 'validation');
@@ -611,7 +611,7 @@ test('schema: a retry clears the schema stall and re-arms the producer', () => {
   const o = fire(engine, wf, 'planner', 1000);
   for (let i = 0; i < 2; i++) engine.green(wf, o.run, 'plan', { bad: i } as Record<string, unknown>);
   engine.close(wf, o.run, 'no_work');
-  assert.equal(engine.tick(wf, { now: 2000 }).orders.filter((x) => x.loop === 'planner').length, 0);
+  assert.equal(engine.tick(wf, { now: 2000 }).orders.filter((x) => x.step === 'planner').length, 0);
 
   engine.retry(wf, 'plan', 'human', 'schema fixed upstream');
   assert.equal(store.getArtifact(wf, 'plan')?.schemaRejects, 0);
@@ -620,11 +620,11 @@ test('schema: a retry clears the schema stall and re-arms the producer', () => {
 });
 
 test('schema: emit refuses a non-conforming element atomically and bumps the seal', () => {
-  const gather = loop({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] });
+  const gather = step({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] });
   gather.produces[0]!.schema = { type: 'object', required: ['url'], properties: { url: { type: 'string' } } };
   const d = def('research', [input('question')], [
     gather,
-    loop({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
+    step({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
   ]);
   const { engine, store } = makeEngine([d]);
   const wf = engine.createInstance('research');
@@ -647,16 +647,16 @@ test('schema: emit refuses a non-conforming element atomically and bumps the sea
 
 test('schema: createInstance rejects a provided input that violates its schema', () => {
   const proposalIn = { ...input('proposal'), schema: { type: 'object', required: ['goal'] } };
-  const d = def('d', [proposalIn], [loop({ name: 'a', consumes: ['proposal'], produces: ['plan'] })]);
+  const d = def('d', [proposalIn], [step({ name: 'a', consumes: ['proposal'], produces: ['plan'] })]);
   const { engine } = makeEngine([d]);
   assert.throws(() => engine.createInstance('d', { provide: { proposal: { nope: 1 } } }), /failed schema/);
   const wf = engine.createInstance('d', { provide: { proposal: { goal: 'ship' } } });
-  assert.ok(engine.status(wf).eligible.some((f) => f.loop === 'a'));
+  assert.ok(engine.status(wf).eligible.some((f) => f.step === 'a'));
 });
 
 test('schema: provideInput rejects a value that violates the input schema', () => {
   const proposalIn = { ...input('proposal', { seedOwed: true }), schema: { type: 'object', required: ['goal'] } };
-  const d = def('d', [proposalIn], [loop({ name: 'a', consumes: ['proposal'], produces: ['plan'] })]);
+  const d = def('d', [proposalIn], [step({ name: 'a', consumes: ['proposal'], produces: ['plan'] })]);
   const { engine, store } = makeEngine([d]);
   const wf = engine.createInstance('d');
   assert.throws(() => engine.provideInput(wf, 'proposal', { nope: 1 }), /failed schema/);
@@ -695,14 +695,14 @@ test('deferred: in-flight — a second tick while a run is open produces a defer
   // tick once to open a planner run — do NOT close it
   const t1 = engine.tick(wf, { now: 1000 });
   assert.equal(t1.orders.length, 1);
-  assert.equal(t1.orders[0]!.loop, 'planner');
+  assert.equal(t1.orders[0]!.step, 'planner');
 
   // tick again — the run is still open, so planner should be deferred in-flight
   const t2 = engine.tick(wf, { now: 2000 });
   assert.deepEqual(t2.orders, []);
   assert.equal(t2.deferred.length, 1);
   assert.deepEqual(t2.deferred[0], {
-    loop: 'planner',
+    step: 'planner',
     key: '',
     inputs: ['proposal'],
     outputs: ['plan'],
@@ -715,7 +715,7 @@ test('deferred: cadence — a tick before the cadence interval elapses defers wi
   const cadenced = def(
     'cadenced',
     [input('seed')],
-    [loop({ name: 'watch', consumes: ['seed'], produces: ['report'], cadenceSecs: 60 })],
+    [step({ name: 'watch', consumes: ['seed'], produces: ['report'], cadenceSecs: 60 })],
   );
   const { engine } = makeEngine([cadenced]);
   const wf = engine.createInstance('cadenced');
@@ -729,14 +729,14 @@ test('deferred: cadence — a tick before the cadence interval elapses defers wi
   assert.deepEqual(t.orders, []);
   assert.equal(t.deferred.length, 1);
   assert.equal(t.deferred[0]!.reason, 'cadence');
-  assert.equal(t.deferred[0]!.loop, 'watch');
+  assert.equal(t.deferred[0]!.step, 'watch');
 });
 
 test('deferred: daily-budget — once the budget is spent, subsequent ticks defer with reason daily-budget', () => {
   const budgeted = def(
     'budgeted',
     [input('seed')],
-    [loop({ name: 'watch', consumes: ['seed'], produces: ['report'], cadenceSecs: 0, maxRunsPerDay: 1 })],
+    [step({ name: 'watch', consumes: ['seed'], produces: ['report'], cadenceSecs: 0, maxRunsPerDay: 1 })],
   );
   const { engine } = makeEngine([budgeted]);
   const wf = engine.createInstance('budgeted');
@@ -750,16 +750,16 @@ test('deferred: daily-budget — once the budget is spent, subsequent ticks defe
   assert.deepEqual(t.orders, []);
   assert.equal(t.deferred.length, 1);
   assert.equal(t.deferred[0]!.reason, 'daily-budget');
-  assert.equal(t.deferred[0]!.loop, 'watch');
+  assert.equal(t.deferred[0]!.step, 'watch');
 });
 
-test('deferred: parallel-cap — a map loop with parallel:2 and 4 elements defers 2 with reason parallel-cap', () => {
+test('deferred: parallel-cap — a map step with parallel:2 and 4 elements defers 2 with reason parallel-cap', () => {
   const fan = def(
     'fan2',
     [input('q')],
     [
-      loop({ name: 'gather', consumes: ['q'], produces: ['gather.item[]'] }),
-      loop({
+      step({ name: 'gather', consumes: ['q'], produces: ['gather.item[]'] }),
+      step({
         name: 'work',
         consumes: ['gather.item[$i]'],
         produces: ['gather.item[$i].done'],
@@ -777,8 +777,8 @@ test('deferred: parallel-cap — a map loop with parallel:2 and 4 elements defer
 
   // 4 eligible elements, parallel cap is 2 → 2 orders, 2 deferred
   const t = engine.tick(wf, { now: 2000 });
-  const workOrders = t.orders.filter((o) => o.loop === 'work');
-  const workDeferred = t.deferred.filter((d) => d.loop === 'work');
+  const workOrders = t.orders.filter((o) => o.step === 'work');
+  const workDeferred = t.deferred.filter((d) => d.step === 'work');
   assert.equal(workOrders.length, 2);
   assert.equal(workDeferred.length, 2);
   assert.ok(workDeferred.every((d) => d.reason === 'parallel-cap'));
@@ -789,8 +789,8 @@ test('deferred: parallel-cap — a map loop with parallel:2 and 4 elements defer
 test('(i) nextAlarm: dueAt computed from lastProgressMs + idleAfterMs when no alarm_at set', () => {
   const IDLE_AFTER_MS = 30 * 60 * 1000; // 30 minutes
   const idleDef = def('idle', [input('proposal')], [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-    loop({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: IDLE_AFTER_MS }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: IDLE_AFTER_MS }),
   ]);
   const { engine } = makeEngine([idleDef]);
   const wf = engine.createInstance('idle');
@@ -800,7 +800,7 @@ test('(i) nextAlarm: dueAt computed from lastProgressMs + idleAfterMs when no al
 
   // nextAlarm: dueAt = lastProgressMs + idleAfterMs
   const result = engine.nextAlarm(wf, { now: 1000 });
-  assert.ok(result.dueAt !== null, 'dueAt must be set for a workflow with idle loops');
+  assert.ok(result.dueAt !== null, 'dueAt must be set for a workflow with idle steps');
   assert.ok(result.dueAt! > 0, 'dueAt must be positive');
 
   // isDue at now=dueAt
@@ -815,8 +815,8 @@ test('(i) nextAlarm: dueAt computed from lastProgressMs + idleAfterMs when no al
 test('(i) setAlarm / clearAlarm on engine; nextAlarm reflects alarm_at override', () => {
   const IDLE_AFTER_MS = 30 * 60 * 1000;
   const idleDef = def('idle2', [input('proposal')], [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-    loop({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: IDLE_AFTER_MS }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: IDLE_AFTER_MS }),
   ]);
   const { engine } = makeEngine([idleDef]);
   const wf = engine.createInstance('idle2');
@@ -839,24 +839,24 @@ test('(i) setAlarm / clearAlarm on engine; nextAlarm reflects alarm_at override'
   assert.notEqual(r3.dueAt, customAlarm, 'dueAt should no longer be customAlarm after clearAlarm');
 });
 
-test('idle trigger fires the evaluator loop when alarm is set and threshold is reached', () => {
+test('idle trigger fires the evaluator step when alarm is set and threshold is reached', () => {
   // Use setAlarm to bypass the lastProgressMs-based threshold, since lastProgressMs
   // uses the real clock (putArtifact stamps updated_at with nowMs()) and tests use
   // explicit now. The absolute alarm_at override is the reliable path for integration tests.
   const IDLE_AFTER_MS = 30 * 60 * 1000;
   const idleDef = def('idle3', [input('proposal')], [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-    loop({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: IDLE_AFTER_MS }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: IDLE_AFTER_MS }),
   ]);
   const { engine } = makeEngine([idleDef]);
   const wf = engine.createInstance('idle3');
 
   // Tick at T=1000: planner fires (inputsGreen)
   const t1 = engine.tick(wf, { now: 1000 });
-  assert.ok(t1.orders.some((o) => o.loop === 'planner'), 'planner order expected on first tick');
+  assert.ok(t1.orders.some((o) => o.step === 'planner'), 'planner order expected on first tick');
 
   // Close the planner run so no task is in-flight
-  const plannerRun = t1.orders.find((o) => o.loop === 'planner')!.run;
+  const plannerRun = t1.orders.find((o) => o.step === 'planner')!.run;
   engine.close(wf, plannerRun, 'no_work');
 
   // Set an explicit alarm at T=5000 so we control the threshold
@@ -865,22 +865,22 @@ test('idle trigger fires the evaluator loop when alarm is set and threshold is r
 
   // Tick BEFORE alarm: completion must NOT fire
   const tBefore = engine.tick(wf, { now: alarmAt - 1 });
-  const completionBefore = tBefore.orders.filter((o) => o.loop === 'completion');
+  const completionBefore = tBefore.orders.filter((o) => o.step === 'completion');
   assert.equal(completionBefore.length, 0, 'completion must NOT fire before alarm threshold');
 
   // Close any new planner run so no task is in-flight for the next tick
-  for (const o of tBefore.orders.filter((o) => o.loop === 'planner')) {
+  for (const o of tBefore.orders.filter((o) => o.step === 'planner')) {
     engine.close(wf, o.run, 'no_work');
   }
 
   // Tick AT alarm: completion MUST fire (alarm_at threshold reached, workflow has debts)
   const tAt = engine.tick(wf, { now: alarmAt });
-  const completionAt = tAt.orders.filter((o) => o.loop === 'completion');
+  const completionAt = tAt.orders.filter((o) => o.step === 'completion');
   assert.equal(completionAt.length, 1, 'completion MUST fire when alarm threshold is reached');
   assert.equal(completionAt[0]!.cause, 'idle', 'order must carry cause=idle');
 
-  // TickResult.dueAt must be a number (idle loop exists)
-  assert.ok(tAt.dueAt !== undefined, 'dueAt field must be present when idle loops exist');
+  // TickResult.dueAt must be a number (idle step exists)
+  assert.ok(tAt.dueAt !== undefined, 'dueAt field must be present when idle steps exist');
   assert.equal(typeof tAt.dueAt, 'number', 'dueAt must be a number');
 });
 
@@ -888,8 +888,8 @@ test('idle trigger fires the evaluator loop when alarm is set and threshold is r
 
 test('alarm set before close is preserved; reap also preserves alarm; claim clears it', () => {
   const idleDef = def('alarm-survive', [input('proposal')], [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-    loop({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: 9_999_999 }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'completion', produces: ['outcome'], on: ['idle'], idleAfterMs: 9_999_999 }),
   ]);
   const { engine, store } = makeEngine([idleDef], { reapTtlMs: 500 });
   const wf = engine.createInstance('alarm-survive');
@@ -897,8 +897,8 @@ test('alarm set before close is preserved; reap also preserves alarm; claim clea
 
   // Part A: alarm survives a normal close
   const runId1 = 'run_close_test';
-  store.insertRun(runId1, { workflow: wf, loop: 'completion', key: '' }, 0);
-  store.putTask({ workflow: wf, loop: 'completion', key: '', status: 'claimed',
+  store.insertRun(runId1, { workflow: wf, step: 'completion', key: '' }, 0);
+  store.putTask({ workflow: wf, step: 'completion', key: '', status: 'claimed',
     run: runId1, claimedAt: 1000, attempts: 0, alarmAt: ALARM });
   engine.close(wf, runId1, 'ok');
   assert.equal(store.getAlarm(wf, 'completion'), ALARM, 'close() must not clear a freshly-set alarm');
@@ -906,8 +906,8 @@ test('alarm set before close is preserved; reap also preserves alarm; claim clea
   // Part B: alarm survives reap
   // (reapTtlMs=500; claimedAt=0; now=1000 => 1000-0=1000 > 500 => stale)
   const runId2 = 'run_reap_test';
-  store.insertRun(runId2, { workflow: wf, loop: 'completion', key: '' }, 0);
-  store.putTask({ workflow: wf, loop: 'completion', key: '', status: 'claimed',
+  store.insertRun(runId2, { workflow: wf, step: 'completion', key: '' }, 0);
+  store.putTask({ workflow: wf, step: 'completion', key: '', status: 'claimed',
     run: runId2, claimedAt: 0, attempts: 1, alarmAt: ALARM });
   engine.reap(wf, 1000);
   assert.equal(store.getAlarm(wf, 'completion'), ALARM, 'reap() must not clear a set alarm');
@@ -915,7 +915,7 @@ test('alarm set before close is preserved; reap also preserves alarm; claim clea
   // Part C: claim-time consume still works
   engine.setAlarm(wf, 'completion', 1); // past => immediately due
   const t = engine.tick(wf, { now: 2 });
-  const completionOrder = t.orders.find((o) => o.loop === 'completion');
+  const completionOrder = t.orders.find((o) => o.step === 'completion');
   assert.ok(completionOrder, 'completion must fire when idle alarm is due');
   assert.equal(store.getAlarm(wf, 'completion'), undefined,
     'claim() must clear alarm_at at claim time');
@@ -929,7 +929,7 @@ test('openRun: a reaped or superseded run cannot commit', () => {
 
   // Claim planner as R1 at T=1000
   const t1 = engine.tick(wf, { now: 1000 });
-  const r1 = t1.orders.find((o) => o.loop === 'planner');
+  const r1 = t1.orders.find((o) => o.step === 'planner');
   assert.ok(r1, 'planner must fire on first tick');
 
   // Reap at T=1001 (1001-1000=1 > ttl=0 => stale)
@@ -944,7 +944,7 @@ test('openRun: a reaped or superseded run cannot commit', () => {
 
   // Sub-case B: R2 re-claims; R1 green must still throw
   const t2 = engine.tick(wf, { now: 2000 });
-  const r2 = t2.orders.find((o) => o.loop === 'planner');
+  const r2 = t2.orders.find((o) => o.step === 'planner');
   assert.ok(r2, 'planner must re-fire after reap');
   assert.notEqual(r2.run, r1.run, 'R2 must be a distinct run id');
   assert.throws(

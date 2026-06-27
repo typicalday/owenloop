@@ -48,11 +48,11 @@ function harness(defsDir: string = EXAMPLES) {
 
 const J = (v: unknown) => JSON.stringify(v);
 
-/** Tick once and return the (first) order for `loop`, asserting it exists. */
-function claim(ow: any, wf: string, loop: string): any {
+/** Tick once and return the (first) order for `step`, asserting it exists. */
+function claim(ow: any, wf: string, step: string): any {
   const t = ow('tick', wf);
-  const o = t.orders.find((x: any) => x.loop === loop);
-  assert.ok(o, `expected an order for '${loop}', got: [${t.orders.map((x: any) => x.loop).join(', ')}]`);
+  const o = t.orders.find((x: any) => x.step === step);
+  assert.ok(o, `expected an order for '${step}', got: [${t.orders.map((x: any) => x.step).join(', ')}]`);
   return o;
 }
 
@@ -175,11 +175,11 @@ test('collection: retract-after-green tombstones the element and re-derives the 
   // members are born green on emit, so ONE tick claims the per-element checks AND
   // the reduce together — take the synth order from that same tick, don't re-tick
   const t = ow('tick', wf);
-  for (const c of t.orders.filter((x: any) => x.loop === 'check')) {
+  for (const c of t.orders.filter((x: any) => x.step === 'check')) {
     ow('green', wf, c.run, c.outputs[0], '--value', J({ ok: true }));
     ow('close', wf, c.run);
   }
-  const s = t.orders.find((x: any) => x.loop === 'synth');
+  const s = t.orders.find((x: any) => x.step === 'synth');
   assert.ok(s, 'synth is eligible the instant the collection is sealed');
   ow('green', wf, s.run, 'draft', '--value', J({ from: 'a+b' }));
   ow('close', wf, s.run);
@@ -212,14 +212,14 @@ test('collection: a REJECTED (non-retracted) member blocks the reduce; retractin
 
   // reject member 1 (judgment) — it is a declared debt, so synth must NOT be eligible
   ow('reject', wf, 'gather.source[1]', '--by', 'check', '--text', 'looks wrong');
-  assert.ok(!ow('tick', wf).orders.some((o: any) => o.loop === 'synth'), 'rejected member blocks the reduce');
-  const blocked = ow('status', wf).blocked.find((b: any) => b.loop === 'synth');
+  assert.ok(!ow('tick', wf).orders.some((o: any) => o.step === 'synth'), 'rejected member blocks the reduce');
+  const blocked = ow('status', wf).blocked.find((b: any) => b.step === 'synth');
   assert.ok(blocked && blocked.blockedOn.includes('gather.source[1]'));
 
   // retract it instead → it drops out and synth becomes eligible
   ow('retract', wf, 'gather.source[1]', '--by', 'check', '--text', 'give up on it');
-  assert.ok(ow('tick', wf).orders.some((o: any) => o.loop === 'synth') ||
-    ow('status', wf).eligible.some((f: any) => f.loop === 'synth'), 'retract unblocks the reduce');
+  assert.ok(ow('tick', wf).orders.some((o: any) => o.step === 'synth') ||
+    ow('status', wf).eligible.some((f: any) => f.step === 'synth'), 'retract unblocks the reduce');
   ow.cleanup();
 });
 
@@ -292,12 +292,12 @@ test('CAS: a reaped run is a zombie — its commit is refused (lease no longer h
   const T0 = 1_700_000_000_000;
   const wf = ow('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).workflow;
   // claim AT T0 so the lease timestamp is anchored to the test clock, not wall time
-  const stranded = ow('tick', wf, '--now', String(T0)).orders.find((o: any) => o.loop === 'planner');
+  const stranded = ow('tick', wf, '--now', String(T0)).orders.find((o: any) => o.step === 'planner');
   assert.ok(stranded, 'planner claimed at T0');
   // re-tick far in the future: the lease is past its 2h TTL → reaped → re-armed
   const later = ow('tick', wf, '--now', String(T0 + 3 * 3600_000));
   assert.equal(later.reaped, 1, 'the stranded claim was reaped');
-  assert.ok(later.orders.some((o: any) => o.loop === 'planner'), 'planner re-armed under a fresh run');
+  assert.ok(later.orders.some((o: any) => o.step === 'planner'), 'planner re-armed under a fresh run');
 
   // the original run may no longer commit
   const r = ow.raw('green', wf, stranded.run, 'plan', '--value', J({ plan: 'late' }));
@@ -326,7 +326,7 @@ function startRate(ow: any): string {
   return ow('create', 'rate', '--provide', `seed=${J({})}`).workflow;
 }
 
-test('schedule: an eligible loop is not re-fired until its cadence elapses', () => {
+test('schedule: an eligible step is not re-fired until its cadence elapses', () => {
   const ow = harness(FIXTURES);
   const wf = startRate(ow);
   const T0 = 1_700_000_000_000;
@@ -386,8 +386,8 @@ test('routing: a dead branch skips and the cascade settles its whole subtree to 
 
   // the firing rule fires EVERY eligible consumer — both branches get an order
   const t = ow('tick', wf);
-  const refund = t.orders.find((o: any) => o.loop === 'refund');
-  const deny = t.orders.find((o: any) => o.loop === 'deny');
+  const refund = t.orders.find((o: any) => o.step === 'refund');
+  const deny = t.orders.find((o: any) => o.step === 'deny');
   assert.ok(refund && deny, 'both branches eligible (no XOR over edges §16.1)');
 
   ow('green', wf, refund.run, 'refund_done', '--value', J({ refunded: true }));
@@ -409,8 +409,8 @@ test('routing: re-judging the route revives the previously-skipped branch (level
   ow('green', wf, o.run, 'route', '--value', J({ branch: 'refund' }));
   ow('close', wf, o.run);
   let t = ow('tick', wf);
-  const refund = t.orders.find((x: any) => x.loop === 'refund');
-  const deny = t.orders.find((x: any) => x.loop === 'deny');
+  const refund = t.orders.find((x: any) => x.step === 'refund');
+  const deny = t.orders.find((x: any) => x.step === 'deny');
   ow('green', wf, refund.run, 'refund_done', '--value', J({ refunded: true }));
   ow('close', wf, refund.run);
   ow('skip', wf, 'denial', '--by', 'deny', '--text', 'dead');
@@ -563,7 +563,7 @@ test('robustness: bad references and malformed input fail with a clear error, ex
     [['provide', wf, 'bogusinput', '--value', '{}'], /no such input artifact/],
     [['green', wf, run, 'plan', '--value', 'not-json{'], /invalid JSON/],
     [['green', wf, run, 'nonexistent_output', '--value', '{}'], /unknown artifact/],
-    [['reject', wf, 'plan', '--by', 'ghostloop', '--text', 'x'], /unknown actor/],
+    [['reject', wf, 'plan', '--by', 'ghoststep', '--text', 'x'], /unknown actor/],
   ];
   for (const [args, re] of cases) {
     const r = ow.raw(...args);

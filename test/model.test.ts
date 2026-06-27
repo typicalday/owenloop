@@ -6,7 +6,7 @@ import {
   computeFingerprint,
   eligibleFirings,
   fingerprintMatches,
-  loopMode,
+  stepMode,
   maintainDecisions,
   members,
   pendingOwed,
@@ -15,17 +15,17 @@ import {
   workflowStatus,
 } from '../src/model.ts';
 import { buildDef } from '../src/defs.ts';
-import { arts, def, input, loop } from './helpers.ts';
+import { arts, def, input, step } from './helpers.ts';
 
 // The software-delivery wiring (§9), used across several tests.
 const delivery = def(
   'delivery',
   [input('proposal')],
   [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-    loop({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
-    loop({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
-    loop({ name: 'merger', consumes: ['verdict'], produces: ['merge'] }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+    step({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
+    step({ name: 'merger', consumes: ['verdict'], produces: ['merge'] }),
   ],
 );
 
@@ -34,13 +34,13 @@ const research = def(
   'research',
   [input('question')],
   [
-    loop({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
-    loop({
+    step({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
+    step({
       name: 'formatcheck',
       consumes: ['gather.source[$i]'],
       produces: ['gather.source[$i].formatcheck'],
     }),
-    loop({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
+    step({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
   ],
 );
 
@@ -52,16 +52,16 @@ const chained = def(
   'chained',
   [input('brief')],
   [
-    loop({ name: 'scope', consumes: ['brief'], produces: ['scope.target[]'] }),
-    loop({ name: 'research', consumes: ['scope.target[$i]'], produces: ['scope.target[$i].dossier'] }),
-    loop({ name: 'acquire', consumes: ['scope.target[$i].dossier'], produces: ['scope.target[$i].assets'] }),
+    step({ name: 'scope', consumes: ['brief'], produces: ['scope.target[]'] }),
+    step({ name: 'research', consumes: ['scope.target[$i]'], produces: ['scope.target[$i].dossier'] }),
+    step({ name: 'acquire', consumes: ['scope.target[$i].dossier'], produces: ['scope.target[$i].assets'] }),
   ],
 );
 
-test('loopMode classifies plain / map / reduce', () => {
-  assert.equal(loopMode(delivery.loops[0]!), 'plain');
-  assert.equal(loopMode(research.loops[1]!), 'map');
-  assert.equal(loopMode(research.loops[2]!), 'reduce');
+test('stepMode classifies plain / map / reduce', () => {
+  assert.equal(stepMode(delivery.steps[0]!), 'plain');
+  assert.equal(stepMode(research.steps[1]!), 'map');
+  assert.equal(stepMode(research.steps[2]!), 'reduce');
 });
 
 test('pendingOwed seeds singletons and seals, then map children when elements green', () => {
@@ -88,7 +88,7 @@ test('pendingOwed seeds singletons and seals, then map children when elements gr
   assert.deepEqual(o1, ['gather.source[0].formatcheck', 'gather.source[1].formatcheck']);
 });
 
-test('firing rule — only the loop whose input is green and output owed fires', () => {
+test('firing rule — only the step whose input is green and output owed fires', () => {
   // proposal green, plan owed → only planner is eligible
   const a = arts([
     { path: 'proposal', producer: 'human', acceptance: 'green', version: 1 },
@@ -99,7 +99,7 @@ test('firing rule — only the loop whose input is green and output owed fires',
   ]);
   const f = eligibleFirings(delivery, a);
   assert.equal(f.length, 1);
-  assert.equal(f[0]!.loop, 'planner');
+  assert.equal(f[0]!.step, 'planner');
   assert.deepEqual(f[0]!.inputs, ['proposal']);
   assert.deepEqual(f[0]!.outputs, ['plan']);
 });
@@ -113,7 +113,7 @@ test('firing rule — a green output is not re-fired', () => {
     { path: 'merge', producer: 'merger', acceptance: 'owed' },
   ]);
   const f = eligibleFirings(delivery, a);
-  assert.deepEqual(f.map((x) => x.loop), ['builder']); // planner done, builder now eligible
+  assert.deepEqual(f.map((x) => x.step), ['builder']); // planner done, builder now eligible
 });
 
 test('firing rule — re-firing: a rejected output re-arms its producer', () => {
@@ -125,7 +125,7 @@ test('firing rule — re-firing: a rejected output re-arms its producer', () => 
     { path: 'merge', producer: 'merger', acceptance: 'owed' },
   ]);
   const f = eligibleFirings(delivery, a);
-  assert.deepEqual(f.map((x) => x.loop), ['builder']);
+  assert.deepEqual(f.map((x) => x.step), ['builder']);
 });
 
 test('map eligibility — one firing per green element with an owed child', () => {
@@ -140,7 +140,7 @@ test('map eligibility — one firing per green element with an owed child', () =
     { path: 'gather.source[2].formatcheck', producer: 'formatcheck', acceptance: 'owed' },
     { path: 'draft', producer: 'synthesize', acceptance: 'owed' },
   ]);
-  const f = eligibleFirings(research, a).filter((x) => x.loop === 'formatcheck');
+  const f = eligibleFirings(research, a).filter((x) => x.step === 'formatcheck');
   assert.deepEqual(f.map((x) => x.key).sort(), ['gather.source[1]', 'gather.source[2]']);
   assert.deepEqual(f.find((x) => x.index === 1)!.outputs, ['gather.source[1].formatcheck']);
 });
@@ -167,7 +167,7 @@ test('chained map — gates on the suffixed per-element child, not the bare memb
   const acq = eligibleFirings(chained, arts([
     ...[...a.values()],
     { path: 'scope.target[0].assets', producer: 'acquire', acceptance: 'owed' },
-  ])).filter((x) => x.loop === 'acquire');
+  ])).filter((x) => x.step === 'acquire');
   assert.deepEqual(acq.map((x) => x.key), ['scope.target[0]']);
   // and it fingerprints on the dossier it actually consumed, not the bare member
   assert.deepEqual(acq[0]!.inputs, ['scope.target[0].dossier']);
@@ -196,14 +196,14 @@ test('reduce eligibility — needs seal green AND every live member green', () =
     ...base,
     { path: 'gather.source.sealed', producer: 'gather', acceptance: 'owed', sealOf: 'gather.source' },
   ]);
-  assert.equal(eligibleFirings(research, a).some((x) => x.loop === 'synthesize'), false);
+  assert.equal(eligibleFirings(research, a).some((x) => x.step === 'synthesize'), false);
 
   // seal green, all members green → synthesize fires once over the set
   a = arts([
     ...base,
     { path: 'gather.source.sealed', producer: 'gather', acceptance: 'green', version: 1, sealOf: 'gather.source' },
   ]);
-  const f = eligibleFirings(research, a).filter((x) => x.loop === 'synthesize');
+  const f = eligibleFirings(research, a).filter((x) => x.step === 'synthesize');
   assert.equal(f.length, 1);
   assert.deepEqual(f[0]!.inputs.sort(), ['gather.source.sealed', 'gather.source[0]', 'gather.source[1]']);
 
@@ -213,14 +213,14 @@ test('reduce eligibility — needs seal green AND every live member green', () =
     { path: 'gather.source[1]', producer: 'gather', acceptance: 'rejected', version: 1 },
     { path: 'gather.source.sealed', producer: 'gather', acceptance: 'green', version: 1, sealOf: 'gather.source' },
   ]);
-  assert.equal(eligibleFirings(research, a).some((x) => x.loop === 'synthesize'), false);
+  assert.equal(eligibleFirings(research, a).some((x) => x.step === 'synthesize'), false);
 
   a = arts([
     ...base,
     { path: 'gather.source[1]', producer: 'gather', acceptance: 'retracted', version: 1 },
     { path: 'gather.source.sealed', producer: 'gather', acceptance: 'green', version: 1, sealOf: 'gather.source' },
   ]);
-  const f2 = eligibleFirings(research, a).filter((x) => x.loop === 'synthesize');
+  const f2 = eligibleFirings(research, a).filter((x) => x.step === 'synthesize');
   assert.equal(f2.length, 1);
   assert.deepEqual(f2[0]!.inputs.sort(), ['gather.source.sealed', 'gather.source[0]']); // [1] dropped
 });
@@ -255,7 +255,7 @@ test('requiredInputs — singleton, map child, and reduce shapes', () => {
     requiredInputs(research, r, r.get('draft')!).sort(),
     ['gather.source.sealed', 'gather.source[0]', 'gather.source[3]'],
   );
-  // a seeded input (producer is human, not a loop) rests on nothing
+  // a seeded input (producer is human, not a step) rests on nothing
   assert.deepEqual(requiredInputs(research, r, r.get('question')!), []);
 });
 
@@ -315,9 +315,9 @@ test('cascade — skipped input propagates skip to a plain dependent', () => {
     'routed',
     [input('case')],
     [
-      loop({ name: 'decide', consumes: ['case'], produces: ['router'] }),
-      loop({ name: 'escalate', consumes: ['router'], produces: ['escalation'] }),
-      loop({ name: 'followup', consumes: ['escalation'], produces: ['letter'] }),
+      step({ name: 'decide', consumes: ['case'], produces: ['router'] }),
+      step({ name: 'escalate', consumes: ['router'], produces: ['escalation'] }),
+      step({ name: 'followup', consumes: ['escalation'], produces: ['letter'] }),
     ],
   );
   const a = arts([
@@ -342,8 +342,8 @@ test('cascade — a skipped branch re-arms when its inputs revive', () => {
     'routed',
     [input('case')],
     [
-      loop({ name: 'decide', consumes: ['case'], produces: ['router'] }),
-      loop({ name: 'escalate', consumes: ['router'], produces: ['escalation'] }),
+      step({ name: 'decide', consumes: ['case'], produces: ['router'] }),
+      step({ name: 'escalate', consumes: ['router'], produces: ['escalation'] }),
     ],
   );
   const a = arts([
@@ -376,9 +376,9 @@ test('workflowStatus — debts, eligible, blocked, done', () => {
   const s = workflowStatus(delivery, a);
   assert.equal(s.done, false);
   assert.deepEqual(s.debts.map((d) => d.path), ['merge', 'pr', 'verdict']);
-  assert.deepEqual(s.eligible.map((e) => e.loop), ['builder']);
+  assert.deepEqual(s.eligible.map((e) => e.step), ['builder']);
   // reviewer blocked on pr, merger blocked on verdict
-  const blocked = Object.fromEntries(s.blocked.map((b) => [b.loop, b.blockedOn]));
+  const blocked = Object.fromEntries(s.blocked.map((b) => [b.step, b.blockedOn]));
   assert.deepEqual(blocked['reviewer'], ['pr']);
   assert.deepEqual(blocked['merger'], ['verdict']);
 });
@@ -404,7 +404,7 @@ test('workflowStatus — done when nothing owed-and-not-green', () => {
 const auditedDef = buildDef({
   name: 'audited',
   inputs: [{ name: 'proposal' }],
-  loops: [
+  steps: [
     {
       name: 'planner',
       consumes: ['proposal'],
@@ -439,7 +439,7 @@ test('generates: generated artifact materializes owed and can be greened with fi
 
   // planner should be eligible (plan and audit_log are owed, proposal is green)
   const firings = eligibleFirings(auditedDef, state1);
-  const plannerFiring = firings.find((f) => f.loop === 'planner');
+  const plannerFiring = firings.find((f) => f.step === 'planner');
   assert.ok(plannerFiring !== undefined, 'planner should be eligible');
 
   // Green both plan and audit_log to simulate planner completing
@@ -457,7 +457,7 @@ test('generates: generated artifact materializes owed and can be greened with fi
 });
 
 // Test 14: buildTrace — generated stem appears in producedStems
-test('generates: buildTrace includes generated stem in producedStems for the planner loop', () => {
+test('generates: buildTrace includes generated stem in producedStems for the planner step', () => {
   const artifacts: Array<import('../src/types.ts').ArtifactData & { updatedAt?: number }> = [
     {
       workflow: 'wf1', path: 'proposal', producer: 'human', acceptance: 'green',
@@ -474,13 +474,13 @@ test('generates: buildTrace includes generated stem in producedStems for the pla
   ];
   const runs = [
     {
-      id: 'r1', workflow: 'wf1', loop: 'planner', key: '',
+      id: 'r1', workflow: 'wf1', step: 'planner', key: '',
       outcome: 'ok' as const, createdAt: 1000, updatedAt: 2000,
       fingerprint: { proposal: 1 },
     },
   ];
   const trace = buildTrace(auditedDef, artifacts, runs);
-  const plannerEvent = trace.timeline.find((e) => e.loop === 'planner');
+  const plannerEvent = trace.timeline.find((e) => e.step === 'planner');
   assert.ok(plannerEvent !== undefined, 'planner should appear in timeline');
   assert.ok(
     plannerEvent!.producedStems.includes('audit_log'),
@@ -492,24 +492,24 @@ test('generates: buildTrace includes generated stem in producedStems for the pla
   );
 });
 
-// Test 15: buildGraph — generated stem's loop appears as a node and does not throw
-test('generates: buildGraph includes planner loop node and does not throw', () => {
+// Test 15: buildGraph — generated stem's step appears as a node and does not throw
+test('generates: buildGraph includes planner step node and does not throw', () => {
   // Should not throw
   const graph = buildGraph(auditedDef);
   const plannerNode = graph.nodes.find((n) => n.id === 'planner');
   assert.ok(plannerNode !== undefined, 'planner node should be in graph');
-  assert.equal(plannerNode!.kind, 'loop');
+  assert.equal(plannerNode!.kind, 'step');
   // audit_log is in planner's produces (via union), so it is "owned" by planner in producerOf;
   // since nothing consumes it, there is no edge from planner for audit_log — just no crash.
   assert.ok(!graph.edges.some((e) => e.stem === 'audit_log'), 'no edge for unconsumed audit_log');
 });
 
-// ---- M2-FIRINGS: eligibleFirings, pendingOwed, and debt/done for calls: loops --
+// ---- M2-FIRINGS: eligibleFirings, pendingOwed, and debt/done for calls: steps --
 
 import { parseProduce } from '../src/paths.ts';
 
-/** Build a minimal calls: LoopDef directly (helpers.ts loop() does not support calls:). */
-function callsLoop(name: string, callsTarget: string, produceStem: string): import('../src/types.ts').LoopDef {
+/** Build a minimal calls: StepDef directly (helpers.ts step() does not support calls:). */
+function callsStep(name: string, callsTarget: string, produceStem: string): import('../src/types.ts').StepDef {
   return {
     name,
     calls: callsTarget,
@@ -528,14 +528,14 @@ function callsLoop(name: string, callsTarget: string, produceStem: string): impo
   };
 }
 
-test('eligibleFirings skips calls: loops — no firing is emitted for the calls: loop', () => {
-  // Def with one calls: loop (deliver) and one normal loop (teardown)
+test('eligibleFirings skips calls: steps — no firing is emitted for the calls: step', () => {
+  // Def with one calls: step (deliver) and one normal step (teardown)
   const d = def(
     'parent',
     [input('proposal')],
     [
-      callsLoop('deliver', 'delivery', 'delivered'),
-      loop({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
+      callsStep('deliver', 'delivery', 'delivered'),
+      step({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
     ],
   );
   // Seed: proposal green, delivered owed (so teardown cannot fire either — missing 'delivered')
@@ -544,20 +544,20 @@ test('eligibleFirings skips calls: loops — no firing is emitted for the calls:
     { path: 'delivered', acceptance: 'owed', version: 0 },
   ]);
   const firings = eligibleFirings(d, artMap);
-  // The calls: loop must NOT appear in firings
+  // The calls: step must NOT appear in firings
   assert.ok(
-    !firings.some((f) => f.loop === 'deliver'),
-    `calls: loop 'deliver' must not appear in eligibleFirings; got: ${firings.map((f) => f.loop).join(', ')}`,
+    !firings.some((f) => f.step === 'deliver'),
+    `calls: step 'deliver' must not appear in eligibleFirings; got: ${firings.map((f) => f.step).join(', ')}`,
   );
 });
 
-test('pendingOwed seeds calls: loop output as owed', () => {
+test('pendingOwed seeds calls: step output as owed', () => {
   const d = def(
     'parent',
     [input('proposal')],
     [
-      callsLoop('deliver', 'delivery', 'delivered'),
-      loop({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
+      callsStep('deliver', 'delivery', 'delivered'),
+      step({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
     ],
   );
   // Only proposal is seeded; 'delivered' and 'done' are not yet in arts
@@ -577,8 +577,8 @@ test('workflow is not done while calls: output is owed', () => {
     'parent',
     [input('proposal')],
     [
-      callsLoop('deliver', 'delivery', 'delivered'),
-      loop({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
+      callsStep('deliver', 'delivery', 'delivered'),
+      step({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
     ],
   );
   // All inputs green; calls: output owed; teardown output owed

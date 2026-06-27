@@ -1,14 +1,14 @@
 /**
- * Tests for the loop-level effect:{idempotent,onInvalidate} contract (design §6.5, §17).
+ * Tests for the step-level effect:{idempotent,onInvalidate} contract (design §6.5, §17).
  *
  * Tests (a)–(g) per the plan:
- *   (a) Back-compat: plain loop re-arms on input move
+ *   (a) Back-compat: plain step re-arms on input move
  *   (b) Back-compat: terminal:true green never re-armed
  *   (c) idempotent:true explicit behaves like (a)
  *   (d) non-idempotent + pin: stays green, fingerprint updated, stable
  *   (e) non-idempotent + escalate: rejected-and-held, producer not eligible, surfaces as stalled
  *   (f) Def validation hard errors
- *   (g) Dead-input cascade for non-idempotent loop — NOT gated by effect
+ *   (g) Dead-input cascade for non-idempotent step — NOT gated by effect
  */
 
 import { test } from 'node:test';
@@ -21,19 +21,19 @@ import {
   workflowStatus,
 } from '../src/model.ts';
 import { buildDef, validateDef } from '../src/defs.ts';
-import { arts, def, input, loop } from './helpers.ts';
+import { arts, def, input, step } from './helpers.ts';
 import type { ArtifactData } from '../src/types.ts';
 
-// ---- (a) Back-compat: plain loop re-arms on input move ----------------------
+// ---- (a) Back-compat: plain step re-arms on input move ----------------------
 
-test('(a) back-compat: plain loop re-arms on input move', () => {
-  // Two-loop def: planner→plan, builder→pr
+test('(a) back-compat: plain step re-arms on input move', () => {
+  // Two-step def: planner→plan, builder→pr
   const d = def(
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
     ],
   );
 
@@ -57,8 +57,8 @@ test('(b) back-compat: terminal:true green never re-armed on input move', () => 
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({ name: 'merger', consumes: ['plan'], produces: ['merge'], terminal: true }),
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({ name: 'merger', consumes: ['plan'], produces: ['merge'], terminal: true }),
     ],
   );
 
@@ -83,8 +83,8 @@ test('(c) idempotent:true explicit — re-arms on input move like default', () =
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({ name: 'builder', consumes: ['plan'], produces: ['pr'], effect: { idempotent: true } }),
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({ name: 'builder', consumes: ['plan'], produces: ['pr'], effect: { idempotent: true } }),
     ],
   );
 
@@ -108,8 +108,8 @@ test('(d) non-idempotent + pin: stays green, fingerprint updated, second pass st
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({
         name: 'builder',
         consumes: ['plan'],
         produces: ['pr'],
@@ -143,8 +143,8 @@ test('(d) non-idempotent + pin: stays green, fingerprint updated, second pass st
 
   // Eligibility: builder must NOT appear in eligible firings (pr is green)
   const ef = eligibleFirings(d, settled);
-  assert.ok(!ef.some((f) => f.loop === 'builder'),
-    `builder must not be eligible after pin; eligible: ${ef.map((f) => f.loop).join(', ')}`);
+  assert.ok(!ef.some((f) => f.step === 'builder'),
+    `builder must not be eligible after pin; eligible: ${ef.map((f) => f.step).join(', ')}`);
 
   // Reasons: a 'pinned' entry should be appended
   assert.ok(pr.reasons.some((r) => r.action === 'pinned' && r.kind === 'structural'),
@@ -163,8 +163,8 @@ test('(e) non-idempotent + escalate: rejected-and-held, not eligible, surfaces a
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({
         name: 'builder',
         consumes: ['plan'],
         produces: ['pr'],
@@ -198,8 +198,8 @@ test('(e) non-idempotent + escalate: rejected-and-held, not eligible, surfaces a
 
   // Eligibility: builder must NOT appear in eligible firings (held = frozen)
   const ef = eligibleFirings(d, settled);
-  assert.ok(!ef.some((f) => f.loop === 'builder'),
-    `builder must not be eligible when held; eligible: ${ef.map((f) => f.loop).join(', ')}`);
+  assert.ok(!ef.some((f) => f.step === 'builder'),
+    `builder must not be eligible when held; eligible: ${ef.map((f) => f.step).join(', ')}`);
 
   // workflowStatus must surface pr as stalled with kind='invalidated-irreversible'
   const status = workflowStatus(d, settled);
@@ -211,13 +211,13 @@ test('(e) non-idempotent + escalate: rejected-and-held, not eligible, surfaces a
 
 // ---- (f) Def validation hard errors -----------------------------------------
 
-test('(f) def validation: unknown onInvalidate loop name is a validateDef error', () => {
-  // buildDef no longer throws for named-handler strings in buildLoop;
-  // validateDef (D-D) reports an error when the handler loop doesn't exist.
+test('(f) def validation: unknown onInvalidate step name is a validateDef error', () => {
+  // buildDef no longer throws for named-handler strings in buildStep;
+  // validateDef (D-D) reports an error when the handler step doesn't exist.
   const d = buildDef({
     name: 'bad',
     inputs: [{ name: 'x' }],
-    loops: [
+    steps: [
       { name: 'foo', consumes: ['x'], produces: ['y'], effect: { onInvalidate: 'frobnicate' } },
     ],
   });
@@ -229,12 +229,12 @@ test('(f) def validation: unknown onInvalidate loop name is a validateDef error'
 });
 
 test('(f) def validation: terminal:true and effect: are mutually exclusive', () => {
-  // Build a loop that has both terminal: and effect: via direct LoopDef construction,
+  // Build a step that has both terminal: and effect: via direct StepDef construction,
   // then call validateDef to get the accumulated errors.
   const d = def(
     'test',
     [input('x')],
-    [loop({ name: 'foo', consumes: ['x'], produces: ['y'], terminal: true, effect: { idempotent: false } })],
+    [step({ name: 'foo', consumes: ['x'], produces: ['y'], terminal: true, effect: { idempotent: false } })],
   );
   const errors = validateDef(d);
   assert.ok(
@@ -250,7 +250,7 @@ test('(f) validateDef: onInvalidate=frobnicate → error mentioning non-existent
   const d = buildDef({
     name: 'test',
     inputs: [{ name: 'src' }],
-    loops: [
+    steps: [
       { name: 'worker', consumes: ['src'], produces: ['out'], effect: { onInvalidate: 'frobnicate' } },
     ],
   });
@@ -262,12 +262,12 @@ test('(f) validateDef: onInvalidate=frobnicate → error mentioning non-existent
 });
 
 test('(f) validateDef: terminal:true + effect: → error mentions both', () => {
-  // Build a loop that has both terminal: and effect: — bypass buildDef by
-  // constructing the LoopDef directly via the helpers, then validating.
+  // Build a step that has both terminal: and effect: — bypass buildDef by
+  // constructing the StepDef directly via the helpers, then validating.
   const d = def(
     'test',
     [input('src')],
-    [loop({ name: 'worker', consumes: ['src'], produces: ['out'], terminal: true, effect: { idempotent: false } })],
+    [step({ name: 'worker', consumes: ['src'], produces: ['out'], terminal: true, effect: { idempotent: false } })],
   );
   const errors = validateDef(d);
   assert.ok(
@@ -276,17 +276,17 @@ test('(f) validateDef: terminal:true + effect: → error mentions both', () => {
   );
 });
 
-// ---- (g) Dead-input cascade for non-idempotent loop — NOT gated by effect ---
+// ---- (g) Dead-input cascade for non-idempotent step — NOT gated by effect ---
 
-test('(g) dead-input cascade for non-idempotent loop is unconditionally structural', () => {
-  // Use a pin loop (strongest non-idempotent). When the input is retracted (dead),
+test('(g) dead-input cascade for non-idempotent step is unconditionally structural', () => {
+  // Use a pin step (strongest non-idempotent). When the input is retracted (dead),
   // the cascade must still be retract/skip — NOT a pin op.
   const d = def(
     'research',
     [input('question')],
     [
-      loop({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
-      loop({
+      step({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
+      step({
         name: 'checker',
         consumes: ['gather.source[$i]'],
         produces: ['gather.source[$i].check'],
@@ -325,8 +325,8 @@ test('(h) back-compat: pin still pins (not armed) when onInvalidate=pin', () => 
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({ name: 'builder', consumes: ['plan'], produces: ['pr'], effect: { idempotent: false, onInvalidate: 'pin' } }),
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({ name: 'builder', consumes: ['plan'], produces: ['pr'], effect: { idempotent: false, onInvalidate: 'pin' } }),
     ],
   );
 
@@ -350,8 +350,8 @@ test('(h) back-compat: escalate still rejects-and-holds (not armed) when onInval
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({ name: 'builder', consumes: ['plan'], produces: ['pr'], effect: { idempotent: false, onInvalidate: 'escalate' } }),
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({ name: 'builder', consumes: ['plan'], produces: ['pr'], effect: { idempotent: false, onInvalidate: 'escalate' } }),
     ],
   );
 
@@ -379,14 +379,14 @@ test('(i) dormancy: handler output absent at creation, not eligible', () => {
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({
         name: 'builder',
         consumes: ['plan'],
         produces: ['pr'],
         effect: { idempotent: false, onInvalidate: 'reverter' },
       }),
-      loop({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
+      step({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
     ],
   );
 
@@ -403,8 +403,8 @@ test('(i) dormancy: handler output absent at creation, not eligible', () => {
 
   // No firing eligible for 'reverter'
   const ef = eligibleFirings(d, settled);
-  assert.ok(!ef.some((f) => f.loop === 'reverter'),
-    `reverter must not be eligible at creation; eligible: ${ef.map((f) => f.loop).join(', ')}`);
+  assert.ok(!ef.some((f) => f.step === 'reverter'),
+    `reverter must not be eligible at creation; eligible: ${ef.map((f) => f.step).join(', ')}`);
 });
 
 // ---- (j) Arm-on-invalidation: L pinned + H owed + H eligible after input moves ---
@@ -415,14 +415,14 @@ test('(j) arm-on-invalidation: L pinned, H owed, H eligible after input moves; g
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({
         name: 'builder',
         consumes: ['plan'],
         produces: ['pr'],
         effect: { idempotent: false, onInvalidate: 'reverter' },
       }),
-      loop({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
+      step({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
     ],
   );
 
@@ -433,11 +433,11 @@ test('(j) arm-on-invalidation: L pinned, H owed, H eligible after input moves; g
     { path: 'pr', producer: 'builder', acceptance: 'green', version: 1, fingerprint: { plan: 1 } },
   ]) as Map<string, ArtifactData>;
 
-  // maintainDecisions: expect a pin op for pr AND an arm op with handlerLoop='reverter'
+  // maintainDecisions: expect a pin op for pr AND an arm op with handlerStep='reverter'
   const ops = maintainDecisions(d, artMap);
   assert.ok(ops.some((op) => op.kind === 'pin' && op.path === 'pr'),
     `expected pin op for 'pr'; got: ${JSON.stringify(ops)}`);
-  assert.ok(ops.some((op) => op.kind === 'arm' && op.handlerLoop === 'reverter'),
+  assert.ok(ops.some((op) => op.kind === 'arm' && op.handlerStep === 'reverter'),
     `expected arm op for 'reverter'; got: ${JSON.stringify(ops)}`);
 
   // settleInMemory: plan stays green, revert is owed
@@ -448,10 +448,10 @@ test('(j) arm-on-invalidation: L pinned, H owed, H eligible after input moves; g
 
   // eligibleFirings: reverter appears; builder does not (pr is green)
   const ef = eligibleFirings(d, settled);
-  assert.ok(ef.some((f) => f.loop === 'reverter'),
-    `reverter must be eligible after arm; eligible: ${ef.map((f) => f.loop).join(', ')}`);
-  assert.ok(!ef.some((f) => f.loop === 'builder'),
-    `builder must not be eligible (pr is green); eligible: ${ef.map((f) => f.loop).join(', ')}`);
+  assert.ok(ef.some((f) => f.step === 'reverter'),
+    `reverter must be eligible after arm; eligible: ${ef.map((f) => f.step).join(', ')}`);
+  assert.ok(!ef.some((f) => f.step === 'builder'),
+    `builder must not be eligible (pr is green); eligible: ${ef.map((f) => f.step).join(', ')}`);
 });
 
 // ---- (k) No-thrash: second pass yields no new op, H not re-armed twice --------
@@ -461,14 +461,14 @@ test('(k) no-thrash: second maintainDecisions pass yields no new arm op', () => 
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({
         name: 'builder',
         consumes: ['plan'],
         produces: ['pr'],
         effect: { idempotent: false, onInvalidate: 'reverter' },
       }),
-      loop({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
+      step({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
     ],
   );
 
@@ -497,14 +497,14 @@ test('(l) re-invalidation: input moves to v3 → pin again + H re-armed from gre
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({
         name: 'builder',
         consumes: ['plan'],
         produces: ['pr'],
         effect: { idempotent: false, onInvalidate: 'reverter' },
       }),
-      loop({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
+      step({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
     ],
   );
 
@@ -521,7 +521,7 @@ test('(l) re-invalidation: input moves to v3 → pin again + H re-armed from gre
   const ops = maintainDecisions(d, artMap);
   assert.ok(ops.some((op) => op.kind === 'pin' && op.path === 'pr'),
     `expected pin op for 'pr'; got: ${JSON.stringify(ops)}`);
-  assert.ok(ops.some((op) => op.kind === 'arm' && op.handlerLoop === 'reverter'),
+  assert.ok(ops.some((op) => op.kind === 'arm' && op.handlerStep === 'reverter'),
     `expected arm op for 'reverter'; got: ${JSON.stringify(ops)}`);
 
   // After settleInMemory: revert re-armed to owed from green
@@ -537,14 +537,14 @@ test('(m) green H → workflow reaches done', () => {
     'delivery',
     [input('proposal')],
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-      loop({
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({
         name: 'builder',
         consumes: ['plan'],
         produces: ['pr'],
         effect: { idempotent: false, onInvalidate: 'reverter' },
       }),
-      loop({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
+      step({ name: 'reverter', consumes: ['pr'], produces: ['revert'] }),
     ],
   );
 

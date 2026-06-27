@@ -36,7 +36,7 @@ import type {
   ArtifactData,
   Author,
   JsonSchema,
-  LoopDef,
+  StepDef,
   FiringTrigger,
   ReasonEntry,
   RejectKind,
@@ -50,7 +50,7 @@ const DEFAULT_REAP_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 export interface Order {
   run: string;
   workflow: string;
-  loop: string;
+  step: string;
   key: string;
   index?: number;
   inputs: string[];
@@ -74,16 +74,16 @@ export interface Order {
 
 /**
  * §tick-deferred: an eligible firing the tick did NOT promote to an order, tagged
- * with why. `'in-flight'` — the loop's task is already claimed by an open run;
- * `'cadence'` — the loop's inter-run gap has not elapsed; `'daily-budget'` — the
- * loop's daily run allowance is exhausted (binding over parallel); `'parallel-cap'`
- * — the loop's concurrency cap is the binding constraint. Always emitted by
+ * with why. `'in-flight'` — the step's task is already claimed by an open run;
+ * `'cadence'` — the step's inter-run gap has not elapsed; `'daily-budget'` — the
+ * step's daily run allowance is exhausted (binding over parallel); `'parallel-cap'`
+ * — the step's concurrency cap is the binding constraint. Always emitted by
  * `applySchedule` or `tick`; never alters which firings are selected or claimed.
  */
 export type DeferredReason = 'in-flight' | 'cadence' | 'daily-budget' | 'parallel-cap';
 
 export interface DeferredFiring {
-  loop: string;
+  step: string;
   key: string;
   index?: number;
   inputs: string[];
@@ -98,7 +98,7 @@ export interface TickResult {
   deferred: DeferredFiring[];
   /**
    * The earliest pending time-trigger (ms epoch) among idle evaluators, if any.
-   * Absent when the workflow has no idle loops. An external scheduler uses this
+   * Absent when the workflow has no idle steps. An external scheduler uses this
    * to decide when to next wake the instance.
    */
   dueAt?: number;
@@ -126,7 +126,7 @@ export interface CreateOpts {
   params?: Record<string, string>;
   /** values for inputs provided at start (keyed by input name) */
   provide?: Record<string, Record<string, unknown>>;
-  /** Mode 2 foundation: parent-coordinate link for a child instance spawned by a calls: loop. Persisted to store; no other behavior in PR5a. */
+  /** Mode 2 foundation: parent-coordinate link for a child instance spawned by a calls: step. Persisted to store; no other behavior in PR5a. */
   producedBy?: { parentWf: string; parentPath: string };
 }
 
@@ -279,9 +279,9 @@ export class Engine {
   // ---- Mode 2 calls: child-instance management --------------------------------
 
   /**
-   * M2B: Maintain all `calls:` loops for a parent workflow.
+   * M2B: Maintain all `calls:` steps for a parent workflow.
    * Called at the top of tick (outside any tx) and as cascade-up prompt.
-   * For each calls: loop: spawn the child if gate is ready and no child exists;
+   * For each calls: step: spawn the child if gate is ready and no child exists;
    * re-attach if it exists; re-provide if parent inputs moved; machine-green
    * the parent artifact when the child's declared output is green.
    */
@@ -289,13 +289,13 @@ export class Engine {
     if (this._inMaintainCalls.has(parentWf)) return;
     this._inMaintainCalls.add(parentWf);
     try {
-      for (const loop of def.loops) {
-        if (!loop.calls) continue;
+      for (const step of def.steps) {
+        if (!step.calls) continue;
 
         // STEP 1 — Gather gate stems and check gate readiness.
-        const callsStem = loop.produces[0]!.stem; // single produced artifact name
+        const callsStem = step.produces[0]!.stem; // single produced artifact name
         const callsPath = callsStem;
-        const gateStems = Object.values(loop.callsInputs ?? {});
+        const gateStems = Object.values(step.callsInputs ?? {});
         const parentArts = this.artMap(parentWf);
         const gateReady = gateStems.length === 0 || gateStems.every((s) => isGreen(parentArts.get(s)));
         if (!gateReady) continue;
@@ -307,11 +307,11 @@ export class Engine {
         if (!existingChild) {
           // SPAWN: gate is ready and no child exists yet.
           const seedProvide: Record<string, Record<string, unknown>> = {};
-          for (const [childInputName, parentArtifactName] of Object.entries(loop.callsInputs ?? {})) {
+          for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
             const parentArt = parentArts.get(parentArtifactName);
             if (parentArt?.value !== undefined) seedProvide[childInputName] = parentArt.value;
           }
-          const childId = this.createInstance(loop.calls, {
+          const childId = this.createInstance(step.calls, {
             producedBy: { parentWf, parentPath: callsPath },
             provide: seedProvide,
           });
@@ -328,7 +328,7 @@ export class Engine {
         let childOutcomeArt = childArts.get(childOutcomeStem);
 
         // STEP 5 — RE-PROVIDE if parent gate source moved (M2B-REPROVIDE).
-        for (const [childInputName, parentArtifactName] of Object.entries(loop.callsInputs ?? {})) {
+        for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
           const parentArtNow = parentArts.get(parentArtifactName);
           const childInputArt = childArts.get(childInputName);
           if (parentArtNow?.value !== undefined && !deepEqual(parentArtNow.value, childInputArt?.value)) {
@@ -368,7 +368,7 @@ export class Engine {
           // M2B-REARM: child's outcome is no longer green (e.g. re-provide re-armed it)
           // but the parent calls: artifact is still green. Re-arm it to owed so downstream
           // re-runs when the child completes again. This handles gate re-arm (test f):
-          // the cascade can't detect this because deliver loop has consumes: [].
+          // the cascade can't detect this because deliver step has consumes: [].
           this.store.tx(() => {
             const artNow = this.store.getArtifact(parentWf, callsStem);
             if (!artNow || !isGreen(artNow)) return; // already re-armed or gone
@@ -434,7 +434,7 @@ export class Engine {
       // Clear alarm_at for any idle firing that was selected (consume the alarm).
       for (const f of selected) {
         if (f.cause === 'idle') {
-          this.store.clearAlarm(workflow, f.loop);
+          this.store.clearAlarm(workflow, f.step);
         }
       }
 
@@ -443,7 +443,7 @@ export class Engine {
       for (const f of selected) {
         const result = this.claim(workflow, def, f, arts, now);
         if (result === 'in-flight') {
-          const d: DeferredFiring = { loop: f.loop, key: f.key, inputs: f.inputs, outputs: f.outputs, reason: 'in-flight' };
+          const d: DeferredFiring = { step: f.step, key: f.key, inputs: f.inputs, outputs: f.outputs, reason: 'in-flight' };
           if (f.index !== undefined) d.index = f.index;
           allDeferred.push(d);
         } else if (result) {
@@ -460,7 +460,7 @@ export class Engine {
     });
   }
 
-  /** Per-loop cadence + daily budget + parallel cap over the eligible firings. */
+  /** Per-step cadence + daily budget + parallel cap over the eligible firings. */
   private applySchedule(
     workflow: string,
     def: WorkflowDef,
@@ -472,39 +472,39 @@ export class Engine {
     const deferred: DeferredFiring[] = [];
 
     const defer = (f: Firing, reason: DeferredReason): void => {
-      const d: DeferredFiring = { loop: f.loop, key: f.key, inputs: f.inputs, outputs: f.outputs, reason };
+      const d: DeferredFiring = { step: f.step, key: f.key, inputs: f.inputs, outputs: f.outputs, reason };
       if (f.index !== undefined) d.index = f.index;
       deferred.push(d);
     };
 
-    for (const loop of def.loops) {
-      const loopFirings = firings.filter((f) => f.loop === loop.name);
-      if (loopFirings.length === 0) continue;
+    for (const step of def.steps) {
+      const stepFirings = firings.filter((f) => f.step === step.name);
+      if (stepFirings.length === 0) continue;
 
-      const latest = this.store.latestRun(workflow, loop.name);
-      if (latest && now - latest.createdAt < loop.cadenceSecs * 1000) {
-        for (const f of loopFirings) defer(f, 'cadence');
+      const latest = this.store.latestRun(workflow, step.name);
+      if (latest && now - latest.createdAt < step.cadenceSecs * 1000) {
+        for (const f of stepFirings) defer(f, 'cadence');
         continue;
       }
 
-      const used = this.store.countRuns(workflow, loop.name, midnight);
-      const budget = Math.max(0, loop.maxRunsPerDay - used);
-      const slots = Math.min(loop.parallel, budget);
+      const used = this.store.countRuns(workflow, step.name, midnight);
+      const budget = Math.max(0, step.maxRunsPerDay - used);
+      const slots = Math.min(step.parallel, budget);
 
       // binding constraint for firings beyond the slots: budget is tighter (incl.
       // budget === 0) → daily-budget; otherwise the concurrency cap → parallel-cap.
-      const beyondReason: DeferredReason = budget < loop.parallel ? 'daily-budget' : 'parallel-cap';
+      const beyondReason: DeferredReason = budget < step.parallel ? 'daily-budget' : 'parallel-cap';
 
-      for (const f of loopFirings.slice(0, slots)) selected.push(f);
-      for (const f of loopFirings.slice(slots)) defer(f, beyondReason);
+      for (const f of stepFirings.slice(0, slots)) selected.push(f);
+      for (const f of stepFirings.slice(slots)) defer(f, beyondReason);
     }
 
     return { selected, deferred };
   }
 
-  /** Return the effective reap TTL for a loop — per-loop override or engine default. */
-  private effectiveTtl(loop?: LoopDef): number {
-    return loop?.reapTtlMs ?? this.reapTtlMs;
+  /** Return the effective reap TTL for a step — per-step override or engine default. */
+  private effectiveTtl(step?: StepDef): number {
+    return step?.reapTtlMs ?? this.reapTtlMs;
   }
 
   /**
@@ -527,11 +527,11 @@ export class Engine {
     arts: ArtifactMap,
     now: number,
   ): Order | 'in-flight' | null {
-    const existing = this.store.getTask(workflow, f.loop, f.key);
+    const existing = this.store.getTask(workflow, f.step, f.key);
     if (existing && existing.status === 'claimed') {
       const run = existing.run ? this.store.getRun(existing.run) : undefined;
-      const loopDef = def.loops.find((l) => l.name === f.loop);
-      const ttl = this.effectiveTtl(loopDef);
+      const stepDef = def.steps.find((l) => l.name === f.step);
+      const ttl = this.effectiveTtl(stepDef);
       const fresh =
         !!run &&
         run.outcome === undefined &&
@@ -542,10 +542,10 @@ export class Engine {
     const runId = randId('run');
     const fp = computeFingerprint(arts, f.inputs);
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
-    this.store.insertRun(runId, { workflow, loop: f.loop, key: f.key, fingerprint: fp, ...(f.cause ? { cause: f.cause } : {}) }, now);
+    this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, ...(f.cause ? { cause: f.cause } : {}) }, now);
     this.store.putTask({
       workflow,
-      loop: f.loop,
+      step: f.step,
       key: f.key,
       status: 'claimed',
       run: runId,
@@ -562,7 +562,7 @@ export class Engine {
     f: Firing,
     arts: ArtifactMap,
   ): Order {
-    const loop = this.loop(def, f.loop);
+    const step = this.step(def, f.step);
     const consumes: Record<string, unknown> = {};
     for (const p of f.inputs) {
       const a = arts.get(p);
@@ -581,24 +581,24 @@ export class Engine {
     const order: Order = {
       run: runId,
       workflow,
-      loop: f.loop,
+      step: f.step,
       key: f.key,
       inputs: f.inputs,
       outputs: f.outputs,
-      workdir: loop.workdir,
-      prompt: substitute(loop.body, {
+      workdir: step.workdir,
+      prompt: substitute(step.body, {
         WORKFLOW: workflow,
         RUN: runId,
-        LOOP: f.loop,
+        STEP: f.step,
         KEY: f.key,
         INDEX: f.index === undefined ? '' : String(f.index),
-        MAX_ATTEMPTS: String(loop.maxAttempts),
+        MAX_ATTEMPTS: String(step.maxAttempts),
       }),
       consumes,
       owes,
     };
     if (f.index !== undefined) order.index = f.index;
-    if (loop.model !== undefined) order.model = loop.model;
+    if (step.model !== undefined) order.model = step.model;
     if (f.cause !== undefined) order.cause = f.cause;
     return order;
   }
@@ -657,9 +657,9 @@ export class Engine {
         fingerprint: computeFingerprint(arts, req),
       };
       // A destructive completion (e.g. a merge) is terminal: once green it can
-      // never be re-armed by the forward cascade (§15.2). A loop may declare its
+      // never be re-armed by the forward cascade (§15.2). A step may declare its
       // output terminal in its definition, or the caller may force it per-commit.
-      const producer = def.loops.find((l) => l.name === art.producer);
+      const producer = def.steps.find((l) => l.name === art.producer);
       if (opts.terminal || producer?.terminal) next.terminal = true;
       this.store.putArtifact(next);
       this.settle(workflow, def);
@@ -685,13 +685,13 @@ export class Engine {
     let stem = '';
     const result = this.store.tx((): EmitResult => {
       const r = this.openRun(workflow, run);
-      const loop = this.loop(def, r.loop);
-      const s = collectionStem(loop);
-      if (!s) throw new Error(`loop ${r.loop} does not produce a collection`);
+      const step = this.step(def, r.step);
+      const s = collectionStem(step);
+      if (!s) throw new Error(`step ${r.step} does not produce a collection`);
       stem = s;
       const arts = this.artMap(workflow);
 
-      const req = plainConsumes(loop).map((c) => c.stem);
+      const req = plainConsumes(step).map((c) => c.stem);
       const cas = this.casCheck(arts, req, r.fingerprint ?? {});
       if (cas.moved) {
         const seal = arts.get(sealPath(stem));
@@ -705,7 +705,7 @@ export class Engine {
       // The check is atomic — one bad item accretes nothing and bumps the seal's
       // schema-stall counter — so a producer can't half-fill a collection with
       // malformed members and the run can correct and re-emit on the same lease.
-      const schema = loop.produces.find((p) => p.kind === 'collection' && p.stem === stem)?.schema;
+      const schema = step.produces.find((p) => p.kind === 'collection' && p.stem === stem)?.schema;
       if (schema !== undefined) {
         for (let i = 0; i < items.length; i++) {
           const check = validateValue(schema, items[i]!.value);
@@ -737,7 +737,7 @@ export class Engine {
         this.store.putArtifact({
           workflow,
           path: p,
-          producer: r.loop,
+          producer: r.step,
           acceptance: 'green',
           version: 1,
           value: item.value,
@@ -764,15 +764,15 @@ export class Engine {
     const def = this.defFor(workflow);
     const result = this.store.tx((): CommitResult => {
       const r = this.openRun(workflow, run);
-      const loop = this.loop(def, r.loop);
-      const stem = collectionStem(loop);
-      if (!stem) throw new Error(`loop ${r.loop} does not produce a collection`);
+      const step = this.step(def, r.step);
+      const stem = collectionStem(step);
+      if (!stem) throw new Error(`step ${r.step} does not produce a collection`);
       const arts = this.artMap(workflow);
       const sealP = sealPath(stem);
       const sealArt = arts.get(sealP);
       if (!sealArt) throw new Error(`no seal artifact for ${stem}`);
 
-      const req = plainConsumes(loop).map((c) => c.stem);
+      const req = plainConsumes(step).map((c) => c.stem);
       const cas = this.casCheck(arts, req, r.fingerprint ?? {});
       if (cas.moved) {
         this.bornReject(sealArt, cas.moved);
@@ -898,11 +898,11 @@ export class Engine {
       const patch: { outcome: 'ok' | 'no_work' | 'failed' | 'skipped'; summary?: string } = { outcome };
       if (summary !== undefined) patch.summary = summary;
       this.store.updateRun(run, patch);
-      const task = this.store.getTask(workflow, r.loop, r.key ?? '');
+      const task = this.store.getTask(workflow, r.step, r.key ?? '');
       if (task && task.status === 'claimed' && task.run === run) {
         this.store.putTask({
           workflow,
-          loop: r.loop,
+          step: r.step,
           key: r.key ?? '',
           status: 'idle',
           attempts: task.attempts,
@@ -927,7 +927,7 @@ export class Engine {
     this.store.tx(() => {
       // openRun enforces: exists, not closed, task.run === run
       const r = this.openRun(workflow, run);
-      this.store.touchHeartbeat(workflow, r.loop, r.key ?? '', ts);
+      this.store.touchHeartbeat(workflow, r.step, r.key ?? '', ts);
     });
   }
 
@@ -938,14 +938,14 @@ export class Engine {
     for (const task of this.store.listTasks(workflow)) {
       if (task.status !== 'claimed') continue;
       const run = task.run ? this.store.getRun(task.run) : undefined;
-      const loopDef = resolvedDef.loops.find((l) => l.name === task.loop);
-      const ttl = this.effectiveTtl(loopDef);
+      const stepDef = resolvedDef.steps.find((l) => l.name === task.step);
+      const ttl = this.effectiveTtl(stepDef);
       const stale = task.claimedAt !== undefined && !this.isClaimFresh(task, now, ttl);
       const stranded = !run || run.outcome !== undefined || stale;
       if (stranded) {
         this.store.putTask({
           workflow,
-          loop: task.loop,
+          step: task.step,
           key: task.key,
           status: 'idle',
           attempts: task.attempts + 1,
@@ -963,8 +963,8 @@ export class Engine {
     const def = this.defFor(workflow);
     const arts = this.artMap(workflow);
     const st = workflowStatus(def, arts);
-    // Enrich each debt with its producer's crash-loop signal (the run log; the
-    // pure layer has no store). A map-loop producer fires once per element, its
+    // Enrich each debt with its producer's crash-step signal (the run log; the
+    // pure layer has no store). A map-step producer fires once per element, its
     // run keyed by the consumed element path (e.g. "gather.source[0]"); a
     // plain/reduce producer fires with key "". Recover that firing key from the
     // debt's path so the streak is counted per element, not collapsed to "".
@@ -984,14 +984,14 @@ export class Engine {
 
   // ---- alarm API (E-SETALARM / E-DUE) ----------------------------------------
 
-  /** Set a persistent alarm for an idle evaluator loop. Survives restart. */
-  setAlarm(workflow: string, loop: string, at: number): void {
-    this.store.setAlarm(workflow, loop, at);
+  /** Set a persistent alarm for an idle evaluator step. Survives restart. */
+  setAlarm(workflow: string, step: string, at: number): void {
+    this.store.setAlarm(workflow, step, at);
   }
 
-  /** Clear the alarm for an idle evaluator loop. */
-  clearAlarm(workflow: string, loop: string): void {
-    this.store.clearAlarm(workflow, loop);
+  /** Clear the alarm for an idle evaluator step. */
+  clearAlarm(workflow: string, step: string): void {
+    this.store.clearAlarm(workflow, step);
   }
 
   /**
@@ -1005,10 +1005,10 @@ export class Engine {
     const lastProgressMs = this.store.lastProgressMs(workflow);
     let earliest: number | null = null;
 
-    for (const loop of def.loops) {
-      if (!loop.on?.includes('idle')) continue;
-      const alarmAt = this.store.getAlarm(workflow, loop.name);
-      const threshold = alarmAt ?? (lastProgressMs + (loop.idleAfterMs ?? 0));
+    for (const step of def.steps) {
+      if (!step.on?.includes('idle')) continue;
+      const alarmAt = this.store.getAlarm(workflow, step.name);
+      const threshold = alarmAt ?? (lastProgressMs + (step.idleAfterMs ?? 0));
       if (earliest === null || threshold < earliest) earliest = threshold;
     }
 
@@ -1023,7 +1023,7 @@ export class Engine {
   /**
    * Deliver `event` to every subscriber synchronously, in registration order.
    * The set is snapshotted so a listener that (un)subscribes mid-dispatch does
-   * not mutate the loop. A throwing listener is isolated — its error is routed
+   * not mutate the step. A throwing listener is isolated — its error is routed
    * to `onListenerError` (default: swallowed) and never rethrown — so one bad
    * subscriber can neither roll back the already-committed write nor starve its
    * siblings. A no-subscriber engine short-circuits to zero cost.
@@ -1040,7 +1040,7 @@ export class Engine {
   }
 
   /**
-   * Emit the post-commit `settled` event — `done` plus the eligible loop names,
+   * Emit the post-commit `settled` event — `done` plus the eligible step names,
    * the no-poll signal a host watches to decide whether to re-`tick`. Guarded on
    * having a listener: deriving it runs a full `workflowStatus` artifact scan, so
    * a subscriber-free engine (the CLI and every non-observing caller) must pay
@@ -1052,7 +1052,7 @@ export class Engine {
     const def = this.defFor(workflow);
     const arts = this.artMap(workflow);
     const st = workflowStatus(def, arts);
-    this.fire({ type: 'settled', workflow, done: st.done, eligible: st.eligible.map((e) => e.loop) });
+    this.fire({ type: 'settled', workflow, done: st.done, eligible: st.eligible.map((e) => e.step) });
   }
 
   /** Compute the TimeFacts bag for idle eligibility from the current store state. */
@@ -1065,10 +1065,10 @@ export class Engine {
     const lastProgressMs = this.store.lastProgressMs(workflow);
     const inFlight = this.isInFlight(workflow, now, def);
     const alarms = new Map<string, number>();
-    for (const loop of def.loops) {
-      if (!loop.on?.includes('idle')) continue;
-      const alarmAt = this.store.getAlarm(workflow, loop.name);
-      if (alarmAt !== undefined) alarms.set(loop.name, alarmAt);
+    for (const step of def.steps) {
+      if (!step.on?.includes('idle')) continue;
+      const alarmAt = this.store.getAlarm(workflow, step.name);
+      if (alarmAt !== undefined) alarms.set(step.name, alarmAt);
     }
     void arts; // arts not needed here but passed for consistency
     return { now, lastProgressMs, inFlight, alarms };
@@ -1079,8 +1079,8 @@ export class Engine {
     for (const task of this.store.listTasks(workflow)) {
       if (task.status !== 'claimed') continue;
       const run = task.run ? this.store.getRun(task.run) : undefined;
-      const loopDef = def.loops.find((l) => l.name === task.loop);
-      const ttl = this.effectiveTtl(loopDef);
+      const stepDef = def.steps.find((l) => l.name === task.step);
+      const ttl = this.effectiveTtl(stepDef);
       const fresh =
         !!run &&
         run.outcome === undefined &&
@@ -1094,10 +1094,10 @@ export class Engine {
   private computeDueAt(def: WorkflowDef, workflow: string, now: number): number | null {
     const lastProgressMs = this.store.lastProgressMs(workflow);
     let earliest: number | null = null;
-    for (const loop of def.loops) {
-      if (!loop.on?.includes('idle')) continue;
-      const alarmAt = this.store.getAlarm(workflow, loop.name);
-      const threshold = alarmAt ?? (lastProgressMs + (loop.idleAfterMs ?? 0));
+    for (const step of def.steps) {
+      if (!step.on?.includes('idle')) continue;
+      const alarmAt = this.store.getAlarm(workflow, step.name);
+      const threshold = alarmAt ?? (lastProgressMs + (step.idleAfterMs ?? 0));
       if (earliest === null || threshold < earliest) earliest = threshold;
     }
     void now; // for future use (filtering due vs pending)
@@ -1130,16 +1130,16 @@ export class Engine {
 
   private applyOp(workflow: string, def: WorkflowDef, arts: ArtifactMap, op: CascadeOp): void {
     if (op.kind === 'arm') {
-      const handlerLoop = def.loops.find((l) => l.name === op.handlerLoop);
-      if (!handlerLoop) return;
+      const handlerStep = def.steps.find((l) => l.name === op.handlerStep);
+      if (!handlerStep) return;
       // Singleton outputs
-      for (const p of handlerLoop.produces.filter((pp) => pp.kind === 'singleton')) {
+      for (const p of handlerStep.produces.filter((pp) => pp.kind === 'singleton')) {
         const existing = arts.get(p.stem);
         if (!existing) {
           this.store.putArtifact({
             workflow,
             path: p.stem,
-            producer: handlerLoop.name,
+            producer: handlerStep.name,
             acceptance: 'owed',
             version: 0,
             reasons: [reason('reopen', 'structural', 'engine', op.reason, 0)],
@@ -1157,14 +1157,14 @@ export class Engine {
         // owed/rejected: already a debt, no change.
       }
       // Collection seals
-      for (const p of handlerLoop.produces.filter((pp) => pp.kind === 'collection')) {
+      for (const p of handlerStep.produces.filter((pp) => pp.kind === 'collection')) {
         const sealKey = p.stem + '.sealed';
         const existing = arts.get(sealKey);
         if (!existing) {
           this.store.putArtifact({
             workflow,
             path: sealKey,
-            producer: handlerLoop.name,
+            producer: handlerStep.name,
             acceptance: 'owed',
             version: 0,
             reasons: [reason('reopen', 'structural', 'engine', op.reason, 0)],
@@ -1238,11 +1238,11 @@ export class Engine {
     this.store.updateRun(run, { outcome: 'no_work' });
     const r = this.store.getRun(run);
     if (!r) return;
-    const task = this.store.getTask(workflow, r.loop, r.key ?? '');
+    const task = this.store.getTask(workflow, r.step, r.key ?? '');
     if (task && task.status === 'claimed' && task.run === run) {
       this.store.putTask({
         workflow,
-        loop: r.loop,
+        step: r.step,
         key: r.key ?? '',
         status: 'idle',
         attempts: task.attempts,
@@ -1290,29 +1290,29 @@ export class Engine {
     return this.resolveDef(wf.def);
   }
 
-  private loop(def: WorkflowDef, name: string): LoopDef {
-    const l = def.loops.find((x) => x.name === name);
-    if (!l) throw new Error(`no such loop in ${def.name}: ${name}`);
+  private step(def: WorkflowDef, name: string): StepDef {
+    const l = def.steps.find((x) => x.name === name);
+    if (!l) throw new Error(`no such step in ${def.name}: ${name}`);
     return l;
   }
 
   /**
    * The JSON Schema (if any) declared for the artifact `art` greened by `green()`
-   * — a map child binds to its loop's per-element produce, everything else to a
+   * — a map child binds to its step's per-element produce, everything else to a
    * singleton produce. Seals/collection elements go through `seal`/`emit` and are
    * not handled here. Returns undefined when no schema is declared (the default).
    */
   private produceSchema(def: WorkflowDef, art: ArtifactData): JsonSchema | undefined {
-    const loop = def.loops.find((l) => l.name === art.producer);
-    if (!loop) return undefined;
+    const step = def.steps.find((l) => l.name === art.producer);
+    if (!step) return undefined;
     const el = parseElement(art.path);
     if (el && el.suffix !== '') {
-      const mp = loop.produces.find(
+      const mp = step.produces.find(
         (p) => p.kind === 'map' && p.stem === el.stem && p.suffix === el.suffix,
       );
       return mp?.schema;
     }
-    const sp = loop.produces.find((p) => p.kind === 'singleton' && p.stem === art.path);
+    const sp = step.produces.find((p) => p.kind === 'singleton' && p.stem === art.path);
     return sp?.schema;
   }
 
@@ -1325,7 +1325,7 @@ export class Engine {
     const r = this.store.getRun(run);
     if (!r) throw new Error(`no such run: ${run}`);
     if (r.outcome !== undefined) throw new Error(`run already closed: ${run}`);
-    const task = this.store.getTask(workflow, r.loop, r.key ?? '');
+    const task = this.store.getTask(workflow, r.step, r.key ?? '');
     if (!task || task.run !== run) {
       throw new Error(`run ${run} no longer holds its lease (reaped or superseded)`);
     }
@@ -1333,8 +1333,8 @@ export class Engine {
   }
 
   /**
-   * Authority (§4.1): only a loop that consumes `path`'s stem (or a human/engine)
-   * may judgment-reject it. Consuming is dual-purpose — it is also how a loop is
+   * Authority (§4.1): only a step that consumes `path`'s stem (or a human/engine)
+   * may judgment-reject it. Consuming is dual-purpose — it is also how a step is
    * granted the right to invalidate an artifact (so a step that must send an
    * artifact back, even one it only judges, must declare it in `consumes`).
    */
@@ -1342,9 +1342,9 @@ export class Engine {
     if (by === 'human' || by === 'engine') return;
     const el = parseElement(path);
     const stem = el ? el.stem : path.replace(/\.sealed$/, '');
-    const loop = def.loops.find((l) => l.name === by);
-    if (!loop) throw new Error(`unknown actor: ${by}`);
-    const consumesIt = loop.consumes.some((c) => c.stem === stem || c.stem === path);
+    const step = def.steps.find((l) => l.name === by);
+    if (!step) throw new Error(`unknown actor: ${by}`);
+    const consumesIt = step.consumes.some((c) => c.stem === stem || c.stem === path);
     if (!consumesIt) {
       throw new Error(
         `${by} has no authority to invalidate ${path} (it does not consume it). ` +

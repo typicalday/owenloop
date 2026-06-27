@@ -5,13 +5,13 @@ import { parseProduce } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildDef, DefError, lintDef, loadDefFile, loadDefs, parseDef, validateDef } from '../src/defs.ts';
-import { def, input, loop } from './helpers.ts';
+import { def, input, step } from './helpers.ts';
 
 const delivery = {
   name: 'delivery',
   title: 'Software delivery',
   inputs: [{ name: 'proposal' }],
-  loops: [
+  steps: [
     { name: 'planner', consumes: ['proposal'], produces: ['plan'], body: 'plan it' },
     { name: 'builder', consumes: ['plan'], produces: ['pr'] },
     { name: 'reviewer', consumes: ['pr'], produces: ['verdict'] },
@@ -25,37 +25,37 @@ test('parseDef builds a valid def and fills defaults', () => {
   assert.equal(def.title, 'Software delivery');
   assert.equal(def.inputs[0]!.producer, 'human');
   assert.equal(def.inputs[0]!.seedOwed, false);
-  const planner = def.loops[0]!;
+  const planner = def.steps[0]!;
   assert.equal(planner.cadence, '0s');
   assert.equal(planner.cadenceSecs, 0);
   assert.equal(planner.parallel, 1);
   assert.equal(planner.maxAttempts, 3);
   assert.equal(planner.workdir, 'main');
   assert.deepEqual(planner.invalidates, ['proposal']); // defaults to consumed stems
-  assert.equal(def.loops[3]!.terminal, true);
+  assert.equal(def.steps[3]!.terminal, true);
 });
 
 test('parseDef parses cadence durations to seconds', () => {
   const def = parseDef({
     name: 'poll',
     inputs: [{ name: 'seed' }],
-    loops: [{ name: 'watch', consumes: ['seed'], produces: ['report'], cadence: '30m' }],
+    steps: [{ name: 'watch', consumes: ['seed'], produces: ['report'], cadence: '30m' }],
   });
-  assert.equal(def.loops[0]!.cadenceSecs, 1800);
+  assert.equal(def.steps[0]!.cadenceSecs, 1800);
 });
 
 test('parseDef classifies map and reduce wiring', () => {
   const def = parseDef({
     name: 'research',
     inputs: [{ name: 'question' }],
-    loops: [
+    steps: [
       { name: 'gather', consumes: ['question'], produces: ['gather.source[]'] },
       { name: 'fmt', consumes: ['gather.source[$i]'], produces: ['gather.source[$i].formatcheck'] },
       { name: 'synth', consumes: ['gather.source[*]'], produces: ['draft'] },
     ],
   });
-  assert.equal(def.loops[1]!.consumes[0]!.mode, 'map');
-  assert.equal(def.loops[2]!.consumes[0]!.mode, 'reduce');
+  assert.equal(def.steps[1]!.consumes[0]!.mode, 'map');
+  assert.equal(def.steps[2]!.consumes[0]!.mode, 'reduce');
 });
 
 test('rejects a non-object definition', () => {
@@ -64,19 +64,19 @@ test('rejects a non-object definition', () => {
 });
 
 test('rejects a missing/blank name', () => {
-  assert.throws(() => parseDef({ loops: [{ name: 'a' }] }), DefError);
-  assert.throws(() => parseDef({ name: 'has space', loops: [{ name: 'a' }] }), /alphanumeric/);
+  assert.throws(() => parseDef({ steps: [{ name: 'a' }] }), DefError);
+  assert.throws(() => parseDef({ name: 'has space', steps: [{ name: 'a' }] }), /alphanumeric/);
 });
 
-test('rejects a workflow with no loops', () => {
-  assert.throws(() => parseDef({ name: 'empty', inputs: [{ name: 'x' }] }), /at least one loop/);
+test('rejects a workflow with no steps', () => {
+  assert.throws(() => parseDef({ name: 'empty', inputs: [{ name: 'x' }] }), /at least one step/);
 });
 
 test('validateDef flags a dangling consume', () => {
   const errors = validateDef(buildDef({
     name: 'bad',
     inputs: [{ name: 'a' }],
-    loops: [{ name: 'one', consumes: ['a'], produces: ['b'] }, { name: 'two', consumes: ['nope'], produces: ['c'] }],
+    steps: [{ name: 'one', consumes: ['a'], produces: ['b'] }, { name: 'two', consumes: ['nope'], produces: ['c'] }],
   }));
   assert.ok(errors.some((e) => e.includes("nothing produces 'nope'")), errors.join('; '));
 });
@@ -85,7 +85,7 @@ test('validateDef flags two producers for one artifact', () => {
   const errors = validateDef(buildDef({
     name: 'bad',
     inputs: [{ name: 'a' }],
-    loops: [
+    steps: [
       { name: 'one', consumes: ['a'], produces: ['x'] },
       { name: 'two', consumes: ['a'], produces: ['x'] },
     ],
@@ -93,20 +93,20 @@ test('validateDef flags two producers for one artifact', () => {
   assert.ok(errors.some((e) => e.includes('two producers')), errors.join('; '));
 });
 
-test('validateDef flags an input that collides with a loop name', () => {
+test('validateDef flags an input that collides with a step name', () => {
   const errors = validateDef(buildDef({
     name: 'bad',
     inputs: [{ name: 'planner' }],
-    loops: [{ name: 'planner', consumes: ['planner'], produces: ['plan'] }],
+    steps: [{ name: 'planner', consumes: ['planner'], produces: ['plan'] }],
   }));
-  assert.ok(errors.some((e) => e.includes('both an input and a loop')), errors.join('; '));
+  assert.ok(errors.some((e) => e.includes('both an input and a step')), errors.join('; '));
 });
 
 test('validateDef flags a map consume without a per-element produce', () => {
   const errors = validateDef(buildDef({
     name: 'bad',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       { name: 'gather', consumes: ['q'], produces: ['set[]'] },
       { name: 'broken', consumes: ['set[$i]'], produces: ['summary'] }, // singleton, not map
     ],
@@ -118,16 +118,16 @@ test('validateDef flags a reduce over a non-collection', () => {
   const errors = validateDef(buildDef({
     name: 'bad',
     inputs: [{ name: 'q' }],
-    loops: [{ name: 'synth', consumes: ['q', 'ghost[*]'], produces: ['draft'] }],
+    steps: [{ name: 'synth', consumes: ['q', 'ghost[*]'], produces: ['draft'] }],
   }));
-  assert.ok(errors.some((e) => e.includes("no loop produces 'ghost[]'")), errors.join('; '));
+  assert.ok(errors.some((e) => e.includes("no step produces 'ghost[]'")), errors.join('; '));
 });
 
 test('validateDef detects a dependency cycle', () => {
   const errors = validateDef(buildDef({
-    name: 'loopy',
+    name: 'stepy',
     inputs: [],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['y'], produces: ['x'] },
       { name: 'b', consumes: ['x'], produces: ['y'] },
     ],
@@ -144,14 +144,14 @@ test('the knock-back graph is NOT a cycle (reject is runtime, not a dep edge)', 
 
 test('buildDef rejects consumes that are not a list of strings', () => {
   assert.throws(
-    () => buildDef({ name: 'bad', inputs: [{ name: 'a' }], loops: [{ name: 'x', consumes: 'a', produces: ['y'] }] }),
+    () => buildDef({ name: 'bad', inputs: [{ name: 'a' }], steps: [{ name: 'x', consumes: 'a', produces: ['y'] }] }),
     /must be a list of strings/,
   );
 });
 
 test('buildDef rejects a produce entry that is neither a string nor a { name, schema }', () => {
   assert.throws(
-    () => buildDef({ name: 'bad', inputs: [{ name: 'a' }], loops: [{ name: 'x', consumes: ['a'], produces: [42] }] }),
+    () => buildDef({ name: 'bad', inputs: [{ name: 'a' }], steps: [{ name: 'x', consumes: ['a'], produces: [42] }] }),
     /must be a string or a \{ name, schema \} mapping/,
   );
 });
@@ -162,7 +162,7 @@ test('parseDef aggregates validation errors into a single thrown DefError', () =
       parseDef({
         name: 'bad',
         inputs: [{ name: 'a' }],
-        loops: [
+        steps: [
           { name: 'one', consumes: ['a'], produces: ['b'] },
           { name: 'two', consumes: ['nope'], produces: ['c'] },
         ],
@@ -171,11 +171,11 @@ test('parseDef aggregates validation errors into a single thrown DefError', () =
   );
 });
 
-test('validateDef flags more than one map consume in a loop', () => {
+test('validateDef flags more than one map consume in a step', () => {
   const errors = validateDef(buildDef({
     name: 'bad',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       { name: 'g1', consumes: ['q'], produces: ['a[]'] },
       { name: 'g2', consumes: ['q'], produces: ['b[]'] },
       { name: 'multi', consumes: ['a[$i]', 'b[$i]'], produces: ['a[$i].x'] },
@@ -184,11 +184,11 @@ test('validateDef flags more than one map consume in a loop', () => {
   assert.ok(errors.some((e) => e.includes('more than one map consume')), errors.join('; '));
 });
 
-test('validateDef flags more than one reduce consume in a loop', () => {
+test('validateDef flags more than one reduce consume in a step', () => {
   const errors = validateDef(buildDef({
     name: 'bad',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       { name: 'g1', consumes: ['q'], produces: ['a[]'] },
       { name: 'g2', consumes: ['q'], produces: ['b[]'] },
       { name: 'multi', consumes: ['a[*]', 'b[*]'], produces: ['draft'] },
@@ -197,11 +197,11 @@ test('validateDef flags more than one reduce consume in a loop', () => {
   assert.ok(errors.some((e) => e.includes('more than one reduce consume')), errors.join('; '));
 });
 
-test('validateDef flags a loop that mixes a map and a reduce consume', () => {
+test('validateDef flags a step that mixes a map and a reduce consume', () => {
   const errors = validateDef(buildDef({
     name: 'bad',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       { name: 'g', consumes: ['q'], produces: ['a[]'] },
       { name: 'mix', consumes: ['a[$i]', 'a[*]'], produces: ['a[$i].x'] },
     ],
@@ -213,7 +213,7 @@ test('validateDef flags a per-element produce with no map consume to bind it', (
   const errors = validateDef(buildDef({
     name: 'bad',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       { name: 'g', consumes: ['q'], produces: ['a[]'] },
       { name: 'weird', consumes: ['q'], produces: ['a[$i].x'] }, // map produce, no $i consume
     ],
@@ -225,7 +225,7 @@ test('parseDef attaches a JSON Schema to a produce given as { name, schema }', (
   const def = parseDef({
     name: 'schemad',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       {
         name: 'planner',
         consumes: ['q'],
@@ -233,7 +233,7 @@ test('parseDef attaches a JSON Schema to a produce given as { name, schema }', (
       },
     ],
   });
-  const plan = def.loops[0]!.produces[0]!;
+  const plan = def.steps[0]!.produces[0]!;
   assert.equal(plan.stem, 'plan');
   assert.deepEqual(plan.schema, { type: 'object', required: ['plan'] });
 });
@@ -242,7 +242,7 @@ test('parseDef leaves produces without a schema undefined and accepts mixed entr
   const def = parseDef({
     name: 'mixed',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       {
         name: 'planner',
         consumes: ['q'],
@@ -250,15 +250,15 @@ test('parseDef leaves produces without a schema undefined and accepts mixed entr
       },
     ],
   });
-  assert.equal(def.loops[0]!.produces[0]!.schema, undefined);
-  assert.deepEqual(def.loops[0]!.produces[1]!.schema, { type: 'object' });
+  assert.equal(def.steps[0]!.produces[0]!.schema, undefined);
+  assert.deepEqual(def.steps[0]!.produces[1]!.schema, { type: 'object' });
 });
 
 test('parseDef attaches a JSON Schema to an input', () => {
   const def = parseDef({
     name: 'schemad-in',
     inputs: [{ name: 'proposal', schema: { type: 'object', required: ['text'] } }],
-    loops: [{ name: 'a', consumes: ['proposal'], produces: ['plan'] }],
+    steps: [{ name: 'a', consumes: ['proposal'], produces: ['plan'] }],
   });
   assert.deepEqual(def.inputs[0]!.schema, { type: 'object', required: ['text'] });
 });
@@ -267,13 +267,13 @@ test('parseDef fills maxSchemaFailures default and parses an override', () => {
   const def = parseDef({
     name: 'caps',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['q'], produces: ['plan'] },
       { name: 'b', consumes: ['plan'], produces: ['pr'], maxSchemaFailures: 2 },
     ],
   });
-  assert.equal(def.loops[0]!.maxSchemaFailures, 5);
-  assert.equal(def.loops[1]!.maxSchemaFailures, 2);
+  assert.equal(def.steps[0]!.maxSchemaFailures, 5);
+  assert.equal(def.steps[1]!.maxSchemaFailures, 2);
 });
 
 test('buildDef rejects a malformed produce schema with a DefError', () => {
@@ -282,7 +282,7 @@ test('buildDef rejects a malformed produce schema with a DefError', () => {
       buildDef({
         name: 'bad',
         inputs: [{ name: 'q' }],
-        loops: [{ name: 'a', consumes: ['q'], produces: [{ name: 'plan', schema: 42 }] }],
+        steps: [{ name: 'a', consumes: ['q'], produces: [{ name: 'plan', schema: 42 }] }],
       }),
     (e: unknown) => e instanceof DefError && /must be a JSON Schema object or boolean/.test((e as Error).message),
   );
@@ -294,7 +294,7 @@ test('buildDef rejects a malformed input schema with a DefError', () => {
       buildDef({
         name: 'bad',
         inputs: [{ name: 'q', schema: 'not-a-schema' }],
-        loops: [{ name: 'a', consumes: ['q'], produces: ['plan'] }],
+        steps: [{ name: 'a', consumes: ['q'], produces: ['plan'] }],
       }),
     DefError,
   );
@@ -306,7 +306,7 @@ test('buildDef rejects a produce schema with an unresolved $ref (gross error at 
       buildDef({
         name: 'bad',
         inputs: [{ name: 'q' }],
-        loops: [{ name: 'a', consumes: ['q'], produces: [{ name: 'plan', schema: { $ref: '#/nope' } }] }],
+        steps: [{ name: 'a', consumes: ['q'], produces: [{ name: 'plan', schema: { $ref: '#/nope' } }] }],
       }),
     (e: unknown) => e instanceof DefError && /is not a valid JSON Schema/.test((e as Error).message),
   );
@@ -317,14 +317,14 @@ test('loadDefs discovers a workflow.yaml inside a subdirectory', () => {
   // a flat file...
   writeFileSync(
     join(dir, 'flat.yaml'),
-    'name: flat\ninputs:\n  - name: x\nloops:\n  - name: a\n    consumes: [x]\n    produces: [y]\n',
+    'name: flat\ninputs:\n  - name: x\nsteps:\n  - name: a\n    consumes: [x]\n    produces: [y]\n',
   );
   // ...and a packaged subdirectory with its own workflow.yaml
   const sub = join(dir, 'packaged');
   mkdirSync(sub);
   writeFileSync(
     join(sub, 'workflow.yaml'),
-    'name: packaged\ninputs:\n  - name: seed\nloops:\n  - name: run\n    consumes: [seed]\n    produces: [out]\n',
+    'name: packaged\ninputs:\n  - name: seed\nsteps:\n  - name: run\n    consumes: [seed]\n    produces: [out]\n',
   );
   // a subdirectory WITHOUT a workflow.yaml is silently skipped, not an error
   mkdirSync(join(dir, 'empty-dir'));
@@ -341,7 +341,7 @@ test('loadDefFile and loadDefs read YAML from disk', () => {
       'name: delivery',
       'inputs:',
       '  - name: proposal',
-      'loops:',
+      'steps:',
       '  - name: planner',
       '    consumes: [proposal]',
       '    produces: [plan]',
@@ -354,7 +354,7 @@ test('loadDefFile and loadDefs read YAML from disk', () => {
   );
   const single = loadDefFile(join(dir, 'delivery.yaml'));
   assert.equal(single.name, 'delivery');
-  assert.equal(single.loops[0]!.body.trim(), 'Plan ${WORKFLOW}.');
+  assert.equal(single.steps[0]!.body.trim(), 'Plan ${WORKFLOW}.');
 
   const all = loadDefs(dir);
   assert.deepEqual([...all.keys()], ['delivery']);
@@ -366,7 +366,7 @@ test('lintDef has no errors for a fully reachable linear chain', () => {
   const { errors, warnings } = lintDef(buildDef({
     name: 'linear',
     inputs: [{ name: 'seed' }],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['seed'], produces: ['mid'] },
       { name: 'b', consumes: ['mid'], produces: ['out'], terminal: true },
     ],
@@ -375,14 +375,14 @@ test('lintDef has no errors for a fully reachable linear chain', () => {
   assert.deepEqual(warnings, []);
 });
 
-test('lintDef flags an unreachable loop (its consumed stem has a producer that is unreachable)', () => {
+test('lintDef flags an unreachable step (its consumed stem has a producer that is unreachable)', () => {
   // 'a' is reachable from input 'start'. 'c' consumes 'ghost' (no producer) — dangling.
   // 'b' consumes 'other' which 'c' produces, but 'c' is dangling/unreachable.
   // 'b' should be reported as unreachable; 'c' should NOT be double-reported.
   const def = buildDef({
     name: 'island',
     inputs: [{ name: 'start' }],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['start'], produces: ['mid', 'out'], terminal: true },
       { name: 'c', consumes: ['ghost'], produces: ['other'] },  // dangling: 'ghost' has no producer
       { name: 'b', consumes: ['other'], produces: ['result'] }, // unreachable: 'other' produced by unreachable 'c'
@@ -392,31 +392,31 @@ test('lintDef flags an unreachable loop (its consumed stem has a producer that i
   // 'c' triggers dangling-consume (ghost has no producer)
   assert.ok(errors.some((e) => e.includes("nothing produces 'ghost'")), errors.join('; '));
   // 'b' triggers reachability (other is produced by unreachable 'c')
-  assert.ok(errors.some((e) => /loop 'b' is unreachable/.test(e)), errors.join('; '));
+  assert.ok(errors.some((e) => /step 'b' is unreachable/.test(e)), errors.join('; '));
   // 'c' must NOT also produce a reachability error (it is suppressed because it already has dangling)
-  assert.ok(!errors.some((e) => /loop 'c' is unreachable/.test(e)), 'c should not be double-reported');
+  assert.ok(!errors.some((e) => /step 'c' is unreachable/.test(e)), 'c should not be double-reported');
 });
 
-test('lintDef warns about a non-terminal loop whose output nothing consumes', () => {
+test('lintDef warns about a non-terminal step whose output nothing consumes', () => {
   const def = buildDef({
     name: 'deadend',
     inputs: [{ name: 'seed' }],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['seed'], produces: ['useful', 'orphan'] },
       { name: 'b', consumes: ['useful'], produces: ['final'], terminal: true },
     ],
   });
   const { errors, warnings } = lintDef(def);
   assert.deepEqual(errors, []);
-  assert.ok(warnings.some((w) => w.includes("loop 'a' produces 'orphan' but nothing consumes it")), warnings.join('; '));
+  assert.ok(warnings.some((w) => w.includes("step 'a' produces 'orphan' but nothing consumes it")), warnings.join('; '));
   assert.equal(warnings.filter((w) => w.includes('orphan')).length, 1, 'exactly one warning for orphan');
 });
 
-test('lintDef does not warn about unconsumed outputs on a terminal loop', () => {
+test('lintDef does not warn about unconsumed outputs on a terminal step', () => {
   const def = buildDef({
     name: 'terminal-sink',
     inputs: [{ name: 'seed' }],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['seed'], produces: ['plan'] },
       { name: 'b', consumes: ['plan'], produces: ['done'], terminal: true },
     ],
@@ -425,20 +425,20 @@ test('lintDef does not warn about unconsumed outputs on a terminal loop', () => 
   assert.deepEqual(warnings, []);
 });
 
-test('lintDef does not double-report: a dangling-consume loop is not also reported as unreachable', () => {
+test('lintDef does not double-report: a dangling-consume step is not also reported as unreachable', () => {
   const def = buildDef({
     name: 'dangle-not-double',
     inputs: [{ name: 'seed' }],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['seed'], produces: ['mid'] },
       { name: 'b', consumes: ['nope'], produces: ['out'], terminal: true }, // dangling: 'nope' has no producer
     ],
   });
   const { errors } = lintDef(def);
   const danglingErrors = errors.filter((e) => e.includes("nothing produces 'nope'"));
-  const reachErrors = errors.filter((e) => /loop 'b' is unreachable/.test(e));
+  const reachErrors = errors.filter((e) => /step 'b' is unreachable/.test(e));
   assert.equal(danglingErrors.length, 1, 'exactly one dangling-consume error');
-  assert.equal(reachErrors.length, 0, 'no reachability error for the same loop');
+  assert.equal(reachErrors.length, 0, 'no reachability error for the same step');
 });
 
 test('lintDef on the delivery example: no errors, no warnings', () => {
@@ -453,7 +453,7 @@ test('lintDef on the delivery example: no errors, no warnings', () => {
 const baseInvariantRaw = {
   name: 'inv-base',
   inputs: [{ name: 'proposal' }],
-  loops: [
+  steps: [
     { name: 'planner', consumes: ['proposal'], produces: ['plan'] },
     { name: 'merger', consumes: ['plan'], produces: ['merge'], terminal: true },
   ],
@@ -605,7 +605,7 @@ test('buildDef: nested not/all predicate round-trips (deep-equal)', () => {
 const baseWithGenerates = {
   name: 'audited',
   inputs: [{ name: 'proposal' }],
-  loops: [
+  steps: [
     {
       name: 'planner',
       consumes: ['proposal'],
@@ -617,10 +617,10 @@ const baseWithGenerates = {
   ],
 };
 
-// Test 1: generates: bare strings parse like produces; stem unioned into loop.produces
-test('generates: bare string parses like produces; stem is in loop.generates and loop.produces', () => {
+// Test 1: generates: bare strings parse like produces; stem unioned into step.produces
+test('generates: bare string parses like produces; stem is in step.generates and step.produces', () => {
   const d = buildDef(baseWithGenerates);
-  const planner = d.loops[0]!;
+  const planner = d.steps[0]!;
   assert.ok(planner.generates !== undefined, 'generates should be set');
   assert.equal(planner.generates![0]!.stem, 'audit_log');
   // unioned into produces
@@ -635,7 +635,7 @@ test('generates: { name, schema } attaches a schema to the ProducePattern', () =
   const d = buildDef({
     name: 'schemagen',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       {
         name: 'gen',
         consumes: ['q'],
@@ -645,7 +645,7 @@ test('generates: { name, schema } attaches a schema to the ProducePattern', () =
       },
     ],
   });
-  const g = d.loops[0]!.generates![0]!;
+  const g = d.steps[0]!.generates![0]!;
   assert.equal(g.stem, 'report');
   assert.deepEqual(g.schema, { type: 'object' });
 });
@@ -655,7 +655,7 @@ test('generates: collection pattern parses as collection kind', () => {
   const d = buildDef({
     name: 'collgen',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       {
         name: 'gen',
         consumes: ['q'],
@@ -665,21 +665,21 @@ test('generates: collection pattern parses as collection kind', () => {
       },
     ],
   });
-  const g = d.loops[0]!.generates![0]!;
+  const g = d.steps[0]!.generates![0]!;
   assert.equal(g.kind, 'collection');
   assert.equal(g.stem, 'audit.log');
 });
 
-// Test 4: generates: [] leaves loop.generates absent
-test('generates: empty array leaves loop.generates unset', () => {
+// Test 4: generates: [] leaves step.generates absent
+test('generates: empty array leaves step.generates unset', () => {
   const d = buildDef({
     name: 'emptygens',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['q'], generates: [], produces: ['out'], terminal: true },
     ],
   });
-  assert.ok(d.loops[0]!.generates === undefined, 'generates should be absent for empty array');
+  assert.ok(d.steps[0]!.generates === undefined, 'generates should be absent for empty array');
 });
 
 // Test 5: generates: invalid entry throws DefError
@@ -688,7 +688,7 @@ test('generates: invalid entry (non-string/non-object) throws DefError', () => {
     () => buildDef({
       name: 'bad',
       inputs: [{ name: 'q' }],
-      loops: [{ name: 'a', consumes: ['q'], generates: [42], terminal: true }],
+      steps: [{ name: 'a', consumes: ['q'], generates: [42], terminal: true }],
     }),
     (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema \} mapping/.test((e as Error).message),
   );
@@ -699,7 +699,7 @@ test('validateDef: same stem in both produces: and generates: → hard error', (
   const errors = validateDef(buildDef({
     name: 'conflict',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       {
         name: 'gen',
         consumes: ['q'],
@@ -715,12 +715,12 @@ test('validateDef: same stem in both produces: and generates: → hard error', (
   );
 });
 
-// Test 7: two loops generating the same stem → one-writer error
-test('validateDef: two loops generating the same stem → one-writer error', () => {
+// Test 7: two steps generating the same stem → one-writer error
+test('validateDef: two steps generating the same stem → one-writer error', () => {
   const errors = validateDef(buildDef({
     name: 'twogens',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['q'], generates: ['audit_log'], produces: ['out_a'], terminal: true },
       { name: 'b', consumes: ['q'], generates: ['audit_log'], produces: ['out_b'], terminal: true },
     ],
@@ -736,8 +736,8 @@ test('validateDef: generates map output without a map consume → map-shape erro
   const errors = validateDef(buildDef({
     name: 'badmapgen',
     inputs: [{ name: 'q' }],
-    loops: [
-      // A non-map loop that generates a per-element output — not allowed
+    steps: [
+      // A non-map step that generates a per-element output — not allowed
       { name: 'a', consumes: ['q'], generates: ['col[$i].check'], produces: ['out'], terminal: true },
     ],
   }));
@@ -758,12 +758,12 @@ test('lintDef: a generated unconsumed stem yields no dead-end warning', () => {
   );
 });
 
-// Test 10: a produced unconsumed stem on the same loop still warns while the generated one does not
-test('lintDef: produced unconsumed stem still warns on same loop as generates:', () => {
+// Test 10: a produced unconsumed stem on the same step still warns while the generated one does not
+test('lintDef: produced unconsumed stem still warns on same step as generates:', () => {
   const { errors, warnings } = lintDef(buildDef({
     name: 'mixed-orphan',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       {
         name: 'gen',
         consumes: ['q'],
@@ -792,7 +792,7 @@ test('lintDef: dead-end warning message mentions generates:', () => {
   const { warnings } = lintDef(buildDef({
     name: 'warnmsg',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['q'], produces: ['orphan'], body: '' },
       { name: 'b', consumes: ['q'], produces: ['final'], terminal: true },
     ],
@@ -808,7 +808,7 @@ test('lintDef: terminal: true suppresses all dead-end warnings even when generat
   const { warnings } = lintDef(buildDef({
     name: 'terminal-gen',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       {
         name: 'a',
         consumes: ['q'],
@@ -831,7 +831,7 @@ const baseWithOutputs = {
   name: 'report',
   inputs: [{ name: 'proposal' }],
   outputs: ['summary'],
-  loops: [
+  steps: [
     { name: 'planner', consumes: ['proposal'], produces: ['plan'], body: 'plan it' },
     { name: 'reporter', consumes: ['plan'], produces: ['summary'], generates: ['audit_log'], body: 'report it' },
   ],
@@ -849,7 +849,7 @@ test('outputs: empty array leaves def.outputs absent', () => {
     name: 'no-outs',
     inputs: [{ name: 'q' }],
     outputs: [],
-    loops: [{ name: 'a', consumes: ['q'], produces: ['out'], terminal: true, body: '' }],
+    steps: [{ name: 'a', consumes: ['q'], produces: ['out'], terminal: true, body: '' }],
   });
   assert.ok(d.outputs === undefined, 'def.outputs should be absent for empty array');
 });
@@ -869,7 +869,7 @@ test('lintDef: unlisted unconsumed stem still warns; outputs:-listed one does no
     name: 'partial',
     inputs: [{ name: 'proposal' }],
     outputs: ['summary'],
-    loops: [
+    steps: [
       { name: 'planner', consumes: ['proposal'], produces: ['plan'], body: 'plan it' },
       { name: 'reporter', consumes: ['plan'], produces: ['summary', 'orphan'], body: 'report it' },
     ],
@@ -890,7 +890,7 @@ test('lintDef: terminal:, generates:, and outputs: exemptions all active simulta
     name: 'all-exempt',
     inputs: [{ name: 'q' }],
     outputs: ['summary'],
-    loops: [
+    steps: [
       { name: 'sink', consumes: ['q'], produces: ['final'], terminal: true, body: '' },
       { name: 'gen', consumes: ['q'], produces: ['plan'], generates: ['audit_log'], terminal: true, body: '' },
       { name: 'pub', consumes: ['q'], produces: ['summary'], body: '' },
@@ -899,13 +899,13 @@ test('lintDef: terminal:, generates:, and outputs: exemptions all active simulta
   assert.deepEqual(warnings, []);
 });
 
-// Test (d): outputs: entry naming a stem no loop produces → hard validateDef error
+// Test (d): outputs: entry naming a stem no step produces → hard validateDef error
 test('validateDef: outputs: entry naming an unproduced stem is a hard error', () => {
   const errors = validateDef(buildDef({
     name: 'bad-out',
     inputs: [{ name: 'q' }],
     outputs: ['nonexistent'],
-    loops: [{ name: 'a', consumes: ['q'], produces: ['out'], terminal: true, body: '' }],
+    steps: [{ name: 'a', consumes: ['q'], produces: ['out'], terminal: true, body: '' }],
   }));
   assert.ok(
     errors.some((e) => e.includes('outputs:') && e.includes('nonexistent')),
@@ -919,7 +919,7 @@ test('validateDef + lintDef: outputs: naming a generates: stem is valid', () => 
     name: 'gen-out',
     inputs: [{ name: 'q' }],
     outputs: ['audit_log'],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['q'], generates: ['audit_log'], produces: ['out'], terminal: true, body: '' },
     ],
   });
@@ -931,13 +931,13 @@ test('validateDef + lintDef: outputs: naming a generates: stem is valid', () => 
   );
 });
 
-// Test (f): outputs: naming an input stem (not produced by any loop) → hard error
+// Test (f): outputs: naming an input stem (not produced by any step) → hard error
 test('validateDef: outputs: entry naming an input stem is a hard error', () => {
   const errors = validateDef(buildDef({
     name: 'input-out',
     inputs: [{ name: 'proposal' }],
     outputs: ['proposal'],
-    loops: [{ name: 'a', consumes: ['proposal'], produces: ['result'], terminal: true, body: '' }],
+    steps: [{ name: 'a', consumes: ['proposal'], produces: ['result'], terminal: true, body: '' }],
   }));
   assert.ok(
     errors.some((e) => e.includes('outputs:') && e.includes('proposal')),
@@ -950,7 +950,7 @@ test('lintDef: dead-end warning message mentions outputs:', () => {
   const { warnings } = lintDef(buildDef({
     name: 'warn-msg',
     inputs: [{ name: 'q' }],
-    loops: [
+    steps: [
       { name: 'a', consumes: ['q'], produces: ['orphan'], body: '' },
       { name: 'b', consumes: ['q'], produces: ['final'], terminal: true },
     ],
@@ -965,11 +965,11 @@ test('lintDef: dead-end warning message mentions outputs:', () => {
 
 // (f1) on: ['idle'] without idleAfter → hard error (idleAfter is required for idle trigger)
 test('parseDef: on: [idle] without idleAfter is a hard validateDef error', () => {
-  // buildDef succeeds (no throw from buildLoop) but validateDef reports the cross-check error
+  // buildDef succeeds (no throw from buildStep) but validateDef reports the cross-check error
   const d = buildDef({
     name: 'wf',
     inputs: [{ name: 'seed' }],
-    loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['idle'] }],
+    steps: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['idle'] }],
   });
   const errors = validateDef(d);
   assert.ok(
@@ -984,7 +984,7 @@ test('parseDef: on: [unknown_token] is a hard error', () => {
     () => parseDef({
       name: 'wf',
       inputs: [{ name: 'seed' }],
-      loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['unknown_token'] }],
+      steps: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['unknown_token'] }],
     }),
     DefError,
   );
@@ -996,7 +996,7 @@ test('parseDef: on: [] is a hard error (must not be empty)', () => {
     () => parseDef({
       name: 'wf',
       inputs: [{ name: 'seed' }],
-      loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: [] }],
+      steps: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: [] }],
     }),
     (e: unknown) => {
       assert.ok(e instanceof DefError);
@@ -1011,9 +1011,9 @@ test('parseDef: on: [inputsGreen] is valid', () => {
   const d = parseDef({
     name: 'wf',
     inputs: [{ name: 'seed' }],
-    loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['inputsGreen'] }],
+    steps: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['inputsGreen'] }],
   });
-  assert.deepEqual(d.loops[0]!.on, ['inputsGreen']);
+  assert.deepEqual(d.steps[0]!.on, ['inputsGreen']);
 });
 
 // (f5) on: ['allGreen'] → valid (evaluator with generates: so no dead-end warning)
@@ -1021,12 +1021,12 @@ test('parseDef: on: [allGreen] is valid', () => {
   const d = parseDef({
     name: 'wf',
     inputs: [{ name: 'seed' }],
-    loops: [
+    steps: [
       { name: 'planner', consumes: ['seed'], produces: ['plan'] },
       { name: 'eval', on: ['allGreen'], generates: ['outcome'], consumes: [], body: '' },
     ],
   });
-  assert.deepEqual(d.loops[1]!.on, ['allGreen']);
+  assert.deepEqual(d.steps[1]!.on, ['allGreen']);
 });
 
 // (f6) on: omitted → valid (default behaviour — on is undefined)
@@ -1034,9 +1034,9 @@ test('parseDef: on: omitted → valid, on is undefined', () => {
   const d = parseDef({
     name: 'wf',
     inputs: [{ name: 'seed' }],
-    loops: [{ name: 'a', consumes: ['seed'], produces: ['out'] }],
+    steps: [{ name: 'a', consumes: ['seed'], produces: ['out'] }],
   });
-  assert.equal(d.loops[0]!.on, undefined);
+  assert.equal(d.steps[0]!.on, undefined);
 });
 
 // (f7) on: ['idle'] without idleAfter → validateDef error
@@ -1044,7 +1044,7 @@ test('parseDef: on: [idle] without idleAfter → validateDef error', () => {
   const d = buildDef({
     name: 'wf',
     inputs: [{ name: 'seed' }],
-    loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['idle'] }],
+    steps: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['idle'] }],
   });
   const errors = validateDef(d);
   assert.ok(
@@ -1058,7 +1058,7 @@ test('parseDef: idleAfter set but idle not in on: → validateDef error', () => 
   const d = buildDef({
     name: 'wf',
     inputs: [{ name: 'seed' }],
-    loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], idleAfter: '30m' }],
+    steps: [{ name: 'a', consumes: ['seed'], produces: ['out'], idleAfter: '30m' }],
   });
   const errors = validateDef(d);
   assert.ok(
@@ -1072,14 +1072,14 @@ test('parseDef: on: [idle] with idleAfter is valid', () => {
   const d = parseDef({
     name: 'wf',
     inputs: [{ name: 'seed' }],
-    loops: [
+    steps: [
       { name: 'planner', consumes: ['seed'], produces: ['plan'] },
       { name: 'eval', on: ['idle'], idleAfter: '30m', generates: ['outcome'], consumes: [], body: '' },
     ],
   });
-  assert.deepEqual(d.loops[1]!.on, ['idle']);
-  assert.equal(d.loops[1]!.idleAfter, '30m');
-  assert.equal(d.loops[1]!.idleAfterMs, 30 * 60 * 1000);
+  assert.deepEqual(d.steps[1]!.on, ['idle']);
+  assert.equal(d.steps[1]!.idleAfter, '30m');
+  assert.equal(d.steps[1]!.idleAfterMs, 30 * 60 * 1000);
 });
 
 // (f10) on: ['allGreen', 'idle'], idleAfter: '2h' → valid (combined evaluator)
@@ -1087,22 +1087,22 @@ test('parseDef: on: [allGreen, idle] with idleAfter is valid', () => {
   const d = parseDef({
     name: 'wf',
     inputs: [{ name: 'seed' }],
-    loops: [
+    steps: [
       { name: 'planner', consumes: ['seed'], produces: ['plan'] },
       { name: 'eval', on: ['allGreen', 'idle'], idleAfter: '2h', generates: ['outcome'], consumes: [], body: '' },
     ],
   });
-  assert.deepEqual(d.loops[1]!.on, ['allGreen', 'idle']);
-  assert.equal(d.loops[1]!.idleAfterMs, 2 * 60 * 60 * 1000);
+  assert.deepEqual(d.steps[1]!.on, ['allGreen', 'idle']);
+  assert.equal(d.steps[1]!.idleAfterMs, 2 * 60 * 60 * 1000);
 });
 
-// (f11) on: ['unknown_token'] → hard DefError from buildLoop (unchanged)
+// (f11) on: ['unknown_token'] → hard DefError from buildStep (unchanged)
 test('parseDef: on: [unknown_token] is a hard error (unchanged)', () => {
   assert.throws(
     () => parseDef({
       name: 'wf',
       inputs: [{ name: 'seed' }],
-      loops: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['totally_unknown'] }],
+      steps: [{ name: 'a', consumes: ['seed'], produces: ['out'], on: ['totally_unknown'] }],
     }),
     DefError,
   );
@@ -1112,7 +1112,7 @@ test('parseDef: on: [unknown_token] is a hard error (unchanged)', () => {
 
 test('D-D: non-existent handler → validateDef error', () => {
   const d = def('test', [input('x')], [
-    loop({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'nonexistent' } }),
+    step({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'nonexistent' } }),
   ]);
   const errors = validateDef(d);
   assert.ok(errors.some((e) => e.includes('does not exist') || e.includes('nonexistent')),
@@ -1121,7 +1121,7 @@ test('D-D: non-existent handler → validateDef error', () => {
 
 test('D-D: self-handler → validateDef error', () => {
   const d = def('test', [input('x')], [
-    loop({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'worker' } }),
+    step({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'worker' } }),
   ]);
   const errors = validateDef(d);
   assert.ok(errors.some((e) => e.includes('cannot be its own handler') || e.includes('names itself')),
@@ -1129,11 +1129,11 @@ test('D-D: self-handler → validateDef error', () => {
 });
 
 test('D-D: handler produces nothing → validateDef error', () => {
-  // Construct a handler loop with no produces by using the helper and overriding produces
-  const handlerLoop = { ...loop({ name: 'noop', consumes: [], produces: [] }), produces: [] };
+  // Construct a handler step with no produces by using the helper and overriding produces
+  const handlerStep = { ...step({ name: 'noop', consumes: [], produces: [] }), produces: [] };
   const d = def('test', [input('x')], [
-    loop({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'noop' } }),
-    handlerLoop,
+    step({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'noop' } }),
+    handlerStep,
   ]);
   const errors = validateDef(d);
   assert.ok(errors.some((e) => e.includes('produces no outputs') || e.includes('at least one output')),
@@ -1142,7 +1142,7 @@ test('D-D: handler produces nothing → validateDef error', () => {
 
 test('D-D: pin still valid (no error from named-handler check)', () => {
   const d = def('test', [input('x')], [
-    loop({ name: 'w', consumes: ['x'], produces: ['y'], effect: { idempotent: false, onInvalidate: 'pin' } }),
+    step({ name: 'w', consumes: ['x'], produces: ['y'], effect: { idempotent: false, onInvalidate: 'pin' } }),
   ]);
   // pin is a built-in, must produce no error from D-D check
   const errors = validateDef(d).filter((e) => e.includes('onInvalidate') && !e.includes('terminal'));
@@ -1151,7 +1151,7 @@ test('D-D: pin still valid (no error from named-handler check)', () => {
 
 test('D-D: escalate still valid (no error from named-handler check)', () => {
   const d = def('test', [input('x')], [
-    loop({ name: 'w', consumes: ['x'], produces: ['y'], effect: { idempotent: false, onInvalidate: 'escalate' } }),
+    step({ name: 'w', consumes: ['x'], produces: ['y'], effect: { idempotent: false, onInvalidate: 'escalate' } }),
   ]);
   const errors = validateDef(d).filter((e) => e.includes('onInvalidate') && !e.includes('terminal'));
   assert.deepEqual(errors, [], `escalate must produce no onInvalidate error; errors: ${errors.join('; ')}`);
@@ -1159,8 +1159,8 @@ test('D-D: escalate still valid (no error from named-handler check)', () => {
 
 test('D-D: valid named-handler → no validateDef error for onInvalidate', () => {
   const d = def('test', [input('x')], [
-    loop({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'handler' } }),
-    loop({ name: 'handler', consumes: ['out'], produces: ['done'] }),
+    step({ name: 'worker', consumes: ['x'], produces: ['out'], effect: { idempotent: false, onInvalidate: 'handler' } }),
+    step({ name: 'handler', consumes: ['out'], produces: ['done'] }),
   ]);
   const errors = validateDef(d).filter((e) => e.includes('onInvalidate'));
   assert.deepEqual(errors, [], `valid named handler must produce no onInvalidate error; errors: ${errors.join('; ')}`);
@@ -1172,7 +1172,7 @@ test('D-D: buildDef with valid named-handler passes (no throw)', () => {
     buildDef({
       name: 'test',
       inputs: [{ name: 'x' }],
-      loops: [
+      steps: [
         { name: 'worker', consumes: ['x'], produces: ['out'], effect: { onInvalidate: 'handler' } },
         { name: 'handler', consumes: ['out'], produces: ['done'] },
       ],
@@ -1182,64 +1182,64 @@ test('D-D: buildDef with valid named-handler passes (no throw)', () => {
 
 // ---- M2-GRAMMAR: calls: parsing + validation + cycle tests -------------------
 
-test('parseDef: calls: loop sets calls and callsInputs fields', () => {
+test('parseDef: calls: step sets calls and callsInputs fields', () => {
   const d = parseDef({
     name: 'parent',
     inputs: [{ name: 'proposal' }],
-    loops: [
+    steps: [
       { name: 'deliver', calls: 'delivery', inputs: { proposal: 'proposal' }, produces: ['delivered'] },
       { name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true },
     ],
   });
-  const deliverLoop = d.loops.find((l) => l.name === 'deliver');
-  assert.ok(deliverLoop !== undefined, 'deliver loop must exist');
-  assert.equal(deliverLoop.calls, 'delivery');
-  assert.deepEqual(deliverLoop.callsInputs, { proposal: 'proposal' });
-  assert.equal(deliverLoop.body, '', 'calls: loop must have empty body');
-  assert.equal(deliverLoop.produces.length, 1, 'calls: loop must produce exactly one artifact');
-  assert.equal(deliverLoop.produces[0]!.stem, 'delivered');
-  assert.deepEqual(deliverLoop.consumes, [], 'calls: loop must have no consumes');
+  const deliverStep = d.steps.find((l) => l.name === 'deliver');
+  assert.ok(deliverStep !== undefined, 'deliver step must exist');
+  assert.equal(deliverStep.calls, 'delivery');
+  assert.deepEqual(deliverStep.callsInputs, { proposal: 'proposal' });
+  assert.equal(deliverStep.body, '', 'calls: step must have empty body');
+  assert.equal(deliverStep.produces.length, 1, 'calls: step must produce exactly one artifact');
+  assert.equal(deliverStep.produces[0]!.stem, 'delivered');
+  assert.deepEqual(deliverStep.consumes, [], 'calls: step must have no consumes');
 });
 
-test('validateDef: calls: loop must produce exactly one output — zero outputs errors', () => {
+test('validateDef: calls: step must produce exactly one output — zero outputs errors', () => {
   const d = buildDef({
     name: 'parent',
     inputs: [{ name: 'proposal' }],
-    loops: [
-      // calls: loop with zero produces — should be caught by validateDef
-      // We bypass buildLoop by using a hack: we build a def with a calls: loop then remove produces
+    steps: [
+      // calls: step with zero produces — should be caught by validateDef
+      // We bypass buildStep by using a hack: we build a def with a calls: step then remove produces
       { name: 'deliver', calls: 'delivery', inputs: {}, produces: ['delivered'] },
       { name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true },
     ],
   });
   // Manually zero out the produces to trigger the error
-  const deliverLoop = d.loops.find((l) => l.name === 'deliver')!;
-  deliverLoop.produces = [];
+  const deliverStep = d.steps.find((l) => l.name === 'deliver')!;
+  deliverStep.produces = [];
   const errors = validateDef(d);
   assert.ok(errors.some((e) => e.includes('exactly one output')), `Expected 'exactly one output' error; got: ${errors.join('; ')}`);
 });
 
-test('validateDef: calls: loop must produce exactly one output — two outputs errors', () => {
+test('validateDef: calls: step must produce exactly one output — two outputs errors', () => {
   const d = buildDef({
     name: 'parent',
     inputs: [{ name: 'proposal' }],
-    loops: [
+    steps: [
       { name: 'deliver', calls: 'delivery', inputs: {}, produces: ['delivered'] },
       { name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true },
     ],
   });
-  const deliverLoop = d.loops.find((l) => l.name === 'deliver')!;
+  const deliverStep = d.steps.find((l) => l.name === 'deliver')!;
   // Inject a second produce manually
-  deliverLoop.produces = [deliverLoop.produces[0]!, parseProduce('extra')];
+  deliverStep.produces = [deliverStep.produces[0]!, parseProduce('extra')];
   const errors = validateDef(d);
   assert.ok(errors.some((e) => e.includes('exactly one output')), `Expected 'exactly one output' error; got: ${errors.join('; ')}`);
 });
 
-test('validateDef: calls: loop callsInputs value must be a real parent artifact', () => {
+test('validateDef: calls: step callsInputs value must be a real parent artifact', () => {
   const d = buildDef({
     name: 'parent',
     inputs: [{ name: 'proposal' }],
-    loops: [
+    steps: [
       { name: 'deliver', calls: 'delivery', inputs: { proposal: 'nonexistent_artifact' }, produces: ['delivered'] },
       { name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true },
     ],
@@ -1261,7 +1261,7 @@ test('loadDefs: calls target must exist in resolver namespace', () => {
         'inputs:',
         '  - name: proposal',
         '    seedOwed: true',
-        'loops:',
+        'steps:',
         '  - name: deliver',
         '    calls: does-not-exist',
         '    produces: [delivered]',
@@ -1295,7 +1295,7 @@ test('loadDefs: calls: inputs key must be a declared child input', () => {
       join(dir, 'child.yaml'),
       [
         'name: child',
-        'loops:',
+        'steps:',
         '  - name: worker',
         '    produces: [result]',
         '    body: do work',
@@ -1309,7 +1309,7 @@ test('loadDefs: calls: inputs key must be a declared child input', () => {
         'inputs:',
         '  - name: proposal',
         '    seedOwed: true',
-        'loops:',
+        'steps:',
         '  - name: deliver',
         '    calls: child',
         '    inputs:',
@@ -1345,7 +1345,7 @@ test('detectCallsCycles: A calls B calls A errors with cycle message', () => {
       [
         'name: a',
         'outputs: [result]',
-        'loops:',
+        'steps:',
         '  - name: delegate',
         '    calls: b',
         '    produces: [result]',
@@ -1356,7 +1356,7 @@ test('detectCallsCycles: A calls B calls A errors with cycle message', () => {
       [
         'name: b',
         'outputs: [result]',
-        'loops:',
+        'steps:',
         '  - name: delegate',
         '    calls: a',
         '    produces: [result]',
@@ -1386,7 +1386,7 @@ test('detectCallsCycles: A calls B (acyclic) passes without error', () => {
       [
         'name: b',
         'outputs: [result]',
-        'loops:',
+        'steps:',
         '  - name: worker',
         '    produces: [result]',
         '    body: do work',
@@ -1396,7 +1396,7 @@ test('detectCallsCycles: A calls B (acyclic) passes without error', () => {
       join(dir, 'a.yaml'),
       [
         'name: a',
-        'loops:',
+        'steps:',
         '  - name: delegate',
         '    calls: b',
         '    produces: [delegated]',
@@ -1419,11 +1419,11 @@ test('include cycle and calls cycle are detected independently', () => {
   try {
     writeFileSync(
       join(callsDir, 'a.yaml'),
-      ['name: a', 'outputs: [r]', 'loops:', '  - name: d', '    calls: b', '    produces: [r]'].join('\n'),
+      ['name: a', 'outputs: [r]', 'steps:', '  - name: d', '    calls: b', '    produces: [r]'].join('\n'),
     );
     writeFileSync(
       join(callsDir, 'b.yaml'),
-      ['name: b', 'outputs: [r]', 'loops:', '  - name: d', '    calls: a', '    produces: [r]'].join('\n'),
+      ['name: b', 'outputs: [r]', 'steps:', '  - name: d', '    calls: a', '    produces: [r]'].join('\n'),
     );
     let callsCycleErr: Error | undefined;
     try { loadDefs(callsDir); } catch (e) { callsCycleErr = e as Error; }
@@ -1439,11 +1439,11 @@ test('include cycle and calls cycle are detected independently', () => {
   try {
     writeFileSync(
       join(includeDir, 'a.yaml'),
-      ['name: a', 'loops:', '  - include: b', '    as: bpart'].join('\n'),
+      ['name: a', 'steps:', '  - include: b', '    as: bpart'].join('\n'),
     );
     writeFileSync(
       join(includeDir, 'b.yaml'),
-      ['name: b', 'loops:', '  - include: a', '    as: apart'].join('\n'),
+      ['name: b', 'steps:', '  - include: a', '    as: apart'].join('\n'),
     );
     let includeCycleErr: Error | undefined;
     try { loadDefs(includeDir); } catch (e) { includeCycleErr = e as Error; }
@@ -1461,8 +1461,8 @@ test('loadDefs end-to-end on examples/workflows yields provisioned-delivery and 
   assert.ok(defs.has('delivery'), 'delivery must be in the loaded defs');
   assert.ok(defs.has('provisioned-delivery'), 'provisioned-delivery must be in the loaded defs');
   const pd = defs.get('provisioned-delivery')!;
-  const deliverLoop = pd.loops.find((l) => l.name === 'deliver');
-  assert.ok(deliverLoop !== undefined, 'provisioned-delivery must have a deliver loop');
-  assert.equal(deliverLoop.calls, 'delivery', 'deliver loop must call delivery');
-  assert.deepEqual(deliverLoop.callsInputs, { proposal: 'proposal' });
+  const deliverStep = pd.steps.find((l) => l.name === 'deliver');
+  assert.ok(deliverStep !== undefined, 'provisioned-delivery must have a deliver step');
+  assert.equal(deliverStep.calls, 'delivery', 'deliver step must call delivery');
+  assert.deepEqual(deliverStep.callsInputs, { proposal: 'proposal' });
 });

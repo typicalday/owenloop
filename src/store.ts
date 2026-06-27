@@ -43,7 +43,7 @@ export interface RunRow extends RunData {
 export interface WorkflowRow extends WorkflowData {
   id: string;
   createdAt: number;
-  /** Mode 2 foundation: parent workflow coordinate for a child instance spawned by a calls: loop. */
+  /** Mode 2 foundation: parent workflow coordinate for a child instance spawned by a calls: step. */
   producedBy?: { parentWf: string; parentPath: string };
 }
 
@@ -52,8 +52,8 @@ export interface WorkflowRow extends WorkflowData {
 export function artifactId(workflow: string, path: string): string {
   return detId('art', workflow, path);
 }
-export function taskId(workflow: string, loop: string, key: string): string {
-  return detId('task', workflow, loop, key);
+export function taskId(workflow: string, step: string, key: string): string {
+  return detId('task', workflow, step, key);
 }
 
 // ---- schema ------------------------------------------------------------------
@@ -90,7 +90,7 @@ CREATE INDEX IF NOT EXISTS artifact_wf_accept ON artifact (workflow, acceptance)
 CREATE TABLE IF NOT EXISTS task (
   id          TEXT PRIMARY KEY,
   workflow    TEXT NOT NULL,
-  loop        TEXT NOT NULL,
+  step        TEXT NOT NULL,
   key         TEXT NOT NULL,
   status      TEXT NOT NULL DEFAULT 'idle',
   run         TEXT,
@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS task (
   alarm_at    INTEGER,
   heartbeat_at INTEGER,
   updated_at  INTEGER NOT NULL,
-  UNIQUE (workflow, loop, key)
+  UNIQUE (workflow, step, key)
 );
 CREATE INDEX IF NOT EXISTS task_wf ON task (workflow);
 CREATE INDEX IF NOT EXISTS task_claimed ON task (status, claimed_at);
@@ -107,7 +107,7 @@ CREATE INDEX IF NOT EXISTS task_claimed ON task (status, claimed_at);
 CREATE TABLE IF NOT EXISTS run (
   id          TEXT PRIMARY KEY,
   workflow    TEXT NOT NULL,
-  loop        TEXT NOT NULL,
+  step        TEXT NOT NULL,
   key         TEXT NOT NULL DEFAULT '',
   outcome     TEXT,
   summary     TEXT,
@@ -117,10 +117,10 @@ CREATE TABLE IF NOT EXISTS run (
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS run_wf_loop ON run (workflow, loop, created_at);
+CREATE INDEX IF NOT EXISTS run_wf_step ON run (workflow, step, created_at);
 -- recentFailedRuns filters by key too; this index lets it walk the trailing
--- runs of one loop+key in order without scanning the whole loop's history.
-CREATE INDEX IF NOT EXISTS run_wf_loop_key ON run (workflow, loop, key, created_at);
+-- runs of one step+key in order without scanning the whole step's history.
+CREATE INDEX IF NOT EXISTS run_wf_step_key ON run (workflow, step, key, created_at);
 
 CREATE TABLE IF NOT EXISTS meta (
   k TEXT PRIMARY KEY,
@@ -182,7 +182,7 @@ function mapArtifact(r: ArtifactRowRaw): ArtifactRow {
 interface TaskRowRaw {
   id: string;
   workflow: string;
-  loop: string;
+  step: string;
   key: string;
   status: string;
   run: string | null;
@@ -197,7 +197,7 @@ function mapTask(r: TaskRowRaw): TaskRow {
   const out: TaskRow = {
     id: r.id,
     workflow: r.workflow,
-    loop: r.loop,
+    step: r.step,
     key: r.key,
     status: r.status as TaskData['status'],
     attempts: r.attempts,
@@ -213,7 +213,7 @@ function mapTask(r: TaskRowRaw): TaskRow {
 interface RunRowRaw {
   id: string;
   workflow: string;
-  loop: string;
+  step: string;
   key: string;
   outcome: string | null;
   summary: string | null;
@@ -228,7 +228,7 @@ function mapRun(r: RunRowRaw): RunRow {
   const out: RunRow = {
     id: r.id,
     workflow: r.workflow,
-    loop: r.loop,
+    step: r.step,
     key: r.key,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
@@ -277,6 +277,7 @@ export class Store {
     this.db.exec('PRAGMA busy_timeout = 5000');
     this.db.exec('PRAGMA foreign_keys = ON');
     this.db.exec('PRAGMA synchronous = NORMAL');
+    this.premigrate();
     this.db.exec(SCHEMA);
     this.migrate();
     const cur = this.getMeta('schema_version');
@@ -285,6 +286,39 @@ export class Store {
 
   close(): void {
     this.db.close();
+  }
+
+  /**
+   * Pre-schema migration: rename the legacy `loop` column to `step` on an
+   * existing database BEFORE `exec(SCHEMA)` runs, because the schema's
+   * `run_wf_step` index references the renamed column and would fail against an
+   * old table still spelling it `loop`. SQLite's `RENAME COLUMN` also rewrites
+   * the table's own `UNIQUE (workflow, loop, key)` constraint to reference
+   * `step`. No-op on a fresh database (the tables don't exist yet) and
+   * idempotent on an already-migrated one. Terminology: a workflow node is a
+   * "step", not a "loop".
+   */
+  private premigrate(): void {
+    const tableExists = (name: string): boolean =>
+      this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name) !== undefined;
+    const columns = (table: string): string[] =>
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name);
+
+    if (tableExists('task')) {
+      const cols = columns('task');
+      if (cols.includes('loop') && !cols.includes('step')) {
+        this.db.exec(`ALTER TABLE task RENAME COLUMN loop TO step`);
+      }
+    }
+    if (tableExists('run')) {
+      const cols = columns('run');
+      if (cols.includes('loop') && !cols.includes('step')) {
+        this.db.exec(`ALTER TABLE run RENAME COLUMN loop TO step`);
+      }
+      // Legacy-named indexes; the schema recreates them as run_wf_step / run_wf_step_key.
+      this.db.exec(`DROP INDEX IF EXISTS run_wf_loop`);
+      this.db.exec(`DROP INDEX IF EXISTS run_wf_loop_key`);
+    }
   }
 
   /**
@@ -394,7 +428,7 @@ export class Store {
   }
 
   /**
-   * M2-LINK reverse-lookup: find the child workflow instance spawned by a calls: loop.
+   * M2-LINK reverse-lookup: find the child workflow instance spawned by a calls: step.
    * Used by PR5b re-attach guard (never-duplicate). Returns undefined when no match.
    */
   findChildByParent(parentWf: string, parentPath: string): WorkflowRow | undefined {
@@ -483,8 +517,8 @@ export class Store {
 
   // -- task --------------------------------------------------------------------
 
-  getTask(workflow: string, loop: string, key: string): TaskRow | undefined {
-    const r = this.db.prepare('SELECT * FROM task WHERE id = ?').get(taskId(workflow, loop, key)) as
+  getTask(workflow: string, step: string, key: string): TaskRow | undefined {
+    const r = this.db.prepare('SELECT * FROM task WHERE id = ?').get(taskId(workflow, step, key)) as
       | TaskRowRaw
       | undefined;
     return r ? mapTask(r) : undefined;
@@ -492,7 +526,7 @@ export class Store {
 
   listTasks(workflow: string): TaskRow[] {
     const rows = this.db
-      .prepare('SELECT * FROM task WHERE workflow = ? ORDER BY loop, key')
+      .prepare('SELECT * FROM task WHERE workflow = ? ORDER BY step, key')
       .all(workflow) as unknown as TaskRowRaw[];
     return rows.map(mapTask);
   }
@@ -505,12 +539,12 @@ export class Store {
   }
 
   putTask(data: TaskData): TaskRow {
-    const id = taskId(data.workflow, data.loop, data.key);
+    const id = taskId(data.workflow, data.step, data.key);
     const at = nowMs();
     this.db
       .prepare(
-        `INSERT INTO task (id, workflow, loop, key, status, run, claimed_at, attempts, alarm_at, heartbeat_at, updated_at)
-         VALUES (@id, @workflow, @loop, @key, @status, @run, @claimed_at, @attempts, @alarm_at, @heartbeat_at, @updated_at)
+        `INSERT INTO task (id, workflow, step, key, status, run, claimed_at, attempts, alarm_at, heartbeat_at, updated_at)
+         VALUES (@id, @workflow, @step, @key, @status, @run, @claimed_at, @attempts, @alarm_at, @heartbeat_at, @updated_at)
          ON CONFLICT(id) DO UPDATE SET
            status = excluded.status,
            run = excluded.run,
@@ -523,7 +557,7 @@ export class Store {
       .run({
         id,
         workflow: data.workflow,
-        loop: data.loop,
+        step: data.step,
         key: data.key,
         status: data.status,
         run: data.run ?? null,
@@ -533,38 +567,38 @@ export class Store {
         heartbeat_at: data.heartbeatAt ?? null,
         updated_at: at,
       });
-    return this.getTask(data.workflow, data.loop, data.key) as TaskRow;
+    return this.getTask(data.workflow, data.step, data.key) as TaskRow;
   }
 
-  /** Read the stored alarm_at for (workflow, loop), or undefined if not set. */
-  getAlarm(workflow: string, loop: string): number | undefined {
-    const t = this.getTask(workflow, loop, '');
+  /** Read the stored alarm_at for (workflow, step), or undefined if not set. */
+  getAlarm(workflow: string, step: string): number | undefined {
+    const t = this.getTask(workflow, step, '');
     return t?.alarmAt;
   }
 
-  /** Persist an absolute alarm time for an idle evaluator loop. */
-  setAlarm(workflow: string, loop: string, at: number): void {
-    const id = taskId(workflow, loop, '');
-    const existing = this.getTask(workflow, loop, '');
+  /** Persist an absolute alarm time for an idle evaluator step. */
+  setAlarm(workflow: string, step: string, at: number): void {
+    const id = taskId(workflow, step, '');
+    const existing = this.getTask(workflow, step, '');
     if (existing) {
       this.db.prepare('UPDATE task SET alarm_at = ?, updated_at = ? WHERE id = ?')
         .run(at, nowMs(), id);
     } else {
-      // Rare: evaluator loop has never been ticked. Insert a minimal idle row.
-      this.putTask({ workflow, loop, key: '', status: 'idle', attempts: 0, alarmAt: at });
+      // Rare: evaluator step has never been ticked. Insert a minimal idle row.
+      this.putTask({ workflow, step, key: '', status: 'idle', attempts: 0, alarmAt: at });
     }
   }
 
   /** Clear the alarm (set alarm_at = NULL). */
-  clearAlarm(workflow: string, loop: string): void {
-    const id = taskId(workflow, loop, '');
+  clearAlarm(workflow: string, step: string): void {
+    const id = taskId(workflow, step, '');
     this.db.prepare('UPDATE task SET alarm_at = NULL, updated_at = ? WHERE id = ?')
       .run(nowMs(), id);
   }
 
   /** Update only heartbeat_at on the task row — targeted write, no read-modify-write. */
-  touchHeartbeat(workflow: string, loop: string, key: string, now: number): void {
-    const id = taskId(workflow, loop, key);
+  touchHeartbeat(workflow: string, step: string, key: string, now: number): void {
+    const id = taskId(workflow, step, key);
     this.db.prepare(
       'UPDATE task SET heartbeat_at = ?, updated_at = ? WHERE id = ?'
     ).run(now, nowMs(), id);
@@ -586,10 +620,10 @@ export class Store {
   insertRun(id: string, data: RunData, at: number = nowMs()): RunRow {
     this.db
       .prepare(
-        `INSERT INTO run (id, workflow, loop, key, outcome, summary, session_id, fingerprint, cause, created_at, updated_at)
+        `INSERT INTO run (id, workflow, step, key, outcome, summary, session_id, fingerprint, cause, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, data.workflow, data.loop, data.key ?? '', data.outcome ?? null, data.summary ?? null,
+      .run(id, data.workflow, data.step, data.key ?? '', data.outcome ?? null, data.summary ?? null,
         data.sessionId ?? null, toJson(data.fingerprint), data.cause ?? null, at, at);
     return this.getRun(id) as RunRow;
   }
@@ -599,7 +633,7 @@ export class Store {
     if (!cur) throw new Error(`run not found: ${id}`);
     const merged: RunData = {
       workflow: cur.workflow,
-      loop: cur.loop,
+      step: cur.step,
       key: patch.key ?? cur.key,
       outcome: patch.outcome ?? cur.outcome,
       summary: patch.summary ?? cur.summary,
@@ -621,36 +655,36 @@ export class Store {
     return r ? mapRun(r) : undefined;
   }
 
-  /** How many runs of this loop since `sinceMs` (for the daily budget window). */
-  countRuns(workflow: string, loop: string, sinceMs: number): number {
+  /** How many runs of this step since `sinceMs` (for the daily budget window). */
+  countRuns(workflow: string, step: string, sinceMs: number): number {
     const row = this.db
-      .prepare('SELECT COUNT(*) AS n FROM run WHERE workflow = ? AND loop = ? AND created_at >= ?')
-      .get(workflow, loop, sinceMs) as { n: number };
+      .prepare('SELECT COUNT(*) AS n FROM run WHERE workflow = ? AND step = ? AND created_at >= ?')
+      .get(workflow, step, sinceMs) as { n: number };
     return row.n;
   }
 
-  /** The most recent run of this loop, if any (for cadence gating). */
-  latestRun(workflow: string, loop: string): RunRow | undefined {
+  /** The most recent run of this step, if any (for cadence gating). */
+  latestRun(workflow: string, step: string): RunRow | undefined {
     const r = this.db
-      .prepare('SELECT * FROM run WHERE workflow = ? AND loop = ? ORDER BY created_at DESC LIMIT 1')
-      .get(workflow, loop) as RunRowRaw | undefined;
+      .prepare('SELECT * FROM run WHERE workflow = ? AND step = ? ORDER BY created_at DESC LIMIT 1')
+      .get(workflow, step) as RunRowRaw | undefined;
     return r ? mapRun(r) : undefined;
   }
 
   /**
-   * Count of consecutive trailing `failed` runs for this loop+key — the
-   * crash-loop signal. Any closed run that is NOT `failed` (ok/no_work/skipped)
+   * Count of consecutive trailing `failed` runs for this step+key — the
+   * crash-step signal. Any closed run that is NOT `failed` (ok/no_work/skipped)
    * breaks the streak; still-open runs (outcome NULL) are ignored.
    */
-  recentFailedRuns(workflow: string, loop: string, key: string = ''): number {
+  recentFailedRuns(workflow: string, step: string, key: string = ''): number {
     const rows = this.db
       .prepare(
         // rowid DESC is the tiebreaker: two runs closed in the same millisecond
         // (or a clock that didn't advance) must still order by insertion, or a
         // trailing failed→ok pair could read in the wrong order and miscount.
-        'SELECT outcome FROM run WHERE workflow = ? AND loop = ? AND key = ? AND outcome IS NOT NULL ORDER BY created_at DESC, rowid DESC',
+        'SELECT outcome FROM run WHERE workflow = ? AND step = ? AND key = ? AND outcome IS NOT NULL ORDER BY created_at DESC, rowid DESC',
       )
-      .all(workflow, loop, key) as Array<{ outcome: string }>;
+      .all(workflow, step, key) as Array<{ outcome: string }>;
     let n = 0;
     for (const r of rows) {
       if (r.outcome === 'failed') n++;
@@ -662,7 +696,7 @@ export class Store {
   /**
    * All runs for a workflow instance, ordered by created_at then rowid for a
    * stable insertion-order tiebreak (consistent with recentFailedRuns and the
-   * run_wf_loop index). The rowid tiebreak matters in test environments where
+   * run_wf_step index). The rowid tiebreak matters in test environments where
    * nowMs() may not advance between successive insertions.
    */
   listRuns(workflow: string): RunRow[] {

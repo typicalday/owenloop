@@ -3,180 +3,145 @@
 [![CI](https://github.com/typicalday/owenloop/actions/workflows/ci.yml/badge.svg)](https://github.com/typicalday/owenloop/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-> **Owen keeps the books.** A debt-driven dataflow engine that runs a graph of
-> work by tracking what's *owed*, not what's *done* — and, unlike a bare agent
-> loop, knows when to stop.
+**owenloop runs multi-step agent workflows.** You describe a pipeline of steps in
+a YAML file — usually one AI agent per step — and owenloop works out what's ready
+to run, hands you one job at a time, and keeps the whole pipeline honest as things
+change. It's the memory and the coordination between agent runs; you bring the
+agents.
 
-A generic **dataflow workflow engine**. Steps don't carry a status you flip to
-*running* or *done* — they carry **debts**. A step becomes eligible the moment
-two things are true at once: it *owes* an output, and everything it consumes is
-`green` (accepted). That's the entire scheduler — there is no status column
-anywhere. The framing is **pay-when-paid**: you can only pay what you owe once
-what's owed *to you* has been paid, and that rule runs recursively down the
-graph. Change something upstream and everything built on it silently falls back
-to a debt — no orchestration code, no manual invalidation. Knock-backs,
-fan-out/fan-in, and "keep everything downstream honest" all fall out of that one
-rule instead of being special-cased.
-
-Think of the engine as a **foreman who manages by exception** — his name is
-Owen. You declare the wiring and walk away: Owen pulls work just-in-time, keeps
-the whole graph honest against its live inputs, remembers *why* a step failed
-last time, and only taps you on the shoulder when a step has genuinely failed
-too many times.
-
-### Ralph does the reps. Owen keeps score.
-
-If you've run a coding agent in a `while true` loop — the [Ralph
-technique](https://ghuntley.com/ralph/) — you know the trade: it's gloriously
-persistent, but it leans on a TODO file and git for memory and doesn't really
-know *when it's done* or *why the last pass fell short*. **owenloop is the layer
-Ralph is missing.** They aren't rivals — they're two halves of one machine, one
-wrapped inside the other:
-
-```
-   ┌─► RALPH ── the outer driver loop (the muscle): keep ticking, never stop
-   │      │
-   │      │     OWEN ── the engine (the memory + the brakes)
-   │      │       • what's owed?      • is every input green?
-   │      │       • what failed last pass, and why?
-   │      │       • is the graph done — or stalled, needing a human?
-   │      │            │
-   │      │            ▼  hands out an order
-   │      └─►  your worker / agent does the work ──► green / reject
-   │                                                      │
-   └──────────────────  Ralph ticks again  ◄─────────────┘
-```
-
-Ralph supplies **persistence** — unlimited retries, a fresh context each pass.
-Owen supplies **judgment and termination** — a typed debt graph that knows what
-each step owes, carries the reasons a step was rejected, invalidates downstream
-work the moment an input moves, and *stops re-arming a step that has failed too
-many times*. Ralph alone diverges; wrap Owen inside it and the loop converges.
-Owen doesn't run the work or replace your agent — the agent is still Ralph's
-payload. Owen is the state and the brakes between ticks.
-
-The engine is **domain-neutral**. It doesn't know what a "PR" or a "source" or a
-"report" is. A concrete process — software delivery, research synthesis, triage
-— is just a *wiring*: a set of workflow definitions (YAML) plus a worker that
-executes the orders the engine hands out. The `owenloop` CLI is the seam between
-the two: it speaks JSON on stdout so any worker can drive it.
-
-```
-                 wiring (YAML defs + a worker)
-   ────────────────────────────────────────────────────────
-   owenloop CLI   ──tick──►  orders  ──run──►  green / reject
-   ────────────────────────────────────────────────────────
-                 engine (debt model + forward cascade + CAS)
-                 store  (better-sqlite3, WAL + commit CAS)
-```
-
----
-
-## The idea in one minute
-
-A workflow is a graph of **loops** (steps) connected by the **artifacts** they
-`consumes` and `produces`:
+It was built for AI agent workflows — a planner agent writes a plan, a builder
+agent turns it into a PR, a reviewer agent checks it, a merger ships it — but the
+engine doesn't know what a "PR" or a "plan" is. Any multi-step process where steps
+depend on each other fits: research pipelines, data processing, document review,
+triage.
 
 ```yaml
-loops:
+# delivery.yaml — a four-step agent pipeline
+steps:
   - name: planner
     consumes: [proposal]
     produces: [plan]
   - name: builder
     consumes: [plan]
     produces: [pr]
+  - name: reviewer
+    consumes: [pr]
+    produces: [verdict]
+  - name: merger
+    consumes: [verdict]
+    produces: [merge]
+    terminal: true
 ```
 
-Every artifact sits in one of **five states**:
+---
 
-| state       | debt? | meaning                                                            |
-|-------------|:-----:|-------------------------------------------------------------------|
-| `owed`      |  yes  | declared but not built yet, or re-armed — the producer owes it     |
-| `green`     |  no   | accepted; satisfies everyone who depends on it                    |
-| `rejected`  |  yes  | built, then judged unfit (or structurally re-armed) — a debt       |
-| `retracted` |  no   | a consumer dropped a collection member; terminal, leaves the set   |
-| `skipped`   |  no   | a producer declined its own output on a dead branch                |
+## Why it exists
 
-A loop is **eligible** to fire when it owes a debt (an `owed`/`rejected` output)
-*and* every input it consumes is `green`. That's the whole scheduler. There is
-no "status" column anywhere — `status` is derived from artifact state on every
-read.
+Agents are good at doing one task. They're bad at the bookkeeping *around* a task:
+remembering what's already done, noticing when an earlier step's output changed,
+retrying the right number of times, and knowing when to stop. Wire a few agents
+together by hand and you end up writing a pile of glue — who runs next, what to
+re-run when something upstream moves, when to give up and ask a human.
 
-Three things make this more than a topological sort:
+owenloop is that glue, written once and tested hard. You declare the steps; it
+handles the three things that are tedious to get right:
 
-- **Forward cascade (level-triggered).** A green output is green *only while*
-  every input it was built from is still green and unmoved. Re-plan the `plan`
-  and the `pr`, its `verdict`, and the final `merge` all silently fall back to
-  debts — no orchestration code required.
-- **Reason threads.** A `reject` carries text. The next order for that artifact
-  shows the accumulated `reasons`, so the worker knows *why* it's being asked
-  again. Rejections come in three kinds: **judgment** (a consumer's verdict),
-  **validation** (a produced value failed the artifact's declared JSON Schema —
-  the engine's own refusal), and **structural** (engine bookkeeping from a
-  cascade). Judgment and validation rejects count against liveness on separate
-  counters; structural ones never do.
-- **Schema validation (§19).** An artifact may declare a `schema:` (full JSON
-  Schema draft 2020-12). A produced value is accepted only if it validates;
-  otherwise the commit is refused (**schema-rejected**) with the violations
-  attached, the value never greens, and the worker can correct it on the same
-  open run. Shape is the engine's business; *meaning* stays a consumer's
-  judgment.
-- **Stalls (liveness, §6/§19).** If an artifact is judgment-rejected more than
-  its loop's `maxAttempts` — or schema-rejected more than its `maxSchemaFailures`
-  — the engine **stops re-arming it**. It stays a debt but no longer produces
-  orders — the loop has demonstrably failed and a human is needed. `owenloop
-  retry` resets both counters (optionally with new guidance); `owenloop retract`
-  drops it (for collection members).
+- **What runs next.** A step is ready the moment everything it depends on is
+  accepted *and* it still owes an output. That's the whole scheduler — there's no
+  status field to flip, nothing to sequence by hand.
+- **What to re-run.** Change an early step's output and everything built on it
+  automatically falls back to "not done." No manual invalidation, no stale results
+  slipping through.
+- **When to stop.** If a step keeps getting rejected past its limit, owenloop stops
+  re-running it and flags it for a human — instead of looping forever burning
+  tokens.
 
-Collections add fan-out/fan-in:
+### The mental model: owed, not done
 
-- A loop can `produce` a **collection** (`gather.source[]`): it `emit`s an
-  unknown number of elements, then `seal`s it.
-- A **map** consume (`gather.source[$i]`) fires one run per element.
-- A **reduce** consume (`gather.source[*]`) fires once, eligible only when the
-  collection is sealed *and* every non-retracted member is green.
+owenloop doesn't track whether a step is "running" or "done." It tracks what each
+step **owes**. Every output is in one of five states:
+
+| state       | still owed? | meaning                                                          |
+|-------------|:-----------:|------------------------------------------------------------------|
+| `owed`      |     yes     | declared but not produced yet, or re-armed — the step owes it     |
+| `green`     |     no      | accepted; satisfies everything downstream that depends on it      |
+| `rejected`  |     yes     | produced, then judged unfit (or knocked back by a change) — a debt |
+| `retracted` |     no      | a member dropped from a collection; gone for good                 |
+| `skipped`   |     no      | a step declined its own output on a dead branch                   |
+
+A step is **eligible to run** when it owes a debt (an `owed` or `rejected` output)
+and every input it consumes is `green`. Status is never stored — it's computed from
+these states on every read, so it can't drift out of sync.
+
+Three things make this more than running steps in dependency order:
+
+- **Outputs stay honest as inputs move.** A green output counts as done *only while*
+  the inputs it was built from are still green and unchanged. Re-run the `plan` and
+  the `pr`, its `verdict`, and the final `merge` all quietly fall back to debts — no
+  code required to invalidate them.
+- **Rejections carry reasons.** When a reviewer rejects a PR, the text rides along.
+  The next job for the builder shows *why* it's being asked again, so the agent has
+  the feedback in hand. (Three flavors: a reviewer's **judgment**, the engine's own
+  **schema** refusal of a malformed value, and **structural** knock-backs from a
+  change cascading downstream.)
+- **It knows when to give up.** If an output is rejected more times than its step's
+  `maxAttempts`, the engine stops re-arming it. It stays a debt but produces no more
+  jobs — the step has demonstrably failed and a human is needed. `owenloop retry`
+  resets the counter (optionally with new guidance).
+
+That's the core. Collections add fan-out/fan-in (a step emits N items, a `map` runs
+once per item, a `reduce` runs once they're all in) — see
+[`research`](examples/workflows/research.yaml).
+
+### Driving it with a loop
+
+owenloop never runs anything itself. It hands out jobs and waits to hear back —
+something has to tick it, run the work, and report the result. That something can be
+as simple as a `while` loop around an agent. The [Ralph
+technique](https://ghuntley.com/ralph/) — keep an agent ticking with a fresh context
+each pass — is exactly this kind of outer loop, and owenloop is the half it's
+missing: the persistent state and the brakes. The loop keeps going; owenloop
+remembers what's owed, what failed and why, and when the whole thing is actually
+done. They work side by side — the loop is the muscle, owenloop is the memory.
 
 ---
 
 ## Requirements
 
-- **Node ≥ 22.6** — owenloop runs TypeScript directly via Node's native type
-  stripping. There is no build step. (Developed on Node 25.)
-- Runtime deps: `better-sqlite3` (storage), `yaml` (defs), and
-  `@cfworker/json-schema` (artifact schema validation, §19) — all
-  zero- or low-transitive.
+- **Node ≥ 22.6.** owenloop runs TypeScript directly via Node's built-in type
+  stripping — there's no build step.
+- **No native dependencies.** Storage is Node's built-in `node:sqlite`, so there's
+  nothing to compile. The only runtime deps are `yaml` (parsing defs) and
+  `@cfworker/json-schema` (optional per-artifact schema validation).
 
 ```sh
-git clone <repo> owenloop && cd owenloop
+git clone https://github.com/typicalday/owenloop && cd owenloop
 npm install
 npm run check     # typecheck + full test suite
 ```
 
-Or consume it as a dependency — owenloop ships its TypeScript source (no build
-step), so the importing project just needs a Node ≥ 22.6 ESM host with
-type-stripping (on by default in 23.6+):
+Or use it as a dependency — owenloop ships its TypeScript source (no build step), so
+you just need a Node ≥ 22.6 ESM host:
 
 ```sh
 npm install owenloop
 ```
 
 ```ts
-import { createEngine } from 'owenloop';   // see "Programmatic / embedding" below
+import { createEngine } from 'owenloop';   // see "Embedding it" below
 ```
 
 ---
 
 ## Quick start
 
-The bundled examples live in [`examples/workflows`](examples/workflows), each
-demonstrating one idea: [`delivery`](examples/workflows/delivery.yaml)
-(knock-backs), [`research`](examples/workflows/research.yaml) (collections),
-[`routing`](examples/workflows/routing.yaml) (skip-cascade),
-[`intake`](examples/workflows/intake.yaml) (schema validation, §19), and
-[`sla-watchdog`](examples/workflows/sla-watchdog.yaml) (idle trigger, completion
-evaluator, alarm — §21). Point
-owenloop at them and drive one end to end. Every data command prints JSON, so the
-snippet below pipes through `jq`.
+The [`examples/workflows`](examples/workflows) folder has a workflow per idea:
+[`delivery`](examples/workflows/delivery.yaml) (a review knock-back loop),
+[`research`](examples/workflows/research.yaml) (collections),
+[`routing`](examples/workflows/routing.yaml) (skip a dead branch),
+[`intake`](examples/workflows/intake.yaml) (schema validation), and
+[`sla-watchdog`](examples/workflows/sla-watchdog.yaml) (idle timers and deadlines).
+Every command prints JSON, so the snippet below pipes through `jq`.
 
 ```sh
 export OWENLOOP_DEFS=examples/workflows
@@ -184,78 +149,79 @@ export OWENLOOP_DB=/tmp/owenloop-demo.db
 
 owenloop defs                                  # what workflows are available
 
-# start an instance; `proposal` is a seedOwed input so we provide it up front
+# start an instance; `proposal` is seeded as owed, so we provide it up front
 wf=$(owenloop create delivery \
        --provide proposal='{"text":"add dark mode"}' | jq -r .workflow)
 
-# the wiring/worker loop: tick → run → report
-run=$(owenloop tick $wf | jq -r '.orders[0].run')   # claim the `planner` order
-owenloop green  $wf $run plan --value '{"plan":"…"}' # report its output
+# the worker loop: tick → run → report
+run=$(owenloop tick $wf | jq -r '.orders[0].run')   # claim the planner job
+owenloop green $wf $run plan --value '{"plan":"…"}'  # report its output
 
-owenloop status $wf                            # debts / eligible / blocked / done
+owenloop status $wf                            # owed / eligible / blocked / done
 ```
 
-`owenloop` here is `node bin/owenloop.mjs` — either run that directly, use the
-`npm run owenloop --` script, or `npm link` to put `owenloop` on your PATH.
+`owenloop` here is `node bin/owenloop.mjs` — run that directly, use the `npm run
+owenloop --` script, or `npm link` to put `owenloop` on your PATH.
 
-A **knock-back**: when an order for `reviewer` comes up, instead of greening its
-`verdict` you can reject the PR —
+**A knock-back.** When the reviewer's job comes up, instead of greening its `verdict`
+you can reject the PR:
 
 ```sh
 owenloop reject $wf pr --by reviewer --text "tests are missing"
 ```
 
-— which re-arms `builder` with that reason attached to its next order's `owes`.
-Do it past `builder`'s `maxAttempts` and `pr` **stalls**; `owenloop retry $wf pr
---text "use the new fixture"` clears it.
+That re-arms `builder` with the reason attached to its next job. Do it past
+`builder`'s `maxAttempts` and `pr` **stalls** — owenloop stops re-arming it and waits
+for a human. `owenloop retry $wf pr --text "use the new fixture"` clears the stall and
+resets the counter.
 
-The [`research`](examples/workflows/research.yaml) example demonstrates the
-collection path (`emit` / `seal` / map / reduce / `retract`), and
-[`intake`](examples/workflows/intake.yaml) demonstrates **schema validation**
-(§19) — every artifact pins its shape, so a malformed `green`/`emit`/`provide`
-is refused at commit. Each example's header comment walks through the commands.
+Each example's header comment walks through its commands end to end.
 
 ---
 
 ## CLI reference
 
-Global: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) and
+Global flags: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) and
 `--defs <dir>` (env `OWENLOOP_DEFS`, default `./workflows`).
 
 | command | what it does |
 |---|---|
 | `defs` | list available workflow definitions |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
-| `provide <wf> <name> [--value json]` | supply a `seedOwed` input after the fact |
-| `tick <wf> [--now <ms>]` | claim and emit eligible **orders** (the work to run) |
+| `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
+| `tick <wf> [--now <ms>]` | claim and emit eligible **orders** (the jobs to run) |
 | `status <wf>` | derived view: `done`, `debts`, `eligible`, `blocked` |
 | `show <wf>` | dump raw artifacts (debugging) |
 | `list` | list instances |
 | `green <wf> <run> <path> [--value json] [--terminal]` | accept an owed output |
-| `emit <wf> <run> --items '[{…},{…}]'` | accrete collection elements |
+| `emit <wf> <run> --items '[{…},{…}]'` | add collection elements |
 | `seal <wf> <run> [--value json]` | mark a collection complete |
-| `reject <wf> <path> --by <author> --text <msg>` | judgment-reject (re-arms producer) |
+| `reject <wf> <path> --by <author> --text <msg>` | reject an output (re-arms its producer) |
 | `retract <wf> <path> --by <author> --text <msg>` | drop a collection member |
-| `skip <wf> <path> --by <author> --text <msg>` | producer declines its own output |
-| `retry <wf> <path> [--by a] [--text guidance]` | clear a §6 stall, reset the counter |
-| `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed run's lease |
+| `skip <wf> <path> --by <author> --text <msg>` | a step declines its own output |
+| `retry <wf> <path> [--by a] [--text guidance]` | clear a stall, reset the counter |
+| `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed job |
 | `delete <wf>` | delete an instance and all its rows |
 
-**Exit codes for `green` / `emit` / `seal`:** these verbs exit non-zero when the engine refuses the commit (`born-rejected` or `schema-rejected`). The result JSON is always written to stdout regardless of outcome; the human-readable reason goes to stderr. A success commit exits 0.
+**Exit codes for `green` / `emit` / `seal`:** these exit non-zero when the engine
+refuses the commit (the value was born-rejected or failed its schema). The result JSON
+is always written to stdout; the human-readable reason goes to stderr. A successful
+commit exits 0 — a worker should treat a non-zero exit as a failure, not a success.
 
-### The order shape (what a worker consumes)
+### What a job looks like
 
-`tick` returns `{ workflow, orders, reaped }`. Each order is self-contained:
+`tick` returns `{ workflow, orders, reaped }`. Each order is self-contained — a worker
+needs nothing else to do the work:
 
 ```jsonc
 {
-  "run": "r_…",            // lease id — pass back to green/emit/seal/close
-  "loop": "builder",
-  "key": "",               // map orders carry the element key + index
+  "run": "r_…",            // job id — pass it back to green/emit/seal/close
+  "step": "builder",       // which step this job is for
+  "key": "",               // map jobs carry the element key + index
   "inputs":  ["plan"],
   "outputs": ["pr"],
-  "prompt":  "…body with ${WORKFLOW}/${RUN}/${INDEX} substituted…",
-  "consumes": { "plan": { /* captured green handle */ } },
+  "prompt":  "…body with ${WORKFLOW}/${RUN}/${INDEX} filled in…",
+  "consumes": { "plan": { /* the accepted input value */ } },
   "owes": [                // the feedback channel
     { "path": "pr", "acceptance": "rejected", "judgmentRejects": 2, "schemaRejects": 0,
       "reasons": [ { "action": "reject", "kind": "judgment", "by": "reviewer",
@@ -264,69 +230,63 @@ Global: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) and
 }
 ```
 
-A worker reads `prompt` + `consumes` + `owes`, does the work, then reports the
-result with `green` (or `emit`/`seal` for collections), and finally `close`s the
-run. `owes[].judgmentRejects` (and `owes[].schemaRejects`, §19) let a wiring
-escalate (e.g. switch to a stronger
-model) before the engine stalls the artifact.
+A worker reads `prompt` + `consumes` + `owes`, does the work, reports with `green`
+(or `emit`/`seal` for collections), then `close`s the job. The reject counts in
+`owes[]` let a workflow escalate on its own — e.g. switch to a stronger model after
+two rejections — before the engine stalls the step.
 
 ---
 
-## Programmatic / embedding
+## Embedding it
 
-The CLI is a thin adapter — it maps `argv` to engine calls and prints JSON. The
-engine itself is an ordinary class, so you can drive it **in-process** and get
-the same lifecycle back as typed objects (`Order`, `CommitResult`,
-`WorkflowStatus`) instead of JSON on stdout — no subprocess, no parsing. The
-[`owenloop`](package.json) package's entry point exports everything you need.
-
-`createEngine` bundles the store + definition wiring into one call:
+The CLI is a thin adapter: it maps `argv` to engine calls and prints JSON. The engine
+is an ordinary class, so you can drive it **in-process** and get typed objects back
+(`Order`, `CommitResult`, `WorkflowStatus`) — no subprocess, no JSON parsing.
 
 ```ts
 import { createEngine } from 'owenloop';
 
 const { engine, store } = createEngine({
-  db: '.owenloop/state.db',          // or ':memory:' for an ephemeral instance
+  db: '.owenloop/state.db',         // or ':memory:' for an ephemeral instance
   defsDir: 'workflows',             // load YAML defs from a dir … or pass `defs: [myDef]`
 });
 
-// start an instance (proposal is a seedOwed input, so provide it up front)
+// start an instance (proposal is seeded as owed, so provide it up front)
 const wf = engine.createInstance('delivery', {
   provide: { proposal: { text: 'add dark mode' } },
 });
 
-// the wiring/worker loop: tick → run → report
+// the worker loop: tick → run → report
 const { orders } = engine.tick(wf);
 for (const order of orders) {
-  const result = await runYourWorker(order);            // ← your domain
+  const result = await runYourAgent(order);              // ← your domain
   engine.green(wf, order.run, order.outputs[0], result); // typed CommitResult back
   engine.close(wf, order.run);
 }
 
-engine.status(wf);   // a typed WorkflowStatus: done / debts / eligible / blocked
+engine.status(wf);   // typed WorkflowStatus: done / debts / eligible / blocked
 store.close();        // on shutdown
 ```
 
 Prefer to **react** instead of poll? `engine.subscribe(listener)` (or
-`createEngine({ onEvent })`) pushes a typed `EngineEvent` the instant a mutation
-commits — re-`tick` only when there's new eligible work, or resolve a promise
-when the workflow is `done`. See [`examples/events.ts`](examples/events.ts).
+`createEngine({ onEvent })`) pushes a typed event the instant a mutation commits — so
+you can re-`tick` only when there's new work, or resolve a promise when the workflow is
+`done`. See [`examples/events.ts`](examples/events.ts).
 
-The `engine`/`store` are meant to be long-lived (one per database). Concurrency
-is the store's: better-sqlite3 is synchronous and single-writer-per-process,
-with cross-process advancement made safe by the commit-fingerprint CAS — a good
-fit for an embedded control-plane. See [`docs/embedding.md`](docs/embedding.md)
-for the full surface, lifecycle, events, and trade-offs.
+The `engine`/`store` pair is meant to be long-lived (one per database). Concurrency is
+the store's job: `node:sqlite` is synchronous and single-writer-per-process, and
+cross-process safety comes from a commit fingerprint check (described under
+[Storage](#storage)). See [`docs/embedding.md`](docs/embedding.md) for the full
+surface, lifecycle, and trade-offs.
 
 ---
 
-## Workflow definition format
+## Writing a workflow
 
 A workflow is one self-contained YAML file under the `--defs` directory (either
-`name.yaml`, or `name/workflow.yaml`). It is parsed, type-checked, and
-**statically validated** before any instance is created — dangling consumes, two
-producers for one artifact, map/reduce shape mismatches, and dependency cycles
-are all caught up front.
+`name.yaml` or `name/workflow.yaml`). It's parsed, type-checked, and **validated**
+before any instance is created — dangling consumes, two producers for one artifact,
+map/reduce mismatches, and dependency cycles are all caught up front.
 
 ```yaml
 name: delivery                 # required; [a-z0-9][a-z0-9_-]*
@@ -337,95 +297,75 @@ inputs:                        # external artifacts, seeded when an instance sta
   - name: proposal
     seedOwed: true             # true → starts owed (must be `provide`d to unblock)
     producer: human            # optional label for who supplies it (default: human)
-    schema:                    # optional JSON Schema (2020-12); a `provide`d value
-      type: object             #   that violates it is refused (§19)
+    schema:                    # optional JSON Schema (2020-12); a provided value
+      type: object             #   that violates it is refused
       required: [text]
 
-outputs:               # optional; workflow-level public leaves / embedding interface
-  - summary            #   lint-exempt from dead-end warnings; must be produced by a loop;
-  - outcome            #   does NOT freeze re-arm (unlike terminal: true)
+outputs:               # optional; the workflow's public outputs (its interface when
+  - summary            #   embedded in another workflow). Exempt from dead-end lint
+  - outcome            #   warnings; must be produced by a step.
 
-loops:
+steps:
   - name: planner
     consumes: [proposal]       # plain | map (src[$i]) | reduce (src[*])
     produces:                  # singleton | collection (src[]) | map (src[$i].x)
-      - name: plan             # a produce may be a bare name, or {name, schema}:
-        schema:                #   a green/emit whose value fails this is refused (§19)
+      - name: plan             # a produce can be a bare name, or {name, schema}:
+        schema:                #   a green/emit whose value fails this is refused
           type: object
           required: [plan]
           properties: { plan: { type: string } }
-    body: |                    # prompt; ${WORKFLOW} ${RUN} ${INDEX} are substituted
+    body: |                    # the prompt; ${WORKFLOW} ${RUN} ${INDEX} are filled in
       Read the proposal and produce a `plan`.
 
-    generates:                 # optional; outputs this loop intentionally makes but
-      - audit_log              #   NO consumer is expected. Lint-exempt from dead-end
-      - report[]               #   warnings. Engine behavior identical to produces:.
+    generates:                 # optional; outputs this step makes that NO step
+      - audit_log              #   consumes. Exempt from dead-end lint; otherwise
+      - report[]               #   identical to produces:.
 
     # all optional, with defaults:
-    maxAttempts: 3             # judgment-reject cap before the output stalls (§6)
-    maxSchemaFailures: 5       # schema-reject cap before the output stalls (§19); 0 = off
+    maxAttempts: 3             # reject cap before the output stalls
+    maxSchemaFailures: 5       # schema-reject cap before the output stalls; 0 = off
     parallel: 1                # max concurrent runs (raise it to fan out a map)
-    terminal: false            # true → a green output is a destructive completion,
-                               #        never re-armed by the cascade (§15.2)
-    effect:                    # optional; loop-level effect contract (§20)
-      idempotent: true         #   true (default): safe to re-derive if inputs move → re-arms normally
-                               #   false: loop fires irreversible side effects; do not re-fire silently
-      onInvalidate: escalate   #   consulted only when idempotent: false
-                               #   'pin'      → keep green, re-point fingerprint (stays up-to-date)
-                               #   'escalate' → reject-and-hold; stall requires human intervention
-                               #   Named-handler strings are a planned follow-up (hard error today)
-    on: [inputsGreen]          # optional; firing trigger (§21). Values:
-                               #   'inputsGreen' (default) — fire when consumed inputs are green
-                               #   'allGreen'               — fire when workflow is done (completion evaluator)
-                               #   'idle'                   — fire when quiescent past idleAfter threshold (§21.8)
-                               #   Omit for classic inputsGreen behaviour; on:[] is a hard error.
-    idleAfter: 30m             # required when 'idle' is in on:; duration string (e.g. "30m", "2h")
-    invalidates: [plan]        # which input stems this loop may invalidate
-                               #   (default: its consumed stems)
+    terminal: false            # true → a green output is a final result, never
+                               #        re-armed by the cascade
+    effect:                    # optional; how to handle re-running side-effecting steps
+      idempotent: true         #   true (default): safe to re-derive if inputs move
+      onInvalidate: escalate   #   consulted only when idempotent: false (see below)
+    on: [inputsGreen]          # optional; firing trigger (see below)
+    idleAfter: 30m             # required when 'idle' is in on:
+    invalidates: [plan]        # which input stems this step may invalidate
     cadence: "0s"              # min spacing between runs (e.g. "30m")
     maxRunsPerDay: 1000
     model: …                   # opaque hint passed through on the order
     workdir: main              # opaque hint passed through on the order
 ```
 
-**Completion evaluator example:**
-
-```yaml
-- name: completion
-  on: [allGreen]           # firing trigger: fires when the workflow is done
-  generates: [outcome]     # evaluator's outcome — lint-exempt, public interface
-  body: |
-    # runs when the workflow is done; inspect and green outcome
-```
-
 ### `produces:` vs `generates:`
 
-A stem under `produces:` is expected to be consumed downstream; owenloop lint warns if it
-isn't. A stem under `generates:` is intentionally consumed by nothing (an audit log, an
-external artifact, or a dev-branch stub); lint leaves it alone. Generated artifacts are
-identical to produced ones in every other respect: schema-validated, fingerprinted,
-greenable, and visible in `status`/`show`/`trace`/`graph`.
+A stem under `produces:` is expected to be consumed downstream — owenloop's lint warns
+if nothing consumes it. A stem under `generates:` is deliberately consumed by nothing
+(an audit log, an external artifact, a stub); lint leaves it alone. Generated artifacts
+are otherwise identical: schema-validated, fingerprinted, greenable, and visible in
+`status`/`show`.
 
-### `outputs:` — the workflow interface
+### `outputs:` — the workflow's interface
 
-A top-level `outputs:` field declares which stems are this workflow's intentional public
-leaves — the artifacts a parent workflow will later consume when this one is embedded
-(`include:`/`calls:`, future feature). A stem listed in `outputs:` is exempt from
-dead-end warnings (a third exemption alongside `generates:` and `terminal: true`), but
-unlike `terminal:` it stays re-armable.
+Top-level `outputs:` declares which stems are the workflow's intentional public results
+— what a parent workflow consumes when this one is embedded. Listed stems are exempt
+from dead-end warnings, but unlike `terminal:` they stay re-armable.
 
 | key | level | lint-exempt | re-armable | meaning |
 |---|---|---|---|---|
-| `terminal: true` | loop | yes | **no** | destructive completion; never re-armed |
-| `generates:` | loop | yes | yes | internal intentional sink, not the public interface |
-| `outputs:` | workflow | yes | yes | public interface / future composition boundary |
+| `terminal: true` | step | yes | **no** | final result; never re-armed |
+| `generates:` | step | yes | yes | internal sink, not the public interface |
+| `outputs:` | workflow | yes | yes | public interface / composition boundary |
 
-Validation: every stem in `outputs:` must be produced by at least one loop (stems under
-`generates:` count, since they are unioned into `produces` at build time).
+### Composition — `include:` (compile-time) and `calls:` (runtime)
 
-### Workflow composition (Mode 1 — compile-time `include:`)
+Two ways to build a workflow out of other workflows:
 
-A loop-list entry may be an `include:` directive to splice another workflow's loops in at compile time (def-load time). This is pure `defs.ts` — zero engine change. The engine sees one expanded flat graph.
+**`include:` (Mode 1, compile-time)** splices another workflow's steps directly into
+the parent when the def is loaded. The engine sees one flat graph; child steps get an
+`as:` prefix.
 
 ```yaml
 name: full-cycle
@@ -434,81 +374,44 @@ inputs:
     seedOwed: true
 outputs:
   - torn_down
-loops:
+steps:
   - name: provision
     consumes: [proposal]
     produces: [environment]
-  - include: delivery           # splice delivery's loops in
+  - include: delivery           # splice delivery's steps in
     as: deliver                 # prefix: deliver.planner, deliver.plan, deliver.merge …
     inputs:
-      proposal: proposal        # map child's seedOwed input to outer 'proposal' artifact
+      proposal: proposal        # map the child's seeded input to the outer 'proposal'
   - name: teardown
-    consumes: [environment, deliver.merge]   # consume the inlined child artifact directly
+    consumes: [environment, deliver.merge]   # consume the inlined child output directly
     produces: [torn_down]
 ```
 
-After loading, the expanded def's loops are:
-`provision`, `deliver.planner`, `deliver.builder`, `deliver.reviewer`, `deliver.merger`, `teardown` — one flat instance, one cascade, one completion evaluator.
+After loading, the steps are `provision`, `deliver.planner`, `deliver.builder`,
+`deliver.reviewer`, `deliver.merger`, `teardown` — one flat instance. Use `include:`
+for brand-new combined workflows where nothing downstream expects the original step
+names.
 
-**Grammar rules:**
-- `as:` is required; must match `^[a-z][a-zA-Z0-9_-]*$`; must be unique across all includes in the same parent; must not equal any sibling loop name.
-- `inputs:` is optional; each key must be a real input of the child def.
-- `include:` must name a workflow present in the same def directory.
-
-**Semantics:**
-- **Mapped inputs** (`inputs: { childInput: outerArtifact }`) become internal consume edges — `outerArtifact` is an existing artifact in the parent (input or produce), checked by `validateDef`.
-- **Unmapped inputs** are hoisted as `${as}.${childInput}` outer inputs, preserving `seedOwed` and schema.
-- **Collection loops** in the child prefix correctly: `source[]` → `deliver.source[]`; seal and element paths follow from the prefixed stem.
-- **Nested includes** work recursively; cycles are a hard error.
-
-**Constraint:** Mode 1 inlines the child's namespace into the parent. Use it for **brand-new combined workflows** where no downstream tooling expects the old loop names. The existing `delivery` workflow's loops (`planner`, `builder`, `reviewer`, `merger`) become `deliver.planner` etc. — correct for a new `full-cycle` workflow, but would break `dev` tooling that expects the original names. For embedding an existing workflow as an encapsulated unit, use Mode 2 (`calls:`).
-
-### Workflow composition (Mode 2 — runtime `calls:`)
-
-Mode 2 is the **runtime** sibling of Mode 1. Instead of inlining a child workflow's loops at compile time, a `calls:` loop delegates to a **separate child workflow instance** at runtime. The calls: loop is machine-handled — it never emits a worker order.
-
-PR5b (this PR) delivers the full runtime behavior: spawn, cascade-up, outcome propagation, re-attach, and re-provide. The `provisioned-delivery` example is now drivable end-to-end.
+**`calls:` (Mode 2, runtime)** delegates to a **separate child instance** at runtime
+instead of inlining. The `calls:` step is machine-handled — it never emits a worker
+job. Use it to embed an existing workflow as a black box, keeping its internals hidden.
 
 ```yaml
-# delivery.yaml — the called workflow declares one public output
-name: delivery
-outputs: [merge]             # embedding interface: merge is the public outcome
-
-inputs:
-  - name: proposal
-    seedOwed: true
-
-loops:
-  - name: planner
-    consumes: [proposal]
-    produces: [plan]
-    # ...
-  - name: merger
-    consumes: [verdict]
-    produces: [merge]
-    terminal: true
-```
-
-```yaml
-# provisioned-delivery.yaml — the parent calls delivery
+# provisioned-delivery.yaml — the parent calls delivery as a child instance
 name: provisioned-delivery
-
 inputs:
   - name: proposal
     seedOwed: true
-
-loops:
+steps:
   - name: provision
     consumes: [proposal]
     produces: [sandbox]
     body: Provision environment.
-
   - name: deliver
-    calls: delivery          # child workflow name (must exist in the same def directory)
-    inputs:                  # child input name → parent artifact name (gate: sandbox green)
+    calls: delivery          # child workflow name (must exist in the same def dir)
+    inputs:                  # child input → parent artifact (gate: sandbox green)
       proposal: proposal
-    produces: [delivered]    # exactly one parent artifact; greens when delivery.merge greens
-
+    produces: [delivered]    # one parent artifact; greens when delivery's output greens
   - name: teardown
     consumes: [delivered]
     produces: [torn_down]
@@ -516,98 +419,46 @@ loops:
     body: Tear down and green `torn_down`.
 ```
 
-Runtime behavior (all engine-internal, zero event bus, zero new subsystem):
-1. **Spawn**: when gate inputs (parent artifacts in `inputs:`) are green, `maintainCalls` creates the child instance with `producedBy` and seeds its declared inputs.
-2. **Re-attach**: `findChildByParent(parentWf, callsPath)` — spawn is guarded; if a child already exists (crash/re-tick), it is re-attached rather than duplicated.
-3. **Cascade-up**: when the child's declared `outputs:` artifact greens, the engine machine-greens the parent's calls: artifact (no worker run, no CAS). Durability is via the persisted `producedBy` link — even without the prompt, the next parent tick reads the child outcome.
-4. **Re-provide**: if a mapped gate input moves to a new version/value, the engine re-provides it to the existing child (the child re-runs internally). No second child is spawned.
-5. **Failure branch**: a child that greens its outcome with `{status: 'failed'}` propagates that value up unchanged. Teardown fires on success or failure.
+The engine spawns the child when the gate inputs are green, greens the parent's
+`calls:` output when the child's declared output greens (no worker run), and re-provides
+inputs to the existing child if a gate input changes — it never spawns a duplicate.
 
-Grammar rules:
-- `calls:` names a workflow that exists in the same def directory (resolver namespace).
-- The called workflow must declare exactly one `outputs:` stem (v1 rule; validated at load time).
-- `inputs:` keys must be declared inputs of the child workflow; values must be real parent artifacts (inputs or loop produces).
-- `produces:` must declare exactly one artifact (the parent artifact the child outcome feeds).
-- A `calls:` loop has no `body:` — it is machine-handled, never a worker firing.
-- Cross-def `calls:` cycles are detected at load time and reported as `calls cycle: a -> b -> a`. This check is separate from the `include:` cycle guard.
-
-**Mode 1 vs Mode 2:**
-
-| | Mode 1 `include:` | Mode 2 `calls:` |
+| | `include:` (Mode 1) | `calls:` (Mode 2) |
 |---|---|---|
-| When | Compile-time (load time) | Runtime (per instance) |
-| Loops | Inlined with `as:` prefix | Run in a separate child instance |
+| When | Compile-time (load) | Runtime (per instance) |
+| Steps | Inlined with `as:` prefix | Run in a separate child instance |
 | Use for | New combined workflows | Embedding an existing workflow as a black box |
-| Output visibility | All child stems visible in parent namespace | Only the declared `produces:` artifact |
+| Visibility | All child stems visible in the parent | Only the declared `produces:` artifact |
 
-### `effect:` — the loop effect contract
+### `effect:` — re-running steps with side effects
 
-A loop may declare `effect: { idempotent?, onInvalidate? }` to control how the engine
-routes when the loop's green artifact's inputs move to a newer version (§20):
+By default a step is **idempotent** — safe to re-run if its inputs move, which is what
+the cascade does. But some steps fire irreversible side effects (a deploy, a publish, an
+external API write). For those, declare `effect: { idempotent: false, onInvalidate: … }`
+to tell the engine what to do when the inputs move instead of silently re-firing:
 
-- **`idempotent: true` (default)** — re-deriving the artifact is safe; the engine
-  re-arms it as a normal structural reject, exactly as today. Any loop without an `effect:`
-  field behaves as if `idempotent: true` were declared — no existing def or test is
-  affected.
-- **`idempotent: false`** — the loop fires an irreversible side effect (a deploy, a publish,
-  an external API mutation). The engine must not silently re-fire it when upstream inputs
-  move. `onInvalidate` specifies what happens instead:
-  - **`onInvalidate: 'pin'`** — the artifact stays green; its fingerprint is re-pointed to
-    the current input versions so the cascade sees it as up-to-date. The producer does not
-    re-fire. Use when stale-but-shipped is acceptable.
-  - **`onInvalidate: 'escalate'` (default when `idempotent: false`)** — the artifact is
-    rejected-and-held (`isHeld`). The producer does not auto-re-fire; the debt surfaces as
-    `stalled: true` with `kind: 'invalidated-irreversible'` in `owenloop status`, requiring
-    human intervention (`owenloop retry` / fix upstream / accept-as-is).
+- **`pin`** — keep the output green and re-point its fingerprint to the new inputs. The
+  step does not re-fire. Use when stale-but-shipped is acceptable.
+- **`escalate`** (default when `idempotent: false`) — reject and hold. The step does not
+  auto-re-fire; the debt shows up as `stalled` in `status`, waiting for a human.
+- **`<stepName>`** — pin the original output and arm a named compensating step (e.g. a
+  `reverter`) instead of redoing the irreversible work.
 
-`terminal: true` is the legacy spelling for `effect: { idempotent: false, onInvalidate: 'pin' }`
-plus the dead-end lint exemption. The two coexist on the same engine version and are mutually
-exclusive on the same loop. Dead-input cascade (a retracted or skipped input) is always
-structural regardless of `effect:` — only the moved-version re-arm path routes on it.
+`terminal: true` is the legacy shorthand for "irreversible, pin on invalidation" plus
+the dead-end lint exemption.
 
-| key | idempotent | onInvalidate | cascade behavior on input move |
-|---|---|---|---|
-| _(none)_ or `effect: { idempotent: true }` | true | — | re-arm (structural reject) as today |
-| `effect: { idempotent: false, onInvalidate: 'pin' }` | false | pin | stay green, re-point fingerprint |
-| `effect: { idempotent: false, onInvalidate: 'escalate' }` | false | escalate | reject-and-hold; stalled |
-| `effect: { idempotent: false, onInvalidate: '<loopName>' }` | false | loopName | pin original + arm named handler |
-| `terminal: true` | false | pin | stay green + lint-exempt (legacy) |
+### `on:` — when a step fires
 
-**`onInvalidate: '<loopName>'`** (named-handler routing) pins the original artifact
-green and arms the named handler loop — materializing its outputs as `owed` so it becomes
-eligible next tick. The handler is an ordinary forward-producer loop; the engine sequences
-nothing beyond making it eligible. Example:
+By default a step fires when its consumed inputs are all green (`inputsGreen`). The
+`on:` field makes the trigger explicit and swappable:
 
-```yaml
-loops:
-  - name: merger
-    consumes: [pr]
-    produces: [merge]
-    effect:
-      idempotent: false
-      onInvalidate: reverter    # arms the 'reverter' loop on invalidation
-  - name: reverter
-    consumes: [merge]           # reverter consumes whatever it needs to undo
-    produces: [revert]          # normal forward producer
-```
-
-The handler is dormant at instance creation (its outputs are not seeded `owed` until L is
-first invalidated). If the input moves again after the handler has greened, the handler is
-re-armed automatically. This does NOT auto-redo the irreversible step — it routes a
-compensating forward action (§6.6).
-
-### `on:` — the loop firing trigger
-
-By default, a loop fires when its consumed inputs are all green (`inputsGreen`). The optional `on:` field makes the trigger explicit and swappable.
-
-- **`on:` omitted** — equivalent to `on: ['inputsGreen']`. All existing defs behave exactly as before.
-- **`on: ['inputsGreen']`** — explicit default. Fire when consumed inputs are green.
-- **`on: ['allGreen']`** — completion evaluator mode (§21). The loop fires when the workflow is "all-green" — no outstanding debts among all artifacts except the evaluator's own produced outputs (bootstrap exclusion). Use for a loop that inspects the completed workflow and emits an `outcome` artifact.
-- **`on: ['idle']`** — idle trigger (§21.8). The loop fires when the workflow is quiescent and no progress has been made for longer than `idleAfter`. Use for a watchdog, a stuck-detector, or a timeout handler. Requires `idleAfter` (hard error if absent).
-- **`on: ['allGreen', 'idle']`** — combined evaluator. Fires on completion (`allGreen`) and also fires if the workflow has been stuck past the idle threshold. A worker reads `order.cause` (`'allGreen'` or `'idle'`) to branch behaviour.
-- **`on: []`** — hard error: a loop must have at least one firing trigger.
-
-**`idleAfter`:** required when `'idle'` is in `on:`. A duration string (same format as `cadence`, e.g. `"30m"`, `"2h"`, `"1d"`). The loop fires when no artifact in the workflow has been updated for this long. Progress resets the clock: every state change (green, reject, owed) advances `last_progress`.
+- **`inputsGreen`** (default) — fire when the consumed inputs are green.
+- **`allGreen`** — fire when the whole workflow is otherwise done. Use for a *completion
+  evaluator*: a final step that inspects the finished workflow and greens an `outcome`.
+- **`idle`** — fire when the workflow has made no progress for longer than `idleAfter`
+  (required). Use for a watchdog, a stuck-detector, or a timeout handler.
+- **`[allGreen, idle]`** — both. The worker reads `order.cause` (`'allGreen'` or
+  `'idle'`) to branch.
 
 ```yaml
 - name: completion
@@ -618,92 +469,55 @@ By default, a loop fires when its consumed inputs are all green (`inputsGreen`).
     # order.cause is 'allGreen' when done, 'idle' when stuck past 30m
 ```
 
-**Alarm (absolute override):** a worker that needs a recurring heartbeat or a deadline can call `engine.setAlarm(workflow, loop, at)` with an absolute ms-epoch timestamp. The alarm overrides the relative `idleAfter` window and survives process restart (persisted in SQLite). The engine clears the alarm when idle fires; the worker must call `setAlarm` again inside its body to re-arm:
-
-```typescript
-// inside an idle-trigger worker body:
-engine.setAlarm(workflowId, 'completion', Date.now() + 3_600_000); // re-arm in 1 hour
-await owenloop.green(order.run, { /* ... */ });
-```
-
-**`engine.nextAlarm(workflow)`** returns `{ dueAt: number | null; isDue: boolean }` — the earliest pending idle threshold across all idle loops in the workflow. An external scheduler uses this to decide when to wake the instance.
-
-**Bootstrap exclusion:** the evaluator's own `outcome` is excluded from the all-green check so that "all other artifacts are done" can be true before the evaluator runs.
-
-**Re-arm:** once `outcome` is green, if the workflow later falls back out of all-green (e.g. an upstream input is re-provided), `maintainDecisions` detects that `outcome` is green but the workflow is no longer all-green, and emits a structural reject to re-arm `outcome`. The evaluator re-fires automatically when the workflow returns to all-green.
-
-**`cause` in the order:** the engine threads the trigger onto `order.cause` (e.g. `'allGreen'` or `'idle'`). A worker can read `order.cause` to branch behaviour — for example, a completion evaluator may inspect status, green `outcome`, and message a human.
+**Alarms.** A worker that needs a heartbeat or a deadline can call
+`engine.setAlarm(workflow, step, at)` with an absolute timestamp — it overrides the
+relative `idleAfter` window and survives a process restart.
+`engine.nextAlarm(workflow)` tells an external scheduler when to wake the instance.
 
 ### Consume / produce grammar
 
 | pattern | role | fires |
 |---|---|---|
 | `plan` | **plain** consume / **singleton** produce | when `plan` is green |
-| `gather.source[]` | **collection** produce | producer `emit`s N elements, then `seal`s |
+| `gather.source[]` | **collection** produce | the producer `emit`s N elements, then `seal`s |
 | `gather.source[$i]` | **map** | one run per element; binds `${INDEX}` |
-| `gather.source[$i].verdict` | **map** produce | the per-element output of a map loop |
-| `gather.source[*]` | **reduce** consume | once, when sealed + all surviving members green |
+| `gather.source[$i].verdict` | **map** produce | the per-element output of a map step |
+| `gather.source[*]` | **reduce** consume | once, when sealed and all surviving members green |
 
-A loop consumes in exactly one mode — plain-only, a single map, or a single
-reduce (a map loop must also declare its `[$i]` output, and vice-versa). These
-rules are enforced by the validator, not left to runtime surprise.
-
----
-
-## The wiring concept
-
-owenloop deliberately stops at "here is an order; tell me the outcome." A
-**wiring** supplies the two things the engine refuses to assume:
-
-1. **What the steps mean** — the YAML definitions (the `delivery`/`research`
-   examples are wirings).
-2. **How an order gets executed** — a *worker* loop. In pseudocode:
-
-   ```
-   for each workflow:
-     { orders } = owenloop tick $wf
-     for each order:
-       result = run(order.prompt, order.consumes, order.owes)   # ← your domain
-       if result.ok:        owenloop green   $wf $order.run $output --value …
-       else if rejected:    owenloop reject  $wf $artifact --by $loop --text …
-       owenloop close $wf $order.run --outcome …
-   ```
-
-A coding agent that opens PRs is one such worker; a research bot that fetches and
-fact-checks sources is another. Both layer onto the *same* engine — the engine
-never learned what a PR or a source is. That decoupling is the whole point: the
-debt model, forward cascade, stall liveness, and concurrency-safe commit live
-once, in the engine, and every wiring inherits them.
+A step consumes in exactly one mode — plain, a single map, or a single reduce. The
+validator enforces this at load time, so you don't hit it as a runtime surprise.
 
 ---
 
-## Architecture
+## How it's built
+
+owenloop is small and split along a pure-core / imperative-shell line:
 
 | module | responsibility |
 |---|---|
 | [`src/types.ts`](src/types.ts) | shared types: the five-state lifecycle, reason threads, def shapes |
 | [`src/paths.ts`](src/paths.ts) | parse/match the `src[$i]` / `src[*]` / `src[]` path grammar |
-| [`src/defs.ts`](src/defs.ts) | load YAML → validated `WorkflowDef` (static wiring checks) |
-| [`src/schema.ts`](src/schema.ts) | JSON Schema validation of artifact values (§19), via `@cfworker/json-schema` |
-| [`src/model.ts`](src/model.ts) | the pure core: `eligibleFirings`, the cascade, `workflowStatus`, `isStalled`/`isSchemaStalled` |
-| [`src/store.ts`](src/store.ts) | better-sqlite3 persistence; transactions; the commit CAS |
+| [`src/defs.ts`](src/defs.ts) | load YAML → validated `WorkflowDef` (the static wiring checks) |
+| [`src/schema.ts`](src/schema.ts) | JSON Schema validation of artifact values, via `@cfworker/json-schema` |
+| [`src/model.ts`](src/model.ts) | the pure core: what's eligible, the cascade, status, stall detection |
+| [`src/store.ts`](src/store.ts) | `node:sqlite` persistence; transactions; the commit check |
 | [`src/engine.ts`](src/engine.ts) | the imperative shell: `tick`/`green`/`reject`/… → mutate → `settle()` |
 | [`src/cli.ts`](src/cli.ts) | argv → engine calls, JSON on stdout |
 
-**Invariant:** every engine mutation ends with `settle()` — materialize owed
-outputs and run the forward cascade to a fixpoint — so `status()` is a pure read
-over artifact state and never lies.
+**Invariant:** every engine mutation ends with `settle()` — materialize owed outputs and
+run the cascade to a fixpoint — so `status()` is a pure read over artifact state and
+never lies.
 
 ### Storage
 
-State lives in a single SQLite database via **better-sqlite3** in WAL mode. There
-is no separate graph engine: the flat artifact/task/run tables *are* the graph,
-and the dependency structure is recomputed from the definition on each tick.
-Concurrent advancement is made safe by a **commit-fingerprint CAS** — a run
-records the version of every input it claimed, and its commit is rejected
-("born-rejected") if any of those inputs moved underneath it. Each artifact
-carries a monotonic version so the level-trigger can ask "is this green output
-still resting on the inputs it was built from?".
+State lives in a single SQLite database via Node's built-in **`node:sqlite`** in WAL
+mode — no native module to compile, no separate graph engine. The flat
+artifact/task/run tables *are* the graph; the dependency structure is recomputed from
+the definition on each tick. Concurrent advancement is made safe by a **commit
+fingerprint check**: a run records the version of every input it claimed, and its commit
+is rejected ("born-rejected") if any of those inputs moved underneath it. Each artifact
+carries a monotonic version, so the engine can always ask "is this green output still
+resting on the inputs it was built from?".
 
 ---
 
@@ -711,47 +525,37 @@ still resting on the inputs it was built from?".
 
 ```sh
 npm test          # node --test, spec reporter
-npm run typecheck # tsc --noEmit (erasable-syntax only — verifies type-strip safety)
+npm run typecheck # tsc --noEmit (verifies the source is type-strip-safe)
 npm run check     # both
 ```
 
-The suite (172 tests) spans unit tests (`paths`, `store`, `model`, `defs`,
-`schema`, `util`, `cli`), engine integration tests (the cascade, the §6 stall,
-schema validation/§19, concurrency/CAS), and **47 end-to-end tests** that spawn
-the real `bin/owenloop.mjs` binary and drive the example workflows through their
-full lifecycles.
+The suite is **432 tests**: unit tests (`paths`, `store`, `model`, `defs`, `schema`,
+`util`, `cli`), engine integration tests (the cascade, the stall, schema validation,
+the concurrency check), and **49 end-to-end tests** that spawn the real
+`bin/owenloop.mjs` binary and drive the example workflows through their full lifecycles.
 
-Two e2e files carry most of that weight, by opposite intent.
-[`test/edge.e2e.test.ts`](test/edge.e2e.test.ts) is a 26-case edge battery aimed
-squarely at the corners the spec is most particular about: forward-cascade
-invalidation, terminal completion surviving an upstream reject, empty /
-fully-retracted / retract-after-green collections, the commit CAS (born-rejected
-+ the reaped-run zombie guard), cadence / daily-budget gating, the skip-cascade
-and its reversibility, the authority / version / reason-thread invariants, and
-CLI robustness against malformed input.
-[`test/scenarios.e2e.test.ts`](test/scenarios.e2e.test.ts) takes the opposite
-tack — eight multi-step *positive* stories that confirm the behaviors the design
-doc promises hold end to end: the map `parallel` cap (§3), map and reduce firing
-as concurrent branches with the reduce gating on members not verdicts (§3/§11),
-the reason thread riding the next order (§4), stall → retry → re-stall with
-`blocked` excluding the stalled loop (§6/§18), and the level-trigger
-re-firing on a re-provided input while staying idempotent on a healthy graph and
-leaving a terminal output untouched (§7).
-[`test/schema.e2e.test.ts`](test/schema.e2e.test.ts) drives the §19 surface end
-to end against a schema-pinned fixture: a malformed singleton is schema-rejected
-rather than greened, a corrected value greens on the same open run, repeated
-failures trip the `maxSchemaFailures` stall and a `retry` clears it, a malformed
-collection element refuses the whole `emit` atomically, and a schema-violating
-input is refused at `create` with a non-zero exit.
+Two e2e files carry most of the weight, by opposite intent.
+[`test/edge.e2e.test.ts`](test/edge.e2e.test.ts) is a 26-case edge battery aimed at the
+corners the design is most particular about: cascade invalidation, terminal completion
+surviving an upstream reject, empty / fully-retracted collections, the commit check,
+cadence and daily-budget gating, the skip-cascade, and CLI robustness against malformed
+input. [`test/scenarios.e2e.test.ts`](test/scenarios.e2e.test.ts) takes the opposite
+tack — eight multi-step *positive* stories that confirm the documented behaviors hold
+end to end: the map `parallel` cap, map and reduce firing as concurrent branches, the
+reason thread riding the next job, stall → retry → re-stall, and the cascade re-firing on
+a re-provided input while leaving a healthy graph and a terminal output untouched.
+[`test/schema.e2e.test.ts`](test/schema.e2e.test.ts) drives schema validation end to end:
+a malformed value is rejected rather than greened, a corrected value greens on the same
+open job, repeated failures trip the stall and a `retry` clears it.
 
 ---
 
 ## Design reference
 
-owenloop is a faithful, decoupled implementation of an internal dataflow-engine
-spec. [`docs/design.md`](docs/design.md) is a self-contained distillation —
-the lifecycle, firing rule, forward cascade, the two reject kinds, §6 liveness,
-and the concurrency model — cross-referenced from the source as `§N`.
+owenloop is a faithful, decoupled implementation of an internal dataflow-engine spec.
+[`docs/design.md`](docs/design.md) is a self-contained walkthrough — the lifecycle,
+firing rule, forward cascade, the reject kinds, the liveness rules, and the concurrency
+model — cross-referenced from the source.
 
 ---
 

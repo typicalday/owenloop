@@ -46,9 +46,9 @@ function tmpDb(): string {
   return join(dir, 'state.db');
 }
 
-function orderFor(tick: any, loop: string): any {
-  const o = tick.orders.find((x: any) => x.loop === loop);
-  assert.ok(o, `expected an order for '${loop}', got: ${tick.orders.map((x: any) => x.loop).join(', ')}`);
+function orderFor(tick: any, step: string): any {
+  const o = tick.orders.find((x: any) => x.step === step);
+  assert.ok(o, `expected an order for '${step}', got: ${tick.orders.map((x: any) => x.step).join(', ')}`);
   return o;
 }
 
@@ -61,9 +61,9 @@ test('delivery: full pipeline with a reviewer knock-back ends green & terminal',
   const wf = ow('create', 'delivery', '--provide', `proposal=${JSON.stringify({ text: 'add dark mode' })}`).workflow;
   assert.ok(wf.startsWith('wf'), wf);
 
-  // planner: only eligible loop at the start
+  // planner: only eligible step at the start
   let t = ow('tick', wf);
-  assert.deepEqual(t.orders.map((o: any) => o.loop), ['planner']);
+  assert.deepEqual(t.orders.map((o: any) => o.step), ['planner']);
   let o = orderFor(t, 'planner');
   assert.deepEqual(o.consumes, { proposal: { text: 'add dark mode' } }); // captured green input
   assert.equal(ow('green', wf, o.run, 'plan', '--value', JSON.stringify({ plan: 'do X' })).outcome, 'green');
@@ -124,7 +124,7 @@ test('research: collection fan-out, retract, born-rejected CAS, and reduce re-de
 
   // after the seal, the map (check ×3) and the reduce (synth) are all eligible
   const t = ow('tick', wf);
-  const checks = t.orders.filter((x: any) => x.loop === 'check');
+  const checks = t.orders.filter((x: any) => x.step === 'check');
   assert.equal(checks.length, 3, 'one check firing per element');
   const synth = orderFor(t, 'synth'); // claimed now — its fingerprint snapshots all 3 sources
 
@@ -171,7 +171,7 @@ test('delivery: a PR knocked back to the cap stalls, then `retry` clears it', ()
   let guard = 0;
   for (;;) {
     assert.ok(++guard <= 20, 'pr should have stalled by now');
-    const builder = ow('tick', wf).orders.find((o: any) => o.loop === 'builder');
+    const builder = ow('tick', wf).orders.find((o: any) => o.step === 'builder');
     if (!builder) break; // not re-armed → stalled
     ow('green', wf, builder.run, 'pr', '--value', JSON.stringify({ pr: guard }));
     ow('close', wf, builder.run);
@@ -204,13 +204,13 @@ test('delivery: a PR knocked back to the cap stalls, then `retry` clears it', ()
   rmSync(join(db, '..'), { recursive: true, force: true });
 });
 
-test('a crash-looping producer surfaces failedRuns in status and the bulk status --all', () => {
+test('a crash-steping producer surfaces failedRuns in status and the bulk status --all', () => {
   const db = tmpDb();
   const ow = makeCli(db);
   const wf = ow('create', 'delivery', '--provide', `proposal=${JSON.stringify({ text: 'x' })}`).workflow;
 
   // the planner claims and closes `failed` three times without greening — a
-  // crash loop, which §6 never stalls (judgmentRejects stays 0)
+  // crash step, which §6 never stalls (judgmentRejects stays 0)
   for (let i = 0; i < 3; i++) {
     const planner = orderFor(ow('tick', wf), 'planner');
     ow('close', wf, planner.run, '--outcome', 'failed');
@@ -218,7 +218,7 @@ test('a crash-looping producer surfaces failedRuns in status and the bulk status
 
   const plan = ow('status', wf).debts.find((d: any) => d.path === 'plan');
   assert.equal(plan.failedRuns, 3, 'single-instance status carries the streak');
-  assert.equal(plan.stalled, false, 'a crash loop is not a §6 judgment stall');
+  assert.equal(plan.stalled, false, 'a crash step is not a §6 judgment stall');
 
   // the bulk fleet read derives the same per-debt counter in one process
   const entry = ow('status', '--all').find((e: any) => e.workflow === wf);
@@ -242,7 +242,7 @@ test('a seedOwed input gates the pipeline until `provide` supplies it', () => {
   let st = ow('status', wf);
   assert.equal(st.done, false);
   assert.ok(st.debts.some((d: any) => d.path === 'proposal'), 'proposal should be an open debt');
-  assert.ok(st.blocked.some((b: any) => b.loop === 'planner' && b.blockedOn.includes('proposal')));
+  assert.ok(st.blocked.some((b: any) => b.step === 'planner' && b.blockedOn.includes('proposal')));
   assert.deepEqual(ow('tick', wf).orders, [], 'no orders while the input is owed');
 
   // supply it — now the planner is eligible
@@ -250,7 +250,7 @@ test('a seedOwed input gates the pipeline until `provide` supplies it', () => {
   st = ow('status', wf);
   assert.ok(!st.debts.some((d: any) => d.path === 'proposal'), 'proposal is settled');
   const t = ow('tick', wf);
-  assert.deepEqual(t.orders.map((o: any) => o.loop), ['planner']);
+  assert.deepEqual(t.orders.map((o: any) => o.step), ['planner']);
   assert.deepEqual(t.orders[0].consumes, { proposal: { text: 'ship it' } });
 
   rmSync(join(db, '..'), { recursive: true, force: true });

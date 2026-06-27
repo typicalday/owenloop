@@ -24,7 +24,7 @@ inputs:
   - name: question
     seedOwed: true          # required: supply with --provide or `owenloop provide`
 
-loops:
+steps:
   - name: gather
     consumes: [question]
     produces: ["gather.source[]"]    # a collection: emit elements, then seal

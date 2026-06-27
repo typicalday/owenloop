@@ -26,12 +26,12 @@ const wf = engine.createInstance('delivery', {
 });
 console.log('created instance:', wf);
 
-// Pull eligible orders. Only `planner` is eligible — it's the one loop whose
+// Pull eligible orders. Only `planner` is eligible — it's the one step whose
 // input (`proposal`) is green.
 const { orders } = engine.tick(wf);
 const order = orders[0];
 if (!order) throw new Error('expected a planner order');
-console.log(`order: ${order.loop} → owes ${order.owes.map((o) => o.path).join(', ')}`);
+console.log(`order: ${order.step} → owes ${order.owes.map((o) => o.path).join(', ')}`);
 
 // Report the planner's output, then release the lease.
 const result = engine.green(wf, order.run, 'plan', { plan: 'do the thing' });
@@ -40,7 +40,7 @@ engine.close(wf, order.run);
 
 // `status` is a pure read over artifact state — never a lie.
 const status = engine.status(wf);
-console.log('eligible next:', status.eligible.map((e) => e.loop).join(', ') || '(none)');
+console.log('eligible next:', status.eligible.map((e) => e.step).join(', ') || '(none)');
 console.log('debts:', status.debts.map((d) => `${d.path}:${d.acceptance}`).join(', '));
 
 store.close();

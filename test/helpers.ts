@@ -1,10 +1,10 @@
-/** Shared test fixtures — inline workflow/loop builders and an artifact-map helper. */
+/** Shared test fixtures — inline workflow/step builders and an artifact-map helper. */
 
 import { parseConsume, parseProduce } from '../src/paths.ts';
-import type { ArtifactData, EffectDef, FiringTrigger, InputDef, LoopDef, WorkflowDef } from '../src/types.ts';
+import type { ArtifactData, EffectDef, FiringTrigger, InputDef, StepDef, WorkflowDef } from '../src/types.ts';
 import type { ArtifactMap } from '../src/model.ts';
 
-export interface LoopSpec {
+export interface StepSpec {
   name: string;
   consumes?: string[];
   produces?: string[];
@@ -26,7 +26,7 @@ export interface LoopSpec {
   reapTtlMs?: number;
 }
 
-export function loop(spec: LoopSpec): LoopDef {
+export function step(spec: StepSpec): StepDef {
   const consumes = (spec.consumes ?? []).map(parseConsume);
   const produces = (spec.produces ?? []).map(parseProduce);
   return {
@@ -52,8 +52,8 @@ export function loop(spec: LoopSpec): LoopDef {
   };
 }
 
-export function def(name: string, inputs: InputDef[], loops: LoopDef[]): WorkflowDef {
-  return { name, inputs, loops };
+export function def(name: string, inputs: InputDef[], steps: StepDef[]): WorkflowDef {
+  return { name, inputs, steps };
 }
 
 export function input(name: string, opts: { producer?: string; seedOwed?: boolean } = {}): InputDef {

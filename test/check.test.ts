@@ -7,7 +7,7 @@
  *   judgmentRejects, schemaRejects, fingerprint }. This proves the checker's
  *   verdicts are trustworthy.
  *
- * Part 2: modelCheck unit tests — deadlocks, stuck, completable, dead loops.
+ * Part 2: modelCheck unit tests — deadlocks, stuck, completable, dead steps.
  *
  * Part 3: CLI 'check' command smoke tests.
  */
@@ -23,7 +23,7 @@ import { openStore } from '../src/store.ts';
 import { applyOutcome, eligibleFirings, evalInvariantPredicate, settleInMemory, modelCheck, workflowStatus } from '../src/model.ts';
 import { main } from '../src/cli.ts';
 import type { ArtifactData, InvariantDef, InvariantPredicate, WorkflowDef } from '../src/types.ts';
-import { def, input, loop } from './helpers.ts';
+import { def, input, step } from './helpers.ts';
 
 // ---- shared workflow definitions (same as engine.test.ts) --------------------
 
@@ -31,10 +31,10 @@ const delivery = def(
   'delivery',
   [input('proposal')],
   [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-    loop({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
-    loop({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
-    loop({ name: 'merger', consumes: ['verdict'], produces: ['merge'], terminal: true }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+    step({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
+    step({ name: 'merger', consumes: ['verdict'], produces: ['merge'], terminal: true }),
   ],
 );
 
@@ -43,10 +43,10 @@ const deliveryProvided = def(
   'delivery-provided',
   [input('proposal', { seedOwed: false })],
   [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-    loop({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
-    loop({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
-    loop({ name: 'merger', consumes: ['verdict'], produces: ['merge'], terminal: true }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+    step({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
+    step({ name: 'merger', consumes: ['verdict'], produces: ['merge'], terminal: true }),
   ],
 );
 
@@ -55,10 +55,10 @@ const deliveryProvidedNoSchemaStall = def(
   'delivery-provided-ns',
   [input('proposal', { seedOwed: false })],
   [
-    loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'], maxSchemaFailures: 0 }),
-    loop({ name: 'builder', consumes: ['plan'], produces: ['pr'], maxSchemaFailures: 0 }),
-    loop({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'], maxSchemaFailures: 0 }),
-    loop({ name: 'merger', consumes: ['verdict'], produces: ['merge'], terminal: true, maxSchemaFailures: 0 }),
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'], maxSchemaFailures: 0 }),
+    step({ name: 'builder', consumes: ['plan'], produces: ['pr'], maxSchemaFailures: 0 }),
+    step({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'], maxSchemaFailures: 0 }),
+    step({ name: 'merger', consumes: ['verdict'], produces: ['merge'], terminal: true, maxSchemaFailures: 0 }),
   ],
 );
 
@@ -66,13 +66,13 @@ const research = def(
   'research',
   [input('question', { seedOwed: false })],
   [
-    loop({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
-    loop({
+    step({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
+    step({
       name: 'formatcheck',
       consumes: ['gather.source[$i]'],
       produces: ['gather.source[$i].formatcheck'],
     }),
-    loop({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
+    step({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
   ],
 );
 
@@ -114,11 +114,11 @@ function makeEngine(defs: WorkflowDef[]): { engine: Engine } {
   return { engine };
 }
 
-/** Tick and return the single order for `loopName`. */
-function fire(engine: Engine, wf: string, loopName: string): Order {
+/** Tick and return the single order for `stepName`. */
+function fire(engine: Engine, wf: string, stepName: string): Order {
   const t = engine.tick(wf, { now: Date.now() });
-  const matching = t.orders.filter((o) => o.loop === loopName);
-  assert.equal(matching.length, 1, `expected exactly one ${loopName} order`);
+  const matching = t.orders.filter((o) => o.step === stepName);
+  assert.equal(matching.length, 1, `expected exactly one ${stepName} order`);
   return matching[0]!;
 }
 
@@ -171,7 +171,7 @@ test('conformance scenario 1: delivery happy path — all artifacts match engine
 
   // In-memory: find planner firing, apply 'green'
   const plannerFirings = eligibleFirings(deliveryProvided, memMap);
-  const plannerFiring = plannerFirings.find((f) => f.loop === 'planner');
+  const plannerFiring = plannerFirings.find((f) => f.step === 'planner');
   assert.ok(plannerFiring, 'expected planner firing');
   memMap = applyOutcome(deliveryProvided, memMap, plannerFiring, 'green', { maxCollectionSize: 2 })[0]!;
 
@@ -183,7 +183,7 @@ test('conformance scenario 1: delivery happy path — all artifacts match engine
   engine.close(wf, builderOrder.run);
 
   const builderFirings = eligibleFirings(deliveryProvided, memMap);
-  const builderFiring = builderFirings.find((f) => f.loop === 'builder');
+  const builderFiring = builderFirings.find((f) => f.step === 'builder');
   assert.ok(builderFiring, 'expected builder firing');
   memMap = applyOutcome(deliveryProvided, memMap, builderFiring, 'green', { maxCollectionSize: 2 })[0]!;
 
@@ -195,7 +195,7 @@ test('conformance scenario 1: delivery happy path — all artifacts match engine
   engine.close(wf, reviewerOrder.run);
 
   const reviewerFirings = eligibleFirings(deliveryProvided, memMap);
-  const reviewerFiring = reviewerFirings.find((f) => f.loop === 'reviewer');
+  const reviewerFiring = reviewerFirings.find((f) => f.step === 'reviewer');
   assert.ok(reviewerFiring, 'expected reviewer firing');
   memMap = applyOutcome(deliveryProvided, memMap, reviewerFiring, 'green', { maxCollectionSize: 2 })[0]!;
 
@@ -207,7 +207,7 @@ test('conformance scenario 1: delivery happy path — all artifacts match engine
   engine.close(wf, mergerOrder.run);
 
   const mergerFirings = eligibleFirings(deliveryProvided, memMap);
-  const mergerFiring = mergerFirings.find((f) => f.loop === 'merger');
+  const mergerFiring = mergerFirings.find((f) => f.step === 'merger');
   assert.ok(mergerFiring, 'expected merger firing');
   memMap = applyOutcome(deliveryProvided, memMap, mergerFiring, 'green', { maxCollectionSize: 2 })[0]!;
 
@@ -246,7 +246,7 @@ test('conformance scenario 2: judgment-reject cycle — builder/reviewer/reject/
   engine.green(wf, plannerOrder.run, 'plan', { plan: 'v1' });
   engine.close(wf, plannerOrder.run);
 
-  const plannerFiring = eligibleFirings(deliveryProvided, memMap).find((f) => f.loop === 'planner')!;
+  const plannerFiring = eligibleFirings(deliveryProvided, memMap).find((f) => f.step === 'planner')!;
   memMap = applyOutcome(deliveryProvided, memMap, plannerFiring, 'green', { maxCollectionSize: 2 })[0]!;
 
   // builder → green pr
@@ -254,7 +254,7 @@ test('conformance scenario 2: judgment-reject cycle — builder/reviewer/reject/
   engine.green(wf, builderOrder1.run, 'pr', { pr: '#1' });
   engine.close(wf, builderOrder1.run);
 
-  const builderFiring1 = eligibleFirings(deliveryProvided, memMap).find((f) => f.loop === 'builder')!;
+  const builderFiring1 = eligibleFirings(deliveryProvided, memMap).find((f) => f.step === 'builder')!;
   memMap = applyOutcome(deliveryProvided, memMap, builderFiring1, 'green', { maxCollectionSize: 2 })[0]!;
 
   assertConformance('before reject', engineArts(engine, wf), inMemArts(memMap), ['proposal', 'plan', 'pr', 'verdict', 'merge']);
@@ -266,7 +266,7 @@ test('conformance scenario 2: judgment-reject cycle — builder/reviewer/reject/
   engine.close(wf, reviewerOrder1.run, 'no_work');
 
   // In-memory: reviewer fires, applies judgment-reject (which targets 'pr', a consumed input)
-  const reviewerFiring1 = eligibleFirings(deliveryProvided, memMap).find((f) => f.loop === 'reviewer')!;
+  const reviewerFiring1 = eligibleFirings(deliveryProvided, memMap).find((f) => f.step === 'reviewer')!;
   memMap = applyOutcome(deliveryProvided, memMap, reviewerFiring1, 'judgment-reject', { maxCollectionSize: 2 })[0]!;
 
   assertConformance('after judgment-reject of pr', engineArts(engine, wf), inMemArts(memMap), ['proposal', 'plan', 'pr', 'verdict', 'merge']);
@@ -276,7 +276,7 @@ test('conformance scenario 2: judgment-reject cycle — builder/reviewer/reject/
   engine.green(wf, builderOrder2.run, 'pr', { pr: '#2' });
   engine.close(wf, builderOrder2.run);
 
-  const builderFiring2 = eligibleFirings(deliveryProvided, memMap).find((f) => f.loop === 'builder')!;
+  const builderFiring2 = eligibleFirings(deliveryProvided, memMap).find((f) => f.step === 'builder')!;
   memMap = applyOutcome(deliveryProvided, memMap, builderFiring2, 'green', { maxCollectionSize: 2 })[0]!;
 
   assertConformance('after builder re-green', engineArts(engine, wf), inMemArts(memMap), ['proposal', 'plan', 'pr', 'verdict', 'merge']);
@@ -309,7 +309,7 @@ test('conformance scenario 3: collection — research emit-seal with 2 items', (
 
   // In-memory: gather fires with emit-seal, count=2 → third element (index 2) of successors array
   const gatherFirings = eligibleFirings(research, memMap);
-  const gatherFiring = gatherFirings.find((f) => f.loop === 'gather')!;
+  const gatherFiring = gatherFirings.find((f) => f.step === 'gather')!;
   assert.ok(gatherFiring, 'expected gather firing');
   // applyOutcome for emit-seal returns [count0, count1, count2] — we want count=2
   const emitSealSuccessors = applyOutcome(research, memMap, gatherFiring, 'emit-seal', { maxCollectionSize: 2 });
@@ -327,8 +327,8 @@ test('conformance scenario 3: collection — research emit-seal with 2 items', (
   // After emit-seal(2), synthesize is immediately eligible (all members green, seal green).
   // Tick returns: formatcheck[0], formatcheck[1], synthesize — all at once.
   const allTick = engine.tick(wf, { now: Date.now() });
-  const fcOrders = allTick.orders.filter((o) => o.loop === 'formatcheck');
-  const synthOrderImmediate = allTick.orders.find((o) => o.loop === 'synthesize');
+  const fcOrders = allTick.orders.filter((o) => o.step === 'formatcheck');
+  const synthOrderImmediate = allTick.orders.find((o) => o.step === 'synthesize');
   assert.equal(fcOrders.length, 2, 'expected two formatcheck orders');
   assert.ok(synthOrderImmediate, 'expected synthesize order immediately after emit-seal(2)');
 
@@ -346,13 +346,13 @@ test('conformance scenario 3: collection — research emit-seal with 2 items', (
   // First: both formatcheck firings
   for (const key of ['gather.source[0]', 'gather.source[1]']) {
     const fcFirings = eligibleFirings(research, memMap);
-    const fcFiring = fcFirings.find((f) => f.loop === 'formatcheck' && f.key === key)!;
+    const fcFiring = fcFirings.find((f) => f.step === 'formatcheck' && f.key === key)!;
     assert.ok(fcFiring, `expected formatcheck[${key}] firing`);
     memMap = applyOutcome(research, memMap, fcFiring, 'green', { maxCollectionSize: 2 })[0]!;
   }
   // Then: synthesize (now eligible because all members are green)
   const synthFirings = eligibleFirings(research, memMap);
-  const synthFiring = synthFirings.find((f) => f.loop === 'synthesize')!;
+  const synthFiring = synthFirings.find((f) => f.step === 'synthesize')!;
   assert.ok(synthFiring, 'expected synthesize firing after both formatchecks green');
   memMap = applyOutcome(research, memMap, synthFiring, 'green', { maxCollectionSize: 2 })[0]!;
 
@@ -370,7 +370,7 @@ test('conformance scenario 3: collection — research emit-seal with 2 items', (
 // ---- Part 2: modelCheck unit tests -------------------------------------------
 
 test('modelCheck: linear def with no stalls → completable, exhaustive search', () => {
-  // A minimal 2-step workflow where both loops have maxAttempts=1000 and maxSchemaFailures=0,
+  // A minimal 2-step workflow where both steps have maxAttempts=1000 and maxSchemaFailures=0,
   // making stall paths unreachable in practice (we'd need 1000 rejects to deadlock).
   // With maxStates=50 this stays bounded (we don't explore 1000 rejection paths),
   // but the key assertion is: it IS completable and bounded=false only when truly exhausted.
@@ -378,7 +378,7 @@ test('modelCheck: linear def with no stalls → completable, exhaustive search',
     'simple-no-stall',
     [input('start', { seedOwed: false })],
     [
-      loop({
+      step({
         name: 'step1',
         consumes: ['start'],
         produces: ['out1'],
@@ -390,16 +390,16 @@ test('modelCheck: linear def with no stalls → completable, exhaustive search',
   // With maxStates=50: we can find the completable path before hitting stall states
   const report = modelCheck(simpleNoStall, { maxStates: 50 });
   assert.equal(report.completable, true, 'single-step workflow should be completable');
-  assert.equal(report.deadLoops.length, 0, 'no dead loops in simple workflow');
+  assert.equal(report.deadSteps.length, 0, 'no dead steps in simple workflow');
   // The workflow IS completable; whether bounded depends on maxStates
 });
 
 test('modelCheck: deadlocking def (maxAttempts=1 → stall after one reject)', () => {
-  // Loop 'a' has maxAttempts=1: after one judgment-reject, x is stalled (frozen).
+  // Step 'a' has maxAttempts=1: after one judgment-reject, x is stalled (frozen).
   // No eligible firings remain, not done → deadlock AND stuck.
   const deadlockDef = def('deadlocker', [input('start', { seedOwed: false })], [
-    loop({ name: 'a', consumes: ['start'], produces: ['x'], maxAttempts: 1 }),
-    loop({ name: 'b', consumes: ['x'], produces: ['y'] }),
+    step({ name: 'a', consumes: ['start'], produces: ['x'], maxAttempts: 1 }),
+    step({ name: 'b', consumes: ['x'], produces: ['y'] }),
   ]);
 
   const report = modelCheck(deadlockDef, { maxStates: 200 });
@@ -411,12 +411,12 @@ test('modelCheck: deadlocking def (maxAttempts=1 → stall after one reject)', (
   assert.equal(report.bounded, false, 'small def should be exhausted');
 });
 
-test('modelCheck: dead loop via maxDepth truncation', () => {
+test('modelCheck: dead step via maxDepth truncation', () => {
   // With maxDepth=1, merger never fires in the delivery def (depth 1 only
   // reaches plan being green, not all the way to verdict being green).
   const report = modelCheck(deliveryProvidedNoSchemaStall, { maxDepth: 1, maxStates: 100 });
   assert.ok(report.bounded, 'search should be bounded when maxDepth=1');
-  assert.ok(report.deadLoops.includes('merger'), 'merger should not fire within depth 1');
+  assert.ok(report.deadSteps.includes('merger'), 'merger should not fire within depth 1');
 });
 
 test('modelCheck: bounded flag and boundsHit', () => {
@@ -439,7 +439,7 @@ test('modelCheck: workflow with seedOwed=true input but no provider → deadlock
     'owed-input',
     [input('proposal', { seedOwed: true })],  // starts owed, must be provided externally
     [
-      loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
     ],
   );
   const report = modelCheck(owedInputDef, { maxStates: 50 });
@@ -497,7 +497,7 @@ test('CLI check: json format emits structured report', () => {
   const report = JSON.parse(r.out);
   assert.ok('completable' in report, 'report should have completable field');
   assert.ok('deadlocks' in report, 'report should have deadlocks field');
-  assert.ok('deadLoops' in report, 'report should have deadLoops field');
+  assert.ok('deadSteps' in report, 'report should have deadSteps field');
   assert.ok('bounded' in report, 'report should have bounded field');
   assert.ok('stats' in report, 'report should have stats field');
 });
@@ -513,7 +513,7 @@ test('CLI check: bounded search shows SEARCH INCOMPLETE banner and exits 0', () 
       'inputs:',
       '  - name: start',
       '    seedOwed: false',
-      'loops:',
+      'steps:',
       '  - name: worker',
       '    consumes: [start]',
       '    produces: [result]',
@@ -544,7 +544,7 @@ test('CLI check: a def with definite deadlock exits 1 when exhaustive', () => {
       'inputs:',
       '  - name: start',
       '    seedOwed: false',
-      'loops:',
+      'steps:',
       '  - name: a',
       '    consumes: [start]',
       '    produces: [x]',
@@ -573,7 +573,7 @@ test('CLI check: completable healthy def (seedOwed=false, maxSchemaFailures: 0) 
       'inputs:',
       '  - name: start',
       '    seedOwed: false',
-      'loops:',
+      'steps:',
       '  - name: worker',
       '    consumes: [start]',
       '    produces: [result]',
@@ -720,7 +720,7 @@ const deliveryViolatedInvDef: WorkflowDef = {
   ] satisfies InvariantDef[],
 };
 
-// A 1-loop def where the worker can skip its output. Reaching `done` via skip
+// A 1-step def where the worker can skip its output. Reaching `done` via skip
 // leaves `result` skipped (not green), violating "when done, result must be green".
 // The violation is at BFS depth >= 1 (you must fire worker/skip to reach it), so a
 // re-drive of its counterexample path actually executes — unlike a depth-0 violation.
@@ -728,7 +728,7 @@ const skipDoneInvDef: WorkflowDef = {
   ...def(
     'skip-done',
     [input('start', { seedOwed: false })],
-    [loop({ name: 'worker', consumes: ['start'], produces: ['result'], maxSchemaFailures: 0 })],
+    [step({ name: 'worker', consumes: ['start'], produces: ['result'], maxSchemaFailures: 0 })],
   ),
   invariants: [
     {
@@ -759,7 +759,7 @@ test('modelCheck: real-witness re-drive — counterexample path is genuinely exe
   assert.equal(report.invariantViolations.length, 1, 'need exactly one violation to re-drive');
   const violation = report.invariantViolations[0]!;
   // The violation must be reached by firing at least one step (not a depth-0 seed
-  // violation) — otherwise the re-drive loop below would be vacuous.
+  // violation) — otherwise the re-drive step below would be vacuous.
   assert.ok(violation.path.length >= 1, 'counterexample must require >= 1 firing (non-vacuous re-drive)');
 
   // Seed the initial state the same way modelCheck does: `start` green (seedOwed=false).
@@ -779,8 +779,8 @@ test('modelCheck: real-witness re-drive — counterexample path is genuinely exe
   // Walk each step in the counterexample path through the real in-memory transitions.
   for (const step of violation.path) {
     const firings = eligibleFirings(skipDoneInvDef, memMap);
-    const firing = firings.find((f) => f.loop === step.loop && f.key === step.key);
-    assert.ok(firing, `expected a firing for ${step.loop}/${step.key} at this step`);
+    const firing = firings.find((f) => f.step === step.step && f.key === step.key);
+    assert.ok(firing, `expected a firing for ${step.step}/${step.key} at this step`);
     const successors = applyOutcome(skipDoneInvDef, memMap, firing, step.outcome, { maxCollectionSize: 2 });
     assert.ok(successors.length > 0, 'applyOutcome must return at least one successor');
     memMap = successors[0]!;
@@ -815,9 +815,9 @@ test('modelCheck: when:state-done guarded invariant that holds → no violations
   assert.deepEqual(report.invariantViolations, [], 'when-guarded invariant should hold in all done states');
 });
 
-// §3.3 test 27: {state:'done'} invariant violated (1-loop def where done is reachable with output skipped)
+// §3.3 test 27: {state:'done'} invariant violated (1-step def where done is reachable with output skipped)
 test('modelCheck: state:done invariant violated when done-state has wrong acceptance', () => {
-  // Reuses the module-level skipDoneInvDef: a 1-loop def where the worker can skip its output.
+  // Reuses the module-level skipDoneInvDef: a 1-step def where the worker can skip its output.
   // When done via skip, the output is skipped not green → violates "when done, result is green".
   const report = modelCheck(skipDoneInvDef, { maxStates: 500 });
   // The workflow can reach done via skip (result=skipped), violating the invariant
@@ -854,7 +854,7 @@ const violatedInvYaml = [
   'inputs:',
   '  - name: start',
   '    seedOwed: false',
-  'loops:',
+  'steps:',
   '  - name: worker',
   '    consumes: [start]',
   '    produces: [result]',
@@ -907,7 +907,7 @@ test('CLI check: all invariants hold → exit 0, no Invariant violations in outp
     'inputs:',
     '  - name: start',
     '    seedOwed: false',
-    'loops:',
+    'steps:',
     '  - name: worker',
     '    consumes: [start]',
     '    produces: [result]',
@@ -932,7 +932,7 @@ test('CLI check: invariant with unknown stem → exit 1, err contains /unknown s
     'inputs:',
     '  - name: start',
     '    seedOwed: false',
-    'loops:',
+    'steps:',
     '  - name: worker',
     '    consumes: [start]',
     '    produces: [result]',

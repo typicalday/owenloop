@@ -11,12 +11,12 @@ import assert from 'node:assert/strict';
 import { createEngine } from '../src/factory.ts';
 import { Engine } from '../src/engine.ts';
 import type { EngineEvent } from '../src/engine.ts';
-import { def, input, loop } from './helpers.ts';
+import { def, input, step } from './helpers.ts';
 
 // seed is green at start (seedOwed:false) ⇒ `step` is immediately eligible and
 // owes the single output `out`; greening it completes the workflow.
 const tiny = def('tiny', [input('seed', { seedOwed: false })], [
-  loop({ name: 'step', consumes: ['seed'], produces: ['out'] }),
+  step({ name: 'step', consumes: ['seed'], produces: ['out'] }),
 ]);
 
 test('events: createInstance emits instance then settled', () => {
@@ -86,7 +86,7 @@ test('events: provideInput emits a provide commit then settled', () => {
   // A seedOwed input is owed until provided; providing it greens it and makes
   // the consumer eligible.
   const owedSeed = def('owed', [input('seed', { seedOwed: true })], [
-    loop({ name: 'step', consumes: ['seed'], produces: ['out'] }),
+    step({ name: 'step', consumes: ['seed'], produces: ['out'] }),
   ]);
   const { engine, store } = createEngine({ db: ':memory:', defs: [owedSeed] });
   const wf = engine.createInstance('owed');
@@ -172,8 +172,8 @@ test('events: reject emits a reject commit then settled, re-arming the producer'
   // step1 produces `mid`; step2 consumes `mid` and produces `out`. A reject of
   // `mid` (authored by its consumer step2) re-arms step1.
   const chain = def('chain', [input('seed', { seedOwed: false })], [
-    loop({ name: 'step1', consumes: ['seed'], produces: ['mid'] }),
-    loop({ name: 'step2', consumes: ['mid'], produces: ['out'] }),
+    step({ name: 'step1', consumes: ['seed'], produces: ['mid'] }),
+    step({ name: 'step2', consumes: ['mid'], produces: ['out'] }),
   ]);
   const { engine, store } = createEngine({ db: ':memory:', defs: [chain] });
   const wf = engine.createInstance('chain');

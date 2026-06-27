@@ -184,7 +184,7 @@ Commands:
   defs                                   list available workflow definitions
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N]
-                                         bounded reachability check (deadlocks, stuck, dead loops, declared invariants)
+                                         bounded reachability check (deadlocks, stuck, dead steps, declared invariants)
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
   tick <wf> [--now <ms>]                 pull eligible orders
@@ -289,14 +289,14 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         io.out('');
         io.out(`Deadlocks (${report.deadlocks.length}):`);
         for (const d of report.deadlocks) {
-          io.out(`  path: ${d.path.map((s) => `${s.loop}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
+          io.out(`  path: ${d.path.map((s) => `${s.step}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
         }
       }
       if (report.stuck.length > 0) {
         io.out('');
         io.out(`Stuck states (${report.stuck.length}):`);
         for (const s of report.stuck) {
-          io.out(`  path: ${s.path.map((p) => `${p.loop}/${p.outcome}`).join(' -> ') || '(initial state)'}`);
+          io.out(`  path: ${s.path.map((p) => `${p.step}/${p.outcome}`).join(' -> ') || '(initial state)'}`);
         }
       }
       if (report.invariantViolations.length > 0) {
@@ -304,17 +304,17 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         io.out(`Invariant violations (${report.invariantViolations.length}):`);
         for (const v of report.invariantViolations) {
           io.out(`  invariant: ${v.invariant}`);
-          io.out(`  path: ${v.path.map((s) => `${s.loop}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
+          io.out(`  path: ${v.path.map((s) => `${s.step}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
         }
       }
-      if (report.deadLoops.length > 0) {
+      if (report.deadSteps.length > 0) {
         io.out('');
-        io.out(`Dead loops (never fire in explored space): ${report.deadLoops.join(', ')}`);
+        io.out(`Dead steps (never fire in explored space): ${report.deadSteps.join(', ')}`);
       }
       if (report.completePath) {
         io.out('');
         io.out(`Example completion path:`);
-        io.out(`  ${report.completePath.map((s) => `${s.loop}/${s.outcome}`).join(' -> ') || '(already done)'}`);
+        io.out(`  ${report.completePath.map((s) => `${s.step}/${s.outcome}`).join(' -> ') || '(already done)'}`);
       }
     }
 
@@ -349,7 +349,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
           name: d.name,
           title: d.title ?? null,
           inputs: d.inputs.map((i) => i.name),
-          loops: d.loops.map((l) => l.name),
+          steps: d.steps.map((l) => l.name),
         })));
         return 0;
       }
@@ -434,7 +434,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
               ? JSON.stringify(ev.consumedInputs)
               : '(no fingerprint)';
             const produced = ev.producedStems.join(', ') || '(none)';
-            io.out(`#${ev.seq} ${ts} ${ev.loop}${keyPart} ${ev.outcome ?? 'open'} — consumed ${consumed} produced [${produced}]`);
+            io.out(`#${ev.seq} ${ts} ${ev.step}${keyPart} ${ev.outcome ?? 'open'} — consumed ${consumed} produced [${produced}]`);
             if (ev.summary) io.out(`    summary: ${ev.summary}`);
           }
           io.out('');

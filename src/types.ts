@@ -2,7 +2,7 @@
  * Shared types for the owenloop engine.
  *
  * The engine is domain-neutral: nothing here knows what a "PR" or a "report"
- * is. A workflow is a graph of loops wired by the artifacts they consume and
+ * is. A workflow is a graph of steps wired by the artifacts they consume and
  * produce; a step's eligibility to run is a pure function of artifact state.
  * See docs/design.md (a distillation of the dataflow-workflow-engine spec).
  */
@@ -25,16 +25,16 @@ export const SETTLED_STATES: ReadonlySet<Acceptance> = new Set<Acceptance>([
 ]);
 
 /** Who/what authored a lifecycle action. */
-export type Author = 'engine' | 'human' | string; // a loop name, or these specials
+export type Author = 'engine' | 'human' | string; // a step name, or these specials
 
 /**
  * The kind of an invalidation, for the §6 liveness accounting.
  *  - `judgment`: a consumer's verdict ("fix it") — counts toward the §6 stall.
  *  - `structural`: engine bookkeeping (cascade / born-rejected / re-arm) — does NOT count.
  *  - `validation`: a produced value failed its declared JSON Schema (§19) — counts
- *    toward a *separate* per-artifact stall bounded by the loop's `maxSchemaFailures`.
+ *    toward a *separate* per-artifact stall bounded by the step's `maxSchemaFailures`.
  *  - `invalidated-irreversible`: the artifact was rejected-and-held because its inputs
- *    moved and its producer loop declared `effect: { idempotent: false, onInvalidate: 'escalate' }`.
+ *    moved and its producer step declared `effect: { idempotent: false, onInvalidate: 'escalate' }`.
  *    The producer is NOT auto-eligible to re-fire; a human must intervene (retry / fix upstream).
  */
 export type RejectKind = 'judgment' | 'structural' | 'validation' | 'invalidated-irreversible';
@@ -74,7 +74,7 @@ export type Fingerprint = Record<string, number>;
 export interface ArtifactData {
   workflow: string; // workflow-instance uid
   path: string; // provenance path, e.g. "plan" or "gather.source[3]"
-  producer: string; // loop name that owns (produces) this artifact
+  producer: string; // step name that owns (produces) this artifact
   acceptance: Acceptance;
   version: number; // 0 until first green; bumps by 1 on each green (re)production
   value?: Record<string, unknown>; // captured handles (only meaningful when green)
@@ -91,7 +91,7 @@ export interface ArtifactData {
 /** A task/lease node — the claimable unit of work-in-flight (design §2.2). */
 export interface TaskData {
   workflow: string;
-  loop: string;
+  step: string;
   key: string; // binding identity: "" for plain/reduce/collection, element path for map
   status: 'idle' | 'claimed';
   run?: string; // run uid holding the lease
@@ -99,14 +99,14 @@ export interface TaskData {
   /** Last heartbeat timestamp (ms epoch). Updated by Engine.heartbeat(). */
   heartbeatAt?: number;
   attempts: number; // reaper strikes (lease churn), distinct from artifact judgmentRejects
-  /** Persisted alarm time (ms epoch) for idle evaluator loops. Stored in task row. */
+  /** Persisted alarm time (ms epoch) for idle evaluator steps. Stored in task row. */
   alarmAt?: number;
 }
 
 /** A run node — audit/budget trail, and the holder of a claim's fingerprint. */
 export interface RunData {
   workflow: string;
-  loop: string;
+  step: string;
   key?: string; // binding key of the claimed firing ("" for plain/reduce)
   outcome?: 'ok' | 'no_work' | 'failed' | 'skipped';
   summary?: string;
@@ -150,7 +150,7 @@ export interface ProducePattern {
 }
 
 /**
- * A loop-level trigger token that controls when the loop is eligible to fire.
+ * A step-level trigger token that controls when the step is eligible to fire.
  * - 'inputsGreen' (default) — classic behaviour: fire when consumed inputs are green.
  * - 'allGreen' — fire when the workflow is all-green (no debts among non-evaluator artifacts).
  * - 'idle' — fire when the workflow is quiescent past the idleAfter threshold (§21.8).
@@ -158,8 +158,8 @@ export interface ProducePattern {
 export type FiringTrigger = 'inputsGreen' | 'allGreen' | 'idle';
 
 /**
- * Declared per-loop effect contract (design §6.5). Controls forward-cascade routing
- * when the loop's green artifact's inputs move to a new version.
+ * Declared per-step effect contract (design §6.5). Controls forward-cascade routing
+ * when the step's green artifact's inputs move to a new version.
  */
 export interface EffectDef {
   /** If true (default), re-deriving the artifact after inputs move is safe.
@@ -168,26 +168,26 @@ export interface EffectDef {
   /** Routing when idempotent:false and an input moves.
    *  'pin'        — keep the artifact green, re-point fingerprint to current inputs.
    *  'escalate'   — reject the artifact as held; producer not auto-re-eligible.
-   *  '<loopName>' — pin the original AND arm the named handler loop (D-A/D-B).
+   *  '<stepName>' — pin the original AND arm the named handler step (D-A/D-B).
    *  Defaults to 'escalate' when idempotent:false and omitted. */
   onInvalidate?: 'pin' | 'escalate' | string;
 }
 
-/** A loop (step) definition. */
-export interface LoopDef {
+/** A step (step) definition. */
+export interface StepDef {
   name: string;
-  /** Inputs this loop reads — and, by the same declaration, the artifacts it has
+  /** Inputs this step reads — and, by the same declaration, the artifacts it has
    *  authority to judgment-`reject` (§4.1). Consuming is dual-purpose: it gates and
-   *  fingerprints the loop's firing (§3/§7) AND confers the right to send that
+   *  fingerprints the step's firing (§3/§7) AND confers the right to send that
    *  artifact back. To let a step invalidate an artifact, make it consume that
    *  artifact — even when the step only *judges* the artifact (e.g. the merger
    *  consuming `pr` to judge its mergeability) rather than transforming it. */
   consumes: ConsumePattern[];
   produces: ProducePattern[];
-  /** Artifacts this loop generates that are intentionally NOT consumed downstream.
+  /** Artifacts this step generates that are intentionally NOT consumed downstream.
    *  Lint-exempt from dead-end warnings. Unioned into `produces` at def-build time. */
   generates?: ProducePattern[];
-  /** input names this loop has authority to invalidate (defaults to its consumed stems) */
+  /** input names this step has authority to invalidate (defaults to its consumed stems) */
   invalidates: string[];
   cadence: string; // e.g. "30m"
   cadenceSecs: number;
@@ -198,26 +198,26 @@ export interface LoopDef {
   maxSchemaFailures: number;
   model?: string;
   workdir: string;
-  /** the loop's output is a destructive completion (e.g. a merge): green is terminal (§15.2) */
+  /** the step's output is a destructive completion (e.g. a merge): green is terminal (§15.2) */
   terminal?: boolean;
-  /** Loop-level effect contract (§6.5). Only consulted for non-terminal greens whose inputs move. */
+  /** Step-level effect contract (§6.5). Only consulted for non-terminal greens whose inputs move. */
   effect?: EffectDef;
-  /** Loop-level firing trigger (§21). Omitted = ['inputsGreen'] (default behaviour). */
+  /** Step-level firing trigger (§21). Omitted = ['inputsGreen'] (default behaviour). */
   on?: FiringTrigger[];
   /** Duration string for the idle threshold (e.g. "30m"). Required when 'idle' is in on:. */
   idleAfter?: string;
   /** Parsed idleAfter in milliseconds. */
   idleAfterMs?: number;
-  /** Per-loop reap TTL override in milliseconds. Falls back to the engine's DEFAULT_REAP_TTL_MS. */
+  /** Per-step reap TTL override in milliseconds. Falls back to the engine's DEFAULT_REAP_TTL_MS. */
   reapTtlMs?: number;
   body: string; // prompt body
-  /** Mode 2 foundation: name of the child workflow this loop delegates to. Machine-handled, never a worker firing. */
+  /** Mode 2 foundation: name of the child workflow this step delegates to. Machine-handled, never a worker firing. */
   calls?: string;
-  /** Mode 2 foundation: child input name → parent artifact name wiring for a calls: loop. */
+  /** Mode 2 foundation: child input name → parent artifact name wiring for a calls: step. */
   callsInputs?: Record<string, string>;
 }
 
-/** A workflow definition: a set of loops plus declared external inputs. */
+/** A workflow definition: a set of steps plus declared external inputs. */
 export interface WorkflowDef {
   name: string;
   title?: string;
@@ -225,20 +225,20 @@ export interface WorkflowDef {
   /** external inputs seeded as artifacts when an instance starts (e.g. "proposal") */
   inputs: InputDef[];
   /**
-   * Fully-expanded loop list. Raw YAML may contain `include:` directives (Mode 1, §22)
+   * Fully-expanded step list. Raw YAML may contain `include:` directives (Mode 1, §22)
    * that are expanded at load time by `expandIncludes`; the engine always sees a flat list.
    */
-  loops: LoopDef[];
+  steps: StepDef[];
   /** Workflow-level public outputs / embedding interface (design doc §5.2).
    *  Declared stems are intentional leaves: lint-exempt from dead-end warnings.
-   *  A stem listed here that no loop produces is a hard validateDef error. */
+   *  A stem listed here that no step produces is a hard validateDef error. */
   outputs?: string[];
   dir?: string; // source directory, if loaded from disk
   /** Declared safety invariants verified by `modelCheck`/`owenloop check`. */
   invariants?: InvariantDef[];
   /**
    * @internal Mode 1 include directives before expansion. Set by `buildDef` when a
-   * loop-list entry has an `include:` key. Consumed and removed by `expandIncludes`.
+   * step-list entry has an `include:` key. Consumed and removed by `expandIncludes`.
    * Never visible to the engine; always undefined on a fully-expanded def.
    */
   _includes?: Array<{ pos: number; defName: string; as: string; inputs: Record<string, string> }>;
@@ -262,7 +262,7 @@ export interface InputDef {
  * derived from the run's fingerprint and the workflow definition respectively.
  *
  * NOTE on causality: `producedStems` is structural (from the def) — we know
- * which stems this loop is responsible for, but there is no stored FK linking
+ * which stems this step is responsible for, but there is no stored FK linking
  * a specific run to the artifact version it produced. `consumedInputs` is from
  * the run's fingerprint (what versions of inputs were live at claim time) —
  * this IS a stored fact. The causal edge "run R produced version N of stem S"
@@ -272,7 +272,7 @@ export interface TimelineEvent {
   seq: number;               // 1-based sequence number, stable across renders
   at: number;                // run.createdAt (ms since epoch)
   endedAt: number;           // run.updatedAt (ms since epoch, last mutation)
-  loop: string;              // loop name
+  step: string;              // step name
   key: string;               // binding key ("" for plain/reduce, element path for map)
   outcome: string | undefined; // 'ok' | 'no_work' | 'failed' | 'skipped' | undefined (open)
   summary: string | undefined;
@@ -284,11 +284,11 @@ export interface TimelineEvent {
    */
   consumedInputs: Fingerprint | undefined;
   /**
-   * The stems this loop is declared to produce (from the def), not from a
-   * stored link. For map loops this is the map pattern stem (e.g.
+   * The stems this step is declared to produce (from the def), not from a
+   * stored link. For map steps this is the map pattern stem (e.g.
    * "gather.source[$i].formatcheck"); for collection producers it is the
    * collection stem (e.g. "gather.source"); for singletons it is the stem name.
-   * This is structural, not temporal — it tells you what the loop *could*
+   * This is structural, not temporal — it tells you what the step *could*
    * produce, not which version it produced in this specific run.
    */
   producedStems: string[];
@@ -297,7 +297,7 @@ export interface TimelineEvent {
 /** The lifecycle biography of one artifact: its current state + full event thread. */
 export interface ArtifactBiography {
   path: string;
-  producer: string;          // loop name
+  producer: string;          // step name
   terminal: boolean;
   acceptance: Acceptance;
   version: number;
@@ -337,9 +337,9 @@ export interface WorkflowTrace {
    * Honest representation of the inference gap: a green run does not append a
    * ReasonEntry and there is no stored produced_by_run FK. The causal edge
    * "run R produced version N of artifact A" is inferred by matching:
-   *   - the loop that produced A (from A.producer = run.loop)
-   *   - ordered by run.createdAt — the Nth 'ok' run of loop L is the likely
-   *     producer of version N of that loop's output
+   *   - the step that produced A (from A.producer = run.step)
+   *   - ordered by run.createdAt — the Nth 'ok' run of step L is the likely
+   *     producer of version N of that step's output
    * This is a heuristic and not guaranteed to be correct in the presence of
    * concurrent processes or clock skew. Do not rely on it for correctness
    * decisions; it is provided only for human readability.
@@ -359,14 +359,14 @@ export type GraphNodeState =
   | 'retracted'  // all outputs are retracted
   | 'none';      // no artifact data (static view or no artifacts yet)
 
-/** One node in the wiring graph: either a loop or an external input. */
+/** One node in the wiring graph: either a step or an external input. */
 export interface GraphNode {
-  id: string;              // stable identifier: loop name or input name
-  kind: 'loop' | 'input';
+  id: string;              // stable identifier: step name or input name
+  kind: 'step' | 'input';
   label: string;           // display label (same as id for now)
-  terminal?: boolean;      // loops only: declared terminal
-  parallel?: number;       // loops only: parallelism setting
-  model?: string;          // loops only: model hint
+  terminal?: boolean;      // steps only: declared terminal
+  parallel?: number;       // steps only: parallelism setting
+  model?: string;          // steps only: model hint
   /** Overlay: present only when artifacts were supplied to buildGraph */
   state?: GraphNodeState;
   /** Overlay: true when any output artifact is stalled */
@@ -375,8 +375,8 @@ export interface GraphNode {
 
 /** One directed edge: producer → consumer. */
 export interface GraphEdge {
-  from: string;            // node id (loop name or input name)
-  to: string;              // loop node id
+  from: string;            // node id (step name or input name)
+  to: string;              // step node id
   stem: string;            // the artifact stem crossing this edge
   mode: 'plain' | 'map' | 'reduce'; // consume mode at the to-node
   /** For map: the binder name (e.g. "i") — used for label generation */
@@ -394,9 +394,9 @@ export interface WorkflowGraph {
 
 // ---- model-checker types (§check) -------------------------------------------
 
-/** One step on a BFS path: a loop fired, on which key, with which outcome. */
+/** One step on a BFS path: a step fired, on which key, with which outcome. */
 export interface CheckStep {
-  loop: string;
+  step: string;
   key: string;      // "" for plain/reduce; element path for map
   outcome: 'green' | 'judgment-reject' | 'schema-reject' | 'skip' | 'retract' | 'emit-seal';
 }
@@ -428,10 +428,10 @@ export interface CheckReport {
   completable: boolean;
   completePath?: CheckStep[];
   /**
-   * Loop names that never appear as the firing loop in any explored transition
+   * Step names that never appear as the firing step in any explored transition
    * (dynamically dead within the bounded search).
    */
-  deadLoops: string[];
+  deadSteps: string[];
   /**
    * Invariants that are violated in some reachable state. Always present ([]
    * when no invariants declared or none violated). Each entry is deduplicated by

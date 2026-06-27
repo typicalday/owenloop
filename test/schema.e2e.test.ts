@@ -47,10 +47,10 @@ function harness(defsDir: string = FIXTURES) {
 
 const J = (v: unknown) => JSON.stringify(v);
 
-function claim(ow: any, wf: string, loop: string): any {
+function claim(ow: any, wf: string, step: string): any {
   const t = ow('tick', wf);
-  const o = t.orders.find((x: any) => x.loop === loop);
-  assert.ok(o, `expected an order for '${loop}', got: [${t.orders.map((x: any) => x.loop).join(', ')}]`);
+  const o = t.orders.find((x: any) => x.step === step);
+  assert.ok(o, `expected an order for '${step}', got: [${t.orders.map((x: any) => x.step).join(', ')}]`);
   return o;
 }
 
@@ -135,7 +135,7 @@ test('schema e2e: repeated failures stall the producer, and retry clears it', ()
   ow('close', wf, pl.run, '--outcome', 'no_work');
 
   // stalled: the planner is no longer re-armed
-  assert.equal(ow('tick', wf).orders.filter((o: any) => o.loop === 'planner').length, 0);
+  assert.equal(ow('tick', wf).orders.filter((o: any) => o.step === 'planner').length, 0);
   const debt = ow('status', wf).debts.find((d: any) => d.path === 'plan');
   assert.equal(debt.stalled, true);
   assert.equal(debt.kind, 'validation');
@@ -184,7 +184,7 @@ test('schema e2e: a schema-violating provide is refused (seedOwed input via the 
   // non-seedOwed input. Confirm the conforming create then proceeds normally.
   const ow = harness();
   const wf = ow('create', 'schemacheck', '--provide', `spec=${J({ goal: 'ok' })}`).workflow;
-  assert.ok(ow('status', wf).eligible.some((f: any) => f.loop === 'planner'));
+  assert.ok(ow('status', wf).eligible.some((f: any) => f.step === 'planner'));
   ow.cleanup();
 });
 

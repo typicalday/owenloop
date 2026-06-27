@@ -1,12 +1,12 @@
 # Provision → deliver (via calls:) → teardown.
 #
 # Demonstrates the Mode 2 `calls:` grammar (PR5a static foundation).
-# The `deliver` loop delegates to the `delivery` workflow at runtime —
+# The `deliver` step delegates to the `delivery` workflow at runtime —
 # PR5b will add the actual spawn/cascade-up/outcome-read behavior.
 #
 # Static guarantees provided by this PR:
 #   - Grammar: `calls: delivery` with `inputs:` wiring is parsed and validated.
-#   - `deliver` is excluded from eligibleFirings (machine-handled, not a worker loop).
+#   - `deliver` is excluded from eligibleFirings (machine-handled, not a worker step).
 #   - The `delivered` artifact is seeded as owed — a normal debt until PR5b greens it.
 #   - Cross-def calls: cycle check prevents delivery calling back to provisioned-delivery.
 #
@@ -25,7 +25,7 @@ inputs:
   - name: proposal
     seedOwed: true
 
-loops:
+steps:
   - name: provision
     consumes: [proposal]
     produces: [sandbox]

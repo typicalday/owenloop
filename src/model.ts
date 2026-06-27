@@ -32,7 +32,7 @@ import type {
   GraphNode,
   GraphNodeState,
   InvariantPredicate,
-  LoopDef,
+  StepDef,
   ProducePattern,
   RunData,
   TimelineEvent,
@@ -54,13 +54,13 @@ export interface TimeFacts {
   lastProgressMs: number;
   /** Whether any run is genuinely in flight (claimed + lease fresh). */
   inFlight: boolean;
-  /** Per-loop alarm_at values: loop name → alarm_at in ms (if set). */
+  /** Per-step alarm_at values: step name → alarm_at in ms (if set). */
   alarms: Map<string, number>;
 }
 
-/** A candidate run: a loop bound to a particular key, with its concrete edges. */
+/** A candidate run: a step bound to a particular key, with its concrete edges. */
 export interface Firing {
-  loop: string;
+  step: string;
   key: string; // "" for plain/reduce, the element path for a map element
   index?: number; // the bound element index, for map firings
   inputs: string[]; // concrete consumed input paths (all green) — the claim fingerprint domain
@@ -76,34 +76,34 @@ export type CascadeOp =
   | { kind: 'skip'; path: string; reason: string } // cascade skip down a dead branch
   | { kind: 'rearm'; path: string; reason: string } // skipped→owed when the branch revives
   | { kind: 'pin'; path: string; reason: string } // stays green, fingerprint re-pointed to current inputs
-  | { kind: 'arm'; handlerLoop: string; reason: string; path?: undefined }; // arm a handler loop on invalidation of L
+  | { kind: 'arm'; handlerStep: string; reason: string; path?: undefined }; // arm a handler step on invalidation of L
 
-// ---- loop shape classification ----------------------------------------------
+// ---- step shape classification ----------------------------------------------
 
-export function mapConsume(loop: LoopDef): ConsumePattern | undefined {
-  return loop.consumes.find((c) => c.mode === 'map');
+export function mapConsume(step: StepDef): ConsumePattern | undefined {
+  return step.consumes.find((c) => c.mode === 'map');
 }
-export function reduceConsume(loop: LoopDef): ConsumePattern | undefined {
-  return loop.consumes.find((c) => c.mode === 'reduce');
+export function reduceConsume(step: StepDef): ConsumePattern | undefined {
+  return step.consumes.find((c) => c.mode === 'reduce');
 }
-export function plainConsumes(loop: LoopDef): ConsumePattern[] {
-  return loop.consumes.filter((c) => c.mode === 'plain');
+export function plainConsumes(step: StepDef): ConsumePattern[] {
+  return step.consumes.filter((c) => c.mode === 'plain');
 }
 
-export type LoopMode = 'plain' | 'map' | 'reduce';
-export function loopMode(loop: LoopDef): LoopMode {
-  if (mapConsume(loop)) return 'map';
-  if (reduceConsume(loop)) return 'reduce';
+export type StepMode = 'plain' | 'map' | 'reduce';
+export function stepMode(step: StepDef): StepMode {
+  if (mapConsume(step)) return 'map';
+  if (reduceConsume(step)) return 'reduce';
   return 'plain';
 }
 
-export function mapProduce(loop: LoopDef): ProducePattern | undefined {
-  return loop.produces.find((p) => p.kind === 'map');
+export function mapProduce(step: StepDef): ProducePattern | undefined {
+  return step.produces.find((p) => p.kind === 'map');
 }
 /**
  * The concrete input artifact a map element binds on for index `i`. Normally the
  * bare collection member `stem[i]`. But when the map consume carries a suffix
- * (`stem[$i].sub` — the loop chains off *another* map's per-element output), the
+ * (`stem[$i].sub` — the step chains off *another* map's per-element output), the
  * gate is that suffixed per-element child `stem[i].sub`, not the bare member.
  * The bare member set still fixes the index space (cardinality, §11.1); the
  * suffix only moves where the greenness/fingerprint gate points.
@@ -111,15 +111,15 @@ export function mapProduce(loop: LoopDef): ProducePattern | undefined {
 export function mapInputPath(mc: ConsumePattern, index: number): string {
   return elementPath(mc.stem, index, mc.suffix);
 }
-/** The collection stem a loop produces (`gather.source` for `gather.source[]`), if any. */
-export function collectionStem(loop: LoopDef): string | undefined {
-  return loop.produces.find((p) => p.kind === 'collection')?.stem;
+/** The collection stem a step produces (`gather.source` for `gather.source[]`), if any. */
+export function collectionStem(step: StepDef): string | undefined {
+  return step.produces.find((p) => p.kind === 'collection')?.stem;
 }
-export function singletonProduces(loop: LoopDef): ProducePattern[] {
-  return loop.produces.filter((p) => p.kind === 'singleton');
+export function singletonProduces(step: StepDef): ProducePattern[] {
+  return step.produces.filter((p) => p.kind === 'singleton');
 }
-export function collectionProduces(loop: LoopDef): ProducePattern[] {
-  return loop.produces.filter((p) => p.kind === 'collection');
+export function collectionProduces(step: StepDef): ProducePattern[] {
+  return step.produces.filter((p) => p.kind === 'collection');
 }
 
 // ---- small predicates --------------------------------------------------------
@@ -165,20 +165,20 @@ export function isHeld(a: ArtifactData | undefined): boolean {
 }
 
 /** An artifact is frozen (no firing re-arms it) when either stall trips or it is held. */
-function frozen(a: ArtifactData | undefined, loop: LoopDef): boolean {
-  return isStalled(a, loop.maxAttempts) || isSchemaStalled(a, loop.maxSchemaFailures) || isHeld(a);
+function frozen(a: ArtifactData | undefined, step: StepDef): boolean {
+  return isStalled(a, step.maxAttempts) || isSchemaStalled(a, step.maxSchemaFailures) || isHeld(a);
 }
 
-/** Resolve the effective effect contract for a loop. Defaults: idempotent=true. */
-function resolvedEffect(loop: LoopDef | undefined): { idempotent: boolean; onInvalidate: 'pin' | 'escalate' | string } {
-  const idempotent = loop?.effect?.idempotent ?? true;
-  const onInvalidate = loop?.effect?.onInvalidate ?? 'escalate';
+/** Resolve the effective effect contract for a step. Defaults: idempotent=true. */
+function resolvedEffect(step: StepDef | undefined): { idempotent: boolean; onInvalidate: 'pin' | 'escalate' | string } {
+  const idempotent = step?.effect?.idempotent ?? true;
+  const onInvalidate = step?.effect?.onInvalidate ?? 'escalate';
   return { idempotent, onInvalidate };
 }
 
-/** The effective set of firing triggers for a loop. Defaults to ['inputsGreen']. */
-function resolvedTriggers(loop: LoopDef): FiringTrigger[] {
-  return loop.on ?? ['inputsGreen'];
+/** The effective set of firing triggers for a step. Defaults to ['inputsGreen']. */
+function resolvedTriggers(step: StepDef): FiringTrigger[] {
+  return step.on ?? ['inputsGreen'];
 }
 
 /**
@@ -208,8 +208,8 @@ export function members(arts: ArtifactMap, stem: string): ArtifactData[] {
   return out;
 }
 
-function loopByName(def: WorkflowDef, name: string): LoopDef | undefined {
-  return def.loops.find((l) => l.name === name);
+function stepByName(def: WorkflowDef, name: string): StepDef | undefined {
+  return def.steps.find((l) => l.name === name);
 }
 
 // ---- required inputs & fingerprints -----------------------------------------
@@ -217,13 +217,13 @@ function loopByName(def: WorkflowDef, name: string): LoopDef | undefined {
 /**
  * The concrete artifact paths `art` must rest on (all green) to legitimately be
  * green. This is the domain of its build fingerprint and the level-trigger's
- * standing check (§12.3). It is derived from the producer loop's consume
+ * standing check (§12.3). It is derived from the producer step's consume
  * patterns and the artifact's own role (seal / element / map child / singleton).
  */
 export function requiredInputs(def: WorkflowDef, arts: ArtifactMap, art: ArtifactData): string[] {
-  const loop = loopByName(def, art.producer);
-  if (!loop) return [];
-  const plain = plainConsumes(loop).map((c) => c.stem);
+  const step = stepByName(def, art.producer);
+  if (!step) return [];
+  const plain = plainConsumes(step).map((c) => c.stem);
 
   // a seal or a bare collection element rests only on the producer's plain inputs
   if (art.sealOf) return plain;
@@ -235,14 +235,14 @@ export function requiredInputs(def: WorkflowDef, arts: ArtifactMap, art: Artifac
   // member; with a suffixed map consume (`src[$i].dossier`, chaining off another
   // map) it is that suffixed child — so a stale dossier cascades to its assets.
   if (el && el.suffix !== '') {
-    const mc = mapConsume(loop);
+    const mc = mapConsume(step);
     if (mc) return [mapInputPath(mc, el.index), ...plain];
     return [elementPath(el.stem, el.index), ...plain];
   }
 
   // a singleton: a reduce output rests on the whole live set + seal; a plain
   // output rests only on its plain inputs
-  const rc = reduceConsume(loop);
+  const rc = reduceConsume(step);
   if (rc) {
     const live = members(arts, rc.stem).filter((m) => !isSettledOut(m));
     return [...live.map((m) => m.path), sealPath(rc.stem), ...plain];
@@ -298,20 +298,20 @@ export function pendingOwed(def: WorkflowDef, arts: ArtifactMap): ArtifactData[]
     out.push(a);
   };
 
-  // D-A: handler loops are dormant at creation — exclude their outputs from normal seeding.
-  // A loop H is a handler iff some other loop L declares effect.onInvalidate === H.name.
-  const handlerLoopNames = new Set<string>();
-  for (const loop of def.loops) {
-    const oi = loop.effect?.onInvalidate;
-    if (oi && oi !== 'pin' && oi !== 'escalate') handlerLoopNames.add(oi);
+  // D-A: handler steps are dormant at creation — exclude their outputs from normal seeding.
+  // A step H is a handler iff some other step L declares effect.onInvalidate === H.name.
+  const handlerStepNames = new Set<string>();
+  for (const step of def.steps) {
+    const oi = step.effect?.onInvalidate;
+    if (oi && oi !== 'pin' && oi !== 'escalate') handlerStepNames.add(oi);
   }
 
-  for (const loop of def.loops) {
-    if (handlerLoopNames.has(loop.name)) continue; // handler: dormant, skip normal seeding
-    const mode = loopMode(loop);
+  for (const step of def.steps) {
+    if (handlerStepNames.has(step.name)) continue; // handler: dormant, skip normal seeding
+    const mode = stepMode(step);
     if (mode === 'map') {
-      const mc = mapConsume(loop);
-      const mp = mapProduce(loop);
+      const mc = mapConsume(step);
+      const mp = mapProduce(step);
       if (!mc || !mp) continue;
       // the bare members fix the index space; a child is owed only once that
       // index's actual consumed input (bare member, or its suffixed child) greens
@@ -319,11 +319,11 @@ export function pendingOwed(def: WorkflowDef, arts: ArtifactMap): ArtifactData[]
         const el = parseElement(m.path);
         if (!el) continue;
         if (!isGreen(arts.get(mapInputPath(mc, el.index)))) continue;
-        ensure(bindProduce(mp, el.index), loop.name);
+        ensure(bindProduce(mp, el.index), step.name);
       }
     } else {
-      for (const p of singletonProduces(loop)) ensure(p.stem, loop.name);
-      for (const p of collectionProduces(loop)) ensure(sealPath(p.stem), loop.name, p.stem);
+      for (const p of singletonProduces(step)) ensure(p.stem, step.name);
+      for (const p of collectionProduces(step)) ensure(sealPath(p.stem), step.name, p.stem);
     }
   }
   return out;
@@ -332,28 +332,28 @@ export function pendingOwed(def: WorkflowDef, arts: ArtifactMap): ArtifactData[]
 // ---- eligibility (§3 / §11.4) ------------------------------------------------
 
 /**
- * Returns true if the idle trigger is eligible for this loop.
+ * Returns true if the idle trigger is eligible for this step.
  * Pure — takes only explicit parameters; no Date, no nowMs.
  *
  * Eligibility: now >= (alarm_at ?? last_progress + idleAfterMs)
  *   AND workflow is NOT done (has debts excluding evaluator outputs)
- *   AND no run is in-flight for this loop
+ *   AND no run is in-flight for this step
  */
 function idleEligible(
-  loop: LoopDef,
+  step: StepDef,
   arts: ArtifactMap,
   time: TimeFacts,
 ): boolean {
   const { now, lastProgressMs, inFlight, alarms } = time;
   if (inFlight) return false; // R12: in-flight ≠ idle
 
-  const idleAfterMs = loop.idleAfterMs!; // validated: idle requires idleAfter
-  const alarmAt = alarms.get(loop.name);
+  const idleAfterMs = step.idleAfterMs!; // validated: idle requires idleAfter
+  const alarmAt = alarms.get(step.name);
   const threshold = alarmAt ?? (lastProgressMs + idleAfterMs);
   if (now < threshold) return false;
 
   // Compute evaluator's own outputs to exclude from all-green check.
-  const evaluatorOutputs = new Set<string>(plainOutputs(loop));
+  const evaluatorOutputs = new Set<string>(plainOutputs(step));
 
   // Not-done gate: idle fires only when there ARE non-evaluator debts.
   // (If the workflow is all-green → allGreen fires, not idle.)
@@ -372,35 +372,35 @@ function idleEligible(
 export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: TimeFacts): Firing[] {
   const firings: Firing[] = [];
 
-  for (const loop of def.loops) {
-    // M2: calls: loops are machine-handled (PR5b spawns the child); never emit a worker firing.
-    if (loop.calls) continue;
+  for (const step of def.steps) {
+    // M2: calls: steps are machine-handled (PR5b spawns the child); never emit a worker firing.
+    if (step.calls) continue;
 
-    const triggers = resolvedTriggers(loop);
+    const triggers = resolvedTriggers(step);
     const hasInputsGreen = triggers.includes('inputsGreen');
     const hasAllGreen = triggers.includes('allGreen');
     const hasIdle = triggers.includes('idle');
 
     if (hasInputsGreen) {
-      const mode = loopMode(loop);
-      const plain = plainConsumes(loop);
+      const mode = stepMode(step);
+      const plain = plainConsumes(step);
       const plainPaths = plain.map((c) => c.stem);
       const plainSatisfied = plainPaths.every((p) => isGreen(arts.get(p)));
 
       if (mode === 'plain') {
         if (plainSatisfied) {
-          const outs = plainOutputs(loop).filter((p) => {
+          const outs = plainOutputs(step).filter((p) => {
             const a = arts.get(p);
-            return isDebt(a) && !frozen(a, loop);
+            return isDebt(a) && !frozen(a, step);
           });
           if (outs.length) {
-            firings.push({ loop: loop.name, key: '', inputs: plainPaths, outputs: outs });
+            firings.push({ step: step.name, key: '', inputs: plainPaths, outputs: outs });
           }
         }
       } else if (mode === 'map') {
         if (plainSatisfied) {
-          const mc = mapConsume(loop);
-          const mp = mapProduce(loop);
+          const mc = mapConsume(step);
+          const mp = mapProduce(step);
           if (mc && mp) {
             for (const m of members(arts, mc.stem)) {
               const el = parseElement(m.path);
@@ -411,9 +411,9 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
               if (!isGreen(arts.get(inPath))) continue;
               const outPath = bindProduce(mp, el.index);
               const outArt = arts.get(outPath);
-              if (!isDebt(outArt) || frozen(outArt, loop)) continue;
+              if (!isDebt(outArt) || frozen(outArt, step)) continue;
               firings.push({
-                loop: loop.name,
+                step: step.name,
                 key: m.path,
                 index: el.index,
                 inputs: [inPath, ...plainPaths],
@@ -424,22 +424,22 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
         }
       } else {
         // reduce
-        const rc = reduceConsume(loop);
+        const rc = reduceConsume(step);
         if (rc && plainSatisfied) {
           const seal = arts.get(sealPath(rc.stem));
           if (isGreen(seal)) {
             const mem = members(arts, rc.stem);
             const live = mem.filter((m) => !isSettledOut(m));
             if (!live.some((m) => !isGreen(m))) {
-              const outs = singletonProduces(loop)
+              const outs = singletonProduces(step)
                 .map((p) => p.stem)
                 .filter((p) => {
                   const a = arts.get(p);
-                  return isDebt(a) && !frozen(a, loop);
+                  return isDebt(a) && !frozen(a, step);
                 });
               if (outs.length) {
                 firings.push({
-                  loop: loop.name,
+                  step: step.name,
                   key: '',
                   inputs: [...live.map((m) => m.path), sealPath(rc.stem), ...plainPaths],
                   outputs: outs,
@@ -452,23 +452,23 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
     }
 
     if (hasAllGreen) {
-      // Compute the set of output paths this evaluator loop produces.
+      // Compute the set of output paths this evaluator step produces.
       // These are excluded from the all-green check (bootstrap exclusion).
-      const evaluatorOutputs = new Set<string>(plainOutputs(loop));
+      const evaluatorOutputs = new Set<string>(plainOutputs(step));
 
       // The workflow is all-green (excluding the evaluator's own outputs).
       const wfAllGreen = allArtifactsGreen(arts, evaluatorOutputs);
       if (wfAllGreen) {
         // Workflow IS all-green. Check if the evaluator still has a debt to discharge.
-        const outs = plainOutputs(loop).filter((p) => {
+        const outs = plainOutputs(step).filter((p) => {
           const a = arts.get(p);
-          return isDebt(a) && !frozen(a, loop);
+          return isDebt(a) && !frozen(a, step);
         });
         if (outs.length > 0) {
           firings.push({
-            loop: loop.name,
+            step: step.name,
             key: '',
-            inputs: [], // allGreen loop has no consumed inputs to fingerprint
+            inputs: [], // allGreen step has no consumed inputs to fingerprint
             outputs: outs,
             cause: 'allGreen',
           });
@@ -477,14 +477,14 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
     }
 
     if (hasIdle && time) {
-      if (idleEligible(loop, arts, time)) {
-        const outs = plainOutputs(loop).filter((p) => {
+      if (idleEligible(step, arts, time)) {
+        const outs = plainOutputs(step).filter((p) => {
           const a = arts.get(p);
-          return isDebt(a) && !frozen(a, loop);
+          return isDebt(a) && !frozen(a, step);
         });
         if (outs.length > 0) {
           firings.push({
-            loop: loop.name,
+            step: step.name,
             key: '',
             inputs: [],
             outputs: outs,
@@ -498,11 +498,11 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
   return firings;
 }
 
-/** The concrete output paths a plain loop drives eligibility from (singletons + seals). */
-function plainOutputs(loop: LoopDef): string[] {
+/** The concrete output paths a plain step drives eligibility from (singletons + seals). */
+function plainOutputs(step: StepDef): string[] {
   const out: string[] = [];
-  for (const p of singletonProduces(loop)) out.push(p.stem);
-  for (const p of collectionProduces(loop)) out.push(sealPath(p.stem));
+  for (const p of singletonProduces(step)) out.push(p.stem);
+  for (const p of collectionProduces(step)) out.push(sealPath(p.stem));
   return out;
 }
 
@@ -563,7 +563,7 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
       if (!offender && versionsOk) continue; // invariant holds
 
       // Dead/settled input: structural cascade (retract or skip). NOT gated by effect:
-      // (§17.5 — dead-input cascade for non-idempotent loops is unconditionally structural).
+      // (§17.5 — dead-input cascade for non-idempotent steps is unconditionally structural).
       if (offender && offenderPath) {
         ops.push(cascadeFromDeadInput(art.path, offender, offenderPath, isMapChild));
         continue;
@@ -571,8 +571,8 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
 
       // All inputs are green but at least one moved (version changed). Route on effect:.
       const moved = req.find((p) => (arts.get(p)?.version ?? -1) !== (art.fingerprint ?? {})[p]);
-      const producerLoop = loopByName(def, art.producer);
-      const effect = resolvedEffect(producerLoop);
+      const producerStep = stepByName(def, art.producer);
+      const effect = resolvedEffect(producerStep);
 
       if (effect.idempotent) {
         // Default (idempotent=true): re-arm as before. No behavior change for existing defs.
@@ -584,7 +584,7 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
         // Named handler (D-B): pin the original L + arm the handler H.
         // Pin re-points fingerprint so the next pass sees invariant holds (no thrash, D-C).
         ops.push({ kind: 'pin', path: art.path, reason: `pinned: ${moved ?? 'an input'} moved; original kept green, handler '${effect.onInvalidate}' armed` });
-        ops.push({ kind: 'arm', handlerLoop: effect.onInvalidate, reason: `handler '${effect.onInvalidate}' armed: L='${art.producer}' artifact pinned on input move` });
+        ops.push({ kind: 'arm', handlerStep: effect.onInvalidate, reason: `handler '${effect.onInvalidate}' armed: L='${art.producer}' artifact pinned on input move` });
       } else {
         // Escalate: reject-and-hold — producer must not auto-fire; surfaces as stalled.
         ops.push({ kind: 'reject', path: art.path, held: true, reason: `held: ${moved ?? 'an input'} moved; irreversible — escalate to human (effect.onInvalidate=escalate)` });
@@ -609,16 +609,16 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
     (a) => a.acceptance === 'green' && a.terminal === true,
   );
 
-  // allGreen re-arm: a green outcome of an allGreen-triggered loop is re-armed
+  // allGreen re-arm: a green outcome of an allGreen-triggered step is re-armed
   // when the workflow is no longer all-green (excluding the evaluator's own outputs).
   // This ensures the evaluator re-fires if the workflow later falls out of done.
-  for (const loop of def.loops) {
-    const triggers = resolvedTriggers(loop);
+  for (const step of def.steps) {
+    const triggers = resolvedTriggers(step);
     if (!triggers.includes('allGreen')) continue;
     if (anyTerminalGreen) continue; // sealed — terminal artifact already green
 
     // Compute this evaluator's output paths.
-    const evaluatorOutputPaths = plainOutputs(loop);
+    const evaluatorOutputPaths = plainOutputs(step);
     const evaluatorOutputSet = new Set<string>(evaluatorOutputPaths);
 
     // Check workflow all-green status excluding this evaluator's outputs.
@@ -640,13 +640,13 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
   // idle heartbeat re-arm: if an idle evaluator's outcome is green AND the idle
   // threshold has elapsed again (alarm set by the evaluator), re-arm outcome.
   if (time) {
-    for (const loop of def.loops) {
-      const triggers = resolvedTriggers(loop);
+    for (const step of def.steps) {
+      const triggers = resolvedTriggers(step);
       if (!triggers.includes('idle')) continue;
-      if (!idleEligible(loop, arts, time)) continue; // threshold not reached
+      if (!idleEligible(step, arts, time)) continue; // threshold not reached
       if (anyTerminalGreen) continue; // sealed — terminal artifact already green
 
-      const evaluatorOutputPaths = plainOutputs(loop);
+      const evaluatorOutputPaths = plainOutputs(step);
       for (const path of evaluatorOutputPaths) {
         const art = arts.get(path);
         if (!art || art.acceptance !== 'green' || art.terminal) continue;
@@ -681,8 +681,8 @@ function cascadeFromDeadInput(
 // ---- observability (§17) -----------------------------------------------------
 
 export interface Blocker {
-  loop: string;
-  blockedOn: string[]; // non-green inputs holding the loop back
+  step: string;
+  blockedOn: string[]; // non-green inputs holding the step back
 }
 
 export interface WorkflowStatus {
@@ -695,7 +695,7 @@ export interface WorkflowStatus {
     stalled: boolean;
     reason?: string;
     /**
-     * Consecutive trailing `failed` runs for this debt's producer (crash-loop
+     * Consecutive trailing `failed` runs for this debt's producer (crash-step
      * signal). Enriched by `engine.status()` from the run log — `workflowStatus`
      * is pure and never sets it. Absent when zero or unknown.
      */
@@ -726,7 +726,7 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
             ? 'invalidated-irreversible'
             : 'structural'
       : 'unbuilt';
-    const prod = loopByName(def, a.producer);
+    const prod = stepByName(def, a.producer);
     // Held artifacts (isHeld) surface as stalled: true — they require human intervention.
     const stalled =
       !!prod && (isStalled(a, prod.maxAttempts) || isSchemaStalled(a, prod.maxSchemaFailures) || isHeld(a));
@@ -737,38 +737,38 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
   debts.sort((x, y) => x.path.localeCompare(y.path));
 
   const eligible = eligibleFirings(def, arts);
-  const eligibleLoops = new Set(eligible.map((f) => f.loop));
+  const eligibleSteps = new Set(eligible.map((f) => f.step));
 
   const blocked: Blocker[] = [];
-  for (const loop of def.loops) {
-    if (eligibleLoops.has(loop.name)) continue;
-    if (!loopOwesSomething(def, loop, arts)) continue; // owes nothing → done, not blocked
-    const blockedOn = blockingInputs(def, loop, arts);
-    if (blockedOn.length) blocked.push({ loop: loop.name, blockedOn });
+  for (const step of def.steps) {
+    if (eligibleSteps.has(step.name)) continue;
+    if (!stepOwesSomething(def, step, arts)) continue; // owes nothing → done, not blocked
+    const blockedOn = blockingInputs(def, step, arts);
+    if (blockedOn.length) blocked.push({ step: step.name, blockedOn });
   }
 
   const done = ![...arts.values()].some((a) => DEBT_STATES.has(a.acceptance));
   return { done, debts, eligible, blocked };
 }
 
-function loopOwesSomething(def: WorkflowDef, loop: LoopDef, arts: ArtifactMap): boolean {
-  const mode = loopMode(loop);
+function stepOwesSomething(def: WorkflowDef, step: StepDef, arts: ArtifactMap): boolean {
+  const mode = stepMode(step);
   if (mode === 'map') {
-    const mc = mapConsume(loop);
-    const mp = mapProduce(loop);
+    const mc = mapConsume(step);
+    const mp = mapProduce(step);
     if (!mc || !mp) return false;
     return members(arts, mc.stem).some((m) => {
       const el = parseElement(m.path);
       return el ? isDebt(arts.get(bindProduce(mp, el.index))) : false;
     });
   }
-  return plainOutputs(loop).some((p) => isDebt(arts.get(p)));
+  return plainOutputs(step).some((p) => isDebt(arts.get(p)));
 }
 
-function blockingInputs(def: WorkflowDef, loop: LoopDef, arts: ArtifactMap): string[] {
+function blockingInputs(def: WorkflowDef, step: StepDef, arts: ArtifactMap): string[] {
   const out: string[] = [];
-  for (const c of plainConsumes(loop)) if (!isGreen(arts.get(c.stem))) out.push(c.stem);
-  const rc = reduceConsume(loop);
+  for (const c of plainConsumes(step)) if (!isGreen(arts.get(c.stem))) out.push(c.stem);
+  const rc = reduceConsume(step);
   if (rc) {
     const seal = sealPath(rc.stem);
     if (!isGreen(arts.get(seal))) out.push(seal);
@@ -778,8 +778,8 @@ function blockingInputs(def: WorkflowDef, loop: LoopDef, arts: ArtifactMap): str
   }
   // a map child that owes but can't fire is blocked on its per-element input
   // (its bare member, or — for a chained map — the suffixed child upstream owes)
-  const mc = mapConsume(loop);
-  const mp = mapProduce(loop);
+  const mc = mapConsume(step);
+  const mp = mapProduce(step);
   if (mc && mp) {
     for (const m of members(arts, mc.stem)) {
       const el = parseElement(m.path);
@@ -842,18 +842,18 @@ export function buildTrace(
   // --- step 1: build an ArtifactMap for workflowStatus reuse ---
   const artMap: ArtifactMap = new Map(artifacts.map((a) => [a.path, a]));
 
-  // --- step 2: build the loop → producedStems map from the def ---
-  // For map loops: the raw produce pattern string (e.g. "gather.source[$i].formatcheck")
+  // --- step 2: build the step → producedStems map from the def ---
+  // For map steps: the raw produce pattern string (e.g. "gather.source[$i].formatcheck")
   // For collection producers: the collection stem (e.g. "gather.source")
   // For singletons: the stem name (e.g. "plan", "pr")
-  const loopProducedStems = new Map<string, string[]>();
-  for (const loop of def.loops) {
+  const stepProducedStems = new Map<string, string[]>();
+  for (const step of def.steps) {
     const stems: string[] = [];
-    for (const p of singletonProduces(loop)) stems.push(p.stem);
-    for (const p of collectionProduces(loop)) stems.push(p.stem);
-    const mp = mapProduce(loop);
+    for (const p of singletonProduces(step)) stems.push(p.stem);
+    for (const p of collectionProduces(step)) stems.push(p.stem);
+    const mp = mapProduce(step);
     if (mp) stems.push(mp.raw); // use the raw pattern (e.g. "gather.source[$i].check")
-    loopProducedStems.set(loop.name, stems);
+    stepProducedStems.set(step.name, stems);
   }
 
   // --- step 3: build the timeline ---
@@ -868,13 +868,13 @@ export function buildTrace(
     seq: idx + 1,
     at: run.createdAt,
     endedAt: run.updatedAt,
-    loop: run.loop,
+    step: run.step,
     key: run.key ?? '',
     outcome: run.outcome,
     summary: run.summary,
     sessionId: run.sessionId,
     consumedInputs: run.fingerprint,
-    producedStems: loopProducedStems.get(run.loop) ?? [],
+    producedStems: stepProducedStems.get(run.step) ?? [],
   }));
 
   // --- step 4: build artifact biographies ---
@@ -893,11 +893,11 @@ export function buildTrace(
         if (e.action === 'retry') totalRetries++;
       }
 
-      // Check stall: need the producer loop's caps
-      const producerLoop = def.loops.find((l) => l.name === art.producer);
-      if (producerLoop) {
-        const stallJ = isStalled(art, producerLoop.maxAttempts);
-        const stallS = isSchemaStalled(art, producerLoop.maxSchemaFailures);
+      // Check stall: need the producer step's caps
+      const producerStep = def.steps.find((l) => l.name === art.producer);
+      if (producerStep) {
+        const stallJ = isStalled(art, producerStep.maxAttempts);
+        const stallS = isSchemaStalled(art, producerStep.maxSchemaFailures);
         if (stallJ || stallS) stalledArtifacts.push(art.path);
       }
 
@@ -936,10 +936,10 @@ export function buildTrace(
     },
     inferenceNote:
       'producedStems is derived from the workflow definition (structural) and ' +
-      'identifies which stems a loop is responsible for, not which version it ' +
+      'identifies which stems a step is responsible for, not which version it ' +
       'produced in a specific run. consumedInputs is the run fingerprint (a ' +
       'stored fact at claim time). The causal edge run→artifact-version is an ' +
-      'inference: the Nth ok run of loop L corresponds to version N of its ' +
+      'inference: the Nth ok run of step L corresponds to version N of its ' +
       "output stems. This is a heuristic — no stored FK exists (by design, " +
       "to avoid schema changes).",
   };
@@ -956,7 +956,7 @@ export function buildTrace(
  *
  * Edge derivation replicates validateDef's producerOf map exactly:
  *   inputs → input node id (= input name)
- *   singleton/collection produces → the loop that produces them
+ *   singleton/collection produces → the step that produces them
  *   map produces (per-element) are NOT registered in producerOf —
  *     they live under the collection they annotate
  *
@@ -970,13 +970,13 @@ export function buildGraph(
   artifacts?: ReadonlyArray<ArtifactData>,
 ): WorkflowGraph {
   // --- 1. Build producerOf exactly as validateDef does ---
-  const producerOf = new Map<string, string>(); // stem → node id (input name or loop name)
+  const producerOf = new Map<string, string>(); // stem → node id (input name or step name)
   const collectionStems = new Set<string>();
 
   for (const inp of def.inputs) {
     producerOf.set(inp.name, inp.name); // input node id = input name
   }
-  for (const l of def.loops) {
+  for (const l of def.steps) {
     for (const p of l.produces) {
       if (p.kind === 'collection') {
         collectionStems.add(p.stem);
@@ -996,11 +996,11 @@ export function buildGraph(
     nodes.push({ id: inp.name, kind: 'input', label: inp.name });
   }
 
-  // Loop nodes — overlay state computed below
-  for (const l of def.loops) {
+  // Step nodes — overlay state computed below
+  for (const l of def.steps) {
     const node: GraphNode = {
       id: l.name,
-      kind: 'loop',
+      kind: 'step',
       label: l.name,
     };
     if (l.terminal) node.terminal = true;
@@ -1012,7 +1012,7 @@ export function buildGraph(
   // --- 3. Build edges ---
   const edges: GraphEdge[] = [];
 
-  for (const l of def.loops) {
+  for (const l of def.steps) {
     for (const c of l.consumes) {
       // Resolve producer: look up c.stem in producerOf
       const producerNode = producerOf.get(c.stem) ?? `__dangling__${c.stem}`;
@@ -1034,13 +1034,13 @@ export function buildGraph(
   // --- 4. Overlay: annotate nodes with live artifact state ---
   const hasOverlay = artifacts !== undefined && artifacts.length > 0;
   if (artifacts && artifacts.length > 0) {
-    // Build a loop name → LoopDef map for cap lookup
-    const loopMap = new Map<string, LoopDef>(def.loops.map((l) => [l.name, l]));
+    // Build a step name → StepDef map for cap lookup
+    const stepMap = new Map<string, StepDef>(def.steps.map((l) => [l.name, l]));
     // Build a set of input names for membership test
     const inputNames = new Set<string>(def.inputs.map((i) => i.name));
 
     // Group artifacts for node lookup:
-    //   - loop nodes:  match by a.producer (= loop name)
+    //   - step nodes:  match by a.producer (= step name)
     //   - input nodes: match by a.path (= input name), since inputs have producer = 'human'
     const byProducer = new Map<string, ArtifactData[]>();
     const byPath = new Map<string, ArtifactData>();
@@ -1052,7 +1052,7 @@ export function buildGraph(
     }
 
     for (const node of nodes) {
-      // For input nodes, look up by path; for loop nodes, look up by producer name.
+      // For input nodes, look up by path; for step nodes, look up by producer name.
       const nodeArts: ArtifactData[] =
         node.kind === 'input'
           ? (inputNames.has(node.id) && byPath.has(node.id) ? [byPath.get(node.id)!] : [])
@@ -1062,9 +1062,9 @@ export function buildGraph(
         continue;
       }
 
-      const loop = loopMap.get(node.id);
-      const maxAttempts = loop?.maxAttempts ?? 3;
-      const maxSchema = loop?.maxSchemaFailures ?? 5;
+      const step = stepMap.get(node.id);
+      const maxAttempts = step?.maxAttempts ?? 3;
+      const maxSchema = step?.maxSchemaFailures ?? 5;
 
       // Determine worst-state using priority: stalled > rejected > owed > skipped/retracted > green
       let worstState: GraphNodeState = 'green';
@@ -1304,15 +1304,15 @@ function applyOpInMemory(
   if (op.kind === 'arm') {
     // Arm the handler: materialize each of its singleton/collection outputs as owed
     // if absent, or re-arm to owed if currently green (re-invalidation, D-C re-arm).
-    const handlerLoop = def.loops.find((l) => l.name === op.handlerLoop);
-    if (!handlerLoop) return;
-    for (const p of handlerLoop.produces.filter((pp) => pp.kind === 'singleton')) {
+    const handlerStep = def.steps.find((l) => l.name === op.handlerStep);
+    if (!handlerStep) return;
+    for (const p of handlerStep.produces.filter((pp) => pp.kind === 'singleton')) {
       const existing = arts.get(p.stem);
       if (!existing) {
         arts.set(p.stem, {
           workflow: '',
           path: p.stem,
-          producer: handlerLoop.name,
+          producer: handlerStep.name,
           acceptance: 'owed',
           version: 0,
           reasons: [],
@@ -1326,14 +1326,14 @@ function applyOpInMemory(
       // If owed or rejected already, no change needed (already a debt).
     }
     // Collection seals: same pattern on sealPath(stem).
-    for (const p of handlerLoop.produces.filter((pp) => pp.kind === 'collection')) {
+    for (const p of handlerStep.produces.filter((pp) => pp.kind === 'collection')) {
       const sealKey = p.stem + '.sealed';
       const existing = arts.get(sealKey);
       if (!existing) {
         arts.set(sealKey, {
           workflow: '',
           path: sealKey,
-          producer: handlerLoop.name,
+          producer: handlerStep.name,
           acceptance: 'owed',
           version: 0,
           reasons: [],
@@ -1462,16 +1462,16 @@ function eligibleOutcomes(
   arts: Map<string, ArtifactData>,
   firing: Firing,
 ): CheckStep['outcome'][] {
-  const loop = def.loops.find((l) => l.name === firing.loop);
-  if (!loop) return ['green'];
-  const stem = collectionStem(loop);
+  const step = def.steps.find((l) => l.name === firing.step);
+  if (!step) return ['green'];
+  const stem = collectionStem(step);
   const outPath = firing.outputs[0] ?? '';
   const el = parseElement(outPath);
   const isMember = !!el && el.suffix === '';
 
   const outcomes: CheckStep['outcome'][] = [];
   if (stem && !el) {
-    // collection producer (plain loop with collection output) — emit-seal path
+    // collection producer (plain step with collection output) — emit-seal path
     outcomes.push('emit-seal');
     return outcomes;
   }
@@ -1479,7 +1479,7 @@ function eligibleOutcomes(
   outcomes.push('green');
 
   // judgment-reject is only valid when the firing has at least one consumed input
-  // from a loop producer (not 'human'). A loop can only invalidate artifacts it
+  // from a step producer (not 'human'). A step can only invalidate artifacts it
   // didn't originally seed — rejecting a human-provided input is not modeled here
   // (the engine's assertAuthority enforces this at runtime).
   const hasRejectableInput = firing.inputs.some((p) => {
@@ -1505,9 +1505,9 @@ function applyEmitSeal(
   firing: Firing,
   maxCollectionSize: number,
 ): Array<Map<string, ArtifactData>> {
-  const loop = def.loops.find((l) => l.name === firing.loop);
-  if (!loop) return [];
-  const stem = collectionStem(loop);
+  const step = def.steps.find((l) => l.name === firing.step);
+  if (!step) return [];
+  const stem = collectionStem(step);
   if (!stem) return [];
   const sealP = sealPath(stem);
   const sealArt = arts.get(sealP);
@@ -1529,7 +1529,7 @@ function applyEmitSeal(
       next.set(p, {
         workflow: '',
         path: p,
-        producer: firing.loop,
+        producer: firing.step,
         acceptance: 'green',
         version: 1,
         fingerprint: fp,
@@ -1558,7 +1558,7 @@ function applyEmitSeal(
  *   'green'           — singleton/map output: acceptance green, version+1,
  *                       fingerprint = computeFingerprint(arts, firing.inputs)
  *   'judgment-reject' — reject the primary consumed input (the green artifact
- *                       the loop consumes that it has authority to invalidate),
+ *                       the step consumes that it has authority to invalidate),
  *                       bumping judgmentRejects+1
  *   'schema-reject'   — acceptance rejected, schemaRejects+1 on the output
  *   'skip'            — acceptance skipped + fingerprint of requiredInputs
@@ -1588,7 +1588,7 @@ export function applyOutcome(
   if (outcome === 'judgment-reject') {
     // judgment-reject is a CONSUMER action on a CONSUMED artifact, not on the output.
     // Identify the "reject target" — the primary consumed artifact that this
-    // firing loop can invalidate. This is the first input that has a loop producer
+    // firing step can invalidate. This is the first input that has a step producer
     // (not 'human') and is currently green. If no such input exists, this outcome
     // is a no-op (eligibleOutcomes guards against this case).
     const rejectTarget = firing.inputs.find((p) => {
@@ -1613,7 +1613,7 @@ export function applyOutcome(
   const art = next.get(outPath);
   if (!art) return [settleInMemory(def, next)];
 
-  const loop = def.loops.find((l) => l.name === firing.loop);
+  const step = def.steps.find((l) => l.name === firing.step);
 
   if (outcome === 'green') {
     const fp = computeFingerprint(arts, firing.inputs);
@@ -1623,7 +1623,7 @@ export function applyOutcome(
       version: art.version + 1,
       fingerprint: fp,
     };
-    if (loop?.terminal) updated.terminal = true;
+    if (step?.terminal) updated.terminal = true;
     next.set(outPath, updated);
   } else if (outcome === 'schema-reject') {
     next.set(outPath, {
@@ -1662,12 +1662,12 @@ export function applyOutcome(
  */
 function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string {
   const parts: string[] = [];
-  const loopMap = new Map(def.loops.map((l) => [l.name, l]));
+  const stepMap = new Map(def.steps.map((l) => [l.name, l]));
 
   for (const [path, art] of [...arts.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-    const loop = loopMap.get(art.producer);
-    const maxAttempts = loop?.maxAttempts ?? 3;
-    const maxSchema = loop?.maxSchemaFailures ?? 5;
+    const step = stepMap.get(art.producer);
+    const maxAttempts = step?.maxAttempts ?? 3;
+    const maxSchema = step?.maxSchemaFailures ?? 5;
 
     const vRank = art.version === 0 ? 0 : art.acceptance === 'green' ? 1 : 2;
     const jBucket = Math.min(art.judgmentRejects, maxAttempts);
@@ -1699,7 +1699,7 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
  * - deadlocks: reachable states that are not done and have no eligible firings
  * - stuck states: reachable states with a stalled debt
  * - completability: whether any reachable state is done (with an example path)
- * - dead loops: loops whose name never appears as a firing in any explored transition
+ * - dead steps: steps whose name never appears as a firing in any explored transition
  *
  * Pure — no store, no engine, no IO.
  */
@@ -1729,14 +1729,14 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     stuck: [],
     completable: false,
     completePath: undefined,
-    deadLoops: [],
+    deadSteps: [],
     invariantViolations: [],
     stats: { statesExplored: 0, depthReached: 0 },
   };
 
   /** Invariant names already recorded (BFS → first hit is the shortest path). */
   const reportedInvariants = new Set<string>();
-  const firedLoops = new Set<string>();
+  const firedSteps = new Set<string>();
   let depthReached = 0;
   const boundsHit = new Set<'maxDepth' | 'maxStates'>();
 
@@ -1800,7 +1800,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 
     // Expand successors
     outer: for (const firing of firings) {
-      firedLoops.add(firing.loop);
+      firedSteps.add(firing.step);
       const outcomes = eligibleOutcomes(def, node.arts, firing);
 
       for (const outcome of outcomes) {
@@ -1810,7 +1810,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
           break outer;
         }
 
-        const step: CheckStep = { loop: firing.loop, key: firing.key, outcome };
+        const step: CheckStep = { step: firing.step, key: firing.key, outcome };
         const successors = applyOutcome(def, node.arts, firing, outcome, { maxCollectionSize });
 
         for (const suc of successors) {
@@ -1830,9 +1830,9 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   report.boundsHit = [...boundsHit];
   report.bounded = boundsHit.size > 0;
 
-  // Dead loops: loops in the def that never appeared as a firing.loop
-  report.deadLoops = def.loops
-    .filter((l) => !firedLoops.has(l.name))
+  // Dead steps: steps in the def that never appeared as a firing.step
+  report.deadSteps = def.steps
+    .filter((l) => !firedSteps.has(l.name))
     .map((l) => l.name);
 
   return report;

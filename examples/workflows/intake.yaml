@@ -41,7 +41,7 @@ inputs:
         format: { enum: [json, csv, rss] }
       additionalProperties: false
 
-loops:
+steps:
   - name: parse
     consumes: [request]
     maxSchemaFailures: 3       # stall `spec` after 3 malformed commits (§18); `retry` clears it

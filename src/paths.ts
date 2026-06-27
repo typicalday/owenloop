@@ -8,7 +8,7 @@
  *   plain     plan                       — exact singleton
  *   map       gather.source[$i]          — binds per element (fires once per element)
  *   reduce    gather.source[*]           — globs the whole set (fires once)
- *   collection (produces)  gather.source[]   — declares the loop emits a collection
+ *   collection (produces)  gather.source[]   — declares the step emits a collection
  *   map output (produces)  gather.source[$i].formatcheck  — one output per element
  *
  * A path carries at most one index token `[n]`; that is sufficient for every
@@ -90,7 +90,7 @@ export function parseProduce(raw: string): ProducePattern {
     return { raw: r, kind: 'collection', stem: m[1] as string, suffix: '' };
   }
   if (REDUCE_RE.test(r)) {
-    throw new Error(`a loop cannot 'produce' a reduce glob: '${raw}'`);
+    throw new Error(`a step cannot 'produce' a reduce glob: '${raw}'`);
   }
   if (ELEMENT_RE.test(r)) {
     throw new Error(`produce must not hardcode an index: '${raw}'`);

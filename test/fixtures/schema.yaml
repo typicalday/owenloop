@@ -13,7 +13,7 @@ inputs:
       properties:
         goal: { type: string, minLength: 1 }
       additionalProperties: false
-loops:
+steps:
   - name: planner
     consumes: [spec]
     maxSchemaFailures: 2

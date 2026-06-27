@@ -6,7 +6,7 @@
  * operator would hit: the map `parallel` cap (§3), map and reduce as concurrent
  * branches that gate on members not verdicts (§3/§11), the reason thread riding
  * the next order (§4), stall → retry → re-stall with `blocked` excluding the
- * stalled loop (§6/§17), the level-trigger re-firing on a re-provided input and
+ * stalled step (§6/§17), the level-trigger re-firing on a re-provided input and
  * staying idempotent on a healthy graph (§7), and the `unbuilt` status kind (§17).
  * All drive the real binary against real SQLite.
  */
@@ -36,15 +36,15 @@ function harness(defsDir: string = EXAMPLES) {
 }
 
 const J = (v: unknown) => JSON.stringify(v);
-const find = (tick: any, loop: string) => tick.orders.find((o: any) => o.loop === loop);
+const find = (tick: any, step: string) => tick.orders.find((o: any) => o.step === step);
 const arts = (ow: any, wf: string) => ow('show', wf) as any[];
 const art = (ow: any, wf: string, path: string) => arts(ow, wf).find((a) => a.path === path);
 
 /** Build a delivery to all-green-but-not-merged; returns the workflow id. */
 function deliverToVerdict(ow: any): string {
   const wf = ow('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).workflow;
-  for (const [loop, out] of [['planner', 'plan'], ['builder', 'pr'], ['reviewer', 'verdict']] as const) {
-    const o = find(ow('tick', wf), loop);
+  for (const [step, out] of [['planner', 'plan'], ['builder', 'pr'], ['reviewer', 'verdict']] as const) {
+    const o = find(ow('tick', wf), step);
     ow('green', wf, o.run, out, '--value', J({}));
     ow('close', wf, o.run);
   }
@@ -63,12 +63,12 @@ test('§3 map: a single tick claims at most `parallel` element firings', () => {
   ow('seal', wf, s.run);
   ow('close', wf, s.run);
 
-  const inFlight = (t: any) => t.orders.filter((o: any) => o.loop === 'work').length;
+  const inFlight = (t: any) => t.orders.filter((o: any) => o.step === 'work').length;
   const t1 = ow('tick', wf);
   assert.equal(inFlight(t1), 2, 'cap=2 even though 5 elements are eligible');
   assert.equal(inFlight(ow('tick', wf)), 0, 'nothing more claimable while the 2 leases are held');
 
-  for (const o of t1.orders.filter((o: any) => o.loop === 'work')) {
+  for (const o of t1.orders.filter((o: any) => o.step === 'work')) {
     ow('green', wf, o.run, o.outputs[0], '--value', J({}));
     ow('close', wf, o.run);
   }
@@ -86,7 +86,7 @@ test('§3 reduce gates on members, not verdicts — a rejected map verdict does 
 
   // ONE tick claims the per-element checks AND the reduce — they are concurrent branches
   const t = ow('tick', wf);
-  const checks = t.orders.filter((o: any) => o.loop === 'check');
+  const checks = t.orders.filter((o: any) => o.step === 'check');
   const synth = find(t, 'synth');
   assert.equal(checks.length, 2, 'a check firing per element');
   assert.ok(synth, 'the reduce is eligible alongside the maps, not after them');
@@ -129,10 +129,10 @@ test('§4 a re-armed order carries the artifact\'s full reason history in owes[]
 });
 
 // ============================================================================
-// §6 / §17 — stalls: re-stall after retry, and blocked excludes a stalled loop
+// §6 / §17 — stalls: re-stall after retry, and blocked excludes a stalled step
 // ============================================================================
 
-test('§6 stall → retry → re-stall: retry resets the counter and the loop can stall again', () => {
+test('§6 stall → retry → re-stall: retry resets the counter and the step can stall again', () => {
   const ow = harness();
   const wf = ow('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).workflow;
   ow('green', wf, find(ow('tick', wf), 'planner').run, 'plan', '--value', J({}));
@@ -151,16 +151,16 @@ test('§6 stall → retry → re-stall: retry resets the counter and the loop ca
 
   const first = knockUntilStalled();
   assert.equal(first.stalled, true, 'stalls at the cap');
-  // §17: a stalled loop is NOT "blocked" (it isn't waiting on an input) and not eligible
+  // §17: a stalled step is NOT "blocked" (it isn't waiting on an input) and not eligible
   const st = ow('status', wf);
-  assert.ok(!st.blocked.some((b: any) => b.loop === 'builder'), 'blocked excludes the stalled loop');
-  assert.ok(!st.eligible.some((e: any) => e.loop === 'builder'), 'a stalled loop is not re-armed');
+  assert.ok(!st.blocked.some((b: any) => b.step === 'builder'), 'blocked excludes the stalled step');
+  assert.ok(!st.eligible.some((e: any) => e.step === 'builder'), 'a stalled step is not re-armed');
 
-  // retry is the only counter-reset; the loop becomes live again
+  // retry is the only counter-reset; the step becomes live again
   ow('retry', wf, 'pr', '--text', 'new test harness, try again');
   assert.equal(art(ow, wf, 'pr').judgmentRejects, 0, 'retry zeroes the counter');
   assert.equal(ow('status', wf).debts.find((d: any) => d.path === 'pr').stalled, false);
-  assert.ok(ow('status', wf).eligible.some((e: any) => e.loop === 'builder'), 'builder live again');
+  assert.ok(ow('status', wf).eligible.some((e: any) => e.step === 'builder'), 'builder live again');
 
   // ...and the very same failure mode can stall it a second time
   assert.equal(knockUntilStalled().stalled, true, 're-accumulates to a fresh stall');
@@ -234,8 +234,8 @@ test('§17 a never-built owed artifact is classified as kind "unbuilt"', () => {
   const plan = st.debts.find((d: any) => d.path === 'plan');
   assert.equal(plan.kind, 'unbuilt', 'owed-and-never-rejected reads as unbuilt, not a judgment/structural debt');
   assert.equal(plan.stalled, false);
-  // and downstream loops with no green input yet are "blocked", not eligible
-  assert.ok(st.blocked.some((b: any) => b.loop === 'builder' && b.blockedOn.includes('plan')));
-  assert.deepEqual(st.eligible.map((e: any) => e.loop), ['planner'], 'only the root step can run');
+  // and downstream steps with no green input yet are "blocked", not eligible
+  assert.ok(st.blocked.some((b: any) => b.step === 'builder' && b.blockedOn.includes('plan')));
+  assert.deepEqual(st.eligible.map((e: any) => e.step), ['planner'], 'only the root step can run');
   ow.cleanup();
 });

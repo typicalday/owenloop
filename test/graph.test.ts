@@ -16,34 +16,34 @@ import assert from 'node:assert/strict';
 import { Store } from '../src/store.ts';
 import { Engine } from '../src/engine.ts';
 import { buildGraph, graphToDot, graphToMermaid } from '../src/model.ts';
-import { def, input, loop } from './helpers.ts';
+import { def, input, step } from './helpers.ts';
 
 // ---- fixture defs ------------------------------------------------------------
 
 // delivery: linear chain — proposal → planner → builder → reviewer → merger
 const delivery = def('delivery', [input('proposal')], [
-  loop({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
-  loop({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
-  loop({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
-  loop({ name: 'merger', consumes: ['verdict'], produces: ['merge'], terminal: true }),
+  step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+  step({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+  step({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
+  step({ name: 'merger', consumes: ['verdict'], produces: ['merge'], terminal: true }),
 ]);
 
 // research: collection + map + reduce
 const research = def('research', [input('question')], [
-  loop({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
-  loop({ name: 'formatcheck', consumes: ['gather.source[$i]'], produces: ['gather.source[$i].formatcheck'] }),
-  loop({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
+  step({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] }),
+  step({ name: 'formatcheck', consumes: ['gather.source[$i]'], produces: ['gather.source[$i].formatcheck'] }),
+  step({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
 ]);
 
 // ---- buildGraph: structure ---------------------------------------------------
 
-test('buildGraph: nodes = loops + inputs, all present', () => {
+test('buildGraph: nodes = steps + inputs, all present', () => {
   const g = buildGraph(delivery);
   const ids = g.nodes.map((n) => n.id).sort();
   assert.deepEqual(ids, ['builder', 'merger', 'planner', 'proposal', 'reviewer']);
   assert.equal(g.nodes.find((n) => n.id === 'proposal')!.kind, 'input');
   assert.equal(g.nodes.find((n) => n.id === 'merger')!.terminal, true);
-  assert.equal(g.nodes.find((n) => n.id === 'planner')!.kind, 'loop');
+  assert.equal(g.nodes.find((n) => n.id === 'planner')!.kind, 'step');
   assert.equal(g.hasOverlay, false);
 });
 
@@ -76,7 +76,7 @@ test('buildGraph: map consume produces map-mode edge, reduce produces reduce-mod
   assert.equal(reduceEdge!.stem, 'gather.source');
 });
 
-test('buildGraph: terminal loop is flagged on the node', () => {
+test('buildGraph: terminal step is flagged on the node', () => {
   const g = buildGraph(delivery);
   assert.equal(g.nodes.find((n) => n.id === 'merger')!.terminal, true);
   assert.equal(g.nodes.find((n) => n.id === 'planner')!.terminal, undefined);
@@ -84,8 +84,8 @@ test('buildGraph: terminal loop is flagged on the node', () => {
 
 test('buildGraph: dangling consume renders without crashing', () => {
   const d = def('broken', [input('seed')], [
-    loop({ name: 'a', consumes: ['seed'], produces: ['mid'] }),
-    loop({ name: 'b', consumes: ['ghost'], produces: ['out'] }), // ghost has no producer
+    step({ name: 'a', consumes: ['seed'], produces: ['mid'] }),
+    step({ name: 'b', consumes: ['ghost'], produces: ['out'] }), // ghost has no producer
   ]);
   const g = buildGraph(d);
   // There should be a dangling edge for ghost
@@ -137,7 +137,7 @@ test('buildGraph overlay: stalled artifact sets node.stalled = true and state = 
   const store = new Store(':memory:');
   // Use maxAttempts=1 so one reject immediately stalls
   const d = def('small', [input('seed')], [
-    loop({ name: 'worker', consumes: ['seed'], produces: ['out'], maxAttempts: 1 }),
+    step({ name: 'worker', consumes: ['seed'], produces: ['out'], maxAttempts: 1 }),
   ]);
   const engine = new Engine(store, () => d);
   const wf = engine.createInstance('small', { provide: { seed: {} } });
@@ -188,7 +188,7 @@ test('graphToDot: contains digraph, node ids, and -> edges', () => {
   // ellipse for input node
   assert.match(dot, /shape=ellipse/, 'input node has ellipse shape');
   // doublecircle for terminal
-  assert.match(dot, /shape=doublecircle/, 'terminal loop has doublecircle shape');
+  assert.match(dot, /shape=doublecircle/, 'terminal step has doublecircle shape');
 });
 
 test('graphToMermaid: contains flowchart and edge arrow', () => {

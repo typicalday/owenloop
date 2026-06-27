@@ -118,12 +118,12 @@ test('listArtifacts is scoped to a workflow', () => {
 test('task upsert toggles lease fields', () => {
   const s = mem();
   const wf = randId('wf');
-  s.putTask({ workflow: wf, loop: 'build', key: '', status: 'idle', attempts: 0 });
+  s.putTask({ workflow: wf, step: 'build', key: '', status: 'idle', attempts: 0 });
   let t = s.getTask(wf, 'build', '');
   assert.equal(t?.status, 'idle');
   assert.equal(t?.run, undefined);
 
-  s.putTask({ workflow: wf, loop: 'build', key: '', status: 'claimed', run: 'run_1', claimedAt: 123, attempts: 1 });
+  s.putTask({ workflow: wf, step: 'build', key: '', status: 'claimed', run: 'run_1', claimedAt: 123, attempts: 1 });
   t = s.getTask(wf, 'build', '');
   assert.equal(t?.status, 'claimed');
   assert.equal(t?.run, 'run_1');
@@ -137,14 +137,14 @@ test('run insert/update + budget counters', () => {
   const s = mem();
   const wf = randId('wf');
   const r1 = randId('run');
-  s.insertRun(r1, { workflow: wf, loop: 'build' });
+  s.insertRun(r1, { workflow: wf, step: 'build' });
   s.updateRun(r1, { outcome: 'ok', summary: 'done', sessionId: 'sess-9' });
   const got = s.getRun(r1);
   assert.equal(got?.outcome, 'ok');
   assert.equal(got?.summary, 'done');
   assert.equal(got?.sessionId, 'sess-9');
 
-  s.insertRun(randId('run'), { workflow: wf, loop: 'build' });
+  s.insertRun(randId('run'), { workflow: wf, step: 'build' });
   assert.equal(s.countRuns(wf, 'build', 0), 2);
   assert.equal(s.countRuns(wf, 'other', 0), 0);
   assert.equal(s.latestRun(wf, 'build')?.workflow, wf);
@@ -186,8 +186,8 @@ test('deleteWorkflow cascades to artifacts/tasks/runs', () => {
   const wf = randId('wf');
   s.insertWorkflow(wf, { def: 'd' });
   s.putArtifact(artifact(wf, 'plan'));
-  s.putTask({ workflow: wf, loop: 'build', key: '', status: 'idle', attempts: 0 });
-  s.insertRun(randId('run'), { workflow: wf, loop: 'build' });
+  s.putTask({ workflow: wf, step: 'build', key: '', status: 'idle', attempts: 0 });
+  s.insertRun(randId('run'), { workflow: wf, step: 'build' });
   s.deleteWorkflow(wf);
   assert.equal(s.getWorkflow(wf), undefined);
   assert.equal(s.listArtifacts(wf).length, 0);
@@ -203,12 +203,12 @@ test('run cause round-trips through insert and update', () => {
   const r2 = randId('run');
 
   // insert with cause set — must survive to getRun
-  s.insertRun(r1, { workflow: wf, loop: 'builder', cause: 'allGreen' });
+  s.insertRun(r1, { workflow: wf, step: 'builder', cause: 'allGreen' });
   const got = s.getRun(r1);
   assert.equal(got?.cause, 'allGreen', 'cause persists through insertRun');
 
   // insert without cause — must be absent (not undefined-as-string)
-  s.insertRun(r2, { workflow: wf, loop: 'builder' });
+  s.insertRun(r2, { workflow: wf, step: 'builder' });
   assert.equal(s.getRun(r2)?.cause, undefined, 'absent cause stays absent');
 
   // updateRun can set cause after the fact
@@ -227,9 +227,9 @@ test('listRuns returns all runs for a workflow ordered by created_at, rowid', ()
   const r1 = randId('run');
   const r2 = randId('run');
   const r3 = randId('run');
-  s.insertRun(r1, { workflow: wf, loop: 'planner', key: '' }, 1000);
-  s.insertRun(r2, { workflow: wf, loop: 'builder', key: '' }, 2000);
-  s.insertRun(r3, { workflow: wf2, loop: 'other', key: '' }, 500); // different wf — must not appear
+  s.insertRun(r1, { workflow: wf, step: 'planner', key: '' }, 1000);
+  s.insertRun(r2, { workflow: wf, step: 'builder', key: '' }, 2000);
+  s.insertRun(r3, { workflow: wf2, step: 'other', key: '' }, 500); // different wf — must not appear
 
   // Close r1 with ok outcome so round-trip is verified
   s.updateRun(r1, { outcome: 'ok', fingerprint: { proposal: 1 } });
@@ -238,7 +238,7 @@ test('listRuns returns all runs for a workflow ordered by created_at, rowid', ()
   assert.equal(runs.length, 2, 'only runs for wf, not wf2');
   assert.equal(runs[0]!.id, r1, 'ordered by created_at: r1 first');
   assert.equal(runs[1]!.id, r2, 'r2 second');
-  assert.equal(runs[0]!.loop, 'planner');
+  assert.equal(runs[0]!.step, 'planner');
   assert.equal(runs[0]!.outcome, 'ok');
   assert.deepEqual(runs[0]!.fingerprint, { proposal: 1 });
   assert.equal(runs[1]!.outcome, undefined, 'open run has undefined outcome');
@@ -251,19 +251,19 @@ test('listRuns returns all runs for a workflow ordered by created_at, rowid', ()
 test('setAlarm / getAlarm / clearAlarm round-trip', () => {
   const s = mem();
   const wf = randId('wf');
-  const loop = 'completion';
+  const step = 'completion';
   const alarmTime = 9999;
 
   // No alarm yet — getAlarm returns undefined
-  assert.equal(s.getAlarm(wf, loop), undefined);
+  assert.equal(s.getAlarm(wf, step), undefined);
 
   // setAlarm creates the task row and sets alarm_at
-  s.setAlarm(wf, loop, alarmTime);
-  assert.equal(s.getAlarm(wf, loop), alarmTime, 'getAlarm returns the stored alarm_at');
+  s.setAlarm(wf, step, alarmTime);
+  assert.equal(s.getAlarm(wf, step), alarmTime, 'getAlarm returns the stored alarm_at');
 
   // clearAlarm sets alarm_at to null → getAlarm returns undefined
-  s.clearAlarm(wf, loop);
-  assert.equal(s.getAlarm(wf, loop), undefined, 'getAlarm returns undefined after clearAlarm');
+  s.clearAlarm(wf, step);
+  assert.equal(s.getAlarm(wf, step), undefined, 'getAlarm returns undefined after clearAlarm');
 
   s.close();
 });
@@ -271,18 +271,18 @@ test('setAlarm / getAlarm / clearAlarm round-trip', () => {
 test('setAlarm updates an existing task row (upsert path)', () => {
   const s = mem();
   const wf = randId('wf');
-  const loop = 'completion';
+  const step = 'completion';
 
   // Create the task row via putTask first
-  s.putTask({ workflow: wf, loop, key: '', status: 'idle', attempts: 0 });
+  s.putTask({ workflow: wf, step, key: '', status: 'idle', attempts: 0 });
 
   // setAlarm on existing row
-  s.setAlarm(wf, loop, 12345);
-  assert.equal(s.getAlarm(wf, loop), 12345);
+  s.setAlarm(wf, step, 12345);
+  assert.equal(s.getAlarm(wf, step), 12345);
 
   // Update alarm
-  s.setAlarm(wf, loop, 99999);
-  assert.equal(s.getAlarm(wf, loop), 99999, 'setAlarm updates alarm_at on existing row');
+  s.setAlarm(wf, step, 99999);
+  assert.equal(s.getAlarm(wf, step), 99999, 'setAlarm updates alarm_at on existing row');
 
   s.close();
 });
@@ -332,20 +332,20 @@ test('alarm_at survives a process restart (file-backed round-trip)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-store-test-'));
   const dbPath = join(dir, 'test.db');
   const wf = randId('wf');
-  const loop = 'completion';
+  const step = 'completion';
   const alarmTime = 1_700_000_000_000; // a plausible ms-epoch value
 
   try {
     // First process lifetime: open, set alarm, close.
     const s1 = new Store(dbPath);
-    s1.setAlarm(wf, loop, alarmTime);
-    assert.equal(s1.getAlarm(wf, loop), alarmTime, 'alarm readable before close');
+    s1.setAlarm(wf, step, alarmTime);
+    assert.equal(s1.getAlarm(wf, step), alarmTime, 'alarm readable before close');
     s1.close();
 
     // Second process lifetime: open the same file (migrate() runs), read alarm.
     const s2 = new Store(dbPath);
     assert.equal(
-      s2.getAlarm(wf, loop),
+      s2.getAlarm(wf, step),
       alarmTime,
       'alarm_at survives Store close+reopen (restart persistence)',
     );

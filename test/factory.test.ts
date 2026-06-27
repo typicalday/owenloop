@@ -9,12 +9,12 @@ import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createEngine } from '../src/factory.ts';
-import { def, input, loop } from './helpers.ts';
+import { def, input, step } from './helpers.ts';
 
 const EXAMPLES = join(import.meta.dirname, '..', 'examples', 'workflows');
 
 const tiny = def('tiny', [input('seed', { seedOwed: false })], [
-  loop({ name: 'step', consumes: ['seed'], produces: ['out'] }),
+  step({ name: 'step', consumes: ['seed'], produces: ['out'] }),
 ]);
 
 test('createEngine: drives an instance from in-memory defs (array)', () => {
@@ -24,7 +24,7 @@ test('createEngine: drives an instance from in-memory defs (array)', () => {
   const wf = engine.createInstance('tiny');
   const { orders } = engine.tick(wf);
   assert.equal(orders.length, 1);
-  assert.equal(orders[0]?.loop, 'step');
+  assert.equal(orders[0]?.step, 'step');
   assert.deepEqual(orders[0]?.owes.map((o) => o.path), ['out']);
 
   const res = engine.green(wf, orders[0]!.run, 'out', { ok: true });

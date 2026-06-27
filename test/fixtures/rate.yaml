@@ -1,11 +1,11 @@
-# Test-only fixture: a single re-firing loop with a non-trivial cadence and a low
+# Test-only fixture: a single re-firing step with a non-trivial cadence and a low
 # daily budget, so the scheduler's rate-limiting (cadence / maxRunsPerDay) can be
 # driven deterministically via the CLI's `--now` clock. `ping` never greens `pong`
 # in the tests (each run is closed `no_work`), so `pong` stays a debt and `ping`
 # stays perpetually eligible — isolating the schedule gate from dataflow.
 name: rate
 title: Rate-limit fixture
-loops:
+steps:
   - name: ping
     consumes: [seed]
     produces: [pong]
