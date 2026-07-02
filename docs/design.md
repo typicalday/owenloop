@@ -1150,5 +1150,13 @@ step) will not retroactively ask for that input; only new step-level
 before assuming `adopt` reconciles *every* possible shape of definition
 change — it reconciles the step graph, not workflow-level input contracts.
 
+The consequence is sharper than "not re-requested": the added input has no
+artifact row in that instance, so `provide` refuses it (`no such input
+artifact`) — the input is **unreachable for the life of the instance**, and
+any step consuming it is blocked forever. When a mid-flight replan needs a
+new external fact, don't add an `inputs:` entry; add a **consumeless intake
+step** (`produces: [facts]`, no `consumes:`) and green it directly — being a
+step output, it is exactly what `adopt` knows how to materialize.
+
 `adopt` returns `{ workflow, defHash, previousHash? }` (`previousHash` is
 omitted for a legacy pre-pinning row that had no prior hash to report).
