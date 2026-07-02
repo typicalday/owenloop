@@ -129,7 +129,21 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 `;
 
+/**
+ * The schema version this binary understands. Bump when `migrate()` gains a
+ * new additive step. Invariant: `schema_version` in the `meta` table must
+ * never be written downward — the `Store` constructor refuses to open
+ * (throwing `StoreVersionError`) a database whose stored schema_version is
+ * numerically greater than this binary's, rather than silently stamping it
+ * back down and running with a stale, incomplete understanding of a newer
+ * on-disk schema.
+ */
 const SCHEMA_VERSION = '5';
+
+/** Thrown by the `Store` constructor when the on-disk `schema_version` is
+ *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
+ *  upgrade their owenloop install to open this database. */
+export class StoreVersionError extends Error {}
 
 // ---- (de)serialization helpers ----------------------------------------------
 
@@ -306,6 +320,16 @@ export class Store {
     this.db.exec(SCHEMA);
     this.migrate();
     const cur = this.getMeta('schema_version');
+    if (cur !== undefined) {
+      const curNum = parseInt(cur, 10);
+      const ownNum = parseInt(SCHEMA_VERSION, 10);
+      if (curNum > ownNum) {
+        throw new StoreVersionError(
+          `database schema_version ${cur} is newer than this owenloop's schema_version ${SCHEMA_VERSION}; ` +
+          `upgrade your owenloop install to open this database`,
+        );
+      }
+    }
     if (cur !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
   }
 

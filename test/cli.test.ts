@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { main } from '../src/cli.ts';
 
 const EXAMPLES = join(import.meta.dirname, '..', 'examples', 'workflows');
@@ -62,6 +63,23 @@ test('an unknown command exits 1 and echoes usage', () => {
   assert.equal(r.code, 1);
   assert.match(r.err, /unknown command: frobnicate/);
   assert.match(r.err, /Usage: owenloop/, 'usage is included to orient the user');
+});
+
+test('opening a downgraded database via the CLI exits 1 with a clear stderr message', () => {
+  const { run, db } = makeCli();
+  const first = run('list');
+  assert.equal(first.code, 0, 'first open on a fresh db succeeds and creates schema');
+
+  // Simulate a newer binary having stamped a higher schema_version directly
+  // on the same db file the CLI just created.
+  const raw = new DatabaseSync(db);
+  raw.exec(`INSERT INTO meta (k, v) VALUES ('schema_version', '99') ON CONFLICT(k) DO UPDATE SET v = excluded.v`);
+  raw.close();
+
+  const second = run('list');
+  assert.equal(second.code, 1, 'reopening a newer-schema db must exit non-zero');
+  assert.match(second.err, /schema_version/i);
+  assert.match(second.err, /newer|upgrade/i, 'message should tell the operator to upgrade');
 });
 
 // ---- the full lifecycle, in-process -----------------------------------------

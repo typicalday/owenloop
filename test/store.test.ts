@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { Store, artifactId, taskId } from '../src/store.ts';
+import { Store, StoreVersionError, artifactId, taskId } from '../src/store.ts';
 import { randId } from '../src/util.ts';
 import type { ArtifactData } from '../src/types.ts';
 
@@ -532,6 +532,67 @@ test('tx() BEGIN IMMEDIATE: second connection is blocked at BEGIN, not mid-write
     db1.exec('ROLLBACK');
     db1.close();
     db2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- schema-version downgrade guard -----------------------------------------
+
+test('fresh database stamps schema_version to current SCHEMA_VERSION, no throw', () => {
+  const s = mem();
+  assert.equal(s.getMeta('schema_version'), '5');
+  s.close();
+});
+
+test('opening a DB already at current SCHEMA_VERSION is a no-op, no throw', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-schemaver-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    const s1 = new Store(dbPath);
+    s1.close();
+    const s2 = new Store(dbPath); // reopen at same version — must not throw
+    assert.equal(s2.getMeta('schema_version'), '5');
+    s2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('opening a DB with an older schema_version upgrades normally (regression guard)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-schemaver-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    const s1 = new Store(dbPath);
+    s1.setMeta('schema_version', '3'); // simulate an old on-disk stamp
+    s1.close();
+
+    const s2 = new Store(dbPath); // must NOT throw
+    assert.equal(s2.getMeta('schema_version'), '5', 'upgrades to current SCHEMA_VERSION');
+    s2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('opening a DB with a newer-than-binary schema_version throws StoreVersionError and does not rewrite it downward', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-schemaver-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    // Create a normal DB, then simulate a newer binary having stamped it.
+    const s1 = new Store(dbPath);
+    s1.setMeta('schema_version', '6');
+    s1.close();
+
+    // Reopening at this binary's SCHEMA_VERSION ('5') must refuse.
+    assert.throws(() => new Store(dbPath), StoreVersionError);
+
+    // Direct raw read proves schema_version was NOT rewritten downward by
+    // the throwing constructor.
+    const raw = new DatabaseSync(dbPath);
+    const row = raw.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
+    assert.equal(row.v, '6', 'schema_version must remain at the newer stamped value, never rewritten down');
+    raw.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
