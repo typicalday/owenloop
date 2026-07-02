@@ -155,7 +155,7 @@ export type ProduceKind = 'singleton' | 'collection' | 'map';
 export type GroupMode = 'exactlyOne' | 'atMostOne' | 'atLeastOne';
 
 /**
- * §25 declarative exclusive produce-groups: a step-level (not stem-level)
+ * §26 declarative exclusive produce-groups: a step-level (not stem-level)
  * `produces:` entry naming a set of sibling singleton stems (`of:`) and the
  * commit-exclusivity contract (`mode:`) the engine enforces across them:
  *   - 'exactlyOne'  — exactly one member may ever be green; the engine refuses
@@ -268,7 +268,7 @@ export interface StepDef {
   callsInputs?: Record<string, string>;
   /** §24 judges: marker naming the produce stem this synthesized step judges. Mirrors `calls?`. */
   judges?: string;
-  /** §25: declarative exclusive produce-groups spanning two or more of this step's own produces. */
+  /** §26: declarative exclusive produce-groups spanning two or more of this step's own produces. */
   groups?: GroupDef[];
 }
 
@@ -460,7 +460,7 @@ export interface CheckStep {
     | 'green' | 'judgment-reject' | 'schema-reject' | 'skip' | 'retract' | 'emit-seal'
     // §24: outcomes for a synthesized judge step's own firing (against the judged stem)
     | 'judge-approve' | 'judge-reject'
-    // §25: a commit refused because it would violate its group's exactlyOne/atMostOne contract
+    // §26: a commit refused because it would violate its group's exactlyOne/atMostOne contract
     | 'group-reject';
 }
 

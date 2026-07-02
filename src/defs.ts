@@ -43,7 +43,7 @@ interface RawProduce {
   /** §24 judges: optional quality-gate list hanging off a singleton produce entry. */
   judges?: unknown;
 }
-/** §25: a `group:` entry in a `produces:` list — spans multiple sibling stems, not a produce itself. */
+/** §26: a `group:` entry in a `produces:` list — spans multiple sibling stems, not a produce itself. */
 interface RawGroup {
   group?: unknown;
   mode?: unknown;
@@ -203,7 +203,7 @@ function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<Pro
 }
 
 /**
- * Parse a `group:` entry in a `produces:` list (§25 YAML surface). Contributes
+ * Parse a `group:` entry in a `produces:` list (§26 YAML surface). Contributes
  * zero ProducePatterns — it names an exclusivity contract across sibling stems
  * declared elsewhere in the SAME produces list, so it's parsed and returned
  * separately rather than folded into the pattern array.
@@ -224,7 +224,7 @@ function parseGroup(v: RawGroup, ctx: string): GroupDef {
  * (`plan`, `gather.source[]`), a mapping `{ name, schema, judges }` attaching
  * a JSON Schema the produced value must satisfy at commit time (§19) and/or a
  * quality-gate list (§24), or a `{ group, mode, of }` exclusivity declaration
- * (§25) spanning sibling stems produced by this same list. `baseDir` resolves
+ * (§26) spanning sibling stems produced by this same list. `baseDir` resolves
  * judge `bodyFile:` entries. Returns both the produce patterns and any groups
  * found, as a pure function (no out-param mutation).
  */

@@ -1,5 +1,5 @@
 /**
- * §25 — declarative exclusive produce-groups. A step's `produces:` list may
+ * §26 — declarative exclusive produce-groups. A step's `produces:` list may
  * carry `{ group, mode, of }` entries declaring a commit-exclusivity contract
  * across two or more of the step's own singleton sibling stems:
  *   - 'exactlyOne'/'atMostOne' — the engine refuses a second commit once one
@@ -30,7 +30,7 @@ import { applyOutcome, eligibleFirings, modelCheck, settleInMemory } from '../sr
  * maxSchemaFailures: 0 and maxAttempts: 1000 on every step disable schema-reject
  * and judgment-reject stalling (see check.test.ts's convention) so modelCheck's
  * BFS explores only the group-relevant outcomes within a bounded search, not
- * incidental stall dynamics unrelated to §25.
+ * incidental stall dynamics unrelated to §26.
  */
 function routerDef(mode: 'exactlyOne' | 'atMostOne' | 'atLeastOne' = 'exactlyOne'): WorkflowDef {
   return buildDef({
@@ -113,6 +113,61 @@ test('groups: (a) exactlyOne — a second commit to the losing sibling is refuse
   const urgentArt = getArt(store, wf, 'urgent');
   assert.equal(urgentArt?.acceptance, 'skipped');
   assert.equal(urgentArt?.version, 0);
+
+  engine.close(wf, triageRun);
+});
+
+// ---- (a2) ordering: group refusal preempts schema validation, not the reverse --
+
+test('groups: (a2) a schema-invalid commit against an already-decided losing sibling is group-rejected, not schema-rejected', () => {
+  // A dedicated def where 'urgent' additionally declares a schema, so a
+  // commit to it can be BOTH schema-invalid AND targeting a group loser at
+  // the same time. groupCasCheck must run before schema validation (same
+  // "check first, don't mutate on refusal" ordering as the other structural
+  // refusal checks, and the same ordering already correct in the human-bypass
+  // and judge-approve branches) — so the outcome must be 'group-rejected'
+  // and NEITHER schemaRejects NOR the artifact's acceptance/version should
+  // move, exactly as a group refusal never mutates anything.
+  const d = buildDef({
+    name: 'orderingDef',
+    inputs: [{ name: 'ticket' }],
+    steps: [
+      {
+        name: 'triage',
+        consumes: ['ticket'],
+        produces: [
+          'simple',
+          { name: 'urgent', schema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } } },
+          { group: 'route', mode: 'exactlyOne', of: ['simple', 'urgent'] },
+        ],
+        maxSchemaFailures: 0,
+        maxAttempts: 1000,
+      },
+      { name: 'handleSimple', consumes: ['simple'], produces: ['simpleDone'], maxSchemaFailures: 0, maxAttempts: 1000 },
+      { name: 'handleUrgent', consumes: ['urgent'], produces: ['urgentDone'], maxSchemaFailures: 0, maxAttempts: 1000 },
+    ],
+  });
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance('orderingDef', { provide: { ticket: { text: 'x' } } });
+
+  const triageRun = fire(engine, wf, 'triage').run;
+  const winRes = engine.green(wf, triageRun, 'simple', { ok: true });
+  assert.equal(winRes.outcome, 'green');
+  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'skipped');
+
+  // attempt to green the losing sibling with a value that would ALSO fail its
+  // own declared schema (missing the required 'ok' property).
+  const loseRes = engine.green(wf, triageRun, 'urgent', { wrong: 1 } as Record<string, unknown>);
+  assert.equal(loseRes.outcome, 'group-rejected');
+  assert.match(loseRes.reason ?? '', /route.*exactlyOne.*simple.*green/);
+
+  // neither counter moved, and the artifact was not mutated beyond the
+  // earlier auto-skip — schema validation never ran.
+  const urgentArt = getArt(store, wf, 'urgent');
+  assert.equal(urgentArt?.acceptance, 'skipped');
+  assert.equal(urgentArt?.version, 0);
+  assert.equal(urgentArt?.schemaRejects, 0);
+  assert.equal(urgentArt?.judgmentRejects, 0);
 
   engine.close(wf, triageRun);
 });

@@ -74,7 +74,7 @@ export interface Firing {
 export type CascadeOp =
   | { kind: 'reject'; path: string; reason: string; held?: true } // green→rejected, value kept; held=true for escalate
   | { kind: 'retract'; path: string; reason: string } // tombstone a map child of a retracted element
-  | { kind: 'skip'; path: string; reason: string; rejectKind?: RejectKind } // cascade skip down a dead branch (§25: auto-skip of a losing group sibling sets rejectKind: 'exclusive'; default 'structural')
+  | { kind: 'skip'; path: string; reason: string; rejectKind?: RejectKind } // cascade skip down a dead branch (§26: auto-skip of a losing group sibling sets rejectKind: 'exclusive'; default 'structural')
   | { kind: 'rearm'; path: string; reason: string } // skipped→owed when the branch revives
   | { kind: 'pin'; path: string; reason: string } // stays green, fingerprint re-pointed to current inputs
   | { kind: 'arm'; handlerStep: string; reason: string; path?: undefined }; // arm a handler step on invalidation of L
@@ -643,7 +643,7 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
     }
   }
 
-  // §25: declarative exclusive produce-groups — auto-skip losing siblings.
+  // §26: declarative exclusive produce-groups — auto-skip losing siblings.
   // Once a group (exactlyOne/atMostOne) has a green winner, every other member
   // still resting in a debt state (owed/rejected) can never legally commit —
   // the group's exclusivity is enforced at commit time by the engine's
@@ -833,7 +833,7 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
   }
   pending.sort((x, y) => x.path.localeCompare(y.path));
 
-  // §25: an `atLeastOne` group is satisfied once any one member is green — its
+  // §26: an `atLeastOne` group is satisfied once any one member is green — its
   // other members may legitimately sit `owed` forever (no auto-skip fires for
   // atLeastOne, unlike exactlyOne/atMostOne) without that being "not done".
   // Stored acceptance is untouched; this is a done-ness computation only.
@@ -1601,7 +1601,7 @@ function eligibleOutcomes(
   // the judge agent can issue (green/reject, Q2) as their own outcomes, entirely
   // separate from the producer-outcome branches below.
   if (step.judges) {
-    // §25: if this is the last pending judge and approving would flip the
+    // §26: if this is the last pending judge and approving would flip the
     // judged stem green, a group refusal (if any) preempts 'judge-approve'
     // exactly like the real engine's judge-actor branch (groupCasCheck runs
     // before the artifact is landed green).
@@ -1631,7 +1631,7 @@ function eligibleOutcomes(
     return outcomes;
   }
 
-  // §25: if committing this output green would violate its group's
+  // §26: if committing this output green would violate its group's
   // exactlyOne/atMostOne exclusivity (a sibling already won), the engine
   // refuses the commit — model 'group-reject' instead of 'green' so the
   // checker explores the real refusal path rather than an impossible green.
@@ -1665,7 +1665,7 @@ function eligibleOutcomes(
 }
 
 /**
- * §25: the checker-side twin of `Engine.groupCasCheck` — would committing
+ * §26: the checker-side twin of `Engine.groupCasCheck` — would committing
  * `path` as green violate its produce-group's exactlyOne/atMostOne contract?
  * Same rule: refuse iff a *different* sibling in the group is already green.
  * `atLeastOne` groups never refuse.
@@ -1767,7 +1767,7 @@ export function applyOutcome(
   const next = new Map(arts);
   const outPath = firing.outputs[0];
 
-  // §25: a group-refused commit is a pure no-op — like schema-rejected, the
+  // §26: a group-refused commit is a pure no-op — like schema-rejected, the
   // value is never applied and no counters move. Mirrors the real engine's
   // groupCasCheck refusal (both the plain-producer and judge-approve moments).
   if (outcome === 'group-reject') {

@@ -118,7 +118,7 @@ export interface CommitResult {
     // yet (other judges may still be pending) — 'approved' distinguishes that
     // from 'green' (every declared judge has now signed the current version).
     | 'approved'
-    // §25: refused because this commit would violate its produce-group's
+    // §26: refused because this commit would violate its produce-group's
     // exactlyOne/atMostOne exclusivity contract — a sibling already won. Like
     // schema-rejected, the value is NOT committed, no counters are bumped, and
     // the run/lease is left open for the caller to close as it sees fit.
@@ -658,7 +658,7 @@ export class Engine {
         const arts = this.artMap(workflow);
         const art = arts.get(path);
         if (!art) throw new Error(`cannot green unknown artifact: ${path}`);
-        // §25: a human bypass is still subject to group exclusivity — it must
+        // §26: a human bypass is still subject to group exclusivity — it must
         // not be able to land a second winner alongside an already-green sibling.
         const groupCas = this.groupCasCheck(def, arts, art);
         if (groupCas.rejected) {
@@ -708,7 +708,7 @@ export class Engine {
         const judgeNames = this.declaredJudgeNames(def, art);
         const allApproved = judgeNames.every((jn) => approvals[jn] === art.version);
         if (allApproved) {
-          // §25: the last judge's approve is the moment this stem would go
+          // §26: the last judge's approve is the moment this stem would go
           // green — gate it on group exclusivity exactly like a plain commit.
           const groupCas = this.groupCasCheck(def, arts, art);
           if (groupCas.rejected) {
@@ -729,6 +729,24 @@ export class Engine {
 
       const art = arts.get(path);
       if (!art) throw new Error(`cannot green unknown artifact: ${path}`);
+
+      // §26: a producer commit that would land green (no judges gating it) is
+      // subject to group exclusivity — a judged produce defers this check to
+      // the judge-approve branch above, since that's the actual green moment.
+      // This runs before CAS/schema (same "check first, don't mutate on
+      // refusal" ordering as the other structural refusal checks, and as the
+      // human-bypass/judge-approve branches above): a losing sibling must be
+      // refused as 'group-rejected' without bumping the schema-stall counter,
+      // even when its value also happens to be schema-invalid.
+      const judgeNames = this.declaredJudgeNames(def, art);
+      const hasJudges = judgeNames.length > 0;
+      if (!hasJudges) {
+        const groupCas = this.groupCasCheck(def, arts, art);
+        if (groupCas.rejected) {
+          this.settle(workflow, def);
+          return { path, outcome: 'group-rejected', reason: groupCas.reason };
+        }
+      }
 
       const req = requiredInputs(def, arts, art);
       const cas = this.casCheck(arts, req, r.fingerprint ?? {});
@@ -765,18 +783,6 @@ export class Engine {
       // submission's sign-offs never leak onto a fresh version. Terminal is
       // deferred to judge-approve time (handled in the runStep?.judges branch
       // above), so it is deliberately NOT applied here when judges are declared.
-      const judgeNames = this.declaredJudgeNames(def, art);
-      const hasJudges = judgeNames.length > 0;
-      // §25: a producer commit that would land green (no judges gating it) is
-      // subject to group exclusivity — a judged produce defers this check to
-      // the judge-approve branch above, since that's the actual green moment.
-      if (!hasJudges) {
-        const groupCas = this.groupCasCheck(def, arts, art);
-        if (groupCas.rejected) {
-          this.settle(workflow, def);
-          return { path, outcome: 'group-rejected', reason: groupCas.reason };
-        }
-      }
       const next: ArtifactData = {
         ...art,
         acceptance: hasJudges ? 'submitted' : 'green',
@@ -1392,7 +1398,7 @@ export class Engine {
     if (op.kind === 'skip') {
       // A cascade-skip down a dead subtree carries a fingerprint too, so it
       // re-arms when the upstream branch revives (mirrors a producer skip).
-      // §25: an auto-skip of a losing group sibling tags rejectKind 'exclusive'
+      // §26: an auto-skip of a losing group sibling tags rejectKind 'exclusive'
       // instead of the default 'structural' (op.rejectKind carries this).
       this.store.putArtifact({
         ...art,
@@ -1507,7 +1513,7 @@ export class Engine {
   }
 
   /**
-   * §25: refuse a commit that would violate its produce-group's exclusivity
+   * §26: refuse a commit that would violate its produce-group's exclusivity
    * contract. Only `exactlyOne`/`atMostOne` groups gate at commit time (an
    * `atLeastOne` group never refuses — any number of members may be green).
    * Looks up the group by scanning the artifact's producer step's `groups:`
