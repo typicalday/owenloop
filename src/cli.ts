@@ -38,6 +38,7 @@ import { buildGraph, buildTrace, graphToDot, graphToMermaid, modelCheck } from '
 import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import { DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
+import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 import { detId, nowMs, parseDurationMs } from './util.ts';
 
@@ -226,6 +227,12 @@ Commands:
 
 Environment: OWENLOOP_DB, OWENLOOP_DEFS`;
 
+/** Append parse failures to a "definition not found" error — the def the user asked for may be in one of the broken files. */
+function failureNote(failures: DefLoadFailure[]): string {
+  if (failures.length === 0) return '';
+  return `\n${failures.length} file(s) failed to load:\n  - ${failures.map((f) => `${f.file}: ${f.error}`).join('\n  - ')}`;
+}
+
 function dispatch(command: string, io: CliIO, args: Args): number {
   // help and lint need no store
   if (command === 'help' || command === '--help' || command === '-h') {
@@ -235,22 +242,30 @@ function dispatch(command: string, io: CliIO, args: Args): number {
 
   if (command === 'lint') {
     const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
-    const defs = existsSync(defsDir) ? loadDefsRaw(defsDir) : new Map<string, WorkflowDef>();
+    const failures: DefLoadFailure[] = [];
+    const defs = existsSync(defsDir) ? loadDefsRaw(defsDir, failures) : new Map<string, WorkflowDef>();
     const defName = args.positionals[1];
     let hasErrors = false;
 
     if (defName !== undefined) {
       const def = defs.get(defName);
-      if (!def) throw new CliError(`unknown workflow definition '${defName}' (looked in ${defsDir})`);
+      if (!def) throw new CliError(`unknown workflow definition '${defName}' (looked in ${defsDir})${failureNote(failures)}`);
       const result = lintDef(def);
       if (result.errors.length) hasErrors = true;
       print(io, { def: def.name, errors: result.errors, warnings: result.warnings });
     } else {
-      const results = [...defs.values()].map((def) => {
-        const result = lintDef(def);
-        if (result.errors.length) hasErrors = true;
-        return { def: def.name, errors: result.errors, warnings: result.warnings };
-      });
+      const results: { def?: string; file?: string; errors: string[]; warnings: string[] }[] =
+        [...defs.values()].map((def) => {
+          const result = lintDef(def);
+          if (result.errors.length) hasErrors = true;
+          return { def: def.name, errors: result.errors, warnings: result.warnings };
+        });
+      // Files that never became defs (malformed YAML / bad shape) are lint errors
+      // too — omitting them makes `lint` claim a dir is clean when `create` would die.
+      for (const f of failures) {
+        hasErrors = true;
+        results.push({ file: f.file, errors: [f.error], warnings: [] });
+      }
       print(io, results);
     }
 
@@ -260,13 +275,14 @@ function dispatch(command: string, io: CliIO, args: Args): number {
 
   if (command === 'check') {
     const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
-    const defs = existsSync(defsDir) ? loadDefsRaw(defsDir) : new Map<string, WorkflowDef>();
+    const failures: DefLoadFailure[] = [];
+    const defs = existsSync(defsDir) ? loadDefsRaw(defsDir, failures) : new Map<string, WorkflowDef>();
     const defName = need(args, 1, 'def');
     const def = defs.get(defName);
     if (!def) {
       throw new CliError(
         `unknown workflow definition '${defName}' (looked in ${defsDir}).\n` +
-        `Known definitions: ${[...defs.keys()].sort().join(', ') || '(none)'}`,
+        `Known definitions: ${[...defs.keys()].sort().join(', ') || '(none)'}${failureNote(failures)}`,
       );
     }
 

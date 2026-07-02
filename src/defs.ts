@@ -21,7 +21,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from './paths.ts';
@@ -1490,6 +1490,20 @@ export function loadDefFile(file: string): WorkflowDef {
 }
 
 /**
+ * Read, YAML-parse, and shape-build a single def file, attributing any failure
+ * to the file: a bare `steps[0]: unknown key 'x'` (or a raw YAML syntax error)
+ * is a debugging trap when a whole defs directory is being loaded.
+ */
+function buildDefFile(file: string): WorkflowDef {
+  const text = readFileSync(file, 'utf8');
+  try {
+    return buildDef(parseYaml(text), basename(file), dirname(file));
+  } catch (e) {
+    throw new DefError(`${file}: ${(e as Error).message}`);
+  }
+}
+
+/**
  * Load every workflow definition under `dir`: each `*.yaml` / `*.yml` file, and
  * each immediate subdirectory containing a `workflow.yaml`. Returns them keyed
  * by name (throwing on a duplicate name across files).
@@ -1511,18 +1525,11 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
     const st = statSync(full);
     if (st.isDirectory()) {
       const wf = join(full, 'workflow.yaml');
-      try {
-        if (statSync(wf).isFile()) {
-          const text = readFileSync(wf, 'utf8');
-          addRaw(buildDef(parseYaml(text), basename(wf), dirname(wf)), wf);
-        }
-      } catch (e) {
-        if (e instanceof DefError) throw e;
-        /* no workflow.yaml in this subdir — skip */
+      if (existsSync(wf) && statSync(wf).isFile()) {
+        addRaw(buildDefFile(wf), wf);
       }
     } else if (/\.ya?ml$/.test(entry) && entry !== 'workflow.yaml') {
-      const text = readFileSync(full, 'utf8');
-      addRaw(buildDef(parseYaml(text), basename(full), dirname(full)), full);
+      addRaw(buildDefFile(full), full);
     }
   }
 
@@ -1571,37 +1578,46 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
   return out;
 }
 
+/** One file that `loadDefsRaw` could not turn into a def (malformed YAML, bad shape, duplicate name). */
+export interface DefLoadFailure {
+  file: string;
+  error: string;
+}
+
 /**
  * Like `loadDefs` but uses `buildDef` (not `parseDef`) so wiring errors are
  * returned in the lint result rather than thrown. Used by `owenloop lint`.
- * Silently skips files that fail shape-parsing (malformed YAML or bad types).
+ * Skips files that fail shape-parsing (malformed YAML or bad types); pass
+ * `failures` to collect what was skipped and why, so callers can surface it.
  *
  * Two-phase: Phase 1 collects all defs. Phase 2 expands includes best-effort
  * (silently skips expansion failures so the lint caller sees un-expanded defs).
  */
-export function loadDefsRaw(dir: string): Map<string, WorkflowDef> {
-  // Phase 1: build all defs silently skipping malformed files.
+export function loadDefsRaw(dir: string, failures?: DefLoadFailure[]): Map<string, WorkflowDef> {
+  // Phase 1: build all defs, skipping (and recording) malformed files.
   const raw = new Map<string, WorkflowDef>();
+  const tryAdd = (file: string): void => {
+    try {
+      const text = readFileSync(file, 'utf8');
+      const def = buildDef(parseYaml(text), basename(file), dirname(file));
+      def.dir = file;
+      if (raw.has(def.name)) {
+        failures?.push({ file, error: `duplicate workflow name '${def.name}' under ${dir}` });
+        return;
+      }
+      raw.set(def.name, def);
+    } catch (e) {
+      failures?.push({ file, error: (e as Error).message });
+    }
+  };
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
     const st = statSync(full);
     if (st.isDirectory()) {
       const wf = join(full, 'workflow.yaml');
-      try {
-        if (statSync(wf).isFile()) {
-          const text = readFileSync(wf, 'utf8');
-          const def = buildDef(parseYaml(text), basename(wf), dirname(wf));
-          def.dir = wf;
-          if (!raw.has(def.name)) raw.set(def.name, def);
-        }
-      } catch { /* no workflow.yaml or buildDef failed shape-check — skip */ }
+      if (existsSync(wf) && statSync(wf).isFile()) tryAdd(wf);
     } else if (/\.ya?ml$/.test(entry) && entry !== 'workflow.yaml') {
-      try {
-        const text = readFileSync(full, 'utf8');
-        const def = buildDef(parseYaml(text), basename(full), dirname(full));
-        def.dir = full;
-        if (!raw.has(def.name)) raw.set(def.name, def);
-      } catch { /* malformed YAML or shape error — skip */ }
+      tryAdd(full);
     }
   }
 
