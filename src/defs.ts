@@ -21,7 +21,7 @@
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from './paths.ts';
 import { parseDurationMs, parseDurationSecs } from './util.ts';
@@ -59,6 +59,7 @@ interface RawStep {
   on?: unknown;
   idleAfter?: unknown;
   body?: unknown;
+  bodyFile?: unknown;
   /** M2-GRAMMAR: if present, this entry is a calls: step (Mode 2 runtime composition). */
   calls?: unknown;
   reapTtl?: unknown;
@@ -301,7 +302,7 @@ function parseInvariants(v: unknown, ctx: string): InvariantDef[] {
  * full build-and-validate; this is exposed mainly so the validator can be
  * exercised on a built-but-invalid graph.
  */
-export function buildDef(raw: unknown, source?: string): WorkflowDef {
+export function buildDef(raw: unknown, source?: string, baseDir?: string): WorkflowDef {
   if (typeof raw !== 'object' || raw === null) {
     throw new DefError(`workflow definition${source ? ` (${source})` : ''} must be a mapping`);
   }
@@ -335,7 +336,7 @@ export function buildDef(raw: unknown, source?: string): WorkflowDef {
       const inc = parseIncludeDirective(rl, i, name);
       includes.push({ pos: steps.length, ...inc });
     } else {
-      steps.push(buildStep(rl as RawStep, i));
+      steps.push(buildStep(rl as RawStep, i, baseDir));
     }
   }
 
@@ -547,8 +548,8 @@ export function expandIncludes(
 }
 
 /** Build a validated `WorkflowDef` from a parsed YAML object (or throw DefError). */
-export function parseDef(raw: unknown, source?: string): WorkflowDef {
-  const def = buildDef(raw, source);
+export function parseDef(raw: unknown, source?: string, baseDir?: string): WorkflowDef {
+  const def = buildDef(raw, source, baseDir);
   const errors = validateDef(def);
   if (errors.length) {
     throw new DefError(
@@ -558,7 +559,7 @@ export function parseDef(raw: unknown, source?: string): WorkflowDef {
   return def;
 }
 
-function buildStep(rl: RawStep, i: number): StepDef {
+function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef {
   // M2-GRAMMAR: if this entry carries a 'calls' key, parse it as a calls: step (Mode 2).
   if (typeof rl.calls !== 'undefined') {
     const rawCalls = rl as RawCalls;
@@ -601,6 +602,28 @@ function buildStep(rl: RawStep, i: number): StepDef {
   const producesPatterns = parseProduces(rl.produces, `step '${name}'.produces`);
   const generatesPatterns = parseProduces(rl.generates, `step '${name}'.generates`);
   const cadence = rl.cadence === undefined ? DEFAULTS.cadence : asString(rl.cadence, `step '${name}'.cadence`);
+  const hasBody = rl.body !== undefined;
+  const hasBodyFile = rl.bodyFile !== undefined;
+  if (hasBody && hasBodyFile) {
+    throw new DefError(`step '${name}': set either body or bodyFile, not both`);
+  }
+  let body: string;
+  if (hasBodyFile) {
+    const bodyFileRel = asString(rl.bodyFile, `step '${name}'.bodyFile`);
+    if (baseDir === undefined) {
+      throw new DefError(
+        `step '${name}': bodyFile requires a workflow loaded from disk (no base directory to resolve '${bodyFileRel}' against)`,
+      );
+    }
+    const resolvedPath = join(baseDir, bodyFileRel);
+    try {
+      body = readFileSync(resolvedPath, 'utf8');
+    } catch (e) {
+      throw new DefError(`step '${name}': bodyFile '${bodyFileRel}' could not be read (resolved to '${resolvedPath}'): ${(e as Error).message}`);
+    }
+  } else {
+    body = hasBody ? asString(rl.body, `step '${name}'.body`) : '';
+  }
   const step: StepDef = {
     name,
     consumes,
@@ -615,7 +638,7 @@ function buildStep(rl: RawStep, i: number): StepDef {
     maxAttempts: asNumber(rl.maxAttempts, DEFAULTS.maxAttempts, `step '${name}'.maxAttempts`),
     maxSchemaFailures: asNumber(rl.maxSchemaFailures, DEFAULTS.maxSchemaFailures, `step '${name}'.maxSchemaFailures`),
     workdir: rl.workdir === undefined ? DEFAULTS.workdir : asString(rl.workdir, `step '${name}'.workdir`),
-    body: rl.body === undefined ? '' : asString(rl.body, `step '${name}'.body`),
+    body,
   };
   if (rl.model !== undefined) step.model = asString(rl.model, `step '${name}'.model`);
   if (asBool(rl.terminal, false, `step '${name}'.terminal`)) step.terminal = true;
@@ -1059,7 +1082,7 @@ function detectCallsCycles(defs: Map<string, WorkflowDef>): void {
 export function loadDefFile(file: string): WorkflowDef {
   const text = readFileSync(file, 'utf8');
   const raw = parseYaml(text);
-  const def = parseDef(raw, basename(file));
+  const def = parseDef(raw, basename(file), dirname(file));
   def.dir = file;
   return def;
 }
@@ -1089,7 +1112,7 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
       try {
         if (statSync(wf).isFile()) {
           const text = readFileSync(wf, 'utf8');
-          addRaw(buildDef(parseYaml(text), basename(wf)), wf);
+          addRaw(buildDef(parseYaml(text), basename(wf), dirname(wf)), wf);
         }
       } catch (e) {
         if (e instanceof DefError) throw e;
@@ -1097,7 +1120,7 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
       }
     } else if (/\.ya?ml$/.test(entry) && entry !== 'workflow.yaml') {
       const text = readFileSync(full, 'utf8');
-      addRaw(buildDef(parseYaml(text), basename(full)), full);
+      addRaw(buildDef(parseYaml(text), basename(full), dirname(full)), full);
     }
   }
 
@@ -1165,7 +1188,7 @@ export function loadDefsRaw(dir: string): Map<string, WorkflowDef> {
       try {
         if (statSync(wf).isFile()) {
           const text = readFileSync(wf, 'utf8');
-          const def = buildDef(parseYaml(text), basename(wf));
+          const def = buildDef(parseYaml(text), basename(wf), dirname(wf));
           def.dir = wf;
           if (!raw.has(def.name)) raw.set(def.name, def);
         }
@@ -1173,7 +1196,7 @@ export function loadDefsRaw(dir: string): Map<string, WorkflowDef> {
     } else if (/\.ya?ml$/.test(entry) && entry !== 'workflow.yaml') {
       try {
         const text = readFileSync(full, 'utf8');
-        const def = buildDef(parseYaml(text), basename(full));
+        const def = buildDef(parseYaml(text), basename(full), dirname(full));
         def.dir = full;
         if (!raw.has(def.name)) raw.set(def.name, def);
       } catch { /* malformed YAML or shape error — skip */ }

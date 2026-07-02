@@ -360,6 +360,97 @@ test('loadDefFile and loadDefs read YAML from disk', () => {
   assert.deepEqual([...all.keys()], ['delivery']);
 });
 
+// ---- bodyFile ------------------------------------------------------------
+
+test("bodyFile: resolves relative to the workflow YAML's own directory", () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-bodyfile-'));
+  mkdirSync(join(dir, 'prompts'));
+  writeFileSync(join(dir, 'prompts', 'research.md'), 'Research ${WORKFLOW}.\n');
+  writeFileSync(
+    join(dir, 'workflow.yaml'),
+    [
+      'name: research',
+      'inputs:',
+      '  - name: topic',
+      'steps:',
+      '  - name: researcher',
+      '    consumes: [topic]',
+      '    produces: [findings]',
+      '    bodyFile: prompts/research.md',
+    ].join('\n'),
+  );
+
+  const viaFile = loadDefFile(join(dir, 'workflow.yaml'));
+  assert.equal(viaFile.steps[0]!.body.trim(), 'Research ${WORKFLOW}.');
+
+  const viaDirSubdir = mkdtempSync(join(tmpdir(), 'owenloop-bodyfile-dirs-'));
+  mkdirSync(join(viaDirSubdir, 'research'));
+  mkdirSync(join(viaDirSubdir, 'research', 'prompts'));
+  writeFileSync(join(viaDirSubdir, 'research', 'prompts', 'research.md'), 'Research ${WORKFLOW}.\n');
+  writeFileSync(
+    join(viaDirSubdir, 'research', 'workflow.yaml'),
+    [
+      'name: research',
+      'inputs:',
+      '  - name: topic',
+      'steps:',
+      '  - name: researcher',
+      '    consumes: [topic]',
+      '    produces: [findings]',
+      '    bodyFile: prompts/research.md',
+    ].join('\n'),
+  );
+  const all = loadDefs(viaDirSubdir);
+  const viaDir = all.get('research');
+  assert.ok(viaDir !== undefined, 'research workflow must load via loadDefs');
+  assert.equal(viaDir.steps[0]!.body.trim(), 'Research ${WORKFLOW}.');
+});
+
+test('body: and bodyFile: together throws DefError matching /either body or bodyFile/', () => {
+  const raw = {
+    name: 'delivery',
+    inputs: [{ name: 'proposal' }],
+    steps: [
+      { name: 'planner', consumes: ['proposal'], produces: ['plan'], body: 'inline', bodyFile: 'x.md' },
+    ],
+  };
+  assert.throws(
+    () => buildDef(raw),
+    (e: unknown) => e instanceof DefError && /either body or bodyFile/.test((e as Error).message),
+  );
+
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-bodyfile-both-'));
+  writeFileSync(
+    join(dir, 'workflow.yaml'),
+    [
+      'name: delivery',
+      'inputs:',
+      '  - name: proposal',
+      'steps:',
+      '  - name: planner',
+      '    consumes: [proposal]',
+      '    produces: [plan]',
+      '    body: inline',
+      '    bodyFile: x.md',
+    ].join('\n'),
+  );
+  assert.throws(
+    () => loadDefFile(join(dir, 'workflow.yaml')),
+    (e: unknown) => e instanceof DefError && /either body or bodyFile/.test((e as Error).message),
+  );
+});
+
+test('bodyFile with no resolvable base throws a clear DefError', () => {
+  const raw = {
+    name: 'delivery',
+    inputs: [{ name: 'proposal' }],
+    steps: [
+      { name: 'planner', consumes: ['proposal'], produces: ['plan'], bodyFile: 'x.md' },
+    ],
+  };
+  assert.throws(() => buildDef(raw), DefError);
+});
+
 // ---- lintDef -----------------------------------------------------------------
 
 test('lintDef has no errors for a fully reachable linear chain', () => {

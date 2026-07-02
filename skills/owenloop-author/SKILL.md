@@ -233,6 +233,7 @@ steps:
         schema: { type: object, required: [ok] }
     body: |                    # the prompt handed to the worker; ${WORKFLOW}
       Do the one job and green `result`.   # ${RUN} ${INDEX} are filled in
+    bodyFile: path/to.md       # load body from a file, relative to this workflow's dir; mutually exclusive with body
     generates: [audit_log]     # optional; outputs nothing consumes (no dead-end warning)
     maxAttempts: 3             # reject cap before the output stalls (default 3)
     parallel: 1                # max concurrent runs (raise to fan out a map)
