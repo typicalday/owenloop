@@ -1195,13 +1195,29 @@ export class Engine {
 
   /** Release stranded leases (claimed by a dead/closed run, or past the TTL). */
   reap(workflow: string, now = nowMs(), def?: WorkflowDef): number {
+    return this.reapDetailed(workflow, now, def).count;
+  }
+
+  /**
+   * Same lease-cleanup loop `reap()` runs, but reports what it reaped and
+   * accepts a `ttlOverride` so `reap --now` (admin stand-down) can force every
+   * claim stale without perturbing the `now` clock (which would also skew any
+   * future cadence/budget math sharing this helper).
+   */
+  private reapDetailed(
+    workflow: string,
+    now: number,
+    def?: WorkflowDef,
+    opts: { ttlOverride?: number } = {},
+  ): { count: number; details: Array<{ step: string; key: string; run?: string }> } {
     const resolvedDef = def ?? this.defFor(workflow);
     let n = 0;
+    const details: Array<{ step: string; key: string; run?: string }> = [];
     for (const task of this.store.listTasks(workflow)) {
       if (task.status !== 'claimed') continue;
       const run = task.run ? this.store.getRun(task.run) : undefined;
       const stepDef = resolvedDef.steps.find((l) => l.name === task.step);
-      const ttl = this.effectiveTtl(stepDef);
+      const ttl = opts.ttlOverride ?? this.effectiveTtl(stepDef);
       const stale = task.claimedAt !== undefined && !this.isClaimFresh(task, now, ttl);
       const stranded = !run || run.outcome !== undefined || stale;
       if (stranded) {
@@ -1214,9 +1230,29 @@ export class Engine {
           ...(task.alarmAt !== undefined ? { alarmAt: task.alarmAt } : {}),
         });
         n++;
+        const detail: { step: string; key: string; run?: string } = { step: task.step, key: task.key };
+        if (task.run !== undefined) detail.run = task.run;
+        details.push(detail);
       }
     }
-    return n;
+    return { count: n, details };
+  }
+
+  /**
+   * Deliberately run the reaper outside a full `tick` (no maintain/eligibility/
+   * claim cycle — `calls:` child maintenance is intentionally untouched here,
+   * keeping this scoped to lease cleanup only). `opts.ttlOverride: 0` is the
+   * admin stand-down: it forces every claim stale regardless of its real TTL,
+   * for clearing a dead worker's lease by hand. Runs inside a transaction like
+   * every other mutating engine method, since it writes task rows.
+   */
+  reapWithDetails(
+    workflow: string,
+    now = nowMs(),
+    def?: WorkflowDef,
+    opts: { ttlOverride?: number } = {},
+  ): { count: number; details: Array<{ step: string; key: string; run?: string }> } {
+    return this.store.tx(() => this.reapDetailed(workflow, now, def, opts));
   }
 
   // ---- observability ---------------------------------------------------------
@@ -1260,6 +1296,20 @@ export class Engine {
         const pinnedHash = wf.defHash ?? hashDef(wf.defSnapshot);
         st.defDrift = hashDef(live) !== pinnedHash;
       }
+    }
+    // NEW: surface in-flight (claimed) tasks — same enrichment pattern as the
+    // debts loop above, since this needs the task table and the pure
+    // workflowStatus() has no store access.
+    const now = nowMs();
+    for (const task of this.store.listTasks(workflow)) {
+      if (task.status !== 'claimed') continue;
+      const entry: WorkflowStatus['inFlight'][number] = { step: task.step, key: task.key, attempts: task.attempts };
+      if (task.run !== undefined) entry.run = task.run;
+      if (task.claimedAt !== undefined) entry.claimedAt = task.claimedAt;
+      if (task.heartbeatAt !== undefined) entry.heartbeatAt = task.heartbeatAt;
+      if (task.claimedAt !== undefined) entry.claimAgeMs = now - task.claimedAt;
+      if (task.heartbeatAt !== undefined) entry.heartbeatAgeMs = now - task.heartbeatAt;
+      st.inFlight.push(entry);
     }
     return st;
   }

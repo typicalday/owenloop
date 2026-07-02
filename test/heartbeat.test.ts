@@ -192,3 +192,62 @@ test('heartbeat: status() exposes attempts incremented after each reap', () => {
   assert.ok(planDebt2, 'plan should still be a debt');
   assert.equal(planDebt2.attempts, 2, 'attempts should be 2 after second reap');
 });
+
+// ---- Test 8: status().inFlight reports claimed tasks, then clears on close ----
+
+test('status(): inFlight lists a claimed task with all fields, then empties after close', () => {
+  const { engine, wf } = makeEngine(deliveryDef, { reapTtlMs: 1000 });
+
+  const t0 = engine.tick(wf, { now: 0 });
+  assert.equal(t0.orders.length, 1);
+  const R1 = t0.orders[0]!.run;
+
+  const before = engine.status(wf);
+  assert.equal(before.inFlight.length, 1);
+  const entry = before.inFlight[0]!;
+  assert.equal(entry.step, 'planner');
+  assert.equal(entry.key, '');
+  assert.equal(entry.run, R1);
+  assert.equal(typeof entry.claimedAt, 'number');
+  assert.equal(entry.attempts, 0);
+  assert.ok((entry.claimAgeMs ?? -1) >= 0);
+  assert.equal(entry.heartbeatAt, undefined, 'no heartbeat sent yet');
+  assert.equal(entry.heartbeatAgeMs, undefined);
+
+  engine.heartbeat(wf, R1, 10);
+  const afterBeat = engine.status(wf).inFlight[0]!;
+  assert.equal(afterBeat.heartbeatAt, 10);
+  assert.ok((afterBeat.heartbeatAgeMs ?? -1) >= 0);
+
+  engine.close(wf, R1, 'ok');
+  const after = engine.status(wf);
+  assert.equal(after.inFlight.length, 0, 'closing the run releases the lease — no longer in flight');
+});
+
+// ---- Test 9: reapWithDetails reports what it reaped; ttlOverride:0 forces stale --
+
+test('engine.reapWithDetails: reports reaped step/key/run, and ttlOverride:0 forces a fresh claim stale', () => {
+  const { engine, wf } = makeEngine(deliveryDef, { reapTtlMs: 999_999 });
+
+  const t0 = engine.tick(wf, { now: 0 });
+  const R1 = t0.orders[0]!.run;
+
+  // Normal TTL rules (no override): the claim is fresh, nothing reaped.
+  const plain = engine.reapWithDetails(wf, 100);
+  assert.equal(plain.count, 0);
+  assert.deepEqual(plain.details, []);
+
+  // ttlOverride: 0 forces every claim stale, regardless of the real TTL.
+  const forced = engine.reapWithDetails(wf, 100, undefined, { ttlOverride: 0 });
+  assert.equal(forced.count, 1);
+  assert.equal(forced.details.length, 1);
+  assert.equal(forced.details[0]!.step, 'planner');
+  assert.equal(forced.details[0]!.key, '');
+  assert.equal(forced.details[0]!.run, R1);
+
+  // The reaped run no longer holds its lease.
+  assert.throws(
+    () => engine.green(wf, R1, 'plan', { v: 1 }),
+    /no longer holds its lease|reaped or superseded/,
+  );
+});
