@@ -199,7 +199,7 @@ Usage: owenloop <command> [args] [--db <path>] [--defs <dir>]
 Commands:
   defs                                   list available workflow definitions
   lint [<def-name>]                      check def(s) for wiring problems
-  check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N]
+  check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided]
                                          bounded reachability check (deadlocks, stuck, dead steps, declared invariants)
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
@@ -302,6 +302,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       ...(maxDepth !== undefined ? { maxDepth } : {}),
       ...(maxStates !== undefined ? { maxStates } : {}),
       ...(maxCollection !== undefined ? { maxCollectionSize: maxCollection } : {}),
+      ...(flag(args, 'assume-provided') ? { assumeProvided: true } : {}),
     });
 
     if (format === 'json') {

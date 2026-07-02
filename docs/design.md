@@ -814,6 +814,15 @@ either of these — it answers "is this graph structurally sound," not "can a
 human or a stale commit route around a stall." See README's Testing section
 for how `owenloop check` fits alongside the test suite.
 
+The checker also has no runtime `provide` values, so by default a
+`seedOwed: true` input starts owed with no transition that can green it —
+reported as a false depth-0 deadlock for a def whose inputs the operator
+always supplies via `provide` at `create` time. Pass `--assume-provided`
+(`assumeProvided` in `CheckOptions` when calling `modelCheck` directly) to
+seed those inputs green instead, modeling "the operator already ran
+`provide`." It only affects the initial seed — a genuine deadlock reachable
+past the inputs is still reported.
+
 ## §26 Declarative exclusive produce-groups (`group:`)
 
 A step's `produces:` list can carry a `group:` entry spanning two or more of

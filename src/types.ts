@@ -497,6 +497,13 @@ export interface CheckOptions {
   maxDepth?: number;         // default 50
   maxStates?: number;        // default 5000
   maxCollectionSize?: number; // default 2 — max members when fan-out from an emit
+  /**
+   * Seed `seedOwed: true` inputs green, as if `provide` already ran. The checker
+   * has no runtime provide values, so without this every seedOwed input starts
+   * owed with no transition that can green it — a def whose inputs the operator
+   * supplies at create time reports a false depth-0 deadlock. Default false.
+   */
+  assumeProvided?: boolean;
 }
 
 /** The structured report produced by modelCheck. */
