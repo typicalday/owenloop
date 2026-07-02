@@ -376,6 +376,9 @@ engine: 1                      # optional; declares the engine generation this d
                                 #   A mismatch is a load-time DefError, not a confusing runtime failure.
 title: Software delivery       # optional
 description: …                 # optional
+x:                              # optional; opaque extension map for external runners/
+  anything: goes                #   tooling — shape-checked (must be a map), contents
+                                #   never read or interpreted by the engine (§27.3)
 
 inputs:                        # external artifacts, seeded when an instance starts
   - name: proposal
@@ -422,6 +425,8 @@ steps:
     maxRunsPerDay: 1000
     model: …                   # opaque hint passed through on the order
     workdir: main              # opaque hint passed through on the order
+    x:                          # optional; opaque extension map, passed through
+      anything: goes            #   untouched onto the order (Order.x); see §27.3
 ```
 
 ### `produces:` vs `generates:`

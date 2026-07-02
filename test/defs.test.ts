@@ -1919,6 +1919,141 @@ test('§27 (13) engine: is scoped per-file — an included/called child with a d
   }
 });
 
+// ---- §27.3: the opaque x: extension map ------------------------------------
+
+test('§27.3 (1) x: is accepted at def level and exposed on the loaded def, contents untouched', () => {
+  const parsed = parseDef({
+    ...delivery,
+    x: { budget: { maxTokens: 2_000_000 }, anything: ['runner', 'owned'] },
+  });
+  assert.deepEqual(parsed.x, { budget: { maxTokens: 2_000_000 }, anything: ['runner', 'owned'] });
+});
+
+test('§27.3 (2) x: is accepted at step level and exposed on the StepDef, contents untouched', () => {
+  const parsed = parseDef({
+    name: 'wf',
+    inputs: [{ name: 'q' }],
+    steps: [{
+      name: 'a', consumes: ['q'], produces: ['y'],
+      x: { agentProfile: 'claude-research', tools: ['search_web'], nested: { deep: true } },
+    }],
+  });
+  assert.deepEqual(parsed.steps[0]!.x, {
+    agentProfile: 'claude-research', tools: ['search_web'], nested: { deep: true },
+  });
+});
+
+test('§27.3 (3) x: omitted leaves the field absent at both levels (fully backward compatible)', () => {
+  const parsed = parseDef(delivery);
+  assert.equal(parsed.x, undefined);
+  assert.equal(parsed.steps[0]!.x, undefined);
+});
+
+test('§27.3 (4) an empty map x: {} is accepted at both levels', () => {
+  const parsed = parseDef({
+    ...delivery,
+    x: {},
+    steps: [
+      { name: 'planner', consumes: ['proposal'], produces: ['plan'], x: {} },
+      ...delivery.steps.slice(1),
+    ],
+  });
+  assert.deepEqual(parsed.x, {});
+  assert.deepEqual(parsed.steps[0]!.x, {});
+});
+
+test('§27.3 (5) non-map x: at def level throws DefError (string, list, number, null)', () => {
+  for (const bad of ['nope', ['a', 'b'], 42, null]) {
+    assert.throws(
+      () => buildDef({ ...delivery, x: bad }),
+      (e: unknown) => e instanceof DefError && /'delivery'\.x must be a map/.test((e as Error).message),
+      `x: ${JSON.stringify(bad)} at def level must be rejected`,
+    );
+  }
+});
+
+test('§27.3 (6) non-map x: at step level throws DefError naming the step', () => {
+  for (const bad of ['nope', ['a', 'b'], 42, null]) {
+    assert.throws(
+      () => buildDef({
+        name: 'wf',
+        inputs: [{ name: 'q' }],
+        steps: [{ name: 'a', consumes: ['q'], produces: ['y'], x: bad }],
+      }),
+      (e: unknown) => e instanceof DefError && /step 'a'\.x must be a map/.test((e as Error).message),
+      `x: ${JSON.stringify(bad)} at step level must be rejected`,
+    );
+  }
+});
+
+test('§27.3 (7) unknown-key rejection still fires alongside a valid x: — x is not a loophole', () => {
+  assert.throws(
+    () => buildDef({ ...delivery, x: { fine: true }, bogus: true }),
+    (e: unknown) => e instanceof DefError && /unknown key 'bogus'/.test((e as Error).message),
+  );
+  assert.throws(
+    () => buildDef({
+      name: 'wf',
+      inputs: [{ name: 'q' }],
+      steps: [{ name: 'a', consumes: ['q'], produces: ['y'], x: { fine: true }, bogus: true }],
+    }),
+    (e: unknown) => e instanceof DefError && /unknown key 'bogus'/.test((e as Error).message),
+  );
+});
+
+test('§27.3 (8) x: is NOT accepted on the smaller calls:/include: shapes (same shape-routing rule as §27.2)', () => {
+  assert.throws(
+    () => buildDef({
+      name: 'wf',
+      inputs: [{ name: 'q' }],
+      steps: [{ name: 'a', calls: 'child', inputs: { q: 'q' }, produces: ['y'], x: { nope: true } }],
+    }),
+    (e: unknown) => e instanceof DefError && /unknown key 'x'/.test((e as Error).message),
+  );
+  assert.throws(
+    () => buildDef({
+      name: 'wf',
+      steps: [{ include: 'child', as: 'kid', x: { nope: true } }],
+    }),
+    (e: unknown) => e instanceof DefError && /unknown key 'x'/.test((e as Error).message),
+  );
+});
+
+test('§27.3 (9) a child step\'s x: survives include: expansion untouched; the child\'s def-level x: is not merged into the parent', () => {
+  const dir = mktempDefsDir();
+  try {
+    writeFileSync(
+      join(dir, 'child.yaml'),
+      [
+        'name: child',
+        'x:',
+        '  childLevel: true',
+        'inputs:',
+        '  - name: seed',
+        'steps:',
+        '  - name: work',
+        '    consumes: [seed]',
+        '    produces: [out]',
+        '    x:',
+        '      agentProfile: claude-research',
+        '      budget: { maxTokens: 400000 }',
+      ].join('\n'),
+    );
+    writeFileSync(
+      join(dir, 'parent.yaml'),
+      ['name: parent', 'steps:', '  - include: child', '    as: kid'].join('\n'),
+    );
+    const all = loadDefs(dir);
+    const parent = all.get('parent')!;
+    const work = parent.steps.find((s) => s.name === 'kid.work')!;
+    assert.deepEqual(work.x, { agentProfile: 'claude-research', budget: { maxTokens: 400000 } });
+    assert.equal(parent.x, undefined); // child's def-level x: stays on the child
+    assert.deepEqual(all.get('child')!.x, { childLevel: true });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('Mode 1 include: prefixStep keeps a reduce consume suffix after stem-prefixing', () => {
   const dir = mktempDefsDir();
   try {

@@ -998,6 +998,52 @@ check in `buildStep` — exactly the same discriminator logic already used to
 dispatch parsing — so the unknown-key check can never accidentally validate
 an entry against the wrong shape's allowlist.
 
+### §27.3 `x:` — the opaque extension map
+
+The unknown-key rejection above is deliberately strict, which raises the
+obvious question: how does an external runner, a commercial platform layered
+on top, or any third-party tooling attach its *own* configuration to a
+workflow without either forking the engine or forcing allowlist churn for
+every new knob? The answer is exactly one sanctioned escape hatch: **`x:`**,
+accepted at the definition top level and on a normal step.
+
+The engine's entire contract for `x:` is three clauses:
+
+1. **Shape, not contents.** At load time `x:` must be a plain map (a YAML
+   mapping) — anything else (`x: nope`, `x: [a, b]`, `x: 42`, `x: null`) is
+   a `DefError` (`asExtension`, defs.ts). What's *inside* the map is never
+   validated, read, or interpreted by the engine. Whoever owns the vocabulary
+   inside `x:` (a runner, a platform) validates it against their own schema
+   at their own load time.
+2. **Pass-through, untouched.** A step-level `x:` is carried verbatim through
+   `buildOrder()` onto the emitted `Order` (`Order.x`) — the same pass-through
+   contract as `model` — so the runner consuming the order gets it without a
+   second read of the YAML. The definition-level `x:` is exposed as
+   `WorkflowDef.x` on the loaded def.
+3. **Additive and inert.** A definition without `x:` is unchanged, byte for
+   byte, in behavior and in `hashDef` terms. A definition *with* `x:` behaves
+   identically to one without as far as the engine is concerned — eligibility,
+   firing, acceptance, cascade, and the model checker are all blind to it.
+
+This keeps external vocabularies out of the engine entirely: the same YAML
+file is a single source of truth read by two consumers — the engine reads
+the dataflow fields, the runner reads `x:` — with no allowlist churn as the
+external tooling grows knobs, and no third-party schema leaking into the
+engine's own.
+
+Scope notes: `x:` is a key on the two *authored, engine-fired* shapes
+(`RAW_DEF_KEYS`, `RAW_STEP_KEYS`). It is **not** in the smaller
+`calls:`/`include:` directive shapes (same shape-routing rule as §27.2 —
+those are machine-handled entries with no order for a runner to configure)
+and not on produce/group/judge/input entries. Because `x:` rides inside the
+def, it participates in §28 pinning like every other field: an instance sees
+the `x:` snapshotted at `createInstance` time, and `hashDef` treats an `x:`
+edit as real drift — which is correct, since the runner's behavior for that
+instance depends on it. `expandIncludes` carries a child step's `x:` through
+prefixing untouched (there are no stems inside `x:` to rewrite — it's
+opaque); a child definition's own top-level `x:` stays on the child def and
+is not merged into the parent's.
+
 ## §28 Instance-to-definition pinning
 
 Every prior section treats a workflow *definition* as the stable thing and a
