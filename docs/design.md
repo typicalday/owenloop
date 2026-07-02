@@ -681,6 +681,20 @@ verbs with no new CLI surface:
   `'green'` as a failure and would have misreported a healthy
   producer-into-`submitted` commit as an error.
 
+`reject()` grows a matching, smaller vocabulary: `{ outcome: 'rejected' |
+'born-rejected'; reason?: string }` (previously `void`). `'rejected'` is the
+normal case — unchanged behavior, exit 0. `'born-rejected'` is new: a judge's
+verdict lost the CAS race in §24.4 (the judged stem moved since this judge's
+order was claimed) and was refused rather than applied — the judged artifact
+is untouched, `judgmentRejects` is not bumped, and the CLI's `case 'reject':`
+handler (split out from the `retract`/`skip` block it used to share, since
+those two verbs are still `void`) mirrors `green`'s born-rejected branch:
+print the outcome, exit 1. Before this, the CLI discarded `reject()`'s return
+value and always printed `{ok:true}` / exit 0 — a stale judge reject looked
+like success on the wire, exactly the failure `judged-research.yaml`'s
+documented `owenloop reject … --by researcher.report.judges.rigor` usage must
+surface to a scripted caller.
+
 ### §24.8 YAML surface
 
 ```yaml

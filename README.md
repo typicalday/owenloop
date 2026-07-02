@@ -207,10 +207,13 @@ Global flags: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) an
 | `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed job |
 | `delete <wf>` | delete an instance and all its rows |
 
-**Exit codes for `green` / `emit` / `seal`:** these exit non-zero when the engine
-refuses the commit (the value was born-rejected or failed its schema). The result JSON
-is always written to stdout; the human-readable reason goes to stderr. A successful
-commit exits 0 — a worker should treat a non-zero exit as a failure, not a success.
+**Exit codes for `green` / `emit` / `seal` / `reject`:** these exit non-zero when the
+engine refuses the commit or verdict (born-rejected, or a schema failure for `green` /
+`emit` / `seal`). `reject` can be born-rejected too — a [judge's](#judges---quality-gates-before-green)
+verdict lands on a stale `submitted` version (a sibling judge already settled it, the
+producer resubmitted, or a human bypassed it) and the CAS guard refuses it. The result
+JSON is always written to stdout; the human-readable reason goes to stderr. A successful
+call exits 0 — a worker should treat a non-zero exit as a failure, not a success.
 
 ### What a job looks like
 
@@ -393,6 +396,12 @@ surface. Once every declared judge has approved the current version, `report`
 goes `green`. A single reject sends it straight to `rejected` and re-arms
 `researcher`; a rebuild starts every judge's ledger fresh, so a sibling
 judge's earlier approval never carries over to a new version.
+
+A judge's `reject` is itself CAS-guarded against staleness: if the judged
+artifact has already moved past the version this judge was looking at (a
+sibling judge rejected it first, the producer resubmitted, or a human
+bypassed the ledger), the reject is refused — `born-rejected`, exit code 1 —
+instead of silently corrupting the newer submission's ledger.
 
 A human can always short-circuit the panel:
 
