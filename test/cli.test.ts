@@ -230,6 +230,96 @@ test('tick --now=<ms> drives the clock deterministically (rate fixture)', () => 
   assert.equal(run('tick', wf, `--now=${T0 + 30 * 60_000}`).json().orders.length, 0);
 });
 
+// ---- runs / reap --------------------------------------------------------------
+
+test('runs: lists closed and open runs, joining claim state only for the open one', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  // First run: claim, green, close — a closed run with no claim-state fields.
+  const r1 = run('tick', wf).json().orders[0];
+  run('green', wf, r1.run, 'plan', '--value', J({ plan: 'v1' }));
+  run('close', wf, r1.run);
+
+  // Second run: builder claims `pr`, left open (not greened/closed).
+  const r2 = run('tick', wf).json().orders.find((o: any) => o.step === 'builder');
+  assert.ok(r2, 'builder order should be available after planner closed');
+
+  const rows = run('runs', wf).json();
+  assert.equal(rows.length, 2);
+
+  const closedRow = rows.find((r: any) => r.run === r1.run);
+  assert.equal(closedRow.step, 'planner');
+  assert.equal(closedRow.outcome, 'ok');
+  assert.equal(closedRow.claimedAt, undefined, 'a closed run carries no claim-state fields');
+  assert.equal(closedRow.attempts, undefined);
+
+  const openRow = rows.find((r: any) => r.run === r2.run);
+  assert.equal(openRow.step, 'builder');
+  assert.equal(openRow.outcome, 'open');
+  assert.equal(typeof openRow.claimedAt, 'number');
+  assert.equal(typeof openRow.attempts, 'number');
+  assert.ok(openRow.claimAgeMs >= 0);
+});
+
+test('runs --open: returns only the open run, with its claim join populated', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const order = run('tick', wf).json().orders[0]; // planner, left open
+  const rows = run('runs', wf, '--open').json();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].run, order.run);
+  assert.equal(rows[0].step, 'planner');
+  assert.equal(typeof rows[0].claimedAt, 'number');
+  assert.equal(typeof rows[0].attempts, 'number');
+  assert.ok(rows[0].claimAgeMs >= 0);
+  assert.equal(typeof rows[0].heartbeatAgeMs, 'undefined', 'no heartbeat sent yet');
+});
+
+test('reap --now clears a fresh claim (admin stand-down) and invalidates its run', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const order = run('tick', wf).json().orders[0]; // planner claimed, well within the 2h default TTL
+  const r = run('reap', wf, '--now');
+  assert.equal(r.code, 0);
+  const body = r.json();
+  assert.equal(body.reaped, 1, '--now forces the fresh claim stale regardless of real TTL');
+  assert.equal(body.details.length, 1);
+  assert.equal(body.details[0].step, 'planner');
+  assert.equal(body.details[0].key, '');
+  assert.equal(body.details[0].run, order.run);
+
+  // The old run no longer holds its lease — green/close on it must fail loudly.
+  const g = run('green', wf, order.run, 'plan', '--value', J({ plan: 'v1' }));
+  assert.equal(g.code, 1);
+  assert.match(g.err, /no longer holds its lease|reaped or superseded/);
+});
+
+test('reap (no --now) leaves a fresh claim alone', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const order = run('tick', wf).json().orders[0];
+  const r = run('reap', wf);
+  assert.equal(r.code, 0);
+  const body = r.json();
+  assert.equal(body.reaped, 0, 'a fresh claim is well within the default TTL');
+  assert.deepEqual(body.details, []);
+
+  // The run still holds its lease — green/close still succeeds normally.
+  assert.equal(run('green', wf, order.run, 'plan', '--value', J({ plan: 'v1' })).json().outcome, 'green');
+  assert.equal(run('close', wf, order.run).json().outcome, 'ok');
+});
+
+test('reap: unknown workflow is a labelled error', () => {
+  const { run } = makeCli();
+  const r = run('reap', 'wf_nope');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /workflow not found: wf_nope/);
+});
+
 test('close defaults its outcome to "ok" when --outcome is omitted', () => {
   const { run } = makeCli();
   const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;

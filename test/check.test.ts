@@ -592,10 +592,10 @@ test('CLI check: completable healthy def (seedOwed=false, maxSchemaFailures: 0) 
 
 // Helper: minimal WorkflowStatus stubs
 function doneStatus() {
-  return { done: true, debts: [], eligible: [], blocked: [], pending: [] };
+  return { done: true, debts: [], eligible: [], blocked: [], pending: [], inFlight: [] };
 }
 function notDoneStatus() {
-  return { done: false, debts: [], eligible: [], blocked: [], pending: [] };
+  return { done: false, debts: [], eligible: [], blocked: [], pending: [], inFlight: [] };
 }
 
 // §3.2 test 12: atom is:'green' true/false

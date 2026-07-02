@@ -11,6 +11,8 @@
  *   owenloop create <def> [--provide n=json] [--title t]   start an instance
  *   owenloop provide <wf> <name> [--value json]   supply an owed input
  *   owenloop tick <wf> [--now ms]       pull eligible orders
+ *   owenloop reap <wf> [--now]          run the reaper; --now forces every claim stale (TTL 0)
+ *   owenloop runs <wf> [--open]         list this instance's runs (+ claim state for open ones)
  *   owenloop status <wf>                derive debts / eligible / blocked
  *   owenloop status --all               every instance's status in one call (fleet read)
  *   owenloop show <wf>                  dump raw artifacts (debugging)
@@ -36,6 +38,7 @@ import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import { DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
+import { detId, nowMs } from './util.ts';
 
 export interface CliIO {
   cwd: string;
@@ -189,6 +192,8 @@ Commands:
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
   adopt <wf>                             re-pin an instance to the current def (§28); settles new debts
   tick <wf> [--now <ms>]                 pull eligible orders
+  reap <wf> [--now]                      run the reaper; --now forces every claim stale (TTL 0)
+  runs <wf> [--open]                     list this instance's runs (+ claim state for open ones)
   status <wf>                            derive debts / eligible / blocked
   status --all                           every instance's status in one call (fleet read)
   show <wf>                              dump raw artifacts
@@ -389,6 +394,17 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         print(io, engine.tick(wf, tickOpts));
         return 0;
       }
+      case 'reap': {
+        const wf = need(args, 1, 'workflow');
+        const nowFlag = flag(args, 'now');
+        const wfRow = store.getWorkflow(wf);
+        if (!wfRow) throw new CliError(`workflow not found: ${wf}`);
+        const def = ctx.defs.get(wfRow.def);
+        if (!def) throw new CliError(`unknown workflow definition '${wfRow.def}' (looked in ${ctx.defsDir})`);
+        const result = engine.reapWithDetails(wf, nowMs(), def, nowFlag ? { ttlOverride: 0 } : {});
+        print(io, { reaped: result.count, details: result.details });
+        return 0;
+      }
       case 'status': {
         // `--all` is the fleet read: one call returns every instance's full
         // status plus its identity and `task` join key, so a supervisor (dev)
@@ -467,6 +483,40 @@ function dispatch(command: string, io: CliIO, args: Args): number {
           // default: JSON
           print(io, trace);
         }
+        return 0;
+      }
+      case 'runs': {
+        const wf = need(args, 1, 'workflow');
+        const openOnly = flag(args, 'open');
+        const runs = store.listRuns(wf); // src/store.ts, already workflow-scoped
+        const tasks = store.listTasks(wf); // for the claim join
+        const now = nowMs();
+        const taskByKey = new Map(tasks.map((t) => [detId('taskkey', t.step, t.key), t]));
+
+        const rows = runs
+          .filter((r) => !openOnly || r.outcome === undefined)
+          .map((r) => {
+            const base: Record<string, unknown> = {
+              run: r.id,
+              step: r.step,
+              key: r.key,
+              outcome: r.outcome ?? 'open',
+              createdAt: r.createdAt,
+              updatedAt: r.updatedAt,
+            };
+            if (r.outcome !== undefined) return base; // only join claim state for OPEN runs
+            const task = taskByKey.get(detId('taskkey', r.step, r.key ?? ''));
+            if (!task || task.run !== r.id) return base; // superseded/reaped — no live claim to join
+            return {
+              ...base,
+              claimedAt: task.claimedAt,
+              heartbeatAt: task.heartbeatAt,
+              attempts: task.attempts,
+              claimAgeMs: task.claimedAt !== undefined ? now - task.claimedAt : undefined,
+              heartbeatAgeMs: task.heartbeatAt !== undefined ? now - task.heartbeatAt : undefined,
+            };
+          });
+        print(io, rows);
         return 0;
       }
       case 'list': {

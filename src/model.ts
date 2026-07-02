@@ -786,6 +786,22 @@ export interface WorkflowStatus {
    * yet approved the current version.
    */
   pending: Array<{ path: string; version: number; pendingJudges: string[] }>;
+  /**
+   * Claimed (in-flight) tasks across the workflow. Always an engine-side
+   * enrichment (like `debts[].failedRuns`/`.attempts`) since it needs the task
+   * table — `workflowStatus` itself has no store access and always returns
+   * `[]`; `Engine.status()` populates this after calling into this function.
+   */
+  inFlight: Array<{
+    step: string;
+    key: string;
+    run?: string;
+    claimedAt?: number;
+    heartbeatAt?: number;
+    attempts: number;
+    claimAgeMs?: number;
+    heartbeatAgeMs?: number;
+  }>;
 }
 
 /** Derive the operator view purely from artifact state (§17) — never stored. */
@@ -850,7 +866,7 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
   const done = ![...arts.values()].some(
     (a) => OUTSTANDING_STATES.has(a.acceptance) && !(a.acceptance === 'owed' && satisfiedAtLeastOneMembers.has(a.path)),
   );
-  return { done, debts, eligible, blocked, pending };
+  return { done, debts, eligible, blocked, pending, inFlight: [] };
 }
 
 /** The declared judge names for a produce stem (empty if the stem has no judges). */

@@ -70,7 +70,7 @@ for (const order of orders) {
   engine.close(wf, order.run);
 }
 
-const status = engine.status(wf);   // { done, debts, eligible, blocked }
+const status = engine.status(wf);   // { done, debts, eligible, blocked, inFlight }
 ```
 
 Each `order` is self-contained: `prompt`, `consumes` (the captured green

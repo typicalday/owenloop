@@ -209,7 +209,9 @@ Global flags: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) an
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
 | `tick <wf> [--now <ms>]` | claim and emit eligible **orders** (the jobs to run) |
-| `status <wf>` | derived view: `done`, `debts`, `eligible`, `blocked` |
+| `reap <wf> [--now]` | run the reaper; `--now` forces every claim stale (TTL 0) — see below |
+| `runs <wf> [--open]` | list this instance's runs, joining claim state for open ones |
+| `status <wf>` | derived view: `done`, `debts`, `eligible`, `blocked`, `inFlight` |
 | `show <wf>` | dump raw artifacts (debugging) |
 | `list` | list instances |
 | `green <wf> <run> <path> [--value json] [--terminal]` | accept an owed output |
@@ -222,6 +224,24 @@ Global flags: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) an
 | `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed job |
 | `delete <wf>` | delete an instance and all its rows |
 | `adopt <wf>` | re-pin an instance to the current definition and settle any new debts |
+
+**`reap`, `runs`, and `status.inFlight` — observing and clearing in-flight work:**
+`tick` already reaps stranded leases as a side effect (a dead/closed run, or a
+claim past its TTL), but sometimes an orchestrator needs to act deliberately
+instead of waiting for the next tick. `owenloop reap <wf>` runs that same
+cleanup on demand, applying the normal per-step/engine TTL rules — usually a
+no-op (`{ reaped: 0, details: [] }`). `owenloop reap <wf> --now` is the admin
+stand-down: it forces every currently-claimed task stale (TTL 0) regardless of
+how fresh its claim is, for reclaiming a worker you know is dead without
+waiting out the TTL. Reaping re-arms the task immediately, so **the run that
+held the cleared lease can no longer commit** — its next `green`/`close` fails
+with `run <id> no longer holds its lease (reaped or superseded)`, the same
+error a normal TTL-expired reap produces. `owenloop runs <wf> [--open]` and
+`status <wf>`'s `inFlight` array are the read side: `runs` lists every run
+this instance has ever had (with `--open` filtering to still-open ones, each
+joined with its owning task's `claimedAt`/`heartbeatAt`/`attempts`), while
+`status.inFlight` is the currently-claimed subset in the same shape, for a
+quick "what's running right now" check without listing full run history.
 
 **Exit codes for `green` / `emit` / `seal` / `reject`:** these exit non-zero when the
 engine refuses the commit or verdict (born-rejected, or a schema failure for `green` /
