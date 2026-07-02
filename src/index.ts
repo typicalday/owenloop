@@ -34,6 +34,7 @@ export { Store, openStore, StoreVersionError } from './store.ts';
 export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
 
 export { buildDef, DefError, expandIncludes, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, validateDef } from './defs.ts';
+export type { DefLoadFailure } from './defs.ts';
 
 export {
   applyOutcome,

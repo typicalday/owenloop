@@ -690,6 +690,71 @@ test('owenloop lint exits 0 when a def has warnings but no errors', () => {
   assert.deepEqual(warned.errors, []);
 });
 
+test('owenloop lint reports files that fail to parse instead of silently omitting them', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lint-unparseable-'));
+  writeFileSync(
+    join(dir, 'fine.yaml'),
+    'name: fine\ninputs:\n  - name: seed\nsteps:\n  - name: a\n    consumes: [seed]\n    produces: [out]\n    terminal: true\n',
+  );
+  // typo'd key: buildDef rejects the shape, so the def never loads
+  writeFileSync(
+    join(dir, 'typo.yaml'),
+    'name: typo\nsteps:\n  - name: a\n    produces: [y]\n    maxAttepts: 3\n',
+  );
+  const { run } = makeCli({ defs: dir });
+  const r = run('lint');
+  assert.equal(r.code, 1, 'a file create would refuse to load must fail lint too');
+  const results = r.json();
+  const failed = results.find((x: any) => x.file?.endsWith('typo.yaml'));
+  assert.ok(failed, 'unparseable file appears in lint output');
+  assert.match(failed.errors[0], /unknown key 'maxAttepts'/);
+  const fine = results.find((x: any) => x.def === 'fine');
+  assert.deepEqual(fine.errors, [], 'healthy sibling def still lints clean');
+});
+
+test("owenloop lint <name> for a def stuck in a broken file explains why it wasn't found", () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lint-broken-name-'));
+  writeFileSync(
+    join(dir, 'typo.yaml'),
+    'name: typo\nsteps:\n  - name: a\n    produces: [y]\n    maxAttepts: 3\n',
+  );
+  const { run } = makeCli({ defs: dir });
+  const r = run('lint', 'typo');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /unknown workflow definition 'typo'/);
+  assert.match(r.err, /typo\.yaml/, 'points at the file that failed to load');
+  assert.match(r.err, /unknown key 'maxAttepts'/, 'includes the load error');
+});
+
+test('owenloop check on an unknown def lists files that failed to load', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-check-broken-'));
+  writeFileSync(join(dir, 'mangled.yaml'), 'name: mangled\nsteps: [\n');
+  const { run } = makeCli({ defs: dir });
+  const r = run('check', 'mangled');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /unknown workflow definition 'mangled'/);
+  assert.match(r.err, /mangled\.yaml/, 'points at the file that failed to load');
+});
+
+test('strict-loading commands name the broken file, not just the error', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-broken-'));
+  writeFileSync(
+    join(dir, 'fine.yaml'),
+    'name: fine\ninputs:\n  - name: seed\nsteps:\n  - name: a\n    consumes: [seed]\n    produces: [out]\n    terminal: true\n',
+  );
+  writeFileSync(
+    join(dir, 'typo.yaml'),
+    'name: typo\nsteps:\n  - name: a\n    produces: [y]\n    maxAttepts: 3\n',
+  );
+  const { run } = makeCli({ defs: dir });
+  // `defs` uses the strict loader: one broken file fails the whole dir, so the
+  // error must say WHICH file — otherwise a defs dir is undebuggable at size.
+  const r = run('defs');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /typo\.yaml/);
+  assert.match(r.err, /unknown key 'maxAttepts'/);
+});
+
 // ---- trace command ----------------------------------------------------------
 
 test('trace outputs valid JSON with timeline and artifacts fields', () => {

@@ -4,7 +4,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { parseProduce } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, DefError, hashDef, lintDef, loadDefFile, loadDefs, parseDef, validateDef } from '../src/defs.ts';
+import { buildDef, DefError, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, validateDef } from '../src/defs.ts';
+import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
 const delivery = {
@@ -484,6 +485,79 @@ test('loadDefFile and loadDefs read YAML from disk', () => {
 
   const all = loadDefs(dir);
   assert.deepEqual([...all.keys()], ['delivery']);
+});
+
+test('loadDefs: a shape error names the offending file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-badshape-'));
+  writeFileSync(
+    join(dir, 'good.yaml'),
+    'name: good\ninputs:\n  - name: x\nsteps:\n  - name: a\n    consumes: [x]\n    produces: [y]\n',
+  );
+  writeFileSync(
+    join(dir, 'broken.yaml'),
+    'name: broken\nsteps:\n  - name: a\n    produces: [y]\n    maxAttepts: 3\n',
+  );
+  assert.throws(
+    () => loadDefs(dir),
+    (e: Error) =>
+      e instanceof DefError
+      && e.message.includes(join(dir, 'broken.yaml'))
+      && e.message.includes("unknown key 'maxAttepts'"),
+  );
+});
+
+test('loadDefs: a YAML syntax error names the offending file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-badyaml-'));
+  writeFileSync(join(dir, 'mangled.yaml'), 'name: mangled\nsteps: [\n');
+  assert.throws(
+    () => loadDefs(dir),
+    (e: Error) => e instanceof DefError && e.message.includes(join(dir, 'mangled.yaml')),
+  );
+});
+
+test('loadDefs: a parse error in a subdirectory workflow.yaml is an error, not a silent skip', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-badsub-'));
+  const sub = join(dir, 'packaged');
+  mkdirSync(sub);
+  writeFileSync(join(sub, 'workflow.yaml'), 'name: packaged\nsteps: [\n');
+  assert.throws(
+    () => loadDefs(dir),
+    (e: Error) => e instanceof DefError && e.message.includes(join(sub, 'workflow.yaml')),
+  );
+});
+
+test('loadDefsRaw: collects per-file failures and still returns the good defs', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-defsraw-fail-'));
+  writeFileSync(
+    join(dir, 'good.yaml'),
+    'name: good\ninputs:\n  - name: x\nsteps:\n  - name: a\n    consumes: [x]\n    produces: [y]\n',
+  );
+  writeFileSync(
+    join(dir, 'broken.yaml'),
+    'name: broken\nsteps:\n  - name: a\n    produces: [y]\n    maxAttepts: 3\n',
+  );
+  writeFileSync(join(dir, 'mangled.yaml'), 'name: mangled\nsteps: [\n');
+  // duplicate of `good` — recorded as a failure, first definition wins
+  writeFileSync(
+    join(dir, 'zz-dupe.yaml'),
+    'name: good\ninputs:\n  - name: x\nsteps:\n  - name: a\n    consumes: [x]\n    produces: [y]\n',
+  );
+
+  const failures: DefLoadFailure[] = [];
+  const defs = loadDefsRaw(dir, failures);
+  assert.deepEqual([...defs.keys()], ['good']);
+  assert.deepEqual(failures.map((f) => f.file).sort(), [
+    join(dir, 'broken.yaml'),
+    join(dir, 'mangled.yaml'),
+    join(dir, 'zz-dupe.yaml'),
+  ]);
+  const broken = failures.find((f) => f.file.endsWith('broken.yaml'))!;
+  assert.ok(broken.error.includes("unknown key 'maxAttepts'"));
+  const dupe = failures.find((f) => f.file.endsWith('zz-dupe.yaml'))!;
+  assert.ok(dupe.error.includes("duplicate workflow name 'good'"));
+
+  // without a failures array the behavior is unchanged: skip silently
+  assert.deepEqual([...loadDefsRaw(dir).keys()], ['good']);
 });
 
 // ---- bodyFile ------------------------------------------------------------
