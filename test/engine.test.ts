@@ -100,6 +100,28 @@ test('a firing carries its consumed input handles and owed reason thread', () =>
   assert.deepEqual(planner.owes.map((w) => w.path), ['plan']);
 });
 
+test('§27.3: a step-level x: rides through buildOrder onto the Order untouched; steps without x: emit orders without it', () => {
+  const stepX = { agentProfile: 'claude-research', budget: { maxTokens: 400_000 }, tools: ['search_web'] };
+  const wfDef = def(
+    'xflow',
+    [input('proposal')],
+    [
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'], x: stepX }),
+      step({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+    ],
+  );
+  const { engine } = makeEngine([wfDef]);
+  const wf = engine.createInstance('xflow');
+
+  const planner = fire(engine, wf, 'planner', 1000);
+  // carried through verbatim — same pass-through contract as `model`
+  assert.deepEqual(planner.x, stepX);
+  complete(engine, wf, planner, { plan: 'v1' });
+
+  const builder = fire(engine, wf, 'builder', 2000);
+  assert.equal(builder.x, undefined);
+});
+
 // ---- knock-back cycle (judgment reject) -------------------------------------
 
 test('knock-back: a judgment reject re-arms the producer and carries feedback', () => {

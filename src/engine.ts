@@ -59,6 +59,10 @@ export interface Order {
   outputs: string[];
   workdir: string;
   model?: string;
+  /** §27.3: the step's opaque `x:` extension map, carried through untouched
+   *  (same pass-through contract as `model`). The engine never reads it —
+   *  it exists for the external runner/tooling consuming this order. */
+  x?: Record<string, unknown>;
   prompt: string;
   /** captured handles of the green inputs this run builds on */
   consumes: Record<string, unknown>;
@@ -674,6 +678,7 @@ export class Engine {
     };
     if (f.index !== undefined) order.index = f.index;
     if (step.model !== undefined) order.model = step.model;
+    if (step.x !== undefined) order.x = step.x;
     if (f.cause !== undefined) order.cause = f.cause;
     return order;
   }

@@ -278,6 +278,10 @@ export interface StepDef {
   judges?: string;
   /** §26: declarative exclusive produce-groups spanning two or more of this step's own produces. */
   groups?: GroupDef[];
+  /** §27.3: opaque step-level extension map (`x:`). Validated as a plain map at
+   *  load time, never interpreted by the engine — carried untouched through
+   *  `buildOrder` onto the Order for an external runner/tooling to read. */
+  x?: Record<string, unknown>;
 }
 
 /** A workflow definition: a set of steps plus declared external inputs. */
@@ -305,6 +309,9 @@ export interface WorkflowDef {
   dir?: string; // source directory, if loaded from disk
   /** Declared safety invariants verified by `modelCheck`/`owenloop check`. */
   invariants?: InvariantDef[];
+  /** §27.3: opaque workflow-level extension map (`x:`). Validated as a plain
+   *  map at load time, never interpreted by the engine. */
+  x?: Record<string, unknown>;
   /**
    * @internal Mode 1 include directives before expansion. Set by `buildDef` when a
    * step-list entry has an `include:` key. Consumed and removed by `expandIncludes`.

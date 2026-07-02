@@ -96,13 +96,15 @@ interface RawStep {
   /** M2-GRAMMAR: if present, this entry is a calls: step (Mode 2 runtime composition). */
   calls?: unknown;
   reapTtl?: unknown;
+  /** §27.3: opaque extension map — validated as a map, never interpreted. */
+  x?: unknown;
 }
 /** Keys valid on a normal (non-calls:, non-include:) step entry. */
 const RAW_STEP_KEYS = [
   'name', 'consumes', 'produces', 'generates', 'invalidates', 'cadence',
   'maxRunsPerDay', 'parallel', 'maxAttempts', 'maxSchemaFailures', 'model',
   'workdir', 'terminal', 'effect', 'on', 'idleAfter', 'body', 'bodyFile',
-  'calls', 'reapTtl',
+  'calls', 'reapTtl', 'x',
 ] as const;
 
 /** Duck-typed sniffer for a raw calls: directive (Mode 2). */
@@ -135,8 +137,10 @@ interface RawDef {
   outputs?: unknown;
   invariants?: unknown;
   engine?: unknown;
+  /** §27.3: opaque extension map — validated as a map, never interpreted. */
+  x?: unknown;
 }
-const RAW_DEF_KEYS = ['name', 'title', 'description', 'inputs', 'steps', 'outputs', 'invariants', 'engine'] as const;
+const RAW_DEF_KEYS = ['name', 'title', 'description', 'inputs', 'steps', 'outputs', 'invariants', 'engine', 'x'] as const;
 
 // ---- defaults ----------------------------------------------------------------
 
@@ -216,6 +220,19 @@ function asEngineVersion(v: unknown, name: string): number {
     );
   }
   return v;
+}
+
+/**
+ * Coerce a raw `x:` value (§27.3): must be a plain map (a YAML mapping), else
+ * a load-time DefError. The CONTENTS are deliberately not validated — `x:` is
+ * the sanctioned opaque extension point for external runners/tooling; the
+ * engine only guarantees its shape and carries it through untouched.
+ */
+function asExtension(v: unknown, ctx: string): Record<string, unknown> {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+    throw new DefError(`${ctx} must be a map (a YAML mapping of extension fields)`);
+  }
+  return v as Record<string, unknown>;
 }
 
 /**
@@ -585,6 +602,7 @@ export function buildDef(raw: unknown, source?: string, baseDir?: string): Workf
     const outs = asStringArray(r.outputs, 'outputs');
     if (outs.length > 0) def.outputs = outs;
   }
+  if (r.x !== undefined) def.x = asExtension(r.x, `workflow '${name}'.x`);
   return def;
 }
 
@@ -918,6 +936,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
     body,
   };
   if (rl.model !== undefined) step.model = asString(rl.model, `step '${name}'.model`);
+  if (rl.x !== undefined) step.x = asExtension(rl.x, `step '${name}'.x`);
   if (asBool(rl.terminal, false, `step '${name}'.terminal`)) step.terminal = true;
   if (generatesPatterns.length > 0) step.generates = generatesPatterns; // kept for lint only
   if (groups.length > 0) step.groups = groups;

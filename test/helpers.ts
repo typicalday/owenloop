@@ -28,6 +28,7 @@ export interface StepSpec {
   idleAfter?: string;
   idleAfterMs?: number;
   reapTtlMs?: number;
+  x?: Record<string, unknown>;
 }
 
 export function step(spec: StepSpec): StepDef {
@@ -52,6 +53,7 @@ export function step(spec: StepSpec): StepDef {
     ...(spec.idleAfterMs !== undefined ? { idleAfterMs: spec.idleAfterMs } : {}),
     ...(spec.reapTtlMs !== undefined ? { reapTtlMs: spec.reapTtlMs } : {}),
     ...(spec.groups !== undefined ? { groups: spec.groups } : {}),
+    ...(spec.x !== undefined ? { x: spec.x } : {}),
     workdir: spec.workdir ?? 'main',
     body: spec.body ?? `run ${spec.name}`,
   };
