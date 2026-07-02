@@ -152,7 +152,7 @@ test('buildDef rejects consumes that are not a list of strings', () => {
 test('buildDef rejects a produce entry that is neither a string nor a { name, schema }', () => {
   assert.throws(
     () => buildDef({ name: 'bad', inputs: [{ name: 'a' }], steps: [{ name: 'x', consumes: ['a'], produces: [42] }] }),
-    /must be a string or a \{ name, schema \} mapping/,
+    /must be a string or a \{ name, schema, judges \} mapping/,
   );
 });
 
@@ -781,7 +781,7 @@ test('generates: invalid entry (non-string/non-object) throws DefError', () => {
       inputs: [{ name: 'q' }],
       steps: [{ name: 'a', consumes: ['q'], generates: [42], terminal: true }],
     }),
-    (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema \} mapping/.test((e as Error).message),
+    (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema, judges \} mapping/.test((e as Error).message),
   );
 });
 

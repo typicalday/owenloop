@@ -441,6 +441,10 @@ function dispatch(command: string, io: CliIO, args: Args): number {
           io.out('=== Artifacts ===');
           for (const art of trace.artifacts) {
             io.out(`${art.path}  (${art.acceptance}, v${art.version}, producer: ${art.producer})`);
+            if (art.approvals && Object.keys(art.approvals).length > 0) {
+              const ledger = Object.entries(art.approvals).map(([jn, v]) => `${jn}@v${v}`).join(', ');
+              io.out(`  approvals: ${ledger}`);
+            }
             if (art.events.length === 0) {
               io.out('  (no lifecycle events)');
             } else {
@@ -467,12 +471,17 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       }
       case 'green': {
         const wf = need(args, 1, 'workflow');
+        // §24: a human bypass (§4.11) passes 'human' in place of a run id — no
+        // lease/CAS applies, see Engine.green's actor-discrimination doc comment.
         const run = need(args, 2, 'run');
         const path = need(args, 3, 'path');
         const value = parseJson(last(args, 'value'));
         const res = engine.green(wf, run, path, value, { terminal: flag(args, 'terminal') });
         print(io, res);
-        if (res.outcome !== 'green') {
+        // §24: 'submitted' (producer commit awaiting judges) and 'approved'
+        // (one judge signed, others still pending) are successful outcomes,
+        // not errors — only 'born-rejected' and 'schema-rejected' are failures.
+        if (res.outcome === 'born-rejected' || res.outcome === 'schema-rejected') {
           io.err(`green ${path}: ${res.outcome}${res.reason ? ' — ' + res.reason : ''}`);
           return 1;
         }

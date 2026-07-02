@@ -7,13 +7,14 @@
  * See docs/design.md (a distillation of the dataflow-workflow-engine spec).
  */
 
-/** The five-state artifact lifecycle (design §11.3). */
+/** The six-state artifact lifecycle (design §11.3, extended by §24 judges). */
 export type Acceptance =
   | 'owed' // declared-but-unbuilt, or re-armed: a debt the producer must discharge
   | 'green' // accepted; satisfies whoever depends on it
   | 'rejected' // produced then judged unfit (or structurally re-armed): a debt
   | 'retracted' // a consumer dropped a collection member; terminal, out of [*]
-  | 'skipped'; // a producer declined its own output on a dead branch; settled, re-armable
+  | 'skipped' // a producer declined its own output on a dead branch; settled, re-armable
+  | 'submitted'; // built + schema-valid, awaiting judge sign-off (§24); not green, not a producer debt
 
 /** A debt is an artifact a producer owes that is not green. */
 export const DEBT_STATES: ReadonlySet<Acceptance> = new Set<Acceptance>(['owed', 'rejected']);
@@ -22,6 +23,17 @@ export const SETTLED_STATES: ReadonlySet<Acceptance> = new Set<Acceptance>([
   'green',
   'retracted',
   'skipped',
+]);
+/**
+ * States that make a workflow "not done" / an artifact "not yet usable" (§24 §4.7).
+ * Superset of DEBT_STATES: adds `submitted`, which is not a producer debt (the
+ * producer already discharged it) but is also not usable by consumers. Use this
+ * set for every "anything outstanding?" question (done-ness, allGreen); keep
+ * DEBT_STATES for strictly producer-owed semantics.
+ */
+export const OUTSTANDING_STATES: ReadonlySet<Acceptance> = new Set<Acceptance>([
+  ...DEBT_STATES,
+  'submitted',
 ]);
 
 /** Who/what authored a lifecycle action. */
@@ -86,6 +98,8 @@ export interface ArtifactData {
   sealOf?: string;
   /** a green that fired irreversible cleanup cannot be re-armed (design §15.2) */
   terminal?: boolean;
+  /** §24 judges: sign-off ledger — judge name → version that judge approved */
+  approvals?: Record<string, number>;
 }
 
 /** A task/lease node — the claimable unit of work-in-flight (design §2.2). */
@@ -147,6 +161,20 @@ export interface ProducePattern {
   suffix: string;
   /** optional JSON Schema the produced value must satisfy at commit time (§19) */
   schema?: JsonSchema;
+  /**
+   * §24 judges: optional quality gate(s) on this produce entry. v1: singleton
+   * produces only (validateDef hard-errors otherwise). Each entry is resolved
+   * (bodyFile read eagerly) into a plain `body` at parse time — no `bodyFile`
+   * on the parsed shape, mirroring StepDef.
+   */
+  judges?: Array<{
+    name: string;
+    body: string;
+    model?: string;
+    inputs?: boolean; // default false: judge sees only the judged value
+    cadence?: string;
+    maxRunsPerDay?: number;
+  }>;
 }
 
 /**
@@ -215,6 +243,8 @@ export interface StepDef {
   calls?: string;
   /** Mode 2 foundation: child input name → parent artifact name wiring for a calls: step. */
   callsInputs?: Record<string, string>;
+  /** §24 judges: marker naming the produce stem this synthesized step judges. Mirrors `calls?`. */
+  judges?: string;
 }
 
 /** A workflow definition: a set of steps plus declared external inputs. */
@@ -310,6 +340,8 @@ export interface ArtifactBiography {
    * that touched this artifact, across all versions.
    */
   events: ReasonEntry[];
+  /** §24: per-version sign-off ledger (judge name -> approved version), if any judges are declared. */
+  approvals?: Record<string, number>;
 }
 
 /** The full derived trace for one workflow instance. */
@@ -357,6 +389,7 @@ export type GraphNodeState =
   | 'stalled'    // at least one rejected AND past its producer cap
   | 'skipped'    // all outputs are skipped (dead branch)
   | 'retracted'  // all outputs are retracted
+  | 'submitted'  // at least one submitted (awaiting judge sign-off), none owed/rejected/stalled
   | 'none';      // no artifact data (static view or no artifacts yet)
 
 /** One node in the wiring graph: either a step or an external input. */
@@ -398,7 +431,10 @@ export interface WorkflowGraph {
 export interface CheckStep {
   step: string;
   key: string;      // "" for plain/reduce; element path for map
-  outcome: 'green' | 'judgment-reject' | 'schema-reject' | 'skip' | 'retract' | 'emit-seal';
+  outcome:
+    | 'green' | 'judgment-reject' | 'schema-reject' | 'skip' | 'retract' | 'emit-seal'
+    // §24: outcomes for a synthesized judge step's own firing (against the judged stem)
+    | 'judge-approve' | 'judge-reject';
 }
 
 /** A finding with its shortest witness path from the initial state. */

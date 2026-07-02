@@ -17,7 +17,7 @@ import {
   parseElement,
   sealPath,
 } from './paths.ts';
-import { DEBT_STATES, SETTLED_STATES } from './types.ts';
+import { DEBT_STATES, OUTSTANDING_STATES, SETTLED_STATES } from './types.ts';
 import type {
   Acceptance,
   ArtifactBiography,
@@ -95,6 +95,19 @@ export function stepMode(step: StepDef): StepMode {
   if (mapConsume(step)) return 'map';
   if (reduceConsume(step)) return 'reduce';
   return 'plain';
+}
+
+/**
+ * §24: the sign-off-ledger key for a synthesized judge step — the last
+ * dot-segment of its synthesized name (`${producerStep}.${stem}.judges.${judgeName}`,
+ * see defs.ts `synthesizeJudgeSteps`). Shared by eligibleFirings (model.ts) and
+ * the commit-path actor discrimination (engine.ts) so both sides agree on the
+ * one naming convention.
+ */
+export function judgeNameOf(step: StepDef): string {
+  const marker = '.judges.';
+  const idx = step.name.lastIndexOf(marker);
+  return idx === -1 ? step.name : step.name.slice(idx + marker.length);
 }
 
 export function mapProduce(step: StepDef): ProducePattern | undefined {
@@ -190,7 +203,7 @@ function resolvedTriggers(step: StepDef): FiringTrigger[] {
 function allArtifactsGreen(arts: ArtifactMap, excludePaths: ReadonlySet<string>): boolean {
   for (const [path, a] of arts) {
     if (excludePaths.has(path)) continue;
-    if (DEBT_STATES.has(a.acceptance)) return false;
+    if (OUTSTANDING_STATES.has(a.acceptance)) return false;
   }
   return true;
 }
@@ -376,6 +389,29 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
     // M2: calls: steps are machine-handled (PR5b spawns the child); never emit a worker firing.
     if (step.calls) continue;
 
+    // §24: a judge step fires through the NORMAL pipeline (§7.1) — level-triggered
+    // on "the judged stem is submitted and this judge hasn't approved the current
+    // version yet", replacing the inputsGreen check entirely. It has no outputs
+    // of its own; `outputs: [judgedStem]` carries the judged artifact through
+    // buildOrder's `owes` so the order surfaces the value + current acceptance,
+    // and the judge's later green/reject verb targets that same path (Q2).
+    if (step.judges) {
+      const judgedStem = step.judges;
+      const judged = arts.get(judgedStem);
+      if (judged && judged.acceptance === 'submitted') {
+        const approvedVersion = judged.approvals?.[judgeNameOf(step)];
+        if (approvedVersion !== judged.version) {
+          firings.push({
+            step: step.name,
+            key: '',
+            inputs: step.consumes.map((c) => c.stem),
+            outputs: [judgedStem],
+          });
+        }
+      }
+      continue;
+    }
+
     const triggers = resolvedTriggers(step);
     const hasInputsGreen = triggers.includes('inputsGreen');
     const hasAllGreen = triggers.includes('allGreen');
@@ -556,9 +592,12 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
       }
     }
 
-    // A non-terminal green is subject to the forward reject cascade: it may only
-    // stay green while every input is green *and unmoved* from its build (§11.8).
-    if (art.acceptance === 'green' && !art.terminal) {
+    // A non-terminal green — or a `submitted` artifact awaiting/holding judge
+    // sign-off (§24 §4.3) — is subject to the forward reject cascade: it may
+    // only stay usable while every input is green *and unmoved* from its build
+    // (§11.8). `submitted` is never terminal (terminal applies at judge-approve
+    // time, §4.8, so a still-submitted artifact cannot have terminal:true yet).
+    if ((art.acceptance === 'green' && !art.terminal) || art.acceptance === 'submitted') {
       const versionsOk = fingerprintMatches(arts, req, art.fingerprint ?? {});
       if (!offender && versionsOk) continue; // invariant holds
 
@@ -709,6 +748,13 @@ export interface WorkflowStatus {
   }>;
   eligible: Firing[];
   blocked: Blocker[];
+  /**
+   * §24 §4.7: artifacts `submitted` (built, awaiting judge sign-off). Not a
+   * producer debt — the producer already discharged it — but still outstanding
+   * for done-ness. `pendingJudges` lists the declared judge names that have not
+   * yet approved the current version.
+   */
+  pending: Array<{ path: string; version: number; pendingJudges: string[] }>;
 }
 
 /** Derive the operator view purely from artifact state (§17) — never stored. */
@@ -747,8 +793,26 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
     if (blockedOn.length) blocked.push({ step: step.name, blockedOn });
   }
 
-  const done = ![...arts.values()].some((a) => DEBT_STATES.has(a.acceptance));
-  return { done, debts, eligible, blocked };
+  const pending: WorkflowStatus['pending'] = [];
+  for (const a of arts.values()) {
+    if (a.acceptance !== 'submitted') continue;
+    const judgeNames = declaredJudgeNames(def, a.path);
+    const pendingJudges = judgeNames.filter((jn) => a.approvals?.[jn] !== a.version);
+    pending.push({ path: a.path, version: a.version, pendingJudges });
+  }
+  pending.sort((x, y) => x.path.localeCompare(y.path));
+
+  const done = ![...arts.values()].some((a) => OUTSTANDING_STATES.has(a.acceptance));
+  return { done, debts, eligible, blocked, pending };
+}
+
+/** The declared judge names for a produce stem (empty if the stem has no judges). */
+function declaredJudgeNames(def: WorkflowDef, stem: string): string[] {
+  for (const step of def.steps) {
+    const p = step.produces.find((pp) => pp.stem === stem && pp.kind === 'singleton');
+    if (p?.judges) return p.judges.map((j) => j.name);
+  }
+  return [];
 }
 
 function stepOwesSomething(def: WorkflowDef, step: StepDef, arts: ArtifactMap): boolean {
@@ -901,7 +965,7 @@ export function buildTrace(
         if (stallJ || stallS) stalledArtifacts.push(art.path);
       }
 
-      return {
+      const bio: ArtifactBiography = {
         path: art.path,
         producer: art.producer,
         terminal: art.terminal ?? false,
@@ -911,6 +975,8 @@ export function buildTrace(
         schemaRejects: art.schemaRejects,
         events: art.reasons, // already chronological (append-only thread)
       };
+      if (art.approvals !== undefined) bio.approvals = art.approvals;
+      return bio;
     });
 
   // --- step 5: summary ---
@@ -1095,11 +1161,23 @@ export function buildGraph(
             }
           }
           if (worstState !== 'owed') {
-            const allSkipped = nodeArts.every((a) => a.acceptance === 'skipped');
-            const allRetracted = nodeArts.every((a) => a.acceptance === 'retracted');
-            if (allSkipped) worstState = 'skipped';
-            else if (allRetracted) worstState = 'retracted';
-            // else: all green
+            // §24: submitted (awaiting judge sign-off) ranks below owed — not a
+            // producer debt — but above skipped/retracted/green, since it is not
+            // yet usable by consumers. Without this branch a submitted artifact
+            // falls through to the implicit "all green" case below.
+            for (const a of nodeArts) {
+              if (a.acceptance === 'submitted') {
+                worstState = 'submitted';
+                break;
+              }
+            }
+            if (worstState !== 'submitted') {
+              const allSkipped = nodeArts.every((a) => a.acceptance === 'skipped');
+              const allRetracted = nodeArts.every((a) => a.acceptance === 'retracted');
+              if (allSkipped) worstState = 'skipped';
+              else if (allRetracted) worstState = 'retracted';
+              // else: all green
+            }
           }
         }
       }
@@ -1131,6 +1209,7 @@ const STATE_FILL_COLORS: Record<string, string> = {
   stalled: '#ef9a9a',
   skipped: '#f5f5f5',
   retracted: '#eeeeee',
+  submitted: '#fff59d',
 };
 
 function dotEscape(s: string): string {
@@ -1391,6 +1470,11 @@ function applyOpInMemory(
   // reject and retract
   const acceptance: Acceptance = op.kind === 'reject' ? 'rejected' : 'retracted';
   const newArt: ArtifactData = { ...art, acceptance };
+  // §24 §4.3: mirrors Engine.applyOp — a cascade reject off `submitted` discards
+  // the sign-off ledger (see engine.ts applyOp for the full rationale).
+  if (art.acceptance === 'submitted' && art.approvals !== undefined) {
+    newArt.approvals = undefined;
+  }
   if (op.kind === 'reject' && op.held) {
     // Append a reason entry with kind='invalidated-irreversible' to mark this as held.
     // The held condition is detected by isHeld() via the last reasons entry's kind.
@@ -1464,6 +1548,15 @@ function eligibleOutcomes(
 ): CheckStep['outcome'][] {
   const step = def.steps.find((l) => l.name === firing.step);
   if (!step) return ['green'];
+
+  // §24: a judge firing's own verdict is against the judged stem, not against a
+  // produce of its own (judge steps declare `produces: []`). Model the two verbs
+  // the judge agent can issue (green/reject, Q2) as their own outcomes, entirely
+  // separate from the producer-outcome branches below.
+  if (step.judges) {
+    return ['judge-approve', 'judge-reject'];
+  }
+
   const stem = collectionStem(step);
   const outPath = firing.outputs[0] ?? '';
   const el = parseElement(outPath);
@@ -1615,15 +1708,52 @@ export function applyOutcome(
 
   const step = def.steps.find((l) => l.name === firing.step);
 
+  // §24: a judge firing's outcomes act on the JUDGED stem (firing.outputs[0],
+  // per eligibleFirings), not on an output of the judge step itself (it has none).
+  if (outcome === 'judge-approve' || outcome === 'judge-reject') {
+    if (step?.judges && art.acceptance === 'submitted') {
+      const jName = judgeNameOf(step);
+      if (outcome === 'judge-reject') {
+        next.set(outPath, {
+          ...art,
+          acceptance: 'rejected',
+          judgmentRejects: art.judgmentRejects + 1,
+          approvals: undefined,
+        });
+      } else {
+        const approvals = { ...(art.approvals ?? {}), [jName]: art.version };
+        const judgeNames = declaredJudgeNames(def, outPath);
+        const allApproved = judgeNames.every((jn) => approvals[jn] === art.version);
+        if (allApproved) {
+          const producerStep = def.steps.find((l) =>
+            l.produces.some((p) => p.stem === outPath && p.kind !== 'map'),
+          );
+          const updated: ArtifactData = {
+            ...art,
+            acceptance: 'green',
+            approvals,
+          };
+          if (producerStep?.terminal) updated.terminal = true;
+          next.set(outPath, updated);
+        } else {
+          next.set(outPath, { ...art, approvals });
+        }
+      }
+    }
+    return [settleInMemory(def, next)];
+  }
+
   if (outcome === 'green') {
     const fp = computeFingerprint(arts, firing.inputs);
+    const hasJudges = !!step?.produces.find((p) => p.stem === outPath)?.judges?.length;
     const updated: ArtifactData = {
       ...art,
-      acceptance: 'green',
+      acceptance: hasJudges ? 'submitted' : 'green',
       version: art.version + 1,
       fingerprint: fp,
+      approvals: undefined,
     };
-    if (step?.terminal) updated.terminal = true;
+    if (step?.terminal && !hasJudges) updated.terminal = true;
     next.set(outPath, updated);
   } else if (outcome === 'schema-reject') {
     next.set(outPath, {
@@ -1669,11 +1799,27 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
     const maxAttempts = step?.maxAttempts ?? 3;
     const maxSchema = step?.maxSchemaFailures ?? 5;
 
-    const vRank = art.version === 0 ? 0 : art.acceptance === 'green' ? 1 : 2;
+    // §24: `submitted` gets its own rank (3) — distinct from both green (1) and
+    // owed/rejected (2). Without this, a `submitted` dependency and a
+    // `rejected` dependency canonicalize identically in the skip-fingerprint
+    // encoding below, and the BFS silently under-explores the submitted branch
+    // of the state space.
+    const vRank = art.version === 0 ? 0 : art.acceptance === 'green' ? 1 : art.acceptance === 'submitted' ? 3 : 2;
     const jBucket = Math.min(art.judgmentRejects, maxAttempts);
     const sBucket = Math.min(art.schemaRejects, maxSchema);
 
     let entry = `${path}:${art.acceptance}:${vRank}:${jBucket}:${sBucket}`;
+
+    // §24: encode the sign-off ledger so two states differing only in which
+    // judges have approved (same acceptance/version) are not canonicalized
+    // as the same BFS node.
+    if (art.approvals && Object.keys(art.approvals).length > 0) {
+      const apParts = Object.entries(art.approvals)
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([judge, v]) => `${judge}@${v}`)
+        .join(',');
+      entry += `|ap:${apParts}`;
+    }
 
     // For skipped: encode fingerprint as sorted "fPath:fRank" pairs
     if (art.acceptance === 'skipped' && art.fingerprint) {
@@ -1681,7 +1827,7 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
         .sort((a, b) => a[0].localeCompare(b[0]))
         .map(([k, v]) => {
           const dep = arts.get(k);
-          const depRank = v === 0 ? 0 : dep?.acceptance === 'green' ? 1 : 2;
+          const depRank = v === 0 ? 0 : dep?.acceptance === 'green' ? 1 : dep?.acceptance === 'submitted' ? 3 : 2;
           return `${k}@${depRank}`;
         })
         .join(',');

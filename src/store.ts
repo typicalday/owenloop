@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS artifact (
   schema_rejects   INTEGER NOT NULL DEFAULT 0,
   seal_of          TEXT,
   terminal         INTEGER NOT NULL DEFAULT 0,
+  approvals        TEXT,
   updated_at       INTEGER NOT NULL,
   UNIQUE (workflow, path)
 );
@@ -128,7 +129,7 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 `;
 
-const SCHEMA_VERSION = '4';
+const SCHEMA_VERSION = '5';
 
 // ---- (de)serialization helpers ----------------------------------------------
 
@@ -154,6 +155,7 @@ interface ArtifactRowRaw {
   schema_rejects: number;
   seal_of: string | null;
   terminal: number;
+  approvals: string | null;
   updated_at: number;
 }
 
@@ -176,6 +178,8 @@ function mapArtifact(r: ArtifactRowRaw): ArtifactRow {
   const fp = fromJson<Fingerprint | undefined>(r.fingerprint, undefined);
   if (fp !== undefined) out.fingerprint = fp;
   if (r.seal_of !== null) out.sealOf = r.seal_of;
+  const approvals = fromJson<Record<string, number> | undefined>(r.approvals, undefined);
+  if (approvals !== undefined) out.approvals = approvals;
   return out;
 }
 
@@ -353,6 +357,10 @@ export class Store {
     }
     // Reverse-lookup index (CREATE INDEX IF NOT EXISTS is idempotent).
     this.db.exec(`CREATE INDEX IF NOT EXISTS workflow_produced_by ON workflow(produced_by_wf, produced_by_path)`);
+    // §24: judges — the per-version sign-off ledger (judge name -> approved version).
+    if (!artifactCols.some((c) => c.name === 'approvals')) {
+      this.db.exec(`ALTER TABLE artifact ADD COLUMN approvals TEXT`);
+    }
   }
 
   /**
@@ -476,9 +484,9 @@ export class Store {
       .prepare(
         `INSERT INTO artifact
            (id, workflow, path, producer, acceptance, version, value, fingerprint,
-            reasons, judgment_rejects, schema_rejects, seal_of, terminal, updated_at)
+            reasons, judgment_rejects, schema_rejects, seal_of, terminal, approvals, updated_at)
          VALUES (@id, @workflow, @path, @producer, @acceptance, @version, @value, @fingerprint,
-            @reasons, @judgment_rejects, @schema_rejects, @seal_of, @terminal, @updated_at)
+            @reasons, @judgment_rejects, @schema_rejects, @seal_of, @terminal, @approvals, @updated_at)
          ON CONFLICT(id) DO UPDATE SET
            producer = excluded.producer,
            acceptance = excluded.acceptance,
@@ -490,6 +498,7 @@ export class Store {
            schema_rejects = excluded.schema_rejects,
            seal_of = excluded.seal_of,
            terminal = excluded.terminal,
+           approvals = excluded.approvals,
            updated_at = excluded.updated_at`,
       )
       .run({
@@ -506,6 +515,7 @@ export class Store {
         schema_rejects: data.schemaRejects,
         seal_of: data.sealOf ?? null,
         terminal: data.terminal ? 1 : 0,
+        approvals: toJson(data.approvals),
         updated_at: at,
       });
     return this.getArtifactById(id) as ArtifactRow;

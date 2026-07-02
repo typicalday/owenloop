@@ -21,6 +21,7 @@ import {
   eligibleFirings,
   fingerprintMatches,
   isGreen,
+  judgeNameOf,
   maintainDecisions,
   pendingOwed,
   plainConsumes,
@@ -106,7 +107,17 @@ export interface TickResult {
 
 export interface CommitResult {
   path: string;
-  outcome: 'green' | 'born-rejected' | 'schema-rejected';
+  outcome:
+    | 'green' | 'born-rejected' | 'schema-rejected'
+    // §24: a producer's `green()` call against a produce with `judges:`
+    // declared lands `submitted`, not `green` — the value is committed and the
+    // version bumped, but the artifact awaits sign-off (§4.4).
+    | 'submitted'
+    // §24: a judge-step actor's `green()` call against a `submitted` stem
+    // records its ledger slot but doesn't necessarily flip the artifact green
+    // yet (other judges may still be pending) — 'approved' distinguishes that
+    // from 'green' (every declared judge has now signed the current version).
+    | 'approved';
   reason?: string;
   /** the schema violations, when `outcome` is `schema-rejected` (§18) */
   issues?: SchemaIssue[];
@@ -605,7 +616,30 @@ export class Engine {
 
   // ---- producer commits ------------------------------------------------------
 
-  /** Commit a singleton/map output green — or born-reject it if an input moved. */
+  /**
+   * Commit a singleton/map output green — or born-reject it if an input moved.
+   *
+   * §24 actor discrimination, by `run`:
+   *   - `run === 'human'` — the §4.11 override. No lease, no CAS: a human
+   *     `green` on any artifact (in particular a `submitted` one) is a full
+   *     bypass of the sign-off ledger, `submitted → green` immediately, and
+   *     in-flight judge orders for that submission die on their own §4.6 CAS
+   *     check the next time they try to verdict (the stem is no longer
+   *     `submitted` at their fingerprinted version).
+   *   - a real run whose step is a synthesized judge step (`step.judges`) —
+   *     this is a judge verdict against the *judged* stem (`step.judges`),
+   *     not a produce of the judge step's own (it has none). Judge-variant CAS
+   *     (§4.6): the judged stem must still be `submitted` at the version this
+   *     judge's run fingerprinted at claim time. Records the ledger slot; only
+   *     flips `submitted → green` once every declared judge has signed the
+   *     current version. Terminal is applied here (§4.8), not at producer
+   *     commit, when the produce has judges.
+   *   - a real run whose step is the artifact's actual producer — today's
+   *     path, with one addition: if the produce declares `judges:`, the
+   *     commit lands `submitted` (not `green`), clears any stale `approvals`
+   *     ledger from a prior submission (§4.4), and defers `terminal` to
+   *     judge-approve time instead of applying it here.
+   */
   green(
     workflow: string,
     run: string,
@@ -614,9 +648,66 @@ export class Engine {
     opts: { terminal?: boolean } = {},
   ): CommitResult {
     const def = this.defFor(workflow);
+    if (run === 'human') {
+      const result = this.store.tx((): CommitResult => {
+        const arts = this.artMap(workflow);
+        const art = arts.get(path);
+        if (!art) throw new Error(`cannot green unknown artifact: ${path}`);
+        const req = requiredInputs(def, arts, art);
+        const next: ArtifactData = {
+          ...art,
+          acceptance: 'green',
+          version: art.version + 1,
+          value,
+          fingerprint: computeFingerprint(arts, req),
+          approvals: undefined,
+        };
+        const producer = def.steps.find((l) => l.name === art.producer);
+        if (opts.terminal || producer?.terminal) next.terminal = true;
+        this.store.putArtifact(next);
+        this.settle(workflow, def);
+        return { path, outcome: 'green' };
+      });
+      this.fire({ type: 'commit', workflow, run, path: result.path, action: 'green', outcome: result.outcome });
+      this.fireSettled(workflow);
+      this.triggerParentIfChild(workflow);
+      return result;
+    }
+
     const result = this.store.tx((): CommitResult => {
       const r = this.openRun(workflow, run);
+      const runStep = def.steps.find((l) => l.name === r.step);
       const arts = this.artMap(workflow);
+
+      // §24: a judge-step actor's `green` targets the judged stem, not an
+      // output of its own (judge steps declare `produces: []`).
+      if (runStep?.judges) {
+        const judgedStem = runStep.judges;
+        const judged = arts.get(judgedStem);
+        const cas = this.judgeCasCheck(judged, judgedStem, r.fingerprint ?? {});
+        if (cas.moved) {
+          this.releaseLeaseOnBornReject(workflow, run);
+          this.settle(workflow, def);
+          return { path: judgedStem, outcome: 'born-rejected', reason: cas.reason };
+        }
+        const art = judged as ArtifactData; // judgeCasCheck guarantees submitted (non-null)
+        const jName = judgeNameOf(runStep);
+        const approvals = { ...(art.approvals ?? {}), [jName]: art.version };
+        const judgeNames = this.declaredJudgeNames(def, art);
+        const allApproved = judgeNames.every((jn) => approvals[jn] === art.version);
+        if (allApproved) {
+          const producer = def.steps.find((l) => l.name === art.producer);
+          const next: ArtifactData = { ...art, acceptance: 'green', approvals };
+          if (producer?.terminal) next.terminal = true;
+          this.store.putArtifact(next);
+          this.settle(workflow, def);
+          return { path: judgedStem, outcome: 'green' };
+        }
+        this.store.putArtifact({ ...art, approvals });
+        this.settle(workflow, def);
+        return { path: judgedStem, outcome: 'approved' };
+      }
+
       const art = arts.get(path);
       if (!art) throw new Error(`cannot green unknown artifact: ${path}`);
 
@@ -649,21 +740,30 @@ export class Engine {
         }
       }
 
+      // §24 §4.4/§4.8: when this produce declares judges, the commit lands
+      // `submitted` (not `green`) and the version bumps here — CAS re-arms on
+      // resubmission, not on judge-approve. `approvals` resets so a prior
+      // submission's sign-offs never leak onto a fresh version. Terminal is
+      // deferred to judge-approve time (handled in the runStep?.judges branch
+      // above), so it is deliberately NOT applied here when judges are declared.
+      const judgeNames = this.declaredJudgeNames(def, art);
+      const hasJudges = judgeNames.length > 0;
       const next: ArtifactData = {
         ...art,
-        acceptance: 'green',
+        acceptance: hasJudges ? 'submitted' : 'green',
         version: art.version + 1,
         value,
         fingerprint: computeFingerprint(arts, req),
+        approvals: undefined,
       };
       // A destructive completion (e.g. a merge) is terminal: once green it can
       // never be re-armed by the forward cascade (§15.2). A step may declare its
       // output terminal in its definition, or the caller may force it per-commit.
       const producer = def.steps.find((l) => l.name === art.producer);
-      if (opts.terminal || producer?.terminal) next.terminal = true;
+      if (!hasJudges && (opts.terminal || producer?.terminal)) next.terminal = true;
       this.store.putArtifact(next);
       this.settle(workflow, def);
-      return { path, outcome: 'green' };
+      return { path, outcome: hasJudges ? 'submitted' : 'green' };
     });
     this.fire({ type: 'commit', workflow, run, path: result.path, action: 'green', outcome: result.outcome });
     if (result.outcome === 'born-rejected') {
@@ -807,10 +907,18 @@ export class Engine {
     this.store.tx(() => {
       const art = this.store.getArtifact(workflow, path);
       if (!art) throw new Error(`cannot reject unknown artifact: ${path}`);
+      // §24 §3.1/§4.4: a judge reject (or a human reject on a `submitted`
+      // artifact) is a quality verdict, not a cascade invalidation — it wins
+      // immediately regardless of any other judge's already-recorded approval,
+      // bumps `judgmentRejects` exactly once for this submission (this call IS
+      // that one verdict — the artifact leaves `submitted` right after, so no
+      // other judge's reject can double-count it), and clears the now-moot
+      // sign-off ledger so a rebuilt/resubmitted artifact is judged fresh.
       this.store.putArtifact({
         ...art,
         acceptance: 'rejected',
         judgmentRejects: art.judgmentRejects + 1,
+        approvals: undefined,
         reasons: [...art.reasons, reason('reject', 'judgment', by, text, art.version)],
       });
       this.settle(workflow, def);
@@ -880,6 +988,10 @@ export class Engine {
         acceptance: 'owed',
         judgmentRejects: 0,
         schemaRejects: 0,
+        // §24 §4.11: a retry after a judge-reject stall clears the sign-off
+        // ledger along with the counters, so the rebuilt artifact is judged
+        // fresh rather than inheriting stale approvals from the stalled round.
+        approvals: undefined,
         reasons: [...art.reasons, reason('retry', 'structural', by, text, art.version)],
       });
       this.settle(workflow, def);
@@ -1219,9 +1331,14 @@ export class Engine {
     // For held rejects (effect.onInvalidate=escalate), use 'invalidated-irreversible' kind
     // so isHeld() can detect them and suppress auto-re-eligibility.
     const rejectKind = op.kind === 'reject' && op.held ? 'invalidated-irreversible' : 'structural';
+    // §24 §4.3: a cascade reject discards any pending/completed judge verdict on
+    // the now-stale value — clear the sign-off ledger (the version-keyed check in
+    // eligibleFirings would ignore stale entries anyway; clearing keeps state honest).
+    const clearApprovals = art.acceptance === 'submitted' && art.approvals !== undefined;
     this.store.putArtifact({
       ...art,
       acceptance,
+      ...(clearApprovals ? { approvals: undefined } : {}),
       reasons: [...art.reasons, reason(action, rejectKind, 'engine', op.reason, art.version)],
     });
   }
@@ -1278,6 +1395,30 @@ export class Engine {
     return {};
   }
 
+  /**
+   * §24/§4.6: the judge-commit variant of `casCheck`. A judge doesn't gate on
+   * its *inputs* being green (it consumes the judged stem while that stem is
+   * `submitted`, not green) — it gates on the judged stem still being
+   * `submitted` **at the version the judge's run fingerprinted at claim time**.
+   * If the producer resubmitted (new version) or a human/other judge already
+   * settled it (moved off `submitted`) while this judge's order was in flight,
+   * the stale verdict is refused — the judge simply re-fires on the fresh state.
+   */
+  private judgeCasCheck(
+    judged: ArtifactData | undefined,
+    judgedStem: string,
+    fp: Record<string, number>,
+  ): { moved?: string; reason?: string } {
+    if (!judged || judged.acceptance !== 'submitted') {
+      return { moved: judgedStem, reason: `${judgedStem} is not submitted at commit` };
+    }
+    const fpVersion = fp[judgedStem];
+    if (fpVersion !== undefined && judged.version !== fpVersion) {
+      return { moved: judgedStem, reason: `${judgedStem} moved version during this run` };
+    }
+    return {};
+  }
+
   private artMap(workflow: string): Map<string, ArtifactData> {
     const m = new Map<string, ArtifactData>();
     for (const a of this.store.listArtifacts(workflow)) m.set(a.path, a);
@@ -1314,6 +1455,18 @@ export class Engine {
     }
     const sp = step.produces.find((p) => p.kind === 'singleton' && p.stem === art.path);
     return sp?.schema;
+  }
+
+  /**
+   * §24: the declared judge names for `art`'s produce entry, or `[]` if none —
+   * `judges:` is only ever valid on a singleton produce (Q3, enforced at parse
+   * time), so unlike `produceSchema` there is no map-element case to handle.
+   */
+  private declaredJudgeNames(def: WorkflowDef, art: ArtifactData): string[] {
+    const step = def.steps.find((l) => l.name === art.producer);
+    if (!step) return [];
+    const sp = step.produces.find((p) => p.kind === 'singleton' && p.stem === art.path);
+    return sp?.judges?.map((j) => j.name) ?? [];
   }
 
   /**

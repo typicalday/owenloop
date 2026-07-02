@@ -36,10 +36,22 @@ interface RawInput {
   seedOwed?: unknown;
   schema?: unknown;
 }
-/** A produce entry: either a bare `"plan"` string, or `{ name, schema }`. */
+/** A produce entry: either a bare `"plan"` string, or `{ name, schema, judges }`. */
 interface RawProduce {
   name?: unknown;
   schema?: unknown;
+  /** §24 judges: optional quality-gate list hanging off a singleton produce entry. */
+  judges?: unknown;
+}
+/** A single raw `judges:` list entry on a produce. */
+interface RawJudge {
+  name?: unknown;
+  body?: unknown;
+  bodyFile?: unknown;
+  model?: unknown;
+  inputs?: unknown;
+  cadence?: unknown;
+  maxRunsPerDay?: unknown;
 }
 interface RawStep {
   name?: unknown;
@@ -132,11 +144,65 @@ function asSchema(v: unknown, ctx: string): JsonSchema {
 }
 
 /**
- * Parse a step's `produces` list. Each entry is either a bare pattern string
- * (`plan`, `gather.source[]`) or a mapping `{ name, schema }` attaching a JSON
- * Schema the produced value must satisfy at commit time (§19).
+ * Parse a `judges:` list hanging off a produce entry (§24 YAML surface). Each
+ * entry's `bodyFile` (if present) is resolved against `baseDir` and read
+ * eagerly, exactly like a step's `bodyFile` (#38) — by the time the judge is
+ * synthesized it carries a plain resolved `body`.
  */
-function parseProduces(v: unknown, ctx: string): ProducePattern[] {
+function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<ProducePattern['judges']> {
+  if (!Array.isArray(v)) throw new DefError(`${ctx} must be a list`);
+  const seen = new Set<string>();
+  return v.map((entry, i) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new DefError(`${ctx}[${i}] must be a { name, body|bodyFile, ... } mapping`);
+    }
+    const raw = entry as RawJudge;
+    const name = asString(raw.name, `${ctx}[${i}].name`);
+    if (seen.has(name)) throw new DefError(`${ctx}: duplicate judge name '${name}'`);
+    seen.add(name);
+    const hasBody = raw.body !== undefined;
+    const hasBodyFile = raw.bodyFile !== undefined;
+    if (hasBody && hasBodyFile) {
+      throw new DefError(`judge '${name}': set either body or bodyFile, not both`);
+    }
+    if (!hasBody && !hasBodyFile) {
+      throw new DefError(`judge '${name}': must set either body or bodyFile`);
+    }
+    let body: string;
+    if (hasBodyFile) {
+      const bodyFileRel = asString(raw.bodyFile, `judge '${name}'.bodyFile`);
+      if (baseDir === undefined) {
+        throw new DefError(
+          `judge '${name}': bodyFile requires a workflow loaded from disk (no base directory to resolve '${bodyFileRel}' against)`,
+        );
+      }
+      const resolvedPath = join(baseDir, bodyFileRel);
+      try {
+        body = readFileSync(resolvedPath, 'utf8');
+      } catch (e) {
+        throw new DefError(`judge '${name}': bodyFile '${bodyFileRel}' could not be read (resolved to '${resolvedPath}'): ${(e as Error).message}`);
+      }
+    } else {
+      body = asString(raw.body, `judge '${name}'.body`);
+    }
+    const judge: NonNullable<ProducePattern['judges']>[number] = { name, body };
+    if (raw.model !== undefined) judge.model = asString(raw.model, `judge '${name}'.model`);
+    if (raw.inputs !== undefined) judge.inputs = asBool(raw.inputs, false, `judge '${name}'.inputs`);
+    if (raw.cadence !== undefined) judge.cadence = asString(raw.cadence, `judge '${name}'.cadence`);
+    if (raw.maxRunsPerDay !== undefined) {
+      judge.maxRunsPerDay = asNumber(raw.maxRunsPerDay, DEFAULTS.maxRunsPerDay, `judge '${name}'.maxRunsPerDay`);
+    }
+    return judge;
+  });
+}
+
+/**
+ * Parse a step's `produces` list. Each entry is either a bare pattern string
+ * (`plan`, `gather.source[]`) or a mapping `{ name, schema, judges }` attaching
+ * a JSON Schema the produced value must satisfy at commit time (§19) and/or a
+ * quality-gate list (§24). `baseDir` resolves judge `bodyFile:` entries.
+ */
+function parseProduces(v: unknown, ctx: string, baseDir?: string): ProducePattern[] {
   if (v === undefined) return [];
   if (!Array.isArray(v)) throw new DefError(`${ctx} must be a list`);
   return v.map((entry, i) => {
@@ -146,9 +212,15 @@ function parseProduces(v: unknown, ctx: string): ProducePattern[] {
       const name = asString(raw.name, `${ctx}[${i}].name`);
       const pat = parseProduce(name);
       if (raw.schema !== undefined) pat.schema = asSchema(raw.schema, `produce '${name}'.schema`);
+      if (raw.judges !== undefined) {
+        if (pat.kind !== 'singleton') {
+          throw new DefError(`produce '${name}': judges: is only supported on singleton produces (v1), got a ${pat.kind} produce`);
+        }
+        pat.judges = parseJudges(raw.judges, `produce '${name}'.judges`, baseDir);
+      }
       return pat;
     }
-    throw new DefError(`${ctx}[${i}] must be a string or a { name, schema } mapping`);
+    throw new DefError(`${ctx}[${i}] must be a string or a { name, schema, judges } mapping`);
   });
 }
 
@@ -225,7 +297,7 @@ function collectPredicateStems(pred: InvariantPredicate): string[] {
 
 // Allowed `is` literals for path atoms
 const ALLOWED_IS = new Set<string>([
-  'owed', 'green', 'rejected', 'retracted', 'skipped', 'present', 'absent',
+  'owed', 'green', 'rejected', 'retracted', 'skipped', 'submitted', 'present', 'absent',
 ]);
 
 /** Parse a raw object into an InvariantPredicate, throwing DefError on shape errors. */
@@ -336,7 +408,7 @@ export function buildDef(raw: unknown, source?: string, baseDir?: string): Workf
       const inc = parseIncludeDirective(rl, i, name);
       includes.push({ pos: steps.length, ...inc });
     } else {
-      steps.push(buildStep(rl as RawStep, i, baseDir));
+      steps.push(...buildStep(rl as RawStep, i, baseDir));
     }
   }
 
@@ -420,6 +492,10 @@ function prefixStep(step: StepDef, prefix: string): StepDef {
     newEffect = { ...step.effect, onInvalidate: prefixStem(step.effect.onInvalidate) };
   }
 
+  // judges: marker names a local stem (unlike calls:, which names an external
+  // workflow) — it must be prefixed to keep pointing at the (now-prefixed) produce.
+  const newJudges = step.judges !== undefined ? prefixStem(step.judges) : undefined;
+
   const result: StepDef = {
     ...step,
     name: prefixStem(step.name),
@@ -429,6 +505,7 @@ function prefixStep(step: StepDef, prefix: string): StepDef {
   };
   if (newGenerates !== undefined) result.generates = newGenerates;
   if (newEffect !== undefined) result.effect = newEffect;
+  if (newJudges !== undefined) result.judges = newJudges;
   return result;
 }
 
@@ -559,7 +636,50 @@ export function parseDef(raw: unknown, source?: string, baseDir?: string): Workf
   return def;
 }
 
-function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef {
+/**
+ * Synthesize one full StepDef per declared `judges:` entry on a produce
+ * pattern (§24 §3.2, §7.2). Shape mirrors the `calls:` template above, with
+ * exactly three deltas from a hand-written step: the `judges: <stem>` marker
+ * (eligibility trigger, replacing inputsGreen — see model.ts), `produces: []`
+ * (a judge emits a verdict against the judged stem, not a new artifact), and
+ * `consumes: [stem, ...(inputs ? producerConsumeStems : [])]` so authority
+ * flows from the existing consume-edge check (`assertAuthority`) with no
+ * special-casing. Everything else (cadence, maxRunsPerDay, model, body,
+ * workdir, maxAttempts/maxSchemaFailures defaults) is inherited exactly like
+ * an ordinary step, because judge orders flow through the normal
+ * eligibleFirings → applySchedule → claim → buildOrder pipeline (§7.1).
+ */
+function synthesizeJudgeSteps(
+  producerStepName: string,
+  pat: ProducePattern,
+  producerConsumeStems: string[],
+): StepDef[] {
+  if (!pat.judges || pat.judges.length === 0) return [];
+  return pat.judges.map((j): StepDef => {
+    const consumeStems = j.inputs ? [pat.stem, ...producerConsumeStems] : [pat.stem];
+    const consumes = consumeStems.map((stem) => parseConsume(stem));
+    const cadence = j.cadence ?? DEFAULTS.cadence;
+    const step: StepDef = {
+      name: `${producerStepName}.${pat.stem}.judges.${j.name}`,
+      judges: pat.stem,
+      consumes,
+      produces: [],
+      invalidates: [],
+      cadence,
+      cadenceSecs: parseDurationSecs(cadence),
+      maxRunsPerDay: j.maxRunsPerDay ?? DEFAULTS.maxRunsPerDay,
+      parallel: 1,
+      maxAttempts: DEFAULTS.maxAttempts,
+      maxSchemaFailures: DEFAULTS.maxSchemaFailures,
+      workdir: DEFAULTS.workdir,
+      body: j.body,
+    };
+    if (j.model !== undefined) step.model = j.model;
+    return step;
+  });
+}
+
+function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
   // M2-GRAMMAR: if this entry carries a 'calls' key, parse it as a calls: step (Mode 2).
   if (typeof rl.calls !== 'undefined') {
     const rawCalls = rl as RawCalls;
@@ -577,7 +697,12 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef {
       }
     }
     // parse produces: (required; exactly one — enforced by validateDef)
-    const producesPatterns = parseProduces(rawCalls.produces, `step '${name}'.produces`);
+    const producesPatterns = parseProduces(rawCalls.produces, `step '${name}'.produces`, baseDir);
+    for (const p of producesPatterns) {
+      if (p.judges && p.judges.length > 0) {
+        throw new DefError(`step '${name}': judges: is not supported on a calls: step's produces (produce '${p.stem}')`);
+      }
+    }
     const step: StepDef = {
       name,
       calls: callsTarget,
@@ -594,13 +719,13 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef {
       workdir: DEFAULTS.workdir,
       body: '',              // machine-handled: no prompt body
     };
-    return step;
+    return [step];
   }
 
   const name = asString(rl.name, `steps[${i}].name`);
   const consumes = asStringArray(rl.consumes, `step '${name}'.consumes`).map(parseConsume);
-  const producesPatterns = parseProduces(rl.produces, `step '${name}'.produces`);
-  const generatesPatterns = parseProduces(rl.generates, `step '${name}'.generates`);
+  const producesPatterns = parseProduces(rl.produces, `step '${name}'.produces`, baseDir);
+  const generatesPatterns = parseProduces(rl.generates, `step '${name}'.generates`, baseDir);
   const cadence = rl.cadence === undefined ? DEFAULTS.cadence : asString(rl.cadence, `step '${name}'.cadence`);
   const hasBody = rl.body !== undefined;
   const hasBodyFile = rl.bodyFile !== undefined;
@@ -681,7 +806,16 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef {
     const reapTtlStr = asString(rl.reapTtl, `step '${name}'.reapTtl`);
     step.reapTtlMs = parseDurationMs(reapTtlStr);
   }
-  return step;
+  // generates: entries may not declare judges: (they are lint-exempt side outputs,
+  // not part of the step's primary contract) — hard error mirrors the calls: check above.
+  for (const p of generatesPatterns) {
+    if (p.judges && p.judges.length > 0) {
+      throw new DefError(`step '${name}': judges: is not supported on a generates: entry (produce '${p.stem}')`);
+    }
+  }
+  const producerConsumeStems = consumes.map((c) => c.stem);
+  const judgeSteps = producesPatterns.flatMap((p) => synthesizeJudgeSteps(name, p, producerConsumeStems));
+  return [step, ...judgeSteps];
 }
 
 // ---- validation --------------------------------------------------------------
@@ -869,6 +1003,30 @@ export function validateDef(def: WorkflowDef): string[] {
           `calls: step '${l.name}' maps to parent artifact '${parentArtifact}' which is not produced by any step or input`,
         );
       }
+    }
+  }
+
+  // J24-VALIDATE: synthesized judge step per-def rules.
+  for (const l of def.steps) {
+    if (l.judges === undefined) continue;
+    // (a) a judge step must produce nothing — it commits a verdict against the
+    //     judged stem, not a new artifact.
+    if (l.produces.length !== 0) {
+      errors.push(`judge step '${l.name}' must produce no outputs (got ${l.produces.length})`);
+    }
+    // (b) the judged stem must be a real producer with exactly one producer,
+    //     and that producer's own produce entry must be the singleton the
+    //     judge was synthesized from (defensive — buildStep already enforces
+    //     singleton-only, this guards against future direct StepDef construction).
+    const judgedStem = l.judges;
+    if (!producerOf.has(judgedStem)) {
+      errors.push(`judge step '${l.name}' judges '${judgedStem}' but nothing produces it`);
+    } else if (collectionStems.has(judgedStem)) {
+      errors.push(`judge step '${l.name}' judges '${judgedStem}' which is a collection produce; judges: is singleton-only (v1)`);
+    }
+    // (c) the judge step must consume the judged stem (authority flows from consumes).
+    if (!l.consumes.some((c) => c.mode === 'plain' && c.stem === judgedStem)) {
+      errors.push(`judge step '${l.name}' does not consume its judged stem '${judgedStem}'`);
     }
   }
 

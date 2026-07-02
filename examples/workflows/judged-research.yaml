@@ -1,0 +1,58 @@
+# Artifact judges — demonstrates `judges:` (§24 of docs/design.md).
+#
+# `researcher` produces `report`, gated by two judges: `completeness` (an
+# inline prompt) and `rigor` (loaded from disk via `bodyFile`, with a model
+# override and read access to the producer's inputs). Each judge is a real
+# synthesized step — it fires its own worker order through the normal
+# eligible -> claim -> order pipeline, and renders its verdict with the
+# existing `green` / `reject` verbs against `report` itself (no new CLI
+# surface). `report` sits in the new `submitted` acceptance state from the
+# moment `researcher` commits it until every declared judge has approved the
+# same version; a single reject sends it straight to `rejected` and re-arms
+# `researcher`.
+#
+# Drive it:
+#   wf=$(owenloop create judged-research --provide question='{"text":"why is the sky blue"}' | jq -r .workflow)
+#   owenloop tick $wf                                        # -> order for `researcher`
+#   owenloop green $wf <run> report --value '{"sections":["intro","body"]}'
+#   owenloop tick $wf                                        # -> orders for both judges
+#   owenloop green $wf <completeness-run> report --value '{}'   # judge approves (ledger slot)
+#   owenloop green $wf <rigor-run> report --value '{}'          # last judge approves -> report goes green
+#   # ...or a judge can instead:
+#   owenloop reject $wf report --by researcher.report.judges.rigor --text "no citations for claim 2"
+#   # -> report goes straight to rejected, researcher re-arms; the OTHER judge's
+#   #    partial approval is discarded, not carried over to the rebuild.
+#
+# A human can always bypass the ledger outright:
+#   owenloop green $wf human report --value '{"sections":["intro","body"],"approvedManually":true}'
+
+name: judged-research
+title: Judged research report
+description: A producer whose output must clear two independent quality judges before it counts as green.
+
+inputs:
+  - name: question
+    seedOwed: true          # required: supply with --provide or `owenloop provide`
+
+steps:
+  - name: researcher
+    consumes: [question]
+    produces:
+      - name: report
+        schema: { type: object, required: [sections] }
+        judges:
+          - name: completeness
+            body: |
+              Evaluate `report`: every section present, no placeholder or TODO
+              text, every claim carries a citation. If it falls short, reject
+              `report` with the concrete gaps (this re-arms the researcher).
+              Otherwise approve.
+          - name: rigor
+            bodyFile: judges/rigor.md
+            model: claude-opus-4-8   # optional, per-judge model override
+            inputs: true             # this judge also reads `question` for context
+    maxAttempts: 5   # caps producer rebuilds AND judge-reject -> rebuild loops
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Answer `question` and write the `report`. It must clear two judges —
+      `completeness` and `rigor` — before it is usable downstream.
