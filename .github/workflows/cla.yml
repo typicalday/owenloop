@@ -43,5 +43,5 @@ jobs:
           branch: 'cla-signatures'
           path-to-signatures: 'signatures/version1/cla.json'
 
-          # Accounts that never need to sign: the owner and bots.
-          allowlist: 'alexattd,dependabot[bot],*[bot]'
+          # Accounts that never need to sign: the owner's GitHub accounts and bots.
+          allowlist: 'alexattd,nullbtb,dependabot[bot],*[bot]'
