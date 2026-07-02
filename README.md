@@ -571,3 +571,11 @@ must provide the corresponding source for the modified work.
 A **commercial license** is available for organizations that want to use owenloop in
 proprietary products or closed-source/network services without AGPLv3 obligations —
 contact Typical Day.
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Note that
+owenloop requires every contributor to sign a **Contributor License Agreement**
+that assigns copyright in contributions to Typical Day LLC, so the project can be
+dual-licensed (AGPLv3 + commercial). The process is a one-time comment on your
+first pull request.
