@@ -312,7 +312,9 @@ instance onto the current definition, run `owenloop adopt <wf>` — it re-snapsh
 re-hashes the pin, then settles the instance so any debts the new shape introduces
 (new steps, changed `consumes`/`produces`) show up right away. `adopt` only surfaces
 new **step** outputs as debts; a workflow's `inputs:` are seeded once at `create` and
-are not retroactively re-requested.
+are not retroactively re-requested — in fact an input added mid-flight can never be
+supplied to that instance (`provide` refuses it). Need a new external fact after a
+replan? Add a consumeless intake step and green it directly (see design.md §28.4).
 
 ---
 
