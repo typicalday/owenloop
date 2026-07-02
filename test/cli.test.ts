@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { main } from '../src/cli.ts';
+import { exampleDefNames } from './helpers.ts';
 
 const EXAMPLES = join(import.meta.dirname, '..', 'examples', 'workflows');
 
@@ -87,7 +88,9 @@ test('opening a downgraded database via the CLI exits 1 with a clear stderr mess
 test('a full delivery happy path runs end to end through main()', () => {
   const { run } = makeCli();
 
-  assert.deepEqual(run('defs').json().map((d: any) => d.name).sort(), ['delivery', 'full-cycle', 'intake', 'judged-research', 'onboarding', 'provisioned-delivery', 'research', 'routing', 'routing-groups', 'sla-watchdog']);
+  const expectedDefNames = exampleDefNames(EXAMPLES);
+  assert.ok(expectedDefNames.length >= 5, 'sanity: examples/workflows should yield several defs, not a degenerate/empty set');
+  assert.deepEqual(run('defs').json().map((d: any) => d.name).sort(), expectedDefNames);
   assert.deepEqual(run('list').json(), []);
 
   const wf = run('create', 'delivery', '--title', 'Dark mode', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;

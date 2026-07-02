@@ -11,6 +11,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { exampleDefNames } from './helpers.ts';
 
 const ROOT = join(import.meta.dirname, '..');
 const BIN = join(ROOT, 'bin', 'owenloop.mjs');
@@ -281,7 +282,9 @@ test('list and defs reflect created instances', () => {
   const db = tmpDb();
   const ow = makeCli(db);
 
-  assert.deepEqual(ow('defs').map((d: any) => d.name).sort(), ['delivery', 'full-cycle', 'intake', 'judged-research', 'onboarding', 'provisioned-delivery', 'research', 'routing', 'routing-groups', 'sla-watchdog']);
+  const expectedDefNames = exampleDefNames(DEFS);
+  assert.ok(expectedDefNames.length >= 5, 'sanity: examples/workflows should yield several defs, not a degenerate/empty set');
+  assert.deepEqual(ow('defs').map((d: any) => d.name).sort(), expectedDefNames);
   assert.deepEqual(ow('list'), []);
 
   const wf = ow('create', 'delivery', '--title', 'Dark mode', '--provide', `proposal=${JSON.stringify({ text: 'x' })}`).workflow;
