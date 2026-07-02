@@ -188,10 +188,14 @@ steps:
     parallel: 8                           # fan out — check concurrently
     body: Fact-check this one source; green its `.verdict`, or `retract` it if unusable.
   - name: synth
-    consumes: ["gather.source[*]"]        # REDUCE: fires once all survivors are green
+    consumes: ["gather.source[*].verdict"]  # SUFFIXED REDUCE: fires when every survivor's .verdict is green
     produces: [draft]
-    body: Synthesize the surviving sources into a `draft`.
+    body: Synthesize the surviving sources' verdicts into a `draft`.
 ```
+
+A bare `gather.source[*]` reduce (no suffix) also exists — it gates only on
+the members themselves, firing as soon as all survivors are green,
+regardless of any per-element child artifact.
 
 **Routing (skip the dead branch):**
 ```yaml
@@ -227,7 +231,7 @@ inputs:                        # external artifacts, seeded when an instance sta
 
 steps:
   - name: worker
-    consumes: [brief]          # plain | map src[$i] | reduce src[*]
+    consumes: [brief]          # plain | map src[$i] | reduce src[*] or src[*].child
     produces:                  # singleton | collection src[] | map src[$i].x
       - name: result           # a produce can be a bare name OR {name, schema}
         schema: { type: object, required: [ok] }
@@ -250,7 +254,8 @@ Consume/produce path grammar:
 | `gather.source[]` | collection produce (emit N, then seal) |
 | `gather.source[$i]` | map (one run per element; binds `${INDEX}`) |
 | `gather.source[$i].verdict` | a map step's per-element output |
-| `gather.source[*]` | reduce (fires once, when sealed and all survivors green) |
+| `gather.source[*]` | reduce (fires once sealed and all surviving *members* are green) |
+| `gather.source[*].verdict` | suffixed reduce (fires once sealed and every surviving member's `.verdict` is green) |
 
 A step consumes in exactly one mode (plain, map, or reduce) — the loader enforces it.
 
