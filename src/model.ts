@@ -1609,12 +1609,13 @@ export function settleInMemory(
 }
 
 /** Internal: seed the initial artifact map exactly as Engine.createInstance does. */
-function seedArts(def: WorkflowDef): Map<string, ArtifactData> {
+function seedArts(def: WorkflowDef, assumeProvided = false): Map<string, ArtifactData> {
   const arts = new Map<string, ArtifactData>();
   for (const input of def.inputs) {
     // seedOwed=false → seed green (version 1); seedOwed=true → seed owed (version 0)
-    // The checker has no runtime `provide` values, so seedOwed inputs start owed.
-    const seedGreen = !input.seedOwed;
+    // The checker has no runtime `provide` values, so seedOwed inputs start owed —
+    // unless assumeProvided, which models "the operator ran `provide` at create".
+    const seedGreen = !input.seedOwed || assumeProvided;
     arts.set(input.name, {
       workflow: '',
       path: input.name,
@@ -1992,7 +1993,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   const maxStates = opts.maxStates ?? 5000;
   const maxCollectionSize = opts.maxCollectionSize ?? 2;
 
-  const initial = seedArts(def);
+  const initial = seedArts(def, opts.assumeProvided ?? false);
   const initialKey = canonicalKey(def, initial);
 
   type StateNode = {

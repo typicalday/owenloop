@@ -470,6 +470,40 @@ test('modelCheck: workflow with seedOwed=true input but no provider → deadlock
   assert.ok(dl0, 'deadlock should be at depth 0 (initial state)');
 });
 
+test('modelCheck: assumeProvided seeds seedOwed inputs green, dissolving the false depth-0 deadlock', () => {
+  // Same shape as above — but the operator WILL `provide proposal` at create
+  // time, so the depth-0 deadlock is an artifact of the checker having no
+  // runtime values. assumeProvided models the provide.
+  const owedInputDef = def(
+    'owed-input',
+    [input('proposal', { seedOwed: true })],
+    [
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'], maxAttempts: 1000, maxSchemaFailures: 0 }),
+    ],
+  );
+  const report = modelCheck(owedInputDef, { maxStates: 50, assumeProvided: true });
+  const dl0 = report.deadlocks.find((d) => d.path.length === 0);
+  assert.equal(dl0, undefined, 'no depth-0 deadlock once inputs are assumed provided');
+  assert.equal(report.completable, true, 'the real workflow completes, so should the model');
+});
+
+test('modelCheck: assumeProvided does not mask a genuine deadlock past the inputs', () => {
+  // proposal is provided, but step b's consume of 'ghostless' output chain still
+  // stalls at maxAttempts=1 after one reject — assumeProvided must not hide that.
+  const stillBroken = def(
+    'still-broken',
+    [input('proposal', { seedOwed: true })],
+    [
+      step({ name: 'a', consumes: ['proposal'], produces: ['x'], maxAttempts: 1 }),
+      step({ name: 'b', consumes: ['x'], produces: ['y'] }),
+    ],
+  );
+  const report = modelCheck(stillBroken, { maxStates: 200, assumeProvided: true });
+  assert.ok(report.deadlocks.length > 0, 'stall-induced deadlock still reported');
+  const dl0 = report.deadlocks.find((d) => d.path.length === 0);
+  assert.equal(dl0, undefined, 'but not at depth 0 — inputs themselves are green');
+});
+
 test('modelCheck: completePath is set when completable', () => {
   const report = modelCheck(deliveryProvidedNoSchemaStall, { maxStates: 500 });
   assert.equal(report.completable, true);
@@ -608,6 +642,37 @@ test('CLI check: completable healthy def (seedOwed=false, maxSchemaFailures: 0) 
   assert.equal(r.code, 0, 'clean exhaustive search → exit 0');
   assert.match(r.out, /Completable: yes/);
   assert.match(r.out, /owenloop check: tiny/);
+});
+
+test('CLI check: --assume-provided turns a seedOwed=true false deadlock into a clean pass', () => {
+  // Same healthy tiny def as above, but the input starts owed (the normal
+  // authoring style: the operator runs `provide` at create). Without the flag
+  // the checker reports a depth-0 deadlock; with it, the def checks clean.
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-assume-'));
+  writeFileSync(
+    join(defsDir, 'tiny.yaml'),
+    [
+      'name: tiny',
+      'inputs:',
+      '  - name: start',
+      '    seedOwed: true',
+      'steps:',
+      '  - name: worker',
+      '    consumes: [start]',
+      '    produces: [result]',
+      '    maxSchemaFailures: 0',
+      '    body: do it',
+    ].join('\n'),
+  );
+  const { run } = makeCli({ defs: defsDir });
+
+  const bare = run('check', 'tiny');
+  assert.equal(bare.code, 1, 'without the flag, the owed input deadlocks at depth 0');
+  assert.match(bare.out, /Deadlocks/);
+
+  const assumed = run('check', 'tiny', '--assume-provided');
+  assert.equal(assumed.code, 0, 'with --assume-provided the same def checks clean');
+  assert.match(assumed.out, /Completable: yes/);
 });
 
 // ---- Part 4: evalInvariantPredicate unit tests (§3.2) -------------------------
