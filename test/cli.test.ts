@@ -532,6 +532,57 @@ test('green: born-rejected exits non-zero and still prints result JSON', () => {
   assert.match(r.err, /born-rejected/);
 });
 
+test('reject: a stale judge verdict (CAS mismatch) exits non-zero and reports born-rejected, not a silent success', () => {
+  // Reproduces the judged-research.yaml walkthrough's judge-reject call
+  // (`owenloop reject $wf report --by researcher.report.judges.rigor ...`)
+  // in the specific race §24.4/§4.6 guards against: the judge's order was
+  // claimed against an older `report` version that has since moved on
+  // (here, a sibling judge already rejected it first), so this judge's
+  // reject must be refused as born-rejected — not silently reported ok.
+  const { run } = makeCli();
+  const wf = run('create', 'judged-research', '--provide', `question=${J({ text: 'why is the sky blue' })}`).json().workflow;
+
+  const researcherRun = run('tick', wf).json().orders.find((o: any) => o.step === 'researcher').run;
+  assert.equal(run('green', wf, researcherRun, 'report', '--value', J({ sections: ['intro'] })).code, 0);
+  run('close', wf, researcherRun);
+
+  // Both judge orders claim against the same (now `submitted`) report version.
+  const judgeOrders = run('tick', wf).json().orders;
+  const completenessStep = 'researcher.report.judges.completeness';
+  const rigorStep = 'researcher.report.judges.rigor';
+  assert.ok(judgeOrders.some((o: any) => o.step === completenessStep));
+  assert.ok(judgeOrders.some((o: any) => o.step === rigorStep));
+
+  // completeness rejects first — report leaves `submitted`, re-arming researcher.
+  const r1 = run('reject', wf, 'report', '--by', completenessStep, '--text', 'missing a section');
+  assert.equal(r1.code, 0);
+  assert.equal(r1.json().outcome, 'rejected');
+
+  // rigor's in-flight verdict for that same (now-stale) submission arrives late.
+  const r2 = run('reject', wf, 'report', '--by', rigorStep, '--text', 'no citations for claim 2');
+  assert.equal(r2.code, 1, 'a stale judge reject must exit non-zero, not report a false success');
+  const j2 = r2.json();
+  assert.equal(j2.outcome, 'born-rejected');
+  assert.match(r2.err, /born-rejected/);
+});
+
+test('reject: retract and skip are unaffected — still exit 0 with { ok: true } on a normal (non-judge) reject', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+  const planRun = run('tick', wf).json().orders[0].run;
+  assert.equal(run('green', wf, planRun, 'plan', '--value', J({ plan: 'v1' })).code, 0);
+  run('close', wf, planRun);
+
+  // A plain (non-judge) reject on a normal artifact — no CAS guard applies,
+  // this is the ordinary consumer-invalidation path and must stay a clean success.
+  const r = run('reject', wf, 'plan', '--by', 'builder', '--text', 'needs rework');
+  assert.equal(r.code, 0);
+  const j = r.json();
+  assert.equal(j.ok, true);
+  assert.equal(j.action, 'reject');
+  assert.equal(j.outcome, 'rejected');
+});
+
 test('green: schema-rejected exits non-zero and still prints result JSON', () => {
   const FIXTURES = join(import.meta.dirname, 'fixtures');
   const { run } = makeCli({ defs: FIXTURES });
