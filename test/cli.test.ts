@@ -517,6 +517,119 @@ test('status --all reports a finished instance as done with no debts', () => {
   assert.deepEqual(entry.eligible, [], 'and has no eligible steps');
 });
 
+// ---- wait --------------------------------------------------------------------
+
+test('wait --until eligible returns immediately when a step is already eligible', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const r = run('wait', wf, '--until', 'eligible', '--timeout', '5s');
+  assert.equal(r.code, 0);
+  const body = r.json();
+  assert.ok(body.eligible.length > 0, 'planner should already be eligible right after create');
+});
+
+test('wait --until done returns immediately when the workflow is already fully green', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const step = (step: string, path: string, terminal = false) => {
+    const order = run('tick', wf).json().orders.find((o: any) => o.step === step);
+    assert.ok(order, `${step} order`);
+    const args = ['green', wf, order.run, path, '--value', J({ ok: true })];
+    if (terminal) args.push('--terminal');
+    run(...args);
+    run('close', wf, order.run);
+  };
+  step('planner', 'plan');
+  step('builder', 'pr');
+  step('reviewer', 'verdict');
+  step('merger', 'merge', true);
+
+  const r = run('wait', wf, '--until', 'done', '--timeout', '5s');
+  assert.equal(r.code, 0);
+  assert.equal(r.json().done, true);
+});
+
+test('wait --until eligible times out when the condition is never met', () => {
+  const { run } = makeCli();
+  // A freshly created instance with nothing provided has no eligible steps
+  // yet in some defs, but `delivery` seeds `plan` as eligible immediately —
+  // use a workflow that is already fully done, so `eligible` stays empty.
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+  const step = (step: string, path: string, terminal = false) => {
+    const order = run('tick', wf).json().orders.find((o: any) => o.step === step);
+    const args = ['green', wf, order.run, path, '--value', J({ ok: true })];
+    if (terminal) args.push('--terminal');
+    run(...args);
+    run('close', wf, order.run);
+  };
+  step('planner', 'plan');
+  step('builder', 'pr');
+  step('reviewer', 'verdict');
+  step('merger', 'merge', true);
+
+  // now the workflow is done: it will never become eligible again
+  const r = run('wait', wf, '--until', 'eligible', '--timeout', '1s');
+  assert.equal(r.code, 1);
+  const body = r.json();
+  assert.equal(body.ok, false);
+  assert.equal(body.error, 'timeout');
+  assert.equal(body.until, 'eligible');
+});
+
+test('wait --until done times out when the condition is never met', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const r = run('wait', wf, '--until', 'done', '--timeout', '1s');
+  assert.equal(r.code, 1);
+  const body = r.json();
+  assert.equal(body.ok, false);
+  assert.equal(body.error, 'timeout');
+  assert.equal(body.until, 'done');
+});
+
+test('wait: bad --until value exits 1 with a labelled error, no polling attempted', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const r = run('wait', wf, '--until', 'frobnicate');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--until must be "eligible" or "done"/);
+});
+
+test('wait: bad --timeout value exits 1 mentioning --timeout', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const r = run('wait', wf, '--until', 'eligible', '--timeout', 'nope');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--timeout:/);
+});
+
+test('wait: missing workflow positional fails with the standard labelled error', () => {
+  const { run } = makeCli();
+  const r = run('wait');
+  assert.match(r.err, /missing required argument: workflow/);
+});
+
+test('wait on an unknown workflow id fails the same way plain status does', () => {
+  const { run } = makeCli();
+  const statusErr = run('status', 'wf_does_not_exist').err;
+  const waitErr = run('wait', 'wf_does_not_exist', '--until', 'done').err;
+  assert.equal(statusErr, waitErr, 'wait must not invent a new error path for an unknown workflow');
+});
+
+test('wait: omitting --timeout does not throw (default kicks in silently)', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+  // Already-eligible case exercises "no --timeout given" without waiting
+  // out the real 10-minute default.
+  const r = run('wait', wf, '--until', 'eligible');
+  assert.equal(r.code, 0);
+});
+
 // ---- store/path defaulting --------------------------------------------------
 
 test('with no --db or OWENLOOP_DB, the store defaults under cwd/.owenloop', () => {

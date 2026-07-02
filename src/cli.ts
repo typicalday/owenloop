@@ -15,6 +15,7 @@
  *   owenloop runs <wf> [--open]         list this instance's runs (+ claim state for open ones)
  *   owenloop status <wf>                derive debts / eligible / blocked
  *   owenloop status --all               every instance's status in one call (fleet read)
+ *   owenloop wait <wf> --until eligible|done [--timeout <dur>]   block until engine state matches
  *   owenloop show <wf>                  dump raw artifacts (debugging)
  *   owenloop list                       list instances
  *   owenloop green <wf> <run> <path> [--value json] [--terminal]
@@ -38,7 +39,7 @@ import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import { DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
-import { detId, nowMs } from './util.ts';
+import { detId, nowMs, parseDurationMs } from './util.ts';
 
 export interface CliIO {
   cwd: string;
@@ -177,6 +178,17 @@ function print(io: CliIO, value: unknown): void {
   io.out(JSON.stringify(value, null, 2));
 }
 
+/**
+ * Synchronous blocking sleep. The whole codebase is sync end to end (no
+ * async/Promise/setTimeout anywhere in src/*.ts), so `wait` needs a sync
+ * sleep rather than turning `main`/`dispatch` async. `Atomics.wait` on a
+ * value that never changes (compare 0 against 0) blocks for the full `ms`
+ * every time — exactly the "just sleep" behavior wanted here.
+ */
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 // ---- commands ----------------------------------------------------------------
 
 const USAGE = `owenloop — a dataflow workflow engine
@@ -196,6 +208,7 @@ Commands:
   runs <wf> [--open]                     list this instance's runs (+ claim state for open ones)
   status <wf>                            derive debts / eligible / blocked
   status --all                           every instance's status in one call (fleet read)
+  wait <wf> --until eligible|done [--timeout <dur>]   block until engine state matches
   show <wf>                              dump raw artifacts
   trace <wf> [--format text]             causal timeline + artifact biographies
   graph <def-or-wf> [--format dot|mermaid|json]   wiring graph (+ live overlay if wf id)
@@ -427,6 +440,55 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         }
         print(io, engine.status(need(args, 1, 'workflow')));
         return 0;
+      }
+      case 'wait': {
+        // Blocking poll so an orchestrator/agent can wait for engine state
+        // change without burning inference on a poll loop. Plain synchronous
+        // poll of the local db (cheap — one process, no LLM calls). On
+        // success, prints the exact `status()` shape (same as plain
+        // `status <wf>`) so a caller sees WHY it returned and can pipe the
+        // output the same way. On timeout, exits 1 with a JSON body (not
+        // just a stderr string) naming what's still unmet.
+        const wf = need(args, 1, 'workflow');
+        const until = last(args, 'until');
+        if (until !== 'eligible' && until !== 'done') {
+          throw new CliError(`--until must be "eligible" or "done" (got: ${until ?? '(missing)'})`);
+        }
+        const timeoutSpec = last(args, 'timeout') ?? '10m';
+        let timeoutMs: number;
+        try {
+          timeoutMs = parseDurationMs(timeoutSpec);
+        } catch (e) {
+          throw new CliError(`--timeout: ${(e as Error).message}`);
+        }
+
+        const pollMs = 250;
+        const deadline = nowMs() + timeoutMs;
+        for (;;) {
+          // Unknown/unresolvable workflow throws here the same way plain
+          // `status <wf>` does today — `wait` inherits that for free. A bad
+          // workflow id is a hard error, not a wait condition.
+          const st = engine.status(wf);
+          const satisfied = until === 'done' ? st.done : st.eligible.length > 0;
+          if (satisfied) {
+            print(io, st);
+            return 0;
+          }
+          const now = nowMs();
+          if (now >= deadline) {
+            print(io, {
+              ok: false,
+              error: 'timeout',
+              until,
+              timeout: timeoutSpec,
+              status: st, // last-observed state, so the caller sees *why* it's still unmet
+            });
+            return 1;
+          }
+          // Clamped so the last iteration wakes right at the deadline
+          // instead of sleeping past it.
+          sleepMs(Math.min(pollMs, deadline - now));
+        }
       }
       case 'show': {
         const wf = need(args, 1, 'workflow');
