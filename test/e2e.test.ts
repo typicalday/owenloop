@@ -281,7 +281,7 @@ test('list and defs reflect created instances', () => {
   const db = tmpDb();
   const ow = makeCli(db);
 
-  assert.deepEqual(ow('defs').map((d: any) => d.name).sort(), ['delivery', 'full-cycle', 'intake', 'judged-research', 'onboarding', 'provisioned-delivery', 'research', 'routing', 'sla-watchdog']);
+  assert.deepEqual(ow('defs').map((d: any) => d.name).sort(), ['delivery', 'full-cycle', 'intake', 'judged-research', 'onboarding', 'provisioned-delivery', 'research', 'routing', 'routing-groups', 'sla-watchdog']);
   assert.deepEqual(ow('list'), []);
 
   const wf = ow('create', 'delivery', '--title', 'Dark mode', '--provide', `proposal=${JSON.stringify({ text: 'x' })}`).workflow;

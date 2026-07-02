@@ -117,7 +117,12 @@ export interface CommitResult {
     // records its ledger slot but doesn't necessarily flip the artifact green
     // yet (other judges may still be pending) — 'approved' distinguishes that
     // from 'green' (every declared judge has now signed the current version).
-    | 'approved';
+    | 'approved'
+    // §26: refused because this commit would violate its produce-group's
+    // exactlyOne/atMostOne exclusivity contract — a sibling already won. Like
+    // schema-rejected, the value is NOT committed, no counters are bumped, and
+    // the run/lease is left open for the caller to close as it sees fit.
+    | 'group-rejected';
   reason?: string;
   /** the schema violations, when `outcome` is `schema-rejected` (§18) */
   issues?: SchemaIssue[];
@@ -653,6 +658,13 @@ export class Engine {
         const arts = this.artMap(workflow);
         const art = arts.get(path);
         if (!art) throw new Error(`cannot green unknown artifact: ${path}`);
+        // §26: a human bypass is still subject to group exclusivity — it must
+        // not be able to land a second winner alongside an already-green sibling.
+        const groupCas = this.groupCasCheck(def, arts, art);
+        if (groupCas.rejected) {
+          this.settle(workflow, def);
+          return { path, outcome: 'group-rejected', reason: groupCas.reason };
+        }
         const req = requiredInputs(def, arts, art);
         const next: ArtifactData = {
           ...art,
@@ -696,6 +708,13 @@ export class Engine {
         const judgeNames = this.declaredJudgeNames(def, art);
         const allApproved = judgeNames.every((jn) => approvals[jn] === art.version);
         if (allApproved) {
+          // §26: the last judge's approve is the moment this stem would go
+          // green — gate it on group exclusivity exactly like a plain commit.
+          const groupCas = this.groupCasCheck(def, arts, art);
+          if (groupCas.rejected) {
+            this.settle(workflow, def);
+            return { path: judgedStem, outcome: 'group-rejected', reason: groupCas.reason };
+          }
           const producer = def.steps.find((l) => l.name === art.producer);
           const next: ArtifactData = { ...art, acceptance: 'green', approvals };
           if (producer?.terminal) next.terminal = true;
@@ -710,6 +729,24 @@ export class Engine {
 
       const art = arts.get(path);
       if (!art) throw new Error(`cannot green unknown artifact: ${path}`);
+
+      // §26: a producer commit that would land green (no judges gating it) is
+      // subject to group exclusivity — a judged produce defers this check to
+      // the judge-approve branch above, since that's the actual green moment.
+      // This runs before CAS/schema (same "check first, don't mutate on
+      // refusal" ordering as the other structural refusal checks, and as the
+      // human-bypass/judge-approve branches above): a losing sibling must be
+      // refused as 'group-rejected' without bumping the schema-stall counter,
+      // even when its value also happens to be schema-invalid.
+      const judgeNames = this.declaredJudgeNames(def, art);
+      const hasJudges = judgeNames.length > 0;
+      if (!hasJudges) {
+        const groupCas = this.groupCasCheck(def, arts, art);
+        if (groupCas.rejected) {
+          this.settle(workflow, def);
+          return { path, outcome: 'group-rejected', reason: groupCas.reason };
+        }
+      }
 
       const req = requiredInputs(def, arts, art);
       const cas = this.casCheck(arts, req, r.fingerprint ?? {});
@@ -746,8 +783,6 @@ export class Engine {
       // submission's sign-offs never leak onto a fresh version. Terminal is
       // deferred to judge-approve time (handled in the runStep?.judges branch
       // above), so it is deliberately NOT applied here when judges are declared.
-      const judgeNames = this.declaredJudgeNames(def, art);
-      const hasJudges = judgeNames.length > 0;
       const next: ArtifactData = {
         ...art,
         acceptance: hasJudges ? 'submitted' : 'green',
@@ -1363,11 +1398,13 @@ export class Engine {
     if (op.kind === 'skip') {
       // A cascade-skip down a dead subtree carries a fingerprint too, so it
       // re-arms when the upstream branch revives (mirrors a producer skip).
+      // §26: an auto-skip of a losing group sibling tags rejectKind 'exclusive'
+      // instead of the default 'structural' (op.rejectKind carries this).
       this.store.putArtifact({
         ...art,
         acceptance: 'skipped',
         fingerprint: computeFingerprint(arts, requiredInputs(def, arts, art)),
-        reasons: [...art.reasons, reason('skip', 'structural', 'engine', op.reason, art.version)],
+        reasons: [...art.reasons, reason('skip', op.rejectKind ?? 'structural', 'engine', op.reason, art.version)],
       });
       return;
     }
@@ -1473,6 +1510,33 @@ export class Engine {
       return { moved: judgedStem, reason: `${judgedStem} moved version during this run` };
     }
     return {};
+  }
+
+  /**
+   * §26: refuse a commit that would violate its produce-group's exclusivity
+   * contract. Only `exactlyOne`/`atMostOne` groups gate at commit time (an
+   * `atLeastOne` group never refuses — any number of members may be green).
+   * Looks up the group by scanning the artifact's producer step's `groups:`
+   * for one whose `of:` contains this stem; refuses iff a *different* sibling
+   * in that group is already `green`. A sibling that is merely owed/rejected
+   * is not a conflict — this artifact would simply become the group's winner.
+   */
+  private groupCasCheck(
+    def: WorkflowDef,
+    arts: ArtifactMap,
+    art: ArtifactData,
+  ): { rejected: boolean; reason?: string } {
+    const producer = def.steps.find((l) => l.name === art.producer);
+    const group = producer?.groups?.find((g) => g.of.includes(art.path));
+    if (!group || group.mode === 'atLeastOne') return { rejected: false };
+    const winner = group.of.find((stem) => stem !== art.path && arts.get(stem)?.acceptance === 'green');
+    if (winner !== undefined) {
+      return {
+        rejected: true,
+        reason: `group '${group.group}' (${group.mode}) already has a winner: '${winner}' is green`,
+      };
+    }
+    return { rejected: false };
   }
 
   private artMap(workflow: string): Map<string, ArtifactData> {

@@ -49,7 +49,7 @@ export type Author = 'engine' | 'human' | string; // a step name, or these speci
  *    moved and its producer step declared `effect: { idempotent: false, onInvalidate: 'escalate' }`.
  *    The producer is NOT auto-eligible to re-fire; a human must intervene (retry / fix upstream).
  */
-export type RejectKind = 'judgment' | 'structural' | 'validation' | 'invalidated-irreversible';
+export type RejectKind = 'judgment' | 'structural' | 'validation' | 'invalidated-irreversible' | 'exclusive';
 
 export type ReasonAction =
   | 'reject'
@@ -152,6 +152,29 @@ export interface ConsumePattern {
 
 export type ProduceKind = 'singleton' | 'collection' | 'map';
 
+export type GroupMode = 'exactlyOne' | 'atMostOne' | 'atLeastOne';
+
+/**
+ * §26 declarative exclusive produce-groups: a step-level (not stem-level)
+ * `produces:` entry naming a set of sibling singleton stems (`of:`) and the
+ * commit-exclusivity contract (`mode:`) the engine enforces across them:
+ *   - 'exactlyOne'  — exactly one member may ever be green; the engine refuses
+ *                      a second commit and auto-skips the untouched siblings
+ *                      once the first winner lands.
+ *   - 'atMostOne'   — same refusal/auto-skip behaviour, but zero winners is a
+ *                      legal end state too (no member ever commits).
+ *   - 'atLeastOne'  — no commit-time refusal; `workflowStatus`/the checker
+ *                      simply stop counting the other members as outstanding
+ *                      once one member is green.
+ * Lives alongside a step's `produces` list (not nested in a `ProducePattern`)
+ * because a group spans multiple stems.
+ */
+export interface GroupDef {
+  group: string;
+  mode: GroupMode;
+  of: string[];
+}
+
 /** A parsed produce declaration. */
 export interface ProducePattern {
   raw: string;
@@ -245,6 +268,8 @@ export interface StepDef {
   callsInputs?: Record<string, string>;
   /** §24 judges: marker naming the produce stem this synthesized step judges. Mirrors `calls?`. */
   judges?: string;
+  /** §26: declarative exclusive produce-groups spanning two or more of this step's own produces. */
+  groups?: GroupDef[];
 }
 
 /** A workflow definition: a set of steps plus declared external inputs. */
@@ -434,7 +459,9 @@ export interface CheckStep {
   outcome:
     | 'green' | 'judgment-reject' | 'schema-reject' | 'skip' | 'retract' | 'emit-seal'
     // §24: outcomes for a synthesized judge step's own firing (against the judged stem)
-    | 'judge-approve' | 'judge-reject';
+    | 'judge-approve' | 'judge-reject'
+    // §26: a commit refused because it would violate its group's exactlyOne/atMostOne contract
+    | 'group-reject';
 }
 
 /** A finding with its shortest witness path from the initial state. */
