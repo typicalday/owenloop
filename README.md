@@ -308,10 +308,15 @@ surface, lifecycle, and trade-offs.
 A workflow is one self-contained YAML file under the `--defs` directory (either
 `name.yaml` or `name/workflow.yaml`). It's parsed, type-checked, and **validated**
 before any instance is created — dangling consumes, two producers for one artifact,
-map/reduce mismatches, and dependency cycles are all caught up front.
+map/reduce mismatches, and dependency cycles are all caught up front. An unrecognized
+key anywhere in the grammar (a typo like `bodyfile:`, a stray field) is also a
+load-time error, naming the offending key — nothing is silently ignored.
 
 ```yaml
 name: delivery                 # required; [a-z0-9][a-z0-9_-]*
+engine: 1                      # optional; declares the engine generation this def targets —
+                                #   omit it and it defaults to the version this build supports.
+                                #   A mismatch is a load-time DefError, not a confusing runtime failure.
 title: Software delivery       # optional
 description: …                 # optional
 

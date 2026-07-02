@@ -55,7 +55,7 @@ export function step(spec: StepSpec): StepDef {
 }
 
 export function def(name: string, inputs: InputDef[], steps: StepDef[]): WorkflowDef {
-  return { name, inputs, steps };
+  return { name, engine: 1, inputs, steps };
 }
 
 export function input(name: string, opts: { producer?: string; seedOwed?: boolean } = {}): InputDef {

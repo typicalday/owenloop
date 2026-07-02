@@ -902,3 +902,86 @@ every other outcome family to the live `Engine` covers this one too
 See `examples/workflows/routing-groups.yaml` for a runnable end-to-end
 example (the same router shape as `routing.yaml`, with the manual
 `engine.skip()` replaced by a declarative `group:`/`exactlyOne` contract).
+
+## §27 Engine-version contract and unknown-key rejection
+
+Two independent load-time hardening changes, both aimed at the same failure
+mode: a definition that *looks* fine but silently does not mean what the
+author intended, discovered only once it misbehaves at runtime instead of
+being caught the moment it's loaded.
+
+### §27.1 `engine:` — a declared compatibility contract
+
+A definition may declare `engine: <n>` at the top level. `buildDef` coerces
+and checks it via `asEngineVersion`: it must be a positive integer no greater
+than `SUPPORTED_ENGINE_VERSION` (defs.ts), a constant bumped whenever a future
+engine generation makes a breaking change to definition semantics. Omitting
+`engine:` defaults to `SUPPORTED_ENGINE_VERSION` — every `WorkflowDef` in
+memory carries a definite `engine: number` (the field is required on the
+type, never `undefined`), but no existing definition needs to change to keep
+working.
+
+The check is deliberately `>`, not `!==`: a definition declaring an older
+supported `engine:` (or omitting it) must keep loading unchanged even after
+`SUPPORTED_ENGINE_VERSION` is bumped — only a definition that requests a
+version *ahead* of what the running binary understands is an error. That
+error — `workflow '<name>' requires engine version <n> but this owenloop
+only supports up to <max> — upgrade owenloop` — fires at load time, before
+any instance is created, rather than as a confusing failure mid-run once the
+engine's actual behavior diverges from what the definition assumes.
+
+`engine:` is checked **per file**, not across `include:`/`calls:` edges: each
+YAML file is parsed by its own `buildDef` call, independently of any parent
+or child it's wired to. An included or called definition's `engine:` is
+validated against `SUPPORTED_ENGINE_VERSION` exactly like a top-level one,
+with no propagation or cross-checking between parent and child — `expandIncludes`
+never reads or rewrites `WorkflowDef.engine`, so a parent's declared version
+says nothing about a child's, and vice versa.
+
+### §27.2 Unknown-key rejection
+
+Every `Raw*` shape parsed from YAML (`RawDef`, `RawInput`, `RawStep`,
+`RawCalls`, `RawInclude`, `RawProduce`, `RawGroup`, `RawJudge`) is a
+*duck-typed* TypeScript interface — it describes what the parser reads, but
+on its own does nothing to stop an author's typo (`bodyfile:` instead of
+`bodyFile:`, `maxAttepts:` instead of `maxAttempts:`) or a stray/forward-looking
+field from being silently accepted and then silently ignored. Before this
+change, such a field parsed cleanly and simply never took effect — a
+debugging trap with no error message pointing at the cause.
+
+`assertNoUnknownKeys(obj, allowed, ctx)` closes that gap: called immediately
+after each duck-type cast (`as RawX`) and before any field on that object is
+read, it rejects any key not in a hand-maintained `RAW_*_KEYS` allowlist
+declared next to the corresponding `Raw*` interface (e.g. `RAW_STEP_KEYS`
+beside `RawStep`). A mismatch between the interface and its allowlist is a
+correctness bug, not a type error — the two are kept adjacent in defs.ts
+specifically so a reviewer adding a field to one sees the other.
+
+It is wired into all eight parse sites: the top-level definition
+(`RAW_DEF_KEYS`), a normal step (`RAW_STEP_KEYS`), a produce mapping entry
+(`RAW_PRODUCE_KEYS`), a `group:` exclusivity entry in a `produces:` list
+(`RAW_GROUP_KEYS`, §26), a judge entry (`RAW_JUDGE_KEYS`), an input entry
+(`RAW_INPUT_KEYS`), and the two duck-typed step-list directives that are
+distinguished from a normal step and from each other purely by which
+discriminator key is present: a `calls:` step (`RAW_CALLS_KEYS`) and an
+`include:` directive (`RAW_INCLUDE_KEYS`).
+
+The `group:` site follows the same "smaller, different shape" rule as the
+`calls:`/`include:` pair below, for the same reason: a `group:` entry
+(`group`, `mode`, `of`) is not a produce entry with extra fields, it's a
+distinct, smaller shape routed by `parseProduces` checking `'group' in
+entry` before falling through to `RAW_PRODUCE_KEYS` — so it gets its own
+allowlist rather than folding into one that would wrongly permit `name:` or
+`schema:` on a group declaration.
+
+That last pair (`calls:`/`include:`) is the other subtlety worth calling
+out explicitly: `calls:` and `include:` steps are *smaller, different*
+shapes from a normal step, not a normal step with extra fields. A `calls:`
+step entry that also carries `body:` is not "a calls step with an unused
+body field" — it's rejected as an unknown key, because `RAW_CALLS_KEYS`
+(`name`, `calls`, `inputs`, `produces`) does not include `body`. The
+routing itself (which allowlist an entry is checked against) is decided by
+`isIncludeDirective` / `isCallsDirective` / the `rl.calls !== undefined`
+check in `buildStep` — exactly the same discriminator logic already used to
+dispatch parsing — so the unknown-key check can never accidentally validate
+an entry against the wrong shape's allowlist.

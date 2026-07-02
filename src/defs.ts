@@ -36,6 +36,10 @@ interface RawInput {
   seedOwed?: unknown;
   schema?: unknown;
 }
+/** Hand-maintained key allowlist for RawInput — kept next to the interface so
+ *  the two can't silently drift (§27 unknown-key rejection). */
+const RAW_INPUT_KEYS = ['name', 'producer', 'seedOwed', 'schema'] as const;
+
 /** A produce entry: either a bare `"plan"` string, or `{ name, schema, judges }`. */
 interface RawProduce {
   name?: unknown;
@@ -43,12 +47,20 @@ interface RawProduce {
   /** §24 judges: optional quality-gate list hanging off a singleton produce entry. */
   judges?: unknown;
 }
+const RAW_PRODUCE_KEYS = ['name', 'schema', 'judges'] as const;
+
 /** §26: a `group:` entry in a `produces:` list — spans multiple sibling stems, not a produce itself. */
 interface RawGroup {
   group?: unknown;
   mode?: unknown;
   of?: unknown;
 }
+/** Hand-maintained key allowlist for RawGroup — a `group:` entry is a
+ *  DIFFERENT (smaller) shape than RawProduce, not a produce with extra
+ *  fields, so it gets its own allowlist rather than folding into
+ *  RAW_PRODUCE_KEYS (§27 unknown-key rejection). */
+const RAW_GROUP_KEYS = ['group', 'mode', 'of'] as const;
+
 /** A single raw `judges:` list entry on a produce. */
 interface RawJudge {
   name?: unknown;
@@ -59,6 +71,8 @@ interface RawJudge {
   cadence?: unknown;
   maxRunsPerDay?: unknown;
 }
+const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay'] as const;
+
 interface RawStep {
   name?: unknown;
   consumes?: unknown;
@@ -82,6 +96,14 @@ interface RawStep {
   calls?: unknown;
   reapTtl?: unknown;
 }
+/** Keys valid on a normal (non-calls:, non-include:) step entry. */
+const RAW_STEP_KEYS = [
+  'name', 'consumes', 'produces', 'generates', 'invalidates', 'cadence',
+  'maxRunsPerDay', 'parallel', 'maxAttempts', 'maxSchemaFailures', 'model',
+  'workdir', 'terminal', 'effect', 'on', 'idleAfter', 'body', 'bodyFile',
+  'calls', 'reapTtl',
+] as const;
+
 /** Duck-typed sniffer for a raw calls: directive (Mode 2). */
 interface RawCalls {
   name?: unknown;
@@ -89,12 +111,20 @@ interface RawCalls {
   inputs?: unknown;
   produces?: unknown;
 }
+/** Keys valid on a calls: step entry — a DIFFERENT (smaller) shape than RawStep;
+ *  the `calls:` key is what routes an entry here instead of RAW_STEP_KEYS. */
+const RAW_CALLS_KEYS = ['name', 'calls', 'inputs', 'produces'] as const;
+
 /** Duck-typed sniffer for a raw include directive. */
 interface RawInclude {
   include?: unknown;
   as?: unknown;
   inputs?: unknown;
 }
+/** Keys valid on an include: directive entry — the `include:` key is the
+ *  discriminator that routes an entry here instead of RAW_STEP_KEYS/RAW_CALLS_KEYS. */
+const RAW_INCLUDE_KEYS = ['include', 'as', 'inputs'] as const;
+
 interface RawDef {
   name?: unknown;
   title?: unknown;
@@ -103,7 +133,9 @@ interface RawDef {
   steps?: unknown;
   outputs?: unknown;
   invariants?: unknown;
+  engine?: unknown;
 }
+const RAW_DEF_KEYS = ['name', 'title', 'description', 'inputs', 'steps', 'outputs', 'invariants', 'engine'] as const;
 
 // ---- defaults ----------------------------------------------------------------
 
@@ -115,6 +147,19 @@ const DEFAULTS = {
   maxSchemaFailures: 5,
   workdir: 'main',
 } as const;
+
+/**
+ * The engine-version contract (§27). A workflow definition may declare
+ * `engine: <n>`; it must be a positive integer no greater than this constant
+ * or buildDef throws a DefError — catching an author running a definition
+ * written against a newer engine generation than the one running, before any
+ * instance is created, rather than failing confusingly mid-run. The check is
+ * forward-compatible (`>`, not `!==`): a def declaring an older supported
+ * version keeps loading unchanged even after this constant is bumped.
+ * Omitting `engine:` defaults to this same value (fully backward compatible:
+ * no existing definition needs to add it).
+ */
+export const SUPPORTED_ENGINE_VERSION = 1;
 
 // ---- small coercion helpers --------------------------------------------------
 
@@ -148,6 +193,48 @@ function asSchema(v: unknown, ctx: string): JsonSchema {
   }
   return v as JsonSchema;
 }
+/**
+ * Coerce + validate a raw `engine:` value (§27): must be a positive integer
+ * no greater than SUPPORTED_ENGINE_VERSION. Defaults to SUPPORTED_ENGINE_VERSION
+ * when omitted, so every WorkflowDef in memory carries a definite, checked
+ * `engine` number — never `undefined` — regardless of whether the author
+ * wrote `engine:` at all. Using a `>` (not `!==`) comparison against the max
+ * keeps this forward-compatible: once SUPPORTED_ENGINE_VERSION is bumped past
+ * 1, older defs that still declare `engine: 1` (or omit it) must keep loading
+ * exactly as before — only defs requesting a version the running binary
+ * doesn't yet support should be rejected.
+ */
+function asEngineVersion(v: unknown, name: string): number {
+  if (v === undefined) return SUPPORTED_ENGINE_VERSION;
+  if (typeof v !== 'number' || !Number.isInteger(v) || v <= 0) {
+    throw new DefError(`workflow '${name}': engine must be a positive integer`);
+  }
+  if (v > SUPPORTED_ENGINE_VERSION) {
+    throw new DefError(
+      `workflow '${name}' requires engine version ${v} but this owenloop only supports up to ${SUPPORTED_ENGINE_VERSION} — upgrade owenloop`,
+    );
+  }
+  return v;
+}
+
+/**
+ * Reject any key on `obj` that isn't in `allowed` (§27). A typo'd or
+ * forward-looking field (e.g. `bodyfile:`, `maxAttepts:`) previously parsed
+ * silently and was dropped on the floor — this turns that into a DefError
+ * naming the exact offending key(s) and where they were found, instead of a
+ * confusing "why isn't my field doing anything" debugging session.
+ *
+ * Call immediately after a duck-type cast (`as RawX`) and before any field
+ * reads, so the check runs against the same raw object every other coercion
+ * helper reads from.
+ */
+function assertNoUnknownKeys(obj: object, allowed: readonly string[], ctx: string): void {
+  const allowedSet = new Set(allowed);
+  const unknown = Object.keys(obj).filter((k) => !allowedSet.has(k));
+  if (unknown.length > 0) {
+    throw new DefError(`${ctx}: unknown key${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => `'${k}'`).join(', ')}`);
+  }
+}
 
 /**
  * Parse a `judges:` list hanging off a produce entry (§24 YAML surface). Each
@@ -163,6 +250,7 @@ function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<Pro
       throw new DefError(`${ctx}[${i}] must be a { name, body|bodyFile, ... } mapping`);
     }
     const raw = entry as RawJudge;
+    assertNoUnknownKeys(raw, RAW_JUDGE_KEYS, `${ctx}[${i}]`);
     const name = asString(raw.name, `${ctx}[${i}].name`);
     if (seen.has(name)) throw new DefError(`${ctx}: duplicate judge name '${name}'`);
     seen.add(name);
@@ -209,6 +297,7 @@ function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<Pro
  * separately rather than folded into the pattern array.
  */
 function parseGroup(v: RawGroup, ctx: string): GroupDef {
+  assertNoUnknownKeys(v, RAW_GROUP_KEYS, ctx);
   const group = asString(v.group, `${ctx}.group`);
   const mode = asString(v.mode, `group '${group}'.mode`);
   if (mode !== 'exactlyOne' && mode !== 'atMostOne' && mode !== 'atLeastOne') {
@@ -244,6 +333,7 @@ function parseProduces(v: unknown, ctx: string, baseDir?: string): { patterns: P
         return;
       }
       const raw = entry as RawProduce;
+      assertNoUnknownKeys(raw, RAW_PRODUCE_KEYS, `${ctx}[${i}]`);
       const name = asString(raw.name, `${ctx}[${i}].name`);
       const pat = parseProduce(name);
       if (raw.schema !== undefined) pat.schema = asSchema(raw.schema, `produce '${name}'.schema`);
@@ -282,6 +372,7 @@ function parseIncludeDirective(
   parentName: string,
 ): { defName: string; as: string; inputs: Record<string, string> } {
   const obj = raw as RawInclude;
+  assertNoUnknownKeys(obj, RAW_INCLUDE_KEYS, `step entry [${i}] include directive`);
   // include: must be a non-empty string
   if (typeof obj.include !== 'string' || obj.include.trim() === '') {
     throw new DefError(`step entry [${i}] 'include:' must be a workflow name string`);
@@ -416,13 +507,16 @@ export function buildDef(raw: unknown, source?: string, baseDir?: string): Workf
     throw new DefError(`workflow definition${source ? ` (${source})` : ''} must be a mapping`);
   }
   const r = raw as RawDef;
+  assertNoUnknownKeys(r, RAW_DEF_KEYS, `workflow definition${source ? ` (${source})` : ''}`);
   const name = asString(r.name, 'name');
   if (!/^[a-z0-9][a-z0-9_-]*$/i.test(name)) {
     throw new DefError(`workflow name '${name}' must be alphanumeric (with - or _)`);
   }
+  const engine = asEngineVersion(r.engine, name);
 
   const inputs: InputDef[] = (Array.isArray(r.inputs) ? r.inputs : []).map((ri, i) => {
     const raw = ri as RawInput;
+    assertNoUnknownKeys(raw, RAW_INPUT_KEYS, `inputs[${i}]`);
     const inName = asString(raw.name, `inputs[${i}].name`);
     const input: InputDef = {
       name: inName,
@@ -468,7 +562,7 @@ export function buildDef(raw: unknown, source?: string, baseDir?: string): Workf
   // (The steps array above may be empty if ALL entries are includes — that is fine
   //  once expanded. But we still need the workflow to have some work.)
 
-  const def: WorkflowDef = { name, inputs, steps };
+  const def: WorkflowDef = { name, engine, inputs, steps };
   if (includes.length > 0) def._includes = includes;
   if (r.title !== undefined) def.title = asString(r.title, 'title');
   if (r.description !== undefined) def.description = asString(r.description, 'description');
@@ -720,6 +814,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
   // M2-GRAMMAR: if this entry carries a 'calls' key, parse it as a calls: step (Mode 2).
   if (typeof rl.calls !== 'undefined') {
     const rawCalls = rl as RawCalls;
+    assertNoUnknownKeys(rawCalls, RAW_CALLS_KEYS, `steps[${i}] (calls: step)`);
     const name = asString(rawCalls.name, `steps[${i}].name`);
     const callsTarget = asString(rawCalls.calls, `step '${name}'.calls`);
     // parse inputs: optional mapping of child input name -> parent artifact name
@@ -762,6 +857,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
     return [step];
   }
 
+  assertNoUnknownKeys(rl, RAW_STEP_KEYS, `steps[${i}]`);
   const name = asString(rl.name, `steps[${i}].name`);
   const consumes = asStringArray(rl.consumes, `step '${name}'.consumes`).map(parseConsume);
   const { patterns: producesPatterns, groups } = parseProduces(rl.produces, `step '${name}'.produces`, baseDir);
