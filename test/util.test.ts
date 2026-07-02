@@ -49,3 +49,11 @@ test('localMidnightMs returns the start of the local day at or before now', () =
   assert.ok(mid <= now && now - mid < 24 * 3600_000, 'within the same local day');
   assert.equal(d.getDate(), 16, 'same calendar day');
 });
+
+test('localMidnightMs: local semantics are a documented tradeoff, not an oversight', () => {
+  // Pins the decision: this engine intentionally uses host-local midnight.
+  // See the doc comment on localMidnightMs in src/util.ts and design.md
+  // §12.3 for the DST / multi-host caveats this implies.
+  const now = new Date(2026, 0, 1, 0, 0, 0, 0).getTime(); // exact local midnight
+  assert.equal(localMidnightMs(now), now, 'exact midnight maps to itself');
+});

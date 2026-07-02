@@ -160,6 +160,16 @@ order-independent — re-running `settle()` on a healthy graph yields no ops.
   landing a green that already rests on stale inputs. This makes concurrent
   advancement safe without locking the graph: two workers can race, and at most
   one lands green; the loser is re-armed with an honest reason.
+- **§12.3 Daily-budget windows are host-local** — `maxRunsPerDay` gates
+  against a window starting at host-local midnight (`localMidnightMs` in
+  util.ts), not UTC midnight. Two consequences worth knowing: (1) the day
+  containing a DST transition is 23h or 25h, so a budget can reset
+  slightly early/late that day; (2) if multiple hosts in different
+  timezones drive the same store, they disagree on what "today" is and
+  can therefore disagree on maxRunsPerDay accounting for the same step.
+  Neither is currently a problem this project commits to solving — there
+  is no documented multi-timezone deployment target — but if one emerges,
+  switch to UTC midnight and update this note.
 
 ## §15 Completion
 
