@@ -34,6 +34,7 @@ import type {
   InvariantPredicate,
   StepDef,
   ProducePattern,
+  RejectKind,
   RunData,
   TimelineEvent,
   WorkflowDef,
@@ -73,7 +74,7 @@ export interface Firing {
 export type CascadeOp =
   | { kind: 'reject'; path: string; reason: string; held?: true } // green→rejected, value kept; held=true for escalate
   | { kind: 'retract'; path: string; reason: string } // tombstone a map child of a retracted element
-  | { kind: 'skip'; path: string; reason: string } // cascade skip down a dead branch
+  | { kind: 'skip'; path: string; reason: string; rejectKind?: RejectKind } // cascade skip down a dead branch (§25: auto-skip of a losing group sibling sets rejectKind: 'exclusive'; default 'structural')
   | { kind: 'rearm'; path: string; reason: string } // skipped→owed when the branch revives
   | { kind: 'pin'; path: string; reason: string } // stays green, fingerprint re-pointed to current inputs
   | { kind: 'arm'; handlerStep: string; reason: string; path?: undefined }; // arm a handler step on invalidation of L
@@ -642,6 +643,36 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
     }
   }
 
+  // §25: declarative exclusive produce-groups — auto-skip losing siblings.
+  // Once a group (exactlyOne/atMostOne) has a green winner, every other member
+  // still resting in a debt state (owed/rejected) can never legally commit —
+  // the group's exclusivity is enforced at commit time by the engine's
+  // groupCasCheck, so those siblings would just stall forever without this.
+  // Auto-skip settles them; the ordinary skipped-artifact rearm loop above
+  // (which runs on the artifact's own next maintenance pass) revives them if
+  // the winner is later un-greened (rejected/retracted) and the group's
+  // fingerprint-gated inputs move again — no separate rearm code is needed.
+  for (const step of def.steps) {
+    if (!step.groups || step.groups.length === 0) continue;
+    for (const g of step.groups) {
+      if (g.mode === 'atLeastOne') continue;
+      const winner = g.of.find((stem) => arts.get(stem)?.acceptance === 'green');
+      if (!winner) continue;
+      for (const stem of g.of) {
+        if (stem === winner) continue;
+        const sib = arts.get(stem);
+        if (!sib) continue;
+        if (sib.acceptance !== 'owed' && sib.acceptance !== 'rejected') continue; // already skipped/retracted/green
+        ops.push({
+          kind: 'skip',
+          path: stem,
+          reason: `group '${g.group}' (${g.mode}): '${winner}' won, auto-skipping sibling`,
+          rejectKind: 'exclusive',
+        });
+      }
+    }
+  }
+
   // Terminal-settle invariant (§15.2): once any terminal artifact is green,
   // the instance is sealed — no completion evaluator should re-arm.
   const anyTerminalGreen = [...arts.values()].some(
@@ -802,7 +833,23 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
   }
   pending.sort((x, y) => x.path.localeCompare(y.path));
 
-  const done = ![...arts.values()].some((a) => OUTSTANDING_STATES.has(a.acceptance));
+  // §25: an `atLeastOne` group is satisfied once any one member is green — its
+  // other members may legitimately sit `owed` forever (no auto-skip fires for
+  // atLeastOne, unlike exactlyOne/atMostOne) without that being "not done".
+  // Stored acceptance is untouched; this is a done-ness computation only.
+  const satisfiedAtLeastOneMembers = new Set<string>();
+  for (const step of def.steps) {
+    if (!step.groups) continue;
+    for (const g of step.groups) {
+      if (g.mode !== 'atLeastOne') continue;
+      if (g.of.some((stem) => arts.get(stem)?.acceptance === 'green')) {
+        for (const stem of g.of) satisfiedAtLeastOneMembers.add(stem);
+      }
+    }
+  }
+  const done = ![...arts.values()].some(
+    (a) => OUTSTANDING_STATES.has(a.acceptance) && !(a.acceptance === 'owed' && satisfiedAtLeastOneMembers.has(a.path)),
+  );
   return { done, debts, eligible, blocked, pending };
 }
 
@@ -1554,6 +1601,21 @@ function eligibleOutcomes(
   // the judge agent can issue (green/reject, Q2) as their own outcomes, entirely
   // separate from the producer-outcome branches below.
   if (step.judges) {
+    // §25: if this is the last pending judge and approving would flip the
+    // judged stem green, a group refusal (if any) preempts 'judge-approve'
+    // exactly like the real engine's judge-actor branch (groupCasCheck runs
+    // before the artifact is landed green).
+    const judgedStem = step.judges;
+    const judgedArt = arts.get(judgedStem);
+    if (judgedArt?.acceptance === 'submitted') {
+      const jName = judgeNameOf(step);
+      const approvals = { ...(judgedArt.approvals ?? {}), [jName]: judgedArt.version };
+      const judgeNames = declaredJudgeNames(def, judgedStem);
+      const allApproved = judgeNames.every((jn) => approvals[jn] === judgedArt.version);
+      if (allApproved && groupWouldReject(def, arts, judgedStem)) {
+        return ['group-reject', 'judge-reject'];
+      }
+    }
     return ['judge-approve', 'judge-reject'];
   }
 
@@ -1569,7 +1631,18 @@ function eligibleOutcomes(
     return outcomes;
   }
 
-  outcomes.push('green');
+  // §25: if committing this output green would violate its group's
+  // exactlyOne/atMostOne exclusivity (a sibling already won), the engine
+  // refuses the commit — model 'group-reject' instead of 'green' so the
+  // checker explores the real refusal path rather than an impossible green.
+  // A judged produce's actual green-moment is judge-approve (handled above),
+  // so this only applies to a plain (non-judged) producer output.
+  const hasJudges = !!step.produces.find((p) => p.stem === outPath)?.judges?.length;
+  if (!hasJudges && outPath && groupWouldReject(def, arts, outPath)) {
+    outcomes.push('group-reject');
+  } else {
+    outcomes.push('green');
+  }
 
   // judgment-reject is only valid when the firing has at least one consumed input
   // from a step producer (not 'human'). A step can only invalidate artifacts it
@@ -1589,6 +1662,22 @@ function eligibleOutcomes(
   // retract only for bare collection members
   if (isMember) outcomes.push('retract');
   return outcomes;
+}
+
+/**
+ * §25: the checker-side twin of `Engine.groupCasCheck` — would committing
+ * `path` as green violate its produce-group's exactlyOne/atMostOne contract?
+ * Same rule: refuse iff a *different* sibling in the group is already green.
+ * `atLeastOne` groups never refuse.
+ */
+function groupWouldReject(def: WorkflowDef, arts: Map<string, ArtifactData>, path: string): boolean {
+  for (const step of def.steps) {
+    if (!step.groups) continue;
+    const group = step.groups.find((g) => g.of.includes(path));
+    if (!group || group.mode === 'atLeastOne') continue;
+    return group.of.some((stem) => stem !== path && arts.get(stem)?.acceptance === 'green');
+  }
+  return false;
 }
 
 /** Internal: emit-seal branches — one map per element count 0..maxCollectionSize. */
@@ -1677,6 +1766,13 @@ export function applyOutcome(
   // all other outcomes: single successor
   const next = new Map(arts);
   const outPath = firing.outputs[0];
+
+  // §25: a group-refused commit is a pure no-op — like schema-rejected, the
+  // value is never applied and no counters move. Mirrors the real engine's
+  // groupCasCheck refusal (both the plain-producer and judge-approve moments).
+  if (outcome === 'group-reject') {
+    return [settleInMemory(def, next)];
+  }
 
   if (outcome === 'judgment-reject') {
     // judgment-reject is a CONSUMER action on a CONSUMED artifact, not on the output.

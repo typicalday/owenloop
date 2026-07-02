@@ -26,7 +26,7 @@ import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from './paths.ts';
 import { parseDurationMs, parseDurationSecs } from './util.ts';
 import { assertValidSchema } from './schema.ts';
-import type { Acceptance, EffectDef, FiringTrigger, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
+import type { Acceptance, EffectDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
 
@@ -42,6 +42,12 @@ interface RawProduce {
   schema?: unknown;
   /** §24 judges: optional quality-gate list hanging off a singleton produce entry. */
   judges?: unknown;
+}
+/** §25: a `group:` entry in a `produces:` list — spans multiple sibling stems, not a produce itself. */
+interface RawGroup {
+  group?: unknown;
+  mode?: unknown;
+  of?: unknown;
 }
 /** A single raw `judges:` list entry on a produce. */
 interface RawJudge {
@@ -197,17 +203,46 @@ function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<Pro
 }
 
 /**
- * Parse a step's `produces` list. Each entry is either a bare pattern string
- * (`plan`, `gather.source[]`) or a mapping `{ name, schema, judges }` attaching
- * a JSON Schema the produced value must satisfy at commit time (§19) and/or a
- * quality-gate list (§24). `baseDir` resolves judge `bodyFile:` entries.
+ * Parse a `group:` entry in a `produces:` list (§25 YAML surface). Contributes
+ * zero ProducePatterns — it names an exclusivity contract across sibling stems
+ * declared elsewhere in the SAME produces list, so it's parsed and returned
+ * separately rather than folded into the pattern array.
  */
-function parseProduces(v: unknown, ctx: string, baseDir?: string): ProducePattern[] {
-  if (v === undefined) return [];
+function parseGroup(v: RawGroup, ctx: string): GroupDef {
+  const group = asString(v.group, `${ctx}.group`);
+  const mode = asString(v.mode, `group '${group}'.mode`);
+  if (mode !== 'exactlyOne' && mode !== 'atMostOne' && mode !== 'atLeastOne') {
+    throw new DefError(`group '${group}': mode must be one of exactlyOne, atMostOne, atLeastOne, got '${mode}'`);
+  }
+  if (!Array.isArray(v.of)) throw new DefError(`group '${group}': of: must be a list`);
+  const of = v.of.map((s, i) => asString(s, `group '${group}'.of[${i}]`));
+  return { group, mode, of };
+}
+
+/**
+ * Parse a step's `produces` list. Each entry is either a bare pattern string
+ * (`plan`, `gather.source[]`), a mapping `{ name, schema, judges }` attaching
+ * a JSON Schema the produced value must satisfy at commit time (§19) and/or a
+ * quality-gate list (§24), or a `{ group, mode, of }` exclusivity declaration
+ * (§25) spanning sibling stems produced by this same list. `baseDir` resolves
+ * judge `bodyFile:` entries. Returns both the produce patterns and any groups
+ * found, as a pure function (no out-param mutation).
+ */
+function parseProduces(v: unknown, ctx: string, baseDir?: string): { patterns: ProducePattern[]; groups: GroupDef[] } {
+  if (v === undefined) return { patterns: [], groups: [] };
   if (!Array.isArray(v)) throw new DefError(`${ctx} must be a list`);
-  return v.map((entry, i) => {
-    if (typeof entry === 'string') return parseProduce(entry);
+  const patterns: ProducePattern[] = [];
+  const groups: GroupDef[] = [];
+  v.forEach((entry, i) => {
+    if (typeof entry === 'string') {
+      patterns.push(parseProduce(entry));
+      return;
+    }
     if (typeof entry === 'object' && entry !== null && !Array.isArray(entry)) {
+      if ('group' in entry) {
+        groups.push(parseGroup(entry as RawGroup, `${ctx}[${i}]`));
+        return;
+      }
       const raw = entry as RawProduce;
       const name = asString(raw.name, `${ctx}[${i}].name`);
       const pat = parseProduce(name);
@@ -218,10 +253,12 @@ function parseProduces(v: unknown, ctx: string, baseDir?: string): ProducePatter
         }
         pat.judges = parseJudges(raw.judges, `produce '${name}'.judges`, baseDir);
       }
-      return pat;
+      patterns.push(pat);
+      return;
     }
     throw new DefError(`${ctx}[${i}] must be a string or a { name, schema, judges } mapping`);
   });
+  return { patterns, groups };
 }
 
 export class DefError extends Error {}
@@ -697,11 +734,14 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
       }
     }
     // parse produces: (required; exactly one — enforced by validateDef)
-    const producesPatterns = parseProduces(rawCalls.produces, `step '${name}'.produces`, baseDir);
+    const { patterns: producesPatterns, groups: callsGroups } = parseProduces(rawCalls.produces, `step '${name}'.produces`, baseDir);
     for (const p of producesPatterns) {
       if (p.judges && p.judges.length > 0) {
         throw new DefError(`step '${name}': judges: is not supported on a calls: step's produces (produce '${p.stem}')`);
       }
+    }
+    if (callsGroups.length > 0) {
+      throw new DefError(`step '${name}': group: is not supported on a calls: step's produces (group '${callsGroups[0]!.group}')`);
     }
     const step: StepDef = {
       name,
@@ -724,8 +764,11 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
 
   const name = asString(rl.name, `steps[${i}].name`);
   const consumes = asStringArray(rl.consumes, `step '${name}'.consumes`).map(parseConsume);
-  const producesPatterns = parseProduces(rl.produces, `step '${name}'.produces`, baseDir);
-  const generatesPatterns = parseProduces(rl.generates, `step '${name}'.generates`, baseDir);
+  const { patterns: producesPatterns, groups } = parseProduces(rl.produces, `step '${name}'.produces`, baseDir);
+  const { patterns: generatesPatterns, groups: generatesGroups } = parseProduces(rl.generates, `step '${name}'.generates`, baseDir);
+  if (generatesGroups.length > 0) {
+    throw new DefError(`step '${name}': group: is not supported on a generates: entry (group '${generatesGroups[0]!.group}')`);
+  }
   const cadence = rl.cadence === undefined ? DEFAULTS.cadence : asString(rl.cadence, `step '${name}'.cadence`);
   const hasBody = rl.body !== undefined;
   const hasBodyFile = rl.bodyFile !== undefined;
@@ -768,6 +811,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
   if (rl.model !== undefined) step.model = asString(rl.model, `step '${name}'.model`);
   if (asBool(rl.terminal, false, `step '${name}'.terminal`)) step.terminal = true;
   if (generatesPatterns.length > 0) step.generates = generatesPatterns; // kept for lint only
+  if (groups.length > 0) step.groups = groups;
   if (rl.effect !== undefined) {
     if (typeof rl.effect !== 'object' || rl.effect === null || Array.isArray(rl.effect)) {
       throw new DefError(`step '${name}'.effect must be an object`);
@@ -1027,6 +1071,39 @@ export function validateDef(def: WorkflowDef): string[] {
     // (c) the judge step must consume the judged stem (authority flows from consumes).
     if (!l.consumes.some((c) => c.mode === 'plain' && c.stem === judgedStem)) {
       errors.push(`judge step '${l.name}' does not consume its judged stem '${judgedStem}'`);
+    }
+  }
+
+  // G25-VALIDATE: declarative exclusive produce-groups per-def rules.
+  for (const l of def.steps) {
+    if (l.groups === undefined || l.groups.length === 0) continue;
+    const claimedStems = new Set<string>();
+    const groupNames = new Set<string>();
+    for (const g of l.groups) {
+      if (groupNames.has(g.group)) {
+        errors.push(`step '${l.name}': group '${g.group}' is declared more than once`);
+      }
+      groupNames.add(g.group);
+      if (g.mode !== 'exactlyOne' && g.mode !== 'atMostOne' && g.mode !== 'atLeastOne') {
+        errors.push(`step '${l.name}': group '${g.group}' has unknown mode '${g.mode}'`);
+      }
+      if (g.of.length < 2) {
+        errors.push(`step '${l.name}': group '${g.group}' needs at least two members`);
+      }
+      for (const stem of g.of) {
+        const p = l.produces.find((p) => p.stem === stem);
+        if (!p) {
+          errors.push(`step '${l.name}': group '${g.group}' names '${stem}' in of: but this step does not produce it`);
+          continue;
+        }
+        if (p.kind !== 'singleton') {
+          errors.push(`step '${l.name}': group '${g.group}' member '${stem}' is a ${p.kind} produce; group membership is singleton-only (v1)`);
+        }
+        if (claimedStems.has(stem)) {
+          errors.push(`step '${l.name}': stem '${stem}' is claimed by more than one group`);
+        }
+        claimedStems.add(stem);
+      }
     }
   }
 

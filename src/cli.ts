@@ -480,8 +480,9 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         print(io, res);
         // §24: 'submitted' (producer commit awaiting judges) and 'approved'
         // (one judge signed, others still pending) are successful outcomes,
-        // not errors — only 'born-rejected' and 'schema-rejected' are failures.
-        if (res.outcome === 'born-rejected' || res.outcome === 'schema-rejected') {
+        // not errors — only 'born-rejected', 'schema-rejected', and (§25)
+        // 'group-rejected' are failures.
+        if (res.outcome === 'born-rejected' || res.outcome === 'schema-rejected' || res.outcome === 'group-rejected') {
           io.err(`green ${path}: ${res.outcome}${res.reason ? ' — ' + res.reason : ''}`);
           return 1;
         }

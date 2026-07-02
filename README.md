@@ -431,6 +431,35 @@ runnable example, and [`docs/design.md` §24](docs/design.md) for the full
 design (the `submitted` state, the sign-off ledger, the stale-verdict race,
 and how judge order failures are kept separate from judge rejects).
 
+### `group:` — exclusive/inclusive produce groups
+
+A step's `produces:` list can carry a `group:` entry naming two or more of
+that step's own singleton sibling stems and the commit-exclusivity contract
+the engine enforces across them — no more manually calling `engine.skip()`
+on the branch a router step didn't take.
+
+```yaml
+produces:
+  - simple
+  - urgent
+  - group: route
+    mode: exactlyOne       # exactlyOne | atMostOne | atLeastOne
+    of: [simple, urgent]
+```
+
+- **`exactlyOne`** / **`atMostOne`** — once one member goes `green`, the
+  engine refuses any commit to a sibling (`'group-rejected'`, like
+  `'schema-rejected'` — value not written, run left open) and auto-skips the
+  untouched siblings in the same step. The two modes differ only in intent:
+  `atMostOne` also tolerates a producer that routes to *neither* member.
+- **`atLeastOne`** — no refusal, no auto-skip; once any one member is green,
+  the rest no longer count as outstanding for done-ness.
+
+A group's auto-skip re-arms exactly like a manual skip (same fingerprint
+mechanism, §7) if the upstream inputs it depended on move. See
+[`docs/design.md` §25](docs/design.md) for the full design (refusal timing,
+the judges interaction, and the model-checker parity guarantee).
+
 ### `outputs:` — the workflow's interface
 
 Top-level `outputs:` declares which stems are the workflow's intentional public results

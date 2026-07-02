@@ -801,3 +801,100 @@ defeating the purpose of running the checker at all. Don't over-trust
 either of these — it answers "is this graph structurally sound," not "can a
 human or a stale commit route around a stall." See README's Testing section
 for how `owenloop check` fits alongside the test suite.
+
+## §26 Declarative exclusive produce-groups (`group:`)
+
+A step's `produces:` list can carry a `group:` entry spanning two or more of
+that *same step's* own singleton sibling stems, declaring a commit-exclusivity
+contract the engine enforces directly — instead of the step's own body
+manually calling `engine.skip()` on the branch it didn't take (§16.1 routing,
+still supported, still the right tool when a step needs bespoke logic beyond
+plain either/or routing).
+
+```yaml
+produces:
+  - simple
+  - urgent
+  - group: route
+    mode: exactlyOne       # exactlyOne | atMostOne | atLeastOne
+    of: [simple, urgent]
+```
+
+- **`exactlyOne`** — one member is expected to go green; once it does, the
+  engine refuses any further commit to a sibling (`'group-rejected'`) and
+  auto-skips the untouched siblings in the same cascade that lands the
+  winner.
+- **`atMostOne`** — identical refusal/auto-skip mechanics to `exactlyOne`.
+  The only difference is intent, not enforcement: a producer that routes to
+  *neither* member (e.g. manually skips both) is a legal terminal state too —
+  the engine has no way to verify "a real winner should have existed," so
+  `exactlyOne` vs `atMostOne` is a documented contract for the workflow
+  author, not a distinct runtime check.
+- **`atLeastOne`** — never refuses a commit and never auto-skips. Once any
+  one member is green, `workflowStatus`'s done-ness computation stops
+  counting the other (still-`owed`) members as outstanding — the same
+  discharge rule §17 already uses for other "good enough" completions. Stored
+  acceptance is untouched; this is a done-ness read, not a state mutation.
+
+### §26.1 Refusal timing
+
+The refusal check (`groupCasCheck` in engine.ts, mirrored by `groupWouldReject`
+in model.ts for the checker) runs *before* schema/CAS validation on every
+commit attempt against a group member: does a **different** sibling in the
+group already sit `green`? If so, the commit is refused with outcome
+`'group-rejected'` — the value is not written, no counters move, the run/lease
+is left open for the caller, exactly like `'schema-rejected'`. A judged
+group member (`judges:` on the same produce) is checked at the judge-approve
+moment (full ledger completion → `green`), not at the producer's initial
+`submitted` — a judge-reject or a still-pending ledger must never trip a
+sibling's auto-skip.
+
+### §26.2 Auto-skip is a cascade op, not a special commit path
+
+Auto-skip is implemented purely inside `maintainDecisions` (model.ts) — the
+same pure, level-triggered fixpoint function §11.8/§12.3 already uses for
+reject/retract/skip/rearm/pin/arm. For every `exactlyOne`/`atMostOne` group
+with exactly one `green` member, every `owed`/`rejected` sibling gets a `skip`
+op with `rejectKind: 'exclusive'` (a new `RejectKind`, alongside `judgment` /
+`structural` / `validation` / `invalidated-irreversible` — a liveness-
+accounting category, distinct from the skip's `ReasonAction`, which stays
+`'skip'`). Because `Engine.settle()` runs this cascade to a full fixpoint
+synchronously at the end of every `green()` call, the auto-skip is already
+visible by the time the winning `green()` call returns — a caller never
+observes an intermediate state where the winner is green but the loser is
+still `owed`.
+
+Re-arming an auto-skipped sibling needs zero group-specific code: it goes
+through the exact same generic skip-re-arm mechanism (fingerprint-keyed,
+§7) that already re-arms a manually-skipped branch when its upstream inputs
+move. `rejectKind: 'exclusive'` only changes how the artifact is
+*classified* for liveness accounting; it does not change how it re-arms.
+
+### §26.3 Grammar and validation
+
+`group:` is parsed alongside — not nested inside — a step's `produces:`
+patterns (`parseGroup` in defs.ts), since a group spans multiple stems rather
+than describing one. `validateDef` rejects, per step:
+
+- an unknown `mode`;
+- an `of:` list with fewer than two members;
+- a member stem this step does not itself produce (whether that stem doesn't
+  exist anywhere in the def, or is produced by a *different* step — group
+  membership is scoped to the declaring step's own produces list either way);
+- a member that is a collection/map produce (group membership is
+  singleton-only in v1, same restriction as `judges:`);
+- the same stem claimed by two different groups on one step.
+
+A step may declare more than one group, as long as their `of:` sets are
+disjoint. `group:` is rejected at build time on a `calls:` step's produces
+and on a `generates:` entry — both are machine-handled shapes that don't fit
+the "producer chooses which sibling to commit" model.
+
+### §26.4 Model checker parity
+
+`eligibleOutcomes` (model.ts) offers `'group-reject'` instead of `'green'`
+for a firing whose output would violate its group's contract, so the BFS
+explores the real refusal path rather than an impossible green — the same
+differential-conformance test (`test/check.test.ts`'s pattern) that pins
+every other outcome family to the live `Engine` covers this one too
+(`test/groups.test.ts`, scenario (h)).

@@ -1,13 +1,14 @@
 /** Shared test fixtures — inline workflow/step builders and an artifact-map helper. */
 
 import { parseConsume, parseProduce } from '../src/paths.ts';
-import type { ArtifactData, EffectDef, FiringTrigger, InputDef, StepDef, WorkflowDef } from '../src/types.ts';
+import type { ArtifactData, EffectDef, FiringTrigger, GroupDef, InputDef, StepDef, WorkflowDef } from '../src/types.ts';
 import type { ArtifactMap } from '../src/model.ts';
 
 export interface StepSpec {
   name: string;
   consumes?: string[];
   produces?: string[];
+  groups?: GroupDef[];
   invalidates?: string[];
   cadence?: string;
   cadenceSecs?: number;
@@ -47,6 +48,7 @@ export function step(spec: StepSpec): StepDef {
     ...(spec.idleAfter !== undefined ? { idleAfter: spec.idleAfter } : {}),
     ...(spec.idleAfterMs !== undefined ? { idleAfterMs: spec.idleAfterMs } : {}),
     ...(spec.reapTtlMs !== undefined ? { reapTtlMs: spec.reapTtlMs } : {}),
+    ...(spec.groups !== undefined ? { groups: spec.groups } : {}),
     workdir: spec.workdir ?? 'main',
     body: spec.body ?? `run ${spec.name}`,
   };
