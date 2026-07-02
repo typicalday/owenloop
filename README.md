@@ -212,6 +212,7 @@ Global flags: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) an
 | `reap <wf> [--now]` | run the reaper; `--now` forces every claim stale (TTL 0) — see below |
 | `runs <wf> [--open]` | list this instance's runs, joining claim state for open ones |
 | `status <wf>` | derived view: `done`, `debts`, `eligible`, `blocked`, `inFlight` |
+| `wait <wf> --until eligible\|done [--timeout <dur>]` | block until engine state matches, then print `status` |
 | `show <wf>` | dump raw artifacts (debugging) |
 | `list` | list instances |
 | `green <wf> <run> <path> [--value json] [--terminal]` | accept an owed output |
@@ -242,6 +243,18 @@ this instance has ever had (with `--open` filtering to still-open ones, each
 joined with its owning task's `claimedAt`/`heartbeatAt`/`attempts`), while
 `status.inFlight` is the currently-claimed subset in the same shape, for a
 quick "what's running right now" check without listing full run history.
+
+**`wait` — blocking on engine state instead of polling:** `owenloop wait <wf>
+--until eligible|done` sits in a loop, re-checking `status <wf>` every 250ms,
+until `--until eligible` sees a non-empty `eligible` list or `--until done`
+sees `done: true` — then it prints that `status` (same shape `status <wf>`
+would) and exits 0. `--timeout <dur>` (default `10m`, same duration format as
+`reap`/cadence — `90m`, `2h`, `45s`) bounds the wait: on timeout it exits 1
+with `{ok:false, error:"timeout", until, timeout, status}` on stdout, where
+`status` is the last-observed state so the caller sees what's still unmet. An
+unknown workflow id fails the same way `status <wf>` does. Use it in an
+orchestrator or agent script to block for engine state change without
+burning inference on a poll loop.
 
 **Exit codes for `green` / `emit` / `seal` / `reject`:** these exit non-zero when the
 engine refuses the commit or verdict (born-rejected, or a schema failure for `green` /
