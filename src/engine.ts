@@ -1617,6 +1617,22 @@ export class Engine {
     const stem = el ? el.stem : path.replace(/\.sealed$/, '');
     const step = def.steps.find((l) => l.name === by);
     if (!step) throw new Error(`unknown actor: ${by}`);
+
+    if (step.judges !== undefined) {
+      // §24: a judge may only invalidate the exact stem named in its own
+      // `judges:` marker — never a stem it merely consumes for context via
+      // `inputs: true` (defs.ts synthesizeJudgeSteps splices the producer's
+      // own input stems into a judge's `consumes` for read-only context;
+      // that consume edge must grant NO reject authority over those stems).
+      if (step.judges !== stem && step.judges !== path) {
+        throw new Error(
+          `${by} has no authority to invalidate ${path} (it judges \`${step.judges}\`, not \`${stem}\`). ` +
+            `A judge may only reject the stem named in its own \`judges:\` marker.`,
+        );
+      }
+      return;
+    }
+
     const consumesIt = step.consumes.some((c) => c.stem === stem || c.stem === path);
     if (!consumesIt) {
       throw new Error(

@@ -44,6 +44,27 @@ function researcherDef(opts: { maxAttempts?: number } = {}): WorkflowDef {
   });
 }
 
+function researcherWithInputsJudgeDef(): WorkflowDef {
+  return buildDef({
+    name: 'researcherInputsJudgeDef',
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [
+      {
+        name: 'researcher',
+        consumes: ['question'],
+        produces: [
+          {
+            name: 'report',
+            judges: [
+              { name: 'completeness', body: 'evaluate completeness', inputs: true },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+}
+
 // ---- harness ----------------------------------------------------------------
 
 function makeEngine(defs: WorkflowDef[]): { engine: Engine; store: Store } {
@@ -557,4 +578,43 @@ test('judges: (j2) a judge with cadence defers a re-fire until the gap elapses',
   const tickLater = engine.tick(wf, { now: t0 + 61 * 60_000 });
   const laterOrder = tickLater.orders.find((o) => o.step.endsWith('.completeness'));
   assert.ok(laterOrder !== undefined, 'judge should re-fire once the cadence gap has elapsed');
+});
+
+// ---- (k) judge authority is scoped to its own judged stem only --------------
+
+test('judges: (k) a judge with inputs:true cannot reject a stem it only consumes for context', () => {
+  const { engine, store } = makeEngine([researcherWithInputsJudgeDef()]);
+  const wf = engine.createInstance('researcherInputsJudgeDef', { provide: { question: { text: 'why' } } });
+
+  const run1 = engine.tick(wf).orders.find((o) => o.step === 'researcher')!.run;
+  engine.green(wf, run1, 'report', { sections: ['a'] });
+  engine.close(wf, run1);
+  assert.equal(getArt(store, wf, 'report')?.acceptance, 'submitted');
+
+  const tick2 = engine.tick(wf);
+  const judgeOrder = tick2.orders.find((o) => o.step.includes('.judges.'))!;
+  assert.ok(judgeOrder, 'the inputs:true judge should be eligible on the submitted report');
+
+  const questionBefore = getArt(store, wf, 'question');
+
+  // The judge consumes `question` for context (inputs: true) but does not
+  // judge it — rejecting it must be refused, not applied.
+  assert.throws(() => engine.reject(wf, 'question', judgeOrder.step, 'trying to reject the wrong stem'));
+
+  // `question` is completely untouched by the refused reject.
+  assert.deepEqual(getArt(store, wf, 'question'), questionBefore);
+
+  // The judged `report` is untouched too — still submitted, no ledger change.
+  const reportAfter = getArt(store, wf, 'report');
+  assert.equal(reportAfter?.acceptance, 'submitted');
+  assert.equal(reportAfter?.judgmentRejects, 0);
+
+  // The SAME judge rejecting its own declared stem (`report`) still works.
+  const res = engine.reject(wf, 'report', judgeOrder.step, 'actually reject the judged stem');
+  assert.equal(res.outcome, 'rejected');
+  engine.close(wf, judgeOrder.run);
+
+  const reportRejected = getArt(store, wf, 'report');
+  assert.equal(reportRejected?.acceptance, 'rejected');
+  assert.equal(reportRejected?.judgmentRejects, 1);
 });
