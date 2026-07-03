@@ -1,5 +1,5 @@
 /**
- * §24 — artifact judges (docs/proposals/artifact-judge.md). End-to-end engine
+ * §24 — artifact judges (see docs/design.md §24). End-to-end engine
  * coverage for the `judges:` feature: a producer step's `produces` entry
  * declares one or more judges; the producer's `green` commit lands the
  * artifact `submitted` instead of `green`; each judge is a synthesized

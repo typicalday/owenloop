@@ -164,7 +164,7 @@ export interface CreateOpts {
   params?: Record<string, string>;
   /** values for inputs provided at start (keyed by input name) */
   provide?: Record<string, Record<string, unknown>>;
-  /** Mode 2 foundation: parent-coordinate link for a child instance spawned by a calls: step. Persisted to store; no other behavior in PR5a. */
+  /** Mode 2: parent-coordinate link for a child instance spawned by a calls: step. Persisted to store; used only to cascade the child's outcome back up. */
   producedBy?: { parentWf: string; parentPath: string };
 }
 

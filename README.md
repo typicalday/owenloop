@@ -128,20 +128,23 @@ done. They work side by side — the loop is the muscle, owenloop is the memory.
 
 ## Requirements
 
-- **Node ≥ 22.6.** owenloop runs TypeScript directly via Node's built-in type
-  stripping — there's no build step.
-- **No native dependencies.** Storage is Node's built-in `node:sqlite`, so there's
-  nothing to compile. The only runtime deps are `yaml` (parsing defs) and
+- **Node ≥ 22.13.** Storage is Node's built-in `node:sqlite`, which is available
+  unflagged from 22.13 onward (it still prints an experimental warning until it
+  stabilises in Node 24.15 / 25.7). owenloop is an ESM-only package.
+- **No native dependencies.** `node:sqlite` is built in, so there's nothing to
+  compile. The only runtime deps are `yaml` (parsing defs) and
   `@cfworker/json-schema` (optional per-artifact schema validation).
 
 ```sh
 git clone https://github.com/typicalday/owenloop && cd owenloop
 npm install
 npm run check     # typecheck + full test suite
+npm run build     # compile src/ → dist/ (what gets published)
 ```
 
-Or use it as a dependency — owenloop ships its TypeScript source (no build step), so
-you just need a Node ≥ 22.6 ESM host:
+Or use it as a dependency. The package ships compiled JavaScript plus type
+declarations (`dist/`), so it works in any Node ≥ 22.13 ESM host — no build step
+or loader on your side:
 
 ```sh
 npm install owenloop
@@ -694,7 +697,7 @@ owenloop is small and split along a pure-core / imperative-shell line:
 
 | module | responsibility |
 |---|---|
-| [`src/types.ts`](src/types.ts) | shared types: the five-state lifecycle, reason threads, def shapes |
+| [`src/types.ts`](src/types.ts) | shared types: the six-state lifecycle, reason threads, def shapes |
 | [`src/paths.ts`](src/paths.ts) | parse/match the `src[$i]` / `src[*]` / `src[]` path grammar |
 | [`src/defs.ts`](src/defs.ts) | load YAML → validated `WorkflowDef` (the static wiring checks) |
 | [`src/schema.ts`](src/schema.ts) | JSON Schema validation of artifact values, via `@cfworker/json-schema` |
@@ -724,11 +727,12 @@ resting on the inputs it was built from?".
 
 ```sh
 npm test          # node --test, spec reporter
-npm run typecheck # tsc --noEmit (verifies the source is type-strip-safe)
+npm run typecheck # tsc --noEmit (type-checks the source)
 npm run check     # both
+npm run build     # compile src/ → dist/ (also runs automatically on npm pack/publish)
 ```
 
-The suite is **448 tests**: unit tests (`paths`, `store`, `model`, `defs`, `schema`,
+The suite is **578 tests**: unit tests (`paths`, `store`, `model`, `defs`, `schema`,
 `util`, `cli`), engine integration tests (the cascade, the stall, schema validation,
 the concurrency check, `judges:` sign-off/CAS/throttling in `test/judges.test.ts`),
 and end-to-end tests that spawn the real `bin/owenloop.mjs` binary and drive the

@@ -33,28 +33,20 @@ export type { CreateEngineOpts, CreatedEngine } from './factory.ts';
 export { Store, openStore, StoreVersionError } from './store.ts';
 export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
 
-export { buildDef, DefError, expandIncludes, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, validateDef } from './defs.ts';
+export { buildDef, DefError, expandIncludes, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
 export type { DefLoadFailure } from './defs.ts';
 
 export {
-  applyOutcome,
   buildGraph,
   buildTrace,
-  collectionProduces,
   eligibleFirings,
-  evalInvariantPredicate,
   graphToDot,
   graphToMermaid,
-  isSchemaStalled,
   isStalled,
-  maintainDecisions,
-  mapProduce,
   modelCheck,
-  settleInMemory,
-  singletonProduces,
   workflowStatus,
 } from './model.ts';
-export type { ArtifactMap, Blocker, CascadeOp, Firing, TimeFacts, WorkflowStatus } from './model.ts';
+export type { ArtifactMap, Blocker, Firing, TimeFacts, WorkflowStatus } from './model.ts';
 
 export {
   parseConsume,

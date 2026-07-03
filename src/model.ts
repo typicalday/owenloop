@@ -401,7 +401,7 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
   const firings: Firing[] = [];
 
   for (const step of def.steps) {
-    // M2: calls: steps are machine-handled (PR5b spawns the child); never emit a worker firing.
+    // M2: calls: steps are machine-handled (the engine spawns the child); never emit a worker firing.
     if (step.calls) continue;
 
     // §24: a judge step fires through the NORMAL pipeline (§7.1) — level-triggered

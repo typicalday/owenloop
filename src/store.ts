@@ -535,7 +535,7 @@ export class Store {
 
   /**
    * M2-LINK reverse-lookup: find the child workflow instance spawned by a calls: step.
-   * Used by PR5b re-attach guard (never-duplicate). Returns undefined when no match.
+   * Used by the calls: re-attach guard (never-duplicate). Returns undefined when no match.
    */
   findChildByParent(parentWf: string, parentPath: string): WorkflowRow | undefined {
     const r = this.db

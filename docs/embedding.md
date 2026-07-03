@@ -168,7 +168,7 @@ const { engine } = createEngine({ db: ':memory:', defs: [research] });
 - **Long-lived.** Create the `engine`/`store` once per database and reuse them;
   call `store.close()` on shutdown. There's no per-call open/close cost like the
   CLI pays.
-- **Synchronous, single-writer-per-process.** The store is better-sqlite3: every
+- **Synchronous, single-writer-per-process.** The store is `node:sqlite` (`DatabaseSync`): every
   engine call is synchronous and blocks the event loop for its (short) duration,
   and there is one writer connection per process. This suits an embedded
   control-plane/orchestrator; it is not a high-QPS request path.
@@ -190,3 +190,8 @@ loaders (`loadDefs`, `parseDef`, `buildDef`, …), the pure model functions
 all the shared types (`Order`, `CommitResult`, `WorkflowStatus`, `WorkflowDef`,
 `EngineEvent`, `EngineListener`, …). For most hosts, `createEngine` + the engine methods + the `Order` /
 `CommitResult` / `WorkflowStatus` types are the whole surface you need.
+
+`SUPPORTED_ENGINE_VERSION` is the programmatic form of the design.md §27
+engine-version contract — the highest `engine:` a def may declare and still load.
+Tooling can preflight-check a def's `engine:` field against it before handing the
+def to the engine.

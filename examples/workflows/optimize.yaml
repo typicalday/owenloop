@@ -1,0 +1,164 @@
+# Metric-optimization wiring — iterate toward a score, not a spec.
+#
+# Every other example drives to a fixed endpoint: merge the PR, approve the
+# contract, index the plans. This one has no fixed finish line — a builder
+# tightens a solution, a measure step scores it, and a reflect step decides
+# whether to stop or send the builder around again. The reject verb is doing a
+# different job here: it isn't a defect verdict, it's the loop's *continue*,
+# and the reason text is the optimizer's control channel.
+#
+# Beyond what delivery.yaml's knock-back shows, this demonstrates four idioms:
+#
+# - **Stall-aware rejection — gradient vs. entropy.** Agents looping against a
+#   metric find the cheapest knob and turn it forever. `reflect` compares the
+#   fresh score against the previous cycle's and emits two qualitatively
+#   different reasons: score moved → a GRADIENT reason ("keep going, push the
+#   same lever harder"); score flat → a PIVOT reason ("this approach is
+#   exhausted — take a substantively different direction, not a variation").
+#   Forced entropy on stall, encoded in the reason thread the builder already
+#   reads.
+# - **The loop's only memory is what rides the artifacts.** An order carries
+#   the current *values* of what a step consumes, plus the reason thread of its
+#   own outputs — nothing else survives a cycle. So the previous score is
+#   echoed around the loop explicitly: reflect puts it in the reject reason,
+#   the builder (who sees `attempt`'s thread) copies it into the next
+#   `attempt.prev_bytes`, and reflect (who consumes `attempt`) reads it back.
+# - **Measurement pinned upstream.** `baseline` fixes the exact build/measure
+#   commands once, before the loop starts, and `measure` is a pure sensor that
+#   runs them verbatim and reports numbers — it never judges. Neither the
+#   builder nor the measurer can redefine what "better" means mid-loop, and a
+#   `testsPass: false` score is rejected by reflect regardless of the byte
+#   count — the two cheapest shortcuts (move the goalposts, delete the
+#   features) are closed by wiring, not by prompt discipline.
+# - **`maxAttempts` as the optimization budget.** Every reflect reject —
+#   gradient or pivot — burns one attempt, so the cap is a cycle budget, not a
+#   failure allowance. Exhaust it and `attempt` stalls for a human: the
+#   stop-loss when the metric refuses to reach the goal. `owenloop retry` buys
+#   more cycles with fresh guidance.
+#
+# Drive it:
+#   wf=$(owenloop create optimize --provide target='{"repo":"/code/myapp","goalBytes":250000}' | jq -r .workflow)
+#   owenloop tick $wf                     # -> order for `baseline`
+#   owenloop green $wf <run> baseline --value '{"buildCommand":"npm run build && gzip -c dist/app.js | wc -c","testCommand":"npm test","bytes":412000}'
+#   owenloop tick $wf                     # -> order for `builder` (first attempt: prev_bytes null)
+#   owenloop green $wf <run> attempt --value '{"approach":"tree-shaking","summary":"switched lodash imports to per-method","prev_bytes":null}'
+#   owenloop tick $wf                     # -> order for `measure`
+#   owenloop green $wf <run> score --value '{"bytes":388000,"testsPass":true}'
+#   owenloop tick $wf                     # -> order for `reflect`; 412000 -> 388000 moved, so:
+#   owenloop reject $wf attempt --by reflect --text "GRADIENT prev_bytes=388000: tree-shaking is paying — lodash is out but moment.js (68kB gzipped) is still bundled for one date format. Replace it."
+#   ...                                   # builder re-arms with the reason; measure re-derives; the loop turns.
+#   ...                                   # a later cycle where the score does NOT move gets the other kind of reason:
+#   owenloop reject $wf attempt --by reflect --text "PIVOT prev_bytes=361000: score flat two cycles — import tuning is exhausted. Do not send another variation of it; try a different lever entirely (code-split the admin routes, or swap the chart library)."
+#   ...                                   # goal reached -> reflect stops the loop instead of rejecting:
+#   owenloop green $wf <run> outcome --value '{"finalBytes":248000,"cycles":5,"approaches":["tree-shaking","code-splitting"]}'
+#   # or the budget runs out first: attempt stalls (out of attempts), status shows it, a human decides —
+#   owenloop retry $wf attempt --text "8 more cycles: focus only on the vendor chunk"
+
+name: optimize
+title: Metric optimization loop
+description: Build → measure → reflect, looping on stall-aware rejections (gradient vs. pivot) until a numeric goal is met or the attempt budget runs out.
+outputs: [outcome]
+
+inputs:
+  - name: target
+    seedOwed: true            # required at create: the repo and the finish line
+    schema:
+      type: object
+      required: [repo, goalBytes]
+      properties:
+        repo: { type: string, minLength: 1 }
+        goalBytes: { type: integer, minimum: 1 }   # gzipped bundle budget
+      additionalProperties: false
+
+steps:
+  - name: baseline
+    consumes: [target]
+    produces:
+      - name: baseline        # pins HOW to measure, once, before the loop starts
+        schema:
+          type: object
+          required: [buildCommand, testCommand, bytes]
+          properties:
+            buildCommand: { type: string, minLength: 1 }   # exact command that prints the metric
+            testCommand: { type: string, minLength: 1 }
+            bytes: { type: integer, minimum: 0 }           # the starting score
+          additionalProperties: false
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      In `target.repo`, find the production build and derive one exact command
+      that prints the gzipped bundle size in bytes, and the repo's test
+      command. Run both once and green `baseline` with the commands and the
+      starting byte count. This is the loop's fixed yardstick — measure will
+      run these commands verbatim every cycle, so make them deterministic.
+
+  - name: builder
+    consumes: [target, baseline]
+    produces:
+      - name: attempt
+        schema:
+          type: object
+          required: [approach, summary, prev_bytes]
+          properties:
+            approach: { type: string, minLength: 1 }       # named lever, e.g. "tree-shaking"
+            summary: { type: string, minLength: 1 }
+            prev_bytes: { type: ["integer", "null"] }      # echo of the last score (null on cycle 1)
+          additionalProperties: false
+    maxAttempts: 8            # the optimization BUDGET: every reflect reject — gradient
+                              # or pivot — burns one; exhausting it stalls for a human
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Shrink the gzipped bundle of `target.repo` toward `target.goalBytes`
+      without breaking `baseline.testCommand`. Green `attempt` with the
+      approach you took, a summary of the change, and prev_bytes.
+
+      If `attempt` carries reject reasons, the NEWEST one is your direction:
+      - GRADIENT prev_bytes=N — the last change moved the score. Stay on the
+        current approach and push the specific lever the reason names.
+      - PIVOT prev_bytes=N — the score stalled. The current approach is
+        exhausted: pick a substantively different one (a different `approach`
+        value), not a variation of what just failed to move the number.
+      Either way, copy N into `attempt.prev_bytes` — that echo is how reflect
+      remembers the last score. On the first cycle prev_bytes is null.
+
+  - name: measure
+    consumes: [attempt, baseline]
+    produces:
+      - name: score           # structured numeric output — never prose
+        schema:
+          type: object
+          required: [bytes, testsPass]
+          properties:
+            bytes: { type: integer, minimum: 0 }
+            testsPass: { type: boolean }
+          additionalProperties: false
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Pure sensor: run `baseline.buildCommand` and `baseline.testCommand`
+      verbatim — do not substitute your own idea of the metric — and green
+      `score` with the byte count and whether the tests passed. No judgment,
+      no advice; reflect decides what the numbers mean.
+
+  - name: reflect
+    consumes: [target, attempt, score]
+    produces: [outcome]
+    terminal: true            # once the goal is met the loop is over for good
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Decide whether the loop stops or turns. Exactly one of:
+      1. `score.testsPass` is false — reject `attempt`: the size win doesn't
+         count, restore behavior first (include prev_bytes=`attempt.prev_bytes`
+         unchanged; a broken build is not a new score).
+      2. `score.bytes` <= `target.goalBytes` — goal met. Green `outcome` with
+         the final bytes and how many cycles it took. The loop ends.
+      3. `attempt.prev_bytes` is null or `score.bytes` < it — progress. Reject
+         `attempt` with a GRADIENT reason: name the next concrete lever on the
+         SAME approach, and embed "prev_bytes=<score.bytes>" for the builder
+         to echo.
+      4. Otherwise — stalled. Reject `attempt` with a PIVOT reason: state that
+         `attempt.approach` is exhausted and the next attempt must take a
+         substantively different direction, not a variation. Embed
+         "prev_bytes=<score.bytes>".
+      A reject re-arms the builder, the cascade re-derives `score`, and this
+      step fires again on the fresh number. Every reject burns one of the
+      builder's attempts — when the budget is gone, `attempt` stalls for a
+      human (`owenloop retry` re-opens it with fresh guidance).

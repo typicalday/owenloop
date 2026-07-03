@@ -225,8 +225,9 @@ its embedding interface — under a top-level `outputs:` field.
 - **Validation:** `validateDef` hard-errors if any `outputs:` entry names a stem that no
   step produces. Stems declared under `generates:` are unioned into `produces` at build
   time and therefore count as produced — naming them in `outputs:` is valid.
-- **Future use:** `outputs:` will become the boundary contract for workflow composition
-  (`include:` / `calls:`). This wiring is not implemented yet.
+- **Composition boundary:** `outputs:` is the boundary contract for workflow composition
+  (`include:` §22 / `calls:` §23) — a called or included workflow's declared public output
+  is the artifact its parent consumes.
 
 Relationship of the three exemption mechanisms:
 
@@ -234,7 +235,7 @@ Relationship of the three exemption mechanisms:
 |---|---|---|---|---|
 | `terminal: true` | step | yes | no | destructive completion; green never re-armed |
 | `generates:` | step | yes | yes | internal intentional sink, not the public interface |
-| `outputs:` | workflow | yes | yes | public interface / future composition boundary |
+| `outputs:` | workflow | yes | yes | public interface / composition boundary |
 
 ## §18 Derived status
 
@@ -389,12 +390,12 @@ version (§7).
 Every step today is implicitly `on: [inputsGreen]` — fire when consumed inputs are green. `on:` makes the firing trigger explicit.
 
 - **§21.1 `inputsGreen` (default)** — the existing behaviour, unchanged. A step whose `on:` is omitted, or explicitly set to `['inputsGreen']`, fires exactly as today.
-- **§21.2 `allGreen`** — the step fires when the workflow is all-green: no outstanding debts among all artifacts *except the evaluator's own produced outputs* (bootstrap exclusion). Fires immediately on all-green (no delay — the `idle` trigger, which waits, is a planned follow-up, PR3b).
+- **§21.2 `allGreen`** — the step fires when the workflow is all-green: no outstanding debts among all artifacts *except the evaluator's own produced outputs* (bootstrap exclusion). Fires immediately on all-green (no delay — the `idle` trigger, which waits instead, is §21.8).
 - **§21.3 Bootstrap exclusion** — the evaluator's own owed `outcome` is not counted among the debts in the all-green check. Without this, the evaluator's firing could never be triggered (its own debt would prevent all-green).
 - **§21.4 Fall-out-of-done re-arm** — once `outcome` is green (done), if the workflow later falls out of all-green (a new debt appears — e.g. a re-provided input re-arms an upstream artifact), `maintainDecisions` detects that `outcome` is green but all-green no longer holds, and emits a structural reject to re-arm `outcome`. When the workflow returns to all-green, `eligibleFirings` offers the evaluator again. This is stable: `maintainDecisions` only emits the op when the workflow is NOT all-green but `outcome` IS green. After the reject is applied, `outcome` is a debt — the op is not re-emitted. **Exception — terminal-settle invariant (§15.2):** if any artifact with `terminal: true` is green, neither the `allGreen` re-arm nor the `idle` re-arm is emitted, even if the workflow falls out of all-green. A terminal-green artifact seals the workflow; re-arming a completion evaluator after that point would spuriously undo a finished workflow whose side effects are irreversible.
 - **§21.5 Trigger-cause** — the engine threads the cause ('allGreen') onto the `Firing`, the `RunData`, and the `Order`. A worker can read `order.cause` to branch behaviour (e.g. inspect status, green `outcome`, message a human).
 - **§21.6 One `outcome` output** — the evaluator step produces exactly one singleton `outcome` artifact. This is the embedding boundary contract (§17): the outer workflow or teardown step consumes the child's `outcome`.
-- **§21.7 The `idle` trigger** — landed in PR3b. See §21.8 below.
+- **§21.7 The `idle` trigger** — see §21.8 below.
 - **§21.8 `idle` trigger** — a step with `on: ['idle']` (or `on: ['allGreen', 'idle']`) fires when the workflow is quiescent and a time threshold has elapsed. Eligibility requires: (a) the workflow is NOT all-green (allGreen owns the done condition — idle must not race it), (b) no run is in-flight (any claimed, lease-fresh task blocks idle; R12), and (c) `now >= threshold` where `threshold` is determined by §21.9–§21.10. When eligible, `eligibleFirings` emits a `Firing` with `cause: 'idle'`. The step must declare `idleAfter` (a duration string, e.g. `"30m"`); omitting `idleAfter` when `'idle'` is in `on:` is a hard `validateDef` error.
 - **§21.9 Sliding window (relative alarm)** — by default the threshold is `last_progress + idleAfterMs`. `last_progress` is derived as `MAX(artifact.updated_at)` across all artifacts of the workflow (query: `SELECT MAX(updated_at) FROM artifact WHERE workflow = ?`, fallback 0 if none). Every artifact state change goes through `putArtifact`, which stamps `updated_at = nowMs()`, so `last_progress` reliably captures the most recent forward-progress event. Artifact births (owed materialisation), greens, and rejects all advance it. The window slides: if the workflow makes progress, the clock resets.
 - **§21.10 Absolute alarm (override)** — a worker or external scheduler may call `engine.setAlarm(workflow, step, at)` to set an absolute wake-up time. This writes `alarm_at` (ms epoch) to the `task` row for `(workflow, step, key='')` and survives process restart (SQLite-persisted). When `alarm_at` is set, `threshold = alarm_at` takes precedence over the relative fallback. The alarm is consumed (cleared) by the engine when the idle firing is selected — a worker that wants a recurring heartbeat must call `setAlarm` again inside its body. `clearAlarm(workflow, step)` sets `alarm_at = NULL`.
@@ -441,10 +442,6 @@ Every child artifact and step name is prefixed with `${as}.`:
 
 `expandIncludes` maintains an include stack. If a def name appears already on the stack, it throws `DefError: include cycle: <a> -> <b> -> <a>`.
 
-### §22.6 Dev-tooling note (deferred)
-
-Mode 1's name-prefixing (`deliver.plan`, `deliver.merge`) affects `dev` tooling that keys on step names (worktree wiring, dashboard rendering, fleet shape-matching). Making those prefix-aware is deferred to the dev-tooling PR. Mode 1 v1 is the right tool for **brand-new combined workflows** authored fresh; not for re-skinning an existing delivery line (use Mode 2 for that).
-
 
 ---
 
@@ -452,7 +449,7 @@ Mode 1's name-prefixing (`deliver.plan`, `deliver.merge`) affects `dev` tooling 
 
 Mode 2 is the **runtime** sibling of Mode 1 (`include:`). Instead of inlining a child workflow's steps at compile time, a `calls:` step declares that a **separate child workflow instance** produces one of the parent's artifacts at runtime. The `calls:` step is machine-handled — it never emits a worker order.
 
-> **PR5a** delivers the static foundation: grammar, validation, the cross-def cycle check, the `producedBy` parent-coordinate link, and `eligibleFirings` exclusion. **PR5b** will add the runtime cascade-up behavior (spawn-on-eligible, cross-boundary outcome read, machine-green, re-attach, re-provide).
+Mode 2 ships in two layers, both implemented: a **static foundation** (grammar, validation, the cross-def cycle check, the `producedBy` parent-coordinate link, and `eligibleFirings` exclusion) and the **runtime cascade-up** behavior (spawn-on-eligible, cross-boundary outcome read, machine-green, re-attach, re-provide), documented in §23.6.
 
 ### §23.1 Grammar
 
@@ -486,10 +483,10 @@ Shape rules:
 
 ### §23.2 `producedBy` parent-coordinate link
 
-When PR5b spawns a child instance, it passes `producedBy: { parentWf, parentPath }` to `createInstance`, which persists it via the store. The coordinate serves three duties:
+When the engine spawns a child instance, it passes `producedBy: { parentWf, parentPath }` to `createInstance`, which persists it via the store. The coordinate serves three duties:
 
 1. **Re-attach on reap**: when a child run is reaped, the engine re-attaches via the stored link.
-2. **Reverse lookup**: `store.findChildByParent(parentWf, parentPath)` — the never-duplicate guard in PR5b.
+2. **Reverse lookup**: `store.findChildByParent(parentWf, parentPath)` — the never-duplicate guard.
 3. **Cascade-up anchor**: the engine reads `producedBy` to propagate the child's outcome to the parent.
 
 **Storage**: two nullable columns on the `workflow` table — `produced_by_wf TEXT` and `produced_by_path TEXT` (both null for a top-level instance). Two columns (not a JSON blob) because the reverse lookup `(parentWf, parentPath) → child` must be SQL-indexable. The index `workflow_produced_by ON workflow(produced_by_wf, produced_by_path)` makes the lookup O(1). Added by the additive migration in `store.migrate()` (schema version 3).
@@ -508,11 +505,11 @@ This check is **separate** from the include-cycle guard in `expandIncludes` (§2
 
 ### §23.5 `createInstance.producedBy`
 
-`CreateOpts` gains `producedBy?: { parentWf: string; parentPath: string }`. When present, `createInstance` passes it to `insertWorkflow`, which stores both columns. No other behavior changes in PR5a — the field is wired end-to-end (store → engine → opts) so PR5b can call `createInstance({ producedBy })` without touching those layers.
+`CreateOpts` gains `producedBy?: { parentWf: string; parentPath: string }`. When present, `createInstance` passes it to `insertWorkflow`, which stores both columns. The static layer changes nothing else — the field is wired end-to-end (store → engine → opts) so the runtime layer can call `createInstance({ producedBy })` without touching those layers.
 
-### §23.6 Runtime cascade-up (PR5b)
+### §23.6 Runtime cascade-up
 
-PR5b ships `maintainCalls` in `engine.ts` — the engine-internal method that drives the calls: lifecycle. All cross-instance behavior lives in the engine only; `model.ts` stays pure single-instance.
+The engine ships `maintainCalls` in `engine.ts` — the engine-internal method that drives the calls: lifecycle. All cross-instance behavior lives in the engine only; `model.ts` stays pure single-instance.
 
 #### §23.6.1 `maintainCalls` algorithm
 
@@ -544,12 +541,7 @@ The machine-green fingerprint covers only `gateStems` (the parent artifacts wire
 
 #### §23.6.6 Transaction composition
 
-`maintainCalls` runs OUTSIDE any open `store.tx()`. Each mutating action (spawn via `createInstance`, re-provide via `provideInput`, machine-green) opens its own `store.tx()`. No nested transactions — better-sqlite3 does not support nested `BEGIN IMMEDIATE`.
-
-#### §23.6.7 Deferred
-
-- **Live cross-instance addressing** (`<step>.<child-path>` syntax) — §4.7 O7.
-- **GC of orphaned children** on parent delete — §4.8 D3.
+`maintainCalls` runs OUTSIDE any open `store.tx()`. Each mutating action (spawn via `createInstance`, re-provide via `provideInput`, machine-green) opens its own `store.tx()`. No nested transactions — node:sqlite does not support nested `BEGIN IMMEDIATE`.
 
 ## §24 Artifact judges (`judges:`)
 
@@ -561,8 +553,6 @@ domain review. A judge is not a review step (that stays a normal `consumes:
 a node of their own — completeness, rigor, tone, format — evaluated by the
 engine's own firing pipeline rather than by a human threading a review step
 into the graph.
-
-Full design record: `docs/proposals/artifact-judge.md` (locked 2026-07-01).
 
 ### §24.1 The `submitted` state
 

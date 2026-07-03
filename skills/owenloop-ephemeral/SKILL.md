@@ -337,5 +337,7 @@ ledger completes — the gate is real.
 
 ---
 
-Background and evidence for every convention here (including the full friction
-log from the validation runs): `docs/proposals/ephemeral-workflows.md`.
+Every convention here was validated by authoring throwaway defs and driving
+them end to end with the real CLI (fan-out review, pipeline-with-knock-back
+including a stall → `retry`, and gather-distill-solve with a judge). It builds
+only on already-shipped engine features — no engine changes are required.

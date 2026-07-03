@@ -1,16 +1,16 @@
 # Provision → deliver (via calls:) → teardown.
 #
-# Demonstrates the Mode 2 `calls:` grammar (PR5a static foundation).
-# The `deliver` step delegates to the `delivery` workflow at runtime —
-# PR5b will add the actual spawn/cascade-up/outcome-read behavior.
+# Demonstrates the Mode 2 `calls:` grammar. The `deliver` step delegates to the
+# `delivery` workflow at runtime: the engine spawns a child `delivery` instance
+# and greens `delivered` from the child's terminal outcome (cascade-up).
 #
-# Static guarantees provided by this PR:
+# How it behaves:
 #   - Grammar: `calls: delivery` with `inputs:` wiring is parsed and validated.
 #   - `deliver` is excluded from eligibleFirings (machine-handled, not a worker step).
-#   - The `delivered` artifact is seeded as owed — a normal debt until PR5b greens it.
+#   - The `delivered` artifact is seeded as owed — a debt greened by the child outcome.
 #   - Cross-def calls: cycle check prevents delivery calling back to provisioned-delivery.
 #
-# Drive it (once PR5b lands):
+# Drive it:
 #   wf=$(owenloop create provisioned-delivery | jq -r .workflow)
 #   owenloop tick $wf   # -> orders: provision
 #   ...
@@ -18,8 +18,9 @@
 name: provisioned-delivery
 title: Provision → deliver (Mode 2 calls:) → teardown
 description: |
-  Parent workflow demonstrating the calls: grammar (PR5a foundation).
-  Runtime cascade-up behavior (spawn, green via child outcome) is PR5b.
+  Parent workflow demonstrating the calls: grammar. At runtime the engine
+  spawns the child delivery instance and greens `delivered` from its outcome
+  (cascade-up).
 
 inputs:
   - name: proposal
