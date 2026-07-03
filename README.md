@@ -237,10 +237,13 @@ to a human, or run a compensating step instead of silently re-firing. See
 
 ### Model tiers
 
-`model: fast | standard | strong` declares intent, not a vendor id — the
-engine passes it through untouched to whatever dispatches your workers. A
-portable workflow says "this step needs strong judgment"; the host binds that
-to whatever model it runs on. See
+`model: fast | standard | strong | strongest` declares intent, not a vendor
+id — the engine passes it through untouched to whatever dispatches your
+workers. A portable workflow says "this step needs strong judgment"; the
+host binds that to whatever model it runs on. `strong` is a high-capability
+workhorse tier, not the host's single most capable model — that's what the
+opt-in `strongest` tier is for, reserved for the rare step where nothing less
+will do. See
 [`docs/authoring.md`](docs/authoring.md#model--quality-tiers-not-vendor-ids).
 
 ### Event subscription — for embedding

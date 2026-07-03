@@ -117,18 +117,23 @@ a schema reject re-arms the step with the validation errors on the thread. You
 don't pre-check; the rails do.
 
 **Resolving `model`.** An order may carry a `model` hint. The portable
-convention is three quality tiers — resolve them to whatever your host offers:
+convention is four quality tiers — resolve them to whatever your host offers:
 
-| tier | meaning | on Claude Code |
+| tier | meaning | on Claude Code (illustrative — current, not contractual) |
 |---|---|---|
-| `fast` | mechanical work | haiku |
-| `standard` | everyday judgment | sonnet |
-| `strong` | the step the workflow exists for | the strongest available (fable if offered, else opus) |
+| `fast` | mechanical work: grounded reading, extraction, formatting | a fast/cheap model (e.g. haiku) |
+| `standard` | everyday judgment: routing, merging, most judges | a mid-capability model (e.g. sonnet) |
+| `strong` | the expensive step the workflow exists for: synthesis, final artifacts, high-stakes judges — a high-capability workhorse, not the flagship | a strong workhorse model (Opus-class) |
+| `strongest` | the rare step where nothing less will do, cost accepted — the single most capable model the host offers | the host's most capable model available (its flagship) |
 
 Any other value is a literal model id — pass it through unchanged. No `model`
-on the order → your host's default. Never silently downgrade a `strong` step
-to save tokens; the workflow's author priced that step deliberately — if the
-tier isn't available to you, say so and escalate rather than substitute.
+on the order → your host's default. Never silently downgrade a `strong` or
+`strongest` step to save tokens; the workflow's author priced that step
+deliberately — if the tier isn't available to you, say so and escalate rather
+than substitute. The same discipline runs in reverse: never silently upgrade
+a `strong` step to the host's flagship model either — that defeats the point
+of splitting `strong` from `strongest`, and quietly changes what the def's
+author priced the step at.
 
 An order may also carry `workdir` — an opaque location hint the def chose to
 set (absent otherwise). Treat it as a hint about *where within the working

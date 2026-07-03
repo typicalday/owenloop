@@ -61,9 +61,10 @@ steps:
     invalidates: [plan]        # which input stems this step may invalidate
     cadence: "0s"              # min spacing between runs (e.g. "30m")
     maxRunsPerDay: 1000
-    model: standard            # quality tier (fast | standard | strong) or a
-                               #   literal model id — opaque to the engine,
-                               #   passed through on the order (see below)
+    model: standard            # quality tier (fast | standard | strong |
+                               #   strongest) or a literal model id — opaque
+                               #   to the engine, passed through on the order
+                               #   (see below)
     workdir: …                 # opaque hint passed through on the order; omitted when unset
     x:                          # optional; opaque extension map, passed through
       anything: goes            #   untouched onto the order (Order.x); see design.md §27.3
@@ -73,16 +74,22 @@ steps:
 
 The engine never calls a model; `model:` is an opaque string that rides the
 order to whatever dispatches your workers (an agent skill, a runner, your own
-loop). Portable workflows should declare **intent** with one of three tier
+loop). Portable workflows should declare **intent** with one of four tier
 names and let the dispatcher bind them to the host it runs on — Claude Code,
 Codex, Gemini CLI, whatever:
 
 - `fast` — mechanical work: grounded reading, extraction, formatting
 - `standard` — everyday judgment: routing, merging, most judges
 - `strong` — the expensive step the workflow exists for: synthesis, final
-  artifacts, high-stakes judges
+  artifacts, high-stakes judges. This is a high-capability **workhorse**
+  tier — the ceiling a normal workflow should reach for — not the host's
+  single most capable model.
+- `strongest` — the rare step where nothing less will do, cost accepted: the
+  single most capable model the host offers. This tier is never a sensible
+  default and a def must opt into it explicitly for one specific step; most
+  workflows never need it.
 
-A value that isn't one of the three tiers should be passed through verbatim as
+A value that isn't one of the four tiers should be passed through verbatim as
 a literal model id. Pin an exact model when you need reproducibility — just
 know the def is now host-specific, on purpose. Omit `model:` entirely and the
 dispatcher uses its default.
