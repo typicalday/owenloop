@@ -33,6 +33,59 @@ remembered between invocations — pass both on every command.
 | `delete <wf>` | delete an instance and all its rows |
 | `adopt <wf>` | re-pin an instance to the current definition and settle any new debts |
 
+## Hand-driven walkthrough
+
+The [`examples/workflows`](../examples/workflows) folder has a workflow per
+idea: [`delivery`](../examples/workflows/delivery.yaml) (a review knock-back
+loop), [`ship`](../examples/workflows/ship.yaml) (delivery grown up: the full
+production line with provisioned workspaces, an adversarial reviewer, a doc
+pass, and teardown owned as a step),
+[`research`](../examples/workflows/research.yaml) (collections),
+[`routing`](../examples/workflows/routing.yaml) (skip a dead branch),
+[`intake`](../examples/workflows/intake.yaml) (schema validation),
+[`sla-watchdog`](../examples/workflows/sla-watchdog.yaml) (idle timers and
+deadlines), and [`improve`](../examples/workflows/improve.yaml) (a
+codebase-advisor pipeline combining collections, a mid-flight human gate,
+per-element knock-backs, and suffixed-reduce fan-ins). Each example's header
+comment walks through its commands end to end.
+
+Playing every worker yourself is the fastest way to internalize the loop.
+Every command prints JSON, so the snippet below pipes through `jq`:
+
+```sh
+git clone https://github.com/typicalday/owenloop && cd owenloop
+npm install && npm run build
+
+export OWENLOOP_DEFS=examples/workflows
+export OWENLOOP_DB=/tmp/owenloop-demo.db
+
+owenloop() { node bin/owenloop.mjs "$@"; }   # or `npm link` to put it on PATH
+
+owenloop defs                                  # what workflows are available
+
+# start an instance; `proposal` is seeded as owed, so we provide it up front
+wf=$(owenloop create delivery \
+       --provide proposal='{"text":"add dark mode"}' | jq -r .workflow)
+
+# the worker loop: tick → run → report
+run=$(owenloop tick $wf | jq -r '.orders[0].run')   # claim the planner job
+owenloop green $wf $run plan --value '{"plan":"…"}'  # report its output
+
+owenloop status $wf                            # owed / eligible / blocked / done
+```
+
+**A knock-back.** When the reviewer's job comes up, instead of greening its
+`verdict` you can reject the PR:
+
+```sh
+owenloop reject $wf pr --by reviewer --text "tests are missing"
+```
+
+That re-arms `builder` with the reason attached to its next job. Do it past
+`builder`'s `maxAttempts` and `pr` **stalls** — owenloop stops re-arming it
+and waits for a human. `owenloop retry $wf pr --text "use the new fixture"`
+clears the stall and resets the counter.
+
 ## `reap`, `runs`, and `status.inFlight` — observing and clearing in-flight work
 
 `tick` already reaps stranded leases as a side effect (a dead/closed run, or a

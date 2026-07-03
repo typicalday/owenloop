@@ -18,40 +18,73 @@ makes them useful. The workflow around them doesn't.
 
 ## See it work
 
-A two-step pipeline: a writer drafts something, an editor signs off on it.
+A research pipeline: a researcher gathers findings, a writer turns them into
+a report, and an independent reviewer must sign off before the report counts.
+Every clause of that sentence is *enforced* below, not requested:
 
 ```yaml
-# hello.yaml
-name: hello
+# workflows/report.yaml
+name: report
 inputs:
-  - name: topic
+  - name: question
     seedOwed: true
 steps:
+  - name: researcher
+    consumes: [question]
+    produces:
+      - name: findings
+        schema: { type: object, required: [claims, sources] }
+    body: Research the question. Every claim needs a source.
   - name: writer
-    consumes: [topic]
-    produces: [draft]
-    body: Write a short paragraph about ${topic}.
-  - name: editor
-    consumes: [draft]
-    produces: [final]
-    terminal: true
-    body: Tighten the draft and green it as `final`.
+    consumes: [findings]
+    produces:
+      - name: report
+        judges:
+          - name: reviewer
+            body: Reject the report if any claim lacks a citation
+                  or drifts from the findings. Otherwise approve.
+    maxAttempts: 3
+    body: Write the report from the findings, citations inline.
 ```
 
-```sh
-mkdir demo && cd demo && mkdir workflows && mv ../hello.yaml workflows/
-export OWENLOOP_DB=demo.db
+You don't drive this by hand. An orchestrator — an agent skill, a plain
+`while` loop, your own code — ticks the engine, hands each job to an agent,
+and reports results back. Here's what the engine enforces as that loop runs:
 
-wf=$(npx owenloop create hello --provide topic='{"text":"tidepools"}' | jq -r .workflow)
-npx owenloop tick $wf                 # -> one order, for `writer`
-npx owenloop status $wf               # owed / eligible / blocked / done
-```
+1. **The writer cannot start early.** The first tick emits exactly one order —
+   the researcher's. There is no writer job to hand out, so no eager agent can
+   write a report from findings that don't exist. The hope version is a
+   prompt: *"wait until research is complete before writing."*
 
-`npx owenloop` works straight from a fresh `npm install` — the package ships a
-`bin` entry, no global install or build step needed. `tick` hands you a
-self-contained job (prompt + inputs); you run it with whatever agent you like
-and report the result with `green`. The [Quick start](#quick-start) below
-walks a full pipeline — including a rejection — end to end.
+2. **Malformed output never enters the pipeline.** The researcher reports
+   findings missing `sources` — the engine *refuses the commit* at the schema,
+   and the retry order carries the validation errors as feedback. The hope
+   version: the bad output flows downstream and fails somewhere confusing.
+
+3. **The report can't approve itself.** When the writer commits `report`, it
+   lands in `submitted`, not done. The reviewer is a separate order to a
+   separate agent — one that never saw the writer's reasoning. A rejection
+   re-arms the writer with the reviewer's reasons attached to its next job.
+   The hope version: *"review your work before finishing"* — the fox
+   auditing the henhouse.
+
+4. **Failure has a floor.** Third rejected attempt and `report` **stalls**:
+   the engine stops issuing jobs for it and flags it for a human, instead of
+   letting an agent grind the same mistake all night on your API bill.
+
+5. **"Done" stays honest.** Sharpen the `question` after the run finishes and
+   `findings` and `report` fall back to owed — the finished workflow un-does
+   itself, automatically, rather than standing on inputs that no longer exist.
+
+None of this depends on an agent reading carefully, remembering instructions,
+or being honest about its own work. And notice that you never defined a state
+or a transition — only what each step consumes and produces. This isn't a
+state machine an agent is asked to role-play from a prompt; the states live
+in the engine, and the engine doesn't negotiate. The agents stay
+probabilistic; the bookkeeping around them never is. The [Quick
+start](#quick-start) gets you running in two commands, and [Driving it with a
+loop](#driving-it-with-a-loop) covers orchestrators — including the shipped
+skills that do it for you.
 
 ---
 
@@ -224,14 +257,31 @@ instead of ticking on a timer. See [Embedding it](#embedding-it) and
 owenloop never runs anything itself. It hands out jobs and waits to hear back —
 something has to tick it, run the work, and report the result. That something can be
 as simple as a `while` loop around an agent. The [Ralph
-technique](https://ghuntley.com/ralph/) — keep an agent ticking with a fresh context
+loop](https://ghuntley.com/ralph/) — keep an agent ticking with a fresh context
 each pass — is exactly this kind of outer loop, and owenloop is the half it's
 missing: the persistent state and the brakes. The loop keeps going; owenloop
 remembers what's owed, what failed and why, and when the whole thing is actually
 done. They work side by side — the loop is the muscle, owenloop is the memory.
 
-If you're driving owenloop from Claude Code, three shipped agent skills cover
-the loop for you — no hand-rolled `while` loop needed:
+The outer loop is deliberately not owenloop's business, which means it can be
+anything that can run a CLI command or call a function. In practice that
+looks like:
+
+- **Your own harness** — a `while` loop, a cron job, a CI stage: tick, run
+  each order with whatever executes your work (an agent CLI, an API call, a
+  script), report, repeat. Fully deterministic dispatch if you want it —
+  see [Embedding it](#embedding-it) for the in-process version.
+- **An agent as the orchestrator** — point any tool-using agent (Claude Code,
+  Codex, Gemini CLI, anything that can run a shell command) at the CLI and
+  tell it to drive the instance to done. A slash command or skill that wraps
+  this turns "run the release workflow" into one line.
+- **An agent structuring its own work, inline** — mid-task, an agent authors
+  a throwaway workflow, drives itself through it, and deletes it: the engine
+  as scratch discipline rather than standing infrastructure.
+
+The engine doesn't know or care which of these is ticking it — an order is an
+order. For Claude Code specifically, three shipped skills implement these
+patterns ready-made:
 
 - [`owenloop-conduct`](skills/owenloop-conduct/SKILL.md) — drive an existing
   workflow instance to done: tick, dispatch each order to a fresh subagent,
@@ -246,57 +296,38 @@ the loop for you — no hand-rolled `while` loop needed:
 
 ## Quick start
 
-The [`examples/workflows`](examples/workflows) folder has a workflow per idea:
-[`delivery`](examples/workflows/delivery.yaml) (a review knock-back loop),
-[`ship`](examples/workflows/ship.yaml) (delivery grown up: the full production
-line with provisioned workspaces, an adversarial reviewer, a doc pass, and
-teardown owned as a step),
-[`research`](examples/workflows/research.yaml) (collections),
-[`routing`](examples/workflows/routing.yaml) (skip a dead branch),
-[`intake`](examples/workflows/intake.yaml) (schema validation),
-[`sla-watchdog`](examples/workflows/sla-watchdog.yaml) (idle timers and deadlines), and
-[`improve`](examples/workflows/improve.yaml) (a codebase-advisor pipeline
-combining collections, a mid-flight human gate, per-element knock-backs, and
-suffixed-reduce fan-ins).
-Every command prints JSON, so the snippet below pipes through `jq`.
+Install the owenloop skills for whatever agent you use — Claude Code, Codex,
+Cursor, and most others:
 
 ```sh
-git clone https://github.com/typicalday/owenloop && cd owenloop
-npm install && npm run build
-
-export OWENLOOP_DEFS=examples/workflows
-export OWENLOOP_DB=/tmp/owenloop-demo.db
-
-owenloop() { node bin/owenloop.mjs "$@"; }   # or `npm link` to put it on PATH
-
-owenloop defs                                  # what workflows are available
-
-# start an instance; `proposal` is seeded as owed, so we provide it up front
-wf=$(owenloop create delivery \
-       --provide proposal='{"text":"add dark mode"}' | jq -r .workflow)
-
-# the worker loop: tick → run → report
-run=$(owenloop tick $wf | jq -r '.orders[0].run')   # claim the planner job
-owenloop green $wf $run plan --value '{"plan":"…"}'  # report its output
-
-owenloop status $wf                            # owed / eligible / blocked / done
+npx skills add typicalday/owenloop
 ```
 
-**A knock-back.** When the reviewer's job comes up, instead of greening its `verdict`
-you can reject the PR:
+Then ask your agent for what you want:
 
-```sh
-owenloop reject $wf pr --by reviewer --text "tests are missing"
-```
+> Use owenloop-author to build me a workflow that researches a topic, writes
+> a report, and doesn't accept it until an independent reviewer signs off —
+> then run it on "tidepools".
 
-That re-arms `builder` with the reason attached to its next job. Do it past
-`builder`'s `maxAttempts` and `pr` **stalls** — owenloop stops re-arming it and waits
-for a human. `owenloop retry $wf pr --text "use the new fixture"` clears the stall and
-resets the counter.
+The skill interviews you for anything missing, writes and validates the YAML
+definition, then conducts the instance to done — dispatching each order to a
+fresh subagent, relaying knock-backs, and escalating stalls to you. Already
+have a def? *"Conduct the report workflow"* hands it to
+[`owenloop-conduct`](skills/owenloop-conduct/SKILL.md). The engine itself
+arrives via `npx owenloop` — no clone, no build, no environment variables, no
+CLI verbs to memorize.
 
-Each example's header comment walks through its commands end to end. Full
-command reference: [`docs/cli.md`](docs/cli.md). Full YAML grammar:
-[`docs/authoring.md`](docs/authoring.md).
+**Want to see or drive the machinery yourself?** Everything above goes
+through the same small CLI (`create`, `tick`, `green`, `reject`, …).
+[`docs/cli.md`](docs/cli.md) has the full command reference and a hand-driven
+walkthrough of a pipeline — including a rejection knock-back and a stall —
+and [`examples/workflows`](examples/workflows) has seven runnable defs, from a
+minimal review loop ([`delivery`](examples/workflows/delivery.yaml)) to a
+full production line ([`ship`](examples/workflows/ship.yaml)) and a
+collections-heavy research pipeline
+([`research`](examples/workflows/research.yaml)). Full YAML grammar:
+[`docs/authoring.md`](docs/authoring.md). Driving it from your own code:
+[Embedding it](#embedding-it).
 
 ---
 
