@@ -726,7 +726,7 @@ steps:
           - name: rigor
             bodyFile: judges/rigor.md # or a prompt loaded from disk (§16) —
                                       # body/bodyFile mutually exclusive
-            model: claude-opus-4-8    # optional, per-judge model
+            model: strong             # optional, per-judge model
             inputs: true              # optional, default false — judge also
                                       # reads the producer's inputs (question)
     maxAttempts: 5    # producer's cap — also bounds judge-reject → rebuild loops
@@ -736,7 +736,10 @@ steps:
 - `body:` / `bodyFile:` — the judge agent's prompt (exactly one required,
   mutually exclusive, same rule as step bodies). `bodyFile` is resolved
   against the workflow's base directory and read eagerly at def-load.
-- `model:` — optional model override for that judge's order.
+- `model:` — optional model override for that judge's order. Opaque to the
+  engine, like the step-level key: the recommended vocabulary is the quality
+  tiers `fast` / `standard` / `strong`, resolved to a concrete model by the
+  dispatcher; any other value passes through verbatim as a literal model id.
 - `inputs:` — optional, default `false`: the judge sees only the judged value
   on its own merits; `true` adds read-only consume edges on the producer's
   inputs, for criteria that need "what was asked for" as context.

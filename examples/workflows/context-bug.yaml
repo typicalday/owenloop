@@ -7,10 +7,10 @@
 # no ordering between them), then the same distill -> judged brief -> solver
 # knock-back protocol as the codebase workflow:
 #
-#   trace_harvest (haiku)    the code the failure touches, right now
-#   history_harvest (haiku)  how that code got this way (log, blame, PRs, issues)
-#   distill (sonnet)         merge both lanes -> `brief`, judged
-#   solve (fable)            fix the bug; can reject the brief with the gap
+#   trace_harvest (fast)     the code the failure touches, right now
+#   history_harvest (fast)   how that code got this way (log, blame, PRs, issues)
+#   distill (standard)       merge both lanes -> `brief`, judged
+#   solve (strong)           fix the bug; can reject the brief with the gap
 #
 # When a fixed fan-out covers the ground, it beats a scout + collection:
 # fewer steps, no emit/seal ceremony, knock-backs target a lane by NAME
@@ -82,7 +82,7 @@ steps:
                 dirty: { type: boolean }
               additionalProperties: false
           additionalProperties: false
-    model: claude-haiku-4-5-20251001
+    model: fast
     maxAttempts: 3
     body: |
       Workflow ${WORKFLOW}, run ${RUN}.
@@ -135,7 +135,7 @@ steps:
                 dirty: { type: boolean }
               additionalProperties: false
           additionalProperties: false
-    model: claude-haiku-4-5-20251001
+    model: fast
     maxAttempts: 3
     body: |
       Workflow ${WORKFLOW}, run ${RUN}.
@@ -208,12 +208,12 @@ steps:
         judges:
           - name: grounded
             bodyFile: judges/grounded.md
-            model: claude-haiku-4-5-20251001
+            model: fast
             inputs: true
           - name: lean
             bodyFile: judges/lean.md
-            model: claude-haiku-4-5-20251001
-    model: claude-sonnet-5
+            model: fast
+    model: standard
     maxAttempts: 6     # absorbs judge rejects AND solver knock-backs
     body: |
       Workflow ${WORKFLOW}, run ${RUN}.
@@ -233,7 +233,7 @@ steps:
   - name: solve
     consumes: [bug, brief]
     produces: [solution]
-    model: claude-fable-5      # the only expensive step
+    model: strong              # the only expensive step
     maxAttempts: 3
     body: |
       Workflow ${WORKFLOW}, run ${RUN}.

@@ -49,7 +49,7 @@ steps:
               Otherwise approve.
           - name: rigor
             bodyFile: judges/rigor.md
-            model: claude-opus-4-8   # optional, per-judge model override
+            model: strong            # optional, per-judge model override — tier or literal id
             inputs: true             # this judge also reads `question` for context
     maxAttempts: 5   # caps producer rebuilds AND judge-reject -> rebuild loops
     body: |
