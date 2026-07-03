@@ -1,0 +1,371 @@
+# Ship — the software production line.
+#
+# One instance = one approved change (feature, bug, chore — the kind doesn't
+# matter; it's all development). Every change rides the same rails:
+#
+#   plan + provision → build → review → document → check → merge → clean up
+#
+# This is the grown-up sibling of delivery.yaml (which teaches the wiring in
+# four steps). It's the line the authors actually run their own changes down,
+# genericized: full artifact schemas, tiered models, honest escalation, and —
+# the part most pipelines get wrong — the machine lifecycle as first-class
+# steps. `provisioner` stands up the branch/worktree BEFORE the builder starts
+# and owns it as the `workspace` artifact; `deprovisioner` reclaims it AFTER
+# the terminal merge. Because `cleanup` stays owed until teardown happens, the
+# instance is not done until the branch is gone — teardown is a debt the
+# scheduler must settle, not a best-effort afterthought that leaks branches.
+#
+# The dynamics worth watching:
+#   - The reviewer rejecting `pr` re-arms `builder` with the reasons attached.
+#   - A re-planned `plan` cascades forward: `pr`, `verdict`, `docs`, `checks`,
+#     `merge` all fall back to debts automatically.
+#   - `merge` is terminal — a destructive completion, never re-armed.
+#   - `planSeed` (optional) shortcuts the planner or adopts a half-done branch.
+#
+# The bodies describe WHAT each step must produce, not which agent runs it —
+# `model:` uses the quality tiers (fast / standard / strong) resolved by
+# whatever dispatches the orders.
+#
+# Drive it:
+#   wf=$(owenloop create ship --provide proposal='{"text":"add rate limiting to the API"}' | jq -r .workflow)
+#   owenloop tick $wf     # -> TWO orders at once: planner and provisioner
+#   ...
+#   owenloop reject $wf pr --by reviewer --text "error path untested; add the 429 case"
+#
+# Or hand it to an agent: the owenloop-conduct skill (skills/owenloop-conduct)
+# drives an instance to done, one fresh subagent per order.
+#
+# Scaffolding hygiene: if the db (.owenloop/) and this defs dir live inside
+# the repo the workflow ships changes to, gitignore them first — a builder
+# running `git add -A` will otherwise sweep them into the PR.
+#
+# Continue half-done work instead of starting fresh:
+#   owenloop create ship --provide proposal='{"text":"finish the rate limiter"}' \
+#                        --provide planSeed='{"adopt":true,"branch":"wip/rate-limit"}'
+
+name: ship
+title: Ship — the software production line
+description: Plan + provision → build → review → document → check → merge → clean up. Lifecycle bracketed as owned artifacts; reviewer knock-backs; terminal merge.
+outputs: [merge]
+
+inputs:
+  - name: proposal          # the approved brief, seeded at create
+    seedOwed: true
+    producer: human
+    # A pure brief — it never names a branch. Continuing half-done work is
+    # requested through planSeed.adopt, not the proposal. Extra fields (task
+    # ids, links, titles) may ride along; only `text` is required.
+    schema:
+      type: object
+      required: [text]
+      properties:
+        text: { type: string, minLength: 1 }
+
+  - name: planSeed          # optional planner/lifecycle bypass
+    seedOwed: false         # seeds green with value:undefined when omitted (the normal path)
+    producer: human
+    # Absent on the standard path — the engine omits undefined-valued inputs
+    # from a step's `consumes`, the planner drafts from scratch, and the
+    # provisioner mints a fresh branch. Provide it to shortcut the planner
+    # and/or adopt an existing branch:
+    #   {path:"<repo-relative path>"}  — forward an existing plan file verbatim
+    #   {text:"<full plan content>"}   — pass a free-text plan straight through
+    #   {adopt:true, branch:"<name>"}  — continue half-done work: the provisioner
+    #                                    checks out <branch> instead of minting
+    #                                    one, and the planner writes an
+    #                                    adaptation brief over what's there.
+    schema:                 # polymorphic; validated only when provided
+      anyOf:
+        - { type: object, required: [path],          properties: { path: { type: string, minLength: 1 } } }
+        - { type: object, required: [text],          properties: { text: { type: string, minLength: 1 } } }
+        - { type: object, required: [adopt, branch], properties: { adopt: { enum: [true] }, branch: { type: string, minLength: 1 } } }
+
+steps:
+  - name: planner
+    consumes: [proposal, planSeed]
+    produces:
+      - name: plan
+        schema:
+          type: object
+          required: [plan]
+          properties:
+            plan: { type: string, minLength: 1 }
+    model: strong           # judgment gates everything downstream — the builder executes this brief
+    reapTtl: 20m            # a dead planner should re-arm in minutes, not the 2h engine default
+    maxRunsPerDay: 6
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}. Turn the approved `proposal` into a
+      precise build plan so the builder executes instead of guessing. You never
+      write code.
+
+      Check `planSeed` in your order's `consumes` FIRST — it is usually absent
+      (the key will not be present at all, not merely null), and each present
+      shape is a different, shorter job than planning from scratch:
+
+      - planSeed = {path:"<relpath>"}: the plan already exists as a file in the
+        repo. Read it verbatim (do not rewrite or summarize), confirm it is
+        coherent, then green `plan` with `{"plan":"<file contents>"}`.
+      - planSeed = {text:"<content>"}: the full plan was supplied as free text.
+        Green `plan` with `{"plan":"<content>"}` directly. Do not rewrite.
+      - planSeed = {adopt:true, branch:"<name>"}: prior work already exists on
+        that branch (the provisioner adopted it). Survey it read-only —
+        `git log`, `git diff` vs the default branch — what is done vs what
+        remains, then write an ADAPTATION brief: goal, what is already done,
+        what remains, how to verify. Green `plan` with that brief.
+      - planSeed absent (the standard path): draft the full plan from scratch
+        using `proposal.text` as the brief. Study the code read-only first —
+        the files involved, the patterns the codebase already uses, the tests
+        covering the area. The plan must fit how this project actually works,
+        not how you would greenfield it. Write a standalone document: goal,
+        files to touch, approach, edge cases, how to verify — concrete enough
+        that a builder with no other context can execute it. Note which docs
+        the change should touch so the documenter has a concrete target.
+
+      Green `plan` with `{"plan":"<the full plan document>"}`. Plan
+      autonomously by default — fill ordinary gaps with reasonable assumptions
+      and state them in the plan. If the design forces a one-way-door choice
+      (expensive to reverse, wide blast radius, or later work builds on it) or
+      the proposal genuinely conflicts with how the project works, do NOT
+      guess: close the run `failed` with a summary naming the decision needed.
+      That failure is the escalation — a human answers and the step re-fires.
+
+  - name: provisioner
+    consumes: [proposal, planSeed]
+    produces:
+      - name: workspace
+        schema:
+          type: object
+          required: [worktreePath, branch]
+          properties:
+            worktreePath: { type: string, minLength: 1 }
+            branch:       { type: string, minLength: 1 }
+    model: fast             # mechanical git work — no judgment
+    reapTtl: 15m
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}. Stand up the machine before any build
+      work starts. You own lifecycle SETUP the way `deprovisioner` owns
+      TEARDOWN. Pure mechanics — no code, no planning.
+
+      - If `planSeed` says {adopt:true, branch:"<name>"}: check out that
+        existing branch (local or remote) instead of creating one.
+      - Otherwise mint a work branch named after this instance (e.g.
+        `ship/<the wf id's short suffix>`) off the repo's default branch.
+      - If the repo uses git worktrees, create one for the branch and use its
+        absolute path as `worktreePath`. Otherwise check the branch out in
+        place and use the checkout root.
+      - Idempotent: if the branch/worktree already exists, adopt it — do not
+        re-create or reset it.
+
+      Green `workspace` with `{"worktreePath":"<abs>","branch":"<name>"}`.
+      The builder consumes `workspace`, so it cannot fire until this is green —
+      the workspace is guaranteed to exist before any build work starts.
+
+  - name: builder
+    consumes: [plan, workspace]
+    produces:
+      - name: pr
+        schema:
+          type: object
+          required: [prUrl, branch, number]
+          properties:
+            prUrl:  { type: string, minLength: 1 }
+            branch: { type: string, minLength: 1 }
+            number: { type: integer }
+    model: standard         # execution from a precise brief; the plan carries the judgment
+    reapTtl: 30m            # the longest agent step — full test suites run here
+    maxAttempts: 5          # reviewer knock-backs re-arm this a lot before it stalls
+    parallel: 1
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}. Implement `plan` in the provisioned
+      workspace (`workspace.worktreePath`, already created) and open a PR.
+
+      - If `pr` already carries reject reasons (see the order's `owes`), this
+        is a re-arm: read every reason, address all of them, and re-green. Do
+        not produce attempt N+1 of the same approach the reviewer already
+        rejected. Fix forward — do not resolve a finding by reverting
+        intentional code unless it is a genuine correctness, reliability, or
+        security issue.
+      - Implement the plan. Run the project's tests, linter, and typechecker.
+        Never weaken or skip tests to get green. An honest failure (close
+        `failed`) is worth more than a fake success.
+      - Commit on `workspace.branch`, push it, and open a PR referencing the
+        workflow.
+
+      Green `pr` with `{"prUrl":"<url>","branch":"<branch>","number":<n>}`.
+      You do NOT review or merge your own work — the review is a separate step.
+
+  - name: reviewer
+    consumes: [pr, plan]    # plan is a real input: the review judges the diff AGAINST the plan
+    produces:
+      - name: verdict       # only `approved` is contractual; findings/risk ride along
+        schema:
+          type: object
+          required: [approved]
+          properties:
+            approved: { type: boolean }
+    model: strong           # a soft pass here ships a bug; the verdict gates the merger
+    reapTtl: 20m
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}. Review work you did not write — be
+      adversarial, not agreeable. You never edit the code.
+
+      - Read the full PR diff. Does it do what `plan` asked, completely? Flag
+        deviations from the plan.
+      - Look specifically for: tests deleted/weakened/skipped, error handling
+        removed, hardcoded values, secrets, unrelated drive-by changes, and
+        claims in the PR description the diff does not support.
+      - Do a full pass — do NOT stop after the first finding; enumerate every
+        material issue you can substantiate. Do not re-run tests (the builder
+        did) and do not report style/format/lint issues.
+      - Check CI on the PR (`gh pr checks <n>`). Never approve a PR whose CI
+        is red or pending. A repo with NO checks configured is not a blocker
+        (`gh pr checks` exits non-zero with "no checks reported" — that is
+        an answer, not a failure): note it in the verdict and judge on the
+        diff alone.
+
+      Objective, contained defects (bugs, missing error handling, wrong
+      values, red CI, a recoverable plan deviation) → `reject` the `pr` with
+      specific, actionable reasons; the builder fixes them, no human needed.
+      A genuine one-way-door question the plan didn't settle → close the run
+      `failed` with the question; that is the escalation. Otherwise green
+      `verdict` with
+      `{"approved":true,"risk_level":"low|medium|high","findings":[{"severity":"…","file":"…","description":"…"}],"note":"<one line>"}`
+      and post an approving PR review. (GitHub refuses self-approval on a
+      solo account — expected and harmless; post the review as a comment
+      instead. The `verdict` artifact, not the GitHub review, is the gate.)
+
+  - name: documenter
+    consumes: [verdict, pr, workspace]  # verdict is the gate; pr/workspace are the handles the body works with
+    produces:
+      - name: docs
+        schema:
+          type: object
+          required: [updated, files]
+          properties:
+            updated: { type: boolean }
+            files:   { type: array, items: { type: string } }
+    model: standard         # a doc-only pass; runs once, after the change is approved
+    reapTtl: 20m
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}. The change is approved. Bring the docs
+      in line with it. You edit ONLY documentation — never executable code or
+      tests — and you run exactly once, so do not re-review the work.
+
+      - Assess fast (read-only first): in `workspace.worktreePath`, scan the
+        PR's diff (`pr.number`) for what a reader needs to know — new or changed public APIs, new behaviors, changed config,
+        removed functionality with stale references. If nothing material
+        changed for a reader (internal refactor, test-only change), green
+        immediately with `{"updated":false,"files":[]}`. Do not hunt for
+        cosmetic edits.
+      - Otherwise update only the affected docs and doc-comments: minimal, in
+        the project's existing style. Keep READMEs concise — deep detail
+        belongs in docs/.
+
+      Commit and push any doc updates to the PR branch (`pr.branch`, checked
+      out in the workspace), then green `docs` with
+      `{"updated":true|false,"files":["…"]}`. Touch nothing else — the checker
+      and merger land the final state.
+
+  - name: checker
+    consumes: [docs, workspace]
+    produces:
+      - name: checks
+        schema:
+          type: object
+          required: [status]
+          properties:
+            status: { enum: [passed, failed, no-checks-declared] }
+    model: fast             # mechanical: run the declared checks, report honestly
+    reapTtl: 15m
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}. One last verification at the FINAL
+      branch head — this step fires after the documenter precisely so the
+      commit that gets merged (including any doc commits) is the commit that
+      was checked.
+
+      In `workspace.worktreePath`, run the project's own check suite — whatever
+      the repo declares (`npm test`, `npm run check`, `make test`, a checks
+      script). Report honestly, do not fix anything:
+      - exit 0            → green `checks` with `{"status":"passed"}`
+      - non-zero          → green `checks` with `{"status":"failed"}`
+      - no declared suite → green `checks` with `{"status":"no-checks-declared"}`
+
+      A failed status is still a green artifact — your job is the record, not
+      the gate. The merger reads `checks.status` and refuses to land a failed
+      one.
+
+  - name: merger
+    consumes: [verdict, docs, pr, checks, workspace]
+    # pr is a real input: the merger lands it (needs its handle) AND judges its
+    # mergeability — consuming pr is what grants the authority to reject it on
+    # a conflict. verdict/docs are the approval and docs-done gates; checks is
+    # the final-head verification record; workspace is the handle the
+    # deprovisioner tears down after this greens.
+    produces:
+      - name: merge
+        schema:
+          type: object
+          required: [merged, sha]
+          properties:
+            merged: { type: boolean }
+            sha:    { type: string, minLength: 1 }
+    terminal: true          # a merge is a destructive completion — never re-armed
+    model: standard
+    reapTtl: 15m
+    parallel: 1
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}. The `verdict` is approval. Land the
+      work.
+
+      - Gate on the record: if `checks.status` is `failed`, do not merge —
+        `reject` the `pr` with the failure so the builder fixes it.
+      - Re-check CI: if the PR has checks, all must be green; if it has none,
+        proceed on the verdict alone. Never merge over red or pending CI.
+      - Squash-merge the PR and delete the remote branch in one step:
+        `gh pr merge --squash --delete-branch <n>`.
+
+      Green `merge` (terminal) with `{"merged":true,"sha":"<commit>"}`. Do NOT
+      reclaim the worktree or local branch yourself — the `deprovisioner` step
+      owns teardown and fires automatically once this green lands. If the
+      merge fails on conflicts, `reject` the `pr` with the conflict details so
+      the builder rebases — do not force it.
+
+  - name: deprovisioner
+    consumes: [merge, workspace]
+    generates:              # generates: not produces: — a lint-exempt dead-end record
+      - name: cleanup
+        schema:
+          type: object
+          required: [reclaimed, branch]
+          properties:
+            reclaimed:    { type: boolean }
+            branch:       { type: string, minLength: 1 }
+            worktreePath: { type: string }
+    on: [inputsGreen]       # fires exactly once when merge (terminal) AND workspace are green
+    model: fast             # mechanical git teardown
+    reapTtl: 15m
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}. The merge landed. Reclaim the machine.
+      This step is why the instance stays NOT-done past the terminal merge:
+      `cleanup` is owed until teardown actually happens, so a leaked branch is
+      a visible debt, not a silent leftover.
+
+      - Read `worktreePath`/`branch` from the `workspace` artifact — never
+        re-derive a naming convention; an adopted branch tears down too.
+      - If the workspace was an in-place checkout (no separate worktree),
+        check out the default branch FIRST — git refuses to delete the
+        branch you are standing on.
+      - Remove the worktree if one was created, delete the local branch, and
+        best-effort delete any leftover remote branch (the merger's
+        `--delete-branch` usually already did). Much of this is often already
+        done — that makes this a verification pass, not wasted work: confirm
+        each is gone, reclaim what isn't.
+
+      Green `cleanup` with `{"reclaimed":true,"branch":"<name>"}` and close.
+
+      (Authoring note: the trigger must be `on:[inputsGreen]`, never
+      `on:[allGreen]` — an allGreen firing stores an empty input fingerprint,
+      which can never match the required [merge, workspace] inputs at green
+      time, so the artifact would be born-rejected on every firing. With
+      inputsGreen the fingerprint matches and, once green, re-firing is
+      suppressed because `merge` is terminal — so this runs exactly once.)
