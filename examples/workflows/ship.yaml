@@ -35,6 +35,10 @@
 # Or hand it to an agent: the owenloop-conduct skill (skills/owenloop-conduct)
 # drives an instance to done, one fresh subagent per order.
 #
+# Scaffolding hygiene: if the db (.owenloop/) and this defs dir live inside
+# the repo the workflow ships changes to, gitignore them first — a builder
+# running `git add -A` will otherwise sweep them into the PR.
+#
 # Continue half-done work instead of starting fresh:
 #   owenloop create ship --provide proposal='{"text":"finish the rate limiter"}' \
 #                        --provide planSeed='{"adopt":true,"branch":"wip/rate-limit"}'
@@ -191,7 +195,7 @@ steps:
       You do NOT review or merge your own work — the review is a separate step.
 
   - name: reviewer
-    consumes: [pr]
+    consumes: [pr, plan]    # plan is a real input: the review judges the diff AGAINST the plan
     produces:
       - name: verdict       # only `approved` is contractual; findings/risk ride along
         schema:
@@ -214,7 +218,10 @@ steps:
         material issue you can substantiate. Do not re-run tests (the builder
         did) and do not report style/format/lint issues.
       - Check CI on the PR (`gh pr checks <n>`). Never approve a PR whose CI
-        is red or pending.
+        is red or pending. A repo with NO checks configured is not a blocker
+        (`gh pr checks` exits non-zero with "no checks reported" — that is
+        an answer, not a failure): note it in the verdict and judge on the
+        diff alone.
 
       Objective, contained defects (bugs, missing error handling, wrong
       values, red CI, a recoverable plan deviation) → `reject` the `pr` with
@@ -223,10 +230,12 @@ steps:
       `failed` with the question; that is the escalation. Otherwise green
       `verdict` with
       `{"approved":true,"risk_level":"low|medium|high","findings":[{"severity":"…","file":"…","description":"…"}],"note":"<one line>"}`
-      and post an approving PR review.
+      and post an approving PR review. (GitHub refuses self-approval on a
+      solo account — expected and harmless; post the review as a comment
+      instead. The `verdict` artifact, not the GitHub review, is the gate.)
 
   - name: documenter
-    consumes: [verdict]
+    consumes: [verdict, pr, workspace]  # verdict is the gate; pr/workspace are the handles the body works with
     produces:
       - name: docs
         schema:
@@ -242,8 +251,8 @@ steps:
       in line with it. You edit ONLY documentation — never executable code or
       tests — and you run exactly once, so do not re-review the work.
 
-      - Assess fast (read-only first): scan the diff for what a reader needs
-        to know — new or changed public APIs, new behaviors, changed config,
+      - Assess fast (read-only first): in `workspace.worktreePath`, scan the
+        PR's diff (`pr.number`) for what a reader needs to know — new or changed public APIs, new behaviors, changed config,
         removed functionality with stale references. If nothing material
         changed for a reader (internal refactor, test-only change), green
         immediately with `{"updated":false,"files":[]}`. Do not hunt for
@@ -252,7 +261,8 @@ steps:
         the project's existing style. Keep READMEs concise — deep detail
         belongs in docs/.
 
-      Commit and push any doc updates to the PR branch, then green `docs` with
+      Commit and push any doc updates to the PR branch (`pr.branch`, checked
+      out in the workspace), then green `docs` with
       `{"updated":true|false,"files":["…"]}`. Touch nothing else — the checker
       and merger land the final state.
 
@@ -274,8 +284,8 @@ steps:
       was checked.
 
       In `workspace.worktreePath`, run the project's own check suite — whatever
-      the repo declares (`npm run check`, `make test`, a checks script). Report
-      honestly, do not fix anything:
+      the repo declares (`npm test`, `npm run check`, `make test`, a checks
+      script). Report honestly, do not fix anything:
       - exit 0            → green `checks` with `{"status":"passed"}`
       - non-zero          → green `checks` with `{"status":"failed"}`
       - no declared suite → green `checks` with `{"status":"no-checks-declared"}`
@@ -342,9 +352,14 @@ steps:
 
       - Read `worktreePath`/`branch` from the `workspace` artifact — never
         re-derive a naming convention; an adopted branch tears down too.
+      - If the workspace was an in-place checkout (no separate worktree),
+        check out the default branch FIRST — git refuses to delete the
+        branch you are standing on.
       - Remove the worktree if one was created, delete the local branch, and
-        best-effort delete any leftover remote branch (the merger usually
-        already did).
+        best-effort delete any leftover remote branch (the merger's
+        `--delete-branch` usually already did). Much of this is often already
+        done — that makes this a verification pass, not wasted work: confirm
+        each is gone, reclaim what isn't.
 
       Green `cleanup` with `{"reclaimed":true,"branch":"<name>"}` and close.
 
