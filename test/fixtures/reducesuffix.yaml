@@ -1,0 +1,22 @@
+# Test-only fixture: a suffixed reduce (`gather.source[*].formatcheck`). `gather`
+# emits bare members; `formatcheck` maps each member into a per-element verdict;
+# `synth` fans in over those verdicts, not the bare members — this is the
+# "gate on verdicts, not just members" shape documented as a caveat against
+# examples/workflows/research.yaml (bare reduce), now expressible without
+# touching that example. Mirrors research.yaml's wiring shape exactly, with
+# one extra dot on synth's consume.
+name: reducesuffix
+title: Suffixed reduce fixture
+inputs:
+  - name: question
+steps:
+  - name: gather
+    consumes: [question]
+    produces: ["gather.source[]"]
+  - name: formatcheck
+    consumes: ["gather.source[$i]"]
+    produces: ["gather.source[$i].formatcheck"]
+    parallel: 8
+  - name: synth
+    consumes: ["gather.source[*].formatcheck"]
+    produces: [draft]

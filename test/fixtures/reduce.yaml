@@ -1,0 +1,22 @@
+# Test-only fixture: a bare-member reduce (`gather.source[*]`), mirroring
+# examples/workflows/research.yaml's shape before it moved to a suffixed
+# reduce (`gather.source[*].verdict`, PR follow-up to #58). Kept so the
+# bare-reduce battery (gates on members, not verdicts; fires alongside the
+# map; blocks on a rejected member; re-derives on retract) still has a
+# concrete fixture to drive without depending on the now-suffixed example.
+name: reduce
+title: Bare reduce fixture
+inputs:
+  - name: question
+    seedOwed: true
+steps:
+  - name: gather
+    consumes: [question]
+    produces: ["gather.source[]"]
+  - name: check
+    consumes: ["gather.source[$i]"]
+    produces: ["gather.source[$i].verdict"]
+    parallel: 8
+  - name: synth
+    consumes: ["gather.source[*]"]
+    produces: [draft]

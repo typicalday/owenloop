@@ -1,0 +1,45 @@
+# Mode 1 compile-time include example.
+# Includes the delivery workflow under the 'deliver' prefix, maps its seedOwed
+# 'proposal' input to the outer 'proposal' artifact, and adds a teardown step
+# that consumes the inlined merge artifact as 'deliver.merge'.
+#
+# After expansion (one flat WorkflowDef):
+#   inputs: [proposal]
+#   steps: [provision, deliver.planner, deliver.builder, deliver.reviewer,
+#           deliver.merger, teardown]
+# The engine sees one graph; cascade crosses the seam for free.
+#
+# Load with:
+#   owenloop --defs examples/workflows defs
+
+name: full-cycle
+title: Provision + delivery + teardown (Mode 1 compile-time inline)
+description: |
+  Embeds the delivery workflow as a compile-time include.
+  One flat instance — no engine change.
+
+inputs:
+  - name: proposal
+    seedOwed: true
+
+outputs:
+  - torn_down
+
+steps:
+  - name: provision
+    consumes: [proposal]
+    produces: [environment]
+    body: |
+      Provision the environment for ${WORKFLOW}. Green `environment`.
+
+  - include: delivery
+    as: deliver
+    inputs:
+      proposal: proposal   # map child's seedOwed input to outer 'proposal'
+
+  - name: teardown
+    consumes: [environment, deliver.merge]
+    produces: [torn_down]
+    generates: [teardown_log]
+    body: |
+      Tear down the environment. Green `torn_down`.

@@ -1,0 +1,51 @@
+# Provision → deliver (via calls:) → teardown.
+#
+# Demonstrates the Mode 2 `calls:` grammar. The `deliver` step delegates to the
+# `delivery` workflow at runtime: the engine spawns a child `delivery` instance
+# and greens `delivered` from the child's terminal outcome (cascade-up).
+#
+# How it behaves:
+#   - Grammar: `calls: delivery` with `inputs:` wiring is parsed and validated.
+#   - `deliver` is excluded from eligibleFirings (machine-handled, not a worker step).
+#   - The `delivered` artifact is seeded as owed — a debt greened by the child outcome.
+#   - Cross-def calls: cycle check prevents delivery calling back to provisioned-delivery.
+#
+# Drive it:
+#   wf=$(owenloop create provisioned-delivery | jq -r .workflow)
+#   owenloop tick $wf   # -> orders: provision
+#   ...
+
+name: provisioned-delivery
+title: Provision → deliver (Mode 2 calls:) → teardown
+description: |
+  Parent workflow demonstrating the calls: grammar. At runtime the engine
+  spawns the child delivery instance and greens `delivered` from its outcome
+  (cascade-up).
+
+inputs:
+  - name: proposal
+    seedOwed: true
+
+steps:
+  - name: provision
+    consumes: [proposal]
+    produces: [sandbox]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Provision a sandbox environment for the proposal.
+      Green `sandbox` with the environment details.
+
+  - name: deliver
+    calls: delivery
+    inputs:
+      proposal: proposal
+    produces: [delivered]
+
+  - name: teardown
+    consumes: [delivered, sandbox]
+    produces: [torn_down]
+    terminal: true
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Tear down the sandbox environment.
+      Green `torn_down` to complete the workflow.

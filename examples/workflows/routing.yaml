@@ -1,0 +1,60 @@
+# Conditional-routing wiring — demonstrates skip + the skip-cascade (§16.1).
+#
+# A `triage` step routes a ticket down ONE of two branches. The firing rule fires
+# every eligible consumer (there is no "take one edge"), so BOTH `refund` and
+# `deny` become eligible once `route` is green — and the wiring settles the dead
+# branch by having its producer SKIP its own owed output. The engine then cascades
+# that skip down the dead subtree (`notify`'s `notice` auto-skips), so the whole
+# branch settles in one sweep and the workflow can reach `done` (a `skipped`
+# artifact is NOT a debt). The skip is level-triggered and reversible: re-judge
+# `route` and the skipped subtree re-arms.
+#
+# Drive it:
+#   wf=$(owenloop create routing --provide ticket='{"kind":"refund"}' | jq -r .workflow)
+#   owenloop tick $wf                                   # -> order for `triage`
+#   owenloop green $wf <run> route --value '{"branch":"refund"}'
+#   owenloop tick $wf                                   # -> orders for BOTH refund & deny
+#   owenloop green $wf <refund-run> refund_done --value '{"refunded":true}'
+#   owenloop skip  $wf denial --by deny --text "route=refund, deny branch is dead"
+#   owenloop status $wf                                 # done: notice auto-skipped
+
+name: routing
+title: Conditional routing
+description: A router picks a branch; the dead branch skips and the cascade settles its subtree.
+
+inputs:
+  - name: ticket
+    seedOwed: true
+
+steps:
+  - name: triage
+    consumes: [ticket]
+    produces: [route]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Decide which branch handles `ticket`. Green `route` with {"branch": "refund"} or
+      {"branch": "deny"} — the value is the system's own decision (§5-safe to store).
+
+  - name: refund
+    consumes: [route]
+    produces: [refund_done]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      If route.branch is "refund", process it and green `refund_done`. Otherwise the
+      refund branch is dead: `skip refund_done --by refund` so this branch settles.
+
+  - name: deny
+    consumes: [route]
+    produces: [denial]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      If route.branch is "deny", write the denial and green `denial`. Otherwise the
+      deny branch is dead: `skip denial --by deny`.
+
+  - name: notify
+    consumes: [denial]
+    produces: [notice]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Notify the customer of the `denial`. If `denial` was skipped (the refund branch
+      won), the engine auto-skips this whole branch — `notify` never runs.

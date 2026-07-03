@@ -1,0 +1,58 @@
+# Declarative exclusive produce-groups — demonstrates `group:` (§26).
+#
+# Same shape as `routing.yaml` (a `triage` step picks one of two branches), but
+# the exclusivity is declared, not hand-rolled: `triage`'s `produces:` carries a
+# `group:` naming `simple`/`urgent` as `exactlyOne`. Green whichever branch the
+# ticket takes and the engine — not the step body — refuses a second commit to
+# the sibling (`'group-rejected'`) and auto-skips it in the same cascade that
+# lands the winner. No `engine.skip()` call in either branch's own body.
+#
+# Drive it:
+#   wf=$(owenloop create routing-groups --provide ticket='{"kind":"urgent"}' | jq -r .workflow)
+#   owenloop tick $wf                                    # -> order for `triage`
+#   owenloop green $wf <run> urgent --value '{"escalated":true}'
+#   owenloop tick $wf                                    # -> order for handleUrgent only;
+#                                                         #    handleSimple's `simple` is already
+#                                                         #    auto-skipped, no order for it
+#   # a late/racing commit to the losing sibling is refused, not silently accepted:
+#   #   owenloop green $wf <run> simple --value '{}'     # -> {"outcome":"group-rejected", ...}
+#   owenloop green $wf <urgent-run> urgentDone --value '{"handled":true}'
+#   owenloop status $wf                                  # done: simple auto-skipped
+
+name: routing-groups
+title: Declarative exclusive routing
+description: A router picks one of two produces; group:/exactlyOne makes the engine enforce and auto-skip the loser (§26).
+
+inputs:
+  - name: ticket
+    seedOwed: true
+
+steps:
+  - name: triage
+    consumes: [ticket]
+    produces:
+      - simple
+      - urgent
+      - group: route
+        mode: exactlyOne     # exactlyOne | atMostOne | atLeastOne
+        of: [simple, urgent]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Decide which branch handles `ticket`. Green exactly one of `simple` or
+      `urgent` — the `route` group refuses any commit to the other one once
+      this one lands green, and auto-skips it. Don't call `skip` yourself;
+      the engine does it for you.
+
+  - name: handleSimple
+    consumes: [simple]
+    produces: [simpleDone]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Handle the simple ticket described by `simple` and green `simpleDone`.
+
+  - name: handleUrgent
+    consumes: [urgent]
+    produces: [urgentDone]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Handle the urgent ticket described by `urgent` and green `urgentDone`.

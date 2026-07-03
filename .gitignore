@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+/tmp/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.owenloop/
+coverage/
+
+# dev delivery-system scaffolding (local foreman state — not part of the library)
+.dev/*
+!.dev/checks.sh

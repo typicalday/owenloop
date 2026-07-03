@@ -1,0 +1,41 @@
+# Test-only fixture: a pipeline that pins the *shape* of its artifacts with JSON
+# Schema (design §18). The `spec` input, the `plan` singleton, and each `source[]`
+# collection element each carry a `schema:`; a produced value that violates it is
+# refused at commit (schema-rejected) rather than greened. `planner` and `gather`
+# set a low `maxSchemaFailures` so the §18 stall can be driven deterministically.
+name: schemacheck
+title: Schema-validated pipeline (test fixture)
+inputs:
+  - name: spec
+    schema:
+      type: object
+      required: [goal]
+      properties:
+        goal: { type: string, minLength: 1 }
+      additionalProperties: false
+steps:
+  - name: planner
+    consumes: [spec]
+    maxSchemaFailures: 2
+    produces:
+      - name: plan
+        schema:
+          type: object
+          required: [steps]
+          properties:
+            steps: { type: integer, minimum: 1 }
+          additionalProperties: false
+  - name: gather
+    consumes: [plan]
+    maxSchemaFailures: 2
+    produces:
+      - name: "source[]"
+        schema:
+          type: object
+          required: [url]
+          properties:
+            url: { type: string, minLength: 1 }
+          additionalProperties: false
+  - name: synth
+    consumes: ["source[*]"]
+    produces: [report]

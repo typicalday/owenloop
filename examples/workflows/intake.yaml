@@ -1,0 +1,94 @@
+# Schema-validated intake wiring — demonstrates JSON Schema validation (§18).
+#
+# Every artifact here pins its *shape* with a `schema:` (full JSON Schema draft
+# 2020-12). The engine refuses a produced value that violates its schema at
+# commit time: a `green` / `emit` / `provide` whose value is malformed is
+# *schema-rejected* (reject kind `validation`), NOT greened — the artifact stays
+# a debt, the violations ride its reason thread, and the worker can correct and
+# re-green on the same open run. Repeated schema failures past `maxSchemaFailures`
+# stall the producer the same way a §6 judgment stall does; `owenloop retry`
+# resets the counter and re-arms it. Shape is the engine's business; *meaning*
+# stays a consumer's `reject`.
+#
+# Drive it — every value below conforms; the commented one is refused on purpose:
+#   wf=$(owenloop create intake \
+#          --provide request='{"source":"https://example.com/feed","format":"json"}' | jq -r .workflow)
+#   owenloop tick  $wf                                     # -> order for `parse`
+#   owenloop green $wf <run> spec --value '{"endpoint":"https://example.com/feed","limit":50}'
+#   # a malformed value is schema-rejected, not greened (endpoint fails ^https?://):
+#   #   owenloop green $wf <run> spec --value '{"endpoint":"not-a-url"}'   # -> {"outcome":"schema-rejected", ...}
+#   owenloop tick  $wf                                     # -> order for `fetch` (collection)
+#   owenloop emit  $wf <run> --items '[{"id":"a1","title":"First"},{"id":"a2","title":"Second"}]'
+#   owenloop seal  $wf <run>                               # done emitting
+#   owenloop tick  $wf                                     # -> order for `index` (reduce)
+#   owenloop green $wf <run> report --value '{"count":2}'
+#   owenloop status $wf                                    # done
+
+name: intake
+title: Schema-validated intake
+description: Validate a request, derive a fetch spec, gather records, index them — every artifact schema-pinned (§18).
+
+inputs:
+  - name: request
+    seedOwed: true            # required: supply with --provide or `owenloop provide`
+    # the external request is refused unless it carries a URL source and a known
+    # format — a `provide`/`create` with a bad value exits non-zero (§18).
+    schema:
+      type: object
+      required: [source, format]
+      properties:
+        source: { type: string, pattern: "^https?://" }
+        format: { enum: [json, csv, rss] }
+      additionalProperties: false
+
+steps:
+  - name: parse
+    consumes: [request]
+    maxSchemaFailures: 3       # stall `spec` after 3 malformed commits (§18); `retry` clears it
+    produces:
+      # a produce entry may be a bare name (like the others) or a {name, schema}
+      # mapping that attaches the contract the engine enforces at commit time.
+      - name: spec
+        schema:
+          type: object
+          required: [endpoint]
+          properties:
+            endpoint: { type: string, pattern: "^https?://" }
+            limit: { type: integer, minimum: 1, maximum: 1000 }
+          additionalProperties: false
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Read `request` and produce a normalized fetch `spec` ({endpoint, limit?}).
+      A value that violates the schema is refused — fix it and re-green on this run.
+
+  - name: fetch
+    consumes: [spec]
+    maxSchemaFailures: 3
+    produces:
+      # a *collection*: every element you `emit` is validated against this schema.
+      # One malformed element refuses the whole emit atomically — nothing accretes.
+      - name: "fetch.record[]"
+        schema:
+          type: object
+          required: [id, title]
+          properties:
+            id: { type: string, minLength: 1 }
+            title: { type: string, minLength: 1 }
+          additionalProperties: false
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Fetch records per `spec`. `emit` each as a {id, title} element, then `seal`.
+
+  - name: index
+    consumes: ["fetch.record[*]"]   # REDUCE: once sealed + every member green
+    produces:
+      - name: report
+        schema:
+          type: object
+          required: [count]
+          properties:
+            count: { type: integer, minimum: 0 }
+          additionalProperties: false
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Reduce the gathered records into a `report` ({count}).

@@ -1,0 +1,162 @@
+# New-hire onboarding wiring — a long-running, pause/resume coordinator.
+#
+# A re-creation of Google's ADK "long-running agent that pauses, resumes, and
+# never loses context" onboarding example, expressed in owenloop's dataflow
+# model. The ADK version is a six-state machine (START → WELCOME_SENT →
+# DOCUMENTS_SIGNED → IT_PROVISIONED → HARDWARE_DELIVERED → COMPLETED) whose
+# whole point is the *idle time*: long dormant waits for a human signature and
+# for a shipping confirmation.
+#
+# owenloop needs no state column for that. Each external wait is just an
+# artifact *owed by an external producer* — a `seedOwed` input. The step that
+# consumes it sits as a debt ("dormant") and produces no orders until a webhook
+# fulfills the input with `owenloop provide`. That is the pause; the next `tick`
+# is the resume. Context never replays — the new-hire details live in the
+# `hire` artifact and every order carries its captured `consumes` (§ store).
+#
+# State-machine → dataflow mapping:
+#   START             → `hire` input (seedOwed, producer: human)
+#   WELCOME_SENT      → `send_welcome` step produces `welcome_packet`   (send_welcome_packet)
+#   DOCUMENTS_SIGNED  → `signed_documents` input (seedOwed, hr_portal webhook)
+#   IT_PROVISIONED    → `provision_it` step produces `it_accounts`      (the it_agent sub-agent)
+#   HARDWARE_DELIVERED→ `hardware_delivered` input (seedOwed, shipping webhook)
+#   COMPLETED         → `send_day_one` step produces `day_one_schedule` (terminal; send_day_one_schedule)
+#
+# The two pauses fall out of the wiring: `provision_it` cannot fire until both
+# the welcome went out AND `signed_documents` is provided; `confirm_hardware`
+# cannot fire until IT is set up AND `hardware_delivered` is provided. Until the
+# webhook arrives those steps are blocked debts that emit no work.
+#
+# Drive it (the worker step; webhooks are the two `provide` calls):
+#   wf=$(owenloop create onboarding \
+#          --provide hire='{"name":"Ada Lovelace","email":"ada@corp.com","start_date":"2026-07-01"}' \
+#          | jq -r .workflow)
+#   run=$(owenloop tick $wf | jq -r '.orders[0].run')              # -> order for `send_welcome`
+#   owenloop green $wf $run welcome_packet --value '{"sent":true,"packet_url":"https://hr/welcome/ada"}'
+#   owenloop status $wf            # `provision_it` is blocked: dormant, awaiting the signature webhook
+#
+#   # … hours/days later, the HR portal POSTs /webhooks/document_signed → the worker runs:
+#   owenloop provide $wf signed_documents --value '{"contract_id":"C-1029","signed_at":"2026-06-20"}'
+#   run=$(owenloop tick $wf | jq -r '.orders[0].run')              # -> order for `provision_it` (it_agent)
+#   owenloop green $wf $run it_accounts --value '{"email_provisioned":true,"laptop_ordered":true}'
+#   owenloop status $wf            # `confirm_hardware` is now the dormant debt
+#
+#   # … shipping POSTs the hardware-delivered webhook → the worker runs:
+#   owenloop provide $wf hardware_delivered --value '{"tracking":"1Z999","delivered_at":"2026-06-28"}'
+#   run=$(owenloop tick $wf | jq -r '.orders[0].run')              # -> order for `confirm_hardware`
+#   owenloop green $wf $run hardware_ready --value '{"asset_tag":"LT-4471","verified":true}'
+#   run=$(owenloop tick $wf | jq -r '.orders[0].run')              # -> order for `send_day_one`
+#   owenloop green $wf $run day_one_schedule --value '{"sent":true,"first_meeting":"09:30"}' --terminal
+#   owenloop status $wf            # done
+
+name: onboarding
+title: New-hire onboarding coordinator
+description: Send welcome → await signature → provision IT → await hardware → send day-one schedule, with long dormant pauses on the two external webhooks.
+
+inputs:
+  - name: hire                  # START — required to begin; supply at create
+    seedOwed: true
+    producer: human
+    schema:
+      type: object
+      required: [name, email, start_date]
+      properties:
+        name: { type: string, minLength: 1 }
+        email: { type: string, pattern: "^[^@]+@[^@]+$" }
+        start_date: { type: string }   # ISO date the hire begins
+      additionalProperties: false
+
+  - name: signed_documents      # DOCUMENTS_SIGNED — fulfilled by the /webhooks/document_signed call
+    seedOwed: true              # owed from the start; the worker `provide`s it when HR signals
+    producer: hr_portal
+    schema:
+      type: object
+      required: [contract_id, signed_at]
+      properties:
+        contract_id: { type: string, minLength: 1 }
+        signed_at: { type: string }
+      additionalProperties: false
+
+  - name: hardware_delivered    # HARDWARE_DELIVERED — fulfilled by the shipping webhook
+    seedOwed: true
+    producer: shipping
+    schema:
+      type: object
+      required: [tracking, delivered_at]
+      properties:
+        tracking: { type: string, minLength: 1 }
+        delivered_at: { type: string }
+      additionalProperties: false
+
+steps:
+  - name: send_welcome          # WELCOME_SENT — the send_welcome_packet tool
+    consumes: [hire]
+    produces:
+      - name: welcome_packet
+        schema:
+          type: object
+          required: [sent]
+          properties:
+            sent: { type: boolean }
+            packet_url: { type: string }
+          additionalProperties: false
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Read `hire` and dispatch the welcome packet + the documents that need
+      signing (send_welcome_packet). Green `welcome_packet` once sent. The flow
+      then goes dormant until the HR portal reports the documents signed.
+
+  - name: provision_it          # IT_PROVISIONED — the it_agent sub-agent
+    # Fires only once the welcome went out AND the signature webhook fulfilled
+    # `signed_documents`. Until then this step is a blocked, dormant debt — the
+    # ADK pause, with no polling and no replayed history.
+    consumes: [welcome_packet, signed_documents]
+    produces:
+      - name: it_accounts
+        schema:
+          type: object
+          required: [email_provisioned, laptop_ordered]
+          properties:
+            email_provisioned: { type: boolean }
+            laptop_ordered: { type: boolean }
+          additionalProperties: false
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Documents are signed. Delegate to the IT agent: create corporate accounts
+      and order the laptop. Green `it_accounts` with what was provisioned. The
+      flow then goes dormant until shipping confirms hardware delivery.
+
+  - name: confirm_hardware       # the check_hardware_delivery tool
+    # Waits on the second pause: IT done AND the hardware-delivered webhook.
+    consumes: [it_accounts, hardware_delivered]
+    produces:
+      - name: hardware_ready
+        schema:
+          type: object
+          required: [verified]
+          properties:
+            verified: { type: boolean }
+            asset_tag: { type: string }
+          additionalProperties: false
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Hardware is delivered. Verify the equipment arrived and is the right
+      machine (check_hardware_delivery). Green `hardware_ready` once verified.
+
+  - name: send_day_one           # COMPLETED — the send_day_one_schedule tool
+    consumes: [hardware_ready]
+    terminal: true               # finishing onboarding is a destructive completion
+    produces:
+      - name: day_one_schedule
+        schema:
+          type: object
+          required: [sent]
+          properties:
+            sent: { type: boolean }
+            first_meeting: { type: string }
+          additionalProperties: false
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Everything is in place. Send the personalized first-day schedule
+      (send_day_one_schedule) and green `day_one_schedule` (terminal) — onboarding
+      is complete.

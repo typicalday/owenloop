@@ -1,0 +1,58 @@
+# Research wiring — demonstrates collections (fan-out / fan-in, §11).
+#
+# `gather` produces a *collection* `gather.source[]` (emitting an unknown number
+# of sources, then sealing). `check` MAPS over each element (`gather.source[$i]`
+# -> a per-element `gather.source[$i].verdict`). `synth` REDUCES the whole
+# collection via a suffixed reduce (`gather.source[*].verdict`), eligible only
+# once the seal is green AND every surviving member's `.verdict` is green. A bad
+# source can be `retract`ed — it drops out of the reduce (member and `.verdict`
+# requirement both) without blocking it.
+#
+# Drive it:
+#   wf=$(owenloop create research --provide question='{"q":"why is the sky blue"}' | jq -r .workflow)
+#   owenloop tick $wf                                   # -> order for `gather`
+#   owenloop emit $wf <run> --items '[{"url":"a"},{"url":"b"}]'
+#   owenloop seal $wf <run>                             # done emitting
+#   owenloop tick $wf                                   # -> per-element `check` orders
+#   ...
+#   owenloop retract $wf 'gather.source[1]' --by human --text "paywalled"
+
+name: research
+title: Research synthesis
+description: Gather sources (collection), fact-check each (map), synthesize (reduce).
+
+inputs:
+  - name: question
+    seedOwed: true          # required: supply with --provide or `owenloop provide`
+
+steps:
+  - name: gather
+    consumes: [question]
+    produces: ["gather.source[]"]    # a collection: emit elements, then seal
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Find sources answering `question`. `emit` each as an element, then `seal`
+      the collection when you have enough.
+
+  - name: check
+    consumes: ["gather.source[$i]"]  # MAP: one run per element
+    produces: ["gather.source[$i].verdict"]
+    parallel: 8                       # fan out — check sources concurrently
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}, element ${INDEX}.
+      Fact-check this one source. Green its `.verdict` if it holds up, or
+      `retract gather.source[${INDEX}]` if the source is unusable — a retracted
+      element drops out of `synth`'s reduce entirely, member and `.verdict`
+      requirement together (not merely dropping out of a parallel race), and
+      cascades a re-draft if `synth` already ran.
+
+  - name: synth
+    # REDUCE: eligible once the collection is sealed and every *surviving*
+    # (non-retracted) member's `.verdict` is green. It gates on `check`'s
+    # verdicts, not the bare members — so it does NOT fire until every
+    # surviving source has actually been checked.
+    consumes: ["gather.source[*].verdict"]
+    produces: [draft]
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Synthesize the surviving sources into a `draft` answer.

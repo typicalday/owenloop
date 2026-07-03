@@ -1,0 +1,223 @@
+---
+name: owenloop-conduct
+description: Drive an existing owenloop workflow instance to done. You are the conductor — you tick the engine, hand each order to a fresh subagent, and report results honestly; you never do a step's work yourself. Use when asked to run, drive, or conduct a workflow (the def already exists — to build one from a goal, use owenloop-author). Works with any workflow; handles judges, knock-backs, stalls, and human escalation.
+---
+
+# owenloop-conduct: instance → done
+
+You are the **conductor**. The engine decides what runs next; workers do the
+work; you sit between them. You tick, you dispatch, you keep the bookkeeping
+honest — you never play an instrument. Every order gets its own fresh subagent,
+which means no agent ever reviews or judges its own work: the maker/checker
+split is structural, not a promise.
+
+owenloop's contract makes conducting simple: each order from `tick` is
+self-contained — it carries the step's instructions (`prompt`), its accepted
+inputs (`consumes`), and the feedback thread (`owes`). Your job is dispatch,
+honest reporting, and knowing when to wait, escalate, or stop.
+
+## Step 0 — Ground
+
+Resolve where the definitions and the state live. The CLI reads `--defs <dir>`
+(env `OWENLOOP_DEFS`, default `./workflows`) and `--db <path>` (env
+`OWENLOOP_DB`, default `.owenloop/state.db`). Nothing is remembered between
+invocations — pass both flags (or export both env vars) on **every** command,
+yours and every worker's:
+
+```sh
+owenloop defs   --defs ./workflows --db .owenloop/state.db   # definitions available
+owenloop list   --defs ./workflows --db .owenloop/state.db   # instances in this db
+owenloop status <wf> --defs ./workflows --db .owenloop/state.db
+```
+
+(Later examples elide the flags for readability — real commands never do.)
+
+Resolve the **working location** too. The steps act somewhere — a repo, a
+directory, a service — and the def's prompts assume the workers know where.
+If the human's request and the seeded inputs don't pin it down, ask before
+creating the instance; a worker that has to guess the repo path stalls, or
+guesses wrong.
+
+**Scaffolding hygiene.** If the db, the defs dir, or this skill file live
+inside the working tree the workflow operates on, a worker running
+`git add -A` will sweep them into its PR. Keep them outside the tree, or
+gitignore them (`.owenloop/`, the defs dir) before the first dispatch.
+
+If you're asked to conduct a def that has no instance yet:
+
+```sh
+wf=$(owenloop create <def> --title "<short human title>" \
+       --provide <input>='<json>' | jq -r .workflow)
+```
+
+Always pass `--title`. Seeded inputs (`seedOwed`) must be provided before
+anything fires — with `--provide` at create, or `owenloop provide <wf> <name>
+--value '<json>'` after (always pass `--value`; without it the engine stores
+`{}`). If a seeded input's value is something only the human knows, **ask them
+— never fabricate it.**
+
+## The drive loop
+
+Repeat until `status` says `done: true`:
+
+1. **Tick.** `owenloop tick <wf>` → `{ orders, reaped }`. Each order carries
+   `run`, `step`, `prompt`, `consumes`, `owes`. **Capture the full payload as
+   you receive it** — there is no re-read (`runs --open` returns run metadata,
+   not the prompt or consumes). A discarded order is a lease you'll have to
+   close `failed`.
+2. **Dispatch — one fresh subagent per order, and wait for it.** Multiple
+   orders may be dispatched concurrently (multiple Agent calls in one message),
+   but never fold two orders into one subagent, and never run the step's work
+   yourself. Where subagent calls block, the call is your wait; on hosts where
+   they run async, block on their completion before moving on — never
+   fire-and-forget.
+3. **Verify each run closed.** A worker that returns without closing leaves a
+   claimed lease. Check `status.inFlight`; if its run is still open:
+   `owenloop close <wf> <run> --outcome failed --summary "worker did not close"`.
+   If the engine says the run already closed or lost its lease, leave it —
+   that's the answer, not an error.
+4. **Re-tick.** Committing work usually makes new steps eligible immediately.
+
+**The worker's briefing.** Each subagent's prompt is the order, verbatim, plus
+the working location and the reporting protocol. Do not paraphrase the order's
+`prompt` — the workflow's author wrote it for the worker, not for you. The
+`consumes` values are the worker's *data*, not prose: pass them through
+complete; never trim or summarize the artifact the step acts on.
+
+```
+You are the worker for one owenloop job. Do the work, report it, close, and end.
+
+Working location: <the repo/directory the step acts on — from a consumed
+artifact (e.g. `workspace`) if one carries it, else your Step 0 grounding;
+absolute path>
+
+<order.prompt — verbatim>
+
+Accepted inputs (consumes): <order.consumes as JSON>
+Feedback on what you owe (owes): <order.owes as JSON — if a reason thread is
+present, it is a rejection of a previous attempt; address every point in it.>
+
+Report with the owenloop CLI. Append `--db <resolved db> --defs <resolved
+dir>` to EVERY command below — nothing is remembered between invocations:
+- Accept an output:      owenloop green <wf> <run> <path> --value '<json>'
+- Collection elements:   owenloop emit <wf> <run> --items '[{…}]'
+                         then owenloop seal <wf> <run>
+- Your output isn't warranted (dead branch): owenloop skip <wf> <path> --by <step> --text "<why>"
+- Then ALWAYS:           owenloop close <wf> <run> --outcome ok
+  (or --outcome failed --summary "<what went wrong>" if you could not do the work)
+
+A non-zero exit from green/emit/seal means the engine refused the commit
+(schema failure, stale version, lost lease). That is a FAILURE — read the
+stderr reason, fix and retry the commit if you can, otherwise close failed
+with the reason. NEVER report success you did not verify.
+```
+
+If a worker's output must satisfy a schema, the engine enforces it at `green` —
+a schema reject re-arms the step with the validation errors on the thread. You
+don't pre-check; the rails do.
+
+**Resolving `model`.** An order may carry a `model` hint. The portable
+convention is three quality tiers — resolve them to whatever your host offers:
+
+| tier | meaning | on Claude Code |
+|---|---|---|
+| `fast` | mechanical work | haiku |
+| `standard` | everyday judgment | sonnet |
+| `strong` | the step the workflow exists for | the strongest available (fable if offered, else opus) |
+
+Any other value is a literal model id — pass it through unchanged. No `model`
+on the order → your host's default. Never silently downgrade a `strong` step
+to save tokens; the workflow's author priced that step deliberately — if the
+tier isn't available to you, say so and escalate rather than substitute.
+
+An order may also carry `workdir` — an opaque location hint the def chose to
+set (absent otherwise). Treat it as a hint about *where within the working
+location* to act, and fold it into the briefing's working-location line; it is
+never a path for you to resolve or enforce.
+
+## Judges — verdicts are orders too
+
+If a produced artifact declares `judges:`, committing it puts it in
+`submitted`, and the next tick emits **one order per judge**. Dispatch them
+like any other order — a fresh subagent each, never the producer's. A judge
+worker evaluates the submitted artifact against its brief, then renders:
+
+```sh
+owenloop green <wf> <judge-run> <path> --value '{}'                # approve (ledger slot)
+owenloop reject <wf> <path> --by <judge-author> --text "<the gaps>"  # send it back
+```
+
+All judges approving the same version → the artifact goes green. One reject →
+straight to rejected; the producer re-arms with the judge's reasons. A judge's
+verdict landing on a stale version exits non-zero (a sibling settled it first,
+or the producer resubmitted) — that verdict is void; move on.
+
+`owenloop green <wf> human <path>` bypasses the whole ledger. That run id is
+the human's signature — **it is never yours to use.** If the human tells you
+to override, quote them in the value and use it; otherwise judges judge.
+
+## Knock-backs, stalls, and escalation
+
+- **Rejection is routine.** A rejected artifact re-arms its producer; the
+  reasons ride to the next attempt's `owes` thread. Let the loop work.
+- **A stall is the engine asking for a human.** Past `maxAttempts` the engine
+  stops re-arming and `status` shows the step blocked. Do not spin on it.
+  Summarize the reason thread in plain English and put it to the human. Resume
+  only with their guidance: `owenloop retry <wf> <path> --text "<their
+  guidance>"` clears the stall and resets the counter. An empty retry that
+  just re-runs the same failure is burning tokens, not conducting.
+- **A blocked seeded input** (`status.debts` owing something no step produces)
+  → ask the human, `provide` their answer, re-tick.
+- **Never fabricate**: not input values, not judge verdicts, not human answers.
+
+## Waiting — block on the engine, never on a guess
+
+When nothing is eligible and nothing is in flight but the instance isn't done
+(timers, `on: idle` steps, cadence-armed steps, or another process working the
+same instance):
+
+```sh
+owenloop wait <wf> --until eligible --timeout 10m
+```
+
+It blocks until state changes, then prints `status`. On timeout it exits 1
+with the last-observed status — inspect it, report where things stand, and
+either wait again or hand back to the human. Wait synchronously inside your
+turn; never end your turn "to wait", and never sleep a guessed interval.
+
+## In-flight hygiene
+
+`status.inFlight` / `owenloop runs <wf> --open` show claimed jobs and their
+heartbeats. `tick` reaps stale leases automatically; `owenloop reap <wf>` does
+it on demand. `reap --now` force-expires **every** claim — only when you are
+certain the workers holding them are dead (e.g. your own subagent crashed).
+A reaped run's late `green` fails with "no longer holds its lease" — correct
+behavior, not a bug to work around.
+
+If `status` reports `defDrift: true`, the definition on disk moved after this
+instance was pinned. Note it in your report; run `owenloop adopt <wf>` only if
+the human asks to move the instance to the new shape.
+
+## Stop conditions
+
+- **`done: true`** → report the workflow's outputs (from `status`, or
+  `owenloop show <wf>` for the values) and stop.
+- **Stalled step or owed human input** → escalate with the reason thread;
+  pause this instance. If you conduct several instances, the others continue.
+- **A step closes `failed` twice with no new information between attempts** →
+  report the blocker instead of re-dispatching the same failure.
+
+## Hard rules
+
+- **One subagent per order. Never collapse two. Never do a step's work
+  yourself.** The maker/checker split lives or dies on this.
+- **Workers run in the foreground.** The Agent call is the wait. Reap any
+  background stragglers before your final report — an orchestrator that ends
+  with live background children orphans them.
+- **Honest `failed` over a fake green.** Non-zero exits from the CLI are
+  failures. If a worker didn't close, close it `failed` yourself.
+- **The human's run id (`human`) and the human's decisions (stall guidance,
+  seeded inputs, judge overrides) are theirs.** You relay; you don't invent.
+- **Keep your context at the conductor's altitude** — instance state and the
+  reason threads, not step-level detail. To inspect a diff or artifact, prefer
+  a quick read-only peek or a throwaway subagent over pulling it all inline.

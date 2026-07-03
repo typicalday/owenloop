@@ -1,0 +1,18 @@
+# Test-only fixture: a fan-out map with a deliberately low concurrency cap, so the
+# §3 `parallel` limit on map firings can be observed directly. `spawn` emits an
+# arbitrary number of `item[]` elements; `work` maps over them but only `parallel`
+# element-firings may be in flight at once — so a single tick claims at most 2
+# `work` runs even when 5 elements are eligible.
+name: mapcap
+title: Map concurrency cap
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: spawn
+    consumes: [seed]
+    produces: ["item[]"]
+  - name: work
+    consumes: ["item[$i]"]
+    produces: ["item[$i].result"]
+    parallel: 2
