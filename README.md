@@ -122,7 +122,11 @@ This repo ships that muscle as agent skills:
 [`skills/owenloop-conduct`](skills/owenloop-conduct/SKILL.md) drives an instance to
 done (one fresh subagent per job, honest reporting, human escalation), and
 [`skills/owenloop-author`](skills/owenloop-author/SKILL.md) turns a goal into a
-validated workflow file.
+validated workflow file. One command installs them into your agent of choice:
+
+```sh
+npx skills add typicalday/owenloop
+```
 
 ## Quick start
 

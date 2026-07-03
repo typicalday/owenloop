@@ -1,6 +1,6 @@
 ---
 name: owenloop-author
-description: Build and run an owenloop workflow from a plain-English goal. Use when a human wants to turn a multi-step process — a research pipeline, content production, data processing, document review, an agent delivery loop — into a deterministic owenloop workflow. You interview them, compile the goal into a validated workflow def, present it back in plain English for approval, then drive the tick→work→report loop to a finished result. The human never has to read YAML. Two phases: COMPILE (interactive, with the human) and RUN (deterministic; a fresh session can just run a finished def).
+description: "Build and run an owenloop workflow from a plain-English goal. Use when a human wants to turn a multi-step process — a research pipeline, content production, data processing, document review, an agent delivery loop — into a deterministic owenloop workflow. You interview them, compile the goal into a validated workflow def, present it back in plain English for approval, then drive the tick→work→report loop to a finished result. The human never has to read YAML. Two phases: COMPILE (interactive, with the human) and RUN (deterministic; a fresh session can just run a finished def)."
 ---
 
 # owenloop-author: goal → workflow → run
