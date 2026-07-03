@@ -31,7 +31,7 @@ test('parseDef builds a valid def and fills defaults', () => {
   assert.equal(planner.cadenceSecs, 0);
   assert.equal(planner.parallel, 1);
   assert.equal(planner.maxAttempts, 3);
-  assert.equal(planner.workdir, 'main');
+  assert.equal(planner.workdir, undefined); // no default: absent unless the def sets it
   assert.deepEqual(planner.invalidates, ['proposal']); // defaults to consumed stems
   assert.equal(def.steps[3]!.terminal, true);
 });

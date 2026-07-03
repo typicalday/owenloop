@@ -150,7 +150,6 @@ const DEFAULTS = {
   parallel: 1,
   maxAttempts: 3,
   maxSchemaFailures: 5,
-  workdir: 'main',
 } as const;
 
 /**
@@ -807,7 +806,7 @@ export function parseDef(raw: unknown, source?: string, baseDir?: string): Workf
  * `consumes: [stem, ...(inputs ? producerConsumeStems : [])]` so authority
  * flows from the existing consume-edge check (`assertAuthority`) with no
  * special-casing. Everything else (cadence, maxRunsPerDay, model, body,
- * workdir, maxAttempts/maxSchemaFailures defaults) is inherited exactly like
+ * maxAttempts/maxSchemaFailures defaults) is inherited exactly like
  * an ordinary step, because judge orders flow through the normal
  * eligibleFirings → applySchedule → claim → buildOrder pipeline (§7.1).
  */
@@ -833,7 +832,6 @@ function synthesizeJudgeSteps(
       parallel: 1,
       maxAttempts: DEFAULTS.maxAttempts,
       maxSchemaFailures: DEFAULTS.maxSchemaFailures,
-      workdir: DEFAULTS.workdir,
       body: j.body,
     };
     if (j.model !== undefined) step.model = j.model;
@@ -882,7 +880,6 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
       parallel: 1,
       maxAttempts: 1,        // never worker-fired; 1 is a safe non-zero sentinel
       maxSchemaFailures: DEFAULTS.maxSchemaFailures,
-      workdir: DEFAULTS.workdir,
       body: '',              // machine-handled: no prompt body
     };
     return [step];
@@ -932,9 +929,9 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
     parallel: asNumber(rl.parallel, DEFAULTS.parallel, `step '${name}'.parallel`),
     maxAttempts: asNumber(rl.maxAttempts, DEFAULTS.maxAttempts, `step '${name}'.maxAttempts`),
     maxSchemaFailures: asNumber(rl.maxSchemaFailures, DEFAULTS.maxSchemaFailures, `step '${name}'.maxSchemaFailures`),
-    workdir: rl.workdir === undefined ? DEFAULTS.workdir : asString(rl.workdir, `step '${name}'.workdir`),
     body,
   };
+  if (rl.workdir !== undefined) step.workdir = asString(rl.workdir, `step '${name}'.workdir`);
   if (rl.model !== undefined) step.model = asString(rl.model, `step '${name}'.model`);
   if (rl.x !== undefined) step.x = asExtension(rl.x, `step '${name}'.x`);
   if (asBool(rl.terminal, false, `step '${name}'.terminal`)) step.terminal = true;

@@ -429,7 +429,7 @@ steps:
     cadence: "0s"              # min spacing between runs (e.g. "30m")
     maxRunsPerDay: 1000
     model: …                   # opaque hint passed through on the order
-    workdir: main              # opaque hint passed through on the order
+    workdir: …                 # opaque hint passed through on the order; omitted when unset
     x:                          # optional; opaque extension map, passed through
       anything: goes            #   untouched onto the order (Order.x); see §27.3
 ```
