@@ -90,6 +90,20 @@ If a worker's output must satisfy a schema, the engine enforces it at `green` �
 a schema reject re-arms the step with the validation errors on the thread. You
 don't pre-check; the rails do.
 
+**Resolving `model`.** An order may carry a `model` hint. The portable
+convention is three quality tiers — resolve them to whatever your host offers:
+
+| tier | meaning | on Claude Code |
+|---|---|---|
+| `fast` | mechanical work | haiku |
+| `standard` | everyday judgment | sonnet |
+| `strong` | the step the workflow exists for | the strongest available (opus/fable) |
+
+Any other value is a literal model id — pass it through unchanged. No `model`
+on the order → your host's default. Never silently downgrade a `strong` step
+to save tokens; the workflow's author priced that step deliberately — if the
+tier isn't available to you, say so and escalate rather than substitute.
+
 ## Judges — verdicts are orders too
 
 If a produced artifact declares `judges:`, committing it puts it in
