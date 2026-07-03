@@ -20,14 +20,28 @@ honest reporting, and knowing when to wait, escalate, or stop.
 
 Resolve where the definitions and the state live. The CLI reads `--defs <dir>`
 (env `OWENLOOP_DEFS`, default `./workflows`) and `--db <path>` (env
-`OWENLOOP_DB`, default `.owenloop/state.db`). Whatever you resolve here, pass
-the same values to every worker you spawn.
+`OWENLOOP_DB`, default `.owenloop/state.db`). Nothing is remembered between
+invocations — pass both flags (or export both env vars) on **every** command,
+yours and every worker's:
 
 ```sh
-owenloop defs                 # definitions available
-owenloop list                 # instances in this db
-owenloop status <wf>          # done / debts / eligible / blocked / inFlight
+owenloop defs   --defs ./workflows --db .owenloop/state.db   # definitions available
+owenloop list   --defs ./workflows --db .owenloop/state.db   # instances in this db
+owenloop status <wf> --defs ./workflows --db .owenloop/state.db
 ```
+
+(Later examples elide the flags for readability — real commands never do.)
+
+Resolve the **working location** too. The steps act somewhere — a repo, a
+directory, a service — and the def's prompts assume the workers know where.
+If the human's request and the seeded inputs don't pin it down, ask before
+creating the instance; a worker that has to guess the repo path stalls, or
+guesses wrong.
+
+**Scaffolding hygiene.** If the db, the defs dir, or this skill file live
+inside the working tree the workflow operates on, a worker running
+`git add -A` will sweep them into its PR. Keep them outside the tree, or
+gitignore them (`.owenloop/`, the defs dir) before the first dispatch.
 
 If you're asked to conduct a def that has no instance yet:
 
@@ -47,11 +61,16 @@ anything fires — with `--provide` at create, or `owenloop provide <wf> <name>
 Repeat until `status` says `done: true`:
 
 1. **Tick.** `owenloop tick <wf>` → `{ orders, reaped }`. Each order carries
-   `run`, `step`, `prompt`, `consumes`, `owes`.
-2. **Dispatch — one fresh subagent per order, in the foreground.** Multiple
+   `run`, `step`, `prompt`, `consumes`, `owes`. **Capture the full payload as
+   you receive it** — there is no re-read (`runs --open` returns run metadata,
+   not the prompt or consumes). A discarded order is a lease you'll have to
+   close `failed`.
+2. **Dispatch — one fresh subagent per order, and wait for it.** Multiple
    orders may be dispatched concurrently (multiple Agent calls in one message),
    but never fold two orders into one subagent, and never run the step's work
-   yourself. The foreground call *is* your wait.
+   yourself. Where subagent calls block, the call is your wait; on hosts where
+   they run async, block on their completion before moving on — never
+   fire-and-forget.
 3. **Verify each run closed.** A worker that returns without closing leaves a
    claimed lease. Check `status.inFlight`; if its run is still open:
    `owenloop close <wf> <run> --outcome failed --summary "worker did not close"`.
@@ -60,11 +79,17 @@ Repeat until `status` says `done: true`:
 4. **Re-tick.** Committing work usually makes new steps eligible immediately.
 
 **The worker's briefing.** Each subagent's prompt is the order, verbatim, plus
-the reporting protocol. Do not paraphrase the order's `prompt` — the workflow's
-author wrote it for the worker, not for you:
+the working location and the reporting protocol. Do not paraphrase the order's
+`prompt` — the workflow's author wrote it for the worker, not for you. The
+`consumes` values are the worker's *data*, not prose: pass them through
+complete; never trim or summarize the artifact the step acts on.
 
 ```
 You are the worker for one owenloop job. Do the work, report it, close, and end.
+
+Working location: <the repo/directory the step acts on — from a consumed
+artifact (e.g. `workspace`) if one carries it, else your Step 0 grounding;
+absolute path>
 
 <order.prompt — verbatim>
 
@@ -72,7 +97,8 @@ Accepted inputs (consumes): <order.consumes as JSON>
 Feedback on what you owe (owes): <order.owes as JSON — if a reason thread is
 present, it is a rejection of a previous attempt; address every point in it.>
 
-Report with the owenloop CLI (db: <resolved db>, defs: <resolved dir>):
+Report with the owenloop CLI. Append `--db <resolved db> --defs <resolved
+dir>` to EVERY command below — nothing is remembered between invocations:
 - Accept an output:      owenloop green <wf> <run> <path> --value '<json>'
 - Collection elements:   owenloop emit <wf> <run> --items '[{…}]'
                          then owenloop seal <wf> <run>
@@ -97,12 +123,17 @@ convention is three quality tiers — resolve them to whatever your host offers:
 |---|---|---|
 | `fast` | mechanical work | haiku |
 | `standard` | everyday judgment | sonnet |
-| `strong` | the step the workflow exists for | the strongest available (opus/fable) |
+| `strong` | the step the workflow exists for | the strongest available (fable if offered, else opus) |
 
 Any other value is a literal model id — pass it through unchanged. No `model`
 on the order → your host's default. Never silently downgrade a `strong` step
 to save tokens; the workflow's author priced that step deliberately — if the
 tier isn't available to you, say so and escalate rather than substitute.
+
+An order may also carry `workdir` — an opaque location hint the def chose to
+set (absent otherwise). Treat it as a hint about *where within the working
+location* to act, and fold it into the briefing's working-location line; it is
+never a path for you to resolve or enforce.
 
 ## Judges — verdicts are orders too
 
