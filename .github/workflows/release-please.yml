@@ -1,0 +1,26 @@
+name: release-please
+
+# Maintains CHANGELOG.md and package.json version via a standing release PR.
+# Merging that PR creates the GitHub release + tag, which triggers
+# npm-publish.yml to build and publish the package.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

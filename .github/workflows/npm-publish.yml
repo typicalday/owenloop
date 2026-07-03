@@ -1,0 +1,38 @@
+name: npm publish
+
+# Fires when release-please cuts a GitHub release (see release-please.yml).
+# Publishes to npm via trusted publishing (OIDC) -- no npm token secret.
+# Requires the npmjs.com package to have this repo + workflow file linked
+# under Package settings -> Trusted Publisher.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    if: startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs a recent npm CLI (bundled with Node 22 on
+      # setup-node is new enough, but pin explicitly for clarity/stability).
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+
+      - run: npm run check
+
+      - run: npm publish --provenance --access public
