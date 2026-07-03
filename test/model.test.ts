@@ -650,7 +650,6 @@ function callsStep(name: string, callsTarget: string, produceStem: string): impo
     parallel: 1,
     maxAttempts: 1,
     maxSchemaFailures: 5,
-    workdir: 'main',
     body: '',
   };
 }

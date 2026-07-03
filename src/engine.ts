@@ -57,7 +57,7 @@ export interface Order {
   index?: number;
   inputs: string[];
   outputs: string[];
-  workdir: string;
+  workdir?: string;
   model?: string;
   /** §27.3: the step's opaque `x:` extension map, carried through untouched
    *  (same pass-through contract as `model`). The engine never reads it —
@@ -664,7 +664,6 @@ export class Engine {
       key: f.key,
       inputs: f.inputs,
       outputs: f.outputs,
-      workdir: step.workdir,
       prompt: substitute(step.body, {
         WORKFLOW: workflow,
         RUN: runId,
@@ -677,6 +676,7 @@ export class Engine {
       owes,
     };
     if (f.index !== undefined) order.index = f.index;
+    if (step.workdir !== undefined) order.workdir = step.workdir;
     if (step.model !== undefined) order.model = step.model;
     if (step.x !== undefined) order.x = step.x;
     if (f.cause !== undefined) order.cause = f.cause;

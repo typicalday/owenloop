@@ -54,7 +54,7 @@ export function step(spec: StepSpec): StepDef {
     ...(spec.reapTtlMs !== undefined ? { reapTtlMs: spec.reapTtlMs } : {}),
     ...(spec.groups !== undefined ? { groups: spec.groups } : {}),
     ...(spec.x !== undefined ? { x: spec.x } : {}),
-    workdir: spec.workdir ?? 'main',
+    ...(spec.workdir !== undefined ? { workdir: spec.workdir } : {}),
     body: spec.body ?? `run ${spec.name}`,
   };
 }

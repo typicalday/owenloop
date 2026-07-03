@@ -256,7 +256,8 @@ export interface StepDef {
   /** §19: how many schema-validation failures an output may accrue before it stalls */
   maxSchemaFailures: number;
   model?: string;
-  workdir: string;
+  /** opaque location hint passed through on the order; no default — absent unless the def sets it */
+  workdir?: string;
   /** the step's output is a destructive completion (e.g. a merge): green is terminal (§15.2) */
   terminal?: boolean;
   /** Step-level effect contract (§6.5). Only consulted for non-terminal greens whose inputs move. */
