@@ -428,11 +428,31 @@ steps:
     invalidates: [plan]        # which input stems this step may invalidate
     cadence: "0s"              # min spacing between runs (e.g. "30m")
     maxRunsPerDay: 1000
-    model: …                   # opaque hint passed through on the order
+    model: standard            # quality tier (fast | standard | strong) or a
+                               #   literal model id — opaque to the engine,
+                               #   passed through on the order (see below)
     workdir: …                 # opaque hint passed through on the order; omitted when unset
     x:                          # optional; opaque extension map, passed through
       anything: goes            #   untouched onto the order (Order.x); see §27.3
 ```
+
+### `model:` — quality tiers, not vendor ids
+
+The engine never calls a model; `model:` is an opaque string that rides the
+order to whatever dispatches your workers (an agent skill, a runner, your own
+loop). Portable workflows should declare **intent** with one of three tier
+names and let the dispatcher bind them to the host it runs on — Claude Code,
+Codex, Gemini CLI, whatever:
+
+- `fast` — mechanical work: grounded reading, extraction, formatting
+- `standard` — everyday judgment: routing, merging, most judges
+- `strong` — the expensive step the workflow exists for: synthesis, final
+  artifacts, high-stakes judges
+
+A value that isn't one of the three tiers should be passed through verbatim as
+a literal model id. Pin an exact model when you need reproducibility — just
+know the def is now host-specific, on purpose. Omit `model:` entirely and the
+dispatcher uses its default.
 
 ### `produces:` vs `generates:`
 
@@ -467,7 +487,7 @@ steps:
           - name: rigor
             bodyFile: judges/rigor.md # or a prompt loaded from disk —
                                       # body/bodyFile mutually exclusive
-            model: claude-opus-4-8    # optional, per-judge model
+            model: strong             # optional, per-judge model tier
             inputs: true              # optional, default false — judge also
                                       # reads the producer's inputs (question)
     maxAttempts: 5    # producer's cap — also bounds judge-reject → rebuild loops

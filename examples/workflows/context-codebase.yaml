@@ -3,11 +3,11 @@
 # The shape: cheap models harvest and distill context so the expensive solver
 # reads a tight, verified brief instead of exploring raw. Four stages:
 #
-#   scout (sonnet)    consumes task, emits `scout.lead[]` — WHERE to look
-#   harvest (haiku)   MAP over leads, one cheap reader per lead -> `.finding`
-#   distill (sonnet)  REDUCE all findings -> `brief`, judged for grounding
+#   scout (standard)  consumes task, emits `scout.lead[]` — WHERE to look
+#   harvest (fast)    MAP over leads, one cheap reader per lead -> `.finding`
+#   distill (standard) REDUCE all findings -> `brief`, judged for grounding
 #                     and leanness before it counts as green
-#   solve (fable)     consumes the brief; the only expensive step
+#   solve (strong)    consumes the brief; the only expensive step
 #
 # Two idioms beyond research.yaml / improve.yaml:
 #
@@ -74,7 +74,7 @@ steps:
             why: { type: string, minLength: 1 }      # what this lead should answer for the task
             kind: { enum: [code, docs, config, history, tests] }
           additionalProperties: false
-    model: claude-sonnet-5     # needs judgment about WHERE to look; not worth fable
+    model: standard            # needs judgment about WHERE to look; not worth the strong tier
     maxAttempts: 3
     body: |
       Workflow ${WORKFLOW}, run ${RUN}.
@@ -122,7 +122,7 @@ steps:
                 dirty: { type: boolean }
               additionalProperties: false
           additionalProperties: false
-    model: claude-haiku-4-5-20251001   # mechanical grounded reading — the cheap tier's home turf
+    model: fast                # mechanical grounded reading — the cheap tier's home turf
     parallel: 8
     maxAttempts: 3
     body: |
@@ -198,12 +198,12 @@ steps:
         judges:
           - name: grounded
             bodyFile: judges/grounded.md
-            model: claude-haiku-4-5-20251001
+            model: fast
             inputs: true               # reads the findings to check claims against sources
           - name: lean
             bodyFile: judges/lean.md
-            model: claude-haiku-4-5-20251001
-    model: claude-sonnet-5     # judgment about relevance and merging; the pivotal cheap step
+            model: fast
+    model: standard            # judgment about relevance and merging; the pivotal cheap step
     maxAttempts: 6             # absorbs BOTH judge rejects and solver knock-backs — budget for a few rounds of each
     body: |
       Workflow ${WORKFLOW}, run ${RUN}.
@@ -224,7 +224,7 @@ steps:
   - name: solve
     consumes: [task, brief]    # consuming `brief` grants reject authority over it (§4.1)
     produces: [solution]
-    model: claude-fable-5      # the ONLY expensive step — everything upstream exists to keep this context small
+    model: strong              # the ONLY expensive step — everything upstream exists to keep this context small
     maxAttempts: 3
     body: |
       Workflow ${WORKFLOW}, run ${RUN}.
