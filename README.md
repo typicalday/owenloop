@@ -1,7 +1,7 @@
 # owenloop
 
 [![CI](https://github.com/typicalday/owenloop/actions/workflows/ci.yml/badge.svg)](https://github.com/typicalday/owenloop/actions/workflows/ci.yml)
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 **owenloop runs multi-step agent workflows.** You describe a pipeline of steps in
 a YAML file — usually one AI agent per step — and owenloop works out what's ready
@@ -779,7 +779,7 @@ open job, repeated failures trip the stall and a `retry` clears it.
 
 ## Design reference
 
-owenloop is a faithful, decoupled implementation of an internal dataflow-engine spec.
+owenloop is a faithful, decoupled implementation of a dataflow-engine spec.
 [`docs/design.md`](docs/design.md) is a self-contained walkthrough — the lifecycle,
 firing rule, forward cascade, the reject kinds, the liveness rules, and the concurrency
 model — cross-referenced from the source.
@@ -788,20 +788,16 @@ model — cross-referenced from the source.
 
 ## License
 
-[GNU AGPLv3](LICENSE) © Typical Day.
+[Apache-2.0](LICENSE) © Typical Day LLC.
 
-You may use, modify, self-host, and redistribute owenloop under the terms of the
-AGPLv3. If you modify owenloop and make it available to users over a network, you
-must provide the corresponding source for the modified work.
-
-A **commercial license** is available for organizations that want to use owenloop in
-proprietary products or closed-source/network services without AGPLv3 obligations —
-contact Typical Day.
+owenloop is permissively licensed — use, modify, self-host, and redistribute
+it, including in proprietary or closed-source products, under the terms of
+the Apache License 2.0.
 
 ## Contributing
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Note that
 owenloop requires every contributor to sign a **Contributor License Agreement**
-that assigns copyright in contributions to Typical Day LLC, so the project can be
-dual-licensed (AGPLv3 + commercial). The process is a one-time comment on your
-first pull request.
+that assigns copyright in contributions to Typical Day LLC, so the project can
+be maintained — and relicensed in the future if ever needed — under one clear
+owner. The process is a one-time comment on your first pull request.

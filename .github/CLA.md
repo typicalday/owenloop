@@ -6,8 +6,8 @@ Thank you for your interest in contributing to **owenloop**, a project owned by
 **Typical Day LLC** ("we", "us", or "Typical Day"). This Contributor License
 Agreement ("Agreement") sets out the terms under which you contribute. It exists
 so that Typical Day is the sole owner of the project's copyright and can license
-the project as it sees fit — including under the GNU Affero General Public License
-v3.0, under separate commercial licenses, or under any future license.
+the project as it sees fit — including under the Apache License 2.0, under
+other open-source or commercial licenses, or under any future license.
 
 By signing this Agreement (including electronically, e.g. by commenting on a pull
 request in the manner our automated tooling instructs), you accept and agree to

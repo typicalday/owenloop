@@ -37,6 +37,6 @@ First public release.
 - The package ships compiled JavaScript plus type declarations (`dist/`); it does
   not ship TypeScript source, because Node cannot type-strip files under
   `node_modules`.
-- Licensed under **AGPL-3.0-only**.
+- Licensed under **Apache-2.0**.
 
 [0.1.0]: https://github.com/typicalday/owenloop/releases/tag/v0.1.0

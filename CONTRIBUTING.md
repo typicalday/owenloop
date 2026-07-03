@@ -5,11 +5,11 @@ there's one required step: signing our Contributor License Agreement.
 
 ## Contributor License Agreement (required)
 
-owenloop is owned by **Typical Day LLC**. The project is released under the
-[GNU AGPLv3](LICENSE), and a separate commercial license is offered to
-organizations that don't want AGPLv3 obligations. To keep this dual-licensing
-possible — and to keep ownership of the codebase clear and in one place — Typical
-Day must be the sole owner of the project's copyright.
+owenloop is owned by **Typical Day LLC** and released under the
+[Apache License 2.0](LICENSE). To keep ownership of the codebase clear and
+in one place — and to preserve the ability to steward or relicense the
+project in the future if ever needed — Typical Day must be the sole owner
+of the project's copyright.
 
 So we ask every contributor to sign a **Contributor License Agreement (CLA)** that
 **assigns copyright** in your contributions to Typical Day LLC. In plain terms:
@@ -17,8 +17,8 @@ So we ask every contributor to sign a **Contributor License Agreement (CLA)** th
 - You **transfer ownership** of the code you contribute to Typical Day LLC.
 - You get a **license back** to keep using your own contributions for anything you
   like.
-- Typical Day can license and **relicense** owenloop — AGPLv3, commercial, or
-  otherwise — without needing to track down every contributor.
+- Typical Day can license and **relicense** owenloop without needing to
+  track down every contributor.
 
 This is a deliberate choice. If assigning copyright isn't something you're willing
 to do, that's completely fine — but we won't be able to merge the contribution.

@@ -2,7 +2,7 @@
   "name": "owenloop",
   "version": "0.1.0",
   "description": "A debt-driven dataflow engine for AI agent workflows. Steps fire on what they owe, not a status; the graph stays honest with its live inputs and knows when to stop — deterministic rails for your agents (yes, your Ralph loop too). Embedded node:sqlite, zero infrastructure.",
-  "license": "AGPL-3.0-only",
+  "license": "Apache-2.0",
   "author": "typicalday",
   "type": "module",
   "repository": {
