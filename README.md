@@ -160,6 +160,9 @@ import { createEngine } from 'owenloop';   // see "Embedding it" below
 
 The [`examples/workflows`](examples/workflows) folder has a workflow per idea:
 [`delivery`](examples/workflows/delivery.yaml) (a review knock-back loop),
+[`ship`](examples/workflows/ship.yaml) (delivery grown up: the full production
+line with provisioned workspaces, an adversarial reviewer, a doc pass, and
+teardown owned as a step),
 [`research`](examples/workflows/research.yaml) (collections),
 [`routing`](examples/workflows/routing.yaml) (skip a dead branch),
 [`intake`](examples/workflows/intake.yaml) (schema validation),
