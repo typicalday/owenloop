@@ -45,3 +45,13 @@ jobs:
 
           # Accounts that never need to sign: the owner's GitHub accounts and bots.
           allowlist: 'alexattd,nullbtb,dependabot[bot],*[bot]'
+
+          # Do not lock the PR conversation after merge (action default: true).
+          # release-please fires on the same merge push and posts an "included
+          # in vX.Y.Z" comment on this PR; if the conversation is locked that
+          # comment fails ("Unable to create comment because issue is locked"),
+          # which turns into a red X on the release workflow. This setting
+          # only affects the post-merge lock — CLA signing/enforcement itself
+          # (comment-based signing, signature storage on cla-signatures) is
+          # unchanged.
+          lock-pullrequest-aftermerge: false
