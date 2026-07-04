@@ -34,11 +34,13 @@ steps:
   - name: planner
     consumes: [proposal]       # plain | map (src[$i]) | reduce (src[*])
     produces:                  # singleton | collection (src[]) | map (src[$i].x)
-      - name: plan             # a produce can be a bare name, or {name, schema}:
+      - name: plan             # a produce can be a bare name, or {name, schema, ...}:
         schema:                #   a green/emit whose value fails this is refused
           type: object
           required: [plan]
           properties: { plan: { type: string } }
+        # maxAttempts: 2       # optional; overrides the step's maxAttempts (below)
+        # maxSchemaFailures: 1 #   just for this produce — see design.md §6
     body: |                    # the prompt; ${WORKFLOW} ${RUN} ${INDEX} are filled in
       Read the proposal and produce a `plan`.
     bodyFile: path/to.md       # load body from a file, relative to this workflow's dir; mutually exclusive with body
@@ -48,8 +50,10 @@ steps:
       - report[]               #   identical to produces:.
 
     # all optional, with defaults:
-    maxAttempts: 3             # reject cap before the output stalls
-    maxSchemaFailures: 5       # schema-reject cap before the output stalls; 0 = off
+    maxAttempts: 3             # reject cap before the output stalls — default for
+                               #   every produce on this step; a produce can override
+    maxSchemaFailures: 5       # schema-reject cap before the output stalls; 0 = off —
+                               #   same per-produce override rule as maxAttempts
     parallel: 1                # max concurrent runs (raise it to fan out a map)
     terminal: false            # true → a green output is a final result, never
                                #        re-armed by the cascade
@@ -133,7 +137,9 @@ steps:
             model: strong             # optional, per-judge model tier
             inputs: true              # optional, default false — judge also
                                       # reads the producer's inputs (question)
-    maxAttempts: 5    # producer's cap — also bounds judge-reject → rebuild loops
+    maxAttempts: 5    # producer's cap (default for every produce on this step)
+                      # — also bounds judge-reject → rebuild loops; `report`
+                      # above could set its own maxAttempts: to override it
 ```
 
 Each judge is a real step under the hood — it fires its own worker order

@@ -717,3 +717,85 @@ test('workflow is not done while calls: output is owed', () => {
   assert.equal(status.done, false, 'workflow must not be done while calls: output is owed');
   assert.ok(status.debts.length > 0, 'workflow must have debts while calls: output is owed');
 });
+
+// ---- per-produce maxAttempts/maxSchemaFailures override -----------------------
+
+test('per-produce maxAttempts override stalls that produce independently of a sibling produce on the same step', () => {
+  const s = step({ name: 'builder', consumes: ['plan'], produces: ['pr', 'consultRequest'], maxAttempts: 5 });
+  // Override consultRequest's cap down to 2; leave pr on the step default (5).
+  s.produces[1]!.maxAttempts = 2;
+  const d = def('wf', [input('plan')], [s]);
+  const artMap = arts([
+    { path: 'plan', acceptance: 'green', version: 1 },
+    { path: 'pr', producer: 'builder', acceptance: 'rejected', version: 1, judgmentRejects: 2 },
+    { path: 'consultRequest', producer: 'builder', acceptance: 'rejected', version: 1, judgmentRejects: 2 },
+  ]);
+  const status = workflowStatus(d, artMap);
+  const pr = status.debts.find((x) => x.path === 'pr');
+  const consultRequest = status.debts.find((x) => x.path === 'consultRequest');
+  assert.equal(pr!.stalled, false, 'pr has 2 rejects but step default cap is 5 — must not be stalled');
+  assert.equal(
+    consultRequest!.stalled,
+    true,
+    'consultRequest has 2 rejects and an override cap of 2 — must be stalled',
+  );
+});
+
+test('per-produce maxAttempts: omitting the override reproduces today\'s behavior exactly (both stall at step cap)', () => {
+  // Mirrors graph.test.ts's "Use maxAttempts=1 so one reject immediately stalls" precedent,
+  // just at workflowStatus granularity with two sibling produces, neither overridden.
+  const s = step({ name: 'builder', consumes: ['plan'], produces: ['pr', 'consultRequest'], maxAttempts: 1 });
+  const d = def('wf', [input('plan')], [s]);
+  const artMap = arts([
+    { path: 'plan', acceptance: 'green', version: 1 },
+    { path: 'pr', producer: 'builder', acceptance: 'rejected', version: 1, judgmentRejects: 1 },
+    { path: 'consultRequest', producer: 'builder', acceptance: 'rejected', version: 1, judgmentRejects: 1 },
+  ]);
+  const status = workflowStatus(d, artMap);
+  const pr = status.debts.find((x) => x.path === 'pr');
+  const consultRequest = status.debts.find((x) => x.path === 'consultRequest');
+  assert.equal(pr!.stalled, true, 'pr must stall at the step default cap when not overridden');
+  assert.equal(consultRequest!.stalled, true, 'consultRequest must stall at the step default cap when not overridden');
+});
+
+test('per-produce maxSchemaFailures override stalls that produce independently of a sibling produce on the same step', () => {
+  const s = step({ name: 'builder', consumes: ['plan'], produces: ['pr', 'consultRequest'], maxSchemaFailures: 5 });
+  // Override consultRequest's schema cap down to 2; leave pr on the step default (5).
+  s.produces[1]!.maxSchemaFailures = 2;
+  const d = def('wf', [input('plan')], [s]);
+  const artMap = arts([
+    { path: 'plan', acceptance: 'green', version: 1 },
+    { path: 'pr', producer: 'builder', acceptance: 'rejected', version: 1, schemaRejects: 2 },
+    { path: 'consultRequest', producer: 'builder', acceptance: 'rejected', version: 1, schemaRejects: 2 },
+  ]);
+  const status = workflowStatus(d, artMap);
+  const pr = status.debts.find((x) => x.path === 'pr');
+  const consultRequest = status.debts.find((x) => x.path === 'consultRequest');
+  assert.equal(pr!.stalled, false, 'pr has 2 schema rejects but step default cap is 5 — must not be stalled');
+  assert.equal(
+    consultRequest!.stalled,
+    true,
+    'consultRequest has 2 schema rejects and an override cap of 2 — must be stalled',
+  );
+});
+
+test('per-produce maxSchemaFailures: 0 override disables the schema stall even when the step default is nonzero', () => {
+  const s = step({ name: 'builder', consumes: ['plan'], produces: ['pr', 'consultRequest'], maxSchemaFailures: 3 });
+  // Override consultRequest's schema cap to 0 — disables the schema stall for it specifically.
+  s.produces[1]!.maxSchemaFailures = 0;
+  const d = def('wf', [input('plan')], [s]);
+  const artMap = arts([
+    { path: 'plan', acceptance: 'green', version: 1 },
+    { path: 'pr', producer: 'builder', acceptance: 'rejected', version: 1, schemaRejects: 3 },
+    { path: 'consultRequest', producer: 'builder', acceptance: 'rejected', version: 1, schemaRejects: 100 },
+  ]);
+  const status = workflowStatus(d, artMap);
+  const pr = status.debts.find((x) => x.path === 'pr');
+  const consultRequest = status.debts.find((x) => x.path === 'consultRequest');
+  assert.equal(pr!.stalled, true, 'pr must stall at the step default cap of 3');
+  assert.equal(
+    consultRequest!.stalled,
+    false,
+    'consultRequest has an explicit maxSchemaFailures: 0 override — schema stall must stay disabled regardless of reject count',
+  );
+});

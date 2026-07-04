@@ -159,6 +159,49 @@ test('buildGraph overlay: stalled artifact sets node.stalled = true and state = 
   store.close();
 });
 
+test('buildGraph overlay: per-produce maxAttempts override stalls only that artifact within a shared node', () => {
+  const store = new Store(':memory:');
+  // Step default maxAttempts=5; override 'consultRequest' down to 2. 'pr' stays on the default.
+  const s = step({
+    name: 'worker',
+    consumes: ['seed'],
+    produces: ['pr', 'consultRequest'],
+    maxAttempts: 5,
+  });
+  s.produces[1]!.maxAttempts = 2;
+  const d = def('small', [input('seed')], [s]);
+  const engine = new Engine(store, () => d);
+  const wf = engine.createInstance('small', { provide: { seed: {} } });
+
+  // Worker fires once, produces both outputs.
+  const tick = engine.tick(wf);
+  const order = tick.orders[0]!;
+  engine.green(wf, order.run, 'pr', { v: 1 });
+  engine.green(wf, order.run, 'consultRequest', { v: 1 });
+  engine.close(wf, order.run, 'ok');
+
+  // Reject both twice — enough to stall consultRequest (cap 2) but not pr (cap 5).
+  engine.reject(wf, 'pr', 'human', 'reject 1');
+  engine.reject(wf, 'consultRequest', 'human', 'reject 1');
+  let next = engine.tick(wf).orders[0]!;
+  engine.green(wf, next.run, 'pr', { v: 2 });
+  engine.green(wf, next.run, 'consultRequest', { v: 2 });
+  engine.close(wf, next.run, 'ok');
+  engine.reject(wf, 'pr', 'human', 'reject 2');
+  engine.reject(wf, 'consultRequest', 'human', 'reject 2');
+
+  const artifacts = store.listArtifacts(wf);
+  const g = buildGraph(d, artifacts);
+
+  const workerNode = g.nodes.find((n) => n.id === 'worker');
+  // The node aggregates both artifacts; since consultRequest is stalled, the node must
+  // surface stalled overall (worst-state), proving the per-artifact loop picked up the override.
+  assert.equal(workerNode!.stalled, true, 'node must report stalled since consultRequest (cap 2) has stalled');
+  assert.equal(workerNode!.state, 'stalled');
+
+  store.close();
+});
+
 // ---- determinism -------------------------------------------------------------
 
 test('buildGraph + renderers are deterministic (calling twice yields identical output)', () => {

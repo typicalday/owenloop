@@ -161,7 +161,10 @@ export function isGreen(a: ArtifactData | undefined): boolean {
  * the stall (`retry` resets the count, or `retract` drops a collection member).
  * Only *judgment* rejects count toward `judgmentRejects` (structural cascade /
  * born-rejected / level-trigger churn never bump it), so this bounds genuine
- * verdict-thrash without tripping on bookkeeping (§11.9).
+ * verdict-thrash without tripping on bookkeeping (§11.9). `cap` is resolved by
+ * the caller from the artifact's owning produce override, falling back to the
+ * step default — see `effectiveMaxAttempts()`. This function itself is
+ * agnostic to where `cap` came from.
  */
 export function isStalled(a: ArtifactData | undefined, cap: number): boolean {
   return !!a && a.acceptance === 'rejected' && a.judgmentRejects >= cap;
@@ -173,6 +176,9 @@ export function isStalled(a: ArtifactData | undefined, cap: number): boolean {
  * refusing a malformed value, not a consumer's verdict — so the two stalls are
  * tuned independently (`maxSchemaFailures` vs `maxAttempts`) and a `retry`
  * clears both. A `cap` of 0 disables the schema stall (unbounded retries).
+ * `cap` is resolved by the caller from the artifact's owning produce override,
+ * falling back to the step default — see `effectiveMaxSchemaFailures()`. This
+ * function itself is agnostic to where `cap` came from.
  */
 export function isSchemaStalled(a: ArtifactData | undefined, cap: number): boolean {
   return !!a && cap > 0 && a.acceptance === 'rejected' && a.schemaRejects >= cap;
@@ -188,9 +194,50 @@ export function isHeld(a: ArtifactData | undefined): boolean {
   return a.reasons.length > 0 && a.reasons[a.reasons.length - 1]!.kind === 'invalidated-irreversible';
 }
 
+/** Resolve the effective maxAttempts for a specific produce, falling back to
+ *  the owning step's default (§6). `produce` may be undefined if the artifact
+ *  couldn't be matched to a produce pattern (defensive; should not happen for
+ *  a well-formed def) — falls back to the step value in that case too. */
+function effectiveMaxAttempts(step: StepDef, produce: ProducePattern | undefined): number {
+  return produce?.maxAttempts ?? step.maxAttempts;
+}
+/** Resolve the effective maxSchemaFailures for a specific produce, falling
+ *  back to the owning step's default (§18). Same fallback rule as
+ *  effectiveMaxAttempts. */
+function effectiveMaxSchemaFailures(step: StepDef, produce: ProducePattern | undefined): number {
+  return produce?.maxSchemaFailures ?? step.maxSchemaFailures;
+}
+
+/** The produce pattern on `step` that owns artifact `path` (by stem/suffix
+ *  match), or undefined if none matches (should not happen for a
+ *  well-formed def — defensive fallback only). Singleton/collection
+ *  produces match by exact stem; map produces match a parsed element's
+ *  stem+suffix (mirrors matchConsume's map branch); collection members
+ *  match via isMemberOf. Group declarations never appear in step.produces
+ *  (they live in step.groups), so no special case is needed for them. */
+function produceOwning(step: StepDef, path: string): ProducePattern | undefined {
+  for (const p of step.produces) {
+    if (p.kind === 'map') {
+      const el = parseElement(path);
+      if (el && el.stem === p.stem && el.suffix === p.suffix) return p;
+      continue;
+    }
+    if (p.kind === 'collection' && isMemberOf(p.stem, path)) return p;
+    // singleton: p.stem is the bare artifact path.
+    if (p.stem === path) return p;
+  }
+  return undefined;
+}
+
 /** An artifact is frozen (no firing re-arms it) when either stall trips or it is held. */
 function frozen(a: ArtifactData | undefined, step: StepDef): boolean {
-  return isStalled(a, step.maxAttempts) || isSchemaStalled(a, step.maxSchemaFailures) || isHeld(a);
+  if (!a) return false;
+  const produce = produceOwning(step, a.path);
+  return (
+    isStalled(a, effectiveMaxAttempts(step, produce)) ||
+    isSchemaStalled(a, effectiveMaxSchemaFailures(step, produce)) ||
+    isHeld(a)
+  );
 }
 
 /** Resolve the effective effect contract for a step. Defaults: idempotent=true. */
@@ -876,9 +923,13 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
             : 'structural'
       : 'unbuilt';
     const prod = stepByName(def, a.producer);
+    const producePat = prod && produceOwning(prod, a.path);
     // Held artifacts (isHeld) surface as stalled: true — they require human intervention.
     const stalled =
-      !!prod && (isStalled(a, prod.maxAttempts) || isSchemaStalled(a, prod.maxSchemaFailures) || isHeld(a));
+      !!prod &&
+      (isStalled(a, effectiveMaxAttempts(prod, producePat)) ||
+        isSchemaStalled(a, effectiveMaxSchemaFailures(prod, producePat)) ||
+        isHeld(a));
     const entry: WorkflowStatus['debts'][number] = { path: a.path, acceptance: a.acceptance, kind, stalled };
     if (last) entry.reason = last.text;
     debts.push(entry);
@@ -1085,8 +1136,9 @@ export function buildTrace(
       // Check stall: need the producer step's caps
       const producerStep = def.steps.find((l) => l.name === art.producer);
       if (producerStep) {
-        const stallJ = isStalled(art, producerStep.maxAttempts);
-        const stallS = isSchemaStalled(art, producerStep.maxSchemaFailures);
+        const producePat = produceOwning(producerStep, art.path);
+        const stallJ = isStalled(art, effectiveMaxAttempts(producerStep, producePat));
+        const stallS = isSchemaStalled(art, effectiveMaxSchemaFailures(producerStep, producePat));
         if (stallJ || stallS) stalledArtifacts.push(art.path);
       }
 
@@ -1255,14 +1307,15 @@ export function buildGraph(
       }
 
       const step = stepMap.get(node.id);
-      const maxAttempts = step?.maxAttempts ?? 3;
-      const maxSchema = step?.maxSchemaFailures ?? 5;
 
       // Determine worst-state using priority: stalled > rejected > owed > skipped/retracted > green
       let worstState: GraphNodeState = 'green';
       let anyStalled = false;
 
       for (const a of nodeArts) {
+        const producePat = step && produceOwning(step, a.path);
+        const maxAttempts = step ? effectiveMaxAttempts(step, producePat) : 3;
+        const maxSchema = step ? effectiveMaxSchemaFailures(step, producePat) : 5;
         const stallJ = isStalled(a, maxAttempts);
         const stallS = isSchemaStalled(a, maxSchema);
         if (stallJ || stallS) {
@@ -1966,8 +2019,9 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
 
   for (const [path, art] of [...arts.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
     const step = stepMap.get(art.producer);
-    const maxAttempts = step?.maxAttempts ?? 3;
-    const maxSchema = step?.maxSchemaFailures ?? 5;
+    const producePat = step && produceOwning(step, path);
+    const maxAttempts = step ? effectiveMaxAttempts(step, producePat) : 3;
+    const maxSchema = step ? effectiveMaxSchemaFailures(step, producePat) : 5;
 
     // §24: `submitted` gets its own rank (3) — distinct from both green (1) and
     // owed/rejected (2). Without this, a `submitted` dependency and a

@@ -188,11 +188,15 @@ process, the session, and the model that's driving it. See
 
 ### Stall detection — the token-burn stopper
 
-If an output is rejected more times than its step's `maxAttempts`, the engine
-stops re-arming it. It stays a debt, but produces no more jobs — the step has
+If an output is rejected more times than its `maxAttempts`, the engine stops
+re-arming it. It stays a debt, but produces no more jobs — the step has
 demonstrably failed, and it's flagged for a human instead of looping forever.
 `owenloop retry` clears the stall and resets the counter, optionally with new
-guidance. See [`docs/cli.md`](docs/cli.md).
+guidance. `maxAttempts` (and `maxSchemaFailures` below) is set on the step as
+a default for all its outputs, but any single `produces:` entry can override
+either cap for itself when one output needs a different bound than its
+siblings. See [`docs/cli.md`](docs/cli.md) and
+[`docs/design.md` §6](docs/design.md).
 
 ### Schema refusal
 
