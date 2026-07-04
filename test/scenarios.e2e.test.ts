@@ -97,6 +97,9 @@ test('§3 reduce gates on members, not verdicts — a rejected map verdict does 
   // green one verdict, REJECT the other — the members themselves stay green
   ow('green', wf, checks[0].run, checks[0].outputs[0], '--value', J({ ok: true }));
   ow('close', wf, checks[0].run);
+  // a verdict requires a built version (§6): green it first, then reject it —
+  // not reject the never-built owed output directly.
+  ow('green', wf, checks[1].run, checks[1].outputs[0], '--value', J({ ok: false }));
   ow('reject', wf, checks[1].outputs[0], '--by', 'synth', '--text', 'bad verdict');
   assert.deepEqual(
     arts(ow, wf).filter((a) => /source\[\d+\]$/.test(a.path)).map((a) => a.acceptance),

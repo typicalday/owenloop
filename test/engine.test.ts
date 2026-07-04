@@ -203,6 +203,147 @@ test('§6 stall: a judgment-rejected output stops re-arming at the cap, until re
   assert.equal(engine.status(wf).done, true);
 });
 
+// ---- commit-side verb guards (audit F3/F5/F7) -------------------------------
+
+test('reject: refuses a never-built owed artifact — no judgmentRejects bump, producer still offered', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery');
+  complete(engine, wf, fire(engine, wf, 'planner', 1000), { plan: 'v1' });
+  // builder has not fired yet — pr is still owed (never built).
+  assert.equal(store.getArtifact(wf, 'pr')?.acceptance, 'owed');
+
+  assert.throws(
+    () => engine.reject(wf, 'pr', 'reviewer', 'premature verdict'),
+    /cannot reject 'pr' in state 'owed': a verdict requires a built version/,
+  );
+
+  const pr = store.getArtifact(wf, 'pr');
+  assert.equal(pr?.acceptance, 'owed', 'artifact untouched');
+  assert.equal(pr?.judgmentRejects, 0, 'no stall-counter bump from a refused reject');
+  assert.deepEqual(engine.status(wf).eligible.map((e) => e.step), ['builder'], 'producer still offered');
+});
+
+test('reject: refuses a retracted collection member — stays retracted, not resurrected to a live debt', () => {
+  const { engine, store } = makeEngine([research]);
+  const wf = engine.createInstance('research', { provide: { question: { q: 'why' } } });
+
+  const gather = fire(engine, wf, 'gather', 1000);
+  engine.emit(wf, gather.run, [{ value: { s: 'a' } }, { value: { s: 'b' } }]);
+  engine.seal(wf, gather.run, {});
+  engine.close(wf, gather.run);
+
+  engine.retract(wf, 'gather.source[1]', 'human', 'duplicate');
+  assert.equal(store.getArtifact(wf, 'gather.source[1]')?.acceptance, 'retracted');
+
+  assert.throws(
+    () => engine.reject(wf, 'gather.source[1]', 'human', 'change of mind'),
+    /cannot reject 'gather\.source\[1\]' in state 'retracted': a verdict requires a built version/,
+  );
+  assert.equal(store.getArtifact(wf, 'gather.source[1]')?.acceptance, 'retracted', 'stays retracted, not resurrected');
+});
+
+test('reject: unaffected on a built green or submitted artifact (existing behavior)', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery');
+  complete(engine, wf, fire(engine, wf, 'planner', 1000), { plan: 'v1' });
+  complete(engine, wf, fire(engine, wf, 'builder', 2000), { pr: 'v1' });
+
+  // reviewer rejects the built (green) pr — still legal.
+  const reviewer = fire(engine, wf, 'reviewer', 3000);
+  const r = engine.reject(wf, 'pr', 'reviewer', 'tests fail on CI');
+  engine.close(wf, reviewer.run, 'no_work');
+  assert.equal(r.outcome, 'rejected');
+  assert.equal(store.getArtifact(wf, 'pr')?.acceptance, 'rejected');
+  assert.equal(store.getArtifact(wf, 'pr')?.judgmentRejects, 1);
+});
+
+test('retract: refuses an actor who does not consume the member (no authority)', () => {
+  const { engine, store } = makeEngine([research]);
+  const wf = engine.createInstance('research', { provide: { question: { q: 'why' } } });
+
+  const gather = fire(engine, wf, 'gather', 1000);
+  engine.emit(wf, gather.run, [{ value: { s: 'a' } }, { value: { s: 'b' } }]);
+  engine.seal(wf, gather.run, {});
+  engine.close(wf, gather.run);
+
+  // 'gather' produces the member but does not consume it, and 'synthesize'
+  // consumes gather.source[*] (the reduce), not gather.source[$i] — neither
+  // is a legitimate authority; an unknown actor name must also be refused.
+  assert.throws(() => engine.retract(wf, 'gather.source[1]', 'gather', 'nope'), /has no authority/);
+  assert.throws(() => engine.retract(wf, 'gather.source[1]', 'no-such-step', 'nope'), /unknown actor/);
+  assert.equal(store.getArtifact(wf, 'gather.source[1]')?.acceptance, 'green', 'untouched by the refused retracts');
+
+  // a consuming step (formatcheck, via gather.source[$i]) and human both have authority.
+  engine.retract(wf, 'gather.source[1]', 'formatcheck', 'bad element');
+  assert.equal(store.getArtifact(wf, 'gather.source[1]')?.acceptance, 'retracted');
+});
+
+test('retry: refuses an actor with no authority, and refuses a retracted artifact', () => {
+  const { engine, store } = makeEngine([delivery]); // builder maxAttempts defaults to 3
+  const wf = engine.createInstance('delivery');
+  complete(engine, wf, fire(engine, wf, 'planner', 1000), { plan: 'v1' });
+
+  let now = 2000;
+  for (let i = 1; i <= 3; i++) {
+    const builder = fire(engine, wf, 'builder', now++);
+    engine.green(wf, builder.run, 'pr', { pr: i });
+    engine.close(wf, builder.run);
+    const reviewer = fire(engine, wf, 'reviewer', now++);
+    engine.reject(wf, 'pr', 'reviewer', `attempt ${i} unfit`);
+    engine.close(wf, reviewer.run, 'no_work');
+  }
+  assert.equal(engine.status(wf).debts.find((d) => d.path === 'pr')?.stalled, true);
+
+  // an actor with no consume edge over 'pr' has no authority to retry it.
+  assert.throws(() => engine.retry(wf, 'pr', 'merger', 'let me try'), /has no authority/);
+  assert.throws(() => engine.retry(wf, 'pr', 'no-such-step', 'let me try'), /unknown actor/);
+  assert.equal(store.getArtifact(wf, 'pr')?.judgmentRejects, 3, 'refused retries leave the stall untouched');
+
+  // by human on a stalled artifact still works (counter reset preserved).
+  engine.retry(wf, 'pr', 'human', 'switch to the new fixture');
+  assert.equal(store.getArtifact(wf, 'pr')?.judgmentRejects, 0);
+
+  // a retracted collection member cannot be resurrected via retry — retract is final.
+  const { engine: e2, store: s2 } = makeEngine([research]);
+  const wf2 = e2.createInstance('research', { provide: { question: { q: 'why' } } });
+  const gather = fire(e2, wf2, 'gather', 1000);
+  e2.emit(wf2, gather.run, [{ value: { s: 'a' } }]);
+  e2.seal(wf2, gather.run, {});
+  e2.close(wf2, gather.run);
+  e2.retract(wf2, 'gather.source[0]', 'human', 'duplicate');
+  assert.throws(
+    () => e2.retry(wf2, 'gather.source[0]', 'human'),
+    /retracted, which is terminal/,
+  );
+  assert.equal(s2.getArtifact(wf2, 'gather.source[0]')?.acceptance, 'retracted');
+});
+
+test('human green: enforces the declared output schema — a schema-invalid value is refused, artifact unchanged', () => {
+  const planner = step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] });
+  planner.produces[0]!.schema = {
+    type: 'object',
+    required: ['plan'],
+    properties: { plan: { type: 'string', minLength: 1 } },
+    additionalProperties: false,
+  };
+  const withSchema = def('schemedelivery', [input('proposal')], [planner]);
+  const { engine, store } = makeEngine([withSchema]);
+  const wf = engine.createInstance('schemedelivery');
+
+  assert.throws(
+    () => engine.green(wf, 'human', 'plan', { wrong: 1 }),
+    /human green for 'plan' failed schema/,
+  );
+  const plan = store.getArtifact(wf, 'plan');
+  assert.equal(plan?.acceptance, 'owed', 'artifact untouched on a refused human green');
+  assert.equal(plan?.version, 0, 'no version bump on a refused human green');
+
+  // a schema-valid value still greens (existing behavior).
+  const r = engine.green(wf, 'human', 'plan', { plan: 'v1' });
+  assert.equal(r.outcome, 'green');
+  assert.equal(store.getArtifact(wf, 'plan')?.acceptance, 'green');
+});
+
 // ---- crash-step: consecutive failed-run counter -----------------------------
 
 test('crash-step: status surfaces a producer that keeps closing failed without greening', () => {

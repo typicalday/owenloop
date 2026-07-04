@@ -735,6 +735,20 @@ export class Engine {
           this.settle(workflow, def);
           return { path, outcome: 'group-rejected', reason: groupCas.reason };
         }
+        // §18: a human bypass still lands a value downstream consumers assume
+        // is schema-valid (and which can later crash e.g. maintainCalls child
+        // seeding), so enforce the same produce schema the producer-commit path
+        // enforces (below). Unlike that path, there is no lease/retry loop to
+        // protect here — a schema-invalid human green is a hard refusal (thrown
+        // Error), not a schemaRejects-bumping soft one: no version bump, artifact
+        // left untouched. The judge bypass (§24.6) is untouched by this check.
+        const humanSchema = this.produceSchema(def, art);
+        if (humanSchema !== undefined) {
+          const check = validateValue(humanSchema, value);
+          if (!check.valid) {
+            throw new Error(`human green for '${path}' failed schema: ${summarizeIssues(check.issues)}`);
+          }
+        }
         const req = requiredInputs(def, arts, art);
         const next: ArtifactData = {
           ...art,
@@ -1057,6 +1071,24 @@ export class Engine {
         }
       }
 
+      // §6: a judgment verdict is about a *produced* version (design §6) — refuse
+      // a reject on anything that isn't currently a build (`green`) or awaiting
+      // verdict (`submitted`). Two concrete wedges this closes: rejecting a
+      // never-built `owed` artifact would burn a judgmentRejects toward the §6
+      // stall cap with zero build attempts (a silent freeze — the producer side
+      // never re-offers past the cap); rejecting a terminal `retracted` collection
+      // member would flip a dead member back to a live `rejected` debt, but no
+      // firing shape can ever rebuild a bare collection element (§11.3: retracted
+      // is terminal, out of the live set), so the instance wedges permanently.
+      // The judge-CAS branch above already guarantees `submitted` for judge
+      // verdicts that reach here (a stale one already returned born-rejected),
+      // so this only bites the plain/human reject path in practice.
+      if (art.acceptance !== 'green' && art.acceptance !== 'submitted') {
+        throw new Error(
+          `cannot reject '${path}' in state '${art.acceptance}': a verdict requires a built version (green|submitted)`,
+        );
+      }
+
       // §24 §3.1/§4.4: a judge reject (or a human reject on a `submitted`
       // artifact) is a quality verdict, not a cascade invalidation — it wins
       // immediately regardless of any other judge's already-recorded approval,
@@ -1093,6 +1125,13 @@ export class Engine {
     const def = this.defFor(workflow);
     const el = parseElement(path);
     if (!el || el.suffix !== '') throw new Error(`retract is only valid on a collection member: ${path}`);
+    // §4.1/§11.3: same authority rule as reject — only a consumer of the member's
+    // stem (or human/engine) may drop it. Without this, any string actor name
+    // (even one not in the def) could terminally retract a green member of a
+    // sealed collection. assertAuthority resolves an element path to its stem
+    // via parseElement internally, so `path` (not `el.stem`) is passed straight
+    // through, same as reject().
+    this.assertAuthority(def, by, path, 'retract');
     this.store.tx(() => {
       const art = this.store.getArtifact(workflow, path);
       if (!art) throw new Error(`cannot retract unknown artifact: ${path}`);
@@ -1141,9 +1180,20 @@ export class Engine {
    */
   retry(workflow: string, path: string, by: Author = 'human', text = 'retry: stall cleared'): void {
     const def = this.defFor(workflow);
+    // §4.1: same authority rule as reject/retract — only a consumer of the
+    // stem (or human/engine) may re-arm it.
+    this.assertAuthority(def, by, path, 'retry');
     this.store.tx(() => {
       const art = this.store.getArtifact(workflow, path);
       if (!art) throw new Error(`cannot retry unknown artifact: ${path}`);
+      // §11.3: retry re-arms to `owed`, but a bare collection element that has
+      // been retracted has no producer firing that can ever rebuild it — retry
+      // would resurrect a terminally-dropped member into a guaranteed wedge.
+      // `retract` is final by design; every other state (rejected, stalled,
+      // skipped, green) stays a legal retry target.
+      if (art.acceptance === 'retracted') {
+        throw new Error(`cannot retry '${path}': it was retracted, which is terminal (use a fresh collection element instead)`);
+      }
       this.store.putArtifact({
         ...art,
         acceptance: 'owed',

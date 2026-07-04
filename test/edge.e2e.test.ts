@@ -292,6 +292,9 @@ test('suffixed reduce: a REJECTED child blocks the reduce even though its bare m
   const checks = ow('tick', wf).orders.filter((o: any) => o.step === 'formatcheck');
   ow('green', wf, checks[0].run, checks[0].outputs[0], '--value', J({ ok: true }));
   ow('close', wf, checks[0].run);
+  // a verdict requires a built version (§6): green it first, then reject it —
+  // not reject the never-built owed output directly.
+  ow('green', wf, checks[1].run, checks[1].outputs[0], '--value', J({ ok: false }));
   ow('reject', wf, checks[1].outputs[0], '--by', 'human', '--text', 'bad formatting');
   ow('close', wf, checks[1].run);
 
