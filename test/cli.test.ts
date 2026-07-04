@@ -987,6 +987,29 @@ test('emit: schema-rejected exits non-zero and still prints result JSON', () => 
   assert.ok(r.err.length > 0);
 });
 
+test('emit: sealed-rejected exits non-zero after the seal has greened, on the same open lease', () => {
+  const FIXTURES = join(import.meta.dirname, 'fixtures');
+  const { run } = makeCli({ defs: FIXTURES });
+  const wf = run('create', 'schemacheck', '--provide', `spec=${J({ goal: 'test' })}`).json().workflow;
+  const planOrder = run('tick', wf).json().orders[0];
+  run('green', wf, planOrder.run, 'plan', '--value', J({ steps: 1 }));
+  run('close', wf, planOrder.run);
+  const gatherOrder = run('tick', wf).json().orders[0];
+  run('emit', wf, gatherOrder.run, '--items', J([{ url: 'a' }]));
+  const sealRes = run('seal', wf, gatherOrder.run, '--value', J({}));
+  assert.equal(sealRes.code, 0);
+
+  // same open lease, late emit after the seal is already green
+  const r = run('emit', wf, gatherOrder.run, '--items', J([{ url: 'b' }]));
+  assert.equal(r.code, 1, 'a late emit after a green seal must exit non-zero (§11.1)');
+  assert.equal(r.json().outcome, 'sealed-rejected');
+  assert.match(r.err, /sealed-rejected/);
+
+  // the lease is still open — the run can still close cleanly
+  const closeRes = run('close', wf, gatherOrder.run);
+  assert.equal(closeRes.code, 0);
+});
+
 // ---- §28: instance-to-definition pinning (adopt, status defDrift) ----------
 
 /** Two temp defs dirs, both defining a workflow named 'pinnable', with a

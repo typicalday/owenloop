@@ -173,7 +173,7 @@ export interface CommitResult {
 
 /** The outcome of an `emit` (collection accretion) — possibly schema-refused. */
 export interface EmitResult {
-  outcome: 'emitted' | 'born-rejected' | 'schema-rejected';
+  outcome: 'emitted' | 'born-rejected' | 'schema-rejected' | 'sealed-rejected';
   /** the element paths created (empty unless `emitted`) */
   created: string[];
   reason?: string;
@@ -1062,6 +1062,21 @@ export class Engine {
         this.releaseLeaseOnBornReject(workflow, run);
         this.settle(workflow, def);
         return { outcome: 'born-rejected', created: [], reason: cas.reason };
+      }
+
+      // §11.1: once the seal is green the collection is complete — the offer
+      // side never offers collection work again, so a late `emit` on a still
+      // -open lease is refused rather than silently growing a "complete" set.
+      // Check first, don't mutate on refusal (mirrors green()'s group check):
+      // no counters bumped, no artifacts touched, lease stays open so the run
+      // can still close.
+      const sealForGreenCheck = arts.get(sealPath(stem));
+      if (sealForGreenCheck && isGreen(sealForGreenCheck)) {
+        return {
+          outcome: 'sealed-rejected',
+          created: [],
+          reason: `collection ${stem} is sealed: seal green = set complete (§11.1)`,
+        };
       }
 
       // §18: every emitted element must satisfy the collection's declared schema.
