@@ -49,6 +49,26 @@ import type {
 
 const DEFAULT_REAP_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 
+/**
+ * F2: a typed refusal for a produced-value/input-value schema mismatch, thrown
+ * by `createInstance` (seed provide) and `provideInput`. Distinct from a bare
+ * `Error` so callers that need to distinguish "this value doesn't fit the
+ * schema" from a genuine bug (e.g. `maintainCalls`'s STEP 3/STEP 5, which must
+ * turn a CHILD's schema refusal into a debt on the parent rather than crash
+ * the parent's tick) can catch narrowly instead of blanket-catching.
+ */
+export class SchemaRefusalError extends Error {
+  readonly inputName: string;
+  readonly issues: SchemaIssue[];
+
+  constructor(inputName: string, issues: SchemaIssue[]) {
+    super(`input '${inputName}' failed schema: ${summarizeIssues(issues)}`);
+    this.name = 'SchemaRefusalError';
+    this.inputName = inputName;
+    this.issues = issues;
+  }
+}
+
 /** A self-contained unit of work emitted by a tick. */
 export interface Order {
   run: string;
@@ -265,7 +285,7 @@ export class Engine {
         if (provided !== undefined && input.schema !== undefined) {
           const check = validateValue(input.schema, provided);
           if (!check.valid) {
-            throw new Error(`input '${input.name}' failed schema: ${summarizeIssues(check.issues)}`);
+            throw new SchemaRefusalError(input.name, check.issues);
           }
         }
         const seedGreen = !input.seedOwed || provided !== undefined;
@@ -303,7 +323,7 @@ export class Engine {
       if (inputDef?.schema !== undefined) {
         const check = validateValue(inputDef.schema, value);
         if (!check.valid) {
-          throw new Error(`input '${name}' failed schema: ${summarizeIssues(check.issues)}`);
+          throw new SchemaRefusalError(name, check.issues);
         }
       }
       this.store.putArtifact({
@@ -355,6 +375,72 @@ export class Engine {
   // ---- Mode 2 calls: child-instance management --------------------------------
 
   /**
+   * F4: the synthetic fingerprint key a `calls:` artifact uses to pin its
+   * fingerprint to the child outcome's version. A calls: step declares
+   * `consumes: []` (§ M2B), so its produce's fingerprint would otherwise never
+   * see the child outcome (which lives in another instance entirely) — this
+   * key is how that pin rides inside the same `Fingerprint` map alongside the
+   * gate stems, without colliding with any real parent artifact path (gate
+   * stems are bare names; this key is namespaced and reserved).
+   */
+  private static readonly CHILD_OUTCOME_PIN_KEY = '__child_outcome_version__';
+
+  /**
+   * F4: the single place that computes "what child-outcome version is this
+   * calls: artifact currently resting on" — used both when machine-greening
+   * (STEP 6) and when stamping the pin at verdict time (reject propagation,
+   * human skip). Returns undefined if no child has ever been spawned (nothing
+   * to pin to).
+   */
+  private childOutcomePin(parentWf: string, callsPath: string): number | undefined {
+    const child = this.store.findChildByParent(parentWf, callsPath);
+    if (!child) return undefined;
+    const childDef = this.defFor(child.id);
+    const childOutcomeStem = childDef.outputs![0]!;
+    const childArts = this.artMap(child.id);
+    const childOutcomeArt = childArts.get(childOutcomeStem);
+    return childOutcomeArt?.version ?? -1;
+  }
+
+  /**
+   * F2: record a child input-schema refusal (from STEP 3 spawn or STEP 5
+   * re-provide) as a debt on the PARENT calls artifact — same shape as
+   * green()'s schema-reject branch (acceptance: 'rejected', schemaRejects+1,
+   * a 'validation' reasons entry naming the child input and the schema
+   * issues) — so the tick can proceed instead of throwing, and the parent
+   * calls artifact surfaces as a stallable debt (maxSchemaFailures/retry).
+   * Stamps the current gate fingerprint on the rejected artifact so the
+   * STEP-2 guard can tell "gate unmoved, don't re-attempt" from "gate moved,
+   * worth retrying" on the next tick.
+   */
+  private recordCallsSchemaReject(
+    parentWf: string,
+    def: WorkflowDef,
+    callsStem: string,
+    gateStems: string[],
+    err: SchemaRefusalError,
+    now?: number,
+  ): void {
+    const text = `child input '${err.inputName}' failed schema: ${summarizeIssues(err.issues)}`;
+    this.store.tx(() => {
+      const art = this.store.getArtifact(parentWf, callsStem);
+      if (!art) return; // not yet materialized by pendingOwed — nothing to stamp
+      const gateArts = this.artMap(parentWf);
+      const fp = computeFingerprint(gateArts, gateStems);
+      this.store.putArtifact({
+        ...art,
+        acceptance: 'rejected',
+        schemaRejects: art.schemaRejects + 1,
+        fingerprint: fp,
+        reasons: [...art.reasons, reason('schema-reject', 'validation', 'engine', text, art.version)],
+      });
+      this.settle(parentWf, def, now);
+    });
+    this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject', outcome: 'schema-rejected' });
+    this.fireSettled(parentWf);
+  }
+
+  /**
    * M2B: Maintain all `calls:` steps for a parent workflow.
    * Called at the top of tick (outside any tx) and as cascade-up prompt.
    * For each calls: step: spawn the child if gate is ready and no child exists;
@@ -379,6 +465,19 @@ export class Engine {
         // STEP 2 — Look up any existing child via reverse index.
         let existingChild = this.store.findChildByParent(parentWf, callsPath);
 
+        // F2: if the parent calls artifact is already `rejected` on a schema
+        // refusal (see STEP 3/5 below) and the gate stems haven't moved since
+        // that refusal was recorded, don't re-attempt — the same value would
+        // just refuse again. The gate fingerprint on the rejected artifact is
+        // the guard; a moved gate (fingerprint mismatch) means the parent
+        // value may have been fixed, so fall through and retry.
+        const parentCallsArtPre = this.store.getArtifact(parentWf, callsStem);
+        if (!existingChild && parentCallsArtPre?.acceptance === 'rejected') {
+          const gateArtsPre = this.artMap(parentWf);
+          const currentGateFp = computeFingerprint(gateArtsPre, gateStems);
+          if (deepEqual(currentGateFp, parentCallsArtPre.fingerprint ?? {})) continue;
+        }
+
         // STEP 3 — SPAWN or RE-ATTACH.
         if (!existingChild) {
           // SPAWN: gate is ready and no child exists yet.
@@ -387,10 +486,26 @@ export class Engine {
             const parentArt = parentArts.get(parentArtifactName);
             if (parentArt?.value !== undefined) seedProvide[childInputName] = parentArt.value;
           }
-          const childId = this.createInstance(step.calls, {
-            producedBy: { parentWf, parentPath: callsPath },
-            provide: seedProvide,
-          });
+          // F2: a child input-schema refusal here is not a bug — a parent
+          // value can be legal per the parent's own schema (looser, or absent)
+          // yet illegal per the child's declared input schema. Catch narrowly
+          // (SchemaRefusalError only; anything else is a genuine bug and must
+          // still throw) and record it as a debt on the PARENT calls artifact,
+          // mirroring green()'s schema-reject branch, so the tick proceeds
+          // instead of crash-looping every subsequent tick(parent).
+          let childId: string;
+          try {
+            childId = this.createInstance(step.calls, {
+              producedBy: { parentWf, parentPath: callsPath },
+              provide: seedProvide,
+            });
+          } catch (err) {
+            if (err instanceof SchemaRefusalError) {
+              this.recordCallsSchemaReject(parentWf, def, callsStem, gateStems, err, now);
+              continue;
+            }
+            throw err;
+          }
           existingChild = this.store.getWorkflow(childId);
         }
         // else: RE-ATTACH — existingChild is the already-spawned child; no new spawn.
@@ -406,11 +521,25 @@ export class Engine {
         let childOutcomeArt = childArts.get(childOutcomeStem);
 
         // STEP 5 — RE-PROVIDE if parent gate source moved (M2B-REPROVIDE).
+        // F2: same typed-refusal handling as STEP 3 — a re-provided parent
+        // value illegal per the child's input schema becomes a debt on the
+        // parent calls artifact instead of throwing out of provideInput's
+        // cascade-up. The human's own provide of the PARENT input still
+        // commits (that validation happens against the PARENT's schema,
+        // inside provideInput's own tx, before this cascade ever runs).
         for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
           const parentArtNow = parentArts.get(parentArtifactName);
           const childInputArt = childArts.get(childInputName);
           if (parentArtNow?.value !== undefined && !deepEqual(parentArtNow.value, childInputArt?.value)) {
-            this.provideInput(existingChild.id, childInputName, parentArtNow.value as Record<string, unknown>);
+            try {
+              this.provideInput(existingChild.id, childInputName, parentArtNow.value as Record<string, unknown>);
+            } catch (err) {
+              if (err instanceof SchemaRefusalError) {
+                this.recordCallsSchemaReject(parentWf, def, callsStem, gateStems, err, now);
+                continue;
+              }
+              throw err;
+            }
           }
         }
 
@@ -420,13 +549,28 @@ export class Engine {
         childOutcomeArt = childArts.get(childOutcomeStem);
         const parentCallsArt = this.store.getArtifact(parentWf, callsStem);
 
+        // F2: don't machine-green over a schema-rejected debt — it needs a
+        // human `retry` (or a moved gate, handled by the guard above) before
+        // this step revisits it.
+        if (parentCallsArt?.acceptance === 'rejected') continue;
+
         if (isGreen(childOutcomeArt) && childOutcomeArt?.value !== undefined) {
           const alreadyGreen = isGreen(parentCallsArt);
           const sameValue = alreadyGreen && deepEqual(childOutcomeArt.value, parentCallsArt?.value);
-          if (!alreadyGreen || !sameValue) {
+          // F4: version-pinning. Only machine-green when the child outcome's
+          // version has moved past whatever version is currently pinned on
+          // the parent artifact — this is what lets a consumer's reject
+          // (propagated down, parent reopened to owed pinned to the rejected
+          // child version) or a human skip (pinned at skip time) stand until
+          // the child actually rebuilds past that pin, instead of being
+          // silently overridden on the very next tick.
+          const pinnedVersion = parentCallsArt?.fingerprint?.[Engine.CHILD_OUTCOME_PIN_KEY];
+          const pastPin = pinnedVersion === undefined || childOutcomeArt.version > pinnedVersion;
+          if ((!alreadyGreen || !sameValue) && pastPin) {
             if (!parentCallsArt) continue; // not yet materialized by pendingOwed — skip
             const gateArts = this.artMap(parentWf);
             const fp = computeFingerprint(gateArts, gateStems);
+            fp[Engine.CHILD_OUTCOME_PIN_KEY] = childOutcomeArt.version;
             const next: ArtifactData = {
               ...parentCallsArt,
               acceptance: 'green',
@@ -1046,6 +1190,18 @@ export class Engine {
   reject(workflow: string, path: string, by: Author, text: string): { outcome: 'rejected' | 'born-rejected'; reason?: string } {
     const def = this.defFor(workflow);
     this.assertAuthority(def, by, path, 'reject');
+
+    // F4: a reject on an artifact produced by a `calls:` step is a verdict on
+    // the CHILD's work, not the parent's own — forward it. Detection: the
+    // producing step declares `calls:`. The child is resolved via the
+    // parent→child reverse index (store.findChildByParent); if no child was
+    // ever spawned there is nothing to judge, so refuse (consistent with the
+    // verb-guard rule below that a verdict needs a built version).
+    const producingStep = def.steps.find((s) => s.produces.some((p) => p.stem === path));
+    if (producingStep?.calls) {
+      return this.rejectCallsArtifact(workflow, def, producingStep, path, by, text);
+    }
+
     const judgeStep = def.steps.find((s) => s.name === by);
     const judgedStem = judgeStep?.judges;
     let releasedRun: string | undefined;
@@ -1120,6 +1276,88 @@ export class Engine {
     return result;
   }
 
+  /**
+   * F4: forward a reject on a `calls:`-produced artifact to the CHILD's
+   * outcome artifact, then reopen the parent calls artifact to `owed` pinned
+   * (via `childOutcomePin`) to the just-rejected child outcome version, so
+   * STEP 6's mirror only fires again once the child has actually rebuilt past
+   * this verdict (§ F4 settled design).
+   *
+   * The forward is engine-internal: authority was already checked against the
+   * PARENT def by `assertAuthority` in `reject()` above, so the child's own
+   * `assertAuthority` is not consulted — the author recorded on the child's
+   * reasons entry is `parent:<by>` to make the indirection visible in its
+   * audit thread.
+   */
+  private rejectCallsArtifact(
+    parentWf: string,
+    def: WorkflowDef,
+    producingStep: StepDef,
+    callsStem: string,
+    by: Author,
+    text: string,
+  ): { outcome: 'rejected' | 'born-rejected'; reason?: string } {
+    const child = this.store.findChildByParent(parentWf, callsStem);
+    if (!child) {
+      throw new Error(
+        `cannot reject '${callsStem}': no child instance has been spawned yet (a verdict requires a built version)`,
+      );
+    }
+    const childDef = this.defFor(child.id);
+    const childOutcomeStem = childDef.outputs![0]!;
+
+    this.store.tx(() => {
+      const parentArt = this.store.getArtifact(parentWf, callsStem);
+      if (!parentArt) throw new Error(`cannot reject unknown artifact: ${callsStem}`);
+      if (parentArt.acceptance !== 'green' && parentArt.acceptance !== 'submitted') {
+        throw new Error(
+          `cannot reject '${callsStem}' in state '${parentArt.acceptance}': a verdict requires a built version (green|submitted)`,
+        );
+      }
+
+      const childArt = this.store.getArtifact(child.id, childOutcomeStem);
+      if (!childArt) throw new Error(`cannot reject '${callsStem}': child outcome artifact missing`);
+
+      // Child outcome → rejected, judgmentRejects+1, author `parent:<by>`.
+      this.store.putArtifact({
+        ...childArt,
+        acceptance: 'rejected',
+        judgmentRejects: childArt.judgmentRejects + 1,
+        approvals: undefined,
+        reasons: [...childArt.reasons, reason('reject', 'judgment', `parent:${by}` as Author, text, childArt.version)],
+      });
+      this.settle(child.id, childDef);
+
+      // Parent calls artifact → reopened to owed (not left rejected), pinned
+      // to the just-rejected child outcome version.
+      this.store.putArtifact({
+        ...parentArt,
+        acceptance: 'owed',
+        fingerprint: { ...(parentArt.fingerprint ?? {}), [Engine.CHILD_OUTCOME_PIN_KEY]: childArt.version },
+        reasons: [
+          ...parentArt.reasons,
+          {
+            at: nowMs(),
+            action: 'reopen' as const,
+            kind: 'structural' as const,
+            by: 'engine' as const,
+            text: `reject forwarded to child outcome '${childOutcomeStem}': ${text}`,
+            fromVersion: parentArt.version,
+          },
+        ],
+      });
+      this.settle(parentWf, def);
+    });
+    this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject' });
+    this.fireSettled(parentWf);
+    // The child's own firings (re-arming its producer with the feedback on
+    // its owes thread) need tick(child) — not driven from here; see docs/design.md
+    // M2/M2B "sweeping" note. Prompt maintainCalls now so the parent's own
+    // state (owed/pin) is visible immediately, mirroring provideInput's cascade.
+    this.maintainCalls(parentWf, def);
+    return { outcome: 'rejected' };
+  }
+
   /** Retract a collection member (§11.3): drop it, terminally; abandon the index. */
   retract(workflow: string, path: string, by: Author, text: string): void {
     const def = this.defFor(workflow);
@@ -1159,10 +1397,21 @@ export class Engine {
       // Fingerprint the inputs this skip rests on, so the level-trigger only
       // re-arms the branch when those inputs *move* (§16.1), not merely stay green.
       const req = requiredInputs(def, arts, art);
+      const fp = computeFingerprint(arts, req);
+      // F4: a calls: step declares `consumes: []`, so `req` above never sees
+      // its real input — the child outcome, which lives in another instance.
+      // Capture the same version pin `childOutcomePin` uses elsewhere, so a
+      // skip made on evidence from child version N survives arbitrary ticks
+      // (order A) until the child actually rebuilds past N (order B).
+      const producingStep = def.steps.find((s) => s.name === art.producer);
+      if (producingStep?.calls) {
+        const pin = this.childOutcomePin(workflow, path);
+        if (pin !== undefined) fp[Engine.CHILD_OUTCOME_PIN_KEY] = pin;
+      }
       this.store.putArtifact({
         ...art,
         acceptance: 'skipped',
-        fingerprint: computeFingerprint(arts, req),
+        fingerprint: fp,
         reasons: [...art.reasons, reason('skip', 'structural', by, text, art.version)],
       });
       this.settle(workflow, def);
