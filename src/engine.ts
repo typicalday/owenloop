@@ -1590,9 +1590,15 @@ export class Engine {
       // re-arms when the upstream branch revives (mirrors a producer skip).
       // §26: an auto-skip of a losing group sibling tags rejectKind 'exclusive'
       // instead of the default 'structural' (op.rejectKind carries this).
+      // §26.2: if the skipped sibling was `submitted` (awaiting judgment), it
+      // may be carrying a partial approvals sign-off — clear it the same way
+      // a cascade reject does (§24 §4.3), so a stale sign-off never leaks onto
+      // a later resubmission if the winner is un-greened and the branch revives.
+      const clearApprovals = art.acceptance === 'submitted' && art.approvals !== undefined;
       this.store.putArtifact({
         ...art,
         acceptance: 'skipped',
+        ...(clearApprovals ? { approvals: undefined } : {}),
         fingerprint: computeFingerprint(arts, requiredInputs(def, arts, art)),
         reasons: [...art.reasons, reason('skip', op.rejectKind ?? 'structural', 'engine', op.reason, art.version)],
       });

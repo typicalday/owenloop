@@ -312,6 +312,7 @@ test('groups: (f) a judged group member is refused at the judge-approve moment, 
           { group: 'route', mode: 'exactlyOne', of: ['simple', 'urgent'] },
         ],
       },
+      { name: 'handleSimple', consumes: ['simple'], produces: ['simpleDone'] },
     ],
   });
   const { engine, store } = makeEngine([d]);
@@ -327,16 +328,178 @@ test('groups: (f) a judged group member is refused at the judge-approve moment, 
 
   // NOW 'simple' wins, while the judge run above is already in-flight — this
   // models the real race the group-aware eligibility filter cannot prevent
-  // (the order was claimed before the winner landed): the judge's eventual
-  // approve must still be refused at commit time by groupCasCheck.
+  // (the order was claimed before the winner landed). §26.2's auto-skip now
+  // also covers a still-`submitted` sibling, so 'urgent' auto-skips in this
+  // very same settle (engine.close's cascade) rather than staying wedged in
+  // 'submitted'. The judge's eventual approve is still refused — no longer by
+  // groupCasCheck's group check (the artifact isn't `submitted` anymore to
+  // even reach it) but by the ordinary stale-run/acceptance-mismatch guard
+  // (`born-rejected`). Either refusal path is correct; what matters is
+  // 'urgent' never flips to green.
   engine.green(wf, triageRun, 'simple', { ok: true });
   assert.equal(getArt(store, wf, 'simple')?.acceptance, 'green');
   engine.close(wf, triageRun);
+  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'skipped', 'urgent auto-skips in the same settle as the winner');
 
-  // the judge fires and approves — THIS is the green-moment, and it must be refused
+  // the judge fires and approves — this must still be refused, now via
+  // born-rejected (acceptance no longer submitted) rather than group-rejected.
   const judgeRes = engine.green(wf, judgeOrder.run, 'urgent', {});
-  assert.equal(judgeRes.outcome, 'group-rejected');
-  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'submitted', 'urgent must remain submitted, not flip to green');
+  assert.equal(judgeRes.outcome, 'born-rejected');
+  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'skipped', 'urgent must remain skipped, not flip to green');
+});
+
+// ---- (f3) §26.2: a submitted sibling still awaiting judgment auto-skips too ----
+
+test('groups: (f3) a submitted (judge-pending) losing sibling is auto-skipped by the same settle as the winner, reaching done', () => {
+  const d = buildDef({
+    name: 'judgedGroupDef4',
+    inputs: [{ name: 'ticket', seedOwed: false }],
+    steps: [
+      {
+        name: 'triage',
+        consumes: ['ticket'],
+        produces: [
+          'simple',
+          { name: 'urgent', judges: [{ name: 'sanity', body: 'check it' }] },
+          { group: 'route', mode: 'exactlyOne', of: ['simple', 'urgent'] },
+        ],
+      },
+      { name: 'handleSimple', consumes: ['simple'], produces: ['simpleDone'] },
+    ],
+  });
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance('judgedGroupDef4', { provide: { ticket: { text: 'x' } } });
+
+  const triageRun = fire(engine, wf, 'triage').run;
+  // 'urgent' lands 'submitted' first (still awaiting its judge's verdict) —
+  // no winner exists yet.
+  const submitRes = engine.green(wf, triageRun, 'urgent', { ok: true });
+  assert.equal(submitRes.outcome, 'submitted');
+  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'submitted');
+
+  // NOW 'simple' wins — this settle must auto-skip the still-submitted 'urgent'
+  // sibling in the SAME settle as the winner's commit (§26.2), not leave it
+  // wedged in 'submitted' forever (an OUTSTANDING state the old owed/rejected
+  // -only guard could never resolve).
+  engine.green(wf, triageRun, 'simple', { ok: true });
+  engine.close(wf, triageRun);
+
+  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'skipped', 'submitted loser must auto-skip, not stay wedged');
+  const lastReason = getArt(store, wf, 'urgent')?.reasons.slice(-1)[0];
+  assert.equal(lastReason?.action, 'skip');
+  assert.equal(lastReason?.kind, 'exclusive');
+
+  // no judge order for the now-skipped sibling is ever offered again — this
+  // same tick also claims the still-outstanding handleSimple order, so grab
+  // it here rather than ticking again (a second tick would see nothing new,
+  // since the run claimed on this tick is already in-flight).
+  const t = engine.tick(wf);
+  assert.ok(t.orders.every((o) => o.step !== 'triage.urgent.judges.sanity'));
+
+  // and the workflow reaches done: true once the remaining debt (handleSimple) settles
+  assert.equal(engine.status(wf).done, false, 'handleSimple has not fired yet');
+  const handleOrder = t.orders.find((o) => o.step === 'handleSimple');
+  assert.ok(handleOrder, 'expected a handleSimple order on this tick');
+  const handleRun = handleOrder!.run;
+  engine.green(wf, handleRun, 'simpleDone', { ok: true });
+  engine.close(wf, handleRun);
+  assert.equal(engine.status(wf).done, true);
+});
+
+// ---- (f4) §26.2 + §16.1: winner later un-greened → skipped ex-submitted sibling
+//           re-arms with a CLEAN approvals ledger (no stale partial sign-off leak) ----
+
+test('groups: (f4) rejecting the winner re-arms the ex-submitted skipped sibling with approvals cleared', () => {
+  const d = buildDef({
+    name: 'judgedGroupDef5',
+    inputs: [{ name: 'ticket', seedOwed: false }],
+    steps: [
+      {
+        name: 'triage',
+        consumes: ['ticket'],
+        produces: [
+          'simple',
+          {
+            name: 'urgent',
+            judges: [
+              { name: 'first', body: 'check one' },
+              { name: 'second', body: 'check two' },
+            ],
+          },
+          { group: 'route', mode: 'exactlyOne', of: ['simple', 'urgent'] },
+        ],
+      },
+    ],
+  });
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance('judgedGroupDef5', { provide: { ticket: { text: 'x' } } });
+
+  const triageRun = fire(engine, wf, 'triage').run;
+  const submitRes = engine.green(wf, triageRun, 'urgent', { ok: true });
+  assert.equal(submitRes.outcome, 'submitted');
+
+  // both of urgent's judges become eligible in parallel (judges are not
+  // sequenced — each independently fires once 'urgent' is submitted) — the
+  // same tick claims both orders, so grab both here rather than calling
+  // fire() a second time (which would see nothing new: the first call's tick
+  // already claimed both as in-flight runs).
+  let t = engine.tick(wf, { now: Date.now() });
+  const firstJudgeOrder = t.orders.find((o) => o.step === 'triage.urgent.judges.first')!;
+  const secondJudgeOrderEarly = t.orders.find((o) => o.step === 'triage.urgent.judges.second')!;
+  assert.ok(firstJudgeOrder && secondJudgeOrderEarly, 'expected both judge orders on this tick');
+
+  // only 'first' signs off — a partial approvals ledger entry is now recorded
+  // on the still-submitted artifact. Close 'second's run unresolved (it never
+  // approves before the skip lands) so it does not linger in-flight forever.
+  const partialRes = engine.green(wf, firstJudgeOrder.run, 'urgent', {});
+  assert.equal(partialRes.outcome, 'approved');
+  engine.close(wf, firstJudgeOrder.run);
+  engine.close(wf, secondJudgeOrderEarly.run);
+  const beforeSkip = getArt(store, wf, 'urgent');
+  assert.equal(beforeSkip?.acceptance, 'submitted');
+  assert.ok(beforeSkip?.approvals && Object.keys(beforeSkip.approvals).length > 0, 'partial sign-off recorded');
+
+  // 'simple' now wins — this settle must auto-skip 'urgent' (still submitted,
+  // with the partial approvals ledger) and, per §26.2, clear that ledger so a
+  // later resubmission never inherits the stale partial sign-off.
+  engine.green(wf, triageRun, 'simple', { ok: true });
+  engine.close(wf, triageRun);
+
+  const skipped = getArt(store, wf, 'urgent');
+  assert.equal(skipped?.acceptance, 'skipped');
+  assert.equal(skipped?.approvals, undefined, 'approvals must be cleared on the skipped ex-submitted artifact');
+
+  // the winner is later rejected — 'ticket' itself never moves (only 'simple'
+  // does), so the fingerprint-gated §16.1 rearm loop does not flip 'urgent'
+  // to 'owed' by itself (mirrors (e): the sibling stays exactly as settle left
+  // it — skipped, approvals-clean — until re-triage directly re-produces it).
+  // Re-triage fires because the now-rejected 'simple' is once again a debt.
+  engine.reject(wf, 'simple', 'human', 're-triage: now urgent');
+  t = engine.tick(wf, { now: Date.now() });
+  const triageRun2 = t.orders.find((o) => o.step === 'triage')!.run;
+
+  const beforeResubmit = getArt(store, wf, 'urgent');
+  assert.equal(beforeResubmit?.acceptance, 'skipped');
+  assert.equal(beforeResubmit?.approvals, undefined, 'skipped artifact must still have a clean approvals ledger');
+
+  const resubmitRes = engine.green(wf, triageRun2, 'urgent', { ok: true });
+  assert.equal(resubmitRes.outcome, 'submitted');
+  assert.equal(getArt(store, wf, 'urgent')?.approvals, undefined, 'resubmission starts with no approvals');
+  engine.close(wf, triageRun2);
+
+  // both judges must sign off again — the old partial sign-off from before the
+  // skip is gone, not silently satisfying the 'first' judge a second time.
+  // Same as above: both judges are eligible in parallel on one tick.
+  t = engine.tick(wf, { now: Date.now() });
+  const firstJudgeOrder2 = t.orders.find((o) => o.step === 'triage.urgent.judges.first')!;
+  const secondJudgeOrder2 = t.orders.find((o) => o.step === 'triage.urgent.judges.second')!;
+  assert.ok(firstJudgeOrder2 && secondJudgeOrder2, 'expected both judge orders on this tick');
+
+  const firstRes2 = engine.green(wf, firstJudgeOrder2.run, 'urgent', {});
+  assert.equal(firstRes2.outcome, 'approved');
+  const secondRes2 = engine.green(wf, secondJudgeOrder2.run, 'urgent', {});
+  assert.equal(secondRes2.outcome, 'green');
+  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'green');
 });
 
 // ---- (f2) eligibility never offers a NEW judge order once a winner already exists --
@@ -368,11 +531,17 @@ test('groups: (f2) eligibleFirings never offers a fresh judge order for a group-
   assert.equal(submitRes.outcome, 'submitted');
   engine.close(wf, triageRun);
 
+  // §26.2: 'urgent' auto-skips in the very same settle (engine.close's cascade)
+  // that lands 'simple' as the winner, since a submitted sibling is now
+  // covered by the auto-skip guard — it never survives to be independently
+  // suppressed by eligibleFirings.
+  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'skipped');
+
   // Before the fix, this tick would dispatch a judge order doomed to
-  // group-reject (a wasted subagent spawn). After the fix, it is suppressed.
+  // group-reject (a wasted subagent spawn). After the fix, there is no judge
+  // order because the sibling is already skipped.
   const t = engine.tick(wf);
   assert.ok(t.orders.every((o) => o.step !== 'triage.urgent.judges.sanity'));
-  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'submitted');
 });
 
 // ---- (g) checker exploration: modelCheck explores group-reject/auto-skip -------
@@ -430,6 +599,77 @@ test('groups: (h) conformance — a losing-sibling commit is refused identically
   // should be no eligible firing targeting it at all, matching the engine's post-close state.
   assert.equal(triageFiring2, undefined, 'urgent should already be auto-skipped, not re-eligible');
   assert.equal(memMap.get('urgent')?.acceptance, 'skipped');
+});
+
+// ---- (h2) differential conformance: a SUBMITTED losing sibling auto-skips
+//           identically in engine and checker, with approvals cleared on both ----
+
+test('groups: (h2) conformance — a submitted (judge-pending) losing sibling auto-skips identically in engine and checker, approvals cleared on both', () => {
+  const d = buildDef({
+    name: 'judgedConformanceDef',
+    inputs: [{ name: 'ticket', seedOwed: false }],
+    steps: [
+      {
+        name: 'triage',
+        consumes: ['ticket'],
+        produces: [
+          'simple',
+          { name: 'urgent', judges: [{ name: 'sanity', body: 'check it' }] },
+          { group: 'route', mode: 'exactlyOne', of: ['simple', 'urgent'] },
+        ],
+      },
+    ],
+  });
+
+  // Engine side: 'urgent' submits (still awaiting its judge), then 'simple' wins.
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance('judgedConformanceDef', { provide: { ticket: { text: 'x' } } });
+  const triageRun = fire(engine, wf, 'triage').run;
+  const submitRes = engine.green(wf, triageRun, 'urgent', { ok: true });
+  assert.equal(submitRes.outcome, 'submitted');
+  engine.green(wf, triageRun, 'simple', { ok: true });
+  engine.close(wf, triageRun);
+  const engineUrgent = getArt(store, wf, 'urgent');
+  assert.equal(engineUrgent?.acceptance, 'skipped');
+  assert.equal(engineUrgent?.approvals, undefined);
+
+  // In-memory (checker) side — mirror the same firing sequence via
+  // eligibleFirings/applyOutcome/settleInMemory, exactly like (h).
+  let memMap = new Map<string, ArtifactData>();
+  memMap.set('ticket', {
+    workflow: '',
+    path: 'ticket',
+    producer: 'human',
+    acceptance: 'owed',
+    version: 0,
+    reasons: [],
+    judgmentRejects: 0,
+    schemaRejects: 0,
+  });
+  memMap = settleInMemory(d, memMap);
+  memMap.set('ticket', { ...memMap.get('ticket')!, acceptance: 'green', version: 1 });
+  memMap = settleInMemory(d, memMap);
+
+  const triageFirings1 = eligibleFirings(d, memMap);
+  const urgentFiring = triageFirings1.find((f) => f.step === 'triage' && f.outputs.includes('urgent'));
+  assert.ok(urgentFiring, 'expected a triage firing targeting urgent');
+  memMap = applyOutcome(d, memMap, { ...urgentFiring!, outputs: ['urgent'] }, 'green', { maxCollectionSize: 2 })[0]!;
+  assert.equal(memMap.get('urgent')?.acceptance, 'submitted', 'urgent should be submitted, awaiting its judge');
+
+  const triageFirings2 = eligibleFirings(d, memMap);
+  const simpleFiring = triageFirings2.find((f) => f.step === 'triage' && f.outputs.includes('simple'));
+  assert.ok(simpleFiring, 'expected a triage firing targeting simple');
+  memMap = applyOutcome(d, memMap, { ...simpleFiring!, outputs: ['simple'] }, 'green', { maxCollectionSize: 2 })[0]!;
+  assert.equal(memMap.get('simple')?.acceptance, 'green');
+
+  // urgent must now match the engine: auto-skipped, approvals cleared, no
+  // eligible firing remains for it.
+  const triageFirings3 = eligibleFirings(d, memMap);
+  const urgentFiring3 = triageFirings3.find((f) => f.step === 'triage' && f.outputs.includes('urgent'));
+  assert.equal(urgentFiring3, undefined, 'submitted urgent should already be auto-skipped, not re-eligible');
+  const memUrgent = memMap.get('urgent');
+  assert.equal(memUrgent?.acceptance, 'skipped');
+  assert.equal(memUrgent?.approvals, undefined);
 });
 
 // ---- (i) human retry does not bypass group suppression -------------------------

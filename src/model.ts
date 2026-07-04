@@ -748,13 +748,17 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
 
   // §26: declarative exclusive produce-groups — auto-skip losing siblings.
   // Once a group (exactlyOne/atMostOne) has a green winner, every other member
-  // still resting in a debt state (owed/rejected) can never legally commit —
-  // the group's exclusivity is enforced at commit time by the engine's
-  // groupCasCheck, so those siblings would just stall forever without this.
-  // Auto-skip settles them; the ordinary skipped-artifact rearm loop above
-  // (which runs on the artifact's own next maintenance pass) revives them if
-  // the winner is later un-greened (rejected/retracted) and the group's
-  // fingerprint-gated inputs move again — no separate rearm code is needed.
+  // still resting in a debt state (owed/rejected) or awaiting judgment
+  // (submitted) can never legally commit — the group's exclusivity is
+  // enforced at commit time by the engine's groupCasCheck, so those siblings
+  // would just stall forever without this. A submitted sibling in particular
+  // is an OUTSTANDING state; left alone the instance can never reach
+  // done: true. Auto-skip settles them (clearing any partial approvals so a
+  // later resubmission never inherits a stale sign-off); the ordinary
+  // skipped-artifact rearm loop above (which runs on the artifact's own next
+  // maintenance pass) revives them if the winner is later un-greened
+  // (rejected/retracted) and the group's fingerprint-gated inputs move again
+  // — no separate rearm code is needed.
   for (const step of def.steps) {
     if (!step.groups || step.groups.length === 0) continue;
     for (const g of step.groups) {
@@ -765,7 +769,12 @@ export function maintainDecisions(def: WorkflowDef, arts: ArtifactMap, time?: Ti
         if (stem === winner) continue;
         const sib = arts.get(stem);
         if (!sib) continue;
-        if (sib.acceptance !== 'owed' && sib.acceptance !== 'rejected') continue; // already skipped/retracted/green
+        if (
+          sib.acceptance !== 'owed' &&
+          sib.acceptance !== 'rejected' &&
+          sib.acceptance !== 'submitted'
+        )
+          continue; // already skipped/retracted/green
         ops.push({
           kind: 'skip',
           path: stem,
@@ -1613,10 +1622,15 @@ function applyOpInMemory(
     return;
   }
   if (op.kind === 'skip') {
-    // mirrors Engine.applyOp skip branch: acceptance → 'skipped' + fingerprint
+    // mirrors Engine.applyOp skip branch: acceptance → 'skipped' + fingerprint.
+    // §26.2: also mirrors the approvals-clear now applied on the engine side —
+    // a submitted sibling auto-skipped out of a losing group must not carry a
+    // stale partial sign-off into a later re-arm.
+    const clearApprovals = art.acceptance === 'submitted' && art.approvals !== undefined;
     arts.set(op.path, {
       ...art,
       acceptance: 'skipped',
+      ...(clearApprovals ? { approvals: undefined } : {}),
       fingerprint: computeFingerprint(arts, requiredInputs(def, arts, art)),
     });
     return;
