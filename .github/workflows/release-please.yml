@@ -20,7 +20,18 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
+      # Mint a short-lived token from the org's release App. Using this instead
+      # of the default GITHUB_TOKEN is what lets the release PR trigger other
+      # workflows (CI, CLA, pr-title) -- GITHUB_TOKEN-authored events can't, so
+      # required checks would otherwise hang unreported and the PR couldn't merge.
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
       - uses: googleapis/release-please-action@v4
         with:
+          token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
