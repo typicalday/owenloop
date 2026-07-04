@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/typicalday/owenloop/compare/v0.1.1...v0.2.0) (2026-07-04)
+
+
+### Features
+
+* per-produce override of maxAttempts / maxSchemaFailures ([#8](https://github.com/typicalday/owenloop/issues/8)) ([3285720](https://github.com/typicalday/owenloop/commit/32857203d0b587077733110f1231b272e39fed83))
+
+
+### Bug Fixes
+
+* eligibleFirings never offers a firing groupCasCheck will refuse ([#9](https://github.com/typicalday/owenloop/issues/9)) ([024b78f](https://github.com/typicalday/owenloop/commit/024b78f61094ba1fbce274ffa9d331a48fdc972f))
+
 ## [0.1.1](https://github.com/typicalday/owenloop/compare/v0.1.0...v0.1.1) (2026-07-04)
 
 
