@@ -71,6 +71,10 @@ Repeat until `status` says `done: true`:
    yourself. Where subagent calls block, the call is your wait; on hosts where
    they run async, block on their completion before moving on — never
    fire-and-forget.
+   Check `order.worker` before briefing: absent or `'agent'` means dispatch a
+   subagent exactly as described below. Any other value (e.g. `'command'`)
+   means the order is for a *different* kind of executor — see "Resolving
+   `worker`" below before dispatching it as if it were an agent order.
 3. **Verify each run closed.** A worker that returns without closing leaves a
    claimed lease. Check `status.inFlight`; if its run is still open:
    `owenloop close <wf> <run> --outcome failed --summary "worker did not close"`.
@@ -139,6 +143,21 @@ An order may also carry `workdir` — an opaque location hint the def chose to
 set (absent otherwise). Treat it as a hint about *where within the working
 location* to act, and fold it into the briefing's working-location line; it is
 never a path for you to resolve or enforce.
+
+**Resolving `worker`.** An order may carry a `worker` label declaring which
+kind of executor it's for. Absent, or `'agent'`, is today's default and the
+only case this skill drives directly: dispatch a fresh subagent exactly as
+described above. Any other value (`'command'`, or a label your host defines)
+means the order is *not* for an LLM subagent at all — it's for whatever
+non-agent executor your host wires up for that label, using the order's
+`command` (opaque — a string, never parsed or shelled out by you) and `spec`
+(an opaque config map) to decide how to run it. You are still the conductor
+for that order: still tick, still verify the run closed, still report
+honestly — you simply hand it to the matching executor instead of an agent
+subagent. If your host has no executor wired up for a worker value you see,
+that's a blocker, not something to paper over by running it as an agent
+anyway (the def's author deliberately chose a non-agent worker for that
+step) — escalate it.
 
 ## Judges — verdicts are orders too
 

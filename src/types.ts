@@ -214,6 +214,17 @@ export interface ProducePattern {
     inputs?: boolean; // default false: judge sees only the judged value
     cadence?: string;
     maxRunsPerDay?: number;
+    /** Declares which kind of executor this judge's synthesized order is for.
+     *  Same opaque-passthrough contract as StepDef.worker — default 'agent'
+     *  when omitted. */
+    worker?: string;
+    /** Required when worker is 'command'; the command string for that worker
+     *  to run. Opaque to the engine — never parsed, never shelled out. */
+    command?: string;
+    /** Optional opaque config object for a non-agent/non-command worker type
+     *  (or additionally alongside `command`). Shape-checked as a plain map
+     *  only (mirrors `x:`'s asExtension contract) — contents never read. */
+    spec?: Record<string, unknown>;
   }>;
 }
 
@@ -271,6 +282,19 @@ export interface StepDef {
    *  model.ts effectiveMaxSchemaFailures()). */
   maxSchemaFailures: number;
   model?: string;
+  /** Declares which kind of executor this step's order is for. Default
+   *  'agent' when omitted (today's behavior — every existing def is
+   *  unchanged). Opaque to the engine beyond the shape rules validateDef
+   *  enforces; carried through verbatim on the Order, same contract as
+   *  `model`. */
+  worker?: string;
+  /** Required when worker is 'command'; the command string for that worker
+   *  to run. Opaque to the engine — never parsed, never shelled out. */
+  command?: string;
+  /** Optional opaque config object for a non-agent/non-command worker type
+   *  (or additionally alongside `command`). Shape-checked as a plain map
+   *  only (mirrors `x:`'s asExtension contract) — contents never read. */
+  spec?: Record<string, unknown>;
   /** opaque location hint passed through on the order; no default — absent unless the def sets it */
   workdir?: string;
   /** the step's output is a destructive completion (e.g. a merge): green is terminal (§15.2) */
@@ -328,6 +352,10 @@ export interface WorkflowDef {
   /** §27.3: opaque workflow-level extension map (`x:`). Validated as a plain
    *  map at load time, never interpreted by the engine. */
   x?: Record<string, unknown>;
+  /** Optional allow-list of worker values; when present, validateDef errors
+   *  on any step/judge whose `worker` is not in this list (typo guard).
+   *  Absent = any worker string accepted. */
+  workers?: string[];
   /**
    * @internal Mode 1 include directives before expansion. Set by `buildDef` when a
    * step-list entry has an `include:` key. Consumed and removed by `expandIncludes`.

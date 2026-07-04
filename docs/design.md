@@ -1180,6 +1180,88 @@ prefixing untouched (there are no stems inside `x:` to rewrite — it's
 opaque); a child definition's own top-level `x:` stays on the child def and
 is not merged into the parent's.
 
+### §27.4 `worker:`/`command:`/`spec:` — declaring the executor
+
+`x:` (§27.3) is a namespaced escape hatch for arbitrary external vocabulary.
+`worker:` is a narrower, purpose-built field for one specific job: telling
+whatever dispatches orders *which kind* of executor a step's order is for. It
+follows the same opaque-passthrough contract as `model` — the engine never
+interprets it, only carries it — but unlike `model` (a free-form quality
+hint) and unlike `x:` (fully unvalidated contents), `worker:` gets two narrow,
+hard-coded shape rules, because the two most common worker types have a
+structural precondition the engine can cheaply catch at load time instead of
+letting it surface as a confusing runtime stall.
+
+**The contract, four clauses:**
+
+1. **Default is `'agent'`, and that default is silent.** A step (or judge)
+   that omits `worker:` entirely behaves exactly as it did before this
+   feature existed — every def in this repo predating `worker:` is
+   unaffected, byte for byte. The default is applied at validation and
+   engine-order-building time, never written back into the parsed def.
+2. **`worker: command` requires `command:`.** A step (or judge) whose
+   effective worker is `'command'` and carries no `command:` is a load-time
+   `DefError`: `` step '<name>' has worker 'command' but no command: ``. Any
+   other worker string has no such requirement — `command:` is only ever
+   validated when the worker is literally `'command'`.
+3. **`worker: agent` (explicit) requires a non-empty `body:`.** This check is
+   deliberately scoped to an *explicit* `worker: agent`, not the *defaulted*
+   value — i.e. `validateDef` checks `l.worker === 'agent'`, never
+   `(l.worker ?? 'agent') === 'agent'`. That distinction matters: plenty of
+   existing fixtures and generator-only steps rely on `buildStep`'s
+   empty-body default and never write `worker:` at all. Checking the
+   defaulted value would retroactively break every one of them. Checking
+   only the explicit form catches the actual mistake this rule exists for —
+   someone opts into `worker: agent` on purpose and forgets the prompt —
+   without touching a single pre-existing def.
+4. **`command:` and `spec:` are otherwise opaque.** `command` is
+   shape-checked as a string (`asString`); `spec` is shape-checked as a plain
+   map (`asExtension` — the same helper `x:` uses, reused verbatim, no new
+   helper). Neither's *contents* are read, parsed, or interpreted by the
+   engine. `spec` exists for cases where `command` alone isn't enough
+   configuration (a timeout, a working directory hint, environment
+   overrides) without inventing a new field per knob — the same "shape, not
+   contents" philosophy as `x:`, just scoped to one step instead of the
+   whole def.
+
+**The optional `workers:` allow-list.** A definition can declare `workers:
+[agent, command, …]` at the top level — a typo guard, nothing more. When
+present, `validateDef` rejects any step or judge whose *effective* worker
+(after the `?? 'agent'` default is applied) isn't in the list. This runs
+**after** the default, deliberately: a def that declares `workers: [command]`
+(excluding `'agent'` on purpose) still fails a step that omits `worker:`
+entirely, because that step's effective worker is `'agent'` and `'agent'`
+isn't in the list. This is the intended behavior — once a def opts into the
+allow-list, it's exhaustive, and a step relying on the silent default doesn't
+get a free pass around it. A def with no `workers:` key accepts any worker
+string; there is no engine-wide registry of valid worker types to check
+against.
+
+**Pass-through.** `worker`, `command`, and `spec` all ride `buildOrder` onto
+the emitted `Order` untouched — `Order.worker`, `Order.command`, `Order.spec`
+— the same pass-through contract as `Order.model` and `Order.x`. A step that
+never sets them emits an order with all three fields absent, identical to
+before this feature existed.
+
+**Judges get the same fields, for free.** §24's `synthesizeJudgeSteps` turns
+each `judges:` entry into an ordinary `StepDef` — so a judge entry accepting
+`worker:`/`command:`/`spec:` and having the exact same `validateDef` rules
+apply to it isn't a separate code path, it's the same rules running against
+an already-existing synthesized step. A judge can therefore be a
+deterministic check (a script's exit code) instead of an LLM verdict, without
+any new validation logic. Note the pre-existing, orthogonal judge
+requirement — every judge needs `body:` or `bodyFile:` regardless of
+`worker:` — still applies; a `worker: command` judge still declares a
+`body:`, it's simply unread by a non-agent dispatcher.
+
+**Scope notes**, mirroring §27.3's: `worker`/`command`/`spec` are additive
+and inert — a definition that never sets any of the three is unchanged in
+behavior and in `hashDef` terms. They live on the same two authored,
+engine-fired shapes as `x:` (a normal step, and — new here — a judge entry),
+participate in §28 pinning the same way (snapshotted at `createInstance`,
+and a later edit is real `hashDef` drift), and pass through `expandIncludes`
+prefixing untouched (there are no stems inside them to rewrite).
+
 ## §28 Instance-to-definition pinning
 
 Every prior section treats a workflow *definition* as the stable thing and a

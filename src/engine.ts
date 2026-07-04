@@ -80,6 +80,16 @@ export interface Order {
   outputs: string[];
   workdir?: string;
   model?: string;
+  /** Declares which kind of executor this order is for. Absent = 'agent'
+   *  (today's behavior). Opaque to the engine; carried through verbatim from
+   *  the step definition, same pass-through contract as `model`/`x`. */
+  worker?: string;
+  /** The command string for a `worker: command` order. Opaque to the engine
+   *  — never parsed, never shelled out. */
+  command?: string;
+  /** Opaque config object for a non-agent/non-command worker type (or
+   *  alongside `command`). Carried through untouched, contents never read. */
+  spec?: Record<string, unknown>;
   /** §27.3: the step's opaque `x:` extension map, carried through untouched
    *  (same pass-through contract as `model`). The engine never reads it —
    *  it exists for the external runner/tooling consuming this order. */
@@ -828,6 +838,9 @@ export class Engine {
     if (f.index !== undefined) order.index = f.index;
     if (step.workdir !== undefined) order.workdir = step.workdir;
     if (step.model !== undefined) order.model = step.model;
+    if (step.worker !== undefined) order.worker = step.worker;
+    if (step.command !== undefined) order.command = step.command;
+    if (step.spec !== undefined) order.spec = step.spec;
     if (step.x !== undefined) order.x = step.x;
     if (f.cause !== undefined) order.cause = f.cause;
     return order;
