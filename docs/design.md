@@ -907,21 +907,39 @@ sibling's auto-skip.
 Auto-skip is implemented purely inside `maintainDecisions` (model.ts) — the
 same pure, level-triggered fixpoint function §11.8/§12.3 already uses for
 reject/retract/skip/rearm/pin/arm. For every `exactlyOne`/`atMostOne` group
-with exactly one `green` member, every `owed`/`rejected` sibling gets a `skip`
-op with `rejectKind: 'exclusive'` (a new `RejectKind`, alongside `judgment` /
-`structural` / `validation` / `invalidated-irreversible` — a liveness-
-accounting category, distinct from the skip's `ReasonAction`, which stays
-`'skip'`). Because `Engine.settle()` runs this cascade to a full fixpoint
-synchronously at the end of every `green()` call, the auto-skip is already
-visible by the time the winning `green()` call returns — a caller never
-observes an intermediate state where the winner is green but the loser is
-still `owed`.
+with exactly one `green` member, every `owed`, `rejected`, **or `submitted`**
+sibling gets a `skip` op with `rejectKind: 'exclusive'` (a new `RejectKind`,
+alongside `judgment` / `structural` / `validation` / `invalidated-irreversible`
+— a liveness-accounting category, distinct from the skip's `ReasonAction`,
+which stays `'skip'`). Because `Engine.settle()` runs this cascade to a full
+fixpoint synchronously at the end of every `green()` call, the auto-skip is
+already visible by the time the winning `green()` call returns — a caller
+never observes an intermediate state where the winner is green but the loser
+is still `owed` or `submitted`.
+
+A `submitted` sibling is an OUTSTANDING state (§15): left uncovered by this
+cascade, a judged group member that submits before its sibling wins can never
+be settled — its judge order is correctly suppressed by §26.5's eligibility
+pre-filter, but the artifact itself just sits `submitted` forever, wedging the
+instance out of `done: true` permanently. Covering `submitted` here closes
+that gap. Skipping a `submitted` sibling also **clears its `approvals`
+ledger** (mirrors the cascade-reject approvals-clear, §24 §4.3): a partial
+judge sign-off recorded before the skip must never leak onto a later
+resubmission if the winning sibling is later un-greened and the branch
+revives — `Engine.applyOp`'s `'skip'` branch and its pure in-memory twin,
+`applyOpInMemory`'s `'skip'` branch (the checker's own reimplementation, since
+`settleInMemory` calls `maintainDecisions` directly and inherits the cascade
+fix for free, but `applyOpInMemory` mirrors the engine's mutation 1:1 and
+needs the same approvals-clear applied independently), both clear `approvals`
+on the skipped artifact whenever its prior acceptance was `submitted`.
 
 Re-arming an auto-skipped sibling needs zero group-specific code: it goes
 through the exact same generic skip-re-arm mechanism (fingerprint-keyed,
 §7) that already re-arms a manually-skipped branch when its upstream inputs
 move. `rejectKind: 'exclusive'` only changes how the artifact is
-*classified* for liveness accounting; it does not change how it re-arms.
+*classified* for liveness accounting; it does not change how it re-arms — and
+the cleared approvals ledger travels with it, so a re-armed (or freshly
+re-produced) sibling always starts its judge ledger from empty.
 
 ### §26.3 Grammar and validation
 
@@ -966,16 +984,19 @@ sibling in this stem's group already sit green?" Every WORKER-firing branch
 output path that is currently group-blocked, so the automatic sweep (`tick`)
 never dispatches an order — in particular, never spawns a judge order for a
 `submitted` sibling — that `groupCasCheck` is guaranteed to refuse the moment
-it tries to land green. This closes a real gap: before this fix, a `submitted`
-group member (one gated by `judges:`) was never auto-skipped by §26.2's
-cascade (auto-skip only acts on `owed`/`rejected` siblings), so its judge kept
-firing every tick until a human intervened — a wasted subagent spawn on every
-tick, not a correctness bug (the judge's `green()` call was always correctly
-refused), but pure waste this fix eliminates (`test/groups.test.ts` scenario
-(f2)). `groupCasCheck` itself stays load-bearing for a judge order that was
-already claimed (in flight) before the winner landed — the pre-filter only
-stops a *new* order from being offered, so scenario (f) still exercises the
-commit-time refusal against that in-flight race.
+it tries to land green. Historically this pre-filter was the only defense for
+a `submitted` group loser: §26.2's cascade covered only `owed`/`rejected`
+siblings, so a `submitted` member just sat there — its judge order suppressed
+from firing again, but the artifact itself never settled, wedging the
+instance out of `done: true` forever (a liveness bug, not merely wasted
+spawns). §26.2 now also auto-skips a `submitted` loser in the same settle as
+the winner's commit, so this eligibility pre-filter and that cascade converge:
+a `submitted` sibling is skipped essentially as soon as it stops being newly
+eligible (`test/groups.test.ts` scenario (f3)). `groupCasCheck` itself stays
+load-bearing for a judge order that was already claimed (in flight) before the
+winner landed — the pre-filter and the cascade both only act going forward, so
+scenario (f) still exercises the commit-time refusal against that in-flight
+race.
 
 Suppression applies to the automatic sweep only. A human `retry` re-arms the
 named artifact directly and does not itself run `eligibleFirings` — but the
