@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1](https://github.com/typicalday/owenloop/compare/v0.2.0...v0.2.1) (2026-07-04)
+
+
+### Bug Fixes
+
+* auto-skip submitted group siblings to prevent permanent wedge ([#15](https://github.com/typicalday/owenloop/issues/15)) ([484aea2](https://github.com/typicalday/owenloop/commit/484aea20d682196574b5c8c7da35bfd3e10619d3))
+* catch child schema refusals as debts and version-pin the calls: mirror ([#16](https://github.com/typicalday/owenloop/issues/16)) ([500cce7](https://github.com/typicalday/owenloop/commit/500cce7152023391c19393ee5dcb18d802a6b2e8))
+* close three commit-side verb guard gaps (F3, F5, F7) ([#11](https://github.com/typicalday/owenloop/issues/11)) ([fbcc777](https://github.com/typicalday/owenloop/commit/fbcc77700fefcf66f287e5e903ad7c03e9b59b64))
+* refuse emit after the collection seal has greened (§11.1, F6) ([#17](https://github.com/typicalday/owenloop/issues/17)) ([cd963cf](https://github.com/typicalday/owenloop/commit/cd963cf9296504dc0278f9fa68d097a60e318c0f))
+* ship src/ in the npm files allowlist ([#13](https://github.com/typicalday/owenloop/issues/13)) ([20ffcea](https://github.com/typicalday/owenloop/commit/20ffcea9132610203ef9da3cfa147990ad157ca9))
+
 ## [0.2.0](https://github.com/typicalday/owenloop/compare/v0.1.1...v0.2.0) (2026-07-04)
 
 
