@@ -110,6 +110,18 @@ rebuild it. The step has demonstrably failed; a human must intervene.
 `status.debts[].stalled` surfaces either; `blocked` deliberately excludes a
 stalled step (it isn't waiting on an input — it's out of attempts).
 
+`maxAttempts` (and `maxSchemaFailures`, §19) is set on the *step* and applies
+to every one of its produces as a **default**. A `{name, ...}` produce entry
+may override either cap for itself — `maxAttempts:` / `maxSchemaFailures:` on
+the produce, not the step — when one output needs a tighter or looser bound
+than its siblings (`group:` produce entries carry no such override; they
+aren't a `{name, ...}` produce and always defer to the step). `cap` in
+`isStalled`/`isSchemaStalled` above is resolved per-artifact by
+`effectiveMaxAttempts()` / `effectiveMaxSchemaFailures()` (model.ts):
+`produce?.maxAttempts ?? step.maxAttempts`, so an explicit `0` on the produce
+is honored rather than falling through to the step default — only an
+*absent* override inherits.
+
 Held artifacts (`isHeld`, §20) also surface as `stalled: true` in
 `workflowStatus.debts`. A held step is not waiting on an input — it fired an
 irreversible side effect and must not silently re-fire; a human must `retry` or
@@ -291,7 +303,10 @@ a malformed value, not a consumer disagreeing with a sound one. Once
 (`isSchemaStalled`): it stays a debt but stops re-arming, exactly like a §6
 judgment stall. The two caps (`maxSchemaFailures`, default 5; `maxAttempts`) are
 tuned independently, a `maxSchemaFailures` of 0 disables the schema stall, and a
-single `retry` resets *both* counters. `validateValue` is total — a schema that
+single `retry` resets *both* counters. Like `maxAttempts` (§6), `maxSchemaFailures`
+is a step-level default that an individual `{name, ...}` produce may override;
+the override rules are identical (`??` fallback, an explicit produce-level `0`
+honored, `group:` entries unaffected). `validateValue` is total — a schema that
 somehow throws at validate time (an unresolved `$ref`, a stack overflow on a
 self-referential schema + deeply nested value) is folded into an ordinary
 validation failure rather than crashing the commit, and the surrounding
@@ -729,7 +744,10 @@ steps:
             model: strong             # optional, per-judge model
             inputs: true              # optional, default false — judge also
                                       # reads the producer's inputs (question)
-    maxAttempts: 5    # producer's cap — also bounds judge-reject → rebuild loops
+        maxAttempts: 8    # optional, §6 — overrides the step default below
+                          # just for `report`; absent caps still inherit
+    maxAttempts: 5    # producer's cap (default for every produce on this step)
+                      # — also bounds judge-reject → rebuild loops
 ```
 
 - `name:` — required; keys the sign-off ledger and the audit trail.
