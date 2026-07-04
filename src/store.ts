@@ -557,7 +557,10 @@ export class Store {
   // -- artifact ----------------------------------------------------------------
 
   getArtifact(workflow: string, path: string): ArtifactRow | undefined {
-    return this.getArtifactById(artifactId(workflow, path));
+    const r = this.db
+      .prepare('SELECT * FROM artifact WHERE workflow = ? AND path = ?')
+      .get(workflow, path) as ArtifactRowRaw | undefined;
+    return r ? mapArtifact(r) : undefined;
   }
 
   getArtifactById(id: string): ArtifactRow | undefined {
@@ -585,7 +588,7 @@ export class Store {
             reasons, judgment_rejects, schema_rejects, seal_of, terminal, approvals, updated_at)
          VALUES (@id, @workflow, @path, @producer, @acceptance, @version, @value, @fingerprint,
             @reasons, @judgment_rejects, @schema_rejects, @seal_of, @terminal, @approvals, @updated_at)
-         ON CONFLICT(id) DO UPDATE SET
+         ON CONFLICT(workflow, path) DO UPDATE SET
            producer = excluded.producer,
            acceptance = excluded.acceptance,
            version = excluded.version,
@@ -616,19 +619,19 @@ export class Store {
         approvals: toJson(data.approvals),
         updated_at: at,
       });
-    return this.getArtifactById(id) as ArtifactRow;
+    return this.getArtifact(data.workflow, data.path) as ArtifactRow;
   }
 
   deleteArtifact(workflow: string, path: string): void {
-    this.db.prepare('DELETE FROM artifact WHERE id = ?').run(artifactId(workflow, path));
+    this.db.prepare('DELETE FROM artifact WHERE workflow = ? AND path = ?').run(workflow, path);
   }
 
   // -- task --------------------------------------------------------------------
 
   getTask(workflow: string, step: string, key: string): TaskRow | undefined {
-    const r = this.db.prepare('SELECT * FROM task WHERE id = ?').get(taskId(workflow, step, key)) as
-      | TaskRowRaw
-      | undefined;
+    const r = this.db
+      .prepare('SELECT * FROM task WHERE workflow = ? AND step = ? AND key = ?')
+      .get(workflow, step, key) as TaskRowRaw | undefined;
     return r ? mapTask(r) : undefined;
   }
 
@@ -653,7 +656,7 @@ export class Store {
       .prepare(
         `INSERT INTO task (id, workflow, step, key, status, run, claimed_at, attempts, alarm_at, heartbeat_at, updated_at)
          VALUES (@id, @workflow, @step, @key, @status, @run, @claimed_at, @attempts, @alarm_at, @heartbeat_at, @updated_at)
-         ON CONFLICT(id) DO UPDATE SET
+         ON CONFLICT(workflow, step, key) DO UPDATE SET
            status = excluded.status,
            run = excluded.run,
            claimed_at = excluded.claimed_at,
@@ -686,11 +689,10 @@ export class Store {
 
   /** Persist an absolute alarm time for an idle evaluator step. */
   setAlarm(workflow: string, step: string, at: number): void {
-    const id = taskId(workflow, step, '');
     const existing = this.getTask(workflow, step, '');
     if (existing) {
-      this.db.prepare('UPDATE task SET alarm_at = ?, updated_at = ? WHERE id = ?')
-        .run(at, nowMs(), id);
+      this.db.prepare('UPDATE task SET alarm_at = ?, updated_at = ? WHERE workflow = ? AND step = ? AND key = ?')
+        .run(at, nowMs(), workflow, step, '');
     } else {
       // Rare: evaluator step has never been ticked. Insert a minimal idle row.
       this.putTask({ workflow, step, key: '', status: 'idle', attempts: 0, alarmAt: at });
@@ -699,17 +701,15 @@ export class Store {
 
   /** Clear the alarm (set alarm_at = NULL). */
   clearAlarm(workflow: string, step: string): void {
-    const id = taskId(workflow, step, '');
-    this.db.prepare('UPDATE task SET alarm_at = NULL, updated_at = ? WHERE id = ?')
-      .run(nowMs(), id);
+    this.db.prepare('UPDATE task SET alarm_at = NULL, updated_at = ? WHERE workflow = ? AND step = ? AND key = ?')
+      .run(nowMs(), workflow, step, '');
   }
 
   /** Update only heartbeat_at on the task row — targeted write, no read-modify-write. */
   touchHeartbeat(workflow: string, step: string, key: string, now: number): void {
-    const id = taskId(workflow, step, key);
     this.db.prepare(
-      'UPDATE task SET heartbeat_at = ?, updated_at = ? WHERE id = ?'
-    ).run(now, nowMs(), id);
+      'UPDATE task SET heartbeat_at = ?, updated_at = ? WHERE workflow = ? AND step = ? AND key = ?'
+    ).run(now, nowMs(), workflow, step, key);
   }
 
   /**
