@@ -127,13 +127,26 @@ Held artifacts (`isHeld`, §20) also surface as `stalled: true` in
 irreversible side effect and must not silently re-fire; a human must `retry` or
 fix the upstream cause.
 
+A `reject()` (judgment verdict) requires the target to already be a *built*
+version — `green` or `submitted` — and refuses otherwise (a thrown Error): an
+`owed` artifact has no build to render a verdict on (rejecting it would burn a
+`judgmentRejects` toward the cap above with zero build attempts, a silent
+freeze), and a `retracted` collection member is terminal (§11.3) — no firing
+shape can ever rebuild it, so flipping it back to a live `rejected` debt would
+wedge the instance.
+
 Clearing a stall:
 - **`retry`** — reset *both* counters to 0 and re-owe the artifact (optionally
   with fresh guidance appended as a `retry` reason). The only path that resets
   the counters. Also clears the held condition: a `retry` appends a `'retry'`
   reason entry, so the last entry's `kind` is no longer `'invalidated-irreversible'`
-  and `isHeld` returns false.
-- **`retract`** — drop the member (collection elements).
+  and `isHeld` returns false. Requires the same consume-edge authority as
+  `reject`/`retract` (§4.1), and refuses a `retracted` target — retract is
+  final, and a bare collection element has no producer firing that could ever
+  rebuild it.
+- **`retract`** — drop the member (collection elements), terminally. Requires
+  the same consume-edge authority as `reject` (§4.1): only a step that
+  consumes the member's stem (or human/engine) may retract it.
 
 ## §7 The forward cascade (level-triggered)
 
@@ -689,6 +702,13 @@ verbs with no new CLI surface:
 - **`retry`** — clears `approvals` in addition to the existing counter reset,
   so a human clearing a judge-reject stall doesn't leave a stale partial
   ledger for the rebuild to inherit.
+
+A human bypass's scope is deliberately narrow: it skips the judge ledger and
+the lease/CAS machinery, but not the artifact's declared output schema — a
+human `green` on a produce with a `schema:` is validated exactly like a
+producer commit (§18), refused with a thrown Error (no version bump, no
+schemaRejects bump — there is no retry loop to protect on this path) rather
+than silently landing a value downstream consumers assume is schema-valid.
 
 ### §24.7 `CommitResult['outcome']` — three success outcomes, two failure
 
