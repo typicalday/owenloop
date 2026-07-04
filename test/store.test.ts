@@ -684,3 +684,91 @@ test('§28: newer-than-binary (7) still refuses to open at SCHEMA_VERSION 6', ()
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('legacy/foreign id rows are addressed by natural key, not recomputed id', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const now = Date.now();
+
+  // -- artifact: raw-insert a row whose stored id does NOT match what
+  // artifactId(wf, 'plan') would compute today (simulating an older engine's
+  // id-derivation formula).
+  const legacyArtId = 'legacy-art-id-does-not-match-derivation';
+  s.db
+    .prepare(
+      `INSERT INTO artifact
+         (id, workflow, path, producer, acceptance, version, value, fingerprint,
+          reasons, judgment_rejects, schema_rejects, seal_of, terminal, approvals, updated_at)
+       VALUES (@id, @workflow, @path, @producer, @acceptance, @version, @value, @fingerprint,
+          @reasons, @judgment_rejects, @schema_rejects, @seal_of, @terminal, @approvals, @updated_at)`,
+    )
+    .run({
+      id: legacyArtId,
+      workflow: wf,
+      path: 'plan',
+      producer: 'maker',
+      acceptance: 'owed',
+      version: 0,
+      value: null,
+      fingerprint: null,
+      reasons: '[]',
+      judgment_rejects: 0,
+      schema_rejects: 0,
+      seal_of: null,
+      terminal: 0,
+      approvals: null,
+      updated_at: now,
+    });
+
+  // Upsert by natural key must not throw UNIQUE constraint failed, and must
+  // update the existing legacy-id row rather than colliding.
+  assert.doesNotThrow(() => s.putArtifact(artifact(wf, 'plan', { acceptance: 'green', version: 5 })));
+  const gotArt = s.getArtifact(wf, 'plan');
+  assert.equal(gotArt?.acceptance, 'green');
+  assert.equal(gotArt?.version, 5);
+  // The surrogate id is preserved across the upsert, never recomputed.
+  assert.equal(gotArt?.id, legacyArtId);
+
+  s.deleteArtifact(wf, 'plan');
+  assert.equal(s.getArtifact(wf, 'plan'), undefined);
+
+  // -- task: same shape.
+  const legacyTaskId = 'legacy-task-id-does-not-match-derivation';
+  s.db
+    .prepare(
+      `INSERT INTO task (id, workflow, step, key, status, run, claimed_at, attempts, alarm_at, heartbeat_at, updated_at)
+       VALUES (@id, @workflow, @step, @key, @status, @run, @claimed_at, @attempts, @alarm_at, @heartbeat_at, @updated_at)`,
+    )
+    .run({
+      id: legacyTaskId,
+      workflow: wf,
+      step: 'build',
+      key: '',
+      status: 'idle',
+      run: null,
+      claimed_at: null,
+      attempts: 0,
+      alarm_at: null,
+      heartbeat_at: null,
+      updated_at: now,
+    });
+
+  assert.doesNotThrow(() =>
+    s.putTask({ workflow: wf, step: 'build', key: '', status: 'claimed', attempts: 1 }),
+  );
+  const gotTask = s.getTask(wf, 'build', '');
+  assert.equal(gotTask?.status, 'claimed');
+  assert.equal(gotTask?.attempts, 1);
+  assert.equal(gotTask?.id, legacyTaskId);
+
+  s.touchHeartbeat(wf, 'build', '', now + 1);
+  assert.equal(s.getTask(wf, 'build', '')?.heartbeatAt, now + 1);
+
+  s.setAlarm(wf, 'build', now + 2);
+  assert.equal(s.getTask(wf, 'build', '')?.alarmAt, now + 2);
+
+  s.clearAlarm(wf, 'build');
+  assert.equal(s.getTask(wf, 'build', '')?.alarmAt, undefined);
+
+  s.close();
+});
