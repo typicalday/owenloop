@@ -192,6 +192,15 @@ export interface ProducePattern {
   suffix: string;
   /** optional JSON Schema the produced value must satisfy at commit time (§19) */
   schema?: JsonSchema;
+  /** §6/§18 per-produce override of the step's maxAttempts (judgment-reject
+   *  stall cap). Falls back to the owning step's maxAttempts when absent —
+   *  see model.ts effectiveMaxAttempts(). Only meaningful on {name,...}
+   *  produces (not group: declarations, which don't produce a ProducePattern
+   *  at all). */
+  maxAttempts?: number;
+  /** §6/§18 per-produce override of the step's maxSchemaFailures. Same
+   *  fallback rule as maxAttempts. */
+  maxSchemaFailures?: number;
   /**
    * §24 judges: optional quality gate(s) on this produce entry. v1: singleton
    * produces only (validateDef hard-errors otherwise). Each entry is resolved
@@ -252,8 +261,14 @@ export interface StepDef {
   cadenceSecs: number;
   maxRunsPerDay: number;
   parallel: number;
+  /** §6/§18: judgment-reject stall cap. This is the step-level DEFAULT for
+   *  this step's produces — an individual produce may override it via
+   *  ProducePattern.maxAttempts (see model.ts effectiveMaxAttempts()). */
   maxAttempts: number;
-  /** §19: how many schema-validation failures an output may accrue before it stalls */
+  /** §19: how many schema-validation failures an output may accrue before it
+   *  stalls. Step-level DEFAULT for this step's produces — an individual
+   *  produce may override it via ProducePattern.maxSchemaFailures (see
+   *  model.ts effectiveMaxSchemaFailures()). */
   maxSchemaFailures: number;
   model?: string;
   /** opaque location hint passed through on the order; no default — absent unless the def sets it */

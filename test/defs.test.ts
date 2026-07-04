@@ -153,7 +153,7 @@ test('buildDef rejects consumes that are not a list of strings', () => {
 test('buildDef rejects a produce entry that is neither a string nor a { name, schema }', () => {
   assert.throws(
     () => buildDef({ name: 'bad', inputs: [{ name: 'a' }], steps: [{ name: 'x', consumes: ['a'], produces: [42] }] }),
-    /must be a string or a \{ name, schema, judges \} mapping/,
+    /must be a string or a \{ name, schema, judges, maxAttempts, maxSchemaFailures \} mapping/,
   );
 });
 
@@ -1027,7 +1027,7 @@ test('generates: invalid entry (non-string/non-object) throws DefError', () => {
       inputs: [{ name: 'q' }],
       steps: [{ name: 'a', consumes: ['q'], generates: [42], terminal: true }],
     }),
-    (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema, judges \} mapping/.test((e as Error).message),
+    (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema, judges, maxAttempts, maxSchemaFailures \} mapping/.test((e as Error).message),
   );
 });
 
@@ -2194,4 +2194,65 @@ test('§28 hashDef: is a short hex string', () => {
   const h = hashDef(a);
   assert.equal(h.length, 16);
   assert.match(h, /^[0-9a-f]{16}$/);
+});
+
+// ---- per-produce maxAttempts/maxSchemaFailures override -----------------------
+
+test('parseProduces accepts and attaches a per-produce maxAttempts/maxSchemaFailures override', () => {
+  const wf = parseDef({
+    name: 'caps-per-produce',
+    inputs: [{ name: 'plan' }],
+    steps: [
+      {
+        name: 'builder',
+        consumes: ['plan'],
+        maxAttempts: 5,
+        produces: [
+          { name: 'pr' },
+          { name: 'consultRequest', maxAttempts: 2, maxSchemaFailures: 1 },
+        ],
+      },
+    ],
+  });
+  const [pr, consultRequest] = wf.steps[0]!.produces;
+  assert.equal(pr!.maxAttempts, undefined);
+  assert.equal(pr!.maxSchemaFailures, undefined);
+  assert.equal(consultRequest!.maxAttempts, 2);
+  assert.equal(consultRequest!.maxSchemaFailures, 1);
+});
+
+test('parseProduces: unknown key on a produce mapping is still rejected alongside maxAttempts (regression)', () => {
+  assert.throws(
+    () =>
+      buildDef({
+        name: 'wf',
+        inputs: [{ name: 'q' }],
+        steps: [{ name: 'a', consumes: ['q'], produces: [{ name: 'y', maxAttempts: 2, bogus: true }] }],
+      }),
+    (e: unknown) => e instanceof DefError && /unknown key 'bogus'/.test((e as Error).message),
+  );
+});
+
+test('parseProduces: negative maxAttempts on a produce throws a DefError naming the produce', () => {
+  assert.throws(
+    () =>
+      buildDef({
+        name: 'wf',
+        inputs: [{ name: 'q' }],
+        steps: [{ name: 'a', consumes: ['q'], produces: [{ name: 'pr', maxAttempts: -1 }] }],
+      }),
+    (e: unknown) => e instanceof DefError && /pr.*maxAttempts.*non-negative/.test((e as Error).message),
+  );
+});
+
+test('parseProduces: negative maxSchemaFailures on a produce throws a DefError naming the produce', () => {
+  assert.throws(
+    () =>
+      buildDef({
+        name: 'wf',
+        inputs: [{ name: 'q' }],
+        steps: [{ name: 'a', consumes: ['q'], produces: [{ name: 'pr', maxSchemaFailures: -1 }] }],
+      }),
+    (e: unknown) => e instanceof DefError && /pr.*maxSchemaFailures.*non-negative/.test((e as Error).message),
+  );
 });

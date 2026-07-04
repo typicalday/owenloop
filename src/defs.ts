@@ -41,14 +41,19 @@ interface RawInput {
  *  the two can't silently drift (§27 unknown-key rejection). */
 const RAW_INPUT_KEYS = ['name', 'producer', 'seedOwed', 'schema'] as const;
 
-/** A produce entry: either a bare `"plan"` string, or `{ name, schema, judges }`. */
+/** A produce entry: either a bare `"plan"` string, or
+ *  `{ name, schema, judges, maxAttempts, maxSchemaFailures }`. */
 interface RawProduce {
   name?: unknown;
   schema?: unknown;
   /** §24 judges: optional quality-gate list hanging off a singleton produce entry. */
   judges?: unknown;
+  /** §6/§18 per-produce override of the step's maxAttempts. */
+  maxAttempts?: unknown;
+  /** §6/§18 per-produce override of the step's maxSchemaFailures. */
+  maxSchemaFailures?: unknown;
 }
-const RAW_PRODUCE_KEYS = ['name', 'schema', 'judges'] as const;
+const RAW_PRODUCE_KEYS = ['name', 'schema', 'judges', 'maxAttempts', 'maxSchemaFailures'] as const;
 
 /** §26: a `group:` entry in a `produces:` list — spans multiple sibling stems, not a produce itself. */
 interface RawGroup {
@@ -327,12 +332,13 @@ function parseGroup(v: RawGroup, ctx: string): GroupDef {
 
 /**
  * Parse a step's `produces` list. Each entry is either a bare pattern string
- * (`plan`, `gather.source[]`), a mapping `{ name, schema, judges }` attaching
- * a JSON Schema the produced value must satisfy at commit time (§19) and/or a
- * quality-gate list (§24), or a `{ group, mode, of }` exclusivity declaration
- * (§26) spanning sibling stems produced by this same list. `baseDir` resolves
- * judge `bodyFile:` entries. Returns both the produce patterns and any groups
- * found, as a pure function (no out-param mutation).
+ * (`plan`, `gather.source[]`), a mapping `{ name, schema, judges, maxAttempts,
+ * maxSchemaFailures }` attaching a JSON Schema the produced value must satisfy
+ * at commit time (§19), a quality-gate list (§24), and/or a per-produce
+ * override of the step's §6/§18 stall caps, or a `{ group, mode, of }`
+ * exclusivity declaration (§26) spanning sibling stems produced by this same
+ * list. `baseDir` resolves judge `bodyFile:` entries. Returns both the produce
+ * patterns and any groups found, as a pure function (no out-param mutation).
  */
 function parseProduces(v: unknown, ctx: string, baseDir?: string): { patterns: ProducePattern[]; groups: GroupDef[] } {
   if (v === undefined) return { patterns: [], groups: [] };
@@ -360,10 +366,20 @@ function parseProduces(v: unknown, ctx: string, baseDir?: string): { patterns: P
         }
         pat.judges = parseJudges(raw.judges, `produce '${name}'.judges`, baseDir);
       }
+      if (raw.maxAttempts !== undefined) {
+        const v = asNumber(raw.maxAttempts, 0, `produce '${name}'.maxAttempts`);
+        if (v < 0) throw new DefError(`produce '${name}'.maxAttempts must be a non-negative number`);
+        pat.maxAttempts = v;
+      }
+      if (raw.maxSchemaFailures !== undefined) {
+        const v = asNumber(raw.maxSchemaFailures, 0, `produce '${name}'.maxSchemaFailures`);
+        if (v < 0) throw new DefError(`produce '${name}'.maxSchemaFailures must be a non-negative number`);
+        pat.maxSchemaFailures = v;
+      }
       patterns.push(pat);
       return;
     }
-    throw new DefError(`${ctx}[${i}] must be a string or a { name, schema, judges } mapping`);
+    throw new DefError(`${ctx}[${i}] must be a string or a { name, schema, judges, maxAttempts, maxSchemaFailures } mapping`);
   });
   return { patterns, groups };
 }

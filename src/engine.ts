@@ -670,6 +670,11 @@ export class Engine {
         STEP: f.step,
         KEY: f.key,
         INDEX: f.index === undefined ? '' : String(f.index),
+        // Intentionally step-generic: a single firing can discharge multiple
+        // outputs (f.outputs) at once, so there is no single produce to
+        // resolve a per-produce maxAttempts override against here. This
+        // always reflects the step default even when individual produces
+        // override it (see model.ts effectiveMaxAttempts()).
         MAX_ATTEMPTS: String(step.maxAttempts),
       }),
       consumes,
