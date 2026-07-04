@@ -870,6 +870,38 @@ test('schema: emit refuses a non-conforming element atomically and bumps the sea
   assert.deepEqual(ok.created, ['gather.source[0]', 'gather.source[1]']);
 });
 
+test('§11.1: emit after the seal greens is refused (sealed-rejected), lease stays open, run still closes', () => {
+  const gather = step({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] });
+  const d = def('research', [input('question')], [
+    gather,
+    step({ name: 'synthesize', consumes: ['gather.source[*]'], produces: ['draft'] }),
+  ]);
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance('research');
+  const g = fire(engine, wf, 'gather', 1000);
+
+  engine.emit(wf, g.run, [{ value: { s: 'a' } }, { value: { s: 'b' } }]);
+  engine.seal(wf, g.run, { count: 2 });
+  const sealBefore = store.getArtifact(wf, 'gather.source.sealed');
+  assert.equal(sealBefore?.acceptance, 'green');
+
+  // same open lease, late emit after the seal is already green
+  const late = engine.emit(wf, g.run, [{ value: { s: 'c' } }]);
+  assert.equal(late.outcome, 'sealed-rejected');
+  assert.deepEqual(late.created, []);
+  assert.ok(late.reason?.includes('gather.source'));
+
+  // no new member, no counter changes, seal still green
+  assert.ok(!store.getArtifact(wf, 'gather.source[2]'), 'no new member written');
+  const sealAfter = store.getArtifact(wf, 'gather.source.sealed');
+  assert.equal(sealAfter?.acceptance, 'green');
+  assert.equal(sealAfter?.version, sealBefore?.version, 'seal untouched by the refused emit');
+  assert.equal(sealAfter?.schemaRejects, sealBefore?.schemaRejects, 'no counters bumped');
+
+  // the lease stays open — the run can still close cleanly
+  assert.doesNotThrow(() => engine.close(wf, g.run));
+});
+
 test('schema: createInstance rejects a provided input that violates its schema', () => {
   const proposalIn = { ...input('proposal'), schema: { type: 'object', required: ['goal'] } };
   const d = def('d', [proposalIn], [step({ name: 'a', consumes: ['proposal'], produces: ['plan'] })]);

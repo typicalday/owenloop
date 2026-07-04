@@ -168,7 +168,10 @@ order-independent — re-running `settle()` on a healthy graph yields no ops.
 
 - **§11.1 produce `src[]`** — the producer `emit`s an unknown number of bare
   elements (`src[0]`, `src[1]`, …), then `seal`s. The seal is itself an artifact
-  (`sealOf = src`); the collection is "complete" when the seal is green.
+  (`sealOf = src`); the collection is "complete" when the seal is green. Once
+  the seal is green, a further `emit` on the same open lease is refused
+  (`sealed-rejected`) rather than silently growing a "complete" set; the lease
+  stays open so the run can still close.
 - **§11.2 map `src[$i]`** — fan-out: one firing per element, `${INDEX}` bound.
 - **§11.x reduce `src[*]`** — fan-in: see §3.
 - **§11.x reduce with suffix `src[*].child`** — fan-in one level deeper: the
