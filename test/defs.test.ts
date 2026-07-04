@@ -269,6 +269,100 @@ test('buildDef rejects judges: declared on a non-singleton (collection) produce'
   );
 });
 
+// ---- worker:/command:/spec: declarative executor dispatch ------------------
+
+test('parseDef rejects worker: command with no command:', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'bad',
+        inputs: [{ name: 'a' }],
+        steps: [
+          { name: 'runner', consumes: ['a'], produces: ['result'], worker: 'command' },
+        ],
+      }),
+    (e: unknown) => e instanceof DefError && /has worker 'command' but no command:/.test((e as Error).message),
+  );
+});
+
+test('parseDef rejects worker: agent (explicit) with no body:', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'bad',
+        inputs: [{ name: 'a' }],
+        steps: [
+          { name: 'runner', consumes: ['a'], produces: ['result'], worker: 'agent' },
+        ],
+      }),
+    (e: unknown) => e instanceof DefError && /has worker 'agent' but no body:/.test((e as Error).message),
+  );
+});
+
+test('parseDef accepts worker: agent (or omitted) with a real body', () => {
+  const wf = parseDef({
+    name: 'ok',
+    inputs: [{ name: 'a' }],
+    steps: [
+      { name: 'omitted', consumes: ['a'], produces: ['plan'], body: 'do the thing' },
+      { name: 'explicit', consumes: ['plan'], produces: ['result'], worker: 'agent', body: 'do the other thing' },
+    ],
+  });
+  assert.equal(wf.steps.find((s) => s.name === 'omitted')!.worker, undefined);
+  assert.equal(wf.steps.find((s) => s.name === 'explicit')!.worker, 'agent');
+});
+
+test('parseDef rejects a step declaring a worker not in the def-level workers: allow-list', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'bad',
+        workers: ['agent', 'command'],
+        inputs: [{ name: 'a' }],
+        steps: [
+          { name: 'runner', consumes: ['a'], produces: ['result'], worker: 'weird', command: 'echo hi' },
+        ],
+      }),
+    (e: unknown) => e instanceof DefError && /does not list it/.test((e as Error).message),
+  );
+});
+
+test('parseDef accepts an opaque worker value with no workers: allow-list and no command/body requirement', () => {
+  const wf = parseDef({
+    name: 'ok',
+    inputs: [{ name: 'a' }],
+    steps: [
+      { name: 'runner', consumes: ['a'], produces: ['result'], worker: 'browser-automation' },
+    ],
+  });
+  assert.equal(wf.steps.find((s) => s.name === 'runner')!.worker, 'browser-automation');
+});
+
+test('parseDef rejects a judge entry declaring worker: command with no command: (same validateDef rule, synthesized step)', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'bad',
+        inputs: [{ name: 'a' }],
+        steps: [
+          {
+            name: 'researcher',
+            consumes: ['a'],
+            produces: [
+              {
+                name: 'report',
+                judges: [{ name: 'ci-gate', body: 'unused', worker: 'command' }],
+              },
+            ],
+          },
+        ],
+      }),
+    (e: unknown) =>
+      e instanceof DefError &&
+      /step 'researcher\.report\.judges\.ci-gate' has worker 'command' but no command:/.test((e as Error).message),
+  );
+});
+
 test('parseDef aggregates validation errors into a single thrown DefError', () => {
   assert.throws(
     () =>

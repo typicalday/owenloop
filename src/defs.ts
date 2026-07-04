@@ -76,8 +76,11 @@ interface RawJudge {
   inputs?: unknown;
   cadence?: unknown;
   maxRunsPerDay?: unknown;
+  worker?: unknown;
+  command?: unknown;
+  spec?: unknown;
 }
-const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay'] as const;
+const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay', 'worker', 'command', 'spec'] as const;
 
 interface RawStep {
   name?: unknown;
@@ -103,13 +106,20 @@ interface RawStep {
   reapTtl?: unknown;
   /** §27.3: opaque extension map — validated as a map, never interpreted. */
   x?: unknown;
+  /** Declares which kind of executor this step's order is for. Opaque
+   *  passthrough, mirrors `model`. */
+  worker?: unknown;
+  /** Required when worker is 'command'; opaque command string. */
+  command?: unknown;
+  /** Optional opaque config object for a non-agent/non-command worker type. */
+  spec?: unknown;
 }
 /** Keys valid on a normal (non-calls:, non-include:) step entry. */
 const RAW_STEP_KEYS = [
   'name', 'consumes', 'produces', 'generates', 'invalidates', 'cadence',
   'maxRunsPerDay', 'parallel', 'maxAttempts', 'maxSchemaFailures', 'model',
   'workdir', 'terminal', 'effect', 'on', 'idleAfter', 'body', 'bodyFile',
-  'calls', 'reapTtl', 'x',
+  'calls', 'reapTtl', 'x', 'worker', 'command', 'spec',
 ] as const;
 
 /** Duck-typed sniffer for a raw calls: directive (Mode 2). */
@@ -144,8 +154,10 @@ interface RawDef {
   engine?: unknown;
   /** §27.3: opaque extension map — validated as a map, never interpreted. */
   x?: unknown;
+  /** Optional def-level allow-list of worker values (typo guard for step/judge `worker:`). */
+  workers?: unknown;
 }
-const RAW_DEF_KEYS = ['name', 'title', 'description', 'inputs', 'steps', 'outputs', 'invariants', 'engine', 'x'] as const;
+const RAW_DEF_KEYS = ['name', 'title', 'description', 'inputs', 'steps', 'outputs', 'invariants', 'engine', 'x', 'workers'] as const;
 
 // ---- defaults ----------------------------------------------------------------
 
@@ -308,6 +320,9 @@ function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<Pro
     if (raw.maxRunsPerDay !== undefined) {
       judge.maxRunsPerDay = asNumber(raw.maxRunsPerDay, DEFAULTS.maxRunsPerDay, `judge '${name}'.maxRunsPerDay`);
     }
+    if (raw.worker !== undefined) judge.worker = asString(raw.worker, `judge '${name}'.worker`);
+    if (raw.command !== undefined) judge.command = asString(raw.command, `judge '${name}'.command`);
+    if (raw.spec !== undefined) judge.spec = asExtension(raw.spec, `judge '${name}'.spec`);
     return judge;
   });
 }
@@ -618,6 +633,7 @@ export function buildDef(raw: unknown, source?: string, baseDir?: string): Workf
     if (outs.length > 0) def.outputs = outs;
   }
   if (r.x !== undefined) def.x = asExtension(r.x, `workflow '${name}'.x`);
+  if (r.workers !== undefined) def.workers = asStringArray(r.workers, `workflow '${name}'.workers`);
   return def;
 }
 
@@ -851,6 +867,9 @@ function synthesizeJudgeSteps(
       body: j.body,
     };
     if (j.model !== undefined) step.model = j.model;
+    if (j.worker !== undefined) step.worker = j.worker;
+    if (j.command !== undefined) step.command = j.command;
+    if (j.spec !== undefined) step.spec = j.spec;
     return step;
   });
 }
@@ -949,6 +968,9 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
   };
   if (rl.workdir !== undefined) step.workdir = asString(rl.workdir, `step '${name}'.workdir`);
   if (rl.model !== undefined) step.model = asString(rl.model, `step '${name}'.model`);
+  if (rl.worker !== undefined) step.worker = asString(rl.worker, `step '${name}'.worker`);
+  if (rl.command !== undefined) step.command = asString(rl.command, `step '${name}'.command`);
+  if (rl.spec !== undefined) step.spec = asExtension(rl.spec, `step '${name}'.spec`);
   if (rl.x !== undefined) step.x = asExtension(rl.x, `step '${name}'.x`);
   if (asBool(rl.terminal, false, `step '${name}'.terminal`)) step.terminal = true;
   if (generatesPatterns.length > 0) step.generates = generatesPatterns; // kept for lint only
@@ -1140,6 +1162,44 @@ export function validateDef(def: WorkflowDef): string[] {
         errors.push(`step '${l.name}': effect.onInvalidate '${oi}' names itself; a step cannot be its own handler`);
       } else if (handlerStep.produces.length === 0) {
         errors.push(`step '${l.name}': effect.onInvalidate handler '${oi}' produces no outputs; a handler must produce at least one output`);
+      }
+    }
+  }
+
+  // W1-VALIDATE: worker:/command: shape rules (declarative executor dispatch).
+  // Only two hard requirements; any other worker value is fully opaque.
+  for (const l of def.steps) {
+    const worker = l.worker ?? 'agent';
+    // Deliberately `l.worker === 'agent'` (explicit opt-in), NOT
+    // `(l.worker ?? 'agent') === 'agent'` — that stricter form would also
+    // catch every default-agent step that already gets away with an empty
+    // body today (e.g. calls:-adjacent or generator-only fixtures), breaking
+    // existing defs that never write `worker:` at all. Scoping the check to
+    // an EXPLICIT `worker: agent` keeps every pre-existing def byte-for-byte
+    // unaffected while still catching "someone opted into the agent worker
+    // type and forgot a body".
+    if (l.worker === 'agent' && l.body.trim() === '') {
+      errors.push(`step '${l.name}' has worker 'agent' but no body: (an agent step needs a prompt)`);
+    } else if (worker === 'command') {
+      if (l.command === undefined) {
+        errors.push(`step '${l.name}' has worker 'command' but no command:`);
+      }
+    }
+    // any other worker value: opaque, no body/command requirement
+  }
+
+  // W1-VALIDATE: workers: def-level allow-list typo guard. Applied AFTER the
+  // per-step `worker` default (?? 'agent') — a def declaring `workers:
+  // [command]` (deliberately excluding 'agent') still fails a step that omits
+  // `worker:` entirely, since its effective worker is 'agent'. This is
+  // intended (the list is exhaustive once declared), documented in
+  // docs/authoring.md.
+  if (def.workers && def.workers.length > 0) {
+    const allowed = new Set(def.workers);
+    for (const l of def.steps) {
+      const worker = l.worker ?? 'agent';
+      if (!allowed.has(worker)) {
+        errors.push(`step '${l.name}' has worker '${worker}' but workflow '${def.name}'.workers does not list it`);
       }
     }
   }

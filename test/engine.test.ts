@@ -122,6 +122,37 @@ test('§27.3: a step-level x: rides through buildOrder onto the Order untouched;
   assert.equal(builder.x, undefined);
 });
 
+test('worker/command/spec ride through buildOrder onto the Order untouched; steps without them emit orders without them', () => {
+  const wfDef = def(
+    'workerflow',
+    [input('proposal')],
+    [
+      step({
+        name: 'runner',
+        consumes: ['proposal'],
+        produces: ['result'],
+        worker: 'command',
+        command: 'npm test',
+        spec: { timeout: 300 },
+      }),
+      step({ name: 'reviewer', consumes: ['result'], produces: ['verdict'] }),
+    ],
+  );
+  const { engine } = makeEngine([wfDef]);
+  const wf = engine.createInstance('workerflow', { provide: { proposal: { text: 'x' } } });
+
+  const runner = fire(engine, wf, 'runner', 1000);
+  assert.equal(runner.worker, 'command');
+  assert.equal(runner.command, 'npm test');
+  assert.deepEqual(runner.spec, { timeout: 300 });
+  complete(engine, wf, runner, { result: 'ok' });
+
+  const reviewer = fire(engine, wf, 'reviewer', 2000);
+  assert.equal(reviewer.worker, undefined);
+  assert.equal(reviewer.command, undefined);
+  assert.equal(reviewer.spec, undefined);
+});
+
 // ---- knock-back cycle (judgment reject) -------------------------------------
 
 test('knock-back: a judgment reject re-arms the producer and carries feedback', () => {

@@ -1,0 +1,56 @@
+# Declarative executor dispatch — demonstrates `worker:`/`command:`/`spec:`
+# (§27.4 of docs/design.md).
+#
+# The engine never executes anything; `worker:` just labels which kind of
+# executor a step's order is for, so the same def can mix an LLM-driven step
+# with a deterministic, non-LLM one. `planner` omits `worker:` entirely (the
+# default, unaffected `'agent'` path — every existing def in this repo stays
+# exactly like this). `tester` declares `worker: command` with a real
+# `command:` — a runner dispatching this order runs the command instead of an
+# agent, no judgment involved. `tester`'s `result` produce is gated by a
+# command judge (`ci-gate`): judges can be deterministic too, not just
+# LLM-based — this one runs a check script and approves/rejects on exit status.
+#
+# Drive it:
+#   wf=$(owenloop create command-worker --provide plan='{"text":"add a cache layer"}' | jq -r .workflow)
+#   owenloop tick $wf                              # -> order for `planner` (worker: agent, default)
+#   owenloop green $wf <run> reviewed_plan --value '{"approved":true}'
+#   owenloop tick $wf                              # -> order for `tester` (worker: command)
+#   owenloop green $wf <run> result --value '{"exitCode":0}'
+#   owenloop tick $wf                              # -> order for the `ci-gate` judge (worker: command)
+#   owenloop green $wf <judge-run> result --value '{}'   # judge approves -> result goes green
+
+name: command-worker
+title: Command-dispatched worker step
+description: Mixes an agent step with a deterministic command step and a command judge.
+
+inputs:
+  - name: plan
+    seedOwed: true          # required: supply with --provide or `owenloop provide`
+
+steps:
+  - name: planner
+    consumes: [plan]
+    produces: [reviewed_plan]
+    # worker: omitted here on purpose — the default/common case, completely
+    # unaffected by this feature. This step dispatches to an agent exactly
+    # like every step in every other bundled example.
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Read `plan` and sanity-check it. Green `reviewed_plan` with your call.
+
+  - name: tester
+    consumes: [reviewed_plan]
+    produces:
+      - name: result
+        judges:
+          - name: ci-gate
+            body: "unused by a command judge, but still a required field (§24)" # not read; a command judge acts on exit status, not a prompt
+            worker: command              # deterministic — no judgment, just run the script
+            command: scripts/ci-gate.sh  # exit 0 approves, non-zero rejects with its output
+    worker: command                     # deterministic — no judgment, just run the script
+    command: npm test                   # opaque to the engine; the dispatcher runs this
+    spec:                                # opaque config for the dispatcher; engine never reads it
+      timeout: 300
+      workdir: .
+    body: ""                            # not required for worker: command (no agent prompt)

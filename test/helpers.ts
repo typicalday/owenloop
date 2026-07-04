@@ -21,6 +21,9 @@ export interface StepSpec {
   maxSchemaFailures?: number;
   model?: string;
   workdir?: string;
+  worker?: string;
+  command?: string;
+  spec?: Record<string, unknown>;
   body?: string;
   terminal?: boolean;
   effect?: EffectDef;
@@ -55,6 +58,9 @@ export function step(spec: StepSpec): StepDef {
     ...(spec.groups !== undefined ? { groups: spec.groups } : {}),
     ...(spec.x !== undefined ? { x: spec.x } : {}),
     ...(spec.workdir !== undefined ? { workdir: spec.workdir } : {}),
+    ...(spec.worker !== undefined ? { worker: spec.worker } : {}),
+    ...(spec.command !== undefined ? { command: spec.command } : {}),
+    ...(spec.spec !== undefined ? { spec: spec.spec } : {}),
     body: spec.body ?? `run ${spec.name}`,
   };
 }

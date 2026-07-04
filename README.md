@@ -158,6 +158,10 @@ Two things make this more than running steps in dependency order:
   *width* — a producer can emit any number of elements — but the wiring graph
   itself (which steps exist, what each consumes and produces) is fixed when
   the definition loads, not mutable while an instance runs.
+- **Not a command runner.** `worker:`/`command:` label which kind of
+  executor an order is for and carry a command string through untouched —
+  the engine never shells out, executes, or interprets it. Actually running
+  anything is always the dispatcher's job, on the other side of `tick`.
 
 ---
 
@@ -249,6 +253,20 @@ workhorse tier, not the host's single most capable model — that's what the
 opt-in `strongest` tier is for, reserved for the rare step where nothing less
 will do. See
 [`docs/authoring.md`](docs/authoring.md#model--quality-tiers-not-vendor-ids).
+
+### Worker dispatch
+
+`worker: agent | command | …` declares which kind of executor a step's order
+is for — the default (`agent`, silent when omitted) is unaffected; every
+def written before this feature stays byte for byte the same. Opt a step
+into `worker: command` and give it a `command:` string to switch it to a
+deterministic executor instead of an LLM — the engine never runs it, only
+carries it through on the order for your dispatcher to branch on. An
+optional `spec:` map carries further opaque config (a timeout, a working
+directory), and a judge entry accepts the same fields, so a quality gate can
+be a script's exit code instead of a verdict. See
+[`docs/authoring.md`](docs/authoring.md#worker--declaring-the-executor) and
+[`command-worker.yaml`](examples/workflows/command-worker.yaml).
 
 ### Event subscription — for embedding
 

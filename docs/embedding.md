@@ -75,9 +75,34 @@ const status = engine.status(wf);   // { done, debts, eligible, blocked, inFligh
 
 Each `order` is self-contained: `prompt`, `consumes` (the captured green
 inputs), `owes` (the owed outputs + their accumulated reason threads), plus
-`inputs`/`outputs`/`model`. A consumer rejecting an upstream artifact is just
-`engine.reject(wf, path, by, text)`; the forward cascade and stall liveness
-behave exactly as they do under the CLI, because it's the same engine.
+`inputs`/`outputs`/`model`/`worker`/`command`/`spec`. A consumer rejecting an
+upstream artifact is just `engine.reject(wf, path, by, text)`; the forward
+cascade and stall liveness behave exactly as they do under the CLI, because
+it's the same engine.
+
+`order.worker` is where dispatch-by-executor-type earns its keep in an
+embedder: rather than every order going to the same LLM-driving `runYourWorker`,
+branch on it before deciding how to run the order.
+
+```ts
+for (const order of orders) {
+  const result =
+    order.worker === 'command'
+      ? await runCommand(order.command!, order.spec)  // order.command is opaque — never shelled out by owenloop itself
+      : await runYourAgent(order);                     // default / worker: 'agent' / anything else you handle the same way
+
+  const commit = engine.green(wf, order.run, order.outputs[0], result);
+  engine.close(wf, order.run);
+}
+```
+
+`worker`/`command`/`spec` are all optional and opaque — the engine only
+shape-checks them at load time (`command` a string, `spec` a plain map) and
+never reads their contents itself. `order.worker` is `undefined` when the
+step never set it (today's default, unaffected by this feature). See
+[`docs/design.md` §27.4](design.md) for the full contract and
+[`docs/authoring.md`](authoring.md#worker--declaring-the-executor) for how to
+declare it on a step.
 
 A runnable version of this lives at [`examples/embed.ts`](../examples/embed.ts):
 

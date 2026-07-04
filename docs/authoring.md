@@ -70,6 +70,10 @@ steps:
                                #   to the engine, passed through on the order
                                #   (see below)
     workdir: …                 # opaque hint passed through on the order; omitted when unset
+    worker: agent               # opaque executor label (default: agent); see below
+    command: …                  # required when worker: command; opaque, never shelled out
+    spec:                       # optional opaque config map, shape-checked like x: (a plain map)
+      anything: goes            #   contents never read by the engine; see below
     x:                          # optional; opaque extension map, passed through
       anything: goes            #   untouched onto the order (Order.x); see design.md §27.3
 ```
@@ -97,6 +101,59 @@ A value that isn't one of the four tiers should be passed through verbatim as
 a literal model id. Pin an exact model when you need reproducibility — just
 know the def is now host-specific, on purpose. Omit `model:` entirely and the
 dispatcher uses its default.
+
+## `worker:` — declaring the executor
+
+Every step in every def written before this feature dispatches to an LLM
+agent — that's still the default, and omitting `worker:` entirely leaves a
+def byte-for-byte unchanged. `worker:` lets a step opt into a *different*
+kind of executor instead: a shell command, a webhook, a browser-automation
+runner, anything a dispatcher on the other end of `tick` knows how to run.
+The engine never executes anything itself — `worker:` is an opaque label
+that rides the order (same pass-through contract as `model`) for whatever
+drives your workers to switch on.
+
+```yaml
+steps:
+  - name: tester
+    consumes: [reviewed_plan]
+    produces: [result]
+    worker: command              # opaque to the engine; default is 'agent'
+    command: npm test            # required when worker: command; never parsed or shelled out
+    spec:                        # optional opaque config for the dispatcher
+      timeout: 300
+      workdir: .
+    body: ""                     # not required for worker: command
+```
+
+Two shape rules, both enforced at load time, everything else opaque:
+
+- **`worker: command` requires `command:`.** A `command`-worker step with no
+  `command:` is a load-time `DefError` — the dispatcher would have nothing to
+  run.
+- **`worker: agent` (explicit) requires a real `body:`.** Omitting `worker:`
+  still defaults to `'agent'` and still needs no body-shape check beyond
+  today's behavior — this rule only fires when a step *explicitly* writes
+  `worker: agent` and leaves `body:` empty, which is almost certainly a
+  mistake (an agent step with no prompt).
+
+Any other `worker` value (`browser-automation`, `webhook`, your own label) is
+fully opaque — no `body:`/`command:` requirement at all. A definition can
+optionally declare `workers: [agent, command]` at the top level as a typo
+guard; when present, `validateDef` rejects any step (or judge — see below)
+whose effective worker (after the `agent` default) isn't in the list:
+
+```yaml
+name: my-workflow
+workers: [agent, command]   # optional allow-list; absent = any worker string accepted
+```
+
+`command:` and `spec:` are opaque the same way `x:` is: `command` is
+shape-checked as a string, `spec` as a plain map, and neither is ever read or
+interpreted by the engine beyond that. All three (`worker`, `command`,
+`spec`) ride through `buildOrder` onto the emitted `Order` untouched, exactly
+like `model` and `workdir`. See [`docs/design.md` §27.4](design.md) for the
+full contract.
 
 ## `produces:` vs `generates:`
 
@@ -137,10 +194,23 @@ steps:
             model: strong             # optional, per-judge model tier
             inputs: true              # optional, default false — judge also
                                       # reads the producer's inputs (question)
+          - name: ci-gate
+            body: "unused by a command judge, but still a required field" # every
+                                      # judge needs body/bodyFile regardless of worker
+            worker: command           # judges can be deterministic too — same
+            command: scripts/ci-gate.sh  #   worker:/command: contract as a normal step
     maxAttempts: 5    # producer's cap (default for every produce on this step)
                       # — also bounds judge-reject → rebuild loops; `report`
                       # above could set its own maxAttempts: to override it
 ```
+
+A judge entry accepts the same `worker:`/`command:`/`spec:` fields as a
+normal step (see [`worker:` above](#worker--declaring-the-executor)) — a
+judge can be a deterministic check (a script's exit status) instead of an
+LLM verdict. Note `body:`/`bodyFile:` is still required on every judge
+regardless of `worker:` — that requirement is orthogonal to this feature and
+applies even to a `worker: command` judge (the field just goes unread by a
+non-agent dispatcher).
 
 Each judge is a real step under the hood — it fires its own worker order
 through the normal pipeline, with its own throttles (`cadence:`,
