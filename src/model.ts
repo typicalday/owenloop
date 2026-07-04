@@ -236,6 +236,36 @@ function stepByName(def: WorkflowDef, name: string): StepDef | undefined {
   return def.steps.find((l) => l.name === name);
 }
 
+/**
+ * §26: the single source of truth for "does `path` sit behind a produce-group
+ * that already has a different green winner?" Looks up `path`'s producer step
+ * (via `arts.get(path)?.producer`, not a step lookup on `path` itself — this
+ * must work for a judged stem, whose producer is the ORIGINAL producer step,
+ * not the synthesized judge step), finds the exactlyOne/atMostOne group (if
+ * any) on that step whose `of:` contains `path`, and returns the winning
+ * sibling's stem if one is already green — undefined otherwise (no group, an
+ * atLeastOne group, or no winner yet). `atLeastOne` never blocks (§26: "never
+ * refuses a commit and never auto-skips").
+ *
+ * Shared by:
+ *  - Engine.groupCasCheck (engine.ts) — the commit-time refusal.
+ *  - groupWouldReject (model.ts, checker) — BFS outcome prediction.
+ *  - eligibleFirings (below) — the pre-filter this change adds, so eligibility
+ *    can never offer a firing the commit check is guaranteed to refuse.
+ */
+export function groupBlockingWinner(
+  def: WorkflowDef,
+  arts: ArtifactMap,
+  path: string,
+): string | undefined {
+  const art = arts.get(path);
+  const producer = art ? stepByName(def, art.producer) : undefined;
+  if (!producer) return undefined;
+  const group = producer.groups?.find((g) => g.of.includes(path));
+  if (!group || group.mode === 'atLeastOne') return undefined;
+  return group.of.find((stem) => stem !== path && arts.get(stem)?.acceptance === 'green');
+}
+
 // ---- required inputs & fingerprints -----------------------------------------
 
 /**
@@ -410,10 +440,13 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
     // of its own; `outputs: [judgedStem]` carries the judged artifact through
     // buildOrder's `owes` so the order surfaces the value + current acceptance,
     // and the judge's later green/reject verb targets that same path (Q2).
+    // §26: a judge order for a `submitted` stem that already lost its exclusivity
+    // group (a different sibling is green) would only ever be refused as
+    // 'group-rejected' at judge-approve time (groupCasCheck) — never offer it.
     if (step.judges) {
       const judgedStem = step.judges;
       const judged = arts.get(judgedStem);
-      if (judged && judged.acceptance === 'submitted') {
+      if (judged && judged.acceptance === 'submitted' && groupBlockingWinner(def, arts, judgedStem) === undefined) {
         const approvedVersion = judged.approvals?.[judgeNameOf(step)];
         if (approvedVersion !== judged.version) {
           firings.push({
@@ -442,7 +475,7 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
         if (plainSatisfied) {
           const outs = plainOutputs(step).filter((p) => {
             const a = arts.get(p);
-            return isDebt(a) && !frozen(a, step);
+            return isDebt(a) && !frozen(a, step) && groupBlockingWinner(def, arts, p) === undefined;
           });
           if (outs.length) {
             firings.push({ step: step.name, key: '', inputs: plainPaths, outputs: outs });
@@ -462,7 +495,11 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
               if (!isGreen(arts.get(inPath))) continue;
               const outPath = bindProduce(mp, el.index);
               const outArt = arts.get(outPath);
-              if (!isDebt(outArt) || frozen(outArt, step)) continue;
+              // group: membership is singleton-only (§26.3), so a map-produce outPath can
+              // never be a group member today — this check is defensive, not reachable,
+              // and exists so a future relaxation of the singleton-only restriction can't
+              // silently reopen the eligibility/commit-check gap this file fixes.
+              if (!isDebt(outArt) || frozen(outArt, step) || groupBlockingWinner(def, arts, outPath) !== undefined) continue;
               firings.push({
                 step: step.name,
                 key: m.path,
@@ -491,7 +528,7 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
                 .map((p) => p.stem)
                 .filter((p) => {
                   const a = arts.get(p);
-                  return isDebt(a) && !frozen(a, step);
+                  return isDebt(a) && !frozen(a, step) && groupBlockingWinner(def, arts, p) === undefined;
                 });
               if (outs.length) {
                 firings.push({
@@ -518,7 +555,7 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
         // Workflow IS all-green. Check if the evaluator still has a debt to discharge.
         const outs = plainOutputs(step).filter((p) => {
           const a = arts.get(p);
-          return isDebt(a) && !frozen(a, step);
+          return isDebt(a) && !frozen(a, step) && groupBlockingWinner(def, arts, p) === undefined;
         });
         if (outs.length > 0) {
           firings.push({
@@ -536,7 +573,7 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
       if (idleEligible(step, arts, time)) {
         const outs = plainOutputs(step).filter((p) => {
           const a = arts.get(p);
-          return isDebt(a) && !frozen(a, step);
+          return isDebt(a) && !frozen(a, step) && groupBlockingWinner(def, arts, p) === undefined;
         });
         if (outs.length > 0) {
           firings.push({
@@ -1714,13 +1751,7 @@ function eligibleOutcomes(
  * `atLeastOne` groups never refuse.
  */
 function groupWouldReject(def: WorkflowDef, arts: Map<string, ArtifactData>, path: string): boolean {
-  for (const step of def.steps) {
-    if (!step.groups) continue;
-    const group = step.groups.find((g) => g.of.includes(path));
-    if (!group || group.mode === 'atLeastOne') continue;
-    return group.of.some((stem) => stem !== path && arts.get(stem)?.acceptance === 'green');
-  }
-  return false;
+  return groupBlockingWinner(def, arts, path) !== undefined;
 }
 
 /** Internal: emit-seal branches — one map per element count 0..maxCollectionSize. */

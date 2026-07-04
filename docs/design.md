@@ -918,6 +918,39 @@ See `examples/workflows/routing-groups.yaml` for a runnable end-to-end
 example (the same router shape as `routing.yaml`, with the manual
 `engine.skip()` replaced by a declarative `group:`/`exactlyOne` contract).
 
+### §26.5 Eligibility never offers a firing the commit check already refuses
+
+`eligibleFirings` (model.ts) is pre-filtered by the same `groupBlockingWinner`
+helper `groupCasCheck` (engine.ts) and `groupWouldReject` (model.ts, checker)
+use — the three call sites share one source of truth for "does a different
+sibling in this stem's group already sit green?" Every WORKER-firing branch
+(plain, map, reduce, allGreen, idle, and the judge-step branch) excludes an
+output path that is currently group-blocked, so the automatic sweep (`tick`)
+never dispatches an order — in particular, never spawns a judge order for a
+`submitted` sibling — that `groupCasCheck` is guaranteed to refuse the moment
+it tries to land green. This closes a real gap: before this fix, a `submitted`
+group member (one gated by `judges:`) was never auto-skipped by §26.2's
+cascade (auto-skip only acts on `owed`/`rejected` siblings), so its judge kept
+firing every tick until a human intervened — a wasted subagent spawn on every
+tick, not a correctness bug (the judge's `green()` call was always correctly
+refused), but pure waste this fix eliminates (`test/groups.test.ts` scenario
+(f2)). `groupCasCheck` itself stays load-bearing for a judge order that was
+already claimed (in flight) before the winner landed — the pre-filter only
+stops a *new* order from being offered, so scenario (f) still exercises the
+commit-time refusal against that in-flight race.
+
+Suppression applies to the automatic sweep only. A human `retry` re-arms the
+named artifact directly and does not itself run `eligibleFirings` — but the
+artifact is still subject to `maintainDecisions`' own auto-skip cascade
+(§26.2), which runs synchronously inside `retry`'s `settle()` call and
+re-skips it immediately if the winning sibling is still green. Either way — a
+retried stem is suppressed again on the next tick exactly like a
+machine-originated re-arm, unless the winning sibling has been knocked down
+first (`reject`/`retract`), which makes the *producer* eligible to re-fire
+again (`test/groups.test.ts` scenario (i)). This mirrors the existing
+human-bypass symmetry at `green()` (§24.6): a human bypasses the run/lease/CAS
+machinery, never the group-exclusivity contract itself.
+
 ## §27 Engine-version contract and unknown-key rejection
 
 Two independent load-time hardening changes, both aimed at the same failure

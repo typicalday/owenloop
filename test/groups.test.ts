@@ -318,21 +318,61 @@ test('groups: (f) a judged group member is refused at the judge-approve moment, 
   const wf = engine.createInstance('judgedGroupDef', { provide: { ticket: { text: 'x' } } });
 
   const triageRun = fire(engine, wf, 'triage').run;
-  // 'simple' wins first
+  // 'urgent' producer commit lands 'submitted' (judges gate the actual green,
+  // not the producer commit) — no winner exists yet, so its judge order is
+  // legitimately offered and claimed here (a real in-flight run).
+  const submitRes = engine.green(wf, triageRun, 'urgent', { ok: true });
+  assert.equal(submitRes.outcome, 'submitted');
+  const judgeOrder = fire(engine, wf, 'triage.urgent.judges.sanity');
+
+  // NOW 'simple' wins, while the judge run above is already in-flight — this
+  // models the real race the group-aware eligibility filter cannot prevent
+  // (the order was claimed before the winner landed): the judge's eventual
+  // approve must still be refused at commit time by groupCasCheck.
   engine.green(wf, triageRun, 'simple', { ok: true });
   assert.equal(getArt(store, wf, 'simple')?.acceptance, 'green');
+  engine.close(wf, triageRun);
 
-  // 'urgent' producer commit still lands 'submitted' (judges gate the actual green,
-  // not the producer commit) — no group refusal yet.
+  // the judge fires and approves — THIS is the green-moment, and it must be refused
+  const judgeRes = engine.green(wf, judgeOrder.run, 'urgent', {});
+  assert.equal(judgeRes.outcome, 'group-rejected');
+  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'submitted', 'urgent must remain submitted, not flip to green');
+});
+
+// ---- (f2) eligibility never offers a NEW judge order once a winner already exists --
+
+test('groups: (f2) eligibleFirings never offers a fresh judge order for a group-blocked submitted sibling', () => {
+  const d = buildDef({
+    name: 'judgedGroupDef2',
+    inputs: [{ name: 'ticket', seedOwed: false }],
+    steps: [
+      {
+        name: 'triage',
+        consumes: ['ticket'],
+        produces: [
+          'simple',
+          { name: 'urgent', judges: [{ name: 'sanity', body: 'check it' }] },
+          { group: 'route', mode: 'exactlyOne', of: ['simple', 'urgent'] },
+        ],
+      },
+    ],
+  });
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance('judgedGroupDef2', { provide: { ticket: { text: 'x' } } });
+
+  const triageRun = fire(engine, wf, 'triage').run;
+  // 'simple' wins first, 'urgent' submits afterward — the winner already exists
+  // by the time urgent's judge would become eligible.
+  engine.green(wf, triageRun, 'simple', { ok: true });
   const submitRes = engine.green(wf, triageRun, 'urgent', { ok: true });
   assert.equal(submitRes.outcome, 'submitted');
   engine.close(wf, triageRun);
 
-  // the judge fires and approves — THIS is the green-moment, and it must be refused
-  const judgeOrder = fire(engine, wf, 'triage.urgent.judges.sanity');
-  const judgeRes = engine.green(wf, judgeOrder.run, 'urgent', {});
-  assert.equal(judgeRes.outcome, 'group-rejected');
-  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'submitted', 'urgent must remain submitted, not flip to green');
+  // Before the fix, this tick would dispatch a judge order doomed to
+  // group-reject (a wasted subagent spawn). After the fix, it is suppressed.
+  const t = engine.tick(wf);
+  assert.ok(t.orders.every((o) => o.step !== 'triage.urgent.judges.sanity'));
+  assert.equal(getArt(store, wf, 'urgent')?.acceptance, 'submitted');
 });
 
 // ---- (g) checker exploration: modelCheck explores group-reject/auto-skip -------
@@ -390,6 +430,100 @@ test('groups: (h) conformance — a losing-sibling commit is refused identically
   // should be no eligible firing targeting it at all, matching the engine's post-close state.
   assert.equal(triageFiring2, undefined, 'urgent should already be auto-skipped, not re-eligible');
   assert.equal(memMap.get('urgent')?.acceptance, 'skipped');
+});
+
+// ---- (i) human retry does not bypass group suppression -------------------------
+
+test('groups: (i) a human retry of a group-blocked judged sibling is still suppressed until the winner is knocked down', () => {
+  // Same shape as scenario (f): simple/urgent exactlyOne, urgent gated by a judge.
+  const d = buildDef({
+    name: 'judgedGroupDef3',
+    inputs: [{ name: 'ticket', seedOwed: false }],
+    steps: [
+      {
+        name: 'triage',
+        consumes: ['ticket'],
+        produces: [
+          'simple',
+          { name: 'urgent', judges: [{ name: 'sanity', body: 'check it' }] },
+          { group: 'route', mode: 'exactlyOne', of: ['simple', 'urgent'] },
+        ],
+      },
+    ],
+  });
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance('judgedGroupDef3', { provide: { ticket: { text: 'x' } } });
+
+  const triageRun = fire(engine, wf, 'triage').run;
+  engine.green(wf, triageRun, 'simple', { ok: true }); // simple wins
+  const submitRes = engine.green(wf, triageRun, 'urgent', { ok: true }); // urgent -> submitted
+  assert.equal(submitRes.outcome, 'submitted');
+  engine.close(wf, triageRun);
+
+  // Before the fix: this tick would still offer a judge order for urgent's
+  // judge (wasted spawn, doomed to group-reject). After the fix: suppressed.
+  let t = engine.tick(wf);
+  assert.ok(t.orders.every((o) => o.step !== 'triage.urgent.judges.sanity'));
+
+  // A human retry re-arms urgent to 'owed' — but the winner (simple) is still
+  // green, so maintainDecisions' own auto-skip cascade (run synchronously
+  // inside retry's settle()) immediately auto-skips it right back. Retry is
+  // not a bypass of group exclusivity in either the auto-skip layer or the
+  // eligibility layer this plan adds.
+  engine.retry(wf, 'urgent', 'human', 'force re-judge');
+  assert.equal(store.getArtifact(wf, 'urgent')?.acceptance, 'skipped');
+  t = engine.tick(wf);
+  assert.ok(
+    t.orders.every((o) => o.step !== 'triage.urgent.judges.sanity'),
+    'retry does not bypass group suppression while a winner is green',
+  );
+
+  // Knock the winner down — the real, documented lever: un-green the winner,
+  // not a retry bypass. 'urgent' stays skipped (its own required inputs never
+  // moved), but 'triage' becomes eligible again since 'simple' is no longer a
+  // group-blocking winner — the next tick re-fires triage itself.
+  engine.reject(wf, 'simple', 'human', 're-triage');
+  t = engine.tick(wf);
+  assert.ok(t.orders.some((o) => o.step === 'triage'));
+});
+
+// ---- (j)-(l): eligibleFirings pre-filter, exercised directly (pure function) ----
+
+test('groups: (j) eligibleFirings itself excludes a group-blocked owed sibling, independent of auto-skip', () => {
+  const d = routerDef('exactlyOne');
+  const arts = new Map<string, ArtifactData>();
+  arts.set('ticket', { workflow: '', path: 'ticket', producer: 'human', acceptance: 'green', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  arts.set('simple', { workflow: '', path: 'simple', producer: 'triage', acceptance: 'green', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  arts.set('urgent', { workflow: '', path: 'urgent', producer: 'triage', acceptance: 'owed', version: 0, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  const firings = eligibleFirings(d, arts);
+  // triage's own outputs filter must exclude 'urgent' — it is group-blocked by 'simple'.
+  const triageFiring = firings.find((f) => f.step === 'triage');
+  assert.ok(!triageFiring || !triageFiring.outputs.includes('urgent'));
+});
+
+test('groups: (k) atLeastOne group never suppresses (regression)', () => {
+  const d = routerDef('atLeastOne');
+  const arts = new Map<string, ArtifactData>();
+  arts.set('ticket', { workflow: '', path: 'ticket', producer: 'human', acceptance: 'green', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  arts.set('simple', { workflow: '', path: 'simple', producer: 'triage', acceptance: 'green', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  arts.set('urgent', { workflow: '', path: 'urgent', producer: 'triage', acceptance: 'owed', version: 0, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  const firings = eligibleFirings(d, arts);
+  const triageFiring = firings.find((f) => f.step === 'triage');
+  assert.ok(triageFiring, 'atLeastOne must still offer urgent');
+  assert.ok(triageFiring!.outputs.includes('urgent'));
+});
+
+test('groups: (l) no winner yet — no suppression (regression)', () => {
+  const d = routerDef('exactlyOne');
+  const arts = new Map<string, ArtifactData>();
+  arts.set('ticket', { workflow: '', path: 'ticket', producer: 'human', acceptance: 'green', version: 1, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  arts.set('simple', { workflow: '', path: 'simple', producer: 'triage', acceptance: 'owed', version: 0, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  arts.set('urgent', { workflow: '', path: 'urgent', producer: 'triage', acceptance: 'owed', version: 0, reasons: [], judgmentRejects: 0, schemaRejects: 0 });
+  const firings = eligibleFirings(d, arts);
+  const triageFiring = firings.find((f) => f.step === 'triage');
+  assert.ok(triageFiring, 'no winner yet — both siblings still offered');
+  assert.ok(triageFiring!.outputs.includes('simple'));
+  assert.ok(triageFiring!.outputs.includes('urgent'));
 });
 
 // ---- validation: group grammar rejections (mirrors §24 J24-VALIDATE tests) -----
