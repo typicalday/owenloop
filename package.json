@@ -38,6 +38,7 @@
   },
   "files": [
     "dist",
+    "src",
     "bin",
     "examples/workflows",
     "docs",
