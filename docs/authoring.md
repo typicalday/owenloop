@@ -197,6 +197,13 @@ runnable example, and [`docs/design.md` §26](design.md) for the full
 design (refusal timing, the judges interaction, and the model-checker parity
 guarantee).
 
+Eligibility (the automatic sweep) is pre-filtered the same way commit-time
+refusal is: a group-blocked stem — including a `submitted` stem still waiting
+on a judge, per `judges:` above — is never offered as a firing while a
+different sibling already sits green. A human `retry` re-arms it, but the
+group suppression re-applies on the next tick unless the winning sibling is
+knocked down first.
+
 ## `outputs:` — the workflow's interface
 
 Top-level `outputs:` declares which stems are the workflow's intentional public results

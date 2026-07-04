@@ -20,6 +20,7 @@ import {
   computeFingerprint,
   eligibleFirings,
   fingerprintMatches,
+  groupBlockingWinner,
   isGreen,
   judgeNameOf,
   maintainDecisions,
@@ -1660,17 +1661,14 @@ export class Engine {
     arts: ArtifactMap,
     art: ArtifactData,
   ): { rejected: boolean; reason?: string } {
+    const winner = groupBlockingWinner(def, arts, art.path);
+    if (winner === undefined) return { rejected: false };
     const producer = def.steps.find((l) => l.name === art.producer);
-    const group = producer?.groups?.find((g) => g.of.includes(art.path));
-    if (!group || group.mode === 'atLeastOne') return { rejected: false };
-    const winner = group.of.find((stem) => stem !== art.path && arts.get(stem)?.acceptance === 'green');
-    if (winner !== undefined) {
-      return {
-        rejected: true,
-        reason: `group '${group.group}' (${group.mode}) already has a winner: '${winner}' is green`,
-      };
-    }
-    return { rejected: false };
+    const group = producer?.groups?.find((g) => g.of.includes(art.path))!; // safe: winner defined implies group found
+    return {
+      rejected: true,
+      reason: `group '${group.group}' (${group.mode}) already has a winner: '${winner}' is green`,
+    };
   }
 
   private artMap(workflow: string): Map<string, ArtifactData> {
