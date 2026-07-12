@@ -920,7 +920,9 @@ export interface WorkflowStatus {
      * done-ness, recursive stall flag, own-debt count). Engine-enriched from
      * the cross-instance store like `failedRuns`/`attempts` — populated only
      * by `Engine.status()`, never by the pure `workflowStatus`. Absent when
-     * the debt is not a `calls:` artifact or no child exists yet.
+     * the debt is not a `calls:` artifact, no child exists yet, or the child's
+     * def is unresolvable (unpinned row whose def was removed — the summary is
+     * enrichment and must not make `status` throw).
      */
     child?: ChildStatusSummary;
   }>;

@@ -1136,3 +1136,82 @@ test('calls: deep tick (8) tick(parent) reaps a child\'s stale lease and re-emit
     'the child worker order is re-emitted after the reap',
   );
 });
+
+// ---- (9) dueAt min-fold across the tree --------------------------------------
+
+/** idleChildDef: childDef plus an idle step, so the child frame has a dueAt. */
+const idleChildDef: WorkflowDef = {
+  ...def(
+    'idleChildDef',
+    [input('data', { seedOwed: true })],
+    [
+      step({ name: 'worker', consumes: ['data'], produces: ['result'] }),
+      step({ name: 'cnudge', consumes: [], produces: ['cnote'], on: ['idle'], idleAfterMs: 500_000 }),
+    ],
+  ),
+  outputs: ['result'],
+};
+
+/** idleParentDef: parentDef plus an idle step, calling idleChildDef. */
+const idleDeliverStep: StepDef = {
+  ...step({ name: 'deliver', produces: ['delivered'] }),
+  calls: 'idleChildDef',
+  callsInputs: { data: 'sandbox' },
+  consumes: [],
+};
+const idleParentDef: WorkflowDef = def(
+  'idleParentDef',
+  [input('proposal', { seedOwed: true })],
+  [
+    step({ name: 'provision', consumes: ['proposal'], produces: ['sandbox'] }),
+    idleDeliverStep,
+    step({ name: 'pnudge', consumes: [], produces: ['pnote'], on: ['idle'], idleAfterMs: 900_000 }),
+    step({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
+  ],
+);
+
+test('calls: deep tick (9) dueAt is the min across parent and descended child', () => {
+  const { engine, store } = makeEngine([idleChildDef, idleParentDef]);
+  const parentWf = engine.createInstance('idleParentDef', { provide: { proposal: { text: 'x' } } });
+  const childWf = spawnChild(engine, store, parentWf);
+
+  // Pin each frame's idle threshold with an explicit alarm (E-SETALARM makes
+  // computeDueAt deterministic: alarmAt wins over lastProgress + idleAfterMs).
+  // Both alarms sit in the future so neither idle step actually fires.
+  const NOW = Date.now();
+  const childDue = NOW + 60_000;
+  const parentDue = NOW + 120_000;
+  engine.setAlarm(childWf, 'cnudge', childDue);
+  engine.setAlarm(parentWf, 'pnudge', parentDue);
+
+  // Child due first → the fold picks the child's dueAt.
+  const t1 = engine.tick(parentWf);
+  assert.equal(t1.dueAt, childDue, 'dueAt is the child\'s earlier alarm, folded up through the descent');
+
+  // Flip the order: parent due first → the fold keeps the parent's own dueAt.
+  engine.setAlarm(childWf, 'cnudge', NOW + 300_000);
+  const t2 = engine.tick(parentWf);
+  assert.equal(t2.dueAt, parentDue, 'dueAt stays the parent\'s alarm when it is the earlier of the two');
+});
+
+// ---- (10) unresolvable child def → status degrades, never throws --------------
+
+test('calls: status with an unresolvable child def skips the child summary instead of throwing', () => {
+  const { engine, store } = makeEngine([childDef, parentDef]);
+  const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'x' } } });
+  const childWf = spawnChild(engine, store, parentWf);
+
+  // Simulate a pre-§28 (unpinned) child row whose def has since been removed:
+  // replace the spawned child with a row that has no snapshot and a def name
+  // the resolver does not know. defFor(child) now throws.
+  store.deleteWorkflow(childWf);
+  store.insertWorkflow('wf_ghost_child', { def: 'no-such-def' }, { parentWf, parentPath: 'delivered' });
+  assert.throws(() => engine.status('wf_ghost_child'), /no def/, 'the child itself is genuinely unresolvable');
+
+  // status(parent) must not throw — the calls debt survives, just without the
+  // child summary (enrichment degrades, the parent stays inspectable).
+  const st = engine.status(parentWf);
+  const debt = st.debts.find((d) => d.path === 'delivered');
+  assert.ok(debt !== undefined, 'the calls debt is still reported');
+  assert.equal(debt!.child, undefined, 'the child summary is skipped, not fabricated');
+});
