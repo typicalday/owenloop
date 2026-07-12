@@ -61,10 +61,14 @@ anything fires — with `--provide` at create, or `owenloop provide <wf> <name>
 Repeat until `status` says `done: true`:
 
 1. **Tick.** `owenloop tick <wf>` → `{ orders, reaped }`. Each order carries
-   `run`, `step`, `prompt`, `consumes`, `owes`. **Capture the full payload as
-   you receive it** — there is no re-read (`runs --open` returns run metadata,
-   not the prompt or consumes). A discarded order is a lease you'll have to
-   close `failed`.
+   `run`, `workflow`, `step`, `prompt`, `consumes`, `owes`. **Capture the full
+   payload as you receive it** — there is no re-read (`runs --open` returns run
+   metadata, not the prompt or consumes). A discarded order is a lease you'll
+   have to close `failed`. Tick is **deep by default**: it also descends into
+   any live `calls:` children, so an order in the list may belong to a *child*
+   instance — its `order.workflow` is that child's id, not the `<wf>` you
+   ticked. Dispatch and commit each order against `order.workflow`, never the
+   id you passed to `tick` (see "Deep tick and `calls:` children" below).
 2. **Dispatch — one fresh subagent per order, and wait for it.** Multiple
    orders may be dispatched concurrently (multiple Agent calls in one message),
    but never fold two orders into one subagent, and never run the step's work
@@ -76,8 +80,10 @@ Repeat until `status` says `done: true`:
    means the order is for a *different* kind of executor — see "Resolving
    `worker`" below before dispatching it as if it were an agent order.
 3. **Verify each run closed.** A worker that returns without closing leaves a
-   claimed lease. Check `status.inFlight`; if its run is still open:
-   `owenloop close <wf> <run> --outcome failed --summary "worker did not close"`.
+   claimed lease. Check `owenloop status <order.workflow>` → its `inFlight` (a
+   child order's run lives in the child's own status, not the root's); if its
+   run is still open:
+   `owenloop close <order.workflow> <run> --outcome failed --summary "worker did not close"`.
    If the engine says the run already closed or lost its lease, leave it —
    that's the answer, not an error.
 4. **Re-tick.** Committing work usually makes new steps eligible immediately.
@@ -101,8 +107,11 @@ Accepted inputs (consumes): <order.consumes as JSON>
 Feedback on what you owe (owes): <order.owes as JSON — if a reason thread is
 present, it is a rejection of a previous attempt; address every point in it.>
 
-Report with the owenloop CLI. Append `--db <resolved db> --defs <resolved
-dir>` to EVERY command below — nothing is remembered between invocations:
+Report with the owenloop CLI. `<wf>` below is THIS order's `order.workflow`
+(a deep tick can hand you an order from a child instance — commit against the
+id on the order, not the one the conductor ticked). Append `--db <resolved db>
+--defs <resolved dir>` to EVERY command below — nothing is remembered between
+invocations:
 - Accept an output:      owenloop green <wf> <run> <path> --value '<json>'
 - Collection elements:   owenloop emit <wf> <run> --items '[{…}]'
                          then owenloop seal <wf> <run>
@@ -159,6 +168,36 @@ that's a blocker, not something to paper over by running it as an agent
 anyway (the def's author deliberately chose a non-agent worker for that
 step) — escalate it.
 
+## Deep tick and `calls:` children
+
+A step can declare `calls:` — it delegates its work to a whole *child* workflow
+instance the engine spawns and drives underneath. You do not tick children by
+hand. `owenloop tick <wf>` is **deep by default**: after ticking `<wf>` it
+descends into every live `calls:` child (recursively, so grandchildren too) and
+folds their orders, reaps, and timers into the one result. A single
+`tick <root>` drives the entire tree.
+
+The one thing this changes for you: **an order may belong to a child, not the
+`<wf>` you ticked.** Read `order.workflow` on every order and use *that* id for
+everything — the briefing's commit commands, `close`, and the `inFlight` check.
+Dispatch is otherwise identical; a child order is just an ordinary order that
+happens to carry a different `workflow`.
+
+- **Don't tick children yourself.** The deep tick already reached them. Ticking
+  a child separately isn't wrong (it's the `--shallow` single-instance path),
+  but in the normal drive loop it's redundant — tick the root and let the
+  descent do it.
+- **`--shallow`** ticks only the named instance (no descent); every order then
+  carries that id. Reach for it only when you deliberately want to drive one
+  instance in isolation.
+- **`wait --until` is single-instance.** It polls one instance's `status`, so it
+  won't see a child's eligible orders. When the outstanding work lives in a
+  child, wait on the child (`wait <child.workflow> --until …`), or re-tick the
+  root and inspect the folded orders.
+- **Child stalls surface on the parent** — see the `child.stalled` bullet under
+  "Knock-backs, stalls, and escalation": escalate and retry on the child that
+  owns the work, not the parent's pass-through `calls:` artifact.
+
 ## Judges — verdicts are orders too
 
 If a produced artifact declares `judges:`, committing it puts it in
@@ -192,6 +231,14 @@ to override, quote them in the value and use it; otherwise judges judge.
   just re-runs the same failure is burning tokens, not conducting.
 - **A blocked seeded input** (`status.debts` owing something no step produces)
   → ask the human, `provide` their answer, re-tick.
+- **A stalled child** (`status <wf>` shows a `calls:` debt whose `child.stalled`
+  is `true`) means the block is one level down — a worker inside the child
+  instance hit `maxAttempts` with no green outcome. Don't retry the *parent*
+  `calls:` artifact; the parent has nothing to redo. Read the child's own
+  reason thread (`owenloop status <child.workflow>` → its stalled debt's
+  reasons, or walk deeper if the child's summary points at a grandchild),
+  summarize it for the human, and clear it on the instance that owns the work:
+  `owenloop retry <child.workflow> <path> --text "<their guidance>"`.
 - **Never fabricate**: not input values, not judge verdicts, not human answers.
 
 ## Waiting — block on the engine, never on a guess

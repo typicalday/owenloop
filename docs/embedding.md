@@ -73,12 +73,23 @@ for (const order of orders) {
 const status = engine.status(wf);   // { done, debts, eligible, blocked, inFlight }
 ```
 
-Each `order` is self-contained: `prompt`, `consumes` (the captured green
-inputs), `owes` (the owed outputs + their accumulated reason threads), plus
+Each `order` is self-contained: `workflow` (the instance it belongs to — see
+deep tick below), `prompt`, `consumes` (the captured green inputs), `owes` (the
+owed outputs + their accumulated reason threads), plus
 `inputs`/`outputs`/`model`/`worker`/`command`/`spec`. A consumer rejecting an
 upstream artifact is just `engine.reject(wf, path, by, text)`; the forward
 cascade and stall liveness behave exactly as they do under the CLI, because
 it's the same engine.
+
+`engine.tick(wf)` is **deep by default**: after ticking `wf` it descends into
+every live `calls:` child (recursively), folding their orders, `reaped`, folded
+`deferred` (each tagged with its own `workflow`), and the tree-minimum `dueAt`
+into the one `TickResult`. So an order in the list may belong to a child, not
+`wf` — commit (`green`/`emit`/`seal`/`reject`) and `close` against
+`order.workflow`, not the id you passed to `tick`. Pass `engine.tick(wf, { deep:
+false })` to tick just that one instance (every order then carries `wf`). The
+childless example above never triggers descent, so `order.workflow === wf`
+throughout; it matters once a step declares `calls:`.
 
 `order.worker` is where dispatch-by-executor-type earns its keep in an
 embedder: rather than every order going to the same LLM-driving `runYourWorker`,

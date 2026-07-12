@@ -867,6 +867,32 @@ export interface Blocker {
   blockedOn: string[]; // non-green inputs holding the step back
 }
 
+/**
+ * A compact summary of a `calls:` child instance, attached to the parent's
+ * `calls:` debt by `Engine.status()`. A pure data shape (no logic) so it can
+ * live here next to `WorkflowStatus` — the `debts[]` entry type references it,
+ * and `model.ts` imports nothing from `engine.ts`, which avoids a source cycle.
+ * All the instance-crossing work that populates it (resolving the child def,
+ * reading the child's artifacts, recursing along the unpaid `calls:` path)
+ * stays in `engine.ts`; `workflowStatus` never sets it.
+ * - `workflow` — the child instance id (the handle a human uses to inspect /
+ *   `retry` the child).
+ * - `def` — the child def name.
+ * - `done` — the child's own done-ness.
+ * - `stalled` — true when the child (or, recursively, any descendant on ITS
+ *   unpaid `calls:` path) has a stalled debt; lets a grandchild stall surface
+ *   as `child.stalled: true` on the root debt.
+ * - `debts` — a COUNT of the child's own debts (the `workflow` id is the
+ *   inspection handle for the detail).
+ */
+export interface ChildStatusSummary {
+  workflow: string;
+  def: string;
+  done: boolean;
+  stalled: boolean;
+  debts: number;
+}
+
 export interface WorkflowStatus {
   done: boolean;
   debts: Array<{
@@ -888,6 +914,15 @@ export interface WorkflowStatus {
      * Absent when zero or unknown.
      */
     attempts?: number;
+    /**
+     * §23.6.8: when this debt is a `calls:` step's produced artifact and a
+     * child instance has been spawned, a summary of that child (id, def,
+     * done-ness, recursive stall flag, own-debt count). Engine-enriched from
+     * the cross-instance store like `failedRuns`/`attempts` — populated only
+     * by `Engine.status()`, never by the pure `workflowStatus`. Absent when
+     * the debt is not a `calls:` artifact or no child exists yet.
+     */
+    child?: ChildStatusSummary;
   }>;
   eligible: Firing[];
   blocked: Blocker[];

@@ -15,7 +15,7 @@ remembered between invocations — pass both on every command.
 | `defs` | list available workflow definitions |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
-| `tick <wf> [--now <ms>]` | claim and emit eligible **orders** (the jobs to run) |
+| `tick <wf> [--now <ms>] [--shallow]` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only) |
 | `reap <wf> [--now]` | run the reaper; `--now` forces every claim stale (TTL 0) — see below |
 | `runs <wf> [--open]` | list this instance's runs, joining claim state for open ones |
 | `status <wf>` | derived view: `done`, `debts`, `eligible`, `blocked`, `inFlight` |
@@ -138,6 +138,7 @@ a worker needs nothing else to do the work:
 ```jsonc
 {
   "run": "r_…",            // job id — pass it back to green/emit/seal/close
+  "workflow": "wf_…",      // the instance this order belongs to — see deep tick below
   "step": "builder",       // which step this job is for
   "key": "",               // map jobs carry the element key + index
   "inputs":  ["plan"],
@@ -156,6 +157,30 @@ A worker reads `prompt` + `consumes` + `owes`, does the work, reports with
 `green` (or `emit`/`seal` for collections), then `close`s the job. The reject
 counts in `owes[]` let a workflow escalate on its own — e.g. switch to a
 stronger model after two rejections — before the engine stalls the step.
+
+**Deep tick and `order.workflow`.** `tick <wf>` is **deep by default**: it ticks
+`<wf>` and then descends into every live `calls:` child, folding their orders
+into the one result. So an order in the list may belong to a child instance,
+not `<wf>` — always dispatch and commit (`green`/`emit`/`seal`/`close`) against
+`order.workflow`, not the id you passed to `tick`. `--shallow` ticks only the
+one instance (every order then carries `<wf>` itself); use it for a deliberate
+single-instance drive. `reaped` sums across the tree and `dueAt` (when present)
+is the earliest wake across all levels. A folded deferral in the deep result
+carries its own `workflow` (absent = the root you ticked, present = a
+descendant).
+
+**Child stalls on `status`.** `status <wf>`'s `calls:`-debt entries carry a
+`child: { workflow, def, done, stalled, debts }` summary once a child has been
+spawned. `child.stalled: true` means the child (or a grandchild below it) has a
+worker stuck at `maxAttempts` with no green outcome — the parent debt is blocked
+on stuck child work. This lets a conductor spot a wedged child from the parent
+`status` alone, without separately walking into the child's own `status`.
+
+**`wait --until` is single-instance.** `wait <wf> --until eligible|done` polls
+`status <wf>`, which is that one instance's derived view — it does **not** see a
+child's `eligible` orders or wait on child completion. To block on a tree, wait
+on the instance that actually owes the work (often a child), or poll deep
+`tick`/`status` yourself.
 
 ## Instance pinning — editing a workflow definition mid-flight
 

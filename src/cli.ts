@@ -204,7 +204,7 @@ Commands:
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
   adopt <wf>                             re-pin an instance to the current def (§28); settles new debts
-  tick <wf> [--now <ms>]                 pull eligible orders
+  tick <wf> [--now <ms>] [--shallow]     pull eligible orders (deep: also from calls: children; --shallow for this instance only)
   reap <wf> [--now]                      run the reaper; --now forces every claim stale (TTL 0)
   runs <wf> [--open]                     list this instance's runs (+ claim state for open ones)
   status <wf>                            derive debts / eligible / blocked
@@ -420,7 +420,11 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       case 'tick': {
         const wf = need(args, 1, 'workflow');
         const nowRaw = last(args, 'now');
-        const tickOpts = nowRaw !== undefined ? { now: Number(nowRaw) } : {};
+        // §23.6.8: tick is deep by default (descends into calls: children and
+        // returns their orders too); --shallow restores single-instance ticking.
+        const tickOpts: { now?: number; deep?: boolean } = {};
+        if (nowRaw !== undefined) tickOpts.now = Number(nowRaw);
+        if (flag(args, 'shallow')) tickOpts.deep = false;
         print(io, engine.tick(wf, tickOpts));
         return 0;
       }
