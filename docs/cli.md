@@ -13,6 +13,7 @@ remembered between invocations — pass both on every command.
 | command | what it does |
 |---|---|
 | `defs` | list available workflow definitions |
+| `add <owner>/<repo>[@ref]` | fetch, validate, and install a repo's workflow defs from GitHub (public repos only) — see below |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
 | `tick <wf> [--now <ms>] [--shallow]` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only) |
@@ -32,6 +33,52 @@ remembered between invocations — pass both on every command.
 | `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed job |
 | `delete <wf>` | delete an instance and all its rows |
 | `adopt <wf>` | re-pin an instance to the current definition and settle any new debts |
+
+## `add` — installing shared workflow defs from GitHub
+
+`owenloop add <owner>/<repo>[@ref]` fetches a public GitHub repo's
+`workflows/**` folder (via GitHub's REST API and Node's built-in `fetch` — no
+new dependency), validates every def with the same lint/validate/`check`
+machinery `owenloop lint`/`owenloop check` use, and only then installs them
+under `<defsDir>/<owner>-<repo>/`. A def that fails parse, lint, validation,
+or has a definite `check` defect refuses the **whole** add — nothing is
+written, and every reason is printed.
+
+`ref` defaults to `HEAD` (the repo's default branch) and is pinned to the
+resolved commit sha before anything is fetched or installed. Provenance is
+recorded in `.owenloop/installed.json`:
+
+```jsonc
+{
+  "version": 1,
+  "installed": {
+    "<owner>/<repo>": {
+      "source": "<owner>/<repo>",
+      "ref": "HEAD",
+      "sha": "<40-char-commit-sha>",
+      "installedAt": 1699999999999,
+      "path": "<owner>-<repo>",
+      "files": ["foo.yaml", "sub/bar.yaml"]
+    }
+  }
+}
+```
+
+Re-running `add` for the same repo is idempotent: it clears the previous
+install at `<defsDir>/<owner>-<repo>/` and replaces the lockfile entry, so a
+file removed upstream disappears locally too.
+
+**Discovery limitation.** `defs`/`loadDefs` only scan the defs dir's
+top-level `*.yaml` files and immediate-subdir `workflow.yaml` files — they
+don't recurse into `<owner>-<repo>/*.yaml`. Defs installed by `add` are
+validated and recorded, but a plain `owenloop tick`/`create` against the
+default defs dir won't see them until you point `--defs` (or
+`OWENLOOP_DEFS`) directly at the installed subfolder, e.g. `--defs
+workflows/<owner>-<repo>`. Auto-discovering installed defs is a deliberate
+follow-up, not yet implemented.
+
+Public repos only — no auth/token support yet; a private repo (or a bad
+ref) surfaces as a 404 from the sha-resolve step.
 
 ## Hand-driven walkthrough
 

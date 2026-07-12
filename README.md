@@ -354,6 +354,11 @@ collections-heavy research pipeline
 [`docs/authoring.md`](docs/authoring.md). Driving it from your own code:
 [Embedding it](#embedding-it).
 
+Want someone else's workflow defs instead of writing your own?
+`owenloop add <owner>/<repo>` fetches a public GitHub repo's `workflows/**`,
+validates every def, and installs them locally with pinned provenance — see
+the `add` entry in [`docs/cli.md`](docs/cli.md).
+
 ---
 
 ## Requirements
