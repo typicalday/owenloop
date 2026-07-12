@@ -1119,3 +1119,34 @@ test('owenloop adopt on an unknown workflow id exits non-zero with a clear messa
   assert.equal(r.code, 1);
   assert.match(r.err, /no such workflow instance/);
 });
+
+// ---- §23.6.8 deep tick: tick is deep by default; --shallow scopes it --------
+
+test('tick is deep by default (surfaces calls: child orders); --shallow scopes to this instance', () => {
+  const { run } = makeCli();
+
+  // provisioned-delivery: provision -> deliver (calls: delivery) -> teardown.
+  const parent = run(
+    'create',
+    'provisioned-delivery',
+    '--provide',
+    `proposal=${J({ text: 'x' })}`,
+  ).json().workflow;
+
+  // Shallow tick: maintainCalls still spawns the child, but the result carries
+  // ONLY this instance's own orders (the parent's provision), never the child's.
+  const shallow = run('tick', parent, '--shallow').json();
+  assert.ok(shallow.orders.length > 0, 'shallow tick still yields the parent\'s own orders');
+  assert.ok(
+    shallow.orders.every((o: any) => o.workflow === parent),
+    '--shallow returns only the parent instance\'s orders',
+  );
+  const child = run('list').json().find((w: any) => w.id !== parent);
+  assert.ok(child, 'the child delivery instance is spawned even under a shallow tick');
+
+  // Deep tick (default): the spawned child's order now surfaces through the
+  // parent tick, stamped with the child's own workflow id.
+  const deep = run('tick', parent).json();
+  const childOrder = deep.orders.find((o: any) => o.workflow === child.id);
+  assert.ok(childOrder, 'a deep tick surfaces an order from the spawned child instance');
+});

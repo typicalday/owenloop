@@ -29,12 +29,12 @@ import {
   requiredInputs,
   workflowStatus,
 } from './model.ts';
-import type { ArtifactMap, CascadeOp, Firing, TimeFacts, WorkflowStatus } from './model.ts';
+import type { ArtifactMap, CascadeOp, ChildStatusSummary, Firing, TimeFacts, WorkflowStatus } from './model.ts';
 import { summarizeIssues, validateValue } from './schema.ts';
 import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
 import { localMidnightMs, nowMs, randId } from './util.ts';
-import type { Store } from './store.ts';
+import type { Store, WorkflowRow } from './store.ts';
 import type {
   ArtifactData,
   Author,
@@ -126,8 +126,30 @@ export interface DeferredFiring {
   inputs: string[];
   outputs: string[];
   reason: DeferredReason;
+  /**
+   * §23.6.8 deep tick: which instance this deferred firing belongs to.
+   * Convention — **absent = the ticked ROOT instance; present = the named
+   * descendant.** A deep `tick(root)` folds each live `calls:` child's own
+   * `TickResult` up: a child-originated entry is stamped with the child's
+   * workflow id (a grandchild's already-stamped id is preserved), while the
+   * root frame's own deferrals stay unstamped. Lets a driver tell whose
+   * `in-flight`/`cadence`/… deferral it is reading without ambiguity.
+   */
+  workflow?: string;
 }
 
+/**
+ * The result of a `tick`. §23.6.8: a deep `tick(root)` (the default) descends
+ * into every live `calls:` child and folds the whole subtree's work into this
+ * one result — `orders` are flattened (each `Order` carries its own
+ * `workflow`, so a driver dispatches/commits by `order.workflow`), `reaped` is
+ * summed across the tree, `dueAt` is the min across the tree, and `deferred`
+ * entries are stamped with their originating instance (absent = this root; see
+ * `DeferredFiring.workflow`). `workflow` below always stays the ROOT (ticked)
+ * id — child results are folded, never returned as the root. `tick(wf,
+ * { deep: false })` (CLI `--shallow`) restores the pre-deep behavior: only this
+ * instance's own orders/reaps/deferrals.
+ */
 export interface TickResult {
   workflow: string;
   orders: Order[];
@@ -469,8 +491,7 @@ export class Engine {
         const callsPath = callsStem;
         const gateStems = Object.values(step.callsInputs ?? {});
         const parentArts = this.artMap(parentWf);
-        const gateReady = gateStems.length === 0 || gateStems.every((s) => isGreen(parentArts.get(s)));
-        if (!gateReady) continue;
+        if (!this.callsGateReady(parentArts, step)) continue;
 
         // STEP 2 — Look up any existing child via reverse index.
         let existingChild = this.store.findChildByParent(parentWf, callsPath);
@@ -648,12 +669,39 @@ export class Engine {
 
   // ---- the tick (maintain → reap → eligible → cadence/budget → claim) --------
 
-  tick(workflow: string, opts: { now?: number } = {}): TickResult {
+  /**
+   * Pull eligible orders for `workflow`. §23.6.8: **deep by default** — after
+   * maintaining and ticking this instance, descend into every live `calls:`
+   * child (recursively, grandchildren too) and fold their orders / reaps /
+   * deferrals / `dueAt` into the returned result so a driver that ticks only
+   * the root drives the whole composed tree (a shallow tick would deadlock a
+   * `calls:` workflow — the child's eligible steps would never be claimed).
+   * Pass `{ deep: false }` (CLI `--shallow`) to restore the pre-deep behavior:
+   * only this instance's own orders. See `TickResult` for the fold semantics.
+   */
+  tick(workflow: string, opts: { now?: number; deep?: boolean } = {}): TickResult {
+    return this.tickInternal(workflow, opts.now ?? nowMs(), opts.deep ?? true, new Set());
+  }
+
+  /**
+   * The recursive tick worker. Runs this instance's own maintain → reap →
+   * eligible → claim cycle (its body is byte-for-byte the pre-deep `tick`,
+   * kept inside its own `store.tx`), then — when `deep` — descends into each
+   * live `calls:` child by calling itself again. The descent MUST run OUTSIDE
+   * this frame's `store.tx`: `store.tx` forbids re-entrancy, and every child
+   * frame opens its own tx (via its own `maintainCalls` + tick body), so a
+   * child is driven by a full nested `tickInternal`, never a child tx opened
+   * inside the parent's. `visited` is a defensive cycle guard (mirrors
+   * `_inMaintainCalls`; instances already form a tree via `producedBy` and
+   * `detectCallsCycles` forbids def-level cycles).
+   */
+  private tickInternal(workflow: string, now: number, deep: boolean, visited: Set<string>): TickResult {
+    if (visited.has(workflow)) return { workflow, orders: [], reaped: 0, deferred: [] };
+    visited.add(workflow);
     const def = this.defFor(workflow);
-    const now = opts.now ?? nowMs();
     // M2B: maintain calls: child instances before the normal tick/reap/claim cycle.
     this.maintainCalls(workflow, def, now);
-    return this.store.tx(() => {
+    const result = this.store.tx(() => {
       this.settle(workflow, def, now);
       const reaped = this.reap(workflow, now, def);
 
@@ -675,23 +723,82 @@ export class Engine {
       const orders: Order[] = [];
       const allDeferred: DeferredFiring[] = [...deferred];
       for (const f of selected) {
-        const result = this.claim(workflow, def, f, arts, now);
-        if (result === 'in-flight') {
+        const claimed = this.claim(workflow, def, f, arts, now);
+        if (claimed === 'in-flight') {
           const d: DeferredFiring = { step: f.step, key: f.key, inputs: f.inputs, outputs: f.outputs, reason: 'in-flight' };
           if (f.index !== undefined) d.index = f.index;
           allDeferred.push(d);
-        } else if (result) {
-          orders.push(result);
+        } else if (claimed) {
+          orders.push(claimed);
         }
       }
 
       // E-DUE: compute earliest pending time-trigger for the result.
       const dueAt = this.computeDueAt(def, workflow, now);
 
-      const result: TickResult = { workflow, orders, reaped, deferred: allDeferred };
-      if (dueAt !== null) result.dueAt = dueAt;
-      return result;
+      const r: TickResult = { workflow, orders, reaped, deferred: allDeferred };
+      if (dueAt !== null) r.dueAt = dueAt;
+      return r;
     });
+
+    // §23.6.8 DESCENT — outside this frame's tx (see method doc). Drive each
+    // live calls: child with its own full tickInternal and fold its result up.
+    if (deep) {
+      for (const { child } of this.callsDescendTargets(workflow, def)) {
+        const cr = this.tickInternal(child.id, now, deep, visited);
+        // orders: flatten; each Order already carries its own `workflow`.
+        result.orders.push(...cr.orders);
+        // deferred: stamp child-originated entries with the child id, preserving
+        // a grandchild's already-stamped id (absent = ticked root, see type doc).
+        for (const d of cr.deferred) {
+          result.deferred.push({ ...d, workflow: d.workflow ?? cr.workflow });
+        }
+        // reaped: sum across the tree (also reaps dead child leases that would
+        // otherwise sit until someone ticked the child directly).
+        result.reaped += cr.reaped;
+        // dueAt: min across the tree; stays absent when neither side has one.
+        if (cr.dueAt !== undefined) {
+          result.dueAt = result.dueAt === undefined ? cr.dueAt : Math.min(result.dueAt, cr.dueAt);
+        }
+      }
+    }
+    return result;
+  }
+
+  /**
+   * §23.6.8: is a `calls:` step's gate ready — i.e. every parent artifact wired
+   * into `callsInputs` is green? Shared by `maintainCalls` STEP 1 and
+   * `callsDescendTargets` so the descend condition can never drift from the
+   * spawn/re-provide condition. Empty gate (`callsInputs: {}`) is always ready.
+   */
+  private callsGateReady(parentArts: ArtifactMap, step: StepDef): boolean {
+    const gateStems = Object.values(step.callsInputs ?? {});
+    return gateStems.length === 0 || gateStems.every((s) => isGreen(parentArts.get(s)));
+  }
+
+  /**
+   * §23.6.8: the live `calls:` children a deep tick should descend into, one
+   * per calls: step whose (1) gate is green, (2) child instance exists, and
+   * (3) debt is unpaid (the parent calls artifact is not green). Read AFTER
+   * `maintainCalls` has run this frame, so a just-spawned child is visible and
+   * a just-machine-greened debt is correctly skipped. Consequences that fall
+   * out for free: gate re-armed after spawn → not ready → no descend
+   * (consistent with maintainCalls bailing at STEP 1, never driving work on
+   * disputed inputs); debt already paid → skip.
+   */
+  private callsDescendTargets(parentWf: string, def: WorkflowDef): Array<{ step: StepDef; child: WorkflowRow }> {
+    const arts = this.artMap(parentWf);
+    const out: Array<{ step: StepDef; child: WorkflowRow }> = [];
+    for (const step of def.steps) {
+      if (!step.calls) continue;
+      const stem = step.produces[0]!.stem;
+      if (!this.callsGateReady(arts, step)) continue; // 1. gate green
+      const child = this.store.findChildByParent(parentWf, stem);
+      if (!child) continue; // 2. child exists
+      if (isGreen(arts.get(stem))) continue; // 3. debt unpaid
+      out.push({ step, child });
+    }
+    return out;
   }
 
   /** Per-step cadence + daily budget + parallel cap over the eligible firings. */
@@ -1617,6 +1724,18 @@ export class Engine {
       const task = this.store.getTask(workflow, a.producer, key);
       if (task && task.attempts > 0) d.attempts = task.attempts;
     }
+    // §23.6.8: surface a `calls:` child on each unpaid calls debt so a stalled
+    // descendant is visible from the root. Walk the debts again: a debt whose
+    // path is a calls: step's produced stem, with a spawned child, gets a
+    // recursive child summary (all instance-crossing logic stays here, in the
+    // engine — the pure workflowStatus never touches another instance).
+    for (const d of st.debts) {
+      const callsStep = def.steps.find((s) => s.calls && s.produces[0]!.stem === d.path);
+      if (!callsStep) continue;
+      const child = this.store.findChildByParent(workflow, d.path);
+      if (!child) continue;
+      d.child = this.childStatusSummary(child.id, new Set());
+    }
     // §28: informational drift flag — compare the currently-loaded live def
     // for this instance's def NAME against the pinned snapshot's hash. Only
     // meaningful when a pin exists; only computable when the live def still
@@ -2013,6 +2132,36 @@ export class Engine {
     const m = new Map<string, ArtifactData>();
     for (const a of this.store.listArtifacts(workflow)) m.set(a.path, a);
     return m;
+  }
+
+  /**
+   * §23.6.8: a compact summary of a `calls:` child for parent-status enrichment.
+   * Uses the pure `workflowStatus` for the child's own debts (lighter than a
+   * full recursive `Engine.status` — the `stalled` flag is already set by the
+   * pure layer). `stalled` propagates recursively along the child's OWN unpaid
+   * `calls:` path so a grandchild stall shows as `stalled: true` here. `debts`
+   * is a COUNT — the `workflow` id is the human's inspection handle. `visited`
+   * guards against any accidental instance cycle.
+   */
+  private childStatusSummary(childWf: string, visited: Set<string>): ChildStatusSummary {
+    visited.add(childWf);
+    const childDef = this.defFor(childWf);
+    const childArts = this.artMap(childWf);
+    const cs = workflowStatus(childDef, childArts);
+    let stalled = cs.debts.some((d) => d.stalled);
+    if (!stalled) {
+      for (const d of cs.debts) {
+        const callsStep = childDef.steps.find((s) => s.calls && s.produces[0]!.stem === d.path);
+        if (!callsStep) continue;
+        const grandchild = this.store.findChildByParent(childWf, d.path);
+        if (!grandchild || visited.has(grandchild.id)) continue;
+        if (this.childStatusSummary(grandchild.id, visited).stalled) {
+          stalled = true;
+          break;
+        }
+      }
+    }
+    return { workflow: childWf, def: childDef.name, done: cs.done, stalled, debts: cs.debts.length };
   }
 
   private defFor(workflow: string): WorkflowDef {

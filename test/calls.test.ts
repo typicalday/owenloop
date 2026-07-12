@@ -108,7 +108,7 @@ function getArt(store: Store, wf: string, path: string): ArtifactData | undefine
 
 // ---- test (a): happy path end-to-end ----------------------------------------
 
-test('calls: (a) happy path end-to-end — spawn, cascade-up, teardown', () => {
+test('calls: (a) happy path end-to-end — full loop driven ONLY by tick(parent) (deep)', () => {
   const { engine, store } = makeEngine([childDef, parentDef]);
 
   // Create parent instance with proposal provided
@@ -127,7 +127,9 @@ test('calls: (a) happy path end-to-end — spawn, cascade-up, teardown', () => {
   engine.green(parentWf, provRun, 'sandbox', { env: 'test-env' });
   engine.close(parentWf, provRun);
 
-  // Tick 2 → maintainCalls runs → child spawned (no worker order for deliver)
+  // Tick 2 (DEEP, default) → maintainCalls spawns the child AND the descent
+  // claims the child's worker order in the same parent tick. `deliver` itself
+  // is a calls: step and never emits a worker order.
   const tick2 = engine.tick(parentWf);
   assert.ok(tick2.orders.every((o) => o.step !== 'deliver'), 'deliver must not produce worker orders');
 
@@ -140,13 +142,15 @@ test('calls: (a) happy path end-to-end — spawn, cascade-up, teardown', () => {
   assert.equal(childDataArt?.acceptance, 'green');
   assert.deepEqual(childDataArt?.value, { env: 'test-env' });
 
-  // Drive the child: tick → worker order → green result → close
-  const childTick1 = engine.tick(childRow!.id);
-  assert.equal(childTick1.orders.length, 1);
-  assert.equal(childTick1.orders[0]!.step, 'worker');
-  const workerRun = childTick1.orders[0]!.run;
-  engine.green(childRow!.id, workerRun, 'result', { value: 'done' });
-  engine.close(childRow!.id, workerRun);
+  // Deep tick: the child's worker order is emitted from the PARENT tick,
+  // stamped with the child's workflow id — no explicit tick(child) needed.
+  const workerOrder = tick2.orders.find((o) => o.step === 'worker');
+  assert.ok(workerOrder !== undefined, 'parent tick must emit the child worker order (deep tick)');
+  assert.equal(workerOrder!.workflow, childRow!.id, 'child order carries the child workflow id');
+
+  // Commit via the parent-emitted order.
+  engine.green(childRow!.id, workerOrder!.run, 'result', { value: 'done' });
+  engine.close(childRow!.id, workerOrder!.run);
 
   // Tick parent → maintainCalls machine-greens delivered, teardown becomes eligible
   const tick3 = engine.tick(parentWf);
@@ -173,14 +177,14 @@ test('calls: (b) re-attach — maintainCalls twice does not duplicate child', ()
   const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
 
   // Green sandbox first
-  const tick1 = engine.tick(parentWf);
+  const tick1 = engine.tick(parentWf, { deep: false });
   const provRun = tick1.orders[0]!.run;
   engine.green(parentWf, provRun, 'sandbox', { env: 'v1' });
   engine.close(parentWf, provRun);
 
   // Call tick twice (maintainCalls runs each time)
-  engine.tick(parentWf);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
+  engine.tick(parentWf, { deep: false });
 
   // Exactly one child should exist
   const children = store.listChildrenByParent(parentWf);
@@ -194,7 +198,7 @@ test('calls: (b) re-attach — maintainCalls twice does not duplicate child', ()
   engine.close(childId, workerRun);
 
   // Now tick parent (durability: parent reads child outcome on tick, no prompt needed)
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   const deliveredArt = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredArt?.acceptance, 'green');
   assert.deepEqual(deliveredArt?.value, { value: 'result-v1' });
@@ -211,13 +215,13 @@ test('calls: (c) re-provide — parent input moves, child input updated, no seco
   const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
 
   // Green sandbox v1
-  const tick1 = engine.tick(parentWf);
+  const tick1 = engine.tick(parentWf, { deep: false });
   const provRun = tick1.orders[0]!.run;
   engine.green(parentWf, provRun, 'sandbox', { env: 'v1' });
   engine.close(parentWf, provRun);
 
   // Tick → child spawned with data={env:'v1'}
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined);
   assert.deepEqual(getArt(store, childRow!.id, 'data')?.value, { env: 'v1' });
@@ -232,7 +236,7 @@ test('calls: (c) re-provide — parent input moves, child input updated, no seco
   });
 
   // Tick parent → maintainCalls detects value mismatch → re-provides data to child
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   // Child's data should now be {env:'v2'}
   const childDataArt = getArt(store, childRow!.id, 'data');
@@ -251,7 +255,7 @@ test('calls: (d) failure branch — status-bearing outcome propagates, teardown 
   const parentWf = engine.createInstance('parentFailDef');
 
   // Tick parent → maintainCalls spawns child (no gate needed, empty callsInputs)
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined, 'child should be spawned immediately with empty callsInputs');
 
@@ -264,7 +268,7 @@ test('calls: (d) failure branch — status-bearing outcome propagates, teardown 
 
   // Tick parent → maintainCalls reads child outcome → machine-greens 'delivered' with {status:'failed'}
   // Teardown also becomes eligible in the same tick (settle fires inside maintainCalls, then again in tick)
-  const tick3 = engine.tick(parentWf);
+  const tick3 = engine.tick(parentWf, { deep: false });
   const deliveredArt = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredArt?.acceptance, 'green');
   assert.deepEqual(deliveredArt?.value, { status: 'failed' });
@@ -287,11 +291,11 @@ test('calls: (e) child outcome re-green — parent delivered updates with new va
   const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
 
   // Green sandbox, tick → child spawned
-  const tick1 = engine.tick(parentWf);
+  const tick1 = engine.tick(parentWf, { deep: false });
   const provRun = tick1.orders[0]!.run;
   engine.green(parentWf, provRun, 'sandbox', { env: 'test' });
   engine.close(parentWf, provRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined);
@@ -303,7 +307,7 @@ test('calls: (e) child outcome re-green — parent delivered updates with new va
   engine.close(childRow!.id, run1);
 
   // Tick parent → delivered greens with {value:'v1'}
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   assert.deepEqual(getArt(store, parentWf, 'delivered')?.value, { value: 'v1' });
 
   // Re-arm child's result via retry so it goes back to owed
@@ -317,7 +321,7 @@ test('calls: (e) child outcome re-green — parent delivered updates with new va
   engine.close(childRow!.id, run2);
 
   // Tick parent → maintainCalls detects value changed → re-greens delivered with {value:'v2'}
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   const deliveredArt = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredArt?.acceptance, 'green');
   assert.deepEqual(deliveredArt?.value, { value: 'v2' });
@@ -331,11 +335,11 @@ test('calls: (f) gate re-arm — cascade re-arms delivered, maintainCalls re-pro
   const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
 
   // Green sandbox v1, tick → child spawned
-  const tick1 = engine.tick(parentWf);
+  const tick1 = engine.tick(parentWf, { deep: false });
   const provRun = tick1.orders[0]!.run;
   engine.green(parentWf, provRun, 'sandbox', { env: 'v1' });
   engine.close(parentWf, provRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined);
@@ -345,7 +349,7 @@ test('calls: (f) gate re-arm — cascade re-arms delivered, maintainCalls re-pro
   const workerRun = childTick1.orders[0]!.run;
   engine.green(childRow!.id, workerRun, 'result', { value: 'done-v1' });
   engine.close(childRow!.id, workerRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   const deliveredV1 = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredV1?.acceptance, 'green');
@@ -362,12 +366,12 @@ test('calls: (f) gate re-arm — cascade re-arms delivered, maintainCalls re-pro
   });
 
   // Tick parent → the cascade in settle() re-arms 'delivered' to owed (fingerprint mismatch)
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   const deliveredAfterMove = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredAfterMove?.acceptance, 'owed', 'delivered should be re-armed to owed after sandbox moved');
 
   // Tick parent again → maintainCalls runs → detects data mismatch → re-provides to child
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   assert.deepEqual(getArt(store, childRow!.id, 'data')?.value, { env: 'v2' });
 
   // Drive child to re-green its result
@@ -379,7 +383,7 @@ test('calls: (f) gate re-arm — cascade re-arms delivered, maintainCalls re-pro
   engine.close(childRow!.id, run2);
 
   // Tick parent → maintainCalls re-greens 'delivered'
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   const deliveredV2 = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredV2?.acceptance, 'green');
   assert.deepEqual(deliveredV2?.value, { value: 'done-v2' });
@@ -411,7 +415,7 @@ test('calls: (g) provideInput cascades to calls: child without extra tick', () =
   const parentWf = engine.createInstance('parentProvideDef', { provide: { data2: { env: 'v1' } } });
 
   // Tick parent → maintainCalls spawns child immediately (gate input data2 is green)
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined, 'child should be spawned after tick with data2 green');
   assert.deepEqual(getArt(store, childRow!.id, 'data')?.value, { env: 'v1' });
@@ -588,14 +592,14 @@ test('calls: F2 — spawn-time child schema refusal is a debt, tick does not thr
 
   const parentWf = engine.createInstance('strictParentDef', { provide: { proposal: { text: 'hello' } } });
 
-  const tick1 = engine.tick(parentWf);
+  const tick1 = engine.tick(parentWf, { deep: false });
   const provRun = tick1.orders[0]!.run;
   // sandbox is schema-less at the parent, so a number for `env` greens fine here...
   engine.green(parentWf, provRun, 'sandbox', { env: 42 });
   engine.close(parentWf, provRun);
 
   // ...but the child's `data` input requires env: string — tick must NOT throw.
-  assert.doesNotThrow(() => engine.tick(parentWf));
+  assert.doesNotThrow(() => engine.tick(parentWf, { deep: false }));
 
   const delivered = getArt(store, parentWf, 'delivered');
   assert.equal(delivered?.acceptance, 'rejected');
@@ -608,8 +612,8 @@ test('calls: F2 — spawn-time child schema refusal is a debt, tick does not thr
   assert.equal(store.findChildByParent(parentWf, 'delivered'), undefined);
 
   // Subsequent ticks with the gate unmoved must not re-throw or double-bump schemaRejects.
-  engine.tick(parentWf);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
+  engine.tick(parentWf, { deep: false });
   const deliveredAfter = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredAfter?.schemaRejects, 1, 'schemaRejects must not double-bump while gate is unmoved');
   assert.equal(store.findChildByParent(parentWf, 'delivered'), undefined, 'no spawn attempt while rejected+unmoved gate');
@@ -618,7 +622,7 @@ test('calls: F2 — spawn-time child schema refusal is a debt, tick does not thr
   const sandboxArt = getArt(store, parentWf, 'sandbox');
   store.putArtifact({ ...sandboxArt!, version: sandboxArt!.version + 1, value: { env: 'ok-now' } });
   engine.retry(parentWf, 'delivered');
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined, 'spawn should succeed once the gate value is fixed');
@@ -631,11 +635,11 @@ test('calls: F2 — re-provide-time child schema refusal is a debt, human provid
   const parentWf = engine.createInstance('strictParentDef', { provide: { proposal: { text: 'hello' } } });
 
   // Healthy spawn: sandbox greens with a legal value.
-  const tick1 = engine.tick(parentWf);
+  const tick1 = engine.tick(parentWf, { deep: false });
   const provRun = tick1.orders[0]!.run;
   engine.green(parentWf, provRun, 'sandbox', { env: 'v1' });
   engine.close(parentWf, provRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined, 'child should spawn on a legal value');
@@ -647,7 +651,7 @@ test('calls: F2 — re-provide-time child schema refusal is a debt, human provid
   store.putArtifact({ ...sandboxArt!, version: sandboxArt!.version + 1, value: { env: 7 } });
 
   // tick's maintainCalls cascade-up must not throw out of provideInput.
-  assert.doesNotThrow(() => engine.tick(parentWf));
+  assert.doesNotThrow(() => engine.tick(parentWf, { deep: false }));
 
   const delivered = getArt(store, parentWf, 'delivered');
   assert.equal(delivered?.acceptance, 'rejected');
@@ -670,11 +674,11 @@ test('calls: F4 — reject propagates to child outcome, parent reopens to owed, 
   const { engine, store } = makeEngine([childDef, parentDef]);
 
   const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
-  const tick1 = engine.tick(parentWf);
+  const tick1 = engine.tick(parentWf, { deep: false });
   const provRun = tick1.orders[0]!.run;
   engine.green(parentWf, provRun, 'sandbox', { env: 'v1' });
   engine.close(parentWf, provRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined);
@@ -682,7 +686,7 @@ test('calls: F4 — reject propagates to child outcome, parent reopens to owed, 
   const workerRun = childTick1.orders[0]!.run;
   engine.green(childRow!.id, workerRun, 'result', { value: 'v1' });
   engine.close(childRow!.id, workerRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   const deliveredGreen = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredGreen?.acceptance, 'green');
@@ -707,7 +711,7 @@ test('calls: F4 — reject propagates to child outcome, parent reopens to owed, 
   assert.equal(deliveredAfterReject?.acceptance, 'owed');
 
   // F4 livelock gone: a tick does NOT re-green the parent from the unchanged child value.
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   const deliveredStillOwed = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredStillOwed?.acceptance, 'owed', 'must not re-green from the unchanged (rejected) child value');
 
@@ -728,7 +732,7 @@ test('calls: F4 — reject propagates to child outcome, parent reopens to owed, 
   assert.ok(getArt(store, childRow!.id, 'result')!.version > childOutcomeGreenVersion);
 
   // Parent mirrors the new value.
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   const deliveredV2 = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredV2?.acceptance, 'green');
   assert.deepEqual(deliveredV2?.value, { value: 'v2' });
@@ -740,11 +744,11 @@ test('calls: F4 ordering A — human skip on green calls artifact survives arbit
   const { engine, store } = makeEngine([childDef, parentDef]);
 
   const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
-  const tick1 = engine.tick(parentWf);
+  const tick1 = engine.tick(parentWf, { deep: false });
   const provRun = tick1.orders[0]!.run;
   engine.green(parentWf, provRun, 'sandbox', { env: 'v1' });
   engine.close(parentWf, provRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined);
@@ -752,7 +756,7 @@ test('calls: F4 ordering A — human skip on green calls artifact survives arbit
   const workerRun = childTick1.orders[0]!.run;
   engine.green(childRow!.id, workerRun, 'result', { value: 'v3' });
   engine.close(childRow!.id, workerRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   assert.equal(getArt(store, parentWf, 'delivered')?.acceptance, 'green');
 
@@ -762,7 +766,7 @@ test('calls: F4 ordering A — human skip on green calls artifact survives arbit
 
   // The machine never overrides a decision made on current evidence — arbitrary ticks
   // must not re-green 'delivered' back from 'skipped' while the child is unchanged.
-  for (let i = 0; i < 5; i++) engine.tick(parentWf);
+  for (let i = 0; i < 5; i++) engine.tick(parentWf, { deep: false });
   assert.equal(getArt(store, parentWf, 'delivered')?.acceptance, 'skipped', 'skip must survive arbitrary ticks');
 });
 
@@ -770,11 +774,11 @@ test('calls: F4 ordering B — skip pinned to stale child version; gate moves, c
   const { engine, store } = makeEngine([childDef, parentDef]);
 
   const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
-  const tick1 = engine.tick(parentWf);
+  const tick1 = engine.tick(parentWf, { deep: false });
   const provRun = tick1.orders[0]!.run;
   engine.green(parentWf, provRun, 'sandbox', { env: 'v1' });
   engine.close(parentWf, provRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined);
@@ -782,7 +786,7 @@ test('calls: F4 ordering B — skip pinned to stale child version; gate moves, c
   const workerRun = childTick1.orders[0]!.run;
   engine.green(childRow!.id, workerRun, 'result', { value: 'v3' });
   engine.close(childRow!.id, workerRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   // Skip pinned to the v3 child outcome version.
   engine.skip(parentWf, 'delivered', 'human', 'skipping for now');
@@ -791,7 +795,7 @@ test('calls: F4 ordering B — skip pinned to stale child version; gate moves, c
   // Gate moves: sandbox re-provisioned to v2.
   const sandboxArt = getArt(store, parentWf, 'sandbox');
   store.putArtifact({ ...sandboxArt!, version: sandboxArt!.version + 1, value: { env: 'v2' } });
-  engine.tick(parentWf); // re-provides child's data input
+  engine.tick(parentWf, { deep: false }); // re-provides child's data input
 
   assert.deepEqual(getArt(store, childRow!.id, 'data')?.value, { env: 'v2' });
 
@@ -804,7 +808,7 @@ test('calls: F4 ordering B — skip pinned to stale child version; gate moves, c
   engine.close(childRow!.id, run2);
 
   // A months-old skip cannot permanently gag a fresh child result: parent re-arms and mirrors.
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
   const deliveredAfter = getArt(store, parentWf, 'delivered');
   assert.equal(deliveredAfter?.acceptance, 'green', 'stale pin must not block a fresh child result from mirroring');
   assert.deepEqual(deliveredAfter?.value, { value: 'v4' });
@@ -816,11 +820,11 @@ test('calls: F4 — a propagated reject surfaces in the CHILD workflow\'s status
   const { engine, store } = makeEngine([childDef, parentDef]);
 
   const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
-  const tick1 = engine.tick(parentWf);
+  const tick1 = engine.tick(parentWf, { deep: false });
   const provRun = tick1.orders[0]!.run;
   engine.green(parentWf, provRun, 'sandbox', { env: 'v1' });
   engine.close(parentWf, provRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   const childRow = store.findChildByParent(parentWf, 'delivered');
   assert.ok(childRow !== undefined);
@@ -828,7 +832,7 @@ test('calls: F4 — a propagated reject surfaces in the CHILD workflow\'s status
   const workerRun = childTick1.orders[0]!.run;
   engine.green(childRow!.id, workerRun, 'result', { value: 'v1' });
   engine.close(childRow!.id, workerRun);
-  engine.tick(parentWf);
+  engine.tick(parentWf, { deep: false });
 
   engine.reject(parentWf, 'delivered', 'teardown', 'needs rework');
 
@@ -839,4 +843,296 @@ test('calls: F4 — a propagated reject surfaces in the CHILD workflow\'s status
   const resultDebt = childStatus.debts.find((d) => d.path === 'result');
   assert.ok(resultDebt !== undefined, 'the rejected child outcome must appear in the child\'s status.debts');
   assert.equal(resultDebt!.acceptance, 'rejected');
+});
+
+// ============================================================================
+// §23.6.8 DEEP TICK — descend into calls: children from the parent tick, and
+// surface child stalls on parent status. (Change 1 + Change 2.)
+// ============================================================================
+
+// ---- 3-level nesting fixtures (leaf = childDef) -----------------------------
+
+/** midDef: calls childDef (leaf); its own output is the leaf mirror. */
+const midDeliverStep: StepDef = {
+  ...step({ name: 'middeliver', produces: ['leaf_mirror'] }),
+  calls: 'childDef',
+  callsInputs: { data: 'mid_in' },
+  consumes: [],
+};
+const midDef: WorkflowDef = {
+  ...def('midDef', [input('mid_in', { seedOwed: true })], [midDeliverStep]),
+  outputs: ['leaf_mirror'],
+};
+
+/** topDef: calls midDef; its own output is the mid mirror. */
+const topDeliverStep: StepDef = {
+  ...step({ name: 'topdeliver', produces: ['mid_mirror'] }),
+  calls: 'midDef',
+  callsInputs: { mid_in: 'top_in' },
+  consumes: [],
+};
+const topDef: WorkflowDef = {
+  ...def('topDef', [input('top_in', { seedOwed: true })], [topDeliverStep]),
+  outputs: ['mid_mirror'],
+};
+
+// ---- stall fixtures (a child whose result can be rejected to the cap) --------
+
+/**
+ * stallChildDef: `worker` produces `result` (its declared output); `checker`
+ * consumes `result` and so has authority to `reject` it. worker.maxAttempts=2,
+ * so two rejects drive `result` past the §6 stall cap → `stalled`.
+ */
+const stallChildDef: WorkflowDef = {
+  ...def(
+    'stallChildDef',
+    [input('data', { seedOwed: true })],
+    [
+      step({ name: 'worker', consumes: ['data'], produces: ['result'], maxAttempts: 2 }),
+      step({ name: 'checker', consumes: ['result'], produces: ['verdict'] }),
+    ],
+  ),
+  outputs: ['result'],
+};
+
+const stallDeliverStep: StepDef = {
+  ...step({ name: 'deliver', produces: ['delivered'] }),
+  calls: 'stallChildDef',
+  callsInputs: { data: 'sandbox' },
+  consumes: [],
+};
+const stallParentDef: WorkflowDef = def(
+  'stallParentDef',
+  [input('proposal', { seedOwed: true })],
+  [
+    step({ name: 'provision', consumes: ['proposal'], produces: ['sandbox'] }),
+    stallDeliverStep,
+    step({ name: 'teardown', consumes: ['delivered'], produces: ['done'], terminal: true }),
+  ],
+);
+
+/** stallMidDef: calls stallChildDef (a stall-capable leaf). */
+const stallMidDeliverStep: StepDef = {
+  ...step({ name: 'middeliver', produces: ['leaf_mirror'] }),
+  calls: 'stallChildDef',
+  callsInputs: { data: 'mid_in' },
+  consumes: [],
+};
+const stallMidDef: WorkflowDef = {
+  ...def('stallMidDef', [input('mid_in', { seedOwed: true })], [stallMidDeliverStep]),
+  outputs: ['leaf_mirror'],
+};
+
+/** stallTopDef: calls stallMidDef → a 3-level tree whose leaf can stall. */
+const stallTopDeliverStep: StepDef = {
+  ...step({ name: 'topdeliver', produces: ['mid_mirror'] }),
+  calls: 'stallMidDef',
+  callsInputs: { mid_in: 'top_in' },
+  consumes: [],
+};
+const stallTopDef: WorkflowDef = {
+  ...def('stallTopDef', [input('top_in', { seedOwed: true })], [stallTopDeliverStep]),
+  outputs: ['mid_mirror'],
+};
+
+// ---- helpers ----------------------------------------------------------------
+
+/** Drive a parentDef instance until the child is spawned (shallow, no descent). */
+function spawnChild(engine: Engine, store: Store, parentWf: string): string {
+  const t1 = engine.tick(parentWf, { deep: false });
+  const provRun = t1.orders.find((o) => o.step === 'provision')!.run;
+  engine.green(parentWf, provRun, 'sandbox', { env: 'v1' });
+  engine.close(parentWf, provRun);
+  engine.tick(parentWf, { deep: false }); // maintainCalls spawns child, no descent
+  const childRow = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(childRow !== undefined, 'child should be spawned');
+  return childRow!.id;
+}
+
+/** Reject a stallChildDef's `result` to its stall cap (2). */
+function stallResult(engine: Engine, childWf: string): void {
+  for (let i = 0; i < 2; i++) {
+    const ct = engine.tick(childWf, { deep: false });
+    const wo = ct.orders.find((o) => o.step === 'worker');
+    assert.ok(wo !== undefined, `worker should re-fire (attempt ${i})`);
+    engine.green(childWf, wo!.run, 'result', { n: i });
+    engine.close(childWf, wo!.run);
+    engine.reject(childWf, 'result', 'checker', 'nope');
+  }
+}
+
+// ---- (2) three-level nesting ------------------------------------------------
+
+test('calls: deep tick (2) three-level nesting — tick(root) surfaces the grandchild order', () => {
+  const { engine, store } = makeEngine([childDef, midDef, topDef]);
+  const root = engine.createInstance('topDef', { provide: { top_in: { env: 'g' } } });
+
+  // One deep tick spawns mid, provides its input, descends → spawns leaf,
+  // provides its input, descends → claims the leaf's worker order.
+  const t = engine.tick(root);
+
+  const midRow = store.findChildByParent(root, 'mid_mirror');
+  assert.ok(midRow !== undefined, 'mid child spawned');
+  const leafRow = store.findChildByParent(midRow!.id, 'leaf_mirror');
+  assert.ok(leafRow !== undefined, 'leaf grandchild spawned');
+
+  const workerOrder = t.orders.find((o) => o.step === 'worker');
+  assert.ok(workerOrder !== undefined, 'root tick surfaces the grandchild worker order');
+  assert.equal(workerOrder!.workflow, leafRow!.id, 'grandchild order carries the grandchild workflow id');
+});
+
+// ---- (3) gate not green → no descend ----------------------------------------
+
+test('calls: deep tick (3) gate re-armed → no descend that round', () => {
+  const { engine, store } = makeEngine([childDef, parentDef]);
+  const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'x' } } });
+  const childWf = spawnChild(engine, store, parentWf);
+
+  // Re-arm the gate input (sandbox) to non-green — the child is mid-work.
+  const sb = getArt(store, parentWf, 'sandbox')!;
+  store.putArtifact({ ...sb, acceptance: 'owed' });
+
+  const t = engine.tick(parentWf); // deep, but gate not ready → descent skipped
+  assert.ok(t.orders.every((o) => o.workflow !== childWf), 'no child orders while gate re-armed');
+  assert.ok(t.deferred.every((d) => d.workflow !== childWf), 'no child deferrals — descent skipped entirely');
+});
+
+// ---- (4) debt paid → no descend ---------------------------------------------
+
+test('calls: deep tick (4) calls artifact green → no descend', () => {
+  const { engine, store } = makeEngine([childDef, parentDef]);
+  const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'x' } } });
+  const childWf = spawnChild(engine, store, parentWf);
+
+  // Drive the child to green its result, then tick parent to machine-green delivered.
+  const ct = engine.tick(childWf, { deep: false });
+  const wo = ct.orders.find((o) => o.step === 'worker')!;
+  engine.green(childWf, wo.run, 'result', { value: 'ok' });
+  engine.close(childWf, wo.run);
+  engine.tick(parentWf, { deep: false });
+  assert.equal(getArt(store, parentWf, 'delivered')?.acceptance, 'green', 'delivered debt is paid');
+
+  // Deep tick with the debt paid → descent is skipped (no child orders).
+  const t = engine.tick(parentWf);
+  assert.ok(t.orders.every((o) => o.workflow !== childWf), 'no child orders once the calls debt is green');
+  assert.equal(getArt(store, parentWf, 'delivered')?.acceptance, 'green');
+});
+
+// ---- (5) deep:false / --shallow restores today's behavior -------------------
+
+test('calls: deep tick (5) { deep: false } returns only this instance\'s orders', () => {
+  const { engine, store } = makeEngine([childDef, parentDef]);
+  const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'x' } } });
+  const childWf = spawnChild(engine, store, parentWf);
+
+  // Shallow parent tick emits no child order...
+  const shallow = engine.tick(parentWf, { deep: false });
+  assert.ok(shallow.orders.every((o) => o.workflow !== childWf), 'shallow tick returns no child orders');
+
+  // ...the explicit child tick is still required to get the worker order.
+  const ct = engine.tick(childWf, { deep: false });
+  assert.ok(ct.orders.find((o) => o.step === 'worker') !== undefined, 'child worker via explicit child tick');
+});
+
+// ---- (6) in-flight dedup ----------------------------------------------------
+
+test('calls: deep tick (6) second tick(parent) → in-flight deferral stamped with child id, no duplicate', () => {
+  const { engine, store } = makeEngine([childDef, parentDef]);
+  const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'x' } } });
+
+  const p1 = engine.tick(parentWf);
+  engine.green(parentWf, p1.orders[0]!.run, 'sandbox', { env: 'v1' });
+  engine.close(parentWf, p1.orders[0]!.run);
+
+  // First deep tick: spawn child + claim its worker order.
+  const t = engine.tick(parentWf);
+  const childRow = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(childRow !== undefined);
+  const wo = t.orders.find((o) => o.step === 'worker' && o.workflow === childRow!.id);
+  assert.ok(wo !== undefined, 'first parent tick claims the child worker');
+
+  // Second deep tick: the child worker is already in-flight → deferred, not duplicated.
+  const t2 = engine.tick(parentWf);
+  assert.equal(
+    t2.orders.find((o) => o.step === 'worker' && o.workflow === childRow!.id),
+    undefined,
+    'no duplicate child order',
+  );
+  const dfr = t2.deferred.find((d) => d.reason === 'in-flight' && d.workflow === childRow!.id);
+  assert.ok(dfr !== undefined, 'in-flight deferral is stamped with the child workflow id');
+});
+
+// ---- (7) stalled child → parent status --------------------------------------
+
+test('calls: deep tick (7) stalled child surfaces child.stalled on the parent debt', () => {
+  const { engine, store } = makeEngine([stallChildDef, stallParentDef]);
+  const parentWf = engine.createInstance('stallParentDef', { provide: { proposal: { text: 'x' } } });
+  const childWf = spawnChild(engine, store, parentWf);
+
+  stallResult(engine, childWf);
+  // Reconcile parent: the now-non-green child outcome re-arms delivered to owed.
+  engine.tick(parentWf, { deep: false });
+
+  const st = engine.status(parentWf);
+  const deliveredDebt = st.debts.find((d) => d.path === 'delivered');
+  assert.ok(deliveredDebt !== undefined, 'delivered is an unpaid debt while the child is stalled');
+  assert.ok(deliveredDebt!.child !== undefined, 'a child summary is attached to the calls debt');
+  assert.equal(deliveredDebt!.child!.workflow, childWf, 'child summary carries the child id to inspect');
+  assert.equal(deliveredDebt!.child!.def, 'stallChildDef');
+  assert.equal(deliveredDebt!.child!.stalled, true, 'a stalled child is visible from the parent');
+});
+
+test('calls: deep tick (7b) grandchild stall propagates to the root debt', () => {
+  const { engine, store } = makeEngine([stallChildDef, stallMidDef, stallTopDef]);
+  const root = engine.createInstance('stallTopDef', { provide: { top_in: { env: 'g' } } });
+
+  // Spawn the tree shallowly, level by level.
+  engine.tick(root, { deep: false }); // spawn mid, provide mid_in
+  const midRow = store.findChildByParent(root, 'mid_mirror');
+  assert.ok(midRow !== undefined, 'mid child spawned');
+  engine.tick(midRow!.id, { deep: false }); // spawn leaf, provide data
+  const leafRow = store.findChildByParent(midRow!.id, 'leaf_mirror');
+  assert.ok(leafRow !== undefined, 'leaf grandchild spawned');
+
+  // Stall the leaf, then reconcile the mirrors back up to owed.
+  stallResult(engine, leafRow!.id);
+  engine.tick(midRow!.id, { deep: false }); // mid re-arms leaf_mirror to owed
+  engine.tick(root, { deep: false }); // root re-arms mid_mirror to owed
+
+  const st = engine.status(root);
+  const debt = st.debts.find((d) => d.path === 'mid_mirror');
+  assert.ok(debt !== undefined, 'mid_mirror is an unpaid debt at the root');
+  assert.ok(debt!.child !== undefined, 'mid child summary attached');
+  assert.equal(debt!.child!.workflow, midRow!.id);
+  assert.equal(debt!.child!.stalled, true, 'a grandchild stall propagates up to the root debt via the mid child');
+});
+
+// ---- (8) reap across the tree -----------------------------------------------
+
+test('calls: deep tick (8) tick(parent) reaps a child\'s stale lease and re-emits the order', () => {
+  const { engine, store } = makeEngine([childDef, parentDef]);
+  const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'x' } } });
+
+  const T0 = 1_000_000;
+  const p1 = engine.tick(parentWf, { now: T0 });
+  engine.green(parentWf, p1.orders[0]!.run, 'sandbox', { env: 'v1' });
+  engine.close(parentWf, p1.orders[0]!.run);
+
+  // Deep tick claims the child worker at T0.
+  const t = engine.tick(parentWf, { now: T0 });
+  const childRow = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(childRow !== undefined);
+  assert.ok(
+    t.orders.find((o) => o.step === 'worker' && o.workflow === childRow!.id) !== undefined,
+    'child worker claimed at T0',
+  );
+
+  // Advance past the default 2h reap TTL — the parent deep tick reaps the
+  // child's stale lease (reaped count includes it) and re-emits the order.
+  const t2 = engine.tick(parentWf, { now: T0 + 3 * 60 * 60 * 1000 });
+  assert.ok(t2.reaped >= 1, 'the child\'s stale lease is reaped through the parent deep tick');
+  assert.ok(
+    t2.orders.find((o) => o.step === 'worker' && o.workflow === childRow!.id) !== undefined,
+    'the child worker order is re-emitted after the reap',
+  );
 });
