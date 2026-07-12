@@ -80,8 +80,9 @@ Repeat until `status` says `done: true`:
    means the order is for a *different* kind of executor — see "Resolving
    `worker`" below before dispatching it as if it were an agent order.
 3. **Verify each run closed.** A worker that returns without closing leaves a
-   claimed lease. Check `status.<order.workflow>.inFlight` (a child order's run
-   lives in the child's own status, not the root's); if its run is still open:
+   claimed lease. Check `owenloop status <order.workflow>` → its `inFlight` (a
+   child order's run lives in the child's own status, not the root's); if its
+   run is still open:
    `owenloop close <order.workflow> <run> --outcome failed --summary "worker did not close"`.
    If the engine says the run already closed or lost its lease, leave it —
    that's the answer, not an error.
