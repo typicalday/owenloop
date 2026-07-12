@@ -1734,7 +1734,8 @@ export class Engine {
       if (!callsStep) continue;
       const child = this.store.findChildByParent(workflow, d.path);
       if (!child) continue;
-      d.child = this.childStatusSummary(child.id, new Set());
+      const summary = this.childStatusSummary(child.id, new Set());
+      if (summary !== undefined) d.child = summary;
     }
     // §28: informational drift flag — compare the currently-loaded live def
     // for this instance's def NAME against the pinned snapshot's hash. Only
@@ -2142,10 +2143,20 @@ export class Engine {
    * `calls:` path so a grandchild stall shows as `stalled: true` here. `debts`
    * is a COUNT — the `workflow` id is the human's inspection handle. `visited`
    * guards against any accidental instance cycle.
+   *
+   * Returns `undefined` when the child's def is unresolvable (an unpinned row
+   * whose def was deleted/renamed) — practically unreachable since `calls:`
+   * spawns pin (§28), but a summary is enrichment, and enrichment must not
+   * make `status(parent)` throw (same stance as the §28 drift flag).
    */
-  private childStatusSummary(childWf: string, visited: Set<string>): ChildStatusSummary {
+  private childStatusSummary(childWf: string, visited: Set<string>): ChildStatusSummary | undefined {
     visited.add(childWf);
-    const childDef = this.defFor(childWf);
+    let childDef: WorkflowDef;
+    try {
+      childDef = this.defFor(childWf);
+    } catch {
+      return undefined;
+    }
     const childArts = this.artMap(childWf);
     const cs = workflowStatus(childDef, childArts);
     let stalled = cs.debts.some((d) => d.stalled);
@@ -2155,7 +2166,7 @@ export class Engine {
         if (!callsStep) continue;
         const grandchild = this.store.findChildByParent(childWf, d.path);
         if (!grandchild || visited.has(grandchild.id)) continue;
-        if (this.childStatusSummary(grandchild.id, visited).stalled) {
+        if (this.childStatusSummary(grandchild.id, visited)?.stalled) {
           stalled = true;
           break;
         }
