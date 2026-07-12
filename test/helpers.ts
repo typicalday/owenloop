@@ -2,6 +2,7 @@
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from '../src/paths.ts';
 import type { ArtifactData, EffectDef, FiringTrigger, GroupDef, InputDef, StepDef, WorkflowDef } from '../src/types.ts';
@@ -122,4 +123,92 @@ export function exampleDefNames(dir: string): string[] {
     names.push(raw.name);
   }
   return names.sort();
+}
+
+// ---- USTAR/pax tar-gz writer (for test/untar.test.ts and test/add.test.ts) ---
+//
+// A minimal, from-scratch tar+gzip writer used to build fixture tarballs
+// shaped like GitHub's codeload output: a single root dir prefix
+// (`<owner>-<repo>-<sha>/…`), USTAR headers, and a pax extended header
+// (typeflag 'x') for any path over 100 chars. Deliberately independent of
+// `src/untar.ts` — it exists to exercise that reader, not share code with it.
+
+const BLOCK = 512;
+
+function octalField(value: number, length: number): string {
+  // length includes the trailing NUL; e.g. length 12 -> 11 octal digits + '\0'.
+  return value.toString(8).padStart(length - 1, '0') + '\0';
+}
+
+function writeField(buf: Buffer, str: string, offset: number, length: number): void {
+  buf.write(str, offset, Math.min(Buffer.byteLength(str, 'ascii'), length), 'ascii');
+}
+
+function padTo512(data: Buffer): Buffer {
+  const padded = Math.ceil(data.length / BLOCK) * BLOCK;
+  const out = Buffer.alloc(padded);
+  data.copy(out);
+  return out;
+}
+
+/** Build one 512-byte USTAR header block (name truncated to 100 bytes — long names go via a pax 'x' entry instead). */
+function tarHeader(name: string, size: number, typeflag: string): Buffer {
+  const buf = Buffer.alloc(BLOCK);
+  writeField(buf, name, 0, 100);
+  writeField(buf, octalField(0o644, 8), 100, 8); // mode
+  writeField(buf, octalField(0, 8), 108, 8); // uid
+  writeField(buf, octalField(0, 8), 116, 8); // gid
+  writeField(buf, octalField(size, 12), 124, 12); // size
+  writeField(buf, octalField(0, 12), 136, 12); // mtime
+  buf.fill(0x20, 148, 156); // checksum field: spaces while computing
+  buf[156] = typeflag.charCodeAt(0);
+  writeField(buf, 'ustar', 257, 6); // magic "ustar\0" (rest zero-filled)
+  writeField(buf, '00', 263, 2); // version
+
+  let sum = 0;
+  for (let i = 0; i < BLOCK; i++) sum += buf[i] as number;
+  writeField(buf, octalField(sum, 6) + ' ', 148, 8);
+  return buf;
+}
+
+/** One pax extended-header data record: "<len> <key>=<value>\n", <len> self-inclusive. */
+function paxRecord(key: string, value: string): string {
+  const suffixLen = 1 + key.length + 1 + value.length + 1; // ' ' + key + '=' + value + '\n'
+  let digits = String(suffixLen).length;
+  let total = digits + suffixLen;
+  // digit count of `total` can grow once (crossing a power-of-ten boundary) — settle it.
+  while (String(total).length !== digits) {
+    digits = String(total).length;
+    total = digits + suffixLen;
+  }
+  return `${total} ${key}=${value}\n`;
+}
+
+function tarEntryBlocks(fullPath: string, data: Uint8Array): Buffer[] {
+  const blocks: Buffer[] = [];
+  if (Buffer.byteLength(fullPath, 'utf8') > 100) {
+    const paxData = Buffer.from(paxRecord('path', fullPath), 'utf8');
+    blocks.push(tarHeader('PaxHeader', paxData.length, 'x'), padTo512(paxData));
+    // Name field is overridden by the pax record above; content is moot.
+    blocks.push(tarHeader(fullPath.slice(0, 99), data.length, '0'), padTo512(Buffer.from(data)));
+  } else {
+    blocks.push(tarHeader(fullPath, data.length, '0'), padTo512(Buffer.from(data)));
+  }
+  return blocks;
+}
+
+/**
+ * Build a gzipped USTAR archive shaped like a GitHub codeload tarball: every
+ * file in `files` (relative path -> text contents) lands under
+ * `<rootPrefix>/<relative path>`. Used to feed a fake injected `fetch` in
+ * `test/add.test.ts`, and to round-trip against `extractTarGz` in
+ * `test/untar.test.ts`.
+ */
+export function makeGithubTarball(rootPrefix: string, files: Record<string, string>): Buffer {
+  const blocks: Buffer[] = [];
+  for (const [relPath, contents] of Object.entries(files)) {
+    blocks.push(...tarEntryBlocks(`${rootPrefix}/${relPath}`, Buffer.from(contents, 'utf8')));
+  }
+  blocks.push(Buffer.alloc(BLOCK * 2)); // two all-zero blocks mark end of archive
+  return gzipSync(Buffer.concat(blocks));
 }

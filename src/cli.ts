@@ -8,6 +8,7 @@
  * argv to engine calls.
  *
  *   owenloop defs                       list available workflow definitions
+ *   owenloop add <owner>/<repo>[@ref]   fetch, validate, and install a repo's workflow defs (public repos)
  *   owenloop create <def> [--provide n=json] [--title t]   start an instance
  *   owenloop provide <wf> <name> [--value json]   supply an owed input
  *   owenloop tick <wf> [--now ms]       pull eligible orders
@@ -31,7 +32,8 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Engine } from './engine.ts';
 import { buildGraph, buildTrace, graphToDot, graphToMermaid, modelCheck } from './model.ts';
@@ -41,12 +43,24 @@ import { DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts
 import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 import { detId, nowMs, parseDurationMs } from './util.ts';
+import { extractTarGz } from './untar.ts';
+import {
+  githubShaUrl,
+  githubTarballUrl,
+  installFiles,
+  parseRepoSpec,
+  readLockfile,
+  writeLockfile,
+} from './add.ts';
+import type { InstalledEntry } from './add.ts';
 
 export interface CliIO {
   cwd: string;
   env: Record<string, string | undefined>;
   out: (line: string) => void;
   err: (line: string) => void;
+  /** Injectable for hermetic tests — `add` is the only command that fetches. */
+  fetch?: typeof globalThis.fetch;
 }
 
 function defaultIO(): CliIO {
@@ -55,6 +69,7 @@ function defaultIO(): CliIO {
     env: process.env,
     out: (s) => process.stdout.write(`${s}\n`),
     err: (s) => process.stderr.write(`${s}\n`),
+    fetch: globalThis.fetch,
   };
 }
 
@@ -198,6 +213,7 @@ Usage: owenloop <command> [args] [--db <path>] [--defs <dir>]
 
 Commands:
   defs                                   list available workflow definitions
+  add <owner>/<repo>[@ref]               fetch, validate, and install a repo's workflow defs (public repos)
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided]
                                          bounded reachability check (deadlocks, stuck, dead steps, declared invariants)
@@ -805,6 +821,186 @@ function statusEntry(engine: Engine, w: WorkflowRow): Record<string, unknown> {
     return { ...base, ...engine.status(w.id) };
   } catch (e) {
     return { ...base, error: (e as Error).message };
+  }
+}
+
+/**
+ * `owenloop add <owner>/<repo>[@ref]` — the one network-touching CLI verb
+ * (workflow-distribution Stage 1). Fetches a public GitHub repo's tarball,
+ * validates its `workflows/**` defs with the same lint/check machinery
+ * `owenloop lint`/`owenloop check` use, and — only if everything passes —
+ * installs them under `<defsDir>/<owner>-<repo>/` and records provenance in
+ * `.owenloop/installed.json`. A partial install is never left behind: any
+ * refusal (parse/lint/validate/check failure) writes nothing.
+ *
+ * Kept inside cli.ts (rather than add.ts) so it can reuse `Args`/`need`/
+ * `last`/`CliError`/`parseJson`/`print`/`failureNote` without exporting them
+ * from this module — the pure, unit-tested logic (spec parsing, lockfile
+ * I/O, file install) lives in `src/add.ts`; this function is just the async
+ * network + arg glue.
+ */
+async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
+  const spec = need(args, 1, 'owner/repo[@ref]');
+  const { owner, repo, ref } = parseRepoSpec(spec);
+  const source = `${owner}/${repo}`;
+  const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
+  const lockfilePath = join(io.cwd, '.owenloop', 'installed.json');
+  const fetchFn = io.fetch ?? globalThis.fetch;
+
+  // 1. Resolve the ref to a pinned commit sha.
+  const shaRes = await fetchFn(githubShaUrl(owner, repo, ref), {
+    headers: { Accept: 'application/vnd.github.sha', 'User-Agent': 'owenloop' },
+  });
+  if (!shaRes.ok) {
+    const notFoundNote = shaRes.status === 404 ? ' (repo or ref not found)' : '';
+    throw new CliError(`could not resolve ${source}@${ref}: GitHub returned ${shaRes.status}${notFoundNote}`);
+  }
+  const shaBody = (await shaRes.text()).trim();
+  if (!/^[0-9a-f]{40}$/i.test(shaBody)) {
+    throw new CliError(`unexpected response resolving ${source}@${ref}: expected a 40-char commit sha, got "${shaBody}"`);
+  }
+  const sha = shaBody;
+
+  // 2. Fetch the tarball for that pinned sha.
+  const tarRes = await fetchFn(githubTarballUrl(owner, repo, sha), {
+    headers: { 'User-Agent': 'owenloop' },
+  });
+  if (!tarRes.ok) {
+    throw new CliError(`could not fetch tarball for ${source}@${sha}: GitHub returned ${tarRes.status}`);
+  }
+  const bytes = new Uint8Array(await tarRes.arrayBuffer());
+
+  // 3. Extract, strip the single leading '<owner>-<repo>-<sha>/' root-dir
+  //    component GitHub tarballs always have, and keep only workflows/**
+  //    (re-keyed relative to that dir).
+  let rawFiles: Map<string, Uint8Array>;
+  try {
+    rawFiles = extractTarGz(bytes);
+  } catch (e) {
+    throw new CliError(`could not extract tarball for ${source}@${sha}: ${(e as Error).message}`);
+  }
+  const files = new Map<string, Uint8Array>();
+  for (const [rawPath, data] of rawFiles) {
+    const firstSlash = rawPath.indexOf('/');
+    const rest = firstSlash >= 0 ? rawPath.slice(firstSlash + 1) : '';
+    if (rest.startsWith('workflows/')) {
+      const relPath = rest.slice('workflows/'.length);
+      if (relPath) files.set(relPath, data);
+    }
+  }
+  // Note: git (and so GitHub's tarball export) never tracks a truly empty
+  // directory, so "no workflows/ dir at all" and "workflows/ dir exists but
+  // is untracked-empty" are indistinguishable from the archive's contents —
+  // both land here as files.size === 0. A `workflows/` dir that is tracked
+  // but genuinely has zero yaml defs in it (e.g. holds only a .gitkeep)
+  // takes the success/`installed: 0` path below instead, since it has at
+  // least one file under the prefix.
+  if (files.size === 0) {
+    throw new CliError(`no workflows/ directory found in ${source}@${ref}`);
+  }
+
+  // 4. Validate before writing anything: stage into a throwaway temp dir and
+  //    run the SAME checks `lint`/`check` run on a normal defs dir.
+  const stagingRoot = mkdtempSync(join(tmpdir(), 'owenloop-add-'));
+  const stagingWorkflowsDir = join(stagingRoot, 'workflows');
+  try {
+    for (const [relPath, data] of files) {
+      const full = join(stagingWorkflowsDir, relPath);
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, data);
+    }
+
+    const failures: DefLoadFailure[] = [];
+    const staged = loadDefsRaw(stagingWorkflowsDir, failures);
+    const reasons: string[] = failures.map((f) => `${f.file}: ${f.error}`);
+
+    for (const stagedDef of staged.values()) {
+      const lintResult = lintDef(stagedDef);
+      reasons.push(...lintResult.errors.map((e) => `${stagedDef.name}: ${e}`));
+      const validationErrors = validateDef(stagedDef);
+      reasons.push(...validationErrors.map((e) => `${stagedDef.name}: ${e}`));
+
+      // Mirror the `check` command's exact "definite defect" predicate — but,
+      // deliberately, WITH `assumeProvided: true`. Without it, a def with any
+      // `seedOwed` input (the norm — see e.g. `proposal` in delivery.yaml)
+      // deadlocks in the very first state, because the checker models "no
+      // `provide` has happened yet" by default (see `seedArts` in
+      // src/model.ts). `owenloop check <def>` behaves the same way absent
+      // `--assume-provided`; verified every def under examples/workflows/
+      // fails plain `check` for exactly this reason. Since `add` validates a
+      // def that a real user will `provide` into after install (that's the
+      // whole point of a seedOwed input), refusing every seedOwed def here
+      // would make `add` unable to install almost any real workflow,
+      // including this project's own examples — so this checks "is it
+      // completable once its owed inputs are supplied," the same bar a
+      // careful author would clear with `check --assume-provided` before
+      // publishing.
+      const report = modelCheck(stagedDef, { assumeProvided: true });
+      const hasDefiniteDefect =
+        report.invariantViolations.length > 0 ||
+        (!report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0));
+      if (hasDefiniteDefect) {
+        reasons.push(
+          `${stagedDef.name}: definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
+            `${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`,
+        );
+      }
+    }
+
+    if (reasons.length > 0) {
+      throw new CliError(
+        `refusing to install ${source}@${sha} — ${reasons.length} problem(s) found; nothing written:\n  - ${reasons.join('\n  - ')}`,
+      );
+    }
+
+    // 5. Install (idempotent — clears any prior install at this folder first).
+    const folder = `${owner}-${repo}`;
+    const written = installFiles(defsDir, folder, files);
+
+    // 6. Record provenance.
+    const lf = readLockfile(lockfilePath);
+    const entry: InstalledEntry = { source, ref, sha, installedAt: nowMs(), path: folder, files: written };
+    lf.installed[source] = entry;
+    writeLockfile(lockfilePath, lf);
+
+    // 7. Report.
+    print(io, {
+      ok: true,
+      source,
+      ref,
+      sha,
+      path: folder,
+      installed: written.length,
+      defs: [...staged.values()].map((d) => d.name).sort(),
+    });
+    return 0;
+  } finally {
+    rmSync(stagingRoot, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Async entry point that adds network I/O for `add` on top of the otherwise
+ * fully-synchronous engine/CLI (see the doc comment on `sleepMs` above and
+ * README "sync end to end"). `main`/`dispatch` stay sync and unchanged — this
+ * wraps them, routing only `add` through the async path, so every existing
+ * command and test keeps working exactly as before.
+ */
+export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
+  const args = parseArgs(argv);
+  const command = args.positionals[0];
+  if (command !== 'add') {
+    return main(argv, io);
+  }
+  try {
+    return await dispatchAdd(io, args);
+  } catch (e) {
+    if (e instanceof CliError || e instanceof DefError) {
+      io.err(`error: ${e.message}`);
+    } else {
+      io.err(`error: ${(e as Error).message}`);
+    }
+    return 1;
   }
 }
 
