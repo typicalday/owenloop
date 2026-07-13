@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { parseProduce } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parse as parseYamlText } from 'yaml';
 import { buildDef, DefError, hashDef, hashDefForHub, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, validateDef } from '../src/defs.ts';
 import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
@@ -2298,15 +2299,29 @@ test('hashDefForHub: identical yaml hashes the same regardless of checkout direc
   const dirA = mktempDefsDir();
   const dirB = mktempDefsDir();
   try {
-    writeFileSync(join(dirA, 'portable.yaml'), CONTENT_YAML);
-    writeFileSync(join(dirB, 'portable.yaml'), CONTENT_YAML);
+    const fileA = join(dirA, 'portable.yaml');
+    const fileB = join(dirB, 'portable.yaml');
+    writeFileSync(fileA, CONTENT_YAML);
+    writeFileSync(fileB, CONTENT_YAML);
     const a = loadDefsRaw(dirA).get('portable')!;
     const b = loadDefsRaw(dirB).get('portable')!;
     assert.notEqual(a.dir, b.dir, 'sanity: the two defs really do live at different absolute paths');
     assert.notEqual(hashDef(a), hashDef(b), 'hashDef stays checkout-specific (includes def.dir)');
+
+    // hashDefForHub must match the hub's own canonicalization exactly:
+    // parseDef(YAML.parse(yaml)) with no baseDir — hub-canonical, not a stand-in.
     assert.equal(
       hashDefForHub(CONTENT_YAML),
-      hashDefForHub(CONTENT_YAML),
+      hashDef(parseDef(parseYamlText(CONTENT_YAML))),
+      'hashDefForHub must reproduce parseDef(YAML.parse(yaml)) with no baseDir, exactly as the hub computes it',
+    );
+
+    // And it must be baseDir-independent in practice: loading the same YAML
+    // text from two different checkout directories yields the same hub hash,
+    // even though hashDef of the loaded defs differs (per the assertion above).
+    assert.equal(
+      hashDefForHub(readFileSync(fileA, 'utf8')),
+      hashDefForHub(readFileSync(fileB, 'utf8')),
       'hashDefForHub is a pure function of the yaml text — portable across checkouts',
     );
   } finally {

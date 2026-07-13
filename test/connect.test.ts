@@ -6,6 +6,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { hubBindingPath, readHubBinding, writeHubBinding } from '../src/hub.ts';
 import type { Credential, HubBinding } from '../src/hub.ts';
 import { mainAsync } from '../src/cli.ts';
@@ -87,6 +88,35 @@ test('connect: no stored credential errors, mentions `owenloop login`, writes no
   assert.match(t.err.join('\n'), /owenloop login/);
   assert.equal(calls.length, 0, 'never probes the hub without a credential');
   assert.equal(readHubBinding(hubBindingPath(t.cwd)), null, 'no hub.json written');
+});
+
+test('connect: a legacy hub.json with a leftover `pushed` ledger key still parses and connect rewrites it to the slim {version, hub} shape', async () => {
+  const { fetch } = routedFetch({ 'GET /api/whoami': verifyOk });
+  const t = makeIo({ fetch });
+  t.store.set(ORIGIN, JSON.stringify(OAUTH_CRED));
+  // Simulate a hub.json written by a pre-server-diff CLI: still has the old
+  // client-side push ledger under `pushed`, which the current binding type
+  // no longer has a field for.
+  writeHubBinding(hubBindingPath(t.cwd), {
+    version: 1,
+    hub: ORIGIN,
+    // @ts-expect-error -- simulating a pre-server-diff CLI's binding file
+    pushed: { alpha: { localHash: 'h1', remoteVersion: 3, remoteHash: 'rh1', pushedAt: 10 } },
+  });
+
+  const code = await mainAsync(['connect', '--hub', ORIGIN], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  const result = JSON.parse(t.out.join('\n'));
+  assert.equal(result.ok, true);
+  assert.equal(result.switchedFrom, undefined, 'same origin — not a rebind, just a rewrite');
+
+  const raw = readFileSync(hubBindingPath(t.cwd), 'utf8');
+  assert.deepEqual(
+    JSON.parse(raw),
+    { version: 1, hub: ORIGIN },
+    'connect rewrites the file to the slim shape, dropping the legacy pushed key',
+  );
+  assert.deepEqual(readHubBinding(hubBindingPath(t.cwd)), { version: 1, hub: ORIGIN });
 });
 
 test('connect: a 401 from whoami errors cleanly and writes no hub.json', async () => {
