@@ -361,9 +361,10 @@ the `add` entry in [`docs/cli.md`](docs/cli.md).
 
 Publishing your defs to a hosted hub instead? `owenloop login` authenticates
 the CLI (loopback OAuth, or a pasted token via `--with-token`; the credential
-goes into the macOS Keychain or a `0600` file, never the repo), `owenloop
-connect` binds the project to a hub, and `owenloop push` publishes your defs —
-idempotent client-side, so an unchanged re-push is a no-op. See the
+goes into the macOS Keychain or a `0600` file, never the repo, and is verified
+against the hub before it's ever stored), `owenloop connect` binds the project
+to a hub, and `owenloop push` publishes your defs — idempotent against the
+hub's own def hashes, so an unchanged re-push is a no-op. See the
 [Hub](docs/cli.md#hub-login-connect-push-logout) section in `docs/cli.md`.
 
 ---

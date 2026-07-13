@@ -22,7 +22,7 @@ positional or the next `--flag`, never consumed as this flag's argument. Use
 | `add <owner>/<repo>[@ref]` | fetch, validate, and install a repo's workflow defs from GitHub (public repos only) — see below |
 | `login [--hub <url>] [--with-token]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login-connect-push-logout) |
 | `connect [--hub <url>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
-| `push [<defName>...] [--force] [--dry-run]` | publish local workflow defs to the bound hub (client-side idempotent) |
+| `push [<defName>...] [--force] [--dry-run]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
 | `logout [--hub <url>]` | delete the stored credential for a hub |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
@@ -126,16 +126,20 @@ a `0700` directory. Either way the token is never written into the repo or a
 `.env`. `login`'s JSON reports `storage: "keychain" | "file"` and `kind`, and
 prints **no token value** to stdout/stderr.
 
-There is no `whoami` endpoint yet, so `login` can confirm a credential works
-but can't name the org it belongs to — check the hub console for that.
+Both branches verify the credential against `GET /api/whoami` before storing
+it — a `401` there means the credential is never written to disk. On success
+`login`'s JSON reports the org and identity it authenticated as (`org`,
+`orgId`, `identity`, and `email` when the hub returns one), read straight from
+`whoami`.
 
 ### `connect` — bind a project to a hub
 
 `owenloop connect` writes `.owenloop/hub.json` recording which hub this project
-publishes to, after re-verifying the stored credential (`GET /api/workflows`).
-Run `login` first. Re-connecting to the **same** origin preserves the existing
-push state; switching to a **different** hub resets it (and the JSON reports
-`switchedFrom` + `pushStateReset: true`).
+publishes to, after re-verifying the stored credential against `GET
+/api/whoami`. Run `login` first. The JSON reports the same org/identity fields
+as `login`; re-connecting to the **same** origin reports no `switchedFrom`,
+switching to a **different** hub reports `switchedFrom: <old origin>` and
+rebinds the project to the new one.
 
 ### `push` — publish local defs to the bound hub
 
@@ -147,41 +151,42 @@ any definite defect aborts the whole push. stdout is machine-parseable JSON;
 the human-readable diff (`+ new`, `~ changed`, `= unchanged`, `! failed`) goes
 to stderr.
 
-**Idempotency is client-side, and the hub is push-blind.** The service's
-`create_workflow` is append-only — it mints a new version on every call and
-exposes no def hash in its read APIs. So `push` records what it sent in
-`.owenloop/hub.json` (`localHash` = a **portable** content hash of the def, plus
-the returned `remoteVersion`/`remoteHash`) and skips a def whose local hash is
-unchanged since the last push — that's what makes a re-push a no-op. `--force`
-re-pushes even unchanged defs; `--dry-run` reports the plan and writes nothing
-(no state, no network). A `<defName>` that doesn't resolve is an error; a
-`{ok:false}` from the hub mid-batch records the defs that did land and exits 1.
+**Idempotency is server-side truth, not a client ledger.** `push` fetches the
+hub's own view of every def (`GET /api/workflows`, which reports each def's
+`hash`) and diffs local content against it directly — there is no
+`.owenloop/hub.json` push ledger to go stale, drift, or need migrating. A def
+whose content hash matches the hub's is `unchanged` and is never sent at all.
+`--dry-run` reports the plan (`new`/`changed`/`unchanged`, and `wouldPush`)
+without sending anything. A real push that does go out can still come back
+`noop`: the hub's `create_workflow` is itself idempotent by content hash, so
+if server truth and local truth briefly disagree (e.g. `--force` re-sending
+content that's actually already there), the hub reports `{unchanged: true}`
+and no new version is minted — `push`'s JSON distinguishes `pushed`
+(version-forwarded) from `noop` (server said unchanged) from `unchanged`
+(skipped locally, never sent). `--force` re-sends every selected def
+regardless of the local diff. A `<defName>` that doesn't resolve is an error;
+an `{ok:false}` from the hub mid-batch records the defs that did land and
+exits 1.
 
-The committed `hub.json` **is meant to be portable across checkouts**: cloning
-the repo somewhere else, or a teammate checking it out at a different path,
-must not cause every def to look "changed" and re-push. The local hash is
-therefore computed over the def's content only, with the checkout-specific
-absolute source path stripped out first — not a raw hash of the loaded def
-object. **Migration note:** a `hub.json` written before this was true recorded
-the path-sensitive hash; the first `push` against it upgrades each entry to the
-portable hash silently, in place, with **zero** network calls, as long as the
-checkout's absolute path hasn't changed. Only a genuinely different checkout
-(a fresh clone at a different path, a different machine) sees one forced
-re-push per def — an unavoidable one-time cost, since the hub can't tell "same
-content, different path" from "changed" on its own — after which that
-checkout's ledger is portable too.
+The def hash is computed by re-parsing the raw YAML with no checkout-specific
+`baseDir` — the same canonicalization the hub applies — so it's portable
+across checkouts and machines by construction: a fresh clone at a different
+path diffs identically to the original checkout, with no one-time migration
+or forced re-push. It's stable only within a pinned engine version; a
+version bump that changes how defs canonicalize will read as `changed` on the
+next push, not as an error, since `create_workflow` is idempotent either way.
 
 On a `401`, an OAuth credential is refreshed once and the request retried; an
 agent (`olp_`) token has no refresh path, so a `401` is a hard "re-mint it"
 error.
 
-**Include limitation.** A def whose file uses `include:` is refused
-(`uses include:, not hub-pushable yet`): the hub's `create_workflow` parses the
-raw YAML without include expansion, and a re-serialized expanded def isn't
-round-trippable. Inline such defs before pushing. This, the missing `whoami`,
-the absent def hash in read APIs, exact-match redirect URIs, no device-code
-grant, and no server-side idempotency key are all recorded follow-ups on the
-service, not gaps in the CLI.
+**Include and bodyFile limitations.** A def whose file uses `include:` is
+refused (`uses include:, not hub-pushable`): the hub's `create_workflow`
+parses the raw YAML without include expansion, and a re-serialized expanded
+def isn't round-trippable. A def using `bodyFile:` is refused the same way
+(`uses bodyFile:, not hub-pushable`) — there's no checkout `baseDir` to
+resolve the external file against once the YAML leaves this machine. Inline
+both before pushing.
 
 ## Hand-driven walkthrough
 

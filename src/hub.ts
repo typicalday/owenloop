@@ -5,10 +5,17 @@
  *
  * Same split as `src/add.ts`: the network-free, filesystem-adjacent pieces live
  * here (origin normalization, PKCE, credential + project-binding (de)serialization
- * with strict file-mode enforcement, push-diff computation, API-response shape
+ * with strict file-mode enforcement, server-diff computation, API-response shape
  * guards); the async network + arg glue lives in `src/cli.ts` (`dispatchLogin`
  * etc.) so this module stays trivially testable and `cli.ts` doesn't widen its
  * export surface.
+ *
+ * `.owenloop/hub.json` is a pure binding (which hub this project publishes to)
+ * — there is no client-side push ledger. `push` diffs local defs against the
+ * server's own `hash` (`GET /api/workflows`, see `computeServerDiff`), and
+ * `POST /api/create_workflow` is idempotent, so the server is always the
+ * source of truth for "did this change" — a client-side cache would just be a
+ * second copy of that truth that can go stale.
  *
  * Secret hygiene is a hard rule here: credentials never land in the repo or a
  * plaintext `.env`. The file fallback below is mode 0600 (dir 0700) and lives
@@ -134,36 +141,34 @@ export function writeCredentialFile(path: string, file: CredentialFile): void {
 
 // ---- project → hub binding (.owenloop/hub.json) ------------------------------
 
-export interface PushedEntry {
-  localHash: string;
-  remoteVersion: number;
-  remoteHash: string;
-  pushedAt: number;
-}
-
 /**
- * `.owenloop/hub.json` — written by `connect`, updated by `push`. Safe to
- * commit: contains no secrets, only the bound hub origin and per-def push state
- * (the client-side idempotency ledger).
+ * `.owenloop/hub.json` — written by `connect`. Safe to commit: contains no
+ * secrets, only the bound hub origin. Purely a binding — `push` diffs against
+ * server truth (`GET /api/workflows`), so there is no client-side ledger to
+ * carry here.
  */
 export interface HubBinding {
   version: 1;
   hub: string;
-  pushed: Record<string, PushedEntry>;
 }
 
 export function hubBindingPath(cwd: string): string {
   return join(cwd, '.owenloop', 'hub.json');
 }
 
-/** Read `.owenloop/hub.json`; a missing file is `null` (project not bound yet). */
+/**
+ * Read `.owenloop/hub.json`; a missing file is `null` (project not bound
+ * yet). A file written by a pre-server-diff CLI may still carry a `pushed`
+ * key (the old push ledger) — it parses fine and the key is silently
+ * ignored; the next `connect` rewrite drops it.
+ */
 export function readHubBinding(path: string): HubBinding | null {
   if (!existsSync(path)) return null;
   const parsed = JSON.parse(readFileSync(path, 'utf8')) as HubBinding;
   if (!parsed || typeof parsed.hub !== 'string') {
     throw new Error(`malformed hub binding at ${path}`);
   }
-  return { version: 1, hub: parsed.hub, pushed: parsed.pushed ?? {} };
+  return { version: 1, hub: parsed.hub };
 }
 
 export function writeHubBinding(path: string, binding: HubBinding): void {
@@ -171,69 +176,62 @@ export function writeHubBinding(path: string, binding: HubBinding): void {
   writeFileSync(path, `${JSON.stringify(binding, null, 2)}\n`);
 }
 
-// ---- push diff ---------------------------------------------------------------
+// ---- push candidates + server diff --------------------------------------------
 
-/**
- * A local def selected for a push, with its content hash and raw source yaml.
- * `legacyHash` (optional) is the old checkout-specific `hashDef` value, kept
- * alongside the portable `hash` (`hashDefContent`) so `computePushDiff` can
- * recognize a def pushed under the pre-portability ledger format as unchanged
- * and migrate it in place, instead of forcing one spurious re-push per
- * checkout that happens to have a different absolute path.
- */
+/** A local def selected for a push, with its server-canonical content hash and raw source yaml. */
 export interface DefPushCandidate {
   name: string;
   hash: string;
-  legacyHash?: string;
   yaml: string;
 }
 
-export interface PushDiff<T extends { name: string; hash: string; legacyHash?: string }> {
-  toPush: T[];
+/** One entry from `GET /api/workflows`'s `workflows` array. */
+export interface WorkflowSummary {
+  name: string;
+  hash: string;
+  version?: number;
+}
+
+export interface ServerDiff<T extends { name: string; hash: string }> {
+  toPush: (T & { status: 'new' | 'changed' })[];
   unchanged: T[];
-  /** Subset of `unchanged` matched only via `legacyHash` — the ledger entry for
-   *  these needs its `localHash` rewritten to the portable hash (see
-   *  `dispatchPush`'s migration write), even though no push is needed. */
-  migrated: T[];
 }
 
 /**
  * Partition selected defs into those that need pushing vs. those already
- * up-to-date, purely from local state (`pushed`): a def whose current
- * `hashDef` equals its recorded `localHash` is unchanged (skip); a new or
- * changed hash is pushed. `force` pushes everything regardless.
+ * up-to-date, purely from the server's own `hash` for each name (from
+ * `GET /api/workflows`, via `parseWorkflowList`): a name absent from the
+ * server is `new`; present with a different (or missing) hash is `changed`;
+ * present with an equal hash is `unchanged` (skipped — no request sent).
  *
- * A def whose portable `hash` doesn't match the recorded `localHash` but whose
- * `legacyHash` (the old checkout-specific hash) does is ALSO unchanged — it's
- * the same content, just recorded under the pre-portability ledger format —
- * and is additionally reported in `migrated` so the caller can rewrite the
- * ledger entry to the portable hash without a network round-trip.
+ * `force` pushes every candidate regardless of hash — labeled `new` when the
+ * server has no entry for it, `changed` otherwise (even when the hash is
+ * equal: force means "send it", and the label should still read true).
  *
- * This is the client-side idempotency the service can't give us: its
- * `create_workflow` always mints a new version even for byte-identical yaml, so
- * "re-push with no changes is a no-op" has to be decided here, before any
- * network write.
+ * Server names with no local counterpart are ignored (this is a push, not a
+ * sync — the CLI never deletes or reports on hub-only defs).
  */
-export function computePushDiff<T extends { name: string; hash: string; legacyHash?: string }>(
-  defs: T[],
-  pushed: Record<string, PushedEntry>,
+export function computeServerDiff<T extends { name: string; hash: string }>(
+  candidates: T[],
+  server: Map<string, WorkflowSummary>,
   force: boolean,
-): PushDiff<T> {
-  const toPush: T[] = [];
+): ServerDiff<T> {
+  const toPush: (T & { status: 'new' | 'changed' })[] = [];
   const unchanged: T[] = [];
-  const migrated: T[] = [];
-  for (const d of defs) {
-    const prior = pushed[d.name];
-    if (!force && prior && prior.localHash === d.hash) {
-      unchanged.push(d);
-    } else if (!force && prior && d.legacyHash !== undefined && prior.localHash === d.legacyHash) {
-      unchanged.push(d);
-      migrated.push(d);
+  for (const c of candidates) {
+    const remote = server.get(c.name);
+    const status: 'new' | 'changed' = remote === undefined ? 'new' : 'changed';
+    if (force) {
+      toPush.push({ ...c, status });
+    } else if (remote === undefined) {
+      toPush.push({ ...c, status: 'new' });
+    } else if (remote.hash !== c.hash) {
+      toPush.push({ ...c, status: 'changed' });
     } else {
-      toPush.push(d);
+      unchanged.push(c);
     }
   }
-  return { toPush, unchanged, migrated };
+  return { toPush, unchanged };
 }
 
 // ---- API response shape guards ----------------------------------------------
@@ -244,6 +242,9 @@ export interface CreateWorkflowOk {
   name: string;
   version: number;
   hash: string;
+  /** `true` when the posted content's hash equals the latest stored version
+   *  (server-side idempotent no-op) — no new version was minted. */
+  unchanged?: boolean;
 }
 
 /**
@@ -263,10 +264,77 @@ export function createWorkflowError(body: unknown): string | null {
 /** Narrow a create_workflow success body to its typed shape (after `createWorkflowError` returns null). */
 export function asCreateWorkflowOk(body: unknown): CreateWorkflowOk {
   const b = body as Record<string, unknown>;
-  return {
+  const out: CreateWorkflowOk = {
     ok: true,
     name: typeof b.name === 'string' ? b.name : '',
     version: typeof b.version === 'number' ? b.version : 0,
     hash: typeof b.hash === 'string' ? b.hash : '',
   };
+  if (b.unchanged === true) out.unchanged = true;
+  return out;
+}
+
+/**
+ * Identity returned by `GET /api/whoami` (bearer auth, no RBAC verb — a 200
+ * proves the credential authenticates, not that it carries any particular
+ * scope; `tokenStatus` is always `'active'` over the wire because a
+ * revoked/unknown/disabled credential 401s in auth middleware before the
+ * handler runs, so it is deliberately not carried here — branch on the HTTP
+ * status, never on a `tokenStatus` field).
+ */
+export interface WhoamiIdentity {
+  orgId: string;
+  orgName: string;
+  actor: { id: string; kind: string; role: string };
+  authMethod: string;
+  email?: string;
+}
+
+/** Narrow a `GET /api/whoami` 200 body to its typed shape. Throws on a malformed body. */
+export function asWhoami(body: unknown): WhoamiIdentity {
+  if (typeof body !== 'object' || body === null) throw new Error('whoami: unexpected response shape (not an object)');
+  const b = body as Record<string, unknown>;
+  if (typeof b.orgId !== 'string') throw new Error('whoami: response missing string orgId');
+  const rawActor = (typeof b.actor === 'object' && b.actor !== null ? b.actor : {}) as Record<string, unknown>;
+  const identity: WhoamiIdentity = {
+    orgId: b.orgId,
+    orgName: typeof b.orgName === 'string' ? b.orgName : '',
+    actor: {
+      id: typeof rawActor.id === 'string' ? rawActor.id : '',
+      kind: typeof rawActor.kind === 'string' ? rawActor.kind : '',
+      role: typeof rawActor.role === 'string' ? rawActor.role : '',
+    },
+    authMethod: typeof b.authMethod === 'string' ? b.authMethod : '',
+  };
+  if (typeof b.email === 'string') identity.email = b.email;
+  return identity;
+}
+
+/**
+ * Parse `GET /api/workflows`'s body into a `name -> WorkflowSummary` map for
+ * `computeServerDiff`. Throws a descriptive error (the caller wraps it in a
+ * `CliError`) on a missing/malformed `workflows` array.
+ */
+export function parseWorkflowList(body: unknown): Map<string, WorkflowSummary> {
+  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).workflows)) {
+    throw new Error('malformed response from the hub: expected a `workflows` array');
+  }
+  const list = (body as Record<string, unknown>).workflows as unknown[];
+  const out = new Map<string, WorkflowSummary>();
+  list.forEach((entry, i) => {
+    if (typeof entry !== 'object' || entry === null) {
+      throw new Error(`malformed response from the hub: workflows[${i}] is not an object`);
+    }
+    const e = entry as Record<string, unknown>;
+    if (typeof e.name !== 'string') {
+      throw new Error(`malformed response from the hub: workflows[${i}] missing string name`);
+    }
+    const summary: WorkflowSummary = {
+      name: e.name,
+      hash: typeof e.hash === 'string' ? e.hash : '',
+    };
+    if (typeof e.version === 'number') summary.version = e.version;
+    out.set(e.name, summary);
+  });
+  return out;
 }
