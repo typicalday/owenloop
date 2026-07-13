@@ -182,6 +182,23 @@ test('computeServerDiff: a name absent from the server-vs-local diff on the serv
   assert.equal(unchanged.length, 0);
 });
 
+test('computeServerDiff: a server entry with no/undefined hash is treated as present-but-changed, not new', () => {
+  // The type says `hash: string`, but a server response can omit it in
+  // practice (e.g. a workflow row created before hashing existed). It's
+  // present in the map (server.get returns a summary, not undefined), so it
+  // must not be classified 'new' — it's 'changed', same as any other hash
+  // mismatch, and will be re-pushed to backfill the hash.
+  const server = new Map<string, WorkflowSummary>([
+    ['nohash', { name: 'nohash' } as WorkflowSummary],
+  ]);
+  const { toPush, unchanged } = computeServerDiff([{ name: 'nohash', hash: 'X' }], server, false);
+  assert.equal(unchanged.length, 0);
+  assert.deepEqual(
+    toPush.map((d) => ({ name: d.name, status: d.status })),
+    [{ name: 'nohash', status: 'changed' }],
+  );
+});
+
 // ---- create_workflow response guard ------------------------------------------
 
 test('createWorkflowError: ok:true is null, ok:false surfaces the error verbatim', () => {
