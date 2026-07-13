@@ -14,6 +14,10 @@ remembered between invocations — pass both on every command.
 |---|---|
 | `defs` | list available workflow definitions |
 | `add <owner>/<repo>[@ref]` | fetch, validate, and install a repo's workflow defs from GitHub (public repos only) — see below |
+| `login [--hub <url>] [--with-token]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login-connect-push-logout) |
+| `connect [--hub <url>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
+| `push [<defName>...] [--force] [--dry-run]` | publish local workflow defs to the bound hub (client-side idempotent) |
+| `logout [--hub <url>]` | delete the stored credential for a hub |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
 | `tick <wf> [--now <ms>] [--shallow]` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only) |
@@ -79,6 +83,88 @@ follow-up, not yet implemented.
 
 Public repos only — no auth/token support yet; a private repo (or a bad
 ref) surfaces as a 404 from the sha-resolve step.
+
+## Hub (`login` / `connect` / `push` / `logout`)
+
+These four commands publish local workflow defs to a hosted **hub** (default
+`https://api.owenloop.com`; override per-command with `--hub <url>` or the
+`OWENLOOP_HUB` env var). They are the only network-bound commands besides
+`add`, and they talk only to endpoints the hub exposes today — no new
+service-side surface. The hub URL is normalized to its origin
+(`scheme://host[:port]`); path/query are dropped.
+
+### `login` — authenticate the CLI against a hub
+
+Two ways to get a credential, both of which **verify before storing** (a token
+that can't call the hub is never written to disk):
+
+- **Loopback OAuth (default).** `owenloop login` binds a single-use catcher on
+  `127.0.0.1:<random-port>`, dynamically registers a public client
+  (`token_endpoint_auth_method: none`), opens your browser to the hub's
+  authorize endpoint with an auth-code + PKCE (S256) challenge, and exchanges
+  the returned code for an access/refresh token. State is checked on the
+  callback (CSRF guard) and the flow times out after 5 minutes. The exact
+  loopback `redirect_uri` is sent in the registration because the hub matches
+  redirect URIs by exact string (no RFC 8252 variable-port allowance).
+- **Paste a token.** `… | owenloop login --with-token` reads a single token
+  from stdin (never argv, so it stays out of your shell history and the process
+  table). An `olp_`-prefixed **agent** token or an `mcpat_`-prefixed **access**
+  token is accepted; anything else is rejected before any network call.
+
+**Where the credential lands.** On macOS it goes into the login **Keychain**
+(`security`, service `owenloop-hub`, one item per hub origin) with the secret
+fed over stdin, never on the command line. Elsewhere — or with
+`OWENLOOP_NO_KEYCHAIN=1` — it falls back to a `0600` file at
+`$XDG_CONFIG_HOME/owenloop/credentials.json` (or `~/.config/owenloop/…`) inside
+a `0700` directory. Either way the token is never written into the repo or a
+`.env`. `login`'s JSON reports `storage: "keychain" | "file"` and `kind`, and
+prints **no token value** to stdout/stderr.
+
+There is no `whoami` endpoint yet, so `login` can confirm a credential works
+but can't name the org it belongs to — check the hub console for that.
+
+### `connect` — bind a project to a hub
+
+`owenloop connect` writes `.owenloop/hub.json` recording which hub this project
+publishes to, after re-verifying the stored credential (`GET /api/workflows`).
+Run `login` first. Re-connecting to the **same** origin preserves the existing
+push state; switching to a **different** hub resets it (and the JSON reports
+`switchedFrom` + `pushStateReset: true`).
+
+### `push` — publish local defs to the bound hub
+
+`owenloop push [<defName>...]` publishes the project's workflow defs (all of
+them, or just the named ones) to the hub the project is `connect`ed to. It
+reuses the **exact** all-or-nothing validation gate `add` uses — lint, validate,
+and a bounded `check` — across every selected def before a single byte is sent;
+any definite defect aborts the whole push. stdout is machine-parseable JSON;
+the human-readable diff (`+ new`, `~ changed`, `= unchanged`, `! failed`) goes
+to stderr.
+
+**Idempotency is client-side, and the hub is push-blind.** The service's
+`create_workflow` is append-only — it mints a new version on every call and
+exposes no def hash in its read APIs. So `push` records what it sent in
+`.owenloop/hub.json` (`localHash` = `sha256(JSON.stringify(def))[:16]`, plus the
+returned `remoteVersion`/`remoteHash`) and skips a def whose local hash is
+unchanged since the last push — that's what makes a re-push a no-op. Because the
+hub can't be consulted for drift, this state is **local to the machine**: a
+fresh clone (or a second developer) has no push state and will re-push
+everything once. `--force` re-pushes even unchanged defs; `--dry-run` reports
+the plan and writes nothing (no state, no network). A `<defName>` that doesn't
+resolve is an error; a `{ok:false}` from the hub mid-batch records the defs that
+did land and exits 1.
+
+On a `401`, an OAuth credential is refreshed once and the request retried; an
+agent (`olp_`) token has no refresh path, so a `401` is a hard "re-mint it"
+error.
+
+**Include limitation.** A def whose file uses `include:` is refused
+(`uses include:, not hub-pushable yet`): the hub's `create_workflow` parses the
+raw YAML without include expansion, and a re-serialized expanded def isn't
+round-trippable. Inline such defs before pushing. This, the missing `whoami`,
+the absent def hash in read APIs, exact-match redirect URIs, no device-code
+grant, and no server-side idempotency key are all recorded follow-ups on the
+service, not gaps in the CLI.
 
 ## Hand-driven walkthrough
 

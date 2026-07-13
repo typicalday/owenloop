@@ -32,14 +32,19 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { parse as parseYaml } from 'yaml';
 import { Engine } from './engine.ts';
 import { buildGraph, buildTrace, graphToDot, graphToMermaid, modelCheck } from './model.ts';
 import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
-import { DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
+import { buildDef, DefError, hashDef, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 import { detId, nowMs, parseDurationMs } from './util.ts';
@@ -53,14 +58,47 @@ import {
   writeLockfile,
 } from './add.ts';
 import type { InstalledEntry } from './add.ts';
+import {
+  asCreateWorkflowOk,
+  computePushDiff,
+  createWorkflowError,
+  credentialFilePath,
+  hubBindingPath,
+  normalizeOrigin,
+  pkcePair,
+  randomState,
+  readCredentialFile,
+  readHubBinding,
+  resolveEndpoint,
+  writeCredentialFile,
+  writeHubBinding,
+} from './hub.ts';
+import type { Credential, DefPushCandidate, HubBinding } from './hub.ts';
+
+/** An OS keychain backend, keyed by hub origin (the `account`). */
+export interface Keychain {
+  get(account: string): string | null;
+  set(account: string, value: string): void;
+  delete(account: string): void;
+}
 
 export interface CliIO {
   cwd: string;
   env: Record<string, string | undefined>;
   out: (line: string) => void;
   err: (line: string) => void;
-  /** Injectable for hermetic tests — `add` is the only command that fetches. */
+  /** Injectable for hermetic tests — the network-touching verbs (`add`, hub commands) use this. */
   fetch?: typeof globalThis.fetch;
+  /** Open a URL in the user's browser (login). Default: fire-and-forget `open`/`xdg-open`/`start`. */
+  openUrl?: (url: string) => void;
+  /**
+   * OS keychain backend for credential storage. Default: a `security`-backed
+   * implementation on macOS, `undefined` elsewhere (so the 0600 file fallback
+   * engages). Set `OWENLOOP_NO_KEYCHAIN=1` to force the file fallback.
+   */
+  keychain?: Keychain;
+  /** Read a secret from stdin (`login --with-token`). Default: drain `process.stdin`. */
+  readStdin?: () => Promise<string>;
 }
 
 function defaultIO(): CliIO {
@@ -70,6 +108,68 @@ function defaultIO(): CliIO {
     out: (s) => process.stdout.write(`${s}\n`),
     err: (s) => process.stderr.write(`${s}\n`),
     fetch: globalThis.fetch,
+    openUrl: defaultOpenUrl,
+    readStdin: defaultReadStdin,
+  };
+}
+
+/** Fire-and-forget browser open — never blocks the login flow on the child. */
+function defaultOpenUrl(url: string): void {
+  const platform = process.platform;
+  const cmd = platform === 'darwin' ? 'open' : platform === 'win32' ? 'start' : 'xdg-open';
+  try {
+    spawn(cmd, [url], { stdio: 'ignore', detached: true }).unref();
+  } catch {
+    // Non-fatal: the URL is also printed to stderr for the user to open manually.
+  }
+}
+
+async function defaultReadStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
+ * The default macOS keychain backend (generic passwords under service
+ * `owenloop-hub`). The secret is fed through the `security -i` command stream on
+ * stdin, never as a `-w` argv value, so it never appears in `ps`/shell history.
+ * Returns `undefined` off macOS or when `OWENLOOP_NO_KEYCHAIN=1`, so callers
+ * fall back to the 0600 credential file.
+ */
+const KEYCHAIN_SERVICE = 'owenloop-hub';
+
+function defaultKeychain(env: Record<string, string | undefined>): Keychain | undefined {
+  if (env.OWENLOOP_NO_KEYCHAIN === '1') return undefined;
+  if (process.platform !== 'darwin') return undefined;
+  return {
+    get(account: string): string | null {
+      try {
+        const out = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w'], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        return out.replace(/\n$/, '');
+      } catch {
+        return null; // not found (errSecItemNotFound) — treated as "no credential"
+      }
+    },
+    set(account: string, value: string): void {
+      // `security -i` reads newline-terminated commands from stdin; the secret
+      // rides in that stdin stream (single-quoted), never on this process's argv.
+      const sq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+      const cmd = `add-generic-password -U -s ${sq(KEYCHAIN_SERVICE)} -a ${sq(account)} -w ${sq(value)}\n`;
+      execFileSync('security', ['-i'], { input: cmd, stdio: ['pipe', 'ignore', 'ignore'] });
+    },
+    delete(account: string): void {
+      try {
+        execFileSync('security', ['delete-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account], {
+          stdio: 'ignore',
+        });
+      } catch {
+        // Not found — already absent; a no-op delete is success.
+      }
+    },
   };
 }
 
@@ -214,6 +314,10 @@ Usage: owenloop <command> [args] [--db <path>] [--defs <dir>]
 Commands:
   defs                                   list available workflow definitions
   add <owner>/<repo>[@ref]               fetch, validate, and install a repo's workflow defs (public repos)
+  login [--hub <url>] [--with-token]     authenticate the CLI against a hub (loopback OAuth, or --with-token from stdin)
+  logout [--hub <url>]                   delete the stored credential for a hub
+  connect [--hub <url>]                  bind this project to a hub and verify the stored credential
+  push [<defName>...] [--force] [--dry-run]   publish local workflow defs to the bound hub (idempotent)
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided]
                                          bounded reachability check (deadlocks, stuck, dead steps, declared invariants)
@@ -979,21 +1083,685 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   }
 }
 
+// ---- hub onboarding: login / logout / connect / push -------------------------
+
 /**
- * Async entry point that adds network I/O for `add` on top of the otherwise
- * fully-synchronous engine/CLI (see the doc comment on `sleepMs` above and
- * README "sync end to end"). `main`/`dispatch` stay sync and unchanged — this
- * wraps them, routing only `add` through the async path, so every existing
- * command and test keeps working exactly as before.
+ * Resolve the target hub origin: `--hub` > `OWENLOOP_HUB` env > the default
+ * production hub. Normalized (scheme required, trailing slash/path stripped) so
+ * it can serve as a stable credential-store key and project binding value.
  */
+const DEFAULT_HUB = 'https://api.owenloop.com';
+
+function resolveHub(io: CliIO, args: Args): string {
+  const raw = last(args, 'hub') ?? io.env.OWENLOOP_HUB ?? DEFAULT_HUB;
+  try {
+    return normalizeOrigin(raw);
+  } catch (e) {
+    throw new CliError((e as Error).message);
+  }
+}
+
+function resolveKeychain(io: CliIO): Keychain | undefined {
+  if (io.env.OWENLOOP_NO_KEYCHAIN === '1') return undefined;
+  return io.keychain ?? defaultKeychain(io.env);
+}
+
+/** Read a stored credential for `origin`, trying the keychain first, then the 0600 file. */
+function readCredential(io: CliIO, origin: string): Credential | null {
+  const kc = resolveKeychain(io);
+  if (kc) {
+    const raw = kc.get(origin);
+    if (raw) {
+      try {
+        return JSON.parse(raw) as Credential;
+      } catch {
+        // Corrupt keychain entry — fall through to the file store.
+      }
+    }
+  }
+  const file = readCredentialFile(credentialFilePath(io.env));
+  return file.hubs[origin] ?? null;
+}
+
+/** Store a credential for `origin`; returns which backend was used. */
+function storeCredential(io: CliIO, origin: string, cred: Credential): 'keychain' | 'file' {
+  const kc = resolveKeychain(io);
+  if (kc) {
+    try {
+      kc.set(origin, JSON.stringify(cred));
+      return 'keychain';
+    } catch {
+      // Keychain write failed (locked, unavailable) — fall back to the file store.
+    }
+  }
+  const path = credentialFilePath(io.env);
+  const file = readCredentialFile(path);
+  file.hubs[origin] = cred;
+  writeCredentialFile(path, file);
+  return 'file';
+}
+
+/** Delete any stored credential for `origin` from both backends. Returns whether anything was removed. */
+function deleteCredential(io: CliIO, origin: string): boolean {
+  let removed = false;
+  const kc = resolveKeychain(io);
+  if (kc && kc.get(origin) !== null) {
+    kc.delete(origin);
+    removed = true;
+  }
+  const path = credentialFilePath(io.env);
+  const file = readCredentialFile(path);
+  if (file.hubs[origin] !== undefined) {
+    delete file.hubs[origin];
+    writeCredentialFile(path, file);
+    removed = true;
+  }
+  return removed;
+}
+
+/** The Bearer value for an authenticated request. Never logged. */
+function authHeader(cred: Credential): string {
+  return `Bearer ${cred.accessToken}`;
+}
+
+/**
+ * Ensure an `oauth` credential's access token is fresh: if it expires within
+ * 60s, refresh once (grant_type=refresh_token) and persist the new token. No-op
+ * for `agent`/`oauth-pasted` credentials (they don't refresh). Returns the
+ * possibly-updated credential.
+ */
+async function ensureFreshOAuth(io: CliIO, origin: string, cred: Credential): Promise<Credential> {
+  if (cred.kind !== 'oauth') return cred;
+  if (cred.expiresAt - nowMs() > 60_000) return cred;
+  return refreshOAuth(io, origin, cred);
+}
+
+async function refreshOAuth(
+  io: CliIO,
+  origin: string,
+  cred: Extract<Credential, { kind: 'oauth' }>,
+): Promise<Credential> {
+  const fetchFn = io.fetch ?? globalThis.fetch;
+  const tokenEndpoint = await discoverTokenEndpoint(io, origin);
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: cred.refreshToken,
+    client_id: cred.clientId,
+  });
+  const res = await fetchFn(tokenEndpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  if (!res.ok) {
+    throw new CliError('credential expired and refresh failed — run `owenloop login`');
+  }
+  const json = (await res.json()) as { access_token?: string; expires_in?: number; refresh_token?: string };
+  if (typeof json.access_token !== 'string') {
+    throw new CliError('credential expired and refresh returned no access token — run `owenloop login`');
+  }
+  const expiresIn = typeof json.expires_in === 'number' ? json.expires_in : 3600;
+  const refreshed: Credential = {
+    kind: 'oauth',
+    accessToken: json.access_token,
+    refreshToken: typeof json.refresh_token === 'string' ? json.refresh_token : cred.refreshToken,
+    expiresAt: nowMs() + expiresIn * 1000,
+    clientId: cred.clientId,
+  };
+  storeCredential(io, origin, refreshed);
+  return refreshed;
+}
+
+interface AsMetadata {
+  authorization_endpoint?: string;
+  token_endpoint?: string;
+  registration_endpoint?: string;
+}
+
+async function discoverMetadata(io: CliIO, origin: string): Promise<AsMetadata> {
+  const fetchFn = io.fetch ?? globalThis.fetch;
+  const res = await fetchFn(resolveEndpoint(origin, '/.well-known/oauth-authorization-server'), {
+    headers: { Accept: 'application/json' },
+  });
+  if (!res.ok) {
+    throw new CliError(`could not read OAuth metadata from ${origin} (HTTP ${res.status})`);
+  }
+  return (await res.json()) as AsMetadata;
+}
+
+async function discoverTokenEndpoint(io: CliIO, origin: string): Promise<string> {
+  const meta = await discoverMetadata(io, origin);
+  if (!meta.token_endpoint) throw new CliError(`hub ${origin} advertises no token_endpoint`);
+  return resolveEndpoint(origin, meta.token_endpoint);
+}
+
+/**
+ * Verify a credential works against the hub's `GET /api/workflows` (any 2xx =
+ * good; also proves the token's `list` scope). Refreshes an expiring oauth
+ * token first, and retries exactly once after a 401→refresh for oauth; a 401 on
+ * an agent token is a hard "revoked/invalid" error. Returns the credential
+ * actually used (possibly refreshed), so the caller can persist it.
+ */
+async function verifyCredential(io: CliIO, origin: string, cred: Credential): Promise<Credential> {
+  const fetchFn = io.fetch ?? globalThis.fetch;
+  let current = await ensureFreshOAuth(io, origin, cred);
+  let res = await fetchFn(resolveEndpoint(origin, '/api/workflows'), {
+    headers: { Authorization: authHeader(current), Accept: 'application/json' },
+  });
+  if (res.status === 401 && current.kind === 'oauth') {
+    current = await refreshOAuth(io, origin, current as Extract<Credential, { kind: 'oauth' }>);
+    res = await fetchFn(resolveEndpoint(origin, '/api/workflows'), {
+      headers: { Authorization: authHeader(current), Accept: 'application/json' },
+    });
+  }
+  if (res.status === 401) {
+    if (current.kind === 'agent') {
+      throw new CliError('token revoked or invalid — re-mint it in the console or run `owenloop login`');
+    }
+    throw new CliError('credential rejected by the hub — run `owenloop login`');
+  }
+  if (!res.ok) {
+    throw new CliError(`hub ${origin} rejected the credential (HTTP ${res.status})`);
+  }
+  return current;
+}
+
+/**
+ * `owenloop login` — authenticate the CLI against a hub. Primary flow is a
+ * loopback OAuth auth-code + PKCE(S256) exchange; `--with-token` reads an
+ * `olp_`/`mcpat_` token from stdin instead (never argv). Either way the
+ * credential is verified before it is stored, and stored in the OS keychain or
+ * a 0600 file — never plaintext in the repo or `.env`.
+ */
+async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
+  const origin = resolveHub(io, args);
+  const existed = readCredential(io, origin) !== null;
+
+  if (flag(args, 'with-token')) {
+    const readStdin = io.readStdin ?? defaultReadStdin;
+    const token = (await readStdin()).trim();
+    if (token === '') throw new CliError('no token on stdin (pipe the token in, e.g. `pbpaste | owenloop login --with-token`)');
+    let cred: Credential;
+    if (token.startsWith('olp_')) cred = { kind: 'agent', accessToken: token };
+    else if (token.startsWith('mcpat_')) cred = { kind: 'oauth-pasted', accessToken: token };
+    else throw new CliError('unrecognized token — expected an `olp_` agent token or an `mcpat_` access token');
+    await verifyCredential(io, origin, cred); // never store an unverified token
+    const storage = storeCredential(io, origin, cred);
+    print(io, {
+      ok: true,
+      hub: origin,
+      kind: cred.kind,
+      storage,
+      replaced: existed,
+      note: 'authenticated; org details are visible in the hub console (no whoami endpoint yet)',
+    });
+    return 0;
+  }
+
+  // Loopback OAuth: bind the port FIRST (the service matches redirect URIs by
+  // exact string — no RFC 8252 variable-port allowance — so the DCR must carry
+  // the concrete 127.0.0.1:<port> callback).
+  const { verifier, challenge } = pkcePair();
+  const state = randomState();
+  const { server, port, waitForCallback, close } = await startLoopbackServer(state);
+  try {
+    const redirectUri = `http://127.0.0.1:${port}/callback`;
+    const meta = await discoverMetadata(io, origin);
+    if (!meta.authorization_endpoint || !meta.token_endpoint || !meta.registration_endpoint) {
+      throw new CliError(`hub ${origin} does not advertise the OAuth endpoints login needs`);
+    }
+    const clientId = await registerClient(io, origin, meta.registration_endpoint, redirectUri);
+
+    const authUrl = new URL(resolveEndpoint(origin, meta.authorization_endpoint));
+    authUrl.searchParams.set('response_type', 'code');
+    authUrl.searchParams.set('client_id', clientId);
+    authUrl.searchParams.set('redirect_uri', redirectUri);
+    authUrl.searchParams.set('code_challenge', challenge);
+    authUrl.searchParams.set('code_challenge_method', 'S256');
+    authUrl.searchParams.set('state', state);
+
+    io.err(`Opening your browser to sign in. If it does not open, visit:\n  ${authUrl.toString()}`);
+    (io.openUrl ?? defaultOpenUrl)(authUrl.toString());
+
+    const { code } = await waitForCallback;
+
+    const cred = await exchangeCode(io, origin, meta.token_endpoint, {
+      code,
+      clientId,
+      redirectUri,
+      verifier,
+    });
+    const storage = storeCredential(io, origin, cred);
+    print(io, {
+      ok: true,
+      hub: origin,
+      kind: cred.kind,
+      storage,
+      replaced: existed,
+      note: 'authenticated; org details are visible in the hub console (no whoami endpoint yet)',
+    });
+    return 0;
+  } finally {
+    void server;
+    close();
+  }
+}
+
+interface LoopbackServer {
+  server: ReturnType<typeof createServer>;
+  port: number;
+  waitForCallback: Promise<{ code: string }>;
+  close: () => void;
+}
+
+const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** Bind a single-use loopback catcher on 127.0.0.1:0 that resolves on the OAuth callback. */
+async function startLoopbackServer(expectedState: string): Promise<LoopbackServer> {
+  const loginHtml = (msg: string): string =>
+    `<!doctype html><meta charset="utf-8"><title>owenloop</title><body style="font-family:system-ui;padding:2rem"><p>${msg}</p></body>`;
+
+  let resolveCb!: (v: { code: string }) => void;
+  let rejectCb!: (e: Error) => void;
+  const waitForCallback = new Promise<{ code: string }>((res, rej) => {
+    resolveCb = res;
+    rejectCb = rej;
+  });
+
+  const server = createServer((req, res) => {
+    const u = new URL(req.url ?? '/', 'http://127.0.0.1');
+    if (u.pathname !== '/callback') {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    const error = u.searchParams.get('error');
+    const code = u.searchParams.get('code');
+    const gotState = u.searchParams.get('state');
+    if (error) {
+      res.writeHead(400, { 'Content-Type': 'text/html' });
+      res.end(loginHtml('Login failed. You can close this tab.'));
+      rejectCb(new CliError(`login denied by the hub: ${error}`));
+      return;
+    }
+    if (gotState !== expectedState) {
+      res.writeHead(400, { 'Content-Type': 'text/html' });
+      res.end(loginHtml('State mismatch. You can close this tab.'));
+      rejectCb(new CliError('state mismatch on the OAuth callback — possible CSRF; aborting login'));
+      return;
+    }
+    if (!code) {
+      res.writeHead(400, { 'Content-Type': 'text/html' });
+      res.end(loginHtml('Missing authorization code. You can close this tab.'));
+      rejectCb(new CliError('OAuth callback carried no authorization code'));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(loginHtml('Login complete — return to your terminal.'));
+    resolveCb({ code });
+  });
+
+  const timer = setTimeout(() => {
+    rejectCb(new CliError('login timed out after 5 minutes waiting for the browser callback'));
+  }, LOGIN_TIMEOUT_MS);
+  timer.unref?.();
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as AddressInfo).port;
+
+  return {
+    server,
+    port,
+    waitForCallback,
+    close: () => {
+      clearTimeout(timer);
+      server.close();
+    },
+  };
+}
+
+/** DCR a public client (no client secret) with the exact loopback redirect URI. */
+async function registerClient(io: CliIO, origin: string, registrationEndpoint: string, redirectUri: string): Promise<string> {
+  const fetchFn = io.fetch ?? globalThis.fetch;
+  const res = await fetchFn(resolveEndpoint(origin, registrationEndpoint), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_name: 'owenloop CLI',
+      redirect_uris: [redirectUri],
+      token_endpoint_auth_method: 'none',
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+    }),
+  });
+  if (!res.ok) {
+    throw new CliError(`dynamic client registration failed at ${origin} (HTTP ${res.status})`);
+  }
+  const json = (await res.json()) as { client_id?: string };
+  if (typeof json.client_id !== 'string') {
+    throw new CliError('dynamic client registration returned no client_id');
+  }
+  return json.client_id;
+}
+
+/** Exchange an auth code for tokens (form-encoded, with the PKCE verifier). */
+async function exchangeCode(
+  io: CliIO,
+  origin: string,
+  tokenEndpoint: string,
+  p: { code: string; clientId: string; redirectUri: string; verifier: string },
+): Promise<Credential> {
+  const fetchFn = io.fetch ?? globalThis.fetch;
+  const body = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code: p.code,
+    client_id: p.clientId,
+    redirect_uri: p.redirectUri,
+    code_verifier: p.verifier,
+  });
+  const res = await fetchFn(resolveEndpoint(origin, tokenEndpoint), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+  if (!res.ok) {
+    throw new CliError(`token exchange failed at ${origin} (HTTP ${res.status})`);
+  }
+  const json = (await res.json()) as {
+    access_token?: string;
+    refresh_token?: string;
+    expires_in?: number;
+  };
+  if (typeof json.access_token !== 'string' || typeof json.refresh_token !== 'string') {
+    throw new CliError('token exchange returned an incomplete token set');
+  }
+  const expiresIn = typeof json.expires_in === 'number' ? json.expires_in : 3600;
+  return {
+    kind: 'oauth',
+    accessToken: json.access_token,
+    refreshToken: json.refresh_token,
+    expiresAt: nowMs() + expiresIn * 1000,
+    clientId: p.clientId,
+  };
+}
+
+/**
+ * `owenloop logout` — delete the stored credential for a hub from both the
+ * keychain and the file store. Cheap; completes the credential lifecycle.
+ */
+async function dispatchLogout(io: CliIO, args: Args): Promise<number> {
+  const origin = resolveHub(io, args);
+  const removed = deleteCredential(io, origin);
+  print(io, { ok: true, hub: origin, removed });
+  return 0;
+}
+
+/**
+ * `owenloop connect` — bind the current project to a hub (writes
+ * `.owenloop/hub.json`) and verify the stored credential works. Requires a
+ * prior `owenloop login` for the resolved origin. Preserves existing push
+ * state when re-binding the same origin; resets it when switching hubs.
+ */
+async function dispatchConnect(io: CliIO, args: Args): Promise<number> {
+  const origin = resolveHub(io, args);
+  const cred = readCredential(io, origin);
+  if (!cred) throw new CliError(`no stored credential for ${origin} — run \`owenloop login\` first`);
+
+  await verifyCredential(io, origin, cred);
+
+  const path = hubBindingPath(io.cwd);
+  const existing = readHubBinding(path);
+  const pushed = existing && existing.hub === origin ? existing.pushed : {};
+  const switched = existing !== null && existing.hub !== origin;
+  const binding: HubBinding = { version: 1, hub: origin, pushed };
+  writeHubBinding(path, binding);
+
+  print(io, {
+    ok: true,
+    hub: origin,
+    ...(switched ? { switchedFrom: existing!.hub, pushStateReset: true } : {}),
+    note: 'connected; org details are visible in the hub console (no whoami endpoint yet)',
+  });
+  return 0;
+}
+
+/**
+ * `owenloop push [<defName>...] [--force] [--dry-run]` — publish local workflow
+ * defs to the bound hub, idempotent by client-side push state (the service is
+ * append-only, so unchanged defs are skipped here, never re-versioned). Mirrors
+ * `add`'s all-or-nothing client-side validation gate before any network write;
+ * server-side failures mid-batch record what landed and exit 1.
+ */
+async function dispatchPush(io: CliIO, args: Args): Promise<number> {
+  const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
+  const dryRun = flag(args, 'dry-run');
+  const force = flag(args, 'force');
+
+  // Require a project binding.
+  const bindingPath = hubBindingPath(io.cwd);
+  const binding = readHubBinding(bindingPath);
+  if (!binding) throw new CliError('this project is not bound to a hub — run `owenloop connect` first');
+  const origin = binding.hub;
+  // A --hub that disagrees with the binding is a mistake, not a silent override.
+  const hubArg = last(args, 'hub');
+  if (hubArg !== undefined) {
+    const requested = normalizeOrigin(hubArg);
+    if (requested !== origin) {
+      throw new CliError(`this project is bound to ${origin}, not ${requested} — re-run \`owenloop connect\` to rebind`);
+    }
+  }
+
+  let cred = readCredential(io, origin);
+  if (!cred) throw new CliError(`no stored credential for ${origin} — run \`owenloop login\``);
+
+  // Load defs (same machinery as lint/add).
+  if (!existsSync(defsDir)) throw new CliError(`defs directory not found: ${defsDir}`);
+  const failures: DefLoadFailure[] = [];
+  const allDefs = loadDefsRaw(defsDir, failures);
+
+  // Narrow to positional names, if any (error on an unknown name).
+  const requested = args.positionals.slice(1);
+  let selected: WorkflowDef[];
+  if (requested.length > 0) {
+    selected = [];
+    for (const name of requested) {
+      const def = allDefs.get(name);
+      if (!def) {
+        throw new CliError(`unknown workflow definition '${name}' (looked in ${defsDir})${failureNote(failures)}`);
+      }
+      selected.push(def);
+    }
+  } else {
+    selected = [...allDefs.values()];
+  }
+  if (selected.length === 0) {
+    throw new CliError(`nothing to push — no workflow definitions found in ${defsDir}`);
+  }
+
+  // Client-side validation gate — all-or-nothing, mirroring dispatchAdd exactly.
+  // Any failure aborts the entire push; nothing is sent.
+  const reasons: string[] = failures.map((f) => `${f.file}: ${f.error}`);
+  for (const def of selected) {
+    const lintResult = lintDef(def);
+    reasons.push(...lintResult.errors.map((e) => `${def.name}: ${e}`));
+    reasons.push(...validateDef(def).map((e) => `${def.name}: ${e}`));
+    const report = modelCheck(def, { assumeProvided: true });
+    const hasDefiniteDefect =
+      report.invariantViolations.length > 0 ||
+      (!report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0));
+    if (hasDefiniteDefect) {
+      reasons.push(
+        `${def.name}: definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
+          `${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`,
+      );
+    }
+  }
+
+  // Assemble the push candidates: verbatim source yaml + content hash. Defs
+  // whose file uses include: are not hub-pushable (the service's create_workflow
+  // parses without include expansion, and a re-serialized expanded def is not
+  // round-trippable) — refuse them with a clear per-def reason.
+  const candidates: DefPushCandidate[] = [];
+  for (const def of selected) {
+    if (!def.dir) {
+      reasons.push(`${def.name}: has no source file on disk to push`);
+      continue;
+    }
+    const yaml = readFileSync(def.dir, 'utf8');
+    let usesInclude = false;
+    try {
+      const rawDef = buildDef(parseYaml(yaml), basename(def.dir), dirname(def.dir));
+      usesInclude = (rawDef._includes?.length ?? 0) > 0;
+    } catch {
+      // A shape error here would already have surfaced via the validation gate;
+      // treat an unexpected re-parse failure conservatively as pushable-as-is.
+    }
+    if (usesInclude) {
+      reasons.push(`${def.name}: uses include:, not hub-pushable yet`);
+      continue;
+    }
+    candidates.push({ name: def.name, hash: hashDef(def), yaml });
+  }
+
+  if (reasons.length > 0) {
+    throw new CliError(
+      `refusing to push — ${reasons.length} problem(s) found; nothing sent:\n  - ${reasons.join('\n  - ')}`,
+    );
+  }
+
+  const { toPush, unchanged } = computePushDiff(candidates, binding.pushed, force);
+
+  // Diff-style human lines go to stderr so stdout stays machine-parseable JSON.
+  for (const c of unchanged) io.err(`= ${c.name} (unchanged)`);
+
+  if (dryRun) {
+    for (const c of toPush) {
+      const prior = binding.pushed[c.name];
+      io.err(prior ? `~ ${c.name} (changed)` : `+ ${c.name} (new)`);
+    }
+    print(io, {
+      ok: true,
+      dryRun: true,
+      hub: origin,
+      wouldPush: toPush.map((c) => c.name),
+      unchanged: unchanged.map((c) => c.name),
+    });
+    return 0;
+  }
+
+  // Refresh an expiring oauth token once up front (per-request 401 refresh below covers mid-batch expiry).
+  cred = await ensureFreshOAuth(io, origin, cred);
+
+  const fetchFn = io.fetch ?? globalThis.fetch;
+  const pushedNames: string[] = [];
+  const failed: { name: string; error: string }[] = [];
+
+  for (const c of toPush) {
+    const prior = binding.pushed[c.name];
+    const label = prior ? '~' : '+';
+    try {
+      let res = await createWorkflowRequest(fetchFn, origin, cred, c.yaml);
+      if (res.status === 401 && cred.kind === 'oauth') {
+        cred = await refreshOAuth(io, origin, cred as Extract<Credential, { kind: 'oauth' }>);
+        res = await createWorkflowRequest(fetchFn, origin, cred, c.yaml);
+      }
+      if (res.status === 401) {
+        if (cred.kind === 'agent') {
+          throw new CliError('token revoked or invalid — re-mint it in the console or run `owenloop login`');
+        }
+        throw new CliError('credential rejected by the hub — run `owenloop login`');
+      }
+      if (res.status === 413) throw new CliError('workflow yaml exceeds the hub 32MB request cap');
+      if (res.status === 429) {
+        const retryAfter = res.headers.get('retry-after');
+        throw new CliError(`rate limited by the hub${retryAfter ? ` (retry after ${retryAfter})` : ''}`);
+      }
+      if (!res.ok) throw new CliError(`hub returned HTTP ${res.status}`);
+
+      const bodyJson: unknown = await res.json();
+      const errText = createWorkflowError(bodyJson);
+      if (errText !== null) throw new CliError(`hub rejected the def: ${errText}`);
+
+      const okBody = asCreateWorkflowOk(bodyJson);
+      binding.pushed[c.name] = {
+        localHash: c.hash,
+        remoteVersion: okBody.version,
+        remoteHash: okBody.hash,
+        pushedAt: nowMs(),
+      };
+      writeHubBinding(bindingPath, binding); // persist incrementally — never lose a landed push
+      pushedNames.push(c.name);
+      io.err(`${label} ${c.name} (→ v${okBody.version})`);
+    } catch (e) {
+      // A hard auth error aborts the whole run (re-throw); a per-def server
+      // failure is recorded and the batch continues (already-pushed defs stand).
+      if (e instanceof CliError && /run `owenloop login`|re-mint it/.test(e.message)) {
+        throw e;
+      }
+      const msg = (e as Error).message;
+      failed.push({ name: c.name, error: msg });
+      io.err(`! ${c.name} (failed: ${msg})`);
+    }
+  }
+
+  print(io, {
+    ok: failed.length === 0,
+    hub: origin,
+    pushed: pushedNames,
+    unchanged: unchanged.map((c) => c.name),
+    failed,
+  });
+  return failed.length === 0 ? 0 : 1;
+}
+
+function createWorkflowRequest(
+  fetchFn: typeof globalThis.fetch,
+  origin: string,
+  cred: Credential,
+  yaml: string,
+): Promise<Response> {
+  return fetchFn(resolveEndpoint(origin, '/api/create_workflow'), {
+    method: 'POST',
+    headers: {
+      Authorization: authHeader(cred),
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ yaml }),
+  });
+}
+
+/**
+ * Async entry point that adds network I/O for `add` and the hub commands on top
+ * of the otherwise fully-synchronous engine/CLI (see the doc comment on
+ * `sleepMs` above and README "sync end to end"). `main`/`dispatch` stay sync and
+ * unchanged — this wraps them, routing only the network-touching verbs through
+ * the async path, so every existing command and test keeps working exactly as
+ * before.
+ */
+const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push']);
+
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   const args = parseArgs(argv);
   const command = args.positionals[0];
-  if (command !== 'add') {
+  if (command === undefined || !ASYNC_COMMANDS.has(command)) {
     return main(argv, io);
   }
   try {
-    return await dispatchAdd(io, args);
+    switch (command) {
+      case 'add':
+        return await dispatchAdd(io, args);
+      case 'login':
+        return await dispatchLogin(io, args);
+      case 'logout':
+        return await dispatchLogout(io, args);
+      case 'connect':
+        return await dispatchConnect(io, args);
+      case 'push':
+        return await dispatchPush(io, args);
+      default:
+        return main(argv, io); // unreachable — ASYNC_COMMANDS guards the switch
+    }
   } catch (e) {
     if (e instanceof CliError || e instanceof DefError) {
       io.err(`error: ${e.message}`);
