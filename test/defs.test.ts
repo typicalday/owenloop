@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { parseProduce } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, DefError, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, validateDef } from '../src/defs.ts';
+import { buildDef, DefError, hashDef, hashDefContent, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, validateDef } from '../src/defs.ts';
 import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -2288,6 +2288,43 @@ test('§28 hashDef: is a short hex string', () => {
   const h = hashDef(a);
   assert.equal(h.length, 16);
   assert.match(h, /^[0-9a-f]{16}$/);
+});
+
+// ---- hashDefContent — portable content hash for the hub push ledger ---------
+
+const CONTENT_YAML = 'name: portable\ninputs:\n  - name: x\nsteps:\n  - name: a\n    consumes: [x]\n    produces: [y]\n';
+
+test('hashDefContent: identical content hashes the same across different checkout directories, unlike hashDef', () => {
+  const dirA = mktempDefsDir();
+  const dirB = mktempDefsDir();
+  try {
+    writeFileSync(join(dirA, 'portable.yaml'), CONTENT_YAML);
+    writeFileSync(join(dirB, 'portable.yaml'), CONTENT_YAML);
+    const a = loadDefsRaw(dirA).get('portable')!;
+    const b = loadDefsRaw(dirB).get('portable')!;
+    assert.notEqual(a.dir, b.dir, 'sanity: the two defs really do live at different absolute paths');
+    assert.notEqual(hashDef(a), hashDef(b), 'hashDef stays checkout-specific (includes def.dir)');
+    assert.equal(hashDefContent(a), hashDefContent(b), 'hashDefContent is portable across checkouts');
+  } finally {
+    rmSync(dirA, { recursive: true, force: true });
+    rmSync(dirB, { recursive: true, force: true });
+  }
+});
+
+test('hashDefContent: changes when the def body changes', () => {
+  const dir = mktempDefsDir();
+  try {
+    writeFileSync(join(dir, 'portable.yaml'), CONTENT_YAML);
+    const a = loadDefsRaw(dir).get('portable')!;
+    writeFileSync(
+      join(dir, 'portable.yaml'),
+      'name: portable\ninputs:\n  - name: x\nsteps:\n  - name: a\n    consumes: [x]\n    produces: [z]\n',
+    );
+    const b = loadDefsRaw(dir).get('portable')!;
+    assert.notEqual(hashDefContent(a), hashDefContent(b));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---- per-produce maxAttempts/maxSchemaFailures override -----------------------

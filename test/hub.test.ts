@@ -145,6 +145,50 @@ test('computePushDiff: --force pushes everything, even unchanged', () => {
   assert.deepEqual(toPush.map((d) => d.name), ['same']);
 });
 
+test('computePushDiff: a def matched only via legacyHash is unchanged AND reported as migrated', () => {
+  const pushed: Record<string, PushedEntry> = {
+    // Ledger entry recorded under the old checkout-specific hash.
+    old: { localHash: 'LEGACY', remoteVersion: 1, remoteHash: 'r', pushedAt: 1 },
+  };
+  const defs = [{ name: 'old', hash: 'PORTABLE', legacyHash: 'LEGACY' }];
+  const { toPush, unchanged, migrated } = computePushDiff(defs, pushed, false);
+  assert.equal(toPush.length, 0, 'no network call needed — content is unchanged');
+  assert.deepEqual(unchanged.map((d) => d.name), ['old']);
+  assert.deepEqual(migrated.map((d) => d.name), ['old']);
+});
+
+test('computePushDiff: matching the portable hash directly reports nothing as migrated', () => {
+  const pushed: Record<string, PushedEntry> = {
+    same: { localHash: 'PORTABLE', remoteVersion: 1, remoteHash: 'r', pushedAt: 1 },
+  };
+  const defs = [{ name: 'same', hash: 'PORTABLE', legacyHash: 'LEGACY' }];
+  const { unchanged, migrated } = computePushDiff(defs, pushed, false);
+  assert.deepEqual(unchanged.map((d) => d.name), ['same']);
+  assert.equal(migrated.length, 0, 'already portable — nothing to migrate');
+});
+
+test('computePushDiff: neither hash matches (foreign checkout, old ledger) — pushed, not migrated', () => {
+  const pushed: Record<string, PushedEntry> = {
+    old: { localHash: 'FOREIGN-LEGACY', remoteVersion: 1, remoteHash: 'r', pushedAt: 1 },
+  };
+  const defs = [{ name: 'old', hash: 'PORTABLE', legacyHash: 'LEGACY' }];
+  const { toPush, unchanged, migrated } = computePushDiff(defs, pushed, false);
+  assert.deepEqual(toPush.map((d) => d.name), ['old']);
+  assert.equal(unchanged.length, 0);
+  assert.equal(migrated.length, 0);
+});
+
+test('computePushDiff: --force pushes everything even when legacyHash would otherwise migrate it', () => {
+  const pushed: Record<string, PushedEntry> = {
+    old: { localHash: 'LEGACY', remoteVersion: 1, remoteHash: 'r', pushedAt: 1 },
+  };
+  const defs = [{ name: 'old', hash: 'PORTABLE', legacyHash: 'LEGACY' }];
+  const { toPush, unchanged, migrated } = computePushDiff(defs, pushed, true);
+  assert.deepEqual(toPush.map((d) => d.name), ['old']);
+  assert.equal(unchanged.length, 0);
+  assert.equal(migrated.length, 0, 'force wins — nothing is merely migrated');
+});
+
 // ---- create_workflow response guard ------------------------------------------
 
 test('createWorkflowError: ok:true is null, ok:false surfaces the error verbatim', () => {

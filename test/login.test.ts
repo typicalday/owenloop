@@ -175,3 +175,60 @@ test('logout: deletes the credential from the keychain', async () => {
   assert.equal(JSON.parse(t.out.join('\n')).removed, true);
   assert.ok(!t.store.has(ORIGIN), 'credential removed from the keychain');
 });
+
+test('logout: also deletes the FILE-side credential (OWENLOOP_NO_KEYCHAIN)', async () => {
+  const { fetch } = routedFetch({
+    'GET /api/workflows': () => ({ status: 200, json: { workflows: [] } }),
+  });
+  const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' }, stdin: 'olp_tok' });
+  await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
+  const path = credentialFilePath(t.io.env);
+  assert.ok(readCredentialFile(path).hubs[ORIGIN], 'credential landed in the file store, not the keychain');
+
+  t.out.length = 0;
+  const code = await mainAsync(['logout', '--hub', HUB], t.io);
+  assert.equal(code, 0);
+  assert.equal(JSON.parse(t.out.join('\n')).removed, true);
+  assert.equal(readCredentialFile(path).hubs[ORIGIN], undefined, 'credential removed from the file store too');
+});
+
+// ---- login timeout must not crash the process (unhandled rejection) ---------
+
+/** Wraps `inner` so the given pathname's response resolves only after `delayMs`. */
+function delayedFetch(inner: typeof globalThis.fetch, pathname: string, delayMs: number): typeof globalThis.fetch {
+  return (async (input: string | URL | Request, init?: RequestInit) => {
+    const urlStr = typeof input === 'string' ? input : input.toString();
+    if (new URL(urlStr).pathname === pathname) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    return inner(input, init);
+  }) as typeof globalThis.fetch;
+}
+
+test('login: a timeout firing mid-metadata-fetch surfaces a clean CliError, never an unhandledRejection', async () => {
+  const { fetch } = loginRoutes();
+  // The timer (30ms, via the test-only env knob) fires while the metadata GET
+  // is still in flight (resolves after ~120ms) — dispatchLogin hasn't reached
+  // its `await waitForCallback` yet, so without the no-op .catch this would be
+  // an unhandled rejection that crashes the process.
+  const slowFetch = delayedFetch(fetch, '/.well-known/oauth-authorization-server', 120);
+  const t = makeIo({ fetch: slowFetch, env: { OWENLOOP_LOGIN_TIMEOUT_MS: '30' }, onOpenUrl: driveCallback() });
+
+  let unhandled: unknown;
+  const onUnhandled = (reason: unknown): void => {
+    unhandled = reason;
+  };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const code = await mainAsync(['login', '--hub', HUB], t.io);
+    assert.equal(code, 1);
+    assert.match(t.err.join('\n'), /login timed out/);
+    assert.equal(t.store.size, 0, 'nothing stored after a timeout');
+
+    // Give any (incorrectly) unhandled rejection a tick to surface.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(unhandled, undefined, 'the timeout rejection must never surface as an unhandledRejection');
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});

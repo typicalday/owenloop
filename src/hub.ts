@@ -173,16 +173,28 @@ export function writeHubBinding(path: string, binding: HubBinding): void {
 
 // ---- push diff ---------------------------------------------------------------
 
-/** A local def selected for a push, with its content hash and raw source yaml. */
+/**
+ * A local def selected for a push, with its content hash and raw source yaml.
+ * `legacyHash` (optional) is the old checkout-specific `hashDef` value, kept
+ * alongside the portable `hash` (`hashDefContent`) so `computePushDiff` can
+ * recognize a def pushed under the pre-portability ledger format as unchanged
+ * and migrate it in place, instead of forcing one spurious re-push per
+ * checkout that happens to have a different absolute path.
+ */
 export interface DefPushCandidate {
   name: string;
   hash: string;
+  legacyHash?: string;
   yaml: string;
 }
 
-export interface PushDiff<T extends { name: string; hash: string }> {
+export interface PushDiff<T extends { name: string; hash: string; legacyHash?: string }> {
   toPush: T[];
   unchanged: T[];
+  /** Subset of `unchanged` matched only via `legacyHash` — the ledger entry for
+   *  these needs its `localHash` rewritten to the portable hash (see
+   *  `dispatchPush`'s migration write), even though no push is needed. */
+  migrated: T[];
 }
 
 /**
@@ -191,27 +203,37 @@ export interface PushDiff<T extends { name: string; hash: string }> {
  * `hashDef` equals its recorded `localHash` is unchanged (skip); a new or
  * changed hash is pushed. `force` pushes everything regardless.
  *
+ * A def whose portable `hash` doesn't match the recorded `localHash` but whose
+ * `legacyHash` (the old checkout-specific hash) does is ALSO unchanged — it's
+ * the same content, just recorded under the pre-portability ledger format —
+ * and is additionally reported in `migrated` so the caller can rewrite the
+ * ledger entry to the portable hash without a network round-trip.
+ *
  * This is the client-side idempotency the service can't give us: its
  * `create_workflow` always mints a new version even for byte-identical yaml, so
  * "re-push with no changes is a no-op" has to be decided here, before any
  * network write.
  */
-export function computePushDiff<T extends { name: string; hash: string }>(
+export function computePushDiff<T extends { name: string; hash: string; legacyHash?: string }>(
   defs: T[],
   pushed: Record<string, PushedEntry>,
   force: boolean,
 ): PushDiff<T> {
   const toPush: T[] = [];
   const unchanged: T[] = [];
+  const migrated: T[] = [];
   for (const d of defs) {
     const prior = pushed[d.name];
     if (!force && prior && prior.localHash === d.hash) {
       unchanged.push(d);
+    } else if (!force && prior && d.legacyHash !== undefined && prior.localHash === d.legacyHash) {
+      unchanged.push(d);
+      migrated.push(d);
     } else {
       toPush.push(d);
     }
   }
-  return { toPush, unchanged };
+  return { toPush, unchanged, migrated };
 }
 
 // ---- API response shape guards ----------------------------------------------

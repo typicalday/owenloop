@@ -8,6 +8,12 @@ Global flags: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) an
 `--defs <dir>` (env `OWENLOOP_DEFS`, default `./workflows`). Nothing is
 remembered between invocations — pass both on every command.
 
+Boolean flags (`--force`, `--dry-run`, `--all`, `--open`, `--terminal`,
+`--recursive`, `--with-token`, `--shallow`, `--assume-provided`, and the bare
+`--now` on `reap`) never take a following value — the next token is always a
+positional or the next `--flag`, never consumed as this flag's argument. Use
+`--flag=value` (e.g. `--now=<ms>` on `tick`) for flags that do take a value.
+
 ## Commands
 
 | command | what it does |
@@ -20,7 +26,7 @@ remembered between invocations — pass both on every command.
 | `logout [--hub <url>]` | delete the stored credential for a hub |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
-| `tick <wf> [--now <ms>] [--shallow]` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only) |
+| `tick <wf> [--now=<ms>] [--shallow]` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only) |
 | `reap <wf> [--now]` | run the reaper; `--now` forces every claim stale (TTL 0) — see below |
 | `runs <wf> [--open]` | list this instance's runs, joining claim state for open ones |
 | `status <wf>` | derived view: `done`, `debts`, `eligible`, `blocked`, `inFlight` |
@@ -144,15 +150,26 @@ to stderr.
 **Idempotency is client-side, and the hub is push-blind.** The service's
 `create_workflow` is append-only — it mints a new version on every call and
 exposes no def hash in its read APIs. So `push` records what it sent in
-`.owenloop/hub.json` (`localHash` = `sha256(JSON.stringify(def))[:16]`, plus the
-returned `remoteVersion`/`remoteHash`) and skips a def whose local hash is
-unchanged since the last push — that's what makes a re-push a no-op. Because the
-hub can't be consulted for drift, this state is **local to the machine**: a
-fresh clone (or a second developer) has no push state and will re-push
-everything once. `--force` re-pushes even unchanged defs; `--dry-run` reports
-the plan and writes nothing (no state, no network). A `<defName>` that doesn't
-resolve is an error; a `{ok:false}` from the hub mid-batch records the defs that
-did land and exits 1.
+`.owenloop/hub.json` (`localHash` = a **portable** content hash of the def, plus
+the returned `remoteVersion`/`remoteHash`) and skips a def whose local hash is
+unchanged since the last push — that's what makes a re-push a no-op. `--force`
+re-pushes even unchanged defs; `--dry-run` reports the plan and writes nothing
+(no state, no network). A `<defName>` that doesn't resolve is an error; a
+`{ok:false}` from the hub mid-batch records the defs that did land and exits 1.
+
+The committed `hub.json` **is meant to be portable across checkouts**: cloning
+the repo somewhere else, or a teammate checking it out at a different path,
+must not cause every def to look "changed" and re-push. The local hash is
+therefore computed over the def's content only, with the checkout-specific
+absolute source path stripped out first — not a raw hash of the loaded def
+object. **Migration note:** a `hub.json` written before this was true recorded
+the path-sensitive hash; the first `push` against it upgrades each entry to the
+portable hash silently, in place, with **zero** network calls, as long as the
+checkout's absolute path hasn't changed. Only a genuinely different checkout
+(a fresh clone at a different path, a different machine) sees one forced
+re-push per def — an unavoidable one-time cost, since the hub can't tell "same
+content, different path" from "changed" on its own — after which that
+checkout's ledger is portable too.
 
 On a `401`, an OAuth credential is refreshed once and the request retried; an
 agent (`olp_`) token has no refresh path, so a `401` is a hard "re-mint it"

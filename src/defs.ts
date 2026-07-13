@@ -556,6 +556,24 @@ export function hashDef(def: WorkflowDef): string {
 }
 
 /**
+ * Portable content hash of a `WorkflowDef`, for the hub CLI's push-idempotency
+ * ledger (`.owenloop/hub.json`). Unlike `hashDef` (used for engine instance-to-
+ * definition pinning, where the def's on-disk identity is exactly the point),
+ * this hash must be stable across checkouts — the same workflow content
+ * checked out at a different absolute path, or on a different machine, must
+ * hash identically so the committed ledger doesn't churn. `dir` (source
+ * directory, if loaded from disk) is the only absolute-path-bearing field on
+ * `WorkflowDef` — audited against every place a path is written into a def
+ * (buildDef's `source`/`baseDir` params are only used to resolve/read
+ * `bodyFile` content, never stored as a path; `loadDefs`/`loadDefsRaw` set
+ * only `def.dir`) — so it is the only field stripped before hashing.
+ */
+export function hashDefContent(def: WorkflowDef): string {
+  const { dir, ...rest } = def;
+  return createHash('sha256').update(JSON.stringify(rest)).digest('hex').slice(0, 16);
+}
+
+/**
  * Build a `WorkflowDef` from a parsed YAML object, coercing types and filling
  * defaults — but WITHOUT the static wiring checks. Throws DefError only on
  * malformed shapes (wrong types, missing name/steps). Use `parseDef` for the
