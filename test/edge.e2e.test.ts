@@ -406,10 +406,10 @@ test('CAS: a reaped run is a zombie — its commit is refused (lease no longer h
   const T0 = 1_700_000_000_000;
   const wf = ow('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).workflow;
   // claim AT T0 so the lease timestamp is anchored to the test clock, not wall time
-  const stranded = ow('tick', wf, '--now', String(T0)).orders.find((o: any) => o.step === 'planner');
+  const stranded = ow('tick', wf, `--now=${T0}`).orders.find((o: any) => o.step === 'planner');
   assert.ok(stranded, 'planner claimed at T0');
   // re-tick far in the future: the lease is past its 2h TTL → reaped → re-armed
-  const later = ow('tick', wf, '--now', String(T0 + 3 * 3600_000));
+  const later = ow('tick', wf, `--now=${T0 + 3 * 3600_000}`);
   assert.equal(later.reaped, 1, 'the stranded claim was reaped');
   assert.ok(later.orders.some((o: any) => o.step === 'planner'), 'planner re-armed under a fresh run');
 
@@ -445,14 +445,14 @@ test('schedule: an eligible step is not re-fired until its cadence elapses', () 
   const wf = startRate(ow);
   const T0 = 1_700_000_000_000;
 
-  const first = ow('tick', wf, '--now', String(T0));
+  const first = ow('tick', wf, `--now=${T0}`);
   assert.equal(first.orders.length, 1, 'fires at T0');
   ow('close', wf, first.orders[0].run, '--outcome', 'no_work'); // pong stays owed → still eligible
 
-  const tooSoon = ow('tick', wf, '--now', String(T0 + 59 * 60_000)); // 59m < 1h cadence
+  const tooSoon = ow('tick', wf, `--now=${T0 + 59 * 60_000}`); // 59m < 1h cadence
   assert.equal(tooSoon.orders.length, 0, 'cadence gate holds it back');
 
-  const due = ow('tick', wf, '--now', String(T0 + 60 * 60_000)); // exactly 1h → due
+  const due = ow('tick', wf, `--now=${T0 + 60 * 60_000}`); // exactly 1h → due
   assert.equal(due.orders.length, 1, 'fires again once the cadence has elapsed');
   ow.cleanup();
 });
@@ -465,13 +465,13 @@ test('schedule: maxRunsPerDay caps firings within a day even when cadence has el
   noon.setHours(12, 0, 0, 0);
   const T0 = noon.getTime();
 
-  const r1 = ow('tick', wf, '--now', String(T0));
+  const r1 = ow('tick', wf, `--now=${T0}`);
   ow('close', wf, r1.orders[0].run, '--outcome', 'no_work');
-  const r2 = ow('tick', wf, '--now', String(T0 + 3600_000));
+  const r2 = ow('tick', wf, `--now=${T0 + 3600_000}`);
   assert.equal(r2.orders.length, 1, 'second run is within budget');
   ow('close', wf, r2.orders[0].run, '--outcome', 'no_work');
 
-  const r3 = ow('tick', wf, '--now', String(T0 + 2 * 3600_000)); // cadence ok, but budget spent
+  const r3 = ow('tick', wf, `--now=${T0 + 2 * 3600_000}`); // cadence ok, but budget spent
   assert.equal(r3.orders.length, 0, 'maxRunsPerDay=2 blocks the third firing today');
   ow.cleanup();
 });
@@ -481,7 +481,7 @@ test('schedule: over-ticking is safe — repeated ticks never double-claim', () 
   const wf = startRate(ow);
   const T0 = 1_700_000_000_000;
   const orders = [];
-  for (let i = 0; i < 5; i++) orders.push(...ow('tick', wf, '--now', String(T0)).orders);
+  for (let i = 0; i < 5; i++) orders.push(...ow('tick', wf, `--now=${T0}`).orders);
   assert.equal(orders.length, 1, 'exactly one claim despite five ticks at the same instant');
   ow.cleanup();
 });

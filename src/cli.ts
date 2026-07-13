@@ -44,7 +44,7 @@ import { Engine } from './engine.ts';
 import { buildGraph, buildTrace, graphToDot, graphToMermaid, modelCheck } from './model.ts';
 import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
-import { buildDef, DefError, hashDef, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
+import { buildDef, DefError, hashDef, hashDefContent, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 import { detId, nowMs, parseDurationMs } from './util.ts';
@@ -180,6 +180,29 @@ interface Args {
   options: Map<string, string[]>;
 }
 
+/**
+ * Flags that are always boolean and must never consume the following token as
+ * a value — `owenloop push --force foo` must force-push only `foo`, not treat
+ * `foo` as `--force`'s value and swallow it from the positionals. Audited
+ * against every `flag(args, ...)` call site in this file. `now` is dual-mode:
+ * a bare boolean for `reap`, but `tick` reads it as `--now=<ms>` (the `=` form
+ * bypasses this set entirely, handled by the `eq >= 0` branch below); the
+ * space-separated `--now 123` form intentionally no longer binds `123` as
+ * `now`'s value — docs/cli.md documents only `--now=<ms>`.
+ */
+const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
+  'assume-provided',
+  'shallow',
+  'now',
+  'all',
+  'open',
+  'terminal',
+  'recursive',
+  'with-token',
+  'dry-run',
+  'force',
+]);
+
 function parseArgs(argv: string[]): Args {
   const positionals: string[] = [];
   const options = new Map<string, string[]>();
@@ -192,6 +215,8 @@ function parseArgs(argv: string[]): Args {
       if (eq >= 0) {
         val = key.slice(eq + 1);
         key = key.slice(0, eq);
+      } else if (BOOLEAN_FLAGS.has(key)) {
+        val = 'true'; // never consume the next token for a known-boolean flag
       } else if (i + 1 < argv.length && !(argv[i + 1] as string).startsWith('--')) {
         val = argv[++i] as string;
       } else {
@@ -1303,7 +1328,9 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
   // the concrete 127.0.0.1:<port> callback).
   const { verifier, challenge } = pkcePair();
   const state = randomState();
-  const { server, port, waitForCallback, close } = await startLoopbackServer(state);
+  const timeoutOverride = Number(io.env.OWENLOOP_LOGIN_TIMEOUT_MS);
+  const timeoutMs = Number.isFinite(timeoutOverride) && timeoutOverride > 0 ? timeoutOverride : undefined;
+  const { server, port, waitForCallback, close } = await startLoopbackServer(state, timeoutMs);
   try {
     const redirectUri = `http://127.0.0.1:${port}/callback`;
     const meta = await discoverMetadata(io, origin);
@@ -1356,8 +1383,13 @@ interface LoopbackServer {
 
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 
-/** Bind a single-use loopback catcher on 127.0.0.1:0 that resolves on the OAuth callback. */
-async function startLoopbackServer(expectedState: string): Promise<LoopbackServer> {
+/**
+ * Bind a single-use loopback catcher on 127.0.0.1:0 that resolves on the OAuth
+ * callback. `timeoutMs` overrides the 5-minute default (test knob, threaded
+ * from `OWENLOOP_LOGIN_TIMEOUT_MS` by `dispatchLogin`, consistent with the
+ * project's other `OWENLOOP_*` test-only env knobs).
+ */
+async function startLoopbackServer(expectedState: string, timeoutMs: number = LOGIN_TIMEOUT_MS): Promise<LoopbackServer> {
   const loginHtml = (msg: string): string =>
     `<!doctype html><meta charset="utf-8"><title>owenloop</title><body style="font-family:system-ui;padding:2rem"><p>${msg}</p></body>`;
 
@@ -1367,6 +1399,13 @@ async function startLoopbackServer(expectedState: string): Promise<LoopbackServe
     resolveCb = res;
     rejectCb = rej;
   });
+  // The timeout timer (below) can fire — and reject waitForCallback — before
+  // dispatchLogin reaches its `await waitForCallback` (it awaits
+  // discoverMetadata/registerClient first), which would otherwise surface as
+  // an unhandled rejection and crash the process. This no-op .catch marks the
+  // rejection handled without consuming it; the later real `await
+  // waitForCallback` in dispatchLogin still sees and throws the same error.
+  waitForCallback.catch(() => {});
 
   const server = createServer((req, res) => {
     const u = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -1403,7 +1442,7 @@ async function startLoopbackServer(expectedState: string): Promise<LoopbackServe
 
   const timer = setTimeout(() => {
     rejectCb(new CliError('login timed out after 5 minutes waiting for the browser callback'));
-  }, LOGIN_TIMEOUT_MS);
+  }, timeoutMs);
   timer.unref?.();
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -1620,7 +1659,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       reasons.push(`${def.name}: uses include:, not hub-pushable yet`);
       continue;
     }
-    candidates.push({ name: def.name, hash: hashDef(def), yaml });
+    // `hash` is the portable content hash (stable across checkouts — see
+    // hashDefContent); `legacyHash` is the old checkout-specific hashDef value,
+    // carried alongside so computePushDiff can recognize and migrate a
+    // pre-portability ledger entry without a spurious re-push.
+    candidates.push({ name: def.name, hash: hashDefContent(def), legacyHash: hashDef(def), yaml });
   }
 
   if (reasons.length > 0) {
@@ -1629,7 +1672,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     );
   }
 
-  const { toPush, unchanged } = computePushDiff(candidates, binding.pushed, force);
+  const { toPush, unchanged, migrated } = computePushDiff(candidates, binding.pushed, force);
 
   // Diff-style human lines go to stderr so stdout stays machine-parseable JSON.
   for (const c of unchanged) io.err(`= ${c.name} (unchanged)`);
@@ -1647,6 +1690,21 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       unchanged: unchanged.map((c) => c.name),
     });
     return 0;
+  }
+
+  // Silent one-time ledger migration: entries matched only via the legacy
+  // (checkout-specific) hash get their `localHash` rewritten to the portable
+  // content hash — zero network calls, done once before the push loop so a
+  // same-checkout upgrade never triggers a spurious re-push (the legacy hash
+  // recomputes identically since def.dir hasn't changed). A foreign checkout
+  // with an old-format ledger mismatches both hashes and falls into `toPush`
+  // instead — exactly one forced re-push, after which the ledger is portable.
+  if (migrated.length > 0) {
+    for (const c of migrated) {
+      const prior = binding.pushed[c.name];
+      if (prior) binding.pushed[c.name] = { ...prior, localHash: c.hash };
+    }
+    writeHubBinding(bindingPath, binding);
   }
 
   // Refresh an expiring oauth token once up front (per-request 401 refresh below covers mid-batch expiry).
