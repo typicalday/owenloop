@@ -1,0 +1,177 @@
+/**
+ * `owenloop login` / `logout` driven in-process through `mainAsync`. The OAuth
+ * AS (metadata / DCR / token) is a canned `routedFetch`; the browser step is an
+ * injected `openUrl` that drives the REAL loopback server the login flow binds
+ * (loopback-only, still hermetic). Credentials land in an injected fake keychain
+ * or, with OWENLOOP_NO_KEYCHAIN=1, the 0600 file under a fixture `$HOME`.
+ */
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { statSync } from 'node:fs';
+import { join } from 'node:path';
+import { mainAsync } from '../src/cli.ts';
+import { credentialFilePath, readCredentialFile } from '../src/hub.ts';
+import type { Credential } from '../src/hub.ts';
+import { makeIo, OAUTH_METADATA, routedFetch } from './hubkit.ts';
+import type { RouteHandler } from './hubkit.ts';
+
+const HUB = 'http://127.0.0.1:9';
+const ORIGIN = 'http://127.0.0.1:9';
+
+/** Routes for a successful OAuth loopback exchange. */
+function loginRoutes(overrides: Record<string, RouteHandler> = {}) {
+  return routedFetch({
+    'GET /.well-known/oauth-authorization-server': () => ({ status: 200, json: OAUTH_METADATA }),
+    'POST /mcp/register': () => ({ status: 200, json: { client_id: 'client-abc' } }),
+    'POST /mcp/token': () => ({
+      status: 200,
+      json: { access_token: 'mcpat_access', refresh_token: 'rt_refresh', expires_in: 3600, token_type: 'Bearer' },
+    }),
+    ...overrides,
+  });
+}
+
+/** An openUrl that plays the browser+consent: drives the loopback callback with the given code/state override. */
+function driveCallback(mutate?: (u: { code: string; state: string }) => Record<string, string>) {
+  return (authUrl: string) => {
+    const u = new URL(authUrl);
+    const redirectUri = u.searchParams.get('redirect_uri')!;
+    const state = u.searchParams.get('state')!;
+    const params = mutate ? mutate({ code: 'auth-code-1', state }) : { code: 'auth-code-1', state };
+    const cb = new URL(redirectUri);
+    for (const [k, v] of Object.entries(params)) cb.searchParams.set(k, v);
+    // Real loopback fetch (not the injected fake) — fire-and-forget after login awaits.
+    void fetch(cb.toString()).catch(() => {});
+  };
+}
+
+test('login: loopback OAuth stores an oauth credential in the keychain', async () => {
+  const { fetch, calls } = loginRoutes();
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const result = JSON.parse(t.out.join('\n'));
+  assert.equal(result.ok, true);
+  assert.equal(result.kind, 'oauth');
+  assert.equal(result.storage, 'keychain');
+  assert.equal(result.hub, ORIGIN);
+
+  const stored = JSON.parse(t.store.get(ORIGIN)!) as Credential;
+  assert.equal(stored.kind, 'oauth');
+  assert.equal(stored.accessToken, 'mcpat_access');
+
+  // DCR carried the exact loopback redirect URI, token_endpoint_auth_method:none.
+  const dcr = calls.find((c) => c.pathname === '/mcp/register')!;
+  const dcrBody = JSON.parse(dcr.body!);
+  assert.equal(dcrBody.token_endpoint_auth_method, 'none');
+  assert.match(dcrBody.redirect_uris[0], /^http:\/\/127\.0\.0\.1:\d+\/callback$/);
+
+  // No token value leaks to stdout/stderr.
+  const combined = t.out.join('\n') + t.err.join('\n');
+  assert.doesNotMatch(combined, /mcpat_access|rt_refresh/);
+});
+
+test('login: OWENLOOP_NO_KEYCHAIN forces the 0600 file fallback', async () => {
+  const { fetch } = loginRoutes();
+  const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' }, onOpenUrl: driveCallback() });
+
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(JSON.parse(t.out.join('\n')).storage, 'file');
+
+  const path = credentialFilePath(t.io.env);
+  const file = readCredentialFile(path);
+  assert.equal((file.hubs[ORIGIN] as Credential).accessToken, 'mcpat_access');
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.equal(t.store.size, 0, 'nothing written to the keychain when NO_KEYCHAIN=1');
+});
+
+test('login: a state mismatch on the callback aborts, storing nothing', async () => {
+  const { fetch } = loginRoutes();
+  const t = makeIo({ fetch, onOpenUrl: driveCallback(() => ({ code: 'auth-code-1', state: 'WRONG' })) });
+
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /state mismatch/);
+  assert.equal(t.store.size, 0);
+});
+
+test('login: a token-exchange failure aborts, storing nothing', async () => {
+  const { fetch } = loginRoutes({ 'POST /mcp/token': () => ({ status: 400, json: { error: 'invalid_grant' } }) });
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /token exchange failed/);
+  assert.equal(t.store.size, 0);
+});
+
+test('login: consent denied (error=access_denied) aborts', async () => {
+  const { fetch } = loginRoutes();
+  const t = makeIo({ fetch, onOpenUrl: driveCallback(() => ({ error: 'access_denied' })) });
+
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /login denied/);
+  assert.equal(t.store.size, 0);
+});
+
+test('login --with-token: reads an olp_ agent token from stdin, verifies, and stores it', async () => {
+  const { fetch, calls } = routedFetch({
+    'GET /api/workflows': () => ({ status: 200, json: { workflows: [] } }),
+  });
+  const t = makeIo({ fetch, stdin: '  olp_org_secret\n' });
+
+  const code = await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const result = JSON.parse(t.out.join('\n'));
+  assert.equal(result.kind, 'agent');
+  const stored = JSON.parse(t.store.get(ORIGIN)!) as Credential;
+  assert.equal(stored.accessToken, 'olp_org_secret');
+
+  // Verified via GET /api/workflows before storing, with the bearer token.
+  const verify = calls.find((c) => c.pathname === '/api/workflows')!;
+  assert.equal(verify.authorization, 'Bearer olp_org_secret');
+  assert.doesNotMatch(t.out.join('\n') + t.err.join('\n'), /olp_org_secret/);
+});
+
+test('login --with-token: an unverifiable token (401) is not stored', async () => {
+  const { fetch } = routedFetch({
+    'GET /api/workflows': () => ({ status: 401, json: { error: 'invalid' } }),
+  });
+  const t = makeIo({ fetch, stdin: 'olp_bad' });
+
+  const code = await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /revoked or invalid/);
+  assert.equal(t.store.size, 0);
+});
+
+test('login --with-token: an unrecognized token prefix is rejected before any network call', async () => {
+  const { fetch, calls } = routedFetch({});
+  const t = makeIo({ fetch, stdin: 'garbage-token' });
+
+  const code = await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /unrecognized token/);
+  assert.equal(calls.length, 0);
+});
+
+test('logout: deletes the credential from the keychain', async () => {
+  const { fetch } = routedFetch({
+    'GET /api/workflows': () => ({ status: 200, json: { workflows: [] } }),
+  });
+  const t = makeIo({ fetch, stdin: 'olp_tok' });
+  await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
+  assert.ok(t.store.has(ORIGIN));
+
+  t.out.length = 0; // drop the login output so we parse only logout's JSON
+  const code = await mainAsync(['logout', '--hub', HUB], t.io);
+  assert.equal(code, 0);
+  assert.equal(JSON.parse(t.out.join('\n')).removed, true);
+  assert.ok(!t.store.has(ORIGIN), 'credential removed from the keychain');
+});
