@@ -230,6 +230,39 @@ test('tick --now=<ms> drives the clock deterministically (rate fixture)', () => 
   assert.equal(run('tick', wf, `--now=${T0 + 30 * 60_000}`).json().orders.length, 0);
 });
 
+test('tick --now (space form) is a boolean flag now, not a value — non-numeric --now is rejected', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  // Space form: `--now` binds boolean 'true' (see BOOLEAN_FLAGS), so
+  // Number('true') would be NaN without the guard — must fail loudly, not
+  // silently drive the engine's clock with NaN.
+  const spaceForm = run('tick', wf, '--now', '123');
+  assert.equal(spaceForm.code, 1);
+  assert.match(spaceForm.err, /invalid value for --now/);
+
+  const eqForm = run('tick', wf, '--now=abc');
+  assert.equal(eqForm.code, 1);
+  assert.match(eqForm.err, /invalid value for --now/);
+});
+
+test('heartbeat --now=<non-numeric> is rejected, not silently NaN', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+  const order = run('tick', wf).json().orders[0];
+
+  const r = run('heartbeat', wf, order.run, '--now=abc');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /invalid value for --now/);
+});
+
+test('check --max-depth=<non-numeric> is rejected, not silently NaN', () => {
+  const { run } = makeCli();
+  const r = run('check', 'delivery', '--max-depth=abc');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /invalid value for --max-depth/);
+});
+
 // ---- runs / reap --------------------------------------------------------------
 
 test('runs: lists closed and open runs, joining claim state only for the open one', () => {

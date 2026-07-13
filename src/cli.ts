@@ -256,6 +256,17 @@ function needOpt(args: Args, key: string): string {
   return v;
 }
 
+/** Read an optional numeric flag; throw a CliError (never NaN) on a non-finite value. */
+function numOpt(args: Args, key: string): number | undefined {
+  const raw = last(args, key);
+  if (raw === undefined) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    throw new CliError(`invalid value for --${key}: expected --${key}=<number> (got "${raw}")`);
+  }
+  return n;
+}
+
 function parseJson(s: string | undefined, fallback: Record<string, unknown> = {}): Record<string, unknown> {
   if (s === undefined) return fallback;
   let v: unknown;
@@ -439,9 +450,9 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     }
 
     const format = last(args, 'format') ?? 'text';
-    const maxDepth = last(args, 'max-depth') !== undefined ? Number(last(args, 'max-depth')) : undefined;
-    const maxStates = last(args, 'max-states') !== undefined ? Number(last(args, 'max-states')) : undefined;
-    const maxCollection = last(args, 'max-collection') !== undefined ? Number(last(args, 'max-collection')) : undefined;
+    const maxDepth = numOpt(args, 'max-depth');
+    const maxStates = numOpt(args, 'max-states');
+    const maxCollection = numOpt(args, 'max-collection');
 
     const report = modelCheck(def, {
       ...(maxDepth !== undefined ? { maxDepth } : {}),
@@ -564,11 +575,11 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       }
       case 'tick': {
         const wf = need(args, 1, 'workflow');
-        const nowRaw = last(args, 'now');
+        const now = numOpt(args, 'now');
         // §23.6.8: tick is deep by default (descends into calls: children and
         // returns their orders too); --shallow restores single-instance ticking.
         const tickOpts: { now?: number; deep?: boolean } = {};
-        if (nowRaw !== undefined) tickOpts.now = Number(nowRaw);
+        if (now !== undefined) tickOpts.now = now;
         if (flag(args, 'shallow')) tickOpts.deep = false;
         print(io, engine.tick(wf, tickOpts));
         return 0;
@@ -594,8 +605,9 @@ function dispatch(command: string, io: CliIO, args: Args): number {
           // `--all` is the whole-fleet read; a workflow argument is
           // contradictory (one or all?). Reject it in both orderings rather
           // than silently ignoring the caller's intent:
-          //   `status wf --all`  → the wf lands in positionals[1]
-          //   `status --all wf`  → the parser binds wf as `--all`'s value
+          //   `status wf --all` / `status --all wf` → the wf lands in positionals[1]
+          //     (`all` is a boolean flag and never consumes the next token)
+          //   `status --all=wf` → the `=` form binds wf as `--all`'s value
           const v = last(args, 'all');
           const stray = args.positionals[1] ?? (v !== 'true' && v !== '' ? v : undefined);
           if (stray !== undefined) {
@@ -852,8 +864,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       case 'heartbeat': {
         const wf = need(args, 1, 'workflow');
         const run = need(args, 2, 'run');
-        const nowRaw = last(args, 'now');
-        engine.heartbeat(wf, run, nowRaw !== undefined ? Number(nowRaw) : undefined);
+        engine.heartbeat(wf, run, numOpt(args, 'now'));
         print(io, { ok: true, workflow: wf, run });
         return 0;
       }
@@ -1441,7 +1452,8 @@ async function startLoopbackServer(expectedState: string, timeoutMs: number = LO
   });
 
   const timer = setTimeout(() => {
-    rejectCb(new CliError('login timed out after 5 minutes waiting for the browser callback'));
+    const human = timeoutMs % 60_000 === 0 ? `${timeoutMs / 60_000} minutes` : `${timeoutMs}ms`;
+    rejectCb(new CliError(`login timed out after ${human} waiting for the browser callback`));
   }, timeoutMs);
   timer.unref?.();
 

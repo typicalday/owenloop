@@ -222,7 +222,11 @@ test('login: a timeout firing mid-metadata-fetch surfaces a clean CliError, neve
   try {
     const code = await mainAsync(['login', '--hub', HUB], t.io);
     assert.equal(code, 1);
-    assert.match(t.err.join('\n'), /login timed out/);
+    assert.match(
+      t.err.join('\n'),
+      /login timed out after 30ms waiting for the browser callback/,
+      'message derives from the actual (overridden) timeout, not a hardcoded "5 minutes"',
+    );
     assert.equal(t.store.size, 0, 'nothing stored after a timeout');
 
     // Give any (incorrectly) unhandled rejection a tick to surface.
