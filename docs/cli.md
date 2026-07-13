@@ -188,6 +188,10 @@ def isn't round-trippable. A def using `bodyFile:` is refused the same way
 resolve the external file against once the YAML leaves this machine. Inline
 both before pushing.
 
+Exact-match redirect URIs (no RFC 8252 variable-port allowance) and no
+device-code grant remain recorded follow-ups on the service, not gaps in the
+CLI.
+
 ## Hand-driven walkthrough
 
 The [`examples/workflows`](../examples/workflows) folder has a workflow per
