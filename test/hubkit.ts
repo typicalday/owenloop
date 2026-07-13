@@ -11,6 +11,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { hashDefForHub } from '../src/defs.ts';
 import type { CliIO, Keychain } from '../src/cli.ts';
 
 export interface RouteResult {
@@ -114,3 +115,74 @@ export const OAUTH_METADATA = {
   grant_types: ['authorization_code', 'refresh_token'],
   code_challenge_methods: ['S256'],
 };
+
+/** Canonical `GET /api/whoami` 200 body, reused across login/connect/push tests. */
+export const WHOAMI_BODY = {
+  orgId: 'org_test123',
+  orgName: 'Test Org',
+  actor: { id: 'user_abc', kind: 'user', role: 'member' },
+  authMethod: 'oauth',
+};
+
+/** Build a `GET /api/workflows` route handler from a list of server-side def summaries. */
+export function workflowsRoute(
+  items: { name: string; hash: string; version?: number; title?: string; steps?: unknown }[],
+): RouteHandler {
+  return () => ({
+    status: 200,
+    json: {
+      text: '',
+      workflows: items.map((it) => ({ steps: [], ...it })),
+    },
+  });
+}
+
+/**
+ * A minimal in-memory stand-in for the hub's `GET /api/workflows` +
+ * `POST /api/create_workflow` pair, reproducing exactly the contract `push`
+ * depends on: a name absent from the store is a fresh create (version 1); a
+ * present name whose `hashDefForHub` matches the incoming yaml is an
+ * idempotent no-op (`{ok:true, unchanged:true, version:<unchanged>}`, no
+ * version bump); a mismatched hash version-forwards. Uses the real
+ * `hashDefForHub` (not a stand-in) so `computeServerDiff`'s LOCAL diff
+ * against `GET /api/workflows`'s `hash` field is exercised exactly as it
+ * would be against the real hub — a genuinely-unchanged push resolves with
+ * zero `create_workflow` calls, not merely a server-side no-op.
+ */
+export function makeFakeHub(seed: { name: string; yaml: string; version?: number }[] = []): {
+  routes: Record<string, RouteHandler>;
+  state: Map<string, { yaml: string; version: number }>;
+} {
+  const state = new Map<string, { yaml: string; version: number }>(
+    seed.map((w) => [w.name, { yaml: w.yaml, version: w.version ?? 1 }]),
+  );
+  const routes: Record<string, RouteHandler> = {
+    'GET /api/workflows': () => ({
+      status: 200,
+      json: {
+        text: '',
+        workflows: [...state.entries()].map(([name, w]) => ({
+          name,
+          hash: hashDefForHub(w.yaml),
+          version: w.version,
+          steps: [],
+        })),
+      },
+    }),
+    'POST /api/create_workflow': (req) => {
+      const body = JSON.parse(req.body ?? '{}') as { yaml?: string };
+      const yaml = typeof body.yaml === 'string' ? body.yaml : '';
+      const hash = hashDefForHub(yaml);
+      const nameMatch = /^name:\s*(\S+)/m.exec(yaml);
+      const name = nameMatch ? nameMatch[1]! : '';
+      const existing = state.get(name);
+      if (existing && hashDefForHub(existing.yaml) === hash) {
+        return { status: 200, json: { ok: true, name, version: existing.version, hash, unchanged: true } };
+      }
+      const version = existing ? existing.version + 1 : 1;
+      state.set(name, { yaml, version });
+      return { status: 200, json: { ok: true, name, version, hash } };
+    },
+  };
+  return { routes, state };
+}

@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { parseProduce } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, DefError, hashDef, hashDefContent, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, validateDef } from '../src/defs.ts';
+import { buildDef, DefError, hashDef, hashDefForHub, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, validateDef } from '../src/defs.ts';
 import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -2290,11 +2290,11 @@ test('§28 hashDef: is a short hex string', () => {
   assert.match(h, /^[0-9a-f]{16}$/);
 });
 
-// ---- hashDefContent — portable content hash for the hub push ledger ---------
+// ---- hashDefForHub — server-canonical content hash for the CLI push diff ----
 
 const CONTENT_YAML = 'name: portable\ninputs:\n  - name: x\nsteps:\n  - name: a\n    consumes: [x]\n    produces: [y]\n';
 
-test('hashDefContent: identical content hashes the same across different checkout directories, unlike hashDef', () => {
+test('hashDefForHub: identical yaml hashes the same regardless of checkout directory, unlike hashDef', () => {
   const dirA = mktempDefsDir();
   const dirB = mktempDefsDir();
   try {
@@ -2304,27 +2304,28 @@ test('hashDefContent: identical content hashes the same across different checkou
     const b = loadDefsRaw(dirB).get('portable')!;
     assert.notEqual(a.dir, b.dir, 'sanity: the two defs really do live at different absolute paths');
     assert.notEqual(hashDef(a), hashDef(b), 'hashDef stays checkout-specific (includes def.dir)');
-    assert.equal(hashDefContent(a), hashDefContent(b), 'hashDefContent is portable across checkouts');
+    assert.equal(
+      hashDefForHub(CONTENT_YAML),
+      hashDefForHub(CONTENT_YAML),
+      'hashDefForHub is a pure function of the yaml text — portable across checkouts',
+    );
   } finally {
     rmSync(dirA, { recursive: true, force: true });
     rmSync(dirB, { recursive: true, force: true });
   }
 });
 
-test('hashDefContent: changes when the def body changes', () => {
-  const dir = mktempDefsDir();
-  try {
-    writeFileSync(join(dir, 'portable.yaml'), CONTENT_YAML);
-    const a = loadDefsRaw(dir).get('portable')!;
-    writeFileSync(
-      join(dir, 'portable.yaml'),
-      'name: portable\ninputs:\n  - name: x\nsteps:\n  - name: a\n    consumes: [x]\n    produces: [z]\n',
-    );
-    const b = loadDefsRaw(dir).get('portable')!;
-    assert.notEqual(hashDefContent(a), hashDefContent(b));
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test('hashDefForHub: changes when the def body changes', () => {
+  const a = hashDefForHub(CONTENT_YAML);
+  const b = hashDefForHub(
+    'name: portable\ninputs:\n  - name: x\nsteps:\n  - name: a\n    consumes: [x]\n    produces: [z]\n',
+  );
+  assert.notEqual(a, b);
+});
+
+test('hashDefForHub: throws a DefError naming bodyFile for a def that uses it (no baseDir to resolve against)', () => {
+  const yaml = 'name: needs-file\nsteps:\n  - name: a\n    bodyFile: prompt.md\n    produces: [y]\n';
+  assert.throws(() => hashDefForHub(yaml), (e: unknown) => e instanceof DefError && /bodyFile/.test((e as Error).message));
 });
 
 // ---- per-produce maxAttempts/maxSchemaFailures override -----------------------

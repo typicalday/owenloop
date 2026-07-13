@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { credentialFilePath, readCredentialFile } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
-import { makeIo, OAUTH_METADATA, routedFetch } from './hubkit.ts';
+import { makeIo, OAUTH_METADATA, routedFetch, WHOAMI_BODY } from './hubkit.ts';
 import type { RouteHandler } from './hubkit.ts';
 
 const HUB = 'http://127.0.0.1:9';
@@ -28,6 +28,7 @@ function loginRoutes(overrides: Record<string, RouteHandler> = {}) {
       status: 200,
       json: { access_token: 'mcpat_access', refresh_token: 'rt_refresh', expires_in: 3600, token_type: 'Bearer' },
     }),
+    'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }),
     ...overrides,
   });
 }
@@ -58,10 +59,17 @@ test('login: loopback OAuth stores an oauth credential in the keychain', async (
   assert.equal(result.kind, 'oauth');
   assert.equal(result.storage, 'keychain');
   assert.equal(result.hub, ORIGIN);
+  assert.equal(result.org, WHOAMI_BODY.orgName);
+  assert.equal(result.orgId, WHOAMI_BODY.orgId);
+  assert.deepEqual(result.identity, WHOAMI_BODY.actor);
 
   const stored = JSON.parse(t.store.get(ORIGIN)!) as Credential;
   assert.equal(stored.kind, 'oauth');
   assert.equal(stored.accessToken, 'mcpat_access');
+
+  // Verified against GET /api/whoami with the exchanged token before storing.
+  const verify = calls.find((c) => c.pathname === '/api/whoami')!;
+  assert.equal(verify.authorization, 'Bearer mcpat_access');
 
   // DCR carried the exact loopback redirect URI, token_endpoint_auth_method:none.
   const dcr = calls.find((c) => c.pathname === '/mcp/register')!;
@@ -121,7 +129,7 @@ test('login: consent denied (error=access_denied) aborts', async () => {
 
 test('login --with-token: reads an olp_ agent token from stdin, verifies, and stores it', async () => {
   const { fetch, calls } = routedFetch({
-    'GET /api/workflows': () => ({ status: 200, json: { workflows: [] } }),
+    'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }),
   });
   const t = makeIo({ fetch, stdin: '  olp_org_secret\n' });
 
@@ -130,18 +138,20 @@ test('login --with-token: reads an olp_ agent token from stdin, verifies, and st
 
   const result = JSON.parse(t.out.join('\n'));
   assert.equal(result.kind, 'agent');
+  assert.equal(result.org, WHOAMI_BODY.orgName);
+  assert.equal(result.orgId, WHOAMI_BODY.orgId);
   const stored = JSON.parse(t.store.get(ORIGIN)!) as Credential;
   assert.equal(stored.accessToken, 'olp_org_secret');
 
-  // Verified via GET /api/workflows before storing, with the bearer token.
-  const verify = calls.find((c) => c.pathname === '/api/workflows')!;
+  // Verified via GET /api/whoami before storing, with the bearer token.
+  const verify = calls.find((c) => c.pathname === '/api/whoami')!;
   assert.equal(verify.authorization, 'Bearer olp_org_secret');
   assert.doesNotMatch(t.out.join('\n') + t.err.join('\n'), /olp_org_secret/);
 });
 
 test('login --with-token: an unverifiable token (401) is not stored', async () => {
   const { fetch } = routedFetch({
-    'GET /api/workflows': () => ({ status: 401, json: { error: 'invalid' } }),
+    'GET /api/whoami': () => ({ status: 401, json: { error: 'invalid' } }),
   });
   const t = makeIo({ fetch, stdin: 'olp_bad' });
 
@@ -149,6 +159,16 @@ test('login --with-token: an unverifiable token (401) is not stored', async () =
   assert.equal(code, 1);
   assert.match(t.err.join('\n'), /revoked or invalid/);
   assert.equal(t.store.size, 0);
+});
+
+test('login: OAuth loopback exchange succeeds but whoami 401s — credential is not stored', async () => {
+  const { fetch } = loginRoutes({ 'GET /api/whoami': () => ({ status: 401, json: { error: 'invalid' } }) });
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /credential rejected/);
+  assert.equal(t.store.size, 0, 'never store an unverified oauth token');
 });
 
 test('login --with-token: an unrecognized token prefix is rejected before any network call', async () => {
@@ -163,7 +183,7 @@ test('login --with-token: an unrecognized token prefix is rejected before any ne
 
 test('logout: deletes the credential from the keychain', async () => {
   const { fetch } = routedFetch({
-    'GET /api/workflows': () => ({ status: 200, json: { workflows: [] } }),
+    'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }),
   });
   const t = makeIo({ fetch, stdin: 'olp_tok' });
   await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
@@ -178,7 +198,7 @@ test('logout: deletes the credential from the keychain', async () => {
 
 test('logout: also deletes the FILE-side credential (OWENLOOP_NO_KEYCHAIN)', async () => {
   const { fetch } = routedFetch({
-    'GET /api/workflows': () => ({ status: 200, json: { workflows: [] } }),
+    'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }),
   });
   const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' }, stdin: 'olp_tok' });
   await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);

@@ -556,21 +556,29 @@ export function hashDef(def: WorkflowDef): string {
 }
 
 /**
- * Portable content hash of a `WorkflowDef`, for the hub CLI's push-idempotency
- * ledger (`.owenloop/hub.json`). Unlike `hashDef` (used for engine instance-to-
- * definition pinning, where the def's on-disk identity is exactly the point),
- * this hash must be stable across checkouts — the same workflow content
- * checked out at a different absolute path, or on a different machine, must
- * hash identically so the committed ledger doesn't churn. `dir` (source
- * directory, if loaded from disk) is the only absolute-path-bearing field on
- * `WorkflowDef` — audited against every place a path is written into a def
- * (buildDef's `source`/`baseDir` params are only used to resolve/read
- * `bodyFile` content, never stored as a path; `loadDefs`/`loadDefsRaw` set
- * only `def.dir`) — so it is the only field stripped before hashing.
+ * Reproduce the hub service's def content hash for the CLI `push` diff
+ * (`owenloop-service` `apps/hub-edge/README.md`, "Hub API parity for CLI"):
+ * `sha256(JSON.stringify(parseDef(YAML.parse(yaml))))` sliced to 16 hex
+ * chars, computed with **no `baseDir`** — the compiled def (defaults filled),
+ * exactly as the server computes it when it has no stored `defs` row. Taking
+ * no `baseDir` is deliberate, not an oversight: it means `parseDef` throws a
+ * `DefError` on any def using `bodyFile:` ("bodyFile requires a workflow
+ * loaded from disk"), which is exactly the server's own limitation — such a
+ * def can't be pushed as raw YAML anyway, so the caller should catch that and
+ * refuse the push with a clear reason, the same way it already refuses an
+ * `include:` def.
+ *
+ * Stable only per pinned engine version: the service pins its `parseDef`/
+ * `hashDef` lineage to a specific commit (`VENDORED_SHA`). As of writing that
+ * commit is an ancestor of this repo's `HEAD` with no changes to
+ * `parseDef`/`buildDef`/`hashDef` in between, so a locally computed hash
+ * currently matches the server's — but a future engine default change could
+ * make them drift. A drifted hash reads as `changed`, not an error: pushing
+ * converges state, because the server's own idempotent `create_workflow`
+ * still recognizes byte-identical content and replies `unchanged: true`.
  */
-export function hashDefContent(def: WorkflowDef): string {
-  const { dir, ...rest } = def;
-  return createHash('sha256').update(JSON.stringify(rest)).digest('hex').slice(0, 16);
+export function hashDefForHub(yaml: string): string {
+  return hashDef(parseDef(parseYaml(yaml)));
 }
 
 /**

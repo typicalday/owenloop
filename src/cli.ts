@@ -44,7 +44,7 @@ import { Engine } from './engine.ts';
 import { buildGraph, buildTrace, graphToDot, graphToMermaid, modelCheck } from './model.ts';
 import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
-import { buildDef, DefError, hashDef, hashDefContent, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
+import { buildDef, DefError, hashDefForHub, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 import { detId, nowMs, parseDurationMs } from './util.ts';
@@ -60,11 +60,13 @@ import {
 import type { InstalledEntry } from './add.ts';
 import {
   asCreateWorkflowOk,
-  computePushDiff,
+  asWhoami,
+  computeServerDiff,
   createWorkflowError,
   credentialFilePath,
   hubBindingPath,
   normalizeOrigin,
+  parseWorkflowList,
   pkcePair,
   randomState,
   readCredentialFile,
@@ -73,7 +75,7 @@ import {
   writeCredentialFile,
   writeHubBinding,
 } from './hub.ts';
-import type { Credential, DefPushCandidate, HubBinding } from './hub.ts';
+import type { Credential, DefPushCandidate, HubBinding, WhoamiIdentity } from './hub.ts';
 
 /** An OS keychain backend, keyed by hub origin (the `account`). */
 export interface Keychain {
@@ -350,10 +352,10 @@ Usage: owenloop <command> [args] [--db <path>] [--defs <dir>]
 Commands:
   defs                                   list available workflow definitions
   add <owner>/<repo>[@ref]               fetch, validate, and install a repo's workflow defs (public repos)
-  login [--hub <url>] [--with-token]     authenticate the CLI against a hub (loopback OAuth, or --with-token from stdin)
+  login [--hub <url>] [--with-token]     authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
   logout [--hub <url>]                   delete the stored credential for a hub
-  connect [--hub <url>]                  bind this project to a hub and verify the stored credential
-  push [<defName>...] [--force] [--dry-run]   publish local workflow defs to the bound hub (idempotent)
+  connect [--hub <url>]                  bind this project to a hub and verify the stored credential (whoami)
+  push [<defName>...] [--force] [--dry-run]   publish local workflow defs to the bound hub (server-diffed, idempotent)
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided]
                                          bounded reachability check (deadlocks, stuck, dead steps, declared invariants)
@@ -1206,16 +1208,27 @@ function authHeader(cred: Credential): string {
  * for `agent`/`oauth-pasted` credentials (they don't refresh). Returns the
  * possibly-updated credential.
  */
-async function ensureFreshOAuth(io: CliIO, origin: string, cred: Credential): Promise<Credential> {
+async function ensureFreshOAuth(io: CliIO, origin: string, cred: Credential, persist = true): Promise<Credential> {
   if (cred.kind !== 'oauth') return cred;
   if (cred.expiresAt - nowMs() > 60_000) return cred;
-  return refreshOAuth(io, origin, cred);
+  return refreshOAuth(io, origin, cred, persist);
 }
 
+/**
+ * `persist` defaults to true — the normal case is refreshing an ALREADY
+ * stored, trusted credential (push/connect), where persisting immediately
+ * matters because refresh tokens can be single-use/rotating: losing the new
+ * one to a later crash would strand the user. `verifyCredential`'s login-time
+ * use passes `persist: false` — a not-yet-stored credential must never be
+ * written to disk/keychain before it is proven to work end to end (a 401 on
+ * the retry after this refresh still fails the overall login), matching the
+ * "never store an unverified token" rule enforced at every login call site.
+ */
 async function refreshOAuth(
   io: CliIO,
   origin: string,
   cred: Extract<Credential, { kind: 'oauth' }>,
+  persist = true,
 ): Promise<Credential> {
   const fetchFn = io.fetch ?? globalThis.fetch;
   const tokenEndpoint = await discoverTokenEndpoint(io, origin);
@@ -1244,7 +1257,7 @@ async function refreshOAuth(
     expiresAt: nowMs() + expiresIn * 1000,
     clientId: cred.clientId,
   };
-  storeCredential(io, origin, refreshed);
+  if (persist) storeCredential(io, origin, refreshed);
   return refreshed;
 }
 
@@ -1272,26 +1285,44 @@ async function discoverTokenEndpoint(io: CliIO, origin: string): Promise<string>
 }
 
 /**
- * Verify a credential works against the hub's `GET /api/workflows` (any 2xx =
- * good; also proves the token's `list` scope). Refreshes an expiring oauth
- * token first, and retries exactly once after a 401→refresh for oauth; a 401 on
- * an agent token is a hard "revoked/invalid" error. Returns the credential
- * actually used (possibly refreshed), so the caller can persist it.
+ * GET `path` on `origin` with a bearer credential, refreshing an expiring
+ * oauth token first and retrying exactly once after a 401→refresh for oauth.
+ * Returns the raw response plus the credential actually used (possibly
+ * refreshed), so the caller can both persist it and apply its own hard-error
+ * semantics on the final status (a 401 after the retry, a non-2xx, etc. —
+ * left to the caller since the wording differs slightly by context).
  */
-async function verifyCredential(io: CliIO, origin: string, cred: Credential): Promise<Credential> {
+async function authedGet(
+  io: CliIO,
+  origin: string,
+  cred: Credential,
+  path: string,
+  persist = true,
+): Promise<{ res: Response; cred: Credential }> {
   const fetchFn = io.fetch ?? globalThis.fetch;
-  let current = await ensureFreshOAuth(io, origin, cred);
-  let res = await fetchFn(resolveEndpoint(origin, '/api/workflows'), {
+  let current = await ensureFreshOAuth(io, origin, cred, persist);
+  let res = await fetchFn(resolveEndpoint(origin, path), {
     headers: { Authorization: authHeader(current), Accept: 'application/json' },
   });
   if (res.status === 401 && current.kind === 'oauth') {
-    current = await refreshOAuth(io, origin, current as Extract<Credential, { kind: 'oauth' }>);
-    res = await fetchFn(resolveEndpoint(origin, '/api/workflows'), {
+    current = await refreshOAuth(io, origin, current as Extract<Credential, { kind: 'oauth' }>, persist);
+    res = await fetchFn(resolveEndpoint(origin, path), {
       headers: { Authorization: authHeader(current), Accept: 'application/json' },
     });
   }
+  return { res, cred: current };
+}
+
+/**
+ * A 401 on an agent token is a hard "revoked/invalid" error; a 401 on any
+ * other credential kind (after `authedGet`'s one refresh-and-retry) is a hard
+ * "credential rejected" error; any other non-2xx is a generic hub-rejected
+ * error naming the status. Shared by `verifyCredential` and `dispatchPush`'s
+ * server-list fetch so both surfaces the same wording for the same failure.
+ */
+function assertAuthOk(res: Response, cred: Credential, origin: string): void {
   if (res.status === 401) {
-    if (current.kind === 'agent') {
+    if (cred.kind === 'agent') {
       throw new CliError('token revoked or invalid — re-mint it in the console or run `owenloop login`');
     }
     throw new CliError('credential rejected by the hub — run `owenloop login`');
@@ -1299,7 +1330,35 @@ async function verifyCredential(io: CliIO, origin: string, cred: Credential): Pr
   if (!res.ok) {
     throw new CliError(`hub ${origin} rejected the credential (HTTP ${res.status})`);
   }
-  return current;
+}
+
+/**
+ * Verify a credential works against the hub's `GET /api/whoami` (any 2xx =
+ * authenticated) and return the identity it names. Whoami carries no RBAC
+ * verb, so this proves *authentication*, not any particular scope (e.g.
+ * `list`) — a token lacking a scope `push` later needs still fails there,
+ * with the hub's own 401/403, which is acceptable and honest. Refreshes an
+ * expiring oauth token first, and retries exactly once after a 401→refresh
+ * for oauth; a 401 on an agent token is a hard "revoked/invalid" error.
+ * Returns the credential actually used (possibly refreshed), so the caller
+ * can persist it, alongside the parsed identity.
+ *
+ * `persist` (default true) controls whether an in-flight refresh writes its
+ * new token to storage immediately (see `refreshOAuth`'s doc comment) —
+ * `dispatchLogin`'s OAuth branch passes `false` because the credential being
+ * verified here hasn't been stored yet at all; a refresh mid-verify must not
+ * sneak a not-yet-proven credential onto disk ahead of the pass/fail verdict.
+ */
+async function verifyCredential(
+  io: CliIO,
+  origin: string,
+  cred: Credential,
+  persist = true,
+): Promise<{ cred: Credential; identity: WhoamiIdentity }> {
+  const { res, cred: current } = await authedGet(io, origin, cred, '/api/whoami', persist);
+  assertAuthOk(res, current, origin);
+  const body: unknown = await res.json();
+  return { cred: current, identity: asWhoami(body) };
 }
 
 /**
@@ -1321,7 +1380,7 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
     if (token.startsWith('olp_')) cred = { kind: 'agent', accessToken: token };
     else if (token.startsWith('mcpat_')) cred = { kind: 'oauth-pasted', accessToken: token };
     else throw new CliError('unrecognized token — expected an `olp_` agent token or an `mcpat_` access token');
-    await verifyCredential(io, origin, cred); // never store an unverified token
+    const { identity } = await verifyCredential(io, origin, cred); // never store an unverified token
     const storage = storeCredential(io, origin, cred);
     print(io, {
       ok: true,
@@ -1329,7 +1388,10 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
       kind: cred.kind,
       storage,
       replaced: existed,
-      note: 'authenticated; org details are visible in the hub console (no whoami endpoint yet)',
+      org: identity.orgName,
+      orgId: identity.orgId,
+      identity: identity.actor,
+      ...(identity.email ? { email: identity.email } : {}),
     });
     return 0;
   }
@@ -1363,12 +1425,13 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
 
     const { code } = await waitForCallback;
 
-    const cred = await exchangeCode(io, origin, meta.token_endpoint, {
+    const exchanged = await exchangeCode(io, origin, meta.token_endpoint, {
       code,
       clientId,
       redirectUri,
       verifier,
     });
+    const { cred, identity } = await verifyCredential(io, origin, exchanged, false); // never store an unverified token
     const storage = storeCredential(io, origin, cred);
     print(io, {
       ok: true,
@@ -1376,7 +1439,10 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
       kind: cred.kind,
       storage,
       replaced: existed,
-      note: 'authenticated; org details are visible in the hub console (no whoami endpoint yet)',
+      org: identity.orgName,
+      orgId: identity.orgId,
+      identity: identity.actor,
+      ...(identity.email ? { email: identity.email } : {}),
     });
     return 0;
   } finally {
@@ -1550,38 +1616,46 @@ async function dispatchLogout(io: CliIO, args: Args): Promise<number> {
 /**
  * `owenloop connect` — bind the current project to a hub (writes
  * `.owenloop/hub.json`) and verify the stored credential works. Requires a
- * prior `owenloop login` for the resolved origin. Preserves existing push
- * state when re-binding the same origin; resets it when switching hubs.
+ * prior `owenloop login` for the resolved origin. `.owenloop/hub.json` is a
+ * pure binding — there's no push state to preserve or reset across a rebind
+ * (see `HubBinding`); `switchedFrom` is still reported when the origin
+ * changes so the caller notices the rebind.
  */
 async function dispatchConnect(io: CliIO, args: Args): Promise<number> {
   const origin = resolveHub(io, args);
   const cred = readCredential(io, origin);
   if (!cred) throw new CliError(`no stored credential for ${origin} — run \`owenloop login\` first`);
 
-  await verifyCredential(io, origin, cred);
+  const { identity } = await verifyCredential(io, origin, cred);
 
   const path = hubBindingPath(io.cwd);
   const existing = readHubBinding(path);
-  const pushed = existing && existing.hub === origin ? existing.pushed : {};
   const switched = existing !== null && existing.hub !== origin;
-  const binding: HubBinding = { version: 1, hub: origin, pushed };
+  const binding: HubBinding = { version: 1, hub: origin };
   writeHubBinding(path, binding);
 
   print(io, {
     ok: true,
     hub: origin,
-    ...(switched ? { switchedFrom: existing!.hub, pushStateReset: true } : {}),
-    note: 'connected; org details are visible in the hub console (no whoami endpoint yet)',
+    ...(switched ? { switchedFrom: existing!.hub } : {}),
+    org: identity.orgName,
+    orgId: identity.orgId,
+    identity: identity.actor,
+    ...(identity.email ? { email: identity.email } : {}),
   });
   return 0;
 }
 
 /**
  * `owenloop push [<defName>...] [--force] [--dry-run]` — publish local workflow
- * defs to the bound hub, idempotent by client-side push state (the service is
- * append-only, so unchanged defs are skipped here, never re-versioned). Mirrors
- * `add`'s all-or-nothing client-side validation gate before any network write;
- * server-side failures mid-batch record what landed and exit 1.
+ * defs to the bound hub, diffed against the hub's own def `hash`
+ * (`GET /api/workflows` — see `computeServerDiff`), never a client-side
+ * ledger. Mirrors `add`'s all-or-nothing client-side validation gate before
+ * any network write; server-side failures mid-batch record what landed and
+ * exit 1. `POST /api/create_workflow` is itself idempotent, so even a wrong
+ * "changed" verdict (e.g. from engine-version drift between this CLI and the
+ * hub) is harmless — it just costs one extra round-trip that the server
+ * reports back as a no-op.
  */
 async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
@@ -1648,10 +1722,15 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     }
   }
 
-  // Assemble the push candidates: verbatim source yaml + content hash. Defs
-  // whose file uses include: are not hub-pushable (the service's create_workflow
-  // parses without include expansion, and a re-serialized expanded def is not
-  // round-trippable) — refuse them with a clear per-def reason.
+  // Assemble the push candidates: verbatim source yaml + the server-canonical
+  // content hash (hashDefForHub). Defs whose file uses include: are not
+  // hub-pushable (the service's create_workflow parses without include
+  // expansion, and a re-serialized expanded def is not round-trippable) —
+  // refuse them with a clear per-def reason. Same for bodyFile: — hashDefForHub
+  // parses with no baseDir (matching the server's own computation), which
+  // throws a DefError naming bodyFile for such a def; catch that specific
+  // failure and refuse the def pre-push rather than letting it read as a
+  // generic error (the server would reject the raw-YAML push anyway).
   const candidates: DefPushCandidate[] = [];
   for (const def of selected) {
     if (!def.dir) {
@@ -1671,11 +1750,17 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       reasons.push(`${def.name}: uses include:, not hub-pushable yet`);
       continue;
     }
-    // `hash` is the portable content hash (stable across checkouts — see
-    // hashDefContent); `legacyHash` is the old checkout-specific hashDef value,
-    // carried alongside so computePushDiff can recognize and migrate a
-    // pre-portability ledger entry without a spurious re-push.
-    candidates.push({ name: def.name, hash: hashDefContent(def), legacyHash: hashDef(def), yaml });
+    let hash: string;
+    try {
+      hash = hashDefForHub(yaml);
+    } catch (e) {
+      if (e instanceof DefError && /bodyFile/.test(e.message)) {
+        reasons.push(`${def.name}: uses bodyFile:, not hub-pushable`);
+        continue;
+      }
+      throw e;
+    }
+    candidates.push({ name: def.name, hash, yaml });
   }
 
   if (reasons.length > 0) {
@@ -1684,39 +1769,37 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     );
   }
 
-  const { toPush, unchanged, migrated } = computePushDiff(candidates, binding.pushed, force);
+  // Fetch the server's own list once — the diff source of truth. Always
+  // fetched, even under --force, so the new/changed labels stay accurate.
+  const { res: listRes, cred: listCred } = await authedGet(io, origin, cred, '/api/workflows');
+  assertAuthOk(listRes, listCred, origin);
+  cred = listCred;
+  let serverMap: Map<string, ReturnType<typeof parseWorkflowList> extends Map<string, infer V> ? V : never>;
+  try {
+    serverMap = parseWorkflowList(await listRes.json());
+  } catch (e) {
+    throw new CliError((e as Error).message);
+  }
+
+  const { toPush, unchanged } = computeServerDiff(candidates, serverMap, force);
 
   // Diff-style human lines go to stderr so stdout stays machine-parseable JSON.
   for (const c of unchanged) io.err(`= ${c.name} (unchanged)`);
 
   if (dryRun) {
     for (const c of toPush) {
-      const prior = binding.pushed[c.name];
-      io.err(prior ? `~ ${c.name} (changed)` : `+ ${c.name} (new)`);
+      io.err(c.status === 'new' ? `+ ${c.name} (new)` : `~ ${c.name} (changed)`);
     }
     print(io, {
       ok: true,
       dryRun: true,
       hub: origin,
-      wouldPush: toPush.map((c) => c.name),
+      new: toPush.filter((c) => c.status === 'new').map((c) => c.name),
+      changed: toPush.filter((c) => c.status === 'changed').map((c) => c.name),
       unchanged: unchanged.map((c) => c.name),
+      wouldPush: toPush.map((c) => c.name),
     });
     return 0;
-  }
-
-  // Silent one-time ledger migration: entries matched only via the legacy
-  // (checkout-specific) hash get their `localHash` rewritten to the portable
-  // content hash — zero network calls, done once before the push loop so a
-  // same-checkout upgrade never triggers a spurious re-push (the legacy hash
-  // recomputes identically since def.dir hasn't changed). A foreign checkout
-  // with an old-format ledger mismatches both hashes and falls into `toPush`
-  // instead — exactly one forced re-push, after which the ledger is portable.
-  if (migrated.length > 0) {
-    for (const c of migrated) {
-      const prior = binding.pushed[c.name];
-      if (prior) binding.pushed[c.name] = { ...prior, localHash: c.hash };
-    }
-    writeHubBinding(bindingPath, binding);
   }
 
   // Refresh an expiring oauth token once up front (per-request 401 refresh below covers mid-batch expiry).
@@ -1724,11 +1807,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
 
   const fetchFn = io.fetch ?? globalThis.fetch;
   const pushedNames: string[] = [];
+  const noopNames: string[] = [];
   const failed: { name: string; error: string }[] = [];
 
   for (const c of toPush) {
-    const prior = binding.pushed[c.name];
-    const label = prior ? '~' : '+';
+    const label = c.status === 'new' ? '+' : '~';
     try {
       let res = await createWorkflowRequest(fetchFn, origin, cred, c.yaml);
       if (res.status === 401 && cred.kind === 'oauth') {
@@ -1753,15 +1836,13 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       if (errText !== null) throw new CliError(`hub rejected the def: ${errText}`);
 
       const okBody = asCreateWorkflowOk(bodyJson);
-      binding.pushed[c.name] = {
-        localHash: c.hash,
-        remoteVersion: okBody.version,
-        remoteHash: okBody.hash,
-        pushedAt: nowMs(),
-      };
-      writeHubBinding(bindingPath, binding); // persist incrementally — never lose a landed push
-      pushedNames.push(c.name);
-      io.err(`${label} ${c.name} (→ v${okBody.version})`);
+      if (okBody.unchanged) {
+        noopNames.push(c.name);
+        io.err(`= ${c.name} (server: unchanged, v${okBody.version})`);
+      } else {
+        pushedNames.push(c.name);
+        io.err(`${label} ${c.name} (→ v${okBody.version})`);
+      }
     } catch (e) {
       // A hard auth error aborts the whole run (re-throw); a per-def server
       // failure is recorded and the batch continues (already-pushed defs stand).
@@ -1778,6 +1859,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     ok: failed.length === 0,
     hub: origin,
     pushed: pushedNames,
+    noop: noopNames,
     unchanged: unchanged.map((c) => c.name),
     failed,
   });
