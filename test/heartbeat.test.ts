@@ -17,7 +17,7 @@ import { def, input, step } from './helpers.ts';
  * Create an engine over an in-memory store.
  * The proposal input seeds as green automatically (seedOwed defaults to false).
  */
-function makeEngine(d: WorkflowDef, opts: { reapTtlMs?: number } = {}): {
+function makeEngine(d: WorkflowDef, opts: { reapTtlMs?: number; maxLeaseMs?: number } = {}): {
   engine: Engine;
   store: Store;
   wf: string;
@@ -250,4 +250,121 @@ test('engine.reapWithDetails: reports reaped step/key/run, and ttlOverride:0 for
     () => engine.green(wf, R1, 'plan', { v: 1 }),
     /no longer holds its lease|reaped or superseded/,
   );
+});
+
+// ---- A3: max-lease clamp ------------------------------------------------------
+
+// A3-1: a beat just inside claimedAt + maxLease keeps the lease fresh.
+test('maxLease: beat just inside claimedAt + maxLease is still fresh', () => {
+  // TTL huge so the anchor rule never bites; maxLease is the only bound.
+  const { engine, wf } = makeEngine(deliveryDef, { reapTtlMs: 1_000_000, maxLeaseMs: 1000 });
+
+  const t0 = engine.tick(wf, { now: 0 });
+  assert.equal(t0.orders.length, 1);
+  const R1 = t0.orders[0]!.run;
+
+  engine.heartbeat(wf, R1, 900);
+  // t=950: 950ms since claim < 1000 maxLease → still fresh.
+  const t950 = engine.tick(wf, { now: 950 });
+  assert.equal(t950.reaped, 0, 'lease inside claimedAt + maxLease must stay fresh');
+});
+
+// A3-2: a recent beat cannot save a lease past claimedAt + maxLease; it is
+// reaped and re-claimable by a fresh run.
+test('maxLease: recent beat past claimedAt + maxLease is reaped and re-claimable', () => {
+  const { engine, wf } = makeEngine(deliveryDef, { reapTtlMs: 1_000_000, maxLeaseMs: 1000 });
+
+  const t0 = engine.tick(wf, { now: 0 });
+  const R1 = t0.orders[0]!.run;
+
+  // Beat at t=1100 — the write still succeeds (lease not yet reaped), but it
+  // cannot push total lifetime back under maxLease.
+  engine.heartbeat(wf, R1, 1100);
+
+  // t=1200: anchor-rule fresh (100ms since beat << TTL) but 1200ms since claim
+  // > 1000 maxLease → stale → reaped, and re-claimed in the same tick.
+  const t1200 = engine.tick(wf, { now: 1200 });
+  assert.equal(t1200.reaped, 1, 'lease past claimedAt + maxLease is stale despite a recent beat');
+  assert.equal(t1200.orders.length, 1, 'the step is re-claimable by a new run');
+  const R2 = t1200.orders[0]!.run;
+  assert.notEqual(R2, R1);
+
+  // The old run no longer holds its lease.
+  assert.throws(
+    () => engine.heartbeat(wf, R1, 1300),
+    /no longer holds its lease|reaped or superseded/,
+  );
+});
+
+// A3-3: per-step maxLeaseMs override SHORTER than the engine default wins.
+test('maxLease: per-step override shorter than engine default — reaped at step maxLease', () => {
+  const shortDef = def(
+    'delivery',
+    [input('proposal')],
+    [step({ name: 'planner', consumes: ['proposal'], produces: ['plan'], maxLeaseMs: 1000 })],
+  );
+  const { engine, wf } = makeEngine(shortDef, { reapTtlMs: 1_000_000, maxLeaseMs: 5000 });
+
+  const t0 = engine.tick(wf, { now: 0 });
+  assert.equal(t0.orders.length, 1);
+
+  // t=1200: past step maxLease (1000) but before engine maxLease (5000).
+  const t1200 = engine.tick(wf, { now: 1200 });
+  assert.equal(t1200.reaped, 1, 'reaped at step maxLease (1000), not engine maxLease (5000)');
+});
+
+// A3-4: per-step maxLeaseMs override LONGER than a short engine default wins.
+test('maxLease: per-step override longer than engine default — not reaped before step maxLease', () => {
+  const longDef = def(
+    'delivery',
+    [input('proposal')],
+    [step({ name: 'planner', consumes: ['proposal'], produces: ['plan'], maxLeaseMs: 2000 })],
+  );
+  const { engine, wf } = makeEngine(longDef, { reapTtlMs: 1_000_000, maxLeaseMs: 500 });
+
+  const t0 = engine.tick(wf, { now: 0 });
+  assert.equal(t0.orders.length, 1);
+
+  // t=800: past engine maxLease (500) but before step maxLease (2000).
+  const t800 = engine.tick(wf, { now: 800 });
+  assert.equal(t800.reaped, 0, 'not reaped at engine maxLease (500) when step maxLease is 2000');
+});
+
+// A3-5: after a reap + re-claim, the clamp re-anchors to the NEW claimedAt.
+test('maxLease: clamp re-anchors to the new claim after reap + re-claim', () => {
+  const { engine, wf } = makeEngine(deliveryDef, { reapTtlMs: 1_000_000, maxLeaseMs: 1000 });
+
+  const t0 = engine.tick(wf, { now: 0 });
+  const R1 = t0.orders[0]!.run;
+
+  // t=1200: R1 past maxLease → reaped, R2 claimed at claimedAt=1200.
+  const t1200 = engine.tick(wf, { now: 1200 });
+  assert.equal(t1200.reaped, 1);
+  const R2 = t1200.orders[0]!.run;
+  assert.notEqual(R2, R1);
+
+  // t=1900: only 700ms since R2's claim (< 1000 maxLease) → fresh, not reaped.
+  const t1900 = engine.tick(wf, { now: 1900 });
+  assert.equal(t1900.reaped, 0, 'clamp re-anchored to R2 claimedAt=1200, so R2 is fresh at t=1900');
+
+  // t=2300: 1100ms since R2's claim (> 1000 maxLease) → stale again.
+  const t2300 = engine.tick(wf, { now: 2300 });
+  assert.equal(t2300.reaped, 1, 'R2 crosses its own claimedAt + maxLease');
+});
+
+// A3-6: the default max lease is ~1h when nothing is set.
+test('maxLease: defaults to ~1h when unset', () => {
+  const hourMs = 60 * 60 * 1000;
+  // No maxLeaseMs opt → engine default 1h. Default reapTtl (2h) leaves the
+  // anchor rule slack so maxLease is the binding bound.
+  const inside = makeEngine(deliveryDef);
+  inside.engine.tick(inside.wf, { now: 0 });
+  const stillFresh = inside.engine.tick(inside.wf, { now: hourMs - 1000 });
+  assert.equal(stillFresh.reaped, 0, 'inside the 1h default lease is fresh');
+
+  const past = makeEngine(deliveryDef);
+  past.engine.tick(past.wf, { now: 0 });
+  // t just past 1h but well under the 2h reap TTL → maxLease is what reaps it.
+  const stale = past.engine.tick(past.wf, { now: hourMs + 1000 });
+  assert.equal(stale.reaped, 1, 'past the 1h default lease is stale even under the 2h TTL');
 });

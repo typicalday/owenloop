@@ -246,6 +246,39 @@ test('tick --now (space form) is a boolean flag now, not a value — non-numeric
   assert.match(eqForm.err, /invalid value for --now/);
 });
 
+test('tick --label passes the caller filter through to the engine (A2)', () => {
+  // A temp def dir with two steps, one labeled 'claude', one 'codex'.
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-labels-'));
+  writeFileSync(
+    join(defsDir, 'labeltest.yaml'),
+    [
+      'name: labeltest',
+      'steps:',
+      '  - name: alpha',
+      '    consumes: [seed]',
+      '    produces: [a]',
+      '    labels: [claude]',
+      '  - name: beta',
+      '    consumes: [seed]',
+      '    produces: [b]',
+      '    labels: [codex]',
+      'inputs:',
+      '  - name: seed',
+      '    seedOwed: true',
+      '',
+    ].join('\n'),
+  );
+  const { run } = makeCli({ defs: defsDir });
+  const wf = run('create', 'labeltest', '--provide', `seed=${J({})}`).json().workflow;
+
+  // A caller serving only 'claude' claims alpha, defers beta as label-mismatch.
+  const t = run('tick', wf, '--label', 'claude').json();
+  assert.deepEqual(t.orders.map((o: any) => o.step), ['alpha'], 'only the matching-label step is claimed');
+  const mismatch = t.deferred.find((d: any) => d.reason === 'label-mismatch');
+  assert.ok(mismatch, 'the disjoint step is reported label-mismatch');
+  assert.equal(mismatch.step, 'beta');
+});
+
 test('heartbeat --now=<non-numeric> is rejected, not silently NaN', () => {
   const { run } = makeCli();
   const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;

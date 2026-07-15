@@ -363,7 +363,7 @@ Commands:
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
   adopt <wf>                             re-pin an instance to the current def (§28); settles new debts
-  tick <wf> [--now <ms>] [--shallow]     pull eligible orders (deep: also from calls: children; --shallow for this instance only)
+  tick <wf> [--now <ms>] [--shallow] [--label <l>]...  pull eligible orders (deep: also from calls: children; --shallow for this instance only; --label filters to matching-label steps)
   reap <wf> [--now]                      run the reaper; --now forces every claim stale (TTL 0)
   runs <wf> [--open]                     list this instance's runs (+ claim state for open ones)
   order <wf> <run>                        print the order packet issued at claim time (persisted in the claim txn)
@@ -582,9 +582,13 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         const now = numOpt(args, 'now');
         // §23.6.8: tick is deep by default (descends into calls: children and
         // returns their orders too); --shallow restores single-instance ticking.
-        const tickOpts: { now?: number; deep?: boolean } = {};
+        const tickOpts: { now?: number; deep?: boolean; labels?: string[] } = {};
         if (now !== undefined) tickOpts.now = now;
         if (flag(args, 'shallow')) tickOpts.deep = false;
+        // A2: repeatable --label narrows the claim to steps whose labels
+        // intersect the caller's; absent = claim everything (today's behavior).
+        const labels = all(args, 'label');
+        if (labels.length > 0) tickOpts.labels = labels;
         print(io, engine.tick(wf, tickOpts));
         return 0;
       }

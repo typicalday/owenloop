@@ -295,7 +295,9 @@ looks like:
 - **Your own harness** — a `while` loop, a cron job, a CI stage: tick, run
   each order with whatever executes your work (an agent CLI, an API call, a
   script), report, repeat. Fully deterministic dispatch if you want it —
-  see [Embedding it](#embedding-it) for the in-process version.
+  see [Embedding it](#embedding-it) for the in-process version. A reference
+  dispatcher/conductor, owenwork, is available separately — the engine core
+  ships no host harness of its own.
 - **An agent as the orchestrator** — point any tool-using agent (Claude Code,
   Codex, Gemini CLI, anything that can run a shell command) at the CLI and
   tell it to drive the instance to done. A slash command or skill that wraps

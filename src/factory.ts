@@ -49,6 +49,9 @@ export interface CreateEngineOpts {
   defsDir?: string;
   /** Forwarded to the `Engine` — the stranded-lease reap TTL in milliseconds. */
   reapTtlMs?: number;
+  /** Forwarded to the `Engine` — the default max total lease lifetime in
+   *  milliseconds (A3). Per-step `maxLease` overrides it. */
+  maxLeaseMs?: number;
   /**
    * A push-style observer registered up front, equivalent to calling
    * `engine.subscribe` immediately after construction. Fires synchronously
@@ -92,10 +95,12 @@ export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
 
   const engineOpts: {
     reapTtlMs?: number;
+    maxLeaseMs?: number;
     onEvent?: EngineListener;
     onListenerError?: (err: unknown, event: EngineEvent) => void;
   } = {};
   if (opts.reapTtlMs !== undefined) engineOpts.reapTtlMs = opts.reapTtlMs;
+  if (opts.maxLeaseMs !== undefined) engineOpts.maxLeaseMs = opts.maxLeaseMs;
   if (opts.onEvent !== undefined) engineOpts.onEvent = opts.onEvent;
   if (opts.onListenerError !== undefined) engineOpts.onListenerError = opts.onListenerError;
 

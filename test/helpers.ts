@@ -32,6 +32,8 @@ export interface StepSpec {
   idleAfter?: string;
   idleAfterMs?: number;
   reapTtlMs?: number;
+  labels?: string[];
+  maxLeaseMs?: number;
   x?: Record<string, unknown>;
 }
 
@@ -56,6 +58,8 @@ export function step(spec: StepSpec): StepDef {
     ...(spec.idleAfter !== undefined ? { idleAfter: spec.idleAfter } : {}),
     ...(spec.idleAfterMs !== undefined ? { idleAfterMs: spec.idleAfterMs } : {}),
     ...(spec.reapTtlMs !== undefined ? { reapTtlMs: spec.reapTtlMs } : {}),
+    ...(spec.labels !== undefined ? { labels: spec.labels } : {}),
+    ...(spec.maxLeaseMs !== undefined ? { maxLeaseMs: spec.maxLeaseMs } : {}),
     ...(spec.groups !== undefined ? { groups: spec.groups } : {}),
     ...(spec.x !== undefined ? { x: spec.x } : {}),
     ...(spec.workdir !== undefined ? { workdir: spec.workdir } : {}),
