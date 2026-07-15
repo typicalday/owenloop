@@ -50,6 +50,17 @@ complete [the Corporate CLA](.github/CORPORATE-CLA.md) and send it to us.
 4. Open a pull request against `main`. CI runs on Node 22 and 24.
 5. Sign the CLA when prompted (see above).
 
+### The core/hub boundary
+
+The engine **core** (`src/engine.ts`, `model.ts`, `store.ts`, `defs.ts`,
+`schema.ts`, `types.ts`, `paths.ts`, `util.ts`, `factory.ts`) is host- and
+vendor-agnostic: it must not import the hub/CLI modules (`hub.ts`, `cli.ts`,
+`add.ts`, `untar.ts`) and must not name concrete providers or models (e.g.
+`claude`, `anthropic`, `openai`) — the engine speaks in opaque tiers, not
+brands. All hub/CLI coupling lives in `src/hub.ts` and `src/cli.ts`. This
+boundary is enforced automatically by `test/boundaries.test.ts` (part of
+`npm run check`), so a violating import or term fails the suite.
+
 ## Reporting bugs and proposing features
 
 Open an issue. For a security vulnerability, please **do not** open a public

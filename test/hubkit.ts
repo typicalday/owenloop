@@ -11,7 +11,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { hashDefForHub } from '../src/defs.ts';
+import { hashDefForHub } from '../src/hub.ts';
 import type { CliIO, Keychain } from '../src/cli.ts';
 
 export interface RouteResult {
