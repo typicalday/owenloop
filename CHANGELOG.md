@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/typicalday/owenloop/compare/v0.2.1...v0.3.0) (2026-07-15)
+
+
+### Features
+
+* re-home `hashDefForHub` into the hub-facing module (`src/hub.ts`) so the engine core carries no hub/CLI coupling, and add a test-based core/hub boundary lint (`test/boundaries.test.ts`)
+* deep tick drives calls: children; surface child stalls on parent status ([#20](https://github.com/typicalday/owenloop/issues/20)) ([b1cc889](https://github.com/typicalday/owenloop/commit/b1cc88935be32429b73d6b1dd123aafab0490cf3))
+* owenloop add &lt;owner&gt;/&lt;repo&gt;[@ref] — install workflow defs from GitHub ([#23](https://github.com/typicalday/owenloop/issues/23)) ([a74ea1c](https://github.com/typicalday/owenloop/commit/a74ea1cc63f0563e3d6a78d7588251280d27e4cc))
+* owenloop login/connect/push/logout — hub onboarding for the CLI ([#24](https://github.com/typicalday/owenloop/issues/24)) ([bedf856](https://github.com/typicalday/owenloop/commit/bedf856c7a5494ea6f16b3d6f39347790198c784))
+* CLI adopts hub parity — whoami-verified auth, server-truth push diff ([#27](https://github.com/typicalday/owenloop/issues/27)) ([e882c70](https://github.com/typicalday/owenloop/commit/e882c7065dcbd91647fce4cd508748fd6700967b))
+
+
+### Bug Fixes
+
+* guard status child summary against unresolvable child def; test dueAt min-fold ([#22](https://github.com/typicalday/owenloop/issues/22)) ([cb7ccd2](https://github.com/typicalday/owenloop/commit/cb7ccd2404f7477ed38d596321ec032c2e3756b5))
+* hub CLI hardening — portable push hash, boolean-flag parse, login timeout ([#25](https://github.com/typicalday/owenloop/issues/25)) ([c36e1b6](https://github.com/typicalday/owenloop/commit/c36e1b6d67a425c0af42b99b705e603f68aaad46))
+* CLI nits from PR #25 review — NaN flag guard, timeout message, stale comment ([#26](https://github.com/typicalday/owenloop/issues/26)) ([e438dcb](https://github.com/typicalday/owenloop/commit/e438dcb7b9709dcd31338565172caebeede5e5d9))
+
 ## [0.2.1](https://github.com/typicalday/owenloop/compare/v0.2.0...v0.2.1) (2026-07-04)
 
 

@@ -44,7 +44,7 @@ import { Engine } from './engine.ts';
 import { buildGraph, buildTrace, graphToDot, graphToMermaid, modelCheck } from './model.ts';
 import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
-import { buildDef, DefError, hashDefForHub, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
+import { buildDef, DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 import { detId, nowMs, parseDurationMs } from './util.ts';
@@ -64,6 +64,7 @@ import {
   computeServerDiff,
   createWorkflowError,
   credentialFilePath,
+  hashDefForHub,
   hubBindingPath,
   normalizeOrigin,
   parseWorkflowList,

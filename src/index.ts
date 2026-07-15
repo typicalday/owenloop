@@ -33,7 +33,8 @@ export type { CreateEngineOpts, CreatedEngine } from './factory.ts';
 export { Store, openStore, StoreVersionError } from './store.ts';
 export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
 
-export { buildDef, DefError, expandIncludes, hashDef, hashDefForHub, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
+export { buildDef, DefError, expandIncludes, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
+export { hashDefForHub } from './hub.ts';
 export type { DefLoadFailure } from './defs.ts';
 
 export {
