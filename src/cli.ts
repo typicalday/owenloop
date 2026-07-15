@@ -366,6 +366,7 @@ Commands:
   tick <wf> [--now <ms>] [--shallow]     pull eligible orders (deep: also from calls: children; --shallow for this instance only)
   reap <wf> [--now]                      run the reaper; --now forces every claim stale (TTL 0)
   runs <wf> [--open]                     list this instance's runs (+ claim state for open ones)
+  order <wf> <run>                        print the order packet issued at claim time (persisted in the claim txn)
   status <wf>                            derive debts / eligible / blocked
   status --all                           every instance's status in one call (fleet read)
   wait <wf> --until eligible|done [--timeout <dur>]   block until engine state matches
@@ -760,6 +761,16 @@ function dispatch(command: string, io: CliIO, args: Args): number {
             };
           });
         print(io, rows);
+        return 0;
+      }
+      case 'order': {
+        const wf = need(args, 1, 'workflow');
+        const run = need(args, 2, 'run');
+        const r = store.getRun(run);
+        if (!r) throw new CliError(`run not found: ${run}`);
+        if (r.workflow !== wf) throw new CliError(`run ${run} belongs to workflow ${r.workflow}, not ${wf}`);
+        if (r.order === undefined) throw new CliError(`run ${run} has no persisted order (created before order persistence, schema v7)`);
+        print(io, r.order);
         return 0;
       }
       case 'list': {

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { Store, StoreVersionError, artifactId, taskId } from '../src/store.ts';
 import { randId } from '../src/util.ts';
-import type { ArtifactData } from '../src/types.ts';
+import type { ArtifactData, Order } from '../src/types.ts';
 import { def, step } from './helpers.ts';
 
 function mem(): Store {
@@ -258,6 +258,92 @@ test('run cause round-trips through insert and update', () => {
   assert.equal(s.getRun(r2)?.cause, 'inputsGreen', 'cause survives updateRun');
 
   s.close();
+});
+
+function sampleOrder(over: Partial<Order> = {}): Order {
+  return {
+    run: 'run_sample',
+    workflow: 'wf_sample',
+    step: 'builder',
+    key: '',
+    inputs: ['proposal'],
+    outputs: ['pr'],
+    prompt: 'build the thing',
+    consumes: { proposal: { text: 'do it', n: 3 } },
+    owes: [{ path: 'pr', acceptance: 'owed', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+    ...over,
+  };
+}
+
+test('order packet round-trips through insertRun and getRun/listRuns', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const r1 = randId('run');
+  const order = sampleOrder({ run: r1, workflow: wf });
+
+  s.insertRun(r1, { workflow: wf, step: 'builder', order });
+  assert.deepStrictEqual(s.getRun(r1)?.order, order, 'order persists byte-for-byte through insertRun/getRun');
+
+  const [row] = s.listRuns(wf);
+  assert.deepStrictEqual(row?.order, order, 'order also present via listRuns');
+
+  s.close();
+});
+
+test('order packet is immutable: updateRun (close path) never clobbers it', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const r1 = randId('run');
+  const order = sampleOrder({ run: r1, workflow: wf });
+
+  s.insertRun(r1, { workflow: wf, step: 'builder', order });
+  // The close path writes outcome/summary — the order must survive untouched.
+  s.updateRun(r1, { outcome: 'ok', summary: 'done' });
+  assert.deepStrictEqual(s.getRun(r1)?.order, order, 'order intact after updateRun');
+  assert.equal(s.getRun(r1)?.outcome, 'ok');
+
+  s.close();
+});
+
+test('run inserted without an order has order undefined (no phantom field)', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const r1 = randId('run');
+  s.insertRun(r1, { workflow: wf, step: 'builder' });
+  assert.equal(s.getRun(r1)?.order, undefined, 'absent order stays absent');
+  s.close();
+});
+
+test('migration: a v6 DB missing order_json upgrades to v7 and legacy runs read order undefined', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-ordermig-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    const s1 = new Store(dbPath);
+    const legacy = randId('run');
+    s1.insertRun(legacy, { workflow: 'wf_legacy', step: 'builder' });
+    s1.close();
+
+    // Simulate a pre-v7 on-disk state: drop the column and stamp the old version.
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('ALTER TABLE run DROP COLUMN order_json');
+    raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('6', 'schema_version');
+    raw.close();
+
+    const s2 = new Store(dbPath); // migrate() must re-add order_json, bump to 7
+    assert.equal(s2.getMeta('schema_version'), '7', 'upgraded to current SCHEMA_VERSION');
+    const cols = (s2.db.prepare('PRAGMA table_info(run)').all() as Array<{ name: string }>).map((c) => c.name);
+    assert.ok(cols.includes('order_json'), 'order_json column re-added by migrate()');
+    assert.equal(s2.getRun(legacy)?.order, undefined, 'legacy run reads order undefined');
+
+    // And a fresh insert on the migrated DB round-trips an order.
+    const fresh = randId('run');
+    const order = sampleOrder({ run: fresh, workflow: 'wf_legacy' });
+    s2.insertRun(fresh, { workflow: 'wf_legacy', step: 'builder', order });
+    assert.deepStrictEqual(s2.getRun(fresh)?.order, order);
+    s2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('listRuns returns all runs for a workflow ordered by created_at, rowid', () => {
@@ -587,7 +673,7 @@ test('tx() BEGIN IMMEDIATE: second connection is blocked at BEGIN, not mid-write
 
 test('fresh database stamps schema_version to current SCHEMA_VERSION, no throw', () => {
   const s = mem();
-  assert.equal(s.getMeta('schema_version'), '6');
+  assert.equal(s.getMeta('schema_version'), '7');
   s.close();
 });
 
@@ -598,7 +684,7 @@ test('opening a DB already at current SCHEMA_VERSION is a no-op, no throw', () =
     const s1 = new Store(dbPath);
     s1.close();
     const s2 = new Store(dbPath); // reopen at same version — must not throw
-    assert.equal(s2.getMeta('schema_version'), '6');
+    assert.equal(s2.getMeta('schema_version'), '7');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -614,7 +700,7 @@ test('opening a DB with an older schema_version upgrades normally (regression gu
     s1.close();
 
     const s2 = new Store(dbPath); // must NOT throw
-    assert.equal(s2.getMeta('schema_version'), '6', 'upgrades to current SCHEMA_VERSION');
+    assert.equal(s2.getMeta('schema_version'), '7', 'upgrades to current SCHEMA_VERSION');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -627,17 +713,17 @@ test('opening a DB with a newer-than-binary schema_version throws StoreVersionEr
   try {
     // Create a normal DB, then simulate a newer binary having stamped it.
     const s1 = new Store(dbPath);
-    s1.setMeta('schema_version', '7');
+    s1.setMeta('schema_version', '8');
     s1.close();
 
-    // Reopening at this binary's SCHEMA_VERSION ('6') must refuse.
+    // Reopening at this binary's SCHEMA_VERSION ('7') must refuse.
     assert.throws(() => new Store(dbPath), StoreVersionError);
 
     // Direct raw read proves schema_version was NOT rewritten downward by
     // the throwing constructor.
     const raw = new DatabaseSync(dbPath);
     const row = raw.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
-    assert.equal(row.v, '7', 'schema_version must remain at the newer stamped value, never rewritten down');
+    assert.equal(row.v, '8', 'schema_version must remain at the newer stamped value, never rewritten down');
     raw.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -647,7 +733,7 @@ test('opening a DB with a newer-than-binary schema_version throws StoreVersionEr
 // Instance-to-definition pinning (§28): regression pair confirming the
 // SCHEMA_VERSION bump to '6' didn't weaken PR #48's downgrade guard — same
 // assertion shape as above, one version number up.
-test('§28: old-DB-upgrades-fine at the new SCHEMA_VERSION 6 (def_snapshot/def_hash columns present)', () => {
+test('§28: old-DB-upgrades-fine at the current SCHEMA_VERSION (def_snapshot/def_hash columns present)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-schemaver-'));
   const dbPath = join(dir, 'test.db');
   try {
@@ -656,7 +742,7 @@ test('§28: old-DB-upgrades-fine at the new SCHEMA_VERSION 6 (def_snapshot/def_h
     s1.close();
 
     const s2 = new Store(dbPath); // must NOT throw
-    assert.equal(s2.getMeta('schema_version'), '6');
+    assert.equal(s2.getMeta('schema_version'), '7');
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('def_snapshot'));
     assert.ok(cols.includes('def_hash'));
@@ -666,19 +752,19 @@ test('§28: old-DB-upgrades-fine at the new SCHEMA_VERSION 6 (def_snapshot/def_h
   }
 });
 
-test('§28: newer-than-binary (7) still refuses to open at SCHEMA_VERSION 6', () => {
+test('§28: newer-than-binary (9) still refuses to open at current SCHEMA_VERSION', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-schemaver-'));
   const dbPath = join(dir, 'test.db');
   try {
     const s1 = new Store(dbPath);
-    s1.setMeta('schema_version', '8');
+    s1.setMeta('schema_version', '9');
     s1.close();
 
     assert.throws(() => new Store(dbPath), StoreVersionError);
 
     const raw = new DatabaseSync(dbPath);
     const row = raw.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
-    assert.equal(row.v, '8', 'schema_version must remain at the newer stamped value, never rewritten down');
+    assert.equal(row.v, '9', 'schema_version must remain at the newer stamped value, never rewritten down');
     raw.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });

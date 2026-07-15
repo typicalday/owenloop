@@ -39,13 +39,15 @@ import type {
   ArtifactData,
   Author,
   JsonSchema,
+  Order,
   StepDef,
-  FiringTrigger,
   ReasonEntry,
   RejectKind,
   ReasonAction,
   WorkflowDef,
 } from './types.ts';
+
+export type { Order } from './types.ts';
 
 const DEFAULT_REAP_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 
@@ -67,46 +69,6 @@ export class SchemaRefusalError extends Error {
     this.inputName = inputName;
     this.issues = issues;
   }
-}
-
-/** A self-contained unit of work emitted by a tick. */
-export interface Order {
-  run: string;
-  workflow: string;
-  step: string;
-  key: string;
-  index?: number;
-  inputs: string[];
-  outputs: string[];
-  workdir?: string;
-  model?: string;
-  /** Declares which kind of executor this order is for. Absent = 'agent'
-   *  (today's behavior). Opaque to the engine; carried through verbatim from
-   *  the step definition, same pass-through contract as `model`/`x`. */
-  worker?: string;
-  /** The command string for a `worker: command` order. Opaque to the engine
-   *  — never parsed, never shelled out. */
-  command?: string;
-  /** Opaque config object for a non-agent/non-command worker type (or
-   *  alongside `command`). Carried through untouched, contents never read. */
-  spec?: Record<string, unknown>;
-  /** §27.3: the step's opaque `x:` extension map, carried through untouched
-   *  (same pass-through contract as `model`). The engine never reads it —
-   *  it exists for the external runner/tooling consuming this order. */
-  x?: Record<string, unknown>;
-  prompt: string;
-  /** captured handles of the green inputs this run builds on */
-  consumes: Record<string, unknown>;
-  /** the owed outputs and their accumulated reason threads (the feedback channel) */
-  owes: Array<{
-    path: string;
-    acceptance: string;
-    judgmentRejects: number;
-    schemaRejects: number;
-    reasons: ReasonEntry[];
-  }>;
-  /** The trigger that woke this firing (§21). Absent = 'inputsGreen'. */
-  cause?: FiringTrigger;
 }
 
 /**
@@ -882,8 +844,17 @@ export class Engine {
 
     const runId = randId('run');
     const fp = computeFingerprint(arts, f.inputs);
+    // Build the order BEFORE inserting the run so the flattened packet lands in
+    // the SAME INSERT that creates the run row (§8 / Gap 1). buildOrder is
+    // store-pure — it reads `def`, the in-memory `arts` map, and the firing, and
+    // writes nothing — so reordering it ahead of insertRun changes no semantics.
+    // Artifacts are overwritten in place (UNIQUE(workflow,path), putArtifact ON
+    // CONFLICT DO UPDATE, no history table), so the issued order is unrecoverable
+    // later unless captured here; this persisted packet is the replay/eval/paper
+    // trail record (buildOrder is deterministic modulo run id).
+    const order = this.buildOrder(def, workflow, runId, f, arts);
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
-    this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, ...(f.cause ? { cause: f.cause } : {}) }, now);
+    this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, order, ...(f.cause ? { cause: f.cause } : {}) }, now);
     this.store.putTask({
       workflow,
       step: f.step,
@@ -893,7 +864,7 @@ export class Engine {
       claimedAt: now,
       attempts: existing?.attempts ?? 0,
     });
-    return this.buildOrder(def, workflow, runId, f, arts);
+    return order;
   }
 
   private buildOrder(

@@ -100,6 +100,33 @@ test('a firing carries its consumed input handles and owed reason thread', () =>
   assert.deepEqual(planner.owes.map((w) => w.path), ['plan']);
 });
 
+test('claim persists the emitted order packet in the same txn — present the moment tick returns', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery', { provide: { proposal: { goal: 'ship it' } } });
+
+  const planner = fire(engine, wf, 'planner', 1000);
+  // The emitted Order IS the persisted packet, written in the claim txn — so it
+  // is already on the run row the instant tick returns (no separate write).
+  assert.deepStrictEqual(store.getRun(planner.run)?.order, planner);
+});
+
+test('sweep: every claimed run row carries a persisted order whose run/step match the row', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery', { provide: { proposal: { text: 'x' } } });
+
+  complete(engine, wf, fire(engine, wf, 'planner', 1000), { plan: 'v1' });
+  complete(engine, wf, fire(engine, wf, 'builder', 2000), { pr: 1 });
+  complete(engine, wf, fire(engine, wf, 'reviewer', 3000), { ok: true });
+
+  const runs = store.listRuns(wf);
+  assert.ok(runs.length >= 3, 'at least the three claimed steps produced run rows');
+  for (const row of runs) {
+    assert.ok(row.order, `run ${row.id} (${row.step}) has a persisted order`);
+    assert.equal(row.order!.run, row.id, 'order.run matches the row id');
+    assert.equal(row.order!.step, row.step, 'order.step matches the row step');
+  }
+});
+
 test('§27.3: a step-level x: rides through buildOrder onto the Order untouched; steps without x: emit orders without it', () => {
   const stepX = { agentProfile: 'claude-research', budget: { maxTokens: 400_000 }, tools: ['search_web'] };
   const wfDef = def(

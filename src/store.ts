@@ -19,6 +19,7 @@ import type {
   Acceptance,
   ArtifactData,
   Fingerprint,
+  Order,
   ReasonEntry,
   RunData,
   TaskData,
@@ -116,6 +117,10 @@ CREATE TABLE IF NOT EXISTS run (
   session_id  TEXT,
   fingerprint TEXT,
   cause       TEXT,
+  -- The flattened order packet issued at claim time (§8 / Gap 1), JSON in TEXT
+  -- (precedent: fingerprint, def_snapshot). Named order_json, NOT order — ORDER
+  -- is a reserved SQL keyword. Nullable: absent on runs created before v7.
+  order_json  TEXT,
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
 );
@@ -141,8 +146,11 @@ CREATE TABLE IF NOT EXISTS meta (
  *
  * Bumped to '6' for instance-to-definition pinning (§28): the `workflow`
  * table gains `def_snapshot`/`def_hash` columns (see `migrate()`).
+ *
+ * Bumped to '7' for claim-time order-packet persistence (§8 / Gap 1): the `run`
+ * table gains `order_json` (see `migrate()`).
  */
-const SCHEMA_VERSION = '6';
+const SCHEMA_VERSION = '7';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -259,6 +267,7 @@ interface RunRowRaw {
   session_id: string | null;
   fingerprint: string | null;
   cause: string | null;
+  order_json: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -282,6 +291,12 @@ function mapRun(r: RunRowRaw): RunRow {
   });
   if (fp !== undefined) out.fingerprint = fp;
   if (r.cause !== null) out.cause = r.cause as RunData['cause'];
+  const order = fromJson<Order | undefined>(r.order_json, undefined, {
+    table: 'run',
+    id: r.id,
+    column: 'order_json',
+  });
+  if (order !== undefined) out.order = order;
   return out;
 }
 
@@ -397,6 +412,10 @@ export class Store {
     const runCols = this.db.prepare(`PRAGMA table_info(run)`).all() as Array<{ name: string }>;
     if (!runCols.some((c) => c.name === 'cause')) {
       this.db.exec(`ALTER TABLE run ADD COLUMN cause TEXT`);
+    }
+    // §8 / Gap 1: claim-time order-packet persistence (schema v7).
+    if (!runCols.some((c) => c.name === 'order_json')) {
+      this.db.exec(`ALTER TABLE run ADD COLUMN order_json TEXT`);
     }
     const taskCols = this.db.prepare(`PRAGMA table_info(task)`).all() as Array<{ name: string }>;
     if (!taskCols.some((c) => c.name === 'alarm_at')) {
@@ -728,17 +747,20 @@ export class Store {
   insertRun(id: string, data: RunData, at: number = nowMs()): RunRow {
     this.db
       .prepare(
-        `INSERT INTO run (id, workflow, step, key, outcome, summary, session_id, fingerprint, cause, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO run (id, workflow, step, key, outcome, summary, session_id, fingerprint, cause, order_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(id, data.workflow, data.step, data.key ?? '', data.outcome ?? null, data.summary ?? null,
-        data.sessionId ?? null, toJson(data.fingerprint), data.cause ?? null, at, at);
+        data.sessionId ?? null, toJson(data.fingerprint), data.cause ?? null, toJson(data.order), at, at);
     return this.getRun(id) as RunRow;
   }
 
   updateRun(id: string, patch: Partial<RunData>): RunRow {
     const cur = this.getRun(id);
     if (!cur) throw new Error(`run not found: ${id}`);
+    // order_json is DELIBERATELY excluded from `merged` and the UPDATE below:
+    // the order packet is immutable after claim (§8 / Gap 1). Omitting it makes
+    // that structural — no close/outcome/summary write can ever clobber it.
     const merged: RunData = {
       workflow: cur.workflow,
       step: cur.step,
