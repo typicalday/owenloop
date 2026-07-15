@@ -310,6 +310,52 @@ test('runs --open: returns only the open run, with its claim join populated', ()
   assert.equal(typeof rows[0].heartbeatAgeMs, 'undefined', 'no heartbeat sent yet');
 });
 
+test('order: prints the persisted order packet for a run, identical to the tick output', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const order = run('tick', wf).json().orders[0]; // planner order, incl its run id
+  const res = run('order', wf, order.run);
+  assert.equal(res.code, 0);
+  assert.deepStrictEqual(res.json(), order, 'read-back packet equals the order the tick emitted');
+});
+
+test('order: unknown run exits 1 with a run-not-found message', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const res = run('order', wf, 'run_bogus');
+  assert.equal(res.code, 1);
+  assert.match(res.err, /run not found/);
+});
+
+test('order: a run queried under the wrong workflow exits 1 with a belongs-to message', () => {
+  const { run } = makeCli();
+  const wfA = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+  const wfB = run('create', 'delivery', '--provide', `proposal=${J({ text: 'y' })}`).json().workflow;
+
+  const order = run('tick', wfA).json().orders[0];
+  const res = run('order', wfB, order.run);
+  assert.equal(res.code, 1);
+  assert.match(res.err, /belongs to workflow/);
+});
+
+test('order: a legacy run without a persisted order exits 1 with a no-persisted-order message', () => {
+  const { run, db } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  // Simulate a pre-v7 run row: order_json NULL.
+  const raw = new DatabaseSync(db);
+  raw
+    .prepare('INSERT INTO run (id, workflow, step, key, order_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run('run_legacy', wf, 'planner', '', null, 1000, 1000);
+  raw.close();
+
+  const res = run('order', wf, 'run_legacy');
+  assert.equal(res.code, 1);
+  assert.match(res.err, /no persisted order/);
+});
+
 test('reap --now clears a fresh claim (admin stand-down) and invalidates its run', () => {
   const { run } = makeCli();
   const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
