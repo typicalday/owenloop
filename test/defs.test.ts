@@ -2350,3 +2350,56 @@ test('parseProduces: negative maxSchemaFailures on a produce throws a DefError n
     (e: unknown) => e instanceof DefError && /pr.*maxSchemaFailures.*non-negative/.test((e as Error).message),
   );
 });
+
+// ---- A2/A3: step labels: and maxLease: parse -------------------------------
+
+test('parseDef parses step labels: into StepDef.labels', () => {
+  const d = parseDef({
+    name: 'labeled',
+    inputs: [{ name: 'seed' }],
+    steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], labels: ['claude', 'codex'] }],
+  });
+  assert.deepEqual(d.steps[0]!.labels, ['claude', 'codex']);
+});
+
+test('parseDef normalizes an empty labels: [] to absent (claimable by anyone)', () => {
+  const d = parseDef({
+    name: 'labeled',
+    inputs: [{ name: 'seed' }],
+    steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], labels: [] }],
+  });
+  assert.equal(d.steps[0]!.labels, undefined);
+});
+
+test('parseDef rejects a non-string entry in labels:', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'labeled',
+        inputs: [{ name: 'seed' }],
+        steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], labels: ['ok', 42] }],
+      }),
+    (e: unknown) => e instanceof DefError && /run'\.labels must be a list of strings/.test((e as Error).message),
+  );
+});
+
+test('parseDef parses step maxLease: duration string into StepDef.maxLeaseMs', () => {
+  const d = parseDef({
+    name: 'clamped',
+    inputs: [{ name: 'seed' }],
+    steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], maxLease: '30m' }],
+  });
+  assert.equal(d.steps[0]!.maxLeaseMs, 30 * 60 * 1000);
+});
+
+test('parseDef rejects a non-string maxLease:', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'clamped',
+        inputs: [{ name: 'seed' }],
+        steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], maxLease: 1800 }],
+      }),
+    (e: unknown) => e instanceof DefError && /run'\.maxLease must be a string/.test((e as Error).message),
+  );
+});

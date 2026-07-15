@@ -355,6 +355,15 @@ export interface StepDef {
   idleAfterMs?: number;
   /** Per-step reap TTL override in milliseconds. Falls back to the engine's DEFAULT_REAP_TTL_MS. */
   reapTtlMs?: number;
+  /** A2: opaque routing labels for peer-orchestrator claim filtering. A tick
+   *  caller passing a label filter only claims steps whose labels intersect it;
+   *  absent (or empty, normalized to absent at parse) = claimable by any caller.
+   *  Distinct from `worker`/`workers` (executor-kind), which this never touches. */
+  labels?: string[];
+  /** A3: per-step max total lease lifetime override in milliseconds — the cap on
+   *  `claimedAt + maxLease` past which renewals can no longer keep a lease fresh.
+   *  Falls back to the engine's DEFAULT_MAX_LEASE_MS. */
+  maxLeaseMs?: number;
   body: string; // prompt body
   /** Mode 2 foundation: name of the child workflow this step delegates to. Machine-handled, never a worker firing. */
   calls?: string;

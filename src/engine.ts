@@ -50,6 +50,7 @@ import type {
 export type { Order } from './types.ts';
 
 const DEFAULT_REAP_TTL_MS = 2 * 60 * 60 * 1000; // 2h
+const DEFAULT_MAX_LEASE_MS = 60 * 60 * 1000; // 1h
 
 /**
  * F2: a typed refusal for a produced-value/input-value schema mismatch, thrown
@@ -78,8 +79,11 @@ export class SchemaRefusalError extends Error {
  * step's daily run allowance is exhausted (binding over parallel); `'parallel-cap'`
  * — the step's concurrency cap is the binding constraint. Always emitted by
  * `applySchedule` or `tick`; never alters which firings are selected or claimed.
+ * `'label-mismatch'` (A2) — the tick caller passed a label filter that does not
+ * intersect the step's declared labels, so a peer orchestrator serving other
+ * labels leaves it for the matching caller.
  */
-export type DeferredReason = 'in-flight' | 'cadence' | 'daily-budget' | 'parallel-cap';
+export type DeferredReason = 'in-flight' | 'cadence' | 'daily-budget' | 'parallel-cap' | 'label-mismatch';
 
 export interface DeferredFiring {
   step: string;
@@ -218,6 +222,7 @@ export class Engine {
   readonly store: Store;
   private readonly resolveDef: DefResolver;
   private readonly reapTtlMs: number;
+  private readonly maxLeaseMs: number;
   private readonly listeners = new Set<EngineListener>();
   private readonly onListenerError?: (err: unknown, event: EngineEvent) => void;
   /** M2B: recursion guard — set of parentWf ids currently inside maintainCalls. */
@@ -228,6 +233,9 @@ export class Engine {
     resolveDef: DefResolver,
     opts: {
       reapTtlMs?: number;
+      /** A3: engine-wide default cap on total lease lifetime (claimedAt + maxLease).
+       *  Per-step `maxLeaseMs` overrides it; falls back to DEFAULT_MAX_LEASE_MS. */
+      maxLeaseMs?: number;
       /** A listener registered up front, equivalent to a `subscribe` call. */
       onEvent?: EngineListener;
       /** Where a throwing listener's error goes (default: swallowed). */
@@ -237,6 +245,7 @@ export class Engine {
     this.store = store;
     this.resolveDef = resolveDef;
     this.reapTtlMs = opts.reapTtlMs ?? DEFAULT_REAP_TTL_MS;
+    this.maxLeaseMs = opts.maxLeaseMs ?? DEFAULT_MAX_LEASE_MS;
     if (opts.onEvent) this.listeners.add(opts.onEvent);
     this.onListenerError = opts.onListenerError;
   }
@@ -641,8 +650,8 @@ export class Engine {
    * Pass `{ deep: false }` (CLI `--shallow`) to restore the pre-deep behavior:
    * only this instance's own orders. See `TickResult` for the fold semantics.
    */
-  tick(workflow: string, opts: { now?: number; deep?: boolean } = {}): TickResult {
-    return this.tickInternal(workflow, opts.now ?? nowMs(), opts.deep ?? true, new Set());
+  tick(workflow: string, opts: { now?: number; deep?: boolean; labels?: string[] } = {}): TickResult {
+    return this.tickInternal(workflow, opts.now ?? nowMs(), opts.deep ?? true, opts.labels ?? [], new Set());
   }
 
   /**
@@ -657,7 +666,7 @@ export class Engine {
    * `_inMaintainCalls`; instances already form a tree via `producedBy` and
    * `detectCallsCycles` forbids def-level cycles).
    */
-  private tickInternal(workflow: string, now: number, deep: boolean, visited: Set<string>): TickResult {
+  private tickInternal(workflow: string, now: number, deep: boolean, labels: string[], visited: Set<string>): TickResult {
     if (visited.has(workflow)) return { workflow, orders: [], reaped: 0, deferred: [] };
     visited.add(workflow);
     const def = this.defFor(workflow);
@@ -673,7 +682,7 @@ export class Engine {
       const timeFacts = this.computeTimeFacts(def, workflow, arts, now);
 
       const firings = eligibleFirings(def, arts, timeFacts);
-      const { selected, deferred } = this.applySchedule(workflow, def, firings, now);
+      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, labels);
 
       // Clear alarm_at for any idle firing that was selected (consume the alarm).
       for (const f of selected) {
@@ -707,7 +716,7 @@ export class Engine {
     // live calls: child with its own full tickInternal and fold its result up.
     if (deep) {
       for (const { child } of this.callsDescendTargets(workflow, def)) {
-        const cr = this.tickInternal(child.id, now, deep, visited);
+        const cr = this.tickInternal(child.id, now, deep, labels, visited);
         // orders: flatten; each Order already carries its own `workflow`.
         result.orders.push(...cr.orders);
         // deferred: stamp child-originated entries with the child id, preserving
@@ -763,12 +772,20 @@ export class Engine {
     return out;
   }
 
-  /** Per-step cadence + daily budget + parallel cap over the eligible firings. */
+  /**
+   * Per-step cadence + daily budget + parallel cap over the eligible firings.
+   * A2: `labels` is the tick caller's optional claim filter — when non-empty, a
+   * step whose own `labels` are also non-empty is only schedulable when the two
+   * intersect; a disjoint step's firings are deferred as `'label-mismatch'`.
+   * Filtering here (before cadence/budget) means a mismatched firing never
+   * consumes the caller's slots and never perturbs cadence math.
+   */
   private applySchedule(
     workflow: string,
     def: WorkflowDef,
     firings: Firing[],
     now: number,
+    labels: string[],
   ): { selected: Firing[]; deferred: DeferredFiring[] } {
     const midnight = localMidnightMs(now);
     const selected: Firing[] = [];
@@ -783,6 +800,15 @@ export class Engine {
     for (const step of def.steps) {
       const stepFirings = firings.filter((f) => f.step === step.name);
       if (stepFirings.length === 0) continue;
+
+      // A2: caller label filter vs. step labels. Both non-empty and disjoint →
+      // this caller must not claim the step; defer every firing and skip it
+      // before it touches cadence/budget/slot math.
+      if (labels.length > 0 && step.labels && step.labels.length > 0 &&
+          !step.labels.some((l) => labels.includes(l))) {
+        for (const f of stepFirings) defer(f, 'label-mismatch');
+        continue;
+      }
 
       const latest = this.store.latestRun(workflow, step.name);
       if (latest && now - latest.createdAt < step.cadenceSecs * 1000) {
@@ -810,16 +836,35 @@ export class Engine {
     return step?.reapTtlMs ?? this.reapTtlMs;
   }
 
+  /** A3: return the effective max total lease lifetime for a step — per-step override or engine default. */
+  private effectiveMaxLease(step?: StepDef): number {
+    return step?.maxLeaseMs ?? this.maxLeaseMs;
+  }
+
   /**
    * Unified liveness predicate: returns true if the task's claim is still fresh.
    * Uses max(claimedAt, heartbeatAt ?? claimedAt) as the freshness anchor so a
    * heartbeating run is never falsely reaped even after the global TTL elapses.
+   *
+   * A3: a second, harder bound also applies — a lease is fresh only while
+   * `now - claimedAt <= maxLease`, measured off the ORIGINAL `claimedAt` of the
+   * current claim. Heartbeats keep satisfying the anchor rule but can never push
+   * a lease past `claimedAt + maxLease`; once crossed the firing is stale and
+   * reapable/re-claimable even while still beating. After a reap + re-claim the
+   * clamp re-anchors to the new claim's `claimedAt`.
    */
-  private isClaimFresh(task: { claimedAt?: number; heartbeatAt?: number }, now: number, ttl: number): boolean {
+  private isClaimFresh(
+    task: { claimedAt?: number; heartbeatAt?: number },
+    now: number,
+    ttl: number,
+    maxLease: number,
+  ): boolean {
     const anchor = task.heartbeatAt !== undefined && task.heartbeatAt > (task.claimedAt ?? 0)
       ? task.heartbeatAt
       : (task.claimedAt ?? 0);
-    return now - anchor <= ttl;
+    if (now - anchor > ttl) return false;
+    // A3 clamp: total lifetime since the original claim may not exceed maxLease.
+    return task.claimedAt === undefined || now - task.claimedAt <= maxLease;
   }
 
   /** Claim a firing's lease via CAS, snapshot the fingerprint, open a run. */
@@ -835,10 +880,11 @@ export class Engine {
       const run = existing.run ? this.store.getRun(existing.run) : undefined;
       const stepDef = def.steps.find((l) => l.name === f.step);
       const ttl = this.effectiveTtl(stepDef);
+      const maxLease = this.effectiveMaxLease(stepDef);
       const fresh =
         !!run &&
         run.outcome === undefined &&
-        (existing.claimedAt === undefined || this.isClaimFresh(existing, now, ttl));
+        (existing.claimedAt === undefined || this.isClaimFresh(existing, now, ttl, maxLease));
       if (fresh) return 'in-flight'; // genuinely in flight — don't double-claim
     }
 
@@ -1598,7 +1644,12 @@ export class Engine {
   /**
    * Touch the liveness timestamp on an open run's task. A run that periodically
    * calls heartbeat() will never be falsely reaped as long as beats arrive within
-   * the effective TTL. Throws (via openRun) if the run no longer holds its lease.
+   * the effective TTL — EXCEPT (A3) once total lifetime since the original claim
+   * exceeds the effective maxLease: past `claimedAt + maxLease` the read-side
+   * freshness predicate (`isClaimFresh`) reports the lease stale no matter how
+   * recent the beat, so a wedged-but-beating run is reaped and re-claimable. This
+   * write stays dumb — it only records `heartbeatAt`; the clamp is judged on read.
+   * Throws (via openRun) if the run no longer holds its lease.
    */
   heartbeat(workflow: string, run: string, now?: number): void {
     const ts = now ?? nowMs();
@@ -1634,7 +1685,8 @@ export class Engine {
       const run = task.run ? this.store.getRun(task.run) : undefined;
       const stepDef = resolvedDef.steps.find((l) => l.name === task.step);
       const ttl = opts.ttlOverride ?? this.effectiveTtl(stepDef);
-      const stale = task.claimedAt !== undefined && !this.isClaimFresh(task, now, ttl);
+      const maxLease = this.effectiveMaxLease(stepDef);
+      const stale = task.claimedAt !== undefined && !this.isClaimFresh(task, now, ttl, maxLease);
       const stranded = !run || run.outcome !== undefined || stale;
       if (stranded) {
         this.store.putTask({
@@ -1842,10 +1894,11 @@ export class Engine {
       const run = task.run ? this.store.getRun(task.run) : undefined;
       const stepDef = def.steps.find((l) => l.name === task.step);
       const ttl = this.effectiveTtl(stepDef);
+      const maxLease = this.effectiveMaxLease(stepDef);
       const fresh =
         !!run &&
         run.outcome === undefined &&
-        (task.claimedAt === undefined || this.isClaimFresh(task, now, ttl));
+        (task.claimedAt === undefined || this.isClaimFresh(task, now, ttl, maxLease));
       if (fresh) return true;
     }
     return false;

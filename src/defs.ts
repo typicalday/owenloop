@@ -104,6 +104,10 @@ interface RawStep {
   /** M2-GRAMMAR: if present, this entry is a calls: step (Mode 2 runtime composition). */
   calls?: unknown;
   reapTtl?: unknown;
+  /** A2: opaque routing labels for peer-orchestrator claim filtering. */
+  labels?: unknown;
+  /** A3: per-step max total lease lifetime (duration string). */
+  maxLease?: unknown;
   /** §27.3: opaque extension map — validated as a map, never interpreted. */
   x?: unknown;
   /** Declares which kind of executor this step's order is for. Opaque
@@ -119,7 +123,7 @@ const RAW_STEP_KEYS = [
   'name', 'consumes', 'produces', 'generates', 'invalidates', 'cadence',
   'maxRunsPerDay', 'parallel', 'maxAttempts', 'maxSchemaFailures', 'model',
   'workdir', 'terminal', 'effect', 'on', 'idleAfter', 'body', 'bodyFile',
-  'calls', 'reapTtl', 'x', 'worker', 'command', 'spec',
+  'calls', 'reapTtl', 'labels', 'maxLease', 'x', 'worker', 'command', 'spec',
 ] as const;
 
 /** Duck-typed sniffer for a raw calls: directive (Mode 2). */
@@ -1012,6 +1016,16 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
   if (rl.reapTtl !== undefined) {
     const reapTtlStr = asString(rl.reapTtl, `step '${name}'.reapTtl`);
     step.reapTtlMs = parseDurationMs(reapTtlStr);
+  }
+  // A2: opaque routing labels. Empty list normalizes to absent (claimable by
+  // any caller), mirroring the groups.length > 0 pattern below.
+  if (rl.labels !== undefined) {
+    const ls = asStringArray(rl.labels, `step '${name}'.labels`);
+    if (ls.length > 0) step.labels = ls;
+  }
+  // A3: per-step max total lease lifetime (duration string, same as reapTtl).
+  if (rl.maxLease !== undefined) {
+    step.maxLeaseMs = parseDurationMs(asString(rl.maxLease, `step '${name}'.maxLease`));
   }
   // generates: entries may not declare judges: (they are lint-exempt side outputs,
   // not part of the step's primary contract) — hard error mirrors the calls: check above.
