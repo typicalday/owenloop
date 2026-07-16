@@ -51,6 +51,15 @@ export type { Order } from './types.ts';
 
 const DEFAULT_REAP_TTL_MS = 2 * 60 * 60 * 1000; // 2h
 const DEFAULT_MAX_LEASE_MS = 60 * 60 * 1000; // 1h
+/**
+ * REL-4: hard cap on `calls:` composition depth (root instance = depth 0), a
+ * defense-in-depth bound independent of construction-time cycle validation.
+ * Generous — real compositions in this repo are depth 2–3; the bound only trips
+ * on a pathological chain (typically a `calls:` cycle that bypassed load-time
+ * validation via a hand-wired `Engine` + custom `DefResolver`). See
+ * `maintainCalls` (spawn-time refusal) and `tickInternal` (descent guard).
+ */
+const DEFAULT_MAX_CALL_DEPTH = 64;
 
 /**
  * F2: a typed refusal for a produced-value/input-value schema mismatch, thrown
@@ -223,6 +232,7 @@ export class Engine {
   private readonly resolveDef: DefResolver;
   private readonly reapTtlMs: number;
   private readonly maxLeaseMs: number;
+  private readonly maxCallDepth: number;
   private readonly listeners = new Set<EngineListener>();
   private readonly onListenerError?: (err: unknown, event: EngineEvent) => void;
   /** M2B: recursion guard — set of parentWf ids currently inside maintainCalls. */
@@ -236,6 +246,10 @@ export class Engine {
       /** A3: engine-wide default cap on total lease lifetime (claimedAt + maxLease).
        *  Per-step `maxLeaseMs` overrides it; falls back to DEFAULT_MAX_LEASE_MS. */
       maxLeaseMs?: number;
+      /** REL-4: hard cap on `calls:` composition depth (root = 0). Falls back to
+       *  DEFAULT_MAX_CALL_DEPTH (64). Defense in depth against a calls: cycle
+       *  that bypassed load-time validation (e.g. a hand-wired custom resolver). */
+      maxCallDepth?: number;
       /** A listener registered up front, equivalent to a `subscribe` call. */
       onEvent?: EngineListener;
       /** Where a throwing listener's error goes (default: swallowed). */
@@ -246,6 +260,7 @@ export class Engine {
     this.resolveDef = resolveDef;
     this.reapTtlMs = opts.reapTtlMs ?? DEFAULT_REAP_TTL_MS;
     this.maxLeaseMs = opts.maxLeaseMs ?? DEFAULT_MAX_LEASE_MS;
+    this.maxCallDepth = opts.maxCallDepth ?? DEFAULT_MAX_CALL_DEPTH;
     if (opts.onEvent) this.listeners.add(opts.onEvent);
     this.onListenerError = opts.onListenerError;
   }
@@ -444,6 +459,64 @@ export class Engine {
   }
 
   /**
+   * REL-4: the `calls:` ancestry depth of an instance — how many `producedBy`
+   * parent links separate it from the root of its composed tree. A root
+   * instance (no `producedBy`) is depth 0; a child spawned by the root is
+   * depth 1; and so on. O(depth) — walks the parent chain, which is exactly the
+   * tree the spawn bound is protecting, so it only runs on an actual spawn.
+   */
+  private callsAncestryDepth(workflow: string): number {
+    let depth = 0;
+    let cur = this.store.getWorkflow(workflow);
+    while (cur?.producedBy) {
+      depth++;
+      cur = this.store.getWorkflow(cur.producedBy.parentWf);
+    }
+    return depth;
+  }
+
+  /**
+   * REL-4: record a `calls:` depth-limit refusal as a debt on the PARENT calls
+   * artifact — same clean-stop mechanism as `recordCallsSchemaReject` (mark it
+   * `rejected`, stamp the current gate fingerprint so the STEP-2 F2 guard skips
+   * re-attempts on later ticks), but the reason is a plain structural rejection,
+   * NOT a schema failure: it does not touch `schemaRejects` (that counter gates
+   * `maxSchemaFailures` and means something specific). The message is actionable
+   * — a depth-limit trip almost always means a `calls:` cycle in the def set
+   * bypassed load-time validation (a hand-wired resolver construction validation
+   * cannot see); raising `maxCallDepth` is only correct when the depth is truly
+   * intentional. Stopping here — instead of spawning — is what prevents the
+   * unbounded row creation + stack overflow REL-4 describes.
+   */
+  private recordCallsDepthReject(
+    parentWf: string,
+    def: WorkflowDef,
+    callsStem: string,
+    gateStems: string[],
+    childDefName: string,
+    now?: number,
+  ): void {
+    const text = `calls depth limit reached (maxCallDepth=${this.maxCallDepth}) spawning '${childDefName}': `
+      + `this usually means a calls: cycle in the definition set bypassed load-time validation; `
+      + `raise maxCallDepth via Engine opts only if this depth is intentional`;
+    this.store.tx(() => {
+      const art = this.store.getArtifact(parentWf, callsStem);
+      if (!art) return; // not yet materialized by pendingOwed — nothing to stamp
+      const gateArts = this.artMap(parentWf);
+      const fp = computeFingerprint(gateArts, gateStems);
+      this.store.putArtifact({
+        ...art,
+        acceptance: 'rejected',
+        fingerprint: fp,
+        reasons: [...art.reasons, reason('reject', 'structural', 'engine', text, art.version)],
+      });
+      this.settle(parentWf, def, now);
+    });
+    this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject' });
+    this.fireSettled(parentWf);
+  }
+
+  /**
    * M2B: Maintain all `calls:` steps for a parent workflow.
    * Called at the top of tick (outside any tx) and as cascade-up prompt.
    * For each calls: step: spawn the child if gate is ready and no child exists;
@@ -482,6 +555,17 @@ export class Engine {
 
         // STEP 3 — SPAWN or RE-ATTACH.
         if (!existingChild) {
+          // REL-4 spawn-time bound (the guard that prevents row bloat). Refuse to
+          // spawn once this parent's own calls: ancestry has reached maxCallDepth:
+          // a self- or cross-calling def whose cycle slipped past load-time
+          // validation would otherwise mint a fresh child instance (a new DB row)
+          // at every recursion level until the process stack overflows. Record a
+          // rejection on the parent calls artifact (clean stop; the STEP-2 F2
+          // fingerprint guard then skips re-attempts) instead of throwing.
+          if (this.callsAncestryDepth(parentWf) >= this.maxCallDepth) {
+            this.recordCallsDepthReject(parentWf, def, callsStem, gateStems, step.calls, now);
+            continue;
+          }
           // SPAWN: gate is ready and no child exists yet.
           const seedProvide: Record<string, Record<string, unknown>> = {};
           for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
@@ -651,7 +735,7 @@ export class Engine {
    * only this instance's own orders. See `TickResult` for the fold semantics.
    */
   tick(workflow: string, opts: { now?: number; deep?: boolean; labels?: string[] } = {}): TickResult {
-    return this.tickInternal(workflow, opts.now ?? nowMs(), opts.deep ?? true, opts.labels ?? [], new Set());
+    return this.tickInternal(workflow, opts.now ?? nowMs(), opts.deep ?? true, opts.labels ?? [], new Set(), 0);
   }
 
   /**
@@ -662,11 +746,28 @@ export class Engine {
    * this frame's `store.tx`: `store.tx` forbids re-entrancy, and every child
    * frame opens its own tx (via its own `maintainCalls` + tick body), so a
    * child is driven by a full nested `tickInternal`, never a child tx opened
-   * inside the parent's. `visited` is a defensive cycle guard (mirrors
-   * `_inMaintainCalls`; instances already form a tree via `producedBy` and
-   * `detectCallsCycles` forbids def-level cycles).
+   * inside the parent's.
+   *
+   * REL-4: `visited` (a set of workflow INSTANCE ids) is NOT a sufficient guard
+   * against a `calls:` cycle. Each descent level's `maintainCalls` SPAWNS a
+   * brand-new child instance, so a self-calling def produces a fresh id at every
+   * level — `visited` never trips, and recursion would run unbounded (one DB row
+   * per level) until the stack overflows. The real guard is the `maxCallDepth`
+   * bound: `maintainCalls` refuses to spawn past it (so a newly-created tree can
+   * never get here too deep), and the `depth` check below is the belt-and-braces
+   * backstop for a PRE-EXISTING deep tree (e.g. a DB written by an older build
+   * before the spawn bound existed) — it throws rather than overflow the stack.
+   * `visited` still earns its keep as a re-entrancy guard for a genuinely
+   * re-encountered instance within one tick.
    */
-  private tickInternal(workflow: string, now: number, deep: boolean, labels: string[], visited: Set<string>): TickResult {
+  private tickInternal(workflow: string, now: number, deep: boolean, labels: string[], visited: Set<string>, depth: number): TickResult {
+    if (depth > this.maxCallDepth) {
+      throw new Error(
+        `calls depth limit exceeded (maxCallDepth=${this.maxCallDepth}) ticking '${workflow}': `
+        + `a calls: composition is deeper than the bound, which usually means a calls: cycle `
+        + `in the definition set; raise maxCallDepth via Engine opts only if this depth is intentional`,
+      );
+    }
     if (visited.has(workflow)) return { workflow, orders: [], reaped: 0, deferred: [] };
     visited.add(workflow);
     const def = this.defFor(workflow);
@@ -716,7 +817,7 @@ export class Engine {
     // live calls: child with its own full tickInternal and fold its result up.
     if (deep) {
       for (const { child } of this.callsDescendTargets(workflow, def)) {
-        const cr = this.tickInternal(child.id, now, deep, labels, visited);
+        const cr = this.tickInternal(child.id, now, deep, labels, visited, depth + 1);
         // orders: flatten; each Order already carries its own `workflow`.
         result.orders.push(...cr.orders);
         // deferred: stamp child-originated entries with the child id, preserving

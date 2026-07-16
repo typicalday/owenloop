@@ -25,7 +25,7 @@ import { Engine } from './engine.ts';
 import type { DefResolver, EngineEvent, EngineListener } from './engine.ts';
 import { openStore } from './store.ts';
 import type { Store } from './store.ts';
-import { loadDefs } from './defs.ts';
+import { finalizeDefs, loadDefs } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 
 export interface CreateEngineOpts {
@@ -53,6 +53,14 @@ export interface CreateEngineOpts {
    *  milliseconds (A3). Per-step `maxLease` overrides it. */
   maxLeaseMs?: number;
   /**
+   * Forwarded to the `Engine` — the hard cap on `calls:` composition depth
+   * (REL-4 defense in depth). Construction-time validation already rejects
+   * `calls:` cycles in the resolved def set, so this only matters for a host
+   * that wires an `Engine` with a custom `DefResolver` construction validation
+   * cannot inspect. Defaults to the engine's `DEFAULT_MAX_CALL_DEPTH` (64).
+   */
+  maxCallDepth?: number;
+  /**
    * A push-style observer registered up front, equivalent to calling
    * `engine.subscribe` immediately after construction. Fires synchronously
    * after each committed mutation. See {@link Engine.subscribe}.
@@ -72,20 +80,40 @@ export interface CreatedEngine {
 /**
  * Open a store, resolve definitions, and return a wired `Engine` ready to
  * `createInstance` / `tick` / `green` / … . See `docs/embedding.md`.
+ *
+ * REL-4: an in-memory `defs` set is now validated as a whole (calls targets
+ * exist, `callsInputs` keys valid, exactly-one child output, per-def validation,
+ * and calls-cycle detection) exactly like the filesystem `defsDir` loader — so
+ * `createEngine({ defs })` THROWS `DefError` on an invalid set instead of
+ * silently registering it. The returned `defs` is the validated copy the
+ * resolver closes over.
  */
 export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
   const db = opts.db ?? join('.owenloop', 'state.db');
-  if (db !== ':memory:') mkdirSync(dirname(db), { recursive: true });
-  const store = openStore(db);
 
+  // Resolve (and validate) the def set BEFORE opening the store: a validation
+  // throw here must not leak an open SQLite handle (the `defsDir` branch also
+  // validated inside `loadDefs`, but used to do so after `openStore` — that
+  // reorder is safe, its only observable effect is the leak we're closing).
   let defs: Map<string, WorkflowDef>;
   if (opts.defs !== undefined) {
-    defs = Array.isArray(opts.defs) ? new Map(opts.defs.map((d) => [d.name, d])) : opts.defs;
+    // REL-4: validate the ENTIRE in-memory set exactly like the filesystem
+    // loader — calls targets exist, callsInputs keys valid, exactly-one-output,
+    // per-def validateDef, and cross-def calls-cycle detection. Reuses the
+    // loader's own Phase-2/3 validator (`finalizeDefs`); no second validator.
+    // The resolver below closes over this FINALIZED copy, so mutating the
+    // caller's original Map/array after construction no longer silently changes
+    // resolution — that hole was part of REL-4's surface.
+    const raw = Array.isArray(opts.defs) ? new Map(opts.defs.map((d) => [d.name, d])) : opts.defs;
+    defs = finalizeDefs(raw);
   } else if (opts.defsDir !== undefined) {
     defs = existsSync(opts.defsDir) ? loadDefs(opts.defsDir) : new Map<string, WorkflowDef>();
   } else {
     defs = new Map<string, WorkflowDef>();
   }
+
+  if (db !== ':memory:') mkdirSync(dirname(db), { recursive: true });
+  const store = openStore(db);
 
   const resolveDef: DefResolver = (name) => {
     const d = defs.get(name);
@@ -96,11 +124,13 @@ export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
   const engineOpts: {
     reapTtlMs?: number;
     maxLeaseMs?: number;
+    maxCallDepth?: number;
     onEvent?: EngineListener;
     onListenerError?: (err: unknown, event: EngineEvent) => void;
   } = {};
   if (opts.reapTtlMs !== undefined) engineOpts.reapTtlMs = opts.reapTtlMs;
   if (opts.maxLeaseMs !== undefined) engineOpts.maxLeaseMs = opts.maxLeaseMs;
+  if (opts.maxCallDepth !== undefined) engineOpts.maxCallDepth = opts.maxCallDepth;
   if (opts.onEvent !== undefined) engineOpts.onEvent = opts.onEvent;
   if (opts.onListenerError !== undefined) engineOpts.onListenerError = opts.onListenerError;
 

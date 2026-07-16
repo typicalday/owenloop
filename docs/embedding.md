@@ -26,9 +26,10 @@ const { engine, store } = createEngine({
 | option      | meaning |
 |-------------|---------|
 | `db`        | SQLite path. `':memory:'` for an ephemeral store (great in tests). Defaults to `.owenloop/state.db`; parent dirs are created for a file path. |
-| `defs`      | In-memory definitions as a `Map<string, WorkflowDef>` or an array of `WorkflowDef` (de-duped by name). Takes precedence over `defsDir`. |
+| `defs`      | In-memory definitions as a `Map<string, WorkflowDef>` or an array of `WorkflowDef` (de-duped by name). Takes precedence over `defsDir`. Validated as a whole before use — see [In-memory definitions](#in-memory-definitions). |
 | `defsDir`   | Directory of `*.yaml` definitions, loaded via `loadDefs`. A missing dir yields no defs (lenient, like the CLI), not an error. |
 | `reapTtlMs` | Forwarded to the `Engine` — the stranded-lease reap TTL. |
+| `maxCallDepth` | Forwarded to the `Engine` — the hard cap on `calls:` composition depth (root instance = depth 0). Defaults to 64. Defense in depth against a `calls:` cycle; only relevant when you hand-wire a custom `DefResolver` that construction-time validation can't inspect. |
 | `onEvent`   | A push-style observer registered at construction (equivalent to `engine.subscribe`). See [Events](#events). |
 | `onListenerError` | Where a throwing listener's error is routed (default: swallowed). |
 
@@ -49,6 +50,11 @@ const engine = new Engine(store, (name) => {
   return d;
 });
 ```
+
+`loadDefs` already validates what it reads from disk. If you build a def set by
+hand and want the same whole-set checks the factory applies (cross-def `calls:`
+validity and cycle detection, not just per-def `validateDef`), run it through
+the exported `finalizeDefs(rawMap)` before wiring the resolver over it.
 
 ## The worker step
 
@@ -198,6 +204,14 @@ import { createEngine, parseDef } from 'owenloop';
 const research = parseDef(/* a WorkflowDef-shaped object or YAML you parsed */);
 const { engine } = createEngine({ db: ':memory:', defs: [research] });
 ```
+
+An in-memory `defs` set is validated as a whole — exactly like the filesystem
+`defsDir` loader — before the engine is returned: `calls:` targets must exist,
+`callsInputs` keys must be valid, a called def must have exactly one child
+output, each def passes `validateDef`, and the set is checked for `calls:`
+cycles. An invalid set **throws `DefError`** instead of silently registering.
+The returned `defs` is a validated *copy*, so mutating the `Map`/array you
+passed after construction no longer changes resolution.
 
 ## Lifecycle & concurrency
 
