@@ -90,13 +90,25 @@ it's the same engine.
 
 `engine.tick(wf)` is **deep by default**: after ticking `wf` it descends into
 every live `calls:` child (recursively), folding their orders, `reaped`, folded
-`deferred` (each tagged with its own `workflow`), and the tree-minimum `dueAt`
+`deferred` (each descendant's deferral tagged with its `workflow`; a root-frame
+deferral stays unstamped), and the tree-minimum `dueAt`
 into the one `TickResult`. So an order in the list may belong to a child, not
 `wf` — commit (`green`/`emit`/`seal`/`reject`) and `close` against
 `order.workflow`, not the id you passed to `tick`. Pass `engine.tick(wf, { deep:
 false })` to tick just that one instance (every order then carries `wf`). The
 childless example above never triggers descent, so `order.workflow === wf`
 throughout; it matters once a step declares `calls:`.
+
+**Migrating from shallow ticking.** Because a single deep `engine.tick(root)`
+can advance *many* workflow instances in one call, an embedder moving off the
+one-workflow-per-tick assumption must key any per-workflow logic —
+checkpointing, batching, an external transaction, a progress counter — on
+`order.workflow`, not on the id it passed to `tick`. Don't assume every order in
+one `TickResult` belongs to the instance you ticked; each order carries its own
+`order.workflow`, and a folded deferral is stamped with a descendant's
+`workflow` (absent means the root you ticked). `engine.tick(wf, { deep: false })`
+(CLI `--shallow`) stays the deliberate single-instance escape hatch when you
+want exactly the old behavior.
 
 `order.worker` is where dispatch-by-executor-type earns its keep in an
 embedder: rather than every order going to the same LLM-driving `runYourWorker`,
@@ -174,9 +186,17 @@ The event union (exported as `EngineEvent`):
   commits (and the cascade has already settled inside that tx), so a listener
   that calls `status`/`tick`/`green` observes fully-committed, settled state —
   there is no open transaction to corrupt. A state-changing verb fires its
-  specific `commit`/`instance` event followed by a `settled`; `close` fires only
-  `closed` (it releases a lease, it doesn't touch artifact state); `tick` fires
-  nothing (it hands you orders directly).
+  specific `commit`/`instance` event followed by a `settled`. `close` fires only
+  its `closed` lifecycle event and `tick` fires nothing of its own — `close`
+  otherwise just releases a lease and `tick` just hands you orders — but either
+  can advance `calls:` composition as a side
+  effect, and that composition fires events: a deep `tick` that spawns a child
+  emits `instance` + `settled`, and one that machine-greens or re-arms a parent
+  `calls:` artifact from a child's outcome emits `commit` + `settled` on the
+  parent; a `close` whose run belongs to a `calls:` child prompts that same
+  parent maintenance, so it too can emit `commit`/`settled` on the parent. Only
+  for an instance with no `calls:` parent or children does `close` fire just
+  `closed` and `tick` fire nothing.
 - **Synchronous, registration order.** The engine is single-writer and
   synchronous; listeners fire in the order they subscribed, on the calling
   thread. This is an in-process observer, not an async/cross-process bus —

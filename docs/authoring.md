@@ -82,6 +82,8 @@ steps:
     command: …                  # required when worker: command; opaque, never shelled out
     spec:                       # optional opaque config map, shape-checked like x: (a plain map)
       anything: goes            #   contents never read by the engine; see below
+    labels: [nightly, batch]    # optional routing labels for peer-orchestrator
+                                #   claim filtering (tick --label); empty = absent; see below
     x:                          # optional; opaque extension map, passed through
       anything: goes            #   untouched onto the order (Order.x); see design.md §27.3
 ```
@@ -162,6 +164,35 @@ interpreted by the engine beyond that. All three (`worker`, `command`,
 `spec`) ride through `buildOrder` onto the emitted `Order` untouched, exactly
 like `model` and `workdir`. See [`docs/design.md` §27.4](design.md) for the
 full contract.
+
+## `labels:` — routing a step to a particular tick caller
+
+`labels:` is an optional list of opaque strings on a step. It exists so several
+orchestrators ticking the *same* database can split the work between them: a
+tick caller may pass one or more `--label <x>` filters (CLI) or
+`engine.tick(wf, { labels: [...] })` (embedding), and a step is left for a
+*different* caller only when **both** the caller's filter and the step's own
+`labels:` are non-empty and share no value — that step's firings defer with
+reason `label-mismatch` until a caller whose filter matches (or a caller with
+no filter at all) ticks it. An empty `labels:` list normalizes to absent.
+
+Two consequences are worth stating plainly:
+
+- **Routing, not authorization.** A caller that passes *no* filter claims every
+  step, labeled or not — and any worker that can reach the database can tick
+  without a filter. Labels are a work-splitting convenience, never a security
+  boundary; never rely on them to keep a step away from a worker that shouldn't
+  run it.
+- **Starvation hazard.** If every live caller ticks with a label filter and
+  none of them intersects a given step's labels, that step's orders sit
+  deferred forever with `label-mismatch` — no caller ever claims them.
+  Operators running labeled callers should monitor the deferred/blocked entries
+  (each folded deferral in a `TickResult` carries its `reason`) so a
+  permanently unclaimed step is caught rather than silently stuck.
+
+`labels:` is distinct from [`worker:`](#worker--declaring-the-executor):
+`worker:` says what *kind* of executor should run an order once it's claimed;
+`labels:` says *which tick caller* is allowed to claim it in the first place.
 
 ## `produces:` vs `generates:`
 
@@ -448,3 +479,11 @@ Don't put credentials or secrets in an artifact value. Values are persisted
 as plaintext in the SQLite store (no encryption at rest) and are copied
 verbatim into the prompt/context of every order that consumes them — anyone
 who can read the database or a downstream job's prompt can read it.
+
+Those values are also *retained*, not just transiently persisted: every
+artifact version is kept (the store never overwrites a prior version in place),
+and every run's issued order packet — prompt plus the input values it consumed
+— is written to the SQLite `run` table at claim time and stays there after the
+run closes and the workflow finishes. A secret that flowed through an input
+therefore lives on in the database until the file itself is disposed of — see
+[Storage](../README.md#storage) for the operator's disposal responsibility.

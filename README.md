@@ -341,8 +341,8 @@ definition, then conducts the instance to done — dispatching each order to a
 fresh subagent, relaying knock-backs, and escalating stalls to you. Already
 have a def? *"Conduct the report workflow"* hands it to
 [`owenloop-conduct`](skills/owenloop-conduct/SKILL.md). The engine itself
-arrives via `npx owenloop` — no clone, no build, no environment variables, no
-CLI verbs to memorize.
+arrives via `npx owenloop` (Node ≥ 22.13 required) — no clone, no build, no
+environment variables, no CLI verbs to memorize.
 
 **Want to see or drive the machinery yourself?** Everything above goes
 through the same small CLI (`create`, `tick`, `green`, `reject`, …).
@@ -359,7 +359,11 @@ collections-heavy research pipeline
 Want someone else's workflow defs instead of writing your own?
 `owenloop add <owner>/<repo>` fetches a public GitHub repo's `workflows/**`,
 validates every def, and installs them locally with pinned provenance — see
-the `add` entry in [`docs/cli.md`](docs/cli.md).
+the `add` entry in [`docs/cli.md`](docs/cli.md). An installed def's steps later
+run with your workers' full privileges and owenloop never executes them itself,
+so install only sources you trust, and pin a commit SHA (`@<sha>`) for anything
+you re-add — the [trust model](docs/cli.md#add--installing-shared-workflow-defs-from-github)
+is spelled out there.
 
 Publishing your defs to a hosted hub instead? `owenloop login` authenticates
 the CLI (loopback OAuth, or a pasted token via `--with-token`; the credential
@@ -375,7 +379,8 @@ hub's own def hashes, so an unchanged re-push is a no-op. See the
 
 - **Node ≥ 22.13.** Storage is Node's built-in `node:sqlite`, which is available
   unflagged from 22.13 onward (it still prints an experimental warning until it
-  stabilises in Node 24.15 / 25.7). owenloop is an ESM-only package.
+  stabilises in Node 24.15 / 25.7). owenloop is an ESM-only package. CI runs the
+  full check on Node 22 (active LTS) and 24 (current).
 - **No native dependencies.** `node:sqlite` is built in, so there's nothing to
   compile. The only runtime deps are `yaml` (parsing defs) and
   `@cfworker/json-schema` (optional per-artifact schema validation).
@@ -463,6 +468,16 @@ fingerprint check**: a run records the version of every input it claimed, and it
 is rejected ("born-rejected") if any of those inputs moved underneath it. Each artifact
 carries a monotonic version, so the engine can always ask "is this green output still
 resting on the inputs it was built from?".
+
+**Retention and disposal.** That file is the system of record and it keeps
+everything: every artifact version's value and every run's issued order packet —
+including any sensitive values that flowed through an input — persist after a
+workflow finishes. The default location is `.owenloop/state.db` (plus its WAL
+`-wal`/`-shm` sidecar files), or wherever `--db` / `OWENLOOP_DB` / the `db:`
+embed option points. Rotating or scrubbing that data is the operator's job:
+`owenloop delete <wf>` removes an instance's rows, but SQLite frees those pages
+without erasing or shrinking the file on disk, so for reliable disposal delete
+the database file together with its `-wal`/`-shm` sidecars.
 
 ## Testing
 

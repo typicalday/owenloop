@@ -26,7 +26,7 @@ positional or the next `--flag`, never consumed as this flag's argument. Use
 | `logout [--hub <url>]` | delete the stored credential for a hub |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
-| `tick <wf> [--now=<ms>] [--shallow]` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only) |
+| `tick <wf> [--now=<ms>] [--shallow] [--label <l>]…` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only); repeatable `--label` claims unlabeled steps plus matching-label steps — see below |
 | `reap <wf> [--now]` | run the reaper; `--now` forces every claim stale (TTL 0) — see below |
 | `runs <wf> [--open]` | list this instance's runs, joining claim state for open ones |
 | `status <wf>` | derived view: `done`, `debts`, `eligible`, `blocked`, `inFlight` |
@@ -109,6 +109,35 @@ a deliberate follow-up, not yet implemented.
 
 Public repos only — no auth/token support yet; a private repo (or a bad
 ref) surfaces as a 404 from the sha-resolve step.
+
+**Trust model — what `add` does and does not protect.** Installing a package
+executes nothing at install time: `add` only fetches, validates, and writes
+YAML under the defs dir. But an installed def's steps *run* later, with
+whatever privileges the host process and its dispatcher grant their workers.
+owenloop itself never executes a step body — `worker:`/`command:` are opaque
+labels it carries through untouched and never shells out (see [What owenloop is
+not](../README.md#what-owenloop-is-not) and
+[`docs/authoring.md`](authoring.md#worker--declaring-the-executor)) — so the
+real risk surface is the conductor or worker you point at these defs: the
+prompts and `command:` strings that ship in a package are handed to agents that
+typically run with your full local privileges. **Install only sources you
+trust.**
+
+**Pin a commit SHA for anything you re-add.** `owenloop add <owner>/<repo>@<ref>`
+takes a branch, tag, or commit SHA as `<ref>` — all three resolve through
+GitHub's `GET /repos/<owner>/<repo>/commits/<ref>`. A branch or tag can move
+under you between re-adds; only a SHA guarantees the same bytes every time.
+`add` already resolves whatever `ref` you give (default `HEAD`) to a concrete
+commit sha before fetching, and records that sha in `.owenloop/installed.json`
+(above) — so a single install is already pinned by that record; the SHA
+recommendation is about following a *moving* ref across later re-adds/updates.
+
+The protections described under **Untrusted-archive safety** below guard the
+install *step* — staged all-or-nothing validation with an atomic swap, path
+containment (including symlink-aware `bodyFile` checks), and archive resource
+bounds — not the def *content* that later executes. `add` validates a def's
+structure and contains its paths; it does not sandbox or sanitize what a step
+body will do once a worker runs it. That trust decision stays yours.
 
 **Untrusted-archive safety.** `add` treats the fetched repo as untrusted and
 refuses the whole install (nothing written) on any of these:
@@ -390,6 +419,20 @@ single-instance drive. `reaped` sums across the tree and `dueAt` (when present)
 is the earliest wake across all levels. A folded deferral in the deep result
 carries its own `workflow` (absent = the root you ticked, present = a
 descendant).
+
+**Label routing (`--label`).** `tick <wf> --label <l>` (repeatable) filters
+which steps this caller claims, but only steps that carry their own `labels:`
+are ever excluded: a step is deferred with reason `label-mismatch` and left for
+another caller **only** when its `labels:` are non-empty and share no value with
+the filter you pass. A step with no `labels:` is claimed by every caller,
+filtered or not, and a tick that passes no `--label` claims every eligible step
+regardless of labels. This is **routing, not
+authorization**: any caller that can reach the database can tick without a
+filter and claim anything, so labels split work across cooperating
+orchestrators, they never enforce a boundary. See
+[`labels:`](authoring.md#labels--routing-a-step-to-a-particular-tick-caller) in
+the authoring guide for the step-side declaration and the starvation hazard to
+watch for.
 
 **Child stalls on `status`.** `status <wf>`'s `calls:`-debt entries carry a
 `child: { workflow, def, done, stalled, debts }` summary once a child has been
