@@ -24,6 +24,32 @@ function rather than a feature bolted beside it.
 - **§2.2 Task / lease** — the claimable unit of work-in-flight. One per
   `(step, key)`; `key` is `""` for plain/reduce/collection firings and the
   element path for a map firing.
+
+  **Lease lifecycle.** Claiming a firing writes `claimedAt` on the task and opens
+  a run. A lease's liveness is judged on read (at `reap`/`tick`/claim time), never
+  on a timer:
+  - **Reap TTL (the anchor rule).** A lease is fresh while
+    `now - max(claimedAt, heartbeatAt) <= ttl`, where `ttl` is the effective reap
+    TTL (engine `reapTtlMs`, default 2h; per-step `reapTtl:` overrides). A run that
+    heartbeats within the TTL is **never** reaped by this rule, however long it
+    runs — heartbeats extend the lease indefinitely. A run that goes silent past
+    the TTL is stale, reaped back to `idle` (its `attempts` bumps), and re-claimable
+    by another worker; the old run's next `green`/`close` then fails the commit CAS
+    (§12.2) with a stale-lease error.
+  - **Opt-in max-lease cap.** There is **no default cap on total lease lifetime.**
+    An operator may set one — engine `maxLeaseMs` or per-step `maxLease:` (per-step
+    overrides the engine option) — as a runaway backstop: it bounds total lifetime
+    from the original `claimedAt` regardless of heartbeats, so past
+    `claimedAt + maxLease` even a still-beating lease is reaped. The cap re-anchors
+    to the new `claimedAt` on re-claim. **Tradeoff, stated plainly:** a cap can reap
+    a healthy, still-beating job, after which another worker claims the same order —
+    duplicate execution is the price of the backstop. Leave it unset unless you
+    specifically want that bound; heartbeat liveness is already the reap signal.
+  - **Reap reasons.** When a reap clears a lease it records why, so the two failure
+    modes are distinguishable: `heartbeat-lost` (the anchor rule lapsed — the job
+    went silent) vs. `max-lease-exceeded` (a configured cap expired a still-beating
+    lease). When both bounds lapse, `heartbeat-lost` wins (a dead job is not reported
+    as cap-killed). See §24.5 / the CLI `reap` command for the full reason set.
 - **§2.3 Run** — the audit/budget record created when a task is claimed; holds the
   claim's input **fingerprint** for the commit CAS.
 

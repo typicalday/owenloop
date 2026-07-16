@@ -360,9 +360,10 @@ export interface StepDef {
    *  absent (or empty, normalized to absent at parse) = claimable by any caller.
    *  Distinct from `worker`/`workers` (executor-kind), which this never touches. */
   labels?: string[];
-  /** A3: per-step max total lease lifetime override in milliseconds — the cap on
-   *  `claimedAt + maxLease` past which renewals can no longer keep a lease fresh.
-   *  Falls back to the engine's DEFAULT_MAX_LEASE_MS. */
+  /** A3 (REL-8): per-step OPT-IN max total lease lifetime override in
+   *  milliseconds — the cap on `claimedAt + maxLease` past which renewals can no
+   *  longer keep a lease fresh. Overrides the engine `maxLeaseMs`; when both are
+   *  unset there is NO cap and heartbeats extend the lease indefinitely. */
   maxLeaseMs?: number;
   body: string; // prompt body
   /** Mode 2 foundation: name of the child workflow this step delegates to. Machine-handled, never a worker firing. */

@@ -49,8 +49,9 @@ export interface CreateEngineOpts {
   defsDir?: string;
   /** Forwarded to the `Engine` — the stranded-lease reap TTL in milliseconds. */
   reapTtlMs?: number;
-  /** Forwarded to the `Engine` — the default max total lease lifetime in
-   *  milliseconds (A3). Per-step `maxLease` overrides it. */
+  /** Forwarded to the `Engine` — an OPT-IN hard cap on total lease lifetime in
+   *  milliseconds (A3/REL-8). Per-step `maxLease` overrides it. Unset (default):
+   *  no cap; heartbeats extend a lease indefinitely. */
   maxLeaseMs?: number;
   /**
    * Forwarded to the `Engine` — the hard cap on `calls:` composition depth
