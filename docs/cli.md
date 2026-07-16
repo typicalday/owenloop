@@ -49,10 +49,18 @@ positional or the next `--flag`, never consumed as this flag's argument. Use
 `owenloop add <owner>/<repo>[@ref]` fetches a public GitHub repo's
 `workflows/**` folder (via GitHub's REST API and Node's built-in `fetch` — no
 new dependency), validates every def with the same lint/validate/`check`
-machinery `owenloop lint`/`owenloop check` use, and only then installs them
-under `<defsDir>/<owner>-<repo>/`. A def that fails parse, lint, validation,
-or has a definite `check` defect refuses the **whole** add — nothing is
-written, and every reason is printed.
+machinery `owenloop lint`/`owenloop check` use — plus a strict cross-def
+backstop (include expansion, `calls:` target/inputs/output-count checks,
+cycle detection) on the staged tree, so an error `loadDefsRaw` would
+otherwise swallow still refuses the install — and only then installs them
+under `<defsDir>/<owner>-<repo>-<hash>/`, where `<hash>` is the first 8 hex
+characters of `sha256(owner/repo)`. The hash keeps distinct sources that used
+to collide on the same `<owner>-<repo>` folder (e.g. `a-b/c` and `a/b-c`)
+from clobbering each other. `owner` and `repo` are restricted to the
+GitHub-legal charset (letters, digits, `.`, `_`, `-`) so the folder is always
+a single safe path segment. A def that fails parse, lint, validation, or has
+a definite `check` defect refuses the **whole** add — nothing is written,
+and every reason is printed.
 
 `ref` defaults to `HEAD` (the repo's default branch) and is pinned to the
 resolved commit sha before anything is fetched or installed. Provenance is
@@ -67,25 +75,37 @@ recorded in `.owenloop/installed.json`:
       "ref": "HEAD",
       "sha": "<40-char-commit-sha>",
       "installedAt": 1699999999999,
-      "path": "<owner>-<repo>",
+      "path": "<owner>-<repo>-<hash>",
       "files": ["foo.yaml", "sub/bar.yaml"]
     }
   }
 }
 ```
 
-Re-running `add` for the same repo is idempotent: it clears the previous
-install at `<defsDir>/<owner>-<repo>/` and replaces the lockfile entry, so a
-file removed upstream disappears locally too.
+Re-running `add` for the same repo is idempotent: the fetch is staged under
+`<defsDir>/.owenloop-staging/`, validated, and swapped into place with an
+atomic rename, replacing the previous install and lockfile entry so a file
+removed upstream disappears locally too. Any failure along the way (a
+validation error, a lock timeout, an interrupted rename) leaves the previous
+install and lockfile exactly as they were, with no staging debris.
+Concurrent `add` runs in the same project serialize on a `.owenloop/add.lock`
+file; one that can't acquire the lock within 10s fails cleanly instead of
+interleaving with another install. `add` also refuses to replace a
+destination folder the lockfile doesn't record this source as owning (e.g. a
+hand-placed folder that happens to collide) — remove it manually or fix the
+lockfile to proceed. A repo previously installed under the old
+`<owner>-<repo>` naming is migrated to the new hashed folder automatically,
+and the old one is removed.
 
 **Discovery limitation.** `defs`/`loadDefs` only scan the defs dir's
 top-level `*.yaml` files and immediate-subdir `workflow.yaml` files — they
-don't recurse into `<owner>-<repo>/*.yaml`. Defs installed by `add` are
-validated and recorded, but a plain `owenloop tick`/`create` against the
+don't recurse into `<owner>-<repo>-<hash>/*.yaml`. Defs installed by `add`
+are validated and recorded, but a plain `owenloop tick`/`create` against the
 default defs dir won't see them until you point `--defs` (or
 `OWENLOOP_DEFS`) directly at the installed subfolder, e.g. `--defs
-workflows/<owner>-<repo>`. Auto-discovering installed defs is a deliberate
-follow-up, not yet implemented.
+workflows/<owner>-<repo>-<hash>` — the exact folder name is in
+`.owenloop/installed.json`'s `path` field. Auto-discovering installed defs is
+a deliberate follow-up, not yet implemented.
 
 Public repos only — no auth/token support yet; a private repo (or a bad
 ref) surfaces as a 404 from the sha-resolve step.

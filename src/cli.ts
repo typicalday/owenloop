@@ -32,8 +32,7 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { execFileSync } from 'node:child_process';
@@ -47,15 +46,20 @@ import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import { buildDef, DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
-import { detId, nowMs, parseDurationMs } from './util.ts';
+import { detId, nowMs, parseDurationMs, randId } from './util.ts';
 import { extractTarGz } from './untar.ts';
 import {
+  acquireInstallLock,
   archivePathViolation,
+  commitInstall,
   githubShaUrl,
   githubTarballUrl,
-  installFiles,
+  installFolder,
   parseRepoSpec,
   readLockfile,
+  releaseInstallLock,
+  stageFiles,
+  STAGING_DIRNAME,
   writeLockfile,
 } from './add.ts';
 import type { InstalledEntry } from './add.ts';
@@ -1016,12 +1020,28 @@ function statusEntry(engine: Engine, w: WorkflowRow): Record<string, unknown> {
 const ADD_SHA_TIMEOUT_MS = 30_000;
 const ADD_TARBALL_TIMEOUT_MS = 300_000;
 
+/**
+ * `owenloop add <owner>/<repo>[@ref]` — fetch a repo's `workflows/**`, validate
+ * it, and install it under `<defsDir>/<installFolder(owner,repo)>`.
+ *
+ * The network fetch/extract/path-filter runs FIRST, unlocked (a tarball can
+ * take minutes and holding a lock that long would needlessly serialize
+ * unrelated adds). Everything that touches project state then runs under the
+ * per-project `.owenloop/add.lock`: stale-staging cleanup → lockfile read →
+ * ownership check → stage → strict validation → atomic commit → lockfile write.
+ * Deciding ownership and reading the lockfile INSIDE the lock is deliberate
+ * (TOCTOU discipline — see the store-migration knowledge node); the install is
+ * staged on the destination filesystem and swapped in with an atomic rename, so
+ * any failure leaves the previous install and lockfile exactly as they were,
+ * with no staging debris.
+ */
 async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const spec = need(args, 1, 'owner/repo[@ref]');
   const { owner, repo, ref } = parseRepoSpec(spec);
   const source = `${owner}/${repo}`;
   const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
   const lockfilePath = join(io.cwd, '.owenloop', 'installed.json');
+  const installLockPath = join(io.cwd, '.owenloop', 'add.lock');
   const fetchFn = io.fetch ?? globalThis.fetch;
 
   // 1. Resolve the ref to a pinned commit sha.
@@ -1114,19 +1134,42 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     throw new CliError(`no workflows/ directory found in ${source}@${ref}`);
   }
 
-  // 4. Validate before writing anything: stage into a throwaway temp dir and
-  //    run the SAME checks `lint`/`check` run on a normal defs dir.
-  const stagingRoot = mkdtempSync(join(tmpdir(), 'owenloop-add-'));
-  const stagingWorkflowsDir = join(stagingRoot, 'workflows');
+  // 4. Everything that touches project state runs under the per-project install
+  //    lock: concurrent `add` runs serialize instead of interleaving. The lock
+  //    is acquired only now — AFTER the (potentially slow) network fetch — so a
+  //    tarball download never blocks an unrelated add.
+  const folder = installFolder(owner, repo);
+  const stagingRoot = join(defsDir, STAGING_DIRNAME);
+  const stagingDir = join(stagingRoot, randId('stg'));
+  const lock = await acquireInstallLock(installLockPath);
   try {
-    for (const [relPath, data] of files) {
-      const full = join(stagingWorkflowsDir, relPath);
-      mkdirSync(dirname(full), { recursive: true });
-      writeFileSync(full, data);
+    // The lock holder is the only legitimate writer under the staging root, so
+    // anything already there is debris from a crashed/killed prior run — clear
+    // it. Keeps "no staging debris" true even across a Ctrl-C.
+    rmSync(stagingRoot, { recursive: true, force: true });
+
+    // Read the lockfile and decide ownership INSIDE the lock (TOCTOU: a pre-lock
+    // read could be stale by the time we act on it). A corrupt lockfile is a
+    // hard error (readLockfile), never a silent reset.
+    const lf = readLockfile(lockfilePath);
+    const dest = join(defsDir, folder);
+    const existing = lf.installed[source];
+    if (existsSync(dest) && !(existing && existing.path === folder)) {
+      throw new CliError(
+        `refusing to install ${source}: destination '${folder}' already exists and is not owned by ${source} — ` +
+          `remove it manually or fix ${lockfilePath}`,
+      );
     }
 
+    // Stage the incoming files onto the DESTINATION filesystem (under defsDir),
+    // so the commit is an atomic same-fs rename. Two-level layout keeps the
+    // staged content invisible to loadDefs(defsDir).
+    const written = stageFiles(stagingDir, files);
+
+    // 5. Validate the STAGED tree — the exact bytes that will be renamed into
+    //    place, with no re-write after validation.
     const failures: DefLoadFailure[] = [];
-    const staged = loadDefsRaw(stagingWorkflowsDir, failures);
+    const staged = loadDefsRaw(stagingDir, failures);
     const reasons: string[] = failures.map((f) => `${f.file}: ${f.error}`);
 
     for (const stagedDef of staged.values()) {
@@ -1162,18 +1205,40 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
       }
     }
 
+    // Strict backstop: only if the aggregate pass found nothing, run the FULL
+    // loadDefs on the staged tree. `loadDefsRaw` is best-effort — it swallows
+    // include-expansion failures and cross-def `calls:` errors that strict
+    // `loadDefs` (via finalizeDefs) throws on. Every later command loads the
+    // installed dir with strict `loadDefs`, so this guarantees whatever we
+    // commit cannot make a subsequent `loadDefs` of that dir throw.
+    if (reasons.length === 0) {
+      try {
+        loadDefs(stagingDir);
+      } catch (e) {
+        if (e instanceof DefError) {
+          reasons.push(`cross-definition validation failed: ${e.message}`);
+        } else {
+          throw e;
+        }
+      }
+    }
+
     if (reasons.length > 0) {
       throw new CliError(
         `refusing to install ${source}@${sha} — ${reasons.length} problem(s) found; nothing written:\n  - ${reasons.join('\n  - ')}`,
       );
     }
 
-    // 5. Install (idempotent — clears any prior install at this folder first).
-    const folder = `${owner}-${repo}`;
-    const written = installFiles(defsDir, folder, files);
+    // 6. Commit: atomically swap the validated staging dir into place (with
+    //    rollback on failure), then remove any old-naming dir this source used
+    //    to occupy, then write the lockfile atomically.
+    commitInstall(defsDir, folder, stagingDir);
+    if (existing && existing.path !== folder) {
+      // Migrating off the old `<owner>-<repo>` scheme: this source owns the old
+      // dir per the lockfile, so it is safe to drop now that the new one is in.
+      rmSync(join(defsDir, existing.path), { recursive: true, force: true });
+    }
 
-    // 6. Record provenance.
-    const lf = readLockfile(lockfilePath);
     const entry: InstalledEntry = { source, ref, sha, installedAt: nowMs(), path: folder, files: written };
     lf.installed[source] = entry;
     writeLockfile(lockfilePath, lf);
@@ -1190,7 +1255,10 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     });
     return 0;
   } finally {
+    // On success the staging dir was renamed away and its backup removed; on
+    // failure this clears whatever staging debris is left. Then release the lock.
     rmSync(stagingRoot, { recursive: true, force: true });
+    releaseInstallLock(lock);
   }
 }
 
