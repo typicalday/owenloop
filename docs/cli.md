@@ -287,7 +287,8 @@ the reap TTL — the job went silent), `max-lease-exceeded` (a configured
 `maxLeaseMs`/`maxLease:` cap expired a still-beating lease — only ever seen when
 a cap is set), `run-missing` / `run-closed` (the owning run is gone or already
 closed), or `forced` (a `--now` stand-down cleared a lease that was still fresh
-under the real TTL — reported instead of a misleading liveness reason). `owenloop runs <wf> [--open]` and
+under the real TTL — reported instead of a misleading liveness reason).
+`owenloop runs <wf> [--open]` and
 `status <wf>`'s `inFlight` array are the read side: `runs` lists every run
 this instance has ever had (with `--open` filtering to still-open ones, each
 joined with its owning task's `claimedAt`/`heartbeatAt`/`attempts`), while
