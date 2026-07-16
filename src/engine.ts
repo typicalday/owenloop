@@ -285,47 +285,110 @@ export class Engine {
   createInstance(defName: string, opts: CreateOpts = {}): string {
     const def = this.resolveDef(defName);
     const id = randId('wf');
-    this.store.tx(() => {
-      // §28: pin this instance to the def it was created against — a snapshot
-      // of the fully-expanded compiled def plus its content hash. Every new
-      // instance is stamped; "no snapshot" is strictly a legacy-row
-      // compatibility case (see defFor), never a choice made here.
-      const wfData: {
-        def: string; title?: string; params?: Record<string, string>;
-        defSnapshot: WorkflowDef; defHash: string;
-      } = { def: defName, defSnapshot: def, defHash: hashDef(def) };
-      if (opts.title !== undefined) wfData.title = opts.title;
-      if (opts.params !== undefined) wfData.params = opts.params;
-      this.store.insertWorkflow(id, wfData, opts.producedBy);
-
-      for (const input of def.inputs) {
-        const provided = opts.provide?.[input.name];
-        if (provided !== undefined && input.schema !== undefined) {
-          const check = validateValue(input.schema, provided);
-          if (!check.valid) {
-            throw new SchemaRefusalError(input.name, check.issues);
-          }
-        }
-        const seedGreen = !input.seedOwed || provided !== undefined;
-        const a: ArtifactData = {
-          workflow: id,
-          path: input.name,
-          producer: input.producer,
-          acceptance: seedGreen ? 'green' : 'owed',
-          version: seedGreen ? 1 : 0,
-          reasons: [],
-          judgmentRejects: 0,
-          schemaRejects: 0,
-        };
-        if (provided !== undefined) a.value = provided;
-        this.store.putArtifact(a);
-      }
-      this.settle(id, def);
-      return id;
-    });
+    this.store.tx(() => this.createInstanceInTx(defName, def, id, opts));
     this.fire({ type: 'instance', workflow: id, def: defName });
     this.fireSettled(id);
     return id;
+  }
+
+  /**
+   * The transactional body of instance creation: persist the workflow row, seed
+   * its declared inputs (validating any provided values), and settle. MUST run
+   * inside a `store.tx()` — callers own the tx and the post-commit event firing.
+   * Extracted from {@link createInstance} so the atomic child-spawn path
+   * ({@link spawnChildIfAbsent}) can insert-or-read a child under a single
+   * `BEGIN IMMEDIATE` without nesting transactions.
+   */
+  private createInstanceInTx(defName: string, def: WorkflowDef, id: string, opts: CreateOpts): void {
+    // §28: pin this instance to the def it was created against — a snapshot
+    // of the fully-expanded compiled def plus its content hash. Every new
+    // instance is stamped; "no snapshot" is strictly a legacy-row
+    // compatibility case (see defFor), never a choice made here.
+    const wfData: {
+      def: string; title?: string; params?: Record<string, string>;
+      defSnapshot: WorkflowDef; defHash: string;
+    } = { def: defName, defSnapshot: def, defHash: hashDef(def) };
+    if (opts.title !== undefined) wfData.title = opts.title;
+    if (opts.params !== undefined) wfData.params = opts.params;
+    this.store.insertWorkflow(id, wfData, opts.producedBy);
+
+    for (const input of def.inputs) {
+      const provided = opts.provide?.[input.name];
+      if (provided !== undefined && input.schema !== undefined) {
+        const check = validateValue(input.schema, provided);
+        if (!check.valid) {
+          throw new SchemaRefusalError(input.name, check.issues);
+        }
+      }
+      const seedGreen = !input.seedOwed || provided !== undefined;
+      const a: ArtifactData = {
+        workflow: id,
+        path: input.name,
+        producer: input.producer,
+        acceptance: seedGreen ? 'green' : 'owed',
+        version: seedGreen ? 1 : 0,
+        reasons: [],
+        judgmentRejects: 0,
+        schemaRejects: 0,
+      };
+      if (provided !== undefined) a.value = provided;
+      this.store.putArtifact(a);
+    }
+    this.settle(id, def);
+  }
+
+  /**
+   * REL-5: atomically attach-or-create the child instance for a `calls:` step.
+   * The check-then-insert runs inside ONE `BEGIN IMMEDIATE` transaction, so two
+   * concurrent driver ticks (even in separate processes) serialize on the write
+   * lock: the first inserts the child, the second observes it and re-attaches —
+   * never two children for the same parent coordinate. The v8 partial unique
+   * index (`workflow_produced_by_unique`) is the physical backstop.
+   *
+   * Returns the child id and whether THIS call created it. Events (`instance`,
+   * `settled`) are the caller's responsibility and must fire only when
+   * `created` is true — a re-attach (or a lost race) must be silent, matching
+   * the pre-REL-5 re-attach behavior.
+   *
+   * A `SchemaRefusalError` (a provided parent value illegal per the child's
+   * input schema) propagates out with the tx rolled back — no orphan child row
+   * — preserving the F2 contract in `maintainCalls`.
+   */
+  private spawnChildIfAbsent(
+    defName: string,
+    parentWf: string,
+    callsPath: string,
+    seedProvide: Record<string, Record<string, unknown>>,
+  ): { id: string; created: boolean } {
+    const def = this.resolveDef(defName);
+    const run = (): { id: string; created: boolean } =>
+      this.store.tx(() => {
+        const existing = this.store.findChildByParent(parentWf, callsPath);
+        if (existing) return { id: existing.id, created: false };
+        const id = randId('wf');
+        this.createInstanceInTx(defName, def, id, {
+          producedBy: { parentWf, parentPath: callsPath },
+          provide: seedProvide,
+        });
+        return { id, created: true };
+      });
+    try {
+      return run();
+    } catch (err) {
+      // Constraint backstop for any future concurrent writer that isn't
+      // serialized by BEGIN IMMEDIATE: if the insert lost a race on the unique
+      // index, the winner's row is already committed — read and re-attach to it.
+      // Unreachable under node:sqlite's synchronous, write-lock-serialized
+      // connections, but cheap and correct defense.
+      if (
+        err instanceof Error &&
+        /UNIQUE constraint failed: workflow\.produced_by_wf/.test(err.message)
+      ) {
+        const winner = this.store.findChildByParent(parentWf, callsPath);
+        if (winner) return { id: winner.id, created: false };
+      }
+      throw err;
+    }
   }
 
   /** A human/external producer supplies (greens) an owed input. */
@@ -579,12 +642,12 @@ export class Engine {
           // still throw) and record it as a debt on the PARENT calls artifact,
           // mirroring green()'s schema-reject branch, so the tick proceeds
           // instead of crash-looping every subsequent tick(parent).
-          let childId: string;
+          let spawn: { id: string; created: boolean };
           try {
-            childId = this.createInstance(step.calls, {
-              producedBy: { parentWf, parentPath: callsPath },
-              provide: seedProvide,
-            });
+            // REL-5: atomic insert-or-read inside BEGIN IMMEDIATE — a concurrent
+            // tick that already spawned the child is re-attached here rather
+            // than duplicated. Events fire only when THIS call created it.
+            spawn = this.spawnChildIfAbsent(step.calls, parentWf, callsPath, seedProvide);
           } catch (err) {
             if (err instanceof SchemaRefusalError) {
               this.recordCallsSchemaReject(parentWf, def, callsStem, gateStems, err, now);
@@ -592,7 +655,11 @@ export class Engine {
             }
             throw err;
           }
-          existingChild = this.store.getWorkflow(childId);
+          if (spawn.created) {
+            this.fire({ type: 'instance', workflow: spawn.id, def: step.calls });
+            this.fireSettled(spawn.id);
+          }
+          existingChild = this.store.getWorkflow(spawn.id);
         }
         // else: RE-ATTACH — existingChild is the already-spawned child; no new spawn.
 

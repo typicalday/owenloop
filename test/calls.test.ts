@@ -1289,3 +1289,134 @@ test('calls: (REL-4) an unset maxCallDepth leaves a modest real composition unaf
   assert.equal(store.getArtifact(child!.id, 'result')?.acceptance !== 'rejected', true);
   store.close();
 });
+
+// ---- (11) REL-5: two engines on the same DB converge on exactly one child ----
+
+test('calls: REL-5 — two engines over one DB file spawn exactly one child (atomic re-attach)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-rel5-'));
+  const dbPath = join(dir, 'concurrent.db');
+  try {
+    const byName = new Map([childDef, parentDef].map((d) => [d.name, d]));
+    const resolver = (name: string): WorkflowDef => {
+      const d = byName.get(name);
+      if (!d) throw new Error(`no def: ${name}`);
+      return d;
+    };
+    // Two independent engines/connections over the SAME database file — the
+    // cross-process shape REL-5 guards against.
+    const store1 = openStore(dbPath);
+    const store2 = openStore(dbPath);
+    const engine1 = new Engine(store1, resolver);
+    const engine2 = new Engine(store2, resolver);
+
+    // Count child-spawn 'instance' events observed by each engine.
+    let e1Instances = 0;
+    let e2Instances = 0;
+    engine1.subscribe((e) => { if (e.type === 'instance') e1Instances++; });
+    engine2.subscribe((e) => { if (e.type === 'instance') e2Instances++; });
+
+    // Create the parent and green its gate (sandbox) via engine1.
+    const parentWf = engine1.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+    const tick1 = engine1.tick(parentWf, { deep: false });
+    const provRun = tick1.orders.find((o) => o.step === 'provision')!.run;
+    engine1.green(parentWf, provRun, 'sandbox', { env: 'v1' });
+    engine1.close(parentWf, provRun);
+
+    // Both connections see no child yet (the pre-spawn stale-read both drivers
+    // would observe under a real race).
+    assert.equal(store1.findChildByParent(parentWf, 'delivered'), undefined);
+    assert.equal(store2.findChildByParent(parentWf, 'delivered'), undefined);
+
+    // Ignore the parent-creation instance event; measure only the child spawn.
+    e1Instances = 0;
+    e2Instances = 0;
+
+    // Both engines maintain the same parent's calls: step. The first spawns the
+    // child atomically; the second observes the committed child and re-attaches.
+    engine1.tick(parentWf, { deep: false });
+    engine2.tick(parentWf, { deep: false });
+
+    // Exactly one child, seen identically by both connections.
+    const children1 = store1.listChildrenByParent(parentWf);
+    const children2 = store2.listChildrenByParent(parentWf);
+    assert.equal(children1.length, 1, 'exactly one child despite two engines ticking the same parent');
+    assert.equal(children2.length, 1, 'the second connection sees the same single child');
+    assert.equal(children1[0]!.id, children2[0]!.id, 'both engines converge on the same child id');
+
+    // Only the engine that actually created the child fires an 'instance' event;
+    // the re-attaching engine is silent (matches pre-REL-5 re-attach semantics).
+    assert.equal(e1Instances, 1, 'the spawning engine fires exactly one instance event');
+    assert.equal(e2Instances, 0, 're-attaching engine fires no instance event');
+
+    store1.close();
+    store2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- (12) REL-5: the loser's spawn path re-attaches (created: false) ---------
+//
+// Test (11) drives the loser via engine2.tick, whose STEP 2 read sees the
+// already-committed child and takes the RE-ATTACH branch — so it never enters
+// spawnChildIfAbsent at all. That leaves the primary REL-5 race eliminator —
+// spawnChildIfAbsent's in-tx re-check (`if (existing) return { created: false }`)
+// and its `created: false` return — unexercised: a regression that hoisted the
+// re-check out of the tx or broke the created flag would keep the suite green.
+// Here we drive the loser's spawn path DIRECTLY against a committed child and
+// assert it re-attaches to the winner without creating a second row or firing.
+test('calls: REL-5 — losing spawnChildIfAbsent re-attaches to the winner (created: false, no event)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-rel5-loser-'));
+  const dbPath = join(dir, 'concurrent.db');
+  try {
+    const byName = new Map([childDef, parentDef].map((d) => [d.name, d]));
+    const resolver = (name: string): WorkflowDef => {
+      const d = byName.get(name);
+      if (!d) throw new Error(`no def: ${name}`);
+      return d;
+    };
+    const store1 = openStore(dbPath);
+    const store2 = openStore(dbPath);
+    const engine1 = new Engine(store1, resolver);
+    const engine2 = new Engine(store2, resolver);
+
+    let e2Instances = 0;
+    engine2.subscribe((e) => { if (e.type === 'instance') e2Instances++; });
+
+    // engine1 creates the parent, greens the gate, and spawns the child (winner).
+    const parentWf = engine1.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+    const tick1 = engine1.tick(parentWf, { deep: false });
+    const provRun = tick1.orders.find((o) => o.step === 'provision')!.run;
+    engine1.green(parentWf, provRun, 'sandbox', { env: 'v1' });
+    engine1.close(parentWf, provRun);
+    engine1.tick(parentWf, { deep: false }); // spawns the child
+
+    const winner = store1.findChildByParent(parentWf, 'delivered');
+    assert.ok(winner, 'engine1 spawned the winning child');
+    e2Instances = 0; // ignore any earlier engine2-observed events
+
+    // Drive engine2's spawn path directly with the SAME coordinates a losing
+    // driver's maintainCalls STEP 3 would use (callsInputs { data: sandbox },
+    // sandbox = { env: 'v1' }). It must re-attach to the winner, not create a
+    // second child, and — since it did not create — fire no instance event.
+    const spawn = (
+      engine2 as unknown as {
+        spawnChildIfAbsent(
+          defName: string,
+          parentWf: string,
+          callsPath: string,
+          seedProvide: Record<string, Record<string, unknown>>,
+        ): { id: string; created: boolean };
+      }
+    ).spawnChildIfAbsent('childDef', parentWf, 'delivered', { data: { env: 'v1' } });
+
+    assert.deepEqual(spawn, { id: winner!.id, created: false }, 'loser re-attaches to the winner with created: false');
+    assert.equal(store2.listChildrenByParent(parentWf).length, 1, 'no second child row was created');
+    assert.equal(e2Instances, 0, 'a re-attaching (created: false) spawn fires no instance event');
+
+    store1.close();
+    store2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -329,8 +329,8 @@ test('migration: a v6 DB missing order_json upgrades to v7 and legacy runs read 
     raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('6', 'schema_version');
     raw.close();
 
-    const s2 = new Store(dbPath); // migrate() must re-add order_json, bump to 7
-    assert.equal(s2.getMeta('schema_version'), '7', 'upgraded to current SCHEMA_VERSION');
+    const s2 = new Store(dbPath); // migrate() must re-add order_json, bump to current
+    assert.equal(s2.getMeta('schema_version'), '8', 'upgraded to current SCHEMA_VERSION');
     const cols = (s2.db.prepare('PRAGMA table_info(run)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('order_json'), 'order_json column re-added by migrate()');
     assert.equal(s2.getRun(legacy)?.order, undefined, 'legacy run reads order undefined');
@@ -673,7 +673,7 @@ test('tx() BEGIN IMMEDIATE: second connection is blocked at BEGIN, not mid-write
 
 test('fresh database stamps schema_version to current SCHEMA_VERSION, no throw', () => {
   const s = mem();
-  assert.equal(s.getMeta('schema_version'), '7');
+  assert.equal(s.getMeta('schema_version'), '8');
   s.close();
 });
 
@@ -684,7 +684,7 @@ test('opening a DB already at current SCHEMA_VERSION is a no-op, no throw', () =
     const s1 = new Store(dbPath);
     s1.close();
     const s2 = new Store(dbPath); // reopen at same version — must not throw
-    assert.equal(s2.getMeta('schema_version'), '7');
+    assert.equal(s2.getMeta('schema_version'), '8');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -700,7 +700,7 @@ test('opening a DB with an older schema_version upgrades normally (regression gu
     s1.close();
 
     const s2 = new Store(dbPath); // must NOT throw
-    assert.equal(s2.getMeta('schema_version'), '7', 'upgrades to current SCHEMA_VERSION');
+    assert.equal(s2.getMeta('schema_version'), '8', 'upgrades to current SCHEMA_VERSION');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -713,17 +713,17 @@ test('opening a DB with a newer-than-binary schema_version throws StoreVersionEr
   try {
     // Create a normal DB, then simulate a newer binary having stamped it.
     const s1 = new Store(dbPath);
-    s1.setMeta('schema_version', '8');
+    s1.setMeta('schema_version', '9');
     s1.close();
 
-    // Reopening at this binary's SCHEMA_VERSION ('7') must refuse.
+    // Reopening at this binary's SCHEMA_VERSION ('8') must refuse.
     assert.throws(() => new Store(dbPath), StoreVersionError);
 
     // Direct raw read proves schema_version was NOT rewritten downward by
     // the throwing constructor.
     const raw = new DatabaseSync(dbPath);
     const row = raw.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
-    assert.equal(row.v, '8', 'schema_version must remain at the newer stamped value, never rewritten down');
+    assert.equal(row.v, '9', 'schema_version must remain at the newer stamped value, never rewritten down');
     raw.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -742,7 +742,7 @@ test('§28: old-DB-upgrades-fine at the current SCHEMA_VERSION (def_snapshot/def
     s1.close();
 
     const s2 = new Store(dbPath); // must NOT throw
-    assert.equal(s2.getMeta('schema_version'), '7');
+    assert.equal(s2.getMeta('schema_version'), '8');
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('def_snapshot'));
     assert.ok(cols.includes('def_hash'));
@@ -752,20 +752,202 @@ test('§28: old-DB-upgrades-fine at the current SCHEMA_VERSION (def_snapshot/def
   }
 });
 
-test('§28: newer-than-binary (9) still refuses to open at current SCHEMA_VERSION', () => {
+test('§28: newer-than-binary (99) still refuses to open at current SCHEMA_VERSION', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-schemaver-'));
   const dbPath = join(dir, 'test.db');
   try {
     const s1 = new Store(dbPath);
-    s1.setMeta('schema_version', '9');
+    s1.setMeta('schema_version', '99');
     s1.close();
 
     assert.throws(() => new Store(dbPath), StoreVersionError);
 
     const raw = new DatabaseSync(dbPath);
     const row = raw.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
-    assert.equal(row.v, '9', 'schema_version must remain at the newer stamped value, never rewritten down');
+    assert.equal(row.v, '99', 'schema_version must remain at the newer stamped value, never rewritten down');
     raw.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- REL-5: downgrade-protection + atomic child creation --------------------
+
+test('REL-5: refusing a newer-version DB performs ZERO on-disk mutation (file byte-identical)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-nomutate-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    // Materialize a normal DB, stamp it newer-than-binary, and close so WAL is
+    // checkpointed into the main file — the file is now fully self-contained.
+    const s1 = new Store(dbPath);
+    s1.setMeta('schema_version', '99');
+    s1.close();
+
+    // Snapshot the main DB file exactly as it sits before the refused open.
+    const before = readFileSync(dbPath);
+
+    // The refused open must read/compare the version and throw BEFORE any DDL,
+    // migration, or version stamp runs — the old ordering ran the schema first
+    // and mutated the file (e.g. added order_json) before refusing.
+    assert.throws(() => new Store(dbPath), StoreVersionError);
+
+    const after = readFileSync(dbPath);
+    assert.ok(before.equals(after), 'refused open must not mutate the main database file');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('REL-5: migration is transactional — a failure mid-migrate rolls back, old version intact', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-txmig-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    // Build a v6-shaped fixture: open at current, then raw-revert to a pre-v7,
+    // pre-v8 shape (drop order_json, stamp '6'). Also sabotage the migration so
+    // migrate()'s CREATE UNIQUE INDEX fails: drop the v8 unique index and put a
+    // TABLE of the same name in its place — `CREATE UNIQUE INDEX IF NOT EXISTS`
+    // only suppresses an existing INDEX, so a same-named TABLE still errors.
+    const s1 = new Store(dbPath);
+    s1.close();
+
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('DROP INDEX IF EXISTS workflow_produced_by_unique');
+    raw.exec('ALTER TABLE run DROP COLUMN order_json');
+    raw.exec('CREATE TABLE workflow_produced_by_unique (x INTEGER)');
+    raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('6', 'schema_version');
+    raw.close();
+
+    // Reopening runs the migration inside one BEGIN IMMEDIATE. The unique-index
+    // step fails on the name collision, so the WHOLE migration rolls back —
+    // including the earlier order_json re-add and the version stamp.
+    assert.throws(() => new Store(dbPath));
+
+    const check = new DatabaseSync(dbPath);
+    const ver = check.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
+    assert.equal(ver.v, '6', 'failed migration must leave the old schema_version intact');
+    const cols = (check.prepare('PRAGMA table_info(run)').all() as Array<{ name: string }>).map((c) => c.name);
+    assert.ok(!cols.includes('order_json'), 'the earlier order_json ALTER must have rolled back with the failed tx');
+    check.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('REL-5: the migration tx re-checks schema_version under the write lock (TOCTOU guard)', () => {
+  // The constructor's pre-tx version check is racy: between it and acquiring
+  // BEGIN IMMEDIATE, another (newer) binary can migrate the file and stamp a
+  // higher version. The fix re-reads schema_version as the FIRST statement
+  // inside the migration tx and refuses if it is now newer, so an older binary
+  // can never run its DDL over — and stamp the version back down on — a newer
+  // file. That in-tx re-check is `refuseIfNewer()`; assert it refuses a value a
+  // second connection committed AFTER this store opened (the exact interleaving
+  // the pre-tx check would miss), and leaves the on-disk version untouched.
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-toctou-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    const s = new Store(dbPath); // opens clean at the current version ('8')
+    // A concurrent newer binary migrates + stamps the shared file.
+    const other = new DatabaseSync(dbPath);
+    other.prepare('INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(
+      'schema_version',
+      '99',
+    );
+    other.close();
+
+    // The live connection's re-read (what the in-tx guard runs) must now refuse.
+    const refuse = (s as unknown as { refuseIfNewer(): string | undefined }).refuseIfNewer.bind(s);
+    assert.throws(refuse, StoreVersionError, 'in-tx re-check must refuse a version bumped newer after open');
+
+    // Refusing performed no write — the stamped value is untouched.
+    const raw = new DatabaseSync(dbPath);
+    const row = raw.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
+    assert.equal(row.v, '99', 'the re-check must not rewrite the newer version down');
+    raw.close();
+    s.close();
+
+    // Sanity: at the binary's own version the same re-check passes and returns
+    // the stored value (no throw) — it only refuses strictly-newer DBs.
+    const cleanPath = join(dir, 'clean.db');
+    const s2 = new Store(cleanPath);
+    const check = (s2 as unknown as { refuseIfNewer(): string | undefined }).refuseIfNewer.bind(s2);
+    assert.equal(check(), '8', 're-check returns the current version and does not throw at parity');
+    s2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('REL-5: v8 partial unique index prevents duplicate children, allows NULL-coord top-level rows', () => {
+  const s = mem();
+  const parentWf = randId('wf');
+
+  // First child for (parentWf, 'deliver') — fine.
+  s.insertWorkflow(randId('wf'), { def: 'childDef' }, { parentWf, parentPath: 'deliver' });
+  // Second child with the SAME parent coordinate must violate the unique index.
+  assert.throws(
+    () => s.insertWorkflow(randId('wf'), { def: 'childDef' }, { parentWf, parentPath: 'deliver' }),
+    /UNIQUE constraint failed: workflow\.produced_by_wf/,
+    'a second child for the same parent coordinate must be rejected',
+  );
+
+  // Same parent, DIFFERENT path — allowed (distinct calls: step).
+  s.insertWorkflow(randId('wf'), { def: 'childDef' }, { parentWf, parentPath: 'other' });
+  // Two top-level instances (NULL coordinates) never conflict — the index is partial.
+  s.insertWorkflow(randId('wf'), { def: 'top' });
+  s.insertWorkflow(randId('wf'), { def: 'top' });
+
+  s.close();
+});
+
+test('REL-5: legacy duplicate children are tolerated on open (index skipped, no data deleted)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-legacydupe-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    // Create the schema, then drop the unique index so we can raw-insert the
+    // kind of duplicate the OLD race could have produced, and stamp a pre-v8
+    // version so reopening runs migrate().
+    const s1 = new Store(dbPath);
+    s1.close();
+
+    const parentWf = randId('wf');
+    const older = randId('wf');
+    const newer = randId('wf');
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('DROP INDEX IF EXISTS workflow_produced_by_unique');
+    const ins = raw.prepare(
+      `INSERT INTO workflow (id, def, produced_by_wf, produced_by_path, created_at) VALUES (?, ?, ?, ?, ?)`,
+    );
+    ins.run(older, 'childDef', parentWf, 'deliver', 1000);
+    ins.run(newer, 'childDef', parentWf, 'deliver', 2000);
+    raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('7', 'schema_version');
+    raw.close();
+
+    // Reopening must NOT throw and must NOT delete data — it tolerates the
+    // duplicates and simply skips creating the unique index.
+    const s2 = new Store(dbPath);
+    assert.equal(s2.getMeta('schema_version'), '8', 'still upgrades the version stamp');
+    const idxRow = s2.db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'workflow_produced_by_unique'`)
+      .get();
+    assert.equal(idxRow, undefined, 'unique index is skipped while legacy duplicates exist');
+    assert.equal(s2.listChildrenByParent(parentWf).length, 2, 'no data deleted — both duplicates remain');
+    // findChildByParent picks the oldest, stably across calls.
+    assert.equal(s2.findChildByParent(parentWf, 'deliver')?.id, older);
+    assert.equal(s2.findChildByParent(parentWf, 'deliver')?.id, older);
+    s2.close();
+
+    // After the operator removes the offending duplicate, the next open creates
+    // the index.
+    const raw2 = new DatabaseSync(dbPath);
+    raw2.prepare('DELETE FROM workflow WHERE id = ?').run(newer);
+    raw2.close();
+
+    const s3 = new Store(dbPath);
+    const idxNow = s3.db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'workflow_produced_by_unique'`)
+      .get();
+    assert.ok(idxNow !== undefined, 'unique index is created once the duplicates are gone');
+    s3.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
