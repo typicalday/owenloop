@@ -97,7 +97,12 @@ These four commands publish local workflow defs to a hosted **hub** (default
 `OWENLOOP_HUB` env var). They are the only network-bound commands besides
 `add`, and they talk only to endpoints the hub exposes today — no new
 service-side surface. The hub URL is normalized to its origin
-(`scheme://host[:port]`); path/query are dropped.
+(`scheme://host[:port]`); path/query are dropped. `https` is required for
+every hub origin except the loopback hosts (`127.0.0.1`, `::1`, `localhost`),
+which may use `http` for local development — a remote `http` URL is rejected at
+normalization time so a plaintext origin can never be persisted as a credential
+key or project binding. A legacy `hub.json` carrying a remote-http origin is
+likewise refused at push time, with a hint to re-run `owenloop connect`.
 
 ### `login` — authenticate the CLI against a hub
 
@@ -165,8 +170,12 @@ and no new version is minted — `push`'s JSON distinguishes `pushed`
 (version-forwarded) from `noop` (server said unchanged) from `unchanged`
 (skipped locally, never sent). `--force` re-sends every selected def
 regardless of the local diff. A `<defName>` that doesn't resolve is an error;
-an `{ok:false}` from the hub mid-batch records the defs that did land and
-exits 1.
+an `{ok:false}` (or a malformed `2xx` whose identity fields don't match the
+pushed def) from the hub mid-batch records that def under `failed`, keeps the
+defs that did land, and exits 1. A `429` (rate limited) instead halts the whole
+batch: the current def is recorded as `failed`, the not-yet-attempted remainder
+is reported under a `skipped` output key, and any `Retry-After` the hub sent is
+surfaced in the error.
 
 The def hash is computed by re-parsing the raw YAML with no checkout-specific
 `baseDir` — the same canonicalization the hub applies — so it's portable
