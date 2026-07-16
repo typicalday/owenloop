@@ -102,6 +102,41 @@ export interface ArtifactData {
   approvals?: Record<string, number>;
 }
 
+/** An immutable payload snapshot made whenever an artifact receives a new version. */
+export interface ArtifactVersion {
+  id: string;
+  workflow: string;
+  path: string;
+  version: number;
+  producer: string;
+  value?: Record<string, unknown>;
+  fingerprint?: Fingerprint;
+  initialAcceptance: Acceptance;
+  createdAt: number;
+}
+
+/** One immutable lifecycle transition for an artifact version (version 0 is valid). */
+export interface ArtifactEvent {
+  id: string;
+  workflow: string;
+  path: string;
+  version: number;
+  action: string;
+  actor: Author;
+  reason?: string;
+  timestamp: number;
+  kind?: RejectKind;
+  metadata?: Record<string, unknown>;
+}
+
+/** Narrow history read used by consumers that open a single artifact. */
+export interface ArtifactHistory {
+  current: ArtifactData & { id: string; updatedAt: number };
+  versions: Array<ArtifactVersion & { events: ArtifactEvent[] }>;
+  /** Events associated with version zero, before a payload has been produced. */
+  events: ArtifactEvent[];
+}
+
 /** A task/lease node — the claimable unit of work-in-flight (design §2.2). */
 export interface TaskData {
   workflow: string;

@@ -511,8 +511,17 @@ test('forward cascade: re-deciding plan structurally re-rejects the green pr', (
   assert.equal(pr?.kind, 'structural'); // the engine's cascade
   // structural rejects do NOT count toward the §6 stall cap
   assert.equal(store.getArtifact(wf, 'pr')?.judgmentRejects, 0);
+  const prHistory = store.getArtifactHistory(wf, 'pr');
+  assert.ok(prHistory?.versions[0]?.events.some((event) =>
+    event.action === 'reject' && event.actor === 'engine' && event.kind === 'structural'),
+  'the downstream invalidation is retained as an engine-authored structural cascade event');
   // only planner is eligible now (builder's input went non-green)
   assert.deepEqual(s.eligible.map((e) => e.step), ['planner']);
+
+  engine.retry(wf, 'pr', 'human', 'rebuild after cascade');
+  assert.ok(store.getArtifactHistory(wf, 'pr')?.versions[0]?.events.some((event) =>
+    event.action === 'retry' && event.actor === 'human'),
+  'an explicit re-arm is retained with its human actor on the affected version');
 
   // re-green the plan; builder re-arms and we can proceed
   complete(engine, wf, fire(engine, wf, 'planner', 3000), { plan: 'v2' });

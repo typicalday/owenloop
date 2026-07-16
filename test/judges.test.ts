@@ -148,6 +148,11 @@ test('judges: (a) producer commit lands submitted; both judges approve → green
   assert.equal(finalArt?.acceptance, 'green');
   assert.deepEqual(finalArt?.approvals, { completeness: 1, rigor: 1 });
 
+  const history = store.getArtifactHistory(wf, 'report');
+  const lifecycle = history?.versions[0]?.events.filter((event) => event.action === 'judge-approved');
+  assert.deepEqual(lifecycle?.map((event) => event.actor).sort(), ['completeness', 'rigor'],
+    'both the partial and final multi-judge approvals are attributed to their judge');
+
   const status2 = engine.status(wf);
   assert.equal(status2.done, true);
   assert.equal(status2.pending.length, 0);
@@ -413,6 +418,9 @@ test('judges: (g) human green on a submitted artifact bypasses all pending judge
   const art = getArt(store, wf, 'report');
   assert.equal(art?.acceptance, 'green');
   assert.equal(art?.approvals, undefined, 'the human bypass does not sign the ledger, it overrides it');
+  const history = store.getArtifactHistory(wf, 'report');
+  assert.ok(history?.versions[1]?.events.some((event) => event.action === 'green' && event.actor === 'human'),
+    'a human green is recorded as a human lifecycle action, not as the producer');
 
   const status = engine.status(wf);
   assert.equal(status.done, true);

@@ -77,6 +77,26 @@ test('artifact upsert replaces and preserves JSON fields', () => {
   s.close();
 });
 
+test('artifact history retains immutable versions and lifecycle events', () => {
+  const s = mem();
+  const wf = randId('wf');
+  s.putArtifact(artifact(wf, 'pr', { acceptance: 'green', version: 1, value: { url: 'v1' }, fingerprint: { plan: 1 } }));
+  s.putArtifact(artifact(wf, 'pr', {
+    acceptance: 'rejected', version: 1, value: { url: 'v1' }, fingerprint: { plan: 1 },
+    reasons: [{ at: 10, action: 'reject', kind: 'judgment', by: 'review', text: 'fix checks', fromVersion: 1 }], judgmentRejects: 1,
+  }));
+  s.putArtifact(artifact(wf, 'pr', { acceptance: 'green', version: 2, value: { url: 'v2' }, fingerprint: { plan: 2 } }));
+  const history = s.getArtifactHistory(wf, 'pr');
+  assert.deepEqual(history?.versions.map((v) => v.value), [{ url: 'v1' }, { url: 'v2' }]);
+  assert.deepEqual(history?.versions.map((v) => v.fingerprint), [{ plan: 1 }, { plan: 2 }]);
+  assert.ok(history?.versions[0]?.events.some((event) => event.action === 'produced'));
+  assert.ok(history?.versions[0]?.events.some((event) => event.reason === 'fix checks'));
+  assert.equal(history?.current.value?.url, 'v2');
+  s.deleteArtifact(wf, 'pr');
+  assert.equal(s.getArtifactHistory(wf, 'pr'), undefined);
+  s.close();
+});
+
 test('deleteArtifact removes a single artifact, scoped by workflow + path', () => {
   const s = mem();
   const wf = randId('wf');
@@ -330,7 +350,7 @@ test('migration: a v6 DB missing order_json upgrades to v7 and legacy runs read 
     raw.close();
 
     const s2 = new Store(dbPath); // migrate() must re-add order_json, bump to current
-    assert.equal(s2.getMeta('schema_version'), '8', 'upgraded to current SCHEMA_VERSION');
+    assert.equal(s2.getMeta('schema_version'), '9', 'upgraded to current SCHEMA_VERSION');
     const cols = (s2.db.prepare('PRAGMA table_info(run)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('order_json'), 'order_json column re-added by migrate()');
     assert.equal(s2.getRun(legacy)?.order, undefined, 'legacy run reads order undefined');
@@ -341,6 +361,43 @@ test('migration: a v6 DB missing order_json upgrades to v7 and legacy runs read 
     s2.insertRun(fresh, { workflow: 'wf_legacy', step: 'builder', order });
     assert.deepStrictEqual(s2.getRun(fresh)?.order, order);
     s2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('migration: a pre-v9 reason thread backfills once and reopening v9 is idempotent', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-historymig-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    const s1 = new Store(dbPath);
+    const wf = randId('wf');
+    s1.putArtifact(artifact(wf, 'pr', {
+      acceptance: 'rejected', version: 4,
+      reasons: [{ at: 42, action: 'reject', kind: 'judgment', by: 'reviewer', text: 'needs tests', fromVersion: 4 }],
+      judgmentRejects: 1,
+    }));
+    s1.close();
+
+    // Handcraft the state an upgrader sees: the old projection has reasons,
+    // but v8's new history tables have no rows yet.
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('DELETE FROM artifact_event; DELETE FROM artifact_version;');
+    raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('8', 'schema_version');
+    raw.close();
+
+    const s2 = new Store(dbPath);
+    const once = s2.getArtifactHistory(wf, 'pr');
+    assert.equal(once?.versions.length, 0, 'old overwritten payloads are not invented during backfill');
+    assert.deepEqual(once?.events.map((e) => [e.action, e.actor, e.reason, e.version]), [
+      ['reject', 'reviewer', 'needs tests', 4],
+    ]);
+    s2.close();
+
+    const s3 = new Store(dbPath);
+    const reopened = s3.getArtifactHistory(wf, 'pr');
+    assert.equal(reopened?.events.length, 1, 'opening an already-v8 database does not duplicate legacy events');
+    s3.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -673,7 +730,7 @@ test('tx() BEGIN IMMEDIATE: second connection is blocked at BEGIN, not mid-write
 
 test('fresh database stamps schema_version to current SCHEMA_VERSION, no throw', () => {
   const s = mem();
-  assert.equal(s.getMeta('schema_version'), '8');
+  assert.equal(s.getMeta('schema_version'), '9');
   s.close();
 });
 
@@ -684,7 +741,7 @@ test('opening a DB already at current SCHEMA_VERSION is a no-op, no throw', () =
     const s1 = new Store(dbPath);
     s1.close();
     const s2 = new Store(dbPath); // reopen at same version — must not throw
-    assert.equal(s2.getMeta('schema_version'), '8');
+    assert.equal(s2.getMeta('schema_version'), '9');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -700,7 +757,7 @@ test('opening a DB with an older schema_version upgrades normally (regression gu
     s1.close();
 
     const s2 = new Store(dbPath); // must NOT throw
-    assert.equal(s2.getMeta('schema_version'), '8', 'upgrades to current SCHEMA_VERSION');
+    assert.equal(s2.getMeta('schema_version'), '9', 'upgrades to current SCHEMA_VERSION');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -713,17 +770,17 @@ test('opening a DB with a newer-than-binary schema_version throws StoreVersionEr
   try {
     // Create a normal DB, then simulate a newer binary having stamped it.
     const s1 = new Store(dbPath);
-    s1.setMeta('schema_version', '9');
+    s1.setMeta('schema_version', '10');
     s1.close();
 
-    // Reopening at this binary's SCHEMA_VERSION ('8') must refuse.
+    // Reopening at this binary's SCHEMA_VERSION ('9') must refuse.
     assert.throws(() => new Store(dbPath), StoreVersionError);
 
     // Direct raw read proves schema_version was NOT rewritten downward by
     // the throwing constructor.
     const raw = new DatabaseSync(dbPath);
     const row = raw.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
-    assert.equal(row.v, '9', 'schema_version must remain at the newer stamped value, never rewritten down');
+    assert.equal(row.v, '10', 'schema_version must remain at the newer stamped value, never rewritten down');
     raw.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -742,7 +799,7 @@ test('§28: old-DB-upgrades-fine at the current SCHEMA_VERSION (def_snapshot/def
     s1.close();
 
     const s2 = new Store(dbPath); // must NOT throw
-    assert.equal(s2.getMeta('schema_version'), '8');
+    assert.equal(s2.getMeta('schema_version'), '9');
     const cols = (s2.db.prepare('PRAGMA table_info(workflow)').all() as Array<{ name: string }>).map((c) => c.name);
     assert.ok(cols.includes('def_snapshot'));
     assert.ok(cols.includes('def_hash'));
@@ -845,7 +902,7 @@ test('REL-5: the migration tx re-checks schema_version under the write lock (TOC
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-toctou-'));
   const dbPath = join(dir, 'test.db');
   try {
-    const s = new Store(dbPath); // opens clean at the current version ('8')
+    const s = new Store(dbPath); // opens clean at the current version ('9')
     // A concurrent newer binary migrates + stamps the shared file.
     const other = new DatabaseSync(dbPath);
     other.prepare('INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(
@@ -870,7 +927,7 @@ test('REL-5: the migration tx re-checks schema_version under the write lock (TOC
     const cleanPath = join(dir, 'clean.db');
     const s2 = new Store(cleanPath);
     const check = (s2 as unknown as { refuseIfNewer(): string | undefined }).refuseIfNewer.bind(s2);
-    assert.equal(check(), '8', 're-check returns the current version and does not throw at parity');
+    assert.equal(check(), '9', 're-check returns the current version and does not throw at parity');
     s2.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -925,7 +982,7 @@ test('REL-5: legacy duplicate children are tolerated on open (index skipped, no 
     // Reopening must NOT throw and must NOT delete data — it tolerates the
     // duplicates and simply skips creating the unique index.
     const s2 = new Store(dbPath);
-    assert.equal(s2.getMeta('schema_version'), '8', 'still upgrades the version stamp');
+    assert.equal(s2.getMeta('schema_version'), '9', 'still upgrades the version stamp');
     const idxRow = s2.db
       .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'workflow_produced_by_unique'`)
       .get();
