@@ -90,7 +90,8 @@ it's the same engine.
 
 `engine.tick(wf)` is **deep by default**: after ticking `wf` it descends into
 every live `calls:` child (recursively), folding their orders, `reaped`, folded
-`deferred` (each tagged with its own `workflow`), and the tree-minimum `dueAt`
+`deferred` (each descendant's deferral tagged with its `workflow`; a root-frame
+deferral stays unstamped), and the tree-minimum `dueAt`
 into the one `TickResult`. So an order in the list may belong to a child, not
 `wf` — commit (`green`/`emit`/`seal`/`reject`) and `close` against
 `order.workflow`, not the id you passed to `tick`. Pass `engine.tick(wf, { deep:
@@ -103,8 +104,9 @@ can advance *many* workflow instances in one call, an embedder moving off the
 one-workflow-per-tick assumption must key any per-workflow logic —
 checkpointing, batching, an external transaction, a progress counter — on
 `order.workflow`, not on the id it passed to `tick`. Don't assume every order in
-one `TickResult` belongs to the instance you ticked; the folded orders and
-deferrals each carry their own `workflow`. `engine.tick(wf, { deep: false })`
+one `TickResult` belongs to the instance you ticked; each order carries its own
+`order.workflow`, and a folded deferral is stamped with a descendant's
+`workflow` (absent means the root you ticked). `engine.tick(wf, { deep: false })`
 (CLI `--shallow`) stays the deliberate single-instance escape hatch when you
 want exactly the old behavior.
 
@@ -184,9 +186,10 @@ The event union (exported as `EngineEvent`):
   commits (and the cascade has already settled inside that tx), so a listener
   that calls `status`/`tick`/`green` observes fully-committed, settled state —
   there is no open transaction to corrupt. A state-changing verb fires its
-  specific `commit`/`instance` event followed by a `settled`. `close` and `tick`
-  fire nothing *of their own* — `close` only releases a lease and `tick` only
-  hands you orders — but either can advance `calls:` composition as a side
+  specific `commit`/`instance` event followed by a `settled`. `close` fires only
+  its `closed` lifecycle event and `tick` fires nothing of its own — `close`
+  otherwise just releases a lease and `tick` just hands you orders — but either
+  can advance `calls:` composition as a side
   effect, and that composition fires events: a deep `tick` that spawns a child
   emits `instance` + `settled`, and one that machine-greens or re-arms a parent
   `calls:` artifact from a child's outcome emits `commit` + `settled` on the
