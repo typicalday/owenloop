@@ -50,7 +50,6 @@ import type {
 export type { Order } from './types.ts';
 
 const DEFAULT_REAP_TTL_MS = 2 * 60 * 60 * 1000; // 2h
-const DEFAULT_MAX_LEASE_MS = 60 * 60 * 1000; // 1h
 /**
  * REL-4: hard cap on `calls:` composition depth (root instance = depth 0), a
  * defense-in-depth bound independent of construction-time cycle validation.
@@ -227,11 +226,41 @@ export type EngineEvent =
 /** A synchronous observer of {@link EngineEvent}s. */
 export type EngineListener = (event: EngineEvent) => void;
 
+/**
+ * Why the reaper cleared a stranded lease, surfaced per entry in
+ * {@link Engine.reapWithDetails} `details` (and printed by the CLI `reap`
+ * command). Distinguishes the liveness failures from the bookkeeping ones:
+ * - `heartbeat-lost` — no beat within the effective reap TTL (the anchor rule
+ *   `max(claimedAt, heartbeatAt) + ttl` lapsed): the job went silent.
+ * - `max-lease-exceeded` — a *configured* max-lease cap expired the lease even
+ *   though it was still beating (total lifetime since `claimedAt` passed the
+ *   cap). Only possible when `maxLeaseMs`/per-step `maxLease` is set.
+ * - `run-missing` — the task was claimed but has no run row.
+ * - `run-closed` — the owning run already closed (its outcome is set).
+ * - `forced` — an admin `reap --now` (`ttlOverride: 0`) cleared a lease that
+ *   was still fresh under the real TTL rules; reported instead of a misleading
+ *   liveness reason so the output does not look like the job failed.
+ */
+export type ReapReason =
+  | 'heartbeat-lost'
+  | 'max-lease-exceeded'
+  | 'run-missing'
+  | 'run-closed'
+  | 'forced';
+
+/** One cleared-lease entry from {@link Engine.reapWithDetails}. */
+export interface ReapDetail {
+  step: string;
+  key: string;
+  run?: string;
+  reason: ReapReason;
+}
+
 export class Engine {
   readonly store: Store;
   private readonly resolveDef: DefResolver;
   private readonly reapTtlMs: number;
-  private readonly maxLeaseMs: number;
+  private readonly maxLeaseMs: number | undefined;
   private readonly maxCallDepth: number;
   private readonly listeners = new Set<EngineListener>();
   private readonly onListenerError?: (err: unknown, event: EngineEvent) => void;
@@ -243,8 +272,11 @@ export class Engine {
     resolveDef: DefResolver,
     opts: {
       reapTtlMs?: number;
-      /** A3: engine-wide default cap on total lease lifetime (claimedAt + maxLease).
-       *  Per-step `maxLeaseMs` overrides it; falls back to DEFAULT_MAX_LEASE_MS. */
+      /** A3 (REL-8): OPT-IN hard cap on total lease lifetime (claimedAt +
+       *  maxLease), enforced regardless of heartbeats. Unset (the default) means
+       *  NO cap — a correctly heartbeating job runs as long as it needs, and the
+       *  anchor rule (reap TTL vs. last beat) is the only liveness bound. Set it
+       *  only as a runaway backstop; a per-step `maxLeaseMs` overrides it. */
       maxLeaseMs?: number;
       /** REL-4: hard cap on `calls:` composition depth (root = 0). Falls back to
        *  DEFAULT_MAX_CALL_DEPTH (64). Defense in depth against a calls: cycle
@@ -259,7 +291,7 @@ export class Engine {
     this.store = store;
     this.resolveDef = resolveDef;
     this.reapTtlMs = opts.reapTtlMs ?? DEFAULT_REAP_TTL_MS;
-    this.maxLeaseMs = opts.maxLeaseMs ?? DEFAULT_MAX_LEASE_MS;
+    this.maxLeaseMs = opts.maxLeaseMs;
     this.maxCallDepth = opts.maxCallDepth ?? DEFAULT_MAX_CALL_DEPTH;
     if (opts.onEvent) this.listeners.add(opts.onEvent);
     this.onListenerError = opts.onListenerError;
@@ -1006,35 +1038,65 @@ export class Engine {
     return step?.reapTtlMs ?? this.reapTtlMs;
   }
 
-  /** A3: return the effective max total lease lifetime for a step — per-step override or engine default. */
-  private effectiveMaxLease(step?: StepDef): number {
+  /**
+   * A3 (REL-8): return the effective max total lease lifetime for a step, or
+   * `undefined` when no cap is configured. Per-step `maxLease` overrides the
+   * engine option; when both are unset there is no cap (heartbeats extend the
+   * lease indefinitely). Uses `??` (not `||`) so an explicit `0` stays a cap.
+   */
+  private effectiveMaxLease(step?: StepDef): number | undefined {
     return step?.maxLeaseMs ?? this.maxLeaseMs;
   }
 
   /**
-   * Unified liveness predicate: returns true if the task's claim is still fresh.
-   * Uses max(claimedAt, heartbeatAt ?? claimedAt) as the freshness anchor so a
-   * heartbeating run is never falsely reaped even after the global TTL elapses.
+   * Classify a claimed task's liveness against the two independent bounds, so a
+   * reap can report WHY a lease was cleared:
+   * - `heartbeat-lost` — the anchor rule lapsed: `now - max(claimedAt,
+   *   heartbeatAt) > ttl`. The job went silent (or never beat).
+   * - `max-lease-exceeded` — the anchor rule still holds (a live, beating job)
+   *   but a CONFIGURED `maxLease` cap has been exceeded: `now - claimedAt >
+   *   maxLease`. Only reachable when `maxLease !== undefined`.
+   * - `fresh` — neither bound violated.
    *
-   * A3: a second, harder bound also applies — a lease is fresh only while
-   * `now - claimedAt <= maxLease`, measured off the ORIGINAL `claimedAt` of the
-   * current claim. Heartbeats keep satisfying the anchor rule but can never push
-   * a lease past `claimedAt + maxLease`; once crossed the firing is stale and
-   * reapable/re-claimable even while still beating. After a reap + re-claim the
-   * clamp re-anchors to the new claim's `claimedAt`.
+   * Precedence: `heartbeat-lost` wins when both bounds lapse — if the job was
+   * not alive under the anchor rule, reporting `max-lease-exceeded` would wrongly
+   * suggest the cap killed a healthy job. The cap reason is reported only for a
+   * still-beating lease. The clamp is measured off the ORIGINAL `claimedAt` of
+   * the current claim; after a reap + re-claim it re-anchors to the new claim.
+   */
+  private staleness(
+    task: { claimedAt?: number; heartbeatAt?: number },
+    now: number,
+    ttl: number,
+    maxLease: number | undefined,
+  ): 'fresh' | 'heartbeat-lost' | 'max-lease-exceeded' {
+    const anchor = task.heartbeatAt !== undefined && task.heartbeatAt > (task.claimedAt ?? 0)
+      ? task.heartbeatAt
+      : (task.claimedAt ?? 0);
+    if (now - anchor > ttl) return 'heartbeat-lost';
+    // A3 clamp: total lifetime since the original claim may not exceed a
+    // CONFIGURED maxLease. Unset (undefined) = no cap. `0` is a real (if silly)
+    // cap, so test `!== undefined`, not truthiness.
+    if (maxLease !== undefined && task.claimedAt !== undefined && now - task.claimedAt > maxLease) {
+      return 'max-lease-exceeded';
+    }
+    return 'fresh';
+  }
+
+  /**
+   * Unified liveness predicate: returns true if the task's claim is still fresh.
+   * Thin wrapper over {@link staleness} — see it for the anchor rule and the
+   * opt-in max-lease clamp. A heartbeating run is never falsely reaped after the
+   * global TTL (anchor rule), and only a configured `maxLease` can reap a
+   * still-beating lease.
    */
   private isClaimFresh(
     task: { claimedAt?: number; heartbeatAt?: number },
     now: number,
     ttl: number,
-    maxLease: number,
+    maxLease: number | undefined,
   ): boolean {
-    const anchor = task.heartbeatAt !== undefined && task.heartbeatAt > (task.claimedAt ?? 0)
-      ? task.heartbeatAt
-      : (task.claimedAt ?? 0);
-    if (now - anchor > ttl) return false;
-    // A3 clamp: total lifetime since the original claim may not exceed maxLease.
-    return task.claimedAt === undefined || now - task.claimedAt <= maxLease;
+    return this.staleness(task, now, ttl, maxLease) === 'fresh';
   }
 
   /** Claim a firing's lease via CAS, snapshot the fingerprint, open a run. */
@@ -1818,12 +1880,14 @@ export class Engine {
   /**
    * Touch the liveness timestamp on an open run's task. A run that periodically
    * calls heartbeat() will never be falsely reaped as long as beats arrive within
-   * the effective TTL — EXCEPT (A3) once total lifetime since the original claim
-   * exceeds the effective maxLease: past `claimedAt + maxLease` the read-side
-   * freshness predicate (`isClaimFresh`) reports the lease stale no matter how
-   * recent the beat, so a wedged-but-beating run is reaped and re-claimable. This
-   * write stays dumb — it only records `heartbeatAt`; the clamp is judged on read.
-   * Throws (via openRun) if the run no longer holds its lease.
+   * the effective TTL — EXCEPT (A3) when a max-lease cap is CONFIGURED and total
+   * lifetime since the original claim exceeds it: past `claimedAt + maxLease` the
+   * read-side freshness predicate (`isClaimFresh`) reports the lease stale no
+   * matter how recent the beat, so a wedged-but-beating run is reaped and
+   * re-claimable. With no cap configured (the default) beats extend the lease
+   * indefinitely. This write stays dumb — it only records `heartbeatAt`; the
+   * clamp is judged on read. Throws (via openRun) if the run no longer holds its
+   * lease.
    */
   heartbeat(workflow: string, run: string, now?: number): void {
     const ts = now ?? nowMs();
@@ -1850,19 +1914,36 @@ export class Engine {
     now: number,
     def?: WorkflowDef,
     opts: { ttlOverride?: number } = {},
-  ): { count: number; details: Array<{ step: string; key: string; run?: string }> } {
+  ): { count: number; details: ReapDetail[] } {
     const resolvedDef = def ?? this.defFor(workflow);
     let n = 0;
-    const details: Array<{ step: string; key: string; run?: string }> = [];
+    const details: ReapDetail[] = [];
     for (const task of this.store.listTasks(workflow)) {
       if (task.status !== 'claimed') continue;
       const run = task.run ? this.store.getRun(task.run) : undefined;
       const stepDef = resolvedDef.steps.find((l) => l.name === task.step);
-      const ttl = opts.ttlOverride ?? this.effectiveTtl(stepDef);
+      const realTtl = this.effectiveTtl(stepDef);
       const maxLease = this.effectiveMaxLease(stepDef);
-      const stale = task.claimedAt !== undefined && !this.isClaimFresh(task, now, ttl, maxLease);
-      const stranded = !run || run.outcome !== undefined || stale;
-      if (stranded) {
+      // Classify why (if at all) this claim is stranded, in the same precedence
+      // order the disjunction has always evaluated: run-missing, then run-closed,
+      // then a liveness failure. The stranding DECISION honors ttlOverride (so
+      // `reap --now` forces even a fresh claim stale), but the reported REASON is
+      // computed under the REAL ttl — a lease that was fresh under real rules and
+      // only cleared by the override reports `forced`, not a misleading liveness
+      // reason (§ CLI reap --now).
+      let reason: ReapReason | undefined;
+      if (!run) {
+        reason = 'run-missing';
+      } else if (run.outcome !== undefined) {
+        reason = 'run-closed';
+      } else if (task.claimedAt !== undefined) {
+        const effTtl = opts.ttlOverride ?? realTtl;
+        if (this.staleness(task, now, effTtl, maxLease) !== 'fresh') {
+          const realReason = this.staleness(task, now, realTtl, maxLease);
+          reason = realReason === 'fresh' ? 'forced' : realReason;
+        }
+      }
+      if (reason !== undefined) {
         this.store.putTask({
           workflow,
           step: task.step,
@@ -1872,7 +1953,7 @@ export class Engine {
           ...(task.alarmAt !== undefined ? { alarmAt: task.alarmAt } : {}),
         });
         n++;
-        const detail: { step: string; key: string; run?: string } = { step: task.step, key: task.key };
+        const detail: ReapDetail = { step: task.step, key: task.key, reason };
         if (task.run !== undefined) detail.run = task.run;
         details.push(detail);
       }
@@ -1893,7 +1974,7 @@ export class Engine {
     now = nowMs(),
     def?: WorkflowDef,
     opts: { ttlOverride?: number } = {},
-  ): { count: number; details: Array<{ step: string; key: string; run?: string }> } {
+  ): { count: number; details: ReapDetail[] } {
     return this.store.tx(() => this.reapDetailed(workflow, now, def, opts));
   }
 

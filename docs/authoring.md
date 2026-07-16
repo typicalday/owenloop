@@ -65,6 +65,14 @@ steps:
     invalidates: [plan]        # which input stems this step may invalidate
     cadence: "0s"              # min spacing between runs (e.g. "30m")
     maxRunsPerDay: 1000
+    reapTtl: 30m               # duration; per-step stranded-lease TTL (overrides
+                               #   engine reapTtlMs; default 2h). A beat within it
+                               #   keeps the lease fresh.
+    maxLease: 2h               # duration; opt-in cap on TOTAL lease lifetime,
+                               #   enforced regardless of heartbeats. Omitted =
+                               #   no cap (heartbeats extend indefinitely). Set it
+                               #   only as a runaway backstop — it can reap a
+                               #   still-beating job.
     model: standard            # quality tier (fast | standard | strong |
                                #   strongest) or a literal model id — opaque
                                #   to the engine, passed through on the order

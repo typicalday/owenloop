@@ -9,6 +9,11 @@ import { Engine } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { WorkflowDef } from '../src/types.ts';
+// REL-8: the reap-observability types must reach embedders through the public
+// barrel (the package's only export path), not just from src/engine.ts. Import
+// them from '../src/index.ts' here so typecheck fails if either is dropped from
+// the barrel re-export (see the regression test at the bottom of this file).
+import type { ReapDetail as PublicReapDetail, ReapReason as PublicReapReason } from '../src/index.ts';
 import { def, input, step } from './helpers.ts';
 
 // ---- harness ------------------------------------------------------------------
@@ -244,12 +249,30 @@ test('engine.reapWithDetails: reports reaped step/key/run, and ttlOverride:0 for
   assert.equal(forced.details[0]!.step, 'planner');
   assert.equal(forced.details[0]!.key, '');
   assert.equal(forced.details[0]!.run, R1);
+  // REL-8: a lease that was fresh under the real TTL and only cleared by the
+  // --now override reports `forced`, not a misleading liveness reason.
+  assert.equal(forced.details[0]!.reason, 'forced');
 
   // The reaped run no longer holds its lease.
   assert.throws(
     () => engine.green(wf, R1, 'plan', { v: 1 }),
     /no longer holds its lease|reaped or superseded/,
   );
+});
+
+// ---- REL-8: reap-observability types are on the public export surface ---------
+
+// The behavioral fix widened reapWithDetails() to return ReapReason/ReapDetail.
+// Those types are only useful to embedders if they are importable from the
+// package barrel. The PublicReapReason/PublicReapDetail imports at the top of
+// this file are type-only re-exports from '../src/index.ts'; this test uses them
+// so the assertion is also exercised at runtime. Without the barrel re-export
+// the file fails to typecheck (npm run check), which is the regression guard.
+test('REL-8: ReapReason and ReapDetail are re-exported from the public barrel', () => {
+  const reason: PublicReapReason = 'max-lease-exceeded';
+  const detail: PublicReapDetail = { step: 'planner', key: '', reason };
+  assert.equal(detail.reason, 'max-lease-exceeded');
+  assert.equal(detail.step, 'planner');
 });
 
 // ---- A3: max-lease clamp ------------------------------------------------------
@@ -352,19 +375,102 @@ test('maxLease: clamp re-anchors to the new claim after reap + re-claim', () => 
   assert.equal(t2300.reaped, 1, 'R2 crosses its own claimedAt + maxLease');
 });
 
-// A3-6: the default max lease is ~1h when nothing is set.
-test('maxLease: defaults to ~1h when unset', () => {
+// A3-6 (REL-8): with NO cap configured (the default), there is no max-lease
+// ceiling — heartbeats extend a lease indefinitely. This replaces the old
+// "defaults to ~1h" spec, which asserted exactly the behavior REL-8 reverses:
+// removing the silent 1h default is the whole point of the fix.
+test('maxLease: unset means no cap — a beating lease survives far past the old 1h default', () => {
   const hourMs = 60 * 60 * 1000;
-  // No maxLeaseMs opt → engine default 1h. Default reapTtl (2h) leaves the
-  // anchor rule slack so maxLease is the binding bound.
-  const inside = makeEngine(deliveryDef);
-  inside.engine.tick(inside.wf, { now: 0 });
-  const stillFresh = inside.engine.tick(inside.wf, { now: hourMs - 1000 });
-  assert.equal(stillFresh.reaped, 0, 'inside the 1h default lease is fresh');
 
-  const past = makeEngine(deliveryDef);
-  past.engine.tick(past.wf, { now: 0 });
-  // t just past 1h but well under the 2h reap TTL → maxLease is what reaps it.
-  const stale = past.engine.tick(past.wf, { now: hourMs + 1000 });
-  assert.equal(stale.reaped, 1, 'past the 1h default lease is stale even under the 2h TTL');
+  // (a) No cap, no beat: a lease sitting past the old 1h default is still fresh
+  // under the default 2h reap TTL — the anchor rule is now the only bound.
+  // The old 1h default cap would have reaped this.
+  const noBeat = makeEngine(deliveryDef);
+  noBeat.engine.tick(noBeat.wf, { now: 0 });
+  const past1h = noBeat.engine.tick(noBeat.wf, { now: hourMs + 1000 });
+  assert.equal(past1h.reaped, 0, 'no default cap: a lease past 1h is not reaped under the 2h TTL');
+
+  // (b) No cap, beating every 30 simulated minutes: survives well past 1h and
+  // past the 2h TTL — walk it out to 24h — and the original run can still commit.
+  const beating = makeEngine(deliveryDef);
+  const t0 = beating.engine.tick(beating.wf, { now: 0 });
+  const R1 = t0.orders[0]!.run;
+  const halfHour = 30 * 60 * 1000;
+  for (let t = halfHour; t <= 24 * hourMs; t += halfHour) {
+    beating.engine.heartbeat(beating.wf, R1, t);
+    const tick = beating.engine.tick(beating.wf, { now: t });
+    assert.equal(tick.reaped, 0, `beating lease still fresh at t=${t}ms (far past old 1h cap)`);
+  }
+  // Still holds its lease: the original run commits without a stale-lease throw.
+  assert.doesNotThrow(() => beating.engine.green(beating.wf, R1, 'plan', { v: 1 }));
+});
+
+// ---- REL-8: reap reasons distinguish liveness failures from the opt-in cap ----
+
+// A configured cap that expires a still-beating lease reports 'max-lease-exceeded'.
+test('reap reason: configured cap on a beating lease reports max-lease-exceeded', () => {
+  // Huge TTL so the anchor rule never bites; the 1000ms cap is the only bound.
+  const { engine, wf } = makeEngine(deliveryDef, { reapTtlMs: 1_000_000, maxLeaseMs: 1000 });
+  const t0 = engine.tick(wf, { now: 0 });
+  const R1 = t0.orders[0]!.run;
+  // Beat at t=900 — anchor-rule fresh — but total lifetime at t=1200 exceeds the cap.
+  engine.heartbeat(wf, R1, 900);
+  const reaped = engine.reapWithDetails(wf, 1200);
+  assert.equal(reaped.count, 1);
+  assert.equal(reaped.details[0]!.reason, 'max-lease-exceeded');
+  assert.equal(reaped.details[0]!.run, R1);
+});
+
+// Heartbeat loss with no cap configured reports 'heartbeat-lost' (unchanged behavior).
+test('reap reason: silent lease past TTL with no cap reports heartbeat-lost', () => {
+  const { engine, wf } = makeEngine(deliveryDef, { reapTtlMs: 100 });
+  engine.tick(wf, { now: 0 });
+  // No beats, well past the 100ms TTL, no cap configured.
+  const reaped = engine.reapWithDetails(wf, 500);
+  assert.equal(reaped.count, 1);
+  assert.equal(reaped.details[0]!.reason, 'heartbeat-lost');
+});
+
+// Precedence: when BOTH bounds lapse, heartbeat-lost wins — a job that was not
+// alive under the anchor rule must not be reported as cap-killed.
+test('reap reason: both bounds lapsed reports heartbeat-lost, not max-lease-exceeded', () => {
+  const { engine, wf } = makeEngine(deliveryDef, { reapTtlMs: 100, maxLeaseMs: 1000 });
+  engine.tick(wf, { now: 0 });
+  // No beats: at t=1200 the anchor rule (100ms TTL) has lapsed AND the 1000ms
+  // cap is exceeded — heartbeat-lost takes precedence.
+  const reaped = engine.reapWithDetails(wf, 1200);
+  assert.equal(reaped.count, 1);
+  assert.equal(reaped.details[0]!.reason, 'heartbeat-lost');
+});
+
+// run-closed: a claimed task whose run has already closed reports 'run-closed'.
+test('reap reason: claimed task with a closed run reports run-closed', () => {
+  const { engine, store, wf } = makeEngine(deliveryDef, { reapTtlMs: 1_000_000 });
+  const t0 = engine.tick(wf, { now: 0 });
+  const R1 = t0.orders[0]!.run;
+  // Set the run's outcome directly, leaving the task 'claimed' — close() would
+  // also idle the task; this reconstructs the stranded state a reap must clear.
+  store.updateRun(R1, { outcome: 'ok' });
+  const reaped = engine.reapWithDetails(wf, 100);
+  assert.equal(reaped.count, 1);
+  assert.equal(reaped.details[0]!.reason, 'run-closed');
+});
+
+// run-missing: a claimed task whose run row is absent reports 'run-missing'.
+test('reap reason: claimed task with no run row reports run-missing', () => {
+  const { engine, store, wf } = makeEngine(deliveryDef, { reapTtlMs: 1_000_000 });
+  // A claimed task pointing at a run id that does not exist.
+  store.putTask({
+    workflow: wf,
+    step: 'planner',
+    key: '',
+    status: 'claimed',
+    attempts: 0,
+    claimedAt: 0,
+    run: 'run_ghost',
+  });
+  const reaped = engine.reapWithDetails(wf, 100);
+  const detail = reaped.details.find((d) => d.step === 'planner');
+  assert.ok(detail, 'the ghost-run task is reaped');
+  assert.equal(detail!.reason, 'run-missing');
 });

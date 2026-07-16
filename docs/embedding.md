@@ -29,6 +29,7 @@ const { engine, store } = createEngine({
 | `defs`      | In-memory definitions as a `Map<string, WorkflowDef>` or an array of `WorkflowDef` (de-duped by name). Takes precedence over `defsDir`. Validated as a whole before use — see [In-memory definitions](#in-memory-definitions). |
 | `defsDir`   | Directory of `*.yaml` definitions, loaded via `loadDefs`. A missing dir yields no defs (lenient, like the CLI), not an error. |
 | `reapTtlMs` | Forwarded to the `Engine` — the stranded-lease reap TTL. |
+| `maxLeaseMs` | Forwarded to the `Engine` — an opt-in hard cap on total lease lifetime (per-step `maxLease:` overrides). Unset (default): no cap; heartbeats extend a lease indefinitely. Set it only as a runaway backstop — it can reap a healthy, still-beating job. |
 | `maxCallDepth` | Forwarded to the `Engine` — the hard cap on `calls:` composition depth (root instance = depth 0). Defaults to 64. Defense in depth against a `calls:` cycle; only relevant when you hand-wire a custom `DefResolver` that construction-time validation can't inspect. |
 | `onEvent`   | A push-style observer registered at construction (equivalent to `engine.subscribe`). See [Events](#events). |
 | `onListenerError` | Where a throwing listener's error is routed (default: swallowed). |

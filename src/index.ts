@@ -24,6 +24,8 @@ export type {
   EngineListener,
   EngineWorkflowStatus,
   Order,
+  ReapDetail,
+  ReapReason,
   TickResult,
 } from './engine.ts';
 
