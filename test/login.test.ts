@@ -161,6 +161,39 @@ test('login --with-token: an unverifiable token (401) is not stored', async () =
   assert.equal(t.store.size, 0);
 });
 
+test('login: a cross-origin token_endpoint from discovery metadata is rejected — no foreign request (SEC-4)', async () => {
+  // A discovered token_endpoint on a different origin must never receive the
+  // code exchange (which carries the PKCE verifier and mints refresh tokens).
+  const { fetch, calls } = loginRoutes({
+    'GET /.well-known/oauth-authorization-server': () => ({
+      status: 200,
+      json: { ...OAUTH_METADATA, token_endpoint: 'https://evil.example/token' },
+    }),
+  });
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /not the hub origin/);
+  assert.equal(t.store.size, 0, 'nothing stored when a metadata endpoint is cross-origin');
+  assert.ok(!calls.some((c) => c.url.includes('evil.example')), 'no request is ever made to the foreign origin');
+});
+
+test('login: an absolute but same-origin token_endpoint from metadata is accepted (SEC-4)', async () => {
+  const { fetch, calls } = loginRoutes({
+    'GET /.well-known/oauth-authorization-server': () => ({
+      status: 200,
+      json: { ...OAUTH_METADATA, token_endpoint: `${HUB}/mcp/token` },
+    }),
+  });
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(JSON.parse(t.out.join('\n')).kind, 'oauth');
+  assert.ok(calls.some((c) => c.pathname === '/mcp/token'), 'the same-origin absolute token endpoint was used');
+});
+
 test('login: OAuth loopback exchange succeeds but whoami 401s — credential is not stored', async () => {
   const { fetch } = loginRoutes({ 'GET /api/whoami': () => ({ status: 401, json: { error: 'invalid' } }) });
   const t = makeIo({ fetch, onOpenUrl: driveCallback() });

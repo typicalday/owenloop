@@ -66,11 +66,32 @@ export function hashDefForHub(yaml: string): string {
 // ---- origin normalization ----------------------------------------------------
 
 /**
+ * Loopback hosts allowed to use plaintext `http` for local development. Exact
+ * hostname match: WHATWG `URL` already lowercases hostnames (`HTTP://LOCALHOST`
+ * → `localhost`), canonicalizes IPv4 shorthand (`http://127.1` → `127.0.0.1`),
+ * and keeps the brackets on IPv6 (`http://[::1]` → `[::1]`), so a bare set
+ * membership on `url.hostname` is correct and needs no range parsing.
+ *
+ * Deliberately NOT the whole `127.0.0.0/8` range nor `*.localhost` subdomains —
+ * the exact enumeration the transport policy names (SEC-2). `http://127.0.0.2`
+ * and `http://192.168.x.x` are remote for this purpose and rejected. Conservative
+ * and cheap to widen later (a two-way door).
+ */
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/**
  * Normalize a hub URL to a bare origin (`scheme://host[:port]`), stripping any
  * path, query, trailing slash, and fragment. Requires an http(s) scheme. This
  * is the credential-store key and the project binding value, so it must be
  * canonical: `https://api.owenloop.com/` and `https://api.owenloop.com/foo`
  * both key to `https://api.owenloop.com`.
+ *
+ * Transport policy (SEC-2): `https` is required for every hub origin EXCEPT the
+ * loopback hosts (`127.0.0.1`, `::1`, `localhost`), which may use `http` for
+ * local development. Remote `http` is rejected here, at normalization time, so a
+ * plaintext origin that would leak bearer/refresh tokens, auth codes, and
+ * workflow YAML to an on-path attacker can never be persisted into a credential
+ * key or a project binding.
  */
 export function normalizeOrigin(input: string): string {
   const trimmed = input.trim();
@@ -84,12 +105,37 @@ export function normalizeOrigin(input: string): string {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     throw new Error(`invalid hub url '${input}' — must be http or https, got '${url.protocol}'`);
   }
+  if (url.protocol === 'http:' && !LOOPBACK_HOSTS.has(url.hostname)) {
+    throw new Error(
+      `invalid hub url '${input}' — http is only allowed for loopback hosts (127.0.0.1, ::1, localhost); use https`,
+    );
+  }
   return url.origin;
 }
 
-/** Join an origin and an endpoint that may be absolute or a root-relative path. */
+/**
+ * Join an origin and an endpoint that may be absolute or a root-relative path,
+ * enforcing the same-origin policy for OAuth discovery metadata (SEC-4).
+ *
+ * This is the trust boundary for every endpoint consumed from OAuth metadata —
+ * authorization, token, and registration endpoints all flow through here, as do
+ * the CLI's own literal root-relative API paths. A metadata-derived absolute
+ * endpoint is allowed, but must resolve to the SAME origin as the hub; a
+ * cross-origin (or protocol-relative `//host`) endpoint is rejected so a
+ * discovered `token_endpoint` on a foreign origin can never receive a refresh
+ * token. Path and query are preserved — only `.origin` is compared. The
+ * https-except-loopback rule holds for free: `origin` here is already a
+ * `normalizeOrigin` output at every call site, so same-origin implies the
+ * transport policy.
+ */
 export function resolveEndpoint(origin: string, endpoint: string): string {
-  return new URL(endpoint, `${origin}/`).toString();
+  const resolved = new URL(endpoint, `${origin}/`);
+  if (resolved.origin !== origin) {
+    throw new Error(
+      `refusing endpoint '${endpoint}' — it resolves to origin ${resolved.origin}, not the hub origin ${origin}`,
+    );
+  }
+  return resolved.toString();
 }
 
 // ---- PKCE (RFC 7636) + state -------------------------------------------------
@@ -296,15 +342,46 @@ export function createWorkflowError(body: unknown): string | null {
   return err;
 }
 
-/** Narrow a create_workflow success body to its typed shape (after `createWorkflowError` returns null). */
-export function asCreateWorkflowOk(body: unknown): CreateWorkflowOk {
+/**
+ * Narrow a create_workflow success body to its typed shape (after
+ * `createWorkflowError` returns null), validating STRICTLY (REL-9): a 2xx with
+ * `ok:true` is not enough — the identity fields must be present, well-typed, and
+ * consistent with the def that was pushed, or the "success" is a malformed
+ * response and must be treated as a failure, not silently coerced to defaults.
+ *
+ * - `name` must be a string equal to `expectedName` (the pushed def's name) —
+ *   a mismatch means the server acknowledged the wrong workflow.
+ * - `version` must be a positive integer (the server mints versions from 1).
+ * - `hash` must be a non-empty string. Presence and type only: it is NOT
+ *   required to equal the locally computed `hashDefForHub`, because engine
+ *   drift between CLI and hub legitimately produces differing hashes (see
+ *   `hashDefForHub`'s doc comment).
+ * - `unchanged: true` passes through as an idempotent no-op, validated by the
+ *   same field rules.
+ *
+ * Throws a descriptive `Error` (mirroring `asWhoami`'s throw-on-malformed style)
+ * on any violation; the caller records it as a per-def failure.
+ */
+export function asCreateWorkflowOk(body: unknown, expectedName: string): CreateWorkflowOk {
+  if (typeof body !== 'object' || body === null) {
+    throw new Error('create_workflow: malformed success response — not an object');
+  }
   const b = body as Record<string, unknown>;
-  const out: CreateWorkflowOk = {
-    ok: true,
-    name: typeof b.name === 'string' ? b.name : '',
-    version: typeof b.version === 'number' ? b.version : 0,
-    hash: typeof b.hash === 'string' ? b.hash : '',
-  };
+  if (typeof b.name !== 'string') {
+    throw new Error('create_workflow: malformed success response — missing string name');
+  }
+  if (b.name !== expectedName) {
+    throw new Error(
+      `create_workflow: malformed success response — name '${b.name}' does not match pushed def '${expectedName}'`,
+    );
+  }
+  if (typeof b.version !== 'number' || !Number.isInteger(b.version) || b.version < 1) {
+    throw new Error('create_workflow: malformed success response — version must be a positive integer');
+  }
+  if (typeof b.hash !== 'string' || b.hash === '') {
+    throw new Error('create_workflow: malformed success response — missing non-empty hash');
+  }
+  const out: CreateWorkflowOk = { ok: true, name: b.name, version: b.version, hash: b.hash };
   if (b.unchanged === true) out.unchanged = true;
   return out;
 }
