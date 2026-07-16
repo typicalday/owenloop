@@ -90,8 +90,23 @@ export function stallingFetch(
       return new Promise<Response>((_, reject) => {
         const signal = init?.signal;
         if (!signal) return; // no signal threaded → hangs the test (the point)
-        if (signal.aborted) reject(signal.reason);
-        else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        // Mirror a real in-flight socket: hold a ref'd timer so the event loop
+        // stays alive while we wait for the abort. `AbortSignal.timeout`'s
+        // internal timer is unref'd, so on Node 22 — where nothing else keeps
+        // the loop alive during this fake stall — the loop drains before the
+        // timeout ever fires and the fetch is left pending forever ("Promise
+        // resolution is still pending but the event loop has already
+        // resolved"). In production the open socket keeps the loop alive; this
+        // keep-alive stands in for it. Cleared on abort so it never outlives
+        // the request. (Node 24+ kept the loop alive here on its own, which is
+        // why this only bit on Node 22.)
+        const keepAlive = setInterval(() => {}, 1_000);
+        const fail = (reason: unknown): void => {
+          clearInterval(keepAlive);
+          reject(reason);
+        };
+        if (signal.aborted) fail(signal.reason);
+        else signal.addEventListener('abort', () => fail(signal.reason), { once: true });
       });
     }
     return base.fetch(input, init);
