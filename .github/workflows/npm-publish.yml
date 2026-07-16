@@ -4,6 +4,16 @@ name: npm publish
 # Publishes to npm via trusted publishing (OIDC) -- no npm token secret.
 # Requires the npmjs.com package to have this repo + workflow file linked
 # under Package settings -> Trusted Publisher.
+#
+# Supply-chain hardening (release audit, section 10):
+#   * Every action is pinned by full commit SHA (trailing comment names the
+#     release); npm is pinned to an exact vetted version, not npm@latest.
+#   * Gate 1: the release tag vX.Y.Z must equal package.json "version" exactly.
+#   * Gate 2: the tagged commit must be reachable from origin/main.
+#   * Pack once (npm pack), then inspect the tarball contents against an
+#     allowlist and smoke-test that exact tarball (install into a temp project,
+#     run the CLI), and finally publish THAT tarball -- so the published bytes
+#     are the same bytes that were inspected and smoke-tested.
 
 on:
   release:
@@ -18,21 +28,78 @@ jobs:
     if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
           ref: ${{ github.event.release.tag_name }}
+          # Full history + all branches: the ancestry gate below needs
+          # origin/main available for `git merge-base`.
+          fetch-depth: 0
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      # Trusted publishing needs a recent npm CLI (bundled with Node 22 on
-      # setup-node is new enough, but pin explicitly for clarity/stability).
-      - run: npm install -g npm@latest
+      # Gate 1: the release tag must match package.json "version" exactly.
+      # Pass the tag via env, never interpolate ${{ }} into the script body.
+      - name: Gate - tag matches package.json version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "${TAG#v}" != "$PKG_VERSION" ]; then
+            echo "::error::Tag $TAG does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
+      # Gate 2: the tagged commit must be reachable from origin/main.
+      - name: Gate - tagged commit is on main
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::Release commit $(git rev-parse HEAD) is not reachable from origin/main"
+            exit 1
+          fi
+
+      # Node 22 bundles npm 10.x; OIDC trusted publishing needs npm >= 11.5.1.
+      # Pin an exact vetted release (bump deliberately), never npm@latest --
+      # npm@latest would pull a future, unvetted release into the trusted job.
+      - run: npm install -g npm@12.0.1
 
       - run: npm ci
 
       - run: npm run check
 
-      - run: npm publish --provenance --access public
+      # Pack once. prepack rebuilds dist; the last stdout line is the filename.
+      - name: Pack
+        run: |
+          TARBALL="$(npm pack | tail -n1)"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+
+      # Gate 3: inspect the tarball contents; fail on any path outside the
+      # allowlist. Every entry in the tgz is prefixed `package/`.
+      - name: Gate - inspect tarball contents
+        run: |
+          BAD="$(tar -tzf "$TARBALL" | grep -Ev '^package/(package\.json|README\.md|LICENSE|CHANGELOG\.md|bin/|dist/|docs/|examples/workflows/)' || true)"
+          if [ -n "$BAD" ]; then
+            echo "::error::Unexpected files in tarball:"
+            echo "$BAD"
+            exit 1
+          fi
+
+      # Gate 4: smoke-test that exact tarball -- install into a temp project and
+      # run the CLI binary (exercises the compiled dist + node:sqlite path).
+      - name: Gate - smoke-test tarball
+        run: |
+          SMOKE="$(mktemp -d)"
+          (
+            cd "$SMOKE" \
+              && npm init -y >/dev/null \
+              && npm install --no-audit --no-fund "$GITHUB_WORKSPACE/$TARBALL" \
+              && ./node_modules/.bin/owenloop --help \
+              && [ "$(./node_modules/.bin/owenloop list --db ./state.db)" = "[]" ]
+          )
+
+      # Publish THAT tarball (not a fresh re-pack) so the published bytes are the
+      # inspected/smoke-tested bytes. npm does not run cwd lifecycle scripts when
+      # publishing a tarball; `prepublishOnly` (npm run check) ran above.
+      - run: npm publish "$TARBALL" --provenance --access public
