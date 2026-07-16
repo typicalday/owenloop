@@ -408,26 +408,53 @@ export class Store {
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
-    this.db.exec('PRAGMA journal_mode = WAL');
+    // Connection-scoped only — no file mutation, safe before the version check.
     this.db.exec('PRAGMA busy_timeout = 5000');
+
+    // Refuse an on-disk schema newer than this binary before any file-mutating
+    // pragma or DDL. Re-check again under the migration write lock below.
+    try {
+      this.refuseIfNewer();
+    } catch (err) {
+      this.db.close();
+      throw err;
+    }
+
+    this.db.exec('PRAGMA journal_mode = WAL');
     this.db.exec('PRAGMA foreign_keys = ON');
     this.db.exec('PRAGMA synchronous = NORMAL');
-    this.premigrate();
-    this.db.exec(SCHEMA);
-    const cur = this.getMeta('schema_version');
-    const upgradingToV8 = cur !== undefined && parseInt(cur, 10) < 8;
-    this.migrate(upgradingToV8);
-    if (cur !== undefined) {
-      const curNum = parseInt(cur, 10);
-      const ownNum = parseInt(SCHEMA_VERSION, 10);
-      if (curNum > ownNum) {
-        throw new StoreVersionError(
-          `database schema_version ${cur} is newer than this owenloop's schema_version ${SCHEMA_VERSION}; ` +
-          `upgrade your owenloop install to open this database`,
-        );
-      }
+
+    try {
+      this.tx(() => {
+		const cur = this.refuseIfNewer();
+		this.premigrate();
+		this.db.exec(SCHEMA);
+		// Version 9 introduces immutable history. Earlier databases have no
+		// retained historical payloads, but their lifecycle reasons can be
+		// copied into append-only events exactly once.
+		const backfillLegacyEvents = cur !== undefined && parseInt(cur, 10) < 9;
+		this.migrate(backfillLegacyEvents);
+		if (cur !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
+      });
+    } catch (err) {
+      if (err instanceof StoreVersionError) this.db.close();
+      throw err;
     }
-    if (cur !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
+  }
+
+  /** Read the stored schema version without writing, refusing newer databases. */
+  private refuseIfNewer(): string | undefined {
+    const metaExists =
+      this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).get() !== undefined;
+    if (!metaExists) return undefined;
+    const cur = this.getMeta('schema_version');
+    if (cur !== undefined && parseInt(cur, 10) > parseInt(SCHEMA_VERSION, 10)) {
+      throw new StoreVersionError(
+		`database schema_version ${cur} is newer than this owenloop's schema_version ${SCHEMA_VERSION}; ` +
+		`upgrade your owenloop install to open this database`,
+      );
+    }
+    return cur;
   }
 
   close(): void {
