@@ -18,10 +18,12 @@
  * second copy of that truth that can go stale.
  *
  * Secret hygiene is a hard rule here: credentials never land in the repo or a
- * plaintext `.env`. The file fallback below is mode 0600 (dir 0700) and lives
- * under the user's config dir, never the project; all paths derive from the
+ * plaintext `.env`. The 0600 file backend below (dir 0700) lives under the
+ * user's config dir, never the project; all paths derive from the
  * caller-supplied `env` (HOME / XDG_CONFIG_HOME), never `process.env` directly,
- * so tests fixture `$HOME` and never touch ambient machine state.
+ * so tests fixture `$HOME` and never touch ambient machine state. Both this
+ * file and `.owenloop/hub.json` are written via `writeFileAtomic` — temp file
+ * in the same dir + rename, refusing a symlinked destination (SEC-3).
  *
  * The server-parity def content hash (`hashDefForHub`) also lives here: it is a
  * hub-facing concern (reproducing owenloop-service's canonicalization for the
@@ -30,8 +32,8 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { hashDef, parseDef } from './defs.ts';
 
@@ -208,16 +210,58 @@ export function readCredentialFile(path: string): CredentialFile {
 }
 
 /**
- * Write the credential file with strict permissions: dir 0700, file 0600,
- * re-`chmod`'d on every write (a prior lax umask must never leave the secret
- * world-readable).
+ * Write `data` to `path` atomically, refusing a symlinked (or directory)
+ * destination (SEC-3).
+ *
+ * 1. `lstat` the destination: if it already exists AND is a symlink, throw a
+ *    clear error naming the path rather than clobbering the arbitrary,
+ *    possibly-privileged file the link points at. A pre-existing directory is
+ *    likewise refused with a named error (instead of a raw ENOTDIR from
+ *    rename).
+ * 2. Write to a temp file in the SAME directory (same-dir is required — a
+ *    cross-filesystem rename is not atomic), then `chmod` the temp to `mode`
+ *    BEFORE the rename so the final file never momentarily exists with a lax,
+ *    umask-widened mode (preserving the old "re-chmod on every write"
+ *    guarantee, now applied to the temp).
+ * 3. `rename(tmp, path)` — an atomic replace. On any failure after the temp
+ *    exists, best-effort unlink the temp and rethrow.
+ *
+ * The `lstat` check is a courtesy clear-error, not the security boundary:
+ * `rename` replaces the destination inode rather than following it, so even a
+ * symlink raced into place between the `lstat` and the `rename` is replaced,
+ * never followed — the write can never escape to the link target.
+ */
+export function writeFileAtomic(path: string, data: string, opts?: { mode?: number }): void {
+  const existing = lstatSync(path, { throwIfNoEntry: false });
+  if (existing?.isSymbolicLink()) {
+    throw new Error(`refusing to write ${path}: it is a symbolic link`);
+  }
+  if (existing?.isDirectory()) {
+    throw new Error(`refusing to write ${path}: it is a directory`);
+  }
+  const tmp = join(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}.tmp`);
+  try {
+    writeFileSync(tmp, data, opts?.mode !== undefined ? { mode: opts.mode } : undefined);
+    if (opts?.mode !== undefined) chmodSync(tmp, opts.mode);
+    renameSync(tmp, path);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+}
+
+/**
+ * Write the credential file with strict permissions: dir 0700, file 0600.
+ * The file itself is written atomically via `writeFileAtomic` (temp + rename),
+ * which also chmods the temp to 0600 before the rename — so the secret is
+ * never visible under a laxer mode, even briefly, and a symlinked destination
+ * is refused (SEC-3).
  */
 export function writeCredentialFile(path: string, file: CredentialFile): void {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
-  writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
-  chmodSync(path, 0o600);
+  writeFileAtomic(path, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
 }
 
 // ---- project → hub binding (.owenloop/hub.json) ------------------------------
@@ -254,7 +298,9 @@ export function readHubBinding(path: string): HubBinding | null {
 
 export function writeHubBinding(path: string, binding: HubBinding): void {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(binding, null, 2)}\n`);
+  // Atomic + symlink-refusing (SEC-3). Default mode — hub.json carries no
+  // secrets and is deliberately committable.
+  writeFileAtomic(path, `${JSON.stringify(binding, null, 2)}\n`);
 }
 
 // ---- push candidates + server diff --------------------------------------------

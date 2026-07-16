@@ -63,6 +63,57 @@ export function routedFetch(routes: Record<string, RouteHandler>): {
   return { fetch: fetchFn, calls };
 }
 
+/**
+ * Like `routedFetch`, but for the listed `"METHOD /path"` keys the fetch never
+ * resolves on its own — it rejects only when the caller's `AbortSignal` fires,
+ * with that signal's `reason`. Because `AbortSignal.timeout`'s reason is a
+ * `TimeoutError` DOMException, a call that HANGS (rather than rejecting fast)
+ * proves the production code never threaded the signal into `fetch` — so this
+ * only "passes" when the deadline is really wired. Every other route falls
+ * through to the normal `routedFetch` behavior, sharing its `calls` log.
+ */
+export function stallingFetch(
+  routes: Record<string, RouteHandler>,
+  stallKeys: string[],
+): { fetch: typeof globalThis.fetch; calls: RecordedCall[] } {
+  const stalls = new Set(stallKeys);
+  const base = routedFetch(routes);
+  const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+    const urlStr = typeof input === 'string' ? input : input.toString();
+    const url = new URL(urlStr);
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const key = `${method} ${url.pathname}`;
+    if (stalls.has(key)) {
+      const body = typeof init?.body === 'string' ? init.body : undefined;
+      const authorization = new Headers(init?.headers).get('authorization');
+      base.calls.push({ method, url: urlStr, pathname: url.pathname, body, authorization });
+      return new Promise<Response>((_, reject) => {
+        const signal = init?.signal;
+        if (!signal) return; // no signal threaded → hangs the test (the point)
+        // Mirror a real in-flight socket: hold a ref'd timer so the event loop
+        // stays alive while we wait for the abort. `AbortSignal.timeout`'s
+        // internal timer is unref'd, so on Node 22 — where nothing else keeps
+        // the loop alive during this fake stall — the loop drains before the
+        // timeout ever fires and the fetch is left pending forever ("Promise
+        // resolution is still pending but the event loop has already
+        // resolved"). In production the open socket keeps the loop alive; this
+        // keep-alive stands in for it. Cleared on abort so it never outlives
+        // the request. (Node 24+ kept the loop alive here on its own, which is
+        // why this only bit on Node 22.)
+        const keepAlive = setInterval(() => {}, 1_000);
+        const fail = (reason: unknown): void => {
+          clearInterval(keepAlive);
+          reject(reason);
+        };
+        if (signal.aborted) fail(signal.reason);
+        else signal.addEventListener('abort', () => fail(signal.reason), { once: true });
+      });
+    }
+    return base.fetch(input, init);
+  }) as typeof globalThis.fetch;
+  return { fetch: fetchFn, calls: base.calls };
+}
+
 export interface HubIo {
   io: CliIO;
   cwd: string;
