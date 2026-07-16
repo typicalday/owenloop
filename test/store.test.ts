@@ -366,6 +366,43 @@ test('migration: a v6 DB missing order_json upgrades to v7 and legacy runs read 
   }
 });
 
+test('migration: a pre-v8 reason thread backfills once and reopening v8 is idempotent', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-historymig-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    const s1 = new Store(dbPath);
+    const wf = randId('wf');
+    s1.putArtifact(artifact(wf, 'pr', {
+      acceptance: 'rejected', version: 4,
+      reasons: [{ at: 42, action: 'reject', kind: 'judgment', by: 'reviewer', text: 'needs tests', fromVersion: 4 }],
+      judgmentRejects: 1,
+    }));
+    s1.close();
+
+    // Handcraft the state an upgrader sees: the old projection has reasons,
+    // but v8's new history tables have no rows yet.
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('DELETE FROM artifact_event; DELETE FROM artifact_version;');
+    raw.prepare('UPDATE meta SET v = ? WHERE k = ?').run('7', 'schema_version');
+    raw.close();
+
+    const s2 = new Store(dbPath);
+    const once = s2.getArtifactHistory(wf, 'pr');
+    assert.equal(once?.versions.length, 0, 'old overwritten payloads are not invented during backfill');
+    assert.deepEqual(once?.events.map((e) => [e.action, e.actor, e.reason, e.version]), [
+      ['reject', 'reviewer', 'needs tests', 4],
+    ]);
+    s2.close();
+
+    const s3 = new Store(dbPath);
+    const reopened = s3.getArtifactHistory(wf, 'pr');
+    assert.equal(reopened?.events.length, 1, 'opening an already-v8 database does not duplicate legacy events');
+    s3.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('listRuns returns all runs for a workflow ordered by created_at, rowid', () => {
   const s = mem();
   const wf = randId('wf');

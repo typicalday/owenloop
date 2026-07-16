@@ -414,8 +414,9 @@ export class Store {
     this.db.exec('PRAGMA synchronous = NORMAL');
     this.premigrate();
     this.db.exec(SCHEMA);
-    this.migrate();
     const cur = this.getMeta('schema_version');
+    const upgradingToV8 = cur !== undefined && parseInt(cur, 10) < 8;
+    this.migrate(upgradingToV8);
     if (cur !== undefined) {
       const curNum = parseInt(cur, 10);
       const ownNum = parseInt(SCHEMA_VERSION, 10);
@@ -472,7 +473,7 @@ export class Store {
    * (no `schema_rejects`) needs an explicit `ALTER TABLE`. Additive and
    * idempotent — safe to run on every open.
    */
-  private migrate(): void {
+  private migrate(backfillLegacyEvents: boolean): void {
     const artifactCols = this.db.prepare(`PRAGMA table_info(artifact)`).all() as Array<{ name: string }>;
     if (!artifactCols.some((c) => c.name === 'schema_rejects')) {
       this.db.exec(`ALTER TABLE artifact ADD COLUMN schema_rejects INTEGER NOT NULL DEFAULT 0`);
@@ -534,22 +535,26 @@ export class Store {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN def_hash TEXT`);
     }
 
-    // v8 can faithfully recover lifecycle explanations already present in the
-    // old projection, but never payloads that earlier writes overwrote.
-    const legacy = this.db.prepare('SELECT * FROM artifact').all() as unknown as ArtifactRowRaw[];
-    for (const raw of legacy) {
-      const art = mapArtifact(raw);
-      for (let i = 0; i < art.reasons.length; i++) {
-        const reason = art.reasons[i]!;
-        this.insertArtifactEvent({
-          workflow: art.workflow, path: art.path,
-          version: reason.fromVersion ?? art.version,
-          action: reason.action, actor: reason.by, reason: reason.text,
-          timestamp: reason.at, kind: reason.kind,
-          // This deterministic legacy key makes opening a migrated DB repeat-safe.
-          key: `legacy:${i}:${reason.at}:${reason.action}:${reason.by}:${reason.text}`,
-        });
-      }
+    // Only a genuine pre-v8 -> v8 upgrade may backfill the current projection's
+    // reason thread. Re-opening an already-v8 database must not manufacture a
+    // second copy of its lifecycle events (even though the legacy keys differ
+    // from regular reason-event keys). Historical payloads overwritten before
+    // v8 remain unrecoverable by design.
+    if (backfillLegacyEvents) {
+	const legacy = this.db.prepare('SELECT * FROM artifact').all() as unknown as ArtifactRowRaw[];
+	for (const raw of legacy) {
+	  const art = mapArtifact(raw);
+	  for (let i = 0; i < art.reasons.length; i++) {
+	    const reason = art.reasons[i]!;
+	    this.insertArtifactEvent({
+	      workflow: art.workflow, path: art.path,
+	      version: reason.fromVersion ?? art.version,
+	      action: reason.action, actor: reason.by, reason: reason.text,
+	      timestamp: reason.at, kind: reason.kind,
+	      key: `legacy:${i}:${reason.at}:${reason.action}:${reason.by}:${reason.text}`,
+	    });
+	  }
+	}
     }
   }
 
@@ -794,7 +799,15 @@ export class Store {
     const events = (this.db.prepare(
       'SELECT * FROM artifact_event WHERE workflow = ? AND path = ? ORDER BY created_at, id',
     ).all(workflow, path) as unknown as ArtifactEventRaw[]).map(mapArtifactEvent);
-    return { current, versions: versions.map((v) => ({ ...v, events: events.filter((e) => e.version === v.version) })), events: events.filter((e) => e.version === 0) };
+    const versioned = new Set(versions.map((v) => v.version));
+    return {
+      current,
+      versions: versions.map((v) => ({ ...v, events: events.filter((e) => e.version === v.version) })),
+      // A pre-v8 reason can point at an overwritten version whose payload
+      // cannot be reconstructed. Keep that event visible at the artifact
+      // level rather than silently dropping it from history.
+      events: events.filter((e) => !versioned.has(e.version)),
+    };
   }
 
   deleteArtifact(workflow: string, path: string): void {

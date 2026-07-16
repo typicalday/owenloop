@@ -733,7 +733,9 @@ export class Engine {
             };
             // Do NOT set terminal: calls: artifact must be re-armable if gate inputs move.
             this.store.tx(() => {
-              this.store.putArtifact({ ...next, workflow: parentWf });
+	      this.store.putArtifact({ ...next, workflow: parentWf }, {
+		action: 'provided', actor: 'engine', reason: 'child outcome provided',
+	      });
               this.settle(parentWf, def, now);
             });
             this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'provide' });
@@ -1209,7 +1211,7 @@ export class Engine {
         };
         const producer = def.steps.find((l) => l.name === art.producer);
         if (opts.terminal || producer?.terminal) next.terminal = true;
-        this.store.putArtifact(next);
+	this.store.putArtifact(next, { action: 'green', actor: 'human', reason: 'human green' });
         this.settle(workflow, def);
         return { path, outcome: 'green' };
       });
@@ -1251,11 +1253,11 @@ export class Engine {
           const producer = def.steps.find((l) => l.name === art.producer);
           const next: ArtifactData = { ...art, acceptance: 'green', approvals };
           if (producer?.terminal) next.terminal = true;
-          this.store.putArtifact(next);
+	  this.store.putArtifact(next, { action: 'judge-approved', actor: jName, reason: 'all judges approved' });
           this.settle(workflow, def);
           return { path: judgedStem, outcome: 'green' };
         }
-        this.store.putArtifact({ ...art, approvals });
+	this.store.putArtifact({ ...art, approvals }, { action: 'judge-approved', actor: jName, reason: 'judge approved' });
         this.settle(workflow, def);
         return { path: judgedStem, outcome: 'approved' };
       }
@@ -1329,7 +1331,11 @@ export class Engine {
       // output terminal in its definition, or the caller may force it per-commit.
       const producer = def.steps.find((l) => l.name === art.producer);
       if (!hasJudges && (opts.terminal || producer?.terminal)) next.terminal = true;
-      this.store.putArtifact(next);
+      this.store.putArtifact(next, {
+	action: hasJudges ? 'submitted' : 'produced',
+	actor: r.step,
+	reason: hasJudges ? 'submitted for judgment' : 'producer green',
+      });
       this.settle(workflow, def);
       return { path, outcome: hasJudges ? 'submitted' : 'green' };
     });
@@ -1428,7 +1434,7 @@ export class Engine {
           reasons: [],
           judgmentRejects: 0,
           schemaRejects: 0,
-        });
+	}, { action: 'produced', actor: r.step, reason: 'collection item emitted' });
         created.push(p);
       }
       this.settle(workflow, def);
@@ -1469,7 +1475,7 @@ export class Engine {
         version: sealArt.version + 1,
         value,
         fingerprint: computeFingerprint(arts, req),
-      });
+      }, { action: 'sealed', actor: r.step, reason: 'collection sealed' });
       this.settle(workflow, def);
       return { path: sealP, outcome: 'green' };
     });
@@ -2092,7 +2098,9 @@ export class Engine {
     for (let i = 0; i < limit; i++) {
       let arts = this.artMap(workflow);
       const owed = pendingOwed(def, arts);
-      for (const a of owed) this.store.putArtifact({ ...a, workflow });
+      for (const a of owed) this.store.putArtifact({ ...a, workflow }, {
+	action: 'owed', actor: 'engine', reason: 'artifact became owed',
+      });
       if (owed.length) arts = this.artMap(workflow);
 
       // Only pass TimeFacts when we have a clock reading (tick path).
