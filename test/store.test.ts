@@ -833,6 +833,50 @@ test('REL-5: migration is transactional — a failure mid-migrate rolls back, ol
   }
 });
 
+test('REL-5: the migration tx re-checks schema_version under the write lock (TOCTOU guard)', () => {
+  // The constructor's pre-tx version check is racy: between it and acquiring
+  // BEGIN IMMEDIATE, another (newer) binary can migrate the file and stamp a
+  // higher version. The fix re-reads schema_version as the FIRST statement
+  // inside the migration tx and refuses if it is now newer, so an older binary
+  // can never run its DDL over — and stamp the version back down on — a newer
+  // file. That in-tx re-check is `refuseIfNewer()`; assert it refuses a value a
+  // second connection committed AFTER this store opened (the exact interleaving
+  // the pre-tx check would miss), and leaves the on-disk version untouched.
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-toctou-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    const s = new Store(dbPath); // opens clean at the current version ('8')
+    // A concurrent newer binary migrates + stamps the shared file.
+    const other = new DatabaseSync(dbPath);
+    other.prepare('INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v').run(
+      'schema_version',
+      '99',
+    );
+    other.close();
+
+    // The live connection's re-read (what the in-tx guard runs) must now refuse.
+    const refuse = (s as unknown as { refuseIfNewer(): string | undefined }).refuseIfNewer.bind(s);
+    assert.throws(refuse, StoreVersionError, 'in-tx re-check must refuse a version bumped newer after open');
+
+    // Refusing performed no write — the stamped value is untouched.
+    const raw = new DatabaseSync(dbPath);
+    const row = raw.prepare('SELECT v FROM meta WHERE k = ?').get('schema_version') as { v: string };
+    assert.equal(row.v, '99', 'the re-check must not rewrite the newer version down');
+    raw.close();
+    s.close();
+
+    // Sanity: at the binary's own version the same re-check passes and returns
+    // the stored value (no throw) — it only refuses strictly-newer DBs.
+    const cleanPath = join(dir, 'clean.db');
+    const s2 = new Store(cleanPath);
+    const check = (s2 as unknown as { refuseIfNewer(): string | undefined }).refuseIfNewer.bind(s2);
+    assert.equal(check(), '8', 're-check returns the current version and does not throw at parity');
+    s2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('REL-5: v8 partial unique index prevents duplicate children, allows NULL-coord top-level rows', () => {
   const s = mem();
   const parentWf = randId('wf');

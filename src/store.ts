@@ -352,25 +352,16 @@ export class Store {
     // schema_version BEFORE any DDL or migration runs. The old ordering ran
     // premigrate()/SCHEMA/migrate() first, so opening a NEWER-than-binary
     // database mutated it (e.g. added order_json) before the version check
-    // could refuse it. We now refuse with the file byte-identical.
-    let cur: string | undefined;
-    const metaExists =
-      this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).get() !== undefined;
-    if (metaExists) {
-      cur = this.getMeta('schema_version');
-      if (cur !== undefined) {
-        const curNum = parseInt(cur, 10);
-        const ownNum = parseInt(SCHEMA_VERSION, 10);
-        if (curNum > ownNum) {
-          // Close the handle before throwing — we performed no writes, so the
-          // database file is untouched.
-          this.db.close();
-          throw new StoreVersionError(
-            `database schema_version ${cur} is newer than this owenloop's schema_version ${SCHEMA_VERSION}; ` +
-            `upgrade your owenloop install to open this database`,
-          );
-        }
-      }
+    // could refuse it. This fast path must stay: `PRAGMA journal_mode = WAL`
+    // below rewrites a non-WAL file's header, so a newer DB has to be refused
+    // BEFORE it — keeping the file byte-identical on the refusal path.
+    try {
+      this.refuseIfNewer();
+    } catch (err) {
+      // No writes happened yet, so the file is untouched. Close before rethrow
+      // (plan decision: the handle is closed before StoreVersionError escapes).
+      this.db.close();
+      throw err;
     }
 
     // Only now may we touch the file. journal_mode and foreign_keys cannot be
@@ -385,12 +376,60 @@ export class Store {
     // an interrupted or failed migration rolls back cleanly (leaving the old
     // version intact) instead of leaving a half-migrated file. The BEGIN
     // IMMEDIATE also serializes concurrent first-opens across processes.
-    this.tx(() => {
-      this.premigrate();
-      this.db.exec(SCHEMA);
-      this.migrate();
-      if (cur !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
-    });
+    try {
+      this.tx(() => {
+        // Re-check the version as the FIRST statement inside the write lock.
+        // The pre-check above is TOCTOU-racy: between it and acquiring BEGIN
+        // IMMEDIATE, a newer binary in another process can migrate the file and
+        // stamp a higher schema_version. Without this re-read we would then run
+        // our older DDL over that newer file and stamp the version back DOWN —
+        // silently accepting (and corrupting) a database we must refuse. Re-
+        // reading here makes the version decision ATOMIC with the DDL: nothing
+        // has been written yet, so throwing rolls back to a byte-identical file.
+        // Use the in-tx value for the stamp guard so it reflects the state the
+        // write actually sees, not the stale pre-check read.
+        const curInTx = this.refuseIfNewer();
+        this.premigrate();
+        this.db.exec(SCHEMA);
+        this.migrate();
+        if (curInTx !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
+      });
+    } catch (err) {
+      // The in-tx re-check refuses a newer DB the same way the pre-check does;
+      // honor the same close-before-throw contract on that path too. Other
+      // migration failures keep their prior behavior (propagate; the tx already
+      // rolled back, leaving the old version intact).
+      if (err instanceof StoreVersionError) this.db.close();
+      throw err;
+    }
+  }
+
+  /**
+   * Read the on-disk `schema_version` and throw {@link StoreVersionError} if it
+   * is newer than this binary's {@link SCHEMA_VERSION}. Performs NO writes, so a
+   * throw leaves the database file byte-identical. A missing `meta` table (fresh
+   * DB) or a missing/non-numeric stored value is treated as "old" — returns the
+   * raw stored value (or `undefined`) so the caller can decide whether a re-stamp
+   * is needed. Called BOTH before the migration tx (fast, zero-mutation refusal
+   * before `PRAGMA journal_mode = WAL` touches the file) and as the first
+   * statement INSIDE it (atomic re-check under the write lock — see constructor).
+   */
+  private refuseIfNewer(): string | undefined {
+    const metaExists =
+      this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).get() !== undefined;
+    if (!metaExists) return undefined;
+    const cur = this.getMeta('schema_version');
+    if (cur !== undefined) {
+      const curNum = parseInt(cur, 10);
+      const ownNum = parseInt(SCHEMA_VERSION, 10);
+      if (curNum > ownNum) {
+        throw new StoreVersionError(
+          `database schema_version ${cur} is newer than this owenloop's schema_version ${SCHEMA_VERSION}; ` +
+          `upgrade your owenloop install to open this database`,
+        );
+      }
+    }
+    return cur;
   }
 
   close(): void {
