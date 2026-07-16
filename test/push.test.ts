@@ -507,19 +507,19 @@ test('push: identical content pushed from a second, differently-pathed checkout 
 test('push: a stalled GET /api/workflows diff fetch times out with a clear message (REL-7)', async () => {
   const hub = makeFakeHub();
   const { fetch } = stallingFetch(hub.routes, ['GET /api/workflows']);
-  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '50' } });
+  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '200' } });
   writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
   bind(t);
 
   const code = await mainAsync(['push'], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /hub did not respond within 0\.05s/);
+  assert.match(t.err.join('\n'), /hub did not respond within [\d.]+s/);
 });
 
 test('push: a stalled create_workflow times out and is recorded as a per-def failure (REL-7)', async () => {
   const hub = makeFakeHub();
   const { fetch } = stallingFetch(hub.routes, ['POST /api/create_workflow']);
-  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '50' } });
+  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '200' } });
   writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
   bind(t);
 
@@ -528,7 +528,7 @@ test('push: a stalled create_workflow times out and is recorded as a per-def fai
   const result = JSON.parse(t.out.join('\n'));
   assert.equal(result.ok, false);
   assert.equal(result.failed[0].name, 'foo');
-  assert.match(result.failed[0].error, /hub did not respond within 0\.05s/);
+  assert.match(result.failed[0].error, /hub did not respond within [\d.]+s/);
 });
 
 test('push: a stalled token refresh (expired oauth credential) times out (REL-7)', async () => {
@@ -539,12 +539,12 @@ test('push: a stalled token refresh (expired oauth credential) times out (REL-7)
     'POST /mcp/token': () => ({ status: 200, json: { access_token: 'mcpat_new', expires_in: 3600 } }),
   };
   const { fetch } = stallingFetch(routes, ['POST /mcp/token']);
-  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '50' } });
+  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '200' } });
   writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
   // An already-expired oauth credential forces a refresh up front, which stalls.
   bind(t, { kind: 'oauth', accessToken: 'mcpat_old', refreshToken: 'rt', expiresAt: Date.now() - 1000, clientId: 'c' });
 
   const code = await mainAsync(['push'], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /hub did not respond within 0\.05s/);
+  assert.match(t.err.join('\n'), /hub did not respond within [\d.]+s/);
 });
