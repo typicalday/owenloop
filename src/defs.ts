@@ -1620,7 +1620,28 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
     }
   }
 
-  // Phase 2: expand includes, run per-def validation, and cross-def calls: checks.
+  // Phase 2/3: expand, validate cross-def, and detect calls: cycles.
+  return finalizeDefs(raw);
+}
+
+/**
+ * Phase 2/3 of def loading, factored out so it is the ONE validator every
+ * public construction path shares — the filesystem `loadDefs` above AND the
+ * in-memory `createEngine({ defs })` factory path (REL-4). Given a raw def map
+ * (each def possibly still carrying `_includes`), it: expands each def's
+ * includes; runs the cross-def `calls:` checks (target existence, `callsInputs`
+ * key validity, exactly-one child output); runs `validateDef` per expanded def;
+ * and finally `detectCallsCycles` over the whole expanded map. Returns the
+ * expanded, validated map. Throws `DefError` on the first problem — the same
+ * messages, in the same order, the filesystem loader has always produced (this
+ * is a pure extraction of what used to live inline in `loadDefs`).
+ *
+ * A host wiring an `Engine` by hand with its own set can call this to get the
+ * same validation the factory and the loader apply. `expandIncludes` is a no-op
+ * for a def without `_includes` (the normal in-memory case), so passing a plain
+ * def map through is cheap and only adds the cross-def + cycle checks.
+ */
+export function finalizeDefs(raw: Map<string, WorkflowDef>): Map<string, WorkflowDef> {
   const out = new Map<string, WorkflowDef>();
   const resolver = (name: string): WorkflowDef | undefined => raw.get(name);
   for (const [name, def] of raw) {

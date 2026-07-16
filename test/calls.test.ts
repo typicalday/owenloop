@@ -1215,3 +1215,77 @@ test('calls: status with an unresolvable child def skips the child summary inste
   assert.ok(debt !== undefined, 'the calls debt is still reported');
   assert.equal(debt!.child, undefined, 'the child summary is skipped, not fabricated');
 });
+
+// ---- (REL-4) runtime maxCallDepth bound ---------------------------------------
+//
+// Construction-time validation (createEngine → finalizeDefs) rejects calls:
+// cycles, but a host can wire an Engine DIRECTLY with a custom DefResolver that
+// construction validation cannot inspect. These tests exercise that path: a
+// self-calling def reached through a bare resolver. Without the bound, deep tick
+// spawns a fresh child instance at every level (a new DB row each) until the
+// process stack overflows. With it, the engine stops cleanly at maxCallDepth.
+
+/** A self-calling def: one step `again` that calls itself and outputs `out`. */
+const recurDef: WorkflowDef = {
+  ...def('recur', [], [
+    { ...step({ name: 'again', produces: ['out'] }), calls: 'recur', callsInputs: {}, consumes: [] },
+  ]),
+  outputs: ['out'],
+};
+
+/** Engine wired with a bare resolver (no createEngine validation) + small bound. */
+function makeRecurEngine(maxCallDepth: number): { engine: Engine; store: Store } {
+  const store = openStore(':memory:');
+  const engine = new Engine(store, (name) => {
+    if (name === 'recur') return recurDef;
+    throw new Error(`no def: ${name}`);
+  }, { maxCallDepth });
+  return { engine, store };
+}
+
+test('calls: (REL-4) maxCallDepth stops a self-calling def cleanly — no overflow, bounded rows', () => {
+  const { engine, store } = makeRecurEngine(5);
+  const root = engine.createInstance('recur');
+
+  // (a) a deep tick returns normally — no throw, no stack overflow.
+  assert.doesNotThrow(() => engine.tick(root));
+
+  // (c) it leaves at most maxCallDepth + 1 instances (root + one per allowed
+  //     spawn level), NOT the thousands the unbounded recursion produced.
+  const rowsAfter1 = store.listWorkflows().length;
+  assert.equal(rowsAfter1, 6, 'root + 5 spawned children = maxCallDepth + 1');
+
+  // (b) the deepest instance's calls artifact is rejected with the depth reason.
+  const rejected = store.listWorkflows()
+    .map((w) => store.getArtifact(w.id, 'out'))
+    .find((a) => a?.acceptance === 'rejected');
+  assert.ok(rejected, 'the deepest parent calls artifact was rejected');
+  const last = rejected!.reasons.at(-1);
+  assert.match(last!.text, /calls depth limit reached \(maxCallDepth=5\)/);
+  assert.equal(rejected!.schemaRejects, 0, 'a depth refusal is structural, not a schema failure');
+
+  // (d) a SECOND tick creates no additional rows — the F2 fingerprint guard on
+  //     the rejected artifact stops the engine re-attempting the refused spawn.
+  assert.doesNotThrow(() => engine.tick(root));
+  assert.equal(store.listWorkflows().length, rowsAfter1, 'no new instances on re-tick');
+  store.close();
+});
+
+test('calls: (REL-4) an unset maxCallDepth leaves a modest real composition unaffected', () => {
+  // A genuine (acyclic) parent→child composition still drives end-to-end under
+  // the default bound (64) — the bound only trips a pathological chain.
+  const { engine, store } = makeEngine([childDef, parentDef]);
+  const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+
+  const t1 = engine.tick(parentWf);
+  const prov = t1.orders.find((o) => o.step === 'provision');
+  assert.ok(prov, 'provision fired');
+  engine.green(parentWf, prov!.run, 'sandbox', { env: 'test-env' });
+  engine.close(parentWf, prov!.run);
+
+  engine.tick(parentWf); // spawns the child, no depth refusal
+  const child = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(child, 'child spawned under the default bound');
+  assert.equal(store.getArtifact(child!.id, 'result')?.acceptance !== 'rejected', true);
+  store.close();
+});
