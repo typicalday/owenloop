@@ -16,6 +16,36 @@ import { gunzipSync } from 'node:zlib';
 
 const BLOCK = 512;
 
+/**
+ * Resource bounds enforced while unpacking a tarball. Defaults are sized for
+ * GitHub codeload output and are deliberately generous; tests inject tiny
+ * values to exercise the limits without building giant fixtures.
+ *
+ * - `maxCompressedBytes` (256 MiB): the buffered tarball download itself.
+ * - `maxExpandedBytes` (1 GiB): total inflated size — kills gzip bombs at
+ *   inflate time. GitHub's own recommended repo size sits comfortably below.
+ * - `maxFileCount` (50k): number of regular files kept.
+ * - `maxFileBytes` (100 MiB): GitHub blocks pushing files larger than this,
+ *   and LFS content is never in the tarball, so no legit entry exceeds it.
+ * - `maxPathLength` (1024): guards against absurdly long entry paths (pax or
+ *   USTAR prefix-composed) before they are ever used as a filesystem path.
+ */
+export interface TarLimits {
+  maxCompressedBytes: number;
+  maxExpandedBytes: number;
+  maxFileCount: number;
+  maxFileBytes: number;
+  maxPathLength: number;
+}
+
+export const DEFAULT_TAR_LIMITS: TarLimits = {
+  maxCompressedBytes: 256 * 1024 * 1024,
+  maxExpandedBytes: 1024 * 1024 * 1024,
+  maxFileCount: 50_000,
+  maxFileBytes: 100 * 1024 * 1024,
+  maxPathLength: 1024,
+};
+
 /** Parse a NUL/space-padded octal field (tar's numeric encoding) into a number. */
 function parseOctal(bytes: Uint8Array): number {
   let s = '';
@@ -69,11 +99,31 @@ function parsePaxRecords(data: Uint8Array): Map<string, string> {
  * `<owner>-<repo>-<sha>/` root-dir component GitHub tarballs always have —
  * callers strip that themselves.
  */
-export function extractTarGz(bytes: Uint8Array): Map<string, Uint8Array> {
-  const tar = gunzipSync(bytes);
+export function extractTarGz(bytes: Uint8Array, limits: Partial<TarLimits> = {}): Map<string, Uint8Array> {
+  const lim = { ...DEFAULT_TAR_LIMITS, ...limits };
+
+  if (bytes.length > lim.maxCompressedBytes) {
+    throw new Error(
+      `compressed archive size ${bytes.length} exceeds limit of ${lim.maxCompressedBytes} bytes`,
+    );
+  }
+
+  let tar: Buffer;
+  try {
+    // maxOutputLength caps the inflated size — a gzip bomb aborts here with
+    // ERR_BUFFER_TOO_LARGE rather than exhausting memory.
+    tar = gunzipSync(bytes, { maxOutputLength: lim.maxExpandedBytes });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE') {
+      throw new Error(`expanded archive size exceeds limit of ${lim.maxExpandedBytes} bytes`);
+    }
+    throw e;
+  }
+
   const out = new Map<string, Uint8Array>();
 
   let offset = 0;
+  let fileCount = 0;
   let pendingLongPath: string | undefined;
 
   while (offset + BLOCK <= tar.length) {
@@ -87,9 +137,22 @@ export function extractTarGz(bytes: Uint8Array): Map<string, Uint8Array> {
     const typeflag = String.fromCharCode(header[156] ?? 0);
     const prefixField = readCString(header.subarray(345, 500));
 
+    // parseOctal on a corrupt size field can yield NaN; a valid entry is a
+    // non-negative integer.
+    if (!Number.isInteger(sizeField) || sizeField < 0) {
+      throw new Error(`corrupt tar header: invalid size field (got ${sizeField})`);
+    }
+
     offset += BLOCK;
     const dataStart = offset;
     const dataEnd = dataStart + sizeField;
+    // subarray silently clamps a past-the-end range, so a truncated archive
+    // would otherwise yield a short read instead of an error — guard it.
+    if (dataEnd > tar.length) {
+      throw new Error(
+        `corrupt tar archive: entry data (${sizeField} bytes) extends past end of archive`,
+      );
+    }
     const data = tar.subarray(dataStart, dataEnd);
     // Data is padded up to the next 512-byte boundary.
     offset += Math.ceil(sizeField / BLOCK) * BLOCK;
@@ -117,9 +180,27 @@ export function extractTarGz(bytes: Uint8Array): Map<string, Uint8Array> {
     }
 
     // Regular file.
+    if (sizeField > lim.maxFileBytes) {
+      throw new Error(
+        `archive entry exceeds per-file size limit of ${lim.maxFileBytes} bytes (${sizeField} bytes)`,
+      );
+    }
+    // Validate the FINAL, fully-resolved name (pax 'path' override or USTAR
+    // prefix+name), not the raw 100-byte field — that is what a caller joins.
     const name = pendingLongPath ?? (prefixField ? `${prefixField}/${nameField}` : nameField);
     pendingLongPath = undefined;
-    if (name) out.set(name, new Uint8Array(data));
+    if (name) {
+      if (name.length > lim.maxPathLength) {
+        throw new Error(
+          `archive entry path length ${name.length} exceeds limit of ${lim.maxPathLength} chars`,
+        );
+      }
+      fileCount += 1;
+      if (fileCount > lim.maxFileCount) {
+        throw new Error(`archive file count exceeds limit of ${lim.maxFileCount}`);
+      }
+      out.set(name, new Uint8Array(data));
+    }
   }
 
   return out;

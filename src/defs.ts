@@ -21,8 +21,8 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from './paths.ts';
 import { parseDurationMs, parseDurationSecs } from './util.ts';
@@ -275,6 +275,66 @@ function assertNoUnknownKeys(obj: object, allowed: readonly string[], ctx: strin
 }
 
 /**
+ * Read a step/judge `bodyFile`, enforcing that it resolves to a regular file
+ * contained within `baseDir` (the def file's own directory). Closes SEC-1: an
+ * unchecked `join()` + `readFileSync()` let a remote definition with enough
+ * `../` components read arbitrary local files during `owenloop add`, and that
+ * content then flowed into emitted orders.
+ *
+ * `ctx` is the caller's error prefix (e.g. `step 'planner'` / `judge 'rigor'`);
+ * every failure throws `DefError`. A missing target keeps the historical
+ * "could not be read (resolved to '...')" message shape so anything matching
+ * /could not be read/ stays green.
+ *
+ * The containment root is `baseDir` itself. For an installed package `baseDir`
+ * is always at or below `<defsDir>/<owner>-<repo>/`, so this is strictly
+ * stronger than package-root containment and needs no extra plumbing.
+ */
+function readBodyFileContained(baseDir: string, rel: string, ctx: string): string {
+  if (rel === '' || rel.includes('\0')) {
+    throw new DefError(
+      `${ctx}: bodyFile '${rel}' must be a relative path with no '.' or '..' components`,
+    );
+  }
+  // Reject absolute paths: POSIX/Windows leading separators and drive prefixes.
+  if (isAbsolute(rel) || /^[\\/]/.test(rel) || /^[A-Za-z]:/.test(rel)) {
+    throw new DefError(`${ctx}: bodyFile '${rel}' must be a relative path, not absolute`);
+  }
+  // Reject any '.' or '..' segment (split on both separators — catches
+  // doubled separators and backslash tricks). The proposal asks to reject '.'
+  // too, not just '..'.
+  const segments = rel.split(/[\\/]+/);
+  if (segments.some((s) => s === '.' || s === '..')) {
+    throw new DefError(
+      `${ctx}: bodyFile '${rel}' must be a relative path with no '.' or '..' components`,
+    );
+  }
+  const resolvedPath = join(baseDir, rel);
+  let realBase: string;
+  let realTarget: string;
+  try {
+    // Compare realpath-to-realpath so a symlinked temp dir (macOS /var ->
+    // /private/var) doesn't spuriously fail containment, and so a symlink
+    // INSIDE the package pointing outside resolves — and is caught — below.
+    realBase = realpathSync(baseDir);
+    realTarget = realpathSync(resolvedPath);
+  } catch (e) {
+    throw new DefError(
+      `${ctx}: bodyFile '${rel}' could not be read (resolved to '${resolvedPath}'): ${(e as Error).message}`,
+    );
+  }
+  // The `+ sep` is load-bearing: without it '/pkg-evil' would pass containment
+  // for base '/pkg'. A regular-file target can never equal realBase itself.
+  if (!realTarget.startsWith(realBase + sep)) {
+    throw new DefError(`${ctx}: bodyFile '${rel}' resolves outside the workflow's directory`);
+  }
+  if (!statSync(realTarget).isFile()) {
+    throw new DefError(`${ctx}: bodyFile '${rel}' does not resolve to a regular file`);
+  }
+  return readFileSync(realTarget, 'utf8');
+}
+
+/**
  * Parse a `judges:` list hanging off a produce entry (§24 YAML surface). Each
  * entry's `bodyFile` (if present) is resolved against `baseDir` and read
  * eagerly, exactly like a step's `bodyFile` (#38) — by the time the judge is
@@ -308,12 +368,7 @@ function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<Pro
           `judge '${name}': bodyFile requires a workflow loaded from disk (no base directory to resolve '${bodyFileRel}' against)`,
         );
       }
-      const resolvedPath = join(baseDir, bodyFileRel);
-      try {
-        body = readFileSync(resolvedPath, 'utf8');
-      } catch (e) {
-        throw new DefError(`judge '${name}': bodyFile '${bodyFileRel}' could not be read (resolved to '${resolvedPath}'): ${(e as Error).message}`);
-      }
+      body = readBodyFileContained(baseDir, bodyFileRel, `judge '${name}'`);
     } else {
       body = asString(raw.body, `judge '${name}'.body`);
     }
@@ -946,12 +1001,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
         `step '${name}': bodyFile requires a workflow loaded from disk (no base directory to resolve '${bodyFileRel}' against)`,
       );
     }
-    const resolvedPath = join(baseDir, bodyFileRel);
-    try {
-      body = readFileSync(resolvedPath, 'utf8');
-    } catch (e) {
-      throw new DefError(`step '${name}': bodyFile '${bodyFileRel}' could not be read (resolved to '${resolvedPath}'): ${(e as Error).message}`);
-    }
+    body = readBodyFileContained(baseDir, bodyFileRel, `step '${name}'`);
   } else {
     body = hasBody ? asString(rl.body, `step '${name}'.body`) : '';
   }
