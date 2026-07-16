@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { hubBindingPath, readHubBinding, writeHubBinding } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
-import { makeFakeHub, makeIo, OAUTH_METADATA, routedFetch } from './hubkit.ts';
+import { makeFakeHub, makeIo, OAUTH_METADATA, routedFetch, stallingFetch } from './hubkit.ts';
 import type { HubIo, RouteHandler } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
@@ -500,4 +500,51 @@ test('push: identical content pushed from a second, differently-pathed checkout 
   assert.deepEqual(result.unchanged, ['foo']);
   assert.deepEqual(result.pushed, []);
   assert.equal(calls.filter((c) => c.pathname === '/api/create_workflow').length, 0, 'zero create_workflow calls');
+});
+
+// ---- request deadlines on push's hub/auth calls (REL-7) ---------------------
+
+test('push: a stalled GET /api/workflows diff fetch times out with a clear message (REL-7)', async () => {
+  const hub = makeFakeHub();
+  const { fetch } = stallingFetch(hub.routes, ['GET /api/workflows']);
+  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '50' } });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  bind(t);
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /hub did not respond within 0\.05s/);
+});
+
+test('push: a stalled create_workflow times out and is recorded as a per-def failure (REL-7)', async () => {
+  const hub = makeFakeHub();
+  const { fetch } = stallingFetch(hub.routes, ['POST /api/create_workflow']);
+  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '50' } });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  bind(t);
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 1);
+  const result = JSON.parse(t.out.join('\n'));
+  assert.equal(result.ok, false);
+  assert.equal(result.failed[0].name, 'foo');
+  assert.match(result.failed[0].error, /hub did not respond within 0\.05s/);
+});
+
+test('push: a stalled token refresh (expired oauth credential) times out (REL-7)', async () => {
+  const hub = makeFakeHub();
+  const routes: Record<string, RouteHandler> = {
+    ...hub.routes,
+    'GET /.well-known/oauth-authorization-server': () => ({ status: 200, json: OAUTH_METADATA }),
+    'POST /mcp/token': () => ({ status: 200, json: { access_token: 'mcpat_new', expires_in: 3600 } }),
+  };
+  const { fetch } = stallingFetch(routes, ['POST /mcp/token']);
+  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '50' } });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  // An already-expired oauth credential forces a refresh up front, which stalls.
+  bind(t, { kind: 'oauth', accessToken: 'mcpat_old', refreshToken: 'rt', expiresAt: Date.now() - 1000, clientId: 'c' });
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /hub did not respond within 0\.05s/);
 });

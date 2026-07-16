@@ -96,9 +96,12 @@ export interface CliIO {
   /** Open a URL in the user's browser (login). Default: fire-and-forget `open`/`xdg-open`/`start`. */
   openUrl?: (url: string) => void;
   /**
-   * OS keychain backend for credential storage. Default: a `security`-backed
-   * implementation on macOS, `undefined` elsewhere (so the 0600 file fallback
-   * engages). Set `OWENLOOP_NO_KEYCHAIN=1` to force the file fallback.
+   * OS keychain backend for credential storage. The backend is chosen ONCE per
+   * process (see `credentialBackend`), then used for read/write/delete
+   * consistently: a `security`-backed keychain on macOS, else the 0600 file
+   * store. `undefined` here — non-mac, or `OWENLOOP_NO_KEYCHAIN=1` — selects
+   * the file backend. A keychain write failure is a hard error, never a silent
+   * file fallback (REL-6).
    */
   keychain?: Keychain;
   /** Read a secret from stdin (`login --with-token`). Default: drain `process.stdin`. */
@@ -1217,33 +1220,60 @@ function resolveKeychain(io: CliIO): Keychain | undefined {
   return io.keychain ?? defaultKeychain(io.env);
 }
 
-/** Read a stored credential for `origin`, trying the keychain first, then the 0600 file. */
-function readCredential(io: CliIO, origin: string): Credential | null {
+/**
+ * The credential backend, decided ONCE from env/config (`resolveKeychain`) and
+ * then used consistently for read and write. Deciding once — rather than
+ * per-operation — is the REL-6 fix: the old error-driven fallback let a write
+ * land in the file while a later read hit the (absent/stale) keychain, so a
+ * credential could shadow itself across backends.
+ */
+type CredentialBackend = { kind: 'keychain'; kc: Keychain } | { kind: 'file' };
+
+function credentialBackend(io: CliIO): CredentialBackend {
   const kc = resolveKeychain(io);
-  if (kc) {
-    const raw = kc.get(origin);
-    if (raw) {
-      try {
-        return JSON.parse(raw) as Credential;
-      } catch {
-        // Corrupt keychain entry — fall through to the file store.
-      }
+  return kc ? { kind: 'keychain', kc } : { kind: 'file' };
+}
+
+/**
+ * Read the stored credential for `origin` from the chosen backend ONLY. A
+ * keychain-backed read NEVER falls through to the file (that fallback was the
+ * REL-6 shadowing bug), and a corrupt keychain entry reads as absent (`null`)
+ * — login overwrites it, logout clears it — never as a reason to consult the
+ * file.
+ */
+function readCredential(io: CliIO, origin: string): Credential | null {
+  const backend = credentialBackend(io);
+  if (backend.kind === 'keychain') {
+    const raw = backend.kc.get(origin);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as Credential;
+    } catch {
+      return null; // corrupt entry — treat as absent; do NOT consult the file
     }
   }
   const file = readCredentialFile(credentialFilePath(io.env));
   return file.hubs[origin] ?? null;
 }
 
-/** Store a credential for `origin`; returns which backend was used. */
+/**
+ * Store a credential for `origin` in the chosen backend ONLY; returns which
+ * one. A failed keychain write is a hard error (REL-6), never a silent
+ * fall-through to the file — the escape hatch is to choose the file backend up
+ * front with `OWENLOOP_NO_KEYCHAIN=1`.
+ */
 function storeCredential(io: CliIO, origin: string, cred: Credential): 'keychain' | 'file' {
-  const kc = resolveKeychain(io);
-  if (kc) {
+  const backend = credentialBackend(io);
+  if (backend.kind === 'keychain') {
     try {
-      kc.set(origin, JSON.stringify(cred));
-      return 'keychain';
-    } catch {
-      // Keychain write failed (locked, unavailable) — fall back to the file store.
+      backend.kc.set(origin, JSON.stringify(cred));
+    } catch (e) {
+      throw new CliError(
+        `could not write the credential to the OS keychain: ${(e as Error).message}. ` +
+          'Fix the keychain, or set OWENLOOP_NO_KEYCHAIN=1 to use the 0600 file store',
+      );
     }
+    return 'keychain';
   }
   const path = credentialFilePath(io.env);
   const file = readCredentialFile(path);
@@ -1252,7 +1282,13 @@ function storeCredential(io: CliIO, origin: string, cred: Credential): 'keychain
   return 'file';
 }
 
-/** Delete any stored credential for `origin` from both backends. Returns whether anything was removed. */
+/**
+ * Delete any stored credential for `origin` from BOTH backends. Deliberately
+ * not routed through `credentialBackend`: logout is a defensive dual-clear
+ * (the proposal explicitly blesses it), so a live refresh token can never be
+ * stranded in the store that wasn't the currently-chosen one. Returns whether
+ * anything was removed.
+ */
 function deleteCredential(io: CliIO, origin: string): boolean {
   let removed = false;
   const kc = resolveKeychain(io);
@@ -1273,6 +1309,51 @@ function deleteCredential(io: CliIO, origin: string): boolean {
 /** The Bearer value for an authenticated request. Never logged. */
 function authHeader(cred: Credential): string {
   return `Bearer ${cred.accessToken}`;
+}
+
+// Request deadline for EVERY hub/auth call — OAuth discovery, DCR, code
+// exchange, token refresh, whoami, workflow list, and push (REL-7). These are
+// all small JSON round-trips, so one budget fits them all;
+// OWENLOOP_HUB_TIMEOUT_MS overrides it (a test knob, consistent with
+// OWENLOOP_LOGIN_TIMEOUT_MS and the project's other OWENLOOP_* test-only knobs).
+const HUB_TIMEOUT_MS = 30_000;
+
+function hubTimeoutMs(io: CliIO): number {
+  const override = Number(io.env.OWENLOOP_HUB_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : HUB_TIMEOUT_MS;
+}
+
+/**
+ * `fetch` wrapper putting a deadline on every hub/auth call (REL-7). The abort
+ * signal is threaded into `fetch` AND the body is fully buffered inside the
+ * same try, so the deadline covers a stalled BODY read too — the exact undici
+ * behavior the two `add` fetches document (`AbortSignal.timeout` ties the
+ * signal to the body stream). The returned `Response` re-exposes the buffered
+ * body, so every call site's `res.json()` / `res.status` /
+ * `res.headers.get(...)` usage is byte-for-byte unchanged. A
+ * `TimeoutError`/`AbortError` becomes a clear `CliError` (naming the request,
+ * which is origin+path only — never a token); anything else is rethrown
+ * untouched.
+ */
+async function hubFetch(io: CliIO, url: string, init?: RequestInit): Promise<Response> {
+  const fetchFn = io.fetch ?? globalThis.fetch;
+  const ms = hubTimeoutMs(io);
+  const method = (init?.method ?? 'GET').toUpperCase();
+  try {
+    const res = await fetchFn(url, { ...init, signal: AbortSignal.timeout(ms) });
+    // 204/304 carry no body — reading one would be a spec violation.
+    if (res.status === 204 || res.status === 304) {
+      return new Response(null, { status: res.status, statusText: res.statusText, headers: res.headers });
+    }
+    const body = await res.arrayBuffer();
+    return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+  } catch (e) {
+    const err = e as Error;
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      throw new CliError(`hub did not respond within ${ms / 1000}s (${method} ${url})`);
+    }
+    throw e;
+  }
 }
 
 /**
@@ -1303,14 +1384,13 @@ async function refreshOAuth(
   cred: Extract<Credential, { kind: 'oauth' }>,
   persist = true,
 ): Promise<Credential> {
-  const fetchFn = io.fetch ?? globalThis.fetch;
   const tokenEndpoint = await discoverTokenEndpoint(io, origin);
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
     refresh_token: cred.refreshToken,
     client_id: cred.clientId,
   });
-  const res = await fetchFn(tokenEndpoint, {
+  const res = await hubFetch(io, tokenEndpoint, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
@@ -1341,8 +1421,7 @@ interface AsMetadata {
 }
 
 async function discoverMetadata(io: CliIO, origin: string): Promise<AsMetadata> {
-  const fetchFn = io.fetch ?? globalThis.fetch;
-  const res = await fetchFn(resolveEndpoint(origin, '/.well-known/oauth-authorization-server'), {
+  const res = await hubFetch(io, resolveEndpoint(origin, '/.well-known/oauth-authorization-server'), {
     headers: { Accept: 'application/json' },
   });
   if (!res.ok) {
@@ -1372,14 +1451,13 @@ async function authedGet(
   path: string,
   persist = true,
 ): Promise<{ res: Response; cred: Credential }> {
-  const fetchFn = io.fetch ?? globalThis.fetch;
   let current = await ensureFreshOAuth(io, origin, cred, persist);
-  let res = await fetchFn(resolveEndpoint(origin, path), {
+  let res = await hubFetch(io, resolveEndpoint(origin, path), {
     headers: { Authorization: authHeader(current), Accept: 'application/json' },
   });
   if (res.status === 401 && current.kind === 'oauth') {
     current = await refreshOAuth(io, origin, current as Extract<Credential, { kind: 'oauth' }>, persist);
-    res = await fetchFn(resolveEndpoint(origin, path), {
+    res = await hubFetch(io, resolveEndpoint(origin, path), {
       headers: { Authorization: authHeader(current), Accept: 'application/json' },
     });
   }
@@ -1612,8 +1690,7 @@ async function startLoopbackServer(expectedState: string, timeoutMs: number = LO
 
 /** DCR a public client (no client secret) with the exact loopback redirect URI. */
 async function registerClient(io: CliIO, origin: string, registrationEndpoint: string, redirectUri: string): Promise<string> {
-  const fetchFn = io.fetch ?? globalThis.fetch;
-  const res = await fetchFn(resolveEndpoint(origin, registrationEndpoint), {
+  const res = await hubFetch(io, resolveEndpoint(origin, registrationEndpoint), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1641,7 +1718,6 @@ async function exchangeCode(
   tokenEndpoint: string,
   p: { code: string; clientId: string; redirectUri: string; verifier: string },
 ): Promise<Credential> {
-  const fetchFn = io.fetch ?? globalThis.fetch;
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
     code: p.code,
@@ -1649,7 +1725,7 @@ async function exchangeCode(
     redirect_uri: p.redirectUri,
     code_verifier: p.verifier,
   });
-  const res = await fetchFn(resolveEndpoint(origin, tokenEndpoint), {
+  const res = await hubFetch(io, resolveEndpoint(origin, tokenEndpoint), {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
@@ -1890,7 +1966,6 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   // Refresh an expiring oauth token once up front (per-request 401 refresh below covers mid-batch expiry).
   cred = await ensureFreshOAuth(io, origin, cred);
 
-  const fetchFn = io.fetch ?? globalThis.fetch;
   const pushedNames: string[] = [];
   const noopNames: string[] = [];
   const failed: { name: string; error: string }[] = [];
@@ -1900,10 +1975,10 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     const c = toPush[i]!;
     const label = c.status === 'new' ? '+' : '~';
     try {
-      let res = await createWorkflowRequest(fetchFn, origin, cred, c.yaml);
+      let res = await createWorkflowRequest(io, origin, cred, c.yaml);
       if (res.status === 401 && cred.kind === 'oauth') {
         cred = await refreshOAuth(io, origin, cred as Extract<Credential, { kind: 'oauth' }>);
-        res = await createWorkflowRequest(fetchFn, origin, cred, c.yaml);
+        res = await createWorkflowRequest(io, origin, cred, c.yaml);
       }
       if (res.status === 401) {
         if (cred.kind === 'agent') {
@@ -1970,12 +2045,12 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
 }
 
 function createWorkflowRequest(
-  fetchFn: typeof globalThis.fetch,
+  io: CliIO,
   origin: string,
   cred: Credential,
   yaml: string,
 ): Promise<Response> {
-  return fetchFn(resolveEndpoint(origin, '/api/create_workflow'), {
+  return hubFetch(io, resolveEndpoint(origin, '/api/create_workflow'), {
     method: 'POST',
     headers: {
       Authorization: authHeader(cred),

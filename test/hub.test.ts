@@ -8,9 +8,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { parse as parseYamlText } from 'yaml';
 import {
   asCreateWorkflowOk,
@@ -30,6 +30,7 @@ import {
   readHubBinding,
   resolveEndpoint,
   writeCredentialFile,
+  writeFileAtomic,
   writeHubBinding,
 } from '../src/hub.ts';
 import type { Credential, HubBinding, WorkflowSummary } from '../src/hub.ts';
@@ -144,6 +145,81 @@ test('readCredentialFile: a missing file is an empty store', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-cred-'));
   const store = readCredentialFile(credentialFilePath({ HOME: home }));
   assert.deepEqual(store, { version: 1, hubs: {} });
+});
+
+// ---- atomic, symlink-refusing writes (SEC-3) ---------------------------------
+
+test('SEC-3: writeCredentialFile / writeHubBinding refuse a symlinked destination, leaving the link target intact', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-sym-'));
+  const path = credentialFilePath({ HOME: home });
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true });
+
+  // A real file elsewhere that an attacker's symlink at the dest points at.
+  const target = join(home, 'victim.txt');
+  writeFileSync(target, 'original-secret');
+  symlinkSync(target, path);
+
+  assert.throws(
+    () => writeCredentialFile(path, { version: 1, hubs: {} }),
+    (e: Error) =>
+      e.message.includes('refusing to write') && e.message.includes('symbolic link') && e.message.includes(path),
+  );
+  assert.equal(readFileSync(target, 'utf8'), 'original-secret', 'the link target was never followed or clobbered');
+
+  // writeHubBinding shares the same guard.
+  const bindPath = join(home, 'bind.json');
+  symlinkSync(target, bindPath);
+  assert.throws(
+    () => writeHubBinding(bindPath, { version: 1, hub: 'https://api.owenloop.com' }),
+    /refusing to write .*symbolic link/,
+  );
+  assert.equal(readFileSync(target, 'utf8'), 'original-secret');
+});
+
+test('SEC-3: writeCredentialFile atomically overwrites, re-tightens to 0600 / dir 0700, and leaves no temp file', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-atomic-'));
+  const path = credentialFilePath({ HOME: home });
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true });
+
+  // Pre-existing file with a lax mode and junk content.
+  writeFileSync(path, 'junk', { mode: 0o644 });
+  chmodSync(path, 0o644);
+
+  const cred: Credential = { kind: 'agent', accessToken: 'olp_x' };
+  writeCredentialFile(path, { version: 1, hubs: { 'https://api.owenloop.com': cred } });
+
+  assert.deepEqual(readCredentialFile(path).hubs['https://api.owenloop.com'], cred, 'content replaced');
+  assert.equal(statSync(path).mode & 0o777, 0o600, 'file re-tightened to 0600 despite the prior 0644');
+  assert.equal(statSync(dir).mode & 0o777, 0o700, 'dir 0700');
+  const leftovers = readdirSync(dir).filter((f) => f.includes('.tmp'));
+  assert.deepEqual(leftovers, [], 'no leftover temp file after the atomic rename');
+});
+
+test('SEC-3: writeFileAtomic refuses a directory destination and leaves no stray temp file behind', () => {
+  const base = mkdtempSync(join(tmpdir(), 'owenloop-dir-'));
+  const dest = join(base, 'iamdir');
+  mkdirSync(dest);
+
+  assert.throws(() => writeFileAtomic(dest, 'data', { mode: 0o600 }), /refusing to write .*directory/);
+  const leftovers = readdirSync(base).filter((f) => f.includes('.tmp'));
+  assert.deepEqual(leftovers, [], 'no stray temp file after a refused write');
+});
+
+test('SEC-3: writeFileAtomic fresh-create round-trips (trailing newline preserved) via the readers', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-fresh-'));
+  const path = credentialFilePath({ HOME: home });
+  const cred: Credential = { kind: 'oauth-pasted', accessToken: 'mcpat_z' };
+  writeCredentialFile(path, { version: 1, hubs: { 'https://api.owenloop.com': cred } });
+  assert.deepEqual(readCredentialFile(path).hubs['https://api.owenloop.com'], cred);
+  assert.equal(readFileSync(path, 'utf8').endsWith('\n'), true, 'trailing newline preserved');
+
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-fresh-bind-'));
+  const bindPath = hubBindingPath(cwd);
+  const binding: HubBinding = { version: 1, hub: 'https://api.owenloop.com' };
+  writeHubBinding(bindPath, binding);
+  assert.deepEqual(readHubBinding(bindPath), binding);
 });
 
 // ---- hub binding round-trip ----------------------------------------------

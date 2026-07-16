@@ -11,9 +11,10 @@ import assert from 'node:assert/strict';
 import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
-import { credentialFilePath, readCredentialFile } from '../src/hub.ts';
+import type { Keychain } from '../src/cli.ts';
+import { credentialFilePath, readCredentialFile, writeCredentialFile } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
-import { makeIo, OAUTH_METADATA, routedFetch, WHOAMI_BODY } from './hubkit.ts';
+import { makeIo, OAUTH_METADATA, routedFetch, stallingFetch, WHOAMI_BODY } from './hubkit.ts';
 import type { RouteHandler } from './hubkit.ts';
 
 const HUB = 'http://127.0.0.1:9';
@@ -243,6 +244,109 @@ test('logout: also deletes the FILE-side credential (OWENLOOP_NO_KEYCHAIN)', asy
   assert.equal(code, 0);
   assert.equal(JSON.parse(t.out.join('\n')).removed, true);
   assert.equal(readCredentialFile(path).hubs[ORIGIN], undefined, 'credential removed from the file store too');
+});
+
+// ---- credential backend authority (REL-6) -----------------------------------
+
+test('login --with-token: a keychain write failure is a hard error, never a silent file fallback (REL-6)', async () => {
+  const { fetch } = routedFetch({ 'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }) });
+  const throwingKeychain: Keychain = {
+    get: () => null,
+    set: () => {
+      throw new Error('keychain locked');
+    },
+    delete: () => {},
+  };
+  const t = makeIo({ fetch, keychain: throwingKeychain, stdin: 'olp_tok' });
+
+  const code = await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /could not write the credential/);
+  // No silent fallback: the file store never received the origin.
+  const file = readCredentialFile(credentialFilePath(t.io.env));
+  assert.equal(file.hubs[ORIGIN], undefined, 'no credential silently written to the file store');
+});
+
+test('connect: a credential present ONLY in the file is not read by the keychain backend (REL-6, no shadowing)', async () => {
+  // Seed the file store with a valid credential, but the chosen backend is the
+  // (empty) keychain — the read must NOT fall through to the file, so connect
+  // reports "no stored credential" rather than shadow-reading the stray file.
+  const { fetch } = routedFetch({ 'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }) });
+  const t = makeIo({ fetch });
+  writeCredentialFile(credentialFilePath(t.io.env), {
+    version: 1,
+    hubs: { [ORIGIN]: { kind: 'agent', accessToken: 'olp_stray' } },
+  });
+
+  const code = await mainAsync(['connect', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /no stored credential/);
+});
+
+test('logout: clears BOTH the keychain and the file store (defensive dual-clear)', async () => {
+  const { fetch } = routedFetch({});
+  const t = makeIo({ fetch });
+  t.store.set(ORIGIN, JSON.stringify({ kind: 'agent', accessToken: 'olp_kc' }));
+  const path = credentialFilePath(t.io.env);
+  writeCredentialFile(path, { version: 1, hubs: { [ORIGIN]: { kind: 'agent', accessToken: 'olp_file' } } });
+
+  const code = await mainAsync(['logout', '--hub', HUB], t.io);
+  assert.equal(code, 0);
+  assert.equal(JSON.parse(t.out.join('\n')).removed, true);
+  assert.ok(!t.store.has(ORIGIN), 'keychain entry cleared');
+  assert.equal(readCredentialFile(path).hubs[ORIGIN], undefined, 'file entry cleared too');
+});
+
+// ---- request deadlines on hub/auth calls (REL-7) ----------------------------
+
+/** The full login OAuth route map (stateless handlers), for `stallingFetch`. */
+const LOGIN_ROUTE_MAP: Record<string, RouteHandler> = {
+  'GET /.well-known/oauth-authorization-server': () => ({ status: 200, json: OAUTH_METADATA }),
+  'POST /mcp/register': () => ({ status: 200, json: { client_id: 'client-abc' } }),
+  'POST /mcp/token': () => ({
+    status: 200,
+    json: { access_token: 'mcpat_access', refresh_token: 'rt_refresh', expires_in: 3600, token_type: 'Bearer' },
+  }),
+  'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }),
+};
+
+test('login: a stalled OAuth discovery times out with a clear message (REL-7)', async () => {
+  const { fetch } = stallingFetch(LOGIN_ROUTE_MAP, ['GET /.well-known/oauth-authorization-server']);
+  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '50' }, onOpenUrl: driveCallback() });
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /hub did not respond within 0\.05s/);
+  assert.equal(t.store.size, 0);
+});
+
+test('login: a stalled dynamic client registration times out (REL-7)', async () => {
+  const { fetch } = stallingFetch(LOGIN_ROUTE_MAP, ['POST /mcp/register']);
+  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '50' }, onOpenUrl: driveCallback() });
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /hub did not respond within 0\.05s/);
+  assert.equal(t.store.size, 0);
+});
+
+test('login: a stalled code exchange times out (REL-7)', async () => {
+  const { fetch } = stallingFetch(LOGIN_ROUTE_MAP, ['POST /mcp/token']);
+  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '50' }, onOpenUrl: driveCallback() });
+  const code = await mainAsync(['login', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /hub did not respond within 0\.05s/);
+  assert.equal(t.store.size, 0);
+});
+
+test('login --with-token: a stalled whoami verification times out (REL-7)', async () => {
+  const { fetch } = stallingFetch(
+    { 'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }) },
+    ['GET /api/whoami'],
+  );
+  const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '50' }, stdin: 'olp_tok' });
+  const code = await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /hub did not respond within 0\.05s/);
+  assert.equal(t.store.size, 0);
 });
 
 // ---- login timeout must not crash the process (unhandled rejection) ---------

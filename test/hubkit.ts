@@ -63,6 +63,42 @@ export function routedFetch(routes: Record<string, RouteHandler>): {
   return { fetch: fetchFn, calls };
 }
 
+/**
+ * Like `routedFetch`, but for the listed `"METHOD /path"` keys the fetch never
+ * resolves on its own — it rejects only when the caller's `AbortSignal` fires,
+ * with that signal's `reason`. Because `AbortSignal.timeout`'s reason is a
+ * `TimeoutError` DOMException, a call that HANGS (rather than rejecting fast)
+ * proves the production code never threaded the signal into `fetch` — so this
+ * only "passes" when the deadline is really wired. Every other route falls
+ * through to the normal `routedFetch` behavior, sharing its `calls` log.
+ */
+export function stallingFetch(
+  routes: Record<string, RouteHandler>,
+  stallKeys: string[],
+): { fetch: typeof globalThis.fetch; calls: RecordedCall[] } {
+  const stalls = new Set(stallKeys);
+  const base = routedFetch(routes);
+  const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+    const urlStr = typeof input === 'string' ? input : input.toString();
+    const url = new URL(urlStr);
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const key = `${method} ${url.pathname}`;
+    if (stalls.has(key)) {
+      const body = typeof init?.body === 'string' ? init.body : undefined;
+      const authorization = new Headers(init?.headers).get('authorization');
+      base.calls.push({ method, url: urlStr, pathname: url.pathname, body, authorization });
+      return new Promise<Response>((_, reject) => {
+        const signal = init?.signal;
+        if (!signal) return; // no signal threaded → hangs the test (the point)
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    }
+    return base.fetch(input, init);
+  }) as typeof globalThis.fetch;
+  return { fetch: fetchFn, calls: base.calls };
+}
+
 export interface HubIo {
   io: CliIO;
   cwd: string;
