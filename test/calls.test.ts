@@ -1289,3 +1289,68 @@ test('calls: (REL-4) an unset maxCallDepth leaves a modest real composition unaf
   assert.equal(store.getArtifact(child!.id, 'result')?.acceptance !== 'rejected', true);
   store.close();
 });
+
+// ---- (11) REL-5: two engines on the same DB converge on exactly one child ----
+
+test('calls: REL-5 — two engines over one DB file spawn exactly one child (atomic re-attach)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-rel5-'));
+  const dbPath = join(dir, 'concurrent.db');
+  try {
+    const byName = new Map([childDef, parentDef].map((d) => [d.name, d]));
+    const resolver = (name: string): WorkflowDef => {
+      const d = byName.get(name);
+      if (!d) throw new Error(`no def: ${name}`);
+      return d;
+    };
+    // Two independent engines/connections over the SAME database file — the
+    // cross-process shape REL-5 guards against.
+    const store1 = openStore(dbPath);
+    const store2 = openStore(dbPath);
+    const engine1 = new Engine(store1, resolver);
+    const engine2 = new Engine(store2, resolver);
+
+    // Count child-spawn 'instance' events observed by each engine.
+    let e1Instances = 0;
+    let e2Instances = 0;
+    engine1.subscribe((e) => { if (e.type === 'instance') e1Instances++; });
+    engine2.subscribe((e) => { if (e.type === 'instance') e2Instances++; });
+
+    // Create the parent and green its gate (sandbox) via engine1.
+    const parentWf = engine1.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+    const tick1 = engine1.tick(parentWf, { deep: false });
+    const provRun = tick1.orders.find((o) => o.step === 'provision')!.run;
+    engine1.green(parentWf, provRun, 'sandbox', { env: 'v1' });
+    engine1.close(parentWf, provRun);
+
+    // Both connections see no child yet (the pre-spawn stale-read both drivers
+    // would observe under a real race).
+    assert.equal(store1.findChildByParent(parentWf, 'delivered'), undefined);
+    assert.equal(store2.findChildByParent(parentWf, 'delivered'), undefined);
+
+    // Ignore the parent-creation instance event; measure only the child spawn.
+    e1Instances = 0;
+    e2Instances = 0;
+
+    // Both engines maintain the same parent's calls: step. The first spawns the
+    // child atomically; the second observes the committed child and re-attaches.
+    engine1.tick(parentWf, { deep: false });
+    engine2.tick(parentWf, { deep: false });
+
+    // Exactly one child, seen identically by both connections.
+    const children1 = store1.listChildrenByParent(parentWf);
+    const children2 = store2.listChildrenByParent(parentWf);
+    assert.equal(children1.length, 1, 'exactly one child despite two engines ticking the same parent');
+    assert.equal(children2.length, 1, 'the second connection sees the same single child');
+    assert.equal(children1[0]!.id, children2[0]!.id, 'both engines converge on the same child id');
+
+    // Only the engine that actually created the child fires an 'instance' event;
+    // the re-attaching engine is silent (matches pre-REL-5 re-attach semantics).
+    assert.equal(e1Instances, 1, 'the spawning engine fires exactly one instance event');
+    assert.equal(e2Instances, 0, 're-attaching engine fires no instance event');
+
+    store1.close();
+    store2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

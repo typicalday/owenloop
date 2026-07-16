@@ -149,8 +149,13 @@ CREATE TABLE IF NOT EXISTS meta (
  *
  * Bumped to '7' for claim-time order-packet persistence (§8 / Gap 1): the `run`
  * table gains `order_json` (see `migrate()`).
+ *
+ * Bumped to '8' for REL-5: a partial UNIQUE index on the child-instance
+ * parent-coordinates (`produced_by_wf`, `produced_by_path`) so two concurrent
+ * driver ticks cannot each insert a child for the same `calls:` step (see
+ * `migrate()`).
  */
-const SCHEMA_VERSION = '7';
+const SCHEMA_VERSION = '8';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -340,25 +345,52 @@ export class Store {
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
-    this.db.exec('PRAGMA journal_mode = WAL');
+    // Connection-scoped only — no file mutation, safe before the version check.
     this.db.exec('PRAGMA busy_timeout = 5000');
-    this.db.exec('PRAGMA foreign_keys = ON');
-    this.db.exec('PRAGMA synchronous = NORMAL');
-    this.premigrate();
-    this.db.exec(SCHEMA);
-    this.migrate();
-    const cur = this.getMeta('schema_version');
-    if (cur !== undefined) {
-      const curNum = parseInt(cur, 10);
-      const ownNum = parseInt(SCHEMA_VERSION, 10);
-      if (curNum > ownNum) {
-        throw new StoreVersionError(
-          `database schema_version ${cur} is newer than this owenloop's schema_version ${SCHEMA_VERSION}; ` +
-          `upgrade your owenloop install to open this database`,
-        );
+
+    // Version pre-check with ZERO on-disk mutation: read and compare the stored
+    // schema_version BEFORE any DDL or migration runs. The old ordering ran
+    // premigrate()/SCHEMA/migrate() first, so opening a NEWER-than-binary
+    // database mutated it (e.g. added order_json) before the version check
+    // could refuse it. We now refuse with the file byte-identical.
+    let cur: string | undefined;
+    const metaExists =
+      this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).get() !== undefined;
+    if (metaExists) {
+      cur = this.getMeta('schema_version');
+      if (cur !== undefined) {
+        const curNum = parseInt(cur, 10);
+        const ownNum = parseInt(SCHEMA_VERSION, 10);
+        if (curNum > ownNum) {
+          // Close the handle before throwing — we performed no writes, so the
+          // database file is untouched.
+          this.db.close();
+          throw new StoreVersionError(
+            `database schema_version ${cur} is newer than this owenloop's schema_version ${SCHEMA_VERSION}; ` +
+            `upgrade your owenloop install to open this database`,
+          );
+        }
       }
     }
-    if (cur !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
+
+    // Only now may we touch the file. journal_mode and foreign_keys cannot be
+    // set inside a transaction (foreign_keys is a no-op there; journal_mode
+    // errors), so set them here, before the migration tx.
+    this.db.exec('PRAGMA journal_mode = WAL');
+    this.db.exec('PRAGMA foreign_keys = ON');
+    this.db.exec('PRAGMA synchronous = NORMAL');
+
+    // One transaction for all DDL + the version stamp. SQLite DDL is
+    // transactional, so premigrate()/SCHEMA/migrate()/stamp are all-or-nothing:
+    // an interrupted or failed migration rolls back cleanly (leaving the old
+    // version intact) instead of leaving a half-migrated file. The BEGIN
+    // IMMEDIATE also serializes concurrent first-opens across processes.
+    this.tx(() => {
+      this.premigrate();
+      this.db.exec(SCHEMA);
+      this.migrate();
+      if (cur !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
+    });
   }
 
   close(): void {
@@ -434,6 +466,38 @@ export class Store {
     }
     // Reverse-lookup index (CREATE INDEX IF NOT EXISTS is idempotent).
     this.db.exec(`CREATE INDEX IF NOT EXISTS workflow_produced_by ON workflow(produced_by_wf, produced_by_path)`);
+    // REL-5 (schema v8): a PARTIAL UNIQUE index on the child parent-coordinates
+    // is the backstop that stops two concurrent driver ticks from each
+    // inserting a child for the same calls: step. The engine's atomic
+    // insert-or-read (spawnChildIfAbsent) inside BEGIN IMMEDIATE is the primary
+    // guard; this index makes a duplicate physically impossible for ANY future
+    // writer path. Partial (WHERE both coords NOT NULL) so top-level instances,
+    // which carry NULL coords, never conflict.
+    //
+    // Legacy-duplicate stance (proposal scope 3): TOLERATE existing duplicates,
+    // PREVENT new ones. If the old race already wrote duplicate children, we do
+    // NOT create the unique index (it would fail) and we do NOT delete data
+    // (refusing/bricking the DB would also break the cleanup tooling that must
+    // open it). We skip index creation while dupes exist — the check is a cheap
+    // aggregate on a small table, retried on every open — and rely on the atomic
+    // spawn path to prevent new duplicates regardless. Once the operator removes
+    // the legacy dupes, the next open creates the index.
+    const dupe = this.db
+      .prepare(
+        `SELECT 1 FROM workflow
+           WHERE produced_by_wf IS NOT NULL AND produced_by_path IS NOT NULL
+           GROUP BY produced_by_wf, produced_by_path
+           HAVING COUNT(*) > 1
+           LIMIT 1`,
+      )
+      .get();
+    if (dupe === undefined) {
+      this.db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS workflow_produced_by_unique
+           ON workflow(produced_by_wf, produced_by_path)
+           WHERE produced_by_wf IS NOT NULL AND produced_by_path IS NOT NULL`,
+      );
+    }
     // §24: judges — the per-version sign-off ledger (judge name -> approved version).
     if (!artifactCols.some((c) => c.name === 'approvals')) {
       this.db.exec(`ALTER TABLE artifact ADD COLUMN approvals TEXT`);
@@ -557,8 +621,14 @@ export class Store {
    * Used by the calls: re-attach guard (never-duplicate). Returns undefined when no match.
    */
   findChildByParent(parentWf: string, parentPath: string): WorkflowRow | undefined {
+    // ORDER BY created_at, id LIMIT 1: the v8 unique index prevents NEW
+    // duplicates, but a database that predates it may still hold legacy dupes
+    // from the old race. Pick the oldest (stably, id-tiebroken) so every reader
+    // converges on the same winner instead of an arbitrary row.
     const r = this.db
-      .prepare('SELECT * FROM workflow WHERE produced_by_wf = ? AND produced_by_path = ?')
+      .prepare(
+        'SELECT * FROM workflow WHERE produced_by_wf = ? AND produced_by_path = ? ORDER BY created_at, id LIMIT 1',
+      )
       .get(parentWf, parentPath) as WorkflowRowRaw | undefined;
     return r ? mapWorkflow(r) : undefined;
   }
