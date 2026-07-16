@@ -9,6 +9,11 @@ import { Engine } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { WorkflowDef } from '../src/types.ts';
+// REL-8: the reap-observability types must reach embedders through the public
+// barrel (the package's only export path), not just from src/engine.ts. Import
+// them from '../src/index.ts' here so typecheck fails if either is dropped from
+// the barrel re-export (see the regression test at the bottom of this file).
+import type { ReapDetail as PublicReapDetail, ReapReason as PublicReapReason } from '../src/index.ts';
 import { def, input, step } from './helpers.ts';
 
 // ---- harness ------------------------------------------------------------------
@@ -253,6 +258,21 @@ test('engine.reapWithDetails: reports reaped step/key/run, and ttlOverride:0 for
     () => engine.green(wf, R1, 'plan', { v: 1 }),
     /no longer holds its lease|reaped or superseded/,
   );
+});
+
+// ---- REL-8: reap-observability types are on the public export surface ---------
+
+// The behavioral fix widened reapWithDetails() to return ReapReason/ReapDetail.
+// Those types are only useful to embedders if they are importable from the
+// package barrel. The PublicReapReason/PublicReapDetail imports at the top of
+// this file are type-only re-exports from '../src/index.ts'; this test uses them
+// so the assertion is also exercised at runtime. Without the barrel re-export
+// the file fails to typecheck (npm run check), which is the regression guard.
+test('REL-8: ReapReason and ReapDetail are re-exported from the public barrel', () => {
+  const reason: PublicReapReason = 'max-lease-exceeded';
+  const detail: PublicReapDetail = { step: 'planner', key: '', reason };
+  assert.equal(detail.reason, 'max-lease-exceeded');
+  assert.equal(detail.step, 'planner');
 });
 
 // ---- A3: max-lease clamp ------------------------------------------------------

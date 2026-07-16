@@ -49,7 +49,8 @@ function rather than a feature bolted beside it.
     modes are distinguishable: `heartbeat-lost` (the anchor rule lapsed — the job
     went silent) vs. `max-lease-exceeded` (a configured cap expired a still-beating
     lease). When both bounds lapse, `heartbeat-lost` wins (a dead job is not reported
-    as cap-killed). See §24.5 / the CLI `reap` command for the full reason set.
+    as cap-killed). See the CLI `reap` command (docs/cli.md) — or the `ReapReason`
+    type in `engine.ts` — for the full reason set.
 - **§2.3 Run** — the audit/budget record created when a task is claimed; holds the
   claim's input **fingerprint** for the commit CAS.
 
