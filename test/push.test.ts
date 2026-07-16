@@ -41,6 +41,14 @@ function writeDefs(cwd: string, defs: Record<string, string>): void {
   for (const [file, body] of Object.entries(defs)) writeFileSync(join(dir, file), body);
 }
 
+/** Extract the def name from a create_workflow request body, so a fake hub can
+ *  echo the name it acknowledged (as the real hub does) and pass strict REL-9
+ *  validation. */
+function defName(body: string | undefined): string {
+  const yaml = typeof body === 'string' ? (JSON.parse(body) as { yaml?: string }).yaml ?? '' : '';
+  return /^name:\s*(\S+)/m.exec(yaml)?.[1] ?? '';
+}
+
 const OAUTH_CRED: Credential = {
   kind: 'oauth',
   accessToken: 'mcpat_a',
@@ -229,10 +237,14 @@ test('push: a def using bodyFile: is refused as not hub-pushable', async () => {
 
 test('push: a server {ok:false} mid-batch records successes, still exits 1', async () => {
   let n = 0;
-  const create: RouteHandler = () => {
+  const create: RouteHandler = (req) => {
     n += 1;
+    // Echo the pushed def's name so the first success passes strict validation
+    // (the real hub echoes the name it acknowledged; a stand-in name would now
+    // be caught as a malformed response — see REL-9).
+    const name = defName(req.body);
     return n === 1
-      ? { status: 200, json: { ok: true, name: 'x', version: 1, hash: 'r' } }
+      ? { status: 200, json: { ok: true, name, version: 1, hash: 'r' } }
       : { status: 200, json: { ok: false, error: 'engine version 2 unsupported' } };
   };
   const { fetch } = routedFetch({ 'GET /api/workflows': () => ({ status: 200, json: { workflows: [] } }), 'POST /api/create_workflow': create });
@@ -249,8 +261,91 @@ test('push: a server {ok:false} mid-batch records successes, still exits 1', asy
   assert.match(result.failed[0].error, /engine version 2 unsupported/);
 });
 
+test('push: a malformed 2xx create_workflow response is reported as a failure, not a success (REL-9)', async () => {
+  // 200 with ok:true but a missing hash/version — a malformed success. Before
+  // strict validation this coerced to defaults and reported as pushed.
+  const { fetch } = routedFetch({
+    'GET /api/workflows': () => ({ status: 200, json: { workflows: [] } }),
+    'POST /api/create_workflow': (req) => ({ status: 200, json: { ok: true, name: defName(req.body) } }),
+  });
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  bind(t);
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 1);
+  const result = JSON.parse(t.out.join('\n'));
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.pushed, []);
+  assert.equal(result.failed.length, 1);
+  assert.match(result.failed[0].error, /malformed success response/);
+});
+
+test('push: a 429 mid-batch halts the rest of the batch and surfaces Retry-After (REL-10)', async () => {
+  // Three defs: first lands, second 429s (with Retry-After) — the third must
+  // never be attempted (no hammering a rate-limited server).
+  let n = 0;
+  const create: RouteHandler = (req) => {
+    n += 1;
+    if (n === 1) return { status: 200, json: { ok: true, name: defName(req.body), version: 1, hash: 'r' } };
+    return { status: 429, json: { error: 'slow down' }, headers: { 'retry-after': '30' } };
+  };
+  const { fetch, calls } = routedFetch({
+    'GET /api/workflows': () => ({ status: 200, json: { workflows: [] } }),
+    'POST /api/create_workflow': create,
+  });
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'a.yaml': validDef('a'), 'b.yaml': validDef('b'), 'c.yaml': validDef('c') });
+  bind(t);
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 1);
+  const result = JSON.parse(t.out.join('\n'));
+  assert.equal(result.ok, false);
+  // Exactly two POSTs — the third def is never sent after the 429.
+  assert.equal(calls.filter((c) => c.pathname === '/api/create_workflow').length, 2, 'third def never attempted');
+  assert.equal(result.pushed.length, 1);
+  assert.equal(result.failed.length, 1);
+  assert.match(result.failed[0].error, /rate limited by the hub \(retry after 30\)/);
+  assert.equal(result.skipped.length, 1, 'the not-yet-attempted def is reported as skipped');
+  assert.match(t.err.join('\n'), /stopping — rate limited by the hub; 1 def\(s\) not attempted/);
+});
+
+test('push: a 429 without a Retry-After header omits the suffix cleanly (REL-10)', async () => {
+  const { fetch } = routedFetch({
+    'GET /api/workflows': () => ({ status: 200, json: { workflows: [] } }),
+    'POST /api/create_workflow': () => ({ status: 429, json: { error: 'slow down' } }),
+  });
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  bind(t);
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 1);
+  const result = JSON.parse(t.out.join('\n'));
+  assert.equal(result.failed.length, 1);
+  assert.match(result.failed[0].error, /^rate limited by the hub$/);
+  assert.deepEqual(result.skipped, [], 'the sole def was the one that 429d — nothing left to skip');
+});
+
+test('push: a hub.json carrying a remote-http origin is refused before any network call (SEC-2 defense in depth)', async () => {
+  const { fetch, calls } = routedFetch({});
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  // A binding written by an older CLI, before the transport policy existed —
+  // writeHubBinding does no scheme validation, so it lands verbatim.
+  writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: 'http://api.example.com' });
+  t.store.set('http://api.example.com', JSON.stringify(OAUTH_CRED));
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /only allowed for loopback/);
+  assert.match(t.err.join('\n'), /owenloop connect/);
+  assert.equal(calls.length, 0, 'no network call on a refused insecure binding');
+});
+
 test('push: a 401 on an oauth credential refreshes once and retries', async () => {
-  const create: RouteHandler = () => ({ status: 200, json: { ok: true, name: 'x', version: 1, hash: 'r' } });
+  const create: RouteHandler = (req) => ({ status: 200, json: { ok: true, name: defName(req.body), version: 1, hash: 'r' } });
   // create_workflow 401s for the old token, 200s for the refreshed one.
   const attempts: string[] = [];
   const routes: Record<string, RouteHandler> = {

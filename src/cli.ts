@@ -248,6 +248,17 @@ const flag = (args: Args, key: string): boolean => {
 
 class CliError extends Error {}
 
+/**
+ * A 429 from the hub during a push batch (REL-10). Thrown from the batch loop
+ * and handled by an explicit `instanceof` branch that halts the rest of the
+ * batch and surfaces `Retry-After` — NOT folded into the generic per-def
+ * failure path or matched by message regex. Keeping it a distinct class is the
+ * fix for the shared-catch gotcha (knowledge node "CLI: split a shared
+ * switch-case when one verb's return type changes"): branch on the type, never
+ * on the message text.
+ */
+class RateLimitError extends CliError {}
+
 function need(args: Args, idx: number, label: string): string {
   const v = args.positionals[idx];
   if (v === undefined) throw new CliError(`missing required argument: ${label}`);
@@ -1728,7 +1739,19 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   const bindingPath = hubBindingPath(io.cwd);
   const binding = readHubBinding(bindingPath);
   if (!binding) throw new CliError('this project is not bound to a hub — run `owenloop connect` first');
-  const origin = binding.hub;
+  // Defense in depth (SEC-2): a hub.json written by an older CLI could carry a
+  // remote-http origin that predates the transport policy, and dispatchPush uses
+  // it verbatim as the request origin. Validate the persisted binding at USE
+  // time — normalizeOrigin enforces https-except-loopback. This check lives
+  // here, NOT inside readHubBinding: dispatchConnect reads the existing binding
+  // only to report switchedFrom, and a read-time throw would deadlock rebinding
+  // AWAY from a bad origin. Leave readHubBinding shape-validation-only.
+  let origin: string;
+  try {
+    origin = normalizeOrigin(binding.hub);
+  } catch (e) {
+    throw new CliError(`${(e as Error).message} — re-run \`owenloop connect\` to rebind`);
+  }
   // A --hub that disagrees with the binding is a mistake, not a silent override.
   const hubArg = last(args, 'hub');
   if (hubArg !== undefined) {
@@ -1871,8 +1894,10 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   const pushedNames: string[] = [];
   const noopNames: string[] = [];
   const failed: { name: string; error: string }[] = [];
+  const skipped: string[] = [];
 
-  for (const c of toPush) {
+  for (let i = 0; i < toPush.length; i++) {
+    const c = toPush[i]!;
     const label = c.status === 'new' ? '+' : '~';
     try {
       let res = await createWorkflowRequest(fetchFn, origin, cred, c.yaml);
@@ -1889,7 +1914,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       if (res.status === 413) throw new CliError('workflow yaml exceeds the hub 32MB request cap');
       if (res.status === 429) {
         const retryAfter = res.headers.get('retry-after');
-        throw new CliError(`rate limited by the hub${retryAfter ? ` (retry after ${retryAfter})` : ''}`);
+        throw new RateLimitError(`rate limited by the hub${retryAfter ? ` (retry after ${retryAfter})` : ''}`);
       }
       if (!res.ok) throw new CliError(`hub returned HTTP ${res.status}`);
 
@@ -1897,7 +1922,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       const errText = createWorkflowError(bodyJson);
       if (errText !== null) throw new CliError(`hub rejected the def: ${errText}`);
 
-      const okBody = asCreateWorkflowOk(bodyJson);
+      const okBody = asCreateWorkflowOk(bodyJson, c.name);
       if (okBody.unchanged) {
         noopNames.push(c.name);
         io.err(`= ${c.name} (server: unchanged, v${okBody.version})`);
@@ -1906,6 +1931,21 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
         io.err(`${label} ${c.name} (→ v${okBody.version})`);
       }
     } catch (e) {
+      // A 429 halts the whole batch immediately (REL-10): record this def as
+      // failed, then stop — the not-yet-attempted remainder is reported as
+      // `skipped`, not silently hammered against a rate-limited server.
+      // Handled before the generic path because RateLimitError extends CliError.
+      if (e instanceof RateLimitError) {
+        const msg = e.message;
+        failed.push({ name: c.name, error: msg });
+        io.err(`! ${c.name} (failed: ${msg})`);
+        const remainder = toPush.slice(i + 1).map((r) => r.name);
+        skipped.push(...remainder);
+        if (remainder.length > 0) {
+          io.err(`stopping — rate limited by the hub; ${remainder.length} def(s) not attempted`);
+        }
+        break;
+      }
       // A hard auth error aborts the whole run (re-throw); a per-def server
       // failure is recorded and the batch continues (already-pushed defs stand).
       if (e instanceof CliError && /run `owenloop login`|re-mint it/.test(e.message)) {
@@ -1923,6 +1963,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     pushed: pushedNames,
     noop: noopNames,
     unchanged: unchanged.map((c) => c.name),
+    skipped,
     failed,
   });
   return failed.length === 0 ? 0 : 1;

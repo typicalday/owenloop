@@ -28,6 +28,7 @@ import {
   randomState,
   readCredentialFile,
   readHubBinding,
+  resolveEndpoint,
   writeCredentialFile,
   writeHubBinding,
 } from '../src/hub.ts';
@@ -47,6 +48,41 @@ test('normalizeOrigin rejects non-http(s) and empty input', () => {
   assert.throws(() => normalizeOrigin(''), /empty/);
   assert.throws(() => normalizeOrigin('ftp://example.com'), /http or https/);
   assert.throws(() => normalizeOrigin('not a url'), /invalid hub url/);
+});
+
+test('normalizeOrigin: http allowed only for loopback hosts (SEC-2 transport policy)', () => {
+  // Loopback http is accepted for local dev, across the canonicalizing forms.
+  assert.equal(normalizeOrigin('http://localhost:3000'), 'http://localhost:3000');
+  assert.equal(normalizeOrigin('http://127.0.0.1:8787'), 'http://127.0.0.1:8787');
+  assert.equal(normalizeOrigin('http://[::1]:8080'), 'http://[::1]:8080');
+  // URL canonicalization: LOCALHOST lowercases, 127.1 shorthand → 127.0.0.1.
+  assert.equal(normalizeOrigin('http://LOCALHOST:3000'), 'http://localhost:3000');
+  assert.equal(normalizeOrigin('http://127.1:9'), 'http://127.0.0.1:9');
+  // userinfo is dropped by .origin — the canonical loopback origin remains.
+  assert.equal(normalizeOrigin('http://user:pass@127.0.0.1'), 'http://127.0.0.1');
+  // https is always accepted.
+  assert.equal(normalizeOrigin('https://api.owenloop.com'), 'https://api.owenloop.com');
+});
+
+test('normalizeOrigin: rejects remote http so credentials can never go plaintext to a non-loopback host', () => {
+  assert.throws(() => normalizeOrigin('http://api.owenloop.com'), /only allowed for loopback/);
+  assert.throws(() => normalizeOrigin('http://127.0.0.2'), /only allowed for loopback/);
+  assert.throws(() => normalizeOrigin('http://192.168.1.5'), /only allowed for loopback/);
+  assert.throws(() => normalizeOrigin('http://[::2]:8080'), /only allowed for loopback/);
+});
+
+// ---- endpoint resolution (OAuth-metadata trust boundary, SEC-4) --------------
+
+test('resolveEndpoint: resolves root-relative and same-origin absolute endpoints, keeping path/query', () => {
+  assert.equal(resolveEndpoint('https://api.owenloop.com', '/api/whoami'), 'https://api.owenloop.com/api/whoami');
+  assert.equal(resolveEndpoint('https://api.owenloop.com', '/mcp/token?x=1'), 'https://api.owenloop.com/mcp/token?x=1');
+  // An absolute endpoint is allowed when it is same-origin with the hub.
+  assert.equal(resolveEndpoint('http://127.0.0.1:9', 'http://127.0.0.1:9/mcp/token'), 'http://127.0.0.1:9/mcp/token');
+});
+
+test('resolveEndpoint: rejects a cross-origin or protocol-relative endpoint (no foreign token_endpoint)', () => {
+  assert.throws(() => resolveEndpoint('https://api.owenloop.com', 'https://evil.example/token'), /not the hub origin/);
+  assert.throws(() => resolveEndpoint('http://127.0.0.1:9', '//evil.example/token'), /not the hub origin/);
 });
 
 // ---- PKCE --------------------------------------------------------------------
@@ -211,10 +247,27 @@ test('createWorkflowError: ok:true is null, ok:false surfaces the error verbatim
 });
 
 test('asCreateWorkflowOk: carries unchanged:true through when the server reports a no-op', () => {
-  const ok = asCreateWorkflowOk({ ok: true, name: 'x', version: 2, hash: 'h', unchanged: true });
+  const ok = asCreateWorkflowOk({ ok: true, name: 'x', version: 2, hash: 'h', unchanged: true }, 'x');
   assert.equal(ok.unchanged, true);
-  const fresh = asCreateWorkflowOk({ ok: true, name: 'x', version: 3, hash: 'h2' });
+  const fresh = asCreateWorkflowOk({ ok: true, name: 'x', version: 3, hash: 'h2' }, 'x');
   assert.equal(fresh.unchanged, undefined);
+});
+
+test('asCreateWorkflowOk: a malformed 2xx is an error, not a defaulted success (REL-9)', () => {
+  assert.throws(() => asCreateWorkflowOk('nope', 'x'), /not an object/);
+  assert.throws(() => asCreateWorkflowOk({ ok: true, version: 2, hash: 'h' }, 'x'), /missing string name/);
+  assert.throws(() => asCreateWorkflowOk({ ok: true, name: 'y', version: 2, hash: 'h' }, 'x'), /does not match pushed def/);
+  assert.throws(() => asCreateWorkflowOk({ ok: true, name: 'x', hash: 'h' }, 'x'), /version must be a positive integer/);
+  assert.throws(() => asCreateWorkflowOk({ ok: true, name: 'x', version: 0, hash: 'h' }, 'x'), /version must be a positive integer/);
+  assert.throws(() => asCreateWorkflowOk({ ok: true, name: 'x', version: 1.5, hash: 'h' }, 'x'), /version must be a positive integer/);
+  assert.throws(() => asCreateWorkflowOk({ ok: true, name: 'x', version: 2, hash: '' }, 'x'), /non-empty hash/);
+  // A well-formed, consistent success still narrows cleanly.
+  assert.deepEqual(asCreateWorkflowOk({ ok: true, name: 'x', version: 2, hash: 'h' }, 'x'), {
+    ok: true,
+    name: 'x',
+    version: 2,
+    hash: 'h',
+  });
 });
 
 // ---- whoami response guard -----------------------------------------------
