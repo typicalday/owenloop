@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/typicalday/owenloop/compare/v0.3.0...v0.4.0) (2026-07-16)
+
+
+### Features
+
+* CLI adopts hub parity — whoami-verified auth, server-truth push diff ([#27](https://github.com/typicalday/owenloop/issues/27)) ([e882c70](https://github.com/typicalday/owenloop/commit/e882c7065dcbd91647fce4cd508748fd6700967b))
+* deep tick drives calls: children; surface child stalls on parent status ([#20](https://github.com/typicalday/owenloop/issues/20)) ([b1cc889](https://github.com/typicalday/owenloop/commit/b1cc88935be32429b73d6b1dd123aafab0490cf3))
+* **hub:** transport + OAuth origin policy, strict push responses (SEC-2/4, REL-9/10) ([#33](https://github.com/typicalday/owenloop/issues/33)) ([2f5e999](https://github.com/typicalday/owenloop/commit/2f5e999d0a7eed9260b42e813681f9fcd855f3f7))
+* owenloop add &lt;owner&gt;/&lt;repo&gt;[[@ref](https://github.com/ref)] -- install workflow defs from GitHub ([#23](https://github.com/typicalday/owenloop/issues/23)) ([a74ea1c](https://github.com/typicalday/owenloop/commit/a74ea1cc63f0563e3d6a78d7588251280d27e4cc))
+* owenloop login/connect/push/logout — hub onboarding for the CLI ([#24](https://github.com/typicalday/owenloop/issues/24)) ([bedf856](https://github.com/typicalday/owenloop/commit/bedf856c7a5494ea6f16b3d6f39347790198c784))
+* per-produce override of maxAttempts / maxSchemaFailures ([#8](https://github.com/typicalday/owenloop/issues/8)) ([3285720](https://github.com/typicalday/owenloop/commit/32857203d0b587077733110f1231b272e39fed83))
+* persist issued order packet at claim; add 'owenloop order' read verb ([#30](https://github.com/typicalday/owenloop/issues/30)) ([f77de53](https://github.com/typicalday/owenloop/commit/f77de539db7626f6df9bb5ea7b2a13cc0976a76b))
+* re-home hashDefForHub into hub module, add core/hub boundary lint (0.3.0) ([#29](https://github.com/typicalday/owenloop/issues/29)) ([61f50bc](https://github.com/typicalday/owenloop/commit/61f50bc22adae57a966e0edcd9b33d88931d5010))
+* retain immutable artifact history ([#32](https://github.com/typicalday/owenloop/issues/32)) ([e0dc624](https://github.com/typicalday/owenloop/commit/e0dc624ec79435fc87b2ba82b9fd549687fd5bb7))
+* validate in-memory def sets + hard deep-tick call-depth bound (REL-4) ([#35](https://github.com/typicalday/owenloop/issues/35)) ([ad3564b](https://github.com/typicalday/owenloop/commit/ad3564bdc446d6e228e5ef083464997b9ad668b9))
+* worker-label claim filter and per-step max-lease clamp ([#31](https://github.com/typicalday/owenloop/issues/31)) ([0345044](https://github.com/typicalday/owenloop/commit/034504407fa8b2182b5ada02a3860f6f791d9888))
+
+
+### Bug Fixes
+
+* **add:** atomic, collision-free, validated installs (REL-1/REL-2/REL-3) ([#40](https://github.com/typicalday/owenloop/issues/40)) ([7904446](https://github.com/typicalday/owenloop/commit/7904446c0175bba61a55ead6d52b1a0c725c4e38))
+* atomic child creation and transactional, order-checked store open (REL-5) ([#37](https://github.com/typicalday/owenloop/issues/37)) ([59119d2](https://github.com/typicalday/owenloop/commit/59119d276080946690182b0971e2f281d5783fa4))
+* auto-skip submitted group siblings to prevent permanent wedge ([#15](https://github.com/typicalday/owenloop/issues/15)) ([484aea2](https://github.com/typicalday/owenloop/commit/484aea20d682196574b5c8c7da35bfd3e10619d3))
+* catch child schema refusals as debts and version-pin the calls: mirror ([#16](https://github.com/typicalday/owenloop/issues/16)) ([500cce7](https://github.com/typicalday/owenloop/commit/500cce7152023391c19393ee5dcb18d802a6b2e8))
+* CLI nits from PR [#25](https://github.com/typicalday/owenloop/issues/25) review — NaN flag guard, timeout message, stale comment ([#26](https://github.com/typicalday/owenloop/issues/26)) ([e438dcb](https://github.com/typicalday/owenloop/commit/e438dcb7b9709dcd31338565172caebeede5e5d9))
+* close three commit-side verb guard gaps (F3, F5, F7) ([#11](https://github.com/typicalday/owenloop/issues/11)) ([fbcc777](https://github.com/typicalday/owenloop/commit/fbcc77700fefcf66f287e5e903ad7c03e9b59b64))
+* credential backend authority, hub/auth deadlines, atomic symlink-refusing writes (REL-6/REL-7/SEC-3) ([#39](https://github.com/typicalday/owenloop/issues/39)) ([f71853b](https://github.com/typicalday/owenloop/commit/f71853b0893415c8d578b847262180a5b8d861b1))
+* eligibleFirings never offers a firing groupCasCheck will refuse ([#9](https://github.com/typicalday/owenloop/issues/9)) ([024b78f](https://github.com/typicalday/owenloop/commit/024b78f61094ba1fbce274ffa9d331a48fdc972f))
+* **engine:** make max-lease cap opt-in; distinguish reap reasons (REL-8) ([#38](https://github.com/typicalday/owenloop/issues/38)) ([074fb5e](https://github.com/typicalday/owenloop/commit/074fb5e6a58248d172320fdf38f22418a13fe6b4))
+* guard status child summary against unresolvable child def; test dueAt min-fold ([#22](https://github.com/typicalday/owenloop/issues/22)) ([cb7ccd2](https://github.com/typicalday/owenloop/commit/cb7ccd2404f7477ed38d596321ec032c2e3756b5))
+* hub CLI hardening — portable push hash, boolean-flag parse, login timeout ([#25](https://github.com/typicalday/owenloop/issues/25)) ([c36e1b6](https://github.com/typicalday/owenloop/commit/c36e1b6d67a425c0af42b99b705e603f68aaad46))
+* keep release-please tags as vX.Y.Z, not owenloop-vX.Y.Z ([#3](https://github.com/typicalday/owenloop/issues/3)) ([d5e9c37](https://github.com/typicalday/owenloop/commit/d5e9c37344f459a18a21f513a7898382a9ffac76))
+* refuse emit after the collection seal has greened (§11.1, F6) ([#17](https://github.com/typicalday/owenloop/issues/17)) ([cd963cf](https://github.com/typicalday/owenloop/commit/cd963cf9296504dc0278f9fa68d097a60e318c0f))
+* **security:** contain bodyFile resolution and bound archive extraction in add (SEC-1) ([#34](https://github.com/typicalday/owenloop/issues/34)) ([6d8ccfa](https://github.com/typicalday/owenloop/commit/6d8ccfac2cc92164fe6f0548a038423d983e2ca9))
+* ship src/ in the npm files allowlist ([#13](https://github.com/typicalday/owenloop/issues/13)) ([20ffcea](https://github.com/typicalday/owenloop/commit/20ffcea9132610203ef9da3cfa147990ad157ca9))
+
 ## [0.3.0](https://github.com/typicalday/owenloop/compare/v0.2.1...v0.3.0) (2026-07-15)
 
 
