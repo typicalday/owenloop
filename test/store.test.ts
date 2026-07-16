@@ -77,6 +77,26 @@ test('artifact upsert replaces and preserves JSON fields', () => {
   s.close();
 });
 
+test('artifact history retains immutable versions and lifecycle events', () => {
+  const s = mem();
+  const wf = randId('wf');
+  s.putArtifact(artifact(wf, 'pr', { acceptance: 'green', version: 1, value: { url: 'v1' }, fingerprint: { plan: 1 } }));
+  s.putArtifact(artifact(wf, 'pr', {
+    acceptance: 'rejected', version: 1, value: { url: 'v1' }, fingerprint: { plan: 1 },
+    reasons: [{ at: 10, action: 'reject', kind: 'judgment', by: 'review', text: 'fix checks', fromVersion: 1 }], judgmentRejects: 1,
+  }));
+  s.putArtifact(artifact(wf, 'pr', { acceptance: 'green', version: 2, value: { url: 'v2' }, fingerprint: { plan: 2 } }));
+  const history = s.getArtifactHistory(wf, 'pr');
+  assert.deepEqual(history?.versions.map((v) => v.value), [{ url: 'v1' }, { url: 'v2' }]);
+  assert.deepEqual(history?.versions.map((v) => v.fingerprint), [{ plan: 1 }, { plan: 2 }]);
+  assert.ok(history?.versions[0]?.events.some((event) => event.action === 'produced'));
+  assert.ok(history?.versions[0]?.events.some((event) => event.reason === 'fix checks'));
+  assert.equal(history?.current.value?.url, 'v2');
+  s.deleteArtifact(wf, 'pr');
+  assert.equal(s.getArtifactHistory(wf, 'pr'), undefined);
+  s.close();
+});
+
 test('deleteArtifact removes a single artifact, scoped by workflow + path', () => {
   const s = mem();
   const wf = randId('wf');

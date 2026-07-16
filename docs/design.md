@@ -27,6 +27,19 @@ function rather than a feature bolted beside it.
 - **§2.3 Run** — the audit/budget record created when a task is claimed; holds the
   claim's input **fingerprint** for the commit CAS.
 
+### §2.4 Persistence history
+
+SQLite keeps `artifact` as the compact current-state projection used by the
+scheduler. In addition, every newly produced positive version is captured once
+in immutable `artifact_version` (payload, fingerprint, producer, initial
+acceptance, and time), while `artifact_event` is an append-only, version-addressed
+lifecycle stream. `Store.getArtifactHistory(workflow, path)` is deliberately a
+narrow, lazy read; normal artifact/status listing does not load it. Intentional
+artifact or workflow deletion also removes its history, so active instances retain
+history but cleanup leaves no orphan audit rows. Upgrading legacy databases can
+backfill the existing reason entries, but cannot recover payloads overwritten
+before this schema existed; durable payload history begins after migration.
+
 ## §3 The firing rule
 
 A step's eligibility depends on its consume mode:

@@ -18,6 +18,9 @@ import { detId, nowMs } from './util.ts';
 import type {
   Acceptance,
   ArtifactData,
+  ArtifactEvent,
+  ArtifactHistory,
+  ArtifactVersion,
   Fingerprint,
   Order,
   ReasonEntry,
@@ -90,6 +93,35 @@ CREATE TABLE IF NOT EXISTS artifact (
 CREATE INDEX IF NOT EXISTS artifact_wf ON artifact (workflow);
 CREATE INDEX IF NOT EXISTS artifact_wf_accept ON artifact (workflow, acceptance);
 
+-- Immutable audit history.  artifact remains the small current-state projection.
+CREATE TABLE IF NOT EXISTS artifact_version (
+  id TEXT PRIMARY KEY,
+  workflow TEXT NOT NULL,
+  path TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  producer TEXT NOT NULL,
+  value TEXT,
+  fingerprint TEXT,
+  initial_acceptance TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  UNIQUE (workflow, path, version)
+);
+CREATE INDEX IF NOT EXISTS artifact_version_wf_path ON artifact_version (workflow, path, version);
+
+CREATE TABLE IF NOT EXISTS artifact_event (
+  id TEXT PRIMARY KEY,
+  workflow TEXT NOT NULL,
+  path TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  reason TEXT,
+  kind TEXT,
+  metadata TEXT,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS artifact_event_wf_path_version_at ON artifact_event (workflow, path, version, created_at, id);
+
 CREATE TABLE IF NOT EXISTS task (
   id          TEXT PRIMARY KEY,
   workflow    TEXT NOT NULL,
@@ -149,13 +181,13 @@ CREATE TABLE IF NOT EXISTS meta (
  *
  * Bumped to '7' for claim-time order-packet persistence (§8 / Gap 1): the `run`
  * table gains `order_json` (see `migrate()`).
- *
  * Bumped to '8' for REL-5: a partial UNIQUE index on the child-instance
  * parent-coordinates (`produced_by_wf`, `produced_by_path`) so two concurrent
- * driver ticks cannot each insert a child for the same `calls:` step (see
- * `migrate()`).
+ * driver ticks cannot each insert a child for the same `calls:` step.
+ *
+ * Bumped to '9' for immutable artifact payload/version and lifecycle-event history.
  */
-const SCHEMA_VERSION = '8';
+const SCHEMA_VERSION = '9';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -228,6 +260,37 @@ function mapArtifact(r: ArtifactRowRaw): ArtifactRow {
     column: 'approvals',
   });
   if (approvals !== undefined) out.approvals = approvals;
+  return out;
+}
+
+interface ArtifactVersionRaw {
+  id: string; workflow: string; path: string; version: number; producer: string;
+  value: string | null; fingerprint: string | null; initial_acceptance: string; created_at: number;
+}
+interface ArtifactEventRaw {
+  id: string; workflow: string; path: string; version: number; action: string; actor: string;
+  reason: string | null; kind: string | null; metadata: string | null; created_at: number;
+}
+function mapArtifactVersion(r: ArtifactVersionRaw): ArtifactVersion {
+  const out: ArtifactVersion = {
+    id: r.id, workflow: r.workflow, path: r.path, version: r.version, producer: r.producer,
+    initialAcceptance: r.initial_acceptance as Acceptance, createdAt: r.created_at,
+  };
+  const value = fromJson<Record<string, unknown> | undefined>(r.value, undefined, { table: 'artifact_version', id: r.id, column: 'value' });
+  const fingerprint = fromJson<Fingerprint | undefined>(r.fingerprint, undefined, { table: 'artifact_version', id: r.id, column: 'fingerprint' });
+  if (value !== undefined) out.value = value;
+  if (fingerprint !== undefined) out.fingerprint = fingerprint;
+  return out;
+}
+function mapArtifactEvent(r: ArtifactEventRaw): ArtifactEvent {
+  const out: ArtifactEvent = {
+    id: r.id, workflow: r.workflow, path: r.path, version: r.version, action: r.action,
+    actor: r.actor, timestamp: r.created_at,
+  };
+  if (r.reason !== null) out.reason = r.reason;
+  if (r.kind !== null) out.kind = r.kind as ArtifactEvent['kind'];
+  const metadata = fromJson<Record<string, unknown> | undefined>(r.metadata, undefined, { table: 'artifact_event', id: r.id, column: 'metadata' });
+  if (metadata !== undefined) out.metadata = metadata;
   return out;
 }
 
@@ -345,79 +408,13 @@ export class Store {
 
   constructor(path: string) {
     this.db = new DatabaseSync(path);
-    // Connection-scoped only — no file mutation, safe before the version check.
-    this.db.exec('PRAGMA busy_timeout = 5000');
-
-    // Version pre-check with ZERO on-disk mutation: read and compare the stored
-    // schema_version BEFORE any DDL or migration runs. The old ordering ran
-    // premigrate()/SCHEMA/migrate() first, so opening a NEWER-than-binary
-    // database mutated it (e.g. added order_json) before the version check
-    // could refuse it. This fast path must stay: `PRAGMA journal_mode = WAL`
-    // below rewrites a non-WAL file's header, so a newer DB has to be refused
-    // BEFORE it — keeping the file byte-identical on the refusal path.
-    try {
-      this.refuseIfNewer();
-    } catch (err) {
-      // No writes happened yet, so the file is untouched. Close before rethrow
-      // (plan decision: the handle is closed before StoreVersionError escapes).
-      this.db.close();
-      throw err;
-    }
-
-    // Only now may we touch the file. journal_mode and foreign_keys cannot be
-    // set inside a transaction (foreign_keys is a no-op there; journal_mode
-    // errors), so set them here, before the migration tx.
     this.db.exec('PRAGMA journal_mode = WAL');
+    this.db.exec('PRAGMA busy_timeout = 5000');
     this.db.exec('PRAGMA foreign_keys = ON');
     this.db.exec('PRAGMA synchronous = NORMAL');
-
-    // One transaction for all DDL + the version stamp. SQLite DDL is
-    // transactional, so premigrate()/SCHEMA/migrate()/stamp are all-or-nothing:
-    // an interrupted or failed migration rolls back cleanly (leaving the old
-    // version intact) instead of leaving a half-migrated file. The BEGIN
-    // IMMEDIATE also serializes concurrent first-opens across processes.
-    try {
-      this.tx(() => {
-        // Re-check the version as the FIRST statement inside the write lock.
-        // The pre-check above is TOCTOU-racy: between it and acquiring BEGIN
-        // IMMEDIATE, a newer binary in another process can migrate the file and
-        // stamp a higher schema_version. Without this re-read we would then run
-        // our older DDL over that newer file and stamp the version back DOWN —
-        // silently accepting (and corrupting) a database we must refuse. Re-
-        // reading here makes the version decision ATOMIC with the DDL: nothing
-        // has been written yet, so throwing rolls back to a byte-identical file.
-        // Use the in-tx value for the stamp guard so it reflects the state the
-        // write actually sees, not the stale pre-check read.
-        const curInTx = this.refuseIfNewer();
-        this.premigrate();
-        this.db.exec(SCHEMA);
-        this.migrate();
-        if (curInTx !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
-      });
-    } catch (err) {
-      // The in-tx re-check refuses a newer DB the same way the pre-check does;
-      // honor the same close-before-throw contract on that path too. Other
-      // migration failures keep their prior behavior (propagate; the tx already
-      // rolled back, leaving the old version intact).
-      if (err instanceof StoreVersionError) this.db.close();
-      throw err;
-    }
-  }
-
-  /**
-   * Read the on-disk `schema_version` and throw {@link StoreVersionError} if it
-   * is newer than this binary's {@link SCHEMA_VERSION}. Performs NO writes, so a
-   * throw leaves the database file byte-identical. A missing `meta` table (fresh
-   * DB) or a missing/non-numeric stored value is treated as "old" — returns the
-   * raw stored value (or `undefined`) so the caller can decide whether a re-stamp
-   * is needed. Called BOTH before the migration tx (fast, zero-mutation refusal
-   * before `PRAGMA journal_mode = WAL` touches the file) and as the first
-   * statement INSIDE it (atomic re-check under the write lock — see constructor).
-   */
-  private refuseIfNewer(): string | undefined {
-    const metaExists =
-      this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'`).get() !== undefined;
-    if (!metaExists) return undefined;
+    this.premigrate();
+    this.db.exec(SCHEMA);
+    this.migrate();
     const cur = this.getMeta('schema_version');
     if (cur !== undefined) {
       const curNum = parseInt(cur, 10);
@@ -429,7 +426,7 @@ export class Store {
         );
       }
     }
-    return cur;
+    if (cur !== SCHEMA_VERSION) this.setMeta('schema_version', SCHEMA_VERSION);
   }
 
   close(): void {
@@ -505,22 +502,8 @@ export class Store {
     }
     // Reverse-lookup index (CREATE INDEX IF NOT EXISTS is idempotent).
     this.db.exec(`CREATE INDEX IF NOT EXISTS workflow_produced_by ON workflow(produced_by_wf, produced_by_path)`);
-    // REL-5 (schema v8): a PARTIAL UNIQUE index on the child parent-coordinates
-    // is the backstop that stops two concurrent driver ticks from each
-    // inserting a child for the same calls: step. The engine's atomic
-    // insert-or-read (spawnChildIfAbsent) inside BEGIN IMMEDIATE is the primary
-    // guard; this index makes a duplicate physically impossible for ANY future
-    // writer path. Partial (WHERE both coords NOT NULL) so top-level instances,
-    // which carry NULL coords, never conflict.
-    //
-    // Legacy-duplicate stance (proposal scope 3): TOLERATE existing duplicates,
-    // PREVENT new ones. If the old race already wrote duplicate children, we do
-    // NOT create the unique index (it would fail) and we do NOT delete data
-    // (refusing/bricking the DB would also break the cleanup tooling that must
-    // open it). We skip index creation while dupes exist — the check is a cheap
-    // aggregate on a small table, retried on every open — and rely on the atomic
-    // spawn path to prevent new duplicates regardless. Once the operator removes
-    // the legacy dupes, the next open creates the index.
+    // REL-5 (schema v8): make duplicate calls: children physically impossible
+    // for future writers. Legacy duplicates are tolerated until cleaned up.
     const dupe = this.db
       .prepare(
         `SELECT 1 FROM workflow
@@ -549,6 +532,24 @@ export class Store {
     }
     if (!wfCols.some((c) => c.name === 'def_hash')) {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN def_hash TEXT`);
+    }
+
+    // v8 can faithfully recover lifecycle explanations already present in the
+    // old projection, but never payloads that earlier writes overwrote.
+    const legacy = this.db.prepare('SELECT * FROM artifact').all() as unknown as ArtifactRowRaw[];
+    for (const raw of legacy) {
+      const art = mapArtifact(raw);
+      for (let i = 0; i < art.reasons.length; i++) {
+        const reason = art.reasons[i]!;
+        this.insertArtifactEvent({
+          workflow: art.workflow, path: art.path,
+          version: reason.fromVersion ?? art.version,
+          action: reason.action, actor: reason.by, reason: reason.text,
+          timestamp: reason.at, kind: reason.kind,
+          // This deterministic legacy key makes opening a migrated DB repeat-safe.
+          key: `legacy:${i}:${reason.at}:${reason.action}:${reason.by}:${reason.text}`,
+        });
+      }
     }
   }
 
@@ -637,6 +638,8 @@ export class Store {
   /** Deletes only this workflow's own rows (artifact/task/run/workflow). Does NOT
    * cascade to children spawned via calls: — see deleteWorkflowCascade for that. */
   deleteWorkflow(id: string): void {
+    this.db.prepare('DELETE FROM artifact_event WHERE workflow = ?').run(id);
+    this.db.prepare('DELETE FROM artifact_version WHERE workflow = ?').run(id);
     this.db.prepare('DELETE FROM artifact WHERE workflow = ?').run(id);
     this.db.prepare('DELETE FROM task WHERE workflow = ?').run(id);
     this.db.prepare('DELETE FROM run WHERE workflow = ?').run(id);
@@ -660,14 +663,8 @@ export class Store {
    * Used by the calls: re-attach guard (never-duplicate). Returns undefined when no match.
    */
   findChildByParent(parentWf: string, parentPath: string): WorkflowRow | undefined {
-    // ORDER BY created_at, id LIMIT 1: the v8 unique index prevents NEW
-    // duplicates, but a database that predates it may still hold legacy dupes
-    // from the old race. Pick the oldest (stably, id-tiebroken) so every reader
-    // converges on the same winner instead of an arbitrary row.
     const r = this.db
-      .prepare(
-        'SELECT * FROM workflow WHERE produced_by_wf = ? AND produced_by_path = ? ORDER BY created_at, id LIMIT 1',
-      )
+      .prepare('SELECT * FROM workflow WHERE produced_by_wf = ? AND produced_by_path = ?')
       .get(parentWf, parentPath) as WorkflowRowRaw | undefined;
     return r ? mapWorkflow(r) : undefined;
   }
@@ -706,9 +703,10 @@ export class Store {
   }
 
   /** Insert or fully replace the artifact at (workflow, path). */
-  putArtifact(data: ArtifactData): ArtifactRow {
+  putArtifact(data: ArtifactData, provenance?: { action?: string; actor?: string; reason?: string; kind?: string; timestamp?: number; key?: string }): ArtifactRow {
+    const previous = this.getArtifact(data.workflow, data.path);
     const id = artifactId(data.workflow, data.path);
-    const at = nowMs();
+    const at = provenance?.timestamp ?? nowMs();
     this.db
       .prepare(
         `INSERT INTO artifact
@@ -747,10 +745,61 @@ export class Store {
         approvals: toJson(data.approvals),
         updated_at: at,
       });
+    const changed = !previous || JSON.stringify({ ...previous, id: undefined, updatedAt: undefined }) !== JSON.stringify({ ...data, id: undefined, updatedAt: undefined });
+    if (changed) {
+      if (data.version > 0 && (!previous || data.version > previous.version)) {
+        this.db.prepare(
+          `INSERT INTO artifact_version (id, workflow, path, version, producer, value, fingerprint, initial_acceptance, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(workflow, path, version) DO NOTHING`,
+        ).run(detId('artver', data.workflow, data.path, String(data.version)), data.workflow, data.path, data.version,
+          data.producer, toJson(data.value), toJson(data.fingerprint), data.acceptance, at);
+      }
+      const appended = previous ? data.reasons.slice(previous.reasons.length) : data.reasons;
+      if (appended.length) {
+        for (let i = 0; i < appended.length; i++) {
+          const r = appended[i]!;
+          this.insertArtifactEvent({ workflow: data.workflow, path: data.path, version: r.fromVersion ?? data.version,
+            action: r.action, actor: r.by, reason: r.text, timestamp: r.at, kind: r.kind,
+            key: `reason:${previous?.reasons.length ?? 0}:${i}:${r.at}:${r.action}:${r.by}:${r.text}` });
+        }
+      } else {
+        const action = provenance?.action ?? (data.version > (previous?.version ?? 0)
+          ? (data.acceptance === 'submitted' ? 'submitted' : 'produced')
+          : data.acceptance !== previous?.acceptance ? data.acceptance : 'updated');
+        this.insertArtifactEvent({ workflow: data.workflow, path: data.path, version: data.version, action,
+          actor: provenance?.actor ?? (data.producer || 'engine'), reason: provenance?.reason,
+          timestamp: at, kind: provenance?.kind, key: provenance?.key });
+      }
+    }
     return this.getArtifact(data.workflow, data.path) as ArtifactRow;
   }
 
+  private insertArtifactEvent(event: { workflow: string; path: string; version: number; action: string; actor: string; reason?: string; timestamp: number; kind?: string; metadata?: Record<string, unknown>; key?: string }): void {
+    const identity = event.key ?? `${event.action}:${event.actor}:${event.reason ?? ''}:${event.timestamp}:${event.kind ?? ''}`;
+    const id = detId('artevt', event.workflow, event.path, String(event.version), identity);
+    this.db.prepare(
+      `INSERT INTO artifact_event (id, workflow, path, version, action, actor, reason, kind, metadata, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
+    ).run(id, event.workflow, event.path, event.version, event.action, event.actor, event.reason ?? null,
+      event.kind ?? null, toJson(event.metadata), event.timestamp);
+  }
+
+  /** Returns history for exactly one artifact; list/status reads stay projection-only. */
+  getArtifactHistory(workflow: string, path: string): ArtifactHistory | undefined {
+    const current = this.getArtifact(workflow, path);
+    if (!current) return undefined;
+    const versions = (this.db.prepare(
+      'SELECT * FROM artifact_version WHERE workflow = ? AND path = ? ORDER BY version, created_at, id',
+    ).all(workflow, path) as unknown as ArtifactVersionRaw[]).map(mapArtifactVersion);
+    const events = (this.db.prepare(
+      'SELECT * FROM artifact_event WHERE workflow = ? AND path = ? ORDER BY created_at, id',
+    ).all(workflow, path) as unknown as ArtifactEventRaw[]).map(mapArtifactEvent);
+    return { current, versions: versions.map((v) => ({ ...v, events: events.filter((e) => e.version === v.version) })), events: events.filter((e) => e.version === 0) };
+  }
+
   deleteArtifact(workflow: string, path: string): void {
+    this.db.prepare('DELETE FROM artifact_event WHERE workflow = ? AND path = ?').run(workflow, path);
+    this.db.prepare('DELETE FROM artifact_version WHERE workflow = ? AND path = ?').run(workflow, path);
     this.db.prepare('DELETE FROM artifact WHERE workflow = ? AND path = ?').run(workflow, path);
   }
 
