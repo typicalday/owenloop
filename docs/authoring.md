@@ -43,7 +43,7 @@ steps:
         # maxSchemaFailures: 1 #   just for this produce — see design.md §6
     body: |                    # the prompt; ${WORKFLOW} ${RUN} ${INDEX} are filled in
       Read the proposal and produce a `plan`.
-    bodyFile: path/to.md       # load body from a file, relative to this workflow's dir; mutually exclusive with body
+    bodyFile: path/to.md       # load body from a file, relative to this workflow's dir (must resolve inside it); mutually exclusive with body
 
     generates:                 # optional; outputs this step makes that NO step
       - audit_log              #   consumes. Exempt from dead-end lint; otherwise
