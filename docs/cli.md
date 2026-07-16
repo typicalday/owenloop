@@ -119,6 +119,12 @@ normalization time so a plaintext origin can never be persisted as a credential
 key or project binding. A legacy `hub.json` carrying a remote-http origin is
 likewise refused at push time, with a hint to re-run `owenloop connect`.
 
+**Request timeouts.** Every hub call — OAuth discovery, client registration,
+code exchange, token refresh, `whoami`, the workflow list, and each push — is
+bounded by a 30s deadline; a stalled hub surfaces as a friendly `hub did not
+respond within 30s` error instead of hanging. `OWENLOOP_HUB_TIMEOUT_MS`
+overrides the budget (a test knob).
+
 ### `login` — authenticate the CLI against a hub
 
 Two ways to get a credential, both of which **verify before storing** (a token
@@ -145,6 +151,12 @@ fed over stdin, never on the command line. Elsewhere — or with
 a `0700` directory. Either way the token is never written into the repo or a
 `.env`. `login`'s JSON reports `storage: "keychain" | "file"` and `kind`, and
 prints **no token value** to stdout/stderr.
+
+The backend is chosen once from your platform and env and then used for every
+read and write — a keychain-backed CLI never silently drops to the file store.
+If the keychain write fails (locked or unavailable), `login` errors out instead
+of writing the secret elsewhere: unlock the keychain, or set
+`OWENLOOP_NO_KEYCHAIN=1` to select the file store up front.
 
 Both branches verify the credential against `GET /api/whoami` before storing
 it — a `401` there means the credential is never written to disk. On success
