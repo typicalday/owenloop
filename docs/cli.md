@@ -90,6 +90,21 @@ follow-up, not yet implemented.
 Public repos only — no auth/token support yet; a private repo (or a bad
 ref) surfaces as a 404 from the sha-resolve step.
 
+**Untrusted-archive safety.** `add` treats the fetched repo as untrusted and
+refuses the whole install (nothing written) on any of these:
+
+- **Path containment.** An archive entry whose path would escape the install
+  dir (absolute, or a `..` component) is rejected, and every offender is named.
+  A def's `bodyFile` is likewise resolved symlink-aware and must be a regular
+  file inside the def's own directory — an absolute path, a `..` component, or
+  a symlink pointing outside is refused (both while staging and when a
+  previously-installed package is later loaded).
+- **Resource bounds on extraction.** The download is capped at 256 MiB
+  compressed and 1 GiB expanded (a gzip bomb aborts at inflate time rather than
+  exhausting memory), 50k files, 100 MiB per file, and 1024-char entry paths.
+- **Request timeouts.** The sha-resolve fetch times out after 30s and the
+  tarball download after 5 min, each surfacing as a friendly error.
+
 ## Hub (`login` / `connect` / `push` / `logout`)
 
 These four commands publish local workflow defs to a hosted **hub** (default

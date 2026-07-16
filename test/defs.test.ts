@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { parseProduce } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -743,6 +743,162 @@ test('bodyFile with no resolvable base throws a clear DefError', () => {
     ],
   };
   assert.throws(() => buildDef(raw), DefError);
+});
+
+// ---- bodyFile containment (SEC-1) ------------------------------------------
+//
+// A remote definition must not be able to read files outside its own workflow
+// directory via `bodyFile`. Fixtures put a `secret.md` OUTSIDE a `pkg/` dir and
+// load a workflow from inside `pkg/`, mirroring an installed package.
+
+/** Build a `pkg/` dir under a fresh temp root, with `secret.md` a sibling of pkg. */
+function bodyFileFixture(): { root: string; pkg: string } {
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-bodyfile-sec-'));
+  const pkg = join(root, 'pkg');
+  mkdirSync(pkg);
+  writeFileSync(join(root, 'secret.md'), 'TOP SECRET\n');
+  return { root, pkg };
+}
+
+test('bodyFile: a step bodyFile with a ../ traversal is rejected (SEC-1)', () => {
+  const { pkg } = bodyFileFixture();
+  writeFileSync(
+    join(pkg, 'workflow.yaml'),
+    [
+      'name: evil',
+      'inputs:',
+      '  - name: topic',
+      'steps:',
+      '  - name: researcher',
+      '    consumes: [topic]',
+      '    produces: [findings]',
+      '    bodyFile: ../secret.md',
+    ].join('\n'),
+  );
+  assert.throws(
+    () => loadDefFile(join(pkg, 'workflow.yaml')),
+    (e: unknown) =>
+      e instanceof DefError &&
+      /step 'researcher': bodyFile '\.\.\/secret\.md'/.test((e as Error).message),
+  );
+});
+
+test('bodyFile: a judge bodyFile with a ../ traversal is rejected (SEC-1)', () => {
+  const { pkg } = bodyFileFixture();
+  writeFileSync(
+    join(pkg, 'workflow.yaml'),
+    [
+      'name: evil',
+      'inputs:',
+      '  - name: topic',
+      'steps:',
+      '  - name: researcher',
+      '    consumes: [topic]',
+      '    produces:',
+      '      - name: findings',
+      '        judges:',
+      '          - name: rigor',
+      '            bodyFile: ../secret.md',
+    ].join('\n'),
+  );
+  assert.throws(
+    () => loadDefFile(join(pkg, 'workflow.yaml')),
+    (e: unknown) =>
+      e instanceof DefError &&
+      /judge 'rigor': bodyFile '\.\.\/secret\.md'/.test((e as Error).message),
+  );
+});
+
+test('bodyFile: an absolute step bodyFile is rejected', () => {
+  const { pkg } = bodyFileFixture();
+  writeFileSync(
+    join(pkg, 'workflow.yaml'),
+    [
+      'name: evil',
+      'inputs:',
+      '  - name: topic',
+      'steps:',
+      '  - name: researcher',
+      '    consumes: [topic]',
+      '    produces: [findings]',
+      '    bodyFile: /etc/hosts',
+    ].join('\n'),
+  );
+  assert.throws(
+    () => loadDefFile(join(pkg, 'workflow.yaml')),
+    (e: unknown) =>
+      e instanceof DefError && /bodyFile '\/etc\/hosts' must be a relative path/.test((e as Error).message),
+  );
+});
+
+test("bodyFile: a '.' component is rejected", () => {
+  const { pkg } = bodyFileFixture();
+  writeFileSync(join(pkg, 'x.md'), 'body\n');
+  writeFileSync(
+    join(pkg, 'workflow.yaml'),
+    [
+      'name: evil',
+      'inputs:',
+      '  - name: topic',
+      'steps:',
+      '  - name: researcher',
+      '    consumes: [topic]',
+      '    produces: [findings]',
+      '    bodyFile: ./x.md',
+    ].join('\n'),
+  );
+  assert.throws(
+    () => loadDefFile(join(pkg, 'workflow.yaml')),
+    (e: unknown) =>
+      e instanceof DefError &&
+      /bodyFile '\.\/x\.md' must be a relative path with no '\.' or '\.\.' components/.test((e as Error).message),
+  );
+});
+
+test('bodyFile: a symlink inside the package pointing outside is rejected', () => {
+  const { root, pkg } = bodyFileFixture();
+  // link.md lives inside pkg (passes the segment check) but resolves outside it.
+  symlinkSync(join(root, 'secret.md'), join(pkg, 'link.md'));
+  writeFileSync(
+    join(pkg, 'workflow.yaml'),
+    [
+      'name: evil',
+      'inputs:',
+      '  - name: topic',
+      'steps:',
+      '  - name: researcher',
+      '    consumes: [topic]',
+      '    produces: [findings]',
+      '    bodyFile: link.md',
+    ].join('\n'),
+  );
+  assert.throws(
+    () => loadDefFile(join(pkg, 'workflow.yaml')),
+    (e: unknown) =>
+      e instanceof DefError &&
+      /bodyFile 'link\.md' resolves outside the workflow's directory/.test((e as Error).message),
+  );
+});
+
+test('bodyFile: a contained nested bodyFile still loads (containment does not break legit packages)', () => {
+  const { pkg } = bodyFileFixture();
+  mkdirSync(join(pkg, 'prompts'));
+  writeFileSync(join(pkg, 'prompts', 'research.md'), 'Research ${WORKFLOW}.\n');
+  writeFileSync(
+    join(pkg, 'workflow.yaml'),
+    [
+      'name: legit',
+      'inputs:',
+      '  - name: topic',
+      'steps:',
+      '  - name: researcher',
+      '    consumes: [topic]',
+      '    produces: [findings]',
+      '    bodyFile: prompts/research.md',
+    ].join('\n'),
+  );
+  const loaded = loadDefFile(join(pkg, 'workflow.yaml'));
+  assert.equal(loaded.steps[0]!.body.trim(), 'Research ${WORKFLOW}.');
 });
 
 // ---- lintDef -----------------------------------------------------------------

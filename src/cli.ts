@@ -50,6 +50,7 @@ import type { WorkflowDef } from './types.ts';
 import { detId, nowMs, parseDurationMs } from './util.ts';
 import { extractTarGz } from './untar.ts';
 import {
+  archivePathViolation,
   githubShaUrl,
   githubTarballUrl,
   installFiles,
@@ -997,6 +998,13 @@ function statusEntry(engine: Engine, w: WorkflowRow): Record<string, unknown> {
  * I/O, file install) lives in `src/add.ts`; this function is just the async
  * network + arg glue.
  */
+// Request deadlines for the two `add` fetches. A small JSON/text sha lookup
+// should be quick; the whole-repo tarball may be large on a slow link, so it
+// gets a much longer budget. Constants only — no env knob (a follow-up can add
+// one if ever needed).
+const ADD_SHA_TIMEOUT_MS = 30_000;
+const ADD_TARBALL_TIMEOUT_MS = 300_000;
+
 async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const spec = need(args, 1, 'owner/repo[@ref]');
   const { owner, repo, ref } = parseRepoSpec(spec);
@@ -1006,9 +1014,19 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const fetchFn = io.fetch ?? globalThis.fetch;
 
   // 1. Resolve the ref to a pinned commit sha.
-  const shaRes = await fetchFn(githubShaUrl(owner, repo, ref), {
-    headers: { Accept: 'application/vnd.github.sha', 'User-Agent': 'owenloop' },
-  });
+  let shaRes: Response;
+  try {
+    shaRes = await fetchFn(githubShaUrl(owner, repo, ref), {
+      headers: { Accept: 'application/vnd.github.sha', 'User-Agent': 'owenloop' },
+      signal: AbortSignal.timeout(ADD_SHA_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const err = e as Error;
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      throw new CliError(`timed out after ${ADD_SHA_TIMEOUT_MS / 1000}s resolving ${source}@${ref}`);
+    }
+    throw e;
+  }
   if (!shaRes.ok) {
     const notFoundNote = shaRes.status === 404 ? ' (repo or ref not found)' : '';
     throw new CliError(`could not resolve ${source}@${ref}: GitHub returned ${shaRes.status}${notFoundNote}`);
@@ -1019,14 +1037,26 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   }
   const sha = shaBody;
 
-  // 2. Fetch the tarball for that pinned sha.
-  const tarRes = await fetchFn(githubTarballUrl(owner, repo, sha), {
-    headers: { 'User-Agent': 'owenloop' },
-  });
-  if (!tarRes.ok) {
-    throw new CliError(`could not fetch tarball for ${source}@${sha}: GitHub returned ${tarRes.status}`);
+  // 2. Fetch the tarball for that pinned sha. The timeout must cover the body
+  //    read too — undici ties the abort signal to the body stream — so the
+  //    fetch AND arrayBuffer() live in the same try.
+  let bytes: Uint8Array;
+  try {
+    const tarRes = await fetchFn(githubTarballUrl(owner, repo, sha), {
+      headers: { 'User-Agent': 'owenloop' },
+      signal: AbortSignal.timeout(ADD_TARBALL_TIMEOUT_MS),
+    });
+    if (!tarRes.ok) {
+      throw new CliError(`could not fetch tarball for ${source}@${sha}: GitHub returned ${tarRes.status}`);
+    }
+    bytes = new Uint8Array(await tarRes.arrayBuffer());
+  } catch (e) {
+    const err = e as Error;
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      throw new CliError(`timed out after ${ADD_TARBALL_TIMEOUT_MS / 1000}s downloading tarball for ${source}@${sha}`);
+    }
+    throw e;
   }
-  const bytes = new Uint8Array(await tarRes.arrayBuffer());
 
   // 3. Extract, strip the single leading '<owner>-<repo>-<sha>/' root-dir
   //    component GitHub tarballs always have, and keep only workflows/**
@@ -1038,13 +1068,29 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     throw new CliError(`could not extract tarball for ${source}@${sha}: ${(e as Error).message}`);
   }
   const files = new Map<string, Uint8Array>();
+  const pathViolations: string[] = [];
   for (const [rawPath, data] of rawFiles) {
     const firstSlash = rawPath.indexOf('/');
     const rest = firstSlash >= 0 ? rawPath.slice(firstSlash + 1) : '';
     if (rest.startsWith('workflows/')) {
       const relPath = rest.slice('workflows/'.length);
-      if (relPath) files.set(relPath, data);
+      if (relPath) {
+        // Reject any entry that would escape the staging/install dir BEFORE it
+        // is ever joined and written (SEC-1). Collect every offender so the
+        // refusal names them all.
+        const violation = archivePathViolation(relPath);
+        if (violation) {
+          pathViolations.push(`${rawPath}: ${violation}`);
+          continue;
+        }
+        files.set(relPath, data);
+      }
     }
+  }
+  if (pathViolations.length > 0) {
+    throw new CliError(
+      `refusing to install ${source}@${sha} — ${pathViolations.length} unsafe archive path(s) found; nothing written:\n  - ${pathViolations.join('\n  - ')}`,
+    );
   }
   // Note: git (and so GitHub's tarball export) never tracks a truly empty
   // directory, so "no workflows/ dir at all" and "workflows/ dir exists but

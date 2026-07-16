@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
+import { archivePathViolation } from '../src/add.ts';
 import { makeGithubTarball } from './helpers.ts';
 
 const SHA_A = 'a'.repeat(40);
@@ -357,6 +358,157 @@ test('add: corrupt/non-gzip tarball bytes surface as a clear CliError', async ()
   const code = await mainAsync(['add', `${owner}/${repo}`], io);
   assert.equal(code, 1);
   assert.match(err.join('\n'), /could not extract tarball/);
+});
+
+// ---- SEC-1: archive path escape refused --------------------------------------
+
+test('add: an archive entry that escapes with ../ refuses the whole add — nothing written', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
+    'workflows/good.yaml': validDefYaml('good'),
+    'workflows/../../victim.yaml': 'name: pwned\n',
+  });
+  const { fetch } = fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  });
+  const { io, cwd, err } = makeIo(fetch);
+
+  const code = await mainAsync(['add', `${owner}/${repo}`], io);
+  assert.equal(code, 1);
+  assert.match(err.join('\n'), /unsafe archive path/);
+  assert.match(err.join('\n'), /victim\.yaml/);
+
+  assert.ok(!existsSync(join(cwd, 'workflows', `${owner}-${repo}`)), 'defsDir untouched on refusal');
+  assert.ok(!existsSync(lockfilePath(cwd)), 'no lockfile written on refusal');
+  assert.ok(!existsSync(join(cwd, 'victim.yaml')), 'victim not written into cwd');
+});
+
+test('add: a def whose bodyFile escapes with ../ is refused during staging validation (SEC-1 repro)', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const auditDef = [
+    'name: audit',
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: worker',
+    '    consumes: [seed]',
+    '    produces: [out]',
+    '    terminal: true',
+    '    maxSchemaFailures: 0',
+    '    bodyFile: ../../../../etc/hosts',
+    '',
+  ].join('\n');
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
+    'workflows/audit.yaml': auditDef,
+  });
+  const { fetch } = fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  });
+  const { io, cwd, err } = makeIo(fetch);
+
+  const code = await mainAsync(['add', `${owner}/${repo}`], io);
+  assert.equal(code, 1);
+  assert.match(err.join('\n'), /refusing to install/);
+  assert.match(err.join('\n'), /bodyFile/);
+
+  assert.ok(!existsSync(join(cwd, 'workflows', `${owner}-${repo}`)), 'nothing installed');
+  assert.ok(!existsSync(lockfilePath(cwd)), 'no lockfile written on refusal');
+});
+
+test('add: a package whose def uses a contained bodyFile installs cleanly', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const fooDef = [
+    'name: foo',
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: worker',
+    '    consumes: [seed]',
+    '    produces: [out]',
+    '    terminal: true',
+    '    maxSchemaFailures: 0',
+    '    bodyFile: prompts/x.md',
+    '',
+  ].join('\n');
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
+    'workflows/foo.yaml': fooDef,
+    'workflows/prompts/x.md': 'do the thing\n',
+  });
+  const { fetch } = fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  });
+  const { io, cwd, out } = makeIo(fetch);
+
+  const code = await mainAsync(['add', `${owner}/${repo}`], io);
+  assert.equal(code, 0, out.join('\n'));
+  const result = JSON.parse(out.join('\n'));
+  assert.deepEqual(result.defs, ['foo']);
+  assert.equal(result.installed, 2); // foo.yaml + prompts/x.md
+  assert.ok(existsSync(join(cwd, 'workflows', `${owner}-${repo}`, 'prompts', 'x.md')));
+});
+
+// ---- SEC-1: fetch timeout wiring ---------------------------------------------
+
+test('add: both fetches carry an AbortSignal deadline', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
+    'workflows/foo.yaml': validDefYaml('foo'),
+  });
+  const { fetch, calls } = fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  });
+  const { io } = makeIo(fetch);
+
+  const code = await mainAsync(['add', `${owner}/${repo}`], io);
+  assert.equal(code, 0);
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.ok(call.init?.signal instanceof AbortSignal, `expected an AbortSignal on ${call.url}`);
+  }
+});
+
+test('add: a fetch timeout surfaces as a friendly CliError', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  // A fetch that behaves like an aborted request: rejects with a TimeoutError,
+  // exactly as AbortSignal.timeout drives undici.
+  const fetchFn = (async () => {
+    throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+  }) as unknown as typeof globalThis.fetch;
+  const { io, err } = makeIo(fetchFn);
+
+  const code = await mainAsync(['add', `${owner}/${repo}`], io);
+  assert.equal(code, 1);
+  assert.match(err.join('\n'), /timed out after 30s resolving acme\/widgets@HEAD/);
+});
+
+// ---- archivePathViolation (unit) ---------------------------------------------
+
+test('archivePathViolation: accepts safe relative paths and rejects unsafe ones', () => {
+  // safe
+  assert.equal(archivePathViolation('foo.yaml'), undefined);
+  assert.equal(archivePathViolation('a/b/c.yaml'), undefined);
+  assert.equal(archivePathViolation('prompts/x.md'), undefined);
+  // unsafe
+  assert.ok(archivePathViolation(''), 'empty');
+  assert.ok(archivePathViolation('/etc/passwd'), 'absolute posix');
+  assert.ok(archivePathViolation('C:\\Windows\\system32'), 'windows drive');
+  assert.ok(archivePathViolation('../x'), 'leading dotdot');
+  assert.ok(archivePathViolation('a/../b'), 'embedded dotdot');
+  assert.ok(archivePathViolation('a\\..\\b'), 'backslash dotdot');
+  assert.ok(archivePathViolation('./x'), 'dot segment');
+  assert.ok(archivePathViolation('a\0b'), 'NUL byte');
+  assert.ok(archivePathViolation('x'.repeat(2000)), 'overlong');
 });
 
 // ---- everything else still routes through the sync main() --------------------
