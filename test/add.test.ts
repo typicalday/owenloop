@@ -2333,3 +2333,203 @@ test('discovery(g): a top-level def that calls: an installed def resolves and cr
   assert.equal(created.code, 0, created.err.join('\n'));
   assert.match(JSON.parse(created.out.join('\n')).workflow, /^wf_/);
 });
+
+// ---- offline crash-recovery: `owenloop add --recover` ------------------------
+//
+// `add --recover` is a NETWORK-FREE entry point to the same
+// `recoverInterruptedInstall` the normal add path runs inline. A machine that
+// crashed mid-install and is now OFFLINE can finish/undo the interrupted install
+// without waiting for the network. Every test below drives through
+// `mainAsync(['add','--recover', ...])` with a fetch that THROWS on any call and
+// asserts `calls.length === 0` — proving the path never reaches the SHA/tarball
+// fetches.
+
+/**
+ * Drive `owenloop add --recover [extra…]` in-process with a fetch that throws on
+ * ANY call (`fakeFetch({})` has no canned responses), against a caller-supplied
+ * cwd (so the crash-fixture helpers can seed it first). Returns exit code, the
+ * parsed JSON report (if the command printed one), stderr, and the recorded
+ * fetch calls — which must always be empty.
+ */
+async function recoverVia(
+  cwd: string,
+  extraArgs: string[] = [],
+  env: Record<string, string> = {},
+): Promise<{ code: number; report: Record<string, unknown> | undefined; err: string[]; calls: FetchCall[] }> {
+  const { fetch, calls } = fakeFetch({});
+  const out: string[] = [];
+  const err: string[] = [];
+  const io: CliIO = { cwd, env, out: (s) => out.push(s), err: (s) => err.push(s), fetch };
+  const code = await mainAsync(['add', '--recover', ...extraArgs], io);
+  let report: Record<string, unknown> | undefined;
+  if (out.length > 0) {
+    try {
+      report = JSON.parse(out.join('\n')) as Record<string, unknown>;
+    } catch {
+      report = undefined;
+    }
+  }
+  return { code, report, err, calls };
+}
+
+test('add --recover (offline): rolls a leftover install FORWARD with no network', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // Committed past the ledger write, journal stuck at `finalizing`: dest holds the
+  // new content, a stale backup is retained, staging debris present.
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'PREV');
+  seedDir(p.stagingDir, 'foo.yaml', 'NEW');
+  seedLockfileEntry(cwd, SHA_B, folder);
+  seedJournal(cwd, { phase: 'finalizing', hadDest: true, sha: SHA_B, folder });
+
+  const { code, report, calls } = await recoverVia(cwd);
+
+  assert.equal(code, 0);
+  assert.equal(report?.outcome, 'rolled-forward');
+  assert.equal(report?.recovered, true);
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'NEW', 'installed content kept');
+  assert.ok(!existsSync(p.backupDir), 'retained backup discarded');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+  assert.equal(calls.length, 0, 'no network call on the recover path');
+});
+
+test('add --recover (offline): rolls a leftover install BACK with no network', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // An upgrade crashed AFTER the swap but BEFORE the ledger write (case (b)):
+  // staging gone, backup present, dest holds the new content, ledger still the old
+  // sha. Roll back: restore the previous content at dest.
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'PREV');
+  seedLockfileEntry(cwd, SHA_A, folder);
+  seedJournal(cwd, { phase: 'applying', hadDest: true, sha: SHA_B, folder });
+
+  const { code, report, calls } = await recoverVia(cwd);
+
+  assert.equal(code, 0);
+  assert.equal(report?.outcome, 'rolled-back');
+  assert.equal(report?.recovered, true);
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'PREV', 'previous content restored at dest');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+  assert.equal(calls.length, 0, 'no network call on the recover path');
+});
+
+test('add --recover (offline): no journal ⇒ clean no-op success, nothing mutated', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  const { code, report, calls } = await recoverVia(cwd);
+
+  assert.equal(code, 0);
+  assert.equal(report?.recovered, false);
+  assert.match(String(report?.message), /nothing to recover/);
+  // The SEC-3 symlink guard mkdirs the default defs dir (same as the normal add
+  // path), but recovery installs nothing: the defs tree is empty and no journal
+  // is created.
+  assert.deepEqual(readdirSync(defsDirOf(cwd)), [], 'defs tree left empty — nothing installed');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'no journal created');
+  assert.equal(calls.length, 0, 'no network call on the recover path');
+});
+
+test('add --recover (offline): a fail-closed refusal exits 1, mutates nothing, no network', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  // E1 fail-closed shape: `applying`, `hadDest:false`, an existing UNRELATED dest
+  // dir, no ledger entry, no staging, no backup — on-disk indistinguishable from a
+  // forged journal, so recovery refuses and the dest survives byte-identical.
+  seedDir(p.dest, 'foo.yaml', 'VICTIM');
+  seedJournal(cwd, { phase: 'applying', hadDest: false, sha: SHA_B, folder: installFolder(OWNER, REPO) });
+
+  const { code, report, err, calls } = await recoverVia(cwd);
+
+  assert.equal(code, 1);
+  assert.equal(report, undefined, 'no success report printed on refusal');
+  assert.match(err.join('\n'), /refusing crash-recovery/, 'refusal message surfaced on stderr');
+  assert.match(err.join('\n'), /nothing corroborates/);
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'VICTIM', 'dest survives byte-identical');
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left in place as evidence');
+  assert.equal(calls.length, 0, 'no network call even on refusal');
+});
+
+test('add --recover (offline): honors --defs, recovering the pointed-at tree', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const altDefs = mkdtempSync(join(tmpdir(), 'owenloop-altdefs-'));
+  const folder = installFolder(OWNER, REPO);
+  // Seed a `finalizing` leftover rooted at the ALTERNATE defs dir (not cwd/workflows).
+  const stagingRoot = join(altDefs, STAGING_DIRNAME);
+  const dest = join(altDefs, folder);
+  const backupDir = join(stagingRoot, 'stg_test-old');
+  seedDir(dest, 'foo.yaml', 'NEW');
+  seedDir(backupDir, 'foo.yaml', 'PREV');
+  writeLockfile(lockfilePath(cwd), {
+    version: 1,
+    installed: {
+      [`${OWNER}/${REPO}`]: {
+        source: `${OWNER}/${REPO}`,
+        ref: 'HEAD',
+        sha: SHA_B,
+        installedAt: 1,
+        path: folder,
+        files: ['foo.yaml'],
+      },
+    },
+  });
+  writeAddJournal(journalPathOf(cwd), {
+    version: 1,
+    phase: 'finalizing',
+    source: `${OWNER}/${REPO}`,
+    sha: SHA_B,
+    folder,
+    stagingId: 'stg_test',
+    hadDest: true,
+    defsDir: altDefs,
+    ref: 'HEAD',
+    startedAt: 1,
+  });
+
+  const { code, report, calls } = await recoverVia(cwd, ['--defs', altDefs]);
+
+  assert.equal(code, 0);
+  assert.equal(report?.outcome, 'rolled-forward');
+  assert.equal(readFileSync(join(dest, 'foo.yaml'), 'utf8'), 'NEW', 'alt-tree install kept');
+  assert.ok(!existsSync(backupDir), 'alt-tree backup discarded');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+  assert.equal(calls.length, 0, 'no network call on the recover path');
+});
+
+test('add --recover (offline): refuses a repository argument, exit 1, no network', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  const { code, err, calls } = await recoverVia(cwd, ['acme/widgets']);
+
+  assert.equal(code, 1);
+  assert.match(err.join('\n'), /--recover takes no repository argument/);
+  assert.equal(calls.length, 0, 'refused before any fetch');
+});
+
+test('add --recover --bogus: rejected by preflight before any I/O', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  const { code, err, calls } = await recoverVia(cwd, ['--bogus']);
+
+  assert.equal(code, 1);
+  assert.match(err.join('\n'), /unknown option/);
+  assert.match(err.join('\n'), /bogus/);
+  assert.equal(calls.length, 0, 'rejected before any fetch');
+});
+
+test('add --recover on a clean cwd: proves the COMMAND_OPTIONS/USAGE registration', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  // A bare `add --recover` must be accepted by preflight (registered flag) and
+  // succeed as a no-op — this is the positive half of the option-guard check.
+  const { code, report } = await recoverVia(cwd);
+
+  assert.equal(code, 0);
+  assert.equal(report?.ok, true);
+  assert.equal(report?.recovered, false);
+});
