@@ -113,6 +113,16 @@ lockfile to proceed. A repo previously installed under the old
 `<owner>-<repo>` naming is migrated to the new hashed folder automatically,
 and the old one is removed only once the new lockfile entry is durably written.
 
+`add` never trusts `.owenloop/installed.json` for filesystem paths: the lockfile
+is validated fail-closed on read. A file that parses but is structurally invalid
+— an unsupported `version`, a malformed or key-mismatched entry, a non-hex
+`sha`, an escaping `files` entry, or a `path` that is not a single safe folder
+segment (any `..`, absolute, or separator-bearing `path` is refused, never
+normalized) — is a hard error naming the offending entry and field, never
+silently reset to empty (which would erase ownership records). This closes a
+directory-migration path where a crafted committed lockfile could make `add`
+move and then delete a directory outside the defs dir.
+
 **Discovery limitation.** `defs`/`loadDefs` only scan the defs dir's
 top-level `*.yaml` files and immediate-subdir `workflow.yaml` files — they
 don't recurse into `<owner>-<repo>-<hash>/*.yaml`. Defs installed by `add`
