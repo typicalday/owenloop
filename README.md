@@ -395,6 +395,45 @@ import { createEngine } from 'owenloop';   // see "Embedding it" below
 
 ---
 
+## Upgrading from 0.2.1
+
+Upgrading a project from the 0.2.1 release pulls in everything that has landed
+since. The changes that need operator or embedder attention:
+
+- **Deep recursive ticking.** One `tick` now advances the whole `calls:` tree
+  by default, so a single call can drive many workflow instances at once and
+  their execution timing shifts. Embedders that key per-workflow logic —
+  checkpoints, transactions, counters — must key on `order.workflow`, not the
+  id passed to `tick` (`--shallow` / `{ deep: false }` is the single-instance
+  escape hatch). See
+  [Migrating from shallow ticking](docs/embedding.md#the-worker-step) and
+  [Deep tick and `order.workflow`](docs/cli.md#what-a-job-looks-like); the full
+  guidance lives there.
+- **Node ≥ 22.13 required.** The `engines` field pins Node ≥ 22.13, and CI runs
+  the full check on Node 22 and 24 — see [Requirements](#requirements) just
+  above.
+- **Database schema v9.** The first open by a new binary migrates the database
+  in a single transaction that rolls back on failure; a database whose stored
+  version is newer than the binary is refused rather than opened. Migrated
+  databases do **not** get backfilled artifact-history payload snapshots —
+  durable payload history begins after migration (legacy lifecycle reasons are
+  carried over exactly once). Copy the SQLite database (`.owenloop/state.db`
+  plus its `-wal`/`-shm` sidecars) before upgrading; downgrading means
+  restoring that copy, because an older binary refuses a v9 database.
+- **New retained plaintext data.** Issued order packets and artifact history
+  now persist in the database, so rotating and disposing of that data is the
+  operator's job — see [Retention and disposal](#storage).
+- **New network-facing commands and credential storage.** `owenloop login` /
+  `connect` / `push` (and `add`, for installing shared defs) reach the network
+  and store a credential in the macOS Keychain or a `0600` file — see the
+  [Hub](docs/cli.md#hub-login-connect-push-logout) section and the `add`
+  [trust model](docs/cli.md#add--installing-shared-workflow-defs-from-github).
+- **Max-lease cap is now opt-in.** There is no default lease ceiling; anyone who
+  relied on the brief post-0.2.1 default cap must set `maxLeaseMs` (or a
+  per-step `maxLease`) explicitly.
+
+---
+
 ## Embedding it
 
 The CLI is a thin adapter: it maps `argv` to engine calls and prints JSON. The engine
@@ -488,19 +527,19 @@ npm run check     # both
 npm run build     # compile src/ → dist/ (also runs automatically on npm pack/publish)
 ```
 
-The suite is **579 tests**: unit tests (`paths`, `store`, `model`, `defs`, `schema`,
+The suite spans unit tests (`paths`, `store`, `model`, `defs`, `schema`,
 `util`, `cli`), engine integration tests (the cascade, the stall, schema validation,
 the concurrency check, `judges:` sign-off/CAS/throttling in `test/judges.test.ts`),
 and end-to-end tests that spawn the real `bin/owenloop.mjs` binary and drive the
 example workflows through their full lifecycles.
 
 Two e2e files carry most of the weight, by opposite intent.
-[`test/edge.e2e.test.ts`](test/edge.e2e.test.ts) is a 26-case edge battery aimed at the
+[`test/edge.e2e.test.ts`](test/edge.e2e.test.ts) is an edge battery aimed at the
 corners the design is most particular about: cascade invalidation, terminal completion
 surviving an upstream reject, empty / fully-retracted collections, the commit check,
 cadence and daily-budget gating, the skip-cascade, and CLI robustness against malformed
 input. [`test/scenarios.e2e.test.ts`](test/scenarios.e2e.test.ts) takes the opposite
-tack — eight multi-step *positive* stories that confirm the documented behaviors hold
+tack — multi-step *positive* stories that confirm the documented behaviors hold
 end to end: the map `parallel` cap, map and reduce firing as concurrent branches, the
 reason thread riding the next job, stall → retry → re-stall, and the cascade re-firing on
 a re-provided input while leaving a healthy graph and a terminal output untouched.
