@@ -1873,6 +1873,67 @@ test('recovery: refuses when a directory it would rename is actually a symlink (
   assert.ok(existsSync(journalPathOf(cwd)), 'journal left as evidence');
 });
 
+test('recovery: a SAME-sha re-add killed between the dest→backup and staging→dest renames restores from backup (no silent data loss)', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // Re-adding an already-installed source at the SAME sha. commitInstall renamed
+  // dest → backupDir (step 4a) and the process was killed BEFORE the staging →
+  // dest swap (4b): dest is ABSENT, staging is still present, and backupDir holds
+  // the ONLY surviving copy of the installed content. The ledger already records
+  // this exact sha+folder from the prior successful install, so the `applying` +
+  // ledger-match test passes — but rolling FORWARD here would rmSync backupDir and
+  // leave the ledger claiming an install that is gone from disk (silent data
+  // loss). Recovery must branch on disk state and restore backupDir → dest.
+  seedDir(p.stagingDir, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'INSTALLED'); // the only surviving copy
+  seedLockfileEntry(cwd, SHA_B, folder);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+  seedJournal(cwd, { phase: 'applying', hadDest: true, sha: SHA_B, folder });
+
+  recoverIn(cwd);
+
+  assert.ok(existsSync(p.dest), 'dest restored — content not lost');
+  assert.equal(
+    readFileSync(join(p.dest, 'foo.yaml'), 'utf8'),
+    'INSTALLED',
+    'installed content restored from backup, not discarded',
+  );
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'ledger untouched (still records the install)');
+  assert.ok(!existsSync(p.backupDir), 'backup consumed by the restore');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('recovery: refuses a VALID journal when the staging root is a planted symlink — no mutation outside defsDir', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // The attacker's out-of-tree directory the symlinked staging root points at.
+  const outside = mkdtempSync(join(tmpdir(), 'owenloop-outside-'));
+  const outsideBefore = readdirSync(outside);
+  // Hostile checkout: `workflows/` and `.owenloop/` ship as REAL dirs (pass
+  // SEC-3), the in-tree dest holds a real victim dir, and `.owenloop-staging` is
+  // planted as a SYMLINK to the attacker's outside dir. The journal is fully VALID
+  // (single-segment folder inside defsDir, matching defsDir, applying,
+  // hadDest=false, empty ledger) so validateAddJournal accepts it. Recovery would
+  // otherwise take roll-back case (c) `!hadDest` with dest present:
+  // renameSync(dest, undoDir) where undoDir sits UNDER the symlinked staging root,
+  // moving the victim OUTSIDE defsDir. Recovery must refuse before any fs mutation.
+  mkdirSync(p.defsDir, { recursive: true });
+  seedDir(p.dest, 'foo.yaml', 'VICTIM');
+  symlinkSync(outside, p.stagingRoot);
+  seedJournal(cwd, { phase: 'applying', hadDest: false, sha: SHA_B, folder });
+
+  assert.throws(() => recoverIn(cwd), /staging root .* is a symlink/);
+
+  // NO fs mutation anywhere: the victim dir is intact in place, nothing landed in
+  // the attacker's outside dir, and the journal is left as evidence.
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'VICTIM', 'in-tree victim dir untouched');
+  assert.deepEqual(readdirSync(outside), outsideBefore, 'nothing moved into the attacker dir');
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left in place as evidence');
+});
+
 test('validateAddJournal / readAddJournal: reject unknown phase, bad version, and corrupt JSON', () => {
   const base = {
     version: 1,

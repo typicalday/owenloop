@@ -909,8 +909,20 @@ function recoveryRefusal(journalPath: string, detail: string): Error {
  * symlinked segment must never be renamed/rm'd, since finalize/rollback would
  * act through it) or a non-directory file is refused. `lstat`, never `stat`, so
  * a symlink is seen as a symlink, not followed to its target.
+ *
+ * The PARENT is checked too, not just the leaf: `lstat` on the leaf sees a
+ * symlinked leaf, but a symlinked *parent* directory would be silently followed
+ * by the `rename`/`rm` that acts on the leaf, redirecting the whole mutation
+ * outside `defsDir` (a hostile checkout planting `.owenloop-staging` as a
+ * symlink is exactly this). Refuse a symlinked immediate parent before trusting
+ * the leaf probe. (Absent parent ⇒ the leaf is absent too; nothing to refuse.)
  */
 function probeRecoveryDir(p: string, journalPath: string, label: string): 'dir' | 'absent' {
+  const parent = dirname(p);
+  const parentSt = lstatSync(parent, { throwIfNoEntry: false });
+  if (parentSt?.isSymbolicLink()) {
+    throw recoveryRefusal(journalPath, `${label} parent '${parent}' is a symlink`);
+  }
   let st;
   try {
     st = lstatSync(p);
@@ -953,10 +965,15 @@ export interface RecoverInterruptedInstallArgs {
  *     discards may be missing. Clear the retained backup + parked old-name and
  *     the staging root. Trivially idempotent.
  *  2. `applying` + the ledger already records this source at `journal.sha`/
- *     `journal.folder` ⇒ the ledger write actually completed (a crash in the
- *     writeLockfile→phase-rewrite window) ⇒ roll forward.
- *  3. `applying`, no ledger match ⇒ roll back through the guarded, idempotent
- *     decision table below (mirroring `rollbackInstallCommit`'s order).
+ *     `journal.folder` ⇒ the commit MAY have landed, but the ledger match alone
+ *     does not prove it — branch on disk: dest present ⇒ the swap completed ⇒
+ *     roll forward; dest ABSENT ⇒ a same-sha re-add crashed inside commitInstall's
+ *     dest→backup / staging→dest window and backupDir holds the only copy ⇒ roll
+ *     back (restore it) rather than discarding it (which would be silent data
+ *     loss against a ledger that still records the install).
+ *  3. `applying`, no ledger match (or ledger match with dest absent) ⇒ roll back
+ *     through the guarded, idempotent decision table below (mirroring
+ *     `rollbackInstallCommit`'s order).
  *
  * Crash-safety of recovery itself: the journal is removed LAST, after all
  * restore/discard renames, and every step is a single atomic rename guarded by
@@ -999,9 +1016,33 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
   const dest = join(defsDir, journal.folder);
   const oldNameOriginal = journal.oldNamePath !== undefined ? join(defsDir, journal.oldNamePath) : undefined;
 
-  // Belt-and-braces: single-segment folder/oldNamePath already make traversal
-  // unrepresentable, but re-assert containment at the mutation targets too.
-  assertUnderDefs(dest, defsDir, journalPath);
+  // Symlink-guard the staging ROOT itself before deriving any mutation from it.
+  // `dispatchAdd`'s `mkdirRefusingSymlink` guards `.owenloop` and the default
+  // defsDir, but NOT `<defsDir>/.owenloop-staging` — and stagingDir/backupDir/
+  // undoDir/parkedOldName all hang off it, so a hostile checkout that ships
+  // `.owenloop-staging` as a symlink would make every rename/rm below act
+  // through it, moving/deleting dirs OUTSIDE defsDir. `lstat` (never `stat`) so
+  // the link is seen as a link; a non-dir squatting there is refused too; absent
+  // is fine (a fresh recovery mkdirs it). This runs BEFORE any fs mutation, and
+  // recovery now precedes dispatchAdd's `rmSync(stagingRoot)`, so nothing else
+  // clears it first.
+  const stagingRootSt = lstatSync(stagingRoot, { throwIfNoEntry: false });
+  if (stagingRootSt?.isSymbolicLink()) {
+    throw recoveryRefusal(journalPath, `staging root '${stagingRoot}' is a symlink`);
+  }
+  if (stagingRootSt && !stagingRootSt.isDirectory()) {
+    throw recoveryRefusal(journalPath, `staging root '${stagingRoot}' is not a directory`);
+  }
+
+  // Belt-and-braces containment: re-assert that EVERY rename/rm source and target
+  // resolves under defsDir — not just dest/oldNameOriginal, but every staging-
+  // root-derived path too (a crafted journal + a symlinked staging root must not
+  // drive a mutation outside the tree). Single-segment folder/oldNamePath/
+  // stagingId already make lexical traversal unrepresentable; this is the extra
+  // guard the review asked for on the staging-derived paths.
+  for (const p of [stagingRoot, stagingDir, backupDir, undoDir, parkedOldName, dest]) {
+    assertUnderDefs(p, defsDir, journalPath);
+  }
   if (oldNameOriginal !== undefined) assertUnderDefs(oldNameOriginal, defsDir, journalPath);
 
   // Roll forward: the ledger is durably new; discard the retained backup + parked
@@ -1030,12 +1071,24 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
   const lf = readLockfile(lockfilePath);
   const installed = lf.installed[journal.source];
   if (installed && installed.sha === journal.sha && installed.path === journal.folder) {
-    // The commit point passed (crash in the writeLockfile→phase-rewrite window),
-    // or the same source@sha is being re-added post-swap: dest holds that sha's
-    // content by construction (contents are sha-pinned), so (defs, ledger) is
-    // already consistent — roll forward.
-    rollForward();
-    return;
+    // The ledger records this exact source@sha — but a ledger match ALONE does
+    // NOT prove the commit swap landed. Branch on ACTUAL disk state:
+    //  - dest PRESENT ⇒ the swap completed (a crash in the writeLockfile→phase-
+    //    rewrite window, or a same-sha re-add already past the swap): dest holds
+    //    that sha's content, so (defs ⇔ ledger) is consistent ⇒ roll forward
+    //    (discard the now-stale backup).
+    //  - dest ABSENT ⇒ we are inside commitInstall's 4a→4b window of a SAME-sha
+    //    re-add (dest was renamed to backupDir, and the staging→dest swap never
+    //    ran). backupDir now holds the ONLY copy of the content. Rolling forward
+    //    would `rmSync` it — silent data loss, leaving the ledger claiming an
+    //    install that is gone from disk. Fall THROUGH to the roll-back table,
+    //    which restores backupDir → dest; the ledger already records this sha, so
+    //    the restored state is consistent. The two cases are distinguishable by
+    //    disk, so branch on it rather than trusting the ledger match alone.
+    if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
+      rollForward();
+      return;
+    }
   }
 
   // ROLL BACK — restore the pre-commit directory state. Guarded idempotent
