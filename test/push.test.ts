@@ -82,6 +82,65 @@ test('push: first push sends every def, all land as new on the fake hub, exits 0
   assert.equal(hub.state.get('bar')?.version, 1);
 });
 
+// ---- unknown-option rejection: the headline repro (safety flag typo) --------
+
+test('push --dryrn is rejected before any I/O — the safety-flag typo does NOT push (zero fetches, hub unchanged)', async () => {
+  const hub = makeFakeHub();
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch });
+  // A fully push-able state: bound project + real defs. Without the guard, this
+  // WOULD do a real push — which is exactly the silent-drop hazard being fixed.
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  bind(t);
+
+  const code = await mainAsync(['push', '--dryrn'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /--dryrn/, 'names the offending option');
+  assert.match(t.err.join('\n'), /did you mean --dry-run\?/, 'suggests the intended flag');
+  assert.equal(calls.length, 0, 'no network I/O whatsoever before the rejection');
+  assert.equal(hub.state.get('foo'), undefined, 'nothing landed on the fake hub');
+});
+
+test('push --frce (typo of --force) is rejected with zero fetches', async () => {
+  const hub = makeFakeHub();
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  bind(t);
+
+  const code = await mainAsync(['push', '--frce'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /--frce/);
+  assert.match(t.err.join('\n'), /did you mean --force\?/);
+  assert.equal(calls.length, 0);
+});
+
+test('push --help prints usage and exits 0 without touching the hub', async () => {
+  const hub = makeFakeHub();
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  bind(t);
+
+  const code = await mainAsync(['push', '--help'], t.io);
+  assert.equal(code, 0);
+  assert.match(t.out.join('\n'), /Usage: owenloop <command>/);
+  assert.equal(calls.length, 0, 'help short-circuits before any push work');
+});
+
+test('push: a genuinely valid --dry-run/--force invocation still parses (no over-rejection)', async () => {
+  const hub = makeFakeHub();
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  bind(t);
+
+  const code = await mainAsync(['push', '--dry-run', '--force'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  // --dry-run means the diff is read but nothing is created.
+  assert.equal(calls.filter((c) => c.pathname === '/api/create_workflow').length, 0);
+});
+
 test('push: a re-push with no changes is a no-op — zero create_workflow calls (local hash diff)', async () => {
   const hub = makeFakeHub();
   const t = makeIo({ fetch: routedFetch(hub.routes).fetch });

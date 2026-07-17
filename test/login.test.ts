@@ -83,6 +83,19 @@ test('login: loopback OAuth stores an oauth credential in the keychain', async (
   assert.doesNotMatch(combined, /mcpat_access|rt_refresh/);
 });
 
+test('login --huub (typo of --hub) is rejected before any keychain or network access', async () => {
+  const { fetch, calls } = loginRoutes();
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+
+  const code = await mainAsync(['login', '--huub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /--huub/, 'names the offending option');
+  assert.match(t.err.join('\n'), /did you mean --hub\?/, 'suggests the intended flag');
+  assert.equal(calls.length, 0, 'no OAuth discovery/exchange before the rejection');
+  assert.equal(t.openedUrls.length, 0, 'no browser/loopback flow started');
+  assert.equal(t.store.get(ORIGIN), undefined, 'no credential stored');
+});
+
 test('login: OWENLOOP_NO_KEYCHAIN forces the 0600 file fallback', async () => {
   const { fetch } = loginRoutes();
   const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' }, onOpenUrl: driveCallback() });

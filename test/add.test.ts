@@ -172,6 +172,20 @@ test('add: happy path installs a valid def, writes the lockfile, and reports it'
   assert.equal(typeof entry.installedAt, 'number');
 });
 
+test('add: a misspelled option is rejected before any network I/O — nothing fetched or installed', async () => {
+  // No canned responses: any fetch would throw. The guard must fire first.
+  const { fetch, calls } = fakeFetch({});
+  const { io, cwd, err } = makeIo(fetch);
+
+  const code = await mainAsync(['add', 'acme/widgets', '--dfes'], io);
+  assert.equal(code, 1);
+  assert.match(err.join('\n'), /--dfes/, 'names the offending option');
+  assert.match(err.join('\n'), /did you mean --defs\?/, 'suggests the nearest valid option');
+  assert.equal(calls.length, 0, 'zero fetches — the sha lookup never runs');
+  assert.equal(existsSync(lockfilePath(cwd)), false, 'no lockfile written');
+  assert.equal(existsSync(join(cwd, 'workflows')), false, 'nothing installed');
+});
+
 test('add: an explicit @ref is preserved in the report and lockfile (pinned to the resolved sha)', async () => {
   const owner = 'acme';
   const repo = 'widgets';

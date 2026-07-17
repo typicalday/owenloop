@@ -384,7 +384,7 @@ function sleepMs(ms: number): void {
 
 // ---- commands ----------------------------------------------------------------
 
-const USAGE = `owenloop — a dataflow workflow engine
+export const USAGE = `owenloop — a dataflow workflow engine
 
 Usage: owenloop <command> [args] [--db <path>] [--defs <dir>]
 
@@ -429,6 +429,137 @@ Environment: OWENLOOP_DB, OWENLOOP_DEFS`;
 function failureNote(failures: DefLoadFailure[]): string {
   if (failures.length === 0) return '';
   return `\n${failures.length} file(s) failed to load:\n  - ${failures.map((f) => `${f.file}: ${f.error}`).join('\n  - ')}`;
+}
+
+/**
+ * Options accepted on EVERY command. docs/cli.md documents `--db`/`--defs` as
+ * global ("pass both on every command"), so they are allowlisted everywhere —
+ * even on commands that ignore them — to avoid rejecting a documented
+ * invocation.
+ */
+const GLOBAL_OPTIONS = ['db', 'defs'] as const;
+
+/** Build a command's option allowlist: the two globals plus its own long-form flags. */
+const cmdOpts = (...extra: string[]): ReadonlySet<string> => new Set<string>([...GLOBAL_OPTIONS, ...extra]);
+
+/**
+ * Single source of truth for the `--options` each command accepts, consulted by
+ * `preflight` before any side effect. Unknown-OPTION rejection AND
+ * unknown-COMMAND detection both derive from this table: a developer who adds a
+ * new `dispatch`/`ASYNC_COMMANDS` case without a matching entry here gets
+ * `unknown command` on the very first invocation, so the command cannot run
+ * until its flags are declared. That is the forcing function that stops the
+ * silently-dropped-flag hole (a misspelled `push --dryrn` doing a real push)
+ * from reappearing — keep this table in lockstep with the dispatch verbs and
+ * the USAGE string. All names are long-form: this CLI has no short options
+ * (`-h` reaches dispatch as a positional). Values are audited against every
+ * `last/all/flag/needOpt/numOpt` call site.
+ */
+export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map<string, ReadonlySet<string>>([
+  ['help', cmdOpts()],
+  ['defs', cmdOpts()],
+  ['add', cmdOpts()],
+  ['login', cmdOpts('hub', 'with-token')],
+  ['logout', cmdOpts('hub')],
+  ['connect', cmdOpts('hub')],
+  ['push', cmdOpts('dry-run', 'force', 'hub')],
+  ['lint', cmdOpts()],
+  ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided')],
+  ['create', cmdOpts('title', 'provide', 'param')],
+  ['provide', cmdOpts('value')],
+  ['adopt', cmdOpts()],
+  ['tick', cmdOpts('now', 'shallow', 'label')],
+  ['reap', cmdOpts('now')],
+  ['status', cmdOpts('all')],
+  ['wait', cmdOpts('until', 'timeout')],
+  ['show', cmdOpts()],
+  ['trace', cmdOpts('format')],
+  ['runs', cmdOpts('open')],
+  ['order', cmdOpts()],
+  ['list', cmdOpts()],
+  ['green', cmdOpts('value', 'terminal')],
+  ['emit', cmdOpts('items')],
+  ['seal', cmdOpts('value')],
+  ['reject', cmdOpts('by', 'text')],
+  ['retract', cmdOpts('by', 'text')],
+  ['skip', cmdOpts('by', 'text')],
+  ['retry', cmdOpts('by', 'text')],
+  ['close', cmdOpts('outcome', 'summary')],
+  ['heartbeat', cmdOpts('now')],
+  ['delete', cmdOpts('recursive')],
+  ['graph', cmdOpts('format')],
+]);
+
+/** Levenshtein edit distance (small DP, no deps) — used only for "did you mean" hints. */
+function editDistance(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  let prev = new Array<number>(n + 1);
+  let curr = new Array<number>(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const del = (prev[j] as number) + 1;
+      const ins = (curr[j - 1] as number) + 1;
+      const sub = (prev[j - 1] as number) + cost;
+      curr[j] = Math.min(del, ins, sub);
+    }
+    [prev, curr] = [curr, prev];
+  }
+  return prev[n] as number;
+}
+
+/**
+ * Reject any `--option` the target command does not declare in
+ * `COMMAND_OPTIONS`. Names each offender with its `--` prefix, suggests the
+ * nearest valid option (edit distance ≤ 2), and lists the command's valid
+ * options. Throws `CliError` (exit 1 via the entry-point catch). Runs BEFORE
+ * any side effect — see `preflight`.
+ */
+function assertKnownOptions(command: string, args: Args): void {
+  const allowed = COMMAND_OPTIONS.get(command);
+  if (!allowed) return; // unknown command is handled separately (in preflight)
+  const unknown = [...args.options.keys()].filter((k) => !allowed.has(k));
+  if (unknown.length === 0) return;
+  const lines = unknown.map((k) => {
+    const base = `unknown option --${k} for '${command}'`;
+    const near =
+      k.length > 0
+        ? [...allowed]
+            .map((o) => ({ o, d: editDistance(k, o) }))
+            .filter((c) => c.d <= 2)
+            .sort((a, b) => a.d - b.d)[0]
+        : undefined;
+    return near ? `${base} (did you mean --${near.o}?)` : base;
+  });
+  const validSorted = [...allowed].map((o) => `--${o}`).sort();
+  throw new CliError(`${lines.join('\n')}\nvalid options for '${command}': ${validSorted.join(', ')}`);
+}
+
+/**
+ * Pre-dispatch guard shared by both entry points (`main` and `mainAsync`) so
+ * the sync and async paths cannot drift. In order: the help escape hatch
+ * (`help`/`--help`/`-h`, or `--help` given anywhere e.g. `push --help`) prints
+ * usage and short-circuits with exit 0; an unrecognized command throws the same
+ * `unknown command` error dispatch's `default:` produces (but now before
+ * `openCtx`, so it no longer creates `.owenloop/state.db`); then unknown
+ * options are rejected. All of this runs ahead of any filesystem, keychain, or
+ * network I/O. Returns an exit code to short-circuit on, or `undefined` to
+ * proceed to dispatch. `command` is always defined here — callers own the
+ * no-command usage branch.
+ */
+function preflight(command: string, args: Args, io: CliIO): number | undefined {
+  if (command === 'help' || command === '--help' || command === '-h' || args.options.has('help')) {
+    io.out(USAGE);
+    return 0;
+  }
+  if (!COMMAND_OPTIONS.has(command)) {
+    throw new CliError(`unknown command: ${command}\n\n${USAGE}`);
+  }
+  assertKnownOptions(command, args);
+  return undefined;
 }
 
 function dispatch(command: string, io: CliIO, args: Args): number {
@@ -2428,7 +2559,7 @@ function createWorkflowRequest(
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   const args = parseArgs(argv);
@@ -2437,6 +2568,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
     return main(argv, io);
   }
   try {
+    const short = preflight(command, args, io);
+    if (short !== undefined) return short;
     switch (command) {
       case 'add':
         return await dispatchAdd(io, args);
@@ -2470,6 +2603,8 @@ export function main(argv: string[], io: CliIO = defaultIO()): number {
     return 0;
   }
   try {
+    const short = preflight(command, args, io);
+    if (short !== undefined) return short;
     return dispatch(command, io, args);
   } catch (e) {
     if (e instanceof CliError || e instanceof DefError) {
