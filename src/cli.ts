@@ -43,7 +43,16 @@ import { Engine } from './engine.ts';
 import { buildGraph, buildTrace, graphToDot, graphToMermaid, modelCheck } from './model.ts';
 import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
-import { buildDef, DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
+import {
+  buildDef,
+  DefError,
+  finalizeDefs,
+  lintDef,
+  loadDefs,
+  loadDefsRaw,
+  loadDefsUnfinalized,
+  validateDef,
+} from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 import { dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
@@ -70,7 +79,7 @@ import {
   writeAddJournal,
   writeLockfile,
 } from './add.ts';
-import type { AddJournal, InstalledEntry, InstallCommitHandle } from './add.ts';
+import type { AddJournal, InstalledEntry, InstallCommitHandle, Lockfile } from './add.ts';
 import {
   asCreateWorkflowOk,
   asWhoami,
@@ -342,10 +351,93 @@ interface Ctx {
   dbPath: string;
 }
 
+/**
+ * Load the DEFAULT def set, folding in the defs `owenloop add` installed under
+ * ledger-recorded subfolders of `defsDir` so `defs`/`create`/`tick`/etc. see
+ * them by name with NO `--defs` flag. Called ONLY when the operator did not
+ * override the defs dir (see {@link openCtx}) — an explicit `--defs`/`OWENLOOP_DEFS`
+ * targets a specific literal dir and keeps today's pure-scan behavior, including
+ * `--defs workflows/<owner>-<repo>-<hash>` pointed straight at an install folder.
+ *
+ * The composition is ledger-DRIVEN and BOUNDED: it only folds in folders named
+ * by fail-closed-validated `installed.json` entries (never a raw tree recurse),
+ * and it stays in the CLI layer (where both cwd and defsDir are known) so
+ * `loadDefs`/`loadDefsUnfinalized` in defs.ts hold no ledger knowledge.
+ *
+ * Two-phase discipline: it merges the RAW (unfinalized) maps of the base dir and
+ * each install folder, then runs ONE `finalizeDefs` over the union. That single
+ * finalize is what lets a project-local def `calls:` an installed def across the
+ * boundary — finalizing each dir independently would throw "does not exist"
+ * before the merge. When the ledger is empty/missing the result is exactly
+ * `finalizeDefs(loadDefsUnfinalized(defsDir))` === today's `loadDefs(defsDir)`:
+ * zero behavior drift on the no-installs path.
+ *
+ * Precedence: project-local (base) defs WIN over installed defs; among installed
+ * entries, ledger sources are iterated in sorted order and the FIRST-loaded def
+ * with a given name wins. Every shadowed def is surfaced as a warning on stderr,
+ * never a silent clobber. Note the outer base scan ALREADY loads an install
+ * folder's `workflow.yaml` via its immediate-subdir rule, while the fold-in
+ * loads that folder's top-level `*.yaml` (excluding `workflow.yaml`) — the two
+ * scans are disjoint per file, so no file is ever loaded twice and any name
+ * collision is a genuine two-file collision.
+ *
+ * Fail-OPEN: the fold-in never breaks base loading. A corrupt/invalid ledger, a
+ * missing install folder, or an install folder that fails to load each emits a
+ * warning on stderr and is skipped; base defs still load. (The add-time
+ * fail-closed validation in add.ts is untouched — we consume `readLockfile`,
+ * discovery merely refuses to act on a bad ledger rather than crashing.)
+ */
+function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, WorkflowDef> {
+  const merged = existsSync(defsDir) ? loadDefsUnfinalized(defsDir) : new Map<string, WorkflowDef>();
+
+  let lf: Lockfile;
+  try {
+    lf = readLockfile(join(io.cwd, '.owenloop', 'installed.json'));
+  } catch (e) {
+    io.err(`warning: skipping installed workflow defs: ${(e as Error).message}`);
+    return finalizeDefs(merged);
+  }
+
+  for (const source of Object.keys(lf.installed).sort()) {
+    const entry = lf.installed[source];
+    if (entry === undefined) continue; // unreachable — keys come from lf.installed
+    const entryDir = join(defsDir, entry.path);
+    if (!existsSync(entryDir)) {
+      io.err(`warning: installed defs folder missing for ${source}: ${entry.path}`);
+      continue;
+    }
+    let entryRaw: Map<string, WorkflowDef>;
+    try {
+      entryRaw = loadDefsUnfinalized(entryDir);
+    } catch (e) {
+      io.err(`warning: failed to load installed defs for ${source} (${entry.path}): ${(e as Error).message}`);
+      continue;
+    }
+    for (const [name, def] of entryRaw) {
+      const winner = merged.get(name);
+      if (winner !== undefined) {
+        io.err(
+          `warning: workflow '${name}' from ${def.dir ?? entryDir} is shadowed by ${winner.dir ?? 'project defs'} (project defs take precedence over installed defs)`,
+        );
+        continue;
+      }
+      merged.set(name, def);
+    }
+  }
+
+  return finalizeDefs(merged);
+}
+
 function openCtx(io: CliIO, args: Args): Ctx {
   const dbOverride = last(args, 'db') ?? io.env.OWENLOOP_DB;
   const dbPath = dbOverride ?? join(io.cwd, '.owenloop', 'state.db');
-  const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
+  // An explicit `--defs`/`OWENLOOP_DEFS` is the operator targeting a literal dir
+  // (keep pure-scan behavior, no ledger fold-in); its ABSENCE means the default
+  // dir, where `add` installs and the ledger's folders live — fold installed
+  // defs in there. The rule is "was an override given", not path equality: even
+  // `OWENLOOP_DEFS=<cwd>/workflows` counts as an override and stays literal.
+  const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
+  const defsDir = defsOverride ?? join(io.cwd, 'workflows');
   // Guard the built-in default (`cwd/.owenloop/state.db`) against a symlinked
   // `.owenloop` from a hostile checkout (SEC-3). Directory guard first, then the
   // file-level guard on `state.db` and its SQLite sidecars — a symlinked db file
@@ -358,7 +450,12 @@ function openCtx(io: CliIO, args: Args): Ctx {
     dbPathRefusingSymlink(dbPath);
   } else mkdirSync(dirname(dbPath), { recursive: true });
   const store = openStore(dbPath);
-  const defs = existsSync(defsDir) ? loadDefs(defsDir) : new Map<string, WorkflowDef>();
+  const defs =
+    defsOverride !== undefined
+      ? existsSync(defsDir)
+        ? loadDefs(defsDir)
+        : new Map<string, WorkflowDef>()
+      : loadDefsWithInstalled(io, defsDir);
   const engine = new Engine(store, (name) => {
     const d = defs.get(name);
     if (!d) throw new CliError(`unknown workflow definition '${name}' (looked in ${defsDir})`);
@@ -1641,6 +1738,9 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
       path: folder,
       installed: written.length,
       defs: [...staged.values()].map((d) => d.name).sort(),
+      hint: `installed workflows are now discoverable by default — run e.g. \`owenloop create ${
+        [...staged.values()].map((d) => d.name).sort()[0] ?? '<def-name>'
+      }\` with no --defs flag; for an explicit --defs, point it at ${folder}`,
     });
     return 0;
   } finally {

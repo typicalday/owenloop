@@ -1650,7 +1650,29 @@ function buildDefFile(file: string): WorkflowDef {
  * defs in the same directory (M1-SITE).
  */
 export function loadDefs(dir: string): Map<string, WorkflowDef> {
-  // Phase 1: build all defs (un-expanded) from disk.
+  // Phase 1 (scan) then Phase 2/3 (finalize). The two phases are split so a
+  // caller that needs to MERGE raw maps from several dirs before validating
+  // (e.g. the CLI's installed-defs fold-in, which must let a base def `calls:`
+  // an installed def across the boundary) can run one finalize over the merged
+  // raw map. For a single dir this is exactly the old inline body.
+  return finalizeDefs(loadDefsUnfinalized(dir));
+}
+
+/**
+ * Phase 1 of def loading: scan `dir` and build every workflow def UN-finalized
+ * (includes not yet expanded, no cross-def / cycle validation). Loads each
+ * top-level `*.yaml` / `*.yml` file (excluding a top-level `workflow.yaml`) and
+ * each immediate subdirectory's `workflow.yaml`. Throws `DefError` on a
+ * duplicate name WITHIN this dir. This is a pure extraction of what used to live
+ * inline in `loadDefs` — `loadDefs(dir)` is exactly `finalizeDefs(loadDefsUnfinalized(dir))`.
+ *
+ * Exported so a caller can merge the raw maps of several dirs and run a single
+ * `finalizeDefs` over the union (giving correct include-expansion and cross-def
+ * `calls:` resolution across the merged boundary). This function stays a pure
+ * dir-scanner: it holds NO ledger / `installed.json` knowledge (that composition
+ * lives at the CLI layer where cwd and defsDir are both known).
+ */
+export function loadDefsUnfinalized(dir: string): Map<string, WorkflowDef> {
   const raw = new Map<string, WorkflowDef>();
   const addRaw = (def: WorkflowDef, file: string): void => {
     if (raw.has(def.name)) throw new DefError(`duplicate workflow name '${def.name}' under ${dir}`);
@@ -1669,9 +1691,7 @@ export function loadDefs(dir: string): Map<string, WorkflowDef> {
       addRaw(buildDefFile(full), full);
     }
   }
-
-  // Phase 2/3: expand, validate cross-def, and detect calls: cycles.
-  return finalizeDefs(raw);
+  return raw;
 }
 
 /**

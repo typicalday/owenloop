@@ -194,15 +194,30 @@ defs dir is guarded only on the default `cwd/workflows` fallback — an explicit
 `--defs`/`OWENLOOP_DEFS` is operator intent and is installed through as-is,
 matching the `--db`/`OWENLOOP_DB` rule above.
 
-**Discovery limitation.** `defs`/`loadDefs` only scan the defs dir's
-top-level `*.yaml` files and immediate-subdir `workflow.yaml` files — they
-don't recurse into `<owner>-<repo>-<hash>/*.yaml`. Defs installed by `add`
-are validated and recorded, but a plain `owenloop tick`/`create` against the
-default defs dir won't see them until you point `--defs` (or
-`OWENLOOP_DEFS`) directly at the installed subfolder, e.g. `--defs
-workflows/<owner>-<repo>-<hash>` — the exact folder name is in
-`.owenloop/installed.json`'s `path` field. Auto-discovering installed defs is
-a deliberate follow-up, not yet implemented.
+**Installed-def discovery.** Defs installed by `add` are discovered by default:
+a plain `owenloop defs`/`create`/`tick` against the DEFAULT defs dir
+(`cwd/workflows`) sees them by name, no `--defs` flag needed. `loadDefs` itself
+stays a pure dir-scanner (top-level `*.yaml` plus immediate-subdir
+`workflow.yaml`); the CLI folds installed subfolders in on top, ledger-driven and
+bounded — it only loads folders named by the fail-closed-validated
+`.owenloop/installed.json` entries, never a raw recurse of the tree.
+
+- **Only under the default defs dir.** An explicit `--defs`/`OWENLOOP_DEFS` is
+  operator intent to target a literal dir and keeps the pure-scan behavior with
+  no fold-in — the rule is "was an override given", so even
+  `OWENLOOP_DEFS=$PWD/workflows` counts as an override and stays literal.
+  Pointing `--defs` straight at an install folder
+  (`--defs workflows/<owner>-<repo>-<hash>`) still works exactly as before.
+- **Precedence.** Project-local (top-level) defs win over installed defs; among
+  installed entries the ledger sources are iterated in sorted order and the
+  first-loaded def with a given name wins. Every shadowed def is reported as a
+  `warning:` on stderr (stdout JSON stays clean), never a silent clobber.
+- **Fail-open.** The fold-in never breaks base loading. A corrupt or
+  structurally-invalid `installed.json`, a missing install folder, or an install
+  folder that fails to load each emits a `warning:` on stderr and is skipped;
+  your project defs still load and the command still exits 0. The add-time
+  fail-closed lockfile validation is unchanged — discovery consumes it and simply
+  refuses to act on a bad ledger rather than crashing.
 
 Public repos only — no auth/token support yet; a private repo (or a bad
 ref) surfaces as a 404 from the sha-resolve step.

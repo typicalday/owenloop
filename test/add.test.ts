@@ -2068,3 +2068,268 @@ test('recovery: end-to-end — a real add rolls a leftover install forward befor
   assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
   assert.ok(!existsSync(p.stagingRoot), 'no staging debris left behind');
 });
+
+// ---- default discovery of add-installed defs (G2) ---------------------------
+//
+// A def installed by `add` lands under <defsDir>/<owner>-<repo>-<hash>/ and is
+// recorded in .owenloop/installed.json. The DEFAULT def-loading path (defs /
+// create / tick, via openCtx) folds those ledger-recorded folders in, so the
+// installed defs are runnable by name with no --defs flag. These tests drive
+// that end to end with fully materialized fixture state (cwd, .owenloop/, and
+// the install folder) inside the test's own temp dir — no ambient machine state.
+
+/** A minimal valid def with an optional distinguishing `title:`. */
+function defYaml(name: string, title?: string): string {
+  const lines = [`name: ${name}`];
+  if (title !== undefined) lines.push(`title: ${title}`);
+  lines.push(
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: worker',
+    '    consumes: [seed]',
+    '    produces: [out]',
+    '    terminal: true',
+    '    maxSchemaFailures: 0',
+    '',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Materialize an installed package by hand: write <cwd>/workflows/<folder>/<file>
+ * for each staged def and a matching valid `installed.json` entry (version 1,
+ * key `owner/repo`, 40-hex sha, `files` listing the def filenames). This mirrors
+ * what `add` leaves on disk, without the network/tarball path.
+ */
+function stageInstall(
+  cwd: string,
+  owner: string,
+  repo: string,
+  files: Record<string, string>,
+): string {
+  const folder = installFolder(owner, repo);
+  const dir = join(cwd, 'workflows', folder);
+  mkdirSync(dir, { recursive: true });
+  for (const [file, body] of Object.entries(files)) writeFileSync(join(dir, file), body);
+  const source = `${owner}/${repo}`;
+  const existing = existsSync(lockfilePath(cwd)) ? readLockfile(lockfilePath(cwd)) : { version: 1 as const, installed: {} };
+  const lf: Lockfile = {
+    version: 1,
+    installed: {
+      ...existing.installed,
+      [source]: { source, ref: 'HEAD', sha: SHA_A, installedAt: 1, path: folder, files: Object.keys(files) },
+    },
+  };
+  mkdirSync(join(cwd, '.owenloop'), { recursive: true });
+  writeLockfile(lockfilePath(cwd), lf);
+  return folder;
+}
+
+/** Run a CLI command in a fresh cwd (no network) and return code + captured out/err. */
+async function runCli(
+  cwd: string,
+  argv: string[],
+  env: Record<string, string> = {},
+): Promise<{ code: number; out: string[]; err: string[] }> {
+  const out: string[] = [];
+  const err: string[] = [];
+  const io: CliIO = {
+    cwd,
+    env,
+    out: (s) => out.push(s),
+    err: (s) => err.push(s),
+    fetch: (async () => { throw new Error('no network in this test'); }) as typeof globalThis.fetch,
+  };
+  const code = await mainAsync(argv, io);
+  return { code, out, err };
+}
+
+test('discovery(a): installed def is listed by `defs` and runnable by `create` with no --defs', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-a-'));
+  stageInstall(cwd, 'acme', 'widgets', { 'foo.yaml': defYaml('foo') });
+
+  const listed = await runCli(cwd, ['defs']);
+  assert.equal(listed.code, 0, listed.err.join('\n'));
+  const defs = JSON.parse(listed.out.join('\n')) as Array<{ name: string }>;
+  assert.ok(defs.some((d) => d.name === 'foo'), `installed def 'foo' listed; got ${defs.map((d) => d.name).join(',')}`);
+
+  const created = await runCli(cwd, ['create', 'foo']);
+  assert.equal(created.code, 0, created.err.join('\n'));
+  assert.match(JSON.parse(created.out.join('\n')).workflow, /^wf_/);
+});
+
+test('discovery(b.i): a ledger entry whose folder is absent warns on stderr, does not crash', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-bi-'));
+  // A valid top-level project def so base loading has something to return.
+  mkdirSync(join(cwd, 'workflows'), { recursive: true });
+  writeFileSync(join(cwd, 'workflows', 'local.yaml'), defYaml('local'));
+  // A ledger entry pointing at a folder that does not exist on disk.
+  const source = 'acme/widgets';
+  const folder = installFolder('acme', 'widgets');
+  mkdirSync(join(cwd, '.owenloop'), { recursive: true });
+  writeLockfile(lockfilePath(cwd), {
+    version: 1,
+    installed: { [source]: { source, ref: 'HEAD', sha: SHA_A, installedAt: 1, path: folder, files: ['foo.yaml'] } },
+  });
+
+  const r = await runCli(cwd, ['defs']);
+  assert.equal(r.code, 0, r.err.join('\n'));
+  const defs = JSON.parse(r.out.join('\n')) as Array<{ name: string }>;
+  assert.deepEqual(defs.map((d) => d.name), ['local'], 'top-level def still loads');
+  assert.match(r.err.join('\n'), /installed defs folder missing for acme\/widgets/);
+});
+
+test('discovery(b.ii): a structurally-invalid installed.json warns and skips, base defs still load', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-bii-'));
+  mkdirSync(join(cwd, 'workflows'), { recursive: true });
+  writeFileSync(join(cwd, 'workflows', 'local.yaml'), defYaml('local'));
+  // Bad sha (not 40-hex) → validateLockfile throws on read → discovery skips.
+  mkdirSync(join(cwd, '.owenloop'), { recursive: true });
+  writeFileSync(
+    lockfilePath(cwd),
+    JSON.stringify({
+      version: 1,
+      installed: { 'acme/widgets': { source: 'acme/widgets', ref: 'HEAD', sha: 'not-a-sha', installedAt: 1, path: 'x', files: [] } },
+    }),
+  );
+
+  const r = await runCli(cwd, ['defs']);
+  assert.equal(r.code, 0, r.err.join('\n'));
+  const defs = JSON.parse(r.out.join('\n')) as Array<{ name: string }>;
+  assert.deepEqual(defs.map((d) => d.name), ['local'], 'top-level def still loads despite a bad ledger');
+  assert.match(r.err.join('\n'), /skipping installed workflow defs:/);
+});
+
+test('discovery(c): a name collision resolves to the top-level def and warns naming both files', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-c-'));
+  // Top-level and installed both define workflow 'X', with distinguishing titles.
+  mkdirSync(join(cwd, 'workflows'), { recursive: true });
+  writeFileSync(join(cwd, 'workflows', 'x.yaml'), defYaml('X', 'project-copy'));
+  stageInstall(cwd, 'acme', 'widgets', { 'x.yaml': defYaml('X', 'installed-copy') });
+
+  const r = await runCli(cwd, ['defs']);
+  assert.equal(r.code, 0, r.err.join('\n'));
+  const defs = JSON.parse(r.out.join('\n')) as Array<{ name: string; title: string }>;
+  const x = defs.find((d) => d.name === 'X');
+  assert.ok(x, 'workflow X present');
+  assert.equal(x!.title, 'project-copy', 'project-local def wins the collision');
+  const warn = r.err.join('\n');
+  assert.match(warn, /workflow 'X'.*is shadowed by/);
+  assert.match(warn, /project defs take precedence over installed defs/);
+  const folder = installFolder('acme', 'widgets');
+  assert.ok(warn.includes(folder), 'shadow warning names the installed (shadowed) file path');
+});
+
+test('discovery(d): explicit --defs at the install folder loads it; --defs elsewhere folds in nothing', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-d-'));
+  const folder = stageInstall(cwd, 'acme', 'widgets', { 'foo.yaml': defYaml('foo') });
+
+  // (1) explicit --defs pointed straight at the install folder still works as today.
+  // (Absolute path: the test harness injects io.cwd, but a relative --defs would
+  // resolve against the real process.cwd; the CLI treats an explicit --defs literally.)
+  const direct = await runCli(cwd, ['defs', '--defs', join(cwd, 'workflows', folder)]);
+  assert.equal(direct.code, 0, direct.err.join('\n'));
+  const directDefs = JSON.parse(direct.out.join('\n')) as Array<{ name: string }>;
+  assert.deepEqual(directDefs.map((d) => d.name), ['foo']);
+
+  // (2) explicit --defs at some OTHER dir with a populated ledger in cwd does NOT fold in installed defs.
+  const other = join(cwd, 'other');
+  mkdirSync(other, { recursive: true });
+  writeFileSync(join(other, 'bar.yaml'), defYaml('bar'));
+  const elsewhere = await runCli(cwd, ['defs', '--defs', other]);
+  assert.equal(elsewhere.code, 0, elsewhere.err.join('\n'));
+  const elsewhereDefs = JSON.parse(elsewhere.out.join('\n')) as Array<{ name: string }>;
+  assert.deepEqual(elsewhereDefs.map((d) => d.name).sort(), ['bar'], 'installed def absent under an explicit --defs override');
+  assert.equal(elsewhere.err.join('\n'), '', 'no fold-in warnings under an explicit override');
+});
+
+test('discovery(d-env): OWENLOOP_DEFS=<default path> still counts as an override (literal, no fold-in)', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-denv-'));
+  stageInstall(cwd, 'acme', 'widgets', { 'foo.yaml': defYaml('foo') });
+  // Also a top-level project def so the literal dir is non-empty.
+  writeFileSync(join(cwd, 'workflows', 'local.yaml'), defYaml('local'));
+
+  const r = await runCli(cwd, ['defs'], { OWENLOOP_DEFS: join(cwd, 'workflows') });
+  assert.equal(r.code, 0, r.err.join('\n'));
+  const defs = JSON.parse(r.out.join('\n')) as Array<{ name: string }>;
+  assert.deepEqual(defs.map((d) => d.name).sort(), ['local'], 'no fold-in even when OWENLOOP_DEFS equals the default path');
+});
+
+test('discovery(e): `add` success output includes a run-ready hint naming the def and install folder', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, { 'workflows/foo.yaml': validDefYaml('foo') });
+  const { fetch } = fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  });
+  const { io, out } = makeIo(fetch);
+
+  const code = await mainAsync(['add', `${owner}/${repo}`], io);
+  assert.equal(code, 0, out.join('\n'));
+  const result = JSON.parse(out.join('\n'));
+  assert.equal(typeof result.hint, 'string');
+  // (a) runnable by name with no flag; (b) still names the install folder for --defs users.
+  assert.match(result.hint, /owenloop create foo/, 'hint names the runnable-by-name command');
+  assert.ok(result.hint.includes(installFolder(owner, repo)), 'hint includes the install folder path');
+});
+
+test('discovery(f): with no ledger, `defs` output is byte-identical to the literal loadDefs path', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-f-'));
+  mkdirSync(join(cwd, 'workflows'), { recursive: true });
+  writeFileSync(join(cwd, 'workflows', 'a.yaml'), defYaml('a'));
+  writeFileSync(join(cwd, 'workflows', 'b.yaml'), defYaml('b'));
+  // No .owenloop/installed.json at all — the no-installs path.
+
+  const viaDefault = await runCli(cwd, ['defs']); // loadDefsWithInstalled, empty ledger
+  const viaLiteral = await runCli(cwd, ['defs', '--defs', join(cwd, 'workflows')]); // plain loadDefs
+  assert.equal(viaDefault.code, 0, viaDefault.err.join('\n'));
+  assert.equal(viaLiteral.code, 0, viaLiteral.err.join('\n'));
+  assert.equal(viaDefault.out.join('\n'), viaLiteral.out.join('\n'), 'zero drift on the no-installs path');
+  assert.equal(viaDefault.err.join('\n'), '', 'no warnings when there is no ledger');
+});
+
+test('discovery(g): a top-level def that calls: an installed def resolves and creates', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-disc-g-'));
+  // Installed CHILD def, callable (declares exactly one output).
+  const childYaml = [
+    'name: child',
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'outputs: [result]',
+    'steps:',
+    '  - name: w',
+    '    consumes: [seed]',
+    '    produces: [result]',
+    '    terminal: true',
+    '    maxSchemaFailures: 0',
+    '',
+  ].join('\n');
+  stageInstall(cwd, 'acme', 'widgets', { 'child.yaml': childYaml });
+  // Top-level PARENT that calls the installed child across the base/installed boundary.
+  const parentYaml = [
+    'name: parent',
+    'inputs:',
+    '  - name: proposal',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: deliver',
+    '    calls: child',
+    '    inputs: {}',
+    '    produces: [delivered]',
+    '  - name: teardown',
+    '    consumes: [delivered]',
+    '    produces: [done]',
+    '    terminal: true',
+    '    maxSchemaFailures: 0',
+    '',
+  ].join('\n');
+  writeFileSync(join(cwd, 'workflows', 'parent.yaml'), parentYaml);
+
+  const created = await runCli(cwd, ['create', 'parent']);
+  assert.equal(created.code, 0, created.err.join('\n'));
+  assert.match(JSON.parse(created.out.join('\n')).workflow, /^wf_/);
+});
