@@ -1269,9 +1269,34 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     }
     if (existing && existing.path !== folder) {
       // Migrating off the old `<owner>-<repo>` scheme: park (not delete) the old
-      // dir so a lockfile-write failure below can restore it. Finalized away on
-      // success.
-      parkOldNameDir(handle, defsDir, existing.path);
+      // dir so a failure below can restore it. Finalized away on success. This
+      // park now sits INSIDE the recoverable region — a park failure must roll
+      // the committed swap back too, exactly like the lockfile-write failure
+      // below (a bare park could otherwise strand the swap and leave the next
+      // `add` refusing on an ownership mismatch).
+      try {
+        parkOldNameDir(handle, defsDir, existing.path);
+      } catch (e) {
+        try {
+          rollbackInstallCommit(handle);
+        } catch (rollbackErr) {
+          // Double fault: parking the old dir failed AND restoring the directory
+          // state failed. The previous content is now parked under the staging
+          // root — preserve it past the `finally` and tell the user how to
+          // recover, mirroring the lockfile-write double fault below.
+          preserveStagingRoot = true;
+          throw new CliError(
+            `could not migrate ${source} off old-name directory '${existing.path}' (${(e as Error).message}) ` +
+              `and rolling the install back failed too (${(rollbackErr as Error).message}); ` +
+              `previous content preserved under ${stagingRoot} — recover it before running add again ` +
+              `(the next add clears that directory as debris)`,
+          );
+        }
+        throw new CliError(
+          `could not migrate ${source} off old-name directory '${existing.path}': ${(e as Error).message} — ` +
+            `install rolled back, previous state restored`,
+        );
+      }
     }
 
     const entry: InstalledEntry = { source, ref, sha, installedAt: nowMs(), path: folder, files: written };
