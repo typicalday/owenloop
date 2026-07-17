@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Engine } from '../src/engine.ts';
+import { Engine, SchemaRefusalError } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { ArtifactData, StepDef, WorkflowDef } from '../src/types.ts';
@@ -1762,6 +1762,263 @@ test('calls: C2 — re-provision re-reads the parent in-tx; a concurrent advance
 
     // (3) Event hygiene: X emitted no child `data` provide commit on the aborted pass.
     assert.equal(e1DataProvides, 0, 'X fires no commit/provide for the child data input');
+
+    store1.close();
+    store2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- (B1) STALE-CLAIM: deep descent must not claim child work against a parent
+//      value superseded by a committed concurrent parent advance ---------------
+//
+// X provisions the child at gate v1 (child input `data` v1, worker claimable). During
+// X's deep tick, at DESCENT time — after maintainCalls STEP 2 and provisionCallsChild's
+// in-tx re-read (both no-op since the child already equals v1) — Y advances the parent
+// gate to v2 with a raw putArtifact and NO re-provision, so the child input stays v1.
+// X's descent then enters the child frame; the in-tx guard sees parent gate v2 vs child
+// input v1 and issues NO child order. A follow-up deep tick re-provisions the child to
+// v2 and only THEN issues the worker order consuming v2 — deferral, not deadlock.
+//
+// Injection: one-shot patch of store1.findChildByParent(parentWf,'delivered'), firing Y
+// on the DESCENT-time read (callsDescendTargets — X holds no write lock there). The
+// maintainCalls STEP-2 read and provisionCallsChild's in-tx read come earlier in the
+// same pass, so we count and fire on the THIRD read — the read-count injection technique
+// of tests (14)/(15). FAILS at e6e951c (descent claims child work off v1); PASSES after.
+test('calls: B1 — deep descent defers a stale cross-connection child claim (no order on a superseded gate)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-b1-staleclaim-'));
+  const dbPath = join(dir, 'concurrent.db');
+  try {
+    const byName = new Map([childDef, parentDef].map((d) => [d.name, d]));
+    const resolver = (name: string): WorkflowDef => {
+      const d = byName.get(name);
+      if (!d) throw new Error(`no def: ${name}`);
+      return d;
+    };
+    const store1 = openStore(dbPath);
+    const store2 = openStore(dbPath);
+    const engine1 = new Engine(store1, resolver); // X — the connection under test
+    const engine2 = new Engine(store2, resolver); // Y — the interleaving connection
+
+    // Parent + gate green (sandbox v1); spawn the child (data v1), worker claimable.
+    const parentWf = engine1.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+    const t1 = engine1.tick(parentWf, { deep: false });
+    const provRun = t1.orders.find((o) => o.step === 'provision')!.run;
+    engine1.green(parentWf, provRun, 'sandbox', { env: 'v1' });
+    engine1.close(parentWf, provRun);
+    engine1.tick(parentWf, { deep: false }); // spawns child, seeds data v1
+    const childRow = store1.findChildByParent(parentWf, 'delivered');
+    assert.ok(childRow, 'child spawned');
+    assert.deepEqual(getArt(store1, childRow!.id, 'data')?.value, { env: 'v1' }, 'child synced at v1');
+    assert.equal(getArt(store1, parentWf, 'delivered')?.acceptance, 'owed', 'delivered owed');
+
+    // Fire Y on the DESCENT-time findChildByParent read (3rd of the deep pass).
+    let deliveredFinds = 0;
+    let injected = false;
+    const origFind = store1.findChildByParent.bind(store1);
+    (store1 as unknown as { findChildByParent: Store['findChildByParent'] }).findChildByParent = ((
+      pWf: string,
+      pPath: string,
+    ) => {
+      if (!injected && pWf === parentWf && pPath === 'delivered') {
+        deliveredFinds++;
+        if (deliveredFinds === 3) {
+          injected = true;
+          const sandbox = store2.getArtifact(parentWf, 'sandbox')!;
+          store2.putArtifact({ ...sandbox, version: sandbox.version + 1, value: { env: 'v2' } });
+        }
+      }
+      return origFind(pWf, pPath);
+    }) as Store['findChildByParent'];
+
+    const interleaved = engine1.tick(parentWf); // deep
+    (store1 as unknown as { findChildByParent: Store['findChildByParent'] }).findChildByParent = origFind;
+
+    assert.ok(injected, 'the interleave fired on the descent-time lookup');
+
+    // (1) No stale claim: no child order issued this pass, child input still v1.
+    assert.equal(
+      interleaved.orders.find((o) => o.workflow === childRow!.id),
+      undefined,
+      'no child order issued against the superseded v1 input',
+    );
+    assert.deepEqual(getArt(store1, childRow!.id, 'data')?.value, { env: 'v1' },
+      'child input still v1 (X issued no v2 re-provide this pass)');
+    assert.equal(store1.listChildrenByParent(parentWf).length, 1, 'no duplicate child');
+
+    // (3) Deferral, not deadlock: the next deep tick re-provisions the child to v2 and
+    //     THEN issues the worker order consuming the current v2 value.
+    const followUp = engine1.tick(parentWf); // deep — re-provides data v2, then descends
+    assert.deepEqual(getArt(store1, childRow!.id, 'data')?.value, { env: 'v2' }, 'child re-provided to v2');
+    const workerOrder = followUp.orders.find((o) => o.step === 'worker' && o.workflow === childRow!.id);
+    assert.ok(workerOrder, 'worker order issued once the child is consistent at v2');
+    assert.deepEqual(workerOrder!.consumes.data, { env: 'v2' }, 'worker consumes the current v2 value, never v1');
+
+    store1.close();
+    store2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- (B3a) SKIPPED parent call → deep tick issues NO child worker order -------
+//
+// A human declares the calls: branch dead (`skip` on `delivered`). The child still
+// exists with a green input, so its worker is eligible — but a deep tick must not
+// descend into a skipped (dead) branch. FAILS at e6e951c (descend skips only green,
+// so a skipped call still issues the child order); PASSES after Fix B3 (owed-only).
+test('calls: B3 — a skipped parent calls artifact is not descended (no child order for a dead branch)', () => {
+  const { engine, store } = makeEngine([childDef, parentDef]);
+
+  const parentWf = engine.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+  const t1 = engine.tick(parentWf, { deep: false });
+  const provRun = t1.orders.find((o) => o.step === 'provision')!.run;
+  engine.green(parentWf, provRun, 'sandbox', { env: 'v1' });
+  engine.close(parentWf, provRun);
+  engine.tick(parentWf, { deep: false }); // spawn child (data v1), worker claimable
+  const childRow = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(childRow, 'child spawned');
+
+  engine.skip(parentWf, 'delivered', 'human', 'dead branch');
+  assert.equal(getArt(store, parentWf, 'delivered')?.acceptance, 'skipped', 'delivered skipped');
+
+  const deep = engine.tick(parentWf); // deep
+  assert.equal(getArt(store, parentWf, 'delivered')?.acceptance, 'skipped', 'delivered stays skipped');
+  assert.equal(
+    deep.orders.find((o) => o.workflow === childRow!.id),
+    undefined,
+    'no child worker order issued for a skipped (dead) branch',
+  );
+});
+
+// ---- (B3b) SCHEMA-REJECTED parent call → deep tick issues NO child order ------
+//
+// A re-provide with a child-illegal value stamps `delivered` rejected (F2). The child
+// still holds its old legal input, so its worker is eligible — but a deep tick must not
+// descend into a rejected branch and issue work off the stale value. FAILS at e6e951c;
+// PASSES after Fix B3 (owed-only). Uses the strict child schema so the re-provide refuses.
+test('calls: B3 — a schema-rejected parent calls artifact is not descended (no child order on the old value)', () => {
+  const { engine, store } = makeEngine([strictChildDef, strictParentDef]);
+
+  const parentWf = engine.createInstance('strictParentDef', { provide: { proposal: { text: 'hello' } } });
+  const t1 = engine.tick(parentWf, { deep: false });
+  const provRun = t1.orders.find((o) => o.step === 'provision')!.run;
+  engine.green(parentWf, provRun, 'sandbox', { env: 'v1' }); // legal for the child
+  engine.close(parentWf, provRun);
+  engine.tick(parentWf, { deep: false }); // spawn child (data v1), worker claimable
+  const childRow = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(childRow, 'child spawned on a legal value');
+  assert.deepEqual(getArt(store, childRow!.id, 'data')?.value, { env: 'v1' });
+
+  // Parent value moves to a child-illegal value (legal at the schema-less parent),
+  // so maintainCalls' re-provide refuses and stamps delivered `rejected`.
+  const sandboxArt = getArt(store, parentWf, 'sandbox');
+  store.putArtifact({ ...sandboxArt!, version: sandboxArt!.version + 1, value: { env: 7 } });
+  engine.tick(parentWf, { deep: false });
+  assert.equal(getArt(store, parentWf, 'delivered')?.acceptance, 'rejected', 'delivered rejected');
+  assert.deepEqual(getArt(store, childRow!.id, 'data')?.value, { env: 'v1' },
+    'child input unchanged (the re-provide refused)');
+
+  const deep = engine.tick(parentWf); // deep
+  assert.equal(
+    deep.orders.find((o) => o.workflow === childRow!.id),
+    undefined,
+    'no child worker order issued off a schema-rejected branch',
+  );
+});
+
+// ---- (B2) REFUSAL-DISCARD: a refusal recorded after a concurrent valid gate
+//      advance is discarded, not stamped over the valid update -----------------
+//
+// X's re-provide hits a SchemaRefusalError inside the provision tx (rolled back). Before
+// X's recording tx (`recordCallsSchemaReject`) opens — X holds no lock between the
+// rollback and that BEGIN — Y commits a VALID gate v2. The recorder must compare the
+// gate fingerprint the failed validation saw against the current one, see they differ,
+// and DISCARD the obsolete refusal: `delivered` stays owed (not rejected), schemaRejects
+// is unchanged, no schema-rejected event fires, and the valid v2 update is not stuck.
+// FAILS at e6e951c (stamps the refusal under the moved fingerprint → the F2 guard then
+// freezes the valid update as rejected); PASSES after Fix B2 (carry-and-compare).
+//
+// Injection: wrap store1.tx — when a wrapped closure throws SchemaRefusalError, arm a
+// flag; on the NEXT store1.tx (the recording tx), fire Y committing the valid gate v2
+// before delegating.
+test('calls: B2 — a schema refusal recorded after a concurrent valid gate advance is discarded, not stamped', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-b2-refusal-discard-'));
+  const dbPath = join(dir, 'concurrent.db');
+  try {
+    const byName = new Map([strictChildDef, strictParentDef].map((d) => [d.name, d]));
+    const resolver = (name: string): WorkflowDef => {
+      const d = byName.get(name);
+      if (!d) throw new Error(`no def: ${name}`);
+      return d;
+    };
+    const store1 = openStore(dbPath);
+    const store2 = openStore(dbPath);
+    const engine1 = new Engine(store1, resolver); // X — the connection under test
+    const engine2 = new Engine(store2, resolver); // Y — the interleaving connection
+
+    // Parent + child spawned and synced at a legal gate v1.
+    const parentWf = engine1.createInstance('strictParentDef', { provide: { proposal: { text: 'hello' } } });
+    const t1 = engine1.tick(parentWf, { deep: false });
+    const provRun = t1.orders.find((o) => o.step === 'provision')!.run;
+    engine1.green(parentWf, provRun, 'sandbox', { env: 'v1' });
+    engine1.close(parentWf, provRun);
+    engine1.tick(parentWf, { deep: false }); // spawn child, seed data v1
+    const childRow = store1.findChildByParent(parentWf, 'delivered');
+    assert.ok(childRow, 'child spawned');
+    const schemaRejectsBefore = getArt(store1, parentWf, 'delivered')!.schemaRejects;
+
+    // X advances the gate to a child-ILLEGAL value (legal at the schema-less parent),
+    // so the next re-provide refuses.
+    const sandboxBad = store1.getArtifact(parentWf, 'sandbox')!;
+    store1.putArtifact({ ...sandboxBad, version: sandboxBad.version + 1, value: { env: 7 } });
+
+    // Count schema-rejected commit events X fires for delivered.
+    let e1SchemaRejects = 0;
+    const unsub = engine1.subscribe((e) => {
+      if (e.type === 'commit' && e.path === 'delivered' && e.outcome === 'schema-rejected') e1SchemaRejects++;
+    });
+
+    // Wrap store1.tx: on the recording tx (the one AFTER the refusal), fire Y committing
+    // a VALID gate v2 before delegating.
+    let sawRefusal = false;
+    let yFired = false;
+    const origTx = store1.tx.bind(store1);
+    (store1 as unknown as { tx: Store['tx'] }).tx = (<T,>(fn: () => T): T => {
+      if (sawRefusal && !yFired) {
+        yFired = true;
+        const sb = store2.getArtifact(parentWf, 'sandbox')!;
+        store2.putArtifact({ ...sb, version: sb.version + 1, value: { env: 'v2-ok' } });
+      }
+      try {
+        return origTx(fn);
+      } catch (err) {
+        if (err instanceof SchemaRefusalError) sawRefusal = true;
+        throw err;
+      }
+    }) as Store['tx'];
+
+    engine1.tick(parentWf, { deep: false }); // re-provide refuses → recording tx sees moved gate → discard
+    (store1 as unknown as { tx: Store['tx'] }).tx = origTx;
+    unsub();
+
+    assert.ok(sawRefusal, 'X actually hit the schema refusal');
+    assert.ok(yFired, 'Y committed the valid gate before the recording tx');
+
+    // (1) The obsolete refusal was DISCARDED: delivered is NOT rejected.
+    assert.notEqual(getArt(store1, parentWf, 'delivered')?.acceptance, 'rejected',
+      'the obsolete refusal must not be stamped over the concurrent valid update');
+    // (2) schemaRejects unchanged — a discarded refusal must not consume the budget.
+    assert.equal(getArt(store1, parentWf, 'delivered')?.schemaRejects, schemaRejectsBefore,
+      'schemaRejects must not bump on a discarded refusal');
+    // (3) Event hygiene: X fired no schema-rejected commit.
+    assert.equal(e1SchemaRejects, 0, 'no schema-rejected event on a discarded refusal');
+
+    // (4) Not stuck: a subsequent tick provisions the child from the valid v2 and proceeds.
+    engine1.tick(parentWf, { deep: false });
+    assert.deepEqual(getArt(store1, childRow!.id, 'data')?.value, { env: 'v2-ok' },
+      'child re-provisioned from the valid v2 gate — the valid update is not stuck rejected');
 
     store1.close();
     store2.close();

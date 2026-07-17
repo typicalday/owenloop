@@ -38,6 +38,7 @@ import type { Store, WorkflowRow } from './store.ts';
 import type {
   ArtifactData,
   Author,
+  Fingerprint,
   JsonSchema,
   Order,
   StepDef,
@@ -71,6 +72,17 @@ const DEFAULT_MAX_CALL_DEPTH = 64;
 export class SchemaRefusalError extends Error {
   readonly inputName: string;
   readonly issues: SchemaIssue[];
+  /**
+   * B2: the gate fingerprint of the exact parent snapshot the failed validation
+   * saw, captured inside the validating transaction and attached before this
+   * error is rethrown out to `maintainCalls`. `recordCallsSchemaReject` compares
+   * it to the gate fingerprint at recording time so a refusal recorded after a
+   * concurrent VALID gate advance is discarded instead of stamped onto (and
+   * thereby stalling) the valid update. Mutable and optional: set by the thrower
+   * (`provisionCallsChild`) once the snapshot is known; absent means "no snapshot
+   * carried" and the recorder falls back to today's stamp-fresh behavior.
+   */
+  gateFingerprint?: Fingerprint;
 
   constructor(inputName: string, issues: SchemaIssue[]) {
     super(`input '${inputName}' failed schema: ${summarizeIssues(issues)}`);
@@ -409,11 +421,19 @@ export class Engine {
     gateStems: string[],
     now?: number,
   ): { childId: string; created: boolean; provided: string[] } | null {
+    // B2: the gate fingerprint of the exact in-tx snapshot the seed/re-provide
+    // validation ran against. Captured fresh inside `run()` so a retry re-reads
+    // it; carried out on a `SchemaRefusalError` so `recordCallsSchemaReject` can
+    // tell "gate unmoved since the failure" (stamp) from "a concurrent valid
+    // gate advance landed" (discard). Pure computation over the already-fetched
+    // `parentArts` — no extra in-tx store read (E2 busy_timeout GOTCHA-safe).
+    let seenGateFp: Fingerprint | undefined;
     const run = (): { childId: string; created: boolean; provided: string[] } | null =>
       this.store.tx(() => {
         // 1. FRESH parent snapshot — re-read inside the write lock; never trust
         //    the caller's STEP-1 map.
         const parentArts = this.artMap(parentWf);
+        seenGateFp = computeFingerprint(parentArts, gateStems);
 
         // 2. Gate readiness against the fresh snapshot: a stem re-armed
         //    concurrently must stop provisioning (abort silent — STEP-1 semantics).
@@ -508,6 +528,10 @@ export class Engine {
       ) {
         return run();
       }
+      // B2: tag a child-input schema refusal with the gate fingerprint the failed
+      // validation actually saw, so the recorder can discard it if the gate has
+      // since moved to a valid value on another connection.
+      if (err instanceof SchemaRefusalError) err.gateFingerprint = seenGateFp;
       throw err;
     }
   }
@@ -614,6 +638,21 @@ export class Engine {
    * Stamps the current gate fingerprint on the rejected artifact so the
    * STEP-2 guard can tell "gate unmoved, don't re-attempt" from "gate moved,
    * worth retrying" on the next tick.
+   *
+   * B2 (snapshot-consistent recording): `seenGateFp` is the gate fingerprint of
+   * the exact snapshot the failed validation saw (carried on the
+   * `SchemaRefusalError`). Inside the recording tx we recompute the CURRENT gate
+   * fingerprint and compare:
+   * - equal → the gate has not moved since the failure: stamp the rejection.
+   * - not equal → a concurrent VALID gate advance landed between the validation
+   *   and here: DISCARD the now-obsolete refusal (write nothing). Stamping it
+   *   would freeze the valid update as `rejected` because the STEP-2 F2 guard
+   *   would then read "gate unmoved, don't retry".
+   * - `seenGateFp` undefined (defensive; the sole call site always carries one)
+   *   → legacy stamp-fresh behavior.
+   * Returns true only when it actually stamped, so the caller fires the
+   * schema-rejected / settled events only on a real write (a discarded refusal
+   * is silent — abort discipline, mirroring `publishCallsGreen`).
    */
   private recordCallsSchemaReject(
     parentWf: string,
@@ -621,14 +660,18 @@ export class Engine {
     callsStem: string,
     gateStems: string[],
     err: SchemaRefusalError,
+    seenGateFp: Fingerprint | undefined,
     now?: number,
-  ): void {
+  ): boolean {
     const text = `child input '${err.inputName}' failed schema: ${summarizeIssues(err.issues)}`;
-    this.store.tx(() => {
+    return this.store.tx(() => {
       const art = this.store.getArtifact(parentWf, callsStem);
-      if (!art) return; // not yet materialized by pendingOwed — nothing to stamp
+      if (!art) return false; // not yet materialized by pendingOwed — nothing to stamp
       const gateArts = this.artMap(parentWf);
       const fp = computeFingerprint(gateArts, gateStems);
+      // B2: gate moved to a different value since the validation failed → the
+      // refusal is stale; discard it and let the concurrent valid update proceed.
+      if (seenGateFp !== undefined && !deepEqual(fp, seenGateFp)) return false;
       this.store.putArtifact({
         ...art,
         acceptance: 'rejected',
@@ -637,9 +680,8 @@ export class Engine {
         reasons: [...art.reasons, reason('schema-reject', 'validation', 'engine', text, art.version)],
       });
       this.settle(parentWf, def, now);
+      return true;
     });
-    this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject', outcome: 'schema-rejected' });
-    this.fireSettled(parentWf);
   }
 
   /**
@@ -671,6 +713,15 @@ export class Engine {
    * cannot see); raising `maxCallDepth` is only correct when the depth is truly
    * intentional. Stopping here — instead of spawning — is what prevents the
    * unbounded row creation + stack overflow REL-4 describes.
+   *
+   * B2 asymmetry (deliberate, NOT an oversight): unlike `recordCallsSchemaReject`
+   * this recorder is NOT exposed to the wrong-snapshot race, so it needs no
+   * carry-and-compare guard. A depth refusal's validity does not depend on the
+   * gate snapshot: `callsAncestryDepth` walks the immutable `producedBy` chain and
+   * `maxCallDepth` is fixed, so a refusal decided at time T stays valid at
+   * recording time regardless of concurrent gate movement — and if a moved-gate
+   * re-attempt were somehow blocked, it would deterministically re-trip the same
+   * depth refusal anyway (identical outcome, no lost valid update to strand).
    */
   private recordCallsDepthReject(
     parentWf: string,
@@ -769,7 +820,14 @@ export class Engine {
           provision = this.provisionCallsChild(parentWf, step, callsStem, gateStems, now);
         } catch (err) {
           if (err instanceof SchemaRefusalError) {
-            this.recordCallsSchemaReject(parentWf, def, callsStem, gateStems, err, now);
+            // B2: pass the fingerprint the failed validation saw. If the gate has
+            // since moved (a concurrent valid update), the recorder discards the
+            // refusal and returns false — fire no schema-rejected event, and let
+            // the next pass provision against the now-valid gate.
+            if (this.recordCallsSchemaReject(parentWf, def, callsStem, gateStems, err, err.gateFingerprint, now)) {
+              this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject', outcome: 'schema-rejected' });
+              this.fireSettled(parentWf);
+            }
             continue;
           }
           throw err;
@@ -1053,8 +1111,33 @@ export class Engine {
    * before the spawn bound existed) — it throws rather than overflow the stack.
    * `visited` still earns its keep as a re-entrancy guard for a genuinely
    * re-encountered instance within one tick.
+   *
+   * B1 (in-tx descent claim guard): a deep parent descends into a child by
+   * calling this again with `parentEdge` — the calls: edge the child hangs
+   * from. Inside the child frame's OWN claim tx, before any child order is
+   * issued, we re-verify that the parent gate and the child's synchronized
+   * inputs are still mutually consistent with the CURRENTLY-committed parent
+   * state (the same predicate `publishCallsGreen` uses on the publish side).
+   * `provisionCallsChild` commits child input v1; another connection can advance
+   * the parent to v2 before this non-transactional descent claims — without the
+   * guard the child claims work against the stale v1. On mismatch the frame
+   * issues nothing and its subtree is not descended; the next parent tick
+   * re-synchronizes via `maintainCalls`. Absent `parentEdge` = the root frame,
+   * unguarded (nothing above it to be inconsistent with). Each frame checks only
+   * its IMMEDIATE parent edge; a grandchild gets its own edge from the child
+   * frame's descent loop, so every issued order in the tree is guarded by the
+   * edge it hangs from. The guard is silent (no debt/reasons/events), mirroring
+   * the abort discipline of `publishCallsGreen`/`provisionCallsChild`.
    */
-  private tickInternal(workflow: string, now: number, deep: boolean, labels: string[], visited: Set<string>, depth: number): TickResult {
+  private tickInternal(
+    workflow: string,
+    now: number,
+    deep: boolean,
+    labels: string[],
+    visited: Set<string>,
+    depth: number,
+    parentEdge?: { parentWf: string; step: StepDef; callsStem: string },
+  ): TickResult {
     if (depth > this.maxCallDepth) {
       throw new Error(
         `calls depth limit exceeded (maxCallDepth=${this.maxCallDepth}) ticking '${workflow}': `
@@ -1067,11 +1150,38 @@ export class Engine {
     const def = this.defFor(workflow);
     // M2B: maintain calls: child instances before the normal tick/reap/claim cycle.
     this.maintainCalls(workflow, def, now);
+    // B1: set inside the frame tx when the parent↔child consistency guard fires;
+    // read after the tx to suppress this subtree's descent too.
+    let staleEdge = false;
     const result = this.store.tx(() => {
       this.settle(workflow, def, now);
       const reaped = this.reap(workflow, now, def);
 
       const arts = this.artMap(workflow);
+
+      // B1: in-tx descent claim guard. `arts` is THIS (child) frame's snapshot,
+      // already read inside the write lock. Re-verify the immediate parent edge
+      // against ONE fresh in-tx parent snapshot (`artMap`/`listArtifacts`, NOT a
+      // separate `store.getArtifact` for the calls key — E2 busy_timeout GOTCHA)
+      // before claiming any order. Reuses the exact descend condition (Fix B3's
+      // owed-only) and `publishCallsGreen`'s gate-ready + child-consistency
+      // predicates, so claim-side and publish-side never drift. On mismatch the
+      // parent advanced since provision: settle/reap already ran and stay (both
+      // child-local and useful), but this frame issues no firings/claims and its
+      // subtree is skipped below. Next parent tick re-synchronizes.
+      if (parentEdge) {
+        const pArts = this.artMap(parentEdge.parentWf);
+        const callsArt = pArts.get(parentEdge.callsStem);
+        if (callsArt?.acceptance !== 'owed'
+          || !this.callsGateReady(pArts, parentEdge.step)
+          || !this.childConsistentWithGate(pArts, arts, parentEdge.step)) {
+          staleEdge = true;
+          const dueAt = this.computeDueAt(def, workflow, now);
+          const r: TickResult = { workflow, orders: [], reaped, deferred: [] };
+          if (dueAt !== null) r.dueAt = dueAt;
+          return r;
+        }
+      }
 
       // Compute time facts for idle eligibility (clock-read boundary).
       const timeFacts = this.computeTimeFacts(def, workflow, arts, now);
@@ -1109,9 +1219,15 @@ export class Engine {
 
     // §23.6.8 DESCENT — outside this frame's tx (see method doc). Drive each
     // live calls: child with its own full tickInternal and fold its result up.
-    if (deep) {
-      for (const { child } of this.callsDescendTargets(workflow, def)) {
-        const cr = this.tickInternal(child.id, now, deep, labels, visited, depth + 1);
+    // B1: when this frame's own inputs are disputed (guard fired), skip the whole
+    // subtree — do not tick grandchildren off a frame that issued nothing.
+    if (deep && !staleEdge) {
+      for (const { step, child } of this.callsDescendTargets(workflow, def)) {
+        const cr = this.tickInternal(child.id, now, deep, labels, visited, depth + 1, {
+          parentWf: workflow,
+          step,
+          callsStem: step.produces[0]!.stem,
+        });
         // orders: flatten; each Order already carries its own `workflow`.
         result.orders.push(...cr.orders);
         // deferred: stamp child-originated entries with the child id, preserving
@@ -1145,12 +1261,23 @@ export class Engine {
   /**
    * §23.6.8: the live `calls:` children a deep tick should descend into, one
    * per calls: step whose (1) gate is green, (2) child instance exists, and
-   * (3) debt is unpaid (the parent calls artifact is not green). Read AFTER
+   * (3) the parent calls artifact is specifically `owed`. Read AFTER
    * `maintainCalls` has run this frame, so a just-spawned child is visible and
    * a just-machine-greened debt is correctly skipped. Consequences that fall
    * out for free: gate re-armed after spawn → not ready → no descend
    * (consistent with maintainCalls bailing at STEP 1, never driving work on
    * disputed inputs); debt already paid → skip.
+   *
+   * B3: condition (3) descends ONLY on `owed`, never on any non-green state.
+   * `owed` is the sole live producer debt: it covers the fresh spawn, the F4
+   * propagated-reject reopen (parent reopened to owed pinned at the rejected
+   * child version), and `rearmCallsGreen`'s reopen — all of which legitimately
+   * want child work driven. `green` is paid; `rejected` (F2 schema / REL-4 depth
+   * refusal) needs a human `retry` or a moved gate handled by `maintainCalls`,
+   * never child work; `skipped` is a human-declared dead branch; `retracted` is
+   * terminal; `submitted` is not a producer debt (a calls artifact is machine
+   * -greened and should never be `submitted`) — none of these represent live
+   * child work, so descending into them issued orders for dead/refused branches.
    */
   private callsDescendTargets(parentWf: string, def: WorkflowDef): Array<{ step: StepDef; child: WorkflowRow }> {
     const arts = this.artMap(parentWf);
@@ -1161,7 +1288,7 @@ export class Engine {
       if (!this.callsGateReady(arts, step)) continue; // 1. gate green
       const child = this.store.findChildByParent(parentWf, stem);
       if (!child) continue; // 2. child exists
-      if (isGreen(arts.get(stem))) continue; // 3. debt unpaid
+      if (arts.get(stem)?.acceptance !== 'owed') continue; // 3. descend only on an owed debt
       out.push({ step, child });
     }
     return out;
