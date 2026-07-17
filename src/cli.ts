@@ -1182,6 +1182,20 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     const lf = readLockfile(lockfilePath);
     const dest = join(defsDir, folder);
     const existing = lf.installed[source];
+    // Use-site exact-match (Layer 2): the entry being installed may only record
+    // the currently computed folder OR the exact legacy `<owner>-<repo>` name
+    // (the only pre-hash scheme this tool ever wrote). `readLockfile` has
+    // already refused any structurally unsafe `path`; this additionally refuses
+    // a structurally-valid-but-WRONG segment (e.g. 'not-the-right-folder')
+    // before any staging/commit mutation, so the later `existing.path !== folder`
+    // migration branch is guaranteed to see only the exact legacy name.
+    const legacyFolder = `${owner}-${repo}`;
+    if (existing && existing.path !== folder && existing.path !== legacyFolder) {
+      throw new CliError(
+        `refusing to install ${source}: lockfile records install path '${existing.path}', ` +
+          `which is neither the expected '${folder}' nor the legacy '${legacyFolder}' — fix ${lockfilePath} manually`,
+      );
+    }
     if (existsSync(dest) && !(existing && existing.path === folder)) {
       throw new CliError(
         `refusing to install ${source}: destination '${folder}' already exists and is not owned by ${source} — ` +

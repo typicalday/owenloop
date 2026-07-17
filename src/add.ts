@@ -13,6 +13,7 @@
 import {
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -21,7 +22,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -51,6 +52,29 @@ export function archivePathViolation(relPath: string): string | undefined {
   if (relPath.length > MAX_ARCHIVE_PATH_LENGTH) {
     return `exceeds ${MAX_ARCHIVE_PATH_LENGTH}-char path length limit`;
   }
+  return undefined;
+}
+
+/**
+ * Returns `undefined` if `relPath` is a safe SINGLE-SEGMENT lockfile install
+ * path, else a human-readable reason it must be rejected. Stricter than
+ * {@link archivePathViolation}: a lockfile entry's `path` is one on-disk path
+ * segment by construction — both the current `<owner>-<repo>-<hash>` scheme and
+ * the only legacy scheme this tool ever wrote (`<owner>-<repo>`, see
+ * {@link installFolder}) — so ANY separator is refused outright. That single
+ * rule makes `..` traversal, `.owenloop/../../x`, and nested escape shapes
+ * unrepresentable before any `join`/`rename` ever touches the path. Like
+ * `archivePathViolation` this is reject-don't-normalize: a bad path is refused,
+ * never canonicalized into a "safe" one.
+ */
+export function lockfilePathViolation(relPath: string): string | undefined {
+  // Reuse the shared checks (empty, NUL, absolute, '.'/'..' segments, length).
+  const base = archivePathViolation(relPath);
+  if (base) return base;
+  // A lockfile install path additionally must be a single segment: no
+  // separators at all, so a multi-segment on-disk path like 'legacy/olddir'
+  // (which passes archivePathViolation) is still refused here.
+  if (/[\\/]/.test(relPath)) return 'contains a path separator';
   return undefined;
 }
 
@@ -119,6 +143,13 @@ export function githubTarballUrl(owner: string, repo: string, sha: string): stri
 
 // ---- lockfile ------------------------------------------------------------
 
+/**
+ * One installed-package record. `path` is a single on-disk folder segment (see
+ * {@link lockfilePathViolation}); `sha` is a 40-char hex commit sha; `source`
+ * equals the record's key in {@link Lockfile.installed}. These invariants are
+ * NOT trusted from disk — {@link validateLockfile} enforces every one on read,
+ * fail-closed, before any consumer acts on an entry.
+ */
 export interface InstalledEntry {
   source: string;
   ref: string;
@@ -133,20 +164,88 @@ export interface Lockfile {
   installed: Record<string, InstalledEntry>;
 }
 
+/** A 40-char hex commit sha (case-insensitive), as GitHub returns. */
+const SHA_HEX_RE = /^[0-9a-f]{40}$/i;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Structurally validate a parsed `installed.json`, fail-closed. A
+ * parseable-but-schema-invalid lockfile is a hard error naming the offending
+ * entry+field — never silently reset to `{}` (which would erase ownership
+ * records and re-enable the clobbering {@link installFolder} was hardened
+ * against) and never normalized. This is the trust boundary for the lockfile:
+ * downstream code (`dispatchAdd`, `parkOldNameDir`) may only act on entries
+ * that have passed through here. Critically, EVERY entry is validated, not just
+ * the one being installed — `dispatchAdd` re-serializes the whole lockfile on
+ * success, so acting while carrying a poisoned sibling entry would re-persist
+ * it. Unknown extra keys (on the lockfile or an entry) are tolerated for
+ * forward compatibility; required shape is enforced, additions are not
+ * forbidden. Returns the value narrowed to {@link Lockfile}. `path` appears
+ * only in error messages.
+ */
+export function validateLockfile(parsed: unknown, path: string): Lockfile {
+  const fail = (detail: string): never => {
+    throw new Error(`invalid lockfile at ${path}: ${detail} — fix or remove it manually`);
+  };
+  if (!isPlainObject(parsed)) return fail('top-level value is not an object');
+  if (parsed.version !== 1) {
+    return fail(`unsupported lockfile version ${JSON.stringify(parsed.version)} (expected 1)`);
+  }
+  if (!isPlainObject(parsed.installed)) return fail("'installed' is not an object");
+  for (const [key, entry] of Object.entries(parsed.installed)) {
+    const at = (field: string): string => `installed[${JSON.stringify(key)}].${field}`;
+    if (!isPlainObject(entry)) return fail(`installed[${JSON.stringify(key)}] is not an object`);
+    if (typeof entry.source !== 'string' || entry.source === '') {
+      return fail(`${at('source')} is not a non-empty string`);
+    }
+    if (entry.source !== key) {
+      return fail(`${at('source')} '${entry.source}' does not match its key '${key}'`);
+    }
+    if (typeof entry.ref !== 'string' || entry.ref === '') {
+      return fail(`${at('ref')} is not a non-empty string`);
+    }
+    if (typeof entry.sha !== 'string' || !SHA_HEX_RE.test(entry.sha)) {
+      return fail(`${at('sha')} is not a 40-char hex commit sha`);
+    }
+    if (typeof entry.installedAt !== 'number' || !Number.isFinite(entry.installedAt)) {
+      return fail(`${at('installedAt')} is not a finite number`);
+    }
+    if (typeof entry.path !== 'string') return fail(`${at('path')} is not a string`);
+    const pathViolation = lockfilePathViolation(entry.path);
+    if (pathViolation) return fail(`${at('path')} ${pathViolation}`);
+    if (!Array.isArray(entry.files)) return fail(`${at('files')} is not an array`);
+    entry.files.forEach((file, i) => {
+      if (typeof file !== 'string') return fail(`${at(`files[${i}]`)} is not a string`);
+      const fileViolation = archivePathViolation(file);
+      if (fileViolation) return fail(`${at(`files[${i}]`)} ${fileViolation}`);
+    });
+  }
+  return parsed as unknown as Lockfile;
+}
+
 /**
  * Read `.owenloop/installed.json`; a missing file is an empty lockfile, not an
  * error. A file that exists but does not parse is a hard error naming the path
  * — never silently reset to `{}`, which would erase ownership records and
- * re-enable the clobbering `installFolder` was hardened against.
+ * re-enable the clobbering `installFolder` was hardened against. A file that
+ * parses but is structurally invalid (bad version, malformed entry, a `path`
+ * that is not a safe single segment, a bad `sha`/`files`) is likewise a
+ * fail-closed hard error — see {@link validateLockfile}. The lockfile is never
+ * trusted for filesystem paths.
  */
 export function readLockfile(path: string): Lockfile {
   if (!existsSync(path)) return { version: 1, installed: {} };
   const raw = readFileSync(path, 'utf8');
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as Lockfile;
+    parsed = JSON.parse(raw);
   } catch (e) {
     throw new Error(`corrupt lockfile at ${path}: ${(e as Error).message} — fix or remove it manually`);
   }
+  return validateLockfile(parsed, path);
 }
 
 /**
@@ -323,10 +422,45 @@ export function commitInstall(defsDir: string, folder: string, stagingDir: strin
  * Records the move on `handle.oldName`. If the old dir does not exist on disk
  * (the lockfile names a path that is already gone), records nothing — matching
  * the previous `rmSync(..., { force: true })` tolerance of absence.
+ *
+ * Defense-in-depth (Layer 3): even though `readLockfile`/`validateLockfile` and
+ * the use-site in `dispatchAdd` already constrain `oldRelPath` to a safe single
+ * segment, the authoritative containment check is re-asserted HERE, at the
+ * mutation site, before any rename — a poisoned `existing.path` must never move
+ * a directory outside `defsDir` (which `finalizeInstallCommit` would then
+ * recursively delete). Following this project's TOCTOU discipline, the check
+ * that matters is the one at the filesystem operation, not only up front:
+ * `oldRelPath` must be a single segment AND resolve under `defsDir`, and the
+ * target must be a real directory — a symlink at the legacy path is refused (a
+ * symlinked segment must never be parked/finalized, since finalize deletes it).
+ * Deliberate behavior change vs. the old `existsSync` probe: a DANGLING symlink
+ * at the old path was previously silently ignored (existsSync follows links);
+ * it is now refused, which is fail-closed and correct.
  */
 export function parkOldNameDir(handle: InstallCommitHandle, defsDir: string, oldRelPath: string): void {
+  const violation = lockfilePathViolation(oldRelPath);
+  if (violation) {
+    throw new Error(`refusing old-name migration path '${oldRelPath}': ${violation}`);
+  }
   const originalPath = join(defsDir, oldRelPath);
-  if (!existsSync(originalPath)) return;
+  // Resolved-path containment: '..'-free by the single-segment rule above, but
+  // recompute at the rename site so no path outside defsDir can ever be moved.
+  if (!resolve(originalPath).startsWith(resolve(defsDir) + sep)) {
+    throw new Error(`refusing old-name migration path '${oldRelPath}': escapes the defs directory`);
+  }
+  let st;
+  try {
+    st = lstatSync(originalPath); // lstat, not stat: never follow a symlink here.
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return; // already gone — nothing to park
+    throw e;
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`refusing old-name migration: '${originalPath}' is a symlink`);
+  }
+  if (!st.isDirectory()) {
+    throw new Error(`refusing old-name migration: '${originalPath}' is not a directory`);
+  }
   const parkedAt = `${handle.undoDir}-oldname`;
   renameSync(originalPath, parkedAt);
   handle.oldName = { originalPath, parkedAt };

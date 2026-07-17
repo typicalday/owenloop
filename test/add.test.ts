@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
@@ -18,11 +18,13 @@ import {
   commitInstall,
   finalizeInstallCommit,
   installFolder,
+  lockfilePathViolation,
   parkOldNameDir,
   readLockfile,
   releaseInstallLock,
   rollbackInstallCommit,
   STAGING_DIRNAME,
+  validateLockfile,
   writeLockfile,
   type Lockfile,
 } from '../src/add.ts';
@@ -789,66 +791,214 @@ test('add: a lockfile-write failure during old-name migration keeps the old dir 
   rmSync(injected, { recursive: true, force: true });
 });
 
-test(
-  'add: a park failure during old-name migration rolls back the committed swap',
-  // Permission bits don't bind for root, so the injected rename would succeed
-  // and the test would go red for the wrong reason. CI is non-root; guard the
-  // hypothetical root run instead of leaving it flaky.
-  { skip: typeof process.getuid === 'function' && process.getuid() === 0 },
-  async () => {
-    const owner = 'acme';
-    const repo = 'widgets';
-    const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+// ---- SEC-3 (re-audit HIGH): lockfile path validation + containment ----------
+//
+// A crafted committed `.owenloop/installed.json` must never make `add` move —
+// and then recursively DELETE — a directory outside the defs dir. Each refusal
+// below asserts: exit 1, a clear error, and NO filesystem mutation of the
+// out-of-tree target (the victim still exists with its contents) plus an
+// unchanged lockfile.
 
-    // Pre-hash state, but with a NESTED old path so we can deny the park rename
-    // via the PARENT dir's permissions without touching `workflows` itself
-    // (`existing.path` is read verbatim from the user-editable lockfile, so a
-    // nested path is a legitimate on-disk shape).
-    const oldRel = 'legacy/olddir';
-    const legacyParent = join(cwd, 'workflows', 'legacy');
-    const oldDir = join(cwd, 'workflows', oldRel);
-    mkdirSync(oldDir, { recursive: true });
-    writeFileSync(join(oldDir, 'foo.yaml'), validDefYaml('foo'));
-    const seedLf: Lockfile = {
-      version: 1,
-      installed: {
-        [`${owner}/${repo}`]: {
-          source: `${owner}/${repo}`,
-          ref: 'HEAD',
-          sha: SHA_A,
-          installedAt: 1,
-          path: oldRel,
-          files: ['foo.yaml'],
-        },
+test('add: a lockfile entry whose path traverses out with ../ is refused on read; victim untouched', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  // A victim dir OUTSIDE the defs dir, with a sentinel to prove it is untouched.
+  const victim = join(cwd, 'victim');
+  mkdirSync(victim, { recursive: true });
+  writeFileSync(join(victim, 'keep.txt'), 'do not delete me');
+
+  const seedLf: Lockfile = {
+    version: 1,
+    installed: {
+      [`${owner}/${repo}`]: {
+        source: `${owner}/${repo}`,
+        ref: 'HEAD',
+        sha: SHA_A,
+        installedAt: 1,
+        path: '../victim',
+        files: ['foo.yaml'],
       },
-    };
-    writeLockfile(lockfilePath(cwd), seedLf);
-    const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+    },
+  };
+  // Seed the poisoned lockfile by hand (writeLockfile does not validate paths).
+  mkdirSync(join(cwd, '.owenloop'), { recursive: true });
+  writeFileSync(lockfilePath(cwd), `${JSON.stringify(seedLf, null, 2)}\n`);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
 
-    // Injection: read+exec but no write on `legacy`. Staging (under
-    // `workflows/.owenloop-staging`) and the commit swap (into
-    // `workflows/<hashed>`) only need write on `workflows` and succeed;
-    // `parkOldNameDir`'s `renameSync` out of `legacy` then throws EACCES/EPERM.
-    chmodSync(legacyParent, 0o555);
-    const b = await addInto(cwd, owner, repo, SHA_B, { 'workflows/foo.yaml': validDefYaml('foo') });
-    // Restore write access BEFORE any assertion so temp-dir cleanup works even
-    // if an assertion below fails.
-    chmodSync(legacyParent, 0o755);
+  const b = await addInto(cwd, owner, repo, SHA_B, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(b.code, 1);
+  assert.match(b.err.join('\n'), /invalid lockfile/);
+  assert.match(b.err.join('\n'), /path/);
+  assert.match(b.err.join('\n'), /acme\/widgets/);
 
-    assert.equal(b.code, 1);
-    assert.match(b.err.join('\n'), /could not migrate/);
-    assert.match(b.err.join('\n'), /rolled back, previous state restored/);
-    assert.match(b.err.join('\n'), /EACCES|EPERM/, 'underlying fs error surfaced');
+  assert.equal(readFileSync(join(victim, 'keep.txt'), 'utf8'), 'do not delete me', 'victim intact');
+  assert.ok(existsSync(victim), 'victim dir still present');
+  assert.ok(!existsSync(join(cwd, 'workflows', installFolder(owner, repo))), 'nothing installed');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'lockfile unchanged');
+  assert.ok(!existsSync(join(cwd, 'workflows', STAGING_DIRNAME)), 'no staging debris');
+});
 
-    assert.ok(
-      !existsSync(join(cwd, 'workflows', installFolder(owner, repo))),
-      'hashed dir absent — the committed swap was rolled back',
-    );
-    assert.equal(readFileSync(join(oldDir, 'foo.yaml'), 'utf8'), validDefYaml('foo'), 'old-name dir untouched');
-    assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'lockfile unchanged (still records the old path)');
-    assert.ok(!existsSync(join(cwd, 'workflows', STAGING_DIRNAME)), 'no staging debris');
-  },
-);
+test('add: a lockfile entry whose path is absolute is refused on read; victim untouched', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  const victim = join(cwd, 'victim');
+  mkdirSync(victim, { recursive: true });
+  writeFileSync(join(victim, 'keep.txt'), 'do not delete me');
+
+  const seedLf: Lockfile = {
+    version: 1,
+    installed: {
+      [`${owner}/${repo}`]: {
+        source: `${owner}/${repo}`,
+        ref: 'HEAD',
+        sha: SHA_A,
+        installedAt: 1,
+        path: victim, // absolute path to the out-of-tree dir
+        files: ['foo.yaml'],
+      },
+    },
+  };
+  mkdirSync(join(cwd, '.owenloop'), { recursive: true });
+  writeFileSync(lockfilePath(cwd), `${JSON.stringify(seedLf, null, 2)}\n`);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+
+  const b = await addInto(cwd, owner, repo, SHA_B, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(b.code, 1);
+  assert.match(b.err.join('\n'), /invalid lockfile/);
+  assert.match(b.err.join('\n'), /path/);
+
+  assert.equal(readFileSync(join(victim, 'keep.txt'), 'utf8'), 'do not delete me', 'victim intact');
+  assert.ok(!existsSync(join(cwd, 'workflows', installFolder(owner, repo))), 'nothing installed');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'lockfile unchanged');
+});
+
+test('add: a lockfile entry with a NESTED path is refused on read; nested dir untouched', async () => {
+  // The direct successor of the old chmod-based park-failure fixture: a nested
+  // `legacy/olddir` path was that test's injection vehicle (`existing.path` read
+  // verbatim). Nested paths are now refused before ANY mutation, so the hole is
+  // closed at read time.
+  const owner = 'acme';
+  const repo = 'widgets';
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  const oldRel = 'legacy/olddir';
+  const oldDir = join(cwd, 'workflows', oldRel);
+  mkdirSync(oldDir, { recursive: true });
+  writeFileSync(join(oldDir, 'foo.yaml'), validDefYaml('foo'));
+
+  const seedLf: Lockfile = {
+    version: 1,
+    installed: {
+      [`${owner}/${repo}`]: {
+        source: `${owner}/${repo}`,
+        ref: 'HEAD',
+        sha: SHA_A,
+        installedAt: 1,
+        path: oldRel,
+        files: ['foo.yaml'],
+      },
+    },
+  };
+  mkdirSync(join(cwd, '.owenloop'), { recursive: true });
+  writeFileSync(lockfilePath(cwd), `${JSON.stringify(seedLf, null, 2)}\n`);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+
+  const b = await addInto(cwd, owner, repo, SHA_B, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(b.code, 1);
+  assert.match(b.err.join('\n'), /invalid lockfile/);
+  assert.match(b.err.join('\n'), /separator/);
+
+  assert.equal(readFileSync(join(oldDir, 'foo.yaml'), 'utf8'), validDefYaml('foo'), 'nested dir untouched');
+  assert.ok(!existsSync(join(cwd, 'workflows', installFolder(owner, repo))), 'nothing installed');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'lockfile unchanged');
+  assert.ok(!existsSync(join(cwd, 'workflows', STAGING_DIRNAME)), 'no staging debris');
+});
+
+test('add: a lockfile entry with a safe-but-mismatched path segment is refused at the use-site; no mutation', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  // 'not-the-right-folder' passes structural validation (single safe segment)
+  // but is neither the computed folder nor the legacy `<owner>-<repo>` name, so
+  // the use-site exact-match refuses it before any staging/commit.
+  const seedLf: Lockfile = {
+    version: 1,
+    installed: {
+      [`${owner}/${repo}`]: {
+        source: `${owner}/${repo}`,
+        ref: 'HEAD',
+        sha: SHA_A,
+        installedAt: 1,
+        path: 'not-the-right-folder',
+        files: ['foo.yaml'],
+      },
+    },
+  };
+  writeLockfile(lockfilePath(cwd), seedLf);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+
+  const b = await addInto(cwd, owner, repo, SHA_B, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(b.code, 1);
+  assert.match(b.err.join('\n'), /neither the expected/);
+
+  assert.ok(!existsSync(join(cwd, 'workflows', installFolder(owner, repo))), 'nothing installed');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'lockfile unchanged');
+  assert.ok(!existsSync(join(cwd, 'workflows', STAGING_DIRNAME)), 'no staging debris');
+});
+
+test('add: a symlinked legacy dir is refused at the rename site, rolling the committed swap back', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  // A real victim dir outside `workflows`, and a legacy-named SYMLINK pointing at
+  // it. `path: 'acme-widgets'` passes structural validation AND the use-site
+  // exact-match (it equals the legacy `<owner>-<repo>` name), so the refusal
+  // happens at Layer 3 inside parkOldNameDir — AFTER commitInstall — exercising
+  // the post-commit rollback the old chmod fixture covered.
+  const victim = join(cwd, 'victim');
+  mkdirSync(victim, { recursive: true });
+  writeFileSync(join(victim, 'keep.txt'), 'do not delete me');
+  mkdirSync(join(cwd, 'workflows'), { recursive: true });
+  const legacyLink = join(cwd, 'workflows', `${owner}-${repo}`);
+  symlinkSync(victim, legacyLink);
+
+  const seedLf: Lockfile = {
+    version: 1,
+    installed: {
+      [`${owner}/${repo}`]: {
+        source: `${owner}/${repo}`,
+        ref: 'HEAD',
+        sha: SHA_A,
+        installedAt: 1,
+        path: `${owner}-${repo}`,
+        files: ['foo.yaml'],
+      },
+    },
+  };
+  writeLockfile(lockfilePath(cwd), seedLf);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+
+  const b = await addInto(cwd, owner, repo, SHA_B, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(b.code, 1);
+  assert.match(b.err.join('\n'), /could not migrate/);
+  assert.match(b.err.join('\n'), /rolled back, previous state restored/);
+  assert.match(b.err.join('\n'), /symlink/);
+
+  assert.ok(
+    !existsSync(join(cwd, 'workflows', installFolder(owner, repo))),
+    'hashed dir absent — the committed swap was rolled back',
+  );
+  assert.ok(existsSync(legacyLink), 'the symlink is left untouched');
+  assert.equal(readFileSync(join(victim, 'keep.txt'), 'utf8'), 'do not delete me', 'victim intact');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'lockfile unchanged');
+  assert.ok(!existsSync(join(cwd, 'workflows', STAGING_DIRNAME)), 'no staging debris');
+});
 
 test('add: an old-name migration success path installs the hashed dir, removes the old one, updates the lockfile', async () => {
   const owner = 'acme';
@@ -1047,9 +1197,13 @@ test('writeLockfile: writes atomically (round-trips, leaves no temp sibling)', (
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-lf-'));
   const p = join(dir, 'installed.json');
   const lf: Lockfile = {
+    // `sha` must be a real 40-hex sha: readLockfile now validates it on the read
+    // side of this round-trip (the old placeholder 'x' would be refused). The
+    // test's intent — atomic write, no temp sibling, round-trip equality — is
+    // unchanged.
     version: 1,
     installed: {
-      'a/b': { source: 'a/b', ref: 'HEAD', sha: 'x', installedAt: 1, path: 'a-b-deadbeef', files: ['foo.yaml'] },
+      'a/b': { source: 'a/b', ref: 'HEAD', sha: SHA_A, installedAt: 1, path: 'a-b-deadbeef', files: ['foo.yaml'] },
     },
   };
   writeLockfile(p, lf);
@@ -1066,6 +1220,94 @@ test('readLockfile: a corrupt lockfile is a hard error, never a silent reset to 
   const p = join(dir, 'installed.json');
   writeFileSync(p, '{ this is not valid json');
   assert.throws(() => readLockfile(p), /corrupt lockfile/);
+});
+
+// ---- SEC-3: structural lockfile validation (unit) ----------------------------
+
+test('lockfilePathViolation: accepts a single safe segment, rejects separators and traversal', () => {
+  // safe single segment (both current and legacy schemes)
+  assert.equal(lockfilePathViolation('acme-widgets'), undefined);
+  assert.equal(lockfilePathViolation('acme-widgets-deadbeef'), undefined);
+  // stricter than archivePathViolation: ANY separator is refused
+  assert.match(lockfilePathViolation('legacy/olddir')!, /separator/);
+  assert.match(lockfilePathViolation('a\\b')!, /separator/);
+  // and everything archivePathViolation already rejects
+  assert.ok(lockfilePathViolation(''), 'empty');
+  assert.ok(lockfilePathViolation('/etc/passwd'), 'absolute posix');
+  assert.ok(lockfilePathViolation('../victim'), 'leading dotdot');
+  assert.ok(lockfilePathViolation('..'), 'dotdot');
+  assert.ok(lockfilePathViolation('.'), 'dot');
+  assert.ok(lockfilePathViolation('a\0b'), 'NUL byte');
+});
+
+test('validateLockfile: a well-formed lockfile passes through unchanged', () => {
+  const lf: Lockfile = {
+    version: 1,
+    installed: {
+      'a/b': { source: 'a/b', ref: 'HEAD', sha: SHA_A, installedAt: 1, path: 'a-b-deadbeef', files: ['foo.yaml'] },
+    },
+  };
+  assert.deepEqual(validateLockfile(structuredClone(lf), 'installed.json'), lf);
+  // Unknown extra keys are tolerated (forward compatibility).
+  const withExtra = structuredClone(lf) as unknown as Record<string, unknown>;
+  withExtra.futureField = true;
+  (withExtra.installed as Record<string, Record<string, unknown>>)['a/b']!.futureEntryField = 42;
+  assert.doesNotThrow(() => validateLockfile(withExtra, 'installed.json'));
+});
+
+test('validateLockfile: every malformed shape is a hard error naming the entry/field', () => {
+  const base = (): Record<string, unknown> => ({
+    version: 1,
+    installed: {
+      'a/b': { source: 'a/b', ref: 'HEAD', sha: SHA_A, installedAt: 1, path: 'a-b-deadbeef', files: ['foo.yaml'] },
+    },
+  });
+  const mutate = (fn: (lf: Record<string, unknown>) => void): Record<string, unknown> => {
+    const lf = base();
+    fn(lf);
+    return lf;
+  };
+  const entry = (lf: Record<string, unknown>): Record<string, unknown> =>
+    (lf.installed as Record<string, Record<string, unknown>>)['a/b']!;
+
+  const cases: Array<[Record<string, unknown> | unknown, RegExp]> = [
+    ['not an object', /invalid lockfile/],
+    [[], /invalid lockfile/],
+    [mutate((lf) => { lf.version = 2; }), /unsupported lockfile version/],
+    [mutate((lf) => { lf.version = '1'; }), /unsupported lockfile version/],
+    [mutate((lf) => { delete lf.version; }), /unsupported lockfile version/],
+    [mutate((lf) => { lf.installed = []; }), /'installed' is not an object/],
+    [mutate((lf) => { (lf.installed as Record<string, unknown>)['a/b'] = 'x'; }), /is not an object/],
+    [mutate((lf) => { delete entry(lf).source; }), /\.source/],
+    [mutate((lf) => { entry(lf).source = 'other/repo'; }), /does not match its key/],
+    [mutate((lf) => { delete entry(lf).ref; }), /\.ref/],
+    [mutate((lf) => { entry(lf).sha = 'x'; }), /\.sha/],
+    [mutate((lf) => { entry(lf).sha = SHA_A.slice(0, 39); }), /\.sha/],
+    [mutate((lf) => { entry(lf).installedAt = 'soon'; }), /\.installedAt/],
+    [mutate((lf) => { entry(lf).path = 'legacy/olddir'; }), /\.path contains a path separator/],
+    [mutate((lf) => { entry(lf).path = '../victim'; }), /\.path/],
+    [mutate((lf) => { entry(lf).files = 'foo.yaml'; }), /\.files is not an array/],
+    [mutate((lf) => { entry(lf).files = [1]; }), /\.files\[0\] is not a string/],
+    [mutate((lf) => { entry(lf).files = ['../x']; }), /\.files\[0\]/],
+  ];
+  for (const [input, re] of cases) {
+    assert.throws(() => validateLockfile(input, 'installed.json'), re, JSON.stringify(input));
+  }
+});
+
+test('parkOldNameDir: a traversing oldRelPath throws and never touches the out-of-tree target', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-park-'));
+  const defsDir = join(dir, 'defs');
+  mkdirSync(defsDir, { recursive: true });
+  const victim = join(dir, 'victim');
+  mkdirSync(victim, { recursive: true });
+  writeFileSync(join(victim, 'keep.txt'), 'do not delete me');
+
+  const handle = { dest: join(defsDir, 'pkg-hashed'), undoDir: join(defsDir, STAGING_DIRNAME, 'stg1-undo') };
+  assert.throws(() => parkOldNameDir(handle, defsDir, '../victim'), /refusing old-name migration/);
+
+  assert.equal(readFileSync(join(victim, 'keep.txt'), 'utf8'), 'do not delete me', 'victim untouched');
+  assert.ok(existsSync(victim), 'victim dir still present');
 });
 
 // ---- parseRepoSpec: charset tightening ---------------------------------------
