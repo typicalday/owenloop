@@ -123,6 +123,17 @@ silently reset to empty (which would erase ownership records). This closes a
 directory-migration path where a crafted committed lockfile could make `add`
 move and then delete a directory outside the defs dir.
 
+`add` also refuses a symlinked project `.owenloop` directory and a symlinked
+**default** defs dir before any state write — the same filesystem-isolation
+guard used elsewhere, closing the one spot `add` hadn't yet applied it to. A
+hostile checkout shipping `.owenloop -> /elsewhere` or a symlinked `./workflows`
+could otherwise redirect `add.lock`, `installed.json`, and the staged/committed
+defs outside the project. `.owenloop` is guarded unconditionally, since its
+lock and lockfile paths are always `cwd`-derived in `add` with no override; the
+defs dir is guarded only on the default `cwd/workflows` fallback — an explicit
+`--defs`/`OWENLOOP_DEFS` is operator intent and is installed through as-is,
+matching the `--db`/`OWENLOOP_DB` rule above.
+
 **Discovery limitation.** `defs`/`loadDefs` only scan the defs dir's
 top-level `*.yaml` files and immediate-subdir `workflow.yaml` files — they
 don't recurse into `<owner>-<repo>-<hash>/*.yaml`. Defs installed by `add`
