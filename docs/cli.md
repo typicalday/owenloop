@@ -100,9 +100,15 @@ or a lockfile-write failure *after* the directory swap — rolls the directory
 state back, restoring the previous install and any old-name directory and
 leaving the lockfile unchanged, with no staging debris. The one deliberate
 exception is a rollback double fault — the follow-on step fails *and* restoring
-the directory state fails too — where the displaced previous content is
-intentionally preserved under `<defsDir>/.owenloop-staging/` and the error
-names that path; recover it before re-running `add`.
+the directory state fails too. For a lockfile-write double fault, the
+displaced previous content is intentionally preserved under
+`<defsDir>/.owenloop-staging/` and the error names that path; recover it
+before re-running `add`. For a park double fault during old-name migration,
+there's no staging backup to preserve — the old-name directory was never
+moved, so it stays intact at its original path, and the error instead names
+the newly installed content stranded at the destination path; re-running
+`add` recovers automatically, discarding the stranded content and leaving the
+previous install in place.
 
 Those rollbacks cover *in-process* failures — a thrown error `add` catches. A
 hard kill (SIGKILL, power loss) partway through the commit skips them entirely,

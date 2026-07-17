@@ -1435,18 +1435,23 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
         try {
           rollbackInstallCommit(handle);
         } catch (rollbackErr) {
-          // Double fault: parking the old dir failed AND restoring the directory
-          // state failed. The previous content is now parked under the staging
-          // root — preserve it past the `finally` and LEAVE the journal (phase
-          // `applying`) so the next add's recovery retries the restore before
-          // anything clears the staging root, mirroring the lockfile-write double
-          // fault below.
+          // Double fault: parking the old dir failed AND rolling the committed
+          // swap back failed. Nothing of value sits under the staging root here —
+          // the staging dir was consumed by the swap, and this migration branch
+          // never has a backup (`dest` cannot pre-exist; see the ownership refusal
+          // above). The old-name dir was never moved (the park is a single atomic
+          // rename recorded only on success) so it stays intact at its original
+          // path, and the stranded item is the NEW content still at `dest`. LEAVE
+          // the journal (phase `applying`) so the next add's recovery rolls the
+          // swap back (case (c): discards `dest`) before anything clears the
+          // staging root, mirroring the lockfile-write double fault below.
           preserveStagingRoot = true;
           throw new CliError(
             `could not migrate ${source} off old-name directory '${existing.path}' (${(e as Error).message}) ` +
               `and rolling the install back failed too (${(rollbackErr as Error).message}); ` +
-              `previous content preserved under ${stagingRoot} — recover it before running add again ` +
-              `(the next owenloop add will attempt recovery automatically; leaving it, that dir is cleared as debris)`,
+              `the old-name directory was never moved and is intact at ${join(defsDir, existing.path)}, ` +
+              `and the newly installed content is stranded at ${dest} — ` +
+              `the next owenloop add will recover automatically (discarding the stranded content and leaving the previous install in place)`,
           );
         }
         // Directory state restored in-process — nothing left to recover, so drop
