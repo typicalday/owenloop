@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
@@ -789,6 +789,67 @@ test('add: a lockfile-write failure during old-name migration keeps the old dir 
   rmSync(injected, { recursive: true, force: true });
 });
 
+test(
+  'add: a park failure during old-name migration rolls back the committed swap',
+  // Permission bits don't bind for root, so the injected rename would succeed
+  // and the test would go red for the wrong reason. CI is non-root; guard the
+  // hypothetical root run instead of leaving it flaky.
+  { skip: typeof process.getuid === 'function' && process.getuid() === 0 },
+  async () => {
+    const owner = 'acme';
+    const repo = 'widgets';
+    const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+    // Pre-hash state, but with a NESTED old path so we can deny the park rename
+    // via the PARENT dir's permissions without touching `workflows` itself
+    // (`existing.path` is read verbatim from the user-editable lockfile, so a
+    // nested path is a legitimate on-disk shape).
+    const oldRel = 'legacy/olddir';
+    const legacyParent = join(cwd, 'workflows', 'legacy');
+    const oldDir = join(cwd, 'workflows', oldRel);
+    mkdirSync(oldDir, { recursive: true });
+    writeFileSync(join(oldDir, 'foo.yaml'), validDefYaml('foo'));
+    const seedLf: Lockfile = {
+      version: 1,
+      installed: {
+        [`${owner}/${repo}`]: {
+          source: `${owner}/${repo}`,
+          ref: 'HEAD',
+          sha: SHA_A,
+          installedAt: 1,
+          path: oldRel,
+          files: ['foo.yaml'],
+        },
+      },
+    };
+    writeLockfile(lockfilePath(cwd), seedLf);
+    const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+
+    // Injection: read+exec but no write on `legacy`. Staging (under
+    // `workflows/.owenloop-staging`) and the commit swap (into
+    // `workflows/<hashed>`) only need write on `workflows` and succeed;
+    // `parkOldNameDir`'s `renameSync` out of `legacy` then throws EACCES/EPERM.
+    chmodSync(legacyParent, 0o555);
+    const b = await addInto(cwd, owner, repo, SHA_B, { 'workflows/foo.yaml': validDefYaml('foo') });
+    // Restore write access BEFORE any assertion so temp-dir cleanup works even
+    // if an assertion below fails.
+    chmodSync(legacyParent, 0o755);
+
+    assert.equal(b.code, 1);
+    assert.match(b.err.join('\n'), /could not migrate/);
+    assert.match(b.err.join('\n'), /rolled back, previous state restored/);
+    assert.match(b.err.join('\n'), /EACCES|EPERM/, 'underlying fs error surfaced');
+
+    assert.ok(
+      !existsSync(join(cwd, 'workflows', installFolder(owner, repo))),
+      'hashed dir absent — the committed swap was rolled back',
+    );
+    assert.equal(readFileSync(join(oldDir, 'foo.yaml'), 'utf8'), validDefYaml('foo'), 'old-name dir untouched');
+    assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'lockfile unchanged (still records the old path)');
+    assert.ok(!existsSync(join(cwd, 'workflows', STAGING_DIRNAME)), 'no staging debris');
+  },
+);
+
 test('add: an old-name migration success path installs the hashed dir, removes the old one, updates the lockfile', async () => {
   const owner = 'acme';
   const repo = 'widgets';
@@ -906,6 +967,26 @@ test('writeLockfile: a rename failure removes the temp sibling and rethrows', ()
     [],
     'temp sibling cleaned up on rename failure',
   );
+});
+
+test('writeLockfile: a failing cleanup never masks the original rename error', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lf-'));
+  const p = join(dir, 'installed.json');
+  // A directory at the destination makes `renameSync(tmpFile, p)` throw.
+  mkdirSync(p);
+  // Inject a cleanup op that itself throws — the double fault the fix guards.
+  assert.throws(
+    () => writeLockfile(p, { version: 1, installed: {} }, { rm: () => { throw new Error('cleanup-boom'); } }),
+    // The ORIGINAL rename error must surface, not the cleanup error. Don't pin a
+    // single errno — macOS/Linux differ on renaming a file onto a directory
+    // (EISDIR vs ENOTDIR/EPERM variants); just assert it is NOT the cleanup one.
+    (e: unknown) => e instanceof Error && !/cleanup-boom/.test(e.message),
+  );
+  // The injected cleanup was forced to fail, so the tmp sibling remains here —
+  // remove it manually rather than asserting on its absence.
+  for (const f of readdirSync(dir).filter((f) => f.startsWith('installed.json.tmp'))) {
+    rmSync(join(dir, f), { force: true });
+  }
 });
 
 // ---- REL-2: full cross-definition validation before commit -------------------

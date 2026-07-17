@@ -93,9 +93,15 @@ write are one recoverable operation: the install is *committed* only when
 `.owenloop/installed.json` is atomically replaced, and the displaced previous
 directory (and any old-name directory) is kept until that write succeeds. Any
 failure before that commit point — a validation error, a lock timeout, an
-interrupted rename, or a lockfile-write failure *after* the directory swap —
-rolls the directory state back, restoring the previous install and any
-old-name directory and leaving the lockfile unchanged, with no staging debris.
+interrupted rename, a failure parking the old-name directory during migration,
+or a lockfile-write failure *after* the directory swap — rolls the directory
+state back, restoring the previous install and any old-name directory and
+leaving the lockfile unchanged, with no staging debris. The one deliberate
+exception is a rollback double fault — the follow-on step fails *and* restoring
+the directory state fails too — where the displaced previous content is
+intentionally preserved under `<defsDir>/.owenloop-staging/` and the error
+names that path; recover it before re-running `add`, since the next `add`
+clears that directory as debris.
 Concurrent `add` runs in the same project serialize on a `.owenloop/add.lock`
 file; one that can't acquire the lock within 10s fails cleanly instead of
 interleaving with another install. `add` also refuses to replace a

@@ -156,18 +156,39 @@ export function readLockfile(path: string): Lockfile {
  * two racing writers can only ever leave a fully-formed file.
  *
  * If the final `renameSync` throws (EACCES, EISDIR on `path`, a full disk),
- * the temp sibling is removed before the error propagates so a failed write
- * cannot leak an `installed.json.tmp.<pid>` file. The original error is
- * surfaced unchanged — never swallowed.
+ * the temp sibling is removed on a best-effort basis before the error
+ * propagates so a failed write cannot leak an `installed.json.tmp.<pid>` file.
+ * The original rename error is surfaced unchanged — never swallowed, and never
+ * masked by a failure of that cleanup removal (if the removal itself throws,
+ * that error is swallowed and the tmp sibling may remain in that double fault).
  */
-export function writeLockfile(path: string, lf: Lockfile): void {
+export interface WriteLockfileOpts {
+  /**
+   * Removal op used to clean up the temp sibling when the atomic rename fails.
+   * Defaults to `rmSync`; injectable so a test can force the cleanup itself to
+   * throw and prove the ORIGINAL rename error still surfaces — the same
+   * test-determinism seam as `AcquireLockOpts` in this file.
+   */
+  rm?: (path: string, opts: { force: true }) => void;
+}
+
+export function writeLockfile(path: string, lf: Lockfile, opts: WriteLockfileOpts = {}): void {
+  const rm = opts.rm ?? ((p: string, o: { force: true }) => rmSync(p, o));
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, `${JSON.stringify(lf, null, 2)}\n`);
   try {
     renameSync(tmp, path);
   } catch (e) {
-    rmSync(tmp, { force: true });
+    // Best-effort cleanup: the temp sibling should not leak on a failed write,
+    // but if the removal ITSELF throws (e.g. unlink EACCES) we must not let that
+    // replace the original rename error — swallow the cleanup error and rethrow
+    // `e`. A tmp sibling may survive in that double fault.
+    try {
+      rm(tmp, { force: true });
+    } catch {
+      // ignore — surfacing the original rename error matters more than cleanup.
+    }
     throw e;
   }
 }
@@ -330,6 +351,11 @@ export function finalizeInstallCommit(handle: InstallCommitHandle): void {
  *   3. if an old-name dir was parked, rename it back to where the lockfile says.
  * The parked new content under `undoDir` is left for the caller's staging-root
  * cleanup to dispose of. Any throw propagates to the caller.
+ *
+ * Safe to call from a FAILED `parkOldNameDir`: that helper records
+ * `handle.oldName` only after its single rename succeeds, so a park failure
+ * leaves `oldName` unset and step 3 self-skips — there is no "park partially
+ * happened" state to reconcile (the park is one atomic rename).
  */
 export function rollbackInstallCommit(handle: InstallCommitHandle): void {
   renameSync(handle.dest, handle.undoDir);
