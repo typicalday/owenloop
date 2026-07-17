@@ -327,9 +327,9 @@ export class Engine {
    * The transactional body of instance creation: persist the workflow row, seed
    * its declared inputs (validating any provided values), and settle. MUST run
    * inside a `store.tx()` — callers own the tx and the post-commit event firing.
-   * Extracted from {@link createInstance} so the atomic child-spawn path
-   * ({@link spawnChildIfAbsent}) can insert-or-read a child under a single
-   * `BEGIN IMMEDIATE` without nesting transactions.
+   * Extracted from {@link createInstance} so the atomic child-provision path
+   * ({@link provisionCallsChild}) can find-or-create a child and sync its inputs
+   * under a single `BEGIN IMMEDIATE` without nesting transactions.
    */
   private createInstanceInTx(defName: string, def: WorkflowDef, id: string, opts: CreateOpts): void {
     // §28: pin this instance to the def it was created against — a snapshot
@@ -370,54 +370,143 @@ export class Engine {
   }
 
   /**
-   * REL-5: atomically attach-or-create the child instance for a `calls:` step.
-   * The check-then-insert runs inside ONE `BEGIN IMMEDIATE` transaction, so two
-   * concurrent driver ticks (even in separate processes) serialize on the write
-   * lock: the first inserts the child, the second observes it and re-attaches —
-   * never two children for the same parent coordinate. The v8 partial unique
-   * index (`workflow_produced_by_unique`) is the physical backstop.
+   * C2: atomic fresh-snapshot child provision for a `calls:` step — the
+   * creation-side mirror of `publishCallsGreen`'s discipline. Find-or-create the
+   * child AND synchronize every mapped child input, all inside ONE
+   * `BEGIN IMMEDIATE`, from a parent snapshot RE-READ inside that same tx — never
+   * from the caller's (STEP-1) snapshot. Because the write and every read it
+   * depends on share one write lock, the committed seed/sync values are by
+   * construction current at commit: "never regress a child input" needs no
+   * version comparison — the fresh in-tx read IS the guard.
    *
-   * Returns the child id and whether THIS call created it. Events (`instance`,
-   * `settled`) are the caller's responsibility and must fire only when
-   * `created` is true — a re-attach (or a lost race) must be silent, matching
-   * the pre-REL-5 re-attach behavior.
+   * This closes two reproduced cross-connection races the STEP-1 snapshot exposed:
+   * (a) SPAWN — a child seeded from a stale parent value while a concurrent tick
+   * advanced the gate; (b) RE-PROVISION — a stale parent value stamped backward
+   * over a newer child input (version bumps, value regresses). `maintainCalls`'
+   * pre-reads (gate readiness, `findChildByParent`, F2 fingerprint, depth) are now
+   * OPTIMISTIC — they decide only WHETHER to attempt; this helper re-verifies
+   * everything the write depends on in-tx.
    *
-   * A `SchemaRefusalError` (a provided parent value illegal per the child's
-   * input schema) propagates out with the tx rolled back — no orphan child row
-   * — preserving the F2 contract in `maintainCalls`.
+   * Returns `{ childId, created, provided }` — `created` true only when THIS call
+   * inserted the child, `provided` the list of child inputs it actually re-wrote
+   * (empty for a plain spawn, since a fresh seed already equals the fresh
+   * snapshot). Events (`instance`, `commit`/`provide`, `settled`) and the child
+   * cascade are the caller's responsibility, fired post-commit, matching the
+   * pre-C2 per-action semantics. Returns `null` on a silent abort: the gate was
+   * re-armed, or an F2 schema-reject debt landed, since the pre-read — "not yet"
+   * state, next tick redoes the pass (publishCallsGreen discipline; no debt, no
+   * events written).
+   *
+   * A `SchemaRefusalError` (a seed or re-provided parent value illegal per the
+   * child's input schema) propagates out with the whole tx rolled back — no
+   * orphan child row, no partial input sync — preserving the F2 contract; the
+   * caller records it as a debt on the parent calls artifact.
    */
-  private spawnChildIfAbsent(
-    defName: string,
+  private provisionCallsChild(
     parentWf: string,
-    callsPath: string,
-    seedProvide: Record<string, Record<string, unknown>>,
-  ): { id: string; created: boolean } {
-    const def = this.resolveDef(defName);
-    const run = (): { id: string; created: boolean } =>
+    step: StepDef,
+    callsStem: string,
+    gateStems: string[],
+    now?: number,
+  ): { childId: string; created: boolean; provided: string[] } | null {
+    const run = (): { childId: string; created: boolean; provided: string[] } | null =>
       this.store.tx(() => {
-        const existing = this.store.findChildByParent(parentWf, callsPath);
-        if (existing) return { id: existing.id, created: false };
-        const id = randId('wf');
-        this.createInstanceInTx(defName, def, id, {
-          producedBy: { parentWf, parentPath: callsPath },
-          provide: seedProvide,
-        });
-        return { id, created: true };
+        // 1. FRESH parent snapshot — re-read inside the write lock; never trust
+        //    the caller's STEP-1 map.
+        const parentArts = this.artMap(parentWf);
+
+        // 2. Gate readiness against the fresh snapshot: a stem re-armed
+        //    concurrently must stop provisioning (abort silent — STEP-1 semantics).
+        if (!this.callsGateReady(parentArts, step)) return null;
+
+        // 3. In-tx F2 guard: an F2 schema-reject debt that landed concurrently
+        //    (rejected + gate fingerprint unmoved) must not be provisioned over — a
+        //    moved gate falls through and retries (mirrors STEP 2's optimistic guard).
+        //    Read the calls artifact from the SAME fresh in-tx `parentArts` snapshot
+        //    (listArtifacts), not a separate `store.getArtifact` — one consistent
+        //    read, and it avoids adding a parent-calls-artifact read inside the write
+        //    lock (which STEP-6's cross-connection tests count).
+        const parentCallsArt = parentArts.get(callsStem);
+        if (parentCallsArt?.acceptance === 'rejected') {
+          const fp = computeFingerprint(parentArts, gateStems);
+          if (deepEqual(fp, parentCallsArt.fingerprint ?? {})) return null;
+        }
+
+        // 4. Find-or-create the child (in-tx check-then-insert — absorbs the old
+        //    spawnChildIfAbsent guarantee, only its home moved).
+        let child = this.store.findChildByParent(parentWf, callsStem);
+        let created = false;
+        let childDef: WorkflowDef;
+        if (!child) {
+          const childId = randId('wf');
+          childDef = this.resolveDef(step.calls!);
+          const seedProvide: Record<string, Record<string, unknown>> = {};
+          for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
+            const parentArt = parentArts.get(parentArtifactName);
+            if (parentArt?.value !== undefined) {
+              seedProvide[childInputName] = parentArt.value as Record<string, unknown>;
+            }
+          }
+          // createInstanceInTx validates the seed against the child input schema
+          // and throws SchemaRefusalError (tx rolls back — no orphan child).
+          this.createInstanceInTx(step.calls!, childDef, childId, {
+            producedBy: { parentWf, parentPath: callsStem },
+            provide: seedProvide,
+          });
+          child = this.store.getWorkflow(childId)!;
+          created = true;
+        } else {
+          // §28: read the existing child per its own pinned snapshot.
+          childDef = this.defFor(child.id);
+        }
+
+        // 5. Synchronize EVERY mapped child input from the SAME fresh snapshot.
+        //    A freshly-seeded child already equals the snapshot, so its inputs
+        //    no-op here (no spurious provide for a plain spawn). This is the exact
+        //    body of `provideInput`, inlined so it shares this tx (store.tx forbids
+        //    re-entrancy) — behavior identical, all-or-nothing on refusal.
+        const childArts = this.artMap(child.id);
+        const provided: string[] = [];
+        for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
+          const parentArt = parentArts.get(parentArtifactName);
+          if (parentArt?.value === undefined) continue; // nothing to provide
+          const childArt = childArts.get(childInputName);
+          if (!childArt) throw new Error(`no such input artifact: ${childInputName}`);
+          if (deepEqual(parentArt.value, childArt.value)) continue; // already current
+          const inputDef = childDef.inputs.find((i) => i.name === childInputName);
+          if (inputDef?.schema !== undefined) {
+            const check = validateValue(inputDef.schema, parentArt.value);
+            if (!check.valid) throw new SchemaRefusalError(childInputName, check.issues);
+          }
+          this.store.putArtifact({
+            ...childArt,
+            acceptance: 'green',
+            version: childArt.version + 1,
+            value: parentArt.value,
+          });
+          provided.push(childInputName);
+        }
+
+        // 6. Settle the child if we wrote anything (matches createInstanceInTx /
+        //    provideInput). A fresh spawn already settled inside createInstanceInTx;
+        //    re-settling is a cheap fixpoint no-op.
+        if (created || provided.length > 0) this.settle(child.id, childDef, now);
+
+        return { childId: child.id, created, provided };
       });
+
     try {
       return run();
     } catch (err) {
-      // Constraint backstop for any future concurrent writer that isn't
-      // serialized by BEGIN IMMEDIATE: if the insert lost a race on the unique
-      // index, the winner's row is already committed — read and re-attach to it.
-      // Unreachable under node:sqlite's synchronous, write-lock-serialized
-      // connections, but cheap and correct defense.
+      // UNIQUE-index backstop for any future concurrent writer not serialized by
+      // BEGIN IMMEDIATE: the whole failed tx rolled back, so a single retry finds
+      // the winner in-tx and syncs its inputs. Unreachable under node:sqlite's
+      // synchronous, write-lock-serialized connections, but cheap and correct.
       if (
         err instanceof Error &&
         /UNIQUE constraint failed: workflow\.produced_by_wf/.test(err.message)
       ) {
-        const winner = this.store.findChildByParent(parentWf, callsPath);
-        if (winner) return { id: winner.id, created: false };
+        return run();
       }
       throw err;
     }
@@ -648,53 +737,65 @@ export class Engine {
           if (deepEqual(currentGateFp, parentCallsArtPre.fingerprint ?? {})) continue;
         }
 
-        // STEP 3 — SPAWN or RE-ATTACH.
-        if (!existingChild) {
-          // REL-4 spawn-time bound (the guard that prevents row bloat). Refuse to
-          // spawn once this parent's own calls: ancestry has reached maxCallDepth:
-          // a self- or cross-calling def whose cycle slipped past load-time
-          // validation would otherwise mint a fresh child instance (a new DB row)
-          // at every recursion level until the process stack overflows. Record a
-          // rejection on the parent calls artifact (clean stop; the STEP-2 F2
-          // fingerprint guard then skips re-attempts) instead of throwing.
-          if (this.callsAncestryDepth(parentWf) >= this.maxCallDepth) {
-            this.recordCallsDepthReject(parentWf, def, callsStem, gateStems, step.calls, now);
+        // STEP 3 — SPAWN or RE-PROVISION, atomically against a FRESH snapshot.
+        //
+        // REL-4 spawn-time depth bound (the guard that prevents row bloat). Only an
+        // OPTIMISTIC pre-check, and only when no child exists yet: a self- or
+        // cross-calling def whose cycle slipped past load-time validation would
+        // otherwise mint a fresh child instance (a new DB row) at every recursion
+        // level until the process stack overflows. `callsAncestryDepth` walks the
+        // `producedBy` chain, which is immutable after insert, so it cannot race and
+        // needs no in-tx recheck. Record a rejection on the parent calls artifact
+        // (clean stop; the STEP-2 F2 fingerprint guard then skips re-attempts).
+        if (!existingChild && this.callsAncestryDepth(parentWf) >= this.maxCallDepth) {
+          this.recordCallsDepthReject(parentWf, def, callsStem, gateStems, step.calls, now);
+          continue;
+        }
+
+        // The find-or-create AND every mapped input sync happen in ONE
+        // BEGIN IMMEDIATE inside the helper, from a parent snapshot RE-READ in that
+        // tx — so a child is never CREATED or WRITTEN from a snapshot older than its
+        // committing transaction (closes the SPAWN and RE-PROVISION races). The
+        // pre-reads above (gate readiness, findChildByParent, F2 fingerprint, depth)
+        // are optimistic — they decide only whether to attempt; the helper
+        // re-verifies in-tx and aborts (returns null) if the gate re-armed or an F2
+        // debt landed since. F2: a child input-schema refusal (seed or re-provide)
+        // is not a bug — a parent value legal per the parent's own schema can be
+        // illegal per the child's — so it rolls the whole provision tx back and
+        // becomes a debt on the PARENT calls artifact (mirroring green()'s
+        // schema-reject branch) instead of crash-looping every subsequent tick.
+        let provision: { childId: string; created: boolean; provided: string[] } | null;
+        try {
+          provision = this.provisionCallsChild(parentWf, step, callsStem, gateStems, now);
+        } catch (err) {
+          if (err instanceof SchemaRefusalError) {
+            this.recordCallsSchemaReject(parentWf, def, callsStem, gateStems, err, now);
             continue;
           }
-          // SPAWN: gate is ready and no child exists yet.
-          const seedProvide: Record<string, Record<string, unknown>> = {};
-          for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
-            const parentArt = parentArts.get(parentArtifactName);
-            if (parentArt?.value !== undefined) seedProvide[childInputName] = parentArt.value;
-          }
-          // F2: a child input-schema refusal here is not a bug — a parent
-          // value can be legal per the parent's own schema (looser, or absent)
-          // yet illegal per the child's declared input schema. Catch narrowly
-          // (SchemaRefusalError only; anything else is a genuine bug and must
-          // still throw) and record it as a debt on the PARENT calls artifact,
-          // mirroring green()'s schema-reject branch, so the tick proceeds
-          // instead of crash-looping every subsequent tick(parent).
-          let spawn: { id: string; created: boolean };
-          try {
-            // REL-5: atomic insert-or-read inside BEGIN IMMEDIATE — a concurrent
-            // tick that already spawned the child is re-attached here rather
-            // than duplicated. Events fire only when THIS call created it.
-            spawn = this.spawnChildIfAbsent(step.calls, parentWf, callsPath, seedProvide);
-          } catch (err) {
-            if (err instanceof SchemaRefusalError) {
-              this.recordCallsSchemaReject(parentWf, def, callsStem, gateStems, err, now);
-              continue;
-            }
-            throw err;
-          }
-          if (spawn.created) {
-            this.fire({ type: 'instance', workflow: spawn.id, def: step.calls });
-            this.fireSettled(spawn.id);
-          }
-          existingChild = this.store.getWorkflow(spawn.id);
+          throw err;
         }
-        // else: RE-ATTACH — existingChild is the already-spawned child; no new spawn.
+        if (!provision) continue; // silent abort (gate re-armed / F2 debt landed) — next tick retries.
 
+        // Post-commit events, matching the pre-C2 per-action semantics exactly:
+        // only the creating connection fires `instance`; each re-provided input
+        // fires a commit/provide as provideInput did; a settled + one cascade run
+        // (idempotent maintenance — once per provision, not once per input) so a
+        // grandchild gets re-provided in the same pass.
+        if (provision.created) {
+          this.fire({ type: 'instance', workflow: provision.childId, def: step.calls });
+          this.fireSettled(provision.childId);
+        }
+        for (const name of provision.provided) {
+          this.fire({ type: 'commit', workflow: provision.childId, path: name, action: 'provide' });
+        }
+        if (provision.provided.length > 0) {
+          this.fireSettled(provision.childId);
+          // provideInput's cascade-up, outside the tx (store.tx forbids re-entrancy);
+          // the _inMaintainCalls guard keys on parentWf, so this nested call is safe.
+          this.maintainCalls(provision.childId, this.defFor(provision.childId), now);
+        }
+
+        existingChild = this.store.getWorkflow(provision.childId);
         if (!existingChild) continue; // defensive: createInstance returned but getWorkflow failed
 
         // STEP 4 — Read child's declared outcome artifact.
@@ -704,29 +805,6 @@ export class Engine {
         const childOutcomeStem = childDef.outputs![0]!; // validated by Phase-2 check
         let childArts = this.artMap(existingChild.id);
         let childOutcomeArt = childArts.get(childOutcomeStem);
-
-        // STEP 5 — RE-PROVIDE if parent gate source moved (M2B-REPROVIDE).
-        // F2: same typed-refusal handling as STEP 3 — a re-provided parent
-        // value illegal per the child's input schema becomes a debt on the
-        // parent calls artifact instead of throwing out of provideInput's
-        // cascade-up. The human's own provide of the PARENT input still
-        // commits (that validation happens against the PARENT's schema,
-        // inside provideInput's own tx, before this cascade ever runs).
-        for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
-          const parentArtNow = parentArts.get(parentArtifactName);
-          const childInputArt = childArts.get(childInputName);
-          if (parentArtNow?.value !== undefined && !deepEqual(parentArtNow.value, childInputArt?.value)) {
-            try {
-              this.provideInput(existingChild.id, childInputName, parentArtNow.value as Record<string, unknown>);
-            } catch (err) {
-              if (err instanceof SchemaRefusalError) {
-                this.recordCallsSchemaReject(parentWf, def, callsStem, gateStems, err, now);
-                continue;
-              }
-              throw err;
-            }
-          }
-        }
 
         // STEP 6 — MACHINE-GREEN or STAY OWED (M2B-CASCADEUP).
         //
