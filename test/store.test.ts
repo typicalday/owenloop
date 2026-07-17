@@ -991,6 +991,16 @@ test('REL-5: legacy duplicate children are tolerated on open (index skipped, no 
     // findChildByParent picks the oldest, stably across calls.
     assert.equal(s2.findChildByParent(parentWf, 'deliver')?.id, older);
     assert.equal(s2.findChildByParent(parentWf, 'deliver')?.id, older);
+    // ...and stays deterministic even when SQLite reverses its scan order.
+    // reverse_unordered_selects is per-connection, so it must be set on the
+    // store's own live connection. Under unordered SQL this pragma flips the
+    // returned duplicate — the ORDER BY is what keeps oldest-wins stable.
+    s2.db.exec('PRAGMA reverse_unordered_selects=ON');
+    assert.equal(
+      s2.findChildByParent(parentWf, 'deliver')?.id,
+      older,
+      'oldest child still wins with reverse_unordered_selects=ON',
+    );
     s2.close();
 
     // After the operator removes the offending duplicate, the next open creates
@@ -1008,6 +1018,116 @@ test('REL-5: legacy duplicate children are tolerated on open (index skipped, no 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('findChildByParent: id breaks the tie when created_at is identical (deterministic under either scan order)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-childtie-'));
+  const dbPath = join(dir, 'test.db');
+  try {
+    const s1 = new Store(dbPath);
+    s1.close();
+
+    const parentWf = randId('wf');
+    // Fixed, lexically-ordered ids with IDENTICAL created_at: the ORDER BY
+    // `id` secondary key is the only thing that makes the winner deterministic.
+    const lo = 'wf_aaa';
+    const hi = 'wf_bbb';
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('DROP INDEX IF EXISTS workflow_produced_by_unique');
+    const ins = raw.prepare(
+      `INSERT INTO workflow (id, def, produced_by_wf, produced_by_path, created_at) VALUES (?, ?, ?, ?, ?)`,
+    );
+    // Insert the lexically-larger id FIRST so natural rowid order disagrees
+    // with id order — proving the tiebreak is the ORDER BY, not insert order.
+    ins.run(hi, 'childDef', parentWf, 'deliver', 5000);
+    ins.run(lo, 'childDef', parentWf, 'deliver', 5000);
+    raw.close();
+
+    const s = new Store(dbPath);
+    try {
+      assert.equal(s.findChildByParent(parentWf, 'deliver')?.id, lo, 'lexically-smaller id wins by default');
+      s.db.exec('PRAGMA reverse_unordered_selects=ON');
+      assert.equal(
+        s.findChildByParent(parentWf, 'deliver')?.id,
+        lo,
+        'lexically-smaller id still wins with reverse_unordered_selects=ON',
+      );
+    } finally {
+      s.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('putArtifact: structural change-detection — key-order-only rewrites are true no-ops, real changes are not', () => {
+  const s = mem();
+  const wf = randId('wf');
+
+  const countEvents = (): number => {
+    const h = s.getArtifactHistory(wf, 'pr');
+    if (!h) return 0;
+    return h.versions.reduce((n, v) => n + v.events.length, 0) + h.events.length;
+  };
+
+  // Green v1 with a nested value in one key order, plus a fingerprint.
+  s.putArtifact(
+    artifact(wf, 'pr', {
+      acceptance: 'green',
+      version: 1,
+      value: { beta: 2, alpha: 1, nested: { y: 2, x: 1 } },
+      fingerprint: { plan: 1 },
+    }),
+  );
+  const afterFirst = countEvents();
+  assert.equal(afterFirst, 1, 'first green appends exactly one produced event');
+
+  // Semantically identical payload written with shuffled key order at BOTH the
+  // nested-value level AND the top-level ArtifactData literal (built by hand so
+  // top-level property order actually differs), and with `terminal` omitted.
+  const shuffled: ArtifactData = {
+    judgmentRejects: 0,
+    reasons: [],
+    version: 1,
+    acceptance: 'green',
+    schemaRejects: 0,
+    producer: 'maker',
+    path: 'pr',
+    workflow: wf,
+    fingerprint: { plan: 1 },
+    value: { nested: { x: 1, y: 2 }, alpha: 1, beta: 2 },
+  };
+  s.putArtifact(shuffled);
+  assert.equal(countEvents(), afterFirst, 'key-order-only rewrite is a true no-op — no extra event');
+  assert.equal(s.getArtifactHistory(wf, 'pr')?.versions.length, 1, 'still exactly one version');
+
+  // Over-suppression guard (a): an acceptance-only change (same version) is a
+  // real change and appends an event.
+  s.putArtifact(
+    artifact(wf, 'pr', {
+      acceptance: 'rejected',
+      version: 1,
+      value: { beta: 2, alpha: 1, nested: { y: 2, x: 1 } },
+      fingerprint: { plan: 1 },
+      reasons: [{ at: 10, action: 'reject', kind: 'judgment', by: 'review', text: 'nope', fromVersion: 1 }],
+      judgmentRejects: 1,
+    }),
+  );
+  const afterAcceptance = countEvents();
+  assert.ok(afterAcceptance > afterFirst, 'acceptance/reason change appends an event');
+
+  // Over-suppression guard (b): a value change (new version) appends an event.
+  s.putArtifact(
+    artifact(wf, 'pr', {
+      acceptance: 'green',
+      version: 2,
+      value: { beta: 2, alpha: 1, nested: { y: 2, x: 99 } },
+      fingerprint: { plan: 2 },
+    }),
+  );
+  assert.ok(countEvents() > afterAcceptance, 'value change appends an event');
+
+  s.close();
 });
 
 test('legacy/foreign id rows are addressed by natural key, not recomputed id', () => {

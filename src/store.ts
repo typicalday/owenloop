@@ -199,6 +199,58 @@ export class StoreVersionError extends Error {}
 function toJson(v: unknown): string | null {
   return v === undefined ? null : JSON.stringify(v);
 }
+
+/**
+ * Key-order-independent canonical serialization of a JSON-shaped value.
+ * Plain objects are rebuilt with their keys sorted and `undefined`-valued
+ * properties dropped (mirroring `JSON.stringify`, so `{ x: undefined }` and
+ * `{}` canonicalize the same). Array order is preserved — `reasons` is an
+ * append-only thread whose order is significant. Values passed here already
+ * round-trip through JSON columns, so no Date/Map/cycle handling is needed.
+ * Used by `putArtifact` to decide "changed vs no-op" without being fooled by
+ * property insertion order (which would append a false `artifact_event`).
+ */
+function canonicalJson(v: unknown): string {
+  return JSON.stringify(canonicalize(v));
+}
+function canonicalize(v: unknown): unknown {
+  if (Array.isArray(v)) return v.map(canonicalize);
+  if (v !== null && typeof v === 'object') {
+    const src = v as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(src).sort()) {
+      if (src[k] !== undefined) out[k] = canonicalize(src[k]);
+    }
+    return out;
+  }
+  return v;
+}
+
+/**
+ * The semantic fields of an artifact that define "has this changed?" — an
+ * explicit projection so identity/timestamp columns (`id`, `updatedAt`) and
+ * insertion order never influence the decision. `terminal` is normalized to a
+ * boolean because `mapArtifact` always materializes it while callers may omit
+ * it; without this, every repeat write that omits `terminal` would read as
+ * changed and append a false event.
+ */
+function artifactSemantics(x: ArtifactData): unknown {
+  return {
+    workflow: x.workflow,
+    path: x.path,
+    producer: x.producer,
+    acceptance: x.acceptance,
+    version: x.version,
+    value: x.value,
+    fingerprint: x.fingerprint,
+    reasons: x.reasons,
+    judgmentRejects: x.judgmentRejects,
+    schemaRejects: x.schemaRejects,
+    sealOf: x.sealOf,
+    terminal: x.terminal ?? false,
+    approvals: x.approvals,
+  };
+}
 function fromJson<T>(s: unknown, fallback: T, ctx: { table: string; id: string; column: string }): T {
   if (s === null || s === undefined) return fallback;
   try {
@@ -696,7 +748,9 @@ export class Store {
    */
   findChildByParent(parentWf: string, parentPath: string): WorkflowRow | undefined {
     const r = this.db
-      .prepare('SELECT * FROM workflow WHERE produced_by_wf = ? AND produced_by_path = ?')
+      .prepare(
+        'SELECT * FROM workflow WHERE produced_by_wf = ? AND produced_by_path = ? ORDER BY created_at, id LIMIT 1',
+      )
       .get(parentWf, parentPath) as WorkflowRowRaw | undefined;
     return r ? mapWorkflow(r) : undefined;
   }
@@ -777,7 +831,7 @@ export class Store {
         approvals: toJson(data.approvals),
         updated_at: at,
       });
-    const changed = !previous || JSON.stringify({ ...previous, id: undefined, updatedAt: undefined }) !== JSON.stringify({ ...data, id: undefined, updatedAt: undefined });
+    const changed = !previous || canonicalJson(artifactSemantics(previous)) !== canonicalJson(artifactSemantics(data));
     if (changed) {
       if (data.version > 0 && (!previous || data.version > previous.version)) {
         this.db.prepare(
