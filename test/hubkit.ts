@@ -20,6 +20,14 @@ export interface RouteResult {
   status: number;
   json?: unknown;
   headers?: Record<string, string>;
+  /**
+   * Escape hatch for streaming/oversized-body tests (realHttpServer only): when
+   * set, the server writes the head (status + `headers`) and hands the raw
+   * `ServerResponse` to this handler, which writes chunks, ends, or deliberately
+   * leaves the stream open — bypassing the JSON serialization path. `routedFetch`
+   * (in-memory, no real stream) throws if such a route is hit.
+   */
+  stream?: (res: ServerResponse) => void;
 }
 export type RouteHandler = (req: { url: URL; body: string | undefined; method: string }) => RouteResult;
 
@@ -61,6 +69,7 @@ export function routedFetch(routes: Record<string, RouteHandler>): {
     const handler = routes[`${method} ${url.pathname}`];
     if (!handler) throw new Error(`routedFetch: no route for ${method} ${url.pathname}`);
     const r = handler({ url, body, method });
+    if (r.stream) throw new Error(`routedFetch: stream routes require realHttpServer (${method} ${url.pathname})`);
     const headers = { 'Content-Type': 'application/json', ...(r.headers ?? {}) };
     const payload = r.json === undefined ? '' : JSON.stringify(r.json);
     return new Response(payload, { status: r.status, headers });
@@ -157,6 +166,13 @@ export async function realHttpServer(routes: Record<string, RouteHandler>): Prom
         return;
       }
       const r = handler({ url, body, method });
+      if (r.stream) {
+        // Streaming route: write the head, then let the handler own the body
+        // (write chunks, end, or leave it open to exercise a client cancel).
+        res.writeHead(r.status, r.headers ?? {});
+        r.stream(res);
+        return;
+      }
       const headers = { 'Content-Type': 'application/json', ...(r.headers ?? {}) };
       const payload = r.json === undefined ? '' : JSON.stringify(r.json);
       res.writeHead(r.status, headers);
@@ -170,7 +186,14 @@ export async function realHttpServer(routes: Record<string, RouteHandler>): Prom
   return {
     origin,
     calls,
-    close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
+    // Drop any socket the client cancelled mid-stream before close() waits on
+    // it (Node ≥ 18.2; we run 22) — otherwise a lingering half-open connection
+    // can hang teardown of a streaming test.
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.closeAllConnections();
+        server.close((e) => (e ? reject(e) : resolve()));
+      }),
   };
 }
 
