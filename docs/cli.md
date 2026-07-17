@@ -113,6 +113,21 @@ lockfile to proceed. A repo previously installed under the old
 `<owner>-<repo>` naming is migrated to the new hashed folder automatically,
 and the old one is removed only once the new lockfile entry is durably written.
 
+The lock's stale-reclaim is liveness-aware, not purely age-based: a lock
+whose recorded pid is alive on this host is never reclaimed no matter how
+long it's held, and one whose pid is dead is reclaimed immediately. Age (the
+10-minute window) governs reclaim only as a fail-closed fallback for a lock
+this process can't attribute to a live owner — unparseable, or missing a
+pid. A lock recorded from a **different host** is never age-reclaimed
+either, since a pid liveness check proves nothing about a foreign PID space;
+it's held until its own machine clears it. Each acquisition writes a
+per-lock ownership token, and release only deletes the file if that token
+still matches — so a holder that loses a race can never delete a lock a
+fresh owner has since re-acquired. A lock file that can be `stat`'d but not
+read (e.g. root-owned, or mid-write) no longer spins the acquire loop
+sleeplessly; it falls through to the normal poll sleep and still respects
+the `waitMs` timeout.
+
 `add` never trusts `.owenloop/installed.json` for filesystem paths: the lockfile
 is validated fail-closed on read. A file that parses but is structurally invalid
 — an unsupported `version`, a malformed or key-mismatched entry, a non-hex

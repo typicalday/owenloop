@@ -7,8 +7,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
@@ -637,17 +637,157 @@ test('acquireInstallLock: reclaims a lock whose holder pid is dead', async () =>
   releaseInstallLock(handle);
 });
 
-test('acquireInstallLock: reclaims a lock whose mtime is past the stale window', async () => {
+test('acquireInstallLock: a live same-host holder is NOT stolen by age — second acquire refuses, lock untouched', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
   const lockPath = join(dir, 'add.lock');
-  writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+  // A live holder: this process's own pid, current host, a fresh token, an old start.
+  const payload = JSON.stringify({
+    pid: process.pid,
+    startedAt: Date.now() - 60 * 60_000,
+    token: 'a'.repeat(32),
+    host: hostname(),
+  });
+  writeFileSync(lockPath, payload);
 
-  // Holder pid is alive (this process), but a clock jumped an hour ahead makes
-  // the lock's mtime older than the 10-minute stale window → reclaimable.
+  // Backdate the lock's mtime an hour into the past — genuinely past the
+  // 10-minute stale window (real clock, so the wait deadline is still
+  // reachable). Under the OLD age-based policy this reclaimed the lock; under
+  // the liveness-aware policy a live pid is never stolen regardless of age.
+  const anHourAgo = new Date(Date.now() - 60 * 60_000);
+  utimesSync(lockPath, anHourAgo, anHourAgo);
+
+  await assert.rejects(
+    acquireInstallLock(lockPath, { waitMs: 40, pollMs: 5 }),
+    /another owenloop add is in progress.*timed out waiting after/,
+  );
+  assert.equal(readFileSync(lockPath, 'utf8'), payload, 'live holder lock byte-identical after refusal');
+});
+
+test('acquireInstallLock: reclaims a dead-pid lock in the new token+host payload format', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
+  const lockPath = join(dir, 'add.lock');
+  writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: 999999, startedAt: Date.now(), token: 'b'.repeat(32), host: hostname() }),
+  );
+
+  const handle = await acquireInstallLock(lockPath, { isPidAlive: () => false, waitMs: 40, pollMs: 5 });
+  assert.ok(handle.acquired, 'dead-pid lock reclaimed (new-format payload)');
+  releaseInstallLock(handle);
+});
+
+test('acquireInstallLock: a foreign-host lock is treated as held even if its pid is free locally', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
+  const lockPath = join(dir, 'add.lock');
+  const payload = JSON.stringify({
+    pid: 4242,
+    startedAt: Date.now(),
+    token: 'c'.repeat(32),
+    host: 'some-other-host',
+  });
+  writeFileSync(lockPath, payload);
+
+  // isPidAlive: () => false proves liveness is not even consulted for a foreign
+  // host — a different host's PID space says nothing about a local pid.
+  await assert.rejects(
+    acquireInstallLock(lockPath, { isPidAlive: () => false, waitMs: 40, pollMs: 5 }),
+    /another owenloop add is in progress.*timed out waiting after/,
+  );
+  assert.equal(readFileSync(lockPath, 'utf8'), payload, 'foreign-host lock untouched');
+});
+
+test('releaseInstallLock: does not delete a lock whose token no longer matches, and never throws', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
+  const lockPath = join(dir, 'add.lock');
+
+  const handle = await acquireInstallLock(lockPath);
+  // Simulate another process reclaiming and re-acquiring: overwrite with a different token.
+  const foreign = JSON.stringify({ pid: process.pid, startedAt: Date.now(), token: 'd'.repeat(32), host: hostname() });
+  writeFileSync(lockPath, foreign);
+
+  releaseInstallLock(handle); // must NOT delete someone else's lock, must not throw
+  assert.ok(existsSync(lockPath), 'foreign-owned lock still present');
+  assert.equal(readFileSync(lockPath, 'utf8'), foreign, 'foreign-owned lock byte-identical');
+});
+
+test('acquireInstallLock: an unparseable lock fails closed, then is reclaimed once past the abandonment window', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
+  const lockPath = join(dir, 'add.lock');
+  writeFileSync(lockPath, 'not json at all');
+
+  // Fails closed while recent: no live owner attributable, mtime within window → held.
+  await assert.rejects(
+    acquireInstallLock(lockPath, { waitMs: 40, pollMs: 5 }),
+    /another owenloop add is in progress.*timed out waiting after/,
+  );
+  assert.equal(readFileSync(lockPath, 'utf8'), 'not json at all', 'unparseable lock untouched while recent');
+
+  // Once the clock is far past the stale window, the abandoned lock is reclaimable.
   const future = Date.now() + 60 * 60_000;
   const handle = await acquireInstallLock(lockPath, { now: () => future, waitMs: 40, pollMs: 5 });
-  assert.ok(handle.acquired, 'mtime-stale lock reclaimed');
+  assert.ok(handle.acquired, 'abandoned unparseable lock reclaimed past the stale window');
   releaseInstallLock(handle);
+});
+
+test(
+  'acquireInstallLock: an unreadable, backdated lock still respects waitMs and rejects — no sleepless spin',
+  {
+    // chmod 0o000 does not block root reads, so the EACCES path this exercises
+    // cannot arise as root — skip rather than false-pass.
+    skip:
+      typeof process.getuid === 'function' && process.getuid() === 0
+        ? 'requires non-root: chmod 0o000 must actually block reads'
+        : false,
+  },
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
+    const lockPath = join(dir, 'add.lock');
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+
+    // Backdate mtime past the stale window, then make the file unreadable:
+    // statSync still succeeds (dir perms), but readFileSync EACCES → raw null →
+    // lockIsStale's case-4 age path judges it stale. Regression: the re-verify
+    // branch used to `continue` on the null re-read, bypassing BOTH the deadline
+    // check and the poll sleep — a synchronous, sleepless busy-loop that starved
+    // the event loop and never enforced waitMs. It must now poll and time out.
+    const anHourAgo = new Date(Date.now() - 60 * 60_000);
+    utimesSync(lockPath, anHourAgo, anHourAgo);
+    chmodSync(lockPath, 0o000);
+    try {
+      await assert.rejects(
+        acquireInstallLock(lockPath, { waitMs: 40, pollMs: 5 }),
+        /timed out waiting after/,
+      );
+    } finally {
+      chmodSync(lockPath, 0o600); // restore so mkdtemp teardown can remove it
+    }
+  },
+);
+
+test('acquireInstallLock: an out-of-range startedAt yields the clean timeout message, not a RangeError', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
+  const lockPath = join(dir, 'add.lock');
+  // Lock content is untrusted: a finite startedAt outside the ECMAScript Date
+  // range would make `new Date(startedAt).toISOString()` throw RangeError while
+  // building the timeout message. A live same-host holder so the message path
+  // is reached; the offending value must be omitted, not blow up.
+  const payload = JSON.stringify({
+    pid: process.pid,
+    startedAt: 1e30,
+    token: 'e'.repeat(32),
+    host: hostname(),
+  });
+  writeFileSync(lockPath, payload);
+
+  await assert.rejects(
+    acquireInstallLock(lockPath, { waitMs: 40, pollMs: 5 }),
+    (err) =>
+      err instanceof Error &&
+      !(err instanceof RangeError) &&
+      !/Invalid time value/.test(err.message) &&
+      /another owenloop add is in progress.*timed out waiting after/.test(err.message),
+  );
+  assert.equal(readFileSync(lockPath, 'utf8'), payload, 'live holder lock untouched after refusal');
 });
 
 // ---- REL-3: staged install, atomic commit, rollback --------------------------

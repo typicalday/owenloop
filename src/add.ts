@@ -23,7 +23,8 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { hostname } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 /** Max length for an in-archive relative path we are willing to join and write. */
@@ -507,12 +508,27 @@ const LOCK_POLL_MS = 100;
 export interface InstallLockHandle {
   lockPath: string;
   acquired: boolean;
+  /** Per-acquisition ownership token — present when `acquired`; proof of ownership for release. */
+  token?: string;
+}
+
+/** Parsed shape of a lock-file payload. Every field is optional so a legacy or partial payload still parses. */
+interface LockHolder {
+  pid?: number;
+  startedAt?: number;
+  token?: string;
+  host?: string;
 }
 
 export interface AcquireLockOpts {
   /** Max time to wait for a live lock before failing cleanly (default 10s). */
   waitMs?: number;
-  /** A lock older than this (by mtime) is reclaimed even if its pid looks live (default 10m). */
+  /**
+   * Age (by mtime) past which an *unparseable/abandoned* lock may be reclaimed
+   * (default 10m). Age NEVER reclaims a lock whose recorded pid is alive on
+   * this host — it only governs the fail-closed fallback for a lock we cannot
+   * attribute to a live owner (unparseable payload, or one without a pid).
+   */
   staleMs?: number;
   /** Poll interval while waiting on a live lock (default 100ms). */
   pollMs?: number;
@@ -520,6 +536,8 @@ export interface AcquireLockOpts {
   isPidAlive?: (pid: number) => boolean;
   /** Clock — injectable so tests are deterministic. */
   now?: () => number;
+  /** Current hostname — injectable so cross-host tests are deterministic (default `os.hostname`). */
+  hostname?: () => string;
 }
 
 /** `true` if a process with `pid` exists (signal 0 probes without delivering). */
@@ -534,24 +552,52 @@ function defaultIsPidAlive(pid: number): boolean {
   }
 }
 
-function readLockHolder(lockPath: string): { pid?: number; startedAt?: number } | null {
+/** Read the lock file's raw bytes, or `null` if it is gone/unreadable. */
+function readLockRaw(lockPath: string): string | null {
   try {
-    return JSON.parse(readFileSync(lockPath, 'utf8'));
+    return readFileSync(lockPath, 'utf8');
   } catch {
     return null;
   }
 }
 
+/** Parse raw lock bytes into a holder, or `null` if absent/unparseable. */
+function parseLockHolder(raw: string | null): LockHolder | null {
+  if (raw === null) return null;
+  try {
+    return JSON.parse(raw) as LockHolder;
+  } catch {
+    return null;
+  }
+}
+
+/** Read + parse the lock file in one step (fresh read). Used off the hot loop. */
+function readLockHolder(lockPath: string): LockHolder | null {
+  return parseLockHolder(readLockRaw(lockPath));
+}
+
 /**
- * A held lock is stale (safe to reclaim) if: its holder pid is dead; OR its
- * file mtime is past the stale window; OR its contents are unparseable AND it
- * is past the stale window. A parseable, live, recent lock is NOT stale.
+ * Decide whether the lock described by `holder` (parsed from a raw read) may be
+ * reclaimed, given the current host. Liveness-aware, not age-based:
+ *
+ *   1. `statSync` fails — the lock vanished mid-judgment → treat as reclaimable
+ *      (the acquire loop re-verifies and simply retries the exclusive create).
+ *   2. Holder records a `host` that differs from ours → NOT stale, ever. A
+ *      foreign PID space means `process.kill(pid, 0)` proves nothing; a shared
+ *      filesystem could be locked by another machine. Held; caller refuses.
+ *   3. Holder has a numeric `pid` and either matches our host or omits `host`
+ *      (a legacy same-machine payload) → stale iff that pid is dead. Age never
+ *      reclaims a live-pid lock — this is the core safety policy.
+ *   4. Unparseable, or parses without a numeric pid → fail closed: held until
+ *      `now() - mtimeMs > staleMs` (age is the only abandonment signal left).
  */
 function lockIsStale(
   lockPath: string,
+  holder: LockHolder | null,
   staleMs: number,
   isPidAlive: (pid: number) => boolean,
   now: () => number,
+  currentHost: string,
 ): boolean {
   let mtimeMs: number;
   try {
@@ -560,19 +606,26 @@ function lockIsStale(
     // Vanished between the EEXIST and here — someone else reclaimed it; retry.
     return true;
   }
-  const holder = readLockHolder(lockPath);
-  const past = now() - mtimeMs > staleMs;
-  if (holder && typeof holder.pid === 'number') {
-    return !isPidAlive(holder.pid) || past;
+  // Case 2: recorded on a different host — its pid tells us nothing. Held.
+  if (holder && typeof holder.host === 'string' && holder.host !== currentHost) {
+    return false;
   }
-  return past;
+  // Case 3: same host (or legacy no-host payload) with a numeric pid — liveness decides.
+  if (holder && typeof holder.pid === 'number') {
+    return !isPidAlive(holder.pid);
+  }
+  // Case 4: no attributable live owner — age is the only abandonment signal.
+  return now() - mtimeMs > staleMs;
 }
 
 /**
  * Acquire the per-project install lock at `lockPath` (an exclusive-create of the
- * file). If another process holds it: reclaim it if stale, otherwise poll until
- * it frees, and if it does not free within `waitMs` fail cleanly with a clear
- * message. Always pair with `releaseInstallLock` in a `finally`.
+ * file, `openSync(..,'wx')` — the O_EXCL create is the real serialization point).
+ * The payload carries an ownership token, the owner pid, a start timestamp, and
+ * the host. If another process holds it: reclaim it only when liveness-aware
+ * staleness says its owner is gone (see `lockIsStale`), otherwise poll until it
+ * frees, and if it does not free within `waitMs` fail cleanly with a clear
+ * in-progress message. Always pair with `releaseInstallLock` in a `finally`.
  */
 export async function acquireInstallLock(
   lockPath: string,
@@ -583,38 +636,85 @@ export async function acquireInstallLock(
   const pollMs = opts.pollMs ?? LOCK_POLL_MS;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
   const now = opts.now ?? Date.now;
+  const host = (opts.hostname ?? hostname)();
 
   mkdirSync(dirname(lockPath), { recursive: true });
   const deadline = now() + waitMs;
   for (;;) {
     try {
       const fd = openSync(lockPath, 'wx');
+      const token = randomBytes(16).toString('hex');
       try {
-        writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: now() }));
+        writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: now(), token, host }));
       } finally {
         closeSync(fd);
       }
-      return { lockPath, acquired: true };
+      return { lockPath, acquired: true, token };
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
     }
-    if (lockIsStale(lockPath, staleMs, isPidAlive, now)) {
-      rmSync(lockPath, { force: true });
-      continue; // reclaimed — retry the exclusive create
+    // Judge staleness from a single captured raw read...
+    const raw = readLockRaw(lockPath);
+    const holder = parseLockHolder(raw);
+    if (lockIsStale(lockPath, holder, staleMs, isPidAlive, now, host)) {
+      // ...then re-verify the bytes are unchanged immediately before deleting.
+      // Between judging stale and rmSync a third process could reclaim and
+      // re-create the lock; deleting then would destroy a *fresh* owner's lock.
+      // Residual window is a few syscalls (read-compare-delete) rather than the
+      // poll interval — and the `wx` create below is the true arbiter: if two
+      // reclaimers race, one wins the create and the other loops on EEXIST. A
+      // rename-based reclaim was rejected: POSIX rename clobbers its target, so
+      // any "rename back on mismatch" arm can itself destroy a newer lock.
+      const raw2 = readLockRaw(lockPath);
+      if (raw2 !== null && raw2 === raw) {
+        rmSync(lockPath, { force: true });
+        continue; // reclaimed — retry the exclusive create
+      }
+      // Bytes changed under us, or the lock is stat-able but unreadable (a
+      // root-owned 0600 lock: statSync needs only dir perms, readFileSync
+      // EACCES → raw/raw2 null). Do NOT delete — fall through to the deadline
+      // check and poll sleep below. Never `continue` here: with an unreadable,
+      // backdated lock this branch would otherwise spin sleeplessly, starving
+      // the event loop and never enforcing `waitMs`.
     }
     if (now() >= deadline) {
-      const holder = readLockHolder(lockPath);
-      const who = typeof holder?.pid === 'number' ? `pid ${holder.pid}` : 'another process';
-      throw new Error(
-        `another owenloop add (${who}) holds ${lockPath}; timed out waiting after ${Math.round(waitMs / 1000)}s`,
-      );
+      throw new Error(inProgressMessage(lockPath, holder, waitMs));
     }
     await sleep(pollMs);
   }
 }
 
-/** Release a lock acquired by `acquireInstallLock`. A no-op if not acquired. */
+/** Build the clear "another add is in progress" timeout error, with graceful fallbacks. */
+function inProgressMessage(lockPath: string, holder: LockHolder | null, waitMs: number): string {
+  const who = typeof holder?.pid === 'number' ? `pid ${holder.pid}` : 'another process';
+  // Lock content is untrusted input: a finite `startedAt` outside the ECMAScript
+  // Date range (|t| > 8.64e15 ms) makes `new Date(t).toISOString()` throw
+  // RangeError. Only render held-since when the value is a valid time value;
+  // otherwise omit it (same graceful fallback as an absent startedAt).
+  const heldSince =
+    typeof holder?.startedAt === 'number' &&
+    Number.isFinite(holder.startedAt) &&
+    Math.abs(holder.startedAt) <= 8.64e15
+      ? `, held since ${new Date(holder.startedAt).toISOString()}`
+      : '';
+  const s = Math.round(waitMs / 1000);
+  return `another owenloop add is in progress (${who}${heldSince}) — holds ${lockPath}; timed out waiting after ${s}s`;
+}
+
+/**
+ * Release a lock acquired by `acquireInstallLock`. Token-checked and
+ * best-effort: a no-op if not acquired, if the lock is already gone/unparseable,
+ * or if its token no longer matches this handle (someone else legitimately
+ * re-acquired it — deleting would steal *their* lock). Never throws; it runs in
+ * `dispatchAdd`'s `finally` and must not mask the real error.
+ */
 export function releaseInstallLock(handle: InstallLockHandle): void {
   if (!handle.acquired) return;
-  rmSync(handle.lockPath, { force: true });
+  try {
+    const holder = readLockHolder(handle.lockPath);
+    if (!holder || holder.token !== handle.token) return;
+    rmSync(handle.lockPath, { force: true });
+  } catch {
+    // Already reclaimed/replaced, or an unexpected fs error — swallow.
+  }
 }
