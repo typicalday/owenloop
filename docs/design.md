@@ -60,7 +60,11 @@ SQLite keeps `artifact` as the compact current-state projection used by the
 scheduler. In addition, every newly produced positive version is captured once
 in immutable `artifact_version` (payload, fingerprint, producer, initial
 acceptance, and time), while `artifact_event` is an append-only, version-addressed
-lifecycle stream. `Store.getArtifactHistory(workflow, path)` is deliberately a
+lifecycle stream. Re-persisting a semantically identical artifact state appends no
+event: change-detection is structural (a canonical, key-order-independent
+comparison of the artifact's semantic fields), so `artifact_event` stays a true
+audit stream rather than growing on order-only or no-op rewrites.
+`Store.getArtifactHistory(workflow, path)` is deliberately a
 narrow, lazy read; normal artifact/status listing does not load it. Intentional
 artifact or workflow deletion also removes its history, so active instances retain
 history but cleanup leaves no orphan audit rows. Upgrading legacy databases can
