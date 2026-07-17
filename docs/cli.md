@@ -6,7 +6,10 @@ in-process equivalent — see [`docs/embedding.md`](embedding.md).
 
 Global flags: `--db <path>` (env `OWENLOOP_DB`, default `.owenloop/state.db`) and
 `--defs <dir>` (env `OWENLOOP_DEFS`, default `./workflows`). Nothing is
-remembered between invocations — pass both on every command.
+remembered between invocations — pass both on every command. Opening the
+**default** db path refuses a symlinked `.owenloop` directory rather than
+following it (filesystem-isolation guard against a hostile checkout); an
+explicit `--db`/`OWENLOOP_DB` is operator intent and is created as-is.
 
 Boolean flags (`--force`, `--dry-run`, `--all`, `--open`, `--terminal`,
 `--recursive`, `--with-token`, `--shallow`, `--assume-provided`, and the bare
@@ -226,6 +229,11 @@ publishes to, after re-verifying the stored credential against `GET
 as `login`; re-connecting to the **same** origin reports no `switchedFrom`,
 switching to a **different** hub reports `switchedFrom: <old origin>` and
 rebinds the project to the new one.
+
+A symlinked project `.owenloop` directory is refused with a clear error rather
+than followed: a hostile checkout cannot ship `.owenloop -> /elsewhere` to
+redirect the `hub.json` write outside the project (filesystem-isolation
+guarantee).
 
 ### `push` — publish local defs to the bound hub
 

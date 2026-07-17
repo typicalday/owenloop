@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detId, randId, parseDurationMs, parseDurationSecs, localMidnightMs } from '../src/util.ts';
+import { existsSync, lstatSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { detId, randId, mkdirRefusingSymlink, parseDurationMs, parseDurationSecs, localMidnightMs } from '../src/util.ts';
 
 test('detId is deterministic in its parts and namespaced by prefix', () => {
   assert.equal(detId('art', 'wf1', 'plan'), detId('art', 'wf1', 'plan'), 'same parts → same id');
@@ -56,4 +59,36 @@ test('localMidnightMs: local semantics are a documented tradeoff, not an oversig
   // §12.3 for the DST / multi-host caveats this implies.
   const now = new Date(2026, 0, 1, 0, 0, 0, 0).getTime(); // exact local midnight
   assert.equal(localMidnightMs(now), now, 'exact midnight maps to itself');
+});
+
+// ---- SEC-3: mkdirRefusingSymlink (parent-directory symlink guard) -----------
+
+test('mkdirRefusingSymlink: fresh-create, no-op on real dir, refuses dangling symlink and plain-file component', () => {
+  const base = mkdtempSync(join(tmpdir(), 'owenloop-mkguard-'));
+
+  // Fresh create (missing) → creates it (recursively).
+  const fresh = join(base, 'a', '.owenloop');
+  mkdirRefusingSymlink(fresh);
+  assert.equal(lstatSync(fresh).isDirectory(), true, 'fresh dir created');
+
+  // Pre-existing real dir → no-op, still a dir.
+  mkdirRefusingSymlink(fresh);
+  assert.equal(lstatSync(fresh).isDirectory(), true, 'no-op on an existing real dir');
+
+  // Dangling symlink → refused (recursive mkdir would otherwise CREATE the target).
+  const dangling = join(base, 'dangling');
+  symlinkSync(join(base, 'does-not-exist'), dangling);
+  assert.throws(() => mkdirRefusingSymlink(dangling), /refusing to write under .*symbolic link/);
+  assert.equal(existsSync(join(base, 'does-not-exist')), false, 'dangling link target was not created');
+
+  // Symlink-to-directory → refused (the core hole: recursive mkdir succeeds silently).
+  const realTarget = mkdtempSync(join(tmpdir(), 'owenloop-mkguard-target-'));
+  const linkToDir = join(base, 'linkdir');
+  symlinkSync(realTarget, linkToDir);
+  assert.throws(() => mkdirRefusingSymlink(linkToDir), /refusing to write under .*symbolic link/);
+
+  // Plain-file component → clear "not a directory" error, not a raw ENOTDIR.
+  const plainFile = join(base, 'afile');
+  writeFileSync(plainFile, 'x');
+  assert.throws(() => mkdirRefusingSymlink(plainFile), /refusing to write under .*not a directory/);
 });

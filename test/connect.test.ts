@@ -6,7 +6,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { hubBindingPath, readHubBinding, writeHubBinding } from '../src/hub.ts';
 import type { Credential, HubBinding } from '../src/hub.ts';
 import { mainAsync } from '../src/cli.ts';
@@ -127,4 +129,22 @@ test('connect: a 401 from whoami errors cleanly and writes no hub.json', async (
   const code = await mainAsync(['connect', '--hub', ORIGIN], t.io);
   assert.equal(code, 1);
   assert.equal(readHubBinding(hubBindingPath(t.cwd)), null, 'no hub.json written on a failed verify');
+});
+
+test('SEC-3: connect in a hostile checkout refuses a symlinked `.owenloop`, leaving the link target untouched', async () => {
+  const { fetch } = routedFetch({ 'GET /api/whoami': verifyOk });
+  const t = makeIo({ fetch });
+  t.store.set(ORIGIN, JSON.stringify(OAUTH_CRED));
+
+  // A hostile checkout ships `.owenloop -> /elsewhere`; connect must refuse the
+  // write rather than redirecting hub.json outside the project.
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-connect-elsewhere-'));
+  symlinkSync(elsewhere, join(t.cwd, '.owenloop'));
+
+  const code = await mainAsync(['connect', '--hub', ORIGIN], t.io);
+  assert.equal(code, 1, t.err.join('\n'));
+  const stderr = t.err.join('\n');
+  assert.match(stderr, /refusing to write under/);
+  assert.match(stderr, /symbolic link/);
+  assert.deepEqual(readdirSync(elsewhere), [], 'the symlink target directory gained no hub.json');
 });

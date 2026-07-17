@@ -23,7 +23,13 @@
  * caller-supplied `env` (HOME / XDG_CONFIG_HOME), never `process.env` directly,
  * so tests fixture `$HOME` and never touch ambient machine state. Both this
  * file and `.owenloop/hub.json` are written via `writeFileAtomic` — temp file
- * in the same dir + rename, refusing a symlinked destination (SEC-3).
+ * in the same dir + rename, refusing a symlinked destination (SEC-3). The
+ * parent-directory half of that guard is `mkdirRefusingSymlink` (in `util.ts`,
+ * so the core store factory can share it without core depending on this hub
+ * module): before creating the project `.owenloop` dir we refuse a symlinked
+ * `.owenloop` component, so a hostile checkout shipping `.owenloop -> /elsewhere`
+ * cannot redirect the write outside the project even though the final file
+ * itself is not (yet) a symlink.
  *
  * The server-parity def content hash (`hashDefForHub`) also lives here: it is a
  * hub-facing concern (reproducing owenloop-service's canonicalization for the
@@ -36,6 +42,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, 
 import { basename, dirname, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { hashDef, parseDef } from './defs.ts';
+import { mkdirRefusingSymlink } from './util.ts';
 
 // ---- server-parity def content hash ------------------------------------------
 
@@ -297,9 +304,13 @@ export function readHubBinding(path: string): HubBinding | null {
 }
 
 export function writeHubBinding(path: string, binding: HubBinding): void {
-  mkdirSync(dirname(path), { recursive: true });
-  // Atomic + symlink-refusing (SEC-3). Default mode — hub.json carries no
-  // secrets and is deliberately committable.
+  // Refuse a symlinked `.owenloop` parent (SEC-3, parent-directory half): a
+  // hostile checkout can ship `.owenloop -> /elsewhere` to redirect this write
+  // outside the project. Unconditional — this function only ever writes the
+  // project binding, so there is no operator-supplied override to honor.
+  mkdirRefusingSymlink(dirname(path));
+  // Atomic + symlink-refusing on the FILE (SEC-3). Default mode — hub.json
+  // carries no secrets and is deliberately committable.
   writeFileAtomic(path, `${JSON.stringify(binding, null, 2)}\n`);
 }
 

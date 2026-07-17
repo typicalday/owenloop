@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -1261,4 +1261,30 @@ test('tick is deep by default (surfaces calls: child orders); --shallow scopes t
   const deep = run('tick', parent).json();
   const childOrder = deep.orders.find((o: any) => o.workflow === child.id);
   assert.ok(childOrder, 'a deep tick surfaces an order from the spawned child instance');
+});
+
+// ---- SEC-3: openCtx default-db path refuses a symlinked `.owenloop` ----------
+
+test('SEC-3: default state.db under a symlinked `.owenloop` is refused; the link target gains no state.db', () => {
+  // No OWENLOOP_DB / --db → the db path is the built-in default cwd/.owenloop/state.db.
+  const { run, home } = makeCli({ setDbEnv: false });
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-clielsewhere-'));
+  symlinkSync(elsewhere, join(home, '.owenloop'));
+
+  const r = run('defs');
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.err, /refusing to write under/);
+  assert.match(r.err, /symbolic link/);
+  assert.deepEqual(readdirSync(elsewhere), [], 'the symlink target directory gained no state.db');
+});
+
+test('SEC-3: an explicit --db under a plain dir skips the guard even when `.owenloop` is a symlink', () => {
+  const { run, home } = makeCli({ setDbEnv: false });
+  // A symlinked `.owenloop` is present, but the operator points --db elsewhere.
+  symlinkSync(mkdtempSync(join(tmpdir(), 'owenloop-clielsewhere2-')), join(home, '.owenloop'));
+  const realDb = join(mkdtempSync(join(tmpdir(), 'owenloop-clidb-')), 'state.db');
+
+  const r = run('defs', '--db', realDb);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(existsSync(realDb), true, 'the explicit db path opened normally');
 });
