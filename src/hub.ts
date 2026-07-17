@@ -10,6 +10,15 @@
  * etc.) so this module stays trivially testable and `cli.ts` doesn't widen its
  * export surface.
  *
+ * The keychain backend selection and the read side of credential storage also
+ * live here (`defaultKeychain` / `resolveKeychain` / `credentialBackend` /
+ * `readStoredCredential`): the `security` shell-out is synchronous and
+ * injectable, so it stays consistent with this module's network-free, testable
+ * charter, and it lets the public barrel (`src/index.ts`) export a supported
+ * read-only `readStoredCredential` without pulling in `cli.ts` (which the
+ * core/hub boundary lint forbids). `cli.ts` keeps thin wrappers so there is one
+ * implementation of backend selection, not two.
+ *
  * `.owenloop/hub.json` is a pure binding (which hub this project publishes to)
  * — there is no client-side push ledger. `push` diffs local defs against the
  * server's own `hash` (`GET /api/workflows`, see `computeServerDiff`), and
@@ -37,6 +46,7 @@
  * lets `defs.ts` stay host/hub-agnostic.
  */
 
+import { execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
@@ -269,6 +279,138 @@ export function writeCredentialFile(path: string, file: CredentialFile): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
   writeFileAtomic(path, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
+}
+
+// ---- keychain backend + credential read --------------------------------------
+
+/**
+ * An OS keychain backend, keyed by hub origin (the `account`). The default
+ * implementation (macOS `security` generic passwords) is `defaultKeychain`;
+ * tests and embedding hosts inject their own. Never logs or echoes the secret.
+ */
+export interface Keychain {
+  get(account: string): string | null;
+  set(account: string, value: string): void;
+  delete(account: string): void;
+}
+
+const KEYCHAIN_SERVICE = 'owenloop-hub';
+
+/**
+ * The default macOS keychain backend (generic passwords under service
+ * `owenloop-hub`). The secret is fed through the `security -i` command stream on
+ * stdin, never as a `-w` argv value, so it never appears in `ps`/shell history.
+ * Returns `undefined` off macOS or when `OWENLOOP_NO_KEYCHAIN=1`, so callers
+ * fall back to the 0600 credential file.
+ */
+export function defaultKeychain(env: Record<string, string | undefined>): Keychain | undefined {
+  if (env.OWENLOOP_NO_KEYCHAIN === '1') return undefined;
+  if (process.platform !== 'darwin') return undefined;
+  return {
+    get(account: string): string | null {
+      try {
+        const out = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w'], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+        });
+        return out.replace(/\n$/, '');
+      } catch {
+        return null; // not found (errSecItemNotFound) — treated as "no credential"
+      }
+    },
+    set(account: string, value: string): void {
+      // `security -i` reads newline-terminated commands from stdin; the secret
+      // rides in that stdin stream (single-quoted), never on this process's argv.
+      const sq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+      const cmd = `add-generic-password -U -s ${sq(KEYCHAIN_SERVICE)} -a ${sq(account)} -w ${sq(value)}\n`;
+      execFileSync('security', ['-i'], { input: cmd, stdio: ['pipe', 'ignore', 'ignore'] });
+    },
+    delete(account: string): void {
+      try {
+        execFileSync('security', ['delete-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account], {
+          stdio: 'ignore',
+        });
+      } catch {
+        // Not found — already absent; a no-op delete is success.
+      }
+    },
+  };
+}
+
+/**
+ * Resolve the keychain backend for this env, honoring the hard override:
+ * `OWENLOOP_NO_KEYCHAIN=1` forces the file backend (`undefined`) EVEN when a
+ * keychain is injected; otherwise the injected backend wins, else the platform
+ * default.
+ */
+export function resolveKeychain(
+  env: Record<string, string | undefined>,
+  injected?: Keychain,
+): Keychain | undefined {
+  if (env.OWENLOOP_NO_KEYCHAIN === '1') return undefined;
+  return injected ?? defaultKeychain(env);
+}
+
+/**
+ * The credential backend, decided ONCE from env/config (`resolveKeychain`) and
+ * then used consistently for read and write. Deciding once — rather than
+ * per-operation — is the REL-6 fix: the old error-driven fallback let a write
+ * land in the file while a later read hit the (absent/stale) keychain, so a
+ * credential could shadow itself across backends.
+ */
+export type CredentialBackend = { kind: 'keychain'; kc: Keychain } | { kind: 'file' };
+
+export function credentialBackend(
+  env: Record<string, string | undefined>,
+  injected?: Keychain,
+): CredentialBackend {
+  const kc = resolveKeychain(env, injected);
+  return kc ? { kind: 'keychain', kc } : { kind: 'file' };
+}
+
+/** Options for `readStoredCredential`. */
+export interface ReadStoredCredentialOpts {
+  /** Environment to consult (OWENLOOP_NO_KEYCHAIN, HOME/XDG_CONFIG_HOME). Default: `process.env`. */
+  env?: Record<string, string | undefined>;
+  /** Injectable keychain backend (tests / embedding hosts). Ignored when OWENLOOP_NO_KEYCHAIN=1. */
+  keychain?: Keychain;
+}
+
+/**
+ * Read the stored hub credential for `origin` from the chosen backend ONLY —
+ * the supported, read-only programmatic surface (owenwork's CredentialReader
+ * seam wires to this once released). Secret hygiene is unchanged: this function
+ * never logs or echoes the returned credential, and there is deliberately no
+ * write/delete companion on the public surface.
+ *
+ * `origin` is normalized (idempotent on already-normalized input, so the CLI's
+ * pre-normalized callers are unaffected) so the account key matches what
+ * `login`/`connect` persisted; an invalid or plaintext-remote origin throws at
+ * normalization (SEC-2), exactly as the CLI would.
+ *
+ * Backend is selected once (`credentialBackend`). A keychain-backed read NEVER
+ * falls through to the file (that fallback was the REL-6 shadowing bug), and a
+ * corrupt keychain entry reads as absent (`null`) — never as a reason to
+ * consult the file. The file backend derives its path from the supplied `env`
+ * (HOME / XDG_CONFIG_HOME), never `process.env` directly, so a caller passing
+ * `opts.env` stays hermetic; only the top-level default falls back to
+ * `process.env`.
+ */
+export function readStoredCredential(origin: string, opts?: ReadStoredCredentialOpts): Credential | null {
+  const env = opts?.env ?? process.env;
+  const key = normalizeOrigin(origin);
+  const backend = credentialBackend(env, opts?.keychain);
+  if (backend.kind === 'keychain') {
+    const raw = backend.kc.get(key);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as Credential;
+    } catch {
+      return null; // corrupt entry — treat as absent; do NOT consult the file
+    }
+  }
+  const file = readCredentialFile(credentialFilePath(env));
+  return file.hubs[key] ?? null;
 }
 
 // ---- project → hub binding (.owenloop/hub.json) ------------------------------

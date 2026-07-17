@@ -36,7 +36,8 @@ export { Store, openStore, StoreVersionError } from './store.ts';
 export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
 
 export { buildDef, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
-export { hashDefForHub } from './hub.ts';
+export { hashDefForHub, normalizeOrigin, readStoredCredential } from './hub.ts';
+export type { Credential, Keychain, ReadStoredCredentialOpts } from './hub.ts';
 export type { DefLoadFailure } from './defs.ts';
 
 export {
