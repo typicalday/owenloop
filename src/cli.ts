@@ -1127,7 +1127,8 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const spec = need(args, 1, 'owner/repo[@ref]');
   const { owner, repo, ref } = parseRepoSpec(spec);
   const source = `${owner}/${repo}`;
-  const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
+  const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
+  const defsDir = defsOverride ?? join(io.cwd, 'workflows');
   const lockfilePath = join(io.cwd, '.owenloop', 'installed.json');
   const installLockPath = join(io.cwd, '.owenloop', 'add.lock');
   const fetchFn = io.fetch ?? globalThis.fetch;
@@ -1233,6 +1234,16 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const folder = installFolder(owner, repo);
   const stagingRoot = join(defsDir, STAGING_DIRNAME);
   const stagingDir = join(stagingRoot, randId('stg'));
+  // SEC-3, add's half: refuse a symlinked project `.owenloop` (the parent of
+  // add.lock and installed.json — always cwd-derived in add, no override
+  // exists) and a symlinked DEFAULT defs dir before any state write. Both must
+  // precede acquireInstallLock: `.owenloop` is written by the lock acquire and
+  // the ledger; defsDir is DELETED-through by the stale-staging rmSync below and
+  // then written by staging/commit. An explicit --defs/OWENLOOP_DEFS is operator
+  // intent, not repo content — deliberately installing through a symlink keeps
+  // today's behavior, matching the --db/OWENLOOP_DB rule.
+  mkdirRefusingSymlink(join(io.cwd, '.owenloop'));
+  if (defsOverride === undefined) mkdirRefusingSymlink(defsDir);
   const lock = await acquireInstallLock(installLockPath);
   // Set true only on a rollback double-fault, where the ONLY copy of the
   // previous content ends up parked under the staging root — then the `finally`
