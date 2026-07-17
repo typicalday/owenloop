@@ -795,11 +795,12 @@ export class Engine {
   /**
    * The seed/consistency invariant for a `calls:` step: every child input wired
    * from a parent gate artifact whose value is defined must currently deepEqual
-   * that gate value. Shared by STEP 5's re-provide condition and STEP 6's in-tx
-   * verify so the two can never drift — STEP 5 skips when the parent gate value
-   * is undefined (nothing to provide), and so does this. A mismatch means a
-   * re-provide is pending against the very gate a fresh fingerprint would claim,
-   * so publishing now would stamp a stale child value under a newer gate.
+   * that gate value. STEP 6's in-tx verify calls this; STEP 5's re-provide
+   * condition applies the same per-input invariant inline (mirrored, not a call
+   * here) — the two encode the same rule and must be kept in step by hand. Both
+   * skip when the parent gate value is undefined (nothing to provide). A mismatch
+   * means a re-provide is pending against the very gate a fresh fingerprint would
+   * claim, so publishing now would stamp a stale child value under a newer gate.
    */
   private childConsistentWithGate(parentArts: ArtifactMap, childArts: ArtifactMap, step: StepDef): boolean {
     for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
