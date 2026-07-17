@@ -154,12 +154,22 @@ export function readLockfile(path: string): Lockfile {
  * `renameSync` over the destination. A crash or a concurrent reader never sees
  * a half-written `installed.json` (rename is atomic within a directory), and
  * two racing writers can only ever leave a fully-formed file.
+ *
+ * If the final `renameSync` throws (EACCES, EISDIR on `path`, a full disk),
+ * the temp sibling is removed before the error propagates so a failed write
+ * cannot leak an `installed.json.tmp.<pid>` file. The original error is
+ * surfaced unchanged — never swallowed.
  */
 export function writeLockfile(path: string, lf: Lockfile): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp.${process.pid}`;
   writeFileSync(tmp, `${JSON.stringify(lf, null, 2)}\n`);
-  renameSync(tmp, path);
+  try {
+    renameSync(tmp, path);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
 }
 
 // ---- staging + atomic commit -----------------------------------------------
@@ -192,18 +202,70 @@ export function stageFiles(targetDir: string, files: Map<string, Uint8Array>): s
 }
 
 /**
- * Atomically swap a validated `stagingDir` into place at `defsDir/folder`,
- * rolling back to the previous install if the swap fails. Both dirs live on the
- * same filesystem by construction (staging is under `defsDir`), so the renames
- * are atomic and `EXDEV` is impossible. Sequence: back up any existing install
- * (rename dest → `<stagingDir>-old`) — if that fails nothing has changed;
- * rename staging → dest; on failure rename the backup back; on success drop the
- * backup.
+ * Thrown by `commitInstall` when the atomic swap fails AND the rollback of it
+ * fails too — a near-impossible same-filesystem double-fault. Carries the path
+ * where the previous version was left so the caller can preserve it (its
+ * `preservedAt` sits under the staging root, which the caller would otherwise
+ * clean up as debris). A distinguishable type so the caller can tell this
+ * "must-preserve" double-fault apart from an ordinary swap failure.
  */
-export function commitInstall(defsDir: string, folder: string, stagingDir: string): void {
+export class RollbackFailedError extends Error {
+  readonly preservedAt: string;
+  constructor(message: string, preservedAt: string) {
+    super(message);
+    this.name = 'RollbackFailedError';
+    this.preservedAt = preservedAt;
+  }
+}
+
+/**
+ * A handle to a committed-but-not-yet-finalized install, returned by
+ * `commitInstall`. The install directory already holds the NEW content, but the
+ * displaced previous install (and any migrated old-name dir) are RETAINED under
+ * the staging root — not yet discarded — so the caller can still roll the
+ * directory state back if a later step (the lockfile write) fails. The caller
+ * MUST eventually either `finalizeInstallCommit` (discard the retained dirs) or
+ * `rollbackInstallCommit` (restore the previous state). All retained/undo paths
+ * derive from `stagingDir`, so they live under `<defsDir>/.owenloop-staging/` —
+ * same filesystem (renames stay atomic), and the staging-root cleanup covers
+ * them.
+ */
+export interface InstallCommitHandle {
+  /** `defsDir/folder` — now holding the NEW content. */
+  dest: string;
+  /** `${stagingDir}-old` — the displaced previous dest, if one existed. */
+  backupDir?: string;
+  /** `${stagingDir}-undo` — where a rollback parks the new content before restoring. */
+  undoDir: string;
+  /** Set by `parkOldNameDir` when an old-naming dir was migrated off. */
+  oldName?: { originalPath: string; parkedAt: string };
+}
+
+/**
+ * Atomically swap a validated `stagingDir` into place at `defsDir/folder`,
+ * rolling back to the previous install if the swap itself fails. Both dirs live
+ * on the same filesystem by construction (staging is under `defsDir`), so the
+ * renames are atomic and `EXDEV` is impossible.
+ *
+ * Two-phase commit: unlike a one-shot swap, this does NOT delete the displaced
+ * previous install on success — it returns an {@link InstallCommitHandle} whose
+ * `backupDir` still holds it. The caller must then either
+ * {@link finalizeInstallCommit} (discard the backup, making the swap permanent)
+ * once its follow-on work — the lockfile write — has durably succeeded, or
+ * {@link rollbackInstallCommit} to restore the previous directory state if that
+ * work fails. This is what lets "commit the directory + write the lockfile" be
+ * one recoverable operation.
+ *
+ * Sequence: back up any existing install (rename dest → `<stagingDir>-old`) — if
+ * that fails nothing has changed; rename staging → dest; on failure rename the
+ * backup back (throwing {@link RollbackFailedError} if even that fails, so the
+ * caller can preserve the named copy).
+ */
+export function commitInstall(defsDir: string, folder: string, stagingDir: string): InstallCommitHandle {
   mkdirSync(defsDir, { recursive: true });
   const dest = join(defsDir, folder);
   const backupDir = `${stagingDir}-old`;
+  const undoDir = `${stagingDir}-undo`;
   let backedUp = false;
   if (existsSync(dest)) {
     // Ownership is verified by the caller before we get here. If this rename
@@ -219,16 +281,60 @@ export function commitInstall(defsDir: string, folder: string, stagingDir: strin
         renameSync(backupDir, dest);
       } catch (rollbackErr) {
         // Near-impossible (same dir, same fs), but if even the rollback fails,
-        // name the backup so the previous version is recoverable by hand.
-        throw new Error(
+        // name the backup so the previous version is recoverable by hand — and
+        // signal (via the type) that the caller must preserve it.
+        throw new RollbackFailedError(
           `install of '${folder}' failed and rollback failed too; ` +
             `previous version preserved at ${backupDir}: ${(rollbackErr as Error).message}`,
+          backupDir,
         );
       }
     }
     throw e;
   }
-  if (backedUp) rmSync(backupDir, { recursive: true, force: true });
+  return { dest, backupDir: backedUp ? backupDir : undefined, undoDir };
+}
+
+/**
+ * Migrate a source off its old `<owner>-<repo>` install directory by PARKING it
+ * (rename → `<stagingDir>-undo-oldname`) instead of deleting it, so a later
+ * rollback can put it back where the (still-unchanged) lockfile expects it.
+ * Records the move on `handle.oldName`. If the old dir does not exist on disk
+ * (the lockfile names a path that is already gone), records nothing — matching
+ * the previous `rmSync(..., { force: true })` tolerance of absence.
+ */
+export function parkOldNameDir(handle: InstallCommitHandle, defsDir: string, oldRelPath: string): void {
+  const originalPath = join(defsDir, oldRelPath);
+  if (!existsSync(originalPath)) return;
+  const parkedAt = `${handle.undoDir}-oldname`;
+  renameSync(originalPath, parkedAt);
+  handle.oldName = { originalPath, parkedAt };
+}
+
+/**
+ * Make the commit permanent: discard the retained previous install and any
+ * parked old-name dir. Call ONLY after the follow-on lockfile write has durably
+ * succeeded — this is the point of no return.
+ */
+export function finalizeInstallCommit(handle: InstallCommitHandle): void {
+  if (handle.backupDir) rmSync(handle.backupDir, { recursive: true, force: true });
+  if (handle.oldName) rmSync(handle.oldName.parkedAt, { recursive: true, force: true });
+}
+
+/**
+ * Undo a `commitInstall` (plus any `parkOldNameDir`), restoring the pre-commit
+ * directory state. Order matters:
+ *   1. park the new content out of `dest` (rename dest → undoDir) — for a fresh
+ *      install, this alone restores "nothing installed";
+ *   2. if a previous install was displaced, rename its backup back over `dest`;
+ *   3. if an old-name dir was parked, rename it back to where the lockfile says.
+ * The parked new content under `undoDir` is left for the caller's staging-root
+ * cleanup to dispose of. Any throw propagates to the caller.
+ */
+export function rollbackInstallCommit(handle: InstallCommitHandle): void {
+  renameSync(handle.dest, handle.undoDir);
+  if (handle.backupDir) renameSync(handle.backupDir, handle.dest);
+  if (handle.oldName) renameSync(handle.oldName.parkedAt, handle.oldName.originalPath);
 }
 
 // ---- per-project install lock ----------------------------------------------
