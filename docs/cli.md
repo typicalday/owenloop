@@ -32,6 +32,7 @@ positional or the next `--flag`, never consumed as this flag's argument. Use
 |---|---|
 | `defs` | list available workflow definitions |
 | `add <owner>/<repo>[@ref]` | fetch, validate, and install a repo's workflow defs from GitHub (public repos only) — see below |
+| `add --recover` | finish or undo a crash-interrupted install, offline — no network call — see below |
 | `login [--hub <url>] [--with-token]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
 | `push [<defName>...] [--force] [--dry-run]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
@@ -140,6 +141,20 @@ directory is expected is refused — any bad shape, mismatch, or contradictory
 on-disk state refuses with no filesystem mutation and leaves the journal in
 place as evidence. A rollback double fault likewise leaves the journal behind,
 so the next `add` retries the restore automatically before touching staging.
+
+`add --recover` runs that same recovery on demand, standalone, with **no
+network call** — for a machine that crashed mid-install and is still offline
+when you need the tree usable again, rather than waiting on the normal `add`
+path (which also recovers inline, but only after its SHA and tarball fetches).
+It takes no `<owner>/<repo>` argument — `add --recover acme/widgets` refuses
+rather than guessing whether you meant "recover then install" (that's just a
+plain `owenloop add acme/widgets`, which recovers inline anyway). It acquires
+the same `.owenloop/add.lock`, calls `recoverInterruptedInstall`, and prints
+one of three outcomes: `{"ok":true,"recovered":false,...}` when there was no
+journal to act on, or `{"ok":true,"recovered":true,"outcome":"rolled-forward"|"rolled-back",...}`
+when it finished or undid the interrupted install. A refusal (bad, mismatched,
+or contradictory journal) throws the same as the inline path: exit 1, nothing
+mutated, the journal left in place as evidence.
 
 The recovery guarantee covers *process* death — a crash, SIGKILL, or
 termination — not sudden power loss. Journal and lockfile writes are atomic

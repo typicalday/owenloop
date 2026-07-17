@@ -70,6 +70,7 @@ import {
   parseRepoSpec,
   readLockfile,
   recoverInterruptedInstall,
+  type RecoveryOutcome,
   releaseInstallLock,
   removeAddJournal,
   rollbackInstallCommit,
@@ -229,6 +230,10 @@ const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   'with-token',
   'dry-run',
   'force',
+  // `add --recover` takes NO value: `add --recover acme/widgets` must keep
+  // `acme/widgets` as a positional so the recover branch can refuse it, rather
+  // than binding it as `--recover`'s value and silently dropping it.
+  'recover',
 ]);
 
 function parseArgs(argv: string[]): Args {
@@ -488,6 +493,7 @@ Usage: owenloop <command> [args] [--db <path>] [--defs <dir>]
 Commands:
   defs                                   list available workflow definitions
   add <owner>/<repo>[@ref]               fetch, validate, and install a repo's workflow defs (public repos)
+  add --recover                          finish or undo a crash-interrupted install (offline; no network)
   login [--hub <url>] [--with-token]     authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
   logout [--hub <url>]                   delete the stored credential for a hub
   connect [--hub <url>]                  bind this project to a hub and verify the stored credential (whoami)
@@ -555,7 +561,7 @@ const cmdOpts = (...extra: string[]): ReadonlySet<string> => new Set<string>([..
 export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map<string, ReadonlySet<string>>([
   ['help', cmdOpts()],
   ['defs', cmdOpts()],
-  ['add', cmdOpts()],
+  ['add', cmdOpts('recover')],
   ['login', cmdOpts('hub', 'with-token')],
   ['logout', cmdOpts('hub')],
   ['connect', cmdOpts('hub')],
@@ -1370,6 +1376,12 @@ function tarballMaxBytes(io: CliIO): number {
  * (and, via `preserveStagingRoot`, without the `finally` clearing the evidence).
  */
 async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
+  // Offline crash-recovery branch. This sits at the VERY TOP — before `need`/
+  // `parseRepoSpec` and before either network fetch — so `--recover` is
+  // structurally incapable of reaching the SHA/tarball fetches. A machine that
+  // crashed mid-install and is now offline can finish or undo the interrupted
+  // install with no network (recovery is purely local filesystem work).
+  if (flag(args, 'recover')) return dispatchAddRecover(io, args);
   const spec = need(args, 1, 'owner/repo[@ref]');
   const { owner, repo, ref } = parseRepoSpec(spec);
   const source = `${owner}/${repo}`;
@@ -1751,6 +1763,81 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     // the user to recover (the next add clears it as debris). Then release the lock.
     if (!preserveStagingRoot) rmSync(stagingRoot, { recursive: true, force: true });
     releaseInstallLock(lock);
+  }
+}
+
+/**
+ * `owenloop add --recover`: an OFFLINE, network-free entry point to the same
+ * `recoverInterruptedInstall` the normal add path runs inline. `dispatchAdd`
+ * branches here at its very top, before `parseRepoSpec` and before the SHA and
+ * tarball fetches — so this path can never touch the network. The normal add
+ * path already runs recovery inline (belt-and-suspenders); this exists only so a
+ * machine that crashed mid-install and is now offline can finish/undo the
+ * interrupted install without waiting for the network to return.
+ *
+ * The lock scope here is recovery-ONLY: acquire `.owenloop/add.lock`, run
+ * recovery, release. There is no fetch to keep outside the lock (the reason the
+ * normal path acquires the lock only after the download), so the whole
+ * short local operation runs under it. No `--db`/store open — recovery never
+ * reads the store. Refusals (bad/mismatched/contradictory journal) throw and
+ * propagate to `mainAsync`'s catch as `error: ...`, exit 1, mutating nothing —
+ * and unlike the inline path there is no `preserveStagingRoot` dance, because
+ * this path never rmSyncs the staging root itself, so a refusal naturally leaves
+ * the journal, staging root, and dest untouched as evidence.
+ */
+async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
+  // With --recover the owner/repo positional is optional; a supplied spec is
+  // ambiguous ("recover then install"?), so refuse rather than guess — the
+  // normal add path runs recovery inline anyway, so "recover then install" is
+  // just `owenloop add owner/repo`.
+  if (args.positionals[1] !== undefined) {
+    throw new CliError('--recover takes no repository argument — run recovery alone, then re-run add');
+  }
+
+  // Resolve paths EXACTLY as dispatchAdd does — same defsDir/lock/journal
+  // derivation — so recovery acts on the same tree a real add would. No fetch
+  // reference, no store open.
+  const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
+  const defsDir = defsOverride ?? join(io.cwd, 'workflows');
+  const lockfilePath = join(io.cwd, '.owenloop', 'installed.json');
+  const installLockPath = join(io.cwd, '.owenloop', 'add.lock');
+  const journalPath = join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME);
+
+  // Mirror the SEC-3 symlink guards from the normal path (same order, same
+  // rationale): `.owenloop` is written by the lock acquire; the default defsDir
+  // is mutated-through by recovery. An explicit --defs/OWENLOOP_DEFS is operator
+  // intent, not repo content, so it is not symlink-guarded (matching dispatchAdd).
+  mkdirRefusingSymlink(join(io.cwd, '.owenloop'));
+  if (defsOverride === undefined) mkdirRefusingSymlink(defsDir);
+
+  const lock = await acquireInstallLock(installLockPath);
+  let outcome: RecoveryOutcome;
+  try {
+    outcome = recoverInterruptedInstall({ defsDir, journalPath, lockfilePath });
+  } finally {
+    releaseInstallLock(lock);
+  }
+
+  switch (outcome) {
+    case 'no-journal':
+      print(io, { ok: true, recovered: false, message: 'nothing to recover — no interrupted install found' });
+      return 0;
+    case 'rolled-forward':
+      print(io, {
+        ok: true,
+        recovered: true,
+        outcome: 'rolled-forward',
+        message: 'interrupted install completed (rolled forward)',
+      });
+      return 0;
+    case 'rolled-back':
+      print(io, {
+        ok: true,
+        recovered: true,
+        outcome: 'rolled-back',
+        message: 'interrupted install undone — previous state restored (or already consistent)',
+      });
+      return 0;
   }
 }
 

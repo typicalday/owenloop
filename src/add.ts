@@ -952,6 +952,16 @@ export interface RecoverInterruptedInstallArgs {
 }
 
 /**
+ * What `recoverInterruptedInstall` DID, for callers (the offline `add --recover`
+ * entry point) that report the result to the user. A refusal is NOT an outcome —
+ * it throws. `'rolled-back'` collapses the roll-back table's terminal arms,
+ * including the touch-nothing / already-consistent ones (distinguishing
+ * "restored" from "was already consistent" per arm would thread state through
+ * the decision table for message cosmetics only).
+ */
+export type RecoveryOutcome = 'no-journal' | 'rolled-forward' | 'rolled-back';
+
+/**
  * Bring an interrupted install back to a consistent (defs ⇔ ledger) state, then
  * remove the journal. Called by `dispatchAdd` under the A3 install lock,
  * BEFORE the stale-staging cleanup (the backups a rollback needs live under the
@@ -994,10 +1004,10 @@ export interface RecoverInterruptedInstallArgs {
  * leaves the journal in place; `dispatchAdd` sets `preserveStagingRoot` so its
  * `finally` cannot then destroy the backups a later attempt needs.
  */
-export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): void {
+export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): RecoveryOutcome {
   const { defsDir, journalPath, lockfilePath } = args;
   const journal = readAddJournal(journalPath);
-  if (journal === null) return; // no interrupted install — happy path, unchanged.
+  if (journal === null) return 'no-journal'; // no interrupted install — happy path, unchanged.
 
   // An interrupted install in a DIFFERENT defs tree: recovering "here" would act
   // on paths this invocation was never pointed at, and trusting the recorded
@@ -1068,7 +1078,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 
   if (journal.phase === 'finalizing') {
     rollForward();
-    return;
+    return 'rolled-forward';
   }
 
   // phase === 'applying': the ledger write may or may not have landed. Read it
@@ -1093,7 +1103,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     //    disk, so branch on it rather than trusting the ledger match alone.
     if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
       rollForward();
-      return;
+      return 'rolled-forward';
     }
   }
 
@@ -1208,4 +1218,5 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
   // remove the journal LAST so a crash before this leaves everything replayable.
   rmSync(stagingRoot, { recursive: true, force: true });
   removeAddJournal(journalPath);
+  return 'rolled-back';
 }
