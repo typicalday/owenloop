@@ -33,7 +33,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -50,6 +50,7 @@ import { dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDuratio
 import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
 import {
   acquireInstallLock,
+  ADD_JOURNAL_FILENAME,
   archivePathViolation,
   commitInstall,
   finalizeInstallCommit,
@@ -59,14 +60,17 @@ import {
   parkOldNameDir,
   parseRepoSpec,
   readLockfile,
+  recoverInterruptedInstall,
   releaseInstallLock,
+  removeAddJournal,
   rollbackInstallCommit,
   RollbackFailedError,
   stageFiles,
   STAGING_DIRNAME,
+  writeAddJournal,
   writeLockfile,
 } from './add.ts';
-import type { InstalledEntry, InstallCommitHandle } from './add.ts';
+import type { AddJournal, InstalledEntry, InstallCommitHandle } from './add.ts';
 import {
   asCreateWorkflowOk,
   asWhoami,
@@ -1111,17 +1115,31 @@ function tarballMaxBytes(io: CliIO): number {
  * The network fetch/extract/path-filter runs FIRST, unlocked (a tarball can
  * take minutes and holding a lock that long would needlessly serialize
  * unrelated adds). Everything that touches project state then runs under the
- * per-project `.owenloop/add.lock`: stale-staging cleanup → lockfile read →
- * ownership check → stage → strict validation → atomic commit (backups
- * retained) → lockfile write → finalize (backups discarded). Deciding ownership
- * and reading the lockfile INSIDE the lock is deliberate (TOCTOU discipline —
- * see the store-migration knowledge node). The install is staged on the
- * destination filesystem and swapped in with an atomic rename, but the displaced
- * previous install and any old-name dir are kept until the lockfile write
- * succeeds — the directory commit and the ledger write are one recoverable
- * operation. Any failure before the lockfile is durably written rolls the
- * directory state back and leaves the previous install and lockfile exactly as
- * they were, with no staging debris.
+ * per-project `.owenloop/add.lock`: crash-recovery pass → stale-staging cleanup
+ * → lockfile read → ownership check → stage → strict validation → atomic commit
+ * (backups retained) → journal write → lockfile write → journal advance →
+ * finalize (backups discarded) → journal remove. Deciding ownership and reading
+ * the lockfile INSIDE the lock is deliberate (TOCTOU discipline — see the
+ * store-migration knowledge node). The install is staged on the destination
+ * filesystem and swapped in with an atomic rename, but the displaced previous
+ * install and any old-name dir are kept until the lockfile write succeeds — the
+ * directory commit and the ledger write are one recoverable operation. Any
+ * failure before the lockfile is durably written rolls the directory state back
+ * and leaves the previous install and lockfile exactly as they were, with no
+ * staging debris.
+ *
+ * A `.owenloop/add.journal` intent record closes the crash-recovery gap the
+ * in-process rollback arms can't: it is written (phase `applying`) right before
+ * the destructive `commitInstall`, advanced (phase `finalizing`) right after the
+ * durable ledger write, and removed on clean completion. A process killed
+ * mid-install leaves the journal behind; the NEXT add runs
+ * `recoverInterruptedInstall` FIRST inside the lock — before the stale-staging
+ * clear, since the backups a rollback needs live under the staging root — to
+ * roll the interrupted install forward (past the commit point) or back (before
+ * it) to a consistent (defs ⇔ ledger) state. The journal is attacker-
+ * influenceable input, validated fail-closed with the same A1 discipline as the
+ * lockfile; a bad/mismatched/contradictory journal REFUSES with no fs mutation
+ * (and, via `preserveStagingRoot`, without the `finally` clearing the evidence).
  */
 async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const spec = need(args, 1, 'owner/repo[@ref]');
@@ -1131,6 +1149,7 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const defsDir = defsOverride ?? join(io.cwd, 'workflows');
   const lockfilePath = join(io.cwd, '.owenloop', 'installed.json');
   const installLockPath = join(io.cwd, '.owenloop', 'add.lock');
+  const journalPath = join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME);
   const fetchFn = io.fetch ?? globalThis.fetch;
 
   // 1. Resolve the ref to a pinned commit sha.
@@ -1233,7 +1252,8 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   //    tarball download never blocks an unrelated add.
   const folder = installFolder(owner, repo);
   const stagingRoot = join(defsDir, STAGING_DIRNAME);
-  const stagingDir = join(stagingRoot, randId('stg'));
+  const stagingId = randId('stg');
+  const stagingDir = join(stagingRoot, stagingId);
   // SEC-3, add's half: refuse a symlinked project `.owenloop` (the parent of
   // add.lock and installed.json — always cwd-derived in add, no override
   // exists) and a symlinked DEFAULT defs dir before any state write. Both must
@@ -1250,6 +1270,19 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   // must NOT delete it (the error message tells the user to recover it).
   let preserveStagingRoot = false;
   try {
+    // Recover a crash-interrupted prior install FIRST — before the stale-staging
+    // clear, since the backups/parked dirs a rollback needs live UNDER the
+    // staging root, so clearing it first would destroy them. Any refusal (bad or
+    // mismatched or contradictory journal) must preserve the staging root and the
+    // journal as evidence: without this, the `finally` below would rmSync the
+    // staging root and take the backups a later recovery needs with it.
+    try {
+      recoverInterruptedInstall({ defsDir, journalPath, lockfilePath });
+    } catch (e) {
+      preserveStagingRoot = true;
+      throw e;
+    }
+
     // The lock holder is the only legitimate writer under the staging root, so
     // anything already there is debris from a crashed/killed prior run — clear
     // it. Keeps "no staging debris" true even across a Ctrl-C.
@@ -1356,6 +1389,30 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     //    then finalize (discard the retained backups). If the lockfile write
     //    fails after the swap, roll the directory state back so the previous
     //    install and lockfile are left exactly as they were.
+    //
+    // Write the crash-recovery journal (phase `applying`) BEFORE the first
+    // destructive step. `hadDest` is captured here, under the lock, right before
+    // commitInstall reads the same fact — so recovery knows whether a backup dir
+    // will exist. A migration off the old `<owner>-<repo>` name records that
+    // path so recovery can restore the parked old-name dir. If the process is
+    // killed anywhere past this point, the next add's recovery pass uses this
+    // record to roll forward or back.
+    const migratingOldName = existing !== undefined && existing.path !== folder;
+    const journalBase: AddJournal = {
+      version: 1,
+      phase: 'applying',
+      source,
+      sha,
+      folder,
+      stagingId,
+      hadDest: existsSync(dest),
+      ...(migratingOldName ? { oldNamePath: existing.path } : {}),
+      defsDir: resolve(defsDir),
+      ref,
+      startedAt: nowMs(),
+    };
+    writeAddJournal(journalPath, journalBase);
+
     let handle: InstallCommitHandle;
     try {
       handle = commitInstall(defsDir, folder, stagingDir);
@@ -1380,16 +1437,21 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
         } catch (rollbackErr) {
           // Double fault: parking the old dir failed AND restoring the directory
           // state failed. The previous content is now parked under the staging
-          // root — preserve it past the `finally` and tell the user how to
-          // recover, mirroring the lockfile-write double fault below.
+          // root — preserve it past the `finally` and LEAVE the journal (phase
+          // `applying`) so the next add's recovery retries the restore before
+          // anything clears the staging root, mirroring the lockfile-write double
+          // fault below.
           preserveStagingRoot = true;
           throw new CliError(
             `could not migrate ${source} off old-name directory '${existing.path}' (${(e as Error).message}) ` +
               `and rolling the install back failed too (${(rollbackErr as Error).message}); ` +
               `previous content preserved under ${stagingRoot} — recover it before running add again ` +
-              `(the next add clears that directory as debris)`,
+              `(the next owenloop add will attempt recovery automatically; leaving it, that dir is cleared as debris)`,
           );
         }
+        // Directory state restored in-process — nothing left to recover, so drop
+        // the journal before surfacing the (single-fault) failure.
+        removeAddJournal(journalPath);
         throw new CliError(
           `could not migrate ${source} off old-name directory '${existing.path}': ${(e as Error).message} — ` +
             `install rolled back, previous state restored`,
@@ -1407,21 +1469,32 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
       } catch (rollbackErr) {
         // Double fault: the ledger write failed AND restoring the directory
         // failed. The previous content is now parked under the staging root —
-        // preserve it past the `finally` and tell the user how to recover.
+        // preserve it past the `finally` and LEAVE the journal (phase
+        // `applying`, ledger not committed) so the next add's recovery restores
+        // the previous state before anything clears the staging root.
         preserveStagingRoot = true;
         throw new CliError(
           `could not record install of ${source} in ${lockfilePath} (${(e as Error).message}) ` +
             `and rolling the install back failed too (${(rollbackErr as Error).message}); ` +
             `previous content preserved under ${stagingRoot} — recover it before running add again ` +
-            `(the next add clears that directory as debris)`,
+            `(the next owenloop add will attempt recovery automatically; leaving it, that dir is cleared as debris)`,
         );
       }
+      // Directory state restored in-process — drop the journal before surfacing
+      // the (single-fault) failure.
+      removeAddJournal(journalPath);
       throw new CliError(
         `could not record install of ${source} in ${lockfilePath}: ${(e as Error).message} — ` +
           `install rolled back, previous state restored`,
       );
     }
+    // The ledger write is the durable commit point: past here a crash rolls
+    // FORWARD. Record that in the journal (phase `finalizing`) so recovery
+    // finishes the install rather than tearing it down, then finalize and drop
+    // the journal now that there is nothing left to recover.
+    writeAddJournal(journalPath, { ...journalBase, phase: 'finalizing' });
     finalizeInstallCommit(handle);
+    removeAddJournal(journalPath);
 
     // 7. Report.
     print(io, {
