@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
@@ -727,6 +727,67 @@ test('acquireInstallLock: an unparseable lock fails closed, then is reclaimed on
   const handle = await acquireInstallLock(lockPath, { now: () => future, waitMs: 40, pollMs: 5 });
   assert.ok(handle.acquired, 'abandoned unparseable lock reclaimed past the stale window');
   releaseInstallLock(handle);
+});
+
+test(
+  'acquireInstallLock: an unreadable, backdated lock still respects waitMs and rejects — no sleepless spin',
+  {
+    // chmod 0o000 does not block root reads, so the EACCES path this exercises
+    // cannot arise as root — skip rather than false-pass.
+    skip:
+      typeof process.getuid === 'function' && process.getuid() === 0
+        ? 'requires non-root: chmod 0o000 must actually block reads'
+        : false,
+  },
+  async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
+    const lockPath = join(dir, 'add.lock');
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+
+    // Backdate mtime past the stale window, then make the file unreadable:
+    // statSync still succeeds (dir perms), but readFileSync EACCES → raw null →
+    // lockIsStale's case-4 age path judges it stale. Regression: the re-verify
+    // branch used to `continue` on the null re-read, bypassing BOTH the deadline
+    // check and the poll sleep — a synchronous, sleepless busy-loop that starved
+    // the event loop and never enforced waitMs. It must now poll and time out.
+    const anHourAgo = new Date(Date.now() - 60 * 60_000);
+    utimesSync(lockPath, anHourAgo, anHourAgo);
+    chmodSync(lockPath, 0o000);
+    try {
+      await assert.rejects(
+        acquireInstallLock(lockPath, { waitMs: 40, pollMs: 5 }),
+        /timed out waiting after/,
+      );
+    } finally {
+      chmodSync(lockPath, 0o600); // restore so mkdtemp teardown can remove it
+    }
+  },
+);
+
+test('acquireInstallLock: an out-of-range startedAt yields the clean timeout message, not a RangeError', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
+  const lockPath = join(dir, 'add.lock');
+  // Lock content is untrusted: a finite startedAt outside the ECMAScript Date
+  // range would make `new Date(startedAt).toISOString()` throw RangeError while
+  // building the timeout message. A live same-host holder so the message path
+  // is reached; the offending value must be omitted, not blow up.
+  const payload = JSON.stringify({
+    pid: process.pid,
+    startedAt: 1e30,
+    token: 'e'.repeat(32),
+    host: hostname(),
+  });
+  writeFileSync(lockPath, payload);
+
+  await assert.rejects(
+    acquireInstallLock(lockPath, { waitMs: 40, pollMs: 5 }),
+    (err) =>
+      err instanceof Error &&
+      !(err instanceof RangeError) &&
+      !/Invalid time value/.test(err.message) &&
+      /another owenloop add is in progress.*timed out waiting after/.test(err.message),
+  );
+  assert.equal(readFileSync(lockPath, 'utf8'), payload, 'live holder lock untouched after refusal');
 });
 
 // ---- REL-3: staged install, atomic commit, rollback --------------------------

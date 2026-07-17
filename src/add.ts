@@ -666,9 +666,16 @@ export async function acquireInstallLock(
       // rename-based reclaim was rejected: POSIX rename clobbers its target, so
       // any "rename back on mismatch" arm can itself destroy a newer lock.
       const raw2 = readLockRaw(lockPath);
-      if (raw2 === null || raw2 !== raw) continue; // someone else acted — re-judge fresh
-      rmSync(lockPath, { force: true });
-      continue; // reclaimed — retry the exclusive create
+      if (raw2 !== null && raw2 === raw) {
+        rmSync(lockPath, { force: true });
+        continue; // reclaimed — retry the exclusive create
+      }
+      // Bytes changed under us, or the lock is stat-able but unreadable (a
+      // root-owned 0600 lock: statSync needs only dir perms, readFileSync
+      // EACCES → raw/raw2 null). Do NOT delete — fall through to the deadline
+      // check and poll sleep below. Never `continue` here: with an unreadable,
+      // backdated lock this branch would otherwise spin sleeplessly, starving
+      // the event loop and never enforcing `waitMs`.
     }
     if (now() >= deadline) {
       throw new Error(inProgressMessage(lockPath, holder, waitMs));
@@ -680,8 +687,14 @@ export async function acquireInstallLock(
 /** Build the clear "another add is in progress" timeout error, with graceful fallbacks. */
 function inProgressMessage(lockPath: string, holder: LockHolder | null, waitMs: number): string {
   const who = typeof holder?.pid === 'number' ? `pid ${holder.pid}` : 'another process';
+  // Lock content is untrusted input: a finite `startedAt` outside the ECMAScript
+  // Date range (|t| > 8.64e15 ms) makes `new Date(t).toISOString()` throw
+  // RangeError. Only render held-since when the value is a valid time value;
+  // otherwise omit it (same graceful fallback as an absent startedAt).
   const heldSince =
-    typeof holder?.startedAt === 'number'
+    typeof holder?.startedAt === 'number' &&
+    Number.isFinite(holder.startedAt) &&
+    Math.abs(holder.startedAt) <= 8.64e15
       ? `, held since ${new Date(holder.startedAt).toISOString()}`
       : '';
   const s = Math.round(waitMs / 1000);
