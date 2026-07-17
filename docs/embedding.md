@@ -262,6 +262,21 @@ all the shared types (`Order`, `CommitResult`, `WorkflowStatus`, `WorkflowDef`,
 `EngineEvent`, `EngineListener`, …). For most hosts, `createEngine` + the engine methods + the `Order` /
 `CommitResult` / `WorkflowStatus` types are the whole surface you need.
 
+The index also exports a **read-only credential surface** for hosts that need
+to read a stored hub credential through owenloop's own store logic instead of
+duplicating it: `readStoredCredential(origin, opts?)` returns the `Credential`
+for a hub origin (or `null` if none is stored), using the same backend
+selection as the CLI — macOS Keychain, or the `0600` credentials file
+elsewhere / with `OWENLOOP_NO_KEYCHAIN=1` (see
+[where the credential lands](cli.md#hub-login--connect--push--logout)). The
+backend is chosen once and a keychain-backed read never falls through to the
+file; a corrupt keychain entry reads as absent. The origin is normalized with
+the exported `normalizeOrigin` (invalid or plaintext-remote origins throw,
+exactly as in the CLI), and `ReadStoredCredentialOpts` lets tests and hosts
+inject `env` and a `Keychain` backend. The function never logs or echoes the
+secret, and there is deliberately no write or delete companion on the public
+surface — `login`/`logout` remain the only way to store or remove a credential.
+
 `SUPPORTED_ENGINE_VERSION` is the programmatic form of the design.md §27
 engine-version contract — the highest `engine:` a def may declare and still load.
 Tooling can preflight-check a def's `engine:` field against it before handing the
