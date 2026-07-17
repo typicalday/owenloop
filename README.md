@@ -371,7 +371,7 @@ goes into the macOS Keychain or a `0600` file, never the repo, and is verified
 against the hub before it's ever stored), `owenloop connect` binds the project
 to a hub, and `owenloop push` publishes your defs — idempotent against the
 hub's own def hashes, so an unchanged re-push is a no-op. See the
-[Hub](docs/cli.md#hub-login-connect-push-logout) section in `docs/cli.md`.
+[Hub](docs/cli.md#hub-login--connect--push--logout) section in `docs/cli.md`.
 
 ---
 
@@ -426,7 +426,7 @@ since. The changes that need operator or embedder attention:
 - **New network-facing commands and credential storage.** `owenloop login` /
   `connect` / `push` (and `add`, for installing shared defs) reach the network
   and store a credential in the macOS Keychain or a `0600` file — see the
-  [Hub](docs/cli.md#hub-login-connect-push-logout) section and the `add`
+  [Hub](docs/cli.md#hub-login--connect--push--logout) section and the `add`
   [trust model](docs/cli.md#add--installing-shared-workflow-defs-from-github).
 - **Max-lease cap is now opt-in.** There is no default lease ceiling; anyone who
   relied on the brief post-0.2.1 default cap must set `maxLeaseMs` (or a
