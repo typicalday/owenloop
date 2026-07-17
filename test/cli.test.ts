@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkS
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { main } from '../src/cli.ts';
+import { ASYNC_COMMANDS, COMMAND_OPTIONS, main, USAGE } from '../src/cli.ts';
 import { exampleDefNames } from './helpers.ts';
 
 const EXAMPLES = join(import.meta.dirname, '..', 'examples', 'workflows');
@@ -64,6 +64,80 @@ test('an unknown command exits 1 and echoes usage', () => {
   assert.equal(r.code, 1);
   assert.match(r.err, /unknown command: frobnicate/);
   assert.match(r.err, /Usage: owenloop/, 'usage is included to orient the user');
+});
+
+test('an unknown command is rejected BEFORE the state db is created', () => {
+  const { run, home } = makeCli({ setDbEnv: false });
+  const r = run('frobnicate');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /unknown command: frobnicate/);
+  assert.equal(existsSync(join(home, '.owenloop')), false, 'no .owenloop/ dir mkdir-ed for an unknown command');
+});
+
+// ---- unknown-option rejection (before any side effect) ----------------------
+
+test('a misspelled option on a sync command exits 1, names the offender, suggests the fix', () => {
+  const { run } = makeCli();
+  const r = run('green', 'wf_x', 'run_x', 'plan', '--terminl');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--terminl/, 'names the offending option');
+  assert.match(r.err, /--terminal/, 'suggests the nearest valid option');
+  assert.match(r.err, /valid options for 'green'/, 'lists the valid options');
+});
+
+test('a misspelled option is rejected BEFORE openCtx creates the state db', () => {
+  const { run, home } = makeCli({ setDbEnv: false });
+  const r = run('create', 'delivery', '--titel', 'x');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--titel/);
+  assert.match(r.err, /did you mean --title\?/);
+  assert.equal(existsSync(join(home, '.owenloop')), false, 'guard fires ahead of the .owenloop/ mkdir');
+});
+
+test('an unknown boolean-style option (no value) is still rejected', () => {
+  const { run } = makeCli();
+  const r = run('status', 'wf_x', '--verbse');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--verbse/);
+});
+
+test('every currently-valid flag combination is still accepted (over-rejection guard)', () => {
+  const { run } = makeCli({ defs: join(import.meta.dirname, 'fixtures') });
+  const wf = run('create', 'rate', '--provide', `seed=${J({})}`).json().workflow;
+  // multi-flag positive: --now / --shallow / repeated --label all pass the guard.
+  const r = run('tick', wf, '--now=1700000000000', '--shallow', '--label', 'a', '--label', 'b');
+  assert.equal(r.code, 0, r.err);
+  // --defs accepted (allowlisted globally) on a command that does not read it.
+  assert.equal(run('list', '--defs', 'unused-dir').code, 0, 'globals allowlisted everywhere');
+});
+
+test('cmd --help prints usage and exits 0 without doing the command (sync path)', () => {
+  const { run } = makeCli();
+  const r = run('list', '--help');
+  assert.equal(r.code, 0);
+  assert.match(r.out, /Usage: owenloop <command>/);
+});
+
+// ---- the option table is the single source of truth ------------------------
+
+test('COMMAND_OPTIONS covers exactly the commands USAGE advertises', () => {
+  // USAGE lists one command per "  <name>" line; help/--help/-h are dispatch
+  // entry points, not advertised verbs, but must still be table members so the
+  // help escape hatch and unknown-command detection agree.
+  const advertised = new Set(
+    USAGE.split('\n')
+      .map((l) => /^  ([a-z][a-z-]*)\b/.exec(l)?.[1])
+      .filter((x): x is string => x !== undefined),
+  );
+  const tableKeys = new Set(COMMAND_OPTIONS.keys());
+  tableKeys.delete('help'); // help is an entry point, not a USAGE line
+  assert.deepEqual([...tableKeys].sort(), [...advertised].sort());
+});
+
+test('every ASYNC_COMMANDS member has a COMMAND_OPTIONS entry (no unreachable async verb)', () => {
+  for (const cmd of ASYNC_COMMANDS) {
+    assert.ok(COMMAND_OPTIONS.has(cmd), `async command '${cmd}' must declare its options`);
+  }
 });
 
 test('opening a downgraded database via the CLI exits 1 with a clear stderr message', () => {
