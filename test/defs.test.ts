@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { parseProduce } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, DefError, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, validateDef } from '../src/defs.ts';
+import { buildDef, DefError, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, validateDef } from '../src/defs.ts';
 import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -579,6 +579,52 @@ test('loadDefFile and loadDefs read YAML from disk', () => {
 
   const all = loadDefs(dir);
   assert.deepEqual([...all.keys()], ['delivery']);
+});
+
+test('loadDefsUnfinalized: loadDefs(dir) deep-equals finalizeDefs(loadDefsUnfinalized(dir))', () => {
+  // The extraction (defs.ts: loadDefs === finalizeDefs(loadDefsUnfinalized(dir)))
+  // must be behavior-preserving. Build a dir with a top-level file AND a
+  // subdir workflow.yaml, then assert the two paths produce identical maps.
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-unfinal-'));
+  writeFileSync(
+    join(dir, 'delivery.yaml'),
+    [
+      'name: delivery',
+      'inputs:',
+      '  - name: proposal',
+      'steps:',
+      '  - name: planner',
+      '    consumes: [proposal]',
+      '    produces: [plan]',
+      '  - name: builder',
+      '    consumes: [plan]',
+      '    produces: [pr]',
+    ].join('\n'),
+  );
+  const sub = join(dir, 'nested');
+  mkdirSync(sub);
+  writeFileSync(
+    join(sub, 'workflow.yaml'),
+    ['name: nested', 'inputs:', '  - name: seed', 'steps:', '  - name: w', '    consumes: [seed]', '    produces: [out]'].join('\n'),
+  );
+
+  const viaLoadDefs = loadDefs(dir);
+  const viaExtraction = finalizeDefs(loadDefsUnfinalized(dir));
+  assert.deepEqual([...viaExtraction.keys()].sort(), [...viaLoadDefs.keys()].sort());
+  for (const name of viaLoadDefs.keys()) {
+    assert.deepEqual(viaExtraction.get(name), viaLoadDefs.get(name), `def '${name}' identical via both paths`);
+  }
+
+  // loadDefsUnfinalized scans the same files but does not throw on cross-def wiring.
+  assert.deepEqual([...loadDefsUnfinalized(dir).keys()].sort(), ['delivery', 'nested']);
+});
+
+test('loadDefsUnfinalized: throws on a duplicate name within one dir (same as loadDefs)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-defs-unfinal-dup-'));
+  const body = ['name: dup', 'inputs:', '  - name: seed', 'steps:', '  - name: w', '    consumes: [seed]', '    produces: [out]'].join('\n');
+  writeFileSync(join(dir, 'a.yaml'), body);
+  writeFileSync(join(dir, 'b.yaml'), body);
+  assert.throws(() => loadDefsUnfinalized(dir), /duplicate workflow name 'dup'/);
 });
 
 test('loadDefs: a shape error names the offending file', () => {
