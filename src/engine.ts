@@ -729,6 +729,21 @@ export class Engine {
         }
 
         // STEP 6 — MACHINE-GREEN or STAY OWED (M2B-CASCADEUP).
+        //
+        // The reads below are an OPTIMISTIC gate ONLY: they decide whether to
+        // *attempt* a publish or a re-arm — never what to publish. The write,
+        // and a re-read+re-verify of every input it depends on, happen together
+        // inside one BEGIN IMMEDIATE in the helper (publishCallsGreen /
+        // rearmCallsGreen). Under WAL + BEGIN IMMEDIATE no other connection can
+        // commit between that in-tx re-read and the write, so a cross-connection
+        // interleave — the parent gate advanced to a newer version, or the child
+        // outcome re-armed, between this stale pre-read and the write — is caught
+        // in-tx and the pass aborts (helper returns false, nothing written),
+        // deferring to the next tick. The published value, the gate fingerprint
+        // it claims, and the child-outcome pin therefore always come from ONE
+        // atomic snapshot. commit/settled events fire only when the helper wrote,
+        // so an aborted pass is silent to listeners.
+        //
         // Re-read after potential re-provide.
         childArts = this.artMap(existingChild.id);
         childOutcomeArt = childArts.get(childOutcomeStem);
@@ -748,60 +763,159 @@ export class Engine {
           // (propagated down, parent reopened to owed pinned to the rejected
           // child version) or a human skip (pinned at skip time) stand until
           // the child actually rebuilds past that pin, instead of being
-          // silently overridden on the very next tick.
+          // silently overridden on the very next tick. (Re-checked in-tx by
+          // the helper against the snapshot it commits under.)
           const pinnedVersion = parentCallsArt?.fingerprint?.[Engine.CHILD_OUTCOME_PIN_KEY];
           const pastPin = pinnedVersion === undefined || childOutcomeArt.version > pinnedVersion;
-          if ((!alreadyGreen || !sameValue) && pastPin) {
-            if (!parentCallsArt) continue; // not yet materialized by pendingOwed — skip
-            const gateArts = this.artMap(parentWf);
-            const fp = computeFingerprint(gateArts, gateStems);
-            fp[Engine.CHILD_OUTCOME_PIN_KEY] = childOutcomeArt.version;
-            const next: ArtifactData = {
-              ...parentCallsArt,
-              acceptance: 'green',
-              version: parentCallsArt.version + 1,
-              value: childOutcomeArt.value,
-              fingerprint: fp,
-            };
-            // Do NOT set terminal: calls: artifact must be re-armable if gate inputs move.
-            this.store.tx(() => {
-	      this.store.putArtifact({ ...next, workflow: parentWf }, {
-		action: 'provided', actor: 'engine', reason: 'child outcome provided',
-	      });
-              this.settle(parentWf, def, now);
-            });
-            this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'provide' });
-            this.fireSettled(parentWf);
+          if ((!alreadyGreen || !sameValue) && pastPin && parentCallsArt) {
+            // parentCallsArt truthy: not-yet-materialized (pendingOwed) → skip.
+            if (this.publishCallsGreen(
+              parentWf, def, step, callsStem, gateStems, existingChild.id, childOutcomeStem, now,
+            )) {
+              this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'provide' });
+              this.fireSettled(parentWf);
+            }
           }
         } else if (!isGreen(childOutcomeArt) && isGreen(parentCallsArt) && parentCallsArt) {
           // M2B-REARM: child's outcome is no longer green (e.g. re-provide re-armed it)
           // but the parent calls: artifact is still green. Re-arm it to owed so downstream
           // re-runs when the child completes again. This handles gate re-arm (test f):
           // the cascade can't detect this because deliver step has consumes: [].
-          this.store.tx(() => {
-            const artNow = this.store.getArtifact(parentWf, callsStem);
-            if (!artNow || !isGreen(artNow)) return; // already re-armed or gone
-            this.store.putArtifact({
-              ...artNow,
-              acceptance: 'owed',
-              reasons: [...artNow.reasons, {
-                at: nowMs(),
-                action: 'reopen' as const,
-                kind: 'structural' as const,
-                by: 'engine' as const,
-                text: 'gate input moved: child re-running',
-                fromVersion: artNow.version,
-              }],
-            });
-            this.settle(parentWf, def, now);
-          });
-          this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'retry' });
-          this.fireSettled(parentWf);
+          if (this.rearmCallsGreen(parentWf, def, callsStem, existingChild.id, childOutcomeStem, now)) {
+            this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'retry' });
+            this.fireSettled(parentWf);
+          }
         }
       }
     } finally {
       this._inMaintainCalls.delete(parentWf);
     }
+  }
+
+  /**
+   * The seed/consistency invariant for a `calls:` step: every child input wired
+   * from a parent gate artifact whose value is defined must currently deepEqual
+   * that gate value. Shared by STEP 5's re-provide condition and STEP 6's in-tx
+   * verify so the two can never drift — STEP 5 skips when the parent gate value
+   * is undefined (nothing to provide), and so does this. A mismatch means a
+   * re-provide is pending against the very gate a fresh fingerprint would claim,
+   * so publishing now would stamp a stale child value under a newer gate.
+   */
+  private childConsistentWithGate(parentArts: ArtifactMap, childArts: ArtifactMap, step: StepDef): boolean {
+    for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
+      const parentArt = parentArts.get(parentArtifactName);
+      if (parentArt?.value === undefined) continue;
+      const childInputArt = childArts.get(childInputName);
+      if (!deepEqual(parentArt.value, childInputArt?.value)) return false;
+    }
+    return true;
+  }
+
+  /**
+   * STEP 6 machine-green as an atomic snapshot-and-commit. maintainCalls'
+   * optimistic pre-reads decide only WHETHER to call this; the decision inputs
+   * are all re-read and re-verified here INSIDE the same BEGIN IMMEDIATE that
+   * performs the write, so the published value, the gate fingerprint it claims,
+   * and the child-outcome pin come from ONE snapshot. Any verify failing aborts
+   * the publish (returns false; the commit is a no-op — do NOT throw, there is
+   * nothing to roll back, and an abort must not record debt/reasons/fingerprint:
+   * the state is simply "not yet" and the next tick redoes the pass against
+   * fresh state). Returns true only when it actually wrote, so the caller fires
+   * commit/settled events only on a real publish.
+   */
+  private publishCallsGreen(
+    parentWf: string,
+    def: WorkflowDef,
+    step: StepDef,
+    callsStem: string,
+    gateStems: string[],
+    expectedChildId: string,
+    childOutcomeStem: string,
+    now?: number,
+  ): boolean {
+    return this.store.tx(() => {
+      const parentArts = this.artMap(parentWf);
+      const parentCallsArt = this.store.getArtifact(parentWf, callsStem);
+      // Vanished, or an F2 schema-reject debt landed since the pre-read → abort.
+      if (!parentCallsArt || parentCallsArt.acceptance === 'rejected') return false;
+
+      // Same child the optimistic read saw; a different id means the tree moved.
+      const child = this.store.findChildByParent(parentWf, callsStem);
+      if (!child || child.id !== expectedChildId) return false;
+
+      const childArts = this.artMap(child.id);
+      const childOutcomeArt = childArts.get(childOutcomeStem);
+      // Child re-armed between the pre-read and here → defer.
+      if (!childOutcomeArt || !isGreen(childOutcomeArt) || childOutcomeArt.value === undefined) return false;
+
+      // Gate still ready, and the child still consistent with the gate values
+      // the fingerprint is about to claim (the heart of the fix).
+      if (!this.callsGateReady(parentArts, step)) return false;
+      if (!this.childConsistentWithGate(parentArts, childArts, step)) return false;
+
+      // Idempotent no-op: another connection already published this exact value.
+      const alreadyGreen = isGreen(parentCallsArt);
+      if (alreadyGreen && deepEqual(childOutcomeArt.value, parentCallsArt.value)) return false;
+
+      // F4 version pin, recomputed from the in-tx child outcome version.
+      const pinnedVersion = parentCallsArt.fingerprint?.[Engine.CHILD_OUTCOME_PIN_KEY];
+      if (pinnedVersion !== undefined && childOutcomeArt.version <= pinnedVersion) return false;
+
+      const fp = computeFingerprint(parentArts, gateStems);
+      fp[Engine.CHILD_OUTCOME_PIN_KEY] = childOutcomeArt.version;
+      // Do NOT set terminal: calls: artifact must be re-armable if gate inputs move.
+      this.store.putArtifact({
+        ...parentCallsArt,
+        acceptance: 'green',
+        version: parentCallsArt.version + 1,
+        value: childOutcomeArt.value,
+        fingerprint: fp,
+      }, { action: 'provided', actor: 'engine', reason: 'child outcome provided' });
+      this.settle(parentWf, def, now);
+      return true;
+    });
+  }
+
+  /**
+   * STEP 6 re-arm as the mirror-image atomic guard. maintainCalls' optimistic
+   * pre-read decides only WHETHER to call this; the parent artifact AND the
+   * child outcome are re-read inside the write lock, and the re-arm happens only
+   * if the parent is still green AND the child outcome is still NOT green in-tx.
+   * If the child went green between the optimistic read and the tx, this does
+   * nothing (returns false) and the next maintainCalls pass publishes normally.
+   * Returns true only when it wrote.
+   */
+  private rearmCallsGreen(
+    parentWf: string,
+    def: WorkflowDef,
+    callsStem: string,
+    expectedChildId: string,
+    childOutcomeStem: string,
+    now?: number,
+  ): boolean {
+    return this.store.tx(() => {
+      const artNow = this.store.getArtifact(parentWf, callsStem);
+      if (!artNow || !isGreen(artNow)) return false; // already re-armed or gone
+      const child = this.store.findChildByParent(parentWf, callsStem);
+      if (!child || child.id !== expectedChildId) return false;
+      const childOutcomeArt = this.artMap(child.id).get(childOutcomeStem);
+      // Child went green in-tx → don't re-arm; let the green branch publish next pass.
+      if (isGreen(childOutcomeArt)) return false;
+      this.store.putArtifact({
+        ...artNow,
+        acceptance: 'owed',
+        reasons: [...artNow.reasons, {
+          at: nowMs(),
+          action: 'reopen' as const,
+          kind: 'structural' as const,
+          by: 'engine' as const,
+          text: 'gate input moved: child re-running',
+          fromVersion: artNow.version,
+        }],
+      });
+      this.settle(parentWf, def, now);
+      return true;
+    });
   }
 
   /**
