@@ -46,7 +46,7 @@ import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import { buildDef, DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
-import { detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
+import { dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
 import { extractTarGz } from './untar.ts';
 import {
   acquireInstallLock,
@@ -343,11 +343,16 @@ function openCtx(io: CliIO, args: Args): Ctx {
   const dbPath = dbOverride ?? join(io.cwd, '.owenloop', 'state.db');
   const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
   // Guard the built-in default (`cwd/.owenloop/state.db`) against a symlinked
-  // `.owenloop` from a hostile checkout (SEC-3). An explicit `--db`/`OWENLOOP_DB`
-  // comes from the operator, not the repo — deliberately pointing state through a
-  // symlinked dir is intent, so keep today's behavior for overrides.
-  if (dbOverride === undefined) mkdirRefusingSymlink(dirname(dbPath));
-  else mkdirSync(dirname(dbPath), { recursive: true });
+  // `.owenloop` from a hostile checkout (SEC-3). Directory guard first, then the
+  // file-level guard on `state.db` and its SQLite sidecars — a symlinked db file
+  // inside a REAL `.owenloop` would otherwise redirect writes SQLite follows. An
+  // explicit `--db`/`OWENLOOP_DB` comes from the operator, not the repo —
+  // deliberately pointing state through a symlink is intent, so keep today's
+  // behavior for overrides.
+  if (dbOverride === undefined) {
+    mkdirRefusingSymlink(dirname(dbPath));
+    dbPathRefusingSymlink(dbPath);
+  } else mkdirSync(dirname(dbPath), { recursive: true });
   const store = openStore(dbPath);
   const defs = existsSync(defsDir) ? loadDefs(defsDir) : new Map<string, WorkflowDef>();
   const engine = new Engine(store, (name) => {

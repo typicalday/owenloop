@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createEngine } from '../src/factory.ts';
@@ -102,6 +102,103 @@ test('SEC-3: createEngine with the default db path refuses a symlinked `.owenloo
   const realDb = join(mkdtempSync(join(tmpdir(), 'owenloop-factory-real-')), 'state.db');
   const { store } = createEngine({ db: realDb, defs: [tiny] });
   assert.ok(existsSync(realDb), 'explicit db path opened normally despite a hostile-looking cwd elsewhere');
+  store.close();
+});
+
+test('SEC-3: createEngine with the default db path refuses a symlinked `state.db` inside a real `.owenloop`; target untouched', () => {
+  // A REAL `.owenloop/` directory (so the parent-dir guard passes) but the
+  // db FILE is a symlink to a file elsewhere — opening it would follow the link.
+  const hostile = mkdtempSync(join(tmpdir(), 'owenloop-factory-dbsym-'));
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-factory-dbtarget-'));
+  const target = join(elsewhere, 'evil.db');
+  writeFileSync(target, 'original');
+  mkdirSync(join(hostile, '.owenloop'));
+  symlinkSync(target, join(hostile, '.owenloop', 'state.db'));
+
+  const prevCwd = process.cwd();
+  process.chdir(hostile);
+  try {
+    assert.throws(
+      () => createEngine({ defs: [tiny] }),
+      /refusing to write to .*state\.db: it is a symbolic link/,
+    );
+    assert.equal(readFileSync(target, 'utf8'), 'original', 'the symlink target was not written through');
+  } finally {
+    process.chdir(prevCwd);
+  }
+});
+
+test('SEC-3: createEngine refuses a DANGLING `state.db` symlink and does not create the target', () => {
+  const hostile = mkdtempSync(join(tmpdir(), 'owenloop-factory-dangling-'));
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-factory-danglingtgt-'));
+  const target = join(elsewhere, 'not-yet.db'); // does not exist
+  mkdirSync(join(hostile, '.owenloop'));
+  symlinkSync(target, join(hostile, '.owenloop', 'state.db'));
+
+  const prevCwd = process.cwd();
+  process.chdir(hostile);
+  try {
+    assert.throws(
+      () => createEngine({ defs: [tiny] }),
+      /refusing to write to .*state\.db: it is a symbolic link/,
+    );
+    assert.equal(existsSync(target), false, 'the dangling symlink target was not created');
+  } finally {
+    process.chdir(prevCwd);
+  }
+});
+
+test('SEC-3: createEngine refuses a symlinked WAL sidecar even when `state.db` is absent', () => {
+  // WAL/journal sidecars follow file symlinks too (node:sqlite passes no
+  // SQLITE_OPEN_NOFOLLOW), so a symlinked `state.db-wal` redirects writes.
+  const hostile = mkdtempSync(join(tmpdir(), 'owenloop-factory-wal-'));
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-factory-waltgt-'));
+  const target = join(elsewhere, 'evil.db-wal');
+  writeFileSync(target, 'original-wal');
+  mkdirSync(join(hostile, '.owenloop'));
+  symlinkSync(target, join(hostile, '.owenloop', 'state.db-wal'));
+
+  const prevCwd = process.cwd();
+  process.chdir(hostile);
+  try {
+    assert.throws(
+      () => createEngine({ defs: [tiny] }),
+      /refusing to write to .*state\.db-wal: it is a symbolic link/,
+    );
+    assert.equal(readFileSync(target, 'utf8'), 'original-wal', 'the WAL symlink target was not written through');
+  } finally {
+    process.chdir(prevCwd);
+  }
+});
+
+test('SEC-3: createEngine opens normally in a real `.owenloop` with no pre-existing db (happy path intact)', () => {
+  const clean = mkdtempSync(join(tmpdir(), 'owenloop-factory-clean-'));
+  mkdirSync(join(clean, '.owenloop'));
+
+  const prevCwd = process.cwd();
+  process.chdir(clean);
+  try {
+    const { engine, store } = createEngine({ defs: [tiny] });
+    assert.ok(existsSync(join(clean, '.owenloop', 'state.db')), 'default db created on the happy path');
+    const wf = engine.createInstance('tiny');
+    assert.ok(wf.startsWith('wf_'));
+    store.close();
+  } finally {
+    process.chdir(prevCwd);
+  }
+});
+
+test('SEC-3: an explicit db pointing AT a symlink still opens (override keeps current behavior)', () => {
+  // Operator intent: an explicit `db` bypasses the file guard, same carve-out
+  // the directory guard already makes for explicit paths.
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-factory-exptgt-'));
+  const realDb = join(elsewhere, 'real.db');
+  const linkDir = mkdtempSync(join(tmpdir(), 'owenloop-factory-explink-'));
+  const linkDb = join(linkDir, 'state.db');
+  symlinkSync(realDb, linkDb);
+
+  const { store } = createEngine({ db: linkDb, defs: [tiny] });
+  assert.ok(existsSync(realDb), 'explicit db symlink was followed (override behavior preserved)');
   store.close();
 });
 
