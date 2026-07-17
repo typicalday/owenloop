@@ -26,9 +26,28 @@ function packedFiles(): string[] {
     cwd: ROOT,
     encoding: 'utf8',
   });
-  const manifest = JSON.parse(out) as Array<{ files?: Array<{ path: string }> }>;
-  const files = manifest[0]?.files ?? [];
-  return files.map((f) => f.path.replace(/\\/g, '/'));
+  // The `pack --json` top level differs by npm major: npm <=11 emits an ARRAY
+  // of package manifests; npm 12 emits an OBJECT keyed by package name. The
+  // per-file entries ({ path, size, mode }) are identical either way — only the
+  // wrapper changed. Normalize to the single manifest entry without hardcoding
+  // the package name (it is keyed by name; a rename would break a literal key).
+  const parsed = JSON.parse(out) as unknown;
+  const entry = (
+    Array.isArray(parsed)
+      ? parsed[0]
+      : parsed && typeof parsed === 'object'
+        ? Object.values(parsed)[0]
+        : undefined
+  ) as { files?: Array<{ path: string }> } | undefined;
+  const files = (entry?.files ?? []).map((f) => f.path.replace(/\\/g, '/'));
+  // Fail loudly if the schema shifts again: an empty list would silently pass
+  // every "must NOT include X" assertion while only tripping the "must include"
+  // one. The raw-output snippet makes the next npm bump self-diagnosing.
+  assert.ok(
+    files.length > 0,
+    `npm pack --json returned no files — output schema likely changed again; raw output starts: ${out.slice(0, 200)}`,
+  );
+  return files;
 }
 
 test('npm pack includes everything a consumer needs', () => {
