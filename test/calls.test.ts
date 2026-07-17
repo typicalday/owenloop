@@ -1420,3 +1420,157 @@ test('calls: REL-5 — losing spawnChildIfAbsent re-attaches to the winner (crea
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- (13) REL-5: atomic snapshot-and-commit — the deep-tick stale-publish race
+//
+// The re-audit's cross-connection interleave: connection X's maintainCalls reads
+// the child outcome as green (v1) in its optimistic STEP-6 pre-read; connection Y
+// then advances the parent gate (sandbox → v2) and re-provides, which re-arms the
+// child outcome to owed; X must NOT go on to publish the parent `delivered`
+// artifact with the stale v1 child value under a fingerprint claiming the v2 gate,
+// and must NOT issue downstream (teardown) work off it. With the atomic
+// snapshot-and-commit fix, X's in-tx re-read sees the child re-armed and aborts the
+// publish, deferring to the next tick.
+//
+// Staging: `delivered` is kept OWED (never published) at interleave time — the
+// clean first-publish case where the F4 pin is undefined, so the optimistic gate
+// unconditionally attempts a publish. We reach "child result green, delivered
+// owed" by writing the child `result` green DIRECTLY via the store (as tests c/f
+// stage sandbox moves), bypassing engine.green so triggerParentIfChild does not
+// publish `delivered` for us.
+//
+// Interleave injection: X's optimistic STEP-6 pre-read calls
+// store.getArtifact(parentWf, 'delivered'). That path is read exactly twice per
+// maintainCalls pass before the write — once at STEP 2 (the F2 fingerprint guard)
+// and once at STEP 6 (the optimistic gate). We monkey-patch store1.getArtifact and
+// fire Y's mutations on the SECOND such read (the STEP-6 gate, after X has already
+// captured the child outcome as green v1) — a point where X holds NO transaction,
+// so Y's own BEGIN IMMEDIATE commits rather than blocking on busy_timeout.
+//
+// The re-arm branch's mirror (child goes green during X's re-arm pre-read window →
+// parent must not be re-armed) is verified by inspection of rearmCallsGreen's in-tx
+// isGreen re-check plus the existing test (f); staging it deterministically is
+// awkward, so it is intentionally not reproduced here.
+test('calls: REL-5 — atomic snapshot-and-commit defers a stale cross-connection publish', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-rel5-snapshot-'));
+  const dbPath = join(dir, 'concurrent.db');
+  try {
+    const byName = new Map([childDef, parentDef].map((d) => [d.name, d]));
+    const resolver = (name: string): WorkflowDef => {
+      const d = byName.get(name);
+      if (!d) throw new Error(`no def: ${name}`);
+      return d;
+    };
+    const store1 = openStore(dbPath);
+    const store2 = openStore(dbPath);
+    const engine1 = new Engine(store1, resolver); // X — the connection under test
+    const engine2 = new Engine(store2, resolver); // Y — the interleaving connection
+
+    // Parent + gate green (sandbox v1) via X.
+    const parentWf = engine1.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+    const t1 = engine1.tick(parentWf, { deep: false });
+    const provRun = t1.orders.find((o) => o.step === 'provision')!.run;
+    engine1.green(parentWf, provRun, 'sandbox', { env: 'v1' });
+    engine1.close(parentWf, provRun);
+
+    // Spawn the child; `delivered` is now materialized but still owed.
+    engine1.tick(parentWf, { deep: false });
+    const childRow = store1.findChildByParent(parentWf, 'delivered');
+    assert.ok(childRow, 'child spawned');
+    assert.equal(getArt(store1, parentWf, 'delivered')?.acceptance, 'owed', 'delivered starts owed');
+
+    // Stage the child result green v1 WITHOUT engine.green, so triggerParentIfChild
+    // does not publish `delivered`. Fingerprint references the current `data`
+    // version so Y's re-provide (which bumps `data`) auto-invalidates it.
+    const dataArt = store1.getArtifact(childRow!.id, 'data')!;
+    const resultOwed = store1.getArtifact(childRow!.id, 'result')!;
+    store1.putArtifact({
+      ...resultOwed,
+      acceptance: 'green',
+      version: resultOwed.version + 1,
+      value: { value: 'v1' },
+      fingerprint: { data: dataArt.version },
+    });
+    assert.equal(getArt(store1, childRow!.id, 'result')?.acceptance, 'green', 'child result staged green v1');
+    assert.equal(getArt(store1, parentWf, 'delivered')?.acceptance, 'owed', 'delivered still owed pre-interleave');
+
+    // Count `delivered`-provide commit events X emits during the interleaved tick.
+    let e1DeliveredProvides = 0;
+    const unsub = engine1.subscribe((e) => {
+      if (e.type === 'commit' && e.path === 'delivered' && e.action === 'provide') e1DeliveredProvides++;
+    });
+
+    // Inject Y on X's SECOND getArtifact(parentWf,'delivered') — the STEP-6 gate.
+    let deliveredReads = 0;
+    let injected = false;
+    const origGetArtifact = store1.getArtifact.bind(store1);
+    (store1 as unknown as { getArtifact: Store['getArtifact'] }).getArtifact = ((wf: string, path: string) => {
+      if (!injected && wf === parentWf && path === 'delivered') {
+        deliveredReads++;
+        if (deliveredReads === 2) {
+          injected = true;
+          // Y advances the gate to v2 and re-provides — re-arming the child result
+          // to owed — while X holds no transaction.
+          const sandbox = store2.getArtifact(parentWf, 'sandbox')!;
+          store2.putArtifact({ ...sandbox, version: sandbox.version + 1, value: { env: 'v2' } });
+          engine2.tick(parentWf, { deep: false });
+        }
+      }
+      return origGetArtifact(wf, path);
+    }) as Store['getArtifact'];
+
+    // The interleaved pass. X's optimistic read saw the child green v1; its in-tx
+    // re-verify must catch the re-armed child and abort the publish.
+    const interleaved = engine1.tick(parentWf, { deep: false });
+    (store1 as unknown as { getArtifact: Store['getArtifact'] }).getArtifact = origGetArtifact;
+    unsub();
+
+    assert.ok(injected, 'the interleave actually fired on the STEP-6 read');
+    assert.notEqual(
+      getArt(store1, childRow!.id, 'result')?.acceptance, 'green',
+      'sanity: Y re-armed the child result to owed',
+    );
+
+    // (1) No stale publish: delivered must not be green with the v1 value under a v2
+    //     fingerprint — with the fix it simply stays not-green (deferred).
+    const deliveredAfter = getArt(store1, parentWf, 'delivered');
+    assert.notEqual(deliveredAfter?.acceptance, 'green',
+      'must not publish stale child value under a newer gate fingerprint');
+    // Belt-and-braces invariant form: IF it were green, value+fingerprint must be
+    // mutually consistent with the current child/gate — never stale-vs-newer.
+    if (deliveredAfter?.acceptance === 'green') {
+      const curResult = getArt(store1, childRow!.id, 'result');
+      const curSandbox = getArt(store1, parentWf, 'sandbox');
+      assert.deepEqual(deliveredAfter.value, curResult?.value, 'green delivered must carry the current child value');
+      assert.equal(deliveredAfter.fingerprint?.sandbox, curSandbox?.version, 'and a fingerprint claiming the current gate');
+    }
+
+    // (2) No downstream work off the stale result.
+    assert.equal(interleaved.orders.find((o) => o.step === 'teardown'), undefined,
+      'no teardown order issued off the stale result');
+
+    // (4) Event hygiene: X emitted no delivered-provide commit during the aborted pass.
+    assert.equal(e1DeliveredProvides, 0, 'X fires no commit/provide for delivered on the aborted pass');
+
+    // (3) Deferral, not deadlock: drive the child to green its result with v2 content;
+    //     the parent then publishes the FRESH result and downstream fires.
+    const childTick = engine1.tick(childRow!.id, { deep: false });
+    const workerRun = childTick.orders.find((o) => o.step === 'worker')!.run;
+    engine1.green(childRow!.id, workerRun, 'result', { value: 'v2' });
+    engine1.close(childRow!.id, workerRun);
+    const finalTick = engine1.tick(parentWf, { deep: false });
+
+    const deliveredFinal = getArt(store1, parentWf, 'delivered');
+    assert.equal(deliveredFinal?.acceptance, 'green', 'delivered publishes once the fresh result lands');
+    assert.deepEqual(deliveredFinal?.value, { value: 'v2' }, 'with the v2 child value');
+    const sandboxFinal = getArt(store1, parentWf, 'sandbox');
+    assert.equal(deliveredFinal?.fingerprint?.sandbox, sandboxFinal?.version,
+      'fingerprint claims the current (v2) gate version');
+    assert.ok(finalTick.orders.find((o) => o.step === 'teardown'), 'teardown fires off the fresh result');
+
+    store1.close();
+    store2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
