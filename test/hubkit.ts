@@ -9,6 +9,8 @@
  */
 
 import { mkdtempSync } from 'node:fs';
+import { createServer } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { hashDefForHub } from '../src/hub.ts';
@@ -27,6 +29,9 @@ export interface RecordedCall {
   pathname: string;
   body: string | undefined;
   authorization: string | null;
+  /** The `init.redirect` mode the caller passed — lets a test assert every
+   *  hub/auth fetch sets `redirect: 'error'` (the fake ignores it otherwise). */
+  redirect: RequestInit['redirect'];
 }
 
 /** An in-memory keychain plus the backing map for assertions. */
@@ -52,7 +57,7 @@ export function routedFetch(routes: Record<string, RouteHandler>): {
     const method = (init?.method ?? 'GET').toUpperCase();
     const body = typeof init?.body === 'string' ? init.body : undefined;
     const authorization = new Headers(init?.headers).get('authorization');
-    calls.push({ method, url: urlStr, pathname: url.pathname, body, authorization });
+    calls.push({ method, url: urlStr, pathname: url.pathname, body, authorization, redirect: init?.redirect });
     const handler = routes[`${method} ${url.pathname}`];
     if (!handler) throw new Error(`routedFetch: no route for ${method} ${url.pathname}`);
     const r = handler({ url, body, method });
@@ -86,7 +91,7 @@ export function stallingFetch(
     if (stalls.has(key)) {
       const body = typeof init?.body === 'string' ? init.body : undefined;
       const authorization = new Headers(init?.headers).get('authorization');
-      base.calls.push({ method, url: urlStr, pathname: url.pathname, body, authorization });
+      base.calls.push({ method, url: urlStr, pathname: url.pathname, body, authorization, redirect: init?.redirect });
       return new Promise<Response>((_, reject) => {
         const signal = init?.signal;
         if (!signal) return; // no signal threaded → hangs the test (the point)
@@ -112,6 +117,61 @@ export function stallingFetch(
     return base.fetch(input, init);
   }) as typeof globalThis.fetch;
   return { fetch: fetchFn, calls: base.calls };
+}
+
+/**
+ * A REAL `node:http` loopback server speaking the same `RouteHandler` shape as
+ * `routedFetch`, so route tables read identically. Unlike `routedFetch` (an
+ * in-memory fake that bypasses undici and ignores `init.redirect`), this drives
+ * the platform's real fetch — the only way to prove actual redirect BEHAVIOR
+ * (`redirect: 'error'` refusing a 3xx before the second request leaves). Bind a
+ * redirect route with `{ status: 307, headers: { Location: `${foreign.origin}/x` } }`.
+ * Hermetic: loopback only, test-owned, no ambient state, no TLS. Always
+ * `close()` it (e.g. in a `finally` / `t.after`). `calls` records every request
+ * the server actually RECEIVED — a foreign target's `calls` staying empty is
+ * the leak detector. (`redirect` on those records is always `undefined`: a
+ * server cannot observe the client's `init.redirect`; assert that flag via
+ * `routedFetch` instead.)
+ */
+export async function realHttpServer(routes: Record<string, RouteHandler>): Promise<{
+  origin: string;
+  calls: RecordedCall[];
+  close(): Promise<void>;
+}> {
+  const calls: RecordedCall[] = [];
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => void chunks.push(c));
+    req.on('end', () => {
+      const body = chunks.length ? Buffer.concat(chunks).toString('utf8') : undefined;
+      const method = (req.method ?? 'GET').toUpperCase();
+      const host = req.headers.host ?? '127.0.0.1';
+      const url = new URL(req.url ?? '/', `http://${host}`);
+      const authorization = typeof req.headers.authorization === 'string' ? req.headers.authorization : null;
+      calls.push({ method, url: url.toString(), pathname: url.pathname, body, authorization, redirect: undefined });
+      const handler = routes[`${method} ${url.pathname}`];
+      if (!handler) {
+        // Must answer — a thrown handler error inside a real server would hang the client.
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `realHttpServer: no route for ${method} ${url.pathname}` }));
+        return;
+      }
+      const r = handler({ url, body, method });
+      const headers = { 'Content-Type': 'application/json', ...(r.headers ?? {}) };
+      const payload = r.json === undefined ? '' : JSON.stringify(r.json);
+      res.writeHead(r.status, headers);
+      res.end(payload);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = server.address();
+  if (addr === null || typeof addr === 'string') throw new Error('realHttpServer: no port assigned');
+  const origin = `http://127.0.0.1:${addr.port}`;
+  return {
+    origin,
+    calls,
+    close: () => new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
+  };
 }
 
 export interface HubIo {

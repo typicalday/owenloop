@@ -182,7 +182,12 @@ every hub origin except the loopback hosts (`127.0.0.1`, `::1`, `localhost`),
 which may use `http` for local development — a remote `http` URL is rejected at
 normalization time so a plaintext origin can never be persisted as a credential
 key or project binding. A legacy `hub.json` carrying a remote-http origin is
-likewise refused at push time, with a hint to re-run `owenloop connect`.
+likewise refused at push time, with a hint to re-run `owenloop connect`. The CLI
+also never follows an HTTP redirect from a hub — a 3xx response to any hub/auth
+request is treated as an error — so a compromised or misconfigured hub cannot
+bounce credentials or workflow YAML to another origin (same-origin validation
+covers only the initial URL; a redirect would otherwise re-send the request body
+cross-origin).
 
 **Request timeouts.** Every hub call — OAuth discovery, client registration,
 code exchange, token refresh, `whoami`, the workflow list, and each push — is
