@@ -1489,13 +1489,22 @@ function hubTimeoutMs(io: CliIO): number {
  * `TimeoutError`/`AbortError` becomes a clear `CliError` (naming the request,
  * which is origin+path only — never a token); anything else is rethrown
  * untouched.
+ *
+ * `redirect: 'error'` is forced on every call — after the `...init` spread, so
+ * no caller can override it — to close the redirect gap `resolveEndpoint`
+ * (SEC-4) cannot see: same-origin validation covers only the INITIAL URL, but a
+ * validated endpoint answering 307/308 would re-send the POST body (refresh
+ * token, PKCE verifier, auth code, workflow YAML) to a foreign origin — undici
+ * strips the Authorization header on a cross-origin redirect but RESENDS the
+ * body. The hub protocol has no redirects, so any 3xx is a hard, loud failure
+ * mapped to a `CliError` (again naming origin+path only, never a token).
  */
 async function hubFetch(io: CliIO, url: string, init?: RequestInit): Promise<Response> {
   const fetchFn = io.fetch ?? globalThis.fetch;
   const ms = hubTimeoutMs(io);
   const method = (init?.method ?? 'GET').toUpperCase();
   try {
-    const res = await fetchFn(url, { ...init, signal: AbortSignal.timeout(ms) });
+    const res = await fetchFn(url, { ...init, signal: AbortSignal.timeout(ms), redirect: 'error' });
     // 204/304 carry no body — reading one would be a spec violation.
     if (res.status === 204 || res.status === 304) {
       return new Response(null, { status: res.status, statusText: res.statusText, headers: res.headers });
@@ -1506,6 +1515,16 @@ async function hubFetch(io: CliIO, url: string, init?: RequestInit): Promise<Res
     const err = e as Error;
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
       throw new CliError(`hub did not respond within ${ms / 1000}s (${method} ${url})`);
+    }
+    // `redirect: 'error'` makes undici reject a 3xx with a TypeError whose
+    // cause message is 'unexpected redirect' (verified on Node 22.22.3 and 26).
+    // Substring-match for slack against undici wording drift — if it ever stops
+    // matching, the raw TypeError still surfaces (fail-closed, just less pretty).
+    const cause = String((err as { cause?: { message?: string } }).cause?.message ?? '');
+    if (err.name === 'TypeError' && cause.includes('unexpected redirect')) {
+      throw new CliError(
+        `hub responded with a redirect — refusing to follow it (${method} ${url}); redirects are not part of the hub protocol`,
+      );
     }
     throw e;
   }
