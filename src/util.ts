@@ -47,6 +47,59 @@ export function mkdirRefusingSymlink(dir: string): void {
   mkdirSync(dir, { recursive: true });
 }
 
+/**
+ * File-level half of SEC-3: refuse to open the DEFAULT `state.db` (and its
+ * SQLite sidecars) through a symlink. PR #47 / `mkdirRefusingSymlink` closed
+ * the PARENT-directory hole; this closes the sibling one where `.owenloop` is a
+ * REAL directory but `state.db` (or a sidecar) is a symlink to a file
+ * elsewhere. Opening the database follows that file symlink, redirecting every
+ * write outside the project checkout — a hostile checkout can ship
+ * `.owenloop/state.db -> /elsewhere` to do exactly that.
+ *
+ * Sidecars are guarded, not just the main file: `store.ts` runs
+ * `PRAGMA journal_mode = WAL`, so writes flow through `state.db-wal` and
+ * coordinate via the mmap'd `state.db-shm`. SQLite's unix VFS opens both with
+ * plain `open(2)`, which follows file symlinks unless `SQLITE_OPEN_NOFOLLOW` is
+ * passed — and `node:sqlite`'s `DatabaseSync` does not pass it. So a regular
+ * (or absent) `state.db` with `state.db-wal -> /elsewhere` still redirects
+ * writes; WAL mode does not make the sidecars moot. `state.db-journal` only
+ * matters in rollback-journal modes, but a pre-existing hostile db opens in its
+ * on-disk journal mode until the WAL switch runs, so its journal can be touched
+ * transiently during open — one more loop iteration guards it too.
+ *
+ * Lives in `util.ts` (engine core) alongside `mkdirRefusingSymlink` so both
+ * `factory.ts` (core) and `cli.ts` share the one helper without core depending
+ * on a hub/CLI module (the `boundaries.test.ts` core→hub import boundary).
+ *
+ * Behavior, for each of `<dbPath>`, `-wal`, `-shm`, `-journal`:
+ * 1. `lstat` it. Missing → fine (a fresh create).
+ * 2. A symbolic link (to a file, a directory, or dangling — `lstat` reports the
+ *    link itself either way) → throw a clear error naming the path. A dangling
+ *    link matters too: opening it would otherwise CREATE the link target.
+ * 3. Exists but is not a regular file (a directory, FIFO, …) → throw a clear
+ *    "not a regular file" error rather than letting SQLite surface a rawer one
+ *    — a symmetry courtesy mirroring `mkdirRefusingSymlink`'s "not a directory"
+ *    branch.
+ * 4. A regular file → fine (a normal reopen).
+ *
+ * TOCTOU stance matches `writeFileAtomic`/`mkdirRefusingSymlink`: the `lstat`
+ * defends the STATIC hostile-checkout threat (the attacker controls repo
+ * contents at clone time). A live local attacker racing a symlink into place
+ * between the `lstat` and SQLite's open is outside this threat model, the same
+ * caveat those siblings carry.
+ */
+export function dbPathRefusingSymlink(dbPath: string): void {
+  for (const p of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`]) {
+    const existing = lstatSync(p, { throwIfNoEntry: false });
+    if (existing?.isSymbolicLink()) {
+      throw new Error(`refusing to write to ${p}: it is a symbolic link`);
+    }
+    if (existing && !existing.isFile()) {
+      throw new Error(`refusing to write to ${p}: it is not a regular file`);
+    }
+  }
+}
+
 /** Deterministic id from parts — same parts always yield the same id. */
 export function detId(prefix: string, ...parts: string[]): string {
   const h = createHash('sha1').update(parts.join(' ')).digest('hex');

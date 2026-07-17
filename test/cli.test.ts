@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -1287,4 +1287,35 @@ test('SEC-3: an explicit --db under a plain dir skips the guard even when `.owen
   const r = run('defs', '--db', realDb);
   assert.equal(r.code, 0, r.err);
   assert.equal(existsSync(realDb), true, 'the explicit db path opened normally');
+});
+
+test('SEC-3: default state.db is a symlink inside a real `.owenloop` → refused; the link target is untouched', () => {
+  // A REAL `.owenloop/` (parent-dir guard passes) but `state.db` is a symlink
+  // to a file elsewhere — opening the default db would follow it.
+  const { run, home } = makeCli({ setDbEnv: false });
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-clidbtarget-'));
+  const target = join(elsewhere, 'evil.db');
+  writeFileSync(target, 'original');
+  mkdirSync(join(home, '.owenloop'));
+  symlinkSync(target, join(home, '.owenloop', 'state.db'));
+
+  const r = run('defs');
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.err, /refusing to write to/);
+  assert.match(r.err, /symbolic link/);
+  assert.equal(readFileSync(target, 'utf8'), 'original', 'the symlink target was not written through');
+});
+
+test('SEC-3: an explicit --db that is itself a symlink still opens (operator intent preserved)', () => {
+  const { run, home } = makeCli({ setDbEnv: false });
+  mkdirSync(join(home, '.owenloop'));
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-cliexptgt-'));
+  const realDb = join(elsewhere, 'real.db');
+  const linkDir = mkdtempSync(join(tmpdir(), 'owenloop-cliexplink-'));
+  const linkDb = join(linkDir, 'state.db');
+  symlinkSync(realDb, linkDb);
+
+  const r = run('defs', '--db', linkDb);
+  assert.equal(r.code, 0, r.err);
+  assert.equal(existsSync(realDb), true, 'the explicit db symlink was followed (override behavior preserved)');
 });

@@ -25,7 +25,7 @@ import { Engine } from './engine.ts';
 import type { DefResolver, EngineEvent, EngineListener } from './engine.ts';
 import { openStore } from './store.ts';
 import type { Store } from './store.ts';
-import { mkdirRefusingSymlink } from './util.ts';
+import { dbPathRefusingSymlink, mkdirRefusingSymlink } from './util.ts';
 import { finalizeDefs, loadDefs } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 
@@ -116,10 +116,15 @@ export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
 
   if (db !== ':memory:') {
     // Guard the built-in default (`.owenloop/state.db`) against a symlinked
-    // `.owenloop` from a hostile checkout (SEC-3). An explicit `opts.db` comes
-    // from the caller, not the repo, so it keeps today's plain mkdir behavior.
-    if (opts.db === undefined) mkdirRefusingSymlink(dirname(db));
-    else mkdirSync(dirname(db), { recursive: true });
+    // `.owenloop` from a hostile checkout (SEC-3). Directory guard first, then
+    // the file-level guard on `state.db` and its SQLite sidecars — a symlinked
+    // db file inside a REAL `.owenloop` would otherwise redirect writes SQLite
+    // follows. An explicit `opts.db` comes from the caller, not the repo, so it
+    // keeps today's plain mkdir behavior.
+    if (opts.db === undefined) {
+      mkdirRefusingSymlink(dirname(db));
+      dbPathRefusingSymlink(db);
+    } else mkdirSync(dirname(db), { recursive: true });
   }
   const store = openStore(db);
 
