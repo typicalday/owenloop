@@ -1355,17 +1355,19 @@ test('calls: REL-5 — two engines over one DB file spawn exactly one child (ato
   }
 });
 
-// ---- (12) REL-5: the loser's spawn path re-attaches (created: false) ---------
+// ---- (12) REL-5: the loser's provision path re-attaches (created: false) -----
 //
 // Test (11) drives the loser via engine2.tick, whose STEP 2 read sees the
-// already-committed child and takes the RE-ATTACH branch — so it never enters
-// spawnChildIfAbsent at all. That leaves the primary REL-5 race eliminator —
-// spawnChildIfAbsent's in-tx re-check (`if (existing) return { created: false }`)
-// and its `created: false` return — unexercised: a regression that hoisted the
-// re-check out of the tx or broke the created flag would keep the suite green.
-// Here we drive the loser's spawn path DIRECTLY against a committed child and
-// assert it re-attaches to the winner without creating a second row or firing.
-test('calls: REL-5 — losing spawnChildIfAbsent re-attaches to the winner (created: false, no event)', () => {
+// already-committed child and takes the RE-ATTACH branch — so its in-tx
+// find-or-create re-check (`if (child) ... created: false`) never runs against a
+// committed row. That leaves the primary race eliminator — provisionCallsChild's
+// in-tx `findChildByParent` and its `created: false` return — unexercised by the
+// concurrency tests: a regression that hoisted the re-check out of the tx or broke
+// the created flag would keep the suite green. Here we drive the provision path
+// DIRECTLY against a committed, already-synced child and assert it re-attaches to
+// the winner without creating a second row, without re-writing an already-current
+// input, and (since it did not create) firing no instance event.
+test('calls: REL-5 — losing provisionCallsChild re-attaches to the winner (created: false, no provide, no event)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-rel5-loser-'));
   const dbPath = join(dir, 'concurrent.db');
   try {
@@ -1389,30 +1391,36 @@ test('calls: REL-5 — losing spawnChildIfAbsent re-attaches to the winner (crea
     const provRun = tick1.orders.find((o) => o.step === 'provision')!.run;
     engine1.green(parentWf, provRun, 'sandbox', { env: 'v1' });
     engine1.close(parentWf, provRun);
-    engine1.tick(parentWf, { deep: false }); // spawns the child
+    engine1.tick(parentWf, { deep: false }); // spawns the child (seeds data v1)
 
     const winner = store1.findChildByParent(parentWf, 'delivered');
     assert.ok(winner, 'engine1 spawned the winning child');
     e2Instances = 0; // ignore any earlier engine2-observed events
 
-    // Drive engine2's spawn path directly with the SAME coordinates a losing
-    // driver's maintainCalls STEP 3 would use (callsInputs { data: sandbox },
-    // sandbox = { env: 'v1' }). It must re-attach to the winner, not create a
-    // second child, and — since it did not create — fire no instance event.
-    const spawn = (
+    // Drive engine2's provision path DIRECTLY with the SAME coordinates a losing
+    // driver's maintainCalls STEP 3 would use (deliverStep: calls childDef,
+    // callsInputs { data: sandbox }, gate stem 'sandbox'). It must re-attach to the
+    // committed winner (created: false), leave its already-current `data` input
+    // untouched (provided: []), create no second row, and fire no instance event.
+    const provision = (
       engine2 as unknown as {
-        spawnChildIfAbsent(
-          defName: string,
+        provisionCallsChild(
           parentWf: string,
-          callsPath: string,
-          seedProvide: Record<string, Record<string, unknown>>,
-        ): { id: string; created: boolean };
+          step: StepDef,
+          callsStem: string,
+          gateStems: string[],
+          now?: number,
+        ): { childId: string; created: boolean; provided: string[] } | null;
       }
-    ).spawnChildIfAbsent('childDef', parentWf, 'delivered', { data: { env: 'v1' } });
+    ).provisionCallsChild(parentWf, deliverStep, 'delivered', ['sandbox']);
 
-    assert.deepEqual(spawn, { id: winner!.id, created: false }, 'loser re-attaches to the winner with created: false');
+    assert.deepEqual(
+      provision,
+      { childId: winner!.id, created: false, provided: [] },
+      'loser re-attaches to the winner (created: false) and re-provides nothing',
+    );
     assert.equal(store2.listChildrenByParent(parentWf).length, 1, 'no second child row was created');
-    assert.equal(e2Instances, 0, 'a re-attaching (created: false) spawn fires no instance event');
+    assert.equal(e2Instances, 0, 'a re-attaching (created: false) provision fires no instance event');
 
     store1.close();
     store2.close();
@@ -1567,6 +1575,193 @@ test('calls: REL-5 — atomic snapshot-and-commit defers a stale cross-connectio
     assert.equal(deliveredFinal?.fingerprint?.sandbox, sandboxFinal?.version,
       'fingerprint claims the current (v2) gate version');
     assert.ok(finalTick.orders.find((o) => o.step === 'teardown'), 'teardown fires off the fresh result');
+
+    store1.close();
+    store2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- (14) C2: SPAWN race — a child must not be created from a stale snapshot --
+//
+// The re-audit's creation-side interleave. Connection X's maintainCalls captures
+// the parent gate (sandbox v1) in its STEP-1 snapshot, then connection Y advances
+// the gate to v2 before X spawns the child. X must NOT seed the child from the
+// stale v1 snapshot and then issue child work on v1 — with the atomic
+// fresh-snapshot provision, X re-reads the parent INSIDE the spawn tx and seeds
+// the child from the current v2 state, so no active child order ever consumes a
+// superseded value.
+//
+// Interleave injection: X's FIRST store.findChildByParent(parentWf,'delivered')
+// of the pass — maintainCalls STEP 2, after STEP 1 captured the stale snapshot and
+// before any tx opens (X holds no write lock, so Y's own write commits rather than
+// blocking on busy_timeout). One-shot (`injected`) so the fixed helper's in-tx
+// re-read and the deep-descent lookup never re-fire Y while X holds the lock.
+test('calls: C2 — spawn re-reads the parent in-tx; child is seeded from the current gate, not a stale snapshot', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-c2-spawn-'));
+  const dbPath = join(dir, 'concurrent.db');
+  try {
+    const byName = new Map([childDef, parentDef].map((d) => [d.name, d]));
+    const resolver = (name: string): WorkflowDef => {
+      const d = byName.get(name);
+      if (!d) throw new Error(`no def: ${name}`);
+      return d;
+    };
+    const store1 = openStore(dbPath);
+    const store2 = openStore(dbPath);
+    const engine1 = new Engine(store1, resolver); // X — the connection under test
+    const engine2 = new Engine(store2, resolver); // Y — the interleaving connection
+
+    // Parent + gate green (sandbox v1) via X, but NO child spawned yet (do not
+    // tick past the gate green).
+    const parentWf = engine1.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+    const t1 = engine1.tick(parentWf, { deep: false });
+    const provRun = t1.orders.find((o) => o.step === 'provision')!.run;
+    engine1.green(parentWf, provRun, 'sandbox', { env: 'v1' });
+    engine1.close(parentWf, provRun);
+    assert.equal(store1.findChildByParent(parentWf, 'delivered'), undefined, 'no child yet');
+
+    // Inject Y on X's FIRST findChildByParent(parentWf,'delivered') — STEP 2, after
+    // X's stale STEP-1 snapshot, before any tx. Y advances the gate to v2 with a
+    // DIRECT putArtifact (no engine2 tick — nothing must spawn on Y's side).
+    let injected = false;
+    const origFind = store1.findChildByParent.bind(store1);
+    (store1 as unknown as { findChildByParent: Store['findChildByParent'] }).findChildByParent = ((
+      pWf: string,
+      pPath: string,
+    ) => {
+      if (!injected && pWf === parentWf && pPath === 'delivered') {
+        injected = true;
+        const sandbox = store2.getArtifact(parentWf, 'sandbox')!;
+        store2.putArtifact({ ...sandbox, version: sandbox.version + 1, value: { env: 'v2' } });
+      }
+      return origFind(pWf, pPath);
+    }) as Store['findChildByParent'];
+
+    // The interleaved DEEP pass: X spawns the child and, in the same tick, descends
+    // to issue the child worker order.
+    const interleaved = engine1.tick(parentWf);
+    (store1 as unknown as { findChildByParent: Store['findChildByParent'] }).findChildByParent = origFind;
+
+    assert.ok(injected, 'the interleave actually fired on the STEP-2 lookup');
+
+    const childRow = store1.findChildByParent(parentWf, 'delivered');
+    assert.ok(childRow, 'exactly one child was spawned');
+    assert.equal(store1.listChildrenByParent(parentWf).length, 1, 'no duplicate child');
+
+    // The heart of the fix: the child's `data` input is the CURRENT gate value (v2),
+    // never the stale v1 snapshot X captured at STEP 1. (Current main seeds v1.)
+    assert.deepEqual(
+      getArt(store1, childRow!.id, 'data')?.value,
+      { env: 'v2' },
+      'child seeded from the current (v2) gate, not the stale (v1) snapshot',
+    );
+
+    // No active child order consumes a superseded value: the deep tick issued the
+    // child worker order, and the only committed `data` input it can consume is v2.
+    const workerOrder = interleaved.orders.find((o) => o.step === 'worker' && o.workflow === childRow!.id);
+    assert.ok(workerOrder, 'the deep tick issued the child worker order');
+
+    // Parent `delivered` stays owed — the child has not produced its outcome yet.
+    assert.equal(getArt(store1, parentWf, 'delivered')?.acceptance, 'owed', 'delivered still owed');
+
+    store1.close();
+    store2.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- (15) C2: RE-PROVISION race — a concurrent advance is never clobbered back -
+//
+// The re-audit's re-provision interleave. X captures the parent gate (sandbox v1)
+// in its STEP-1 snapshot; Y then advances BOTH the parent gate AND the child input
+// to v2 (its own tick re-provides). X must NOT stamp the stale v1 value back over
+// the child's now-current v2 input (the backward overwrite: child input version
+// bumps while its value regresses). With the atomic fresh-snapshot provision, X
+// re-reads the parent v2 in-tx, finds the child already at v2, and writes nothing.
+//
+// Same injection point as (14): X's FIRST findChildByParent(parentWf,'delivered')
+// of the pass (STEP 2). Y fires there — advance the gate, tick to re-provide — and
+// we capture the child `data` version right after Y's tick.
+test('calls: C2 — re-provision re-reads the parent in-tx; a concurrent advance is not clobbered backward', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-c2-reprovision-'));
+  const dbPath = join(dir, 'concurrent.db');
+  try {
+    const byName = new Map([childDef, parentDef].map((d) => [d.name, d]));
+    const resolver = (name: string): WorkflowDef => {
+      const d = byName.get(name);
+      if (!d) throw new Error(`no def: ${name}`);
+      return d;
+    };
+    const store1 = openStore(dbPath);
+    const store2 = openStore(dbPath);
+    const engine1 = new Engine(store1, resolver); // X — the connection under test
+    const engine2 = new Engine(store2, resolver); // Y — the interleaving connection
+
+    // Parent + child fully spawned and synced at v1 via X.
+    const parentWf = engine1.createInstance('parentDef', { provide: { proposal: { text: 'hello' } } });
+    const t1 = engine1.tick(parentWf, { deep: false });
+    const provRun = t1.orders.find((o) => o.step === 'provision')!.run;
+    engine1.green(parentWf, provRun, 'sandbox', { env: 'v1' });
+    engine1.close(parentWf, provRun);
+    engine1.tick(parentWf, { deep: false }); // spawns child, seeds data v1
+    const childRow = store1.findChildByParent(parentWf, 'delivered');
+    assert.ok(childRow, 'child spawned');
+    assert.deepEqual(getArt(store1, childRow!.id, 'data')?.value, { env: 'v1' }, 'child synced at v1');
+
+    // Count child `data` provide commits X emits during the interleaved pass.
+    let e1DataProvides = 0;
+    const unsub = engine1.subscribe((e) => {
+      if (e.type === 'commit' && e.workflow === childRow!.id && e.path === 'data' && e.action === 'provide') {
+        e1DataProvides++;
+      }
+    });
+
+    // Inject Y on X's FIRST findChildByParent(parentWf,'delivered') — STEP 2. Y
+    // advances the gate to v2 AND ticks, re-provisioning the child `data` to v2.
+    let injected = false;
+    let dataVersionAfterY = -1;
+    const origFind = store1.findChildByParent.bind(store1);
+    (store1 as unknown as { findChildByParent: Store['findChildByParent'] }).findChildByParent = ((
+      pWf: string,
+      pPath: string,
+    ) => {
+      if (!injected && pWf === parentWf && pPath === 'delivered') {
+        injected = true;
+        const sandbox = store2.getArtifact(parentWf, 'sandbox')!;
+        store2.putArtifact({ ...sandbox, version: sandbox.version + 1, value: { env: 'v2' } });
+        engine2.tick(parentWf, { deep: false }); // Y re-provides child data → v2
+        dataVersionAfterY = store2.getArtifact(childRow!.id, 'data')!.version;
+      }
+      return origFind(pWf, pPath);
+    }) as Store['findChildByParent'];
+
+    // The interleaved pass. X's stale STEP-1 snapshot holds v1; its in-tx re-read
+    // must see the current v2 and leave the already-current child input untouched.
+    engine1.tick(parentWf, { deep: false });
+    (store1 as unknown as { findChildByParent: Store['findChildByParent'] }).findChildByParent = origFind;
+    unsub();
+
+    assert.ok(injected, 'the interleave actually fired on the STEP-2 lookup');
+    assert.ok(dataVersionAfterY > 0, 'Y re-provided the child data to v2');
+
+    // (1) No backward overwrite: the child `data` value is the current v2, never
+    //     regressed to the stale v1 X snapshotted. (Current main stamps v1 back.)
+    assert.deepEqual(getArt(store1, childRow!.id, 'data')?.value, { env: 'v2' }, 'child data stays at v2');
+
+    // (2) The child `data` version never moved during X's pass — X wrote nothing, so
+    //     there is neither a regression nor a spurious version bump. (Current main
+    //     bumps the version writing v1 back.)
+    assert.equal(
+      getArt(store1, childRow!.id, 'data')?.version,
+      dataVersionAfterY,
+      'child data version unchanged by X (no backward write)',
+    );
+
+    // (3) Event hygiene: X emitted no child `data` provide commit on the aborted pass.
+    assert.equal(e1DataProvides, 0, 'X fires no commit/provide for the child data input');
 
     store1.close();
     store2.close();
