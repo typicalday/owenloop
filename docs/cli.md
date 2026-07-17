@@ -350,7 +350,10 @@ The backend is chosen once from your platform and env and then used for every
 read and write — a keychain-backed CLI never silently drops to the file store.
 If the keychain write fails (locked or unavailable), `login` errors out instead
 of writing the secret elsewhere: unlock the keychain, or set
-`OWENLOOP_NO_KEYCHAIN=1` to select the file store up front.
+`OWENLOOP_NO_KEYCHAIN=1` to select the file store up front. Programmatic hosts
+can read (only read) a stored credential through the same backend logic via the
+package's exported `readStoredCredential` — see
+[Embedding](embedding.md#whats-exported).
 
 Both branches verify the credential against `GET /api/whoami` before storing
 it — a `401` there means the credential is never written to disk. On success

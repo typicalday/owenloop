@@ -35,7 +35,6 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
-import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { parse as parseYaml } from 'yaml';
@@ -85,6 +84,7 @@ import {
   asCreateWorkflowOk,
   asWhoami,
   computeServerDiff,
+  credentialBackend,
   createWorkflowError,
   credentialFilePath,
   hashDefForHub,
@@ -95,18 +95,18 @@ import {
   randomState,
   readCredentialFile,
   readHubBinding,
+  readStoredCredential,
   resolveEndpoint,
+  resolveKeychain,
   writeCredentialFile,
   writeHubBinding,
 } from './hub.ts';
-import type { Credential, DefPushCandidate, HubBinding, WhoamiIdentity } from './hub.ts';
+import type { Credential, DefPushCandidate, HubBinding, Keychain, WhoamiIdentity } from './hub.ts';
 
-/** An OS keychain backend, keyed by hub origin (the `account`). */
-export interface Keychain {
-  get(account: string): string | null;
-  set(account: string, value: string): void;
-  delete(account: string): void;
-}
+// Re-export the keychain backend type so existing test imports of `Keychain`
+// from `../src/cli.ts` (test/hubkit.ts, test/login.test.ts) keep resolving —
+// the type is now homed in hub.ts (cli → hub is boundary-legal).
+export type { Keychain } from './hub.ts';
 
 export interface CliIO {
   cwd: string;
@@ -157,49 +157,6 @@ async function defaultReadStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
   return Buffer.concat(chunks).toString('utf8');
-}
-
-/**
- * The default macOS keychain backend (generic passwords under service
- * `owenloop-hub`). The secret is fed through the `security -i` command stream on
- * stdin, never as a `-w` argv value, so it never appears in `ps`/shell history.
- * Returns `undefined` off macOS or when `OWENLOOP_NO_KEYCHAIN=1`, so callers
- * fall back to the 0600 credential file.
- */
-const KEYCHAIN_SERVICE = 'owenloop-hub';
-
-function defaultKeychain(env: Record<string, string | undefined>): Keychain | undefined {
-  if (env.OWENLOOP_NO_KEYCHAIN === '1') return undefined;
-  if (process.platform !== 'darwin') return undefined;
-  return {
-    get(account: string): string | null {
-      try {
-        const out = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w'], {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'ignore'],
-        });
-        return out.replace(/\n$/, '');
-      } catch {
-        return null; // not found (errSecItemNotFound) — treated as "no credential"
-      }
-    },
-    set(account: string, value: string): void {
-      // `security -i` reads newline-terminated commands from stdin; the secret
-      // rides in that stdin stream (single-quoted), never on this process's argv.
-      const sq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
-      const cmd = `add-generic-password -U -s ${sq(KEYCHAIN_SERVICE)} -a ${sq(account)} -w ${sq(value)}\n`;
-      execFileSync('security', ['-i'], { input: cmd, stdio: ['pipe', 'ignore', 'ignore'] });
-    },
-    delete(account: string): void {
-      try {
-        execFileSync('security', ['delete-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account], {
-          stdio: 'ignore',
-        });
-      } catch {
-        // Not found — already absent; a no-op delete is success.
-      }
-    },
-  };
 }
 
 // ---- arg parsing -------------------------------------------------------------
@@ -1859,55 +1816,27 @@ function resolveHub(io: CliIO, args: Args): string {
   }
 }
 
-function resolveKeychain(io: CliIO): Keychain | undefined {
-  if (io.env.OWENLOOP_NO_KEYCHAIN === '1') return undefined;
-  return io.keychain ?? defaultKeychain(io.env);
-}
-
 /**
- * The credential backend, decided ONCE from env/config (`resolveKeychain`) and
- * then used consistently for read and write. Deciding once — rather than
- * per-operation — is the REL-6 fix: the old error-driven fallback let a write
- * land in the file while a later read hit the (absent/stale) keychain, so a
- * credential could shadow itself across backends.
- */
-type CredentialBackend = { kind: 'keychain'; kc: Keychain } | { kind: 'file' };
-
-function credentialBackend(io: CliIO): CredentialBackend {
-  const kc = resolveKeychain(io);
-  return kc ? { kind: 'keychain', kc } : { kind: 'file' };
-}
-
-/**
- * Read the stored credential for `origin` from the chosen backend ONLY. A
- * keychain-backed read NEVER falls through to the file (that fallback was the
- * REL-6 shadowing bug), and a corrupt keychain entry reads as absent (`null`)
- * — login overwrites it, logout clears it — never as a reason to consult the
- * file.
+ * Read the stored credential for `origin`. Thin wrapper over the shared
+ * `readStoredCredential` in `hub.ts` (the same implementation the public
+ * package export uses), threading the CLI's injected `env`/`keychain`. Callers
+ * pass a pre-normalized origin (`resolveHub` output); the wrapper's
+ * normalization is idempotent, so CLI behavior is unchanged. REL-6 no-fallback
+ * and corrupt-entry-as-absent semantics live in `hub.ts`.
  */
 function readCredential(io: CliIO, origin: string): Credential | null {
-  const backend = credentialBackend(io);
-  if (backend.kind === 'keychain') {
-    const raw = backend.kc.get(origin);
-    if (!raw) return null;
-    try {
-      return JSON.parse(raw) as Credential;
-    } catch {
-      return null; // corrupt entry — treat as absent; do NOT consult the file
-    }
-  }
-  const file = readCredentialFile(credentialFilePath(io.env));
-  return file.hubs[origin] ?? null;
+  return readStoredCredential(origin, { env: io.env, keychain: io.keychain });
 }
 
 /**
  * Store a credential for `origin` in the chosen backend ONLY; returns which
  * one. A failed keychain write is a hard error (REL-6), never a silent
  * fall-through to the file — the escape hatch is to choose the file backend up
- * front with `OWENLOOP_NO_KEYCHAIN=1`.
+ * front with `OWENLOOP_NO_KEYCHAIN=1`. Backend selection is the shared
+ * `credentialBackend` from `hub.ts`, so read and write agree on one choice.
  */
 function storeCredential(io: CliIO, origin: string, cred: Credential): 'keychain' | 'file' {
-  const backend = credentialBackend(io);
+  const backend = credentialBackend(io.env, io.keychain);
   if (backend.kind === 'keychain') {
     try {
       backend.kc.set(origin, JSON.stringify(cred));
@@ -1935,7 +1864,7 @@ function storeCredential(io: CliIO, origin: string, cred: Credential): 'keychain
  */
 function deleteCredential(io: CliIO, origin: string): boolean {
   let removed = false;
-  const kc = resolveKeychain(io);
+  const kc = resolveKeychain(io.env, io.keychain);
   if (kc && kc.get(origin) !== null) {
     kc.delete(origin);
     removed = true;
