@@ -13,6 +13,13 @@ a real `.owenloop` — rather than following it (filesystem-isolation guard
 against a hostile checkout redirecting state writes); an explicit
 `--db`/`OWENLOOP_DB` is operator intent and is created/opened as-is.
 
+An unrecognized `--option` for a command is rejected — nonzero exit, the
+offending flag named, and the nearest valid option suggested when close
+enough — before any filesystem, keychain, or network effect (e.g. `push
+--dryrn` no longer does a real push). `--db`/`--defs` remain accepted on
+every command, as above. `--help` on any command (or bare `-h`/`help`)
+prints this usage and exits 0 without doing any work.
+
 Boolean flags (`--force`, `--dry-run`, `--all`, `--open`, `--terminal`,
 `--recursive`, `--with-token`, `--shallow`, `--assume-provided`, and the bare
 `--now` on `reap`) never take a following value — the next token is always a
