@@ -177,6 +177,12 @@ refuses the whole install (nothing written) on any of these:
 - **Resource bounds on extraction.** The download is capped at 256 MiB
   compressed and 1 GiB expanded (a gzip bomb aborts at inflate time rather than
   exhausting memory), 50k files, 100 MiB per file, and 1024-char entry paths.
+  The 256 MiB compressed cap is enforced *during* the download by a bounded
+  streaming reader — a response advertising an oversize `Content-Length` is
+  refused before any body is read, and a body that streams past the cap is
+  cancelled the moment it crosses it, so an oversized archive is never fully
+  buffered into memory (the extraction limits above still re-check the size once
+  the bytes are in hand).
 - **Request timeouts.** The sha-resolve fetch times out after 30s and the
   tarball download after 5 min, each surfacing as a friendly error.
 
@@ -204,6 +210,13 @@ code exchange, token refresh, `whoami`, the workflow list, and each push — is
 bounded by a 30s deadline; a stalled hub surfaces as a friendly `hub did not
 respond within 30s` error instead of hanging. `OWENLOOP_HUB_TIMEOUT_MS`
 overrides the budget (a test knob).
+
+**Response-size cap.** Every hub/auth response body is read through the same
+bounded streaming reader, capped at 8 MiB — hub responses are small JSON
+round-trips, so a body advertising or streaming past that cap is refused (the
+stream cancelled) rather than buffered, closing the same memory-exhaustion gap
+on the hub path that the `add` download cap closes on the archive path.
+`OWENLOOP_HUB_MAX_RESPONSE_BYTES` overrides the cap (a test knob).
 
 ### `login` — authenticate the CLI against a hub
 

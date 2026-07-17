@@ -47,7 +47,7 @@ import { buildDef, DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from 
 import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
 import { dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
-import { extractTarGz } from './untar.ts';
+import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
 import {
   acquireInstallLock,
   archivePathViolation,
@@ -1041,6 +1041,70 @@ const ADD_SHA_TIMEOUT_MS = 30_000;
 const ADD_TARBALL_TIMEOUT_MS = 300_000;
 
 /**
+ * Read a `Response` body while enforcing a byte `cap`, so a hostile server can
+ * never make us allocate an oversized body. Rejects UP FRONT on a declared
+ * oversize `Content-Length`; otherwise streams the body in chunks, counting the
+ * bytes that actually land in memory, and cancels the stream the moment the
+ * running total crosses the cap — the chunk buffer never holds more than `cap`
+ * plus one chunk. `label` names the request in the error and is origin+path or
+ * `owner/repo@sha` only — never a token. Counting post-decode bytes (what lands
+ * in memory) is deliberate: the cap protects memory, not wire bytes.
+ *
+ * `res.body === null` (empty/no-body response) yields empty bytes, so callers
+ * behave exactly as they did under `arrayBuffer()`. An absent, malformed, or
+ * multi-valued `Content-Length` skips the header check — the counting path is
+ * the real guard (GitHub codeload tarballs are typically chunked, no header). A
+ * `TimeoutError`/`AbortError` from `read()` (the abort signal fired mid-body)
+ * propagates untouched, so each call site's existing timeout mapping still
+ * fires exactly as it did for `arrayBuffer()` rejections. `cancel()` may reject
+ * on an already-errored stream — swallowed; the cap `CliError` is the story.
+ */
+async function readBodyBounded(res: Response, cap: number, label: string): Promise<Uint8Array> {
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > cap) {
+    await res.body?.cancel().catch(() => {});
+    throw new CliError(
+      `response body for ${label} exceeds the ${cap}-byte cap (declared Content-Length ${declared})`,
+    );
+  }
+  if (res.body === null) return new Uint8Array(0);
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value === undefined) continue;
+    total += value.byteLength;
+    chunks.push(value);
+    if (total > cap) {
+      await reader.cancel().catch(() => {});
+      throw new CliError(`response body for ${label} exceeds the ${cap}-byte cap`);
+    }
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Cap on the `add` tarball download body, enforced DURING the stream by
+ * `readBodyBounded` — defense in depth with `extractTarGz`'s own post-hoc
+ * `maxCompressedBytes` check (kept intact). `OWENLOOP_TARBALL_MAX_BYTES`
+ * overrides it (a test-only knob, validated `Number.isFinite && > 0`,
+ * consistent with the project's other `OWENLOOP_*` knobs) so a mid-stream test
+ * need not buffer the real 256 MiB cap in CI.
+ */
+function tarballMaxBytes(io: CliIO): number {
+  const override = Number(io.env.OWENLOOP_TARBALL_MAX_BYTES);
+  return Number.isFinite(override) && override > 0 ? override : DEFAULT_TAR_LIMITS.maxCompressedBytes;
+}
+
+/**
  * `owenloop add <owner>/<repo>[@ref]` — fetch a repo's `workflows/**`, validate
  * it, and install it under `<defsDir>/<installFolder(owner,repo)>`.
  *
@@ -1086,7 +1150,8 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     const notFoundNote = shaRes.status === 404 ? ' (repo or ref not found)' : '';
     throw new CliError(`could not resolve ${source}@${ref}: GitHub returned ${shaRes.status}${notFoundNote}`);
   }
-  const shaBody = (await shaRes.text()).trim();
+  const shaBytes = await readBodyBounded(shaRes, hubMaxResponseBytes(io), `sha resolution for ${source}@${ref}`);
+  const shaBody = new TextDecoder().decode(shaBytes).trim();
   if (!/^[0-9a-f]{40}$/i.test(shaBody)) {
     throw new CliError(`unexpected response resolving ${source}@${ref}: expected a 40-char commit sha, got "${shaBody}"`);
   }
@@ -1094,7 +1159,10 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
 
   // 2. Fetch the tarball for that pinned sha. The timeout must cover the body
   //    read too — undici ties the abort signal to the body stream — so the
-  //    fetch AND arrayBuffer() live in the same try.
+  //    fetch AND the bounded read live in the same try. readBodyBounded caps the
+  //    download DURING the stream (cancelling at the cap), so an oversized
+  //    tarball is never fully allocated; extractTarGz still re-checks the size
+  //    post-hoc (defense in depth).
   let bytes: Uint8Array;
   try {
     const tarRes = await fetchFn(githubTarballUrl(owner, repo, sha), {
@@ -1104,7 +1172,7 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     if (!tarRes.ok) {
       throw new CliError(`could not fetch tarball for ${source}@${sha}: GitHub returned ${tarRes.status}`);
     }
-    bytes = new Uint8Array(await tarRes.arrayBuffer());
+    bytes = await readBodyBounded(tarRes, tarballMaxBytes(io), `tarball for ${source}@${sha}`);
   } catch (e) {
     const err = e as Error;
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
@@ -1492,12 +1560,26 @@ function hubTimeoutMs(io: CliIO): number {
   return Number.isFinite(override) && override > 0 ? override : HUB_TIMEOUT_MS;
 }
 
+// Cap on any hub/auth JSON RESPONSE body (OAuth discovery, DCR, code exchange,
+// token refresh, whoami, the workflow list, create_workflow). Hub responses are
+// small round-trips — the largest realistic body is a workflows summary list,
+// far below 8 MiB. This is a RESPONSE cap; the hub's 32MB figure (the 413 path)
+// is a REQUEST cap and responses never echo YAML. OWENLOOP_HUB_MAX_RESPONSE_BYTES
+// overrides it (a test-only knob, consistent with OWENLOOP_HUB_TIMEOUT_MS).
+const HUB_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+function hubMaxResponseBytes(io: CliIO): number {
+  const override = Number(io.env.OWENLOOP_HUB_MAX_RESPONSE_BYTES);
+  return Number.isFinite(override) && override > 0 ? override : HUB_MAX_RESPONSE_BYTES;
+}
+
 /**
  * `fetch` wrapper putting a deadline on every hub/auth call (REL-7). The abort
- * signal is threaded into `fetch` AND the body is fully buffered inside the
- * same try, so the deadline covers a stalled BODY read too — the exact undici
+ * signal is threaded into `fetch` AND the body is read (via `readBodyBounded`,
+ * which caps the response size — see HUB_MAX_RESPONSE_BYTES) inside the same
+ * try, so the deadline covers a stalled BODY read too — the exact undici
  * behavior the two `add` fetches document (`AbortSignal.timeout` ties the
- * signal to the body stream). The returned `Response` re-exposes the buffered
+ * signal to the body stream). The returned `Response` re-exposes the read
  * body, so every call site's `res.json()` / `res.status` /
  * `res.headers.get(...)` usage is byte-for-byte unchanged. A
  * `TimeoutError`/`AbortError` becomes a clear `CliError` (naming the request,
@@ -1523,7 +1605,7 @@ async function hubFetch(io: CliIO, url: string, init?: RequestInit): Promise<Res
     if (res.status === 204 || res.status === 304) {
       return new Response(null, { status: res.status, statusText: res.statusText, headers: res.headers });
     }
-    const body = await res.arrayBuffer();
+    const body = await readBodyBounded(res, hubMaxResponseBytes(io), `${method} ${url}`);
     return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
   } catch (e) {
     const err = e as Error;
