@@ -272,11 +272,27 @@ export interface WriteLockfileOpts {
   rm?: (path: string, opts: { force: true }) => void;
 }
 
-export function writeLockfile(path: string, lf: Lockfile, opts: WriteLockfileOpts = {}): void {
+/**
+ * Serialize `value` as pretty JSON into a sibling temp file, then `renameSync`
+ * over `path` — the same atomic tmp+rename discipline {@link writeLockfile} has
+ * always used, extracted so the crash-recovery journal writer
+ * ({@link writeAddJournal}) shares one implementation of it (and its
+ * double-fault cleanup semantics) rather than duplicating the seam. A crash or
+ * a concurrent reader never sees a half-written file (rename is atomic within a
+ * directory).
+ *
+ * If the final `renameSync` throws (EACCES, EISDIR on `path`, a full disk), the
+ * temp sibling is removed on a best-effort basis before the error propagates so
+ * a failed write cannot leak a `<path>.tmp.<pid>` file. The original rename
+ * error is surfaced unchanged — never swallowed, and never masked by a failure
+ * of that cleanup removal (if the removal itself throws, that error is swallowed
+ * and the tmp sibling may remain in that double fault).
+ */
+function writeJsonAtomic(path: string, value: unknown, opts: WriteLockfileOpts = {}): void {
   const rm = opts.rm ?? ((p: string, o: { force: true }) => rmSync(p, o));
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp.${process.pid}`;
-  writeFileSync(tmp, `${JSON.stringify(lf, null, 2)}\n`);
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
   try {
     renameSync(tmp, path);
   } catch (e) {
@@ -291,6 +307,10 @@ export function writeLockfile(path: string, lf: Lockfile, opts: WriteLockfileOpt
     }
     throw e;
   }
+}
+
+export function writeLockfile(path: string, lf: Lockfile, opts: WriteLockfileOpts = {}): void {
+  writeJsonAtomic(path, lf, opts);
 }
 
 // ---- staging + atomic commit -----------------------------------------------
@@ -717,4 +737,429 @@ export function releaseInstallLock(handle: InstallLockHandle): void {
   } catch {
     // Already reclaimed/replaced, or an unexpected fs error — swallow.
   }
+}
+
+// ---- crash-recovery journal ------------------------------------------------
+//
+// A process that dies (crash, SIGKILL, power loss) partway through the
+// destructive part of an install — the `commitInstall` swap, the old-name park,
+// or the ledger write — must leave `.owenloop` recoverable to a consistent
+// (defs-on-disk ⇔ ledger) state by the NEXT `add`, never a half-applied tree.
+// Today's failure arms in `dispatchAdd` only cover IN-PROCESS failures (a throw
+// we catch and roll back); a hard kill skips them entirely. This journal closes
+// that gap: `dispatchAdd` writes a one-record intent file before the first
+// destructive step and advances/removes it as the install progresses, and the
+// next `add` runs `recoverInterruptedInstall` under the same A3 install lock,
+// BEFORE the stale-staging cleanup, to roll a leftover install forward or back.
+//
+// The journal is attacker-influenceable input, exactly like the lockfile (a
+// hostile checkout can ship a crafted `.owenloop/add.journal`). It is validated
+// fail-closed with the A1 discipline (`lockfilePathViolation` on every path
+// field, single-segment ⇒ traversal unrepresentable), every mutation path is
+// re-derived from the CURRENT run's resolved `defsDir` plus those validated
+// segments — never from a recorded absolute path — and A2's symlink rule is
+// re-asserted at each mutation site. Any bad shape, unknown phase, defsDir
+// mismatch, or contradictory disk state REFUSES with no filesystem mutation and
+// leaves the journal in place as evidence.
+
+/** Journal filename under `.owenloop/` (sibling of `installed.json`/`add.lock`). */
+export const ADD_JOURNAL_FILENAME = 'add.journal';
+
+/**
+ * The two durable phases an in-flight install can be caught in. Absent (no
+ * file) is the third, happy state. Deliberately coarse — every extra journal
+ * rewrite is itself a crash window, and each install step is a single atomic
+ * rename, so directory existence/absence recovers the fine-grained progress the
+ * two phases don't record.
+ *
+ * - `applying`: written after staging+validation succeed, immediately before
+ *   `commitInstall`. The ledger write (the documented commit point) has NOT yet
+ *   happened, so recovery rolls BACK — unless the ledger turns out to already
+ *   match (a crash in the tiny writeLockfile→rewrite window), in which case it
+ *   rolls forward.
+ * - `finalizing`: written immediately after the ledger write succeeds, before
+ *   `finalizeInstallCommit`. The commit point has passed, so recovery rolls
+ *   FORWARD (finishes discarding the retained backup + parked old-name dir).
+ */
+export type AddJournalPhase = 'applying' | 'finalizing';
+
+/**
+ * One crash-recovery journal record. `folder`, `stagingId`, and `oldNamePath`
+ * are single on-disk path segments (each {@link lockfilePathViolation}-checked
+ * on read); `defsDir` is compared for equality ONLY and is never joined into a
+ * mutation path; `ref`/`startedAt` are diagnostics. These invariants are NOT
+ * trusted from disk — {@link validateAddJournal} enforces every one, fail-closed.
+ */
+export interface AddJournal {
+  version: 1;
+  phase: AddJournalPhase;
+  /** Ledger key of the source being installed — for the ledger-match check. */
+  source: string;
+  /** 40-char hex commit sha being installed — for the ledger-match check. */
+  sha: string;
+  /** Install folder segment (`dest = join(defsDir, folder)`). Single segment. */
+  folder: string;
+  /** Basename of this run's staging dir (`stg_<hex>`). Single segment. */
+  stagingId: string;
+  /** Did `dest` exist when the journal was written (⇒ a backup dir will exist)? */
+  hadDest: boolean;
+  /** Set only for an old-name (`<owner>-<repo>`) migration. Single segment. */
+  oldNamePath?: string;
+  /** Resolved defs dir at journal-write time — equality-checked, never joined. */
+  defsDir: string;
+  /** The `@ref` this install pinned — diagnostics only. */
+  ref: string;
+  /** Journal-write epoch ms — diagnostics only. */
+  startedAt: number;
+}
+
+/**
+ * Structurally validate a parsed `add.journal`, fail-closed — the trust
+ * boundary for the journal, mirroring {@link validateLockfile}. A
+ * parseable-but-invalid journal is a hard error naming the file and the manual
+ * remedy; recovery NEVER acts on a field that has not passed through here. Every
+ * path field must be a safe single segment so a crafted journal cannot represent
+ * traversal before any `join`/`rename`. Unknown extra keys are tolerated
+ * (forward compatibility, same as the lockfile). `ref`/`startedAt` are
+ * diagnostics: validated for type when present, but not required. `path`
+ * appears only in error messages.
+ */
+export function validateAddJournal(parsed: unknown, path: string): AddJournal {
+  const fail = (detail: string): never => {
+    throw new Error(
+      `invalid crash-recovery journal at ${path}: ${detail} — ` +
+        `inspect and remove it manually, then re-run add`,
+    );
+  };
+  if (!isPlainObject(parsed)) return fail('top-level value is not an object');
+  if (parsed.version !== 1) {
+    return fail(`unsupported journal version ${JSON.stringify(parsed.version)} (expected 1)`);
+  }
+  if (parsed.phase !== 'applying' && parsed.phase !== 'finalizing') {
+    return fail(`unknown phase ${JSON.stringify(parsed.phase)} (expected 'applying' or 'finalizing')`);
+  }
+  if (typeof parsed.source !== 'string' || parsed.source === '') {
+    return fail("'source' is not a non-empty string");
+  }
+  if (typeof parsed.sha !== 'string' || !SHA_HEX_RE.test(parsed.sha)) {
+    return fail("'sha' is not a 40-char hex commit sha");
+  }
+  const segment = (field: string, value: unknown): void => {
+    if (typeof value !== 'string') fail(`'${field}' is not a string`);
+    const violation = lockfilePathViolation(value as string);
+    if (violation) fail(`'${field}' ${violation}`);
+  };
+  segment('folder', parsed.folder);
+  segment('stagingId', parsed.stagingId);
+  if (parsed.oldNamePath !== undefined) segment('oldNamePath', parsed.oldNamePath);
+  if (typeof parsed.hadDest !== 'boolean') return fail("'hadDest' is not a boolean");
+  if (typeof parsed.defsDir !== 'string' || parsed.defsDir === '') {
+    return fail("'defsDir' is not a non-empty string");
+  }
+  if (parsed.ref !== undefined && typeof parsed.ref !== 'string') return fail("'ref' is not a string");
+  if (parsed.startedAt !== undefined && typeof parsed.startedAt !== 'number') {
+    return fail("'startedAt' is not a number");
+  }
+  return parsed as unknown as AddJournal;
+}
+
+/**
+ * Read `.owenloop/add.journal`. Absent ⇒ `null` (the happy path — no
+ * interrupted install to recover). Present-but-unparseable ⇒ a hard error;
+ * present-but-schema-invalid ⇒ a hard error via {@link validateAddJournal}.
+ * Never silently ignores a malformed journal (that would let a crafted file
+ * quietly disable recovery) and never trusts it for filesystem paths.
+ */
+export function readAddJournal(path: string): AddJournal | null {
+  if (!existsSync(path)) return null;
+  const raw = readFileSync(path, 'utf8');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(
+      `corrupt crash-recovery journal at ${path}: ${(e as Error).message} — ` +
+        `inspect and remove it manually, then re-run add`,
+    );
+  }
+  return validateAddJournal(parsed, path);
+}
+
+/** Write the journal atomically (tmp+rename), same discipline as the lockfile. */
+export function writeAddJournal(path: string, journal: AddJournal, opts: WriteLockfileOpts = {}): void {
+  writeJsonAtomic(path, journal, opts);
+}
+
+/** Remove the journal (force: absence is not an error — clean-completion / idempotent). */
+export function removeAddJournal(path: string): void {
+  rmSync(path, { force: true });
+}
+
+/** Build a fail-closed recovery-refusal error naming the journal + manual remedy. */
+function recoveryRefusal(journalPath: string, detail: string): Error {
+  return new Error(
+    `refusing crash-recovery: ${detail} — inspect ${journalPath} and the defs dir, ` +
+      `resolve the state by hand, then re-run add`,
+  );
+}
+
+/**
+ * `lstat`-probe a recovery path: `'dir'` if it is a real directory, `'absent'`
+ * if it does not exist. Fail-closed on anything else — a symlink (A2 rule: a
+ * symlinked segment must never be renamed/rm'd, since finalize/rollback would
+ * act through it) or a non-directory file is refused. `lstat`, never `stat`, so
+ * a symlink is seen as a symlink, not followed to its target.
+ *
+ * The PARENT is checked too, not just the leaf: `lstat` on the leaf sees a
+ * symlinked leaf, but a symlinked *parent* directory would be silently followed
+ * by the `rename`/`rm` that acts on the leaf, redirecting the whole mutation
+ * outside `defsDir` (a hostile checkout planting `.owenloop-staging` as a
+ * symlink is exactly this). Refuse a symlinked immediate parent before trusting
+ * the leaf probe. (Absent parent ⇒ the leaf is absent too; nothing to refuse.)
+ */
+function probeRecoveryDir(p: string, journalPath: string, label: string): 'dir' | 'absent' {
+  const parent = dirname(p);
+  const parentSt = lstatSync(parent, { throwIfNoEntry: false });
+  if (parentSt?.isSymbolicLink()) {
+    throw recoveryRefusal(journalPath, `${label} parent '${parent}' is a symlink`);
+  }
+  let st;
+  try {
+    st = lstatSync(p);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+    throw e;
+  }
+  if (st.isSymbolicLink()) throw recoveryRefusal(journalPath, `${label} at '${p}' is a symlink`);
+  if (!st.isDirectory()) throw recoveryRefusal(journalPath, `${label} at '${p}' is not a directory`);
+  return 'dir';
+}
+
+/** Re-assert resolved-path containment at a mutation target (belt-and-braces). */
+function assertUnderDefs(p: string, defsDir: string, journalPath: string): void {
+  if (!resolve(p).startsWith(resolve(defsDir) + sep)) {
+    throw recoveryRefusal(journalPath, `path '${p}' escapes the defs directory`);
+  }
+}
+
+export interface RecoverInterruptedInstallArgs {
+  /** The CURRENT run's resolved defs dir — every mutation path derives from it. */
+  defsDir: string;
+  /** Path to `.owenloop/add.journal`. */
+  journalPath: string;
+  /** Path to `.owenloop/installed.json` — read to decide the commit-point boundary. */
+  lockfilePath: string;
+}
+
+/**
+ * Bring an interrupted install back to a consistent (defs ⇔ ledger) state, then
+ * remove the journal. Called by `dispatchAdd` under the A3 install lock,
+ * BEFORE the stale-staging cleanup (the backups a rollback needs live under the
+ * staging root). No journal ⇒ returns immediately (happy path unchanged).
+ *
+ * Roll-forward vs roll-back rule: the durable ledger write is the commit point.
+ * At or past it, roll FORWARD (finish the discard); before it, roll BACK
+ * (restore the previous state). Concretely:
+ *
+ *  1. `finalizing` ⇒ roll forward: the ledger is durably new; only finalize's
+ *     discards may be missing. Clear the retained backup + parked old-name and
+ *     the staging root. Trivially idempotent.
+ *  2. `applying` + the ledger already records this source at `journal.sha`/
+ *     `journal.folder` ⇒ the commit MAY have landed, but the ledger match alone
+ *     does not prove it — branch on disk: dest present ⇒ the swap completed ⇒
+ *     roll forward; dest ABSENT ⇒ a same-sha re-add crashed inside commitInstall's
+ *     dest→backup / staging→dest window and backupDir holds the only copy ⇒ roll
+ *     back (restore it) rather than discarding it (which would be silent data
+ *     loss against a ledger that still records the install).
+ *  3. `applying`, no ledger match (or ledger match with dest absent) ⇒ roll back
+ *     through the guarded, idempotent decision table below (mirroring
+ *     `rollbackInstallCommit`'s order).
+ *
+ * Crash-safety of recovery itself: the journal is removed LAST, after all
+ * restore/discard renames, and every step is a single atomic rename guarded by
+ * existence probes — so a crash mid-recovery leaves the journal intact and a
+ * strict subset of the work done; the next attempt re-derives state from disk
+ * and continues (the dest-absent arm of case (b) and the touch-nothing arm of
+ * case (c) ARE the mid-rollback resume states). Running it twice is a no-op the
+ * second time.
+ *
+ * Any refusal (invalid journal, defsDir mismatch, symlink where a directory is
+ * expected, contradictory disk state) throws WITHOUT mutating anything and
+ * leaves the journal in place; `dispatchAdd` sets `preserveStagingRoot` so its
+ * `finally` cannot then destroy the backups a later attempt needs.
+ */
+export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): void {
+  const { defsDir, journalPath, lockfilePath } = args;
+  const journal = readAddJournal(journalPath);
+  if (journal === null) return; // no interrupted install — happy path, unchanged.
+
+  // An interrupted install in a DIFFERENT defs tree: recovering "here" would act
+  // on paths this invocation was never pointed at, and trusting the recorded
+  // absolute path would let a crafted journal point mutations anywhere. Fail
+  // closed — the operator must re-run with the same --defs/OWENLOOP_DEFS.
+  if (resolve(journal.defsDir) !== resolve(defsDir)) {
+    throw recoveryRefusal(
+      journalPath,
+      `journal records defs dir '${journal.defsDir}', but this add resolved '${resolve(defsDir)}' ` +
+        `(re-run add with the same --defs/OWENLOOP_DEFS)`,
+    );
+  }
+
+  // Every mutation path is derived HERE from the current defsDir + the validated
+  // single segments — never from the recorded absolute defsDir. These are
+  // exactly the derivations commitInstall/parkOldNameDir use.
+  const stagingRoot = join(defsDir, STAGING_DIRNAME);
+  const stagingDir = join(stagingRoot, journal.stagingId);
+  const backupDir = `${stagingDir}-old`;
+  const undoDir = `${stagingDir}-undo`;
+  const parkedOldName = `${undoDir}-oldname`;
+  const dest = join(defsDir, journal.folder);
+  const oldNameOriginal = journal.oldNamePath !== undefined ? join(defsDir, journal.oldNamePath) : undefined;
+
+  // Symlink-guard the staging ROOT itself before deriving any mutation from it.
+  // `dispatchAdd`'s `mkdirRefusingSymlink` guards `.owenloop` and the default
+  // defsDir, but NOT `<defsDir>/.owenloop-staging` — and stagingDir/backupDir/
+  // undoDir/parkedOldName all hang off it, so a hostile checkout that ships
+  // `.owenloop-staging` as a symlink would make every rename/rm below act
+  // through it, moving/deleting dirs OUTSIDE defsDir. `lstat` (never `stat`) so
+  // the link is seen as a link; a non-dir squatting there is refused too; absent
+  // is fine (a fresh recovery mkdirs it). This runs BEFORE any fs mutation, and
+  // recovery now precedes dispatchAdd's `rmSync(stagingRoot)`, so nothing else
+  // clears it first.
+  const stagingRootSt = lstatSync(stagingRoot, { throwIfNoEntry: false });
+  if (stagingRootSt?.isSymbolicLink()) {
+    throw recoveryRefusal(journalPath, `staging root '${stagingRoot}' is a symlink`);
+  }
+  if (stagingRootSt && !stagingRootSt.isDirectory()) {
+    throw recoveryRefusal(journalPath, `staging root '${stagingRoot}' is not a directory`);
+  }
+
+  // Belt-and-braces containment: re-assert that EVERY rename/rm source and target
+  // resolves under defsDir — not just dest/oldNameOriginal, but every staging-
+  // root-derived path too (a crafted journal + a symlinked staging root must not
+  // drive a mutation outside the tree). Single-segment folder/oldNamePath/
+  // stagingId already make lexical traversal unrepresentable; this is the extra
+  // guard the review asked for on the staging-derived paths.
+  for (const p of [stagingRoot, stagingDir, backupDir, undoDir, parkedOldName, dest]) {
+    assertUnderDefs(p, defsDir, journalPath);
+  }
+  if (oldNameOriginal !== undefined) assertUnderDefs(oldNameOriginal, defsDir, journalPath);
+
+  // Roll forward: the ledger is durably new; discard the retained backup + parked
+  // old-name dir and clear the staging root, then drop the journal. Symlink-
+  // guarded before each rm; both dirs live under the staging root, so the final
+  // clear is the real cleanup — the explicit rms honor "refuse a symlink" first.
+  const rollForward = (): void => {
+    if (probeRecoveryDir(backupDir, journalPath, 'backup dir') === 'dir') {
+      rmSync(backupDir, { recursive: true, force: true });
+    }
+    if (probeRecoveryDir(parkedOldName, journalPath, 'parked old-name dir') === 'dir') {
+      rmSync(parkedOldName, { recursive: true, force: true });
+    }
+    rmSync(stagingRoot, { recursive: true, force: true });
+    removeAddJournal(journalPath);
+  };
+
+  if (journal.phase === 'finalizing') {
+    rollForward();
+    return;
+  }
+
+  // phase === 'applying': the ledger write may or may not have landed. Read it
+  // (fail-closed validation applies — a corrupt ledger aborts the add exactly as
+  // it does today) and check whether it already records this exact install.
+  const lf = readLockfile(lockfilePath);
+  const installed = lf.installed[journal.source];
+  if (installed && installed.sha === journal.sha && installed.path === journal.folder) {
+    // The ledger records this exact source@sha — but a ledger match ALONE does
+    // NOT prove the commit swap landed. Branch on ACTUAL disk state:
+    //  - dest PRESENT ⇒ the swap completed (a crash in the writeLockfile→phase-
+    //    rewrite window, or a same-sha re-add already past the swap): dest holds
+    //    that sha's content, so (defs ⇔ ledger) is consistent ⇒ roll forward
+    //    (discard the now-stale backup).
+    //  - dest ABSENT ⇒ we are inside commitInstall's 4a→4b window of a SAME-sha
+    //    re-add (dest was renamed to backupDir, and the staging→dest swap never
+    //    ran). backupDir now holds the ONLY copy of the content. Rolling forward
+    //    would `rmSync` it — silent data loss, leaving the ledger claiming an
+    //    install that is gone from disk. Fall THROUGH to the roll-back table,
+    //    which restores backupDir → dest; the ledger already records this sha, so
+    //    the restored state is consistent. The two cases are distinguishable by
+    //    disk, so branch on it rather than trusting the ledger match alone.
+    if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
+      rollForward();
+      return;
+    }
+  }
+
+  // ROLL BACK — restore the pre-commit directory state. Guarded idempotent
+  // renames mirroring rollbackInstallCommit's order; a symlinked source is
+  // refused fail-closed at each probe.
+  mkdirSync(stagingRoot, { recursive: true }); // ensure undo/backup renames have a home
+  const stagingState = probeRecoveryDir(stagingDir, journalPath, 'staging dir');
+  const backupState = probeRecoveryDir(backupDir, journalPath, 'backup dir');
+
+  if (stagingState === 'dir') {
+    // (a) Swap 4b (staging → dest) never happened.
+    if (backupState === 'dir') {
+      // Crash between 4a (dest → backup) and 4b: dest is necessarily absent.
+      // Restore the backup. Fail closed if dest unexpectedly exists too.
+      if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
+        throw recoveryRefusal(journalPath, `both the backup dir and destination '${dest}' exist`);
+      }
+      renameSync(backupDir, dest);
+    }
+    // else backup absent: dest still holds the original (upgrade, pre-backup) or
+    // is absent (fresh install, pre-swap) — already consistent, nothing to move.
+  } else if (backupState === 'dir') {
+    // (b) Staging gone, backup present — an upgrade crashed AFTER the swap.
+    if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
+      // Park the new content aside, then restore the backup over dest.
+      if (probeRecoveryDir(undoDir, journalPath, 'undo dir') === 'dir') {
+        throw recoveryRefusal(journalPath, `undo dir '${undoDir}' already exists`);
+      }
+      renameSync(dest, undoDir);
+      renameSync(backupDir, dest);
+    } else {
+      // dest absent: a prior rollback/recovery died between its two renames (the
+      // new content is already parked under undoDir) — just restore the backup.
+      renameSync(backupDir, dest);
+    }
+  } else {
+    // (c) Staging gone, backup gone.
+    if (!journal.hadDest) {
+      // Fresh install: if the swap put new content at dest, discard it. This is
+      // the fix for today's permanent "not owned" refusal after a fresh-install
+      // crash between the swap and the ledger write.
+      if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
+        if (probeRecoveryDir(undoDir, journalPath, 'undo dir') === 'dir') {
+          throw recoveryRefusal(journalPath, `undo dir '${undoDir}' already exists`);
+        }
+        renameSync(dest, undoDir);
+      }
+    }
+    // hadDest === true: the backup was already restored (a completed in-process
+    // rollback whose journal-remove failed, or a prior recovery attempt) — dirs
+    // are consistent; touch nothing.
+  }
+
+  // (d) Restore a parked old-name dir to where the (unchanged) ledger expects it.
+  if (oldNameOriginal !== undefined) {
+    if (probeRecoveryDir(parkedOldName, journalPath, 'parked old-name dir') === 'dir') {
+      if (probeRecoveryDir(oldNameOriginal, journalPath, 'old-name original') === 'dir') {
+        // Both present is contradictory — unreachable under the single-writer
+        // lock, so don't guess which to keep.
+        throw recoveryRefusal(
+          journalPath,
+          `both the parked old-name dir and its original '${oldNameOriginal}' exist`,
+        );
+      }
+      renameSync(parkedOldName, oldNameOriginal);
+    }
+    // parked absent ⇒ already restored (idempotent re-run) — skip.
+  }
+
+  // (e) The undo/backup leftovers are debris now; clear the staging root and
+  // remove the journal LAST so a crash before this leaves everything replayable.
+  rmSync(stagingRoot, { recursive: true, force: true });
+  removeAddJournal(journalPath);
 }

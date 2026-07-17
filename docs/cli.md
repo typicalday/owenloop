@@ -102,8 +102,29 @@ leaving the lockfile unchanged, with no staging debris. The one deliberate
 exception is a rollback double fault — the follow-on step fails *and* restoring
 the directory state fails too — where the displaced previous content is
 intentionally preserved under `<defsDir>/.owenloop-staging/` and the error
-names that path; recover it before re-running `add`, since the next `add`
-clears that directory as debris.
+names that path; recover it before re-running `add`.
+
+Those rollbacks cover *in-process* failures — a thrown error `add` catches. A
+hard kill (SIGKILL, power loss) partway through the commit skips them entirely,
+so `add` also keeps a one-record crash-recovery journal at
+`.owenloop/add.journal`: it is written just before the first destructive step
+(phase `applying`), advanced to `finalizing` the instant the lockfile write —
+the commit point — succeeds, and removed once the install finishes. The next
+`add` reads it under the same lock, *before* clearing staging, and brings the
+tree back to a consistent (defs ⇔ ledger) state: at or past the commit point it
+rolls **forward** (discards the retained backup and finishes the install);
+before it, it rolls **back** (restores the previous install, or discards an
+orphaned fresh-install directory — the case that used to strand an unowned
+folder and make every later `add` refuse). Recovery is idempotent and re-derives
+every path it touches from the current defs directory, so a crash *during*
+recovery just replays. The journal is treated as hostile input exactly like the
+lockfile: it is validated fail-closed (every path field a safe single segment),
+its recorded defs directory must match this run's, and a symlink where a
+directory is expected is refused — any bad shape, mismatch, or contradictory
+on-disk state refuses with no filesystem mutation and leaves the journal in
+place as evidence. A rollback double fault likewise leaves the journal behind,
+so the next `add` retries the restore automatically before touching staging.
+
 Concurrent `add` runs in the same project serialize on a `.owenloop/add.lock`
 file; one that can't acquire the lock within 10s fails cleanly instead of
 interleaving with another install. `add` also refuses to replace a

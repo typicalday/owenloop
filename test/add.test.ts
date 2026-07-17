@@ -14,18 +14,24 @@ import { mainAsync } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
 import {
   acquireInstallLock,
+  ADD_JOURNAL_FILENAME,
   archivePathViolation,
   commitInstall,
   finalizeInstallCommit,
   installFolder,
   lockfilePathViolation,
   parkOldNameDir,
+  readAddJournal,
   readLockfile,
+  recoverInterruptedInstall,
   releaseInstallLock,
   rollbackInstallCommit,
   STAGING_DIRNAME,
+  validateAddJournal,
   validateLockfile,
+  writeAddJournal,
   writeLockfile,
+  type AddJournal,
   type Lockfile,
 } from '../src/add.ts';
 import { makeGithubTarball } from './helpers.ts';
@@ -1569,4 +1575,407 @@ test('mainAsync delegates every non-add command to the sync main() unchanged', a
   const code = await mainAsync(['defs'], io);
   assert.equal(code, 0, out.join('\n'));
   assert.ok(Array.isArray(JSON.parse(out.join('\n'))));
+});
+
+// ---- crash-recovery journal --------------------------------------------------
+//
+// A hard kill (SIGKILL / power loss) partway through the destructive part of an
+// install skips every in-process rollback arm. The journal + the next add's
+// `recoverInterruptedInstall` close that gap: it rolls a leftover install
+// FORWARD (at/past the ledger commit point) or BACK (before it) to a consistent
+// (defs ⇔ ledger) state. These tests build the crash-time on-disk state by hand
+// — exactly what a killed process would leave — and drive recovery directly, plus
+// one end-to-end path proving `add` runs recovery first.
+
+const OWNER = 'acme';
+const REPO = 'widgets';
+
+function journalPathOf(cwd: string): string {
+  return join(cwd, '.owenloop', ADD_JOURNAL_FILENAME);
+}
+function defsDirOf(cwd: string): string {
+  return join(cwd, 'workflows');
+}
+/** Write a full, valid journal, overriding any fields the test cares about. */
+function seedJournal(cwd: string, over: Partial<AddJournal> = {}): AddJournal {
+  const journal: AddJournal = {
+    version: 1,
+    phase: 'applying',
+    source: `${OWNER}/${REPO}`,
+    sha: SHA_B,
+    folder: installFolder(OWNER, REPO),
+    stagingId: 'stg_test',
+    hadDest: false,
+    defsDir: defsDirOf(cwd),
+    ref: 'HEAD',
+    startedAt: 1,
+    ...over,
+  };
+  writeAddJournal(journalPathOf(cwd), journal);
+  return journal;
+}
+/** Run recovery against the standard cwd layout. */
+function recoverIn(cwd: string): void {
+  recoverInterruptedInstall({
+    defsDir: defsDirOf(cwd),
+    journalPath: journalPathOf(cwd),
+    lockfilePath: lockfilePath(cwd),
+  });
+}
+/** Create `dir` and drop a file in it — a stand-in for an install/backup dir. */
+function seedDir(dir: string, name: string, content: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, name), content);
+}
+/** The crash-time paths recovery derives, for a given cwd + stagingId. */
+function crashPaths(cwd: string, stagingId = 'stg_test'): {
+  defsDir: string;
+  dest: string;
+  stagingRoot: string;
+  stagingDir: string;
+  backupDir: string;
+  undoDir: string;
+  parkedOldName: string;
+} {
+  const defsDir = defsDirOf(cwd);
+  const stagingRoot = join(defsDir, STAGING_DIRNAME);
+  const stagingDir = join(stagingRoot, stagingId);
+  return {
+    defsDir,
+    dest: join(defsDir, installFolder(OWNER, REPO)),
+    stagingRoot,
+    stagingDir,
+    backupDir: `${stagingDir}-old`,
+    undoDir: `${stagingDir}-undo`,
+    parkedOldName: `${stagingDir}-undo-oldname`,
+  };
+}
+function seedLockfileEntry(cwd: string, sha: string, path: string): void {
+  writeLockfile(lockfilePath(cwd), {
+    version: 1,
+    installed: {
+      [`${OWNER}/${REPO}`]: {
+        source: `${OWNER}/${REPO}`,
+        ref: 'HEAD',
+        sha,
+        installedAt: 1,
+        path,
+        files: ['foo.yaml'],
+      },
+    },
+  });
+}
+
+test('recovery: a successful add leaves no crash-recovery journal behind', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const r = await addInto(cwd, OWNER, REPO, SHA_A, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(r.code, 0, r.out.join('\n'));
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed on the happy path');
+});
+
+test('recovery: phase `finalizing` rolls forward — discards the retained backup and clears staging', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  // Committed state: new content at dest, previous version retained as a backup,
+  // plus leftover staging debris — the ledger already durably records the new
+  // install, so only finalize's discards are missing.
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'PREV');
+  seedDir(p.stagingDir, 'foo.yaml', 'NEW');
+  seedJournal(cwd, { phase: 'finalizing', hadDest: true });
+
+  recoverIn(cwd);
+
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'NEW', 'installed content kept');
+  assert.ok(!existsSync(p.backupDir), 'retained backup discarded');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('recovery: phase `applying` with a matching ledger rolls forward (commit point already passed)', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // The ledger write landed but the journal was never advanced to `finalizing`
+  // (a crash in that tiny window): dest holds the new sha, the ledger records it.
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'PREV');
+  seedLockfileEntry(cwd, SHA_B, folder);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+  seedJournal(cwd, { phase: 'applying', hadDest: true, sha: SHA_B, folder });
+
+  recoverIn(cwd);
+
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'NEW', 'install kept — ledger already agrees');
+  assert.ok(!existsSync(p.backupDir), 'retained backup discarded');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'ledger untouched');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('recovery: an upgrade killed after the swap rolls back to the previous install, idempotently', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // Swap done (dest = NEW), backup retained (= PREV), ledger NOT yet updated
+  // (still records the old sha at the same folder) — before the commit point.
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'PREV');
+  seedLockfileEntry(cwd, SHA_A, folder);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+  seedJournal(cwd, { phase: 'applying', hadDest: true, sha: SHA_B, folder });
+
+  recoverIn(cwd);
+
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'PREV', 'previous install restored');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'ledger unchanged (still the old sha)');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+
+  // Idempotent: a second recovery pass (journal now gone) is a clean no-op.
+  recoverIn(cwd);
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'PREV', 'still the previous install');
+});
+
+test('recovery: a fresh install killed after the swap discards the orphan dir (fixes the permanent not-owned refusal)', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  // Fresh install: no prior dest (hadDest=false), so no backup. The swap put NEW
+  // at dest but the ledger write never happened — today this strands an unowned
+  // dir that makes every future add refuse. Recovery must discard it.
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedJournal(cwd, { phase: 'applying', hadDest: false, sha: SHA_B, folder: installFolder(OWNER, REPO) });
+
+  recoverIn(cwd);
+
+  assert.ok(!existsSync(p.dest), 'orphaned fresh-install dir discarded');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+
+  // And the source installs cleanly afterwards — no lingering not-owned refusal.
+  const r = await addInto(cwd, OWNER, REPO, SHA_A, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(r.code, 0, r.err.join('\n'));
+  assert.ok(existsSync(join(p.dest, 'foo.yaml')), 'clean install lands');
+});
+
+test('recovery: an old-name migration killed before the ledger restores the old dir and drops the hashed one', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  const oldRel = `${OWNER}-${REPO}`;
+  const oldOriginal = join(p.defsDir, oldRel);
+  // Migration crash: fresh hashed dir swapped in (NEW, hadDest=false), old-name
+  // dir parked aside, ledger still records the OLD path/sha. Roll back: discard
+  // the hashed dir, restore the parked old-name dir where the ledger expects it.
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedDir(p.parkedOldName, 'foo.yaml', 'OLD');
+  seedLockfileEntry(cwd, SHA_A, oldRel);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+  seedJournal(cwd, { phase: 'applying', hadDest: false, sha: SHA_B, folder, oldNamePath: oldRel });
+
+  recoverIn(cwd);
+
+  assert.ok(!existsSync(p.dest), 'hashed dir discarded');
+  assert.equal(readFileSync(join(oldOriginal, 'foo.yaml'), 'utf8'), 'OLD', 'old-name dir restored in place');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'ledger unchanged (still the old path)');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('recovery: resumes a rollback that itself died between its two renames', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // A prior rollback parked the new content under undoDir, then died BEFORE
+  // restoring the backup: dest is absent, backup still present. Recovery just
+  // finishes the restore.
+  seedDir(p.undoDir, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'PREV');
+  seedLockfileEntry(cwd, SHA_A, folder);
+  seedJournal(cwd, { phase: 'applying', hadDest: true, sha: SHA_B, folder });
+
+  recoverIn(cwd);
+
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'PREV', 'backup restored over the absent dest');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('recovery: an already-restored rollback just clears the leftover journal (touches nothing)', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // In-process rollback finished (dest = PREV again, no backup/staging) but the
+  // journal-remove never ran. No ledger match ⇒ roll-back path, which finds the
+  // dirs already consistent and only needs to drop the journal.
+  seedDir(p.dest, 'foo.yaml', 'PREV');
+  seedLockfileEntry(cwd, SHA_A, folder);
+  seedJournal(cwd, { phase: 'applying', hadDest: true, sha: SHA_B, folder });
+
+  recoverIn(cwd);
+
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'PREV', 'restored dest left as-is');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'leftover journal removed');
+});
+
+test('recovery: refuses a journal that resolved a DIFFERENT defs dir, mutating nothing', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedJournal(cwd, { phase: 'finalizing', defsDir: join(cwd, 'some-other-defs') });
+
+  assert.throws(() => recoverIn(cwd), /journal records defs dir/);
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'NEW', 'no mutation on refusal');
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left in place as evidence');
+});
+
+test('recovery: refuses a crafted journal whose folder tries to traverse out of the tree', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const victim = join(cwd, 'victim');
+  seedDir(victim, 'keep.txt', 'do not touch');
+  // Hand-write a poisoned journal (writeAddJournal would not accept the bad type).
+  mkdirSync(join(cwd, '.owenloop'), { recursive: true });
+  writeFileSync(
+    journalPathOf(cwd),
+    JSON.stringify({
+      version: 1,
+      phase: 'applying',
+      source: `${OWNER}/${REPO}`,
+      sha: SHA_B,
+      folder: '../victim',
+      stagingId: 'stg_test',
+      hadDest: true,
+      defsDir: defsDirOf(cwd),
+      ref: 'HEAD',
+      startedAt: 1,
+    }),
+  );
+
+  assert.throws(() => recoverIn(cwd), /invalid crash-recovery journal/);
+  assert.equal(readFileSync(join(victim, 'keep.txt'), 'utf8'), 'do not touch', 'out-of-tree victim untouched');
+});
+
+test('recovery: refuses when a directory it would rename is actually a symlink (A2)', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const victim = join(cwd, 'victim');
+  seedDir(victim, 'keep.txt', 'do not touch');
+  // Roll-back path, case (a): staging + backup both present, but dest is a
+  // symlink — recovery must refuse (never rename/rm through a link) before acting.
+  seedDir(p.stagingDir, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'PREV');
+  mkdirSync(p.defsDir, { recursive: true });
+  symlinkSync(victim, p.dest);
+  seedJournal(cwd, { phase: 'applying', hadDest: true, sha: SHA_B });
+
+  assert.throws(() => recoverIn(cwd), /is a symlink/);
+  assert.ok(existsSync(p.backupDir), 'backup untouched on refusal');
+  assert.equal(readFileSync(join(victim, 'keep.txt'), 'utf8'), 'do not touch', 'symlink target untouched');
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left as evidence');
+});
+
+test('recovery: a SAME-sha re-add killed between the dest→backup and staging→dest renames restores from backup (no silent data loss)', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // Re-adding an already-installed source at the SAME sha. commitInstall renamed
+  // dest → backupDir (step 4a) and the process was killed BEFORE the staging →
+  // dest swap (4b): dest is ABSENT, staging is still present, and backupDir holds
+  // the ONLY surviving copy of the installed content. The ledger already records
+  // this exact sha+folder from the prior successful install, so the `applying` +
+  // ledger-match test passes — but rolling FORWARD here would rmSync backupDir and
+  // leave the ledger claiming an install that is gone from disk (silent data
+  // loss). Recovery must branch on disk state and restore backupDir → dest.
+  seedDir(p.stagingDir, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'INSTALLED'); // the only surviving copy
+  seedLockfileEntry(cwd, SHA_B, folder);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+  seedJournal(cwd, { phase: 'applying', hadDest: true, sha: SHA_B, folder });
+
+  recoverIn(cwd);
+
+  assert.ok(existsSync(p.dest), 'dest restored — content not lost');
+  assert.equal(
+    readFileSync(join(p.dest, 'foo.yaml'), 'utf8'),
+    'INSTALLED',
+    'installed content restored from backup, not discarded',
+  );
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'ledger untouched (still records the install)');
+  assert.ok(!existsSync(p.backupDir), 'backup consumed by the restore');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('recovery: refuses a VALID journal when the staging root is a planted symlink — no mutation outside defsDir', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // The attacker's out-of-tree directory the symlinked staging root points at.
+  const outside = mkdtempSync(join(tmpdir(), 'owenloop-outside-'));
+  const outsideBefore = readdirSync(outside);
+  // Hostile checkout: `workflows/` and `.owenloop/` ship as REAL dirs (pass
+  // SEC-3), the in-tree dest holds a real victim dir, and `.owenloop-staging` is
+  // planted as a SYMLINK to the attacker's outside dir. The journal is fully VALID
+  // (single-segment folder inside defsDir, matching defsDir, applying,
+  // hadDest=false, empty ledger) so validateAddJournal accepts it. Recovery would
+  // otherwise take roll-back case (c) `!hadDest` with dest present:
+  // renameSync(dest, undoDir) where undoDir sits UNDER the symlinked staging root,
+  // moving the victim OUTSIDE defsDir. Recovery must refuse before any fs mutation.
+  mkdirSync(p.defsDir, { recursive: true });
+  seedDir(p.dest, 'foo.yaml', 'VICTIM');
+  symlinkSync(outside, p.stagingRoot);
+  seedJournal(cwd, { phase: 'applying', hadDest: false, sha: SHA_B, folder });
+
+  assert.throws(() => recoverIn(cwd), /staging root .* is a symlink/);
+
+  // NO fs mutation anywhere: the victim dir is intact in place, nothing landed in
+  // the attacker's outside dir, and the journal is left as evidence.
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'VICTIM', 'in-tree victim dir untouched');
+  assert.deepEqual(readdirSync(outside), outsideBefore, 'nothing moved into the attacker dir');
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left in place as evidence');
+});
+
+test('validateAddJournal / readAddJournal: reject unknown phase, bad version, and corrupt JSON', () => {
+  const base = {
+    version: 1,
+    phase: 'applying',
+    source: `${OWNER}/${REPO}`,
+    sha: SHA_B,
+    folder: installFolder(OWNER, REPO),
+    stagingId: 'stg_test',
+    hadDest: true,
+    defsDir: '/x',
+    ref: 'HEAD',
+    startedAt: 1,
+  };
+  assert.throws(() => validateAddJournal({ ...base, phase: 'bogus' }, '/j'), /unknown phase/);
+  assert.throws(() => validateAddJournal({ ...base, version: 2 }, '/j'), /unsupported journal version/);
+  assert.throws(() => validateAddJournal({ ...base, sha: 'nothex' }, '/j'), /40-char hex/);
+
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-journal-'));
+  const jp = join(dir, 'add.journal');
+  writeFileSync(jp, '{ truncated');
+  assert.throws(() => readAddJournal(jp), /corrupt crash-recovery journal/);
+  // Absent ⇒ null (the happy path — nothing to recover).
+  assert.equal(readAddJournal(join(dir, 'nope.journal')), null);
+});
+
+test('recovery: end-to-end — a real add rolls a leftover install forward before installing', async () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  // Leftover from a crash past the commit point: dest committed, backup retained,
+  // ledger recorded, journal stuck at `finalizing`. The very next `add` (same
+  // source, new sha) must run recovery first, then upgrade cleanly.
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'PREV');
+  seedLockfileEntry(cwd, SHA_B, folder);
+  seedJournal(cwd, { phase: 'finalizing', hadDest: true, sha: SHA_B, folder });
+
+  const r = await addInto(cwd, OWNER, REPO, SHA_C, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(r.code, 0, r.err.join('\n'));
+
+  const lf = readLockfile(lockfilePath(cwd));
+  assert.equal(lf.installed[`${OWNER}/${REPO}`]!.sha, SHA_C, 'upgraded to the new sha after recovery');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+  assert.ok(!existsSync(p.stagingRoot), 'no staging debris left behind');
 });
