@@ -20,7 +20,7 @@ positional or the next `--flag`, never consumed as this flag's argument. Use
 |---|---|
 | `defs` | list available workflow definitions |
 | `add <owner>/<repo>[@ref]` | fetch, validate, and install a repo's workflow defs from GitHub (public repos only) — see below |
-| `login [--hub <url>] [--with-token]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login-connect-push-logout) |
+| `login [--hub <url>] [--with-token]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
 | `push [<defName>...] [--force] [--dry-run]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
 | `logout [--hub <url>]` | delete the stored credential for a hub |
