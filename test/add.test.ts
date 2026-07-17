@@ -98,13 +98,16 @@ function fakeFetch(responses: Record<string, { status: number; body: string | Bu
 }
 
 /** A CliIO bound to a fresh temp cwd, with the given injected fetch. */
-function makeIo(fetchFn: typeof globalThis.fetch): { io: CliIO; cwd: string; out: string[]; err: string[] } {
+function makeIo(
+  fetchFn: typeof globalThis.fetch,
+  env: Record<string, string> = {},
+): { io: CliIO; cwd: string; out: string[]; err: string[] } {
   const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
   const out: string[] = [];
   const err: string[] = [];
   const io: CliIO = {
     cwd,
-    env: {},
+    env,
     out: (s) => out.push(s),
     err: (s) => err.push(s),
     fetch: fetchFn,
@@ -1308,6 +1311,100 @@ test('parkOldNameDir: a traversing oldRelPath throws and never touches the out-o
 
   assert.equal(readFileSync(join(victim, 'keep.txt'), 'utf8'), 'do not delete me', 'victim untouched');
   assert.ok(existsSync(victim), 'victim dir still present');
+});
+
+// ---- SEC-3: add refuses symlinked default state dirs -------------------------
+
+/**
+ * Canned fetch + spec for an otherwise-valid single-def install. The hostile
+ * layout is applied by the caller on the returned cwd BEFORE running the add;
+ * the guard fires after the fetch, so the tarball responses are still needed.
+ */
+function validAddFetch(owner: string, repo: string): typeof globalThis.fetch {
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
+    'workflows/foo.yaml': validDefYaml('foo'),
+  });
+  return fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  }).fetch;
+}
+
+test('SEC-3: add refuses a symlinked `.owenloop`; the link target gains no lock/ledger and nothing is committed', async () => {
+  const { io, cwd, err } = makeIo(validAddFetch('acme', 'widgets'));
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-add-elsewhere-'));
+  symlinkSync(elsewhere, join(cwd, '.owenloop'));
+
+  const code = await mainAsync(['add', 'acme/widgets'], io);
+  assert.equal(code, 1, err.join('\n'));
+  assert.match(err.join('\n'), /refusing to write under/);
+  assert.match(err.join('\n'), /symbolic link/);
+  assert.deepEqual(readdirSync(elsewhere), [], 'no add.lock or installed.json written through the link');
+  assert.equal(
+    existsSync(join(cwd, 'workflows', installFolder('acme', 'widgets'))),
+    false,
+    'no install dir was committed',
+  );
+});
+
+test('SEC-3: add refuses a symlinked default `workflows`; the link target is untouched and no ledger is written', async () => {
+  const { io, cwd, err } = makeIo(validAddFetch('acme', 'widgets'));
+  // A REAL (absent) `.owenloop` — the parent guard passes — but the default
+  // defs dir is a symlink out of tree.
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-add-defs-'));
+  symlinkSync(elsewhere, join(cwd, 'workflows'));
+
+  const code = await mainAsync(['add', 'acme/widgets'], io);
+  assert.equal(code, 1, err.join('\n'));
+  assert.match(err.join('\n'), /refusing to write under/);
+  assert.match(err.join('\n'), /symbolic link/);
+  assert.deepEqual(readdirSync(elsewhere), [], 'no staging or install dir written through the link');
+  assert.equal(existsSync(lockfilePath(cwd)), false, 'guard fired before the lockfile write; no ledger');
+});
+
+test('SEC-3: add refuses a DANGLING symlinked default `workflows` and does not create the link target', async () => {
+  const { io, cwd, err } = makeIo(validAddFetch('acme', 'widgets'));
+  const target = join(cwd, 'nonexistent');
+  symlinkSync(target, join(cwd, 'workflows'));
+
+  const code = await mainAsync(['add', 'acme/widgets'], io);
+  assert.equal(code, 1, err.join('\n'));
+  assert.match(err.join('\n'), /symbolic link/);
+  assert.equal(existsSync(target), false, 'the dangling link target was not created');
+});
+
+test('SEC-3: an explicit --defs through a symlink still installs (operator intent preserved)', async () => {
+  const { io, cwd, out } = makeIo(validAddFetch('acme', 'widgets'));
+  // `.owenloop` is NOT a symlink here (its guard is unconditional and would
+  // refuse first); only the explicit defs target is a symlink.
+  const real = mkdtempSync(join(tmpdir(), 'owenloop-add-realdefs-'));
+  const link = join(cwd, 'defs-link');
+  symlinkSync(real, link);
+
+  const code = await mainAsync(['add', 'acme/widgets', '--defs', link], io);
+  assert.equal(code, 0, out.join('\n'));
+  assert.ok(
+    existsSync(join(real, installFolder('acme', 'widgets'), 'foo.yaml')),
+    'def installed through the explicit defs symlink',
+  );
+  const lf = JSON.parse(readFileSync(lockfilePath(cwd), 'utf8'));
+  assert.equal(lf.installed['acme/widgets'].sha, SHA_A, 'ledger entry written');
+});
+
+test('SEC-3: an explicit OWENLOOP_DEFS through a symlink still installs (env-form operator intent)', async () => {
+  const real = mkdtempSync(join(tmpdir(), 'owenloop-add-realdefsenv-'));
+  // Build cwd first so the link can live inside it, then point the env at it.
+  const { io, cwd, out } = makeIo(validAddFetch('acme', 'widgets'));
+  const link = join(cwd, 'defs-env-link');
+  symlinkSync(real, link);
+  io.env = { OWENLOOP_DEFS: link };
+
+  const code = await mainAsync(['add', 'acme/widgets'], io);
+  assert.equal(code, 0, out.join('\n'));
+  assert.ok(
+    existsSync(join(real, installFolder('acme', 'widgets'), 'foo.yaml')),
+    'def installed through the explicit OWENLOOP_DEFS symlink',
+  );
 });
 
 // ---- parseRepoSpec: charset tightening ---------------------------------------
