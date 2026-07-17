@@ -741,9 +741,9 @@ export function releaseInstallLock(handle: InstallLockHandle): void {
 
 // ---- crash-recovery journal ------------------------------------------------
 //
-// A process that dies (crash, SIGKILL, power loss) partway through the
-// destructive part of an install — the `commitInstall` swap, the old-name park,
-// or the ledger write — must leave `.owenloop` recoverable to a consistent
+// A process that dies (crash, SIGKILL — see docs/cli.md on power-loss limits)
+// partway through the destructive part of an install — the `commitInstall` swap,
+// the old-name park, or the ledger write — must leave `.owenloop` recoverable to a consistent
 // (defs-on-disk ⇔ ledger) state by the NEXT `add`, never a half-applied tree.
 // Today's failure arms in `dispatchAdd` only cover IN-PROCESS failures (a throw
 // we catch and roll back); a hard kill skips them entirely. This journal closes
@@ -973,15 +973,21 @@ export interface RecoverInterruptedInstallArgs {
  *     loss against a ledger that still records the install).
  *  3. `applying`, no ledger match (or ledger match with dest absent) ⇒ roll back
  *     through the guarded, idempotent decision table below (mirroring
- *     `rollbackInstallCommit`'s order).
+ *     `rollbackInstallCommit`'s order) — EXCEPT the case-(c) fresh-install
+ *     discard, which acts on the journal alone (staging + backup both absent) and
+ *     so requires LEDGER corroboration of an interrupted old-name migration
+ *     (`installed.path === journal.oldNamePath`) before it will delete an
+ *     existing dest; uncorroborated ⇒ refuse fail-closed, mutate nothing, leave
+ *     the journal and dest in place (the journal is repo-committable, so a forged
+ *     one must never drive a deletion).
  *
  * Crash-safety of recovery itself: the journal is removed LAST, after all
  * restore/discard renames, and every step is a single atomic rename guarded by
  * existence probes — so a crash mid-recovery leaves the journal intact and a
  * strict subset of the work done; the next attempt re-derives state from disk
- * and continues (the dest-absent arm of case (b) and the touch-nothing arm of
- * case (c) ARE the mid-rollback resume states). Running it twice is a no-op the
- * second time.
+ * and continues (the dest-absent arm of case (b), the touch-nothing arm of
+ * case (c), and the case-(c) uncorroborated refusal ARE the mid-rollback resume
+ * / fail-closed states). Running it twice is a no-op the second time.
  *
  * Any refusal (invalid journal, defsDir mismatch, symlink where a directory is
  * expected, contradictory disk state) throws WITHOUT mutating anything and
@@ -1127,10 +1133,50 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
   } else {
     // (c) Staging gone, backup gone.
     if (!journal.hadDest) {
-      // Fresh install: if the swap put new content at dest, discard it. This is
-      // the fix for today's permanent "not owned" refusal after a fresh-install
-      // crash between the swap and the ledger write.
+      // Fresh install: the swap may have put new content at dest. Discarding it
+      // (rename → undoDir, then rm with the staging root at step (e)) is the ONLY
+      // destructive arm that acts on the word of the journal alone — staging and
+      // backup are both absent by definition of case (c), so the journal is the
+      // only thing asserting this dir is a crash orphan. But the journal lives in
+      // repository-controlled content (`.owenloop/add.journal` is committable), so
+      // a hostile checkout can forge a schema-VALID `applying`/`hadDest:false`
+      // journal naming an existing UNRELATED workflow dir and drive its deletion.
+      // Fail closed: only delete when the LEDGER corroborates that this dest is a
+      // fresh hashed dir left by an interrupted OLD-NAME MIGRATION — i.e. the
+      // ledger still records `journal.source` at the migration's old-name path
+      // (`installed.path === journal.oldNamePath`). That is exactly the state of
+      // the corroborated old-name-migration crash; the parked old-name dir is NOT
+      // required as evidence (a crash in the swap→park window legitimately has no
+      // parked dir yet). Anything else — no ledger entry, or an entry at some
+      // other path (including `journal.folder` itself, which contradicts
+      // `hadDest:false`) — is uncorroborated: refuse, mutate nothing, leave the
+      // journal AND dest in place as evidence.
+      //
+      // Deliberate, documented regression: the genuine fresh-install crash between
+      // the swap and the ledger write (dest present, no ledger, no staging, no
+      // backup) is on-disk INDISTINGUISHABLE from the forgery — every
+      // distinguishing artifact is itself repo-committable and therefore forgeable
+      // — so it now fails closed here instead of auto-discarding. The error names
+      // the manual remedy. Raising the bar from "journal alone" to "journal +
+      // corroborating ledger" is the scope; moving/authenticating recovery state
+      // OUTSIDE repository-controlled content is the tracked follow-up (an attacker
+      // who forges BOTH the journal and a matching ledger old-name entry — or a
+      // backup dir, reaching case (b) — can still drive destructive recovery).
       if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
+        const migrationCorroborated =
+          journal.oldNamePath !== undefined &&
+          installed !== undefined &&
+          installed.path === journal.oldNamePath;
+        if (!migrationCorroborated) {
+          throw recoveryRefusal(
+            journalPath,
+            `journal claims an interrupted fresh install of '${journal.folder}', but nothing ` +
+              `corroborates it (no ledger entry for this source at the journal's old-name path, ` +
+              `no staging dir, no backup) while '${dest}' exists — refusing to discard that ` +
+              `directory. If you did not run an interrupted add in this checkout, remove the ` +
+              `journal; if a fresh install really was interrupted, remove '${dest}' as well`,
+          );
+        }
         if (probeRecoveryDir(undoDir, journalPath, 'undo dir') === 'dir') {
           throw recoveryRefusal(journalPath, `undo dir '${undoDir}' already exists`);
         }

@@ -1579,8 +1579,8 @@ test('mainAsync delegates every non-add command to the sync main() unchanged', a
 
 // ---- crash-recovery journal --------------------------------------------------
 //
-// A hard kill (SIGKILL / power loss) partway through the destructive part of an
-// install skips every in-process rollback arm. The journal + the next add's
+// A hard kill (a process crash / SIGKILL / termination) partway through the
+// destructive part of an install skips every in-process rollback arm. The journal + the next add's
 // `recoverInterruptedInstall` close that gap: it rolls a leftover install
 // FORWARD (at/past the ledger commit point) or BACK (before it) to a consistent
 // (defs ⇔ ledger) state. These tests build the crash-time on-disk state by hand
@@ -1736,25 +1736,100 @@ test('recovery: an upgrade killed after the swap rolls back to the previous inst
   assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'PREV', 'still the previous install');
 });
 
-test('recovery: a fresh install killed after the swap discards the orphan dir (fixes the permanent not-owned refusal)', async () => {
+test('recovery: a fresh install killed after the swap now REFUSES fail-closed (dest present, uncorroborated)', async () => {
   const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
   const p = crashPaths(cwd);
-  // Fresh install: no prior dest (hadDest=false), so no backup. The swap put NEW
-  // at dest but the ledger write never happened — today this strands an unowned
-  // dir that makes every future add refuse. Recovery must discard it.
+  // Fresh install: no prior dest (hadDest=false), so no backup, no staging, no
+  // ledger entry. The swap put NEW at dest but the ledger write never happened.
+  // On disk this is INDISTINGUISHABLE from a forged journal naming an existing
+  // dir (every distinguishing artifact is repo-committable, hence forgeable), so
+  // the case-(c) discard now fails closed rather than deleting on the journal's
+  // word alone. Deliberate tradeoff: this narrow swap→ledger window regresses to
+  // a refusal that names the manual remedy, in exchange for never letting a
+  // forged journal delete an existing workflow dir.
   seedDir(p.dest, 'foo.yaml', 'NEW');
   seedJournal(cwd, { phase: 'applying', hadDest: false, sha: SHA_B, folder: installFolder(OWNER, REPO) });
 
-  recoverIn(cwd);
+  assert.throws(() => recoverIn(cwd), /nothing corroborates/);
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'NEW', 'dest survives untouched on refusal');
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left in place as evidence');
 
-  assert.ok(!existsSync(p.dest), 'orphaned fresh-install dir discarded');
-  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
-  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
-
-  // And the source installs cleanly afterwards — no lingering not-owned refusal.
+  // The operator applies the remedy the error names: remove the journal and the
+  // stranded dest. Afterwards the source installs cleanly — no lingering refusal.
+  rmSync(journalPathOf(cwd));
+  rmSync(p.dest, { recursive: true, force: true });
   const r = await addInto(cwd, OWNER, REPO, SHA_A, { 'workflows/foo.yaml': validDefYaml('foo') });
   assert.equal(r.code, 0, r.err.join('\n'));
-  assert.ok(existsSync(join(p.dest, 'foo.yaml')), 'clean install lands');
+  assert.ok(existsSync(join(p.dest, 'foo.yaml')), 'clean install lands after the manual remedy');
+});
+
+test('recovery: a forged journal naming an existing UNRELATED dir is refused — the victim survives (the re-audit repro)', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const defsDir = defsDirOf(cwd);
+  const victim = join(defsDir, 'victim');
+  // The exact confirmed reproduction: a schema-VALID `applying` journal with
+  // `hadDest:false` naming an existing installed workflow dir (`victim`), with NO
+  // matching ledger entry, NO staging dir, and NO backup. `folder` is a plain
+  // safe single segment (`'victim'`, not the hashed installFolder). Case (c)
+  // must fail closed — deleting on the journal's word alone is the data-integrity
+  // hole, since `.owenloop/add.journal` is repository-committable content.
+  seedDir(victim, 'keep.yaml', 'do not touch');
+  seedJournal(cwd, { phase: 'applying', hadDest: false, sha: SHA_B, folder: 'victim' });
+
+  assert.throws(() => recoverIn(cwd), /nothing corroborates/);
+  assert.ok(existsSync(victim), 'victim dir survives');
+  assert.equal(readFileSync(join(victim, 'keep.yaml'), 'utf8'), 'do not touch', 'victim content byte-identical');
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left in place as evidence');
+});
+
+test('recovery: a forged journal + a contradictory ledger entry at `folder` is still refused', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const defsDir = defsDirOf(cwd);
+  const victim = join(defsDir, 'victim');
+  // Adjacent forgery: same hostile state, but with a ledger entry for the source
+  // recorded at `path === journal.folder` ('victim') with a DIFFERENT sha. This
+  // is contradictory — if the ledger recorded the source installed at `folder`,
+  // `hadDest` could not have been false — and the sha mismatch keeps it out of
+  // the roll-forward ledger-match branch. The corroboration predicate requires
+  // `installed.path === journal.oldNamePath` (undefined here), so it still
+  // refuses; a forged ledger at `folder` must NOT re-open the delete.
+  seedDir(victim, 'keep.yaml', 'do not touch');
+  seedLockfileEntry(cwd, SHA_A, 'victim');
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+  seedJournal(cwd, { phase: 'applying', hadDest: false, sha: SHA_B, folder: 'victim' });
+
+  assert.throws(() => recoverIn(cwd), /nothing corroborates/);
+  assert.equal(readFileSync(join(victim, 'keep.yaml'), 'utf8'), 'do not touch', 'victim untouched');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'ledger untouched');
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left as evidence');
+});
+
+test('recovery: a corroborated old-name migration crashed BEFORE the park still discards the hashed dir (no parked dir required)', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const folder = installFolder(OWNER, REPO);
+  const oldRel = `${OWNER}-${REPO}`;
+  const oldOriginal = join(p.defsDir, oldRel);
+  // Migration crash in the swap→park window: fresh hashed dir swapped in (NEW,
+  // hadDest=false), the ledger still records the source at the OLD-name path, the
+  // journal carries `oldNamePath` — but the old-name dir was NEVER parked yet
+  // (it's still at its original location). The ledger corroborates the migration
+  // (`installed.path === journal.oldNamePath`), so the destructive discard must
+  // still proceed even though there is no parked dir to use as evidence. This
+  // guards the corroboration predicate against over-tightening to require a park.
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedDir(oldOriginal, 'foo.yaml', 'OLD'); // old-name dir still in place — never parked
+  seedLockfileEntry(cwd, SHA_A, oldRel);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+  seedJournal(cwd, { phase: 'applying', hadDest: false, sha: SHA_B, folder, oldNamePath: oldRel });
+
+  recoverIn(cwd);
+
+  assert.ok(!existsSync(p.dest), 'hashed dir discarded (corroborated migration)');
+  assert.equal(readFileSync(join(oldOriginal, 'foo.yaml'), 'utf8'), 'OLD', 'old-name dir left in place');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'ledger unchanged (still the old path)');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
 });
 
 test('recovery: an old-name migration killed before the ledger restores the old dir and drops the hashed one', () => {
