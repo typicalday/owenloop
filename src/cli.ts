@@ -52,17 +52,21 @@ import {
   acquireInstallLock,
   archivePathViolation,
   commitInstall,
+  finalizeInstallCommit,
   githubShaUrl,
   githubTarballUrl,
   installFolder,
+  parkOldNameDir,
   parseRepoSpec,
   readLockfile,
   releaseInstallLock,
+  rollbackInstallCommit,
+  RollbackFailedError,
   stageFiles,
   STAGING_DIRNAME,
   writeLockfile,
 } from './add.ts';
-import type { InstalledEntry } from './add.ts';
+import type { InstalledEntry, InstallCommitHandle } from './add.ts';
 import {
   asCreateWorkflowOk,
   asWhoami,
@@ -1006,9 +1010,11 @@ function statusEntry(engine: Engine, w: WorkflowRow): Record<string, unknown> {
  * (workflow-distribution Stage 1). Fetches a public GitHub repo's tarball,
  * validates its `workflows/**` defs with the same lint/check machinery
  * `owenloop lint`/`owenloop check` use, and — only if everything passes —
- * installs them under `<defsDir>/<owner>-<repo>/` and records provenance in
- * `.owenloop/installed.json`. A partial install is never left behind: any
- * refusal (parse/lint/validate/check failure) writes nothing.
+ * installs them under `<defsDir>/<installFolder(owner,repo)>/` and records
+ * provenance in `.owenloop/installed.json`. A partial install is never left
+ * behind: any refusal (parse/lint/validate/check failure) writes nothing, and
+ * even a failure of the lockfile write after the directory swap rolls the
+ * directory state back — the commit point is the durable lockfile write.
  *
  * Kept inside cli.ts (rather than add.ts) so it can reuse `Args`/`need`/
  * `last`/`CliError`/`parseJson`/`print`/`failureNote` without exporting them
@@ -1031,12 +1037,16 @@ const ADD_TARBALL_TIMEOUT_MS = 300_000;
  * take minutes and holding a lock that long would needlessly serialize
  * unrelated adds). Everything that touches project state then runs under the
  * per-project `.owenloop/add.lock`: stale-staging cleanup → lockfile read →
- * ownership check → stage → strict validation → atomic commit → lockfile write.
- * Deciding ownership and reading the lockfile INSIDE the lock is deliberate
- * (TOCTOU discipline — see the store-migration knowledge node); the install is
- * staged on the destination filesystem and swapped in with an atomic rename, so
- * any failure leaves the previous install and lockfile exactly as they were,
- * with no staging debris.
+ * ownership check → stage → strict validation → atomic commit (backups
+ * retained) → lockfile write → finalize (backups discarded). Deciding ownership
+ * and reading the lockfile INSIDE the lock is deliberate (TOCTOU discipline —
+ * see the store-migration knowledge node). The install is staged on the
+ * destination filesystem and swapped in with an atomic rename, but the displaced
+ * previous install and any old-name dir are kept until the lockfile write
+ * succeeds — the directory commit and the ledger write are one recoverable
+ * operation. Any failure before the lockfile is durably written rolls the
+ * directory state back and leaves the previous install and lockfile exactly as
+ * they were, with no staging debris.
  */
 async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const spec = need(args, 1, 'owner/repo[@ref]');
@@ -1145,6 +1155,10 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const stagingRoot = join(defsDir, STAGING_DIRNAME);
   const stagingDir = join(stagingRoot, randId('stg'));
   const lock = await acquireInstallLock(installLockPath);
+  // Set true only on a rollback double-fault, where the ONLY copy of the
+  // previous content ends up parked under the staging root — then the `finally`
+  // must NOT delete it (the error message tells the user to recover it).
+  let preserveStagingRoot = false;
   try {
     // The lock holder is the only legitimate writer under the staging root, so
     // anything already there is debris from a crashed/killed prior run — clear
@@ -1232,19 +1246,53 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
       );
     }
 
-    // 6. Commit: atomically swap the validated staging dir into place (with
-    //    rollback on failure), then remove any old-naming dir this source used
-    //    to occupy, then write the lockfile atomically.
-    commitInstall(defsDir, folder, stagingDir);
+    // 6. Commit as one recoverable operation: atomically swap the validated
+    //    staging dir into place (backups RETAINED, not dropped), park any
+    //    old-naming dir this source used to occupy, write the lockfile, and only
+    //    then finalize (discard the retained backups). If the lockfile write
+    //    fails after the swap, roll the directory state back so the previous
+    //    install and lockfile are left exactly as they were.
+    let handle: InstallCommitHandle;
+    try {
+      handle = commitInstall(defsDir, folder, stagingDir);
+    } catch (e) {
+      // commitInstall's own swap-then-rollback double-fault left the only copy
+      // of previous content under the staging root — keep it (see the `finally`).
+      if (e instanceof RollbackFailedError) preserveStagingRoot = true;
+      throw e;
+    }
     if (existing && existing.path !== folder) {
-      // Migrating off the old `<owner>-<repo>` scheme: this source owns the old
-      // dir per the lockfile, so it is safe to drop now that the new one is in.
-      rmSync(join(defsDir, existing.path), { recursive: true, force: true });
+      // Migrating off the old `<owner>-<repo>` scheme: park (not delete) the old
+      // dir so a lockfile-write failure below can restore it. Finalized away on
+      // success.
+      parkOldNameDir(handle, defsDir, existing.path);
     }
 
     const entry: InstalledEntry = { source, ref, sha, installedAt: nowMs(), path: folder, files: written };
     lf.installed[source] = entry;
-    writeLockfile(lockfilePath, lf);
+    try {
+      writeLockfile(lockfilePath, lf);
+    } catch (e) {
+      try {
+        rollbackInstallCommit(handle);
+      } catch (rollbackErr) {
+        // Double fault: the ledger write failed AND restoring the directory
+        // failed. The previous content is now parked under the staging root —
+        // preserve it past the `finally` and tell the user how to recover.
+        preserveStagingRoot = true;
+        throw new CliError(
+          `could not record install of ${source} in ${lockfilePath} (${(e as Error).message}) ` +
+            `and rolling the install back failed too (${(rollbackErr as Error).message}); ` +
+            `previous content preserved under ${stagingRoot} — recover it before running add again ` +
+            `(the next add clears that directory as debris)`,
+        );
+      }
+      throw new CliError(
+        `could not record install of ${source} in ${lockfilePath}: ${(e as Error).message} — ` +
+          `install rolled back, previous state restored`,
+      );
+    }
+    finalizeInstallCommit(handle);
 
     // 7. Report.
     print(io, {
@@ -1258,9 +1306,12 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     });
     return 0;
   } finally {
-    // On success the staging dir was renamed away and its backup removed; on
-    // failure this clears whatever staging debris is left. Then release the lock.
-    rmSync(stagingRoot, { recursive: true, force: true });
+    // On success the staging dir was renamed away and its retained backups
+    // finalized; on failure this clears whatever staging debris is left. The one
+    // exception is a rollback double-fault (`preserveStagingRoot`), where the
+    // only surviving copy of the previous content is parked here — leave it for
+    // the user to recover (the next add clears it as debris). Then release the lock.
+    if (!preserveStagingRoot) rmSync(stagingRoot, { recursive: true, force: true });
     releaseInstallLock(lock);
   }
 }

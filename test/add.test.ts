@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
@@ -15,9 +15,14 @@ import type { CliIO } from '../src/cli.ts';
 import {
   acquireInstallLock,
   archivePathViolation,
+  commitInstall,
+  finalizeInstallCommit,
   installFolder,
+  parkOldNameDir,
   readLockfile,
   releaseInstallLock,
+  rollbackInstallCommit,
+  STAGING_DIRNAME,
   writeLockfile,
   type Lockfile,
 } from '../src/add.ts';
@@ -681,6 +686,226 @@ test('add: pre-existing staging debris is cleared by a successful add', async ()
   const { code, out } = await addInto(cwd, owner, repo, SHA_A, { 'workflows/foo.yaml': validDefYaml('foo') });
   assert.equal(code, 0, out.join('\n'));
   assert.ok(!existsSync(join(cwd, 'workflows', '.owenloop-staging')), 'staging root removed after success');
+});
+
+// ---- lockfile write + directory commit are one recoverable operation ---------
+
+/**
+ * Inject a deterministic lockfile-write failure that fires AFTER the directory
+ * swap. `writeLockfile` writes to `${installed.json}.tmp.${process.pid}` before
+ * the atomic rename; the tests run in-process, so `process.pid` is ours. A
+ * DIRECTORY at that exact path makes `writeFileSync(tmp, …)` throw EISDIR at the
+ * lockfile-write stage — after the commit swap, before finalize — with no
+ * production test seam. Returns the injected path so the test can clean it up.
+ */
+function injectLockfileWriteFailure(cwd: string): string {
+  const owenloopDir = join(cwd, '.owenloop');
+  mkdirSync(owenloopDir, { recursive: true });
+  const injected = join(owenloopDir, `installed.json.tmp.${process.pid}`);
+  mkdirSync(injected, { recursive: true });
+  return injected;
+}
+
+test('add: a lockfile-write failure on a fresh install rolls back to nothing installed', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const injected = injectLockfileWriteFailure(cwd);
+
+  const { code, err } = await addInto(cwd, owner, repo, SHA_A, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(code, 1);
+  assert.match(err.join('\n'), /could not record install/);
+  assert.match(err.join('\n'), /rolled back, previous state restored/);
+  assert.match(err.join('\n'), /EISDIR/, 'underlying fs error surfaced');
+
+  const dest = join(cwd, 'workflows', installFolder(owner, repo));
+  assert.ok(!existsSync(dest), 'rolled back — no unmanaged install directory left behind');
+  assert.ok(!existsSync(lockfilePath(cwd)), 'no lockfile written');
+  assert.ok(!existsSync(join(cwd, 'workflows', STAGING_DIRNAME)), 'no staging debris');
+  rmSync(injected, { recursive: true, force: true });
+});
+
+test('add: a lockfile-write failure on a re-add restores the prior install and lockfile byte-for-byte', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  const a = await addInto(cwd, owner, repo, SHA_A, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(a.code, 0, a.out.join('\n'));
+  const dest = join(cwd, 'workflows', installFolder(owner, repo));
+  const fooBefore = readFileSync(join(dest, 'foo.yaml'), 'utf8');
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+
+  const injected = injectLockfileWriteFailure(cwd);
+  const b = await addInto(cwd, owner, repo, SHA_B, {
+    'workflows/foo.yaml': validDefYaml('foo'),
+    'workflows/extra.yaml': validDefYaml('extra'),
+  });
+  assert.equal(b.code, 1);
+  assert.match(b.err.join('\n'), /could not record install/);
+
+  assert.equal(readFileSync(join(dest, 'foo.yaml'), 'utf8'), fooBefore, 'prior install restored byte-identical');
+  assert.ok(!existsSync(join(dest, 'extra.yaml')), 'the v2-only file was never committed');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'lockfile unchanged');
+  assert.ok(!existsSync(join(cwd, 'workflows', STAGING_DIRNAME)), 'no staging debris');
+  rmSync(injected, { recursive: true, force: true });
+});
+
+test('add: a lockfile-write failure during old-name migration keeps the old dir and lockfile intact', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  // Manufacture pre-hash state: an old `<owner>-<repo>` dir this source owns.
+  const oldRel = `${owner}-${repo}`;
+  const oldDir = join(cwd, 'workflows', oldRel);
+  mkdirSync(oldDir, { recursive: true });
+  writeFileSync(join(oldDir, 'foo.yaml'), validDefYaml('foo'));
+  const seedLf: Lockfile = {
+    version: 1,
+    installed: {
+      [`${owner}/${repo}`]: {
+        source: `${owner}/${repo}`,
+        ref: 'HEAD',
+        sha: SHA_A,
+        installedAt: 1,
+        path: oldRel,
+        files: ['foo.yaml'],
+      },
+    },
+  };
+  writeLockfile(lockfilePath(cwd), seedLf);
+  const lockBefore = readFileSync(lockfilePath(cwd), 'utf8');
+
+  const injected = injectLockfileWriteFailure(cwd);
+  const b = await addInto(cwd, owner, repo, SHA_B, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(b.code, 1);
+  assert.match(b.err.join('\n'), /could not record install/);
+
+  assert.equal(readFileSync(join(oldDir, 'foo.yaml'), 'utf8'), validDefYaml('foo'), 'old-name dir still present');
+  assert.ok(!existsSync(join(cwd, 'workflows', installFolder(owner, repo))), 'hashed dir absent after rollback');
+  assert.equal(readFileSync(lockfilePath(cwd), 'utf8'), lockBefore, 'lockfile unchanged (still records the old path)');
+  assert.ok(!existsSync(join(cwd, 'workflows', STAGING_DIRNAME)), 'no staging debris');
+  rmSync(injected, { recursive: true, force: true });
+});
+
+test('add: an old-name migration success path installs the hashed dir, removes the old one, updates the lockfile', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+
+  const oldRel = `${owner}-${repo}`;
+  const oldDir = join(cwd, 'workflows', oldRel);
+  mkdirSync(oldDir, { recursive: true });
+  writeFileSync(join(oldDir, 'foo.yaml'), validDefYaml('foo'));
+  writeLockfile(lockfilePath(cwd), {
+    version: 1,
+    installed: {
+      [`${owner}/${repo}`]: {
+        source: `${owner}/${repo}`,
+        ref: 'HEAD',
+        sha: SHA_A,
+        installedAt: 1,
+        path: oldRel,
+        files: ['foo.yaml'],
+      },
+    },
+  });
+
+  const b = await addInto(cwd, owner, repo, SHA_B, { 'workflows/foo.yaml': validDefYaml('foo') });
+  assert.equal(b.code, 0, b.out.join('\n'));
+
+  assert.ok(
+    existsSync(join(cwd, 'workflows', installFolder(owner, repo), 'foo.yaml')),
+    'migrated to the hashed folder',
+  );
+  assert.ok(!existsSync(oldDir), 'old-name dir removed on success');
+  const lf = readLockfile(lockfilePath(cwd));
+  assert.equal(lf.installed[`${owner}/${repo}`]!.path, installFolder(owner, repo), 'lockfile now records the hashed path');
+  assert.equal(lf.installed[`${owner}/${repo}`]!.sha, SHA_B);
+  assert.ok(
+    !existsSync(join(cwd, 'workflows', STAGING_DIRNAME)),
+    'no staging debris — the parked old-name dir was finalized away',
+  );
+});
+
+// ---- two-phase commit helpers (unit) -----------------------------------------
+
+test('commitInstall/rollback: round-trips a prior install and a parked old-name dir', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-commit-'));
+  const defsDir = join(dir, 'defs');
+  const folder = 'pkg-hashed';
+  const dest = join(defsDir, folder);
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, 'x.yaml'), 'PREV');
+  const oldRel = 'pkg-old';
+  const oldDir = join(defsDir, oldRel);
+  mkdirSync(oldDir, { recursive: true });
+  writeFileSync(join(oldDir, 'y.yaml'), 'OLD');
+  const stagingDir = join(defsDir, STAGING_DIRNAME, 'stg1');
+  mkdirSync(stagingDir, { recursive: true });
+  writeFileSync(join(stagingDir, 'x.yaml'), 'NEW');
+
+  const handle = commitInstall(defsDir, folder, stagingDir);
+  assert.equal(readFileSync(join(dest, 'x.yaml'), 'utf8'), 'NEW', 'new content swapped in');
+  parkOldNameDir(handle, defsDir, oldRel);
+  assert.ok(!existsSync(oldDir), 'old-name dir parked away');
+
+  rollbackInstallCommit(handle);
+  assert.equal(readFileSync(join(dest, 'x.yaml'), 'utf8'), 'PREV', 'prior content restored byte-identical');
+  assert.equal(readFileSync(join(oldDir, 'y.yaml'), 'utf8'), 'OLD', 'old-name dir re-placed');
+});
+
+test('commitInstall/rollback: a fresh commit rolls back to no destination', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-commit-'));
+  const defsDir = join(dir, 'defs');
+  const folder = 'pkg-hashed';
+  const dest = join(defsDir, folder);
+  const stagingDir = join(defsDir, STAGING_DIRNAME, 'stg1');
+  mkdirSync(stagingDir, { recursive: true });
+  writeFileSync(join(stagingDir, 'x.yaml'), 'NEW');
+
+  const handle = commitInstall(defsDir, folder, stagingDir);
+  assert.ok(existsSync(dest), 'fresh commit lands');
+  rollbackInstallCommit(handle);
+  assert.ok(!existsSync(dest), 'fresh install rolled back to nothing');
+});
+
+test('finalizeInstallCommit: discards the retained backup and parked old-name dir', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-commit-'));
+  const defsDir = join(dir, 'defs');
+  const folder = 'pkg-hashed';
+  const dest = join(defsDir, folder);
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, 'x.yaml'), 'PREV');
+  const oldRel = 'pkg-old';
+  const oldDir = join(defsDir, oldRel);
+  mkdirSync(oldDir, { recursive: true });
+  writeFileSync(join(oldDir, 'y.yaml'), 'OLD');
+  const stagingDir = join(defsDir, STAGING_DIRNAME, 'stg1');
+  mkdirSync(stagingDir, { recursive: true });
+  writeFileSync(join(stagingDir, 'x.yaml'), 'NEW');
+
+  const handle = commitInstall(defsDir, folder, stagingDir);
+  parkOldNameDir(handle, defsDir, oldRel);
+  finalizeInstallCommit(handle);
+
+  assert.equal(readFileSync(join(dest, 'x.yaml'), 'utf8'), 'NEW', 'new content stays in place');
+  assert.ok(!existsSync(handle.backupDir!), 'retained backup discarded');
+  assert.ok(handle.oldName && !existsSync(handle.oldName.parkedAt), 'parked old-name dir discarded');
+});
+
+test('writeLockfile: a rename failure removes the temp sibling and rethrows', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-lf-'));
+  const p = join(dir, 'installed.json');
+  // A directory at the destination makes `renameSync(tmpFile, p)` throw.
+  mkdirSync(p);
+  assert.throws(() => writeLockfile(p, { version: 1, installed: {} }));
+  assert.deepEqual(
+    readdirSync(dir).filter((f) => f.startsWith('installed.json.tmp')),
+    [],
+    'temp sibling cleaned up on rename failure',
+  );
 });
 
 // ---- REL-2: full cross-definition validation before commit -------------------

@@ -85,9 +85,14 @@ recorded in `.owenloop/installed.json`:
 Re-running `add` for the same repo is idempotent: the fetch is staged under
 `<defsDir>/.owenloop-staging/`, validated, and swapped into place with an
 atomic rename, replacing the previous install and lockfile entry so a file
-removed upstream disappears locally too. Any failure along the way (a
-validation error, a lock timeout, an interrupted rename) leaves the previous
-install and lockfile exactly as they were, with no staging debris.
+removed upstream disappears locally too. The directory swap and the lockfile
+write are one recoverable operation: the install is *committed* only when
+`.owenloop/installed.json` is atomically replaced, and the displaced previous
+directory (and any old-name directory) is kept until that write succeeds. Any
+failure before that commit point — a validation error, a lock timeout, an
+interrupted rename, or a lockfile-write failure *after* the directory swap —
+rolls the directory state back, restoring the previous install and any
+old-name directory and leaving the lockfile unchanged, with no staging debris.
 Concurrent `add` runs in the same project serialize on a `.owenloop/add.lock`
 file; one that can't acquire the lock within 10s fails cleanly instead of
 interleaving with another install. `add` also refuses to replace a
@@ -95,7 +100,7 @@ destination folder the lockfile doesn't record this source as owning (e.g. a
 hand-placed folder that happens to collide) — remove it manually or fix the
 lockfile to proceed. A repo previously installed under the old
 `<owner>-<repo>` naming is migrated to the new hashed folder automatically,
-and the old one is removed.
+and the old one is removed only once the new lockfile entry is durably written.
 
 **Discovery limitation.** `defs`/`loadDefs` only scan the defs dir's
 top-level `*.yaml` files and immediate-subdir `workflow.yaml` files — they
