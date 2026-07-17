@@ -5,7 +5,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createEngine } from '../src/factory.ts';
@@ -75,6 +75,33 @@ test('createEngine: a file db path creates parent directories', () => {
   // and it is a working engine
   const wf = engine.createInstance('tiny');
   assert.ok(wf.startsWith('wf_'));
+  store.close();
+});
+
+test('SEC-3: createEngine with the default db path refuses a symlinked `.owenloop`; explicit db opens fine', () => {
+  // Default path is relative `.owenloop/state.db`, resolved against cwd — so a
+  // hostile checkout's symlinked `.owenloop` would redirect the store file.
+  const hostile = mkdtempSync(join(tmpdir(), 'owenloop-factory-hostile-'));
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-factory-elsewhere-'));
+  symlinkSync(elsewhere, join(hostile, '.owenloop'));
+
+  const prevCwd = process.cwd();
+  process.chdir(hostile);
+  try {
+    assert.throws(
+      () => createEngine({ defs: [tiny] }), // no db opt → built-in default
+      /refusing to write under .*symbolic link/,
+    );
+    assert.deepEqual(readdirSync(elsewhere), [], 'the symlink target gained no state.db');
+  } finally {
+    process.chdir(prevCwd);
+  }
+
+  // The same symlink layout is irrelevant when the caller supplies an explicit
+  // db under a plain dir — the guard is default-path only, so it opens normally.
+  const realDb = join(mkdtempSync(join(tmpdir(), 'owenloop-factory-real-')), 'state.db');
+  const { store } = createEngine({ db: realDb, defs: [tiny] });
+  assert.ok(existsSync(realDb), 'explicit db path opened normally despite a hostile-looking cwd elsewhere');
   store.close();
 });
 

@@ -222,6 +222,11 @@ as `login`; re-connecting to the **same** origin reports no `switchedFrom`,
 switching to a **different** hub reports `switchedFrom: <old origin>` and
 rebinds the project to the new one.
 
+A symlinked project `.owenloop` directory is refused with a clear error rather
+than followed: a hostile checkout cannot ship `.owenloop -> /elsewhere` to
+redirect the `hub.json` write outside the project (filesystem-isolation
+guarantee).
+
 ### `push` — publish local defs to the bound hub
 
 `owenloop push [<defName>...]` publishes the project's workflow defs (all of

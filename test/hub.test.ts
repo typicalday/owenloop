@@ -207,6 +207,25 @@ test('SEC-3: writeFileAtomic refuses a directory destination and leaves no stray
   assert.deepEqual(leftovers, [], 'no stray temp file after a refused write');
 });
 
+test('SEC-3: writeHubBinding refuses a symlinked `.owenloop` parent, leaving the link target directory intact', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-parentsym-'));
+  // The attacker's redirect target: a real directory elsewhere.
+  const elsewhere = mkdtempSync(join(tmpdir(), 'owenloop-elsewhere-'));
+  // A hostile checkout ships `.owenloop -> /elsewhere`.
+  symlinkSync(elsewhere, join(cwd, '.owenloop'));
+
+  const bindPath = hubBindingPath(cwd);
+  assert.throws(
+    () => writeHubBinding(bindPath, { version: 1, hub: 'https://api.owenloop.com' }),
+    (e: Error) =>
+      e.message.includes('refusing to write under') &&
+      e.message.includes('symbolic link') &&
+      e.message.includes(join(cwd, '.owenloop')),
+  );
+  // The link target directory gained no hub.json — the write never escaped.
+  assert.deepEqual(readdirSync(elsewhere), [], 'the symlink target directory was never written into');
+});
+
 test('SEC-3: writeFileAtomic fresh-create round-trips (trailing newline preserved) via the readers', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-fresh-'));
   const path = credentialFilePath({ HOME: home });

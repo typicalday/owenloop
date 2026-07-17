@@ -25,7 +25,7 @@ const { engine, store } = createEngine({
 
 | option      | meaning |
 |-------------|---------|
-| `db`        | SQLite path. `':memory:'` for an ephemeral store (great in tests). Defaults to `.owenloop/state.db`; parent dirs are created for a file path. |
+| `db`        | SQLite path. `':memory:'` for an ephemeral store (great in tests). Defaults to `.owenloop/state.db`; parent dirs are created for a file path. When the **default** path is used, a symlinked `.owenloop` directory is refused (filesystem-isolation guard against a hostile checkout); an explicit `db` path is the caller's responsibility and is created as-is. |
 | `defs`      | In-memory definitions as a `Map<string, WorkflowDef>` or an array of `WorkflowDef` (de-duped by name). Takes precedence over `defsDir`. Validated as a whole before use — see [In-memory definitions](#in-memory-definitions). |
 | `defsDir`   | Directory of `*.yaml` definitions, loaded via `loadDefs`. A missing dir yields no defs (lenient, like the CLI), not an error. |
 | `reapTtlMs` | Forwarded to the `Engine` — the stranded-lease reap TTL. |
