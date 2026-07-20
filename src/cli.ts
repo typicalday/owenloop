@@ -87,8 +87,10 @@ import {
   credentialBackend,
   createWorkflowError,
   credentialFilePath,
+  credentialSlot,
   hashDefForHub,
   hubBindingPath,
+  keychainServiceFor,
   normalizeOrigin,
   parseWorkflowList,
   pkcePair,
@@ -101,7 +103,14 @@ import {
   writeCredentialFile,
   writeHubBinding,
 } from './hub.ts';
-import type { Credential, DefPushCandidate, HubBinding, Keychain, WhoamiIdentity } from './hub.ts';
+import type {
+  Credential,
+  CredentialSlotSelector,
+  DefPushCandidate,
+  HubBinding,
+  Keychain,
+  WhoamiIdentity,
+} from './hub.ts';
 
 // Re-export the keychain backend type so existing test imports of `Keychain`
 // from `../src/cli.ts` (test/hubkit.ts, test/login.test.ts) keep resolving —
@@ -451,10 +460,11 @@ Commands:
   defs                                   list available workflow definitions
   add <owner>/<repo>[@ref]               fetch, validate, and install a repo's workflow defs (public repos)
   add --recover                          finish or undo a crash-interrupted install (offline; no network)
-  login [--hub <url>] [--with-token]     authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
-  logout [--hub <url>]                   delete the stored credential for a hub
-  connect [--hub <url>]                  bind this project to a hub and verify the stored credential (whoami)
-  push [<defName>...] [--force] [--dry-run]   publish local workflow defs to the bound hub (server-diffed, idempotent)
+  login [--hub <url>] [--with-token] [--as <slot>]   authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
+  logout [--hub <url>] [--as <slot>]     delete the stored credential for a hub in one slot
+  connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
+  push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
+                                         --as names the credential slot: human (default), agent, or agent:<account>
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided]
                                          bounded reachability check (deadlocks, stuck, dead steps, declared invariants)
@@ -519,10 +529,10 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['help', cmdOpts()],
   ['defs', cmdOpts()],
   ['add', cmdOpts('recover')],
-  ['login', cmdOpts('hub', 'with-token')],
-  ['logout', cmdOpts('hub')],
-  ['connect', cmdOpts('hub')],
-  ['push', cmdOpts('dry-run', 'force', 'hub')],
+  ['login', cmdOpts('hub', 'with-token', 'as')],
+  ['logout', cmdOpts('hub', 'as')],
+  ['connect', cmdOpts('hub', 'as')],
+  ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
   ['lint', cmdOpts()],
   ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided')],
   ['create', cmdOpts('title', 'provide', 'param')],
@@ -1817,29 +1827,71 @@ function resolveHub(io: CliIO, args: Args): string {
 }
 
 /**
- * Read the stored credential for `origin`. Thin wrapper over the shared
- * `readStoredCredential` in `hub.ts` (the same implementation the public
+ * Parse `--as <human | agent | agent:NAME>` into a `CredentialSlotSelector`.
+ * Absent `--as` means the **human** slot — the everyday interactive case.
+ * A malformed value (or an invalid account name, validated by `credentialSlot`)
+ * is a usage error, never a silent coercion to some other slot.
+ */
+function resolveSlot(args: Args): CredentialSlotSelector {
+  const raw = last(args, 'as');
+  const sel = parseSlotArg(raw);
+  // Validate eagerly so a bad account name fails before any network or store
+  // access, with the same wording every later call site would produce.
+  try {
+    credentialSlot(sel);
+  } catch (e) {
+    throw new CliError(`--as: ${(e as Error).message}`);
+  }
+  return sel;
+}
+
+function parseSlotArg(raw: string | undefined): CredentialSlotSelector {
+  if (raw === undefined) return { principal: 'human' };
+  if (raw === 'human') return { principal: 'human' };
+  if (raw === 'agent') return { principal: 'agent' };
+  if (raw.startsWith('agent:')) return { principal: 'agent', account: raw.slice('agent:'.length) };
+  throw new CliError(`--as: unrecognized slot '${raw}' — expected 'human', 'agent', or 'agent:<account>'`);
+}
+
+/**
+ * The "nothing stored here" message for a read that missed. It names the SLOT,
+ * not just the origin — a credential may well exist for this hub under another
+ * principal, and the fix is `--as`, not another `login`.
+ */
+function emptySlotMessage(origin: string, slot: CredentialSlotSelector): string {
+  const name = credentialSlot(slot);
+  return `no stored credential for ${origin} in slot \`${name}\` — run \`owenloop login\` (or pass --as agent:<name>)`;
+}
+
+/**
+ * Read the stored credential for `origin` in `slot`. Thin wrapper over the
+ * shared `readStoredCredential` in `hub.ts` (the same implementation the public
  * package export uses), threading the CLI's injected `env`/`keychain`. Callers
  * pass a pre-normalized origin (`resolveHub` output); the wrapper's
  * normalization is idempotent, so CLI behavior is unchanged. REL-6 no-fallback
  * and corrupt-entry-as-absent semantics live in `hub.ts`.
  */
-function readCredential(io: CliIO, origin: string): Credential | null {
-  return readStoredCredential(origin, { env: io.env, keychain: io.keychain });
+function readCredential(io: CliIO, origin: string, slot: CredentialSlotSelector): Credential | null {
+  return readStoredCredential(origin, { ...slot, env: io.env, keychain: io.keychain });
 }
 
 /**
- * Store a credential for `origin` in the chosen backend ONLY; returns which
- * one. A failed keychain write is a hard error (REL-6), never a silent
- * fall-through to the file — the escape hatch is to choose the file backend up
- * front with `OWENLOOP_NO_KEYCHAIN=1`. Backend selection is the shared
- * `credentialBackend` from `hub.ts`, so read and write agree on one choice.
+ * Store a credential for `origin` in `slot`, in the chosen backend ONLY;
+ * returns which one. A failed keychain write is a hard error (REL-6), never a
+ * silent fall-through to the file — the escape hatch is to choose the file
+ * backend up front with `OWENLOOP_NO_KEYCHAIN=1`. Backend selection is the
+ * shared `credentialBackend` from `hub.ts`, so read and write agree on one
+ * choice.
+ *
+ * The file backend MERGES into the origin's slot map: writing `agent:ci` must
+ * leave a `human` credential for the same origin intact.
  */
-function storeCredential(io: CliIO, origin: string, cred: Credential): 'keychain' | 'file' {
+function storeCredential(io: CliIO, origin: string, slot: CredentialSlotSelector, cred: Credential): 'keychain' | 'file' {
+  const account = credentialSlot(slot);
   const backend = credentialBackend(io.env, io.keychain);
   if (backend.kind === 'keychain') {
     try {
-      backend.kc.set(origin, JSON.stringify(cred));
+      backend.kc.set(keychainServiceFor(origin), account, JSON.stringify(cred));
     } catch (e) {
       throw new CliError(
         `could not write the credential to the OS keychain: ${(e as Error).message}. ` +
@@ -1850,29 +1902,40 @@ function storeCredential(io: CliIO, origin: string, cred: Credential): 'keychain
   }
   const path = credentialFilePath(io.env);
   const file = readCredentialFile(path);
-  file.hubs[origin] = cred;
+  file.hubs[origin] = { ...file.hubs[origin], [account]: cred };
   writeCredentialFile(path, file);
   return 'file';
 }
 
 /**
- * Delete any stored credential for `origin` from BOTH backends. Deliberately
- * not routed through `credentialBackend`: logout is a defensive dual-clear
- * (the proposal explicitly blesses it), so a live refresh token can never be
- * stranded in the store that wasn't the currently-chosen one. Returns whether
- * anything was removed.
+ * Delete the stored credential for `(origin, slot)` from BOTH backends.
+ * Deliberately not routed through `credentialBackend`: logout is a defensive
+ * dual-clear (the proposal explicitly blesses it), so a live refresh token can
+ * never be stranded in the store that wasn't the currently-chosen one. Returns
+ * whether anything was removed.
+ *
+ * Only the NAMED slot is removed. A blanket "clear every slot for this origin"
+ * is not implementable — the keychain cannot enumerate its accounts — and
+ * faking it on the file backend alone would be a half-truth, so the slot is
+ * always explicit (defaulting to `human`).
  */
-function deleteCredential(io: CliIO, origin: string): boolean {
+function deleteCredential(io: CliIO, origin: string, slot: CredentialSlotSelector): boolean {
+  const account = credentialSlot(slot);
   let removed = false;
   const kc = resolveKeychain(io.env, io.keychain);
-  if (kc && kc.get(origin) !== null) {
-    kc.delete(origin);
+  const service = keychainServiceFor(origin);
+  if (kc && kc.get(service, account) !== null) {
+    kc.delete(service, account);
     removed = true;
   }
   const path = credentialFilePath(io.env);
   const file = readCredentialFile(path);
-  if (file.hubs[origin] !== undefined) {
-    delete file.hubs[origin];
+  const slots = file.hubs[origin];
+  if (slots !== undefined && slots[account] !== undefined) {
+    delete slots[account];
+    // Drop the origin key once its last slot is gone, so the file never keeps
+    // an empty husk that a later read would have to special-case.
+    if (Object.keys(slots).length === 0) delete file.hubs[origin];
     writeCredentialFile(path, file);
     removed = true;
   }
@@ -1967,11 +2030,20 @@ async function hubFetch(io: CliIO, url: string, init?: RequestInit): Promise<Res
  * 60s, refresh once (grant_type=refresh_token) and persist the new token. No-op
  * for `agent`/`oauth-pasted` credentials (they don't refresh). Returns the
  * possibly-updated credential.
+ *
+ * `slot` is the slot the credential was READ from — a refreshed token must be
+ * written back to that same slot, never to a default one.
  */
-async function ensureFreshOAuth(io: CliIO, origin: string, cred: Credential, persist = true): Promise<Credential> {
+async function ensureFreshOAuth(
+  io: CliIO,
+  origin: string,
+  slot: CredentialSlotSelector,
+  cred: Credential,
+  persist = true,
+): Promise<Credential> {
   if (cred.kind !== 'oauth') return cred;
   if (cred.expiresAt - nowMs() > 60_000) return cred;
-  return refreshOAuth(io, origin, cred, persist);
+  return refreshOAuth(io, origin, slot, cred, persist);
 }
 
 /**
@@ -1987,6 +2059,7 @@ async function ensureFreshOAuth(io: CliIO, origin: string, cred: Credential, per
 async function refreshOAuth(
   io: CliIO,
   origin: string,
+  slot: CredentialSlotSelector,
   cred: Extract<Credential, { kind: 'oauth' }>,
   persist = true,
 ): Promise<Credential> {
@@ -2016,7 +2089,7 @@ async function refreshOAuth(
     expiresAt: nowMs() + expiresIn * 1000,
     clientId: cred.clientId,
   };
-  if (persist) storeCredential(io, origin, refreshed);
+  if (persist) storeCredential(io, origin, slot, refreshed);
   return refreshed;
 }
 
@@ -2053,16 +2126,17 @@ async function discoverTokenEndpoint(io: CliIO, origin: string): Promise<string>
 async function authedGet(
   io: CliIO,
   origin: string,
+  slot: CredentialSlotSelector,
   cred: Credential,
   path: string,
   persist = true,
 ): Promise<{ res: Response; cred: Credential }> {
-  let current = await ensureFreshOAuth(io, origin, cred, persist);
+  let current = await ensureFreshOAuth(io, origin, slot, cred, persist);
   let res = await hubFetch(io, resolveEndpoint(origin, path), {
     headers: { Authorization: authHeader(current), Accept: 'application/json' },
   });
   if (res.status === 401 && current.kind === 'oauth') {
-    current = await refreshOAuth(io, origin, current as Extract<Credential, { kind: 'oauth' }>, persist);
+    current = await refreshOAuth(io, origin, slot, current as Extract<Credential, { kind: 'oauth' }>, persist);
     res = await hubFetch(io, resolveEndpoint(origin, path), {
       headers: { Authorization: authHeader(current), Accept: 'application/json' },
     });
@@ -2109,10 +2183,11 @@ function assertAuthOk(res: Response, cred: Credential, origin: string): void {
 async function verifyCredential(
   io: CliIO,
   origin: string,
+  slot: CredentialSlotSelector,
   cred: Credential,
   persist = true,
 ): Promise<{ cred: Credential; identity: WhoamiIdentity }> {
-  const { res, cred: current } = await authedGet(io, origin, cred, '/api/whoami', persist);
+  const { res, cred: current } = await authedGet(io, origin, slot, cred, '/api/whoami', persist);
   assertAuthOk(res, current, origin);
   const body: unknown = await res.json();
   return { cred: current, identity: asWhoami(body) };
@@ -2124,10 +2199,18 @@ async function verifyCredential(
  * `olp_`/`mcpat_` token from stdin instead (never argv). Either way the
  * credential is verified before it is stored, and stored in the OS keychain or
  * a 0600 file — never plaintext in the repo or `.env`.
+ *
+ * The SLOT the credential lands in follows the credential KIND, with `--as`
+ * naming the agent account: a human credential (loopback `oauth`, or a pasted
+ * `mcpat_`) writes `human`; a pasted `olp_` agent token writes
+ * `agent:<account>` (`default` unless `--as agent:NAME`). A `--as` that
+ * contradicts the credential kind is a usage error, not a silent coercion —
+ * that is what keeps the agent slot holding agent keys.
  */
 async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
   const origin = resolveHub(io, args);
-  const existed = readCredential(io, origin) !== null;
+  const asked = resolveSlot(args);
+  const asGiven = last(args, 'as') !== undefined;
 
   if (flag(args, 'with-token')) {
     const readStdin = io.readStdin ?? defaultReadStdin;
@@ -2137,12 +2220,27 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
     if (token.startsWith('olp_')) cred = { kind: 'agent', accessToken: token };
     else if (token.startsWith('mcpat_')) cred = { kind: 'oauth-pasted', accessToken: token };
     else throw new CliError('unrecognized token — expected an `olp_` agent token or an `mcpat_` access token');
-    const { identity } = await verifyCredential(io, origin, cred); // never store an unverified token
-    const storage = storeCredential(io, origin, cred);
+    // Contradictions are usage errors, refused BEFORE any network call so
+    // nothing is verified or stored under a slot the token does not belong in.
+    if (cred.kind === 'agent' && asGiven && asked.principal === 'human') {
+      throw new CliError(
+        'an `olp_` agent token cannot be stored in the `human` slot — drop `--as human`, or pass `--as agent[:<account>]`',
+      );
+    }
+    if (cred.kind !== 'agent' && asked.principal === 'agent') {
+      throw new CliError(
+        `a ${cred.kind} credential is a human credential and cannot be stored in the \`${credentialSlot(asked)}\` slot — drop \`--as\`, or paste an \`olp_\` agent token`,
+      );
+    }
+    const slot: CredentialSlotSelector = cred.kind === 'agent' ? { principal: 'agent', ...(asked.principal === 'agent' && asked.account !== undefined ? { account: asked.account } : {}) } : { principal: 'human' };
+    const existed = readCredential(io, origin, slot) !== null;
+    const { identity } = await verifyCredential(io, origin, slot, cred); // never store an unverified token
+    const storage = storeCredential(io, origin, slot, cred);
     print(io, {
       ok: true,
       hub: origin,
       kind: cred.kind,
+      slot: credentialSlot(slot),
       storage,
       replaced: existed,
       org: identity.orgName,
@@ -2152,6 +2250,16 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
     });
     return 0;
   }
+
+  // Loopback OAuth always yields a HUMAN credential — `--as agent*` on this
+  // flow is a contradiction, refused before the browser is opened.
+  if (asked.principal === 'agent') {
+    throw new CliError(
+      `the loopback OAuth login produces a human credential and cannot be stored in the \`${credentialSlot(asked)}\` slot — drop \`--as\`, or use \`login --with-token\` with an \`olp_\` agent token`,
+    );
+  }
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const existed = readCredential(io, origin, slot) !== null;
 
   // Loopback OAuth: bind the port FIRST (the service matches redirect URIs by
   // exact string — no RFC 8252 variable-port allowance — so the DCR must carry
@@ -2188,12 +2296,13 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
       redirectUri,
       verifier,
     });
-    const { cred, identity } = await verifyCredential(io, origin, exchanged, false); // never store an unverified token
-    const storage = storeCredential(io, origin, cred);
+    const { cred, identity } = await verifyCredential(io, origin, slot, exchanged, false); // never store an unverified token
+    const storage = storeCredential(io, origin, slot, cred);
     print(io, {
       ok: true,
       hub: origin,
       kind: cred.kind,
+      slot: credentialSlot(slot),
       storage,
       replaced: existed,
       org: identity.orgName,
@@ -2358,13 +2467,21 @@ async function exchangeCode(
 }
 
 /**
- * `owenloop logout` — delete the stored credential for a hub from both the
- * keychain and the file store. Cheap; completes the credential lifecycle.
+ * `owenloop logout` — delete the stored credential for a hub, in ONE slot
+ * (`--as`, default `human`), from both the keychain and the file store. Cheap;
+ * completes the credential lifecycle. Other slots for the same origin are left
+ * alone: the keychain cannot enumerate its accounts, so a blanket
+ * clear-everything is not implementable and is not faked.
  */
 async function dispatchLogout(io: CliIO, args: Args): Promise<number> {
   const origin = resolveHub(io, args);
-  const removed = deleteCredential(io, origin);
-  print(io, { ok: true, hub: origin, removed });
+  const slot = resolveSlot(args);
+  const removed = deleteCredential(io, origin, slot);
+  const slotName = credentialSlot(slot);
+  if (!removed) {
+    io.err(`no stored credential for ${origin} in slot \`${slotName}\` — another slot may hold one (see --as)`);
+  }
+  print(io, { ok: true, hub: origin, slot: slotName, removed });
   return 0;
 }
 
@@ -2378,10 +2495,11 @@ async function dispatchLogout(io: CliIO, args: Args): Promise<number> {
  */
 async function dispatchConnect(io: CliIO, args: Args): Promise<number> {
   const origin = resolveHub(io, args);
-  const cred = readCredential(io, origin);
-  if (!cred) throw new CliError(`no stored credential for ${origin} — run \`owenloop login\` first`);
+  const slot = resolveSlot(args);
+  const cred = readCredential(io, origin, slot);
+  if (!cred) throw new CliError(emptySlotMessage(origin, slot));
 
-  const { identity } = await verifyCredential(io, origin, cred);
+  const { identity } = await verifyCredential(io, origin, slot, cred);
 
   const path = hubBindingPath(io.cwd);
   const existing = readHubBinding(path);
@@ -2416,6 +2534,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
   const dryRun = flag(args, 'dry-run');
   const force = flag(args, 'force');
+  const slot = resolveSlot(args);
 
   // Require a project binding.
   const bindingPath = hubBindingPath(io.cwd);
@@ -2443,8 +2562,8 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     }
   }
 
-  let cred = readCredential(io, origin);
-  if (!cred) throw new CliError(`no stored credential for ${origin} — run \`owenloop login\``);
+  let cred = readCredential(io, origin, slot);
+  if (!cred) throw new CliError(emptySlotMessage(origin, slot));
 
   // Load defs (same machinery as lint/add).
   if (!existsSync(defsDir)) throw new CliError(`defs directory not found: ${defsDir}`);
@@ -2538,7 +2657,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
 
   // Fetch the server's own list once — the diff source of truth. Always
   // fetched, even under --force, so the new/changed labels stay accurate.
-  const { res: listRes, cred: listCred } = await authedGet(io, origin, cred, '/api/workflows');
+  const { res: listRes, cred: listCred } = await authedGet(io, origin, slot, cred, '/api/workflows');
   assertAuthOk(listRes, listCred, origin);
   cred = listCred;
   let serverMap: Map<string, ReturnType<typeof parseWorkflowList> extends Map<string, infer V> ? V : never>;
@@ -2570,7 +2689,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   }
 
   // Refresh an expiring oauth token once up front (per-request 401 refresh below covers mid-batch expiry).
-  cred = await ensureFreshOAuth(io, origin, cred);
+  cred = await ensureFreshOAuth(io, origin, slot, cred);
 
   const pushedNames: string[] = [];
   const noopNames: string[] = [];
@@ -2583,7 +2702,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     try {
       let res = await createWorkflowRequest(io, origin, cred, c.yaml);
       if (res.status === 401 && cred.kind === 'oauth') {
-        cred = await refreshOAuth(io, origin, cred as Extract<Credential, { kind: 'oauth' }>);
+        cred = await refreshOAuth(io, origin, slot, cred as Extract<Credential, { kind: 'oauth' }>);
         res = await createWorkflowRequest(io, origin, cred, c.yaml);
       }
       if (res.status === 401) {

@@ -13,7 +13,8 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { hashDefForHub } from '../src/hub.ts';
+import { credentialSlot, hashDefForHub, keychainServiceFor } from '../src/hub.ts';
+import type { CredentialSlotSelector } from '../src/hub.ts';
 import type { CliIO, Keychain } from '../src/cli.ts';
 
 export interface RouteResult {
@@ -42,13 +43,33 @@ export interface RecordedCall {
   redirect: RequestInit['redirect'];
 }
 
-/** An in-memory keychain plus the backing map for assertions. */
+/**
+ * The composite key the fake keychain stores under, given a hub origin and a
+ * credential slot. Tests assert on `t.store` through this helper rather than
+ * hand-writing the composite format, so the format lives in exactly one place.
+ */
+export function kcKey(origin: string, slot: CredentialSlotSelector | string): string {
+  const account = typeof slot === 'string' ? slot : credentialSlot(slot);
+  return `${keychainServiceFor(origin)}\u0000${account}`;
+}
+
+/** The `human` slot key for `origin` — the default slot, used by most tests. */
+export function kcHuman(origin: string): string {
+  return kcKey(origin, { principal: 'human' });
+}
+
+/**
+ * An in-memory keychain plus the backing map for assertions. Keyed by
+ * `(service, account)` like the real backend; the map's key is the `kcKey`
+ * composite.
+ */
 export function fakeKeychain(): { keychain: Keychain; store: Map<string, string> } {
   const store = new Map<string, string>();
+  const composite = (service: string, account: string): string => `${service}\u0000${account}`;
   const keychain: Keychain = {
-    get: (account) => store.get(account) ?? null,
-    set: (account, value) => void store.set(account, value),
-    delete: (account) => void store.delete(account),
+    get: (service, account) => store.get(composite(service, account)) ?? null,
+    set: (service, account, value) => void store.set(composite(service, account), value),
+    delete: (service, account) => void store.delete(composite(service, account)),
   };
   return { keychain, store };
 }

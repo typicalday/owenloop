@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { hubBindingPath, readHubBinding, writeHubBinding } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
-import { makeFakeHub, makeIo, OAUTH_METADATA, routedFetch, stallingFetch } from './hubkit.ts';
+import { kcHuman, kcKey, makeFakeHub, makeIo, OAUTH_METADATA, routedFetch, stallingFetch } from './hubkit.ts';
 import type { HubIo, RouteHandler } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
@@ -59,7 +59,7 @@ const OAUTH_CRED: Credential = {
 
 /** Seed a bound project + stored credential into a HubIo. */
 function bind(t: HubIo, cred: Credential = OAUTH_CRED): void {
-  t.store.set(ORIGIN, JSON.stringify(cred));
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(cred));
   writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: ORIGIN });
 }
 
@@ -394,7 +394,7 @@ test('push: a hub.json carrying a remote-http origin is refused before any netwo
   // A binding written by an older CLI, before the transport policy existed —
   // writeHubBinding does no scheme validation, so it lands verbatim.
   writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: 'http://api.example.com' });
-  t.store.set('http://api.example.com', JSON.stringify(OAUTH_CRED));
+  t.store.set(kcHuman('http://api.example.com'), JSON.stringify(OAUTH_CRED));
 
   const code = await mainAsync(['push'], t.io);
   assert.equal(code, 1);
@@ -424,7 +424,7 @@ test('push: a 401 on an oauth credential refreshes once and retries', async () =
   assert.deepEqual(JSON.parse(t.out.join('\n')).pushed, ['foo']);
   assert.ok(recorded.some((c) => c.pathname === '/mcp/token'), 'refresh happened');
   // The stored credential was updated to the refreshed access token.
-  assert.equal((JSON.parse(t.store.get(ORIGIN)!) as Credential).accessToken, 'mcpat_new');
+  assert.equal((JSON.parse(t.store.get(kcHuman(ORIGIN))!) as Credential).accessToken, 'mcpat_new');
 });
 
 test('push: a 401 on an agent token is a hard error (no refresh path)', async () => {
@@ -547,7 +547,7 @@ test('push: identical content pushed from a second, differently-pathed checkout 
   // server-side, so a different checkout path is irrelevant.
   const second = makeIo();
   writeDefs(second.cwd, { 'foo.yaml': validDef('foo') });
-  second.store.set(ORIGIN, JSON.stringify(OAUTH_CRED));
+  second.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
   writeHubBinding(hubBindingPath(second.cwd), { version: 1, hub: ORIGIN });
   assert.notEqual(first.cwd, second.cwd, 'sanity: genuinely different absolute paths');
 
@@ -606,4 +606,35 @@ test('push: a stalled token refresh (expired oauth credential) times out (REL-7)
   const code = await mainAsync(['push'], t.io);
   assert.equal(code, 1);
   assert.match(t.err.join('\n'), /hub did not respond within [\d.]+s/);
+});
+
+// ---- credential slots (--as) ------------------------------------------------
+
+test('push --as agent:ci authenticates with that slot and leaves hub.json alone', async () => {
+  const hub = makeFakeHub();
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: ORIGIN });
+  t.store.set(kcHuman(ORIGIN), JSON.stringify({ kind: 'agent', accessToken: 'olp_human_side' }));
+  t.store.set(kcKey(ORIGIN, { principal: 'agent', account: 'ci' }), JSON.stringify({ kind: 'agent', accessToken: 'olp_ci' }));
+
+  const code = await mainAsync(['push', '--as', 'agent:ci'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.ok(calls.length > 0);
+  for (const call of calls) assert.equal(call.authorization, 'Bearer olp_ci', `${call.pathname} used the named slot`);
+  assert.deepEqual(readHubBinding(hubBindingPath(t.cwd)), { version: 1, hub: ORIGIN }, 'the binding is credential-agnostic');
+});
+
+test('push: an empty slot errors naming the slot, sending nothing', async () => {
+  const hub = makeFakeHub();
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  bind(t);
+
+  const code = await mainAsync(['push', '--as', 'agent:ci'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /no stored credential for .* in slot `agent:ci`/);
+  assert.equal(calls.length, 0, 'nothing sent, and no fallback to the human slot');
 });

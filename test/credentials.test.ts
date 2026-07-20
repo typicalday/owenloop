@@ -1,9 +1,12 @@
 /**
  * `readStoredCredential` — the public, read-only credential surface exported
- * from the package root. Exercises both backends (injected fake keychain and
- * the 0600 file store under a fixture `$HOME`), the REL-6 no-fallback rule,
- * backend precedence, origin normalization, and that the export + its types
- * resolve from the barrel (`src/index.ts`).
+ * from the package root, now keyed by SLOT (`human` / `agent:<account>`).
+ * Exercises both backends (injected fake keychain and the 0600 file store under
+ * a fixture `$HOME`), slot isolation, account defaulting and validation, the
+ * REL-6 no-fallback rule, backend precedence, origin normalization, the
+ * corrupt-entry-reads-as-absent guard, the deliberate invisibility of entries
+ * written under the OLD one-slot-per-origin keying, and that the exports + their
+ * types resolve from the barrel (`src/index.ts`).
  *
  * Hermetic per project rule: every test materializes its own `$HOME` fixture
  * (mkdtemp) and either injects the fake keychain or forces the file backend
@@ -15,20 +18,32 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { credentialFilePath, normalizeOrigin, readStoredCredential, writeCredentialFile } from '../src/hub.ts';
-import type { Credential } from '../src/hub.ts';
+import {
+  credentialFilePath,
+  credentialSlot,
+  keychainServiceFor,
+  normalizeOrigin,
+  readStoredCredential,
+  writeCredentialFile,
+} from '../src/hub.ts';
+import type { Credential, CredentialSlotSelector } from '../src/hub.ts';
 import { fakeKeychain } from './hubkit.ts';
 // Consumer-style import of the package root, exactly as an external consumer resolves it.
 import * as pub from '../src/index.ts';
 // Type-level proof that the barrel re-exports `Credential` (typecheck fails if not).
-import type { Credential as BarrelCredential } from '../src/index.ts';
+import type { Credential as BarrelCredential, CredentialSlotSelector as BarrelSelector } from '../src/index.ts';
 
 const ORIGIN = 'https://hub.example.com';
 const KEY = normalizeOrigin(ORIGIN);
 const CRED: Credential = { kind: 'agent', accessToken: 'olp_x' };
+
+const HUMAN: CredentialSlotSelector = { principal: 'human' };
+const AGENT: CredentialSlotSelector = { principal: 'agent' };
+const AGENT_CI: CredentialSlotSelector = { principal: 'agent', account: 'ci' };
 
 /** A fixture env with an isolated `$HOME`; opts merge on top (e.g. the NO_KEYCHAIN flag). */
 function fixtureEnv(extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
@@ -36,65 +51,235 @@ function fixtureEnv(extra: Record<string, string | undefined> = {}): Record<stri
   return { HOME: home, ...extra };
 }
 
-test('keychain backend, hit: returns the parsed credential', () => {
-  const env = fixtureEnv();
+/** Seed the keychain-backed store for `(origin, slot)`, mirroring what the CLI writes. */
+function seedKeychain(kc: pub.Keychain, origin: string, slot: CredentialSlotSelector, cred: Credential): void {
+  kc.set(keychainServiceFor(origin), credentialSlot(slot), JSON.stringify(cred));
+}
+
+/** Seed the file-backed store with a whole origin → slot → credential map. */
+function seedFile(
+  env: Record<string, string | undefined>,
+  hubs: Record<string, Record<string, Credential>>,
+): void {
+  writeCredentialFile(credentialFilePath(env), { version: 2, hubs });
+}
+
+// ---- slot round-trips, both backends ----------------------------------------
+
+const SLOT_CASES: [string, CredentialSlotSelector][] = [
+  ['human', HUMAN],
+  ['agent:default', AGENT],
+  ['agent:custom', { principal: 'agent', account: 'custom' }],
+];
+
+for (const [label, slot] of SLOT_CASES) {
+  test(`keychain backend: round-trips the ${label} slot`, () => {
+    const env = fixtureEnv();
+    const { keychain } = fakeKeychain();
+    const cred: Credential = { kind: 'agent', accessToken: `olp_${label}` };
+    seedKeychain(keychain, KEY, slot, cred);
+    assert.deepEqual(readStoredCredential(ORIGIN, { ...slot, env, keychain }), cred);
+    // Deleting the slot makes it absent again.
+    keychain.delete(keychainServiceFor(KEY), credentialSlot(slot));
+    assert.equal(readStoredCredential(ORIGIN, { ...slot, env, keychain }), null);
+  });
+
+  test(`file backend: round-trips the ${label} slot`, () => {
+    const env = fixtureEnv({ OWENLOOP_NO_KEYCHAIN: '1' });
+    const cred: Credential = { kind: 'agent', accessToken: `olp_${label}` };
+    assert.equal(readStoredCredential(ORIGIN, { ...slot, env }), null);
+    seedFile(env, { [KEY]: { [credentialSlot(slot)]: cred } });
+    assert.deepEqual(readStoredCredential(ORIGIN, { ...slot, env }), cred);
+    seedFile(env, { [KEY]: {} });
+    assert.equal(readStoredCredential(ORIGIN, { ...slot, env }), null);
+  });
+}
+
+test('two agent accounts on the same origin do not collide (both backends)', () => {
+  const ciCred: Credential = { kind: 'agent', accessToken: 'olp_ci' };
+  const relCred: Credential = { kind: 'agent', accessToken: 'olp_release' };
+  const REL: CredentialSlotSelector = { principal: 'agent', account: 'release' };
+
+  const kcEnv = fixtureEnv();
   const { keychain } = fakeKeychain();
-  keychain.set(KEY, JSON.stringify(CRED));
-  assert.deepEqual(readStoredCredential(ORIGIN, { env, keychain }), CRED);
+  seedKeychain(keychain, KEY, AGENT_CI, ciCred);
+  seedKeychain(keychain, KEY, REL, relCred);
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...AGENT_CI, env: kcEnv, keychain }), ciCred);
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...REL, env: kcEnv, keychain }), relCred);
+
+  const fileEnv = fixtureEnv({ OWENLOOP_NO_KEYCHAIN: '1' });
+  seedFile(fileEnv, { [KEY]: { 'agent:ci': ciCred, 'agent:release': relCred } });
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...AGENT_CI, env: fileEnv }), ciCred);
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...REL, env: fileEnv }), relCred);
 });
 
-test('keychain backend, miss: returns null', () => {
+test('human and agent:default on the same origin do not collide (both backends)', () => {
+  const humanCred: Credential = { kind: 'oauth-pasted', accessToken: 'mcpat_human' };
+  const agentCred: Credential = { kind: 'agent', accessToken: 'olp_agent' };
+
+  const kcEnv = fixtureEnv();
+  const { keychain } = fakeKeychain();
+  seedKeychain(keychain, KEY, HUMAN, humanCred);
+  seedKeychain(keychain, KEY, AGENT, agentCred);
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...HUMAN, env: kcEnv, keychain }), humanCred);
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...AGENT, env: kcEnv, keychain }), agentCred);
+
+  const fileEnv = fixtureEnv({ OWENLOOP_NO_KEYCHAIN: '1' });
+  seedFile(fileEnv, { [KEY]: { human: humanCred, 'agent:default': agentCred } });
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...HUMAN, env: fileEnv }), humanCred);
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...AGENT, env: fileEnv }), agentCred);
+});
+
+test('account defaulting: { principal: agent } and { account: "default" } address the same slot', () => {
   const env = fixtureEnv();
   const { keychain } = fakeKeychain();
-  assert.equal(readStoredCredential(ORIGIN, { env, keychain }), null);
+  seedKeychain(keychain, KEY, { principal: 'agent', account: 'default' }, CRED);
+  assert.deepEqual(readStoredCredential(ORIGIN, { principal: 'agent', env, keychain }), CRED);
+  assert.equal(credentialSlot({ principal: 'agent' }), credentialSlot({ principal: 'agent', account: 'default' }));
 });
+
+// ---- the old keying is invisible (no migration, by design) -------------------
+
+test('an entry written under the OLD keychain keying is invisible to the slot reader', () => {
+  const env = fixtureEnv();
+  const { keychain } = fakeKeychain();
+  // Pre-slot keying: service `owenloop-hub`, account = the origin.
+  keychain.set('owenloop-hub', KEY, JSON.stringify(CRED));
+  assert.equal(readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }), null);
+  assert.equal(readStoredCredential(ORIGIN, { ...AGENT, env, keychain }), null);
+});
+
+test('a v1 credential file reads as an empty store, so old file entries are invisible', () => {
+  const env = fixtureEnv({ OWENLOOP_NO_KEYCHAIN: '1' });
+  const path = credentialFilePath(env);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  // Hand-written v1 shape: origin → credential (no slot level).
+  writeFileSync(path, `${JSON.stringify({ version: 1, hubs: { [KEY]: CRED } }, null, 2)}\n`, { mode: 0o600 });
+  assert.equal(readStoredCredential(ORIGIN, { ...HUMAN, env }), null);
+  assert.equal(readStoredCredential(ORIGIN, { ...AGENT, env }), null);
+});
+
+// ---- corrupt entries read as absent, symmetrically ---------------------------
+
+test('corrupt keychain entry reads as absent, not a file fallthrough (REL-6)', () => {
+  const env = fixtureEnv();
+  const { keychain } = fakeKeychain();
+  seedKeychain(keychain, KEY, HUMAN, CRED);
+  keychain.set(keychainServiceFor(KEY), 'human', 'not-json-{'); // corrupt
+  seedFile(env, { [KEY]: { human: CRED } });
+  assert.equal(readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }), null);
+});
+
+test('a well-formed-JSON but wrong-shape keychain entry also reads as absent', () => {
+  const env = fixtureEnv();
+  const { keychain } = fakeKeychain();
+  keychain.set(keychainServiceFor(KEY), 'human', JSON.stringify({ kind: 'agent' })); // no accessToken
+  assert.equal(readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }), null);
+  keychain.set(keychainServiceFor(KEY), 'human', JSON.stringify({ kind: 'nope', accessToken: 'x' }));
+  assert.equal(readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }), null);
+  // An `oauth` entry missing its refresh half is not a usable oauth credential.
+  keychain.set(keychainServiceFor(KEY), 'human', JSON.stringify({ kind: 'oauth', accessToken: 'a', clientId: 'c' }));
+  assert.equal(readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }), null);
+});
+
+test('a corrupt FILE slot value reads as absent (not a throw, not a keychain fallthrough)', () => {
+  const env = fixtureEnv({ OWENLOOP_NO_KEYCHAIN: '1' });
+  seedFile(env, { [KEY]: { human: { kind: 'agent' } as unknown as Credential, 'agent:default': CRED } });
+  assert.equal(readStoredCredential(ORIGIN, { ...HUMAN, env }), null);
+  // The sibling slot is untouched by its neighbour's corruption.
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...AGENT, env }), CRED);
+});
+
+// ---- backend isolation (REL-6) ----------------------------------------------
 
 test('REL-6: empty keychain never falls through to a populated file', () => {
   const env = fixtureEnv();
   const { keychain } = fakeKeychain(); // keychain EMPTY
-  writeCredentialFile(credentialFilePath(env), { version: 1, hubs: { [KEY]: CRED } });
-  assert.equal(readStoredCredential(ORIGIN, { env, keychain }), null);
-});
-
-test('REL-6: corrupt keychain entry reads as absent, not a file fallthrough', () => {
-  const env = fixtureEnv();
-  const { keychain } = fakeKeychain();
-  keychain.set(KEY, 'not-json-{'); // corrupt
-  writeCredentialFile(credentialFilePath(env), { version: 1, hubs: { [KEY]: CRED } });
-  assert.equal(readStoredCredential(ORIGIN, { env, keychain }), null);
+  seedFile(env, { [KEY]: { human: CRED } });
+  assert.equal(readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }), null);
 });
 
 test('backend precedence: OWENLOOP_NO_KEYCHAIN=1 forces the file backend even when a keychain is injected', () => {
   const env = fixtureEnv({ OWENLOOP_NO_KEYCHAIN: '1' });
   const { keychain } = fakeKeychain();
-  const kcCred: Credential = { kind: 'agent', accessToken: 'olp_from_keychain' };
-  keychain.set(KEY, JSON.stringify(kcCred)); // should be IGNORED
+  seedKeychain(keychain, KEY, HUMAN, { kind: 'agent', accessToken: 'olp_from_keychain' }); // should be IGNORED
   const fileCred: Credential = { kind: 'agent', accessToken: 'olp_from_file' };
-  writeCredentialFile(credentialFilePath(env), { version: 1, hubs: { [KEY]: fileCred } });
-  assert.deepEqual(readStoredCredential(ORIGIN, { env, keychain }), fileCred);
+  seedFile(env, { [KEY]: { human: fileCred } });
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }), fileCred);
 });
 
-test('file backend: reads a written store; empty store returns null', () => {
-  const env = fixtureEnv({ OWENLOOP_NO_KEYCHAIN: '1' }); // no keychain injected → file backend, platform-independent
-  assert.equal(readStoredCredential(ORIGIN, { env }), null);
-  writeCredentialFile(credentialFilePath(env), { version: 1, hubs: { [KEY]: CRED } });
-  assert.deepEqual(readStoredCredential(ORIGIN, { env }), CRED);
-});
+// ---- selector validation ------------------------------------------------------
 
-test('origin is normalized before the account lookup; an invalid remote origin throws', () => {
+test('invalid agent account names are rejected with a clear error', () => {
   const env = fixtureEnv();
   const { keychain } = fakeKeychain();
-  keychain.set(KEY, JSON.stringify(CRED)); // stored under the normalized origin
-  // A path-bearing, trailing-slash variant normalizes to the same key.
-  assert.deepEqual(readStoredCredential('https://hub.example.com/some/path/', { env, keychain }), CRED);
-  // A plaintext remote origin is rejected at normalization (SEC-2), exactly as the CLI would.
-  assert.throws(() => readStoredCredential('http://remote.example.com', { env, keychain }), /http is only allowed for loopback/);
+  for (const bad of ['', '-leading', 'has space', 'has/slash', 'a'.repeat(65), 'agent:nested'.replace('agent', '@')]) {
+    assert.throws(
+      () => readStoredCredential(ORIGIN, { principal: 'agent', account: bad, env, keychain }),
+      /invalid agent account/,
+      `expected '${bad}' to be rejected`,
+    );
+  }
+  // The boundary cases that ARE legal.
+  assert.equal(credentialSlot({ principal: 'agent', account: 'a'.repeat(64) }), `agent:${'a'.repeat(64)}`);
+  assert.equal(credentialSlot({ principal: 'agent', account: 'a.b_c-1' }), 'agent:a.b_c-1');
 });
 
-test('public surface: the barrel re-exports the read function, the normalizer, and the Credential type', () => {
+test('`account` supplied with principal human throws rather than being ignored', () => {
+  const env = fixtureEnv();
+  const { keychain } = fakeKeychain();
+  assert.throws(
+    () =>
+      readStoredCredential(ORIGIN, {
+        ...({ principal: 'human', account: 'x' } as unknown as CredentialSlotSelector),
+        env,
+        keychain,
+      }),
+    /only meaningful with principal 'agent'/,
+  );
+});
+
+test('agent:human does not collide with the human slot', () => {
+  const env = fixtureEnv();
+  const { keychain } = fakeKeychain();
+  const humanCred: Credential = { kind: 'oauth-pasted', accessToken: 'mcpat_h' };
+  seedKeychain(keychain, KEY, HUMAN, humanCred);
+  assert.equal(credentialSlot({ principal: 'agent', account: 'human' }), 'agent:human');
+  assert.equal(readStoredCredential(ORIGIN, { principal: 'agent', account: 'human', env, keychain }), null);
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }), humanCred);
+});
+
+// ---- origin normalization (SEC-2) --------------------------------------------
+
+test('origin is normalized before the slot lookup; an invalid remote origin throws', () => {
+  const env = fixtureEnv();
+  const { keychain } = fakeKeychain();
+  seedKeychain(keychain, KEY, HUMAN, CRED); // stored under the normalized origin
+  // A path-bearing, trailing-slash variant normalizes to the same key.
+  assert.deepEqual(readStoredCredential('https://hub.example.com/some/path/', { ...HUMAN, env, keychain }), CRED);
+  // A plaintext remote origin is rejected at normalization (SEC-2), exactly as the CLI would.
+  assert.throws(
+    () => readStoredCredential('http://remote.example.com', { ...HUMAN, env, keychain }),
+    /http is only allowed for loopback/,
+  );
+});
+
+test('keychainServiceFor namespaces the service per origin', () => {
+  assert.equal(keychainServiceFor(KEY), 'owenloop:https://hub.example.com');
+  assert.notEqual(keychainServiceFor(KEY), keychainServiceFor('https://other.example.com'));
+});
+
+// ---- the barrel ---------------------------------------------------------------
+
+test('public surface: the barrel re-exports the read function, slot helpers, and the types', () => {
   assert.equal(typeof pub.readStoredCredential, 'function');
   assert.equal(typeof pub.normalizeOrigin, 'function');
-  // Type-level use of the barrel's Credential type — compiles only if it resolves from the barrel.
+  assert.equal(typeof pub.credentialSlot, 'function');
+  assert.equal(typeof pub.keychainServiceFor, 'function');
+  assert.equal(pub.credentialSlot({ principal: 'agent', account: 'ci' }), 'agent:ci');
+  // Type-level use of the barrel's types — compiles only if they resolve from the barrel.
   const typed: BarrelCredential = { kind: 'oauth-pasted', accessToken: 'mcpat_x' };
   assert.equal(typed.kind, 'oauth-pasted');
+  const sel: BarrelSelector = { principal: 'agent', account: 'ci' };
+  assert.equal(sel.principal, 'agent');
 });
