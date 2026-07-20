@@ -88,6 +88,7 @@ import {
   createWorkflowError,
   credentialFilePath,
   credentialSlot,
+  externalCredentialCommand,
   hashDefForHub,
   hubBindingPath,
   keychainServiceFor,
@@ -1881,7 +1882,9 @@ function readCredential(io: CliIO, origin: string, slot: CredentialSlotSelector)
  * silent fall-through to the file — the escape hatch is to choose the file
  * backend up front with `OWENLOOP_NO_KEYCHAIN=1`. Backend selection is the
  * shared `credentialBackend` from `hub.ts`, so read and write agree on one
- * choice.
+ * choice. That shared selection now has a third variant: when an external
+ * credential command is configured this throws, because the command — not the
+ * local store — is what reads will consult.
  *
  * The file backend MERGES into the origin's slot map: writing `agent:ci` must
  * leave a `human` credential for the same origin intact.
@@ -1889,6 +1892,15 @@ function readCredential(io: CliIO, origin: string, slot: CredentialSlotSelector)
 function storeCredential(io: CliIO, origin: string, slot: CredentialSlotSelector, cred: Credential): 'keychain' | 'file' {
   const account = credentialSlot(slot);
   const backend = credentialBackend(io.env, io.keychain);
+  if (backend.kind === 'external') {
+    // Writing to a store that reads will never consult is exactly the
+    // "half-working setup hands back a stale key" failure the external command
+    // exists to prevent, so refuse loudly instead.
+    throw new CliError(
+      'an external credential command is configured (OWENLOOP_CREDENTIAL_COMMAND), so it — not the ' +
+        'local store — supplies credentials for this hub; unset it to use `owenloop login`',
+    );
+  }
   if (backend.kind === 'keychain') {
     try {
       backend.kc.set(keychainServiceFor(origin), account, JSON.stringify(cred));
@@ -2089,7 +2101,12 @@ async function refreshOAuth(
     expiresAt: nowMs() + expiresIn * 1000,
     clientId: cred.clientId,
   };
-  if (persist) storeCredential(io, origin, slot, refreshed);
+  // When an external command supplies credentials it owns the credential's
+  // whole lifecycle; owenloop must not write a refreshed token into a store it
+  // will never read (and `storeCredential` refuses in that mode anyway).
+  if (persist && externalCredentialCommand(io.env) === undefined) {
+    storeCredential(io, origin, slot, refreshed);
+  }
   return refreshed;
 }
 
@@ -2206,11 +2223,26 @@ async function verifyCredential(
  * `agent:<account>` (`default` unless `--as agent:NAME`). A `--as` that
  * contradicts the credential kind is a usage error, not a silent coercion —
  * that is what keeps the agent slot holding agent keys.
+ *
+ * Refused outright while an external credential command is configured: that
+ * command, not the local store, is what every read consults, so there is nothing
+ * for `login` to usefully write. The check is here — before the "did a
+ * credential already exist?" probe, which would otherwise RUN the command and
+ * report its failure instead of this far more actionable reason — with
+ * `storeCredential`'s own throw kept as the invariant backstop for any other
+ * write path.
  */
 async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
   const origin = resolveHub(io, args);
   const asked = resolveSlot(args);
   const asGiven = last(args, 'as') !== undefined;
+
+  if (externalCredentialCommand(io.env) !== undefined) {
+    throw new CliError(
+      'an external credential command is configured (OWENLOOP_CREDENTIAL_COMMAND), so it — not the ' +
+        'local store — supplies credentials for this hub; unset it to use `owenloop login`',
+    );
+  }
 
   if (flag(args, 'with-token')) {
     const readStdin = io.readStdin ?? defaultReadStdin;

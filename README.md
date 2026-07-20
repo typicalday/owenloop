@@ -430,7 +430,10 @@ since. The changes that need operator or embedder attention:
   [trust model](docs/cli.md#add--installing-shared-workflow-defs-from-github).
   A hub origin now holds one credential per named **slot** (`--as
   human|agent|agent:<account>`), and credentials stored under the earlier keying
-  are not read — there is no migration, so re-run `owenloop login`.
+  are not read — there is no migration, so re-run `owenloop login`. Setting
+  `OWENLOOP_CREDENTIAL_COMMAND` instead supplies the credential from a command
+  of your own (a secret manager, or any host without a keychain); it takes
+  precedence over both stores and fails loudly rather than falling back.
 - **Max-lease cap is now opt-in.** There is no default lease ceiling; anyone who
   relied on the brief post-0.2.1 default cap must set `maxLeaseMs` (or a
   per-step `maxLease`) explicitly.

@@ -381,6 +381,40 @@ can read (only read) a stored credential through the same backend logic via the
 package's exported `readStoredCredential` — see
 [Embedding](embedding.md#whats-exported).
 
+**Supplying the credential from your own tooling.** If your secrets live in a
+secret manager, or you run on a host with no keychain, set
+`OWENLOOP_CREDENTIAL_COMMAND` to a shell command line that prints a credential.
+It takes precedence over both stores, so the full order is **external command →
+keychain → file**, still chosen once. Nothing is auto-detected: the variable is
+the only way to turn this on, and an unset or blank value leaves everything
+exactly as described above.
+
+The contract:
+
+- The command runs as `/bin/sh -c "<your command>"`, so a pipeline or arguments
+  work (`my-helper --hub prod`).
+- Context arrives in the **environment**, not on the command line:
+  `OWENLOOP_CREDENTIAL_ORIGIN` (the normalized hub origin) and
+  `OWENLOOP_CREDENTIAL_SLOT` (`human` or `agent:<account>`). Your command should
+  return the credential for exactly that pair.
+- `OWENLOOP_CREDENTIAL_COMMAND` is **removed** from the command's own
+  environment, so a helper that shells back into `owenloop` cannot recurse.
+- It must print a credential as a JSON object on **stdout** — the same shape
+  stored in `credentials.json`, e.g. `{"kind":"agent","accessToken":"olp_…"}` or
+  a full `{"kind":"oauth", …}` object. A bare token is not accepted. stdout is
+  captured and never logged; the command's **stderr passes straight through** to
+  your terminal, so put diagnostics there — never the secret.
+- It must finish within 10s, overridable with
+  `OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS`.
+
+A configured command is **authoritative**: a nonzero exit, a timeout, empty
+output, or output that is not a well-formed credential is a hard error naming
+the hub and the slot — never a quiet fall back to a keychain or file entry,
+which would risk handing back a stale key. For the same reason `login` refuses
+to run while the variable is set (unset it if you want to use the local store
+again), and a refreshed OAuth token is not written to the local store — your
+command owns the credential's lifecycle. `logout` still clears local entries.
+
 Both branches verify the credential against `GET /api/whoami` before storing
 it — a `401` there means the credential is never written to disk. On success
 `login`'s JSON reports the org and identity it authenticated as (`org`,
