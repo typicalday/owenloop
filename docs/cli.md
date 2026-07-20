@@ -366,9 +366,11 @@ empty `agent:ci` fails rather than quietly pushing as you. `logout` without
 name as the account) with the secret fed over stdin, never on the command line.
 Elsewhere — or with `OWENLOOP_NO_KEYCHAIN=1` — it falls back to a `0600` file at
 `$XDG_CONFIG_HOME/owenloop/credentials.json` (or `~/.config/owenloop/…`) inside
-a `0700` directory, keyed `hubs[origin][slot]`. Either way the token is never written into the repo or a
-`.env`. `login`'s JSON reports `storage: "keychain" | "file"` and `kind`, and
-prints **no token value** to stdout/stderr.
+a `0700` directory, keyed `hubs[origin][slot]`. Either way the token is never
+written into the repo or a `.env`. `login`'s JSON reports `storage: "keychain" |
+"file"` and `kind`, and prints **no token value** to stdout/stderr. A credential
+stored by an earlier release used a different keying and is **not** read; there
+is deliberately no migration, so re-run `owenloop login`.
 
 The backend is chosen once from your platform and env and then used for every
 read and write — a keychain-backed CLI never silently drops to the file store.

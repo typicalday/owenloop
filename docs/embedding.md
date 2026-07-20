@@ -273,7 +273,8 @@ backend is chosen once and a keychain-backed read never falls through to the
 file; a corrupt keychain entry reads as absent. The origin is normalized with
 the exported `normalizeOrigin` (invalid or plaintext-remote origins throw,
 exactly as in the CLI), and `ReadStoredCredentialOpts` lets tests and hosts
-inject `env` and a `Keychain` backend.
+inject `env` and a `Keychain` backend — whose `get`/`set`/`delete` now take
+`(service, account)`, the account being the slot.
 
 `opts` is required, and carries the slot selector: `{ principal: 'human' }` or
 `{ principal: 'agent', account?: string }` (`account` defaults to `'default'`,
@@ -282,8 +283,8 @@ and is only meaningful for `'agent'`). The companion exports `credentialSlot`
 an invalid account name) and `keychainServiceFor` (normalized origin → the
 keychain service name) let a host address the same slots the CLI does without
 re-deriving the keying. Slots never fall back to one another: an empty
-`agent:ci` reads as `null` even when `human` is populated. The function never logs or echoes the
-secret, and there is deliberately no write or delete companion on the public
+`agent:ci` reads as `null` even when `human` is populated. The function never
+logs or echoes the secret, and there is deliberately no write or delete companion on the public
 surface — `login`/`logout` remain the only way to store or remove a credential.
 
 `SUPPORTED_ENGINE_VERSION` is the programmatic form of the design.md §27
