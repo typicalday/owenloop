@@ -264,16 +264,25 @@ all the shared types (`Order`, `CommitResult`, `WorkflowStatus`, `WorkflowDef`,
 
 The index also exports a **read-only credential surface** for hosts that need
 to read a stored hub credential through owenloop's own store logic instead of
-duplicating it: `readStoredCredential(origin, opts?)` returns the `Credential`
-for a hub origin (or `null` if none is stored), using the same backend
-selection as the CLI — macOS Keychain, or the `0600` credentials file
+duplicating it: `readStoredCredential(origin, opts)` returns the `Credential`
+for a hub origin **and slot** (or `null` if none is stored), using the same
+backend selection as the CLI — macOS Keychain, or the `0600` credentials file
 elsewhere / with `OWENLOOP_NO_KEYCHAIN=1` (see
 [where the credential lands](cli.md#hub-login--connect--push--logout)). The
 backend is chosen once and a keychain-backed read never falls through to the
 file; a corrupt keychain entry reads as absent. The origin is normalized with
 the exported `normalizeOrigin` (invalid or plaintext-remote origins throw,
 exactly as in the CLI), and `ReadStoredCredentialOpts` lets tests and hosts
-inject `env` and a `Keychain` backend. The function never logs or echoes the
+inject `env` and a `Keychain` backend.
+
+`opts` is required, and carries the slot selector: `{ principal: 'human' }` or
+`{ principal: 'agent', account?: string }` (`account` defaults to `'default'`,
+and is only meaningful for `'agent'`). The companion exports `credentialSlot`
+(selector → the canonical slot string `human` / `agent:<account>`, throwing on
+an invalid account name) and `keychainServiceFor` (normalized origin → the
+keychain service name) let a host address the same slots the CLI does without
+re-deriving the keying. Slots never fall back to one another: an empty
+`agent:ci` reads as `null` even when `human` is populated. The function never logs or echoes the
 secret, and there is deliberately no write or delete companion on the public
 surface — `login`/`logout` remain the only way to store or remove a credential.
 

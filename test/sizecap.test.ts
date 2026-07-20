@@ -26,7 +26,7 @@ import { mainAsync } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
 import { hubBindingPath, writeHubBinding } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
-import { makeIo, realHttpServer } from './hubkit.ts';
+import { kcHuman, makeIo, realHttpServer } from './hubkit.ts';
 import type { HubIo } from './hubkit.ts';
 
 // ---- shared fixtures ---------------------------------------------------------
@@ -55,7 +55,7 @@ function writeDefs(cwd: string, defs: Record<string, string>): void {
 
 /** Bind the cwd + a stored credential to a hub origin (inline of push.test's `bind`). */
 function bindReal(t: HubIo, origin: string, cred: Credential): void {
-  t.store.set(origin, JSON.stringify(cred));
+  t.store.set(kcHuman(origin), JSON.stringify(cred));
   writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: origin });
 }
 

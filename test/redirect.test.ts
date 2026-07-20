@@ -23,7 +23,7 @@ import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { credentialFilePath, hubBindingPath, readCredentialFile, writeHubBinding } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
-import { makeIo, OAUTH_METADATA, realHttpServer, routedFetch, WHOAMI_BODY } from './hubkit.ts';
+import { kcHuman, makeIo, OAUTH_METADATA, realHttpServer, routedFetch, WHOAMI_BODY } from './hubkit.ts';
 import type { HubIo, RouteHandler } from './hubkit.ts';
 
 const REDIRECT_STATUSES = [301, 302, 303, 307, 308] as const;
@@ -52,7 +52,7 @@ function writeDefs(cwd: string, defs: Record<string, string>): void {
 
 /** Bind the cwd + a stored credential to a REAL hub origin (inline of push.test's `bind`). */
 function bindReal(t: HubIo, origin: string, cred: Credential): void {
-  t.store.set(origin, JSON.stringify(cred));
+  t.store.set(kcHuman(origin), JSON.stringify(cred));
   writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: origin });
 }
 
@@ -90,7 +90,7 @@ test('refresh: a redirect on POST /mcp/token fails loudly; the refresh-token bod
       assert.match(t.err.join('\n'), /refusing to follow it/, `status ${status}: redirect wording`);
       assert.equal(foreign.calls.length, 0, `status ${status}: refresh-token body leaked to foreign origin`);
       // The stored credential is untouched (refresh threw before persisting).
-      assert.equal(t.store.get(hub.origin), JSON.stringify(expired), `status ${status}: credential mutated`);
+      assert.equal(t.store.get(kcHuman(hub.origin)), JSON.stringify(expired), `status ${status}: credential mutated`);
     } finally {
       await hub.close();
       await foreign.close();

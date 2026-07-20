@@ -19,6 +19,15 @@
  * core/hub boundary lint forbids). `cli.ts` keeps thin wrappers so there is one
  * implementation of backend selection, not two.
  *
+ * Credentials are keyed by **slot**, not by origin alone: one stored credential
+ * per `(normalized origin, principal-account)` pair, the slot being `human` or
+ * `agent:<account>` (account defaults to `default`). See `CredentialSlotSelector`
+ * and `credentialSlot`. A reader must always name the slot it wants — it can
+ * never guess — so a host or CLI verb can never accidentally read the wrong
+ * principal's credential. There is deliberately NO migration from the older
+ * one-slot-per-origin keying: entries written under it are simply never found
+ * and read as absent; the upgrade step is re-running `login`.
+ *
  * `.owenloop/hub.json` is a pure binding (which hub this project publishes to)
  * — there is no client-side push ledger. `push` diffs local defs against the
  * server's own `hash` (`GET /api/workflows`, see `computeServerDiff`), and
@@ -189,18 +198,126 @@ export function randomState(): string {
 // ---- credential storage ------------------------------------------------------
 
 /**
- * Stored per hub origin. Never logged or echoed. `oauth` carries a refreshable
- * pair (loopback flow); `agent` is a pasted `olp_` token and `oauth-pasted` a
- * pasted `mcpat_` access token — neither refreshes.
+ * Stored per **slot** — one credential per `(normalized origin, slot)` pair,
+ * the slot being `human` or `agent:<account>` (see `CredentialSlotSelector`).
+ * Never logged or echoed. `oauth` carries a refreshable pair (loopback flow);
+ * `agent` is a pasted `olp_` token and `oauth-pasted` a pasted `mcpat_` access
+ * token — neither refreshes.
  */
 export type Credential =
   | { kind: 'oauth'; accessToken: string; refreshToken: string; expiresAt: number; clientId: string }
   | { kind: 'agent'; accessToken: string }
   | { kind: 'oauth-pasted'; accessToken: string };
 
+/**
+ * Which stored credential to address: the human's, or a named agent account's.
+ *
+ * A credential lives in a **slot** — `human`, or `agent:<account>` with
+ * `account` defaulting to `'default'`. The slot is part of the storage key on
+ * both backends (keychain account, and the second level of the credential
+ * file's `hubs` map), so `human` and `agent:default` on the same origin are
+ * distinct entries that never collide, and neither does `agent:ci` with
+ * `agent:release`.
+ *
+ * The discriminator is an **account**, never a "label" — labels are a different
+ * axis of the system and the word is reserved.
+ */
+export type CredentialSlotSelector =
+  | { principal: 'human' }
+  | { principal: 'agent'; account?: string };
+
+/**
+ * The credential file (`~/.config/owenloop/credentials.json`), v2: origin →
+ * slot → credential. `version` is `2`; a file carrying any other version reads
+ * as an EMPTY store (see `readCredentialFile`) — that is how entries under the
+ * older one-slot-per-origin keying become invisible without any migration code.
+ */
 export interface CredentialFile {
-  version: 1;
-  hubs: Record<string, Credential>;
+  version: 2;
+  hubs: Record<string, Record<string, Credential>>;
+}
+
+/**
+ * Legal agent account names. Deliberately conservative — alphanumeric start,
+ * then alphanumerics plus `.`/`_`/`-`, 1..64 chars — so an empty, over-long, or
+ * exotic name can never reach the keychain or the file key. Widening this later
+ * is a two-way door; narrowing it would not be.
+ */
+const ACCOUNT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+/** The default agent account when `--as agent` names none. */
+const DEFAULT_ACCOUNT = 'default';
+
+/**
+ * Resolve a selector to its slot string: `'human'` or `` `agent:${account}` ``.
+ *
+ * This is the ONE place account defaulting and validation happen — every read,
+ * write, and delete path funnels through it, so no call site re-implements the
+ * `agent:` concatenation. Throws on an invalid account name, and on `account`
+ * supplied alongside `principal: 'human'`: TypeScript's excess-property check
+ * does not reliably reject that against a union, so it is a runtime error too
+ * rather than a silently ignored argument.
+ *
+ * `agent:human` cannot collide with `human` by construction — the `agent:`
+ * prefix differs — so no extra guard is needed.
+ */
+export function credentialSlot(sel: CredentialSlotSelector): string {
+  if (sel.principal === 'human') {
+    if ((sel as { account?: unknown }).account !== undefined) {
+      throw new Error("credential slot: `account` is only meaningful with principal 'agent', not 'human'");
+    }
+    return 'human';
+  }
+  if (sel.principal !== 'agent') {
+    throw new Error(`credential slot: unknown principal '${String((sel as { principal?: unknown }).principal)}'`);
+  }
+  const account = sel.account ?? DEFAULT_ACCOUNT;
+  if (typeof account !== 'string' || !ACCOUNT_RE.test(account)) {
+    throw new Error(
+      `invalid agent account '${String(account)}' — expected 1-64 chars matching [A-Za-z0-9][A-Za-z0-9._-]*`,
+    );
+  }
+  return `agent:${account}`;
+}
+
+/**
+ * The keychain SERVICE for a hub origin; the slot is the keychain ACCOUNT.
+ * `origin` must already be `normalizeOrigin`d — every call site normalizes
+ * first, so SEC-2 (remote plaintext rejected) happens before any keychain or
+ * filesystem access.
+ */
+export function keychainServiceFor(normalizedOrigin: string): string {
+  return `owenloop:${normalizedOrigin}`;
+}
+
+/**
+ * Shape-guard a stored credential value, returning `null` when it is not a
+ * well-formed `Credential`. Used on BOTH backends so "a corrupt entry reads as
+ * absent" is symmetric: previously the keychain path did an unchecked
+ * `JSON.parse(...) as Credential` and the file path validated nothing at all,
+ * so a truncated or hand-edited entry could surface as a bogus credential
+ * instead of a clean miss.
+ */
+export function parseCredential(raw: unknown): Credential | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const c = raw as Record<string, unknown>;
+  if (typeof c.accessToken !== 'string' || c.accessToken === '') return null;
+  if (c.kind === 'agent' || c.kind === 'oauth-pasted') {
+    return { kind: c.kind, accessToken: c.accessToken };
+  }
+  if (c.kind === 'oauth') {
+    if (typeof c.refreshToken !== 'string' || c.refreshToken === '') return null;
+    if (typeof c.expiresAt !== 'number' || !Number.isFinite(c.expiresAt)) return null;
+    if (typeof c.clientId !== 'string' || c.clientId === '') return null;
+    return {
+      kind: 'oauth',
+      accessToken: c.accessToken,
+      refreshToken: c.refreshToken,
+      expiresAt: c.expiresAt,
+      clientId: c.clientId,
+    };
+  }
+  return null;
 }
 
 /** The user-level config dir (never the project dir). Derives from the caller's env. */
@@ -216,14 +333,28 @@ export function credentialFilePath(env: Record<string, string | undefined>): str
   return join(configDir(env), 'credentials.json');
 }
 
-/** Read the credential file; a missing file is an empty store, not an error. */
+/**
+ * Read the credential file; a missing file is an empty store, not an error.
+ *
+ * A file whose `version` is not `2` also reads as an EMPTY store — no throw, no
+ * migration, no hybrid write. That is how entries under the older
+ * one-slot-per-origin keying become invisible (there are no external users, so
+ * the documented upgrade step is re-running `login`). Stated deliberately: the
+ * next write then replaces such a file wholesale, which is acceptable because
+ * its entries are unreachable by design.
+ *
+ * Genuinely broken JSON, or a `hubs` that is not an object, still throws —
+ * "corrupt reads as absent" is about a corrupt ENTRY (see `parseCredential`),
+ * not a destroyed file.
+ */
 export function readCredentialFile(path: string): CredentialFile {
-  if (!existsSync(path)) return { version: 1, hubs: {} };
-  const parsed = JSON.parse(readFileSync(path, 'utf8')) as CredentialFile;
-  if (!parsed || typeof parsed !== 'object' || typeof parsed.hubs !== 'object') {
+  if (!existsSync(path)) return { version: 2, hubs: {} };
+  const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<CredentialFile>;
+  if (!parsed || typeof parsed !== 'object' || typeof parsed.hubs !== 'object' || parsed.hubs === null) {
     throw new Error(`malformed credential file at ${path}`);
   }
-  return { version: 1, hubs: parsed.hubs };
+  if (parsed.version !== 2) return { version: 2, hubs: {} };
+  return { version: 2, hubs: parsed.hubs };
 }
 
 /**
@@ -284,32 +415,33 @@ export function writeCredentialFile(path: string, file: CredentialFile): void {
 // ---- keychain backend + credential read --------------------------------------
 
 /**
- * An OS keychain backend, keyed by hub origin (the `account`). The default
- * implementation (macOS `security` generic passwords) is `defaultKeychain`;
- * tests and embedding hosts inject their own. Never logs or echoes the secret.
+ * An OS keychain backend, keyed by `(service, account)` — the service is
+ * `keychainServiceFor(origin)` (`owenloop:<origin>`) and the account is the
+ * credential slot (`human` / `agent:<name>`). The pair mirrors macOS
+ * `security`'s own `-s`/`-a` arguments. The default implementation (macOS
+ * `security` generic passwords) is `defaultKeychain`; tests and embedding hosts
+ * inject their own. Never logs or echoes the secret.
  */
 export interface Keychain {
-  get(account: string): string | null;
-  set(account: string, value: string): void;
-  delete(account: string): void;
+  get(service: string, account: string): string | null;
+  set(service: string, account: string, value: string): void;
+  delete(service: string, account: string): void;
 }
-
-const KEYCHAIN_SERVICE = 'owenloop-hub';
 
 /**
  * The default macOS keychain backend (generic passwords under service
- * `owenloop-hub`). The secret is fed through the `security -i` command stream on
- * stdin, never as a `-w` argv value, so it never appears in `ps`/shell history.
- * Returns `undefined` off macOS or when `OWENLOOP_NO_KEYCHAIN=1`, so callers
- * fall back to the 0600 credential file.
+ * `owenloop:<origin>`, account = the credential slot). The secret is fed through
+ * the `security -i` command stream on stdin, never as a `-w` argv value, so it
+ * never appears in `ps`/shell history. Returns `undefined` off macOS or when
+ * `OWENLOOP_NO_KEYCHAIN=1`, so callers fall back to the 0600 credential file.
  */
 export function defaultKeychain(env: Record<string, string | undefined>): Keychain | undefined {
   if (env.OWENLOOP_NO_KEYCHAIN === '1') return undefined;
   if (process.platform !== 'darwin') return undefined;
   return {
-    get(account: string): string | null {
+    get(service: string, account: string): string | null {
       try {
-        const out = execFileSync('security', ['find-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account, '-w'], {
+        const out = execFileSync('security', ['find-generic-password', '-s', service, '-a', account, '-w'], {
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'ignore'],
         });
@@ -318,16 +450,18 @@ export function defaultKeychain(env: Record<string, string | undefined>): Keycha
         return null; // not found (errSecItemNotFound) — treated as "no credential"
       }
     },
-    set(account: string, value: string): void {
+    set(service: string, account: string, value: string): void {
       // `security -i` reads newline-terminated commands from stdin; the secret
       // rides in that stdin stream (single-quoted), never on this process's argv.
+      // The service string now carries `:` and `//` — inert for `security`, but
+      // the single-quote escaping stays as the general guard it always was.
       const sq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
-      const cmd = `add-generic-password -U -s ${sq(KEYCHAIN_SERVICE)} -a ${sq(account)} -w ${sq(value)}\n`;
+      const cmd = `add-generic-password -U -s ${sq(service)} -a ${sq(account)} -w ${sq(value)}\n`;
       execFileSync('security', ['-i'], { input: cmd, stdio: ['pipe', 'ignore', 'ignore'] });
     },
-    delete(account: string): void {
+    delete(service: string, account: string): void {
       try {
-        execFileSync('security', ['delete-generic-password', '-s', KEYCHAIN_SERVICE, '-a', account], {
+        execFileSync('security', ['delete-generic-password', '-s', service, '-a', account], {
           stdio: 'ignore',
         });
       } catch {
@@ -368,49 +502,71 @@ export function credentialBackend(
   return kc ? { kind: 'keychain', kc } : { kind: 'file' };
 }
 
-/** Options for `readStoredCredential`. */
-export interface ReadStoredCredentialOpts {
+/**
+ * Options for `readStoredCredential`. The slot selector is REQUIRED (it is
+ * spread into this type, not optional): the caller must name which principal's
+ * credential it wants.
+ */
+export type ReadStoredCredentialOpts = CredentialSlotSelector & {
   /** Environment to consult (OWENLOOP_NO_KEYCHAIN, HOME/XDG_CONFIG_HOME). Default: `process.env`. */
   env?: Record<string, string | undefined>;
   /** Injectable keychain backend (tests / embedding hosts). Ignored when OWENLOOP_NO_KEYCHAIN=1. */
   keychain?: Keychain;
-}
+};
 
 /**
- * Read the stored hub credential for `origin` from the chosen backend ONLY —
- * the supported, read-only programmatic surface (owenwork's CredentialReader
- * seam wires to this once released). Secret hygiene is unchanged: this function
- * never logs or echoes the returned credential, and there is deliberately no
- * write/delete companion on the public surface.
+ * Read the stored hub credential for `origin` **in the named slot** from the
+ * chosen backend ONLY — the supported, read-only programmatic surface
+ * (owenwork's CredentialReader seam wires to this once released). Secret hygiene
+ * is unchanged: this function never logs or echoes the returned credential, and
+ * there is deliberately no write/delete companion on the public surface —
+ * `login` / `logout` remain the only way to store or remove a credential.
+ *
+ * `opts` and its `principal` are both required, so a caller can never
+ * accidentally read the wrong principal's credential:
+ *
+ * ```ts
+ * readStoredCredential(origin, { principal: 'human' });
+ * readStoredCredential(origin, { principal: 'agent' });                 // agent:default
+ * readStoredCredential(origin, { principal: 'agent', account: 'ci' });  // agent:ci
+ * ```
+ *
+ * Passing `account` with `principal: 'human'` throws (see `credentialSlot`),
+ * because TypeScript's excess-property check does not reliably reject it
+ * against a union.
  *
  * `origin` is normalized (idempotent on already-normalized input, so the CLI's
- * pre-normalized callers are unaffected) so the account key matches what
- * `login`/`connect` persisted; an invalid or plaintext-remote origin throws at
- * normalization (SEC-2), exactly as the CLI would.
+ * pre-normalized callers are unaffected) BEFORE any keychain or filesystem
+ * access, so the storage key matches what `login` persisted and an invalid or
+ * plaintext-remote origin throws at normalization (SEC-2), exactly as the CLI
+ * would.
  *
  * Backend is selected once (`credentialBackend`). A keychain-backed read NEVER
  * falls through to the file (that fallback was the REL-6 shadowing bug), and a
- * corrupt keychain entry reads as absent (`null`) — never as a reason to
- * consult the file. The file backend derives its path from the supplied `env`
- * (HOME / XDG_CONFIG_HOME), never `process.env` directly, so a caller passing
- * `opts.env` stays hermetic; only the top-level default falls back to
+ * corrupt entry reads as absent (`null`) on either backend — never as a reason
+ * to consult the other. The file backend derives its path from the supplied
+ * `env` (HOME / XDG_CONFIG_HOME), never `process.env` directly, so a caller
+ * passing `opts.env` stays hermetic; only the top-level default falls back to
  * `process.env`.
  */
-export function readStoredCredential(origin: string, opts?: ReadStoredCredentialOpts): Credential | null {
-  const env = opts?.env ?? process.env;
+export function readStoredCredential(origin: string, opts: ReadStoredCredentialOpts): Credential | null {
+  const env = opts.env ?? process.env;
   const key = normalizeOrigin(origin);
-  const backend = credentialBackend(env, opts?.keychain);
+  const slot = credentialSlot(opts);
+  const backend = credentialBackend(env, opts.keychain);
   if (backend.kind === 'keychain') {
-    const raw = backend.kc.get(key);
+    const raw = backend.kc.get(keychainServiceFor(key), slot);
     if (!raw) return null;
+    let decoded: unknown;
     try {
-      return JSON.parse(raw) as Credential;
+      decoded = JSON.parse(raw);
     } catch {
       return null; // corrupt entry — treat as absent; do NOT consult the file
     }
+    return parseCredential(decoded);
   }
   const file = readCredentialFile(credentialFilePath(env));
-  return file.hubs[key] ?? null;
+  return parseCredential(file.hubs[key]?.[slot]);
 }
 
 // ---- project → hub binding (.owenloop/hub.json) ------------------------------

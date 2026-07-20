@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { hubBindingPath, readHubBinding, writeHubBinding } from '../src/hub.ts';
 import type { Credential, HubBinding } from '../src/hub.ts';
 import { mainAsync } from '../src/cli.ts';
-import { makeIo, routedFetch, WHOAMI_BODY } from './hubkit.ts';
+import { kcHuman, kcKey, makeIo, routedFetch, WHOAMI_BODY } from './hubkit.ts';
 import type { RouteHandler } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
@@ -32,7 +32,7 @@ const verifyOk: RouteHandler = () => ({ status: 200, json: WHOAMI_BODY });
 test('connect: happy path — writes hub.json bound to the origin, reports org identity, ok:true', async () => {
   const { fetch } = routedFetch({ 'GET /api/whoami': verifyOk });
   const t = makeIo({ fetch });
-  t.store.set(ORIGIN, JSON.stringify(OAUTH_CRED));
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
 
   const code = await mainAsync(['connect', '--hub', ORIGIN], t.io);
   assert.equal(code, 0, t.err.join('\n'));
@@ -51,7 +51,7 @@ test('connect: happy path — writes hub.json bound to the origin, reports org i
 test('connect: re-connecting the SAME origin reports no switchedFrom', async () => {
   const { fetch } = routedFetch({ 'GET /api/whoami': verifyOk });
   const t = makeIo({ fetch });
-  t.store.set(ORIGIN, JSON.stringify(OAUTH_CRED));
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
   const seeded: HubBinding = { version: 1, hub: ORIGIN };
   writeHubBinding(hubBindingPath(t.cwd), seeded);
 
@@ -67,8 +67,8 @@ test('connect: re-connecting the SAME origin reports no switchedFrom', async () 
 test('connect: switching to a DIFFERENT origin reports switchedFrom and rebinds', async () => {
   const { fetch } = routedFetch({ 'GET /api/whoami': verifyOk });
   const t = makeIo({ fetch });
-  t.store.set(ORIGIN, JSON.stringify(OAUTH_CRED));
-  t.store.set(OTHER_ORIGIN, JSON.stringify(OAUTH_CRED));
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
+  t.store.set(kcHuman(OTHER_ORIGIN), JSON.stringify(OAUTH_CRED));
   writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: ORIGIN });
 
   const code = await mainAsync(['connect', '--hub', OTHER_ORIGIN], t.io);
@@ -95,7 +95,7 @@ test('connect: no stored credential errors, mentions `owenloop login`, writes no
 test('connect: a legacy hub.json with a leftover `pushed` ledger key still parses and connect rewrites it to the slim {version, hub} shape', async () => {
   const { fetch } = routedFetch({ 'GET /api/whoami': verifyOk });
   const t = makeIo({ fetch });
-  t.store.set(ORIGIN, JSON.stringify(OAUTH_CRED));
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
   // Simulate a hub.json written by a pre-server-diff CLI: still has the old
   // client-side push ledger under `pushed`, which the current binding type
   // no longer has a field for.
@@ -124,7 +124,7 @@ test('connect: a legacy hub.json with a leftover `pushed` ledger key still parse
 test('connect: a 401 from whoami errors cleanly and writes no hub.json', async () => {
   const { fetch } = routedFetch({ 'GET /api/whoami': () => ({ status: 401, json: { error: 'invalid' } }) });
   const t = makeIo({ fetch });
-  t.store.set(ORIGIN, JSON.stringify(OAUTH_CRED));
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
 
   const code = await mainAsync(['connect', '--hub', ORIGIN], t.io);
   assert.equal(code, 1);
@@ -134,7 +134,7 @@ test('connect: a 401 from whoami errors cleanly and writes no hub.json', async (
 test('SEC-3: connect in a hostile checkout refuses a symlinked `.owenloop`, leaving the link target untouched', async () => {
   const { fetch } = routedFetch({ 'GET /api/whoami': verifyOk });
   const t = makeIo({ fetch });
-  t.store.set(ORIGIN, JSON.stringify(OAUTH_CRED));
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
 
   // A hostile checkout ships `.owenloop -> /elsewhere`; connect must refuse the
   // write rather than redirecting hub.json outside the project.
@@ -147,4 +147,29 @@ test('SEC-3: connect in a hostile checkout refuses a symlinked `.owenloop`, leav
   assert.match(stderr, /refusing to write under/);
   assert.match(stderr, /symbolic link/);
   assert.deepEqual(readdirSync(elsewhere), [], 'the symlink target directory gained no hub.json');
+});
+
+// ---- credential slots (--as) ------------------------------------------------
+
+test('connect --as agent:ci reads that slot, and ignores a human credential entirely', async () => {
+  const { fetch, calls } = routedFetch({ 'GET /api/whoami': verifyOk });
+  const t = makeIo({ fetch });
+  t.store.set(kcHuman(ORIGIN), JSON.stringify({ kind: 'agent', accessToken: 'olp_human_side' }));
+  t.store.set(kcKey(ORIGIN, { principal: 'agent', account: 'ci' }), JSON.stringify({ kind: 'agent', accessToken: 'olp_ci' }));
+
+  const code = await mainAsync(['connect', '--hub', ORIGIN, '--as', 'agent:ci'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(calls.find((c) => c.pathname === '/api/whoami')?.authorization, 'Bearer olp_ci');
+});
+
+test('connect: an empty slot errors naming the slot, without falling back to another one', async () => {
+  const { fetch, calls } = routedFetch({ 'GET /api/whoami': verifyOk });
+  const t = makeIo({ fetch });
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
+
+  const code = await mainAsync(['connect', '--hub', ORIGIN, '--as', 'agent:ci'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /no stored credential for .* in slot `agent:ci`/);
+  assert.equal(calls.length, 0, 'the human credential was never used as a fallback');
+  assert.equal(readHubBinding(hubBindingPath(t.cwd)), null, 'no hub.json written');
 });

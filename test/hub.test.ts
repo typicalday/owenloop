@@ -132,10 +132,10 @@ test('writeCredentialFile round-trips and enforces 0600 file / 0700 dir', () => 
     expiresAt: 123,
     clientId: 'client-1',
   };
-  writeCredentialFile(path, { version: 1, hubs: { 'https://api.owenloop.com': cred } });
+  writeCredentialFile(path, { version: 2, hubs: { 'https://api.owenloop.com': { human: cred } } });
 
   const readBack = readCredentialFile(path);
-  assert.deepEqual(readBack.hubs['https://api.owenloop.com'], cred);
+  assert.deepEqual(readBack.hubs['https://api.owenloop.com']?.human, cred);
 
   assert.equal(statSync(path).mode & 0o777, 0o600, 'credential file is 0600');
   assert.equal(statSync(join(home, '.config', 'owenloop')).mode & 0o777, 0o700, 'config dir is 0700');
@@ -144,7 +144,26 @@ test('writeCredentialFile round-trips and enforces 0600 file / 0700 dir', () => 
 test('readCredentialFile: a missing file is an empty store', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-cred-'));
   const store = readCredentialFile(credentialFilePath({ HOME: home }));
-  assert.deepEqual(store, { version: 1, hubs: {} });
+  assert.deepEqual(store, { version: 2, hubs: {} });
+});
+
+test('readCredentialFile: a non-v2 file reads as an EMPTY store (old keying is invisible, no migration)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-cred-v1-'));
+  const path = credentialFilePath({ HOME: home });
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const cred: Credential = { kind: 'agent', accessToken: 'olp_old' };
+  writeFileSync(path, `${JSON.stringify({ version: 1, hubs: { 'https://api.owenloop.com': cred } })}\n`);
+  assert.deepEqual(readCredentialFile(path), { version: 2, hubs: {} });
+});
+
+test('readCredentialFile: a genuinely malformed file still THROWS (a corrupt entry is not a destroyed file)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-cred-bad-'));
+  const path = credentialFilePath({ HOME: home });
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writeFileSync(path, '{ not json');
+  assert.throws(() => readCredentialFile(path));
+  writeFileSync(path, JSON.stringify({ version: 2, hubs: 'nope' }));
+  assert.throws(() => readCredentialFile(path), /malformed credential file/);
 });
 
 // ---- atomic, symlink-refusing writes (SEC-3) ---------------------------------
@@ -161,7 +180,7 @@ test('SEC-3: writeCredentialFile / writeHubBinding refuse a symlinked destinatio
   symlinkSync(target, path);
 
   assert.throws(
-    () => writeCredentialFile(path, { version: 1, hubs: {} }),
+    () => writeCredentialFile(path, { version: 2, hubs: {} }),
     (e: Error) =>
       e.message.includes('refusing to write') && e.message.includes('symbolic link') && e.message.includes(path),
   );
@@ -188,9 +207,9 @@ test('SEC-3: writeCredentialFile atomically overwrites, re-tightens to 0600 / di
   chmodSync(path, 0o644);
 
   const cred: Credential = { kind: 'agent', accessToken: 'olp_x' };
-  writeCredentialFile(path, { version: 1, hubs: { 'https://api.owenloop.com': cred } });
+  writeCredentialFile(path, { version: 2, hubs: { 'https://api.owenloop.com': { human: cred } } });
 
-  assert.deepEqual(readCredentialFile(path).hubs['https://api.owenloop.com'], cred, 'content replaced');
+  assert.deepEqual(readCredentialFile(path).hubs['https://api.owenloop.com']?.human, cred, 'content replaced');
   assert.equal(statSync(path).mode & 0o777, 0o600, 'file re-tightened to 0600 despite the prior 0644');
   assert.equal(statSync(dir).mode & 0o777, 0o700, 'dir 0700');
   const leftovers = readdirSync(dir).filter((f) => f.includes('.tmp'));
@@ -230,8 +249,8 @@ test('SEC-3: writeFileAtomic fresh-create round-trips (trailing newline preserve
   const home = mkdtempSync(join(tmpdir(), 'owenloop-fresh-'));
   const path = credentialFilePath({ HOME: home });
   const cred: Credential = { kind: 'oauth-pasted', accessToken: 'mcpat_z' };
-  writeCredentialFile(path, { version: 1, hubs: { 'https://api.owenloop.com': cred } });
-  assert.deepEqual(readCredentialFile(path).hubs['https://api.owenloop.com'], cred);
+  writeCredentialFile(path, { version: 2, hubs: { 'https://api.owenloop.com': { human: cred } } });
+  assert.deepEqual(readCredentialFile(path).hubs['https://api.owenloop.com']?.human, cred);
   assert.equal(readFileSync(path, 'utf8').endsWith('\n'), true, 'trailing newline preserved');
 
   const cwd = mkdtempSync(join(tmpdir(), 'owenloop-fresh-bind-'));

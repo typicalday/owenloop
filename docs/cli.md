@@ -33,10 +33,10 @@ positional or the next `--flag`, never consumed as this flag's argument. Use
 | `defs` | list available workflow definitions |
 | `add <owner>/<repo>[@ref]` | fetch, validate, and install a repo's workflow defs from GitHub (public repos only) — see below |
 | `add --recover` | finish or undo a crash-interrupted install, offline — no network call — see below |
-| `login [--hub <url>] [--with-token]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
-| `connect [--hub <url>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
-| `push [<defName>...] [--force] [--dry-run]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
-| `logout [--hub <url>]` | delete the stored credential for a hub |
+| `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
+| `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
+| `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
+| `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
 | `tick <wf> [--now=<ms>] [--shallow] [--label <l>]…` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only); repeatable `--label` claims unlabeled steps plus matching-label steps — see below |
@@ -337,12 +337,36 @@ that can't call the hub is never written to disk):
   table). An `olp_`-prefixed **agent** token or an `mcpat_`-prefixed **access**
   token is accepted; anything else is rejected before any network call.
 
+**Credential slots (`--as`).** A hub origin holds more than one credential, each
+in a named **slot**, so a human sign-in and any number of agent tokens coexist
+on the same machine without overwriting each other:
+
+| `--as` value | slot | who it is |
+|---|---|---|
+| *(omitted)* | depends on the credential — see below | |
+| `human` | `human` | you, via loopback OAuth or a pasted `mcpat_` token |
+| `agent` | `agent:default` | an agent token with no account name |
+| `agent:<account>` | `agent:<account>` | a named agent, e.g. `agent:ci` |
+
+An account name is 1–64 characters matching `[A-Za-z0-9][A-Za-z0-9._-]*`;
+anything else is a usage error. With `--as` omitted, a credential lands in the
+slot it belongs to: loopback OAuth and pasted `mcpat_` tokens go to `human`,
+`olp_` agent tokens go to `agent:default`. The two contradictions are refused as
+usage errors **before any network call**, so nothing unverified is stored:
+`--as human` with an `olp_` token, and `--as agent[:…]` with an OAuth or pasted
+human credential. `login`'s JSON reports the `slot` it wrote.
+
+`connect`, `push`, and `logout` take the same `--as` and act on exactly that
+slot — there is no fallback to another slot, so `push --as agent:ci` with an
+empty `agent:ci` fails rather than quietly pushing as you. `logout` without
+`--as` removes only `human`.
+
 **Where the credential lands.** On macOS it goes into the login **Keychain**
-(`security`, service `owenloop-hub`, one item per hub origin) with the secret
-fed over stdin, never on the command line. Elsewhere — or with
-`OWENLOOP_NO_KEYCHAIN=1` — it falls back to a `0600` file at
+(`security`, service `owenloop:<hub origin>`, one item per slot, with the slot
+name as the account) with the secret fed over stdin, never on the command line.
+Elsewhere — or with `OWENLOOP_NO_KEYCHAIN=1` — it falls back to a `0600` file at
 `$XDG_CONFIG_HOME/owenloop/credentials.json` (or `~/.config/owenloop/…`) inside
-a `0700` directory. Either way the token is never written into the repo or a
+a `0700` directory, keyed `hubs[origin][slot]`. Either way the token is never written into the repo or a
 `.env`. `login`'s JSON reports `storage: "keychain" | "file"` and `kind`, and
 prints **no token value** to stdout/stderr.
 

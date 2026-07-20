@@ -14,7 +14,7 @@ import { mainAsync } from '../src/cli.ts';
 import type { Keychain } from '../src/cli.ts';
 import { credentialFilePath, readCredentialFile, writeCredentialFile } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
-import { makeIo, OAUTH_METADATA, routedFetch, stallingFetch, WHOAMI_BODY } from './hubkit.ts';
+import { kcHuman, kcKey, makeIo, OAUTH_METADATA, routedFetch, stallingFetch, WHOAMI_BODY } from './hubkit.ts';
 import type { RouteHandler } from './hubkit.ts';
 
 const HUB = 'http://127.0.0.1:9';
@@ -64,7 +64,7 @@ test('login: loopback OAuth stores an oauth credential in the keychain', async (
   assert.equal(result.orgId, WHOAMI_BODY.orgId);
   assert.deepEqual(result.identity, WHOAMI_BODY.actor);
 
-  const stored = JSON.parse(t.store.get(ORIGIN)!) as Credential;
+  const stored = JSON.parse(t.store.get(kcHuman(ORIGIN))!) as Credential;
   assert.equal(stored.kind, 'oauth');
   assert.equal(stored.accessToken, 'mcpat_access');
 
@@ -93,7 +93,7 @@ test('login --huub (typo of --hub) is rejected before any keychain or network ac
   assert.match(t.err.join('\n'), /did you mean --hub\?/, 'suggests the intended flag');
   assert.equal(calls.length, 0, 'no OAuth discovery/exchange before the rejection');
   assert.equal(t.openedUrls.length, 0, 'no browser/loopback flow started');
-  assert.equal(t.store.get(ORIGIN), undefined, 'no credential stored');
+  assert.equal(t.store.get(kcHuman(ORIGIN)), undefined, 'no credential stored');
 });
 
 test('login: OWENLOOP_NO_KEYCHAIN forces the 0600 file fallback', async () => {
@@ -106,7 +106,7 @@ test('login: OWENLOOP_NO_KEYCHAIN forces the 0600 file fallback', async () => {
 
   const path = credentialFilePath(t.io.env);
   const file = readCredentialFile(path);
-  assert.equal((file.hubs[ORIGIN] as Credential).accessToken, 'mcpat_access');
+  assert.equal(file.hubs[ORIGIN]?.human?.accessToken, 'mcpat_access');
   assert.equal(statSync(path).mode & 0o777, 0o600);
   assert.equal(t.store.size, 0, 'nothing written to the keychain when NO_KEYCHAIN=1');
 });
@@ -154,8 +154,9 @@ test('login --with-token: reads an olp_ agent token from stdin, verifies, and st
   assert.equal(result.kind, 'agent');
   assert.equal(result.org, WHOAMI_BODY.orgName);
   assert.equal(result.orgId, WHOAMI_BODY.orgId);
-  const stored = JSON.parse(t.store.get(ORIGIN)!) as Credential;
+  const stored = JSON.parse(t.store.get(kcKey(ORIGIN, { principal: 'agent' }))!) as Credential;
   assert.equal(stored.accessToken, 'olp_org_secret');
+  assert.equal(result.slot, 'agent:default');
 
   // Verified via GET /api/whoami before storing, with the bearer token.
   const verify = calls.find((c) => c.pathname === '/api/whoami')!;
@@ -234,13 +235,14 @@ test('logout: deletes the credential from the keychain', async () => {
   });
   const t = makeIo({ fetch, stdin: 'olp_tok' });
   await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
-  assert.ok(t.store.has(ORIGIN));
+  const agentSlot = kcKey(ORIGIN, { principal: 'agent' });
+  assert.ok(t.store.has(agentSlot));
 
   t.out.length = 0; // drop the login output so we parse only logout's JSON
-  const code = await mainAsync(['logout', '--hub', HUB], t.io);
+  const code = await mainAsync(['logout', '--hub', HUB, '--as', 'agent'], t.io);
   assert.equal(code, 0);
   assert.equal(JSON.parse(t.out.join('\n')).removed, true);
-  assert.ok(!t.store.has(ORIGIN), 'credential removed from the keychain');
+  assert.ok(!t.store.has(agentSlot), 'credential removed from the keychain');
 });
 
 test('logout: also deletes the FILE-side credential (OWENLOOP_NO_KEYCHAIN)', async () => {
@@ -250,10 +252,10 @@ test('logout: also deletes the FILE-side credential (OWENLOOP_NO_KEYCHAIN)', asy
   const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' }, stdin: 'olp_tok' });
   await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
   const path = credentialFilePath(t.io.env);
-  assert.ok(readCredentialFile(path).hubs[ORIGIN], 'credential landed in the file store, not the keychain');
+  assert.ok(readCredentialFile(path).hubs[ORIGIN]?.['agent:default'], 'credential landed in the file store, not the keychain');
 
   t.out.length = 0;
-  const code = await mainAsync(['logout', '--hub', HUB], t.io);
+  const code = await mainAsync(['logout', '--hub', HUB, '--as', 'agent'], t.io);
   assert.equal(code, 0);
   assert.equal(JSON.parse(t.out.join('\n')).removed, true);
   assert.equal(readCredentialFile(path).hubs[ORIGIN], undefined, 'credential removed from the file store too');
@@ -287,8 +289,8 @@ test('connect: a credential present ONLY in the file is not read by the keychain
   const { fetch } = routedFetch({ 'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }) });
   const t = makeIo({ fetch });
   writeCredentialFile(credentialFilePath(t.io.env), {
-    version: 1,
-    hubs: { [ORIGIN]: { kind: 'agent', accessToken: 'olp_stray' } },
+    version: 2,
+    hubs: { [ORIGIN]: { human: { kind: 'agent', accessToken: 'olp_stray' } } },
   });
 
   const code = await mainAsync(['connect', '--hub', HUB], t.io);
@@ -299,14 +301,14 @@ test('connect: a credential present ONLY in the file is not read by the keychain
 test('logout: clears BOTH the keychain and the file store (defensive dual-clear)', async () => {
   const { fetch } = routedFetch({});
   const t = makeIo({ fetch });
-  t.store.set(ORIGIN, JSON.stringify({ kind: 'agent', accessToken: 'olp_kc' }));
+  t.store.set(kcHuman(ORIGIN), JSON.stringify({ kind: 'agent', accessToken: 'olp_kc' }));
   const path = credentialFilePath(t.io.env);
-  writeCredentialFile(path, { version: 1, hubs: { [ORIGIN]: { kind: 'agent', accessToken: 'olp_file' } } });
+  writeCredentialFile(path, { version: 2, hubs: { [ORIGIN]: { human: { kind: 'agent', accessToken: 'olp_file' } } } });
 
   const code = await mainAsync(['logout', '--hub', HUB], t.io);
   assert.equal(code, 0);
   assert.equal(JSON.parse(t.out.join('\n')).removed, true);
-  assert.ok(!t.store.has(ORIGIN), 'keychain entry cleared');
+  assert.ok(!t.store.has(kcHuman(ORIGIN)), 'keychain entry cleared');
   assert.equal(readCredentialFile(path).hubs[ORIGIN], undefined, 'file entry cleared too');
 });
 
@@ -405,4 +407,116 @@ test('login: a timeout firing mid-metadata-fetch surfaces a clean CliError, neve
   } finally {
     process.off('unhandledRejection', onUnhandled);
   }
+});
+
+// ---- credential slots (--as) ------------------------------------------------
+
+/** A whoami-only fake hub: enough to verify a pasted token, nothing more. */
+function whoamiOnly() {
+  return routedFetch({ 'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }) });
+}
+
+test('login --with-token: an `olp_` token lands in agent:default, and --as agent:ci lands in agent:ci', async () => {
+  const t = makeIo({ fetch: whoamiOnly().fetch, stdin: 'olp_default' });
+  assert.equal(await mainAsync(['login', '--hub', HUB, '--with-token'], t.io), 0, t.err.join('\n'));
+  assert.equal(JSON.parse(t.out.join('\n')).slot, 'agent:default');
+  assert.equal(
+    (JSON.parse(t.store.get(kcKey(ORIGIN, { principal: 'agent' }))!) as Credential).accessToken,
+    'olp_default',
+  );
+  assert.equal(t.store.get(kcHuman(ORIGIN)), undefined, 'the human slot is untouched');
+
+  const t2 = makeIo({ fetch: whoamiOnly().fetch, stdin: 'olp_ci' });
+  assert.equal(await mainAsync(['login', '--hub', HUB, '--with-token', '--as', 'agent:ci'], t2.io), 0, t2.err.join('\n'));
+  assert.equal(JSON.parse(t2.out.join('\n')).slot, 'agent:ci');
+  assert.equal(
+    (JSON.parse(t2.store.get(kcKey(ORIGIN, { principal: 'agent', account: 'ci' }))!) as Credential).accessToken,
+    'olp_ci',
+  );
+  assert.equal(t2.store.get(kcKey(ORIGIN, { principal: 'agent' })), undefined, 'agent:default is untouched');
+});
+
+test('login: the loopback OAuth credential lands in the human slot', async () => {
+  const { fetch } = loginRoutes();
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+
+  assert.equal(await mainAsync(['login', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  assert.ok(t.store.has(kcHuman(ORIGIN)));
+  assert.equal(t.store.size, 1, 'exactly one slot written');
+});
+
+test('login: the two slot contradictions are refused without verifying or storing anything', async () => {
+  // An `olp_` agent token explicitly aimed at the human slot.
+  const a = whoamiOnly();
+  const ta = makeIo({ fetch: a.fetch, stdin: 'olp_tok' });
+  assert.equal(await mainAsync(['login', '--hub', HUB, '--with-token', '--as', 'human'], ta.io), 1);
+  assert.match(ta.err.join('\n'), /cannot be stored in the `human` slot/);
+  assert.equal(a.calls.length, 0, 'refused before the verify call');
+  assert.equal(ta.store.size, 0, 'nothing stored');
+
+  // A pasted human `mcpat_` token aimed at an agent slot.
+  const b = whoamiOnly();
+  const tb = makeIo({ fetch: b.fetch, stdin: 'mcpat_tok' });
+  assert.equal(await mainAsync(['login', '--hub', HUB, '--with-token', '--as', 'agent:ci'], tb.io), 1);
+  assert.match(tb.err.join('\n'), /cannot be stored in the `agent:ci` slot/);
+  assert.equal(b.calls.length, 0, 'refused before the verify call');
+  assert.equal(tb.store.size, 0, 'nothing stored');
+
+  // The loopback OAuth flow aimed at an agent slot: refused before the browser.
+  const c = loginRoutes();
+  const tc = makeIo({ fetch: c.fetch, onOpenUrl: driveCallback() });
+  assert.equal(await mainAsync(['login', '--hub', HUB, '--as', 'agent'], tc.io), 1);
+  assert.match(tc.err.join('\n'), /cannot be stored in the `agent:default` slot/);
+  assert.equal(tc.openedUrls.length, 0, 'no browser opened');
+  assert.equal(c.calls.length, 0, 'no OAuth discovery');
+  assert.equal(tc.store.size, 0, 'nothing stored');
+});
+
+test('login: an unusable --as value is rejected as a usage error', async () => {
+  const { fetch, calls } = whoamiOnly();
+  const t = makeIo({ fetch, stdin: 'olp_tok' });
+  assert.equal(await mainAsync(['login', '--hub', HUB, '--with-token', '--as', 'robot'], t.io), 1);
+  assert.match(t.err.join('\n'), /--as: unrecognized slot 'robot'/);
+
+  const t2 = makeIo({ fetch, stdin: 'olp_tok' });
+  assert.equal(await mainAsync(['login', '--hub', HUB, '--with-token', '--as', 'agent:has space'], t2.io), 1);
+  assert.match(t2.err.join('\n'), /--as: invalid agent account/);
+  assert.equal(calls.length, 0, 'no network touched by either rejection');
+});
+
+test('logout --as agent:ci removes only that slot; plain logout removes only human', async () => {
+  const { fetch } = routedFetch({});
+  const t = makeIo({ fetch });
+  const human = kcHuman(ORIGIN);
+  const ci = kcKey(ORIGIN, { principal: 'agent', account: 'ci' });
+  const dflt = kcKey(ORIGIN, { principal: 'agent' });
+  for (const key of [human, ci, dflt]) {
+    t.store.set(key, JSON.stringify({ kind: 'agent', accessToken: `olp_${key}` }));
+  }
+
+  assert.equal(await mainAsync(['logout', '--hub', HUB, '--as', 'agent:ci'], t.io), 0, t.err.join('\n'));
+  const first = JSON.parse(t.out.join('\n'));
+  assert.equal(first.removed, true);
+  assert.equal(first.slot, 'agent:ci');
+  assert.ok(!t.store.has(ci), 'agent:ci removed');
+  assert.ok(t.store.has(human) && t.store.has(dflt), 'the other slots survive');
+
+  t.out.length = 0;
+  assert.equal(await mainAsync(['logout', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  const second = JSON.parse(t.out.join('\n'));
+  assert.equal(second.removed, true);
+  assert.equal(second.slot, 'human');
+  assert.ok(!t.store.has(human), 'human removed');
+  assert.ok(t.store.has(dflt), 'agent:default still survives');
+});
+
+test('logout: an empty slot reports removed:false and names --as in the hint', async () => {
+  const { fetch } = routedFetch({});
+  const t = makeIo({ fetch });
+  t.store.set(kcKey(ORIGIN, { principal: 'agent' }), JSON.stringify({ kind: 'agent', accessToken: 'olp_tok' }));
+
+  assert.equal(await mainAsync(['logout', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  assert.equal(JSON.parse(t.out.join('\n')).removed, false);
+  assert.match(t.err.join('\n'), /--as/);
+  assert.ok(t.store.has(kcKey(ORIGIN, { principal: 'agent' })), 'the agent slot was not collaterally removed');
 });
