@@ -176,6 +176,22 @@ test('login --with-token: an unverifiable token (401) is not stored', async () =
   assert.equal(t.store.size, 0);
 });
 
+test('login: refuses to write while an external credential command is configured', async () => {
+  // The command supplies credentials for this hub, so the local store is never
+  // read. Letting `login` write into it anyway would strand a credential nobody
+  // consults — the stale-key failure the external command exists to prevent.
+  const { fetch } = routedFetch({
+    'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }),
+  });
+  const t = makeIo({ fetch, env: { OWENLOOP_CREDENTIAL_COMMAND: 'my-helper --hub prod' }, stdin: 'olp_tok' });
+
+  const code = await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /OWENLOOP_CREDENTIAL_COMMAND/);
+  assert.match(t.err.join('\n'), /unset it to use `owenloop login`/);
+  assert.equal(t.store.size, 0);
+});
+
 test('login: a cross-origin token_endpoint from discovery metadata is rejected — no foreign request (SEC-4)', async () => {
   // A discovered token_endpoint on a different origin must never receive the
   // code exchange (which carries the PKCE verifier and mints refresh tokens).

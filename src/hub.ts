@@ -19,6 +19,16 @@
  * core/hub boundary lint forbids). `cli.ts` keeps thin wrappers so there is one
  * implementation of backend selection, not two.
  *
+ * Backend precedence is **external → keychain → file**, resolved once in
+ * `credentialBackend`. The external backend is an OPTIONAL, explicitly
+ * configured command (`OWENLOOP_CREDENTIAL_COMMAND`) that prints a credential
+ * for the requested `(origin, slot)` — it gives non-macOS workers, CI, and
+ * users whose secrets live in a secret manager a supported way to feed owenloop
+ * a credential without owenloop learning about any specific manager. When it is
+ * configured it is AUTHORITATIVE: a failure of any kind is a loud error and
+ * never a fallthrough to a store (see `runCredentialCommand`). When it is not
+ * configured, behaviour is byte-for-byte what it was before it existed.
+ *
  * Credentials are keyed by **slot**, not by origin alone: one stored credential
  * per `(normalized origin, principal-account)` pair, the slot being `human` or
  * `agent:<account>` (account defaults to `default`). See `CredentialSlotSelector`
@@ -472,6 +482,125 @@ export function defaultKeychain(env: Record<string, string | undefined>): Keycha
 }
 
 /**
+ * The configured external credential command, or `undefined` when it is unset
+ * or blank.
+ *
+ * Configuration is a single environment variable, `OWENLOOP_CREDENTIAL_COMMAND`,
+ * read off the caller-supplied `env` record like every other knob in this module
+ * (`OWENLOOP_NO_KEYCHAIN`, `OWENLOOP_HUB`, the `*_TIMEOUT_MS` overrides) — never
+ * `process.env` directly, so hosts and tests stay hermetic. Explicit config
+ * only: there is deliberately no discovery, no scanning for helper binaries, and
+ * no implicit default.
+ *
+ * An all-whitespace value is treated as NOT configured, and that decision is
+ * made HERE rather than at each call site, so "is the external backend active?"
+ * has exactly one answer.
+ */
+export function externalCredentialCommand(
+  env: Record<string, string | undefined>,
+): string | undefined {
+  const raw = env.OWENLOOP_CREDENTIAL_COMMAND;
+  if (typeof raw !== 'string' || raw.trim() === '') return undefined;
+  return raw;
+}
+
+/** Request deadline for the external credential command; see `runCredentialCommand`. */
+const CREDENTIAL_COMMAND_TIMEOUT_MS = 10_000;
+
+/** Cap on the command's stdout, so a runaway helper cannot exhaust memory. */
+const CREDENTIAL_COMMAND_MAX_BUFFER = 1024 * 1024;
+
+function credentialCommandTimeoutMs(env: Record<string, string | undefined>): number {
+  const override = Number(env.OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : CREDENTIAL_COMMAND_TIMEOUT_MS;
+}
+
+/**
+ * Run the configured external credential command and return the credential it
+ * printed. THROWS on every failure — it never returns `null` and never falls
+ * through to a store.
+ *
+ * That asymmetry with the stores is deliberate. In a store a corrupt entry reads
+ * as absent (REL-6, see `parseCredential`); from the external command a corrupt
+ * result is a hard ERROR, because a configured command is AUTHORITATIVE and a
+ * silent miss there is exactly the failure this feature exists to prevent — a
+ * half-working helper quietly handing back a stale local key.
+ *
+ * Invocation contract:
+ * - The configured value is a shell command line, run as `/bin/sh -c <command>`,
+ *   so a user can write `my-helper --hub prod` or a pipeline.
+ * - Context reaches the child through the ENVIRONMENT, never argv, so nothing
+ *   has to be shell-quoted into the command string and the secret never rides on
+ *   a command line: `OWENLOOP_CREDENTIAL_ORIGIN` (the NORMALIZED origin) and
+ *   `OWENLOOP_CREDENTIAL_SLOT` (exactly what `credentialSlot()` returned).
+ * - `OWENLOOP_CREDENTIAL_COMMAND` is DELETED from the child's environment. That
+ *   deletion is deliberate: a helper that shells back into `owenloop` would
+ *   otherwise recurse forever.
+ * - stdout must be a JSON object that satisfies `parseCredential` — the same one
+ *   guard both stores use, so there is exactly one definition of "a well-formed
+ *   credential". A bare token is deliberately NOT accepted; inferring `kind`
+ *   would duplicate `login`'s token-kind logic.
+ * - stdio is `['ignore', 'pipe', 'inherit']`: the helper's own diagnostics go
+ *   straight to the user's stderr and owenloop never captures, stores, or echoes
+ *   them (captured stderr could carry the secret into an error message or a
+ *   log). stdout is captured and never logged.
+ */
+function runCredentialCommand(
+  command: string,
+  env: Record<string, string | undefined>,
+  origin: string,
+  slot: string,
+): Credential {
+  // The command string itself came from the user's own config, not a secret
+  // store, so naming it is useful. Captured stdout is or contains the SECRET and
+  // must never reach an error message.
+  const fail = (detail: string): never => {
+    throw new Error(`external credential command failed for ${origin} slot \`${slot}\`: ${detail}`);
+  };
+
+  const childEnv: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v !== undefined) childEnv[k] = v;
+  }
+  delete childEnv.OWENLOOP_CREDENTIAL_COMMAND;
+  childEnv.OWENLOOP_CREDENTIAL_ORIGIN = origin;
+  childEnv.OWENLOOP_CREDENTIAL_SLOT = slot;
+
+  const timeout = credentialCommandTimeoutMs(env);
+  let out: string;
+  try {
+    out = execFileSync('/bin/sh', ['-c', command], {
+      encoding: 'utf8',
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'inherit'],
+      timeout,
+      maxBuffer: CREDENTIAL_COMMAND_MAX_BUFFER,
+    });
+  } catch (e) {
+    const err = e as { status?: unknown; signal?: unknown; code?: unknown };
+    if (err.code === 'ETIMEDOUT' || (err.status === null && typeof err.signal === 'string')) {
+      return fail(`command timed out after ${timeout}ms`);
+    }
+    if (typeof err.status === 'number') return fail(`command exited with status ${err.status}`);
+    // Only the errno CODE is surfaced — it is a fixed token (ENOENT, ENOBUFS,
+    // …) that can never carry the child's output.
+    return fail(`command could not be run (${typeof err.code === 'string' ? err.code : 'unknown error'})`);
+  }
+
+  const trimmed = out.trim();
+  if (trimmed === '') return fail('command produced no output');
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(trimmed);
+  } catch {
+    return fail('command produced output that is not JSON');
+  }
+  const cred = parseCredential(decoded);
+  if (cred === null) return fail('command produced a value that is not a well-formed credential');
+  return cred;
+}
+
+/**
  * Resolve the keychain backend for this env, honoring the hard override:
  * `OWENLOOP_NO_KEYCHAIN=1` forces the file backend (`undefined`) EVEN when a
  * keychain is injected; otherwise the injected backend wins, else the platform
@@ -486,18 +615,33 @@ export function resolveKeychain(
 }
 
 /**
- * The credential backend, decided ONCE from env/config (`resolveKeychain`) and
- * then used consistently for read and write. Deciding once — rather than
- * per-operation — is the REL-6 fix: the old error-driven fallback let a write
- * land in the file while a later read hit the (absent/stale) keychain, so a
- * credential could shadow itself across backends.
+ * The credential backend, decided ONCE from env/config and then used
+ * consistently for read and write. Deciding once — rather than per-operation —
+ * is the REL-6 fix: the old error-driven fallback let a write land in the file
+ * while a later read hit the (absent/stale) keychain, so a credential could
+ * shadow itself across backends.
+ *
+ * Precedence is **external → keychain → file**. Resolving all three here, in one
+ * place, is what makes "decided once" and "a configured external command wins
+ * over a populated keychain or file entry" the same fact, with no second
+ * decision point that could drift.
  */
-export type CredentialBackend = { kind: 'keychain'; kc: Keychain } | { kind: 'file' };
+export type CredentialBackend =
+  | { kind: 'external'; command: string }
+  | { kind: 'keychain'; kc: Keychain }
+  | { kind: 'file' };
 
+/**
+ * `OWENLOOP_NO_KEYCHAIN=1` deliberately does NOT affect the external branch: it
+ * selects between the two LOCAL stores, and the external command sits in front
+ * of both.
+ */
 export function credentialBackend(
   env: Record<string, string | undefined>,
   injected?: Keychain,
 ): CredentialBackend {
+  const command = externalCredentialCommand(env);
+  if (command !== undefined) return { kind: 'external', command };
   const kc = resolveKeychain(env, injected);
   return kc ? { kind: 'keychain', kc } : { kind: 'file' };
 }
@@ -541,19 +685,33 @@ export type ReadStoredCredentialOpts = CredentialSlotSelector & {
  * plaintext-remote origin throws at normalization (SEC-2), exactly as the CLI
  * would.
  *
- * Backend is selected once (`credentialBackend`). A keychain-backed read NEVER
- * falls through to the file (that fallback was the REL-6 shadowing bug), and a
- * corrupt entry reads as absent (`null`) on either backend — never as a reason
- * to consult the other. The file backend derives its path from the supplied
- * `env` (HOME / XDG_CONFIG_HOME), never `process.env` directly, so a caller
- * passing `opts.env` stays hermetic; only the top-level default falls back to
- * `process.env`.
+ * Backend is selected once (`credentialBackend`), with precedence external →
+ * keychain → file. A keychain-backed read NEVER falls through to the file (that
+ * fallback was the REL-6 shadowing bug), and a corrupt entry reads as absent
+ * (`null`) on either store — never as a reason to consult the other. The file
+ * backend derives its path from the supplied `env` (HOME / XDG_CONFIG_HOME),
+ * never `process.env` directly, so a caller passing `opts.env` stays hermetic;
+ * only the top-level default falls back to `process.env`.
+ *
+ * **When `OWENLOOP_CREDENTIAL_COMMAND` is configured this function can THROW
+ * instead of returning `null`**, and it does not consult a store at all. The
+ * command is authoritative, so a nonzero exit, a timeout, empty output, or
+ * output that is not a well-formed credential is a loud error naming the origin
+ * and the slot — never a silent fallthrough to a stale local entry. See
+ * `runCredentialCommand`. When it is NOT configured, behaviour is exactly what
+ * it has always been.
  */
 export function readStoredCredential(origin: string, opts: ReadStoredCredentialOpts): Credential | null {
   const env = opts.env ?? process.env;
+  // Normalization runs FIRST, so SEC-2 (plaintext remote origins rejected) and
+  // slot validation both apply to the external path too — a bad origin or
+  // account never reaches the child process.
   const key = normalizeOrigin(origin);
   const slot = credentialSlot(opts);
   const backend = credentialBackend(env, opts.keychain);
+  if (backend.kind === 'external') {
+    return runCredentialCommand(backend.command, env, key, slot);
+  }
   if (backend.kind === 'keychain') {
     const raw = backend.kc.get(keychainServiceFor(key), slot);
     if (!raw) return null;

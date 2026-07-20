@@ -5,15 +5,19 @@
  * a fixture `$HOME`), slot isolation, account defaulting and validation, the
  * REL-6 no-fallback rule, backend precedence, origin normalization, the
  * corrupt-entry-reads-as-absent guard, the deliberate invisibility of entries
- * written under the OLD one-slot-per-origin keying, and that the exports + their
- * types resolve from the barrel (`src/index.ts`).
+ * written under the OLD one-slot-per-origin keying, the OPTIONAL external
+ * credential command that sits in front of both stores, and that the exports +
+ * their types resolve from the barrel (`src/index.ts`).
  *
  * Hermetic per project rule: every test materializes its own `$HOME` fixture
  * (mkdtemp) and either injects the fake keychain or forces the file backend
  * with `OWENLOOP_NO_KEYCHAIN=1` — never the developer's real keychain, never
  * their real `~/.config`, and never platform-dependent (`defaultKeychain` is
  * `undefined` off macOS, so backend choice here is always forced by injection
- * or the env flag, not by the runner's OS).
+ * or the env flag, not by the runner's OS). The external-command tests hold to
+ * the same bar: each writes its own helper script into its own temp dir and
+ * invokes it through `process.execPath`, so nothing depends on the runner's
+ * `PATH` or on any installed binary.
  */
 
 import { test } from 'node:test';
@@ -23,8 +27,10 @@ import { dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  credentialBackend,
   credentialFilePath,
   credentialSlot,
+  externalCredentialCommand,
   keychainServiceFor,
   normalizeOrigin,
   readStoredCredential,
@@ -267,6 +273,173 @@ test('origin is normalized before the slot lookup; an invalid remote origin thro
 test('keychainServiceFor namespaces the service per origin', () => {
   assert.equal(keychainServiceFor(KEY), 'owenloop:https://hub.example.com');
   assert.notEqual(keychainServiceFor(KEY), keychainServiceFor('https://other.example.com'));
+});
+
+// ---- the optional external credential command ---------------------------------
+
+/**
+ * Write `body` as a JS file in its own temp dir and return a shell command line
+ * that runs it. `process.execPath` (not a bare `node`) is deliberate: the
+ * fixture env is `{ HOME }` with no `PATH`, so the child could not resolve
+ * `node` by name. `/bin/sh` is assumed present, as it already is for the
+ * `security` shell-out.
+ */
+function commandPrinting(body: string): string {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-cred-cmd-'));
+  const script = join(dir, 'helper.mjs');
+  writeFileSync(script, body, { mode: 0o700 });
+  return `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}`;
+}
+
+/** A helper that prints `cred` as JSON on stdout and exits 0. */
+function commandEmitting(cred: Credential): string {
+  return commandPrinting(`process.stdout.write(${JSON.stringify(JSON.stringify(cred))});\n`);
+}
+
+const EXTERNAL: Credential = { kind: 'agent', accessToken: 'olp_from_command' };
+const STORED: Credential = { kind: 'agent', accessToken: 'olp_from_store' };
+
+test('external command wins over a credential present in the keychain', () => {
+  const { keychain } = fakeKeychain();
+  seedKeychain(keychain, KEY, HUMAN, STORED);
+  const env = fixtureEnv({ OWENLOOP_CREDENTIAL_COMMAND: commandEmitting(EXTERNAL) });
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }), EXTERNAL);
+});
+
+test('external command wins over a credential present in the file store', () => {
+  const env = fixtureEnv({ OWENLOOP_NO_KEYCHAIN: '1' });
+  seedFile(env, { [KEY]: { human: STORED } });
+  env.OWENLOOP_CREDENTIAL_COMMAND = commandEmitting(EXTERNAL);
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...HUMAN, env }), EXTERNAL);
+});
+
+/**
+ * Every failure mode: the command is authoritative, so each one throws an error
+ * naming the origin AND the slot, and NONE of them falls through to the seeded
+ * store. The seeded store is the whole point — a returned `STORED` would be the
+ * silent-stale-key bug this feature exists to prevent.
+ */
+const FAILURE_CASES: [string, string, RegExp][] = [
+  ['nonzero exit', 'process.exit(1);\n', /command exited with status 1/],
+  ['empty stdout', 'process.exit(0);\n', /produced no output/],
+  ['whitespace-only stdout', 'process.stdout.write("  \\n ");\n', /produced no output/],
+  ['unparseable stdout', 'process.stdout.write("not json");\n', /output that is not JSON/],
+  [
+    'well-formed JSON that is not a credential',
+    'process.stdout.write(JSON.stringify({ accessToken: "" }));\n',
+    /not a well-formed credential/,
+  ],
+  [
+    'an oauth object missing its refresh half',
+    'process.stdout.write(JSON.stringify({ kind: "oauth", accessToken: "a", clientId: "c" }));\n',
+    /not a well-formed credential/,
+  ],
+];
+
+for (const [label, body, expected] of FAILURE_CASES) {
+  test(`external command failure (${label}) throws and never falls through to a store`, () => {
+    const { keychain } = fakeKeychain();
+    seedKeychain(keychain, KEY, HUMAN, STORED);
+    const env = fixtureEnv({ OWENLOOP_CREDENTIAL_COMMAND: commandPrinting(body) });
+    seedFile(env, { [KEY]: { human: STORED } });
+    assert.throws(
+      () => readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }),
+      (e: Error) => {
+        assert.match(e.message, expected);
+        assert.match(e.message, new RegExp(KEY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+        assert.match(e.message, /slot `human`/);
+        // The stale store value must never be echoed back in any form.
+        assert.ok(!e.message.includes(STORED.accessToken), 'error must not carry the stored secret');
+        return true;
+      },
+    );
+  });
+}
+
+test('external command that hangs times out and throws, with no fallthrough', () => {
+  const { keychain } = fakeKeychain();
+  seedKeychain(keychain, KEY, HUMAN, STORED);
+  const env = fixtureEnv({
+    OWENLOOP_CREDENTIAL_COMMAND: commandPrinting('setTimeout(() => {}, 60_000);\n'),
+    OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '250',
+  });
+  assert.throws(
+    () => readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }),
+    /external credential command failed for .* slot `human`: command timed out after 250ms/,
+  );
+});
+
+test('the slot and the normalized origin reach the command verbatim', () => {
+  // The helper echoes its own context back through the credential it prints.
+  const command = commandPrinting(
+    'process.stdout.write(JSON.stringify({ kind: "agent", accessToken: ' +
+      '`${process.env.OWENLOOP_CREDENTIAL_SLOT}|${process.env.OWENLOOP_CREDENTIAL_ORIGIN}` }));\n',
+  );
+  const env = fixtureEnv({ OWENLOOP_CREDENTIAL_COMMAND: command });
+  for (const [expectedSlot, sel] of SLOT_CASES) {
+    const got = readStoredCredential(ORIGIN, { ...sel, env });
+    assert.deepEqual(got, { kind: 'agent', accessToken: `${expectedSlot}|${KEY}` });
+  }
+  // A path-bearing variant still hands the child the NORMALIZED origin.
+  assert.deepEqual(readStoredCredential('https://hub.example.com/some/path/', { ...HUMAN, env }), {
+    kind: 'agent',
+    accessToken: `human|${KEY}`,
+  });
+});
+
+test('the command does not inherit OWENLOOP_CREDENTIAL_COMMAND, so a helper cannot recurse', () => {
+  const command = commandPrinting(
+    'const leaked = process.env.OWENLOOP_CREDENTIAL_COMMAND !== undefined;\n' +
+      'process.stdout.write(JSON.stringify({ kind: "agent", accessToken: leaked ? "leaked" : "absent" }));\n',
+  );
+  const env = fixtureEnv({ OWENLOOP_CREDENTIAL_COMMAND: command });
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...HUMAN, env }), { kind: 'agent', accessToken: 'absent' });
+});
+
+test('a blank OWENLOOP_CREDENTIAL_COMMAND is not configured — the store answers as usual', () => {
+  const { keychain } = fakeKeychain();
+  seedKeychain(keychain, KEY, HUMAN, STORED);
+  for (const blank of ['', '   ', '\t\n']) {
+    const env = fixtureEnv({ OWENLOOP_CREDENTIAL_COMMAND: blank });
+    assert.deepEqual(readStoredCredential(ORIGIN, { ...HUMAN, env, keychain }), STORED);
+  }
+});
+
+test('an invalid account and a plaintext remote origin still throw BEFORE the command runs', () => {
+  // A command that would "succeed" — if either guard ran late, these would
+  // return this credential instead of throwing.
+  const env = fixtureEnv({ OWENLOOP_CREDENTIAL_COMMAND: commandEmitting(EXTERNAL) });
+  assert.throws(
+    () => readStoredCredential(ORIGIN, { principal: 'agent', account: 'has space', env }),
+    /invalid agent account/,
+  );
+  assert.throws(
+    () => readStoredCredential('http://remote.example.com', { ...HUMAN, env }),
+    /http is only allowed for loopback/,
+  );
+});
+
+test('OWENLOOP_NO_KEYCHAIN=1 does not disable the external command', () => {
+  const env = fixtureEnv({
+    OWENLOOP_NO_KEYCHAIN: '1',
+    OWENLOOP_CREDENTIAL_COMMAND: commandEmitting(EXTERNAL),
+  });
+  seedFile(env, { [KEY]: { human: STORED } });
+  assert.deepEqual(readStoredCredential(ORIGIN, { ...HUMAN, env }), EXTERNAL);
+});
+
+test('externalCredentialCommand reports configuration exactly once, for every call site', () => {
+  assert.equal(externalCredentialCommand({}), undefined);
+  assert.equal(externalCredentialCommand({ OWENLOOP_CREDENTIAL_COMMAND: '  ' }), undefined);
+  assert.equal(externalCredentialCommand({ OWENLOOP_CREDENTIAL_COMMAND: 'helper --x' }), 'helper --x');
+  // …and the backend union reflects it, with external ahead of both stores.
+  const { keychain } = fakeKeychain();
+  assert.deepEqual(credentialBackend({ OWENLOOP_CREDENTIAL_COMMAND: 'helper' }, keychain), {
+    kind: 'external',
+    command: 'helper',
+  });
+  assert.equal(credentialBackend({}, keychain).kind, 'keychain');
+  assert.equal(credentialBackend({ OWENLOOP_NO_KEYCHAIN: '1' }, keychain).kind, 'file');
 });
 
 // ---- the barrel ---------------------------------------------------------------

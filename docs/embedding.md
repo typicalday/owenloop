@@ -287,6 +287,15 @@ re-deriving the keying. Slots never fall back to one another: an empty
 logs or echoes the secret, and there is deliberately no write or delete companion on the public
 surface — `login`/`logout` remain the only way to store or remove a credential.
 
+One behaviour to handle: when the user has set `OWENLOOP_CREDENTIAL_COMMAND` (an
+external command that supplies the credential, ahead of both stores — see
+[where the credential lands](cli.md#hub-login--connect--push--logout)),
+`readStoredCredential` consults that command instead of any store, and a failing
+command **throws** rather than returning `null`. So in that mode `null` still
+means "no credential", but an exception means "the configured command could not
+produce one" — surface its message rather than treating it as an empty slot,
+because falling back to a local store is exactly what the setting forbids.
+
 `SUPPORTED_ENGINE_VERSION` is the programmatic form of the design.md §27
 engine-version contract — the highest `engine:` a def may declare and still load.
 Tooling can preflight-check a def's `engine:` field against it before handing the
