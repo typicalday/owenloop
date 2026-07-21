@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/typicalday/owenloop/compare/v0.3.1...v0.4.0) (2026-07-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* `Keychain` methods take `(service, account)`, the `readStoredCredential` options argument is required and must carry a principal, and credentials stored under the previous keying are not read. There is deliberately no migration path — re-run `owenloop login`.
+
+### Features
+
+* **hub:** optional external command for hub credentials ([#69](https://github.com/typicalday/owenloop/issues/69)) ([bd52654](https://github.com/typicalday/owenloop/commit/bd526545983e055a479be2f93e1e644a2ee37131))
+* principal-namespaced credential slots for hub credentials ([#68](https://github.com/typicalday/owenloop/issues/68)) ([253174f](https://github.com/typicalday/owenloop/commit/253174f33d51f90f1e051e85ff21a15b4d11e031))
+* **store:** export read-only credential surface (readStoredCredential) ([#66](https://github.com/typicalday/owenloop/issues/66)) ([ed43efd](https://github.com/typicalday/owenloop/commit/ed43efdc7f305ca231f35f251c9d13886898d41a))
+
 ## [0.3.1](https://github.com/typicalday/owenloop/compare/v0.3.0...v0.3.1) (2026-07-17)
 
 

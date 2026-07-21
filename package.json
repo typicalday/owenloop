@@ -1,6 +1,6 @@
 {
   "name": "owenloop",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Deterministic rails for agentic workflows. Declare steps and dependencies; the engine guarantees order, redoes what changes invalidate, and stops what keeps failing — instead of hoping the agent follows through.",
   "license": "Apache-2.0",
   "author": "typicalday",
