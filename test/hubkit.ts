@@ -8,6 +8,7 @@
  * or the network (beyond the test-owned 127.0.0.1 loopback the login flow uses).
  */
 
+import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -37,7 +38,14 @@ export interface RouteResult {
    */
   stream?: (res: ServerResponse) => void;
 }
-export type RouteHandler = (req: { url: URL; body: string | undefined; method: string }) => RouteResult;
+export type RouteHandler = (req: {
+  url: URL;
+  body: string | undefined;
+  method: string;
+  /** The request's `Authorization` header value (e.g. `Bearer <token>`), or `null`. Lets a
+   *  stateful fake branch on the human vs agent bearer — most handlers ignore it. */
+  authorization: string | null;
+}) => RouteResult;
 
 export interface RecordedCall {
   method: string;
@@ -96,7 +104,7 @@ export function routedFetch(routes: Record<string, RouteHandler>): {
     calls.push({ method, url: urlStr, pathname: url.pathname, body, authorization, redirect: init?.redirect });
     const handler = routes[`${method} ${url.pathname}`];
     if (!handler) throw new Error(`routedFetch: no route for ${method} ${url.pathname}`);
-    const r = handler({ url, body, method });
+    const r = handler({ url, body, method, authorization });
     if (r.stream) throw new Error(`routedFetch: stream routes require realHttpServer (${method} ${url.pathname})`);
     const headers = { 'Content-Type': 'application/json', ...(r.headers ?? {}) };
     const payload = r.raw !== undefined ? r.raw : r.json === undefined ? '' : JSON.stringify(r.json);
@@ -193,7 +201,7 @@ export async function realHttpServer(routes: Record<string, RouteHandler>): Prom
         res.end(JSON.stringify({ error: `realHttpServer: no route for ${method} ${url.pathname}` }));
         return;
       }
-      const r = handler({ url, body, method });
+      const r = handler({ url, body, method, authorization });
       if (r.stream) {
         // Streaming route: write the head, then let the handler own the body
         // (write chunks, end, or leave it open to exercise a client cancel).
@@ -243,6 +251,14 @@ export interface MakeIoOpts {
   stdin?: string;
   /** Called with the authorize URL; use it to drive the loopback in login tests. */
   onOpenUrl?: (url: string) => void;
+  /** Injected interactive-prompt seam for `setup` (the succession / name prompts).
+   *  The default `makeIo` leaves it undefined so a scripted test that supplies no
+   *  prompt exercises the non-interactive guard. */
+  prompt?: (question: string) => Promise<string>;
+  /** Injected exec seam for the plugin probe (`claude plugin list`). Undefined by
+   *  default, so the plugin check just doesn't find the binary unless the test PATH
+   *  provides one AND a runCommand is supplied. */
+  runCommand?: (cmd: string, args: string[]) => { status: number | null; stdout: string; stderr: string };
 }
 
 export function makeIo(opts: MakeIoOpts = {}): HubIo {
@@ -265,6 +281,8 @@ export function makeIo(opts: MakeIoOpts = {}): HubIo {
     },
     keychain: opts.keychain ?? kc.keychain,
     readStdin: async () => opts.stdin ?? '',
+    prompt: opts.prompt,
+    runCommand: opts.runCommand,
   };
   return { io, cwd, home, out, err, openedUrls, store: opts.store ?? kc.store };
 }
@@ -347,4 +365,215 @@ export function makeFakeHub(seed: { name: string; yaml: string; version?: number
     },
   };
   return { routes, state };
+}
+
+// ---- makeIdentityHub: the stateful fake for setup/doctor -------------------
+
+/** One agent identity in the fake hub's state. `lastContactAt` is identity-level;
+ *  the reported `lastUsedAt` is COMPUTED (max over the identity's tokens, incl. revoked). */
+export interface IdentityRow {
+  id: string;
+  name: string;
+  createdAt: number;
+  lastContactAt: number | null;
+  pools: string[];
+  disabled: boolean;
+}
+
+/** One issued agent token. `plaintext` is the `olp_` secret a `whoami` bearer presents. */
+export interface TokenRow {
+  id: string;
+  plaintext: string;
+  agentId: string;
+  revoked: boolean;
+  lastUsedAt: number | null;
+}
+
+/** The mutable state a `makeIdentityHub` closes over — tests seed/inspect it directly. */
+export interface IdentityHubState {
+  identities: Map<string, IdentityRow>;
+  tokens: Map<string, TokenRow>;
+  /** When true, `GET /api/agent_identities` returns 403 even for a human bearer (non-admin human). */
+  adminForbidden: boolean;
+  /** HTTP status the `refresh_token` grant returns (200 ok; set 400 for the dead-refresh test). */
+  refreshGrantStatus: number;
+  counter: { n: number };
+}
+
+/** A seed identity (with an optional live token) for `makeIdentityHub`. */
+export interface SeedIdentity {
+  id?: string;
+  name: string;
+  pools?: string[];
+  lastContactAt?: number | null;
+  lastUsedAt?: number | null;
+  disabled?: boolean;
+  /** Seed a token for this identity so its computed `lastUsedAt` is set and its `olp_` verifies. */
+  token?: { plaintext: string; revoked?: boolean };
+}
+
+const IDENTITY_ORG = { orgId: 'org_test123', orgName: 'Test Org' };
+
+/** The bearer (minus `Bearer `) from an Authorization header value. */
+function bearerOf(authorization: string | null): string {
+  return (authorization ?? '').replace(/^Bearer\s+/i, '');
+}
+
+/**
+ * A stateful fake hub for `setup`/`doctor`, composable with `routedFetch`.
+ * Models the OAuth AS (metadata / DCR / token, both grants), `whoami` (branching
+ * on the human `mcpat*` bearer vs a live `olp_` agent token), `agent_identities`
+ * (human-only; computes `lastUsedAt` as the max over an identity's tokens
+ * INCLUDING revoked ones — deliberately rekey-surviving), `mint_agent_token`
+ * (name-taken 400 branch; the `text` field carries the plaintext), and
+ * `rekey_agent_token` (revokes the identity's live tokens, mints a new `olp_`).
+ *
+ * Returns `{ routes, state }`; wrap `routes` with `routedFetch` (a fresh wrap
+ * over the SAME `routes` reuses the same mutable `state` — the second-run no-op
+ * test relies on this). Seed identities/tokens via `seed` or by mutating `state`.
+ */
+export function makeIdentityHub(seed: { identities?: SeedIdentity[] } = {}): {
+  routes: Record<string, RouteHandler>;
+  state: IdentityHubState;
+} {
+  const state: IdentityHubState = {
+    identities: new Map(),
+    tokens: new Map(),
+    adminForbidden: false,
+    refreshGrantStatus: 200,
+    counter: { n: 0 },
+  };
+
+  (seed.identities ?? []).forEach((s, i) => {
+    const id = s.id ?? `agent_seed_${i + 1}`;
+    state.identities.set(id, {
+      id,
+      name: s.name,
+      createdAt: Date.now(),
+      lastContactAt: s.lastContactAt ?? null,
+      pools: s.pools ?? [],
+      disabled: s.disabled ?? false,
+    });
+    if (s.token) {
+      const tid = `tok_seed_${i + 1}`;
+      state.tokens.set(tid, {
+        id: tid,
+        plaintext: s.token.plaintext,
+        agentId: id,
+        revoked: s.token.revoked ?? false,
+        lastUsedAt: s.lastUsedAt ?? null,
+      });
+    }
+  });
+
+  const computedLastUsedAt = (agentId: string): number | null =>
+    [...state.tokens.values()]
+      .filter((t) => t.agentId === agentId)
+      .reduce<number | null>((m, t) => (t.lastUsedAt !== null && (m === null || t.lastUsedAt > m) ? t.lastUsedAt : m), null);
+
+  const requireHuman = (authorization: string | null): boolean => bearerOf(authorization).startsWith('mcpat');
+
+  const routes: Record<string, RouteHandler> = {
+    // --- OAuth AS ---
+    'GET /.well-known/oauth-authorization-server': () => ({ status: 200, json: OAUTH_METADATA }),
+    'POST /mcp/register': () => ({ status: 200, json: { client_id: 'client-abc' } }),
+    'POST /mcp/token': (req) => {
+      const grant = new URLSearchParams(req.body ?? '').get('grant_type');
+      if (grant === 'refresh_token') {
+        if (state.refreshGrantStatus !== 200) return { status: state.refreshGrantStatus, json: { error: 'invalid_grant' } };
+        return { status: 200, json: { access_token: 'mcpat_refreshed', refresh_token: 'rt_refresh2', expires_in: 3600, token_type: 'Bearer' } };
+      }
+      return { status: 200, json: { access_token: 'mcpat_access', refresh_token: 'rt_refresh', expires_in: 3600, token_type: 'Bearer' } };
+    },
+
+    // --- identity plane ---
+    'GET /api/whoami': (req) => {
+      const bearer = bearerOf(req.authorization);
+      if (bearer.startsWith('mcpat')) {
+        return { status: 200, json: { ...IDENTITY_ORG, actor: { id: 'user_abc', kind: 'user', role: 'admin' }, authMethod: 'oauth', email: 'alex@typical.day' } };
+      }
+      const tok = [...state.tokens.values()].find((t) => t.plaintext === bearer && !t.revoked);
+      if (tok) {
+        return { status: 200, json: { ...IDENTITY_ORG, actor: { id: tok.agentId, kind: 'agent', role: 'agent' }, authMethod: 'agent_token' } };
+      }
+      return { status: 401, json: { message: 'unauthorized' } };
+    },
+    'GET /api/agent_identities': (req) => {
+      if (!requireHuman(req.authorization)) return { status: 403, json: { message: 'forbidden' } };
+      if (state.adminForbidden) return { status: 403, json: { message: 'forbidden: manage_tokens requires an admin credential' } };
+      const identities = [...state.identities.values()].map((id) => ({
+        id: id.id,
+        name: id.name,
+        role: 'agent',
+        createdBy: 'user_abc',
+        createdAt: id.createdAt,
+        disabled: id.disabled,
+        firstContactAt: null,
+        lastContactAt: id.lastContactAt,
+        lastUsedAt: computedLastUsedAt(id.id),
+        pools: id.pools,
+      }));
+      return { status: 200, json: { identities } };
+    },
+
+    // --- token verbs ---
+    'POST /api/mint_agent_token': (req) => {
+      if (!requireHuman(req.authorization)) return { status: 403, json: { message: 'forbidden' } };
+      const body = JSON.parse(req.body ?? '{}') as { name?: string; scopes?: string[]; pools?: string[] };
+      const name = body.name ?? '';
+      if ([...state.identities.values()].some((i) => i.name === name)) {
+        return { status: 400, json: { message: `agent name already taken: "${name}"` } };
+      }
+      const n = ++state.counter.n;
+      const agentId = `agent_${n}`;
+      const tokenId = `tok_${n}`;
+      const plaintext = `olp_minted_${n}_secretpart`;
+      const pools = body.pools ?? ['personal-alex'];
+      state.identities.set(agentId, { id: agentId, name, createdAt: Date.now(), lastContactAt: null, pools, disabled: false });
+      state.tokens.set(tokenId, { id: tokenId, plaintext, agentId, revoked: false, lastUsedAt: null });
+      return {
+        status: 200,
+        json: { text: `Agent token minted (id ${tokenId}). Store this secret now — it will not be shown again:\n${plaintext}`, id: tokenId, token: plaintext, agentId, pools },
+      };
+    },
+    'POST /api/rekey_agent_token': (req) => {
+      if (!requireHuman(req.authorization)) return { status: 403, json: { message: 'forbidden' } };
+      const body = JSON.parse(req.body ?? '{}') as { agentId?: string };
+      const agentId = body.agentId ?? '';
+      if (!state.identities.has(agentId)) return { status: 400, json: { message: `unknown agent: ${agentId}` } };
+      const revokedTokenIds: string[] = [];
+      for (const t of state.tokens.values()) {
+        if (t.agentId === agentId && !t.revoked) {
+          t.revoked = true;
+          revokedTokenIds.push(t.id);
+        }
+      }
+      const n = ++state.counter.n;
+      const tokenId = `tok_${n}`;
+      const plaintext = `olp_rekeyed_${n}_secretpart`;
+      state.tokens.set(tokenId, { id: tokenId, plaintext, agentId, revoked: false, lastUsedAt: null });
+      return {
+        status: 200,
+        json: { text: `Agent token re-keyed. Store this secret now:\n${plaintext}`, id: tokenId, token: plaintext, agentId, revokedTokenIds, scopes: ['work'] },
+      };
+    },
+    'POST /api/revoke_token': (req) => {
+      const body = JSON.parse(req.body ?? '{}') as { tokenId?: string };
+      const t = state.tokens.get(body.tokenId ?? '');
+      if (t) t.revoked = true;
+      return { status: 200, json: { ok: true } };
+    },
+  };
+
+  return { routes, state };
+}
+
+/**
+ * THE leak assertion, run at the end of EVERY setup/doctor test: no `olp_`
+ * substring may appear on stdout or stderr. The fake mint/rekey tokens all start
+ * `olp_` and are carried in the `text` field, so this has teeth.
+ */
+export function assertNoOlp(t: HubIo): void {
+  const combined = [...t.out, ...t.err].join('\n');
+  assert.ok(!/olp_/.test(combined), `no olp_ token may appear on stdout/stderr; got:\n${combined}`);
 }
