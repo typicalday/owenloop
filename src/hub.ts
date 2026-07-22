@@ -981,6 +981,67 @@ export function asWhoami(body: unknown): WhoamiIdentity {
 }
 
 /**
+ * Success shape of `POST /api/mint_agent_token` — the fields a caller is allowed
+ * to keep. Deliberately a WHITELIST: the real 200 body also carries a `text`
+ * field whose value CONTAINS the one-time `olp_` plaintext token ("Store this
+ * secret now …\n<olp_…>"), so a caller must never spread the raw body — it must
+ * build its result from these named fields only.
+ *
+ * `token` is the plaintext secret. It rides this typed shape exactly ONE hop:
+ * from `asMintAgentTokenOk`'s caller into `storeCredential`. It is never logged,
+ * printed, or embedded in an error — see `mintAgentCredential` (credentials.ts)
+ * and the identity model's §6 "rule of gates".
+ */
+export interface MintAgentTokenOk {
+  /** Token id — a non-secret revocation handle, safe to print. */
+  id: string;
+  /** The one-time `olp_` plaintext. SECRET — store-only, never echoed. */
+  token: string;
+  /** The minted agent's id — a non-secret handle, safe to print. */
+  agentId: string;
+  /** Resolved pool NAMES the token was granted on — non-secret. */
+  pools: string[];
+}
+
+/**
+ * Narrow a `POST /api/mint_agent_token` 200 body to its typed success shape,
+ * validating STRICTLY (mirrors `asWhoami`/`asCreateWorkflowOk`'s throw-on-
+ * malformed style): a 2xx is not enough — the identity fields must be present
+ * and well-typed, or the "success" is a malformed response and must be treated
+ * as a failure rather than silently coerced.
+ *
+ * **Token hygiene (load-bearing):** every error message names the offending
+ * FIELD only — it never echoes a field VALUE. A malformed body could still carry
+ * the `olp_` plaintext (in `text`, or in a mistyped `token`), so echoing values
+ * here would be the exact leak §6 forbids. `id`/`agentId` must be non-empty
+ * strings; `token` a non-empty string starting `olp_`; `pools` an array of
+ * strings (empty allowed defensively — the server always resolves at least one,
+ * but the client does not depend on that to stay leak-safe).
+ */
+export function asMintAgentTokenOk(body: unknown): MintAgentTokenOk {
+  if (typeof body !== 'object' || body === null) {
+    throw new Error('mint_agent_token: malformed success response — not an object');
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.id !== 'string' || b.id === '') {
+    throw new Error('mint_agent_token: malformed success response — missing non-empty string id');
+  }
+  if (typeof b.agentId !== 'string' || b.agentId === '') {
+    throw new Error('mint_agent_token: malformed success response — missing non-empty string agentId');
+  }
+  if (typeof b.token !== 'string' || b.token === '') {
+    throw new Error('mint_agent_token: malformed success response — missing non-empty string token');
+  }
+  if (!b.token.startsWith('olp_')) {
+    throw new Error('mint_agent_token: malformed success response — token is not an olp_ token');
+  }
+  if (!Array.isArray(b.pools) || b.pools.some((p) => typeof p !== 'string')) {
+    throw new Error('mint_agent_token: malformed success response — pools must be an array of strings');
+  }
+  return { id: b.id, token: b.token, agentId: b.agentId, pools: b.pools as string[] };
+}
+
+/**
  * Parse `GET /api/workflows`'s body into a `name -> WorkflowSummary` map for
  * `computeServerDiff`. Throws a descriptive error (the caller wraps it in a
  * `CliError`) on a missing/malformed `workflows` array.

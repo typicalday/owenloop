@@ -62,6 +62,7 @@ import {
   ensureFreshOAuth,
   hubFetch,
   hubMaxResponseBytes,
+  mintAgentCredential,
   readBodyBounded,
   refreshOAuth,
   storeCredential,
@@ -105,6 +106,7 @@ import {
   hashDefForHub,
   hubBindingPath,
   keychainServiceFor,
+  listStoredHubOrigins,
   normalizeOrigin,
   parseWorkflowList,
   pkcePair,
@@ -483,6 +485,7 @@ Commands:
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
   push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
+  agent new <name> [--pools <a,b>] [--hub <url>]   mint a new agent identity on the hub and store its token in slot agent:<name> (the token is never printed)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided]
@@ -552,6 +555,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
+  ['agent', cmdOpts('pools', 'hub')],
   ['mcp', cmdOpts('hub')],
   ['lint', cmdOpts()],
   ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided')],
@@ -2556,6 +2560,160 @@ function createWorkflowRequest(
 }
 
 /**
+ * Resolve the hub `agent new` mints on: `--hub <origin>` (normalized via
+ * `normalizeOrigin`) → else the ONE hub the credential FILE knows → else a
+ * `CliError` with `exitCode: 2` naming both remedies.
+ *
+ * Deliberately NOT `resolveHub` (`--hub → OWENLOOP_HUB → DEFAULT_HUB`): silently
+ * defaulting a MINT to the production hub while the user is logged into a dev hub
+ * would mint on the wrong org, and a mint is not undone by a retry. `OWENLOOP_HUB`
+ * is intentionally excluded so this stays in parity with O2's `owenloop mcp`.
+ *
+ * `listStoredHubOrigins` is backend-aware (shared with O2's `owenloop mcp`): only
+ * the FILE backend can enumerate, so it returns `null` on a keychain- or
+ * external-command-backed machine — those must pass `--hub`. A file-backed store
+ * returns the origins with a valid `human` slot: `[]` (log in first), exactly one
+ * (used automatically), or more than one (the non-secret origin keys are listed
+ * back so the user can pick).
+ */
+function resolveAgentHub(io: CliIO, args: Args): string {
+  const flagVal = last(args, 'hub');
+  if (flagVal !== undefined) {
+    try {
+      return normalizeOrigin(flagVal);
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+  }
+  const origins = listStoredHubOrigins(io.env, io.keychain);
+  if (origins === null) {
+    const backend = credentialBackend(io.env, io.keychain);
+    const which = backend.kind === 'external' ? 'external-command' : 'keychain';
+    throw new CliError(
+      `cannot determine which hub to mint on — the ${which} credential store cannot be enumerated; ` +
+        'pass --hub <origin>',
+      { exitCode: 2 },
+    );
+  }
+  if (origins.length === 1) return origins[0]!;
+  throw new CliError(
+    'cannot determine which hub to mint on — pass --hub <origin>, or log in to exactly one hub first ' +
+      '(owenloop login --hub <origin>)' +
+      (origins.length > 1 ? `; stored hubs: ${origins.join(', ')}` : ''),
+    { exitCode: 2 },
+  );
+}
+
+/**
+ * `owenloop agent new <name>` — mint a new agent identity on the hub and store
+ * its `olp_` token in slot `agent:<name>`.
+ *
+ * **Secret hygiene (identity model §6, "rule of gates"):** the minted token goes
+ * process→store ONLY — it never appears on stdout, stderr, in an error, or in a
+ * log. `mintAgentCredential` (credentials.ts) owns the token end to end and
+ * returns none of it; the confirmation printed here is built from an explicit
+ * WHITELIST of non-secret fields (name, pools, storage backend, revocation ids).
+ *
+ * Ordering is load-bearing (PR #69 lesson, carried by `mintAgentCredential`): the
+ * client-side name validation and the external-command refusal both run BEFORE
+ * any network call, so a refusal that would make the credential unstorable never
+ * mints a server-side token first — minting then failing to store would burn the
+ * agent name permanently.
+ *
+ * Exit codes: 0 ok; 1 generic failure (invalid name, name taken, pool/shape
+ * rejection, network timeout, minted-but-unstored); 2 the hub is unresolvable;
+ * 3 the human credential is absent or irrecoverable (remedy names
+ * `owenloop login --hub <origin>`).
+ *
+ * A subcommand switch (`new` only today) leaves room for `agent list`/etc. later.
+ */
+async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
+  const sub = args.positionals[1];
+  if (sub !== 'new') {
+    throw new CliError(`unknown agent subcommand '${sub ?? ''}' — expected: agent new <name>`);
+  }
+  const name = args.positionals[2];
+  if (name === undefined) {
+    throw new CliError(
+      'missing required argument: <name> (usage: owenloop agent new <name> [--pools a,b] [--hub <url>])',
+    );
+  }
+  // Validate the agent name eagerly — before any I/O — with the store's own
+  // wording, so a bad name never reaches the network or the store.
+  try {
+    credentialSlot({ principal: 'agent', account: name });
+  } catch (e) {
+    throw new CliError(`agent new: invalid agent name — ${(e as Error).message}`);
+  }
+
+  // --pools: split on `,`, trim, drop empties. Absent → undefined (key omitted
+  // from the request; the server then defaults to the minter's personal pool).
+  // Present but empty (`--pools ""` / `--pools ,`) → usage error, before any I/O.
+  // No client-side pool-name validation — the server is the enforcement of record.
+  const poolsRaw = last(args, 'pools');
+  let pools: string[] | undefined;
+  if (poolsRaw !== undefined) {
+    pools = poolsRaw
+      .split(',')
+      .map((p) => p.trim())
+      .filter((p) => p !== '');
+    if (pools.length === 0) {
+      throw new CliError('--pools requires at least one pool name');
+    }
+  }
+
+  // Refuse an external-command setup at the TOP of the dispatcher — before the
+  // human-credential read (which would otherwise RUN the command) and before any
+  // network call (PR #69 lesson; `mintAgentCredential` carries the same guard as
+  // a library backstop). Refusing only at store time would mint a server-side
+  // token we could never store locally, permanently burning the agent name.
+  if (externalCredentialCommand(io.env) !== undefined) {
+    throw new CliError(
+      'an external credential command is configured (OWENLOOP_CREDENTIAL_COMMAND), so it — not the ' +
+        'local store — supplies credentials for this hub; unset it to use `owenloop login`',
+    );
+  }
+
+  const origin = resolveAgentHub(io, args);
+
+  // The human bearer for the resolved origin. Absent → exit 3 with the verbatim
+  // remedy the brief mandates.
+  const cred = readCredential(io, origin, { principal: 'human' });
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  let result;
+  try {
+    result = await mintAgentCredential(io, origin, { principal: 'human' }, cred, { name, pools });
+  } catch (e) {
+    // A refresh-failure-family error (the human oauth is irrecoverable, or a 401
+    // survived the refresh-and-retry) is exit 3 with the login remedy; every
+    // other CliError propagates as-is — a network timeout stays exit 1, because a
+    // flaky network is not an irrecoverable credential.
+    if (e instanceof CliError && /run `owenloop login`/.test(e.message)) {
+      throw new CliError(`${e.message} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+    }
+    throw e;
+  }
+
+  // Confirmation: whitelisted, non-secret fields ONLY. `text`/`token` are
+  // structurally absent from `result`, so there is nothing here to leak.
+  print(io, {
+    ok: true,
+    hub: origin,
+    name,
+    slot: `agent:${name}`,
+    pools: result.pools,
+    scopes: ['work'],
+    storage: result.storage,
+    agentId: result.agentId,
+    tokenId: result.id,
+  });
+  return 0;
+}
+
+/**
  * Async entry point that adds network I/O for `add` and the hub commands on top
  * of the otherwise fully-synchronous engine/CLI (see the doc comment on
  * `sleepMs` above and README "sync end to end"). `main`/`dispatch` stay sync and
@@ -2563,7 +2721,7 @@ function createWorkflowRequest(
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'mcp']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'mcp']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   const args = parseArgs(argv);
@@ -2585,6 +2743,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchConnect(io, args);
       case 'push':
         return await dispatchPush(io, args);
+      case 'agent':
+        return await dispatchAgent(io, args);
       case 'mcp':
         return await dispatchMcp(io, args);
       default:
@@ -2596,7 +2756,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
     } else {
       io.err(`error: ${(e as Error).message}`);
     }
-    return 1;
+    // A CliError carries its own exit code (default 1); everything else is 1.
+    return e instanceof CliError ? e.exitCode : 1;
   }
 }
 
@@ -2618,6 +2779,7 @@ export function main(argv: string[], io: CliIO = defaultIO()): number {
     } else {
       io.err(`error: ${(e as Error).message}`);
     }
-    return 1;
+    // A CliError carries its own exit code (default 1); everything else is 1.
+    return e instanceof CliError ? e.exitCode : 1;
   }
 }

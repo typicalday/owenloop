@@ -37,6 +37,7 @@ positional or the next `--flag`, never consumed as this flag's argument. Use
 | `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
+| `agent new <name> [--pools <a,b>] [--hub <url>]` | mint a new agent identity on the hub and store its token in slot `agent:<name>` — the token is never printed — see [Hub](#hub-login--connect--push--logout) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
@@ -516,6 +517,63 @@ both before pushing.
 Exact-match redirect URIs (no RFC 8252 variable-port allowance) and no
 device-code grant remain recorded follow-ups on the service, not gaps in the
 CLI.
+
+### `agent new` — mint an agent token into a slot
+
+`owenloop agent new <name>` mints a new agent identity on the hub (`POST
+/api/mint_agent_token`, authenticated as your **human** credential) and stores
+the returned `olp_` token in the local credential slot `agent:<name>` — the same
+slot `login --as agent:<name>` writes and `push --as agent:<name>` reads. Use it
+to provision an agent token without pasting one by hand: the mint and the store
+happen in one step, and you never handle the secret.
+
+**The token is never printed.** The minted `olp_` token goes process → store
+only — it never appears on stdout, stderr, in an error, or in a log (identity
+model §6, "rule of gates"). The confirmation JSON is built from a whitelist of
+**non-secret** fields only: `hub`, `name`, `slot`, `pools` (the resolved pool
+names), `scopes` (`["work"]`), `storage` (`keychain` | `file`), `agentId` (the
+agent's id), and `tokenId` (a revocation handle). To use the agent afterwards,
+pass `--as agent:<name>` to `connect`/`push`; to revoke it, use its `tokenId`
+on the hub.
+
+**Which hub gets minted on (`--hub`).** Resolution is deliberately narrow —
+minting on the wrong org is not undone by a retry:
+
+1. `--hub <origin>` if given (normalized the same way as everywhere else).
+2. Otherwise the **one** hub your credential *file* stores — if exactly one is
+   present, it's used.
+3. Otherwise the command **exits 2** naming both remedies (pass `--hub`, or log
+   in to exactly one hub); when more than one hub is stored their origins are
+   listed back so you can pick.
+
+Unlike other commands this does **not** fall back to `OWENLOOP_HUB` or the
+built-in default hub — silently defaulting a mint would risk minting on the
+production hub while you're logged into a dev one. Note that hub enumeration is
+**file-store only** (shared with `owenloop mcp`): the keychain and the
+external-command backend cannot list their entries, so on such a machine step 2
+cannot enumerate the store and you must pass `--hub`.
+
+**`--pools <a,b>`.** A comma-separated list of pool names the token is granted
+on (trimmed, empties dropped). Omit the flag to let the hub default the token to
+the minter's personal pool; `--pools ""` (or `--pools ,`) is a usage error. Pool
+names are validated by the hub, not the client.
+
+**A configured external credential command blocks the mint.** If
+`OWENLOOP_CREDENTIAL_COMMAND` is set, that command — not the local store —
+supplies credentials for the hub, so `agent new` refuses up front (it has
+nowhere to write the minted token); unset the variable to use the local store.
+This check, the name validation, and the empty-`--pools` check all run **before**
+any network call, so a refusal never mints a server-side token first — a mint
+that then failed to store would burn the agent name permanently.
+
+**Exit codes.**
+
+| code | meaning |
+|---|---|
+| `0` | minted and stored |
+| `1` | generic failure — invalid or already-taken name, pool/shape rejection, network timeout, or a token that minted but couldn't be stored |
+| `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
+| `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
 
 ## `mcp` — stdio control-plane server for MCP hosts
 
