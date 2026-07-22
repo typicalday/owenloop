@@ -38,6 +38,8 @@ positional or the next `--flag`, never consumed as this flag's argument. Use
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `agent new <name> [--pools <a,b>] [--hub <url>]` | mint a new agent identity on the hub and store its token in slot `agent:<name>` — the token is never printed — see [Hub](#hub-login--connect--push--logout) |
+| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>]` | converge this machine's install (human login, agent credential, owenwork settings, plugin) in one idempotent pass — see [`setup`](#setup--converge-a-machines-install) |
+| `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
@@ -574,6 +576,137 @@ that then failed to store would burn the agent name permanently.
 | `1` | generic failure — invalid or already-taken name, pool/shape rejection, network timeout, or a token that minted but couldn't be stored |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
+
+## `setup` — converge a machine's install
+
+`owenloop setup` is the one-shot onboarding command. It brings a machine to a
+working install by converging six surfaces in order, each a **probe → (skip |
+act)** step — a step acts only when its probe fails, so a second run on an
+already-set-up machine performs **zero writes** (no store mutation, no settings
+write, no browser, no mint/rekey/register POST). The steps:
+
+1. **inspect** — read-only report of what's already present (human credential,
+   owenwork settings, `claude` on PATH, agent slots). No writes.
+2. **human login** — verify the stored **human** credential, or run the same
+   loopback-OAuth browser flow as `owenloop login` when none is present or it no
+   longer verifies. This is the gate that makes step 3's mint/rekey legal.
+3. **agent** — find a local `agent:<name>` slot that verifies live against the
+   hub and reuse it; otherwise **mint** a new agent identity or **rekey**
+   (replace the credential of) an existing one. How the target is chosen is
+   [below](#choosing-the-agent-flow-a-vs-flow-b).
+4. **owenwork settings** — write `hubOrigin` into the owenwork settings file so
+   the local worker talks to this hub (skipped when it already matches).
+5. **plugin** — check whether the Claude Code `owenloop` plugin is installed.
+   **Non-fatal:** while the marketplace is unpublished this step only *prints*
+   the manual install commands (`claude plugin marketplace add owenloop` then
+   `claude plugin install owenloop@owenloop`); it never fails setup.
+6. **doctor** — a final [`doctor`](#doctor--check-a-machines-install) pass over
+   the same surfaces, whose result becomes setup's exit code.
+
+Progress lines (the `[n/6]` headers and `✓`/`✗` marks) go to **stderr**; the
+final machine-readable summary — `{ ok, hub, steps, doctor }` — goes to
+**stdout**.
+
+### Choosing the agent (Flow A vs Flow B)
+
+When step 3 has to act (no reusable local agent slot), it decides *which* agent
+to connect this machine to:
+
+- **Flow A — fresh org (no agent identities on the hub):** setup asks you to
+  **name** the agent, prefilled with a sanitized form of the machine hostname.
+  The name is a suggestion — any label matching `[A-Za-z0-9][A-Za-z0-9._-]*`
+  (1–64 chars) is accepted. It then **mints** that agent.
+- **Flow B — org already has agents (succession):** setup shows the existing
+  agents (each with its name, when it was **last active**, and its **pools**)
+  and asks whether this is a *new* installation or one that *replaces* an
+  existing agent. Choosing **new** mints a fresh agent; choosing **replace**
+  **rekeys** the chosen agent — which **revokes that agent's current
+  credential**, so if it is still running elsewhere it will be disconnected
+  there.
+
+**Non-interactive runs must pass a bypass flag.** When stdin is not a TTY (a
+scripted or piped run) and step 3 needs to act, setup will not block on a
+prompt — it errors unless you pre-decide with one of:
+
+- `--new-agent <name>` — mint a new agent named `<name>` (skips Flow A's name
+  prompt and Flow B's succession prompt).
+- `--replace-agent <name>` — rekey the existing agent named `<name>` (skips the
+  succession prompt); errors if no such agent exists on the hub.
+
+The two flags are mutually exclusive. `--pools <a,b>` applies **only** to a mint
+(`--new-agent` or a fresh org); combining it with `--replace-agent` is a usage
+error, because rekeying preserves the agent's existing pools (manage those in
+the console).
+
+### Hub resolution differs from `agent new`
+
+`setup` (and `doctor`) resolve the target hub like `agent new` with **one**
+deliberate difference: a brand-new machine with **no** stored hub falls back to
+the built-in **default hub** (printing a `targeting <hub>` notice to stderr)
+instead of exiting 2. That is safe here because the mint happens only *after*
+you sign in through that hub's own browser consent, and the target is printed
+first. Resolution order:
+
+1. `--hub <origin>` if given.
+2. Otherwise the **one** hub your credential *file* stores, if exactly one is
+   present.
+3. More than one stored hub → **exit 2**, listing them so you can pass `--hub`.
+4. Zero stored hubs (or a keychain/external backend that can't enumerate) →
+   the **default hub**, with a printed notice.
+
+### A configured external credential command blocks setup
+
+If `OWENLOOP_CREDENTIAL_COMMAND` is set, that command — not the local store —
+supplies this hub's credentials, so setup **refuses up front**, *before any
+browser opens*. Its human-login and agent-mint steps would write keys nobody
+reads; unset the variable to use `owenloop login` and the local store. (This is
+the same guard `agent new` applies, just moved ahead of the OAuth round-trip so
+the flagship command never opens a browser only to fail at the store.)
+
+### After setup
+
+If the connected agent account is anything other than `default`, setup prints a
+reminder to run owenwork with `OWENWORK_ACCOUNT=<name>` so the worker reads the
+right slot.
+
+**Exit codes.**
+
+| code | meaning |
+|---|---|
+| `0` | every step ended skipped/done/noted **and** doctor's core checks (1–5) passed |
+| `1` | setup ran but doctor's core checks did not all pass |
+| non-zero (thrown) | a hard failure — bad flags, unresolvable hub (2), 403 from the hub (setup needs an admin credential to manage agents), a named `--replace-agent` that doesn't exist, or a configured external credential command |
+
+## `doctor` — check a machine's install
+
+`owenloop doctor` is the **read-only** diagnostic behind setup's final step. It
+probes the same install surfaces and prints one `✓`/`✗` line per check to
+stderr, plus a `{ ok, hub, checks }` summary to stdout. It performs **no
+configuration writes** — no mint, rekey, slot create/delete, settings write, or
+browser. (The one unavoidable carve-out: verifying the human credential may
+rotate-and-persist an *expiring* human OAuth token, exactly as every authed
+command does — refreshing without persisting would strand the rotated refresh
+token and corrupt the install.)
+
+The checks, in order:
+
+| # | check | ✓ means | core |
+|---|---|---|---|
+| 1 | human credential | a human credential is stored for this hub | yes |
+| 2 | human plane | that credential verifies live against the hub (`whoami`) | yes |
+| 3 | agent slot | an `agent:<name>` credential is stored | yes |
+| 4 | agent plane | that agent credential verifies live against the hub | yes |
+| 5 | owenwork settings | the settings file's `hubOrigin` matches this hub | yes |
+| 6 | plugin | the Claude Code `owenloop` plugin is installed | **no** (rendered only) |
+
+Each `✗` line names its own remedy (`run owenloop setup`, `owenloop login --hub
+<origin>`, re-run setup's Replace, and so on). doctor never short-circuits — a
+machine with no working human credential still renders lines 3–6, degrading
+honestly rather than dropping them.
+
+**Exit code.** `0` when the **core** checks (1–5) all pass, `1` otherwise. The
+plugin check (6) is *rendered* but does not affect the exit code while the
+marketplace is unpublished.
 
 ## `mcp` — stdio control-plane server for MCP hosts
 
