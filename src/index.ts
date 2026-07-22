@@ -40,6 +40,9 @@ export { credentialSlot, hashDefForHub, keychainServiceFor, normalizeOrigin, rea
 export type { Credential, CredentialSlotSelector, Keychain, ReadStoredCredentialOpts } from './hub.ts';
 export type { DefLoadFailure } from './defs.ts';
 
+export { deleteCredential, ensureFreshOAuth, storeCredential } from './credentials.ts';
+export type { CredentialIO } from './credentials.ts';
+
 export {
   buildGraph,
   buildTrace,

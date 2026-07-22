@@ -54,7 +54,18 @@ import {
 } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
 import type { WorkflowDef } from './types.ts';
-import { dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
+import { CliError, dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
+import {
+  authHeader,
+  deleteCredential,
+  discoverMetadata,
+  ensureFreshOAuth,
+  hubFetch,
+  hubMaxResponseBytes,
+  readBodyBounded,
+  refreshOAuth,
+  storeCredential,
+} from './credentials.ts';
 import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
 import {
   acquireInstallLock,
@@ -241,8 +252,6 @@ const flag = (args: Args, key: string): boolean => {
   const v = last(args, key);
   return v === 'true' || v === '' || (v !== undefined && v !== 'false');
 };
-
-class CliError extends Error {}
 
 /**
  * A 429 from the hub during a push batch (REL-10). Thrown from the batch loop
@@ -1247,57 +1256,6 @@ const ADD_SHA_TIMEOUT_MS = 30_000;
 const ADD_TARBALL_TIMEOUT_MS = 300_000;
 
 /**
- * Read a `Response` body while enforcing a byte `cap`, so a hostile server can
- * never make us allocate an oversized body. Rejects UP FRONT on a declared
- * oversize `Content-Length`; otherwise streams the body in chunks, counting the
- * bytes that actually land in memory, and cancels the stream the moment the
- * running total crosses the cap — the chunk buffer never holds more than `cap`
- * plus one chunk. `label` names the request in the error and is origin+path or
- * `owner/repo@sha` only — never a token. Counting post-decode bytes (what lands
- * in memory) is deliberate: the cap protects memory, not wire bytes.
- *
- * `res.body === null` (empty/no-body response) yields empty bytes, so callers
- * behave exactly as they did under `arrayBuffer()`. An absent, malformed, or
- * multi-valued `Content-Length` skips the header check — the counting path is
- * the real guard (GitHub codeload tarballs are typically chunked, no header). A
- * `TimeoutError`/`AbortError` from `read()` (the abort signal fired mid-body)
- * propagates untouched, so each call site's existing timeout mapping still
- * fires exactly as it did for `arrayBuffer()` rejections. `cancel()` may reject
- * on an already-errored stream — swallowed; the cap `CliError` is the story.
- */
-async function readBodyBounded(res: Response, cap: number, label: string): Promise<Uint8Array> {
-  const declared = Number(res.headers.get('content-length'));
-  if (Number.isFinite(declared) && declared > cap) {
-    await res.body?.cancel().catch(() => {});
-    throw new CliError(
-      `response body for ${label} exceeds the ${cap}-byte cap (declared Content-Length ${declared})`,
-    );
-  }
-  if (res.body === null) return new Uint8Array(0);
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value === undefined) continue;
-    total += value.byteLength;
-    chunks.push(value);
-    if (total > cap) {
-      await reader.cancel().catch(() => {});
-      throw new CliError(`response body for ${label} exceeds the ${cap}-byte cap`);
-    }
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return out;
-}
-
-/**
  * Cap on the `add` tarball download body, enforced DURING the stream by
  * `readBodyBounded` — defense in depth with `extractTarGz`'s own post-hoc
  * `maxCompressedBytes` check (kept intact). `OWENLOOP_TARBALL_MAX_BYTES`
@@ -1877,262 +1835,6 @@ function readCredential(io: CliIO, origin: string, slot: CredentialSlotSelector)
 }
 
 /**
- * Store a credential for `origin` in `slot`, in the chosen backend ONLY;
- * returns which one. A failed keychain write is a hard error (REL-6), never a
- * silent fall-through to the file — the escape hatch is to choose the file
- * backend up front with `OWENLOOP_NO_KEYCHAIN=1`. Backend selection is the
- * shared `credentialBackend` from `hub.ts`, so read and write agree on one
- * choice. That shared selection now has a third variant: when an external
- * credential command is configured this throws, because the command — not the
- * local store — is what reads will consult.
- *
- * The file backend MERGES into the origin's slot map: writing `agent:ci` must
- * leave a `human` credential for the same origin intact.
- */
-function storeCredential(io: CliIO, origin: string, slot: CredentialSlotSelector, cred: Credential): 'keychain' | 'file' {
-  const account = credentialSlot(slot);
-  const backend = credentialBackend(io.env, io.keychain);
-  if (backend.kind === 'external') {
-    // Writing to a store that reads will never consult is exactly the
-    // "half-working setup hands back a stale key" failure the external command
-    // exists to prevent, so refuse loudly instead.
-    throw new CliError(
-      'an external credential command is configured (OWENLOOP_CREDENTIAL_COMMAND), so it — not the ' +
-        'local store — supplies credentials for this hub; unset it to use `owenloop login`',
-    );
-  }
-  if (backend.kind === 'keychain') {
-    try {
-      backend.kc.set(keychainServiceFor(origin), account, JSON.stringify(cred));
-    } catch (e) {
-      throw new CliError(
-        `could not write the credential to the OS keychain: ${(e as Error).message}. ` +
-          'Fix the keychain, or set OWENLOOP_NO_KEYCHAIN=1 to use the 0600 file store',
-      );
-    }
-    return 'keychain';
-  }
-  const path = credentialFilePath(io.env);
-  const file = readCredentialFile(path);
-  file.hubs[origin] = { ...file.hubs[origin], [account]: cred };
-  writeCredentialFile(path, file);
-  return 'file';
-}
-
-/**
- * Delete the stored credential for `(origin, slot)` from BOTH backends.
- * Deliberately not routed through `credentialBackend`: logout is a defensive
- * dual-clear (the proposal explicitly blesses it), so a live refresh token can
- * never be stranded in the store that wasn't the currently-chosen one. Returns
- * whether anything was removed.
- *
- * Only the NAMED slot is removed. A blanket "clear every slot for this origin"
- * is not implementable — the keychain cannot enumerate its accounts — and
- * faking it on the file backend alone would be a half-truth, so the slot is
- * always explicit (defaulting to `human`).
- */
-function deleteCredential(io: CliIO, origin: string, slot: CredentialSlotSelector): boolean {
-  const account = credentialSlot(slot);
-  let removed = false;
-  const kc = resolveKeychain(io.env, io.keychain);
-  const service = keychainServiceFor(origin);
-  if (kc && kc.get(service, account) !== null) {
-    kc.delete(service, account);
-    removed = true;
-  }
-  const path = credentialFilePath(io.env);
-  const file = readCredentialFile(path);
-  const slots = file.hubs[origin];
-  if (slots !== undefined && slots[account] !== undefined) {
-    delete slots[account];
-    // Drop the origin key once its last slot is gone, so the file never keeps
-    // an empty husk that a later read would have to special-case.
-    if (Object.keys(slots).length === 0) delete file.hubs[origin];
-    writeCredentialFile(path, file);
-    removed = true;
-  }
-  return removed;
-}
-
-/** The Bearer value for an authenticated request. Never logged. */
-function authHeader(cred: Credential): string {
-  return `Bearer ${cred.accessToken}`;
-}
-
-// Request deadline for EVERY hub/auth call — OAuth discovery, DCR, code
-// exchange, token refresh, whoami, workflow list, and push (REL-7). These are
-// all small JSON round-trips, so one budget fits them all;
-// OWENLOOP_HUB_TIMEOUT_MS overrides it (a test knob, consistent with
-// OWENLOOP_LOGIN_TIMEOUT_MS and the project's other OWENLOOP_* test-only knobs).
-const HUB_TIMEOUT_MS = 30_000;
-
-function hubTimeoutMs(io: CliIO): number {
-  const override = Number(io.env.OWENLOOP_HUB_TIMEOUT_MS);
-  return Number.isFinite(override) && override > 0 ? override : HUB_TIMEOUT_MS;
-}
-
-// Cap on any hub/auth JSON RESPONSE body (OAuth discovery, DCR, code exchange,
-// token refresh, whoami, the workflow list, create_workflow). Hub responses are
-// small round-trips — the largest realistic body is a workflows summary list,
-// far below 8 MiB. This is a RESPONSE cap; the hub's 32MB figure (the 413 path)
-// is a REQUEST cap and responses never echo YAML. OWENLOOP_HUB_MAX_RESPONSE_BYTES
-// overrides it (a test-only knob, consistent with OWENLOOP_HUB_TIMEOUT_MS).
-const HUB_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
-
-function hubMaxResponseBytes(io: CliIO): number {
-  const override = Number(io.env.OWENLOOP_HUB_MAX_RESPONSE_BYTES);
-  return Number.isFinite(override) && override > 0 ? override : HUB_MAX_RESPONSE_BYTES;
-}
-
-/**
- * `fetch` wrapper putting a deadline on every hub/auth call (REL-7). The abort
- * signal is threaded into `fetch` AND the body is read (via `readBodyBounded`,
- * which caps the response size — see HUB_MAX_RESPONSE_BYTES) inside the same
- * try, so the deadline covers a stalled BODY read too — the exact undici
- * behavior the two `add` fetches document (`AbortSignal.timeout` ties the
- * signal to the body stream). The returned `Response` re-exposes the read
- * body, so every call site's `res.json()` / `res.status` /
- * `res.headers.get(...)` usage is byte-for-byte unchanged. A
- * `TimeoutError`/`AbortError` becomes a clear `CliError` (naming the request,
- * which is origin+path only — never a token); anything else is rethrown
- * untouched.
- *
- * `redirect: 'error'` is forced on every call — after the `...init` spread, so
- * no caller can override it — to close the redirect gap `resolveEndpoint`
- * (SEC-4) cannot see: same-origin validation covers only the INITIAL URL, but a
- * validated endpoint answering 307/308 would re-send the POST body (refresh
- * token, PKCE verifier, auth code, workflow YAML) to a foreign origin — undici
- * strips the Authorization header on a cross-origin redirect but RESENDS the
- * body. The hub protocol has no redirects, so any 3xx is a hard, loud failure
- * mapped to a `CliError` (again naming origin+path only, never a token).
- */
-async function hubFetch(io: CliIO, url: string, init?: RequestInit): Promise<Response> {
-  const fetchFn = io.fetch ?? globalThis.fetch;
-  const ms = hubTimeoutMs(io);
-  const method = (init?.method ?? 'GET').toUpperCase();
-  try {
-    const res = await fetchFn(url, { ...init, signal: AbortSignal.timeout(ms), redirect: 'error' });
-    // 204/304 carry no body — reading one would be a spec violation.
-    if (res.status === 204 || res.status === 304) {
-      return new Response(null, { status: res.status, statusText: res.statusText, headers: res.headers });
-    }
-    const body = await readBodyBounded(res, hubMaxResponseBytes(io), `${method} ${url}`);
-    return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
-  } catch (e) {
-    const err = e as Error;
-    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
-      throw new CliError(`hub did not respond within ${ms / 1000}s (${method} ${url})`);
-    }
-    // `redirect: 'error'` makes undici reject a 3xx with a TypeError whose
-    // cause message is 'unexpected redirect' (verified on Node 22.22.3 and 26).
-    // Substring-match for slack against undici wording drift — if it ever stops
-    // matching, the raw TypeError still surfaces (fail-closed, just less pretty).
-    const cause = String((err as { cause?: { message?: string } }).cause?.message ?? '');
-    if (err.name === 'TypeError' && cause.includes('unexpected redirect')) {
-      throw new CliError(
-        `hub responded with a redirect — refusing to follow it (${method} ${url}); redirects are not part of the hub protocol`,
-      );
-    }
-    throw e;
-  }
-}
-
-/**
- * Ensure an `oauth` credential's access token is fresh: if it expires within
- * 60s, refresh once (grant_type=refresh_token) and persist the new token. No-op
- * for `agent`/`oauth-pasted` credentials (they don't refresh). Returns the
- * possibly-updated credential.
- *
- * `slot` is the slot the credential was READ from — a refreshed token must be
- * written back to that same slot, never to a default one.
- */
-async function ensureFreshOAuth(
-  io: CliIO,
-  origin: string,
-  slot: CredentialSlotSelector,
-  cred: Credential,
-  persist = true,
-): Promise<Credential> {
-  if (cred.kind !== 'oauth') return cred;
-  if (cred.expiresAt - nowMs() > 60_000) return cred;
-  return refreshOAuth(io, origin, slot, cred, persist);
-}
-
-/**
- * `persist` defaults to true — the normal case is refreshing an ALREADY
- * stored, trusted credential (push/connect), where persisting immediately
- * matters because refresh tokens can be single-use/rotating: losing the new
- * one to a later crash would strand the user. `verifyCredential`'s login-time
- * use passes `persist: false` — a not-yet-stored credential must never be
- * written to disk/keychain before it is proven to work end to end (a 401 on
- * the retry after this refresh still fails the overall login), matching the
- * "never store an unverified token" rule enforced at every login call site.
- */
-async function refreshOAuth(
-  io: CliIO,
-  origin: string,
-  slot: CredentialSlotSelector,
-  cred: Extract<Credential, { kind: 'oauth' }>,
-  persist = true,
-): Promise<Credential> {
-  const tokenEndpoint = await discoverTokenEndpoint(io, origin);
-  const body = new URLSearchParams({
-    grant_type: 'refresh_token',
-    refresh_token: cred.refreshToken,
-    client_id: cred.clientId,
-  });
-  const res = await hubFetch(io, tokenEndpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: body.toString(),
-  });
-  if (!res.ok) {
-    throw new CliError('credential expired and refresh failed — run `owenloop login`');
-  }
-  const json = (await res.json()) as { access_token?: string; expires_in?: number; refresh_token?: string };
-  if (typeof json.access_token !== 'string') {
-    throw new CliError('credential expired and refresh returned no access token — run `owenloop login`');
-  }
-  const expiresIn = typeof json.expires_in === 'number' ? json.expires_in : 3600;
-  const refreshed: Credential = {
-    kind: 'oauth',
-    accessToken: json.access_token,
-    refreshToken: typeof json.refresh_token === 'string' ? json.refresh_token : cred.refreshToken,
-    expiresAt: nowMs() + expiresIn * 1000,
-    clientId: cred.clientId,
-  };
-  // When an external command supplies credentials it owns the credential's
-  // whole lifecycle; owenloop must not write a refreshed token into a store it
-  // will never read (and `storeCredential` refuses in that mode anyway).
-  if (persist && externalCredentialCommand(io.env) === undefined) {
-    storeCredential(io, origin, slot, refreshed);
-  }
-  return refreshed;
-}
-
-interface AsMetadata {
-  authorization_endpoint?: string;
-  token_endpoint?: string;
-  registration_endpoint?: string;
-}
-
-async function discoverMetadata(io: CliIO, origin: string): Promise<AsMetadata> {
-  const res = await hubFetch(io, resolveEndpoint(origin, '/.well-known/oauth-authorization-server'), {
-    headers: { Accept: 'application/json' },
-  });
-  if (!res.ok) {
-    throw new CliError(`could not read OAuth metadata from ${origin} (HTTP ${res.status})`);
-  }
-  return (await res.json()) as AsMetadata;
-}
-
-async function discoverTokenEndpoint(io: CliIO, origin: string): Promise<string> {
-  const meta = await discoverMetadata(io, origin);
-  if (!meta.token_endpoint) throw new CliError(`hub ${origin} advertises no token_endpoint`);
-  return resolveEndpoint(origin, meta.token_endpoint);
-}
-
-/**
  * GET `path` on `origin` with a bearer credential, refreshing an expiring
  * oauth token first and retrying exactly once after a 401→refresh for oauth.
  * Returns the raw response plus the credential actually used (possibly
@@ -2267,7 +1969,7 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
     const slot: CredentialSlotSelector = cred.kind === 'agent' ? { principal: 'agent', ...(asked.principal === 'agent' && asked.account !== undefined ? { account: asked.account } : {}) } : { principal: 'human' };
     const existed = readCredential(io, origin, slot) !== null;
     const { identity } = await verifyCredential(io, origin, slot, cred); // never store an unverified token
-    const storage = storeCredential(io, origin, slot, cred);
+    const storage = await storeCredential(io, origin, slot, cred);
     print(io, {
       ok: true,
       hub: origin,
@@ -2329,7 +2031,7 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
       verifier,
     });
     const { cred, identity } = await verifyCredential(io, origin, slot, exchanged, false); // never store an unverified token
-    const storage = storeCredential(io, origin, slot, cred);
+    const storage = await storeCredential(io, origin, slot, cred);
     print(io, {
       ok: true,
       hub: origin,
@@ -2508,7 +2210,7 @@ async function exchangeCode(
 async function dispatchLogout(io: CliIO, args: Args): Promise<number> {
   const origin = resolveHub(io, args);
   const slot = resolveSlot(args);
-  const removed = deleteCredential(io, origin, slot);
+  const removed = await deleteCredential(io, origin, slot);
   const slotName = credentialSlot(slot);
   if (!removed) {
     io.err(`no stored credential for ${origin} in slot \`${slotName}\` — another slot may hold one (see --as)`);

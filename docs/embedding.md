@@ -262,9 +262,10 @@ all the shared types (`Order`, `CommitResult`, `WorkflowStatus`, `WorkflowDef`,
 `EngineEvent`, `EngineListener`, …). For most hosts, `createEngine` + the engine methods + the `Order` /
 `CommitResult` / `WorkflowStatus` types are the whole surface you need.
 
-The index also exports a **read-only credential surface** for hosts that need
-to read a stored hub credential through owenloop's own store logic instead of
-duplicating it: `readStoredCredential(origin, opts)` returns the `Credential`
+The index also exports a **credential surface** for hosts that need to read,
+write, or refresh a stored hub credential through owenloop's own store logic
+instead of duplicating it. The read entry is `readStoredCredential(origin, opts)`,
+which returns the `Credential`
 for a hub origin **and slot** (or `null` if none is stored), using the same
 backend selection as the CLI — macOS Keychain, or the `0600` credentials file
 elsewhere / with `OWENLOOP_NO_KEYCHAIN=1` (see
@@ -284,8 +285,31 @@ an invalid account name) and `keychainServiceFor` (normalized origin → the
 keychain service name) let a host address the same slots the CLI does without
 re-deriving the keying. Slots never fall back to one another: an empty
 `agent:ci` reads as `null` even when `human` is populated. The function never
-logs or echoes the secret, and there is deliberately no write or delete companion on the public
-surface — `login`/`logout` remain the only way to store or remove a credential.
+logs or echoes the secret.
+
+The write entries let a host store or refresh a credential the same way the CLI
+does, addressing the same slots. All three are **async** and take a `CredentialIO`
+(`{ env, keychain?, fetch? }` — a strict subset of the CLI's own io, so the CLI
+passes its `io` unchanged):
+
+- `storeCredential(io, origin, slot, credential)` — writes a credential into a
+  slot, merging with the other slots on the same origin (the file backend keeps
+  `human` when you write `agent:ci`).
+- `deleteCredential(io, origin, slot)` — removes one slot.
+- `ensureFreshOAuth(io, origin, slot, credential)` — returns the credential if
+  it is still fresh (more than 60s from expiry), otherwise refreshes the OAuth
+  token over the network and persists the rotated result, returning it.
+
+`storeCredential`, `deleteCredential`, and the persist inside `ensureFreshOAuth`
+serialize through the `credentials.lock` file described in
+[where the credential lands](cli.md#hub-login--connect--push--logout): a
+concurrent refresh adopts a token another process already rotated rather than
+double-refreshing and clobbering it. When `OWENLOOP_CREDENTIAL_COMMAND` is set,
+that command owns the credential lifecycle — `storeCredential`/`deleteCredential`
+refuse to write, and `ensureFreshOAuth` refreshes over the network without
+persisting. `login`/`logout` are still the CLI's way to store or remove a
+credential; these exports are the programmatic equivalent for a host embedding
+the engine.
 
 One behaviour to handle: when the user has set `OWENLOOP_CREDENTIAL_COMMAND` (an
 external command that supplies the credential, ahead of both stores — see
