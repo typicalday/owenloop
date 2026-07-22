@@ -67,6 +67,8 @@ import {
   refreshOAuth,
   storeCredential,
 } from './credentials.ts';
+import { runMcpCommand } from './mcp/serve.ts';
+import type { LineStream } from './mcp/server.ts';
 import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
 import {
   acquireInstallLock,
@@ -151,6 +153,12 @@ export interface CliIO {
   keychain?: Keychain;
   /** Read a secret from stdin (`login --with-token`). Default: drain `process.stdin`. */
   readStdin?: () => Promise<string>;
+  /**
+   * The newline-delimited transport `owenloop mcp` pumps JSON-RPC frames from.
+   * Injectable for hermetic tests (a `PassThrough`); `undefined` here so the
+   * command falls back to `process.stdin`. Only the `mcp` verb reads it.
+   */
+  stdinStream?: LineStream;
 }
 
 function defaultIO(): CliIO {
@@ -478,6 +486,7 @@ Commands:
   push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
   agent new <name> [--pools <a,b>] [--hub <url>]   mint a new agent identity on the hub and store its token in slot agent:<name> (the token is never printed)
+  mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided]
                                          bounded reachability check (deadlocks, stuck, dead steps, declared invariants)
@@ -547,6 +556,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['connect', cmdOpts('hub', 'as')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
   ['agent', cmdOpts('pools', 'hub')],
+  ['mcp', cmdOpts('hub')],
   ['lint', cmdOpts()],
   ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided')],
   ['create', cmdOpts('title', 'provide', 'param')],
@@ -2507,6 +2517,17 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   return failed.length === 0 ? 0 : 1;
 }
 
+/**
+ * `owenloop mcp` — serve the human control plane to a local MCP host over stdio.
+ * A thin adapter: read the optional `--hub <url>` flag and hand `io` (which
+ * satisfies the module's `McpIo`) to `runMcpCommand`, which resolves the origin,
+ * builds the tool list, and pumps stdin until EOF. All the logic lives in
+ * `src/mcp/serve.ts`; this stays a two-line dispatch like every other verb.
+ */
+async function dispatchMcp(io: CliIO, args: Args): Promise<number> {
+  return runMcpCommand(io, { hubFlag: last(args, 'hub') });
+}
+
 function createWorkflowRequest(
   io: CliIO,
   origin: string,
@@ -2534,10 +2555,12 @@ function createWorkflowRequest(
  * would mint on the wrong org, and a mint is not undone by a retry. `OWENLOOP_HUB`
  * is intentionally excluded so this stays in parity with O2's `owenloop mcp`.
  *
- * `listStoredHubOrigins` is file-store only — the keychain cannot enumerate — so
- * a keychain-only machine reads zero origins here and must pass `--hub`. When more
- * than one hub is stored the origins (non-secret keys) are listed back, so the
- * user can pick.
+ * `listStoredHubOrigins` is backend-aware (shared with O2's `owenloop mcp`): only
+ * the FILE backend can enumerate, so it returns `null` on a keychain- or
+ * external-command-backed machine — those must pass `--hub`. A file-backed store
+ * returns the origins with a valid `human` slot: `[]` (log in first), exactly one
+ * (used automatically), or more than one (the non-secret origin keys are listed
+ * back so the user can pick).
  */
 function resolveAgentHub(io: CliIO, args: Args): string {
   const flagVal = last(args, 'hub');
@@ -2548,7 +2571,16 @@ function resolveAgentHub(io: CliIO, args: Args): string {
       throw new CliError((e as Error).message);
     }
   }
-  const origins = listStoredHubOrigins(io.env);
+  const origins = listStoredHubOrigins(io.env, io.keychain);
+  if (origins === null) {
+    const backend = credentialBackend(io.env, io.keychain);
+    const which = backend.kind === 'external' ? 'external-command' : 'keychain';
+    throw new CliError(
+      `cannot determine which hub to mint on — the ${which} credential store cannot be enumerated; ` +
+        'pass --hub <origin>',
+      { exitCode: 2 },
+    );
+  }
   if (origins.length === 1) return origins[0]!;
   throw new CliError(
     'cannot determine which hub to mint on — pass --hub <origin>, or log in to exactly one hub first ' +
@@ -2675,7 +2707,7 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'mcp']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   const args = parseArgs(argv);
@@ -2699,6 +2731,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchPush(io, args);
       case 'agent':
         return await dispatchAgent(io, args);
+      case 'mcp':
+        return await dispatchMcp(io, args);
       default:
         return main(argv, io); // unreachable — ASYNC_COMMANDS guards the switch
     }

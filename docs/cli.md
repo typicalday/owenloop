@@ -38,6 +38,7 @@ positional or the next `--flag`, never consumed as this flag's argument. Use
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `agent new <name> [--pools <a,b>] [--hub <url>]` | mint a new agent identity on the hub and store its token in slot `agent:<name>` — the token is never printed — see [Hub](#hub-login--connect--push--logout) |
+| `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
 | `tick <wf> [--now=<ms>] [--shallow] [--label <l>]…` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only); repeatable `--label` claims unlabeled steps plus matching-label steps — see below |
@@ -548,8 +549,9 @@ minting on the wrong org is not undone by a retry:
 Unlike other commands this does **not** fall back to `OWENLOOP_HUB` or the
 built-in default hub — silently defaulting a mint would risk minting on the
 production hub while you're logged into a dev one. Note that hub enumeration is
-**file-store only**: the keychain cannot list its entries, so on a
-keychain-backed machine step 2 sees zero hubs and you must pass `--hub`.
+**file-store only** (shared with `owenloop mcp`): the keychain and the
+external-command backend cannot list their entries, so on such a machine step 2
+cannot enumerate the store and you must pass `--hub`.
 
 **`--pools <a,b>`.** A comma-separated list of pool names the token is granted
 on (trimmed, empties dropped). Omit the flag to let the hub default the token to
@@ -572,6 +574,112 @@ that then failed to store would burn the agent name permanently.
 | `1` | generic failure — invalid or already-taken name, pool/shape rejection, network timeout, or a token that minted but couldn't be stored |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
+
+## `mcp` — stdio control-plane server for MCP hosts
+
+`owenloop mcp` is a long-running server that exposes the hub's **human control
+plane** to a local MCP host (Claude Code, or any client that speaks MCP over
+stdio). This is the `owenloop-cli-mcp` surface: an MCP host spawns it as a
+subprocess — **you do not run it yourself at a prompt**. It reads
+newline-delimited JSON-RPC 2.0 on stdin, translates each `tools/call` into one
+authenticated HTTPS request to the hub's `/api/*` REST mirror, and writes the
+JSON-RPC reply on stdout. It runs until stdin closes (EOF), then exits `0`.
+
+It authenticates as the logged-in **human**, using the same stored credential
+`login` writes and the same locked OAuth-refresh path the other hub commands
+use. It is never interactive: it never opens a browser and never starts a
+loopback listener. If no human credential is stored, a tool call returns an
+error telling you to run `owenloop login --hub <origin>` in a terminal and retry
+(see [Authentication and secrets](#authentication-and-secrets) below).
+
+### Choosing the hub origin
+
+`owenloop mcp` binds to exactly one hub origin, resolved in this order:
+
+1. `--hub <url>` flag.
+2. `OWENLOOP_HUB` env var.
+3. If the **file** credential backend holds exactly ONE hub with a valid `human`
+   credential, that hub is used.
+4. Otherwise it exits `2` and prints why to stderr (nothing is written to
+   stdout — stdout is the protocol channel).
+
+There is **no** silent default-hub fallback: a control-plane server must never
+bind to a hub you did not name. The exit-`2` messages name both remedies:
+
+- No hub credentials stored → `run \`owenloop login --hub <origin>\` first, or pass --hub <origin>`.
+- More than one hub stored → the message lists every stored origin and says `pass --hub <origin>`.
+- The credential store cannot be enumerated (macOS Keychain or an external
+  credential command) → `pass --hub <origin> (or set OWENLOOP_HUB)`. Only the
+  file backend can list stored origins, so on a Keychain-backed machine `mcp`
+  effectively requires `--hub` or `OWENLOOP_HUB`.
+
+A malformed `--hub`/`OWENLOOP_HUB` value is a normal exit-`1` error, like every
+other command.
+
+### Tools
+
+The server exposes 17 baseline tools mirroring the hub's own MCP toolset, plus
+`create_agent`. Each baseline tool's result is the hub REST response as one text
+block; a non-2xx response comes back as an error result.
+
+| tool | what it does |
+|---|---|
+| `whats_next` | tick a workflow and get the next work order(s), or the inbox of started instances |
+| `submit` | submit a work order output |
+| `reject_artifact` | send an upstream artifact back to its producer with a reason |
+| `provide_input` | answer a human gate — provide a value for a seeded/owed input |
+| `start_run` | create a new instance from a definition name |
+| `create_workflow` | parse + load a workflow def YAML (the authoring hard gate) |
+| `get_workflow` | fetch one loaded definition |
+| `list_workflows` | names, titles, step counts, and def hash/version of every loaded def |
+| `get_status` | `engine.status` verbatim plus a plain-English rendering |
+| `heartbeat` | touch the liveness timestamp on an open run so it is not reaped mid-step |
+| `get_order` | re-fetch the persisted order packet and lease state for a run you hold |
+| `release` | give back a claim so its order is re-offered without waiting out the reap TTL |
+| `publish_event` | publish an event against a contract, starting one run per matched subscription |
+| `list_subscriptions` | the org's contract subscriptions |
+| `presence_ping` | register/refresh this conductor in the presence registry |
+| `list_conductors` | your principal's registered conductors and their online/offline state |
+| `wake` | cheap "has anything changed since cursor X" pre-check for a polling loop |
+| `create_agent` | create a NEW agent identity and store its credential locally — **never returns the token** |
+
+`create_agent {name, pools?}` mints a fresh agent identity on the hub with
+`work` scope, then writes the minted `olp_` token straight to this machine's
+credential store (slot `agent:<name>`). The token is **never** returned in the
+tool result, printed, or logged — the result is `{name, pools, stored: true}`,
+built from scratch. It refuses a name that is already taken (the hub's error
+message is surfaced verbatim; error bodies never carry tokens). If the store
+write fails, the result says so and tells you to revoke/re-key the agent from
+the console.
+
+One further tool, `stage_enrollment`, is **conditionally** registered — it
+appears only when the hub advertises the staging endpoint (or when
+`OWENLOOP_MCP_ENROLLMENT=1` forces it on). It returns a join code the new agent
+redeems; a join code is transferred authority, not a credential, so it is safe
+to surface in a tool result. When the endpoint is absent, the tool is hidden
+(fail-closed).
+
+### Authentication and secrets
+
+Every tool call re-reads the stored `human` credential, refreshes it through the
+shared locked OAuth path if it is near expiry, and attaches it only as the
+`Authorization` header — the bearer never rides a tool result. Minted agent
+tokens (`create_agent`) are written to the local credential store and **never
+appear in any tool result, stderr line, or log**. If authentication fails
+(missing credential, refresh failure, or a final 401), the tool returns an error
+result whose text names the fix — run `owenloop login --hub <origin>` in a
+terminal — rather than prompting; the server itself never authenticates
+interactively.
+
+### Environment knobs
+
+| variable | effect |
+|---|---|
+| `OWENLOOP_HUB` | hub origin when `--hub` is absent (rung 2 of origin resolution) |
+| `OWENLOOP_MCP_ENROLLMENT` | `1` forces `stage_enrollment` on, `0` off; unset = probe the hub |
+| `OWENLOOP_MCP_PROBE_TIMEOUT_MS` | deadline for the `stage_enrollment` capability probe (default `3000`) |
+| `OWENLOOP_HUB_TIMEOUT_MS` | per-request hub timeout (shared with the other hub commands) |
+| `OWENLOOP_CRED_LOCK_WAIT_MS` / `OWENLOOP_CRED_LOCK_POLL_MS` | credential-lock wait/poll knobs (shared) |
 
 ## Hand-driven walkthrough
 

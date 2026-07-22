@@ -368,24 +368,6 @@ export function readCredentialFile(path: string): CredentialFile {
 }
 
 /**
- * The hub origins the credential FILE knows (its top-level `hubs` keys). Used by
- * `agent new` / `owenloop mcp` to auto-resolve the target hub when exactly one is
- * stored and no `--hub` was passed.
- *
- * **File-store only, by design.** The macOS keychain backend can only
- * get/set/delete a known `(service, account)` pair — it cannot ENUMERATE its
- * entries — and the external-command backend has no enumeration either. So this
- * reflects the file store alone: a keychain-backed machine reads as zero origins
- * here and must pass `--hub`. That is a documented limitation, not a bug. A
- * missing or non-v2 file reads as an empty store (see `readCredentialFile`), so
- * the result is `[]`. Origins are non-secret keys — safe to list back to the
- * user.
- */
-export function listStoredHubOrigins(env: Record<string, string | undefined>): string[] {
-  return Object.keys(readCredentialFile(credentialFilePath(env)).hubs);
-}
-
-/**
  * Write `data` to `path` atomically, refusing a symlinked (or directory)
  * destination (SEC-3).
  *
@@ -743,6 +725,51 @@ export function readStoredCredential(origin: string, opts: ReadStoredCredentialO
   }
   const file = readCredentialFile(credentialFilePath(env));
   return parseCredential(file.hubs[key]?.[slot]);
+}
+
+/**
+ * Enumerate the hub origins that have a usable `human` credential stored, or
+ * `null` when the active backend cannot be enumerated.
+ *
+ * Consumer: `owenloop mcp`'s origin inference (`resolveMcpOrigin` in
+ * `src/mcp/serve.ts`). When the host spawns the server with neither `--hub` nor
+ * `OWENLOOP_HUB`, the server tries to infer the single hub the user is logged
+ * in to. That inference is only sound on the FILE backend, which can list its
+ * `hubs` map; the keychain and external-command backends cannot enumerate:
+ *
+ * - **file** → the origins in `readCredentialFile(credentialFilePath(env)).hubs`
+ *   whose `human` slot parses as a well-formed `Credential` (`parseCredential`).
+ *   An origin present only under an `agent:<name>` slot is NOT returned — the
+ *   control plane authenticates as the human.
+ * - **keychain** → `null`. The `Keychain` interface (get/set/delete by
+ *   `(service, account)`) has no list operation — macOS `security` cannot
+ *   enumerate the accounts under a service without a keychain-wide dump this
+ *   module deliberately does not perform. There is no way to know which origins
+ *   have entries, so it returns `null` ("cannot enumerate") rather than a
+ *   misleading empty list.
+ * - **external** → `null`, for the same reason: the command answers a single
+ *   `(origin, slot)` query; it has no listing contract.
+ *
+ * `null` (cannot enumerate), `[]` (nothing stored), and a length>1 result are
+ * all distinct signals the caller turns into tailored exit-2 messages — this
+ * function reports the fact, it never decides the outcome. It never logs or
+ * echoes any credential; only the origin KEYS (never secrets) are returned.
+ *
+ * `env`/`keychain` are threaded exactly as `readStoredCredential` threads them,
+ * so a caller passing a fixture `env` stays hermetic.
+ */
+export function listStoredHubOrigins(
+  env: Record<string, string | undefined>,
+  keychain?: Keychain,
+): string[] | null {
+  const backend = credentialBackend(env, keychain);
+  if (backend.kind !== 'file') return null;
+  const file = readCredentialFile(credentialFilePath(env));
+  const origins: string[] = [];
+  for (const [origin, slots] of Object.entries(file.hubs)) {
+    if (parseCredential(slots?.['human']) !== null) origins.push(origin);
+  }
+  return origins;
 }
 
 // ---- project → hub binding (.owenloop/hub.json) ------------------------------

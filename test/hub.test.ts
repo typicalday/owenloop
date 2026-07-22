@@ -37,6 +37,7 @@ import {
 } from '../src/hub.ts';
 import type { Credential, HubBinding, WorkflowSummary } from '../src/hub.ts';
 import { DefError, hashDef, loadDefsRaw, parseDef } from '../src/defs.ts';
+import { fakeKeychain } from './hubkit.ts';
 
 // ---- origin normalization ----------------------------------------------------
 
@@ -460,24 +461,36 @@ test('asMintAgentTokenOk: a malformed body throws NAMING THE FIELD ONLY, never e
 
 // ---- listStoredHubOrigins — file-store origin enumeration ------------------
 
-test('listStoredHubOrigins: missing file → [], v2 file → its origin keys, non-v2 → []', () => {
+test('listStoredHubOrigins: file backend lists human-slot origins; keychain → null', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-origins-'));
-  const env = { HOME: home };
-  // Missing credentials.json.
+  // OWENLOOP_NO_KEYCHAIN=1 forces the FILE backend so the enumeration path runs
+  // regardless of the host OS (on macOS the default backend is the keychain).
+  const env = { HOME: home, OWENLOOP_NO_KEYCHAIN: '1' };
+  // Missing credentials.json → empty store.
   assert.deepEqual(listStoredHubOrigins(env), []);
-  // v2 with two origins.
+  // v2 with two origins that each carry a valid `human` slot, plus one that has
+  // ONLY an `agent:<name>` slot — the agent-only origin is NOT returned, because
+  // enumeration is for the human principal (auto-resolving `mcp` / `agent new`).
   const path = credentialFilePath(env);
   writeCredentialFile(path, {
     version: 2,
     hubs: {
       'https://a.example': { human: { kind: 'agent', accessToken: 'x' } },
       'https://b.example': { human: { kind: 'agent', accessToken: 'y' } },
+      'https://agent-only.example': { 'agent:ci': { kind: 'agent', accessToken: 'z' } },
     },
   });
-  assert.deepEqual(listStoredHubOrigins(env).sort(), ['https://a.example', 'https://b.example']);
+  // Non-null assertion: OWENLOOP_NO_KEYCHAIN=1 pins the file backend, which never
+  // returns null (only the keychain/external backends do).
+  assert.deepEqual(listStoredHubOrigins(env)!.sort(), ['https://a.example', 'https://b.example']);
   // A non-v2 file reads as an empty store (old keying is invisible).
   writeFileSync(path, JSON.stringify({ version: 1, hubs: { 'https://c.example': {} } }));
   assert.deepEqual(listStoredHubOrigins(env), []);
+  // A keychain (or external-command) backend cannot enumerate → null, a signal
+  // distinct from [] (file backend, nothing stored) that callers turn into a
+  // "pass --hub" message.
+  const { keychain } = fakeKeychain();
+  assert.equal(listStoredHubOrigins({ HOME: home }, keychain), null);
 });
 
 // ---- workflow list response guard -----------------------------------------
