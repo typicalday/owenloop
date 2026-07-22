@@ -938,6 +938,34 @@ deadlocks, stuck artifacts, dead steps, and violations of any declared
 invariants. It is a static analysis of a workflow definition's shape, not a
 simulation of a running instance.
 
+Dead steps — a step name that never appears as a firing in any explored
+transition — are split into two categories with different severity, via a
+static `canEverFire(step, def)` check (`model.ts`) that needs no search
+bounds at all:
+- **structurally dead** (`report.structurallyDeadSteps`) — `canEverFire` is
+  false: the step can NEVER fire, regardless of `--max-depth`/
+  `--max-states`. This is a genuine wiring defect (e.g. a reduce-mode step
+  with no singleton produce to discharge). It is always a *definite*
+  finding — bounds-independent by construction — so it is folded into
+  `hasDefiniteDefect` and makes `check` exit nonzero, the same way an
+  invariant violation does.
+- **unreached within bounds** (`report.unreachedSteps`) — `canEverFire` is
+  true: the step CAN fire in principle, but the bounded search didn't reach
+  it before exhausting `--max-states`/`--max-depth`. This is informational
+  only, a bounds artifact — it does NOT affect the exit code. Raising the
+  search bounds may surface the step firing.
+
+`canEverFire` is a sound detector of deadness: it only reports a step as
+structurally dead when certain no firing can ever be pushed for it (mirrors
+`eligibleFirings`'s discharge-set logic per step mode); when uncertain it
+defaults to "can fire," so a step is never wrongly flagged as a wiring
+defect. Most structurally-dead shapes are already caught earlier as hard
+errors by `validateDef` (which `check` runs first and throws on) — the
+residual case `canEverFire` exists to catch is a reduce-mode step whose
+`produces:` has zero singleton entries (and no collection produce either,
+so `validateDef`'s reduce check doesn't trip), which reaches `modelCheck`
+silently dead.
+
 Two things it deliberately does not model, and why: **born-rejected
 commits** — a stale-CAS refusal (§12.2, §24.4) is a refusal, not a state
 transition, so it isn't a reachable state the search should explore; and

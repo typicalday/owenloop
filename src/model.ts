@@ -646,6 +646,78 @@ function plainOutputs(step: StepDef): string[] {
   return out;
 }
 
+/**
+ * Forward stem-reachability fixpoint from the seeded workflow inputs: a step's
+ * produced stems become reachable once every one of its consumed stems is
+ * reachable. Intentionally duplicates defs.ts's `reachabilityErrors` fixpoint
+ * rather than importing it — defs.ts does not import model.ts and model.ts
+ * does not import defs.ts; canEverFire's discharge-set logic (below) depends
+ * on model.ts's own mode helpers, so importing across the boundary either way
+ * would create a cycle. This local copy keeps the import graph acyclic.
+ */
+function reachableStems(def: WorkflowDef): Set<string> {
+  const reachable = new Set<string>(def.inputs.map((i) => i.name));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const step of def.steps) {
+      if (!step.consumes.every((c) => reachable.has(c.stem))) continue;
+      for (const p of step.produces) {
+        if (!reachable.has(p.stem)) {
+          reachable.add(p.stem);
+          changed = true;
+        }
+      }
+    }
+  }
+  return reachable;
+}
+
+/**
+ * Pure static predicate: can `step` EVER fire, under ANY search bounds?
+ *
+ * A SOUND detector of deadness: returns false ONLY when we are CERTAIN no
+ * firing can ever be pushed for this step, mirroring the discharge-set logic
+ * `eligibleFirings` (above) actually uses. When uncertain, returns true (the
+ * safe, non-failing default) — a false "structurally dead" would wrongly make
+ * `check` exit nonzero, so soundness is biased toward under-reporting.
+ *
+ * - Reachability: if any consumed stem is not reachable from the workflow
+ *   inputs (see `reachableStems`), the step can never fire. Belt-and-suspenders
+ *   — `validateDef`'s `reachabilityErrors` already turns this into a hard error
+ *   before `modelCheck` ever runs, so this arm is defensive, not the live path.
+ * - Judge step (`step.judges`): fires against the judged stem, not a produces
+ *   set; can-fire iff the judged stem is reachable (already implied by the
+ *   reachability arm above, since a judge step consumes the judged stem — kept
+ *   explicit for clarity and to stay correct if judge-step synthesis changes).
+ * - reduce: the discharge set is `singletonProduces(step)` only (see the
+ *   reduce branch of `eligibleFirings`) — zero singleton produces means no
+ *   firing is ever pushed, regardless of bounds.
+ * - map: needs both a map-consume and a map-produce to bind an element.
+ * - plain (inputsGreen / allGreen / idle): the discharge set is `plainOutputs`
+ *   (singleton produces + collection seals) — empty means no firing ever.
+ *
+ * `reachable` may be precomputed once by the caller and passed in (modelCheck
+ * calls this per dead step and must not recompute the fixpoint each time).
+ */
+export function canEverFire(step: StepDef, def: WorkflowDef, reachable?: Set<string>): boolean {
+  const reach = reachable ?? reachableStems(def);
+  if (!step.consumes.every((c) => reach.has(c.stem))) return false;
+
+  if (step.judges) return reach.has(step.judges);
+
+  switch (stepMode(step)) {
+    case 'reduce':
+      return singletonProduces(step).length > 0;
+    case 'map':
+      return !!mapProduce(step) && !!mapConsume(step);
+    case 'plain':
+      return plainOutputs(step).length > 0;
+    default:
+      return true; // not certain of deadness — default to can-fire (soundness bias)
+  }
+}
+
 // ---- level-triggered maintenance (§11.8, §12.3) -----------------------------
 
 /**
@@ -2120,7 +2192,14 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
  * - deadlocks: reachable states that are not done and have no eligible firings
  * - stuck states: reachable states with a stalled debt
  * - completability: whether any reachable state is done (with an example path)
- * - dead steps: steps whose name never appears as a firing in any explored transition
+ * - dead steps: steps whose name never appears as a firing in any explored
+ *   transition. Split into two categories by the static `canEverFire` check
+ *   (independent of search bounds):
+ *   - structurally-dead: `canEverFire` is false — the step can NEVER fire
+ *     regardless of `--max-depth`/`--max-states`. A genuine wiring defect.
+ *   - unreached-within-bounds: `canEverFire` is true — the step CAN fire in
+ *     principle but the bounded search didn't reach it. A bounds artifact,
+ *     not a defect; raising `--max-states`/`--max-depth` may surface it.
  *
  * Pure — no store, no engine, no IO.
  */
@@ -2150,7 +2229,8 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     stuck: [],
     completable: false,
     completePath: undefined,
-    deadSteps: [],
+    structurallyDeadSteps: [],
+    unreachedSteps: [],
     invariantViolations: [],
     stats: { statesExplored: 0, depthReached: 0 },
   };
@@ -2251,10 +2331,20 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
   report.boundsHit = [...boundsHit];
   report.bounded = boundsHit.size > 0;
 
-  // Dead steps: steps in the def that never appeared as a firing.step
-  report.deadSteps = def.steps
-    .filter((l) => !firedSteps.has(l.name))
-    .map((l) => l.name);
+  // Dead steps: steps in the def that never appeared as a firing.step, split
+  // by the static canEverFire check into structurally-dead (a real wiring
+  // defect — can never fire regardless of bounds) vs unreached-within-bounds
+  // (can fire in principle; the bounded search just didn't reach it).
+  // Compute the reachability fixpoint once, not per dead step.
+  const reachable = reachableStems(def);
+  for (const l of def.steps) {
+    if (firedSteps.has(l.name)) continue;
+    if (canEverFire(l, def, reachable)) {
+      report.unreachedSteps.push(l.name);
+    } else {
+      report.structurallyDeadSteps.push(l.name);
+    }
+  }
 
   return report;
 }
