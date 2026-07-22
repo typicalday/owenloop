@@ -1146,6 +1146,19 @@ export function validateDef(def: WorkflowDef): string[] {
     }
   }
 
+  // a reduce-mode step whose only produces are collections can never fire: eligibleFirings'
+  // reduce branch (src/model.ts) derives the discharge set from singletonProduces(step) only,
+  // so zero singleton produces means outs.length === 0 and no firing is ever pushed — the step
+  // is silently dead (collection debt owed forever, absent from eligible/pending/blocked).
+  for (const l of def.steps) {
+    const isReduce = l.consumes.some((c) => c.mode === 'reduce');
+    const hasCollectionProduce = l.produces.some((p) => p.kind === 'collection');
+    const hasSingletonProduce = l.produces.some((p) => p.kind === 'singleton');
+    if (isReduce && hasCollectionProduce && !hasSingletonProduce) {
+      errors.push(`step ${l.name} is reduce-mode but produces only collections; reduce steps can only discharge singleton produces`);
+    }
+  }
+
   // same stem in both produces: and generates: on the same step is a hard error
   for (const l of def.steps) {
     if (!l.generates || l.generates.length === 0) continue;
@@ -1292,6 +1305,18 @@ export function validateDef(def: WorkflowDef): string[] {
     }
     if (!hasIdle && l.idleAfterMs !== undefined) {
       errors.push(`step '${l.name}': idleAfter is set but 'idle' is not in on:; idleAfter is only meaningful with the idle trigger`);
+    }
+  }
+
+  // an allGreen/idle evaluator step that declares consumes can never commit: both firings
+  // (src/model.ts) are built with inputs: [], so the claim fingerprint is empty, but commit-time
+  // casCheck (src/engine.ts) derives required inputs from consumes and finds no fingerprint
+  // entry for them — every firing is born-rejected forever. Evaluators must declare their
+  // output under generates: with no consumes: (see examples/workflows/sla-watchdog.yaml, monitor).
+  for (const l of def.steps) {
+    const triggers = l.on ?? ['inputsGreen'];
+    if (triggers.some((t) => t === 'allGreen' || t === 'idle') && l.consumes.length > 0) {
+      errors.push(`evaluator step ${l.name} (on: allGreen/idle) must not declare consumes; its firings carry no input fingerprint`);
     }
   }
 

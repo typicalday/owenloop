@@ -441,6 +441,11 @@ By default a step fires when its consumed inputs are all green (`inputsGreen`). 
     # order.cause is 'allGreen' when done, 'idle' when stuck past 30m
 ```
 
+An `allGreen`/`idle` step must not also declare `consumes:` — both firing kinds
+carry an empty input fingerprint, so a commit can never satisfy it, and
+`owenloop lint` hard-errors on it. Declare the step's output under
+`produces:`/`generates:` only.
+
 **Alarms.** A worker that needs a heartbeat or a deadline can call
 `engine.setAlarm(workflow, step, at)` with an absolute timestamp — it overrides the
 relative `idleAfter` window and survives a process restart.
@@ -459,6 +464,10 @@ relative `idleAfter` window and survives a process restart.
 
 A step consumes in exactly one mode — plain, a single map, or a single reduce. The
 validator enforces this at load time, so you don't hit it as a runtime surprise.
+
+A reduce step needs at least one singleton produce (via `produces:` or `generates:`)
+to discharge into — reducing into collection produces only leaves nothing for the
+step to fire, and `owenloop lint` hard-errors on it.
 
 Collections add fan-out/fan-in on top of the base grammar: a step emits N
 items, a `map` runs once per item, a `reduce` runs once they're all in, and a
