@@ -656,10 +656,22 @@ export interface CheckReport {
   completable: boolean;
   completePath?: CheckStep[];
   /**
-   * Step names that never appear as the firing step in any explored transition
-   * (dynamically dead within the bounded search).
+   * Step names that never appear as the firing step in any explored transition,
+   * AND a static "can this step ever fire?" check (independent of bounds) is
+   * CERTAIN no firing can ever be pushed for it (see model.ts `canEverFire`).
+   * A genuine wiring defect — always present ([] when none), and (unlike
+   * `unreachedSteps`) ALWAYS a definite finding regardless of `bounded`,
+   * because the check needs no search bounds to be certain.
    */
-  deadSteps: string[];
+  structurallyDeadSteps: string[];
+  /**
+   * Step names that never appear as the firing step in any explored transition,
+   * but the static `canEverFire` check says they COULD fire in principle — the
+   * bounded search just didn't reach them before exhausting `--max-states`/
+   * `--max-depth`. Informational only, NOT a defect: a bounds artifact. Raising
+   * the search bounds may make the step fire. Always present ([] when none).
+   */
+  unreachedSteps: string[];
   /**
    * Invariants that are violated in some reachable state. Always present ([]
    * when no invariants declared or none violated). Each entry is deduplicated by

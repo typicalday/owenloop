@@ -729,7 +729,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     } else {
       // text format
       const clean = report.deadlocks.length === 0 && report.stuck.length === 0
-        && report.invariantViolations.length === 0;
+        && report.invariantViolations.length === 0 && report.structurallyDeadSteps.length === 0;
       const status = clean && report.completable ? 'OK' : clean ? 'INCOMPLETE' : 'DEFECTS FOUND';
       io.out(`=== owenloop check: ${def.name} ===`);
       io.out(`Status: ${status}`);
@@ -762,9 +762,13 @@ function dispatch(command: string, io: CliIO, args: Args): number {
           io.out(`  path: ${v.path.map((s) => `${s.step}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
         }
       }
-      if (report.deadSteps.length > 0) {
+      if (report.structurallyDeadSteps.length > 0) {
         io.out('');
-        io.out(`Dead steps (never fire in explored space): ${report.deadSteps.join(', ')}`);
+        io.out(`Structurally dead steps (can never fire — wiring defect): ${report.structurallyDeadSteps.join(', ')}`);
+      }
+      if (report.unreachedSteps.length > 0) {
+        io.out('');
+        io.out(`Unreached within bounds (raise --max-states/--max-depth): ${report.unreachedSteps.join(', ')}`);
       }
       if (report.completePath) {
         io.out('');
@@ -781,14 +785,24 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     //   fabrications. Contrast deadlocks/stuck, where the maxCollectionSize cap can
     //   manufacture a spurious "no moves" state — hence those require !bounded.
     //   Do NOT remove this asymmetry; it encodes a real soundness distinction.
+    // - structurally-dead steps → ALWAYS nonzero, regardless of bounded. Unlike
+    //   deadlocks/stuck (found by the bounded BFS, so a tighter maxCollectionSize
+    //   can manufacture a spurious one), structurally-dead is a STATIC canEverFire
+    //   finding that needs no search bounds at all — it is sound and bounds-
+    //   independent by construction (model.ts's canEverFire only ever returns
+    //   false when certain), so it belongs with invariant violations, not with
+    //   deadlock/stuck. unreachedSteps (the other dead-step bucket) must NEVER
+    //   affect the exit code — it is purely a bounds artifact.
     // - definite deadlock/stuck only when EXHAUSTIVE (!bounded) → nonzero
-    // - truncated with no invariant violations → 0
+    // - truncated with no invariant violations / structurally-dead steps → 0
     const hasDefiniteDefect =
       report.invariantViolations.length > 0 ||
+      report.structurallyDeadSteps.length > 0 ||
       (!report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0));
     if (hasDefiniteDefect) {
       throw new CliError(
         `definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
+        `${report.structurallyDeadSteps.length} structurally dead step(s), ` +
         `${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`,
       );
     }

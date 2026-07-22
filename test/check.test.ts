@@ -21,6 +21,7 @@ import { Engine } from '../src/engine.ts';
 import type { Order } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import { applyOutcome, eligibleFirings, evalInvariantPredicate, settleInMemory, modelCheck, workflowStatus } from '../src/model.ts';
+import { validateDef } from '../src/defs.ts';
 import { main } from '../src/cli.ts';
 import type { ArtifactData, InvariantDef, InvariantPredicate, WorkflowDef } from '../src/types.ts';
 import { def, input, step } from './helpers.ts';
@@ -390,7 +391,8 @@ test('modelCheck: linear def with no stalls → completable, exhaustive search',
   // With maxStates=50: we can find the completable path before hitting stall states
   const report = modelCheck(simpleNoStall, { maxStates: 50 });
   assert.equal(report.completable, true, 'single-step workflow should be completable');
-  assert.equal(report.deadSteps.length, 0, 'no dead steps in simple workflow');
+  assert.equal(report.structurallyDeadSteps.length, 0, 'no structurally-dead steps in simple workflow');
+  assert.equal(report.unreachedSteps.length, 0, 'no unreached steps in simple workflow');
   // The workflow IS completable; whether bounded depends on maxStates
 });
 
@@ -433,12 +435,80 @@ test('modelCheck: suffixed reduce (src[*].child) explores to completable', () =>
   assert.equal(report.completable, true, 'suffixed-reduce workflow should be completable');
 });
 
-test('modelCheck: dead step via maxDepth truncation', () => {
+test('modelCheck: dead step via maxDepth truncation classifies as unreached, not structurally dead', () => {
   // With maxDepth=1, merger never fires in the delivery def (depth 1 only
-  // reaches plan being green, not all the way to verdict being green).
+  // reaches plan being green, not all the way to verdict being green). merger
+  // CAN fire with generous bounds (it's a normal plain producer), so this is
+  // a bounds artifact, not a wiring defect.
   const report = modelCheck(deliveryProvidedNoSchemaStall, { maxDepth: 1, maxStates: 100 });
   assert.ok(report.bounded, 'search should be bounded when maxDepth=1');
-  assert.ok(report.deadSteps.includes('merger'), 'merger should not fire within depth 1');
+  assert.ok(report.unreachedSteps.includes('merger'), 'merger should be unreached-within-bounds');
+  assert.ok(!report.structurallyDeadSteps.includes('merger'), 'merger is not structurally dead — it CAN fire with generous bounds');
+});
+
+// A reduce-mode step over a validly-produced+sealed collection that produces
+// NOTHING dischargeable: `validateDef` only errors on reduce-produces-only-
+// collections (isReduce && hasCollectionProduce && !hasSingletonProduce) — an
+// empty `produces: []` trips neither that check nor any other validateDef rule,
+// so it reaches modelCheck, where the reduce discharge set (singletonProduces)
+// is empty and the step can NEVER fire, regardless of bounds. This is the
+// residual structurally-dead case the static canEverFire analysis exists for.
+const precisionMap = def(
+  'precision-map',
+  [input('seed', { seedOwed: false })],
+  [
+    step({ name: 'fanout', consumes: ['seed'], produces: ['items[]'] }),
+    step({ name: 'mapper', consumes: ['items[$i]'], produces: ['items[$i].checked'] }),
+    step({ name: 'reducer', consumes: ['items[*].checked'], produces: [] }),
+  ],
+);
+
+test('modelCheck: structurally-dead reduce step (produces nothing) is flagged and never fires under any bounds', () => {
+  assert.deepEqual(validateDef(precisionMap), [], 'precision-map must pass validateDef with zero errors (the residual case validateDef misses)');
+
+  const report = modelCheck(precisionMap, { maxStates: 500, maxDepth: 50 });
+  assert.ok(report.structurallyDeadSteps.includes('reducer'), 'reducer should be classified structurally dead');
+  assert.ok(!report.unreachedSteps.includes('reducer'), 'reducer should not also appear as unreached');
+
+  // Raising bounds substantially must not change the classification — canEverFire
+  // is static and bounds-independent.
+  const reportBigBounds = modelCheck(precisionMap, { maxStates: 5000, maxDepth: 200 });
+  assert.ok(reportBigBounds.structurallyDeadSteps.includes('reducer'), 'reducer stays structurally dead even with much larger bounds');
+});
+
+test('modelCheck: judge and allGreen evaluator steps are never false-flagged as structurally dead', () => {
+  // A judge step fires against the judged stem (no produces of its own) — it
+  // must not be flagged dead just because singletonProduces/plainOutputs is
+  // empty. An allGreen evaluator with a real produce must can-fire too.
+  const withJudgeAndEvaluator = def(
+    'judge-and-evaluator',
+    [input('proposal', { seedOwed: false })],
+    [
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+      // synthesize the judge shape directly (mirrors defs.ts synthesizeJudgeSteps):
+      // judges the 'plan' stem, produces nothing of its own.
+      { ...step({ name: 'planner.plan.judges.reviewer', consumes: ['plan'], produces: [] }), judges: 'plan' },
+      step({ name: 'evaluator', consumes: [], produces: ['summary'], on: ['allGreen'] }),
+    ],
+  );
+  const report = modelCheck(withJudgeAndEvaluator, { maxStates: 500, maxDepth: 50 });
+  assert.ok(
+    !report.structurallyDeadSteps.includes('planner.plan.judges.reviewer'),
+    'a judge step must not be false-flagged as structurally dead',
+  );
+  assert.ok(
+    !report.structurallyDeadSteps.includes('evaluator'),
+    'an allGreen evaluator with a real produce must not be false-flagged as structurally dead',
+  );
+});
+
+test('modelCheck: a structurally-dead step in an otherwise-completable, exhaustively-searched def is still flagged', () => {
+  // The workflow completes fine without 'reducer' ever contributing anything —
+  // completable=true does NOT excuse a genuine wiring defect elsewhere in the def.
+  const report = modelCheck(precisionMap, { maxStates: 500, maxDepth: 50 });
+  assert.equal(report.completable, true, 'precision-map should still be completable (fanout/mapper complete the workflow)');
+  assert.equal(report.bounded, false, 'small def should be exhausted, not bounded');
+  assert.ok(report.structurallyDeadSteps.includes('reducer'), 'the structural defect is reported regardless of overall completability');
 });
 
 test('modelCheck: bounded flag and boundsHit', () => {
@@ -553,7 +623,8 @@ test('CLI check: json format emits structured report', () => {
   const report = JSON.parse(r.out);
   assert.ok('completable' in report, 'report should have completable field');
   assert.ok('deadlocks' in report, 'report should have deadlocks field');
-  assert.ok('deadSteps' in report, 'report should have deadSteps field');
+  assert.ok('structurallyDeadSteps' in report, 'report should have structurallyDeadSteps field');
+  assert.ok('unreachedSteps' in report, 'report should have unreachedSteps field');
   assert.ok('bounded' in report, 'report should have bounded field');
   assert.ok('stats' in report, 'report should have stats field');
 });
@@ -673,6 +744,84 @@ test('CLI check: --assume-provided turns a seedOwed=true false deadlock into a c
   const assumed = run('check', 'tiny', '--assume-provided');
   assert.equal(assumed.code, 0, 'with --assume-provided the same def checks clean');
   assert.match(assumed.out, /Completable: yes/);
+});
+
+test('CLI check: a def with a structurally-dead step exits nonzero and reports it distinctly from unreached', () => {
+  // precision-map shape: a reduce step ('reducer') consumes a mapped collection
+  // but produces nothing dischargeable — validateDef passes clean (the residual
+  // case it doesn't catch), yet the step can never fire under any bounds.
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-structdead-'));
+  writeFileSync(
+    join(defsDir, 'precision-map.yaml'),
+    [
+      'name: precision-map',
+      'inputs:',
+      '  - name: seed',
+      '    seedOwed: false',
+      'steps:',
+      '  - name: fanout',
+      '    consumes: [seed]',
+      '    produces: ["items[]"]',
+      '    body: fan out',
+      '  - name: mapper',
+      '    consumes: ["items[$i]"]',
+      '    produces: ["items[$i].checked"]',
+      '    body: check item',
+      '  - name: reducer',
+      '    consumes: ["items[*].checked"]',
+      '    produces: []',
+      '    body: reduce (produces nothing — can never fire)',
+    ].join('\n'),
+  );
+  const { run } = makeCli({ defs: defsDir });
+
+  const text = run('check', 'precision-map');
+  assert.equal(text.code, 1, 'a structurally-dead step is a definite defect → exit 1');
+  assert.match(text.err, /definite defects found/);
+  assert.match(text.out, /Structurally dead steps \(can never fire — wiring defect\): reducer/);
+  assert.doesNotMatch(text.out, /Unreached within bounds/);
+
+  const json = run('check', 'precision-map', '--format', 'json');
+  const report = JSON.parse(json.out);
+  assert.deepEqual(report.structurallyDeadSteps, ['reducer']);
+  assert.deepEqual(report.unreachedSteps, []);
+});
+
+test('CLI check: a step merely unreached-within-bounds exits 0 and is reported informationally', () => {
+  // A healthy 3-step chain where every step CAN fire, but a tight --max-depth
+  // truncates the search before the tail step ('merger') ever fires.
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-unreached-'));
+  writeFileSync(
+    join(defsDir, 'chain.yaml'),
+    [
+      'name: chain',
+      'inputs:',
+      '  - name: start',
+      '    seedOwed: false',
+      'steps:',
+      '  - name: first',
+      '    consumes: [start]',
+      '    produces: [mid]',
+      '    maxSchemaFailures: 0',
+      '    body: first',
+      '  - name: merger',
+      '    consumes: [mid]',
+      '    produces: [result]',
+      '    maxSchemaFailures: 0',
+      '    body: merge',
+    ].join('\n'),
+  );
+  const { run } = makeCli({ defs: defsDir });
+
+  const text = run('check', 'chain', '--max-depth', '1');
+  assert.equal(text.code, 0, 'unreached-within-bounds is not a defect → exit 0');
+  assert.match(text.out, /Unreached within bounds \(raise --max-states\/--max-depth\): merger/);
+  assert.doesNotMatch(text.out, /Structurally dead steps/);
+
+  const json = run('check', 'chain', '--max-depth', '1', '--format', 'json');
+  const report = JSON.parse(json.out);
+  assert.ok(report.unreachedSteps.includes('merger'), 'merger should be in unreachedSteps');
+  assert.deepEqual(report.structurallyDeadSteps, [], 'no structurally-dead steps in a healthy chain');
 });
 
 // ---- Part 4: evalInvariantPredicate unit tests (§3.2) -------------------------

@@ -565,6 +565,14 @@ a re-provided input while leaving a healthy graph and a terminal output untouche
 a malformed value is rejected rather than greened, a corrected value greens on the same
 open job, repeated failures trip the stall and a `retry` clears it.
 
+`owenloop check <def>` runs a bounded static reachability search over a workflow
+definition and reports dead steps (never seen firing) split by severity: steps that
+can NEVER fire regardless of search bounds are **structurally dead** — a real wiring
+defect, reported nonzero exit — while steps that CAN fire but the bounded search
+just didn't reach are **unreached within bounds** — informational only, exit 0.
+See [`docs/design.md` §25](docs/design.md#25-the-model-checker-owenloop-check--scope)
+for the full breakdown.
+
 ---
 
 ## Design reference
