@@ -636,7 +636,12 @@ export interface CheckOptions {
    * Seed `seedOwed: true` inputs green, as if `provide` already ran. The checker
    * has no runtime provide values, so without this every seedOwed input starts
    * owed with no transition that can green it — a def whose inputs the operator
-   * supplies at create time reports a false depth-0 deadlock. Default false.
+   * supplies at create time reports a false depth-0 deadlock. Default (this
+   * field, when calling `modelCheck` directly) is false — that library default
+   * is unchanged. The `owenloop check` CLI command, however, now defaults this
+   * to true (seedOwed inputs are assumed provided by default, modeling the
+   * operator's `provide` at create); its `--strict-inputs` flag opts back out
+   * to false, restoring the seedOwed-starts-owed behavior described above.
    */
   assumeProvided?: boolean;
 }

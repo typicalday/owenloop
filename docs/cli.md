@@ -21,10 +21,22 @@ every command, as above. `--help` on any command (or bare `-h`/`help`)
 prints this usage and exits 0 without doing any work.
 
 Boolean flags (`--force`, `--dry-run`, `--all`, `--open`, `--terminal`,
-`--recursive`, `--with-token`, `--shallow`, `--assume-provided`, and the bare
-`--now` on `reap`) never take a following value — the next token is always a
-positional or the next `--flag`, never consumed as this flag's argument. Use
-`--flag=value` (e.g. `--now=<ms>` on `tick`) for flags that do take a value.
+`--recursive`, `--with-token`, `--shallow`, `--assume-provided`,
+`--strict-inputs`, and the bare `--now` on `reap`) never take a following
+value — the next token is always a positional or the next `--flag`, never
+consumed as this flag's argument. Use `--flag=value` (e.g. `--now=<ms>` on
+`tick`) for flags that do take a value.
+
+`owenloop check <def>` defaults to treating `seedOwed` inputs as provided
+(`assumeProvided: true`), so a def whose only initial gate is an unprovided
+seeded input no longer reports a false depth-0 `True deadlocks` and doesn't
+exit nonzero for it. `--strict-inputs` opts back out to the previous
+seedOwed-starts-owed behavior, and when that's the def's only blocker also
+prints a one-line hint naming the responsible input(s). `--assume-provided`
+is still accepted (never errors) but is now redundant with the default; if
+both flags are passed, `--strict-inputs` wins. See
+[`docs/design.md` §25](design.md#25-the-model-checker-owenloop-check--scope)
+for the full breakdown.
 
 ## Commands
 

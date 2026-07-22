@@ -1844,6 +1844,9 @@ function seedArts(def: WorkflowDef, assumeProvided = false): Map<string, Artifac
     // seedOwed=false → seed green (version 1); seedOwed=true → seed owed (version 0)
     // The checker has no runtime `provide` values, so seedOwed inputs start owed —
     // unless assumeProvided, which models "the operator ran `provide` at create".
+    // This function's own default stays false; the `owenloop check` CLI command
+    // now passes assumeProvided: true by default (its `--strict-inputs` flag
+    // passes false to restore this owed-start behavior) — see CheckOptions.
     const seedGreen = !input.seedOwed || assumeProvided;
     arts.set(input.name, {
       workflow: '',

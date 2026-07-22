@@ -672,16 +672,67 @@ function makeCli(opts: { defs?: string } = {}) {
   return { run, home };
 }
 
-test('CLI check: text format on delivery (has seedOwed=true → true deadlock)', () => {
-  // The example 'delivery.yaml' has proposal.seedOwed=true with no producer, so
-  // it's a depth-0 TRUE deadlock (frozen() is already false for an owed/version-0
-  // artifact, and no step produces it — freeze-lift changes nothing).
+test('CLI check: text format on delivery, no flags (seedOwed inputs assumed provided by default → no initial-state deadlock)', () => {
+  // The example 'delivery.yaml' has proposal.seedOwed=true with no producer.
+  // `owenloop check` now defaults to assumeProvided: true (seeded inputs are
+  // modeled as if `provide` already ran at create), so this no longer reports
+  // a false depth-0 deadlock and exits 0.
   const { run } = makeCli();
   const r = run('check', 'delivery');
-  // true deadlock + exhaustive → exit 1
+  assert.equal(r.code, 0, 'seedOwed inputs assumed provided by default → exit 0');
+  assert.match(r.out, /owenloop check: delivery/);
+  assert.doesNotMatch(r.out, /True deadlocks/);
+  assert.doesNotMatch(r.out, /\(initial state\)/);
+  assert.doesNotMatch(r.out, /Hint:/);
+});
+
+test('CLI check: --strict-inputs restores the seedOwed-starts-owed behavior, reporting delivery.yaml as a true deadlock', () => {
+  // Same 'delivery.yaml' as above, but with --strict-inputs the seedOwed
+  // proposal input starts owed again (today's pre-change behavior), and since
+  // nothing produces it, it's a depth-0 TRUE deadlock (frozen() is already
+  // false for an owed/version-0 artifact, and no step produces it — freeze-lift
+  // changes nothing).
+  const { run } = makeCli();
+  const r = run('check', 'delivery', '--strict-inputs');
   assert.equal(r.code, 1, 'definite deadlock → exit 1');
   assert.match(r.out, /owenloop check: delivery/);
   assert.match(r.out, /True deadlocks/);
+  assert.match(r.out, /\(initial state\)/);
+  assert.match(r.out, /Hint: the initial-state deadlock is caused solely by unprovided seedOwed input\(s\): proposal\./);
+  assert.match(r.out, /--strict-inputs/);
+});
+
+test('CLI check: --strict-inputs hint precision — a def with NO seedOwed inputs never prints the hint (hasSeedOwed guard)', () => {
+  // A tiny healthy def whose only input is seedOwed=false (auto-seeded green,
+  // never owed at start). --strict-inputs still restores owed-start semantics
+  // for seedOwed inputs, but there are none here, so there's no initial-state
+  // deadlock and the hint's hasSeedOwed guard has nothing to fire on.
+  // Note: a genuinely STRUCTURAL initial-state deadlock (unrelated to seedOwed
+  // inputs) is not constructible through the `check` CLI at all — validateDef
+  // rejects unreachable-step/produce-cycle defs before modelCheck ever runs
+  // (see the plan's "Key finding"), so this test and the strictMode guard
+  // exercised by the default-mode test above are the two precision guards that
+  // ARE reachable through the CLI.
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-noseedowed-'));
+  writeFileSync(
+    join(defsDir, 'nosowok.yaml'),
+    [
+      'name: nosowok',
+      'inputs:',
+      '  - name: start',
+      '    seedOwed: false',
+      'steps:',
+      '  - name: worker',
+      '    consumes: [start]',
+      '    produces: [result]',
+      '    maxSchemaFailures: 0',
+      '    body: do it',
+    ].join('\n'),
+  );
+  const { run } = makeCli({ defs: defsDir });
+  const r = run('check', 'nosowok', '--strict-inputs');
+  assert.equal(r.code, 0, 'no seedOwed inputs → no initial-state deadlock even under --strict-inputs');
+  assert.doesNotMatch(r.out, /Hint:/);
 });
 
 test('CLI check: json format emits structured report', () => {
@@ -765,12 +816,15 @@ test('CLI check: a stall-only def (maxAttempts brake + completable branch) exits
   assert.match(r.out, /Completable: yes/);
 });
 
-test('CLI check: a def with a TRUE deadlock exits 1 when exhaustive', () => {
+test('CLI check: a def with a TRUE deadlock exits 1 when exhaustive (--strict-inputs)', () => {
   // owed input with no producer: frozen() is already false (the artifact is
   // owed/version-0, never rejected) and no step produces it, so freeze-lift
   // yields zero firings — a genuine structural dead-end (TRUE deadlock), not
   // a brake. This is the required true-deadlock exit-1 fixture, kept separate
   // from the stall-only fixture above (which now exits 0).
+  // Under the new default, seedOwed inputs are assumed provided, which would
+  // dissolve this deadlock — so --strict-inputs is required to restore the
+  // owed-start behavior this fixture is testing.
   const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-truedeadlock-'));
   writeFileSync(
     join(defsDir, 'owed-no-producer.yaml'),
@@ -787,7 +841,7 @@ test('CLI check: a def with a TRUE deadlock exits 1 when exhaustive', () => {
     ].join('\n'),
   );
   const { run } = makeCli({ defs: defsDir });
-  const r = run('check', 'owed-no-producer');
+  const r = run('check', 'owed-no-producer', '--strict-inputs');
   assert.equal(r.code, 1, 'true deadlock in exhaustive search → exit 1');
   assert.match(r.out, /True deadlocks/);
   assert.match(r.err, /definite defects found/);
@@ -821,8 +875,10 @@ test('CLI check: completable healthy def (seedOwed=false, maxSchemaFailures: 0) 
 
 test('CLI check: --assume-provided turns a seedOwed=true false deadlock into a clean pass', () => {
   // Same healthy tiny def as above, but the input starts owed (the normal
-  // authoring style: the operator runs `provide` at create). Without the flag
-  // the checker reports a depth-0 deadlock; with it, the def checks clean.
+  // authoring style: the operator runs `provide` at create). With --strict-
+  // inputs the checker reports a depth-0 deadlock (today's pre-change,
+  // seedOwed-starts-owed behavior); with --assume-provided (still accepted,
+  // now redundant with the new default) the def checks clean.
   const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-assume-'));
   writeFileSync(
     join(defsDir, 'tiny.yaml'),
@@ -841,8 +897,8 @@ test('CLI check: --assume-provided turns a seedOwed=true false deadlock into a c
   );
   const { run } = makeCli({ defs: defsDir });
 
-  const bare = run('check', 'tiny');
-  assert.equal(bare.code, 1, 'without the flag, the owed input deadlocks at depth 0');
+  const bare = run('check', 'tiny', '--strict-inputs');
+  assert.equal(bare.code, 1, 'with --strict-inputs, the owed input deadlocks at depth 0');
   assert.match(bare.out, /True deadlocks/);
 
   const assumed = run('check', 'tiny', '--assume-provided');

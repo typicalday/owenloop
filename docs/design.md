@@ -1011,14 +1011,27 @@ either of these — it answers "is this graph structurally sound," not "can a
 human or a stale commit route around a stall." See README's Testing section
 for how `owenloop check` fits alongside the test suite.
 
-The checker also has no runtime `provide` values, so by default a
-`seedOwed: true` input starts owed with no transition that can green it —
-reported as a false depth-0 deadlock for a def whose inputs the operator
-always supplies via `provide` at `create` time. Pass `--assume-provided`
-(`assumeProvided` in `CheckOptions` when calling `modelCheck` directly) to
-seed those inputs green instead, modeling "the operator already ran
-`provide`." It only affects the initial seed — a genuine deadlock reachable
-past the inputs is still reported.
+The checker also has no runtime `provide` values, so a `seedOwed: true`
+input has no transition that can green it on its own — without seeding it
+green some other way, it starts owed and can manufacture a false depth-0
+deadlock for a def whose inputs the operator always supplies via `provide`
+at `create` time. `CheckOptions.assumeProvided` (library level, when calling
+`modelCheck` directly) controls this and **defaults to `false`** — that
+library default is unchanged by the CLI change below, and is what the
+`modelCheck` unit tests calling it directly still rely on.
+
+`owenloop check` (the CLI command), however, now defaults to
+`assumeProvided: true` — seedOwed inputs are seeded green by default,
+modeling "the operator already ran `provide` at `create`." This dissolves
+the false depth-0 deadlock for the common case without the flag. Pass
+`--strict-inputs` to opt back out to the seedOwed-starts-owed behavior; when
+that's the *sole* reason for an initial-state deadlock, `owenloop check`
+also prints a one-line hint naming the responsible seedOwed input(s) and
+pointing at re-running without `--strict-inputs`. `--assume-provided` is
+still accepted (never errors) but is now redundant with the default; if both
+`--strict-inputs` and `--assume-provided` are passed, `--strict-inputs` wins.
+In all cases, seeding only affects the initial seed — a genuine deadlock
+reachable past the inputs is still reported.
 
 ## §26 Declarative exclusive produce-groups (`group:`)
 

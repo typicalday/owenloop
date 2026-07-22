@@ -584,6 +584,13 @@ moves, a genuine structural dead-end, which fails the check nonzero when the sea
 is exhaustive. See [`docs/design.md` §25](docs/design.md#25-the-model-checker-owenloop-check--scope)
 for the full breakdown.
 
+By default, `seedOwed` inputs are assumed provided (modeling the operator's `provide`
+already having run at create), so a def whose only initial gate is an unprovided seeded
+input no longer reports a false `True deadlocks ... (initial state)` and nonzero exit.
+`--strict-inputs` restores the seeded-inputs-start-owed behavior; when that's the sole
+blocker, it also prints a one-line hint naming the seedOwed input(s) responsible.
+`--assume-provided` is still accepted but is now a no-op (redundant with the default).
+
 ---
 
 ## Design reference
