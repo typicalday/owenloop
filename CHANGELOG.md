@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1](https://github.com/typicalday/owenloop/compare/v0.4.0...v0.4.1) (2026-07-22)
+
+
+### Features
+
+* **check:** default seedOwed inputs to assumed-provided, add --strict-inputs ([#80](https://github.com/typicalday/owenloop/issues/80)) ([1a0891f](https://github.com/typicalday/owenloop/commit/1a0891f280c5d0ccb942cb29ad734480238d652d))
+* **check:** split dead steps into structurally-dead vs unreached-within-bounds ([#77](https://github.com/typicalday/owenloop/issues/77)) ([f7efb10](https://github.com/typicalday/owenloop/commit/f7efb10f922ea5a0baf04df839ce36fd0c626e82))
+* **check:** split EXPECTED stall states from TRUE deadlocks in owenloop check ([#78](https://github.com/typicalday/owenloop/issues/78)) ([5933a67](https://github.com/typicalday/owenloop/commit/5933a67eeee9e654d3e4ba4c48854f6ef04b83b0))
+* **cli:** agent new — mint an agent token into the credential store ([#75](https://github.com/typicalday/owenloop/issues/75)) ([f115cb9](https://github.com/typicalday/owenloop/commit/f115cb9739be28e29de5a7e1debd1155e4ab4a9f))
+* **cli:** owenloop setup + doctor — shipped auth/setup experience (O4) ([#79](https://github.com/typicalday/owenloop/issues/79)) ([9a10d9a](https://github.com/typicalday/owenloop/commit/9a10d9ac618b6f31a5db5c106e3ae91bf44a3c6d))
+* **defs:** flag silently-dead reduce and evaluator steps in validateDef ([#73](https://github.com/typicalday/owenloop/issues/73)) ([84c81f4](https://github.com/typicalday/owenloop/commit/84c81f46197792fe741bff7d74f5e30a537598d7))
+* **hub:** credential write API + concurrency-safe OAuth refresh ([#71](https://github.com/typicalday/owenloop/issues/71)) ([9514571](https://github.com/typicalday/owenloop/commit/95145718492882cfd1088d540f54d639773e82a7))
+* **mcp:** `owenloop mcp` stdio control-plane server (O2) ([#76](https://github.com/typicalday/owenloop/issues/76)) ([0daa66c](https://github.com/typicalday/owenloop/commit/0daa66c5fd32a64a40ab08ba9b393b77350fb91c))
+
+
+### Bug Fixes
+
+* **engine:** distinguish absent-from-fingerprint vs moved-version in born-reject reasons ([#74](https://github.com/typicalday/owenloop/issues/74)) ([1567b80](https://github.com/typicalday/owenloop/commit/1567b807accc11a71eb9f2cfd7930224577a67a0))
+
 ## [0.4.0](https://github.com/typicalday/owenloop/compare/v0.3.1...v0.4.0) (2026-07-21)
 
 
