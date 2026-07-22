@@ -209,6 +209,7 @@ interface Args {
  */
 const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   'assume-provided',
+  'strict-inputs',
   'shallow',
   'now',
   'all',
@@ -488,7 +489,7 @@ Commands:
   agent new <name> [--pools <a,b>] [--hub <url>]   mint a new agent identity on the hub and store its token in slot agent:<name> (the token is never printed)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   lint [<def-name>]                      check def(s) for wiring problems
-  check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided]
+  check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided] [--strict-inputs]
                                          bounded reachability check (stall states, true deadlocks, stuck, dead steps, declared invariants)
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
@@ -558,7 +559,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['agent', cmdOpts('pools', 'hub')],
   ['mcp', cmdOpts('hub')],
   ['lint', cmdOpts()],
-  ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided')],
+  ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided', 'strict-inputs')],
   ['create', cmdOpts('title', 'provide', 'param')],
   ['provide', cmdOpts('value')],
   ['adopt', cmdOpts()],
@@ -720,13 +721,19 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     const maxDepth = numOpt(args, 'max-depth');
     const maxStates = numOpt(args, 'max-states');
     const maxCollection = numOpt(args, 'max-collection');
+    // `--strict-inputs` restores the pre-existing seedOwed-starts-owed behavior;
+    // it takes precedence over `--assume-provided` when both are passed (the
+    // newer explicit opt-out wins; `--assume-provided` is otherwise redundant
+    // with the new default and is kept only so it never errors as unknown).
+    const strictInputs = flag(args, 'strict-inputs');
 
-    const report = modelCheck(def, {
+    const bounds = {
       ...(maxDepth !== undefined ? { maxDepth } : {}),
       ...(maxStates !== undefined ? { maxStates } : {}),
       ...(maxCollection !== undefined ? { maxCollectionSize: maxCollection } : {}),
-      ...(flag(args, 'assume-provided') ? { assumeProvided: true } : {}),
-    });
+    };
+
+    const report = modelCheck(def, { ...bounds, assumeProvided: !strictInputs });
 
     if (format === 'json') {
       print(io, report);
@@ -756,6 +763,25 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         io.out(`True deadlocks (no path to completion at unlimited attempts) (${report.deadlocks.length}):`);
         for (const d of report.deadlocks) {
           io.out(`  path: ${d.path.map((s) => `${s.step}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
+        }
+      }
+      if (strictInputs) {
+        const seedOwedNames = def.inputs.filter((i) => i.seedOwed).map((i) => i.name);
+        const initialDeadlock = report.deadlocks.some((d) => d.path.length === 0);
+        if (seedOwedNames.length > 0 && initialDeadlock) {
+          // precision: would treating seedOwed inputs as provided dissolve the
+          // initial-state deadlock? If so, it's caused solely by unprovided
+          // seedOwed inputs, not a structural defect — print a hint pointing at
+          // the new default. This never fires for a deadlock that survives
+          // providing the seeded inputs (a structural one).
+          const probe = modelCheck(def, { ...bounds, assumeProvided: true });
+          const clearedByProvide = !probe.deadlocks.some((d) => d.path.length === 0);
+          if (clearedByProvide) {
+            io.out('');
+            io.out(`Hint: the initial-state deadlock is caused solely by unprovided seedOwed input(s): ${seedOwedNames.join(', ')}.`);
+            io.out(`      Seeded inputs are assumed provided by default; this appears only because --strict-inputs was passed.`);
+            io.out(`      Re-run 'owenloop check ${def.name}' without --strict-inputs to check the real reachable space.`);
+          }
         }
       }
       if (report.stuck.length > 0) {
