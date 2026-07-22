@@ -174,6 +174,48 @@ test('setup: a second run performs ZERO writes (no store mutation, no settings w
   assertNoOlp(t2);
 });
 
+// ---- external credential command: refuse before opening the browser ---------
+
+test('setup: an external credential command refuses BEFORE any browser opens (symmetric with login)', async () => {
+  // Same incident class as the login guard (PR #69): when OWENLOOP_CREDENTIAL_COMMAND
+  // is set the external command — not the local store — supplies this hub's
+  // credentials, so setup's human-login step (which opens the loopback OAuth
+  // browser) and its agent mint would strand keys nobody reads. Setup must fail
+  // FAST with login's EXACT refusal, at the top, before any step runs.
+  //
+  // What the guard replaces: without it, setup gives a confusing, non-symmetric
+  // late failure. In external mode `readCredential` never returns null — the
+  // command either yields a well-formed credential or THROWS (hub.ts
+  // runCredentialCommand). So a missing/failing command (here `my-helper`, not
+  // on PATH) throws at step 1 inspect with a raw "external credential command
+  // failed … status 127" message; a succeeding command instead fails later at
+  // step 3's mint refusal after network calls. Either way the loopback-OAuth
+  // browser is never reached, so `openedUrls` is a standing witness that no
+  // browser opens — and the DISTINGUISHING signal this test asserts is that the
+  // error is login's clean refusal, which only the guard produces. Pre-fix the
+  // error is the raw status-127 text (no OWENLOOP_CREDENTIAL_COMMAND / "unset
+  // it" guidance), so this test fails without the guard and passes with it.
+  //
+  // driveCallback is wired only defensively: if a future refactor ever let the
+  // browser branch be reached, the callback keeps the run from hanging.
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({
+    fetch,
+    onOpenUrl: driveCallback(),
+    env: { OWENLOOP_CREDENTIAL_COMMAND: 'my-helper --hub prod' },
+  });
+
+  const code = await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t.io);
+  assert.equal(code, 1);
+  assert.equal(t.openedUrls.length, 0, 'no browser/loopback flow ever started');
+  const errText = t.err.join('\n');
+  assert.match(errText, /OWENLOOP_CREDENTIAL_COMMAND/);
+  assert.match(errText, /unset it to use `owenloop login`/);
+  assert.equal(t.store.size, 0, 'nothing written to the local store');
+  assertNoOlp(t);
+});
+
 // ---- Flow B: succession -----------------------------------------------------
 
 test('setup: succession prompt (Flow B) renders verbatim framing and rekeys the chosen agent', async () => {

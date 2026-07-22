@@ -3157,6 +3157,19 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     }
   }
 
+  // Symmetric with `dispatchLogin`: when an external credential command supplies
+  // this hub's credentials, the local store is never consulted, so setup's
+  // human-login step (step 2, which opens the loopback OAuth browser) and its
+  // agent mint would strand keys nobody reads. Refuse BEFORE any browser opens —
+  // otherwise setup completes the full OAuth round-trip only to fail at
+  // storeCredential's backstop, wasting a browser trip on the flagship command.
+  if (externalCredentialCommand(io.env) !== undefined) {
+    throw new CliError(
+      'an external credential command is configured (OWENLOOP_CREDENTIAL_COMMAND), so it — not the ' +
+        'local store — supplies credentials for this hub; unset it to use `owenloop login`',
+    );
+  }
+
   const origin = resolveSetupHub(io, args);
   const steps: SetupStep[] = [];
 
