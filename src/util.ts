@@ -4,6 +4,19 @@ import { createHash, randomBytes } from 'node:crypto';
 import { lstatSync, mkdirSync } from 'node:fs';
 
 /**
+ * A user-facing CLI/library error whose `message` is printed as-is (no stack
+ * trace) — the "expected, explained" failure class, distinct from a programming
+ * bug. Homed here in `util.ts` (which has no project-internal imports) so it can
+ * be shared by `cli.ts` (where `RateLimitError extends CliError`) and
+ * `credentials.ts` (which must throw it without importing `cli.ts`, avoiding a
+ * cycle and keeping the library barrel from ever loading `cli.ts`). Deliberately
+ * NOT re-exported from the package barrel (`src/index.ts`): it was module-private
+ * before, and the credential-write PR does not widen the public API beyond the
+ * functions the proposal names.
+ */
+export class CliError extends Error {}
+
+/**
  * `mkdir -p` for a project-state directory (e.g. `.owenloop`), refusing to
  * create it through a symlinked component (SEC-3, parent-directory half).
  *
