@@ -26,6 +26,7 @@
 import { join } from 'node:path';
 import {
   asMintAgentTokenOk,
+  asRekeyAgentTokenOk,
   configDir,
   credentialBackend,
   credentialFilePath,
@@ -716,4 +717,157 @@ export async function mintAgentCredential(
 
   // 9. Return non-secret handles only — no token field exists to leak.
   return { id: ok.id, agentId: ok.agentId, pools: ok.pools, storage };
+}
+
+/**
+ * The result of `rekeyAgentCredential`. Like `MintAgentResult`, carries NO token
+ * field — only non-secret handles the caller may print. The new `olp_` plaintext
+ * is written to the store inside `rekeyAgentCredential` and never leaves it.
+ *
+ * `revokedTokenIds` are the ids the rekey invalidated server-side — the OLD
+ * installation's credential(s). Their presence is the honest signal that any
+ * still-running copy of this agent elsewhere is now disconnected. No `pools`
+ * field: rekey changes no pool membership.
+ */
+export interface RekeyAgentResult {
+  /** New token id — a non-secret revocation handle. */
+  id: string;
+  /** The rekeyed agent's id — a non-secret handle. */
+  agentId: string;
+  /** Ids of the tokens this rekey revoked (the old installation's). */
+  revokedTokenIds: string[];
+  /** The new token's scopes. */
+  scopes: string[];
+  /** Which local backend the new token landed in. */
+  storage: 'keychain' | 'file';
+}
+
+/**
+ * Re-key an EXISTING agent identity on `origin` as the human `cred`: the hub
+ * mints a fresh `olp_` token for `agentId`, REVOKES the identity's current
+ * token(s), and this function persists the new token into the SAME
+ * `agent:<name>` slot — overwriting the old one. Sibling of
+ * `mintAgentCredential` with the identical §6 discipline; the only shape
+ * differences are the endpoint (`/api/rekey_agent_token`), the request body
+ * (`{agentId}` — no name/scopes/pools; rekey preserves pools), and the response
+ * guard (`asRekeyAgentTokenOk` — no `pools` field).
+ *
+ * **The token NEVER leaves this function.** It flows exactly one hop —
+ * `asRekeyAgentTokenOk(body).token` → `storeCredential` — and is never returned,
+ * thrown, logged, or embedded in any message. The returned `RekeyAgentResult`
+ * structurally omits it.
+ *
+ * **Irreversibility (why the caller must gate this behind a hard auth step):**
+ * a successful rekey has ALREADY revoked the old token server-side by the time
+ * this function returns. If the local `storeCredential` then fails, the old
+ * installation is disconnected AND the new token is unrecoverable locally — the
+ * error says exactly that and points at console Reconnect; it never prints the
+ * token as a fallback.
+ *
+ * @param humanSlot the slot `cred` was read from (always `{principal:'human'}`).
+ * @param params.agentId the identity to rekey (resolved by the caller from the
+ *   `agent_identities` listing by NAME — names are org-unique).
+ * @param params.name the agent account name — the local slot `agent:<name>` the
+ *   new token is written to. Validated before any I/O.
+ */
+export async function rekeyAgentCredential(
+  io: CredentialIO,
+  origin: string,
+  humanSlot: CredentialSlotSelector,
+  cred: Credential,
+  params: { agentId: string; name: string },
+): Promise<RekeyAgentResult> {
+  // 1. Validate the agent name (the local slot target) before any I/O — same
+  //    byte-identical client regex as mint.
+  credentialSlot({ principal: 'agent', account: params.name });
+
+  // 2. Refuse an external-command setup BEFORE the network call — same reason as
+  //    mint: the rekey would revoke the old token server-side, but the new one
+  //    could never be stored, stranding the install.
+  if (externalCredentialCommand(io.env) !== undefined) {
+    throw new CliError(
+      'an external credential command is configured (OWENLOOP_CREDENTIAL_COMMAND), so it — not the ' +
+        'local store — supplies credentials for this hub; unset it to use `owenloop login`',
+    );
+  }
+
+  // 3. Freshen the human oauth bearer (persist=true). No-op for non-oauth kinds.
+  let current = await ensureFreshOAuth(io, origin, humanSlot, cred);
+
+  const doPost = (bearer: Credential): Promise<Response> =>
+    hubFetch(io, resolveEndpoint(origin, '/api/rekey_agent_token'), {
+      method: 'POST',
+      headers: {
+        Authorization: authHeader(bearer),
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ agentId: params.agentId }),
+    });
+
+  // 4 + 5. POST; on a 401 with an oauth credential, refresh once and retry once.
+  let res = await doPost(current);
+  if (res.status === 401 && current.kind === 'oauth') {
+    current = await refreshOAuth(io, origin, humanSlot, current as Extract<Credential, { kind: 'oauth' }>);
+    res = await doPost(current);
+  }
+  if (res.status === 401) {
+    throw new CliError('credential rejected by the hub — run `owenloop login`');
+  }
+
+  // 6. Any other non-2xx: surface the hub's typed `message` VERBATIM (e.g. an
+  //    unknown agentId, or a `forbidden` for a non-admin human). Never raw body.
+  if (!res.ok) {
+    let message: string | undefined;
+    try {
+      const errBody = (await res.json()) as unknown;
+      if (typeof errBody === 'object' && errBody !== null) {
+        const m = (errBody as Record<string, unknown>).message;
+        if (typeof m === 'string' && m !== '') message = m;
+      }
+    } catch {
+      // Non-JSON body — fall through to the generic status message.
+    }
+    throw new CliError(message ?? `hub ${origin} rejected the rekey (HTTP ${res.status})`);
+  }
+
+  // 7. Narrow the 2xx body. Same double-wrap as mint: the raw body carries the
+  //    plaintext in `text`, and V8's SyntaxError embeds body snippets, so BOTH
+  //    the JSON-parse failure and the guard failure throw FIXED/field-only
+  //    strings — never body text.
+  let body: unknown;
+  try {
+    body = (await res.json()) as unknown;
+  } catch {
+    throw new CliError('rekey_agent_token: malformed success response — body is not valid JSON');
+  }
+  let ok;
+  try {
+    ok = asRekeyAgentTokenOk(body);
+  } catch (e) {
+    throw new CliError((e as Error).message);
+  }
+
+  // 8. Store the new token — its only hop. On a store failure the old token is
+  //    ALREADY revoked server-side (the previous installation is disconnected)
+  //    and the new one is now unrecoverable locally; say so honestly and point
+  //    at console Reconnect. NEVER print the token as a fallback (§6).
+  let storage: 'keychain' | 'file';
+  try {
+    storage = await storeCredential(
+      io,
+      origin,
+      { principal: 'agent', account: params.name },
+      { kind: 'agent', accessToken: ok.token },
+    );
+  } catch (e) {
+    throw new CliError(
+      `the agent token was re-keyed but the new token could not be stored locally: ${(e as Error).message}. ` +
+        `The old token for '${params.name}' is already revoked (any other running copy is now disconnected); ` +
+        `recover via the console (Reconnect) — the new token cannot be recovered from here`,
+    );
+  }
+
+  // 9. Return non-secret handles only — no token field exists to leak.
+  return { id: ok.id, agentId: ok.agentId, revokedTokenIds: ok.revokedTokenIds, scopes: ok.scopes, storage };
 }

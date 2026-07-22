@@ -32,10 +32,12 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
-import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, delimiter, dirname, join, resolve } from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
+import { createInterface } from 'node:readline/promises';
+import { hostname } from 'node:os';
 import type { AddressInfo } from 'node:net';
 import { parse as parseYaml } from 'yaml';
 import { Engine } from './engine.ts';
@@ -65,6 +67,7 @@ import {
   mintAgentCredential,
   readBodyBounded,
   refreshOAuth,
+  rekeyAgentCredential,
   storeCredential,
 } from './credentials.ts';
 import { runMcpCommand } from './mcp/serve.ts';
@@ -95,6 +98,7 @@ import {
 } from './add.ts';
 import type { AddJournal, InstalledEntry, InstallCommitHandle, Lockfile } from './add.ts';
 import {
+  asAgentIdentities,
   asCreateWorkflowOk,
   asWhoami,
   computeServerDiff,
@@ -120,6 +124,7 @@ import {
   writeHubBinding,
 } from './hub.ts';
 import type {
+  AgentIdentitySummary,
   Credential,
   CredentialSlotSelector,
   DefPushCandidate,
@@ -127,6 +132,7 @@ import type {
   Keychain,
   WhoamiIdentity,
 } from './hub.ts';
+import { owenworkSettingsPath, readOwenworkSettingsRaw, writeOwenworkHubOrigin } from './owenwork.ts';
 
 // Re-export the keychain backend type so existing test imports of `Keychain`
 // from `../src/cli.ts` (test/hubkit.ts, test/login.test.ts) keep resolving —
@@ -159,6 +165,23 @@ export interface CliIO {
    * command falls back to `process.stdin`. Only the `mcp` verb reads it.
    */
   stdinStream?: LineStream;
+  /**
+   * Ask the user a question and read a line back. Used only by `setup`'s
+   * interactive branches (name-this-agent, succession choice). Default: a
+   * `node:readline/promises` interface over `process.stdin`/`process.stderr` —
+   * the question and echo go to STDERR so stdout stays a clean machine-parseable
+   * JSON document (the repo's diagnostics-to-stderr convention). Injectable so
+   * tests script answers without a TTY.
+   */
+  prompt?: (question: string) => Promise<string>;
+  /**
+   * Run a local command and capture its result — used ONLY by `setup`/`doctor`'s
+   * Claude Code plugin probe (`claude plugin list`). Default: a `spawnSync`
+   * wrapper with `shell: false` (never interpolates argv into a shell) that
+   * never inherits stdio. Injectable so tests model the plugin state without a
+   * real `claude` binary.
+   */
+  runCommand?: (cmd: string, args: string[]) => { status: number | null; stdout: string; stderr: string };
 }
 
 function defaultIO(): CliIO {
@@ -170,7 +193,33 @@ function defaultIO(): CliIO {
     fetch: globalThis.fetch,
     openUrl: defaultOpenUrl,
     readStdin: defaultReadStdin,
+    prompt: defaultPrompt,
+    runCommand: defaultRunCommand,
   };
+}
+
+/**
+ * The default interactive prompt: a one-shot `node:readline/promises` question
+ * whose text and echo go to STDERR (so stdout remains the parseable JSON
+ * document). Closed immediately after the single read.
+ */
+async function defaultPrompt(question: string): Promise<string> {
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    return await rl.question(question);
+  } finally {
+    rl.close();
+  }
+}
+
+/**
+ * The default local-command runner: `spawnSync` with `shell: false` (argv is
+ * passed as a vector, never interpolated into a shell) and captured, not
+ * inherited, stdio. Only the plugin probe uses it.
+ */
+function defaultRunCommand(cmd: string, args: string[]): { status: number | null; stdout: string; stderr: string } {
+  const r = spawnSync(cmd, args, { encoding: 'utf8' });
+  return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
 
 /** Fire-and-forget browser open — never blocks the login flow on the child. */
@@ -487,6 +536,8 @@ Commands:
   push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
   agent new <name> [--pools <a,b>] [--hub <url>]   mint a new agent identity on the hub and store its token in slot agent:<name> (the token is never printed)
+  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--pools <a,b>]   converge this machine's install: human login, agent credential, owenwork settings, plugin (idempotent)
+  doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided] [--strict-inputs]
@@ -557,6 +608,8 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['connect', cmdOpts('hub', 'as')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
   ['agent', cmdOpts('pools', 'hub')],
+  ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'pools')],
+  ['doctor', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
   ['lint', cmdOpts()],
   ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided', 'strict-inputs')],
@@ -2059,6 +2112,39 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
       `the loopback OAuth login produces a human credential and cannot be stored in the \`${credentialSlot(asked)}\` slot — drop \`--as\`, or use \`login --with-token\` with an \`olp_\` agent token`,
     );
   }
+  const r = await runLoopbackOAuth(io, origin);
+  print(io, {
+    ok: true,
+    hub: origin,
+    kind: r.cred.kind,
+    slot: credentialSlot({ principal: 'human' }),
+    storage: r.storage,
+    replaced: r.replaced,
+    org: r.identity.orgName,
+    orgId: r.identity.orgId,
+    identity: r.identity.actor,
+    ...(r.identity.email ? { email: r.identity.email } : {}),
+  });
+  return 0;
+}
+
+/**
+ * The loopback OAuth auth-code + PKCE(S256) round-trip, extracted verbatim from
+ * `dispatchLogin` so `setup`'s human-login gate (step 2) runs the exact same
+ * flow — one implementation, one behavior. Always targets the **human** slot
+ * (the only slot loopback OAuth can produce). Binds a single-use 127.0.0.1:0
+ * catcher, discovers the hub's OAuth metadata, dynamically registers a client
+ * for the concrete redirect URI, opens the browser, waits for the callback,
+ * exchanges the code, verifies the resulting credential against `whoami`
+ * (persist=false — an unverified token must never reach storage ahead of its
+ * pass/fail verdict), then stores it. Returns whether a human credential was
+ * already present (`replaced`), the stored credential, the verified identity,
+ * and the storage backend actually used.
+ */
+async function runLoopbackOAuth(
+  io: CliIO,
+  origin: string,
+): Promise<{ cred: Credential; identity: WhoamiIdentity; storage: 'keychain' | 'file'; replaced: boolean }> {
   const slot: CredentialSlotSelector = { principal: 'human' };
   const existed = readCredential(io, origin, slot) !== null;
 
@@ -2099,19 +2185,7 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
     });
     const { cred, identity } = await verifyCredential(io, origin, slot, exchanged, false); // never store an unverified token
     const storage = await storeCredential(io, origin, slot, cred);
-    print(io, {
-      ok: true,
-      hub: origin,
-      kind: cred.kind,
-      slot: credentialSlot(slot),
-      storage,
-      replaced: existed,
-      org: identity.orgName,
-      orgId: identity.orgId,
-      identity: identity.actor,
-      ...(identity.email ? { email: identity.email } : {}),
-    });
-    return 0;
+    return { cred, identity, storage, replaced: existed };
   } finally {
     void server;
     close();
@@ -2752,6 +2826,690 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
   return 0;
 }
 
+// ---- setup & doctor ---------------------------------------------------------
+//
+// `owenloop setup` is the idempotent converger for a machine's install (identity
+// model doc §7 Flow A/B): human login → agent credential → owenwork settings →
+// Claude Code plugin → a final doctor pass. `owenloop doctor` (§8) is the
+// read-only probe of the same five surfaces. Both share `resolveSetupHub` (one
+// target) and the agent-slot probe.
+//
+// Secrets discipline (§6 "rule of gates"): NO code path here passes a token to
+// `io.out`/`io.err`/an Error. The only token hops live inside
+// `mintAgentCredential`/`rekeyAgentCredential` (caller→store). The succession
+// prompt renders name/last-active/pools; doctor renders identity/pools; the
+// owenwork settings file receives `hubOrigin` only.
+
+/** One step's outcome in the setup summary. `noted` = informational, never a failure. */
+interface SetupStep {
+  step: string;
+  action: 'skipped' | 'done' | 'noted';
+  detail: string;
+}
+
+/** One doctor check line: a ✓/✗ label + a distinct detail/remedy. */
+interface DoctorCheck {
+  label: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** The doctor report: the ordered checks and whether the CORE checks (1–5, excluding the plugin) all passed. */
+interface DoctorResult {
+  ok: boolean;
+  checks: DoctorCheck[];
+}
+
+/** A locally-stored agent slot that verified live against the hub. */
+interface VerifiedAgent {
+  name: string;
+  actorId: string;
+  /** The matching identity from the `agent_identities` listing, when one could be resolved (id first, else name). */
+  identity: AgentIdentitySummary | undefined;
+}
+
+/**
+ * The plugin check is rendered but NON-FATAL while the marketplace is not yet
+ * fetchably published (the brief's open question): `doctor` shows ✓/✗ but the
+ * plugin never flips the exit code, and `setup` PRINTS install instructions
+ * instead of failing. Flip to `true` once the shell-out install lands.
+ */
+const PLUGIN_CHECK_FATAL = false;
+
+/**
+ * Resolve the hub `setup`/`doctor` target. Deviates from `resolveAgentHub` in
+ * exactly ONE way (documented in the plan §4): a fresh machine — which is the
+ * Flow A mainline — has NO stored hub, so instead of `resolveAgentHub`'s exit-2
+ * it falls back to the production `DEFAULT_HUB` with a printed notice. The
+ * wrong-hub-mint risk `resolveAgentHub` guards against does not apply: the mint
+ * happens only AFTER the human logs in through this hub's own browser consent,
+ * and the target line is printed first.
+ *
+ * - `--hub <origin>` → `normalizeOrigin`.
+ * - else `listStoredHubOrigins`: exactly one → use it; more than one → `CliError`
+ *   exitCode 2 listing them; zero or `null` (keychain/external cannot enumerate)
+ *   → `DEFAULT_HUB` + notice.
+ *
+ * `OWENLOOP_HUB` stays excluded (O2/O3 parity). Shared by both commands so they
+ * agree on the target.
+ */
+function resolveSetupHub(io: CliIO, args: Args): string {
+  const flagVal = last(args, 'hub');
+  if (flagVal !== undefined) {
+    try {
+      return normalizeOrigin(flagVal);
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+  }
+  const origins = listStoredHubOrigins(io.env, io.keychain);
+  if (origins !== null && origins.length === 1) return origins[0]!;
+  if (origins !== null && origins.length > 1) {
+    throw new CliError(
+      `more than one hub is configured on this machine — pass --hub <origin> to pick one; stored hubs: ${origins.join(', ')}`,
+      { exitCode: 2 },
+    );
+  }
+  io.err(`targeting ${DEFAULT_HUB} (pass --hub to override)`);
+  return DEFAULT_HUB;
+}
+
+/**
+ * Is `cmd` an executable file on `env.PATH`? A pure PATH scan (no exec), so it is
+ * hermetic-testable by pointing `PATH` at a fixture dir with a chmod +x stub.
+ * A directory entry, a non-executable file, or an unreadable dir is skipped.
+ */
+function commandOnPath(env: Record<string, string | undefined>, cmd: string): boolean {
+  const path = env.PATH;
+  if (!path) return false;
+  for (const dir of path.split(delimiter)) {
+    if (dir === '') continue;
+    const full = join(dir, cmd);
+    try {
+      const st = statSync(full);
+      if (st.isFile() && (st.mode & 0o111) !== 0) return true;
+    } catch {
+      // not here — keep scanning
+    }
+  }
+  return false;
+}
+
+/**
+ * Coerce a raw string (a hostname) into a valid agent account name, or `''` when
+ * nothing usable survives. Lowercase; drop every character outside the account
+ * body class `[a-z0-9._-]`; strip leading non-alphanumerics (the account MUST
+ * start alphanumeric); clamp to 64 chars. A suggestion only — never parsed or
+ * matched (§2); the user may accept it or type any valid label.
+ */
+export function sanitizeAgentName(raw: string): string {
+  let s = raw.toLowerCase().replace(/[^a-z0-9._-]/g, '');
+  s = s.replace(/^[^a-z0-9]+/, '');
+  if (s.length > 64) s = s.slice(0, 64);
+  return s;
+}
+
+/**
+ * The identity's last-active instant in epoch-ms: `max` of its two non-null
+ * timestamps (`lastUsedAt`, the rekey-surviving token-level max; `lastContactAt`,
+ * the identity-level any-protocol contact), or `null` when both are absent. Both
+ * recording paths are monotone, so `max` is the correct "most recent activity".
+ */
+export function lastActiveMs(identity: AgentIdentitySummary): number | null {
+  const c = identity.lastContactAt;
+  const u = identity.lastUsedAt;
+  if (c === null) return u;
+  if (u === null) return c;
+  return Math.max(c, u);
+}
+
+/**
+ * Render an elapsed-time delta (ms) as a short relative string: `just now`,
+ * `<n>m ago`, `<n>h ago`, `<n>d ago`. A `null` delta (no recorded activity)
+ * renders `never`. Negative deltas (clock skew) clamp to `just now`.
+ */
+export function formatLastActive(deltaMs: number | null): string {
+  if (deltaMs === null) return 'never';
+  const ms = Math.max(0, deltaMs);
+  const min = Math.floor(ms / 60_000);
+  if (min < 1) return 'just now';
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return `${Math.floor(hr / 24)}d ago`;
+}
+
+/**
+ * File-backend agent account names stored for `origin`, or `null` when the
+ * backend cannot enumerate (keychain/external) — mirrors `listStoredHubOrigins`'
+ * backend-awareness. The keychain interface is get/set/delete only, so the real
+ * agent probe on a keychain machine is the identity-name-keyed reads in step 3.
+ */
+function enumerateAgentAccounts(io: CliIO, origin: string): string[] | null {
+  if (credentialBackend(io.env, io.keychain).kind !== 'file') return null;
+  const file = readCredentialFile(credentialFilePath(io.env));
+  return Object.keys(file.hubs[origin] ?? {})
+    .filter((k) => k.startsWith('agent:'))
+    .map((k) => k.slice('agent:'.length));
+}
+
+/**
+ * Probe local agent slots (`names`) for one that verifies live against the hub's
+ * `whoami`. Reads each `agent:<name>` slot; a hit is verified with `authedGet`
+ * (ensureFreshOAuth no-ops on the `agent` kind; a 401 = revoked → `sawRevoked`).
+ * Prefers a slot whose `whoami actor.id` matches a listed identity id; falls back
+ * to the first otherwise-verified slot (id/name mismatch is tolerated, never a
+ * hard fail — see plan §5). Never a write.
+ */
+async function probeAgentSlots(
+  io: CliIO,
+  origin: string,
+  names: string[],
+  identities: AgentIdentitySummary[],
+): Promise<{ verified: VerifiedAgent | null; sawSlot: boolean; sawRevoked: boolean }> {
+  let verified: VerifiedAgent | null = null;
+  let sawSlot = false;
+  let sawRevoked = false;
+  for (const name of names) {
+    const cred = readCredential(io, origin, { principal: 'agent', account: name });
+    if (cred === null) continue;
+    sawSlot = true;
+    let res: Response;
+    try {
+      ({ res } = await authedGet(io, origin, { principal: 'agent', account: name }, cred, '/api/whoami'));
+    } catch {
+      continue;
+    }
+    if (res.status === 401) {
+      sawRevoked = true;
+      continue;
+    }
+    if (!res.ok) continue;
+    let actorId = '';
+    try {
+      actorId = asWhoami(await res.json()).actor.id;
+    } catch {
+      continue;
+    }
+    const byId = identities.find((i) => i.id === actorId);
+    const byName = identities.find((i) => i.name === name);
+    const va: VerifiedAgent = { name, actorId, identity: byId ?? byName };
+    if (byId) return { verified: va, sawSlot, sawRevoked };
+    if (verified === null) verified = va;
+  }
+  return { verified, sawSlot, sawRevoked };
+}
+
+/**
+ * The interactive prompt for setup, or the non-interactive guard. Returns
+ * `io.prompt` when injected; else, when stdin is a real TTY, the default
+ * readline prompt; else a `CliError` naming the two bypass flags — thrown BEFORE
+ * any mutation so a scripted/piped run never blocks or half-applies.
+ */
+function requirePrompt(io: CliIO): (question: string) => Promise<string> {
+  if (io.prompt) return io.prompt;
+  if (process.stdin.isTTY) return defaultPrompt;
+  throw new CliError(
+    'setup needs to ask which agent to use, but stdin is not interactive — pass ' +
+      '--new-agent <name> to create a new agent, or --replace-agent <name> to replace an existing one',
+  );
+}
+
+/**
+ * Prompt for an agent name (Flow A). Offers `sanitizeAgentName(hostname())` as a
+ * prefill an empty answer accepts; an invalid answer re-prompts once, then a
+ * `CliError`. The name is a SUGGESTION only — any valid label is accepted.
+ */
+async function promptAgentName(io: CliIO): Promise<string> {
+  const prompt = requirePrompt(io);
+  const prefill = sanitizeAgentName(hostname());
+  const question = prefill ? `Name this agent [${prefill}]: ` : 'Name this agent: ';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const raw = (await prompt(question)).trim();
+    const answer = raw === '' ? prefill : raw;
+    if (answer === '') {
+      io.err('an agent name is required');
+      continue;
+    }
+    try {
+      credentialSlot({ principal: 'agent', account: answer });
+      return answer;
+    } catch {
+      io.err(`invalid agent name '${answer}' — expected 1-64 chars matching [A-Za-z0-9][A-Za-z0-9._-]*`);
+    }
+  }
+  throw new CliError('no valid agent name provided');
+}
+
+/**
+ * Render the succession question (Flow B) and read a choice. The framing
+ * sentences are VERBATIM from the model doc; the radio glyphs become numbered
+ * terminal choices (the honest line-input adaptation). `[1]` = new installation;
+ * `[k]` = replace the (k-2)th non-disabled identity. Each Replace line shows the
+ * name, `last active <relative>`, and pools. Invalid input re-prompts once, then
+ * a `CliError`.
+ */
+async function promptSuccession(
+  io: CliIO,
+  identities: AgentIdentitySummary[],
+): Promise<{ kind: 'new' } | { kind: 'replace'; identity: AgentIdentitySummary }> {
+  const prompt = requirePrompt(io);
+  const candidates = identities.filter((i) => !i.disabled);
+  const now = nowMs();
+  const lines: string[] = [
+    'Is this a new installation, or does it replace an existing one?',
+    '',
+    '  [1] New installation → create a new agent',
+  ];
+  candidates.forEach((id, i) => {
+    const active = lastActiveMs(id);
+    const rel = formatLastActive(active === null ? null : now - active);
+    const pools = id.pools.length ? id.pools.join(', ') : '(none)';
+    lines.push(`  [${i + 2}] Replace: ${id.name}  last active ${rel} · pools: ${pools}`);
+  });
+  lines.push('');
+  lines.push('⚠ "Replace" revokes that agent\'s current credential. If it is still');
+  lines.push('  running somewhere, it will be disconnected there.');
+  lines.push('');
+  const max = candidates.length + 1;
+  const question = `${lines.join('\n')}\nChoose [1-${max}]: `;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const raw = (await prompt(attempt === 0 ? question : `Choose [1-${max}]: `)).trim();
+    const n = Number(raw);
+    if (Number.isInteger(n) && n >= 1 && n <= max) {
+      if (n === 1) return { kind: 'new' };
+      return { kind: 'replace', identity: candidates[n - 2]! };
+    }
+    io.err(`please enter a number between 1 and ${max}`);
+  }
+  throw new CliError('no valid choice provided');
+}
+
+/** Probe the Claude Code plugin state: is `claude` on PATH, and does `plugin list` mention owenloop? */
+function probePlugin(io: CliIO): { claudeFound: boolean; installed: boolean } {
+  if (!commandOnPath(io.env, 'claude')) return { claudeFound: false, installed: false };
+  const run = io.runCommand ?? defaultRunCommand;
+  try {
+    return { claudeFound: true, installed: run('claude', ['plugin', 'list']).stdout.includes('owenloop') };
+  } catch {
+    return { claudeFound: true, installed: false };
+  }
+}
+
+/**
+ * The plugin ACT step. While the marketplace is unpublished this PRINTS the
+ * manual install instructions instead of shelling out — the single seam a real
+ * shell-out install would replace later. Never fails setup.
+ */
+function installPluginStep(io: CliIO, state: { claudeFound: boolean; installed: boolean }): void {
+  if (!state.claudeFound) io.err('Claude Code (claude) not detected on PATH.');
+  io.err('Claude Code plugin — install manually:');
+  io.err('  claude plugin marketplace add owenloop');
+  io.err('  claude plugin install owenloop@owenloop');
+}
+
+/**
+ * `owenloop setup` — converge this machine's install in six probe→(skip|act)
+ * steps, idempotently: a second run performs ZERO writes (no store mutation, no
+ * settings write, no browser, no mint/rekey/register POST). Each ACT is reached
+ * only through its probe failing.
+ *
+ * Flags: `--hub <url>`; mutually-exclusive `--new-agent <name>` / `--replace-agent
+ * <name>` (bypass the interactive agent branches); `--pools <a,b>` (mint only —
+ * a usage error with `--replace-agent`, which preserves pools).
+ *
+ * Exit: 0 when every step ended skipped/done/noted AND doctor's core (non-plugin)
+ * checks pass; 1 otherwise. Any hard failure throws (mapped to an exit code by
+ * `mainAsync`).
+ */
+async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
+  // --- usage validation, before any I/O ---
+  const newAgent = last(args, 'new-agent');
+  const replaceAgent = last(args, 'replace-agent');
+  if (newAgent !== undefined && replaceAgent !== undefined) {
+    throw new CliError('pass at most one of --new-agent or --replace-agent, not both');
+  }
+  const poolsRaw = last(args, 'pools');
+  let pools: string[] | undefined;
+  if (poolsRaw !== undefined) {
+    pools = poolsRaw
+      .split(',')
+      .map((p) => p.trim())
+      .filter((p) => p !== '');
+    if (pools.length === 0) throw new CliError('--pools requires at least one pool name');
+  }
+  if (replaceAgent !== undefined && pools !== undefined) {
+    throw new CliError(
+      "--pools cannot be combined with --replace-agent — re-keying preserves the agent's pools (manage pools in the console)",
+    );
+  }
+  for (const [flagName, val] of [
+    ['--new-agent', newAgent],
+    ['--replace-agent', replaceAgent],
+  ] as const) {
+    if (val !== undefined) {
+      try {
+        credentialSlot({ principal: 'agent', account: val });
+      } catch (e) {
+        throw new CliError(`${flagName}: invalid agent name — ${(e as Error).message}`);
+      }
+    }
+  }
+
+  // Symmetric with `dispatchLogin`: when an external credential command supplies
+  // this hub's credentials, the local store is never consulted, so setup's
+  // human-login step (step 2, which opens the loopback OAuth browser) and its
+  // agent mint would strand keys nobody reads. Refuse BEFORE any browser opens —
+  // otherwise setup completes the full OAuth round-trip only to fail at
+  // storeCredential's backstop, wasting a browser trip on the flagship command.
+  if (externalCredentialCommand(io.env) !== undefined) {
+    throw new CliError(
+      'an external credential command is configured (OWENLOOP_CREDENTIAL_COMMAND), so it — not the ' +
+        'local store — supplies credentials for this hub; unset it to use `owenloop login`',
+    );
+  }
+
+  const origin = resolveSetupHub(io, args);
+  const steps: SetupStep[] = [];
+
+  // --- [1/6] inspect: zero writes, best-effort probes ---
+  io.err('[1/6] inspect');
+  io.err(`  human credential: ${readCredential(io, origin, { principal: 'human' }) !== null ? 'present' : 'none — will log in'}`);
+  const inspectSettingsPath = owenworkSettingsPath(io.env);
+  let settingsNote: string;
+  if (!existsSync(inspectSettingsPath)) {
+    settingsNote = 'missing — will write';
+  } else {
+    try {
+      const raw = readOwenworkSettingsRaw(inspectSettingsPath);
+      const found = raw && typeof raw.hubOrigin === 'string' ? raw.hubOrigin : undefined;
+      settingsNote = found === origin ? `hubOrigin already ${origin}` : `hubOrigin ${found ?? '(unset)'} — will update`;
+    } catch {
+      settingsNote = 'present but unreadable — step 4 will error if still corrupt';
+    }
+  }
+  io.err(`  owenwork settings: ${settingsNote}`);
+  io.err(`  claude on PATH: ${commandOnPath(io.env, 'claude') ? 'yes' : 'no'}`);
+  const inspectAccts = enumerateAgentAccounts(io, origin);
+  io.err(
+    inspectAccts === null
+      ? '  agent slots: checked in step 3'
+      : `  agent slots: ${inspectAccts.length ? inspectAccts.map((a) => `agent:${a}`).join(', ') : 'none'}`,
+  );
+  steps.push({ step: 'inspect', action: 'done', detail: 'probed local state' });
+
+  // --- [2/6] human login: the hard gate that makes step 3's rekey legal ---
+  io.err('[2/6] human login');
+  let humanCred = readCredential(io, origin, { principal: 'human' });
+  let humanIdentity: WhoamiIdentity;
+  if (humanCred !== null) {
+    try {
+      const verified = await verifyCredential(io, origin, { principal: 'human' }, humanCred);
+      humanCred = verified.cred;
+      humanIdentity = verified.identity;
+      io.err(`✓ human: ${humanIdentity.email ?? humanIdentity.actor.id} @ ${humanIdentity.orgName}`);
+      steps.push({ step: 'human login', action: 'skipped', detail: `${humanIdentity.email ?? humanIdentity.actor.id} @ ${humanIdentity.orgName}` });
+    } catch (e) {
+      if (!(e instanceof CliError)) throw e; // a genuine non-credential error is not a re-login trigger
+      const r = await runLoopbackOAuth(io, origin);
+      humanCred = r.cred;
+      humanIdentity = r.identity;
+      io.err(`✓ human: signed in as ${humanIdentity.email ?? humanIdentity.actor.id} @ ${humanIdentity.orgName}`);
+      steps.push({ step: 'human login', action: 'done', detail: `signed in as ${humanIdentity.email ?? humanIdentity.actor.id}` });
+    }
+  } else {
+    const r = await runLoopbackOAuth(io, origin);
+    humanCred = r.cred;
+    humanIdentity = r.identity;
+    io.err(`✓ human: signed in as ${humanIdentity.email ?? humanIdentity.actor.id} @ ${humanIdentity.orgName}`);
+    steps.push({ step: 'human login', action: 'done', detail: `signed in as ${humanIdentity.email ?? humanIdentity.actor.id}` });
+  }
+
+  // --- [3/6] agent ---
+  io.err('[3/6] agent');
+  const { res: idRes } = await authedGet(io, origin, { principal: 'human' }, humanCred, '/api/agent_identities');
+  if (idRes.status === 403) {
+    throw new CliError('setup needs an admin credential to manage agents (hub returned 403)');
+  }
+  assertAuthOk(idRes, humanCred, origin);
+  const identities = asAgentIdentities(await idRes.json());
+
+  const candidateNames = new Set<string>(identities.map((i) => i.name));
+  candidateNames.add('default');
+  const probe = await probeAgentSlots(io, origin, [...candidateNames], identities);
+
+  let agentAccount: string;
+  if (probe.verified !== null) {
+    agentAccount = probe.verified.name;
+    const poolsStr = probe.verified.identity ? ` (pools: ${probe.verified.identity.pools.join(', ') || 'none'})` : '';
+    io.err(`✓ agent: ${agentAccount}${poolsStr}`);
+    steps.push({ step: 'agent', action: 'skipped', detail: `agent:${agentAccount} verified` });
+  } else {
+    // ACT — resolve which agent to connect, then mint or rekey.
+    let action: { mode: 'mint'; name: string } | { mode: 'rekey'; agentId: string; name: string };
+    if (newAgent !== undefined) {
+      action = { mode: 'mint', name: newAgent };
+    } else if (replaceAgent !== undefined) {
+      const target = identities.find((i) => i.name === replaceAgent);
+      if (target === undefined) {
+        throw new CliError(
+          `no agent named '${replaceAgent}' on ${origin} — available: ${identities.map((i) => i.name).join(', ') || '(none)'}`,
+        );
+      }
+      action = { mode: 'rekey', agentId: target.id, name: replaceAgent };
+    } else if (identities.length === 0) {
+      // Flow A — fresh org, prompt for a name.
+      action = { mode: 'mint', name: await promptAgentName(io) };
+    } else {
+      // Flow B — succession.
+      const choice = await promptSuccession(io, identities);
+      action =
+        choice.kind === 'new'
+          ? { mode: 'mint', name: await promptAgentName(io) }
+          : { mode: 'rekey', agentId: choice.identity.id, name: choice.identity.name };
+    }
+
+    if (action.mode === 'mint') {
+      const result = await mintAgentCredential(io, origin, { principal: 'human' }, humanCred, { name: action.name, pools });
+      agentAccount = action.name;
+      io.err(`✓ agent: minted agent:${agentAccount} (pools: ${result.pools.join(', ') || 'none'})`);
+      steps.push({ step: 'agent', action: 'done', detail: `minted agent:${agentAccount}` });
+    } else {
+      const result = await rekeyAgentCredential(io, origin, { principal: 'human' }, humanCred, { agentId: action.agentId, name: action.name });
+      agentAccount = action.name;
+      io.err(`✓ agent: re-keyed agent:${agentAccount} (revoked ${result.revokedTokenIds.length} old token(s))`);
+      steps.push({ step: 'agent', action: 'done', detail: `re-keyed agent:${agentAccount}` });
+    }
+  }
+
+  // --- [4/6] owenwork settings ---
+  io.err('[4/6] owenwork settings');
+  const settingsPath = owenworkSettingsPath(io.env);
+  const existingSettings = readOwenworkSettingsRaw(settingsPath); // corrupt file → hard CliError (never clobber)
+  const currentHub = existingSettings && typeof existingSettings.hubOrigin === 'string' ? existingSettings.hubOrigin : undefined;
+  if (existingSettings !== null && currentHub === origin) {
+    io.err(`✓ owenwork settings: hubOrigin already ${origin}`);
+    steps.push({ step: 'owenwork settings', action: 'skipped', detail: settingsPath });
+  } else {
+    const written = writeOwenworkHubOrigin(io.env, origin);
+    io.err(`✓ owenwork settings: hubOrigin ${written.previous ?? '(unset)'} → ${origin}`);
+    steps.push({ step: 'owenwork settings', action: 'done', detail: `${written.previous ?? '(unset)'} → ${origin}` });
+  }
+  if (agentAccount !== 'default') {
+    io.err(`non-default agent account — run owenwork with OWENWORK_ACCOUNT=${agentAccount}`);
+  }
+
+  // --- [5/6] plugin (non-fatal) ---
+  io.err('[5/6] plugin');
+  const pluginState = probePlugin(io);
+  if (pluginState.installed) {
+    io.err('✓ plugin: owenloop installed');
+    steps.push({ step: 'plugin', action: 'skipped', detail: 'installed' });
+  } else {
+    installPluginStep(io, pluginState);
+    steps.push({
+      step: 'plugin',
+      action: 'noted',
+      detail: pluginState.claudeFound ? 'not installed — printed manual instructions' : 'claude not on PATH — printed manual instructions',
+    });
+  }
+
+  // --- [6/6] doctor pass ---
+  io.err('[6/6] doctor');
+  const doctor = await runDoctor(io, origin);
+
+  print(io, { ok: doctor.ok, hub: origin, steps, doctor: { ok: doctor.ok, checks: doctor.checks } });
+  return doctor.ok ? 0 : 1;
+}
+
+/**
+ * `owenloop doctor` — the read-only probe of the five install surfaces plus the
+ * plugin, rendering one distinct ✓/✗ line each. NO configuration writes (no
+ * mint, rekey, slot create/delete, settings write, or browser). The one
+ * carve-out: `authedGet`'s persist=true MAY rotate-and-persist an expiring human
+ * oauth token — as every authed verb does — because a refresh WITHOUT persisting
+ * would strand the rotated refresh token and corrupt the install (worse than a
+ * write). Tests use non-expiring tokens so the strict zero-write assertion holds.
+ */
+async function dispatchDoctor(io: CliIO, args: Args): Promise<number> {
+  const origin = resolveSetupHub(io, args);
+  const doctor = await runDoctor(io, origin);
+  print(io, { ok: doctor.ok, hub: origin, checks: doctor.checks });
+  return doctor.ok ? 0 : 1;
+}
+
+/**
+ * Run the six doctor checks in order, printing each ✓/✗ line to stderr and
+ * returning the structured result. Never short-circuits — a machine with no
+ * working human credential still renders lines 3–6 (the agent probe degrades
+ * honestly). `ok` reflects checks 1–5 only; the plugin check (6) renders but,
+ * while `PLUGIN_CHECK_FATAL` is false, never affects `ok`.
+ */
+async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
+  const checks: DoctorCheck[] = [];
+  let coreOk = true;
+  const record = (label: string, ok: boolean, detail: string, core: boolean): void => {
+    io.err(`${ok ? '✓' : '✗'} ${label}: ${detail}`);
+    checks.push({ label, ok, detail });
+    if (core && !ok) coreOk = false;
+  };
+
+  // 1. human slot
+  const humanCred = readCredential(io, origin, { principal: 'human' });
+  if (humanCred === null) {
+    record('human credential', false, `none stored for ${origin} — run owenloop setup (or owenloop login --hub ${origin})`, true);
+  } else {
+    record('human credential', true, 'present', true);
+  }
+
+  // 2. human plane
+  let humanOk = false;
+  let usableHumanCred: Credential | null = null;
+  if (humanCred !== null) {
+    try {
+      const { cred, identity } = await verifyCredential(io, origin, { principal: 'human' }, humanCred);
+      humanOk = true;
+      usableHumanCred = cred;
+      record('human plane', true, `${identity.email ?? identity.actor.id} @ ${identity.orgName}`, true);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/refresh/i.test(msg)) {
+        record('human plane', false, 'human credential present but irrecoverable (refresh failed) — run owenloop login', true);
+      } else if (/rejected by the hub|revoked or invalid/.test(msg)) {
+        record('human plane', false, 'human credential rejected by the hub — run owenloop login', true);
+      } else {
+        record('human plane', false, `could not reach the hub — ${msg}`, true);
+      }
+    }
+  } else {
+    record('human plane', false, 'not checked — no human credential to verify', true);
+  }
+
+  // Best-effort identities listing for the agent checks (soft: a 403/failure degrades, never throws).
+  let identities: AgentIdentitySummary[] = [];
+  let identitiesForbidden = false;
+  let identitiesAvailable = false;
+  if (humanOk && usableHumanCred !== null) {
+    try {
+      const { res } = await authedGet(io, origin, { principal: 'human' }, usableHumanCred, '/api/agent_identities');
+      if (res.status === 403) {
+        identitiesForbidden = true;
+      } else if (res.ok) {
+        identities = asAgentIdentities(await res.json());
+        identitiesAvailable = true;
+      }
+    } catch {
+      // leave degraded
+    }
+  }
+
+  // 3. agent slot (presence) + 4. agent plane (verification)
+  const candidateNames = new Set<string>(identities.map((i) => i.name));
+  const fileAccts = enumerateAgentAccounts(io, origin);
+  if (fileAccts !== null) for (const a of fileAccts) candidateNames.add(a);
+  candidateNames.add('default');
+  const agentProbe = await probeAgentSlots(io, origin, [...candidateNames], identities);
+
+  if (!agentProbe.sawSlot) {
+    if (!identitiesAvailable && !humanOk && fileAccts === null) {
+      record('agent slot', false, 'not probeable without a working human credential', true);
+    } else {
+      record('agent slot', false, `no agent credential stored for ${origin} — run owenloop setup`, true);
+    }
+    record('agent plane', false, 'no agent credential to verify — run owenloop setup', true);
+  } else {
+    record('agent slot', true, 'present', true);
+    if (agentProbe.verified !== null) {
+      const va = agentProbe.verified;
+      const pools = va.identity
+        ? `pools: ${va.identity.pools.join(', ') || 'none'}`
+        : identitiesForbidden
+          ? '(pools not visible — requires an admin credential)'
+          : '(pools unknown)';
+      const idPart = va.identity ? va.identity.id : va.actorId;
+      record('agent plane', true, `${va.name} (agent id ${idPart}) · ${pools}`, true);
+    } else if (agentProbe.sawRevoked) {
+      record('agent plane', false, 'agent token revoked or invalid — re-run owenloop setup (Replace) or Reconnect in the console', true);
+    } else {
+      record('agent plane', false, 'agent credential present but could not be verified against the hub', true);
+    }
+  }
+
+  // 5. owenwork settings
+  const settingsPath = owenworkSettingsPath(io.env);
+  let settingsRaw: Record<string, unknown> | null = null;
+  let settingsError: string | null = null;
+  try {
+    settingsRaw = readOwenworkSettingsRaw(settingsPath);
+  } catch (e) {
+    settingsError = e instanceof Error ? e.message : String(e);
+  }
+  if (settingsError !== null) {
+    record('owenwork settings', false, settingsError, true);
+  } else if (settingsRaw === null) {
+    record('owenwork settings', false, `missing (${settingsPath})`, true);
+  } else {
+    const found = typeof settingsRaw.hubOrigin === 'string' ? settingsRaw.hubOrigin : undefined;
+    if (found !== origin) {
+      record('owenwork settings', false, `hubOrigin is ${found ?? '(unset)'}, expected ${origin}`, true);
+    } else {
+      record('owenwork settings', true, settingsPath, true);
+    }
+  }
+
+  // 6. plugin (rendered; non-core while PLUGIN_CHECK_FATAL is false)
+  const pluginState = probePlugin(io);
+  if (!pluginState.claudeFound) {
+    record('plugin', false, 'Claude Code (claude) not on PATH', PLUGIN_CHECK_FATAL);
+  } else if (!pluginState.installed) {
+    record('plugin', false, 'plugin not installed — claude plugin marketplace add owenloop && claude plugin install owenloop@owenloop', PLUGIN_CHECK_FATAL);
+  } else {
+    record('plugin', true, 'owenloop installed', PLUGIN_CHECK_FATAL);
+  }
+
+  return { ok: coreOk, checks };
+}
+
 /**
  * Async entry point that adds network I/O for `add` and the hub commands on top
  * of the otherwise fully-synchronous engine/CLI (see the doc comment on
@@ -2760,7 +3518,7 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'mcp']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'setup', 'doctor', 'mcp']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   const args = parseArgs(argv);
@@ -2784,6 +3542,10 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchPush(io, args);
       case 'agent':
         return await dispatchAgent(io, args);
+      case 'setup':
+        return await dispatchSetup(io, args);
+      case 'doctor':
+        return await dispatchDoctor(io, args);
       case 'mcp':
         return await dispatchMcp(io, args);
       default:

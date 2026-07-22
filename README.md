@@ -375,6 +375,14 @@ hub's own def hashes, so an unchanged re-push is a no-op. `owenloop agent new
 `agent:<name>` without ever printing it. See the
 [Hub](docs/cli.md#hub-login--connect--push--logout) section in `docs/cli.md`.
 
+Setting up a machine from scratch? `owenloop setup` converges the whole install
+in one idempotent pass — human login, agent credential, owenwork settings, and
+the Claude Code plugin — so a re-run on an already-set-up machine writes
+nothing. `owenloop doctor` is its read-only counterpart: it checks each piece
+and prints a `✓`/`✗` line with the remedy. See
+[`setup`](docs/cli.md#setup--converge-a-machines-install) and
+[`doctor`](docs/cli.md#doctor--check-a-machines-install) in `docs/cli.md`.
+
 Driving the hub from an MCP host instead? `owenloop mcp` serves the hub control
 plane to a local MCP host (Claude Code) over stdio — MCP hosts spawn it, you
 don't run it yourself — authenticating as your logged-in human credential and

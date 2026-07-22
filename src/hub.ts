@@ -1042,6 +1042,141 @@ export function asMintAgentTokenOk(body: unknown): MintAgentTokenOk {
 }
 
 /**
+ * One agent identity as `GET /api/agent_identities` reports it — the fields the
+ * setup converger and the doctor probe consult. The row is non-secret: it names
+ * agents and their pools, never a token.
+ *
+ * `lastContactAt` is identity-level (overwritten on EVERY authenticated contact,
+ * `olp_` or `mcpat_`). `lastUsedAt` is the edge-computed max over the identity's
+ * `agent`-kind tokens INCLUDING revoked ones — it deliberately survives a rekey.
+ * Both are epoch-ms or `null`; the succession UI shows `max(non-null of the two)`
+ * (see `lastActiveMs`). `disabled` gates whether the identity is a live
+ * succession candidate.
+ */
+export interface AgentIdentitySummary {
+  id: string;
+  name: string;
+  disabled: boolean;
+  pools: string[];
+  lastContactAt: number | null;
+  lastUsedAt: number | null;
+}
+
+/**
+ * Narrow `GET /api/agent_identities`'s 200 body (`{identities: [...]}`) to a
+ * typed array. Throws on a malformed body (missing `identities` array, or a row
+ * missing `id`/`name`). Non-secret shape — the rows carry no token — so errors
+ * may name indices/fields freely. `lastContactAt`/`lastUsedAt` tolerate `null`
+ * or absence (→ `null`) but reject a present non-number; `pools` defaults to an
+ * empty array when absent, rejects a present non-array-of-strings; `disabled`
+ * defaults to `false`.
+ */
+export function asAgentIdentities(body: unknown): AgentIdentitySummary[] {
+  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).identities)) {
+    throw new Error('agent_identities: malformed response — expected an `identities` array');
+  }
+  const list = (body as Record<string, unknown>).identities as unknown[];
+  return list.map((entry, i) => {
+    if (typeof entry !== 'object' || entry === null) {
+      throw new Error(`agent_identities: malformed response — identities[${i}] is not an object`);
+    }
+    const e = entry as Record<string, unknown>;
+    if (typeof e.id !== 'string' || e.id === '') {
+      throw new Error(`agent_identities: malformed response — identities[${i}] missing non-empty string id`);
+    }
+    if (typeof e.name !== 'string' || e.name === '') {
+      throw new Error(`agent_identities: malformed response — identities[${i}] missing non-empty string name`);
+    }
+    const epochOrNull = (v: unknown, field: string): number | null => {
+      if (v === undefined || v === null) return null;
+      if (typeof v !== 'number') throw new Error(`agent_identities: malformed response — identities[${i}].${field} must be a number or null`);
+      return v;
+    };
+    let pools: string[] = [];
+    if (e.pools !== undefined) {
+      if (!Array.isArray(e.pools) || e.pools.some((p) => typeof p !== 'string')) {
+        throw new Error(`agent_identities: malformed response — identities[${i}].pools must be an array of strings`);
+      }
+      pools = e.pools as string[];
+    }
+    return {
+      id: e.id,
+      name: e.name,
+      disabled: e.disabled === true,
+      pools,
+      lastContactAt: epochOrNull(e.lastContactAt, 'lastContactAt'),
+      lastUsedAt: epochOrNull(e.lastUsedAt, 'lastUsedAt'),
+    };
+  });
+}
+
+/**
+ * Success shape of `POST /api/rekey_agent_token` — the whitelist a caller may
+ * keep. Sibling of `MintAgentTokenOk`, and MUST stay a whitelist for the same
+ * reason: the real 200 body carries a `text` field whose value CONTAINS the new
+ * one-time `olp_` plaintext, so a caller must never spread the raw body.
+ *
+ * Rekey has NO `pools` field (re-keying preserves the agent's existing pool
+ * membership — the verb changes none), so `MintAgentTokenOk`/`asMintAgentTokenOk`
+ * cannot be reused. `scopes` and `revokedTokenIds` are non-secret handles.
+ */
+export interface RekeyAgentTokenOk {
+  /** New token id — a non-secret revocation handle, safe to print. */
+  id: string;
+  /** The new one-time `olp_` plaintext. SECRET — store-only, never echoed. */
+  token: string;
+  /** The rekeyed agent's id — a non-secret handle, safe to print. */
+  agentId: string;
+  /** Ids of the tokens this rekey revoked — non-secret. */
+  revokedTokenIds: string[];
+  /** The new token's scopes — non-secret. */
+  scopes: string[];
+}
+
+/**
+ * Narrow a `POST /api/rekey_agent_token` 200 body to its typed success shape.
+ * Mirrors `asMintAgentTokenOk`'s discipline exactly: STRICT validation of the
+ * identity fields, and every error names the offending FIELD only — never a
+ * field VALUE — because a malformed body could still carry the `olp_` plaintext
+ * (in `text`, or a mistyped `token`), and echoing values would be the exact leak
+ * §6 forbids. `id`/`agentId` non-empty strings; `token` a non-empty string
+ * starting `olp_`; `revokedTokenIds`/`scopes` arrays of strings, each tolerated
+ * absent (→ empty array) but rejected if present-and-malformed.
+ */
+export function asRekeyAgentTokenOk(body: unknown): RekeyAgentTokenOk {
+  if (typeof body !== 'object' || body === null) {
+    throw new Error('rekey_agent_token: malformed success response — not an object');
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.id !== 'string' || b.id === '') {
+    throw new Error('rekey_agent_token: malformed success response — missing non-empty string id');
+  }
+  if (typeof b.agentId !== 'string' || b.agentId === '') {
+    throw new Error('rekey_agent_token: malformed success response — missing non-empty string agentId');
+  }
+  if (typeof b.token !== 'string' || b.token === '') {
+    throw new Error('rekey_agent_token: malformed success response — missing non-empty string token');
+  }
+  if (!b.token.startsWith('olp_')) {
+    throw new Error('rekey_agent_token: malformed success response — token is not an olp_ token');
+  }
+  const strArray = (v: unknown, field: string): string[] => {
+    if (v === undefined) return [];
+    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string')) {
+      throw new Error(`rekey_agent_token: malformed success response — ${field} must be an array of strings`);
+    }
+    return v as string[];
+  };
+  return {
+    id: b.id,
+    token: b.token,
+    agentId: b.agentId,
+    revokedTokenIds: strArray(b.revokedTokenIds, 'revokedTokenIds'),
+    scopes: strArray(b.scopes, 'scopes'),
+  };
+}
+
+/**
  * Parse `GET /api/workflows`'s body into a `name -> WorkflowSummary` map for
  * `computeServerDiff`. Throws a descriptive error (the caller wraps it in a
  * `CliError`) on a missing/malformed `workflows` array.
