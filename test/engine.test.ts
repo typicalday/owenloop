@@ -742,6 +742,51 @@ test('concurrency: a born-rejected (CAS-stale) run auto-releases its lease — n
   assert.equal(engine.green(wf, builder2.run, 'pr', { built: 'on v2' }).outcome, 'green');
 });
 
+test('concurrency: born-reject reasons distinguish absent-from-fingerprint vs moved-version', () => {
+  // ABSENT arm — mirror the real allGreen-with-consumes trap: an allGreen firing
+  // carries an empty claim fingerprint, but the step still declares consumes:,
+  // so requiredInputs demands a path that was never fingerprinted.
+  const trapped = def('trapped', [input('proposal')], [
+    step({ name: 'planner', consumes: ['proposal'], produces: ['plan'] }),
+    step({ name: 'evaluator', consumes: ['plan'], produces: ['outcome'], on: ['allGreen'] }),
+  ]);
+  const { engine: engine1, store: store1 } = makeEngine([trapped]);
+  const wf1 = engine1.createInstance('trapped');
+
+  complete(engine1, wf1, fire(engine1, wf1, 'planner', 1000), { plan: 'v1' });
+  const ev = fire(engine1, wf1, 'evaluator', 2000);
+  assert.deepEqual(ev.consumes, {}, 'allGreen firing carries no consumed input handles');
+
+  const res1 = engine1.green(wf1, ev.run, 'outcome', { done: true });
+  assert.equal(res1.outcome, 'born-rejected');
+  assert.match(res1.reason ?? '', /was not in the claim fingerprint/);
+  assert.doesNotMatch(res1.reason ?? '', /moved version/);
+
+  const stored1 = store1.getArtifact(wf1, 'outcome')?.reasons.at(-1);
+  assert.match(stored1?.text ?? '', /^born-rejected: plan was not in the claim fingerprint/);
+  assert.equal(stored1?.action, 'born-rejected');
+  assert.equal(stored1?.kind, 'structural');
+
+  // CHANGED arm — same shape as the stale-commit test above: the path WAS
+  // fingerprinted at claim time, but a concurrent commit moved it since.
+  const { engine: engine2, store: store2 } = makeEngine([delivery]);
+  const wf2 = engine2.createInstance('delivery');
+
+  complete(engine2, wf2, fire(engine2, wf2, 'planner', 1000), { plan: 'v1' });
+  const builder = fire(engine2, wf2, 'builder', 2000);
+  engine2.reject(wf2, 'plan', 'human', 'pivot');
+  complete(engine2, wf2, fire(engine2, wf2, 'planner', 2500), { plan: 'v2' });
+
+  const res2 = engine2.green(wf2, builder.run, 'pr', { built: 'on v1' });
+  assert.equal(res2.outcome, 'born-rejected');
+  assert.match(res2.reason ?? '', /moved version during this run/);
+  assert.match(res2.reason ?? '', /claimed v1, now v2/);
+  assert.doesNotMatch(res2.reason ?? '', /not in the claim fingerprint/);
+
+  const stored2 = store2.getArtifact(wf2, 'pr')?.reasons.at(-1);
+  assert.match(stored2?.text ?? '', /^born-rejected: plan moved version during this run/);
+});
+
 test('a reaped run cannot commit (lease check)', () => {
   const { engine } = makeEngine([delivery], { reapTtlMs: 100 });
   const wf = engine.createInstance('delivery');
