@@ -20,6 +20,13 @@ import type { CliIO, Keychain } from '../src/cli.ts';
 export interface RouteResult {
   status: number;
   json?: unknown;
+  /**
+   * Raw, un-serialized response body. When set it is written verbatim, bypassing
+   * `JSON.stringify` — the only way to model a response whose body is NOT valid
+   * JSON (e.g. a 200 that dumps a plaintext token instead of the expected object).
+   * Takes precedence over `json`.
+   */
+  raw?: string;
   headers?: Record<string, string>;
   /**
    * Escape hatch for streaming/oversized-body tests (realHttpServer only): when
@@ -92,7 +99,7 @@ export function routedFetch(routes: Record<string, RouteHandler>): {
     const r = handler({ url, body, method });
     if (r.stream) throw new Error(`routedFetch: stream routes require realHttpServer (${method} ${url.pathname})`);
     const headers = { 'Content-Type': 'application/json', ...(r.headers ?? {}) };
-    const payload = r.json === undefined ? '' : JSON.stringify(r.json);
+    const payload = r.raw !== undefined ? r.raw : r.json === undefined ? '' : JSON.stringify(r.json);
     return new Response(payload, { status: r.status, headers });
   }) as typeof globalThis.fetch;
   return { fetch: fetchFn, calls };
@@ -195,7 +202,7 @@ export async function realHttpServer(routes: Record<string, RouteHandler>): Prom
         return;
       }
       const headers = { 'Content-Type': 'application/json', ...(r.headers ?? {}) };
-      const payload = r.json === undefined ? '' : JSON.stringify(r.json);
+      const payload = r.raw !== undefined ? r.raw : r.json === undefined ? '' : JSON.stringify(r.json);
       res.writeHead(r.status, headers);
       res.end(payload);
     });

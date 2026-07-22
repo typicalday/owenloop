@@ -678,7 +678,16 @@ export async function mintAgentCredential(
   // 7. Narrow the 2xx body through the whitelisting guard. A malformed body could
   //    still carry the plaintext in `text`, so the guard's message names the
   //    FIELD only — rewrapped as a CliError to carry it verbatim.
-  const body = (await res.json()) as unknown;
+  //    `res.json()` itself is wrapped too: on a 200 whose body is NOT valid JSON,
+  //    V8's SyntaxError message embeds a verbatim snippet of the raw body — which
+  //    on THIS endpoint is the plaintext token. The thrown CliError message is a
+  //    FIXED string (never the parse-error message) so no body text can leak (§6).
+  let body: unknown;
+  try {
+    body = (await res.json()) as unknown;
+  } catch {
+    throw new CliError('mint_agent_token: malformed success response — body is not valid JSON');
+  }
   let ok;
   try {
     ok = asMintAgentTokenOk(body);

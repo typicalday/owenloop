@@ -327,6 +327,32 @@ test('agent new: a malformed 200 (missing token) is exit 1, names the field only
   assertNoTokenLeak(t);
 });
 
+test('agent new: a 200 whose body is NOT valid JSON is exit 1, names invalid-JSON only, leaks no body text, stores nothing', async () => {
+  // The success path is the one endpoint whose body carries the plaintext token.
+  // A 200 with a raw, non-JSON body (a proxy/truncation quirk, or a hub bug that
+  // dumps the token as text) makes `res.json()` throw a V8 SyntaxError whose
+  // message embeds a verbatim snippet of that body — the token. The mint code
+  // must wrap the parse and throw a FIXED string, never the parse-error message.
+  const { fetch } = routedFetch({
+    'POST /api/mint_agent_token': () => ({
+      status: 200,
+      // Raw text body (not JSON) that literally contains the token.
+      raw: `Store this secret now — it will not be shown again:\n${TOKEN}`,
+    }),
+  });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['agent', 'new', 'codex', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  const err = t.err.join('\n');
+  assert.match(err, /malformed success response — body is not valid JSON/);
+  // The V8 parse-error snippet must NOT surface — only the fixed message above.
+  assert.doesNotMatch(err, /Unexpected token/);
+  assert.equal(t.store.get(kcKey(ORIGIN, 'agent:codex')), undefined, 'nothing stored');
+  assertNoTokenLeak(t);
+});
+
 // ---- keychain write failure AFTER a successful mint ------------------------
 
 test('agent new: a keychain write failure after a successful mint is exit 1 (minted-but-unstored), no token leak', async () => {
