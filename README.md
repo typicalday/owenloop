@@ -434,6 +434,12 @@ since. The changes that need operator or embedder attention:
   `OWENLOOP_CREDENTIAL_COMMAND` instead supplies the credential from a command
   of your own (a secret manager, or any host without a keychain); it takes
   precedence over both stores and fails loudly rather than falling back.
+  Embedders can now read, write, and refresh a hub credential programmatically
+  through the package's exported credential surface (`readStoredCredential`,
+  `storeCredential`, `deleteCredential`, `ensureFreshOAuth`, `CredentialIO`);
+  concurrent OAuth refreshes are serialized by a `credentials.lock` file so a
+  token rotation can't clobber a fresher one — see
+  [What's exported](docs/embedding.md#whats-exported).
 - **Max-lease cap is now opt-in.** There is no default lease ceiling; anyone who
   relied on the brief post-0.2.1 default cap must set `maxLeaseMs` (or a
   per-step `maxLease`) explicitly.
