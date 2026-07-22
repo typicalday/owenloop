@@ -1668,7 +1668,7 @@ export class Engine {
       const req = requiredInputs(def, arts, art);
       const cas = this.casCheck(arts, req, r.fingerprint ?? {});
       if (cas.moved) {
-        this.bornReject(art, cas.moved);
+        this.bornReject(art, cas.moved, cas.reason);
         this.releaseLeaseOnBornReject(workflow, run);
         this.settle(workflow, def);
         return { path, outcome: 'born-rejected', reason: cas.reason };
@@ -1751,7 +1751,7 @@ export class Engine {
       const cas = this.casCheck(arts, req, r.fingerprint ?? {});
       if (cas.moved) {
         const seal = arts.get(sealPath(stem));
-        if (seal) this.bornReject(seal, cas.moved);
+        if (seal) this.bornReject(seal, cas.moved, cas.reason);
         this.releaseLeaseOnBornReject(workflow, run);
         this.settle(workflow, def);
         return { outcome: 'born-rejected', created: [], reason: cas.reason };
@@ -1846,7 +1846,7 @@ export class Engine {
       const req = plainConsumes(step).map((c) => c.stem);
       const cas = this.casCheck(arts, req, r.fingerprint ?? {});
       if (cas.moved) {
-        this.bornReject(sealArt, cas.moved);
+        this.bornReject(sealArt, cas.moved, cas.reason);
         this.releaseLeaseOnBornReject(workflow, run);
         this.settle(workflow, def);
         return { path: sealP, outcome: 'born-rejected', reason: cas.reason };
@@ -2655,13 +2655,13 @@ export class Engine {
     }
   }
 
-  private bornReject(art: ArtifactData, movedPath: string): void {
+  private bornReject(art: ArtifactData, movedPath: string, reasonText?: string): void {
     this.store.putArtifact({
       ...art,
       acceptance: 'rejected',
       reasons: [
         ...art.reasons,
-        reason('born-rejected', 'structural', 'engine', `born-rejected: ${movedPath} moved during this run`, art.version),
+        reason('born-rejected', 'structural', 'engine', `born-rejected: ${reasonText ?? `${movedPath} moved during this run`}`, art.version),
       ],
     });
   }
@@ -2677,7 +2677,16 @@ export class Engine {
     }
     if (!fingerprintMatches(arts, req, fp)) {
       const moved = req.find((p) => (arts.get(p)?.version ?? -1) !== fp[p]) ?? req[0] ?? 'inputs';
-      return { moved, reason: `${moved} moved version during this run` };
+      // Two structurally different causes share this branch: (a) ABSENT — the path
+      // was never in the claim fingerprint at all (e.g. an allGreen/idle firing whose
+      // inputs: [] yields fp={}, but the step still declares consumes:), so there is
+      // no claimed version to have "moved" from; (b) CHANGED — the path WAS
+      // fingerprinted but a concurrent commit moved it since claim. Keep the wording
+      // distinct so the diagnostic doesn't lie about case (a).
+      if (fp[moved] === undefined) {
+        return { moved, reason: `${moved} was not in the claim fingerprint (this firing carried no input version for it)` };
+      }
+      return { moved, reason: `${moved} moved version during this run (claimed v${fp[moved]}, now v${arts.get(moved)?.version ?? -1})` };
     }
     return {};
   }
