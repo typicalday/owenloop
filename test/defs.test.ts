@@ -442,6 +442,33 @@ test('validateDef flags a per-element produce with no map consume to bind it', (
   assert.ok(errors.some((e) => e.includes('no map ($i) consume to bind it')), errors.join('; '));
 });
 
+test('validateDef flags a reduce-mode step that produces only collections (silently dead)', () => {
+  const errors = validateDef(buildDef({
+    name: 'bad',
+    inputs: [{ name: 'q' }],
+    steps: [
+      { name: 'gather', consumes: ['q'], produces: ['set[]'] },
+      { name: 'synth', consumes: ['set[*]'], produces: ['out[]'] },
+    ],
+  }));
+  assert.ok(
+    errors.some((e) => e.includes('step synth is reduce-mode but produces only collections; reduce steps can only discharge singleton produces')),
+    errors.join('; '),
+  );
+});
+
+test('validateDef does not flag a reduce-mode step that produces a singleton', () => {
+  const errors = validateDef(buildDef({
+    name: 'ok',
+    inputs: [{ name: 'q' }],
+    steps: [
+      { name: 'gather', consumes: ['q'], produces: ['set[]'] },
+      { name: 'synth', consumes: ['set[*]'], produces: ['summary'] },
+    ],
+  }));
+  assert.ok(!errors.some((e) => e.includes('is reduce-mode but produces only collections')), errors.join('; '));
+});
+
 test('parseDef attaches a JSON Schema to a produce given as { name, schema }', () => {
   const def = parseDef({
     name: 'schemad',
@@ -1727,6 +1754,49 @@ test('parseDef: on: [allGreen, idle] with idleAfter is valid', () => {
   });
   assert.deepEqual(d.steps[1]!.on, ['allGreen', 'idle']);
   assert.equal(d.steps[1]!.idleAfterMs, 2 * 60 * 60 * 1000);
+});
+
+// (f12) on: ['allGreen'] with consumes → validateDef error (firing can never commit)
+test('validateDef flags an allGreen evaluator step that declares consumes', () => {
+  const errors = validateDef(buildDef({
+    name: 'bad',
+    inputs: [{ name: 'seed' }],
+    steps: [
+      { name: 'eval', on: ['allGreen'], consumes: ['seed'], produces: ['out'] },
+    ],
+  }));
+  assert.ok(
+    errors.some((e) => e.includes('evaluator step eval (on: allGreen/idle) must not declare consumes; its firings carry no input fingerprint')),
+    errors.join('; '),
+  );
+});
+
+// (f13) on: ['idle'] with consumes → validateDef error (firing can never commit)
+test('validateDef flags an idle evaluator step that declares consumes', () => {
+  const errors = validateDef(buildDef({
+    name: 'bad',
+    inputs: [{ name: 'seed' }],
+    steps: [
+      { name: 'eval', on: ['idle'], idleAfter: '1h', consumes: ['seed'], produces: ['out'] },
+    ],
+  }));
+  assert.ok(
+    errors.some((e) => e.includes('evaluator step eval (on: allGreen/idle) must not declare consumes; its firings carry no input fingerprint')),
+    errors.join('; '),
+  );
+});
+
+// (f14) correct evaluator (on: allGreen, generates:, no consumes) → no error
+test('validateDef does not flag a correct evaluator with generates: and no consumes', () => {
+  const errors = validateDef(buildDef({
+    name: 'ok',
+    inputs: [{ name: 'seed' }],
+    steps: [
+      { name: 'planner', consumes: ['seed'], produces: ['plan'] },
+      { name: 'eval', on: ['allGreen'], generates: ['outcome'], consumes: [], body: '' },
+    ],
+  }));
+  assert.ok(!errors.some((e) => e.includes('must not declare consumes')), errors.join('; '));
 });
 
 // (f11) on: ['unknown_token'] → hard DefError from buildStep (unchanged)
