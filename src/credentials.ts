@@ -25,6 +25,7 @@
 
 import { join } from 'node:path';
 import {
+  asMintAgentTokenOk,
   configDir,
   credentialBackend,
   credentialFilePath,
@@ -552,4 +553,158 @@ export async function refreshOAuth(
   } finally {
     releaseFileLock(handle);
   }
+}
+
+// ---- agent minting ---------------------------------------------------------
+
+/**
+ * The result of `mintAgentCredential`. Deliberately carries NO token field —
+ * only non-secret handles the caller may print. The minted `olp_` plaintext is
+ * written to the credential store inside `mintAgentCredential` and never leaves
+ * it, so no caller can leak what it never received (§6 "rule of gates").
+ */
+export interface MintAgentResult {
+  /** Token id — a non-secret revocation handle. */
+  id: string;
+  /** The minted agent's id — a non-secret handle. */
+  agentId: string;
+  /** Resolved pool NAMES from the server. */
+  pools: string[];
+  /** Which local backend the token landed in. */
+  storage: 'keychain' | 'file';
+}
+
+/**
+ * Mint a new agent identity on `origin` as the human `cred` and persist the
+ * returned `olp_` token to slot `agent:<name>`. CLI-free (no `Args`, no exit
+ * codes — the caller maps failures to exit codes) so both `owenloop agent new`
+ * (O3) and `owenloop mcp`'s `create_agent` (O2) can reuse it.
+ *
+ * **The token NEVER leaves this function.** It flows exactly one hop —
+ * `asMintAgentTokenOk(body).token` → `storeCredential` — and is never returned,
+ * thrown, logged, or embedded in any message (identity model §6). The returned
+ * `MintAgentResult` structurally omits it. The hub's 4xx `message` (e.g. H1's
+ * `agent name already taken: "…"`) is surfaced verbatim via `CliError`; a
+ * malformed 2xx names the offending FIELD only, never a value.
+ *
+ * Order is load-bearing (PR #69 lesson): the client-side name check and the
+ * external-command refusal both run BEFORE any network call. Refusing only at
+ * `storeCredential` time would mint a server-side token that can never be stored
+ * locally — permanently burning the agent name (re-running refuses "taken").
+ *
+ * @param humanSlot the slot `cred` was read from (always `{principal:'human'}`
+ *   today; explicit for symmetry with the store/refresh signatures).
+ * @param params.scopes defaults to `['work']` — the H3 route REQUIRES a
+ *   non-empty `scopes`; an empty list is server-refused.
+ * @param params.pools omitted when absent so the server defaults to the minter's
+ *   personal pool (`pools: []` is server-refused with `pool_invalid`).
+ */
+export async function mintAgentCredential(
+  io: CredentialIO,
+  origin: string,
+  humanSlot: CredentialSlotSelector,
+  cred: Credential,
+  params: { name: string; pools?: string[]; scopes?: string[] },
+): Promise<MintAgentResult> {
+  // 1. Validate the agent name before any I/O. The client regex is byte-identical
+  //    to the server's, so this can never mask a server-side "invalid name" —
+  //    only "taken" is left to the server. Throws on an invalid name.
+  credentialSlot({ principal: 'agent', account: params.name });
+
+  // 2. Refuse an external-command setup BEFORE the network call. In that mode the
+  //    command — not the local store — is authoritative, so a minted token could
+  //    never be stored; minting first would burn the name. Same wording as
+  //    `storeCredential`'s refusal.
+  if (externalCredentialCommand(io.env) !== undefined) {
+    throw new CliError(
+      'an external credential command is configured (OWENLOOP_CREDENTIAL_COMMAND), so it — not the ' +
+        'local store — supplies credentials for this hub; unset it to use `owenloop login`',
+    );
+  }
+
+  // 3. Freshen the human oauth bearer (persist=true: a rotated refresh token must
+  //    land in the store). No-op for oauth-pasted / agent kinds.
+  let current = await ensureFreshOAuth(io, origin, humanSlot, cred);
+
+  const scopes = params.scopes ?? ['work'];
+  const doPost = (bearer: Credential): Promise<Response> =>
+    hubFetch(io, resolveEndpoint(origin, '/api/mint_agent_token'), {
+      method: 'POST',
+      headers: {
+        Authorization: authHeader(bearer),
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      // `pools` omitted entirely when absent (server default = personal pool);
+      // never sent as `[]` (server-refused).
+      body: JSON.stringify({
+        name: params.name,
+        scopes,
+        ...(params.pools !== undefined ? { pools: params.pools } : {}),
+      }),
+    });
+
+  // 4 + 5. POST; on a 401 with an oauth credential, refresh once and retry once —
+  //         the exact `authedGet`/`dispatchPush` pattern.
+  let res = await doPost(current);
+  if (res.status === 401 && current.kind === 'oauth') {
+    current = await refreshOAuth(io, origin, humanSlot, current as Extract<Credential, { kind: 'oauth' }>);
+    res = await doPost(current);
+  }
+  if (res.status === 401) {
+    // A second 401 (or a non-oauth credential the hub rejected) is a hard
+    // "credential rejected" — the human slot never holds an agent kind, so the
+    // agent-token wording cannot apply here.
+    throw new CliError('credential rejected by the hub — run `owenloop login`');
+  }
+
+  // 6. Any other non-2xx: surface the hub's typed `message` VERBATIM (this is how
+  //    H1's `agent name already taken: "…"`, `pool_invalid`, `bad_request`, and
+  //    `forbidden` all surface uniformly). Never include raw body text.
+  if (!res.ok) {
+    let message: string | undefined;
+    try {
+      const errBody = (await res.json()) as unknown;
+      if (typeof errBody === 'object' && errBody !== null) {
+        const m = (errBody as Record<string, unknown>).message;
+        if (typeof m === 'string' && m !== '') message = m;
+      }
+    } catch {
+      // Non-JSON body — fall through to the generic status message.
+    }
+    throw new CliError(message ?? `hub ${origin} rejected the mint (HTTP ${res.status})`);
+  }
+
+  // 7. Narrow the 2xx body through the whitelisting guard. A malformed body could
+  //    still carry the plaintext in `text`, so the guard's message names the
+  //    FIELD only — rewrapped as a CliError to carry it verbatim.
+  const body = (await res.json()) as unknown;
+  let ok;
+  try {
+    ok = asMintAgentTokenOk(body);
+  } catch (e) {
+    throw new CliError((e as Error).message);
+  }
+
+  // 8. Store the token — its only hop out of this function. On a keychain write
+  //    failure the token was ALREADY minted server-side and is now unrecoverable
+  //    locally; report that honestly. NEVER print the token as a fallback (§6).
+  let storage: 'keychain' | 'file';
+  try {
+    storage = await storeCredential(
+      io,
+      origin,
+      { principal: 'agent', account: params.name },
+      { kind: 'agent', accessToken: ok.token },
+    );
+  } catch (e) {
+    throw new CliError(
+      `the agent token was minted but could not be stored locally: ${(e as Error).message}. ` +
+        `The agent '${params.name}' now exists on the hub — recover via the console (Reconnect/re-key) ` +
+        `once storage works; re-running \`agent new ${params.name}\` will refuse the taken name`,
+    );
+  }
+
+  // 9. Return non-secret handles only — no token field exists to leak.
+  return { id: ok.id, agentId: ok.agentId, pools: ok.pools, storage };
 }

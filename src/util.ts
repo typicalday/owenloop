@@ -13,8 +13,21 @@ import { lstatSync, mkdirSync } from 'node:fs';
  * NOT re-exported from the package barrel (`src/index.ts`): it was module-private
  * before, and the credential-write PR does not widen the public API beyond the
  * functions the proposal names.
+ *
+ * `exitCode` lets a specific failure map to a distinct process exit status
+ * (consumed by both entry-point catches in `cli.ts`). It defaults to `1`, so
+ * every existing `new CliError(msg)` — and `RateLimitError extends CliError`,
+ * which inherits this constructor — keeps its byte-for-byte exit-1 behavior. The
+ * non-default codes today are `agent new`'s exit 2 (hub unresolvable) and exit 3
+ * (human credential absent/irrecoverable).
  */
-export class CliError extends Error {}
+export class CliError extends Error {
+  readonly exitCode: number;
+  constructor(message: string, opts?: { exitCode?: number }) {
+    super(message);
+    this.exitCode = opts?.exitCode ?? 1;
+  }
+}
 
 /**
  * `mkdir -p` for a project-state directory (e.g. `.owenloop`), refusing to

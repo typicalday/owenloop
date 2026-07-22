@@ -14,6 +14,7 @@ import { dirname, join } from 'node:path';
 import { parse as parseYamlText } from 'yaml';
 import {
   asCreateWorkflowOk,
+  asMintAgentTokenOk,
   asWhoami,
   base64url,
   computeServerDiff,
@@ -22,6 +23,7 @@ import {
   credentialFilePath,
   hashDefForHub,
   hubBindingPath,
+  listStoredHubOrigins,
   normalizeOrigin,
   parseWorkflowList,
   pkcePair,
@@ -406,6 +408,76 @@ test('asWhoami: narrows a well-formed body, defaults missing optional fields', (
 test('asWhoami: throws on a missing orgId or non-object body', () => {
   assert.throws(() => asWhoami({}), /missing string orgId/);
   assert.throws(() => asWhoami('nope'), /unexpected response shape/);
+});
+
+// ---- mint_agent_token response guard (whitelist; token hygiene) ------------
+
+test('asMintAgentTokenOk: narrows a well-formed body to the whitelisted fields only', () => {
+  const ok = asMintAgentTokenOk({
+    // The real server also carries the plaintext in `text` and extra fields like
+    // poolIds — none of which must survive the narrow.
+    text: 'Store this secret now — it will not be shown again:\nolp_secret',
+    id: 'tok_1',
+    token: 'olp_secret',
+    agentId: 'agent_1',
+    pools: ['personal-alex'],
+    poolIds: ['pool_1'],
+  });
+  assert.deepEqual(ok, { id: 'tok_1', token: 'olp_secret', agentId: 'agent_1', pools: ['personal-alex'] });
+  // No `text`/`poolIds` leaked through the whitelist.
+  assert.equal((ok as unknown as Record<string, unknown>).text, undefined);
+  assert.equal((ok as unknown as Record<string, unknown>).poolIds, undefined);
+});
+
+test('asMintAgentTokenOk: empty pools array is allowed defensively', () => {
+  const ok = asMintAgentTokenOk({ id: 'tok_1', token: 'olp_x', agentId: 'a', pools: [] });
+  assert.deepEqual(ok.pools, []);
+});
+
+test('asMintAgentTokenOk: a malformed body throws NAMING THE FIELD ONLY, never echoing a value', () => {
+  // Each malformed field is rejected; the token value is never echoed in the message.
+  const cases: [unknown, RegExp][] = [
+    ['nope', /not an object/],
+    [{ token: 'olp_x', agentId: 'a', pools: [] }, /missing non-empty string id/],
+    [{ id: '', token: 'olp_x', agentId: 'a', pools: [] }, /missing non-empty string id/],
+    [{ id: 'tok_1', token: 'olp_x', pools: [] }, /missing non-empty string agentId/],
+    [{ id: 'tok_1', token: '', agentId: 'a', pools: [] }, /missing non-empty string token/],
+    [{ id: 'tok_1', agentId: 'a', pools: [] }, /missing non-empty string token/],
+    [{ id: 'tok_1', token: 'sk-live-notolp', agentId: 'a', pools: [] }, /not an olp_ token/],
+    [{ id: 'tok_1', token: 'olp_x', agentId: 'a' }, /pools must be an array of strings/],
+    [{ id: 'tok_1', token: 'olp_x', agentId: 'a', pools: [1, 2] }, /pools must be an array of strings/],
+  ];
+  for (const [body, re] of cases) {
+    assert.throws(() => asMintAgentTokenOk(body), re);
+    // The non-olp_ value must never appear verbatim in the thrown message.
+    try {
+      asMintAgentTokenOk(body);
+    } catch (e) {
+      assert.doesNotMatch((e as Error).message, /sk-live-notolp/);
+    }
+  }
+});
+
+// ---- listStoredHubOrigins — file-store origin enumeration ------------------
+
+test('listStoredHubOrigins: missing file → [], v2 file → its origin keys, non-v2 → []', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-origins-'));
+  const env = { HOME: home };
+  // Missing credentials.json.
+  assert.deepEqual(listStoredHubOrigins(env), []);
+  // v2 with two origins.
+  const path = credentialFilePath(env);
+  writeCredentialFile(path, {
+    version: 2,
+    hubs: {
+      'https://a.example': { human: { kind: 'agent', accessToken: 'x' } },
+      'https://b.example': { human: { kind: 'agent', accessToken: 'y' } },
+    },
+  });
+  assert.deepEqual(listStoredHubOrigins(env).sort(), ['https://a.example', 'https://b.example']);
+  // A non-v2 file reads as an empty store (old keying is invisible).
+  writeFileSync(path, JSON.stringify({ version: 1, hubs: { 'https://c.example': {} } }));
+  assert.deepEqual(listStoredHubOrigins(env), []);
 });
 
 // ---- workflow list response guard -----------------------------------------
