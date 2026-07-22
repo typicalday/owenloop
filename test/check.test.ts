@@ -22,8 +22,8 @@ import type { Order } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import { applyOutcome, eligibleFirings, evalInvariantPredicate, settleInMemory, modelCheck, workflowStatus } from '../src/model.ts';
 import { validateDef } from '../src/defs.ts';
-import { main } from '../src/cli.ts';
-import type { ArtifactData, CheckStep, InvariantDef, InvariantPredicate, WorkflowDef } from '../src/types.ts';
+import { hasDefiniteCheckDefect, main } from '../src/cli.ts';
+import type { ArtifactData, CheckReport, CheckStep, InvariantDef, InvariantPredicate, WorkflowDef } from '../src/types.ts';
 import { def, input, step } from './helpers.ts';
 
 // ---- shared workflow definitions (same as engine.test.ts) --------------------
@@ -571,6 +571,69 @@ test('modelCheck: a structurally-dead step in an otherwise-completable, exhausti
   assert.equal(report.completable, true, 'precision-map should still be completable (fanout/mapper complete the workflow)');
   assert.equal(report.bounded, false, 'small def should be exhausted, not bounded');
   assert.ok(report.structurallyDeadSteps.includes('reducer'), 'the structural defect is reported regardless of overall completability');
+});
+
+// A minimal but fully-shaped CheckReport builder for hasDefiniteCheckDefect
+// unit tests — only the fields the predicate reads vary per case; the rest
+// are fixed to their "clean" defaults.
+function baseReport(overrides: Partial<CheckReport>): CheckReport {
+  return {
+    def: 'x',
+    bounded: false,
+    boundsHit: [],
+    deadlocks: [],
+    stallStates: [],
+    stuck: [],
+    completable: true,
+    structurallyDeadSteps: [],
+    unreachedSteps: [],
+    invariantViolations: [],
+    stats: { statesExplored: 0, depthReached: 0 },
+    ...overrides,
+  };
+}
+
+test('hasDefiniteCheckDefect: unit predicate agrees for all three commands', () => {
+  // structurally-dead-only → true (this is exactly the #77 residual gap: add/push
+  // used to omit this term while check included it)
+  assert.equal(
+    hasDefiniteCheckDefect(baseReport({ structurallyDeadSteps: ['x'], bounded: false })),
+    true,
+    'a structurally-dead step alone is a definite defect',
+  );
+
+  // unreached-only → false: unreachedSteps must NEVER trip the predicate, it is a
+  // bounds artifact ("raise --max-states/--max-depth"), not a definite defect.
+  assert.equal(
+    hasDefiniteCheckDefect(baseReport({ unreachedSteps: ['x'], bounded: true })),
+    false,
+    'unreached-within-bounds alone must never be a definite defect',
+  );
+
+  // invariant-only → true
+  assert.equal(
+    hasDefiniteCheckDefect(baseReport({ invariantViolations: [{ invariant: 'inv', path: [] }] })),
+    true,
+    'an invariant violation alone is a definite defect',
+  );
+
+  // deadlock while bounded (search truncated) → false: a tight maxCollectionSize
+  // cap can manufacture a spurious no-moves state, so a deadlock only counts
+  // when the search was exhaustive.
+  assert.equal(
+    hasDefiniteCheckDefect(baseReport({ deadlocks: [{ path: [] }], bounded: true })),
+    false,
+    'a deadlock found only under bounded search is not yet definite',
+  );
+  // same deadlock while NOT bounded (exhaustive search) → true
+  assert.equal(
+    hasDefiniteCheckDefect(baseReport({ deadlocks: [{ path: [] }], bounded: false })),
+    true,
+    'a deadlock found under an exhaustive search is a definite defect',
+  );
+
+  // all-empty clean report → false
+  assert.equal(hasDefiniteCheckDefect(baseReport({})), false, 'a clean report with no findings is not a definite defect');
 });
 
 test('modelCheck: bounded flag and boundsHit', () => {

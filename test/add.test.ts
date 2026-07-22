@@ -280,6 +280,131 @@ test('add: a def that fails validation refuses the whole add — nothing written
 });
 
 /**
+ * Regression fixture for the structurallyDeadSteps divergence: `add`'s
+ * definite-defect predicate omitted the `structurallyDeadSteps` term that
+ * `check` has always included, so a validateDef-missed structurally-dead step
+ * (a reduce step whose `produces: []` discharges nothing, so it can NEVER
+ * fire under any bounds — see test/check.test.ts's `precision-map` fixture)
+ * was never reported as a structurally-dead defect by `add`'s message, even
+ * when `add` happened to reject the def anyway (this exact fixture also trips
+ * an unrelated true-deadlock elsewhere in its reachable state graph, so the
+ * OLD predicate's `deadlocks` term coincidentally still exits 1 — see
+ * modelCheck's report on this def: bounded=false, deadlocks.length=130,
+ * structurallyDeadSteps=['reducer']). What this test actually proves: the
+ * error message/classification now correctly names the real defect
+ * (`1 structurally dead step`) instead of only the incidental deadlock count
+ * — pre-fix, `/structurally dead step/` never appears in `add`'s output for
+ * this def; post-fix it does, matching `check`'s wording exactly. Both must
+ * now agree via the shared `hasDefiniteCheckDefect`.
+ */
+function precisionMapDefYaml(name: string): string {
+  return [
+    `name: ${name}`,
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: false',
+    'steps:',
+    '  - name: fanout',
+    '    consumes: [seed]',
+    '    produces: ["items[]"]',
+    '    body: fan out',
+    '  - name: mapper',
+    '    consumes: ["items[$i]"]',
+    '    produces: ["items[$i].checked"]',
+    '    body: check item',
+    '  - name: reducer',
+    '    consumes: ["items[*].checked"]',
+    '    produces: []',
+    '    body: reduce (produces nothing — can never fire)',
+    '',
+  ].join('\n');
+}
+
+test('add: a def with a validateDef-missed structurally-dead step is REJECTED (mirrors check)', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
+    'workflows/precision-map.yaml': precisionMapDefYaml('precision-map'),
+  });
+  const { fetch } = fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  });
+  const { io, cwd, err } = makeIo(fetch);
+
+  const code = await mainAsync(['add', `${owner}/${repo}`], io);
+  assert.equal(code, 1, 'a structurally-dead step must refuse the add, mirroring check');
+  const errText = err.join('\n');
+  assert.match(errText, /refusing to install/);
+  assert.match(errText, /definite defects found/);
+  assert.match(errText, /1 structurally dead step/);
+
+  const installedFile = join(cwd, 'workflows', installFolder(owner, repo), 'precision-map.yaml');
+  assert.ok(!existsSync(installedFile), 'the structurally-dead def must not be installed');
+});
+
+/**
+ * A SECOND, minimal structurally-dead fixture with no incidental true
+ * deadlocks anywhere else in its reachable state graph (unlike precision-map
+ * above, whose extra `mapper` step happens to also produce 130 unrelated true
+ * deadlocks) — `fanout` produces `items[]` and `reducer` is the sole consumer,
+ * discharging nothing (`produces: []`). modelCheck on this def reports
+ * bounded=false, deadlocks=[], invariantViolations=[], structurallyDeadSteps=
+ * ['reducer']. This isolates the EXACT #77 residual gap: pre-fix, `add`'s
+ * predicate (invariantViolations>0 || (!bounded && deadlocks>0)) evaluates to
+ * FALSE for this report — nothing else trips it — so `add` installed this
+ * broken def cleanly at exit 0, in direct contradiction with `owenloop check`
+ * exiting 1 on the identical def. THIS TEST FAILS PRE-FIX (installs at exit 0)
+ * and PASSES POST-FIX (rejects at exit 1) — see the precision-map test above
+ * for why THAT fixture's pre/post-fix delta is message-only, not accept/reject.
+ */
+function deadReduceDefYaml(name: string): string {
+  return [
+    `name: ${name}`,
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: false',
+    'steps:',
+    '  - name: fanout',
+    '    consumes: [seed]',
+    '    produces: ["items[]"]',
+    '    body: fan out',
+    '    maxSchemaFailures: 0',
+    '  - name: reducer',
+    '    consumes: ["items[*]"]',
+    '    produces: []',
+    '    body: reduce (produces nothing — can never fire)',
+    '    maxSchemaFailures: 0',
+    '',
+  ].join('\n');
+}
+
+test('add: a minimal, incident-free structurally-dead step is REJECTED (the exact #77 residual gap: silently accepted pre-fix)', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
+    'workflows/dead-reduce.yaml': deadReduceDefYaml('dead-reduce'),
+  });
+  const { fetch } = fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  });
+  const { io, cwd, err } = makeIo(fetch);
+
+  const code = await mainAsync(['add', `${owner}/${repo}`], io);
+  assert.equal(code, 1, 'a structurally-dead step must refuse the add, mirroring check — pre-fix this installed at exit 0');
+  const errText = err.join('\n');
+  assert.match(errText, /refusing to install/);
+  assert.match(errText, /definite defects found/);
+  assert.match(errText, /0 invariant violation/);
+  assert.match(errText, /1 structurally dead step/);
+  assert.match(errText, /0 true deadlock/);
+
+  const installedFile = join(cwd, 'workflows', installFolder(owner, repo), 'dead-reduce.yaml');
+  assert.ok(!existsSync(installedFile), 'the structurally-dead def must not be installed');
+});
+
+/**
  * Regression fixture for the PR #78 reject: `add`'s client-side validation gate
  * mirrored `check`'s OLD single-bucket "definite defect" predicate
  * (deadlocks>0 || stuck>0), which the reject reason on wf_8953ec8c461658a729904889

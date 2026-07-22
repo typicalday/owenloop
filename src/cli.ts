@@ -55,7 +55,7 @@ import {
   validateDef,
 } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
-import type { WorkflowDef } from './types.ts';
+import type { CheckReport, WorkflowDef } from './types.ts';
 import { CliError, dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
 import {
   authHeader,
@@ -576,6 +576,27 @@ function failureNote(failures: DefLoadFailure[]): string {
 }
 
 /**
+ * The single "definite defect" predicate over a modelCheck `report`, shared by
+ * `check`, `add` (dispatchAdd) and `push` (dispatchPush) so all three
+ * accept-or-reject a def identically. A pure function of the report object — it
+ * does NOT read or change how any caller seeded its modelCheck (add/push seed
+ * `assumeProvided: true`; check seeds `assumeProvided: !strictInputs`).
+ *
+ * invariant violations and structurally-dead steps are ALWAYS definite (sound
+ * regardless of bounds); a true deadlock counts ONLY when the search was
+ * exhaustive (`!bounded`) because a tight maxCollectionSize cap can manufacture
+ * a spurious one. `unreachedSteps` is deliberately EXCLUDED — it is a bounds
+ * artifact ("raise --max-states/--max-depth"), never a definite defect.
+ */
+export function hasDefiniteCheckDefect(report: CheckReport): boolean {
+  return (
+    report.invariantViolations.length > 0 ||
+    report.structurallyDeadSteps.length > 0 ||
+    (!report.bounded && report.deadlocks.length > 0)
+  );
+}
+
+/**
  * Options accepted on EVERY command. docs/cli.md documents `--db`/`--defs` as
  * global ("pass both on every command"), so they are allowlisted everywhere —
  * even on commands that ignore them — to avoid rejecting a documented
@@ -891,10 +912,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     //   one branch while the line still moves on another). Neither is a defect.
     // - truncated with no invariant violations / structurally-dead steps / true
     //   deadlocks → 0
-    const hasDefiniteDefect =
-      report.invariantViolations.length > 0 ||
-      report.structurallyDeadSteps.length > 0 ||
-      (!report.bounded && report.deadlocks.length > 0);
+    const hasDefiniteDefect = hasDefiniteCheckDefect(report);
     if (hasDefiniteDefect) {
       throw new CliError(
         `definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
@@ -1618,28 +1636,26 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
       const validationErrors = validateDef(stagedDef);
       reasons.push(...validationErrors.map((e) => `${stagedDef.name}: ${e}`));
 
-      // Mirror the `check` command's exact "definite defect" predicate — but,
-      // deliberately, WITH `assumeProvided: true`. Without it, a def with any
-      // `seedOwed` input (the norm — see e.g. `proposal` in delivery.yaml)
-      // deadlocks in the very first state, because the checker models "no
-      // `provide` has happened yet" by default (see `seedArts` in
-      // src/model.ts). `owenloop check <def>` behaves the same way absent
-      // `--assume-provided`; verified every def under examples/workflows/
-      // fails plain `check` for exactly this reason. Since `add` validates a
-      // def that a real user will `provide` into after install (that's the
-      // whole point of a seedOwed input), refusing every seedOwed def here
-      // would make `add` unable to install almost any real workflow,
-      // including this project's own examples — so this checks "is it
-      // completable once its owed inputs are supplied," the same bar a
-      // careful author would clear with `check --assume-provided` before
-      // publishing.
+      // The definite-defect verdict here is the shared `hasDefiniteCheckDefect(report)`
+      // helper — identical to `check`. What is deliberately different is only the
+      // seeding of THIS modelCheck call: `assumeProvided: true` (below). Without it,
+      // a def with any `seedOwed` input (the norm — see e.g. `proposal` in
+      // delivery.yaml) deadlocks in the very first state, because the checker models
+      // "no `provide` has happened yet" by default (see `seedArts` in src/model.ts).
+      // `owenloop check <def>` behaves the same way absent `--assume-provided`;
+      // verified every def under examples/workflows/ fails plain `check` for exactly
+      // this reason. Since `add` validates a def that a real user will `provide` into
+      // after install (that's the whole point of a seedOwed input), refusing every
+      // seedOwed def here would make `add` unable to install almost any real
+      // workflow, including this project's own examples — so this checks "is it
+      // completable once its owed inputs are supplied," the same bar a careful author
+      // would clear with `check --assume-provided` before publishing.
       const report = modelCheck(stagedDef, { assumeProvided: true });
-      const hasDefiniteDefect =
-        report.invariantViolations.length > 0 ||
-        (!report.bounded && report.deadlocks.length > 0);
+      const hasDefiniteDefect = hasDefiniteCheckDefect(report);
       if (hasDefiniteDefect) {
         reasons.push(
           `${stagedDef.name}: definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
+            `${report.structurallyDeadSteps.length} structurally dead step(s), ` +
             `${report.deadlocks.length} true deadlock(s))`,
         );
       }
@@ -2472,12 +2488,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     reasons.push(...lintResult.errors.map((e) => `${def.name}: ${e}`));
     reasons.push(...validateDef(def).map((e) => `${def.name}: ${e}`));
     const report = modelCheck(def, { assumeProvided: true });
-    const hasDefiniteDefect =
-      report.invariantViolations.length > 0 ||
-      (!report.bounded && report.deadlocks.length > 0);
+    const hasDefiniteDefect = hasDefiniteCheckDefect(report);
     if (hasDefiniteDefect) {
       reasons.push(
         `${def.name}: definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
+          `${report.structurallyDeadSteps.length} structurally dead step(s), ` +
           `${report.deadlocks.length} true deadlock(s))`,
       );
     }
