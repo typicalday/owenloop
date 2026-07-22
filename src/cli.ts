@@ -1553,11 +1553,11 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
       const report = modelCheck(stagedDef, { assumeProvided: true });
       const hasDefiniteDefect =
         report.invariantViolations.length > 0 ||
-        (!report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0));
+        (!report.bounded && report.deadlocks.length > 0);
       if (hasDefiniteDefect) {
         reasons.push(
           `${stagedDef.name}: definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
-            `${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`,
+            `${report.deadlocks.length} true deadlock(s))`,
         );
       }
     }
@@ -2370,11 +2370,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     const report = modelCheck(def, { assumeProvided: true });
     const hasDefiniteDefect =
       report.invariantViolations.length > 0 ||
-      (!report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0));
+      (!report.bounded && report.deadlocks.length > 0);
     if (hasDefiniteDefect) {
       reasons.push(
         `${def.name}: definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
-          `${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`,
+          `${report.deadlocks.length} true deadlock(s))`,
       );
     }
   }

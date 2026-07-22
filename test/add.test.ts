@@ -279,6 +279,73 @@ test('add: a def that fails validation refuses the whole add — nothing written
   assert.ok(!existsSync(lockfilePath(cwd)), 'no lockfile written on refusal');
 });
 
+/**
+ * Regression fixture for the PR #78 reject: `add`'s client-side validation gate
+ * mirrored `check`'s OLD single-bucket "definite defect" predicate
+ * (deadlocks>0 || stuck>0), which the reject reason on wf_8953ec8c461658a729904889
+ * flagged as stale after `check` was split into true-deadlock-only + informational
+ * stuck. Shape: 'a' produces x (schema-stall disabled); 'c' consumes x (a
+ * non-human producer, so judgment-reject IS modeled — see eligibleOutcomes's
+ * hasRejectableInput gate) with maxAttempts: 1, so one reject freezes y.
+ * Independently, 'd' consumes 'seed' directly and stays eligible at that same
+ * state — a MOVING stuck state (see test/check.test.ts's identical fixture at
+ * the modelCheck layer). Zero true deadlocks, zero invariant violations, the
+ * def stays completable. Before the fix, `add`'s stale predicate rejected this
+ * as "definite defects found (... 0 deadlock(s), N stuck state(s))" even though
+ * `owenloop check` blesses the identical def with exit 0 — a self-contradiction.
+ */
+function stuckBrakeDefYaml(name: string): string {
+  return [
+    `name: ${name}`,
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: a',
+    '    consumes: [seed]',
+    '    produces: [x]',
+    '    maxSchemaFailures: 0',
+    '    body: run a',
+    '  - name: c',
+    '    consumes: [x]',
+    '    produces: [y]',
+    '    maxAttempts: 1',
+    '    maxSchemaFailures: 0',
+    '    terminal: true',
+    '    body: run c',
+    '  - name: d',
+    '    consumes: [seed]',
+    '    produces: [z]',
+    '    maxSchemaFailures: 0',
+    '    terminal: true',
+    '    body: run d',
+    '',
+  ].join('\n');
+}
+
+test('add: a completable def with a maxAttempts brake on one branch and a moving independent branch (a MOVING stuck state) is NOT rejected as a definite defect', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
+    'workflows/stuckbrake.yaml': stuckBrakeDefYaml('stuckbrake'),
+  });
+  const { fetch } = fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  });
+  const { io, cwd, out, err } = makeIo(fetch);
+
+  const code = await mainAsync(['add', `${owner}/${repo}`], io);
+  assert.equal(code, 0, err.join('\n') || out.join('\n'));
+
+  const result = JSON.parse(out.join('\n'));
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.defs, ['stuckbrake']);
+
+  const installedFile = join(cwd, 'workflows', installFolder(owner, repo), 'stuckbrake.yaml');
+  assert.ok(existsSync(installedFile), 'the stuck-brake def installed cleanly, mirroring `check`\'s verdict');
+});
+
 // ---- no workflows/ dir in the tarball -----------------------------------------
 
 test('add: a tarball with no workflows/ directory refuses with a specific message', async () => {

@@ -445,6 +445,36 @@ test('modelCheck: no state is ever double-listed across stallStates / deadlocks 
   assert.ok(stallPaths.size > 0, 'expected at least one stall state in this fixture');
 });
 
+test('modelCheck: a MOVING stuck state (one branch brakes, an independent branch is still eligible) is non-vacuous and carries no deadlock/invariant defect', () => {
+  // Regression fixture for the PR #78 reject: report.stuck is only populated for
+  // a state that STILL has an eligible firing elsewhere (model.ts continues past
+  // the no-moves stallStates/deadlocks branch before ever checking `stuck` — see
+  // the comment at model.ts's `if (status.debts.some((d) => d.stalled))`). The
+  // single-chain `deadlocker` fixture above can never exercise that: its only
+  // producer of a rejectable input ('a' consumes the human-provided 'start', so
+  // judgment-reject is never modeled — see eligibleOutcomes's hasRejectableInput
+  // gate) means it only ever schema-stalls, and once that branch stalls nothing
+  // downstream is eligible either (stallStates, not stuck).
+  //
+  // Shape here: 'a' produces x (schema-stall disabled), 'c' consumes x (a
+  // non-human producer, so judgment-reject IS modeled) with maxAttempts: 1 — one
+  // reject freezes y. Independently, 'd' consumes 'start' directly and is still
+  // eligible at that same state → a genuine MOVING stuck state (c's branch is
+  // frozen; d's branch still moves). The whole def stays completable (a
+  // succeed-first-try path exists) with zero true deadlocks.
+  const stuckBrakeDef = def('stuck-brake', [input('start', { seedOwed: false })], [
+    step({ name: 'a', consumes: ['start'], produces: ['x'], maxSchemaFailures: 0 }),
+    step({ name: 'c', consumes: ['x'], produces: ['y'], maxAttempts: 1, maxSchemaFailures: 0 }),
+    step({ name: 'd', consumes: ['start'], produces: ['z'], maxSchemaFailures: 0 }),
+  ]);
+  const report = modelCheck(stuckBrakeDef, { maxStates: 500 });
+  assert.ok(report.stuck.length > 0, 'expected at least one MOVING stuck state in this fixture');
+  assert.equal(report.deadlocks.length, 0, 'no true deadlock — only a brake tripped on one branch');
+  assert.equal(report.invariantViolations.length, 0);
+  assert.equal(report.structurallyDeadSteps.length, 0);
+  assert.equal(report.completable, true, 'a completable branch coexists with the stuck branch');
+});
+
 test('modelCheck: suffixed reduce (src[*].child) explores to completable', () => {
   // gather emits members, formatcheck maps each into a `.formatcheck` child,
   // synth fans in over the children (not the bare members). Confirms the
