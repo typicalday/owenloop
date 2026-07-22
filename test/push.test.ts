@@ -142,6 +142,115 @@ test('push: a completable def with a maxAttempts brake on one branch and a movin
   assert.equal(hub.state.get('stuckbrake')?.version, 1, 'the stuck-brake def pushed cleanly, mirroring `check`\'s verdict');
 });
 
+/**
+ * Regression fixture for the structurallyDeadSteps divergence: `push`'s
+ * definite-defect predicate omitted the `structurallyDeadSteps` term that
+ * `check` has always included, so a validateDef-missed structurally-dead step
+ * (a reduce step whose `produces: []` discharges nothing, so it can NEVER
+ * fire under any bounds — see test/check.test.ts's `precision-map` fixture)
+ * was never reported as a structurally-dead defect by `push`'s message, even
+ * when `push` happened to reject the def anyway (this exact fixture also
+ * trips an unrelated true-deadlock elsewhere in its reachable state graph, so
+ * the OLD predicate's `deadlocks` term coincidentally still exits 1 — see
+ * modelCheck's report on this def: bounded=false, deadlocks.length=130,
+ * structurallyDeadSteps=['reducer']). What this test actually proves: the
+ * error message/classification now correctly names the real defect
+ * (`1 structurally dead step`) instead of only the incidental deadlock count
+ * — pre-fix, `/structurally dead step/` never appears in `push`'s output for
+ * this def; post-fix it does, matching `check`'s wording exactly. Both must
+ * now agree via the shared `hasDefiniteCheckDefect`.
+ */
+function precisionMapDef(name: string): string {
+  return [
+    `name: ${name}`,
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: false',
+    'steps:',
+    '  - name: fanout',
+    '    consumes: [seed]',
+    '    produces: ["items[]"]',
+    '    body: fan out',
+    '  - name: mapper',
+    '    consumes: ["items[$i]"]',
+    '    produces: ["items[$i].checked"]',
+    '    body: check item',
+    '  - name: reducer',
+    '    consumes: ["items[*].checked"]',
+    '    produces: []',
+    '    body: reduce (produces nothing — can never fire)',
+    '',
+  ].join('\n');
+}
+
+test('push: a def with a validateDef-missed structurally-dead step is REJECTED (mirrors check)', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo({ fetch: routedFetch(hub.routes).fetch });
+  writeDefs(t.cwd, { 'precision-map.yaml': precisionMapDef('precision-map') });
+  bind(t);
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 1, 'a structurally-dead step must refuse the push, mirroring check');
+  const errText = t.err.join('\n');
+  assert.match(errText, /refusing to push/);
+  assert.match(errText, /definite defects found/);
+  assert.match(errText, /1 structurally dead step/);
+  assert.equal(hub.state.get('precision-map'), undefined, 'nothing was sent to the hub');
+});
+
+/**
+ * A SECOND, minimal structurally-dead fixture with no incidental true
+ * deadlocks anywhere else in its reachable state graph (unlike precision-map
+ * above, whose extra `mapper` step happens to also produce 130 unrelated true
+ * deadlocks) — `fanout` produces `items[]` and `reducer` is the sole consumer,
+ * discharging nothing (`produces: []`). modelCheck on this def reports
+ * bounded=false, deadlocks=[], invariantViolations=[], structurallyDeadSteps=
+ * ['reducer']. This isolates the EXACT #77 residual gap: pre-fix, `push`'s
+ * predicate (invariantViolations>0 || (!bounded && deadlocks>0)) evaluates to
+ * FALSE for this report — nothing else trips it — so `push` sent this broken
+ * def cleanly at exit 0, in direct contradiction with `owenloop check` exiting
+ * 1 on the identical def. THIS TEST FAILS PRE-FIX (pushes at exit 0) and
+ * PASSES POST-FIX (rejects at exit 1) — see the precision-map test above for
+ * why THAT fixture's pre/post-fix delta is message-only, not accept/reject.
+ */
+function deadReduceDef(name: string): string {
+  return [
+    `name: ${name}`,
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: false',
+    'steps:',
+    '  - name: fanout',
+    '    consumes: [seed]',
+    '    produces: ["items[]"]',
+    '    body: fan out',
+    '    maxSchemaFailures: 0',
+    '  - name: reducer',
+    '    consumes: ["items[*]"]',
+    '    produces: []',
+    '    body: reduce (produces nothing — can never fire)',
+    '    maxSchemaFailures: 0',
+    '',
+  ].join('\n');
+}
+
+test('push: a minimal, incident-free structurally-dead step is REJECTED (the exact #77 residual gap: silently pushed pre-fix)', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo({ fetch: routedFetch(hub.routes).fetch });
+  writeDefs(t.cwd, { 'dead-reduce.yaml': deadReduceDef('dead-reduce') });
+  bind(t);
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 1, 'a structurally-dead step must refuse the push, mirroring check — pre-fix this pushed at exit 0');
+  const errText = t.err.join('\n');
+  assert.match(errText, /refusing to push/);
+  assert.match(errText, /definite defects found/);
+  assert.match(errText, /0 invariant violation/);
+  assert.match(errText, /1 structurally dead step/);
+  assert.match(errText, /0 true deadlock/);
+  assert.equal(hub.state.get('dead-reduce'), undefined, 'nothing was sent to the hub');
+});
+
 // ---- unknown-option rejection: the headline repro (safety flag typo) --------
 
 test('push --dryrn is rejected before any I/O — the safety-flag typo does NOT push (zero fetches, hub unchanged)', async () => {
