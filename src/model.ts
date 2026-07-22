@@ -473,8 +473,19 @@ function idleEligible(
  * output to discharge. This is the scheduling gate (§11.4): necessary, not
  * sufficient; the commit fingerprint (§12.2) is the correctness boundary.
  * Assumes `pendingOwed` has already been materialized into `arts`.
+ *
+ * `opts.ignoreFreeze` (used by `modelCheck`'s stall-vs-true-deadlock
+ * recompute): when true, treat every `frozen()` guard as false — i.e.
+ * "what would be eligible if every maxAttempts/maxSchemaFailures/held brake
+ * were lifted (a human `retry` = unlimited attempts)". It ONLY lifts the
+ * freeze; group-exclusivity, input-green gates, and `isDebt` are untouched.
  */
-export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: TimeFacts): Firing[] {
+export function eligibleFirings(
+  def: WorkflowDef,
+  arts: ArtifactMap,
+  time?: TimeFacts,
+  opts?: { ignoreFreeze?: boolean },
+): Firing[] {
   const firings: Firing[] = [];
 
   for (const step of def.steps) {
@@ -522,7 +533,7 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
         if (plainSatisfied) {
           const outs = plainOutputs(step).filter((p) => {
             const a = arts.get(p);
-            return isDebt(a) && !frozen(a, step) && groupBlockingWinner(def, arts, p) === undefined;
+            return isDebt(a) && (opts?.ignoreFreeze || !frozen(a, step)) && groupBlockingWinner(def, arts, p) === undefined;
           });
           if (outs.length) {
             firings.push({ step: step.name, key: '', inputs: plainPaths, outputs: outs });
@@ -546,7 +557,12 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
               // never be a group member today — this check is defensive, not reachable,
               // and exists so a future relaxation of the singleton-only restriction can't
               // silently reopen the eligibility/commit-check gap this file fixes.
-              if (!isDebt(outArt) || frozen(outArt, step) || groupBlockingWinner(def, arts, outPath) !== undefined) continue;
+              if (
+                !isDebt(outArt) ||
+                (!opts?.ignoreFreeze && frozen(outArt, step)) ||
+                groupBlockingWinner(def, arts, outPath) !== undefined
+              )
+                continue;
               firings.push({
                 step: step.name,
                 key: m.path,
@@ -575,7 +591,7 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
                 .map((p) => p.stem)
                 .filter((p) => {
                   const a = arts.get(p);
-                  return isDebt(a) && !frozen(a, step) && groupBlockingWinner(def, arts, p) === undefined;
+                  return isDebt(a) && (opts?.ignoreFreeze || !frozen(a, step)) && groupBlockingWinner(def, arts, p) === undefined;
                 });
               if (outs.length) {
                 firings.push({
@@ -602,7 +618,7 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
         // Workflow IS all-green. Check if the evaluator still has a debt to discharge.
         const outs = plainOutputs(step).filter((p) => {
           const a = arts.get(p);
-          return isDebt(a) && !frozen(a, step) && groupBlockingWinner(def, arts, p) === undefined;
+          return isDebt(a) && (opts?.ignoreFreeze || !frozen(a, step)) && groupBlockingWinner(def, arts, p) === undefined;
         });
         if (outs.length > 0) {
           firings.push({
@@ -620,7 +636,7 @@ export function eligibleFirings(def: WorkflowDef, arts: ArtifactMap, time?: Time
       if (idleEligible(step, arts, time)) {
         const outs = plainOutputs(step).filter((p) => {
           const a = arts.get(p);
-          return isDebt(a) && !frozen(a, step) && groupBlockingWinner(def, arts, p) === undefined;
+          return isDebt(a) && (opts?.ignoreFreeze || !frozen(a, step)) && groupBlockingWinner(def, arts, p) === undefined;
         });
         if (outs.length > 0) {
           firings.push({
@@ -2189,8 +2205,20 @@ function canonicalKey(def: WorkflowDef, arts: Map<string, ArtifactData>): string
  * Bounded reachability / liveness checker over a workflow definition.
  *
  * Explores the full (or depth/state-bounded) state space via BFS to find:
- * - deadlocks: reachable states that are not done and have no eligible firings
- * - stuck states: reachable states with a stalled debt
+ * - a non-done, zero-eligible-firings state is split into exactly ONE of two
+ *   mutually exclusive buckets by recomputing eligibility with every freeze
+ *   lifted (unlimited attempts — see `eligibleFirings`'s `ignoreFreeze`):
+ *   - stall states: the recompute yields >= 1 firing — the state's only
+ *     blocker is a frozen/stalled debt (maxAttempts / maxSchemaFailures /
+ *     held). A by-design human-escalation brake. EXPECTED, never a defect.
+ *   - true deadlocks: the recompute STILL yields zero firings — a genuine
+ *     structural dead-end with no path to completion even at unlimited
+ *     attempts. A real defect.
+ * - stuck states: reachable states that have a stalled debt but STILL have
+ *   >= 1 eligible firing elsewhere (a brake tripped on one branch while the
+ *   line moves on another). Informational only; a no-moves state is never
+ *   listed here — it lands in `stallStates` or `deadlocks` instead, so no
+ *   state is ever double-listed.
  * - completability: whether any reachable state is done (with an example path)
  * - dead steps: steps whose name never appears as a firing in any explored
  *   transition. Split into two categories by the static `canEverFire` check
@@ -2226,6 +2254,7 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     bounded: false,
     boundsHit: [],
     deadlocks: [],
+    stallStates: [],
     stuck: [],
     completable: false,
     completePath: undefined,
@@ -2279,18 +2308,29 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       continue; // done states have no successors
     }
 
-    // Check stuck (any debt.stalled)
-    if (status.debts.some((d) => d.stalled)) {
-      report.stuck.push({ path: node.path });
-      // continue exploring (there may be other paths)
-    }
-
     const firings = status.eligible;
 
-    // Check deadlock: non-done, no eligible firings
+    // Non-done state with no eligible firings: classify by recomputing eligibility
+    // as if every freeze/stall were lifted (unlimited attempts). If a producer
+    // would re-arm → an EXPECTED stall state (a by-design brake). If not → a
+    // TRUE deadlock (a structural dead-end with no path to completion even at
+    // unlimited attempts).
     if (firings.length === 0 && !status.done) {
-      report.deadlocks.push({ path: node.path });
+      const lifted = eligibleFirings(def, node.arts, undefined, { ignoreFreeze: true });
+      if (lifted.length > 0) {
+        report.stallStates.push({ path: node.path });
+      } else {
+        report.deadlocks.push({ path: node.path });
+      }
       continue;
+    }
+
+    // The state HAS eligible firings (the line can still move). If a brake tripped
+    // on some *other* branch, record it as an informational stuck state. A no-moves
+    // stall state never reaches here (it `continue`d above), so no state is ever
+    // listed in both `stuck` and `stallStates`/`deadlocks`.
+    if (status.debts.some((d) => d.stalled)) {
+      report.stuck.push({ path: node.path });
     }
 
     // Respect maxDepth

@@ -82,6 +82,66 @@ test('push: first push sends every def, all land as new on the fake hub, exits 0
   assert.equal(hub.state.get('bar')?.version, 1);
 });
 
+// ---- validation gate must mirror `check`'s current (not stale) predicate ----
+
+/**
+ * Regression fixture for the PR #78 reject: `push`'s client-side validation
+ * gate mirrored `check`'s OLD single-bucket "definite defect" predicate
+ * (deadlocks>0 || stuck>0), stale after `check` was split into true-deadlock-
+ * only + informational stuck. Shape: 'a' produces x (schema-stall disabled);
+ * 'c' consumes x (a non-human producer, so judgment-reject IS modeled — see
+ * eligibleOutcomes's hasRejectableInput gate) with maxAttempts: 1, so one
+ * reject freezes y. Independently, 'd' consumes 'seed' directly and stays
+ * eligible at that same state — a MOVING stuck state (identical fixture to
+ * test/check.test.ts and test/add.test.ts). Zero true deadlocks, zero
+ * invariant violations, the def stays completable. Before the fix, `push`'s
+ * stale predicate rejected this as "definite defects found (... 0 deadlock(s),
+ * N stuck state(s))" even though `owenloop check` blesses the identical def
+ * with exit 0 — a self-contradiction.
+ */
+function stuckBrakeDef(name: string): string {
+  return [
+    `name: ${name}`,
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: a',
+    '    consumes: [seed]',
+    '    produces: [x]',
+    '    maxSchemaFailures: 0',
+    '    body: run a',
+    '  - name: c',
+    '    consumes: [x]',
+    '    produces: [y]',
+    '    maxAttempts: 1',
+    '    maxSchemaFailures: 0',
+    '    terminal: true',
+    '    body: run c',
+    '  - name: d',
+    '    consumes: [seed]',
+    '    produces: [z]',
+    '    maxSchemaFailures: 0',
+    '    terminal: true',
+    '    body: run d',
+    '',
+  ].join('\n');
+}
+
+test('push: a completable def with a maxAttempts brake on one branch and a moving independent branch (a MOVING stuck state) is NOT rejected as a definite defect', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo({ fetch: routedFetch(hub.routes).fetch });
+  writeDefs(t.cwd, { 'stuckbrake.yaml': stuckBrakeDef('stuckbrake') });
+  bind(t);
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const result = JSON.parse(t.out.join('\n'));
+  assert.deepEqual(result.pushed, ['stuckbrake']);
+  assert.equal(hub.state.get('stuckbrake')?.version, 1, 'the stuck-brake def pushed cleanly, mirroring `check`\'s verdict');
+});
+
 // ---- unknown-option rejection: the headline repro (safety flag typo) --------
 
 test('push --dryrn is rejected before any I/O — the safety-flag typo does NOT push (zero fetches, hub unchanged)', async () => {

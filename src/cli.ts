@@ -489,7 +489,7 @@ Commands:
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided]
-                                         bounded reachability check (deadlocks, stuck, dead steps, declared invariants)
+                                         bounded reachability check (stall states, true deadlocks, stuck, dead steps, declared invariants)
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
   adopt <wf>                             re-pin an instance to the current def (§28); settles new debts
@@ -732,7 +732,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       print(io, report);
     } else {
       // text format
-      const clean = report.deadlocks.length === 0 && report.stuck.length === 0
+      const clean = report.deadlocks.length === 0
         && report.invariantViolations.length === 0 && report.structurallyDeadSteps.length === 0;
       const status = clean && report.completable ? 'OK' : clean ? 'INCOMPLETE' : 'DEFECTS FOUND';
       io.out(`=== owenloop check: ${def.name} ===`);
@@ -744,16 +744,23 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         io.out(`SEARCH INCOMPLETE — bounds hit: ${report.boundsHit.join(', ')}`);
         io.out('Verdicts apply only within the explored region.');
       }
+      if (report.stallStates.length > 0) {
+        io.out('');
+        io.out(`Stall states (expected — maxAttempts / human-escalation brakes) (${report.stallStates.length}):`);
+        for (const s of report.stallStates) {
+          io.out(`  path: ${s.path.map((p) => `${p.step}/${p.outcome}`).join(' -> ') || '(initial state)'}`);
+        }
+      }
       if (report.deadlocks.length > 0) {
         io.out('');
-        io.out(`Deadlocks (${report.deadlocks.length}):`);
+        io.out(`True deadlocks (no path to completion at unlimited attempts) (${report.deadlocks.length}):`);
         for (const d of report.deadlocks) {
           io.out(`  path: ${d.path.map((s) => `${s.step}/${s.outcome}`).join(' -> ') || '(initial state)'}`);
         }
       }
       if (report.stuck.length > 0) {
         io.out('');
-        io.out(`Stuck states (${report.stuck.length}):`);
+        io.out(`Stuck states (brake tripped; other branches still moving — informational) (${report.stuck.length}):`);
         for (const s of report.stuck) {
           io.out(`  path: ${s.path.map((p) => `${p.step}/${p.outcome}`).join(' -> ') || '(initial state)'}`);
         }
@@ -786,28 +793,34 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     //   counterexample path was produced by real applyOutcome/settleInMemory
     //   transitions (pinned to the live Engine by the conformance test). The path
     //   is a genuine executable witness; bounds only cause MISSES, never
-    //   fabrications. Contrast deadlocks/stuck, where the maxCollectionSize cap can
-    //   manufacture a spurious "no moves" state — hence those require !bounded.
+    //   fabrications. Contrast true deadlocks, where the maxCollectionSize cap can
+    //   manufacture a spurious "no moves" state — hence that requires !bounded.
     //   Do NOT remove this asymmetry; it encodes a real soundness distinction.
     // - structurally-dead steps → ALWAYS nonzero, regardless of bounded. Unlike
-    //   deadlocks/stuck (found by the bounded BFS, so a tighter maxCollectionSize
+    //   true deadlocks (found by the bounded BFS, so a tighter maxCollectionSize
     //   can manufacture a spurious one), structurally-dead is a STATIC canEverFire
     //   finding that needs no search bounds at all — it is sound and bounds-
     //   independent by construction (model.ts's canEverFire only ever returns
     //   false when certain), so it belongs with invariant violations, not with
-    //   deadlock/stuck. unreachedSteps (the other dead-step bucket) must NEVER
+    //   true deadlocks. unreachedSteps (the other dead-step bucket) must NEVER
     //   affect the exit code — it is purely a bounds artifact.
-    // - definite deadlock/stuck only when EXHAUSTIVE (!bounded) → nonzero
-    // - truncated with no invariant violations / structurally-dead steps → 0
+    // - definite (true) deadlock only when EXHAUSTIVE (!bounded) → nonzero
+    // - stall states and stuck states are by-design brakes and NEVER affect the
+    //   exit code — a stall state (report.stallStates) is EXPECTED (a human-
+    //   escalation brake whose freeze, once lifted, re-arms a producer), and a
+    //   stuck state (report.stuck) is purely informational (a brake tripped on
+    //   one branch while the line still moves on another). Neither is a defect.
+    // - truncated with no invariant violations / structurally-dead steps / true
+    //   deadlocks → 0
     const hasDefiniteDefect =
       report.invariantViolations.length > 0 ||
       report.structurallyDeadSteps.length > 0 ||
-      (!report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0));
+      (!report.bounded && report.deadlocks.length > 0);
     if (hasDefiniteDefect) {
       throw new CliError(
         `definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
         `${report.structurallyDeadSteps.length} structurally dead step(s), ` +
-        `${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`,
+        `${report.deadlocks.length} true deadlock(s))`,
       );
     }
     return 0;
@@ -1544,11 +1557,11 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
       const report = modelCheck(stagedDef, { assumeProvided: true });
       const hasDefiniteDefect =
         report.invariantViolations.length > 0 ||
-        (!report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0));
+        (!report.bounded && report.deadlocks.length > 0);
       if (hasDefiniteDefect) {
         reasons.push(
           `${stagedDef.name}: definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
-            `${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`,
+            `${report.deadlocks.length} true deadlock(s))`,
         );
       }
     }
@@ -2361,11 +2374,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     const report = modelCheck(def, { assumeProvided: true });
     const hasDefiniteDefect =
       report.invariantViolations.length > 0 ||
-      (!report.bounded && (report.deadlocks.length > 0 || report.stuck.length > 0));
+      (!report.bounded && report.deadlocks.length > 0);
     if (hasDefiniteDefect) {
       reasons.push(
         `${def.name}: definite defects found (${report.invariantViolations.length} invariant violation(s), ` +
-          `${report.deadlocks.length} deadlock(s), ${report.stuck.length} stuck state(s))`,
+          `${report.deadlocks.length} true deadlock(s))`,
       );
     }
   }
