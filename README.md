@@ -370,7 +370,9 @@ the CLI (loopback OAuth, or a pasted token via `--with-token`; the credential
 goes into the macOS Keychain or a `0600` file, never the repo, and is verified
 against the hub before it's ever stored), `owenloop connect` binds the project
 to a hub, and `owenloop push` publishes your defs — idempotent against the
-hub's own def hashes, so an unchanged re-push is a no-op. See the
+hub's own def hashes, so an unchanged re-push is a no-op. `owenloop agent new
+<name>` mints an agent identity on the hub and stores its token in slot
+`agent:<name>` without ever printing it. See the
 [Hub](docs/cli.md#hub-login--connect--push--logout) section in `docs/cli.md`.
 
 ---
@@ -430,7 +432,9 @@ since. The changes that need operator or embedder attention:
   [trust model](docs/cli.md#add--installing-shared-workflow-defs-from-github).
   A hub origin now holds one credential per named **slot** (`--as
   human|agent|agent:<account>`), and credentials stored under the earlier keying
-  are not read — there is no migration, so re-run `owenloop login`. Setting
+  are not read — there is no migration, so re-run `owenloop login`. `owenloop
+  agent new <name>` mints an agent token straight into slot `agent:<name>`
+  without ever printing the secret. Setting
   `OWENLOOP_CREDENTIAL_COMMAND` instead supplies the credential from a command
   of your own (a secret manager, or any host without a keychain); it takes
   precedence over both stores and fails loudly rather than falling back.
