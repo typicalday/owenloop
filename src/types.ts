@@ -648,9 +648,34 @@ export interface CheckReport {
   bounded: boolean;
   /** Which bounds were hit, for honest reporting. */
   boundsHit: ('maxDepth' | 'maxStates')[];
-  /** Reachable states where done=false and eligibleFirings=[]: a genuine deadlock. */
+  /**
+   * Reachable non-done states with zero eligible firings that have NO path to
+   * completion even at unlimited attempts — i.e. recomputing eligibility with
+   * all freezes lifted (a human `retry` = unlimited attempts) STILL yields
+   * zero firings. A genuine structural dead-end (TRUE deadlock). A definite
+   * defect only when the search was exhaustive (`!bounded`) — the
+   * maxCollectionSize cap can otherwise manufacture a spurious no-moves
+   * state. Always present ([] when none).
+   */
   deadlocks: CheckFinding[];
-  /** Reachable states that have a stalled debt (judgmentRejects >= cap). */
+  /**
+   * Reachable non-done states with zero eligible firings whose ONLY blocker
+   * is a frozen/stalled debt (maxAttempts / maxSchemaFailures / held).
+   * Recomputing eligibility with all freezes lifted (a human `retry` =
+   * unlimited attempts) yields >= 1 firing, so a producer would re-arm and
+   * the line could move. These are the DESIGNED human-escalation brakes —
+   * EXPECTED, never a defect; they do not affect the exit code. Always
+   * present ([] when none).
+   */
+  stallStates: CheckFinding[];
+  /**
+   * Reachable states that have a stalled debt (maxAttempts/maxSchemaFailures/
+   * held) BUT still have >= 1 eligible firing — a brake tripped on one branch
+   * while the line can still move on another. Informational; NOT a defect on
+   * its own. A no-moves state whose only blocker is a frozen debt is recorded
+   * under `stallStates` instead, never here — so no state appears in both
+   * `stuck` and `stallStates`/`deadlocks`.
+   */
   stuck: CheckFinding[];
   /** Whether any explored state is done, and (when true) one example path to it. */
   completable: boolean;

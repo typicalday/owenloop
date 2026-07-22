@@ -570,7 +570,14 @@ definition and reports dead steps (never seen firing) split by severity: steps t
 can NEVER fire regardless of search bounds are **structurally dead** — a real wiring
 defect, reported nonzero exit — while steps that CAN fire but the bounded search
 just didn't reach are **unreached within bounds** — informational only, exit 0.
-See [`docs/design.md` §25](docs/design.md#25-the-model-checker-owenloop-check--scope)
+It also splits every reachable non-done, no-moves state into exactly one of two
+buckets: a **stall state** — the state's only blocker is a frozen/stalled debt
+(maxAttempts / maxSchemaFailures / held); recomputing eligibility with the freeze
+lifted (a human `retry` = unlimited attempts) shows a producer would re-arm and the
+line could move — this is an EXPECTED, by-design human-escalation brake and never
+fails the check — versus a **true deadlock** — the same recompute STILL yields no
+moves, a genuine structural dead-end, which fails the check nonzero when the search
+is exhaustive. See [`docs/design.md` §25](docs/design.md#25-the-model-checker-owenloop-check--scope)
 for the full breakdown.
 
 ---

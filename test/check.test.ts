@@ -7,7 +7,7 @@
  *   judgmentRejects, schemaRejects, fingerprint }. This proves the checker's
  *   verdicts are trustworthy.
  *
- * Part 2: modelCheck unit tests — deadlocks, stuck, completable, dead steps.
+ * Part 2: modelCheck unit tests — stall states, true deadlocks, stuck, completable, dead steps.
  *
  * Part 3: CLI 'check' command smoke tests.
  */
@@ -23,7 +23,7 @@ import { openStore } from '../src/store.ts';
 import { applyOutcome, eligibleFirings, evalInvariantPredicate, settleInMemory, modelCheck, workflowStatus } from '../src/model.ts';
 import { validateDef } from '../src/defs.ts';
 import { main } from '../src/cli.ts';
-import type { ArtifactData, InvariantDef, InvariantPredicate, WorkflowDef } from '../src/types.ts';
+import type { ArtifactData, CheckStep, InvariantDef, InvariantPredicate, WorkflowDef } from '../src/types.ts';
 import { def, input, step } from './helpers.ts';
 
 // ---- shared workflow definitions (same as engine.test.ts) --------------------
@@ -396,21 +396,53 @@ test('modelCheck: linear def with no stalls → completable, exhaustive search',
   // The workflow IS completable; whether bounded depends on maxStates
 });
 
-test('modelCheck: deadlocking def (maxAttempts=1 → stall after one reject)', () => {
-  // Step 'a' has maxAttempts=1: after one judgment-reject, x is stalled (frozen).
-  // No eligible firings remain, not done → deadlock AND stuck.
+test('modelCheck: maxAttempts=1 def (stall, not deadlock, after one reject — a completable branch coexists)', () => {
+  // Step 'a' has maxAttempts=1: after one judgment-reject, x is stalled (frozen),
+  // no eligible firings remain, not done. But recomputing eligibility with the
+  // freeze lifted (unlimited attempts) re-arms 'a' → this is an EXPECTED stall
+  // state, not a true deadlock. The same BFS also finds the completable branch
+  // (a green → b green → done), so this def coexists a stall state with
+  // completability — the required stall+completable-branch fixture.
   const deadlockDef = def('deadlocker', [input('start', { seedOwed: false })], [
     step({ name: 'a', consumes: ['start'], produces: ['x'], maxAttempts: 1 }),
     step({ name: 'b', consumes: ['x'], produces: ['y'] }),
   ]);
 
   const report = modelCheck(deadlockDef, { maxStates: 200 });
-  assert.ok(report.deadlocks.length > 0, 'should find a deadlock');
-  assert.ok(report.stuck.length > 0, 'should find a stuck state');
-  // At least one deadlock has a non-empty witness path
-  const dlWithPath = report.deadlocks.find((d) => d.path.length > 0);
-  assert.ok(dlWithPath, 'deadlock should have a witness path');
+  assert.ok(report.stallStates.length > 0, 'should find a stall state');
+  assert.equal(report.deadlocks.length, 0, 'no TRUE deadlock — freeze-lift re-arms a producer');
+  assert.equal(report.completable, true, 'a completable branch (a succeeds first try) coexists with the stall branch');
+  // At least one stall state has a non-empty witness path
+  const stallWithPath = report.stallStates.find((s) => s.path.length > 0);
+  assert.ok(stallWithPath, 'stall state should have a witness path');
   assert.equal(report.bounded, false, 'small def should be exhausted');
+});
+
+test('modelCheck: no state is ever double-listed across stallStates / deadlocks / stuck (maxAttempts fixture)', () => {
+  // Same maxAttempts=1 shape as above. The classification must partition every
+  // non-done, zero-firings state into exactly ONE of {stallStates, deadlocks},
+  // and a `stuck` entry only ever occurs for a state that ALSO has an eligible
+  // firing (so it can never be the same state that landed in stallStates or
+  // deadlocks, which both `continue` on the no-moves branch before `stuck` is
+  // ever checked).
+  const deadlockDef = def('deadlocker', [input('start', { seedOwed: false })], [
+    step({ name: 'a', consumes: ['start'], produces: ['x'], maxAttempts: 1 }),
+    step({ name: 'b', consumes: ['x'], produces: ['y'] }),
+  ]);
+  const report = modelCheck(deadlockDef, { maxStates: 200 });
+
+  const canon = (path: CheckStep[]) => path.map((s) => `${s.step}/${s.outcome}`).join(' -> ');
+  const stallPaths = new Set(report.stallStates.map((s) => canon(s.path)));
+  const deadlockPaths = new Set(report.deadlocks.map((d) => canon(d.path)));
+  const stuckPaths = new Set(report.stuck.map((s) => canon(s.path)));
+
+  for (const p of stallPaths) assert.ok(!deadlockPaths.has(p), `path ${p} double-listed in stallStates AND deadlocks`);
+  for (const p of stuckPaths) {
+    assert.ok(!stallPaths.has(p), `path ${p} double-listed in stuck AND stallStates`);
+    assert.ok(!deadlockPaths.has(p), `path ${p} double-listed in stuck AND deadlocks`);
+  }
+  // Sanity: this fixture does produce at least one stall state to make the check non-vacuous.
+  assert.ok(stallPaths.size > 0, 'expected at least one stall state in this fixture');
 });
 
 test('modelCheck: suffixed reduce (src[*].child) explores to completable', () => {
@@ -557,9 +589,12 @@ test('modelCheck: assumeProvided seeds seedOwed inputs green, dissolving the fal
   assert.equal(report.completable, true, 'the real workflow completes, so should the model');
 });
 
-test('modelCheck: assumeProvided does not mask a genuine deadlock past the inputs', () => {
-  // proposal is provided, but step b's consume of 'ghostless' output chain still
-  // stalls at maxAttempts=1 after one reject — assumeProvided must not hide that.
+test('modelCheck: assumeProvided does not mask a genuine (stall) problem past the inputs', () => {
+  // proposal is provided, but step a's produce of 'x' still stalls at
+  // maxAttempts=1 after one reject — assumeProvided must not hide that. This
+  // is a STALL state (freeze-lift re-arms 'a'), not a TRUE deadlock — the
+  // point of the test is that assumeProvided doesn't mask a problem past the
+  // seeded inputs, regardless of which of the two buckets it lands in.
   const stillBroken = def(
     'still-broken',
     [input('proposal', { seedOwed: true })],
@@ -569,9 +604,10 @@ test('modelCheck: assumeProvided does not mask a genuine deadlock past the input
     ],
   );
   const report = modelCheck(stillBroken, { maxStates: 200, assumeProvided: true });
-  assert.ok(report.deadlocks.length > 0, 'stall-induced deadlock still reported');
-  const dl0 = report.deadlocks.find((d) => d.path.length === 0);
-  assert.equal(dl0, undefined, 'but not at depth 0 — inputs themselves are green');
+  assert.ok(report.stallStates.length > 0, 'stall state past the inputs still reported');
+  assert.equal(report.deadlocks.length, 0, 'no TRUE deadlock — freeze-lift re-arms a');
+  const dl0 = report.stallStates.find((s) => s.path.length === 0);
+  assert.equal(dl0, undefined, 'but not at depth 0 — inputs themselves are green, so assumeProvided did not mask a depth-0 issue');
 });
 
 test('modelCheck: completePath is set when completable', () => {
@@ -606,14 +642,16 @@ function makeCli(opts: { defs?: string } = {}) {
   return { run, home };
 }
 
-test('CLI check: text format on delivery (has seedOwed=true → deadlock)', () => {
-  // The example 'delivery.yaml' has proposal.seedOwed=true, so it deadlocks
+test('CLI check: text format on delivery (has seedOwed=true → true deadlock)', () => {
+  // The example 'delivery.yaml' has proposal.seedOwed=true with no producer, so
+  // it's a depth-0 TRUE deadlock (frozen() is already false for an owed/version-0
+  // artifact, and no step produces it — freeze-lift changes nothing).
   const { run } = makeCli();
   const r = run('check', 'delivery');
-  // deadlock + exhaustive → exit 1
+  // true deadlock + exhaustive → exit 1
   assert.equal(r.code, 1, 'definite deadlock → exit 1');
   assert.match(r.out, /owenloop check: delivery/);
-  assert.match(r.out, /Deadlocks/);
+  assert.match(r.out, /True deadlocks/);
 });
 
 test('CLI check: json format emits structured report', () => {
@@ -623,6 +661,7 @@ test('CLI check: json format emits structured report', () => {
   const report = JSON.parse(r.out);
   assert.ok('completable' in report, 'report should have completable field');
   assert.ok('deadlocks' in report, 'report should have deadlocks field');
+  assert.ok('stallStates' in report, 'report should have stallStates field');
   assert.ok('structurallyDeadSteps' in report, 'report should have structurallyDeadSteps field');
   assert.ok('unreachedSteps' in report, 'report should have unreachedSteps field');
   assert.ok('bounded' in report, 'report should have bounded field');
@@ -661,8 +700,13 @@ test('CLI check: unknown def exits 1 with known-names list', () => {
   assert.match(r.err, /Known definitions:/);
 });
 
-test('CLI check: a def with definite deadlock exits 1 when exhaustive', () => {
-  // Write a deadlocker.yaml to a temp defs dir
+test('CLI check: a stall-only def (maxAttempts brake + completable branch) exits 0 and shows the Stall states section', () => {
+  // Write a deadlocker.yaml to a temp defs dir. Step 'a' has maxAttempts=1: one
+  // branch rejects and freezes 'x' (a STALL state — freeze-lift re-arms 'a'),
+  // while another branch has 'a' succeed straight through to a done state. This
+  // is the required "stall + completable branch coexisting" fixture: it must
+  // exit 0 (a stall state is EXPECTED, never a defect) and print the Stall
+  // states section, with no True deadlocks section.
   const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-defs-'));
   writeFileSync(
     join(defsDir, 'deadlocker.yaml'),
@@ -685,7 +729,37 @@ test('CLI check: a def with definite deadlock exits 1 when exhaustive', () => {
   );
   const { run } = makeCli({ defs: defsDir });
   const r = run('check', 'deadlocker');
-  assert.equal(r.code, 1, 'definite deadlock in exhaustive search → exit 1');
+  assert.equal(r.code, 0, 'a stall state (expected brake) is never a defect → exit 0');
+  assert.match(r.out, /Stall states \(expected/);
+  assert.doesNotMatch(r.out, /True deadlocks/);
+  assert.match(r.out, /Completable: yes/);
+});
+
+test('CLI check: a def with a TRUE deadlock exits 1 when exhaustive', () => {
+  // owed input with no producer: frozen() is already false (the artifact is
+  // owed/version-0, never rejected) and no step produces it, so freeze-lift
+  // yields zero firings — a genuine structural dead-end (TRUE deadlock), not
+  // a brake. This is the required true-deadlock exit-1 fixture, kept separate
+  // from the stall-only fixture above (which now exits 0).
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-truedeadlock-'));
+  writeFileSync(
+    join(defsDir, 'owed-no-producer.yaml'),
+    [
+      'name: owed-no-producer',
+      'inputs:',
+      '  - name: proposal',
+      '    seedOwed: true',
+      'steps:',
+      '  - name: planner',
+      '    consumes: [proposal]',
+      '    produces: [plan]',
+      '    body: plan it',
+    ].join('\n'),
+  );
+  const { run } = makeCli({ defs: defsDir });
+  const r = run('check', 'owed-no-producer');
+  assert.equal(r.code, 1, 'true deadlock in exhaustive search → exit 1');
+  assert.match(r.out, /True deadlocks/);
   assert.match(r.err, /definite defects found/);
 });
 
@@ -739,7 +813,7 @@ test('CLI check: --assume-provided turns a seedOwed=true false deadlock into a c
 
   const bare = run('check', 'tiny');
   assert.equal(bare.code, 1, 'without the flag, the owed input deadlocks at depth 0');
-  assert.match(bare.out, /Deadlocks/);
+  assert.match(bare.out, /True deadlocks/);
 
   const assumed = run('check', 'tiny', '--assume-provided');
   assert.equal(assumed.code, 0, 'with --assume-provided the same def checks clean');

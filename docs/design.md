@@ -933,10 +933,43 @@ agents:**
 ## §25 The model checker (`owenloop check`) — scope
 
 `owenloop check <def>` (see `cli.ts` usage) runs a bounded reachability
-search over `applyOutcome` transitions in `model.ts`, looking for
-deadlocks, stuck artifacts, dead steps, and violations of any declared
-invariants. It is a static analysis of a workflow definition's shape, not a
-simulation of a running instance.
+search over `applyOutcome` transitions in `model.ts`, looking for stall
+states, true deadlocks, stuck artifacts, dead steps, and violations of any
+declared invariants. It is a static analysis of a workflow definition's
+shape, not a simulation of a running instance.
+
+**Stall states vs true deadlocks.** A reachable, non-done state with zero
+eligible firings is classified into exactly ONE of two mutually exclusive
+buckets, by recomputing eligibility as if every freeze were lifted
+(`eligibleFirings(def, arts, undefined, { ignoreFreeze: true })` — "unlimited
+attempts," i.e. what a human `retry` grants):
+- **stall state** (`report.stallStates`) — the recompute yields >= 1 firing:
+  the state's ONLY blocker is a frozen/stalled debt — `maxAttempts` reached
+  (`isStalled`, §6), `maxSchemaFailures` reached (`isSchemaStalled`, §6/§18),
+  or held (`isHeld`, §20). Lifting the freeze re-arms a producer, so the
+  line COULD move. This is a by-design human-escalation brake — EXPECTED,
+  never a defect, and it never affects the exit code.
+- **true deadlock** (`report.deadlocks`) — the recompute STILL yields zero
+  firings: no producer would re-arm even at unlimited attempts. A genuine
+  structural dead-end (e.g. a `group:`-blocked or ungreen-input state, or an
+  owed input with no producer). This is folded into `hasDefiniteDefect` and
+  makes `check` exit nonzero — but only when the search was exhaustive
+  (`!report.bounded`), since a tight `--max-collection`/`--max-states` cap
+  can otherwise manufacture a spurious no-moves state.
+
+The freeze-lift recompute ONLY lifts the `frozen()` guard — it does not
+bypass group-exclusivity (`groupBlockingWinner`), input-green gates, or
+`isDebt`. A state blocked by a group winner or an ungreen input classifies as
+a true deadlock, not a stall state, even if some artifact elsewhere also
+happens to be frozen.
+
+Separately, `report.stuck` records reachable states that have a stalled
+debt (`maxAttempts`/`maxSchemaFailures`/held) BUT still have >= 1 eligible
+firing — a brake tripped on one branch while the line can still move on
+another. This is informational only, never a defect on its own, and a
+no-moves state is never listed here (it lands in `stallStates` or
+`deadlocks` instead) — so no single state is ever double-listed across
+`stuck`, `stallStates`, and `deadlocks`.
 
 Dead steps — a step name that never appears as a firing in any explored
 transition — are split into two categories with different severity, via a
