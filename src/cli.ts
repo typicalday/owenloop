@@ -66,6 +66,8 @@ import {
   refreshOAuth,
   storeCredential,
 } from './credentials.ts';
+import { runMcpCommand } from './mcp/serve.ts';
+import type { LineStream } from './mcp/server.ts';
 import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
 import {
   acquireInstallLock,
@@ -149,6 +151,12 @@ export interface CliIO {
   keychain?: Keychain;
   /** Read a secret from stdin (`login --with-token`). Default: drain `process.stdin`. */
   readStdin?: () => Promise<string>;
+  /**
+   * The newline-delimited transport `owenloop mcp` pumps JSON-RPC frames from.
+   * Injectable for hermetic tests (a `PassThrough`); `undefined` here so the
+   * command falls back to `process.stdin`. Only the `mcp` verb reads it.
+   */
+  stdinStream?: LineStream;
 }
 
 function defaultIO(): CliIO {
@@ -475,6 +483,7 @@ Commands:
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
   push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
+  mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided]
                                          bounded reachability check (deadlocks, stuck, dead steps, declared invariants)
@@ -543,6 +552,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
+  ['mcp', cmdOpts('hub')],
   ['lint', cmdOpts()],
   ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided')],
   ['create', cmdOpts('title', 'provide', 'param')],
@@ -2503,6 +2513,17 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   return failed.length === 0 ? 0 : 1;
 }
 
+/**
+ * `owenloop mcp` — serve the human control plane to a local MCP host over stdio.
+ * A thin adapter: read the optional `--hub <url>` flag and hand `io` (which
+ * satisfies the module's `McpIo`) to `runMcpCommand`, which resolves the origin,
+ * builds the tool list, and pumps stdin until EOF. All the logic lives in
+ * `src/mcp/serve.ts`; this stays a two-line dispatch like every other verb.
+ */
+async function dispatchMcp(io: CliIO, args: Args): Promise<number> {
+  return runMcpCommand(io, { hubFlag: last(args, 'hub') });
+}
+
 function createWorkflowRequest(
   io: CliIO,
   origin: string,
@@ -2528,7 +2549,7 @@ function createWorkflowRequest(
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'mcp']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   const args = parseArgs(argv);
@@ -2550,6 +2571,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchConnect(io, args);
       case 'push':
         return await dispatchPush(io, args);
+      case 'mcp':
+        return await dispatchMcp(io, args);
       default:
         return main(argv, io); // unreachable — ASYNC_COMMANDS guards the switch
     }
