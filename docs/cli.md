@@ -49,8 +49,8 @@ for the full breakdown.
 | `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
-| `agent new <name> [--pools <a,b>] [--hub <url>]` | mint a new agent identity on the hub and store its token in slot `agent:<name>` — the token is never printed — see [Hub](#hub-login--connect--push--logout) |
-| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>]` | converge this machine's install (human login, agent credential, owenwork settings, plugin) in one idempotent pass — see [`setup`](#setup--converge-a-machines-install) |
+| `agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]` | mint a new agent identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--conductor` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
+| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]` | converge this machine's install (human login, agent credential, owenwork settings, plugin) in one idempotent pass — see [`setup`](#setup--converge-a-machines-install) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
@@ -545,7 +545,8 @@ happen in one step, and you never handle the secret.
 only — it never appears on stdout, stderr, in an error, or in a log (identity
 model §6, "rule of gates"). The confirmation JSON is built from a whitelist of
 **non-secret** fields only: `hub`, `name`, `slot`, `pools` (the resolved pool
-names), `scopes` (`["work"]`), `storage` (`keychain` | `file`), `agentId` (the
+names), `scopes` (the minted token's scopes — `["work"]` by default, or whatever
+`--scopes`/`--conductor` selected), `storage` (`keychain` | `file`), `agentId` (the
 agent's id), and `tokenId` (a revocation handle). To use the agent afterwards,
 pass `--as agent:<name>` to `connect`/`push`; to revoke it, use its `tokenId`
 on the hub.
@@ -572,13 +573,22 @@ on (trimmed, empties dropped). Omit the flag to let the hub default the token to
 the minter's personal pool; `--pools ""` (or `--pools ,`) is a usage error. Pool
 names are validated by the hub, not the client.
 
+**`--scopes <a,b>` / `--conductor`.** A comma-separated list of scopes the minted
+token carries (trimmed, empties dropped). Omit both flags to mint **work-only**
+(the default). `--conductor` is shorthand for `--scopes work,run` — the identity
+a service account needs to both serve and *start* runs. The two flags are
+mutually exclusive (`--scopes … --conductor` together is a usage error), and
+`--scopes ""` (or `--scopes ,`) is a usage error. Scope names are validated by
+the hub, not the client.
+
 **A configured external credential command blocks the mint.** If
 `OWENLOOP_CREDENTIAL_COMMAND` is set, that command — not the local store —
 supplies credentials for the hub, so `agent new` refuses up front (it has
 nowhere to write the minted token); unset the variable to use the local store.
-This check, the name validation, and the empty-`--pools` check all run **before**
-any network call, so a refusal never mints a server-side token first — a mint
-that then failed to store would burn the agent name permanently.
+This check, the name validation, the empty-`--pools` check, the empty-`--scopes`
+check, and the `--scopes`/`--conductor` mutual-exclusivity check all run
+**before** any network call, so a refusal never mints a server-side token first
+— a mint that then failed to store would burn the agent name permanently.
 
 **Exit codes.**
 
@@ -648,7 +658,11 @@ prompt — it errors unless you pre-decide with one of:
 The two flags are mutually exclusive. `--pools <a,b>` applies **only** to a mint
 (`--new-agent` or a fresh org); combining it with `--replace-agent` is a usage
 error, because rekeying preserves the agent's existing pools (manage those in
-the console).
+the console). `--scopes <a,b>` likewise applies **only** to a mint — it selects
+the minted token's scopes (default `work`); combining it with `--replace-agent`
+is a usage error, because rekeying preserves the agent's existing scopes (mint a
+new agent to change scopes). `setup` has no `--conductor` shorthand — spell the
+scopes out with `--scopes work,run`.
 
 ### Hub resolution differs from `agent new`
 
@@ -788,9 +802,10 @@ block; a non-2xx response comes back as an error result.
 | `wake` | cheap "has anything changed since cursor X" pre-check for a polling loop |
 | `create_agent` | create a NEW agent identity and store its credential locally — **never returns the token** |
 
-`create_agent {name, pools?}` mints a fresh agent identity on the hub with
-`work` scope, then writes the minted `olp_` token straight to this machine's
-credential store (slot `agent:<name>`). The token is **never** returned in the
+`create_agent {name, pools?, scopes?}` mints a fresh agent identity on the hub
+with `work` scope by default; pass `scopes` (e.g. `["work","run"]`) to choose the
+minted token's scopes. It then writes the minted `olp_` token straight to this
+machine's credential store (slot `agent:<name>`). The token is **never** returned in the
 tool result, printed, or logged — the result is `{name, pools, stored: true}`,
 built from scratch. It refuses a name that is already taken (the hub's error
 message is surfaced verbatim; error bodies never carry tokens). If the store

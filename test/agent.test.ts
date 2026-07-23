@@ -441,9 +441,67 @@ test('agent new: an unknown option is rejected by preflight before any side effe
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['agent', 'new', 'codex', '--scopes', 'work', '--hub', HUB], t.io);
+  const code = await mainAsync(['agent', 'new', 'codex', '--bogus', 'x', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /unknown option --scopes for 'agent'/);
+  assert.match(t.err.join('\n'), /unknown option --bogus for 'agent'/);
   assert.equal(calls.length, 0);
+  assertNoTokenLeak(t);
+});
+
+// ---- selectable scopes ------------------------------------------------------
+
+test('agent new: --scopes work,run mints with those scopes and prints them', async () => {
+  const { fetch, calls } = routedFetch({ 'POST /api/mint_agent_token': mintOk() });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['agent', 'new', 'codex', '--scopes', 'work,run', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const mint = calls.find((c) => c.pathname === '/api/mint_agent_token')!;
+  assert.deepEqual(JSON.parse(mint.body!), { name: 'codex', scopes: ['work', 'run'] });
+
+  const result = JSON.parse(t.out.join('\n'));
+  assert.deepEqual(result.scopes, ['work', 'run'], 'printed scopes reflect the resolved request value');
+  assertNoTokenLeak(t);
+});
+
+test('agent new: --conductor is sugar for --scopes work,run', async () => {
+  const { fetch, calls } = routedFetch({ 'POST /api/mint_agent_token': mintOk() });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['agent', 'new', 'codex', '--conductor', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const mint = calls.find((c) => c.pathname === '/api/mint_agent_token')!;
+  assert.deepEqual(JSON.parse(mint.body!), { name: 'codex', scopes: ['work', 'run'] });
+
+  const result = JSON.parse(t.out.join('\n'));
+  assert.deepEqual(result.scopes, ['work', 'run']);
+  assertNoTokenLeak(t);
+});
+
+test('agent new: --scopes and --conductor together is a usage error, no network', async () => {
+  const { fetch, calls } = routedFetch({ 'POST /api/mint_agent_token': mintOk() });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['agent', 'new', 'codex', '--scopes', 'work,run', '--conductor', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /at most one of --scopes or --conductor/);
+  assert.equal(calls.length, 0, 'no network on a usage error');
+  assertNoTokenLeak(t);
+});
+
+test('agent new: --scopes "" is a usage error before any network call', async () => {
+  const { fetch, calls } = routedFetch({ 'POST /api/mint_agent_token': mintOk() });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['agent', 'new', 'codex', '--scopes', '', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /--scopes requires at least one scope name/);
+  assert.equal(calls.length, 0, 'no network on a usage error');
   assertNoTokenLeak(t);
 });

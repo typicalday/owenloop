@@ -254,9 +254,57 @@ test('mcp: create_agent stores the minted olp_ token and NEVER echoes any byte o
   const stored = JSON.parse(t.store.get(kcKey(ORIGIN, { principal: 'agent', account: 'newbot' }))!) as Credential;
   assert.deepEqual(stored, { kind: 'agent', accessToken: SECRET });
 
-  // The mint request hardcoded scopes:['work'] and forwarded name + pools.
+  // The mint request defaulted scopes:['work'] and forwarded name + pools.
   const mint = calls.find((c) => c.pathname === '/api/mint_agent_token');
   assert.deepEqual(JSON.parse(mint!.body!), { name: 'newbot', scopes: ['work'], pools: ['alex-personal'] });
+});
+
+test('mcp: create_agent honors a passed scopes array in the mint body', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/mint_agent_token': () => ({ status: 200, json: { token: 'olp_conductor_tok', pools: [] } }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { code, frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'create_agent', { name: 'condbot', scopes: ['work', 'run'] })]);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(frames[1]!.result!.isError, undefined);
+
+  const mint = calls.find((c) => c.pathname === '/api/mint_agent_token');
+  assert.deepEqual(JSON.parse(mint!.body!), { name: 'condbot', scopes: ['work', 'run'] });
+  for (const line of t.out) assert.ok(!line.includes('olp_'), `olp_ leaked to stdout frame: ${line}`);
+  assert.ok(t.store.get(kcKey(ORIGIN, { principal: 'agent', account: 'condbot' })), 'agent:condbot stored');
+});
+
+test('mcp: create_agent with no scopes defaults the mint body to work-only', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/mint_agent_token': () => ({ status: 200, json: { token: 'olp_def_tok', pools: [] } }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { code } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'create_agent', { name: 'defbot' })]);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const mint = calls.find((c) => c.pathname === '/api/mint_agent_token');
+  assert.deepEqual(JSON.parse(mint!.body!), { name: 'defbot', scopes: ['work'] });
+});
+
+test('mcp: create_agent rejects empty scopes BEFORE any network call, storing nothing', async () => {
+  const { fetch, calls } = routedFetch({});
+  const t = makeIo({ fetch });
+  // No human credential seeded (like the invalid-name test): scope validation
+  // runs before any credential read, so no gating probe or mint call fires.
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'create_agent', { name: 'emptybot', scopes: [] })]);
+  assert.equal(frames[1]!.result!.isError, true);
+  assert.match(frames[1]!.result!.content![0]!.text, /invalid scopes/);
+  assert.equal(calls.length, 0, 'no hub call was made for invalid scopes');
+  assert.equal(t.store.get(kcKey(ORIGIN, { principal: 'agent', account: 'emptybot' })), undefined, 'nothing stored');
 });
 
 test('mcp: create_agent rejects an invalid name BEFORE any network call', async () => {

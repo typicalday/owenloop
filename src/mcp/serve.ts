@@ -20,7 +20,8 @@
  *      header, never a tool result. The server holds NO credential state between
  *      calls — its only state is the resolved origin and the fixed tool list.
  *   2. `create_agent` MINTS an `olp_` agent token and writes it straight to the
- *      local store (`storeCredential`, slot `agent:<name>`, scopes `['work']`);
+ *      local store (`storeCredential`, slot `agent:<name>`, caller-chosen scopes,
+ *      default `['work']`);
  *      the token is NEVER returned in a tool result, printed, or logged. The
  *      mint response body carries the plaintext in TWO fields (`data.token` AND
  *      the human `text` "Store this secret now…"), so the handler builds its
@@ -512,12 +513,13 @@ function createAgentTool(deps: McpDeps): ToolRegistration {
   return {
     name: 'create_agent',
     description:
-      'Create a NEW agent identity on the hub and store its credential locally. NEVER returns the token — it is written to this machine\'s credential store only. Refuses a name that is already taken. Mints with `work` scope.',
+      'Create a NEW agent identity on the hub and store its credential locally. NEVER returns the token — it is written to this machine\'s credential store only. Refuses a name that is already taken. Mints with `work` scope by default; pass `scopes` (e.g. ["work","run"]) to choose.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' },
         pools: { type: 'array', items: { type: 'string' } },
+        scopes: { type: 'array', items: { type: 'string' } },
       },
       required: ['name'],
       additionalProperties: false,
@@ -529,8 +531,20 @@ function createAgentTool(deps: McpDeps): ToolRegistration {
       if (typeof name !== 'string' || !AGENT_NAME_RE.test(name)) {
         return errorText('invalid agent name — expected 1-64 chars matching [A-Za-z0-9][A-Za-z0-9._-]*');
       }
+      // `scopes` is optional. When present it must be a non-empty array of
+      // non-empty strings — validated BEFORE any network call (the schema is
+      // advisory). Absent → the `work`-only default. No scope-NAME check: the
+      // hub is the enforcement of record (same stance as pools).
+      const scopesArg = args['scopes'];
+      let scopes: string[] | undefined;
+      if (scopesArg !== undefined) {
+        if (!Array.isArray(scopesArg) || scopesArg.length === 0 || !scopesArg.every((s) => typeof s === 'string' && s !== '')) {
+          return errorText('invalid scopes — expected a non-empty array of scope name strings');
+        }
+        scopes = scopesArg as string[];
+      }
       const pools = args['pools'];
-      const body: Record<string, unknown> = { name, scopes: ['work'] };
+      const body: Record<string, unknown> = { name, scopes: scopes ?? ['work'] };
       if (Array.isArray(pools)) body.pools = pools;
 
       const r = await callHub(deps, { method: 'POST', path: '/api/mint_agent_token', body });

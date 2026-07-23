@@ -323,6 +323,33 @@ test('setup --new-agent with a non-empty org: mint path forwards --pools, no pro
   assertNoOlp(t);
 });
 
+test('setup --new-agent: --scopes forwards into the mint body', async () => {
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_x', name: 'other', pools: ['team'] }] });
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch }); // NO prompt seam — --new-agent must not prompt
+  seedHuman(t.store);
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'fresh', '--scopes', 'work,run'], t.io), 0, t.err.join('\n'));
+  const mint = calls.find((c) => c.pathname === '/api/mint_agent_token');
+  assert.ok(mint, 'mint called');
+  const body = JSON.parse(mint!.body!);
+  assert.equal(body.name, 'fresh');
+  assert.deepEqual(body.scopes, ['work', 'run'], '--scopes forwarded to the mint body');
+  assertNoOlp(t);
+});
+
+test('setup --replace-agent + --scopes is a usage error before any network', async () => {
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', pools: [] }] });
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t.store);
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--replace-agent', 'worker', '--scopes', 'work,run'], t.io), 1);
+  assert.match(t.err.join('\n'), /--scopes cannot be combined with --replace-agent/);
+  assert.equal(calls.length, 0, 'no network touched before the usage error');
+  assertNoOlp(t);
+});
+
 // ---- non-interactive guard --------------------------------------------------
 
 test('setup: identities exist, no flags, no prompt seam → CliError naming both bypass flags, no mint/rekey', async () => {
