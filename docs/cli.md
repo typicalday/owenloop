@@ -585,9 +585,10 @@ the hub, not the client.
 `OWENLOOP_CREDENTIAL_COMMAND` is set, that command — not the local store —
 supplies credentials for the hub, so `agent new` refuses up front (it has
 nowhere to write the minted token); unset the variable to use the local store.
-This check, the name validation, and the empty-`--pools` check all run **before**
-any network call, so a refusal never mints a server-side token first — a mint
-that then failed to store would burn the agent name permanently.
+This check, the name validation, the empty-`--pools` check, the empty-`--scopes`
+check, and the `--scopes`/`--conductor` mutual-exclusivity check all run
+**before** any network call, so a refusal never mints a server-side token first
+— a mint that then failed to store would burn the agent name permanently.
 
 **Exit codes.**
 
