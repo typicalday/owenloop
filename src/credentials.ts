@@ -571,6 +571,12 @@ export interface MintAgentResult {
   agentId: string;
   /** Resolved pool NAMES from the server. */
   pools: string[];
+  /**
+   * The minted token's scopes — the client-resolved request value (the H3 route
+   * requires non-empty scopes and honors them verbatim, so request == minted).
+   * Non-secret; lets callers print the truth instead of a hard-coded literal.
+   */
+  scopes: string[];
   /** Which local backend the token landed in. */
   storage: 'keychain' | 'file';
 }
@@ -715,8 +721,10 @@ export async function mintAgentCredential(
     );
   }
 
-  // 9. Return non-secret handles only — no token field exists to leak.
-  return { id: ok.id, agentId: ok.agentId, pools: ok.pools, storage };
+  // 9. Return non-secret handles only — no token field exists to leak. `scopes`
+  //    is the client-resolved request value (server honors it verbatim), not a
+  //    server-body field — the mint response guard does not parse scopes.
+  return { id: ok.id, agentId: ok.agentId, pools: ok.pools, scopes, storage };
 }
 
 /**

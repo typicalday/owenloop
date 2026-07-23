@@ -535,8 +535,8 @@ Commands:
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
   push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
-  agent new <name> [--pools <a,b>] [--hub <url>]   mint a new agent identity on the hub and store its token in slot agent:<name> (the token is never printed)
-  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--pools <a,b>]   converge this machine's install: human login, agent credential, owenwork settings, plugin (idempotent)
+  agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]   mint a new agent identity on the hub and store its token in slot agent:<name> (the token is never printed; --conductor = --scopes work,run)
+  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenwork settings, plugin (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   lint [<def-name>]                      check def(s) for wiring problems
@@ -628,8 +628,8 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
-  ['agent', cmdOpts('pools', 'hub')],
-  ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'pools')],
+  ['agent', cmdOpts('pools', 'hub', 'scopes', 'conductor')],
+  ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'pools', 'scopes')],
   ['doctor', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
   ['lint', cmdOpts()],
@@ -2740,7 +2740,13 @@ function resolveAgentHub(io: CliIO, args: Args): string {
  * process→store ONLY — it never appears on stdout, stderr, in an error, or in a
  * log. `mintAgentCredential` (credentials.ts) owns the token end to end and
  * returns none of it; the confirmation printed here is built from an explicit
- * WHITELIST of non-secret fields (name, pools, storage backend, revocation ids).
+ * WHITELIST of non-secret fields (name, pools, scopes, storage backend,
+ * revocation ids).
+ *
+ * Flags: `--pools a,b` (agent's pools; default = minter's personal pool);
+ * `--scopes a,b` (the minted token's scopes; default `work`); `--conductor`
+ * (sugar for `--scopes work,run`; mutually exclusive with `--scopes`); `--hub`.
+ * `--scopes` is passed to the hub verbatim — no client-side scope-name check.
  *
  * Ordering is load-bearing (PR #69 lesson, carried by `mintAgentCredential`): the
  * client-side name validation and the external-command refusal both run BEFORE
@@ -2763,7 +2769,7 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
   const name = args.positionals[2];
   if (name === undefined) {
     throw new CliError(
-      'missing required argument: <name> (usage: owenloop agent new <name> [--pools a,b] [--hub <url>])',
+      'missing required argument: <name> (usage: owenloop agent new <name> [--pools a,b] [--scopes work,run | --conductor] [--hub <url>])',
     );
   }
   // Validate the agent name eagerly — before any I/O — with the store's own
@@ -2790,6 +2796,33 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
     }
   }
 
+  // --scopes: same split/trim/filter shape as --pools. Absent → undefined (the
+  // key is omitted from the mint params, so mintAgentCredential applies its own
+  // `?? ['work']` default). Present but empty (`--scopes ""` / `--scopes ,`) →
+  // usage error, before any I/O. No client-side scope-NAME validation — the hub
+  // is the enforcement of record (same stance as pools).
+  const scopesRaw = last(args, 'scopes');
+  let scopes: string[] | undefined;
+  if (scopesRaw !== undefined) {
+    scopes = scopesRaw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s !== '');
+    if (scopes.length === 0) {
+      throw new CliError('--scopes requires at least one scope name');
+    }
+  }
+  // --conductor is sugar for --scopes work,run. It takes no value. Combining it
+  // with an explicit --scopes is a usage error (two ways to say the same thing,
+  // possibly conflicting) — refused before any I/O.
+  const conductor = flag(args, 'conductor');
+  if (conductor) {
+    if (scopes !== undefined) {
+      throw new CliError('pass at most one of --scopes or --conductor, not both');
+    }
+    scopes = ['work', 'run'];
+  }
+
   // Refuse an external-command setup at the TOP of the dispatcher — before the
   // human-credential read (which would otherwise RUN the command) and before any
   // network call (PR #69 lesson; `mintAgentCredential` carries the same guard as
@@ -2813,7 +2846,7 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
 
   let result;
   try {
-    result = await mintAgentCredential(io, origin, { principal: 'human' }, cred, { name, pools });
+    result = await mintAgentCredential(io, origin, { principal: 'human' }, cred, { name, pools, scopes });
   } catch (e) {
     // A refresh-failure-family error (the human oauth is irrecoverable, or a 401
     // survived the refresh-and-retry) is exit 3 with the login remedy; every
@@ -2833,7 +2866,7 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
     name,
     slot: `agent:${name}`,
     pools: result.pools,
-    scopes: ['work'],
+    scopes: result.scopes,
     storage: result.storage,
     agentId: result.agentId,
     tokenId: result.id,
@@ -3171,7 +3204,9 @@ function installPluginStep(io: CliIO, state: { claudeFound: boolean; installed: 
  *
  * Flags: `--hub <url>`; mutually-exclusive `--new-agent <name>` / `--replace-agent
  * <name>` (bypass the interactive agent branches); `--pools <a,b>` (mint only —
- * a usage error with `--replace-agent`, which preserves pools).
+ * a usage error with `--replace-agent`, which preserves pools); `--scopes <a,b>`
+ * (mint only — the minted token's scopes, default `work`; a usage error with
+ * `--replace-agent`, which preserves scopes).
  *
  * Exit: 0 when every step ended skipped/done/noted AND doctor's core (non-plugin)
  * checks pass; 1 otherwise. Any hard failure throws (mapped to an exit code by
@@ -3196,6 +3231,22 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   if (replaceAgent !== undefined && pools !== undefined) {
     throw new CliError(
       "--pools cannot be combined with --replace-agent — re-keying preserves the agent's pools (manage pools in the console)",
+    );
+  }
+  // --scopes: same shape as --pools. Absent → undefined (mint inherits the
+  // `?? ['work']` default). Present but empty → usage error, before any I/O.
+  const scopesRaw = last(args, 'scopes');
+  let scopes: string[] | undefined;
+  if (scopesRaw !== undefined) {
+    scopes = scopesRaw
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s !== '');
+    if (scopes.length === 0) throw new CliError('--scopes requires at least one scope name');
+  }
+  if (replaceAgent !== undefined && scopes !== undefined) {
+    throw new CliError(
+      "--scopes cannot be combined with --replace-agent — re-keying preserves the agent's scopes (mint a new agent to change scopes)",
     );
   }
   for (const [flagName, val] of [
@@ -3325,9 +3376,9 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     }
 
     if (action.mode === 'mint') {
-      const result = await mintAgentCredential(io, origin, { principal: 'human' }, humanCred, { name: action.name, pools });
+      const result = await mintAgentCredential(io, origin, { principal: 'human' }, humanCred, { name: action.name, pools, scopes });
       agentAccount = action.name;
-      io.err(`✓ agent: minted agent:${agentAccount} (pools: ${result.pools.join(', ') || 'none'})`);
+      io.err(`✓ agent: minted agent:${agentAccount} (pools: ${result.pools.join(', ') || 'none'}; scopes: ${result.scopes.join(', ')})`);
       steps.push({ step: 'agent', action: 'done', detail: `minted agent:${agentAccount}` });
     } else {
       const result = await rekeyAgentCredential(io, origin, { principal: 'human' }, humanCred, { agentId: action.agentId, name: action.name });
