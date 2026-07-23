@@ -1,7 +1,7 @@
 /**
  * The owenloop CLI — a thin, scriptable surface over the engine.
  *
- * Every data command prints JSON to stdout, so a *wiring* (the worker/automation
+ * Every data command prints JSON to stdout, so a *wiring* (the Step Agent/automation
  * that actually runs orders) can drive the engine programmatically: `tick` to
  * pull orders, run them, then `green` / `emit` / `seal` / `reject` / `close` to
  * report outcomes. The engine itself is domain-neutral; this binary just maps
@@ -535,7 +535,7 @@ Commands:
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
   push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
-  agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]   mint a new agent identity on the hub and store its token in slot agent:<name> (the token is never printed; --conductor = --scopes work,run)
+  agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --conductor = --scopes work,run)
   setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenwork settings, plugin (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
@@ -1015,7 +1015,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         return 0;
       }
       case 'wait': {
-        // Blocking poll so an orchestrator/agent can wait for engine state
+        // Blocking poll so an orchestrator (Prime Agent or Conductor) can wait for engine state
         // change without burning inference on a poll loop. Plain synchronous
         // poll of the local db (cheap — one process, no LLM calls). On
         // success, prints the exact `status()` shape (same as plain
@@ -2733,7 +2733,7 @@ function resolveAgentHub(io: CliIO, args: Args): string {
 }
 
 /**
- * `owenloop agent new <name>` — mint a new agent identity on the hub and store
+ * `owenloop agent new <name>` — mint a new Scoped Identity on the hub and store
  * its `olp_` token in slot `agent:<name>`.
  *
  * **Secret hygiene (identity model §6, "rule of gates"):** the minted token goes
@@ -2743,7 +2743,7 @@ function resolveAgentHub(io: CliIO, args: Args): string {
  * WHITELIST of non-secret fields (name, pools, scopes, storage backend,
  * revocation ids).
  *
- * Flags: `--pools a,b` (agent's pools; default = minter's personal pool);
+ * Flags: `--pools a,b` (the Scoped Identity's pools; default = minter's personal pool);
  * `--scopes a,b` (the minted token's scopes; default `work`); `--conductor`
  * (sugar for `--scopes work,run`; mutually exclusive with `--scopes`); `--hub`.
  * `--scopes` is passed to the hub verbatim — no client-side scope-name check.
@@ -3098,8 +3098,8 @@ function requirePrompt(io: CliIO): (question: string) => Promise<string> {
   if (io.prompt) return io.prompt;
   if (process.stdin.isTTY) return defaultPrompt;
   throw new CliError(
-    'setup needs to ask which agent to use, but stdin is not interactive — pass ' +
-      '--new-agent <name> to create a new agent, or --replace-agent <name> to replace an existing one',
+    'setup needs to ask which Scoped Identity to use, but stdin is not interactive — pass ' +
+      '--new-agent <name> to create a new Scoped Identity, or --replace-agent <name> to replace an existing one',
   );
 }
 
@@ -3111,7 +3111,7 @@ function requirePrompt(io: CliIO): (question: string) => Promise<string> {
 async function promptAgentName(io: CliIO): Promise<string> {
   const prompt = requirePrompt(io);
   const prefill = sanitizeAgentName(hostname());
-  const question = prefill ? `Name this agent [${prefill}]: ` : 'Name this agent: ';
+  const question = prefill ? `Name this Scoped Identity [${prefill}]: ` : 'Name this Scoped Identity: ';
   for (let attempt = 0; attempt < 2; attempt++) {
     const raw = (await prompt(question)).trim();
     const answer = raw === '' ? prefill : raw;
@@ -3131,7 +3131,8 @@ async function promptAgentName(io: CliIO): Promise<string> {
 
 /**
  * Render the succession question (Flow B) and read a choice. The framing
- * sentences are VERBATIM from the model doc; the radio glyphs become numbered
+ * sentences are adapted from the model doc (§7 Flow B), restated in the settled
+ * vocabulary; the radio glyphs become numbered
  * terminal choices (the honest line-input adaptation). `[1]` = new installation;
  * `[k]` = replace the (k-2)th non-disabled identity. Each Replace line shows the
  * name, `last active <relative>`, and pools. Invalid input re-prompts once, then
@@ -3147,7 +3148,7 @@ async function promptSuccession(
   const lines: string[] = [
     'Is this a new installation, or does it replace an existing one?',
     '',
-    '  [1] New installation → create a new agent',
+    '  [1] New installation → create a new Scoped Identity',
   ];
   candidates.forEach((id, i) => {
     const active = lastActiveMs(id);
@@ -3156,7 +3157,7 @@ async function promptSuccession(
     lines.push(`  [${i + 2}] Replace: ${id.name}  last active ${rel} · pools: ${pools}`);
   });
   lines.push('');
-  lines.push('⚠ "Replace" revokes that agent\'s current credential. If it is still');
+  lines.push('⚠ "Replace" revokes that Scoped Identity\'s current credential. If it is still');
   lines.push('  running somewhere, it will be disconnected there.');
   lines.push('');
   const max = candidates.length + 1;
@@ -3335,7 +3336,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   io.err('[3/6] agent');
   const { res: idRes } = await authedGet(io, origin, { principal: 'human' }, humanCred, '/api/agent_identities');
   if (idRes.status === 403) {
-    throw new CliError('setup needs an admin credential to manage agents (hub returned 403)');
+    throw new CliError('setup needs an admin credential to manage Scoped Identities (hub returned 403)');
   }
   assertAuthOk(idRes, humanCred, origin);
   const identities = asAgentIdentities(await idRes.json());
@@ -3359,7 +3360,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
       const target = identities.find((i) => i.name === replaceAgent);
       if (target === undefined) {
         throw new CliError(
-          `no agent named '${replaceAgent}' on ${origin} — available: ${identities.map((i) => i.name).join(', ') || '(none)'}`,
+          `no Scoped Identity named '${replaceAgent}' on ${origin} — available: ${identities.map((i) => i.name).join(', ') || '(none)'}`,
         );
       }
       action = { mode: 'rekey', agentId: target.id, name: replaceAgent };

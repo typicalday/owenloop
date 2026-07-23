@@ -6,8 +6,9 @@ on an `Engine` and prints the results as JSON. Everything it does, a host
 process can do **in-process** — and get the lifecycle back as typed objects
 rather than JSON on stdout.
 
-This document covers the in-process API: the one-call factory, the worker step,
-in-memory definitions, lifecycle/concurrency, and **push-style events** so a host
+This document covers the in-process API: the one-call factory, the worker step
+(the loop a Step Agent — or your own host code — runs), in-memory definitions,
+lifecycle/concurrency, and **push-style events** so a host
 can react the instant the graph advances instead of polling.
 
 ## The one-call factory

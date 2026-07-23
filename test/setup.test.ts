@@ -121,7 +121,7 @@ test('setup: fresh machine interactive — injected prompt names the agent; empt
     });
     assert.equal(await mainAsync(['setup', '--hub', HUB], t.io), 0, t.err.join('\n'));
     assert.ok(t.store.get(kcKey(ORIGIN, { principal: 'agent', account: 'mybox' })), 'agent:mybox stored');
-    assert.match(questions.join('\n'), /Name this agent \[/, 'prefill prompt shown');
+    assert.match(questions.join('\n'), /Name this Scoped Identity \[/, 'prefill prompt shown');
     assertNoOlp(t);
   }
 
@@ -287,7 +287,7 @@ test('setup --replace-agent: prompt-free rekey; unknown name errors; --pools is 
     seedHuman(t.store);
 
     assert.equal(await mainAsync(['setup', '--hub', HUB, '--replace-agent', 'ghost'], t.io), 1);
-    assert.match(t.err.join('\n'), /no agent named 'ghost'/);
+    assert.match(t.err.join('\n'), /no Scoped Identity named 'ghost'/);
     assert.match(t.err.join('\n'), /worker/, 'lists the available names');
     assert.ok(!calls.some((c) => c.pathname === '/api/rekey_agent_token'), 'no rekey on an unknown name');
     assertNoOlp(t);

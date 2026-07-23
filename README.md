@@ -48,11 +48,11 @@ steps:
 ```
 
 You don't drive this by hand. An orchestrator — an agent skill, a plain
-`while` loop, your own code — ticks the engine, hands each job to an agent,
+`while` loop, your own code — ticks the engine, hands each job to a Step Agent,
 and reports results back. Here's what the engine enforces as that loop runs:
 
 1. **The writer cannot start early.** The first tick emits exactly one order —
-   the researcher's. There is no writer job to hand out, so no eager agent can
+   the researcher's. There is no writer job to hand out, so no eager Step Agent can
    write a report from findings that don't exist. The hope version is a
    prompt: *"wait until research is complete before writing."*
 
@@ -63,7 +63,7 @@ and reports results back. Here's what the engine enforces as that loop runs:
 
 3. **The report can't approve itself.** When the writer commits `report`, it
    lands in `submitted`, not done. The reviewer is a separate order to a
-   separate agent — one that never saw the writer's reasoning. A rejection
+   separate Step Agent — one that never saw the writer's reasoning. A rejection
    re-arms the writer with the reviewer's reasons attached to its next job.
    The hope version: *"review your work before finishing"* — the fox
    auditing the henhouse.
@@ -140,7 +140,7 @@ Two things make this more than running steps in dependency order:
   the inputs it was built from are still green and unchanged. Re-run an early step and
   everything built on it quietly falls back to a debt — no code required to invalidate it.
 - **Rejections carry reasons.** When a reviewer rejects an output, the text rides along.
-  The next job for the producer shows *why* it's being asked again, so the agent has
+  The next job for the producer shows *why* it's being asked again, so the Step Agent has
   the feedback in hand. (Three flavors: a reviewer's **judgment**, the engine's own
   **schema** refusal of a malformed value, and **structural** knock-backs from a
   change cascading downstream.)
@@ -247,7 +247,7 @@ to a human, or run a compensating step instead of silently re-firing. See
 
 `model: fast | standard | strong | strongest` declares intent, not a vendor
 id — the engine passes it through untouched to whatever dispatches your
-workers. A portable workflow says "this step needs strong judgment"; the
+Step Agents. A portable workflow says "this step needs strong judgment"; the
 host binds that to whatever model it runs on. `strong` is a high-capability
 workhorse tier, not the host's single most capable model — that's what the
 opt-in `strongest` tier is for, reserved for the rare step where nothing less
@@ -296,13 +296,13 @@ looks like:
   each order with whatever executes your work (an agent CLI, an API call, a
   script), report, repeat. Fully deterministic dispatch if you want it —
   see [Embedding it](#embedding-it) for the in-process version. A reference
-  dispatcher/conductor, owenwork, is available separately — the engine core
+  dispatcher/Conductor, owenwork, is available separately — the engine core
   ships no host harness of its own.
-- **An agent as the orchestrator** — point any tool-using agent (Claude Code,
+- **A Prime Agent as the orchestrator** — point any tool-using agent (Claude Code,
   Codex, Gemini CLI, anything that can run a shell command) at the CLI and
   tell it to drive the instance to done. A slash command or skill that wraps
   this turns "run the release workflow" into one line.
-- **An agent structuring its own work, inline** — mid-task, an agent authors
+- **A Prime Agent structuring its own work, inline** — mid-task, the Prime Agent authors
   a throwaway workflow, drives itself through it, and deletes it: the engine
   as scratch discipline rather than standing infrastructure.
 
@@ -323,14 +323,14 @@ patterns ready-made:
 
 ## Quick start
 
-Install the owenloop skills for whatever agent you use — Claude Code, Codex,
+Install the owenloop skills for whatever Prime Agent you use — Claude Code, Codex,
 Cursor, and most others:
 
 ```sh
 npx skills add typicalday/owenloop
 ```
 
-Then ask your agent for what you want:
+Then ask your Prime Agent for what you want:
 
 > Use owenloop-author to build me a workflow that researches a topic, writes
 > a report, and doesn't accept it until an independent reviewer signs off —
@@ -360,7 +360,7 @@ Want someone else's workflow defs instead of writing your own?
 `owenloop add <owner>/<repo>` fetches a public GitHub repo's `workflows/**`,
 validates every def, and installs them locally with pinned provenance — see
 the `add` entry in [`docs/cli.md`](docs/cli.md). An installed def's steps later
-run with your workers' full privileges and owenloop never executes them itself,
+run with your Step Agents' full privileges and owenloop never executes them itself,
 so install only sources you trust, and pin a commit SHA (`@<sha>`) for anything
 you re-add — the [trust model](docs/cli.md#add--installing-shared-workflow-defs-from-github)
 is spelled out there.
@@ -371,7 +371,7 @@ goes into the macOS Keychain or a `0600` file, never the repo, and is verified
 against the hub before it's ever stored), `owenloop connect` binds the project
 to a hub, and `owenloop push` publishes your defs — idempotent against the
 hub's own def hashes, so an unchanged re-push is a no-op. `owenloop agent new
-<name>` mints an agent identity on the hub and stores its token in slot
+<name>` mints a Scoped Identity on the hub and stores its token in slot
 `agent:<name>` without ever printing it. See the
 [Hub](docs/cli.md#hub-login--connect--push--logout) section in `docs/cli.md`.
 
@@ -483,7 +483,7 @@ const wf = engine.createInstance('delivery', {
   provide: { proposal: { text: 'add dark mode' } },
 });
 
-// the worker loop: tick → run → report
+// the Step Agent loop: tick → run → report
 const { orders } = engine.tick(wf);
 for (const order of orders) {
   const result = await runYourAgent(order);              // ← your domain

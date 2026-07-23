@@ -1042,7 +1042,7 @@ export function asMintAgentTokenOk(body: unknown): MintAgentTokenOk {
 }
 
 /**
- * One agent identity as `GET /api/agent_identities` reports it — the fields the
+ * One Scoped Identity as `GET /api/agent_identities` reports it — the fields the
  * setup converger and the doctor probe consult. The row is non-secret: it names
  * agents and their pools, never a token.
  *
