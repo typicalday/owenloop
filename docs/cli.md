@@ -800,9 +800,9 @@ block; a non-2xx response comes back as an error result.
 | `presence_ping` | register/refresh this Conductor in the presence registry |
 | `list_conductors` | your principal's registered Conductors and their online/offline state |
 | `wake` | cheap "has anything changed since cursor X" pre-check for a polling loop |
-| `create_agent` | create a NEW agent identity and store its credential locally — **never returns the token** |
+| `create_agent` | create a NEW Scoped Identity and store its credential locally — **never returns the token** |
 
-`create_agent {name, pools?, scopes?}` mints a fresh agent identity on the hub
+`create_agent {name, pools?, scopes?}` mints a fresh Scoped Identity on the hub
 with `work` scope by default; pass `scopes` (e.g. `["work","run"]`) to choose the
 minted token's scopes. It then writes the minted `olp_` token straight to this
 machine's credential store (slot `agent:<name>`). The token is **never** returned in the

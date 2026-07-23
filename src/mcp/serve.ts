@@ -502,7 +502,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 const AGENT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 /**
- * Tool 18 — `create_agent`. Mints a NEW agent identity and writes its `olp_`
+ * Tool 18 — `create_agent`. Mints a NEW Scoped Identity and writes its `olp_`
  * token straight to the local store; NEVER returns the token. Decision 6: the
  * mint response leaks the plaintext in `data.token` AND the human `text` field,
  * so this handler never passes the raw body outbound — it takes only the
