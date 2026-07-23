@@ -582,7 +582,7 @@ export interface MintAgentResult {
 }
 
 /**
- * Mint a new agent identity on `origin` as the human `cred` and persist the
+ * Mint a new Scoped Identity on `origin` as the human `cred` and persist the
  * returned `olp_` token to slot `agent:<name>`. CLI-free (no `Args`, no exit
  * codes — the caller maps failures to exit codes) so both `owenloop agent new`
  * (O3) and `owenloop mcp`'s `create_agent` (O2) can reuse it.
@@ -751,7 +751,7 @@ export interface RekeyAgentResult {
 }
 
 /**
- * Re-key an EXISTING agent identity on `origin` as the human `cred`: the hub
+ * Re-key an EXISTING Scoped Identity on `origin` as the human `cred`: the hub
  * mints a fresh `olp_` token for `agentId`, REVOKES the identity's current
  * token(s), and this function persists the new token into the SAME
  * `agent:<name>` slot — overwriting the old one. Sibling of

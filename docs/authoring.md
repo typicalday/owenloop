@@ -91,7 +91,7 @@ steps:
 ## `model:` — quality tiers, not vendor ids
 
 The engine never calls a model; `model:` is an opaque string that rides the
-order to whatever dispatches your workers (an agent skill, a runner, your own
+order to whatever dispatches your Step Agents (an agent skill, a runner, your own
 loop). Portable workflows should declare **intent** with one of four tier
 names and let the dispatcher bind them to the host it runs on — Claude Code,
 Codex, Gemini CLI, whatever:
@@ -121,7 +121,7 @@ kind of executor instead: a shell command, a webhook, a browser-automation
 runner, anything a dispatcher on the other end of `tick` knows how to run.
 The engine never executes anything itself — `worker:` is an opaque label
 that rides the order (same pass-through contract as `model`) for whatever
-drives your workers to switch on.
+drives your Step Agents to switch on.
 
 ```yaml
 steps:
@@ -179,9 +179,9 @@ no filter at all) ticks it. An empty `labels:` list normalizes to absent.
 Two consequences are worth stating plainly:
 
 - **Routing, not authorization.** A caller that passes *no* filter claims every
-  step, labeled or not — and any worker that can reach the database can tick
+  step, labeled or not — and any Step Agent that can reach the database can tick
   without a filter. Labels are a work-splitting convenience, never a security
-  boundary; never rely on them to keep a step away from a worker that shouldn't
+  boundary; never rely on them to keep a step away from a Step Agent that shouldn't
   run it.
 - **Starvation hazard.** If every live caller ticks with a label filter and
   none of them intersects a given step's labels, that step's orders sit
@@ -429,7 +429,7 @@ By default a step fires when its consumed inputs are all green (`inputsGreen`). 
   evaluator*: a final step that inspects the finished workflow and greens an `outcome`.
 - **`idle`** — fire when the workflow has made no progress for longer than `idleAfter`
   (required). Use for a watchdog, a stuck-detector, or a timeout handler.
-- **`[allGreen, idle]`** — both. The worker reads `order.cause` (`'allGreen'` or
+- **`[allGreen, idle]`** — both. The Step Agent reads `order.cause` (`'allGreen'` or
   `'idle'`) to branch.
 
 ```yaml
@@ -446,7 +446,7 @@ carry an empty input fingerprint, so a commit can never satisfy it, and
 `owenloop lint` hard-errors on it. Declare the step's output under
 `produces:`/`generates:` only.
 
-**Alarms.** A worker that needs a heartbeat or a deadline can call
+**Alarms.** A Step Agent that needs a heartbeat or a deadline can call
 `engine.setAlarm(workflow, step, at)` with an absolute timestamp — it overrides the
 relative `idleAfter` window and survives a process restart.
 `engine.nextAlarm(workflow)` tells an external scheduler when to wake the instance.

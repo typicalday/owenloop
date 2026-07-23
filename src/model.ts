@@ -1873,7 +1873,7 @@ function eligibleOutcomes(
 
   // §24: a judge firing's own verdict is against the judged stem, not against a
   // produce of its own (judge steps declare `produces: []`). Model the two verbs
-  // the judge agent can issue (green/reject, Q2) as their own outcomes, entirely
+  // the judge Step Agent can issue (green/reject, Q2) as their own outcomes, entirely
   // separate from the producer-outcome branches below.
   if (step.judges) {
     // §26: if this is the last pending judge and approving would flip the

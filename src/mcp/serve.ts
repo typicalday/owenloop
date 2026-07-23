@@ -5,7 +5,7 @@
  * owenloop-service repo): owenloop runs two distinct planes. The HUMAN control
  * plane is the everyday operator surface — starting runs, answering gates,
  * pushing defs — and it authenticates as the logged-in human. The AGENT plane
- * is what a delivery-line worker uses with its own `olp_` bearer. This module
+ * is what a Step Agent uses with its own `olp_` bearer. This module
  * serves the HUMAN plane to a local MCP host (Claude Code) over stdio: it reads
  * newline-delimited JSON-RPC 2.0 on stdin, translates each `tools/call` into one
  * authenticated HTTPS request to the hub's `/api/*` REST mirror, and writes the
@@ -275,8 +275,8 @@ function passthrough(deps: McpDeps, build: (args: Record<string, unknown>) => Hu
 /**
  * The 17 baseline tools — names, descriptions, and schemas mirror the hub's own
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
- * to an H3 `/api/*` REST mirror. Descriptions say "agent" for the identity,
- * never "tool" (model-doc §0/§10).
+ * to an H3 `/api/*` REST mirror. Descriptions say "Scoped Identity" for the identity
+ * (wire names keep `agent`), never "tool" (model-doc §0/§10).
  */
 function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
   return [
@@ -464,7 +464,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'presence_ping',
       description:
-        'Register or refresh this conductor in the presence registry (name + the labels it serves). Call it on a ~60s cadence; the entry reads as offline after ~3 min of missed pings. Observability only. Omitting serve_pools stores an empty label set (overwrite, NOT keep-previous).',
+        'Register or refresh this Conductor in the presence registry (name + the labels it serves). Call it on a ~60s cadence; the entry reads as offline after ~3 min of missed pings. Observability only. Omitting serve_pools stores an empty label set (overwrite, NOT keep-previous).',
       inputSchema: {
         type: 'object',
         properties: { name: { type: 'string' }, serve_pools: { type: 'array', items: { type: 'string' } } },
@@ -476,7 +476,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'list_conductors',
       description:
-        "Your principal's registered conductors, each with an online/offline flag (derived from its last ping), the labels it serves, and how long since it was last seen.",
+        "Your principal's registered Conductors, each with an online/offline flag (derived from its last ping), the labels it serves, and how long since it was last seen.",
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       handler: passthrough(deps, () => ({ method: 'GET', path: '/api/conductors' })),
     },
@@ -502,7 +502,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
 const AGENT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 /**
- * Tool 18 — `create_agent`. Mints a NEW agent identity and writes its `olp_`
+ * Tool 18 — `create_agent`. Mints a NEW Scoped Identity and writes its `olp_`
  * token straight to the local store; NEVER returns the token. Decision 6: the
  * mint response leaks the plaintext in `data.token` AND the human `text` field,
  * so this handler never passes the raw body outbound — it takes only the
@@ -513,7 +513,7 @@ function createAgentTool(deps: McpDeps): ToolRegistration {
   return {
     name: 'create_agent',
     description:
-      'Create a NEW agent identity on the hub and store its credential locally. NEVER returns the token — it is written to this machine\'s credential store only. Refuses a name that is already taken. Mints with `work` scope by default; pass `scopes` (e.g. ["work","run"]) to choose.',
+      'Create a NEW Scoped Identity on the hub and store its credential locally. NEVER returns the token — it is written to this machine\'s credential store only. Refuses a name that is already taken. Mints with `work` scope by default; pass `scopes` (e.g. ["work","run"]) to choose.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -565,7 +565,7 @@ function createAgentTool(deps: McpDeps): ToolRegistration {
         await storeCredential(deps.io, deps.origin, { principal: 'agent', account: name }, { kind: 'agent', accessToken: token });
       } catch (e) {
         return errorText(
-          `${(e as Error).message} — the minted token was NOT stored — revoke/re-key the agent '${name}' from the console`,
+          `${(e as Error).message} — the minted token was NOT stored — revoke/re-key the Scoped Identity '${name}' from the console`,
         );
       }
       // Success: built from scratch. `pools` (poolNames) is safe; token/text/id
@@ -581,7 +581,7 @@ function stageEnrollmentTool(deps: McpDeps): ToolRegistration {
   return {
     name: 'stage_enrollment',
     description:
-      'Stage an agent enrollment on the hub, returning a join code the new agent redeems. A join code is transferred authority, not a credential — it is safe to surface.',
+      'Stage a Scoped Identity enrollment on the hub, returning a join code the enrolling machine redeems. A join code is transferred authority, not a credential — it is safe to surface.',
     inputSchema: {
       type: 'object',
       properties: {

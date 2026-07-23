@@ -8,7 +8,7 @@
  * green"); a commit-fingerprint CAS makes concurrent advancement safe.
  *
  * This is the public API. The engine is domain-neutral: a *wiring* (a set of
- * workflow definitions + a worker that executes orders) layers a concrete
+ * workflow definitions + a Step Agent that executes orders) layers a concrete
  * process — software delivery, research, triage — on top of it.
  */
 

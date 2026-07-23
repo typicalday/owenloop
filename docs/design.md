@@ -663,7 +663,7 @@ The `M2B-REARM` branch (§23.6.1 step 7 — child un-greened while parent stays 
 - **Aggregation.** Child orders are concatenated onto the parent's; `reaped` sums; `dueAt` takes the minimum across the tree so the caller's next-wake is the earliest across all levels. Each folded `DeferredFiring` carries a `workflow` field naming the instance it belongs to — **absent means the ticked root, present means a descendant** — so a caller can still tell which instance a deferral came from. The single `now` is threaded through the whole descent, so a reap TTL that trips at the parent's clock trips consistently for children in the same sweep.
 - **Opt-out.** `tick(parentWf, { deep: false })` (CLI `--shallow`) ticks only that one instance — no descent, orders all carry the root's `workflow`. Use it to drive a single instance deliberately (tests, targeted retries); the default deep tick is what production drivers want.
 
-**Status child-summary.** `status(parentWf)` enriches each `calls:`-debt entry with a `child: ChildStatusSummary` (`{ workflow, def, done, stalled, debts }`) when a child has been spawned for that step. `stalled` is true when the child (or, recursively, a grandchild on an unpaid `calls:` path) has any stalled debt — a worker that hit `maxAttempts` with no green outcome. This lets a conductor see, from the parent alone, that a `calls:` debt is blocked on a stuck child without separately walking into the child's own `status`. Like `failedRuns`/`attempts`, the field is engine-populated cross-instance state; `model.ts`'s pure single-instance `workflowStatus` never sets it.
+**Status child-summary.** `status(parentWf)` enriches each `calls:`-debt entry with a `child: ChildStatusSummary` (`{ workflow, def, done, stalled, debts }`) when a child has been spawned for that step. `stalled` is true when the child (or, recursively, a grandchild on an unpaid `calls:` path) has any stalled debt — a worker that hit `maxAttempts` with no green outcome. This lets a Conductor see, from the parent alone, that a `calls:` debt is blocked on a stuck child without separately walking into the child's own `status`. Like `failedRuns`/`attempts`, the field is engine-populated cross-instance state; `model.ts`'s pure single-instance `workflowStatus` never sets it.
 
 **Discovering children directly.** A driver can still enumerate children itself — `store.listChildrenByParent`/`findChildByParent` give the reverse index from a parent id — and a propagated reject remains visible via the CHILD's own `status(childWf).debts` (the rejected outcome artifact appears there with `acceptance: 'rejected'`). But with deep tick as the default, a driver that sweeps only roots already reaches all live descendants; explicit child enumeration is for inspection and for the `--shallow` single-instance path, not a requirement for liveness.
 
@@ -875,7 +875,7 @@ steps:
 ```
 
 - `name:` — required; keys the sign-off ledger and the audit trail.
-- `body:` / `bodyFile:` — the judge agent's prompt (exactly one required,
+- `body:` / `bodyFile:` — the judge Step Agent's prompt (exactly one required,
   mutually exclusive, same rule as step bodies). `bodyFile` is resolved
   against the workflow's base directory and read eagerly at def-load.
 - `model:` — optional model override for that judge's order. Opaque to the
@@ -919,12 +919,12 @@ left as a known, accepted limitation — see the doc comment on `reject()` in
 `src/engine.ts`.
 
 **Mitigations, for operators running judges with slow or expensive verdict
-agents:**
+Step Agents:**
 
 - Keep `judges: <judgedStem>` steps at `parallel: 1` (the default) so there
   is only ever one live run of a given judge step at a time. This alone
   removes the "two different runs" precondition for the race.
-- Set a generous `reapTtl:` on judge steps whose verdict agent is slow —
+- Set a generous `reapTtl:` on judge steps whose verdict Step Agent is slow —
   reaping is what creates the zombie in the first place (§24.5); a judge
   that is legitimately still working should not be reaped out from under
   itself. A TTL sized to the judge's real worst-case latency, rather than

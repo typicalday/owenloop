@@ -49,7 +49,7 @@ for the full breakdown.
 | `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
-| `agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]` | mint a new agent identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--conductor` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
+| `agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--conductor` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
 | `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]` | converge this machine's install (human login, agent credential, owenwork settings, plugin) in one idempotent pass — see [`setup`](#setup--converge-a-machines-install) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
@@ -256,13 +256,13 @@ ref) surfaces as a 404 from the sha-resolve step.
 **Trust model — what `add` does and does not protect.** Installing a package
 executes nothing at install time: `add` only fetches, validates, and writes
 YAML under the defs dir. But an installed def's steps *run* later, with
-whatever privileges the host process and its dispatcher grant their workers.
+whatever privileges the host process and its dispatcher grant their Step Agents.
 owenloop itself never executes a step body — `worker:`/`command:` are opaque
 labels it carries through untouched and never shells out (see [What owenloop is
 not](../README.md#what-owenloop-is-not) and
 [`docs/authoring.md`](authoring.md#worker--declaring-the-executor)) — so the
-real risk surface is the conductor or worker you point at these defs: the
-prompts and `command:` strings that ship in a package are handed to agents that
+real risk surface is the Conductor or Step Agent you point at these defs: the
+prompts and `command:` strings that ship in a package are handed to Step Agents that
 typically run with your full local privileges. **Install only sources you
 trust.**
 
@@ -280,7 +280,7 @@ install *step* — staged all-or-nothing validation with an atomic swap, path
 containment (including symlink-aware `bodyFile` checks), and archive resource
 bounds — not the def *content* that later executes. `add` validates a def's
 structure and contains its paths; it does not sandbox or sanitize what a step
-body will do once a worker runs it. That trust decision stays yours.
+body will do once a Step Agent runs it. That trust decision stays yours.
 
 **Untrusted-archive safety.** `add` treats the fetched repo as untrusted and
 refuses the whole install (nothing written) on any of these:
@@ -534,7 +534,7 @@ CLI.
 
 ### `agent new` — mint an agent token into a slot
 
-`owenloop agent new <name>` mints a new agent identity on the hub (`POST
+`owenloop agent new <name>` mints a new Scoped Identity on the hub (`POST
 /api/mint_agent_token`, authenticated as your **human** credential) and stores
 the returned `olp_` token in the local credential slot `agent:<name>` — the same
 slot `login --as agent:<name>` writes and `push --as agent:<name>` reads. Use it
@@ -547,7 +547,7 @@ model §6, "rule of gates"). The confirmation JSON is built from a whitelist of
 **non-secret** fields only: `hub`, `name`, `slot`, `pools` (the resolved pool
 names), `scopes` (the minted token's scopes — `["work"]` by default, or whatever
 `--scopes`/`--conductor` selected), `storage` (`keychain` | `file`), `agentId` (the
-agent's id), and `tokenId` (a revocation handle). To use the agent afterwards,
+Scoped Identity's id), and `tokenId` (a revocation handle). To use the Scoped Identity afterwards,
 pass `--as agent:<name>` to `connect`/`push`; to revoke it, use its `tokenId`
 on the hub.
 
@@ -613,11 +613,11 @@ write, no browser, no mint/rekey/register POST). The steps:
    loopback-OAuth browser flow as `owenloop login` when none is present or it no
    longer verifies. This is the gate that makes step 3's mint/rekey legal.
 3. **agent** — find a local `agent:<name>` slot that verifies live against the
-   hub and reuse it; otherwise **mint** a new agent identity or **rekey**
+   hub and reuse it; otherwise **mint** a new Scoped Identity or **rekey**
    (replace the credential of) an existing one. How the target is chosen is
-   [below](#choosing-the-agent-flow-a-vs-flow-b).
+   [below](#choosing-the-scoped-identity-flow-a-vs-flow-b).
 4. **owenwork settings** — write `hubOrigin` into the owenwork settings file so
-   the local worker talks to this hub (skipped when it already matches).
+   the local Step Agent talks to this hub (skipped when it already matches).
 5. **plugin** — check whether the Claude Code `owenloop` plugin is installed.
    **Non-fatal:** while the marketplace is unpublished this step only *prints*
    the manual install commands (`claude plugin marketplace add owenloop` then
@@ -629,20 +629,20 @@ Progress lines (the `[n/6]` headers and `✓`/`✗` marks) go to **stderr**; the
 final machine-readable summary — `{ ok, hub, steps, doctor }` — goes to
 **stdout**.
 
-### Choosing the agent (Flow A vs Flow B)
+### Choosing the Scoped Identity (Flow A vs Flow B)
 
-When step 3 has to act (no reusable local agent slot), it decides *which* agent
+When step 3 has to act (no reusable local agent slot), it decides *which* Scoped Identity
 to connect this machine to:
 
-- **Flow A — fresh org (no agent identities on the hub):** setup asks you to
-  **name** the agent, prefilled with a sanitized form of the machine hostname.
+- **Flow A — fresh org (no Scoped Identities on the hub):** setup asks you to
+  **name** the Scoped Identity, prefilled with a sanitized form of the machine hostname.
   The name is a suggestion — any label matching `[A-Za-z0-9][A-Za-z0-9._-]*`
-  (1–64 chars) is accepted. It then **mints** that agent.
-- **Flow B — org already has agents (succession):** setup shows the existing
-  agents (each with its name, when it was **last active**, and its **pools**)
+  (1–64 chars) is accepted. It then **mints** that Scoped Identity.
+- **Flow B — org already has Scoped Identities (succession):** setup shows the existing
+  Scoped Identities (each with its name, when it was **last active**, and its **pools**)
   and asks whether this is a *new* installation or one that *replaces* an
-  existing agent. Choosing **new** mints a fresh agent; choosing **replace**
-  **rekeys** the chosen agent — which **revokes that agent's current
+  existing Scoped Identity. Choosing **new** mints a fresh Scoped Identity; choosing **replace**
+  **rekeys** the chosen Scoped Identity — which **revokes that Scoped Identity's current
   credential**, so if it is still running elsewhere it will be disconnected
   there.
 
@@ -650,18 +650,18 @@ to connect this machine to:
 scripted or piped run) and step 3 needs to act, setup will not block on a
 prompt — it errors unless you pre-decide with one of:
 
-- `--new-agent <name>` — mint a new agent named `<name>` (skips Flow A's name
+- `--new-agent <name>` — mint a new Scoped Identity named `<name>` (skips Flow A's name
   prompt and Flow B's succession prompt).
-- `--replace-agent <name>` — rekey the existing agent named `<name>` (skips the
-  succession prompt); errors if no such agent exists on the hub.
+- `--replace-agent <name>` — rekey the existing Scoped Identity named `<name>` (skips the
+  succession prompt); errors if no such Scoped Identity exists on the hub.
 
 The two flags are mutually exclusive. `--pools <a,b>` applies **only** to a mint
 (`--new-agent` or a fresh org); combining it with `--replace-agent` is a usage
-error, because rekeying preserves the agent's existing pools (manage those in
+error, because rekeying preserves the Scoped Identity's existing pools (manage those in
 the console). `--scopes <a,b>` likewise applies **only** to a mint — it selects
 the minted token's scopes (default `work`); combining it with `--replace-agent`
-is a usage error, because rekeying preserves the agent's existing scopes (mint a
-new agent to change scopes). `setup` has no `--conductor` shorthand — spell the
+is a usage error, because rekeying preserves the Scoped Identity's existing scopes (mint a
+new Scoped Identity to change scopes). `setup` has no `--conductor` shorthand — spell the
 scopes out with `--scopes work,run`.
 
 ### Hub resolution differs from `agent new`
@@ -692,7 +692,7 @@ the flagship command never opens a browser only to fail at the store.)
 ### After setup
 
 If the connected agent account is anything other than `default`, setup prints a
-reminder to run owenwork with `OWENWORK_ACCOUNT=<name>` so the worker reads the
+reminder to run owenwork with `OWENWORK_ACCOUNT=<name>` so the Step Agent (owenwork) reads the
 right slot.
 
 **Exit codes.**
@@ -701,7 +701,7 @@ right slot.
 |---|---|
 | `0` | every step ended skipped/done/noted **and** doctor's core checks (1–5) passed |
 | `1` | setup ran but doctor's core checks did not all pass |
-| non-zero (thrown) | a hard failure — bad flags, unresolvable hub (2), 403 from the hub (setup needs an admin credential to manage agents), a named `--replace-agent` that doesn't exist, or a configured external credential command |
+| non-zero (thrown) | a hard failure — bad flags, unresolvable hub (2), 403 from the hub (setup needs an admin credential to manage Scoped Identities), a named `--replace-agent` that doesn't exist, or a configured external credential command |
 
 ## `doctor` — check a machine's install
 
@@ -797,12 +797,12 @@ block; a non-2xx response comes back as an error result.
 | `release` | give back a claim so its order is re-offered without waiting out the reap TTL |
 | `publish_event` | publish an event against a contract, starting one run per matched subscription |
 | `list_subscriptions` | the org's contract subscriptions |
-| `presence_ping` | register/refresh this conductor in the presence registry |
-| `list_conductors` | your principal's registered conductors and their online/offline state |
+| `presence_ping` | register/refresh this Conductor in the presence registry |
+| `list_conductors` | your principal's registered Conductors and their online/offline state |
 | `wake` | cheap "has anything changed since cursor X" pre-check for a polling loop |
-| `create_agent` | create a NEW agent identity and store its credential locally — **never returns the token** |
+| `create_agent` | create a NEW Scoped Identity and store its credential locally — **never returns the token** |
 
-`create_agent {name, pools?, scopes?}` mints a fresh agent identity on the hub
+`create_agent {name, pools?, scopes?}` mints a fresh Scoped Identity on the hub
 with `work` scope by default; pass `scopes` (e.g. `["work","run"]`) to choose the
 minted token's scopes. It then writes the minted `olp_` token straight to this
 machine's credential store (slot `agent:<name>`). The token is **never** returned in the
@@ -857,7 +857,7 @@ codebase-advisor pipeline combining collections, a mid-flight human gate,
 per-element knock-backs, and suffixed-reduce fan-ins). Each example's header
 comment walks through its commands end to end.
 
-Playing every worker yourself is the fastest way to internalize the loop.
+Playing every Step Agent yourself is the fastest way to internalize the loop.
 Every command prints JSON, so the snippet below pipes through `jq`:
 
 ```sh
@@ -875,7 +875,7 @@ owenloop defs                                  # what workflows are available
 wf=$(owenloop create delivery \
        --provide proposal='{"text":"add dark mode"}' | jq -r .workflow)
 
-# the worker loop: tick → run → report
+# the Step Agent loop: tick → run → report
 run=$(owenloop tick $wf | jq -r '.orders[0].run')   # claim the planner job
 owenloop green $wf $run plan --value '{"plan":"…"}'  # report its output
 
@@ -902,7 +902,7 @@ instead of waiting for the next tick. `owenloop reap <wf>` runs that same
 cleanup on demand, applying the normal per-step/engine TTL rules — usually a
 no-op (`{ reaped: 0, details: [] }`). `owenloop reap <wf> --now` is the admin
 stand-down: it forces every currently-claimed task stale (TTL 0) regardless of
-how fresh its claim is, for reclaiming a worker you know is dead without
+how fresh its claim is, for reclaiming a Step Agent you know is dead without
 waiting out the TTL. Reaping re-arms the task immediately, so **the run that
 held the cleared lease can no longer commit** — its next `green`/`close` fails
 with `run <id> no longer holds its lease (reaped or superseded)`, the same
@@ -942,13 +942,13 @@ can be born-rejected too — a [judge's](authoring.md#judges--quality-gates-befo
 verdict lands on a stale `submitted` version (a sibling judge already settled
 it, the producer resubmitted, or a human bypassed it) and the CAS guard
 refuses it. The result JSON is always written to stdout; the human-readable
-reason goes to stderr. A successful call exits 0 — a worker should treat a
+reason goes to stderr. A successful call exits 0 — a Step Agent should treat a
 non-zero exit as a failure, not a success.
 
 ## What a job looks like
 
 `tick` returns `{ workflow, orders, reaped }`. Each order is self-contained —
-a worker needs nothing else to do the work:
+a Step Agent needs nothing else to do the work:
 
 ```jsonc
 {
@@ -968,7 +968,7 @@ a worker needs nothing else to do the work:
 }
 ```
 
-A worker reads `prompt` + `consumes` + `owes`, does the work, reports with
+A Step Agent reads `prompt` + `consumes` + `owes`, does the work, reports with
 `green` (or `emit`/`seal` for collections), then `close`s the job. The reject
 counts in `owes[]` let a workflow escalate on its own — e.g. switch to a
 stronger model after two rejections — before the engine stalls the step.
@@ -1001,8 +1001,8 @@ watch for.
 **Child stalls on `status`.** `status <wf>`'s `calls:`-debt entries carry a
 `child: { workflow, def, done, stalled, debts }` summary once a child has been
 spawned. `child.stalled: true` means the child (or a grandchild below it) has a
-worker stuck at `maxAttempts` with no green outcome — the parent debt is blocked
-on stuck child work. This lets a conductor spot a wedged child from the parent
+Step Agent stuck at `maxAttempts` with no green outcome — the parent debt is blocked
+on stuck child work. This lets a Conductor spot a wedged child from the parent
 `status` alone, without separately walking into the child's own `status`.
 
 **`wait --until` is single-instance.** `wait <wf> --until eligible|done` polls
