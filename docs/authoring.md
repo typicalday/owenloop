@@ -165,22 +165,59 @@ interpreted by the engine beyond that. All three (`worker`, `command`,
 like `model` and `workdir`. See [`docs/design.md` §27.4](design.md) for the
 full contract.
 
-## `labels:` — routing a step to a particular tick caller
+## `labels:` — logical capability tags
 
-`labels:` is an optional list of opaque strings on a step. It exists so several
-orchestrators ticking the *same* database can split the work between them: a
-tick caller may pass one or more `--label <x>` filters (CLI) or
-`engine.tick(wf, { labels: [...] })` (embedding), and a step is left for a
+`labels:` is an optional list of strings on a step naming what that step
+*needs* — `gpu`, `repo-access` — not where it runs. They are part of **your**
+vocabulary as a def author: a capability tag, chosen to describe the work.
+An empty `labels:` list normalizes to absent.
+
+**Never write a pool name in a def.** A pool is a deployment fact belonging to
+one org on one hub; a def is portable. The indirection below is what keeps the
+two apart.
+
+**Golden path: most defs need no labels at all.** An **unlabeled** step routes
+to the run's `defaultPool` param if one was given, else to the starter's
+personal pool. That is the default path, and it is the right one until you have
+a fleet with genuinely different machines in it. Labels and bindings are the
+"advanced: teams & fleets" path — reach for a label only when a step needs a
+*specific* kind of machine.
+
+### On a hub: an admin binds each label to a pool
+
+On a hub, every label a step uses must be **bound to a pool by an org admin** —
+`owenloop binding new <label> <pool>`, or Console → Settings → Labels. See
+[label bindings](cli.md#label-bindings) for the commands.
+
+- **An unbound label fails the run at `start_run`**, with an error naming the
+  label and carrying the exact fix command. That fail-fast is deliberate: the
+  old behavior was an order that sat unserved forever. Binding is **explicit
+  only** — there is no implicit fallback in which an unbound label routes
+  somewhere by itself.
+- **Bindings are live, and that is the headline.** Retargeting a label (binding
+  it again, to a different pool) redirects the remaining steps of in-flight runs
+  at their next poll; deleting a binding pauses the steps that use it until it
+  is re-bound. As an author this means your def does **not** need re-publishing
+  when the fleet moves — the operator retargets the binding and your running
+  work follows.
+
+### Locally: labels are a tick filter
+
+The local/OSS engine has no binding table; there, the same labels act as a
+work-splitting filter so several orchestrators ticking the *same* database can
+divide the work. A tick caller may pass one or more `--label <x>` filters (CLI)
+or `engine.tick(wf, { labels: [...] })` (embedding), and a step is left for a
 *different* caller only when **both** the caller's filter and the step's own
 `labels:` are non-empty and share no value — that step's firings defer with
 reason `label-mismatch` until a caller whose filter matches (or a caller with
-no filter at all) ticks it. An empty `labels:` list normalizes to absent.
+no filter at all) ticks it.
 
-Two consequences are worth stating plainly:
+Labels are logical tags in both worlds; only the hub adds the binding
+indirection. Two consequences of the local filter are worth stating plainly:
 
 - **Routing, not authorization.** A caller that passes *no* filter claims every
   step, labeled or not — and any Step Agent that can reach the database can tick
-  without a filter. Labels are a work-splitting convenience, never a security
+  without a filter. Locally, labels are a work-splitting convenience, never a security
   boundary; never rely on them to keep a step away from a Step Agent that shouldn't
   run it.
 - **Starvation hazard.** If every live caller ticks with a label filter and
@@ -192,7 +229,8 @@ Two consequences are worth stating plainly:
 
 `labels:` is distinct from [`worker:`](#worker--declaring-the-executor):
 `worker:` says what *kind* of executor should run an order once it's claimed;
-`labels:` says *which tick caller* is allowed to claim it in the first place.
+`labels:` says *which* caller may claim it in the first place — a tick filter
+locally, a bound pool on a hub.
 
 ## `produces:` vs `generates:`
 

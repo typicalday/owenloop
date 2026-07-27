@@ -1111,6 +1111,123 @@ export function asAgentIdentities(body: unknown): AgentIdentitySummary[] {
 }
 
 /**
+ * One **label binding** as the hub reports it — an org-scoped row mapping a
+ * workflow-def `labels:` entry to a pool. Unrelated to `HubBinding` above, which
+ * is this project directory's binding to a hub (`owenloop connect`); every
+ * symbol in this family is `LabelBinding`-prefixed to keep the two apart.
+ *
+ * Non-secret: the row names a label, a pool, and who created it — never a token.
+ */
+export interface LabelBindingWire {
+  label: string;
+  poolId: string;
+  poolName: string;
+  createdBy: string;
+  createdAt: number;
+}
+
+/**
+ * `POST /api/set_label_binding`'s `binding`, which additionally reports the pool
+ * the label was bound to BEFORE this call — `null` on a fresh bind. That field
+ * is what makes the upsert self-describing: the CLI never has to ask "did this
+ * create or retarget?", the hub says so.
+ */
+export interface LabelBindingSetWire extends LabelBindingWire {
+  previousPoolName: string | null;
+}
+
+/**
+ * Validate the five common `LabelBindingWire` fields on one row. `prefix` is the
+ * endpoint-qualified lead-in the caller wants (e.g.
+ * `set_label_binding: malformed success response`) and `where` names the
+ * offending position (`binding`, or `bindings[2]`) — a FIELD/INDEX name only,
+ * never a value.
+ */
+function asLabelBindingRow(entry: unknown, prefix: string, where: string): LabelBindingWire {
+  if (typeof entry !== 'object' || entry === null) {
+    throw new Error(`${prefix} — ${where} is not an object`);
+  }
+  const e = entry as Record<string, unknown>;
+  for (const field of ['label', 'poolId', 'poolName', 'createdBy'] as const) {
+    if (typeof e[field] !== 'string' || e[field] === '') {
+      throw new Error(`${prefix} — ${where} missing non-empty string ${field}`);
+    }
+  }
+  if (typeof e.createdAt !== 'number') {
+    throw new Error(`${prefix} — ${where} missing number createdAt`);
+  }
+  return {
+    label: e.label as string,
+    poolId: e.poolId as string,
+    poolName: e.poolName as string,
+    createdBy: e.createdBy as string,
+    createdAt: e.createdAt,
+  };
+}
+
+/**
+ * Narrow `POST /api/set_label_binding`'s 200 body (`{ text, binding }`) to the
+ * typed binding. Throws on anything malformed, naming the offending FIELD only —
+ * same discipline as `asAgentIdentities`, so no body value is echoed.
+ *
+ * `previousPoolName` is deliberately LENIENT: **absent or `null` both mean "fresh
+ * bind, no prior pool"**. A JSON serializer that drops `undefined` would
+ * otherwise turn a genuinely successful bind into a hard failure — a strictly
+ * worse outcome than under-reporting a field that is null anyway. A present,
+ * non-null value must be a non-empty string; anything else (a number, an empty
+ * string) throws.
+ */
+export function asLabelBindingOk(body: unknown): LabelBindingSetWire {
+  if (typeof body !== 'object' || body === null) {
+    throw new Error('set_label_binding: malformed success response — not an object');
+  }
+  const b = body as Record<string, unknown>;
+  if (b.binding === undefined) {
+    throw new Error('set_label_binding: malformed success response — missing binding');
+  }
+  const row = asLabelBindingRow(b.binding, 'set_label_binding: malformed success response', 'binding');
+  const prev = (b.binding as Record<string, unknown>).previousPoolName;
+  let previousPoolName: string | null = null;
+  if (prev !== undefined && prev !== null) {
+    if (typeof prev !== 'string' || prev === '') {
+      throw new Error('set_label_binding: malformed success response — binding previousPoolName must be a non-empty string or null');
+    }
+    previousPoolName = prev;
+  }
+  return { ...row, previousPoolName };
+}
+
+/**
+ * Narrow `POST /api/delete_label_binding`'s 200 body (`{ text, deleted: true }`).
+ * `deleted` must be exactly `true` — this guard is how the CLI proves the 2xx
+ * really was a delete. The field is validated but deliberately NOT printed: the
+ * command's stdout shape is `{ ok, hub, label }` (frozen contract §2.4).
+ */
+export function asLabelBindingDeleted(body: unknown): { deleted: true } {
+  if (typeof body !== 'object' || body === null) {
+    throw new Error('delete_label_binding: malformed success response — not an object');
+  }
+  if ((body as Record<string, unknown>).deleted !== true) {
+    throw new Error('delete_label_binding: malformed success response — missing deleted: true');
+  }
+  return { deleted: true };
+}
+
+/**
+ * Narrow `GET /api/label_bindings`'s 200 body (`{ text, bindings: [...] }`) to a
+ * typed array. An EMPTY array is valid — that is the "this org has no bindings
+ * yet" case, not an error. Rows are plain `LabelBindingWire`; `previousPoolName`
+ * is a set-response field only and is not required here.
+ */
+export function asLabelBindings(body: unknown): LabelBindingWire[] {
+  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).bindings)) {
+    throw new Error('label_bindings: malformed response — expected a `bindings` array');
+  }
+  const list = (body as Record<string, unknown>).bindings as unknown[];
+  return list.map((entry, i) => asLabelBindingRow(entry, 'label_bindings: malformed response', `bindings[${i}]`));
+}
+
+/**
  * Success shape of `POST /api/rekey_agent_token` — the whitelist a caller may
  * keep. Sibling of `MintAgentTokenOk`, and MUST stay a whitelist for the same
  * reason: the real 200 body carries a `text` field whose value CONTAINS the new
