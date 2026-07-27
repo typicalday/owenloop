@@ -100,6 +100,9 @@ import type { AddJournal, InstalledEntry, InstallCommitHandle, Lockfile } from '
 import {
   asAgentIdentities,
   asCreateWorkflowOk,
+  asLabelBindingDeleted,
+  asLabelBindingOk,
+  asLabelBindings,
   asWhoami,
   computeServerDiff,
   credentialBackend,
@@ -536,6 +539,9 @@ Commands:
   push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
   agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --conductor = --scopes work,run)
+  binding new <label> <pool> [--hub <url>]   bind (or retarget) a workflow label to a pool on the hub org (admin; human credential)
+  binding rm <label> [--hub <url>]         remove a label's pool binding
+  binding list [--hub <url>]               list the hub org's label bindings
   setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenwork settings, plugin (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
@@ -629,6 +635,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['connect', cmdOpts('hub', 'as')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
   ['agent', cmdOpts('pools', 'hub', 'scopes', 'conductor')],
+  ['binding', cmdOpts('hub')],
   ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'pools', 'scopes')],
   ['doctor', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
@@ -2000,6 +2007,48 @@ async function authedGet(
 }
 
 /**
+ * POST a JSON `body` to `path` on `origin` with a bearer credential — the
+ * request-side sibling of `authedGet`, and the same chain `mintAgentCredential`
+ * runs: refresh an expiring oauth token first (`persist` defaults to true, so a
+ * rotated refresh token lands in the store), POST, and on a 401 with an oauth
+ * credential refresh once and retry exactly once.
+ *
+ * Goes through `hubFetch`, never raw `fetch` — that is what supplies the 30s
+ * deadline, the bounded body read, and `redirect: 'error'`.
+ *
+ * Returns the raw response plus the credential actually used, leaving ALL error
+ * semantics (the final 401, a non-2xx, body parsing) to the caller, exactly like
+ * `authedGet` — the wording differs by context.
+ */
+async function authedPost(
+  io: CliIO,
+  origin: string,
+  slot: CredentialSlotSelector,
+  cred: Credential,
+  path: string,
+  body: unknown,
+  persist = true,
+): Promise<{ res: Response; cred: Credential }> {
+  let current = await ensureFreshOAuth(io, origin, slot, cred, persist);
+  const doPost = (bearer: Credential): Promise<Response> =>
+    hubFetch(io, resolveEndpoint(origin, path), {
+      method: 'POST',
+      headers: {
+        Authorization: authHeader(bearer),
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+  let res = await doPost(current);
+  if (res.status === 401 && current.kind === 'oauth') {
+    current = await refreshOAuth(io, origin, slot, current as Extract<Credential, { kind: 'oauth' }>, persist);
+    res = await doPost(current);
+  }
+  return { res, cred: current };
+}
+
+/**
  * A 401 on an agent token is a hard "revoked/invalid" error; a 401 on any
  * other credential kind (after `authedGet`'s one refresh-and-retry) is a hard
  * "credential rejected" error; any other non-2xx is a generic hub-rejected
@@ -2688,14 +2737,23 @@ function createWorkflowRequest(
 }
 
 /**
- * Resolve the hub `agent new` mints on: `--hub <origin>` (normalized via
- * `normalizeOrigin`) → else the ONE hub the credential FILE knows → else a
- * `CliError` with `exitCode: 2` naming both remedies.
+ * Resolve the hub a mutating hub command acts on — shared by `agent new` and
+ * `binding new|rm|list`: `--hub <origin>` (normalized via `normalizeOrigin`) →
+ * else the ONE hub the credential FILE knows → else a `CliError` with
+ * `exitCode: 2` naming both remedies.
+ *
+ * `purpose` is the verb phrase spliced into both exit-2 messages ("cannot
+ * determine which hub to <purpose> — …"). It defaults to `'mint on'` so
+ * `dispatchAgent`'s two-argument call keeps `agent new`'s error strings
+ * byte-identical; `dispatchBinding` passes `'manage label bindings on'`.
  *
  * Deliberately NOT `resolveHub` (`--hub → OWENLOOP_HUB → DEFAULT_HUB`): silently
  * defaulting a MINT to the production hub while the user is logged into a dev hub
- * would mint on the wrong org, and a mint is not undone by a retry. `OWENLOOP_HUB`
- * is intentionally excluded so this stays in parity with O2's `owenloop mcp`.
+ * would mint on the wrong org, and a mint is not undone by a retry. The same
+ * reasoning covers a label binding — writing one against the wrong org is not
+ * undone by a retry either, and under live resolution it also moves in-flight
+ * work. `OWENLOOP_HUB` is intentionally excluded so this stays in parity with
+ * O2's `owenloop mcp`.
  *
  * `listStoredHubOrigins` is backend-aware (shared with O2's `owenloop mcp`): only
  * the FILE backend can enumerate, so it returns `null` on a keychain- or
@@ -2704,7 +2762,7 @@ function createWorkflowRequest(
  * (used automatically), or more than one (the non-secret origin keys are listed
  * back so the user can pick).
  */
-function resolveAgentHub(io: CliIO, args: Args): string {
+function resolveAgentHub(io: CliIO, args: Args, purpose = 'mint on'): string {
   const flagVal = last(args, 'hub');
   if (flagVal !== undefined) {
     try {
@@ -2718,14 +2776,14 @@ function resolveAgentHub(io: CliIO, args: Args): string {
     const backend = credentialBackend(io.env, io.keychain);
     const which = backend.kind === 'external' ? 'external-command' : 'keychain';
     throw new CliError(
-      `cannot determine which hub to mint on — the ${which} credential store cannot be enumerated; ` +
+      `cannot determine which hub to ${purpose} — the ${which} credential store cannot be enumerated; ` +
         'pass --hub <origin>',
       { exitCode: 2 },
     );
   }
   if (origins.length === 1) return origins[0]!;
   throw new CliError(
-    'cannot determine which hub to mint on — pass --hub <origin>, or log in to exactly one hub first ' +
+    `cannot determine which hub to ${purpose} — pass --hub <origin>, or log in to exactly one hub first ` +
       '(owenloop login --hub <origin>)' +
       (origins.length > 1 ? `; stored hubs: ${origins.join(', ')}` : ''),
     { exitCode: 2 },
@@ -2872,6 +2930,199 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
     tokenId: result.id,
   });
   return 0;
+}
+
+/**
+ * `owenloop binding new|rm|list` — manage the hub org's **label bindings**, the
+ * admin-owned table mapping a workflow-def `labels:` entry to a pool.
+ *
+ * A label binding is NOT the project↔hub binding `owenloop connect` writes to
+ * `.owenloop/hub.json` — different concept, same English word; every symbol in
+ * this family is `LabelBinding`-prefixed to keep them apart.
+ *
+ * | subcommand | endpoint | auth principal |
+ * |---|---|---|
+ * | `binding new <label> <pool>` | `POST /api/set_label_binding` | human (admin role on the hub) |
+ * | `binding rm <label>` | `POST /api/delete_label_binding` | human (admin role on the hub) |
+ * | `binding list` | `GET /api/label_bindings` | human |
+ *
+ * **`set_label_binding` is an upsert.** `binding new` on an already-bound label
+ * RETARGETS it — there is no "already bound" rejection to handle, no client-side
+ * pre-check, and no auto-`rm`. The 200 `binding` carries `previousPoolName`
+ * (`null` on a fresh bind), so the CLI reports which of the two happened without
+ * asking: stdout carries `previousPool`, and a retarget additionally echoes
+ * `<label>: <old> → <new>` to **stderr** (stdout stays one parseable JSON
+ * document). Resolution on the hub is live, so a retarget redirects in-flight
+ * runs at their next poll and a delete pauses the steps using that label —
+ * documented in `docs/cli.md`, deliberately NOT re-warned about on stderr here.
+ *
+ * What is deliberately NOT copied from `dispatchAgent`: its
+ * `OWENLOOP_CREDENTIAL_COMMAND` refusal. That guard exists because `agent new`
+ * must STORE a minted token and an external-command backend has nowhere to write
+ * it. `binding` stores nothing locally, so an external-command machine must be
+ * able to run all three subcommands. (`resolveAgentHub` still exits 2 on such a
+ * machine when `--hub` is absent, because that store cannot be enumerated —
+ * inherited unchanged, and correct.)
+ *
+ * No client-side charset validation of `label` or `pool`: the hub is the
+ * enforcement of record, the same stance `agent new` takes for `--pools`.
+ *
+ * Exit codes: 0 ok; 1 runtime/hub error (unknown pool name, a label that fails
+ * the hub's name rules, a 403 for a non-admin, a malformed 2xx, a network
+ * timeout); 2 the hub is unresolvable; 3 the human credential is absent or
+ * irrecoverable (the error names `owenloop login --hub <origin>`).
+ */
+async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
+  const USAGE_FORMS =
+    'usage: owenloop binding new <label> <pool> [--hub <url>] | owenloop binding rm <label> [--hub <url>] | owenloop binding list [--hub <url>]';
+
+  // --- validation: everything below runs BEFORE any I/O, so a usage error on a
+  //     multi-hub machine reports the usage problem (exit 1), not exit 2.
+  const sub = args.positionals[1];
+  if (sub !== 'new' && sub !== 'rm' && sub !== 'list') {
+    throw new CliError(`unknown binding subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
+  }
+  let label = '';
+  let pool = '';
+  if (sub === 'new' || sub === 'rm') {
+    const raw = args.positionals[2];
+    if (raw === undefined || raw === '') {
+      throw new CliError(`missing required argument: <label> (${USAGE_FORMS})`);
+    }
+    label = raw;
+  }
+  if (sub === 'new') {
+    const raw = args.positionals[3];
+    if (raw === undefined || raw === '') {
+      throw new CliError(`missing required argument: <pool> (${USAGE_FORMS})`);
+    }
+    pool = raw;
+  }
+
+  const origin = resolveAgentHub(io, args, 'manage label bindings on');
+  const slot: CredentialSlotSelector = { principal: 'human' };
+
+  // The human bearer for the resolved origin. Absent → exit 3 with the same
+  // remedy wording `agent new` uses.
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  try {
+    if (sub === 'list') {
+      const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/label_bindings');
+      // The GET deliberately uses `assertAuthOk` unchanged (frozen contract), so
+      // a non-401 non-2xx surfaces its generic wording rather than the hub's
+      // `message`. Message passthrough is a POST-path behavior below.
+      assertAuthOk(res, used, origin);
+      let body: unknown;
+      try {
+        body = (await res.json()) as unknown;
+      } catch {
+        throw new CliError('label_bindings: malformed response — body is not valid JSON');
+      }
+      let bindings;
+      try {
+        bindings = asLabelBindings(body);
+      } catch (e) {
+        throw new CliError((e as Error).message);
+      }
+      // The guard's output — a whitelisted typed array — never the raw body.
+      print(io, { ok: true, hub: origin, bindings });
+      return 0;
+    }
+
+    // `new` and `rm` share one POST ladder; only the path, the request body, the
+    // guard, and the printed shape differ.
+    const endpoint = sub === 'new' ? 'set_label_binding' : 'delete_label_binding';
+    const { res } = await authedPost(
+      io,
+      origin,
+      slot,
+      cred,
+      `/api/${endpoint}`,
+      sub === 'new' ? { label, pool } : { label },
+    );
+
+    if (res.status === 401) {
+      // A 401 that survived `authedPost`'s one refresh-and-retry. The human slot
+      // never holds an agent kind, so `assertAuthOk`'s non-agent wording applies;
+      // the catch below upgrades this to exit 3.
+      throw new CliError('credential rejected by the hub — run `owenloop login`');
+    }
+    if (!res.ok) {
+      // Surface the hub's typed `message` VERBATIM (this is how an unknown pool
+      // name, an invalid label, and a non-admin 403 all surface uniformly).
+      // Never include raw body text.
+      let message: string | undefined;
+      try {
+        const errBody = (await res.json()) as unknown;
+        if (typeof errBody === 'object' && errBody !== null) {
+          const m = (errBody as Record<string, unknown>).message;
+          if (typeof m === 'string' && m !== '') message = m;
+        }
+      } catch {
+        // Non-JSON body — fall through to the generic status message.
+      }
+      throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+    }
+
+    let body: unknown;
+    try {
+      body = (await res.json()) as unknown;
+    } catch {
+      // A FIXED string — never V8's SyntaxError message, which embeds a verbatim
+      // snippet of the raw body.
+      throw new CliError(`${endpoint}: malformed success response — body is not valid JSON`);
+    }
+
+    if (sub === 'new') {
+      let bound;
+      try {
+        bound = asLabelBindingOk(body);
+      } catch (e) {
+        throw new CliError((e as Error).message);
+      }
+      // The server-echoed label/pool, not argv: if the hub normalized either,
+      // stdout tells the truth about what the hub stored (same precedent as
+      // `agent new` printing the server-resolved pools). `previousPool` is
+      // ALWAYS present — `null` on a fresh bind — so a fixed consumer never has
+      // to branch on the key's existence.
+      print(io, {
+        ok: true,
+        hub: origin,
+        label: bound.label,
+        pool: bound.poolName,
+        previousPool: bound.previousPoolName,
+      });
+      // The retarget signal, on stderr only so `| jq` on stdout is unaffected.
+      // A fresh bind emits nothing here.
+      if (bound.previousPoolName !== null) {
+        io.err(`${bound.label}: ${bound.previousPoolName} → ${bound.poolName}`);
+      }
+      return 0;
+    }
+
+    // `rm`: the guard proves the 2xx really was a delete; `deleted` is validated
+    // but deliberately not printed (frozen output contract).
+    try {
+      asLabelBindingDeleted(body);
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+    print(io, { ok: true, hub: origin, label });
+    return 0;
+  } catch (e) {
+    // A refresh-failure-family error (the human oauth is irrecoverable, or a 401
+    // survived the refresh-and-retry) is exit 3 with the login remedy; every
+    // other CliError propagates as-is — a network timeout stays exit 1, because a
+    // flaky network is not an irrecoverable credential.
+    if (e instanceof CliError && /run `owenloop login`/.test(e.message)) {
+      throw new CliError(`${e.message} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+    }
+    throw e;
+  }
 }
 
 // ---- setup & doctor ---------------------------------------------------------
@@ -3585,7 +3836,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'setup', 'doctor', 'mcp']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'binding', 'setup', 'doctor', 'mcp']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   const args = parseArgs(argv);
@@ -3609,6 +3860,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchPush(io, args);
       case 'agent':
         return await dispatchAgent(io, args);
+      case 'binding':
+        return await dispatchBinding(io, args);
       case 'setup':
         return await dispatchSetup(io, args);
       case 'doctor':

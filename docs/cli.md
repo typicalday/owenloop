@@ -50,6 +50,9 @@ for the full breakdown.
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--conductor` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
+| `binding new <label> <pool> [--hub <url>]` | bind (or retarget) a workflow label to a pool on the hub org (admin; human credential) — see [Label bindings](#label-bindings) |
+| `binding rm <label> [--hub <url>]` | remove a label's pool binding — see [Label bindings](#label-bindings) |
+| `binding list [--hub <url>]` | list the hub org's label bindings — see [Label bindings](#label-bindings) |
 | `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]` | converge this machine's install (human login, agent credential, owenwork settings, plugin) in one idempotent pass — see [`setup`](#setup--converge-a-machines-install) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
@@ -599,6 +602,100 @@ check, and the `--scopes`/`--conductor` mutual-exclusivity check all run
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
 
+## Label bindings
+
+A **label binding** maps a workflow-def **label** (a logical capability tag a
+def author writes, like `gpu` or `repo-access`) to a **pool** on one hub org.
+Def authors write labels; an org admin binds each label to a pool. That
+indirection is what keeps deployment facts out of portable defs — see
+[`labels:`](authoring.md#labels--logical-capability-tags) in the authoring guide
+for the step-side declaration.
+
+**Resolution is live.** `start_run` only *checks* that every label a run's steps
+use is currently bound — it stamps no pool for a labeled step. Every later
+routing decision (which conductor is offered the step, and whether a claim is
+allowed) re-reads the binding table as it stands at that moment.
+
+**These edits take effect on work already in flight.**
+
+- **Retargeting.** Running `binding new` on a label that is **already bound**
+  retargets it — this is a normal success, not an error. The remaining steps of
+  every in-flight run using that label are redirected to the new pool at their
+  next poll; no restart and no re-route command. stdout reports the prior pool
+  as `previousPool`, and stderr echoes `gpu: gpu-fleet → cheap-fleet`.
+- **Deleting.** Running `binding rm` on a label that in-flight runs use
+  **pauses** those steps — no conductor is offered them and no claim is
+  accepted — until the label is bound again. Nothing is lost; the work resumes
+  on re-bind.
+
+A label binding is **not** the project↔hub binding `owenloop connect` writes to
+`.owenloop/hub.json` — that one records which hub *this project directory*
+publishes to; a label binding is an org-scoped label→pool row on the hub.
+
+### `binding new <label> <pool>`
+
+`POST /api/set_label_binding`, authenticated as your **human** credential;
+requires the **admin** role on the hub. Binds `<label>` to the pool named
+`<pool>`, or retargets the label if it is already bound. `<pool>` is a pool
+**name** — the hub resolves it to a pool id; the CLI does no pool lookup and
+performs no client-side validation of either argument (the hub is the
+enforcement of record).
+
+### `binding rm <label>`
+
+`POST /api/delete_label_binding`, authenticated as your **human** credential;
+requires the **admin** role on the hub. Removes `<label>`'s binding.
+
+### `binding list`
+
+`GET /api/label_bindings`, authenticated as your **human** credential. Lists the
+org's bindings. An org with no bindings yet is a normal success (exit 0) with an
+empty `bindings` array.
+
+**Flags.** `--hub <url>` only (plus the global `--db`/`--defs`).
+
+**Which hub gets acted on (`--hub`).** Resolution is deliberately narrow — the
+same stance `agent new` takes, because a binding written against the wrong org
+is not undone by a retry, and under live resolution it also moves in-flight
+work:
+
+1. `--hub <origin>` if given (normalized the same way as everywhere else).
+2. Otherwise the **one** hub your credential *file* stores — if exactly one is
+   present, it's used.
+3. Otherwise the command **exits 2** naming both remedies (pass `--hub`, or log
+   in to exactly one hub); when more than one hub is stored their origins are
+   listed back so you can pick.
+
+This does **not** fall back to `OWENLOOP_HUB` or the built-in default hub. Note
+that hub enumeration is **file-store only**: the keychain and the
+external-command backend cannot list their entries, so on such a machine step 2
+cannot enumerate the store and you must pass `--hub`.
+
+**Printed JSON.** stdout is exactly one whitelisted JSON document per
+invocation, built from named fields — never a raw hub body — so `| jq` always
+works. Human progress lines (the retarget echo) go to stderr only.
+
+| subcommand | stdout |
+|---|---|
+| `binding new` | `{ "ok": true, "hub": "<origin>", "label": "gpu", "pool": "ml-pool", "previousPool": null }` |
+| `binding rm` | `{ "ok": true, "hub": "<origin>", "label": "gpu" }` |
+| `binding list` | `{ "ok": true, "hub": "<origin>", "bindings": [ { "label": "gpu", "poolId": "pl_1", "poolName": "ml-pool", "createdBy": "u_1", "createdAt": 1738000000000 } ] }` |
+
+`previousPool` is **always present** on `binding new` — `null` on a fresh bind,
+the prior pool's name on a retarget — so a consumer never has to branch on
+whether the key exists. `label` and `pool` are the values the **hub** echoed
+back, not your argv: if the hub normalized either, stdout tells the truth about
+what was stored.
+
+**Exit codes.**
+
+| code | meaning |
+|---|---|
+| `0` | the binding was set, removed, or listed |
+| `1` | runtime or hub error — an unknown pool name, a label that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
+| `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
+| `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
+
 ## `setup` — converge a machine's install
 
 `owenloop setup` is the one-shot onboarding command. It brings a machine to a
@@ -994,7 +1091,7 @@ regardless of labels. This is **routing, not
 authorization**: any caller that can reach the database can tick without a
 filter and claim anything, so labels split work across cooperating
 orchestrators, they never enforce a boundary. See
-[`labels:`](authoring.md#labels--routing-a-step-to-a-particular-tick-caller) in
+[`labels:`](authoring.md#labels--logical-capability-tags) in
 the authoring guide for the step-side declaration and the starvation hazard to
 watch for.
 
