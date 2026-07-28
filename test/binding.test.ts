@@ -19,6 +19,9 @@
  *   - a fresh bind emits NO stderr echo;
  *   - `rm`'s stdout is `{ ok, hub, label }` — `deleted` is validated on the wire
  *     but never printed;
+ *   - `rm` is **idempotent**: a 200 `{deleted: false}` (the label was not bound)
+ *     is exit 0 with stdout identical to a real delete; only a 200 whose
+ *     `deleted` is absent or non-boolean is exit 1;
  *   - stdout is always exactly one JSON document, so `| jq` works.
  */
 
@@ -448,7 +451,7 @@ test('binding new: a binding with previousPoolName ABSENT is exit 0 with previou
   assert.ok(!t.err.join('\n').includes('→'), 'an absent previousPoolName is a fresh bind — no echo');
 });
 
-test('binding rm: a 200 without deleted: true is exit 1', async () => {
+test('binding rm: a 200 with NO deleted key at all is exit 1', async () => {
   const { fetch } = routedFetch({
     'POST /api/delete_label_binding': () => ({ status: 200, json: { text: 'ok' } }),
   });
@@ -457,8 +460,28 @@ test('binding rm: a 200 without deleted: true is exit 1', async () => {
 
   const code = await mainAsync(['binding', 'rm', 'gpu', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /delete_label_binding: malformed success response — missing deleted: true/);
+  assert.match(t.err.join('\n'), /delete_label_binding: malformed success response — missing boolean deleted/);
   assert.deepEqual(t.out, []);
+});
+
+test('binding rm: a 200 with deleted: false (the label was not bound) is exit 0 with identical stdout — rm is idempotent', async () => {
+  // The hub answers 200 `{deleted: false}` for an unbound label, never a 404
+  // (owenloop-service docs/decisions/label-bindings.md). stdout must be
+  // byte-identical to a real delete — that identity is what idempotent means
+  // at this surface, and a scripted consumer must not have to branch on it.
+  const { fetch } = routedFetch({
+    'POST /api/delete_label_binding': () => ({
+      status: 200,
+      json: { text: "Label 'gpu' was not bound.", label: 'gpu', deleted: false },
+    }),
+  });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'rm', 'gpu', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, label: 'gpu' });
+  assert.deepEqual(t.err, [], 'no extra stderr line either — rm prints nothing extra when the label was not bound');
 });
 
 test('binding list: a malformed row is exit 1, naming the INDEX and field only', async () => {

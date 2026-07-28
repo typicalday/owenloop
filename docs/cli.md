@@ -646,6 +646,12 @@ enforcement of record).
 `POST /api/delete_label_binding`, authenticated as your **human** credential;
 requires the **admin** role on the hub. Removes `<label>`'s binding.
 
+**`rm` is idempotent.** Removing a label that is **not** bound is a normal
+success — the hub answers `200` with `deleted: false` rather than a `404`, and
+the CLI prints the same `{ ok, hub, label }` document it prints for a real
+delete. A script can call `binding rm` unconditionally without branching on
+whether the label was bound.
+
 ### `binding list`
 
 `GET /api/label_bindings`, authenticated as your **human** credential. Lists the
@@ -691,7 +697,7 @@ what was stored.
 
 | code | meaning |
 |---|---|
-| `0` | the binding was set, removed, or listed |
+| `0` | the binding was set, removed (or was already absent), or listed |
 | `1` | runtime or hub error — an unknown pool name, a label that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
