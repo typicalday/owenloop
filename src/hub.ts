@@ -1198,19 +1198,31 @@ export function asLabelBindingOk(body: unknown): LabelBindingSetWire {
 }
 
 /**
- * Narrow `POST /api/delete_label_binding`'s 200 body (`{ text, deleted: true }`).
- * `deleted` must be exactly `true` — this guard is how the CLI proves the 2xx
- * really was a delete. The field is validated but deliberately NOT printed: the
- * command's stdout shape is `{ ok, hub, label }` (frozen contract §2.4).
+ * Narrow `POST /api/delete_label_binding`'s 200 body (`{ text, deleted: boolean }`).
+ * `deleted` must be a BOOLEAN — this guard is how the CLI proves the 2xx really
+ * was a delete verb's answer. BOTH boolean values are valid, deliberate hub
+ * responses:
+ *   - `true`  — the label was bound and is now removed;
+ *   - `false` — the label was not bound, so there was nothing to do. The hub
+ *     answers this with a 200, never a 404 (the `removePoolMember` `{existed}`
+ *     house pattern), and that tolerance is what makes `binding rm` idempotent.
+ * A body with no `deleted` key at all, or a non-boolean one, is genuinely
+ * malformed and throws.
+ *
+ * The field is validated but deliberately NOT printed: the command's stdout
+ * shape is `{ ok, hub, label }` (frozen contract §2.4), byte-identical for both
+ * boolean cases — that identity IS the idempotency guarantee at this surface,
+ * so a scripted consumer never has to branch on whether the label was bound.
  */
-export function asLabelBindingDeleted(body: unknown): { deleted: true } {
+export function asLabelBindingDeleted(body: unknown): { deleted: boolean } {
   if (typeof body !== 'object' || body === null) {
     throw new Error('delete_label_binding: malformed success response — not an object');
   }
-  if ((body as Record<string, unknown>).deleted !== true) {
-    throw new Error('delete_label_binding: malformed success response — missing deleted: true');
+  const deleted = (body as Record<string, unknown>).deleted;
+  if (typeof deleted !== 'boolean') {
+    throw new Error('delete_label_binding: malformed success response — missing boolean deleted');
   }
-  return { deleted: true };
+  return { deleted };
 }
 
 /**
