@@ -103,6 +103,11 @@ import {
   asLabelBindingDeleted,
   asLabelBindingOk,
   asLabelBindings,
+  asPoolCreated,
+  asPoolDeleted,
+  asPoolMemberAdded,
+  asPoolMemberRemoved,
+  asPools,
   asWhoami,
   computeServerDiff,
   credentialBackend,
@@ -542,6 +547,11 @@ Commands:
   binding new <label> <pool> [--hub <url>]   bind (or retarget) a workflow label to a pool on the hub org (admin; human credential)
   binding rm <label> [--hub <url>]         remove a label's pool binding
   binding list [--hub <url>]               list the hub org's label bindings
+  pool list [--hub <url>]                  list the hub org's pools with their members (includes the orphan pool)
+  pool new <name> --kind personal|shared [--owner <memberId>] [--hub <url>]   create a pool on the hub org (admin; human credential)
+  pool rm <poolId> [--hub <url>]           delete a pool; work stamped to it moves to the org's orphan pool
+  pool member add <poolId> <principalKind> <principalId> [--hub <url>]   add a member or agent to a pool
+  pool member rm <poolId> <principalId> [--hub <url>]   remove a principal from a pool
   setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenwork settings, plugin (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
@@ -636,6 +646,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
   ['agent', cmdOpts('pools', 'hub', 'scopes', 'conductor')],
   ['binding', cmdOpts('hub')],
+  ['pool', cmdOpts('hub', 'kind', 'owner')],
   ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'pools', 'scopes')],
   ['doctor', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
@@ -3125,6 +3136,297 @@ async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
   }
 }
 
+/**
+ * `owenloop pool list|new|rm|member add|member rm` — administer hub pools.
+ * Modeled directly on `dispatchBinding`: same validate-before-I/O discipline,
+ * same helpers (`resolveAgentHub`, `readCredential`, `authedGet`/`authedPost`,
+ * `assertAuthOk`), same error-wording shapes, same exit-code ladder.
+ *
+ * | subcommand         | endpoint                      |
+ * |--------------------|-------------------------------|
+ * | `pool list`        | `GET /api/pools`              |
+ * | `pool new`         | `POST /api/create_pool`       |
+ * | `pool rm`          | `POST /api/delete_pool`       |
+ * | `pool member add`  | `POST /api/add_pool_member`   |
+ * | `pool member rm`   | `POST /api/remove_pool_member`|
+ *
+ * All five use the **human** credential slot — `manage_pools` is absent from
+ * the hub's agent scope table, so an agent token is refused on every one of
+ * these routes regardless of scope; the CLI does not carry an agent-token path
+ * for this family, unlike `binding`'s sibling commands.
+ *
+ * **The tolerant / absent-field semantics — the heart of this command.**
+ * `delete_pool` on an unknown pool id, and `remove_pool_member` on a principal
+ * that was never a member, are both ordinary 200 successes (`deleted: false` /
+ * `removed: false`), never 404s — printed and echoed to stderr honestly rather
+ * than invented as an error. `delete_pool`'s optional transfer fields
+ * (`membersRemoved`, `orphanPoolId`, `orphanPoolName`, `stampsTransferred`,
+ * `runsTransferred`, `runningRunsTransferred`) are on stdout IF AND ONLY IF the
+ * wire carried them — never defaulted to `0`/`null`/`[]`, because their
+ * absence is the hub's way of saying nothing moved. When a transfer did
+ * happen, `pool rm` also writes a human-facing stderr summary naming the
+ * orphan pool, because an operator who never sees that line will not go
+ * looking for their moved work.
+ *
+ * Deliberately diverges from `binding rm`: `pool rm` and `pool member rm` DO
+ * print their tolerant booleans (`deleted`, `removed`) on stdout. `binding rm`
+ * hides `deleted` under a frozen output contract; `pool` is a new command
+ * with no such history, so the more honest shape wins.
+ *
+ * Exit codes: 0 ok; 1 usage error, hub refusal (400/403), or malformed
+ * response; 2 the hub is unresolvable; 3 the human credential is absent or
+ * irrecoverable (remedy names `owenloop login --hub <origin>`).
+ */
+async function dispatchPool(io: CliIO, args: Args): Promise<number> {
+  const USAGE_FORMS =
+    'usage: owenloop pool list [--hub <url>] | ' +
+    'owenloop pool new <name> --kind personal|shared [--owner <memberId>] [--hub <url>] | ' +
+    'owenloop pool rm <poolId> [--hub <url>] | ' +
+    'owenloop pool member add <poolId> <principalKind> <principalId> [--hub <url>] | ' +
+    'owenloop pool member rm <poolId> <principalId> [--hub <url>]';
+
+  // --- validation: everything below runs BEFORE any I/O, so a usage error on a
+  //     multi-hub machine reports the usage problem (exit 1), not exit 2.
+  const sub = args.positionals[1];
+  if (sub !== 'list' && sub !== 'new' && sub !== 'rm' && sub !== 'member') {
+    throw new CliError(`unknown pool subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
+  }
+
+  let memberSub: 'add' | 'rm' | undefined;
+  let name = '';
+  let poolId = '';
+  let principalKind = '';
+  let principalId = '';
+  let kind = '';
+  let owner: string | undefined;
+
+  if (sub === 'new') {
+    const raw = args.positionals[2];
+    if (raw === undefined || raw === '') {
+      throw new CliError(`missing required argument: <name> (${USAGE_FORMS})`);
+    }
+    name = raw;
+    const rawKind = last(args, 'kind');
+    if (rawKind === undefined || rawKind === '') {
+      throw new CliError(`missing required option: --kind personal|shared (${USAGE_FORMS})`);
+    }
+    kind = rawKind;
+    const rawOwner = last(args, 'owner');
+    if (rawOwner !== undefined) {
+      if (rawOwner === '') {
+        throw new CliError(`--owner requires a member id (${USAGE_FORMS})`);
+      }
+      owner = rawOwner;
+    }
+  } else if (sub === 'rm') {
+    const raw = args.positionals[2];
+    if (raw === undefined || raw === '') {
+      throw new CliError(`missing required argument: <poolId> (${USAGE_FORMS})`);
+    }
+    poolId = raw;
+  } else if (sub === 'member') {
+    const msub = args.positionals[2];
+    if (msub !== 'add' && msub !== 'rm') {
+      throw new CliError(`unknown pool member subcommand '${msub ?? ''}' — ${USAGE_FORMS}`);
+    }
+    memberSub = msub;
+    const rawPoolId = args.positionals[3];
+    if (rawPoolId === undefined || rawPoolId === '') {
+      throw new CliError(`missing required argument: <poolId> (${USAGE_FORMS})`);
+    }
+    poolId = rawPoolId;
+    if (memberSub === 'add') {
+      const rawKind = args.positionals[4];
+      if (rawKind === undefined || rawKind === '') {
+        throw new CliError(`missing required argument: <principalKind> (${USAGE_FORMS})`);
+      }
+      principalKind = rawKind;
+      const rawId = args.positionals[5];
+      if (rawId === undefined || rawId === '') {
+        throw new CliError(`missing required argument: <principalId> (${USAGE_FORMS})`);
+      }
+      principalId = rawId;
+    } else {
+      const rawId = args.positionals[4];
+      if (rawId === undefined || rawId === '') {
+        throw new CliError(`missing required argument: <principalId> (${USAGE_FORMS})`);
+      }
+      principalId = rawId;
+    }
+  }
+
+  const origin = resolveAgentHub(io, args, 'manage pools on');
+  const slot: CredentialSlotSelector = { principal: 'human' };
+
+  // The human bearer for the resolved origin. Absent → exit 3 with the same
+  // remedy wording `binding`/`agent new` use.
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  try {
+    if (sub === 'list') {
+      const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/pools');
+      // `assertAuthOk`'s generic wording (frozen contract, mirrors `binding
+      // list`); message passthrough is a POST-path behavior below.
+      assertAuthOk(res, used, origin);
+      let body: unknown;
+      try {
+        body = (await res.json()) as unknown;
+      } catch {
+        throw new CliError('pools: malformed response — body is not valid JSON');
+      }
+      let pools;
+      try {
+        pools = asPools(body);
+      } catch (e) {
+        throw new CliError((e as Error).message);
+      }
+      print(io, { ok: true, hub: origin, pools });
+      return 0;
+    }
+
+    // `new`, `rm`, `member add`, and `member rm` share one POST ladder; only the
+    // path, the request body, the guard, and the printed shape differ.
+    let endpoint: string;
+    let reqBody: Record<string, unknown>;
+    if (sub === 'new') {
+      endpoint = 'create_pool';
+      reqBody = { name, kind, ...(owner !== undefined ? { ownerMemberId: owner } : {}) };
+    } else if (sub === 'rm') {
+      endpoint = 'delete_pool';
+      reqBody = { poolId };
+    } else if (memberSub === 'add') {
+      endpoint = 'add_pool_member';
+      reqBody = { poolId, principalKind, principalId };
+    } else {
+      endpoint = 'remove_pool_member';
+      reqBody = { poolId, principalId };
+    }
+
+    const { res } = await authedPost(io, origin, slot, cred, `/api/${endpoint}`, reqBody);
+
+    if (res.status === 401) {
+      // A 401 that survived `authedPost`'s one refresh-and-retry. The human slot
+      // never holds an agent kind, so this generic wording applies; the catch
+      // below upgrades this to exit 3.
+      throw new CliError('credential rejected by the hub — run `owenloop login`');
+    }
+    if (!res.ok) {
+      // Surface the hub's typed `message` VERBATIM (an unknown pool id on
+      // member add/rm, a non-admin 403, an active-workflow delete refusal, an
+      // unvalidated --kind value all surface uniformly). Never include raw
+      // body text.
+      let message: string | undefined;
+      try {
+        const errBody = (await res.json()) as unknown;
+        if (typeof errBody === 'object' && errBody !== null) {
+          const m = (errBody as Record<string, unknown>).message;
+          if (typeof m === 'string' && m !== '') message = m;
+        }
+      } catch {
+        // Non-JSON body — fall through to the generic status message.
+      }
+      throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+    }
+
+    let body: unknown;
+    try {
+      body = (await res.json()) as unknown;
+    } catch {
+      // A FIXED string — never V8's SyntaxError message, which embeds a
+      // verbatim snippet of the raw body.
+      throw new CliError(`${endpoint}: malformed success response — body is not valid JSON`);
+    }
+
+    if (sub === 'new') {
+      let created;
+      try {
+        created = asPoolCreated(body);
+      } catch (e) {
+        throw new CliError((e as Error).message);
+      }
+      print(io, {
+        ok: true,
+        hub: origin,
+        poolId: created.id,
+        name: created.name,
+        kind: created.kind,
+        ownerMemberId: created.ownerMemberId,
+      });
+      return 0;
+    }
+
+    if (sub === 'rm') {
+      let deletedWire;
+      try {
+        deletedWire = asPoolDeleted(body);
+      } catch (e) {
+        throw new CliError((e as Error).message);
+      }
+      // Diverges from `binding rm`: `deleted` (and every transfer field the
+      // wire carried) is printed, never hidden — see the function doc-comment.
+      print(io, { ok: true, hub: origin, ...deletedWire });
+      if (!deletedWire.deleted) {
+        io.err(`no pool '${deletedWire.poolId}' to delete — nothing was removed`);
+      } else if (deletedWire.orphanPoolName !== undefined) {
+        const runs = deletedWire.runsTransferred?.length ?? 0;
+        const stamps = deletedWire.stampsTransferred ?? 0;
+        const running = deletedWire.runningRunsTransferred;
+        const runningClause = running !== undefined && running.length > 0 ? ` (${running.length} still running)` : '';
+        io.err(
+          `pool '${deletedWire.poolId}' deleted — ${stamps} stamp(s) from ${runs} run(s)${runningClause} moved to '${deletedWire.orphanPoolName}' (${deletedWire.orphanPoolId})`,
+        );
+      }
+      return 0;
+    }
+
+    if (memberSub === 'add') {
+      let added;
+      try {
+        added = asPoolMemberAdded(body);
+      } catch (e) {
+        throw new CliError((e as Error).message);
+      }
+      // The argv poolId, not a wire value: `PoolMemberWire` deliberately does
+      // not narrow a `poolId` field (it is reused for `pools[].members[]`,
+      // where a per-member poolId would be redundant), so the request's own
+      // poolId is the only one available to print.
+      print(io, { ok: true, hub: origin, poolId, principalKind: added.principalKind, principalId: added.principalId });
+      return 0;
+    }
+
+    // `member rm`
+    let removedWire;
+    try {
+      removedWire = asPoolMemberRemoved(body);
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+    print(io, {
+      ok: true,
+      hub: origin,
+      poolId: removedWire.poolId,
+      principalId: removedWire.principalId,
+      removed: removedWire.removed,
+    });
+    if (!removedWire.removed) {
+      io.err(`${removedWire.principalId} was not a member of pool '${removedWire.poolId}' — nothing was removed`);
+    }
+    return 0;
+  } catch (e) {
+    // A refresh-failure-family error (the human oauth is irrecoverable, or a 401
+    // survived the refresh-and-retry) is exit 3 with the login remedy; every
+    // other CliError propagates as-is — a network timeout stays exit 1, because a
+    // flaky network is not an irrecoverable credential.
+    if (e instanceof CliError && /run `owenloop login`/.test(e.message)) {
+      throw new CliError(`${e.message} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+    }
+    throw e;
+  }
+}
+
 // ---- setup & doctor ---------------------------------------------------------
 //
 // `owenloop setup` is the idempotent converger for a machine's install (identity
@@ -3836,7 +4138,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'binding', 'setup', 'doctor', 'mcp']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'binding', 'pool', 'setup', 'doctor', 'mcp']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   const args = parseArgs(argv);
@@ -3862,6 +4164,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchAgent(io, args);
       case 'binding':
         return await dispatchBinding(io, args);
+      case 'pool':
+        return await dispatchPool(io, args);
       case 'setup':
         return await dispatchSetup(io, args);
       case 'doctor':

@@ -1240,6 +1240,275 @@ export function asLabelBindings(body: unknown): LabelBindingWire[] {
 }
 
 /**
+ * A **pool** as the hub reports it — an org-scoped queue that agent work is
+ * stamped to. `kind` is `'personal' | 'shared' | 'orphan'` on the wire, but is
+ * deliberately NOT narrowed to that union here: `'orphan'` is a real value
+ * `GET /api/pools` returns, and the hub verbs (`packages/hub-core/src/verbs/
+ * manage-pools.ts`) are the enforcement of record for the other two — the same
+ * stance `agent new` takes for `--pools`.
+ */
+export interface PoolWire {
+  id: string;
+  name: string;
+  kind: string;
+  ownerMemberId: string | null;
+  createdBy: string;
+  createdAt: number;
+}
+
+/** One membership row on a `PoolListingWire` — `principalKind` is `'member' | 'agent'` on the wire, forwarded verbatim. */
+export interface PoolMemberWire {
+  principalKind: string;
+  principalId: string;
+  addedBy: string;
+  addedAt: number;
+}
+
+/**
+ * `GET /api/pools`' per-pool listing — a `PoolWire` plus its members inline
+ * (one hop, no per-pool fan-out) plus a CLIENT-DERIVED `orphan` boolean. `orphan`
+ * never appears on the wire; `asPools` computes it with the same rule as the
+ * hub's own `isOrphanPool` (`manage-pools.ts:170-172`) so the CLI can mark the
+ * org's reserved `orphan:unrouted` pool instead of filtering it out — an
+ * operator has to be able to see where a deleted pool's work went.
+ */
+export interface PoolListingWire extends PoolWire {
+  orphan: boolean;
+  members: PoolMemberWire[];
+}
+
+/**
+ * `POST /api/delete_pool`'s 200 body. `deleted` is always present; the six
+ * transfer fields are OPTIONAL and, deliberately, absent (not `null`, not `0`)
+ * when nothing moved — see `asPoolDeleted`.
+ */
+export interface PoolDeletedWire {
+  poolId: string;
+  deleted: boolean;
+  membersRemoved?: number;
+  orphanPoolId?: string;
+  orphanPoolName?: string;
+  stampsTransferred?: number;
+  runsTransferred?: string[];
+  runningRunsTransferred?: string[];
+}
+
+/** `POST /api/remove_pool_member`'s 200 body — tolerant of a non-member, exactly like `asLabelBindingDeleted`'s `deleted`. */
+export interface PoolMemberRemovedWire {
+  poolId: string;
+  principalId: string;
+  removed: boolean;
+}
+
+/**
+ * The `orphan:` prefix the hub uses to name its reserved orphan pool
+ * (`packages/hub-core/src/pools-table.ts` / `verbs/manage-pools.ts`). Mirrored
+ * here as a named constant — not an invention — so a future reader can tell at
+ * a glance that this string is copied from the hub's source of truth, not
+ * independently chosen.
+ */
+const ORPHAN_POOL_NAME_PREFIX = 'orphan:';
+
+/**
+ * Validate the common `PoolWire` fields on one row. `prefix` is the
+ * endpoint-qualified lead-in (e.g. `pools: malformed response`) and `where`
+ * names the offending position (`pool`, or `pools[2]`) — a FIELD/INDEX name
+ * only, never a value, mirroring `asLabelBindingRow`'s discipline exactly.
+ */
+function asPoolRow(entry: unknown, prefix: string, where: string): PoolWire {
+  if (typeof entry !== 'object' || entry === null) {
+    throw new Error(`${prefix} — ${where} is not an object`);
+  }
+  const e = entry as Record<string, unknown>;
+  for (const field of ['id', 'name', 'kind', 'createdBy'] as const) {
+    if (typeof e[field] !== 'string' || e[field] === '') {
+      throw new Error(`${prefix} — ${where} missing non-empty string ${field}`);
+    }
+  }
+  if (typeof e.createdAt !== 'number') {
+    throw new Error(`${prefix} — ${where} missing number createdAt`);
+  }
+  // Lenient exactly like `previousPoolName`: absent or null both mean "no
+  // owner" — a serializer that drops `undefined` must not turn a valid shared
+  // pool into a hard failure.
+  let ownerMemberId: string | null = null;
+  if (e.ownerMemberId !== undefined && e.ownerMemberId !== null) {
+    if (typeof e.ownerMemberId !== 'string' || e.ownerMemberId === '') {
+      throw new Error(`${prefix} — ${where} ownerMemberId must be a non-empty string or null`);
+    }
+    ownerMemberId = e.ownerMemberId;
+  }
+  return {
+    id: e.id as string,
+    name: e.name as string,
+    kind: e.kind as string,
+    ownerMemberId,
+    createdBy: e.createdBy as string,
+    createdAt: e.createdAt,
+  };
+}
+
+/**
+ * Validate one `PoolMemberWire` row. The wire row also carries `poolId`; it is
+ * deliberately NOT validated and NOT printed here, because inside
+ * `pools[i].members[j]` it is structurally the enclosing pool's `id` and
+ * repeating it adds no information.
+ */
+function asPoolMemberRow(entry: unknown, prefix: string, where: string): PoolMemberWire {
+  if (typeof entry !== 'object' || entry === null) {
+    throw new Error(`${prefix} — ${where} is not an object`);
+  }
+  const e = entry as Record<string, unknown>;
+  for (const field of ['principalKind', 'principalId', 'addedBy'] as const) {
+    if (typeof e[field] !== 'string' || e[field] === '') {
+      throw new Error(`${prefix} — ${where} missing non-empty string ${field}`);
+    }
+  }
+  if (typeof e.addedAt !== 'number') {
+    throw new Error(`${prefix} — ${where} missing number addedAt`);
+  }
+  return {
+    principalKind: e.principalKind as string,
+    principalId: e.principalId as string,
+    addedBy: e.addedBy as string,
+    addedAt: e.addedAt,
+  };
+}
+
+/**
+ * Narrow `GET /api/pools`'s 200 body (`{ text, pools: [...] }`) to a typed
+ * array. An EMPTY array is valid (a brand-new org). `GET /api/pools`
+ * deliberately returns the org's reserved orphan pool when it exists — this
+ * never filters it out; instead every row gets a derived `orphan` boolean,
+ * always present (`true` or `false`), so a scripted consumer never branches on
+ * the key's existence.
+ */
+export function asPools(body: unknown): PoolListingWire[] {
+  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).pools)) {
+    throw new Error('pools: malformed response — expected a `pools` array');
+  }
+  const list = (body as Record<string, unknown>).pools as unknown[];
+  const prefix = 'pools: malformed response';
+  return list.map((entry, i) => {
+    const row = asPoolRow(entry, prefix, `pools[${i}]`);
+    const e = entry as Record<string, unknown>;
+    if (!Array.isArray(e.members)) {
+      throw new Error(`${prefix} — pools[${i}] missing members array`);
+    }
+    const members = e.members.map((m, j) => asPoolMemberRow(m, prefix, `pools[${i}].members[${j}]`));
+    const orphan = row.kind === 'orphan' || row.name.startsWith(ORPHAN_POOL_NAME_PREFIX);
+    return { ...row, orphan, members };
+  });
+}
+
+/**
+ * Narrow `POST /api/create_pool`'s 200 body (`{ text, pool }`) to the typed
+ * row.
+ */
+export function asPoolCreated(body: unknown): PoolWire {
+  const prefix = 'create_pool: malformed success response';
+  if (typeof body !== 'object' || body === null) {
+    throw new Error(`${prefix} — not an object`);
+  }
+  const b = body as Record<string, unknown>;
+  if (b.pool === undefined) {
+    throw new Error(`${prefix} — missing pool`);
+  }
+  return asPoolRow(b.pool, prefix, 'pool');
+}
+
+/**
+ * Narrow `POST /api/delete_pool`'s 200 body. `poolId` and `deleted` are always
+ * present (`deleted` is a genuine boolean — both values are valid, deliberate
+ * hub answers, exactly like `asLabelBindingDeleted`). Each of the six transfer
+ * fields is validated ONLY IF PRESENT and OMITTED from the returned object when
+ * absent — never defaulted to `0`, `null`, or `[]`. Absence is the hub's way of
+ * saying "nothing moved"; default-filling would assert a transfer that never
+ * happened. `runsTransferred`/`runningRunsTransferred` are ARRAYS OF IDS, not
+ * counts — `stampsTransferred`/`membersRemoved` are the counts.
+ */
+export function asPoolDeleted(body: unknown): PoolDeletedWire {
+  const prefix = 'delete_pool: malformed success response';
+  if (typeof body !== 'object' || body === null) {
+    throw new Error(`${prefix} — not an object`);
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.poolId !== 'string' || b.poolId === '') {
+    throw new Error(`${prefix} — missing non-empty string poolId`);
+  }
+  if (typeof b.deleted !== 'boolean') {
+    throw new Error(`${prefix} — missing boolean deleted`);
+  }
+  const out: PoolDeletedWire = { poolId: b.poolId, deleted: b.deleted };
+  const numberIfPresent = (field: 'membersRemoved' | 'stampsTransferred'): void => {
+    if (b[field] === undefined) return;
+    if (typeof b[field] !== 'number') {
+      throw new Error(`${prefix} — ${field} must be a number`);
+    }
+    out[field] = b[field] as number;
+  };
+  const stringIfPresent = (field: 'orphanPoolId' | 'orphanPoolName'): void => {
+    if (b[field] === undefined) return;
+    if (typeof b[field] !== 'string' || b[field] === '') {
+      throw new Error(`${prefix} — ${field} must be a non-empty string`);
+    }
+    out[field] = b[field] as string;
+  };
+  const stringArrayIfPresent = (field: 'runsTransferred' | 'runningRunsTransferred'): void => {
+    if (b[field] === undefined) return;
+    const v = b[field];
+    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string' || x === '')) {
+      throw new Error(`${prefix} — ${field} must be an array of strings`);
+    }
+    out[field] = v as string[];
+  };
+  numberIfPresent('membersRemoved');
+  stringIfPresent('orphanPoolId');
+  stringIfPresent('orphanPoolName');
+  numberIfPresent('stampsTransferred');
+  stringArrayIfPresent('runsTransferred');
+  stringArrayIfPresent('runningRunsTransferred');
+  return out;
+}
+
+/** Narrow `POST /api/add_pool_member`'s 200 body (`{ text, member }`) to the typed row. */
+export function asPoolMemberAdded(body: unknown): PoolMemberWire {
+  const prefix = 'add_pool_member: malformed success response';
+  if (typeof body !== 'object' || body === null) {
+    throw new Error(`${prefix} — not an object`);
+  }
+  const b = body as Record<string, unknown>;
+  if (b.member === undefined) {
+    throw new Error(`${prefix} — missing member`);
+  }
+  return asPoolMemberRow(b.member, prefix, 'member');
+}
+
+/**
+ * Narrow `POST /api/remove_pool_member`'s 200 body (`{ text, poolId,
+ * principalId, removed }`). `removed` must be a genuine boolean — both values
+ * are valid, deliberate hub answers: `false` means the principal was never a
+ * member (tolerant, a normal success), exactly like `asLabelBindingDeleted`.
+ */
+export function asPoolMemberRemoved(body: unknown): PoolMemberRemovedWire {
+  const prefix = 'remove_pool_member: malformed success response';
+  if (typeof body !== 'object' || body === null) {
+    throw new Error(`${prefix} — not an object`);
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.poolId !== 'string' || b.poolId === '') {
+    throw new Error(`${prefix} — missing non-empty string poolId`);
+  }
+  if (typeof b.principalId !== 'string' || b.principalId === '') {
+    throw new Error(`${prefix} — missing non-empty string principalId`);
+  }
+  if (typeof b.removed !== 'boolean') {
+    throw new Error(`${prefix} — missing boolean removed`);
+  }
+  return { poolId: b.poolId, principalId: b.principalId, removed: b.removed };
+}
+
+/**
  * Success shape of `POST /api/rekey_agent_token` — the whitelist a caller may
  * keep. Sibling of `MintAgentTokenOk`, and MUST stay a whitelist for the same
  * reason: the real 200 body carries a `text` field whose value CONTAINS the new
