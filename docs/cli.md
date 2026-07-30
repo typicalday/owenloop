@@ -53,6 +53,11 @@ for the full breakdown.
 | `binding new <label> <pool> [--hub <url>]` | bind (or retarget) a workflow label to a pool on the hub org (admin; human credential) — see [Label bindings](#label-bindings) |
 | `binding rm <label> [--hub <url>]` | remove a label's pool binding — see [Label bindings](#label-bindings) |
 | `binding list [--hub <url>]` | list the hub org's label bindings — see [Label bindings](#label-bindings) |
+| `pool list [--hub <url>]` | list the hub org's pools with their members (includes the orphan pool once one exists) — see [Pools](#pools) |
+| `pool new <name> --kind personal\|shared [--owner <memberId>] [--hub <url>]` | create a pool on the hub org (admin, or own personal pool; human credential) — see [Pools](#pools) |
+| `pool rm <poolId> [--hub <url>]` | delete a pool; work stamped to it moves to the org's orphan pool — see [Pools](#pools) |
+| `pool member add <poolId> <principalKind> <principalId> [--hub <url>]` | add a member or agent to a pool — see [Pools](#pools) |
+| `pool member rm <poolId> <principalId> [--hub <url>]` | remove a principal from a pool — see [Pools](#pools) |
 | `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]` | converge this machine's install (human login, agent credential, owenwork settings, plugin) in one idempotent pass — see [`setup`](#setup--converge-a-machines-install) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
@@ -699,6 +704,147 @@ what was stored.
 |---|---|
 | `0` | the binding was set, removed (or was already absent), or listed |
 | `1` | runtime or hub error — an unknown pool name, a label that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
+| `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
+| `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
+
+## Pools
+
+A **pool** is an org-scoped queue that agent work is stamped to. Every hub org
+can have, in addition to any pools an admin creates, one **orphan pool** (name
+`orphan:unrouted`, `kind: "orphan"`) that the hub itself owns as the landing
+zone for work whose pool was deleted out from under it. It is materialized
+**lazily**, the first time a pool holding stamped work is deleted — an org
+that has never deleted a pool with stamped work has no orphan pool at all, and
+`pool list` shows none. Once it exists, `pool list` includes it — it is
+marked, never hidden, via a derived `orphan: true` boolean on its row (see the
+Printed JSON table below).
+
+This family is independent of [label bindings](#label-bindings): a label binds
+to a pool by *name*, and a pool is where agent work actually queues. Deleting a
+pool a label still points at does not error — the label's routing simply
+resolves nowhere useful until it is rebound.
+
+### `pool list`
+
+`GET /api/pools`, authenticated as your **human** credential. Lists the org's
+pools, each with its member rows (`principalKind`/`principalId`/`addedBy`/
+`addedAt`). An org with no pools at all — including one that has never
+materialized an orphan pool — is still a normal success (exit 0) with an empty
+`pools` array.
+
+### `pool new <name> --kind personal|shared [--owner <memberId>]`
+
+`POST /api/create_pool`, authenticated as your **human** credential; requires
+the **admin** role on the hub, **or** — for `--kind personal --owner
+<memberId>` where `<memberId>` is the caller's own member id — no admin role
+at all: a human may self-service additional personal pools for themself
+without being an admin (`assertPoolMutationAllowed`, hub-core
+`manage-pools.ts:211-214`). Every other combination (a `shared` pool, or a
+`personal` pool owned by someone else) still requires admin. `--kind` is **required** but its value is
+forwarded to the hub **verbatim and unvalidated** — the hub is the enforcement
+of record for which kind values are legal (today `personal`/`shared`; `orphan`
+is reserved for the hub's own pool). `--owner <memberId>` is optional and is
+omitted from the request body entirely when not given — a `personal` pool
+with no owner is the hub's own error to raise, not a client-side rule
+duplicated here.
+
+### `pool rm <poolId>`
+
+`POST /api/delete_pool`, authenticated as your **human** credential; requires
+the **admin** role on the hub for every pool kind, including a personal one —
+`deletePool` bypasses the self-service gate that `pool new`/`pool member
+add`/`pool member rm` use, and is admin-only unconditionally
+(`manage-pools.ts:629`). Deletes the pool. The pool's **membership rows are
+deleted outright, not moved** — `deleteAllPoolMembers` (`manage-pools.ts:706`)
+runs unconditionally in the same transaction, whether or not any stamps
+transfer; `membersRemoved` on stdout is a count of those deletions, since the
+orphan pool's own membership is derived (always the org's current admins) and
+cannot accept arbitrary members. Only the pool's **run stamps and
+queued/running work** move to the org's orphan pool — memberships are never
+among what moves.
+
+**`rm` is idempotent.** Deleting a `<poolId>` that does not exist is a normal
+success — the hub answers `200` with `deleted: false` rather than a `404` —
+and the CLI prints this honestly (see below), plus a stderr line naming the
+pool id, rather than inventing an error.
+
+**Unlike [`binding rm`](#binding-rm-label), `pool rm` prints its tolerant
+`deleted` boolean on stdout.** `binding rm` hides `deleted` under a frozen
+output contract from before this family existed; `pool` carries no such
+history, so the more honest shape was chosen instead.
+
+**The transfer fields are present on stdout if and only if the wire sent
+them** — `membersRemoved`, `orphanPoolId`, `orphanPoolName`,
+`stampsTransferred`, `runsTransferred` (an array of run ids, not a count), and
+`runningRunsTransferred` (the subset still running, also an array) are never
+defaulted to `0`/`null`/`[]`. Their absence means nothing moved; their
+presence means a transfer happened, and stderr also gets a one-line human
+summary naming the destination pool.
+
+### `pool member add <poolId> <principalKind> <principalId>`
+
+`POST /api/add_pool_member` authenticated as your **human** credential;
+requires the **admin** role on the hub, **or** the owner of the personal pool
+being acted on (same self-service carve-out as `pool new`, gated on the
+fetched pool row rather than the raw request — `manage-pools.ts:300`). Adds
+`<principalId>` (a member id or an agent id) to the pool as a
+`<principalKind>` (`member` or `agent`) member. `<principalKind>` is forwarded
+verbatim and unvalidated, same stance as `--kind` on `pool new`.
+
+**The hub refuses this outright against the org's orphan pool, for every
+caller — including an admin.** `assertNotOrphanPool` (`manage-pools.ts:307`)
+throws before the add ever reaches the membership table, and it is a `400`,
+never a `403`: the refusal is identity-independent (true for every caller, not
+a permissions question), so a `403` would wrongly point the caller at their
+own role. The orphan pool's membership is derived — always the org's current
+admins, reconciled automatically on every membership change — and cannot be
+edited directly.
+
+### `pool member rm <poolId> <principalId>`
+
+`POST /api/remove_pool_member`, authenticated as your **human** credential;
+requires the **admin** role on the hub, **or** the owner of the personal pool
+being acted on (`manage-pools.ts:356`). Removes `<principalId>` from the pool.
+
+**`member rm` is idempotent**, mirroring `pool rm`: removing a principal that
+was never a member of `<poolId>` is a normal `200` with `removed: false`, never
+a `404`. The CLI prints `removed: false` on stdout and a stderr line naming
+the principal and pool, rather than treating it as an error.
+
+**Same orphan-pool refusal as `pool member add`.** Targeting the orphan pool
+is a `400` here too (`assertNotOrphanPool`, `manage-pools.ts:363`), for every
+caller including an admin, and for the same reason: the membership is derived,
+not editable.
+
+**Flags.** `--hub <url>` only (plus the global `--db`/`--defs`), except `pool
+new`, which also takes `--kind` (required) and `--owner` (optional).
+
+**Which hub gets acted on (`--hub`).** Identical resolution to the `binding`
+family: `--hub` if given, else the one hub your credential file stores, else
+exit 2 naming both remedies (and, on a multi-hub machine, listing the stored
+origins). No fallback to `OWENLOOP_HUB`
+or the built-in default hub; hub enumeration is file-store only.
+
+**Printed JSON.** stdout is exactly one whitelisted JSON document per
+invocation — never a raw hub body — so `| jq` always works. Human-facing
+lines (the tolerant-false notices, the transfer summary) go to stderr only.
+
+| subcommand | stdout |
+|---|---|
+| `pool list` | `{ "ok": true, "hub": "<origin>", "pools": [ { "id": "pl_1", "name": "team-a", "kind": "shared", "ownerMemberId": null, "createdBy": "u_1", "createdAt": 1738000000000, "orphan": false, "members": [ { "principalKind": "member", "principalId": "u_2", "addedBy": "u_1", "addedAt": 1738000000000 } ] } ] }` |
+| `pool new` | `{ "ok": true, "hub": "<origin>", "poolId": "pl_1", "name": "team-a", "kind": "shared", "ownerMemberId": null }` |
+| `pool rm` (no transfer) | `{ "ok": true, "hub": "<origin>", "poolId": "pl_1", "deleted": true, "membersRemoved": 2 }` |
+| `pool rm` (with transfer) | `{ "ok": true, "hub": "<origin>", "poolId": "pl_1", "deleted": true, "membersRemoved": 2, "orphanPoolId": "pl_orphan", "orphanPoolName": "orphan:unrouted", "stampsTransferred": 5, "runsTransferred": ["run_1", "run_2"], "runningRunsTransferred": ["run_2"] }` |
+| `pool rm` (unknown id) | `{ "ok": true, "hub": "<origin>", "poolId": "pl_bogus", "deleted": false }` |
+| `pool member add` | `{ "ok": true, "hub": "<origin>", "poolId": "pl_1", "principalKind": "member", "principalId": "u_2" }` |
+| `pool member rm` | `{ "ok": true, "hub": "<origin>", "poolId": "pl_1", "principalId": "u_2", "removed": true }` |
+
+**Exit codes.**
+
+| code | meaning |
+|---|---|
+| `0` | the pool/membership was listed, created, removed (or was already absent) |
+| `1` | runtime or hub error — an unknown pool id on a member add/rm, a pool with active work refusing deletion, a `403` for a non-admin, a malformed response, or a network timeout |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
 
