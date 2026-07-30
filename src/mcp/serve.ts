@@ -464,10 +464,15 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'presence_ping',
       description:
-        'Register or refresh this Conductor in the presence registry (name + the labels it serves). Call it on a ~60s cadence; the entry reads as offline after ~3 min of missed pings. Observability only. Omitting serve_pools stores an empty label set (overwrite, NOT keep-previous).',
+        'Register or refresh this Conductor in the presence registry: its name, the pools it serves, and optionally which process incarnation is reporting. Call it on a ~60s cadence; the entry reads as offline once ~3 min have passed since its last ping — derived when the registry is read, nothing sweeps it. Observability only: it never affects serving and never wakes anyone. This is NOT the lease heartbeat — that is the separate `heartbeat` tool, one per claimed run, whose lapse gets the claim reaped. Every field is overwrite, NOT keep-previous: omitting serve_pools stores an empty set, which means "every pool this principal belongs to" (the same reading whats_next gives an empty serve_pools) and NOT "no pools"; omitting conductor_id/started_at clears them.',
       inputSchema: {
         type: 'object',
-        properties: { name: { type: 'string' }, serve_pools: { type: 'array', items: { type: 'string' } } },
+        properties: {
+          name: { type: 'string' },
+          serve_pools: { type: 'array', items: { type: 'string' } },
+          conductor_id: { type: 'string' },
+          started_at: { type: 'number' },
+        },
         required: ['name'],
         additionalProperties: false,
       },
@@ -476,7 +481,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'list_conductors',
       description:
-        "Your principal's registered Conductors, each with an online/offline flag (derived from its last ping), the labels it serves, and how long since it was last seen.",
+        "Your principal's registered Conductors, each with an online/offline flag (derived at read time from its last ping, ~3 min), how long since it was last seen, the pools it serves (returned as `labels`; an empty list means every pool this principal belongs to, not none), and the reporting process incarnation (`conductorId`/`startedAt`) when the hub recorded one.",
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       handler: passthrough(deps, () => ({ method: 'GET', path: '/api/conductors' })),
     },
