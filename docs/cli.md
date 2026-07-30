@@ -900,8 +900,8 @@ block; a non-2xx response comes back as an error result.
 | `release` | give back a claim so its order is re-offered without waiting out the reap TTL |
 | `publish_event` | publish an event against a contract, starting one run per matched subscription |
 | `list_subscriptions` | the org's contract subscriptions |
-| `presence_ping` | register/refresh this Conductor in the presence registry |
-| `list_conductors` | your principal's registered Conductors and their online/offline state |
+| `presence_ping` | register/refresh this Conductor's presence — name, pools served (empty/omitted `serve_pools` means every pool this principal belongs to), and optionally which process incarnation is reporting (`conductor_id`/`started_at`); observability only, a separate mechanism from the `heartbeat` lease tool above |
+| `list_conductors` | your principal's registered Conductors — online/offline derived at read time from last ping, pools served (returned as `labels`; empty means every pool this principal belongs to), and each one's reporting incarnation (`conductorId`/`startedAt`) when the hub recorded one |
 | `wake` | cheap "has anything changed since cursor X" pre-check for a polling loop |
 | `create_agent` | create a NEW Scoped Identity and store its credential locally — **never returns the token** |
 
