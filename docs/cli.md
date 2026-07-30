@@ -755,11 +755,13 @@ the **admin** role on the hub for every pool kind, including a personal one —
 `deletePool` bypasses the self-service gate that `pool new`/`pool member
 add`/`pool member rm` use, and is admin-only unconditionally
 (`manage-pools.ts:629`). Deletes the pool. The pool's **membership rows are
-removed**, not transferred — `membersRemoved` on stdout is a count of
-memberships deleted, since the orphan pool's own membership is derived (always
-the org's current admins) and cannot accept arbitrary members. Only the
-pool's **run stamps and queued/running work** move to the org's orphan pool;
-nothing is discarded, but "moved" applies to stamps and runs, not memberships.
+deleted outright, not moved** — `deleteAllPoolMembers` (`manage-pools.ts:706`)
+runs unconditionally in the same transaction, whether or not any stamps
+transfer; `membersRemoved` on stdout is a count of those deletions, since the
+orphan pool's own membership is derived (always the org's current admins) and
+cannot accept arbitrary members. Only the pool's **run stamps and
+queued/running work** move to the org's orphan pool — memberships are never
+among what moves.
 
 **`rm` is idempotent.** Deleting a `<poolId>` that does not exist is a normal
 success — the hub answers `200` with `deleted: false` rather than a `404` —
@@ -789,6 +791,15 @@ fetched pool row rather than the raw request — `manage-pools.ts:300`). Adds
 `<principalKind>` (`member` or `agent`) member. `<principalKind>` is forwarded
 verbatim and unvalidated, same stance as `--kind` on `pool new`.
 
+**The hub refuses this outright against the org's orphan pool, for every
+caller — including an admin.** `assertNotOrphanPool` (`manage-pools.ts:307`)
+throws before the add ever reaches the membership table, and it is a `400`,
+never a `403`: the refusal is identity-independent (true for every caller, not
+a permissions question), so a `403` would wrongly point the caller at their
+own role. The orphan pool's membership is derived — always the org's current
+admins, reconciled automatically on every membership change — and cannot be
+edited directly.
+
 ### `pool member rm <poolId> <principalId>`
 
 `POST /api/remove_pool_member`, authenticated as your **human** credential;
@@ -799,6 +810,11 @@ being acted on (`manage-pools.ts:356`). Removes `<principalId>` from the pool.
 was never a member of `<poolId>` is a normal `200` with `removed: false`, never
 a `404`. The CLI prints `removed: false` on stdout and a stderr line naming
 the principal and pool, rather than treating it as an error.
+
+**Same orphan-pool refusal as `pool member add`.** Targeting the orphan pool
+is a `400` here too (`assertNotOrphanPool`, `manage-pools.ts:363`), for every
+caller including an admin, and for the same reason: the membership is derived,
+not editable.
 
 **Flags.** `--hub <url>` only (plus the global `--db`/`--defs`), except `pool
 new`, which also takes `--kind` (required) and `--owner` (optional).
