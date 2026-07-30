@@ -228,14 +228,21 @@ test('mcp: list_pools is a plain GET passthrough — the full body (including th
         name: 'alex-personal',
         kind: 'personal',
         ownerMemberId: 'mem_alex',
-        members: [{ principalKind: 'member', principalId: 'mem_alex' }],
+        members: [{ principalKind: 'member', principalId: 'mem_alex', addedBy: 'mem_alex', addedAt: 1700000000000 }],
       },
       {
         // Deliberately included: the orphan pool is a normal row here, not filtered out.
-        id: 'orphan:unrouted',
-        name: 'Unrouted',
+        // `id` is a normal randomId() — NOT the reserved name — per
+        // owenloop-service manage-pools.ts's `ensureOrphanPool`; the reserved
+        // NAME (`ORPHAN_POOL_NAME`) is what `orphan:` prefixes, at :104.
+        id: 'pl_orphan',
+        name: 'orphan:unrouted',
         kind: 'orphan',
-        members: [{ principalKind: 'member', principalId: 'mem_admin1' }, { principalKind: 'member', principalId: 'mem_admin2' }],
+        ownerMemberId: null,
+        members: [
+          { principalKind: 'member', principalId: 'mem_admin1', addedBy: 'mem_admin1', addedAt: 1700000000000 },
+          { principalKind: 'member', principalId: 'mem_admin2', addedBy: 'mem_admin2', addedAt: 1700000000000 },
+        ],
       },
     ],
   };
@@ -326,20 +333,33 @@ test('mcp: remove_pool_member — a tolerant hub 200 {removed:false} (never-a-me
 });
 
 test('mcp: a hub 400 orphan-pool refusal on a pool tool maps to isError (non-2xx still becomes an error, unlike the tolerant remove case)', async () => {
+  // Real hub contract, not invented: `isPoolError` maps to `{error:'pool_invalid', message}`
+  // (owenloop-service apps/hub-edge/src/index.ts:320-321), and the message text is
+  // `assertNotOrphanPool`'s own wording verbatim (manage-pools.ts:187-193), with
+  // `addPoolMember`'s `what` clause (manage-pools.ts:307).
+  const orphanMessage =
+    "pool 'orphan:unrouted' is the org's internal orphan pool — its membership is the org admin roster and " +
+    'cannot be edited directly. It holds work whose pool was deleted; re-route those runs by stamping them ' +
+    'elsewhere or cancel them.';
   const routes: Record<string, RouteHandler> = {
     'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
     'POST /api/add_pool_member': () => ({
       status: 400,
-      json: { error: 'orphan_pool_immutable', message: 'the orphan pool is derived from org admins and cannot be edited directly' },
+      json: { error: 'pool_invalid', message: orphanMessage },
     }),
   };
   const { fetch } = routedFetch(routes);
   const t = makeIo({ fetch });
   seedHuman(t);
 
-  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'add_pool_member', { poolId: 'orphan:unrouted', principalKind: 'member', principalId: 'mem_x' })]);
+  // `poolId` is the pool's ID, not its NAME — `orphan:unrouted` is the reserved
+  // NAME (`ORPHAN_POOL_NAME`), while the id the hub assigns via `ensureOrphanPool`
+  // is a normal `randomId()`. A plausible id is used here for the argument; it is
+  // the tool's REQUEST shape, distinct from the hub's error message above, which
+  // names the pool by its NAME (mirroring `pool.name` in `assertNotOrphanPool`).
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'add_pool_member', { poolId: 'pl_orphan', principalKind: 'member', principalId: 'mem_x' })]);
   assert.equal(frames[1]!.result!.isError, true);
-  assert.deepEqual(resultJson(frames[1]!), { error: 'orphan_pool_immutable', message: 'the orphan pool is derived from org admins and cannot be edited directly' });
+  assert.deepEqual(resultJson(frames[1]!), { error: 'pool_invalid', message: orphanMessage });
 });
 
 // ---- non-interactive auth failure -------------------------------------------

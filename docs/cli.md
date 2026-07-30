@@ -1068,12 +1068,17 @@ write fails, the result says so and tells you to revoke/re-key the agent from
 the console.
 
 **The four pool tools** (`list_pools`, `create_pool`, `add_pool_member`,
-`remove_pool_member`) mirror the [`pool` CLI family](#pools) exactly — same
-`/api/*` routes, same request/response shapes, same RBAC — and are plain
-passthroughs: the hub REST body maps straight to the tool result with no
-narrowing, and each argument schema deliberately has **no `enum`** on
-`kind`/`principalKind`, since the hub, not this client, is the enforcement of
-record for which values are legal.
+`remove_pool_member`) cover the same four operations as the [`pool` CLI
+family](#pools) — `pool list`, `pool new`, `pool member add`, `pool member
+rm` — over the same `/api/*` routes and the same RBAC, but they are not an
+exact mirror of it: `pool rm` (pool deletion) has no MCP counterpart at all
+(see below), and where the CLI narrows each hub response into one
+whitelisted JSON document per invocation (`asPools`, `asPoolCreated`, etc.,
+so `| jq` always works), these MCP tools are plain passthroughs — the raw
+hub REST body maps straight to the tool result with no narrowing. Each
+argument schema deliberately has **no `enum`** on `kind`/`principalKind`,
+since the hub, not this client, is the enforcement of record for which
+values are legal.
 
 Access is **not uniformly admin-only**: `create_pool`, `add_pool_member`, and
 `remove_pool_member` all carry the same self-service carve-out as their CLI
