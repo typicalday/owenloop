@@ -53,8 +53,8 @@ for the full breakdown.
 | `binding new <label> <pool> [--hub <url>]` | bind (or retarget) a workflow label to a pool on the hub org (admin; human credential) — see [Label bindings](#label-bindings) |
 | `binding rm <label> [--hub <url>]` | remove a label's pool binding — see [Label bindings](#label-bindings) |
 | `binding list [--hub <url>]` | list the hub org's label bindings — see [Label bindings](#label-bindings) |
-| `pool list [--hub <url>]` | list the hub org's pools with their members (includes the orphan pool) — see [Pools](#pools) |
-| `pool new <name> --kind personal\|shared [--owner <memberId>] [--hub <url>]` | create a pool on the hub org (admin; human credential) — see [Pools](#pools) |
+| `pool list [--hub <url>]` | list the hub org's pools with their members (includes the orphan pool once one exists) — see [Pools](#pools) |
+| `pool new <name> --kind personal\|shared [--owner <memberId>] [--hub <url>]` | create a pool on the hub org (admin, or own personal pool; human credential) — see [Pools](#pools) |
 | `pool rm <poolId> [--hub <url>]` | delete a pool; work stamped to it moves to the org's orphan pool — see [Pools](#pools) |
 | `pool member add <poolId> <principalKind> <principalId> [--hub <url>]` | add a member or agent to a pool — see [Pools](#pools) |
 | `pool member rm <poolId> <principalId> [--hub <url>]` | remove a principal from a pool — see [Pools](#pools) |
@@ -710,11 +710,14 @@ what was stored.
 ## Pools
 
 A **pool** is an org-scoped queue that agent work is stamped to. Every hub org
-has, in addition to any pools an admin creates, exactly one **orphan pool**
-(name `orphan:unrouted`, `kind: "orphan"`) that the hub itself owns as the
-landing zone for work whose pool was deleted out from under it. `pool list`
-always includes the orphan pool — it is marked, never hidden, via a derived
-`orphan: true` boolean on its row (see [Printed JSON](#printed-json-1) below).
+can have, in addition to any pools an admin creates, one **orphan pool** (name
+`orphan:unrouted`, `kind: "orphan"`) that the hub itself owns as the landing
+zone for work whose pool was deleted out from under it. It is materialized
+**lazily**, the first time a pool holding stamped work is deleted — an org
+that has never deleted a pool with stamped work has no orphan pool at all, and
+`pool list` shows none. Once it exists, `pool list` includes it — it is
+marked, never hidden, via a derived `orphan: true` boolean on its row (see the
+Printed JSON table below).
 
 This family is independent of [label bindings](#label-bindings): a label binds
 to a pool by *name*, and a pool is where agent work actually queues. Deleting a
@@ -725,13 +728,19 @@ resolves nowhere useful until it is rebound.
 
 `GET /api/pools`, authenticated as your **human** credential. Lists the org's
 pools, each with its member rows (`principalKind`/`principalId`/`addedBy`/
-`addedAt`). An org with no pools beyond the built-in orphan pool is still a
-normal success (exit 0).
+`addedAt`). An org with no pools at all — including one that has never
+materialized an orphan pool — is still a normal success (exit 0) with an empty
+`pools` array.
 
 ### `pool new <name> --kind personal|shared [--owner <memberId>]`
 
 `POST /api/create_pool`, authenticated as your **human** credential; requires
-the **admin** role on the hub. `--kind` is **required** but its value is
+the **admin** role on the hub, **or** — for `--kind personal --owner
+<memberId>` where `<memberId>` is the caller's own member id — no admin role
+at all: a human may self-service additional personal pools for themself
+without being an admin (`assertPoolMutationAllowed`, hub-core
+`manage-pools.ts:211-214`). Every other combination (a `shared` pool, or a
+`personal` pool owned by someone else) still requires admin. `--kind` is **required** but its value is
 forwarded to the hub **verbatim and unvalidated** — the hub is the enforcement
 of record for which kind values are legal (today `personal`/`shared`; `orphan`
 is reserved for the hub's own pool). `--owner <memberId>` is optional and is
@@ -742,16 +751,22 @@ duplicated here.
 ### `pool rm <poolId>`
 
 `POST /api/delete_pool`, authenticated as your **human** credential; requires
-the **admin** role on the hub. Deletes the pool. Any members, run stamps,
-and queued/running work the pool held are **transferred to the org's orphan
-pool** — nothing is discarded.
+the **admin** role on the hub for every pool kind, including a personal one —
+`deletePool` bypasses the self-service gate that `pool new`/`pool member
+add`/`pool member rm` use, and is admin-only unconditionally
+(`manage-pools.ts:629`). Deletes the pool. The pool's **membership rows are
+removed**, not transferred — `membersRemoved` on stdout is a count of
+memberships deleted, since the orphan pool's own membership is derived (always
+the org's current admins) and cannot accept arbitrary members. Only the
+pool's **run stamps and queued/running work** move to the org's orphan pool;
+nothing is discarded, but "moved" applies to stamps and runs, not memberships.
 
 **`rm` is idempotent.** Deleting a `<poolId>` that does not exist is a normal
 success — the hub answers `200` with `deleted: false` rather than a `404` —
 and the CLI prints this honestly (see below), plus a stderr line naming the
 pool id, rather than inventing an error.
 
-**Unlike [`binding rm`](#binding-rmlabel), `pool rm` prints its tolerant
+**Unlike [`binding rm`](#binding-rm-label), `pool rm` prints its tolerant
 `deleted` boolean on stdout.** `binding rm` hides `deleted` under a frozen
 output contract from before this family existed; `pool` carries no such
 history, so the more honest shape was chosen instead.
@@ -767,15 +782,18 @@ summary naming the destination pool.
 ### `pool member add <poolId> <principalKind> <principalId>`
 
 `POST /api/add_pool_member` authenticated as your **human** credential;
-requires the **admin** role on the hub. Adds `<principalId>` (a member id or
-an agent id) to the pool as a `<principalKind>` (`member` or `agent`) member.
-`<principalKind>` is forwarded verbatim and unvalidated, same stance as
-`--kind` on `pool new`.
+requires the **admin** role on the hub, **or** the owner of the personal pool
+being acted on (same self-service carve-out as `pool new`, gated on the
+fetched pool row rather than the raw request — `manage-pools.ts:300`). Adds
+`<principalId>` (a member id or an agent id) to the pool as a
+`<principalKind>` (`member` or `agent`) member. `<principalKind>` is forwarded
+verbatim and unvalidated, same stance as `--kind` on `pool new`.
 
 ### `pool member rm <poolId> <principalId>`
 
 `POST /api/remove_pool_member`, authenticated as your **human** credential;
-requires the **admin** role on the hub. Removes `<principalId>` from the pool.
+requires the **admin** role on the hub, **or** the owner of the personal pool
+being acted on (`manage-pools.ts:356`). Removes `<principalId>` from the pool.
 
 **`member rm` is idempotent**, mirroring `pool rm`: removing a principal that
 was never a member of `<poolId>` is a normal `200` with `removed: false`, never
@@ -785,10 +803,10 @@ the principal and pool, rather than treating it as an error.
 **Flags.** `--hub <url>` only (plus the global `--db`/`--defs`), except `pool
 new`, which also takes `--kind` (required) and `--owner` (optional).
 
-**Which hub gets acted on (`--hub`).** Identical resolution to
-[`binding`](#which-hub-gets-acted-on---hub): `--hub` if given, else the one hub
-your credential file stores, else exit 2 naming both remedies (and, on a
-multi-hub machine, listing the stored origins). No fallback to `OWENLOOP_HUB`
+**Which hub gets acted on (`--hub`).** Identical resolution to the `binding`
+family: `--hub` if given, else the one hub your credential file stores, else
+exit 2 naming both remedies (and, on a multi-hub machine, listing the stored
+origins). No fallback to `OWENLOOP_HUB`
 or the built-in default hub; hub enumeration is file-store only.
 
 **Printed JSON.** stdout is exactly one whitelisted JSON document per

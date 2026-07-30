@@ -188,6 +188,32 @@ test('pool new: --kind is forwarded VERBATIM and unvalidated client-side (the hu
   assert.deepEqual(JSON.parse(req.body!), { name: 'team-a', kind: 'bogus-kind' });
 });
 
+test('pool new: prints the SERVER-ECHOED name/kind/id, not argv, when the hub normalizes them', async () => {
+  // argv asks for 'team-a'; the hub stores it differently (e.g. normalized)
+  // and mints its own id. Every other happy-path test's canned body happens
+  // to match argv, so a regression that printed argv instead of `created.*`
+  // would pass all of them — this is the one test that would catch it.
+  const { fetch, calls } = routedFetch({
+    'POST /api/create_pool': createOk({ id: 'pl_7', name: 'team-a-2', kind: 'shared' }),
+  });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['pool', 'new', 'team-a', '--kind', 'shared', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const req = calls.find((c) => c.pathname === '/api/create_pool')!;
+  assert.deepEqual(JSON.parse(req.body!), { name: 'team-a', kind: 'shared' }, 'the request still carries the argv name');
+  assert.deepEqual(stdoutJson(t), {
+    ok: true,
+    hub: ORIGIN,
+    poolId: 'pl_7',
+    name: 'team-a-2',
+    kind: 'shared',
+    ownerMemberId: null,
+  });
+});
+
 test('pool rm: a normal delete with NO transfer prints { ok, hub, poolId, deleted, membersRemoved }, no stderr', async () => {
   const { fetch, calls } = routedFetch({ 'POST /api/delete_pool': deleteOk({ membersRemoved: 2 }) });
   const t = makeIo({ fetch });

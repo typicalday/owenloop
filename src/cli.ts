@@ -547,8 +547,8 @@ Commands:
   binding new <label> <pool> [--hub <url>]   bind (or retarget) a workflow label to a pool on the hub org (admin; human credential)
   binding rm <label> [--hub <url>]         remove a label's pool binding
   binding list [--hub <url>]               list the hub org's label bindings
-  pool list [--hub <url>]                  list the hub org's pools with their members (includes the orphan pool)
-  pool new <name> --kind personal|shared [--owner <memberId>] [--hub <url>]   create a pool on the hub org (admin; human credential)
+  pool list [--hub <url>]                  list the hub org's pools with their members (includes the orphan pool once one exists)
+  pool new <name> --kind personal|shared [--owner <memberId>] [--hub <url>]   create a pool on the hub org (admin, or own personal pool; human credential)
   pool rm <poolId> [--hub <url>]           delete a pool; work stamped to it moves to the org's orphan pool
   pool member add <poolId> <principalKind> <principalId> [--hub <url>]   add a member or agent to a pool
   pool member rm <poolId> <principalId> [--hub <url>]   remove a principal from a pool
@@ -2748,15 +2748,16 @@ function createWorkflowRequest(
 }
 
 /**
- * Resolve the hub a mutating hub command acts on — shared by `agent new` and
- * `binding new|rm|list`: `--hub <origin>` (normalized via `normalizeOrigin`) →
- * else the ONE hub the credential FILE knows → else a `CliError` with
- * `exitCode: 2` naming both remedies.
+ * Resolve the hub a mutating hub command acts on — shared by `agent new`,
+ * `binding new|rm|list`, and `pool`'s five subcommands: `--hub <origin>`
+ * (normalized via `normalizeOrigin`) → else the ONE hub the credential FILE
+ * knows → else a `CliError` with `exitCode: 2` naming both remedies.
  *
  * `purpose` is the verb phrase spliced into both exit-2 messages ("cannot
  * determine which hub to <purpose> — …"). It defaults to `'mint on'` so
  * `dispatchAgent`'s two-argument call keeps `agent new`'s error strings
- * byte-identical; `dispatchBinding` passes `'manage label bindings on'`.
+ * byte-identical; `dispatchBinding` passes `'manage label bindings on'`;
+ * `dispatchPool` passes `'manage pools on'`.
  *
  * Deliberately NOT `resolveHub` (`--hub → OWENLOOP_HUB → DEFAULT_HUB`): silently
  * defaulting a MINT to the production hub while the user is logged into a dev hub

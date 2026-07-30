@@ -19,8 +19,8 @@ import { lstatSync, mkdirSync } from 'node:fs';
  * every existing `new CliError(msg)` — and `RateLimitError extends CliError`,
  * which inherits this constructor — keeps its byte-for-byte exit-1 behavior. The
  * non-default codes today are exit 2 (hub unresolvable) and exit 3 (human
- * credential absent/irrecoverable), used by both `agent new` and
- * `binding new|rm|list`.
+ * credential absent/irrecoverable), used by `agent new`, `binding
+ * new|rm|list`, and `pool`'s five subcommands.
  */
 export class CliError extends Error {
   readonly exitCode: number;
