@@ -175,6 +175,39 @@ test('mcp: get_workflow encodes the name into the GET path', async () => {
   assert.ok(!calls.some((c) => c.pathname === '/api/workflows/a/b'), 'the name must not split into two path segments');
 });
 
+test('mcp: presence_ping advertises optional conductor_id/started_at (schema parity) and the passthrough forwards them snake_case, unchanged for existing calls', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/presence_ping': () => ({ status: 200, json: { ok: true } }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
+    INIT,
+    LIST,
+    call(3, 'presence_ping', { name: 'c1', conductor_id: 'cnd_x', started_at: 123 }),
+    call(4, 'presence_ping', { name: 'c1' }),
+  ]);
+
+  // Schema guard: the two new fields are advertised as optional; the existing call shape
+  // (required/additionalProperties) is byte-identical to before.
+  const tools = (frames[1]!.result as { tools: Array<{ name: string; inputSchema: { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean } }> }).tools;
+  const ping = tools.find((x) => x.name === 'presence_ping')!;
+  assert.ok('conductor_id' in ping.inputSchema.properties, 'conductor_id advertised');
+  assert.ok('started_at' in ping.inputSchema.properties, 'started_at advertised');
+  assert.deepEqual(ping.inputSchema.required, ['name']);
+  assert.equal(ping.inputSchema.additionalProperties, false);
+
+  const pings = calls.filter((c) => c.pathname === '/api/presence_ping');
+  assert.equal(pings.length, 2);
+  // Highest-risk detail: request fields are snake_case and must survive the verbatim passthrough.
+  assert.deepEqual(JSON.parse(pings[0]!.body!), { name: 'c1', conductor_id: 'cnd_x', started_at: 123 });
+  // Omitting the new fields still posts exactly the old shape — no keys added.
+  assert.deepEqual(JSON.parse(pings[1]!.body!), { name: 'c1' });
+});
+
 // ---- non-interactive auth failure -------------------------------------------
 
 test('mcp: with NO stored credential a tool call returns a non-interactive login instruction and NEVER opens a browser', async () => {
