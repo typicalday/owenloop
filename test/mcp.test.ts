@@ -7,7 +7,7 @@
  * `realHttpServer` — no ambient network, no real keychain.
  *
  * The load-bearing assertions:
- *   - the handshake advertises the 18 baseline+create_agent tools;
+ *   - the handshake advertises the 22 baseline+create_agent+pool tools;
  *     `stage_enrollment` is gated (Decision 7);
  *   - a `tools/call` becomes ONE authenticated `/api/*` request and the REST
  *     reply maps to a tool result (2xx → body, non-2xx → isError);
@@ -18,7 +18,10 @@
  *     NEVER lets any byte of the mint response body reach an outbound frame
  *     (the full-transcript no-`olp_` assertion);
  *   - origin resolution exits 2 (naming both remedies) on absent/ambiguous
- *     inference, and exit 1 on a malformed `--hub`.
+ *     inference, and exit 1 on a malformed `--hub`;
+ *   - the four pool tools are plain REST passthroughs (no response narrowing),
+ *     `remove_pool_member`'s tolerant `removed:false` is never turned into a
+ *     tool error, and `delete_pool` is NOT advertised (deliberately excluded).
  */
 
 import { test } from 'node:test';
@@ -77,7 +80,7 @@ function resultJson(frame: Frame): unknown {
 
 // ---- handshake + tool advertising -------------------------------------------
 
-test('mcp: handshake advertises 18 tools (17 baseline + create_agent); stage_enrollment is hidden when the probe 404s', async () => {
+test('mcp: handshake advertises 22 tools (17 baseline + create_agent + 4 pool tools); stage_enrollment is hidden when the probe 404s', async () => {
   // Probe hits POST /api/stage_enrollment → 404 (route unregistered) → hidden.
   const routes: Record<string, RouteHandler> = { 'POST /api/stage_enrollment': () => ({ status: 404, json: { error: 'not_found' } }) };
   const { fetch } = routedFetch(routes);
@@ -87,13 +90,19 @@ test('mcp: handshake advertises 18 tools (17 baseline + create_agent); stage_enr
   const { code, frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, LIST]);
   assert.equal(code, 0, t.err.join('\n'));
   const names = frames[1]!.result!.tools!.map((x) => x.name);
-  assert.equal(names.length, 18, names.join(','));
+  assert.equal(names.length, 22, names.join(','));
   assert.ok(names.includes('create_agent'));
   assert.ok(!names.includes('stage_enrollment'));
   // Sanity: the 17 baseline names are all present.
   for (const n of ['whats_next', 'submit', 'reject_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_conductors', 'wake']) {
     assert.ok(names.includes(n), `missing ${n}`);
   }
+  // The four pool tools are all present.
+  for (const n of ['list_pools', 'create_pool', 'add_pool_member', 'remove_pool_member']) {
+    assert.ok(names.includes(n), `missing ${n}`);
+  }
+  // Regression guard for the human's deliberate exclusion decision (see buildPoolTools).
+  assert.ok(!names.includes('delete_pool'), 'delete_pool must never be advertised on this server');
 });
 
 test('mcp: stage_enrollment gating — env override 1 shows it, 0 hides it, and an unset probe that 400s shows it', async () => {
@@ -206,6 +215,131 @@ test('mcp: presence_ping advertises optional conductor_id/started_at (schema par
   assert.deepEqual(JSON.parse(pings[0]!.body!), { name: 'c1', conductor_id: 'cnd_x', started_at: 123 });
   // Omitting the new fields still posts exactly the old shape — no keys added.
   assert.deepEqual(JSON.parse(pings[1]!.body!), { name: 'c1' });
+});
+
+// ---- pool tools --------------------------------------------------------------
+
+test('mcp: list_pools is a plain GET passthrough — the full body (including the orphan pool row) survives with no filtering or narrowing', async () => {
+  const body = {
+    text: '2 pools',
+    pools: [
+      {
+        id: 'pl_1',
+        name: 'alex-personal',
+        kind: 'personal',
+        ownerMemberId: 'mem_alex',
+        members: [{ principalKind: 'member', principalId: 'mem_alex' }],
+      },
+      {
+        // Deliberately included: the orphan pool is a normal row here, not filtered out.
+        id: 'orphan:unrouted',
+        name: 'Unrouted',
+        kind: 'orphan',
+        members: [{ principalKind: 'member', principalId: 'mem_admin1' }, { principalKind: 'member', principalId: 'mem_admin2' }],
+      },
+    ],
+  };
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'GET /api/pools': () => ({ status: 200, json: body }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'list_pools', {})]);
+  assert.deepEqual(resultJson(frames[1]!), body, 'no filtering or narrowing — the full hub body, orphan row included');
+
+  const pools = calls.filter((c) => c.pathname === '/api/pools');
+  assert.equal(pools.length, 1, 'exactly one hub call');
+  assert.equal(pools[0]!.method, 'GET');
+  assert.equal(pools[0]!.authorization, 'Bearer mcpat_human', 'the human bearer rode the Authorization header');
+});
+
+test('mcp: create_pool forwards name/kind, includes ownerMemberId only when given, and maps the 2xx {text,pool} body through', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/create_pool': (req) => {
+      const parsed = JSON.parse(req.body ?? '{}') as { name: string };
+      return { status: 200, json: { text: `pool ${parsed.name} created`, pool: { id: `pl_${parsed.name}`, name: parsed.name, kind: 'personal' } } };
+    },
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
+    INIT,
+    call(3, 'create_pool', { name: 'alex-personal', kind: 'personal', ownerMemberId: 'mem_alex' }),
+    call(4, 'create_pool', { name: 'team-shared', kind: 'shared' }),
+  ]);
+  assert.deepEqual(resultJson(frames[1]!), { text: 'pool alex-personal created', pool: { id: 'pl_alex-personal', name: 'alex-personal', kind: 'personal' } });
+  assert.deepEqual(resultJson(frames[2]!), { text: 'pool team-shared created', pool: { id: 'pl_team-shared', name: 'team-shared', kind: 'personal' } });
+
+  const posts = calls.filter((c) => c.pathname === '/api/create_pool');
+  assert.equal(posts.length, 2);
+  assert.deepEqual(JSON.parse(posts[0]!.body!), { name: 'alex-personal', kind: 'personal', ownerMemberId: 'mem_alex' });
+  // Omitting ownerMemberId posts EXACTLY {name, kind} — no extra key, no null/undefined placeholder.
+  assert.deepEqual(JSON.parse(posts[1]!.body!), { name: 'team-shared', kind: 'shared' });
+});
+
+test('mcp: add_pool_member forwards poolId/principalKind/principalId unchanged and maps the 2xx {text,member} body through', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/add_pool_member': () => ({
+      status: 200,
+      json: { text: 'member added', member: { poolId: 'pl_1', principalKind: 'agent', principalId: 'agt_1' } },
+    }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'add_pool_member', { poolId: 'pl_1', principalKind: 'agent', principalId: 'agt_1' })]);
+  assert.deepEqual(resultJson(frames[1]!), { text: 'member added', member: { poolId: 'pl_1', principalKind: 'agent', principalId: 'agt_1' } });
+
+  const posts = calls.filter((c) => c.pathname === '/api/add_pool_member');
+  assert.equal(posts.length, 1);
+  assert.deepEqual(JSON.parse(posts[0]!.body!), { poolId: 'pl_1', principalKind: 'agent', principalId: 'agt_1' });
+});
+
+test('mcp: remove_pool_member — a tolerant hub 200 {removed:false} (never-a-member) is a NORMAL result, never turned into a tool error', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/remove_pool_member': () => ({
+      status: 200,
+      json: { text: 'not a member', poolId: 'pl_1', principalId: 'mem_never', removed: false },
+    }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'remove_pool_member', { poolId: 'pl_1', principalId: 'mem_never' })]);
+  // The hub's tolerant semantics (200, removed:false) must NOT be reinterpreted as an error here.
+  assert.equal(frames[1]!.result!.isError, undefined, 'a tolerant removed:false is a normal (non-error) result');
+  assert.deepEqual(resultJson(frames[1]!), { text: 'not a member', poolId: 'pl_1', principalId: 'mem_never', removed: false });
+
+  const posts = calls.filter((c) => c.pathname === '/api/remove_pool_member');
+  assert.equal(posts.length, 1);
+  assert.deepEqual(JSON.parse(posts[0]!.body!), { poolId: 'pl_1', principalId: 'mem_never' });
+});
+
+test('mcp: a hub 400 orphan-pool refusal on a pool tool maps to isError (non-2xx still becomes an error, unlike the tolerant remove case)', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/add_pool_member': () => ({
+      status: 400,
+      json: { error: 'orphan_pool_immutable', message: 'the orphan pool is derived from org admins and cannot be edited directly' },
+    }),
+  };
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'add_pool_member', { poolId: 'orphan:unrouted', principalKind: 'member', principalId: 'mem_x' })]);
+  assert.equal(frames[1]!.result!.isError, true);
+  assert.deepEqual(resultJson(frames[1]!), { error: 'orphan_pool_immutable', message: 'the orphan pool is derived from org admins and cannot be edited directly' });
 });
 
 // ---- non-interactive auth failure -------------------------------------------

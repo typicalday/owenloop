@@ -277,6 +277,12 @@ function passthrough(deps: McpDeps, build: (args: Record<string, unknown>) => Hu
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
  * to an H3 `/api/*` REST mirror. Descriptions say "Scoped Identity" for the identity
  * (wire names keep `agent`), never "tool" (model-doc §0/§10).
+ *
+ * This is not the server's whole tool list. `runMcpCommand` assembles the full
+ * set: these 17, plus `createAgentTool`, plus the four pool tools from
+ * `buildPoolTools` (below — deliberately NOT folded in here, since they do not
+ * mirror the hub's own MCP toolset), plus the conditionally-registered
+ * `stageEnrollmentTool`.
  */
 function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
   return [
@@ -600,6 +606,123 @@ function stageEnrollmentTool(deps: McpDeps): ToolRegistration {
   };
 }
 
+/**
+ * Pool management — the MCP counterpart to the `owenloop pool` CLI family
+ * (`src/cli.ts`'s `dispatchPool`, merged as PR #88). All FOUR tools below are
+ * plain `passthrough` registrations: the hub's pool response bodies carry no
+ * secret (unlike `create_agent`'s mint body), so there is no reason to
+ * hand-build a result, and the hub's `/api/*` routes plus the verbs underneath
+ * them are already the enforcement of record for every field — a client-side
+ * copy of that validation would just be a second place for the rules to drift.
+ *
+ * CREDENTIAL PLANE: unchanged, and worth restating because it is what makes
+ * pool mutation reachable at all from this server. `callHub` always
+ * authenticates as the `human` slot (`HUMAN`, above) — `owenloop mcp` never
+ * calls the hub as a Scoped Identity. On the hub, `createPool`, `addPoolMember`,
+ * and `removePoolMember` gate through `assertPoolMutationAllowed`
+ * (`packages/hub-core/src/verbs/manage-pools.ts`), which falls through to
+ * `assertAllowed(actor, 'manage_pools')` — a verb with NO entry in
+ * `AGENT_SCOPE_FOR_VERB` (`rbac.ts`), so an agent-kind actor is refused
+ * `ForbiddenError` there no matter what scopes it holds. Because this server
+ * always authenticates as a human, that refusal never applies to it. `listPools`
+ * is gated on the separate, agent-reachable `list` verb instead.
+ *
+ * `delete_pool` IS DELIBERATELY ABSENT, and stays absent — a decision by the
+ * repo's human owner, not a technical gap. Deleting a pool transfers its live
+ * `order_pools` stamps onto the org's orphan pool and deletes the pool's own
+ * membership rows outright; that is not an operation a model-driven host
+ * should be able to trigger. Do not add a `delete_pool` tool, an env-flag
+ * variant, or a confirmation-style variant — `owenloop pool rm` on the CLI
+ * remains the only way to delete a pool. Removing a single MEMBER (below) is a
+ * different, reversible operation and stays in scope.
+ */
+function buildPoolTools(deps: McpDeps): ToolRegistration[] {
+  return [
+    {
+      name: 'list_pools',
+      description:
+        "The org's pools, each with its membership rows inline (principalKind/principalId/addedBy/addedAt) — " +
+        'one call, no per-pool fan-out. An org with no pools at all is a normal empty result, not an error. ' +
+        "The org's reserved ORPHAN pool (kind: \"orphan\", or a name starting \"orphan:\") IS returned when it " +
+        'exists and is deliberately NOT filtered out — it is where the hub re-homes work whose pool was ' +
+        'deleted, so a caller has to be able to see where that work went. It is materialized LAZILY: a fresh ' +
+        "org has none. Its membership is derived (always the org's current admins) and cannot be edited — " +
+        'add_pool_member/remove_pool_member both refuse it.',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      handler: passthrough(deps, () => ({ method: 'GET', path: '/api/pools' })),
+    },
+    {
+      name: 'create_pool',
+      description:
+        "Create a pool on the hub org. `kind` is 'personal' or 'shared', forwarded verbatim — the hub is the " +
+        "enforcement of record for legal values ('orphan' is reserved for the hub's own pool and is refused). " +
+        "`ownerMemberId` is required for a 'personal' pool and is simply omitted from the request when not " +
+        'passed. NOT admin-only: an org admin may create any pool, AND a non-admin may create a personal pool ' +
+        'they own by passing kind:"personal" with ownerMemberId set to their own member id (the ' +
+        'self-service branch of the mutation gate). A non-admin asking for a shared pool, for a personal pool ' +
+        'owned by someone else, or for a personal pool with ownerMemberId OMITTED, is refused 403 — the hub ' +
+        'deliberately does not infer the caller as the owner.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          kind: { type: 'string' },
+          ownerMemberId: { type: 'string' },
+        },
+        required: ['name', 'kind'],
+        additionalProperties: false,
+      },
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/create_pool', body: a })),
+    },
+    {
+      name: 'add_pool_member',
+      description:
+        "Add one principal to a pool. `principalKind` is 'member' (a human) or 'agent' (a Scoped Identity), " +
+        'forwarded verbatim; the hub validates it. NOT admin-only: an org admin may act on any pool, AND the ' +
+        'OWNER of a personal pool may add members to that pool without being an admin. HTTP 400 (not a ' +
+        'permissions error, and NOT tolerant): an unknown poolId, an unknown principalId, or a principal that ' +
+        'is ALREADY a member — a duplicate add IS an error, unlike remove_pool_member below. REFUSED OUTRIGHT ' +
+        "against the org's orphan pool, for every caller including an admin, as a 400 (never a 403 — the " +
+        "refusal is identity-independent: it objects to the target pool, not the caller's role). The orphan " +
+        "pool's membership is the derived org admin roster and cannot be edited this way.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          poolId: { type: 'string' },
+          principalKind: { type: 'string' },
+          principalId: { type: 'string' },
+        },
+        required: ['poolId', 'principalKind', 'principalId'],
+        additionalProperties: false,
+      },
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/add_pool_member', body: a })),
+    },
+    {
+      name: 'remove_pool_member',
+      description:
+        'Remove one principal from a pool. TOLERANT: removing a principal that was never a member is a normal ' +
+        'success — HTTP 200 with removed:false, NOT a 404. Read the `removed` boolean rather than treating a ' +
+        'false as a failure. An unknown poolId is DIFFERENT and is an HTTP 400 error. NOT admin-only: same ' +
+        'self-service carve-out as add_pool_member — an org admin, or the owner of the personal pool being ' +
+        "acted on. REFUSED OUTRIGHT against the org's orphan pool, for every caller including an admin, as a " +
+        '400 — and that orphan refusal is NOT tolerant: it throws even when the principal was never a member, ' +
+        'because the objection is to the target pool and is decided before the hub looks at the membership ' +
+        'row. Removing a member is reversible. DELETING a pool is deliberately NOT available on this server at ' +
+        'all — use the `owenloop pool rm` CLI command for that.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          poolId: { type: 'string' },
+          principalId: { type: 'string' },
+        },
+        required: ['poolId', 'principalId'],
+        additionalProperties: false,
+      },
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/remove_pool_member', body: a })),
+    },
+  ];
+}
+
 // ---- enrollment capability gate (Decision 7) --------------------------------
 
 /** The probe deadline; `OWENLOOP_MCP_PROBE_TIMEOUT_MS` overrides the 3000ms default. */
@@ -652,7 +775,7 @@ export async function runMcpCommand(io: McpIo, opts: { hubFlag?: string }): Prom
   }
   const deps: McpDeps = { io, origin: resolved.origin };
 
-  const tools = [...buildBaselineTools(deps), createAgentTool(deps)];
+  const tools = [...buildBaselineTools(deps), createAgentTool(deps), ...buildPoolTools(deps)];
   if (await shouldRegisterEnrollment(deps)) tools.push(stageEnrollmentTool(deps));
 
   const server = createMcpServer({
