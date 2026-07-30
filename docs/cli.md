@@ -1027,7 +1027,9 @@ other command.
 ### Tools
 
 The server exposes 17 baseline tools mirroring the hub's own MCP toolset, plus
-`create_agent`. Each baseline tool's result is the hub REST response as one text
+`create_agent`, plus four [pool](#pools) tools (`list_pools`, `create_pool`,
+`add_pool_member`, `remove_pool_member`) that do not mirror the hub's own MCP
+toolset. Each baseline tool's result is the hub REST response as one text
 block; a non-2xx response comes back as an error result.
 
 | tool | what it does |
@@ -1050,6 +1052,10 @@ block; a non-2xx response comes back as an error result.
 | `list_conductors` | your principal's registered Conductors — online/offline derived at read time from last ping, pools served (returned as `labels`; empty means every pool this principal belongs to), and each one's reporting incarnation (`conductorId`/`startedAt`) when the hub recorded one |
 | `wake` | cheap "has anything changed since cursor X" pre-check for a polling loop |
 | `create_agent` | create a NEW Scoped Identity and store its credential locally — **never returns the token** |
+| `list_pools` | list the org's pools, each with its member rows inline — a plain passthrough, no filtering |
+| `create_pool` | create a pool (`name`, `kind`, optional `ownerMemberId`) |
+| `add_pool_member` | add a member or agent principal to a pool |
+| `remove_pool_member` | remove a principal from a pool (tolerant: removing a non-member is a normal result, not an error) |
 
 `create_agent {name, pools?, scopes?}` mints a fresh Scoped Identity on the hub
 with `work` scope by default; pass `scopes` (e.g. `["work","run"]`) to choose the
@@ -1060,6 +1066,42 @@ built from scratch. It refuses a name that is already taken (the hub's error
 message is surfaced verbatim; error bodies never carry tokens). If the store
 write fails, the result says so and tells you to revoke/re-key the agent from
 the console.
+
+**The four pool tools** (`list_pools`, `create_pool`, `add_pool_member`,
+`remove_pool_member`) cover the same four operations as the [`pool` CLI
+family](#pools) — `pool list`, `pool new`, `pool member add`, `pool member
+rm` — over the same `/api/*` routes and the same RBAC, but they are not an
+exact mirror of it: `pool rm` (pool deletion) has no MCP counterpart at all
+(see below), and where the CLI narrows each hub response into one
+whitelisted JSON document per invocation (`asPools`, `asPoolCreated`, etc.,
+so `| jq` always works), these MCP tools are plain passthroughs — the raw
+hub REST body maps straight to the tool result with no narrowing. Each
+argument schema deliberately has **no `enum`** on `kind`/`principalKind`,
+since the hub, not this client, is the enforcement of record for which
+values are legal.
+
+Access is **not uniformly admin-only**: `create_pool`, `add_pool_member`, and
+`remove_pool_member` all carry the same self-service carve-out as their CLI
+counterparts — a human acting on a **personal pool they own** needs no admin
+role at all (`assertPoolMutationAllowed`); every other target (a `shared`
+pool, or a `personal` pool owned by someone else) still requires the admin
+role. `list_pools` is readable by any of `admin`/`author`/`operator`.
+`remove_pool_member` is **tolerant**: removing a principal that was never a
+member is a normal `200` result with `removed: false`, never a tool error.
+`add_pool_member` is **not** tolerant the same way — adding a principal that
+is already a member is a hub error, mapped to an `isError` result. Both
+`add_pool_member` and `remove_pool_member` refuse the org's orphan pool
+(`orphan:unrouted`) as a `400`, never a `403` — the refusal is
+identity-independent (it objects to the target pool, not the caller's role),
+since that pool's membership is derived from the org's current admins and
+cannot be edited directly.
+
+**`delete_pool` is deliberately NOT a tool here.** Deleting a pool is a
+one-way-door operation gated admin-only unconditionally on the hub (unlike
+the other three verbs, which have the self-service carve-out above), and it
+was excluded from this MCP surface by design. `owenloop pool rm` on the CLI
+remains the only way to delete a pool; removing a single **member** (above)
+is a different, reversible operation and stays in scope for MCP.
 
 One further tool, `stage_enrollment`, is **conditionally** registered — it
 appears only when the hub advertises the staging endpoint (or when
