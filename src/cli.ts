@@ -100,8 +100,8 @@ import type { AddJournal, InstalledEntry, InstallCommitHandle, Lockfile } from '
 import {
   asAgentIdentities,
   asCreateWorkflowOk,
-  asLabelBindingDeleted,
-  asLabelBindingOk,
+  asLabelBindingAdded,
+  asLabelBindingRemoved,
   asLabelBindings,
   asPoolCreated,
   asPoolDeleted,
@@ -544,8 +544,8 @@ Commands:
   push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
   agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --conductor = --scopes work,run)
-  binding new <label> <pool> [--hub <url>]   bind (or retarget) a workflow label to a pool on the hub org (admin; human credential)
-  binding rm <label> [--hub <url>]         remove a label's pool binding
+  binding new <label> <pool> [--hub <url>]   add a pool to a workflow label on the hub org — a label may bind many pools (admin; human credential)
+  binding rm <label> <pool> [--hub <url>]  remove one (label, pool) binding
   binding list [--hub <url>]               list the hub org's label bindings
   pool list [--hub <url>]                  list the hub org's pools with their members (includes the orphan pool once one exists)
   pool new <name> --kind personal|shared [--owner <memberId>] [--hub <url>]   create a pool on the hub org (admin, or own personal pool; human credential)
@@ -2954,19 +2954,29 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
  *
  * | subcommand | endpoint | auth principal |
  * |---|---|---|
- * | `binding new <label> <pool>` | `POST /api/set_label_binding` | human (admin role on the hub) |
- * | `binding rm <label>` | `POST /api/delete_label_binding` | human (admin role on the hub) |
+ * | `binding new <label> <pool>` | `POST /api/add_label_binding` | human (admin role on the hub) |
+ * | `binding rm <label> <pool>` | `POST /api/remove_label_binding` | human (admin role on the hub) |
  * | `binding list` | `GET /api/label_bindings` | human |
  *
- * **`set_label_binding` is an upsert.** `binding new` on an already-bound label
- * RETARGETS it — there is no "already bound" rejection to handle, no client-side
- * pre-check, and no auto-`rm`. The 200 `binding` carries `previousPoolName`
- * (`null` on a fresh bind), so the CLI reports which of the two happened without
- * asking: stdout carries `previousPool`, and a retarget additionally echoes
- * `<label>: <old> → <new>` to **stderr** (stdout stays one parseable JSON
- * document). Resolution on the hub is live, so a retarget redirects in-flight
- * runs at their next poll and a delete pauses the steps using that label —
- * documented in `docs/cli.md`, deliberately NOT re-warned about on stderr here.
+ * **Binding is ADDITIVE, and idempotent per `(label, pool)` PAIR.** A label may
+ * bind MANY pools. `binding new` on an already-bound label ADDS a pool; it never
+ * displaces one already bound. Re-adding the same pair is a normal 200 no-op, so
+ * there is no "already bound" rejection to handle and no client-side pre-check —
+ * the response says which happened via `alreadyBound`, and `boundPoolCount`
+ * reports how many LIVE pools the label binds afterwards.
+ *
+ * **`binding rm` removes ONE pair**, which is why `<pool>` is required. Removing
+ * the LAST LIVE binding PARKS the label: its in-flight steps are offered to no
+ * conductor until it is bound again. The response's `remainingPoolIds` is the
+ * signal (`[]` = parked), and that case gets a **stderr** warning; so does the
+ * tolerant `removed: false` case. stdout stays one parseable JSON document.
+ *
+ * **Retargeting is now two separate operator acts** — add the new pool, then
+ * remove the old one, each separately audited on the hub, with BOTH pools serving
+ * in between. The CLI deliberately does NOT synthesize a retarget by chaining the
+ * two calls, and there is no back-compat fallback to the old routes. Resolution
+ * on the hub is live, so both acts take effect on in-flight runs at their next
+ * poll — documented in `docs/cli.md`.
  *
  * What is deliberately NOT copied from `dispatchAgent`: its
  * `OWENLOOP_CREDENTIAL_COMMAND` refusal. That guard exists because `agent new`
@@ -2986,7 +2996,7 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
  */
 async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
   const USAGE_FORMS =
-    'usage: owenloop binding new <label> <pool> [--hub <url>] | owenloop binding rm <label> [--hub <url>] | owenloop binding list [--hub <url>]';
+    'usage: owenloop binding new <label> <pool> [--hub <url>] | owenloop binding rm <label> <pool> [--hub <url>] | owenloop binding list [--hub <url>]';
 
   // --- validation: everything below runs BEFORE any I/O, so a usage error on a
   //     multi-hub machine reports the usage problem (exit 1), not exit 2.
@@ -2997,18 +3007,19 @@ async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
   let label = '';
   let pool = '';
   if (sub === 'new' || sub === 'rm') {
-    const raw = args.positionals[2];
-    if (raw === undefined || raw === '') {
+    // `<pool>` is required for BOTH now: one call adds or removes ONE
+    // `(label, pool)` pair, and a label-only `rm` would unbind more than the
+    // operator named.
+    const rawLabel = args.positionals[2];
+    if (rawLabel === undefined || rawLabel === '') {
       throw new CliError(`missing required argument: <label> (${USAGE_FORMS})`);
     }
-    label = raw;
-  }
-  if (sub === 'new') {
-    const raw = args.positionals[3];
-    if (raw === undefined || raw === '') {
+    label = rawLabel;
+    const rawPool = args.positionals[3];
+    if (rawPool === undefined || rawPool === '') {
       throw new CliError(`missing required argument: <pool> (${USAGE_FORMS})`);
     }
-    pool = raw;
+    pool = rawPool;
   }
 
   const origin = resolveAgentHub(io, args, 'manage label bindings on');
@@ -3045,17 +3056,11 @@ async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
       return 0;
     }
 
-    // `new` and `rm` share one POST ladder; only the path, the request body, the
-    // guard, and the printed shape differ.
-    const endpoint = sub === 'new' ? 'set_label_binding' : 'delete_label_binding';
-    const { res } = await authedPost(
-      io,
-      origin,
-      slot,
-      cred,
-      `/api/${endpoint}`,
-      sub === 'new' ? { label, pool } : { label },
-    );
+    // `new` and `rm` share one POST ladder AND one request body — `{label, pool}`,
+    // because each call adds or removes exactly one `(label, pool)` pair. Only the
+    // path, the guard, and the printed shape differ.
+    const endpoint = sub === 'new' ? 'add_label_binding' : 'remove_label_binding';
+    const { res } = await authedPost(io, origin, slot, cred, `/api/${endpoint}`, { label, pool });
 
     if (res.status === 401) {
       // A 401 that survived `authedPost`'s one refresh-and-retry. The human slot
@@ -3090,40 +3095,62 @@ async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
     }
 
     if (sub === 'new') {
-      let bound;
+      let added;
       try {
-        bound = asLabelBindingOk(body);
+        added = asLabelBindingAdded(body);
       } catch (e) {
         throw new CliError((e as Error).message);
       }
       // The server-echoed label/pool, not argv: if the hub normalized either,
       // stdout tells the truth about what the hub stored (same precedent as
-      // `agent new` printing the server-resolved pools). `previousPool` is
-      // ALWAYS present — `null` on a fresh bind — so a fixed consumer never has
-      // to branch on the key's existence.
+      // `agent new` printing the server-resolved pools). `alreadyBound` and
+      // `boundPoolCount` carry the HUB's own field names verbatim, so an operator
+      // correlating stdout against the hub's audit log never has to translate.
+      // `createdBy`/`createdAt` are validated but not printed — `binding list` is
+      // where a row's provenance belongs.
       print(io, {
         ok: true,
         hub: origin,
-        label: bound.label,
-        pool: bound.poolName,
-        previousPool: bound.previousPoolName,
+        label: added.binding.label,
+        pool: added.binding.poolName,
+        alreadyBound: added.alreadyBound,
+        boundPoolCount: added.boundPoolCount,
       });
-      // The retarget signal, on stderr only so `| jq` on stdout is unaffected.
-      // A fresh bind emits nothing here.
-      if (bound.previousPoolName !== null) {
-        io.err(`${bound.label}: ${bound.previousPoolName} → ${bound.poolName}`);
-      }
+      // No stderr line on `new`: an add never displaces a pool and never parks a
+      // label, so there is no consequence to warn about.
       return 0;
     }
 
-    // `rm`: the guard proves the 2xx really was a delete; `deleted` is validated
-    // but deliberately not printed (frozen output contract).
+    // `rm`: the guard proves the 2xx really was the remove verb's answer.
+    // `removedWire` (not `removed`) so `removedWire.removed` reads unambiguously —
+    // the same naming `dispatchPool` uses for `deletedWire`/`removedWire`.
+    let removedWire;
     try {
-      asLabelBindingDeleted(body);
+      removedWire = asLabelBindingRemoved(body);
     } catch (e) {
       throw new CliError((e as Error).message);
     }
-    print(io, { ok: true, hub: origin, label });
+    // `poolId` (not a pool name): `remove_label_binding` returns no `poolName`, so
+    // printing one would be an invention. It is `null` on the tolerant path where
+    // the argument matched no live pool name and no row of this label's own.
+    print(io, {
+      ok: true,
+      hub: origin,
+      label: removedWire.label,
+      poolId: removedWire.poolId,
+      removed: removedWire.removed,
+      remainingPoolIds: removedWire.remainingPoolIds,
+    });
+    // stderr only, so `| jq` on stdout is unaffected — mirroring `pool rm` /
+    // `pool member rm`, which narrate their tolerant-false case and their
+    // notable side effect the same way.
+    if (!removedWire.removed) {
+      io.err(`${removedWire.label} was not bound to '${pool}' — nothing was removed`);
+    } else if (removedWire.remainingPoolIds.length === 0) {
+      io.err(
+        `${removedWire.label}: no live bindings remain — runs waiting on this label are parked until it is bound again`,
+      );
+    }
     return 0;
   } catch (e) {
     // A refresh-failure-family error (the human oauth is irrecoverable, or a 401

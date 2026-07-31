@@ -50,8 +50,8 @@ for the full breakdown.
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--conductor` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
-| `binding new <label> <pool> [--hub <url>]` | bind (or retarget) a workflow label to a pool on the hub org (admin; human credential) — see [Label bindings](#label-bindings) |
-| `binding rm <label> [--hub <url>]` | remove a label's pool binding — see [Label bindings](#label-bindings) |
+| `binding new <label> <pool> [--hub <url>]` | add a pool to a workflow label on the hub org — a label may bind many pools (admin; human credential) — see [Label bindings](#label-bindings) |
+| `binding rm <label> <pool> [--hub <url>]` | remove one `(label, pool)` binding — see [Label bindings](#label-bindings) |
 | `binding list [--hub <url>]` | list the hub org's label bindings — see [Label bindings](#label-bindings) |
 | `pool list [--hub <url>]` | list the hub org's pools with their members (includes the orphan pool once one exists) — see [Pools](#pools) |
 | `pool new <name> --kind personal\|shared [--owner <memberId>] [--hub <url>]` | create a pool on the hub org (admin, or own personal pool; human credential) — see [Pools](#pools) |
@@ -611,10 +611,17 @@ check, and the `--scopes`/`--conductor` mutual-exclusivity check all run
 
 A **label binding** maps a workflow-def **label** (a logical capability tag a
 def author writes, like `gpu` or `repo-access`) to a **pool** on one hub org.
-Def authors write labels; an org admin binds each label to a pool. That
-indirection is what keeps deployment facts out of portable defs — see
+Def authors write labels; an org admin binds each label to at least one pool.
+That indirection is what keeps deployment facts out of portable defs — see
 [`labels:`](authoring.md#labels--logical-capability-tags) in the authoring guide
 for the step-side declaration.
+
+**A binding is one `(label, pool)` PAIR, and a label may bind MANY pools.** The
+pair is the unit that is created and destroyed: `binding new` adds one, `binding
+rm` removes one, and `binding list` returns one row per pair — so a label bound
+to three pools appears as three rows. A **dangling binding** is one whose pool
+row was deleted; it survives in the table, routes nothing, and never widens
+access. A label with **zero live bindings** is **parked**: its steps wait.
 
 **Resolution is live.** `start_run` only *checks* that every label a run's steps
 use is currently bound — it stamps no pool for a labeled step. Every later
@@ -623,15 +630,22 @@ allowed) re-reads the binding table as it stands at that moment.
 
 **These edits take effect on work already in flight.**
 
-- **Retargeting.** Running `binding new` on a label that is **already bound**
-  retargets it — this is a normal success, not an error. The remaining steps of
-  every in-flight run using that label are redirected to the new pool at their
-  next poll; no restart and no re-route command. stdout reports the prior pool
-  as `previousPool`, and stderr echoes `gpu: gpu-fleet → cheap-fleet`.
-- **Deleting.** Running `binding rm` on a label that in-flight runs use
-  **pauses** those steps — no conductor is offered them and no claim is
-  accepted — until the label is bound again. Nothing is lost; the work resumes
-  on re-bind.
+- **Adding.** Running `binding new` on a label that is **already bound** ADDS the
+  named pool — it never displaces a pool already bound. Adding widens who can
+  serve the label, live at the next poll of every in-flight run using it. Re-adding
+  a pair that is already there is a normal success, not an error (`alreadyBound:
+  true`).
+- **Removing.** Running `binding rm` removes exactly ONE pair. If the label still
+  has other live bindings, it simply routes to a narrower set and nothing pauses.
+  If the removal takes away the **last live** binding, the label is **parked**:
+  the in-flight steps that use it are offered to no conductor and accept no
+  claim — until it is bound again. Nothing is lost; the work resumes on re-bind.
+  `remainingPoolIds: []` on stdout is that signal, and stderr says so in words.
+- **Retargeting is two acts, not one.** There is no retarget command: add the new
+  pool, then remove the old one. Each is separately audited on the hub, and in
+  between **BOTH** pools serve the label. The CLI deliberately does not chain the
+  two for you — the intermediate state is a real state an operator may want to sit
+  in, and collapsing it would hide a widened access window.
 
 A label binding is **not** the project↔hub binding `owenloop connect` writes to
 `.owenloop/hub.json` — that one records which hub *this project directory*
@@ -639,29 +653,50 @@ publishes to; a label binding is an org-scoped label→pool row on the hub.
 
 ### `binding new <label> <pool>`
 
-`POST /api/set_label_binding`, authenticated as your **human** credential;
-requires the **admin** role on the hub. Binds `<label>` to the pool named
-`<pool>`, or retargets the label if it is already bound. `<pool>` is a pool
-**name** — the hub resolves it to a pool id; the CLI does no pool lookup and
-performs no client-side validation of either argument (the hub is the
-enforcement of record).
+`POST /api/add_label_binding`, authenticated as your **human** credential;
+requires the **admin** role on the hub. ADDS the pool named `<pool>` to
+`<label>`'s bindings. `<pool>` is a pool **name** — the hub resolves it to a pool
+id; the CLI does no pool lookup and performs no client-side validation of either
+argument (the hub is the enforcement of record).
 
-### `binding rm <label>`
+**Adding is idempotent per pair.** Re-adding a `(label, pool)` pair that is
+already bound is a normal success — the hub answers `200` with `alreadyBound:
+true` and changes nothing (the original row keeps its creator and timestamp).
+`boundPoolCount` reports how many **live** pools the label binds after the write.
 
-`POST /api/delete_label_binding`, authenticated as your **human** credential;
-requires the **admin** role on the hub. Removes `<label>`'s binding.
+### `binding rm <label> <pool>`
 
-**`rm` is idempotent.** Removing a label that is **not** bound is a normal
-success — the hub answers `200` with `deleted: false` rather than a `404`, and
-the CLI prints the same `{ ok, hub, label }` document it prints for a real
-delete. A script can call `binding rm` unconditionally without branching on
-whether the label was bound.
+`POST /api/remove_label_binding`, authenticated as your **human** credential;
+requires the **admin** role on the hub. Removes the ONE `(label, pool)` binding
+you name. `<pool>` is **required**: a label may bind many pools, so a label-only
+removal would unbind more than you asked for.
+
+`<pool>` accepts the pool's **name**, or its raw **`pool_id`**. The raw-id form
+is the only way to remove a **dangling** binding — one whose pool row was
+deleted, so there is no name left to resolve. `binding list` shows such a row
+with `poolName: null`; take its `poolId` from there.
+
+**`rm` is idempotent.** Removing a pair that is **not** bound is a normal
+success — the hub answers `200` with `removed: false` rather than a `404` — and
+the CLI prints a full document plus a stderr line saying nothing was removed. A
+script can call `binding rm` unconditionally without branching on whether the
+pair was bound. On that tolerant path `poolId` is `null`, because the argument
+matched neither a live pool name nor one of the label's own rows.
+
+**Removing the last live binding parks the label**, and stderr says so. See
+"These edits take effect on work already in flight" above.
 
 ### `binding list`
 
 `GET /api/label_bindings`, authenticated as your **human** credential. Lists the
-org's bindings. An org with no bindings yet is a normal success (exit 0) with an
-empty `bindings` array.
+org's bindings, ONE row per `(label, pool)` pair ordered by label then pool id —
+so a label bound to several pools appears as several rows. An org with no
+bindings yet is a normal success (exit 0) with an empty `bindings` array.
+
+A row whose `poolName` is `null` is a **dangling binding**: the pool it names was
+deleted. Such a row routes nothing and never widens access, and it is shown
+rather than hidden precisely so you can clean it up — remove it with `binding rm
+<label> <poolId>`.
 
 **Flags.** `--hub <url>` only (plus the global `--db`/`--defs`).
 
@@ -684,25 +719,41 @@ cannot enumerate the store and you must pass `--hub`.
 
 **Printed JSON.** stdout is exactly one whitelisted JSON document per
 invocation, built from named fields — never a raw hub body — so `| jq` always
-works. Human progress lines (the retarget echo) go to stderr only.
+works. Human progress lines (the two `binding rm` warnings) go to stderr only.
 
 | subcommand | stdout |
 |---|---|
-| `binding new` | `{ "ok": true, "hub": "<origin>", "label": "gpu", "pool": "ml-pool", "previousPool": null }` |
-| `binding rm` | `{ "ok": true, "hub": "<origin>", "label": "gpu" }` |
+| `binding new` | `{ "ok": true, "hub": "<origin>", "label": "gpu", "pool": "ml-pool", "alreadyBound": false, "boundPoolCount": 2 }` |
+| `binding rm` | `{ "ok": true, "hub": "<origin>", "label": "gpu", "poolId": "pl_1", "removed": true, "remainingPoolIds": ["pl_2"] }` |
 | `binding list` | `{ "ok": true, "hub": "<origin>", "bindings": [ { "label": "gpu", "poolId": "pl_1", "poolName": "ml-pool", "createdBy": "u_1", "createdAt": 1738000000000 } ] }` |
 
-`previousPool` is **always present** on `binding new` — `null` on a fresh bind,
-the prior pool's name on a retarget — so a consumer never has to branch on
-whether the key exists. `label` and `pool` are the values the **hub** echoed
-back, not your argv: if the hub normalized either, stdout tells the truth about
-what was stored.
+Every added field carries the **hub's own name**, verbatim — the same words its
+audit log and the web console use — so correlating stdout against them never
+needs a translation step.
+
+- `alreadyBound` (`binding new`) — was this exact `(label, pool)` pair already
+  bound before the call? `false` means the pair was created by it.
+- `boundPoolCount` (`binding new`) — how many **live** pools the label binds
+  after the write. A dangling binding routes nothing and is not counted.
+- `removed` (`binding rm`) — did this call actually remove a pair? `false` is the
+  tolerant "it was never bound" case, not an error.
+- `remainingPoolIds` (`binding rm`) — the **live** pools the label still binds.
+  `[]` means the label is now **parked**: `jq '.remainingPoolIds | length == 0'`.
+  It can be `[]` while a dangling row survives, because such a row routes nothing.
+- `poolId` (`binding rm`) — the pool the hub resolved your `<pool>` argument to.
+  It is `null` on the tolerant `removed: false` path, where the argument matched
+  neither a live pool name nor one of the label's own binding rows. `binding rm`
+  never prints a pool *name*: `remove_label_binding` does not return one, and
+  inventing one from argv would not be the hub's answer.
+- `label` and `pool` (`binding new`) are the values the **hub** echoed back, not
+  your argv: if the hub normalized either, stdout tells the truth about what was
+  stored.
 
 **Exit codes.**
 
 | code | meaning |
 |---|---|
-| `0` | the binding was set, removed (or was already absent), or listed |
+| `0` | the pool was added to the label (or was already bound), the binding was removed (or was already absent), or the bindings were listed |
 | `1` | runtime or hub error — an unknown pool name, a label that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
@@ -768,10 +819,11 @@ success — the hub answers `200` with `deleted: false` rather than a `404` —
 and the CLI prints this honestly (see below), plus a stderr line naming the
 pool id, rather than inventing an error.
 
-**Unlike [`binding rm`](#binding-rm-label), `pool rm` prints its tolerant
-`deleted` boolean on stdout.** `binding rm` hides `deleted` under a frozen
-output contract from before this family existed; `pool` carries no such
-history, so the more honest shape was chosen instead.
+**Like [`binding rm`](#binding-rm-label-pool), `pool rm` prints its tolerant
+boolean on stdout** — `deleted` here, `removed` there. Both families report
+honestly whether the call actually changed anything, and both narrate the
+no-op case on stderr, so a script can branch on the boolean and a human reading
+the terminal is told in words.
 
 **The transfer fields are present on stdout if and only if the wire sent
 them** — `membersRemoved`, `orphanPoolId`, `orphanPoolName`,

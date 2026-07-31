@@ -185,8 +185,9 @@ a fleet with genuinely different machines in it. Labels and bindings are the
 
 ### On a hub: an admin binds each label to a pool
 
-On a hub, every label a step uses must be **bound to a pool by an org admin** —
-`owenloop binding new <label> <pool>`, or Console → Settings → Labels. See
+On a hub, every label a step uses must be **bound to at least one pool by an org
+admin** — `owenloop binding new <label> <pool>`, or Console → Settings → Labels.
+A label may bind several pools, and each `binding new` ADDS one. See
 [label bindings](cli.md#label-bindings) for the commands.
 
 - **An unbound label fails the run at `start_run`**, with an error naming the
@@ -194,12 +195,13 @@ On a hub, every label a step uses must be **bound to a pool by an org admin** �
   old behavior was an order that sat unserved forever. Binding is **explicit
   only** — there is no implicit fallback in which an unbound label routes
   somewhere by itself.
-- **Bindings are live, and that is the headline.** Retargeting a label (binding
-  it again, to a different pool) redirects the remaining steps of in-flight runs
-  at their next poll; deleting a binding pauses the steps that use it until it
-  is re-bound. As an author this means your def does **not** need re-publishing
-  when the fleet moves — the operator retargets the binding and your running
-  work follows.
+- **Bindings are live, and that is the headline.** Adding a pool to a label
+  widens who serves it at the next poll of every in-flight run; removing the
+  label's **last live** binding pauses the steps that use it until it is bound
+  again. As an author this means your def does **not** need re-publishing when
+  the fleet moves: the operator ADDS the new pool — from that moment both pools
+  serve the label — and then REMOVES the old one, and your running work follows
+  across without a restart.
 
 ### Locally: labels are a tick filter
 

@@ -1116,39 +1116,62 @@ export function asAgentIdentities(body: unknown): AgentIdentitySummary[] {
  * is this project directory's binding to a hub (`owenloop connect`); every
  * symbol in this family is `LabelBinding`-prefixed to keep the two apart.
  *
+ * One row is ONE `(label, pool)` PAIR, and a label may bind MANY pools — so a
+ * single label appears as MANY rows and nothing may key a collection on `label`.
+ *
+ * `poolName` is `string | null`. A `null` name IS the **dangling binding** case:
+ * the bound pool row was deleted, so the hub has no name left to resolve
+ * (`manage-label-bindings.ts`'s `toWire`). A dangling binding routes nothing and
+ * never widens access, and it is deliberately SURFACED rather than filtered out —
+ * seeing the row is exactly what tells an operator there is something to clean up.
+ *
  * Non-secret: the row names a label, a pool, and who created it — never a token.
  */
 export interface LabelBindingWire {
   label: string;
   poolId: string;
-  poolName: string;
+  poolName: string | null;
   createdBy: string;
   createdAt: number;
 }
 
 /**
- * `POST /api/set_label_binding`'s `binding`, which additionally reports the pool
- * the label was bound to BEFORE this call — `null` on a fresh bind. That field
- * is what makes the upsert self-describing: the CLI never has to ask "did this
- * create or retarget?", the hub says so.
+ * `POST /api/add_label_binding`'s 200 body, narrowed.
+ *
+ * NESTED exactly as the wire nests it: the row lives under `binding`, while
+ * `alreadyBound` and `boundPoolCount` live at the BODY's top level. A flat
+ * interface would blur where each field actually sits.
+ *
+ * - `alreadyBound` — was this exact `(label, pool)` pair already present? The add
+ *   is ADDITIVE and idempotent per pair, so a repeat is a 200 no-op, not an
+ *   error, and `binding.createdBy`/`createdAt` then echo the ORIGINAL row.
+ * - `boundPoolCount` — how many **LIVE** pools the label binds AFTER the write. A
+ *   binding whose pool row was deleted routes nothing and is not counted.
  */
-export interface LabelBindingSetWire extends LabelBindingWire {
-  previousPoolName: string | null;
+export interface LabelBindingAddedWire {
+  binding: LabelBindingWire;
+  alreadyBound: boolean;
+  boundPoolCount: number;
 }
 
 /**
  * Validate the five common `LabelBindingWire` fields on one row. `prefix` is the
  * endpoint-qualified lead-in the caller wants (e.g.
- * `set_label_binding: malformed success response`) and `where` names the
+ * `add_label_binding: malformed success response`) and `where` names the
  * offending position (`binding`, or `bindings[2]`) — a FIELD/INDEX name only,
  * never a value.
+ *
+ * `poolName` is validated LENIENTLY here, unlike the other four fields: absent or
+ * `null` both yield `null`, because `null` is the hub's own answer for a dangling
+ * binding. A caller that additionally KNOWS its pool is live (`asLabelBindingAdded`
+ * resolves by name) layers its own non-null check on top of this shared call.
  */
 function asLabelBindingRow(entry: unknown, prefix: string, where: string): LabelBindingWire {
   if (typeof entry !== 'object' || entry === null) {
     throw new Error(`${prefix} — ${where} is not an object`);
   }
   const e = entry as Record<string, unknown>;
-  for (const field of ['label', 'poolId', 'poolName', 'createdBy'] as const) {
+  for (const field of ['label', 'poolId', 'createdBy'] as const) {
     if (typeof e[field] !== 'string' || e[field] === '') {
       throw new Error(`${prefix} — ${where} missing non-empty string ${field}`);
     }
@@ -1156,80 +1179,133 @@ function asLabelBindingRow(entry: unknown, prefix: string, where: string): Label
   if (typeof e.createdAt !== 'number') {
     throw new Error(`${prefix} — ${where} missing number createdAt`);
   }
+  // Lenient exactly like `asPoolRow`'s `ownerMemberId`: absent or null both mean
+  // "no name to report" — here, a DANGLING binding whose pool row is gone.
+  let poolName: string | null = null;
+  if (e.poolName !== undefined && e.poolName !== null) {
+    if (typeof e.poolName !== 'string' || e.poolName === '') {
+      throw new Error(`${prefix} — ${where} poolName must be a non-empty string or null`);
+    }
+    poolName = e.poolName;
+  }
   return {
     label: e.label as string,
     poolId: e.poolId as string,
-    poolName: e.poolName as string,
+    poolName,
     createdBy: e.createdBy as string,
     createdAt: e.createdAt,
   };
 }
 
 /**
- * Narrow `POST /api/set_label_binding`'s 200 body (`{ text, binding }`) to the
- * typed binding. Throws on anything malformed, naming the offending FIELD only —
- * same discipline as `asAgentIdentities`, so no body value is echoed.
+ * Narrow `POST /api/add_label_binding`'s 200 body
+ * (`{ text, binding, alreadyBound, boundPoolCount }`). Throws on anything
+ * malformed, naming the offending FIELD only — same discipline as
+ * `asAgentIdentities`, so no body value is echoed.
  *
- * `previousPoolName` is deliberately LENIENT: **absent or `null` both mean "fresh
- * bind, no prior pool"**. A JSON serializer that drops `undefined` would
- * otherwise turn a genuinely successful bind into a hard failure — a strictly
- * worse outcome than under-reporting a field that is null anyway. A present,
- * non-null value must be a non-empty string; anything else (a number, an empty
- * string) throws.
+ * `binding.poolName` is required to be a NON-NULL non-empty string here, on top
+ * of `asLabelBindingRow`'s lenient check. That is not a contradiction: an add
+ * resolves its pool BY NAME, so the pool is live by construction and a `null`
+ * name in THIS response is genuinely malformed — whereas a `null` name in a
+ * `label_bindings` row is the legitimate dangling-binding case. Layering a
+ * call-site-specific check on top of the shared row call is the established
+ * shape in this family, not a new pattern.
  */
-export function asLabelBindingOk(body: unknown): LabelBindingSetWire {
+export function asLabelBindingAdded(body: unknown): LabelBindingAddedWire {
+  const prefix = 'add_label_binding: malformed success response';
   if (typeof body !== 'object' || body === null) {
-    throw new Error('set_label_binding: malformed success response — not an object');
+    throw new Error(`${prefix} — not an object`);
   }
   const b = body as Record<string, unknown>;
   if (b.binding === undefined) {
-    throw new Error('set_label_binding: malformed success response — missing binding');
+    throw new Error(`${prefix} — missing binding`);
   }
-  const row = asLabelBindingRow(b.binding, 'set_label_binding: malformed success response', 'binding');
-  const prev = (b.binding as Record<string, unknown>).previousPoolName;
-  let previousPoolName: string | null = null;
-  if (prev !== undefined && prev !== null) {
-    if (typeof prev !== 'string' || prev === '') {
-      throw new Error('set_label_binding: malformed success response — binding previousPoolName must be a non-empty string or null');
-    }
-    previousPoolName = prev;
+  const binding = asLabelBindingRow(b.binding, prefix, 'binding');
+  if (binding.poolName === null) {
+    throw new Error(`${prefix} — binding missing non-empty string poolName`);
   }
-  return { ...row, previousPoolName };
+  if (typeof b.alreadyBound !== 'boolean') {
+    throw new Error(`${prefix} — missing boolean alreadyBound`);
+  }
+  if (typeof b.boundPoolCount !== 'number') {
+    throw new Error(`${prefix} — missing number boundPoolCount`);
+  }
+  return { binding, alreadyBound: b.alreadyBound, boundPoolCount: b.boundPoolCount };
 }
 
 /**
- * Narrow `POST /api/delete_label_binding`'s 200 body (`{ text, deleted: boolean }`).
- * `deleted` must be a BOOLEAN — this guard is how the CLI proves the 2xx really
- * was a delete verb's answer. BOTH boolean values are valid, deliberate hub
+ * Narrow `POST /api/remove_label_binding`'s 200 body
+ * (`{ text, label, poolId, removed, remainingPoolIds }`).
+ *
+ * `removed` must be a BOOLEAN — this guard is how the CLI proves the 2xx really
+ * was the remove verb's answer. BOTH boolean values are valid, deliberate hub
  * responses:
- *   - `true`  — the label was bound and is now removed;
- *   - `false` — the label was not bound, so there was nothing to do. The hub
+ *   - `true`  — the `(label, pool)` pair was bound and is now removed;
+ *   - `false` — the pair was never bound, so there was nothing to do. The hub
  *     answers this with a 200, never a 404 (the `removePoolMember` `{existed}`
  *     house pattern), and that tolerance is what makes `binding rm` idempotent.
- * A body with no `deleted` key at all, or a non-boolean one, is genuinely
- * malformed and throws.
  *
- * The field is validated but deliberately NOT printed: the command's stdout
- * shape is `{ ok, hub, label }` (frozen contract §2.4), byte-identical for both
- * boolean cases — that identity IS the idempotency guarantee at this surface,
- * so a scripted consumer never has to branch on whether the label was bound.
+ * `poolId` is LENIENT (absent or `null` both yield `null`) because `null` is a
+ * real hub output, not a defect: `manage-label-bindings.ts` resolves it as
+ * `namedPool?.id ?? thisLabelsRows.find(...)?.poolId ?? null`, so it is `null`
+ * on exactly the tolerant `removed: false` path where the argument matched
+ * neither a live pool name nor one of this label's own binding rows. Requiring a
+ * non-empty string here would throw on a normal success.
+ *
+ * `remainingPoolIds` is deliberately NOT lenient — it must be PRESENT and an
+ * array of non-empty strings. The asymmetry is the point: for a nullable name,
+ * the lenient default (`null`) is the SAFE reading, but defaulting an absent
+ * `remainingPoolIds` to `[]` would assert "this label is now PARKED" — the
+ * alarming reading, and exactly the signal an operator acts on — off a malformed
+ * body. It lists LIVE pools only, so `[]` genuinely means zero live bindings
+ * remain (which can happen while a dangling row survives, since such a row routes
+ * nothing).
+ *
+ * The stdout shape built from this is documented in `docs/cli.md`'s
+ * "Printed JSON" table under Label bindings.
  */
-export function asLabelBindingDeleted(body: unknown): { deleted: boolean } {
+export function asLabelBindingRemoved(
+  body: unknown,
+): { label: string; poolId: string | null; removed: boolean; remainingPoolIds: string[] } {
+  const prefix = 'remove_label_binding: malformed success response';
   if (typeof body !== 'object' || body === null) {
-    throw new Error('delete_label_binding: malformed success response — not an object');
+    throw new Error(`${prefix} — not an object`);
   }
-  const deleted = (body as Record<string, unknown>).deleted;
-  if (typeof deleted !== 'boolean') {
-    throw new Error('delete_label_binding: malformed success response — missing boolean deleted');
+  const b = body as Record<string, unknown>;
+  if (typeof b.removed !== 'boolean') {
+    throw new Error(`${prefix} — missing boolean removed`);
   }
-  return { deleted };
+  if (typeof b.label !== 'string' || b.label === '') {
+    throw new Error(`${prefix} — missing non-empty string label`);
+  }
+  let poolId: string | null = null;
+  if (b.poolId !== undefined && b.poolId !== null) {
+    if (typeof b.poolId !== 'string' || b.poolId === '') {
+      throw new Error(`${prefix} — poolId must be a non-empty string or null`);
+    }
+    poolId = b.poolId;
+  }
+  if (!Array.isArray(b.remainingPoolIds)) {
+    throw new Error(`${prefix} — missing array remainingPoolIds`);
+  }
+  const remainingPoolIds = (b.remainingPoolIds as unknown[]).map((entry, i) => {
+    if (typeof entry !== 'string' || entry === '') {
+      throw new Error(`${prefix} — remainingPoolIds[${i}] is not a non-empty string`);
+    }
+    return entry;
+  });
+  return { label: b.label, poolId, removed: b.removed, remainingPoolIds };
 }
 
 /**
  * Narrow `GET /api/label_bindings`'s 200 body (`{ text, bindings: [...] }`) to a
  * typed array. An EMPTY array is valid — that is the "this org has no bindings
- * yet" case, not an error. Rows are plain `LabelBindingWire`; `previousPoolName`
- * is a set-response field only and is not required here.
+ * yet" case, not an error.
+ *
+ * Rows are plain `LabelBindingWire`, ONE per `(label, pool)` pair ordered by
+ * `label, pool_id`, so a label bound to many pools yields MANY rows — the array
+ * is forwarded as-is and must never be collapsed into a per-label map. A row
+ * whose `poolName` is `null` is a dangling binding and is kept, not dropped.
  */
 export function asLabelBindings(body: unknown): LabelBindingWire[] {
   if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).bindings)) {
@@ -1293,7 +1369,7 @@ export interface PoolDeletedWire {
   runningRunsTransferred?: string[];
 }
 
-/** `POST /api/remove_pool_member`'s 200 body — tolerant of a non-member, exactly like `asLabelBindingDeleted`'s `deleted`. */
+/** `POST /api/remove_pool_member`'s 200 body — tolerant of a non-member, exactly like `asLabelBindingRemoved`'s `removed`. */
 export interface PoolMemberRemovedWire {
   poolId: string;
   principalId: string;
@@ -1328,9 +1404,9 @@ function asPoolRow(entry: unknown, prefix: string, where: string): PoolWire {
   if (typeof e.createdAt !== 'number') {
     throw new Error(`${prefix} — ${where} missing number createdAt`);
   }
-  // Lenient exactly like `previousPoolName`: absent or null both mean "no
-  // owner" — a serializer that drops `undefined` must not turn a valid shared
-  // pool into a hard failure.
+  // Lenient exactly like `asLabelBindingRow`'s `poolName`: absent or null both
+  // mean "no owner" — a serializer that drops `undefined` must not turn a valid
+  // shared pool into a hard failure.
   let ownerMemberId: string | null = null;
   if (e.ownerMemberId !== undefined && e.ownerMemberId !== null) {
     if (typeof e.ownerMemberId !== 'string' || e.ownerMemberId === '') {
@@ -1420,7 +1496,7 @@ export function asPoolCreated(body: unknown): PoolWire {
 /**
  * Narrow `POST /api/delete_pool`'s 200 body. `poolId` and `deleted` are always
  * present (`deleted` is a genuine boolean — both values are valid, deliberate
- * hub answers, exactly like `asLabelBindingDeleted`). Each of the six transfer
+ * hub answers, exactly like `asLabelBindingRemoved`). Each of the six transfer
  * fields is validated ONLY IF PRESENT and OMITTED from the returned object when
  * absent — never defaulted to `0`, `null`, or `[]`. Absence is the hub's way of
  * saying "nothing moved"; default-filling would assert a transfer that never
@@ -1488,7 +1564,7 @@ export function asPoolMemberAdded(body: unknown): PoolMemberWire {
  * Narrow `POST /api/remove_pool_member`'s 200 body (`{ text, poolId,
  * principalId, removed }`). `removed` must be a genuine boolean — both values
  * are valid, deliberate hub answers: `false` means the principal was never a
- * member (tolerant, a normal success), exactly like `asLabelBindingDeleted`.
+ * member (tolerant, a normal success), exactly like `asLabelBindingRemoved`.
  */
 export function asPoolMemberRemoved(body: unknown): PoolMemberRemovedWire {
   const prefix = 'remove_pool_member: malformed success response';
