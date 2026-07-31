@@ -1,6 +1,6 @@
 /**
  * `owenloop binding new|rm|list` driven in-process through `mainAsync`. The three
- * hub endpoints (`POST /api/set_label_binding`, `POST /api/delete_label_binding`,
+ * hub endpoints (`POST /api/add_label_binding`, `POST /api/remove_label_binding`,
  * `GET /api/label_bindings`) and the OAuth refresh endpoints are canned
  * `routedFetch`/`stallingFetch` routes — no live hub is needed or contacted.
  *
@@ -12,16 +12,18 @@
  * responses carry label/pool names only.
  *
  * The invariants these tests pin, beyond the obvious happy paths:
- *   - `binding new` POSTs to `/api/set_label_binding` and to nothing else (the
- *     v1 `create_`-prefixed route name is dead and must never be requested);
- *   - `binding new` on an already-bound label is a normal SUCCESS (the hub
- *     upserts), reporting `previousPool` on stdout and `old → new` on stderr;
- *   - a fresh bind emits NO stderr echo;
- *   - `rm`'s stdout is `{ ok, hub, label }` — `deleted` is validated on the wire
- *     but never printed;
- *   - `rm` is **idempotent**: a 200 `{deleted: false}` (the label was not bound)
- *     is exit 0 with stdout identical to a real delete; only a 200 whose
- *     `deleted` is absent or non-boolean is exit 1;
+ *   - the routes are `add_label_binding`/`remove_label_binding` and nothing else
+ *     (the retired `set_`/`delete_`-prefixed names must never be requested);
+ *   - a label binds MANY pools: `binding new` is ADDITIVE (`alreadyBound` says
+ *     whether the pair was already there) and `binding list` returns MANY rows per
+ *     label, all of which must survive to stdout — nothing may key on `label`;
+ *   - `binding rm` takes `<label> <pool>`; the missing `<pool>` is a usage error
+ *     with zero network, not a label-wide removal;
+ *   - `rm` is **idempotent**: a 200 `{removed: false}` (the pair was never bound)
+ *     is exit 0 with a full stdout document plus a "was not bound" stderr line;
+ *   - `remainingPoolIds: []` is the PARKED signal and earns a stderr warning;
+ *   - a `list` row with `poolName: null` is a DANGLING binding and is PRINTED,
+ *     never dropped and never an error;
  *   - stdout is always exactly one JSON document, so `| jq` works.
  */
 
@@ -51,32 +53,55 @@ function seedHumanOauth(t: HubIo, over: Partial<Extract<Credential, { kind: 'oau
   );
 }
 
-/** A realistic 200 `set_label_binding` body — `{ text, binding }`, house shape. */
-function setOk(over: Record<string, unknown> = {}): RouteHandler {
+/**
+ * A realistic 200 `add_label_binding` body — `{ text, binding, alreadyBound,
+ * boundPoolCount }`, with `alreadyBound`/`boundPoolCount` at the BODY's top level
+ * exactly as the hub spreads them. `over` patches the nested row; `top` patches
+ * the body's own fields.
+ */
+function addOk(over: Record<string, unknown> = {}, top: Record<string, unknown> = {}): RouteHandler {
   return () => ({
     status: 200,
     json: {
-      text: 'Label "gpu" is now bound to pool "ml-pool".',
+      text: "Label 'gpu' bound to pool 'ml-pool' (now 1 pool).",
       binding: {
         label: 'gpu',
         poolId: 'pl_1',
         poolName: 'ml-pool',
         createdBy: 'u_1',
         createdAt: 1,
-        previousPoolName: null,
         ...over,
       },
+      alreadyBound: false,
+      boundPoolCount: 1,
+      ...top,
     },
   });
 }
 
-/** A realistic 200 `delete_label_binding` body — `{ text, deleted: true }`. */
-function deleteOk(): RouteHandler {
-  return () => ({ status: 200, json: { text: 'Label "gpu" is no longer bound.', deleted: true } });
+/**
+ * A realistic 200 `remove_label_binding` body — `{ text, label, poolId, removed,
+ * remainingPoolIds }`. Defaults to a removal that LEAVES another live pool.
+ */
+function removeOk(over: Record<string, unknown> = {}): RouteHandler {
+  return () => ({
+    status: 200,
+    json: {
+      text: "Label 'gpu' unbound from pool 'ml-pool'.",
+      label: 'gpu',
+      poolId: 'pl_1',
+      removed: true,
+      remainingPoolIds: ['pl_2'],
+      ...over,
+    },
+  });
 }
 
 const ROW_A = { label: 'gpu', poolId: 'pl_1', poolName: 'ml-pool', createdBy: 'u_1', createdAt: 1 };
-const ROW_B = { label: 'repo-access', poolId: 'pl_2', poolName: 'build-fleet', createdBy: 'u_2', createdAt: 2 };
+const ROW_A2 = { label: 'gpu', poolId: 'pl_2', poolName: 'spare-fleet', createdBy: 'u_1', createdAt: 3 };
+const ROW_B = { label: 'repo-access', poolId: 'pl_3', poolName: 'build-fleet', createdBy: 'u_2', createdAt: 2 };
+/** A DANGLING binding: the bound pool row was deleted, so the hub has no name to resolve. */
+const ROW_DANGLING = { label: 'gpu', poolId: 'pl_gone', poolName: null, createdBy: 'u_1', createdAt: 4 };
 
 /** A realistic 200 `label_bindings` body — `{ text, bindings }`. */
 function listOk(rows: unknown[] = [ROW_A, ROW_B]): RouteHandler {
@@ -90,84 +115,176 @@ function stdoutJson(t: HubIo): Record<string, unknown> {
 
 // ---- happy paths ------------------------------------------------------------
 
-test('binding new: fresh bind POSTs set_label_binding and prints previousPool: null with NO stderr echo', async () => {
-  const { fetch, calls } = routedFetch({ 'POST /api/set_label_binding': setOk() });
+test('binding new: a fresh add POSTs add_label_binding and prints alreadyBound: false with NO stderr', async () => {
+  const { fetch, calls } = routedFetch({ 'POST /api/add_label_binding': addOk() });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
   const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
   assert.equal(code, 0, t.err.join('\n'));
 
-  // Exactly one request, to the `set_`-prefixed route — pinning that the dead
-  // v1 `create_`-prefixed route name survives nowhere in the code path.
+  // Exactly one request, to the `add_`-prefixed route — pinning that the retired
+  // `set_`-prefixed route name survives nowhere in the code path.
   assert.equal(calls.length, 1);
   const req = calls[0]!;
-  assert.equal(req.pathname, '/api/set_label_binding');
+  assert.equal(req.pathname, '/api/add_label_binding');
   assert.equal(req.method, 'POST');
   assert.equal(req.authorization, 'Bearer mcpat_x');
   assert.deepEqual(JSON.parse(req.body!), { label: 'gpu', pool: 'ml-pool' });
-
-  assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, label: 'gpu', pool: 'ml-pool', previousPool: null });
-  assert.equal(stdoutJson(t).text, undefined, 'no raw hub body spread onto stdout');
-  assert.ok(!t.err.join('\n').includes('→'), 'a FRESH bind emits no retarget echo');
-});
-
-test('binding new: a RETARGET is a normal success — previousPool on stdout, old → new on stderr', async () => {
-  const { fetch, calls } = routedFetch({
-    'POST /api/set_label_binding': setOk({ poolName: 'cheap-fleet', previousPoolName: 'gpu-fleet' }),
-  });
-  const t = makeIo({ fetch });
-  seedHumanOauth(t);
-
-  const code = await mainAsync(['binding', 'new', 'gpu', 'cheap-fleet', '--hub', HUB], t.io);
-  assert.equal(code, 0, t.err.join('\n'));
-
-  // The CLI sends no "retarget" flag — the upsert is entirely server-side, so
-  // the request body is identical to the fresh-bind case.
-  const req = calls.find((c) => c.pathname === '/api/set_label_binding')!;
-  assert.deepEqual(JSON.parse(req.body!), { label: 'gpu', pool: 'cheap-fleet' });
 
   assert.deepEqual(stdoutJson(t), {
     ok: true,
     hub: ORIGIN,
     label: 'gpu',
-    pool: 'cheap-fleet',
-    previousPool: 'gpu-fleet',
+    pool: 'ml-pool',
+    alreadyBound: false,
+    boundPoolCount: 1,
   });
-  // U+2192, the house glyph for an old → new progress line.
-  assert.ok(t.err.join('\n').includes('gpu: gpu-fleet → cheap-fleet'), 'the retarget echo goes to stderr verbatim');
+  assert.equal(stdoutJson(t).text, undefined, 'no raw hub body spread onto stdout');
+  assert.deepEqual(t.err, [], 'an add has no consequence to warn about — nothing on stderr');
+});
+
+test('binding new: a REPEAT add is a normal success — alreadyBound: true, no stderr, no provenance leak', async () => {
+  // Binding is ADDITIVE and idempotent per (label, pool) pair: re-adding the same
+  // pair is a 200 no-op, not an error, and it never displaces another pool.
+  const { fetch, calls } = routedFetch({
+    'POST /api/add_label_binding': addOk({ createdBy: 'u_original', createdAt: 999 }, { alreadyBound: true, boundPoolCount: 2 }),
+  });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const req = calls.find((c) => c.pathname === '/api/add_label_binding')!;
+  assert.deepEqual(JSON.parse(req.body!), { label: 'gpu', pool: 'ml-pool' }, 'the request body is identical to a fresh add');
+
+  const out = stdoutJson(t);
+  // The wire's `binding` carries the ORIGINAL row's creator/timestamp (the repeat
+  // add preserved it); both are validated but belong to `binding list`, not to
+  // this document. Asserted BEFORE the deepEqual below, which narrows `out`.
+  assert.equal(out.createdBy, undefined, 'createdBy is validated on the wire, never printed here');
+  assert.equal(out.createdAt, undefined, 'createdAt is validated on the wire, never printed here');
+  assert.deepEqual(out, {
+    ok: true,
+    hub: ORIGIN,
+    label: 'gpu',
+    pool: 'ml-pool',
+    alreadyBound: true,
+    boundPoolCount: 2,
+  });
+  assert.deepEqual(t.err, [], 'a repeat add is silent too');
 });
 
 test('binding new: stdout prints the SERVER-echoed label/pool, not argv', async () => {
   const { fetch } = routedFetch({
-    'POST /api/set_label_binding': setOk({ label: 'gpu', poolName: 'ml-pool-canonical' }),
+    'POST /api/add_label_binding': addOk({ label: 'gpu', poolName: 'ml-pool-canonical' }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['binding', 'new', 'gpu', 'ML-Pool', '--hub', HUB], t.io);
+  const code = await mainAsync(['binding', 'new', 'GPU', 'ML-Pool', '--hub', HUB], t.io);
   assert.equal(code, 0, t.err.join('\n'));
-  assert.equal(stdoutJson(t).pool, 'ml-pool-canonical', 'stdout tells the truth about what the hub stored');
+  const out = stdoutJson(t);
+  assert.equal(out.pool, 'ml-pool-canonical', 'stdout tells the truth about what the hub stored');
+  assert.equal(out.label, 'gpu', 'the label is the hub-echoed value too, not argv');
 });
 
-test('binding rm: POSTs delete_label_binding and prints { ok, hub, label } with NO deleted key', async () => {
-  const { fetch, calls } = routedFetch({ 'POST /api/delete_label_binding': deleteOk() });
+test('binding rm: POSTs remove_label_binding with {label, pool} and prints the full removal document', async () => {
+  const { fetch, calls } = routedFetch({ 'POST /api/remove_label_binding': removeOk() });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['binding', 'rm', 'gpu', '--hub', HUB], t.io);
+  const code = await mainAsync(['binding', 'rm', 'gpu', 'ml-pool', '--hub', HUB], t.io);
   assert.equal(code, 0, t.err.join('\n'));
 
-  const req = calls.find((c) => c.pathname === '/api/delete_label_binding')!;
+  assert.equal(calls.length, 1);
+  const req = calls[0]!;
+  assert.equal(req.pathname, '/api/remove_label_binding');
   assert.equal(req.method, 'POST');
   assert.equal(req.authorization, 'Bearer mcpat_x');
-  assert.deepEqual(JSON.parse(req.body!), { label: 'gpu' });
+  // `pool` is REQUIRED on the wire now — the old label-only body is a 400.
+  assert.deepEqual(JSON.parse(req.body!), { label: 'gpu', pool: 'ml-pool' });
 
-  // The wire body carries `deleted: true` (the guard validates it) but stdout
-  // must not — that split is the frozen §2.4 output contract.
-  const out = stdoutJson(t);
-  assert.equal(out.deleted, undefined, 'deleted is validated on the wire, never printed');
-  assert.deepEqual(out, { ok: true, hub: ORIGIN, label: 'gpu' });
+  assert.deepEqual(stdoutJson(t), {
+    ok: true,
+    hub: ORIGIN,
+    label: 'gpu',
+    poolId: 'pl_1',
+    removed: true,
+    remainingPoolIds: ['pl_2'],
+  });
+  // Another LIVE pool still serves the label, so nothing is parked.
+  assert.ok(!t.err.join('\n').includes('parked'), 'no parked warning while live bindings remain');
+});
+
+test('binding rm: removing the LAST live binding PARKS the label — remainingPoolIds: [] plus a stderr warning', async () => {
+  const { fetch } = routedFetch({
+    'POST /api/remove_label_binding': removeOk({ remainingPoolIds: [] }),
+  });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'rm', 'gpu', 'ml-pool', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  assert.deepEqual(stdoutJson(t), {
+    ok: true,
+    hub: ORIGIN,
+    label: 'gpu',
+    poolId: 'pl_1',
+    removed: true,
+    remainingPoolIds: [],
+  });
+  // stderr only, so `| jq` on stdout is unaffected. The operator has to learn
+  // that in-flight steps just parked.
+  assert.match(t.err.join('\n'), /gpu: no live bindings remain — runs waiting on this label are parked/);
+});
+
+test('binding rm: a pair that was never bound is exit 0 with removed: false and a "was not bound" stderr line', async () => {
+  // The hub answers 200 `{removed: false}` for a pair it never held, never a 404
+  // (the `removePoolMember` `{existed}` house pattern) — that tolerance is what
+  // makes `binding rm` idempotent. `poolId` is `null` here because the argument
+  // matched neither a live pool name nor one of this label's own rows.
+  const { fetch } = routedFetch({
+    'POST /api/remove_label_binding': removeOk({
+      text: "Label 'gpu' was not bound to 'no-such-pool'.",
+      poolId: null,
+      removed: false,
+      remainingPoolIds: ['pl_1'],
+    }),
+  });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'rm', 'gpu', 'no-such-pool', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  assert.deepEqual(stdoutJson(t), {
+    ok: true,
+    hub: ORIGIN,
+    label: 'gpu',
+    poolId: null,
+    removed: false,
+    remainingPoolIds: ['pl_1'],
+  });
+  assert.match(t.err.join('\n'), /gpu was not bound to 'no-such-pool' — nothing was removed/);
+  assert.ok(!t.err.join('\n').includes('parked'), 'a no-op removal parked nothing');
+});
+
+test('binding rm: a tolerant removal that ALSO leaves zero live bindings warns only about the no-op', async () => {
+  // `removed: false` wins the stderr line: nothing changed, so nothing was parked
+  // BY THIS CALL even though the label happens to have no live bindings.
+  const { fetch } = routedFetch({
+    'POST /api/remove_label_binding': removeOk({ poolId: null, removed: false, remainingPoolIds: [] }),
+  });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'rm', 'gpu', 'no-such-pool', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.match(t.err.join('\n'), /was not bound/);
+  assert.ok(!t.err.join('\n').includes('parked'), 'this call parked nothing — it removed nothing');
 });
 
 test('binding list: GETs label_bindings and prints the guard-narrowed rows', async () => {
@@ -186,6 +303,34 @@ test('binding list: GETs label_bindings and prints the guard-narrowed rows', asy
   assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, bindings: [ROW_A, ROW_B] });
 });
 
+test('binding list: MANY rows for ONE label all survive to stdout, in wire order', async () => {
+  // The many-to-many regression test. One row per (label, pool) pair means `gpu`
+  // appears three times; anything keying a map on `label` would silently keep one.
+  const { fetch } = routedFetch({ 'GET /api/label_bindings': listOk([ROW_A, ROW_A2, ROW_B, ROW_DANGLING]) });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'list', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const bindings = stdoutJson(t).bindings as Record<string, unknown>[];
+  assert.deepEqual(bindings, [ROW_A, ROW_A2, ROW_B, ROW_DANGLING], 'every row survives, in the order the hub sent them');
+  assert.equal(bindings.filter((b) => b.label === 'gpu').length, 3, 'all three gpu rows are present');
+});
+
+test('binding list: a DANGLING row (poolName: null) is PRINTED, not dropped and not an error', async () => {
+  // The bound pool row was deleted. The binding routes nothing, but the operator
+  // has to be able to SEE it in order to clean it up — so `null` is surfaced.
+  const { fetch } = routedFetch({ 'GET /api/label_bindings': listOk([ROW_DANGLING]) });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'list', '--hub', HUB], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, bindings: [ROW_DANGLING] });
+  assert.equal((stdoutJson(t).bindings as Record<string, unknown>[])[0]!.poolName, null);
+});
+
 test('binding list: an org with ZERO bindings is exit 0 with bindings: [], not an error', async () => {
   const { fetch } = routedFetch({ 'GET /api/label_bindings': listOk([]) });
   const t = makeIo({ fetch });
@@ -201,12 +346,12 @@ test('binding list: an org with ZERO bindings is exit 0 with bindings: [], not a
 test('binding: exit 3 with the login remedy when no human credential exists (all three subcommands, zero network)', async () => {
   for (const argv of [
     ['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB],
-    ['binding', 'rm', 'gpu', '--hub', HUB],
+    ['binding', 'rm', 'gpu', 'ml-pool', '--hub', HUB],
     ['binding', 'list', '--hub', HUB],
   ]) {
     const { fetch, calls } = routedFetch({
-      'POST /api/set_label_binding': setOk(),
-      'POST /api/delete_label_binding': deleteOk(),
+      'POST /api/add_label_binding': addOk(),
+      'POST /api/remove_label_binding': removeOk(),
       'GET /api/label_bindings': listOk(),
     });
     const t = makeIo({ fetch }); // empty keychain
@@ -222,7 +367,7 @@ test('binding new: an expired human oauth REFRESHES once and retries with the re
   const { fetch, calls } = routedFetch({
     'GET /.well-known/oauth-authorization-server': () => ({ status: 200, json: OAUTH_METADATA }),
     'POST /mcp/token': () => ({ status: 200, json: { access_token: 'mcpat_new', expires_in: 3600 } }),
-    'POST /api/set_label_binding': setOk(),
+    'POST /api/add_label_binding': addOk(),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t, { accessToken: 'mcpat_old', expiresAt: Date.now() - 1000 });
@@ -231,7 +376,7 @@ test('binding new: an expired human oauth REFRESHES once and retries with the re
   assert.equal(code, 0, t.err.join('\n'));
 
   assert.ok(calls.some((c) => c.pathname === '/mcp/token'), 'a refresh happened');
-  const req = calls.find((c) => c.pathname === '/api/set_label_binding')!;
+  const req = calls.find((c) => c.pathname === '/api/add_label_binding')!;
   assert.equal(req.authorization, 'Bearer mcpat_new', 'the POST used the refreshed bearer');
 
   // The rotated credential was persisted.
@@ -243,7 +388,7 @@ test('binding new: an expired human oauth whose refresh is REJECTED is exit 3 (i
   const { fetch, calls } = routedFetch({
     'GET /.well-known/oauth-authorization-server': () => ({ status: 200, json: OAUTH_METADATA }),
     'POST /mcp/token': () => ({ status: 400, json: { error: 'invalid_grant' } }),
-    'POST /api/set_label_binding': setOk(),
+    'POST /api/add_label_binding': addOk(),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t, { accessToken: 'mcpat_old', expiresAt: Date.now() - 1000 });
@@ -251,14 +396,14 @@ test('binding new: an expired human oauth whose refresh is REJECTED is exit 3 (i
   const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
   assert.equal(code, 3);
   assert.match(t.err.join('\n'), new RegExp(`run: owenloop login --hub ${ORIGIN.replace(/[.]/g, '\\.')}`));
-  assert.ok(!calls.some((c) => c.pathname === '/api/set_label_binding'), 'nothing bound after a failed refresh');
+  assert.ok(!calls.some((c) => c.pathname === '/api/add_label_binding'), 'nothing bound after a failed refresh');
 });
 
 test('binding new: a 401 that survives the retry is `credential rejected`, exit 3', async () => {
   // An `oauth-pasted` credential has no refresh path, so the 401 is final on the
   // first response — the exact "irrecoverable credential" family.
   const { fetch } = routedFetch({
-    'POST /api/set_label_binding': () => ({ status: 401, json: { error: 'unauthorized' } }),
+    'POST /api/add_label_binding': () => ({ status: 401, json: { error: 'unauthorized' } }),
   });
   const t = makeIo({ fetch });
   t.store.set(kcHuman(ORIGIN), JSON.stringify({ kind: 'oauth-pasted', accessToken: 'mcpat_x' }));
@@ -287,7 +432,7 @@ test('binding list: exit 2 when no --hub and the store knows zero hubs, naming t
 });
 
 test('binding new: exit 2 lists the stored origins when the store knows more than one hub', async () => {
-  const { fetch, calls } = routedFetch({ 'POST /api/set_label_binding': setOk() });
+  const { fetch, calls } = routedFetch({ 'POST /api/add_label_binding': addOk() });
   const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' } });
   writeCredentialFile(credentialFilePath(t.io.env), {
     version: 2,
@@ -307,30 +452,41 @@ test('binding new: exit 2 lists the stored origins when the store knows more tha
   assert.equal(calls.length, 0);
 });
 
-test('binding new: a missing positional beats hub resolution — usage error (exit 1), not exit 2', async () => {
-  // Multi-hub machine: if validation ran AFTER resolveAgentHub this would be a
-  // confusing exit 2 about hubs rather than the real problem.
-  const { fetch, calls } = routedFetch({ 'POST /api/set_label_binding': setOk() });
-  const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' } });
-  writeCredentialFile(credentialFilePath(t.io.env), {
-    version: 2,
-    hubs: {
-      'https://a.example': { human: { kind: 'oauth-pasted', accessToken: 'mcpat_a' } },
-      'https://b.example': { human: { kind: 'oauth-pasted', accessToken: 'mcpat_b' } },
-    },
-  });
+test('binding: a missing positional beats hub resolution — usage error (exit 1), not exit 2', async () => {
+  // Multi-hub machine: if validation ran AFTER resolveAgentHub these would be a
+  // confusing exit 2 about hubs rather than the real problem. `binding rm gpu` is
+  // in here because `<pool>` is now required on `rm` too.
+  for (const [argv, missing] of [
+    [['binding', 'new'], '<label>'],
+    [['binding', 'new', 'gpu'], '<pool>'],
+    [['binding', 'rm'], '<label>'],
+    [['binding', 'rm', 'gpu'], '<pool>'],
+  ] as [string[], string][]) {
+    const { fetch, calls } = routedFetch({
+      'POST /api/add_label_binding': addOk(),
+      'POST /api/remove_label_binding': removeOk(),
+    });
+    const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+    writeCredentialFile(credentialFilePath(t.io.env), {
+      version: 2,
+      hubs: {
+        'https://a.example': { human: { kind: 'oauth-pasted', accessToken: 'mcpat_a' } },
+        'https://b.example': { human: { kind: 'oauth-pasted', accessToken: 'mcpat_b' } },
+      },
+    });
 
-  const code = await mainAsync(['binding', 'new'], t.io);
-  assert.equal(code, 1, 'the usage error wins');
-  assert.match(t.err.join('\n'), /missing required argument: <label>/);
-  assert.equal(calls.length, 0);
+    const code = await mainAsync(argv, t.io);
+    assert.equal(code, 1, `the usage error wins for ${JSON.stringify(argv)}`);
+    assert.match(t.err.join('\n'), new RegExp(`missing required argument: ${missing}`));
+    assert.equal(calls.length, 0);
+  }
 });
 
 // ---- hub refusals (message passthrough) -------------------------------------
 
 test('binding new: a 400 label_binding_invalid surfaces the hub message verbatim, exit 1, empty stdout', async () => {
   const { fetch } = routedFetch({
-    'POST /api/set_label_binding': () => ({
+    'POST /api/add_label_binding': () => ({
       status: 400,
       json: { error: 'label_binding_invalid', message: 'pool "ml-pool" does not exist' },
     }),
@@ -346,7 +502,7 @@ test('binding new: a 400 label_binding_invalid surfaces the hub message verbatim
 
 test('binding new: a 403 (non-admin human) surfaces the hub message, exit 1', async () => {
   const { fetch } = routedFetch({
-    'POST /api/set_label_binding': () => ({
+    'POST /api/add_label_binding': () => ({
       status: 403,
       json: { error: 'forbidden', message: 'admin role required' },
     }),
@@ -359,55 +515,74 @@ test('binding new: a 403 (non-admin human) surfaces the hub message, exit 1', as
   assert.match(t.err.join('\n'), /admin role required/);
 });
 
-test('binding rm: a 400 on delete surfaces the hub message, exit 1', async () => {
+test('binding rm: a 400 on remove surfaces the hub message, exit 1', async () => {
   const { fetch } = routedFetch({
-    'POST /api/delete_label_binding': () => ({
+    'POST /api/remove_label_binding': () => ({
       status: 400,
-      json: { error: 'label_binding_invalid', message: 'label "gpu" is not bound' },
+      json: { error: 'label_binding_invalid', message: 'label "gpu" is not valid' },
     }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['binding', 'rm', 'gpu', '--hub', HUB], t.io);
+  const code = await mainAsync(['binding', 'rm', 'gpu', 'ml-pool', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /label "gpu" is not bound/);
+  assert.match(t.err.join('\n'), /label "gpu" is not valid/);
 });
 
 // ---- malformed 200s (field-only errors, no body echo) -----------------------
 
 test('binding new: a 200 with no binding is exit 1, naming the missing field only', async () => {
   const { fetch } = routedFetch({
-    'POST /api/set_label_binding': () => ({ status: 200, json: { text: 'ok' } }),
+    'POST /api/add_label_binding': () => ({ status: 200, json: { text: 'ok', alreadyBound: false, boundPoolCount: 1 } }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
   const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  const err = t.err.join('\n');
-  assert.match(err, /set_label_binding: malformed success response — missing binding/);
+  assert.match(t.err.join('\n'), /add_label_binding: malformed success response — missing binding/);
   assert.deepEqual(t.out, []);
 });
 
-test('binding new: a 200 whose binding is missing poolName is exit 1, naming that field', async () => {
-  const { fetch } = routedFetch({
-    'POST /api/set_label_binding': () => ({
-      status: 200,
-      json: { text: 'ok', binding: { label: 'gpu', poolId: 'pl_1', createdBy: 'u_1', createdAt: 1 } },
-    }),
-  });
+test('binding new: a binding whose poolName is NULL is exit 1 — an add resolves a LIVE pool by name', async () => {
+  // The one place `poolName: null` is malformed rather than a dangling binding:
+  // `add_label_binding` resolved its pool BY NAME, so the pool is live by
+  // construction. `binding list` treats the same null as legitimate (see above).
+  const { fetch } = routedFetch({ 'POST /api/add_label_binding': addOk({ poolName: null }) });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
   const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /set_label_binding: malformed success response — binding missing non-empty string poolName/);
+  assert.match(t.err.join('\n'), /add_label_binding: malformed success response — binding missing non-empty string poolName/);
+  assert.deepEqual(t.out, []);
+});
+
+test('binding new: a non-boolean alreadyBound is exit 1, naming that field', async () => {
+  const { fetch } = routedFetch({ 'POST /api/add_label_binding': addOk({}, { alreadyBound: 'yes' }) });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /add_label_binding: malformed success response — missing boolean alreadyBound/);
+  assert.doesNotMatch(t.err.join('\n'), /yes/, 'the offending VALUE is never echoed');
+});
+
+test('binding new: a non-number boundPoolCount is exit 1, naming that field', async () => {
+  const { fetch } = routedFetch({ 'POST /api/add_label_binding': addOk({}, { boundPoolCount: '2' }) });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /add_label_binding: malformed success response — missing number boundPoolCount/);
 });
 
 test('binding new: a 200 that is NOT valid JSON is exit 1 with a FIXED message, never the parse error', async () => {
   const { fetch } = routedFetch({
-    'POST /api/set_label_binding': () => ({ status: 200, raw: 'not json at all' }),
+    'POST /api/add_label_binding': () => ({ status: 200, raw: 'not json at all' }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
@@ -415,73 +590,60 @@ test('binding new: a 200 that is NOT valid JSON is exit 1 with a FIXED message, 
   const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
   assert.equal(code, 1);
   const err = t.err.join('\n');
-  assert.match(err, /set_label_binding: malformed success response — body is not valid JSON/);
+  assert.match(err, /add_label_binding: malformed success response — body is not valid JSON/);
   assert.doesNotMatch(err, /Unexpected token/, 'the V8 parse-error snippet must never surface');
 });
 
-test('binding new: a non-string, non-null previousPoolName is exit 1 naming that field', async () => {
-  const { fetch } = routedFetch({ 'POST /api/set_label_binding': setOk({ previousPoolName: 7 }) });
-  const t = makeIo({ fetch });
-  seedHumanOauth(t);
-
-  const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
-  assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /previousPoolName must be a non-empty string or null/);
-});
-
-test('binding new: a binding with previousPoolName ABSENT is exit 0 with previousPool: null (deliberate leniency)', async () => {
-  // A serializer that drops `undefined` must not turn a successful bind into a
-  // failure — absent and null both mean "fresh bind". Pinned so nobody
-  // "tightens" the guard by accident.
+test('binding rm: a 200 with NO removed key at all is exit 1', async () => {
   const { fetch } = routedFetch({
-    'POST /api/set_label_binding': () => ({
-      status: 200,
-      json: {
-        text: 'ok',
-        binding: { label: 'gpu', poolId: 'pl_1', poolName: 'ml-pool', createdBy: 'u_1', createdAt: 1 },
-      },
-    }),
+    'POST /api/remove_label_binding': () => ({ status: 200, json: { text: 'ok', label: 'gpu', remainingPoolIds: [] } }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
-  assert.equal(code, 0, t.err.join('\n'));
-  assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, label: 'gpu', pool: 'ml-pool', previousPool: null });
-  assert.ok(!t.err.join('\n').includes('→'), 'an absent previousPoolName is a fresh bind — no echo');
-});
-
-test('binding rm: a 200 with NO deleted key at all is exit 1', async () => {
-  const { fetch } = routedFetch({
-    'POST /api/delete_label_binding': () => ({ status: 200, json: { text: 'ok' } }),
-  });
-  const t = makeIo({ fetch });
-  seedHumanOauth(t);
-
-  const code = await mainAsync(['binding', 'rm', 'gpu', '--hub', HUB], t.io);
+  const code = await mainAsync(['binding', 'rm', 'gpu', 'ml-pool', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /delete_label_binding: malformed success response — missing boolean deleted/);
+  assert.match(t.err.join('\n'), /remove_label_binding: malformed success response — missing boolean removed/);
   assert.deepEqual(t.out, []);
 });
 
-test('binding rm: a 200 with deleted: false (the label was not bound) is exit 0 with identical stdout — rm is idempotent', async () => {
-  // The hub answers 200 `{deleted: false}` for an unbound label, never a 404
-  // (owenloop-service docs/decisions/label-bindings.md). stdout must be
-  // byte-identical to a real delete — that identity is what idempotent means
-  // at this surface, and a scripted consumer must not have to branch on it.
+test('binding rm: an ABSENT remainingPoolIds THROWS — it is deliberately not lenient', async () => {
+  // Defaulting an absent `remainingPoolIds` to `[]` would assert "this label is
+  // PARKED" — the alarming reading — off a malformed body. Pinned so nobody
+  // "harmonizes" it with the lenient nullable fields.
   const { fetch } = routedFetch({
-    'POST /api/delete_label_binding': () => ({
+    'POST /api/remove_label_binding': () => ({
       status: 200,
-      json: { text: "Label 'gpu' was not bound.", label: 'gpu', deleted: false },
+      json: { text: 'ok', label: 'gpu', poolId: 'pl_1', removed: true },
     }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['binding', 'rm', 'gpu', '--hub', HUB], t.io);
-  assert.equal(code, 0, t.err.join('\n'));
-  assert.deepEqual(stdoutJson(t), { ok: true, hub: ORIGIN, label: 'gpu' });
-  assert.deepEqual(t.err, [], 'no extra stderr line either — rm prints nothing extra when the label was not bound');
+  const code = await mainAsync(['binding', 'rm', 'gpu', 'ml-pool', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /remove_label_binding: malformed success response — missing array remainingPoolIds/);
+  assert.deepEqual(t.out, [], 'nothing on stdout — the parked question is left unanswered, not guessed');
+});
+
+test('binding rm: a non-array remainingPoolIds is exit 1 naming that field', async () => {
+  const { fetch } = routedFetch({ 'POST /api/remove_label_binding': removeOk({ remainingPoolIds: 'pl_2' }) });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'rm', 'gpu', 'ml-pool', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /remove_label_binding: malformed success response — missing array remainingPoolIds/);
+});
+
+test('binding rm: a remainingPoolIds element that is not a non-empty string is exit 1, naming the INDEX', async () => {
+  const { fetch } = routedFetch({ 'POST /api/remove_label_binding': removeOk({ remainingPoolIds: ['pl_2', ''] }) });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'rm', 'gpu', 'ml-pool', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /remove_label_binding: malformed success response — remainingPoolIds\[1\] is not a non-empty string/);
 });
 
 test('binding list: a malformed row is exit 1, naming the INDEX and field only', async () => {
@@ -495,6 +657,17 @@ test('binding list: a malformed row is exit 1, naming the INDEX and field only',
   assert.equal(code, 1);
   assert.match(t.err.join('\n'), /label_bindings: malformed response — bindings\[2\] missing non-empty string label/);
   assert.deepEqual(t.out, []);
+});
+
+test('binding list: a row whose poolName is a non-string, non-null value is exit 1 naming that field', async () => {
+  // `null` is legitimate (dangling); a number is not.
+  const { fetch } = routedFetch({ 'GET /api/label_bindings': listOk([{ ...ROW_A, poolName: 7 }]) });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  const code = await mainAsync(['binding', 'list', '--hub', HUB], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /label_bindings: malformed response — bindings\[0\] poolName must be a non-empty string or null/);
 });
 
 test('binding list: a 200 with no bindings array is exit 1', async () => {
@@ -516,10 +689,13 @@ test('binding: usage errors are exit 1 with ZERO network calls', async () => {
     ['binding', 'new'],
     ['binding', 'new', 'gpu'],
     ['binding', 'rm'],
+    // `<pool>` is REQUIRED on `rm` now. This argv was a SUCCESS before the
+    // many-to-many migration and is deliberately a usage error today.
+    ['binding', 'rm', 'gpu'],
   ]) {
     const { fetch, calls } = routedFetch({
-      'POST /api/set_label_binding': setOk(),
-      'POST /api/delete_label_binding': deleteOk(),
+      'POST /api/add_label_binding': addOk(),
+      'POST /api/remove_label_binding': removeOk(),
       'GET /api/label_bindings': listOk(),
     });
     const t = makeIo({ fetch });
@@ -545,25 +721,25 @@ test('binding list: an unknown option is rejected by preflight before any side e
 // ---- transport discipline ---------------------------------------------------
 
 test('binding new: a hub TIMEOUT is a plain exit 1 (a flaky network is not an irrecoverable credential)', async () => {
-  const { fetch, calls } = stallingFetch({ 'POST /api/set_label_binding': setOk() }, ['POST /api/set_label_binding']);
+  const { fetch, calls } = stallingFetch({ 'POST /api/add_label_binding': addOk() }, ['POST /api/add_label_binding']);
   const t = makeIo({ fetch, env: { OWENLOOP_HUB_TIMEOUT_MS: '80' } });
   seedHumanOauth(t);
 
   const code = await mainAsync(['binding', 'new', 'gpu', 'ml-pool', '--hub', HUB], t.io);
   assert.equal(code, 1);
   assert.match(t.err.join('\n'), /did not respond within/);
-  assert.ok(calls.some((c) => c.pathname === '/api/set_label_binding'), 'the POST was attempted (and stalled)');
+  assert.ok(calls.some((c) => c.pathname === '/api/add_label_binding'), 'the POST was attempted (and stalled)');
 });
 
 test('binding: every request sets redirect: error — proof it went through hubFetch, not raw fetch', async () => {
   for (const [argv, pathname] of [
-    [['binding', 'new', 'gpu', 'ml-pool'], '/api/set_label_binding'],
-    [['binding', 'rm', 'gpu'], '/api/delete_label_binding'],
+    [['binding', 'new', 'gpu', 'ml-pool'], '/api/add_label_binding'],
+    [['binding', 'rm', 'gpu', 'ml-pool'], '/api/remove_label_binding'],
     [['binding', 'list'], '/api/label_bindings'],
   ] as [string[], string][]) {
     const { fetch, calls } = routedFetch({
-      'POST /api/set_label_binding': setOk(),
-      'POST /api/delete_label_binding': deleteOk(),
+      'POST /api/add_label_binding': addOk(),
+      'POST /api/remove_label_binding': removeOk(),
       'GET /api/label_bindings': listOk(),
     });
     const t = makeIo({ fetch });
