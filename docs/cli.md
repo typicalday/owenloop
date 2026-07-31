@@ -754,7 +754,7 @@ needs a translation step.
 | code | meaning |
 |---|---|
 | `0` | the pool was added to the label (or was already bound), the binding was removed (or was already absent), or the bindings were listed |
-| `1` | runtime or hub error — an unknown pool name, a label that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
+| `1` | runtime or hub error — an unknown pool name (`binding new` only; `binding rm` answers a tolerant `removed: false` instead), a label that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
 

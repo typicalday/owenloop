@@ -2989,10 +2989,12 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
  * No client-side charset validation of `label` or `pool`: the hub is the
  * enforcement of record, the same stance `agent new` takes for `--pools`.
  *
- * Exit codes: 0 ok; 1 runtime/hub error (unknown pool name, a label that fails
- * the hub's name rules, a 403 for a non-admin, a malformed 2xx, a network
- * timeout); 2 the hub is unresolvable; 3 the human credential is absent or
- * irrecoverable (the error names `owenloop login --hub <origin>`).
+ * Exit codes: 0 ok; 1 runtime/hub error (an unknown pool name — `binding new`
+ * ONLY, since `binding rm` answers a tolerant `removed: false` instead of a
+ * 400; a label that fails the hub's name rules, a 403 for a non-admin, a
+ * malformed 2xx, a network timeout); 2 the hub is unresolvable; 3 the human
+ * credential is absent or irrecoverable (the error names
+ * `owenloop login --hub <origin>`).
  */
 async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
   const USAGE_FORMS =
@@ -3196,10 +3198,10 @@ async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
  * orphan pool, because an operator who never sees that line will not go
  * looking for their moved work.
  *
- * Deliberately diverges from `binding rm`: `pool rm` and `pool member rm` DO
- * print their tolerant booleans (`deleted`, `removed`) on stdout. `binding rm`
- * hides `deleted` under a frozen output contract; `pool` is a new command
- * with no such history, so the more honest shape wins.
+ * Agrees with `binding rm`: `pool rm` and `pool member rm` print their tolerant
+ * booleans (`deleted`, `removed`) on stdout and narrate the tolerant-false case
+ * on stderr — the same shape `binding rm` uses for its own `removed` and
+ * `remainingPoolIds`. One vocabulary across both families.
  *
  * Exit codes: 0 ok; 1 usage error, hub refusal (400/403), or malformed
  * response; 2 the hub is unresolvable; 3 the human credential is absent or
@@ -3393,8 +3395,9 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
       } catch (e) {
         throw new CliError((e as Error).message);
       }
-      // Diverges from `binding rm`: `deleted` (and every transfer field the
-      // wire carried) is printed, never hidden — see the function doc-comment.
+      // `deleted` (and every transfer field the wire carried) is printed, never
+      // hidden — the same tolerant-boolean shape `binding rm` prints. See the
+      // function doc-comment.
       print(io, { ok: true, hub: origin, ...deletedWire });
       if (!deletedWire.deleted) {
         io.err(`no pool '${deletedWire.poolId}' to delete — nothing was removed`);
