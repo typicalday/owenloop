@@ -1,5 +1,5 @@
 /**
- * `src/owenwork.ts` — the owenloop CLI's key-preserving writer for the SIBLING
+ * `src/work-settings.ts` — the owenloop CLI's key-preserving writer for the EXECUTION
  * `owenwork` tool's `settings.json`. Proves: only `hubOrigin` changes (every
  * other key byte-identical), a corrupt file is a hard error that never clobbers,
  * a missing directory is created, `XDG_CONFIG_HOME` wins over `HOME`, and the
@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { owenworkSettingsPath, readOwenworkSettingsRaw, writeOwenworkHubOrigin } from '../src/owenwork.ts';
+import { owenworkSettingsPath, readOwenworkSettingsRaw, writeOwenworkHubOrigin } from '../src/work-settings.ts';
 
 /** A throwaway HOME dir for one test. */
 function freshHome(): string {

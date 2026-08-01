@@ -96,6 +96,7 @@ jobs:
               && npm init -y >/dev/null \
               && npm install --no-audit --no-fund "$GITHUB_WORKSPACE/$TARBALL" \
               && ./node_modules/.bin/owenloop --help \
+              && ./node_modules/.bin/owenloop work --help \
               && [ "$(./node_modules/.bin/owenloop list --db ./state.db)" = "[]" ]
           )
 

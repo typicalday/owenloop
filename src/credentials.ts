@@ -2,7 +2,7 @@
  * Credential WRITE + OAuth refresh library surface.
  *
  * Extracted from `src/cli.ts` (where these were module-private) so external
- * consumers — a future `owenloop mcp` stdio server, an `owenwork join` command —
+ * consumers — a future `owenloop mcp` stdio server, an `owenloop work join` command —
  * can store credentials and keep an OAuth access token fresh without depending
  * on the CLI module. The exported `storeCredential` / `deleteCredential` /
  * `ensureFreshOAuth` are re-imported by `cli.ts`, so every existing subcommand

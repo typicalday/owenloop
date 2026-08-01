@@ -1,0 +1,489 @@
+/**
+ * `owenloop work agent-run <order-id>` (Phase 3) — the detached, self-leasing runner
+ * that HOSTS one step agent, and the harness-registry COMPOSITION ROOT.
+ *
+ * The proxy spawns one detached
+ * `owenloop work agent-run <workflow>/<run> --origin <url>` per AGENT order — the
+ * ONLY path an agent order takes, since Phase 5 deleted the legacy stamp path
+ * it used to share the lane with. This
+ * process owns that order end to end: it takes the lease on first contact,
+ * renders the step's brief, starts the step agent inside a harness adapter with
+ * a work-holder MCP mount born bound to this order, keeps the lease warm
+ * underneath the turn, and learns whether the agent submitted FROM THE HUB.
+ * Nothing is ever written to any agent-definition directory.
+ *
+ * The orchestration CORE lives in `src/agent/loop.ts` (lease + adapter + confirm
+ * phase, every side effect injected); this role only parses the arg contract,
+ * resolves origin/credential/cache, tags the holder identity, resolves WHICH
+ * adapter hosts the agent, loads the brief template, wires the signal seam, and
+ * maps `AgentRunOutcome` to an exit code.
+ *
+ * ── WHERE THE ADAPTERS COME FROM (Phase 6) ──
+ *
+ * `src/harness/registry.ts` starts empty and forbids a barrel, so SOMEBODY has
+ * to import the adapter modules for their `register(...)` side effect to fire.
+ * Through Phase 5 that somebody was this file AND `src/roles/lint.ts`, each
+ * carrying the same import pair in the same hand-maintained order. Phase 6
+ * consolidated both into `src/harnesses.ts`; this file imports THAT, and the
+ * single line is directly below the header. Adapter import order — which decides
+ * the default harness — now has exactly one owner.
+ *
+ * ── WHERE THE STEP SPEC COMES FROM ──
+ *
+ * The spawn argv (D6) carries only `<workflow>/<run>`, `--origin`, `--conductor`
+ * and `--harness` — no def name and no def hash, both of which the bundle cache
+ * needs. So the runner resolves the def name ITSELF: one non-claiming
+ * `whats_next({workflow})` returns `def` in per-workflow mode, which feeds
+ * `readDispatchBundle(cacheDir, def)` → `bundle.def.hash` → `readStepSpec(...)`.
+ * That keeps the argv exactly as D6 specifies and adds no new settings surface.
+ *
+ * ── CREDENTIALS ──
+ *
+ * Origin/credential resolution mirrors `exec`: origin `--origin` → settings; the
+ * bearer comes from owenloop's store via `resolveBearer`, reading the
+ * `agent:<account>` slot for the account the proxy set in this child's
+ * `OWENWORK_ACCOUNT` spawn env (default `default`). `agent-run` has NO `--as`
+ * flag — the spawn-env channel is the contract.
+ *
+ * D10, CLOSED IN PHASE 6. The MCP mount this runner builds carries no
+ * credential — the mounted work-holder resolves its own from the same store —
+ * and as of Phase 6 the dev-only `OWENWORK_TOKEN` override is no longer
+ * inherited by the harness child either. Both adapters filter it out through
+ * `filterOwenworkEnv` (`src/harness/child-env.ts`), an allowlist scoped to the
+ * `OWENWORK_*` namespace ONLY, so nothing a harness needs in order to start —
+ * `PATH`, `HOME`, `NODE_OPTIONS`, a proxy setting, a vendor's own credential
+ * variable — can be stranded by it.
+ *
+ * The consequence lands in this file: because the child cannot see the override,
+ * THIS ROLE IGNORES IT TOO, so runner and child authenticate as the same
+ * principal. See the block around the `resolveBearer` call. `resolveBearer`
+ * itself is unchanged and every other role still honours the override.
+ *
+ * Phase 4's narrower guarantee still holds and is still asserted: the rejection
+ * delta and the replay brief carry no credential material
+ * (`test/agent-rejection.test.ts`).
+ *
+ * ── WHERE THE STEP AGENT WORKS (Phase 4) ──
+ *
+ * `OrderPacket.workdir` (the hub's choice) > `<workRoot>/<workflow>/<run>/` >
+ * this process's cwd. The middle rung is new: see `src/agent/workdir.ts` for the
+ * per-RUN layout and the reaper that removes it.
+ */
+// ── The composition root, imported for its side effect ──────────────────────
+//
+// PHASE 6: this file used to carry the adapter imports itself, and so did
+// `src/roles/lint.ts` — two roots whose import ORDER had to be kept identical by
+// hand, because the first id registered is the default harness. Both now import
+// the single root, `src/harnesses.ts`, which owns that order. Without this line
+// nothing is registered and every run fails with `'no-harness'`.
+import '../harnesses.ts';
+// ─────────────────────────────────────────────────────────────────────────────
+import { hostname } from 'node:os';
+
+import { readDispatchBundle, readStepSpec, resolveCacheDir } from '../bundle/cache.ts';
+import { createAgentRunLoop, type AdapterResolution, type AgentRunOutcome } from '../agent/loop.ts';
+import type { NormalizedStepSpec } from '../bundle/types.ts';
+import { createHubClient, type HubClient } from '../hub/client.ts';
+import { resolveBearer } from '../credentials/resolve.ts';
+import { loadSettings } from '../settings/settings.ts';
+import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/registry.ts';
+import { appendSession, latestFor, sessionsPath, type SessionRecord } from '../harness/session-store.ts';
+import { ensureWorkDir, resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
+import type { ContactHolder, OrderPacket } from '../hub/types.ts';
+import { resolveConductorId, resolveTarget } from './hold.ts';
+import { installSignalHandlers, type SignalHost } from './signals.ts';
+
+const DEFAULT_INTERVAL_MS = 60_000;
+
+interface ParsedArgs {
+  orderId?: string;
+  workflow?: string;
+  origin?: string;
+  conductor?: string;
+  harness?: string;
+  heartbeatIntervalMs?: number;
+  jumpToleranceMs?: number;
+  submitGraceMs?: number;
+  confirmIntervalMs?: number;
+  error?: string;
+}
+
+/** Positive-integer flag parse shared by the four ms knobs. */
+function positiveMs(name: string, raw: string): { value: number } | { error: string } {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    return { error: `${name} must be a positive integer, got '${raw}'` };
+  }
+  return { value: n };
+}
+
+/**
+ * Parse the positional `<order-id>` plus `--workflow`/`--origin`/`--conductor`/
+ * `--harness`/`--heartbeat-interval`/`--jump-tolerance`/`--submit-grace`/
+ * `--confirm-interval`. Supports `--flag value` and `--flag=value`; a second
+ * positional or an unknown flag is an error. Mirrors `src/roles/exec.ts`.
+ */
+export function parseArgs(args: string[]): ParsedArgs {
+  const parsed: ParsedArgs = {};
+  const takeValue = (a: string, i: number): { value: string; next: number } | { error: string } => {
+    const eq = a.indexOf('=');
+    if (eq !== -1) return { value: a.slice(eq + 1), next: i };
+    const v = args[i + 1];
+    if (v === undefined) return { error: `missing value for ${a}` };
+    return { value: v, next: i + 1 };
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (!a.startsWith('-')) {
+      if (parsed.orderId !== undefined) return { error: `unexpected extra argument '${a}'` };
+      parsed.orderId = a;
+      continue;
+    }
+    const name = a.startsWith('--') && a.includes('=') ? a.slice(0, a.indexOf('=')) : a;
+    switch (name) {
+      case '--workflow':
+      case '--origin':
+      case '--conductor':
+      case '--harness':
+      case '--heartbeat-interval':
+      case '--jump-tolerance':
+      case '--submit-grace':
+      case '--confirm-interval': {
+        const r = takeValue(a, i);
+        if ('error' in r) return { error: r.error };
+        i = r.next;
+        if (name === '--workflow') parsed.workflow = r.value;
+        else if (name === '--origin') parsed.origin = r.value;
+        else if (name === '--conductor') parsed.conductor = r.value;
+        else if (name === '--harness') parsed.harness = r.value;
+        else {
+          const n = positiveMs(name, r.value);
+          if ('error' in n) return { error: n.error };
+          if (name === '--heartbeat-interval') parsed.heartbeatIntervalMs = n.value;
+          else if (name === '--jump-tolerance') parsed.jumpToleranceMs = n.value;
+          else if (name === '--submit-grace') parsed.submitGraceMs = n.value;
+          else parsed.confirmIntervalMs = n.value;
+        }
+        break;
+      }
+      default:
+        return { error: `unknown option '${a}'` };
+    }
+  }
+  return parsed;
+}
+
+function usage(): void {
+  process.stderr.write(
+    'usage: owenloop work agent-run <workflow>/<run> [--origin <url>] [--harness <id>] [--conductor <id>]\n' +
+      '                         [--heartbeat-interval <ms>] [--jump-tolerance <ms>]\n' +
+      '                         [--submit-grace <ms>] [--confirm-interval <ms>]\n' +
+      '   or: owenloop work agent-run <run> --workflow <wf> [...]\n',
+  );
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Map the loop's outcome onto the process exit code (see usage.ts). */
+export function exitCodeFor(outcome: AgentRunOutcome): number {
+  switch (outcome) {
+    case 'submitted':
+    case 'completed':
+      return 0;
+    case 'misroute':
+    case 'no-template':
+    case 'no-harness':
+    case 'no-submit':
+    case 'killed':
+    case 'lease-lost':
+    case 'ownership-error':
+    case 'hub-unreachable':
+    case 'stopped':
+      return 1;
+  }
+}
+
+/**
+ * Injectable process-boundary deps for `run` — defaulting to the real ones, so
+ * the role wiring (holder tag, adapter resolution, signal handlers, outcome
+ * mapping) is testable without spawning a harness, signaling the test process,
+ * or reaching a real hub.
+ */
+export interface RunDeps {
+  signalHost?: SignalHost;
+  hub?: HubClient;
+  out?: (line: string) => void;
+  err?: (line: string) => void;
+  /** cwd for an order that carries no `workdir` (default `process.cwd()`). */
+  cwd?: string;
+  /**
+   * Holder id override (default `<hostname>:<pid>`) — pinned in tests. Injecting
+   * `hub` also skips credential resolution entirely, so a test needs no
+   * owenloop credential store on disk.
+   */
+  holderId?: string;
+}
+
+/**
+ * Import the module named by `OWENWORK_HARNESS_MODULE`, if any, so its
+ * `register(...)` side effect fires before adapter resolution.
+ *
+ * TEST SEAM. Phase 4 filled the composition root's static import block above
+ * with the real adapters, so production no longer needs this to have ANY
+ * adapter at all. What it still buys is the ability for a drill to register a
+ * FAKE adapter inside a real spawned child without the child reaching for a
+ * real CLI. Production leaves the variable unset and this is a no-op. Drills
+ * that use it also pin `OWENWORK_HARNESS=fake`, because the statically
+ * imported real adapters now occupy the front of the registry and would
+ * otherwise win the `defaultHarnessId()` tie-break. A failed import is
+ * reported and then ignored — resolution proceeds and fails honestly with
+ * `'no-harness'` if nothing ended up registered.
+ */
+async function loadHarnessModule(spec: string | undefined, err: (line: string) => void): Promise<void> {
+  if (spec === undefined || spec.trim() === '') return;
+  try {
+    await import(spec);
+  } catch (e) {
+    err(`owenloop work agent-run: could not load OWENWORK_HARNESS_MODULE '${spec}': ${errMsg(e)}`);
+  }
+}
+
+export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
+  const out = deps.out ?? ((line: string): void => void process.stdout.write(`${line}\n`));
+  const err = deps.err ?? ((line: string): void => void process.stderr.write(`${line}\n`));
+  const parsed = parseArgs(args);
+  if (parsed.error !== undefined) {
+    err(`owenloop work agent-run: ${parsed.error}`);
+    usage();
+    return 2;
+  }
+  if (parsed.orderId === undefined || parsed.orderId === '') {
+    err('owenloop work agent-run: missing required <order-id>');
+    usage();
+    return 2;
+  }
+
+  const target = resolveTarget(parsed.orderId, parsed.workflow);
+  if ('error' in target) {
+    err(`owenloop work agent-run: ${target.error}`);
+    usage();
+    return 2;
+  }
+
+  const env = process.env;
+  let settings;
+  try {
+    settings = loadSettings(env);
+  } catch (e) {
+    err(`owenloop work agent-run: ${errMsg(e)}`);
+    return 1;
+  }
+
+  const origin = parsed.origin ?? settings.hubOrigin;
+  if (origin === undefined || origin.trim() === '') {
+    err('owenloop work agent-run: no hub origin — pass --origin <url> or set hubOrigin in settings');
+    return 2;
+  }
+
+  let cacheDir: string;
+  try {
+    cacheDir = resolveCacheDir(env, settings.cacheDir);
+  } catch (e) {
+    err(`owenloop work agent-run: ${errMsg(e)}`);
+    return 1;
+  }
+
+  // D10, CLOSED in Phase 6 (see the header). The dev-only bearer override is no
+  // longer passed to harness children: `filterOwenworkEnv` denies it in both
+  // adapters, because a harness child is an ordinary process that inherits this
+  // environment and at least one harness persists its start parameters to disk.
+  //
+  // THIS BLOCK IS THE OTHER HALF OF THAT CHANGE, and the two must stay together.
+  // If the runner kept honouring the override while the child could not see it,
+  // the two sides would authenticate as different principals: the runner with
+  // the override, the child falling back to its `agent:<account>` credential
+  // slot. An empty slot would then surface mid-order as an opaque MCP handshake
+  // failure, long after startup. So `agent-run` ignores the override too. Both
+  // sides now read the same slot, and an empty slot fails at STARTUP through
+  // `resolveBearer`'s existing exit-code-2 refusal, whose message names the
+  // login command to run.
+  //
+  // SCOPE: this file only. `resolveBearer` is unchanged and every other role
+  // keeps the override — `agent-run` is the one role that spawns a harness.
+  const runnerEnv = { ...env };
+  if ((runnerEnv['OWENWORK_TOKEN'] ?? '') !== '') {
+    delete runnerEnv['OWENWORK_TOKEN'];
+    err(
+      'owenloop work agent-run: OWENWORK_TOKEN is set and is being IGNORED here. The dev-only ' +
+        'bearer override is not passed to harness children, so honouring it would ' +
+        'authenticate the runner and the harness child as different principals. ' +
+        'Authenticate the account instead: `owenloop login --hub <origin> --as agent:<account>`.',
+    );
+  }
+
+  const account = runnerEnv['OWENWORK_ACCOUNT'] ?? 'default';
+  let hub = deps.hub;
+  if (hub === undefined) {
+    const bearer = await resolveBearer({ origin, account, env: runnerEnv });
+    if (!bearer.ok) {
+      err(`owenloop work agent-run: ${bearer.message}`);
+      return bearer.code;
+    }
+    const token = bearer.token;
+    hub = createHubClient({ origin, getToken: async () => token });
+  }
+  const client = hub;
+
+  await loadHarnessModule(env['OWENWORK_HARNESS_MODULE'], err);
+
+  const conductorId = resolveConductorId(parsed.conductor, env);
+  const holder: ContactHolder = {
+    kind: 'exec',
+    id: deps.holderId ?? `${hostname()}:${process.pid}`,
+    ...(conductorId !== undefined ? { conductorId } : {}),
+  };
+
+  /**
+   * Adapter id precedence: `--harness` > `OWENWORK_HARNESS` > the step def's
+   * `harness` field > the first registered adapter. Every rank is a plain
+   * string comparison — nothing here knows what any id MEANS.
+   */
+  const envHarness = env['OWENWORK_HARNESS'];
+  const resolveAdapter = (stepHarness: string | undefined): AdapterResolution => {
+    const id =
+      (parsed.harness !== undefined && parsed.harness !== '' ? parsed.harness : undefined) ??
+      (envHarness !== undefined && envHarness !== '' ? envHarness : undefined) ??
+      (stepHarness !== undefined && stepHarness !== '' ? stepHarness : undefined) ??
+      defaultHarnessId() ??
+      '';
+    const adapter = id !== '' ? adapterFor(id) : undefined;
+    return {
+      id: id !== '' ? id : '<none>',
+      ...(adapter !== undefined ? { adapter } : {}),
+      registered: registeredHarnessIds(),
+    };
+  };
+
+  /** Resolve the def name off the hub, then the cached step spec for the step. */
+  const loadStep = async (order: OrderPacket): Promise<NormalizedStepSpec | null> => {
+    const res = await client.whatsNext({ workflow: target.workflow });
+    const defName = res.def;
+    if (defName === undefined || defName === '') {
+      err(`owenloop work agent-run: whats_next reported no def for workflow '${target.workflow}'`);
+      return null;
+    }
+    const dispatch = readDispatchBundle(cacheDir, defName);
+    if (dispatch.warning !== undefined) err(`owenloop work agent-run: ${dispatch.warning}`);
+    if (dispatch.bundle === null) {
+      err(`owenloop work agent-run: no cached bundle for def '${defName}' — run \`owenloop work prepare ${defName}\``);
+      return null;
+    }
+    const spec = readStepSpec(cacheDir, defName, dispatch.bundle.def.hash, order.step);
+    if (spec === null) {
+      err(
+        `owenloop work agent-run: no step spec for '${order.step}' at ${dispatch.bundle.def.hash} — ` +
+          `re-run \`owenloop work prepare ${defName}\``,
+      );
+      return null;
+    }
+    return spec;
+  };
+
+  /**
+   * The session-store sink. `appendSession` PROPAGATES fs failures by design
+   * (see `src/harness/session-store.ts`), but the store is a resume convenience,
+   * not the lease — a full disk must not abort a run that is otherwise doing its
+   * job. So the role swallows the failure here, after reporting it, and the loop
+   * carries on. The lease, not this file, remains the record of truth.
+   */
+  const sessionsFile = sessionsPath(cacheDir);
+  const writeSession = (rec: SessionRecord): void => {
+    try {
+      appendSession(sessionsFile, rec, { warn: err });
+    } catch (e) {
+      err(`owenloop work agent-run: could not record the session in ${sessionsFile}: ${errMsg(e)}`);
+    }
+  };
+
+  /**
+   * PHASE 4 — where the step agent works when the hub supplies no `workdir`.
+   *
+   * Precedence, highest first:
+   *  1. `deps.cwd` — the test seam. An injected cwd is an explicit instruction
+   *     and must not be second-guessed by a settings key.
+   *  2. `<workRoot>/<workflow>/<run>/`, created here.
+   *  3. `process.cwd()`, if creating that directory fails.
+   *
+   * `OrderPacket.workdir` outranks all three, but it lives on the packet, which
+   * this role never sees — `src/agent/loop.ts` applies it over whatever is
+   * passed here.
+   *
+   * Created EAGERLY, before the first order arrives, because the loop takes a
+   * plain `cwd: string` and turning it into a thunk would push a filesystem
+   * concern into the pure orchestration core. The cost of being early is one
+   * empty directory for a run whose packets all carry a hub `workdir`; the
+   * reaper removes it on the same terms as any other.
+   */
+  let workCwd = deps.cwd ?? process.cwd();
+  if (deps.cwd === undefined) {
+    const workRoot = resolveWorkRoot(env, settings.workRoot, cacheDir);
+    const workRepo = resolveWorkRepo(env, settings.workRepo);
+    try {
+      workCwd = ensureWorkDir({
+        workRoot,
+        workflow: target.workflow,
+        run: target.run,
+        ...(workRepo !== undefined ? { workRepo } : {}),
+        err,
+      });
+    } catch (e) {
+      err(
+        `owenloop work agent-run: could not create a work directory under ${workRoot}: ${errMsg(e)} — ` +
+          `falling back to ${workCwd}`,
+      );
+    }
+  }
+
+  const loop = createAgentRunLoop({
+    hub: client,
+    workflow: target.workflow,
+    run: target.run,
+    holder,
+    origin,
+    account,
+    ...(conductorId !== undefined ? { conductorId } : {}),
+    cwd: workCwd,
+    loadStep,
+    resolveAdapter,
+    appendSession: writeSession,
+    nextAttempt: (workflow, run, step) => {
+      const prev = latestFor(sessionsFile, workflow, run, step);
+      return prev === null ? 1 : prev.attempt + 1;
+    },
+    // PHASE 4: the same reader `nextAttempt` uses, handed to the loop whole so
+    // it can decide resume vs cold replay. Reads only; the loop is what writes.
+    latestSession: (workflow, run, step) => latestFor(sessionsFile, workflow, run, step),
+    sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+    now: () => Date.now(),
+    out,
+    err,
+    heartbeatIntervalMs: parsed.heartbeatIntervalMs ?? DEFAULT_INTERVAL_MS,
+    // Test affordances only: each exposes an existing knob (defaults unchanged)
+    // so a drill can provoke a clock jump or a short confirm without waiting.
+    ...(parsed.jumpToleranceMs !== undefined ? { jumpToleranceMs: parsed.jumpToleranceMs } : {}),
+    ...(parsed.submitGraceMs !== undefined ? { submitGraceMs: parsed.submitGraceMs } : {}),
+    ...(parsed.confirmIntervalMs !== undefined ? { confirmIntervalMs: parsed.confirmIntervalMs } : {}),
+  });
+
+  installSignalHandlers(loop, deps.signalHost ?? process, err, {
+    role: 'agent-run',
+    drainNote: 'stopping the step agent and releasing the order',
+    stopReason: 'signal',
+  });
+
+  const outcome = await loop.run();
+  return exitCodeFor(outcome);
+}

@@ -3,12 +3,12 @@
   "compilerOptions": {
     "noEmit": false,
     "outDir": "dist",
-    "rootDir": "src",
+    "rootDir": ".",
     "declaration": true,
     "declarationMap": false,
     "sourceMap": false,
     "rewriteRelativeImportExtensions": true,
     "stripInternal": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "packages/work/src/**/*.ts"]
 }
