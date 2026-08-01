@@ -29,7 +29,9 @@ import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import { readChildRecords } from '../src/proxy/state.ts';
 import { readSessions, sessionsPath } from '../src/harness/session-store.ts';
 import type { OrderPacket, WorkOrder } from '../src/hub/types.ts';
-import { callTool, handshake, spawnMcp, startMockHub, until, type McpChild } from './helpers/mcp-stdio-client.ts';
+import { startMockHub, until } from './helpers/mcp-stdio-client.ts';
+import { isShiftError } from '../src/shift/protocol.ts';
+import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
 import { fixtureEnv, seedCredentialStore } from './helpers/credential-fixture.ts';
 
 const DEMO_HASH = 'abcdef1234567890';
@@ -79,10 +81,10 @@ function traceCalls(): Array<Record<string, unknown>> {
     .map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
-function spawnProxy(origin: string): McpChild {
-  return spawnMcp(
+function spawnDaemon(origin: string): ShiftChild {
+  return spawnShift(
     [
-      'proxy', '--mcp', '--origin', origin, '--workflow', 'wf1', '--cap', '3',
+      'crew-a', '--origin', origin, '--cap', '3',
       '--poll-interval', '25',
       '--state-dir', stateDir,
     ],
@@ -106,11 +108,12 @@ function spawnProxy(origin: string): McpChild {
 test('SIGTERM to a runner mid-turn tears the harness session down and releases the order', async () => {
   seedCache();
   let wakes = 0;
-  const { origin, reqs, server } = await startMockHub((verb) => {
+  const { origin, reqs, server } = await startMockHub((verb, body) => {
     switch (verb) {
       case 'wake':
         return { text: '', cursor: 1, changed: wakes++ === 0 };
       case 'whats_next':
+        if (body?.workflow === undefined) return { text: '', instances: [{ workflow: 'wf1' }] };
         return { text: '', workflow: 'wf1', def: 'demo', orders: [ORDER] };
       case 'presence_ping':
         return { text: '', ok: true, name: 'p', lastSeen: 1 };
@@ -126,15 +129,15 @@ test('SIGTERM to a runner mid-turn tears the harness session down and releases t
     }
   });
   seedCredentialStore(home, origin);
-  const mcp = spawnProxy(origin);
+  const daemon = spawnDaemon(origin);
   let pid = 0;
   try {
-    await handshake(mcp);
-    const parked = callTool(mcp, 'whats_next', { wait_ms: 3_000 });
+    await daemon.ready;
+    const parked = daemon.request({ op: 'next', wait_ms: 3_000 });
 
     await until(
       () => readChildRecords(stateDir).length === 1,
-      `the agent-run child record; stderr:\n${mcp.stderr()}`,
+      `the agent-run child record; stderr:\n${daemon.stderr()}`,
     );
     pid = readChildRecords(stateDir)[0]!.pid;
 
@@ -161,12 +164,13 @@ test('SIGTERM to a runner mid-turn tears the harness session down and releases t
     assert.equal(sessions.some((s) => s.status === 'submitted'), false, 'a kill is never a submit');
     assert.equal(sessions[0]!.harness, 'fake');
 
-    await parked;
-    mcp.endStdin();
-    assert.equal(await mcp.exited, 0, `exit 0 on transport EOF, stderr:\n${mcp.stderr()}`);
+    const next = await parked;
+    assert.equal(isShiftError(next), false, `next failed: ${JSON.stringify(next)}`);
+    await daemon.request({ op: 'end' });
+    assert.equal(await daemon.exited, 0, `exit 0 after end, stderr:\n${daemon.stderr()}`);
   } finally {
     server.close();
-    mcp.child.kill('SIGKILL');
+    daemon.child.kill('SIGKILL');
     for (const r of readChildRecords(stateDir)) {
       try {
         process.kill(r.pid, 'SIGKILL');

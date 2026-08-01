@@ -195,3 +195,11 @@ test('default fetch path works end to end against a real node:http server', asyn
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+test('presencePing forwards attended_at using the exact snake_case wire field', async () => {
+  const captured: Captured[] = [];
+  const c = client(fakeFetch(captured, { body: { text: 'presence recorded', ok: true, name: 'box', lastSeen: 123 } }));
+  await c.presencePing({ name: 'box', serve_pools: [], attended_at: 456789 });
+  assert.deepEqual(captured[0]!.body, { name: 'box', serve_pools: [], attended_at: 456789 });
+  assert.equal((captured[0]!.body as Record<string, unknown>)['attendedAt'], undefined);
+});

@@ -37,9 +37,6 @@ Options:
       --workflow <id>            poll only this instance (default: inbox — all)
       --poll-interval <ms>       wake poll cadence (default 5000)
       --once                     bootstrap wake + one sweep, then exit (demo/e2e)
-      --mcp                      run as a stdio-MCP server instead of a self-driven
-                                 park: tools whats_next / set_dispatch_cap / submit
-                                 (mutually exclusive with --once)
       --max-agents <n>           max in-flight agent-run children, separate from
                                  --cap (default 4; else settings.maxConcurrentAgents)
       --cache-dir/--state-dir <p>   override the resolved dirs

@@ -1,8 +1,8 @@
 /**
  * DRILL 6 — pool isolation across two concurrent conductors (WO-6.2, M4).
  *
- * The M4 multi-principal property: two real `owenloop work proxy --mcp` conductors,
- * each serving a DIFFERENT pool (`--serve-pools A` vs `B`) and authenticating
+ * The M4 multi-principal property: two real `owenloop shift start` conductors,
+ * each serving a DIFFERENT pool (`A` vs `B`) and authenticating
  * with a DIFFERENT stored-credential account (`--as a` vs `b`, no
  * `OWENWORK_TOKEN`), park against ONE mock hub over ONE split run (`wf1/run1`,
  * step `alpha` on pool A + step `beta` on pool B). We assert each conductor
@@ -43,7 +43,9 @@ import { readChildRecords } from '../src/proxy/state.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import type { WorkOrder } from '../src/hub/types.ts';
-import { callTool, handshake, spawnMcp, startMockHub, type McpChild } from './helpers/mcp-stdio-client.ts';
+import { startMockHub } from './helpers/mcp-stdio-client.ts';
+import { isShiftError } from '../src/shift/protocol.ts';
+import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
 import {
   fixtureEnv,
   seedCredentialStore,
@@ -117,11 +119,11 @@ function seedCache(cacheDir: string): void {
   writeBundle(cacheDir, bundle, specs);
 }
 
-function spawnConductor(c: Conductor, origin: string, account: string, pool: string): McpChild {
-  return spawnMcp(
+function spawnConductor(c: Conductor, origin: string, account: string, pool: string): ShiftChild {
+  return spawnShift(
     [
-      'proxy', '--mcp', '--origin', origin, '--workflow', 'wf1',
-      '--as', account, '--serve-pools', pool,
+      pool, '--origin', origin,
+      '--as', account,
       '--cap', '3', '--poll-interval', '25',
       '--cache-dir', c.cacheDir, '--state-dir', c.stateDir,
     ],
@@ -160,6 +162,9 @@ test('two conductors on different pools + accounts split one run cleanly — eac
       case 'presence_ping':
         return { text: '', ok: true, name: 'p', lastSeen: 1 };
       case 'whats_next': {
+        // Public shift startup has no --workflow flag. The first inbox sweep
+        // discovers wf1; the second request carries the configured pool scope.
+        if (body?.workflow === undefined) return { text: '', instances: [{ workflow: 'wf1' }] };
         const pools = (body?.serve_pools as string[] | undefined) ?? [];
         const orders: WorkOrder[] = [];
         if (pools.includes('A')) orders.push(ALPHA);
@@ -181,23 +186,21 @@ test('two conductors on different pools + accounts split one run cleanly — eac
   const ca = spawnConductor(a, origin, POOL_A_ACCOUNT, 'A');
   const cb = spawnConductor(b, origin, POOL_B_ACCOUNT, 'B');
   try {
-    await Promise.all([handshake(ca), handshake(cb)]);
+    await Promise.all([ca.ready, cb.ready]);
 
-    // Drive both concurrently. Each park sweeps once and returns on its first
-    // non-empty batch — the hub always has each pool's order ready.
+    // Drive both concurrently. Each socket park sweeps once and returns on its
+    // first non-empty batch — the hub always has each pool's order ready.
     const [ra, rb] = await Promise.all([
-      callTool(ca, 'whats_next', { wait_ms: 5_000 }),
-      callTool(cb, 'whats_next', { wait_ms: 5_000 }),
+      ca.request({ op: 'next', wait_ms: 5_000 }),
+      cb.request({ op: 'next', wait_ms: 5_000 }),
     ]);
 
     // (1) Both sweeps succeeded and each reports its LOCAL capacity view. Since
     // Phase 5 every order — command or agent — is run in a detached child, so
-    // `whats_next` hands back no order handles at all; dispatch evidence lives
-    // on disk, in (2).
-    assert.equal(ra.isError, false, `A whats_next failed: ${JSON.stringify(ra.body)}; stderr:\n${ca.stderr()}`);
-    assert.equal(rb.isError, false, `B whats_next failed: ${JSON.stringify(rb.body)}; stderr:\n${cb.stderr()}`);
-    assert.equal(ra.body.orders, undefined, 'no lean orders are returned any more');
-    assert.equal(rb.body.orders, undefined, 'no lean orders are returned any more');
+    // `next` returns no order handles at all; dispatch evidence lives on disk.
+    assert.equal(isShiftError(ra), false, `A next failed: ${JSON.stringify(ra)}; stderr:\n${ca.stderr()}`);
+    assert.equal(isShiftError(rb), false, `B next failed: ${JSON.stringify(rb)}; stderr:\n${cb.stderr()}`);
+    if (isShiftError(ra) || isShiftError(rb)) throw new Error('unexpected shift error');
 
     // (2) On-disk dispatch evidence: each conductor's OWN state dir records
     // exactly one detached `agent-run` child, for its OWN pool's step of the
@@ -255,10 +258,12 @@ test('two conductors on different pools + accounts split one run cleanly — eac
       'B rode a serve_pools whats_next on the wire',
     );
 
-    ca.endStdin();
-    cb.endStdin();
-    assert.equal(await ca.exited, 0, `A exits 0 on EOF, stderr:\n${ca.stderr()}`);
-    assert.equal(await cb.exited, 0, `B exits 0 on EOF, stderr:\n${cb.stderr()}`);
+    assert.ok('events' in ra && Array.isArray(ra.events), 'A next returns the event queue shape');
+    assert.ok('events' in rb && Array.isArray(rb.events), 'B next returns the event queue shape');
+
+    await Promise.all([ca.request({ op: 'end' }), cb.request({ op: 'end' })]);
+    assert.equal(await ca.exited, 0, `A exits 0 after end, stderr:\n${ca.stderr()}`);
+    assert.equal(await cb.exited, 0, `B exits 0 after end, stderr:\n${cb.stderr()}`);
   } finally {
     server.close();
     ca.child.kill('SIGKILL');

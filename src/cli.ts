@@ -556,6 +556,7 @@ Commands:
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   work <subcommand> [args]                run execution-side proxy/hold/exec/agent-run/... commands
+  shift start|next|status|end [args]      run and attend a local Unix-socket shift daemon
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided] [--strict-inputs]
                                          bounded reachability check (stall states, true deadlocks, stuck, dead steps, declared invariants)
@@ -652,6 +653,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['doctor', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
   ['work', cmdOpts()],
+  ['shift', cmdOpts('all', 'origin', 'as', 'name', 'cap', 'max-agents', 'poll-interval', 'once', 'cache-dir', 'state-dir', 'wait')],
   ['lint', cmdOpts()],
   ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided', 'strict-inputs')],
   ['create', cmdOpts('title', 'provide', 'param')],
@@ -4171,17 +4173,21 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'binding', 'pool', 'setup', 'doctor', 'mcp']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'binding', 'pool', 'setup', 'doctor', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
-  // Delegate the entire execution-side argv tail before root parsing. Work roles
-  // own their option grammar, including repeated/value forms that the engine
-  // parser must not consume. The dynamic import is also the cold-start boundary:
-  // ordinary root commands never evaluate the work dispatcher or its adapters.
-  if (argv[0] === 'work') {
+  // Delegate execution-side and shift argv tails before root parsing. Their
+  // roles own their option grammars, including repeated/value forms that the
+  // engine parser must not consume. These dynamic imports are cold-start
+  // boundaries: ordinary root commands never evaluate execution adapters.
+  if (argv[0] === 'work' || argv[0] === 'shift') {
     try {
-      const { mainAsync: runWork } = await import('../packages/work/src/main.ts');
-      return await runWork(argv.slice(1));
+      if (argv[0] === 'work') {
+        const { mainAsync: runWork } = await import('../packages/work/src/main.ts');
+        return await runWork(argv.slice(1));
+      }
+      const { run: runShift } = await import('../packages/work/src/roles/shift.ts');
+      return await runShift(argv.slice(1));
     } catch (e) {
       io.err(`error: ${(e as Error).message}`);
       return 1;
@@ -4233,10 +4239,10 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
   }
 }
 
-/** Run the synchronous engine CLI. The `work` namespace is async-only. */
+/** Run the synchronous engine CLI. The `work` and `shift` namespaces are async-only. */
 export function main(argv: string[], io: CliIO = defaultIO()): number {
-  if (argv[0] === 'work') {
-    io.err('error: owenloop work requires the async entry point');
+  if (argv[0] === 'work' || argv[0] === 'shift') {
+    io.err(`error: owenloop ${argv[0]} requires the async entry point`);
     return 1;
   }
   const args = parseArgs(argv);
