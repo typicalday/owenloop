@@ -18,6 +18,8 @@ function childEnv(dir: string, trace: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
     HOME: dir,
+    XDG_CONFIG_HOME: join(dir, 'config'),
+    NODE_OPTIONS: '',
     OWENLOOP_DB: join(dir, 'state.db'),
     OWENLOOP_DEFS: join(dir, 'defs'),
     OWENLOOP_SDK_TRACE: trace,
@@ -61,7 +63,7 @@ test('the loader trace detects an explicit model SDK import', () => {
   const child = spawnSync(
     process.execPath,
     ['--loader', LOADER, '--input-type=module', '--eval', "await import('@anthropic-ai/claude-agent-sdk')"],
-    { cwd: ROOT, env: { ...process.env, OWENLOOP_SDK_TRACE: trace }, encoding: 'utf8' },
+    { cwd: ROOT, env: childEnv(dir, trace), encoding: 'utf8' },
   );
   assert.equal(child.status, 0, `explicit SDK import failed: ${child.stderr}`);
   assert.match(traceFor(trace), /@anthropic-ai\/claude-agent-sdk/);
