@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { kcHuman, kcKey, makeIdentityHub, makeIo, routedFetch } from './hubkit.ts';
-import { owenworkSettingsPath } from '../src/owenwork.ts';
+import { owenworkSettingsPath } from '../src/work-settings.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';

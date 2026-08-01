@@ -1,0 +1,115 @@
+/**
+ * PHASE 6, ITEMS 3 + 5 — the `OWENWORK_*` namespace allowlist for harness
+ * children. Vendor-neutral by construction: this module names no harness and no
+ * vendor, only owenwork's own environment variables.
+ *
+ * ── WHAT THE FILTER DOES, EXACTLY ────────────────────────────────────────────
+ *
+ * It applies to variables whose name begins with `OWENWORK_`, and to NOTHING
+ * else. Within that namespace only the names in `ADMITTED_OWENWORK_KEYS` are
+ * passed to a harness child; every other `OWENWORK_*` name is removed. Every
+ * variable OUTSIDE the namespace — `PATH`, `HOME`, `TMPDIR`, `LANG`,
+ * `SSL_CERT_FILE`, corporate proxy variables, `NODE_OPTIONS`, each vendor's own
+ * credential and configuration variables — passes through untouched.
+ *
+ * ── WHY THE SCOPE IS THE NAMESPACE AND NOT THE WHOLE ENVIRONMENT ─────────────
+ *
+ * Two requirements pull in opposite directions on one mechanism:
+ *
+ *   ITEM 5 wants owenwork's dev-only hub bearer override to stop reaching
+ *   harness children. A harness child is an ordinary process that inherits its
+ *   parent's environment, and at least one harness demonstrably persists its
+ *   start parameters to disk, so credential material in that environment has a
+ *   real path to a file on the operator's machine.
+ *
+ *   ITEM 3 wants a harness's own OAuth credential variable to KEEP reaching its
+ *   child, because under launchd the Keychain read can fail and that variable is
+ *   the fallback credential path. A stranded credential is a harness that cannot
+ *   start at all.
+ *
+ * A conventional allowlist — "the child gets only the names on this list" —
+ * satisfies both only if the list is exhaustive over everything every vendor
+ * binary needs in order to start. That set is unknowable, and it grows with each
+ * vendor release. Scoping the allowlist to owenwork's OWN namespace makes the
+ * two requirements independent rather than opposed:
+ *
+ *  - owenwork knows every name in the `OWENWORK_*` namespace and every consumer
+ *    of every name. That is exactly the knowledge a precise allowlist needs, and
+ *    exactly the knowledge owenwork does not have about `PATH` or about a
+ *    vendor's variables.
+ *  - No vendor credential variable is in the namespace, so no vendor credential
+ *    can be stranded — not by oversight, not by a later edit. Structurally.
+ *  - It is still deny-by-default WITHIN the namespace, so an `OWENWORK_*`
+ *    variable added by some future phase does not silently start flowing to
+ *    harness children. Adding one to this set is a deliberate, reviewable act.
+ *
+ * ── HOW THE ADMITTED SET WAS DERIVED, AND HOW TO RE-DERIVE IT ────────────────
+ *
+ * The only owenwork process a harness child spawns is the work-holder MCP mount
+ * (`owenloop work hold --mcp`), whose argv is built by `src/agent/brief.ts`. Walking
+ * the import graph from `src/roles/hold.ts` and collecting every `env['OWENWORK_*']`
+ * read yields exactly three names: `OWENWORK_CONDUCTOR_ID` and `OWENWORK_SESSION`
+ * (both in `src/roles/hold.ts`), and `OWENWORK_TOKEN` (in
+ * `src/credentials/resolve.ts`), which is DENIED on purpose — see below.
+ *
+ * `OWENWORK_CACHE_DIR` is admitted although it is NOT reachable from `hold`: it
+ * is read by `resolveCacheDir` (`src/bundle/cache.ts`), which an agent reaches
+ * when its own work runs an owenwork subcommand that touches the bundle cache.
+ * It is a directory path, not credential material, and admitting it keeps the
+ * runner and anything the agent runs pointed at the same cache.
+ *
+ * ── THE ONE DENIAL WITH A DELIBERATE CONSEQUENCE ─────────────────────────────
+ *
+ * `OWENWORK_TOKEN` is denied, and it IS reachable from `hold`. Left alone that
+ * would split the two sides apart: the runner would authenticate to the hub with
+ * the override while the child fell back to its credential slot, and an empty
+ * slot would surface mid-order as a confusing MCP handshake failure. So
+ * `src/roles/agent-run.ts` also ignores `OWENWORK_TOKEN` when resolving its own
+ * bearer. Runner and child then agree, and the failure moves to startup, where
+ * `resolveBearer` already refuses with exit code 2 and an actionable message.
+ */
+
+/**
+ * The `OWENWORK_*` names a harness child may see. Everything else in the
+ * namespace is removed; everything outside the namespace is untouched.
+ *
+ * Each entry needs a named consumer that a harness child can actually reach. An
+ * entry with no such consumer is a leak with a comment on it.
+ */
+export const ADMITTED_OWENWORK_KEYS: ReadonlySet<string> = new Set([
+  // `resolveCacheDir` — src/bundle/cache.ts. Keeps anything the agent runs on
+  // the same bundle cache as the runner. A path, not a secret.
+  'OWENWORK_CACHE_DIR',
+  // `holdConductorId` — src/roles/hold.ts. The fallback when `--conductor=` is
+  // absent from the mount's argv.
+  'OWENWORK_CONDUCTOR_ID',
+  // `holdSession` — src/roles/hold.ts. The fallback when `--session` is absent.
+  'OWENWORK_SESSION',
+]);
+
+/** The namespace this filter governs. Nothing outside it is ever touched. */
+const NAMESPACE = 'OWENWORK_';
+
+/**
+ * A copy of `source` with every non-admitted `OWENWORK_*` key removed.
+ *
+ * `source` is a parameter rather than a read of `process.env` so callers and
+ * tests can inject a fixture; the input is never mutated. Keys are `delete`d
+ * rather than set to `undefined`, because an own key holding `undefined` is not
+ * obviously equivalent to an absent key once it crosses a spawn or
+ * serialization boundary.
+ */
+export function filterOwenworkEnv(
+  source: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  const result: Record<string, string | undefined> = { ...source };
+  for (const key of Object.keys(result)) {
+    if (key.startsWith(NAMESPACE) && !ADMITTED_OWENWORK_KEYS.has(key)) delete result[key];
+  }
+  return result;
+}
+
+/** Whether one variable name may reach a harness child. */
+export function isAdmittedChildEnvKey(key: string): boolean {
+  return !key.startsWith(NAMESPACE) || ADMITTED_OWENWORK_KEYS.has(key);
+}

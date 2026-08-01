@@ -140,7 +140,7 @@ import type {
   Keychain,
   WhoamiIdentity,
 } from './hub.ts';
-import { owenworkSettingsPath, readOwenworkSettingsRaw, writeOwenworkHubOrigin } from './owenwork.ts';
+import { owenworkSettingsPath, readOwenworkSettingsRaw, writeOwenworkHubOrigin } from './work-settings.ts';
 
 // Re-export the keychain backend type so existing test imports of `Keychain`
 // from `../src/cli.ts` (test/hubkit.ts, test/login.test.ts) keep resolving —
@@ -555,6 +555,7 @@ Commands:
   setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenwork settings, plugin (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
+  work <subcommand> [args]                run execution-side proxy/hold/exec/agent-run/... commands
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided] [--strict-inputs]
                                          bounded reachability check (stall states, true deadlocks, stuck, dead steps, declared invariants)
@@ -650,6 +651,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'pools', 'scopes')],
   ['doctor', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
+  ['work', cmdOpts()],
   ['lint', cmdOpts()],
   ['check', cmdOpts('format', 'max-depth', 'max-states', 'max-collection', 'assume-provided', 'strict-inputs')],
   ['create', cmdOpts('title', 'provide', 'param')],
@@ -3987,7 +3989,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     steps.push({ step: 'owenwork settings', action: 'done', detail: `${written.previous ?? '(unset)'} → ${origin}` });
   }
   if (agentAccount !== 'default') {
-    io.err(`non-default agent account — run owenwork with OWENWORK_ACCOUNT=${agentAccount}`);
+    io.err(`non-default agent account — run owenloop work with OWENWORK_ACCOUNT=${agentAccount}`);
   }
 
   // --- [5/6] plugin (non-fatal) ---
@@ -4172,6 +4174,20 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
 export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'binding', 'pool', 'setup', 'doctor', 'mcp']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
+  // Delegate the entire execution-side argv tail before root parsing. Work roles
+  // own their option grammar, including repeated/value forms that the engine
+  // parser must not consume. The dynamic import is also the cold-start boundary:
+  // ordinary root commands never evaluate the work dispatcher or its adapters.
+  if (argv[0] === 'work') {
+    try {
+      const { mainAsync: runWork } = await import('../packages/work/src/main.ts');
+      return await runWork(argv.slice(1));
+    } catch (e) {
+      io.err(`error: ${(e as Error).message}`);
+      return 1;
+    }
+  }
+
   const args = parseArgs(argv);
   const command = args.positionals[0];
   if (command === undefined || !ASYNC_COMMANDS.has(command)) {
@@ -4217,8 +4233,12 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
   }
 }
 
-/** Run the CLI. Returns a process exit code. */
+/** Run the synchronous engine CLI. The `work` namespace is async-only. */
 export function main(argv: string[], io: CliIO = defaultIO()): number {
+  if (argv[0] === 'work') {
+    io.err('error: owenloop work requires the async entry point');
+    return 1;
+  }
   const args = parseArgs(argv);
   const command = args.positionals[0];
   if (command === undefined) {

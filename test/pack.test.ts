@@ -57,22 +57,34 @@ test('npm pack includes everything a consumer needs', () => {
     'README.md',
     'LICENSE',
     'CHANGELOG.md',
-    'dist/index.js',
-    'dist/index.d.ts',
-    'dist/engine.js',
-    'dist/cli.js',
+    'dist/src/index.js',
+    'dist/src/index.d.ts',
+    'dist/src/engine.js',
+    'dist/src/cli.js',
+    'dist/packages/work/src/main.js',
+    'dist/packages/work/src/main.d.ts',
     'bin/owenloop.mjs',
     'examples/workflows/delivery.yaml',
     'docs/design.md',
   ]) {
     assert.ok(files.includes(needed), `tarball should include ${needed}`);
   }
+  assert.deepEqual(
+    files.filter((f) => f.startsWith('bin/')),
+    ['bin/owenloop.mjs'],
+    'tarball should publish exactly one owenloop binary',
+  );
 });
 
 test('npm pack ships compiled output, not TypeScript source', () => {
   const files = packedFiles();
-  const tsSource = files.filter((f) => f.startsWith('src/') || (f.endsWith('.ts') && !f.endsWith('.d.ts')));
+  const tsSource = files.filter((f) =>
+    f.startsWith('src/') ||
+    f.startsWith('packages/') ||
+    (f.endsWith('.ts') && !f.endsWith('.d.ts')),
+  );
   assert.equal(tsSource.length, 0, `tarball must not ship TS source (got ${tsSource.join(', ')})`);
+  assert.ok(!files.includes('bin/owenwork.mjs'), 'tarball must not ship a second owenwork binary');
 });
 
 test('npm pack excludes local state, scaffolding, and repo-only files', () => {

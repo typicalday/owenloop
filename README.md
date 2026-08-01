@@ -296,8 +296,8 @@ looks like:
   each order with whatever executes your work (an agent CLI, an API call, a
   script), report, repeat. Fully deterministic dispatch if you want it —
   see [Embedding it](#embedding-it) for the in-process version. A reference
-  dispatcher/Conductor, owenwork, is available separately — the engine core
-  ships no host harness of its own.
+  dispatcher/Conductor is included in this package under the `owenloop work`
+  namespace — the engine core still ships no host harness of its own.
 - **A Prime Agent as the orchestrator** — point any tool-using agent (Claude Code,
   Codex, Gemini CLI, anything that can run a shell command) at the CLI and
   tell it to drive the instance to done. A slash command or skill that wraps
@@ -342,7 +342,9 @@ fresh subagent, relaying knock-backs, and escalating stalls to you. Already
 have a def? *"Conduct the report workflow"* hands it to
 [`owenloop-conduct`](skills/owenloop-conduct/SKILL.md). The engine itself
 arrives via `npx owenloop` (Node ≥ 22.13 required) — no clone, no build, no
-environment variables, no CLI verbs to memorize.
+environment variables, no CLI verbs to memorize. The same package also includes
+the execution-side companion: use `owenloop work <subcommand>` (for example,
+`owenloop work proxy`); there is no separate `owenwork` package or binary.
 
 **Want to see or drive the machinery yourself?** Everything above goes
 through the same small CLI (`create`, `tick`, `green`, `reject`, …).
@@ -376,8 +378,8 @@ hub's own def hashes, so an unchanged re-push is a no-op. `owenloop agent new
 [Hub](docs/cli.md#hub-login--connect--push--logout) section in `docs/cli.md`.
 
 Setting up a machine from scratch? `owenloop setup` converges the whole install
-in one idempotent pass — human login, agent credential, owenwork settings, and
-the Claude Code plugin — so a re-run on an already-set-up machine writes
+in one idempotent pass — human login, agent credential, the owenwork settings
+file, and the Claude Code plugin — so a re-run on an already-set-up machine writes
 nothing. `owenloop doctor` is its read-only counterpart: it checks each piece
 and prints a `✓`/`✗` line with the remedy. See
 [`setup`](docs/cli.md#setup--converge-a-machines-install) and

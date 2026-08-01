@@ -19,5 +19,5 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "bin/**/*.mjs", "examples/**/*.ts"]
+  "include": ["src/**/*.ts", "packages/work/src/**/*.ts", "test/**/*.ts", "packages/work/test/**/*.ts", "bin/**/*.mjs", "examples/**/*.ts"]
 }

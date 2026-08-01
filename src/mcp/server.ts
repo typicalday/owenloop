@@ -2,15 +2,12 @@
  * A minimal, dependency-light MCP server core — newline-delimited JSON-RPC 2.0
  * over stdio, hand-rolled (O2 plan Decision 1).
  *
- * PROVENANCE: this is a near-verbatim copy of owenwork's proven
- * `src/mcp/server.ts` transport core (`createMcpServer` / `pumpStdin` /
- * `textResult` / the error-code consts / `LineStream`). Only this header was
- * changed. Consolidating the two copies into one shared package is DELIBERATELY
- * DEFERRED (per the O2 brief): owenloop and owenwork are separate packages with
- * no shared dependency today, and duplicating ~400 lines of a stable, test-pinned
- * transport is cheaper than standing up a shared module for it now. owenloop's
- * own `test/mcpcore.test.ts` re-proves the copied behavior against this file, so
- * drift is caught here rather than assumed.
+ * PROVENANCE: this transport core was ported from the execution subsystem's
+ * proven `src/mcp/server.ts` implementation (`createMcpServer` / `pumpStdin` /
+ * `textResult` / the error-code consts / `LineStream`). The implementation now
+ * lives in the root package so engine and execution commands ship together.
+ * `test/mcpcore.test.ts` re-proves the transport behavior against this file,
+ * so later changes are caught rather than assumed.
  *
  * WHY hand-rolled, not `@modelcontextprotocol/sdk`: this repo's posture is two
  * runtime deps (`@cfworker/json-schema` + `yaml`). The SDK drags zod and a

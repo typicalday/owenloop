@@ -1,0 +1,35 @@
+{
+  "name": "demo",
+  "hash": "abcdef1234567890",
+  "version": 3,
+  "steps": [
+    {
+      "name": "builder",
+      "terminal": false,
+      "body": "You are the builder. Implement the plan and open a PR.",
+      "model": "opus",
+      "x": {
+        "harness": {
+          "tools": ["Read", "Edit", "Bash"],
+          "permissionMode": "plan",
+          "maxTurns": 40,
+          "mcpServers": { "extra": { "command": "extra-server" } }
+        }
+      }
+    },
+    {
+      "name": "reviewer",
+      "body": "You are the reviewer. Judge the PR.",
+      "x": { "harness": {} }
+    },
+    {
+      "name": "planner",
+      "body": "You are the planner. Produce a plan."
+    },
+    {
+      "name": "deprovisioner",
+      "worker": "command",
+      "command": "owenwork-deprovision"
+    }
+  ]
+}

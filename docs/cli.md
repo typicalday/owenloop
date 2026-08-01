@@ -61,6 +61,7 @@ for the full breakdown.
 | `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]` | converge this machine's install (human login, agent credential, owenwork settings, plugin) in one idempotent pass — see [`setup`](#setup--converge-a-machines-install) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
+| `work <subcommand> [options]` | run the execution-side CLI companion — see [`work`](#work--execution-side-cli-companion) |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
 | `tick <wf> [--now=<ms>] [--shallow] [--label <l>]…` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only); repeatable `--label` claims unlabeled steps plus matching-label steps — see below |
@@ -80,6 +81,33 @@ for the full breakdown.
 | `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed job |
 | `delete <wf>` | delete an instance and all its rows |
 | `adopt <wf>` | re-pin an instance to the current definition and settle any new debts |
+
+## `work` — execution-side CLI companion
+
+The execution-side commands ship in the same `owenloop` npm package and use the
+same `owenloop` binary. Replace the old separate `owenwork` invocation directly:
+
+```text
+owenwork <subcommand> ...    →    owenloop work <subcommand> ...
+```
+
+Subcommand names and options are unchanged. Run `owenloop work --help` for the
+full role-specific usage. The on-disk `owenwork` settings file and `OWENWORK_*`
+environment variables retain their names because they are configuration and wire
+state, not package or executable names.
+
+| subcommand | what it does |
+|---|---|
+| `proxy [options]` | park at the hub and dispatch orders |
+| `hold --order <id> [options]` | hold an order with a heartbeating lease |
+| `exec <order-id> [options]` | run a command order in a self-leasing loop |
+| `agent-run <order-id> [options]` | host an agent order's Step Agent in a harness and self-leasing loop |
+| `prepare <workflow> [--origin <url>]` | fetch, cache, and normalize step specs |
+| `lint <workflow-name \| path>` | lint `x.harness` option bags in a workflow definition |
+| `sessions [--all] [--json]` | list recorded harness sessions and how to reopen them |
+| `release --session <id> [options]` | drain a session's held claims |
+| `settings` | print the resolved execution settings file |
+| `join <code> [--hub <origin>] [--as <account>]` | redeem a join code and store the Scoped Identity credential |
 
 ## `add` — installing shared workflow defs from GitHub
 
@@ -993,8 +1021,8 @@ the flagship command never opens a browser only to fail at the store.)
 ### After setup
 
 If the connected agent account is anything other than `default`, setup prints a
-reminder to run owenwork with `OWENWORK_ACCOUNT=<name>` so the Step Agent (owenwork) reads the
-right slot.
+reminder to run `owenloop work` with `OWENWORK_ACCOUNT=<name>` so the Step Agent
+reads the right slot.
 
 **Exit codes.**
 
