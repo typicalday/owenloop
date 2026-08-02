@@ -14,6 +14,7 @@ import {
   MAX_RESPONSE_LINE_BYTES,
   OVERLAP_ERROR,
   RESPONSE_TRUNCATION_MARKER,
+  type GateEvent,
 } from '../src/shift/protocol.ts';
 import { requestShift } from '../src/shift/client.ts';
 import { rawShiftRequest } from './helpers/shift-client.ts';
@@ -200,6 +201,25 @@ test('status, atomic clock-in validation, attendance, queued event drain, and wa
   const timeout = await requestShift(f.socketPath, { op: 'next', wait_ms: 20 });
   assert.ok(Date.now() - started < 500, 'wait timeout is bounded');
   assert.deepEqual('events' in timeout && timeout.events, []);
+  await stop(f);
+});
+
+test('gate event passes through next and drains once', async () => {
+  const f = fixture();
+  await waitForPath(f.socketPath);
+  const gate: GateEvent = {
+    type: 'gate',
+    workflow: 'wf_gate',
+    run: 'run_gate',
+    name: 'approval',
+    question: 'Should the gate continue?',
+  };
+  f.daemon.onEvent(gate);
+
+  const first = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  assert.deepEqual('events' in first && first.events, [gate]);
+  const second = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  assert.deepEqual('events' in second && second.events, []);
   await stop(f);
 });
 
