@@ -10,7 +10,11 @@ import { afterEach, beforeEach, test } from 'node:test';
 import type { HubClient } from '../src/hub/client.ts';
 import type { ProxyLoop } from '../src/proxy/loop.ts';
 import { createShiftDaemon, type ShiftDaemon } from '../src/shift/server.ts';
-import { OVERLAP_ERROR } from '../src/shift/protocol.ts';
+import {
+  MAX_RESPONSE_LINE_BYTES,
+  OVERLAP_ERROR,
+  RESPONSE_TRUNCATION_MARKER,
+} from '../src/shift/protocol.ts';
 import { requestShift } from '../src/shift/client.ts';
 import { rawShiftRequest } from './helpers/shift-client.ts';
 
@@ -245,8 +249,54 @@ test('a legal 1,000-event response with 200-character steps fits the client ceil
   assert.equal('events' in response, true);
   if ('events' in response) {
     assert.equal(response.events.length, 1_000);
-    assert.ok(Buffer.byteLength(JSON.stringify(response)) > 256 * 1024);
+    assert.ok(Buffer.byteLength(`${JSON.stringify(response)}\n`, 'utf8') <= MAX_RESPONSE_LINE_BYTES);
   }
+  await stop(f);
+});
+
+test('size-aware event drain retains events that exceed one response and preserves order', async () => {
+  const f = fixture();
+  await waitForPath(f.socketPath);
+  const message = 'é'.repeat(150_000);
+  for (let i = 0; i < 3; i++) {
+    f.daemon.onEvent({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message });
+  }
+
+  const first = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  const second = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  const third = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  const empty = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  for (const [response, run] of [[first, 'r0'], [second, 'r1'], [third, 'r2']] as const) {
+    assert.equal('events' in response, true);
+    if ('events' in response) {
+      assert.equal(response.events.length, 1);
+      assert.equal((response.events[0] as { run?: string }).run, run);
+      assert.ok(Buffer.byteLength(`${JSON.stringify(response)}\n`, 'utf8') <= MAX_RESPONSE_LINE_BYTES);
+    }
+  }
+  assert.deepEqual('events' in empty && empty.events, []);
+  await stop(f);
+});
+
+test('an oversized single event is delivered once with an explicit truncation marker', async () => {
+  const f = fixture();
+  await waitForPath(f.socketPath);
+  f.daemon.onEvent({
+    type: 'failed', workflow: 'wf', run: 'r0', step: 's', kind: 'exec', message: '💥'.repeat(200_000),
+  });
+
+  const response = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  assert.equal('events' in response, true);
+  if ('events' in response) {
+    assert.equal(response.events.length, 1);
+    const event = response.events[0] as { message?: string };
+    assert.equal(typeof event.message, 'string');
+    assert.equal(event.message?.endsWith(RESPONSE_TRUNCATION_MARKER), true);
+    assert.ok(Buffer.byteLength(`${JSON.stringify(response)}\n`, 'utf8') <= MAX_RESPONSE_LINE_BYTES);
+  }
+
+  const empty = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  assert.deepEqual('events' in empty && empty.events, []);
   await stop(f);
 });
 

@@ -21,7 +21,9 @@ import type { ProxyLoop } from '../proxy/loop.ts';
 import {
   MAX_EVENT_QUEUE,
   MAX_REQUEST_LINE_BYTES,
+  MAX_RESPONSE_LINE_BYTES,
   OVERLAP_ERROR,
+  RESPONSE_TRUNCATION_MARKER,
   type ShiftCapacity,
   type ShiftError,
   type ShiftEvent,
@@ -70,6 +72,50 @@ interface StartupLock {
 
 const REQUEST_IDLE_TIMEOUT_MS = 5_000;
 const SHUTDOWN_GRACE_MS = 500;
+
+function serializedResponseBytes(response: ShiftCapacity): number {
+  return Buffer.byteLength(`${JSON.stringify(response)}\n`, 'utf8');
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  const markerBytes = Buffer.byteLength(RESPONSE_TRUNCATION_MARKER, 'utf8');
+  if (maxBytes <= markerBytes) return RESPONSE_TRUNCATION_MARKER;
+  let prefix = Buffer.from(value, 'utf8').subarray(0, maxBytes - markerBytes).toString('utf8');
+  while (Buffer.byteLength(prefix, 'utf8') > maxBytes - markerBytes) prefix = prefix.slice(0, -1);
+  return `${prefix}${RESPONSE_TRUNCATION_MARKER}`;
+}
+
+/**
+ * A single event can be larger than the response ceiling. It is delivered once
+ * with its string fields shortened and an explicit marker instead of blocking
+ * every later event in the FIFO forever.
+ */
+function truncateEventForResponse(event: ShiftEvent, envelope: Omit<ShiftCapacity, 'events'>): ShiftEvent {
+  const candidate = { ...event } as Record<string, unknown>;
+  const stringKeys = Object.keys(candidate).filter((key) => typeof candidate[key] === 'string' && key !== 'type');
+  const markerBytes = Buffer.byteLength(RESPONSE_TRUNCATION_MARKER, 'utf8');
+
+  while (serializedResponseBytes({ ...envelope, events: [candidate as unknown as ShiftEvent] }) > MAX_RESPONSE_LINE_BYTES) {
+    const key = stringKeys
+      .filter((name) => candidate[name] !== RESPONSE_TRUNCATION_MARKER)
+      .sort((left, right) => Buffer.byteLength(String(candidate[right]), 'utf8') - Buffer.byteLength(String(candidate[left]), 'utf8'))[0];
+    if (key === undefined) break;
+    const value = String(candidate[key]);
+    const currentBytes = Buffer.byteLength(value, 'utf8');
+    const targetBytes = Math.max(markerBytes, Math.floor(currentBytes / 2));
+    const shortened = truncateUtf8(value, targetBytes);
+    candidate[key] = shortened === value ? RESPONSE_TRUNCATION_MARKER : shortened;
+  }
+
+  // The current event union has a fixed envelope plus only string fields. The
+  // marker-only form is a final backstop if a future event shape needs more
+  // reduction than the progressive shortening above provided.
+  if (serializedResponseBytes({ ...envelope, events: [candidate as unknown as ShiftEvent] }) > MAX_RESPONSE_LINE_BYTES) {
+    for (const key of stringKeys) candidate[key] = RESPONSE_TRUNCATION_MARKER;
+  }
+  return candidate as unknown as ShiftEvent;
+}
 
 function fileIdentity(stat: Stats): FileIdentity {
   return { dev: stat.dev, ino: stat.ino, ctimeMs: stat.ctimeMs };
@@ -309,12 +355,26 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     respond(current.socket, response);
   };
 
-  const drainEvents = (): ShiftEvent[] => {
-    const drained = events.splice(0, events.length);
-    return drained;
-  };
+  const capacityResponse = (): ShiftCapacity => {
+    const envelope = capacity();
+    const selected: ShiftEvent[] = [];
+    while (selected.length < events.length) {
+      const next = events[selected.length]!;
+      const candidate = { ...envelope, events: [...selected, next] };
+      if (serializedResponseBytes(candidate) <= MAX_RESPONSE_LINE_BYTES) {
+        selected.push(next);
+        continue;
+      }
+      if (selected.length > 0) break;
 
-  const capacityResponse = (): ShiftCapacity => ({ ...capacity(), events: drainEvents() });
+      // Never let one pathological event block the FIFO permanently. The
+      // original event is consumed once as a marked, size-safe representation.
+      const shortened = truncateEventForResponse(next, envelope);
+      selected.push(shortened);
+    }
+    events.splice(0, selected.length);
+    return { ...envelope, events: selected };
+  };
 
   const enqueue = (event: ShiftEvent): void => {
     if (events.length >= MAX_EVENT_QUEUE) {

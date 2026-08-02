@@ -11,12 +11,12 @@ export const SHIFT_SOCKET_NAME = 'shift.sock';
 export const DEFAULT_NEXT_WAIT_MS = 90_000;
 export const MAX_REQUEST_LINE_BYTES = 64 * 1024;
 /**
- * A legal dispatched event with generated workflow/run IDs and a 200-character
- * step name is 346,048 bytes across the 1,000-entry FIFO. The capacity/status
- * envelope adds only a small fixed amount, so 512 KiB leaves over 160 KiB of
- * headroom instead of relying on an observed short-name response.
+ * The server measures each response's serialized UTF-8 byte length against this
+ * ceiling and retains FIFO events that do not fit. A single event whose fields
+ * exceed the ceiling is rendered with an explicit truncation marker.
  */
 export const MAX_RESPONSE_LINE_BYTES = 512 * 1024;
+export const RESPONSE_TRUNCATION_MARKER = '[truncated]';
 export const MAX_EVENT_QUEUE = 1_000;
 export const OVERLAP_ERROR = 'whats_next is already parked — one park at a time (cancel it or wait for it to return)';
 export const NO_DAEMON_SUFFIX = ' — start one with: owenloop shift start <crew…>';
