@@ -35,7 +35,7 @@ let shift: ShiftChild | undefined;
 let commands: CommandResult[];
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'owenwork-shift-blocking-'));
+  root = mkdtempSync(join(tmpdir(), 'owenloop-shift-blocking-'));
   configDir = join(root, 'config');
   cacheDir = join(root, 'cache');
   stateDir = join(root, 'state');
@@ -85,7 +85,7 @@ afterEach(async () => {
 
 function env(): Record<string, string | undefined> {
   return {
-    OWENWORK_TOKEN: TOKEN,
+    OWENLOOP_TOKEN: TOKEN,
     XDG_CONFIG_HOME: configDir,
     NODE_NO_WARNINGS: '1',
   };

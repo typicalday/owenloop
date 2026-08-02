@@ -16,7 +16,7 @@ import {
 
 let dir: string;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'owenwork-state-'));
+  dir = mkdtempSync(join(tmpdir(), 'owenloop-state-'));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
@@ -32,8 +32,8 @@ const rec = (over: Partial<ChildRecord> = {}): ChildRecord => ({
 
 test('resolveStateDir: override → XDG_STATE_HOME → HOME, else throws', () => {
   assert.equal(resolveStateDir({ HOME: '/h' }, '/explicit'), '/explicit');
-  assert.equal(resolveStateDir({ XDG_STATE_HOME: '/xs', HOME: '/h' }), join('/xs', 'owenwork', 'exec'));
-  assert.equal(resolveStateDir({ HOME: '/h' }), join('/h', '.local', 'state', 'owenwork', 'exec'));
+  assert.equal(resolveStateDir({ XDG_STATE_HOME: '/xs', HOME: '/h' }), join('/xs', 'owenloop', 'exec'));
+  assert.equal(resolveStateDir({ HOME: '/h' }), join('/h', '.local', 'state', 'owenloop', 'exec'));
   assert.throws(() => resolveStateDir({}), /cannot locate a state directory/);
 });
 

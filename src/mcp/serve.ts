@@ -28,7 +28,7 @@
  *      result object FROM SCRATCH (`{name, pools, stored:true}`) and never
  *      passes any field of the raw body outbound.
  *
- * The transport core is in `./server.ts` (a copy of owenwork's; see its header).
+ * The transport core is in `./server.ts` (a copy of owenloop's; see its header).
  * Everything owenloop-specific — origin resolution, the authenticated hub
  * client, the tool registrations, the enrollment capability gate, and the
  * command body — lives here.

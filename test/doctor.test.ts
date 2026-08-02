@@ -15,7 +15,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { kcHuman, kcKey, makeIdentityHub, makeIo, routedFetch } from './hubkit.ts';
-import { owenworkSettingsPath } from '../src/work-settings.ts';
+import { owenloopSettingsPath } from '../src/work-settings.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
@@ -41,9 +41,9 @@ function seedAgentSlot(store: Map<string, string>, account: string, plaintext: s
   store.set(kcKey(ORIGIN, { principal: 'agent', account }), JSON.stringify({ kind: 'agent', accessToken: plaintext }));
 }
 
-/** Write an owenwork settings file with the given hubOrigin under `env`'s HOME. */
+/** Write an owenloop settings file with the given hubOrigin under `env`'s HOME. */
 function writeSettings(env: Record<string, string | undefined>, hubOrigin: string): void {
-  const path = owenworkSettingsPath(env);
+  const path = owenloopSettingsPath(env);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify({ hubOrigin }));
 }
@@ -150,7 +150,7 @@ test('doctor: all green → every line ✓, exit 0, and a strict zero-write', as
 
   const err = t.err.join('\n');
   assert.doesNotMatch(err, /✗/, 'no failing check lines');
-  for (const label of ['human credential', 'human plane', 'agent slot', 'agent plane', 'owenwork settings', 'plugin']) {
+  for (const label of ['human credential', 'human plane', 'agent slot', 'agent plane', 'owenloop settings', 'plugin']) {
     assert.match(err, new RegExp(`✓ ${label}`), `${label} passed`);
   }
 

@@ -56,7 +56,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 
 const DEFAULT_OUT = resolve(import.meta.dirname, '..', 'fixtures', 'claude-sdk-stream.jsonl');
 const DEFAULT_PROMPT =
-  'Reply with exactly the word OWENWORK-FIXTURE and nothing else. Do not use any tools.';
+  'Reply with exactly the word OWENLOOP-FIXTURE and nothing else. Do not use any tools.';
 
 function parseArgs(argv) {
   const out = { out: DEFAULT_OUT, prompt: DEFAULT_PROMPT, cwd: undefined };
@@ -105,7 +105,7 @@ function neutralizeInventory(message) {
   const m = structuredClone(message);
   if (m.type === 'system' && m.subtype === 'init') {
     // `mcp_servers` is READ by `consumeTurn`, so it keeps a realistic entry.
-    m.mcp_servers = [{ name: 'owenwork', status: 'pending' }];
+    m.mcp_servers = [{ name: 'owenloop', status: 'pending' }];
     m.tools = ['Bash', 'Read', 'Write'];
     m.slash_commands = [];
     m.agents = [];
@@ -143,7 +143,7 @@ function scrub(json, cwd) {
 }
 
 const args = parseArgs(process.argv.slice(2));
-const cwd = args.cwd ?? mkdtempSync(join(tmpdir(), 'owenwork-record-'));
+const cwd = args.cwd ?? mkdtempSync(join(tmpdir(), 'owenloop-record-'));
 
 const started = Date.now();
 const lines = [];

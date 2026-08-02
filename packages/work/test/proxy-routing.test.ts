@@ -28,14 +28,14 @@ test('machine setting conductor wins over an absent override', () => {
   assert.deepEqual(r.warnings, []);
 });
 
-test('x.owenwork.routing conductor wins over a proxy machine setting', () => {
-  const r = resolveCommandRouting('proxy', step({ x: { owenwork: { routing: 'conductor' } } }));
+test('x.owenloop.routing conductor wins over a proxy machine setting', () => {
+  const r = resolveCommandRouting('proxy', step({ x: { owenloop: { routing: 'conductor' } } }));
   assert.equal(r.routing, 'conductor');
   assert.equal(r.autoDispatch, false);
 });
 
 test('both proxy resolves to proxy', () => {
-  const r = resolveCommandRouting('proxy', step({ x: { owenwork: { routing: 'proxy' } } }));
+  const r = resolveCommandRouting('proxy', step({ x: { owenloop: { routing: 'proxy' } } }));
   assert.equal(r.routing, 'proxy');
   assert.equal(r.autoDispatch, true);
 });
@@ -49,20 +49,20 @@ test('an invalid machine value fails closed to conductor with a warning', () => 
 });
 
 test('an invalid override value fails closed to conductor with a warning', () => {
-  const r = resolveCommandRouting('proxy', step({ x: { owenwork: { routing: 42 } } }));
+  const r = resolveCommandRouting('proxy', step({ x: { owenloop: { routing: 42 } } }));
   assert.equal(r.routing, 'conductor');
   assert.equal(r.warnings.length, 1);
-  assert.match(r.warnings[0]!, /x\.owenwork\.routing/);
+  assert.match(r.warnings[0]!, /x\.owenloop\.routing/);
 });
 
-test('a malformed x.owenwork bag fails closed to conductor with a warning', () => {
-  const r = resolveCommandRouting('proxy', step({ x: { owenwork: 'nope' } }));
+test('a malformed x.owenloop bag fails closed to conductor with a warning', () => {
+  const r = resolveCommandRouting('proxy', step({ x: { owenloop: 'nope' } }));
   assert.equal(r.routing, 'conductor');
   assert.equal(r.warnings.length, 1);
-  assert.match(r.warnings[0]!, /malformed x\.owenwork bag/);
+  assert.match(r.warnings[0]!, /malformed x\.owenloop bag/);
 });
 
-test('an absent x.owenwork bag leaves the machine setting in control', () => {
+test('an absent x.owenloop bag leaves the machine setting in control', () => {
   assert.equal(resolveCommandRouting('proxy', step({ x: { 'claude-code': {} } })).routing, 'proxy');
   assert.equal(resolveCommandRouting('conductor', step({ x: {} })).routing, 'conductor');
 });

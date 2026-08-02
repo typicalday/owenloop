@@ -8,7 +8,7 @@
  * harness-specific artifact. Per agent step it writes a `NormalizedStepSpec` —
  * the step body verbatim as `brief`, the declared harness id, and
  * `normalizeStepPermissions(step.harnessOptions, step)`. The four substitution
- * tokens and the owenwork MCP mount are NOT baked in; `src/agent/brief.ts`
+ * tokens and the owenloop MCP mount are NOT baked in; `src/agent/brief.ts`
  * builds those at run time from the live order, so a bundle is order-independent
  * and reusable across every order of that step.
  *
@@ -24,12 +24,12 @@
  * Resolution (D4/D5):
  *   origin — `--origin` flag → `settings.hubOrigin` → usage error (exit 2)
  *   bearer — owenloop's store via `resolveBearer`: the `agent:<account>` slot for
- *            `OWENWORK_ACCOUNT` (default `default`), with `OWENWORK_TOKEN` as a
+ *            `OWENLOOP_ACCOUNT` (default `default`), with `OWENLOOP_TOKEN` as a
  *            documented dev-only override. A missing Scoped Identity key is a refuse
  *            (exit 2) naming the origin + a runnable `owenloop login` command. prepare
- *            has no `--as` flag — a Conductor sets `OWENWORK_ACCOUNT` for a
+ *            has no `--as` flag — a Conductor sets `OWENLOOP_ACCOUNT` for a
  *            non-default account.
- *   cache  — `OWENWORK_CACHE_DIR` env → `settings.cacheDir` → XDG default.
+ *   cache  — `OWENLOOP_CACHE_DIR` env → `settings.cacheDir` → XDG default.
  *
  * Exit codes: 0 ok · 1 runtime failure (fetch/hub-gap/cache write) · 2 usage.
  * prepare is the entry point, NOT fail-open: a real fetch or cache error surfaces.
@@ -102,7 +102,7 @@ export async function run(args: string[]): Promise<number> {
     return 2;
   }
 
-  const account = env['OWENWORK_ACCOUNT'] ?? 'default';
+  const account = env['OWENLOOP_ACCOUNT'] ?? 'default';
   const bearer = await resolveBearer({ origin, account, env });
   if (!bearer.ok) {
     process.stderr.write(`owenloop work prepare: ${bearer.message}\n`);

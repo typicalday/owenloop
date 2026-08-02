@@ -8,8 +8,8 @@
  *    legacy stamp path performs when it writes a per-order Step Agent file,
  *    minus the file. The runner hands the result straight to
  *    `HarnessAdapter.start` as `StartArgs.brief`.
- *  - `buildOwenworkMcp(spec)` — the `{command, args}` stdio mount for owenwork's
- *    own work-holder MCP surface, byte-identical to the `mcpServers.owenwork`
+ *  - `buildOwenloopMcp(spec)` — the `{command, args}` stdio mount for owenloop's
+ *    own work-holder MCP surface, byte-identical to the `mcpServers.owenloop`
  *    literal the legacy host adapter injects into stamped frontmatter today.
  *
  * WHY THE TOKENS ARE DECLARED HERE AND NOT IMPORTED (plan D4): the legacy
@@ -20,15 +20,15 @@
  *
  * Phase 4 adds a third pure function, `renderRejection` — see its own header.
  *
- * CREDENTIAL STANCE: `buildOwenworkMcp` puts NO credential in argv. The mount
+ * CREDENTIAL STANCE: `buildOwenloopMcp` puts NO credential in argv. The mount
  * carries `--as <account>` — a Scoped Identity *selector*, not a secret — and
  * the mounted work-holder resolves its own bearer from owenloop's credential
  * store. `test/agent-brief.test.ts` asserts this. `renderRejection` reads only
  * `OrderPacket.owes`, which carries no credential either, and
  * `test/agent-rejection.test.ts` asserts that too. The separate, environmental
- * `OWENWORK_TOKEN` inheritance problem — Phase 3 pointed it at Phase 4, Phase 4
- * re-deferred it — is CLOSED as of Phase 6: `filterOwenworkEnv`
- * (`src/harness/child-env.ts`) is an allowlist over the `OWENWORK_*` namespace,
+ * `OWENLOOP_TOKEN` inheritance problem — Phase 3 pointed it at Phase 4, Phase 4
+ * re-deferred it — is CLOSED as of Phase 6: `filterOwenloopEnv`
+ * (`src/harness/child-env.ts`) is an allowlist over the `OWENLOOP_*` namespace,
  * both adapters pass their child `env` through it, and `agent-run` stopped
  * honouring the override on its own side in the same commit so the two sides
  * cannot authenticate as different principals. See `docs/agent-runner.md`.
@@ -36,13 +36,13 @@
 import type { OrderPacket, ReasonEntry } from '../hub/types.ts';
 
 /** The composite `<workflow>/<run>` order id token. */
-export const ORDER_TOKEN = '__OWENWORK_ORDER__';
+export const ORDER_TOKEN = '__OWENLOOP_ORDER__';
 /** The hub origin token. */
-export const ORIGIN_TOKEN = '__OWENWORK_ORIGIN__';
+export const ORIGIN_TOKEN = '__OWENLOOP_ORIGIN__';
 /** The Scoped Identity account token. */
-export const ACCOUNT_TOKEN = '__OWENWORK_ACCOUNT__';
+export const ACCOUNT_TOKEN = '__OWENLOOP_ACCOUNT__';
 /** The dispatching Conductor's self-declared id token (advisory only). */
-export const CONDUCTOR_TOKEN = '__OWENWORK_CONDUCTOR__';
+export const CONDUCTOR_TOKEN = '__OWENLOOP_CONDUCTOR__';
 
 /**
  * Everything the four-token substitution and the MCP mount need.
@@ -85,7 +85,7 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
 
 /**
  * The born-bound work-holder mount handed to `HarnessAdapter.start` as
- * `StartArgs.owenworkMcp`. The adapter mounts it verbatim and never builds it.
+ * `StartArgs.owenloopMcp`. The adapter mounts it verbatim and never builds it.
  *
  * `--conductor=<cid>` is ONE argv element, not two. An absent cid then degrades
  * to the single well-formed string `"--conductor="` instead of a dangling flag
@@ -93,7 +93,7 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
  * (The shape originated with the deleted stamp path, which had to survive a YAML
  * args array; it is kept because it is still the correct, unambiguous form.)
  */
-export function buildOwenworkMcp(spec: BriefSpec): { command: string; args: string[] } {
+export function buildOwenloopMcp(spec: BriefSpec): { command: string; args: string[] } {
   return {
     command: 'owenloop',
     args: [

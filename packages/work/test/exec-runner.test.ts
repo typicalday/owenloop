@@ -11,7 +11,7 @@ import { buildCommandPlan, createDefaultRunner } from '../src/exec/runner.ts';
 // here is a harmless POSIX-shell fixture in a test-created temp cwd — no network,
 // no repo mutation.
 
-const CWD = mkdtempSync(join(tmpdir(), 'owenwork-exec-runner-'));
+const CWD = mkdtempSync(join(tmpdir(), 'owenloop-exec-runner-'));
 const sha256 = (s: string): string => `sha256:${createHash('sha256').update(s).digest('hex')}`;
 
 test('buildCommandPlan is a pure detached `/bin/sh -c` plan', () => {

@@ -20,20 +20,20 @@ const DEMO = JSON.parse(fixture('demo-def.json')) as Record<string, unknown>;
 
 let cacheDir: string;
 let homeDir: string;
-const ENV_KEYS = ['HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'OWENWORK_CACHE_DIR', 'OWENWORK_TOKEN', 'OWENWORK_ACCOUNT', 'OWENLOOP_NO_KEYCHAIN'];
+const ENV_KEYS = ['HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'OWENLOOP_CACHE_DIR', 'OWENLOOP_TOKEN', 'OWENLOOP_ACCOUNT', 'OWENLOOP_NO_KEYCHAIN'];
 let savedEnv: Record<string, string | undefined>;
 
 beforeEach(() => {
-  cacheDir = mkdtempSync(join(tmpdir(), 'owenwork-prep-cache-'));
-  homeDir = mkdtempSync(join(tmpdir(), 'owenwork-prep-home-'));
+  cacheDir = mkdtempSync(join(tmpdir(), 'owenloop-prep-cache-'));
+  homeDir = mkdtempSync(join(tmpdir(), 'owenloop-prep-home-'));
   savedEnv = {};
   for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
   // A clean, fixture-controlled env: no ambient HOME/XDG/token leakage.
   for (const k of ENV_KEYS) delete process.env[k];
   process.env['HOME'] = homeDir;
-  process.env['XDG_CONFIG_HOME'] = homeDir; // settings live under <homeDir>/owenwork/
-  process.env['OWENWORK_CACHE_DIR'] = cacheDir;
-  process.env['OWENWORK_TOKEN'] = 'tok-abc';
+  process.env['XDG_CONFIG_HOME'] = homeDir; // settings live under <homeDir>/owenloop/
+  process.env['OWENLOOP_CACHE_DIR'] = cacheDir;
+  process.env['OWENLOOP_TOKEN'] = 'tok-abc';
   // Hermetic credential store: force owenloop's file backend (no real keychain
   // shell-out) so an unseeded store reads as absent → the refuse path.
   process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
@@ -359,9 +359,9 @@ test('missing --origin and missing settings hubOrigin is a usage error (exit 2)'
   assert.match(r.stderr, /no hub origin/);
 });
 
-test('no Scoped Identity key stored (and no OWENWORK_TOKEN override) is a refuse (exit 2)', async () => {
+test('no Scoped Identity key stored (and no OWENLOOP_TOKEN override) is a refuse (exit 2)', async () => {
   // Empty override + a hermetic empty file store ⇒ the agent slot is absent.
-  process.env['OWENWORK_TOKEN'] = '';
+  process.env['OWENLOOP_TOKEN'] = '';
   const r = await runPrepare(['demo', '--origin', 'http://127.0.0.1:1']);
   assert.equal(r.code, 2);
   assert.match(
@@ -370,15 +370,15 @@ test('no Scoped Identity key stored (and no OWENWORK_TOKEN override) is a refuse
   );
 });
 
-test('OWENWORK_ACCOUNT names the slot in the refuse hint (agent:ci)', async () => {
-  process.env['OWENWORK_TOKEN'] = '';
-  process.env['OWENWORK_ACCOUNT'] = 'ci';
+test('OWENLOOP_ACCOUNT names the slot in the refuse hint (agent:ci)', async () => {
+  process.env['OWENLOOP_TOKEN'] = '';
+  process.env['OWENLOOP_ACCOUNT'] = 'ci';
   const r = await runPrepare(['demo', '--origin', 'http://127.0.0.1:1']);
   assert.equal(r.code, 2);
   assert.match(r.stderr, /account "ci"\) — run: owenloop login --hub http:\/\/127\.0\.0\.1:1 --as agent:ci/);
 });
 
-test('with no OWENWORK_TOKEN, prepare authenticates with the agent slot token from the store', async () => {
+test('with no OWENLOOP_TOKEN, prepare authenticates with the agent slot token from the store', async () => {
   const { server, origin } = await startHub(() => enrichedBody(DEMO));
   // Seed the agent:default slot for this origin; drop the override.
   const dir = join(homeDir, 'owenloop');
@@ -387,7 +387,7 @@ test('with no OWENWORK_TOKEN, prepare authenticates with the agent slot token fr
     join(dir, 'credentials.json'),
     JSON.stringify({ version: 2, hubs: { [origin]: { 'agent:default': { kind: 'agent', accessToken: 'olp_from_store' } } } }),
   );
-  process.env['OWENWORK_TOKEN'] = '';
+  process.env['OWENLOOP_TOKEN'] = '';
   try {
     const r = await runPrepare(['demo', '--origin', origin]);
     assert.equal(r.code, 0, r.stderr);
@@ -400,7 +400,7 @@ test('with no OWENWORK_TOKEN, prepare authenticates with the agent slot token fr
 test('prepare reads hubOrigin from settings when --origin is omitted', async () => {
   const { server, origin } = await startHub(() => enrichedBody(DEMO));
   try {
-    const cfgDir = join(homeDir, 'owenwork');
+    const cfgDir = join(homeDir, 'owenloop');
     mkdirSync(cfgDir, { recursive: true });
     writeFileSync(join(cfgDir, 'settings.json'), JSON.stringify({ hubOrigin: origin }));
     const r = await runPrepare(['demo']);

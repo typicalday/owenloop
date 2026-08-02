@@ -1,6 +1,6 @@
 /**
  * Settings locate, load, and validate. This is the machine-level config
- * surface for owenwork's roles, mirroring owenloop's convention (D12): a
+ * surface for owenloop's roles, mirroring owenloop's convention (D12): a
  * single JSON file at an XDG/HOME path supplying the fallback values every
  * role resolves (CLI flag > env var > settings file > built-in default).
  *
@@ -24,7 +24,7 @@ import { join } from 'node:path';
  *   - `cacheDir`       — bundle cache root; overrides the XDG default
  *     (see bundle/cache.ts).
  *   - `stateDir`       — proxy in-flight state dir; overrides the XDG default
- *     (below `OWENWORK_STATE_DIR`).
+ *     (below `OWENLOOP_STATE_DIR`).
  *   - `dispatchCap`    — proxy max in-flight exec children; below `--cap`,
  *     above the built-in default of 3. A positive integer.
  *   - `commandRouting` — who runs `worker: 'command'` steps this machine sees.
@@ -42,7 +42,7 @@ export interface Settings {
    * Who runs `worker: 'command'` steps this machine sees: `'proxy'` (default)
    * lets the proxy auto-dispatch them; `'conductor'` leaves them for a human/
    * session to pick up via the pickup window. The C3 proxy is the only reader.
-   * A per-step `x.owenwork.routing` override can tighten (never loosen) this —
+   * A per-step `x.owenloop.routing` override can tighten (never loosen) this —
    * most restrictive wins (see src/proxy/routing.ts).
    */
   commandRouting?: 'proxy' | 'conductor';
@@ -104,7 +104,7 @@ export const KNOWN_SETTINGS_KEYS = [
  */
 export interface ValidatedSettings {
   settings: Settings;
-  /** Keys present in the file that owenwork does not recognize. */
+  /** Keys present in the file that owenloop does not recognize. */
   unrecognized: string[];
 }
 
@@ -116,15 +116,15 @@ export interface SettingsInspection extends ValidatedSettings {
 
 /**
  * Resolve the settings file path from the caller's env:
- * `$XDG_CONFIG_HOME/owenwork/settings.json` when `XDG_CONFIG_HOME` is set and
- * non-empty, else `$HOME/.config/owenwork/settings.json`. Throws when neither
+ * `$XDG_CONFIG_HOME/owenloop/settings.json` when `XDG_CONFIG_HOME` is set and
+ * non-empty, else `$HOME/.config/owenloop/settings.json`. Throws when neither
  * is available rather than guessing a home directory.
  */
 export function settingsPath(env: Record<string, string | undefined>): string {
   const xdg = env.XDG_CONFIG_HOME;
-  if (xdg !== undefined && xdg.trim() !== '') return join(xdg, 'owenwork', 'settings.json');
+  if (xdg !== undefined && xdg.trim() !== '') return join(xdg, 'owenloop', 'settings.json');
   const home = env.HOME;
-  if (home !== undefined && home.trim() !== '') return join(home, '.config', 'owenwork', 'settings.json');
+  if (home !== undefined && home.trim() !== '') return join(home, '.config', 'owenloop', 'settings.json');
   throw new Error('cannot locate a settings directory: set HOME or XDG_CONFIG_HOME');
 }
 

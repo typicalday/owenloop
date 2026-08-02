@@ -1,6 +1,6 @@
 /**
  * Unit: resolveBearer + slotArg — the ONE place bearer precedence lives, shared
- * by all five roles: dev-override (OWENWORK_TOKEN) → agent-slot store → refuse.
+ * by all five roles: dev-override (OWENLOOP_TOKEN) → agent-slot store → refuse.
  *
  * Store-backed cases run through the REAL owenloop file backend, seeded into a
  * hermetic temp HOME with OWENLOOP_NO_KEYCHAIN=1 (forces the file store, no
@@ -17,7 +17,7 @@ import { resolveBearer, slotArg } from '../src/credentials/resolve.ts';
 
 let home: string;
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'owenwork-resolve-'));
+  home = mkdtempSync(join(tmpdir(), 'owenloop-resolve-'));
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
@@ -50,15 +50,15 @@ test('slotArg maps default → agent, else agent:<account>', () => {
 
 // ---- override (dev-only) ----------------------------------------------------
 
-test('OWENWORK_TOKEN wins and does NOT consult the store', async () => {
+test('OWENLOOP_TOKEN wins and does NOT consult the store', async () => {
   // Empty store; the override alone must resolve.
-  const r = await resolveBearer({ origin: ORIGIN, account: 'default', env: env({ OWENWORK_TOKEN: 'dev_override' }) });
+  const r = await resolveBearer({ origin: ORIGIN, account: 'default', env: env({ OWENLOOP_TOKEN: 'dev_override' }) });
   assert.deepEqual(r, { ok: true, token: 'dev_override' });
 });
 
-test('a whitespace-only OWENWORK_TOKEN is ignored (falls through to the store)', async () => {
+test('a whitespace-only OWENLOOP_TOKEN is ignored (falls through to the store)', async () => {
   seed(ORIGIN, { default: 'store_tok' });
-  const r = await resolveBearer({ origin: ORIGIN, account: 'default', env: env({ OWENWORK_TOKEN: '   ' }) });
+  const r = await resolveBearer({ origin: ORIGIN, account: 'default', env: env({ OWENLOOP_TOKEN: '   ' }) });
   assert.deepEqual(r, { ok: true, token: 'store_tok' });
 });
 

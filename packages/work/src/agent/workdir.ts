@@ -20,7 +20,7 @@
  *  3. Otherwise (no `workRoot` resolvable) the dispatching process's own cwd,
  *     which is the pre-Phase-4 behaviour.
  *
- * A directory reached by rule 1 is the HUB's, not owenwork's, and `reapWorkDir`
+ * A directory reached by rule 1 is the HUB's, not owenloop's, and `reapWorkDir`
  * refuses to touch it — see `isUnderWorkRoot`.
  *
  * ── PLAIN DIR VS GIT WORKTREE ──
@@ -50,7 +50,7 @@ export function runWorkDir(workRoot: string, workflow: string, run: string): str
 }
 
 /**
- * Resolve the work root: `OWENWORK_WORK_ROOT` > `settings.workRoot` >
+ * Resolve the work root: `OWENLOOP_WORK_ROOT` > `settings.workRoot` >
  * `<cacheDir>/work`. Mirrors `resolveCacheDir`'s precedence shape exactly, so
  * there is one rule to remember for both.
  */
@@ -59,25 +59,25 @@ export function resolveWorkRoot(
   settingsWorkRoot: string | undefined,
   cacheDir: string,
 ): string {
-  const override = env['OWENWORK_WORK_ROOT'];
+  const override = env['OWENLOOP_WORK_ROOT'];
   if (override !== undefined && override.trim() !== '') return override;
   if (settingsWorkRoot !== undefined && settingsWorkRoot.trim() !== '') return settingsWorkRoot;
   return join(cacheDir, 'work');
 }
 
-/** `OWENWORK_WORK_REPO` > `settings.workRepo` > none. */
+/** `OWENLOOP_WORK_REPO` > `settings.workRepo` > none. */
 export function resolveWorkRepo(
   env: Record<string, string | undefined>,
   settingsWorkRepo: string | undefined,
 ): string | undefined {
-  const override = env['OWENWORK_WORK_REPO'];
+  const override = env['OWENLOOP_WORK_REPO'];
   if (override !== undefined && override.trim() !== '') return override;
   if (settingsWorkRepo !== undefined && settingsWorkRepo.trim() !== '') return settingsWorkRepo;
   return undefined;
 }
 
 /**
- * Is `dir` inside `root`? The guard that keeps removal to directories owenwork
+ * Is `dir` inside `root`? The guard that keeps removal to directories owenloop
  * created.
  *
  * Both paths are resolved to absolutes first, so a relative `workRoot` or a
@@ -96,7 +96,7 @@ export interface EnsureWorkDirOptions {
   run: string;
   /** When set, provision as a git worktree of this repo instead of a plain dir. */
   workRepo?: string;
-  /** Branch name for the worktree. Default `owenwork/<workflow>/<run>`. */
+  /** Branch name for the worktree. Default `owenloop/<workflow>/<run>`. */
   branch?: string;
   /** Progress/warning sink. */
   err?: (line: string) => void;
@@ -129,7 +129,7 @@ export function ensureWorkDir(o: EnsureWorkDirOptions): string {
 
   if (o.workRepo !== undefined && o.workRepo !== '') {
     mkdirSync(join(dir, '..'), { recursive: true });
-    const branch = o.branch ?? `owenwork/${o.workflow}/${o.run}`;
+    const branch = o.branch ?? `owenloop/${o.workflow}/${o.run}`;
     const git = o.runGit ?? defaultRunGit;
     const added = git(['worktree', 'add', '-b', branch, dir], o.workRepo);
     if (added.status === 0) return dir;
@@ -216,7 +216,7 @@ export type ReapResult = 'removed' | 'absent' | 'refused' | 'failed';
  *
  *  - `'refused'`: the path is not under `workRoot`. This is the guard that keeps
  *    a hub-supplied `OrderPacket.workdir` — someone else's directory, which
- *    owenwork did not create — out of reach no matter what the gate said.
+ *    owenloop did not create — out of reach no matter what the gate said.
  *  - `'absent'`: nothing there; already gone.
  *  - `'removed'` / `'failed'`: the removal ran and did or did not succeed.
  *

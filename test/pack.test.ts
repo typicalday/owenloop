@@ -84,7 +84,6 @@ test('npm pack ships compiled output, not TypeScript source', () => {
     (f.endsWith('.ts') && !f.endsWith('.d.ts')),
   );
   assert.equal(tsSource.length, 0, `tarball must not ship TS source (got ${tsSource.join(', ')})`);
-  assert.ok(!files.includes('bin/owenwork.mjs'), 'tarball must not ship a second owenwork binary');
 });
 
 test('npm pack excludes local state, scaffolding, and repo-only files', () => {

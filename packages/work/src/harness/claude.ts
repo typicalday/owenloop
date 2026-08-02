@@ -36,7 +36,7 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import { register } from './registry.ts';
-import { filterOwenworkEnv } from './child-env.ts';
+import { filterOwenloopEnv } from './child-env.ts';
 import { ResumeUnavailableError } from './contract.ts';
 import type { LintFinding } from './types.ts';
 import type {
@@ -75,7 +75,7 @@ const HARNESS_ID = 'claude-code';
  * "tidy up the strip list" edit fails loudly instead of silently breaking
  * headless auth. Phase 6 measured it end to end under a real launchd job —
  * `test/tools/launchd-env-probe.sh`, which observes the variable arriving in the
- * job AND surviving `buildChildEnv`, while `OWENWORK_TOKEN` set in the same
+ * job AND surviving `buildChildEnv`, while `OWENLOOP_TOKEN` set in the same
  * plist does not survive.
  */
 const STRIPPED_ENV_KEYS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDECODE'] as const;
@@ -84,10 +84,10 @@ const STRIPPED_ENV_KEYS = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDEC
  *  purpose: the contract deliberately refused an `allowApiBilling` field on
  *  `StartArgs` (it is machine config, not per-start data) and `src/settings.ts`
  *  is shared surface another phase may be editing. */
-const ALLOW_API_BILLING_VAR = 'OWENWORK_ALLOW_API_BILLING';
+const ALLOW_API_BILLING_VAR = 'OWENLOOP_ALLOW_API_BILLING';
 
 /** Operator override for the CLI binary; see `resolveExecutable`. */
-const BIN_OVERRIDE_VAR = 'OWENWORK_CLAUDE_BIN';
+const BIN_OVERRIDE_VAR = 'OWENLOOP_CLAUDE_BIN';
 
 /**
  * Build the environment the harness child runs under.
@@ -118,23 +118,23 @@ const BIN_OVERRIDE_VAR = 'OWENWORK_CLAUDE_BIN';
  *     adapter, it is a correctness requirement (an inherited key shadows the
  *     subscription and bills credits), and it is under the `allowApiBilling`
  *     opt-out.
- *  2. `filterOwenworkEnv` — Phase 6's `OWENWORK_*` namespace allowlist, shared
- *     with the other adapter and NOT under any opt-out. It removes owenwork's
+ *  2. `filterOwenloopEnv` — Phase 6's `OWENLOOP_*` namespace allowlist, shared
+ *     with the other adapter and NOT under any opt-out. It removes owenloop's
  *     own variables that no harness child has a consumer for — the hub bearer
  *     override above all — and touches nothing outside that namespace. In
  *     particular it cannot reach `CLAUDE_CODE_OAUTH_TOKEN`, which is not an
- *     `OWENWORK_*` name and therefore survives by construction, which is what
+ *     `OWENLOOP_*` name and therefore survives by construction, which is what
  *     Phase 6 item 3 needs under launchd.
  *
  * Everything else survives: `PATH`, `HOME`, `TMPDIR`, proxy and TLS variables,
- * and the three admitted `OWENWORK_*` names the mounted work-holder MCP child
+ * and the three admitted `OWENLOOP_*` names the mounted work-holder MCP child
  * actually reads.
  */
 export function buildChildEnv(
   source: Record<string, string | undefined>,
   opts: { allowApiBilling: boolean },
 ): Record<string, string | undefined> {
-  const result = filterOwenworkEnv(source);
+  const result = filterOwenloopEnv(source);
   if (!opts.allowApiBilling) {
     for (const key of STRIPPED_ENV_KEYS) delete result[key];
   }
@@ -152,7 +152,7 @@ export function allowApiBillingFrom(source: Record<string, string | undefined>):
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the CLI executable: `OWENWORK_CLAUDE_BIN` → a `claude` on `PATH` →
+ * Resolve the CLI executable: `OWENLOOP_CLAUDE_BIN` → a `claude` on `PATH` →
  * `undefined`.
  *
  * `undefined` means the caller OMITS `pathToClaudeCodeExecutable` entirely and
@@ -222,17 +222,17 @@ function isPlainMap(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/** The mount for owenwork's own work-holder MCP surface, built from the runner's
+/** The mount for owenloop's own work-holder MCP surface, built from the runner's
  *  verbatim argv. `alwaysLoad` forces its tools into the turn-1 prompt instead of
  *  deferring them behind tool search — a step agent that cannot see `submit` on
  *  turn 1 cannot finish its order. */
-function owenworkMount(mount: { command: string; args: string[] }): McpServerConfig {
+function owenloopMount(mount: { command: string; args: string[] }): McpServerConfig {
   return { type: 'stdio', command: mount.command, args: mount.args, alwaysLoad: true };
 }
 
 /**
- * `mcpServers`, with the owenwork mount layered ON TOP of whatever the step's
- * bag declared. An author's own `owenwork` entry is overwritten, exactly as the
+ * `mcpServers`, with the owenloop mount layered ON TOP of whatever the step's
+ * bag declared. An author's own `owenloop` entry is overwritten, exactly as the
  * legacy frontmatter builder overwrites it today — the mount is born bound to a
  * specific order and a step def may not redirect it.
  */
@@ -241,14 +241,14 @@ function mergeMcpServers(
   mount: { command: string; args: string[] },
 ): Record<string, McpServerConfig> {
   const base = isPlainMap(bagServers) ? (bagServers as Record<string, McpServerConfig>) : {};
-  return { ...base, owenwork: owenworkMount(mount) };
+  return { ...base, owenloop: owenloopMount(mount) };
 }
 
 /** Everything `buildClaudeOptions` reads off a start. `deliver` gets only `cwd`
- *  and `owenworkMcp` from the contract, so it passes an empty permission set. */
+ *  and `owenloopMcp` from the contract, so it passes an empty permission set. */
 export interface ClaudeOptionInputs {
   cwd: string;
-  owenworkMcp: { command: string; args: string[] };
+  owenloopMcp: { command: string; args: string[] };
   /** Per-start override; wins over `permissions.model`. */
   model?: string;
   /** Per-start override; wins over `permissions.effort`. */
@@ -284,7 +284,7 @@ export function buildClaudeOptions(
     cwd: inputs.cwd,
     env: extra.env,
     abortController: extra.abortController,
-    mcpServers: mergeMcpServers(permissions.extensions['mcpServers'], inputs.owenworkMcp),
+    mcpServers: mergeMcpServers(permissions.extensions['mcpServers'], inputs.owenloopMcp),
     stderr: (data: string) => {
       extra.onEvent({ kind: 'progress', text: `stderr: ${data.trimEnd()}` });
     },
@@ -387,7 +387,7 @@ interface ClaudeSession {
   query: Query;
   abortController: AbortController;
   /** The RESOLVED options this session started under. Stashed because the
-   *  contract's `deliver` carries only `cwd`+`owenworkMcp`, while permission
+   *  contract's `deliver` carries only `cwd`+`owenloopMcp`, while permission
    *  mode, tool lists, model and maxTurns are PER-INVOCATION flags a resumed
    *  session does not restore. See the note on `deliver`. */
   options: Options;
@@ -624,7 +624,7 @@ async function stop(ref: HarnessSessionRef): Promise<void> {
  * are legal is vendor knowledge, so it belongs in the vendor's own file and
  * nowhere else.
  *
- * `name` and `description` are RESERVED — owenwork generates the subagent
+ * `name` and `description` are RESERVED — owenloop generates the subagent
  * identity, so a def that sets them is overridden silently and is worth an error.
  */
 const RESERVED_KEYS = ['name', 'description'] as const;
@@ -711,8 +711,8 @@ function lintStep(bag: Record<string, unknown>, step: string): LintFinding[] {
     err(`memory must be one of ${[...MEMORY_SCOPES].join('|')}`, 'memory');
   }
 
-  if (isPlainMap(bag['mcpServers']) && 'owenwork' in bag['mcpServers']) {
-    warn('mcpServers.owenwork is reserved and is replaced by the runner at start', 'mcpServers');
+  if (isPlainMap(bag['mcpServers']) && 'owenloop' in bag['mcpServers']) {
+    warn('mcpServers.owenloop is reserved and is replaced by the runner at start', 'mcpServers');
   }
 
   return findings;
@@ -722,7 +722,7 @@ function lintStep(bag: Record<string, unknown>, step: string): LintFinding[] {
  * The command a human runs to re-open this session in an interactive terminal.
  *
  * WHY IT RESOLVES THE BINARY RATHER THAN PRINTING A BARE NAME. An operator who
- * set `OWENWORK_CLAUDE_BIN` did so because the plain name does not run on their
+ * set `OWENLOOP_CLAUDE_BIN` did so because the plain name does not run on their
  * machine, and a listing that prints a command they cannot paste is worse than
  * printing nothing. `resolveExecutable` returns `undefined` when neither the
  * override nor a `PATH` hit exists; the bare CLI name is the honest fallback

@@ -398,10 +398,10 @@ hub's own def hashes, so an unchanged re-push is a no-op. `owenloop agent new
 Setting up a machine from scratch? `owenloop setup` may sign you in as a human
 and, when needed, mint or rekey and store a Scoped Identity. Setup writes only
 `hubOrigin` into the execution settings file, preserving the other keys. The
-file is `$XDG_CONFIG_HOME/owenwork/settings.json` when `XDG_CONFIG_HOME` is
-set to a non-blank value; otherwise `$HOME/.config/owenwork/settings.json`. For
+file is `$XDG_CONFIG_HOME/owenloop/settings.json` when `XDG_CONFIG_HOME` is
+set to a non-blank value; otherwise `$HOME/.config/owenloop/settings.json`. For
 a non-default account,
-setup only prints the `OWENWORK_ACCOUNT=<name>` instruction. Setup probes the
+setup only prints the `OWENLOOP_ACCOUNT=<name>` instruction. Setup probes the
 Claude Code plugin and, when it is missing, prints the manual commands
 `claude plugin marketplace add owenloop` and
 `claude plugin install owenloop@owenloop`; setup does not install the plugin.

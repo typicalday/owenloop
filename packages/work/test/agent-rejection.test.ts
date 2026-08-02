@@ -238,9 +238,9 @@ test('a brief that alone exceeds the budget wins; the rejection section is dropp
 
 /**
  * The narrow Phase 4 half of D10, and it is still worth having after Phase 6
- * closed the wide half. Phase 6's `filterOwenworkEnv` keeps `OWENWORK_TOKEN` out
+ * closed the wide half. Phase 6's `filterOwenloopEnv` keeps `OWENLOOP_TOKEN` out
  * of the child ENVIRONMENT; this file covers a channel no env filter can reach —
- * the TEXT owenwork itself puts in front of a harness, the rejection delta and
+ * the TEXT owenloop itself puts in front of a harness, the rejection delta and
  * the replay brief. `test/drill-runner-dispatch.test.ts` holds the third
  * channel, the mount's argv.
  *
@@ -250,7 +250,7 @@ test('a brief that alone exceeds the budget wins; the rejection section is dropp
  * environment — fails here instead of leaking silently.
  */
 const CREDENTIAL_PATTERNS: Array<[string, RegExp]> = [
-  ['OWENWORK_TOKEN', /OWENWORK_TOKEN/],
+  ['OWENLOOP_TOKEN', /OWENLOOP_TOKEN/],
   ['a bearer header', /Bearer\s+\S/i],
   ['a --token flag', /--token[= ]/],
   ['an Authorization header', /Authorization\s*:/i],

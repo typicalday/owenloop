@@ -55,7 +55,7 @@ let cacheDir: string;
 let stateDir: string;
 let tracePath: string;
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'owenwork-drill-rk-'));
+  root = mkdtempSync(join(tmpdir(), 'owenloop-drill-rk-'));
   home = join(root, 'home');
   cacheDir = join(root, 'cache');
   stateDir = join(root, 'state');
@@ -89,18 +89,18 @@ function spawnDaemon(origin: string): ShiftChild {
       '--state-dir', stateDir,
     ],
     fixtureEnv(home, {
-      OWENWORK_CACHE_DIR: cacheDir,
-      OWENWORK_HARNESS_MODULE: FAKE_HARNESS,
+      OWENLOOP_CACHE_DIR: cacheDir,
+      OWENLOOP_HARNESS_MODULE: FAKE_HARNESS,
       // PHASE 4 made the composition root import the real adapters, so the
       // registry is no longer empty and the FIRST-REGISTERED default is no
       // longer the module this seam loads. The drill therefore NAMES the
-      // harness it means, at the `OWENWORK_HARNESS` rank — which is also the
+      // harness it means, at the `OWENLOOP_HARNESS` rank — which is also the
       // honest shape: a drill that silently inherited whatever happened to be
       // imported first was passing for a reason it never asserted.
-      OWENWORK_HARNESS: 'fake',
-      OWENWORK_FAKE_TRACE: tracePath,
+      OWENLOOP_HARNESS: 'fake',
+      OWENLOOP_FAKE_TRACE: tracePath,
       // hang: the turn never ends on its own — only the signal can end this run.
-      OWENWORK_FAKE_SCRIPT: JSON.stringify({ id: 'fake', hang: true }),
+      OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'fake', hang: true }),
     }),
   );
 }

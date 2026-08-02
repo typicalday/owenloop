@@ -2,9 +2,9 @@
  * The shared M4-drill credential-store fixture (WO-6.1).
  *
  * The M4 single-principal failure drills MUST authenticate through owenloop's
- * REAL stored-credential path — NOT the `OWENWORK_TOKEN` dev override. That is
+ * REAL stored-credential path — NOT the `OWENLOOP_TOKEN` dev override. That is
  * the distinguishing requirement of M4: M3 already proved the roles scripted
- * with `OWENWORK_TOKEN`; M4 proves owenwork survives the failure modes while
+ * with `OWENLOOP_TOKEN`; M4 proves owenloop survives the failure modes while
  * reading its bearer from owenloop's on-disk store the way production does.
  *
  * In CI there is no macOS Keychain, so we point owenloop's file backend at a
@@ -81,20 +81,20 @@ export function seedCredentialStore(
 
 /**
  * The hermetic env every drill child runs under. Points owenloop's file store
- * (and owenwork's settings) at the temp `home`, forces the file backend (no
- * Keychain in CI), and — CRITICALLY — STRIPS `OWENWORK_TOKEN`.
+ * (and owenloop's settings) at the temp `home`, forces the file backend (no
+ * Keychain in CI), and — CRITICALLY — STRIPS `OWENLOOP_TOKEN`.
  *
  * `spawnMcp` spreads `process.env` into the child, so a stray ambient dev token
  * would otherwise leak in and take the override branch of `resolveBearer`,
  * silently defeating the whole point of an M4 drill. Setting it to `undefined`
  * makes Node drop the key entirely from the child env, guaranteeing the store
- * path. `OWENWORK_SESSION` is cleared so no ambient session-holder tag rides
- * along (drills that want one pass it explicitly). `OWENWORK_ACCOUNT` is dropped
+ * path. `OWENLOOP_SESSION` is cleared so no ambient session-holder tag rides
+ * along (drills that want one pass it explicitly). `OWENLOOP_ACCOUNT` is dropped
  * for the same reason: a dev machine that exports it (e.g. a conductor's
- * `OWENWORK_ACCOUNT=<name>`) would otherwise make the child resolve
+ * `OWENLOOP_ACCOUNT=<name>`) would otherwise make the child resolve
  * `agent:<name>` instead of the `agent:default` slot the fixture seeds, so the
  * store lookup misses and the child exits 2 before any hub contact. Drills that
- * need a non-default account seed that slot and pass `--as`/`OWENWORK_ACCOUNT`
+ * need a non-default account seed that slot and pass `--as`/`OWENLOOP_ACCOUNT`
  * explicitly via `extra`.
  */
 export function fixtureEnv(home: string, extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
@@ -102,9 +102,9 @@ export function fixtureEnv(home: string, extra: Record<string, string | undefine
     HOME: home,
     XDG_CONFIG_HOME: home,
     OWENLOOP_NO_KEYCHAIN: '1',
-    OWENWORK_TOKEN: undefined, // WO-6.1: never the override — the store path IS the drill
-    OWENWORK_SESSION: '',
-    OWENWORK_ACCOUNT: undefined, // hermeticity: never inherit an ambient account (would miss the seeded agent:default slot)
+    OWENLOOP_TOKEN: undefined, // WO-6.1: never the override — the store path IS the drill
+    OWENLOOP_SESSION: '',
+    OWENLOOP_ACCOUNT: undefined, // hermeticity: never inherit an ambient account (would miss the seeded agent:default slot)
     ...extra,
   };
 }

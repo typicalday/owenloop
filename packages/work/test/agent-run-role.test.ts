@@ -87,10 +87,10 @@ test('exitCodeFor maps every outcome to the documented code', () => {
 const DEF = 'mydef';
 const HASH = 'sha256:deadbeef';
 const TEMPLATE = [
-  'order: __OWENWORK_ORDER__',
-  'origin: __OWENWORK_ORIGIN__',
-  'account: __OWENWORK_ACCOUNT__',
-  'conductor: __OWENWORK_CONDUCTOR__',
+  'order: __OWENLOOP_ORDER__',
+  'origin: __OWENLOOP_ORIGIN__',
+  'account: __OWENLOOP_ACCOUNT__',
+  'conductor: __OWENLOOP_CONDUCTOR__',
 ].join('\n');
 
 function agentOrder(o: { claimed?: boolean; outcome?: string; worker?: string; command?: string } = {}): GetOrderResponse {
@@ -257,21 +257,21 @@ function seedBundle(seed: { harness?: string; model?: string; permissions?: Step
 
 beforeEach(() => {
   savedEnv = { ...process.env };
-  home = mkdtempSync(join(tmpdir(), 'owenwork-agentrun-home-'));
+  home = mkdtempSync(join(tmpdir(), 'owenloop-agentrun-home-'));
   cacheDir = join(home, 'cache');
   process.env['HOME'] = home;
   process.env['XDG_CONFIG_HOME'] = home;
-  process.env['OWENWORK_CACHE_DIR'] = cacheDir;
-  delete process.env['OWENWORK_TOKEN'];
-  delete process.env['OWENWORK_ACCOUNT'];
-  delete process.env['OWENWORK_CONDUCTOR_ID'];
+  process.env['OWENLOOP_CACHE_DIR'] = cacheDir;
+  delete process.env['OWENLOOP_TOKEN'];
+  delete process.env['OWENLOOP_ACCOUNT'];
+  delete process.env['OWENLOOP_CONDUCTOR_ID'];
   // PHASE 4 wired the real adapters into the composition root, so importing this
   // role now fills the registry and the FIRST-REGISTERED default is a real
   // vendor adapter that would try to spawn a real process. Every test below that
   // does not itself exercise harness precedence pins the fixture adapter at the
-  // `OWENWORK_HARNESS` rank; the precedence tests clear or override it.
-  process.env['OWENWORK_HARNESS'] = 'fake';
-  delete process.env['OWENWORK_HARNESS_MODULE'];
+  // `OWENLOOP_HARNESS` rank; the precedence tests clear or override it.
+  process.env['OWENLOOP_HARNESS'] = 'fake';
+  delete process.env['OWENLOOP_HARNESS_MODULE'];
   process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
 });
 afterEach(() => {
@@ -330,8 +330,8 @@ test('run() happy path: agent order → brief → fake harness turn → hub outc
 // credential from the store, so no token may appear in the argv the harness
 // child will see.
 //
-// STRIPPING `OWENWORK_TOKEN` FROM THE CHILD ENV IS NOT DONE HERE EITHER — it is
-// done in the adapters, by `filterOwenworkEnv` (`src/harness/child-env.ts`), and
+// STRIPPING `OWENLOOP_TOKEN` FROM THE CHILD ENV IS NOT DONE HERE EITHER — it is
+// done in the adapters, by `filterOwenloopEnv` (`src/harness/child-env.ts`), and
 // is asserted in `test/child-env.test.ts`, `test/harness-claude.test.ts` and
 // `test/harness-codex.test.ts`. What this file owns is the RUNNER-SIDE half of
 // that Phase 6 change: because the harness child can no longer see the
@@ -340,7 +340,7 @@ test('run() happy path: agent order → brief → fake harness turn → hub outc
 // that the rejection delta and the replay brief carry no credential material —
 // lives in `test/agent-rejection.test.ts`.
 test('run() builds an MCP mount whose args carry no credential', async () => {
-  process.env['OWENWORK_TOKEN'] = 'olp_secret_value';
+  process.env['OWENLOOP_TOKEN'] = 'olp_secret_value';
   const fake: FakeAdapter = createFakeAdapter({ id: 'fake' });
   useAdapter(fake);
   seedBundle();
@@ -355,7 +355,7 @@ test('run() builds an MCP mount whose args carry no credential', async () => {
 
   const started = fake.calls.find((c) => c.kind === 'start');
   assert.ok(started !== undefined && started.kind === 'start');
-  const mcp = started.args.owenworkMcp;
+  const mcp = started.args.owenloopMcp;
   assert.deepEqual(mcp, {
     command: 'owenloop',
     args: ['work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'default', '--conductor=cnd_1', '--mcp'],
@@ -363,14 +363,14 @@ test('run() builds an MCP mount whose args carry no credential', async () => {
   const flat = JSON.stringify(mcp);
   assert.ok(!flat.includes('olp_secret_value'), flat);
   assert.ok(!flat.includes('Bearer'), flat);
-  assert.ok(!/--token|OWENWORK_TOKEN/.test(flat), flat);
+  assert.ok(!/--token|OWENLOOP_TOKEN/.test(flat), flat);
 
   // D10(b), CLOSED in Phase 6: the override is not warned about, it is IGNORED,
   // and the message says what to do instead. Both halves are asserted, because a
   // message that announced the change without making it would be worse than the
   // old warning.
   const stderr = err.join('\n');
-  assert.match(stderr, /OWENWORK_TOKEN is set and is being IGNORED here/);
+  assert.match(stderr, /OWENLOOP_TOKEN is set and is being IGNORED here/);
   assert.match(stderr, /owenloop login --hub/, 'the message must name the actionable alternative');
 });
 
@@ -379,7 +379,7 @@ test('run() builds an MCP mount whose args carry no credential', async () => {
  * log line: what `agent-run` hands to `resolveBearer`.
  *
  * The consequence being prevented is a split brain. The harness child cannot see
- * `OWENWORK_TOKEN` any more, so if the runner still honoured it the runner would
+ * `OWENLOOP_TOKEN` any more, so if the runner still honoured it the runner would
  * authenticate to the hub as the override's principal while the child fell back
  * to the `agent:<account>` credential slot — and an empty slot would surface as
  * an opaque MCP handshake failure mid-order rather than as a refusal at startup.
@@ -389,8 +389,8 @@ test('run() builds an MCP mount whose args carry no credential', async () => {
  * code: 2 (`resolveBearer`'s startup refusal) and NOT 0, which is what a runner
  * that still honoured the override would return.
  */
-test('run() ignores OWENWORK_TOKEN when resolving its own bearer, and refuses at startup', async () => {
-  process.env['OWENWORK_TOKEN'] = 'olp_secret_value';
+test('run() ignores OWENLOOP_TOKEN when resolving its own bearer, and refuses at startup', async () => {
+  process.env['OWENLOOP_TOKEN'] = 'olp_secret_value';
   const fake: FakeAdapter = createFakeAdapter({ id: 'fake' });
   useAdapter(fake);
   seedBundle();
@@ -403,7 +403,7 @@ test('run() ignores OWENWORK_TOKEN when resolving its own bearer, and refuses at
 
   assert.equal(code, 2, 'an empty credential slot must fail at STARTUP, not mid-order');
   assert.deepEqual(fake.calls, [], 'no harness may be started once the bearer is refused');
-  assert.match(err.join('\n'), /OWENWORK_TOKEN is set and is being IGNORED here/);
+  assert.match(err.join('\n'), /OWENLOOP_TOKEN is set and is being IGNORED here/);
 });
 
 test('run() renders the brief from the cached template and passes the step permission bag', async () => {
@@ -472,7 +472,7 @@ test('run() fails honestly (exit 1) when --harness names no registered adapter',
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
 });
 
-test('OWENWORK_HARNESS outranks the step def, and the step def outranks the default', async () => {
+test('OWENLOOP_HARNESS outranks the step def, and the step def outranks the default', async () => {
   const chosen = createFakeAdapter({ id: 'chosen' });
   const other = createFakeAdapter({ id: 'other' });
   useAdapter(chosen);
@@ -480,14 +480,14 @@ test('OWENWORK_HARNESS outranks the step def, and the step def outranks the defa
   seedBundle({ harness: 'other' });
 
   // env wins over the step def
-  process.env['OWENWORK_HARNESS'] = 'chosen';
+  process.env['OWENLOOP_HARNESS'] = 'chosen';
   const a = probeHub({ responses: [agentOrder(), agentOrder({ outcome: 'ok' })], def: DEF });
   assert.equal(await run(WIRE, { hub: a.hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: () => {} }), 0);
   assert.equal(chosen.calls.length > 0, true);
   assert.equal(other.calls.length, 0);
 
   // with no env, the step def's `harness` decides
-  delete process.env['OWENWORK_HARNESS'];
+  delete process.env['OWENLOOP_HARNESS'];
   const b = probeHub({ responses: [agentOrder(), agentOrder({ outcome: 'ok' })], def: DEF });
   assert.equal(await run(WIRE, { hub: b.hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: () => {} }), 0);
   assert.equal(other.calls.length > 0, true);
@@ -518,13 +518,13 @@ test('defaultHarnessId is the first registered id, and registration order is sta
   assert.equal(defaultHarnessId(), atImport[0], 'a late registration cannot steal the default');
 });
 
-test('a bad OWENWORK_HARNESS_MODULE is reported and does not crash the runner', async () => {
-  process.env['OWENWORK_HARNESS_MODULE'] = join(home, 'does-not-exist.mjs');
+test('a bad OWENLOOP_HARNESS_MODULE is reported and does not crash the runner', async () => {
+  process.env['OWENLOOP_HARNESS_MODULE'] = join(home, 'does-not-exist.mjs');
   const { hub } = probeHub({ responses: [noHold('ok')], def: DEF });
   const err: string[] = [];
   const code = await run(WIRE, { hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: (l) => err.push(l) });
   assert.equal(code, 0); // first contact says the run is already done
-  assert.match(err.join('\n'), /could not load OWENWORK_HARNESS_MODULE/);
+  assert.match(err.join('\n'), /could not load OWENLOOP_HARNESS_MODULE/);
 });
 
 // ---- template resolution ----------------------------------------------------

@@ -32,12 +32,12 @@
  * cannot be the thing that refuses, and the reap marks the session `dead` instead.
  *
  * IT ALSO PROVES THE WORK DIRECTORY. Both firings resolve their cwd through
- * `ensureWorkDir` under a `OWENWORK_WORK_ROOT` this drill controls, so the drill
+ * `ensureWorkDir` under a `OWENLOOP_WORK_ROOT` this drill controls, so the drill
  * can assert the per-RUN directory was created once, adopted the second time, and
  * is the cwd that reached the harness on BOTH calls. A resume whose cwd moved is
  * not resumable, so "same directory" is a precondition of the claim above.
  *
- * Credential path: owenloop file store (no OWENWORK_TOKEN), as every drill.
+ * Credential path: owenloop file store (no OWENLOOP_TOKEN), as every drill.
  */
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -119,7 +119,7 @@ let workRoot = '';
 let tracePath = '';
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'owenwork-drill-resume-'));
+  root = mkdtempSync(join(tmpdir(), 'owenloop-drill-resume-'));
   home = join(root, 'home');
   cacheDir = join(root, 'cache');
   workRoot = join(root, 'work');
@@ -168,16 +168,16 @@ function runAgent(origin: string): Promise<{ code: number | null; stderr: string
       env: {
         ...process.env,
         ...fixtureEnv(home, {
-          OWENWORK_CACHE_DIR: cacheDir,
-          OWENWORK_WORK_ROOT: workRoot,
-          OWENWORK_HARNESS_MODULE: FAKE_HARNESS,
+          OWENLOOP_CACHE_DIR: cacheDir,
+          OWENLOOP_WORK_ROOT: workRoot,
+          OWENLOOP_HARNESS_MODULE: FAKE_HARNESS,
           // The composition root registers the real vendor adapters on import, so
           // the first-registered default is one of those. Name the fixture
-          // adapter at the `OWENWORK_HARNESS` rank instead of relying on import
+          // adapter at the `OWENLOOP_HARNESS` rank instead of relying on import
           // order, which is not a property this drill is asserting.
-          OWENWORK_HARNESS: 'fake',
-          OWENWORK_FAKE_TRACE: tracePath,
-          OWENWORK_FAKE_SCRIPT: JSON.stringify({
+          OWENLOOP_HARNESS: 'fake',
+          OWENLOOP_FAKE_TRACE: tracePath,
+          OWENLOOP_FAKE_SCRIPT: JSON.stringify({
             id: 'fake',
             token: 'tok-session-1',
             start: { events: [{ kind: 'turn_ended' }] },

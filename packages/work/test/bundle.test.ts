@@ -86,9 +86,9 @@ test('validateFetchedDef leaves harness absent when the step declares none', () 
   assert.equal(oneStep({ name: 'builder', x: { harness: { id: 'codex' } } }).harnessOptions, undefined);
 });
 
-test('validateFetchedDef leaves x.owenwork untouched alongside x.harness', () => {
-  const s = oneStep({ name: 'builder', x: { harness: { id: 'codex' }, owenwork: { machine: 'winserver' } } });
-  assert.deepEqual(s.x, { harness: { id: 'codex' }, owenwork: { machine: 'winserver' } });
+test('validateFetchedDef leaves x.owenloop untouched alongside x.harness', () => {
+  const s = oneStep({ name: 'builder', x: { harness: { id: 'codex' }, owenloop: { machine: 'winserver' } } });
+  assert.deepEqual(s.x, { harness: { id: 'codex' }, owenloop: { machine: 'winserver' } });
 });
 
 test('validateFetchedDef errors honestly on a malformed harness carrier, naming the step', () => {
@@ -256,7 +256,7 @@ test('fetchDef rejects non-JSON 2xx', async () => {
 
 let cacheDir: string;
 beforeEach(() => {
-  cacheDir = mkdtempSync(join(tmpdir(), 'owenwork-cache-'));
+  cacheDir = mkdtempSync(join(tmpdir(), 'owenloop-cache-'));
 });
 afterEach(() => {
   rmSync(cacheDir, { recursive: true, force: true });
@@ -276,10 +276,10 @@ const mkBundleChild = (name: string, hash: string, fetchedAt = Date.now()): Cach
 });
 
 test('resolveCacheDir prefers env, then settings, then XDG, then HOME', () => {
-  assert.equal(resolveCacheDir({ OWENWORK_CACHE_DIR: '/env' }, '/settings'), '/env');
+  assert.equal(resolveCacheDir({ OWENLOOP_CACHE_DIR: '/env' }, '/settings'), '/env');
   assert.equal(resolveCacheDir({}, '/settings'), '/settings');
-  assert.equal(resolveCacheDir({ XDG_CACHE_HOME: '/xdg' }), join('/xdg', 'owenwork'));
-  assert.equal(resolveCacheDir({ HOME: '/home/u' }), join('/home/u', '.cache', 'owenwork'));
+  assert.equal(resolveCacheDir({ XDG_CACHE_HOME: '/xdg' }), join('/xdg', 'owenloop'));
+  assert.equal(resolveCacheDir({ HOME: '/home/u' }), join('/home/u', '.cache', 'owenloop'));
   assert.throws(() => resolveCacheDir({}), /cannot locate a cache directory/);
 });
 

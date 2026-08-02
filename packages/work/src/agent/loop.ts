@@ -72,7 +72,7 @@ import type {
 import { isResumeUnavailable } from '../harness/contract.ts';
 import { orderId, type SessionRecord, type SessionStatus } from '../harness/session-store.ts';
 import {
-  buildOwenworkMcp,
+  buildOwenloopMcp,
   renderBrief,
   renderRejection,
   renderReplayBrief,
@@ -110,7 +110,7 @@ export type StepLoader = (order: OrderPacket) => Promise<NormalizedStepSpec | nu
  *
  * The loop never reads a registry and never names a harness: the role
  * (`src/roles/agent-run.ts`, the composition root) owns the precedence
- * `--harness` > `OWENWORK_HARNESS` > the step def's `harness` field > the
+ * `--harness` > `OWENLOOP_HARNESS` > the step def's `harness` field > the
  * built-in default, and hands back the id it picked plus the adapter, if any.
  * `registered` is only ever used to make the failure message actionable.
  */
@@ -532,10 +532,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       if (delta.deliveredReasonAt !== undefined) deliveredReasonAt = delta.deliveredReasonAt;
     }
 
-    const owenworkMcp = buildOwenworkMcp(spec);
+    const owenloopMcp = buildOwenloopMcp(spec);
     const deliverArgs: DeliverArgs = {
       cwd: recordCwd,
-      owenworkMcp,
+      owenloopMcp,
       permissions,
       ...(packet.model !== undefined ? { model: packet.model } : {}),
     };
@@ -550,7 +550,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
           : {}),
       }),
       cwd: recordCwd,
-      owenworkMcp,
+      owenloopMcp,
       permissions,
       ...(packet.model !== undefined ? { model: packet.model } : {}),
     });

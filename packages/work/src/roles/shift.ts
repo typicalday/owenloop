@@ -99,7 +99,7 @@ function parseStartArgs(args: string[]): StartArgs {
 function resolveSocketPath(flag: string | undefined): { path?: string; error?: string } {
   const env = process.env;
   let settingsStateDir: string | undefined;
-  if (flag === undefined && (env['OWENWORK_STATE_DIR'] === undefined || env['OWENWORK_STATE_DIR']?.trim() === '')) {
+  if (flag === undefined && (env['OWENLOOP_STATE_DIR'] === undefined || env['OWENLOOP_STATE_DIR']?.trim() === '')) {
     try {
       settingsStateDir = loadSettings(env).stateDir;
     } catch (error) {

@@ -1,5 +1,5 @@
-{"dir":"out","t":2,"frame":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"owenwork-recorder","version":"0.0.0"}}}}
-{"dir":"in","t":442,"frame":{"id":1,"result":{"userAgent":"owenwork-recorder/0.146.0 (Mac OS 26.2.0; arm64) unknown (owenwork-recorder; 0.0.0)","codexHome":"/tmp/fixture-codex-home","platformFamily":"unix","platformOs":"macos"}}}
+{"dir":"out","t":2,"frame":{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"owenloop-recorder","version":"0.0.0"}}}}
+{"dir":"in","t":442,"frame":{"id":1,"result":{"userAgent":"owenloop-recorder/0.146.0 (Mac OS 26.2.0; arm64) unknown (owenloop-recorder; 0.0.0)","codexHome":"/tmp/fixture-codex-home","platformFamily":"unix","platformOs":"macos"}}}
 {"dir":"out","t":442,"frame":{"jsonrpc":"2.0","method":"initialized","params":{}}}
 {"dir":"out","t":443,"frame":{"jsonrpc":"2.0","id":2,"method":"thread/resume","params":{"threadId":"11111111-1111-4111-8111-111111111111","cwd":"/tmp/fixture-cwd"}}}
 {"dir":"in","t":443,"frame":{"method":"remoteControl/status/changed","params":{"status":"disabled","serverName":"fixture-host","installationId":"00000000-0000-0000-0000-000000000000","environmentId":null},"emittedAtMs":1785446014804}}

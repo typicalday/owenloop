@@ -14,7 +14,7 @@ let configDir: string;
 let children: ShiftChild[];
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'owenwork-shift-signal-'));
+  root = mkdtempSync(join(tmpdir(), 'owenloop-shift-signal-'));
   configDir = join(root, 'config');
   children = [];
 });
@@ -35,7 +35,7 @@ test('SIGINT and SIGTERM clean each foreground shift socket without an end ping'
       const stateDir = join(root, `state-${String(index)}`);
       const shift = spawnShift(
         ['crew-signal', '--origin', origin, '--poll-interval', '25', '--state-dir', stateDir],
-        { OWENWORK_TOKEN: TOKEN, XDG_CONFIG_HOME: configDir, NODE_NO_WARNINGS: '1' },
+        { OWENLOOP_TOKEN: TOKEN, XDG_CONFIG_HOME: configDir, NODE_NO_WARNINGS: '1' },
       );
       children.push(shift);
       await shift.ready;

@@ -3,7 +3,7 @@
  * PROVISIONING role (NOT runtime): redeem an `ojc_` join code against the
  * hub's unauthenticated `POST /enroll/redeem`, then write the returned
  * `olp_` Scoped Identity token into owenloop's credential store via owenloop's public
- * `storeCredential`. `join` is the SOLE credential-store writer in owenwork —
+ * `storeCredential`. `join` is the SOLE credential-store writer in owenloop —
  * every other role reads the store through `CredentialReader` and never
  * writes it (see src/credentials/resolve.ts).
  *

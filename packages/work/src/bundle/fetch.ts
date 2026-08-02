@@ -50,7 +50,7 @@ function isAgentStep(s: FetchedStep): boolean {
 export const HARNESS_BAG_KEY = 'harness';
 
 /**
- * The sub-key of `x` owenwork used BEFORE `HARNESS_BAG_KEY`. Retained for ONE
+ * The sub-key of `x` owenloop used BEFORE `HARNESS_BAG_KEY`. Retained for ONE
  * purpose: so `parseHarnessCarrier` can recognize a def still written to the old
  * grammar and REJECT it loudly. Nothing ever reads what is inside it.
  *
@@ -84,7 +84,7 @@ function isPlainMap(v: unknown): v is Record<string, unknown> {
  * owenloop's `RAW_STEP_KEYS` rejects unknown top-level step keys at publish
  * today, so a top-level `harness` cannot actually ship yet — reading it is
  * forward compat for the day the grammar promotes the field, and it means the
- * promotion needs no owenwork change.
+ * promotion needs no owenloop change.
  *
  * Validation is loose but HONEST: a non-map `x.harness`, a non-string
  * `x.harness.id`, a non-string top-level `harness`, or a surviving legacy
@@ -123,7 +123,7 @@ export function parseHarnessCarrier(
   if (isPlainMap(x) && LEGACY_BAG_KEY in x) {
     throw new Error(
       `${where} carries a legacy 'x.${LEGACY_BAG_KEY}' bag — rename that key to ` +
-        `'x.${HARNESS_BAG_KEY}' (the fields inside it are unchanged). owenwork no longer ` +
+        `'x.${HARNESS_BAG_KEY}' (the fields inside it are unchanged). owenloop no longer ` +
         `reads 'x.${LEGACY_BAG_KEY}', so running the step with it would silently drop the ` +
         `step's tools, disallowedTools, permissionMode, maxTurns and effort.`,
     );
@@ -188,7 +188,7 @@ function validateDefEnvelope(data: unknown, label: string): FetchedDef {
       throw new Error(`hub workflow '${label}': step '${s['name'] as string}' has a non-map x`);
     }
     // Lift the neutral harness carrier out of `x.harness` (D1). `x` itself is
-    // still carried through verbatim — `x.owenwork` is a separate live
+    // still carried through verbatim — `x.owenloop` is a separate live
     // namespace that `src/proxy/routing.ts` reads.
     const carrier = parseHarnessCarrier(s, label, s['name'] as string);
     return {

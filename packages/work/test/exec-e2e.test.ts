@@ -22,7 +22,7 @@ import type { CommandReceipt } from '../src/exec/receipt.ts';
 //      submit, a release observed on the wire.
 // Commands are harmless fixtures in a temp cwd.
 
-const CWD = mkdtempSync(join(tmpdir(), 'owenwork-exec-e2e-'));
+const CWD = mkdtempSync(join(tmpdir(), 'owenloop-exec-e2e-'));
 const EXEC = { kind: 'exec' as const, id: 'host:9' };
 const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 

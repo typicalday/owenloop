@@ -1,6 +1,6 @@
 /**
  * A registrable fake harness for the DRILLS, loaded by a spawned `owenloop work
- * agent-run` child through the `OWENWORK_HARNESS_MODULE` test seam.
+ * agent-run` child through the `OWENLOOP_HARNESS_MODULE` test seam.
  *
  * WHY A SEPARATE `.mjs` RATHER THAN THE UNIT TESTS' IN-PROCESS FAKE: a drill
  * spawns a REAL detached child, so the child has its own module graph and the
@@ -15,12 +15,12 @@
  *
  * CONFIGURATION — everything arrives through the child's env, since there is no
  * other channel into a detached process:
- *   OWENWORK_FAKE_SCRIPT  JSON. `{ id?, token?, hang?, start?, deliver? }`.
+ *   OWENLOOP_FAKE_SCRIPT  JSON. `{ id?, token?, hang?, start?, deliver? }`.
  *                         `start`/`deliver` are `FakeScript`s (see
  *                         src/harness/fake.ts). `hang: true` makes `start` emit
  *                         its events and then NEVER settle — a turn that is
  *                         still running, which is what the kill drill needs.
- *   OWENWORK_FAKE_TRACE   path to a JSONL file; one line per adapter call
+ *   OWENLOOP_FAKE_TRACE   path to a JSONL file; one line per adapter call
  *                         (`start` / `deliver` / `stop`), so the parent drill
  *                         can observe a child whose stdio is 'ignore'.
  *
@@ -34,7 +34,7 @@ import { createFakeAdapter } from '../../../../dist/packages/work/src/harness/fa
 import { register } from '../../../../dist/packages/work/src/harness/registry.js';
 
 function readScript() {
-  const raw = process.env['OWENWORK_FAKE_SCRIPT'];
+  const raw = process.env['OWENLOOP_FAKE_SCRIPT'];
   if (raw === undefined || raw.trim() === '') return {};
   try {
     return JSON.parse(raw);
@@ -44,7 +44,7 @@ function readScript() {
 }
 
 const spec = readScript();
-const tracePath = process.env['OWENWORK_FAKE_TRACE'];
+const tracePath = process.env['OWENLOOP_FAKE_TRACE'];
 
 /** Append one traced call. Fail-open — a trace write must never fail a run. */
 function trace(entry) {
@@ -82,7 +82,7 @@ const adapter = {
       harnessId: inner.id,
       cwd: args.cwd ?? null,
       brief: args.brief,
-      mcp: args.owenworkMcp,
+      mcp: args.owenloopMcp,
       model: args.model ?? null,
       permissions: args.permissions,
     });

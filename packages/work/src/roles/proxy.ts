@@ -40,7 +40,7 @@ export function resolveStateDirOverride(
   env: Record<string, string | undefined>,
   settingsStateDir: string | undefined,
 ): string | undefined {
-  return flag ?? env['OWENWORK_STATE_DIR'] ?? settingsStateDir;
+  return flag ?? env['OWENLOOP_STATE_DIR'] ?? settingsStateDir;
 }
 
 export function resolveMaxConcurrentAgents(

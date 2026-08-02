@@ -42,15 +42,15 @@
  * Origin/credential resolution mirrors `exec`: origin `--origin` → settings; the
  * bearer comes from owenloop's store via `resolveBearer`, reading the
  * `agent:<account>` slot for the account the proxy set in this child's
- * `OWENWORK_ACCOUNT` spawn env (default `default`). `agent-run` has NO `--as`
+ * `OWENLOOP_ACCOUNT` spawn env (default `default`). `agent-run` has NO `--as`
  * flag — the spawn-env channel is the contract.
  *
  * D10, CLOSED IN PHASE 6. The MCP mount this runner builds carries no
  * credential — the mounted work-holder resolves its own from the same store —
- * and as of Phase 6 the dev-only `OWENWORK_TOKEN` override is no longer
+ * and as of Phase 6 the dev-only `OWENLOOP_TOKEN` override is no longer
  * inherited by the harness child either. Both adapters filter it out through
- * `filterOwenworkEnv` (`src/harness/child-env.ts`), an allowlist scoped to the
- * `OWENWORK_*` namespace ONLY, so nothing a harness needs in order to start —
+ * `filterOwenloopEnv` (`src/harness/child-env.ts`), an allowlist scoped to the
+ * `OWENLOOP_*` namespace ONLY, so nothing a harness needs in order to start —
  * `PATH`, `HOME`, `NODE_OPTIONS`, a proxy setting, a vendor's own credential
  * variable — can be stranded by it.
  *
@@ -228,7 +228,7 @@ export interface RunDeps {
 }
 
 /**
- * Import the module named by `OWENWORK_HARNESS_MODULE`, if any, so its
+ * Import the module named by `OWENLOOP_HARNESS_MODULE`, if any, so its
  * `register(...)` side effect fires before adapter resolution.
  *
  * TEST SEAM. Phase 4 filled the composition root's static import block above
@@ -236,7 +236,7 @@ export interface RunDeps {
  * adapter at all. What it still buys is the ability for a drill to register a
  * FAKE adapter inside a real spawned child without the child reaching for a
  * real CLI. Production leaves the variable unset and this is a no-op. Drills
- * that use it also pin `OWENWORK_HARNESS=fake`, because the statically
+ * that use it also pin `OWENLOOP_HARNESS=fake`, because the statically
  * imported real adapters now occupy the front of the registry and would
  * otherwise win the `defaultHarnessId()` tie-break. A failed import is
  * reported and then ignored — resolution proceeds and fails honestly with
@@ -247,7 +247,7 @@ async function loadHarnessModule(spec: string | undefined, err: (line: string) =
   try {
     await import(spec);
   } catch (e) {
-    err(`owenloop work agent-run: could not load OWENWORK_HARNESS_MODULE '${spec}': ${errMsg(e)}`);
+    err(`owenloop work agent-run: could not load OWENLOOP_HARNESS_MODULE '${spec}': ${errMsg(e)}`);
   }
 }
 
@@ -297,7 +297,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   // D10, CLOSED in Phase 6 (see the header). The dev-only bearer override is no
-  // longer passed to harness children: `filterOwenworkEnv` denies it in both
+  // longer passed to harness children: `filterOwenloopEnv` denies it in both
   // adapters, because a harness child is an ordinary process that inherits this
   // environment and at least one harness persists its start parameters to disk.
   //
@@ -314,17 +314,17 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   // SCOPE: this file only. `resolveBearer` is unchanged and every other role
   // keeps the override — `agent-run` is the one role that spawns a harness.
   const runnerEnv = { ...env };
-  if ((runnerEnv['OWENWORK_TOKEN'] ?? '') !== '') {
-    delete runnerEnv['OWENWORK_TOKEN'];
+  if ((runnerEnv['OWENLOOP_TOKEN'] ?? '') !== '') {
+    delete runnerEnv['OWENLOOP_TOKEN'];
     err(
-      'owenloop work agent-run: OWENWORK_TOKEN is set and is being IGNORED here. The dev-only ' +
+      'owenloop work agent-run: OWENLOOP_TOKEN is set and is being IGNORED here. The dev-only ' +
         'bearer override is not passed to harness children, so honouring it would ' +
         'authenticate the runner and the harness child as different principals. ' +
         'Authenticate the account instead: `owenloop login --hub <origin> --as agent:<account>`.',
     );
   }
 
-  const account = runnerEnv['OWENWORK_ACCOUNT'] ?? 'default';
+  const account = runnerEnv['OWENLOOP_ACCOUNT'] ?? 'default';
   let hub = deps.hub;
   if (hub === undefined) {
     const bearer = await resolveBearer({ origin, account, env: runnerEnv });
@@ -337,7 +337,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
   const client = hub;
 
-  await loadHarnessModule(env['OWENWORK_HARNESS_MODULE'], err);
+  await loadHarnessModule(env['OWENLOOP_HARNESS_MODULE'], err);
 
   const conductorId = resolveConductorId(parsed.conductor, env);
   const holder: ContactHolder = {
@@ -347,11 +347,11 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   };
 
   /**
-   * Adapter id precedence: `--harness` > `OWENWORK_HARNESS` > the step def's
+   * Adapter id precedence: `--harness` > `OWENLOOP_HARNESS` > the step def's
    * `harness` field > the first registered adapter. Every rank is a plain
    * string comparison — nothing here knows what any id MEANS.
    */
-  const envHarness = env['OWENWORK_HARNESS'];
+  const envHarness = env['OWENLOOP_HARNESS'];
   const resolveAdapter = (stepHarness: string | undefined): AdapterResolution => {
     const id =
       (parsed.harness !== undefined && parsed.harness !== '' ? parsed.harness : undefined) ??

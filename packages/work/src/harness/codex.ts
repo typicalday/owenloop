@@ -41,11 +41,11 @@
  *    with a `turn/completed` notification. Resolving `start`/`deliver` on the
  *    response would report a finished turn that had barely begun. Both recorded
  *    timings are visible in `test/fixtures/codex-app-server-session.jsonl`.
- *  - The owenwork MCP mount is `config.mcp_servers.<name>`, a PER-THREAD option
+ *  - The owenloop MCP mount is `config.mcp_servers.<name>`, a PER-THREAD option
  *    that MERGES with `~/.codex/config.toml` rather than replacing it.
  *  - An MCP server child does NOT inherit this process's environment. codex hands
  *    it only `HOME, LOGNAME, PATH, SHELL, TMPDIR, USER, __CF_USER_TEXT_ENCODING`
- *    plus `mcp_servers.<name>.env`. See `mountEnv` — without it the owenwork
+ *    plus `mcp_servers.<name>.env`. See `mountEnv` — without it the owenloop
  *    mount dies before its MCP `initialize` reply and the step agent has no
  *    `submit` tool.
  *
@@ -73,7 +73,7 @@ import type {
   StartArgs,
 } from './contract.ts';
 import { register } from './registry.ts';
-import { ADMITTED_OWENWORK_KEYS, filterOwenworkEnv } from './child-env.ts';
+import { ADMITTED_OWENLOOP_KEYS, filterOwenloopEnv } from './child-env.ts';
 import { JsonRpcError, startStdioRpc, type StdioRpcClient } from './jsonrpc-stdio.ts';
 
 /** The adapter id. Matches the `"codex"` key in `harness-versions.json`, so the
@@ -81,13 +81,13 @@ import { JsonRpcError, startStdioRpc, type StdioRpcClient } from './jsonrpc-stdi
 export const HARNESS_ID = 'codex';
 
 /** The MCP server name the step agent's `get_order` / `submit` tools live under. */
-const OWENWORK_MCP_NAME = 'owenwork';
+const OWENLOOP_MCP_NAME = 'owenloop';
 
 /** `codex app-server` — the subcommand that speaks JSON-RPC over stdio. */
 const APP_SERVER_ARGS = ['app-server'] as const;
 
 /** Client identity sent on `initialize`. Version is informational only. */
-const CLIENT_INFO = { name: 'owenwork', version: '0.1.0' } as const;
+const CLIENT_INFO = { name: 'owenloop', version: '0.1.0' } as const;
 
 /** Handshake and thread setup are fast; a long budget would only mask a hang. */
 const SETUP_TIMEOUT_MS = 30_000;
@@ -182,19 +182,19 @@ export interface McpServerSpec {
 }
 
 /**
- * Non-`OWENWORK_*` variables the owenwork CLI reads and the mount must carry.
+ * Non-`OWENLOOP_*` variables the owenloop CLI reads and the mount must carry.
  * `HOME` is already in codex's own core set; re-supplying it costs nothing and
  * keeps this list a complete statement of what the child needs.
  */
 const MOUNT_ENV_KEEP = ['HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME'] as const;
 
 /**
- * The environment for the owenwork mount, forwarded from THIS process.
+ * The environment for the owenloop mount, forwarded from THIS process.
  *
  * MEASURED, not assumed: `codex app-server` 0.146.0 does NOT give an MCP server
  * child its own environment. It hands the child exactly
  * `HOME, LOGNAME, PATH, SHELL, TMPDIR, USER, __CF_USER_TEXT_ENCODING`
- * plus whatever `mcp_servers.<name>.env` supplies. So `OWENWORK_TOKEN` never
+ * plus whatever `mcp_servers.<name>.env` supplies. So `OWENLOOP_TOKEN` never
  * arrives on its own, `owenloop work hold --mcp` exits 2 before answering
  * `initialize`, and codex reports the mount as
  * `status:'failed'` / `handshaking with MCP server failed: connection closed:
@@ -202,11 +202,11 @@ const MOUNT_ENV_KEEP = ['HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_
  * never complete. The Claude adapter never needed this because Claude Code
  * passes its own environment to MCP children.
  *
- * PHASE 6 NARROWED THE `OWENWORK_*` HALF FROM A PREFIX TO AN ALLOWLIST. It used
- * to forward the whole `OWENWORK_*` prefix so a new variable could not silently
- * stop reaching the mount. That default is now inverted: `ADMITTED_OWENWORK_KEYS`
+ * PHASE 6 NARROWED THE `OWENLOOP_*` HALF FROM A PREFIX TO AN ALLOWLIST. It used
+ * to forward the whole `OWENLOOP_*` prefix so a new variable could not silently
+ * stop reaching the mount. That default is now inverted: `ADMITTED_OWENLOOP_KEYS`
  * (`src/harness/child-env.ts`) enumerates the names a harness child may see, and
- * a new `OWENWORK_*` variable does NOT reach the mount until somebody adds it
+ * a new `OWENLOOP_*` variable does NOT reach the mount until somebody adds it
  * there with a named consumer. The reason is the same fact that made the prefix
  * rule better than `{...process.env}`: `thread/start` params are persisted in
  * codex's rollout file, so anything that reaches this mount has a path to disk —
@@ -225,15 +225,15 @@ function mountEnv(): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value === undefined) continue;
-    if (ADMITTED_OWENWORK_KEYS.has(key) || (MOUNT_ENV_KEEP as readonly string[]).includes(key)) {
+    if (ADMITTED_OWENLOOP_KEYS.has(key) || (MOUNT_ENV_KEEP as readonly string[]).includes(key)) {
       out[key] = value;
     }
   }
   return out;
 }
 
-/** The mount for owenwork's own work-holder MCP surface, verbatim from the runner. */
-function owenworkMount(mcp: { command: string; args: string[] }): McpServerSpec {
+/** The mount for owenloop's own work-holder MCP surface, verbatim from the runner. */
+function owenloopMount(mcp: { command: string; args: string[] }): McpServerSpec {
   return { command: mcp.command, args: [...mcp.args], env: mountEnv() };
 }
 
@@ -264,7 +264,7 @@ export function buildThreadStartParams(
   const ext = args.permissions.extensions;
 
   // The escape hatch: any other config key, without re-opening the contract.
-  // `mcp_servers` is merged in AFTER it, so the owenwork mount always wins.
+  // `mcp_servers` is merged in AFTER it, so the owenloop mount always wins.
   const extraConfig = isPlainMap(ext['codexConfig']) ? { ...ext['codexConfig'] } : {};
 
   const bagServers = isPlainMap(ext['mcpServers']) ? ext['mcpServers'] : {};
@@ -272,10 +272,10 @@ export function buildThreadStartParams(
   const mcpServers: Record<string, unknown> = {
     ...configuredServers,
     ...bagServers,
-    // The owenwork mount wins on a key clash, mirroring how the legacy
-    // frontmatter builder overwrites an author's own `owenwork` entry. Without
+    // The owenloop mount wins on a key clash, mirroring how the legacy
+    // frontmatter builder overwrites an author's own `owenloop` entry. Without
     // it the agent has no `submit` tool and the order can never complete.
-    [OWENWORK_MCP_NAME]: owenworkMount(args.owenworkMcp),
+    [OWENLOOP_MCP_NAME]: owenloopMount(args.owenloopMcp),
   };
 
   const config: Record<string, unknown> = { ...extraConfig, mcp_servers: mcpServers };
@@ -348,14 +348,14 @@ export function buildTurnStartParams(
  * them reverts to the server's defaults.
  *
  * PHASE 4 CLOSED CONTRACT OBSERVATION 1. `deliver`'s third argument used to carry
- * only `cwd` and `owenworkMcp`, so a resume in a different process from the start
+ * only `cwd` and `owenloopMcp`, so a resume in a different process from the start
  * (the normal case for a re-offered step) had nothing to rebuild `approvalPolicy`
  * / `sandbox` / `model` from and silently reverted to server defaults. It now
  * carries the normalized `StepPermissions`, so this function derives the SAME
  * params `buildThreadStartParams` would, and `args` WINS over `base` on every
  * key — `base` only fills in what a `DeliverArgs` cannot express.
  *
- * The owenwork mount is ALWAYS re-supplied. Without it the resumed agent has no
+ * The owenloop mount is ALWAYS re-supplied. Without it the resumed agent has no
  * `submit` tool — a silent, total failure.
  */
 export function buildThreadResumeParams(
@@ -378,7 +378,7 @@ export function buildThreadResumeParams(
     config: {
       ...baseConfig,
       ...argsConfig,
-      // `argsServers` already carries the owenwork mount and is spread last, so
+      // `argsServers` already carries the owenloop mount and is spread last, so
       // the mount still wins over anything `base` held under the same name.
       mcp_servers: { ...baseServers, ...argsServers },
     },
@@ -509,20 +509,20 @@ export function mapNotification(method: string, params: unknown): AgentEvent | u
 }
 
 /**
- * Read an `mcpServer/startupStatus/updated` frame for the owenwork mount's
+ * Read an `mcpServer/startupStatus/updated` frame for the owenloop mount's
  * FAILURE only. PURE — exported for tests.
  *
  * Gates on an explicit `'failed'`, never on the absence of a `'ready'`: absence
  * of a notification is not proof of failure, and gating on ever seeing `'ready'`
  * would deadlock the moment the notification is renamed.
  */
-export function readOwenworkMountFailure(method: string, params: unknown): string | undefined {
+export function readOwenloopMountFailure(method: string, params: unknown): string | undefined {
   if (method !== 'mcpServer/startupStatus/updated') return undefined;
   const p = asMap(params);
-  if (str(p['name']) !== OWENWORK_MCP_NAME) return undefined;
+  if (str(p['name']) !== OWENLOOP_MCP_NAME) return undefined;
   if (str(p['status']) !== 'failed') return undefined;
   const err = str(p['error']) ?? str(p['failureReason']) ?? 'no reason reported';
-  return `owenwork MCP server failed to start: ${err}`;
+  return `owenloop MCP server failed to start: ${err}`;
 }
 
 // ---- the adapter ------------------------------------------------------------
@@ -557,9 +557,9 @@ interface CodexSession {
  */
 const SESSIONS = new Map<string, CodexSession>();
 
-/** The binary. `OWENWORK_CODEX_BIN` overrides; otherwise `PATH` resolves `codex`. */
+/** The binary. `OWENLOOP_CODEX_BIN` overrides; otherwise `PATH` resolves `codex`. */
 function resolveBin(): string {
-  return process.env['OWENWORK_CODEX_BIN'] ?? 'codex';
+  return process.env['OWENLOOP_CODEX_BIN'] ?? 'codex';
 }
 
 /**
@@ -628,7 +628,7 @@ function createTurnGate(onEvent: (e: AgentEvent) => void): TurnGate {
         turnId = str(asMap(asMap(params)['turn'])['id']);
       }
 
-      const mounted = readOwenworkMountFailure(method, params);
+      const mounted = readOwenloopMountFailure(method, params);
       const event = mapNotification(method, params);
       if (event !== undefined) onEvent(event);
 
@@ -656,7 +656,7 @@ function createTurnGate(onEvent: (e: AgentEvent) => void): TurnGate {
  * Answer every server→client request. An unanswered one hangs the turn past the
  * runner's lease, which is the single worst outcome available in this file.
  *
- * Exactly ONE thing is auto-approved — a tool call on owenwork's own MCP mount,
+ * Exactly ONE thing is auto-approved — a tool call on owenloop's own MCP mount,
  * see the `mcpServer/elicitation/request` case. Everything else is refused:
  * under `approvalPolicy:'never'` a command/file approval request should not
  * arrive at all; if one does, throwing (which the client turns into a JSON-RPC
@@ -664,7 +664,7 @@ function createTurnGate(onEvent: (e: AgentEvent) => void): TurnGate {
  * policy said would never be asked for is a security decision this adapter is
  * not authorized to make.
  *
- * `item/tool/requestUserInput` and every non-owenwork elicitation emit
+ * `item/tool/requestUserInput` and every non-owenloop elicitation emit
  * `needs_input` and then throw: the Phase 1 contract deliberately has no reply
  * channel, so replying `{answers:{}}` would be fabricating a user's answer. The
  * error reply surfaces to the model as a failed tool call — the least-wrong
@@ -680,7 +680,7 @@ function handleServerRequest(onEvent: (e: AgentEvent) => void) {
           : [];
         const question = asked.length > 0 ? asked.join(' / ') : 'the harness asked for user input';
         onEvent({ kind: 'needs_input', question: cap(question) });
-        throw new Error('owenwork hosts this session headlessly and cannot answer user input');
+        throw new Error('owenloop hosts this session headlessly and cannot answer user input');
       }
 
       case 'mcpServer/elicitation/request': {
@@ -693,14 +693,14 @@ function handleServerRequest(onEvent: (e: AgentEvent) => void) {
         // therefore does not fail safe — it makes `submit` impossible, so the
         // agent can never green its artifact and every codex order dies owing.
         //
-        // This grants exactly one thing: a call to a tool on owenwork's OWN
+        // This grants exactly one thing: a call to a tool on owenloop's OWN
         // mount. That mount is not third-party code — this adapter wrote it into
-        // `thread/start` itself, and `buildThreadStartParams` lets the owenwork
-        // entry win any key clash, so `serverName === 'owenwork'` cannot be some
+        // `thread/start` itself, and `buildThreadStartParams` lets the owenloop
+        // entry win any key clash, so `serverName === 'owenloop'` cannot be some
         // other server wearing the name. Any other server, and any elicitation
         // that is not a tool-call approval, still gets `needs_input` + a throw.
         if (
-          str(p['serverName']) === OWENWORK_MCP_NAME &&
+          str(p['serverName']) === OWENLOOP_MCP_NAME &&
           str(asMap(p['_meta'])['codex_approval_kind']) === 'mcp_tool_call'
         ) {
           return { action: 'accept', content: {} };
@@ -708,7 +708,7 @@ function handleServerRequest(onEvent: (e: AgentEvent) => void) {
 
         const message = str(p['message']) ?? 'an MCP server asked for user input';
         onEvent({ kind: 'needs_input', question: cap(message) });
-        throw new Error('owenwork hosts this session headlessly and cannot answer an elicitation');
+        throw new Error('owenloop hosts this session headlessly and cannot answer an elicitation');
       }
 
       case 'item/commandExecution/requestApproval':
@@ -718,7 +718,7 @@ function handleServerRequest(onEvent: (e: AgentEvent) => void) {
       case 'execCommandApproval': {
         onEvent({
           kind: 'progress',
-          text: `refusing '${method}': owenwork runs with approvalPolicy 'never' and does not grant approvals`,
+          text: `refusing '${method}': owenloop runs with approvalPolicy 'never' and does not grant approvals`,
         });
         throw new Error(`'${method}' is not answerable by a headless host`);
       }
@@ -740,7 +740,7 @@ interface OpenedClient {
    * Two observers race to report the same death: the failure handler that
    * decided to tear the child down, and `onExit` firing because the teardown
    * killed it. Both must call this — the handler because a child that never
-   * spawned (a bad `OWENWORK_CODEX_BIN`) emits `error` and `close` but never
+   * spawned (a bad `OWENLOOP_CODEX_BIN`) emits `error` and `close` but never
    * `exit`, so `onExit` alone would report nothing; `onExit` because a child that
    * dies on its own is nobody else's news. The latch is what keeps the pair from
    * emitting two `exited` events for one death, and first-caller-wins is
@@ -767,12 +767,12 @@ async function openClient(
     command: resolveBin(),
     args: [...APP_SERVER_ARGS],
     cwd,
-    // PHASE 6 ITEM 5 — the `OWENWORK_*` namespace filter, and ONLY that.
+    // PHASE 6 ITEM 5 — the `OWENLOOP_*` namespace filter, and ONLY that.
     //
     // This is NOT the other adapter's vendor API-key strip, and it must not
     // drift into one: `ANTHROPIC_*` and `OPENAI_*` continue to reach this
     // app-server untouched, which is the recorded decision in
-    // `docs/agent-runner.md`. What changes is that owenwork's own variables with
+    // `docs/agent-runner.md`. What changes is that owenloop's own variables with
     // no consumer inside this process tree — the hub bearer override above all —
     // stop arriving, because this server persists `thread/start` params under
     // `~/.codex/sessions/` and an inherited secret therefore reaches disk.
@@ -780,7 +780,7 @@ async function openClient(
     // The value is a FULL environment (`process.env` minus the denied names),
     // because supplying `env` to the transport replaces the child's environment
     // rather than merging into it.
-    env: filterOwenworkEnv(process.env),
+    env: filterOwenloopEnv(process.env),
     // Every unknown notification lands here and is ignored by `mapNotification`
     // — unsolicited traffic arrives before any request completes, and throwing
     // on one would kill a healthy session.
@@ -818,7 +818,7 @@ async function openClient(
     // is tempting to treat it as part of "starting up" and leave the failure to
     // the caller — but the child is ALREADY SPAWNED and, being `detached`, it is
     // the leader of its own process group. A wedged binary, a wrong
-    // `OWENWORK_CODEX_BIN`, or an `initialize` that times out would otherwise
+    // `OWENLOOP_CODEX_BIN`, or an `initialize` that times out would otherwise
     // leave that group running with nobody holding a handle to it, and the caller
     // would see a rejection with no `exited` event to explain it.
     reportExit(null, describe(err));
@@ -846,7 +846,7 @@ function sleepUnref(ms: number): Promise<void> {
  *
  * Shared by `stop` and by the failure path of a turn that never ended, because
  * both need the same thing and the failure path is the easier one to get wrong:
- * a turn whose gate rejected (an owenwork mount failure is the case that
+ * a turn whose gate rejected (an owenloop mount failure is the case that
  * matters) is still RUNNING on the server, and leaving it alone burns tokens on
  * an answer nobody will ever read.
  *
@@ -890,7 +890,7 @@ function noop(): void {
 /**
  * A turn that rejected did NOT end — drop the session and tear the child down.
  *
- * The case this exists for is the owenwork mount failure: the gate rejects the
+ * The case this exists for is the owenloop mount failure: the gate rejects the
  * instant `mcpServer/startupStatus/updated` reports `failed`, but the SERVER is
  * still happily running the turn, and an agent with no `submit` tool can only
  * spend tokens on an order it cannot possibly complete. A child death or a
@@ -924,7 +924,7 @@ export const codexAdapter: HarnessAdapter = {
    * The command a human runs to re-open this thread in an interactive terminal.
    *
    * It goes through `resolveBin`, the SAME resolution the app-server spawn uses,
-   * so an operator who set `OWENWORK_CODEX_BIN` is handed a command that runs on
+   * so an operator who set `OWENLOOP_CODEX_BIN` is handed a command that runs on
    * their machine rather than a bare name their shell cannot find. The token in
    * `HarnessSessionRef` is the thread id, which is exactly what the CLI's
    * `resume` subcommand takes.

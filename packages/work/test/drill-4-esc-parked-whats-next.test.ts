@@ -23,7 +23,7 @@ let home: string;
 let cacheDir: string;
 let stateDir: string;
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'owenwork-drill4-'));
+  root = mkdtempSync(join(tmpdir(), 'owenloop-drill4-'));
   home = join(root, 'home');
   cacheDir = join(root, 'cache');
   stateDir = join(root, 'state');

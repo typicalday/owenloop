@@ -52,18 +52,18 @@ export interface ChildRecord {
 }
 
 /**
- * Resolve the state dir: `override` → `$XDG_STATE_HOME/owenwork/exec` →
- * `$HOME/.local/state/owenwork/exec`. Throws when none is available (same
+ * Resolve the state dir: `override` → `$XDG_STATE_HOME/owenloop/exec` →
+ * `$HOME/.local/state/owenloop/exec`. Throws when none is available (same
  * stance as the cache/settings resolvers — never guess a home dir). Tests pass
  * an explicit `override` pointing at a temp dir.
  */
 export function resolveStateDir(env: Record<string, string | undefined>, override?: string): string {
   if (override !== undefined && override.trim() !== '') return override;
   const xdg = env['XDG_STATE_HOME'];
-  if (xdg !== undefined && xdg.trim() !== '') return join(xdg, 'owenwork', 'exec');
+  if (xdg !== undefined && xdg.trim() !== '') return join(xdg, 'owenloop', 'exec');
   const home = env['HOME'];
-  if (home !== undefined && home.trim() !== '') return join(home, '.local', 'state', 'owenwork', 'exec');
-  throw new Error('cannot locate a state directory: set OWENWORK_STATE_DIR, XDG_STATE_HOME, or HOME');
+  if (home !== undefined && home.trim() !== '') return join(home, '.local', 'state', 'owenloop', 'exec');
+  throw new Error('cannot locate a state directory: set OWENLOOP_STATE_DIR, XDG_STATE_HOME, or HOME');
 }
 
 /** Map a run id onto a safe record filename (hub run ids are already safe; this

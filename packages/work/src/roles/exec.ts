@@ -21,13 +21,13 @@
  * `{kind:'exec', id}` where id is `<hostname>:<pid>`. `kind:'exec'` is the drain
  * exemption (B3/C6): an exec-held claim survives a SESSION drain — only a signal
  * aimed at THIS process hands the order back. `--conductor <cid>` (env fallback
- * `OWENWORK_CONDUCTOR_ID`), when known, rides along on the holder as
+ * `OWENLOOP_CONDUCTOR_ID`), when known, rides along on the holder as
  * `conductorId` — self-declared and advisory only (D8/INV-82).
  *
  * Origin/credential resolution mirrors `hold`/`proxy`: origin `--origin` →
  * settings; the bearer comes from owenloop's store via `resolveBearer`, reading
  * the `agent:<account>` slot for the account the proxy set in this child's
- * `OWENWORK_ACCOUNT` spawn env (default `default`), with `OWENWORK_TOKEN` as a
+ * `OWENLOOP_ACCOUNT` spawn env (default `default`), with `OWENLOOP_TOKEN` as a
  * documented dev-only override. Exec has NO `--as` flag — the spawn-env channel
  * is the contract. Exit codes are documented in `src/usage.ts`.
  */
@@ -195,7 +195,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 2;
   }
 
-  const account = env['OWENWORK_ACCOUNT'] ?? 'default';
+  const account = env['OWENLOOP_ACCOUNT'] ?? 'default';
   const bearer = await resolveBearer({ origin, account, env });
   if (!bearer.ok) {
     err(`owenloop work exec: ${bearer.message}`);

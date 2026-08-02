@@ -9,7 +9,7 @@
  * composite `<workflow>/<run>` order-id `owenloop work exec` parses, and `--origin`
  * is passed through so the detached child reaches the SAME hub the proxy is
  * parked at without re-reading settings. The proxy-resolved account rides the
- * child's spawn ENV as `OWENWORK_ACCOUNT` (exec has no `--as` flag — the spawn
+ * child's spawn ENV as `OWENLOOP_ACCOUNT` (exec has no `--as` flag — the spawn
  * env is the contract), selecting which Scoped Identity credential slot
  * (agent:<account>) exec reads.
  *
@@ -43,7 +43,7 @@ export interface SpawnSpec {
   /**
    * The harness id to host the step agent in, for `kind: 'agent-run'` only.
    * Absent carries no `--harness` flag, leaving the child to resolve the id
-   * from `OWENWORK_HARNESS`, the step def, or its built-in default. Ignored for
+   * from `OWENLOOP_HARNESS`, the step def, or its built-in default. Ignored for
    * `'exec'` (a command order has no step agent).
    */
   harness?: string;
@@ -87,7 +87,7 @@ export function resolveOwenloopBin(): string {
  * current Node (`execPath`), matching the `owenloop work exec <order-id>` arg contract
  * (the composite `<workflow>/<run>` carries both ids in one positional).
  *
- * The account is NOT an argv flag — it rides `options.env.OWENWORK_ACCOUNT`.
+ * The account is NOT an argv flag — it rides `options.env.OWENLOOP_ACCOUNT`.
  * `env` starts from `process.env` so the detached child keeps the parent's
  * environment inheritance (which is otherwise implicit when `env` is unset),
  * then sets the resolved account on top.
@@ -127,7 +127,7 @@ export function buildSpawnPlan(
         ? ['--harness', spec.harness]
         : []),
     ],
-    options: { detached: true, stdio: 'ignore', env: { ...process.env, OWENWORK_ACCOUNT: account } },
+    options: { detached: true, stdio: 'ignore', env: { ...process.env, OWENLOOP_ACCOUNT: account } },
   };
 }
 

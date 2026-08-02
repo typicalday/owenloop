@@ -4,7 +4,7 @@
  * SKIPPED BY DEFAULT. It needs a logged-in machine and it spends real tokens, so
  * CI stays green without credentials and nobody's laptop runs it by accident:
  *
- *     OWENWORK_LIVE_TESTS=1 node --test test/harness-codex-live.test.ts
+ *     OWENLOOP_LIVE_TESTS=1 node --test test/harness-codex-live.test.ts
  *
  * What it is for: the unit tests in `harness-codex.test.ts` prove the adapter
  * agrees with a RECORDING. Only this file proves it still agrees with the
@@ -16,7 +16,7 @@
  * guarded in `harness-codex.test.ts`:
  *
  *   1. codex does NOT give an MCP server child this process's environment, so
- *      `OWENWORK_TOKEN` never arrived, `owenloop work hold --mcp` exited 2 before its
+ *      `OWENLOOP_TOKEN` never arrived, `owenloop work hold --mcp` exited 2 before its
  *      MCP `initialize` reply, and codex reported the mount `failed` (C15).
  *   2. `approvalPolicy:'never'` does NOT cover MCP tool calls, so every
  *      `get_order`/`submit` was recorded as `user rejected MCP tool call` (D9).
@@ -47,8 +47,8 @@ import {
   submittedUrl,
 } from './helpers/live-rejection.ts';
 
-const LIVE = process.env['OWENWORK_LIVE_TESTS'] === '1';
-const skip = LIVE ? false : 'set OWENWORK_LIVE_TESTS=1 to run';
+const LIVE = process.env['OWENLOOP_LIVE_TESTS'] === '1';
+const skip = LIVE ? false : 'set OWENLOOP_LIVE_TESTS=1 to run';
 
 const BIN = join(import.meta.dirname, '..', '..', '..', 'bin', 'owenloop.mjs');
 const TOKEN = 'tok-codex-live';
@@ -111,7 +111,7 @@ function liveArgs(cwd: string, origin: string, brief: string): StartArgs {
   return {
     brief,
     cwd,
-    owenworkMcp: realMount(origin),
+    owenloopMcp: realMount(origin),
     // `workspace-write`, not `read-only`: the hold child's own working set lives
     // under the temp cwd, and a read-only sandbox is not what production runs.
     permissions: normalizeStepPermissions({ permissionMode: 'never', sandbox: 'workspace-write' }),
@@ -131,7 +131,7 @@ function liveDeliverArgs(cwd: string, origin: string): DeliverArgs {
 /**
  * The mount child's environment. `HarnessMcpMount` is `{command, args}` — it has
  * no `env` field, and Phase 2B may not widen the contract — so the adapter
- * forwards `OWENWORK_*` and the XDG vars from ITS OWN environment onto the
+ * forwards `OWENLOOP_*` and the XDG vars from ITS OWN environment onto the
  * mount (see `mountEnv` in `src/harness/codex.ts`). This test therefore sets
  * them on `process.env` and restores them, exactly as the runner's process
  * would already carry them.
@@ -142,20 +142,20 @@ function withChildEnv(t: { after(fn: () => void): void }, configDir: string): vo
     for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
     Object.assign(process.env, saved);
   });
-  process.env['OWENWORK_TOKEN'] = TOKEN;
+  process.env['OWENLOOP_TOKEN'] = TOKEN;
   process.env['XDG_CONFIG_HOME'] = configDir;
-  process.env['OWENWORK_SESSION'] = '';
+  process.env['OWENLOOP_SESSION'] = '';
 }
 
 function of(reqs: HubReq[], verb: string): HubReq[] {
   return reqs.filter((r) => r.verb === verb);
 }
 
-test('live: a real turn drives the real owenwork mount, and deliver resumes the same thread', { skip }, async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'owenwork-codex-live-'));
+test('live: a real turn drives the real owenloop mount, and deliver resumes the same thread', { skip }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-codex-live-'));
   // A temp XDG_CONFIG_HOME means the hold child sees NO settings file: origin
-  // comes only from `--origin`, token only from `OWENWORK_TOKEN`.
-  const configDir = mkdtempSync(join(tmpdir(), 'owenwork-codex-live-cfg-'));
+  // comes only from `--origin`, token only from `OWENLOOP_TOKEN`.
+  const configDir = mkdtempSync(join(tmpdir(), 'owenloop-codex-live-cfg-'));
   t.after(() => {
     rmSync(dir, { recursive: true, force: true });
     rmSync(configDir, { recursive: true, force: true });
@@ -234,11 +234,11 @@ test('live: a real turn drives the real owenwork mount, and deliver resumes the 
       .map((e) => e.text)
       .join('\n');
 
-    // (4) The REAL owenwork mount started under a live server. This is the
+    // (4) The REAL owenloop mount started under a live server. This is the
     //     assertion the stub used to satisfy vacuously.
-    assert.match(text, /MCP server 'owenwork' status ready/, 'the owenwork mount reached ready');
+    assert.match(text, /MCP server 'owenloop' status ready/, 'the owenloop mount reached ready');
 
-    // (5) THE POINT OF THE WHOLE DRILL: the live agent reached owenwork's own
+    // (5) THE POINT OF THE WHOLE DRILL: the live agent reached owenloop's own
     //     tools and the artifact actually landed on the hub. Nothing short of
     //     this proves a codex-driven order can complete.
     assert.ok(of(reqs, 'get_order').length >= 1, 'the hold made first contact with the hub');
@@ -273,13 +273,13 @@ test('live: a real turn drives the real owenwork mount, and deliver resumes the 
   }
 
   // (7) Nothing the ADAPTER could have written appears in the user's config —
-  //     no `[mcp_servers.owenwork]`, no anything else. Only codex's own
+  //     no `[mcp_servers.owenloop]`, no anything else. Only codex's own
   //     project-trust bookkeeping (stripped above) may differ.
   assert.equal(configSansProjects(), configBefore, '~/.codex/config.toml must not be configured by the adapter');
   assert.equal(
-    /\[mcp_servers\.owenwork\]/.test(configSansProjects() ?? ''),
+    /\[mcp_servers\.owenloop\]/.test(configSansProjects() ?? ''),
     false,
-    'the owenwork mount is a per-thread param and must never be persisted',
+    'the owenloop mount is a per-thread param and must never be persisted',
   );
 });
 
@@ -287,8 +287,8 @@ test(
   'live: LIVE REJECTION DRILL — the hub rejects the first submit and the delta alone drives a revision on the same thread',
   { skip, timeout: 600_000 },
   async (t) => {
-    const dir = mkdtempSync(join(tmpdir(), 'owenwork-codex-live-reject-'));
-    const configDir = mkdtempSync(join(tmpdir(), 'owenwork-codex-live-reject-cfg-'));
+    const dir = mkdtempSync(join(tmpdir(), 'owenloop-codex-live-reject-'));
+    const configDir = mkdtempSync(join(tmpdir(), 'owenloop-codex-live-reject-cfg-'));
     t.after(() => {
       rmSync(dir, { recursive: true, force: true });
       rmSync(configDir, { recursive: true, force: true });
@@ -337,7 +337,7 @@ test(
 );
 
 test('live: resuming a thread the provider never knew is ResumeUnavailable', { skip }, async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'owenwork-codex-live-miss-'));
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-codex-live-miss-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
 
   // No hub is started: the resume must fail on the thread id alone, before the

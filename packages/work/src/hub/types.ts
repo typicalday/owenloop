@@ -1,5 +1,5 @@
 /**
- * Typed request/response shapes for the hub verb surface owenwork's roles call.
+ * Typed request/response shapes for the hub verb surface owenloop's roles call.
  *
  * These mirror `apps/hub-edge/src/api/routes.ts` on owenloop-service `origin/main`
  * (B3 lifecycle verbs are merged). Every REST verb returns `{ text, ...data }`

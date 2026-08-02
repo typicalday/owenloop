@@ -18,9 +18,9 @@ test('resolveCap: --cap beats settings.dispatchCap beats the default 3', () => {
   assert.equal(resolveCap(undefined, undefined), 3); // built-in default
 });
 
-test('resolveStateDirOverride: flag > OWENWORK_STATE_DIR > settings; else undefined', () => {
-  assert.equal(resolveStateDirOverride('/flag', { OWENWORK_STATE_DIR: '/env' }, '/settings'), '/flag');
-  assert.equal(resolveStateDirOverride(undefined, { OWENWORK_STATE_DIR: '/env' }, '/settings'), '/env');
+test('resolveStateDirOverride: flag > OWENLOOP_STATE_DIR > settings; else undefined', () => {
+  assert.equal(resolveStateDirOverride('/flag', { OWENLOOP_STATE_DIR: '/env' }, '/settings'), '/flag');
+  assert.equal(resolveStateDirOverride(undefined, { OWENLOOP_STATE_DIR: '/env' }, '/settings'), '/env');
   assert.equal(resolveStateDirOverride(undefined, {}, '/settings'), '/settings');
   assert.equal(resolveStateDirOverride(undefined, {}, undefined), undefined);
 });

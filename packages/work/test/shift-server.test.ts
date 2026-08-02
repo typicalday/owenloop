@@ -64,7 +64,7 @@ function fixture(options: {
   socketPath?: string;
   onPresence?: (request: Record<string, unknown>) => Promise<void> | void;
 } = {}): Fixture {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-server-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-server-'));
   roots.push(root);
   const state: FakeState = {
     name: 'box', servePools: ['alpha'], cap: 3, stopped: false, childAlive: true,
@@ -311,7 +311,7 @@ test('an oversized single event is delivered once with an explicit truncation ma
 });
 
 test('end lets the daemon process exit while a responded client stops reading', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-unread-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-unread-'));
   roots.push(root);
   const socketPath = join(root, 'shift.sock');
   const serverModule = new URL('../src/shift/server.ts', import.meta.url).href;
@@ -434,7 +434,7 @@ test('active daemon refusal leaves the socket untouched', async () => {
 });
 
 test('stale socket recovery removes only a refused socket and binds a new daemon', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-stale-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-stale-'));
   roots.push(root);
   const path = join(root, 'shift.sock');
   execFileSync('python3', ['-c', [
@@ -451,7 +451,7 @@ test('stale socket recovery removes only a refused socket and binds a new daemon
 });
 
 test('a crashed startup lock is recovered by probing its stale lock socket', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-stale-lock-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-stale-lock-'));
   roots.push(root);
   const path = join(root, 'shift.sock');
   execFileSync('python3', ['-c', [
@@ -468,7 +468,7 @@ test('a crashed startup lock is recovered by probing its stale lock socket', asy
 });
 
 test('regular files, directories, and symlinks are never removed as stale sockets', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-nonsocket-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-nonsocket-'));
   roots.push(root);
   for (const kind of ['file', 'directory', 'symlink'] as const) {
     const path = join(root, kind);
@@ -486,7 +486,7 @@ test('regular files, directories, and symlinks are never removed as stale socket
 });
 
 test('inode-safe cleanup does not remove a successor socket', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-inode-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-inode-'));
   roots.push(root);
   let enteredFinal: () => void = () => {};
   let releaseFinal: () => void = () => {};

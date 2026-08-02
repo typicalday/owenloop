@@ -57,7 +57,7 @@ const SRC = new URL('../src/', import.meta.url);
 
 const tmpDirs: string[] = [];
 const scratch = (): string => {
-  const d = mkdtempSync(join(tmpdir(), 'owenwork-lint-'));
+  const d = mkdtempSync(join(tmpdir(), 'owenloop-lint-'));
   tmpDirs.push(d);
   return d;
 };
@@ -74,7 +74,7 @@ function runLint(args: string[]): { status: number; stdout: string; stderr: stri
   const home = scratch();
   const res = spawnSync(process.execPath, [BIN, 'work', 'lint', ...args], {
     encoding: 'utf8',
-    env: { PATH: process.env['PATH'] ?? '', HOME: home, OWENWORK_CACHE_DIR: join(home, 'cache') },
+    env: { PATH: process.env['PATH'] ?? '', HOME: home, OWENLOOP_CACHE_DIR: join(home, 'cache') },
   });
   return { status: res.status ?? -1, stdout: res.stdout, stderr: res.stderr };
 }

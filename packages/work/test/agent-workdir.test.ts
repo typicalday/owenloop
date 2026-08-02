@@ -46,7 +46,7 @@ import {
 let root = '';
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'owenwork-workroot-'));
+  root = mkdtempSync(join(tmpdir(), 'owenloop-workroot-'));
 });
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
@@ -157,20 +157,20 @@ test('runWorkDir is <workRoot>/<workflow>/<run> and touches nothing', () => {
 });
 
 test('resolveWorkRoot: env > settings > <cacheDir>/work', () => {
-  assert.equal(resolveWorkRoot({ OWENWORK_WORK_ROOT: '/from/env' }, '/from/settings', '/cache'), '/from/env');
+  assert.equal(resolveWorkRoot({ OWENLOOP_WORK_ROOT: '/from/env' }, '/from/settings', '/cache'), '/from/env');
   assert.equal(resolveWorkRoot({}, '/from/settings', '/cache'), '/from/settings');
   assert.equal(resolveWorkRoot({}, undefined, '/cache'), join('/cache', 'work'));
   // Blank is not a value at either rank — otherwise an empty env var would
   // silently disable the settings key.
-  assert.equal(resolveWorkRoot({ OWENWORK_WORK_ROOT: '  ' }, '/from/settings', '/cache'), '/from/settings');
-  assert.equal(resolveWorkRoot({ OWENWORK_WORK_ROOT: '  ' }, '   ', '/cache'), join('/cache', 'work'));
+  assert.equal(resolveWorkRoot({ OWENLOOP_WORK_ROOT: '  ' }, '/from/settings', '/cache'), '/from/settings');
+  assert.equal(resolveWorkRoot({ OWENLOOP_WORK_ROOT: '  ' }, '   ', '/cache'), join('/cache', 'work'));
 });
 
 test('resolveWorkRepo: env > settings > undefined (no default repo)', () => {
-  assert.equal(resolveWorkRepo({ OWENWORK_WORK_REPO: '/from/env' }, '/from/settings'), '/from/env');
+  assert.equal(resolveWorkRepo({ OWENLOOP_WORK_REPO: '/from/env' }, '/from/settings'), '/from/env');
   assert.equal(resolveWorkRepo({}, '/from/settings'), '/from/settings');
   assert.equal(resolveWorkRepo({}, undefined), undefined);
-  assert.equal(resolveWorkRepo({ OWENWORK_WORK_REPO: '' }, ''), undefined);
+  assert.equal(resolveWorkRepo({ OWENLOOP_WORK_REPO: '' }, ''), undefined);
 });
 
 test('isUnderWorkRoot admits descendants, and rejects the root itself, siblings, and escapes', () => {
@@ -220,13 +220,13 @@ test('ensureWorkDir in worktree mode runs `git worktree add -b <branch>` in the 
 
   assert.equal(dir, join(root, 'wf1', 'run1'));
   assert.equal(seen.length, 1, 'the first form succeeded, so there is no second attempt');
-  assert.deepEqual(seen[0]!.args, ['worktree', 'add', '-b', `owenwork/wf1/run1`, dir]);
+  assert.deepEqual(seen[0]!.args, ['worktree', 'add', '-b', `owenloop/wf1/run1`, dir]);
   assert.equal(seen[0]!.cwd, '/repo', 'git runs in the REPO, not in the work dir being created');
   // The parent exists (git makes the leaf), but git was the one that made the leaf.
   assert.ok(existsSync(join(root, 'wf1')));
 });
 
-test('a caller-supplied branch overrides the default owenwork/<workflow>/<run>', () => {
+test('a caller-supplied branch overrides the default owenloop/<workflow>/<run>', () => {
   const seen: string[][] = [];
   ensureWorkDir({
     workRoot: root,
@@ -255,7 +255,7 @@ test('a branch that already exists retries `git worktree add <dir> <branch>` wit
     },
   });
   assert.equal(seen.length, 2);
-  assert.deepEqual(seen[1], ['worktree', 'add', join(root, 'wf1', 'run1'), 'owenwork/wf1/run1']);
+  assert.deepEqual(seen[1], ['worktree', 'add', join(root, 'wf1', 'run1'), 'owenloop/wf1/run1']);
 });
 
 test('worktree mode DEGRADES to a plain directory rather than failing the order', () => {
@@ -280,7 +280,7 @@ test('worktree mode DEGRADES to a plain directory rather than failing the order'
 // ---- reapWorkDir -------------------------------------------------------------
 
 test("reapWorkDir REFUSES a directory outside workRoot — the hub's own workdir is untouchable", () => {
-  const outside = mkdtempSync(join(tmpdir(), 'owenwork-not-ours-'));
+  const outside = mkdtempSync(join(tmpdir(), 'owenloop-not-ours-'));
   try {
     assert.equal(reapWorkDir({ dir: outside, workRoot: root }), 'refused');
     assert.ok(existsSync(outside), 'refused means UNTOUCHED, not "tried and failed"');

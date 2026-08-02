@@ -125,11 +125,11 @@ test('resolveTarget errors on an empty side of the split', () => {
 // configured session id falls back to `anon:<hostname>:<pid>` (unique per
 // process, not a shared constant, so `release --session <id>` drains still
 // match only the process that reported that exact id).
-test('resolveHolder prefers --session, falls back to OWENWORK_SESSION, else an anon:<hostname>:<pid> fallback', () => {
+test('resolveHolder prefers --session, falls back to OWENLOOP_SESSION, else an anon:<hostname>:<pid> fallback', () => {
   assert.deepEqual(resolveHolder('sess-a', {}), { kind: 'session', id: 'sess-a' });
-  assert.deepEqual(resolveHolder(undefined, { OWENWORK_SESSION: 'env-sess' }), { kind: 'session', id: 'env-sess' });
+  assert.deepEqual(resolveHolder(undefined, { OWENLOOP_SESSION: 'env-sess' }), { kind: 'session', id: 'env-sess' });
   assert.deepEqual(resolveHolder(undefined, {}, { hostname: 'host1', pid: 42 }), { kind: 'session', id: 'anon:host1:42' });
-  assert.deepEqual(resolveHolder(undefined, { OWENWORK_SESSION: '' }, { hostname: 'host1', pid: 42 }), {
+  assert.deepEqual(resolveHolder(undefined, { OWENLOOP_SESSION: '' }, { hostname: 'host1', pid: 42 }), {
     kind: 'session',
     id: 'anon:host1:42',
   });
@@ -147,15 +147,15 @@ test('resolveHolder threads conductorId onto the holder when known, omits it whe
   assert.deepEqual(resolveHolder('sess-a', {}), { kind: 'session', id: 'sess-a' }); // no conductorId key at all
 });
 
-// W7: flag > OWENWORK_CONDUCTOR_ID env > undefined; an empty flag value does
+// W7: flag > OWENLOOP_CONDUCTOR_ID env > undefined; an empty flag value does
 // NOT fall through to the env var (a deliberate `--conductor=` override of
 // "no cid" is honored, matching the frontmatter degrade-safely contract).
-test('resolveConductorId prefers --conductor flag, falls back to OWENWORK_CONDUCTOR_ID, else undefined', () => {
+test('resolveConductorId prefers --conductor flag, falls back to OWENLOOP_CONDUCTOR_ID, else undefined', () => {
   assert.equal(resolveConductorId('cnd_a', {}), 'cnd_a');
-  assert.equal(resolveConductorId(undefined, { OWENWORK_CONDUCTOR_ID: 'cnd_env' }), 'cnd_env');
+  assert.equal(resolveConductorId(undefined, { OWENLOOP_CONDUCTOR_ID: 'cnd_env' }), 'cnd_env');
   assert.equal(resolveConductorId(undefined, {}), undefined);
-  assert.equal(resolveConductorId(undefined, { OWENWORK_CONDUCTOR_ID: '' }), undefined);
-  assert.equal(resolveConductorId('', { OWENWORK_CONDUCTOR_ID: 'cnd_env' }), undefined);
+  assert.equal(resolveConductorId(undefined, { OWENLOOP_CONDUCTOR_ID: '' }), undefined);
+  assert.equal(resolveConductorId('', { OWENLOOP_CONDUCTOR_ID: 'cnd_env' }), undefined);
 });
 
 // ---- exit-code mapping ------------------------------------------------------
@@ -173,14 +173,14 @@ let home: string;
 let savedEnv: NodeJS.ProcessEnv;
 beforeEach(() => {
   savedEnv = { ...process.env };
-  home = mkdtempSync(join(tmpdir(), 'owenwork-hold-home-'));
+  home = mkdtempSync(join(tmpdir(), 'owenloop-hold-home-'));
   // Hermetic: an empty HOME so loadSettings returns {} (no hubOrigin), and no
   // ambient token/session leaking in from the developer's or CI runner's env.
   process.env['HOME'] = home;
   process.env['XDG_CONFIG_HOME'] = home;
-  delete process.env['OWENWORK_TOKEN'];
-  delete process.env['OWENWORK_SESSION'];
-  delete process.env['OWENWORK_ACCOUNT'];
+  delete process.env['OWENLOOP_TOKEN'];
+  delete process.env['OWENLOOP_SESSION'];
+  delete process.env['OWENLOOP_ACCOUNT'];
   // Hermetic credential store: force owenloop's file backend (no real keychain
   // shell-out) so an unseeded store reads as absent → the refuse path.
   process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
@@ -208,7 +208,7 @@ test('run() exits 2 when no hub origin is resolvable', async () => {
 });
 
 test('run() exits 2 with the refuse message when no Scoped Identity key is stored', async () => {
-  // No OWENWORK_TOKEN override + a hermetic empty file store (temp HOME/XDG,
+  // No OWENLOOP_TOKEN override + a hermetic empty file store (temp HOME/XDG,
   // OWENLOOP_NO_KEYCHAIN forces the file backend) ⇒ the agent slot is absent.
   const err: string[] = [];
   const code = await run(['--order', 'wf1/run1', '--origin', 'https://hub.example'], { err: (l) => err.push(l) });
@@ -334,7 +334,7 @@ function fakeStdinHost(): { host: StdinHost; onCalls: string[]; emitEof: () => v
 const WIRE_ARGS = ['--order', 'wf1/run1', '--origin', 'https://hub.example', '--heartbeat-interval', '5'];
 
 test('run() with --ignore-stdin installs NO stdin watcher (signals still wired)', async () => {
-  process.env['OWENWORK_TOKEN'] = 'tok';
+  process.env['OWENLOOP_TOKEN'] = 'tok';
   const { hub } = roleHub({ getOrder: order(false, 'ok') }); // completed ⇒ run resolves at first contact
   const sig = fakeSignalHost();
   const stdin = fakeStdinHost();
@@ -353,7 +353,7 @@ test('run() with --ignore-stdin installs NO stdin watcher (signals still wired)'
 });
 
 test('run() without --ignore-stdin: stdin EOF triggers stop(stdin-eof) → final-breath release', async () => {
-  process.env['OWENWORK_TOKEN'] = 'tok';
+  process.env['OWENLOOP_TOKEN'] = 'tok';
   const stdin = fakeStdinHost();
   // First heartbeat simulates the parent session dying: stdin reaches EOF.
   const { hub, releases } = roleHub({
@@ -383,7 +383,7 @@ test('run() without --ignore-stdin: stdin EOF triggers stop(stdin-eof) → final
 });
 
 test('run() signal wiring: hold-role message lines, stop(signal), second SIGINT exits 130', async () => {
-  process.env['OWENWORK_TOKEN'] = 'tok';
+  process.env['OWENLOOP_TOKEN'] = 'tok';
   const sig = fakeSignalHost();
   const { hub, releases } = roleHub({
     getOrder: order(true),
@@ -414,12 +414,12 @@ test('run() signal wiring: hold-role message lines, stop(signal), second SIGINT 
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
 });
 
-// ---- store-backed success (no OWENWORK_TOKEN — the primary path) -------------
+// ---- store-backed success (no OWENLOOP_TOKEN — the primary path) -------------
 // These run WITHOUT an injected hub: the role builds a REAL client whose getToken
 // resolves the agent slot from the seeded store; the mock hub answers first
 // contact with a completed order (exit 0) while recording the auth header.
 
-test('with no OWENWORK_TOKEN, hold authenticates with the agent slot token from the store', async () => {
+test('with no OWENLOOP_TOKEN, hold authenticates with the agent slot token from the store', async () => {
   const { server, origin, auths } = await startRecordingHub();
   seedAgentKeys(home, origin, { default: 'olp_from_store' });
   try {

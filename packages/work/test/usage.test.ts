@@ -12,12 +12,12 @@ import { slotArg } from '../src/credentials/resolve.ts';
 
 test('USAGE surfaces the agent-account model (agent slot, default account)', () => {
   assert.match(USAGE, /agent:<account>/, 'help should name the agent:<account> slot');
-  assert.match(USAGE, /never the human slot/, 'help should say owenwork never reads the human slot');
+  assert.match(USAGE, /never the human slot/, 'help should say owenloop never reads the human slot');
   assert.match(USAGE, /defaults to 'default'/, "help should state the account defaults to 'default'");
 });
 
 test('USAGE names the concrete owenloop connect command in both slot forms', () => {
-  // The store-write lives in owenloop; owenwork only points at it. Assert the
+  // The store-write lives in owenloop; owenloop only points at it. Assert the
   // exact command shape and both `--as` forms the refuse hint can print.
   assert.match(
     USAGE,
@@ -38,7 +38,7 @@ test('USAGE connect shape stays consistent with the resolve.ts refuse hint', () 
 });
 
 test('USAGE carries the honest "does not list accounts" note', () => {
-  assert.match(USAGE, /does NOT list stored accounts/, 'help should state owenwork cannot list accounts');
+  assert.match(USAGE, /does NOT list stored accounts/, 'help should state owenloop cannot list accounts');
   assert.match(USAGE, /owenloop-side capability/, 'help should attribute listing to owenloop');
 });
 
@@ -60,7 +60,7 @@ test('USAGE documents the agent-run role, its harness flag, and the hub-is-truth
   assert.match(USAGE, /--confirm-interval <ms>/);
   // The invariant, stated where an operator will actually read it.
   assert.match(USAGE, /Task completion comes from the HUB, never/);
-  assert.match(USAGE, /OWENWORK_HARNESS\b/);
+  assert.match(USAGE, /OWENLOOP_HARNESS\b/);
 });
 
 test('USAGE documents --max-agents and maxConcurrentAgents, and no deleted stamp-path knob', () => {
@@ -69,7 +69,7 @@ test('USAGE documents --max-agents and maxConcurrentAgents, and no deleted stamp
   assert.match(USAGE, /maxConcurrentAgents, workRoot/);
   // Phase 5 deleted the stamp path; its flags, env var, and settings keys must
   // not survive in the one place operators read to learn what exists.
-  for (const gone of ['--runner-dispatch', '--no-stamp', '--settle-margin', '--agents-dir', 'OWENWORK_AGENTS_DIR', 'runnerDispatch', 'agentsDir']) {
+  for (const gone of ['--runner-dispatch', '--no-stamp', '--settle-margin', '--agents-dir', 'OWENLOOP_AGENTS_DIR', 'runnerDispatch', 'agentsDir']) {
     assert.equal(USAGE.includes(gone), false, `USAGE must not mention ${gone}`);
   }
 });

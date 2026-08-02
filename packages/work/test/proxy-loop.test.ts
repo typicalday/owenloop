@@ -33,7 +33,7 @@ const DEMO_HASH = 'abcdef1234567890';
 let stateDir: string;
 let cacheDir: string;
 beforeEach(() => {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-loop-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-loop-'));
   stateDir = join(root, 'state');
   cacheDir = join(root, 'cache');
 });
@@ -441,7 +441,7 @@ test('a step naming no harness passes no harness to the agent-run child', async 
   const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
   await loop.iterate();
   // No `harness` on the step ⇒ no key at all, leaving the child's own precedence
-  // (--harness → OWENWORK_HARNESS → step def → registry head) in charge.
+  // (--harness → OWENLOOP_HARNESS → step def → registry head) in charge.
   assert.equal('harness' in spawns[0]!, false);
 });
 
@@ -648,11 +648,11 @@ test('setShift({servePools: []}) sends serve_pools: [] on the wire, not omitted'
 test('buildSpawnPlan produces the detached `exec <workflow>/<run> --origin` argv shape as pure data', () => {
   const plan = buildSpawnPlan({ workflow: 'wf1', run: 'run_zzzz' }, 'https://hub.example', 'ci', '/pkg/bin/owenloop.mjs', '/usr/bin/node');
   assert.equal(plan.command, '/usr/bin/node');
-  // Account rides the spawn ENV (OWENWORK_ACCOUNT), NOT the argv — exec has no --as flag.
+  // Account rides the spawn ENV (OWENLOOP_ACCOUNT), NOT the argv — exec has no --as flag.
   assert.deepEqual(plan.args, ['/pkg/bin/owenloop.mjs', 'work', 'exec', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
   assert.equal(plan.options.detached, true);
   assert.equal(plan.options.stdio, 'ignore');
-  assert.equal(plan.options.env['OWENWORK_ACCOUNT'], 'ci');
+  assert.equal(plan.options.env['OWENLOOP_ACCOUNT'], 'ci');
   // Inherited parent env survives (env starts from process.env, then stamps the account).
   assert.equal(plan.options.env['PATH'], process.env['PATH']);
 });
@@ -695,7 +695,7 @@ test('buildSpawnPlan: kind agent-run swaps the role positional and keeps every o
   assert.deepEqual(plan.args, ['/pkg/bin/owenloop.mjs', 'work', 'agent-run', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
   assert.equal(plan.options.detached, true);
   assert.equal(plan.options.stdio, 'ignore');
-  assert.equal(plan.options.env['OWENWORK_ACCOUNT'], 'ci');
+  assert.equal(plan.options.env['OWENLOOP_ACCOUNT'], 'ci');
 });
 
 test('buildSpawnPlan: kind agent-run appends --harness <id> when one is named, and --conductor still rides', () => {

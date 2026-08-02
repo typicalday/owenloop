@@ -6,7 +6,7 @@
  * injected `write` sink, and the protocol tests replay frames that were RECORDED
  * from a real `codex app-server` (see the fixture header comments below). The
  * live end-to-end smoke lives in `harness-codex-live.test.ts`, gated on
- * `OWENWORK_LIVE_TESTS=1`.
+ * `OWENLOOP_LIVE_TESTS=1`.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -27,7 +27,7 @@ import {
   codexAdapter,
   isResumeMiss,
   mapNotification,
-  readOwenworkMountFailure,
+  readOwenloopMountFailure,
   readTurnCompleted,
   RESUME_UNAVAILABLE_CODE,
 } from '../src/harness/codex.ts';
@@ -97,7 +97,7 @@ function startArgs(
   return {
     brief: 'do the thing',
     cwd: '/tmp/fixture-cwd',
-    owenworkMcp: { command: '/tmp/fixture-node', args: ['/tmp/fixture-mcp/owenwork-server.mjs'] },
+    owenloopMcp: { command: '/tmp/fixture-node', args: ['/tmp/fixture-mcp/owenloop-server.mjs'] },
     permissions: normalizeStepPermissions(bag, step),
     ...over,
   };
@@ -353,7 +353,7 @@ test('B1 the recorded session replays through mapNotification without throwing',
   assert.match(text, /^ED$/m);
 });
 
-test('B9 the recording drove the REAL owenwork mount, tools and all', () => {
+test('B9 the recording drove the REAL owenloop mount, tools and all', () => {
   // This is what makes the fixture worth having: it was recorded against
   // `bin/owenloop.mjs work hold --order ... --mcp` pointed at a mock hub, so the
   // frames below are the live protocol, not a hand-written approximation.
@@ -362,8 +362,8 @@ test('B9 the recording drove the REAL owenwork mount, tools and all', () => {
 
   const mount = (
     entries.find((e) => e.dir === 'out' && e.frame['method'] === 'thread/start')!
-      .frame['params'] as { config: { mcp_servers: { owenwork: { args: string[] } } } }
-  ).config.mcp_servers.owenwork;
+      .frame['params'] as { config: { mcp_servers: { owenloop: { args: string[] } } } }
+  ).config.mcp_servers.owenloop;
   assert.deepEqual(mount.args.slice(1), ['work', 'hold', '--order', 'wf1/run1', '--origin', 'http://127.0.0.1:9999', '--mcp']);
 
   const calls = inbound
@@ -373,10 +373,10 @@ test('B9 the recording drove the REAL owenwork mount, tools and all', () => {
   assert.deepEqual(
     calls.map((c) => [c['server'], c['tool'], c['status']]),
     [
-      ['owenwork', 'get_order', 'completed'],
-      ['owenwork', 'submit', 'completed'],
+      ['owenloop', 'get_order', 'completed'],
+      ['owenloop', 'submit', 'completed'],
     ],
-    'both owenwork tools really ran, and both really succeeded',
+    'both owenloop tools really ran, and both really succeeded',
   );
 
   // MEASURED: `approvalPolicy:'never'` does not cover MCP tool calls. Each call
@@ -387,7 +387,7 @@ test('B9 the recording drove the REAL owenwork mount, tools and all', () => {
   assert.equal(asks.length, 2);
   for (const ask of asks) {
     const p = ask.frame['params'] as { serverName: string; _meta: { codex_approval_kind: string } };
-    assert.equal(p.serverName, 'owenwork');
+    assert.equal(p.serverName, 'owenloop');
     assert.equal(p._meta.codex_approval_kind, 'mcp_tool_call');
     const reply = entries.find(
       (e) => e.dir === 'out' && e.frame['id'] === ask.frame['id'] && e.frame['result'] !== undefined,
@@ -420,7 +420,7 @@ test('B10 a cancelled mount startup is not a failure', () => {
   );
   for (const e of entries) {
     if (e.dir !== 'in' || e.frame['method'] !== 'mcpServer/startupStatus/updated') continue;
-    assert.equal(readOwenworkMountFailure('mcpServer/startupStatus/updated', e.frame['params']), undefined);
+    assert.equal(readOwenloopMountFailure('mcpServer/startupStatus/updated', e.frame['params']), undefined);
   }
 });
 
@@ -456,18 +456,18 @@ test('B3 the fixture proves the declared mount is the only one asked for, and it
   const declared = entries.find((e) => e.dir === 'out' && e.frame['method'] === 'thread/start');
   assert.ok(declared);
   const params = declared.frame['params'] as { config: { mcp_servers: Record<string, unknown> } };
-  assert.deepEqual(Object.keys(params.config.mcp_servers), ['owenwork']);
+  assert.deepEqual(Object.keys(params.config.mcp_servers), ['owenloop']);
 
   const ready = entries.filter(
     (e) =>
       e.dir === 'in' &&
       e.frame['method'] === 'mcpServer/startupStatus/updated' &&
-      (e.frame['params'] as { name: string }).name === 'owenwork',
+      (e.frame['params'] as { name: string }).name === 'owenloop',
   );
-  assert.ok(ready.length > 0, 'the owenwork mount must report a startup status');
+  assert.ok(ready.length > 0, 'the owenloop mount must report a startup status');
   assert.ok(
     ready.some((e) => (e.frame['params'] as { status: string }).status === 'ready'),
-    'the owenwork mount reached ready in the recording',
+    'the owenloop mount reached ready in the recording',
   );
 });
 
@@ -522,22 +522,22 @@ test('B6 mapNotification is total — unknown shapes never throw', () => {
     ]) {
       assert.doesNotThrow(() => mapNotification(method, params));
       assert.doesNotThrow(() => readTurnCompleted(method, params));
-      assert.doesNotThrow(() => readOwenworkMountFailure(method, params));
+      assert.doesNotThrow(() => readOwenloopMountFailure(method, params));
     }
   }
 });
 
-test('B7 the owenwork mount failure gates on an explicit failed, and only for owenwork', () => {
-  const failed = readOwenworkMountFailure('mcpServer/startupStatus/updated', {
-    name: 'owenwork',
+test('B7 the owenloop mount failure gates on an explicit failed, and only for owenloop', () => {
+  const failed = readOwenloopMountFailure('mcpServer/startupStatus/updated', {
+    name: 'owenloop',
     status: 'failed',
     error: 'spawn ENOENT',
   });
-  assert.match(failed as string, /owenwork MCP server failed to start: spawn ENOENT/);
+  assert.match(failed as string, /owenloop MCP server failed to start: spawn ENOENT/);
 
   // Another server failing is not our problem — the step can still submit.
   assert.equal(
-    readOwenworkMountFailure('mcpServer/startupStatus/updated', {
+    readOwenloopMountFailure('mcpServer/startupStatus/updated', {
       name: 'some-other-server',
       status: 'failed',
     }),
@@ -546,7 +546,7 @@ test('B7 the owenwork mount failure gates on an explicit failed, and only for ow
   // Not-yet-ready is NOT failure. Gating on the absence of `ready` would deadlock.
   for (const status of ['starting', 'ready', 'cancelled']) {
     assert.equal(
-      readOwenworkMountFailure('mcpServer/startupStatus/updated', { name: 'owenwork', status }),
+      readOwenloopMountFailure('mcpServer/startupStatus/updated', { name: 'owenloop', status }),
       undefined,
     );
   }
@@ -583,11 +583,11 @@ interface Case {
   expect(params: Record<string, unknown>, events: AgentEvent[]): void;
 }
 
-const MOUNT = { command: '/tmp/fixture-node', args: ['/tmp/fixture-mcp/owenwork-server.mjs'] };
+const MOUNT = { command: '/tmp/fixture-node', args: ['/tmp/fixture-mcp/owenloop-server.mjs'] };
 
 /**
  * The built mount is `MOUNT` plus a forwarded `env` — codex hands an MCP child
- * only a tiny core environment, so `OWENWORK_TOKEN` has to ride on the mount or
+ * only a tiny core environment, so `OWENLOOP_TOKEN` has to ride on the mount or
  * `owenloop work hold --mcp` dies before its `initialize` reply. C15 pins the
  * forwarding rule itself; every other case only needs "the real mount, intact".
  */
@@ -601,7 +601,7 @@ function assertMount(actual: unknown): void {
 
 const CASES: Case[] = [
   {
-    name: 'C1 an empty bag yields the safe defaults and the owenwork mount',
+    name: 'C1 an empty bag yields the safe defaults and the owenloop mount',
     bag: undefined,
     expect(p) {
       assert.equal(p['cwd'], '/tmp/fixture-cwd');
@@ -610,8 +610,8 @@ const CASES: Case[] = [
       // The KEY is absent, not null — a null would pin the thread to no model.
       assert.equal('model' in p, false);
       const config = p['config'] as { mcp_servers: Record<string, unknown> };
-      assert.deepEqual(Object.keys(config.mcp_servers), ['owenwork']);
-      assertMount(config.mcp_servers['owenwork']);
+      assert.deepEqual(Object.keys(config.mcp_servers), ['owenloop']);
+      assertMount(config.mcp_servers['owenloop']);
     },
   },
   {
@@ -650,18 +650,18 @@ const CASES: Case[] = [
     },
   },
   {
-    name: 'C6 extra MCP servers merge in, and owenwork wins a name clash',
+    name: 'C6 extra MCP servers merge in, and owenloop wins a name clash',
     bag: {
       mcpServers: {
         extra: { command: 'extra-server', args: [] },
-        owenwork: { command: 'an-imposter', args: ['--pretend'] },
+        owenloop: { command: 'an-imposter', args: ['--pretend'] },
       },
     },
     expect(p) {
       const config = p['config'] as { mcp_servers: Record<string, unknown> };
       assert.deepEqual(config.mcp_servers['extra'], { command: 'extra-server', args: [] });
       // Losing the real mount means no `submit` tool and a dead order.
-      assertMount(config.mcp_servers['owenwork']);
+      assertMount(config.mcp_servers['owenloop']);
     },
   },
   {
@@ -669,7 +669,7 @@ const CASES: Case[] = [
     bag: {
       codexConfig: {
         model_reasoning_summary: 'detailed',
-        mcp_servers: { owenwork: { command: 'nope', args: [] }, other: { command: 'ok', args: [] } },
+        mcp_servers: { owenloop: { command: 'nope', args: [] }, other: { command: 'ok', args: [] } },
       },
     },
     expect(p) {
@@ -679,7 +679,7 @@ const CASES: Case[] = [
       };
       assert.equal(config.model_reasoning_summary, 'detailed');
       assert.deepEqual(config.mcp_servers['other'], { command: 'ok', args: [] });
-      assertMount(config.mcp_servers['owenwork']);
+      assertMount(config.mcp_servers['owenloop']);
     },
   },
   {
@@ -739,12 +739,12 @@ test('C12 effort reaches the turn from either the step bag or the per-start over
   assert.equal(fromArgs.effort ?? fromArgs.permissions.effort, 'low');
 });
 
-test('C13 a resume ALWAYS re-supplies the owenwork mount', () => {
+test('C13 a resume ALWAYS re-supplies the owenloop mount', () => {
   // Cold resume: this process never started the thread, so there is no base.
   const cold = buildThreadResumeParams('th-9', deliverArgs(undefined, { cwd: '/tmp/other' }));
   assert.equal(cold['threadId'], 'th-9');
   assert.equal(cold['cwd'], '/tmp/other');
-  assertMount((cold['config'] as { mcp_servers: Record<string, unknown> }).mcp_servers['owenwork']);
+  assertMount((cold['config'] as { mcp_servers: Record<string, unknown> }).mcp_servers['owenloop']);
 
   // PHASE 4: the resume params are derived from `args.permissions`, which is the
   // SAME source `buildThreadStartParams` reads. A cross-process resume therefore
@@ -754,7 +754,7 @@ test('C13 a resume ALWAYS re-supplies the owenwork mount', () => {
   const rebuilt = buildThreadResumeParams('th-9', argsBag);
   assert.equal(rebuilt['approvalPolicy'], 'on-request');
   assert.equal(rebuilt['sandbox'], 'read-only');
-  assertMount((rebuilt['config'] as { mcp_servers: Record<string, unknown> }).mcp_servers['owenwork']);
+  assertMount((rebuilt['config'] as { mcp_servers: Record<string, unknown> }).mcp_servers['owenloop']);
 
   // Warm resume, same process: `args` WINS over `base` on every key it expresses.
   // `base` is a filler for what a `DeliverArgs` cannot say, never an override —
@@ -763,25 +763,25 @@ test('C13 a resume ALWAYS re-supplies the owenwork mount', () => {
   const warm = buildThreadResumeParams('th-9', deliverArgs(), base);
   assert.equal(warm['approvalPolicy'], 'never', "the args' normalized default beats base");
   assert.equal(warm['sandbox'], 'workspace-write', "the args' normalized default beats base");
-  assertMount((warm['config'] as { mcp_servers: Record<string, unknown> }).mcp_servers['owenwork']);
+  assertMount((warm['config'] as { mcp_servers: Record<string, unknown> }).mcp_servers['owenloop']);
 
   // A key only `base` holds still survives the merge.
   const withExtra = buildThreadResumeParams('th-9', deliverArgs(), { ...base, someBaseOnlyKey: 'kept' });
   assert.equal(withExtra['someBaseOnlyKey'], 'kept');
 });
 
-test('C15 the mount carries the ADMITTED owenwork environment, and nothing else', async (t) => {
+test('C15 the mount carries the ADMITTED owenloop environment, and nothing else', async (t) => {
   // MEASURED against codex 0.146.0: an MCP server child is handed only
   // `HOME, LOGNAME, PATH, SHELL, TMPDIR, USER, __CF_USER_TEXT_ENCODING` plus
   // `mcp_servers.<name>.env`. Without the forward, `owenloop work hold --mcp` gets
   // none of the identity it needs, and codex reports the mount `failed` with
   // `connection closed: initialize response` — no `submit` tool, dead order.
   //
-  // PHASE 6 CHANGED THE `OWENWORK_*` HALF FROM A PREFIX TO AN ALLOWLIST. The
-  // forward used to be `key.startsWith('OWENWORK_')`, so a new variable could
+  // PHASE 6 CHANGED THE `OWENLOOP_*` HALF FROM A PREFIX TO AN ALLOWLIST. The
+  // forward used to be `key.startsWith('OWENLOOP_')`, so a new variable could
   // not silently stop reaching the mount. That default is now inverted, because
   // `thread/start` params are persisted in codex's rollout file: only the names
-  // in `ADMITTED_OWENWORK_KEYS` travel, and a new `OWENWORK_*` variable does not
+  // in `ADMITTED_OWENLOOP_KEYS` travel, and a new `OWENLOOP_*` variable does not
   // reach the mount until somebody adds it there with a named consumer.
   const saved = { ...process.env };
   t.after(() => {
@@ -789,11 +789,11 @@ test('C15 the mount carries the ADMITTED owenwork environment, and nothing else'
     Object.assign(process.env, saved);
   });
 
-  process.env['OWENWORK_SESSION'] = 'sess-c15';
-  process.env['OWENWORK_CONDUCTOR_ID'] = 'cond-c15';
-  process.env['OWENWORK_CACHE_DIR'] = '/tmp/fixture-cache';
-  process.env['OWENWORK_TOKEN'] = 'tok-c15';
-  process.env['OWENWORK_SOMETHING_NEW'] = 'future-var';
+  process.env['OWENLOOP_SESSION'] = 'sess-c15';
+  process.env['OWENLOOP_CONDUCTOR_ID'] = 'cond-c15';
+  process.env['OWENLOOP_CACHE_DIR'] = '/tmp/fixture-cache';
+  process.env['OWENLOOP_TOKEN'] = 'tok-c15';
+  process.env['OWENLOOP_SOMETHING_NEW'] = 'future-var';
   process.env['XDG_CONFIG_HOME'] = '/tmp/fixture-config';
   process.env['AWS_SECRET_ACCESS_KEY'] = 'must-not-travel';
 
@@ -801,18 +801,18 @@ test('C15 the mount carries the ADMITTED owenwork environment, and nothing else'
     buildThreadStartParams(startArgs(undefined)),
     buildThreadResumeParams('th-15', deliverArgs()),
   ]) {
-    const mount = (params['config'] as { mcp_servers: { owenwork: { env: Record<string, string> } } })
-      .mcp_servers.owenwork;
+    const mount = (params['config'] as { mcp_servers: { owenloop: { env: Record<string, string> } } })
+      .mcp_servers.owenloop;
     // The admitted set travels — this is the identity `hold --mcp` reads.
-    assert.equal(mount.env['OWENWORK_SESSION'], 'sess-c15');
-    assert.equal(mount.env['OWENWORK_CONDUCTOR_ID'], 'cond-c15');
-    assert.equal(mount.env['OWENWORK_CACHE_DIR'], '/tmp/fixture-cache');
+    assert.equal(mount.env['OWENLOOP_SESSION'], 'sess-c15');
+    assert.equal(mount.env['OWENLOOP_CONDUCTOR_ID'], 'cond-c15');
+    assert.equal(mount.env['OWENLOOP_CACHE_DIR'], '/tmp/fixture-cache');
     assert.equal(mount.env['XDG_CONFIG_HOME'], '/tmp/fixture-config');
     // The dev-only hub bearer override does NOT travel (Phase 6 item 5): these
     // params reach codex's rollout file on disk.
-    assert.equal('OWENWORK_TOKEN' in mount.env, false);
+    assert.equal('OWENLOOP_TOKEN' in mount.env, false);
     // Deny-by-default inside the namespace: a variable nobody admitted stays home.
-    assert.equal('OWENWORK_SOMETHING_NEW' in mount.env, false);
+    assert.equal('OWENLOOP_SOMETHING_NEW' in mount.env, false);
     // And a blind `{...process.env}` would spray unrelated secrets onto disk.
     assert.equal('AWS_SECRET_ACCESS_KEY' in mount.env, false);
   }
@@ -827,10 +827,10 @@ test('C14 the builders never mutate their inputs', () => {
   assert.equal(JSON.stringify(bag), snapshot);
   // The caller's mount array is copied, not aliased.
   const params = buildThreadStartParams(args);
-  const mount = (params['config'] as { mcp_servers: { owenwork: { args: string[] } } }).mcp_servers
-    .owenwork;
-  assert.notEqual(mount.args, args.owenworkMcp.args);
-  assert.deepEqual(mount.args, args.owenworkMcp.args);
+  const mount = (params['config'] as { mcp_servers: { owenloop: { args: string[] } } }).mcp_servers
+    .owenloop;
+  assert.notEqual(mount.args, args.owenloopMcp.args);
+  assert.deepEqual(mount.args, args.owenloopMcp.args);
 });
 
 // ---------------------------------------------------------------------------
@@ -875,7 +875,7 @@ test('D5 a resume miss against a real child rejects cleanly, with no unhandled r
   // fix that raised an unhandledRejection and killed the process, converting a
   // correctly reported ResumeUnavailableError into a crash. Only a REAL child
   // produces that ordering, so this test uses a stub binary rather than a mock.
-  const dir = mkdtempSync(join(tmpdir(), 'owenwork-codex-stub-'));
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-codex-stub-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
 
   const stub = join(dir, 'stub-app-server.mjs');
@@ -914,12 +914,12 @@ process.stdin.on('data', (chunk) => {
     unhandled.push(e);
   };
   process.on('unhandledRejection', onUnhandled);
-  const previousBin = process.env['OWENWORK_CODEX_BIN'];
-  process.env['OWENWORK_CODEX_BIN'] = stub;
+  const previousBin = process.env['OWENLOOP_CODEX_BIN'];
+  process.env['OWENLOOP_CODEX_BIN'] = stub;
   t.after(() => {
     process.off('unhandledRejection', onUnhandled);
-    if (previousBin === undefined) delete process.env['OWENWORK_CODEX_BIN'];
-    else process.env['OWENWORK_CODEX_BIN'] = previousBin;
+    if (previousBin === undefined) delete process.env['OWENLOOP_CODEX_BIN'];
+    else process.env['OWENLOOP_CODEX_BIN'] = previousBin;
   });
 
   const err = await codexAdapter
@@ -958,21 +958,21 @@ const STUB_TURN = '22222222-2222-4222-8222-222222222222';
  *    stays alive forever, so "was it disposed?" is answerable by signalling it.
  *  - `hang-turn` — acknowledges `turn/start`, emits `turn/started`, and then
  *    never completes the turn on its own. Only a `turn/interrupt` ends it.
- *  - `mount-failure` — as `hang-turn`, plus an owenwork mount that reports
+ *  - `mount-failure` — as `hang-turn`, plus an owenloop mount that reports
  *    `failed` right after the turn begins.
- *  - `elicit` — asks TWO `mcpServer/elicitation/request`s (one for the owenwork
+ *  - `elicit` — asks TWO `mcpServer/elicitation/request`s (one for the owenloop
  *    mount's own tool call, one from an unrelated server), records both replies,
  *    then completes the turn.
  *
  * THE SPEC IS BAKED INTO THE SOURCE, NOT PASSED IN THE ENVIRONMENT. It used to
- * arrive as `process.env.OWENWORK_STUB_SPEC`, which worked only while the
- * adapter forwarded the whole `OWENWORK_*` prefix to its child. Phase 6 narrowed
+ * arrive as `process.env.OWENLOOP_STUB_SPEC`, which worked only while the
+ * adapter forwarded the whole `OWENLOOP_*` prefix to its child. Phase 6 narrowed
  * that to an allowlist (`src/harness/child-env.ts`), and the right fix is NOT to
  * admit a test-only variable into a production allowlist — that would widen the
  * shipped filter to make a test pass. The stub's source is already generated per
  * test, so its configuration belongs in the source. The stub now needs no
  * environment at all, which also makes it a small live proof that a harness
- * child starts fine without owenwork's namespace.
+ * child starts fine without owenloop's namespace.
  */
 const stubSource = (spec: { pidFile: string; logFile: string; mode: string }): string => `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from 'node:fs';
@@ -1025,7 +1025,7 @@ function handle(m) {
       if (spec.mode === 'mount-failure') {
         send({
           method: 'mcpServer/startupStatus/updated',
-          params: { threadId: THREAD, name: 'owenwork', status: 'failed', error: 'stub refused the mount' },
+          params: { threadId: THREAD, name: 'owenloop', status: 'failed', error: 'stub refused the mount' },
         });
       }
       if (spec.mode === 'elicit') {
@@ -1035,9 +1035,9 @@ function handle(m) {
           method: 'mcpServer/elicitation/request',
           id: 900,
           params: {
-            threadId: THREAD, turnId: TURN, serverName: 'owenwork', mode: 'form',
+            threadId: THREAD, turnId: TURN, serverName: 'owenloop', mode: 'form',
             _meta: { codex_approval_kind: 'mcp_tool_call', tool_description: 'submit' },
-            message: 'Allow the owenwork MCP server to run tool "submit"?',
+            message: 'Allow the owenloop MCP server to run tool "submit"?',
             requestedSchema: { type: 'object', properties: {} },
           },
         });
@@ -1092,20 +1092,20 @@ interface Stub {
   alive(): boolean;
 }
 
-/** Install the stub as `OWENWORK_CODEX_BIN` for the duration of one test. */
+/** Install the stub as `OWENLOOP_CODEX_BIN` for the duration of one test. */
 function useStub(t: { after(fn: () => void): void }, mode: string): Stub {
-  const dir = mkdtempSync(join(tmpdir(), 'owenwork-codex-stub-'));
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-codex-stub-'));
   const script = join(dir, 'stub-app-server.mjs');
   const pidFile = join(dir, 'pid');
   const logFile = join(dir, 'received.jsonl');
   writeFileSync(script, stubSource({ pidFile, logFile, mode }), { mode: 0o755 });
   writeFileSync(logFile, '');
 
-  // `OWENWORK_CODEX_BIN` is read by the adapter in THIS process before it
+  // `OWENLOOP_CODEX_BIN` is read by the adapter in THIS process before it
   // spawns anything, so the namespace filter never sees it. The stub's own
   // configuration is compiled into its source above and needs no variable.
-  const previousBin = process.env['OWENWORK_CODEX_BIN'];
-  process.env['OWENWORK_CODEX_BIN'] = script;
+  const previousBin = process.env['OWENLOOP_CODEX_BIN'];
+  process.env['OWENLOOP_CODEX_BIN'] = script;
 
   const pid = (): number | undefined => {
     try {
@@ -1125,8 +1125,8 @@ function useStub(t: { after(fn: () => void): void }, mode: string): Stub {
         /* already gone */
       }
     }
-    if (previousBin === undefined) delete process.env['OWENWORK_CODEX_BIN'];
-    else process.env['OWENWORK_CODEX_BIN'] = previousBin;
+    if (previousBin === undefined) delete process.env['OWENLOOP_CODEX_BIN'];
+    else process.env['OWENLOOP_CODEX_BIN'] = previousBin;
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -1237,7 +1237,7 @@ test('D7 a handshake failure disposes the spawned child and reports the exit', a
   await waitFor(() => !stub.alive(), 'the handshake failure to reap its child');
 });
 
-test('D8 an owenwork mount failure interrupts the turn and tears the child down', async (t) => {
+test('D8 an owenloop mount failure interrupts the turn and tears the child down', async (t) => {
   // REGRESSION GUARD (reviewer warning 5). The gate rejected on `status:failed`,
   // but nothing stopped the SERVER-side turn: with no `submit` tool the agent
   // cannot complete the order, so every token it spends afterwards is wasted.
@@ -1251,8 +1251,8 @@ test('D8 an owenwork mount failure interrupts the turn and tears the child down'
       (e: unknown) => e,
     );
 
-  assert.ok(err instanceof Error, 'a failed owenwork mount must reject the turn');
-  assert.match(err.message, /owenwork MCP server failed to start: stub refused the mount/);
+  assert.ok(err instanceof Error, 'a failed owenloop mount must reject the turn');
+  assert.match(err.message, /owenloop MCP server failed to start: stub refused the mount/);
   assert.ok(
     events.some((e) => e.kind === 'exited' && /failed to start/.test(String(e.error))),
     'the mount failure is reported as an exit',
@@ -1267,14 +1267,14 @@ test('D8 an owenwork mount failure interrupts the turn and tears the child down'
   await codexAdapter.stop({ harness: 'codex', token: STUB_THREAD });
 });
 
-test('D9 owenwork tool-call approvals are granted; every other elicitation is refused', async (t) => {
+test('D9 owenloop tool-call approvals are granted; every other elicitation is refused', async (t) => {
   // MEASURED, and the reason a live order could never finish: `approvalPolicy:
   // 'never'` does NOT cover MCP tool calls in codex 0.146.0. Every call to
   // `get_order`/`submit` arrives first as `mcpServer/elicitation/request` with
   // `_meta.codex_approval_kind:'mcp_tool_call'`, and an error reply is recorded
   // by codex as `user rejected MCP tool call`. Refusing therefore does not fail
   // safe — it removes `submit` and the order dies owing. The grant is scoped to
-  // the owenwork mount, which this adapter wrote into `thread/start` itself.
+  // the owenloop mount, which this adapter wrote into `thread/start` itself.
   const stub = useStub(t, 'elicit');
 
   const events: AgentEvent[] = [];
@@ -1287,7 +1287,7 @@ test('D9 owenwork tool-call approvals are granted; every other elicitation is re
   const owen = replies.find((r) => r.params?.['id'] === 900);
   const other = replies.find((r) => r.params?.['id'] === 901);
 
-  assert.ok(owen !== undefined, 'the owenwork elicitation must be answered, never left hanging');
+  assert.ok(owen !== undefined, 'the owenloop elicitation must be answered, never left hanging');
   assert.deepEqual(owen.params?.['result'], { action: 'accept', content: {} });
   assert.equal(owen.params?.['error'], null);
 
@@ -1299,7 +1299,7 @@ test('D9 owenwork tool-call approvals are granted; every other elicitation is re
     'a foreign elicitation is surfaced to the operator as needs_input',
   );
   assert.equal(
-    events.some((e) => e.kind === 'needs_input' && /owenwork MCP server/.test(e.question)),
+    events.some((e) => e.kind === 'needs_input' && /owenloop MCP server/.test(e.question)),
     false,
     'granting our own tool call must not raise a needs_input the operator has to answer',
   );
