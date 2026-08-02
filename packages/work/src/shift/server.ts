@@ -8,15 +8,10 @@
  */
 import {
   chmodSync,
-  closeSync,
-  fstatSync,
   lstatSync,
   mkdirSync,
-  openSync,
-  readFileSync,
   renameSync,
   unlinkSync,
-  writeFileSync,
   type Stats,
 } from 'node:fs';
 import { createServer, createConnection, type Server, type Socket } from 'node:net';
@@ -69,11 +64,12 @@ interface FileIdentity {
 
 interface StartupLock {
   path: string;
-  fd: number;
+  server: Server;
   identity: FileIdentity;
 }
 
 const REQUEST_IDLE_TIMEOUT_MS = 5_000;
+const SHUTDOWN_GRACE_MS = 500;
 
 function fileIdentity(stat: Stats): FileIdentity {
   return { dev: stat.dev, ino: stat.ino, ctimeMs: stat.ctimeMs };
@@ -119,35 +115,53 @@ async function probeSocket(path: string): Promise<'active' | 'stale'> {
   });
 }
 
-function ownerIsAlive(pid: number): boolean {
+async function bindStartupLock(path: string): Promise<Server> {
+  const lockServer = createServer();
   try {
-    process.kill(pid, 0);
-    return true;
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error): void => {
+        lockServer.off('listening', onListening);
+        reject(error);
+      };
+      const onListening = (): void => {
+        lockServer.off('error', onError);
+        resolve();
+      };
+      lockServer.once('error', onError);
+      lockServer.once('listening', onListening);
+      lockServer.listen(path);
+    });
+    return lockServer;
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    if (code === 'ESRCH') return false;
-    if (code === 'EPERM') return true;
+    try { lockServer.close(); } catch { /* not listening */ }
     throw error;
   }
 }
 
+/**
+ * Acquire an atomic, probeable startup lock.
+ *
+ * The lock is itself a Unix listener. `listen()` is the atomic acquisition
+ * point, and a crashed owner leaves a socket path that a successor can probe;
+ * ownership therefore does not depend on a PID that the OS could later reuse.
+ */
 async function acquireStartupLock(socketPath: string): Promise<StartupLock> {
   const lockPath = `${socketPath}.lock`;
   const waitUntil = Date.now() + 2_000;
   for (;;) {
     try {
-      const fd = openSync(lockPath, 'wx', 0o600);
+      const lockServer = await bindStartupLock(lockPath);
       try {
-        writeFileSync(fd, `${process.pid}\n`, 'utf8');
-        return { path: lockPath, fd, identity: fileIdentity(fstatSync(fd)) };
+        chmodSync(lockPath, 0o600);
+        return { path: lockPath, server: lockServer, identity: fileIdentity(lstatSync(lockPath)) };
       } catch (error) {
-        try { closeSync(fd); } catch { /* best effort */ }
+        try { lockServer.close(); } catch { /* best effort */ }
         try { unlinkSync(lockPath); } catch { /* best effort */ }
         throw error;
       }
     } catch (error) {
       const code = (error as NodeJS.ErrnoException | undefined)?.code;
-      if (code !== 'EEXIST') throw error;
+      if (code !== 'EADDRINUSE') throw error;
     }
 
     let current: Stats;
@@ -157,25 +171,13 @@ async function acquireStartupLock(socketPath: string): Promise<StartupLock> {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') continue;
       throw error;
     }
-    if (!current.isFile() || current.isSymbolicLink()) {
-      throw new Error(`cannot start shift daemon: startup lock ${lockPath} exists and is not a regular file`);
+    if (!current.isSocket()) {
+      throw new Error(`cannot start shift daemon: startup lock ${lockPath} exists and is not a socket`);
     }
 
-    let ownerText: string;
-    try {
-      ownerText = readFileSync(lockPath, 'utf8').trim();
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') continue;
-      throw error;
-    }
-    if (!/^\d+$/.test(ownerText)) {
-      throw new Error(`cannot start shift daemon: startup lock ${lockPath} has invalid ownership`);
-    }
-    const ownerPid = Number(ownerText);
-    if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) {
-      throw new Error(`cannot start shift daemon: startup lock ${lockPath} has invalid ownership`);
-    }
-    if (ownerIsAlive(ownerPid)) {
+    const observedIdentity = fileIdentity(current);
+    const probe = await probeSocket(lockPath);
+    if (probe === 'active') {
       if (Date.now() >= waitUntil) {
         throw new Error(`cannot start shift daemon: another daemon is starting at ${socketPath}`);
       }
@@ -190,7 +192,11 @@ async function acquireStartupLock(socketPath: string): Promise<StartupLock> {
       if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') continue;
       throw error;
     }
-    if (!sameFileIdentity(fileIdentity(current), fileIdentity(currentAgain))) continue;
+    if (!sameFileIdentity(observedIdentity, fileIdentity(currentAgain))) continue;
+    // ACCEPTED LIMITATION: this lstat-then-unlink sequence is not atomic. A
+    // same-user hostile local process could substitute the path between the
+    // check and unlink, but the 0600 socket is in the user's own state
+    // directory, where that process already has direct write access.
     try {
       unlinkSync(lockPath);
     } catch (error) {
@@ -200,13 +206,25 @@ async function acquireStartupLock(socketPath: string): Promise<StartupLock> {
 }
 
 function releaseStartupLock(lock: StartupLock): void {
+  try { lock.server.close(); } catch { /* already closed */ }
   try {
     const current = lstatSync(lock.path);
     if (sameFileIdentity(lock.identity, fileIdentity(current))) unlinkSync(lock.path);
   } catch {
     // The lock may already have been reclaimed after a crash or operator action.
   }
-  try { closeSync(lock.fd); } catch { /* already closed */ }
+}
+
+function forceCloseSocket(socket: Socket): void {
+  socket.unref();
+  try {
+    // resetAndDestroy aborts queued writes instead of waiting for a client
+    // that stopped reading. Older Node versions fall back to destroy().
+    if (typeof socket.resetAndDestroy === 'function') socket.resetAndDestroy();
+    else socket.destroy();
+  } catch {
+    socket.destroy();
+  }
 }
 
 function writeResponse(socket: Socket, response: ShiftResponse): void {
@@ -214,7 +232,7 @@ function writeResponse(socket: Socket, response: ShiftResponse): void {
   try {
     socket.end(`${JSON.stringify(response)}\n`, () => socket.destroy());
   } catch {
-    socket.destroy();
+    forceCloseSocket(socket);
   }
 }
 
@@ -255,11 +273,11 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
   let shutdownStarted = false;
   let shutdownReason: 'end' | 'signal' | 'loop' | undefined;
   let shutdownPromise: Promise<void> | undefined;
-  let shutdownSocket: Socket | undefined;
   let loopPromise: Promise<number> | undefined;
   let parked: ParkedNext | undefined;
+  let shutdownGraceTimer: NodeJS.Timeout | undefined;
   const connections = new Set<Socket>();
-  const respondedConnections = new Set<Socket>();
+  const shutdownSockets = new Set<Socket>();
   const events: ShiftEvent[] = [];
 
   const capacity = (): Omit<ShiftCapacity, 'events'> => {
@@ -280,7 +298,6 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
   };
 
   const respond = (socket: Socket, response: ShiftResponse): void => {
-    respondedConnections.add(socket);
     writeResponse(socket, response);
   };
 
@@ -399,17 +416,30 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
 
   const destroyConnections = (): void => {
     for (const socket of connections) {
-      if (socket === shutdownSocket || respondedConnections.has(socket)) continue;
-      socket.destroy();
+      if (shutdownSockets.has(socket)) continue;
+      forceCloseSocket(socket);
     }
   };
 
+  const armShutdownGrace = (): void => {
+    if (shutdownGraceTimer !== undefined || connections.size === 0) return;
+    shutdownGraceTimer = setTimeout(() => {
+      shutdownGraceTimer = undefined;
+      for (const socket of connections) forceCloseSocket(socket);
+    }, SHUTDOWN_GRACE_MS);
+  };
+
   const requestShutdown = (reason: 'end' | 'signal' | 'loop', preserve?: Socket): Promise<void> => {
-    if (shutdownPromise !== undefined) return shutdownPromise;
+    if (shutdownPromise !== undefined) {
+      if (preserve !== undefined) shutdownSockets.add(preserve);
+      return shutdownPromise;
+    }
     shutdownStarted = true;
     shutdownReason = reason;
-    shutdownSocket = preserve;
+    shutdownSockets.clear();
+    if (preserve !== undefined) shutdownSockets.add(preserve);
     if (reason === 'end') {
+      if (parked !== undefined) shutdownSockets.add(parked.socket);
       enqueue({ type: 'ended' });
     } else if (parked !== undefined) {
       // A signal or unexpected loop exit does not synthesize an `ended` event,
@@ -418,6 +448,9 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
       parked = undefined;
       if (current.timer !== undefined) clearTimeout(current.timer);
     }
+    // Do not exempt already-responded sockets: socket.end() can still be
+    // blocked on a client that stopped reading. New connections are rejected
+    // by handleConnection while shutdownStarted is true.
     destroyConnections();
     opts.loop.stop();
     shutdownPromise = (async () => {
@@ -430,6 +463,9 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
       }
       if (shutdownReason === 'end') await finalClear();
       await closeListening();
+      // The end acknowledgement and a parked `ended` response are allowed a
+      // bounded flush window; an unread client must not keep the daemon alive.
+      armShutdownGrace();
     })();
     return shutdownPromise;
   };
@@ -480,6 +516,11 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
 
   const handleConnection = (socket: Socket): void => {
     connections.add(socket);
+    if (shutdownStarted) {
+      connections.delete(socket);
+      forceCloseSocket(socket);
+      return;
+    }
     let buffer = Buffer.alloc(0);
     let replied = false;
     const replyError = (message: string): void => {
@@ -523,10 +564,14 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     });
     socket.on('close', () => {
       connections.delete(socket);
-      respondedConnections.delete(socket);
+      shutdownSockets.delete(socket);
       if (parked?.socket === socket) {
         if (parked.timer !== undefined) clearTimeout(parked.timer);
         parked = undefined;
+      }
+      if (connections.size === 0 && shutdownGraceTimer !== undefined) {
+        clearTimeout(shutdownGraceTimer);
+        shutdownGraceTimer = undefined;
       }
     });
   };
@@ -548,6 +593,11 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
           if (!sameFileIdentity(probedIdentity, fileIdentity(beforeUnlink))) {
             throw new Error(`cannot start shift daemon: socket changed while checking ${opts.socketPath}`);
           }
+          // ACCEPTED LIMITATION: this lstat-then-unlink sequence is not
+          // atomic. A same-user hostile local process could substitute the
+          // path between the check and unlink, but the 0600 socket is in the
+          // user's own state directory, where that process already has direct
+          // write access.
           unlinkSync(opts.socketPath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') throw error;

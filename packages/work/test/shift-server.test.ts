@@ -1,5 +1,5 @@
 import { createServer, createConnection, type Server, type Socket } from 'node:net';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -232,6 +232,127 @@ test('event FIFO is bounded at 1000 entries and drops oldest entries with a warn
   await stop(f);
 });
 
+test('a legal 1,000-event response with 200-character steps fits the client ceiling', async () => {
+  const f = fixture();
+  await waitForPath(f.socketPath);
+  const workflow = `wf_${'w'.repeat(32)}`;
+  const run = `run_${'r'.repeat(32)}`;
+  const step = 's'.repeat(200);
+  for (let i = 0; i < 1_000; i++) {
+    f.daemon.onEvent({ type: 'dispatched', workflow, run: `${run}_${i}`, step, kind: 'agent-run', pid: 123456 });
+  }
+  const response = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  assert.equal('events' in response, true);
+  if ('events' in response) {
+    assert.equal(response.events.length, 1_000);
+    assert.ok(Buffer.byteLength(JSON.stringify(response)) > 256 * 1024);
+  }
+  await stop(f);
+});
+
+test('end lets the daemon process exit while a responded client stops reading', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-unread-'));
+  roots.push(root);
+  const socketPath = join(root, 'shift.sock');
+  const serverModule = new URL('../src/shift/server.ts', import.meta.url).href;
+  const childScript = join(root, 'daemon.mjs');
+  writeFileSync(childScript, [
+    `import { createShiftDaemon } from ${JSON.stringify(serverModule)};`,
+    "const socketPath = process.argv[2];",
+    "let resolveLoop;",
+    "const loop = {",
+    "  run: () => new Promise((resolve) => { resolveLoop = resolve; }),",
+    "  stop: () => resolveLoop?.(0),",
+    "  freeCapacity: () => 0,",
+    "  getCap: () => 0,",
+    "  getShift: () => ({ name: 'box', servePools: ['alpha'] }),",
+    "  setShift: () => ({ name: 'box', servePools: ['alpha'] }),",
+    "  noteAttended: () => {},",
+    "  getAttendedAt: () => undefined,",
+    "};",
+    "const hub = { presencePing: async () => ({ text: '', ok: true, name: 'box', lastSeen: 1 }) };",
+    "const daemon = createShiftDaemon({ socketPath, stateDir: socketPath.slice(0, socketPath.lastIndexOf('/')), loop, hub, now: () => 1, startedAt: 1, err: console.error });",
+    "const message = 'x'.repeat(16 * 1024);",
+    "for (let i = 0; i < 1000; i++) daemon.onEvent({ type: 'failed', workflow: 'wf', run: `run_${i}`, step: 'step', kind: 'exec', message });",
+    "daemon.run().then((code) => process.exit(code), (error) => { console.error(error); process.exit(1); });",
+  ].join('\n'));
+  const daemon = spawn(process.execPath, [childScript, socketPath], { stdio: ['ignore', 'ignore', 'inherit'] });
+  const daemonExit = new Promise<number | null>((resolve, reject) => {
+    daemon.once('error', reject);
+    daemon.once('exit', (code) => resolve(code));
+  });
+  await waitForPath(socketPath);
+  const unread = spawn('python3', ['-c', [
+    'import select, socket, sys, time',
+    'sock = socket.socket(socket.AF_UNIX)',
+    'sock.connect(sys.argv[1])',
+    'sock.sendall(b\'{"op":"next","wait_ms":0}\\n\')',
+    'print("ready", flush=True)',
+    'deadline = time.monotonic() + 2.0',
+    'while time.monotonic() < deadline:',
+    '    readable, _, _ = select.select([sock], [], [], 0.05)',
+    '    if not readable: continue',
+    '    try: data = sock.recv(1, socket.MSG_PEEK)',
+    '    except OSError: sys.exit(0)',
+    '    if not data: sys.exit(0)',
+    'sys.exit(2)',
+  ].join('\n'), socketPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const ready = new Promise<void>((resolve, reject) => {
+    unread.stdout!.once('data', (chunk: Buffer) => {
+      if (chunk.toString().includes('ready')) resolve();
+      else reject(new Error(`unread client output: ${chunk.toString()}`));
+    });
+    unread.once('error', reject);
+  });
+  const unreadExit = new Promise<number | null>((resolve) => unread.once('exit', (code) => resolve(code)));
+  try {
+    await waitForPath(socketPath);
+    await ready;
+    assert.deepEqual(await requestShift(socketPath, { op: 'end' }), { ok: true, ended: true });
+    const exitCode = await Promise.race([
+      daemonExit,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('daemon stayed alive with unread client')), 1_500)),
+    ]);
+    assert.equal(exitCode, 0);
+  } finally {
+    if (daemon.exitCode === null) daemon.kill('SIGKILL');
+    if (unread.exitCode === null) unread.kill('SIGKILL');
+    await Promise.allSettled([daemonExit, unreadExit]);
+  }
+});
+
+test('shutdown destroys a connection accepted after the initial teardown pass', async () => {
+  let enteredFinal: () => void = () => {};
+  let releaseFinal: () => void = () => {};
+  const finalStarted = new Promise<void>((resolve) => { enteredFinal = resolve; });
+  const finalRelease = new Promise<void>((resolve) => { releaseFinal = resolve; });
+  const f = fixture({
+    onPresence: async (request) => {
+      if (request.attended_at === undefined) {
+        enteredFinal();
+        await finalRelease;
+      }
+    },
+  });
+  await waitForPath(f.socketPath);
+  const ending = requestShift(f.socketPath, { op: 'end' });
+  await finalStarted;
+  const late = createConnection(f.socketPath);
+  await new Promise<void>((resolve, reject) => {
+    late.once('connect', () => {
+      late.write('{"op":"status"');
+      resolve();
+    });
+    late.once('error', reject);
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(late.destroyed, true);
+  releaseFinal();
+  assert.deepEqual(await ending, { ok: true, ended: true });
+  await f.run;
+  late.destroy();
+});
+
 test('end sends one attendance-clearing ping and leaves detached children alone', async () => {
   const f = fixture();
   await waitForPath(f.socketPath);
@@ -266,6 +387,23 @@ test('stale socket recovery removes only a refused socket and binds a new daemon
   const f = fixture({ socketPath: path });
   await waitForPath(path);
   assert.equal(lstatSync(path).isSocket(), true);
+  await stop(f);
+});
+
+test('a crashed startup lock is recovered by probing its stale lock socket', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-stale-lock-'));
+  roots.push(root);
+  const path = join(root, 'shift.sock');
+  execFileSync('python3', ['-c', [
+    'import socket, sys',
+    'sock = socket.socket(socket.AF_UNIX)',
+    'sock.bind(sys.argv[1])',
+    'sock.close()',
+  ].join('; '), `${path}.lock`]);
+  assert.equal(lstatSync(`${path}.lock`).isSocket(), true);
+  const f = fixture({ socketPath: path });
+  await waitForPath(path);
+  assert.equal(existsSync(`${path}.lock`), false);
   await stop(f);
 });
 
