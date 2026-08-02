@@ -23,7 +23,9 @@ import type { CachedBundle } from '../src/bundle/types.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import { readChildRecords } from '../src/proxy/state.ts';
 import type { OrderPacket, WorkOrder } from '../src/hub/types.ts';
-import { callTool, handshake, spawnMcp, startMockHub, until, type McpChild } from './helpers/mcp-stdio-client.ts';
+import { startMockHub, until } from './helpers/mcp-stdio-client.ts';
+import { isShiftError } from '../src/shift/protocol.ts';
+import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
 import { fixtureEnv, seedCredentialStore } from './helpers/credential-fixture.ts';
 
 const DEMO_HASH = 'abcdef1234567890';
@@ -79,10 +81,10 @@ function traceCalls(): Array<Record<string, unknown>> {
     .map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
-function spawnProxy(origin: string): McpChild {
-  return spawnMcp(
+function spawnDaemon(origin: string): ShiftChild {
+  return spawnShift(
     [
-      'proxy', '--mcp', '--origin', origin, '--workflow', 'wf1',
+      'crew-a', '--origin', origin,
       // The global cap is deliberately generous: only --max-agents can bite.
       '--cap', '10', '--max-agents', '1',
       '--poll-interval', '25',
@@ -114,6 +116,7 @@ test('--max-agents caps in-flight runners; over-cap AGENT orders wait for a late
         // the skipped orders are proven still-offerable, not consumed.
         return { text: '', cursor: 1, changed: wakes++ < 2 };
       case 'whats_next':
+        if (body?.workflow === undefined) return { text: '', instances: [{ workflow: 'wf1' }] };
         return { text: '', workflow: 'wf1', def: 'demo', orders: RUNS.map(wo) };
       case 'presence_ping':
         return { text: '', ok: true, name: 'p', lastSeen: 1 };
@@ -130,25 +133,24 @@ test('--max-agents caps in-flight runners; over-cap AGENT orders wait for a late
     }
   });
   seedCredentialStore(home, origin);
-  const mcp = spawnProxy(origin);
+  const daemon = spawnDaemon(origin);
   try {
-    await handshake(mcp);
-    const parked = callTool(mcp, 'whats_next', { wait_ms: 3_000 });
+    await daemon.ready;
+    const parked = daemon.request({ op: 'next', wait_ms: 3_000 });
 
     await until(
       () => readChildRecords(stateDir).length === 1,
-      `the first agent-run child record; stderr:\n${mcp.stderr()}`,
+      `the first agent-run child record; stderr:\n${daemon.stdout()}`,
     );
     await until(
-      () => /at the agent-run cap \(1\)/.test(mcp.stderr()),
-      `the cap message; stderr:\n${mcp.stderr()}`,
+      () => /at the agent-run cap \(1\)/.test(daemon.stdout()),
+      `the cap message; stderr:\n${daemon.stdout()}`,
     );
 
     const res = await parked;
-    assert.equal(res.isError, false, `whats_next failed: ${JSON.stringify(res.body)}`);
-    // Nor are the over-cap orders handed back as order handles: since Phase 5
-    // `whats_next` returns only the capacity view, never an order to pick up.
-    assert.equal(res.body.orders, undefined, 'whats_next returns no order handles at all');
+    assert.equal(isShiftError(res), false, `next failed: ${JSON.stringify(res)}`);
+    if (isShiftError(res) || !('events' in res)) throw new Error('unexpected shift response');
+    assert.equal(res.events.some((event) => event.type === 'dispatched'), true, 'next reports the dispatch event');
 
     // Exactly ONE runner, across every sweep in the park window.
     const recs = readChildRecords(stateDir);
@@ -158,24 +160,24 @@ test('--max-agents caps in-flight runners; over-cap AGENT orders wait for a late
     // The child is a DETACHED process, so its first trace line lands strictly
     // after the record does; wait for the one start rather than racing it.
     const starts = (): Array<Record<string, unknown>> => traceCalls().filter((c) => c['call'] === 'start');
-    await until(() => starts().length >= 1, `the capped runner to start its harness; stderr:\n${mcp.stderr()}`);
+    await until(() => starts().length >= 1, `the capped runner to start its harness; stderr:\n${daemon.stdout()}`);
     assert.equal(starts().length, 1, `only one harness session was started; trace:\n${JSON.stringify(traceCalls(), null, 1)}`);
 
     // The over-cap orders were LEFT, not consumed: nothing was released and the
     // cap message was logged for each of the two skipped candidates.
     assert.equal(reqs.some((r) => r.verb === 'release'), false, 'a capped order is left offered, never handed back');
-    const capLines = mcp.stderr().split('\n').filter((l) => /at the agent-run cap \(1\)/.test(l));
+    const capLines = daemon.stdout().split('\n').filter((l) => /at the agent-run cap \(1\)/.test(l));
     assert.ok(capLines.length >= 2, `expected a cap line per skipped candidate, got:\n${capLines.join('\n')}`);
     assert.ok(
       capLines.every((l) => /leaving for a later sweep/.test(l)),
       'the message must say the order is deferred, not dropped',
     );
 
-    mcp.endStdin();
-    assert.equal(await mcp.exited, 0, `exit 0 on transport EOF, stderr:\n${mcp.stderr()}`);
+    await daemon.request({ op: 'end' });
+    assert.equal(await daemon.exited, 0, `exit 0 after end, stderr:\n${daemon.stdout()}`);
   } finally {
     server.close();
-    mcp.child.kill('SIGKILL');
+    daemon.child.kill('SIGKILL');
     for (const r of readChildRecords(stateDir)) {
       try {
         process.kill(r.pid, 'SIGKILL');

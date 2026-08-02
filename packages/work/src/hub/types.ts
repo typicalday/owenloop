@@ -108,6 +108,8 @@ export interface PresencePingRequest {
   serve_pools?: string[];
   conductor_id?: string;
   started_at?: number;
+  /** Epoch-millisecond timestamp of the last accepted local shift attendance. */
+  attended_at?: number;
 }
 
 /** B4 `presence_ping` response envelope (flattened `{ text, ...data }`). */

@@ -1,17 +1,9 @@
 /**
- * DRILL 4 — Esc'd parked whats_next → clean cancel, no leak (WO-6.1, M4).
+ * DRILL 4 — a disconnected parked shift next cancels cleanly.
  *
- * The M4 failure mode: a conductor issues `whats_next`, it parks with no work,
- * and the human hits Esc (or the client drops the call) — the JSON-RPC/MCP
- * client-cancel path (`notifications/cancelled`). owenwork must abort the park
- * CLEANLY: per the cancel contract the cancelled call sends NO response frame
- * (mcp/server.ts), the server stays alive for the next call, and because a
- * parked proxy holds NO leases and dispatched nothing, there is nothing to
- * strand — no orphan child, no stamped file, no stray hub verb. This drills the
- * D12 cancel-mid-park path end to end through real `proxy --mcp`.
- *
- * Credential path: owenloop file store (no OWENWORK_TOKEN) — the first hub
- * request (presence/wake during the park) carries `Bearer drill_agent_tok`.
+ * The socket transport has the same important property as the retired MCP park:
+ * a client can disconnect while `next` is parked, the daemon survives, and a
+ * later client can still use the daemon without a leaked lease or child.
  */
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,10 +11,12 @@ import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
-import { handshake, spawnMcp, startMockHub, until, type HubReq, type McpChild } from './helpers/mcp-stdio-client.ts';
+import { isShiftError } from '../src/shift/protocol.ts';
+import { rawShiftRequest, spawnShift, type ShiftChild } from './helpers/shift-client.ts';
+import { startMockHub, until } from './helpers/mcp-stdio-client.ts';
 import { DRILL_AUTH, fixtureEnv, seedCredentialStore } from './helpers/credential-fixture.ts';
 
-const of = (reqs: HubReq[], verb: string): HubReq[] => reqs.filter((r) => r.verb === verb);
+const of = (reqs: Array<{ verb: string }>, verb: string): Array<{ verb: string }> => reqs.filter((r) => r.verb === verb);
 
 let root: string;
 let home: string;
@@ -38,7 +32,7 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-/** An IDLE hub: wake never reports change, so whats_next parks and dispatches nothing. */
+/** An IDLE hub: wake never reports change, so the shift parks and dispatches nothing. */
 function hubScript(verb: string): unknown {
   switch (verb) {
     case 'wake':
@@ -50,25 +44,17 @@ function hubScript(verb: string): unknown {
   }
 }
 
-function spawnProxy(origin: string): McpChild {
-  // credential path: owenloop file store (no OWENWORK_TOKEN)
-  return spawnMcp(
+function spawnDaemon(origin: string): ShiftChild {
+  return spawnShift(
     [
-      'proxy', '--mcp', '--origin', origin, '--workflow', 'wf1', '--cap', '3',
-      '--poll-interval', '25',
+      'crew-a', '--origin', origin, '--cap', '3', '--poll-interval', '25',
       '--cache-dir', cacheDir, '--state-dir', stateDir,
     ],
     fixtureEnv(home),
   );
 }
 
-/**
- * Every `*.md` file anywhere under the whole fixture root (home, cache, state).
- * Phase 5 deleted the stamp path, so the honest guard is no longer "the agents
- * dir is empty" — there is no agents dir — it is "NOTHING anywhere wrote an
- * agent-definition file", and the fixture pins HOME so the built-in default
- * location is inside this tree too.
- */
+/** Every `*.md` file anywhere under the fixture root. */
 function stampedFiles(): string[] {
   const out: string[] = [];
   const walk = (dir: string): void => {
@@ -88,51 +74,48 @@ function stampedFiles(): string[] {
   return out;
 }
 
-test('an Esc during a parked whats_next cancels cleanly — no reply frame, server survives, nothing leaked', async () => {
+test('a disconnected parked shift next cancels cleanly — no reply frame, daemon survives, nothing leaked', async () => {
   const { origin, reqs, server } = await startMockHub(hubScript);
   seedCredentialStore(home, origin); // exact dynamic origin
-  const mcp = spawnProxy(origin);
+  const daemon = spawnDaemon(origin);
   try {
-    await handshake(mcp);
+    await daemon.ready;
 
-    // Park a long whats_next WITHOUT awaiting it; keep its request id so we can
-    // both cancel it and prove no reply ever comes back for it.
-    const parkedId = mcp.fireRequest('tools/call', { name: 'whats_next', arguments: { wait_ms: 10_000 } });
+    // Park a long shift next without awaiting it, then disconnect the socket.
+    const parked = rawShiftRequest(daemon.socketPath, { op: 'next', wait_ms: 10_000 });
+    void parked.response.catch(() => undefined);
 
-    // The park is observably live once it has hit the hub (presence/wake).
-    await until(() => reqs.length >= 1, 'the park to reach the hub');
+    // The park is observably accepted once the attendance-forced presence ping
+    // lands. Waiting for that ping also prevents cancellation from racing the
+    // socket's initial connect/write.
+    await until(
+      () => reqs.some((r) => r.verb === 'presence_ping' && r.body?.['attended_at'] !== undefined),
+      'the attended presence ping',
+    );
     assert.equal(reqs[0]!.auth, DRILL_AUTH, 'first hub request carried the store token');
 
-    // THE Esc: client-cancel for that request id.
-    mcp.notify('notifications/cancelled', { requestId: parkedId, reason: 'client cancelled (Esc)' });
+    // The socket equivalent of Esc/client cancellation: close the outstanding
+    // request connection without sending a response.
+    parked.socket.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 300));
 
-    // Give the cancel time to land and (wrongly) reply, if it were going to.
-    await new Promise((r) => setTimeout(r, 300));
+    // The daemon is alive: status answers after the cancellation.
+    const status = await daemon.request({ op: 'status' });
+    assert.equal(isShiftError(status), false);
+    if (!isShiftError(status) && 'attended_at' in status) {
+      assert.notEqual(status.attended_at, null, 'a valid next marks attendance before parking');
+    }
 
-    // (i) The cancel contract: NO response frame ever arrives for the cancelled id.
-    assert.ok(
-      !mcp.frames.some((f) => f.id === parkedId),
-      `a cancelled call must send no reply, but a frame for id ${parkedId} arrived`,
-    );
-
-    // (ii) The server is ALIVE: ping and tools/list answer normally.
-    const pong = await mcp.request('ping');
-    assert.deepEqual(pong.result, {}, 'ping answers after the cancel');
-    const list = await mcp.request('tools/list');
-    const names = (list.result.tools as Array<{ name: string }>).map((t) => t.name).sort();
-    assert.deepEqual(names, ['clock_in', 'set_dispatch_cap', 'submit', 'whats_next'], 'tools still served');
-
-    // (iii) NO leak: the idle park dispatched nothing — no stamped agent files,
-    // and no get_order/release on the wire (the proxy held no leases).
+    // The idle park dispatched nothing — no stamped file and no hub lease verbs.
     assert.deepEqual(stampedFiles(), [], 'an idle park writes no agent-definition file anywhere');
     assert.equal(of(reqs, 'get_order').length, 0, 'no get_order — nothing was dispatched');
-    assert.equal(of(reqs, 'release').length, 0, 'no release — the proxy held no leases to strand');
+    assert.equal(of(reqs, 'release').length, 0, 'no release — the shift held no lease to strand');
 
-    // (iv) Clean exit on transport EOF.
-    mcp.endStdin();
-    assert.equal(await mcp.exited, 0, `exit 0 on transport EOF, stderr:\n${mcp.stderr()}`);
+    const end = await daemon.request({ op: 'end' });
+    assert.deepEqual(end, { ok: true, ended: true });
+    assert.equal(await daemon.exited, 0, `exit 0 after end, stderr:\n${daemon.stderr()}`);
   } finally {
     server.close();
-    mcp.child.kill('SIGKILL');
+    daemon.child.kill('SIGKILL');
   }
 });

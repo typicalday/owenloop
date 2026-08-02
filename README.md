@@ -343,8 +343,21 @@ have a def? *"Conduct the report workflow"* hands it to
 [`owenloop-conduct`](skills/owenloop-conduct/SKILL.md). The engine itself
 arrives via `npx owenloop` (Node ≥ 22.13 required) — no clone, no build, no
 environment variables, no CLI verbs to memorize. The same package also includes
-the execution-side companion: use `owenloop work <subcommand>` (for example,
-`owenloop work proxy`); there is no separate `owenwork` package or binary.
+the execution-side companion; use `owenloop work <subcommand>` for lower-level
+execution tasks. There is no separate `owenwork` package or binary.
+
+For a foreground local shift, start the daemon in one terminal and poll it from
+another:
+
+```sh
+owenloop shift start alpha
+owenloop shift next
+owenloop shift status
+owenloop shift end
+```
+
+`shift start` requires at least one crew; pass `--all` explicitly to serve every
+crew. `shift next` waits up to 90 seconds by default.
 
 **Want to see or drive the machinery yourself?** Everything above goes
 through the same small CLI (`create`, `tick`, `green`, `reject`, …).

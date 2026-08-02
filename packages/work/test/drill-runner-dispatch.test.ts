@@ -37,7 +37,9 @@ import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import { readChildRecords } from '../src/proxy/state.ts';
 import { readSessions, sessionsPath } from '../src/harness/session-store.ts';
 import type { OrderPacket, WorkOrder } from '../src/hub/types.ts';
-import { callTool, handshake, spawnMcp, startMockHub, until, type McpChild } from './helpers/mcp-stdio-client.ts';
+import { startMockHub, until } from './helpers/mcp-stdio-client.ts';
+import { isShiftError } from '../src/shift/protocol.ts';
+import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
 import { DRILL_AUTH, fixtureEnv, seedCredentialStore } from './helpers/credential-fixture.ts';
 
 const DEMO_HASH = 'abcdef1234567890';
@@ -121,12 +123,12 @@ function traceCalls(): Array<Record<string, unknown>> {
     .map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
-function spawnProxy(origin: string): McpChild {
+function spawnDaemon(origin: string): ShiftChild {
   // NOTE: the fixture HOME is what makes every default home-relative location
   // observable to the negative assertion below.
-  return spawnMcp(
+  return spawnShift(
     [
-      'proxy', '--mcp', '--origin', origin, '--workflow', 'wf1', '--cap', '3',
+      'crew-a', '--origin', origin, '--cap', '3',
       '--poll-interval', '25', '--state-dir', stateDir,
     ],
     fixtureEnv(home, {
@@ -149,12 +151,15 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
   seedCache();
   let wakes = 0;
   let getOrders = 0;
-  const { origin, reqs, server } = await startMockHub((verb) => {
+  const { origin, reqs, server } = await startMockHub((verb, body) => {
     switch (verb) {
       case 'wake':
         return { text: '', cursor: 1, changed: wakes++ === 0 };
       case 'whats_next':
-        // Served to BOTH readers: the proxy (which claims the order) and the
+        // Public shift startup has no --workflow flag, so the first request is
+        // inbox discovery; later requests carry workflow wf1.
+        if (body?.workflow === undefined) return { text: '', instances: [{ workflow: 'wf1' }] };
+        // Served to BOTH readers: the shift (which dispatches the order) and the
         // agent-run child (which reads only `def`, to locate its template).
         return { text: '', workflow: 'wf1', def: 'demo', orders: [ORDER] };
       case 'presence_ping':
@@ -175,19 +180,19 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
     }
   });
   seedCredentialStore(home, origin);
-  const mcp = spawnProxy(origin);
+  const daemon = spawnDaemon(origin);
   try {
-    await handshake(mcp);
+    await daemon.ready;
 
-    // The proxy park. Started, NOT awaited: the sweep that dispatches happens
+    // The shift park. Started, NOT awaited: the sweep that dispatches happens
     // inside it, and the child's in-flight record only exists while the child is
     // alive — so it must be read during the park, not after.
-    const parked = callTool(mcp, 'whats_next', { wait_ms: 5_000 });
+    const parked = daemon.request({ op: 'next', wait_ms: 5_000 });
 
     // A real detached child was spawned and recorded as one.
     await until(
       () => readChildRecords(stateDir).length === 1,
-      `the agent-run child record; stderr:\n${mcp.stderr()}`,
+      `the agent-run child record; stderr:\n${daemon.stderr()}`,
     );
     const rec = readChildRecords(stateDir)[0]!;
     assert.equal(rec.kind, 'agent-run');
@@ -199,8 +204,9 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
     // was handed to a detached runner. Since Phase 5 that is unconditional —
     // `whats_next` returns only the capacity view, with no `orders` field at all.
     const res = await parked;
-    assert.equal(res.isError, false, `whats_next failed: ${JSON.stringify(res.body)}; stderr:\n${mcp.stderr()}`);
-    assert.equal(res.body.orders, undefined, 'no order is ever emitted for a session to pick up');
+    assert.equal(isShiftError(res), false, `next failed: ${JSON.stringify(res)}; stderr:\n${daemon.stderr()}`);
+    if (isShiftError(res) || !('events' in res)) throw new Error('unexpected shift response');
+    assert.equal(res.events.some((event) => event.type === 'dispatched'), true, 'next reports the dispatch event');
     assert.equal(reqs[0]!.auth, DRILL_AUTH, 'first hub request carried the store token');
 
     // The child reached the harness through the registry seam.
@@ -247,11 +253,11 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
     // And the hub was never asked to hand the order back.
     assert.equal(reqs.filter((r) => r.verb === 'release').length, 0, 'a submitted order is not released');
 
-    mcp.endStdin();
-    assert.equal(await mcp.exited, 0, `exit 0 on transport EOF, stderr:\n${mcp.stderr()}`);
+    await daemon.request({ op: 'end' });
+    assert.equal(await daemon.exited, 0, `exit 0 after end, stderr:\n${daemon.stderr()}`);
   } finally {
     server.close();
-    mcp.child.kill('SIGKILL');
+    daemon.child.kill('SIGKILL');
     for (const r of readChildRecords(stateDir)) {
       try {
         process.kill(r.pid, 'SIGKILL');

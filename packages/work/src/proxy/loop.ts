@@ -1,9 +1,9 @@
 /**
- * The proxy park loop core (plan decisions 1–11; D2 dispatch split).
+ * The self-driven proxy loop core (D2 dispatch split).
  *
  * `createProxyLoop` is a standing Conductor loop with every side-effecting
  * dependency injected (hub client, spawner, sleep/clock, output streams, dirs),
- * so the same core mounts behind D2's stdio-MCP tools. Per iteration it: pings
+ * so the same core can run behind the local shift daemon. Per iteration it: pings
  * presence when due → cheap `wake(cursor)` pre-check → only when something
  * changed AND there is free capacity, sweeps `whats_next`, classifies/meters
  * orders, and DISPATCHES BY KIND → reaps work dirs → adopts the cursor → sleeps
@@ -44,12 +44,12 @@
  * Everything downstream keys records by `bundle.def.hash`, so a pinned bundle
  * flows through `ChildRecord.hash` untouched.
  *
- * LIVE SHIFT IDENTITY (shifts.md §8 item 4): `name`/`servePools` on
- * `ProxyLoopOptions` are INITIAL values only. The loop holds them as live
- * closure state (`getShift`/`setShift` on `ProxyLoop`) so the MCP `clock_in`
- * tool (`src/proxy/mcp.ts`) can change what a shift is called and which crews
- * it serves without rebuilding the loop — `setShift` also resets the presence
- * timer so the new identity reaches the hub on the very next `iterate()`.
+ * LIVE SHIFT IDENTITY: `name`/`servePools` on `ProxyLoopOptions` are INITIAL
+ * values only. The loop holds them as live closure state (`getShift`/`setShift`
+ * on `ProxyLoop`) so the shift socket's `clock_in` operation can change what a
+ * shift is called and which crews it serves without rebuilding the loop —
+ * `setShift` also resets the presence timer so the new identity reaches the hub
+ * on the very next `iterate()`.
  */
 import { readDispatchBundle } from '../bundle/cache.ts';
 import type { HubClient } from '../hub/client.ts';
@@ -67,6 +67,7 @@ import {
 import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../agent/workdir.ts';
 import { sessionsPath } from '../harness/session-store.ts';
 import type { Spawner } from './spawn.ts';
+import type { ShiftEvent } from '../shift/protocol.ts';
 
 export interface ProxyLoopOptions {
   hub: HubClient;
@@ -79,6 +80,8 @@ export interface ProxyLoopOptions {
   out: (line: string) => void;
   /** stderr sink (one line per call; newline appended). */
   err: (line: string) => void;
+  /** Local dispatch/reap observations consumed by the shift socket wrapper. */
+  onEvent?: (event: ShiftEvent) => void;
   cacheDir: string;
   stateDir: string;
   /** Max concurrent in-flight orders (exec + agent-run children). */
@@ -148,33 +151,36 @@ export interface ProxyLoop {
   stop(): void;
   /**
    * Run exactly one park iteration (presence → wake → sweep-if-changed →
-   * dispatch → reap) and return how many children it spawned. The MCP
-   * `whats_next` tool drives its park with this and stops parking once the count
-   * is non-zero; the standing `run()` loop ignores the count. Cursor/presence
-   * state is held in the closure and persists across calls.
+   * dispatch → reap) and return how many children it spawned. The shift daemon
+   * uses this seam for its loop core; the standing `run()` loop ignores the
+   * count. Cursor/presence state is held in the closure and persists across calls.
    */
   iterate(): Promise<number>;
   /** Free capacity right now (cap − live in-flight). ≤ 0 ⇒ at capacity. */
   freeCapacity(): number;
-  /** Live dispatch-cap (adjusted by the MCP `set_dispatch_cap` tool). */
+  /** Live dispatch-cap used by status and next responses. */
   getCap(): number;
-  /** Adjust the live dispatch cap (MCP `set_dispatch_cap`). */
+  /** Adjust the live dispatch cap for internal callers and tests. */
   setCap(cap: number): void;
   /** The shift's live identity: the presence name and the crew scope (`serve_pools`)
    *  the next ping and the next sweep will carry. Empty `servePools` means ALL of
    *  this identity's crews, never none. */
   getShift(): { name: string; servePools: string[] };
-  /** Set the live shift identity (the MCP `clock_in` tool). A field left ABSENT is
+  /** Set the live shift identity (the socket `clock_in` operation). A field left ABSENT is
    *  left unchanged; `servePools: []` explicitly means "all crews". Also makes the
    *  next presence ping due immediately, so the new identity reaches the hub on the
    *  next iterate() rather than up to presenceIntervalMs later. Returns the result. */
   setShift(next: { name?: string; servePools?: string[] }): { name: string; servePools: string[] };
+  /** Record local client attendance and make the next presence ping due. */
+  noteAttended(at: number): void;
+  /** Return the last accepted attendance timestamp, if any. */
+  getAttendedAt(): number | undefined;
   /**
    * Run-ended reap (metering condition (a)): drop the in-flight record for
    * `run` NOW, so its slot frees immediately instead of waiting for the next
    * reconcile to notice the child exited. The proxy's MCP `submit` tool calls
-   * this when the hub reports a submit CLOSED the run — the one in-process
-   * end-of-run signal the proxy sees. A run whose closing submit went through
+   * an internal caller may use this when the hub reports a submit CLOSED the
+   * run — the one in-process end-of-run signal the proxy sees. A run whose closing submit went through
    * the child's own mount instead is not a problem: that child exits, and the
    * next reconcile's pid probe frees the slot anyway.
    */
@@ -213,11 +219,31 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
   // Park state persists across `iterate()` calls (the MCP park reuses it).
   let cursor: number | undefined;
   let lastPresence = Number.NEGATIVE_INFINITY;
+  let attendedAt: number | undefined;
+
+  function emit(event: ShiftEvent): void {
+    if (opts.onEvent === undefined) return;
+    try {
+      opts.onEvent(event);
+    } catch (e) {
+      opts.err(`shift event sink failed: ${errMsg(e)} (continuing)`);
+    }
+  }
 
   function reconcile() {
     // No clock is passed: reconciliation is purely pid-probed, so there is no
     // time-dependent decision for `opts.now` to influence.
-    return reconcileInFlight(opts.stateDir, { ...(isAlive !== undefined ? { isAlive } : {}) });
+    const result = reconcileInFlight(opts.stateDir, { ...(isAlive !== undefined ? { isAlive } : {}) });
+    for (const rec of result.reaped) {
+      emit({
+        type: 'reaped',
+        workflow: rec.workflow,
+        run: rec.run,
+        kind: rec.kind ?? 'exec',
+        pid: rec.pid,
+      });
+    }
+    return result;
   }
 
   /**
@@ -365,9 +391,26 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
           const rec: ChildRecord = { workflow: c.workflow, run: c.order.run, pid, spawnedAt: opts.now(), kind: 'exec' };
           writeChildRecord(opts.stateDir, rec);
           dispatched++;
+          emit({
+            type: 'dispatched',
+            workflow: c.workflow,
+            run: c.order.run,
+            step: c.order.step,
+            kind: 'exec',
+            pid,
+          });
           opts.out(`dispatched command ${c.workflow}/${c.order.run} (step '${c.order.step}', pid ${pid})`);
         } catch (e) {
-          opts.err(`spawn for ${c.workflow}/${c.order.run} failed: ${errMsg(e)}`);
+          const message = errMsg(e);
+          emit({
+            type: 'failed',
+            workflow: c.workflow,
+            run: c.order.run,
+            step: c.order.step,
+            kind: 'exec',
+            message,
+          });
+          opts.err(`spawn for ${c.workflow}/${c.order.run} failed: ${message}`);
         }
         continue;
       }
@@ -392,9 +435,26 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
         };
         writeChildRecord(opts.stateDir, rec);
         dispatched++;
+        emit({
+          type: 'dispatched',
+          workflow: c.workflow,
+          run: c.order.run,
+          step: c.order.step,
+          kind: 'agent-run',
+          pid,
+        });
         opts.out(`dispatched agent-run ${c.workflow}/${c.order.run} (step '${c.order.step}', pid ${pid})`);
       } catch (e) {
-        opts.err(`agent-run spawn for ${c.workflow}/${c.order.run} failed: ${errMsg(e)}`);
+        const message = errMsg(e);
+        emit({
+          type: 'failed',
+          workflow: c.workflow,
+          run: c.order.run,
+          step: c.order.step,
+          kind: 'agent-run',
+          message,
+        });
+        opts.err(`agent-run spawn for ${c.workflow}/${c.order.run} failed: ${message}`);
       }
     }
 
@@ -458,6 +518,7 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
           serve_pools: servePools,
           ...(opts.conductorId !== undefined ? { conductor_id: opts.conductorId } : {}),
           ...(opts.startedAt !== undefined ? { started_at: opts.startedAt } : {}),
+          ...(attendedAt !== undefined ? { attended_at: attendedAt } : {}),
         });
         lastPresence = opts.now();
       } catch (e) {
@@ -541,6 +602,11 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
       lastPresence = Number.NEGATIVE_INFINITY; // D6: next iterate() pings immediately
       return { name: shiftName, servePools: [...servePools] };
     },
+    noteAttended: (at: number) => {
+      attendedAt = at;
+      lastPresence = Number.NEGATIVE_INFINITY;
+    },
+    getAttendedAt: () => attendedAt,
     noteRunEnded: (run: string) => {
       removeChildRecord(opts.stateDir, run);
     },

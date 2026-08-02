@@ -225,8 +225,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   const settingsLine = recorded.outcome === 'written' ? `written -> ${recorded.path}` : `hubOrigin already set (unchanged) -> ${recorded.path}`;
   out(`  settings: ${settingsLine}`);
   const asSuffix = account === 'default' ? '' : ` --as ${account}`;
-  out(`  next: owenloop work proxy${asSuffix}`);
-  out(`        (or mount as MCP: owenloop work proxy --mcp${asSuffix})`);
+  const shiftScope = pools !== undefined && pools.length > 0 ? pools.join(' ') : '--all';
+  out(`  next: owenloop shift start ${shiftScope}${asSuffix}`);
 
   return 0;
 }
