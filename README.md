@@ -346,18 +346,23 @@ environment variables, no CLI verbs to memorize. The same package also includes
 the execution-side companion; use `owenloop work <subcommand>` for lower-level
 execution tasks. There is no separate `owenwork` package or binary.
 
-For a foreground local shift, start the daemon in one terminal and poll it from
-another:
+For a foreground local shift, start the daemon in one terminal. Run the client
+commands from another terminal:
 
 ```sh
+# Terminal 1: foreground daemon
 owenloop shift start alpha
+
+# Terminal 2: client calls
 owenloop shift next
 owenloop shift status
 owenloop shift end
 ```
 
-`shift start` requires at least one crew; pass `--all` explicitly to serve every
-crew. `shift next` waits up to 90 seconds by default.
+`shift start` requires at least one named crew unless you pass `--all`
+explicitly; `--all` serves all pools for the Scoped Identity. `shift next` waits
+up to 90 seconds by default. For flags, JSON output, daemon behavior, and exit
+codes, see the [`shift` reference](docs/cli.md#shift--foreground-daemon-and-client).
 
 **Want to see or drive the machinery yourself?** Everything above goes
 through the same small CLI (`create`, `tick`, `green`, `reject`, …).
@@ -390,13 +395,19 @@ hub's own def hashes, so an unchanged re-push is a no-op. `owenloop agent new
 `agent:<name>` without ever printing it. See the
 [Hub](docs/cli.md#hub-login--connect--push--logout) section in `docs/cli.md`.
 
-Setting up a machine from scratch? `owenloop setup` converges the whole install
-in one idempotent pass — human login, agent credential, the owenwork settings
-file, and the Claude Code plugin — so a re-run on an already-set-up machine writes
-nothing. `owenloop doctor` is its read-only counterpart: it checks each piece
-and prints a `✓`/`✗` line with the remedy. See
-[`setup`](docs/cli.md#setup--converge-a-machines-install) and
-[`doctor`](docs/cli.md#doctor--check-a-machines-install) in `docs/cli.md`.
+Setting up a machine from scratch? `owenloop setup` may sign you in as a human
+and, when needed, mint or rekey and store a Scoped Identity. Setup writes only
+`hubOrigin` into the execution settings file, preserving the other keys. The
+file is `$XDG_CONFIG_HOME/owenwork/settings.json` when `XDG_CONFIG_HOME` is
+set to a non-blank value; otherwise `$HOME/.config/owenwork/settings.json`. For
+a non-default account,
+setup only prints the `OWENWORK_ACCOUNT=<name>` instruction. Setup probes the
+Claude Code plugin and, when it is missing, prints the manual commands
+`claude plugin marketplace add owenloop` and
+`claude plugin install owenloop@owenloop`; setup does not install the plugin.
+`owenloop doctor` is the read-only counterpart: it checks each piece and prints a
+`✓`/`✗` line with the remedy. See [`setup`](docs/cli.md#setup--onboard-a-machine)
+and [`doctor`](docs/cli.md#doctor--check-a-machines-install) in `docs/cli.md`.
 
 Driving the hub from an MCP host instead? `owenloop mcp` serves the hub control
 plane to a local MCP host (Claude Code) over stdio — MCP hosts spawn it, you

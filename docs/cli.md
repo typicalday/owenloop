@@ -58,9 +58,10 @@ for the full breakdown.
 | `pool rm <poolId> [--hub <url>]` | delete a pool; work stamped to it moves to the org's orphan pool — see [Pools](#pools) |
 | `pool member add <poolId> <principalKind> <principalId> [--hub <url>]` | add a member or agent to a pool — see [Pools](#pools) |
 | `pool member rm <poolId> <principalId> [--hub <url>]` | remove a principal from a pool — see [Pools](#pools) |
-| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]` | converge this machine's install (human login, agent credential, owenwork settings, plugin) in one idempotent pass — see [`setup`](#setup--converge-a-machines-install) |
+| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]` | onboard this machine: may store human and Scoped Identity credentials, write only execution-settings `hubOrigin`, and after probing print missing-plugin commands instead of installing the plugin — see [`setup`](#setup--onboard-a-machine) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
+| `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
 | `work <subcommand> [options]` | run the execution-side CLI companion — see [`work`](#work--execution-side-cli-companion) |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
@@ -82,6 +83,138 @@ for the full breakdown.
 | `delete <wf>` | delete an instance and all its rows |
 | `adopt <wf>` | re-pin an instance to the current definition and settle any new debts |
 
+## `shift` — foreground daemon and client
+
+`owenloop shift` is the public local dispatch surface. `shift start` runs the
+self-driven dispatch loop as a foreground process and listens on
+`<stateDir>/shift.sock`. Each client connection carries one JSON-line request
+and one JSON-line response. The daemon keeps polling and dispatching while no
+`shift next` client is attached.
+
+The `shift start` positional argument is a **crew** name. The routing API calls
+that field a **pool**: `serve_pools` contains the selected pool names. Passing
+`--all` maps to an empty `serve_pools` list, which means all pools available to
+the Scoped Identity. Do not treat `attended_at` as a liveness signal: every
+accepted `shift next` records attendance and makes the next presence ping due,
+but attendance is advisory and observability-only. Attendance never changes
+routing, dispatch, or lease behavior.
+
+The execution settings file is `$XDG_CONFIG_HOME/owenwork/settings.json` when
+`XDG_CONFIG_HOME` is set to a non-blank value; otherwise it is
+`$HOME/.config/owenwork/settings.json`. The
+retained on-disk `owenwork` path and `OWENWORK_*` environment names are current
+configuration names, not a separate package or executable.
+
+### `shift start <crew...>`
+
+```text
+owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]
+[--cap <n>] [--max-agents <n>] [--poll-interval <ms>] [--once]
+[--cache-dir <p>] [--state-dir <p>]
+```
+
+At least one named crew is required unless `--all` is present. `--all` and
+named crews are mutually exclusive. Duplicate named crews collapse to one
+entry before routing. The daemon owns one socket at a time; a second start
+against the same socket is refused. There is no detach mode. `--once` performs
+one loop sweep and exits instead of keeping the foreground daemon running.
+
+| option | default and behavior |
+|---|---|
+| `--origin <url>` | use this hub origin; otherwise use `hubOrigin` from the execution settings file; there is no hub-origin fallback |
+| `--as <account>` | use this Scoped Identity account; defaults to `default` |
+| `--name <n>` | use this shift name; otherwise generate one from the host and current directory with a process/conductor suffix |
+| `--cap <n>` | dispatch capacity; precedence is flag, then `settings.dispatchCap`, then `3` |
+| `--max-agents <n>` | concurrent agent limit; precedence is flag, then `settings.maxConcurrentAgents`, then `4` |
+| `--poll-interval <ms>` | loop polling interval; defaults to `5000` milliseconds |
+| `--once` | run one loop sweep and exit; without it, keep the daemon in the foreground |
+| `--cache-dir <p>` | cache root; precedence is flag, then `OWENWORK_CACHE_DIR`, then `settings.cacheDir`, then `$XDG_CACHE_HOME/owenwork`, then `$HOME/.cache/owenwork` |
+| `--state-dir <p>` | socket and child-state root; precedence is flag, then `OWENWORK_STATE_DIR`, then `settings.stateDir`, then `$XDG_STATE_HOME/owenwork/exec`, then `$HOME/.local/state/owenwork/exec`; the socket is `shift.sock` inside this directory |
+
+A clean start or `--once` completion exits `0`. `owenloop shift --help` also
+exits `0`. Runtime failures such as credential reads or socket/runtime setup
+exit `1`. Usage and
+precondition failures — including no crew or `--all`, invalid flags, a missing
+hub origin, or a missing Scoped Identity credential — exit `2`. The foreground
+daemon's normal lifecycle line is written to stdout when it stays running;
+diagnostics go to stderr.
+
+### `shift next [--wait <seconds>]`
+
+```text
+owenloop shift next [--wait <seconds>] [--state-dir <p>]
+```
+
+`--wait` accepts a finite, non-negative number of seconds and defaults to `90`.
+`--state-dir` selects the daemon socket. Only one `next` call may be parked at
+a time. A second parked call returns this error and exits `1`:
+
+```text
+whats_next is already parked — one park at a time (cancel it or wait for it to return)
+```
+
+When a `next` request is accepted, the daemon stamps `attended_at`. The call
+returns promptly when an event is queued, the wait expires, or the shift
+explicitly ends. A normal timeout exits `0` and prints the current capacity
+object, for example `{ "cap": 3, "free": 3, "running": 0, "events": [] }`.
+Successful responses use the same capacity shape and may include queued event
+objects. For `dispatched`, `reaped`, and `failed`, `kind` is either `exec` or
+`agent-run`:
+
+- `dispatched`: `{ "type": "dispatched", "workflow": "...", "run": "...", "step": "...", "kind": "exec", "pid": 123 }`
+- `reaped`: `{ "type": "reaped", "workflow": "...", "run": "...", "kind": "exec", "pid": 123 }`
+- `failed`: `{ "type": "failed", "workflow": "...", "run": "...", "step": "...", "kind": "exec", "message": "..." }`
+- `ended`: `{ "type": "ended" }`, delivered to a parked `next` when `shift end` explicitly shuts down the daemon
+
+`gate` is a reserved protocol shape for a future local representation of a
+pending hub gate. Production code does not construct live hub gate events yet;
+the local FIFO test and drill scope are recorded in
+[`packages/work/test/shift-walkthrough.manual.md`](../packages/work/test/shift-walkthrough.manual.md).
+
+If no daemon is listening, `next` exits `1` and prints the exact start guidance:
+
+```text
+no shift daemon at <stateDir>/shift.sock — start one with: owenloop shift start <crew…>
+```
+
+Invalid arguments exit `2`. Other client or daemon runtime failures exit `1`.
+All successful client output is one JSON object on stdout; diagnostics are on
+stderr.
+
+### `shift status [--state-dir <path>]`
+
+```text
+owenloop shift status [--state-dir <p>]
+```
+
+With a daemon, status exits `0` and prints:
+
+```json
+{ "name": "host/project#abc123", "serve_pools": ["alpha"], "cap": 3, "free": 3, "running": 0, "attended_at": null, "started_at": 1738000000000 }
+```
+
+`attended_at` remains `null` until the first accepted `next` request. Without a
+daemon, status is still a successful question: it exits `0` and prints
+`{ "status": "no daemon", "socket": "<path>" }`. Invalid arguments exit `2`;
+other client/runtime errors exit `1`.
+
+### `shift end [--state-dir <path>]`
+
+```text
+owenloop shift end [--state-dir <p>]
+```
+
+An explicit end stops the loop, resolves an in-flight `next` with an `ended`
+event, sends the final presence update with `attended_at` omitted so the hub
+clears the attendance stamp, closes the socket, and prints
+`{ "ok": true, "ended": true }` with exit `0`. Detached `exec` and `agent-run`
+children remain alive to finish under their own leases. Signal shutdown (for
+example, Ctrl-C) stops the daemon but does not synthesize the `ended` event or
+perform the explicit attendance-clearing update.
+
+If no daemon is listening, `end` exits `1` with the same start guidance as
+`next`. Invalid arguments exit `2`; other client/runtime errors exit `1`.
+
 ## `work` — execution-side CLI companion
 
 The execution-side commands ship in the same `owenloop` npm package and use the
@@ -91,10 +224,15 @@ same `owenloop` binary. Replace the old separate `owenwork` invocation directly:
 owenwork <subcommand> ...    →    owenloop work <subcommand> ...
 ```
 
-Subcommand names and options are unchanged. Run `owenloop work --help` for the
-full role-specific usage. The on-disk `owenwork` settings file and `OWENWORK_*`
-environment variables retain their names because they are configuration and wire
-state, not package or executable names.
+The transplanted subcommand names remain. The proxy/session `--mcp` option was
+removed; `hold --mcp` remains because the machine-attached hold mount still
+exists. Run `owenloop work --help` for the full role-specific usage.
+
+The execution settings file is `$XDG_CONFIG_HOME/owenwork/settings.json` when
+`XDG_CONFIG_HOME` is set to a non-blank value; otherwise it is
+`$HOME/.config/owenwork/settings.json`. The
+on-disk `owenwork` path and `OWENWORK_*` environment names remain current
+configuration names; they do not identify a separate package or executable.
 
 | subcommand | what it does |
 |---|---|
@@ -928,16 +1066,18 @@ lines (the tolerant-false notices, the transfer summary) go to stderr only.
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
 
-## `setup` — converge a machine's install
+## `setup` — onboard a machine
 
-`owenloop setup` is the one-shot onboarding command. It brings a machine to a
-working install by converging six surfaces in order, each a **probe → (skip |
-act)** step — a step acts only when its probe fails, so a second run on an
-already-set-up machine performs **zero writes** (no store mutation, no settings
-write, no browser, no mint/rekey/register POST). The steps:
+`owenloop setup` is the one-shot onboarding command. It runs six ordered steps.
+Depending on the machine state, setup may store the human credential, mint or
+rekey and store a Scoped Identity credential, and write only `hubOrigin` in the
+execution settings file while preserving its other keys. The plugin step only
+probes whether the Claude Code plugin is installed; when the probe reports it
+missing, setup prints manual install commands but never runs those commands or
+installs the plugin. The steps:
 
 1. **inspect** — read-only report of what's already present (human credential,
-   owenwork settings, `claude` on PATH, agent slots). No writes.
+   execution settings, `claude` on PATH, agent slots). No writes.
 2. **human login** — verify the stored **human** credential, or run the same
    loopback-OAuth browser flow as `owenloop login` when none is present or it no
    longer verifies. This is the gate that makes step 3's mint/rekey legal.
@@ -945,8 +1085,9 @@ write, no browser, no mint/rekey/register POST). The steps:
    hub and reuse it; otherwise **mint** a new Scoped Identity or **rekey**
    (replace the credential of) an existing one. How the target is chosen is
    [below](#choosing-the-scoped-identity-flow-a-vs-flow-b).
-4. **owenwork settings** — write `hubOrigin` into the owenwork settings file so
-   the local Step Agent talks to this hub (skipped when it already matches).
+4. **execution settings** — write only `hubOrigin` into the execution settings
+   file so the local Step Agent talks to this hub, preserving every other key
+   (skipped when `hubOrigin` already matches).
 5. **plugin** — check whether the Claude Code `owenloop` plugin is installed.
    **Non-fatal:** while the marketplace is unpublished this step only *prints*
    the manual install commands (`claude plugin marketplace add owenloop` then
@@ -1051,7 +1192,7 @@ The checks, in order:
 | 2 | human plane | that credential verifies live against the hub (`whoami`) | yes |
 | 3 | agent slot | an `agent:<name>` credential is stored | yes |
 | 4 | agent plane | that agent credential verifies live against the hub | yes |
-| 5 | owenwork settings | the settings file's `hubOrigin` matches this hub | yes |
+| 5 | execution settings | the settings file's `hubOrigin` matches this hub | yes |
 | 6 | plugin | the Claude Code `owenloop` plugin is installed | **no** (rendered only) |
 
 Each `✗` line names its own remedy (`run owenloop setup`, `owenloop login --hub
