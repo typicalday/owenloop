@@ -174,7 +174,7 @@ test('fragmented JSON, malformed requests, and oversized requests receive struct
   await stop(f);
 });
 
-test('status, atomic clock-in validation, attendance, queued event drain, and wait timeout', async () => {
+test('status, atomic clock-in validation, attendance, typed gate event drain, and wait timeout', async () => {
   const f = fixture();
   await waitForPath(f.socketPath);
   const before = await requestShift(f.socketPath, { op: 'status' });
@@ -192,21 +192,7 @@ test('status, atomic clock-in validation, attendance, queued event drain, and wa
   assert.equal('name' in clocked && clocked.name, 'shift-b');
   assert.deepEqual(f.state.servePools, ['beta']);
 
-  f.daemon.onEvent({ type: 'failed', workflow: 'wf1', run: 'r1', step: 's', kind: 'exec', message: 'boom' });
-  const attended = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
-  assert.deepEqual('events' in attended && attended.events, [{ type: 'failed', workflow: 'wf1', run: 'r1', step: 's', kind: 'exec', message: 'boom' }]);
-  assert.equal(f.state.attended, 1234);
-
-  const started = Date.now();
-  const timeout = await requestShift(f.socketPath, { op: 'next', wait_ms: 20 });
-  assert.ok(Date.now() - started < 500, 'wait timeout is bounded');
-  assert.deepEqual('events' in timeout && timeout.events, []);
-  await stop(f);
-});
-
-test('gate event passes through next and drains once', async () => {
-  const f = fixture();
-  await waitForPath(f.socketPath);
+  const failed = { type: 'failed' as const, workflow: 'wf1', run: 'r1', step: 's', kind: 'exec' as const, message: 'boom' };
   const gate: GateEvent = {
     type: 'gate',
     workflow: 'wf_gate',
@@ -214,12 +200,16 @@ test('gate event passes through next and drains once', async () => {
     name: 'approval',
     question: 'Should the gate continue?',
   };
+  f.daemon.onEvent(failed);
   f.daemon.onEvent(gate);
+  const attended = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  assert.deepEqual('events' in attended && attended.events, [failed, gate]);
+  assert.equal(f.state.attended, 1234);
 
-  const first = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
-  assert.deepEqual('events' in first && first.events, [gate]);
-  const second = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
-  assert.deepEqual('events' in second && second.events, []);
+  const started = Date.now();
+  const timeout = await requestShift(f.socketPath, { op: 'next', wait_ms: 20 });
+  assert.ok(Date.now() - started < 500, 'wait timeout is bounded');
+  assert.deepEqual('events' in timeout && timeout.events, []);
   await stop(f);
 });
 

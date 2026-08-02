@@ -9,7 +9,7 @@ This runbook records which parts of the Phase-7 shift walkthrough are automated 
 | 1. Terminal-only shift with no agent attending | `terminal-only daemon dispatches before any shift next and keeps presence unattended` in `shift-blocking-acceptance.test.ts` | Automated |
 | 2. Attended shift with a forced mid-shift turn end | `attending shift survives cancellation and dispatches while no client is parked` in `shift-blocking-acceptance.test.ts`, plus the Claude Code drill below for the harness-side backstop | Daemon half automated; harness half manual |
 | 3. Codex attended shift | The same test-controlled CLI child in the scenario-2 test covers the shared command and socket transport; the Codex drill below covers Codex-specific behavior | Transport automated; harness behavior manual |
-| 4. Gate round-trip through a poll-reply event | `gate event passes through next and drains once` in `shift-server.test.ts`; the live hub round-trip remains a residual production gap | Protocol drain automated; live round-trip unavailable |
+| 4. Gate round-trip through a poll-reply event | `status, atomic clock-in validation, attendance, typed gate event drain, and wait timeout` in `shift-server.test.ts`; the live hub round-trip remains a residual production gap | Protocol drain automated; live round-trip unavailable |
 | 5. `shift end` from another terminal resolves an in-flight poll | `idle next blocks, dispatch wakes it, a second next parks, and a third terminal ends the shift` in `shift-blocking-acceptance.test.ts` | Pre-existing automated coverage |
 
 ## Simulation contract
@@ -63,6 +63,6 @@ The automated CLI-child simulation proves the shared command and Unix-socket tra
 
 ## Gate residual gap
 
-The current repository has no pending-gates method in `packages/work/src/hub/client.ts`, and `packages/work/src/proxy/loop.ts` does not construct a `gate` event. The server test `gate event passes through next and drains once` covers the existing typed event FIFO and local poll-reply path without inventing a hub integration.
+The current repository has no pending-gates method in `packages/work/src/hub/client.ts`, and `packages/work/src/proxy/loop.ts` does not construct a `gate` event. The server test `status, atomic clock-in validation, attendance, typed gate event drain, and wait timeout` covers the existing typed event FIFO and local poll-reply path without inventing a hub integration.
 
 A real `gate arrives -> shift next returns the gate -> a human replies -> owenloop provide -> polling resumes` drill cannot run until a separate scoped change adds hub polling and a gate producer in this repository. The current test must not be read as end-to-end gate coverage.

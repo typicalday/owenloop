@@ -14,6 +14,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
+import { readChildRecords } from '../src/proxy/state.ts';
 import { OVERLAP_ERROR } from '../src/shift/protocol.ts';
 import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
 import { startMockHub, until, type HubReq } from './helpers/mcp-stdio-client.ts';
@@ -42,6 +43,32 @@ beforeEach(() => {
   commands = [];
 });
 
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+async function stopDetachedExecutions(): Promise<void> {
+  const records = readChildRecords(stateDir);
+  for (const record of records) {
+    try {
+      process.kill(record.pid, 'SIGTERM');
+    } catch {
+      // The detached child may have exited between the state read and signal.
+    }
+  }
+  if (records.length === 0) return;
+  await until(
+    () => records.every((record) => !processIsAlive(record.pid)),
+    `detached executions to exit (${records.map((record) => record.pid).join(', ')})`,
+    10_000,
+  );
+}
+
 afterEach(async () => {
   const daemon = shift;
   daemon?.child.kill('SIGKILL');
@@ -52,6 +79,7 @@ afterEach(async () => {
     ...(daemon === undefined ? [] : [daemon.exited]),
     ...commands.map((command) => command.result),
   ]);
+  await stopDetachedExecutions();
   rmSync(root, { recursive: true, force: true });
 });
 
