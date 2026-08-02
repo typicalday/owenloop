@@ -58,7 +58,7 @@ for the full breakdown.
 | `pool rm <poolId> [--hub <url>]` | delete a pool; work stamped to it moves to the org's orphan pool — see [Pools](#pools) |
 | `pool member add <poolId> <principalKind> <principalId> [--hub <url>]` | add a member or agent to a pool — see [Pools](#pools) |
 | `pool member rm <poolId> <principalId> [--hub <url>]` | remove a principal from a pool — see [Pools](#pools) |
-| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]` | converge this machine's install (human login, agent credential, execution settings, plugin) in one idempotent pass — see [`setup`](#setup--converge-a-machines-install) |
+| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]` | onboard this machine: may store human and Scoped Identity credentials, write only execution-settings `hubOrigin`, and after probing print missing-plugin commands instead of installing the plugin — see [`setup`](#setup--onboard-a-machine) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
@@ -99,8 +99,9 @@ accepted `shift next` records attendance and makes the next presence ping due,
 but attendance is advisory and observability-only. Attendance never changes
 routing, dispatch, or lease behavior.
 
-The execution settings file is `$XDG_CONFIG_HOME/owenwork/settings.json`, or
-`$HOME/.config/owenwork/settings.json` when `XDG_CONFIG_HOME` is unset. The
+The execution settings file is `$XDG_CONFIG_HOME/owenwork/settings.json` when
+`XDG_CONFIG_HOME` is set to a non-blank value; otherwise it is
+`$HOME/.config/owenwork/settings.json`. The
 retained on-disk `owenwork` path and `OWENWORK_*` environment names are current
 configuration names, not a separate package or executable.
 
@@ -227,8 +228,9 @@ The transplanted subcommand names remain. The proxy/session `--mcp` option was
 removed; `hold --mcp` remains because the machine-attached hold mount still
 exists. Run `owenloop work --help` for the full role-specific usage.
 
-The execution settings file is `$XDG_CONFIG_HOME/owenwork/settings.json`, or
-`$HOME/.config/owenwork/settings.json` when `XDG_CONFIG_HOME` is unset. The
+The execution settings file is `$XDG_CONFIG_HOME/owenwork/settings.json` when
+`XDG_CONFIG_HOME` is set to a non-blank value; otherwise it is
+`$HOME/.config/owenwork/settings.json`. The
 on-disk `owenwork` path and `OWENWORK_*` environment names remain current
 configuration names; they do not identify a separate package or executable.
 
@@ -1064,13 +1066,15 @@ lines (the tolerant-false notices, the transfer summary) go to stderr only.
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
 
-## `setup` — converge a machine's install
+## `setup` — onboard a machine
 
-`owenloop setup` is the one-shot onboarding command. It brings a machine to a
-working install by converging six surfaces in order, each a **probe → (skip |
-act)** step — a step acts only when its probe fails, so a second run on an
-already-set-up machine performs **zero writes** (no store mutation, no settings
-write, no browser, no mint/rekey/register POST). The steps:
+`owenloop setup` is the one-shot onboarding command. It runs six ordered steps.
+Depending on the machine state, setup may store the human credential, mint or
+rekey and store a Scoped Identity credential, and write only `hubOrigin` in the
+execution settings file while preserving its other keys. The plugin step only
+probes whether the Claude Code plugin is installed; when the probe reports it
+missing, setup prints manual install commands but never runs those commands or
+installs the plugin. The steps:
 
 1. **inspect** — read-only report of what's already present (human credential,
    execution settings, `claude` on PATH, agent slots). No writes.
