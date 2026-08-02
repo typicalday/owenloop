@@ -94,6 +94,7 @@ function orderPacket() {
 
 test('idle next blocks, dispatch wakes it, a second next parks, and a third terminal ends the shift', async () => {
   let dispatchEnabled = false;
+  let dispatchAt: number | undefined;
   let orderVisible = true;
   const order = orderPacket();
   const bundle: CachedBundle = {
@@ -115,6 +116,7 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
       }
       if (dispatchEnabled && orderVisible) {
         orderVisible = false;
+        dispatchAt = Date.now();
         return { text: '', workflow: 'wf_blocking', def: 'demo', orders: [{
           workflow: 'wf_blocking',
           run: 'run_blocking',
@@ -176,6 +178,9 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
     dispatchEnabled = true;
     const firstResult = await firstNext.result;
     assert.equal(firstResult.code, 0, firstResult.stderr);
+    assert.notEqual(dispatchAt, undefined, 'the fake hub must observe a dispatched order');
+    const dispatchLatency = Date.now() - dispatchAt!;
+    assert.ok(dispatchLatency < 2_000, `dispatch-to-return latency was ${dispatchLatency}ms`);
     const firstResponse = jsonResult<{ events: Array<{ type: string }> }>(firstResult);
     assert.ok(firstResponse.events.some((event) => event.type === 'dispatched'), JSON.stringify(firstResponse));
 
@@ -183,6 +188,7 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.equal(secondNext.child.exitCode, null, 'the second terminal next must park while no event is available');
 
+    const presenceBeforeEnd = requests(reqs, 'presence_ping').length;
     const ending = runCli(['shift', 'end', '--state-dir', stateDir]);
     const endedResult = await ending.result;
     assert.equal(endedResult.code, 0, endedResult.stderr);
@@ -202,12 +208,13 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
     assert.deepEqual(jsonResult(afterEndResult), { status: 'no daemon', socket: join(stateDir, 'shift.sock') });
 
     await until(
-      () => requests(reqs, 'presence_ping').some((request) => request.body?.['attended_at'] === undefined),
-      'the final attendance-clearing presence ping',
+      () => requests(reqs, 'presence_ping').length > presenceBeforeEnd,
+      'the post-attendance final presence ping',
     );
-    const finalPing = [...requests(reqs, 'presence_ping')].reverse().find((request) => request.body?.['attended_at'] === undefined);
-    assert.ok(finalPing, 'final presence ping must omit attended_at');
-    assert.equal(Object.hasOwn(finalPing!.body ?? {}, 'attended_at'), false);
+    const postEndPings = requests(reqs, 'presence_ping').slice(presenceBeforeEnd);
+    const finalPing = postEndPings[postEndPings.length - 1];
+    assert.ok(finalPing, 'the final presence ping must occur after attendance');
+    assert.equal(Object.hasOwn(finalPing.body ?? {}, 'attended_at'), false);
   } finally {
     shift?.child.kill('SIGKILL');
     server.close();

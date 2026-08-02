@@ -6,7 +6,19 @@
  * dispatch, and child reconciliation. This wrapper only translates local socket
  * requests and loop observations into the Phase 2 JSON-lines protocol.
  */
-import { chmodSync, lstatSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+  type Stats,
+} from 'node:fs';
 import { createServer, createConnection, type Server, type Socket } from 'node:net';
 
 import type { HubClient } from '../hub/client.ts';
@@ -49,6 +61,28 @@ interface ParkedNext {
   timer: NodeJS.Timeout | undefined;
 }
 
+interface FileIdentity {
+  dev: number;
+  ino: number;
+  ctimeMs: number;
+}
+
+interface StartupLock {
+  path: string;
+  fd: number;
+  identity: FileIdentity;
+}
+
+const REQUEST_IDLE_TIMEOUT_MS = 5_000;
+
+function fileIdentity(stat: Stats): FileIdentity {
+  return { dev: stat.dev, ino: stat.ino, ctimeMs: stat.ctimeMs };
+}
+
+function sameFileIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.ctimeMs === right.ctimeMs;
+}
+
 function errorResponse(message: string): ShiftError {
   return { error: message };
 }
@@ -85,10 +119,100 @@ async function probeSocket(path: string): Promise<'active' | 'stale'> {
   });
 }
 
+function ownerIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ESRCH') return false;
+    if (code === 'EPERM') return true;
+    throw error;
+  }
+}
+
+async function acquireStartupLock(socketPath: string): Promise<StartupLock> {
+  const lockPath = `${socketPath}.lock`;
+  const waitUntil = Date.now() + 2_000;
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, 'wx', 0o600);
+      try {
+        writeFileSync(fd, `${process.pid}\n`, 'utf8');
+        return { path: lockPath, fd, identity: fileIdentity(fstatSync(fd)) };
+      } catch (error) {
+        try { closeSync(fd); } catch { /* best effort */ }
+        try { unlinkSync(lockPath); } catch { /* best effort */ }
+        throw error;
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      if (code !== 'EEXIST') throw error;
+    }
+
+    let current: Stats;
+    try {
+      current = lstatSync(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (!current.isFile() || current.isSymbolicLink()) {
+      throw new Error(`cannot start shift daemon: startup lock ${lockPath} exists and is not a regular file`);
+    }
+
+    let ownerText: string;
+    try {
+      ownerText = readFileSync(lockPath, 'utf8').trim();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (!/^\d+$/.test(ownerText)) {
+      throw new Error(`cannot start shift daemon: startup lock ${lockPath} has invalid ownership`);
+    }
+    const ownerPid = Number(ownerText);
+    if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0) {
+      throw new Error(`cannot start shift daemon: startup lock ${lockPath} has invalid ownership`);
+    }
+    if (ownerIsAlive(ownerPid)) {
+      if (Date.now() >= waitUntil) {
+        throw new Error(`cannot start shift daemon: another daemon is starting at ${socketPath}`);
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      continue;
+    }
+
+    let currentAgain: Stats;
+    try {
+      currentAgain = lstatSync(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') continue;
+      throw error;
+    }
+    if (!sameFileIdentity(fileIdentity(current), fileIdentity(currentAgain))) continue;
+    try {
+      unlinkSync(lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+function releaseStartupLock(lock: StartupLock): void {
+  try {
+    const current = lstatSync(lock.path);
+    if (sameFileIdentity(lock.identity, fileIdentity(current))) unlinkSync(lock.path);
+  } catch {
+    // The lock may already have been reclaimed after a crash or operator action.
+  }
+  try { closeSync(lock.fd); } catch { /* already closed */ }
+}
+
 function writeResponse(socket: Socket, response: ShiftResponse): void {
   if (socket.destroyed) return;
   try {
-    socket.end(`${JSON.stringify(response)}\n`);
+    socket.end(`${JSON.stringify(response)}\n`, () => socket.destroy());
   } catch {
     socket.destroy();
   }
@@ -126,13 +250,16 @@ function validateRequest(value: unknown): ShiftRequest | ShiftError {
 
 export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
   let server: Server | undefined;
-  let socketInode: number | bigint | undefined;
+  let socketIdentity: FileIdentity | undefined;
   let opened = false;
   let shutdownStarted = false;
   let shutdownReason: 'end' | 'signal' | 'loop' | undefined;
   let shutdownPromise: Promise<void> | undefined;
+  let shutdownSocket: Socket | undefined;
   let loopPromise: Promise<number> | undefined;
   let parked: ParkedNext | undefined;
+  const connections = new Set<Socket>();
+  const respondedConnections = new Set<Socket>();
   const events: ShiftEvent[] = [];
 
   const capacity = (): Omit<ShiftCapacity, 'events'> => {
@@ -152,12 +279,17 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     };
   };
 
+  const respond = (socket: Socket, response: ShiftResponse): void => {
+    respondedConnections.add(socket);
+    writeResponse(socket, response);
+  };
+
   const sendParked = (response: ShiftCapacity): void => {
     const current = parked;
     if (current === undefined) return;
     parked = undefined;
     if (current.timer !== undefined) clearTimeout(current.timer);
-    writeResponse(current.socket, response);
+    respond(current.socket, response);
   };
 
   const drainEvents = (): ShiftEvent[] => {
@@ -183,7 +315,7 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     try {
       const current = lstatSync(opts.socketPath);
       if (!current.isSocket()) return;
-      if (socketInode !== undefined && current.ino !== socketInode) return;
+      if (socketIdentity !== undefined && !sameFileIdentity(socketIdentity, fileIdentity(current))) return;
       unlinkSync(opts.socketPath);
     } catch {
       // The socket may already have been removed by an operator or a failed bind.
@@ -206,7 +338,7 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     let preservedPath: string | undefined;
     try {
       const currentPath = lstatSync(opts.socketPath);
-      if (socketInode !== undefined && currentPath.isSocket() && currentPath.ino !== socketInode) {
+      if (socketIdentity !== undefined && currentPath.isSocket() && !sameFileIdentity(socketIdentity, fileIdentity(currentPath))) {
         preservedPath = `${opts.socketPath}.closing-${process.pid}-${Date.now()}`;
         renameSync(opts.socketPath, preservedPath);
       }
@@ -265,10 +397,18 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     }
   };
 
-  const requestShutdown = (reason: 'end' | 'signal' | 'loop'): Promise<void> => {
+  const destroyConnections = (): void => {
+    for (const socket of connections) {
+      if (socket === shutdownSocket || respondedConnections.has(socket)) continue;
+      socket.destroy();
+    }
+  };
+
+  const requestShutdown = (reason: 'end' | 'signal' | 'loop', preserve?: Socket): Promise<void> => {
     if (shutdownPromise !== undefined) return shutdownPromise;
     shutdownStarted = true;
     shutdownReason = reason;
+    shutdownSocket = preserve;
     if (reason === 'end') {
       enqueue({ type: 'ended' });
     } else if (parked !== undefined) {
@@ -277,8 +417,8 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
       const current = parked;
       parked = undefined;
       if (current.timer !== undefined) clearTimeout(current.timer);
-      current.socket.destroy();
     }
+    destroyConnections();
     opts.loop.stop();
     shutdownPromise = (async () => {
       if (loopPromise !== undefined) {
@@ -297,38 +437,38 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
   const handleRequest = async (socket: Socket, value: unknown): Promise<void> => {
     const parsed = validateRequest(value);
     if ('error' in parsed) {
-      writeResponse(socket, parsed);
+      respond(socket, parsed);
       return;
     }
     if (parsed.op === 'status') {
-      writeResponse(socket, status());
+      respond(socket, status());
       return;
     }
     if (shutdownStarted && parsed.op !== 'end') {
-      writeResponse(socket, errorResponse('shift daemon is ending'));
+      respond(socket, errorResponse('shift daemon is ending'));
       return;
     }
     if (parsed.op === 'clock_in') {
       // validateRequest completed all validation before this mutation.
       opts.loop.setShift({ name: parsed.name, servePools: parsed.serve_pools });
-      writeResponse(socket, status());
+      respond(socket, status());
       return;
     }
     if (parsed.op === 'end') {
-      await requestShutdown('end');
-      writeResponse(socket, { ok: true, ended: true });
+      await requestShutdown('end', socket);
+      respond(socket, { ok: true, ended: true });
       return;
     }
 
     // `next` is the only operation that can remain parked.
     if (parked !== undefined) {
-      writeResponse(socket, errorResponse(OVERLAP_ERROR));
+      respond(socket, errorResponse(OVERLAP_ERROR));
       return;
     }
     opts.loop.noteAttended(opts.now());
     const current = capacityResponse();
     if (current.events.length > 0 || parsed.wait_ms === 0 || shutdownStarted) {
-      writeResponse(socket, current);
+      respond(socket, current);
       return;
     }
     const timer = setTimeout(() => {
@@ -339,13 +479,17 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
   };
 
   const handleConnection = (socket: Socket): void => {
+    connections.add(socket);
     let buffer = Buffer.alloc(0);
     let replied = false;
     const replyError = (message: string): void => {
       if (replied) return;
       replied = true;
-      writeResponse(socket, errorResponse(message));
+      respond(socket, errorResponse(message));
     };
+    socket.setTimeout(REQUEST_IDLE_TIMEOUT_MS, () => {
+      if (!replied) replyError('request timed out waiting for a complete line');
+    });
     socket.on('data', (chunk: Buffer) => {
       if (replied) return;
       buffer = Buffer.concat([buffer, chunk]);
@@ -356,16 +500,17 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
       const newline = buffer.indexOf(0x0a);
       if (newline === -1) return;
       replied = true;
+      socket.setTimeout(0);
       const raw = buffer.subarray(0, newline).toString('utf8');
       let value: unknown;
       try {
         value = JSON.parse(raw);
       } catch {
-        writeResponse(socket, errorResponse('malformed JSON request'));
+        respond(socket, errorResponse('malformed JSON request'));
         return;
       }
       void handleRequest(socket, value).catch((error) => {
-        writeResponse(socket, errorResponse(errMsg(error)));
+        respond(socket, errorResponse(errMsg(error)));
       });
     });
     socket.on('error', () => {
@@ -377,6 +522,8 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
       }
     });
     socket.on('close', () => {
+      connections.delete(socket);
+      respondedConnections.delete(socket);
       if (parked?.socket === socket) {
         if (parked.timer !== undefined) clearTimeout(parked.timer);
         parked = undefined;
@@ -386,45 +533,62 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
 
   const openSocket = async (): Promise<void> => {
     mkdirSync(opts.stateDir, { recursive: true });
+    const startupLock = await acquireStartupLock(opts.socketPath);
     try {
-      const current = lstatSync(opts.socketPath);
-      if (!current.isSocket()) {
-        throw new Error(`cannot start shift daemon: ${opts.socketPath} exists and is not a socket`);
-      }
-      const probe = await probeSocket(opts.socketPath);
-      if (probe === 'active') throw new Error(`cannot start shift daemon: another daemon is active at ${opts.socketPath}`);
-      unlinkSync(opts.socketPath);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException | undefined)?.code;
-      if (code !== 'ENOENT') throw error;
-    }
-
-    const nextServer = createServer(handleConnection);
-    server = nextServer;
-    await new Promise<void>((resolve, reject) => {
-      const onError = (error: Error): void => {
-        nextServer.off('listening', onListening);
-        reject(error);
-      };
-      const onListening = (): void => {
-        nextServer.off('error', onError);
-        resolve();
-      };
-      nextServer.once('error', onError);
-      nextServer.once('listening', onListening);
-      nextServer.listen(opts.socketPath);
-    });
-    try {
-      chmodSync(opts.socketPath, 0o600);
-      socketInode = lstatSync(opts.socketPath).ino;
-      opened = true;
-    } catch (error) {
       try {
-        nextServer.close();
-      } catch {
-        // best effort
+        const current = lstatSync(opts.socketPath);
+        if (!current.isSocket()) {
+          throw new Error(`cannot start shift daemon: ${opts.socketPath} exists and is not a socket`);
+        }
+        const probedIdentity = fileIdentity(current);
+        const probe = await probeSocket(opts.socketPath);
+        if (probe === 'active') throw new Error(`cannot start shift daemon: another daemon is active at ${opts.socketPath}`);
+        try {
+          const beforeUnlink = lstatSync(opts.socketPath);
+          if (!sameFileIdentity(probedIdentity, fileIdentity(beforeUnlink))) {
+            throw new Error(`cannot start shift daemon: socket changed while checking ${opts.socketPath}`);
+          }
+          unlinkSync(opts.socketPath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') throw error;
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        if (code !== 'ENOENT') throw error;
       }
-      throw error;
+
+      const nextServer = createServer(handleConnection);
+      server = nextServer;
+      await new Promise<void>((resolve, reject) => {
+        const onError = (error: Error): void => {
+          nextServer.off('listening', onListening);
+          server = undefined;
+          try { nextServer.close(); } catch { /* not listening */ }
+          reject(error);
+        };
+        const onListening = (): void => {
+          nextServer.off('error', onError);
+          resolve();
+        };
+        nextServer.once('error', onError);
+        nextServer.once('listening', onListening);
+        nextServer.listen(opts.socketPath);
+      });
+      try {
+        chmodSync(opts.socketPath, 0o600);
+        socketIdentity = fileIdentity(lstatSync(opts.socketPath));
+        opened = true;
+      } catch (error) {
+        server = undefined;
+        try {
+          nextServer.close();
+        } catch {
+          // best effort
+        }
+        throw error;
+      }
+    } finally {
+      releaseStartupLock(startupLock);
     }
   };
 

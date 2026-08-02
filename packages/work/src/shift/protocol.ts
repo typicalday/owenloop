@@ -10,6 +10,8 @@
 export const SHIFT_SOCKET_NAME = 'shift.sock';
 export const DEFAULT_NEXT_WAIT_MS = 90_000;
 export const MAX_REQUEST_LINE_BYTES = 64 * 1024;
+/** The client must accept the largest ordinary response from the 1,000-event FIFO. */
+export const MAX_RESPONSE_LINE_BYTES = 256 * 1024;
 export const MAX_EVENT_QUEUE = 1_000;
 export const OVERLAP_ERROR = 'whats_next is already parked — one park at a time (cancel it or wait for it to return)';
 export const NO_DAEMON_SUFFIX = ' — start one with: owenloop shift start <crew…>';

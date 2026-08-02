@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import {
   DEFAULT_NEXT_WAIT_MS,
   MAX_REQUEST_LINE_BYTES,
+  MAX_RESPONSE_LINE_BYTES,
   NO_DAEMON_SUFFIX,
   SHIFT_SOCKET_NAME,
   type ShiftRequest,
@@ -64,7 +65,7 @@ export function requestShift(socketPath: string, request: ShiftRequest): Promise
     socket.on('data', (chunk: Buffer) => {
       if (settled) return;
       buffer = Buffer.concat([buffer, chunk]);
-      if (buffer.length > MAX_REQUEST_LINE_BYTES * 2) {
+      if (buffer.length > MAX_RESPONSE_LINE_BYTES) {
         fail(new ShiftClientError('daemon response is too large', { code: 'EMSGSIZE' }));
         return;
       }
