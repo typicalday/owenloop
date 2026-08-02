@@ -14,6 +14,7 @@ import {
   MAX_RESPONSE_LINE_BYTES,
   OVERLAP_ERROR,
   RESPONSE_TRUNCATION_MARKER,
+  type GateEvent,
 } from '../src/shift/protocol.ts';
 import { requestShift } from '../src/shift/client.ts';
 import { rawShiftRequest } from './helpers/shift-client.ts';
@@ -173,7 +174,7 @@ test('fragmented JSON, malformed requests, and oversized requests receive struct
   await stop(f);
 });
 
-test('status, atomic clock-in validation, attendance, queued event drain, and wait timeout', async () => {
+test('status, atomic clock-in validation, attendance, typed gate event drain, and wait timeout', async () => {
   const f = fixture();
   await waitForPath(f.socketPath);
   const before = await requestShift(f.socketPath, { op: 'status' });
@@ -191,9 +192,18 @@ test('status, atomic clock-in validation, attendance, queued event drain, and wa
   assert.equal('name' in clocked && clocked.name, 'shift-b');
   assert.deepEqual(f.state.servePools, ['beta']);
 
-  f.daemon.onEvent({ type: 'failed', workflow: 'wf1', run: 'r1', step: 's', kind: 'exec', message: 'boom' });
+  const failed = { type: 'failed' as const, workflow: 'wf1', run: 'r1', step: 's', kind: 'exec' as const, message: 'boom' };
+  const gate: GateEvent = {
+    type: 'gate',
+    workflow: 'wf_gate',
+    run: 'run_gate',
+    name: 'approval',
+    question: 'Should the gate continue?',
+  };
+  f.daemon.onEvent(failed);
+  f.daemon.onEvent(gate);
   const attended = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
-  assert.deepEqual('events' in attended && attended.events, [{ type: 'failed', workflow: 'wf1', run: 'r1', step: 's', kind: 'exec', message: 'boom' }]);
+  assert.deepEqual('events' in attended && attended.events, [failed, gate]);
   assert.equal(f.state.attended, 1234);
 
   const started = Date.now();
