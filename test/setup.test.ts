@@ -30,7 +30,7 @@ import {
   makeIo,
   routedFetch,
 } from './hubkit.ts';
-import { owenworkSettingsPath } from '../src/work-settings.ts';
+import { owenloopSettingsPath } from '../src/work-settings.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
@@ -92,8 +92,8 @@ test('setup: fresh machine, scripted --new-agent runs steps 2-6 in order and con
   assert.equal(human.accessToken, 'mcpat_access');
   assert.ok(t.store.get(kcKey(ORIGIN, { principal: 'agent', account: 'buildbox' })), 'agent:buildbox stored');
 
-  // owenwork settings written with hubOrigin = the hub.
-  const settings = JSON.parse(readFileSync(owenworkSettingsPath(t.io.env), 'utf8'));
+  // owenloop settings written with hubOrigin = the hub.
+  const settings = JSON.parse(readFileSync(owenloopSettingsPath(t.io.env), 'utf8'));
   assert.equal(settings.hubOrigin, ORIGIN);
 
   // Machine-readable summary on stdout; doctor ran.
@@ -154,7 +154,7 @@ test('setup: a second run performs ZERO writes (no store mutation, no settings w
   assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t1.io), 0, t1.err.join('\n'));
 
   const storeSnapshot = [...store.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1));
-  const settingsPath = owenworkSettingsPath(t1.io.env);
+  const settingsPath = owenloopSettingsPath(t1.io.env);
   const settingsBytes = readFileSync(settingsPath, 'utf8');
 
   // Run 2 — same state, fresh call recorder.

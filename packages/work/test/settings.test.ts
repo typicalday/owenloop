@@ -8,8 +8,8 @@ import { settingsPath, loadSettings, validateSettings, inspectSettings, KNOWN_SE
 
 /** Write a settings.json under a fresh temp XDG dir; returns the XDG root. */
 function withSettingsFile(contents: string): string {
-  const xdg = mkdtempSync(join(tmpdir(), 'owenwork-settings-'));
-  const dir = join(xdg, 'owenwork');
+  const xdg = mkdtempSync(join(tmpdir(), 'owenloop-settings-'));
+  const dir = join(xdg, 'owenloop');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'settings.json'), contents);
   return xdg;
@@ -21,15 +21,15 @@ function withSettingsFile(contents: string): string {
 test('settingsPath: XDG_CONFIG_HOME wins over HOME when set and non-empty', () => {
   assert.equal(
     settingsPath({ XDG_CONFIG_HOME: '/xdg', HOME: '/home/u' }),
-    join('/xdg', 'owenwork', 'settings.json'),
+    join('/xdg', 'owenloop', 'settings.json'),
   );
   assert.equal(
     settingsPath({ XDG_CONFIG_HOME: '  ', HOME: '/home/u' }),
-    join('/home/u', '.config', 'owenwork', 'settings.json'),
+    join('/home/u', '.config', 'owenloop', 'settings.json'),
   );
   assert.equal(
     settingsPath({ HOME: '/home/u' }),
-    join('/home/u', '.config', 'owenwork', 'settings.json'),
+    join('/home/u', '.config', 'owenloop', 'settings.json'),
   );
 });
 
@@ -39,7 +39,7 @@ test('settingsPath: throws when neither HOME nor XDG_CONFIG_HOME is usable', () 
 });
 
 test('loadSettings: absent file yields {}', () => {
-  const home = mkdtempSync(join(tmpdir(), 'owenwork-settings-'));
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-settings-'));
   try {
     assert.deepEqual(loadSettings({ HOME: home }), {});
   } finally {
@@ -48,9 +48,9 @@ test('loadSettings: absent file yields {}', () => {
 });
 
 test('loadSettings: present file is parsed', () => {
-  const xdg = mkdtempSync(join(tmpdir(), 'owenwork-settings-'));
+  const xdg = mkdtempSync(join(tmpdir(), 'owenloop-settings-'));
   try {
-    const dir = join(xdg, 'owenwork');
+    const dir = join(xdg, 'owenloop');
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'settings.json'), JSON.stringify({ hello: 'world' }));
     assert.deepEqual(loadSettings({ XDG_CONFIG_HOME: xdg }), { hello: 'world' } as Record<string, unknown>);
@@ -60,9 +60,9 @@ test('loadSettings: present file is parsed', () => {
 });
 
 test('loadSettings: commandRouting passes through when set', () => {
-  const xdg = mkdtempSync(join(tmpdir(), 'owenwork-settings-'));
+  const xdg = mkdtempSync(join(tmpdir(), 'owenloop-settings-'));
   try {
-    const dir = join(xdg, 'owenwork');
+    const dir = join(xdg, 'owenloop');
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'settings.json'), JSON.stringify({ commandRouting: 'conductor' }));
     assert.equal(loadSettings({ XDG_CONFIG_HOME: xdg }).commandRouting, 'conductor');
@@ -72,9 +72,9 @@ test('loadSettings: commandRouting passes through when set', () => {
 });
 
 test('loadSettings: malformed JSON throws a clear, path-named error', () => {
-  const xdg = mkdtempSync(join(tmpdir(), 'owenwork-settings-'));
+  const xdg = mkdtempSync(join(tmpdir(), 'owenloop-settings-'));
   try {
-    const dir = join(xdg, 'owenwork');
+    const dir = join(xdg, 'owenloop');
     mkdirSync(dir, { recursive: true });
     const file = join(dir, 'settings.json');
     writeFileSync(file, '{ not json');
@@ -130,7 +130,7 @@ test('loadSettings: absent knobs default to undefined (empty file)', () => {
 
 test('loadSettings: a wrong-typed known key errors, naming key + path', () => {
   const xdg = withSettingsFile(JSON.stringify({ hubOrigin: 42 }));
-  const file = join(xdg, 'owenwork', 'settings.json');
+  const file = join(xdg, 'owenloop', 'settings.json');
   try {
     assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), (err: unknown) => {
       assert.ok(err instanceof Error);
@@ -185,13 +185,13 @@ test('validateSettings: a non-object top level is an error', () => {
 });
 
 test('inspectSettings: reports path + exists:false for a missing file', () => {
-  const home = mkdtempSync(join(tmpdir(), 'owenwork-settings-'));
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-settings-'));
   try {
     const i = inspectSettings({ HOME: home });
     assert.equal(i.exists, false);
     assert.deepEqual(i.settings, {});
     assert.deepEqual(i.unrecognized, []);
-    assert.match(i.path, /owenwork[/\\]settings\.json$/);
+    assert.match(i.path, /owenloop[/\\]settings\.json$/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

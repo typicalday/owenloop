@@ -3,11 +3,11 @@
  * resume-failure paths, against the operator's REAL subscription login.
  *
  * SKIPPED BY DEFAULT. It spends real subscription quota and needs a logged-in
- * CLI, so it is gated on `OWENWORK_LIVE_TESTS=1` via node:test's own `skip`
+ * CLI, so it is gated on `OWENLOOP_LIVE_TESTS=1` via node:test's own `skip`
  * option — a default run REPORTS these as skipped rather than passing
  * vacuously, and `.dev/checks.sh` never turns the gate on. Run it by hand:
  *
- *     OWENWORK_LIVE_TESTS=1 node --test --test-reporter=spec test/harness-claude-live.test.ts
+ *     OWENLOOP_LIVE_TESTS=1 node --test --test-reporter=spec test/harness-claude-live.test.ts
  *
  * WHAT MAKES IT A REAL SMOKE. The MCP mount handed to the adapter is the actual
  * production argv — `bin/owenloop.mjs work hold --order <wf>/<run> --origin <hub>
@@ -18,7 +18,7 @@
  *
  * AMBIENT STATE IS MATERIALIZED HERE, NOT ASSUMED. The mounted holder child
  * inherits the environment this adapter builds from `process.env`, so the test
- * sets `OWENWORK_TOKEN` / `XDG_CONFIG_HOME` (a temp dir of its own) on
+ * sets `OWENLOOP_TOKEN` / `XDG_CONFIG_HOME` (a temp dir of its own) on
  * `process.env` for the duration and restores them afterwards. Nothing depends
  * on the runner's own settings file or token.
  */
@@ -42,8 +42,8 @@ import {
   submittedUrl,
 } from './helpers/live-rejection.ts';
 
-const LIVE = process.env['OWENWORK_LIVE_TESTS'] === '1';
-const SKIP = LIVE ? false : 'set OWENWORK_LIVE_TESTS=1 to run (spends real subscription quota)';
+const LIVE = process.env['OWENLOOP_LIVE_TESTS'] === '1';
+const SKIP = LIVE ? false : 'set OWENLOOP_LIVE_TESTS=1 to run (spends real subscription quota)';
 
 const BIN = join(import.meta.dirname, '..', '..', '..', 'bin', 'owenloop.mjs');
 const TOKEN = 'tok-live-smoke';
@@ -112,26 +112,26 @@ interface Rig {
 }
 
 async function rig(script: (verb: string) => unknown = hubScript): Promise<Rig> {
-  const cwd = mkdtempSync(join(tmpdir(), 'owenwork-claude-live-cwd-'));
-  const configDir = mkdtempSync(join(tmpdir(), 'owenwork-claude-live-cfg-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-claude-live-cwd-'));
+  const configDir = mkdtempSync(join(tmpdir(), 'owenloop-claude-live-cfg-'));
   const { origin, reqs, server } = await startMockHub(script);
 
   // The holder child inherits the environment the adapter builds from
   // process.env, so these must be on process.env — set here, restored on close.
   const saved = {
-    OWENWORK_TOKEN: process.env['OWENWORK_TOKEN'],
+    OWENLOOP_TOKEN: process.env['OWENLOOP_TOKEN'],
     XDG_CONFIG_HOME: process.env['XDG_CONFIG_HOME'],
-    OWENWORK_SESSION: process.env['OWENWORK_SESSION'],
+    OWENLOOP_SESSION: process.env['OWENLOOP_SESSION'],
   };
-  process.env['OWENWORK_TOKEN'] = TOKEN;
+  process.env['OWENLOOP_TOKEN'] = TOKEN;
   process.env['XDG_CONFIG_HOME'] = configDir;
-  process.env['OWENWORK_SESSION'] = '';
+  process.env['OWENLOOP_SESSION'] = '';
 
   const events: AgentEvent[] = [];
   const startArgs = (brief: string): StartArgs => ({
     brief,
     cwd,
-    owenworkMcp: {
+    owenloopMcp: {
       command: process.execPath,
       args: [BIN, 'work', 'hold', '--order', 'wf1/run1', '--origin', origin, '--mcp'],
     },
@@ -207,7 +207,7 @@ test(
       );
 
       // The work-holder actually connected.
-      assert.match(text, /mcp=\[[^\]]*owenwork=connected/, `owenwork mount not connected:\n${text}`);
+      assert.match(text, /mcp=\[[^\]]*owenloop=connected/, `owenloop mount not connected:\n${text}`);
 
       // And the whole chain closed the loop: the agent's submit hit the hub.
       await until(() => r.reqs.some((q) => q.verb === 'submit'), 'a submit on the wire', 20_000);
@@ -285,7 +285,7 @@ test(
 
       // (2) A cwd that no longer exists — session lookup is scoped to the
       // project directory, so a deleted worktree can never resume.
-      const gone = mkdtempSync(join(tmpdir(), 'owenwork-claude-live-gone-'));
+      const gone = mkdtempSync(join(tmpdir(), 'owenloop-claude-live-gone-'));
       rmSync(gone, { recursive: true, force: true });
       await assert.rejects(
         () => claudeAdapter.deliver(unknown, 'hello', r.deliverArgs({ cwd: gone }), r.onEvent),

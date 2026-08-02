@@ -17,7 +17,7 @@
  * lease-fail on the wire + exit code, and that the re-offered order completes on
  * a fresh holder.
  *
- * Credential path: owenloop file store (no OWENWORK_TOKEN) — the first hub
+ * Credential path: owenloop file store (no OWENLOOP_TOKEN) — the first hub
  * request carries `Bearer drill_agent_tok`.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -53,7 +53,7 @@ const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r
 
 let home: string;
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'owenwork-drill5-'));
+  home = mkdtempSync(join(tmpdir(), 'owenloop-drill5-'));
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
@@ -78,7 +78,7 @@ test('a SIGSTOP past interval+tolerance trips the clock-jump guard → fast leas
   seedCredentialStore(home, origin); // exact dynamic origin
 
   // Loop-mode hold (NOT --mcp): stdin stays open, so no stdin-EOF final breath
-  // races the freeze. credential path: owenloop file store (no OWENWORK_TOKEN).
+  // races the freeze. credential path: owenloop file store (no OWENLOOP_TOKEN).
   const victim = spawnMcp(
     ['hold', '--order', 'wf1/run1', '--origin', origin,
       '--heartbeat-interval', String(HEARTBEAT_MS), '--jump-tolerance', String(JUMP_TOLERANCE_MS)],

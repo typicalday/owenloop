@@ -1,10 +1,10 @@
 /**
- * Credential read seam. owenwork reads hub credentials through owenloop's
+ * Credential read seam. owenloop reads hub credentials through owenloop's
  * store ONLY — it never writes, prints, or stores credentials itself, and it
  * never reads the keychain or `credentials.json` formats directly.
  *
  * The live wiring is against owenloop 0.4.0's `readStoredCredential`
- * (src/credentials/owenloop.ts → `OwenloopCredentialReader`). owenwork reads
+ * (src/credentials/owenloop.ts → `OwenloopCredentialReader`). owenloop reads
  * ONLY the `agent:<account>` slots — never the `human` slot — so a human-only
  * origin reads as absent (`null`), which the roles surface as a clean refuse.
  * `Credential` is re-exported from owenloop below so this seam and the store

@@ -2,21 +2,21 @@
  * DRILL 1 — kill -9 mid-work, and the final-breath handoff (WO-6.1, M4).
  *
  * The M4 single-principal failure mode: a step agent dies while holding an
- * order. Two independent sub-drills prove owenwork's two truths about it, END
+ * order. Two independent sub-drills prove owenloop's two truths about it, END
  * TO END against the real `bin/owenloop.mjs` over stdio + a mock hub.
  *
- * Credential path: owenloop file store (NO OWENWORK_TOKEN). Each child resolves
+ * Credential path: owenloop file store (NO OWENLOOP_TOKEN). Each child resolves
  * its bearer from the seeded fixture store; the first hub request carries
  * `Bearer drill_agent_tok`, proving the store path (not an env override) — the
  * M4-distinguishing requirement.
  *
  *  1a KILL -9 (ungraceful): SIGKILL is uncatchable, so there is NO final breath
  *     — the holder emits no `release`, and the order would strand until the
- *     hub's lease TTL, then re-offer. We assert the owenwork-side truth (no
+ *     hub's lease TTL, then re-offer. We assert the owenloop-side truth (no
  *     release on a hard kill) and then emulate the re-offer by having a fresh
  *     holder pick up the same run and complete it. CAVEAT: the TTL reap +
  *     re-offer is HUB-side behavior; the mock hub only emulates it. This drill
- *     asserts what owenwork does (no release on SIGKILL; a re-acquiring holder
+ *     asserts what owenloop does (no release on SIGKILL; a re-acquiring holder
  *     completes the order), not a real hub reaper.
  *
  *  1b FINAL BREATH (graceful): a CLEAN exit — SIGTERM, SIGINT, or stdin EOF
@@ -67,7 +67,7 @@ const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r
 
 let home: string;
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'owenwork-drill1-'));
+  home = mkdtempSync(join(tmpdir(), 'owenloop-drill1-'));
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
@@ -81,7 +81,7 @@ async function hubWithStore(): Promise<{ origin: string; reqs: HubReq[]; server:
 }
 
 function spawnHold(origin: string): McpChild {
-  // credential path: owenloop file store (no OWENWORK_TOKEN)
+  // credential path: owenloop file store (no OWENLOOP_TOKEN)
   return spawnMcp(
     ['hold', '--order', 'wf1/run1', '--origin', origin, '--heartbeat-interval', '25', '--mcp'],
     fixtureEnv(home),
@@ -101,7 +101,7 @@ test('1a: SIGKILL mid-work emits NO release (uncatchable) — a fresh holder re-
     victim.child.kill('SIGKILL'); // uncatchable — no final breath is possible
     assert.notEqual(await victim.exited, 0, 'SIGKILL takes the process down non-cleanly');
 
-    // Settle, then prove the owenwork-side truth: a hard kill leaves NO release.
+    // Settle, then prove the owenloop-side truth: a hard kill leaves NO release.
     await realSleep(300);
     assert.equal(of(reqs, 'release').length, 0, 'SIGKILL emits no release — the order strands until the hub TTL');
 
@@ -139,7 +139,7 @@ async function finalBreathVariant(trigger: (mcp: McpChild) => number): Promise<v
   try {
     await handshake(mcp);
     await until(() => of(reqs, 'heartbeat').length >= 1, 'first heartbeat (holding)');
-    assert.equal(reqs[0]!.auth, DRILL_AUTH, 'store-path bearer (no OWENWORK_TOKEN)');
+    assert.equal(reqs[0]!.auth, DRILL_AUTH, 'store-path bearer (no OWENLOOP_TOKEN)');
 
     const signalledAt = trigger(mcp);
     await until(() => of(reqs, 'release').length >= 1, 'a release after the clean shutdown');

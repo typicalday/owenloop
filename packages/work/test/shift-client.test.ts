@@ -24,7 +24,7 @@ afterEach(() => {
 });
 
 async function listenSocket(handler: (socket: import('node:net').Socket) => void): Promise<{ server: Server; path: string }> {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-client-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-client-'));
   roots.push(root);
   const path = shiftSocketPath(root);
   const server = createServer(handler);
@@ -72,7 +72,7 @@ test('requestShift sends one JSON line and parses a fragmented live response', a
 });
 
 test('requestShift reports exact absent-daemon guidance and exposes absent=true', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-client-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-client-'));
   roots.push(root);
   const path = shiftSocketPath(root);
   await assert.rejects(
@@ -94,7 +94,7 @@ test('requestShift rejects malformed daemon JSON and oversized requests', async 
     await new Promise<void>((resolve) => malformed.server.close(() => resolve()));
   }
 
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-client-large-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-client-large-'));
   roots.push(root);
   const path = shiftSocketPath(root);
   const server = createServer((socket) => socket.end('{"ok":true}\n', () => socket.destroy()));
@@ -108,7 +108,7 @@ test('requestShift rejects malformed daemon JSON and oversized requests', async 
 });
 
 test('root shift status returns JSON no-daemon status with exit 0', () => {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-cli-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-cli-'));
   roots.push(root);
   const result = spawnSync(process.execPath, [BIN, 'shift', 'status', '--state-dir', root], {
     encoding: 'utf8',
@@ -120,7 +120,7 @@ test('root shift status returns JSON no-daemon status with exit 0', () => {
 });
 
 test('root shift next and end preserve exact absent-daemon guidance', () => {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-shift-cli-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-cli-'));
   roots.push(root);
   const env = { PATH: process.env['PATH'] ?? '', HOME: root, NODE_NO_WARNINGS: '1' };
   for (const args of [

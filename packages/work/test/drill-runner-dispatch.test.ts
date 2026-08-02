@@ -22,7 +22,7 @@
  * `lease.outcome` does the runner record `submitted`. Turn end alone would leave
  * the session store at `turn-ended`.
  *
- * Credential path: owenloop file store (no OWENWORK_TOKEN), as every drill.
+ * Credential path: owenloop file store (no OWENLOOP_TOKEN), as every drill.
  */
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -86,7 +86,7 @@ let cacheDir: string;
 let stateDir: string;
 let tracePath: string;
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'owenwork-drill-rd-'));
+  root = mkdtempSync(join(tmpdir(), 'owenloop-drill-rd-'));
   home = join(root, 'home');
   cacheDir = join(root, 'cache');
   stateDir = join(root, 'state');
@@ -132,17 +132,17 @@ function spawnDaemon(origin: string): ShiftChild {
       '--poll-interval', '25', '--state-dir', stateDir,
     ],
     fixtureEnv(home, {
-      OWENWORK_CACHE_DIR: cacheDir, // the child gets no --cache-dir flag; env is the channel
-      OWENWORK_HARNESS_MODULE: FAKE_HARNESS,
+      OWENLOOP_CACHE_DIR: cacheDir, // the child gets no --cache-dir flag; env is the channel
+      OWENLOOP_HARNESS_MODULE: FAKE_HARNESS,
       // PHASE 4 made the composition root import the real adapters, so the
       // registry is no longer empty and the FIRST-REGISTERED default is no
       // longer the module this seam loads. The drill therefore NAMES the
-      // harness it means, at the `OWENWORK_HARNESS` rank — which is also the
+      // harness it means, at the `OWENLOOP_HARNESS` rank — which is also the
       // honest shape: a drill that silently inherited whatever happened to be
       // imported first was passing for a reason it never asserted.
-      OWENWORK_HARNESS: 'fake',
-      OWENWORK_FAKE_TRACE: tracePath,
-      OWENWORK_FAKE_SCRIPT: JSON.stringify({ id: 'fake', start: { events: [{ kind: 'turn_ended' }] } }),
+      OWENLOOP_HARNESS: 'fake',
+      OWENLOOP_FAKE_TRACE: tracePath,
+      OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'fake', start: { events: [{ kind: 'turn_ended' }] } }),
     }),
   );
 }
@@ -223,13 +223,13 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
     assert.equal(mcpMount.args[0], 'work');
     assert.ok(mcpMount.args.includes('--mcp'));
     assert.ok(mcpMount.args.includes('wf1/run_x1234'));
-    // Stripping OWENWORK_TOKEN from the child env LANDED in Phase 6
-    // (`filterOwenworkEnv`, asserted in `test/child-env.test.ts` and on the
+    // Stripping OWENLOOP_TOKEN from the child env LANDED in Phase 6
+    // (`filterOwenloopEnv`, asserted in `test/child-env.test.ts` and on the
     // runner seam in `test/agent-run-role.test.ts`). This assertion covers the
     // OTHER channel and still has to: an env filter cannot reach argv, so a
     // credential passed as a mount ARGUMENT would sail straight past it.
     const flatArgs = mcpMount.args.join(' ');
-    assert.equal(/--token|OWENWORK_TOKEN|Bearer/.test(flatArgs), false, `credential in MCP argv: ${flatArgs}`);
+    assert.equal(/--token|OWENLOOP_TOKEN|Bearer/.test(flatArgs), false, `credential in MCP argv: ${flatArgs}`);
     assert.equal(flatArgs.includes('drill_agent_tok'), false, 'the store token never reaches the step agent\'s argv');
 
     // THE INVARIANT: the turn ended, but the runner did not call it done until

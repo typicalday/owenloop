@@ -21,7 +21,7 @@
  * kill a live order. Two other layers do the validating, and BOTH report rather
  * than degrade: the def parser (`parseHarnessCarrier` in `src/bundle/fetch.ts`)
  * throws on a carrier it cannot read at all — including a def still carrying the
- * legacy pre-`x.harness` bag key (`LEGACY_BAG_KEY`, same file) — and `owenwork
+ * legacy pre-`x.harness` bag key (`LEGACY_BAG_KEY`, same file) — and `owenloop
  * lint` errors on a bad FIELD inside a well-formed bag.
  *
  * Field rules are carried over from the legacy compile layer's `KNOWN_FIELDS` /

@@ -31,7 +31,7 @@ import type { ContactHolder, GetOrderResponse, OrderPacket, ReasonEntry } from '
 
 const HOLDER: ContactHolder = { kind: 'exec', id: 'host:99' };
 const CWD = '/work/wf1/run1';
-const TEMPLATE = ['# brief', 'order: __OWENWORK_ORDER__', 'do the work'].join('\n');
+const TEMPLATE = ['# brief', 'order: __OWENLOOP_ORDER__', 'do the work'].join('\n');
 
 const macrotaskSleep = (): Promise<void> => new Promise((r) => setImmediate(r));
 

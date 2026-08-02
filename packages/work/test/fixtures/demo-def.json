@@ -29,7 +29,7 @@
     {
       "name": "deprovisioner",
       "worker": "command",
-      "command": "owenwork-deprovision"
+      "command": "owenloop-deprovision"
     }
   ]
 }

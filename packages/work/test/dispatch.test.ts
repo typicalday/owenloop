@@ -65,7 +65,7 @@ test('exec without an order-id exits 2', () => {
 // env with no hub origin configured.
 test('exec with a valid order-id but no origin configured exits 2', () => {
   const { status, stderr } = runCli(['exec', 'wf1/run1'], {
-    HOME: mkdtempSync(join(tmpdir(), 'owenwork-dispatch-')),
+    HOME: mkdtempSync(join(tmpdir(), 'owenloop-dispatch-')),
   });
   assert.equal(status, 2);
   assert.match(stderr, /no hub origin|no token/);
@@ -76,7 +76,7 @@ test('exec with a valid order-id but no origin configured exits 2', () => {
 // hold-loop / hold-role tests. Run in an env with no hub origin configured.
 test('hold with valid args but no origin configured exits 2', () => {
   const { status, stderr } = runCli(['hold', '--order', 'wf1/run1'], {
-    HOME: mkdtempSync(join(tmpdir(), 'owenwork-dispatch-')),
+    HOME: mkdtempSync(join(tmpdir(), 'owenloop-dispatch-')),
   });
   assert.equal(status, 2);
   assert.match(stderr, /no hub origin|no token/);
@@ -86,7 +86,7 @@ test('hold with valid args but no origin configured exits 2', () => {
 // (a usage error) rather than exiting 3 as a stub. Full behavior is pinned in
 // the proxy-loop / proxy-* tests. Run in an env with no hub origin configured.
 test('proxy with no origin configured exits 2 with usage on stderr', () => {
-  const { status, stderr } = runCli(['proxy'], { HOME: mkdtempSync(join(tmpdir(), 'owenwork-dispatch-')) });
+  const { status, stderr } = runCli(['proxy'], { HOME: mkdtempSync(join(tmpdir(), 'owenloop-dispatch-')) });
   assert.equal(status, 2);
   assert.match(stderr, /no hub origin|no token/);
 });
@@ -107,10 +107,10 @@ test('lint without a target exits 2 with usage on stderr', () => {
 
 // C6 landed release: with no session id resolvable it exits 2 (usage error).
 // Full behavior is pinned in release-role tests. Run in a clean env so a
-// developer's OWENWORK_SESSION cannot leak in.
+// developer's OWENLOOP_SESSION cannot leak in.
 test('release without a session id exits 2 with usage on stderr', () => {
   const { status, stderr } = runCli(['release'], {
-    HOME: mkdtempSync(join(tmpdir(), 'owenwork-dispatch-')),
+    HOME: mkdtempSync(join(tmpdir(), 'owenloop-dispatch-')),
   });
   assert.equal(status, 2);
   assert.match(stderr, /no session id/);
@@ -120,7 +120,7 @@ test('release without a session id exits 2 with usage on stderr', () => {
 // even when no file exists. Full behavior is pinned in settings-role tests.
 test('settings prints the resolved file and exits 0', () => {
   const { status, stdout } = runCli(['settings'], {
-    HOME: mkdtempSync(join(tmpdir(), 'owenwork-dispatch-')),
+    HOME: mkdtempSync(join(tmpdir(), 'owenloop-dispatch-')),
   });
   assert.equal(status, 0);
   assert.match(stdout, /settings file:/);
@@ -130,7 +130,7 @@ test('settings prints the resolved file and exits 0', () => {
 // settings takes no options in v1 — a stray arg is a usage error (exit 2).
 test('settings with a stray arg exits 2', () => {
   const { status, stderr } = runCli(['settings', 'nope'], {
-    HOME: mkdtempSync(join(tmpdir(), 'owenwork-dispatch-')),
+    HOME: mkdtempSync(join(tmpdir(), 'owenloop-dispatch-')),
   });
   assert.equal(status, 2);
   assert.match(stderr, /unexpected argument 'nope'/);
@@ -149,7 +149,7 @@ test('join without a <code> exits 2', () => {
 // ambient env, so no real settings can leak in.
 test('join with a code but no hub origin configured exits 2', () => {
   const { status, stderr } = runCli(['join', 'ojc_x_y'], {
-    HOME: mkdtempSync(join(tmpdir(), 'owenwork-dispatch-')),
+    HOME: mkdtempSync(join(tmpdir(), 'owenloop-dispatch-')),
   });
   assert.equal(status, 2);
   assert.match(stderr, /no hub origin/);

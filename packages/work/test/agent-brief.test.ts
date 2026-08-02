@@ -6,7 +6,7 @@ import {
   CONDUCTOR_TOKEN,
   ORDER_TOKEN,
   ORIGIN_TOKEN,
-  buildOwenworkMcp,
+  buildOwenloopMcp,
   renderBrief,
   type BriefSpec,
 } from '../src/agent/brief.ts';
@@ -29,10 +29,10 @@ const spec = (over: Partial<BriefSpec> = {}): BriefSpec => ({
  * nothing to drift against, so the guard pins the literals instead.
  */
 test('the four substitution tokens are the exact strings published defs embed', () => {
-  assert.equal(ORDER_TOKEN, '__OWENWORK_ORDER__');
-  assert.equal(ORIGIN_TOKEN, '__OWENWORK_ORIGIN__');
-  assert.equal(ACCOUNT_TOKEN, '__OWENWORK_ACCOUNT__');
-  assert.equal(CONDUCTOR_TOKEN, '__OWENWORK_CONDUCTOR__');
+  assert.equal(ORDER_TOKEN, '__OWENLOOP_ORDER__');
+  assert.equal(ORIGIN_TOKEN, '__OWENLOOP_ORIGIN__');
+  assert.equal(ACCOUNT_TOKEN, '__OWENLOOP_ACCOUNT__');
+  assert.equal(CONDUCTOR_TOKEN, '__OWENLOOP_CONDUCTOR__');
 });
 
 test('renderBrief substitutes all four tokens, every occurrence', () => {
@@ -48,7 +48,7 @@ test('renderBrief substitutes all four tokens, every occurrence', () => {
     out,
     ['order=wf1/run_11111111', 'origin=https://hub.example', 'account=default', 'cid=cnd_abc', 'again=wf1/run_11111111'].join('\n'),
   );
-  assert.equal(/__OWENWORK_/.test(out), false, 'no token may survive substitution');
+  assert.equal(/__OWENLOOP_/.test(out), false, 'no token may survive substitution');
 });
 
 test('renderBrief: an absent conductorId substitutes the empty string', () => {
@@ -59,8 +59,8 @@ test('renderBrief leaves template text alone when it holds no tokens', () => {
   assert.equal(renderBrief('plain body $& \\1', spec()), 'plain body $& \\1');
 });
 
-test('buildOwenworkMcp emits the born-bound work-holder argv', () => {
-  assert.deepEqual(buildOwenworkMcp(spec({ conductorId: 'cnd_abc' })), {
+test('buildOwenloopMcp emits the born-bound work-holder argv', () => {
+  assert.deepEqual(buildOwenloopMcp(spec({ conductorId: 'cnd_abc' })), {
     command: 'owenloop',
     args: ['work', 
       'hold',
@@ -76,8 +76,8 @@ test('buildOwenworkMcp emits the born-bound work-holder argv', () => {
   });
 });
 
-test('buildOwenworkMcp: --conductor is ONE argv element, empty value when absent', () => {
-  const { args } = buildOwenworkMcp(spec());
+test('buildOwenloopMcp: --conductor is ONE argv element, empty value when absent', () => {
+  const { args } = buildOwenloopMcp(spec());
   assert.equal(args.includes('--conductor'), false, 'the two-element form is wrong');
   assert.equal(args.includes('--conductor='), true);
 });
@@ -88,9 +88,9 @@ test('buildOwenworkMcp: --conductor is ONE argv element, empty value when absent
  * A regression that started passing a token through argv would leak it into
  * every `ps` listing and into any harness rollout that records its child argv.
  */
-test('buildOwenworkMcp carries no credential', () => {
+test('buildOwenloopMcp carries no credential', () => {
   const token = 'sk_live_notarealsecret';
-  const flat = JSON.stringify(buildOwenworkMcp(spec({ account: 'default', conductorId: 'cnd_abc' })));
+  const flat = JSON.stringify(buildOwenloopMcp(spec({ account: 'default', conductorId: 'cnd_abc' })));
   assert.equal(flat.includes(token), false);
   assert.equal(/token|bearer|secret|password|api[-_]?key/i.test(flat), false, `credential-shaped text in the mount: ${flat}`);
 });

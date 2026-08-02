@@ -77,7 +77,7 @@ function optionsFor(
   const events: AgentEvent[] = [];
   const inputs: ClaudeOptionInputs = {
     cwd: opts.cwd ?? '/tmp/work',
-    owenworkMcp: MOUNT,
+    owenloopMcp: MOUNT,
     permissions: normalizeStepPermissions(bag, opts.step),
     ...(opts.startModel !== undefined ? { model: opts.startModel } : {}),
     ...(opts.startEffort !== undefined ? { effort: opts.startEffort } : {}),
@@ -108,11 +108,11 @@ test('a full bag maps onto the SDK options, setting BOTH tools and allowedTools'
   assert.equal(options.model, 'opus', "the step's first-class model reached the SDK");
   assert.equal(options.cwd, '/tmp/work');
 
-  // The bag's own server survives AND the owenwork mount is layered on top.
+  // The bag's own server survives AND the owenloop mount is layered on top.
   const servers = options.mcpServers as Record<string, Record<string, unknown>>;
-  assert.deepEqual(Object.keys(servers).sort(), ['extra', 'owenwork']);
+  assert.deepEqual(Object.keys(servers).sort(), ['extra', 'owenloop']);
   assert.deepEqual(servers['extra'], { command: 'extra-server' });
-  assert.deepEqual(servers['owenwork'], {
+  assert.deepEqual(servers['owenloop'], {
     type: 'stdio',
     command: MOUNT.command,
     args: MOUNT.args,
@@ -131,16 +131,16 @@ test('an empty bag leaves every optional key ABSENT, not empty', () => {
   }
   assert.equal('allowDangerouslySkipPermissions' in options, false);
 
-  // The owenwork mount is unconditional — it is how the agent reaches its order.
-  assert.deepEqual(Object.keys(options.mcpServers as object), ['owenwork']);
+  // The owenloop mount is unconditional — it is how the agent reaches its order.
+  assert.deepEqual(Object.keys(options.mcpServers as object), ['owenloop']);
 });
 
-test('the owenwork mount overwrites a bag that declares its own owenwork server', () => {
+test('the owenloop mount overwrites a bag that declares its own owenloop server', () => {
   const { options } = optionsFor({
-    mcpServers: { owenwork: { command: 'not-the-real-one', args: ['--hijack'] }, extra: { command: 'x' } },
+    mcpServers: { owenloop: { command: 'not-the-real-one', args: ['--hijack'] }, extra: { command: 'x' } },
   });
   const servers = options.mcpServers as Record<string, Record<string, unknown>>;
-  assert.deepEqual(servers['owenwork'], {
+  assert.deepEqual(servers['owenloop'], {
     type: 'stdio',
     command: MOUNT.command,
     args: MOUNT.args,
@@ -228,7 +228,7 @@ test('env and abortController are always set, and stderr forwards to onEvent as 
   const env = bareEnv({ HOME: '/home/x' });
   const abortController = new AbortController();
   const options = buildClaudeOptions(
-    { cwd: '/tmp/work', owenworkMcp: MOUNT, permissions: { extensions: {} } },
+    { cwd: '/tmp/work', owenloopMcp: MOUNT, permissions: { extensions: {} } },
     { env, abortController, onEvent: (e) => events.push(e) },
   );
   // `env` must ALWAYS be set: omitting it makes the child inherit process.env,
@@ -253,7 +253,7 @@ after(() => {
  *  decoy dir ahead of it. The test builds every byte of this itself so it never
  *  depends on a CLI being installed on the runner. */
 function fixturePathDirs(): { pathValue: string; realDir: string } {
-  const root = mkdtempSync(join(tmpdir(), 'owenwork-claude-bin-'));
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-claude-bin-'));
   binDirs.push(root);
   const decoy = join(root, 'decoy');
   const real = join(root, 'real');
@@ -269,7 +269,7 @@ function fixturePathDirs(): { pathValue: string; realDir: string } {
 
 test('binary resolution: the explicit override wins over everything', () => {
   const { pathValue } = fixturePathDirs();
-  const env = bareEnv({ OWENWORK_CLAUDE_BIN: '/opt/custom/claude', PATH: pathValue });
+  const env = bareEnv({ OWENLOOP_CLAUDE_BIN: '/opt/custom/claude', PATH: pathValue });
   assert.equal(resolveExecutable(env), '/opt/custom/claude');
   assert.equal(optionsFor({}, { env }).options.pathToClaudeCodeExecutable, '/opt/custom/claude');
 });
@@ -282,7 +282,7 @@ test('binary resolution: with no override, an executable on PATH is found and a 
 });
 
 test('binary resolution: nothing resolves means the KEY IS OMITTED, so the SDK uses its bundled executable', () => {
-  const emptyDir = mkdtempSync(join(tmpdir(), 'owenwork-claude-nobin-'));
+  const emptyDir = mkdtempSync(join(tmpdir(), 'owenloop-claude-nobin-'));
   binDirs.push(emptyDir);
   const env = bareEnv({ PATH: emptyDir });
   assert.equal(resolveExecutable(env), undefined);
@@ -307,8 +307,16 @@ const FULL_ENV = (): Record<string, string | undefined> => ({
   ANTHROPIC_AUTH_TOKEN: 'auth-should-not-survive',
   CLAUDECODE: '1',
   CLAUDE_CODE_OAUTH_TOKEN: 'oauth-must-survive',
-  OWENWORK_CACHE_DIR: '/cache-must-survive',
-  OWENWORK_TOKEN: 'tok-must-not-survive',
+  OWENLOOP_CACHE_DIR: '/cache-must-survive',
+  OWENLOOP_CONDUCTOR_ID: 'conductor-must-survive',
+  OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
+  OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
+  OWENLOOP_NO_KEYCHAIN: '1',
+  OWENLOOP_SESSION: 'session-must-survive',
+  OWENLOOP_TOKEN: 'tok-must-not-survive',
+  OWENLOOP_INVENTED_NEXT_PHASE: 'future-must-not-survive',
+  OWENLOOP_CREDENTIAL_ORIGIN: 'helper-origin-must-not-survive',
+  OWENLOOP_CREDENTIAL_SLOT: 'helper-slot-must-not-survive',
   PATH: '/usr/bin',
   HOME: '/home/x',
 });
@@ -345,39 +353,63 @@ test('buildChildEnv strips the billing/nesting variables and keeps everything el
  * exhaustive list of everything the vendor binary needs to start.
  *
  * The namespace-scoped allowlist does both by construction:
- *   - `OWENWORK_TOKEN` is inside the `OWENWORK_*` namespace and not admitted, so
+ *   - `OWENLOOP_TOKEN` is inside the `OWENLOOP_*` namespace and not admitted, so
  *     it is removed;
- *   - `OWENWORK_CACHE_DIR` is inside the namespace AND admitted, so it survives;
+ *   - `OWENLOOP_CACHE_DIR` is inside the namespace AND admitted, so it survives;
  *   - `CLAUDE_CODE_OAUTH_TOKEN`, `PATH` and `HOME` are OUTSIDE the namespace, so
  *     the filter cannot reach them at all — not by oversight, structurally.
  *
  * And the vendor API-key strip is a separate mechanism on a separate toggle:
  * `ANTHROPIC_API_KEY` still goes, and it goes for a different reason.
  */
-test('buildChildEnv: the OWENWORK_* allowlist and the API-key strip are independent', () => {
+test('buildChildEnv: the OWENLOOP_* allowlist and the API-key strip are independent', () => {
   const out = buildChildEnv(FULL_ENV(), { allowApiBilling: false });
 
   assert.equal(out['CLAUDE_CODE_OAUTH_TOKEN'], 'oauth-must-survive', 'item 3: outside the namespace, untouchable');
-  assert.equal(out['OWENWORK_CACHE_DIR'], '/cache-must-survive', 'admitted inside the namespace');
+  assert.equal(out['OWENLOOP_CACHE_DIR'], '/cache-must-survive', 'admitted inside the namespace');
+  assert.equal(out['OWENLOOP_CONDUCTOR_ID'], 'conductor-must-survive');
+  assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND'], '/bin/credential-helper');
+  assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'], '2500');
+  assert.equal(out['OWENLOOP_NO_KEYCHAIN'], '1');
+  assert.equal(out['OWENLOOP_SESSION'], 'session-must-survive');
   assert.equal(out['PATH'], '/usr/bin');
   assert.equal(out['HOME'], '/home/x');
 
-  assert.equal('OWENWORK_TOKEN' in out, false, 'item 5: denied inside the namespace');
+  for (const key of [
+    'OWENLOOP_TOKEN',
+    'OWENLOOP_INVENTED_NEXT_PHASE',
+    'OWENLOOP_CREDENTIAL_ORIGIN',
+    'OWENLOOP_CREDENTIAL_SLOT',
+  ]) {
+    assert.equal(key in out, false, `${key} must stay denied inside the namespace`);
+  }
   assert.equal('ANTHROPIC_API_KEY' in out, false, 'the API-key strip, a separate mechanism');
 });
 
-test('buildChildEnv with allowApiBilling on still applies the OWENWORK_* allowlist', () => {
+test('buildChildEnv with allowApiBilling on still applies the OWENLOOP_* allowlist', () => {
   const source = FULL_ENV();
   const out = buildChildEnv(source, { allowApiBilling: true });
 
   // The opt-out governs the vendor API-key strip ONLY. The namespace allowlist
   // is not a billing question and has no toggle: opting into API billing must
-  // not re-open a path for owenwork's own hub bearer to reach a harness child.
+  // not re-open a path for owenloop's own hub bearer to reach a harness child.
   assert.equal(out['ANTHROPIC_API_KEY'], 'sk-ant-should-not-survive');
   assert.equal(out['ANTHROPIC_AUTH_TOKEN'], 'auth-should-not-survive');
   assert.equal(out['CLAUDECODE'], '1');
-  assert.equal('OWENWORK_TOKEN' in out, false, 'the allowlist is not under the billing toggle');
-  assert.equal(out['OWENWORK_CACHE_DIR'], '/cache-must-survive');
+  assert.equal('OWENLOOP_TOKEN' in out, false, 'the allowlist is not under the billing toggle');
+  assert.equal(out['OWENLOOP_CACHE_DIR'], '/cache-must-survive');
+  assert.equal(out['OWENLOOP_CONDUCTOR_ID'], 'conductor-must-survive');
+  assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND'], '/bin/credential-helper');
+  assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'], '2500');
+  assert.equal(out['OWENLOOP_NO_KEYCHAIN'], '1');
+  assert.equal(out['OWENLOOP_SESSION'], 'session-must-survive');
+  for (const key of [
+    'OWENLOOP_INVENTED_NEXT_PHASE',
+    'OWENLOOP_CREDENTIAL_ORIGIN',
+    'OWENLOOP_CREDENTIAL_SLOT',
+  ]) {
+    assert.equal(key in out, false, `${key} stays denied when API billing is enabled`);
+  }
 
   assert.deepEqual(source, FULL_ENV(), 'the input environment must not be mutated');
   assert.notEqual(out, source, 'still a copy, never the caller’s object');
@@ -385,9 +417,9 @@ test('buildChildEnv with allowApiBilling on still applies the OWENWORK_* allowli
 
 test('the API-billing opt-out is off unless the toggle is exactly "1"', () => {
   assert.equal(allowApiBillingFrom({}), false);
-  assert.equal(allowApiBillingFrom({ OWENWORK_ALLOW_API_BILLING: '1' }), true);
+  assert.equal(allowApiBillingFrom({ OWENLOOP_ALLOW_API_BILLING: '1' }), true);
   for (const v of ['', '0', 'true', 'yes', 'TRUE']) {
-    assert.equal(allowApiBillingFrom({ OWENWORK_ALLOW_API_BILLING: v }), false, `'${v}' must not enable billing`);
+    assert.equal(allowApiBillingFrom({ OWENLOOP_ALLOW_API_BILLING: v }), false, `'${v}' must not enable billing`);
   }
 });
 
@@ -500,8 +532,8 @@ test('lintStep: a string tools value is accepted as well as a string[]', () => {
   assert.deepEqual(lintOf({ disallowedTools: 'Bash' }), []);
 });
 
-test('lintStep: an author mcpServers.owenwork entry is a warning', () => {
-  const f = lintOf({ mcpServers: { owenwork: { command: 'x' } } });
+test('lintStep: an author mcpServers.owenloop entry is a warning', () => {
+  const f = lintOf({ mcpServers: { owenloop: { command: 'x' } } });
   assert.equal(f.length, 1);
   assert.equal(f[0]!.severity, 'warning');
   assert.equal(f[0]!.field, 'mcpServers');

@@ -1,7 +1,7 @@
 /**
  * DRILL 2 — session-close mid-exec: exec DRAINS, the receipt still lands (WO-6.1, M4).
  *
- * The M4 truth this proves: a COMMAND order is owned by a detached `owenwork
+ * The M4 truth this proves: a COMMAND order is owned by a detached `owenloop
  * exec` child, tagged `{kind:'exec'}` — the B3/C6 drain exemption. When the
  * orchestrating session goes away mid-run (its stdin closes), an exec child must
  * NOT hand the order back: it is not session-scoped, it owns the command end to
@@ -12,7 +12,7 @@
  * (exec-e2e.test.ts proves the same drain in-process via `loop.stop`; this drill
  * proves the real binary ignores a real stdin EOF and drains to a receipt.)
  *
- * Credential path: owenloop file store (no OWENWORK_TOKEN) — the first hub
+ * Credential path: owenloop file store (no OWENLOOP_TOKEN) — the first hub
  * request carries `Bearer drill_agent_tok`, proving the store path.
  */
 import { createHash } from 'node:crypto';
@@ -63,7 +63,7 @@ const of = (reqs: HubReq[], verb: string): HubReq[] => reqs.filter((r) => r.verb
 
 let home: string;
 beforeEach(() => {
-  home = mkdtempSync(join(tmpdir(), 'owenwork-drill2-'));
+  home = mkdtempSync(join(tmpdir(), 'owenloop-drill2-'));
 });
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
@@ -72,7 +72,7 @@ afterEach(() => {
 test('exec ignores a mid-run stdin close (session death) — the command drains and the receipt lands, no release', async () => {
   const { origin, reqs, server } = await startMockHub(hubScript);
   seedCredentialStore(home, origin); // exact dynamic origin
-  // credential path: owenloop file store (no OWENWORK_TOKEN)
+  // credential path: owenloop file store (no OWENLOOP_TOKEN)
   const exec = spawnMcp(
     ['exec', 'wf1/run1', '--origin', origin, '--heartbeat-interval', '25'],
     fixtureEnv(home),

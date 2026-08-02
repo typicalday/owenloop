@@ -13,7 +13,7 @@
  * `{ id?: string, ...options }`. `validateFetchedDef` LIFTS it into two
  * first-class neutral fields on the parsed step: `harness` (the id) and
  * `harnessOptions` (every remaining key). Nothing downstream keys a data
- * structure BY a harness name. `x.owenwork` (proxy routing) is a separate live
+ * structure BY a harness name. `x.owenloop` (proxy routing) is a separate live
  * namespace under `x` and is untouched by the lift.
  *
  * HUB GAP (see D1 / bundle/fetch.ts): today `GET /api/workflows/:name`
@@ -64,7 +64,7 @@ export interface FetchedStep {
    * `harness` key when the def carries one (top-level WINS — forward compat for
    * an owenloop grammar that promotes the field). Declaration only: nothing
    * validates the id here; `src/roles/agent-run.ts` resolves it, ranking BELOW
-   * `--harness` and `OWENWORK_HARNESS`, and fails honestly when the id names no
+   * `--harness` and `OWENLOOP_HARNESS`, and fails honestly when the id names no
    * registered adapter.
    */
   harness?: string;
@@ -75,8 +75,8 @@ export interface FetchedStep {
    */
   harnessOptions?: Record<string, unknown>;
   /**
-   * Opaque extension bag. Two sub-keys are meaningful to owenwork: `x.harness`
-   * (lifted into `harness`/`harnessOptions` above) and `x.owenwork` (proxy
+   * Opaque extension bag. Two sub-keys are meaningful to owenloop: `x.harness`
+   * (lifted into `harness`/`harnessOptions` above) and `x.owenloop` (proxy
    * command routing, see `src/proxy/routing.ts`). Everything else passes
    * through untouched.
    */
@@ -134,8 +134,8 @@ export interface FetchedBundle extends FetchedDef {
  *
  * What is DELIBERATELY not in here: the four substitution tokens
  * (`ORDER_TOKEN`, `ORIGIN_TOKEN`, `ACCOUNT_TOKEN`, `CONDUCTOR_TOKEN`) and the
- * `mcpServers.owenwork` mount. Those are built at RUN time from the live order
- * by `src/agent/brief.ts` (`renderBrief` + `buildOwenworkMcp`), which is now the
+ * `mcpServers.owenloop` mount. Those are built at RUN time from the live order
+ * by `src/agent/brief.ts` (`renderBrief` + `buildOwenloopMcp`), which is now the
  * only place they exist. A bundle is therefore order-independent.
  *
  * There is no `extensions` key at the top level: the lossless remainder of the

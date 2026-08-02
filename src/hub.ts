@@ -661,7 +661,7 @@ export type ReadStoredCredentialOpts = CredentialSlotSelector & {
 /**
  * Read the stored hub credential for `origin` **in the named slot** from the
  * chosen backend ONLY — the supported, read-only programmatic surface
- * (owenwork's CredentialReader seam wires to this once released). Secret hygiene
+ * (owenloop's CredentialReader seam wires to this once released). Secret hygiene
  * is unchanged: this function never logs or echoes the returned credential, and
  * there is deliberately no write/delete companion on the public surface —
  * `login` / `logout` remain the only way to store or remove a credential.

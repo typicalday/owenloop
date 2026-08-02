@@ -21,18 +21,18 @@ async function runRole(
 
 /** Create a temp XDG root holding the given settings.json contents. */
 function xdgWith(contents: string): string {
-  const xdg = mkdtempSync(join(tmpdir(), 'owenwork-settings-role-'));
-  mkdirSync(join(xdg, 'owenwork'), { recursive: true });
-  writeFileSync(join(xdg, 'owenwork', 'settings.json'), contents);
+  const xdg = mkdtempSync(join(tmpdir(), 'owenloop-settings-role-'));
+  mkdirSync(join(xdg, 'owenloop'), { recursive: true });
+  writeFileSync(join(xdg, 'owenloop', 'settings.json'), contents);
   return xdg;
 }
 
 test('prints path, exists:no, and defaults when no file exists (exit 0)', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'owenwork-settings-role-'));
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-settings-role-'));
   try {
     const { code, out } = await runRole([], { HOME: home });
     assert.equal(code, 0);
-    assert.match(out, /settings file: .*owenwork[/\\]settings\.json/);
+    assert.match(out, /settings file: .*owenloop[/\\]settings\.json/);
     assert.match(out, /exists: no/);
     // Knobs with a built-in default print it; the rest print (unset).
     assert.match(out, /dispatchCap = 3 {2}\(default\)/);
@@ -99,7 +99,7 @@ test('exits 1 on an invalid known-key type', async () => {
 });
 
 test('exits 2 on a stray argument', async () => {
-  const home = mkdtempSync(join(tmpdir(), 'owenwork-settings-role-'));
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-settings-role-'));
   try {
     const { code, err } = await runRole(['extra'], { HOME: home });
     assert.equal(code, 2);

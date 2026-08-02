@@ -48,11 +48,11 @@ Options:
       --as <account>             Scoped Identity credential account (default
                                  'default'; the proxy stamps this into born-bound
                                  holds)
-      --session <id>             session-holder tag (else env OWENWORK_SESSION;
+      --session <id>             session-holder tag (else env OWENLOOP_SESSION;
                                  else an anon:<hostname>:<pid> fallback — a
                                  holder is always sent)
       --conductor <id>           dispatching Conductor's self-declared id (else
-                                 env OWENWORK_CONDUCTOR_ID); advisory only
+                                 env OWENLOOP_CONDUCTOR_ID); advisory only
       --heartbeat-interval <ms>  lease renew cadence (default 60000)
       --jump-tolerance <ms>      wall-gap slack before a tick is treated as a
                                  clock jump / laptop sleep (default 30000)
@@ -68,7 +68,7 @@ Options:
       --workflow <wf>            required when the order-id is a bare run id
       --origin <url>             hub origin (else settings.hubOrigin)
       --conductor <id>           dispatching Conductor's self-declared id (else
-                                 env OWENWORK_CONDUCTOR_ID); advisory only
+                                 env OWENLOOP_CONDUCTOR_ID); advisory only
       --heartbeat-interval <ms>  lease renew cadence (default 60000)
       --jump-tolerance <ms>      wall-gap slack before a tick is treated as a
                                  clock jump / laptop sleep (default 30000)
@@ -79,10 +79,10 @@ Options:
       --workflow <wf>            required when the order-id is a bare run id
       --origin <url>             hub origin (else settings.hubOrigin)
       --harness <id>             which registered harness hosts the step agent
-                                 (else env OWENWORK_HARNESS, else the step def's
+                                 (else env OWENLOOP_HARNESS, else the step def's
                                  'harness' field, else the first registered one)
       --conductor <id>           dispatching Conductor's self-declared id (else
-                                 env OWENWORK_CONDUCTOR_ID); advisory only
+                                 env OWENLOOP_CONDUCTOR_ID); advisory only
       --heartbeat-interval <ms>  lease renew cadence (default 60000)
       --jump-tolerance <ms>      wall-gap slack before a tick is treated as a
                                  clock jump / laptop sleep (default 30000)
@@ -94,7 +94,7 @@ Options:
 
   release options:
       --session <id>             session whose claims to drain (else env
-                                 OWENWORK_SESSION). Agent-held claims re-offer;
+                                 OWENLOOP_SESSION). Agent-held claims re-offer;
                                  exec-held claims are drain-exempt (B3).
       --origin <url>             hub origin (else settings.hubOrigin)
 
@@ -125,26 +125,26 @@ Options:
                credentials come from owenloop's store — each role reads the
                agent:<account> slot for its origin (never the human slot); a
                missing slot refuses with a runnable 'owenloop login' command.
-               OWENWORK_ACCOUNT       Scoped Identity account for exec/prepare/release
+               OWENLOOP_ACCOUNT       Scoped Identity account for exec/prepare/release
                                       (default 'default'; proxy uses --as, and
                                       stamps it onto dispatched holds/execs)
-               OWENWORK_TOKEN         dev-only bearer override — when set, used
+               OWENLOOP_TOKEN         dev-only bearer override — when set, used
                                       verbatim and the store + account are
                                       bypassed (NOT the primary path)
-               OWENWORK_CACHE_DIR     cache root
-               OWENWORK_STATE_DIR     proxy in-flight state dir
-               OWENWORK_SESSION       hold session-holder tag / release drain target
-               OWENWORK_CONDUCTOR_ID  dispatching Conductor's self-declared id for
+               OWENLOOP_CACHE_DIR     cache root
+               OWENLOOP_STATE_DIR     proxy in-flight state dir
+               OWENLOOP_SESSION       hold session-holder tag / release drain target
+               OWENLOOP_CONDUCTOR_ID  dispatching Conductor's self-declared id for
                                       hold/exec/agent-run's --conductor (advisory
                                       only, never for auth/routing/dispatch)
-               OWENWORK_HARNESS       agent-run harness id; below --harness, above
+               OWENLOOP_HARNESS       agent-run harness id; below --harness, above
                                       the step def's 'harness' field
-               OWENWORK_WORK_ROOT     root for per-RUN agent work dirs
+               OWENLOOP_WORK_ROOT     root for per-RUN agent work dirs
                                       (<workRoot>/<workflow>/<run>); above
                                       settings.workRoot, default <cacheDir>/work.
                                       A hub-supplied OrderPacket.workdir still
                                       wins, and is never reaped.
-               OWENWORK_WORK_REPO     local git repo to cut per-run work dirs from
+               OWENLOOP_WORK_REPO     local git repo to cut per-run work dirs from
                                       as worktrees instead of plain dirs; above
                                       settings.workRepo, default off
 
@@ -163,7 +163,7 @@ Options:
           owenloop work join <code> --hub <origin>
         select an account at run time:
           --as <account>         on proxy / hold
-          OWENWORK_ACCOUNT       on exec / prepare / release
+          OWENLOOP_ACCOUNT       on exec / prepare / release
                                  (proxy resolves once and threads both channels)
       owenloop work does NOT list stored accounts — enumerating an origin's accounts
       is an owenloop-side capability; check owenloop for which slots are stored.

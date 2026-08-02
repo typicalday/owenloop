@@ -13,8 +13,8 @@
  * and the caller says so honestly; re-running `owenloop work prepare` is the fix, and
  * content-hash dirs are cheap to re-fetch.
  *
- * Cache-dir resolution order (D3): `OWENWORK_CACHE_DIR` env → `settings.cacheDir`
- * → `$XDG_CACHE_HOME/owenwork` → `$HOME/.cache/owenwork`; throws when none is
+ * Cache-dir resolution order (D3): `OWENLOOP_CACHE_DIR` env → `settings.cacheDir`
+ * → `$XDG_CACHE_HOME/owenloop` → `$HOME/.cache/owenloop`; throws when none is
  * available (same stance as settingsPath — never guess a home dir). The env
  * override is primarily how tests point everything at a temp dir.
  *
@@ -45,14 +45,14 @@ export function resolveCacheDir(
   env: Record<string, string | undefined>,
   settingsCacheDir?: string,
 ): string {
-  const override = env['OWENWORK_CACHE_DIR'];
+  const override = env['OWENLOOP_CACHE_DIR'];
   if (override !== undefined && override.trim() !== '') return override;
   if (settingsCacheDir !== undefined && settingsCacheDir.trim() !== '') return settingsCacheDir;
   const xdg = env['XDG_CACHE_HOME'];
-  if (xdg !== undefined && xdg.trim() !== '') return join(xdg, 'owenwork');
+  if (xdg !== undefined && xdg.trim() !== '') return join(xdg, 'owenloop');
   const home = env['HOME'];
-  if (home !== undefined && home.trim() !== '') return join(home, '.cache', 'owenwork');
-  throw new Error('cannot locate a cache directory: set OWENWORK_CACHE_DIR, XDG_CACHE_HOME, or HOME');
+  if (home !== undefined && home.trim() !== '') return join(home, '.cache', 'owenloop');
+  throw new Error('cannot locate a cache directory: set OWENLOOP_CACHE_DIR, XDG_CACHE_HOME, or HOME');
 }
 
 /** `<cacheDir>/bundles/<name>` — the dir holding every hash for one workflow. */

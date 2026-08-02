@@ -291,7 +291,7 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
     ['# brief', 'order: wf1/run1', 'origin: https://hub.example', 'account: acct-1', 'conductor: cnd_1'].join('\n'),
   );
   assert.equal(start.args.cwd, '/repo/wt');
-  assert.deepEqual(start.args.owenworkMcp, {
+  assert.deepEqual(start.args.owenloopMcp, {
     command: 'owenloop',
     args: ['work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'acct-1', '--conductor=cnd_1', '--mcp'],
   });

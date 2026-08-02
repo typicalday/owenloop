@@ -18,7 +18,7 @@ import {
 let dir: string;
 let file: string;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'owenwork-sessions-'));
+  dir = mkdtempSync(join(tmpdir(), 'owenloop-sessions-'));
   file = sessionsPath(dir);
 });
 afterEach(() => {

@@ -18,7 +18,7 @@ let root: string;
 let stateDir: string;
 let cacheDir: string;
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), 'owenwork-attendance-events-'));
+  root = mkdtempSync(join(tmpdir(), 'owenloop-attendance-events-'));
   stateDir = join(root, 'state');
   cacheDir = join(root, 'cache');
 });

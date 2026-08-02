@@ -2,7 +2,7 @@
  * The `owenloop work hold --mcp` stdio-MCP mount (plan part 2).
  *
  * A born-bound work-holder: the D2 stamped Step Agent's frontmatter declares
- * `mcpServers.owenwork = owenloop work hold --order <wf>/<run> --origin <url> --mcp`,
+ * `mcpServers.owenloop = owenloop work hold --order <wf>/<run> --origin <url> --mcp`,
  * so when the Step Agent session boots it launches THIS as a stdio MCP server. The
  * server exposes two bare tools the model uses to do its order:
  *   - `get_order` → the order packet (prompt, inputs, owed outputs) for the run

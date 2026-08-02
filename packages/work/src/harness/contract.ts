@@ -2,7 +2,7 @@
  * The harness contract — the ONLY thing every harness adapter implements, and
  * the only shapes the runner speaks.
  *
- * Why it exists: owenwork moved from writing per-order subagent files into
+ * Why it exists: owenloop moved from writing per-order subagent files into
  * a vendor CLI's own directory and handing a lean order to an external Conductor,
  * to HOSTING each step agent itself behind a per-harness adapter, with a
  * provider-native session token persisted per step attempt so a rejected step
@@ -116,7 +116,7 @@ export interface StartArgs {
   /** Per-start override for reasoning effort. Same precedence rule as `model`. */
   effort?: string;
   /**
-   * The stdio mount for owenwork's own work-holder MCP surface (bare
+   * The stdio mount for owenloop's own work-holder MCP surface (bare
    * `get_order`/`submit`).
    *
    * BUILT BY THE RUNNER, NOT BY AN ADAPTER: `src/agent/brief.ts` constructs the
@@ -125,7 +125,7 @@ export interface StartArgs {
    * verbatim and never constructs it — the order id, origin, and account ride
    * argv, never the prompt.
    */
-  owenworkMcp: { command: string; args: string[] };
+  owenloopMcp: { command: string; args: string[] };
   /** Normalized from the step def by `normalizeStepPermissions`. */
   permissions: StepPermissions;
 }
@@ -156,7 +156,7 @@ export interface StartArgs {
  * happened to hold, and it must NOT fall back to a minimal option set on a map
  * miss.
  */
-export type DeliverArgs = Pick<StartArgs, 'cwd' | 'owenworkMcp' | 'permissions'> &
+export type DeliverArgs = Pick<StartArgs, 'cwd' | 'owenloopMcp' | 'permissions'> &
   Pick<StartArgs, 'model' | 'effort'>;
 
 /**

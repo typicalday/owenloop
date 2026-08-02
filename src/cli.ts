@@ -140,7 +140,7 @@ import type {
   Keychain,
   WhoamiIdentity,
 } from './hub.ts';
-import { owenworkSettingsPath, readOwenworkSettingsRaw, writeOwenworkHubOrigin } from './work-settings.ts';
+import { owenloopSettingsPath, readOwenloopSettingsRaw, writeOwenloopHubOrigin } from './work-settings.ts';
 
 // Re-export the keychain backend type so existing test imports of `Keychain`
 // from `../src/cli.ts` (test/hubkit.ts, test/login.test.ts) keep resolving —
@@ -552,7 +552,7 @@ Commands:
   pool rm <poolId> [--hub <url>]           delete a pool; work stamped to it moves to the org's orphan pool
   pool member add <poolId> <principalKind> <principalId> [--hub <url>]   add a member or agent to a pool
   pool member rm <poolId> <principalId> [--hub <url>]   remove a principal from a pool
-  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenwork settings, plugin (idempotent)
+  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenloop settings, plugin (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   work <subcommand> [args]                run execution-side proxy/hold/exec/agent-run/... commands
@@ -3465,7 +3465,7 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
 // ---- setup & doctor ---------------------------------------------------------
 //
 // `owenloop setup` is the idempotent converger for a machine's install (identity
-// model doc §7 Flow A/B): human login → agent credential → owenwork settings →
+// model doc §7 Flow A/B): human login → agent credential → owenloop settings →
 // Claude Code plugin → a final doctor pass. `owenloop doctor` (§8) is the
 // read-only probe of the same five surfaces. Both share `resolveSetupHub` (one
 // target) and the agent-slot probe.
@@ -3474,7 +3474,7 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
 // `io.out`/`io.err`/an Error. The only token hops live inside
 // `mintAgentCredential`/`rekeyAgentCredential` (caller→store). The succession
 // prompt renders name/last-active/pools; doctor renders identity/pools; the
-// owenwork settings file receives `hubOrigin` only.
+// owenloop settings file receives `hubOrigin` only.
 
 /** One step's outcome in the setup summary. `noted` = informational, never a failure. */
 interface SetupStep {
@@ -3870,20 +3870,20 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   // --- [1/6] inspect: zero writes, best-effort probes ---
   io.err('[1/6] inspect');
   io.err(`  human credential: ${readCredential(io, origin, { principal: 'human' }) !== null ? 'present' : 'none — will log in'}`);
-  const inspectSettingsPath = owenworkSettingsPath(io.env);
+  const inspectSettingsPath = owenloopSettingsPath(io.env);
   let settingsNote: string;
   if (!existsSync(inspectSettingsPath)) {
     settingsNote = 'missing — will write';
   } else {
     try {
-      const raw = readOwenworkSettingsRaw(inspectSettingsPath);
+      const raw = readOwenloopSettingsRaw(inspectSettingsPath);
       const found = raw && typeof raw.hubOrigin === 'string' ? raw.hubOrigin : undefined;
       settingsNote = found === origin ? `hubOrigin already ${origin}` : `hubOrigin ${found ?? '(unset)'} — will update`;
     } catch {
       settingsNote = 'present but unreadable — step 4 will error if still corrupt';
     }
   }
-  io.err(`  owenwork settings: ${settingsNote}`);
+  io.err(`  owenloop settings: ${settingsNote}`);
   io.err(`  claude on PATH: ${commandOnPath(io.env, 'claude') ? 'yes' : 'no'}`);
   const inspectAccts = enumerateAgentAccounts(io, origin);
   io.err(
@@ -3977,21 +3977,21 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     }
   }
 
-  // --- [4/6] owenwork settings ---
-  io.err('[4/6] owenwork settings');
-  const settingsPath = owenworkSettingsPath(io.env);
-  const existingSettings = readOwenworkSettingsRaw(settingsPath); // corrupt file → hard CliError (never clobber)
+  // --- [4/6] owenloop settings ---
+  io.err('[4/6] owenloop settings');
+  const settingsPath = owenloopSettingsPath(io.env);
+  const existingSettings = readOwenloopSettingsRaw(settingsPath); // corrupt file → hard CliError (never clobber)
   const currentHub = existingSettings && typeof existingSettings.hubOrigin === 'string' ? existingSettings.hubOrigin : undefined;
   if (existingSettings !== null && currentHub === origin) {
-    io.err(`✓ owenwork settings: hubOrigin already ${origin}`);
-    steps.push({ step: 'owenwork settings', action: 'skipped', detail: settingsPath });
+    io.err(`✓ owenloop settings: hubOrigin already ${origin}`);
+    steps.push({ step: 'owenloop settings', action: 'skipped', detail: settingsPath });
   } else {
-    const written = writeOwenworkHubOrigin(io.env, origin);
-    io.err(`✓ owenwork settings: hubOrigin ${written.previous ?? '(unset)'} → ${origin}`);
-    steps.push({ step: 'owenwork settings', action: 'done', detail: `${written.previous ?? '(unset)'} → ${origin}` });
+    const written = writeOwenloopHubOrigin(io.env, origin);
+    io.err(`✓ owenloop settings: hubOrigin ${written.previous ?? '(unset)'} → ${origin}`);
+    steps.push({ step: 'owenloop settings', action: 'done', detail: `${written.previous ?? '(unset)'} → ${origin}` });
   }
   if (agentAccount !== 'default') {
-    io.err(`non-default agent account — run owenloop work with OWENWORK_ACCOUNT=${agentAccount}`);
+    io.err(`non-default agent account — run owenloop work with OWENLOOP_ACCOUNT=${agentAccount}`);
   }
 
   // --- [5/6] plugin (non-fatal) ---
@@ -4130,25 +4130,25 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
     }
   }
 
-  // 5. owenwork settings
-  const settingsPath = owenworkSettingsPath(io.env);
+  // 5. owenloop settings
+  const settingsPath = owenloopSettingsPath(io.env);
   let settingsRaw: Record<string, unknown> | null = null;
   let settingsError: string | null = null;
   try {
-    settingsRaw = readOwenworkSettingsRaw(settingsPath);
+    settingsRaw = readOwenloopSettingsRaw(settingsPath);
   } catch (e) {
     settingsError = e instanceof Error ? e.message : String(e);
   }
   if (settingsError !== null) {
-    record('owenwork settings', false, settingsError, true);
+    record('owenloop settings', false, settingsError, true);
   } else if (settingsRaw === null) {
-    record('owenwork settings', false, `missing (${settingsPath})`, true);
+    record('owenloop settings', false, `missing (${settingsPath})`, true);
   } else {
     const found = typeof settingsRaw.hubOrigin === 'string' ? settingsRaw.hubOrigin : undefined;
     if (found !== origin) {
-      record('owenwork settings', false, `hubOrigin is ${found ?? '(unset)'}, expected ${origin}`, true);
+      record('owenloop settings', false, `hubOrigin is ${found ?? '(unset)'}, expected ${origin}`, true);
     } else {
-      record('owenwork settings', true, settingsPath, true);
+      record('owenloop settings', true, settingsPath, true);
     }
   }
 

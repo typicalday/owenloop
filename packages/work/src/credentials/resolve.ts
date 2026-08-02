@@ -2,7 +2,7 @@
  * The ONE place the bearer-token resolution / refuse / dev-override logic lives,
  * so all five roles share identical precedence instead of re-deriving it:
  *
- *   1. `OWENWORK_TOKEN` (trimmed, non-empty) — an EXPLICIT dev-only override.
+ *   1. `OWENLOOP_TOKEN` (trimmed, non-empty) — an EXPLICIT dev-only override.
  *      When set, it is used verbatim and the store + account are skipped.
  *   2. Otherwise read the `agent:<account>` slot from owenloop's store:
  *      - a `Credential`  → its bearer token (`credentialToToken`).
@@ -13,7 +13,7 @@
  *
  * The refuse (code 2) is a refuse-to-start precondition, mirroring the old
  * "no token" exit code, so existing exit-code assertions stay valid — only the
- * message text changes. owenwork stays read-only w.r.t. credentials.
+ * message text changes. owenloop stays read-only w.r.t. credentials.
  */
 import { OwenloopCredentialReader } from './owenloop.ts';
 import { credentialToToken } from './reader.ts';
@@ -36,8 +36,8 @@ export async function resolveBearer(args: {
 }): Promise<BearerResult> {
   const { origin, account, env } = args;
 
-  // 1. Dev-only override: explicit OWENWORK_TOKEN bypasses the store + account.
-  const override = env['OWENWORK_TOKEN']?.trim();
+  // 1. Dev-only override: explicit OWENLOOP_TOKEN bypasses the store + account.
+  const override = env['OWENLOOP_TOKEN']?.trim();
   if (override !== undefined && override !== '') {
     return { ok: true, token: override };
   }

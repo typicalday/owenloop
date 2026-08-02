@@ -22,15 +22,15 @@ const TOKEN = 'tok-e2e';
 let configDir: string;
 beforeEach(() => {
   // Isolate settings: a temp XDG_CONFIG_HOME means the child sees NO settings
-  // file — origin comes only from --origin, token only from OWENWORK_TOKEN.
-  configDir = mkdtempSync(join(tmpdir(), 'owenwork-hold-e2e-'));
+  // file — origin comes only from --origin, token only from OWENLOOP_TOKEN.
+  configDir = mkdtempSync(join(tmpdir(), 'owenloop-hold-e2e-'));
 });
 afterEach(() => {
   rmSync(configDir, { recursive: true, force: true });
 });
 
 function childEnv(): Record<string, string | undefined> {
-  return { OWENWORK_TOKEN: TOKEN, XDG_CONFIG_HOME: configDir, OWENWORK_SESSION: '' };
+  return { OWENLOOP_TOKEN: TOKEN, XDG_CONFIG_HOME: configDir, OWENLOOP_SESSION: '' };
 }
 
 function of(reqs: HubReq[], verb: string): HubReq[] {
@@ -74,7 +74,7 @@ test('hold --mcp full lifecycle on the wire: heartbeats from birth, closing subm
   const mcp = spawnHold(origin);
   try {
     const init = await handshake(mcp);
-    assert.equal(init.result.serverInfo.name, 'owenwork-hold');
+    assert.equal(init.result.serverInfo.name, 'owenloop-hold');
 
     const list = await mcp.request('tools/list');
     const names = (list.result.tools as Array<{ name: string }>).map((t) => t.name).sort();

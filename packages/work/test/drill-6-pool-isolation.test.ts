@@ -4,7 +4,7 @@
  * The M4 multi-principal property: two real `owenloop shift start` conductors,
  * each serving a DIFFERENT pool (`A` vs `B`) and authenticating
  * with a DIFFERENT stored-credential account (`--as a` vs `b`, no
- * `OWENWORK_TOKEN`), park against ONE mock hub over ONE split run (`wf1/run1`,
+ * `OWENLOOP_TOKEN`), park against ONE mock hub over ONE split run (`wf1/run1`,
  * step `alpha` on pool A + step `beta` on pool B). We assert each conductor
  * claims/dispatches ONLY its own pool's step, never the other's; that the
  * recorded hub-request log shows ZERO cross-pool claims (a post-hoc audit that
@@ -18,16 +18,16 @@
  * — the shared `startMockHub` helper is untouched; the audit is done post-hoc
  * over its `reqs` log.
  *
- * HONEST BOUNDARY (mock vs. live, owenwork-side vs. hub enforcement):
- * This proves OWENWORK'S side — given a correctly-narrowing hub, owenwork sends
+ * HONEST BOUNDARY (mock vs. live, owenloop-side vs. hub enforcement):
+ * This proves OWENLOOP'S side — given a correctly-narrowing hub, owenloop sends
  * its configured pools on the wire, claims only its pool, and never reaches
  * across, even with two conductors on one hub. It does NOT prove server-enforced
  * isolation: the mock hub only SIMULATES the hub's membership check + narrowing
  * that makes a cross-pool claim fail server-side. That true enforcement (and the
  * real hub audit log) is owned by the hub's own WO-4.1 tests and by the manual
  * live two-conductor demo in `drills/README.md`. Metering-cap enforcement is
- * likewise hub-side and not owenwork-observable, so it is not asserted here (see
- * the runbook) — owenwork's `--cap` is a separate LOCAL concurrency knob.
+ * likewise hub-side and not owenloop-observable, so it is not asserted here (see
+ * the runbook) — owenloop's `--cap` is a separate LOCAL concurrency knob.
  *
  * `pretest` builds `dist/`, so the bin shim resolves for the children.
  */
@@ -96,7 +96,7 @@ interface Conductor {
 }
 
 function makeConductor(tag: string): Conductor {
-  const root = mkdtempSync(join(tmpdir(), `owenwork-drill6-${tag}-`));
+  const root = mkdtempSync(join(tmpdir(), `owenloop-drill6-${tag}-`));
   return {
     root,
     home: join(root, 'home'),
@@ -133,9 +133,9 @@ function spawnConductor(c: Conductor, origin: string, account: string, pool: str
     // first would be passing for a reason it never asserted. `hang: true` keeps
     // each child alive and holding its slot for the duration of the assertions.
     fixtureEnv(c.home, {
-      OWENWORK_HARNESS_MODULE: FAKE_HARNESS,
-      OWENWORK_HARNESS: 'fake',
-      OWENWORK_FAKE_SCRIPT: JSON.stringify({ id: 'fake', hang: true }),
+      OWENLOOP_HARNESS_MODULE: FAKE_HARNESS,
+      OWENLOOP_HARNESS: 'fake',
+      OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'fake', hang: true }),
     }),
   );
 }
@@ -218,7 +218,7 @@ test('two conductors on different pools + accounts split one run cleanly — eac
     assert.equal(aRecs[0]!.step, 'alpha', 'A dispatched its own (alpha) step, never beta');
     assert.equal(bRecs[0]!.step, 'beta', 'B dispatched its own (beta) step, never alpha');
 
-    // (3) Each authenticated with its OWN stored credential — no OWENWORK_TOKEN
+    // (3) Each authenticated with its OWN stored credential — no OWENLOOP_TOKEN
     // override leaked in. Both distinct bearers appear, and EVERY recorded
     // request carries one of exactly those two (no stray/override bearer).
     assert.ok(reqs.some((r) => r.auth === POOL_A_AUTH), 'conductor A used its own stored bearer');
@@ -234,7 +234,7 @@ test('two conductors on different pools + accounts split one run cleanly — eac
     // never 'A'. With the deterministic routing above, this proves no conductor
     // ever reached for — or was served — the other pool's step. This is the
     // accept criterion's "hub audit log shows no cross-pool claim attempts
-    // succeeding", proven here at owenwork's mock level (see header boundary).
+    // succeeding", proven here at owenloop's mock level (see header boundary).
     for (const r of reqs) {
       const pools = r.body?.serve_pools as string[] | undefined;
       if (pools === undefined) continue; // e.g. a wake with no serve_pools field

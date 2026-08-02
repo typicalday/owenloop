@@ -99,11 +99,9 @@ accepted `shift next` records attendance and makes the next presence ping due,
 but attendance is advisory and observability-only. Attendance never changes
 routing, dispatch, or lease behavior.
 
-The execution settings file is `$XDG_CONFIG_HOME/owenwork/settings.json` when
+The execution settings file is `$XDG_CONFIG_HOME/owenloop/settings.json` when
 `XDG_CONFIG_HOME` is set to a non-blank value; otherwise it is
-`$HOME/.config/owenwork/settings.json`. The
-retained on-disk `owenwork` path and `OWENWORK_*` environment names are current
-configuration names, not a separate package or executable.
+`$HOME/.config/owenloop/settings.json`.
 
 ### `shift start <crew...>`
 
@@ -128,8 +126,8 @@ one loop sweep and exits instead of keeping the foreground daemon running.
 | `--max-agents <n>` | concurrent agent limit; precedence is flag, then `settings.maxConcurrentAgents`, then `4` |
 | `--poll-interval <ms>` | loop polling interval; defaults to `5000` milliseconds |
 | `--once` | run one loop sweep and exit; without it, keep the daemon in the foreground |
-| `--cache-dir <p>` | cache root; precedence is flag, then `OWENWORK_CACHE_DIR`, then `settings.cacheDir`, then `$XDG_CACHE_HOME/owenwork`, then `$HOME/.cache/owenwork` |
-| `--state-dir <p>` | socket and child-state root; precedence is flag, then `OWENWORK_STATE_DIR`, then `settings.stateDir`, then `$XDG_STATE_HOME/owenwork/exec`, then `$HOME/.local/state/owenwork/exec`; the socket is `shift.sock` inside this directory |
+| `--cache-dir <p>` | cache root; precedence is flag, then `OWENLOOP_CACHE_DIR`, then `settings.cacheDir`, then `$XDG_CACHE_HOME/owenloop`, then `$HOME/.cache/owenloop` |
+| `--state-dir <p>` | socket and child-state root; precedence is flag, then `OWENLOOP_STATE_DIR`, then `settings.stateDir`, then `$XDG_STATE_HOME/owenloop/exec`, then `$HOME/.local/state/owenloop/exec`; the socket is `shift.sock` inside this directory |
 
 A clean start or `--once` completion exits `0`. `owenloop shift --help` also
 exits `0`. Runtime failures such as credential reads or socket/runtime setup
@@ -228,11 +226,9 @@ The transplanted subcommand names remain. The proxy/session `--mcp` option was
 removed; `hold --mcp` remains because the machine-attached hold mount still
 exists. Run `owenloop work --help` for the full role-specific usage.
 
-The execution settings file is `$XDG_CONFIG_HOME/owenwork/settings.json` when
+The execution settings file is `$XDG_CONFIG_HOME/owenloop/settings.json` when
 `XDG_CONFIG_HOME` is set to a non-blank value; otherwise it is
-`$HOME/.config/owenwork/settings.json`. The
-on-disk `owenwork` path and `OWENWORK_*` environment names remain current
-configuration names; they do not identify a separate package or executable.
+`$HOME/.config/owenloop/settings.json`.
 
 | subcommand | what it does |
 |---|---|
@@ -1162,7 +1158,7 @@ the flagship command never opens a browser only to fail at the store.)
 ### After setup
 
 If the connected agent account is anything other than `default`, setup prints a
-reminder to run `owenloop work` with `OWENWORK_ACCOUNT=<name>` so the Step Agent
+reminder to run `owenloop work` with `OWENLOOP_ACCOUNT=<name>` so the Step Agent
 reads the right slot.
 
 **Exit codes.**

@@ -8,7 +8,7 @@ import { adapterFor, register, registeredHarnessIds, unregister } from '../src/h
 const startArgs = (over: Partial<StartArgs> = {}): StartArgs => ({
   brief: 'do the thing',
   cwd: '/tmp/wt',
-  owenworkMcp: { command: 'owenloop', args: ['work', 'hold', '--order', 'wf_1/run_1', '--mcp'] },
+  owenloopMcp: { command: 'owenloop', args: ['work', 'hold', '--order', 'wf_1/run_1', '--mcp'] },
   permissions: { extensions: {} },
   ...over,
 });
@@ -22,7 +22,7 @@ const startArgs = (over: Partial<StartArgs> = {}): StartArgs => ({
  */
 const deliverArgs = (over: Partial<DeliverArgs> = {}): DeliverArgs => ({
   cwd: '/tmp/wt',
-  owenworkMcp: { command: 'owenloop', args: ['work', ] },
+  owenloopMcp: { command: 'owenloop', args: ['work', ] },
   permissions: { extensions: {} },
   ...over,
 });

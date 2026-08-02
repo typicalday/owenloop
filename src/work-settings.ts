@@ -2,8 +2,8 @@
  * execution settings file writer — the ONE place the root `owenloop` CLI writes
  * into the execution-side settings file.
  *
- * `owenloop work` reads its settings from `$XDG_CONFIG_HOME/owenwork/
- * settings.json` (else `$HOME/.config/owenwork/settings.json`) and, by design,
+ * `owenloop work` reads its settings from `$XDG_CONFIG_HOME/owenloop/
+ * settings.json` (else `$HOME/.config/owenloop/settings.json`) and, by design,
  * NEVER writes them — the root CLI's `setup` command is the writer, so a fresh
  * `owenloop setup` can point `owenloop work` at the hub it just authenticated
  * against.
@@ -30,14 +30,14 @@ import { CliError } from './util.ts';
 
 /**
  * The execution settings file path for this environment. `XDG_CONFIG_HOME` (when
- * set and non-blank) wins over `HOME`, matching owenwork's own resolution and
+ * set and non-blank) wins over `HOME`, matching owenloop's own resolution and
  * the owenloop credential store's `configDir`. Throws when neither is set.
  */
-export function owenworkSettingsPath(env: Record<string, string | undefined>): string {
+export function owenloopSettingsPath(env: Record<string, string | undefined>): string {
   const xdg = env.XDG_CONFIG_HOME;
-  if (xdg && xdg.trim() !== '') return join(xdg, 'owenwork', 'settings.json');
+  if (xdg && xdg.trim() !== '') return join(xdg, 'owenloop', 'settings.json');
   const home = env.HOME;
-  if (home && home.trim() !== '') return join(home, '.config', 'owenwork', 'settings.json');
+  if (home && home.trim() !== '') return join(home, '.config', 'owenloop', 'settings.json');
   throw new CliError('cannot locate a config directory for execution settings: set HOME or XDG_CONFIG_HOME');
 }
 
@@ -51,7 +51,7 @@ export function owenworkSettingsPath(env: Record<string, string | undefined>): s
  *   `null`, a number, a string) → a hard `CliError` naming the path. The writer
  *   must never clobber a file it cannot merge into.
  */
-export function readOwenworkSettingsRaw(path: string): Record<string, unknown> | null {
+export function readOwenloopSettingsRaw(path: string): Record<string, unknown> | null {
   if (!existsSync(path)) return null;
   let parsed: unknown;
   try {
@@ -65,10 +65,10 @@ export function readOwenworkSettingsRaw(path: string): Record<string, unknown> |
   return parsed as Record<string, unknown>;
 }
 
-/** The outcome of a `writeOwenworkHubOrigin` call — the path written and the
+/** The outcome of a `writeOwenloopHubOrigin` call — the path written and the
  * previous `hubOrigin` value (`undefined` when the key was absent or the file
  * did not exist), so a caller can report an old→new transition. */
-export interface OwenworkWriteResult {
+export interface OwenloopWriteResult {
   path: string;
   previous: string | undefined;
 }
@@ -81,9 +81,9 @@ export interface OwenworkWriteResult {
  * file is pretty-printed with a trailing newline. Returns the path and the
  * previous `hubOrigin` (if any).
  */
-export function writeOwenworkHubOrigin(env: Record<string, string | undefined>, origin: string): OwenworkWriteResult {
-  const path = owenworkSettingsPath(env);
-  const existing = readOwenworkSettingsRaw(path);
+export function writeOwenloopHubOrigin(env: Record<string, string | undefined>, origin: string): OwenloopWriteResult {
+  const path = owenloopSettingsPath(env);
+  const existing = readOwenloopSettingsRaw(path);
   const previous = existing !== undefined && existing !== null && typeof existing.hubOrigin === 'string' ? existing.hubOrigin : undefined;
   const merged = { ...(existing ?? {}), hubOrigin: origin };
   mkdirSync(dirname(path), { recursive: true });

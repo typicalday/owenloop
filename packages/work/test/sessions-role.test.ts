@@ -66,21 +66,21 @@ function rec(
 
 /** Seed a cache dir with `records`, oldest first. Returns the cache dir. */
 function seedCache(records: SessionRecord[]): string {
-  const dir = mkdtempSync(join(tmpdir(), 'owenwork-sessions-'));
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-sessions-'));
   tmpDirs.push(dir);
   writeFileSync(sessionsPath(dir), records.map((r) => `${JSON.stringify(r)}\n`).join(''));
   return dir;
 }
 
 function runSessions(args: string[], cacheDir?: string): { status: number; stdout: string; stderr: string } {
-  const home = mkdtempSync(join(tmpdir(), 'owenwork-sessions-home-'));
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-sessions-home-'));
   tmpDirs.push(home);
   const res = spawnSync(process.execPath, [BIN, 'work', 'sessions', ...args], {
     encoding: 'utf8',
     env: {
       PATH: process.env['PATH'] ?? '',
       HOME: home,
-      OWENWORK_CACHE_DIR: cacheDir ?? join(home, 'cache'),
+      OWENLOOP_CACHE_DIR: cacheDir ?? join(home, 'cache'),
     },
   });
   return { status: res.status ?? -1, stdout: res.stdout, stderr: res.stderr };
@@ -154,15 +154,15 @@ test('the real adapters supply a resume command through the contract, not a swit
   const cache = seedCache([
     rec({ run: 'run-a', step: 'builder', status: 'submitted', harness: 'claude-code', token: 'sess-abc' }),
   ]);
-  const home = mkdtempSync(join(tmpdir(), 'owenwork-sessions-home-'));
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-sessions-home-'));
   tmpDirs.push(home);
   const res = spawnSync(process.execPath, [BIN, 'work', 'sessions'], {
     encoding: 'utf8',
     env: {
       PATH: process.env['PATH'] ?? '',
       HOME: home,
-      OWENWORK_CACHE_DIR: cache,
-      OWENWORK_CLAUDE_BIN: '/opt/custom/cli-binary',
+      OWENLOOP_CACHE_DIR: cache,
+      OWENLOOP_CLAUDE_BIN: '/opt/custom/cli-binary',
     },
   });
   assert.equal(res.status, 0, res.stderr);

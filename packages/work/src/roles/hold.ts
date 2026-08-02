@@ -13,14 +13,14 @@
  * seams (`src/roles/signals.ts`), and maps the loop's `HoldOutcome` to an exit
  * code.
  *
- * SESSION IDENTITY: `--session <id>` (env fallback `OWENWORK_SESSION`) rides
+ * SESSION IDENTITY: `--session <id>` (env fallback `OWENLOOP_SESSION`) rides
  * every get_order/heartbeat as the B3 holder tag `{kind:'session', id}`. A
  * holder is now ALWAYS sent (D5): when no session id is configured, `id`
  * falls back to `anon:<hostname>:<pid>` — never omitted. Only `kind:'session'`
  * — exec identity is C5's.
  *
  * CONDUCTOR ATTRIBUTION: `--conductor <cid>` (env fallback
- * `OWENWORK_CONDUCTOR_ID`), when known, rides along on the holder as
+ * `OWENLOOP_CONDUCTOR_ID`), when known, rides along on the holder as
  * `conductorId` — self-declared and advisory only (D8/INV-82), never used for
  * authorization, routing, dispatch, or claim correctness.
  *
@@ -33,7 +33,7 @@
  * the bearer comes from owenloop's store via `resolveBearer`, reading the
  * `agent:<account>` slot for `--as <account>` (default `default`, so a hand-run
  * hold and a proxy-stamped `hold --as <account>` both work), with
- * `OWENWORK_TOKEN` as a documented dev-only override. Exit codes are documented
+ * `OWENLOOP_TOKEN` as a documented dev-only override. Exit codes are documented
  * in `src/usage.ts`.
  */
 import { hostname } from 'node:os';
@@ -168,17 +168,17 @@ function errMsg(err: unknown): string {
 
 /**
  * Resolve the born-bound `--conductor` cid: explicit `--conductor`, else env
- * `OWENWORK_CONDUCTOR_ID`, else `undefined` (no cid known — a hand-run hold
+ * `OWENLOOP_CONDUCTOR_ID`, else `undefined` (no cid known — a hand-run hold
  * with no stamped/exported cid). Advisory only (D8/INV-82).
  */
 export function resolveConductorId(conductor: string | undefined, env: Record<string, string | undefined>): string | undefined {
-  const id = conductor ?? env['OWENWORK_CONDUCTOR_ID'];
+  const id = conductor ?? env['OWENLOOP_CONDUCTOR_ID'];
   return id !== undefined && id !== '' ? id : undefined;
 }
 
 /**
  * Resolve the B3 session-holder tag (D5): explicit `--session`, else env
- * `OWENWORK_SESSION`, else a per-process fallback `anon:<hostname>:<pid>` —
+ * `OWENLOOP_SESSION`, else a per-process fallback `anon:<hostname>:<pid>` —
  * NEVER undefined. The fallback is deliberately unique per process (not a
  * shared constant like `'anon'`): `release --session <id>` drains match on
  * session id, and a shared constant would let unrelated Conductors' claims
@@ -190,7 +190,7 @@ export function resolveHolder(
   env: Record<string, string | undefined>,
   opts: { conductorId?: string; hostname?: string; pid?: number } = {},
 ): ContactHolder {
-  const configured = session ?? env['OWENWORK_SESSION'];
+  const configured = session ?? env['OWENLOOP_SESSION'];
   const id =
     configured !== undefined && configured !== '' ? configured : `anon:${opts.hostname ?? hostname()}:${opts.pid ?? process.pid}`;
   return {
@@ -309,7 +309,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       ...(parsed.jumpToleranceMs !== undefined ? { jumpToleranceMs: parsed.jumpToleranceMs } : {}),
     });
     const server = createMcpServer({
-      name: 'owenwork-hold',
+      name: 'owenloop-hold',
       version: VERSION,
       tools: mount.tools,
       write: (msg) => void process.stdout.write(`${JSON.stringify(msg)}\n`),

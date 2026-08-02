@@ -56,7 +56,7 @@ export interface McpChild {
 
 const REQUEST_TIMEOUT_MS = 10_000;
 
-/** Spawn `owenwork <args>` and wire a line-framed JSON-RPC client to it. */
+/** Spawn `owenloop <args>` and wire a line-framed JSON-RPC client to it. */
 export function spawnMcp(args: string[], env: Record<string, string | undefined>): McpChild {
   const child = spawn(process.execPath, [BIN, 'work', ...args], {
     env: { ...process.env, ...env },
@@ -136,7 +136,7 @@ export async function handshake(mcp: McpChild): Promise<Frame> {
   const init = await mcp.request('initialize', {
     protocolVersion: '2025-06-18',
     capabilities: {},
-    clientInfo: { name: 'owenwork-e2e', version: '0.0.0' },
+    clientInfo: { name: 'owenloop-e2e', version: '0.0.0' },
   });
   mcp.notify('notifications/initialized');
   return init;

@@ -1,6 +1,6 @@
 /**
  * Transport-core acceptance for `src/mcp/server.ts` — the hand-rolled
- * newline-delimited JSON-RPC 2.0 MCP core (a near-verbatim copy of owenwork's;
+ * newline-delimited JSON-RPC 2.0 MCP core (a near-verbatim copy of owenloop's;
  * see that file's header). These tests re-prove the copied behavior against THIS
  * copy so drift is caught here rather than assumed: the handshake, tool
  * dispatch, the error envelopes, and the "a notification is never answered"

@@ -10,12 +10,12 @@
  * exec-held claims are drain-exempt; it cannot list them.
  *
  * Session identity resolves like `hold`: `--session <id>`, else env
- * `OWENWORK_SESSION`; an empty string counts as missing (matches `resolveHolder`).
+ * `OWENLOOP_SESSION`; an empty string counts as missing (matches `resolveHolder`).
  * Missing both is a usage error (exit 2). Origin resolves like the other roles
  * (`--origin` → `settings.hubOrigin`); the bearer comes from owenloop's store
- * via `resolveBearer`, reading the `agent:<account>` slot for `OWENWORK_ACCOUNT`
- * (default `default`), with `OWENWORK_TOKEN` as a documented dev-only override.
- * release has no `--as` flag — a Conductor sets `OWENWORK_ACCOUNT` for a
+ * via `resolveBearer`, reading the `agent:<account>` slot for `OWENLOOP_ACCOUNT`
+ * (default `default`), with `OWENLOOP_TOKEN` as a documented dev-only override.
+ * release has no `--as` flag — a Conductor sets `OWENLOOP_ACCOUNT` for a
  * non-default account.
  *
  * Docs call ONLY for the session form; there is deliberately no targeted CLI
@@ -69,10 +69,10 @@ export function parseArgs(args: string[]): ParsedArgs {
 
 /**
  * Resolve the session id to drain: explicit `--session`, else env
- * `OWENWORK_SESSION`; an empty string is treated as missing.
+ * `OWENLOOP_SESSION`; an empty string is treated as missing.
  */
 export function resolveSession(session: string | undefined, env: Record<string, string | undefined>): string | undefined {
-  const id = session ?? env['OWENWORK_SESSION'];
+  const id = session ?? env['OWENLOOP_SESSION'];
   return id !== undefined && id !== '' ? id : undefined;
 }
 
@@ -111,7 +111,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 
   const session = resolveSession(parsed.session, env);
   if (session === undefined) {
-    err('owenloop work release: no session id — pass --session <id> or set OWENWORK_SESSION');
+    err('owenloop work release: no session id — pass --session <id> or set OWENLOOP_SESSION');
     usage(err);
     return 2;
   }
@@ -130,7 +130,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 2;
   }
 
-  const account = env['OWENWORK_ACCOUNT'] ?? 'default';
+  const account = env['OWENLOOP_ACCOUNT'] ?? 'default';
   const bearer = await resolveBearer({ origin, account, env });
   if (!bearer.ok) {
     err(`owenloop work release: ${bearer.message}`);

@@ -114,12 +114,12 @@ let home: string;
 let savedEnv: NodeJS.ProcessEnv;
 beforeEach(() => {
   savedEnv = { ...process.env };
-  home = mkdtempSync(join(tmpdir(), 'owenwork-exec-home-'));
+  home = mkdtempSync(join(tmpdir(), 'owenloop-exec-home-'));
   process.env['HOME'] = home;
   process.env['XDG_CONFIG_HOME'] = home;
-  delete process.env['OWENWORK_TOKEN'];
-  delete process.env['OWENWORK_ACCOUNT'];
-  delete process.env['OWENWORK_CONDUCTOR_ID'];
+  delete process.env['OWENLOOP_TOKEN'];
+  delete process.env['OWENLOOP_ACCOUNT'];
+  delete process.env['OWENLOOP_CONDUCTOR_ID'];
   // Hermetic credential store: force owenloop's file backend (no real keychain
   // shell-out) so an unseeded store reads as absent → the refuse path.
   process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
@@ -146,7 +146,7 @@ test('run() exits 2 when no hub origin is resolvable', async () => {
 });
 
 test('run() exits 2 with the refuse message when no Scoped Identity key is stored', async () => {
-  // No OWENWORK_TOKEN override + a hermetic empty file store (temp HOME/XDG,
+  // No OWENLOOP_TOKEN override + a hermetic empty file store (temp HOME/XDG,
   // OWENLOOP_NO_KEYCHAIN forces the file backend) ⇒ the agent slot is absent.
   const err: string[] = [];
   const code = await run(['wf1/run1', '--origin', 'https://hub.example'], { err: (l) => err.push(l) });
@@ -264,7 +264,7 @@ function fakeSignalHost(): { host: SignalHost; exits: number[]; registered: stri
 const WIRE_ARGS = ['wf1/run1', '--origin', 'https://hub.example', '--heartbeat-interval', '5'];
 
 test('run() happy path: tags the exec holder, runs, submits a receipt, exits 0', async () => {
-  process.env['OWENWORK_TOKEN'] = 'tok';
+  process.env['OWENLOOP_TOKEN'] = 'tok';
   const { hub, getOrderArgs, submits, releases } = roleHub({ getOrder: commandOrder({ command: 'make build' }) });
   const sig = fakeSignalHost();
 
@@ -294,7 +294,7 @@ test('run() happy path: tags the exec holder, runs, submits a receipt, exits 0',
 // the receipt submit — the hub's attribution columns need it on every path,
 // not just get_order (advisory only, D8/INV-82).
 test('run() threads --conductor onto the exec holder for both get_order and submit', async () => {
-  process.env['OWENWORK_TOKEN'] = 'tok';
+  process.env['OWENLOOP_TOKEN'] = 'tok';
   const { hub, getOrderArgs, submitReqs } = roleHub({ getOrder: commandOrder({ command: 'make build' }) });
   const sig = fakeSignalHost();
 
@@ -313,10 +313,10 @@ test('run() threads --conductor onto the exec holder for both get_order and subm
   assert.deepEqual((submitReqs[0] as { holder?: unknown }).holder, { kind: 'exec', id: 'host:123', conductorId: 'cnd_abc' });
 });
 
-// W7: OWENWORK_CONDUCTOR_ID env is the fallback when --conductor is absent.
-test('run() falls back to OWENWORK_CONDUCTOR_ID when --conductor is absent', async () => {
-  process.env['OWENWORK_TOKEN'] = 'tok';
-  process.env['OWENWORK_CONDUCTOR_ID'] = 'cnd_env';
+// W7: OWENLOOP_CONDUCTOR_ID env is the fallback when --conductor is absent.
+test('run() falls back to OWENLOOP_CONDUCTOR_ID when --conductor is absent', async () => {
+  process.env['OWENLOOP_TOKEN'] = 'tok';
+  process.env['OWENLOOP_CONDUCTOR_ID'] = 'cnd_env';
   const { hub, getOrderArgs } = roleHub({ getOrder: commandOrder({ command: 'make build' }) });
   const sig = fakeSignalHost();
 
@@ -335,7 +335,7 @@ test('run() falls back to OWENWORK_CONDUCTOR_ID when --conductor is absent', asy
 });
 
 test('run() maps a first-contact completed order to exit 0 without running anything', async () => {
-  process.env['OWENWORK_TOKEN'] = 'tok';
+  process.env['OWENLOOP_TOKEN'] = 'tok';
   let started = 0;
   const { hub } = roleHub({ getOrder: commandOrder({ claimed: false, outcome: 'ok' }) });
   const runner: CommandRunner = { start: () => { started++; return { done: Promise.resolve(fixedResult(0)), kill: async () => {} }; } };
@@ -345,7 +345,7 @@ test('run() maps a first-contact completed order to exit 0 without running anyth
 });
 
 test('run() signal wiring: exec message line, SIGINT mid-run kills + releases, exits 1', async () => {
-  process.env['OWENWORK_TOKEN'] = 'tok';
+  process.env['OWENLOOP_TOKEN'] = 'tok';
   const sig = fakeSignalHost();
   const killState = { kills: 0 };
   const { hub, releases, submits } = roleHub({
@@ -371,12 +371,12 @@ test('run() signal wiring: exec message line, SIGINT mid-run kills + releases, e
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
 });
 
-// ---- store-backed success (no OWENWORK_TOKEN — the primary path) -------------
+// ---- store-backed success (no OWENLOOP_TOKEN — the primary path) -------------
 // These run WITHOUT an injected hub: the role builds a REAL client whose getToken
 // resolves the agent slot from the seeded store, and the mock hub answers first
 // contact with a completed order (exit 0, no child spawned) while recording auth.
 
-test('with no OWENWORK_TOKEN, exec authenticates with the agent slot token from the store', async () => {
+test('with no OWENLOOP_TOKEN, exec authenticates with the agent slot token from the store', async () => {
   const { server, origin, auths } = await startRecordingHub();
   seedAgentKeys(home, origin, { default: 'olp_from_store' });
   try {
@@ -388,10 +388,10 @@ test('with no OWENWORK_TOKEN, exec authenticates with the agent slot token from 
   }
 });
 
-test('OWENWORK_ACCOUNT selects a different agent slot (ci token, not default)', async () => {
+test('OWENLOOP_ACCOUNT selects a different agent slot (ci token, not default)', async () => {
   const { server, origin, auths } = await startRecordingHub();
   seedAgentKeys(home, origin, { default: 'tok_default', ci: 'tok_ci' });
-  process.env['OWENWORK_ACCOUNT'] = 'ci';
+  process.env['OWENLOOP_ACCOUNT'] = 'ci';
   try {
     const code = await run(['wf1/run1', '--origin', origin, '--heartbeat-interval', '5'], { out: () => {}, err: () => {} });
     assert.equal(code, 0);

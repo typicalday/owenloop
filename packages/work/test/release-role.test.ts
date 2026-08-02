@@ -65,12 +65,12 @@ test('parseArgs rejects an unknown flag and a missing value', () => {
 
 test('resolveSession prefers --session, falls back to env, empty = missing', () => {
   assert.equal(resolveSession('s-a', {}), 's-a');
-  assert.equal(resolveSession(undefined, { OWENWORK_SESSION: 'env-s' }), 'env-s');
+  assert.equal(resolveSession(undefined, { OWENLOOP_SESSION: 'env-s' }), 'env-s');
   assert.equal(resolveSession(undefined, {}), undefined);
   // An explicit empty --session is treated as missing WITHOUT falling back to
   // env (matches hold's resolveHolder: `'' ?? env` is '', then empty ⇒ missing).
-  assert.equal(resolveSession('', { OWENWORK_SESSION: 'env-s' }), undefined);
-  assert.equal(resolveSession(undefined, { OWENWORK_SESSION: '' }), undefined);
+  assert.equal(resolveSession('', { OWENLOOP_SESSION: 'env-s' }), undefined);
+  assert.equal(resolveSession(undefined, { OWENLOOP_SESSION: '' }), undefined);
 });
 
 // ---- fake hub ---------------------------------------------------------------
@@ -128,13 +128,13 @@ async function runRole(
 // A hermetic env: an empty temp HOME so loadSettings returns {} (no hubOrigin),
 // plus an explicit origin/token unless a case is testing their absence.
 function baseEnv(extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
-  return { HOME: mkdtempSync(join(tmpdir(), 'owenwork-release-')), OWENWORK_TOKEN: 'tok', ...extra };
+  return { HOME: mkdtempSync(join(tmpdir(), 'owenloop-release-')), OWENLOOP_TOKEN: 'tok', ...extra };
 }
 
 // ---- run(): usage exits (no network) ----------------------------------------
 
 test('run() exits 2 when no session id is resolvable', async () => {
-  const env = baseEnv({ OWENWORK_SESSION: undefined });
+  const env = baseEnv({ OWENLOOP_SESSION: undefined });
   try {
     const { code, err } = await runRole(['--origin', 'https://h'], env);
     assert.equal(code, 2);
@@ -156,9 +156,9 @@ test('run() exits 2 when no hub origin is resolvable', async () => {
 });
 
 test('run() exits 2 with the refuse message when no Scoped Identity key is stored', async () => {
-  // No OWENWORK_TOKEN override + a hermetic empty file store (temp HOME,
+  // No OWENLOOP_TOKEN override + a hermetic empty file store (temp HOME,
   // OWENLOOP_NO_KEYCHAIN forces the file backend) ⇒ the agent slot is absent.
-  const env = baseEnv({ OWENWORK_TOKEN: undefined, OWENLOOP_NO_KEYCHAIN: '1' });
+  const env = baseEnv({ OWENLOOP_TOKEN: undefined, OWENLOOP_NO_KEYCHAIN: '1' });
   try {
     const { code, err } = await runRole(['--session', 's1', '--origin', 'https://h'], env);
     assert.equal(code, 2);
@@ -204,8 +204,8 @@ test('happy path posts {session} and prints each released order + the exemption 
   }
 });
 
-test('session id falls back to OWENWORK_SESSION', async () => {
-  const env = baseEnv({ OWENWORK_SESSION: 'env-sess', OWENWORK_TOKEN: 'tok' });
+test('session id falls back to OWENLOOP_SESSION', async () => {
+  const env = baseEnv({ OWENLOOP_SESSION: 'env-sess', OWENLOOP_TOKEN: 'tok' });
   const { hub, releases } = fakeHub({ text: '', released: [] });
   try {
     const { code } = await runRole(['--origin', 'https://h'], env, hub);
@@ -242,18 +242,18 @@ test('a hub error exits 1 and surfaces the hub message', async () => {
   }
 });
 
-// ---- store-backed success (no OWENWORK_TOKEN — the primary path) -------------
+// ---- store-backed success (no OWENLOOP_TOKEN — the primary path) -------------
 
-test('with no OWENWORK_TOKEN, release authenticates with the agent slot token from the store', async () => {
+test('with no OWENLOOP_TOKEN, release authenticates with the agent slot token from the store', async () => {
   const { server, origin, auths } = await startRecordingHub();
-  const home = mkdtempSync(join(tmpdir(), 'owenwork-release-store-'));
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-release-store-'));
   seedAgentKeys(home, origin, { default: 'olp_from_store' });
   // No override; hermetic file backend; XDG points the store at our seeded file.
   const env: Record<string, string | undefined> = {
     HOME: home,
     XDG_CONFIG_HOME: home,
     OWENLOOP_NO_KEYCHAIN: '1',
-    OWENWORK_TOKEN: undefined,
+    OWENLOOP_TOKEN: undefined,
   };
   try {
     // No injected hub — the role builds a REAL client that hits the mock server.
@@ -266,16 +266,16 @@ test('with no OWENWORK_TOKEN, release authenticates with the agent slot token fr
   }
 });
 
-test('OWENWORK_ACCOUNT selects a different agent slot (ci token, not default)', async () => {
+test('OWENLOOP_ACCOUNT selects a different agent slot (ci token, not default)', async () => {
   const { server, origin, auths } = await startRecordingHub();
-  const home = mkdtempSync(join(tmpdir(), 'owenwork-release-acct-'));
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-release-acct-'));
   seedAgentKeys(home, origin, { default: 'tok_default', ci: 'tok_ci' });
   const env: Record<string, string | undefined> = {
     HOME: home,
     XDG_CONFIG_HOME: home,
     OWENLOOP_NO_KEYCHAIN: '1',
-    OWENWORK_TOKEN: undefined,
-    OWENWORK_ACCOUNT: 'ci',
+    OWENLOOP_TOKEN: undefined,
+    OWENLOOP_ACCOUNT: 'ci',
   };
   try {
     const { code } = await runRole(['--session', 's1', '--origin', origin], env);

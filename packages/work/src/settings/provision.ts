@@ -1,5 +1,5 @@
 /**
- * The ONE settings writer in owenwork, provisioning-time only.
+ * The ONE settings writer in owenloop, provisioning-time only.
  *
  * `settings/settings.ts` is deliberately read-only (see its HARD RULE comment)
  * — every role loads settings, no role writes them. `owenloop work join` is the sole

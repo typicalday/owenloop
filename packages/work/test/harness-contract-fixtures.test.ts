@@ -9,7 +9,7 @@
  *
  * HOW IT DIFFERS FROM WHAT ALREADY EXISTED. `test/harness-codex.test.ts`
  * sections B replay the same recordings, but through the PURE helpers
- * (`mapNotification`, `isResumeMiss`, `readOwenworkMountFailure`) — a frame at a
+ * (`mapNotification`, `isResumeMiss`, `readOwenloopMountFailure`) — a frame at a
  * time, with no adapter and no process. The gap that leaves is the whole
  * transport: correlation, the handshake, the turn gate, the `started` event, and
  * the `HarnessSessionRef` the caller persists. This file closes it by standing a
@@ -67,9 +67,9 @@ const FIXTURE_THREAD = '11111111-1111-4111-8111-111111111111';
 
 /**
  * The stub source. `fixture` is BAKED IN rather than passed through the
- * environment: `openClient` now filters `OWENWORK_*` down to the admitted set
+ * environment: `openClient` now filters `OWENLOOP_*` down to the admitted set
  * (Phase 6 items 3+5), so a stub that read its own configuration from an
- * `OWENWORK_`-prefixed variable would either not work or would force a test-only
+ * `OWENLOOP_`-prefixed variable would either not work or would force a test-only
  * key into a production allowlist. Neither is acceptable.
  */
 const replaySource = (fixture: string, pidFile: string, usedFile: string): string => `#!/usr/bin/env node
@@ -167,7 +167,7 @@ interface Replay {
 }
 
 function useReplay(t: { after(fn: () => void): void }, fixture: string): Replay {
-  const dir = mkdtempSync(join(tmpdir(), 'owenwork-replay-'));
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-replay-'));
   const script = join(dir, 'replay-app-server.mjs');
   const pidFile = join(dir, 'pids');
   const usedFile = join(dir, 'used.json');
@@ -175,8 +175,8 @@ function useReplay(t: { after(fn: () => void): void }, fixture: string): Replay 
   writeFileSync(usedFile, '{}');
   writeFileSync(script, replaySource(join(FIXTURE_DIR, fixture), pidFile, usedFile), { mode: 0o755 });
 
-  const previous = process.env['OWENWORK_CODEX_BIN'];
-  process.env['OWENWORK_CODEX_BIN'] = script;
+  const previous = process.env['OWENLOOP_CODEX_BIN'];
+  process.env['OWENLOOP_CODEX_BIN'] = script;
   t.after(() => {
     for (const line of readFileSync(pidFile, 'utf8').split('\n')) {
       const pid = Number(line.trim());
@@ -187,8 +187,8 @@ function useReplay(t: { after(fn: () => void): void }, fixture: string): Replay 
         /* already gone — the adapter disposed it, which is the good case */
       }
     }
-    if (previous === undefined) delete process.env['OWENWORK_CODEX_BIN'];
-    else process.env['OWENWORK_CODEX_BIN'] = previous;
+    if (previous === undefined) delete process.env['OWENLOOP_CODEX_BIN'];
+    else process.env['OWENLOOP_CODEX_BIN'] = previous;
     rmSync(dir, { recursive: true, force: true });
   });
   return { cwd: dir };
@@ -198,7 +198,7 @@ function startArgs(cwd: string): StartArgs {
   return {
     brief: 'do the thing',
     cwd,
-    owenworkMcp: { command: process.execPath, args: ['/tmp/fixture-mcp/owenwork-server.mjs'] },
+    owenloopMcp: { command: process.execPath, args: ['/tmp/fixture-mcp/owenloop-server.mjs'] },
     permissions: normalizeStepPermissions(undefined, undefined),
   };
 }
@@ -248,8 +248,8 @@ test('the recorded session replays through the REAL adapter and yields the recor
   // drops it, that check loses its input silently — so pin it here.
   assert.match(text, /^app-server ready: userAgent=/m);
   // The mount really came up in the recording, cancelled counter-example and all.
-  assert.match(text, /MCP server 'owenwork' status ready/);
-  // Both owenwork tool calls survive the transport as progress, so an operator
+  assert.match(text, /MCP server 'owenloop' status ready/);
+  // Both owenloop tool calls survive the transport as progress, so an operator
   // reading the runner log can see the agent actually reached the hub.
   assert.equal(text.split('\n').filter((l) => /^item\/completed mcpToolCall /.test(l)).length, 2);
 
@@ -384,7 +384,7 @@ test('the recorded SDK stream maps to exactly one progress line and one turn_end
   assert.match(text, /permissionMode=bypassPermissions/);
   // `mcp_servers` is read field-by-field, so a rename would surface as
   // `undefined=undefined` here rather than as a silent blank in production.
-  assert.match(text, /mcp=\[owenwork=pending\]/);
+  assert.match(text, /mcp=\[owenloop=pending\]/);
 });
 
 test('message types the mapping does not know are ignored, not thrown on', async () => {
