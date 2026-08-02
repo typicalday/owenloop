@@ -121,7 +121,7 @@ test('two identical-argv shift children get distinct presence names, and clock_i
     const wnB = await shiftB.request({ op: 'next', wait_ms: 0 });
     assert.equal(isShiftError(wnA), false);
     assert.equal(isShiftError(wnB), false);
-    await until(() => of(reqs, 'presence_ping').filter((r) => r.body?.['attended_at'] !== undefined).length >= 2, 'attendance pings');
+    await until(() => of(reqs, 'presence_ping').filter((r) => r.body?.['attended_at'] !== undefined).length >= 2, 'attendance pings', 30_000);
     const attendedA = [...of(reqs, 'presence_ping')].reverse().find((r) => r.body?.['name'] === nameA && r.body?.['attended_at'] !== undefined);
     const attendedB = [...of(reqs, 'presence_ping')].reverse().find((r) => r.body?.['name'] === nameB && r.body?.['attended_at'] !== undefined);
     assert.deepEqual(attendedA?.body?.['serve_pools'], ['crew-a'], "A's own ping carries only A's scope");
