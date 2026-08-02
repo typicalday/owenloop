@@ -308,7 +308,15 @@ const FULL_ENV = (): Record<string, string | undefined> => ({
   CLAUDECODE: '1',
   CLAUDE_CODE_OAUTH_TOKEN: 'oauth-must-survive',
   OWENLOOP_CACHE_DIR: '/cache-must-survive',
+  OWENLOOP_CONDUCTOR_ID: 'conductor-must-survive',
+  OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
+  OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
+  OWENLOOP_NO_KEYCHAIN: '1',
+  OWENLOOP_SESSION: 'session-must-survive',
   OWENLOOP_TOKEN: 'tok-must-not-survive',
+  OWENLOOP_INVENTED_NEXT_PHASE: 'future-must-not-survive',
+  OWENLOOP_CREDENTIAL_ORIGIN: 'helper-origin-must-not-survive',
+  OWENLOOP_CREDENTIAL_SLOT: 'helper-slot-must-not-survive',
   PATH: '/usr/bin',
   HOME: '/home/x',
 });
@@ -359,10 +367,22 @@ test('buildChildEnv: the OWENLOOP_* allowlist and the API-key strip are independ
 
   assert.equal(out['CLAUDE_CODE_OAUTH_TOKEN'], 'oauth-must-survive', 'item 3: outside the namespace, untouchable');
   assert.equal(out['OWENLOOP_CACHE_DIR'], '/cache-must-survive', 'admitted inside the namespace');
+  assert.equal(out['OWENLOOP_CONDUCTOR_ID'], 'conductor-must-survive');
+  assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND'], '/bin/credential-helper');
+  assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'], '2500');
+  assert.equal(out['OWENLOOP_NO_KEYCHAIN'], '1');
+  assert.equal(out['OWENLOOP_SESSION'], 'session-must-survive');
   assert.equal(out['PATH'], '/usr/bin');
   assert.equal(out['HOME'], '/home/x');
 
-  assert.equal('OWENLOOP_TOKEN' in out, false, 'item 5: denied inside the namespace');
+  for (const key of [
+    'OWENLOOP_TOKEN',
+    'OWENLOOP_INVENTED_NEXT_PHASE',
+    'OWENLOOP_CREDENTIAL_ORIGIN',
+    'OWENLOOP_CREDENTIAL_SLOT',
+  ]) {
+    assert.equal(key in out, false, `${key} must stay denied inside the namespace`);
+  }
   assert.equal('ANTHROPIC_API_KEY' in out, false, 'the API-key strip, a separate mechanism');
 });
 
@@ -378,6 +398,18 @@ test('buildChildEnv with allowApiBilling on still applies the OWENLOOP_* allowli
   assert.equal(out['CLAUDECODE'], '1');
   assert.equal('OWENLOOP_TOKEN' in out, false, 'the allowlist is not under the billing toggle');
   assert.equal(out['OWENLOOP_CACHE_DIR'], '/cache-must-survive');
+  assert.equal(out['OWENLOOP_CONDUCTOR_ID'], 'conductor-must-survive');
+  assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND'], '/bin/credential-helper');
+  assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'], '2500');
+  assert.equal(out['OWENLOOP_NO_KEYCHAIN'], '1');
+  assert.equal(out['OWENLOOP_SESSION'], 'session-must-survive');
+  for (const key of [
+    'OWENLOOP_INVENTED_NEXT_PHASE',
+    'OWENLOOP_CREDENTIAL_ORIGIN',
+    'OWENLOOP_CREDENTIAL_SLOT',
+  ]) {
+    assert.equal(key in out, false, `${key} stays denied when API billing is enabled`);
+  }
 
   assert.deepEqual(source, FULL_ENV(), 'the input environment must not be mutated');
   assert.notEqual(out, source, 'still a copy, never the caller’s object');

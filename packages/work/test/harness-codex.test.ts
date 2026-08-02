@@ -587,8 +587,9 @@ const MOUNT = { command: '/tmp/fixture-node', args: ['/tmp/fixture-mcp/owenloop-
 
 /**
  * The built mount is `MOUNT` plus a forwarded `env` — codex hands an MCP child
- * only a tiny core environment, so `OWENLOOP_TOKEN` has to ride on the mount or
- * `owenloop work hold --mcp` dies before its `initialize` reply. C15 pins the
+ * only a tiny core environment, so the holder's admitted identity and credential
+ * backend controls have to ride on the mount. `OWENLOOP_TOKEN` is deliberately
+ * denied; the holder resolves its stored credential instead. C15 pins the
  * forwarding rule itself; every other case only needs "the real mount, intact".
  */
 function assertMount(actual: unknown): void {
@@ -792,8 +793,13 @@ test('C15 the mount carries the ADMITTED owenloop environment, and nothing else'
   process.env['OWENLOOP_SESSION'] = 'sess-c15';
   process.env['OWENLOOP_CONDUCTOR_ID'] = 'cond-c15';
   process.env['OWENLOOP_CACHE_DIR'] = '/tmp/fixture-cache';
+  process.env['OWENLOOP_CREDENTIAL_COMMAND'] = '/bin/credential-helper';
+  process.env['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'] = '2500';
+  process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
   process.env['OWENLOOP_TOKEN'] = 'tok-c15';
   process.env['OWENLOOP_SOMETHING_NEW'] = 'future-var';
+  process.env['OWENLOOP_CREDENTIAL_ORIGIN'] = 'helper-origin';
+  process.env['OWENLOOP_CREDENTIAL_SLOT'] = 'agent:holder';
   process.env['XDG_CONFIG_HOME'] = '/tmp/fixture-config';
   process.env['AWS_SECRET_ACCESS_KEY'] = 'must-not-travel';
 
@@ -807,12 +813,21 @@ test('C15 the mount carries the ADMITTED owenloop environment, and nothing else'
     assert.equal(mount.env['OWENLOOP_SESSION'], 'sess-c15');
     assert.equal(mount.env['OWENLOOP_CONDUCTOR_ID'], 'cond-c15');
     assert.equal(mount.env['OWENLOOP_CACHE_DIR'], '/tmp/fixture-cache');
+    assert.equal(mount.env['OWENLOOP_CREDENTIAL_COMMAND'], '/bin/credential-helper');
+    assert.equal(mount.env['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'], '2500');
+    assert.equal(mount.env['OWENLOOP_NO_KEYCHAIN'], '1');
     assert.equal(mount.env['XDG_CONFIG_HOME'], '/tmp/fixture-config');
     // The dev-only hub bearer override does NOT travel (Phase 6 item 5): these
     // params reach codex's rollout file on disk.
     assert.equal('OWENLOOP_TOKEN' in mount.env, false);
     // Deny-by-default inside the namespace: a variable nobody admitted stays home.
-    assert.equal('OWENLOOP_SOMETHING_NEW' in mount.env, false);
+    for (const key of [
+      'OWENLOOP_SOMETHING_NEW',
+      'OWENLOOP_CREDENTIAL_ORIGIN',
+      'OWENLOOP_CREDENTIAL_SLOT',
+    ]) {
+      assert.equal(key in mount.env, false, `${key} must stay out of the persisted mount env`);
+    }
     // And a blind `{...process.env}` would spray unrelated secrets onto disk.
     assert.equal('AWS_SECRET_ACCESS_KEY' in mount.env, false);
   }
@@ -974,12 +989,28 @@ const STUB_TURN = '22222222-2222-4222-8222-222222222222';
  * environment at all, which also makes it a small live proof that a harness
  * child starts fine without owenloop's namespace.
  */
-const stubSource = (spec: { pidFile: string; logFile: string; mode: string }): string => `#!/usr/bin/env node
+const stubSource = (spec: { pidFile: string; logFile: string; envFile: string; mode: string }): string => `#!/usr/bin/env node
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 
 const spec = ${JSON.stringify(spec)};
 writeFileSync(spec.pidFile, String(process.pid));
+const envKeys = [
+  'OWENLOOP_CACHE_DIR',
+  'OWENLOOP_CONDUCTOR_ID',
+  'OWENLOOP_CREDENTIAL_COMMAND',
+  'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
+  'OWENLOOP_NO_KEYCHAIN',
+  'OWENLOOP_SESSION',
+  'OWENLOOP_TOKEN',
+  'OWENLOOP_INVENTED_NEXT_PHASE',
+  'OWENLOOP_CREDENTIAL_ORIGIN',
+  'OWENLOOP_CREDENTIAL_SLOT',
+];
+writeFileSync(
+  spec.envFile,
+  JSON.stringify(Object.fromEntries(envKeys.map((key) => [key, process.env[key] ?? null]))),
+);
 // Outlive the turn: a stub that exits on its own would make "the adapter tore it
 // down" indistinguishable from "it was finished anyway".
 setInterval(() => {}, 60_000);
@@ -1086,6 +1117,8 @@ interface Stub {
   dir: string;
   /** Every request the stub received, in arrival order. */
   received(): Array<{ method: string; params: Record<string, unknown> | null }>;
+  /** The app-server's selected environment snapshot, once it has started. */
+  envSnapshot(): Record<string, string | null>;
   /** The stub's own pid, once it has written it. */
   pid(): number | undefined;
   /** True while the stub process still exists. */
@@ -1098,7 +1131,8 @@ function useStub(t: { after(fn: () => void): void }, mode: string): Stub {
   const script = join(dir, 'stub-app-server.mjs');
   const pidFile = join(dir, 'pid');
   const logFile = join(dir, 'received.jsonl');
-  writeFileSync(script, stubSource({ pidFile, logFile, mode }), { mode: 0o755 });
+  const envFile = join(dir, 'env.json');
+  writeFileSync(script, stubSource({ pidFile, logFile, envFile, mode }), { mode: 0o755 });
   writeFileSync(logFile, '');
 
   // `OWENLOOP_CODEX_BIN` is read by the adapter in THIS process before it
@@ -1138,6 +1172,7 @@ function useStub(t: { after(fn: () => void): void }, mode: string): Stub {
         .split('\n')
         .filter((l) => l.trim() !== '')
         .map((l) => JSON.parse(l) as { method: string; params: Record<string, unknown> | null }),
+    envSnapshot: () => JSON.parse(readFileSync(envFile, 'utf8')) as Record<string, string | null>,
     alive: () => {
       const p = pid();
       if (p === undefined) return false;
@@ -1150,6 +1185,47 @@ function useStub(t: { after(fn: () => void): void }, mode: string): Stub {
     },
   };
 }
+
+test('D4 the app-server spawn applies the same six-name filter as the mount', async (t) => {
+  const saved = { ...process.env };
+  t.after(() => {
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
+  });
+
+  process.env['OWENLOOP_CACHE_DIR'] = '/tmp/app-server-cache';
+  process.env['OWENLOOP_CONDUCTOR_ID'] = 'cond-app-server';
+  process.env['OWENLOOP_CREDENTIAL_COMMAND'] = '/bin/credential-helper';
+  process.env['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'] = '2500';
+  process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
+  process.env['OWENLOOP_SESSION'] = 'sess-app-server';
+  process.env['OWENLOOP_TOKEN'] = 'tok-app-server';
+  process.env['OWENLOOP_INVENTED_NEXT_PHASE'] = 'future-app-server';
+  process.env['OWENLOOP_CREDENTIAL_ORIGIN'] = 'origin-app-server';
+  process.env['OWENLOOP_CREDENTIAL_SLOT'] = 'slot-app-server';
+
+  const stub = useStub(t, 'refuse-initialize');
+  const err = await codexAdapter
+    .start(startArgs(undefined, { cwd: stub.dir }), () => {})
+    .then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+  assert.ok(err instanceof Error, 'the refusal makes the test wait until the stub recorded its env');
+
+  assert.deepEqual(stub.envSnapshot(), {
+    OWENLOOP_CACHE_DIR: '/tmp/app-server-cache',
+    OWENLOOP_CONDUCTOR_ID: 'cond-app-server',
+    OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
+    OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
+    OWENLOOP_NO_KEYCHAIN: '1',
+    OWENLOOP_SESSION: 'sess-app-server',
+    OWENLOOP_TOKEN: null,
+    OWENLOOP_INVENTED_NEXT_PHASE: null,
+    OWENLOOP_CREDENTIAL_ORIGIN: null,
+    OWENLOOP_CREDENTIAL_SLOT: null,
+  });
+});
 
 /** Poll until `cond` holds, or throw naming `what`. */
 async function waitFor(cond: () => boolean, what: string, ms = 5_000): Promise<void> {

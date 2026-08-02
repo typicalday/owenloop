@@ -47,10 +47,20 @@
  *
  * The only owenloop process a harness child spawns is the work-holder MCP mount
  * (`owenloop work hold --mcp`), whose argv is built by `src/agent/brief.ts`. Walking
- * the import graph from `src/roles/hold.ts` and collecting every `env['OWENLOOP_*']`
- * read yields exactly three names: `OWENLOOP_CONDUCTOR_ID` and `OWENLOOP_SESSION`
- * (both in `src/roles/hold.ts`), and `OWENLOOP_TOKEN` (in
- * `src/credentials/resolve.ts`), which is DENIED on purpose — see below.
+ * the import graph from `src/roles/hold.ts` and collecting every reachable
+ * `OWENLOOP_*` read yields these holder inputs:
+ *
+ *   - `OWENLOOP_CONDUCTOR_ID` and `OWENLOOP_SESSION` from `src/roles/hold.ts`;
+ *   - `OWENLOOP_CREDENTIAL_COMMAND`, `OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS`,
+ *     and `OWENLOOP_NO_KEYCHAIN` from `src/hub.ts:readStoredCredential()`;
+ *   - `OWENLOOP_TOKEN` from `src/credentials/resolve.ts`, which is DENIED on
+ *     purpose — see below.
+ *
+ * The three credential controls are admitted because the mounted holder uses
+ * them to select and configure its credential backend before the MCP server
+ * starts. `src/hub.ts:runCredentialCommand()` creates
+ * `OWENLOOP_CREDENTIAL_ORIGIN` and `OWENLOOP_CREDENTIAL_SLOT` internally, so
+ * those two helper-only names are not inherited from the harness parent.
  *
  * `OWENLOOP_CACHE_DIR` is admitted although it is NOT reachable from `hold`: it
  * is read by `resolveCacheDir` (`src/bundle/cache.ts`), which an agent reaches
@@ -83,6 +93,13 @@ export const ADMITTED_OWENLOOP_KEYS: ReadonlySet<string> = new Set([
   // `holdConductorId` — src/roles/hold.ts. The fallback when `--conductor=` is
   // absent from the mount's argv.
   'OWENLOOP_CONDUCTOR_ID',
+  // `readStoredCredential` — src/hub.ts. Selects the holder's external
+  // credential backend rather than falling through to keychain/file defaults.
+  'OWENLOOP_CREDENTIAL_COMMAND',
+  // `readStoredCredential` — src/hub.ts. Bounds the external credential helper.
+  'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
+  // `readStoredCredential` — src/hub.ts. Forces the 0600 file backend on macOS.
+  'OWENLOOP_NO_KEYCHAIN',
   // `holdSession` — src/roles/hold.ts. The fallback when `--session` is absent.
   'OWENLOOP_SESSION',
 ]);

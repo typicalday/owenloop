@@ -10,8 +10,8 @@
  *
  * The second half is what stops a future `OWENLOOP_*` variable from silently
  * flowing to harness children. The first half is what makes the whole design
- * safe: the credential variables a harness needs in order to start are not in
- * owenloop's namespace, so no edit to the admitted set can strand one.
+ * safe: the six explicitly consumed child inputs are admitted, while the bearer
+ * and helper-only credential names remain denied.
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -22,12 +22,19 @@ import {
   isAdmittedChildEnvKey,
 } from '../src/harness/child-env.ts';
 
-test('the admitted set is exactly the three names with a reachable child consumer', () => {
+test('the admitted set is exactly the six names with a reachable child consumer', () => {
   // Pinned as a LIST, not a count: growing this set is a deliberate act that
   // must show up in a diff next to the consumer that justifies it.
   assert.deepEqual(
     [...ADMITTED_OWENLOOP_KEYS].sort(),
-    ['OWENLOOP_CACHE_DIR', 'OWENLOOP_CONDUCTOR_ID', 'OWENLOOP_SESSION'],
+    [
+      'OWENLOOP_CACHE_DIR',
+      'OWENLOOP_CONDUCTOR_ID',
+      'OWENLOOP_CREDENTIAL_COMMAND',
+      'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
+      'OWENLOOP_NO_KEYCHAIN',
+      'OWENLOOP_SESSION',
+    ],
     'each admitted name needs a consumer a harness child can actually reach — ' +
       'see the derivation in src/harness/child-env.ts',
   );
@@ -36,6 +43,8 @@ test('the admitted set is exactly the three names with a reachable child consume
     false,
     'the dev-only hub bearer override is the whole point of the denial (item 5)',
   );
+  assert.equal(ADMITTED_OWENLOOP_KEYS.has('OWENLOOP_CREDENTIAL_ORIGIN'), false);
+  assert.equal(ADMITTED_OWENLOOP_KEYS.has('OWENLOOP_CREDENTIAL_SLOT'), false);
 });
 
 test('everything outside the OWENLOOP_ namespace passes through untouched', () => {
@@ -56,22 +65,29 @@ test('everything outside the OWENLOOP_ namespace passes through untouched', () =
   assert.deepEqual(filterOwenloopEnv(source), source);
 });
 
-test('inside the namespace the filter denies by default', () => {
+test('inside the namespace the six admitted inputs survive and everything else is denied', () => {
   const out = filterOwenloopEnv({
     OWENLOOP_CACHE_DIR: '/cache',
     OWENLOOP_CONDUCTOR_ID: 'cond-1',
+    OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
+    OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
+    OWENLOOP_NO_KEYCHAIN: '1',
     OWENLOOP_SESSION: 'sess-1',
     OWENLOOP_TOKEN: 'tok',
     OWENLOOP_ACCOUNT: 'acct',
     OWENLOOP_STATE_DIR: '/state',
     OWENLOOP_HARNESS: 'x',
-    OWENLOOP_LIVE_TESTS: '1',
+    OWENLOOP_CREDENTIAL_ORIGIN: 'https://helper.example',
+    OWENLOOP_CREDENTIAL_SLOT: 'agent:holder',
     // The case that matters most: a name nobody has thought of yet.
     OWENLOOP_INVENTED_NEXT_PHASE: 'surprise',
   });
   assert.deepEqual(out, {
     OWENLOOP_CACHE_DIR: '/cache',
     OWENLOOP_CONDUCTOR_ID: 'cond-1',
+    OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
+    OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
+    OWENLOOP_NO_KEYCHAIN: '1',
     OWENLOOP_SESSION: 'sess-1',
   });
 });
@@ -87,7 +103,21 @@ test('the filter copies rather than mutating, and uses delete rather than undefi
 });
 
 test('isAdmittedChildEnvKey agrees with the filter, name by name', () => {
-  for (const key of ['PATH', 'CLAUDE_CODE_OAUTH_TOKEN', 'OWENLOOP_SESSION', 'OWENLOOP_TOKEN', 'OWENLOOPISH']) {
+  for (const key of [
+    'PATH',
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'OWENLOOP_CACHE_DIR',
+    'OWENLOOP_CONDUCTOR_ID',
+    'OWENLOOP_CREDENTIAL_COMMAND',
+    'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
+    'OWENLOOP_NO_KEYCHAIN',
+    'OWENLOOP_SESSION',
+    'OWENLOOP_TOKEN',
+    'OWENLOOP_INVENTED_NEXT_PHASE',
+    'OWENLOOP_CREDENTIAL_ORIGIN',
+    'OWENLOOP_CREDENTIAL_SLOT',
+    'OWENLOOPISH',
+  ]) {
     const survived = key in filterOwenloopEnv({ [key]: 'v' });
     assert.equal(isAdmittedChildEnvKey(key), survived, `disagreement about '${key}'`);
   }
