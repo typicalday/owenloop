@@ -1264,7 +1264,7 @@ block; a non-2xx response comes back as an error result.
 | `publish_event` | publish an event against a contract, starting one run per matched subscription |
 | `list_subscriptions` | the org's contract subscriptions |
 | `presence_ping` | register/refresh this Shift's presence — name, crews served (empty/omitted `serve_crews` means every crew this principal belongs to), and optionally which process incarnation is reporting (`shift_id`/`started_at`); observability only, a separate mechanism from the `heartbeat` lease tool above |
-| `list_shifts` | your principal's registered Conductors — online/offline derived at read time from last ping, crews served (returned as `crews`; empty means every crew this principal belongs to), and each one's reporting incarnation (`shiftId`/`startedAt`) when the hub recorded one |
+| `list_shifts` | your principal's registered Shifts — online/offline derived at read time from last ping, crews served (returned as `crews`; empty means every crew this principal belongs to), and each one's reporting incarnation (`shiftId`/`startedAt`) when the hub recorded one |
 | `wake` | cheap "has anything changed since cursor X" pre-check for a polling loop |
 | `create_agent` | create a NEW Scoped Identity and store its credential locally — **never returns the token** |
 | `list_crews` | list the org's crews, each with its member rows inline — a plain passthrough, no filtering |
