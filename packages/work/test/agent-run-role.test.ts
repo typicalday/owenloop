@@ -42,11 +42,11 @@ test('parseArgs reads the positional order-id and both flag value forms', () => 
   assert.equal(p.heartbeatIntervalMs, 1500);
 });
 
-test('parseArgs pairs a bare run id with --workflow, and reads --conductor', () => {
-  const p = parseArgs(['run1', '--workflow', 'wf1', '--conductor=cnd_a']);
+test('parseArgs pairs a bare run id with --workflow, and reads --shift', () => {
+  const p = parseArgs(['run1', '--workflow', 'wf1', '--shift=shf_a']);
   assert.equal(p.orderId, 'run1');
   assert.equal(p.workflow, 'wf1');
-  assert.equal(p.conductor, 'cnd_a');
+  assert.equal(p.shift, 'shf_a');
 });
 
 test('parseArgs rejects a second positional and an unknown option', () => {
@@ -90,10 +90,10 @@ const TEMPLATE = [
   'order: __OWENLOOP_ORDER__',
   'origin: __OWENLOOP_ORIGIN__',
   'account: __OWENLOOP_ACCOUNT__',
-  'conductor: __OWENLOOP_CONDUCTOR__',
+  'shift: __OWENLOOP_SHIFT__',
 ].join('\n');
 
-function agentOrder(o: { claimed?: boolean; outcome?: string; worker?: string; command?: string } = {}): GetOrderResponse {
+function agentOrder(o: { claimed?: boolean; outcome?: string; executor?: string; command?: string } = {}): GetOrderResponse {
   return {
     text: '',
     workflow: 'wf1',
@@ -105,7 +105,7 @@ function agentOrder(o: { claimed?: boolean; outcome?: string; worker?: string; c
       key: 'k',
       inputs: [],
       outputs: [],
-      worker: o.worker ?? 'agent',
+      executor: o.executor ?? 'agent',
       command: o.command ?? '',
       prompt: '',
       consumes: {},
@@ -264,7 +264,7 @@ beforeEach(() => {
   process.env['OWENLOOP_CACHE_DIR'] = cacheDir;
   delete process.env['OWENLOOP_TOKEN'];
   delete process.env['OWENLOOP_ACCOUNT'];
-  delete process.env['OWENLOOP_CONDUCTOR_ID'];
+  delete process.env['OWENLOOP_SHIFT_ID'];
   // PHASE 4 wired the real adapters into the composition root, so importing this
   // role now fills the registry and the FIRST-REGISTERED default is a real
   // vendor adapter that would try to spawn a real process. Every test below that
@@ -347,7 +347,7 @@ test('run() builds an MCP mount whose args carry no credential', async () => {
   const { hub } = probeHub({ responses: [agentOrder(), agentOrder({ outcome: 'ok' })], def: DEF });
 
   const err: string[] = [];
-  const code = await run([...WIRE, '--conductor', 'cnd_1'], {
+  const code = await run([...WIRE, '--shift', 'shf_1'], {
     hub, signalHost: fakeSignalHost().host, holderId: 'host:123', cwd: '/work',
     out: () => {}, err: (l) => err.push(l),
   });
@@ -358,7 +358,7 @@ test('run() builds an MCP mount whose args carry no credential', async () => {
   const mcp = started.args.owenloopMcp;
   assert.deepEqual(mcp, {
     command: 'owenloop',
-    args: ['work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'default', '--conductor=cnd_1', '--mcp'],
+    args: ['work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'default', '--shift=shf_1', '--mcp'],
   });
   const flat = JSON.stringify(mcp);
   assert.ok(!flat.includes('olp_secret_value'), flat);
@@ -414,7 +414,7 @@ test('run() renders the brief from the cached template and passes the step permi
   seedBundle({ model: 'm-step', permissions: { tools: ['Read'], model: 'm-step', extensions: {} } });
   const { hub } = probeHub({ responses: [agentOrder(), agentOrder({ outcome: 'ok' })], def: DEF });
 
-  const code = await run([...WIRE, '--conductor', 'cnd_1'], {
+  const code = await run([...WIRE, '--shift', 'shf_1'], {
     hub, signalHost: fakeSignalHost().host, holderId: 'host:123', cwd: '/work', out: () => {}, err: () => {},
   });
   assert.equal(code, 0);
@@ -423,7 +423,7 @@ test('run() renders the brief from the cached template and passes the step permi
   assert.ok(started !== undefined && started.kind === 'start');
   assert.equal(
     started.args.brief,
-    'order: wf1/run1\norigin: https://hub.example\naccount: default\nconductor: cnd_1',
+    'order: wf1/run1\norigin: https://hub.example\naccount: default\nshift: shf_1',
   );
   // The permissions ride PRE-NORMALIZED on the step spec — no lookup, no key.
   assert.deepEqual(started.args.permissions.tools, ['Read']);
@@ -553,7 +553,7 @@ test('run() exits 1 when whats_next reports no def for the workflow', async () =
 test('run() releases a COMMAND order as a misroute and exits 1', async () => {
   useAdapter(createFakeAdapter({ id: 'fake' }));
   seedBundle();
-  const { hub, releases } = probeHub({ responses: [agentOrder({ worker: 'command', command: 'echo hi' }), noHold('ok')], def: DEF });
+  const { hub, releases } = probeHub({ responses: [agentOrder({ executor: 'command', command: 'echo hi' }), noHold('ok')], def: DEF });
   const err: string[] = [];
   const code = await run(WIRE, { hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: (l) => err.push(l) });
   assert.equal(code, 1);

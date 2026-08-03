@@ -17,7 +17,7 @@ import { inspectSettings, KNOWN_SETTINGS_KEYS } from '../settings/settings.ts';
 /** Built-in defaults shown for knobs absent from the file (else `unset`). */
 const DEFAULT_NOTE: Partial<Record<(typeof KNOWN_SETTINGS_KEYS)[number], string>> = {
   dispatchCap: '3',
-  commandRouting: 'proxy',
+  commandRouting: 'shift',
 };
 
 function errMsg(err: unknown): string {

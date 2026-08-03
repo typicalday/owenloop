@@ -27,7 +27,7 @@
  *            `OWENLOOP_ACCOUNT` (default `default`), with `OWENLOOP_TOKEN` as a
  *            documented dev-only override. A missing Scoped Identity key is a refuse
  *            (exit 2) naming the origin + a runnable `owenloop login` command. prepare
- *            has no `--as` flag — a Conductor sets `OWENLOOP_ACCOUNT` for a
+ *            has no `--as` flag — a Shift sets `OWENLOOP_ACCOUNT` for a
  *            non-default account.
  *   cache  — `OWENLOOP_CACHE_DIR` env → `settings.cacheDir` → XDG default.
  *

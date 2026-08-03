@@ -1,7 +1,7 @@
 /**
- * The self-driven proxy loop core (D2 dispatch split).
+ * The self-driven shift loop core (D2 dispatch split).
  *
- * `createProxyLoop` is a standing Conductor loop with every side-effecting
+ * `createShiftLoop` is a standing Shift loop with every side-effecting
  * dependency injected (hub client, spawner, sleep/clock, output streams, dirs),
  * so the same core can run behind the local shift daemon. Per iteration it: pings
  * presence when due → cheap `wake(cursor)` pre-check → only when something
@@ -18,7 +18,7 @@
  *    hosts the step agent itself through a harness adapter. It reads the step's
  *    normalized spec straight out of the bundle cache and renders the brief in
  *    process.
- *  - The proxy makes NO first-contact `get_order` for any kind. It holds no
+ *  - The shift makes NO first-contact `get_order` for any kind. It holds no
  *    leases; the spawned child makes first contact and closes the B2 pickup
  *    window. A failed hand-off lapses back via that window instead of sitting
  *    claimed.
@@ -44,9 +44,9 @@
  * Everything downstream keys records by `bundle.def.hash`, so a pinned bundle
  * flows through `ChildRecord.hash` untouched.
  *
- * LIVE SHIFT IDENTITY: `name`/`servePools` on `ProxyLoopOptions` are INITIAL
+ * LIVE SHIFT IDENTITY: `name`/`serveCrews` on `ShiftLoopOptions` are INITIAL
  * values only. The loop holds them as live closure state (`getShift`/`setShift`
- * on `ProxyLoop`) so the shift socket's `clock_in` operation can change what a
+ * on `ShiftLoop`) so the shift socket's `clock_in` operation can change what a
  * shift is called and which crews it serves without rebuilding the loop —
  * `setShift` also resets the presence timer so the new identity reaches the hub
  * on the very next `iterate()`.
@@ -67,9 +67,9 @@ import {
 import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../agent/workdir.ts';
 import { sessionsPath } from '../harness/session-store.ts';
 import type { Spawner } from './spawn.ts';
-import type { ShiftEvent } from '../shift/protocol.ts';
+import type { ShiftEvent } from './protocol.ts';
 
-export interface ProxyLoopOptions {
+export interface ShiftLoopOptions {
   hub: HubClient;
   spawner: Spawner;
   /** Injected sleep — tests pass an instant/scriptable stub (no real timers). */
@@ -86,20 +86,20 @@ export interface ProxyLoopOptions {
   stateDir: string;
   /** Max concurrent in-flight orders (exec + agent-run children). */
   cap: number;
-  /** Serve pools this proxy accepts (sent to presence + whats_next). INITIAL
-   *  value only — live-mutable via the `ProxyLoop.setShift` (MCP `clock_in`). */
-  servePools: string[];
-  /** Conductor name for presence. INITIAL value only — live-mutable via
-   *  `ProxyLoop.setShift` (MCP `clock_in`). */
+  /** Serve crews this shift accepts (sent to presence + whats_next). INITIAL
+   *  value only — live-mutable via the `ShiftLoop.setShift` (MCP `clock_in`). */
+  serveCrews: string[];
+  /** Shift name for presence. INITIAL value only — live-mutable via
+   *  `ShiftLoop.setShift` (MCP `clock_in`). */
   name: string;
   /**
-   * W7: this Conductor process incarnation's self-declared id (`cnd_<uuid>`)
+   * W7: this Shift process incarnation's self-declared id (`shf_<uuid>`)
    * and process start time — carried on presence pings (attribution/
    * observability only, D8/INV-82) and carried into dispatched holders/orders
-   * so submissions can be traced back to the Conductor that produced them.
+   * so submissions can be traced back to the Shift that produced them.
    * Regenerated every restart, never persisted (D1).
    */
-  conductorId?: string;
+  shiftId?: string;
   startedAt?: number;
   /** When set, poll only this instance; else inbox-mode across all servable. */
   workflow?: string;
@@ -116,7 +116,7 @@ export interface ProxyLoopOptions {
   /**
    * PHASE 4 — the root under which per-RUN agent work directories live
    * (`<workRoot>/<workflow>/<run>/`). ABSENT DISABLES THE REAPER entirely: with
-   * no root there is no set of directories this proxy can claim to own, and a
+   * no root there is no set of directories this shift can claim to own, and a
    * remover with no ownership claim is exactly what must not exist.
    */
   workRoot?: string;
@@ -146,7 +146,7 @@ interface SweepResult {
   openRuns: Set<string>;
 }
 
-export interface ProxyLoop {
+export interface ShiftLoop {
   run(): Promise<number>;
   stop(): void;
   /**
@@ -162,15 +162,15 @@ export interface ProxyLoop {
   getCap(): number;
   /** Adjust the live dispatch cap for internal callers and tests. */
   setCap(cap: number): void;
-  /** The shift's live identity: the presence name and the crew scope (`serve_pools`)
-   *  the next ping and the next sweep will carry. Empty `servePools` means ALL of
+  /** The shift's live identity: the presence name and the crew scope (`serve_crews`)
+   *  the next ping and the next sweep will carry. Empty `serveCrews` means ALL of
    *  this identity's crews, never none. */
-  getShift(): { name: string; servePools: string[] };
+  getShift(): { name: string; serveCrews: string[] };
   /** Set the live shift identity (the socket `clock_in` operation). A field left ABSENT is
-   *  left unchanged; `servePools: []` explicitly means "all crews". Also makes the
+   *  left unchanged; `serveCrews: []` explicitly means "all crews". Also makes the
    *  next presence ping due immediately, so the new identity reaches the hub on the
    *  next iterate() rather than up to presenceIntervalMs later. Returns the result. */
-  setShift(next: { name?: string; servePools?: string[] }): { name: string; servePools: string[] };
+  setShift(next: { name?: string; serveCrews?: string[] }): { name: string; serveCrews: string[] };
   /** Record local client attendance and make the next presence ping due. */
   noteAttended(at: number): void;
   /** Return the last accepted attendance timestamp, if any. */
@@ -178,9 +178,9 @@ export interface ProxyLoop {
   /**
    * Run-ended reap (metering condition (a)): drop the in-flight record for
    * `run` NOW, so its slot frees immediately instead of waiting for the next
-   * reconcile to notice the child exited. The proxy's MCP `submit` tool calls
+   * reconcile to notice the child exited. The shift's MCP `submit` tool calls
    * an internal caller may use this when the hub reports a submit CLOSED the
-   * run — the one in-process end-of-run signal the proxy sees. A run whose closing submit went through
+   * run — the one in-process end-of-run signal the shift sees. A run whose closing submit went through
    * the child's own mount instead is not a problem: that child exits, and the
    * next reconcile's pid probe frees the slot anyway.
    */
@@ -206,7 +206,7 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
+export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   let stopped = false;
   let cap = opts.cap;
   const isAlive = opts.isAlive;
@@ -214,7 +214,7 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
   // which are now INITIAL values only. Arrays are copied so neither the loop
   // nor a caller of getShift/setShift can mutate the other's state afterward.
   let shiftName = opts.name;
-  let servePools = [...opts.servePools];
+  let serveCrews = [...opts.serveCrews];
 
   // Park state persists across `iterate()` calls (the MCP park reuses it).
   let cursor: number | undefined;
@@ -264,8 +264,8 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
      * deliberately left out, because a failed call is not evidence that a run
      * has no open order, and the reaper must never treat silence as absence.
      * `openRuns` is every run those calls reported an order for, including ones
-     * this proxy declined to dispatch (capacity, routing, an in-flight runner):
-     * an order the proxy left alone is still an open order, and its run's work
+     * this shift declined to dispatch (capacity, routing, an in-flight runner):
+     * an order the shift left alone is still an open order, and its run's work
      * directory must survive.
      */
     const polled = new Set<string>();
@@ -307,7 +307,7 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
     for (const wf of instances) {
       let res;
       try {
-        res = await opts.hub.whatsNext({ workflow: wf, serve_pools: servePools });
+        res = await opts.hub.whatsNext({ workflow: wf, serve_crews: serveCrews });
       } catch (e) {
         opts.err(`whats_next for ${wf} failed: ${errMsg(e)}`);
         continue;
@@ -337,7 +337,7 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
           const r = resolveCommandRouting(opts.commandRouting, step);
           for (const w of r.warnings) opts.err(`[${wf}/${order.run}] ${w}`);
           if (!r.autoDispatch) {
-            opts.out(`[${wf}/${order.run}] command step '${order.step}' routed to Conductor — leaving for pickup window`);
+            opts.out(`[${wf}/${order.run}] command step '${order.step}' routed to Shift — leaving for pickup window`);
             continue;
           }
           if (remaining <= 0) continue; // out of free capacity for new work
@@ -471,7 +471,7 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
    *  - `liveRunIds` = the runs of live `agent-run` records, pid-probed by
    *    `reconcileInFlight`. Only `agent-run` records are counted: those are the
    *    only children that hold a work directory — an `exec` child works in the
-   *    proxy's own cwd.
+   *    shift's own cwd.
    *
    * The fourth input is `sessionsFile`: `<cacheDir>/sessions.jsonl`, the same
    * path `owenloop work agent-run` writes its session records to (`src/roles/
@@ -510,13 +510,13 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
   }
 
   async function iteration(): Promise<number> {
-    // Presence when due (starts immediately — this proxy exists to conduct).
+    // Presence when due (starts immediately — this shift exists to conduct).
     if (opts.now() - lastPresence >= opts.presenceIntervalMs) {
       try {
         await opts.hub.presencePing({
           name: shiftName,
-          serve_pools: servePools,
-          ...(opts.conductorId !== undefined ? { conductor_id: opts.conductorId } : {}),
+          serve_crews: serveCrews,
+          ...(opts.shiftId !== undefined ? { shift_id: opts.shiftId } : {}),
           ...(opts.startedAt !== undefined ? { started_at: opts.startedAt } : {}),
           ...(attendedAt !== undefined ? { attended_at: attendedAt } : {}),
         });
@@ -595,12 +595,12 @@ export function createProxyLoop(opts: ProxyLoopOptions): ProxyLoop {
     setCap: (next: number) => {
       cap = next;
     },
-    getShift: () => ({ name: shiftName, servePools: [...servePools] }),
-    setShift: (next: { name?: string; servePools?: string[] }) => {
+    getShift: () => ({ name: shiftName, serveCrews: [...serveCrews] }),
+    setShift: (next: { name?: string; serveCrews?: string[] }) => {
       if (next.name !== undefined) shiftName = next.name;
-      if (next.servePools !== undefined) servePools = [...next.servePools];
+      if (next.serveCrews !== undefined) serveCrews = [...next.serveCrews];
       lastPresence = Number.NEGATIVE_INFINITY; // D6: next iterate() pings immediately
-      return { name: shiftName, servePools: [...servePools] };
+      return { name: shiftName, serveCrews: [...serveCrews] };
     },
     noteAttended: (at: number) => {
       attendedAt = at;

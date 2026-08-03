@@ -175,7 +175,7 @@ function loadSteps(target: string): FetchedStep[] {
 
 /**
  * Pull a loose `FetchedStep[]` out of a def-like object (only name + model +
- * worker + the harness carrier are needed).
+ * executor + the harness carrier are needed).
  *
  * The carrier is lifted by `parseHarnessCarrier`, the SAME function the def
  * parser uses, so lint and prepare cannot disagree about what `x.harness` means.

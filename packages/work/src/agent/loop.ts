@@ -138,8 +138,8 @@ export interface AgentRunLoopOptions {
   origin: string;
   /** Scoped Identity account — rides the mounted work-holder's `--as`. */
   account: string;
-  /** Advisory Conductor attribution — rides `--conductor=<cid>` (may be absent). */
-  conductorId?: string;
+  /** Advisory Shift attribution — rides `--shift=<cid>` (may be absent). */
+  shiftId?: string;
   /** cwd for the step agent when the order packet carries no `workdir`. */
   cwd: string;
   loadStep: StepLoader;
@@ -417,7 +417,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     if (first.t === 'lease') return mapNoHold(first.o);
 
     const packet = first.res.order;
-    if (packet === null || packet.worker === 'command' || (typeof packet.command === 'string' && packet.command !== '')) {
+    if (packet === null || packet.executor === 'command' || (typeof packet.command === 'string' && packet.command !== '')) {
       opts.err(`owenloop work agent-run: ${order} is not an agent order (misroute) — releasing`);
       return releaseWith('misroute', 'misroute');
     }
@@ -460,7 +460,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       run: runId,
       origin: opts.origin,
       account: opts.account,
-      ...(opts.conductorId !== undefined ? { conductorId: opts.conductorId } : {}),
+      ...(opts.shiftId !== undefined ? { shiftId: opts.shiftId } : {}),
     };
     // Permissions arrive PRE-NORMALIZED in the spec. `prepare` ran
     // `normalizeStepPermissions` over the step's `x.harness` options at cache

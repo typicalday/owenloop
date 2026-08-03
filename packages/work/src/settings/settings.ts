@@ -20,35 +20,35 @@ import { join } from 'node:path';
  * Each field is the lowest-precedence fallback for a role option (a CLI flag
  * or env var always wins over it):
  *   - `hubOrigin`      — default hub origin when `--origin` is omitted
- *     (prepare, proxy, hold, exec, release).
+ *     (prepare, shift, hold, exec, release).
  *   - `cacheDir`       — bundle cache root; overrides the XDG default
  *     (see bundle/cache.ts).
- *   - `stateDir`       — proxy in-flight state dir; overrides the XDG default
+ *   - `stateDir`       — shift in-flight state dir; overrides the XDG default
  *     (below `OWENLOOP_STATE_DIR`).
- *   - `dispatchCap`    — proxy max in-flight exec children; below `--cap`,
+ *   - `dispatchCap`    — shift max in-flight exec children; below `--cap`,
  *     above the built-in default of 3. A positive integer.
- *   - `commandRouting` — who runs `worker: 'command'` steps this machine sees.
+ *   - `commandRouting` — who runs `executor: 'command'` steps this machine sees.
  */
 export interface Settings {
   /** Default hub origin when `--origin` is omitted. */
   hubOrigin?: string;
   /** Bundle cache root; overrides the XDG default (see bundle/cache.ts). */
   cacheDir?: string;
-  /** Proxy in-flight state dir; fallback below `--state-dir`/env. */
+  /** Shift in-flight state dir; fallback below `--state-dir`/env. */
   stateDir?: string;
-  /** Proxy dispatch cap (positive integer); fallback below `--cap`, default 3. */
+  /** Shift dispatch cap (positive integer); fallback below `--cap`, default 3. */
   dispatchCap?: number;
   /**
-   * Who runs `worker: 'command'` steps this machine sees: `'proxy'` (default)
-   * lets the proxy auto-dispatch them; `'conductor'` leaves them for a human/
-   * session to pick up via the pickup window. The C3 proxy is the only reader.
+   * Who runs `executor: 'command'` steps this machine sees: `'shift'` (default)
+   * lets the shift auto-dispatch them; `'manual'` leaves them for a human/
+   * session to pick up via the pickup window. The C3 shift is the only reader.
    * A per-step `x.owenloop.routing` override can tighten (never loosen) this —
-   * most restrictive wins (see src/proxy/routing.ts).
+   * most restrictive wins (see src/shift/routing.ts).
    */
-  commandRouting?: 'proxy' | 'conductor';
+  commandRouting?: 'shift' | 'manual';
   /**
    * Max in-flight `agent-run` children (positive integer, default 4 —
-   * `DEFAULT_MAX_AGENTS` in `src/roles/proxy.ts`). A SEPARATE
+   * `DEFAULT_MAX_AGENTS` in `src/roles/shift.ts`). A SEPARATE
    * budget from `dispatchCap`, which meters `exec` children — an agent turn is
    * long and memory-heavy where a command is short, so one number cannot serve
    * both. Fallback below `--max-agents`.
@@ -80,7 +80,7 @@ export interface Settings {
    * LOCALLY OPT-IN, deliberately. Nothing in `src/bundle/types.ts` or
    * `src/hub/types.ts` lets a workflow declare a repo, and adding one would be a
    * hub protocol change — an explicit non-goal. So worktree mode is a property
-   * of the MACHINE running the proxy, not of the workflow.
+   * of the MACHINE running the shift, not of the workflow.
    */
   workRepo?: string;
 }
@@ -166,7 +166,7 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
   }
   if ('commandRouting' in obj) {
     const v = obj['commandRouting'];
-    if (v !== 'proxy' && v !== 'conductor') throw bad('commandRouting', "'proxy' or 'conductor'", v);
+    if (v !== 'shift' && v !== 'manual') throw bad('commandRouting', "'shift' or 'manual'", v);
   }
 
   const known = new Set<string>(KNOWN_SETTINGS_KEYS);

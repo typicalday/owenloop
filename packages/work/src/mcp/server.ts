@@ -14,7 +14,7 @@
  * `write(msg)`. Unit tests feed lines and inspect writes with no child process;
  * `pumpStdin` wires the real `process.stdin`/`process.stdout` in the roles.
  *
- * Supported methods (the subset the Conductor + work-holder need):
+ * Supported methods (the subset the Shift + work-holder need):
  *   - `initialize`            → capabilities `{tools:{}}`, serverInfo, and the
  *                               agreed protocolVersion (echo the client's when
  *                               recognized, else answer with ours).

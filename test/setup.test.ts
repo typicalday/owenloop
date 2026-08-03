@@ -222,9 +222,9 @@ test('setup: succession prompt (Flow B) renders verbatim framing and rekeys the 
   const day = 86_400_000;
   const { routes, state } = makeIdentityHub({
     identities: [
-      { id: 'agent_mbp', name: 'alexs-mbp', pools: ['alex-personal'], lastContactAt: Date.now() - 4 * day },
-      { id: 'agent_hermes', name: 'hermes-worker', pools: ['logistics'], lastContactAt: Date.now() - 2 * 60_000 },
-      { id: 'agent_never', name: 'idle-box', pools: ['spare'], lastContactAt: null },
+      { id: 'agent_mbp', name: 'alexs-mbp', crews: ['alex-personal'], lastContactAt: Date.now() - 4 * day },
+      { id: 'agent_hermes', name: 'hermes-worker', crews: ['logistics'], lastContactAt: Date.now() - 2 * 60_000 },
+      { id: 'agent_never', name: 'idle-box', crews: ['spare'], lastContactAt: null },
     ],
   });
   const { fetch, calls } = routedFetch(routes);
@@ -242,8 +242,8 @@ test('setup: succession prompt (Flow B) renders verbatim framing and rekeys the 
   assert.match(q, /last active 4d ago/);
   assert.match(q, /last active 2m ago/);
   assert.match(q, /last active never/, 'null-both identity renders never');
-  assert.match(q, /pools: alex-personal/);
-  assert.match(q, /pools: logistics/);
+  assert.match(q, /crews: alex-personal/);
+  assert.match(q, /crews: logistics/);
   assert.match(q, /⚠ "Replace" revokes/);
   assert.match(q, /disconnected there/);
 
@@ -262,10 +262,10 @@ test('setup: succession prompt (Flow B) renders verbatim framing and rekeys the 
 
 // ---- explicit bypass flags --------------------------------------------------
 
-test('setup --replace-agent: prompt-free rekey; unknown name errors; --pools is a usage error', async () => {
+test('setup --replace-agent: prompt-free rekey; unknown name errors; --crews is a usage error', async () => {
   // (a) a valid replace, no prompt injected — proves the flag path never prompts.
   {
-    const { routes, state } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', pools: ['ops'], token: { plaintext: 'olp_worker_live' } }] });
+    const { routes, state } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_worker_live' } }] });
     const { fetch, calls } = routedFetch(routes);
     const t = makeIo({ fetch }); // NO prompt seam
     seedHuman(t.store);
@@ -281,7 +281,7 @@ test('setup --replace-agent: prompt-free rekey; unknown name errors; --pools is 
 
   // (b) an unknown --replace-agent name errors listing the available names, no rekey.
   {
-    const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', pools: [] }] });
+    const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: [] }] });
     const { fetch, calls } = routedFetch(routes);
     const t = makeIo({ fetch });
     seedHuman(t.store);
@@ -293,38 +293,38 @@ test('setup --replace-agent: prompt-free rekey; unknown name errors; --pools is 
     assertNoOlp(t);
   }
 
-  // (c) --replace-agent + --pools is a usage error before any network.
+  // (c) --replace-agent + --crews is a usage error before any network.
   {
-    const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', pools: [] }] });
+    const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: [] }] });
     const { fetch, calls } = routedFetch(routes);
     const t = makeIo({ fetch });
     seedHuman(t.store);
 
-    assert.equal(await mainAsync(['setup', '--hub', HUB, '--replace-agent', 'worker', '--pools', 'a'], t.io), 1);
-    assert.match(t.err.join('\n'), /--pools cannot be combined with --replace-agent/);
+    assert.equal(await mainAsync(['setup', '--hub', HUB, '--replace-agent', 'worker', '--crews', 'a'], t.io), 1);
+    assert.match(t.err.join('\n'), /--crews cannot be combined with --replace-agent/);
     assert.equal(calls.length, 0, 'no network touched before the usage error');
     assertNoOlp(t);
   }
 });
 
-test('setup --new-agent with a non-empty org: mint path forwards --pools, no prompt', async () => {
-  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_x', name: 'other', pools: ['team'] }] });
+test('setup --new-agent with a non-empty org: mint path forwards --crews, no prompt', async () => {
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_x', name: 'other', crews: ['team'] }] });
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch }); // NO prompt seam — --new-agent must not prompt
   seedHuman(t.store);
 
-  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'fresh', '--pools', 'a,b'], t.io), 0, t.err.join('\n'));
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'fresh', '--crews', 'a,b'], t.io), 0, t.err.join('\n'));
   const mint = calls.find((c) => c.pathname === '/api/mint_agent_token');
   assert.ok(mint, 'mint called');
   const body = JSON.parse(mint!.body!);
   assert.equal(body.name, 'fresh');
-  assert.deepEqual(body.pools, ['a', 'b'], '--pools forwarded to the mint body');
+  assert.deepEqual(body.crews, ['a', 'b'], '--crews forwarded to the mint body');
   assert.ok(t.store.get(kcKey(ORIGIN, { principal: 'agent', account: 'fresh' })), 'agent:fresh stored');
   assertNoOlp(t);
 });
 
 test('setup --new-agent: --scopes forwards into the mint body', async () => {
-  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_x', name: 'other', pools: ['team'] }] });
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_x', name: 'other', crews: ['team'] }] });
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch }); // NO prompt seam — --new-agent must not prompt
   seedHuman(t.store);
@@ -339,7 +339,7 @@ test('setup --new-agent: --scopes forwards into the mint body', async () => {
 });
 
 test('setup --replace-agent + --scopes is a usage error before any network', async () => {
-  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', pools: [] }] });
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: [] }] });
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch });
   seedHuman(t.store);
@@ -353,7 +353,7 @@ test('setup --replace-agent + --scopes is a usage error before any network', asy
 // ---- non-interactive guard --------------------------------------------------
 
 test('setup: identities exist, no flags, no prompt seam → CliError naming both bypass flags, no mint/rekey', async () => {
-  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_x', name: 'other', pools: [] }] });
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_x', name: 'other', crews: [] }] });
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch }); // no prompt; test stdin is not a TTY
   seedHuman(t.store);
@@ -378,7 +378,7 @@ test('sanitizeAgentName: lowercases, strips out-of-class chars, strips leading n
 
 test('lastActiveMs: max of the two non-null timestamps, or null when both absent', () => {
   const base = (over: Partial<AgentIdentitySummary>): AgentIdentitySummary => ({
-    id: 'i', name: 'n', disabled: false, pools: [], lastContactAt: null, lastUsedAt: null, ...over,
+    id: 'i', name: 'n', disabled: false, crews: [], lastContactAt: null, lastUsedAt: null, ...over,
   });
   assert.equal(lastActiveMs(base({})), null);
   assert.equal(lastActiveMs(base({ lastContactAt: 100 })), 100);
@@ -396,12 +396,12 @@ test('formatLastActive: minutes/hours/days/just now/never', () => {
   assert.equal(formatLastActive(4 * 86_400_000), '4d ago');
 });
 
-test('asAgentIdentities: rejects malformed shapes, tolerates absent timestamps/pools', () => {
+test('asAgentIdentities: rejects malformed shapes, tolerates absent timestamps/crews', () => {
   assert.throws(() => asAgentIdentities({}), /expected an `identities` array/);
   assert.throws(() => asAgentIdentities({ identities: [{ name: 'x' }] }), /missing non-empty string id/);
   assert.throws(() => asAgentIdentities({ identities: [{ id: 'a', name: 'x', lastUsedAt: 'soon' }] }), /lastUsedAt must be a number or null/);
   const ok = asAgentIdentities({ identities: [{ id: 'a', name: 'x' }] });
-  assert.deepEqual(ok, [{ id: 'a', name: 'x', disabled: false, pools: [], lastContactAt: null, lastUsedAt: null }]);
+  assert.deepEqual(ok, [{ id: 'a', name: 'x', disabled: false, crews: [], lastContactAt: null, lastUsedAt: null }]);
 });
 
 test('asRekeyAgentTokenOk: field-name-only errors never echo an olp_ value from the body', () => {

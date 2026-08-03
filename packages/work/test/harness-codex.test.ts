@@ -791,7 +791,7 @@ test('C15 the mount carries the ADMITTED owenloop environment, and nothing else'
   });
 
   process.env['OWENLOOP_SESSION'] = 'sess-c15';
-  process.env['OWENLOOP_CONDUCTOR_ID'] = 'cond-c15';
+  process.env['OWENLOOP_SHIFT_ID'] = 'cond-c15';
   process.env['OWENLOOP_CACHE_DIR'] = '/tmp/fixture-cache';
   process.env['OWENLOOP_CREDENTIAL_COMMAND'] = '/bin/credential-helper';
   process.env['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'] = '2500';
@@ -811,7 +811,7 @@ test('C15 the mount carries the ADMITTED owenloop environment, and nothing else'
       .mcp_servers.owenloop;
     // The admitted set travels — this is the identity `hold --mcp` reads.
     assert.equal(mount.env['OWENLOOP_SESSION'], 'sess-c15');
-    assert.equal(mount.env['OWENLOOP_CONDUCTOR_ID'], 'cond-c15');
+    assert.equal(mount.env['OWENLOOP_SHIFT_ID'], 'cond-c15');
     assert.equal(mount.env['OWENLOOP_CACHE_DIR'], '/tmp/fixture-cache');
     assert.equal(mount.env['OWENLOOP_CREDENTIAL_COMMAND'], '/bin/credential-helper');
     assert.equal(mount.env['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'], '2500');
@@ -997,7 +997,7 @@ const spec = ${JSON.stringify(spec)};
 writeFileSync(spec.pidFile, String(process.pid));
 const envKeys = [
   'OWENLOOP_CACHE_DIR',
-  'OWENLOOP_CONDUCTOR_ID',
+  'OWENLOOP_SHIFT_ID',
   'OWENLOOP_CREDENTIAL_COMMAND',
   'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
   'OWENLOOP_NO_KEYCHAIN',
@@ -1194,7 +1194,7 @@ test('D4 the app-server spawn applies the same six-name filter as the mount', as
   });
 
   process.env['OWENLOOP_CACHE_DIR'] = '/tmp/app-server-cache';
-  process.env['OWENLOOP_CONDUCTOR_ID'] = 'cond-app-server';
+  process.env['OWENLOOP_SHIFT_ID'] = 'cond-app-server';
   process.env['OWENLOOP_CREDENTIAL_COMMAND'] = '/bin/credential-helper';
   process.env['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'] = '2500';
   process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
@@ -1215,7 +1215,7 @@ test('D4 the app-server spawn applies the same six-name filter as the mount', as
 
   assert.deepEqual(stub.envSnapshot(), {
     OWENLOOP_CACHE_DIR: '/tmp/app-server-cache',
-    OWENLOOP_CONDUCTOR_ID: 'cond-app-server',
+    OWENLOOP_SHIFT_ID: 'cond-app-server',
     OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
     OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
     OWENLOOP_NO_KEYCHAIN: '1',

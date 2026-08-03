@@ -44,8 +44,8 @@ test('parseNextArgs defaults to 90 seconds and converts finite non-negative seco
 
 test('state-dir and start parser preserve explicit crews versus --all and reject no crews', () => {
   assert.deepEqual(parseStateDirArgs(['--state-dir=/tmp/state']), { stateDir: '/tmp/state' });
-  assert.deepEqual(parseStartArgs(['alpha', 'alpha', ' beta ']).servePools, ['alpha', 'beta']);
-  assert.deepEqual(parseStartArgs(['--all']).servePools, []);
+  assert.deepEqual(parseStartArgs(['alpha', 'alpha', ' beta ']).serveCrews, ['alpha', 'beta']);
+  assert.deepEqual(parseStartArgs(['--all']).serveCrews, []);
   assert.match(parseStartArgs([]).error!, /at least one crew.*--all/);
   assert.match(parseStartArgs(['--all', 'alpha']).error!, /cannot be combined/);
 });
@@ -59,12 +59,12 @@ test('requestShift sends one JSON line and parses a fragmented live response', a
       if (!raw.includes('\n')) return;
       assert.deepEqual(JSON.parse(raw), { op: 'status' });
       socket.write('{"name":"box",');
-      setTimeout(() => socket.end('"serve_pools":[],"cap":2,"free":2,"running":0,"attended_at":null,"started_at":1}\n'), 1);
+      setTimeout(() => socket.end('"serve_crews":[],"cap":2,"free":2,"running":0,"attended_at":null,"started_at":1}\n'), 1);
     });
   });
   try {
     assert.deepEqual(await requestShift(path, { op: 'status' }), {
-      name: 'box', serve_pools: [], cap: 2, free: 2, running: 0, attended_at: null, started_at: 1,
+      name: 'box', serve_crews: [], cap: 2, free: 2, running: 0, attended_at: null, started_at: 1,
     });
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -100,7 +100,7 @@ test('requestShift rejects malformed daemon JSON and oversized requests', async 
   const server = createServer((socket) => socket.end('{"ok":true}\n', () => socket.destroy()));
   await new Promise<void>((resolve) => server.listen(path, resolve));
   try {
-    const huge = { op: 'clock_in' as const, name: 'n'.repeat(70_000), serve_pools: [] };
+    const huge = { op: 'clock_in' as const, name: 'n'.repeat(70_000), serve_crews: [] };
     await assert.rejects(() => requestShift(path, huge), /request is too large/);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));

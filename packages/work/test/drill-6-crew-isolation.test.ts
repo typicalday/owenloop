@@ -1,31 +1,31 @@
 /**
- * DRILL 6 — pool isolation across two concurrent conductors (WO-6.2, M4).
+ * DRILL 6 — crew isolation across two concurrent shifts (WO-6.2, M4).
  *
- * The M4 multi-principal property: two real `owenloop shift start` conductors,
- * each serving a DIFFERENT pool (`A` vs `B`) and authenticating
+ * The M4 multi-principal property: two real `owenloop shift start` shifts,
+ * each serving a DIFFERENT crew (`A` vs `B`) and authenticating
  * with a DIFFERENT stored-credential account (`--as a` vs `b`, no
  * `OWENLOOP_TOKEN`), park against ONE mock hub over ONE split run (`wf1/run1`,
- * step `alpha` on pool A + step `beta` on pool B). We assert each conductor
- * claims/dispatches ONLY its own pool's step, never the other's; that the
- * recorded hub-request log shows ZERO cross-pool claims (a post-hoc audit that
- * binds each bearer to its pool); and that each authenticated with its own
+ * step `alpha` on crew A + step `beta` on crew B). We assert each shift
+ * claims/dispatches ONLY its own crew's step, never the other's; that the
+ * recorded hub-request log shows ZERO cross-crew claims (a post-hoc audit that
+ * binds each bearer to its crew); and that each authenticated with its own
  * stored credential.
  *
- * The mock hub scripts the hub's `serve_pools` narrowing directly: a
- * `whats_next` sweep is served `alpha` iff it carries pool A, `beta` iff it
- * carries pool B, `[]` otherwise. That deterministic routing plus the recorded
- * per-request `auth` + `serve_pools` is what makes the cross-pool audit airtight
+ * The mock hub scripts the hub's `serve_crews` narrowing directly: a
+ * `whats_next` sweep is served `alpha` iff it carries crew A, `beta` iff it
+ * carries crew B, `[]` otherwise. That deterministic routing plus the recorded
+ * per-request `auth` + `serve_crews` is what makes the cross-crew audit airtight
  * — the shared `startMockHub` helper is untouched; the audit is done post-hoc
  * over its `reqs` log.
  *
  * HONEST BOUNDARY (mock vs. live, owenloop-side vs. hub enforcement):
  * This proves OWENLOOP'S side — given a correctly-narrowing hub, owenloop sends
- * its configured pools on the wire, claims only its pool, and never reaches
- * across, even with two conductors on one hub. It does NOT prove server-enforced
+ * its configured crews on the wire, claims only its crew, and never reaches
+ * across, even with two shifts on one hub. It does NOT prove server-enforced
  * isolation: the mock hub only SIMULATES the hub's membership check + narrowing
- * that makes a cross-pool claim fail server-side. That true enforcement (and the
+ * that makes a cross-crew claim fail server-side. That true enforcement (and the
  * real hub audit log) is owned by the hub's own WO-4.1 tests and by the manual
- * live two-conductor demo in `drills/README.md`. Metering-cap enforcement is
+ * live two-shift demo in `drills/README.md`. Metering-cap enforcement is
  * likewise hub-side and not owenloop-observable, so it is not asserted here (see
  * the runbook) — owenloop's `--cap` is a separate LOCAL concurrency knob.
  *
@@ -39,7 +39,7 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import { writeBundle } from '../src/bundle/cache.ts';
-import { readChildRecords } from '../src/proxy/state.ts';
+import { readChildRecords } from '../src/shift/state.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import type { WorkOrder } from '../src/hub/types.ts';
@@ -49,27 +49,27 @@ import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
 import {
   fixtureEnv,
   seedCredentialStore,
-  POOL_A_ACCOUNT,
-  POOL_A_AUTH,
-  POOL_A_TOKEN,
-  POOL_B_ACCOUNT,
-  POOL_B_AUTH,
-  POOL_B_TOKEN,
+  CREW_A_ACCOUNT,
+  CREW_A_AUTH,
+  CREW_A_TOKEN,
+  CREW_B_ACCOUNT,
+  CREW_B_AUTH,
+  CREW_B_TOKEN,
 } from './helpers/credential-fixture.ts';
 
-// One def, two agent steps — `alpha` served to pool A, `beta` to pool B.
-const DEF_NAME = 'pooldemo';
-const DEF_HASH = 'poolhash00000000';
+// One def, two agent steps — `alpha` served to crew A, `beta` to crew B.
+const DEF_NAME = 'crewdemo';
+const DEF_HASH = 'crewhash00000000';
 
 /** The harness-module test seam target, as an absolute path. */
 const FAKE_HARNESS = fileURLToPath(new URL('./fixtures/fake-harness.mjs', import.meta.url));
 
-/** A minimal agent step (no `worker: 'command'`) → dispatched to an agent-run child. */
+/** A minimal agent step (no `executor: 'command'`) → dispatched to an agent-run child. */
 function step(name: string): { name: string; body: string } {
   return { name, body: `run the ${name} step` };
 }
 
-/** One split run: same run, `alpha` on pool A and `beta` on pool B. */
+/** One split run: same run, `alpha` on crew A and `beta` on crew B. */
 function order(stepName: string): WorkOrder {
   return {
     workflow: 'wf1',
@@ -87,15 +87,15 @@ function order(stepName: string): WorkOrder {
 const ALPHA = order('alpha');
 const BETA = order('beta');
 
-/** Per-conductor isolated fs roots. */
-interface Conductor {
+/** Per-shift isolated fs roots. */
+interface Shift {
   root: string;
   home: string;
   cacheDir: string;
   stateDir: string;
 }
 
-function makeConductor(tag: string): Conductor {
+function makeShift(tag: string): Shift {
   const root = mkdtempSync(join(tmpdir(), `owenloop-drill6-${tag}-`));
   return {
     root,
@@ -105,7 +105,7 @@ function makeConductor(tag: string): Conductor {
   };
 }
 
-/** Seed each conductor's cache with the `pooldemo` bundle + both step specs. */
+/** Seed each shift's cache with the `crewdemo` bundle + both step specs. */
 function seedCache(cacheDir: string): void {
   const specs: NormalizedStepSpec[] = [
     { step: 'alpha', brief: '---\nname: alpha\n---\n\nalpha body\n', permissions: { extensions: {} } },
@@ -119,15 +119,15 @@ function seedCache(cacheDir: string): void {
   writeBundle(cacheDir, bundle, specs);
 }
 
-function spawnConductor(c: Conductor, origin: string, account: string, pool: string): ShiftChild {
+function startShiftProcess(c: Shift, origin: string, account: string, crew: string): ShiftChild {
   return spawnShift(
     [
-      pool, '--origin', origin,
+      crew, '--origin', origin,
       '--as', account,
       '--cap', '3', '--poll-interval', '25',
       '--cache-dir', c.cacheDir, '--state-dir', c.stateDir,
     ],
-    // The agent-run children this proxy spawns must reach a HARNESS. Point the
+    // The agent-run children this shift spawns must reach a HARNESS. Point the
     // registry seam at the scripted fake and NAME it, exactly as the runner
     // drills do — a drill that inherited whichever adapter happened to register
     // first would be passing for a reason it never asserted. `hang: true` keeps
@@ -140,21 +140,21 @@ function spawnConductor(c: Conductor, origin: string, account: string, pool: str
   );
 }
 
-let a: Conductor;
-let b: Conductor;
+let a: Shift;
+let b: Shift;
 beforeEach(() => {
-  a = makeConductor('a');
-  b = makeConductor('b');
+  a = makeShift('a');
+  b = makeShift('b');
 });
 afterEach(() => {
   rmSync(a.root, { recursive: true, force: true });
   rmSync(b.root, { recursive: true, force: true });
 });
 
-test('two conductors on different pools + accounts split one run cleanly — each claims only its pool, zero cross-pool claims, each authed with its own stored credential', async () => {
-  // The hub narrows strictly by `serve_pools`: a sweep is served `alpha` iff it
-  // serves pool A, `beta` iff pool B — the correct-narrowing simulation AND the
-  // refusal (a request that does not serve a pool never receives its order).
+test('two shifts on different crews + accounts split one run cleanly — each claims only its crew, zero cross-crew claims, each authed with its own stored credential', async () => {
+  // The hub narrows strictly by `serve_crews`: a sweep is served `alpha` iff it
+  // serves crew A, `beta` iff crew B — the correct-narrowing simulation AND the
+  // refusal (a request that does not serve a crew never receives its order).
   const { origin, reqs, server } = await startMockHub((verb, body) => {
     switch (verb) {
       case 'wake':
@@ -163,12 +163,12 @@ test('two conductors on different pools + accounts split one run cleanly — eac
         return { text: '', ok: true, name: 'p', lastSeen: 1 };
       case 'whats_next': {
         // Public shift startup has no --workflow flag. The first inbox sweep
-        // discovers wf1; the second request carries the configured pool scope.
+        // discovers wf1; the second request carries the configured crew scope.
         if (body?.workflow === undefined) return { text: '', instances: [{ workflow: 'wf1' }] };
-        const pools = (body?.serve_pools as string[] | undefined) ?? [];
+        const crews = (body?.serve_crews as string[] | undefined) ?? [];
         const orders: WorkOrder[] = [];
-        if (pools.includes('A')) orders.push(ALPHA);
-        if (pools.includes('B')) orders.push(BETA);
+        if (crews.includes('A')) orders.push(ALPHA);
+        if (crews.includes('B')) orders.push(BETA);
         return { text: '', workflow: 'wf1', def: DEF_NAME, orders };
       }
       default:
@@ -176,20 +176,20 @@ test('two conductors on different pools + accounts split one run cleanly — eac
     }
   });
 
-  // Each conductor gets its OWN cache + its OWN credential store (own account +
+  // Each shift gets its OWN cache + its OWN credential store (own account +
   // own token), seeded AFTER startMockHub so the store keys the exact origin.
   seedCache(a.cacheDir);
   seedCache(b.cacheDir);
-  seedCredentialStore(a.home, origin, POOL_A_TOKEN, POOL_A_ACCOUNT);
-  seedCredentialStore(b.home, origin, POOL_B_TOKEN, POOL_B_ACCOUNT);
+  seedCredentialStore(a.home, origin, CREW_A_TOKEN, CREW_A_ACCOUNT);
+  seedCredentialStore(b.home, origin, CREW_B_TOKEN, CREW_B_ACCOUNT);
 
-  const ca = spawnConductor(a, origin, POOL_A_ACCOUNT, 'A');
-  const cb = spawnConductor(b, origin, POOL_B_ACCOUNT, 'B');
+  const ca = startShiftProcess(a, origin, CREW_A_ACCOUNT, 'A');
+  const cb = startShiftProcess(b, origin, CREW_B_ACCOUNT, 'B');
   try {
     await Promise.all([ca.ready, cb.ready]);
 
     // Drive both concurrently. Each socket park sweeps once and returns on its
-    // first non-empty batch — the hub always has each pool's order ready.
+    // first non-empty batch — the hub always has each crew's order ready.
     const [ra, rb] = await Promise.all([
       ca.request({ op: 'next', wait_ms: 5_000 }),
       cb.request({ op: 'next', wait_ms: 5_000 }),
@@ -202,11 +202,11 @@ test('two conductors on different pools + accounts split one run cleanly — eac
     assert.equal(isShiftError(rb), false, `B next failed: ${JSON.stringify(rb)}; stderr:\n${cb.stderr()}`);
     if (isShiftError(ra) || isShiftError(rb)) throw new Error('unexpected shift error');
 
-    // (2) On-disk dispatch evidence: each conductor's OWN state dir records
-    // exactly one detached `agent-run` child, for its OWN pool's step of the
-    // SAME run — the split run, cleanly divided. A hub ignoring serve_pools
-    // would have served both conductors both orders; the disjointness proves
-    // the routing genuinely discriminates on serve_pools.
+    // (2) On-disk dispatch evidence: each shift's OWN state dir records
+    // exactly one detached `agent-run` child, for its OWN crew's step of the
+    // SAME run — the split run, cleanly divided. A hub ignoring serve_crews
+    // would have served both shifts both orders; the disjointness proves
+    // the routing genuinely discriminates on serve_crews.
     const aRecs = readChildRecords(a.stateDir);
     const bRecs = readChildRecords(b.stateDir);
     assert.equal(aRecs.length, 1, `A dispatched exactly one child: ${JSON.stringify(aRecs)}`);
@@ -221,41 +221,41 @@ test('two conductors on different pools + accounts split one run cleanly — eac
     // (3) Each authenticated with its OWN stored credential — no OWENLOOP_TOKEN
     // override leaked in. Both distinct bearers appear, and EVERY recorded
     // request carries one of exactly those two (no stray/override bearer).
-    assert.ok(reqs.some((r) => r.auth === POOL_A_AUTH), 'conductor A used its own stored bearer');
-    assert.ok(reqs.some((r) => r.auth === POOL_B_AUTH), 'conductor B used its own stored bearer');
+    assert.ok(reqs.some((r) => r.auth === CREW_A_AUTH), 'shift A used its own stored bearer');
+    assert.ok(reqs.some((r) => r.auth === CREW_B_AUTH), 'shift B used its own stored bearer');
     assert.ok(
-      reqs.every((r) => r.auth === POOL_A_AUTH || r.auth === POOL_B_AUTH),
+      reqs.every((r) => r.auth === CREW_A_AUTH || r.auth === CREW_B_AUTH),
       `every request carried one of the two stored bearers: ${JSON.stringify(reqs.map((r) => r.auth))}`,
     );
 
-    // (4) Zero cross-pool claims (the audit-log assertion). Binding each bearer
-    // to its pool: every A-bearer request that carries serve_pools carries
+    // (4) Zero cross-crew claims (the audit-log assertion). Binding each bearer
+    // to its crew: every A-bearer request that carries serve_crews carries
     // EXACTLY ['A'] and never 'B'; every B-bearer request carries ['B'] and
-    // never 'A'. With the deterministic routing above, this proves no conductor
-    // ever reached for — or was served — the other pool's step. This is the
-    // accept criterion's "hub audit log shows no cross-pool claim attempts
+    // never 'A'. With the deterministic routing above, this proves no shift
+    // ever reached for — or was served — the other crew's step. This is the
+    // accept criterion's "hub audit log shows no cross-crew claim attempts
     // succeeding", proven here at owenloop's mock level (see header boundary).
     for (const r of reqs) {
-      const pools = r.body?.serve_pools as string[] | undefined;
-      if (pools === undefined) continue; // e.g. a wake with no serve_pools field
-      if (r.auth === POOL_A_AUTH) {
-        assert.deepEqual(pools, ['A'], `A-bearer request served only pool A: ${JSON.stringify(r)}`);
-        assert.ok(!pools.includes('B'), 'A never reached for pool B');
+      const crews = r.body?.serve_crews as string[] | undefined;
+      if (crews === undefined) continue; // e.g. a wake with no serve_crews field
+      if (r.auth === CREW_A_AUTH) {
+        assert.deepEqual(crews, ['A'], `A-bearer request served only crew A: ${JSON.stringify(r)}`);
+        assert.ok(!crews.includes('B'), 'A never reached for crew B');
       } else {
-        assert.deepEqual(pools, ['B'], `B-bearer request served only pool B: ${JSON.stringify(r)}`);
-        assert.ok(!pools.includes('A'), 'B never reached for pool A');
+        assert.deepEqual(crews, ['B'], `B-bearer request served only crew B: ${JSON.stringify(r)}`);
+        assert.ok(!crews.includes('A'), 'B never reached for crew A');
       }
     }
 
-    // Every serve-pools-bearing request the conductors made was audited above:
-    // at least each conductor's presence_ping + whats_next carried its pool.
+    // Every serve-crews-bearing request the shifts made was audited above:
+    // at least each shift's presence_ping + whats_next carried its crew.
     assert.ok(
-      reqs.some((r) => r.verb === 'whats_next' && r.auth === POOL_A_AUTH),
-      'A rode a serve_pools whats_next on the wire',
+      reqs.some((r) => r.verb === 'whats_next' && r.auth === CREW_A_AUTH),
+      'A rode a serve_crews whats_next on the wire',
     );
     assert.ok(
-      reqs.some((r) => r.verb === 'whats_next' && r.auth === POOL_B_AUTH),
-      'B rode a serve_pools whats_next on the wire',
+      reqs.some((r) => r.verb === 'whats_next' && r.auth === CREW_B_AUTH),
+      'B rode a serve_crews whats_next on the wire',
     );
 
     assert.ok('events' in ra && Array.isArray(ra.events), 'A next returns the event queue shape');

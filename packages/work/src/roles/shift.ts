@@ -2,12 +2,12 @@
  * Public `owenloop shift start|next|status|end` command surface.
  *
  * `start` delegates all origin, credential, settings, cache, spawner, and loop
- * construction to the proxy runtime. `next`, `status`, and `end` are thin local
+ * construction to the shift runtime. `next`, `status`, and `end` are thin local
  * socket clients and never contact the hub directly.
  */
 import { loadSettings } from '../settings/settings.ts';
-import { resolveStateDir } from '../proxy/state.ts';
-import { resolveStateDirOverride, runProxyRuntime, type ParsedArgs } from './proxy.ts';
+import { resolveStateDir } from '../shift/state.ts';
+import { resolveStateDirOverride, runShiftRuntime, type ParsedArgs } from '../shift/runtime.ts';
 import {
   noDaemonMessage,
   parseNextArgs,
@@ -92,7 +92,7 @@ function parseStartArgs(args: string[]): StartArgs {
   if (parsed.all !== true && parsed.crews.length === 0) {
     return { crews: parsed.crews, error: 'name at least one crew or pass --all to serve every crew' };
   }
-  parsed.servePools = parsed.all === true ? [] : parsed.crews;
+  parsed.serveCrews = parsed.all === true ? [] : parsed.crews;
   return parsed;
 }
 
@@ -217,7 +217,7 @@ export async function run(args: string[]): Promise<number> {
       usage();
       return 2;
     }
-    return runProxyRuntime(parsed, { daemon: true, role: 'shift' });
+    return runShiftRuntime(parsed, { daemon: true, role: 'shift' });
   }
   if (command === 'next') return runNext(rest);
   if (command === 'status') return runStatus(rest);

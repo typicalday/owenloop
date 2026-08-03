@@ -6,7 +6,6 @@
 export const USAGE = `owenloop work — execution-side CLI companion to owenloop
 
 Usage:
-  owenloop work proxy [options]               park at the hub and dispatch orders
   owenloop work hold --order <id> [options]   hold an order with a heartbeating lease
   owenloop work exec <order-id> [options]     run a command order in a self-leasing loop
   owenloop work agent-run <order-id> [options]  host an agent order's step agent in a
@@ -26,15 +25,14 @@ Options:
   -h, --help                     show this help and exit 0
       --version                  print the owenloop work version and exit 0
 
-  proxy options:
+  root shift options (run as owenloop shift start):
       --origin <url>             hub origin (else settings.hubOrigin)
       --as <account>             Scoped Identity credential account to read + hand
                                  to dispatched holds/execs (default 'default')
-      --name <n>                 Conductor name (default <hostname>/<cwd>)
-      --serve-pools a,b          serve only these pools (comma list; default:
-                                 all pools on the key)
+      --name <n>                 Shift name (default <hostname>/<cwd>)
+      --serve-crews a,b          serve only these crews (comma list; default:
+                                 all crews on the key)
       --cap <n>                  max in-flight exec children (default 3)
-      --workflow <id>            poll only this instance (default: inbox — all)
       --poll-interval <ms>       wake poll cadence (default 5000)
       --once                     bootstrap wake + one sweep, then exit (demo/e2e)
       --max-agents <n>           max in-flight agent-run children, separate from
@@ -46,13 +44,13 @@ Options:
       --workflow <wf>            required when --order is a bare run id
       --origin <url>             hub origin (else settings.hubOrigin)
       --as <account>             Scoped Identity credential account (default
-                                 'default'; the proxy stamps this into born-bound
+                                 'default'; the shift stamps this into born-bound
                                  holds)
       --session <id>             session-holder tag (else env OWENLOOP_SESSION;
                                  else an anon:<hostname>:<pid> fallback — a
                                  holder is always sent)
-      --conductor <id>           dispatching Conductor's self-declared id (else
-                                 env OWENLOOP_CONDUCTOR_ID); advisory only
+      --shift <id>           dispatching Shift's self-declared id (else
+                                 env OWENLOOP_SHIFT_ID); advisory only
       --heartbeat-interval <ms>  lease renew cadence (default 60000)
       --jump-tolerance <ms>      wall-gap slack before a tick is treated as a
                                  clock jump / laptop sleep (default 30000)
@@ -62,18 +60,18 @@ Options:
                                  exclusive with --ignore-stdin — stdin is the
                                  transport)
 
-  exec options (usually spawned by proxy, not run by hand):
+  exec options (usually spawned by shift, not run by hand):
       <workflow>/<run>           the command order to run (positional order-id;
                                  or a bare <run> plus --workflow <wf>)
       --workflow <wf>            required when the order-id is a bare run id
       --origin <url>             hub origin (else settings.hubOrigin)
-      --conductor <id>           dispatching Conductor's self-declared id (else
-                                 env OWENLOOP_CONDUCTOR_ID); advisory only
+      --shift <id>           dispatching Shift's self-declared id (else
+                                 env OWENLOOP_SHIFT_ID); advisory only
       --heartbeat-interval <ms>  lease renew cadence (default 60000)
       --jump-tolerance <ms>      wall-gap slack before a tick is treated as a
                                  clock jump / laptop sleep (default 30000)
 
-  agent-run options (spawned by the proxy, not run by hand):
+  agent-run options (spawned by the shift, not run by hand):
       <workflow>/<run>           the agent order to host (positional order-id;
                                  or a bare <run> plus --workflow <wf>)
       --workflow <wf>            required when the order-id is a bare run id
@@ -81,8 +79,8 @@ Options:
       --harness <id>             which registered harness hosts the step agent
                                  (else env OWENLOOP_HARNESS, else the step def's
                                  'harness' field, else the first registered one)
-      --conductor <id>           dispatching Conductor's self-declared id (else
-                                 env OWENLOOP_CONDUCTOR_ID); advisory only
+      --shift <id>           dispatching Shift's self-declared id (else
+                                 env OWENLOOP_SHIFT_ID); advisory only
       --heartbeat-interval <ms>  lease renew cadence (default 60000)
       --jump-tolerance <ms>      wall-gap slack before a tick is treated as a
                                  clock jump / laptop sleep (default 30000)
@@ -104,7 +102,7 @@ Options:
       maxConcurrentAgents, workRoot, workRepo) with its value + provenance,
       and any unrecognized keys.
       settings.dispatchCap/stateDir are the lowest-precedence
-      fallbacks for proxy's --cap/--state-dir. NO secrets ever
+      fallbacks for shift's --cap/--state-dir. NO secrets ever
       live in settings — credentials stay in owenloop's own store.
 
   sessions options:
@@ -121,21 +119,21 @@ Options:
       --as <account>             credential account to store under (default:
                                  the Scoped Identity name the hub returns)
 
-  proxy/hold/exec/prepare/release env:
+  shift/hold/exec/prepare/release env:
                credentials come from owenloop's store — each role reads the
                agent:<account> slot for its origin (never the human slot); a
                missing slot refuses with a runnable 'owenloop login' command.
                OWENLOOP_ACCOUNT       Scoped Identity account for exec/prepare/release
-                                      (default 'default'; proxy uses --as, and
+                                      (default 'default'; shift uses --as, and
                                       stamps it onto dispatched holds/execs)
                OWENLOOP_TOKEN         dev-only bearer override — when set, used
                                       verbatim and the store + account are
                                       bypassed (NOT the primary path)
                OWENLOOP_CACHE_DIR     cache root
-               OWENLOOP_STATE_DIR     proxy in-flight state dir
+               OWENLOOP_STATE_DIR     shift in-flight state dir
                OWENLOOP_SESSION       hold session-holder tag / release drain target
-               OWENLOOP_CONDUCTOR_ID  dispatching Conductor's self-declared id for
-                                      hold/exec/agent-run's --conductor (advisory
+               OWENLOOP_SHIFT_ID  dispatching Shift's self-declared id for
+                                      hold/exec/agent-run's --shift (advisory
                                       only, never for auth/routing/dispatch)
                OWENLOOP_HARNESS       agent-run harness id; below --harness, above
                                       the step def's 'harness' field
@@ -149,7 +147,7 @@ Options:
                                       settings.workRepo, default off
 
   Credentials / accounts:
-      owenloop work's RUNTIME roles (proxy/hold/exec/prepare/release) are READ-ONLY
+      owenloop work's RUNTIME roles (shift/hold/exec/prepare/release) are READ-ONLY
       over owenloop's credential store — they never write credentials. Each
       role reads the agent:<account> slot for its origin (never the human
       slot); the account defaults to 'default'. 'owenloop work join' is the one
@@ -162,9 +160,9 @@ Options:
         or provision a fresh box from a hub-issued join code:
           owenloop work join <code> --hub <origin>
         select an account at run time:
-          --as <account>         on proxy / hold
+          --as <account>         on shift / hold
           OWENLOOP_ACCOUNT       on exec / prepare / release
-                                 (proxy resolves once and threads both channels)
+                                 (shift resolves once and threads both channels)
       owenloop work does NOT list stored accounts — enumerating an origin's accounts
       is an owenloop-side capability; check owenloop for which slots are stored.
 

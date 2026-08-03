@@ -12,7 +12,7 @@
  *    callback so it can read the first-contact order packet and run the command
  *    while this loop keeps the lease warm underneath it.
  *
- * Like C3's proxy loop, every side effect is injected (hub client, sleep/clock,
+ * Like C3's shift loop, every side effect is injected (hub client, sleep/clock,
  * jitter, output sinks) so every test drives it with a fake hub, a scriptable
  * clock, and no real timers.
  *

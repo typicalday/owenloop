@@ -18,7 +18,7 @@ import {
   type AdapterResolution,
   type AgentRunLoopOptions,
 } from '../src/agent/loop.ts';
-import { ACCOUNT_TOKEN, CONDUCTOR_TOKEN, ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
+import { ACCOUNT_TOKEN, SHIFT_TOKEN, ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { createFakeAdapter } from '../src/harness/fake.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
 import { ResumeUnavailableError } from '../src/harness/contract.ts';
@@ -41,7 +41,7 @@ interface OrderOpts {
   step?: string;
   workdir?: string;
   model?: string;
-  worker?: string;
+  executor?: string;
   command?: string;
   claimed?: boolean;
   outcome?: string;
@@ -62,7 +62,7 @@ function agentOrder(o: OrderOpts = {}): GetOrderResponse {
       outputs: [],
       ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
       ...(o.model !== undefined ? { model: o.model } : {}),
-      ...(o.worker !== undefined ? { worker: o.worker } : {}),
+      ...(o.executor !== undefined ? { executor: o.executor } : {}),
       ...(o.command !== undefined ? { command: o.command } : {}),
       prompt: '',
       consumes: {},
@@ -173,7 +173,7 @@ const TEMPLATE = [
   `order: ${ORDER_TOKEN}`,
   `origin: ${ORIGIN_TOKEN}`,
   `account: ${ACCOUNT_TOKEN}`,
-  `conductor: ${CONDUCTOR_TOKEN}`,
+  `shift: ${SHIFT_TOKEN}`,
 ].join('\n');
 
 /** The default step spec the loop loads: the token brief, no options. */
@@ -193,7 +193,7 @@ interface BuildOpts {
   spec?: NormalizedStepSpec | null;
   loadStep?: AgentRunLoopOptions['loadStep'];
   submitGraceMs?: number;
-  conductorId?: string;
+  shiftId?: string;
 }
 
 function buildOpts(b: BuildOpts): Harnessed {
@@ -209,7 +209,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     holder: HOLDER,
     origin: 'https://hub.example',
     account: 'acct-1',
-    ...(b.conductorId !== undefined ? { conductorId: b.conductorId } : {}),
+    ...(b.shiftId !== undefined ? { shiftId: b.shiftId } : {}),
     cwd: '/fallback/cwd',
     loadStep: b.loadStep ?? (async () => (b.spec === undefined ? baseSpec() : b.spec)),
     resolveAdapter: () => resolution,
@@ -274,7 +274,7 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
   const h = buildOpts({
     hub,
     adapter,
-    conductorId: 'cnd_1',
+    shiftId: 'shf_1',
     spec: {
       step: 'builder',
       brief: TEMPLATE,
@@ -288,12 +288,12 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
   assert.ok(start !== undefined && start.kind === 'start');
   assert.equal(
     start.args.brief,
-    ['# brief', 'order: wf1/run1', 'origin: https://hub.example', 'account: acct-1', 'conductor: cnd_1'].join('\n'),
+    ['# brief', 'order: wf1/run1', 'origin: https://hub.example', 'account: acct-1', 'shift: shf_1'].join('\n'),
   );
   assert.equal(start.args.cwd, '/repo/wt');
   assert.deepEqual(start.args.owenloopMcp, {
     command: 'owenloop',
-    args: ['work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'acct-1', '--conductor=cnd_1', '--mcp'],
+    args: ['work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'acct-1', '--shift=shf_1', '--mcp'],
   });
   // Permissions arrive PRE-NORMALIZED on the step spec — `prepare` already ran
   // `normalizeStepPermissions` over `x.harness`, so this loop passes them
@@ -445,7 +445,7 @@ test('first contact: a 403 maps to ownership-error', async () => {
 
 test('a command order is a misroute: released, nothing started', async () => {
   const adapter = createFakeAdapter();
-  const { hub, calls } = mockHub({ getOrder: [agentOrder({ worker: 'command', command: 'echo hi' })] });
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ executor: 'command', command: 'echo hi' })] });
   const h = buildOpts({ hub, adapter });
 
   assert.equal(await createAgentRunLoop(h.opts).run(), 'misroute');

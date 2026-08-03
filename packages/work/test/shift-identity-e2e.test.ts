@@ -75,8 +75,8 @@ test('two identical-argv shift children get distinct presence names, and clock_i
       throw new Error('unexpected status error');
     }
 
-    const inA = await shiftA.request({ op: 'clock_in', serve_pools: ['crew-a'], name: initialA.name });
-    const inB = await shiftB.request({ op: 'clock_in', serve_pools: ['crew-b'], name: initialB.name });
+    const inA = await shiftA.request({ op: 'clock_in', serve_crews: ['crew-a'], name: initialA.name });
+    const inB = await shiftB.request({ op: 'clock_in', serve_crews: ['crew-b'], name: initialB.name });
     assert.equal(isShiftError(inA), false, `clock_in A failed: ${JSON.stringify(inA)}`);
     assert.equal(isShiftError(inB), false, `clock_in B failed: ${JSON.stringify(inB)}`);
     if (isShiftError(inA) || isShiftError(inB) || !('name' in inA) || !('name' in inB)) {
@@ -92,7 +92,7 @@ test('two identical-argv shift children get distinct presence names, and clock_i
     assert.match(nameB, /#[0-9a-f]{6}$/);
     assert.notEqual(nameA, nameB, 'two identical-argv shifts must not collide on one presence name');
 
-    // The conductor id is present on the hub wire even though the local status
+    // The shift id is present on the hub wire even though the local status
     // protocol intentionally exposes only the public shift identity fields.
     await until(
       () => of(reqs, 'presence_ping').some((r) => r.body?.['name'] === nameA)
@@ -105,15 +105,15 @@ test('two identical-argv shift children get distinct presence names, and clock_i
     const lastB = lastFor(nameB);
     assert.ok(lastA, `no presence ping found carrying name ${nameA}`);
     assert.ok(lastB, `no presence ping found carrying name ${nameB}`);
-    const cidA = lastA!.body?.['conductor_id'] as string | undefined;
-    const cidB = lastB!.body?.['conductor_id'] as string | undefined;
-    assert.ok(cidA, 'conductor_id echoed on A presence');
-    assert.ok(cidB, 'conductor_id echoed on B presence');
+    const cidA = lastA!.body?.['shift_id'] as string | undefined;
+    const cidB = lastB!.body?.['shift_id'] as string | undefined;
+    assert.ok(cidA, 'shift_id echoed on A presence');
+    assert.ok(cidB, 'shift_id echoed on B presence');
     assert.notEqual(cidA, cidB);
     const suffixA = nameA.slice(nameA.lastIndexOf('#') + 1);
     const suffixB = nameB.slice(nameB.lastIndexOf('#') + 1);
-    assert.ok(cidA!.replace(/^cnd_/, '').replace(/-/g, '').startsWith(suffixA), `${cidA} does not start with ${suffixA}`);
-    assert.ok(cidB!.replace(/^cnd_/, '').replace(/-/g, '').startsWith(suffixB), `${cidB} does not start with ${suffixB}`);
+    assert.ok(cidA!.replace(/^shf_/, '').replace(/-/g, '').startsWith(suffixA), `${cidA} does not start with ${suffixA}`);
+    assert.ok(cidB!.replace(/^shf_/, '').replace(/-/g, '').startsWith(suffixB), `${cidB} does not start with ${suffixB}`);
 
     // A socket next marks attendance but does not change the other daemon's
     // mutable scope. The background loop sends the forced presence pings.
@@ -124,8 +124,8 @@ test('two identical-argv shift children get distinct presence names, and clock_i
     await until(() => of(reqs, 'presence_ping').filter((r) => r.body?.['attended_at'] !== undefined).length >= 2, 'attendance pings', 30_000);
     const attendedA = [...of(reqs, 'presence_ping')].reverse().find((r) => r.body?.['name'] === nameA && r.body?.['attended_at'] !== undefined);
     const attendedB = [...of(reqs, 'presence_ping')].reverse().find((r) => r.body?.['name'] === nameB && r.body?.['attended_at'] !== undefined);
-    assert.deepEqual(attendedA?.body?.['serve_pools'], ['crew-a'], "A's own ping carries only A's scope");
-    assert.deepEqual(attendedB?.body?.['serve_pools'], ['crew-b'], "B's own ping carries only B's scope — clock_in on A did not leak into B");
+    assert.deepEqual(attendedA?.body?.['serve_crews'], ['crew-a'], "A's own ping carries only A's scope");
+    assert.deepEqual(attendedB?.body?.['serve_crews'], ['crew-b'], "B's own ping carries only B's scope — clock_in on A did not leak into B");
 
     await Promise.all([shiftA.request({ op: 'end' }), shiftB.request({ op: 'end' })]);
     assert.equal(await shiftA.exited, 0, `A exit 0, stderr:\n${shiftA.stderr()}`);

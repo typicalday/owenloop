@@ -33,7 +33,7 @@
  *
  * Failure stance: provisioning propagates its failure (a runner with no place to
  * work should say so); REMOVAL is best-effort and never throws, because it runs
- * inside the proxy sweep and a sweep must not die over a directory.
+ * inside the shift sweep and a sweep must not die over a directory.
  */
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -263,7 +263,7 @@ export interface WorkDirEntry {
 /**
  * Every `<workRoot>/<workflow>/<run>` directory for the given workflows.
  *
- * SCOPED TO `workflows` ON PURPOSE, not a blind walk of `workRoot`. A proxy
+ * SCOPED TO `workflows` ON PURPOSE, not a blind walk of `workRoot`. A shift
  * started with `--workflow wf1` only ever learns which of wf1's orders are open;
  * it knows nothing about wf2's. Letting it consider wf2's directories would mean
  * judging them against an order list that structurally cannot mention them —

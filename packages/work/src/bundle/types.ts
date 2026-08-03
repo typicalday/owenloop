@@ -13,7 +13,7 @@
  * `{ id?: string, ...options }`. `validateFetchedDef` LIFTS it into two
  * first-class neutral fields on the parsed step: `harness` (the id) and
  * `harnessOptions` (every remaining key). Nothing downstream keys a data
- * structure BY a harness name. `x.owenloop` (proxy routing) is a separate live
+ * structure BY a harness name. `x.owenloop` (shift routing) is a separate live
  * namespace under `x` and is untouched by the lift.
  *
  * HUB GAP (see D1 / bundle/fetch.ts): today `GET /api/workflows/:name`
@@ -76,8 +76,8 @@ export interface FetchedStep {
   harnessOptions?: Record<string, unknown>;
   /**
    * Opaque extension bag. Two sub-keys are meaningful to owenloop: `x.harness`
-   * (lifted into `harness`/`harnessOptions` above) and `x.owenloop` (proxy
-   * command routing, see `src/proxy/routing.ts`). Everything else passes
+   * (lifted into `harness`/`harnessOptions` above) and `x.owenloop` (shift
+   * command routing, see `src/shift/routing.ts`). Everything else passes
    * through untouched.
    */
   x?: Record<string, unknown>;
@@ -133,7 +133,7 @@ export interface FetchedBundle extends FetchedDef {
  * compiled frontmatter entirely.
  *
  * What is DELIBERATELY not in here: the four substitution tokens
- * (`ORDER_TOKEN`, `ORIGIN_TOKEN`, `ACCOUNT_TOKEN`, `CONDUCTOR_TOKEN`) and the
+ * (`ORDER_TOKEN`, `ORIGIN_TOKEN`, `ACCOUNT_TOKEN`, `SHIFT_TOKEN`) and the
  * `mcpServers.owenloop` mount. Those are built at RUN time from the live order
  * by `src/agent/brief.ts` (`renderBrief` + `buildOwenloopMcp`), which is now the
  * only place they exist. A bundle is therefore order-independent.

@@ -6,7 +6,7 @@
  * SCOPE, deliberately narrow: this file polices INSIDE `src/harness/` only. When
  * it was written the wider gate was impossible — nine legacy files under `src/`
  * legitimately named a harness (the `src/adapters/` trio, `src/bundle/types.ts`,
- * `src/proxy/loop.ts`, `src/roles/{lint,prepare,proxy}.ts`, `src/usage.ts`) — so
+ * `src/shift/loop.ts`, `src/roles/{lint,prepare,shift}.ts`, `src/usage.ts`) — so
  * the redesign plan deferred it to Phase 6, once Phase 5 had deleted the legacy
  * path.
  *

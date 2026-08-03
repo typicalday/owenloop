@@ -189,8 +189,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     err('owenloop work join: unexpected hub response');
     return 1;
   }
-  const poolsRaw = body?.['pools'];
-  const pools = Array.isArray(poolsRaw) && poolsRaw.every((p) => typeof p === 'string') ? (poolsRaw as string[]) : undefined;
+  const crewsRaw = body?.['crews'];
+  const crews = Array.isArray(crewsRaw) && crewsRaw.every((p) => typeof p === 'string') ? (crewsRaw as string[]) : undefined;
   // body.hubOrigin (if present) is deliberately never read — see module doc.
 
   const account = parsed.as ?? agentName;
@@ -217,7 +217,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   out(`joined ${origin} as Scoped Identity '${agentName}'`);
-  if (pools !== undefined && pools.length > 0) out(`  pools: ${pools.join(', ')}`);
+  if (crews !== undefined && crews.length > 0) out(`  crews: ${crews.join(', ')}`);
   out(`  credential: agent:${account} (${backend} backend)`);
   // 'unchanged' and 'conflict' both leave the file byte-identical, so both
   // read the same on stdout; the 'conflict' case additionally warned on
@@ -225,7 +225,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   const settingsLine = recorded.outcome === 'written' ? `written -> ${recorded.path}` : `hubOrigin already set (unchanged) -> ${recorded.path}`;
   out(`  settings: ${settingsLine}`);
   const asSuffix = account === 'default' ? '' : ` --as ${account}`;
-  const shiftScope = pools !== undefined && pools.length > 0 ? pools.join(' ') : '--all';
+  const shiftScope = crews !== undefined && crews.length > 0 ? crews.join(' ') : '--all';
   out(`  next: owenloop shift start ${shiftScope}${asSuffix}`);
 
   return 0;

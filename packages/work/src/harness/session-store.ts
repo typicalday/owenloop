@@ -18,10 +18,10 @@
  *
  * FAILURE STANCE, three different answers on purpose:
  *  - READ is fail-open: a missing file reads as `[]` (mirrors `readChildRecords`
- *    in `src/proxy/state.ts`), and a corrupt line is skipped and reported
+ *    in `src/shift/state.ts`), and a corrupt line is skipped and reported
  *    through the injectable `warn` callback, never thrown. A store that cannot
  *    be parsed must degrade a resume into a replay, not break the runner.
- *  - APPEND PROPAGATES. Unlike the proxy's advisory metering records, a lost
+ *  - APPEND PROPAGATES. Unlike the shift's advisory metering records, a lost
  *    session token silently degrades a Phase 4 resume into a cold replay — real
  *    work thrown away — so the caller must see the failure.
  *  - COMPACTION is best-effort (swallowed): the un-compacted file is still
@@ -319,14 +319,14 @@ export function markRunSessionsDead(
  *
  * ── KNOWN FALSE POSITIVE, STATED RATHER THAN ENGINEERED AROUND ───────────────
  *
- * An `owenloop work agent-run` started BY HAND, outside the proxy, has no child record
- * in the proxy state dir, so a proxy booting at that moment sees its `active` row
+ * An `owenloop work agent-run` started BY HAND, outside the shift, has no child record
+ * in the shift state dir, so a shift booting at that moment sees its `active` row
  * as orphaned and retires it. The cost is one cold replay on a hand-run debugging
  * session. Two things keep it small: the caller invokes this at BOOT only, which
  * narrows the window to an instant, and every retirement is returned so the
  * caller can log it with its `(workflow, run, step)`. Do NOT add a pid field to
  * `SessionRecord` to close this — the record is deliberately machine-portable
- * metadata, and the proxy state dir is already the system of record for liveness.
+ * metadata, and the shift state dir is already the system of record for liveness.
  *
  * IDEMPOTENT: the rows it appends are `dead`, so a second call finds nothing
  * `active` left and appends nothing.

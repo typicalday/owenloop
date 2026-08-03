@@ -12,7 +12,7 @@ import {
   resolveStateDir,
   writeChildRecord,
   type ChildRecord,
-} from '../src/proxy/state.ts';
+} from '../src/shift/state.ts';
 
 let dir: string;
 beforeEach(() => {

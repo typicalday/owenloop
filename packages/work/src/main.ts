@@ -11,8 +11,8 @@
  *
  * The role table contains loaders rather than imported functions. This keeps
  * `owenloop work settings` and `owenloop work lint` from evaluating unrelated
- * proxy, runner, or harness modules, and leaves the model SDK behind the
- * adapter's own dynamic import boundary.
+ * runner or harness modules, and leaves the model SDK behind the adapter's own
+ * dynamic import boundary.
  */
 import { USAGE } from './usage.ts';
 
@@ -23,7 +23,6 @@ type RoleModule = { run: Role };
 type RoleLoader = () => Promise<RoleModule>;
 
 const ROLES: Record<string, RoleLoader> = {
-  proxy: () => import('./roles/proxy.ts'),
   hold: () => import('./roles/hold.ts'),
   exec: () => import('./roles/exec.ts'),
   'agent-run': () => import('./roles/agent-run.ts'),

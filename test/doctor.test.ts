@@ -79,7 +79,7 @@ test('doctor: expired human oauth + refresh 400 → ✗ irrecoverable (refresh f
 });
 
 test('doctor: valid human + agent but settings hubOrigin mismatch → ✗ names both origins, exit 1', async () => {
-  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', pools: ['ops'], token: { plaintext: 'olp_live' } }] });
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
   const { fetch } = routedFetch(routes);
   const t = makeIo({ fetch, env: { PATH: pathDir(true) }, runCommand: () => ({ status: 0, stdout: 'owenloop@owenloop', stderr: '' }) });
   seedHuman(t.store);
@@ -95,7 +95,7 @@ test('doctor: valid human + agent but settings hubOrigin mismatch → ✗ names 
 test('doctor: plugin missing is NON-FATAL — ✗ plugin line but exit 0, in both binary-absent and not-installed variants', async () => {
   // (a) claude not on PATH.
   {
-    const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', pools: ['ops'], token: { plaintext: 'olp_live' } }] });
+    const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
     const { fetch } = routedFetch(routes);
     const t = makeIo({ fetch, env: { PATH: pathDir(false) } });
     seedHuman(t.store);
@@ -109,7 +109,7 @@ test('doctor: plugin missing is NON-FATAL — ✗ plugin line but exit 0, in bot
 
   // (b) claude present, plugin list lacks owenloop.
   {
-    const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', pools: ['ops'], token: { plaintext: 'olp_live' } }] });
+    const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
     const { fetch } = routedFetch(routes);
     const t = makeIo({ fetch, env: { PATH: pathDir(true) }, runCommand: () => ({ status: 0, stdout: 'some-other-plugin', stderr: '' }) });
     seedHuman(t.store);
@@ -138,7 +138,7 @@ test('doctor: agent slot present but hub 401s the token → ✗ revoked or inval
 });
 
 test('doctor: all green → every line ✓, exit 0, and a strict zero-write', async () => {
-  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', pools: ['ops'], token: { plaintext: 'olp_live' } }] });
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
   const { fetch } = routedFetch(routes);
   const t = makeIo({ fetch, env: { PATH: pathDir(true) }, runCommand: () => ({ status: 0, stdout: 'owenloop@owenloop v1', stderr: '' }) });
   seedHuman(t.store);

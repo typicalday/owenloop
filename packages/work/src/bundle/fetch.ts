@@ -189,7 +189,7 @@ function validateDefEnvelope(data: unknown, label: string): FetchedDef {
     }
     // Lift the neutral harness carrier out of `x.harness` (D1). `x` itself is
     // still carried through verbatim — `x.owenloop` is a separate live
-    // namespace that `src/proxy/routing.ts` reads.
+    // namespace that `src/shift/routing.ts` reads.
     const carrier = parseHarnessCarrier(s, label, s['name'] as string);
     return {
       name: s['name'] as string,

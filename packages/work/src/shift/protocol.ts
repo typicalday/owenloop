@@ -24,7 +24,7 @@ export const NO_DAEMON_SUFFIX = ' — start one with: owenloop shift start <crew
 export type ShiftRequest =
   | { op: 'next'; wait_ms: number }
   | { op: 'status' }
-  | { op: 'clock_in'; serve_pools: string[]; name: string }
+  | { op: 'clock_in'; serve_crews: string[]; name: string }
   | { op: 'end' };
 
 export interface DispatchedEvent {
@@ -77,7 +77,7 @@ export interface ShiftCapacity {
 
 export interface ShiftStatus {
   name: string;
-  serve_pools: string[];
+  serve_crews: string[];
   cap: number;
   free: number;
   running: number;

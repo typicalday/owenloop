@@ -29,7 +29,7 @@ const enriched = {
   version: 2,
   steps: [
     { name: 'builder', body: 'do it', model: 'opus', x: { harness: {} } },
-    { name: 'runner', worker: 'command' }, // command step needs no body
+    { name: 'runner', executor: 'command' }, // command step needs no body
   ],
 };
 

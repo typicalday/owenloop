@@ -384,7 +384,7 @@ test('listWorkDirs is SCOPED to the given workflows, and skips files and missing
   ensureWorkDir({ workRoot: root, workflow: 'wf2', run: 'run2' });
   writeFileSync(join(root, 'wf1', 'stray-file'), 'not a run');
 
-  // A proxy started with `--workflow wf1` only ever learns which of wf1's orders
+  // A shift started with `--workflow wf1` only ever learns which of wf1's orders
   // are open. Judging wf2's directories against that list would make every one of
   // them look abandoned, so they are never even listed.
   const only = listWorkDirs(root, set('wf1'));

@@ -555,7 +555,7 @@ Commands:
   setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenloop settings, plugin (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
-  work <subcommand> [args]                run execution-side proxy/hold/exec/agent-run/... commands
+  work <subcommand> [args]                run execution-side shift/hold/exec/agent-run/... commands
   shift start|next|status|end [args]      run and attend a local Unix-socket shift daemon
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided] [--strict-inputs]
@@ -2610,7 +2610,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   }
 
   // Fetch the server's own list once — the diff source of truth. Always
-  // fetched, even under --force, so the new/changed labels stay accurate.
+  // fetched, even under --force, so the new/changed capabilities stay accurate.
   const { res: listRes, cred: listCred } = await authedGet(io, origin, slot, cred, '/api/workflows');
   assertAuthOk(listRes, listCred, origin);
   cred = listCred;

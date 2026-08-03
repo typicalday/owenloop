@@ -229,7 +229,7 @@ export type Credential =
  * distinct entries that never collide, and neither does `agent:ci` with
  * `agent:release`.
  *
- * The discriminator is an **account**, never a "label" — labels are a different
+ * The discriminator is an **account**, never a "capability" — capabilities are a different
  * axis of the system and the word is reserved.
  */
 export type CredentialSlotSelector =

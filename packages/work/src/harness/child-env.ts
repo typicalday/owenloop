@@ -50,7 +50,7 @@
  * the import graph from `src/roles/hold.ts` and collecting every reachable
  * `OWENLOOP_*` read yields these holder inputs:
  *
- *   - `OWENLOOP_CONDUCTOR_ID` and `OWENLOOP_SESSION` from `src/roles/hold.ts`;
+ *   - `OWENLOOP_SHIFT_ID` and `OWENLOOP_SESSION` from `src/roles/hold.ts`;
  *   - `OWENLOOP_CREDENTIAL_COMMAND`, `OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS`,
  *     and `OWENLOOP_NO_KEYCHAIN` from `src/hub.ts:readStoredCredential()`;
  *   - `OWENLOOP_TOKEN` from `src/credentials/resolve.ts`, which is DENIED on
@@ -90,9 +90,9 @@ export const ADMITTED_OWENLOOP_KEYS: ReadonlySet<string> = new Set([
   // `resolveCacheDir` — src/bundle/cache.ts. Keeps anything the agent runs on
   // the same bundle cache as the runner. A path, not a secret.
   'OWENLOOP_CACHE_DIR',
-  // `holdConductorId` — src/roles/hold.ts. The fallback when `--conductor=` is
+  // `holdShiftId` — src/roles/hold.ts. The fallback when `--shift=` is
   // absent from the mount's argv.
-  'OWENLOOP_CONDUCTOR_ID',
+  'OWENLOOP_SHIFT_ID',
   // `readStoredCredential` — src/hub.ts. Selects the holder's external
   // credential backend rather than falling through to keychain/file defaults.
   'OWENLOOP_CREDENTIAL_COMMAND',

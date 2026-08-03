@@ -1,5 +1,5 @@
 /**
- * Shift daemon: owns one Unix socket, one self-driven ProxyLoop, a bounded
+ * Shift daemon: owns one Unix socket, one self-driven ShiftLoop, a bounded
  * local event FIFO, and at most one parked `next` client.
  *
  * The loop remains the only owner of hub cursor, presence cadence, capacity,
@@ -17,7 +17,7 @@ import {
 import { createServer, createConnection, type Server, type Socket } from 'node:net';
 
 import type { HubClient } from '../hub/client.ts';
-import type { ProxyLoop } from '../proxy/loop.ts';
+import type { ShiftLoop } from '../shift/loop.ts';
 import {
   MAX_EVENT_QUEUE,
   MAX_REQUEST_LINE_BYTES,
@@ -35,11 +35,11 @@ import {
 export interface ShiftDaemonOptions {
   socketPath: string;
   stateDir: string;
-  loop: ProxyLoop;
+  loop: ShiftLoop;
   hub: HubClient;
   now: () => number;
   startedAt: number;
-  conductorId?: string;
+  shiftId?: string;
   err: (line: string) => void;
 }
 
@@ -48,7 +48,7 @@ export interface ShiftDaemon {
   /** Stop the daemon. `end` performs the final attendance-clearing ping. */
   stop(reason?: 'end' | 'signal' | 'loop'): void;
   status(): ShiftStatus;
-  /** Callback passed into createProxyLoop for local dispatch observations. */
+  /** Callback passed into createShiftLoop for local dispatch observations. */
   onEvent(event: ShiftEvent): void;
   socketPath: string;
 }
@@ -296,17 +296,17 @@ function validateRequest(value: unknown): ShiftRequest | ShiftError {
   }
   if (op === 'clock_in') {
     const name = obj['name'];
-    const pools = obj['serve_pools'];
+    const crews = obj['serve_crews'];
     if (typeof name !== 'string' || name.trim() === '' || name.trim().length > 200) {
       return errorResponse('clock_in name must be a non-empty string of at most 200 characters');
     }
-    if (!Array.isArray(pools) || !pools.every((pool) => typeof pool === 'string' && pool.trim() !== '')) {
-      return errorResponse('clock_in serve_pools must be an array of non-empty crew names');
+    if (!Array.isArray(crews) || !crews.every((crew) => typeof crew === 'string' && crew.trim() !== '')) {
+      return errorResponse('clock_in serve_crews must be an array of non-empty crew names');
     }
     return {
       op: 'clock_in',
       name: name.trim(),
-      serve_pools: pools.map((pool) => (pool as string).trim()),
+      serve_crews: crews.map((crew) => (crew as string).trim()),
     };
   }
   return errorResponse(typeof op === 'string' ? `unknown operation '${op}'` : 'request requires an operation');
@@ -336,7 +336,7 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     const shift = opts.loop.getShift();
     return {
       name: shift.name,
-      serve_pools: shift.servePools,
+      serve_crews: shift.serveCrews,
       ...capacity(),
       attended_at: opts.loop.getAttendedAt() ?? null,
       started_at: opts.startedAt,
@@ -463,8 +463,8 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     try {
       await opts.hub.presencePing({
         name: shift.name,
-        serve_pools: shift.servePools,
-        ...(opts.conductorId !== undefined ? { conductor_id: opts.conductorId } : {}),
+        serve_crews: shift.serveCrews,
+        ...(opts.shiftId !== undefined ? { shift_id: opts.shiftId } : {}),
         started_at: opts.startedAt,
         // Deliberately omit attended_at. The merged hub contract interprets
         // omission as overwrite-to-NULL; JSON null is rejected by validation.
@@ -546,7 +546,7 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     }
     if (parsed.op === 'clock_in') {
       // validateRequest completed all validation before this mutation.
-      opts.loop.setShift({ name: parsed.name, servePools: parsed.serve_pools });
+      opts.loop.setShift({ name: parsed.name, serveCrews: parsed.serve_crews });
       respond(socket, status());
       return;
     }

@@ -29,11 +29,11 @@ test('the admitted set is exactly the six names with a reachable child consumer'
     [...ADMITTED_OWENLOOP_KEYS].sort(),
     [
       'OWENLOOP_CACHE_DIR',
-      'OWENLOOP_CONDUCTOR_ID',
       'OWENLOOP_CREDENTIAL_COMMAND',
       'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
       'OWENLOOP_NO_KEYCHAIN',
       'OWENLOOP_SESSION',
+      'OWENLOOP_SHIFT_ID',
     ],
     'each admitted name needs a consumer a harness child can actually reach — ' +
       'see the derivation in src/harness/child-env.ts',
@@ -68,7 +68,7 @@ test('everything outside the OWENLOOP_ namespace passes through untouched', () =
 test('inside the namespace the six admitted inputs survive and everything else is denied', () => {
   const out = filterOwenloopEnv({
     OWENLOOP_CACHE_DIR: '/cache',
-    OWENLOOP_CONDUCTOR_ID: 'cond-1',
+    OWENLOOP_SHIFT_ID: 'cond-1',
     OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
     OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
     OWENLOOP_NO_KEYCHAIN: '1',
@@ -84,7 +84,7 @@ test('inside the namespace the six admitted inputs survive and everything else i
   });
   assert.deepEqual(out, {
     OWENLOOP_CACHE_DIR: '/cache',
-    OWENLOOP_CONDUCTOR_ID: 'cond-1',
+    OWENLOOP_SHIFT_ID: 'cond-1',
     OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
     OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
     OWENLOOP_NO_KEYCHAIN: '1',
@@ -107,7 +107,7 @@ test('isAdmittedChildEnvKey agrees with the filter, name by name', () => {
     'PATH',
     'CLAUDE_CODE_OAUTH_TOKEN',
     'OWENLOOP_CACHE_DIR',
-    'OWENLOOP_CONDUCTOR_ID',
+    'OWENLOOP_SHIFT_ID',
     'OWENLOOP_CREDENTIAL_COMMAND',
     'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
     'OWENLOOP_NO_KEYCHAIN',

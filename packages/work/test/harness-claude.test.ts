@@ -308,7 +308,7 @@ const FULL_ENV = (): Record<string, string | undefined> => ({
   CLAUDECODE: '1',
   CLAUDE_CODE_OAUTH_TOKEN: 'oauth-must-survive',
   OWENLOOP_CACHE_DIR: '/cache-must-survive',
-  OWENLOOP_CONDUCTOR_ID: 'conductor-must-survive',
+  OWENLOOP_SHIFT_ID: 'shift-must-survive',
   OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
   OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
   OWENLOOP_NO_KEYCHAIN: '1',
@@ -367,7 +367,7 @@ test('buildChildEnv: the OWENLOOP_* allowlist and the API-key strip are independ
 
   assert.equal(out['CLAUDE_CODE_OAUTH_TOKEN'], 'oauth-must-survive', 'item 3: outside the namespace, untouchable');
   assert.equal(out['OWENLOOP_CACHE_DIR'], '/cache-must-survive', 'admitted inside the namespace');
-  assert.equal(out['OWENLOOP_CONDUCTOR_ID'], 'conductor-must-survive');
+  assert.equal(out['OWENLOOP_SHIFT_ID'], 'shift-must-survive');
   assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND'], '/bin/credential-helper');
   assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'], '2500');
   assert.equal(out['OWENLOOP_NO_KEYCHAIN'], '1');
@@ -398,7 +398,7 @@ test('buildChildEnv with allowApiBilling on still applies the OWENLOOP_* allowli
   assert.equal(out['CLAUDECODE'], '1');
   assert.equal('OWENLOOP_TOKEN' in out, false, 'the allowlist is not under the billing toggle');
   assert.equal(out['OWENLOOP_CACHE_DIR'], '/cache-must-survive');
-  assert.equal(out['OWENLOOP_CONDUCTOR_ID'], 'conductor-must-survive');
+  assert.equal(out['OWENLOOP_SHIFT_ID'], 'shift-must-survive');
   assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND'], '/bin/credential-helper');
   assert.equal(out['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'], '2500');
   assert.equal(out['OWENLOOP_NO_KEYCHAIN'], '1');

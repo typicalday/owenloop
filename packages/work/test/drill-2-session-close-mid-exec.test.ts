@@ -38,7 +38,7 @@ function commandOrder(command: string): unknown {
       key: 'k',
       inputs: [],
       outputs: [],
-      worker: 'command',
+      executor: 'command',
       command,
       prompt: '',
       consumes: {},

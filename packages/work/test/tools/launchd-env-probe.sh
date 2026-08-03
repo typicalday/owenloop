@@ -17,7 +17,7 @@
 # WHAT THIS PROBE IS NOT. It runs no vendor binary, performs no login, and holds
 # no real credential — the token value is the literal string
 # `probe-not-a-real-token`. It proves the environment PLUMBING under launchd. It
-# does not prove that a real order completes under a launchd-daemonized proxy;
+# does not prove that a real order completes under a launchd-daemonized shift;
 # that is tier 2, is operator-run, and is marked UNVERIFIED in
 # `docs/agent-runner.md` until a human runs it.
 #

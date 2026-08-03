@@ -308,8 +308,8 @@ test('parseDef accepts worker: agent (or omitted) with a real body', () => {
       { name: 'explicit', consumes: ['plan'], produces: ['result'], worker: 'agent', body: 'do the other thing' },
     ],
   });
-  assert.equal(wf.steps.find((s) => s.name === 'omitted')!.worker, undefined);
-  assert.equal(wf.steps.find((s) => s.name === 'explicit')!.worker, 'agent');
+  assert.equal(wf.steps.find((s) => s.name === 'omitted')!.executor, undefined);
+  assert.equal(wf.steps.find((s) => s.name === 'explicit')!.executor, 'agent');
 });
 
 test('parseDef rejects a step declaring a worker not in the def-level workers: allow-list', () => {
@@ -335,7 +335,7 @@ test('parseDef accepts an opaque worker value with no workers: allow-list and no
       { name: 'runner', consumes: ['a'], produces: ['result'], worker: 'browser-automation' },
     ],
   });
-  assert.equal(wf.steps.find((s) => s.name === 'runner')!.worker, 'browser-automation');
+  assert.equal(wf.steps.find((s) => s.name === 'runner')!.executor, 'browser-automation');
 });
 
 test('parseDef rejects a judge entry declaring worker: command with no command: (same validateDef rule, synthesized step)', () => {
@@ -2625,13 +2625,13 @@ test('parseProduces: negative maxSchemaFailures on a produce throws a DefError n
 
 // ---- A2/A3: step labels: and maxLease: parse -------------------------------
 
-test('parseDef parses step labels: into StepDef.labels', () => {
+test('parseDef parses step labels: into StepDef.capabilities', () => {
   const d = parseDef({
     name: 'labeled',
     inputs: [{ name: 'seed' }],
     steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], labels: ['claude', 'codex'] }],
   });
-  assert.deepEqual(d.steps[0]!.labels, ['claude', 'codex']);
+  assert.deepEqual(d.steps[0]!.capabilities, ['claude', 'codex']);
 });
 
 test('parseDef normalizes an empty labels: [] to absent (claimable by anyone)', () => {
@@ -2640,7 +2640,7 @@ test('parseDef normalizes an empty labels: [] to absent (claimable by anyone)', 
     inputs: [{ name: 'seed' }],
     steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], labels: [] }],
   });
-  assert.equal(d.steps[0]!.labels, undefined);
+  assert.equal(d.steps[0]!.capabilities, undefined);
 });
 
 test('parseDef rejects a non-string entry in labels:', () => {
@@ -2651,7 +2651,7 @@ test('parseDef rejects a non-string entry in labels:', () => {
         inputs: [{ name: 'seed' }],
         steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], labels: ['ok', 42] }],
       }),
-    (e: unknown) => e instanceof DefError && /run'\.labels must be a list of strings/.test((e as Error).message),
+    (e: unknown) => e instanceof DefError && /run'\.capabilities must be a list of strings/.test((e as Error).message),
   );
 });
 

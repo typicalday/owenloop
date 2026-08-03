@@ -19,9 +19,9 @@
  * falls back to `anon:<hostname>:<pid>` — never omitted. Only `kind:'session'`
  * — exec identity is C5's.
  *
- * CONDUCTOR ATTRIBUTION: `--conductor <cid>` (env fallback
- * `OWENLOOP_CONDUCTOR_ID`), when known, rides along on the holder as
- * `conductorId` — self-declared and advisory only (D8/INV-82), never used for
+ * SHIFT ATTRIBUTION: `--shift <cid>` (env fallback
+ * `OWENLOOP_SHIFT_ID`), when known, rides along on the holder as
+ * `shiftId` — self-declared and advisory only (D8/INV-82), never used for
  * authorization, routing, dispatch, or claim correctness.
  *
  * STDIN EOF: a live stdin pipe closing means the parent interactive session
@@ -29,10 +29,10 @@
  * closed at spawn (backgrounded/detached use), pass `--ignore-stdin` so hold
  * does not final-breath at birth.
  *
- * Origin/credential resolution mirrors `proxy`: origin `--origin` → settings;
+ * Origin/credential resolution mirrors `shift`: origin `--origin` → settings;
  * the bearer comes from owenloop's store via `resolveBearer`, reading the
  * `agent:<account>` slot for `--as <account>` (default `default`, so a hand-run
- * hold and a proxy-stamped `hold --as <account>` both work), with
+ * hold and a shift-stamped `hold --as <account>` both work), with
  * `OWENLOOP_TOKEN` as a documented dev-only override. Exit codes are documented
  * in `src/usage.ts`.
  */
@@ -58,7 +58,7 @@ interface ParsedArgs {
   session?: string;
   origin?: string;
   as?: string;
-  conductor?: string;
+  shift?: string;
   heartbeatIntervalMs?: number;
   jumpToleranceMs?: number;
   ignoreStdin: boolean;
@@ -92,7 +92,7 @@ export function parseArgs(args: string[]): ParsedArgs {
       case '--session':
       case '--origin':
       case '--as':
-      case '--conductor':
+      case '--shift':
       case '--heartbeat-interval':
       case '--jump-tolerance': {
         const r = takeValue(a, i);
@@ -103,7 +103,7 @@ export function parseArgs(args: string[]): ParsedArgs {
         else if (name === '--session') parsed.session = r.value;
         else if (name === '--origin') parsed.origin = r.value;
         else if (name === '--as') parsed.as = r.value;
-        else if (name === '--conductor') parsed.conductor = r.value;
+        else if (name === '--shift') parsed.shift = r.value;
         else if (name === '--heartbeat-interval') {
           const n = Number(r.value);
           if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
@@ -157,7 +157,7 @@ export function resolveTarget(order: string, workflowFlag?: string): { workflow:
 function usage(): void {
   process.stderr.write(
     'usage: owenloop work hold --order <workflow>/<run> [--origin <url>] [--as <account>] [--session <id>]\n' +
-      '                     [--conductor <id>] [--heartbeat-interval <ms>] [--jump-tolerance <ms>] [--ignore-stdin] [--mcp]\n' +
+      '                     [--shift <id>] [--heartbeat-interval <ms>] [--jump-tolerance <ms>] [--ignore-stdin] [--mcp]\n' +
       '   or: owenloop work hold --order <run> --workflow <wf> [...]\n',
   );
 }
@@ -167,12 +167,12 @@ function errMsg(err: unknown): string {
 }
 
 /**
- * Resolve the born-bound `--conductor` cid: explicit `--conductor`, else env
- * `OWENLOOP_CONDUCTOR_ID`, else `undefined` (no cid known — a hand-run hold
+ * Resolve the born-bound `--shift` cid: explicit `--shift`, else env
+ * `OWENLOOP_SHIFT_ID`, else `undefined` (no cid known — a hand-run hold
  * with no stamped/exported cid). Advisory only (D8/INV-82).
  */
-export function resolveConductorId(conductor: string | undefined, env: Record<string, string | undefined>): string | undefined {
-  const id = conductor ?? env['OWENLOOP_CONDUCTOR_ID'];
+export function resolveShiftId(shift: string | undefined, env: Record<string, string | undefined>): string | undefined {
+  const id = shift ?? env['OWENLOOP_SHIFT_ID'];
   return id !== undefined && id !== '' ? id : undefined;
 }
 
@@ -181,14 +181,14 @@ export function resolveConductorId(conductor: string | undefined, env: Record<st
  * `OWENLOOP_SESSION`, else a per-process fallback `anon:<hostname>:<pid>` —
  * NEVER undefined. The fallback is deliberately unique per process (not a
  * shared constant like `'anon'`): `release --session <id>` drains match on
- * session id, and a shared constant would let unrelated Conductors' claims
- * collide in a drain. `opts.conductorId` rides along on the holder when known
+ * session id, and a shared constant would let unrelated Shifts' claims
+ * collide in a drain. `opts.shiftId` rides along on the holder when known
  * (advisory only, D8/INV-82); `opts.hostname`/`opts.pid` are test seams.
  */
 export function resolveHolder(
   session: string | undefined,
   env: Record<string, string | undefined>,
-  opts: { conductorId?: string; hostname?: string; pid?: number } = {},
+  opts: { shiftId?: string; hostname?: string; pid?: number } = {},
 ): ContactHolder {
   const configured = session ?? env['OWENLOOP_SESSION'];
   const id =
@@ -196,7 +196,7 @@ export function resolveHolder(
   return {
     kind: 'session',
     id,
-    ...(opts.conductorId !== undefined ? { conductorId: opts.conductorId } : {}),
+    ...(opts.shiftId !== undefined ? { shiftId: opts.shiftId } : {}),
   };
 }
 
@@ -286,8 +286,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
   const token = bearer.token;
 
-  const conductorId = resolveConductorId(parsed.conductor, env);
-  const holder = resolveHolder(parsed.session, env, { conductorId });
+  const shiftId = resolveShiftId(parsed.shift, env);
+  const holder = resolveHolder(parsed.session, env, { shiftId });
 
   const hub = deps.hub ?? createHubClient({ origin, getToken: async () => token });
 

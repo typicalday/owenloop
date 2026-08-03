@@ -1,7 +1,7 @@
 /**
  * `owenloop work exec <order-id>` (C5) — the detached, self-leasing command runner.
  *
- * The proxy (C3) spawns one detached `owenloop work exec <workflow>/<run> --origin
+ * The shift (C3) spawns one detached `owenloop work exec <workflow>/<run> --origin
  * <url>` per COMMAND order. This process owns that order end to end: it takes the
  * lease on first contact, keeps it warm while it shells the order's `command`
  * out, and submits a receipt to every owed output path — then exits. It is the
@@ -14,19 +14,19 @@
  * exit code.
  *
  * ORDER ID: a positional `<workflow>/<run>` composite (or a bare `<run>` plus
- * `--workflow <wf>`), resolved by the same `resolveTarget` `hold` uses. The proxy
+ * `--workflow <wf>`), resolved by the same `resolveTarget` `hold` uses. The shift
  * always emits the composite form.
  *
  * HOLDER IDENTITY: every get_order/heartbeat rides the B3 holder tag
  * `{kind:'exec', id}` where id is `<hostname>:<pid>`. `kind:'exec'` is the drain
  * exemption (B3/C6): an exec-held claim survives a SESSION drain — only a signal
- * aimed at THIS process hands the order back. `--conductor <cid>` (env fallback
- * `OWENLOOP_CONDUCTOR_ID`), when known, rides along on the holder as
- * `conductorId` — self-declared and advisory only (D8/INV-82).
+ * aimed at THIS process hands the order back. `--shift <cid>` (env fallback
+ * `OWENLOOP_SHIFT_ID`), when known, rides along on the holder as
+ * `shiftId` — self-declared and advisory only (D8/INV-82).
  *
- * Origin/credential resolution mirrors `hold`/`proxy`: origin `--origin` →
+ * Origin/credential resolution mirrors `hold`/`shift`: origin `--origin` →
  * settings; the bearer comes from owenloop's store via `resolveBearer`, reading
- * the `agent:<account>` slot for the account the proxy set in this child's
+ * the `agent:<account>` slot for the account the shift set in this child's
  * `OWENLOOP_ACCOUNT` spawn env (default `default`), with `OWENLOOP_TOKEN` as a
  * documented dev-only override. Exec has NO `--as` flag — the spawn-env channel
  * is the contract. Exit codes are documented in `src/usage.ts`.
@@ -38,7 +38,7 @@ import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { createExecLoop, type ExecOutcome } from '../exec/loop.ts';
 import { createDefaultRunner, type CommandRunner } from '../exec/runner.ts';
-import { resolveConductorId, resolveTarget } from './hold.ts';
+import { resolveShiftId, resolveTarget } from './hold.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { installSignalHandlers, type SignalHost } from './signals.ts';
 
@@ -48,7 +48,7 @@ interface ParsedArgs {
   orderId?: string;
   workflow?: string;
   origin?: string;
-  conductor?: string;
+  shift?: string;
   heartbeatIntervalMs?: number;
   jumpToleranceMs?: number;
   error?: string;
@@ -80,7 +80,7 @@ export function parseArgs(args: string[]): ParsedArgs {
     switch (name) {
       case '--workflow':
       case '--origin':
-      case '--conductor':
+      case '--shift':
       case '--heartbeat-interval':
       case '--jump-tolerance': {
         const r = takeValue(a, i);
@@ -88,7 +88,7 @@ export function parseArgs(args: string[]): ParsedArgs {
         i = r.next;
         if (name === '--workflow') parsed.workflow = r.value;
         else if (name === '--origin') parsed.origin = r.value;
-        else if (name === '--conductor') parsed.conductor = r.value;
+        else if (name === '--shift') parsed.shift = r.value;
         else if (name === '--heartbeat-interval') {
           const n = Number(r.value);
           if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
@@ -113,7 +113,7 @@ export function parseArgs(args: string[]): ParsedArgs {
 
 function usage(): void {
   process.stderr.write(
-    'usage: owenloop work exec <workflow>/<run> [--origin <url>] [--conductor <id>] [--heartbeat-interval <ms>] [--jump-tolerance <ms>]\n' +
+    'usage: owenloop work exec <workflow>/<run> [--origin <url>] [--shift <id>] [--heartbeat-interval <ms>] [--jump-tolerance <ms>]\n' +
       '   or: owenloop work exec <run> --workflow <wf> [...]\n',
   );
 }
@@ -203,11 +203,11 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
   const token = bearer.token;
 
-  const conductorId = resolveConductorId(parsed.conductor, env);
+  const shiftId = resolveShiftId(parsed.shift, env);
   const holder: ContactHolder = {
     kind: 'exec',
     id: deps.holderId ?? `${hostname()}:${process.pid}`,
-    ...(conductorId !== undefined ? { conductorId } : {}),
+    ...(shiftId !== undefined ? { shiftId } : {}),
   };
   const hub = deps.hub ?? createHubClient({ origin, getToken: async () => token });
   const runner = deps.runner ?? createDefaultRunner();
