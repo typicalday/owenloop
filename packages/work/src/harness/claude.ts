@@ -19,7 +19,7 @@
  * module as `{kind:'progress', text}` `AgentEvent`s through the caller's
  * `onEvent`, never as a print.
  *
- * NOTHING IMPORTS THIS YET. Phase 3's runner (the composition root) is the first
+ * NOTHING IMPORTS THIS YET. Phase 3's worker (the composition root) is the first
  * production importer; importing this module is what fires the module-scope
  * `register(claudeAdapter)` below and puts the adapter in the runtime registry.
  */
@@ -222,7 +222,7 @@ function isPlainMap(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-/** The mount for owenloop's own work-holder MCP surface, built from the runner's
+/** The mount for owenloop's own work-holder MCP surface, built from the worker's
  *  verbatim argv. `alwaysLoad` forces its tools into the turn-1 prompt instead of
  *  deferring them behind tool search — a step agent that cannot see `submit` on
  *  turn 1 cannot finish its order. */
@@ -712,7 +712,7 @@ function lintStep(bag: Record<string, unknown>, step: string): LintFinding[] {
   }
 
   if (isPlainMap(bag['mcpServers']) && 'owenloop' in bag['mcpServers']) {
-    warn('mcpServers.owenloop is reserved and is replaced by the runner at start', 'mcpServers');
+    warn('mcpServers.owenloop is reserved and is replaced by the worker at start', 'mcpServers');
   }
 
   return findings;

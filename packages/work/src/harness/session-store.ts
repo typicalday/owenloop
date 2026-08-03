@@ -20,7 +20,7 @@
  *  - READ is fail-open: a missing file reads as `[]` (mirrors `readChildRecords`
  *    in `src/shift/state.ts`), and a corrupt line is skipped and reported
  *    through the injectable `warn` callback, never thrown. A store that cannot
- *    be parsed must degrade a resume into a replay, not break the runner.
+ *    be parsed must degrade a resume into a replay, not break the worker.
  *  - APPEND PROPAGATES. Unlike the shift's advisory metering records, a lost
  *    session token silently degrades a Phase 4 resume into a cold replay — real
  *    work thrown away — so the caller must see the failure.
@@ -294,7 +294,7 @@ export function markRunSessionsDead(
  * flight when no process exists.
  *
  * WHAT IS BROKEN WITHOUT THIS. `src/agent/loop.ts` writes `status: 'active'` when
- * a turn starts and rewrites it at turn end. A runner killed mid-turn — SIGKILL,
+ * a turn starts and rewrites it at turn end. A worker killed mid-turn — SIGKILL,
  * a panic, a reboot — never reaches the rewrite, so the newest row for that step
  * says `active` forever. Nothing else ever corrects it.
  *
@@ -313,7 +313,7 @@ export function markRunSessionsDead(
  * ── WHY RETIRING AN ORPHANED `active` ROW IS THE RIGHT DIRECTION TO BE WRONG ──
  *
  * An interrupted turn is the state you least want to resume into: the harness may
- * have half-applied tool calls the runner has no record of, so a resumed session
+ * have half-applied tool calls the worker has no record of, so a resumed session
  * would carry a model that believes work happened which did not. The cost of
  * retiring it is one cold replay. The cost of resuming it is silent divergence.
  *
@@ -352,7 +352,7 @@ export function reconcileActiveSessions(
   const retired: SessionRecord[] = [];
   for (const rec of newest.values()) {
     if (rec.status !== 'active') continue; // a completed turn is still resumable
-    if (liveRunIds.has(rec.run)) continue; // its runner is alive; the row is true
+    if (liveRunIds.has(rec.run)) continue; // its worker is alive; the row is true
     appendSession(file, { ...rec, status: 'dead', updatedAt: now }, opts);
     retired.push(rec);
   }
@@ -363,7 +363,7 @@ export function reconcileActiveSessions(
  * Append one record, then compact when the file has grown past `maxBytes`.
  *
  * The whole line is written in ONE `appendFileSync` call (with its trailing
- * newline) so concurrent runners' O_APPEND writes interleave line-atomically on
+ * newline) so concurrent workers' O_APPEND writes interleave line-atomically on
  * local filesystems. Append failures PROPAGATE — see this module's failure
  * stance. The post-append compaction is best-effort and swallowed.
  */

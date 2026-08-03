@@ -1,6 +1,6 @@
 /**
  * The harness contract — the ONLY thing every harness adapter implements, and
- * the only shapes the runner speaks.
+ * the only shapes the worker speaks.
  *
  * Why it exists: owenloop moved from writing per-order subagent files into
  * a vendor CLI's own directory and handing a lean order to an external Shift,
@@ -51,7 +51,7 @@ export interface HarnessSessionRef {
  * THE HUB IS TRUTH; THIS STREAM IS TELEMETRY + LIVENESS. The step agent signals
  * TASK completion by calling the `submit` MCP tool (registered in
  * `src/hold/mcp.ts` — locate `submitTool` by grep, not by line number). The
- * runner learns that the order finished from `Lease.outcome` on `get_order`
+ * worker learns that the order finished from `Lease.outcome` on `get_order`
  * (the `outcome` field on `Lease` in `src/hub/types.ts`; the mechanism is
  * mapped in `docs/agent-runner.md` §(b)) — NEVER from an `exited` event. An
  * adapter that stops emitting says nothing about whether the work was accepted.
@@ -106,7 +106,7 @@ export interface StartArgs {
    *
    * PRECEDENCE — every adapter resolves `args.model ?? args.permissions.model`
    * (and `args.effort ?? args.permissions.effort`). `StepPermissions.model` is
-   * the normalized step-def value; this field is the runner's override channel
+   * the normalized step-def value; this field is the worker's override channel
    * (e.g. escalating the model on a retry). Stated here because plan §3 puts
    * `model`/`effort` on both shapes without saying which wins; left unresolved,
    * the parallel adapter tracks would each pick a different answer and the
@@ -119,7 +119,7 @@ export interface StartArgs {
    * The stdio mount for owenloop's own work-holder MCP surface (bare
    * `get_order`/`submit`).
    *
-   * BUILT BY THE RUNNER, NOT BY AN ADAPTER: `src/agent/brief.ts` constructs the
+   * BUILT BY THE WORKER, NOT BY AN ADAPTER: `src/agent/brief.ts` constructs the
    * born-bound `hold --order <workflow>/<run> --origin <url> --as <account>
    * --shift=<cid> --mcp` argv from the live order. An adapter mounts it
    * verbatim and never constructs it — the order id, origin, and account ride

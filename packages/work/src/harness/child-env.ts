@@ -66,16 +66,16 @@
  * is read by `resolveCacheDir` (`src/bundle/cache.ts`), which an agent reaches
  * when its own work runs an owenloop subcommand that touches the bundle cache.
  * It is a directory path, not credential material, and admitting it keeps the
- * runner and anything the agent runs pointed at the same cache.
+ * worker and anything the agent runs pointed at the same cache.
  *
  * ── THE ONE DENIAL WITH A DELIBERATE CONSEQUENCE ─────────────────────────────
  *
  * `OWENLOOP_TOKEN` is denied, and it IS reachable from `hold`. Left alone that
- * would split the two sides apart: the runner would authenticate to the hub with
+ * would split the two sides apart: the worker would authenticate to the hub with
  * the override while the child fell back to its credential slot, and an empty
  * slot would surface mid-order as a confusing MCP handshake failure. So
  * `src/roles/agent-run.ts` also ignores `OWENLOOP_TOKEN` when resolving its own
- * bearer. Runner and child then agree, and the failure moves to startup, where
+ * bearer. Worker and child then agree, and the failure moves to startup, where
  * `resolveBearer` already refuses with exit code 2 and an actionable message.
  */
 
@@ -88,7 +88,7 @@
  */
 export const ADMITTED_OWENLOOP_KEYS: ReadonlySet<string> = new Set([
   // `resolveCacheDir` — src/bundle/cache.ts. Keeps anything the agent runs on
-  // the same bundle cache as the runner. A path, not a secret.
+  // the same bundle cache as the worker. A path, not a secret.
   'OWENLOOP_CACHE_DIR',
   // `holdShiftId` — src/roles/hold.ts. The fallback when `--shift=` is
   // absent from the mount's argv.

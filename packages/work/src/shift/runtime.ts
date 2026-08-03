@@ -225,7 +225,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       for (const rec of retired) {
         process.stderr.write(
           `${roleLabel}: retired orphaned session ${rec.workflow}/${rec.run} step '${rec.step}' ` +
-            `(harness '${rec.harness}', attempt ${String(rec.attempt ?? 1)}) — its runner is gone, ` +
+            `(harness '${rec.harness}', attempt ${String(rec.attempt ?? 1)}) — its worker is gone, ` +
             'so the next attempt replays cold\n',
         );
       }

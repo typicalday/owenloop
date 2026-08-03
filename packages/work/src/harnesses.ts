@@ -28,7 +28,7 @@
  * matches the pre-consolidation order in `src/roles/agent-run.ts` and is pinned
  * by a test.
  *
- * Importers: `src/roles/agent-run.ts` (the runner), `src/roles/lint.ts` (lint
+ * Importers: `src/roles/agent-run.ts` (the worker), `src/roles/lint.ts` (lint
  * judges a harness-less step by the SAME default that will run it), and
  * `src/roles/sessions.ts` (it maps a recorded harness id to that adapter's
  * resume command). A new caller of `adapterFor` / `defaultHarnessId` imports

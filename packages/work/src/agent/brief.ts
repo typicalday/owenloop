@@ -1,12 +1,12 @@
 /**
  * Brief rendering + the born-bound work-holder MCP mount, for the `agent-run`
- * runner (Phase 3).
+ * worker (Phase 3).
  *
  * Two pure functions, no I/O:
  *
  *  - `renderBrief(templateContent, spec)` — the SAME four-token substitution the
  *    legacy stamp path performs when it writes a per-order Step Agent file,
- *    minus the file. The runner hands the result straight to
+ *    minus the file. The worker hands the result straight to
  *    `HarnessAdapter.start` as `StartArgs.brief`.
  *  - `buildOwenloopMcp(spec)` — the `{command, args}` stdio mount for owenloop's
  *    own work-holder MCP surface, byte-identical to the `mcpServers.owenloop`
@@ -174,7 +174,7 @@ function reasonLine(index: number, r: ReasonEntry): string {
  * THE CENTRAL DESIGN POINT: this message is SHORT, and it deliberately does NOT
  * contain the brief. The session being resumed already holds the original brief,
  * the file reads, the tool results and the prior submission — that is the entire
- * reason the runner resumes instead of restarting. Re-sending the brief would
+ * reason the worker resumes instead of restarting. Re-sending the brief would
  * spend exactly the tokens this phase exists to save, and would leave the model
  * with two copies of its instructions and no way to tell which is current.
  *

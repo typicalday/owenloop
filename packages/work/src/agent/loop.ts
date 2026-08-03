@@ -1,6 +1,6 @@
 /**
  * The `agent-run` orchestration core (Phase 3) — the detached, self-leasing
- * runner that HOSTS one step agent instead of stamping a file for someone else
+ * worker that HOSTS one step agent instead of stamping a file for someone else
  * to run.
  *
  * It is `src/exec/loop.ts` for AGENT orders: same shared lease loop, same
@@ -11,15 +11,15 @@
  * ══ THE INVARIANT ══
  *
  * The step agent signals TASK completion by calling the `submit` MCP tool inside
- * the mounted `owenloop work hold --mcp` grandchild. This runner learns of that ONLY
+ * the mounted `owenloop work hold --mcp` grandchild. This worker learns of that ONLY
  * from the hub lease outcome — `createLeaseLoop().run()` resolving `'completed'`,
  * or a direct `hub.getOrder` seeing `lease.outcome`. The harness stream
  * (`AgentEvent`) and the SETTLING of `adapter.start()` are telemetry and
  * liveness only, and are never evidence of task success or failure.
  *
  * The trap this design exists to avoid: `start()` resolves at TURN end, which
- * happens within milliseconds of the agent calling `submit`, while the runner's
- * next lease heartbeat may be a full `heartbeatIntervalMs` away. A runner that
+ * happens within milliseconds of the agent calling `submit`, while the worker's
+ * next lease heartbeat may be a full `heartbeatIntervalMs` away. A worker that
  * read "`start()` settled with no outcome yet" as "the agent did not submit"
  * would RELEASE a run that had just completed, and the hub would re-offer a
  * closed order. So `start()` settling never releases. It only:
@@ -79,7 +79,7 @@ import {
   type BriefSpec,
 } from './brief.ts';
 
-/** Discriminated result of one runner life; the role maps these to exit codes. */
+/** Discriminated result of one worker life; the role maps these to exit codes. */
 export type AgentRunOutcome =
   | 'submitted' // the hub reported an outcome — the agent's submit landed (exit 0)
   | 'completed' // the order had already finished at first contact (exit 0)
@@ -87,7 +87,7 @@ export type AgentRunOutcome =
   | 'no-template' // no cached bundle / no step spec for the step (exit 1)
   | 'no-harness' // the resolved harness id names no registered adapter (exit 1)
   | 'no-submit' // the turn ended and the confirm grace expired with no outcome (exit 1)
-  | 'killed' // a signal aimed at the runner tore the session down + released (exit 1)
+  | 'killed' // a signal aimed at the worker tore the session down + released (exit 1)
   | 'lease-lost' // the lease went terminal without an outcome (exit 1)
   | 'ownership-error' // 403 — the run is not ours (exit 1)
   | 'hub-unreachable' // transient failures spanned the window (exit 1)
@@ -132,7 +132,7 @@ export interface AgentRunLoopOptions {
   hub: HubClient;
   workflow: string;
   run: string;
-  /** The runner's holder tag `{kind:'exec', id}` — `'exec'` is drain-exempt. */
+  /** The worker's holder tag `{kind:'exec', id}` — `'exec'` is drain-exempt. */
   holder: ContactHolder;
   /** Hub origin — rides the mounted work-holder's `--origin`. */
   origin: string;
@@ -333,7 +333,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
   }
 
-  /** A first-contact / no-hold lease outcome → runner outcome. Mirrors exec. */
+  /** A first-contact / no-hold lease outcome → worker outcome. Mirrors exec. */
   function mapNoHold(o: LeaseOutcome): AgentRunOutcome {
     switch (o) {
       case 'completed':

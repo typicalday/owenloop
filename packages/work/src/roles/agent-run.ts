@@ -1,5 +1,5 @@
 /**
- * `owenloop work agent-run <order-id>` (Phase 3) — the detached, self-leasing runner
+ * `owenloop work agent-run <order-id>` (Phase 3) — the detached, self-leasing worker
  * that HOSTS one step agent, and the harness-registry COMPOSITION ROOT.
  *
  * The shift spawns one detached
@@ -32,7 +32,7 @@
  *
  * The spawn argv (D6) carries only `<workflow>/<run>`, `--origin`, `--shift`
  * and `--harness` — no def name and no def hash, both of which the bundle cache
- * needs. So the runner resolves the def name ITSELF: one non-claiming
+ * needs. So the worker resolves the def name ITSELF: one non-claiming
  * `whats_next({workflow})` returns `def` in per-workflow mode, which feeds
  * `readDispatchBundle(cacheDir, def)` → `bundle.def.hash` → `readStepSpec(...)`.
  * That keeps the argv exactly as D6 specifies and adds no new settings surface.
@@ -45,7 +45,7 @@
  * `OWENLOOP_ACCOUNT` spawn env (default `default`). `agent-run` has NO `--as`
  * flag — the spawn-env channel is the contract.
  *
- * D10, CLOSED IN PHASE 6. The MCP mount this runner builds carries no
+ * D10, CLOSED IN PHASE 6. The MCP mount this worker builds carries no
  * credential — the mounted work-holder resolves its own from the same store —
  * and as of Phase 6 the dev-only `OWENLOOP_TOKEN` override is no longer
  * inherited by the harness child either. Both adapters filter it out through
@@ -55,7 +55,7 @@
  * variable — can be stranded by it.
  *
  * The consequence lands in this file: because the child cannot see the override,
- * THIS ROLE IGNORES IT TOO, so runner and child authenticate as the same
+ * THIS ROLE IGNORES IT TOO, so worker and child authenticate as the same
  * principal. See the block around the `resolveBearer` call. `resolveBearer`
  * itself is unchanged and every other role still honours the override.
  *
@@ -302,8 +302,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   // environment and at least one harness persists its start parameters to disk.
   //
   // THIS BLOCK IS THE OTHER HALF OF THAT CHANGE, and the two must stay together.
-  // If the runner kept honouring the override while the child could not see it,
-  // the two sides would authenticate as different principals: the runner with
+  // If the worker kept honouring the override while the child could not see it,
+  // the two sides would authenticate as different principals: the worker with
   // the override, the child falling back to its `agent:<account>` credential
   // slot. An empty slot would then surface mid-order as an opaque MCP handshake
   // failure, long after startup. So `agent-run` ignores the override too. Both
@@ -313,21 +313,21 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   //
   // SCOPE: this file only. `resolveBearer` is unchanged and every other role
   // keeps the override — `agent-run` is the one role that spawns a harness.
-  const runnerEnv = { ...env };
-  if ((runnerEnv['OWENLOOP_TOKEN'] ?? '') !== '') {
-    delete runnerEnv['OWENLOOP_TOKEN'];
+  const workerEnv = { ...env };
+  if ((workerEnv['OWENLOOP_TOKEN'] ?? '') !== '') {
+    delete workerEnv['OWENLOOP_TOKEN'];
     err(
       'owenloop work agent-run: OWENLOOP_TOKEN is set and is being IGNORED here. The dev-only ' +
         'bearer override is not passed to harness children, so honouring it would ' +
-        'authenticate the runner and the harness child as different principals. ' +
+        'authenticate the worker and the harness child as different principals. ' +
         'Authenticate the account instead: `owenloop login --hub <origin> --as agent:<account>`.',
     );
   }
 
-  const account = runnerEnv['OWENLOOP_ACCOUNT'] ?? 'default';
+  const account = workerEnv['OWENLOOP_ACCOUNT'] ?? 'default';
   let hub = deps.hub;
   if (hub === undefined) {
-    const bearer = await resolveBearer({ origin, account, env: runnerEnv });
+    const bearer = await resolveBearer({ origin, account, env: workerEnv });
     if (!bearer.ok) {
       err(`owenloop work agent-run: ${bearer.message}`);
       return bearer.code;

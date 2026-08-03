@@ -11,7 +11,7 @@
  *
  * The role table contains loaders rather than imported functions. This keeps
  * `owenloop work settings` and `owenloop work lint` from evaluating unrelated
- * runner or harness modules, and leaves the model SDK behind the adapter's own
+ * worker or harness modules, and leaves the model SDK behind the adapter's own
  * dynamic import boundary.
  */
 import { USAGE } from './usage.ts';

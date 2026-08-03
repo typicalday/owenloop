@@ -11,7 +11,7 @@
  * took the step it would have to know which bag key to reach for, and that key
  * IS a harness vendor name — putting a vendor name in a non-adapter file and
  * breaking the isolation rule this phase establishes. The CALLER extracts the
- * bag (Phase 3's runner today, Phase 5's normalized prepare later). Do not
+ * bag (Phase 3's worker today, Phase 5's normalized prepare later). Do not
  * "fix" this by passing the step plus a bagKey argument: same leak, one
  * indirection later.
  *
