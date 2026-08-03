@@ -19,15 +19,15 @@ export interface HubResponse {
 
 export interface WhatsNextRequest {
   workflow?: string;
-  /** Server-side filter for which serve pools this caller will accept. */
-  serve_pools?: string[];
+  /** Server-side filter for which serve crews this caller will accept. */
+  serve_crews?: string[];
 }
 
 /**
  * One work order from a per-workflow `whats_next` sweep. Mirrors hub-core
  * `verbs/whats-next.ts` `WorkOrder` exactly. `run` IS the order id used by
  * every other hub verb; `step` is the def step name (matched against the
- * cached bundle to classify command vs agent). Fields the proxy does not
+ * cached bundle to classify command vs agent). Fields the shift does not
  * read yet (consumes/expected_outputs/feedback/advisory/submit_hint) are
  * mirrored for completeness — C4/C5 consume them.
  */
@@ -89,24 +89,24 @@ export interface WakeResponse extends HubResponse {
 
 /**
  * B4 `POST /api/presence_ping` body. `name` is non-empty, ≤200 chars.
- * `serve_pools` omitted means OVERWRITE-to-empty hub-side (a ping is the full
- * current truth about a Conductor), so always send the pools this proxy
+ * `serve_crews` omitted means OVERWRITE-to-empty hub-side (a ping is the full
+ * current truth about a Shift), so always send the crews this shift
  * serves (source: hub-core `verbs/presence-ping.ts`).
  *
- * `conductor_id`/`started_at` are W7's self-declared attribution fields — the
- * Conductor process incarnation id (`cnd_<uuid>`, regenerated every restart,
+ * `shift_id`/`started_at` are W7's self-declared attribution fields — the
+ * Shift process incarnation id (`shf_<uuid>`, regenerated every restart,
  * never persisted) and its process start time. Advisory only (D8/INV-82):
  * never used for authorization, routing, dispatch, or claim correctness.
  *
  * WIRE CONVENTION (deliberate, do not "normalize"): these two top-level fields
  * are snake_case even in TS, mirroring the hub's wire body verbatim — unlike
- * `ContactHolder.conductorId` below, whose nested object keys are camelCase on
+ * `ContactHolder.shiftId` below, whose nested object keys are camelCase on
  * the wire. Both conventions are correct for where they live.
  */
 export interface PresencePingRequest {
   name: string;
-  serve_pools?: string[];
-  conductor_id?: string;
+  serve_crews?: string[];
+  shift_id?: string;
   started_at?: number;
   /** Epoch-millisecond timestamp of the last accepted local shift attendance. */
   attended_at?: number;
@@ -131,8 +131,8 @@ export interface PresencePingResponse extends HubResponse {
  * falls back to `anon:<hostname>:<pid>` when no session id is configured — a
  * holder is now ALWAYS sent, never omitted).
  *
- * `conductorId` (W7) is the self-declared Conductor process incarnation id
- * (`cnd_<uuid>`) that dispatched this holder, when known — advisory only
+ * `shiftId` (W7) is the self-declared Shift process incarnation id
+ * (`shf_<uuid>`) that dispatched this holder, when known — advisory only
  * (D8/INV-82), never used for authorization/routing/dispatch/claim decisions.
  * Nested-object convention: camelCase on the wire (unlike `PresencePingRequest`'s
  * top-level snake_case fields above) — this asymmetry is deliberate.
@@ -140,7 +140,7 @@ export interface PresencePingResponse extends HubResponse {
 export interface ContactHolder {
   kind: 'session' | 'exec';
   id: string;
-  conductorId?: string;
+  shiftId?: string;
 }
 
 // ---- get_order --------------------------------------------------------------
@@ -169,7 +169,7 @@ export interface Lease {
 /**
  * The persisted A1 order packet get_order re-serves, mirroring owenloop engine
  * `Order` (verified against owenloop-service `packages/engine-do/dist/vendor/
- * engine/engine.d.ts` on 2026-07-17). exec reads `command`/`worker`/`workdir`
+ * engine/engine.d.ts` on 2026-07-17). exec reads `command`/`executor`/`workdir`
  * to run the order and `owes` to know which output paths to submit the receipt
  * to; every other field is carried for completeness. `command` is opaque — the
  * engine never parses it; exec is the one process that shells it out.
@@ -186,8 +186,8 @@ export interface OrderPacket {
   workdir?: string;
   model?: string;
   /** Executor kind; `'command'` for a command order, absent = `'agent'`. */
-  worker?: string;
-  /** The command string for a `worker: command` order (opaque). */
+  executor?: string;
+  /** The command string for a `executor: command` order (opaque). */
   command?: string;
   spec?: Record<string, unknown>;
   x?: Record<string, unknown>;

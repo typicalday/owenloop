@@ -416,37 +416,37 @@ test('asWhoami: throws on a missing orgId or non-object body', () => {
 test('asMintAgentTokenOk: narrows a well-formed body to the whitelisted fields only', () => {
   const ok = asMintAgentTokenOk({
     // The real server also carries the plaintext in `text` and extra fields like
-    // poolIds — none of which must survive the narrow.
+    // crewIds — none of which must survive the narrow.
     text: 'Store this secret now — it will not be shown again:\nolp_secret',
     id: 'tok_1',
     token: 'olp_secret',
     agentId: 'agent_1',
-    pools: ['personal-alex'],
-    poolIds: ['pool_1'],
+    crews: ['personal-alex'],
+    crewIds: ['crew_1'],
   });
-  assert.deepEqual(ok, { id: 'tok_1', token: 'olp_secret', agentId: 'agent_1', pools: ['personal-alex'] });
-  // No `text`/`poolIds` leaked through the whitelist.
+  assert.deepEqual(ok, { id: 'tok_1', token: 'olp_secret', agentId: 'agent_1', crews: ['personal-alex'] });
+  // No `text`/`crewIds` leaked through the whitelist.
   assert.equal((ok as unknown as Record<string, unknown>).text, undefined);
-  assert.equal((ok as unknown as Record<string, unknown>).poolIds, undefined);
+  assert.equal((ok as unknown as Record<string, unknown>).crewIds, undefined);
 });
 
-test('asMintAgentTokenOk: empty pools array is allowed defensively', () => {
-  const ok = asMintAgentTokenOk({ id: 'tok_1', token: 'olp_x', agentId: 'a', pools: [] });
-  assert.deepEqual(ok.pools, []);
+test('asMintAgentTokenOk: empty crews array is allowed defensively', () => {
+  const ok = asMintAgentTokenOk({ id: 'tok_1', token: 'olp_x', agentId: 'a', crews: [] });
+  assert.deepEqual(ok.crews, []);
 });
 
 test('asMintAgentTokenOk: a malformed body throws NAMING THE FIELD ONLY, never echoing a value', () => {
   // Each malformed field is rejected; the token value is never echoed in the message.
   const cases: [unknown, RegExp][] = [
     ['nope', /not an object/],
-    [{ token: 'olp_x', agentId: 'a', pools: [] }, /missing non-empty string id/],
-    [{ id: '', token: 'olp_x', agentId: 'a', pools: [] }, /missing non-empty string id/],
-    [{ id: 'tok_1', token: 'olp_x', pools: [] }, /missing non-empty string agentId/],
-    [{ id: 'tok_1', token: '', agentId: 'a', pools: [] }, /missing non-empty string token/],
-    [{ id: 'tok_1', agentId: 'a', pools: [] }, /missing non-empty string token/],
-    [{ id: 'tok_1', token: 'sk-live-notolp', agentId: 'a', pools: [] }, /not an olp_ token/],
-    [{ id: 'tok_1', token: 'olp_x', agentId: 'a' }, /pools must be an array of strings/],
-    [{ id: 'tok_1', token: 'olp_x', agentId: 'a', pools: [1, 2] }, /pools must be an array of strings/],
+    [{ token: 'olp_x', agentId: 'a', crews: [] }, /missing non-empty string id/],
+    [{ id: '', token: 'olp_x', agentId: 'a', crews: [] }, /missing non-empty string id/],
+    [{ id: 'tok_1', token: 'olp_x', crews: [] }, /missing non-empty string agentId/],
+    [{ id: 'tok_1', token: '', agentId: 'a', crews: [] }, /missing non-empty string token/],
+    [{ id: 'tok_1', agentId: 'a', crews: [] }, /missing non-empty string token/],
+    [{ id: 'tok_1', token: 'sk-live-notolp', agentId: 'a', crews: [] }, /not an olp_ token/],
+    [{ id: 'tok_1', token: 'olp_x', agentId: 'a' }, /crews must be an array of strings/],
+    [{ id: 'tok_1', token: 'olp_x', agentId: 'a', crews: [1, 2] }, /crews must be an array of strings/],
   ];
   for (const [body, re] of cases) {
     assert.throws(() => asMintAgentTokenOk(body), re);

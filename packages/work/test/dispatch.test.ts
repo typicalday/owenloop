@@ -22,7 +22,7 @@ function runCli(args: string[], env?: Record<string, string>): { status: number;
 test('--help exits 0 and lists every role on stdout', () => {
   const { status, stdout } = runCli(['--help']);
   assert.equal(status, 0);
-  for (const role of ['proxy', 'hold', 'exec', 'prepare', 'lint', 'settings', 'release', 'join']) {
+  for (const role of ['hold', 'exec', 'prepare', 'lint', 'settings', 'release', 'join']) {
     assert.match(stdout, new RegExp(`\\b${role}\\b`), `help should mention ${role}`);
   }
 });
@@ -78,15 +78,6 @@ test('hold with valid args but no origin configured exits 2', () => {
   const { status, stderr } = runCli(['hold', '--order', 'wf1/run1'], {
     HOME: mkdtempSync(join(tmpdir(), 'owenloop-dispatch-')),
   });
-  assert.equal(status, 2);
-  assert.match(stderr, /no hub origin|no token/);
-});
-
-// C3 landed proxy: it now resolves config and exits 2 on a missing origin/token
-// (a usage error) rather than exiting 3 as a stub. Full behavior is pinned in
-// the proxy-loop / proxy-* tests. Run in an env with no hub origin configured.
-test('proxy with no origin configured exits 2 with usage on stderr', () => {
-  const { status, stderr } = runCli(['proxy'], { HOME: mkdtempSync(join(tmpdir(), 'owenloop-dispatch-')) });
   assert.equal(status, 2);
   assert.match(stderr, /no hub origin|no token/);
 });

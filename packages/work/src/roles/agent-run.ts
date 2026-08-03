@@ -2,7 +2,7 @@
  * `owenloop work agent-run <order-id>` (Phase 3) — the detached, self-leasing runner
  * that HOSTS one step agent, and the harness-registry COMPOSITION ROOT.
  *
- * The proxy spawns one detached
+ * The shift spawns one detached
  * `owenloop work agent-run <workflow>/<run> --origin <url>` per AGENT order — the
  * ONLY path an agent order takes, since Phase 5 deleted the legacy stamp path
  * it used to share the lane with. This
@@ -30,7 +30,7 @@
  *
  * ── WHERE THE STEP SPEC COMES FROM ──
  *
- * The spawn argv (D6) carries only `<workflow>/<run>`, `--origin`, `--conductor`
+ * The spawn argv (D6) carries only `<workflow>/<run>`, `--origin`, `--shift`
  * and `--harness` — no def name and no def hash, both of which the bundle cache
  * needs. So the runner resolves the def name ITSELF: one non-claiming
  * `whats_next({workflow})` returns `def` in per-workflow mode, which feeds
@@ -41,7 +41,7 @@
  *
  * Origin/credential resolution mirrors `exec`: origin `--origin` → settings; the
  * bearer comes from owenloop's store via `resolveBearer`, reading the
- * `agent:<account>` slot for the account the proxy set in this child's
+ * `agent:<account>` slot for the account the shift set in this child's
  * `OWENLOOP_ACCOUNT` spawn env (default `default`). `agent-run` has NO `--as`
  * flag — the spawn-env channel is the contract.
  *
@@ -51,7 +51,7 @@
  * inherited by the harness child either. Both adapters filter it out through
  * `filterOwenloopEnv` (`src/harness/child-env.ts`), an allowlist scoped to the
  * `OWENLOOP_*` namespace ONLY, so nothing a harness needs in order to start —
- * `PATH`, `HOME`, `NODE_OPTIONS`, a proxy setting, a vendor's own credential
+ * `PATH`, `HOME`, `NODE_OPTIONS`, a shift setting, a vendor's own credential
  * variable — can be stranded by it.
  *
  * The consequence lands in this file: because the child cannot see the override,
@@ -90,7 +90,7 @@ import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/r
 import { appendSession, latestFor, sessionsPath, type SessionRecord } from '../harness/session-store.ts';
 import { ensureWorkDir, resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
 import type { ContactHolder, OrderPacket } from '../hub/types.ts';
-import { resolveConductorId, resolveTarget } from './hold.ts';
+import { resolveShiftId, resolveTarget } from './hold.ts';
 import { installSignalHandlers, type SignalHost } from './signals.ts';
 
 const DEFAULT_INTERVAL_MS = 60_000;
@@ -99,7 +99,7 @@ interface ParsedArgs {
   orderId?: string;
   workflow?: string;
   origin?: string;
-  conductor?: string;
+  shift?: string;
   harness?: string;
   heartbeatIntervalMs?: number;
   jumpToleranceMs?: number;
@@ -118,7 +118,7 @@ function positiveMs(name: string, raw: string): { value: number } | { error: str
 }
 
 /**
- * Parse the positional `<order-id>` plus `--workflow`/`--origin`/`--conductor`/
+ * Parse the positional `<order-id>` plus `--workflow`/`--origin`/`--shift`/
  * `--harness`/`--heartbeat-interval`/`--jump-tolerance`/`--submit-grace`/
  * `--confirm-interval`. Supports `--flag value` and `--flag=value`; a second
  * positional or an unknown flag is an error. Mirrors `src/roles/exec.ts`.
@@ -144,7 +144,7 @@ export function parseArgs(args: string[]): ParsedArgs {
     switch (name) {
       case '--workflow':
       case '--origin':
-      case '--conductor':
+      case '--shift':
       case '--harness':
       case '--heartbeat-interval':
       case '--jump-tolerance':
@@ -155,7 +155,7 @@ export function parseArgs(args: string[]): ParsedArgs {
         i = r.next;
         if (name === '--workflow') parsed.workflow = r.value;
         else if (name === '--origin') parsed.origin = r.value;
-        else if (name === '--conductor') parsed.conductor = r.value;
+        else if (name === '--shift') parsed.shift = r.value;
         else if (name === '--harness') parsed.harness = r.value;
         else {
           const n = positiveMs(name, r.value);
@@ -176,7 +176,7 @@ export function parseArgs(args: string[]): ParsedArgs {
 
 function usage(): void {
   process.stderr.write(
-    'usage: owenloop work agent-run <workflow>/<run> [--origin <url>] [--harness <id>] [--conductor <id>]\n' +
+    'usage: owenloop work agent-run <workflow>/<run> [--origin <url>] [--harness <id>] [--shift <id>]\n' +
       '                         [--heartbeat-interval <ms>] [--jump-tolerance <ms>]\n' +
       '                         [--submit-grace <ms>] [--confirm-interval <ms>]\n' +
       '   or: owenloop work agent-run <run> --workflow <wf> [...]\n',
@@ -339,11 +339,11 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 
   await loadHarnessModule(env['OWENLOOP_HARNESS_MODULE'], err);
 
-  const conductorId = resolveConductorId(parsed.conductor, env);
+  const shiftId = resolveShiftId(parsed.shift, env);
   const holder: ContactHolder = {
     kind: 'exec',
     id: deps.holderId ?? `${hostname()}:${process.pid}`,
-    ...(conductorId !== undefined ? { conductorId } : {}),
+    ...(shiftId !== undefined ? { shiftId } : {}),
   };
 
   /**
@@ -454,7 +454,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     holder,
     origin,
     account,
-    ...(conductorId !== undefined ? { conductorId } : {}),
+    ...(shiftId !== undefined ? { shiftId } : {}),
     cwd: workCwd,
     loadStep,
     resolveAdapter,

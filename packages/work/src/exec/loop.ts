@@ -1,7 +1,7 @@
 /**
  * The exec orchestration core (C5) — the detached, self-leasing command runner.
  *
- * A command order the proxy (C3) dispatched becomes a detached `owenloop work exec`
+ * A command order the shift (C3) dispatched becomes a detached `owenloop work exec`
  * process. This core drives its whole life against the hub, every side effect
  * injected (hub client, command runner, sleep/clock, output sinks) so tests run
  * it with a fake hub + fake runner and no real timers or child processes:
@@ -12,7 +12,7 @@
  *     lease and delivers the order packet via `onOrder`; the loop then keeps the
  *     lease warm underneath everything below.
  *  2. VALIDATE — a `null` packet, a missing/blank `command`, a non-`command`
- *     worker, or a missing/empty `owes` is a MISROUTE (plan decision 3): not exec's to
+ *     executor, or a missing/empty `owes` is a MISROUTE (plan decision 3): not exec's to
  *     fail (a Step Agent could legitimately run it), so a targeted release, no
  *     submit, exit 1.
  *  3. RUN + RACE — the runner shells the command out while the lease loop runs.
@@ -224,7 +224,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       order === null ||
       typeof command !== 'string' ||
       command === '' ||
-      (order.worker !== undefined && order.worker !== 'command') ||
+      (order.executor !== undefined && order.executor !== 'command') ||
       !Array.isArray(order.owes) ||
       order.owes.length === 0
     ) {

@@ -37,22 +37,22 @@ export const DRILL_TOKEN = 'drill_agent_tok';
 export const DRILL_AUTH = `Bearer ${DRILL_TOKEN}`;
 
 /**
- * Two-conductor constants for the pool-isolation drill (drill 6, WO-6.2).
+ * Two-shift constants for the crew-isolation drill (drill 6, WO-6.2).
  *
- * Drill 6 spawns two concurrent proxy conductors on ONE mock hub, each on a
- * different serve pool AND a different stored-credential account, to prove
- * neither reaches across pools. Each conductor authenticates from its OWN
+ * Drill 6 spawns two concurrent shift shifts on ONE mock hub, each on a
+ * different serve crew AND a different stored-credential account, to prove
+ * neither reaches across crews. Each shift authenticates from its OWN
  * `agent:<account>` slot (accounts `a`/`b` via `--as`), so the recorded wire
  * bearers must be distinct — that distinctness is what lets the drill bind
- * bearer↔pool and audit for cross-pool reaches. The tokens are throwaway
+ * bearer↔crew and audit for cross-crew reaches. The tokens are throwaway
  * literals, never real keys; no secret is committed.
  */
-export const POOL_A_ACCOUNT = 'a';
-export const POOL_B_ACCOUNT = 'b';
-export const POOL_A_TOKEN = 'drill_pool_a_tok';
-export const POOL_B_TOKEN = 'drill_pool_b_tok';
-export const POOL_A_AUTH = `Bearer ${POOL_A_TOKEN}`;
-export const POOL_B_AUTH = `Bearer ${POOL_B_TOKEN}`;
+export const CREW_A_ACCOUNT = 'a';
+export const CREW_B_ACCOUNT = 'b';
+export const CREW_A_TOKEN = 'drill_crew_a_tok';
+export const CREW_B_TOKEN = 'drill_crew_b_tok';
+export const CREW_A_AUTH = `Bearer ${CREW_A_TOKEN}`;
+export const CREW_B_AUTH = `Bearer ${CREW_B_TOKEN}`;
 
 /**
  * Seed owenloop's v2 file backend under `<home>/owenloop/credentials.json` with
@@ -63,7 +63,7 @@ export const POOL_B_AUTH = `Bearer ${POOL_B_TOKEN}`;
  * `account` (default `'default'`) selects the store slot key `agent:<account>`,
  * matching how `resolveBearer` addresses the `--as <account>` surface. Drills
  * 1–5 call this 2/3-arg and land in `agent:default`, unchanged; drill 6 passes
- * a distinct `account` per conductor so each has its own credential.
+ * a distinct `account` per shift so each has its own credential.
  */
 export function seedCredentialStore(
   home: string,
@@ -90,7 +90,7 @@ export function seedCredentialStore(
  * makes Node drop the key entirely from the child env, guaranteeing the store
  * path. `OWENLOOP_SESSION` is cleared so no ambient session-holder tag rides
  * along (drills that want one pass it explicitly). `OWENLOOP_ACCOUNT` is dropped
- * for the same reason: a dev machine that exports it (e.g. a conductor's
+ * for the same reason: a dev machine that exports it (e.g. a shift's
  * `OWENLOOP_ACCOUNT=<name>`) would otherwise make the child resolve
  * `agent:<name>` instead of the `agent:default` slot the fixture seeds, so the
  * store lookup misses and the child exits 2 before any hub contact. Drills that

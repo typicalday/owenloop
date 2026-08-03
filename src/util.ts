@@ -20,7 +20,7 @@ import { lstatSync, mkdirSync } from 'node:fs';
  * which inherits this constructor — keeps its byte-for-byte exit-1 behavior. The
  * non-default codes today are exit 2 (hub unresolvable) and exit 3 (human
  * credential absent/irrecoverable), used by `agent new`, `binding
- * new|rm|list`, and `pool`'s five subcommands.
+ * new|rm|list`, and `crew`'s five subcommands.
  */
 export class CliError extends Error {
   readonly exitCode: number;

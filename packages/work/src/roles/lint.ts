@@ -175,7 +175,7 @@ function loadSteps(target: string): FetchedStep[] {
 
 /**
  * Pull a loose `FetchedStep[]` out of a def-like object (only name + model +
- * worker + the harness carrier are needed).
+ * executor + the harness carrier are needed).
  *
  * The carrier is lifted by `parseHarnessCarrier`, the SAME function the def
  * parser uses, so lint and prepare cannot disagree about what `x.harness` means.
@@ -199,7 +199,7 @@ function stepsFromDefLike(defLike: unknown, source: string): FetchedStep[] {
     return {
       name,
       model: typeof s['model'] === 'string' ? (s['model'] as string) : undefined,
-      worker: typeof s['worker'] === 'string' ? (s['worker'] as string) : undefined,
+      executor: typeof s['executor'] === 'string' ? (s['executor'] as string) : undefined,
       ...parseHarnessCarrier(s, source, name),
       x: (typeof s['x'] === 'object' && s['x'] !== null ? (s['x'] as Record<string, unknown>) : undefined),
     };

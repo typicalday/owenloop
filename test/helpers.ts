@@ -22,7 +22,7 @@ export interface StepSpec {
   maxSchemaFailures?: number;
   model?: string;
   workdir?: string;
-  worker?: string;
+  executor?: string;
   command?: string;
   spec?: Record<string, unknown>;
   body?: string;
@@ -32,7 +32,7 @@ export interface StepSpec {
   idleAfter?: string;
   idleAfterMs?: number;
   reapTtlMs?: number;
-  labels?: string[];
+  capabilities?: string[];
   maxLeaseMs?: number;
   x?: Record<string, unknown>;
 }
@@ -58,12 +58,12 @@ export function step(spec: StepSpec): StepDef {
     ...(spec.idleAfter !== undefined ? { idleAfter: spec.idleAfter } : {}),
     ...(spec.idleAfterMs !== undefined ? { idleAfterMs: spec.idleAfterMs } : {}),
     ...(spec.reapTtlMs !== undefined ? { reapTtlMs: spec.reapTtlMs } : {}),
-    ...(spec.labels !== undefined ? { labels: spec.labels } : {}),
+    ...(spec.capabilities !== undefined ? { capabilities: spec.capabilities } : {}),
     ...(spec.maxLeaseMs !== undefined ? { maxLeaseMs: spec.maxLeaseMs } : {}),
     ...(spec.groups !== undefined ? { groups: spec.groups } : {}),
     ...(spec.x !== undefined ? { x: spec.x } : {}),
     ...(spec.workdir !== undefined ? { workdir: spec.workdir } : {}),
-    ...(spec.worker !== undefined ? { worker: spec.worker } : {}),
+    ...(spec.executor !== undefined ? { executor: spec.executor } : {}),
     ...(spec.command !== undefined ? { command: spec.command } : {}),
     ...(spec.spec !== undefined ? { spec: spec.spec } : {}),
     body: spec.body ?? `run ${spec.name}`,

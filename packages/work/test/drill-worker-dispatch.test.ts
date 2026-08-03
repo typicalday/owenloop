@@ -34,7 +34,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
-import { readChildRecords } from '../src/proxy/state.ts';
+import { readChildRecords } from '../src/shift/state.ts';
 import { readSessions, sessionsPath } from '../src/harness/session-store.ts';
 import type { OrderPacket, WorkOrder } from '../src/hub/types.ts';
 import { startMockHub, until } from './helpers/mcp-stdio-client.ts';
@@ -67,7 +67,7 @@ const ORDER: WorkOrder = {
   submit_hint: 'submit pr',
 };
 
-/** What `get_order` re-serves to the agent-run child. No `worker`/`command` ⇒ AGENT. */
+/** What `get_order` re-serves to the agent-run child. No `executor`/`command` ⇒ AGENT. */
 const PACKET: OrderPacket = {
   run: 'run_x1234',
   workflow: 'wf1',

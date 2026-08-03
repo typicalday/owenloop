@@ -1,8 +1,8 @@
 /**
  * In-flight tracking for detached exec children (plan decision 7).
  *
- * The proxy spawns `owenloop work exec <run>` DETACHED — the child survives a proxy
- * restart (kernel reparenting, SP5-verified). So the proxy cannot trust its own
+ * The shift spawns `owenloop work exec <run>` DETACHED — the child survives a shift
+ * restart (kernel reparenting, SP5-verified). So the shift cannot trust its own
  * memory to know what is in flight across a restart; it reconstructs that from
  * durable local records instead. A state dir holds one JSON record per spawned
  * child — `{ workflow, run, pid, spawnedAt, def?, hash?, step? }` — and on every
@@ -10,19 +10,19 @@
  * count the live ones as in-flight, and reap the dead ones.
  *
  * The design docs disdain PID files for broker/discovery plumbing of
- * harness-managed processes; these are proxy-spawned children, so local
+ * harness-managed processes; these are shift-spawned children, so local
  * bookkeeping is the legitimate mechanism, not that anti-pattern. Metering off
  * this count is an EFFICIENCY mechanism only — engine race-safety plus the
  * pickup/lease TTLs are the correctness backstop — so a rare pid-reuse miscount
  * is acceptable and never a bug to chase.
  *
- * Every fs op is FAIL-OPEN: a broken state dir degrades metering (the proxy may
+ * Every fs op is FAIL-OPEN: a broken state dir degrades metering (the shift may
  * over- or under-count in flight), it never kills the loop.
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-/** One dispatched order the proxy meters against capacity.
+/** One dispatched order the shift meters against capacity.
  *
  *  Two kinds, and BOTH are real local processes tracked by a live pid:
  *   - `exec` (default; absent `kind` for legacy records) — a detached
@@ -31,7 +31,7 @@ import { join } from 'node:path';
  *     agent itself, tracked exactly the same way.
  *
  *  There is no pid-less kind any more. The removed `'agent'` kind recorded a
- *  stamped Step Agent file handed to an out-of-process Conductor: no local
+ *  stamped Step Agent file handed to an out-of-process Shift: no local
  *  child, a `0` sentinel pid, and a coarse TTL standing in for liveness. With
  *  the stamp path gone nothing produces such a record, so a leftover one on disk
  *  fails the pid probe and is reaped on the next reconcile — which is correct.

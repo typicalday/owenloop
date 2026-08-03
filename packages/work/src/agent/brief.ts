@@ -41,14 +41,14 @@ export const ORDER_TOKEN = '__OWENLOOP_ORDER__';
 export const ORIGIN_TOKEN = '__OWENLOOP_ORIGIN__';
 /** The Scoped Identity account token. */
 export const ACCOUNT_TOKEN = '__OWENLOOP_ACCOUNT__';
-/** The dispatching Conductor's self-declared id token (advisory only). */
-export const CONDUCTOR_TOKEN = '__OWENLOOP_CONDUCTOR__';
+/** The dispatching Shift's self-declared id token (advisory only). */
+export const SHIFT_TOKEN = '__OWENLOOP_SHIFT__';
 
 /**
  * Everything the four-token substitution and the MCP mount need.
  *
  * `run` is the BARE run id; it composes with `workflow` into the
- * `<workflow>/<run>` composite every hub verb wants. `conductorId` is advisory
+ * `<workflow>/<run>` composite every hub verb wants. `shiftId` is advisory
  * attribution only (D8/INV-82) and absent resolves to the empty string.
  */
 export interface BriefSpec {
@@ -56,7 +56,7 @@ export interface BriefSpec {
   run: string;
   origin: string;
   account: string;
-  conductorId?: string;
+  shiftId?: string;
 }
 
 /** The composite order id — the only form the hub verbs accept. */
@@ -79,16 +79,16 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
     .join(spec.origin)
     .split(ACCOUNT_TOKEN)
     .join(spec.account)
-    .split(CONDUCTOR_TOKEN)
-    .join(spec.conductorId ?? '');
+    .split(SHIFT_TOKEN)
+    .join(spec.shiftId ?? '');
 }
 
 /**
  * The born-bound work-holder mount handed to `HarnessAdapter.start` as
  * `StartArgs.owenloopMcp`. The adapter mounts it verbatim and never builds it.
  *
- * `--conductor=<cid>` is ONE argv element, not two. An absent cid then degrades
- * to the single well-formed string `"--conductor="` instead of a dangling flag
+ * `--shift=<cid>` is ONE argv element, not two. An absent cid then degrades
+ * to the single well-formed string `"--shift="` instead of a dangling flag
  * with no value or a null array entry, which is what `hold`'s parser expects.
  * (The shape originated with the deleted stamp path, which had to survive a YAML
  * args array; it is kept because it is still the correct, unambiguous form.)
@@ -105,7 +105,7 @@ export function buildOwenloopMcp(spec: BriefSpec): { command: string; args: stri
       spec.origin,
       '--as',
       spec.account,
-      `--conductor=${spec.conductorId ?? ''}`,
+      `--shift=${spec.shiftId ?? ''}`,
       '--mcp',
     ],
   };

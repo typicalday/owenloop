@@ -158,7 +158,7 @@ test('worker/command/spec ride through buildOrder onto the Order untouched; step
         name: 'runner',
         consumes: ['proposal'],
         produces: ['result'],
-        worker: 'command',
+        executor: 'command',
         command: 'npm test',
         spec: { timeout: 300 },
       }),
@@ -169,13 +169,13 @@ test('worker/command/spec ride through buildOrder onto the Order untouched; step
   const wf = engine.createInstance('workerflow', { provide: { proposal: { text: 'x' } } });
 
   const runner = fire(engine, wf, 'runner', 1000);
-  assert.equal(runner.worker, 'command');
+  assert.equal(runner.executor, 'command');
   assert.equal(runner.command, 'npm test');
   assert.deepEqual(runner.spec, { timeout: 300 });
   complete(engine, wf, runner, { result: 'ok' });
 
   const reviewer = fire(engine, wf, 'reviewer', 2000);
-  assert.equal(reviewer.worker, undefined);
+  assert.equal(reviewer.executor, undefined);
   assert.equal(reviewer.command, undefined);
   assert.equal(reviewer.spec, undefined);
 });

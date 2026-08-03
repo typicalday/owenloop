@@ -269,7 +269,7 @@ export function pruneSupersededHashes(cacheDir: string, name: string, keepHash: 
 }
 
 /**
- * The dispatch-time bundle selection for `name` (DD-4), used by the proxy sweep
+ * The dispatch-time bundle selection for `name` (DD-4), used by the shift sweep
  * in place of a bare `readLatestBundle`. `whats_next` serves only the def NAME
  * (no hash, no parent linkage), so per-instance pin disambiguation must come
  * from the local cache's pin index:

@@ -71,7 +71,7 @@ test('boundary A: index.ts (public barrel) never couples to cli.ts', () => {
  * engine speaks in opaque tiers (`fast`/`standard`/`strong`/`strongest`), not
  * provider brands (design.md, judges `model:` discipline). `agent` and
  * `session` are intentionally NOT banned — `agent` is first-class engine
- * grammar (`worker: 'agent'`) and `session` reads as plain English in
+ * grammar (`executor: 'agent'`) and `session` reads as plain English in
  * comments; banning them would fire on legitimate host-agnostic usage.
  */
 const BANNED_TERMS: RegExp[] = [

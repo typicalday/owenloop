@@ -229,7 +229,7 @@ export type Credential =
  * distinct entries that never collide, and neither does `agent:ci` with
  * `agent:release`.
  *
- * The discriminator is an **account**, never a "label" — labels are a different
+ * The discriminator is an **account**, never a "capability" — capabilities are a different
  * axis of the system and the word is reserved.
  */
 export type CredentialSlotSelector =
@@ -999,8 +999,8 @@ export interface MintAgentTokenOk {
   token: string;
   /** The minted agent's id — a non-secret handle, safe to print. */
   agentId: string;
-  /** Resolved pool NAMES the token was granted on — non-secret. */
-  pools: string[];
+  /** Resolved crew NAMES the token was granted on — non-secret. */
+  crews: string[];
 }
 
 /**
@@ -1014,7 +1014,7 @@ export interface MintAgentTokenOk {
  * FIELD only — it never echoes a field VALUE. A malformed body could still carry
  * the `olp_` plaintext (in `text`, or in a mistyped `token`), so echoing values
  * here would be the exact leak §6 forbids. `id`/`agentId` must be non-empty
- * strings; `token` a non-empty string starting `olp_`; `pools` an array of
+ * strings; `token` a non-empty string starting `olp_`; `crews` an array of
  * strings (empty allowed defensively — the server always resolves at least one,
  * but the client does not depend on that to stay leak-safe).
  */
@@ -1035,16 +1035,16 @@ export function asMintAgentTokenOk(body: unknown): MintAgentTokenOk {
   if (!b.token.startsWith('olp_')) {
     throw new Error('mint_agent_token: malformed success response — token is not an olp_ token');
   }
-  if (!Array.isArray(b.pools) || b.pools.some((p) => typeof p !== 'string')) {
-    throw new Error('mint_agent_token: malformed success response — pools must be an array of strings');
+  if (!Array.isArray(b.crews) || b.crews.some((p) => typeof p !== 'string')) {
+    throw new Error('mint_agent_token: malformed success response — crews must be an array of strings');
   }
-  return { id: b.id, token: b.token, agentId: b.agentId, pools: b.pools as string[] };
+  return { id: b.id, token: b.token, agentId: b.agentId, crews: b.crews as string[] };
 }
 
 /**
  * One Scoped Identity as `GET /api/agent_identities` reports it — the fields the
  * setup converger and the doctor probe consult. The row is non-secret: it names
- * agents and their pools, never a token.
+ * agents and their crews, never a token.
  *
  * `lastContactAt` is identity-level (overwritten on EVERY authenticated contact,
  * `olp_` or `mcpat_`). `lastUsedAt` is the edge-computed max over the identity's
@@ -1057,7 +1057,7 @@ export interface AgentIdentitySummary {
   id: string;
   name: string;
   disabled: boolean;
-  pools: string[];
+  crews: string[];
   lastContactAt: number | null;
   lastUsedAt: number | null;
 }
@@ -1067,7 +1067,7 @@ export interface AgentIdentitySummary {
  * typed array. Throws on a malformed body (missing `identities` array, or a row
  * missing `id`/`name`). Non-secret shape — the rows carry no token — so errors
  * may name indices/fields freely. `lastContactAt`/`lastUsedAt` tolerate `null`
- * or absence (→ `null`) but reject a present non-number; `pools` defaults to an
+ * or absence (→ `null`) but reject a present non-number; `crews` defaults to an
  * empty array when absent, rejects a present non-array-of-strings; `disabled`
  * defaults to `false`.
  */
@@ -1092,18 +1092,18 @@ export function asAgentIdentities(body: unknown): AgentIdentitySummary[] {
       if (typeof v !== 'number') throw new Error(`agent_identities: malformed response — identities[${i}].${field} must be a number or null`);
       return v;
     };
-    let pools: string[] = [];
-    if (e.pools !== undefined) {
-      if (!Array.isArray(e.pools) || e.pools.some((p) => typeof p !== 'string')) {
-        throw new Error(`agent_identities: malformed response — identities[${i}].pools must be an array of strings`);
+    let crews: string[] = [];
+    if (e.crews !== undefined) {
+      if (!Array.isArray(e.crews) || e.crews.some((p) => typeof p !== 'string')) {
+        throw new Error(`agent_identities: malformed response — identities[${i}].crews must be an array of strings`);
       }
-      pools = e.pools as string[];
+      crews = e.crews as string[];
     }
     return {
       id: e.id,
       name: e.name,
       disabled: e.disabled === true,
-      pools,
+      crews,
       lastContactAt: epochOrNull(e.lastContactAt, 'lastContactAt'),
       lastUsedAt: epochOrNull(e.lastUsedAt, 'lastUsedAt'),
     };
@@ -1111,67 +1111,67 @@ export function asAgentIdentities(body: unknown): AgentIdentitySummary[] {
 }
 
 /**
- * One **label binding** as the hub reports it — an org-scoped row mapping a
- * workflow-def `labels:` entry to a pool. Unrelated to `HubBinding` above, which
- * is this project directory's binding to a hub (`owenloop connect`); every
- * symbol in this family is `LabelBinding`-prefixed to keep the two apart.
+ * One **capability route** as the hub reports it — an org-scoped row mapping a
+ * workflow-def `capabilities:` entry to a crew. Unrelated to `HubBinding` above, which
+ * is this project directory's route to a hub (`owenloop connect`); every
+ * symbol in this family is `CapabilityRoute`-prefixed to keep the two apart.
  *
- * One row is ONE `(label, pool)` PAIR, and a label may bind MANY pools — so a
- * single label appears as MANY rows and nothing may key a collection on `label`.
+ * One row is ONE `(capability, crew)` PAIR, and a capability may bind MANY crews — so a
+ * single capability appears as MANY rows and nothing may key a collection on `capability`.
  *
- * `poolName` is `string | null`. A `null` name IS the **dangling binding** case:
- * the bound pool row was deleted, so the hub has no name left to resolve
- * (`manage-label-bindings.ts`'s `toWire`). A dangling binding routes nothing and
+ * `crewName` is `string | null`. A `null` name IS the **dangling route** case:
+ * the bound crew row was deleted, so the hub has no name left to resolve
+ * (`manage-capability-routes.ts`'s `toWire`). A dangling route routes nothing and
  * never widens access, and it is deliberately SURFACED rather than filtered out —
  * seeing the row is exactly what tells an operator there is something to clean up.
  *
- * Non-secret: the row names a label, a pool, and who created it — never a token.
+ * Non-secret: the row names a capability, a crew, and who created it — never a token.
  */
-export interface LabelBindingWire {
-  label: string;
-  poolId: string;
-  poolName: string | null;
+export interface CapabilityRouteWire {
+  capability: string;
+  crewId: string;
+  crewName: string | null;
   createdBy: string;
   createdAt: number;
 }
 
 /**
- * `POST /api/add_label_binding`'s 200 body, narrowed.
+ * `POST /api/add_capability_route`'s 200 body, narrowed.
  *
- * NESTED exactly as the wire nests it: the row lives under `binding`, while
- * `alreadyBound` and `boundPoolCount` live at the BODY's top level. A flat
+ * NESTED exactly as the wire nests it: the row lives under `route`, while
+ * `alreadyRouted` and `routedCrewCount` live at the BODY's top level. A flat
  * interface would blur where each field actually sits.
  *
- * - `alreadyBound` — was this exact `(label, pool)` pair already present? The add
+ * - `alreadyRouted` — was this exact `(capability, crew)` pair already present? The add
  *   is ADDITIVE and idempotent per pair, so a repeat is a 200 no-op, not an
- *   error, and `binding.createdBy`/`createdAt` then echo the ORIGINAL row.
- * - `boundPoolCount` — how many **LIVE** pools the label binds AFTER the write. A
- *   binding whose pool row was deleted routes nothing and is not counted.
+ *   error, and `route.createdBy`/`createdAt` then echo the ORIGINAL row.
+ * - `routedCrewCount` — how many **LIVE** crews the capability binds AFTER the write. A
+ *   route whose crew row was deleted routes nothing and is not counted.
  */
-export interface LabelBindingAddedWire {
-  binding: LabelBindingWire;
-  alreadyBound: boolean;
-  boundPoolCount: number;
+export interface CapabilityRouteAddedWire {
+  route: CapabilityRouteWire;
+  alreadyRouted: boolean;
+  routedCrewCount: number;
 }
 
 /**
- * Validate the five common `LabelBindingWire` fields on one row. `prefix` is the
+ * Validate the five common `CapabilityRouteWire` fields on one row. `prefix` is the
  * endpoint-qualified lead-in the caller wants (e.g.
- * `add_label_binding: malformed success response`) and `where` names the
- * offending position (`binding`, or `bindings[2]`) — a FIELD/INDEX name only,
+ * `add_capability_route: malformed success response`) and `where` names the
+ * offending position (`route`, or `routes[2]`) — a FIELD/INDEX name only,
  * never a value.
  *
- * `poolName` is validated LENIENTLY here, unlike the other four fields: absent or
+ * `crewName` is validated LENIENTLY here, unlike the other four fields: absent or
  * `null` both yield `null`, because `null` is the hub's own answer for a dangling
- * binding. A caller that additionally KNOWS its pool is live (`asLabelBindingAdded`
+ * route. A caller that additionally KNOWS its crew is live (`asCapabilityRouteAdded`
  * resolves by name) layers its own non-null check on top of this shared call.
  */
-function asLabelBindingRow(entry: unknown, prefix: string, where: string): LabelBindingWire {
+function asCapabilityRouteRow(entry: unknown, prefix: string, where: string): CapabilityRouteWire {
   if (typeof entry !== 'object' || entry === null) {
     throw new Error(`${prefix} — ${where} is not an object`);
   }
   const e = entry as Record<string, unknown>;
-  for (const field of ['label', 'poolId', 'createdBy'] as const) {
+  for (const field of ['capability', 'crewId', 'createdBy'] as const) {
     if (typeof e[field] !== 'string' || e[field] === '') {
       throw new Error(`${prefix} — ${where} missing non-empty string ${field}`);
     }
@@ -1179,95 +1179,95 @@ function asLabelBindingRow(entry: unknown, prefix: string, where: string): Label
   if (typeof e.createdAt !== 'number') {
     throw new Error(`${prefix} — ${where} missing number createdAt`);
   }
-  // Lenient exactly like `asPoolRow`'s `ownerMemberId`: absent or null both mean
-  // "no name to report" — here, a DANGLING binding whose pool row is gone.
-  let poolName: string | null = null;
-  if (e.poolName !== undefined && e.poolName !== null) {
-    if (typeof e.poolName !== 'string' || e.poolName === '') {
-      throw new Error(`${prefix} — ${where} poolName must be a non-empty string or null`);
+  // Lenient exactly like `asCrewRow`'s `ownerMemberId`: absent or null both mean
+  // "no name to report" — here, a DANGLING route whose crew row is gone.
+  let crewName: string | null = null;
+  if (e.crewName !== undefined && e.crewName !== null) {
+    if (typeof e.crewName !== 'string' || e.crewName === '') {
+      throw new Error(`${prefix} — ${where} crewName must be a non-empty string or null`);
     }
-    poolName = e.poolName;
+    crewName = e.crewName;
   }
   return {
-    label: e.label as string,
-    poolId: e.poolId as string,
-    poolName,
+    capability: e.capability as string,
+    crewId: e.crewId as string,
+    crewName,
     createdBy: e.createdBy as string,
     createdAt: e.createdAt,
   };
 }
 
 /**
- * Narrow `POST /api/add_label_binding`'s 200 body
- * (`{ text, binding, alreadyBound, boundPoolCount }`). Throws on anything
+ * Narrow `POST /api/add_capability_route`'s 200 body
+ * (`{ text, route, alreadyRouted, routedCrewCount }`). Throws on anything
  * malformed, naming the offending FIELD only — same discipline as
  * `asAgentIdentities`, so no body value is echoed.
  *
- * `binding.poolName` is required to be a NON-NULL non-empty string here, on top
- * of `asLabelBindingRow`'s lenient check. That is not a contradiction: an add
- * resolves its pool BY NAME, so the pool is live by construction and a `null`
+ * `route.crewName` is required to be a NON-NULL non-empty string here, on top
+ * of `asCapabilityRouteRow`'s lenient check. That is not a contradiction: an add
+ * resolves its crew BY NAME, so the crew is live by construction and a `null`
  * name in THIS response is genuinely malformed — whereas a `null` name in a
- * `label_bindings` row is the legitimate dangling-binding case. Layering a
+ * `capability_routes` row is the legitimate dangling-route case. Layering a
  * call-site-specific check on top of the shared row call is the established
  * shape in this family, not a new pattern.
  */
-export function asLabelBindingAdded(body: unknown): LabelBindingAddedWire {
-  const prefix = 'add_label_binding: malformed success response';
+export function asCapabilityRouteAdded(body: unknown): CapabilityRouteAddedWire {
+  const prefix = 'add_capability_route: malformed success response';
   if (typeof body !== 'object' || body === null) {
     throw new Error(`${prefix} — not an object`);
   }
   const b = body as Record<string, unknown>;
-  if (b.binding === undefined) {
-    throw new Error(`${prefix} — missing binding`);
+  if (b.route === undefined) {
+    throw new Error(`${prefix} — missing route`);
   }
-  const binding = asLabelBindingRow(b.binding, prefix, 'binding');
-  if (binding.poolName === null) {
-    throw new Error(`${prefix} — binding missing non-empty string poolName`);
+  const route = asCapabilityRouteRow(b.route, prefix, 'route');
+  if (route.crewName === null) {
+    throw new Error(`${prefix} — route missing non-empty string crewName`);
   }
-  if (typeof b.alreadyBound !== 'boolean') {
-    throw new Error(`${prefix} — missing boolean alreadyBound`);
+  if (typeof b.alreadyRouted !== 'boolean') {
+    throw new Error(`${prefix} — missing boolean alreadyRouted`);
   }
-  if (typeof b.boundPoolCount !== 'number') {
-    throw new Error(`${prefix} — missing number boundPoolCount`);
+  if (typeof b.routedCrewCount !== 'number') {
+    throw new Error(`${prefix} — missing number routedCrewCount`);
   }
-  return { binding, alreadyBound: b.alreadyBound, boundPoolCount: b.boundPoolCount };
+  return { route, alreadyRouted: b.alreadyRouted, routedCrewCount: b.routedCrewCount };
 }
 
 /**
- * Narrow `POST /api/remove_label_binding`'s 200 body
- * (`{ text, label, poolId, removed, remainingPoolIds }`).
+ * Narrow `POST /api/remove_capability_route`'s 200 body
+ * (`{ text, capability, crewId, removed, remainingCrewIds }`).
  *
  * `removed` must be a BOOLEAN — this guard is how the CLI proves the 2xx really
  * was the remove verb's answer. BOTH boolean values are valid, deliberate hub
  * responses:
- *   - `true`  — the `(label, pool)` pair was bound and is now removed;
+ *   - `true`  — the `(capability, crew)` pair was bound and is now removed;
  *   - `false` — the pair was never bound, so there was nothing to do. The hub
- *     answers this with a 200, never a 404 (the `removePoolMember` `{existed}`
- *     house pattern), and that tolerance is what makes `binding rm` idempotent.
+ *     answers this with a 200, never a 404 (the `removeCrewMember` `{existed}`
+ *     house pattern), and that tolerance is what makes `capability unbind` idempotent.
  *
- * `poolId` is LENIENT (absent or `null` both yield `null`) because `null` is a
- * real hub output, not a defect: `manage-label-bindings.ts` resolves it as
- * `namedPool?.id ?? thisLabelsRows.find(...)?.poolId ?? null`, so it is `null`
+ * `crewId` is LENIENT (absent or `null` both yield `null`) because `null` is a
+ * real hub output, not a defect: `manage-capability-routes.ts` resolves it as
+ * `namedCrew?.id ?? thisCapabilityRows.find(...)?.crewId ?? null`, so it is `null`
  * on exactly the tolerant `removed: false` path where the argument matched
- * neither a live pool name nor one of this label's own binding rows. Requiring a
+ * neither a live crew name nor one of this capability's own route rows. Requiring a
  * non-empty string here would throw on a normal success.
  *
- * `remainingPoolIds` is deliberately NOT lenient — it must be PRESENT and an
+ * `remainingCrewIds` is deliberately NOT lenient — it must be PRESENT and an
  * array of non-empty strings. The asymmetry is the point: for a nullable name,
  * the lenient default (`null`) is the SAFE reading, but defaulting an absent
- * `remainingPoolIds` to `[]` would assert "this label is now PARKED" — the
+ * `remainingCrewIds` to `[]` would assert "this capability is now PARKED" — the
  * alarming reading, and exactly the signal an operator acts on — off a malformed
- * body. It lists LIVE pools only, so `[]` genuinely means zero live bindings
+ * body. It lists LIVE crews only, so `[]` genuinely means zero live routes
  * remain (which can happen while a dangling row survives, since such a row routes
  * nothing).
  *
  * The stdout shape built from this is documented in `docs/cli.md`'s
- * "Printed JSON" table under Label bindings.
+ * "Printed JSON" table under capability routes.
  */
-export function asLabelBindingRemoved(
+export function asCapabilityRouteRemoved(
   body: unknown,
-): { label: string; poolId: string | null; removed: boolean; remainingPoolIds: string[] } {
-  const prefix = 'remove_label_binding: malformed success response';
+): { capability: string; crewId: string | null; removed: boolean; remainingCrewIds: string[] } {
+  const prefix = 'remove_capability_route: malformed success response';
   if (typeof body !== 'object' || body === null) {
     throw new Error(`${prefix} — not an object`);
   }
@@ -1275,55 +1275,55 @@ export function asLabelBindingRemoved(
   if (typeof b.removed !== 'boolean') {
     throw new Error(`${prefix} — missing boolean removed`);
   }
-  if (typeof b.label !== 'string' || b.label === '') {
-    throw new Error(`${prefix} — missing non-empty string label`);
+  if (typeof b.capability !== 'string' || b.capability === '') {
+    throw new Error(`${prefix} — missing non-empty string capability`);
   }
-  let poolId: string | null = null;
-  if (b.poolId !== undefined && b.poolId !== null) {
-    if (typeof b.poolId !== 'string' || b.poolId === '') {
-      throw new Error(`${prefix} — poolId must be a non-empty string or null`);
+  let crewId: string | null = null;
+  if (b.crewId !== undefined && b.crewId !== null) {
+    if (typeof b.crewId !== 'string' || b.crewId === '') {
+      throw new Error(`${prefix} — crewId must be a non-empty string or null`);
     }
-    poolId = b.poolId;
+    crewId = b.crewId;
   }
-  if (!Array.isArray(b.remainingPoolIds)) {
-    throw new Error(`${prefix} — missing array remainingPoolIds`);
+  if (!Array.isArray(b.remainingCrewIds)) {
+    throw new Error(`${prefix} — missing array remainingCrewIds`);
   }
-  const remainingPoolIds = (b.remainingPoolIds as unknown[]).map((entry, i) => {
+  const remainingCrewIds = (b.remainingCrewIds as unknown[]).map((entry, i) => {
     if (typeof entry !== 'string' || entry === '') {
-      throw new Error(`${prefix} — remainingPoolIds[${i}] is not a non-empty string`);
+      throw new Error(`${prefix} — remainingCrewIds[${i}] is not a non-empty string`);
     }
     return entry;
   });
-  return { label: b.label, poolId, removed: b.removed, remainingPoolIds };
+  return { capability: b.capability, crewId, removed: b.removed, remainingCrewIds };
 }
 
 /**
- * Narrow `GET /api/label_bindings`'s 200 body (`{ text, bindings: [...] }`) to a
- * typed array. An EMPTY array is valid — that is the "this org has no bindings
+ * Narrow `GET /api/capability_routes`'s 200 body (`{ text, routes: [...] }`) to a
+ * typed array. An EMPTY array is valid — that is the "this org has no routes
  * yet" case, not an error.
  *
- * Rows are plain `LabelBindingWire`, ONE per `(label, pool)` pair ordered by
- * `label, pool_id`, so a label bound to many pools yields MANY rows — the array
- * is forwarded as-is and must never be collapsed into a per-label map. A row
- * whose `poolName` is `null` is a dangling binding and is kept, not dropped.
+ * Rows are plain `CapabilityRouteWire`, ONE per `(capability, crew)` pair ordered by
+ * `capability, crew_id`, so a capability bound to many crews yields MANY rows — the array
+ * is forwarded as-is and must never be collapsed into a per-capability map. A row
+ * whose `crewName` is `null` is a dangling route and is kept, not dropped.
  */
-export function asLabelBindings(body: unknown): LabelBindingWire[] {
-  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).bindings)) {
-    throw new Error('label_bindings: malformed response — expected a `bindings` array');
+export function asCapabilityRoutes(body: unknown): CapabilityRouteWire[] {
+  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).routes)) {
+    throw new Error('capability_routes: malformed response — expected a `routes` array');
   }
-  const list = (body as Record<string, unknown>).bindings as unknown[];
-  return list.map((entry, i) => asLabelBindingRow(entry, 'label_bindings: malformed response', `bindings[${i}]`));
+  const list = (body as Record<string, unknown>).routes as unknown[];
+  return list.map((entry, i) => asCapabilityRouteRow(entry, 'capability_routes: malformed response', `routes[${i}]`));
 }
 
 /**
- * A **pool** as the hub reports it — an org-scoped queue that agent work is
+ * A **crew** as the hub reports it — an org-scoped queue that agent work is
  * stamped to. `kind` is `'personal' | 'shared' | 'orphan'` on the wire, but is
  * deliberately NOT narrowed to that union here: `'orphan'` is a real value
- * `GET /api/pools` returns, and the hub verbs (`packages/hub-core/src/verbs/
- * manage-pools.ts`) are the enforcement of record for the other two — the same
- * stance `agent new` takes for `--pools`.
+ * `GET /api/crews` returns, and the hub verbs (`packages/hub-core/src/verbs/
+ * manage-crews.ts`) are the enforcement of record for the other two — the same
+ * stance `agent new` takes for `--crews`.
  */
-export interface PoolWire {
+export interface CrewWire {
   id: string;
   name: string;
   kind: string;
@@ -1332,8 +1332,8 @@ export interface PoolWire {
   createdAt: number;
 }
 
-/** One membership row on a `PoolListingWire` — `principalKind` is `'member' | 'agent'` on the wire, forwarded verbatim. */
-export interface PoolMemberWire {
+/** One membership row on a `CrewListingWire` — `principalKind` is `'member' | 'agent'` on the wire, forwarded verbatim. */
+export interface CrewMemberWire {
   principalKind: string;
   principalId: string;
   addedBy: string;
@@ -1341,57 +1341,57 @@ export interface PoolMemberWire {
 }
 
 /**
- * `GET /api/pools`' per-pool listing — a `PoolWire` plus its members inline
- * (one hop, no per-pool fan-out) plus a CLIENT-DERIVED `orphan` boolean. `orphan`
- * never appears on the wire; `asPools` computes it with the same rule as the
- * hub's own `isOrphanPool` (`manage-pools.ts:170-172`) so the CLI can mark the
- * org's reserved `orphan:unrouted` pool instead of filtering it out — an
- * operator has to be able to see where a deleted pool's work went.
+ * `GET /api/crews`' per-crew listing — a `CrewWire` plus its members inline
+ * (one hop, no per-crew fan-out) plus a CLIENT-DERIVED `orphan` boolean. `orphan`
+ * never appears on the wire; `asCrews` computes it with the same rule as the
+ * hub's own `isOrphanCrew` (`manage-crews.ts:170-172`) so the CLI can mark the
+ * org's reserved `orphan:unrouted` crew instead of filtering it out — an
+ * operator has to be able to see where a deleted crew's work went.
  */
-export interface PoolListingWire extends PoolWire {
+export interface CrewListingWire extends CrewWire {
   orphan: boolean;
-  members: PoolMemberWire[];
+  members: CrewMemberWire[];
 }
 
 /**
- * `POST /api/delete_pool`'s 200 body. `deleted` is always present; the six
+ * `POST /api/delete_crew`'s 200 body. `deleted` is always present; the six
  * transfer fields are OPTIONAL and, deliberately, absent (not `null`, not `0`)
- * when nothing moved — see `asPoolDeleted`.
+ * when nothing moved — see `asCrewDeleted`.
  */
-export interface PoolDeletedWire {
-  poolId: string;
+export interface CrewDeletedWire {
+  crewId: string;
   deleted: boolean;
   membersRemoved?: number;
-  orphanPoolId?: string;
-  orphanPoolName?: string;
+  orphanCrewId?: string;
+  orphanCrewName?: string;
   stampsTransferred?: number;
   runsTransferred?: string[];
   runningRunsTransferred?: string[];
 }
 
-/** `POST /api/remove_pool_member`'s 200 body — tolerant of a non-member, exactly like `asLabelBindingRemoved`'s `removed`. */
-export interface PoolMemberRemovedWire {
-  poolId: string;
+/** `POST /api/remove_crew_member`'s 200 body — tolerant of a non-member, exactly like `asCapabilityRouteRemoved`'s `removed`. */
+export interface CrewMemberRemovedWire {
+  crewId: string;
   principalId: string;
   removed: boolean;
 }
 
 /**
- * The `orphan:` prefix the hub uses to name its reserved orphan pool
- * (`packages/hub-core/src/pools-table.ts` / `verbs/manage-pools.ts`). Mirrored
+ * The `orphan:` prefix the hub uses to name its reserved orphan crew
+ * (`packages/hub-core/src/crews-table.ts` / `verbs/manage-crews.ts`). Mirrored
  * here as a named constant — not an invention — so a future reader can tell at
  * a glance that this string is copied from the hub's source of truth, not
  * independently chosen.
  */
-const ORPHAN_POOL_NAME_PREFIX = 'orphan:';
+const ORPHAN_CREW_NAME_PREFIX = 'orphan:';
 
 /**
- * Validate the common `PoolWire` fields on one row. `prefix` is the
- * endpoint-qualified lead-in (e.g. `pools: malformed response`) and `where`
- * names the offending position (`pool`, or `pools[2]`) — a FIELD/INDEX name
- * only, never a value, mirroring `asLabelBindingRow`'s discipline exactly.
+ * Validate the common `CrewWire` fields on one row. `prefix` is the
+ * endpoint-qualified lead-in (e.g. `crews: malformed response`) and `where`
+ * names the offending position (`crew`, or `crews[2]`) — a FIELD/INDEX name
+ * only, never a value, mirroring `asCapabilityRouteRow`'s discipline exactly.
  */
-function asPoolRow(entry: unknown, prefix: string, where: string): PoolWire {
+function asCrewRow(entry: unknown, prefix: string, where: string): CrewWire {
   if (typeof entry !== 'object' || entry === null) {
     throw new Error(`${prefix} — ${where} is not an object`);
   }
@@ -1404,9 +1404,9 @@ function asPoolRow(entry: unknown, prefix: string, where: string): PoolWire {
   if (typeof e.createdAt !== 'number') {
     throw new Error(`${prefix} — ${where} missing number createdAt`);
   }
-  // Lenient exactly like `asLabelBindingRow`'s `poolName`: absent or null both
+  // Lenient exactly like `asCapabilityRouteRow`'s `crewName`: absent or null both
   // mean "no owner" — a serializer that drops `undefined` must not turn a valid
-  // shared pool into a hard failure.
+  // shared crew into a hard failure.
   let ownerMemberId: string | null = null;
   if (e.ownerMemberId !== undefined && e.ownerMemberId !== null) {
     if (typeof e.ownerMemberId !== 'string' || e.ownerMemberId === '') {
@@ -1425,12 +1425,12 @@ function asPoolRow(entry: unknown, prefix: string, where: string): PoolWire {
 }
 
 /**
- * Validate one `PoolMemberWire` row. The wire row also carries `poolId`; it is
+ * Validate one `CrewMemberWire` row. The wire row also carries `crewId`; it is
  * deliberately NOT validated and NOT printed here, because inside
- * `pools[i].members[j]` it is structurally the enclosing pool's `id` and
+ * `crews[i].members[j]` it is structurally the enclosing crew's `id` and
  * repeating it adds no information.
  */
-function asPoolMemberRow(entry: unknown, prefix: string, where: string): PoolMemberWire {
+function asCrewMemberRow(entry: unknown, prefix: string, where: string): CrewMemberWire {
   if (typeof entry !== 'object' || entry === null) {
     throw new Error(`${prefix} — ${where} is not an object`);
   }
@@ -1452,70 +1452,70 @@ function asPoolMemberRow(entry: unknown, prefix: string, where: string): PoolMem
 }
 
 /**
- * Narrow `GET /api/pools`'s 200 body (`{ text, pools: [...] }`) to a typed
- * array. An EMPTY array is valid (a brand-new org). `GET /api/pools`
- * deliberately returns the org's reserved orphan pool when it exists — this
+ * Narrow `GET /api/crews`'s 200 body (`{ text, crews: [...] }`) to a typed
+ * array. An EMPTY array is valid (a brand-new org). `GET /api/crews`
+ * deliberately returns the org's reserved orphan crew when it exists — this
  * never filters it out; instead every row gets a derived `orphan` boolean,
  * always present (`true` or `false`), so a scripted consumer never branches on
  * the key's existence.
  */
-export function asPools(body: unknown): PoolListingWire[] {
-  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).pools)) {
-    throw new Error('pools: malformed response — expected a `pools` array');
+export function asCrews(body: unknown): CrewListingWire[] {
+  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).crews)) {
+    throw new Error('crews: malformed response — expected a `crews` array');
   }
-  const list = (body as Record<string, unknown>).pools as unknown[];
-  const prefix = 'pools: malformed response';
+  const list = (body as Record<string, unknown>).crews as unknown[];
+  const prefix = 'crews: malformed response';
   return list.map((entry, i) => {
-    const row = asPoolRow(entry, prefix, `pools[${i}]`);
+    const row = asCrewRow(entry, prefix, `crews[${i}]`);
     const e = entry as Record<string, unknown>;
     if (!Array.isArray(e.members)) {
-      throw new Error(`${prefix} — pools[${i}] missing members array`);
+      throw new Error(`${prefix} — crews[${i}] missing members array`);
     }
-    const members = e.members.map((m, j) => asPoolMemberRow(m, prefix, `pools[${i}].members[${j}]`));
-    const orphan = row.kind === 'orphan' || row.name.startsWith(ORPHAN_POOL_NAME_PREFIX);
+    const members = e.members.map((m, j) => asCrewMemberRow(m, prefix, `crews[${i}].members[${j}]`));
+    const orphan = row.kind === 'orphan' || row.name.startsWith(ORPHAN_CREW_NAME_PREFIX);
     return { ...row, orphan, members };
   });
 }
 
 /**
- * Narrow `POST /api/create_pool`'s 200 body (`{ text, pool }`) to the typed
+ * Narrow `POST /api/create_crew`'s 200 body (`{ text, crew }`) to the typed
  * row.
  */
-export function asPoolCreated(body: unknown): PoolWire {
-  const prefix = 'create_pool: malformed success response';
+export function asCrewCreated(body: unknown): CrewWire {
+  const prefix = 'create_crew: malformed success response';
   if (typeof body !== 'object' || body === null) {
     throw new Error(`${prefix} — not an object`);
   }
   const b = body as Record<string, unknown>;
-  if (b.pool === undefined) {
-    throw new Error(`${prefix} — missing pool`);
+  if (b.crew === undefined) {
+    throw new Error(`${prefix} — missing crew`);
   }
-  return asPoolRow(b.pool, prefix, 'pool');
+  return asCrewRow(b.crew, prefix, 'crew');
 }
 
 /**
- * Narrow `POST /api/delete_pool`'s 200 body. `poolId` and `deleted` are always
+ * Narrow `POST /api/delete_crew`'s 200 body. `crewId` and `deleted` are always
  * present (`deleted` is a genuine boolean — both values are valid, deliberate
- * hub answers, exactly like `asLabelBindingRemoved`). Each of the six transfer
+ * hub answers, exactly like `asCapabilityRouteRemoved`). Each of the six transfer
  * fields is validated ONLY IF PRESENT and OMITTED from the returned object when
  * absent — never defaulted to `0`, `null`, or `[]`. Absence is the hub's way of
  * saying "nothing moved"; default-filling would assert a transfer that never
  * happened. `runsTransferred`/`runningRunsTransferred` are ARRAYS OF IDS, not
  * counts — `stampsTransferred`/`membersRemoved` are the counts.
  */
-export function asPoolDeleted(body: unknown): PoolDeletedWire {
-  const prefix = 'delete_pool: malformed success response';
+export function asCrewDeleted(body: unknown): CrewDeletedWire {
+  const prefix = 'delete_crew: malformed success response';
   if (typeof body !== 'object' || body === null) {
     throw new Error(`${prefix} — not an object`);
   }
   const b = body as Record<string, unknown>;
-  if (typeof b.poolId !== 'string' || b.poolId === '') {
-    throw new Error(`${prefix} — missing non-empty string poolId`);
+  if (typeof b.crewId !== 'string' || b.crewId === '') {
+    throw new Error(`${prefix} — missing non-empty string crewId`);
   }
   if (typeof b.deleted !== 'boolean') {
     throw new Error(`${prefix} — missing boolean deleted`);
   }
-  const out: PoolDeletedWire = { poolId: b.poolId, deleted: b.deleted };
+  const out: CrewDeletedWire = { crewId: b.crewId, deleted: b.deleted };
   const numberIfPresent = (field: 'membersRemoved' | 'stampsTransferred'): void => {
     if (b[field] === undefined) return;
     if (typeof b[field] !== 'number') {
@@ -1523,7 +1523,7 @@ export function asPoolDeleted(body: unknown): PoolDeletedWire {
     }
     out[field] = b[field] as number;
   };
-  const stringIfPresent = (field: 'orphanPoolId' | 'orphanPoolName'): void => {
+  const stringIfPresent = (field: 'orphanCrewId' | 'orphanCrewName'): void => {
     if (b[field] === undefined) return;
     if (typeof b[field] !== 'string' || b[field] === '') {
       throw new Error(`${prefix} — ${field} must be a non-empty string`);
@@ -1539,17 +1539,17 @@ export function asPoolDeleted(body: unknown): PoolDeletedWire {
     out[field] = v as string[];
   };
   numberIfPresent('membersRemoved');
-  stringIfPresent('orphanPoolId');
-  stringIfPresent('orphanPoolName');
+  stringIfPresent('orphanCrewId');
+  stringIfPresent('orphanCrewName');
   numberIfPresent('stampsTransferred');
   stringArrayIfPresent('runsTransferred');
   stringArrayIfPresent('runningRunsTransferred');
   return out;
 }
 
-/** Narrow `POST /api/add_pool_member`'s 200 body (`{ text, member }`) to the typed row. */
-export function asPoolMemberAdded(body: unknown): PoolMemberWire {
-  const prefix = 'add_pool_member: malformed success response';
+/** Narrow `POST /api/add_crew_member`'s 200 body (`{ text, member }`) to the typed row. */
+export function asCrewMemberAdded(body: unknown): CrewMemberWire {
+  const prefix = 'add_crew_member: malformed success response';
   if (typeof body !== 'object' || body === null) {
     throw new Error(`${prefix} — not an object`);
   }
@@ -1557,23 +1557,23 @@ export function asPoolMemberAdded(body: unknown): PoolMemberWire {
   if (b.member === undefined) {
     throw new Error(`${prefix} — missing member`);
   }
-  return asPoolMemberRow(b.member, prefix, 'member');
+  return asCrewMemberRow(b.member, prefix, 'member');
 }
 
 /**
- * Narrow `POST /api/remove_pool_member`'s 200 body (`{ text, poolId,
+ * Narrow `POST /api/remove_crew_member`'s 200 body (`{ text, crewId,
  * principalId, removed }`). `removed` must be a genuine boolean — both values
  * are valid, deliberate hub answers: `false` means the principal was never a
- * member (tolerant, a normal success), exactly like `asLabelBindingRemoved`.
+ * member (tolerant, a normal success), exactly like `asCapabilityRouteRemoved`.
  */
-export function asPoolMemberRemoved(body: unknown): PoolMemberRemovedWire {
-  const prefix = 'remove_pool_member: malformed success response';
+export function asCrewMemberRemoved(body: unknown): CrewMemberRemovedWire {
+  const prefix = 'remove_crew_member: malformed success response';
   if (typeof body !== 'object' || body === null) {
     throw new Error(`${prefix} — not an object`);
   }
   const b = body as Record<string, unknown>;
-  if (typeof b.poolId !== 'string' || b.poolId === '') {
-    throw new Error(`${prefix} — missing non-empty string poolId`);
+  if (typeof b.crewId !== 'string' || b.crewId === '') {
+    throw new Error(`${prefix} — missing non-empty string crewId`);
   }
   if (typeof b.principalId !== 'string' || b.principalId === '') {
     throw new Error(`${prefix} — missing non-empty string principalId`);
@@ -1581,7 +1581,7 @@ export function asPoolMemberRemoved(body: unknown): PoolMemberRemovedWire {
   if (typeof b.removed !== 'boolean') {
     throw new Error(`${prefix} — missing boolean removed`);
   }
-  return { poolId: b.poolId, principalId: b.principalId, removed: b.removed };
+  return { crewId: b.crewId, principalId: b.principalId, removed: b.removed };
 }
 
 /**
@@ -1590,7 +1590,7 @@ export function asPoolMemberRemoved(body: unknown): PoolMemberRemovedWire {
  * reason: the real 200 body carries a `text` field whose value CONTAINS the new
  * one-time `olp_` plaintext, so a caller must never spread the raw body.
  *
- * Rekey has NO `pools` field (re-keying preserves the agent's existing pool
+ * Rekey has NO `crews` field (re-keying preserves the agent's existing crew
  * membership — the verb changes none), so `MintAgentTokenOk`/`asMintAgentTokenOk`
  * cannot be reused. `scopes` and `revokedTokenIds` are non-secret handles.
  */

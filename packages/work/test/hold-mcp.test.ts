@@ -107,12 +107,12 @@ test('submit posts a receipt for the bound run and echoes the outcome', async ()
 // so the hub's attribution columns get filled.
 test('submit carries the bound holder through to the hub', async () => {
   const { hub, calls } = mockHub({ submit: { outcome: 'accepted', closed: false } });
-  const mount = createHoldMcp(deps(hub, { holder: { kind: 'session', id: 's-1', conductorId: 'cnd_1' } }));
+  const mount = createHoldMcp(deps(hub, { holder: { kind: 'session', id: 's-1', shiftId: 'shf_1' } }));
   await tool(mount.tools, 'submit').handler({ path: 'pr', value: { url: 'x' }, done: false }, ctx);
   assert.deepEqual(calls, [
     {
       verb: 'submit',
-      arg: { workflow: 'wf1', run: 'run1', path: 'pr', value: { url: 'x' }, done: false, holder: { kind: 'session', id: 's-1', conductorId: 'cnd_1' } },
+      arg: { workflow: 'wf1', run: 'run1', path: 'pr', value: { url: 'x' }, done: false, holder: { kind: 'session', id: 's-1', shiftId: 'shf_1' } },
     },
   ]);
 });

@@ -569,8 +569,8 @@ export interface MintAgentResult {
   id: string;
   /** The minted agent's id — a non-secret handle. */
   agentId: string;
-  /** Resolved pool NAMES from the server. */
-  pools: string[];
+  /** Resolved crew NAMES from the server. */
+  crews: string[];
   /**
    * The minted token's scopes — the client-resolved request value (the H3 route
    * requires non-empty scopes and honors them verbatim, so request == minted).
@@ -603,15 +603,15 @@ export interface MintAgentResult {
  *   today; explicit for symmetry with the store/refresh signatures).
  * @param params.scopes defaults to `['work']` — the H3 route REQUIRES a
  *   non-empty `scopes`; an empty list is server-refused.
- * @param params.pools omitted when absent so the server defaults to the minter's
- *   personal pool (`pools: []` is server-refused with `pool_invalid`).
+ * @param params.crews omitted when absent so the server defaults to the minter's
+ *   personal crew (`crews: []` is server-refused with `crew_invalid`).
  */
 export async function mintAgentCredential(
   io: CredentialIO,
   origin: string,
   humanSlot: CredentialSlotSelector,
   cred: Credential,
-  params: { name: string; pools?: string[]; scopes?: string[] },
+  params: { name: string; crews?: string[]; scopes?: string[] },
 ): Promise<MintAgentResult> {
   // 1. Validate the agent name before any I/O. The client regex is byte-identical
   //    to the server's, so this can never mask a server-side "invalid name" —
@@ -642,12 +642,12 @@ export async function mintAgentCredential(
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      // `pools` omitted entirely when absent (server default = personal pool);
+      // `crews` omitted entirely when absent (server default = personal crew);
       // never sent as `[]` (server-refused).
       body: JSON.stringify({
         name: params.name,
         scopes,
-        ...(params.pools !== undefined ? { pools: params.pools } : {}),
+        ...(params.crews !== undefined ? { crews: params.crews } : {}),
       }),
     });
 
@@ -666,7 +666,7 @@ export async function mintAgentCredential(
   }
 
   // 6. Any other non-2xx: surface the hub's typed `message` VERBATIM (this is how
-  //    H1's `agent name already taken: "…"`, `pool_invalid`, `bad_request`, and
+  //    H1's `agent name already taken: "…"`, `crew_invalid`, `bad_request`, and
   //    `forbidden` all surface uniformly). Never include raw body text.
   if (!res.ok) {
     let message: string | undefined;
@@ -724,7 +724,7 @@ export async function mintAgentCredential(
   // 9. Return non-secret handles only — no token field exists to leak. `scopes`
   //    is the client-resolved request value (server honors it verbatim), not a
   //    server-body field — the mint response guard does not parse scopes.
-  return { id: ok.id, agentId: ok.agentId, pools: ok.pools, scopes, storage };
+  return { id: ok.id, agentId: ok.agentId, crews: ok.crews, scopes, storage };
 }
 
 /**
@@ -734,8 +734,8 @@ export async function mintAgentCredential(
  *
  * `revokedTokenIds` are the ids the rekey invalidated server-side — the OLD
  * installation's credential(s). Their presence is the honest signal that any
- * still-running copy of this agent elsewhere is now disconnected. No `pools`
- * field: rekey changes no pool membership.
+ * still-running copy of this agent elsewhere is now disconnected. No `crews`
+ * field: rekey changes no crew membership.
  */
 export interface RekeyAgentResult {
   /** New token id — a non-secret revocation handle. */
@@ -757,8 +757,8 @@ export interface RekeyAgentResult {
  * `agent:<name>` slot — overwriting the old one. Sibling of
  * `mintAgentCredential` with the identical §6 discipline; the only shape
  * differences are the endpoint (`/api/rekey_agent_token`), the request body
- * (`{agentId}` — no name/scopes/pools; rekey preserves pools), and the response
- * guard (`asRekeyAgentTokenOk` — no `pools` field).
+ * (`{agentId}` — no name/scopes/crews; rekey preserves crews), and the response
+ * guard (`asRekeyAgentTokenOk` — no `crews` field).
  *
  * **The token NEVER leaves this function.** It flows exactly one hop —
  * `asRekeyAgentTokenOk(body).token` → `storeCredential` — and is never returned,

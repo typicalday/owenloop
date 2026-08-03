@@ -64,8 +64,8 @@ test('loadSettings: commandRouting passes through when set', () => {
   try {
     const dir = join(xdg, 'owenloop');
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'settings.json'), JSON.stringify({ commandRouting: 'conductor' }));
-    assert.equal(loadSettings({ XDG_CONFIG_HOME: xdg }).commandRouting, 'conductor');
+    writeFileSync(join(dir, 'settings.json'), JSON.stringify({ commandRouting: 'manual' }));
+    assert.equal(loadSettings({ XDG_CONFIG_HOME: xdg }).commandRouting, 'manual');
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
@@ -98,7 +98,7 @@ test('loadSettings: each C6 knob loads with its value', () => {
       cacheDir: '/c',
       stateDir: '/s',
       dispatchCap: 7,
-      commandRouting: 'conductor',
+      commandRouting: 'manual',
       maxConcurrentAgents: 2,
     }),
   );
@@ -108,7 +108,7 @@ test('loadSettings: each C6 knob loads with its value', () => {
     assert.equal(s.cacheDir, '/c');
     assert.equal(s.stateDir, '/s');
     assert.equal(s.dispatchCap, 7);
-    assert.equal(s.commandRouting, 'conductor');
+    assert.equal(s.commandRouting, 'manual');
     assert.equal(s.maxConcurrentAgents, 2);
   } finally {
     rmSync(xdg, { recursive: true, force: true });
@@ -161,7 +161,7 @@ test('loadSettings: dispatchCap rejects 0, negative, and non-integer', () => {
 test('loadSettings: commandRouting rejects an unknown literal', () => {
   const xdg = withSettingsFile(JSON.stringify({ commandRouting: 'nope' }));
   try {
-    assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), /'commandRouting' must be 'proxy' or 'conductor'/);
+    assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), /'commandRouting' must be 'shift' or 'manual'/);
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }

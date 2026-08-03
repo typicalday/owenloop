@@ -24,7 +24,7 @@ const macrotaskSleep = (): Promise<void> => new Promise((r) => setImmediate(r));
 
 interface OrderOpts {
   command?: string;
-  worker?: string;
+  executor?: string;
   workdir?: string;
   owes?: string[];
   claimed?: boolean;
@@ -46,7 +46,7 @@ function commandOrder(o: OrderOpts = {}): GetOrderResponse {
       inputs: [],
       outputs: [],
       ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
-      worker: o.worker ?? 'command',
+      executor: o.executor ?? 'command',
       command: o.command ?? 'echo hi',
       prompt: '',
       consumes: {},
@@ -288,9 +288,9 @@ test('a null order packet is a misroute — release, no run, no submit', async (
   assert.equal(only(calls, 'release').length, 1);
 });
 
-test('an agent (non-command) worker is a misroute', async () => {
+test('an agent (non-command) executor is a misroute', async () => {
   const fr = fakeRunner();
-  const { hub, calls } = mockHub({ getOrder: [commandOrder({ worker: 'agent' })] });
+  const { hub, calls } = mockHub({ getOrder: [commandOrder({ executor: 'agent' })] });
   const loop = createExecLoop(baseOpts(hub, fr.runner));
   assert.equal(await loop.run(), 'misroute');
   assert.equal(fr.starts.length, 0);

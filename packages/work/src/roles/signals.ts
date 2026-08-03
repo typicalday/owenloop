@@ -1,13 +1,13 @@
 /**
- * Process-lifecycle signal seams shared by the standing roles (`proxy`, `hold`).
+ * Process-lifecycle signal seams shared by the standing roles (`shift`, `hold`).
  *
- * Extracted from `src/roles/proxy.ts` (C3) so C4's `hold` reuses the exact
+ * Extracted from `src/roles/shift.ts` (C3) so C4's `hold` reuses the exact
  * same shutdown mechanism instead of inventing a second one. Two seams:
  *
  *  - `installSignalHandlers` — first SIGINT/SIGTERM flips the target's
  *    `stop(reason?)`; a second signal (either kind) hard-exits 130 (an
  *    operator insisting). The role name and the first-signal drain note are
- *    parameterized so each role prints its own line; proxy's defaults keep its
+ *    parameterized so each role prints its own line; shift's defaults keep its
  *    messages byte-identical to C3 (its regression test asserts them).
  *  - `watchStdinEof` — fires a callback once when stdin reaches EOF (`end` or
  *    `close`). For `hold`, stdin EOF is the parent-session-death signal (a live
@@ -27,15 +27,15 @@ export interface SignalHost {
 
 /** Message/behavior knobs for a role's signal wiring. */
 export interface SignalOptions {
-  /** Role name for the message prefix `owenloop work <role>:` (default `proxy`). */
+  /** Role name for the message prefix `owenloop work <role>:` (default `shift`). */
   role?: string;
-  /** First-signal note after `<sig> received — ` (default proxy's drain note). */
+  /** First-signal note after `<sig> received — ` (default shift's drain note). */
   drainNote?: string;
   /** Reason handed to `target.stop()` on the first signal (roles that care). */
   stopReason?: string;
 }
 
-const DEFAULT_ROLE = 'proxy';
+const DEFAULT_ROLE = 'shift';
 const DEFAULT_DRAIN_NOTE = 'draining, in-flight children keep running';
 
 /**

@@ -288,14 +288,14 @@ test('prepare fetches, caches, and normalizes every agent step into steps/<step>
       brief: 'You are the planner. Produce a plan.',
       permissions: { extensions: {} },
     });
-    // A worker:command step is not an agent step and gets no spec.
+    // A executor:command step is not an agent step and gets no spec.
     assert.equal(existsSync(join(hd, 'steps', 'deprovisioner.json')), false);
 
     assert.match(r.stdout, /normalized 3 step spec\(s\)/);
     // reviewer's `x.harness` is present but EMPTY, planner has none at all —
     // both carry zero options, so both are reported together.
     assert.match(r.stdout, /no harness options declared: reviewer, planner$/m);
-    assert.match(r.stdout, /skipped \(worker:command\): deprovisioner/);
+    assert.match(r.stdout, /skipped \(executor:command\): deprovisioner/);
   } finally {
     await closed(server);
   }

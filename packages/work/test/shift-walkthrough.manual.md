@@ -75,6 +75,6 @@ The automated CLI-child simulation proves the shared command and Unix-socket tra
 
 ## Gate residual gap
 
-A repository search found no production `type: 'gate'` construction today. `GateEvent` is defined in `packages/work/src/shift/protocol.ts` as a reserved future representation, but the current repository has no pending-gates method in `packages/work/src/hub/client.ts`, and `packages/work/src/proxy/loop.ts` does not construct a `gate` event. The server test `status, atomic clock-in validation, attendance, typed gate event drain, and wait timeout` covers the existing typed event FIFO and local poll-reply path without inventing a hub integration.
+A repository search found no production `type: 'gate'` construction today. `GateEvent` is defined in `packages/work/src/shift/protocol.ts` as a reserved future representation, but the current repository has no pending-gates method in `packages/work/src/hub/client.ts`, and `packages/work/src/shift/loop.ts` does not construct a `gate` event. The server test `status, atomic clock-in validation, attendance, typed gate event drain, and wait timeout` covers the existing typed event FIFO and local poll-reply path without inventing a hub integration.
 
 A real `gate arrives -> shift next returns the gate -> a human replies -> owenloop provide -> polling resumes` drill cannot run until a separate scoped change adds hub polling and a gate producer in this repository. The current test must not be read as end-to-end gate coverage; the live gate round-trip is the residual production gap.

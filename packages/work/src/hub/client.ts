@@ -53,7 +53,7 @@ export interface HubClient {
   whoami(): Promise<WhoamiResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
   wake(cursor?: number): Promise<WakeResponse>;
-  /** B4 Conductor presence register/refresh. */
+  /** B4 Shift presence register/refresh. */
   presencePing(req: PresencePingRequest): Promise<PresencePingResponse>;
 }
 

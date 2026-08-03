@@ -3,7 +3,7 @@ import { test } from 'node:test';
 
 import {
   ACCOUNT_TOKEN,
-  CONDUCTOR_TOKEN,
+  SHIFT_TOKEN,
   ORDER_TOKEN,
   ORIGIN_TOKEN,
   buildOwenloopMcp,
@@ -32,7 +32,7 @@ test('the four substitution tokens are the exact strings published defs embed', 
   assert.equal(ORDER_TOKEN, '__OWENLOOP_ORDER__');
   assert.equal(ORIGIN_TOKEN, '__OWENLOOP_ORIGIN__');
   assert.equal(ACCOUNT_TOKEN, '__OWENLOOP_ACCOUNT__');
-  assert.equal(CONDUCTOR_TOKEN, '__OWENLOOP_CONDUCTOR__');
+  assert.equal(SHIFT_TOKEN, '__OWENLOOP_SHIFT__');
 });
 
 test('renderBrief substitutes all four tokens, every occurrence', () => {
@@ -40,19 +40,19 @@ test('renderBrief substitutes all four tokens, every occurrence', () => {
     `order=${ORDER_TOKEN}`,
     `origin=${ORIGIN_TOKEN}`,
     `account=${ACCOUNT_TOKEN}`,
-    `cid=${CONDUCTOR_TOKEN}`,
+    `cid=${SHIFT_TOKEN}`,
     `again=${ORDER_TOKEN}`,
   ].join('\n');
-  const out = renderBrief(template, spec({ conductorId: 'cnd_abc' }));
+  const out = renderBrief(template, spec({ shiftId: 'shf_abc' }));
   assert.equal(
     out,
-    ['order=wf1/run_11111111', 'origin=https://hub.example', 'account=default', 'cid=cnd_abc', 'again=wf1/run_11111111'].join('\n'),
+    ['order=wf1/run_11111111', 'origin=https://hub.example', 'account=default', 'cid=shf_abc', 'again=wf1/run_11111111'].join('\n'),
   );
   assert.equal(/__OWENLOOP_/.test(out), false, 'no token may survive substitution');
 });
 
-test('renderBrief: an absent conductorId substitutes the empty string', () => {
-  assert.equal(renderBrief(`[${CONDUCTOR_TOKEN}]`, spec()), '[]');
+test('renderBrief: an absent shiftId substitutes the empty string', () => {
+  assert.equal(renderBrief(`[${SHIFT_TOKEN}]`, spec()), '[]');
 });
 
 test('renderBrief leaves template text alone when it holds no tokens', () => {
@@ -60,7 +60,7 @@ test('renderBrief leaves template text alone when it holds no tokens', () => {
 });
 
 test('buildOwenloopMcp emits the born-bound work-holder argv', () => {
-  assert.deepEqual(buildOwenloopMcp(spec({ conductorId: 'cnd_abc' })), {
+  assert.deepEqual(buildOwenloopMcp(spec({ shiftId: 'shf_abc' })), {
     command: 'owenloop',
     args: ['work', 
       'hold',
@@ -70,16 +70,16 @@ test('buildOwenloopMcp emits the born-bound work-holder argv', () => {
       'https://hub.example',
       '--as',
       'default',
-      '--conductor=cnd_abc',
+      '--shift=shf_abc',
       '--mcp',
     ],
   });
 });
 
-test('buildOwenloopMcp: --conductor is ONE argv element, empty value when absent', () => {
+test('buildOwenloopMcp: --shift is ONE argv element, empty value when absent', () => {
   const { args } = buildOwenloopMcp(spec());
-  assert.equal(args.includes('--conductor'), false, 'the two-element form is wrong');
-  assert.equal(args.includes('--conductor='), true);
+  assert.equal(args.includes('--shift'), false, 'the two-element form is wrong');
+  assert.equal(args.includes('--shift='), true);
 });
 
 /**
@@ -90,7 +90,7 @@ test('buildOwenloopMcp: --conductor is ONE argv element, empty value when absent
  */
 test('buildOwenloopMcp carries no credential', () => {
   const token = 'sk_live_notarealsecret';
-  const flat = JSON.stringify(buildOwenloopMcp(spec({ account: 'default', conductorId: 'cnd_abc' })));
+  const flat = JSON.stringify(buildOwenloopMcp(spec({ account: 'default', shiftId: 'shf_abc' })));
   assert.equal(flat.includes(token), false);
   assert.equal(/token|bearer|secret|password|api[-_]?key/i.test(flat), false, `credential-shaped text in the mount: ${flat}`);
 });

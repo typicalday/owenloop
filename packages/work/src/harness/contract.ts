@@ -3,7 +3,7 @@
  * the only shapes the runner speaks.
  *
  * Why it exists: owenloop moved from writing per-order subagent files into
- * a vendor CLI's own directory and handing a lean order to an external Conductor,
+ * a vendor CLI's own directory and handing a lean order to an external Shift,
  * to HOSTING each step agent itself behind a per-harness adapter, with a
  * provider-native session token persisted per step attempt so a rejected step
  * can be RESUMED rather than restarted. This file is the seam that makes the
@@ -121,7 +121,7 @@ export interface StartArgs {
    *
    * BUILT BY THE RUNNER, NOT BY AN ADAPTER: `src/agent/brief.ts` constructs the
    * born-bound `hold --order <workflow>/<run> --origin <url> --as <account>
-   * --conductor=<cid> --mcp` argv from the live order. An adapter mounts it
+   * --shift=<cid> --mcp` argv from the live order. An adapter mounts it
    * verbatim and never constructs it — the order id, origin, and account ride
    * argv, never the prompt.
    */

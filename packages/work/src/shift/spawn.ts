@@ -1,14 +1,14 @@
 /**
  * The detached-exec spawn seam (plan decision 6).
  *
- * Every order the proxy dispatches becomes a DETACHED
+ * Every order the shift dispatches becomes a DETACHED
  * `owenloop work exec <workflow>/<run> --origin <url>` child: `detached: true`,
  * `stdio: 'ignore'`, `unref()` — so the child is its own process-group leader and
- * survives the parent's death (SP5-verified kernel reparenting). The proxy meters
+ * survives the parent's death (SP5-verified kernel reparenting). The shift meters
  * and hands off; the child self-leases (C5). Both ids ride the argv as the
  * composite `<workflow>/<run>` order-id `owenloop work exec` parses, and `--origin`
- * is passed through so the detached child reaches the SAME hub the proxy is
- * parked at without re-reading settings. The proxy-resolved account rides the
+ * is passed through so the detached child reaches the SAME hub the shift is
+ * parked at without re-reading settings. The shift-resolved account rides the
  * child's spawn ENV as `OWENLOOP_ACCOUNT` (exec has no `--as` flag — the spawn
  * env is the contract), selecting which Scoped Identity credential slot
  * (agent:<account>) exec reads.
@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 /**
  * What to spawn: the order to run. `run` IS the order id (hub verb contract);
  * `workflow` pairs with it (every hub verb needs both). The hub `origin` is NOT
- * here — it is captured by `createDefaultSpawner` (one hub per proxy), so the
+ * here — it is captured by `createDefaultSpawner` (one hub per shift), so the
  * loop, which knows only the order, calls the seam without carrying it.
  */
 export interface SpawnSpec {
@@ -92,15 +92,15 @@ export function resolveOwenloopBin(): string {
  * environment inheritance (which is otherwise implicit when `env` is unset),
  * then sets the resolved account on top.
  *
- * `conductorId` (W7, trailing — after `execPath` so existing positional
- * callers are unaffected), when non-empty, appends `--conductor <cid>` so the
- * spawned `owenloop work exec` child self-declares which Conductor dispatched it
+ * `shiftId` (W7, trailing — after `execPath` so existing positional
+ * callers are unaffected), when non-empty, appends `--shift <cid>` so the
+ * spawned `owenloop work exec` child self-declares which Shift dispatched it
  * (advisory only, D8/INV-82). Omitted/empty carries no flag at all.
  *
  * Phase 3 (D6) widens this ONE seam rather than adding a second: `spec.kind`
  * selects the role positional (`exec` vs `agent-run`) and `spec.harness`
  * appends `--harness <id>` on the `agent-run` branch. Everything else — the
- * composite order positional, `--origin`, `--conductor`, and every spawn option
+ * composite order positional, `--origin`, `--shift`, and every spawn option
  * — is identical for both kinds, so an agent-run child is detached,
  * stdio-ignored, and account-scoped exactly like an exec child.
  */
@@ -110,7 +110,7 @@ export function buildSpawnPlan(
   account: string,
   binPath: string,
   execPath: string = process.execPath,
-  conductorId?: string,
+  shiftId?: string,
 ): SpawnPlan {
   const role = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
   return {
@@ -122,7 +122,7 @@ export function buildSpawnPlan(
       `${spec.workflow}/${spec.run}`,
       '--origin',
       origin,
-      ...(conductorId !== undefined && conductorId !== '' ? ['--conductor', conductorId] : []),
+      ...(shiftId !== undefined && shiftId !== '' ? ['--shift', shiftId] : []),
       ...(role === 'agent-run' && spec.harness !== undefined && spec.harness !== ''
         ? ['--harness', spec.harness]
         : []),
@@ -133,20 +133,20 @@ export function buildSpawnPlan(
 
 /**
  * The default detached spawner. Captures the resolved hub `origin`, the
- * resolved `account`, the packaged bin path, and the dispatching Conductor's
- * `conductorId` once at construction; each spawn threads them into the
+ * resolved `account`, the packaged bin path, and the dispatching Shift's
+ * `shiftId` once at construction; each spawn threads them into the
  * child's argv + spawn env. `execPath` is passed explicitly (rather than
- * relying on `buildSpawnPlan`'s default) so `conductorId` — trailing after it
+ * relying on `buildSpawnPlan`'s default) so `shiftId` — trailing after it
  * — can be supplied positionally.
  */
 export function createDefaultSpawner(
   origin: string,
   account: string,
   binPath: string = resolveOwenloopBin(),
-  conductorId?: string,
+  shiftId?: string,
 ): Spawner {
   return (spec: SpawnSpec): SpawnResult => {
-    const plan = buildSpawnPlan(spec, origin, account, binPath, process.execPath, conductorId);
+    const plan = buildSpawnPlan(spec, origin, account, binPath, process.execPath, shiftId);
     const child = spawn(plan.command, plan.args, plan.options);
     child.unref();
     if (child.pid === undefined) {

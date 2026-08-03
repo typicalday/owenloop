@@ -28,7 +28,7 @@
     },
     {
       "name": "deprovisioner",
-      "worker": "command",
+      "executor": "command",
       "command": "owenloop-deprovision"
     }
   ]

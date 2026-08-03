@@ -376,7 +376,7 @@ export interface IdentityRow {
   name: string;
   createdAt: number;
   lastContactAt: number | null;
-  pools: string[];
+  crews: string[];
   disabled: boolean;
 }
 
@@ -404,7 +404,7 @@ export interface IdentityHubState {
 export interface SeedIdentity {
   id?: string;
   name: string;
-  pools?: string[];
+  crews?: string[];
   lastContactAt?: number | null;
   lastUsedAt?: number | null;
   disabled?: boolean;
@@ -451,7 +451,7 @@ export function makeIdentityHub(seed: { identities?: SeedIdentity[] } = {}): {
       name: s.name,
       createdAt: Date.now(),
       lastContactAt: s.lastContactAt ?? null,
-      pools: s.pools ?? [],
+      crews: s.crews ?? [],
       disabled: s.disabled ?? false,
     });
     if (s.token) {
@@ -511,7 +511,7 @@ export function makeIdentityHub(seed: { identities?: SeedIdentity[] } = {}): {
         firstContactAt: null,
         lastContactAt: id.lastContactAt,
         lastUsedAt: computedLastUsedAt(id.id),
-        pools: id.pools,
+        crews: id.crews,
       }));
       return { status: 200, json: { identities } };
     },
@@ -519,7 +519,7 @@ export function makeIdentityHub(seed: { identities?: SeedIdentity[] } = {}): {
     // --- token verbs ---
     'POST /api/mint_agent_token': (req) => {
       if (!requireHuman(req.authorization)) return { status: 403, json: { message: 'forbidden' } };
-      const body = JSON.parse(req.body ?? '{}') as { name?: string; scopes?: string[]; pools?: string[] };
+      const body = JSON.parse(req.body ?? '{}') as { name?: string; scopes?: string[]; crews?: string[] };
       const name = body.name ?? '';
       if ([...state.identities.values()].some((i) => i.name === name)) {
         return { status: 400, json: { message: `agent name already taken: "${name}"` } };
@@ -528,12 +528,12 @@ export function makeIdentityHub(seed: { identities?: SeedIdentity[] } = {}): {
       const agentId = `agent_${n}`;
       const tokenId = `tok_${n}`;
       const plaintext = `olp_minted_${n}_secretpart`;
-      const pools = body.pools ?? ['personal-alex'];
-      state.identities.set(agentId, { id: agentId, name, createdAt: Date.now(), lastContactAt: null, pools, disabled: false });
+      const crews = body.crews ?? ['personal-alex'];
+      state.identities.set(agentId, { id: agentId, name, createdAt: Date.now(), lastContactAt: null, crews, disabled: false });
       state.tokens.set(tokenId, { id: tokenId, plaintext, agentId, revoked: false, lastUsedAt: null });
       return {
         status: 200,
-        json: { text: `Agent token minted (id ${tokenId}). Store this secret now — it will not be shown again:\n${plaintext}`, id: tokenId, token: plaintext, agentId, pools },
+        json: { text: `Agent token minted (id ${tokenId}). Store this secret now — it will not be shown again:\n${plaintext}`, id: tokenId, token: plaintext, agentId, crews },
       };
     },
     'POST /api/rekey_agent_token': (req) => {

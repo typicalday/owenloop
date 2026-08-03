@@ -42,7 +42,7 @@ function log(e: EngineEvent): void {
 
 let wf = '';
 
-// The event-driven worker: every `settled` carries the eligible set, so we pull
+// The event-driven loop: every `settled` carries the eligible set, so we pull
 // and green exactly the work it reports — no `status` poll, no timer. Greening
 // an output commits and re-settles synchronously, which re-enters this handler
 // for the next step, walking the pipeline to `done`.

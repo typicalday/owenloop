@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
-import { parseArgs, resolveTarget, resolveHolder, resolveConductorId, exitCodeFor, run } from '../src/roles/hold.ts';
+import { parseArgs, resolveTarget, resolveHolder, resolveShiftId, exitCodeFor, run } from '../src/roles/hold.ts';
 import type { HoldOutcome } from '../src/hold/loop.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
@@ -85,11 +85,11 @@ test('parseArgs reads --jump-tolerance and validates it like the interval', () =
   assert.match(parseArgs(['--jump-tolerance']).error!, /missing value/);
 });
 
-// W7: --conductor both value forms, and its absence defaults to undefined.
-test('parseArgs reads --conductor, both value forms', () => {
-  assert.equal(parseArgs(['--order', 'wf1/run1', '--conductor', 'cnd_a']).conductor, 'cnd_a');
-  assert.equal(parseArgs(['--order', 'wf1/run1', '--conductor=cnd_b']).conductor, 'cnd_b');
-  assert.equal(parseArgs(['--order', 'wf1/run1']).conductor, undefined);
+// W7: --shift both value forms, and its absence defaults to undefined.
+test('parseArgs reads --shift, both value forms', () => {
+  assert.equal(parseArgs(['--order', 'wf1/run1', '--shift', 'shf_a']).shift, 'shf_a');
+  assert.equal(parseArgs(['--order', 'wf1/run1', '--shift=shf_b']).shift, 'shf_b');
+  assert.equal(parseArgs(['--order', 'wf1/run1']).shift, undefined);
 });
 
 // ---- target resolution ------------------------------------------------------
@@ -135,27 +135,27 @@ test('resolveHolder prefers --session, falls back to OWENLOOP_SESSION, else an a
   });
 });
 
-// W7: the resolved conductorId (when known) rides along on the holder,
+// W7: the resolved shiftId (when known) rides along on the holder,
 // whichever branch of session-id resolution won — advisory only (D8/INV-82).
-test('resolveHolder threads conductorId onto the holder when known, omits it when absent', () => {
-  assert.deepEqual(resolveHolder('sess-a', {}, { conductorId: 'cnd_1' }), { kind: 'session', id: 'sess-a', conductorId: 'cnd_1' });
-  assert.deepEqual(resolveHolder(undefined, {}, { conductorId: 'cnd_1', hostname: 'h', pid: 7 }), {
+test('resolveHolder threads shiftId onto the holder when known, omits it when absent', () => {
+  assert.deepEqual(resolveHolder('sess-a', {}, { shiftId: 'shf_1' }), { kind: 'session', id: 'sess-a', shiftId: 'shf_1' });
+  assert.deepEqual(resolveHolder(undefined, {}, { shiftId: 'shf_1', hostname: 'h', pid: 7 }), {
     kind: 'session',
     id: 'anon:h:7',
-    conductorId: 'cnd_1',
+    shiftId: 'shf_1',
   });
-  assert.deepEqual(resolveHolder('sess-a', {}), { kind: 'session', id: 'sess-a' }); // no conductorId key at all
+  assert.deepEqual(resolveHolder('sess-a', {}), { kind: 'session', id: 'sess-a' }); // no shiftId key at all
 });
 
-// W7: flag > OWENLOOP_CONDUCTOR_ID env > undefined; an empty flag value does
-// NOT fall through to the env var (a deliberate `--conductor=` override of
+// W7: flag > OWENLOOP_SHIFT_ID env > undefined; an empty flag value does
+// NOT fall through to the env var (a deliberate `--shift=` override of
 // "no cid" is honored, matching the frontmatter degrade-safely contract).
-test('resolveConductorId prefers --conductor flag, falls back to OWENLOOP_CONDUCTOR_ID, else undefined', () => {
-  assert.equal(resolveConductorId('cnd_a', {}), 'cnd_a');
-  assert.equal(resolveConductorId(undefined, { OWENLOOP_CONDUCTOR_ID: 'cnd_env' }), 'cnd_env');
-  assert.equal(resolveConductorId(undefined, {}), undefined);
-  assert.equal(resolveConductorId(undefined, { OWENLOOP_CONDUCTOR_ID: '' }), undefined);
-  assert.equal(resolveConductorId('', { OWENLOOP_CONDUCTOR_ID: 'cnd_env' }), undefined);
+test('resolveShiftId prefers --shift flag, falls back to OWENLOOP_SHIFT_ID, else undefined', () => {
+  assert.equal(resolveShiftId('shf_a', {}), 'shf_a');
+  assert.equal(resolveShiftId(undefined, { OWENLOOP_SHIFT_ID: 'shf_env' }), 'shf_env');
+  assert.equal(resolveShiftId(undefined, {}), undefined);
+  assert.equal(resolveShiftId(undefined, { OWENLOOP_SHIFT_ID: '' }), undefined);
+  assert.equal(resolveShiftId('', { OWENLOOP_SHIFT_ID: 'shf_env' }), undefined);
 });
 
 // ---- exit-code mapping ------------------------------------------------------

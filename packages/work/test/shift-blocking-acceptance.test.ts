@@ -14,7 +14,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
-import { readChildRecords } from '../src/proxy/state.ts';
+import { readChildRecords } from '../src/shift/state.ts';
 import { OVERLAP_ERROR } from '../src/shift/protocol.ts';
 import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
 import { startMockHub, until, type HubReq } from './helpers/mcp-stdio-client.ts';
@@ -126,7 +126,7 @@ function orderPacket() {
     key: 'cmd',
     inputs: [],
     outputs: ['result'],
-    worker: 'command',
+    executor: 'command',
     command: 'sleep 5',
     prompt: '',
     consumes: {},
@@ -140,7 +140,7 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
   let orderVisible = true;
   const order = orderPacket();
   const bundle: CachedBundle = {
-    def: { name: 'demo', hash: 'hash-blocking', steps: [{ name: 'cmd', worker: 'command' }] },
+    def: { name: 'demo', hash: 'hash-blocking', steps: [{ name: 'cmd', executor: 'command' }] },
     fetchedAt: 0,
     origin: 'acceptance-test',
   };
@@ -195,9 +195,9 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
     const unattended = runCli(['shift', 'status', '--state-dir', stateDir]);
     const unattendedResult = await unattended.result;
     assert.equal(unattendedResult.code, 0);
-    const unattendedStatus = jsonResult<{ attended_at: number | null; serve_pools: string[] }>(unattendedResult);
+    const unattendedStatus = jsonResult<{ attended_at: number | null; serve_crews: string[] }>(unattendedResult);
     assert.equal(unattendedStatus.attended_at, null);
-    assert.deepEqual(unattendedStatus.serve_pools, ['crew-blocking']);
+    assert.deepEqual(unattendedStatus.serve_crews, ['crew-blocking']);
 
     const firstNext = runCli(['shift', 'next', '--wait', '90', '--state-dir', stateDir]);
     await until(
@@ -267,7 +267,7 @@ test('terminal-only daemon dispatches before any shift next and keeps presence u
   let orderVisible = true;
   const order = orderPacket();
   const bundle: CachedBundle = {
-    def: { name: 'demo', hash: 'hash-terminal-only', steps: [{ name: 'cmd', worker: 'command' }] },
+    def: { name: 'demo', hash: 'hash-terminal-only', steps: [{ name: 'cmd', executor: 'command' }] },
     fetchedAt: 0,
     origin: 'acceptance-test',
   };
@@ -351,7 +351,7 @@ test('attending shift survives cancellation and dispatches while no client is pa
   let orderVisible = true;
   const order = orderPacket();
   const bundle: CachedBundle = {
-    def: { name: 'demo', hash: 'hash-attending-cancel', steps: [{ name: 'cmd', worker: 'command' }] },
+    def: { name: 'demo', hash: 'hash-attending-cancel', steps: [{ name: 'cmd', executor: 'command' }] },
     fetchedAt: 0,
     origin: 'acceptance-test',
   };

@@ -27,7 +27,7 @@
  *            `OWENLOOP_ACCOUNT` (default `default`), with `OWENLOOP_TOKEN` as a
  *            documented dev-only override. A missing Scoped Identity key is a refuse
  *            (exit 2) naming the origin + a runnable `owenloop login` command. prepare
- *            has no `--as` flag — a Conductor sets `OWENLOOP_ACCOUNT` for a
+ *            has no `--as` flag — a Shift sets `OWENLOOP_ACCOUNT` for a
  *            non-default account.
  *   cache  — `OWENLOOP_CACHE_DIR` env → `settings.cacheDir` → XDG default.
  *
@@ -197,7 +197,7 @@ export async function run(args: string[]): Promise<number> {
   // Summary.
   out.write(`  normalized ${parent.specs.length} step spec(s)${idempotent ? ' (idempotent — hash already cached, not rewritten)' : ` -> ${cacheLocation}`}\n`);
   if (parent.noHarnessOptions.length > 0) out.write(`  no harness options declared: ${parent.noHarnessOptions.join(', ')}\n`);
-  if (parent.commandSkipped.length > 0) out.write(`  skipped (worker:command): ${parent.commandSkipped.join(', ')}\n`);
+  if (parent.commandSkipped.length > 0) out.write(`  skipped (executor:command): ${parent.commandSkipped.join(', ')}\n`);
   // calls-step messaging (DD-6): pinned children are cached (per-child lines);
   // an UNPINNED calls step (pre-feature publish, no children on the wire) keeps a
   // visible gap line.
@@ -245,7 +245,7 @@ function normalizeDef(def: FetchedDef): NormalizedDef {
   const callsSteps: string[] = [];
 
   for (const step of def.steps) {
-    if (step.worker === 'command') {
+    if (step.executor === 'command') {
       commandSkipped.push(step.name);
       continue;
     }

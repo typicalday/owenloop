@@ -36,7 +36,7 @@ test('prints path, exists:no, and defaults when no file exists (exit 0)', async 
     assert.match(out, /exists: no/);
     // Knobs with a built-in default print it; the rest print (unset).
     assert.match(out, /dispatchCap = 3 {2}\(default\)/);
-    assert.match(out, /commandRouting = proxy {2}\(default\)/);
+    assert.match(out, /commandRouting = shift {2}\(default\)/);
     assert.match(out, /hubOrigin = \(unset\)/);
   } finally {
     rmSync(home, { recursive: true, force: true });
@@ -48,7 +48,7 @@ test('prints each known knob with its value + (settings) provenance', async () =
     JSON.stringify({
       hubOrigin: 'https://hub.example',
       dispatchCap: 5,
-      commandRouting: 'conductor',
+      commandRouting: 'manual',
       maxConcurrentAgents: 2,
     }),
   );
@@ -58,7 +58,7 @@ test('prints each known knob with its value + (settings) provenance', async () =
     assert.match(out, /exists: yes/);
     assert.match(out, /hubOrigin = https:\/\/hub\.example {2}\(settings\)/);
     assert.match(out, /dispatchCap = 5 {2}\(settings\)/);
-    assert.match(out, /commandRouting = conductor {2}\(settings\)/);
+    assert.match(out, /commandRouting = manual {2}\(settings\)/);
     assert.match(out, /maxConcurrentAgents = 2 {2}\(settings\)/);
   } finally {
     rmSync(xdg, { recursive: true, force: true });

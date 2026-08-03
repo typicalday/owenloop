@@ -4,15 +4,15 @@ import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
-import { createProxyLoop } from '../src/proxy/loop.ts';
-import type { ProxyLoopOptions } from '../src/proxy/loop.ts';
+import { createShiftLoop } from '../src/shift/loop.ts';
+import type { ShiftLoopOptions } from '../src/shift/loop.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { WorkOrder } from '../src/hub/types.ts';
 import type { ShiftEvent } from '../src/shift/protocol.ts';
-import { writeChildRecord } from '../src/proxy/state.ts';
+import { writeChildRecord } from '../src/shift/state.ts';
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle, NormalizedStepSpec } from '../src/bundle/types.ts';
-import type { Spawner } from '../src/proxy/spawn.ts';
+import type { Spawner } from '../src/shift/spawn.ts';
 
 let root: string;
 let stateDir: string;
@@ -39,7 +39,7 @@ function mockHub(wakeChanged = false): { hub: HubClient; pings: Array<Record<str
   return { hub, pings };
 }
 
-function baseOpts(hub: HubClient, spawner: Spawner, extra: Partial<ProxyLoopOptions> = {}): ProxyLoopOptions {
+function baseOpts(hub: HubClient, spawner: Spawner, extra: Partial<ShiftLoopOptions> = {}): ShiftLoopOptions {
   return {
     hub,
     spawner,
@@ -50,7 +50,7 @@ function baseOpts(hub: HubClient, spawner: Spawner, extra: Partial<ProxyLoopOpti
     cacheDir,
     stateDir,
     cap: 3,
-    servePools: [],
+    serveCrews: [],
     name: 'box',
     workflow: 'wf1',
     pollIntervalMs: 10,
@@ -61,7 +61,7 @@ function baseOpts(hub: HubClient, spawner: Spawner, extra: Partial<ProxyLoopOpti
 
 function cacheCommand(): void {
   const bundle: CachedBundle = {
-    def: { name: 'demo', hash: 'hash', steps: [{ name: 'cmd', worker: 'command' }] },
+    def: { name: 'demo', hash: 'hash', steps: [{ name: 'cmd', executor: 'command' }] },
     fetchedAt: 0,
     origin: 'test',
   };
@@ -84,7 +84,7 @@ function order(step: string): WorkOrder {
 
 test('attendance is omitted before noteAttended and included after an immediate ping', async () => {
   const { hub, pings } = mockHub(false);
-  const loop = createProxyLoop(baseOpts(hub, () => ({ pid: 1000 })));
+  const loop = createShiftLoop(baseOpts(hub, () => ({ pid: 1000 })));
   await loop.iterate();
   assert.equal('attended_at' in pings[0]!, false);
 
@@ -100,7 +100,7 @@ test('successful command dispatch emits one dispatched event with the child pid'
   const events: ShiftEvent[] = [];
   const { hub } = mockHub(true);
   const spawner: Spawner = () => ({ pid: 4321 });
-  const loop = createProxyLoop(baseOpts(hub, spawner, {
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
     onEvent: (event) => events.push(event),
     // The mock hub returns the order only for per-workflow mode.
     workflow: 'wf1',
@@ -120,7 +120,7 @@ test('dead child reconciliation emits one reaped event', async () => {
   writeChildRecord(stateDir, { workflow: 'wf1', run: 'run_dead', pid: 77, spawnedAt: 0, kind: 'exec' });
   const events: ShiftEvent[] = [];
   const { hub } = mockHub(false);
-  const loop = createProxyLoop(baseOpts(hub, () => ({ pid: 1000 }), {
+  const loop = createShiftLoop(baseOpts(hub, () => ({ pid: 1000 }), {
     isAlive: () => false,
     onEvent: (event) => events.push(event),
   }));
@@ -133,7 +133,7 @@ test('spawn failure emits one failed event and writes no child record', async ()
   const events: ShiftEvent[] = [];
   const { hub } = mockHub(true);
   const spawner: Spawner = () => { throw new Error('fork bomb'); };
-  const loop = createProxyLoop(baseOpts(hub, spawner, {
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
     onEvent: (event) => events.push(event),
   }));
   hub.whatsNext = async (req) => req?.workflow === undefined

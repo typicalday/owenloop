@@ -100,14 +100,14 @@ import type { AddJournal, InstalledEntry, InstallCommitHandle, Lockfile } from '
 import {
   asAgentIdentities,
   asCreateWorkflowOk,
-  asLabelBindingAdded,
-  asLabelBindingRemoved,
-  asLabelBindings,
-  asPoolCreated,
-  asPoolDeleted,
-  asPoolMemberAdded,
-  asPoolMemberRemoved,
-  asPools,
+  asCapabilityRouteAdded,
+  asCapabilityRouteRemoved,
+  asCapabilityRoutes,
+  asCrewCreated,
+  asCrewDeleted,
+  asCrewMemberAdded,
+  asCrewMemberRemoved,
+  asCrews,
   asWhoami,
   computeServerDiff,
   credentialBackend,
@@ -543,19 +543,19 @@ Commands:
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
   push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
-  agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --conductor = --scopes work,run)
-  binding new <label> <pool> [--hub <url>]   add a pool to a workflow label on the hub org — a label may bind many pools (admin; human credential)
-  binding rm <label> <pool> [--hub <url>]  remove one (label, pool) binding
-  binding list [--hub <url>]               list the hub org's label bindings
-  pool list [--hub <url>]                  list the hub org's pools with their members (includes the orphan pool once one exists)
-  pool new <name> --kind personal|shared [--owner <memberId>] [--hub <url>]   create a pool on the hub org (admin, or own personal pool; human credential)
-  pool rm <poolId> [--hub <url>]           delete a pool; work stamped to it moves to the org's orphan pool
-  pool member add <poolId> <principalKind> <principalId> [--hub <url>]   add a member or agent to a pool
-  pool member rm <poolId> <principalId> [--hub <url>]   remove a principal from a pool
-  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenloop settings, plugin (idempotent)
+  agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --shift = --scopes work,run)
+  capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
+  capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
+  capability list [--hub <url>]               list the hub org's capability routes
+  crew list [--hub <url>]                  list the hub org's crews with their members (includes the orphan crew once one exists)
+  crew new <name> --kind personal|shared [--owner <memberId>] [--hub <url>]   create a crew on the hub org (admin, or own personal crew; human credential)
+  crew rm <crewId> [--hub <url>]           delete a crew; work stamped to it moves to the org's orphan crew
+  crew member add <crewId> <principalKind> <principalId> [--hub <url>]   add a member or agent to a crew
+  crew member rm <crewId> <principalId> [--hub <url>]   remove a principal from a crew
+  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenloop settings, plugin (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
-  work <subcommand> [args]                run execution-side proxy/hold/exec/agent-run/... commands
+  work <subcommand> [args]                run execution-side shift/hold/exec/agent-run/... commands
   shift start|next|status|end [args]      run and attend a local Unix-socket shift daemon
   lint [<def-name>]                      check def(s) for wiring problems
   check <def> [--format text|json] [--max-depth N] [--max-states N] [--max-collection N] [--assume-provided] [--strict-inputs]
@@ -563,7 +563,7 @@ Commands:
   create <def> [--title t] [--provide name=json ...] [--param k=v ...]
   provide <wf> <name> [--value json]     supply an owed (seedOwed) input
   adopt <wf>                             re-pin an instance to the current def (§28); settles new debts
-  tick <wf> [--now <ms>] [--shallow] [--label <l>]...  pull eligible orders (deep: also from calls: children; --shallow for this instance only; --label filters to matching-label steps)
+  tick <wf> [--now <ms>] [--shallow] [--capability <c>]...  pull eligible orders (deep: also from calls: children; --shallow for this instance only; --capability filters to matching-capability steps)
   reap <wf> [--now]                      run the reaper; --now forces every claim stale (TTL 0)
   runs <wf> [--open]                     list this instance's runs (+ claim state for open ones)
   order <wf> <run>                        print the order packet issued at claim time (persisted in the claim txn)
@@ -646,10 +646,10 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
-  ['agent', cmdOpts('pools', 'hub', 'scopes', 'conductor')],
-  ['binding', cmdOpts('hub')],
-  ['pool', cmdOpts('hub', 'kind', 'owner')],
-  ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'pools', 'scopes')],
+  ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
+  ['capability', cmdOpts('hub')],
+  ['crew', cmdOpts('hub', 'kind', 'owner')],
+  ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'crews', 'scopes')],
   ['doctor', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
   ['work', cmdOpts()],
@@ -659,7 +659,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['create', cmdOpts('title', 'provide', 'param')],
   ['provide', cmdOpts('value')],
   ['adopt', cmdOpts()],
-  ['tick', cmdOpts('now', 'shallow', 'label')],
+  ['tick', cmdOpts('now', 'shallow', 'capability')],
   ['reap', cmdOpts('now')],
   ['status', cmdOpts('all')],
   ['wait', cmdOpts('until', 'timeout')],
@@ -991,13 +991,13 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         const now = numOpt(args, 'now');
         // §23.6.8: tick is deep by default (descends into calls: children and
         // returns their orders too); --shallow restores single-instance ticking.
-        const tickOpts: { now?: number; deep?: boolean; labels?: string[] } = {};
+        const tickOpts: { now?: number; deep?: boolean; capabilities?: string[] } = {};
         if (now !== undefined) tickOpts.now = now;
         if (flag(args, 'shallow')) tickOpts.deep = false;
-        // A2: repeatable --label narrows the claim to steps whose labels
+        // A2: repeatable --capability narrows the claim to steps whose capabilities
         // intersect the caller's; absent = claim everything (today's behavior).
-        const labels = all(args, 'label');
-        if (labels.length > 0) tickOpts.labels = labels;
+        const capabilities = all(args, 'capability');
+        if (capabilities.length > 0) tickOpts.capabilities = capabilities;
         print(io, engine.tick(wf, tickOpts));
         return 0;
       }
@@ -1037,7 +1037,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         return 0;
       }
       case 'wait': {
-        // Blocking poll so an orchestrator (Prime Agent or Conductor) can wait for engine state
+        // Blocking poll so an orchestrator (Prime Agent or Shift) can wait for engine state
         // change without burning inference on a poll loop. Plain synchronous
         // poll of the local db (cheap — one process, no LLM calls). On
         // success, prints the exact `status()` shape (same as plain
@@ -2610,7 +2610,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   }
 
   // Fetch the server's own list once — the diff source of truth. Always
-  // fetched, even under --force, so the new/changed labels stay accurate.
+  // fetched, even under --force, so the new/changed capabilities stay accurate.
   const { res: listRes, cred: listCred } = await authedGet(io, origin, slot, cred, '/api/workflows');
   assertAuthOk(listRes, listCred, origin);
   cred = listCred;
@@ -2753,20 +2753,20 @@ function createWorkflowRequest(
 
 /**
  * Resolve the hub a mutating hub command acts on — shared by `agent new`,
- * `binding new|rm|list`, and `pool`'s five subcommands: `--hub <origin>`
+ * `capability bind|unbind|list`, and `crew`'s five subcommands: `--hub <origin>`
  * (normalized via `normalizeOrigin`) → else the ONE hub the credential FILE
  * knows → else a `CliError` with `exitCode: 2` naming both remedies.
  *
  * `purpose` is the verb phrase spliced into both exit-2 messages ("cannot
  * determine which hub to <purpose> — …"). It defaults to `'mint on'` so
  * `dispatchAgent`'s two-argument call keeps `agent new`'s error strings
- * byte-identical; `dispatchBinding` passes `'manage label bindings on'`;
- * `dispatchPool` passes `'manage pools on'`.
+ * byte-identical; `dispatchCapability` passes `'manage capability routes on'`;
+ * `dispatchCrew` passes `'manage crews on'`.
  *
  * Deliberately NOT `resolveHub` (`--hub → OWENLOOP_HUB → DEFAULT_HUB`): silently
  * defaulting a MINT to the production hub while the user is logged into a dev hub
  * would mint on the wrong org, and a mint is not undone by a retry. The same
- * reasoning covers a label binding — writing one against the wrong org is not
+ * reasoning covers a capability route — writing one against the wrong org is not
  * undone by a retry either, and under live resolution it also moves in-flight
  * work. `OWENLOOP_HUB` is intentionally excluded so this stays in parity with
  * O2's `owenloop mcp`.
@@ -2814,11 +2814,11 @@ function resolveAgentHub(io: CliIO, args: Args, purpose = 'mint on'): string {
  * process→store ONLY — it never appears on stdout, stderr, in an error, or in a
  * log. `mintAgentCredential` (credentials.ts) owns the token end to end and
  * returns none of it; the confirmation printed here is built from an explicit
- * WHITELIST of non-secret fields (name, pools, scopes, storage backend,
+ * WHITELIST of non-secret fields (name, crews, scopes, storage backend,
  * revocation ids).
  *
- * Flags: `--pools a,b` (the Scoped Identity's pools; default = minter's personal pool);
- * `--scopes a,b` (the minted token's scopes; default `work`); `--conductor`
+ * Flags: `--crews a,b` (the Scoped Identity's crews; default = minter's personal crew);
+ * `--scopes a,b` (the minted token's scopes; default `work`); `--shift`
  * (sugar for `--scopes work,run`; mutually exclusive with `--scopes`); `--hub`.
  * `--scopes` is passed to the hub verbatim — no client-side scope-name check.
  *
@@ -2828,7 +2828,7 @@ function resolveAgentHub(io: CliIO, args: Args, purpose = 'mint on'): string {
  * mints a server-side token first — minting then failing to store would burn the
  * agent name permanently.
  *
- * Exit codes: 0 ok; 1 generic failure (invalid name, name taken, pool/shape
+ * Exit codes: 0 ok; 1 generic failure (invalid name, name taken, crew/shape
  * rejection, network timeout, minted-but-unstored); 2 the hub is unresolvable;
  * 3 the human credential is absent or irrecoverable (remedy names
  * `owenloop login --hub <origin>`).
@@ -2843,7 +2843,7 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
   const name = args.positionals[2];
   if (name === undefined) {
     throw new CliError(
-      'missing required argument: <name> (usage: owenloop agent new <name> [--pools a,b] [--scopes work,run | --conductor] [--hub <url>])',
+      'missing required argument: <name> (usage: owenloop agent new <name> [--crews a,b] [--scopes work,run | --shift] [--hub <url>])',
     );
   }
   // Validate the agent name eagerly — before any I/O — with the store's own
@@ -2854,27 +2854,27 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
     throw new CliError(`agent new: invalid agent name — ${(e as Error).message}`);
   }
 
-  // --pools: split on `,`, trim, drop empties. Absent → undefined (key omitted
-  // from the request; the server then defaults to the minter's personal pool).
-  // Present but empty (`--pools ""` / `--pools ,`) → usage error, before any I/O.
-  // No client-side pool-name validation — the server is the enforcement of record.
-  const poolsRaw = last(args, 'pools');
-  let pools: string[] | undefined;
-  if (poolsRaw !== undefined) {
-    pools = poolsRaw
+  // --crews: split on `,`, trim, drop empties. Absent → undefined (key omitted
+  // from the request; the server then defaults to the minter's personal crew).
+  // Present but empty (`--crews ""` / `--crews ,`) → usage error, before any I/O.
+  // No client-side crew-name validation — the server is the enforcement of record.
+  const crewsRaw = last(args, 'crews');
+  let crews: string[] | undefined;
+  if (crewsRaw !== undefined) {
+    crews = crewsRaw
       .split(',')
       .map((p) => p.trim())
       .filter((p) => p !== '');
-    if (pools.length === 0) {
-      throw new CliError('--pools requires at least one pool name');
+    if (crews.length === 0) {
+      throw new CliError('--crews requires at least one crew name');
     }
   }
 
-  // --scopes: same split/trim/filter shape as --pools. Absent → undefined (the
+  // --scopes: same split/trim/filter shape as --crews. Absent → undefined (the
   // key is omitted from the mint params, so mintAgentCredential applies its own
   // `?? ['work']` default). Present but empty (`--scopes ""` / `--scopes ,`) →
   // usage error, before any I/O. No client-side scope-NAME validation — the hub
-  // is the enforcement of record (same stance as pools).
+  // is the enforcement of record (same stance as crews).
   const scopesRaw = last(args, 'scopes');
   let scopes: string[] | undefined;
   if (scopesRaw !== undefined) {
@@ -2886,13 +2886,13 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
       throw new CliError('--scopes requires at least one scope name');
     }
   }
-  // --conductor is sugar for --scopes work,run. It takes no value. Combining it
+  // --shift is sugar for --scopes work,run. It takes no value. Combining it
   // with an explicit --scopes is a usage error (two ways to say the same thing,
   // possibly conflicting) — refused before any I/O.
-  const conductor = flag(args, 'conductor');
-  if (conductor) {
+  const shift = flag(args, 'shift');
+  if (shift) {
     if (scopes !== undefined) {
-      throw new CliError('pass at most one of --scopes or --conductor, not both');
+      throw new CliError('pass at most one of --scopes or --shift, not both');
     }
     scopes = ['work', 'run'];
   }
@@ -2920,7 +2920,7 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
 
   let result;
   try {
-    result = await mintAgentCredential(io, origin, { principal: 'human' }, cred, { name, pools, scopes });
+    result = await mintAgentCredential(io, origin, { principal: 'human' }, cred, { name, crews, scopes });
   } catch (e) {
     // A refresh-failure-family error (the human oauth is irrecoverable, or a 401
     // survived the refresh-and-retry) is exit 3 with the login remedy; every
@@ -2939,7 +2939,7 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
     hub: origin,
     name,
     slot: `agent:${name}`,
-    pools: result.pools,
+    crews: result.crews,
     scopes: result.scopes,
     storage: result.storage,
     agentId: result.agentId,
@@ -2949,34 +2949,34 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
- * `owenloop binding new|rm|list` — manage the hub org's **label bindings**, the
- * admin-owned table mapping a workflow-def `labels:` entry to a pool.
+ * `owenloop capability bind|unbind|list` — manage the hub org's **capability routes**, the
+ * admin-owned table mapping a workflow-def `capabilities:` entry to a crew.
  *
- * A label binding is NOT the project↔hub binding `owenloop connect` writes to
+ * A capability route is NOT the project↔hub route `owenloop connect` writes to
  * `.owenloop/hub.json` — different concept, same English word; every symbol in
- * this family is `LabelBinding`-prefixed to keep them apart.
+ * this family is `CapabilityRoute`-prefixed to keep them apart.
  *
  * | subcommand | endpoint | auth principal |
  * |---|---|---|
- * | `binding new <label> <pool>` | `POST /api/add_label_binding` | human (admin role on the hub) |
- * | `binding rm <label> <pool>` | `POST /api/remove_label_binding` | human (admin role on the hub) |
- * | `binding list` | `GET /api/label_bindings` | human |
+ * | `capability bind <capability> <crew>` | `POST /api/add_capability_route` | human (admin role on the hub) |
+ * | `capability unbind <capability> <crew>` | `POST /api/remove_capability_route` | human (admin role on the hub) |
+ * | `capability list` | `GET /api/capability_routes` | human |
  *
- * **Binding is ADDITIVE, and idempotent per `(label, pool)` PAIR.** A label may
- * bind MANY pools. `binding new` on an already-bound label ADDS a pool; it never
+ * **route is ADDITIVE, and idempotent per `(capability, crew)` PAIR.** A capability may
+ * bind MANY crews. `capability bind` on an already-bound capability ADDS a crew; it never
  * displaces one already bound. Re-adding the same pair is a normal 200 no-op, so
  * there is no "already bound" rejection to handle and no client-side pre-check —
- * the response says which happened via `alreadyBound`, and `boundPoolCount`
- * reports how many LIVE pools the label binds afterwards.
+ * the response says which happened via `alreadyRouted`, and `routedCrewCount`
+ * reports how many LIVE crews the capability binds afterwards.
  *
- * **`binding rm` removes ONE pair**, which is why `<pool>` is required. Removing
- * the LAST LIVE binding PARKS the label: its in-flight steps are offered to no
- * conductor until it is bound again. The response's `remainingPoolIds` is the
+ * **`capability unbind` removes ONE pair**, which is why `<crew>` is required. Removing
+ * the LAST LIVE route PARKS the capability: its in-flight steps are offered to no
+ * shift until it is bound again. The response's `remainingCrewIds` is the
  * signal (`[]` = parked), and that case gets a **stderr** warning; so does the
  * tolerant `removed: false` case. stdout stays one parseable JSON document.
  *
- * **Retargeting is now two separate operator acts** — add the new pool, then
- * remove the old one, each separately audited on the hub, with BOTH pools serving
+ * **Retargeting is now two separate operator acts** — add the new crew, then
+ * remove the old one, each separately audited on the hub, with BOTH crews serving
  * in between. The CLI deliberately does NOT synthesize a retarget by chaining the
  * two calls, and there is no back-compat fallback to the old routes. Resolution
  * on the hub is live, so both acts take effect on in-flight runs at their next
@@ -2985,50 +2985,50 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
  * What is deliberately NOT copied from `dispatchAgent`: its
  * `OWENLOOP_CREDENTIAL_COMMAND` refusal. That guard exists because `agent new`
  * must STORE a minted token and an external-command backend has nowhere to write
- * it. `binding` stores nothing locally, so an external-command machine must be
+ * it. `capability` stores nothing locally, so an external-command machine must be
  * able to run all three subcommands. (`resolveAgentHub` still exits 2 on such a
  * machine when `--hub` is absent, because that store cannot be enumerated —
  * inherited unchanged, and correct.)
  *
- * No client-side charset validation of `label` or `pool`: the hub is the
- * enforcement of record, the same stance `agent new` takes for `--pools`.
+ * No client-side charset validation of `capability` or `crew`: the hub is the
+ * enforcement of record, the same stance `agent new` takes for `--crews`.
  *
- * Exit codes: 0 ok; 1 runtime/hub error (an unknown pool name — `binding new`
- * ONLY, since `binding rm` answers a tolerant `removed: false` instead of a
- * 400; a label that fails the hub's name rules, a 403 for a non-admin, a
+ * Exit codes: 0 ok; 1 runtime/hub error (an unknown crew name — `capability bind`
+ * ONLY, since `capability unbind` answers a tolerant `removed: false` instead of a
+ * 400; a capability that fails the hub's name rules, a 403 for a non-admin, a
  * malformed 2xx, a network timeout); 2 the hub is unresolvable; 3 the human
  * credential is absent or irrecoverable (the error names
  * `owenloop login --hub <origin>`).
  */
-async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
+async function dispatchCapability(io: CliIO, args: Args): Promise<number> {
   const USAGE_FORMS =
-    'usage: owenloop binding new <label> <pool> [--hub <url>] | owenloop binding rm <label> <pool> [--hub <url>] | owenloop binding list [--hub <url>]';
+    'usage: owenloop capability bind <capability> <crew> [--hub <url>] | owenloop capability unbind <capability> <crew> [--hub <url>] | owenloop capability list [--hub <url>]';
 
   // --- validation: everything below runs BEFORE any I/O, so a usage error on a
   //     multi-hub machine reports the usage problem (exit 1), not exit 2.
   const sub = args.positionals[1];
-  if (sub !== 'new' && sub !== 'rm' && sub !== 'list') {
-    throw new CliError(`unknown binding subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
+  if (sub !== 'bind' && sub !== 'unbind' && sub !== 'list') {
+    throw new CliError(`unknown capability subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
   }
-  let label = '';
-  let pool = '';
-  if (sub === 'new' || sub === 'rm') {
-    // `<pool>` is required for BOTH now: one call adds or removes ONE
-    // `(label, pool)` pair, and a label-only `rm` would unbind more than the
-    // operator named.
-    const rawLabel = args.positionals[2];
-    if (rawLabel === undefined || rawLabel === '') {
-      throw new CliError(`missing required argument: <label> (${USAGE_FORMS})`);
+  let capability = '';
+  let crew = '';
+  if (sub === 'bind' || sub === 'unbind') {
+    // `<crew>` is required for BOTH now: one call adds or removes ONE
+    // `(capability, crew)` pair, and a capability-only `unbind` would unbind more than
+    // the operator named.
+    const rawCapability = args.positionals[2];
+    if (rawCapability === undefined || rawCapability === '') {
+      throw new CliError(`missing required argument: <capability> (${USAGE_FORMS})`);
     }
-    label = rawLabel;
-    const rawPool = args.positionals[3];
-    if (rawPool === undefined || rawPool === '') {
-      throw new CliError(`missing required argument: <pool> (${USAGE_FORMS})`);
+    capability = rawCapability;
+    const rawCrew = args.positionals[3];
+    if (rawCrew === undefined || rawCrew === '') {
+      throw new CliError(`missing required argument: <crew> (${USAGE_FORMS})`);
     }
-    pool = rawPool;
+    crew = rawCrew;
   }
 
-  const origin = resolveAgentHub(io, args, 'manage label bindings on');
+  const origin = resolveAgentHub(io, args, 'manage capability routes on');
   const slot: CredentialSlotSelector = { principal: 'human' };
 
   // The human bearer for the resolved origin. Absent → exit 3 with the same
@@ -3040,7 +3040,7 @@ async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
 
   try {
     if (sub === 'list') {
-      const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/label_bindings');
+      const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/capability_routes');
       // The GET deliberately uses `assertAuthOk` unchanged (frozen contract), so
       // a non-401 non-2xx surfaces its generic wording rather than the hub's
       // `message`. Message passthrough is a POST-path behavior below.
@@ -3049,24 +3049,24 @@ async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
       try {
         body = (await res.json()) as unknown;
       } catch {
-        throw new CliError('label_bindings: malformed response — body is not valid JSON');
+        throw new CliError('capability_routes: malformed response — body is not valid JSON');
       }
-      let bindings;
+      let routes;
       try {
-        bindings = asLabelBindings(body);
+        routes = asCapabilityRoutes(body);
       } catch (e) {
         throw new CliError((e as Error).message);
       }
       // The guard's output — a whitelisted typed array — never the raw body.
-      print(io, { ok: true, hub: origin, bindings });
+      print(io, { ok: true, hub: origin, routes });
       return 0;
     }
 
-    // `new` and `rm` share one POST ladder AND one request body — `{label, pool}`,
-    // because each call adds or removes exactly one `(label, pool)` pair. Only the
+    // `bind` and `unbind` share one POST ladder AND one request body — `{capability, crew}`,
+    // because each call adds or removes exactly one `(capability, crew)` pair. Only the
     // path, the guard, and the printed shape differ.
-    const endpoint = sub === 'new' ? 'add_label_binding' : 'remove_label_binding';
-    const { res } = await authedPost(io, origin, slot, cred, `/api/${endpoint}`, { label, pool });
+    const endpoint = sub === 'bind' ? 'add_capability_route' : 'remove_capability_route';
+    const { res } = await authedPost(io, origin, slot, cred, `/api/${endpoint}`, { capability, crew });
 
     if (res.status === 401) {
       // A 401 that survived `authedPost`'s one refresh-and-retry. The human slot
@@ -3075,8 +3075,8 @@ async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
       throw new CliError('credential rejected by the hub — run `owenloop login`');
     }
     if (!res.ok) {
-      // Surface the hub's typed `message` VERBATIM (this is how an unknown pool
-      // name, an invalid label, and a non-admin 403 all surface uniformly).
+      // Surface the hub's typed `message` VERBATIM (this is how an unknown crew
+      // name, an invalid capability, and a non-admin 403 all surface uniformly).
       // Never include raw body text.
       let message: string | undefined;
       try {
@@ -3100,61 +3100,61 @@ async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
       throw new CliError(`${endpoint}: malformed success response — body is not valid JSON`);
     }
 
-    if (sub === 'new') {
+    if (sub === 'bind') {
       let added;
       try {
-        added = asLabelBindingAdded(body);
+        added = asCapabilityRouteAdded(body);
       } catch (e) {
         throw new CliError((e as Error).message);
       }
-      // The server-echoed label/pool, not argv: if the hub normalized either,
+      // The server-echoed capability/crew, not argv: if the hub normalized either,
       // stdout tells the truth about what the hub stored (same precedent as
-      // `agent new` printing the server-resolved pools). `alreadyBound` and
-      // `boundPoolCount` carry the HUB's own field names verbatim, so an operator
+      // `agent new` printing the server-resolved crews). `alreadyRouted` and
+      // `routedCrewCount` carry the HUB's own field names verbatim, so an operator
       // correlating stdout against the hub's audit log never has to translate.
-      // `createdBy`/`createdAt` are validated but not printed — `binding list` is
+      // `createdBy`/`createdAt` are validated but not printed — `capability list` is
       // where a row's provenance belongs.
       print(io, {
         ok: true,
         hub: origin,
-        label: added.binding.label,
-        pool: added.binding.poolName,
-        alreadyBound: added.alreadyBound,
-        boundPoolCount: added.boundPoolCount,
+        capability: added.route.capability,
+        crew: added.route.crewName,
+        alreadyRouted: added.alreadyRouted,
+        routedCrewCount: added.routedCrewCount,
       });
-      // No stderr line on `new`: an add never displaces a pool and never parks a
-      // label, so there is no consequence to warn about.
+      // No stderr line on `bind`: an add never displaces a crew and never parks a
+      // capability, so there is no consequence to warn about.
       return 0;
     }
 
-    // `rm`: the guard proves the 2xx really was the remove verb's answer.
+    // `unbind`: the guard proves the 2xx really was the remove verb's answer.
     // `removedWire` (not `removed`) so `removedWire.removed` reads unambiguously —
-    // the same naming `dispatchPool` uses for `deletedWire`/`removedWire`.
+    // the same naming `dispatchCrew` uses for `deletedWire`/`removedWire`.
     let removedWire;
     try {
-      removedWire = asLabelBindingRemoved(body);
+      removedWire = asCapabilityRouteRemoved(body);
     } catch (e) {
       throw new CliError((e as Error).message);
     }
-    // `poolId` (not a pool name): `remove_label_binding` returns no `poolName`, so
+    // `crewId` (not a crew name): `remove_capability_route` returns no `crewName`, so
     // printing one would be an invention. It is `null` on the tolerant path where
-    // the argument matched no live pool name and no row of this label's own.
+    // the argument matched no live crew name and no row of this capability's own.
     print(io, {
       ok: true,
       hub: origin,
-      label: removedWire.label,
-      poolId: removedWire.poolId,
+      capability: removedWire.capability,
+      crewId: removedWire.crewId,
       removed: removedWire.removed,
-      remainingPoolIds: removedWire.remainingPoolIds,
+      remainingCrewIds: removedWire.remainingCrewIds,
     });
-    // stderr only, so `| jq` on stdout is unaffected — mirroring `pool rm` /
-    // `pool member rm`, which narrate their tolerant-false case and their
+    // stderr only, so `| jq` on stdout is unaffected — mirroring `crew rm` /
+    // `crew member rm`, which narrate their tolerant-false case and their
     // notable side effect the same way.
     if (!removedWire.removed) {
-      io.err(`${removedWire.label} was not bound to '${pool}' — nothing was removed`);
-    } else if (removedWire.remainingPoolIds.length === 0) {
+      io.err(`${removedWire.capability} was not bound to '${crew}' — nothing was removed`);
+    } else if (removedWire.remainingCrewIds.length === 0) {
       io.err(
-        `${removedWire.label}: no live bindings remain — runs waiting on this label are parked until it is bound again`,
+        `${removedWire.capability}: no live routes remain — runs waiting on this capability are parked until it is bound again`,
       );
     }
     return 0;
@@ -3171,64 +3171,64 @@ async function dispatchBinding(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
- * `owenloop pool list|new|rm|member add|member rm` — administer hub pools.
- * Modeled directly on `dispatchBinding`: same validate-before-I/O discipline,
+ * `owenloop crew list|new|rm|member add|member rm` — administer hub crews.
+ * Modeled directly on `dispatchCapability`: same validate-before-I/O discipline,
  * same helpers (`resolveAgentHub`, `readCredential`, `authedGet`/`authedPost`,
  * `assertAuthOk`), same error-wording shapes, same exit-code ladder.
  *
  * | subcommand         | endpoint                      |
  * |--------------------|-------------------------------|
- * | `pool list`        | `GET /api/pools`              |
- * | `pool new`         | `POST /api/create_pool`       |
- * | `pool rm`          | `POST /api/delete_pool`       |
- * | `pool member add`  | `POST /api/add_pool_member`   |
- * | `pool member rm`   | `POST /api/remove_pool_member`|
+ * | `crew list`        | `GET /api/crews`              |
+ * | `crew new`         | `POST /api/create_crew`       |
+ * | `crew rm`          | `POST /api/delete_crew`       |
+ * | `crew member add`  | `POST /api/add_crew_member`   |
+ * | `crew member rm`   | `POST /api/remove_crew_member`|
  *
- * All five use the **human** credential slot — `manage_pools` is absent from
+ * All five use the **human** credential slot — `manage_crews` is absent from
  * the hub's agent scope table, so an agent token is refused on every one of
  * these routes regardless of scope; the CLI does not carry an agent-token path
  * for this family, unlike `binding`'s sibling commands.
  *
  * **The tolerant / absent-field semantics — the heart of this command.**
- * `delete_pool` on an unknown pool id, and `remove_pool_member` on a principal
+ * `delete_crew` on an unknown crew id, and `remove_crew_member` on a principal
  * that was never a member, are both ordinary 200 successes (`deleted: false` /
  * `removed: false`), never 404s — printed and echoed to stderr honestly rather
- * than invented as an error. `delete_pool`'s optional transfer fields
- * (`membersRemoved`, `orphanPoolId`, `orphanPoolName`, `stampsTransferred`,
+ * than invented as an error. `delete_crew`'s optional transfer fields
+ * (`membersRemoved`, `orphanCrewId`, `orphanCrewName`, `stampsTransferred`,
  * `runsTransferred`, `runningRunsTransferred`) are on stdout IF AND ONLY IF the
  * wire carried them — never defaulted to `0`/`null`/`[]`, because their
  * absence is the hub's way of saying nothing moved. When a transfer did
- * happen, `pool rm` also writes a human-facing stderr summary naming the
- * orphan pool, because an operator who never sees that line will not go
+ * happen, `crew rm` also writes a human-facing stderr summary naming the
+ * orphan crew, because an operator who never sees that line will not go
  * looking for their moved work.
  *
- * Agrees with `binding rm`: `pool rm` and `pool member rm` print their tolerant
+ * Agrees with `capability unbind`: `crew rm` and `crew member rm` print their tolerant
  * booleans (`deleted`, `removed`) on stdout and narrate the tolerant-false case
- * on stderr — the same shape `binding rm` uses for its own `removed` and
- * `remainingPoolIds`. One vocabulary across both families.
+ * on stderr — the same shape `capability unbind` uses for its own `removed` and
+ * `remainingCrewIds`. One vocabulary across both families.
  *
  * Exit codes: 0 ok; 1 usage error, hub refusal (400/403), or malformed
  * response; 2 the hub is unresolvable; 3 the human credential is absent or
  * irrecoverable (remedy names `owenloop login --hub <origin>`).
  */
-async function dispatchPool(io: CliIO, args: Args): Promise<number> {
+async function dispatchCrew(io: CliIO, args: Args): Promise<number> {
   const USAGE_FORMS =
-    'usage: owenloop pool list [--hub <url>] | ' +
-    'owenloop pool new <name> --kind personal|shared [--owner <memberId>] [--hub <url>] | ' +
-    'owenloop pool rm <poolId> [--hub <url>] | ' +
-    'owenloop pool member add <poolId> <principalKind> <principalId> [--hub <url>] | ' +
-    'owenloop pool member rm <poolId> <principalId> [--hub <url>]';
+    'usage: owenloop crew list [--hub <url>] | ' +
+    'owenloop crew new <name> --kind personal|shared [--owner <memberId>] [--hub <url>] | ' +
+    'owenloop crew rm <crewId> [--hub <url>] | ' +
+    'owenloop crew member add <crewId> <principalKind> <principalId> [--hub <url>] | ' +
+    'owenloop crew member rm <crewId> <principalId> [--hub <url>]';
 
   // --- validation: everything below runs BEFORE any I/O, so a usage error on a
   //     multi-hub machine reports the usage problem (exit 1), not exit 2.
   const sub = args.positionals[1];
   if (sub !== 'list' && sub !== 'new' && sub !== 'rm' && sub !== 'member') {
-    throw new CliError(`unknown pool subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
+    throw new CliError(`unknown crew subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
   }
 
   let memberSub: 'add' | 'rm' | undefined;
   let name = '';
-  let poolId = '';
+  let crewId = '';
   let principalKind = '';
   let principalId = '';
   let kind = '';
@@ -3255,20 +3255,20 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
   } else if (sub === 'rm') {
     const raw = args.positionals[2];
     if (raw === undefined || raw === '') {
-      throw new CliError(`missing required argument: <poolId> (${USAGE_FORMS})`);
+      throw new CliError(`missing required argument: <crewId> (${USAGE_FORMS})`);
     }
-    poolId = raw;
+    crewId = raw;
   } else if (sub === 'member') {
     const msub = args.positionals[2];
     if (msub !== 'add' && msub !== 'rm') {
-      throw new CliError(`unknown pool member subcommand '${msub ?? ''}' — ${USAGE_FORMS}`);
+      throw new CliError(`unknown crew member subcommand '${msub ?? ''}' — ${USAGE_FORMS}`);
     }
     memberSub = msub;
-    const rawPoolId = args.positionals[3];
-    if (rawPoolId === undefined || rawPoolId === '') {
-      throw new CliError(`missing required argument: <poolId> (${USAGE_FORMS})`);
+    const rawCrewId = args.positionals[3];
+    if (rawCrewId === undefined || rawCrewId === '') {
+      throw new CliError(`missing required argument: <crewId> (${USAGE_FORMS})`);
     }
-    poolId = rawPoolId;
+    crewId = rawCrewId;
     if (memberSub === 'add') {
       const rawKind = args.positionals[4];
       if (rawKind === undefined || rawKind === '') {
@@ -3289,7 +3289,7 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
     }
   }
 
-  const origin = resolveAgentHub(io, args, 'manage pools on');
+  const origin = resolveAgentHub(io, args, 'manage crews on');
   const slot: CredentialSlotSelector = { principal: 'human' };
 
   // The human bearer for the resolved origin. Absent → exit 3 with the same
@@ -3301,7 +3301,7 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
 
   try {
     if (sub === 'list') {
-      const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/pools');
+      const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/crews');
       // `assertAuthOk`'s generic wording (frozen contract, mirrors `binding
       // list`); message passthrough is a POST-path behavior below.
       assertAuthOk(res, used, origin);
@@ -3309,15 +3309,15 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
       try {
         body = (await res.json()) as unknown;
       } catch {
-        throw new CliError('pools: malformed response — body is not valid JSON');
+        throw new CliError('crews: malformed response — body is not valid JSON');
       }
-      let pools;
+      let crews;
       try {
-        pools = asPools(body);
+        crews = asCrews(body);
       } catch (e) {
         throw new CliError((e as Error).message);
       }
-      print(io, { ok: true, hub: origin, pools });
+      print(io, { ok: true, hub: origin, crews });
       return 0;
     }
 
@@ -3326,17 +3326,17 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
     let endpoint: string;
     let reqBody: Record<string, unknown>;
     if (sub === 'new') {
-      endpoint = 'create_pool';
+      endpoint = 'create_crew';
       reqBody = { name, kind, ...(owner !== undefined ? { ownerMemberId: owner } : {}) };
     } else if (sub === 'rm') {
-      endpoint = 'delete_pool';
-      reqBody = { poolId };
+      endpoint = 'delete_crew';
+      reqBody = { crewId };
     } else if (memberSub === 'add') {
-      endpoint = 'add_pool_member';
-      reqBody = { poolId, principalKind, principalId };
+      endpoint = 'add_crew_member';
+      reqBody = { crewId, principalKind, principalId };
     } else {
-      endpoint = 'remove_pool_member';
-      reqBody = { poolId, principalId };
+      endpoint = 'remove_crew_member';
+      reqBody = { crewId, principalId };
     }
 
     const { res } = await authedPost(io, origin, slot, cred, `/api/${endpoint}`, reqBody);
@@ -3348,7 +3348,7 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
       throw new CliError('credential rejected by the hub — run `owenloop login`');
     }
     if (!res.ok) {
-      // Surface the hub's typed `message` VERBATIM (an unknown pool id on
+      // Surface the hub's typed `message` VERBATIM (an unknown crew id on
       // member add/rm, a non-admin 403, an active-workflow delete refusal, an
       // unvalidated --kind value all surface uniformly). Never include raw
       // body text.
@@ -3377,14 +3377,14 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
     if (sub === 'new') {
       let created;
       try {
-        created = asPoolCreated(body);
+        created = asCrewCreated(body);
       } catch (e) {
         throw new CliError((e as Error).message);
       }
       print(io, {
         ok: true,
         hub: origin,
-        poolId: created.id,
+        crewId: created.id,
         name: created.name,
         kind: created.kind,
         ownerMemberId: created.ownerMemberId,
@@ -3395,23 +3395,23 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
     if (sub === 'rm') {
       let deletedWire;
       try {
-        deletedWire = asPoolDeleted(body);
+        deletedWire = asCrewDeleted(body);
       } catch (e) {
         throw new CliError((e as Error).message);
       }
       // `deleted` (and every transfer field the wire carried) is printed, never
-      // hidden — the same tolerant-boolean shape `binding rm` prints. See the
+      // hidden — the same tolerant-boolean shape `capability unbind` prints. See the
       // function doc-comment.
       print(io, { ok: true, hub: origin, ...deletedWire });
       if (!deletedWire.deleted) {
-        io.err(`no pool '${deletedWire.poolId}' to delete — nothing was removed`);
-      } else if (deletedWire.orphanPoolName !== undefined) {
+        io.err(`no crew '${deletedWire.crewId}' to delete — nothing was removed`);
+      } else if (deletedWire.orphanCrewName !== undefined) {
         const runs = deletedWire.runsTransferred?.length ?? 0;
         const stamps = deletedWire.stampsTransferred ?? 0;
         const running = deletedWire.runningRunsTransferred;
         const runningClause = running !== undefined && running.length > 0 ? ` (${running.length} still running)` : '';
         io.err(
-          `pool '${deletedWire.poolId}' deleted — ${stamps} stamp(s) from ${runs} run(s)${runningClause} moved to '${deletedWire.orphanPoolName}' (${deletedWire.orphanPoolId})`,
+          `crew '${deletedWire.crewId}' deleted — ${stamps} stamp(s) from ${runs} run(s)${runningClause} moved to '${deletedWire.orphanCrewName}' (${deletedWire.orphanCrewId})`,
         );
       }
       return 0;
@@ -3420,34 +3420,34 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
     if (memberSub === 'add') {
       let added;
       try {
-        added = asPoolMemberAdded(body);
+        added = asCrewMemberAdded(body);
       } catch (e) {
         throw new CliError((e as Error).message);
       }
-      // The argv poolId, not a wire value: `PoolMemberWire` deliberately does
-      // not narrow a `poolId` field (it is reused for `pools[].members[]`,
-      // where a per-member poolId would be redundant), so the request's own
-      // poolId is the only one available to print.
-      print(io, { ok: true, hub: origin, poolId, principalKind: added.principalKind, principalId: added.principalId });
+      // The argv crewId, not a wire value: `CrewMemberWire` deliberately does
+      // not narrow a `crewId` field (it is reused for `crews[].members[]`,
+      // where a per-member crewId would be redundant), so the request's own
+      // crewId is the only one available to print.
+      print(io, { ok: true, hub: origin, crewId, principalKind: added.principalKind, principalId: added.principalId });
       return 0;
     }
 
     // `member rm`
     let removedWire;
     try {
-      removedWire = asPoolMemberRemoved(body);
+      removedWire = asCrewMemberRemoved(body);
     } catch (e) {
       throw new CliError((e as Error).message);
     }
     print(io, {
       ok: true,
       hub: origin,
-      poolId: removedWire.poolId,
+      crewId: removedWire.crewId,
       principalId: removedWire.principalId,
       removed: removedWire.removed,
     });
     if (!removedWire.removed) {
-      io.err(`${removedWire.principalId} was not a member of pool '${removedWire.poolId}' — nothing was removed`);
+      io.err(`${removedWire.principalId} was not a member of crew '${removedWire.crewId}' — nothing was removed`);
     }
     return 0;
   } catch (e) {
@@ -3473,7 +3473,7 @@ async function dispatchPool(io: CliIO, args: Args): Promise<number> {
 // Secrets discipline (§6 "rule of gates"): NO code path here passes a token to
 // `io.out`/`io.err`/an Error. The only token hops live inside
 // `mintAgentCredential`/`rekeyAgentCredential` (caller→store). The succession
-// prompt renders name/last-active/pools; doctor renders identity/pools; the
+// prompt renders name/last-active/crews; doctor renders identity/crews; the
 // owenloop settings file receives `hubOrigin` only.
 
 /** One step's outcome in the setup summary. `noted` = informational, never a failure. */
@@ -3723,7 +3723,7 @@ async function promptAgentName(io: CliIO): Promise<string> {
  * vocabulary; the radio glyphs become numbered
  * terminal choices (the honest line-input adaptation). `[1]` = new installation;
  * `[k]` = replace the (k-2)th non-disabled identity. Each Replace line shows the
- * name, `last active <relative>`, and pools. Invalid input re-prompts once, then
+ * name, `last active <relative>`, and crews. Invalid input re-prompts once, then
  * a `CliError`.
  */
 async function promptSuccession(
@@ -3741,8 +3741,8 @@ async function promptSuccession(
   candidates.forEach((id, i) => {
     const active = lastActiveMs(id);
     const rel = formatLastActive(active === null ? null : now - active);
-    const pools = id.pools.length ? id.pools.join(', ') : '(none)';
-    lines.push(`  [${i + 2}] Replace: ${id.name}  last active ${rel} · pools: ${pools}`);
+    const crews = id.crews.length ? id.crews.join(', ') : '(none)';
+    lines.push(`  [${i + 2}] Replace: ${id.name}  last active ${rel} · crews: ${crews}`);
   });
   lines.push('');
   lines.push('⚠ "Replace" revokes that Scoped Identity\'s current credential. If it is still');
@@ -3792,8 +3792,8 @@ function installPluginStep(io: CliIO, state: { claudeFound: boolean; installed: 
  * only through its probe failing.
  *
  * Flags: `--hub <url>`; mutually-exclusive `--new-agent <name>` / `--replace-agent
- * <name>` (bypass the interactive agent branches); `--pools <a,b>` (mint only —
- * a usage error with `--replace-agent`, which preserves pools); `--scopes <a,b>`
+ * <name>` (bypass the interactive agent branches); `--crews <a,b>` (mint only —
+ * a usage error with `--replace-agent`, which preserves crews); `--scopes <a,b>`
  * (mint only — the minted token's scopes, default `work`; a usage error with
  * `--replace-agent`, which preserves scopes).
  *
@@ -3808,21 +3808,21 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   if (newAgent !== undefined && replaceAgent !== undefined) {
     throw new CliError('pass at most one of --new-agent or --replace-agent, not both');
   }
-  const poolsRaw = last(args, 'pools');
-  let pools: string[] | undefined;
-  if (poolsRaw !== undefined) {
-    pools = poolsRaw
+  const crewsRaw = last(args, 'crews');
+  let crews: string[] | undefined;
+  if (crewsRaw !== undefined) {
+    crews = crewsRaw
       .split(',')
       .map((p) => p.trim())
       .filter((p) => p !== '');
-    if (pools.length === 0) throw new CliError('--pools requires at least one pool name');
+    if (crews.length === 0) throw new CliError('--crews requires at least one crew name');
   }
-  if (replaceAgent !== undefined && pools !== undefined) {
+  if (replaceAgent !== undefined && crews !== undefined) {
     throw new CliError(
-      "--pools cannot be combined with --replace-agent — re-keying preserves the agent's pools (manage pools in the console)",
+      "--crews cannot be combined with --replace-agent — re-keying preserves the agent's crews (manage crews in the console)",
     );
   }
-  // --scopes: same shape as --pools. Absent → undefined (mint inherits the
+  // --scopes: same shape as --crews. Absent → undefined (mint inherits the
   // `?? ['work']` default). Present but empty → usage error, before any I/O.
   const scopesRaw = last(args, 'scopes');
   let scopes: string[] | undefined;
@@ -3936,8 +3936,8 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   let agentAccount: string;
   if (probe.verified !== null) {
     agentAccount = probe.verified.name;
-    const poolsStr = probe.verified.identity ? ` (pools: ${probe.verified.identity.pools.join(', ') || 'none'})` : '';
-    io.err(`✓ agent: ${agentAccount}${poolsStr}`);
+    const crewsStr = probe.verified.identity ? ` (crews: ${probe.verified.identity.crews.join(', ') || 'none'})` : '';
+    io.err(`✓ agent: ${agentAccount}${crewsStr}`);
     steps.push({ step: 'agent', action: 'skipped', detail: `agent:${agentAccount} verified` });
   } else {
     // ACT — resolve which agent to connect, then mint or rekey.
@@ -3965,9 +3965,9 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     }
 
     if (action.mode === 'mint') {
-      const result = await mintAgentCredential(io, origin, { principal: 'human' }, humanCred, { name: action.name, pools, scopes });
+      const result = await mintAgentCredential(io, origin, { principal: 'human' }, humanCred, { name: action.name, crews, scopes });
       agentAccount = action.name;
-      io.err(`✓ agent: minted agent:${agentAccount} (pools: ${result.pools.join(', ') || 'none'}; scopes: ${result.scopes.join(', ')})`);
+      io.err(`✓ agent: minted agent:${agentAccount} (crews: ${result.crews.join(', ') || 'none'}; scopes: ${result.scopes.join(', ')})`);
       steps.push({ step: 'agent', action: 'done', detail: `minted agent:${agentAccount}` });
     } else {
       const result = await rekeyAgentCredential(io, origin, { principal: 'human' }, humanCred, { agentId: action.agentId, name: action.name });
@@ -4116,13 +4116,13 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
     record('agent slot', true, 'present', true);
     if (agentProbe.verified !== null) {
       const va = agentProbe.verified;
-      const pools = va.identity
-        ? `pools: ${va.identity.pools.join(', ') || 'none'}`
+      const crews = va.identity
+        ? `crews: ${va.identity.crews.join(', ') || 'none'}`
         : identitiesForbidden
-          ? '(pools not visible — requires an admin credential)'
-          : '(pools unknown)';
+          ? '(crews not visible — requires an admin credential)'
+          : '(crews unknown)';
       const idPart = va.identity ? va.identity.id : va.actorId;
-      record('agent plane', true, `${va.name} (agent id ${idPart}) · ${pools}`, true);
+      record('agent plane', true, `${va.name} (agent id ${idPart}) · ${crews}`, true);
     } else if (agentProbe.sawRevoked) {
       record('agent plane', false, 'agent token revoked or invalid — re-run owenloop setup (Replace) or Reconnect in the console', true);
     } else {
@@ -4173,7 +4173,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'binding', 'pool', 'setup', 'doctor', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'capability', 'crew', 'setup', 'doctor', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -4215,10 +4215,10 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchPush(io, args);
       case 'agent':
         return await dispatchAgent(io, args);
-      case 'binding':
-        return await dispatchBinding(io, args);
-      case 'pool':
-        return await dispatchPool(io, args);
+      case 'capability':
+        return await dispatchCapability(io, args);
+      case 'crew':
+        return await dispatchCrew(io, args);
       case 'setup':
         return await dispatchSetup(io, args);
       case 'doctor':

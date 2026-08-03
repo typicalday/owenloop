@@ -663,7 +663,7 @@ The `M2B-REARM` branch (§23.6.1 step 7 — child un-greened while parent stays 
 - **Aggregation.** Child orders are concatenated onto the parent's; `reaped` sums; `dueAt` takes the minimum across the tree so the caller's next-wake is the earliest across all levels. Each folded `DeferredFiring` carries a `workflow` field naming the instance it belongs to — **absent means the ticked root, present means a descendant** — so a caller can still tell which instance a deferral came from. The single `now` is threaded through the whole descent, so a reap TTL that trips at the parent's clock trips consistently for children in the same sweep.
 - **Opt-out.** `tick(parentWf, { deep: false })` (CLI `--shallow`) ticks only that one instance — no descent, orders all carry the root's `workflow`. Use it to drive a single instance deliberately (tests, targeted retries); the default deep tick is what production drivers want.
 
-**Status child-summary.** `status(parentWf)` enriches each `calls:`-debt entry with a `child: ChildStatusSummary` (`{ workflow, def, done, stalled, debts }`) when a child has been spawned for that step. `stalled` is true when the child (or, recursively, a grandchild on an unpaid `calls:` path) has any stalled debt — a worker that hit `maxAttempts` with no green outcome. This lets a Conductor see, from the parent alone, that a `calls:` debt is blocked on a stuck child without separately walking into the child's own `status`. Like `failedRuns`/`attempts`, the field is engine-populated cross-instance state; `model.ts`'s pure single-instance `workflowStatus` never sets it.
+**Status child-summary.** `status(parentWf)` enriches each `calls:`-debt entry with a `child: ChildStatusSummary` (`{ workflow, def, done, stalled, debts }`) when a child has been spawned for that step. `stalled` is true when the child (or, recursively, a grandchild on an unpaid `calls:` path) has any stalled debt — a worker that hit `maxAttempts` with no green outcome. This lets a Shift see, from the parent alone, that a `calls:` debt is blocked on a stuck child without separately walking into the child's own `status`. Like `failedRuns`/`attempts`, the field is engine-populated cross-instance state; `model.ts`'s pure single-instance `workflowStatus` never sets it.
 
 **Discovering children directly.** A driver can still enumerate children itself — `store.listChildrenByParent`/`findChildByParent` give the reverse index from a parent id — and a propagated reject remains visible via the CHILD's own `status(childWf).debts` (the rejected outcome artifact appears there with `acceptance: 'rejected'`). But with deep tick as the default, a driver that sweeps only roots already reaches all live descendants; explicit child enumeration is for inspection and for the `--shallow` single-instance path, not a requirement for liveness.
 
@@ -1317,39 +1317,39 @@ prefixing untouched (there are no stems inside `x:` to rewrite — it's
 opaque); a child definition's own top-level `x:` stays on the child def and
 is not merged into the parent's.
 
-### §27.4 `worker:`/`command:`/`spec:` — declaring the executor
+### §27.4 `executor:`/`command:`/`spec:` — declaring the executor
 
 `x:` (§27.3) is a namespaced escape hatch for arbitrary external vocabulary.
-`worker:` is a narrower, purpose-built field for one specific job: telling
+`executor:` is a narrower, purpose-built field for one specific job: telling
 whatever dispatches orders *which kind* of executor a step's order is for. It
 follows the same opaque-passthrough contract as `model` — the engine never
 interprets it, only carries it — but unlike `model` (a free-form quality
-hint) and unlike `x:` (fully unvalidated contents), `worker:` gets two narrow,
-hard-coded shape rules, because the two most common worker types have a
+hint) and unlike `x:` (fully unvalidated contents), `executor:` gets two narrow,
+hard-coded shape rules, because the two most common executor types have a
 structural precondition the engine can cheaply catch at load time instead of
 letting it surface as a confusing runtime stall.
 
 **The contract, four clauses:**
 
 1. **Default is `'agent'`, and that default is silent.** A step (or judge)
-   that omits `worker:` entirely behaves exactly as it did before this
-   feature existed — every def in this repo predating `worker:` is
+   that omits `executor:` entirely behaves exactly as it did before this
+   feature existed — every def in this repo predating `executor:` is
    unaffected, byte for byte. The default is applied at validation and
    engine-order-building time, never written back into the parsed def.
-2. **`worker: command` requires `command:`.** A step (or judge) whose
-   effective worker is `'command'` and carries no `command:` is a load-time
-   `DefError`: `` step '<name>' has worker 'command' but no command: ``. Any
-   other worker string has no such requirement — `command:` is only ever
-   validated when the worker is literally `'command'`.
-3. **`worker: agent` (explicit) requires a non-empty `body:`.** This check is
-   deliberately scoped to an *explicit* `worker: agent`, not the *defaulted*
-   value — i.e. `validateDef` checks `l.worker === 'agent'`, never
-   `(l.worker ?? 'agent') === 'agent'`. That distinction matters: plenty of
+2. **`executor: command` requires `command:`.** A step (or judge) whose
+   effective executor is `'command'` and carries no `command:` is a load-time
+   `DefError`: `` step '<name>' has executor 'command' but no command: ``. Any
+   other executor string has no such requirement — `command:` is only ever
+   validated when the executor is literally `'command'`.
+3. **`executor: agent` (explicit) requires a non-empty `body:`.** This check is
+   deliberately scoped to an *explicit* `executor: agent`, not the *defaulted*
+   value — i.e. `validateDef` checks `l.executor === 'agent'`, never
+   `(l.executor ?? 'agent') === 'agent'`. That distinction matters: plenty of
    existing fixtures and generator-only steps rely on `buildStep`'s
-   empty-body default and never write `worker:` at all. Checking the
+   empty-body default and never write `executor:` at all. Checking the
    defaulted value would retroactively break every one of them. Checking
    only the explicit form catches the actual mistake this rule exists for —
-   someone opts into `worker: agent` on purpose and forgets the prompt —
+   someone opts into `executor: agent` on purpose and forgets the prompt —
    without touching a single pre-existing def.
 4. **`command:` and `spec:` are otherwise opaque.** `command` is
    shape-checked as a string (`asString`); `spec` is shape-checked as a plain
@@ -1361,37 +1361,37 @@ letting it surface as a confusing runtime stall.
    contents" philosophy as `x:`, just scoped to one step instead of the
    whole def.
 
-**The optional `workers:` allow-list.** A definition can declare `workers:
+**The optional `executors:` allow-list.** A definition can declare `executors:
 [agent, command, …]` at the top level — a typo guard, nothing more. When
-present, `validateDef` rejects any step or judge whose *effective* worker
+present, `validateDef` rejects any step or judge whose *effective* executor
 (after the `?? 'agent'` default is applied) isn't in the list. This runs
-**after** the default, deliberately: a def that declares `workers: [command]`
-(excluding `'agent'` on purpose) still fails a step that omits `worker:`
-entirely, because that step's effective worker is `'agent'` and `'agent'`
+**after** the default, deliberately: a def that declares `executors: [command]`
+(excluding `'agent'` on purpose) still fails a step that omits `executor:`
+entirely, because that step's effective executor is `'agent'` and `'agent'`
 isn't in the list. This is the intended behavior — once a def opts into the
 allow-list, it's exhaustive, and a step relying on the silent default doesn't
-get a free pass around it. A def with no `workers:` key accepts any worker
-string; there is no engine-wide registry of valid worker types to check
+get a free pass around it. A def with no `executors:` key accepts any executor
+string; there is no engine-wide registry of valid executor types to check
 against.
 
-**Pass-through.** `worker`, `command`, and `spec` all ride `buildOrder` onto
-the emitted `Order` untouched — `Order.worker`, `Order.command`, `Order.spec`
+**Pass-through.** `executor`, `command`, and `spec` all ride `buildOrder` onto
+the emitted `Order` untouched — `Order.executor`, `Order.command`, `Order.spec`
 — the same pass-through contract as `Order.model` and `Order.x`. A step that
 never sets them emits an order with all three fields absent, identical to
 before this feature existed.
 
 **Judges get the same fields, for free.** §24's `synthesizeJudgeSteps` turns
 each `judges:` entry into an ordinary `StepDef` — so a judge entry accepting
-`worker:`/`command:`/`spec:` and having the exact same `validateDef` rules
+`executor:`/`command:`/`spec:` and having the exact same `validateDef` rules
 apply to it isn't a separate code path, it's the same rules running against
 an already-existing synthesized step. A judge can therefore be a
 deterministic check (a script's exit code) instead of an LLM verdict, without
 any new validation logic. Note the pre-existing, orthogonal judge
 requirement — every judge needs `body:` or `bodyFile:` regardless of
-`worker:` — still applies; a `worker: command` judge still declares a
+`executor:` — still applies; a `executor: command` judge still declares a
 `body:`, it's simply unread by a non-agent dispatcher.
 
-**Scope notes**, mirroring §27.3's: `worker`/`command`/`spec` are additive
+**Scope notes**, mirroring §27.3's: `executor`/`command`/`spec` are additive
 and inert — a definition that never sets any of the three is unchanged in
 behavior and in `hashDef` terms. They live on the same two authored,
 engine-fired shapes as `x:` (a normal step, and — new here — a judge entry),

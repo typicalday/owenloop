@@ -7,9 +7,9 @@ import {
   resolveMaxConcurrentAgents,
   resolveShiftName,
   parseArgs,
-} from '../src/roles/proxy.ts';
+} from '../src/shift/runtime.ts';
 
-// C6 wired settings-file fallbacks into proxy's cap + dir resolution. These pin
+// C6 wired settings-file fallbacks into shift's cap + dir resolution. These pin
 // the precedence: CLI flag > env var > settings file > built-in default.
 
 test('resolveCap: --cap beats settings.dispatchCap beats the default 3', () => {
@@ -25,21 +25,21 @@ test('resolveStateDirOverride: flag > OWENLOOP_STATE_DIR > settings; else undefi
   assert.equal(resolveStateDirOverride(undefined, {}, undefined), undefined);
 });
 
-// WO-4.3 serve-pool SELECTION contract, pinned at the parse layer. The wire
-// meaning: no flag → servePools undefined, which run() resolves to `[]` at the
-// call site (`parsed.servePools ?? []`), and the hub reads empty as "serve ALL
-// the actor's pools" — i.e. the default is serve-all, NOT serve-none.
-test('parseArgs --serve-pools: comma-split, trim, drop-empties; no flag ⇒ undefined (→ [] at call site)', () => {
-  // no flag: undefined here; run() turns this into [] via `parsed.servePools ?? []`.
-  assert.equal(parseArgs([]).servePools, undefined);
+// WO-4.3 serve-crew SELECTION contract, pinned at the parse layer. The wire
+// meaning: no flag → serveCrews undefined, which run() resolves to `[]` at the
+// call site (`parsed.serveCrews ?? []`), and the hub reads empty as "serve ALL
+// the actor's crews" — i.e. the default is serve-all, NOT serve-none.
+test('parseArgs --serve-crews: comma-split, trim, drop-empties; no flag ⇒ undefined (→ [] at call site)', () => {
+  // no flag: undefined here; run() turns this into [] via `parsed.serveCrews ?? []`.
+  assert.equal(parseArgs([]).serveCrews, undefined);
   // space-form and =-form both parse to the same list.
-  assert.deepEqual(parseArgs(['--serve-pools', 'a,b']).servePools, ['a', 'b']);
-  assert.deepEqual(parseArgs(['--serve-pools=a,b']).servePools, ['a', 'b']);
+  assert.deepEqual(parseArgs(['--serve-crews', 'a,b']).serveCrews, ['a', 'b']);
+  assert.deepEqual(parseArgs(['--serve-crews=a,b']).serveCrews, ['a', 'b']);
   // trim each entry and drop empty segments.
-  assert.deepEqual(parseArgs(['--serve-pools', ' a , ,b ']).servePools, ['a', 'b']);
+  assert.deepEqual(parseArgs(['--serve-crews', ' a , ,b ']).serveCrews, ['a', 'b']);
   // an empty / whitespace-only value narrows to nothing ⇒ [] (still "serve all" downstream).
-  assert.deepEqual(parseArgs(['--serve-pools', '']).servePools, []);
-  assert.deepEqual(parseArgs(['--serve-pools', '   ']).servePools, []);
+  assert.deepEqual(parseArgs(['--serve-crews', '']).serveCrews, []);
+  assert.deepEqual(parseArgs(['--serve-crews', '   ']).serveCrews, []);
 });
 
 // ---- the agent-run budget ---------------------------------------------------
@@ -67,24 +67,24 @@ test('parseArgs reads --max-agents; absent leaves it undefined', () => {
 // machine in one directory under one identity must NOT resolve to the same
 // default name — that flip-flopping-row defect is what resolveShiftName fixes.
 
-test('resolveShiftName: default is host/dir#<first 6 hex of the cid, cnd_ stripped>', () => {
+test('resolveShiftName: default is host/dir#<first 6 hex of the cid, shf_ stripped>', () => {
   assert.equal(
-    resolveShiftName(undefined, { conductorId: 'cnd_7f3a2b91-aaaa-bbbb-cccc-dddddddddddd', hostname: 'box', cwd: '/a/proj' }),
+    resolveShiftName(undefined, { shiftId: 'shf_7f3a2b91-aaaa-bbbb-cccc-dddddddddddd', hostname: 'box', cwd: '/a/proj' }),
     'box/proj#7f3a2b',
   );
 });
 
 test('resolveShiftName: two different cids on the same host+cwd produce two different names (the §6 defect, at the unit level)', () => {
-  const a = resolveShiftName(undefined, { conductorId: 'cnd_11111111-0000-0000-0000-000000000000', hostname: 'box', cwd: '/a/proj' });
-  const b = resolveShiftName(undefined, { conductorId: 'cnd_22222222-0000-0000-0000-000000000000', hostname: 'box', cwd: '/a/proj' });
+  const a = resolveShiftName(undefined, { shiftId: 'shf_11111111-0000-0000-0000-000000000000', hostname: 'box', cwd: '/a/proj' });
+  const b = resolveShiftName(undefined, { shiftId: 'shf_22222222-0000-0000-0000-000000000000', hostname: 'box', cwd: '/a/proj' });
   assert.notEqual(a, b);
 });
 
 test('resolveShiftName: an explicit --name wins verbatim — no suffix appended', () => {
-  assert.equal(resolveShiftName('explicit', { conductorId: 'cnd_7f3a2b91-aaaa' }), 'explicit');
+  assert.equal(resolveShiftName('explicit', { shiftId: 'shf_7f3a2b91-aaaa' }), 'explicit');
 });
 
-test('resolveShiftName: with no conductorId, falls back to a p<pid> suffix', () => {
+test('resolveShiftName: with no shiftId, falls back to a p<pid> suffix', () => {
   assert.equal(resolveShiftName(undefined, { hostname: 'box', cwd: '/a/proj', pid: 4242 }), 'box/proj#p4242');
 });
 

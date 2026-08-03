@@ -43,12 +43,12 @@ function mintOk(): RouteHandler {
   return () => ({
     status: 200,
     json: {
-      text: `Agent token minted (id tok_1) for pool(s) personal-alex. Store this secret now — it will not be shown again:\n${TOKEN}`,
+      text: `Agent token minted (id tok_1) for crew(s) personal-alex. Store this secret now — it will not be shown again:\n${TOKEN}`,
       id: 'tok_1',
       token: TOKEN,
       agentId: 'agent_1',
-      pools: ['personal-alex'],
-      poolIds: ['pool_1'],
+      crews: ['personal-alex'],
+      crewIds: ['crew_1'],
     },
   });
 }
@@ -75,25 +75,25 @@ test('agent new: mints, stores the token in slot agent:<name>, prints a token-fr
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['agent', 'new', 'codex', '--pools', 'a,b', '--hub', HUB], t.io);
+  const code = await mainAsync(['agent', 'new', 'codex', '--crews', 'a,b', '--hub', HUB], t.io);
   assert.equal(code, 0, t.err.join('\n'));
 
   // The mint request carried the human bearer and the exact JSON body.
   const mint = calls.find((c) => c.pathname === '/api/mint_agent_token')!;
   assert.equal(mint.authorization, 'Bearer mcpat_x');
-  assert.deepEqual(JSON.parse(mint.body!), { name: 'codex', scopes: ['work'], pools: ['a', 'b'] });
+  assert.deepEqual(JSON.parse(mint.body!), { name: 'codex', scopes: ['work'], crews: ['a', 'b'] });
 
   // The token landed in slot agent:codex, as an `agent` credential.
   const stored = JSON.parse(t.store.get(kcKey(ORIGIN, 'agent:codex'))!) as Credential;
   assert.deepEqual(stored, { kind: 'agent', accessToken: TOKEN });
 
-  // stdout confirmation: whitelisted fields only, server-resolved pools, no token/text.
+  // stdout confirmation: whitelisted fields only, server-resolved crews, no token/text.
   const result = JSON.parse(t.out.join('\n'));
   assert.equal(result.ok, true);
   assert.equal(result.name, 'codex');
   assert.equal(result.slot, 'agent:codex');
   assert.equal(result.storage, 'keychain');
-  assert.deepEqual(result.pools, ['personal-alex']);
+  assert.deepEqual(result.crews, ['personal-alex']);
   assert.deepEqual(result.scopes, ['work']);
   assert.equal(result.hub, ORIGIN);
   assert.equal(result.agentId, 'agent_1');
@@ -104,7 +104,7 @@ test('agent new: mints, stores the token in slot agent:<name>, prints a token-fr
   assertNoTokenLeak(t);
 });
 
-test('agent new: --pools omitted sends NO pools key (server defaults to the personal pool)', async () => {
+test('agent new: --crews omitted sends NO crews key (server defaults to the personal crew)', async () => {
   const { fetch, calls } = routedFetch({ 'POST /api/mint_agent_token': mintOk() });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
@@ -115,7 +115,7 @@ test('agent new: --pools omitted sends NO pools key (server defaults to the pers
   const mint = calls.find((c) => c.pathname === '/api/mint_agent_token')!;
   const body = JSON.parse(mint.body!);
   assert.deepEqual(body, { name: 'codex', scopes: ['work'] });
-  assert.ok(!('pools' in body), 'the pools key is omitted entirely, never sent as []');
+  assert.ok(!('crews' in body), 'the crews key is omitted entirely, never sent as []');
   assertNoTokenLeak(t);
 });
 
@@ -268,36 +268,36 @@ test('agent new: an existing name surfaces the hub error verbatim, exit 1, nothi
   assertNoTokenLeak(t);
 });
 
-test('agent new: a pool_invalid 4xx surfaces the hub message, exit 1, nothing stored', async () => {
+test('agent new: a crew_invalid 4xx surfaces the hub message, exit 1, nothing stored', async () => {
   const { fetch } = routedFetch({
     'POST /api/mint_agent_token': () => ({
       status: 400,
-      json: { error: 'pool_invalid', message: 'a key must name at least one pool' },
+      json: { error: 'crew_invalid', message: 'a key must name at least one crew' },
     }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['agent', 'new', 'codex', '--pools', 'nope', '--hub', HUB], t.io);
+  const code = await mainAsync(['agent', 'new', 'codex', '--crews', 'nope', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /a key must name at least one pool/);
+  assert.match(t.err.join('\n'), /a key must name at least one crew/);
   assert.equal(t.store.get(kcKey(ORIGIN, 'agent:codex')), undefined);
   assertNoTokenLeak(t);
 });
 
-test('agent new: a forbidden 403 (non-member pool) surfaces the hub message, exit 1', async () => {
+test('agent new: a forbidden 403 (non-member crew) surfaces the hub message, exit 1', async () => {
   const { fetch } = routedFetch({
     'POST /api/mint_agent_token': () => ({
       status: 403,
-      json: { error: 'forbidden', message: 'not a member of pool "secret"' },
+      json: { error: 'forbidden', message: 'not a member of crew "secret"' },
     }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['agent', 'new', 'codex', '--pools', 'secret', '--hub', HUB], t.io);
+  const code = await mainAsync(['agent', 'new', 'codex', '--crews', 'secret', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /not a member of pool "secret"/);
+  assert.match(t.err.join('\n'), /not a member of crew "secret"/);
   assertNoTokenLeak(t);
 });
 
@@ -312,7 +312,7 @@ test('agent new: a malformed 200 (missing token) is exit 1, names the field only
         text: `Store this secret now — it will not be shown again:\n${TOKEN}`,
         id: 'tok_1',
         agentId: 'agent_1',
-        pools: ['personal-alex'],
+        crews: ['personal-alex'],
         // token: MISSING
       },
     }),
@@ -409,14 +409,14 @@ test('agent new: a client-side invalid name is exit 1 with the account-regex mes
   }
 });
 
-test('agent new: --pools "" is a usage error with no network', async () => {
+test('agent new: --crews "" is a usage error with no network', async () => {
   const { fetch, calls } = routedFetch({ 'POST /api/mint_agent_token': mintOk() });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['agent', 'new', 'codex', '--pools', '', '--hub', HUB], t.io);
+  const code = await mainAsync(['agent', 'new', 'codex', '--crews', '', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /--pools requires at least one pool name/);
+  assert.match(t.err.join('\n'), /--crews requires at least one crew name/);
   assert.equal(calls.length, 0);
   assertNoTokenLeak(t);
 });
@@ -466,12 +466,12 @@ test('agent new: --scopes work,run mints with those scopes and prints them', asy
   assertNoTokenLeak(t);
 });
 
-test('agent new: --conductor is sugar for --scopes work,run', async () => {
+test('agent new: --shift is sugar for --scopes work,run', async () => {
   const { fetch, calls } = routedFetch({ 'POST /api/mint_agent_token': mintOk() });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['agent', 'new', 'codex', '--conductor', '--hub', HUB], t.io);
+  const code = await mainAsync(['agent', 'new', 'codex', '--shift', '--hub', HUB], t.io);
   assert.equal(code, 0, t.err.join('\n'));
 
   const mint = calls.find((c) => c.pathname === '/api/mint_agent_token')!;
@@ -482,14 +482,14 @@ test('agent new: --conductor is sugar for --scopes work,run', async () => {
   assertNoTokenLeak(t);
 });
 
-test('agent new: --scopes and --conductor together is a usage error, no network', async () => {
+test('agent new: --scopes and --shift together is a usage error, no network', async () => {
   const { fetch, calls } = routedFetch({ 'POST /api/mint_agent_token': mintOk() });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['agent', 'new', 'codex', '--scopes', 'work,run', '--conductor', '--hub', HUB], t.io);
+  const code = await mainAsync(['agent', 'new', 'codex', '--scopes', 'work,run', '--shift', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /at most one of --scopes or --conductor/);
+  assert.match(t.err.join('\n'), /at most one of --scopes or --shift/);
   assert.equal(calls.length, 0, 'no network on a usage error');
   assertNoTokenLeak(t);
 });

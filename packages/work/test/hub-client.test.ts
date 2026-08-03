@@ -44,14 +44,14 @@ function client(fetchImpl: typeof fetch, getToken = async () => 'tok-123') {
 test('whatsNext POSTs to /api/whats_next with bearer header and JSON body', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'ok', orders: [] } }));
-  const res = await c.whatsNext({ workflow: 'wf1', serve_pools: ['a'] });
+  const res = await c.whatsNext({ workflow: 'wf1', serve_crews: ['a'] });
 
   const req = captured[0]!;
   assert.equal(req.method, 'POST');
   assert.equal(req.url, 'https://hub.example/api/whats_next');
   assert.equal(req.headers['authorization'], 'Bearer tok-123');
   assert.equal(req.headers['content-type'], 'application/json');
-  assert.deepEqual(req.body, { workflow: 'wf1', serve_pools: ['a'] });
+  assert.deepEqual(req.body, { workflow: 'wf1', serve_crews: ['a'] });
   assert.equal(res.text, 'ok');
   assert.deepEqual(res.orders, []);
 });
@@ -121,14 +121,14 @@ test('wake omits the query string entirely when cursor is undefined (bootstrap)'
   assert.equal(captured[0]!.url, 'https://hub.example/api/wake');
 });
 
-test('presencePing POSTs /api/presence_ping with name and serve_pools', async () => {
+test('presencePing POSTs /api/presence_ping with name and serve_crews', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'presence recorded for box', ok: true, name: 'box', lastSeen: 123 } }));
-  const res = await c.presencePing({ name: 'box', serve_pools: ['a', 'b'] });
+  const res = await c.presencePing({ name: 'box', serve_crews: ['a', 'b'] });
 
   assert.equal(captured[0]!.method, 'POST');
   assert.equal(captured[0]!.url, 'https://hub.example/api/presence_ping');
-  assert.deepEqual(captured[0]!.body, { name: 'box', serve_pools: ['a', 'b'] });
+  assert.deepEqual(captured[0]!.body, { name: 'box', serve_crews: ['a', 'b'] });
   assert.equal(res.ok, true);
   assert.equal(res.name, 'box');
   assert.equal(res.lastSeen, 123);
@@ -199,7 +199,7 @@ test('default fetch path works end to end against a real node:http server', asyn
 test('presencePing forwards attended_at using the exact snake_case wire field', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'presence recorded', ok: true, name: 'box', lastSeen: 123 } }));
-  await c.presencePing({ name: 'box', serve_pools: [], attended_at: 456789 });
-  assert.deepEqual(captured[0]!.body, { name: 'box', serve_pools: [], attended_at: 456789 });
+  await c.presencePing({ name: 'box', serve_crews: [], attended_at: 456789 });
+  assert.deepEqual(captured[0]!.body, { name: 'box', serve_crews: [], attended_at: 456789 });
   assert.equal((captured[0]!.body as Record<string, unknown>)['attendedAt'], undefined);
 });

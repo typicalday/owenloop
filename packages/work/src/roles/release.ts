@@ -15,7 +15,7 @@
  * (`--origin` → `settings.hubOrigin`); the bearer comes from owenloop's store
  * via `resolveBearer`, reading the `agent:<account>` slot for `OWENLOOP_ACCOUNT`
  * (default `default`), with `OWENLOOP_TOKEN` as a documented dev-only override.
- * release has no `--as` flag — a Conductor sets `OWENLOOP_ACCOUNT` for a
+ * release has no `--as` flag — a Shift sets `OWENLOOP_ACCOUNT` for a
  * non-default account.
  *
  * Docs call ONLY for the session form; there is deliberately no targeted CLI

@@ -92,11 +92,11 @@ test('parseArgs reads --jump-tolerance and validates it like the interval', () =
   assert.match(parseArgs(['a', '--jump-tolerance']).error!, /missing value/);
 });
 
-// W7: --conductor both value forms, and its absence defaults to undefined.
-test('parseArgs reads --conductor, both value forms', () => {
-  assert.equal(parseArgs(['wf1/run1', '--conductor', 'cnd_a']).conductor, 'cnd_a');
-  assert.equal(parseArgs(['wf1/run1', '--conductor=cnd_b']).conductor, 'cnd_b');
-  assert.equal(parseArgs(['wf1/run1']).conductor, undefined);
+// W7: --shift both value forms, and its absence defaults to undefined.
+test('parseArgs reads --shift, both value forms', () => {
+  assert.equal(parseArgs(['wf1/run1', '--shift', 'shf_a']).shift, 'shf_a');
+  assert.equal(parseArgs(['wf1/run1', '--shift=shf_b']).shift, 'shf_b');
+  assert.equal(parseArgs(['wf1/run1']).shift, undefined);
 });
 
 // ---- exit-code mapping ------------------------------------------------------
@@ -119,7 +119,7 @@ beforeEach(() => {
   process.env['XDG_CONFIG_HOME'] = home;
   delete process.env['OWENLOOP_TOKEN'];
   delete process.env['OWENLOOP_ACCOUNT'];
-  delete process.env['OWENLOOP_CONDUCTOR_ID'];
+  delete process.env['OWENLOOP_SHIFT_ID'];
   // Hermetic credential store: force owenloop's file backend (no real keychain
   // shell-out) so an unseeded store reads as absent → the refuse path.
   process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
@@ -176,7 +176,7 @@ function commandOrder(o: OrderOpts = {}): GetOrderResponse {
       key: 'k',
       inputs: [],
       outputs: [],
-      worker: 'command',
+      executor: 'command',
       command: o.command ?? 'echo hi',
       prompt: '',
       consumes: {},
@@ -290,15 +290,15 @@ test('run() happy path: tags the exec holder, runs, submits a receipt, exits 0',
   assert.equal(releases.length, 0);
 });
 
-// W7: --conductor rides the exec holder on BOTH first contact (get_order) and
+// W7: --shift rides the exec holder on BOTH first contact (get_order) and
 // the receipt submit — the hub's attribution columns need it on every path,
 // not just get_order (advisory only, D8/INV-82).
-test('run() threads --conductor onto the exec holder for both get_order and submit', async () => {
+test('run() threads --shift onto the exec holder for both get_order and submit', async () => {
   process.env['OWENLOOP_TOKEN'] = 'tok';
   const { hub, getOrderArgs, submitReqs } = roleHub({ getOrder: commandOrder({ command: 'make build' }) });
   const sig = fakeSignalHost();
 
-  const code = await run([...WIRE_ARGS, '--conductor', 'cnd_abc'], {
+  const code = await run([...WIRE_ARGS, '--shift', 'shf_abc'], {
     hub,
     runner: immediateRunner(0),
     signalHost: sig.host,
@@ -309,14 +309,14 @@ test('run() threads --conductor onto the exec holder for both get_order and subm
   });
 
   assert.equal(code, 0);
-  assert.deepEqual((getOrderArgs[0] as { holder?: unknown }).holder, { kind: 'exec', id: 'host:123', conductorId: 'cnd_abc' });
-  assert.deepEqual((submitReqs[0] as { holder?: unknown }).holder, { kind: 'exec', id: 'host:123', conductorId: 'cnd_abc' });
+  assert.deepEqual((getOrderArgs[0] as { holder?: unknown }).holder, { kind: 'exec', id: 'host:123', shiftId: 'shf_abc' });
+  assert.deepEqual((submitReqs[0] as { holder?: unknown }).holder, { kind: 'exec', id: 'host:123', shiftId: 'shf_abc' });
 });
 
-// W7: OWENLOOP_CONDUCTOR_ID env is the fallback when --conductor is absent.
-test('run() falls back to OWENLOOP_CONDUCTOR_ID when --conductor is absent', async () => {
+// W7: OWENLOOP_SHIFT_ID env is the fallback when --shift is absent.
+test('run() falls back to OWENLOOP_SHIFT_ID when --shift is absent', async () => {
   process.env['OWENLOOP_TOKEN'] = 'tok';
-  process.env['OWENLOOP_CONDUCTOR_ID'] = 'cnd_env';
+  process.env['OWENLOOP_SHIFT_ID'] = 'shf_env';
   const { hub, getOrderArgs } = roleHub({ getOrder: commandOrder({ command: 'make build' }) });
   const sig = fakeSignalHost();
 
@@ -331,7 +331,7 @@ test('run() falls back to OWENLOOP_CONDUCTOR_ID when --conductor is absent', asy
   });
 
   assert.equal(code, 0);
-  assert.deepEqual((getOrderArgs[0] as { holder?: unknown }).holder, { kind: 'exec', id: 'host:123', conductorId: 'cnd_env' });
+  assert.deepEqual((getOrderArgs[0] as { holder?: unknown }).holder, { kind: 'exec', id: 'host:123', shiftId: 'shf_env' });
 });
 
 test('run() maps a first-contact completed order to exit 0 without running anything', async () => {

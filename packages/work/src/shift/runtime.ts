@@ -1,10 +1,10 @@
 /**
- * `owenloop work proxy` — the internal standing Conductor loop.
+ * `owenloop work shift` — the internal standing Shift loop.
  *
- * The human-facing shift daemon uses the same setup and ProxyLoop through
- * `runProxyRuntime(..., { daemon: true })`; this module remains the single place
+ * The human-facing shift daemon uses the same setup and ShiftLoop through
+ * `runShiftRuntime(..., { daemon: true })`; this module remains the single place
  * that resolves settings, credentials, caches, child spawners, and signal
- * behavior. The retired proxy stdio-MCP mount is intentionally absent.
+ * behavior. The retired shift stdio-MCP mount is intentionally absent.
  */
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
@@ -14,13 +14,13 @@ import { createHubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
-import { createProxyLoop } from '../proxy/loop.ts';
-import { createDefaultSpawner } from '../proxy/spawn.ts';
-import { resolveStateDir, ensureStateDir, reconcileInFlight } from '../proxy/state.ts';
+import { createShiftLoop } from './loop.ts';
+import { createDefaultSpawner } from './spawn.ts';
+import { resolveStateDir, ensureStateDir, reconcileInFlight } from './state.ts';
 import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.ts';
 import { resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
-import { installSignalHandlers, type SignalHost } from './signals.ts';
-import { createShiftDaemon, type ShiftDaemon } from '../shift/server.ts';
+import { installSignalHandlers, type SignalHost } from '../roles/signals.ts';
+import { createShiftDaemon, type ShiftDaemon } from './server.ts';
 
 // Re-exported so existing importers keep their import site while the
 // implementation lives in the shared signals seam.
@@ -52,12 +52,12 @@ export function resolveMaxConcurrentAgents(
 
 export function resolveShiftName(
   flagName: string | undefined,
-  opts: { conductorId?: string; hostname?: string; cwd?: string; pid?: number } = {},
+  opts: { shiftId?: string; hostname?: string; cwd?: string; pid?: number } = {},
 ): string {
   if (flagName !== undefined && flagName !== '') return flagName;
   const suffix =
-    opts.conductorId !== undefined && opts.conductorId !== ''
-      ? opts.conductorId.replace(/^cnd_/, '').replace(/-/g, '').slice(0, 6)
+    opts.shiftId !== undefined && opts.shiftId !== ''
+      ? opts.shiftId.replace(/^shf_/, '').replace(/-/g, '').slice(0, 6)
       : `p${opts.pid ?? process.pid}`;
   return `${opts.hostname ?? hostname()}/${basename(opts.cwd ?? process.cwd())}#${suffix}`;
 }
@@ -66,7 +66,7 @@ export interface ParsedArgs {
   origin?: string;
   as?: string;
   name?: string;
-  servePools?: string[];
+  serveCrews?: string[];
   cap?: number;
   workflow?: string;
   pollIntervalMs?: number;
@@ -77,7 +77,7 @@ export interface ParsedArgs {
   error?: string;
 }
 
-/** Parse proxy's internal `--flag value` and `--flag=value` forms. */
+/** Parse shift's internal `--flag value` and `--flag=value` forms. */
 export function parseArgs(args: string[]): ParsedArgs {
   const parsed: ParsedArgs = {};
   const takeValue = (a: string, i: number): { value: string; next: number } | { error: string } => {
@@ -105,7 +105,7 @@ export function parseArgs(args: string[]): ParsedArgs {
       case '--origin':
       case '--as':
       case '--name':
-      case '--serve-pools':
+      case '--serve-crews':
       case '--cap':
       case '--max-agents':
       case '--workflow':
@@ -120,8 +120,8 @@ export function parseArgs(args: string[]): ParsedArgs {
         else if (name === '--name') {
           if (r.value.trim() === '') return { error: '--name requires a non-empty value' };
           parsed.name = r.value;
-        } else if (name === '--serve-pools') {
-          parsed.servePools = r.value.split(',').map((s) => s.trim()).filter((s) => s !== '');
+        } else if (name === '--serve-crews') {
+          parsed.serveCrews = r.value.split(',').map((s) => s.trim()).filter((s) => s !== '');
         } else if (name === '--workflow') parsed.workflow = r.value;
         else if (name === '--cache-dir') parsed.cacheDir = r.value;
         else if (name === '--state-dir') parsed.stateDir = r.value;
@@ -149,7 +149,7 @@ export function parseArgs(args: string[]): ParsedArgs {
 
 function usage(): void {
   process.stderr.write(
-    'usage: owenloop work proxy [--origin <url>] [--as <account>] [--name <n>] [--serve-pools a,b] [--cap <n>]\n' +
+    'usage: owenloop work shift [--origin <url>] [--as <account>] [--name <n>] [--serve-crews a,b] [--cap <n>]\n' +
       '                      [--workflow <id>] [--poll-interval <ms>] [--once]\n' +
       '                      [--max-agents <n>] [--cache-dir <p>] [--state-dir <p>]\n',
   );
@@ -159,24 +159,24 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export interface ProxyRuntimeOptions {
+export interface ShiftRuntimeOptions {
   /** Build the Unix-socket shift daemon around the same loop instead of self-driving directly. */
   daemon?: boolean;
   /** Output prefix for errors and lifecycle messages. */
-  role?: 'proxy' | 'shift';
+  role?: 'shift';
   /** Socket path selected by the shift command. */
   socketPath?: string;
 }
 
 /**
- * Shared runtime setup for the internal proxy and public shift daemon.
+ * Shared runtime setup for the internal shift and public shift daemon.
  * `parsed` is already grammar-validated by the caller; this function owns all
  * credential/settings/cache/spawner resolution so the two entry points cannot
  * drift.
  */
-export async function runProxyRuntime(parsed: ParsedArgs, options: ProxyRuntimeOptions = {}): Promise<number> {
+export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeOptions = {}): Promise<number> {
   const daemonMode = options.daemon === true;
-  const roleLabel = options.role === 'shift' ? 'owenloop shift' : 'owenloop work proxy';
+  const roleLabel = options.role === 'shift' ? 'owenloop shift' : 'owenloop work shift';
   const env = process.env;
   let settings;
   try {
@@ -240,14 +240,14 @@ export async function runProxyRuntime(parsed: ParsedArgs, options: ProxyRuntimeO
   const workRepo = resolveWorkRepo(env, settings.workRepo);
   const hub = createHubClient({ origin, getToken: async () => token });
   const now = () => Date.now();
-  const conductorId = `cnd_${randomUUID()}`;
+  const shiftId = `shf_${randomUUID()}`;
   const startedAt = now();
-  const name = resolveShiftName(parsed.name, { conductorId });
-  const spawner = createDefaultSpawner(origin, account, undefined, conductorId);
+  const name = resolveShiftName(parsed.name, { shiftId });
+  const spawner = createDefaultSpawner(origin, account, undefined, shiftId);
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 
   let daemon: ShiftDaemon | undefined;
-  const loop = createProxyLoop({
+  const loop = createShiftLoop({
     hub,
     spawner,
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
@@ -258,7 +258,7 @@ export async function runProxyRuntime(parsed: ParsedArgs, options: ProxyRuntimeO
     cacheDir,
     stateDir,
     cap,
-    servePools: parsed.servePools ?? [],
+    serveCrews: parsed.serveCrews ?? [],
     name,
     commandRouting: settings.commandRouting,
     pollIntervalMs,
@@ -266,7 +266,7 @@ export async function runProxyRuntime(parsed: ParsedArgs, options: ProxyRuntimeO
     maxConcurrentAgents,
     workRoot,
     ...(workRepo !== undefined ? { workRepo } : {}),
-    conductorId,
+    shiftId,
     startedAt,
     ...(parsed.workflow !== undefined ? { workflow: parsed.workflow } : {}),
     ...(parsed.once === true ? { once: true } : {}),
@@ -280,7 +280,7 @@ export async function runProxyRuntime(parsed: ParsedArgs, options: ProxyRuntimeO
       hub,
       now,
       startedAt,
-      conductorId,
+      shiftId,
       err: (line) => process.stderr.write(`${line}\n`),
     });
     installSignalHandlers(daemon, process, (line) => process.stderr.write(`${line}\n`), {
@@ -296,7 +296,7 @@ export async function runProxyRuntime(parsed: ParsedArgs, options: ProxyRuntimeO
 
   installSignalHandlers(loop, process, (line) => process.stderr.write(`${line}\n`));
   if (parsed.once !== true) {
-    process.stdout.write(`owenloop work proxy: parked as '${name}' @ ${origin} (cap ${cap})\n`);
+    process.stdout.write(`owenloop work shift: parked as '${name}' @ ${origin} (cap ${cap})\n`);
   }
   return loop.run();
 }
@@ -304,14 +304,14 @@ export async function runProxyRuntime(parsed: ParsedArgs, options: ProxyRuntimeO
 export async function run(args: string[]): Promise<number> {
   const parsed = parseArgs(args);
   if (parsed.error !== undefined) {
-    process.stderr.write(`owenloop work proxy: ${parsed.error}\n`);
+    process.stderr.write(`owenloop work shift: ${parsed.error}\n`);
     usage();
     return 2;
   }
   if (args.some((arg) => arg === '--mcp' || arg.startsWith('--mcp='))) {
-    process.stderr.write('owenloop work proxy: unknown option \'--mcp\'\n');
+    process.stderr.write('owenloop work shift: unknown option \'--mcp\'\n');
     usage();
     return 2;
   }
-  return runProxyRuntime(parsed);
+  return runShiftRuntime(parsed);
 }

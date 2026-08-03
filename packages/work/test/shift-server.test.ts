@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import type { HubClient } from '../src/hub/client.ts';
-import type { ProxyLoop } from '../src/proxy/loop.ts';
+import type { ShiftLoop } from '../src/shift/loop.ts';
 import { createShiftDaemon, type ShiftDaemon } from '../src/shift/server.ts';
 import {
   MAX_RESPONSE_LINE_BYTES,
@@ -21,7 +21,7 @@ import { rawShiftRequest } from './helpers/shift-client.ts';
 
 interface FakeState {
   name: string;
-  servePools: string[];
+  serveCrews: string[];
   cap: number;
   attended?: number;
   stopped: boolean;
@@ -67,7 +67,7 @@ function fixture(options: {
   const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-server-'));
   roots.push(root);
   const state: FakeState = {
-    name: 'box', servePools: ['alpha'], cap: 3, stopped: false, childAlive: true,
+    name: 'box', serveCrews: ['alpha'], cap: 3, stopped: false, childAlive: true,
   };
   const pings: Array<Record<string, unknown>> = [];
   const errors: string[] = [];
@@ -81,16 +81,16 @@ function fixture(options: {
     freeCapacity: () => state.cap,
     getCap: () => state.cap,
     setCap: (cap: number) => { state.cap = cap; },
-    getShift: () => ({ name: state.name, servePools: [...state.servePools] }),
-    setShift: (next: { name?: string; servePools?: string[] }) => {
+    getShift: () => ({ name: state.name, serveCrews: [...state.serveCrews] }),
+    setShift: (next: { name?: string; serveCrews?: string[] }) => {
       if (next.name !== undefined) state.name = next.name;
-      if (next.servePools !== undefined) state.servePools = [...next.servePools];
-      return { name: state.name, servePools: [...state.servePools] };
+      if (next.serveCrews !== undefined) state.serveCrews = [...next.serveCrews];
+      return { name: state.name, serveCrews: [...state.serveCrews] };
     },
     noteAttended: (at: number) => { state.attended = at; },
     getAttendedAt: () => state.attended,
     noteRunEnded: () => {},
-  } as unknown as ProxyLoop;
+  } as unknown as ShiftLoop;
   const socketPath = options.socketPath ?? join(root, 'shift.sock');
   const daemon = createShiftDaemon({
     socketPath,
@@ -99,7 +99,7 @@ function fixture(options: {
     hub: fakeHub(pings, options.onPresence),
     now: () => 1234,
     startedAt: 99,
-    conductorId: 'cnd_test',
+    shiftId: 'shf_test',
     err: (line) => errors.push(line),
   });
   const run = daemon.run();
@@ -164,7 +164,7 @@ test('fragmented JSON, malformed requests, and oversized requests receive struct
   await waitForPath(f.socketPath);
   await waitForSocketMode(f.socketPath, 0o600);
   assert.deepEqual(await rawResponse(f.socketPath, ['{"op":"sta', 'tus"}\n']), {
-    name: 'box', serve_pools: ['alpha'], cap: 3, free: 3, running: 0, attended_at: null, started_at: 99,
+    name: 'box', serve_crews: ['alpha'], cap: 3, free: 3, running: 0, attended_at: null, started_at: 99,
   });
   assert.deepEqual(await rawResponse(f.socketPath, ['not-json\n']), { error: 'malformed JSON request' });
   assert.deepEqual(await rawResponse(f.socketPath, ['{"op":"wat"}\n']), { error: "unknown operation 'wat'" });
@@ -180,17 +180,17 @@ test('status, atomic clock-in validation, attendance, typed gate event drain, an
   const before = await requestShift(f.socketPath, { op: 'status' });
   assert.equal('attended_at' in before && before.attended_at, null);
 
-  const invalid = await requestShift(f.socketPath, { op: 'clock_in', name: '', serve_pools: ['beta'] });
+  const invalid = await requestShift(f.socketPath, { op: 'clock_in', name: '', serve_crews: ['beta'] });
   assert.deepEqual(invalid, { error: 'clock_in name must be a non-empty string of at most 200 characters' });
   assert.equal(f.state.name, 'box');
-  assert.deepEqual(f.state.servePools, ['alpha']);
+  assert.deepEqual(f.state.serveCrews, ['alpha']);
   assert.equal(f.state.cap, 3);
   assert.equal(f.state.stopped, false);
   assert.equal(f.state.childAlive, true);
 
-  const clocked = await requestShift(f.socketPath, { op: 'clock_in', name: 'shift-b', serve_pools: ['beta'] });
+  const clocked = await requestShift(f.socketPath, { op: 'clock_in', name: 'shift-b', serve_crews: ['beta'] });
   assert.equal('name' in clocked && clocked.name, 'shift-b');
-  assert.deepEqual(f.state.servePools, ['beta']);
+  assert.deepEqual(f.state.serveCrews, ['beta']);
 
   const failed = { type: 'failed' as const, workflow: 'wf1', run: 'r1', step: 's', kind: 'exec' as const, message: 'boom' };
   const gate: GateEvent = {
@@ -325,8 +325,8 @@ test('end lets the daemon process exit while a responded client stops reading', 
     "  stop: () => resolveLoop?.(0),",
     "  freeCapacity: () => 0,",
     "  getCap: () => 0,",
-    "  getShift: () => ({ name: 'box', servePools: ['alpha'] }),",
-    "  setShift: () => ({ name: 'box', servePools: ['alpha'] }),",
+    "  getShift: () => ({ name: 'box', serveCrews: ['alpha'] }),",
+    "  setShift: () => ({ name: 'box', serveCrews: ['alpha'] }),",
     "  noteAttended: () => {},",
     "  getAttendedAt: () => undefined,",
     "};",

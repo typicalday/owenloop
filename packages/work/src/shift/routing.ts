@@ -1,14 +1,14 @@
 /**
  * Command-order routing (plan decision 5). owenloop owns the `x.owenloop` bag
  * on a step — owenloop treats `x` as opaque — and this module defines its one
- * field so far: `routing: 'proxy' | 'conductor'`.
+ * field so far: `routing: 'shift' | 'manual'`.
  *
- * The knob answers ONE question for a `worker: 'command'` step: does THIS proxy
+ * The knob answers ONE question for a `executor: 'command'` step: does THIS shift
  * auto-dispatch it, or leave it for a human/session to pick up? Two inputs feed
- * the decision — the machine-level `commandRouting` setting (default `'proxy'`)
+ * the decision — the machine-level `commandRouting` setting (default `'shift'`)
  * and the per-step `x.owenloop.routing` override — and MOST RESTRICTIVE WINS:
- * if either says `'conductor'`, the proxy does not auto-run the command. An
- * invalid/unknown value anywhere fails CLOSED to `'conductor'` plus a warning —
+ * if either says `'manual'`, the shift does not auto-run the command. An
+ * invalid/unknown value anywhere fails CLOSED to `'manual'` plus a warning —
  * we never auto-run a command step on a value we could not parse.
  *
  * Agent orders are NOT routed through this knob (decision 5) — only command
@@ -16,17 +16,17 @@
  */
 import type { FetchedStep } from '../bundle/types.ts';
 
-export type Routing = 'proxy' | 'conductor';
+export type Routing = 'shift' | 'manual';
 
-/** True for a `worker: 'command'` step (owenloop RAW_STEP_KEYS `worker`). */
+/** True for a `executor: 'command'` step (owenloop RAW_STEP_KEYS `executor`). */
 export function isCommandStep(step: FetchedStep): boolean {
-  return step.worker === 'command';
+  return step.executor === 'command';
 }
 
 export interface RoutingResolution {
   /** The resolved routing after applying most-restrictive-wins. */
   routing: Routing;
-  /** Convenience: whether the proxy should auto-dispatch this command order. */
+  /** Convenience: whether the shift should auto-dispatch this command order. */
   autoDispatch: boolean;
   /** Human-readable warnings (invalid values that failed closed). */
   warnings: string[];
@@ -35,13 +35,13 @@ export interface RoutingResolution {
 /**
  * Coerce an unknown into a `Routing`. `undefined` maps to `absentDefault` with
  * no warning (the field simply wasn't set); any other non-`Routing` value is an
- * error that fails closed to `'conductor'` and appends a warning.
+ * error that fails closed to `'manual'` and appends a warning.
  */
 function coerceRouting(raw: unknown, absentDefault: Routing, label: string, warnings: string[]): Routing {
   if (raw === undefined) return absentDefault;
-  if (raw === 'proxy' || raw === 'conductor') return raw;
-  warnings.push(`invalid ${label} '${String(raw)}' — failing closed to 'conductor' (command not auto-run)`);
-  return 'conductor';
+  if (raw === 'shift' || raw === 'manual') return raw;
+  warnings.push(`invalid ${label} '${String(raw)}' — failing closed to 'manual' (command not auto-run)`);
+  return 'manual';
 }
 
 /** Read `x.owenloop.routing` off a step, distinguishing a malformed bag. */
@@ -55,24 +55,24 @@ function stepRoutingRaw(step: FetchedStep): { raw: unknown; malformedBag: boolea
 }
 
 /**
- * Resolve whether the proxy auto-dispatches a command step. `machineRaw` is the
+ * Resolve whether the shift auto-dispatches a command step. `machineRaw` is the
  * `commandRouting` setting value (unknown — it came from a JSON file); the step
  * override is read from `x.owenloop.routing`. Most restrictive wins; invalid
- * anywhere ⇒ conductor + warning.
+ * anywhere ⇒ manual + warning.
  */
 export function resolveCommandRouting(machineRaw: unknown, step: FetchedStep): RoutingResolution {
   const warnings: string[] = [];
-  const machine = coerceRouting(machineRaw, 'proxy', 'commandRouting setting', warnings);
+  const machine = coerceRouting(machineRaw, 'shift', 'commandRouting setting', warnings);
 
   const { raw: overrideRaw, malformedBag } = stepRoutingRaw(step);
   let override: Routing;
   if (malformedBag) {
-    warnings.push(`step '${step.name}' has a malformed x.owenloop bag — failing closed to 'conductor'`);
-    override = 'conductor';
+    warnings.push(`step '${step.name}' has a malformed x.owenloop bag — failing closed to 'manual'`);
+    override = 'manual';
   } else {
-    override = coerceRouting(overrideRaw, 'proxy', `x.owenloop.routing on step '${step.name}'`, warnings);
+    override = coerceRouting(overrideRaw, 'shift', `x.owenloop.routing on step '${step.name}'`, warnings);
   }
 
-  const routing: Routing = machine === 'conductor' || override === 'conductor' ? 'conductor' : 'proxy';
-  return { routing, autoDispatch: routing === 'proxy', warnings };
+  const routing: Routing = machine === 'manual' || override === 'manual' ? 'manual' : 'shift';
+  return { routing, autoDispatch: routing === 'shift', warnings };
 }

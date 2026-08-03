@@ -154,9 +154,9 @@ function traceCalls(): TraceCall[] {
 
 /**
  * Run ONE `owenloop work agent-run` child to completion and return its exit code plus
- * stderr. Not detached and not through the proxy: this drill is about what two
+ * stderr. Not detached and not through the shift: this drill is about what two
  * successive runner processes do with one session store, and going through the
- * proxy would add a dispatcher whose behaviour `drill-runner-dispatch` already
+ * shift would add a dispatcher whose behaviour `drill-runner-dispatch` already
  * covers.
  */
 function runAgent(origin: string): Promise<{ code: number | null; stderr: string }> {

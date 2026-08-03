@@ -1,11 +1,11 @@
 ---
 name: owenloop-conduct
-description: Drive an existing owenloop workflow instance to done. You are the conductor — you tick the engine, hand each order to a fresh subagent, and report results honestly; you never do a step's work yourself. Use when asked to run, drive, or conduct a workflow (the def already exists — to build one from a goal, use owenloop-author). Works with any workflow; handles judges, knock-backs, stalls, and human escalation.
+description: Drive an existing owenloop workflow instance to done. You are the Shift — you tick the engine, hand each order to a fresh subagent, and report results honestly; you never do a step's work yourself. Use when asked to run, drive, or conduct a workflow (the def already exists — to build one from a goal, use owenloop-author). Works with any workflow; handles judges, knock-backs, stalls, and human escalation.
 ---
 
 # owenloop-conduct: instance → done
 
-You are the **conductor**. The engine decides what runs next; workers do the
+You are the **Shift**. The engine decides what runs next; workers do the
 work; you sit between them. You tick, you dispatch, you keep the bookkeeping
 honest — you never play an instrument. Every order gets its own fresh subagent,
 which means no agent ever reviews or judges its own work: the maker/checker
@@ -75,10 +75,10 @@ Repeat until `status` says `done: true`:
    yourself. Where subagent calls block, the call is your wait; on hosts where
    they run async, block on their completion before moving on — never
    fire-and-forget.
-   Check `order.worker` before briefing: absent or `'agent'` means dispatch a
+   Check `order.executor` before briefing: absent or `'agent'` means dispatch a
    subagent exactly as described below. Any other value (e.g. `'command'`)
    means the order is for a *different* kind of executor — see "Resolving
-   `worker`" below before dispatching it as if it were an agent order.
+   `executor`" below before dispatching it as if it were an agent order.
 3. **Verify each run closed.** A worker that returns without closing leaves a
    claimed lease. Check `owenloop status <order.workflow>` → its `inFlight` (a
    child order's run lives in the child's own status, not the root's); if its
@@ -109,7 +109,7 @@ present, it is a rejection of a previous attempt; address every point in it.>
 
 Report with the owenloop CLI. `<wf>` below is THIS order's `order.workflow`
 (a deep tick can hand you an order from a child instance — commit against the
-id on the order, not the one the conductor ticked). Append `--db <resolved db>
+id on the order, not the one the Shift ticked). Append `--db <resolved db>
 --defs <resolved dir>` to EVERY command below — nothing is remembered between
 invocations:
 - Accept an output:      owenloop green <wf> <run> <path> --value '<json>'
@@ -153,19 +153,19 @@ set (absent otherwise). Treat it as a hint about *where within the working
 location* to act, and fold it into the briefing's working-location line; it is
 never a path for you to resolve or enforce.
 
-**Resolving `worker`.** An order may carry a `worker` label declaring which
+**Resolving `executor`.** An order may carry an `executor` value declaring which
 kind of executor it's for. Absent, or `'agent'`, is today's default and the
 only case this skill drives directly: dispatch a fresh subagent exactly as
-described above. Any other value (`'command'`, or a label your host defines)
+described above. Any other value (`'command'`, or an executor value your host defines)
 means the order is *not* for an LLM subagent at all — it's for whatever
-non-agent executor your host wires up for that label, using the order's
+non-agent executor your host wires up for that executor value, using the order's
 `command` (opaque — a string, never parsed or shelled out by you) and `spec`
-(an opaque config map) to decide how to run it. You are still the conductor
+(an opaque config map) to decide how to run it. You are still the Shift
 for that order: still tick, still verify the run closed, still report
 honestly — you simply hand it to the matching executor instead of an agent
-subagent. If your host has no executor wired up for a worker value you see,
+subagent. If your host has no executor wired up for an executor value you see,
 that's a blocker, not something to paper over by running it as an agent
-anyway (the def's author deliberately chose a non-agent worker for that
+anyway (the def's author deliberately chose a non-agent executor for that
 step) — escalate it.
 
 ## Deep tick and `calls:` children
@@ -289,6 +289,6 @@ the human asks to move the instance to the new shape.
   failures. If a worker didn't close, close it `failed` yourself.
 - **The human's run id (`human`) and the human's decisions (stall guidance,
   seeded inputs, judge overrides) are theirs.** You relay; you don't invent.
-- **Keep your context at the conductor's altitude** — instance state and the
+- **Keep your context at the Shift's altitude** — instance state and the
   reason threads, not step-level detail. To inspect a diff or artifact, prefer
   a quick read-only peek or a throwaway subagent over pulling it all inline.

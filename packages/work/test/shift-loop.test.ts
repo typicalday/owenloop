@@ -4,28 +4,28 @@ import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
-import { createProxyLoop, type ProxyLoop, type ProxyLoopOptions } from '../src/proxy/loop.ts';
-import { buildSpawnPlan, type SpawnSpec, type Spawner } from '../src/proxy/spawn.ts';
-import { readChildRecords, writeChildRecord } from '../src/proxy/state.ts';
+import { createShiftLoop, type ShiftLoop, type ShiftLoopOptions } from '../src/shift/loop.ts';
+import { buildSpawnPlan, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
+import { readChildRecords, writeChildRecord } from '../src/shift/state.ts';
 import { sessionsPath } from '../src/harness/session-store.ts';
 import { readStepSpec, writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import { ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
-import { installSignalHandlers, type SignalHost } from '../src/roles/proxy.ts';
+import { installSignalHandlers, type SignalHost } from '../src/roles/signals.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { InboxInstance, WorkOrder } from '../src/hub/types.ts';
 
 // ---- fixtures ---------------------------------------------------------------
 //
-// D2 dispatch split: the proxy makes NO first-contact get_order. COMMAND orders
+// D2 dispatch split: the shift makes NO first-contact get_order. COMMAND orders
 // spawn a detached `owenloop work exec` child (+ `exec` record); AGENT orders spawn a
 // detached `owenloop work agent-run` child (+ `agent-run` record). BOTH lanes spawn —
 // there is no lean-order handout and no flag selecting between paths. Metering
 // counts both record kinds. These tests exercise both lanes accordingly.
 
-/** The options object the proxy builds for `sweepWorkDirs` (Phase 4 reaper). */
-type SweepOpts = Parameters<NonNullable<ProxyLoopOptions['sweepWorkDirs']>>[0];
+/** The options object the shift builds for `sweepWorkDirs` (Phase 4 reaper). */
+type SweepOpts = Parameters<NonNullable<ShiftLoopOptions['sweepWorkDirs']>>[0];
 
 const ORIGIN = 'https://hub.example';
 const DEMO_HASH = 'abcdef1234567890';
@@ -127,7 +127,7 @@ function fakeSpawner(): { spawner: Spawner; spawns: SpawnSpec[] } {
   return { spawner, spawns };
 }
 
-function baseOpts(hub: HubClient, spawner: Spawner, extra: Partial<ProxyLoopOptions> = {}): ProxyLoopOptions {
+function baseOpts(hub: HubClient, spawner: Spawner, extra: Partial<ShiftLoopOptions> = {}): ShiftLoopOptions {
   return {
     hub,
     spawner,
@@ -138,7 +138,7 @@ function baseOpts(hub: HubClient, spawner: Spawner, extra: Partial<ProxyLoopOpti
     cacheDir,
     stateDir,
     cap: 3,
-    servePools: [],
+    serveCrews: [],
     name: 'box',
     pollIntervalMs: 5000,
     presenceIntervalMs: 60_000,
@@ -152,7 +152,7 @@ const count = (calls: Call[], verb: string): number => calls.filter((c) => c.ver
 /** Cache a bundle whose 'cmd' step is a COMMAND step (exec/spawn lane). */
 function cacheCommandBundle(): void {
   const bundle: CachedBundle = {
-    def: { name: 'demo', hash: DEMO_HASH, steps: [{ name: 'cmd', worker: 'command' }] },
+    def: { name: 'demo', hash: DEMO_HASH, steps: [{ name: 'cmd', executor: 'command' }] },
     fetchedAt: Date.now(),
     origin: 'x',
   };
@@ -182,54 +182,54 @@ function cmdWf(orders: WorkOrder[]): Record<string, { def: string; orders: WorkO
 test('changed:false ⇒ no whats_next sweep', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 5 }] });
   const { spawner } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1' })).run();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1' })).run();
   assert.equal(count(calls, 'wake'), 1);
   assert.equal(count(calls, 'whats_next'), 0);
 });
 
-test('changed:true ⇒ sweep and spawn a command order (no proxy-side get_order)', async () => {
+test('changed:true ⇒ sweep and spawn a command order (no shift-side get_order)', async () => {
   cacheCommandBundle();
   const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: cmdWf([wo('run_aaaa1111', 'cmd')]) });
   const { spawner, spawns } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1' })).run();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1' })).run();
   assert.equal(count(calls, 'whats_next'), 1);
-  assert.equal(count(calls, 'get_order'), 0); // the proxy never first-contacts
+  assert.equal(count(calls, 'get_order'), 0); // the shift never first-contacts
   assert.equal(spawns.length, 1);
   assert.equal(spawns[0]!.run, 'run_aaaa1111');
 });
 
 // WO-4.3 selection contract at the wire: the per-instance whats_next call must
-// carry serve_pools equal to opts.servePools — the DEFAULT [] (hub reads empty
-// as "serve ALL the actor's pools") and a NARROWED subset both reach it. This
+// carry serve_crews equal to opts.serveCrews — the DEFAULT [] (hub reads empty
+// as "serve ALL the actor's crews") and a NARROWED subset both reach it. This
 // is the whats_next twin of the presence-side assertion below (~L256); it does
 // NOT duplicate the hub-client forwarding tests in test/hub-client.test.ts.
 const perWfWhatsNext = (calls: Call[]): unknown =>
   calls.find((c) => c.verb === 'whats_next' && (c.arg as { workflow?: string } | undefined)?.workflow === 'wf1')?.arg;
 
-test('whats_next carries serve_pools: default [] reaches the per-instance wire arg', async () => {
+test('whats_next carries serve_crews: default [] reaches the per-instance wire arg', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { orders: [] } } });
   const { spawner } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', servePools: [] })).run();
-  assert.deepEqual(perWfWhatsNext(calls), { workflow: 'wf1', serve_pools: [] });
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', serveCrews: [] })).run();
+  assert.deepEqual(perWfWhatsNext(calls), { workflow: 'wf1', serve_crews: [] });
 });
 
-test('whats_next carries serve_pools: a narrowed subset reaches the per-instance wire arg', async () => {
+test('whats_next carries serve_crews: a narrowed subset reaches the per-instance wire arg', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { orders: [] } } });
   const { spawner } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', servePools: ['a'] })).run();
-  assert.deepEqual(perWfWhatsNext(calls), { workflow: 'wf1', serve_pools: ['a'] });
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', serveCrews: ['a'] })).run();
+  assert.deepEqual(perWfWhatsNext(calls), { workflow: 'wf1', serve_crews: ['a'] });
 });
 
 test('monotonic cursor adoption across ticks', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 5 }, { changed: false, cursor: 9 }] });
   const { spawner } = fakeSpawner();
-  const h: { loop?: ProxyLoop } = {};
+  const h: { loop?: ShiftLoop } = {};
   let sleeps = 0;
   const sleep = async (): Promise<void> => {
     sleeps++;
     if (sleeps >= 2) h.loop!.stop();
   };
-  const loop = createProxyLoop(baseOpts(hub, spawner, { sleep, workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { sleep, workflow: 'wf1' }));
   h.loop = loop;
   const code = await loop.run();
   assert.equal(code, 0);
@@ -241,13 +241,13 @@ test('monotonic cursor adoption across ticks', async () => {
 test('wake failure is non-fatal — the loop survives and retries', async () => {
   const { hub, calls } = mockHub({ wake: [{ throw: true }, { changed: false, cursor: 2 }] });
   const { spawner } = fakeSpawner();
-  const h: { loop?: ProxyLoop } = {};
+  const h: { loop?: ShiftLoop } = {};
   let sleeps = 0;
   const sleep = async (): Promise<void> => {
     sleeps++;
     if (sleeps >= 2) h.loop!.stop();
   };
-  const loop = createProxyLoop(baseOpts(hub, spawner, { sleep, workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { sleep, workflow: 'wf1' }));
   h.loop = loop;
   const code = await loop.run();
   assert.equal(code, 0);
@@ -257,42 +257,42 @@ test('wake failure is non-fatal — the loop survives and retries', async () => 
 
 // ---- presence cadence -------------------------------------------------------
 
-test('presence pings on its own cadence, carrying name + serve pools', async () => {
+test('presence pings on its own cadence, carrying name + serve crews', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
   let t = 0;
-  const h: { loop?: ProxyLoop } = {};
+  const h: { loop?: ShiftLoop } = {};
   let sleeps = 0;
   const sleep = async (): Promise<void> => {
     sleeps++;
     t += 30_000;
     if (sleeps >= 3) h.loop!.stop();
   };
-  const loop = createProxyLoop(baseOpts(hub, spawner, { sleep, now: () => t, servePools: ['x'], presenceIntervalMs: 60_000, workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { sleep, now: () => t, serveCrews: ['x'], presenceIntervalMs: 60_000, workflow: 'wf1' }));
   h.loop = loop;
   await loop.run();
   const pings = calls.filter((c) => c.verb === 'presence');
   assert.equal(pings.length, 2); // t=0 and t=60000, not the t=30000 tick
-  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_pools: ['x'] });
+  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_crews: ['x'] });
 });
 
-// W7: when the role wires conductorId/startedAt, presence carries them too
+// W7: when the role wires shiftId/startedAt, presence carries them too
 // (advisory only, D8/INV-82); omitted when unset (the test above).
-test('presence carries conductor_id + started_at when the role sets them', async () => {
+test('presence carries shift_id + started_at when the role sets them', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
-  await createProxyLoop(
-    baseOpts(hub, spawner, { once: true, workflow: 'wf1', conductorId: 'cnd_abc', startedAt: 12345 }),
+  await createShiftLoop(
+    baseOpts(hub, spawner, { once: true, workflow: 'wf1', shiftId: 'shf_abc', startedAt: 12345 }),
   ).run();
   const pings = calls.filter((c) => c.verb === 'presence');
   assert.equal(pings.length, 1);
-  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_pools: [], conductor_id: 'cnd_abc', started_at: 12345 });
+  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_crews: [], shift_id: 'shf_abc', started_at: 12345 });
 });
 
 test('a presence failure does not kill the loop', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }], presenceThrows: true });
   const { spawner } = fakeSpawner();
-  const code = await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1' })).run();
+  const code = await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1' })).run();
   assert.equal(code, 0);
   assert.equal(count(calls, 'presence'), 1);
   assert.equal(count(calls, 'wake'), 1); // reached wake despite the presence throw
@@ -305,7 +305,7 @@ test('over-cap command orders are metered: cap 3 of 5 offered spawn', async () =
   const orders = ['run_1', 'run_2', 'run_3', 'run_4', 'run_5'].map((r) => wo(r, 'cmd'));
   const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: cmdWf(orders) });
   const { spawner, spawns } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', cap: 3 })).run();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', cap: 3 })).run();
   assert.equal(spawns.length, 3); // cap 3, 5 offered
   assert.equal(count(calls, 'get_order'), 0);
 });
@@ -317,7 +317,7 @@ test('pre-existing live records count against capacity (startup recovery)', asyn
   const orders = ['run_a', 'run_b', 'run_c'].map((r) => wo(r, 'cmd'));
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: cmdWf(orders) });
   const { spawner, spawns } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', cap: 3, isAlive: () => true })).run();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', cap: 3, isAlive: () => true })).run();
   assert.equal(spawns.length, 1); // 3 cap − 2 live = 1 free
 });
 
@@ -330,7 +330,7 @@ test('dead records are reaped, freeing capacity', async () => {
   const { spawner, spawns } = fakeSpawner();
   // isAlive false for the recovered records (pid<100), true for freshly spawned (pid>=1000)
   const isAlive = (pid: number): boolean => pid >= 1000;
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', cap: 3, isAlive })).run();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', cap: 3, isAlive })).run();
   assert.equal(spawns.length, 3); // both dead ⇒ full capacity
 });
 
@@ -340,7 +340,7 @@ test('a command order already tracked by a live exec record is not re-spawned (d
   const orders = [wo('run_dup', 'cmd'), wo('run_new', 'cmd')];
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: cmdWf(orders) });
   const { spawner, spawns } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', cap: 3, isAlive: () => true })).run();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', cap: 3, isAlive: () => true })).run();
   assert.deepEqual(spawns.map((s) => s.run), ['run_new']);
 });
 
@@ -350,7 +350,7 @@ test('at zero free capacity the loop skips whats_next entirely', async () => {
   writeChildRecord(stateDir, { workflow: 'wf1', run: 'r3', pid: 3, spawnedAt: 0 });
   const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: cmdWf([wo('run_x', 'cmd')]) });
   const { spawner, spawns } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', cap: 3, isAlive: () => true })).run();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', cap: 3, isAlive: () => true })).run();
   assert.equal(count(calls, 'whats_next'), 0);
   assert.equal(spawns.length, 0);
 });
@@ -359,7 +359,7 @@ test('at zero free capacity the loop skips whats_next entirely', async () => {
 
 test('inbox mode fans out to each servable instance', async () => {
   const bundle: CachedBundle = {
-    def: { name: 'demo', hash: DEMO_HASH, steps: [{ name: 'cmd', worker: 'command' }] },
+    def: { name: 'demo', hash: DEMO_HASH, steps: [{ name: 'cmd', executor: 'command' }] },
     fetchedAt: Date.now(),
     origin: 'x',
   };
@@ -373,7 +373,7 @@ test('inbox mode fans out to each servable instance', async () => {
     },
   });
   const { spawner, spawns } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, cap: 3 })).run();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, cap: 3 })).run();
   // one inbox call + one per-instance whats_next each
   assert.equal(count(calls, 'whats_next'), 3);
   assert.deepEqual(spawns.map((s) => s.run).sort(), ['run_a', 'run_b']);
@@ -381,21 +381,21 @@ test('inbox mode fans out to each servable instance', async () => {
 
 // ---- command routing at the loop level --------------------------------------
 
-async function withCommandStep(routing: 'proxy' | 'conductor' | undefined) {
+async function withCommandStep(routing: 'shift' | 'manual' | undefined) {
   cacheCommandBundle();
   const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [wo('run_cmd', 'cmd')] } } });
   const { spawner, spawns } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', ...(routing !== undefined ? { commandRouting: routing } : {}) })).run();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', ...(routing !== undefined ? { commandRouting: routing } : {}) })).run();
   return { calls, spawns };
 }
 
-test('a conductor-routed command order gets no spawn (left for pickup)', async () => {
-  const { spawns } = await withCommandStep('conductor');
+test('a manual-routed command order gets no spawn (left for pickup)', async () => {
+  const { spawns } = await withCommandStep('manual');
   assert.equal(spawns.length, 0);
 });
 
-test('a proxy-routed command order dispatches', async () => {
-  const { spawns } = await withCommandStep('proxy');
+test('a shift-routed command order dispatches', async () => {
+  const { spawns } = await withCommandStep('shift');
   assert.deepEqual(spawns.map((s) => s.run), ['run_cmd']);
 });
 
@@ -405,7 +405,7 @@ test('a dispatched agent order spawns a detached agent-run child and records it'
   cacheBuilderStep();
   const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [wo('run_deadbeef', 'builder')] } } });
   const { spawner, spawns } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
   const dispatched = await loop.iterate();
 
   assert.equal(dispatched, 1);
@@ -429,7 +429,7 @@ test('a step naming a harness passes that id to the agent-run child', async () =
   cacheBuilderWithHarness('some-harness');
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [wo('run_deadbeef', 'builder')] } } });
   const { spawner, spawns } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
   await loop.iterate();
   assert.equal(spawns[0]!.harness, 'some-harness');
 });
@@ -438,7 +438,7 @@ test('a step naming no harness passes no harness to the agent-run child', async 
   cacheBuilderWithHarness();
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [wo('run_deadbeef', 'builder')] } } });
   const { spawner, spawns } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
   await loop.iterate();
   // No `harness` on the step ⇒ no key at all, leaving the child's own precedence
   // (--harness → OWENLOOP_HARNESS → step def → registry head) in charge.
@@ -449,7 +449,7 @@ test('a missing bundle leaves an agent order for pickup with a warning — no sp
   const errs: string[] = [];
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [wo('run_deadbeef', 'builder')] } } });
   const { spawner, spawns } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1', err: (l) => errs.push(l) }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1', err: (l) => errs.push(l) }));
   const dispatched = await loop.iterate();
   assert.equal(dispatched, 0);
   assert.equal(spawns.length, 0);
@@ -464,7 +464,7 @@ test('an order a LIVE agent-run child already holds is never re-dispatched', asy
   writeChildRecord(stateDir, { workflow: 'wf1', run: 'run_deadbeef', pid: 4242, spawnedAt: 0, kind: 'agent-run', def: 'demo', hash: DEMO_HASH, step: 'builder' });
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [wo('run_deadbeef', 'builder')] } } });
   const { spawner, spawns } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1', cap: 2 }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1', cap: 2 }));
   const dispatched = await loop.iterate();
   assert.equal(dispatched, 0);
   assert.equal(spawns.length, 0);
@@ -496,7 +496,7 @@ test('a sweep serving def=child dispatches the PINNED hash, not the newer unpinn
   cachePinnedChild();
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'child', orders: [wo('run_deadbeef', 'builder')] } } });
   const { spawner, spawns } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
   const dispatched = await loop.iterate();
 
   assert.equal(dispatched, 1);
@@ -526,7 +526,7 @@ test('conflicting pins for def=child ⇒ no dispatch, a warning, orders left for
   const errs: string[] = [];
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'child', orders: [wo('run_deadbeef', 'builder')] } } });
   const { spawner, spawns } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1', err: (l) => errs.push(l) }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1', err: (l) => errs.push(l) }));
   const dispatched = await loop.iterate();
 
   assert.equal(dispatched, 0); // refused — no version guessed
@@ -540,7 +540,7 @@ test('conflicting pins for def=child ⇒ no dispatch, a warning, orders left for
 test('stop() before run ⇒ run resolves 0 with zero hub calls', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
   loop.stop();
   const code = await loop.run();
   assert.equal(code, 0);
@@ -550,11 +550,11 @@ test('stop() before run ⇒ run resolves 0 with zero hub calls', async () => {
 test('stop() during the park ⇒ run resolves 0 and makes no further hub call', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
-  const h: { loop?: ProxyLoop } = {};
+  const h: { loop?: ShiftLoop } = {};
   const sleep = async (): Promise<void> => {
     h.loop!.stop(); // stop while parked, after the first iteration
   };
-  const loop = createProxyLoop(baseOpts(hub, spawner, { sleep, workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { sleep, workflow: 'wf1' }));
   h.loop = loop;
   const code = await loop.run();
   assert.equal(code, 0);
@@ -566,7 +566,7 @@ test('stop() during the park ⇒ run resolves 0 and makes no further hub call', 
 test('getCap/setCap/freeCapacity expose the live cap', async () => {
   const { hub } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1', cap: 3 }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1', cap: 3 }));
   assert.equal(loop.getCap(), 3);
   assert.equal(loop.freeCapacity(), 3);
   loop.setCap(5);
@@ -576,48 +576,48 @@ test('getCap/setCap/freeCapacity expose the live cap', async () => {
 
 // ---- shift identity surface (MCP clock_in, shifts.md §8 item 4) ------------
 
-test('setShift updates the live name/servePools; the next presence ping carries them', async () => {
+test('setShift updates the live name/serveCrews; the next presence ping carries them', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
   await loop.iterate(); // first iterate always pings (lastPresence starts at -Infinity)
-  loop.setShift({ name: 'shiftB', servePools: ['project-bar'] });
+  loop.setShift({ name: 'shiftB', serveCrews: ['project-bar'] });
   await loop.iterate(); // setShift reset the presence timer, so this pings again immediately
   const pings = calls.filter((c) => c.verb === 'presence');
   assert.equal(pings.length, 2);
-  assert.deepEqual(pings[1]!.arg, { name: 'shiftB', serve_pools: ['project-bar'] });
+  assert.deepEqual(pings[1]!.arg, { name: 'shiftB', serve_crews: ['project-bar'] });
 });
 
-test('after setShift({servePools}), the per-instance whats_next carries the new servePools', async () => {
+test('after setShift({serveCrews}), the per-instance whats_next carries the new serveCrews', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }, { changed: true, cursor: 2 }] });
   const { spawner } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
-  await loop.iterate(); // first sweep uses the initial servePools ([])
-  loop.setShift({ servePools: ['project-bar'] });
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
+  await loop.iterate(); // first sweep uses the initial serveCrews ([])
+  loop.setShift({ serveCrews: ['project-bar'] });
   await loop.iterate();
   const wn = calls.filter((c) => c.verb === 'whats_next');
-  assert.deepEqual(wn[wn.length - 1]!.arg, { workflow: 'wf1', serve_pools: ['project-bar'] });
+  assert.deepEqual(wn[wn.length - 1]!.arg, { workflow: 'wf1', serve_crews: ['project-bar'] });
 });
 
 test('setShift is a partial update: an omitted field leaves that part of the shift unchanged (via getShift() and the next ping)', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1', servePools: ['x'] }));
-  loop.setShift({ servePools: ['y'] });
-  assert.deepEqual(loop.getShift(), { name: 'box', servePools: ['y'] }); // name untouched by a scope-only call
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1', serveCrews: ['x'] }));
+  loop.setShift({ serveCrews: ['y'] });
+  assert.deepEqual(loop.getShift(), { name: 'box', serveCrews: ['y'] }); // name untouched by a scope-only call
   loop.setShift({ name: 'z' });
-  assert.deepEqual(loop.getShift(), { name: 'z', servePools: ['y'] }); // scope untouched by a name-only call
+  assert.deepEqual(loop.getShift(), { name: 'z', serveCrews: ['y'] }); // scope untouched by a name-only call
 
   await loop.iterate();
   const pings = calls.filter((c) => c.verb === 'presence');
-  assert.deepEqual(pings[0]!.arg, { name: 'z', serve_pools: ['y'] });
+  assert.deepEqual(pings[0]!.arg, { name: 'z', serve_crews: ['y'] });
 });
 
 test('setShift makes the next presence ping due immediately, even mid-cadence (control: a plain tick does not ping early)', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
   let t = 0;
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1', now: () => t, presenceIntervalMs: 60_000 }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1', now: () => t, presenceIntervalMs: 60_000 }));
   await loop.iterate(); // t=0: first iterate always pings
   t = 10_000; // well short of the 60s cadence
   await loop.iterate(); // control: no ping yet — cadence has not elapsed
@@ -630,17 +630,17 @@ test('setShift makes the next presence ping due immediately, even mid-cadence (c
   assert.equal((pings[1]!.arg as { name?: string } | undefined)?.name, 'shiftC');
 });
 
-// D3: [] is SENT, never omitted — the hub reads an omitted serve_pools as
+// D3: [] is SENT, never omitted — the hub reads an omitted serve_crews as
 // "unchanged from the previous ping" in general wire semantics, but a ping is
 // full-current-truth, so [] must appear on the wire to mean "all crews".
-test('setShift({servePools: []}) sends serve_pools: [] on the wire, not omitted', async () => {
+test('setShift({serveCrews: []}) sends serve_crews: [] on the wire, not omitted', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1', servePools: ['only-one'] }));
-  loop.setShift({ servePools: [] });
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1', serveCrews: ['only-one'] }));
+  loop.setShift({ serveCrews: [] });
   await loop.iterate();
   const pings = calls.filter((c) => c.verb === 'presence');
-  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_pools: [] });
+  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_crews: [] });
 });
 
 // ---- spawn seam -------------------------------------------------------------
@@ -657,24 +657,24 @@ test('buildSpawnPlan produces the detached `exec <workflow>/<run> --origin` argv
   assert.equal(plan.options.env['PATH'], process.env['PATH']);
 });
 
-// W7: the dispatching Conductor's id, when supplied, rides as a trailing
-// `--conductor <cid>` flag — after execPath so pre-W7 positional callers
+// W7: the dispatching Shift's id, when supplied, rides as a trailing
+// `--shift <cid>` flag — after execPath so pre-W7 positional callers
 // (the test above) are unaffected.
-test('buildSpawnPlan appends --conductor <cid> when a conductorId is supplied', () => {
+test('buildSpawnPlan appends --shift <cid> when a shiftId is supplied', () => {
   const plan = buildSpawnPlan(
     { workflow: 'wf1', run: 'run_zzzz' },
     'https://hub.example',
     'ci',
     '/pkg/bin/owenloop.mjs',
     '/usr/bin/node',
-    'cnd_abc123',
+    'shf_abc123',
   );
-  assert.deepEqual(plan.args, ['/pkg/bin/owenloop.mjs', 'work', 'exec', 'wf1/run_zzzz', '--origin', 'https://hub.example', '--conductor', 'cnd_abc123']);
+  assert.deepEqual(plan.args, ['/pkg/bin/owenloop.mjs', 'work', 'exec', 'wf1/run_zzzz', '--origin', 'https://hub.example', '--shift', 'shf_abc123']);
 });
 
-// An empty conductorId (the "unresolved" state, per resolveConductorId) degrades
-// safely to no flag at all — never `--conductor ''`.
-test('buildSpawnPlan omits --conductor entirely when conductorId is empty or absent', () => {
+// An empty shiftId (the "unresolved" state, per resolveShiftId) degrades
+// safely to no flag at all — never `--shift ''`.
+test('buildSpawnPlan omits --shift entirely when shiftId is empty or absent', () => {
   const withUndefined = buildSpawnPlan({ workflow: 'wf1', run: 'run_zzzz' }, 'https://hub.example', 'ci', '/pkg/bin/owenloop.mjs', '/usr/bin/node');
   assert.deepEqual(withUndefined.args, ['/pkg/bin/owenloop.mjs', 'work', 'exec', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
   const withEmpty = buildSpawnPlan({ workflow: 'wf1', run: 'run_zzzz' }, 'https://hub.example', 'ci', '/pkg/bin/owenloop.mjs', '/usr/bin/node', '');
@@ -698,14 +698,14 @@ test('buildSpawnPlan: kind agent-run swaps the role positional and keeps every o
   assert.equal(plan.options.env['OWENLOOP_ACCOUNT'], 'ci');
 });
 
-test('buildSpawnPlan: kind agent-run appends --harness <id> when one is named, and --conductor still rides', () => {
+test('buildSpawnPlan: kind agent-run appends --harness <id> when one is named, and --shift still rides', () => {
   const plan = buildSpawnPlan(
     { workflow: 'wf1', run: 'run_zzzz', kind: 'agent-run', harness: 'h1' },
     'https://hub.example',
     'ci',
     '/pkg/bin/owenloop.mjs',
     '/usr/bin/node',
-    'cnd_abc123',
+    'shf_abc123',
   );
   assert.deepEqual(plan.args, [
     '/pkg/bin/owenloop.mjs',
@@ -713,8 +713,8 @@ test('buildSpawnPlan: kind agent-run appends --harness <id> when one is named, a
     'wf1/run_zzzz',
     '--origin',
     'https://hub.example',
-    '--conductor',
-    'cnd_abc123',
+    '--shift',
+    'shf_abc123',
     '--harness',
     'h1',
   ]);
@@ -740,19 +740,19 @@ test('buildSpawnPlan: an empty or absent harness carries no --harness flag, and 
   assert.deepEqual(execSpec.args, ['/pkg/bin/owenloop.mjs', 'work', 'exec', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
 });
 
-// createDefaultSpawner is a thin wrapper: it captures conductorId at
+// createDefaultSpawner is a thin wrapper: it captures shiftId at
 // construction and passes it straight through to buildSpawnPlan (see spawn.ts
 // doc comment) before calling the real `spawn`. Per this file's own testing
 // contract ("pure buildSpawnPlan so a test can assert the exact shape as
 // data" / never launch a real child), the buildSpawnPlan tests above are the
-// intended coverage for the conductorId threading — createDefaultSpawner
+// intended coverage for the shiftId threading — createDefaultSpawner
 // itself is deliberately NOT exercised here.
 
 test('a dispatched command order writes an exec child record carrying the returned pid', async () => {
   cacheCommandBundle();
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: cmdWf([wo('run_rec', 'cmd')]) });
   const { spawner } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1' })).run();
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1' })).run();
   const recFile = join(stateDir, 'run_rec.json');
   assert.equal(existsSync(recFile), true);
   const rec = JSON.parse(readFileSync(recFile, 'utf8')) as { run: string; pid: number; kind?: string };
@@ -770,13 +770,13 @@ test('noteRunEnded frees the dispatch slot immediately (closed-submit end-of-run
     perWf: { wf1: { def: 'demo', orders: [wo('run_x1234', 'builder')] } },
   });
   const { spawner } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
 
   // Dispatch consumes a slot.
   assert.equal(await loop.iterate(), 1);
   assert.equal(loop.freeCapacity(), 2);
 
-  // The proxy's submit tool saw closed:true → the run-ended signal: the slot
+  // The shift's submit tool saw closed:true → the run-ended signal: the slot
   // frees NOW, without waiting for the child's pid probe to go stale.
   loop.noteRunEnded('run_x1234');
   assert.equal(loop.freeCapacity(), 3, 'the dispatch slot freed immediately');
@@ -856,7 +856,7 @@ test('e2e: iterate() dispatches an agent order, parks quiet, and re-sweeps only 
   void cursor; // referenced only to model the hub's cursor threading
 
   const { spawner, spawns } = fakeSpawner();
-  const loop = createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
 
   // Iteration 1: wake changed → sweep → one detached agent-run child.
   assert.equal(await loop.iterate(), 1);
@@ -914,7 +914,7 @@ test('an agent order dispatches even with no cached step spec', async () => {
   writeBundle(cacheDir, { def: { name: 'demo', hash: DEMO_HASH, steps: [{ name: 'builder', body: '' }] }, fetchedAt: 0, origin: ORIGIN }, []);
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: agentWf([wo('run_deadbeef', 'builder')]) });
   const { spawner, spawns } = fakeSpawner();
-  const dispatched = await createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' })).iterate();
+  const dispatched = await createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' })).iterate();
   assert.equal(dispatched, 1);
   assert.equal(spawns.length, 1);
 });
@@ -925,7 +925,7 @@ test('maxConcurrentAgents caps agent-run dispatch on top of the global cap', asy
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: agentWf(orders) });
   const { spawner, spawns } = fakeSpawner();
   const out: string[] = [];
-  await createProxyLoop(
+  await createShiftLoop(
     baseOpts(hub, spawner, {
       workflow: 'wf1',
       cap: 10, // plenty of global room — the agent cap is what must bite
@@ -945,7 +945,7 @@ test('live agent-run records consume the agent cap; the global cap still applies
   writeChildRecord(stateDir, { workflow: 'wf1', run: 'run_prior', pid: process.pid, spawnedAt: 0, kind: 'agent-run', step: 'builder' });
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: agentWf([wo('run_a1', 'builder'), wo('run_b2', 'builder')]) });
   const { spawner, spawns } = fakeSpawner();
-  await createProxyLoop(
+  await createShiftLoop(
     baseOpts(hub, spawner, { workflow: 'wf1', cap: 10, maxConcurrentAgents: 2, isAlive: () => true }),
   ).iterate();
 
@@ -954,7 +954,7 @@ test('live agent-run records consume the agent cap; the global cap still applies
   // And the global cap is not bypassed: cap 1 with a live record leaves no room.
   const b = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: agentWf([wo('run_c3', 'builder')]) });
   const s2 = fakeSpawner();
-  await createProxyLoop(
+  await createShiftLoop(
     baseOpts(b.hub, s2.spawner, { workflow: 'wf1', cap: 1, maxConcurrentAgents: 9, isAlive: () => true }),
   ).iterate();
   assert.equal(s2.spawns.length, 0);
@@ -967,7 +967,7 @@ test('a failing agent-run spawn is reported and writes no record', async () => {
     throw new Error('fork bomb');
   };
   const err: string[] = [];
-  const dispatched = await createProxyLoop(
+  const dispatched = await createShiftLoop(
     baseOpts(hub, spawner, { workflow: 'wf1', err: (l) => err.push(l) }),
   ).iterate();
 
@@ -982,7 +982,7 @@ test('COMMAND orders stay on the exec lane', async () => {
   cacheCommandBundle();
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: cmdWf([wo('run_aaaa1111', 'cmd')]) });
   const { spawner, spawns } = fakeSpawner();
-  await createProxyLoop(baseOpts(hub, spawner, { workflow: 'wf1' })).iterate();
+  await createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' })).iterate();
   assert.equal(spawns.length, 1);
   assert.equal(spawns[0]!.kind, undefined);
   assert.equal(readChildRecords(stateDir)[0]!.kind, 'exec');
@@ -1000,7 +1000,7 @@ test('a run a live agent-run child holds is skipped silently, not via the cap pa
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: agentWf([wo('run_deadbeef', 'builder')]) });
   const { spawner, spawns } = fakeSpawner();
   const out: string[] = [];
-  await createProxyLoop(
+  await createShiftLoop(
     baseOpts(hub, spawner, {
       workflow: 'wf1', cap: 10, maxConcurrentAgents: 9,
       isAlive: () => true, out: (l) => out.push(l),
@@ -1014,19 +1014,19 @@ test('a run a live agent-run child holds is skipped silently, not via the cap pa
 // ---- PHASE 4: the reaper's composition point ---------------------------------
 //
 // `sweepWorkDirs` can only retire the sessions of a run it is removing if the
-// proxy hands it the store's path, and the ONE path that must arrive is
+// shift hands it the store's path, and the ONE path that must arrive is
 // `sessionsPath(cacheDir)` — the very file `owenloop work agent-run` writes, built by
 // the same `resolveCacheDir`. Pointing this anywhere else re-opens the teardown
 // hole silently: dirs still vanish, sessions stay `active`, the next firing
 // resumes into an empty tree. So pin the wiring itself, not just the sweep.
-test('the proxy hands the reaper the session store at sessionsPath(cacheDir)', async () => {
+test('the shift hands the reaper the session store at sessionsPath(cacheDir)', async () => {
   cacheBuilderStep();
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: agentWf([]) });
   const { spawner } = fakeSpawner();
   const workRoot = join(cacheDir, 'work');
 
   let captured: SweepOpts | undefined;
-  await createProxyLoop(
+  await createShiftLoop(
     baseOpts(hub, spawner, {
       workflow: 'wf1',
       workRoot,
