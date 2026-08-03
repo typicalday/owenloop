@@ -264,7 +264,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
      * deliberately left out, because a failed call is not evidence that a run
      * has no open order, and the reaper must never treat silence as absence.
      * `openRuns` is every run those calls reported an order for, including ones
-     * this shift declined to dispatch (capacity, routing, an in-flight runner):
+     * this shift declined to dispatch (capacity, routing, an in-flight worker):
      * an order the shift left alone is still an open order, and its run's work
      * directory must survive.
      */
@@ -282,10 +282,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
      * Runs that ALREADY have a live `agent-run` child. An agent-run child is a
      * PROCESS: re-dispatching one would put a second harness session on a single
      * claim — two step agents briefed for the same order, racing to submit. So a
-     * re-offer for a run a runner already holds is skipped outright, the way the
+     * re-offer for a run a worker already holds is skipped outright, the way the
      * command lane does it.
      */
-    const runnerRuns = new Set(live.filter((r) => r.kind === 'agent-run').map((r) => r.run));
+    const workerRuns = new Set(live.filter((r) => r.kind === 'agent-run').map((r) => r.run));
 
     // Resolve which instances to poll.
     let instances: string[];
@@ -347,9 +347,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
           continue;
         }
 
-        // Agent order. An order a live runner already holds is never re-dispatched
-        // (see `runnerRuns`) — that would double-brief one claim.
-        if (runnerRuns.has(order.run)) continue;
+        // Agent order. An order a live worker already holds is never re-dispatched
+        // (see `workerRuns`) — that would double-brief one claim.
+        if (workerRuns.has(order.run)) continue;
 
         // No resolved bundle ⇒ no dispatch. Two distinct causes, one outcome:
         //   - nothing cached for this def name (the operator never ran
@@ -368,7 +368,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
           if (remaining <= 0) continue;
           // The agent budget applies IN ADDITION to the global one. Skipped
           // candidates are simply left alone — the hub re-offers them on a later
-          // sweep once a runner child exits.
+          // sweep once a worker child exits.
           if (agentRoom <= 0) {
             opts.out(`[${wf}/${order.run}] at the agent-run cap (${maxAgents}) — leaving for a later sweep`);
             continue;

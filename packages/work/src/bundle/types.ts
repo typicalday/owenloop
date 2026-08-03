@@ -59,7 +59,7 @@ export interface FetchedStep {
   /** `'command'` steps are exec/engine concerns, never given a spec (D6). */
   executor?: string;
   /**
-   * Which harness the `agent-run` runner should host this step agent in.
+   * Which harness the `agent-run` worker should host this step agent in.
    * LIFTED by `validateFetchedDef` from `x.harness.id`, or from a top-level
    * `harness` key when the def carries one (top-level WINS — forward compat for
    * an owenloop grammar that promotes the field). Declaration only: nothing

@@ -77,7 +77,7 @@ import { ADMITTED_OWENLOOP_KEYS, filterOwenloopEnv } from './child-env.ts';
 import { JsonRpcError, startStdioRpc, type StdioRpcClient } from './jsonrpc-stdio.ts';
 
 /** The adapter id. Matches the `"codex"` key in `harness-versions.json`, so the
- *  runner can use one string for both the version pin and the adapter lookup. */
+ *  worker can use one string for both the version pin and the adapter lookup. */
 export const HARNESS_ID = 'codex';
 
 /** The MCP server name the step agent's `get_order` / `submit` tools live under. */
@@ -160,7 +160,7 @@ const NATIVE_APPROVAL_POLICIES = new Set(['untrusted', 'on-request', 'never']);
  * `'never'` is the default for everything unrecognized, and that is a decision:
  * this runs headless with no human on the other end, so any policy that can
  * raise a `requestApproval` server request converts a stalled approval into an
- * order that hangs past the runner's lease. The adapter still answers those
+ * order that hangs past the worker's lease. The adapter still answers those
  * requests defensively (see `handleServerRequest`) — belt and braces, because
  * `approvalPolicy` does not govern every request kind.
  */
@@ -232,7 +232,7 @@ function mountEnv(): Record<string, string> {
   return out;
 }
 
-/** The mount for owenloop's own work-holder MCP surface, verbatim from the runner. */
+/** The mount for owenloop's own work-holder MCP surface, verbatim from the worker. */
 function owenloopMount(mcp: { command: string; args: string[] }): McpServerSpec {
   return { command: mcp.command, args: [...mcp.args], env: mountEnv() };
 }
@@ -654,7 +654,7 @@ function createTurnGate(onEvent: (e: AgentEvent) => void): TurnGate {
 
 /**
  * Answer every server→client request. An unanswered one hangs the turn past the
- * runner's lease, which is the single worst outcome available in this file.
+ * worker's lease, which is the single worst outcome available in this file.
  *
  * Exactly ONE thing is auto-approved — a tool call on owenloop's own MCP mount,
  * see the `mcpServer/elicitation/request` case. Everything else is refused:
@@ -1072,6 +1072,6 @@ export const codexAdapter: HarnessAdapter = {
 };
 
 // Adapters self-register at IMPORT time; whoever imports this module is what
-// puts it in the runtime registry. Phase 3's runner owns that import — this
+// puts it in the runtime registry. Phase 3's worker owns that import — this
 // phase only makes the import sufficient.
 register(codexAdapter);

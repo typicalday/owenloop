@@ -1,5 +1,5 @@
 /**
- * `owenloop work exec <order-id>` (C5) — the detached, self-leasing command runner.
+ * `owenloop work exec <order-id>` (C5) — the detached, self-leasing command worker.
  *
  * The shift (C3) spawns one detached `owenloop work exec <workflow>/<run> --origin
  * <url>` per COMMAND order. This process owns that order end to end: it takes the

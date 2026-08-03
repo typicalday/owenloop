@@ -1,6 +1,6 @@
 /**
  * `FakeAdapter` — a scripted `HarnessAdapter` with no I/O, no child process, and
- * no real timers. It exists so Phase 3's runner and the drills can be developed
+ * no real timers. It exists so Phase 3's worker and the drills can be developed
  * and tested before any real adapter lands, and so failure modes that are hard
  * to provoke against a real provider (an unresumable session, a death mid-turn)
  * are one fixture field away.

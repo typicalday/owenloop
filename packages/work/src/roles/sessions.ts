@@ -7,7 +7,7 @@
  * the hub. Before this subcommand the only way to answer "is anything still
  * open on this box, and how do I get into it?" was to read the JSONL by hand.
  * That matters most in exactly the situation where reading files by hand is
- * hardest: a run that failed, whose runner is gone, and whose session may or may
+ * hardest: a run that failed, whose worker is gone, and whose session may or may
  * not still be resumable.
  *
  * WHY NO VENDOR NAME APPEARS IN THIS FILE. The harness id on a `SessionRecord`

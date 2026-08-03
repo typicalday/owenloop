@@ -31,7 +31,7 @@
  * a repo, and adding a field there would be a hub protocol change — an explicit
  * effort non-goal.
  *
- * Failure stance: provisioning propagates its failure (a runner with no place to
+ * Failure stance: provisioning propagates its failure (a worker with no place to
  * work should say so); REMOVAL is best-effort and never throws, because it runs
  * inside the shift sweep and a sweep must not die over a directory.
  */
@@ -189,8 +189,8 @@ export interface ReapGateInput {
  * child" in exactly that gap and delete the directory a moment before the next
  * step needs it.
  *
- * WHY THIS RUNS IN THE SHIFT SWEEP AND NOT IN THE RUNNER AT EXIT: same reason,
- * from the other side. A runner asking "is anything still open?" as it exits is
+ * WHY THIS RUNS IN THE SHIFT SWEEP AND NOT IN THE WORKER AT EXIT: same reason,
+ * from the other side. A worker asking "is anything still open?" as it exits is
  * asking during that gap, every time.
  */
 export function isWorkDirReapable(g: ReapGateInput): boolean {
@@ -338,7 +338,7 @@ export interface SweepWorkDirsOptions {
  * Removing the directory is only half the gate. A session record for the same
  * `(workflow, run, step)` outlives the directory in `sessions.jsonl`, and the
  * next firing of that step RECREATES the directory at the same path
- * (`ensureWorkDir` is idempotent by design), which defeats the runner's
+ * (`ensureWorkDir` is idempotent by design), which defeats the worker's
  * `dirExists(prev.cwd)` and `prev.cwd === recordCwd` guards on its own. So every
  * session of the run is marked `dead` here — `src/agent/loop.ts` refuses to
  * resume a `dead` record, which is what makes resume impossible past this point

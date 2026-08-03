@@ -1,5 +1,5 @@
 /**
- * The exec orchestration core (C5) — the detached, self-leasing command runner.
+ * The exec orchestration core (C5) — the detached, self-leasing command worker.
  *
  * A command order the shift (C3) dispatched becomes a detached `owenloop work exec`
  * process. This core drives its whole life against the hub, every side effect
