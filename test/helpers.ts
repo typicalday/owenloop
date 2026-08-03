@@ -22,7 +22,7 @@ export interface StepSpec {
   maxSchemaFailures?: number;
   model?: string;
   workdir?: string;
-  worker?: string;
+  executor?: string;
   command?: string;
   spec?: Record<string, unknown>;
   body?: string;
@@ -32,7 +32,7 @@ export interface StepSpec {
   idleAfter?: string;
   idleAfterMs?: number;
   reapTtlMs?: number;
-  labels?: string[];
+  capabilities?: string[];
   maxLeaseMs?: number;
   x?: Record<string, unknown>;
 }

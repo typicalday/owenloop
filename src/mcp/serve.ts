@@ -25,7 +25,7 @@
  *      the token is NEVER returned in a tool result, printed, or logged. The
  *      mint response body carries the plaintext in TWO fields (`data.token` AND
  *      the human `text` "Store this secret now…"), so the handler builds its
- *      result object FROM SCRATCH (`{name, pools, stored:true}`) and never
+ *      result object FROM SCRATCH (`{name, crews, stored:true}`) and never
  *      passes any field of the raw body outbound.
  *
  * The transport core is in `./server.ts` (a copy of owenloop's; see its header).
@@ -279,8 +279,8 @@ function passthrough(deps: McpDeps, build: (args: Record<string, unknown>) => Hu
  * (wire names keep `agent`), never "tool" (model-doc §0/§10).
  *
  * This is not the server's whole tool list. `runMcpCommand` assembles the full
- * set: these 17, plus `createAgentTool`, plus the four pool tools from
- * `buildPoolTools` (below — deliberately NOT folded in here, since they do not
+ * set: these 17, plus `createAgentTool`, plus the four crew tools from
+ * `buildCrewTools` (below — deliberately NOT folded in here, since they do not
  * mirror the hub's own MCP toolset), plus the conditionally-registered
  * `stageEnrollmentTool`.
  */
@@ -289,10 +289,10 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'whats_next',
       description:
-        'THE verb. With workflow: ticks it and returns the next work order(s), or a status summary if none. Without workflow: the inbox of started instances. Serves only YOUR OWN runs by default. Pass serve_pools to partition your own runs further (intersects with each step\'s labels; absent or [] = no label filter). serve_pools is ignored in inbox mode (no workflow).',
+        'THE verb. With workflow: ticks it and returns the next work order(s), or a status summary if none. Without workflow: the inbox of started instances. Serves only YOUR OWN runs by default. Pass serve_crews to partition your own runs further (intersects with each step\'s capabilities; absent or [] = no capability filter). serve_crews is ignored in inbox mode (no workflow).',
       inputSchema: {
         type: 'object',
-        properties: { workflow: { type: 'string' }, serve_pools: { type: 'array', items: { type: 'string' } } },
+        properties: { workflow: { type: 'string' }, serve_crews: { type: 'array', items: { type: 'string' } } },
         additionalProperties: false,
       },
       handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/whats_next', body: a })),
@@ -367,7 +367,7 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'get_workflow',
       description:
-        'Def summary and full workflow bundle: steps with consumes/produces, schemas, judges, each step\'s prompt body, model/worker/command, and x extension bags, plus mermaid source and the def content hash/version.',
+        'Def summary and full workflow bundle: steps with consumes/produces, schemas, judges, each step\'s prompt body, model/executor/command, and x extension bags, plus mermaid source and the def content hash/version.',
       inputSchema: {
         type: 'object',
         properties: { name: { type: 'string' } },
@@ -470,13 +470,13 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
     {
       name: 'presence_ping',
       description:
-        'Register or refresh this Conductor in the presence registry: its name, the pools it serves, and optionally which process incarnation is reporting. Call it on a ~60s cadence; the entry reads as offline once ~3 min have passed since its last ping — derived when the registry is read, nothing sweeps it. Observability only: it never affects serving and never wakes anyone. This is NOT the lease heartbeat — that is the separate `heartbeat` tool, one per claimed run, whose lapse gets the claim reaped. Every field is overwrite, NOT keep-previous: omitting serve_pools stores an empty set, which means "every pool this principal belongs to" (the same reading whats_next gives an empty serve_pools) and NOT "no pools"; omitting conductor_id/started_at clears them.',
+        'Register or refresh this Shift in the presence registry: its name, the crews it serves, and optionally which process incarnation is reporting. Call it on a ~60s cadence; the entry reads as offline once ~3 min have passed since its last ping — derived when the registry is read, nothing sweeps it. Observability only: it never affects serving and never wakes anyone. This is NOT the lease heartbeat — that is the separate `heartbeat` tool, one per claimed run, whose lapse gets the claim reaped. Every field is overwrite, NOT keep-previous: omitting serve_crews stores an empty set, which means "every crew this principal belongs to" (the same reading whats_next gives an empty serve_crews) and NOT "no crews"; omitting shift_id/started_at clears them.',
       inputSchema: {
         type: 'object',
         properties: {
           name: { type: 'string' },
-          serve_pools: { type: 'array', items: { type: 'string' } },
-          conductor_id: { type: 'string' },
+          serve_crews: { type: 'array', items: { type: 'string' } },
+          shift_id: { type: 'string' },
           started_at: { type: 'number' },
         },
         required: ['name'],
@@ -485,11 +485,11 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
       handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/presence_ping', body: a })),
     },
     {
-      name: 'list_conductors',
+      name: 'list_shifts',
       description:
-        "Your principal's registered Conductors, each with an online/offline flag (derived at read time from its last ping, ~3 min), how long since it was last seen, the pools it serves (returned as `labels`; an empty list means every pool this principal belongs to, not none), and the reporting process incarnation (`conductorId`/`startedAt`) when the hub recorded one.",
+        "Your principal's registered Shifts, each with an online/offline flag (derived at read time from its last ping, ~3 min), how long since it was last seen, the crews it serves (returned as `crews`; an empty list means every crew this principal belongs to, not none), and the reporting process incarnation (`shiftId`/`startedAt`) when the hub recorded one.",
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-      handler: passthrough(deps, () => ({ method: 'GET', path: '/api/conductors' })),
+      handler: passthrough(deps, () => ({ method: 'GET', path: '/api/shifts' })),
     },
     {
       name: 'wake',
@@ -517,8 +517,8 @@ const AGENT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
  * token straight to the local store; NEVER returns the token. Decision 6: the
  * mint response leaks the plaintext in `data.token` AND the human `text` field,
  * so this handler never passes the raw body outbound — it takes only the
- * validated `token` (to store) and the safe `pools` names (to report), and
- * builds `{name, pools, stored:true}` from scratch.
+ * validated `token` (to store) and the safe `crews` names (to report), and
+ * builds `{name, crews, stored:true}` from scratch.
  */
 function createAgentTool(deps: McpDeps): ToolRegistration {
   return {
@@ -529,7 +529,7 @@ function createAgentTool(deps: McpDeps): ToolRegistration {
       type: 'object',
       properties: {
         name: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' },
-        pools: { type: 'array', items: { type: 'string' } },
+        crews: { type: 'array', items: { type: 'string' } },
         scopes: { type: 'array', items: { type: 'string' } },
       },
       required: ['name'],
@@ -545,7 +545,7 @@ function createAgentTool(deps: McpDeps): ToolRegistration {
       // `scopes` is optional. When present it must be a non-empty array of
       // non-empty strings — validated BEFORE any network call (the schema is
       // advisory). Absent → the `work`-only default. No scope-NAME check: the
-      // hub is the enforcement of record (same stance as pools).
+      // hub is the enforcement of record (same stance as crews).
       const scopesArg = args['scopes'];
       let scopes: string[] | undefined;
       if (scopesArg !== undefined) {
@@ -554,9 +554,9 @@ function createAgentTool(deps: McpDeps): ToolRegistration {
         }
         scopes = scopesArg as string[];
       }
-      const pools = args['pools'];
+      const crews = args['crews'];
       const body: Record<string, unknown> = { name, scopes: scopes ?? ['work'] };
-      if (Array.isArray(pools)) body.pools = pools;
+      if (Array.isArray(crews)) body.crews = crews;
 
       const r = await callHub(deps, { method: 'POST', path: '/api/mint_agent_token', body });
       if (r.authFailed) return errorText(r.authMessage ?? loginHint(deps.origin));
@@ -579,10 +579,10 @@ function createAgentTool(deps: McpDeps): ToolRegistration {
           `${(e as Error).message} — the minted token was NOT stored — revoke/re-key the Scoped Identity '${name}' from the console`,
         );
       }
-      // Success: built from scratch. `pools` (poolNames) is safe; token/text/id
-      // /agentId/poolIds from the body must never reach an outbound frame.
-      const outPools = isObject(r.json) && Array.isArray(r.json['pools']) ? r.json['pools'] : [];
-      return textResult({ name, pools: outPools, stored: true });
+      // Success: built from scratch. `crews` (crewNames) is safe; token/text/id
+      // /agentId/crewIds from the body must never reach an outbound frame.
+      const outCrews = isObject(r.json) && Array.isArray(r.json['crews']) ? r.json['crews'] : [];
+      return textResult({ name, crews: outCrews, stored: true });
     },
   };
 }
@@ -597,7 +597,7 @@ function stageEnrollmentTool(deps: McpDeps): ToolRegistration {
       type: 'object',
       properties: {
         name: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' },
-        pools: { type: 'array', items: { type: 'string' } },
+        crews: { type: 'array', items: { type: 'string' } },
       },
       required: ['name'],
       additionalProperties: false,
@@ -607,60 +607,60 @@ function stageEnrollmentTool(deps: McpDeps): ToolRegistration {
 }
 
 /**
- * Pool management — the MCP counterpart to the `owenloop pool` CLI family
- * (`src/cli.ts`'s `dispatchPool`, merged as PR #88). All FOUR tools below are
- * plain `passthrough` registrations: the hub's pool response bodies carry no
+ * Crew management — the MCP counterpart to the `owenloop crew` CLI family
+ * (`src/cli.ts`'s `dispatchCrew`, merged as PR #88). All FOUR tools below are
+ * plain `passthrough` registrations: the hub's crew response bodies carry no
  * secret (unlike `create_agent`'s mint body), so there is no reason to
  * hand-build a result, and the hub's `/api/*` routes plus the verbs underneath
  * them are already the enforcement of record for every field — a client-side
  * copy of that validation would just be a second place for the rules to drift.
  *
  * CREDENTIAL PLANE: unchanged, and worth restating because it is what makes
- * pool mutation reachable at all from this server. `callHub` always
+ * crew mutation reachable at all from this server. `callHub` always
  * authenticates as the `human` slot (`HUMAN`, above) — `owenloop mcp` never
- * calls the hub as a Scoped Identity. On the hub, `createPool`, `addPoolMember`,
- * and `removePoolMember` gate through `assertPoolMutationAllowed`
- * (`packages/hub-core/src/verbs/manage-pools.ts`), which falls through to
- * `assertAllowed(actor, 'manage_pools')` — a verb with NO entry in
+ * calls the hub as a Scoped Identity. On the hub, `createCrew`, `addCrewMember`,
+ * and `removeCrewMember` gate through `assertCrewMutationAllowed`
+ * (`packages/hub-core/src/verbs/manage-crews.ts`), which falls through to
+ * `assertAllowed(actor, 'manage_crews')` — a verb with NO entry in
  * `AGENT_SCOPE_FOR_VERB` (`rbac.ts`), so an agent-kind actor is refused
  * `ForbiddenError` there no matter what scopes it holds. Because this server
- * always authenticates as a human, that refusal never applies to it. `listPools`
+ * always authenticates as a human, that refusal never applies to it. `listCrews`
  * is gated on the separate, agent-reachable `list` verb instead.
  *
- * `delete_pool` IS DELIBERATELY ABSENT, and stays absent — a decision by the
- * repo's human owner, not a technical gap. Deleting a pool transfers its live
- * `order_pools` stamps onto the org's orphan pool and deletes the pool's own
+ * `delete_crew` IS DELIBERATELY ABSENT, and stays absent — a decision by the
+ * repo's human owner, not a technical gap. Deleting a crew transfers its live
+ * `order_crews` stamps onto the org's orphan crew and deletes the crew's own
  * membership rows outright; that is not an operation a model-driven host
- * should be able to trigger. Do not add a `delete_pool` tool, an env-flag
- * variant, or a confirmation-style variant — `owenloop pool rm` on the CLI
- * remains the only way to delete a pool. Removing a single MEMBER (below) is a
+ * should be able to trigger. Do not add a `delete_crew` tool, an env-flag
+ * variant, or a confirmation-style variant — `owenloop crew rm` on the CLI
+ * remains the only way to delete a crew. Removing a single MEMBER (below) is a
  * different, reversible operation and stays in scope.
  */
-function buildPoolTools(deps: McpDeps): ToolRegistration[] {
+function buildCrewTools(deps: McpDeps): ToolRegistration[] {
   return [
     {
-      name: 'list_pools',
+      name: 'list_crews',
       description:
-        "The org's pools, each with its membership rows inline (principalKind/principalId/addedBy/addedAt) — " +
-        'one call, no per-pool fan-out. An org with no pools at all is a normal empty result, not an error. ' +
-        "The org's reserved ORPHAN pool (kind: \"orphan\", or a name starting \"orphan:\") IS returned when it " +
-        'exists and is deliberately NOT filtered out — it is where the hub re-homes work whose pool was ' +
+        "The org's crews, each with its membership rows inline (principalKind/principalId/addedBy/addedAt) — " +
+        'one call, no per-crew fan-out. An org with no crews at all is a normal empty result, not an error. ' +
+        "The org's reserved ORPHAN crew (kind: \"orphan\", or a name starting \"orphan:\") IS returned when it " +
+        'exists and is deliberately NOT filtered out — it is where the hub re-homes work whose crew was ' +
         'deleted, so a caller has to be able to see where that work went. It is materialized LAZILY: a fresh ' +
         "org has none. Its membership is derived (always the org's current admins) and cannot be edited — " +
-        'add_pool_member/remove_pool_member both refuse it.',
+        'add_crew_member/remove_crew_member both refuse it.',
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-      handler: passthrough(deps, () => ({ method: 'GET', path: '/api/pools' })),
+      handler: passthrough(deps, () => ({ method: 'GET', path: '/api/crews' })),
     },
     {
-      name: 'create_pool',
+      name: 'create_crew',
       description:
-        "Create a pool on the hub org. `kind` is 'personal' or 'shared', forwarded verbatim — the hub is the " +
-        "enforcement of record for legal values ('orphan' is reserved for the hub's own pool and is refused). " +
-        "`ownerMemberId` is required for a 'personal' pool and is simply omitted from the request when not " +
-        'passed. NOT admin-only: an org admin may create any pool, AND a non-admin may create a personal pool ' +
+        "Create a crew on the hub org. `kind` is 'personal' or 'shared', forwarded verbatim — the hub is the " +
+        "enforcement of record for legal values ('orphan' is reserved for the hub's own crew and is refused). " +
+        "`ownerMemberId` is required for a 'personal' crew and is simply omitted from the request when not " +
+        'passed. NOT admin-only: an org admin may create any crew, AND a non-admin may create a personal crew ' +
         'they own by passing kind:"personal" with ownerMemberId set to their own member id (the ' +
-        'self-service branch of the mutation gate). A non-admin asking for a shared pool, for a personal pool ' +
-        'owned by someone else, or for a personal pool with ownerMemberId OMITTED, is refused 403 — the hub ' +
+        'self-service branch of the mutation gate). A non-admin asking for a shared crew, for a personal crew ' +
+        'owned by someone else, or for a personal crew with ownerMemberId OMITTED, is refused 403 — the hub ' +
         'deliberately does not infer the caller as the owner.',
       inputSchema: {
         type: 'object',
@@ -672,53 +672,53 @@ function buildPoolTools(deps: McpDeps): ToolRegistration[] {
         required: ['name', 'kind'],
         additionalProperties: false,
       },
-      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/create_pool', body: a })),
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/create_crew', body: a })),
     },
     {
-      name: 'add_pool_member',
+      name: 'add_crew_member',
       description:
-        "Add one principal to a pool. `principalKind` is 'member' (a human) or 'agent' (a Scoped Identity), " +
-        'forwarded verbatim; the hub validates it. NOT admin-only: an org admin may act on any pool, AND the ' +
-        'OWNER of a personal pool may add members to that pool without being an admin. HTTP 400 (not a ' +
-        'permissions error, and NOT tolerant): an unknown poolId, an unknown principalId, or a principal that ' +
-        'is ALREADY a member — a duplicate add IS an error, unlike remove_pool_member below. REFUSED OUTRIGHT ' +
-        "against the org's orphan pool, for every caller including an admin, as a 400 (never a 403 — the " +
-        "refusal is identity-independent: it objects to the target pool, not the caller's role). The orphan " +
-        "pool's membership is the derived org admin roster and cannot be edited this way.",
+        "Add one principal to a crew. `principalKind` is 'member' (a human) or 'agent' (a Scoped Identity), " +
+        'forwarded verbatim; the hub validates it. NOT admin-only: an org admin may act on any crew, AND the ' +
+        'OWNER of a personal crew may add members to that crew without being an admin. HTTP 400 (not a ' +
+        'permissions error, and NOT tolerant): an unknown crewId, an unknown principalId, or a principal that ' +
+        'is ALREADY a member — a duplicate add IS an error, unlike remove_crew_member below. REFUSED OUTRIGHT ' +
+        "against the org's orphan crew, for every caller including an admin, as a 400 (never a 403 — the " +
+        "refusal is identity-independent: it objects to the target crew, not the caller's role). The orphan " +
+        "crew's membership is the derived org admin roster and cannot be edited this way.",
       inputSchema: {
         type: 'object',
         properties: {
-          poolId: { type: 'string' },
+          crewId: { type: 'string' },
           principalKind: { type: 'string' },
           principalId: { type: 'string' },
         },
-        required: ['poolId', 'principalKind', 'principalId'],
+        required: ['crewId', 'principalKind', 'principalId'],
         additionalProperties: false,
       },
-      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/add_pool_member', body: a })),
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/add_crew_member', body: a })),
     },
     {
-      name: 'remove_pool_member',
+      name: 'remove_crew_member',
       description:
-        'Remove one principal from a pool. TOLERANT: removing a principal that was never a member is a normal ' +
+        'Remove one principal from a crew. TOLERANT: removing a principal that was never a member is a normal ' +
         'success — HTTP 200 with removed:false, NOT a 404. Read the `removed` boolean rather than treating a ' +
-        'false as a failure. An unknown poolId is DIFFERENT and is an HTTP 400 error. NOT admin-only: same ' +
-        'self-service carve-out as add_pool_member — an org admin, or the owner of the personal pool being ' +
-        "acted on. REFUSED OUTRIGHT against the org's orphan pool, for every caller including an admin, as a " +
+        'false as a failure. An unknown crewId is DIFFERENT and is an HTTP 400 error. NOT admin-only: same ' +
+        'self-service carve-out as add_crew_member — an org admin, or the owner of the personal crew being ' +
+        "acted on. REFUSED OUTRIGHT against the org's orphan crew, for every caller including an admin, as a " +
         '400 — and that orphan refusal is NOT tolerant: it throws even when the principal was never a member, ' +
-        'because the objection is to the target pool and is decided before the hub looks at the membership ' +
-        'row. Removing a member is reversible. DELETING a pool is deliberately NOT available on this server at ' +
-        'all — use the `owenloop pool rm` CLI command for that.',
+        'because the objection is to the target crew and is decided before the hub looks at the membership ' +
+        'row. Removing a member is reversible. DELETING a crew is deliberately NOT available on this server at ' +
+        'all — use the `owenloop crew rm` CLI command for that.',
       inputSchema: {
         type: 'object',
         properties: {
-          poolId: { type: 'string' },
+          crewId: { type: 'string' },
           principalId: { type: 'string' },
         },
-        required: ['poolId', 'principalId'],
+        required: ['crewId', 'principalId'],
         additionalProperties: false,
       },
-      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/remove_pool_member', body: a })),
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/remove_crew_member', body: a })),
     },
   ];
 }
@@ -775,7 +775,7 @@ export async function runMcpCommand(io: McpIo, opts: { hubFlag?: string }): Prom
   }
   const deps: McpDeps = { io, origin: resolved.origin };
 
-  const tools = [...buildBaselineTools(deps), createAgentTool(deps), ...buildPoolTools(deps)];
+  const tools = [...buildBaselineTools(deps), createAgentTool(deps), ...buildCrewTools(deps)];
   if (await shouldRegisterEnrollment(deps)) tools.push(stageEnrollmentTool(deps));
 
   const server = createMcpServer({

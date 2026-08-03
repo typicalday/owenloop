@@ -577,7 +577,7 @@ export type GraphNodeState =
 export interface GraphNode {
   id: string;              // stable identifier: step name or input name
   kind: 'step' | 'input';
-  capability: string;           // display capability (same as id for now)
+  label: string;              // display label (same as id for now)
   terminal?: boolean;      // steps only: declared terminal
   parallel?: number;       // steps only: parallelism setting
   model?: string;          // steps only: model hint
@@ -593,9 +593,9 @@ export interface GraphEdge {
   to: string;              // step node id
   stem: string;            // the artifact stem crossing this edge
   mode: 'plain' | 'map' | 'reduce'; // consume mode at the to-node
-  /** For map: the binder name (e.g. "i") — used for capability generation */
+  /** For map: the binder name (e.g. "i") — used for label generation */
   binder?: string;
-  /** For reduce: the suffix, if any (e.g. ".child") — used for capability generation */
+  /** For reduce: the suffix, if any (e.g. ".child") — used for label generation */
   suffix?: string;
 }
 
