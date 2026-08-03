@@ -167,11 +167,11 @@ export interface Order {
   /** Declares which kind of executor this order is for. Absent = 'agent'
    *  (today's behavior). Opaque to the engine; carried through verbatim from
    *  the step definition, same pass-through contract as `model`/`x`. */
-  worker?: string;
-  /** The command string for a `worker: command` order. Opaque to the engine
+  executor?: string;
+  /** The command string for a `executor: command` order. Opaque to the engine
    *  — never parsed, never shelled out. */
   command?: string;
-  /** Opaque config object for a non-agent/non-command worker type (or
+  /** Opaque config object for a non-agent/non-command executor type (or
    *  alongside `command`). Carried through untouched, contents never read. */
   spec?: Record<string, unknown>;
   /** §27.3: the step's opaque `x:` extension map, carried through untouched
@@ -296,13 +296,13 @@ export interface ProducePattern {
     cadence?: string;
     maxRunsPerDay?: number;
     /** Declares which kind of executor this judge's synthesized order is for.
-     *  Same opaque-passthrough contract as StepDef.worker — default 'agent'
+     *  Same opaque-passthrough contract as StepDef.executor — default 'agent'
      *  when omitted. */
-    worker?: string;
-    /** Required when worker is 'command'; the command string for that worker
+    executor?: string;
+    /** Required when executor is 'command'; the command string for that executor
      *  to run. Opaque to the engine — never parsed, never shelled out. */
     command?: string;
-    /** Optional opaque config object for a non-agent/non-command worker type
+    /** Optional opaque config object for a non-agent/non-command executor type
      *  (or additionally alongside `command`). Shape-checked as a plain map
      *  only (mirrors `x:`'s asExtension contract) — contents never read. */
     spec?: Record<string, unknown>;
@@ -368,11 +368,11 @@ export interface StepDef {
    *  unchanged). Opaque to the engine beyond the shape rules validateDef
    *  enforces; carried through verbatim on the Order, same contract as
    *  `model`. */
-  worker?: string;
-  /** Required when worker is 'command'; the command string for that worker
+  executor?: string;
+  /** Required when executor is 'command'; the command string for that executor
    *  to run. Opaque to the engine — never parsed, never shelled out. */
   command?: string;
-  /** Optional opaque config object for a non-agent/non-command worker type
+  /** Optional opaque config object for a non-agent/non-command executor type
    *  (or additionally alongside `command`). Shape-checked as a plain map
    *  only (mirrors `x:`'s asExtension contract) — contents never read. */
   spec?: Record<string, unknown>;
@@ -390,18 +390,18 @@ export interface StepDef {
   idleAfterMs?: number;
   /** Per-step reap TTL override in milliseconds. Falls back to the engine's DEFAULT_REAP_TTL_MS. */
   reapTtlMs?: number;
-  /** A2: opaque routing labels for peer-orchestrator claim filtering. A tick
-   *  caller passing a label filter only claims steps whose labels intersect it;
+  /** A2: opaque routing capabilities for peer-orchestrator claim filtering. A tick
+   *  caller passing a capability filter only claims steps whose capabilities intersect it;
    *  absent (or empty, normalized to absent at parse) = claimable by any caller.
-   *  Distinct from `worker`/`workers` (executor-kind), which this never touches. */
-  labels?: string[];
+   *  Distinct from `executor`/`executors` (executor-kind), which this never touches. */
+  capabilities?: string[];
   /** A3 (REL-8): per-step OPT-IN max total lease lifetime override in
    *  milliseconds — the cap on `claimedAt + maxLease` past which renewals can no
    *  longer keep a lease fresh. Overrides the engine `maxLeaseMs`; when both are
    *  unset there is NO cap and heartbeats extend the lease indefinitely. */
   maxLeaseMs?: number;
   body: string; // prompt body
-  /** Mode 2 foundation: name of the child workflow this step delegates to. Machine-handled, never a worker firing. */
+  /** Mode 2 foundation: name of the child workflow this step delegates to. Machine-handled, never a executor firing. */
   calls?: string;
   /** Mode 2 foundation: child input name → parent artifact name wiring for a calls: step. */
   callsInputs?: Record<string, string>;
@@ -443,10 +443,10 @@ export interface WorkflowDef {
   /** §27.3: opaque workflow-level extension map (`x:`). Validated as a plain
    *  map at load time, never interpreted by the engine. */
   x?: Record<string, unknown>;
-  /** Optional allow-list of worker values; when present, validateDef errors
-   *  on any step/judge whose `worker` is not in this list (typo guard).
-   *  Absent = any worker string accepted. */
-  workers?: string[];
+  /** Optional allow-list of executor values; when present, validateDef errors
+   *  on any step/judge whose `executor` is not in this list (typo guard).
+   *  Absent = any executor string accepted. */
+  executors?: string[];
   /**
    * @internal Mode 1 include directives before expansion. Set by `buildDef` when a
    * step-list entry has an `include:` key. Consumed and removed by `expandIncludes`.
@@ -458,7 +458,7 @@ export interface WorkflowDef {
 export interface InputDef {
   name: string;
   /** who provides it: a human (pulled) or it is provided at start */
-  producer: string; // "human" by convention, or any external label
+  producer: string; // "human" by convention, or any external capability
   /** if true, instance start leaves it owed; otherwise it must be provided at start */
   seedOwed: boolean;
   /** optional JSON Schema a provided input value must satisfy (§19) */
@@ -577,7 +577,7 @@ export type GraphNodeState =
 export interface GraphNode {
   id: string;              // stable identifier: step name or input name
   kind: 'step' | 'input';
-  label: string;           // display label (same as id for now)
+  capability: string;           // display capability (same as id for now)
   terminal?: boolean;      // steps only: declared terminal
   parallel?: number;       // steps only: parallelism setting
   model?: string;          // steps only: model hint
@@ -593,9 +593,9 @@ export interface GraphEdge {
   to: string;              // step node id
   stem: string;            // the artifact stem crossing this edge
   mode: 'plain' | 'map' | 'reduce'; // consume mode at the to-node
-  /** For map: the binder name (e.g. "i") — used for label generation */
+  /** For map: the binder name (e.g. "i") — used for capability generation */
   binder?: string;
-  /** For reduce: the suffix, if any (e.g. ".child") — used for label generation */
+  /** For reduce: the suffix, if any (e.g. ".child") — used for capability generation */
   suffix?: string;
 }
 

@@ -4,7 +4,7 @@
  * These intentionally mirror owenloop's def grammar (`~/code/owenloop/main`
  * `src/defs.ts` RAW_STEP_KEYS) rather than invent anything: a step carries
  * `name/consumes/produces/terminal` today plus the four fields C2 needs to
- * build a step spec — `body`, `model`, `worker`, and the opaque `x` extension
+ * build a step spec — `body`, `model`, `executor`, and the opaque `x` extension
  * bag. Contents of `x` are otherwise NOT validated here (owenloop treats `x` as
  * a plain map with opaque contents).
  *
@@ -18,7 +18,7 @@
  *
  * HUB GAP (see D1 / bundle/fetch.ts): today `GET /api/workflows/:name`
  * (`packages/hub-core/src/verbs/get-workflow.ts`) returns steps with only
- * `name/consumes/produces/terminal` — no `body/model/worker/x`. C2's client
+ * `name/consumes/produces/terminal` — no `body/model/executor/x`. C2's client
  * contract is the natural enrichment of that same route; extending the hub's
  * steps mapping with those passthrough fields is a small owenloop-service
  * follow-up (out of scope here). Typed LOOSELY on purpose — honest-loose over
@@ -57,7 +57,7 @@ export interface FetchedStep {
   /** First-class model field; wins over a harness-option `model` (D6). */
   model?: string;
   /** `'command'` steps are exec/engine concerns, never given a spec (D6). */
-  worker?: string;
+  executor?: string;
   /**
    * Which harness the `agent-run` runner should host this step agent in.
    * LIFTED by `validateFetchedDef` from `x.harness.id`, or from a top-level

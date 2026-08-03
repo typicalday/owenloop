@@ -35,7 +35,7 @@ export interface FetchDefOptions {
 
 /** A step is an agent step (spec candidate) when it is not a command/calls step. */
 function isAgentStep(s: FetchedStep): boolean {
-  return s.worker !== 'command' && s.calls === undefined;
+  return s.executor !== 'command' && s.calls === undefined;
 }
 
 /**
@@ -198,7 +198,7 @@ function validateDefEnvelope(data: unknown, label: string): FetchedDef {
       terminal: typeof s['terminal'] === 'boolean' ? (s['terminal'] as boolean) : undefined,
       body: typeof s['body'] === 'string' ? (s['body'] as string) : undefined,
       model: typeof s['model'] === 'string' ? (s['model'] as string) : undefined,
-      worker: typeof s['worker'] === 'string' ? (s['worker'] as string) : undefined,
+      executor: typeof s['executor'] === 'string' ? (s['executor'] as string) : undefined,
       ...carrier,
       x: s['x'] as Record<string, unknown> | undefined,
       calls: typeof s['calls'] === 'string' ? (s['calls'] as string) : undefined,
@@ -214,7 +214,7 @@ function validateDefEnvelope(data: unknown, label: string): FetchedDef {
     throw new Error(
       `hub does not serve step bodies yet — get_workflow predates C2 bundle fields ` +
         `(agent step(s) with no body: ${names}). The hub's get-workflow.ts steps ` +
-        `mapping needs the body/model/worker/x passthrough fields before prepare can compile '${label}'.`,
+        `mapping needs the body/model/executor/x passthrough fields before prepare can compile '${label}'.`,
     );
   }
 

@@ -99,11 +99,11 @@ export class SchemaRefusalError extends Error {
  * step's daily run allowance is exhausted (binding over parallel); `'parallel-cap'`
  * — the step's concurrency cap is the binding constraint. Always emitted by
  * `applySchedule` or `tick`; never alters which firings are selected or claimed.
- * `'label-mismatch'` (A2) — the tick caller passed a label filter that does not
- * intersect the step's declared labels, so a peer orchestrator serving other
- * labels leaves it for the matching caller.
+ * `'capability-mismatch'` (A2) — the tick caller passed a capability filter that does not
+ * intersect the step's declared capabilities, so a peer orchestrator serving other
+ * capabilities leaves it for the matching caller.
  */
-export type DeferredReason = 'in-flight' | 'cadence' | 'daily-budget' | 'parallel-cap' | 'label-mismatch';
+export type DeferredReason = 'in-flight' | 'cadence' | 'daily-budget' | 'parallel-cap' | 'capability-mismatch';
 
 export interface DeferredFiring {
   step: string;
@@ -1086,8 +1086,8 @@ export class Engine {
    * Pass `{ deep: false }` (CLI `--shallow`) to restore the pre-deep behavior:
    * only this instance's own orders. See `TickResult` for the fold semantics.
    */
-  tick(workflow: string, opts: { now?: number; deep?: boolean; labels?: string[] } = {}): TickResult {
-    return this.tickInternal(workflow, opts.now ?? nowMs(), opts.deep ?? true, opts.labels ?? [], new Set(), 0);
+  tick(workflow: string, opts: { now?: number; deep?: boolean; capabilities?: string[] } = {}): TickResult {
+    return this.tickInternal(workflow, opts.now ?? nowMs(), opts.deep ?? true, opts.capabilities ?? [], new Set(), 0);
   }
 
   /**
@@ -1133,7 +1133,7 @@ export class Engine {
     workflow: string,
     now: number,
     deep: boolean,
-    labels: string[],
+    capabilities: string[],
     visited: Set<string>,
     depth: number,
     parentEdge?: { parentWf: string; step: StepDef; callsStem: string },
@@ -1187,7 +1187,7 @@ export class Engine {
       const timeFacts = this.computeTimeFacts(def, workflow, arts, now);
 
       const firings = eligibleFirings(def, arts, timeFacts);
-      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, labels);
+      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, capabilities);
 
       // Clear alarm_at for any idle firing that was selected (consume the alarm).
       for (const f of selected) {
@@ -1223,7 +1223,7 @@ export class Engine {
     // subtree — do not tick grandchildren off a frame that issued nothing.
     if (deep && !staleEdge) {
       for (const { step, child } of this.callsDescendTargets(workflow, def)) {
-        const cr = this.tickInternal(child.id, now, deep, labels, visited, depth + 1, {
+        const cr = this.tickInternal(child.id, now, deep, capabilities, visited, depth + 1, {
           parentWf: workflow,
           step,
           callsStem: step.produces[0]!.stem,
@@ -1296,9 +1296,9 @@ export class Engine {
 
   /**
    * Per-step cadence + daily budget + parallel cap over the eligible firings.
-   * A2: `labels` is the tick caller's optional claim filter — when non-empty, a
-   * step whose own `labels` are also non-empty is only schedulable when the two
-   * intersect; a disjoint step's firings are deferred as `'label-mismatch'`.
+   * A2: `capabilities` is the tick caller's optional claim filter — when non-empty, a
+   * step whose own `capabilities` are also non-empty is only schedulable when the two
+   * intersect; a disjoint step's firings are deferred as `'capability-mismatch'`.
    * Filtering here (before cadence/budget) means a mismatched firing never
    * consumes the caller's slots and never perturbs cadence math.
    */
@@ -1307,7 +1307,7 @@ export class Engine {
     def: WorkflowDef,
     firings: Firing[],
     now: number,
-    labels: string[],
+    capabilities: string[],
   ): { selected: Firing[]; deferred: DeferredFiring[] } {
     const midnight = localMidnightMs(now);
     const selected: Firing[] = [];
@@ -1323,12 +1323,12 @@ export class Engine {
       const stepFirings = firings.filter((f) => f.step === step.name);
       if (stepFirings.length === 0) continue;
 
-      // A2: caller label filter vs. step labels. Both non-empty and disjoint →
+      // A2: caller capability filter vs. step capabilities. Both non-empty and disjoint →
       // this caller must not claim the step; defer every firing and skip it
       // before it touches cadence/budget/slot math.
-      if (labels.length > 0 && step.labels && step.labels.length > 0 &&
-          !step.labels.some((l) => labels.includes(l))) {
-        for (const f of stepFirings) defer(f, 'label-mismatch');
+      if (capabilities.length > 0 && step.capabilities && step.capabilities.length > 0 &&
+          !step.capabilities.some((l) => capabilities.includes(l))) {
+        for (const f of stepFirings) defer(f, 'capability-mismatch');
         continue;
       }
 
@@ -1514,7 +1514,7 @@ export class Engine {
     if (f.index !== undefined) order.index = f.index;
     if (step.workdir !== undefined) order.workdir = step.workdir;
     if (step.model !== undefined) order.model = step.model;
-    if (step.worker !== undefined) order.worker = step.worker;
+    if (step.executor !== undefined) order.executor = step.executor;
     if (step.command !== undefined) order.command = step.command;
     if (step.spec !== undefined) order.spec = step.spec;
     if (step.x !== undefined) order.x = step.x;

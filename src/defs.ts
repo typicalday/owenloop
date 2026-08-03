@@ -76,11 +76,11 @@ interface RawJudge {
   inputs?: unknown;
   cadence?: unknown;
   maxRunsPerDay?: unknown;
-  worker?: unknown;
+  executor?: unknown;
   command?: unknown;
   spec?: unknown;
 }
-const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay', 'worker', 'command', 'spec'] as const;
+const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay', 'executor', 'command', 'spec'] as const;
 
 interface RawStep {
   name?: unknown;
@@ -104,18 +104,18 @@ interface RawStep {
   /** M2-GRAMMAR: if present, this entry is a calls: step (Mode 2 runtime composition). */
   calls?: unknown;
   reapTtl?: unknown;
-  /** A2: opaque routing labels for peer-orchestrator claim filtering. */
-  labels?: unknown;
+  /** A2: opaque routing capabilities for peer-orchestrator claim filtering. */
+  capabilities?: unknown;
   /** A3: per-step max total lease lifetime (duration string). */
   maxLease?: unknown;
   /** §27.3: opaque extension map — validated as a map, never interpreted. */
   x?: unknown;
   /** Declares which kind of executor this step's order is for. Opaque
    *  passthrough, mirrors `model`. */
-  worker?: unknown;
-  /** Required when worker is 'command'; opaque command string. */
+  executor?: unknown;
+  /** Required when executor is 'command'; opaque command string. */
   command?: unknown;
-  /** Optional opaque config object for a non-agent/non-command worker type. */
+  /** Optional opaque config object for a non-agent/non-command executor type. */
   spec?: unknown;
 }
 /** Keys valid on a normal (non-calls:, non-include:) step entry. */
@@ -123,7 +123,7 @@ const RAW_STEP_KEYS = [
   'name', 'consumes', 'produces', 'generates', 'invalidates', 'cadence',
   'maxRunsPerDay', 'parallel', 'maxAttempts', 'maxSchemaFailures', 'model',
   'workdir', 'terminal', 'effect', 'on', 'idleAfter', 'body', 'bodyFile',
-  'calls', 'reapTtl', 'labels', 'maxLease', 'x', 'worker', 'command', 'spec',
+  'calls', 'reapTtl', 'capabilities', 'maxLease', 'x', 'executor', 'command', 'spec',
 ] as const;
 
 /** Duck-typed sniffer for a raw calls: directive (Mode 2). */
@@ -158,10 +158,10 @@ interface RawDef {
   engine?: unknown;
   /** §27.3: opaque extension map — validated as a map, never interpreted. */
   x?: unknown;
-  /** Optional def-level allow-list of worker values (typo guard for step/judge `worker:`). */
-  workers?: unknown;
+  /** Optional def-level allow-list of executor values (typo guard for step/judge `executor:`). */
+  executors?: unknown;
 }
-const RAW_DEF_KEYS = ['name', 'title', 'description', 'inputs', 'steps', 'outputs', 'invariants', 'engine', 'x', 'workers'] as const;
+const RAW_DEF_KEYS = ['name', 'title', 'description', 'inputs', 'steps', 'outputs', 'invariants', 'engine', 'x', 'executors'] as const;
 
 // ---- defaults ----------------------------------------------------------------
 
@@ -379,7 +379,7 @@ function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<Pro
     if (raw.maxRunsPerDay !== undefined) {
       judge.maxRunsPerDay = asNumber(raw.maxRunsPerDay, DEFAULTS.maxRunsPerDay, `judge '${name}'.maxRunsPerDay`);
     }
-    if (raw.worker !== undefined) judge.worker = asString(raw.worker, `judge '${name}'.worker`);
+    if (raw.executor !== undefined) judge.executor = asString(raw.executor, `judge '${name}'.executor`);
     if (raw.command !== undefined) judge.command = asString(raw.command, `judge '${name}'.command`);
     if (raw.spec !== undefined) judge.spec = asExtension(raw.spec, `judge '${name}'.spec`);
     return judge;
@@ -692,7 +692,7 @@ export function buildDef(raw: unknown, source?: string, baseDir?: string): Workf
     if (outs.length > 0) def.outputs = outs;
   }
   if (r.x !== undefined) def.x = asExtension(r.x, `workflow '${name}'.x`);
-  if (r.workers !== undefined) def.workers = asStringArray(r.workers, `workflow '${name}'.workers`);
+  if (r.executors !== undefined) def.executors = asStringArray(r.executors, `workflow '${name}'.executors`);
   return def;
 }
 
@@ -926,7 +926,7 @@ function synthesizeJudgeSteps(
       body: j.body,
     };
     if (j.model !== undefined) step.model = j.model;
-    if (j.worker !== undefined) step.worker = j.worker;
+    if (j.executor !== undefined) step.executor = j.executor;
     if (j.command !== undefined) step.command = j.command;
     if (j.spec !== undefined) step.spec = j.spec;
     return step;
@@ -972,7 +972,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
       cadenceSecs: 0,
       maxRunsPerDay: DEFAULTS.maxRunsPerDay,
       parallel: 1,
-      maxAttempts: 1,        // never worker-fired; 1 is a safe non-zero sentinel
+      maxAttempts: 1,        // never executor-fired; 1 is a safe non-zero sentinel
       maxSchemaFailures: DEFAULTS.maxSchemaFailures,
       body: '',              // machine-handled: no prompt body
     };
@@ -1022,7 +1022,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
   };
   if (rl.workdir !== undefined) step.workdir = asString(rl.workdir, `step '${name}'.workdir`);
   if (rl.model !== undefined) step.model = asString(rl.model, `step '${name}'.model`);
-  if (rl.worker !== undefined) step.worker = asString(rl.worker, `step '${name}'.worker`);
+  if (rl.executor !== undefined) step.executor = asString(rl.executor, `step '${name}'.executor`);
   if (rl.command !== undefined) step.command = asString(rl.command, `step '${name}'.command`);
   if (rl.spec !== undefined) step.spec = asExtension(rl.spec, `step '${name}'.spec`);
   if (rl.x !== undefined) step.x = asExtension(rl.x, `step '${name}'.x`);
@@ -1067,11 +1067,11 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
     const reapTtlStr = asString(rl.reapTtl, `step '${name}'.reapTtl`);
     step.reapTtlMs = parseDurationMs(reapTtlStr);
   }
-  // A2: opaque routing labels. Empty list normalizes to absent (claimable by
+  // A2: opaque routing capabilities. Empty list normalizes to absent (claimable by
   // any caller), mirroring the groups.length > 0 pattern below.
-  if (rl.labels !== undefined) {
-    const ls = asStringArray(rl.labels, `step '${name}'.labels`);
-    if (ls.length > 0) step.labels = ls;
+  if (rl.capabilities !== undefined) {
+    const ls = asStringArray(rl.capabilities, `step '${name}'.capabilities`);
+    if (ls.length > 0) step.capabilities = ls;
   }
   // A3: per-step max total lease lifetime (duration string, same as reapTtl).
   if (rl.maxLease !== undefined) {
@@ -1243,40 +1243,40 @@ export function validateDef(def: WorkflowDef): string[] {
     }
   }
 
-  // W1-VALIDATE: worker:/command: shape rules (declarative executor dispatch).
-  // Only two hard requirements; any other worker value is fully opaque.
+  // W1-VALIDATE: executor:/command: shape rules (declarative executor dispatch).
+  // Only two hard requirements; any other executor value is fully opaque.
   for (const l of def.steps) {
-    const worker = l.worker ?? 'agent';
-    // Deliberately `l.worker === 'agent'` (explicit opt-in), NOT
-    // `(l.worker ?? 'agent') === 'agent'` — that stricter form would also
+    const executor = l.executor ?? 'agent';
+    // Deliberately `l.executor === 'agent'` (explicit opt-in), NOT
+    // `(l.executor ?? 'agent') === 'agent'` — that stricter form would also
     // catch every default-agent step that already gets away with an empty
     // body today (e.g. calls:-adjacent or generator-only fixtures), breaking
-    // existing defs that never write `worker:` at all. Scoping the check to
-    // an EXPLICIT `worker: agent` keeps every pre-existing def byte-for-byte
-    // unaffected while still catching "someone opted into the agent worker
+    // existing defs that never write `executor:` at all. Scoping the check to
+    // an EXPLICIT `executor: agent` keeps every pre-existing def byte-for-byte
+    // unaffected while still catching "someone opted into the agent executor
     // type and forgot a body".
-    if (l.worker === 'agent' && l.body.trim() === '') {
-      errors.push(`step '${l.name}' has worker 'agent' but no body: (an agent step needs a prompt)`);
-    } else if (worker === 'command') {
+    if (l.executor === 'agent' && l.body.trim() === '') {
+      errors.push(`step '${l.name}' has executor 'agent' but no body: (an agent step needs a prompt)`);
+    } else if (executor === 'command') {
       if (l.command === undefined) {
-        errors.push(`step '${l.name}' has worker 'command' but no command:`);
+        errors.push(`step '${l.name}' has executor 'command' but no command:`);
       }
     }
-    // any other worker value: opaque, no body/command requirement
+    // any other executor value: opaque, no body/command requirement
   }
 
-  // W1-VALIDATE: workers: def-level allow-list typo guard. Applied AFTER the
-  // per-step `worker` default (?? 'agent') — a def declaring `workers:
+  // W1-VALIDATE: executors: def-level allow-list typo guard. Applied AFTER the
+  // per-step `executor` default (?? 'agent') — a def declaring `executors:
   // [command]` (deliberately excluding 'agent') still fails a step that omits
-  // `worker:` entirely, since its effective worker is 'agent'. This is
+  // `executor:` entirely, since its effective executor is 'agent'. This is
   // intended (the list is exhaustive once declared), documented in
   // docs/authoring.md.
-  if (def.workers && def.workers.length > 0) {
-    const allowed = new Set(def.workers);
+  if (def.executors && def.executors.length > 0) {
+    const allowed = new Set(def.executors);
     for (const l of def.steps) {
-      const worker = l.worker ?? 'agent';
-      if (!allowed.has(worker)) {
-        errors.push(`step '${l.name}' has worker '${worker}' but workflow '${def.name}'.workers does not list it`);
+      const executor = l.executor ?? 'agent';
+      if (!allowed.has(executor)) {
+        errors.push(`step '${l.name}' has executor '${executor}' but workflow '${def.name}'.executors does not list it`);
       }
     }
   }
