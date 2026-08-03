@@ -972,7 +972,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
       cadenceSecs: 0,
       maxRunsPerDay: DEFAULTS.maxRunsPerDay,
       parallel: 1,
-      maxAttempts: 1,        // never executor-fired; 1 is a safe non-zero sentinel
+      maxAttempts: 1,        // never worker-fired; 1 is a safe non-zero sentinel
       maxSchemaFailures: DEFAULTS.maxSchemaFailures,
       body: '',              // machine-handled: no prompt body
     };

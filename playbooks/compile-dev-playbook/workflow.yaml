@@ -1,0 +1,338 @@
+# compile-dev-playbook — the playbook compiler, developer-task edition.
+#
+# Compiles playbooks for repeatable DEVELOPMENT tasks — SDK integrations,
+# service setup, infra additions — from live vendor documentation. The
+# research sources (official docs, changelogs), the verification vocabulary
+# (test suites, exit codes, lint gates), and the judge criteria are all
+# dev-flavored on purpose; a different domain (business SOPs, compliance
+# processes) deserves its own variant with equally sharp domain judges, not
+# a genericized version of this one. The spine (scout -> distill invariants
+# vs ephemera -> compile -> gate -> test-drive -> human-gated publish) is
+# domain-invariant and is the part to extract via include: when a second
+# domain variant exists.
+#
+# Treats documentation as source code and a workflow def as the compiled
+# artifact: research a repeatable task across live docs, distill the knowledge
+# into invariants (what must always be true) vs ephemera (what changes with
+# versions), compile that into a new owenloop def, and refuse to publish it
+# until it lints clean, survives an adversarial gate-sharpness review, and has
+# actually been test-driven against the engine. Staleness becomes a rebuild:
+# re-run this workflow on the same brief and diff the output.
+#
+# Workspace contract (for whatever conducts this):
+#   - Conduct from a scratch workspace dir. The `draft` step writes the
+#     generated def to ./build/<name>.yaml in that workspace.
+#   - `npx owenloop` must resolve (the lint judge and the test drive shell out
+#     to it).
+#   - Agent workers need file read/write and web access; the def_draft judges
+#     read the drafted YAML from disk at the path carried in the artifact.
+#
+# Drive it:
+#   wf=$(owenloop create compile-dev-playbook \
+#     --provide brief='{"task":"add Stripe subscription billing to a Node/TypeScript app","category":"billing"}' \
+#     | jq -r .workflow)
+#   owenloop tick $wf     # ... conduct to done (e.g. with the owenloop-conduct skill)
+#   # `approval` is a human gate before publish. Flying solo? Pre-approve at create:
+#   #   --provide approval='{"approved_by":"alex"}'
+#   # Otherwise the instance parks blocked on it — durably, in SQLite — until:
+#   #   owenloop provide $wf approval --value '{"approved_by":"alex"}'
+
+name: compile-dev-playbook
+title: Playbook compiler (developer tasks)
+description: >
+  Research a repeatable development task (SDK integration, service setup,
+  infra addition) across live documentation and compile the knowledge into a
+  validated, gate-checked, test-driven owenloop workflow def ("playbook"),
+  publishable to a library or hub.
+
+workers: [agent, command]   # typo guard: any other worker label is a load error
+
+x:
+  category: meta
+  motto: docs are source; the def is the compiled artifact
+
+inputs:
+  - name: brief
+    seedOwed: true
+    schema:
+      type: object
+      required: [task]
+      properties:
+        task:     { type: string, description: "What the playbook automates, e.g. 'add Stripe subscription billing to a Node/TypeScript app'" }
+        stack:    { type: string, description: "Target stack/context assumptions, if any" }
+        category: { type: string, description: "Hub category, e.g. billing | auth | infra | ops" }
+        notes:    { type: string, description: "Anything else: scope cuts, org conventions, publish destination" }
+
+  - name: approval
+    seedOwed: true
+    producer: human
+    schema:
+      type: object
+      required: [approved_by]
+      properties:
+        approved_by: { type: string }
+        notes:       { type: string }
+
+outputs:
+  - playbook
+
+steps:
+  # ── Research ────────────────────────────────────────────────────────────
+  - name: scout
+    consumes: [brief]
+    produces: ["scout.source[]"]
+    model: standard
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Find the authoritative sources for the task in `brief`. Prefer, in order:
+      official docs (setup/integration guides, API references), official
+      changelogs or release notes (to see what moved recently), then credible
+      community material only where official docs are thin.
+      `emit` each source as {url, title, kind, why} where kind is one of
+      official | changelog | community and `why` says what this source is
+      expected to contribute. `seal` once official docs cover the core flow
+      AND at least one source speaks to recency (changelog/release notes).
+      Do not emit more than ~10 sources — this is a scout, not a crawl.
+
+  - name: read
+    consumes: ["scout.source[$i]"]
+    produces: ["scout.source[$i].extract"]
+    parallel: 6
+    model: fast
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}, element ${INDEX}.
+      Fetch and read this ONE source. Extract, grounded strictly in what the
+      page actually says (no memory, no invention):
+        - steps: the procedure the source prescribes, in order
+        - invariant_candidates: things that must be TRUE for the integration
+          to be correct/safe, regardless of SDK version (e.g. "webhook
+          signatures must be verified")
+        - pitfalls: warnings, deprecations, common mistakes the source calls out
+        - versioning: API/SDK versions, dates, anything that smells ephemeral
+        - verifications: anything checkable by a command or test (exit codes,
+          CLI verbs, test recipes, dashboard states)
+        - human_actions: anything only a human can do (create an account,
+          approve a dashboard setting, supply a credential)
+      Green `.extract` with those fields plus the source url. If the source is
+      dead, paywalled, or off-topic, `retract scout.source[${INDEX}]` instead —
+      it drops out of the distillation entirely.
+
+  # ── Distill: invariants vs ephemera ─────────────────────────────────────
+  - name: distill
+    consumes: [brief, "scout.source[*].extract"]
+    produces:
+      - name: knowledge
+        schema:
+          type: object
+          required: [invariants, ephemera, human_inputs, verifications, sources]
+          properties:
+            invariants:
+              type: array
+              minItems: 3
+              items:
+                type: object
+                required: [claim, verify_by, sources]
+                properties:
+                  claim:     { type: string }
+                  why:       { type: string }
+                  verify_by: { type: string, description: "How a workflow gate could check this: a command, a judge criterion, a schema" }
+                  sources:   { type: array, items: { type: string }, minItems: 1 }
+            ephemera:
+              type: array
+              items:
+                type: object
+                required: [detail, source]
+                properties:
+                  detail: { type: string, description: "Version-bound specifics: SDK calls, current API versions, exact snippets" }
+                  source: { type: string }
+            human_inputs:
+              type: array
+              items:
+                type: object
+                required: [name, what]
+                properties:
+                  name: { type: string }
+                  what: { type: string }
+            verifications:
+              type: array
+              minItems: 2
+              items:
+                type: object
+                required: [what, how]
+                properties:
+                  what: { type: string }
+                  how:  { type: string, description: "command | judge | schema — and the concrete check" }
+            sources:
+              type: array
+              items: { type: string }
+        judges:
+          - name: altitude
+            model: strong
+            body: |
+              Judge `knowledge` for altitude discipline — the one rule that
+              keeps compiled playbooks from going stale:
+                - Every invariant must be a WHAT-MUST-BE-TRUE claim, durable
+                  across SDK versions. Reject if any invariant is code-level
+                  how-to (exact function names, snippets, current API
+                  versions) — that material belongs in `ephemera`.
+                - Every invariant must carry a usable `verify_by` — something
+                  a workflow gate could actually check. "Be careful" is not a
+                  verification. Reject vague ones, naming them.
+                - Reject if `human_inputs` is empty but any extract mentioned
+                  accounts, credentials, or dashboard actions.
+              Otherwise approve. Rejections must name the offending entries.
+          - name: grounding
+            inputs: true
+            body: |
+              You can see the source extracts `knowledge` was distilled from.
+              Cross-check: every invariant's `sources` must point at extracts
+              that actually support the claim. Reject any invariant that is
+              unsupported by, or contradicts, the extracts — cite which.
+              Otherwise approve.
+    maxAttempts: 3
+    model: strong
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Distill every surviving source extract into `knowledge` — the invariant
+      model of this task, per the schema. The discipline that matters:
+      invariants are what must be true in ANY correct implementation
+      (durable); ephemera are today's specifics (SDK calls, versions) and are
+      recorded only as pointers back to sources — the compiled playbook will
+      cite them, never hardcode them. Merge duplicates across sources; where
+      sources conflict, prefer official and newer, and note the conflict.
+
+  # ── Compile ──────────────────────────────────────────────────────────────
+  - name: draft
+    consumes: [brief, knowledge]
+    produces:
+      - name: def_draft
+        schema:
+          type: object
+          required: [name, path, summary, gates]
+          properties:
+            name:    { type: string, description: "the generated def's name:" }
+            path:    { type: string, description: "where the YAML was written, e.g. build/<name>.yaml" }
+            summary: { type: string }
+            gates:   { type: array, minItems: 2, items: { type: string }, description: "the enforced gates the def carries, one line each" }
+        judges:
+          - name: lints-clean
+            worker: command
+            command: npx owenloop lint --defs build
+            spec: { workdir: "." }
+            body: unused by a command judge; exit 0 approves, non-zero rejects with the lint output
+          - name: gate-sharpness
+            bodyFile: judges/gate-sharpness.md
+            model: strong
+          - name: security
+            bodyFile: judges/security.md
+            model: strong
+    maxAttempts: 4
+    model: strong
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Compile `knowledge` into a complete owenloop workflow def for the task
+      in `brief`. Write the YAML to build/<name>.yaml (create build/ if
+      needed), then green `def_draft` with {name, path, summary, gates} — the
+      YAML itself lives on disk, not in the artifact.
+
+      Compilation rules — each is checked by a judge, so cutting corners just
+      buys you a rejection:
+      1. FRESHNESS: the generated def's FIRST step must consume the def's
+         seeded task input and produce a plan grounded in reading the current
+         official docs (cite the source URLs from `knowledge` in its body).
+         The playbook forces doc-reading; it never substitutes for it.
+      2. INVARIANTS → STRUCTURE: every invariant in `knowledge` must be
+         carried by the def's structure — a step with a schema'd produce, a
+         judge, or a command gate. An invariant that survives only as prose
+         in a body is a compile error.
+      3. GATES: every entry in `knowledge.verifications` becomes an enforced
+         gate — `worker: command` with the check command where deterministic
+         (tests run and pass = exit code), a judge otherwise. List each in
+         `def_draft.gates`.
+      4. HUMAN MOMENTS: every entry in `knowledge.human_inputs` becomes a
+         seedOwed input with a schema — the instance parks until a human
+         provides it. Never model these as agent steps. Secrets are
+         referenced by name (secret-manager key, env var name), never carried
+         as values.
+      5. EPHEMERA: never hardcode version-bound specifics. Where the
+         implementer needs them, the step body says "consult <source URL>".
+      6. SIDE EFFECTS: any step with an irreversible external effect declares
+         effect: { idempotent: false, onInvalidate: escalate } (or a named
+         compensator).
+      7. PROVENANCE: the def carries an x: block — compiled_from (source
+         URLs), compiled_for (brief.task), category, compiled_at (today's
+         date) — so staleness is visible and a recompile is diffable.
+      8. HOUSE RULES: model tiers by intent (fast/standard/strong), sensible
+         maxAttempts, a header comment with drive instructions, and
+         `workers:` listing every worker label used.
+
+  # ── Test drive: a def that has never been driven is a hypothesis ────────
+  - name: testdrive
+    consumes: [def_draft]
+    invalidates: [def_draft]
+    produces:
+      - name: drive_report
+        schema:
+          type: object
+          required: [verdict, evidence, issues]
+          properties:
+            verdict:  { type: string, enum: [pass] }
+            evidence: { type: array, minItems: 2, items: { type: string }, description: "commands run and what they returned" }
+            issues:   { type: array, items: { type: string } }
+        judges:
+          - name: honest-drive
+            inputs: true
+            body: |
+              Judge `drive_report` against the def it claims to have driven.
+              Reject if: `evidence` does not show BOTH a reachability check
+              and a real instance being ticked; the claimed refusal probe is
+              missing; or `issues` lists anything that should have been a
+              rejection of `def_draft` instead of a pass. A pass without
+              evidence is a lie — reject it. Otherwise approve.
+    maxAttempts: 3
+    model: standard
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Test-drive the def at `def_draft.path` against the real engine. At
+      minimum, run and capture:
+        1. npx owenloop check <name> --defs build --assume-provided
+           (bounded reachability: deadlocks, stuck steps, dead branches)
+        2. A dry instantiation against a SCRATCH db (never the real one):
+           npx owenloop create <name> --defs build --db build/testdrive.db \
+             --provide <seed inputs with plausible sample values>
+           then tick it and confirm the first order(s) are the doc-reading
+           step, not something deeper in the graph.
+        3. A refusal probe: green one schema'd artifact with a deliberately
+           malformed value and confirm the engine refuses it
+           (schema-rejected), then a valid value and confirm it lands.
+      Then EITHER green `drive_report` with verdict "pass" and the evidence
+      (commands + observed output), OR — if anything is wrong with the def —
+      reject `def_draft` with the concrete failures (this re-arms `draft`
+      with your reasons attached) and close this run without greening. Never
+      both; never a pass on faith. Clean up the scratch db.
+
+  # ── Publish (human-gated, irreversible) ─────────────────────────────────
+  - name: publish
+    consumes: [def_draft, drive_report, approval]
+    produces:
+      - name: playbook
+        schema:
+          type: object
+          required: [name, path, sources, compiled_at]
+          properties:
+            name:        { type: string }
+            path:        { type: string, description: "where the published def landed" }
+            sources:     { type: array, items: { type: string } }
+            compiled_at: { type: string }
+    effect:
+      idempotent: false        # publishing is an external write —
+      onInvalidate: escalate   # if upstream moves later, hold for a human, don't re-publish
+    model: fast
+    body: |
+      Workflow ${WORKFLOW}, run ${RUN}.
+      Publish the approved def: copy `def_draft.path` into the playbook
+      library (brief.notes may name a destination; default ./playbooks/).
+      Verify the copy is byte-identical and its x: provenance block is
+      complete. Green `playbook` with {name, path, sources, compiled_at}
+      taken from the def's own provenance. Do not edit the def here — publish
+      exactly what was judged and driven.

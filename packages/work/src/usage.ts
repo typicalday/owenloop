@@ -25,13 +25,14 @@ Options:
   -h, --help                     show this help and exit 0
       --version                  print the owenloop work version and exit 0
 
-  root shift options (run as owenloop shift start):
+  root shift options (run as owenloop shift start <crew...> | --all):
+      <crew...>                  serve only these crews (positional, space
+                                 separated); or --all for every crew on the key
+      --all                      serve every crew on the key
       --origin <url>             hub origin (else settings.hubOrigin)
       --as <account>             Scoped Identity credential account to read + hand
                                  to dispatched holds/execs (default 'default')
       --name <n>                 Shift name (default <hostname>/<cwd>)
-      --serve-crews a,b          serve only these crews (comma list; default:
-                                 all crews on the key)
       --cap <n>                  max in-flight exec children (default 3)
       --poll-interval <ms>       wake poll cadence (default 5000)
       --once                     bootstrap wake + one sweep, then exit (demo/e2e)

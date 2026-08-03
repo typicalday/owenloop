@@ -401,7 +401,7 @@ export interface StepDef {
    *  unset there is NO cap and heartbeats extend the lease indefinitely. */
   maxLeaseMs?: number;
   body: string; // prompt body
-  /** Mode 2 foundation: name of the child workflow this step delegates to. Machine-handled, never a executor firing. */
+  /** Mode 2 foundation: name of the child workflow this step delegates to. Machine-handled, never a worker firing. */
   calls?: string;
   /** Mode 2 foundation: child input name → parent artifact name wiring for a calls: step. */
   callsInputs?: Record<string, string>;
@@ -458,7 +458,7 @@ export interface WorkflowDef {
 export interface InputDef {
   name: string;
   /** who provides it: a human (pulled) or it is provided at start */
-  producer: string; // "human" by convention, or any external capability
+  producer: string; // "human" by convention, or any external provider name
   /** if true, instance start leaves it owed; otherwise it must be provided at start */
   seedOwed: boolean;
   /** optional JSON Schema a provided input value must satisfy (§19) */
