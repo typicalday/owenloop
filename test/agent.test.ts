@@ -466,12 +466,12 @@ test('agent new: --scopes work,run mints with those scopes and prints them', asy
   assertNoTokenLeak(t);
 });
 
-test('agent new: --conductor is sugar for --scopes work,run', async () => {
+test('agent new: --shift is sugar for --scopes work,run', async () => {
   const { fetch, calls } = routedFetch({ 'POST /api/mint_agent_token': mintOk() });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['agent', 'new', 'codex', '--conductor', '--hub', HUB], t.io);
+  const code = await mainAsync(['agent', 'new', 'codex', '--shift', '--hub', HUB], t.io);
   assert.equal(code, 0, t.err.join('\n'));
 
   const mint = calls.find((c) => c.pathname === '/api/mint_agent_token')!;
@@ -482,14 +482,14 @@ test('agent new: --conductor is sugar for --scopes work,run', async () => {
   assertNoTokenLeak(t);
 });
 
-test('agent new: --scopes and --conductor together is a usage error, no network', async () => {
+test('agent new: --scopes and --shift together is a usage error, no network', async () => {
   const { fetch, calls } = routedFetch({ 'POST /api/mint_agent_token': mintOk() });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
-  const code = await mainAsync(['agent', 'new', 'codex', '--scopes', 'work,run', '--conductor', '--hub', HUB], t.io);
+  const code = await mainAsync(['agent', 'new', 'codex', '--scopes', 'work,run', '--shift', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /at most one of --scopes or --conductor/);
+  assert.match(t.err.join('\n'), /at most one of --scopes or --shift/);
   assert.equal(calls.length, 0, 'no network on a usage error');
   assertNoTokenLeak(t);
 });

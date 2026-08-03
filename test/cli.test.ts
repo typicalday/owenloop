@@ -104,8 +104,8 @@ test('an unknown boolean-style option (no value) is still rejected', () => {
 test('every currently-valid flag combination is still accepted (over-rejection guard)', () => {
   const { run } = makeCli({ defs: join(import.meta.dirname, 'fixtures') });
   const wf = run('create', 'rate', '--provide', `seed=${J({})}`).json().workflow;
-  // multi-flag positive: --now / --shallow / repeated --label all pass the guard.
-  const r = run('tick', wf, '--now=1700000000000', '--shallow', '--label', 'a', '--label', 'b');
+  // multi-flag positive: --now / --shallow / repeated --capability all pass the guard.
+  const r = run('tick', wf, '--now=1700000000000', '--shallow', '--capability', 'a', '--capability', 'b');
   assert.equal(r.code, 0, r.err);
   // --defs accepted (allowlisted globally) on a command that does not read it.
   assert.equal(run('list', '--defs', 'unused-dir').code, 0, 'globals allowlisted everywhere');
@@ -320,22 +320,22 @@ test('tick --now (space form) is a boolean flag now, not a value — non-numeric
   assert.match(eqForm.err, /invalid value for --now/);
 });
 
-test('tick --label passes the caller filter through to the engine (A2)', () => {
-  // A temp def dir with two steps, one labeled 'claude', one 'codex'.
-  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-labels-'));
+test('tick --capability passes the caller filter through to the engine (A2)', () => {
+  // A temp def dir with two steps, one capability-routed 'claude', one 'codex'.
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-capabilities-'));
   writeFileSync(
-    join(defsDir, 'labeltest.yaml'),
+    join(defsDir, 'capabilitytest.yaml'),
     [
-      'name: labeltest',
+      'name: capabilitytest',
       'steps:',
       '  - name: alpha',
       '    consumes: [seed]',
       '    produces: [a]',
-      '    labels: [claude]',
+      '    capabilities: [claude]',
       '  - name: beta',
       '    consumes: [seed]',
       '    produces: [b]',
-      '    labels: [codex]',
+      '    capabilities: [codex]',
       'inputs:',
       '  - name: seed',
       '    seedOwed: true',
@@ -343,13 +343,13 @@ test('tick --label passes the caller filter through to the engine (A2)', () => {
     ].join('\n'),
   );
   const { run } = makeCli({ defs: defsDir });
-  const wf = run('create', 'labeltest', '--provide', `seed=${J({})}`).json().workflow;
+  const wf = run('create', 'capabilitytest', '--provide', `seed=${J({})}`).json().workflow;
 
-  // A caller serving only 'claude' claims alpha, defers beta as label-mismatch.
-  const t = run('tick', wf, '--label', 'claude').json();
-  assert.deepEqual(t.orders.map((o: any) => o.step), ['alpha'], 'only the matching-label step is claimed');
-  const mismatch = t.deferred.find((d: any) => d.reason === 'label-mismatch');
-  assert.ok(mismatch, 'the disjoint step is reported label-mismatch');
+  // A caller serving only 'claude' claims alpha, defers beta as capability-mismatch.
+  const t = run('tick', wf, '--capability', 'claude').json();
+  assert.deepEqual(t.orders.map((o: any) => o.step), ['alpha'], 'only the matching-capability step is claimed');
+  const mismatch = t.deferred.find((d: any) => d.reason === 'capability-mismatch');
+  assert.ok(mismatch, 'the disjoint step is reported capability-mismatch');
   assert.equal(mismatch.step, 'beta');
 });
 

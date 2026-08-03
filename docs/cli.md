@@ -49,23 +49,23 @@ for the full breakdown.
 | `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
-| `agent new <name> [--pools <a,b>] [--scopes <a,b>] [--conductor] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--conductor` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
-| `binding new <label> <pool> [--hub <url>]` | add a pool to a workflow label on the hub org — a label may bind many pools (admin; human credential) — see [Label bindings](#label-bindings) |
-| `binding rm <label> <pool> [--hub <url>]` | remove one `(label, pool)` binding — see [Label bindings](#label-bindings) |
-| `binding list [--hub <url>]` | list the hub org's label bindings — see [Label bindings](#label-bindings) |
-| `pool list [--hub <url>]` | list the hub org's pools with their members (includes the orphan pool once one exists) — see [Pools](#pools) |
-| `pool new <name> --kind personal\|shared [--owner <memberId>] [--hub <url>]` | create a pool on the hub org (admin, or own personal pool; human credential) — see [Pools](#pools) |
-| `pool rm <poolId> [--hub <url>]` | delete a pool; work stamped to it moves to the org's orphan pool — see [Pools](#pools) |
-| `pool member add <poolId> <principalKind> <principalId> [--hub <url>]` | add a member or agent to a pool — see [Pools](#pools) |
-| `pool member rm <poolId> <principalId> [--hub <url>]` | remove a principal from a pool — see [Pools](#pools) |
-| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--pools <a,b>] [--scopes <a,b>]` | onboard this machine: may store human and Scoped Identity credentials, write only execution-settings `hubOrigin`, and after probing print missing-plugin commands instead of installing the plugin — see [`setup`](#setup--onboard-a-machine) |
+| `agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--shift` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
+| `capability bind <capability> <crew> [--hub <url>]` | add a crew to a workflow capability on the hub org — a capability may route to many crews (admin; human credential) — see [Capability routes](#capability-routes) |
+| `capability unbind <capability> <crew> [--hub <url>]` | remove one `(capability, crew)` route — see [Capability routes](#capability-routes) |
+| `capability list [--hub <url>]` | list the hub org's capability routes — see [Capability routes](#capability-routes) |
+| `crew list [--hub <url>]` | list the hub org's crews with their members (includes the orphan crew once one exists) — see [Crews](#crews) |
+| `crew new <name> --kind personal\|shared [--owner <memberId>] [--hub <url>]` | create a crew on the hub org (admin, or own personal crew; human credential) — see [Crews](#crews) |
+| `crew rm <crewId> [--hub <url>]` | delete a crew; work stamped to it moves to the org's orphan crew — see [Crews](#crews) |
+| `crew member add <crewId> <principalKind> <principalId> [--hub <url>]` | add a member or agent to a crew — see [Crews](#crews) |
+| `crew member rm <crewId> <principalId> [--hub <url>]` | remove a principal from a crew — see [Crews](#crews) |
+| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>]` | onboard this machine: may store human and Scoped Identity credentials, write only execution-settings `hubOrigin`, and after probing print missing-plugin commands instead of installing the plugin — see [`setup`](#setup--onboard-a-machine) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
 | `work <subcommand> [options]` | run the execution-side CLI companion — see [`work`](#work--execution-side-cli-companion) |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
-| `tick <wf> [--now=<ms>] [--shallow] [--label <l>]…` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only); repeatable `--label` claims unlabeled steps plus matching-label steps — see below |
+| `tick <wf> [--now=<ms>] [--shallow] [--capability <l>]…` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only); repeatable `--capability` claims steps without capabilities plus matching-capability steps — see below |
 | `reap <wf> [--now]` | run the reaper; `--now` forces every claim stale (TTL 0) — see below |
 | `runs <wf> [--open]` | list this instance's runs, joining claim state for open ones |
 | `status <wf>` | derived view: `done`, `debts`, `eligible`, `blocked`, `inFlight` |
@@ -92,8 +92,8 @@ and one JSON-line response. The daemon keeps polling and dispatching while no
 `shift next` client is attached.
 
 The `shift start` positional argument is a **crew** name. The routing API calls
-that field a **pool**: `serve_pools` contains the selected pool names. Passing
-`--all` maps to an empty `serve_pools` list, which means all pools available to
+that field a **crew**: `serve_crews` contains the selected crew names. Passing
+`--all` maps to an empty `serve_crews` list, which means all crews available to
 the Scoped Identity. Do not treat `attended_at` as a liveness signal: every
 accepted `shift next` records attendance and makes the next presence ping due,
 but attendance is advisory and observability-only. Attendance never changes
@@ -121,7 +121,7 @@ one loop sweep and exits instead of keeping the foreground daemon running.
 |---|---|
 | `--origin <url>` | use this hub origin; otherwise use `hubOrigin` from the execution settings file; there is no hub-origin fallback |
 | `--as <account>` | use this Scoped Identity account; defaults to `default` |
-| `--name <n>` | use this shift name; otherwise generate one from the host and current directory with a process/conductor suffix |
+| `--name <n>` | use this shift name; otherwise generate one from the host and current directory with a process/shift suffix |
 | `--cap <n>` | dispatch capacity; precedence is flag, then `settings.dispatchCap`, then `3` |
 | `--max-agents <n>` | concurrent agent limit; precedence is flag, then `settings.maxConcurrentAgents`, then `4` |
 | `--poll-interval <ms>` | loop polling interval; defaults to `5000` milliseconds |
@@ -188,7 +188,7 @@ owenloop shift status [--state-dir <p>]
 With a daemon, status exits `0` and prints:
 
 ```json
-{ "name": "host/project#abc123", "serve_pools": ["alpha"], "cap": 3, "free": 3, "running": 0, "attended_at": null, "started_at": 1738000000000 }
+{ "name": "host/project#abc123", "serve_crews": ["alpha"], "cap": 3, "free": 3, "running": 0, "attended_at": null, "started_at": 1738000000000 }
 ```
 
 `attended_at` remains `null` until the first accepted `next` request. Without a
@@ -222,9 +222,10 @@ same `owenloop` binary. Replace the old separate `owenwork` invocation directly:
 owenwork <subcommand> ...    →    owenloop work <subcommand> ...
 ```
 
-The transplanted subcommand names remain. The proxy/session `--mcp` option was
-removed; `hold --mcp` remains because the machine-attached hold mount still
-exists. Run `owenloop work --help` for the full role-specific usage.
+The transplanted subcommand names remain. The standing Shift daemon is
+only the root `owenloop shift` command; `owenloop work` has no standing-daemon alias.
+`hold --mcp` remains because the machine-attached hold mount still exists.
+Run `owenloop work --help` for the full role-specific usage.
 
 The execution settings file is `$XDG_CONFIG_HOME/owenloop/settings.json` when
 `XDG_CONFIG_HOME` is set to a non-blank value; otherwise it is
@@ -232,7 +233,6 @@ The execution settings file is `$XDG_CONFIG_HOME/owenloop/settings.json` when
 
 | subcommand | what it does |
 |---|---|
-| `proxy [options]` | park at the hub and dispatch orders |
 | `hold --order <id> [options]` | hold an order with a heartbeating lease |
 | `exec <order-id> [options]` | run a command order in a self-leasing loop |
 | `agent-run <order-id> [options]` | host an agent order's Step Agent in a harness and self-leasing loop |
@@ -427,11 +427,11 @@ ref) surfaces as a 404 from the sha-resolve step.
 executes nothing at install time: `add` only fetches, validates, and writes
 YAML under the defs dir. But an installed def's steps *run* later, with
 whatever privileges the host process and its dispatcher grant their Step Agents.
-owenloop itself never executes a step body — `worker:`/`command:` are opaque
-labels it carries through untouched and never shells out (see [What owenloop is
+owenloop itself never executes a step body — `executor:`/`command:` are opaque
+fields it carries through untouched and never shells out (see [What owenloop is
 not](../README.md#what-owenloop-is-not) and
-[`docs/authoring.md`](authoring.md#worker--declaring-the-executor)) — so the
-real risk surface is the Conductor or Step Agent you point at these defs: the
+[`docs/authoring.md`](authoring.md#executor--declaring-the-executor)) — so the
+real risk surface is the Shift or Step Agent you point at these defs: the
 prompts and `command:` strings that ship in a package are handed to Step Agents that
 typically run with your full local privileges. **Install only sources you
 trust.**
@@ -714,9 +714,9 @@ happen in one step, and you never handle the secret.
 **The token is never printed.** The minted `olp_` token goes process → store
 only — it never appears on stdout, stderr, in an error, or in a log (identity
 model §6, "rule of gates"). The confirmation JSON is built from a whitelist of
-**non-secret** fields only: `hub`, `name`, `slot`, `pools` (the resolved pool
+**non-secret** fields only: `hub`, `name`, `slot`, `crews` (the resolved crew
 names), `scopes` (the minted token's scopes — `["work"]` by default, or whatever
-`--scopes`/`--conductor` selected), `storage` (`keychain` | `file`), `agentId` (the
+`--scopes`/`--shift` selected), `storage` (`keychain` | `file`), `agentId` (the
 Scoped Identity's id), and `tokenId` (a revocation handle). To use the Scoped Identity afterwards,
 pass `--as agent:<name>` to `connect`/`push`; to revoke it, use its `tokenId`
 on the hub.
@@ -738,16 +738,16 @@ production hub while you're logged into a dev one. Note that hub enumeration is
 external-command backend cannot list their entries, so on such a machine step 2
 cannot enumerate the store and you must pass `--hub`.
 
-**`--pools <a,b>`.** A comma-separated list of pool names the token is granted
+**`--crews <a,b>`.** A comma-separated list of crew names the token is granted
 on (trimmed, empties dropped). Omit the flag to let the hub default the token to
-the minter's personal pool; `--pools ""` (or `--pools ,`) is a usage error. Pool
+the minter's personal crew; `--crews ""` (or `--crews ,`) is a usage error. Crew
 names are validated by the hub, not the client.
 
-**`--scopes <a,b>` / `--conductor`.** A comma-separated list of scopes the minted
+**`--scopes <a,b>` / `--shift`.** A comma-separated list of scopes the minted
 token carries (trimmed, empties dropped). Omit both flags to mint **work-only**
-(the default). `--conductor` is shorthand for `--scopes work,run` — the identity
+(the default). `--shift` is shorthand for `--scopes work,run` — the identity
 a service account needs to both serve and *start* runs. The two flags are
-mutually exclusive (`--scopes … --conductor` together is a usage error), and
+mutually exclusive (`--scopes … --shift` together is a usage error), and
 `--scopes ""` (or `--scopes ,`) is a usage error. Scope names are validated by
 the hub, not the client.
 
@@ -755,8 +755,8 @@ the hub, not the client.
 `OWENLOOP_CREDENTIAL_COMMAND` is set, that command — not the local store —
 supplies credentials for the hub, so `agent new` refuses up front (it has
 nowhere to write the minted token); unset the variable to use the local store.
-This check, the name validation, the empty-`--pools` check, the empty-`--scopes`
-check, and the `--scopes`/`--conductor` mutual-exclusivity check all run
+This check, the name validation, the empty-`--crews` check, the empty-`--scopes`
+check, and the `--scopes`/`--shift` mutual-exclusivity check all run
 **before** any network call, so a refusal never mints a server-side token first
 — a mint that then failed to store would burn the agent name permanently.
 
@@ -765,105 +765,104 @@ check, and the `--scopes`/`--conductor` mutual-exclusivity check all run
 | code | meaning |
 |---|---|
 | `0` | minted and stored |
-| `1` | generic failure — invalid or already-taken name, pool/shape rejection, network timeout, or a token that minted but couldn't be stored |
+| `1` | generic failure — invalid or already-taken name, crew/shape rejection, network timeout, or a token that minted but couldn't be stored |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
 
-## Label bindings
+## Capability routes
 
-A **label binding** maps a workflow-def **label** (a logical capability tag a
-def author writes, like `gpu` or `repo-access`) to a **pool** on one hub org.
-Def authors write labels; an org admin binds each label to at least one pool.
+A **capability route** maps a workflow-def **capability** (a logical capability tag a
+def author writes, like `gpu` or `repo-access`) to a **crew** on one hub org.
+Def authors write capabilities; an org admin binds each capability to at least one crew.
 That indirection is what keeps deployment facts out of portable defs — see
-[`labels:`](authoring.md#labels--logical-capability-tags) in the authoring guide
+[`capabilities:`](authoring.md#capabilities--logical-capability-tags) in the authoring guide
 for the step-side declaration.
 
-**A binding is one `(label, pool)` PAIR, and a label may bind MANY pools.** The
-pair is the unit that is created and destroyed: `binding new` adds one, `binding
-rm` removes one, and `binding list` returns one row per pair — so a label bound
-to three pools appears as three rows. A **dangling binding** is one whose pool
+**A route is one `(capability, crew)` PAIR, and a capability may bind MANY crews.** The
+pair is the unit that is created and destroyed: `capability bind` adds one, `capability unbind` removes one, and `capability list` returns one row per pair — so a capability bound
+to three crews appears as three rows. A **dangling route** is one whose crew
 row was deleted; it survives in the table, routes nothing, and never widens
-access. A label with **zero live bindings** is **parked**: its steps wait.
+access. A capability with **zero live routes** is **parked**: its steps wait.
 
-**Resolution is live.** `start_run` only *checks* that every label a run's steps
-use is currently bound — it stamps no pool for a labeled step. Every later
-routing decision (which conductor is offered the step, and whether a claim is
-allowed) re-reads the binding table as it stands at that moment.
+**Resolution is live.** `start_run` only *checks* that every capability a run's steps
+use is currently bound — it stamps no crew for a capability-routed step. Every later
+routing decision (which Shift is offered the step, and whether a claim is
+allowed) re-reads the route table as it stands at that moment.
 
 **These edits take effect on work already in flight.**
 
-- **Adding.** Running `binding new` on a label that is **already bound** ADDS the
-  named pool — it never displaces a pool already bound. Adding widens who can
-  serve the label, live at the next poll of every in-flight run using it. Re-adding
-  a pair that is already there is a normal success, not an error (`alreadyBound:
+- **Adding.** Running `capability bind` on a capability that is **already bound** ADDS the
+  named crew — it never displaces a crew already bound. Adding widens who can
+  serve the capability, live at the next poll of every in-flight run using it. Re-adding
+  a pair that is already there is a normal success, not an error (`alreadyRouted:
   true`).
-- **Removing.** Running `binding rm` removes exactly ONE pair. If the label still
-  has other live bindings, it simply routes to a narrower set and nothing pauses.
-  If the removal takes away the **last live** binding, the label is **parked**:
-  the in-flight steps that use it are offered to no conductor and accept no
+- **Removing.** Running `capability unbind` removes exactly ONE pair. If the capability still
+  has other live routes, it simply routes to a narrower set and nothing pauses.
+  If the removal takes away the **last live** route, the capability is **parked**:
+  the in-flight steps that use it are offered to no Shift and accept no
   claim — until it is bound again. Nothing is lost; the work resumes on re-bind.
-  `remainingPoolIds: []` on stdout is that signal, and stderr says so in words.
+  `remainingCrewIds: []` on stdout is that signal, and stderr says so in words.
 - **Retargeting is two acts, not one.** There is no retarget command: add the new
-  pool, then remove the old one. Each is separately audited on the hub, and in
-  between **BOTH** pools serve the label. The CLI deliberately does not chain the
+  crew, then remove the old one. Each is separately audited on the hub, and in
+  between **BOTH** crews serve the capability. The CLI deliberately does not chain the
   two for you — the intermediate state is a real state an operator may want to sit
   in, and collapsing it would hide a widened access window.
 
-A label binding is **not** the project↔hub binding `owenloop connect` writes to
+A capability route is **not** the project↔hub binding `owenloop connect` writes to
 `.owenloop/hub.json` — that one records which hub *this project directory*
-publishes to; a label binding is an org-scoped label→pool row on the hub.
+publishes to; a capability route is an org-scoped capability→crew row on the hub.
 
-### `binding new <label> <pool>`
+### `capability bind <capability> <crew>`
 
-`POST /api/add_label_binding`, authenticated as your **human** credential;
-requires the **admin** role on the hub. ADDS the pool named `<pool>` to
-`<label>`'s bindings. `<pool>` is a pool **name** — the hub resolves it to a pool
-id; the CLI does no pool lookup and performs no client-side validation of either
+`POST /api/add_capability_route`, authenticated as your **human** credential;
+requires the **admin** role on the hub. ADDS the crew named `<crew>` to
+`<capability>`'s routes. `<crew>` is a crew **name** — the hub resolves it to a crew
+id; the CLI does no crew lookup and performs no client-side validation of either
 argument (the hub is the enforcement of record).
 
-**Adding is idempotent per pair.** Re-adding a `(label, pool)` pair that is
-already bound is a normal success — the hub answers `200` with `alreadyBound:
+**Adding is idempotent per pair.** Re-adding a `(capability, crew)` pair that is
+already bound is a normal success — the hub answers `200` with `alreadyRouted:
 true` and changes nothing (the original row keeps its creator and timestamp).
-`boundPoolCount` reports how many **live** pools the label binds after the write.
+`routedCrewCount` reports how many **live** crews the capability binds after the write.
 
-### `binding rm <label> <pool>`
+### `capability unbind <capability> <crew>`
 
-`POST /api/remove_label_binding`, authenticated as your **human** credential;
-requires the **admin** role on the hub. Removes the ONE `(label, pool)` binding
-you name. `<pool>` is **required**: a label may bind many pools, so a label-only
+`POST /api/remove_capability_route`, authenticated as your **human** credential;
+requires the **admin** role on the hub. Removes the ONE `(capability, crew)` route
+you name. `<crew>` is **required**: a capability may bind many crews, so a capability-only
 removal would unbind more than you asked for.
 
-`<pool>` accepts the pool's **name**, or its raw **`pool_id`**. The raw-id form
-is the only way to remove a **dangling** binding — one whose pool row was
-deleted, so there is no name left to resolve. `binding list` shows such a row
-with `poolName: null`; take its `poolId` from there.
+`<crew>` accepts the crew's **name**, or its raw **`crew_id`**. The raw-id form
+is the only way to remove a **dangling** route — one whose crew row was
+deleted, so there is no name left to resolve. `capability list` shows such a row
+with `crewName: null`; take its `crewId` from there.
 
 **`rm` is idempotent.** Removing a pair that is **not** bound is a normal
 success — the hub answers `200` with `removed: false` rather than a `404` — and
 the CLI prints a full document plus a stderr line saying nothing was removed. A
-script can call `binding rm` unconditionally without branching on whether the
-pair was bound. On that tolerant path `poolId` is `null`, because the argument
-matched neither a live pool name nor one of the label's own rows.
+script can call `capability unbind` unconditionally without branching on whether the
+pair was bound. On that tolerant path `crewId` is `null`, because the argument
+matched neither a live crew name nor one of the capability's own rows.
 
-**Removing the last live binding parks the label**, and stderr says so. See
+**Removing the last live route parks the capability**, and stderr says so. See
 "These edits take effect on work already in flight" above.
 
-### `binding list`
+### `capability list`
 
-`GET /api/label_bindings`, authenticated as your **human** credential. Lists the
-org's bindings, ONE row per `(label, pool)` pair ordered by label then pool id —
-so a label bound to several pools appears as several rows. An org with no
-bindings yet is a normal success (exit 0) with an empty `bindings` array.
+`GET /api/capability_routes`, authenticated as your **human** credential. Lists the
+org's routes, ONE row per `(capability, crew)` pair ordered by capability then crew id —
+so a capability bound to several crews appears as several rows. An org with no
+routes yet is a normal success (exit 0) with an empty `routes` array.
 
-A row whose `poolName` is `null` is a **dangling binding**: the pool it names was
+A row whose `crewName` is `null` is a **dangling route**: the crew it names was
 deleted. Such a row routes nothing and never widens access, and it is shown
-rather than hidden precisely so you can clean it up — remove it with `binding rm
-<label> <poolId>`.
+rather than hidden precisely so you can clean it up — remove it with `capability unbind
+<capability> <crewId>`.
 
 **Flags.** `--hub <url>` only (plus the global `--db`/`--defs`).
 
 **Which hub gets acted on (`--hub`).** Resolution is deliberately narrow — the
-same stance `agent new` takes, because a binding written against the wrong org
+same stance `agent new` takes, because a route written against the wrong org
 is not undone by a retry, and under live resolution it also moves in-flight
 work:
 
@@ -881,33 +880,33 @@ cannot enumerate the store and you must pass `--hub`.
 
 **Printed JSON.** stdout is exactly one whitelisted JSON document per
 invocation, built from named fields — never a raw hub body — so `| jq` always
-works. Human progress lines (the two `binding rm` warnings) go to stderr only.
+works. Human progress lines (the two `capability unbind` warnings) go to stderr only.
 
 | subcommand | stdout |
 |---|---|
-| `binding new` | `{ "ok": true, "hub": "<origin>", "label": "gpu", "pool": "ml-pool", "alreadyBound": false, "boundPoolCount": 2 }` |
-| `binding rm` | `{ "ok": true, "hub": "<origin>", "label": "gpu", "poolId": "pl_1", "removed": true, "remainingPoolIds": ["pl_2"] }` |
-| `binding list` | `{ "ok": true, "hub": "<origin>", "bindings": [ { "label": "gpu", "poolId": "pl_1", "poolName": "ml-pool", "createdBy": "u_1", "createdAt": 1738000000000 } ] }` |
+| `capability bind` | `{ "ok": true, "hub": "<origin>", "capability": "gpu", "crew": "ml-crew", "alreadyRouted": false, "routedCrewCount": 2 }` |
+| `capability unbind` | `{ "ok": true, "hub": "<origin>", "capability": "gpu", "crewId": "crw_1", "removed": true, "remainingCrewIds": ["crw_2"] }` |
+| `capability list` | `{ "ok": true, "hub": "<origin>", "routes": [ { "capability": "gpu", "crewId": "crw_1", "crewName": "ml-crew", "createdBy": "u_1", "createdAt": 1738000000000 } ] }` |
 
 Every added field carries the **hub's own name**, verbatim — the same words its
 audit log and the web console use — so correlating stdout against them never
 needs a translation step.
 
-- `alreadyBound` (`binding new`) — was this exact `(label, pool)` pair already
+- `alreadyRouted` (`capability bind`) — was this exact `(capability, crew)` pair already
   bound before the call? `false` means the pair was created by it.
-- `boundPoolCount` (`binding new`) — how many **live** pools the label binds
-  after the write. A dangling binding routes nothing and is not counted.
-- `removed` (`binding rm`) — did this call actually remove a pair? `false` is the
+- `routedCrewCount` (`capability bind`) — how many **live** crews the capability binds
+  after the write. A dangling route routes nothing and is not counted.
+- `removed` (`capability unbind`) — did this call actually remove a pair? `false` is the
   tolerant "it was never bound" case, not an error.
-- `remainingPoolIds` (`binding rm`) — the **live** pools the label still binds.
-  `[]` means the label is now **parked**: `jq '.remainingPoolIds | length == 0'`.
+- `remainingCrewIds` (`capability unbind`) — the **live** crews the capability still binds.
+  `[]` means the capability is now **parked**: `jq '.remainingCrewIds | length == 0'`.
   It can be `[]` while a dangling row survives, because such a row routes nothing.
-- `poolId` (`binding rm`) — the pool the hub resolved your `<pool>` argument to.
+- `crewId` (`capability unbind`) — the crew the hub resolved your `<crew>` argument to.
   It is `null` on the tolerant `removed: false` path, where the argument matched
-  neither a live pool name nor one of the label's own binding rows. `binding rm`
-  never prints a pool *name*: `remove_label_binding` does not return one, and
+  neither a live crew name nor one of the capability's own route rows. `capability unbind`
+  never prints a crew *name*: `remove_capability_route` does not return one, and
   inventing one from argv would not be the hub's answer.
-- `label` and `pool` (`binding new`) are the values the **hub** echoed back, not
+- `capability` and `crew` (`capability bind`) are the values the **hub** echoed back, not
   your argv: if the hub normalized either, stdout tells the truth about what was
   stored.
 
@@ -915,126 +914,125 @@ needs a translation step.
 
 | code | meaning |
 |---|---|
-| `0` | the pool was added to the label (or was already bound), the binding was removed (or was already absent), or the bindings were listed |
-| `1` | runtime or hub error — an unknown pool name (`binding new` only; `binding rm` answers a tolerant `removed: false` instead), a label that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
+| `0` | the crew was added to the capability (or was already bound), the route was removed (or was already absent), or the routes were listed |
+| `1` | runtime or hub error — an unknown crew name (`capability bind` only; `capability unbind` answers a tolerant `removed: false` instead), a capability that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
 
-## Pools
+## Crews
 
-A **pool** is an org-scoped queue that agent work is stamped to. Every hub org
-can have, in addition to any pools an admin creates, one **orphan pool** (name
+A **crew** is an org-scoped queue that agent work is stamped to. Every hub org
+can have, in addition to any crews an admin creates, one **orphan crew** (name
 `orphan:unrouted`, `kind: "orphan"`) that the hub itself owns as the landing
-zone for work whose pool was deleted out from under it. It is materialized
-**lazily**, the first time a pool holding stamped work is deleted — an org
-that has never deleted a pool with stamped work has no orphan pool at all, and
-`pool list` shows none. Once it exists, `pool list` includes it — it is
+zone for work whose crew was deleted out from under it. It is materialized
+**lazily**, the first time a crew holding stamped work is deleted — an org
+that has never deleted a crew with stamped work has no orphan crew at all, and
+`crew list` shows none. Once it exists, `crew list` includes it — it is
 marked, never hidden, via a derived `orphan: true` boolean on its row (see the
 Printed JSON table below).
 
-This family is independent of [label bindings](#label-bindings): a label binds
-to a pool by *name*, and a pool is where agent work actually queues. Deleting a
-pool a label still points at does not error — the label's routing simply
+This family is independent of [capability routes](#capability-routes): a capability routes
+to a crew by *name*, and a crew is where agent work actually queues. Deleting a
+crew a capability still points at does not error — the capability's routing simply
 resolves nowhere useful until it is rebound.
 
-### `pool list`
+### `crew list`
 
-`GET /api/pools`, authenticated as your **human** credential. Lists the org's
-pools, each with its member rows (`principalKind`/`principalId`/`addedBy`/
-`addedAt`). An org with no pools at all — including one that has never
-materialized an orphan pool — is still a normal success (exit 0) with an empty
-`pools` array.
+`GET /api/crews`, authenticated as your **human** credential. Lists the org's
+crews, each with its member rows (`principalKind`/`principalId`/`addedBy`/
+`addedAt`). An org with no crews at all — including one that has never
+materialized an orphan crew — is still a normal success (exit 0) with an empty
+`crews` array.
 
-### `pool new <name> --kind personal|shared [--owner <memberId>]`
+### `crew new <name> --kind personal|shared [--owner <memberId>]`
 
-`POST /api/create_pool`, authenticated as your **human** credential; requires
+`POST /api/create_crew`, authenticated as your **human** credential; requires
 the **admin** role on the hub, **or** — for `--kind personal --owner
 <memberId>` where `<memberId>` is the caller's own member id — no admin role
-at all: a human may self-service additional personal pools for themself
+at all: a human may self-service additional personal crews for themself
 without being an admin (`assertPoolMutationAllowed`, hub-core
-`manage-pools.ts:211-214`). Every other combination (a `shared` pool, or a
-`personal` pool owned by someone else) still requires admin. `--kind` is **required** but its value is
+`manage-crews.ts:211-214`). Every other combination (a `shared` crew, or a
+`personal` crew owned by someone else) still requires admin. `--kind` is **required** but its value is
 forwarded to the hub **verbatim and unvalidated** — the hub is the enforcement
 of record for which kind values are legal (today `personal`/`shared`; `orphan`
-is reserved for the hub's own pool). `--owner <memberId>` is optional and is
-omitted from the request body entirely when not given — a `personal` pool
+is reserved for the hub's own crew). `--owner <memberId>` is optional and is
+omitted from the request body entirely when not given — a `personal` crew
 with no owner is the hub's own error to raise, not a client-side rule
 duplicated here.
 
-### `pool rm <poolId>`
+### `crew rm <crewId>`
 
-`POST /api/delete_pool`, authenticated as your **human** credential; requires
-the **admin** role on the hub for every pool kind, including a personal one —
-`deletePool` bypasses the self-service gate that `pool new`/`pool member
-add`/`pool member rm` use, and is admin-only unconditionally
-(`manage-pools.ts:629`). Deletes the pool. The pool's **membership rows are
-deleted outright, not moved** — `deleteAllPoolMembers` (`manage-pools.ts:706`)
+`POST /api/delete_crew`, authenticated as your **human** credential; requires
+the **admin** role on the hub for every crew kind, including a personal one —
+`deletePool` bypasses the self-service gate that `crew new`/`crew member
+add`/`crew member rm` use, and is admin-only unconditionally
+(`manage-crews.ts:629`). Deletes the crew. The crew's **membership rows are
+deleted outright, not moved** — `deleteAllPoolMembers` (`manage-crews.ts:706`)
 runs unconditionally in the same transaction, whether or not any stamps
 transfer; `membersRemoved` on stdout is a count of those deletions, since the
-orphan pool's own membership is derived (always the org's current admins) and
-cannot accept arbitrary members. Only the pool's **run stamps and
-queued/running work** move to the org's orphan pool — memberships are never
+orphan crew's own membership is derived (always the org's current admins) and
+cannot accept arbitrary members. Only the crew's **run stamps and
+queued/running work** move to the org's orphan crew — memberships are never
 among what moves.
 
-**`rm` is idempotent.** Deleting a `<poolId>` that does not exist is a normal
+**`rm` is idempotent.** Deleting a `<crewId>` that does not exist is a normal
 success — the hub answers `200` with `deleted: false` rather than a `404` —
 and the CLI prints this honestly (see below), plus a stderr line naming the
-pool id, rather than inventing an error.
+crew id, rather than inventing an error.
 
-**Like [`binding rm`](#binding-rm-label-pool), `pool rm` prints its tolerant
+**Like [`capability unbind`](#capability-unbind-capability-crew), `crew rm` prints its tolerant
 boolean on stdout** — `deleted` here, `removed` there. Both families report
 honestly whether the call actually changed anything, and both narrate the
 no-op case on stderr, so a script can branch on the boolean and a human reading
 the terminal is told in words.
 
 **The transfer fields are present on stdout if and only if the wire sent
-them** — `membersRemoved`, `orphanPoolId`, `orphanPoolName`,
+them** — `membersRemoved`, `orphanCrewId`, `orphanCrewName`,
 `stampsTransferred`, `runsTransferred` (an array of run ids, not a count), and
 `runningRunsTransferred` (the subset still running, also an array) are never
 defaulted to `0`/`null`/`[]`. Their absence means nothing moved; their
 presence means a transfer happened, and stderr also gets a one-line human
-summary naming the destination pool.
+summary naming the destination crew.
 
-### `pool member add <poolId> <principalKind> <principalId>`
+### `crew member add <crewId> <principalKind> <principalId>`
 
-`POST /api/add_pool_member` authenticated as your **human** credential;
-requires the **admin** role on the hub, **or** the owner of the personal pool
-being acted on (same self-service carve-out as `pool new`, gated on the
-fetched pool row rather than the raw request — `manage-pools.ts:300`). Adds
-`<principalId>` (a member id or an agent id) to the pool as a
+`POST /api/add_crew_member` authenticated as your **human** credential;
+requires the **admin** role on the hub, **or** the owner of the personal crew
+being acted on (same self-service carve-out as `crew new`, gated on the
+fetched crew row rather than the raw request — `manage-crews.ts:300`). Adds
+`<principalId>` (a member id or an agent id) to the crew as a
 `<principalKind>` (`member` or `agent`) member. `<principalKind>` is forwarded
-verbatim and unvalidated, same stance as `--kind` on `pool new`.
+verbatim and unvalidated, same stance as `--kind` on `crew new`.
 
-**The hub refuses this outright against the org's orphan pool, for every
-caller — including an admin.** `assertNotOrphanPool` (`manage-pools.ts:307`)
+**The hub refuses this outright against the org's orphan crew, for every
+caller — including an admin.** `assertNotOrphanPool` (`manage-crews.ts:307`)
 throws before the add ever reaches the membership table, and it is a `400`,
 never a `403`: the refusal is identity-independent (true for every caller, not
 a permissions question), so a `403` would wrongly point the caller at their
-own role. The orphan pool's membership is derived — always the org's current
+own role. The orphan crew's membership is derived — always the org's current
 admins, reconciled automatically on every membership change — and cannot be
 edited directly.
 
-### `pool member rm <poolId> <principalId>`
+### `crew member rm <crewId> <principalId>`
 
-`POST /api/remove_pool_member`, authenticated as your **human** credential;
-requires the **admin** role on the hub, **or** the owner of the personal pool
-being acted on (`manage-pools.ts:356`). Removes `<principalId>` from the pool.
+`POST /api/remove_crew_member`, authenticated as your **human** credential;
+requires the **admin** role on the hub, **or** the owner of the personal crew
+being acted on (`manage-crews.ts:356`). Removes `<principalId>` from the crew.
 
-**`member rm` is idempotent**, mirroring `pool rm`: removing a principal that
-was never a member of `<poolId>` is a normal `200` with `removed: false`, never
+**`member rm` is idempotent**, mirroring `crew rm`: removing a principal that
+was never a member of `<crewId>` is a normal `200` with `removed: false`, never
 a `404`. The CLI prints `removed: false` on stdout and a stderr line naming
-the principal and pool, rather than treating it as an error.
+the principal and crew, rather than treating it as an error.
 
-**Same orphan-pool refusal as `pool member add`.** Targeting the orphan pool
-is a `400` here too (`assertNotOrphanPool`, `manage-pools.ts:363`), for every
+**Same orphan-crew refusal as `crew member add`.** Targeting the orphan crew
+is a `400` here too (`assertNotOrphanPool`, `manage-crews.ts:363`), for every
 caller including an admin, and for the same reason: the membership is derived,
 not editable.
 
-**Flags.** `--hub <url>` only (plus the global `--db`/`--defs`), except `pool
+**Flags.** `--hub <url>` only (plus the global `--db`/`--defs`), except `crew
 new`, which also takes `--kind` (required) and `--owner` (optional).
 
-**Which hub gets acted on (`--hub`).** Identical resolution to the `binding`
-family: `--hub` if given, else the one hub your credential file stores, else
+**Which hub gets acted on (`--hub`).** Identical resolution to the capability-route family: `--hub` if given, else the one hub your credential file stores, else
 exit 2 naming both remedies (and, on a multi-hub machine, listing the stored
 origins). No fallback to `OWENLOOP_HUB`
 or the built-in default hub; hub enumeration is file-store only.
@@ -1045,20 +1043,20 @@ lines (the tolerant-false notices, the transfer summary) go to stderr only.
 
 | subcommand | stdout |
 |---|---|
-| `pool list` | `{ "ok": true, "hub": "<origin>", "pools": [ { "id": "pl_1", "name": "team-a", "kind": "shared", "ownerMemberId": null, "createdBy": "u_1", "createdAt": 1738000000000, "orphan": false, "members": [ { "principalKind": "member", "principalId": "u_2", "addedBy": "u_1", "addedAt": 1738000000000 } ] } ] }` |
-| `pool new` | `{ "ok": true, "hub": "<origin>", "poolId": "pl_1", "name": "team-a", "kind": "shared", "ownerMemberId": null }` |
-| `pool rm` (no transfer) | `{ "ok": true, "hub": "<origin>", "poolId": "pl_1", "deleted": true, "membersRemoved": 2 }` |
-| `pool rm` (with transfer) | `{ "ok": true, "hub": "<origin>", "poolId": "pl_1", "deleted": true, "membersRemoved": 2, "orphanPoolId": "pl_orphan", "orphanPoolName": "orphan:unrouted", "stampsTransferred": 5, "runsTransferred": ["run_1", "run_2"], "runningRunsTransferred": ["run_2"] }` |
-| `pool rm` (unknown id) | `{ "ok": true, "hub": "<origin>", "poolId": "pl_bogus", "deleted": false }` |
-| `pool member add` | `{ "ok": true, "hub": "<origin>", "poolId": "pl_1", "principalKind": "member", "principalId": "u_2" }` |
-| `pool member rm` | `{ "ok": true, "hub": "<origin>", "poolId": "pl_1", "principalId": "u_2", "removed": true }` |
+| `crew list` | `{ "ok": true, "hub": "<origin>", "crews": [ { "id": "crw_1", "name": "team-a", "kind": "shared", "ownerMemberId": null, "createdBy": "u_1", "createdAt": 1738000000000, "orphan": false, "members": [ { "principalKind": "member", "principalId": "u_2", "addedBy": "u_1", "addedAt": 1738000000000 } ] } ] }` |
+| `crew new` | `{ "ok": true, "hub": "<origin>", "crewId": "crw_1", "name": "team-a", "kind": "shared", "ownerMemberId": null }` |
+| `crew rm` (no transfer) | `{ "ok": true, "hub": "<origin>", "crewId": "crw_1", "deleted": true, "membersRemoved": 2 }` |
+| `crew rm` (with transfer) | `{ "ok": true, "hub": "<origin>", "crewId": "crw_1", "deleted": true, "membersRemoved": 2, "orphanCrewId": "crw_orphan", "orphanCrewName": "orphan:unrouted", "stampsTransferred": 5, "runsTransferred": ["run_1", "run_2"], "runningRunsTransferred": ["run_2"] }` |
+| `crew rm` (unknown id) | `{ "ok": true, "hub": "<origin>", "crewId": "crw_bogus", "deleted": false }` |
+| `crew member add` | `{ "ok": true, "hub": "<origin>", "crewId": "crw_1", "principalKind": "member", "principalId": "u_2" }` |
+| `crew member rm` | `{ "ok": true, "hub": "<origin>", "crewId": "crw_1", "principalId": "u_2", "removed": true }` |
 
 **Exit codes.**
 
 | code | meaning |
 |---|---|
-| `0` | the pool/membership was listed, created, removed (or was already absent) |
-| `1` | runtime or hub error — an unknown pool id on a member add/rm, a pool with active work refusing deletion, a `403` for a non-admin, a malformed response, or a network timeout |
+| `0` | the crew/membership was listed, created, removed (or was already absent) |
+| `1` | runtime or hub error — an unknown crew id on a member add/rm, a crew with active work refusing deletion, a `403` for a non-admin, a malformed response, or a network timeout |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
 
@@ -1105,7 +1103,7 @@ to connect this machine to:
   The name is a suggestion — any label matching `[A-Za-z0-9][A-Za-z0-9._-]*`
   (1–64 chars) is accepted. It then **mints** that Scoped Identity.
 - **Flow B — org already has Scoped Identities (succession):** setup shows the existing
-  Scoped Identities (each with its name, when it was **last active**, and its **pools**)
+  Scoped Identities (each with its name, when it was **last active**, and its **crews**)
   and asks whether this is a *new* installation or one that *replaces* an
   existing Scoped Identity. Choosing **new** mints a fresh Scoped Identity; choosing **replace**
   **rekeys** the chosen Scoped Identity — which **revokes that Scoped Identity's current
@@ -1121,13 +1119,13 @@ prompt — it errors unless you pre-decide with one of:
 - `--replace-agent <name>` — rekey the existing Scoped Identity named `<name>` (skips the
   succession prompt); errors if no such Scoped Identity exists on the hub.
 
-The two flags are mutually exclusive. `--pools <a,b>` applies **only** to a mint
+The two flags are mutually exclusive. `--crews <a,b>` applies **only** to a mint
 (`--new-agent` or a fresh org); combining it with `--replace-agent` is a usage
-error, because rekeying preserves the Scoped Identity's existing pools (manage those in
+error, because rekeying preserves the Scoped Identity's existing crews (manage those in
 the console). `--scopes <a,b>` likewise applies **only** to a mint — it selects
 the minted token's scopes (default `work`); combining it with `--replace-agent`
 is a usage error, because rekeying preserves the Scoped Identity's existing scopes (mint a
-new Scoped Identity to change scopes). `setup` has no `--conductor` shorthand — spell the
+new Scoped Identity to change scopes). `setup` has no `--shift` shorthand — spell the
 scopes out with `--scopes work,run`.
 
 ### Hub resolution differs from `agent new`
@@ -1244,8 +1242,8 @@ other command.
 ### Tools
 
 The server exposes 17 baseline tools mirroring the hub's own MCP toolset, plus
-`create_agent`, plus four [pool](#pools) tools (`list_pools`, `create_pool`,
-`add_pool_member`, `remove_pool_member`) that do not mirror the hub's own MCP
+`create_agent`, plus four [crew](#crews) tools (`list_crews`, `create_crew`,
+`add_crew_member`, `remove_crew_member`) that do not mirror the hub's own MCP
 toolset. Each baseline tool's result is the hub REST response as one text
 block; a non-2xx response comes back as an error result.
 
@@ -1265,30 +1263,30 @@ block; a non-2xx response comes back as an error result.
 | `release` | give back a claim so its order is re-offered without waiting out the reap TTL |
 | `publish_event` | publish an event against a contract, starting one run per matched subscription |
 | `list_subscriptions` | the org's contract subscriptions |
-| `presence_ping` | register/refresh this Conductor's presence — name, pools served (empty/omitted `serve_pools` means every pool this principal belongs to), and optionally which process incarnation is reporting (`conductor_id`/`started_at`); observability only, a separate mechanism from the `heartbeat` lease tool above |
-| `list_conductors` | your principal's registered Conductors — online/offline derived at read time from last ping, pools served (returned as `labels`; empty means every pool this principal belongs to), and each one's reporting incarnation (`conductorId`/`startedAt`) when the hub recorded one |
+| `presence_ping` | register/refresh this Shift's presence — name, crews served (empty/omitted `serve_crews` means every crew this principal belongs to), and optionally which process incarnation is reporting (`shift_id`/`started_at`); observability only, a separate mechanism from the `heartbeat` lease tool above |
+| `list_shifts` | your principal's registered Conductors — online/offline derived at read time from last ping, crews served (returned as `crews`; empty means every crew this principal belongs to), and each one's reporting incarnation (`shiftId`/`startedAt`) when the hub recorded one |
 | `wake` | cheap "has anything changed since cursor X" pre-check for a polling loop |
 | `create_agent` | create a NEW Scoped Identity and store its credential locally — **never returns the token** |
-| `list_pools` | list the org's pools, each with its member rows inline — a plain passthrough, no filtering |
-| `create_pool` | create a pool (`name`, `kind`, optional `ownerMemberId`) |
-| `add_pool_member` | add a member or agent principal to a pool |
-| `remove_pool_member` | remove a principal from a pool (tolerant: removing a non-member is a normal result, not an error) |
+| `list_crews` | list the org's crews, each with its member rows inline — a plain passthrough, no filtering |
+| `create_crew` | create a crew (`name`, `kind`, optional `ownerMemberId`) |
+| `add_crew_member` | add a member or agent principal to a crew |
+| `remove_crew_member` | remove a principal from a crew (tolerant: removing a non-member is a normal result, not an error) |
 
-`create_agent {name, pools?, scopes?}` mints a fresh Scoped Identity on the hub
+`create_agent {name, crews?, scopes?}` mints a fresh Scoped Identity on the hub
 with `work` scope by default; pass `scopes` (e.g. `["work","run"]`) to choose the
 minted token's scopes. It then writes the minted `olp_` token straight to this
 machine's credential store (slot `agent:<name>`). The token is **never** returned in the
-tool result, printed, or logged — the result is `{name, pools, stored: true}`,
+tool result, printed, or logged — the result is `{name, crews, stored: true}`,
 built from scratch. It refuses a name that is already taken (the hub's error
 message is surfaced verbatim; error bodies never carry tokens). If the store
 write fails, the result says so and tells you to revoke/re-key the agent from
 the console.
 
-**The four pool tools** (`list_pools`, `create_pool`, `add_pool_member`,
-`remove_pool_member`) cover the same four operations as the [`pool` CLI
-family](#pools) — `pool list`, `pool new`, `pool member add`, `pool member
+**The four crew tools** (`list_crews`, `create_crew`, `add_crew_member`,
+`remove_crew_member`) cover the same four operations as the [`crew` CLI
+family](#crews) — `crew list`, `crew new`, `crew member add`, `crew member
 rm` — over the same `/api/*` routes and the same RBAC, but they are not an
-exact mirror of it: `pool rm` (pool deletion) has no MCP counterpart at all
+exact mirror of it: `crew rm` (crew deletion) has no MCP counterpart at all
 (see below), and where the CLI narrows each hub response into one
 whitelisted JSON document per invocation (`asPools`, `asPoolCreated`, etc.,
 so `| jq` always works), these MCP tools are plain passthroughs — the raw
@@ -1297,27 +1295,27 @@ argument schema deliberately has **no `enum`** on `kind`/`principalKind`,
 since the hub, not this client, is the enforcement of record for which
 values are legal.
 
-Access is **not uniformly admin-only**: `create_pool`, `add_pool_member`, and
-`remove_pool_member` all carry the same self-service carve-out as their CLI
-counterparts — a human acting on a **personal pool they own** needs no admin
+Access is **not uniformly admin-only**: `create_crew`, `add_crew_member`, and
+`remove_crew_member` all carry the same self-service carve-out as their CLI
+counterparts — a human acting on a **personal crew they own** needs no admin
 role at all (`assertPoolMutationAllowed`); every other target (a `shared`
-pool, or a `personal` pool owned by someone else) still requires the admin
-role. `list_pools` is readable by any of `admin`/`author`/`operator`.
-`remove_pool_member` is **tolerant**: removing a principal that was never a
+crew, or a `personal` crew owned by someone else) still requires the admin
+role. `list_crews` is readable by any of `admin`/`author`/`operator`.
+`remove_crew_member` is **tolerant**: removing a principal that was never a
 member is a normal `200` result with `removed: false`, never a tool error.
-`add_pool_member` is **not** tolerant the same way — adding a principal that
+`add_crew_member` is **not** tolerant the same way — adding a principal that
 is already a member is a hub error, mapped to an `isError` result. Both
-`add_pool_member` and `remove_pool_member` refuse the org's orphan pool
+`add_crew_member` and `remove_crew_member` refuse the org's orphan crew
 (`orphan:unrouted`) as a `400`, never a `403` — the refusal is
-identity-independent (it objects to the target pool, not the caller's role),
-since that pool's membership is derived from the org's current admins and
+identity-independent (it objects to the target crew, not the caller's role),
+since that crew's membership is derived from the org's current admins and
 cannot be edited directly.
 
-**`delete_pool` is deliberately NOT a tool here.** Deleting a pool is a
+**`delete_crew` is deliberately NOT a tool here.** Deleting a crew is a
 one-way-door operation gated admin-only unconditionally on the hub (unlike
 the other three verbs, which have the self-service carve-out above), and it
-was excluded from this MCP surface by design. `owenloop pool rm` on the CLI
-remains the only way to delete a pool; removing a single **member** (above)
+was excluded from this MCP surface by design. `owenloop crew rm` on the CLI
+remains the only way to delete a crew; removing a single **member** (above)
 is a different, reversible operation and stays in scope for MCP.
 
 One further tool, `stage_enrollment`, is **conditionally** registered — it
@@ -1492,17 +1490,17 @@ is the earliest wake across all levels. A folded deferral in the deep result
 carries its own `workflow` (absent = the root you ticked, present = a
 descendant).
 
-**Label routing (`--label`).** `tick <wf> --label <l>` (repeatable) filters
-which steps this caller claims, but only steps that carry their own `labels:`
-are ever excluded: a step is deferred with reason `label-mismatch` and left for
-another caller **only** when its `labels:` are non-empty and share no value with
-the filter you pass. A step with no `labels:` is claimed by every caller,
-filtered or not, and a tick that passes no `--label` claims every eligible step
-regardless of labels. This is **routing, not
+**Capability routing (`--capability`).** `tick <wf> --capability <l>` (repeatable) filters
+which steps this caller claims, but only steps that carry their own `capabilities:`
+are ever excluded: a step is deferred with reason `capability-mismatch` and left for
+another caller **only** when its `capabilities:` are non-empty and share no value with
+the filter you pass. A step with no `capabilities:` is claimed by every caller,
+filtered or not, and a tick that passes no `--capability` claims every eligible step
+regardless of capabilities. This is **routing, not
 authorization**: any caller that can reach the database can tick without a
-filter and claim anything, so labels split work across cooperating
+filter and claim anything, so capabilities split work across cooperating
 orchestrators, they never enforce a boundary. See
-[`labels:`](authoring.md#labels--logical-capability-tags) in
+[`capabilities:`](authoring.md#capabilities--logical-capability-tags) in
 the authoring guide for the step-side declaration and the starvation hazard to
 watch for.
 
@@ -1510,7 +1508,7 @@ watch for.
 `child: { workflow, def, done, stalled, debts }` summary once a child has been
 spawned. `child.stalled: true` means the child (or a grandchild below it) has a
 Step Agent stuck at `maxAttempts` with no green outcome — the parent debt is blocked
-on stuck child work. This lets a Conductor spot a wedged child from the parent
+on stuck child work. This lets a Shift spot a wedged child from the parent
 `status` alone, without separately walking into the child's own `status`.
 
 **`wait --until` is single-instance.** `wait <wf> --until eligible|done` polls

@@ -1,9 +1,9 @@
 /**
- * A2 — worker-label claim filter tests.
+ * A2 — capability claim filter tests.
  *
- * A tick caller may pass an optional `labels` filter; a step may declare its own
- * `labels`. A firing is claimable iff the caller passes no filter, OR the step
- * declares no labels, OR the two sets intersect. Disjoint → the firing is
+ * A tick caller may pass an optional `capabilities` filter; a step may declare its own
+ * `capabilities`. A firing is claimable iff the caller passes no filter, OR the step
+ * declares no capabilities, OR the two sets intersect. Disjoint → the firing is
  * deferred as `'capability-mismatch'` and left for a matching caller. The deep tick
  * threads the same filter into `calls:` children.
  */
@@ -27,7 +27,7 @@ function makeEngine(defs: WorkflowDef[]): { engine: Engine; store: Store } {
   return { engine, store };
 }
 
-// A def with a labeled step, a differently-labeled step, and an unlabeled one —
+// A def with a capability-routed step, a differently-capability-routed step, and an without capabilities one —
 // all three eligible off the same seeded input.
 const mixedDef = def(
   'mixed',
@@ -51,15 +51,15 @@ test('capabilities: no caller filter claims every eligible firing, labeled or no
   assert.equal(t.deferred.filter((d) => d.reason === 'capability-mismatch').length, 0);
 });
 
-// ---- Test 2: filter claims intersecting + unlabeled, defers disjoint ----------
+// ---- Test 2: filter claims intersecting + without capabilities, defers disjoint ----------
 
-test('capabilities: filter claims matching + unlabeled steps, defers the disjoint one', () => {
+test('capabilities: filter claims matching + uncapability-routed steps, defers the disjoint one', () => {
   const { engine } = makeEngine([mixedDef]);
   const wf = engine.createInstance('mixed');
 
   const t = engine.tick(wf, { now: 0, capabilities: ['x'] });
   const claimed = t.orders.map((o) => o.step).sort();
-  // alpha (labels ['x'] intersect) + gamma (no labels = universal); beta deferred.
+  // alpha (capabilities ['x'] intersect) + gamma (no capabilities = universal); beta deferred.
   assert.deepEqual(claimed, ['alpha', 'gamma']);
 
   const mismatches = t.deferred.filter((d) => d.reason === 'capability-mismatch');
@@ -69,7 +69,7 @@ test('capabilities: filter claims matching + unlabeled steps, defers the disjoin
 
 // ---- Test 3: any-overlap intersection claims (["a","b"] vs ["b","c"]) ---------
 
-test('capabilities: partial overlap between filter and step labels claims', () => {
+test('capabilities: partial overlap between filter and step capabilities claims', () => {
   const overlapDef = def(
     'overlap',
     [input('proposal')],
@@ -94,14 +94,14 @@ test('capabilities: disjoint firing defers, then a matching caller claims it', (
   const { engine } = makeEngine([soloDef]);
   const wf = engine.createInstance('solo');
 
-  // A caller serving only 'x' must not claim the 'y' step.
+  // A caller/Shift serving only 'x' must not claim the 'y' step.
   const t1 = engine.tick(wf, { now: 0, capabilities: ['x'] });
   assert.equal(t1.orders.length, 0, 'disjoint caller claims nothing');
   const mismatch = t1.deferred.find((d) => d.reason === 'capability-mismatch');
-  assert.ok(mismatch, 'the firing is reported as label-mismatch, not silently dropped');
+  assert.ok(mismatch, 'the firing is reported as capability-mismatch, not silently dropped');
   assert.equal(mismatch!.step, 'beta');
 
-  // A caller serving 'y' claims the same firing on a later tick.
+  // A caller/Shift serving 'y' claims the same firing on a later tick.
   const t2 = engine.tick(wf, { now: 1, capabilities: ['y'] });
   assert.equal(t2.orders.length, 1);
   assert.equal(t2.orders[0]!.step, 'beta');
@@ -148,19 +148,19 @@ test('capabilities: deep tick threads the filter into a calls: child — no cros
   const { engine, store } = makeEngine([childLabeledDef, parentCallsDef]);
   const parentWf = engine.createInstance('parentCalls');
 
-  // A conductor serving only 'codex' ticks deep. The child spawns (machine-
+  // A Shift serving only 'codex' ticks deep. The child spawns (machine-
   // handled, filter-independent) but its 'claude' runner must NOT be claimed.
   const t1 = engine.tick(parentWf, { now: 0, capabilities: ['codex'] });
   const child = store.findChildByParent(parentWf, 'delivered');
-  assert.ok(child, 'child instance is spawned regardless of the label filter');
-  assert.ok(t1.orders.every((o) => o.step !== 'runner'), 'mismatched conductor does not cross-claim the child runner');
+  assert.ok(child, 'child instance is spawned regardless of the capability filter');
+  assert.ok(t1.orders.every((o) => o.step !== 'runner'), 'mismatched Shift does not cross-claim the child runner');
   const childMismatch = t1.deferred.find((d) => d.reason === 'capability-mismatch' && d.step === 'runner');
   assert.ok(childMismatch, 'the child runner is reported deferred');
   assert.equal(childMismatch!.workflow, child!.id, 'the deferral is stamped with the child workflow id');
 
-  // A conductor serving 'claude' claims the child runner on a later deep tick.
+  // A Shift serving 'claude' claims the child runner on a later deep tick.
   const t2 = engine.tick(parentWf, { now: 1, capabilities: ['claude'] });
   const runnerOrder = t2.orders.find((o) => o.step === 'runner');
-  assert.ok(runnerOrder, 'matching conductor claims the child runner');
+  assert.ok(runnerOrder, 'matching Shift claims the child runner');
   assert.equal(runnerOrder!.workflow, child!.id);
 });

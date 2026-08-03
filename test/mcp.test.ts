@@ -94,7 +94,7 @@ test('mcp: handshake advertises 22 tools (17 baseline + create_agent + 4 crew to
   assert.ok(names.includes('create_agent'));
   assert.ok(!names.includes('stage_enrollment'));
   // Sanity: the 17 baseline names are all present.
-  for (const n of ['whats_next', 'submit', 'reject_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_conductors', 'wake']) {
+  for (const n of ['whats_next', 'submit', 'reject_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'wake']) {
     assert.ok(names.includes(n), `missing ${n}`);
   }
   // The four crew tools are all present.
@@ -184,7 +184,7 @@ test('mcp: get_workflow encodes the name into the GET path', async () => {
   assert.ok(!calls.some((c) => c.pathname === '/api/workflows/a/b'), 'the name must not split into two path segments');
 });
 
-test('mcp: presence_ping advertises optional conductor_id/started_at (schema parity) and the passthrough forwards them snake_case, unchanged for existing calls', async () => {
+test('mcp: presence_ping advertises optional shift_id/started_at (schema parity) and the passthrough forwards them snake_case, unchanged for existing calls', async () => {
   const routes: Record<string, RouteHandler> = {
     'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
     'POST /api/presence_ping': () => ({ status: 200, json: { ok: true } }),
@@ -196,7 +196,7 @@ test('mcp: presence_ping advertises optional conductor_id/started_at (schema par
   const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
     INIT,
     LIST,
-    call(3, 'presence_ping', { name: 'c1', conductor_id: 'cnd_x', started_at: 123 }),
+    call(3, 'presence_ping', { name: 'c1', shift_id: 'shf_x', started_at: 123 }),
     call(4, 'presence_ping', { name: 'c1' }),
   ]);
 
@@ -204,7 +204,7 @@ test('mcp: presence_ping advertises optional conductor_id/started_at (schema par
   // (required/additionalProperties) is byte-identical to before.
   const tools = (frames[1]!.result as { tools: Array<{ name: string; inputSchema: { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean } }> }).tools;
   const ping = tools.find((x) => x.name === 'presence_ping')!;
-  assert.ok('conductor_id' in ping.inputSchema.properties, 'conductor_id advertised');
+  assert.ok('shift_id' in ping.inputSchema.properties, 'shift_id advertised');
   assert.ok('started_at' in ping.inputSchema.properties, 'started_at advertised');
   assert.deepEqual(ping.inputSchema.required, ['name']);
   assert.equal(ping.inputSchema.additionalProperties, false);
@@ -212,7 +212,7 @@ test('mcp: presence_ping advertises optional conductor_id/started_at (schema par
   const pings = calls.filter((c) => c.pathname === '/api/presence_ping');
   assert.equal(pings.length, 2);
   // Highest-risk detail: request fields are snake_case and must survive the verbatim passthrough.
-  assert.deepEqual(JSON.parse(pings[0]!.body!), { name: 'c1', conductor_id: 'cnd_x', started_at: 123 });
+  assert.deepEqual(JSON.parse(pings[0]!.body!), { name: 'c1', shift_id: 'shf_x', started_at: 123 });
   // Omitting the new fields still posts exactly the old shape — no keys added.
   assert.deepEqual(JSON.parse(pings[1]!.body!), { name: 'c1' });
 });
@@ -224,7 +224,7 @@ test('mcp: list_crews is a plain GET passthrough — the full body (including th
     text: '2 crews',
     crews: [
       {
-        id: 'pl_1',
+        id: 'crw_1',
         name: 'alex-personal',
         kind: 'personal',
         ownerMemberId: 'mem_alex',
@@ -235,7 +235,7 @@ test('mcp: list_crews is a plain GET passthrough — the full body (including th
         // `id` is a normal randomId() — NOT the reserved name — per
         // owenloop-service manage-crews.ts's `ensureOrphanCrew`; the reserved
         // NAME (`ORPHAN_CREW_NAME`) is what `orphan:` prefixes, at :104.
-        id: 'pl_orphan',
+        id: 'crw_orphan',
         name: 'orphan:unrouted',
         kind: 'orphan',
         ownerMemberId: null,
@@ -295,19 +295,19 @@ test('mcp: add_crew_member forwards crewId/principalKind/principalId unchanged a
     'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
     'POST /api/add_crew_member': () => ({
       status: 200,
-      json: { text: 'member added', member: { crewId: 'pl_1', principalKind: 'agent', principalId: 'agt_1' } },
+      json: { text: 'member added', member: { crewId: 'crw_1', principalKind: 'agent', principalId: 'agt_1' } },
     }),
   };
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch });
   seedHuman(t);
 
-  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'add_crew_member', { crewId: 'pl_1', principalKind: 'agent', principalId: 'agt_1' })]);
-  assert.deepEqual(resultJson(frames[1]!), { text: 'member added', member: { crewId: 'pl_1', principalKind: 'agent', principalId: 'agt_1' } });
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'add_crew_member', { crewId: 'crw_1', principalKind: 'agent', principalId: 'agt_1' })]);
+  assert.deepEqual(resultJson(frames[1]!), { text: 'member added', member: { crewId: 'crw_1', principalKind: 'agent', principalId: 'agt_1' } });
 
   const posts = calls.filter((c) => c.pathname === '/api/add_crew_member');
   assert.equal(posts.length, 1);
-  assert.deepEqual(JSON.parse(posts[0]!.body!), { crewId: 'pl_1', principalKind: 'agent', principalId: 'agt_1' });
+  assert.deepEqual(JSON.parse(posts[0]!.body!), { crewId: 'crw_1', principalKind: 'agent', principalId: 'agt_1' });
 });
 
 test('mcp: remove_crew_member — a tolerant hub 200 {removed:false} (never-a-member) is a NORMAL result, never turned into a tool error', async () => {
@@ -315,21 +315,21 @@ test('mcp: remove_crew_member — a tolerant hub 200 {removed:false} (never-a-me
     'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
     'POST /api/remove_crew_member': () => ({
       status: 200,
-      json: { text: 'not a member', crewId: 'pl_1', principalId: 'mem_never', removed: false },
+      json: { text: 'not a member', crewId: 'crw_1', principalId: 'mem_never', removed: false },
     }),
   };
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch });
   seedHuman(t);
 
-  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'remove_crew_member', { crewId: 'pl_1', principalId: 'mem_never' })]);
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'remove_crew_member', { crewId: 'crw_1', principalId: 'mem_never' })]);
   // The hub's tolerant semantics (200, removed:false) must NOT be reinterpreted as an error here.
   assert.equal(frames[1]!.result!.isError, undefined, 'a tolerant removed:false is a normal (non-error) result');
-  assert.deepEqual(resultJson(frames[1]!), { text: 'not a member', crewId: 'pl_1', principalId: 'mem_never', removed: false });
+  assert.deepEqual(resultJson(frames[1]!), { text: 'not a member', crewId: 'crw_1', principalId: 'mem_never', removed: false });
 
   const posts = calls.filter((c) => c.pathname === '/api/remove_crew_member');
   assert.equal(posts.length, 1);
-  assert.deepEqual(JSON.parse(posts[0]!.body!), { crewId: 'pl_1', principalId: 'mem_never' });
+  assert.deepEqual(JSON.parse(posts[0]!.body!), { crewId: 'crw_1', principalId: 'mem_never' });
 });
 
 test('mcp: a hub 400 orphan-crew refusal on a crew tool maps to isError (non-2xx still becomes an error, unlike the tolerant remove case)', async () => {
@@ -357,7 +357,7 @@ test('mcp: a hub 400 orphan-crew refusal on a crew tool maps to isError (non-2xx
   // is a normal `randomId()`. A plausible id is used here for the argument; it is
   // the tool's REQUEST shape, distinct from the hub's error message above, which
   // names the crew by its NAME (mirroring `crew.name` in `assertNotOrphanCrew`).
-  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'add_crew_member', { crewId: 'pl_orphan', principalKind: 'member', principalId: 'mem_x' })]);
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'add_crew_member', { crewId: 'crw_orphan', principalKind: 'member', principalId: 'mem_x' })]);
   assert.equal(frames[1]!.result!.isError, true);
   assert.deepEqual(resultJson(frames[1]!), { error: 'crew_invalid', message: orphanMessage });
 });
@@ -417,7 +417,7 @@ test('mcp: create_agent stores the minted olp_ token and NEVER echoes any byte o
     token: SECRET,
     agentId: 'agt_1',
     crews: ['alex-personal'],
-    crewIds: ['pl_1'],
+    crewIds: ['crw_1'],
   };
   const routes: Record<string, RouteHandler> = {
     'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
@@ -449,7 +449,7 @@ test('mcp: create_agent stores the minted olp_ token and NEVER echoes any byte o
 test('mcp: create_agent honors a passed scopes array in the mint body', async () => {
   const routes: Record<string, RouteHandler> = {
     'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
-    'POST /api/mint_agent_token': () => ({ status: 200, json: { token: 'olp_conductor_tok', crews: [] } }),
+    'POST /api/mint_agent_token': () => ({ status: 200, json: { token: 'olp_Shift_tok', crews: [] } }),
   };
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch });

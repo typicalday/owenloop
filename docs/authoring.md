@@ -78,12 +78,12 @@ steps:
                                #   to the engine, passed through on the order
                                #   (see below)
     workdir: …                 # opaque hint passed through on the order; omitted when unset
-    worker: agent               # opaque executor label (default: agent); see below
-    command: …                  # required when worker: command; opaque, never shelled out
+    executor: agent               # opaque executor value (default: agent); see below
+    command: …                  # required when executor: command; opaque, never shelled out
     spec:                       # optional opaque config map, shape-checked like x: (a plain map)
       anything: goes            #   contents never read by the engine; see below
-    labels: [nightly, batch]    # optional routing labels for peer-orchestrator
-                                #   claim filtering (tick --label); empty = absent; see below
+    capabilities: [nightly, batch]    # optional routing capabilities for peer-orchestrator
+                                #   claim filtering (tick --capability); empty = absent; see below
     x:                          # optional; opaque extension map, passed through
       anything: goes            #   untouched onto the order (Order.x); see design.md §27.3
 ```
@@ -112,14 +112,14 @@ a literal model id. Pin an exact model when you need reproducibility — just
 know the def is now host-specific, on purpose. Omit `model:` entirely and the
 dispatcher uses its default.
 
-## `worker:` — declaring the executor
+## `executor:` — declaring the executor
 
 Every step in every def written before this feature dispatches to an LLM
-agent — that's still the default, and omitting `worker:` entirely leaves a
-def byte-for-byte unchanged. `worker:` lets a step opt into a *different*
+agent — that's still the default, and omitting `executor:` entirely leaves a
+def byte-for-byte unchanged. `executor:` lets a step opt into a *different*
 kind of executor instead: a shell command, a webhook, a browser-automation
 runner, anything a dispatcher on the other end of `tick` knows how to run.
-The engine never executes anything itself — `worker:` is an opaque label
+The engine never executes anything itself — `executor:` is an opaque field
 that rides the order (same pass-through contract as `model`) for whatever
 drives your Step Agents to switch on.
 
@@ -128,111 +128,111 @@ steps:
   - name: tester
     consumes: [reviewed_plan]
     produces: [result]
-    worker: command              # opaque to the engine; default is 'agent'
-    command: npm test            # required when worker: command; never parsed or shelled out
+    executor: command              # opaque to the engine; default is 'agent'
+    command: npm test            # required when executor: command; never parsed or shelled out
     spec:                        # optional opaque config for the dispatcher
       timeout: 300
       workdir: .
-    body: ""                     # not required for worker: command
+    body: ""                     # not required for executor: command
 ```
 
 Two shape rules, both enforced at load time, everything else opaque:
 
-- **`worker: command` requires `command:`.** A `command`-worker step with no
+- **`executor: command` requires `command:`.** A `command`-executor step with no
   `command:` is a load-time `DefError` — the dispatcher would have nothing to
   run.
-- **`worker: agent` (explicit) requires a real `body:`.** Omitting `worker:`
+- **`executor: agent` (explicit) requires a real `body:`.** Omitting `executor:`
   still defaults to `'agent'` and still needs no body-shape check beyond
   today's behavior — this rule only fires when a step *explicitly* writes
-  `worker: agent` and leaves `body:` empty, which is almost certainly a
+  `executor: agent` and leaves `body:` empty, which is almost certainly a
   mistake (an agent step with no prompt).
 
-Any other `worker` value (`browser-automation`, `webhook`, your own label) is
+Any other `executor` value (`browser-automation`, `webhook`, your own executor value) is
 fully opaque — no `body:`/`command:` requirement at all. A definition can
-optionally declare `workers: [agent, command]` at the top level as a typo
+optionally declare `executors: [agent, command]` at the top level as a typo
 guard; when present, `validateDef` rejects any step (or judge — see below)
-whose effective worker (after the `agent` default) isn't in the list:
+whose effective executor (after the `agent` default) isn't in the list:
 
 ```yaml
 name: my-workflow
-workers: [agent, command]   # optional allow-list; absent = any worker string accepted
+executors: [agent, command]   # optional allow-list; absent = any executor string accepted
 ```
 
 `command:` and `spec:` are opaque the same way `x:` is: `command` is
 shape-checked as a string, `spec` as a plain map, and neither is ever read or
-interpreted by the engine beyond that. All three (`worker`, `command`,
+interpreted by the engine beyond that. All three (`executor`, `command`,
 `spec`) ride through `buildOrder` onto the emitted `Order` untouched, exactly
 like `model` and `workdir`. See [`docs/design.md` §27.4](design.md) for the
 full contract.
 
-## `labels:` — logical capability tags
+## `capabilities:` — logical capability tags
 
-`labels:` is an optional list of strings on a step naming what that step
+`capabilities:` is an optional list of strings on a step naming what that step
 *needs* — `gpu`, `repo-access` — not where it runs. They are part of **your**
 vocabulary as a def author: a capability tag, chosen to describe the work.
-An empty `labels:` list normalizes to absent.
+An empty `capabilities:` list normalizes to absent.
 
-**Never write a pool name in a def.** A pool is a deployment fact belonging to
+**Never write a crew name in a def.** A crew is a deployment fact belonging to
 one org on one hub; a def is portable. The indirection below is what keeps the
 two apart.
 
-**Golden path: most defs need no labels at all.** An **unlabeled** step routes
-to the run's `defaultPool` param if one was given, else to the starter's
-personal pool. That is the default path, and it is the right one until you have
-a fleet with genuinely different machines in it. Labels and bindings are the
-"advanced: teams & fleets" path — reach for a label only when a step needs a
+**Golden path: most defs need no capabilities at all.** A step **without capabilities** routes
+to the run's `defaultCrew` param if one was given, else to the starter's
+personal crew. That is the default path, and it is the right one until you have
+a fleet with genuinely different machines in it. Capabilities and routes are the
+"advanced: teams & fleets" path — reach for a capability only when a step needs a
 *specific* kind of machine.
 
-### On a hub: an admin binds each label to a pool
+### On a hub: an admin binds each capability to a crew
 
-On a hub, every label a step uses must be **bound to at least one pool by an org
-admin** — `owenloop binding new <label> <pool>`, or Console → Settings → Labels.
-A label may bind several pools, and each `binding new` ADDS one. See
-[label bindings](cli.md#label-bindings) for the commands.
+On a hub, every capability a step uses must be **bound to at least one crew by an org
+admin** — `owenloop capability bind <capability> <crew>`, or Console → Settings → Capabilities.
+A capability may bind several crews, and each `capability bind` ADDS one. See
+[capability routes](cli.md#capability-routes) for the commands.
 
-- **An unbound label fails the run at `start_run`**, with an error naming the
-  label and carrying the exact fix command. That fail-fast is deliberate: the
-  old behavior was an order that sat unserved forever. Binding is **explicit
-  only** — there is no implicit fallback in which an unbound label routes
+- **An unbound capability fails the run at `start_run`**, with an error naming the
+  capability and carrying the exact fix command. That fail-fast is deliberate: the
+  old behavior was an order that sat unserved forever. Route is **explicit
+  only** — there is no implicit fallback in which an unbound capability routes
   somewhere by itself.
-- **Bindings are live, and that is the headline.** Adding a pool to a label
+- **Routes are live, and that is the headline.** Adding a crew to a capability
   widens who serves it at the next poll of every in-flight run; removing the
-  label's **last live** binding pauses the steps that use it until it is bound
+  capability's **last live** route pauses the steps that use it until it is bound
   again. As an author this means your def does **not** need re-publishing when
-  the fleet moves: the operator ADDS the new pool — from that moment both pools
-  serve the label — and then REMOVES the old one, and your running work follows
+  the fleet moves: the operator ADDS the new crew — from that moment both crews
+  serve the capability — and then REMOVES the old one, and your running work follows
   across without a restart.
 
-### Locally: labels are a tick filter
+### Locally: capabilities are a tick filter
 
-The local/OSS engine has no binding table; there, the same labels act as a
+The local/OSS engine has no capability route table; there, the same capabilities act as a
 work-splitting filter so several orchestrators ticking the *same* database can
-divide the work. A tick caller may pass one or more `--label <x>` filters (CLI)
-or `engine.tick(wf, { labels: [...] })` (embedding), and a step is left for a
+divide the work. A tick caller may pass one or more `--capability <x>` filters (CLI)
+or `engine.tick(wf, { capabilities: [...] })` (embedding), and a step is left for a
 *different* caller only when **both** the caller's filter and the step's own
-`labels:` are non-empty and share no value — that step's firings defer with
-reason `label-mismatch` until a caller whose filter matches (or a caller with
+`capabilities:` are non-empty and share no value — that step's firings defer with
+reason `capability-mismatch` until a caller whose filter matches (or a caller with
 no filter at all) ticks it.
 
-Labels are logical tags in both worlds; only the hub adds the binding
+Capabilities are logical tags in both worlds; only the hub adds the route
 indirection. Two consequences of the local filter are worth stating plainly:
 
 - **Routing, not authorization.** A caller that passes *no* filter claims every
-  step, labeled or not — and any Step Agent that can reach the database can tick
-  without a filter. Locally, labels are a work-splitting convenience, never a security
+  step, with capabilities or not — and any Step Agent that can reach the database can tick
+  without a filter. Locally, capabilities are a work-splitting convenience, never a security
   boundary; never rely on them to keep a step away from a Step Agent that shouldn't
   run it.
-- **Starvation hazard.** If every live caller ticks with a label filter and
-  none of them intersects a given step's labels, that step's orders sit
-  deferred forever with `label-mismatch` — no caller ever claims them.
-  Operators running labeled callers should monitor the deferred/blocked entries
+- **Starvation hazard.** If every live caller ticks with a capability filter and
+  none of them intersects a given step's capabilities, that step's orders sit
+  deferred forever with `capability-mismatch` — no caller ever claims them.
+  Operators running capability-filtered callers should monitor the deferred/blocked entries
   (each folded deferral in a `TickResult` carries its `reason`) so a
   permanently unclaimed step is caught rather than silently stuck.
 
-`labels:` is distinct from [`worker:`](#worker--declaring-the-executor):
-`worker:` says what *kind* of executor should run an order once it's claimed;
-`labels:` says *which* caller may claim it in the first place — a tick filter
-locally, a bound pool on a hub.
+`capabilities:` is distinct from [`executor:`](#executor--declaring-the-executor):
+`executor:` says what *kind* of executor should run an order once it's claimed;
+`capabilities:` says *which* caller may claim it in the first place — a tick filter
+locally, a bound crew on a hub.
 
 ## `produces:` vs `generates:`
 
@@ -275,23 +275,23 @@ steps:
                                       # reads the producer's inputs (question)
           - name: ci-gate
             body: "unused by a command judge, but still a required field" # every
-                                      # judge needs body/bodyFile regardless of worker
-            worker: command           # judges can be deterministic too — same
-            command: scripts/ci-gate.sh  #   worker:/command: contract as a normal step
+                                      # judge needs body/bodyFile regardless of executor
+            executor: command           # judges can be deterministic too — same
+            command: scripts/ci-gate.sh  #   executor:/command: contract as a normal step
     maxAttempts: 5    # producer's cap (default for every produce on this step)
                       # — also bounds judge-reject → rebuild loops; `report`
                       # above could set its own maxAttempts: to override it
 ```
 
-A judge entry accepts the same `worker:`/`command:`/`spec:` fields as a
-normal step (see [`worker:` above](#worker--declaring-the-executor)) — a
+A judge entry accepts the same `executor:`/`command:`/`spec:` fields as a
+normal step (see [`executor:` above](#executor--declaring-the-executor)) — a
 judge can be a deterministic check (a script's exit status) instead of an
 LLM verdict. Note `body:`/`bodyFile:` is still required on every judge
-regardless of `worker:` — that requirement is orthogonal to this feature and
-applies even to a `worker: command` judge (the field just goes unread by a
+regardless of `executor:` — that requirement is orthogonal to this feature and
+applies even to a `executor: command` judge (the field just goes unread by a
 non-agent dispatcher).
 
-Each judge is a real step under the hood — it fires its own worker order
+Each judge is a real step under the hood — it fires its own Worker order
 through the normal pipeline, with its own throttles (`cadence:`,
 `maxRunsPerDay:`) and retry/timeout behavior. When `researcher` commits
 `report`, it lands `submitted` (not `green`) instead — schema-valid, but
@@ -405,7 +405,7 @@ for brand-new combined workflows where nothing downstream expects the original s
 names.
 
 **`calls:` (Mode 2, runtime)** delegates to a **separate child instance** at runtime
-instead of inlining. The `calls:` step is machine-handled — it never emits a worker
+instead of inlining. The `calls:` step is machine-handled — it never emits a Worker
 job. Use it to embed an existing workflow as a black box, keeping its internals hidden.
 
 ```yaml
@@ -432,7 +432,7 @@ steps:
 ```
 
 The engine spawns the child when the gate inputs are green, greens the parent's
-`calls:` output when the child's declared output greens (no worker run), and re-provides
+`calls:` output when the child's declared output greens (no Worker run), and re-provides
 inputs to the existing child if a gate input changes — it never spawns a duplicate.
 
 | | `include:` (Mode 1) | `calls:` (Mode 2) |

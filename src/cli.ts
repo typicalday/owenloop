@@ -2760,13 +2760,13 @@ function createWorkflowRequest(
  * `purpose` is the verb phrase spliced into both exit-2 messages ("cannot
  * determine which hub to <purpose> — …"). It defaults to `'mint on'` so
  * `dispatchAgent`'s two-argument call keeps `agent new`'s error strings
- * byte-identical; `dispatchCapability` passes `'manage label bindings on'`;
+ * byte-identical; `dispatchCapability` passes `'manage capability routes on'`;
  * `dispatchCrew` passes `'manage crews on'`.
  *
  * Deliberately NOT `resolveHub` (`--hub → OWENLOOP_HUB → DEFAULT_HUB`): silently
  * defaulting a MINT to the production hub while the user is logged into a dev hub
  * would mint on the wrong org, and a mint is not undone by a retry. The same
- * reasoning covers a label binding — writing one against the wrong org is not
+ * reasoning covers a capability route — writing one against the wrong org is not
  * undone by a retry either, and under live resolution it also moves in-flight
  * work. `OWENLOOP_HUB` is intentionally excluded so this stays in parity with
  * O2's `owenloop mcp`.
@@ -3014,13 +3014,13 @@ async function dispatchCapability(io: CliIO, args: Args): Promise<number> {
   let crew = '';
   if (sub === 'bind' || sub === 'unbind') {
     // `<crew>` is required for BOTH now: one call adds or removes ONE
-    // `(capability, crew)` pair, and a capability-only `rm` would unbind more than the
-    // operator named.
-    const rawLabel = args.positionals[2];
-    if (rawLabel === undefined || rawLabel === '') {
+    // `(capability, crew)` pair, and a capability-only `unbind` would unbind more than
+    // the operator named.
+    const rawCapability = args.positionals[2];
+    if (rawCapability === undefined || rawCapability === '') {
       throw new CliError(`missing required argument: <capability> (${USAGE_FORMS})`);
     }
-    capability = rawLabel;
+    capability = rawCapability;
     const rawCrew = args.positionals[3];
     if (rawCrew === undefined || rawCrew === '') {
       throw new CliError(`missing required argument: <crew> (${USAGE_FORMS})`);
@@ -3062,7 +3062,7 @@ async function dispatchCapability(io: CliIO, args: Args): Promise<number> {
       return 0;
     }
 
-    // `new` and `rm` share one POST ladder AND one request body — `{capability, crew}`,
+    // `bind` and `unbind` share one POST ladder AND one request body — `{capability, crew}`,
     // because each call adds or removes exactly one `(capability, crew)` pair. Only the
     // path, the guard, and the printed shape differ.
     const endpoint = sub === 'bind' ? 'add_capability_route' : 'remove_capability_route';
@@ -3122,12 +3122,12 @@ async function dispatchCapability(io: CliIO, args: Args): Promise<number> {
         alreadyRouted: added.alreadyRouted,
         routedCrewCount: added.routedCrewCount,
       });
-      // No stderr line on `new`: an add never displaces a crew and never parks a
+      // No stderr line on `bind`: an add never displaces a crew and never parks a
       // capability, so there is no consequence to warn about.
       return 0;
     }
 
-    // `rm`: the guard proves the 2xx really was the remove verb's answer.
+    // `unbind`: the guard proves the 2xx really was the remove verb's answer.
     // `removedWire` (not `removed`) so `removedWire.removed` reads unambiguously —
     // the same naming `dispatchCrew` uses for `deletedWire`/`removedWire`.
     let removedWire;

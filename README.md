@@ -158,7 +158,7 @@ Two things make this more than running steps in dependency order:
   *width* — a producer can emit any number of elements — but the wiring graph
   itself (which steps exist, what each consumes and produces) is fixed when
   the definition loads, not mutable while an instance runs.
-- **Not a command runner.** `worker:`/`command:` label which kind of
+- **Not a command runner.** `executor:`/`command:` declare which kind of
   executor an order is for and carry a command string through untouched —
   the engine never shells out, executes, or interprets it. Actually running
   anything is always the dispatcher's job, on the other side of `tick`.
@@ -256,17 +256,17 @@ will do. See
 
 ### Worker dispatch
 
-`worker: agent | command | …` declares which kind of executor a step's order
+`executor: agent | command | …` declares which kind of executor a step's order
 is for — the default (`agent`, silent when omitted) is unaffected; every
 def written before this feature stays byte for byte the same. Opt a step
-into `worker: command` and give it a `command:` string to switch it to a
+into `executor: command` and give it a `command:` string to switch it to a
 deterministic executor instead of an LLM — the engine never runs it, only
 carries it through on the order for your dispatcher to branch on. An
 optional `spec:` map carries further opaque config (a timeout, a working
 directory), and a judge entry accepts the same fields, so a quality gate can
 be a script's exit code instead of a verdict. See
-[`docs/authoring.md`](docs/authoring.md#worker--declaring-the-executor) and
-[`command-worker.yaml`](examples/workflows/command-worker.yaml).
+[`docs/authoring.md`](docs/authoring.md#executor--declaring-the-executor) and
+[`command-executor.yaml`](examples/workflows/command-executor.yaml).
 
 ### Event subscription — for embedding
 
@@ -295,9 +295,7 @@ looks like:
 - **Your own harness** — a `while` loop, a cron job, a CI stage: tick, run
   each order with whatever executes your work (an agent CLI, an API call, a
   script), report, repeat. Fully deterministic dispatch if you want it —
-  see [Embedding it](#embedding-it) for the in-process version. A reference
-  dispatcher/Conductor is included in this package under the `owenloop work`
-  namespace — the engine core still ships no host harness of its own.
+  see [Embedding it](#embedding-it) for the in-process version. The root `owenloop shift` command is the standing Shift runtime — the engine core still ships no host harness of its own.
 - **A Prime Agent as the orchestrator** — point any tool-using agent (Claude Code,
   Codex, Gemini CLI, anything that can run a shell command) at the CLI and
   tell it to drive the instance to done. A slash command or skill that wraps
@@ -360,7 +358,7 @@ owenloop shift end
 ```
 
 `shift start` requires at least one named crew unless you pass `--all`
-explicitly; `--all` serves all pools for the Scoped Identity. `shift next` waits
+explicitly; `--all` serves all Crews for the Scoped Identity. `shift next` waits
 up to 90 seconds by default. For flags, JSON output, daemon behavior, and exit
 codes, see the [`shift` reference](docs/cli.md#shift--foreground-daemon-and-client).
 

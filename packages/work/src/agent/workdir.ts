@@ -189,7 +189,7 @@ export interface ReapGateInput {
  * child" in exactly that gap and delete the directory a moment before the next
  * step needs it.
  *
- * WHY THIS RUNS IN THE PROXY SWEEP AND NOT IN THE RUNNER AT EXIT: same reason,
+ * WHY THIS RUNS IN THE SHIFT SWEEP AND NOT IN THE RUNNER AT EXIT: same reason,
  * from the other side. A runner asking "is anything still open?" as it exits is
  * asking during that gap, every time.
  */

@@ -1121,7 +1121,7 @@ export function asAgentIdentities(body: unknown): AgentIdentitySummary[] {
  *
  * `crewName` is `string | null`. A `null` name IS the **dangling route** case:
  * the bound crew row was deleted, so the hub has no name left to resolve
- * (`manage-label-bindings.ts`'s `toWire`). A dangling route routes nothing and
+ * (`manage-capability-routes.ts`'s `toWire`). A dangling route routes nothing and
  * never widens access, and it is deliberately SURFACED rather than filtered out —
  * seeing the row is exactly what tells an operator there is something to clean up.
  *
@@ -1243,10 +1243,10 @@ export function asCapabilityRouteAdded(body: unknown): CapabilityRouteAddedWire 
  *   - `true`  — the `(capability, crew)` pair was bound and is now removed;
  *   - `false` — the pair was never bound, so there was nothing to do. The hub
  *     answers this with a 200, never a 404 (the `removeCrewMember` `{existed}`
- *     house pattern), and that tolerance is what makes `route rm` idempotent.
+ *     house pattern), and that tolerance is what makes `capability unbind` idempotent.
  *
  * `crewId` is LENIENT (absent or `null` both yield `null`) because `null` is a
- * real hub output, not a defect: `manage-label-bindings.ts` resolves it as
+ * real hub output, not a defect: `manage-capability-routes.ts` resolves it as
  * `namedCrew?.id ?? thisCapabilityRows.find(...)?.crewId ?? null`, so it is `null`
  * on exactly the tolerant `removed: false` path where the argument matched
  * neither a live crew name nor one of this capability's own route rows. Requiring a
