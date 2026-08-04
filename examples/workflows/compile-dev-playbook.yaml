@@ -45,7 +45,7 @@ description: >
   validated, gate-checked, test-driven owenloop workflow def ("playbook"),
   publishable to a library or hub.
 
-workers: [agent, command]   # typo guard: any other worker label is a load error
+executors: [agent, command]   # typo guard: any other executor value is a load error
 
 x:
   category: meta
@@ -216,7 +216,7 @@ steps:
             gates:   { type: array, minItems: 2, items: { type: string }, description: "the enforced gates the def carries, one line each" }
         judges:
           - name: lints-clean
-            worker: command
+            executor: command
             command: npx owenloop lint --defs build
             spec: { workdir: "." }
             body: unused by a command judge; exit 0 approves, non-zero rejects with the lint output
@@ -246,7 +246,7 @@ steps:
          judge, or a command gate. An invariant that survives only as prose
          in a body is a compile error.
       3. GATES: every entry in `knowledge.verifications` becomes an enforced
-         gate — `worker: command` with the check command where deterministic
+         gate — `executor: command` with the check command where deterministic
          (tests run and pass = exit code), a judge otherwise. List each in
          `def_draft.gates`.
       4. HUMAN MOMENTS: every entry in `knowledge.human_inputs` becomes a
@@ -264,7 +264,7 @@ steps:
          date) — so staleness is visible and a recompile is diffable.
       8. HOUSE RULES: model tiers by intent (fast/standard/strong), sensible
          maxAttempts, a header comment with drive instructions, and
-         `workers:` listing every worker label used.
+         `executors:` listing every executor value used.
 
   # ── Test drive: a def that has never been driven is a hypothesis ────────
   - name: testdrive

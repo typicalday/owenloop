@@ -366,11 +366,14 @@ codes, see the [`shift` reference](docs/cli.md#shift--foreground-daemon-and-clie
 through the same small CLI (`create`, `tick`, `green`, `reject`, …).
 [`docs/cli.md`](docs/cli.md) has the full command reference and a hand-driven
 walkthrough of a pipeline — including a rejection knock-back and a stall —
-and [`examples/workflows`](examples/workflows) has seven runnable defs, from a
+and [`examples/workflows`](examples/workflows) has seventeen runnable defs, from a
 minimal review loop ([`delivery`](examples/workflows/delivery.yaml)) to a
-full production line ([`ship`](examples/workflows/ship.yaml)) and a
+full production line ([`ship`](examples/workflows/ship.yaml)), a
 collections-heavy research pipeline
-([`research`](examples/workflows/research.yaml)). Full YAML grammar:
+([`research`](examples/workflows/research.yaml)), and a compiler that turns
+live vendor docs into a new gate-checked def
+([`compile-dev-playbook`](examples/workflows/compile-dev-playbook.yaml)).
+Full YAML grammar:
 [`docs/authoring.md`](docs/authoring.md). Driving it from your own code:
 [Embedding it](#embedding-it).
 
