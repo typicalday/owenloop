@@ -1728,7 +1728,7 @@ test('add <bundle.wnlp> installs into the PROJECT store and prints the structure
   assert.equal(existsSync(join(cwd, '.owenloop', ADD_JOURNAL_FILENAME)), false, 'journal removed');
 });
 
-test('add relative .wnlp path resolves against injected CliIO.cwd', async () => {
+test('add relative .wnlp path resolves against injected CliIO.cwd, not process.cwd', async () => {
   const { run, cwd } = makeBundleCli({
     bundleIngestor: cliFakeIngestor(),
     preCommitVerifier: cliFakeVerifier(),
@@ -1736,11 +1736,22 @@ test('add relative .wnlp path resolves against injected CliIO.cwd', async () => 
   const bundle = cliMakeBundle('relative');
   writeFileSync(join(cwd, 'relative.wnlp'), cliBundleBytes(bundle));
 
-  const r = await run('add', 'relative.wnlp');
+  // Put a same-named invalid file in a different process cwd. If the CLI ever
+  // regresses to process.cwd(), the fake A1 adapter rejects this file instead
+  // of installing the bundle from the injected CliIO.cwd.
+  const processCwd = mkdtempSync(join(tmpdir(), 'owenloop-processcwd-'));
+  writeFileSync(join(processCwd, 'relative.wnlp'), 'not the injected bundle');
+  const previousCwd = process.cwd();
+  process.chdir(processCwd);
+  try {
+    const r = await run('add', 'relative.wnlp');
 
-  assert.equal(r.code, 0, r.err);
-  assert.equal(r.json().source, 'relative.wnlp', 'diagnostics preserve the supplied relative path');
-  assert.equal(r.json().objectPath, join(cwd, 'workflows', 'objects', 'sha256', bundle.digest));
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.json().source, 'relative.wnlp', 'diagnostics preserve the supplied relative path');
+    assert.equal(r.json().objectPath, join(cwd, 'workflows', 'objects', 'sha256', bundle.digest));
+  } finally {
+    process.chdir(previousCwd);
+  }
 });
 
 test('add <bundle.wnlp> --global installs under ~/.owenloop/workflows (injected HOME)', async () => {

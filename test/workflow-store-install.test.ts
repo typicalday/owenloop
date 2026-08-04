@@ -621,6 +621,37 @@ test('recovery: symlinked object parents are refused before any recovery mutatio
   assert.equal(readFileSync(join(outside, 'victim'), 'utf8'), 'keep', 'outside target was untouched');
 });
 
+test('recovery: a symlinked metadata file is refused before commit-point probing', async () => {
+  const { root, lockPath, journalPath } = tempStore();
+  const digest = defDigest('e'.repeat(64));
+  const objDir = join(root, objectDestRelPath(digest));
+  mkdirSync(objDir, { recursive: true });
+  writeFileSync(join(objDir, 'def.yaml'), validDefYaml('metadata-link'));
+
+  const metadata = { version: 1, entries: {} };
+  const outside = mkdtempSync(join(tmpdir(), 'owenloop-recovery-metadata-target-'));
+  const outsideIndex = join(outside, 'index.json');
+  writeFileSync(outsideIndex, `${JSON.stringify(metadata, null, 2)}\n`);
+  writeAddJournal(journalPath, {
+    version: 2,
+    phase: 'applying',
+    destSegments: ['objects', 'sha256', digest],
+    stagingId: 'stg_metadata_link',
+    hadDest: false,
+    root,
+    metadataHash: sha256Hex(canonicalJsonBytes(metadata)),
+  });
+  symlinkSync(outsideIndex, storeIndexPath(root));
+
+  await assert.rejects(
+    recoverWorkflowStore({ root, lockPath, journalPath }),
+    /install metadata.*symlink|metadata.*symlink/i,
+  );
+  assert.ok(existsSync(journalPath), 'journal remains as evidence');
+  assert.ok(existsSync(objDir), 'destination remains untouched');
+  assert.equal(readFileSync(outsideIndex, 'utf8'), `${JSON.stringify(metadata, null, 2)}\n`);
+});
+
 test('recovery: a fresh v2 swap is discarded only with a matching external marker', async () => {
   const { root, lockPath, journalPath } = tempStore();
   const markerDir = mkdtempSync(join(tmpdir(), 'owenloop-recovery-markers-'));

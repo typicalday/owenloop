@@ -10,11 +10,11 @@
  * invalid rather than being lowercased into apparent validity).
  */
 
-import { existsSync, lstatSync, readFileSync, rmSync } from 'node:fs';
+import { lstatSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DIGEST_RE, StoreIndexError, parseWorkflowCoordinate } from './types.ts';
 import type { WorkflowStoreIndex } from './types.ts';
-import { writeJsonAtomic } from '../install.ts';
+import { readRegularFileNoFollow, writeJsonAtomic } from '../install.ts';
 
 /** The current (and only) index schema version. */
 export const WORKFLOW_STORE_INDEX_VERSION = 1;
@@ -81,16 +81,14 @@ export function parseWorkflowStoreIndex(parsed: unknown, path: string): Workflow
  * (a directory) is refused for the same reason.
  */
 export function readWorkflowStoreIndex(path: string): WorkflowStoreIndex {
-  const st = lstatSync(path, { throwIfNoEntry: false });
-  if (st === undefined) return emptyWorkflowStoreIndex();
-  if (st.isSymbolicLink()) {
-    throw new StoreIndexError(`refusing workflow store index at ${path}: it is a symlink`);
+  let rawBytes: Uint8Array | undefined;
+  try {
+    rawBytes = readRegularFileNoFollow(path, 'workflow store index');
+  } catch (e) {
+    throw new StoreIndexError(`refusing workflow store index at ${path}: ${(e as Error).message}`);
   }
-  if (!st.isFile()) {
-    throw new StoreIndexError(`refusing workflow store index at ${path}: it is not a regular file`);
-  }
-  if (!existsSync(path)) return emptyWorkflowStoreIndex(); // raced away between lstat and read
-  const raw = readFileSync(path, 'utf8');
+  if (rawBytes === undefined) return emptyWorkflowStoreIndex();
+  const raw = new TextDecoder().decode(rawBytes);
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);

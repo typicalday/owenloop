@@ -34,9 +34,11 @@
 
 import {
   chmodSync,
-  existsSync,
+  closeSync,
+  constants as fsConstants,
   lstatSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -160,6 +162,41 @@ export function guardStateFile(path: string, label = 'state file'): void {
   }
   if (!st.isFile()) {
     throw new Error(`refusing to use ${label} '${path}': it is not a regular file`);
+  }
+}
+
+/**
+ * Read one regular file without following a symlink during the open. The
+ * initial `lstat` rejects a planted link or non-file, and `O_NOFOLLOW` closes
+ * the replace-between-check-and-open window. An absent file returns undefined
+ * so callers can distinguish an empty file (which still needs parsing) from a
+ * never-created metadata file.
+ */
+export function readRegularFileNoFollow(path: string, label = 'file'): Uint8Array | undefined {
+  const st = lstatSync(path, { throwIfNoEntry: false });
+  if (st === undefined) return undefined;
+  if (st.isSymbolicLink()) {
+    throw new Error(`refusing to read ${label} '${path}': it is a symlink`);
+  }
+  if (!st.isFile()) {
+    throw new Error(`refusing to read ${label} '${path}': it is not a regular file`);
+  }
+
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return undefined;
+    if (code === 'ELOOP') {
+      throw new Error(`refusing to read ${label} '${path}': it is a symlink`);
+    }
+    throw e;
+  }
+  try {
+    return readFileSync(fd);
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -1129,8 +1166,13 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
   let commitPointReached = false;
   let v1Lookup: LedgerLookup | undefined;
   if (journal.version === 2) {
-    const metaBytes = existsSync(lockfilePath) ? readFileSync(lockfilePath) : new Uint8Array();
-    commitPointReached = sha256Hex(metaBytes) === journal.metadataHash;
+    let metaBytes: Uint8Array | undefined;
+    try {
+      metaBytes = readRegularFileNoFollow(lockfilePath, 'install metadata');
+    } catch (e) {
+      throw recoveryRefusal(journalPath, (e as Error).message);
+    }
+    commitPointReached = sha256Hex(metaBytes ?? new Uint8Array()) === journal.metadataHash;
   } else {
     if (args.readLedger === undefined) {
       throw recoveryRefusal(
