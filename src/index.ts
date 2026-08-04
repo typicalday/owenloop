@@ -35,6 +35,61 @@ export type { CreateEngineOpts, CreatedEngine } from './factory.ts';
 export { Store, openStore, StoreVersionError } from './store.ts';
 export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
 
+// The content-addressed WORKFLOW store (distinct from the SQLite runtime
+// store above): two-level digest-addressed workflow objects + coordinate
+// index, `.wnlp` bundle installation, and fail-closed resolution.
+export {
+  defDigest,
+  emptyWorkflowStoreIndex,
+  globalStoreRoot,
+  hardenObjectModes,
+  installWorkflowBundle,
+  isDefDigest,
+  objectDestRelPath,
+  objectDirForDigest,
+  parseWorkflowCoordinate,
+  parseWorkflowStoreIndex,
+  projectStoreRoot,
+  probeObjectDir,
+  probeStoreRoot,
+  readWorkflowStoreIndex,
+  recoverWorkflowStore,
+  resolveWorkflowCoordinate,
+  resolveWorkflowDigest,
+  serializeWorkflowStoreIndex,
+  storeIndexPath,
+  workflowCoordinate,
+  WORKFLOW_STORE_INDEX_VERSION,
+  WorkflowStoreError,
+  StoreIndexError,
+  StoreDigestError,
+  StoreCoordinateError,
+  StoreAmbiguityError,
+  StoreNotFoundError,
+  StoreIntegrityError,
+  StoreConflictError,
+  StorePathError,
+  BundleIngestorUnavailableError,
+  PreCommitVerifierUnavailableError,
+} from './store/index.ts';
+export type {
+  BundleInstallResult,
+  BundleIngestor,
+  BundleSource,
+  DefDigest,
+  InstallWorkflowBundleArgs,
+  PreCommitVerifier,
+  RecoverWorkflowStoreArgs,
+  ResolvedWorkflowObject,
+  ResolveWorkflowCoordinateArgs,
+  ResolveWorkflowDigestArgs,
+  ResolutionLevel,
+  StoreLevel,
+  WorkflowCoordinate,
+  WorkflowStoreIndex,
+  WorkflowStoreIndexEntry,
+} from './store/index.ts';
+
 export { buildDef, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
 export { credentialSlot, hashDefForHub, keychainServiceFor, normalizeOrigin, readStoredCredential } from './hub.ts';
 export type { Credential, CredentialSlotSelector, Keychain, ReadStoredCredentialOpts } from './hub.ts';

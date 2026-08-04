@@ -275,6 +275,36 @@ pushes a typed event the instant a mutation commits, so a host can react
 instead of ticking on a timer. See [Embedding it](#embedding-it) and
 [`docs/embedding.md`](docs/embedding.md).
 
+### Shared workflows — the content-addressed store
+
+Workflow definitions are shared, not hand-copied. Two install routes land
+them in the tree, both all-or-nothing with crash recovery:
+
+- **GitHub repos** — `owenloop add <owner>/<repo>[@ref]` fetches a public
+  repo's `workflows/**`, validates every def with the engine's strict pass,
+  and installs it under `<defsDir>/<owner>-<repo>-<hash>/`, recording
+  provenance (resolved commit sha) in `.owenloop/installed.json`.
+- **Workflow bundles** — `owenloop add widget.wnlp [--global]` (a local
+  `.wnlp` file or an `https://` URL) installs into a **content-addressed
+  store**: the project store lives under the defs dir, `--global` installs
+  into `~/.owenloop/workflows`. Each store holds an `index.json` mapping
+  `namespace/name@version` coordinates to content digests, plus immutable
+  objects at `objects/sha256/<digest>/` — identical content deduplicates to
+  one object, and an object's identity is its digest alone (never its name
+  or source). Objects are hardened read-only in place, and every resolution
+  re-verifies the bytes before returning a path.
+
+Bundle installs fail closed without their two required adapters (bundle
+ingestion and pre-commit verification) — there is no default accepting
+parser, digest algorithm, or verifier, and publishing from this engine does
+not sign a bundle. Resolution is deliberately split: execution resolves by
+**digest only** (project first, fall-through to global only when the project
+object is absent — a corrupt project object is a hard error, never masked by
+a global copy), while human-facing lookups resolve by **coordinate** and
+surface a structured ambiguity error when the two levels disagree — never a
+silent project-first pick. Full semantics:
+[`docs/cli.md`](docs/cli.md#add-with-bundles--the-content-addressed-workflow-store).
+
 ---
 
 ## Driving it with a loop
@@ -546,7 +576,9 @@ owenloop is small and split along a pure-core / imperative-shell line:
 | [`src/defs.ts`](src/defs.ts) | load YAML → validated `WorkflowDef` (the static wiring checks) |
 | [`src/schema.ts`](src/schema.ts) | JSON Schema validation of artifact values, via `@cfworker/json-schema` |
 | [`src/model.ts`](src/model.ts) | the pure core: what's eligible, the cascade, status, stall detection |
-| [`src/store.ts`](src/store.ts) | `node:sqlite` persistence; transactions; the commit check |
+| [`src/store.ts`](src/store.ts) | the SQLite **runtime** store — `node:sqlite` persistence; transactions; the commit check (instance/artifact state) |
+| [`src/install.ts`](src/install.ts) | the host-neutral install transaction: safe staging, atomic swap with a retained backup, two-phase journal, lock, recovery |
+| [`src/store/`](src/store/) | the content-addressed **workflow** store — digest-addressed definition objects, the two-level coordinate index, `.wnlp` bundle install, fail-closed resolution (immutable defs; distinct from the runtime store) |
 | [`src/engine.ts`](src/engine.ts) | the imperative shell: `tick`/`green`/`reject`/… → mutate → `settle()` |
 | [`src/cli.ts`](src/cli.ts) | argv → engine calls, JSON on stdout |
 

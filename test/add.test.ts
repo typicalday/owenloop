@@ -1658,7 +1658,11 @@ test('parkOldNameDir: a traversing oldRelPath throws and never touches the out-o
   mkdirSync(victim, { recursive: true });
   writeFileSync(join(victim, 'keep.txt'), 'do not delete me');
 
-  const handle = { dest: join(defsDir, 'pkg-hashed'), undoDir: join(defsDir, STAGING_DIRNAME, 'stg1-undo') };
+  const handle = {
+    dest: join(defsDir, 'pkg-hashed'),
+    destRelPath: 'pkg-hashed',
+    undoDir: join(defsDir, STAGING_DIRNAME, 'stg1-undo'),
+  };
   assert.throws(() => parkOldNameDir(handle, defsDir, '../victim'), /refusing old-name migration/);
 
   assert.equal(readFileSync(join(victim, 'keep.txt'), 'utf8'), 'do not delete me', 'victim untouched');
@@ -2724,4 +2728,257 @@ test('add --recover on a clean cwd: proves the COMMAND_OPTIONS/USAGE registratio
   assert.equal(code, 0);
   assert.equal(report?.ok, true);
   assert.equal(report?.recovered, false);
+});
+
+// ---- v2 (generic) journal compatibility — WITHOUT weakening v1 ----------------
+//
+// The transaction's journal reader now accepts a second, route-neutral journal
+// version (v2: destSegments/stagingId/hadDest/root/metadataHash). These cases
+// pin: (1) v2 journals validate and recover through the SAME readAddJournal/
+// recoverInterruptedInstall surface the GitHub route has always used; (2) every
+// v1 refusal and validation rule still fires byte-for-byte (nothing weakened).
+
+import {
+  canonicalJsonBytes,
+  recoverInterruptedInstall as recoverInterruptedInstallGeneric,
+  sha256Hex,
+  validateInstallJournalV2,
+} from '../src/install.ts';
+import type { InstallJournalV2 } from '../src/install.ts';
+
+/**
+ * Write a full, valid v2 journal, overriding the fields a test cares about.
+ * Single-segment dest by default (the crashPaths helpers seed single-segment
+ * dirs); CAS-shaped three-segment cases pass `destSegments` explicitly.
+ */
+function seedJournalV2(cwd: string, over: Partial<InstallJournalV2> = {}): InstallJournalV2 {
+  const journal: InstallJournalV2 = {
+    version: 2,
+    phase: 'applying',
+    destSegments: ['pkg'],
+    stagingId: 'stg_test',
+    hadDest: false,
+    root: defsDirOf(cwd),
+    metadataHash: sha256Hex(canonicalJsonBytes({ version: 1, entries: {} })),
+    label: 'acme/widgets@1',
+    startedAt: 1,
+    ...over,
+  };
+  writeAddJournal(journalPathOf(cwd), journal);
+  return journal;
+}
+
+test('v2 journal: readAddJournal accepts and validates it; hostile v2 shapes are refused', () => {
+  const jp = '/tmp/not-a-real-path.journal';
+  const base = {
+    version: 2,
+    phase: 'applying',
+    destSegments: ['objects', 'sha256', 'd'.repeat(64)],
+    stagingId: 'stg_test',
+    hadDest: false,
+    root: '/some/root',
+    metadataHash: 'e'.repeat(64),
+  };
+  // Valid round-trip.
+  assert.deepEqual(validateInstallJournalV2(base, jp), base);
+  // Every malformed shape is a named hard error — fail-closed.
+  assert.throws(() => validateInstallJournalV2({ ...base, phase: 'bogus' }, jp), /unknown phase/);
+  assert.throws(() => validateInstallJournalV2({ ...base, version: 3 }, jp), /unsupported journal version/);
+  assert.throws(() => validateInstallJournalV2({ ...base, destSegments: [] }, jp), /destSegments/);
+  assert.throws(
+    () => validateInstallJournalV2({ ...base, destSegments: ['objects', '../evil'] }, jp),
+    /destSegments\[1\]/,
+  );
+  assert.throws(() => validateInstallJournalV2({ ...base, metadataHash: 'E'.repeat(64) }, jp), /lowercase 64-char/);
+  assert.throws(() => validateInstallJournalV2({ ...base, metadataHash: 'short' }, jp), /lowercase 64-char/);
+  assert.throws(() => validateInstallJournalV2({ ...base, root: '' }, jp), /root/);
+  assert.throws(() => validateInstallJournalV2({ ...base, hadDest: 'yes' }, jp), /hadDest/);
+  // v1 rules are UNTOUCHED: a v1-shaped object still must pass v1 validation,
+  // and a v2 object must NOT pass v1 validation (and vice versa).
+  assert.throws(() => validateAddJournal(base, jp), /unsupported journal version/);
+});
+
+test('v2 journal: readAddJournal dispatches on the raw version field (v2 validated by v2 rules)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-journal-'));
+  const jp = join(dir, 'add.journal');
+  const journal = {
+    version: 2,
+    phase: 'finalizing',
+    destSegments: ['pkg'],
+    stagingId: 'stg_test',
+    hadDest: true,
+    root: dir,
+    metadataHash: 'f'.repeat(64),
+  };
+  writeFileSync(jp, JSON.stringify(journal, null, 2));
+  assert.deepEqual(readAddJournal(jp), journal);
+});
+
+test('v2 journal: phase `finalizing` rolls forward through the shared recovery', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const dest = join(defsDirOf(cwd), 'pkg'); // the journal's own dest (single segment)
+  // Committed v2 state: new object at dest, previous version retained as a
+  // backup; the metadata is durably new, so only finalize's discards are missing.
+  seedDir(dest, 'def.yaml', 'NEW');
+  seedDir(p.backupDir, 'def.yaml', 'PREV');
+  seedJournalV2(cwd, { phase: 'finalizing', hadDest: true, root: defsDirOf(cwd) });
+
+  recoverIn(cwd);
+
+  assert.equal(readFileSync(join(dest, 'def.yaml'), 'utf8'), 'NEW', 'installed content kept');
+  assert.ok(!existsSync(p.backupDir), 'retained backup discarded');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('v2 journal: phase `applying` with a matching metadata hash rolls forward (commit point passed)', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const dest = join(defsDirOf(cwd), 'pkg');
+  // The metadata write landed but the journal never advanced to `finalizing`:
+  // the v2 commit-point test is sha256(current metadata bytes) === metadataHash.
+  const metaPath = lockfilePath(cwd); // stand-in metadata file (v2 hashes whatever lockfilePath names)
+  mkdirSync(join(cwd, '.owenloop'), { recursive: true });
+  const metaBytes = canonicalJsonBytes({ version: 1, entries: { 'acme/widgets@1': { digest: 'd'.repeat(64), pinned: false } } });
+  writeFileSync(metaPath, metaBytes);
+  seedDir(dest, 'def.yaml', 'NEW');
+  seedDir(p.backupDir, 'def.yaml', 'PREV');
+  seedJournalV2(cwd, { phase: 'applying', hadDest: true, metadataHash: sha256Hex(metaBytes) });
+
+  recoverIn(cwd);
+
+  assert.equal(readFileSync(join(dest, 'def.yaml'), 'utf8'), 'NEW', 'install kept — metadata already agrees');
+  assert.ok(!existsSync(p.backupDir), 'retained backup discarded');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('v2 journal: phase `applying`, commit point NOT reached, backup present, restores the backup over dest', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  const dest = join(defsDirOf(cwd), 'pkg');
+  // Case (b): staging gone, backup present, dest present, metadata never
+  // landed (hash mismatch) ⇒ roll back: park the new content under undoDir,
+  // restore the backup over dest.
+  seedDir(dest, 'def.yaml', 'NEW');
+  seedDir(p.backupDir, 'def.yaml', 'PREV');
+  seedJournalV2(cwd, { phase: 'applying', hadDest: true, metadataHash: 'a'.repeat(64) });
+
+  recoverIn(cwd);
+
+  assert.equal(readFileSync(join(dest, 'def.yaml'), 'utf8'), 'PREV', 'previous state restored');
+  assert.ok(!existsSync(p.backupDir), 'backup consumed by the restore');
+  assert.ok(!existsSync(p.stagingRoot), 'staging root cleared (undo leftovers are debris)');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('v2 journal: phase `applying`, commit point NOT reached, staging present, backup absent, touches nothing', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  // Case (a), fresh install pre-swap: staging still holds the new content,
+  // backup absent, dest absent, metadata mismatch ⇒ already consistent — the
+  // rollback table touches nothing; step (e) clears staging as debris.
+  seedDir(p.stagingDir, 'def.yaml', 'NEW');
+  seedJournalV2(cwd, { phase: 'applying', hadDest: false, metadataHash: 'a'.repeat(64) });
+
+  recoverIn(cwd);
+
+  assert.ok(!existsSync(p.dest), 'destination never created');
+  assert.ok(!existsSync(p.stagingRoot), 'staging debris cleared');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('v2 journal: a fresh-install forgery (staging+backup absent, dest present) is REFUSED fail-closed', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const dest = join(defsDirOf(cwd), 'pkg');
+  // Case (c): the on-disk shape of a forged v2 journal naming an unrelated
+  // dir it wants deleted — staging absent, backup absent, dest present,
+  // metadata mismatch. Fail closed; mutate nothing.
+  seedDir(dest, 'victim.yaml', 'KEEP');
+  seedJournalV2(cwd, { phase: 'applying', hadDest: false, metadataHash: 'b'.repeat(64) });
+
+  assert.throws(() => recoverIn(cwd), /refusing to discard that directory/);
+  assert.ok(existsSync(join(dest, 'victim.yaml')), 'victim survives');
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left as evidence');
+});
+
+test('v2 journal: three-segment CAS destSegments recover through the shared surface too', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const defsDir = defsDirOf(cwd);
+  const digest = 'd'.repeat(64);
+  const dest = join(defsDir, 'objects', 'sha256', digest);
+  const stagingRoot = join(defsDir, STAGING_DIRNAME);
+  const backupDir = join(stagingRoot, 'stg_test-old');
+  mkdirSync(join(defsDir, 'objects', 'sha256'), { recursive: true });
+  seedDir(dest, 'def.yaml', 'NEW');
+  seedDir(backupDir, 'def.yaml', 'PREV');
+  seedJournalV2(cwd, {
+    phase: 'applying',
+    hadDest: true,
+    destSegments: ['objects', 'sha256', digest],
+    metadataHash: 'a'.repeat(64),
+  });
+
+  recoverIn(cwd);
+
+  assert.equal(readFileSync(join(dest, 'def.yaml'), 'utf8'), 'PREV', 'CAS object path restored through segments');
+  assert.ok(!existsSync(backupDir), 'backup consumed by the restore');
+  assert.ok(!existsSync(journalPathOf(cwd)), 'journal removed');
+});
+
+test('v2 journal: recovery of a DIFFERENT root is refused (root equality, never joined)', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  seedJournalV2(cwd, { root: '/some/other/root' });
+  assert.throws(() => recoverIn(cwd), /journal records store root/);
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left as evidence');
+});
+
+test('v2 journal: a traversing destSegments entry is refused by the validator', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-journal-'));
+  const jp = join(dir, 'add.journal');
+  writeFileSync(
+    jp,
+    JSON.stringify({
+      version: 2,
+      phase: 'applying',
+      destSegments: ['..', 'etc'],
+      stagingId: 'stg_test',
+      hadDest: false,
+      root: dir,
+      metadataHash: 'c'.repeat(64),
+    }),
+  );
+  assert.throws(() => readAddJournal(jp), /destSegments\[0\]/);
+});
+
+test('v1 recovery is unchanged: a v1 journal still requires the ledger and recovers exactly as before', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  const p = crashPaths(cwd);
+  // v1 journal, commit point reached via the ledger, dest present ⇒ forward.
+  seedDir(p.dest, 'foo.yaml', 'NEW');
+  seedDir(p.backupDir, 'foo.yaml', 'PREV');
+  seedLockfileEntry(cwd, SHA_B, installFolder(OWNER, REPO));
+  seedJournal(cwd, { phase: 'applying', hadDest: true, sha: SHA_B, folder: installFolder(OWNER, REPO) });
+
+  recoverIn(cwd);
+
+  assert.equal(readFileSync(join(p.dest, 'foo.yaml'), 'utf8'), 'NEW', 'v1 forward path intact');
+  assert.ok(!existsSync(p.backupDir), 'backup discarded');
+});
+
+test('v1 recovery is unchanged: a v1 journal WITHOUT a ledger lookup is refused (no weakening)', () => {
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-add-test-'));
+  seedJournal(cwd, { phase: 'applying' });
+  // The GENERIC recovery without readLedger must refuse a v1 journal — the
+  // store route passes no ledger, and the GitHub route always supplies one.
+  assert.throws(
+    () =>
+      recoverInterruptedInstallGeneric({
+        defsDir: defsDirOf(cwd),
+        journalPath: journalPathOf(cwd),
+        lockfilePath: lockfilePath(cwd),
+      }),
+    /requires the GitHub recovery entry point/,
+  );
+  assert.ok(existsSync(journalPathOf(cwd)), 'journal left as evidence');
 });

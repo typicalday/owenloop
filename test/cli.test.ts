@@ -8,11 +8,31 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { ASYNC_COMMANDS, COMMAND_OPTIONS, main, USAGE } from '../src/cli.ts';
+import { ASYNC_COMMANDS, classifyAddSource, COMMAND_OPTIONS, main, mainAsync, USAGE } from '../src/cli.ts';
+import type { CliIO } from '../src/cli.ts';
+import { ADD_JOURNAL_FILENAME } from '../src/add.ts';
+import {
+  defDigest,
+  globalStoreRoot,
+  storeIndexPath,
+  workflowCoordinate,
+  WORKFLOW_STORE_INDEX_FILENAME,
+} from '../src/store/index.ts';
+import type { BundleIngestor, BundleSource, DefDigest, PreCommitVerifier, WorkflowCoordinate } from '../src/store/index.ts';
 import { exampleDefNames } from './helpers.ts';
 
 const EXAMPLES = join(import.meta.dirname, '..', 'examples', 'workflows');
@@ -1392,4 +1412,486 @@ test('SEC-3: an explicit --db that is itself a symlink still opens (operator int
   const r = run('defs', '--db', linkDb);
   assert.equal(r.code, 0, r.err);
   assert.equal(existsSync(realDb), true, 'the explicit db symlink was followed (override behavior preserved)');
+});
+
+// ---- `add` bundle route (USAGE / allowlist / classifier / --global) -------------
+
+test('USAGE advertises the bundle add syntax, --global, and --recover --global', () => {
+  assert.match(USAGE, /add <bundle\.wnlp \| https:\/\/url> \[--global\]/, 'bundle add line');
+  assert.match(USAGE, /--global: ~\/\.owenloop\/workflows/, 'global store location documented');
+  assert.match(USAGE, /add --recover \[--global\]/, 'global recover line');
+});
+
+test('COMMAND_OPTIONS registers --global on add (and --recover stays)', () => {
+  const opts = COMMAND_OPTIONS.get('add');
+  assert.ok(opts, 'add has an option table');
+  assert.ok(opts!.has('global'), '--global is allowlisted on add');
+  assert.ok(opts!.has('recover'), '--recover is still allowlisted on add');
+});
+
+test('classifyAddSource: owner/repo[@ref] keeps the GitHub route', () => {
+  assert.deepEqual(classifyAddSource('acme/widgets'), { kind: 'github', spec: 'acme/widgets' });
+  assert.deepEqual(classifyAddSource('acme/widgets@main'), {
+    kind: 'github',
+    spec: 'acme/widgets@main',
+  });
+});
+
+test('classifyAddSource: a .wnlp path is a bundle FILE regardless of existence', () => {
+  assert.deepEqual(classifyAddSource('packs/widget.wnlp'), { kind: 'file', path: 'packs/widget.wnlp' });
+  assert.deepEqual(classifyAddSource('/abs/widget.wnlp'), { kind: 'file', path: '/abs/widget.wnlp' });
+  assert.deepEqual(classifyAddSource('missing.wnlp'), { kind: 'file', path: 'missing.wnlp' });
+});
+
+test('classifyAddSource: http(s) URLs take the bundle route; other schemes are refused', () => {
+  assert.deepEqual(classifyAddSource('https://example.com/w.wnlp'), {
+    kind: 'url',
+    url: 'https://example.com/w.wnlp',
+  });
+  assert.deepEqual(classifyAddSource('http://example.com/w.wnlp'), {
+    kind: 'url',
+    url: 'http://example.com/w.wnlp',
+  });
+  for (const bad of ['ftp://example.com/w.wnlp', 'ssh://acme/widgets', 'file:///tmp/w.wnlp']) {
+    assert.throws(() => classifyAddSource(bad), (e: Error) => {
+      assert.match(e.message, /unsupported source scheme/);
+      assert.match(e.message, /owner\/repo\[@ref\] \(GitHub\), a local \.wnlp file, or an http\(s\) URL/);
+      return true;
+    }, bad);
+  }
+});
+
+// ---- fake A1/A2 adapters for the CLI bundle route ----------------------------
+// Same fixture discipline as test/workflow-store-install.test.ts: the "bundle"
+// is plain JSON (coordinate + files + claim), the digest is computed HERE with
+// node:crypto, and the fake ingestor recomputes it as the tamper gate. The
+// real ~/.owenloop is never touched — HOME is injected per test.
+
+interface CliWireManifest {
+  coordinate: { namespace: string; name: string; version: string };
+  files: Record<string, string>;
+  claim: string;
+  digest: string;
+}
+
+function cliSha256Content(
+  coordinate: CliWireManifest['coordinate'],
+  files: Record<string, string>,
+): string {
+  return createHash('sha256')
+    .update(new TextEncoder().encode(JSON.stringify({ coordinate, files })))
+    .digest('hex');
+}
+
+function cliValidDefYaml(name: string): string {
+  return [
+    `name: ${name}`,
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: worker',
+    '    consumes: [seed]',
+    '    produces: [out]',
+    '    terminal: true',
+    '    maxSchemaFailures: 0',
+    '',
+  ].join('\n');
+}
+
+function cliMakeBundle(name = 'widget'): CliWireManifest {
+  const coordinate = { namespace: 'acme', name, version: '1.0.0' };
+  const files = { 'def.yaml': cliValidDefYaml(name) };
+  const digest = cliSha256Content(coordinate, files);
+  return { coordinate, files, claim: digest, digest };
+}
+
+function cliBundleBytes(m: CliWireManifest): Uint8Array {
+  return new TextEncoder().encode(
+    JSON.stringify({ coordinate: m.coordinate, files: m.files, claim: m.claim }),
+  );
+}
+
+function cliFakeIngestor(): BundleIngestor & { ingests: number } {
+  const state = { ingests: 0 };
+  return {
+    ingests: 0,
+    async ingest(input: {
+      source: BundleSource;
+      bytes: Uint8Array;
+      stagingDir: string;
+    }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest }> {
+      state.ingests++;
+      (this as { ingests: number }).ingests = state.ingests;
+      const m = JSON.parse(new TextDecoder().decode(input.bytes));
+      if (cliSha256Content(m.coordinate, m.files) !== m.claim) {
+        throw new Error('fake A1: bundle digest mismatch — refusing');
+      }
+      mkdirSync(input.stagingDir, { recursive: true });
+      for (const [rel, content] of Object.entries(m.files)) {
+        const full = join(input.stagingDir, rel);
+        mkdirSync(join(full, '..'), { recursive: true });
+        writeFileSync(full, content as string);
+      }
+      return { coordinate: workflowCoordinate(m.coordinate), digest: defDigest(m.claim) };
+    },
+    async verifyInstalledObject(): Promise<void> {},
+  };
+}
+
+function cliFakeVerifier(): PreCommitVerifier & { calls: number } {
+  const state = { calls: 0 };
+  return {
+    calls: 0,
+    async verify(): Promise<void> {
+      state.calls++;
+      (this as { calls: number }).calls = state.calls;
+    },
+  };
+}
+
+/** A hermetic CliIO for the async bundle route: temp HOME + cwd, captured streams. */
+function makeBundleCli(opts: {
+  env?: Record<string, string | undefined>;
+  bundleIngestor?: BundleIngestor;
+  preCommitVerifier?: PreCommitVerifier;
+  fetch?: typeof globalThis.fetch;
+} = {}) {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-clibundle-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'owenloop-clibundlecwd-'));
+  const out: string[] = [];
+  const err: string[] = [];
+  const io: CliIO = {
+    cwd,
+    env: { HOME: home, ...opts.env },
+    out: (s) => out.push(s),
+    err: (s) => err.push(s),
+    bundleIngestor: opts.bundleIngestor,
+    preCommitVerifier: opts.preCommitVerifier,
+    fetch: opts.fetch,
+  };
+  const run = async (...argv: string[]) => {
+    const code = await mainAsync(argv, io);
+    const outText = out.join('\n');
+    return { code, out: outText, err: err.join('\n'), json: () => JSON.parse(outText) };
+  };
+  return { run, home, cwd, io };
+}
+
+// ---- --global / --defs conflict ------------------------------------------------
+
+test('add --global with --defs (flag) is refused with the fixed conflict message', async () => {
+  const { run, home } = makeBundleCli();
+  const r = await run('add', 'x.wnlp', '--global', '--defs', '/somewhere');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--global cannot be combined with --defs: the global store lives in the home directory/);
+  assert.equal(existsSync(join(home, '.owenloop', 'workflows')), false, 'no global store was created');
+});
+
+test('add --global with OWENLOOP_DEFS set (env) is refused the same way', async () => {
+  const { run } = makeBundleCli({ env: { OWENLOOP_DEFS: '/somewhere' } });
+  const r = await run('add', 'x.wnlp', '--global');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--global cannot be combined with --defs/);
+});
+
+test('add --recover --global with a defs override is refused too', async () => {
+  const { run } = makeBundleCli({ env: { OWENLOOP_DEFS: '/somewhere' } });
+  const r = await run('add', '--recover', '--global');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--global cannot be combined with --defs/);
+});
+
+// ---- fail-closed adapter gates at the CLI dispatch site --------------------------
+
+test('add <bundle.wnlp> without a BundleIngestor fails closed BEFORE any commit', async () => {
+  const { run, cwd } = makeBundleCli({ preCommitVerifier: cliFakeVerifier() });
+  const bundlePath = join(cwd, 'w.wnlp');
+  writeFileSync(bundlePath, cliBundleBytes(cliMakeBundle()));
+  const r = await run('add', bundlePath);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /BundleIngestor adapter is bound/);
+  assert.match(r.err, /nothing was staged or committed/);
+  assert.equal(existsSync(join(cwd, 'workflows')), false, 'no project store root created');
+  assert.equal(existsSync(join(cwd, 'workflows', WORKFLOW_STORE_INDEX_FILENAME)), false);
+});
+
+test('add <bundle.wnlp> without a PreCommitVerifier fails closed BEFORE any commit', async () => {
+  const { run, cwd } = makeBundleCli({ bundleIngestor: cliFakeIngestor() });
+  const bundlePath = join(cwd, 'w.wnlp');
+  writeFileSync(bundlePath, cliBundleBytes(cliMakeBundle()));
+  const r = await run('add', bundlePath);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /PreCommitVerifier adapter is bound/);
+  assert.match(r.err, /nothing was staged or committed/);
+  assert.equal(existsSync(join(cwd, 'workflows')), false, 'no project store root created');
+});
+
+// ---- bundle FILE read discipline -------------------------------------------------
+
+test('add <missing.wnlp> names the path and reports file not found', async () => {
+  const { run, cwd } = makeBundleCli({
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  const r = await run('add', join(cwd, 'missing.wnlp'));
+  assert.equal(r.code, 1);
+  assert.match(r.err, /could not read bundle at .*missing\.wnlp: file not found/);
+});
+
+test('add <symlink.wnlp> is refused (never read through a link)', async () => {
+  const { run, cwd } = makeBundleCli({
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  const real = join(cwd, 'real.wnlp');
+  writeFileSync(real, cliBundleBytes(cliMakeBundle()));
+  const link = join(cwd, 'link.wnlp');
+  symlinkSync(real, link);
+  const r = await run('add', link);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /refusing bundle at .*link\.wnlp: it is a symlink/);
+});
+
+test('add <dir.wnlp> is refused (not a regular file)', async () => {
+  const { run, cwd } = makeBundleCli({
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  mkdirSync(join(cwd, 'dir.wnlp'));
+  const r = await run('add', join(cwd, 'dir.wnlp'));
+  assert.equal(r.code, 1);
+  assert.match(r.err, /refusing bundle at .*dir\.wnlp: not a regular file/);
+});
+
+test('an oversized bundle file is refused before allocation (cap via OWENLOOP_TARBALL_MAX_BYTES)', async () => {
+  const { run, cwd } = makeBundleCli({
+    env: { OWENLOOP_TARBALL_MAX_BYTES: '10' },
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  const big = join(cwd, 'big.wnlp');
+  writeFileSync(big, cliBundleBytes(cliMakeBundle())); // well over 10 bytes
+  const r = await run('add', big);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /over the 10-byte cap/);
+});
+
+// ---- successful installs: structured JSON out + hardened store state -------------
+
+test('add <bundle.wnlp> installs into the PROJECT store and prints the structured result', async () => {
+  const { run, cwd } = makeBundleCli({
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  const bundle = cliMakeBundle();
+  const bundlePath = join(cwd, 'widget.wnlp');
+  writeFileSync(bundlePath, cliBundleBytes(bundle));
+
+  const r = await run('add', bundlePath);
+  assert.equal(r.code, 0, r.err);
+  const result = r.json();
+  const root = join(cwd, 'workflows');
+  assert.deepEqual(result, {
+    ok: true,
+    source: bundlePath,
+    level: 'project',
+    coordinate: 'acme/widget@1.0.0',
+    digest: bundle.digest,
+    objectPath: join(root, 'objects', 'sha256', bundle.digest),
+    installed: true,
+  });
+
+  // On-disk state: hardened object + index entry keyed by coordinate.
+  const defFile = join(root, 'objects', 'sha256', bundle.digest, 'def.yaml');
+  assert.equal(readFileSync(defFile, 'utf8'), cliValidDefYaml('widget'));
+  assert.equal(statSync(defFile).mode & 0o777, 0o444, 'installed file is read-only');
+  assert.equal(statSync(join(root, 'objects', 'sha256', bundle.digest)).mode & 0o777, 0o555, 'object dir is non-writable');
+  const index = JSON.parse(readFileSync(join(root, WORKFLOW_STORE_INDEX_FILENAME), 'utf8'));
+  assert.deepEqual(index.entries, { 'acme/widget@1.0.0': { digest: bundle.digest, pinned: false } });
+  assert.equal(existsSync(join(root, '.owenloop-staging')), false, 'staging cleared');
+  assert.equal(existsSync(join(cwd, '.owenloop', ADD_JOURNAL_FILENAME)), false, 'journal removed');
+});
+
+test('add <bundle.wnlp> --global installs under ~/.owenloop/workflows (injected HOME)', async () => {
+  const { run, cwd, home } = makeBundleCli({
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  const bundle = cliMakeBundle('gadget');
+  const bundlePath = join(cwd, 'gadget.wnlp');
+  writeFileSync(bundlePath, cliBundleBytes(bundle));
+
+  const r = await run('add', bundlePath, '--global');
+  assert.equal(r.code, 0, r.err);
+  const root = globalStoreRoot(home);
+  assert.deepEqual(r.json(), {
+    ok: true,
+    source: bundlePath,
+    level: 'global',
+    coordinate: 'acme/gadget@1.0.0',
+    digest: bundle.digest,
+    objectPath: join(root, 'objects', 'sha256', bundle.digest),
+    installed: true,
+  });
+  assert.equal(existsSync(join(root, 'objects', 'sha256', bundle.digest, 'def.yaml')), true);
+  const index = JSON.parse(readFileSync(storeIndexPath(root), 'utf8'));
+  assert.deepEqual(index.entries, { 'acme/gadget@1.0.0': { digest: bundle.digest, pinned: false } });
+  assert.equal(existsSync(join(cwd, 'workflows')), false, 'no project store was created');
+});
+
+test('add https://url fetches the bundle through io.fetch (User-Agent + redirect: error)', async () => {
+  const bundle = cliMakeBundle('remote');
+  const calls: Array<{ url: string; init: RequestInit | undefined }> = [];
+  const fetchFn = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(input), init });
+    return new Response(Buffer.from(cliBundleBytes(bundle)), { status: 200 });
+  }) as typeof globalThis.fetch;
+  const { run, cwd } = makeBundleCli({
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+    fetch: fetchFn,
+  });
+
+  const r = await run('add', 'https://example.com/remote.wnlp');
+  assert.equal(r.code, 0, r.err);
+  assert.equal(calls.length, 1);
+  const call = calls[0];
+  assert.ok(call, 'fetch was called exactly once');
+  assert.equal(call.url, 'https://example.com/remote.wnlp');
+  assert.equal((call.init?.headers as Record<string, string>)['User-Agent'], 'owenloop');
+  assert.equal(call.init?.redirect, 'error');
+  assert.deepEqual(r.json(), {
+    ok: true,
+    source: 'https://example.com/remote.wnlp',
+    level: 'project',
+    coordinate: 'acme/remote@1.0.0',
+    digest: bundle.digest,
+    objectPath: join(cwd, 'workflows', 'objects', 'sha256', bundle.digest),
+    installed: true,
+  });
+});
+
+test('add https://url surfaces a non-2xx status and commits nothing', async () => {
+  const fetchFn = (async () => new Response('nope', { status: 404 })) as typeof globalThis.fetch;
+  const { run, cwd } = makeBundleCli({
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+    fetch: fetchFn,
+  });
+  const r = await run('add', 'https://example.com/gone.wnlp');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /could not fetch bundle from https:\/\/example\.com\/gone\.wnlp: server returned 404/);
+  assert.equal(existsSync(join(cwd, 'workflows')), false);
+});
+
+test('add https://url refuses redirects instead of following them silently', async () => {
+  const fetchFn = (async () => new Response('', { status: 302, headers: { location: '/elsewhere' } })) as typeof globalThis.fetch;
+  const { run, cwd } = makeBundleCli({
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+    fetch: fetchFn,
+  });
+  const r = await run('add', 'https://example.com/moved.wnlp');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /could not fetch bundle from https:\/\/example\.com\/moved\.wnlp/, 'undici surfaces the redirect refusal');
+  assert.equal(existsSync(join(cwd, 'workflows')), false);
+});
+
+// ---- add --recover --global -------------------------------------------------------
+
+test('add --recover --global with nothing to recover reports recovered:false', async () => {
+  const { run, home } = makeBundleCli();
+  const r = await run('add', '--recover', '--global');
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(r.json(), {
+    ok: true,
+    recovered: false,
+    message: 'nothing to recover — no interrupted install found',
+  });
+  assert.equal(existsSync(globalStoreRoot(home)), true, 'the global root was probed/created');
+});
+
+test('add --recover --global rolls a finalizing v2 journal forward (offline)', async () => {
+  const { run, home } = makeBundleCli();
+  const root = globalStoreRoot(home);
+  const stagingRoot = join(root, '.owenloop-staging');
+  const stagingDir = join(stagingRoot, 'stg_cli');
+  mkdirSync(stagingDir, { recursive: true });
+  writeFileSync(join(stagingDir, 'leftover'), 'x');
+  mkdirSync(join(root, '.owenloop'), { recursive: true });
+  writeFileSync(
+    join(root, '.owenloop', ADD_JOURNAL_FILENAME),
+    JSON.stringify({
+      version: 2,
+      phase: 'finalizing',
+      destSegments: ['objects', 'sha256', 'f'.repeat(64)],
+      stagingId: 'stg_cli',
+      hadDest: true,
+      root,
+      metadataHash: 'a'.repeat(64),
+      label: 'acme/widget@1.0.0',
+    }),
+  );
+
+  const r = await run('add', '--recover', '--global');
+  assert.equal(r.code, 0, r.err);
+  assert.deepEqual(r.json(), {
+    ok: true,
+    recovered: true,
+    outcome: 'rolled-forward',
+    message: 'interrupted install completed (rolled forward)',
+  });
+  assert.equal(existsSync(stagingRoot), false, 'staging cleared by the roll-forward');
+  assert.equal(existsSync(join(root, '.owenloop', ADD_JOURNAL_FILENAME)), false, 'journal removed');
+});
+
+test('add --recover --global refuses a v1 (GitHub) journal at the global root', async () => {
+  // v1 journals are the GitHub route's schema; the global store has no ledger
+  // to vouch, so recovery must fail closed with the entry-point message.
+  const { run, home } = makeBundleCli();
+  const root = globalStoreRoot(home);
+  mkdirSync(join(root, '.owenloop'), { recursive: true });
+  writeFileSync(
+    join(root, '.owenloop', ADD_JOURNAL_FILENAME),
+    JSON.stringify({
+      version: 1,
+      phase: 'applying',
+      source: 'acme/widgets',
+      sha: 'a'.repeat(40),
+      folder: 'acme-widgets-deadbeef',
+      stagingId: 'stg_v1',
+      hadDest: false,
+      defsDir: root,
+    }),
+  );
+
+  const r = await run('add', '--recover', '--global');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /requires the GitHub recovery entry point/);
+  assert.equal(existsSync(join(root, '.owenloop', ADD_JOURNAL_FILENAME)), true, 'journal preserved as evidence');
+});
+
+test('add --recover --global refuses a journal recorded against a different store root', async () => {
+  const { run, home } = makeBundleCli();
+  const root = globalStoreRoot(home);
+  mkdirSync(join(root, '.owenloop'), { recursive: true });
+  writeFileSync(
+    join(root, '.owenloop', ADD_JOURNAL_FILENAME),
+    JSON.stringify({
+      version: 2,
+      phase: 'applying',
+      destSegments: ['objects', 'sha256', 'b'.repeat(64)],
+      stagingId: 'stg_else',
+      hadDest: false,
+      root: '/tmp/some-other-store',
+      metadataHash: 'c'.repeat(64),
+      label: 'acme/widget@1.0.0',
+    }),
+  );
+
+  const r = await run('add', '--recover', '--global');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /journal records store root '\/tmp\/some-other-store'/);
+  assert.match(r.err, /re-run against the same store root/);
 });
