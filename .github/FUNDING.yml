@@ -1,9 +1,0 @@
-# Renders a "Sponsor" button on the repo. Uncomment and fill the lines you use.
-# Any line left commented is simply ignored — no broken button.
-
-# github: [typicalday]              # GitHub Sponsors — requires enrolling at github.com/sponsors
-# buy_me_a_coffee: your-handle      # https://buymeacoffee.com/<handle>
-# ko_fi: your-handle                # https://ko-fi.com/<handle>
-# open_collective: owenloop         # https://opencollective.com/<slug>  (good fit for a project, not a person)
-# polar: typicalday                 # https://polar.sh  (developer-focused, handles tax/VAT)
-# custom: ["https://your-stripe-payment-link"]   # any URL — Stripe link, PayPal, etc.

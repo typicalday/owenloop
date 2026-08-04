@@ -9,7 +9,7 @@ wearing a workflow costume, and it does not ship.
 Reject `def_draft` (with the concrete, fixable gaps) if ANY of these hold:
 
 1. **Weak gates.** Fewer than two non-trivial enforced gates across the def —
-   where a gate is a `worker: command` step/judge whose exit status decides,
+   where a gate is an `executor: command` step/judge whose exit status decides,
    a judge with a sharp rejection criterion, or a schema on an artifact whose
    shape matters. "The agent will make sure tests pass" in a body is not a
    gate.
