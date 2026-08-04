@@ -1,11 +1,13 @@
 {
   "name": "owenloop",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Deterministic rails for agentic workflows. Declare steps and dependencies; the engine guarantees order, redoes what changes invalidate, and stops what keeps failing — instead of hoping the agent follows through.",
   "license": "Apache-2.0",
   "author": "typicalday",
   "type": "module",
-  "workspaces": ["packages/work"],
+  "workspaces": [
+    "packages/work"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/typicalday/owenloop.git"
