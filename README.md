@@ -471,6 +471,13 @@ never surfacing a token to the model. See the
 - **No native dependencies.** `node:sqlite` is built in, so there's nothing to
   compile. The only runtime deps are `yaml` (parsing defs) and
   `@cfworker/json-schema` (optional per-artifact schema validation).
+- **OpenSSH `ssh-keygen` with `-Y` support** (OpenSSH 8.1+) for the signing
+  features. `owenloop setup` automatically ensures an Ed25519 signing key for
+  each of the three local principals — human, machine, agent — and signs /
+  verifies records with stock SSHSIG (`ssh-keygen -Y`). Keys land in the macOS
+  Keychain, Linux libsecret (`secret-tool`), or a `0700`/`0600` file store
+  under `$HOME/.owenloop/keys/`; one backend is chosen once and never
+  error-fallback. See [Signing and key storage](docs/crypto.md).
 
 ```sh
 npm install owenloop

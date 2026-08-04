@@ -71,6 +71,8 @@ import {
   rekeyAgentCredential,
   storeCredential,
 } from './credentials.ts';
+import { PrincipalKeyManager } from './crypto/keys.ts';
+import type { PrincipalKeyRef } from './crypto/keys.ts';
 import { runMcpCommand } from './mcp/serve.ts';
 import type { LineStream } from './mcp/server.ts';
 import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
@@ -222,6 +224,15 @@ export interface CliIO {
    * real `claude` binary.
    */
   runCommand?: (cmd: string, args: string[]) => { status: number | null; stdout: string; stderr: string };
+  /**
+   * The principal signing-key manager for `setup`'s `[4/7] signing keys` step.
+   * Injectable so setup tests never reach the developer's real `ssh-keygen`,
+   * Keychain, libsecret, SSH agent, or `$HOME` (`makeFakePrincipalKeys` in
+   * test/hubkit.ts). Default: a real `PrincipalKeyManager` over `io.env`.
+   * Structurally `Pick<PrincipalKeyManager, 'ensure'>` — the narrow surface
+   * setup uses — so fakes stay trivial.
+   */
+  principalKeys?: Pick<PrincipalKeyManager, 'ensure'>;
 }
 
 function defaultIO(): CliIO {
@@ -594,7 +605,7 @@ Commands:
   crew rm <crewId> [--hub <url>]           delete a crew; work stamped to it moves to the org's orphan crew
   crew member add <crewId> <principalKind> <principalId> [--hub <url>]   add a member or agent to a crew
   crew member rm <crewId> <principalId> [--hub <url>]   remove a principal from a crew
-  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>]   converge this machine's install: human login, agent credential, owenloop settings, plugin (idempotent)
+  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]   converge this machine's install: human login, agent credential, signing keys, owenloop settings, plugin (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   work <subcommand> [args]                run execution-side shift/hold/exec/agent-run/... commands
@@ -676,7 +687,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
   ['crew', cmdOpts('hub', 'kind', 'owner')],
-  ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'crews', 'scopes')],
+  ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'crews', 'scopes', 'reuse-ssh-key')],
   ['doctor', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
   ['work', cmdOpts()],
@@ -4174,16 +4185,18 @@ function installPluginStep(io: CliIO, state: { claudeFound: boolean; installed: 
 }
 
 /**
- * `owenloop setup` — converge this machine's install in six probe→(skip|act)
+ * `owenloop setup` — converge this machine's install in seven probe→(skip|act)
  * steps, idempotently: a second run performs ZERO writes (no store mutation, no
- * settings write, no browser, no mint/rekey/register POST). Each ACT is reached
- * only through its probe failing.
+ * key generation, no settings write, no browser, no mint/rekey/register POST).
+ * Each ACT is reached only through its probe failing.
  *
  * Flags: `--hub <url>`; mutually-exclusive `--new-agent <name>` / `--replace-agent
  * <name>` (bypass the interactive agent branches); `--crews <a,b>` (mint only —
  * a usage error with `--replace-agent`, which preserves crews); `--scopes <a,b>`
  * (mint only — the minted token's scopes, default `work`; a usage error with
- * `--replace-agent`, which preserves scopes).
+ * `--replace-agent`, which preserves scopes); `--reuse-ssh-key <path>` (human
+ * signing key only — validate an existing Ed25519 SSH key and record it instead
+ * of generating the human key; a conflict with an existing key is a hard error).
  *
  * Exit: 0 when every step ended skipped/done/noted AND doctor's core (non-plugin)
  * checks pass; 1 otherwise. Any hard failure throws (mapped to an exit code by
@@ -4252,11 +4265,22 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     );
   }
 
+  // --reuse-ssh-key: explicit SSH-key reuse for the HUMAN key only. The key
+  // itself is validated (and challenged) inside the signing-keys step; here
+  // only the path shape is checked, so a typo fails BEFORE any browser opens.
+  const reuseSshKey = last(args, 'reuse-ssh-key');
+  if (reuseSshKey !== undefined && reuseSshKey.trim() === '') {
+    throw new CliError('--reuse-ssh-key requires a key file path');
+  }
+  if (reuseSshKey !== undefined && !existsSync(reuseSshKey)) {
+    throw new CliError(`--reuse-ssh-key: no such file: ${reuseSshKey}`);
+  }
+
   const origin = resolveSetupHub(io, args);
   const steps: SetupStep[] = [];
 
-  // --- [1/6] inspect: zero writes, best-effort probes ---
-  io.err('[1/6] inspect');
+  // --- [1/7] inspect: zero writes, best-effort probes ---
+  io.err('[1/7] inspect');
   io.err(`  human credential: ${readCredential(io, origin, { principal: 'human' }) !== null ? 'present' : 'none — will log in'}`);
   const inspectSettingsPath = owenloopSettingsPath(io.env);
   let settingsNote: string;
@@ -4268,7 +4292,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
       const found = raw && typeof raw.hubOrigin === 'string' ? raw.hubOrigin : undefined;
       settingsNote = found === origin ? `hubOrigin already ${origin}` : `hubOrigin ${found ?? '(unset)'} — will update`;
     } catch {
-      settingsNote = 'present but unreadable — step 4 will error if still corrupt';
+      settingsNote = 'present but unreadable — the settings step will error if still corrupt';
     }
   }
   io.err(`  owenloop settings: ${settingsNote}`);
@@ -4281,8 +4305,8 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   );
   steps.push({ step: 'inspect', action: 'done', detail: 'probed local state' });
 
-  // --- [2/6] human login: the hard gate that makes step 3's rekey legal ---
-  io.err('[2/6] human login');
+  // --- [2/7] human login: the hard gate that makes step 3's rekey legal ---
+  io.err('[2/7] human login');
   let humanCred = readCredential(io, origin, { principal: 'human' });
   let humanIdentity: WhoamiIdentity;
   if (humanCred !== null) {
@@ -4308,8 +4332,8 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     steps.push({ step: 'human login', action: 'done', detail: `signed in as ${humanIdentity.email ?? humanIdentity.actor.id}` });
   }
 
-  // --- [3/6] agent ---
-  io.err('[3/6] agent');
+  // --- [3/7] agent ---
+  io.err('[3/7] agent');
   const { res: idRes } = await authedGet(io, origin, { principal: 'human' }, humanCred, '/api/agent_identities');
   if (idRes.status === 403) {
     throw new CliError('setup needs an admin credential to manage Scoped Identities (hub returned 403)');
@@ -4322,8 +4346,12 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   const probe = await probeAgentSlots(io, origin, [...candidateNames], identities);
 
   let agentAccount: string;
+  // The stable principal id for the agent signing key: the hub's agent actor
+  // id (`agentId`), which rekey preserves and mint mints fresh.
+  let agentPrincipalId: string;
   if (probe.verified !== null) {
     agentAccount = probe.verified.name;
+    agentPrincipalId = probe.verified.identity?.id ?? probe.verified.actorId;
     const crewsStr = probe.verified.identity ? ` (crews: ${probe.verified.identity.crews.join(', ') || 'none'})` : '';
     io.err(`✓ agent: ${agentAccount}${crewsStr}`);
     steps.push({ step: 'agent', action: 'skipped', detail: `agent:${agentAccount} verified` });
@@ -4355,18 +4383,40 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     if (action.mode === 'mint') {
       const result = await mintAgentCredential(io, origin, { principal: 'human' }, humanCred, { name: action.name, crews, scopes });
       agentAccount = action.name;
+      agentPrincipalId = result.agentId;
       io.err(`✓ agent: minted agent:${agentAccount} (crews: ${result.crews.join(', ') || 'none'}; scopes: ${result.scopes.join(', ')})`);
       steps.push({ step: 'agent', action: 'done', detail: `minted agent:${agentAccount}` });
     } else {
       const result = await rekeyAgentCredential(io, origin, { principal: 'human' }, humanCred, { agentId: action.agentId, name: action.name });
       agentAccount = action.name;
+      agentPrincipalId = result.agentId;
       io.err(`✓ agent: re-keyed agent:${agentAccount} (revoked ${result.revokedTokenIds.length} old token(s))`);
       steps.push({ step: 'agent', action: 'done', detail: `re-keyed agent:${agentAccount}` });
     }
   }
 
-  // --- [4/6] owenloop settings ---
-  io.err('[4/6] owenloop settings');
+  // --- [4/7] signing keys: human → machine → agent, idempotently ---
+  // Prints kind + state + backend ONLY. Never key bytes, fingerprints,
+  // secret-store values, or reused private-key paths.
+  io.err('[4/7] signing keys');
+  const keys = io.principalKeys ?? new PrincipalKeyManager({ env: io.env });
+  const humanRef: PrincipalKeyRef = { origin, kind: 'human', id: humanIdentity.actor.id };
+  const machineRef: PrincipalKeyRef = { origin, kind: 'machine', id: 'local' };
+  const agentRef: PrincipalKeyRef = { origin, kind: 'agent', id: agentPrincipalId };
+  const ensured: string[] = [];
+  {
+    const human = await keys.ensure(humanRef, reuseSshKey !== undefined ? { reuse: { path: reuseSshKey } } : undefined);
+    ensured.push(`human ${human.state} (${human.backend})`);
+    const machine = await keys.ensure(machineRef);
+    ensured.push(`machine ${machine.state} (${machine.backend})`);
+    const agent = await keys.ensure(agentRef);
+    ensured.push(`agent ${agent.state} (${agent.backend})`);
+  }
+  io.err(`✓ signing keys: ${ensured.join(', ')}`);
+  steps.push({ step: 'signing keys', action: 'done', detail: ensured.join(', ') });
+
+  // --- [5/7] owenloop settings ---
+  io.err('[5/7] owenloop settings');
   const settingsPath = owenloopSettingsPath(io.env);
   const existingSettings = readOwenloopSettingsRaw(settingsPath); // corrupt file → hard CliError (never clobber)
   const currentHub = existingSettings && typeof existingSettings.hubOrigin === 'string' ? existingSettings.hubOrigin : undefined;
@@ -4382,8 +4432,8 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     io.err(`non-default agent account — run owenloop work with OWENLOOP_ACCOUNT=${agentAccount}`);
   }
 
-  // --- [5/6] plugin (non-fatal) ---
-  io.err('[5/6] plugin');
+  // --- [6/7] plugin (non-fatal) ---
+  io.err('[6/7] plugin');
   const pluginState = probePlugin(io);
   if (pluginState.installed) {
     io.err('✓ plugin: owenloop installed');
@@ -4397,8 +4447,8 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     });
   }
 
-  // --- [6/6] doctor pass ---
-  io.err('[6/6] doctor');
+  // --- [7/7] doctor pass ---
+  io.err('[7/7] doctor');
   const doctor = await runDoctor(io, origin);
 
   print(io, { ok: doctor.ok, hub: origin, steps, doctor: { ok: doctor.ok, checks: doctor.checks } });

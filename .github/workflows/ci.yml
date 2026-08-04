@@ -32,3 +32,27 @@ jobs:
       - run: npm ci
 
       - run: bash .dev/checks.sh
+
+  # Real SSHSIG interoperability: both OS runners ship stock `ssh-keygen` with
+  # `-Y` support, so the crypto tests run unskipped — module sign → stock
+  # verify and stock sign → module verify in both directions, plus the secure
+  # file-backend fallback (ubuntu has no `secret-tool` service in CI; macOS
+  # Keychain is never touched — storage adapters stay hermetic via fakes).
+  crypto-interop:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    name: crypto interop (${{ matrix.os }})
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run test:crypto
