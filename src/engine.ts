@@ -47,6 +47,8 @@ import type {
   ReasonAction,
   WorkflowDef,
 } from './types.ts';
+import { createDefInstructionSource, OrderResolver } from './order-resolver.ts';
+import type { OrderInstructionSource, ResolvedInstructions } from './order-resolver.ts';
 
 export type { Order } from './types.ts';
 
@@ -271,6 +273,15 @@ export interface ReapDetail {
 export class Engine {
   readonly store: Store;
   private readonly resolveDef: DefResolver;
+  /**
+   * The reference-mode instruction boundary (WP-B1): where an order's
+   * `defDigest` turns back into exact authored instructions. Injected when a
+   * host supplies a WP-A3-compatible source; otherwise a loaded-definition
+   * adapter that still emits and resolves reference orders (not a
+   * compatibility mode). Public read-only facade: {@link Engine.resolver}.
+   */
+  private readonly instructionSource: OrderInstructionSource;
+  readonly resolver: OrderResolver;
   private readonly reapTtlMs: number;
   private readonly maxLeaseMs: number | undefined;
   private readonly maxCallDepth: number;
@@ -298,10 +309,20 @@ export class Engine {
       onEvent?: EngineListener;
       /** Where a throwing listener's error goes (default: swallowed). */
       onListenerError?: (err: unknown, event: EngineEvent) => void;
+      /**
+       * WP-A3-compatible digest/instruction source (WP-B1 seam). When
+       * supplied, `buildOrder` takes definition digests from it and
+       * resolution reads its verified records; when absent, the engine
+       * builds a loaded-definition adapter (same reference-mode behavior,
+       * no legacy fallback).
+       */
+      instructionSource?: OrderInstructionSource;
     } = {},
   ) {
     this.store = store;
     this.resolveDef = resolveDef;
+    this.instructionSource = opts.instructionSource ?? createDefInstructionSource();
+    this.resolver = new OrderResolver(this.instructionSource);
     this.reapTtlMs = opts.reapTtlMs ?? DEFAULT_REAP_TTL_MS;
     this.maxLeaseMs = opts.maxLeaseMs;
     this.maxCallDepth = opts.maxCallDepth ?? DEFAULT_MAX_CALL_DEPTH;
@@ -1465,6 +1486,17 @@ export class Engine {
     return order;
   }
 
+  /**
+   * Build the reference-mode order for a firing (WP-B1). Carries the pinned
+   * snapshot's `defDigest` plus routing/reference fields, dynamic `consumes`
+   * values, and dynamic `owes` feedback — but NEVER authored prompt or
+   * command text, and no `owes[].acceptance` (the lifecycle state is dynamic
+   * engine state, not instructions). The digest comes from the instruction
+   * source's identity for the exact `def` passed in — the pinned snapshot
+   * from `defFor(workflow)`, never a fresh name lookup — and that same
+   * snapshot is registered under the digest (a side effect of `digestOf`),
+   * so the order stays resolvable after the live definition map changes.
+   */
   private buildOrder(
     def: WorkflowDef,
     workflow: string,
@@ -1473,6 +1505,7 @@ export class Engine {
     arts: ArtifactMap,
   ): Order {
     const step = this.step(def, f.step);
+    const defDigest = this.instructionSource.digestOf(def);
     const consumes: Record<string, unknown> = {};
     for (const p of f.inputs) {
       const a = arts.get(p);
@@ -1482,7 +1515,6 @@ export class Engine {
       const a = arts.get(p);
       return {
         path: p,
-        acceptance: a?.acceptance ?? 'owed',
         judgmentRejects: a?.judgmentRejects ?? 0,
         schemaRejects: a?.schemaRejects ?? 0,
         reasons: a?.reasons ?? [],
@@ -1493,33 +1525,33 @@ export class Engine {
       workflow,
       step: f.step,
       key: f.key,
+      defDigest,
       inputs: f.inputs,
       outputs: f.outputs,
-      prompt: substitute(step.body, {
-        WORKFLOW: workflow,
-        RUN: runId,
-        STEP: f.step,
-        KEY: f.key,
-        INDEX: f.index === undefined ? '' : String(f.index),
-        // Intentionally step-generic: a single firing can discharge multiple
-        // outputs (f.outputs) at once, so there is no single produce to
-        // resolve a per-produce maxAttempts override against here. This
-        // always reflects the step default even when individual produces
-        // override it (see model.ts effectiveMaxAttempts()).
-        MAX_ATTEMPTS: String(step.maxAttempts),
-      }),
       consumes,
       owes,
     };
     if (f.index !== undefined) order.index = f.index;
     if (step.workdir !== undefined) order.workdir = step.workdir;
     if (step.model !== undefined) order.model = step.model;
-    if (step.executor !== undefined) order.executor = step.executor;
-    if (step.command !== undefined) order.command = step.command;
+    if (step.executor !== undefined) order.worker = step.executor;
     if (step.spec !== undefined) order.spec = step.spec;
     if (step.x !== undefined) order.x = step.x;
     if (f.cause !== undefined) order.cause = f.cause;
     return order;
+  }
+
+  /**
+   * Resolve an order's static instructions through the SAME `(defDigest,
+   * step, key)` boundary {@link Engine.resolver} uses: exact authored prompt
+   * and command bytes (plus source-owned acceptance when the source carries
+   * it), with the runtime placeholders materialized in the prompt. Purely a
+   * read — never mutates the stored/emitted order, and never re-embeds text
+   * on it. Throws `UnknownDefDigestError` when no verified record exists for
+   * the order's digest — before any caller can execute a prompt or command.
+   */
+  resolveOrder(order: Order): ResolvedInstructions {
+    return this.resolver.resolveOrder(order);
   }
 
   // ---- producer commits ------------------------------------------------------
@@ -2907,10 +2939,6 @@ function nextIndex(arts: ArtifactMap, stem: string): number {
     if (el && el.stem === stem && el.suffix === '') max = Math.max(max, el.index);
   }
   return max + 1;
-}
-
-function substitute(body: string, vars: Record<string, string>): string {
-  return body.replace(/\$\{(\w+)\}/g, (m, k: string) => (k in vars ? vars[k] ?? '' : m));
 }
 
 /** M2B: structural deep-equal, order-insensitive on object keys (artifact values are always JSON-shaped). */

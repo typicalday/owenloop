@@ -10,8 +10,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createEngine } from '../src/factory.ts';
 import { DefError } from '../src/defs.ts';
+import type { OrderInstructionRef, OrderInstructionSource, ResolvedInstructions } from '../src/order-resolver.ts';
 import type { WorkflowDef } from '../src/types.ts';
-import { def, input, step } from './helpers.ts';
+import { assertReferenceContract, def, input, step } from './helpers.ts';
 
 const EXAMPLES = join(import.meta.dirname, '..', 'examples', 'workflows');
 
@@ -278,5 +279,79 @@ test('createEngine: REL-4 a valid composed in-memory set still constructs and dr
 
   engine.tick(wf); // deep tick — maintainCalls spawns the childOk instance
   assert.ok(store.findChildByParent(wf, 'delivered'), 'composed child was spawned — composition intact');
+  store.close();
+});
+
+// ---- WP-B1: reference-mode orders through the factory ------------------------
+
+test('createEngine: in-memory and defsDir orders are the same reference shape, resolvable through the returned resolver', () => {
+  // in-memory path
+  const inMem = createEngine({ db: ':memory:', defs: [tiny] });
+  const wf1 = inMem.engine.createInstance('tiny');
+  const orders1 = inMem.engine.tick(wf1).orders;
+  assert.equal(orders1.length, 1);
+  const memOrder = orders1[0]!;
+  assertReferenceContract(memOrder);
+  // the returned resolver is the engine's facade — same object, same source
+  assert.equal(inMem.resolver, inMem.engine.resolver, 'CreatedEngine.resolver IS the engine resolver facade');
+  const memResolved = inMem.resolver.resolveOrder(memOrder);
+  assert.equal(memResolved.prompt, 'run step', 'in-memory order resolves its authored body');
+
+  // defsDir path
+  const fromDir = createEngine({ db: ':memory:', defsDir: EXAMPLES });
+  const wf2 = fromDir.engine.createInstance('delivery', { provide: { proposal: { text: 'x' } } });
+  const orders2 = fromDir.engine.tick(wf2).orders;
+  assert.equal(orders2.length, 1);
+  const dirOrder = orders2[0]!;
+  assertReferenceContract(dirOrder);
+  // identical reference field set — one shape for both paths
+  assert.deepEqual(
+    Object.keys(dirOrder).sort(),
+    Object.keys(memOrder).sort(),
+    'defsDir and in-memory orders carry the exact same reference fields',
+  );
+  const dirResolved = fromDir.resolver.resolveOrder(dirOrder);
+  assert.equal(typeof dirResolved.prompt, 'string');
+  assert.ok(dirResolved.prompt!.length > 0);
+  inMem.store.close();
+  fromDir.store.close();
+});
+
+test('createEngine: an injected WP-A3-compatible source supplies the digest and the exact instruction record', () => {
+  const FAKE_DIGEST = 'a3-canonical-digest-0123456789abcdef';
+  const FAKE_PROMPT = 'verified prompt from the injected source';
+  const FAKE_ACCEPTANCE = 'verified acceptance from the injected source';
+  const lookups: OrderInstructionRef[] = [];
+  const source: OrderInstructionSource = {
+    digestOf: () => FAKE_DIGEST,
+    lookup: (ref) => {
+      lookups.push(ref);
+      if (ref.defDigest !== FAKE_DIGEST) return undefined;
+      const resolved: ResolvedInstructions = { prompt: FAKE_PROMPT, acceptance: FAKE_ACCEPTANCE };
+      return resolved;
+    },
+  };
+
+  const { engine, store, resolver } = createEngine({ db: ':memory:', defs: [tiny], instructionSource: source });
+  const wf = engine.createInstance('tiny');
+  const order = engine.tick(wf).orders[0]!;
+
+  // buildOrder used the supplied digest, not the fallback identity
+  assert.equal(order.defDigest, FAKE_DIGEST);
+  assertReferenceContract(order);
+
+  // the public resolver uses the supplied record — body bytes are the
+  // source's verified bytes, not the loaded def's authored body
+  const resolved = resolver.resolveOrder(order);
+  assert.equal(resolved.prompt, FAKE_PROMPT);
+  assert.equal(resolved.acceptance, FAKE_ACCEPTANCE);
+  assert.equal(resolved.command, undefined);
+  assert.ok(lookups.some((l) => l.defDigest === FAKE_DIGEST && l.step === 'step'), 'resolver consulted the injected source');
+
+  // an unknown digest against the same source is still the named refusal
+  assert.throws(
+    () => resolver.resolve({ defDigest: 'not-a-real-digest', step: 'step', key: '' }),
+    (err: unknown) => err instanceof Error && err.name === 'UnknownDefDigestError',
+  );
   store.close();
 });

@@ -153,42 +153,61 @@ export interface TaskData {
 }
 
 /** A run node — audit/budget trail, and the holder of a claim's fingerprint. */
-/** A self-contained unit of work emitted by a tick. */
+/**
+ * A reference-mode unit of work emitted by a tick (WP-B1). The order is a
+ * REFERENCE packet: `defDigest` identifies the pinned definition snapshot
+ * that emitted it, and the authored static instruction bytes (prompt,
+ * command, acceptance) ride the resolver boundary instead — see
+ * `OrderResolver` in order-resolver.ts. An order NEVER carries authored
+ * prompt or command text, nor `owes[].acceptance` (the artifact lifecycle
+ * state is dynamic engine state, not channel-1 instructions). It does carry
+ * the routing/reference fields, the dynamic consumed input values, and the
+ * dynamic rejection feedback. One shape serves both local (`owenloop tick`)
+ * and embedded/library callers — there is no verify-mode or legacy branch.
+ */
 export interface Order {
   run: string;
   workflow: string;
   step: string;
   key: string;
   index?: number;
+  /** The digest of the definition snapshot this order was emitted against.
+   *  Resolves static instructions through the `(defDigest, step, key)`
+   *  boundary; an unknown digest is a named refusal (UnknownDefDigestError). */
+  defDigest: string;
   inputs: string[];
   outputs: string[];
   workdir?: string;
   model?: string;
-  /** Declares which kind of executor this order is for. Absent = 'agent'
+  /** Declares which kind of worker this order is for. Absent = 'agent'
    *  (today's behavior). Opaque to the engine; carried through verbatim from
-   *  the step definition, same pass-through contract as `model`/`x`. */
-  executor?: string;
-  /** The command string for a `executor: command` order. Opaque to the engine
-   *  — never parsed, never shelled out. */
-  command?: string;
-  /** Opaque config object for a non-agent/non-command executor type (or
-   *  alongside `command`). Carried through untouched, contents never read. */
+   *  the authored step's `executor:` field (the YAML grammar is unchanged),
+   *  same pass-through contract as `model`/`x`. */
+  worker?: string;
+  /** Opaque config object for a non-agent/non-command worker type (or
+   *  alongside a command). Carried through untouched, contents never read. */
   spec?: Record<string, unknown>;
   /** §27.3: the step's opaque `x:` extension map, carried through untouched
    *  (same pass-through contract as `model`). The engine never reads it —
    *  it exists for the external runner/tooling consuming this order. */
   x?: Record<string, unknown>;
-  prompt: string;
   /** captured handles of the green inputs this run builds on */
   consumes: Record<string, unknown>;
   /** the owed outputs and their accumulated reason threads (the feedback channel) */
   owes: Array<{
     path: string;
-    acceptance: string;
     judgmentRejects: number;
     schemaRejects: number;
     reasons: ReasonEntry[];
+    /** Opaque proof/signature placeholder for future WP-A4-signed reason
+     *  threads. Data-only today: no cryptographic code attaches or verifies
+     *  it — the slot exists so signed dynamic data can land without changing
+     *  the reference-mode wire shape. */
+    proof?: string;
   }>;
+  /** Opaque proof/signature placeholder for future WP-A4-signed dynamic
+   *  consume values. Data-only today — same contract as `owes[].proof`. */
+  consumesProof?: string;
   /** The trigger that woke this firing (§21). Absent = 'inputsGreen'. */
   cause?: FiringTrigger;
 }

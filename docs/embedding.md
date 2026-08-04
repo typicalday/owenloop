@@ -16,13 +16,15 @@ can react the instant the graph advances instead of polling.
 ```ts
 import { createEngine } from 'owenloop';
 
-const { engine, store } = createEngine({
+const { engine, store, resolver } = createEngine({
   db: '.owenloop/state.db',   // SQLite path; ':memory:' for ephemeral. Default: .owenloop/state.db
   defsDir: 'workflows',      // load *.yaml defs from a directory
 });
 ```
 
-`createEngine(opts)` returns `{ engine, store, defs }` and accepts:
+`createEngine(opts)` returns `{ engine, store, defs, resolver }` — `resolver`
+is the order's instruction resolver (see [The worker step](#the-worker-step)),
+the same one the engine uses internally — and accepts:
 
 | option      | meaning |
 |-------------|---------|
@@ -32,6 +34,7 @@ const { engine, store } = createEngine({
 | `reapTtlMs` | Forwarded to the `Engine` — the stranded-lease reap TTL. |
 | `maxLeaseMs` | Forwarded to the `Engine` — an opt-in hard cap on total lease lifetime (per-step `maxLease:` overrides). Unset (default): no cap; heartbeats extend a lease indefinitely. Set it only as a runaway backstop — it can reap a healthy, still-beating job. |
 | `maxCallDepth` | Forwarded to the `Engine` — the hard cap on `calls:` composition depth (root instance = depth 0). Defaults to 64. Defense in depth against a `calls:` cycle; only relevant when you hand-wire a custom `DefResolver` that construction-time validation can't inspect. |
+| `instructionSource` | The order-instruction source (`OrderInstructionSource`: `digestOf` + `lookup` + optional `stepDef`). Default: an adapter over the definitions this engine loads — the same reference-mode behavior the CLI gets. Supply your own to serve digests and instructions from a content-addressed store of verified definitions; `buildOrder` takes digests from it and `resolver` reads its records (see [Resolving instructions](#resolving-instructions)). |
 | `onEvent`   | A push-style observer registered at construction (equivalent to `engine.subscribe`). See [Events](#events). |
 | `onListenerError` | Where a throwing listener's error is routed (default: swallowed). |
 
@@ -70,7 +73,8 @@ const wf = engine.createInstance('delivery', {
 
 const { orders } = engine.tick(wf);
 for (const order of orders) {
-  const result = await runYourWorker(order);              // ← your domain
+  const instructions = resolver.resolveOrder(order);      // { prompt?, command? }
+  const result = await runYourWorker(order, instructions); // ← your domain
   const commit = engine.green(wf, order.run, order.outputs[0], result);
   if (commit.outcome !== 'green') {
     // born-rejected (an input moved) or schema-rejected (§18) — inspect commit.reason
@@ -81,13 +85,39 @@ for (const order of orders) {
 const status = engine.status(wf);   // { done, debts, eligible, blocked, inFlight }
 ```
 
-Each `order` is self-contained: `workflow` (the instance it belongs to — see
-deep tick below), `prompt`, `consumes` (the captured green inputs), `owes` (the
-owed outputs + their accumulated reason threads), plus
-`inputs`/`outputs`/`model`/`executor`/`command`/`spec`. A consumer rejecting an
-upstream artifact is just `engine.reject(wf, path, by, text)`; the forward
-cascade and stall liveness behave exactly as they do under the CLI, because
-it's the same engine.
+Each `order` is a **reference packet**: `workflow` (the instance it belongs
+to — see deep tick below), `defDigest` (identifies the definition snapshot to
+resolve instructions from), `consumes` (the captured green inputs), `owes`
+(the owed outputs + their accumulated reason threads), plus
+`inputs`/`outputs`/`workdir`/`model`/`worker`/`spec`/`x`/`cause`. It carries
+no authored prompt or command text — those resolve through `resolver` by
+digest (next section). A consumer rejecting an upstream artifact is just
+`engine.reject(wf, path, by, text)`; the forward cascade and stall liveness
+behave exactly as they do under the CLI, because it's the same engine.
+
+### Resolving instructions
+
+Orders are resolved before dispatch through the `(defDigest, step, key)`
+boundary — `resolver.resolveOrder(order)` (or `resolver.resolve(ref)` for a
+bare reference). The resolver is backed by an `OrderInstructionSource`, and
+the same path serves every caller: the CLI, this embedded engine, and orders
+relayed from a remote coordinator or transport all resolve through one
+boundary, against whatever source the deployer trusts. The shipped default is
+the loaded-definition adapter (seeded with the defs this engine runs); a host
+that distributes definitions from a content-addressed store can inject its own
+source via `instructionSource` — `buildOrder` takes digests from it and
+resolution reads its verified records, with no other engine change.
+
+Resolution returns `{ prompt?, command?, acceptance? }` — the exact authored
+values, byte-for-byte (a step with an empty body resolves to no prompt; the
+resolver never fabricates text), with the runtime placeholders
+(`${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MAX_ATTEMPTS}`)
+materialized into the prompt. An unknown digest — the definition was never
+delivered, or the bytes don't match what emitted the order — raises the named
+refusal `UnknownDefDigestError` (it carries `defDigest`, and its message names
+it). Treat that as refuse-the-job: there is no fallback to name-based
+resolution and no degraded mode. See [`docs/design.md` §29](design.md) for the
+full contract.
 
 `engine.tick(wf)` is **deep by default**: after ticking `wf` it descends into
 every live `calls:` child (recursively), folding their orders, `reaped`, folded
@@ -111,27 +141,32 @@ one `TickResult` belongs to the instance you ticked; each order carries its own
 (CLI `--shallow`) stays the deliberate single-instance escape hatch when you
 want exactly the old behavior.
 
-`order.executor` is where dispatch-by-executor-type earns its keep in an
+`order.worker` is where dispatch-by-worker-type earns its keep in an
 embedder: rather than every order going to the same LLM-driving `runYourWorker`,
 branch on it before deciding how to run the order.
 
 ```ts
 for (const order of orders) {
+  const instructions = resolver.resolveOrder(order);
   const result =
-    order.executor === 'command'
-      ? await runCommand(order.command!, order.spec)  // order.command is opaque — never shelled out by owenloop itself
-      : await runYourAgent(order);                     // default / executor: 'agent' / anything else you handle the same way
+    order.worker === 'command'
+      ? await runCommand(instructions.command!, order.spec)  // resolved command text is opaque to owenloop — never shelled out by the engine itself
+      : await runYourAgent(order, instructions.prompt);      // default / worker: 'agent' / anything else you handle the same way
 
   const commit = engine.green(wf, order.run, order.outputs[0], result);
   engine.close(wf, order.run);
 }
 ```
 
-`executor`/`command`/`spec` are all optional and opaque — the engine only
-shape-checks them at load time (`command` a string, `spec` a plain map) and
-never reads their contents itself. `order.executor` is `undefined` when the
-step never set it (today's default, unaffected by this feature). See
-[`docs/design.md` §27.4](design.md) for the full contract and
+`worker`/`spec` are optional and opaque on the order; the authored
+`executor:`/`command:`/`spec:` are shape-checked at load time (`command` a
+string, `spec` a plain map) and the engine never reads their contents itself.
+`order.worker` maps verbatim from the authored step's `executor:` and is
+`undefined` when the step never set it (today's default, unaffected by this
+feature); the authored `command:` text is not on the order — it arrives via
+`resolver.resolveOrder(order).command`. See
+[`docs/design.md` §27.4](design.md) for the authored contract,
+[§29](design.md) for the reference-mode order, and
 [`docs/authoring.md`](authoring.md#executor--declaring-the-executor) for how to
 declare it on a step.
 

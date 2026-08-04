@@ -101,9 +101,10 @@ test('delivery: full pipeline with a reviewer knock-back ends green & terminal',
 
   // the knock-back re-armed the builder (this tick proves it)
   o = orderFor(ow('tick', wf), 'builder');
-  // the feedback thread is delivered on the order's `owes`
+  // the dynamic feedback thread is delivered on the order's `owes` — the
+  // lifecycle state itself is not (reference mode never mirrors acceptance)
   const prOwe = o.owes.find((x: any) => x.path === 'pr');
-  assert.equal(prOwe.acceptance, 'rejected');
+  assert.equal(prOwe.acceptance, undefined, 'reference orders carry no owes[].acceptance');
   assert.ok(prOwe.reasons.at(-1).text.includes('tests missing'));
   ow('green', wf, o.run, 'pr', '--value', JSON.stringify({ url: 'pr/2' }));
   ow('close', wf, o.run);
@@ -353,6 +354,14 @@ test('§28: an in-flight instance stays pinned to its original def shape after t
   let st = ow('status', wf);
   assert.equal(st.defDrift, false, 'no drift yet — the source has not moved');
 
+  // Baseline: capture the digest the ORIGINAL (pre-edit) definition emits
+  // against, then release the claim as no_work so planner stays eligible for
+  // the post-edit tick below. Reference mode keeps the authored body off the
+  // order, so digest equality is the pinning proof here.
+  const baseline = ow('tick', wf);
+  const digest0 = orderFor(baseline, 'planner').defDigest;
+  ow('close', wf, orderFor(baseline, 'planner').run, '--outcome', 'no_work');
+
   // 2. Edit the YAML on disk: change planner's body AND add a brand-new step
   // (notifier) so there's both a "changed prompt" and a "fresh debt" to prove
   // out.
@@ -377,12 +386,15 @@ test('§28: an in-flight instance stays pinned to its original def shape after t
   writeFileSync(yamlPath, edited);
 
   // 3. tick the ALREADY-CREATED instance: it must still behave per the
-  // ORIGINAL (pinned) shape — planner's prompt/body must still be the old
-  // one, not the new one, and no 'notice' debt should appear (that step
-  // doesn't exist in the pinned snapshot).
+  // ORIGINAL (pinned) shape — planner's order must still carry the ORIGINAL
+  // defDigest (reference mode: the authored body rides the resolver, never
+  // the order), and no 'notice' debt should appear (that step doesn't exist
+  // in the pinned snapshot).
   const t1 = ow('tick', wf);
   const plannerOrder = orderFor(t1, 'planner');
-  assert.match(plannerOrder.prompt, /original prompt/, 'pinned instance must use the ORIGINAL body, not the edited one');
+  assert.equal(typeof plannerOrder.defDigest, 'string', 'reference order carries a defDigest');
+  assert.equal(plannerOrder.defDigest, digest0, 'pinned instance must emit orders against the ORIGINAL definition digest');
+  assert.equal(plannerOrder.prompt, undefined, 'no authored prompt text rides the order in reference mode');
 
   ow('green', wf, plannerOrder.run, 'plan', '--value', JSON.stringify({ v: 1 }));
   ow('close', wf, plannerOrder.run);
@@ -414,6 +426,11 @@ test('§28: an in-flight instance stays pinned to its original def shape after t
   builder: {
     const tb = ow('tick', wf);
     const builderOrder = orderFor(tb, 'builder');
+    assert.notEqual(
+      builderOrder.defDigest,
+      digest0,
+      'after adopt, orders carry the NEW definition digest',
+    );
     ow('green', wf, builderOrder.run, 'pr', '--value', JSON.stringify({ n: 1 }));
     ow('close', wf, builderOrder.run);
   }

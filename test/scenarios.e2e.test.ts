@@ -127,7 +127,9 @@ test('§4 a re-armed order carries the artifact\'s full reason history in owes[]
   const reorder = find(ow('tick', wf), 'builder');
   const owed = reorder.owes.find((o: any) => o.path === 'pr');
   assert.ok(owed, 'the re-armed order owes pr');
-  assert.equal(owed.acceptance, 'rejected');
+  // reference-mode orders (WP-B1) carry no owes[].acceptance — the lifecycle
+  // state lives on the artifact row
+  assert.equal(art(ow, wf, 'pr').acceptance, 'rejected');
   assert.equal(owed.judgmentRejects, 1);
   assert.equal(owed.reasons.at(-1).text, 'needs tests', 'the worker sees why it was knocked back');
   assert.equal(owed.reasons.at(-1).by, 'reviewer');

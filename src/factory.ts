@@ -27,6 +27,8 @@ import { openStore } from './store.ts';
 import type { Store } from './store.ts';
 import { dbPathRefusingSymlink, mkdirRefusingSymlink } from './util.ts';
 import { finalizeDefs, loadDefs } from './defs.ts';
+import { createDefInstructionSource, OrderResolver } from './order-resolver.ts';
+import type { OrderInstructionSource } from './order-resolver.ts';
 import type { WorkflowDef } from './types.ts';
 
 export interface CreateEngineOpts {
@@ -70,6 +72,14 @@ export interface CreateEngineOpts {
   onEvent?: EngineListener;
   /** Where a throwing `onEvent`/subscriber's error goes (default: swallowed). */
   onListenerError?: (err: unknown, event: EngineEvent) => void;
+  /**
+   * WP-A3-compatible digest/instruction source (the WP-B1 seam). When
+   * supplied, emitted orders take their `defDigest` from this source and
+   * resolution reads its verified records; when absent, `createEngine`
+   * builds one loaded-definition resolver from the finalized def set —
+   * same reference-mode behavior, no legacy branch.
+   */
+  instructionSource?: OrderInstructionSource;
 }
 
 export interface CreatedEngine {
@@ -77,6 +87,12 @@ export interface CreatedEngine {
   store: Store;
   /** The resolved definition set, so a host can introspect what was registered. */
   defs: Map<string, WorkflowDef>;
+  /**
+   * The reference-order resolver (WP-B1) — the one resolution path for
+   * emitted orders. Identical to `engine.resolver`; returned here so an
+   * embedder can resolve without holding the engine object.
+   */
+  resolver: OrderResolver;
 }
 
 /**
@@ -134,19 +150,28 @@ export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
     return d;
   };
 
+  // WP-B1: one resolver for reference orders, shared by the engine (emission)
+  // and returned to the embedder (resolution). Seeded with the finalized def
+  // set so their digests are registered up front; `buildOrder` re-registers
+  // each exact pinned snapshot it emits against.
+  const instructionSource =
+    opts.instructionSource ?? createDefInstructionSource(defs.values());
+
   const engineOpts: {
     reapTtlMs?: number;
     maxLeaseMs?: number;
     maxCallDepth?: number;
     onEvent?: EngineListener;
     onListenerError?: (err: unknown, event: EngineEvent) => void;
+    instructionSource?: OrderInstructionSource;
   } = {};
   if (opts.reapTtlMs !== undefined) engineOpts.reapTtlMs = opts.reapTtlMs;
   if (opts.maxLeaseMs !== undefined) engineOpts.maxLeaseMs = opts.maxLeaseMs;
   if (opts.maxCallDepth !== undefined) engineOpts.maxCallDepth = opts.maxCallDepth;
   if (opts.onEvent !== undefined) engineOpts.onEvent = opts.onEvent;
   if (opts.onListenerError !== undefined) engineOpts.onListenerError = opts.onListenerError;
+  engineOpts.instructionSource = instructionSource;
 
   const engine = new Engine(store, resolveDef, engineOpts);
-  return { engine, store, defs };
+  return { engine, store, defs, resolver: engine.resolver };
 }

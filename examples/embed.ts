@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { createEngine } from '../src/index.ts';
 
 // An ephemeral in-memory store; defs loaded from this directory's YAML.
-const { engine, store } = createEngine({
+const { engine, store, resolver } = createEngine({
   db: ':memory:',
   defsDir: join(import.meta.dirname, 'workflows'),
 });
@@ -27,16 +27,24 @@ const wf = engine.createInstance('delivery', {
 console.log('created instance:', wf);
 
 // Pull eligible orders. Only `planner` is eligible — it's the one step whose
-// input (`proposal`) is green.
+// input (`proposal`) is green. Orders are REFERENCE packets: they carry a
+// defDigest and routing/dynamic fields, never the authored prompt text.
 const { orders } = engine.tick(wf);
 const order = orders[0];
 if (!order) throw new Error('expected a planner order');
-console.log(`order: ${order.step} → owes ${order.owes.map((o) => o.path).join(', ')}`);
+console.log(`order: ${order.step} (defDigest ${order.defDigest.slice(0, 12)}…) → owes ${order.owes.map((o) => o.path).join(', ')}`);
 
-// Report the planner's output, then release the lease.
-const result = engine.green(wf, order.run, 'plan', { plan: 'do the thing' });
+// Resolve the reference into exact authored instructions BEFORE dispatching —
+// the same boundary local and remote orders use; an unknown digest raises
+// UnknownDefDigestError here, before anything executes.
+const instructions = resolver.resolveOrder(order);
+console.log('resolved prompt:', JSON.stringify(instructions.prompt));
+
+// Report the planner's output (keyed by order.workflow/run/output path),
+// then release the lease.
+const result = engine.green(order.workflow, order.run, order.outputs[0]!, { plan: 'do the thing' });
 console.log('green →', result.outcome);
-engine.close(wf, order.run);
+engine.close(order.workflow, order.run);
 
 // `status` is a pure read over artifact state — never a lie.
 const status = engine.status(wf);

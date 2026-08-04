@@ -281,16 +281,18 @@ test('run cause round-trips through insert and update', () => {
 });
 
 function sampleOrder(over: Partial<Order> = {}): Order {
+  // WP-B1 reference shape: defDigest present, no prompt/command, no
+  // owes[].acceptance — dynamic consumes/reasons ride, static text does not.
   return {
     run: 'run_sample',
     workflow: 'wf_sample',
     step: 'builder',
     key: '',
+    defDigest: 'deadbeef'.repeat(8),
     inputs: ['proposal'],
     outputs: ['pr'],
-    prompt: 'build the thing',
     consumes: { proposal: { text: 'do it', n: 3 } },
-    owes: [{ path: 'pr', acceptance: 'owed', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+    owes: [{ path: 'pr', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     ...over,
   };
 }

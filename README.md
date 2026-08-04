@@ -159,9 +159,10 @@ Two things make this more than running steps in dependency order:
   itself (which steps exist, what each consumes and produces) is fixed when
   the definition loads, not mutable while an instance runs.
 - **Not a command runner.** `executor:`/`command:` declare which kind of
-  executor an order is for and carry a command string through untouched —
-  the engine never shells out, executes, or interprets it. Actually running
-  anything is always the dispatcher's job, on the other side of `tick`.
+  worker an order is for (`Order.worker`) and what command text a worker
+  resolves for it — the engine never shells out, executes, or interprets
+  it. Actually running anything is always the dispatcher's job, on the other
+  side of `tick`.
 
 ---
 
@@ -256,15 +257,18 @@ will do. See
 
 ### Worker dispatch
 
-`executor: agent | command | …` declares which kind of executor a step's order
-is for — the default (`agent`, silent when omitted) is unaffected; every
-def written before this feature stays byte for byte the same. Opt a step
-into `executor: command` and give it a `command:` string to switch it to a
-deterministic executor instead of an LLM — the engine never runs it, only
-carries it through on the order for your dispatcher to branch on. An
-optional `spec:` map carries further opaque config (a timeout, a working
-directory), and a judge entry accepts the same fields, so a quality gate can
-be a script's exit code instead of a verdict. See
+`executor: agent | command | …` declares which kind of worker a step's order
+is for — the authored value lands on the order as `Order.worker`, and the
+default (`agent`, silent when omitted) is unaffected; every def written
+before this feature stays byte for byte the same. Opt a step into
+`executor: command` and give it a `command:` string to switch it to a
+deterministic worker instead of an LLM — the engine never runs it; your
+dispatcher branches on `order.worker` and resolves the authored command text
+through the order's `defDigest` at the `(defDigest, step, key)` boundary —
+the packet itself carries no command text. An optional `spec:` map carries further
+opaque config (a timeout, a working directory), and a judge entry accepts the
+same fields, so a quality gate can be a script's exit code instead of a
+verdict. See
 [`docs/authoring.md`](docs/authoring.md#executor--declaring-the-executor) and
 [`command-executor.yaml`](examples/workflows/command-executor.yaml).
 
@@ -500,7 +504,7 @@ is an ordinary class, so you can drive it **in-process** and get typed objects b
 ```ts
 import { createEngine } from 'owenloop';
 
-const { engine, store } = createEngine({
+const { engine, store, resolver } = createEngine({
   db: '.owenloop/state.db',         // or ':memory:' for an ephemeral instance
   defsDir: 'workflows',             // load YAML defs from a dir … or pass `defs: [myDef]`
 });
@@ -510,12 +514,16 @@ const wf = engine.createInstance('delivery', {
   provide: { proposal: { text: 'add dark mode' } },
 });
 
-// the Step Agent loop: tick → run → report
+// the Step Agent loop: tick → resolve → run → report
 const { orders } = engine.tick(wf);
 for (const order of orders) {
-  const result = await runYourAgent(order);              // ← your domain
-  engine.green(wf, order.run, order.outputs[0], result); // typed CommitResult back
-  engine.close(wf, order.run);
+  // orders are reference packets: routing + dynamic data + a defDigest, never
+  // authored prompt/command text. Resolve before dispatch — same boundary the
+  // CLI uses; an unknown digest throws UnknownDefDigestError here.
+  const instructions = resolver.resolveOrder(order);     // { prompt?, command? }
+  const result = await runYourAgent(order, instructions); // ← your domain
+  engine.green(order.workflow, order.run, order.outputs[0], result); // typed CommitResult back
+  engine.close(order.workflow, order.run);
 }
 
 engine.status(wf);   // typed WorkflowStatus: done / debts / eligible / blocked
@@ -566,9 +574,12 @@ carries a monotonic version, so the engine can always ask "is this green output 
 resting on the inputs it was built from?".
 
 **Retention and disposal.** That file is the system of record and it keeps
-everything: every artifact version's value and every run's issued order packet —
+everything: every artifact version's value and every run's issued order
+packet — the dynamic input values it consumed and its rejection reasons,
 including any sensitive values that flowed through an input — persist after a
-workflow finishes. The default location is `.owenloop/state.db` (plus its WAL
+workflow finishes. Authored prompt and command text are not in the packet
+(orders are reference packets that carry a `defDigest` instead), so
+instruction text is retained once, in the definition, not per firing. The default location is `.owenloop/state.db` (plus its WAL
 `-wal`/`-shm` sidecar files), or wherever `--db` / `OWENLOOP_DB` / the `db:`
 embed option points. Rotating or scrubbing that data is the operator's job:
 `owenloop delete <wf>` removes an instance's rows, but SQLite frees those pages
