@@ -1,0 +1,16 @@
+# The execution entrypoint of the golden-bundle package. The def name must
+# equal bundle.yaml's package.name; pack/inspect refuse a mismatch.
+name: golden-bundle
+title: Golden bundle fixture
+description: Test fixture covering nested files, UTF-8 text, binary bytes, one executable, and a PAX path.
+
+inputs:
+  - name: seed
+    seedOwed: true
+
+steps:
+  - name: worker
+    consumes: [seed]
+    produces: [report]
+    maxSchemaFailures: 0
+    bodyFile: instructions/build.md

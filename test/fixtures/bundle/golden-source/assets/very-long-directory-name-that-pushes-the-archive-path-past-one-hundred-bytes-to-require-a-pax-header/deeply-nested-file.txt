@@ -1,0 +1,1 @@
+This file exists only so its archive path exceeds 100 UTF-8 bytes and exercises the deterministic PAX path header.

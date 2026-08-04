@@ -32,8 +32,8 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline/promises';
@@ -76,6 +76,7 @@ import type { PrincipalKeyRef } from './crypto/keys.ts';
 import { runMcpCommand } from './mcp/serve.ts';
 import type { LineStream } from './mcp/server.ts';
 import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
+import { BundleError, digestBundle, inspectBundle, packBundle, unpackBundle } from './bundle/index.ts';
 import {
   acquireInstallLock,
   ADD_JOURNAL_FILENAME,
@@ -567,6 +568,169 @@ function print(io: CliIO, value: unknown): void {
   io.out(JSON.stringify(value, null, 2));
 }
 
+/** Validate the exact positional shape of one bundle subcommand. */
+function assertBundlePositionals(args: Args, count: number, usage: string): void {
+  if (args.positionals.length !== count) {
+    throw new CliError(`invalid bundle arguments; usage: ${usage}`);
+  }
+}
+
+/** `--output` requires a following value; parseArgs represents a bare flag as `true`. */
+function bundleOutput(args: Args): string | undefined {
+  const value = last(args, 'output');
+  if (value === 'true') {
+    throw new CliError('owenloop bundle pack: --output requires a path value');
+  }
+  return value;
+}
+
+function printBundlePackResult(io: CliIO, outputAbs: string, packed: ReturnType<typeof packBundle>): void {
+  print(io, {
+    path: outputAbs,
+    digest: packed.digest,
+    name: packed.manifest.package.name,
+    version: packed.manifest.package.version,
+    files: packed.entries.length,
+  });
+}
+
+function printBundleUnpackResult(io: CliIO, result: ReturnType<typeof unpackBundle>): void {
+  print(io, {
+    path: result.path,
+    digest: result.digest,
+    name: result.manifest.package.name,
+    version: result.manifest.package.version,
+    files: result.entries.length,
+  });
+}
+
+function printBundleInspectResult(io: CliIO, result: ReturnType<typeof inspectBundle>): void {
+  print(io, {
+    digest: result.digest,
+    manifest: result.manifest,
+    entries: result.entries.map((e) => ({ path: e.path, size: e.size, executable: e.executable, sha256: e.sha256 })),
+  });
+}
+
+/**
+ * `owenloop bundle pack|unpack|inspect|digest` — the `.wnlp` package-format
+ * verbs (WP-A1; format contract in `docs/bundles.md`). Purely filesystem
+ * work on the bytes the user points at: these commands NEVER open the store
+ * (dispatched before `openCtx`), NEVER touch the network, and NEVER write
+ * `.owenloop/` state. Every `BundleError` carries a stable `code`, kept in
+ * the stderr message so scripts can match on it.
+ */
+function dispatchBundle(io: CliIO, args: Args): number {
+  const sub = need(args, 1, 'pack|unpack|inspect|digest');
+  if (sub !== 'pack' && args.options.has('output')) {
+    throw new CliError(`owenloop bundle ${sub}: --output is only valid for pack`);
+  }
+
+  switch (sub) {
+    case 'pack': {
+      assertBundlePositionals(args, 3, 'owenloop bundle pack <source-dir> [--output <bundle.wnlp>]');
+      const outputOpt = bundleOutput(args);
+      const source = need(args, 2, 'source-dir');
+      const sourceAbs = resolve(io.cwd, source);
+      // Check an explicit output before reading the source. The output cannot
+      // become one of the source files during a pack operation.
+      if (outputOpt !== undefined) assertOutputOutsideSource(resolve(io.cwd, outputOpt), sourceAbs);
+      const packed = runBundle(() => packBundle(sourceAbs));
+      const outputAbs = resolve(io.cwd, outputOpt ?? defaultPackOutput(sourceAbs, packed.manifest.package.name, packed.manifest.package.version));
+      // The default output is derived from the manifest, so it is checked after
+      // packing; an explicit output was checked before the source walk above.
+      assertOutputOutsideSource(outputAbs, sourceAbs);
+      // Reject an existing non-file output (a directory); replace a regular file.
+      const existing = lstatSync(outputAbs, { throwIfNoEntry: false });
+      if (existing && !existing.isFile()) throw new CliError(`owenloop bundle pack: output '${outputOpt ?? defaultPackOutput(sourceAbs, packed.manifest.package.name, packed.manifest.package.version)}' exists and is not a regular file`);
+      writeBundleFileAtomic(outputAbs, packed.bytes);
+      printBundlePackResult(io, outputAbs, packed);
+      return 0;
+    }
+    case 'unpack': {
+      assertBundlePositionals(args, 4, 'owenloop bundle unpack <bundle.wnlp> <destination-dir>');
+      const bundlePath = need(args, 2, 'bundle.wnlp');
+      const destination = need(args, 3, 'destination-dir');
+      const bytes = readBundleFile(io, bundlePath);
+      const result = runBundle(() => unpackBundle(bytes, resolve(io.cwd, destination)));
+      printBundleUnpackResult(io, result);
+      return 0;
+    }
+    case 'inspect': {
+      assertBundlePositionals(args, 3, 'owenloop bundle inspect <bundle.wnlp>');
+      const bundlePath = need(args, 2, 'bundle.wnlp');
+      const bytes = readBundleFile(io, bundlePath);
+      const result = runBundle(() => inspectBundle(bytes));
+      printBundleInspectResult(io, result);
+      return 0;
+    }
+    case 'digest': {
+      assertBundlePositionals(args, 3, 'owenloop bundle digest <bundle.wnlp>');
+      const bundlePath = need(args, 2, 'bundle.wnlp');
+      const bytes = readBundleFile(io, bundlePath);
+      const result = runBundle(() => digestBundle(bytes));
+      print(io, { digest: result.digest });
+      return 0;
+    }
+    default:
+      throw new CliError(`owenloop bundle: unknown subcommand '${sub}' (expected pack, unpack, inspect, or digest)`);
+  }
+}
+
+/** Default pack output: `<package-name>-<version>.wnlp` next to the source directory. */
+function defaultPackOutput(sourceAbs: string, name: string, version: string): string {
+  return join(dirname(sourceAbs), `${name}-${version}.wnlp`);
+}
+
+/** Refuse an output path located inside the source tree (or equal to it). */
+function assertOutputOutsideSource(outputAbs: string, sourceAbs: string): void {
+  const sourcePrefix = sourceAbs.endsWith(sep) ? sourceAbs : sourceAbs + sep;
+  if (outputAbs === sourceAbs || outputAbs.startsWith(sourcePrefix)) {
+    throw new CliError(`owenloop bundle pack: output '${outputAbs}' is inside the source directory '${sourceAbs}'`);
+  }
+}
+
+/** Read a `.wnlp` file from disk, converting fs failures into CliErrors. */
+function readBundleFile(io: CliIO, bundlePath: string): Buffer {
+  const abs = resolve(io.cwd, bundlePath);
+  try {
+    return readFileSync(abs);
+  } catch (e) {
+    throw new CliError(`owenloop bundle: cannot read '${bundlePath}': ${(e as Error).message}`);
+  }
+}
+
+/** Run a bundle API call, converting a BundleError into a CliError that keeps the stable code. */
+function runBundle<T>(fn: () => T): T {
+  try {
+    return fn();
+  } catch (e) {
+    if (e instanceof BundleError) {
+      throw new CliError(`owenloop bundle [${e.code}]: ${e.message}`);
+    }
+    throw e;
+  }
+}
+
+/**
+ * Write `bytes` to `outputAbs` atomically: a collision-safe sibling temporary
+ * directory, then rename the temporary file over the destination. Temporary
+ * state is cleaned on every failure and after success.
+ */
+function writeBundleFileAtomic(outputAbs: string, bytes: Uint8Array): void {
+  let tempDir: string | undefined;
+  try {
+    tempDir = mkdtempSync(join(dirname(outputAbs), '.owenloop-pack-'));
+    const tmp = join(tempDir, basename(outputAbs));
+    writeFileSync(tmp, bytes, { mode: 0o644, flag: 'wx' });
+    renameSync(tmp, outputAbs);
+  } catch (e) {
+    throw new CliError(`owenloop bundle pack: cannot write output: ${(e as Error).message}`);
+  } finally {
+    if (tempDir !== undefined) rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 /**
  * Synchronous blocking sleep. The whole codebase is sync end to end (no
  * async/Promise/setTimeout anywhere in src/*.ts), so `wait` needs a sync
@@ -591,6 +755,10 @@ Commands:
                                          install a workflow BUNDLE into the content-addressed store
                                          (default: project store under the defs dir; --global: ~/.owenloop/workflows)
   add --recover [--global]               finish or undo a crash-interrupted install (offline; no network)
+  bundle pack <source-dir> [--output <bundle.wnlp>]   pack a source directory into a deterministic .wnlp bundle
+  bundle unpack <bundle.wnlp> <destination-dir>       unpack a .wnlp bundle into a new directory
+  bundle inspect <bundle.wnlp>           strictly validate a .wnlp bundle and print its manifest/entries
+  bundle digest <bundle.wnlp>            print the bundle's def digest (SHA-256 of the canonical tar)
   login [--hub <url>] [--with-token] [--as <slot>]   authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
   logout [--hub <url>] [--as <slot>]     delete the stored credential for a hub in one slot
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
@@ -680,6 +848,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['help', cmdOpts()],
   ['defs', cmdOpts()],
   ['add', cmdOpts('recover', 'global')],
+  ['bundle', cmdOpts('output')],
   ['login', cmdOpts('hub', 'with-token', 'as')],
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
@@ -981,6 +1150,14 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       );
     }
     return 0;
+  }
+
+  // The bundle namespace is pure filesystem work on the bytes the user
+  // points at — dispatched BEFORE openCtx so pack/inspect/digest neither
+  // open/create `.owenloop/state.db` nor touch a remote (same reasoning as
+  // lint/check above; see docs/cli.md).
+  if (command === 'bundle') {
+    return dispatchBundle(io, args);
   }
 
   const ctx = openCtx(io, args);

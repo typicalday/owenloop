@@ -1,0 +1,382 @@
+/**
+ * `.wnlp` manifest (`bundle.yaml`) — strict fail-closed parsing, schema
+ * validation, cross-reference lock checks, integrity construction, and
+ * canonical YAML serialization (WP-A1, see `docs/bundles.md`).
+ *
+ * The manifest is package-only: it carries identity, platform selectors, a
+ * per-file integrity map, REQUESTED capabilities (never granted here), and a
+ * digest-pinned `lock` map for explicit `namespace/name@version` call
+ * references. Execution fields (`worker`, `command`, interpreter, script…)
+ * are unknown keys and refused — `workflow.yaml` is the only execution
+ * surface.
+ *
+ * Parsing is fail-closed on the YAML AST: parse errors AND warnings refuse
+ * the document; aliases, merge keys, tags (custom or built-in), non-string
+ * map keys, and duplicate keys are all named refusals. Canonical
+ * serialization is deterministic: fixed key order, sorted map keys and list
+ * values (ascending UTF-8 bytes), every string double-quoted, two-space
+ * indent, one final newline.
+ */
+
+import { createHash } from 'node:crypto';
+import {
+  isAlias,
+  isMap,
+  isPair,
+  isScalar,
+  isSeq,
+  parseDocument,
+} from 'yaml';
+import type { ParsedNode, Pair } from 'yaml';
+import { archivePathViolation } from '../archive.ts';
+import { BundleError } from './types.ts';
+import type { BundleManifest } from './types.ts';
+
+/** Lowercase 64-hex SHA-256 of `bytes`. */
+export function sha256Hex(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+const DIGEST_RE = /^[0-9a-f]{64}$/;
+/** Portable package name — same charset the engine's workflow names use. */
+const PACKAGE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** Version: printable ASCII, no separators that would break filenames or lock keys. */
+const VERSION_RE = /^[!-~]{1,128}$/;
+/** Platform selector: `os-arch`-style identifier. */
+const PLATFORM_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+/** Capability class identifier. */
+const CAPABILITY_CLASS_RE = /^[A-Za-z][A-Za-z0-9._-]{0,127}$/;
+/** Explicit cross-bundle reference: `namespace/name@version`. */
+const VERSIONED_REF_RE = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)@([!-~]+)$/;
+
+/** True when `text` is the explicit `namespace/name@version` reference form. */
+export function isVersionedReference(text: string): boolean {
+  return VERSIONED_REF_RE.test(text);
+}
+
+/**
+ * Walk a yaml AST into plain JS values, fail-closed: refuses aliases, merge
+ * keys, any tag (custom `!x` or built-in `!!x`), and non-string map keys.
+ * Plain scalars keep their parsed type (string/number/boolean/null); quoted
+ * scalars are always strings.
+ */
+function astToPlain(node: ParsedNode | Pair<ParsedNode, ParsedNode | null> | null, ctx: string): unknown {
+  if (node === null) {
+    throw new BundleError('MANIFEST_ERROR', `${ctx}: empty value is not allowed`);
+  }
+  if (isPair(node)) {
+    throw new BundleError('MANIFEST_ERROR', `${ctx}: unexpected key/value pair outside a mapping`);
+  }
+  if (isAlias(node)) {
+    throw new BundleError('MANIFEST_ERROR', `${ctx}: YAML aliases are not allowed`);
+  }
+  const tag = (node as { tag?: string | null }).tag;
+  if (tag !== undefined && tag !== null) {
+    throw new BundleError('MANIFEST_ERROR', `${ctx}: tagged YAML nodes are not allowed`);
+  }
+  if (isMap(node)) {
+    const out: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    for (const item of node.items) {
+      const keyNode = item.key;
+      if (isAlias(keyNode)) {
+	throw new BundleError('MANIFEST_ERROR', `${ctx}: YAML aliases are not allowed`);
+      }
+      if (!isScalar(keyNode) || typeof keyNode.value !== 'string') {
+	throw new BundleError('MANIFEST_ERROR', `${ctx}: mapping keys must be strings`);
+      }
+      const key = keyNode.value;
+      if (key === '<<') {
+	throw new BundleError('MANIFEST_ERROR', `${ctx}: YAML merge keys are not allowed`);
+      }
+      out[key] = astToPlain(item.value, `${ctx}.${key}`);
+    }
+    return out;
+  }
+  if (isSeq(node)) {
+    return node.items.map((item, i) => astToPlain(item, `${ctx}[${i}]`));
+  }
+  if (isScalar(node)) {
+    if (node.tag !== undefined && node.tag !== null) {
+      throw new BundleError('MANIFEST_ERROR', `${ctx}: tagged scalar '${node.tag}' is not allowed`);
+    }
+    return node.value;
+  }
+  throw new BundleError('MANIFEST_ERROR', `${ctx}: unsupported YAML node`);
+}
+
+function asString(value: unknown, ctx: string): string {
+  if (typeof value !== 'string') {
+    throw new BundleError('MANIFEST_ERROR', `${ctx}: must be a string`);
+  }
+  return value;
+}
+
+function asMap(value: unknown, ctx: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new BundleError('MANIFEST_ERROR', `${ctx}: must be a mapping`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function assertExactKeys(obj: Record<string, unknown>, keys: readonly string[], ctx: string): void {
+  const allowed = new Set(keys);
+  for (const k of Object.keys(obj)) {
+    if (!allowed.has(k)) {
+      throw new BundleError('MANIFEST_ERROR', `${ctx}: unknown key '${k}'`);
+    }
+  }
+  for (const k of keys) {
+    if (!(k in obj)) {
+      throw new BundleError('MANIFEST_ERROR', `${ctx}: missing required key '${k}'`);
+    }
+  }
+}
+
+/** Assert a string list is duplicate-free; returns it. */
+function assertDuplicateFree(values: string[], ctx: string): string[] {
+  const seen = new Set<string>();
+  for (const v of values) {
+    if (seen.has(v)) {
+      throw new BundleError('MANIFEST_ERROR', `${ctx}: duplicate value '${v}'`);
+    }
+    seen.add(v);
+  }
+  return values;
+}
+
+const sortedByUtf8 = (values: string[]): string[] =>
+  [...values].sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')));
+
+/**
+ * Parse and validate `.wnlp` manifest bytes, fail-closed. Refuses non-UTF-8
+ * input, a missing (or double) final newline, any YAML parse error or
+ * warning, and every shape violation. Returns the validated manifest; the
+ * source byte order of collections is NOT enforced here — canonicality is a
+ * separate concern ({@link manifestIsCanonical}).
+ */
+export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw new BundleError('MANIFEST_ERROR', 'bundle.yaml: not valid UTF-8');
+  }
+  if (!text.endsWith('\n')) {
+    throw new BundleError('MANIFEST_ERROR', 'bundle.yaml: must end with exactly one final newline');
+  }
+  if (text.endsWith('\n\n')) {
+    throw new BundleError('MANIFEST_ERROR', 'bundle.yaml: must end with exactly one final newline');
+  }
+
+  const doc = parseDocument(text);
+  if (doc.errors.length > 0) {
+    throw new BundleError('MANIFEST_ERROR', `bundle.yaml: YAML parse error: ${doc.errors[0]!.message.split('\n')[0]}`);
+  }
+  if (doc.warnings.length > 0) {
+    throw new BundleError('MANIFEST_ERROR', `bundle.yaml: YAML rejected: ${doc.warnings[0]!.message.split('\n')[0]}`);
+  }
+
+  const plain = astToPlain(doc.contents as ParsedNode | null, 'bundle.yaml');
+  const root = asMap(plain, 'bundle.yaml');
+  assertExactKeys(root, ['formatVersion', 'package', 'entrypoint', 'platforms', 'integrity', 'capabilities', 'lock'], 'bundle.yaml');
+
+  // formatVersion — refuse future versions rather than guess.
+  const formatVersion = root['formatVersion'];
+  if (typeof formatVersion !== 'number' || !Number.isInteger(formatVersion)) {
+    throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.formatVersion: must be an integer');
+  }
+  if (formatVersion !== 1) {
+    throw new BundleError('UNSUPPORTED_FORMAT_VERSION', `bundle.yaml.formatVersion: unsupported format version ${formatVersion} (this reader supports 1)`);
+  }
+
+  // package identity.
+  const pkg = asMap(root['package'], 'bundle.yaml.package');
+  assertExactKeys(pkg, ['name', 'version'], 'bundle.yaml.package');
+  const name = asString(pkg['name'], 'bundle.yaml.package.name');
+  if (!PACKAGE_NAME_RE.test(name)) {
+    throw new BundleError('MANIFEST_ERROR', `bundle.yaml.package.name: '${name}' must be 1-128 chars of letters, digits, '-', '_' (starting alphanumeric)`);
+  }
+  const version = asString(pkg['version'], 'bundle.yaml.package.version');
+  if (!VERSION_RE.test(version) || version.includes('/') || version.includes('\\')) {
+    throw new BundleError('MANIFEST_ERROR', `bundle.yaml.package.version: '${version}' must be 1-128 printable ASCII chars with no '/' or '\\'`);
+  }
+
+  // entrypoint — fixed to workflow.yaml in v1.
+  const entrypoint = asString(root['entrypoint'], 'bundle.yaml.entrypoint');
+  if (entrypoint !== 'workflow.yaml') {
+    throw new BundleError('MANIFEST_ERROR', `bundle.yaml.entrypoint: must be 'workflow.yaml' (got '${entrypoint}')`);
+  }
+
+  // platforms — duplicate-free string selectors.
+  const platformsRaw = root['platforms'];
+  if (!Array.isArray(platformsRaw)) {
+    throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.platforms: must be a list');
+  }
+  const platforms = assertDuplicateFree(
+    platformsRaw.map((p, i) => asString(p, `bundle.yaml.platforms[${i}]`)),
+    'bundle.yaml.platforms',
+  );
+  for (const p of platforms) {
+    if (!PLATFORM_RE.test(p)) {
+      throw new BundleError('MANIFEST_ERROR', `bundle.yaml.platforms: selector '${p}' must be 1-128 chars of letters, digits, '.', '_', '-' (starting alphanumeric)`);
+    }
+  }
+
+  // integrity — algorithm fixed; per-file digests validated here and the
+  // exact coverage is cross-checked against archive entries by the caller.
+  const integrity = asMap(root['integrity'], 'bundle.yaml.integrity');
+  assertExactKeys(integrity, ['algorithm', 'files'], 'bundle.yaml.integrity');
+  if (integrity['algorithm'] !== 'sha256') {
+    throw new BundleError('MANIFEST_ERROR', `bundle.yaml.integrity.algorithm: must be 'sha256' (got '${String(integrity['algorithm'])}')`);
+  }
+  const files: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const [path, digest] of Object.entries(asMap(integrity['files'], 'bundle.yaml.integrity.files'))) {
+    const violation = archivePathViolation(path);
+    if (violation) {
+      throw new BundleError('MANIFEST_ERROR', `bundle.yaml.integrity.files: unsafe path '${path}': ${violation}`, path);
+    }
+    if (path === 'bundle.yaml') {
+      throw new BundleError('MANIFEST_ERROR', "bundle.yaml.integrity.files: must not list 'bundle.yaml' (recursive self-hash)");
+    }
+    const d = asString(digest, `bundle.yaml.integrity.files['${path}']`);
+    if (!DIGEST_RE.test(d)) {
+      throw new BundleError('MANIFEST_ERROR', `bundle.yaml.integrity.files['${path}']: digest must be lowercase 64-hex SHA-256`);
+    }
+    files[path] = d;
+  }
+
+  // capabilities — requested classes → requested values (requests only).
+  const capabilities: Record<string, string[]> = Object.create(null) as Record<string, string[]>;
+  for (const [cls, values] of Object.entries(asMap(root['capabilities'], 'bundle.yaml.capabilities'))) {
+    if (!CAPABILITY_CLASS_RE.test(cls)) {
+      throw new BundleError('MANIFEST_ERROR', `bundle.yaml.capabilities: class '${cls}' must be 1-128 chars of letters, digits, '.', '_', '-' (starting with a letter)`);
+    }
+    if (!Array.isArray(values)) {
+      throw new BundleError('MANIFEST_ERROR', `bundle.yaml.capabilities['${cls}']: must be a list`);
+    }
+    const vals = assertDuplicateFree(
+      values.map((v, i) => asString(v, `bundle.yaml.capabilities['${cls}'][${i}]`)),
+      `bundle.yaml.capabilities['${cls}']`,
+    );
+    for (const v of vals) {
+      const hasControl = [...v].some((ch) => {
+	const code = ch.codePointAt(0) ?? 0;
+	return code === 0 || code < 0x20 || code === 0x7f;
+      });
+      if (v === '' || hasControl || v.length > 1024) {
+	throw new BundleError('MANIFEST_ERROR', `bundle.yaml.capabilities['${cls}']: value '${v}' must be a non-empty printable string (<= 1024 chars)`);
+      }
+    }
+    capabilities[cls] = vals;
+  }
+
+  // lock — explicit versioned reference text → def digest.
+  const lock: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const [ref, digestRaw] of Object.entries(asMap(root['lock'], 'bundle.yaml.lock'))) {
+    if (!isVersionedReference(ref)) {
+      throw new BundleError('MANIFEST_ERROR', `bundle.yaml.lock: key '${ref}' must be an explicit 'namespace/name@version' reference`);
+    }
+    const digest = asString(digestRaw, `bundle.yaml.lock['${ref}']`);
+    if (!DIGEST_RE.test(digest)) {
+      throw new BundleError('MANIFEST_ERROR', `bundle.yaml.lock['${ref}']: digest must be lowercase 64-hex SHA-256`);
+    }
+    lock[ref] = digest;
+  }
+
+  return {
+    formatVersion: 1,
+    package: { name, version },
+    entrypoint: 'workflow.yaml',
+    platforms,
+    integrity: { algorithm: 'sha256', files },
+    capabilities,
+    lock,
+  };
+}
+
+/** Double-quote a string for canonical YAML output (JSON escaping is valid YAML). */
+const q = (s: string): string => JSON.stringify(s);
+
+/**
+ * Serialize a manifest to its canonical bytes: fixed top-level key order,
+ * map keys and list values sorted by ascending UTF-8 bytes, every string
+ * double-quoted, two-space indent, one final newline. Deterministic across
+ * platforms — the checked-in golden vector freezes the result.
+ */
+export function manifestToBytes(manifest: BundleManifest): Uint8Array {
+  const lines: string[] = [];
+  lines.push(`formatVersion: ${manifest.formatVersion}`);
+  lines.push('package:');
+  lines.push(`  name: ${q(manifest.package.name)}`);
+  lines.push(`  version: ${q(manifest.package.version)}`);
+  lines.push(`entrypoint: ${q(manifest.entrypoint)}`);
+
+  const platforms = sortedByUtf8(manifest.platforms);
+  if (platforms.length === 0) {
+    lines.push('platforms: []');
+  } else {
+    lines.push('platforms:');
+    for (const p of platforms) lines.push(`  - ${q(p)}`);
+  }
+
+  lines.push('integrity:');
+  lines.push('  algorithm: "sha256"');
+  const fileKeys = sortedByUtf8(Object.keys(manifest.integrity.files));
+  if (fileKeys.length === 0) {
+    lines.push('  files: {}');
+  } else {
+    lines.push('  files:');
+    for (const k of fileKeys) lines.push(`    ${q(k)}: ${q(manifest.integrity.files[k]!)}`);
+  }
+
+  const capKeys = sortedByUtf8(Object.keys(manifest.capabilities));
+  if (capKeys.length === 0) {
+    lines.push('capabilities: {}');
+  } else {
+    lines.push('capabilities:');
+    for (const cls of capKeys) {
+      const vals = sortedByUtf8(manifest.capabilities[cls]!);
+      if (vals.length === 0) {
+	lines.push(`  ${q(cls)}: []`);
+      } else {
+	lines.push(`  ${q(cls)}:`);
+	for (const v of vals) lines.push(`    - ${q(v)}`);
+      }
+    }
+  }
+
+  const lockKeys = sortedByUtf8(Object.keys(manifest.lock));
+  if (lockKeys.length === 0) {
+    lines.push('lock: {}');
+  } else {
+    lines.push('lock:');
+    for (const k of lockKeys) lines.push(`  ${q(k)}: ${q(manifest.lock[k]!)}`);
+  }
+
+  return Buffer.from(`${lines.join('\n')}\n`, 'utf8');
+}
+
+/** True when `bytes` is exactly the canonical serialization of the manifest it parses to. */
+export function manifestIsCanonical(bytes: Uint8Array): boolean {
+  const manifest = parseManifestBytes(bytes);
+  const canonical = manifestToBytes(manifest);
+  return Buffer.compare(Buffer.from(bytes), Buffer.from(canonical)) === 0;
+}
+
+/**
+ * Cross-reference check: every `calls:` target in `callsTargets` that uses
+ * the explicit `namespace/name@version` form must carry a `lock` entry. Bare
+ * (same-package) calls stay governed by the existing def grammar and need no
+ * lock. A1 does not resolve or fetch locks — it only validates coverage.
+ */
+export function assertLockCoverage(manifest: BundleManifest, callsTargets: string[]): void {
+  for (const target of callsTargets) {
+    if (!isVersionedReference(target)) continue;
+    if (!Object.prototype.hasOwnProperty.call(manifest.lock, target)) {
+      throw new BundleError(
+	'MANIFEST_ERROR',
+	`bundle.yaml.lock: calls: target '${target}' uses the explicit 'namespace/name@version' form and requires a lock entry`,
+      );
+    }
+  }
+}

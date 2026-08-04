@@ -34,6 +34,7 @@ import {
   type AddJournal,
   type Lockfile,
 } from '../src/add.ts';
+import { archivePathViolation as sharedArchivePathViolation, DEFAULT_TAR_LIMITS } from '../src/archive.ts';
 import { makeGithubTarball } from './helpers.ts';
 
 const SHA_A = 'a'.repeat(40);
@@ -725,6 +726,8 @@ test('add: a fetch timeout surfaces as a friendly CliError', async () => {
 // ---- archivePathViolation (unit) ---------------------------------------------
 
 test('archivePathViolation: accepts safe relative paths and rejects unsafe ones', () => {
+  assert.equal(archivePathViolation, sharedArchivePathViolation, 'add re-exports the shared archive path policy');
+  assert.equal(DEFAULT_TAR_LIMITS.maxFileBytes > 0, true);
   // safe
   assert.equal(archivePathViolation('foo.yaml'), undefined);
   assert.equal(archivePathViolation('a/b/c.yaml'), undefined);
