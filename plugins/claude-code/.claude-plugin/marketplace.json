@@ -1,0 +1,14 @@
+{
+  "name": "owenloop",
+  "description": "Claude Code driver pack for the hosted owenloop workflow engine.",
+  "owner": {
+    "name": "Typical Day"
+  },
+  "plugins": [
+    {
+      "name": "owenloop",
+      "source": "./plugin",
+      "description": "Claude Code driver for the owenloop workflow engine."
+    }
+  ]
+}

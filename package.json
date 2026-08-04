@@ -43,6 +43,7 @@
     "dist",
     "bin",
     "examples/workflows",
+    "plugins",
     "docs",
     "CHANGELOG.md"
   ],
@@ -56,6 +57,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint src packages/work/src",
     "clean": "rm -rf dist",
+    "materialize:plugins": "node scripts/materialize-plugins.mjs",
     "build": "npm run clean && tsc -p tsconfig.build.json",
     "pretest": "npm run build",
     "check": "npm run typecheck && npm run lint && npm run build && npm run test:quiet",

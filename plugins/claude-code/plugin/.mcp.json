@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "owenloop": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "owenloop@^0.4.1", "mcp"]
+    }
+  }
+}
