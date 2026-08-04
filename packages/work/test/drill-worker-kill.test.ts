@@ -1,11 +1,11 @@
 /**
- * DRILL — RUNNER KILLED MID-TURN.
+ * DRILL — WORKER KILLED MID-TURN.
  *
  * The failure mode: an `owenloop work agent-run` child is holding a claimed order
  * with a LIVE harness session when the machine (or an operator, or a restart)
  * takes it down. Two things must happen, in this order, or the order strands
  * until its lease TTL expires and a live model session is left orphaned:
- *   1. the runner tears the harness session down (`adapter.stop`), and
+ *   1. the worker tears the harness session down (`adapter.stop`), and
  *   2. it hands the order back to the hub (a targeted `release`).
  *
  * The fake harness is scripted with `hang: true`: `start` emits `started` and
@@ -105,7 +105,7 @@ function spawnDaemon(origin: string): ShiftChild {
   );
 }
 
-test('SIGTERM to a runner mid-turn tears the harness session down and releases the order', async () => {
+test('SIGTERM to a worker mid-turn tears the harness session down and releases the order', async () => {
   seedCache();
   let wakes = 0;
   const { origin, reqs, server } = await startMockHub((verb, body) => {
@@ -157,10 +157,23 @@ test('SIGTERM to a runner mid-turn tears the harness session down and releases t
     assert.deepEqual(rel.body, { workflow: 'wf1', run: 'run_x1234' }, 'a targeted release, not a session drain');
 
     // The session store records the attempt as dead, not submitted — a killed
-    // runner never claims the task finished.
+    // worker never claims the task finished.
+    //
+    // The `dead` row lands AFTER the release, not before it: `stop()`
+    // (src/agent/loop.ts) fires `void teardown()` and `lease.stop()` and writes
+    // nothing; the record is written by the main path at
+    // src/agent/loop.ts:635, which only runs once `leasePromise` resolves —
+    // i.e. once `finalBreath`'s release call has already returned. The mock hub
+    // records the verb before it even answers, so `release` is observable
+    // strictly earlier. Wait for the row rather than racing it.
+    await until(
+      () => readSessions(sessionsPath(cacheDir)).at(-1)?.status === 'dead',
+      'the session store to record the kill as dead',
+      10_000,
+    );
+
     const sessions = readSessions(sessionsPath(cacheDir));
     assert.ok(sessions.length > 0, 'the attempt was recorded');
-    assert.equal(sessions.at(-1)!.status, 'dead');
     assert.equal(sessions.some((s) => s.status === 'submitted'), false, 'a kill is never a submit');
     assert.equal(sessions[0]!.harness, 'fake');
 
