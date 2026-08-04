@@ -12,8 +12,10 @@ import {
   defInstructionDigest,
   OrderResolver,
   UnknownDefDigestError,
+  UnknownInstructionError,
 } from '../src/order-resolver.ts';
 import type { Order } from '../src/types.ts';
+import type { OrderInstructionSource } from '../src/order-resolver.ts';
 import { def, input, step } from './helpers.ts';
 
 // A verified fixture with DELIBERATE whitespace and newlines in every field —
@@ -31,7 +33,7 @@ const fixtureDef = def(
       produces: ['result'],
       executor: 'command',
       command: COMMAND,
-      body: '', // a command step may carry an empty body — no fabricated prompt
+      body: '', // a command step may carry an authored empty prompt
     }),
   ],
 );
@@ -63,7 +65,12 @@ test('resolver returns byte-exact prompt and command values (whitespace preserve
 
   const cmd = resolver.resolve({ defDigest: digest, step: 'cmdstep', key: '' });
   assert.equal(cmd.command, COMMAND, 'command bytes round-trip exactly');
-  assert.equal(cmd.prompt, undefined, 'an empty body resolves as no prompt — never fabricated');
+  assert.equal(cmd.prompt, '', 'an authored empty body resolves as the exact empty prompt');
+  assert.equal(
+    resolver.resolveOrder(orderOf({ defDigest: digest, step: 'cmdstep', key: '' })).prompt,
+    '',
+    'resolveOrder preserves an authored empty prompt too',
+  );
 });
 
 test('runtime placeholder materialization matches the pre-reference substitution behavior', () => {
@@ -132,6 +139,24 @@ test('an unknown digest throws UnknownDefDigestError — no name fallback, no em
   );
 });
 
+test('a known digest with a missing step raises a distinct instruction refusal', () => {
+  const source = createDefInstructionSource([fixtureDef]);
+  const resolver = new OrderResolver(source);
+  const digest = defInstructionDigest(fixtureDef);
+
+  assert.throws(
+    () => resolver.resolve({ defDigest: digest, step: 'not-a-step', key: '' }),
+    (err: unknown) => {
+      assert.ok(err instanceof UnknownInstructionError, 'missing step is not an unknown digest');
+      assert.equal(err.name, 'UnknownInstructionError');
+      assert.equal((err as UnknownInstructionError).defDigest, digest);
+      assert.equal((err as UnknownInstructionError).step, 'not-a-step');
+      assert.equal((err as UnknownInstructionError).key, '');
+      return true;
+    },
+  );
+});
+
 test('identical content from different directories digests identically; dir never changes identity', () => {
   const a = { ...fixtureDef, dir: '/tmp/load-site-a' };
   const b = { ...fixtureDef, dir: '/somewhere/else/b' };
@@ -189,6 +214,40 @@ test('digestOf registers the exact snapshot it digested — resolution survives 
   // resolve after registration — the snapshot passed to digestOf is the one served
   const resolver = new OrderResolver(source);
   assert.equal(resolver.resolve({ defDigest: digest, step: 'agentstep', key: '' }).prompt, PROMPT);
+});
+
+test('digest registration keeps emitted instructions stable after the caller mutates the source definition', () => {
+  const mutable = structuredClone(fixtureDef);
+  const source = createDefInstructionSource();
+  const digest = source.digestOf(mutable);
+  const resolver = new OrderResolver(source);
+
+  mutable.steps[0]!.body = 'mutated prompt';
+  mutable.steps[1]!.command = 'mutated command';
+
+  assert.equal(resolver.resolve({ defDigest: digest, step: 'agentstep', key: '' }).prompt, PROMPT);
+  assert.equal(resolver.resolve({ defDigest: digest, step: 'cmdstep', key: '' }).command, COMMAND);
+});
+
+test('an injected source supplies maxAttempts for placeholder materialization without stepDef access', () => {
+  const digest = 'injected-digest';
+  const source: OrderInstructionSource = {
+    digestOf: () => digest,
+    lookup: (ref: { defDigest: string; step: string; key: string }) => {
+      if (ref.defDigest !== digest) return { status: 'unknown-digest' as const };
+      if (ref.step !== 'worker') return { status: 'unknown-step' as const };
+      return {
+        status: 'resolved' as const,
+        instructions: { prompt: 'attempts=${MAX_ATTEMPTS}', maxAttempts: 11 },
+      };
+    },
+  };
+  const resolver = new OrderResolver(source);
+
+  assert.equal(
+    resolver.resolveOrder(orderOf({ defDigest: digest, step: 'worker', workflow: 'wf_i', run: 'run_i' })).prompt,
+    'attempts=11',
+  );
 });
 
 test('the engine default-construction adapter behaves the same way (no-source Engine path)', () => {

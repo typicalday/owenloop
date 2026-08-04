@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createEngine } from '../src/factory.ts';
 import { DefError } from '../src/defs.ts';
-import type { OrderInstructionRef, OrderInstructionSource, ResolvedInstructions } from '../src/order-resolver.ts';
+import type { OrderInstructionRef, OrderInstructionSource } from '../src/order-resolver.ts';
 import type { WorkflowDef } from '../src/types.ts';
 import { assertReferenceContract, def, input, step } from './helpers.ts';
 
@@ -326,9 +326,15 @@ test('createEngine: an injected WP-A3-compatible source supplies the digest and 
     digestOf: () => FAKE_DIGEST,
     lookup: (ref) => {
       lookups.push(ref);
-      if (ref.defDigest !== FAKE_DIGEST) return undefined;
-      const resolved: ResolvedInstructions = { prompt: FAKE_PROMPT, acceptance: FAKE_ACCEPTANCE };
-      return resolved;
+      if (ref.defDigest !== FAKE_DIGEST) return { status: 'unknown-digest' };
+      return {
+        status: 'resolved',
+        instructions: {
+          prompt: FAKE_PROMPT,
+          acceptance: FAKE_ACCEPTANCE,
+          maxAttempts: 3,
+        },
+      };
     },
   };
 

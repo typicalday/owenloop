@@ -34,7 +34,7 @@ the same one the engine uses internally — and accepts:
 | `reapTtlMs` | Forwarded to the `Engine` — the stranded-lease reap TTL. |
 | `maxLeaseMs` | Forwarded to the `Engine` — an opt-in hard cap on total lease lifetime (per-step `maxLease:` overrides). Unset (default): no cap; heartbeats extend a lease indefinitely. Set it only as a runaway backstop — it can reap a healthy, still-beating job. |
 | `maxCallDepth` | Forwarded to the `Engine` — the hard cap on `calls:` composition depth (root instance = depth 0). Defaults to 64. Defense in depth against a `calls:` cycle; only relevant when you hand-wire a custom `DefResolver` that construction-time validation can't inspect. |
-| `instructionSource` | The order-instruction source (`OrderInstructionSource`: `digestOf` + `lookup` + optional `stepDef`). Default: an adapter over the definitions this engine loads — the same reference-mode behavior the CLI gets. Supply your own to serve digests and instructions from a content-addressed store of verified definitions; `buildOrder` takes digests from it and `resolver` reads its records (see [Resolving instructions](#resolving-instructions)). |
+| `instructionSource` | The order-instruction source (`OrderInstructionSource`: `digestOf` + typed `lookup`). Each resolved record includes the exact static instruction bytes and the step's `maxAttempts` materialization metadata. Default: an adapter over the definitions this engine loads — the same reference-mode behavior the CLI gets. Supply your own to serve digests and instructions from a content-addressed store of verified definitions; `buildOrder` takes digests from it and `resolver` reads its records (see [Resolving instructions](#resolving-instructions)). |
 | `onEvent`   | A push-style observer registered at construction (equivalent to `engine.subscribe`). See [Events](#events). |
 | `onListenerError` | Where a throwing listener's error is routed (default: swallowed). |
 
@@ -75,11 +75,11 @@ const { orders } = engine.tick(wf);
 for (const order of orders) {
   const instructions = resolver.resolveOrder(order);      // { prompt?, command? }
   const result = await runYourWorker(order, instructions); // ← your domain
-  const commit = engine.green(wf, order.run, order.outputs[0], result);
+  const commit = engine.green(order.workflow, order.run, order.outputs[0], result);
   if (commit.outcome !== 'green') {
     // born-rejected (an input moved) or schema-rejected (§18) — inspect commit.reason
   }
-  engine.close(wf, order.run);
+  engine.close(order.workflow, order.run);
 }
 
 const status = engine.status(wf);   // { done, debts, eligible, blocked, inFlight }
@@ -109,8 +109,8 @@ source via `instructionSource` — `buildOrder` takes digests from it and
 resolution reads its verified records, with no other engine change.
 
 Resolution returns `{ prompt?, command?, acceptance? }` — the exact authored
-values, byte-for-byte (a step with an empty body resolves to no prompt; the
-resolver never fabricates text), with the runtime placeholders
+values, byte-for-byte (the loaded-definition adapter preserves an authored
+empty body as `prompt: ''`; a source may omit prompt when no prompt exists), with the runtime placeholders
 (`${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MAX_ATTEMPTS}`)
 materialized into the prompt. An unknown digest — the definition was never
 delivered, or the bytes don't match what emitted the order — raises the named
@@ -153,8 +153,8 @@ for (const order of orders) {
       ? await runCommand(instructions.command!, order.spec)  // resolved command text is opaque to owenloop — never shelled out by the engine itself
       : await runYourAgent(order, instructions.prompt);      // default / worker: 'agent' / anything else you handle the same way
 
-  const commit = engine.green(wf, order.run, order.outputs[0], result);
-  engine.close(wf, order.run);
+  const commit = engine.green(order.workflow, order.run, order.outputs[0], result);
+  engine.close(order.workflow, order.run);
 }
 ```
 

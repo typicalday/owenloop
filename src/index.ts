@@ -38,11 +38,14 @@ export {
   OrderResolver,
   substituteOrderVars,
   UnknownDefDigestError,
+  UnknownInstructionError,
 } from './order-resolver.ts';
 export type {
+  OrderInstructionLookup,
   OrderInstructionRef,
   OrderInstructionSource,
   OrderRuntimeVars,
+  ResolvedInstructionRecord,
   ResolvedInstructions,
 } from './order-resolver.ts';
 

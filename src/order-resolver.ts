@@ -56,6 +56,22 @@ export interface ResolvedInstructions {
 }
 
 /**
+ * A resolved instruction record also carries the authored step metadata needed
+ * to materialize runtime placeholders. `maxAttempts` is required even when a
+ * prompt is absent so every source has one explicit, deterministic contract for
+ * `${MAX_ATTEMPTS}` rather than silently falling back to an empty string.
+ */
+export interface ResolvedInstructionRecord extends ResolvedInstructions {
+  maxAttempts: number;
+}
+
+/** The typed result of a source lookup. Missing digest and missing step are distinct. */
+export type OrderInstructionLookup =
+  | { status: 'resolved'; instructions: ResolvedInstructionRecord }
+  | { status: 'unknown-digest' }
+  | { status: 'unknown-step' };
+
+/**
  * The narrow digest/instruction source seam. WP-B1 ships the loaded-definition
  * adapter ({@link createDefInstructionSource}); WP-A3 can later inject an
  * implementation backed by its content-addressed store (canonical bundle
@@ -71,21 +87,12 @@ export interface OrderInstructionSource {
    */
   digestOf(def: WorkflowDef): string;
   /**
-   * Resolve one reference to its exact instruction bytes, or return
-   * `undefined` when no verified record exists for `(ref.defDigest,
-   * ref.step)` — the caller turns `undefined` into the named refusal. The
-   * `key` participates in identity (map elements are distinct bindings of
-   * the same step) but the authored bytes are per step: a source may ignore
-   * it when its storage is per-step.
+   * Resolve one reference to its exact instruction bytes and materialization
+   * metadata. The result must distinguish an unknown digest from a known
+   * digest with a missing step; the resolver reserves UnknownDefDigestError
+   * for the former.
    */
-  lookup(ref: OrderInstructionRef): ResolvedInstructions | undefined;
-  /**
-   * Optional authored step access for materialization defaults (e.g. the
-   * `${MAX_ATTEMPTS}` step default). Purely informational — resolution and
-   * the named refusal depend only on `lookup`. Absent when a source keeps
-   * instructions but not the surrounding step shape.
-   */
-  stepDef?(ref: OrderInstructionRef): StepDef | undefined;
+  lookup(ref: OrderInstructionRef): OrderInstructionLookup;
 }
 
 /**
@@ -102,6 +109,26 @@ export class UnknownDefDigestError extends Error {
   constructor(defDigest: string) {
     super(`unknown defDigest '${defDigest}' — no verified definition/instruction record exists for this digest; refusing to resolve instructions`);
     this.defDigest = defDigest;
+  }
+}
+
+/**
+ * The digest is known, but the referenced step is not present in that
+ * definition snapshot. This is deliberately distinct from
+ * {@link UnknownDefDigestError}: a malformed reference must not claim that a
+ * verified definition digest is unknown.
+ */
+export class UnknownInstructionError extends Error {
+  override readonly name = 'UnknownInstructionError';
+  readonly defDigest: string;
+  readonly step: string;
+  readonly key: string;
+
+  constructor(ref: OrderInstructionRef) {
+    super(`unknown instruction step '${ref.step}' for defDigest '${ref.defDigest}' and key '${ref.key}'`);
+    this.defDigest = ref.defDigest;
+    this.step = ref.step;
+    this.key = ref.key;
   }
 }
 
@@ -179,25 +206,31 @@ export function createDefInstructionSource(seeds?: Iterable<WorkflowDef>): Order
   const byDigest = new Map<string, WorkflowDef>();
   const register = (def: WorkflowDef): string => {
     const digest = defInstructionDigest(def);
-    byDigest.set(digest, def);
+    // Keep a private deep snapshot. The caller may mutate the definition or a
+    // public defs map after an order is emitted; the digest must continue to
+    // address the exact instruction bytes that were hashed.
+    byDigest.set(digest, structuredClone(def));
     return digest;
   };
   if (seeds !== undefined) for (const def of seeds) register(def);
-  const findStep = (ref: OrderInstructionRef): StepDef | undefined => {
-    const def = byDigest.get(ref.defDigest);
-    return def?.steps.find((s) => s.name === ref.step);
-  };
   return {
     digestOf: (def: WorkflowDef) => register(def),
-    lookup: (ref: OrderInstructionRef): ResolvedInstructions | undefined => {
-      const step = findStep(ref);
-      if (step === undefined) return undefined;
-      const resolved: ResolvedInstructions = {};
-      if (step.body !== '') resolved.prompt = step.body;
-      if (step.command !== undefined) resolved.command = step.command;
-      return resolved;
+    lookup: (ref: OrderInstructionRef): OrderInstructionLookup => {
+      const def = byDigest.get(ref.defDigest);
+      if (def === undefined) return { status: 'unknown-digest' };
+      const step = def.steps.find((s) => s.name === ref.step);
+      if (step === undefined) return { status: 'unknown-step' };
+      return {
+        status: 'resolved',
+        instructions: {
+          // StepDef.body is always a string. Preserve an authored empty body as
+          // prompt: '' rather than converting an exact value into absence.
+          prompt: step.body,
+          ...(step.command !== undefined ? { command: step.command } : {}),
+          maxAttempts: step.maxAttempts,
+        },
+      };
     },
-    stepDef: findStep,
   };
 }
 
@@ -259,11 +292,12 @@ export class OrderResolver {
     this.source = source;
   }
 
-  /** The low-level `(defDigest, step, key)` boundary: exact authored bytes or the named refusal. */
-  resolve(ref: OrderInstructionRef): ResolvedInstructions {
-    const resolved = this.source.lookup(ref);
-    if (resolved === undefined) throw new UnknownDefDigestError(ref.defDigest);
-    return resolved;
+  /** The low-level `(defDigest, step, key)` boundary: exact authored bytes or a typed refusal. */
+  resolve(ref: OrderInstructionRef): ResolvedInstructionRecord {
+    const result = this.source.lookup(ref);
+    if (result.status === 'unknown-digest') throw new UnknownDefDigestError(ref.defDigest);
+    if (result.status === 'unknown-step') throw new UnknownInstructionError(ref);
+    return result.instructions;
   }
 
   /**
@@ -275,22 +309,19 @@ export class OrderResolver {
    */
   resolveOrder(order: Order): ResolvedInstructions {
     const ref: OrderInstructionRef = { defDigest: order.defDigest, step: order.step, key: order.key };
-    const resolved = this.source.lookup(ref);
-    if (resolved === undefined) throw new UnknownDefDigestError(order.defDigest);
-    if (resolved.prompt === undefined) return resolved;
-    const stepDef = this.stepDef(ref);
+    // Keep this helper on the public low-level boundary. This is the same
+    // typed lookup/refusal path used by bare references; no caller can bypass
+    // digest verification or step-reference errors through resolveOrder.
+    const resolved = this.resolve(ref);
+    const { maxAttempts, ...instructions } = resolved;
+    if (resolved.prompt === undefined) return instructions;
     return {
-      ...resolved,
+      ...instructions,
       prompt: substituteOrderVars(
         resolved.prompt,
         { workflow: order.workflow, run: order.run, key: order.key, ...(order.index !== undefined ? { index: order.index } : {}) },
-        { step: order.step, ...(stepDef !== undefined ? { maxAttempts: stepDef.maxAttempts } : {}) },
+        { step: order.step, maxAttempts },
       ),
     };
-  }
-
-  /** The authored step behind a resolvable ref (for placeholder defaults); undefined if the source won't say. */
-  private stepDef(ref: OrderInstructionRef): StepDef | undefined {
-    return this.source.stepDef?.(ref);
   }
 }

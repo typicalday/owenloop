@@ -1620,6 +1620,34 @@ test('§28: adopt on an unknown workflow id throws', () => {
   assert.throws(() => engine.adopt('wf_does_not_exist'), /no such workflow instance/);
 });
 
+test('WP-B1: an emitted digest keeps the original prompt and command after the source definition mutates', () => {
+  const mutable = def(
+    'mutable-instructions',
+    [input('proposal', { seedOwed: true })],
+    [
+      step({
+        name: 'runner',
+        consumes: ['proposal'],
+        produces: ['result'],
+        executor: 'command',
+        body: 'original prompt',
+        command: 'original command',
+      }),
+    ],
+  );
+  const { engine } = makeEngine([mutable]);
+  const wf = engine.createInstance('mutable-instructions', { provide: { proposal: { text: 'x' } } });
+  const order = fire(engine, wf, 'runner', 1000);
+  assert.equal(engine.resolveOrder(order).prompt, 'original prompt');
+  assert.equal(engine.resolveOrder(order).command, 'original command');
+
+  mutable.steps[0]!.body = 'mutated prompt';
+  mutable.steps[0]!.command = 'mutated command';
+
+  assert.equal(engine.resolveOrder(order).prompt, 'original prompt');
+  assert.equal(engine.resolveOrder(order).command, 'original command');
+});
+
 test('WP-B1 pin/adopt: a pinned instance keeps the OLD digest + OLD prompt bytes after the source changes; adopt flips both to the NEW ones', () => {
   const { engine, setDef } = makeMutableEngine([delivery]);
   const wf = engine.createInstance('delivery', { provide: { proposal: { text: 'x' } } });

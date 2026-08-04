@@ -1574,25 +1574,34 @@ embedded engine, and anything built on top):
 ```
 interface OrderInstructionSource {
   digestOf(def: WorkflowDef): string;                    // identity + registration
-  lookup(ref: OrderInstructionRef): ResolvedInstructions | undefined;
-  stepDef?(ref: OrderInstructionRef): StepDef | undefined;
+  lookup(ref: OrderInstructionRef): OrderInstructionLookup;
 }
 
 interface OrderInstructionRef { defDigest: string; step: string; key: string; }
 interface ResolvedInstructions { prompt?: string; command?: string; acceptance?: string; }
+interface ResolvedInstructionRecord extends ResolvedInstructions {
+  maxAttempts: number;                                  // materialization metadata
+}
+type OrderInstructionLookup =
+  | { status: 'resolved'; instructions: ResolvedInstructionRecord }
+  | { status: 'unknown-digest' }
+  | { status: 'unknown-step' };
 ```
 
 `createDefInstructionSource(defs?)` is the shipped adapter: it indexes
-loaded definitions by digest and serves the exact authored values —
-byte-for-byte, whitespace preserved, nothing trimmed, nothing fabricated
-(a step with an empty `body:` resolves to no prompt; a step with no
-`command:` resolves to no command). The seam is an injectable interface
-because the digest-keyed lookup is precisely the shape a future
-content-addressed definition store plugs into: an embedder (or the CLI) can
-hand the engine any source implementing these three methods, and
-`buildOrder`/resolution work unchanged against it. The engine ships no
-network fetch and no verification logic — "verified local source" means
-whatever the deployer trusts, addressed by digest.
+private deep snapshots of loaded definitions by digest and serves the exact
+authored values — byte-for-byte, whitespace preserved, nothing trimmed,
+nothing fabricated (an authored empty `body:` resolves to `prompt: ''`; a
+step with no `command:` resolves to no command). The typed lookup result keeps
+an unknown digest distinct from a missing step inside a known digest. The
+resolved record also carries the step's `maxAttempts` default, so an injected
+source cannot silently erase `${MAX_ATTEMPTS}` during materialization. The
+seam is an injectable interface because the digest-keyed lookup is precisely
+the shape a future content-addressed definition store plugs into: an embedder
+(or the CLI) can hand the engine any source implementing these methods, and
+`buildOrder`/resolution work unchanged against it. The engine ships no network
+fetch and no verification logic — "verified local source" means whatever the
+deployer trusts, addressed by digest.
 
 `OrderResolver` sits on top of a source: `resolve(ref)` returns the source's
 record or throws the named refusal; `resolveOrder(order)` builds the
@@ -1600,8 +1609,8 @@ record or throws the named refusal; `resolveOrder(order)` builds the
 runtime placeholders in the resolved prompt — the same substitution
 `${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MAX_ATTEMPTS}` that
 `buildOrder` used to inline, moved whole to resolution time (unknown
-placeholders stay untouched; `MAX_ATTEMPTS` renders the authored step's
-`maxAttempts` default, read from the resolved step definition). Substitution
+placeholders stay untouched; `MAX_ATTEMPTS` renders the `maxAttempts` metadata
+from the resolved instruction record). Substitution
 moved because the packet no longer contains materialized text: the authored
 body is served as authored, and the per-run values join it at resolve time.
 `Engine` exposes the resolver as `engine.resolver` (and `createEngine`
@@ -1610,15 +1619,18 @@ returns it alongside the engine), so an embedder's loop is
 
 ### §29.3 Unknown digest — a named refusal, never a fallback
 
-If `lookup` returns nothing for an order's digest — the definition was never
+If `lookup` returns `{ status: 'unknown-digest' }` — the definition was never
 delivered to this worker, or the delivered bytes differ from what emitted
 the order — resolution throws `UnknownDefDigestError`. The error names the
 digest (`err.defDigest`, and in its message) and nothing else is attempted:
 there is no fall back to name-based resolution, no "closest matching def",
-no empty-instructions degradation. Digest identity is the point — a worker
-that cannot resolve the exact digest it was handed must refuse the job,
-because executing instructions it cannot vouch for would reintroduce,
-through the back door, the very channel this contract removes.
+no empty-instructions degradation. If the digest is known but `step` is not
+present, resolution throws `UnknownInstructionError` and identifies the
+`defDigest`, `step`, and `key`; that malformed reference must not claim the
+verified digest is unknown. Digest identity is the point — a worker that
+cannot resolve the exact digest and instruction reference it was handed must
+refuse the job, because executing instructions it cannot vouch for would
+reintroduce, through the back door, the very channel this contract removes.
 
 ### §29.4 Interaction with pinning (§28)
 
