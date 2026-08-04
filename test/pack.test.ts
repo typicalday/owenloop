@@ -13,8 +13,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 
 const ROOT = join(import.meta.dirname, '..');
 
@@ -48,6 +49,17 @@ function packedFiles(): string[] {
     `npm pack --json returned no files — output schema likely changed again; raw output starts: ${out.slice(0, 200)}`,
   );
   return files;
+}
+
+/** Recursively list repository-relative files under a directory. */
+function walkFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) out.push(...walkFiles(full));
+    else if (entry.isFile()) out.push(relative(ROOT, full).replace(/\\/g, '/'));
+  }
+  return out;
 }
 
 test('npm pack includes everything a consumer needs', () => {
@@ -99,5 +111,15 @@ test('npm pack excludes local state, scaffolding, and repo-only files', () => {
   for (const prefix of ['test/', '.github/']) {
     const leaked = files.filter((f) => f.startsWith(prefix));
     assert.equal(leaked.length, 0, `tarball must not include ${prefix}* (got ${leaked.join(', ')})`);
+  }
+});
+
+test('npm pack ships the whole plugins/ tree', () => {
+  const expected = walkFiles(join(ROOT, 'plugins'));
+  assert.ok(expected.length > 0, 'plugins/ must contain at least one file');
+
+  const packed = new Set(packedFiles());
+  for (const rel of expected) {
+    assert.ok(packed.has(rel), `tarball should include ${rel}`);
   }
 });
