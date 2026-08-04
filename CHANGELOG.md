@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/typicalday/owenloop/compare/v0.4.1...v0.5.0) (2026-08-04)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cli:** fold owenwork execution CLI into owenloop work ([#91](https://github.com/typicalday/owenloop/issues/91))
+* **cli:** `owenloop binding rm` now requires a `<pool>` argument (`owenloop binding rm <label> <pool>`), and both `binding new` and `binding rm` print new stdout shapes. `binding new` no longer reports `previousPool`; scripts that read it must use `alreadyBound` / `boundPoolCount` instead. The CLI now requires a hub serving `add_label_binding` and `remove_label_binding`.
+
+### Features
+
+* add durable shift daemon ([#92](https://github.com/typicalday/owenloop/issues/92)) ([2c68808](https://github.com/typicalday/owenloop/commit/2c6880891d904067071904a3cfda8461ffc2587d))
+* **cli,mcp:** selectable scopes for agent-identity minting ([#83](https://github.com/typicalday/owenloop/issues/83)) ([f9b7a55](https://github.com/typicalday/owenloop/commit/f9b7a559e9ab8f27bdaf15cf26dd6dcc8968c6a4))
+* **cli:** fold owenwork execution CLI into owenloop work ([#91](https://github.com/typicalday/owenloop/issues/91)) ([1ed865a](https://github.com/typicalday/owenloop/commit/1ed865ae6d03cbb176d81e26f2ecce60a5cebd1c))
+* **cli:** migrate binding commands to many-to-many label bindings ([6ba3cc2](https://github.com/typicalday/owenloop/commit/6ba3cc254f8874f8cb734d596b1b6d267c4b5946))
+* **cli:** owenloop binding new|rm|list — label→pool bindings + author docs ([#85](https://github.com/typicalday/owenloop/issues/85)) ([c561861](https://github.com/typicalday/owenloop/commit/c561861c208d96d576997939e33063db8de1670b))
+* **cli:** owenloop pool new|rm|list, pool member add|rm ([#88](https://github.com/typicalday/owenloop/issues/88)) ([8ad5fab](https://github.com/typicalday/owenloop/commit/8ad5fabc454650fed6f006b8b3b55d001d102d85))
+* **mcp:** add pool tools (list_pools/create_pool/add_pool_member/remove_pool_member) ([#89](https://github.com/typicalday/owenloop/issues/89)) ([be2d667](https://github.com/typicalday/owenloop/commit/be2d6678d7da6de14bdb1a90f99c5077f1b95c86))
+
+
+### Bug Fixes
+
+* **cli:** unify add/push/check's definite-defect predicate via shared helper ([#81](https://github.com/typicalday/owenloop/issues/81)) ([0a43b99](https://github.com/typicalday/owenloop/commit/0a43b99bf3f7b615d74fe4f3780b775adf8c12a8))
+* correct three vocabulary defects found in post-merge audit ([b43f5f6](https://github.com/typicalday/owenloop/commit/b43f5f696d74e35244ed7a355dcf106ad386f53b))
+* **mcp:** sync presence_ping/list_conductors doc-text with hub behavior (W9.4) ([#87](https://github.com/typicalday/owenloop/issues/87)) ([72fc488](https://github.com/typicalday/owenloop/commit/72fc488c2fab055e64951482ff625483bdb927f1))
+* repair and promote compile-dev-playbook, drop stray FUNDING.yml ([#99](https://github.com/typicalday/owenloop/issues/99)) ([7c78094](https://github.com/typicalday/owenloop/commit/7c780945841eb41467d508cac864b3262d5a8f38))
+
 ## [0.4.1](https://github.com/typicalday/owenloop/compare/v0.4.0...v0.4.1) (2026-07-22)
 
 
