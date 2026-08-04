@@ -297,12 +297,14 @@ them in the tree, both all-or-nothing with crash recovery:
 Bundle installs fail closed without their two required adapters (bundle
 ingestion and pre-commit verification) — there is no default accepting
 parser, digest algorithm, or verifier, and publishing from this engine does
-not sign a bundle. Resolution is deliberately split: execution resolves by
-**digest only** (project first, fall-through to global only when the project
-object is absent — a corrupt project object is a hard error, never masked by
-a global copy), while human-facing lookups resolve by **coordinate** and
-surface a structured ambiguity error when the two levels disagree — never a
-silent project-first pick. Full semantics:
+not sign a bundle. `--global` applies only to `.wnlp` bundle sources; a GitHub
+source with `--global` is refused before any network request. Resolution is
+deliberately split: execution resolves by **digest only** (project first,
+fall-through to global only when the project object is absent — a corrupt
+project object is a hard error, never masked by a global copy), while
+human-facing lookups resolve by **coordinate** and surface a structured
+ambiguity error when the two levels disagree — never a silent project-first
+pick. Full semantics:
 [`docs/cli.md`](docs/cli.md#add-with-bundles--the-content-addressed-workflow-store).
 
 ---

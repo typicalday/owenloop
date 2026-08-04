@@ -24,6 +24,7 @@ import {
   mkdtempSync,
   readFileSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -35,6 +36,7 @@ import {
   objectDestRelPath,
   PreCommitVerifierUnavailableError,
   readWorkflowStoreIndex,
+  StoreIntegrityError,
   recoverWorkflowStore,
   storeIndexPath,
   workflowCoordinate,
@@ -47,7 +49,7 @@ import type {
   WorkflowCoordinate,
 } from '../src/store/index.ts';
 import { ADD_JOURNAL_FILENAME, writeAddJournal } from '../src/add.ts';
-import { canonicalJsonBytes, sha256Hex } from '../src/install.ts';
+import { canonicalJsonBytes, createRecoveryMarker, sha256Hex } from '../src/install.ts';
 
 // ---- independent fixture layer ---------------------------------------------------
 
@@ -193,13 +195,21 @@ test('install: a valid bundle installs with the fixed commit order and hardened 
   const ingestor = fakeIngestor();
   const verifier = fakeVerifier();
   const events: string[] = [];
-  // Wrap the adapters to capture the call ORDER.
+  let a1StagingDir = '';
+  // Wrap the adapters to capture the call ORDER and the exact staged tree that
+  // A2 receives before the destination exists.
   const orderedIngestor: BundleIngestor = {
-    async ingest(i) { events.push('a1-ingest'); return ingestor.ingest(i); },
+    async ingest(i) { a1StagingDir = i.stagingDir; events.push('a1-ingest'); return ingestor.ingest(i); },
     async verifyInstalledObject(i) { events.push('a1-verify-installed'); return ingestor.verifyInstalledObject(i); },
   };
   const orderedVerifier: PreCommitVerifier = {
-    async verify(i) { events.push('a2-verify'); return verifier.verify(i); },
+    async verify(i) {
+      events.push('a2-verify');
+      assert.equal(i.objectDir, a1StagingDir, 'A2 receives the A1 staging directory');
+      assert.ok(existsSync(i.objectDir), 'A1 staging directory exists during A2 verification');
+      assert.ok(!existsSync(join(root, objectDestRelPath(defDigest(m.digest)))), 'final object is not installed during A2 verification');
+      return verifier.verify(i);
+    },
   };
 
   const result = await installWorkflowBundle({
@@ -240,6 +250,83 @@ test('install: a valid bundle installs with the fixed commit order and hardened 
 });
 
 // ---- tamper, verifier, and validation refusals -------------------------------------
+
+test('install: state directory and lock/journal leaves are guarded before lock acquisition', async () => {
+  const cases: Array<{
+    name: string;
+    setup: (root: string, lockPath: string, journalPath: string) => void;
+    expected: RegExp;
+  }> = [
+    {
+      name: 'state directory symlink',
+      setup: (root) => symlinkSync(mkdtempSync(join(tmpdir(), 'owenloop-state-target-')), join(root, '.owenloop')),
+      expected: /install state directory .*symlink/,
+    },
+    {
+      name: 'lock leaf symlink',
+      setup: (_root, lockPath) => symlinkSync(mkdtempSync(join(tmpdir(), 'owenloop-lock-target-')), lockPath),
+      expected: /install lock .*symlink/,
+    },
+    {
+      name: 'journal leaf symlink',
+      setup: (_root, _lockPath, journalPath) => symlinkSync(mkdtempSync(join(tmpdir(), 'owenloop-journal-target-')), journalPath),
+      expected: /crash-recovery journal .*symlink/,
+    },
+    {
+      name: 'lock leaf directory',
+      setup: (_root, lockPath) => mkdirSync(lockPath),
+      expected: /install lock .*not a regular file/,
+    },
+    {
+      name: 'journal leaf directory',
+      setup: (_root, _lockPath, journalPath) => mkdirSync(journalPath),
+      expected: /crash-recovery journal .*not a regular file/,
+    },
+  ];
+
+  for (const { name, setup, expected } of cases) {
+    const { root, lockPath, journalPath } = tempStore(`owenloop-state-guard-${name.replaceAll(' ', '-')}-`);
+    if (name !== 'state directory symlink') mkdirSync(join(root, '.owenloop'), { recursive: true });
+    setup(root, lockPath, journalPath);
+    const ingestor = fakeIngestor();
+    await assert.rejects(
+      installWorkflowBundle({
+	bytes: bundleBytes(makeBundle(name.replaceAll(' ', '-'))),
+	source: SRC,
+	root,
+	level: 'project',
+	lockPath,
+	journalPath,
+	ingestor,
+	verifier: fakeVerifier(),
+      }),
+      expected,
+      name,
+    );
+    assert.equal(ingestor.ingests, 0, `${name}: A1 did not run before the refusal`);
+  }
+});
+
+test('install: a symlinked object parent is corrupt and never used as a destination', async () => {
+  const { root, lockPath, journalPath } = tempStore();
+  symlinkSync(mkdtempSync(join(tmpdir(), 'owenloop-object-target-')), join(root, 'objects'));
+  const m = makeBundle('object-parent-link');
+
+  await assert.rejects(
+    installWorkflowBundle({
+      bytes: bundleBytes(m),
+      source: SRC,
+      root,
+      level: 'project',
+      lockPath,
+      journalPath,
+      ingestor: fakeIngestor(),
+      verifier: fakeVerifier(),
+    }),
+    (e: unknown) => e instanceof StoreIntegrityError && e.code === 'object-corrupt' && /symlink/.test(e.message),
+  );
+  assert.ok(!existsSync(storeIndexPath(root)), 'index was not written');
+});
 
 test('install: one altered byte is rejected by A1 before anything is committed', async () => {
   const { root, lockPath, journalPath } = tempStore();
@@ -510,6 +597,56 @@ test('recovery: crash BEFORE the swap — staged debris cleared, dest never crea
   assert.ok(!existsSync(journalPath), 'journal dropped');
   // Second recovery is a no-op.
   assert.equal(await recoverWorkflowStore({ root, lockPath, journalPath }), 'no-journal');
+});
+
+test('recovery: symlinked object parents are refused before any recovery mutation', async () => {
+  const { root, lockPath, journalPath } = tempStore();
+  const digest = defDigest('a'.repeat(64));
+  const outside = mkdtempSync(join(tmpdir(), 'owenloop-recovery-object-target-'));
+  writeFileSync(join(outside, 'victim'), 'keep');
+  mkdirSync(join(root, '.owenloop'), { recursive: true });
+  writeAddJournal(journalPath, {
+    version: 2, phase: 'applying',
+    destSegments: ['objects', 'sha256', digest],
+    stagingId: 'stg_linked_objects', hadDest: false, root,
+    metadataHash: sha256Hex(canonicalJsonBytes({ version: 1, entries: {} })),
+  });
+  symlinkSync(outside, join(root, 'objects'));
+
+  await assert.rejects(
+    recoverWorkflowStore({ root, lockPath, journalPath }),
+    /recovery.*objects.*symlink|objects.*symlink/i,
+  );
+  assert.ok(existsSync(journalPath), 'journal remains as evidence');
+  assert.equal(readFileSync(join(outside, 'victim'), 'utf8'), 'keep', 'outside target was untouched');
+});
+
+test('recovery: a fresh v2 swap is discarded only with a matching external marker', async () => {
+  const { root, lockPath, journalPath } = tempStore();
+  const markerDir = mkdtempSync(join(tmpdir(), 'owenloop-recovery-markers-'));
+  const digest = defDigest('b'.repeat(64));
+  const stagingId = 'stg_fresh_marker';
+  const destSegments = ['objects', 'sha256', digest];
+  const objDir = join(root, ...destSegments);
+  // Crash window: the fresh staging directory was renamed to the final object,
+  // but the metadata write never landed. No staging or backup remains.
+  mkdirSync(objDir, { recursive: true });
+  writeFileSync(join(objDir, 'def.yaml'), validDefYaml('orphaned'));
+  const marker = createRecoveryMarker({ root, destSegments, stagingId, markerDir });
+  writeAddJournal(journalPath, {
+    version: 2, phase: 'applying',
+    destSegments, stagingId, hadDest: false, root,
+    metadataHash: sha256Hex(canonicalJsonBytes({ version: 1, entries: {} })),
+    recoveryMarkerId: marker.id,
+  });
+
+  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath, recoveryMarkerDir: markerDir });
+
+  assert.equal(outcome, 'rolled-back');
+  assert.ok(!existsSync(objDir), 'the corroborated fresh destination is discarded');
+  assert.ok(!existsSync(join(root, '.owenloop-staging')), 'staging debris is cleared');
+  assert.ok(!existsSync(journalPath), 'journal is removed last');
+  assert.ok(!existsSync(marker.path), 'external marker is removed after journal cleanup');
 });
 
 test('recovery: crash BETWEEN the swap and the index write — the backup is restored over dest', async () => {

@@ -22,7 +22,7 @@
 
 import { lstatSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve as resolvePath } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
 import {
   StoreAmbiguityError,
   StoreIndexError,
@@ -34,6 +34,7 @@ import {
 } from './types.ts';
 import type { DefDigest, ResolutionLevel, WorkflowCoordinate } from './types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
+import { probeDirectoryPath } from '../install.ts';
 import type { BundleIngestor } from './install.ts';
 
 /**
@@ -57,6 +58,22 @@ export function globalStoreRoot(home: string = homedir()): string {
 /** The index file path at a store root. */
 export function storeIndexPath(root: string): string {
   return join(root, WORKFLOW_STORE_INDEX_FILENAME);
+}
+
+/** Canonical state paths for one workflow store root. */
+export interface WorkflowStoreStatePaths {
+  stateDir: string;
+  lockPath: string;
+  journalPath: string;
+}
+
+export function workflowStoreStatePaths(root: string): WorkflowStoreStatePaths {
+  const stateDir = join(root, '.owenloop');
+  return {
+    stateDir,
+    lockPath: join(stateDir, 'add.lock'),
+    journalPath: join(stateDir, 'add.journal'),
+  };
 }
 
 /**
@@ -85,23 +102,18 @@ export function probeStoreRoot(root: string): 'dir' | 'absent' {
  * must never be papered over by a global fall-through.
  */
 export function probeObjectDir(objectDir: string, digest: DefDigest, level: ResolutionLevel): 'dir' | 'absent' {
-  const st = lstatSync(objectDir, { throwIfNoEntry: false });
-  if (st === undefined) return 'absent';
-  if (st.isSymbolicLink()) {
-    throw new StoreIntegrityError(
-      'object-corrupt',
-      digest,
-      `${level}-level object dir is a symlink — refusing (no fallback)`,
-    );
+  try {
+    const root = dirname(dirname(dirname(objectDir)));
+    return probeDirectoryPath(objectDir, `${level}-level workflow object`, root);
+  } catch (e) {
+    const leaf = lstatSync(objectDir, { throwIfNoEntry: false });
+    const detail = leaf?.isSymbolicLink()
+      ? `${level}-level object dir is a symlink — refusing (no fallback)`
+      : leaf !== undefined && !leaf.isDirectory()
+	? `${level}-level object dir is not a directory — refusing (no fallback)`
+	: `${(e as Error).message} — refusing (no fallback)`;
+    throw new StoreIntegrityError('object-corrupt', digest, detail);
   }
-  if (!st.isDirectory()) {
-    throw new StoreIntegrityError(
-      'object-corrupt',
-      digest,
-      `${level}-level object dir is not a directory — refusing (no fallback)`,
-    );
-  }
-  return 'dir';
 }
 
 /** One resolution result: where the object lives and which levels hold it. */

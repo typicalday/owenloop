@@ -128,6 +128,21 @@ test('probeStoreRoot: absent is NOT an error; symlink and non-dir squatting are'
     e instanceof StorePathError && /not a directory/.test(e.message));
 });
 
+test('probeObjectDir: symlinked objects and sha256 parents are corrupt, not absent', () => {
+  const d = digest('5');
+  const objectsRoot = tempDir();
+  const objects = join(objectsRoot, 'objects');
+  symlinkSync(tempDir(), objects);
+  assert.throws(() => probeObjectDir(objectDirForDigest(objectsRoot, d), d, 'project'), (e: unknown) =>
+    e instanceof StoreIntegrityError && e.code === 'object-corrupt' && /objects/.test(e.message));
+
+  const shaRoot = tempDir();
+  mkdirSync(join(shaRoot, 'objects'));
+  symlinkSync(tempDir(), join(shaRoot, 'objects', 'sha256'));
+  assert.throws(() => probeObjectDir(objectDirForDigest(shaRoot, d), d, 'global'), (e: unknown) =>
+    e instanceof StoreIntegrityError && e.code === 'object-corrupt' && /sha256/.test(e.message));
+});
+
 // ---- index.json round-trip + hostile shapes --------------------------------------
 
 test('index: write→read round-trip; missing file reads as an EMPTY index (not an error)', () => {

@@ -59,6 +59,7 @@ export {
   serializeWorkflowStoreIndex,
   storeIndexPath,
   workflowCoordinate,
+  workflowStoreStatePaths,
   WORKFLOW_STORE_INDEX_VERSION,
   WorkflowStoreError,
   StoreIndexError,
@@ -88,6 +89,7 @@ export type {
   WorkflowCoordinate,
   WorkflowStoreIndex,
   WorkflowStoreIndexEntry,
+  WorkflowStoreStatePaths,
 } from './store/index.ts';
 
 export { buildDef, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';

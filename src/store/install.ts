@@ -22,9 +22,9 @@
  * or a hub module.
  */
 
-import { chmodSync, existsSync, lstatSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
-import { mkdirRefusingSymlink, randId } from '../util.ts';
+import { chmodSync, lstatSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { randId } from '../util.ts';
 import { DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from '../defs.ts';
 import type { DefLoadFailure } from '../defs.ts';
 import { hasDefiniteCheckDefect, modelCheck } from '../model.ts';
@@ -32,11 +32,16 @@ import {
   acquireInstallLock,
   canonicalJsonBytes,
   commitInstall,
+  createRecoveryMarker,
+  ensureDirectoryPathNoSymlink,
   finalizeInstallCommit,
+  guardStateFile,
   multiSegmentPathViolation,
+  probeDirectoryPath,
   recoverInterruptedInstall,
   releaseInstallLock,
   removeAddJournal,
+  removeRecoveryMarker,
   rmRecursiveForce,
   RollbackFailedError,
   rollbackInstallCommit,
@@ -137,6 +142,8 @@ export interface InstallWorkflowBundleArgs {
   lockPath: string;
   /** Path of the per-root crash-recovery journal. */
   journalPath: string;
+  /** External marker directory for corroborating a fresh swap with no backup. */
+  recoveryMarkerDir?: string;
   /** Bundle-ingest adapter — REQUIRED (fail-closed without it). */
   ingestor: BundleIngestor;
   /** Pre-commit verifier — REQUIRED (fail-closed without it). */
@@ -251,7 +258,7 @@ export function hardenObjectModes(dir: string): void {
  * {@link StoreIntegrityError} — never replaced, never fallen through.
  */
 export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Promise<BundleInstallResult> {
-  const { bytes, source, root, level, lockPath, journalPath, ingestor, verifier, readLedger } = args;
+  const { bytes, source, root, level, lockPath, journalPath, recoveryMarkerDir, ingestor, verifier, readLedger } = args;
   if (ingestor === undefined || ingestor === null) throw new BundleIngestorUnavailableError();
   if (verifier === undefined || verifier === null) throw new PreCommitVerifierUnavailableError();
 
@@ -260,7 +267,11 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
   const stagingId = randId('stg');
   const stagingDir = join(stagingRoot, stagingId);
 
-  mkdirRefusingSymlink(root);
+  ensureDirectoryPathNoSymlink(root, 'workflow store root');
+  ensureDirectoryPathNoSymlink(dirname(lockPath), 'install state directory');
+  ensureDirectoryPathNoSymlink(dirname(journalPath), 'install state directory');
+  guardStateFile(lockPath, 'install lock');
+  guardStateFile(journalPath, 'crash-recovery journal');
   const lock = await acquireInstallLock(lockPath);
   // Set true only when the ONLY copy of some content sits under the staging
   // root (a rollback double-fault) — then the `finally` must NOT clear it.
@@ -274,7 +285,13 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // ledger a leftover v1 journal is refused. Any refusal preserves the
     // staging root + journal as evidence.
     try {
-      recoverInterruptedInstall({ defsDir: root, journalPath, lockfilePath: indexPath, readLedger });
+      recoverInterruptedInstall({
+	defsDir: root,
+	journalPath,
+	lockfilePath: indexPath,
+	readLedger,
+	recoveryMarkerDir,
+      });
     } catch (e) {
       preserveStagingRoot = true;
       throw e;
@@ -300,7 +317,12 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     if (existing !== undefined && existing.digest !== digest) {
       throw new StoreConflictError(coordinate, existing.digest);
     }
-    const objectAlreadyPresent = existsSync(objectDir);
+    let objectAlreadyPresent: boolean;
+    try {
+      objectAlreadyPresent = probeDirectoryPath(objectDir, 'workflow object', root) === 'dir';
+    } catch (e) {
+      throw new StoreIntegrityError('object-corrupt', digest, (e as Error).message);
+    }
 
     // Validate the staged tree with the engine's strict pass — the exact
     // bytes that will be committed, with no re-write after validation.
@@ -340,7 +362,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 
     // A2 pre-commit verification: after content/engine validation, before ANY
     // destination swap or index write. A rejection commits nothing.
-    await verifier.verify({ source, coordinate, digest, objectDir });
+    await verifier.verify({ source, coordinate, digest, objectDir: stagingDir });
 
     // The post-install index, computed BEFORE the commit point so its exact
     // canonical bytes are what the journal's metadataHash commits to.
@@ -349,6 +371,18 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       entries: { ...index.entries, [coordinate]: { digest, pinned: existing?.pinned ?? false } },
     };
     const metadataHash = sha256Hex(canonicalJsonBytes(nextIndex));
+
+    // A fresh swap needs an external corroboration marker because the staging
+    // and backup directories can both be absent after a crash. Dedupe has no
+    // destructive object swap and therefore needs no marker.
+    const recoveryMarker = objectAlreadyPresent
+      ? undefined
+      : createRecoveryMarker({
+	  root,
+	  destSegments: ['objects', 'sha256', digest],
+	  stagingId,
+	  markerDir: recoveryMarkerDir,
+	});
 
     // Journal (v2, phase `applying`) BEFORE the first destructive step.
     const journalBase = {
@@ -360,8 +394,14 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       root,
       metadataHash,
       label: coordinate,
+      recoveryMarkerId: recoveryMarker?.id,
     };
-    writeAddJournal(journalPath, journalBase);
+    try {
+      writeAddJournal(journalPath, journalBase);
+    } catch (e) {
+      if (recoveryMarker !== undefined) removeRecoveryMarker(recoveryMarker);
+      throw e;
+    }
 
     let handle: InstallCommitHandle | undefined;
     if (objectAlreadyPresent) {
@@ -374,6 +414,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
         await ingestor.verifyInstalledObject({ objectDir, digest });
       } catch (e) {
         removeAddJournal(journalPath);
+	if (recoveryMarker !== undefined) removeRecoveryMarker(recoveryMarker);
         throw new StoreIntegrityError(
           'object-corrupt',
           digest,
@@ -399,6 +440,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       } catch (e) {
         rollbackInstallCommit(handle);
         removeAddJournal(journalPath);
+	if (recoveryMarker !== undefined) removeRecoveryMarker(recoveryMarker);
         throw new Error(
           `refusing to install bundle '${coordinate}': object hardening failed ` +
             `(${(e as Error).message}) — install rolled back, previous state restored`,
@@ -430,6 +472,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
         }
       }
       removeAddJournal(journalPath);
+      if (recoveryMarker !== undefined) removeRecoveryMarker(recoveryMarker);
       throw new Error(
         `could not record install of '${coordinate}' in ${indexPath}: ${(e as Error).message} — ` +
           `install rolled back, previous state restored`,
@@ -443,6 +486,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     if (handle !== undefined) finalizeInstallCommit(handle);
     rmRecursiveForce(stagingRoot);
     removeAddJournal(journalPath);
+    if (recoveryMarker !== undefined) removeRecoveryMarker(recoveryMarker);
 
     return {
       source,
@@ -467,6 +511,8 @@ export interface RecoverWorkflowStoreArgs {
   lockPath: string;
   /** Path of the root's crash-recovery journal. */
   journalPath: string;
+  /** External marker directory for fresh-install recovery corroboration. */
+  recoveryMarkerDir?: string;
 }
 
 /**
@@ -478,13 +524,18 @@ export interface RecoverWorkflowStoreArgs {
  * Refusals throw and leave the journal, staging, and objects untouched.
  */
 export async function recoverWorkflowStore(args: RecoverWorkflowStoreArgs): Promise<RecoveryOutcome> {
-  mkdirRefusingSymlink(args.root);
+  ensureDirectoryPathNoSymlink(args.root, 'workflow store root');
+  ensureDirectoryPathNoSymlink(dirname(args.lockPath), 'install state directory');
+  ensureDirectoryPathNoSymlink(dirname(args.journalPath), 'install state directory');
+  guardStateFile(args.lockPath, 'install lock');
+  guardStateFile(args.journalPath, 'crash-recovery journal');
   const lock = await acquireInstallLock(args.lockPath);
   try {
     return recoverInterruptedInstall({
       defsDir: args.root,
       journalPath: args.journalPath,
       lockfilePath: storeIndexPath(args.root),
+      recoveryMarkerDir: args.recoveryMarkerDir,
     });
   } finally {
     releaseInstallLock(lock);

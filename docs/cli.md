@@ -493,11 +493,12 @@ owenloop add --recover [--global]        # offline crash recovery (per root)
 The source is classified before anything else: `owner/repo[@ref]` keeps the
 GitHub route byte-for-byte unchanged; a path ending in `.wnlp` is a bundle
 file; an `http:`/`https:` URL is a bundle URL. Any other URL scheme
-(`ftp:`, `file:`, …) is refused — never a silent fallback. The source string
-is origin data only (diagnostics and messages); it is never joined into a
-filesystem path and never part of a bundle's identity. Identity comes from
-the bundle's own `namespace/name@version` coordinate and its canonical
-content digest.
+(`ftp:`, `file:`, …) is refused — never a silent fallback. `--global` applies
+only to `.wnlp` bundle sources; a GitHub source with `--global` is refused
+before any network request. The source string is origin data only (diagnostics
+and messages); it is never joined into a filesystem path and never part of a
+bundle's identity. Identity comes from the bundle's own
+`namespace/name@version` coordinate and its canonical content digest.
 
 **The `.wnlp` route requires two adapters and fails closed without them.**
 Bundle ingestion (unpacking, manifest integrity, canonical digest,
@@ -546,9 +547,12 @@ Coordinates, source strings, and version text never join into a path.
    given. A URL fetch uses the same 5 min timeout, refuses redirects
    (`redirect: 'error'`) instead of following them silently, and streams
    through the same bounded reader.
-2. Acquire the root's install lock (project installs share the project
-   `.owenloop/add.lock`, so GitHub and bundle installs in one project
-   serialize together).
+2. Acquire the canonical root lock at `<root>/.owenloop/add.lock`. A GitHub
+   install also retains its legacy cwd-derived lock for compatibility and, when
+   the resolved `--defs` root differs from that cwd, acquires both locks in a
+   fixed order. The canonical lock makes bundle installs from different cwd
+   values serialize when they target one shared `--defs` root; the additional
+   GitHub lock keeps the legacy route compatible.
 3. Recover a prior interrupted install (before clearing staging — the
    backups a rollback needs live under the staging root).
 4. Reread and validate the index **inside** the lock (a corrupt index is a
@@ -603,11 +607,17 @@ nothing is written. An existing coordinate at the SAME digest deduplicates
 **Crash recovery** is the same two-phase discipline as the GitHub route,
 generalized: the v2 journal's commit-point test compares the hash of the
 current `index.json` bytes against the journal's recorded metadata hash
-(route-neutral — no GitHub ledger involved). `add --recover --global` runs
-the store's recovery standalone against the global root with no network and
-prints `{"ok":true,"recovered":false|true,"outcome":…}` exactly like the
-project variant. A v1 (GitHub-schema) journal found at the global root is
-refused fail-closed — there is no ledger there to vouch for it — and a
+(route-neutral — no GitHub ledger involved). A fresh v2 install also writes a
+single-use external recovery marker under the user's recovery-marker directory
+(default `~/.owenloop/recovery-markers`) before the applying journal. If a
+crash leaves the destination present with no staging or backup, recovery
+discards that destination only when the marker exactly matches the store root,
+destination segments, staging id, and `hadDest: false`; a missing or mismatched
+marker refuses and preserves the destination and journal. `add --recover --global`
+runs the store's recovery standalone against the global root with no network
+and prints `{"ok":true,"recovered":false|true,"outcome":…}` exactly
+like the project variant. A v1 (GitHub-schema) journal found at the global root
+is refused fail-closed — there is no ledger there to vouch for it — and a
 journal recorded against a *different* store root is refused rather than
 trusting its absolute path. Refusals leave the journal in place as evidence.
 
@@ -647,9 +657,12 @@ intended tree.
 `add <owner>/<repo>[@ref]`: the same inputs reach the same parser, the
 `<owner>-<repo>-<hash>` namespace is untouched, `.owenloop/installed.json`
 keeps its schema and validation, and an explicit `--defs`/`OWENLOOP_DEFS`
-still installs through a symlinked defs dir (operator intent). The only
-shared surface is the project's add lock and journal path, where the two
-routes serialize together and recover each other's journals by version.
+still installs through a symlinked defs dir (operator intent). The routes
+share the canonical resolved-store lock, while the GitHub route retains its
+legacy cwd-derived lock and journal for compatibility. Recovery checks both
+journal locations and dispatches by journal version; a v2 store journal uses
+`index.json` metadata and a v1 GitHub journal uses `installed.json` ledger
+corroboration.
 
 ## Hub (`login` / `connect` / `push` / `logout`)
 

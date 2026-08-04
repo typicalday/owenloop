@@ -374,6 +374,8 @@ export interface RecoverInterruptedInstallArgs {
   journalPath: string;
   /** Path to `.owenloop/installed.json` — read to decide the commit-point boundary. */
   lockfilePath: string;
+  /** External marker directory for fresh v2 recovery corroboration. */
+  recoveryMarkerDir?: string;
 }
 
 /**
@@ -391,6 +393,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     defsDir: args.defsDir,
     journalPath: args.journalPath,
     lockfilePath: args.lockfilePath,
+    recoveryMarkerDir: args.recoveryMarkerDir,
     readLedger: () => {
       // readLockfile validates fail-closed; a corrupt lockfile aborts the add
       // exactly as it does on the normal path.

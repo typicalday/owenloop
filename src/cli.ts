@@ -33,7 +33,7 @@
  */
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { basename, delimiter, dirname, join, resolve } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline/promises';
@@ -97,7 +97,7 @@ import {
   writeAddJournal,
   writeLockfile,
 } from './add.ts';
-import type { AddJournal, InstalledEntry, InstallCommitHandle, Lockfile } from './add.ts';
+import type { AddJournal, InstalledEntry, InstallCommitHandle, InstallLockHandle, Lockfile } from './add.ts';
 import {
   BundleIngestorUnavailableError,
   globalStoreRoot,
@@ -106,6 +106,7 @@ import {
   projectStoreRoot,
   recoverWorkflowStore,
   storeIndexPath,
+  workflowStoreStatePaths,
 } from './store/index.ts';
 import type { BundleIngestor, BundleSource, PreCommitVerifier } from './store/index.ts';
 import {
@@ -152,6 +153,7 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { owenloopSettingsPath, readOwenloopSettingsRaw, writeOwenloopHubOrigin } from './work-settings.ts';
+import { ensureDirectoryPathNoSymlink, guardStateFile } from './install.ts';
 
 // Re-export the keychain backend type so existing test imports of `Keychain`
 // from `../src/cli.ts` (test/hubkit.ts, test/login.test.ts) keep resolving —
@@ -181,6 +183,8 @@ export interface CliIO {
    * is no default accepting verifier. The GitHub repo route never uses it.
    */
   preCommitVerifier?: PreCommitVerifier;
+  /** Optional test/runtime override for the external fresh-install marker directory. */
+  recoveryMarkerDir?: string;
   /** Open a URL in the user's browser (login). Default: fire-and-forget `open`/`xdg-open`/`start`. */
   openUrl?: (url: string) => void;
   /**
@@ -1515,9 +1519,10 @@ export function classifyAddSource(spec: string): AddSource {
  * never fully allocated.
  */
 function readBundleFile(io: CliIO, path: string): Uint8Array {
+  const filesystemPath = isAbsolute(path) ? path : join(io.cwd, path);
   let st: ReturnType<typeof lstatSync>;
   try {
-    st = lstatSync(path);
+    st = lstatSync(filesystemPath);
   } catch {
     throw new CliError(`could not read bundle at ${path}: file not found`);
   }
@@ -1533,7 +1538,7 @@ function readBundleFile(io: CliIO, path: string): Uint8Array {
   }
   let bytes: Uint8Array;
   try {
-    bytes = readFileSync(path);
+    bytes = readFileSync(filesystemPath);
   } catch (e) {
     throw new CliError(`could not read bundle at ${path}: ${(e as Error).message}`);
   }
@@ -1610,12 +1615,9 @@ async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Prom
   const root = globalFlag
     ? globalStoreRoot(home)
     : projectStoreRoot(defsOverride ?? join(io.cwd, 'workflows'));
-  const lockPath = globalFlag
-    ? join(root, '.owenloop', 'add.lock')
-    : join(io.cwd, '.owenloop', 'add.lock');
-  const journalPath = globalFlag
-    ? join(root, '.owenloop', ADD_JOURNAL_FILENAME)
-    : join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME);
+  const statePaths = workflowStoreStatePaths(root);
+  const lockPath = statePaths.lockPath;
+  const journalPath = statePaths.journalPath;
 
   // Bytes first, lock later (same as the GitHub route). Origin data only —
   // the bundle's manifest is the identity authority.
@@ -1661,6 +1663,7 @@ async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Prom
     level: globalFlag ? 'global' : 'project',
     lockPath,
     journalPath,
+    recoveryMarkerDir: io.recoveryMarkerDir,
     ingestor: io.bundleIngestor,
     verifier: io.preCommitVerifier,
     readLedger,
@@ -1691,7 +1694,7 @@ async function dispatchAddRecoverGlobal(io: CliIO): Promise<number> {
   const lockPath = join(root, '.owenloop', 'add.lock');
   const journalPath = join(root, '.owenloop', ADD_JOURNAL_FILENAME);
 
-  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath });
+  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath, recoveryMarkerDir: io.recoveryMarkerDir });
   switch (outcome) {
     case 'no-journal':
       print(io, { ok: true, recovered: false, message: 'nothing to recover — no interrupted install found' });
@@ -1762,6 +1765,9 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const spec = need(args, 1, '<source>');
   const classified = classifyAddSource(spec);
   if (classified.kind !== 'github') return dispatchAddBundle(io, args, classified);
+  if (flag(args, 'global')) {
+    throw new CliError('--global is only supported for .wnlp bundle sources');
+  }
   const { owner, repo, ref } = parseRepoSpec(spec);
   const source = `${owner}/${repo}`;
   const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
@@ -1769,6 +1775,7 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const lockfilePath = join(io.cwd, '.owenloop', 'installed.json');
   const installLockPath = join(io.cwd, '.owenloop', 'add.lock');
   const journalPath = join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME);
+  const canonicalState = workflowStoreStatePaths(projectStoreRoot(defsDir));
   const fetchFn = io.fetch ?? globalThis.fetch;
 
   // 1. Resolve the ref to a pinned commit sha.
@@ -1882,8 +1889,21 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   // intent, not repo content — deliberately installing through a symlink keeps
   // today's behavior, matching the --db/OWENLOOP_DB rule.
   mkdirRefusingSymlink(join(io.cwd, '.owenloop'));
+  guardStateFile(installLockPath, 'install lock');
+  guardStateFile(journalPath, 'crash-recovery journal');
+  guardStateFile(lockfilePath, 'installed ledger');
   if (defsOverride === undefined) mkdirRefusingSymlink(defsDir);
-  const lock = await acquireInstallLock(installLockPath);
+  mkdirRefusingSymlink(canonicalState.stateDir);
+  guardStateFile(canonicalState.lockPath, 'canonical install lock');
+  guardStateFile(canonicalState.journalPath, 'canonical crash-recovery journal');
+  const lockPaths = [...new Set([installLockPath, canonicalState.lockPath])].sort();
+  const locks: InstallLockHandle[] = [];
+  try {
+    for (const path of lockPaths) locks.push(await acquireInstallLock(path));
+  } catch (e) {
+    for (const handle of locks.reverse()) releaseInstallLock(handle);
+    throw e;
+  }
   // Set true only on a rollback double-fault, where the ONLY copy of the
   // previous content ends up parked under the staging root — then the `finally`
   // must NOT delete it (the error message tells the user to recover it).
@@ -1896,7 +1916,13 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     // journal as evidence: without this, the `finally` below would rmSync the
     // staging root and take the backups a later recovery needs with it.
     try {
-      recoverInterruptedInstall({ defsDir, journalPath, lockfilePath });
+      recoverInterruptedInstall({
+	defsDir,
+	journalPath: canonicalState.journalPath,
+	lockfilePath: storeIndexPath(defsDir),
+	recoveryMarkerDir: io.recoveryMarkerDir,
+      });
+      recoverInterruptedInstall({ defsDir, journalPath, lockfilePath, recoveryMarkerDir: io.recoveryMarkerDir });
     } catch (e) {
       preserveStagingRoot = true;
       throw e;
@@ -2142,7 +2168,7 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     // the user to recover (the next add clears it as debris). Then release the
     // lock. rmRecursiveForce: the debris may hold a hardened CAS object.
     if (!preserveStagingRoot) rmRecursiveForce(stagingRoot);
-    releaseInstallLock(lock);
+    for (const handle of locks.reverse()) releaseInstallLock(handle);
   }
 }
 
@@ -2192,20 +2218,43 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
   const lockfilePath = join(io.cwd, '.owenloop', 'installed.json');
   const installLockPath = join(io.cwd, '.owenloop', 'add.lock');
   const journalPath = join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME);
+  const canonicalState = workflowStoreStatePaths(projectStoreRoot(defsDir));
 
   // Mirror the SEC-3 symlink guards from the normal path (same order, same
   // rationale): `.owenloop` is written by the lock acquire; the default defsDir
   // is mutated-through by recovery. An explicit --defs/OWENLOOP_DEFS is operator
   // intent, not repo content, so it is not symlink-guarded (matching dispatchAdd).
   mkdirRefusingSymlink(join(io.cwd, '.owenloop'));
+  guardStateFile(installLockPath, 'install lock');
+  guardStateFile(journalPath, 'crash-recovery journal');
+  guardStateFile(lockfilePath, 'installed ledger');
   if (defsOverride === undefined) mkdirRefusingSymlink(defsDir);
-
-  const lock = await acquireInstallLock(installLockPath);
-  let outcome: RecoveryOutcome;
+  const canonicalStateExists = lstatSync(canonicalState.stateDir, { throwIfNoEntry: false }) !== undefined;
+  if (canonicalStateExists) {
+    mkdirRefusingSymlink(canonicalState.stateDir);
+    guardStateFile(canonicalState.lockPath, 'canonical install lock');
+    guardStateFile(canonicalState.journalPath, 'canonical crash-recovery journal');
+  }
+  const lockPaths = [...new Set([installLockPath, ...(canonicalStateExists ? [canonicalState.lockPath] : [])])].sort();
+  const locks: InstallLockHandle[] = [];
   try {
-    outcome = recoverInterruptedInstall({ defsDir, journalPath, lockfilePath });
+    for (const path of lockPaths) locks.push(await acquireInstallLock(path));
+  } catch (e) {
+    for (const handle of locks.reverse()) releaseInstallLock(handle);
+    throw e;
+  }
+  let outcome: RecoveryOutcome = 'no-journal';
+  try {
+    const canonicalOutcome = recoverInterruptedInstall({
+      defsDir,
+      journalPath: canonicalState.journalPath,
+      lockfilePath: storeIndexPath(defsDir),
+      recoveryMarkerDir: io.recoveryMarkerDir,
+    });
+    const legacyOutcome = recoverInterruptedInstall({ defsDir, journalPath, lockfilePath });
+    outcome = legacyOutcome !== 'no-journal' ? legacyOutcome : canonicalOutcome;
   } finally {
-    releaseInstallLock(lock);
+    for (const handle of locks.reverse()) releaseInstallLock(handle);
   }
 
   switch (outcome) {

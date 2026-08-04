@@ -59,11 +59,13 @@ export {
   resolveWorkflowCoordinate,
   resolveWorkflowDigest,
   storeIndexPath,
+  workflowStoreStatePaths,
 } from './resolve.ts';
 export type {
   ResolvedWorkflowObject,
   ResolveWorkflowCoordinateArgs,
   ResolveWorkflowDigestArgs,
+  WorkflowStoreStatePaths,
 } from './resolve.ts';
 
 export {

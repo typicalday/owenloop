@@ -1595,6 +1595,21 @@ test('add --global with OWENLOOP_DEFS set (env) is refused the same way', async 
   assert.match(r.err, /--global cannot be combined with --defs/);
 });
 
+test('add GitHub source with --global is refused before any network request', async () => {
+  let fetchCalls = 0;
+  const fetchFn = (async () => {
+    fetchCalls++;
+    throw new Error('network must not be reached');
+  }) as typeof globalThis.fetch;
+  const { run } = makeBundleCli({ fetch: fetchFn });
+
+  const r = await run('add', 'acme/widgets', '--global');
+
+  assert.equal(r.code, 1);
+  assert.match(r.err, /--global is only supported for \.wnlp bundle sources/);
+  assert.equal(fetchCalls, 0, 'GitHub SHA/tarball fetches were not attempted');
+});
+
 test('add --recover --global with a defs override is refused too', async () => {
   const { run } = makeBundleCli({ env: { OWENLOOP_DEFS: '/somewhere' } });
   const r = await run('add', '--recover', '--global');
@@ -1713,6 +1728,21 @@ test('add <bundle.wnlp> installs into the PROJECT store and prints the structure
   assert.equal(existsSync(join(cwd, '.owenloop', ADD_JOURNAL_FILENAME)), false, 'journal removed');
 });
 
+test('add relative .wnlp path resolves against injected CliIO.cwd', async () => {
+  const { run, cwd } = makeBundleCli({
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  const bundle = cliMakeBundle('relative');
+  writeFileSync(join(cwd, 'relative.wnlp'), cliBundleBytes(bundle));
+
+  const r = await run('add', 'relative.wnlp');
+
+  assert.equal(r.code, 0, r.err);
+  assert.equal(r.json().source, 'relative.wnlp', 'diagnostics preserve the supplied relative path');
+  assert.equal(r.json().objectPath, join(cwd, 'workflows', 'objects', 'sha256', bundle.digest));
+});
+
 test('add <bundle.wnlp> --global installs under ~/.owenloop/workflows (injected HOME)', async () => {
   const { run, cwd, home } = makeBundleCli({
     bundleIngestor: cliFakeIngestor(),
@@ -1738,6 +1768,37 @@ test('add <bundle.wnlp> --global installs under ~/.owenloop/workflows (injected 
   const index = JSON.parse(readFileSync(storeIndexPath(root), 'utf8'));
   assert.deepEqual(index.entries, { 'acme/gadget@1.0.0': { digest: bundle.digest, pinned: false } });
   assert.equal(existsSync(join(cwd, 'workflows')), false, 'no project store was created');
+});
+
+test('two bundle adds from different cwd values serialize on one canonical --defs lock', async () => {
+  const sharedDefs = mkdtempSync(join(tmpdir(), 'owenloop-shared-defs-'));
+  const a = makeBundleCli({
+    env: { OWENLOOP_DEFS: sharedDefs },
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  const b = makeBundleCli({
+    env: { OWENLOOP_DEFS: sharedDefs },
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  const bundleA = cliMakeBundle('alpha');
+  const bundleB = cliMakeBundle('beta');
+  writeFileSync(join(a.cwd, 'alpha.wnlp'), cliBundleBytes(bundleA));
+  writeFileSync(join(b.cwd, 'beta.wnlp'), cliBundleBytes(bundleB));
+
+  const [resultA, resultB] = await Promise.all([
+    a.run('add', 'alpha.wnlp'),
+    b.run('add', 'beta.wnlp'),
+  ]);
+
+  assert.equal(resultA.code, 0, resultA.err);
+  assert.equal(resultB.code, 0, resultB.err);
+  const index = JSON.parse(readFileSync(storeIndexPath(sharedDefs), 'utf8'));
+  assert.deepEqual(index.entries, {
+    'acme/alpha@1.0.0': { digest: bundleA.digest, pinned: false },
+    'acme/beta@1.0.0': { digest: bundleB.digest, pinned: false },
+  });
 });
 
 test('add https://url fetches the bundle through io.fetch (User-Agent + redirect: error)', async () => {

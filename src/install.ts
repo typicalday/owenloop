@@ -44,8 +44,9 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
-import { createHash } from 'node:crypto';
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
 import { acquireFileLock, releaseFileLock } from './lock.ts';
 import type { AcquireFileLockOpts, FileLockHandle } from './lock.ts';
 import { mkdirRefusingSymlink } from './util.ts';
@@ -114,6 +115,81 @@ export function multiSegmentPathViolation(relPath: string): string | undefined {
     if (violation) return `segment '${segment}' ${violation}`;
   }
   return undefined;
+}
+
+/**
+ * Ensure a state directory is real before a caller creates or writes below it.
+ * The final directory and its immediate parent are checked with `lstat`; the
+ * caller's existing filesystem root may contain an operator/system symlink
+ * (for example macOS's `/var`), which is outside the state directory boundary.
+ * Missing directories are created recursively and the final leaf is checked
+ * again before the caller proceeds.
+ */
+export function ensureDirectoryPathNoSymlink(dir: string, label = 'directory'): void {
+  const absolute = resolve(dir);
+  const parent = dirname(absolute);
+  const parentSt = lstatSync(parent, { throwIfNoEntry: false });
+  if (parentSt?.isSymbolicLink()) {
+    throw new Error(`refusing to use ${label} '${absolute}': its parent '${parent}' is a symbolic link`);
+  }
+  if (parentSt && !parentSt.isDirectory()) {
+    throw new Error(`refusing to use ${label} '${absolute}': its parent '${parent}' is not a directory`);
+  }
+  let st = lstatSync(absolute, { throwIfNoEntry: false });
+  if (st === undefined) {
+    mkdirSync(absolute, { recursive: true });
+    st = lstatSync(absolute, { throwIfNoEntry: false });
+  }
+  if (st === undefined) {
+    throw new Error(`refusing to use ${label} '${absolute}': it disappeared during creation`);
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`refusing to use ${label} '${absolute}': it is a symlink`);
+  }
+  if (!st.isDirectory()) {
+    throw new Error(`refusing to use ${label} '${absolute}': it is not a directory`);
+  }
+}
+
+/** Refuse a symlink or non-regular-file state leaf; an absent leaf is allowed. */
+export function guardStateFile(path: string, label = 'state file'): void {
+  const st = lstatSync(path, { throwIfNoEntry: false });
+  if (st === undefined) return;
+  if (st.isSymbolicLink()) {
+    throw new Error(`refusing to use ${label} '${path}': it is a symlink`);
+  }
+  if (!st.isFile()) {
+    throw new Error(`refusing to use ${label} '${path}': it is not a regular file`);
+  }
+}
+
+/**
+ * Probe a directory path without following symlinks through any component.
+ * Missing components mean the path is absent; an existing symlink or non-dir
+ * component is an integrity failure. This is used for CAS object ownership and
+ * recovery probes, where `existsSync` would incorrectly follow links.
+ */
+export function probeDirectoryPath(path: string, label = 'directory', trustedBoundary?: string): 'dir' | 'absent' {
+  const absolute = resolve(path);
+  const start = trustedBoundary === undefined ? parse(absolute).root : resolve(trustedBoundary);
+  const remainder = relative(start, absolute);
+  if (remainder === '' || (!trustedBoundary && remainder.startsWith('..'))) return 'dir';
+  if (trustedBoundary && (remainder === '..' || remainder.startsWith(`..${sep}`))) {
+    throw new Error(`refusing to use ${label} '${absolute}': it escapes trusted boundary '${start}'`);
+  }
+  let current = start;
+  for (const segment of remainder.split(sep).filter(Boolean)) {
+    current = join(current, segment);
+    const st = lstatSync(current, { throwIfNoEntry: false });
+    if (st === undefined) return 'absent';
+    if (st.isSymbolicLink()) {
+      throw new Error(`refusing to use ${label} '${current}': it is a symlink`);
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`refusing to use ${label} '${current}': it is not a directory`);
+    }
+  }
+  return 'dir';
 }
 
 // ---- atomic metadata write ----------------------------------------------------
@@ -325,7 +401,7 @@ export function commitInstall(root: string, destRelPath: string, stagingDir: str
   const backupDir = `${stagingDir}-old`;
   const undoDir = `${stagingDir}-undo`;
   let backedUp = false;
-  if (existsSync(dest)) {
+  if (probeDirectoryPath(dest, 'install destination', root) === 'dir') {
     // Ownership is verified by the caller before we get here. If this rename
     // throws, nothing has changed — dest is still the previous install. The
     // rename restores write modes first: the displaced dir may hold a hardened
@@ -419,6 +495,8 @@ export function acquireInstallLock(
   lockPath: string,
   opts: AcquireLockOpts = {},
 ): Promise<InstallLockHandle> {
+  mkdirRefusingSymlink(dirname(lockPath));
+  guardStateFile(lockPath, 'install lock');
   return acquireFileLock(lockPath, { label: 'owenloop add', ...opts });
 }
 
@@ -528,6 +606,8 @@ export interface InstallJournalV2 {
   label?: string;
   /** Journal-write epoch ms — diagnostics only. */
   startedAt?: number;
+  /** External transaction marker for a fresh-install swap with no backup. */
+  recoveryMarkerId?: string;
 }
 
 /** A journal of either version, as read from disk. */
@@ -640,6 +720,11 @@ export function validateInstallJournalV2(parsed: unknown, path: string): Install
   if (parsed.startedAt !== undefined && typeof parsed.startedAt !== 'number') {
     return fail("'startedAt' is not a number");
   }
+  if (parsed.recoveryMarkerId !== undefined) {
+    if (typeof parsed.recoveryMarkerId !== 'string') return fail("'recoveryMarkerId' is not a string");
+    const markerViolation = lockfilePathViolation(parsed.recoveryMarkerId);
+    if (markerViolation) return fail(`'recoveryMarkerId' ${markerViolation}`);
+  }
   return parsed as unknown as InstallJournalV2;
 }
 
@@ -659,6 +744,112 @@ export function validateAnyInstallJournal(parsed: unknown, path: string): AnyIns
   );
 }
 
+// ---- external fresh-install corroboration -----------------------------------
+//
+// A v2 fresh install can crash after staging has been renamed to its final
+// object path but before the index commit. At that point the journal, index,
+// destination name, and absence of staging/backup are all repository-controlled
+// or ambiguous. The marker below is created with O_EXCL in a directory outside
+// the store root and records the exact transaction identity. Recovery will
+// discard a destination in that otherwise ambiguous state only when the marker
+// matches every journal field exactly.
+
+export interface RecoveryMarkerRecord {
+  version: 1;
+  root: string;
+  destSegments: string[];
+  stagingId: string;
+  hadDest: false;
+}
+
+export interface RecoveryMarkerHandle {
+  id: string;
+  path: string;
+  markerDir: string;
+  record: RecoveryMarkerRecord;
+}
+
+export function defaultRecoveryMarkerDir(): string {
+  return join(homedir(), '.owenloop', 'recovery-markers');
+}
+
+function markerFilePath(markerDir: string, id: string): string {
+  const violation = lockfilePathViolation(id);
+  if (violation) throw new Error(`invalid recovery marker id '${id}': ${violation}`);
+  return join(markerDir, `${id}.json`);
+}
+
+function validateRecoveryMarker(parsed: unknown, path: string): RecoveryMarkerRecord {
+  const fail = (detail: string): never => {
+    throw new Error(`invalid recovery marker at ${path}: ${detail}`);
+  };
+  if (!isPlainObject(parsed)) return fail('top-level value is not an object');
+  if (parsed.version !== 1) return fail('unsupported marker version');
+  if (typeof parsed.root !== 'string' || parsed.root === '') return fail("'root' is not a non-empty string");
+  if (!Array.isArray(parsed.destSegments) || parsed.destSegments.length === 0) {
+    return fail("'destSegments' is not a non-empty array");
+  }
+  for (const [i, value] of parsed.destSegments.entries()) {
+    if (typeof value !== 'string') return fail(`'destSegments[${i}]' is not a string`);
+    const violation = lockfilePathViolation(value);
+    if (violation) return fail(`'destSegments[${i}]' ${violation}`);
+  }
+  if (typeof parsed.stagingId !== 'string') return fail("'stagingId' is not a string");
+  const stagingViolation = lockfilePathViolation(parsed.stagingId);
+  if (stagingViolation) return fail(`'stagingId' ${stagingViolation}`);
+  if (parsed.hadDest !== false) return fail("'hadDest' must be false");
+  return parsed as unknown as RecoveryMarkerRecord;
+}
+
+export function createRecoveryMarker(input: {
+  root: string;
+  destSegments: string[];
+  stagingId: string;
+  markerDir?: string;
+}): RecoveryMarkerHandle {
+  const markerDir = input.markerDir ?? defaultRecoveryMarkerDir();
+  ensureDirectoryPathNoSymlink(markerDir, 'recovery marker directory');
+  const record: RecoveryMarkerRecord = {
+    version: 1,
+    root: resolve(input.root),
+    destSegments: [...input.destSegments],
+    stagingId: input.stagingId,
+    hadDest: false,
+  };
+  const id = `mkr_${randomUUID().replaceAll('-', '')}`;
+  const path = markerFilePath(markerDir, id);
+  writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+  return { id, path, markerDir, record };
+}
+
+export function readRecoveryMarker(id: string, markerDir = defaultRecoveryMarkerDir()): RecoveryMarkerRecord | null {
+  // The marker directory is an operator-selected external path. Check the
+  // directory leaf and immediate parent, while allowing platform-managed
+  // aliases such as macOS /var → /private/var above that boundary.
+  if (probeDirectoryPath(markerDir, 'recovery marker directory', dirname(markerDir)) === 'absent') return null;
+  const path = markerFilePath(markerDir, id);
+  const st = lstatSync(path, { throwIfNoEntry: false });
+  if (st === undefined) return null;
+  guardStateFile(path, 'recovery marker');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (e) {
+    throw new Error(`corrupt recovery marker at ${path}: ${(e as Error).message}`);
+  }
+  return validateRecoveryMarker(parsed, path);
+}
+
+export function removeRecoveryMarker(handle: RecoveryMarkerHandle | { id: string; markerDir?: string }): void {
+  const markerDir = 'markerDir' in handle && handle.markerDir !== undefined
+    ? handle.markerDir
+    : defaultRecoveryMarkerDir();
+  if (probeDirectoryPath(markerDir, 'recovery marker directory', dirname(markerDir)) === 'absent') return;
+  const path = markerFilePath(markerDir, handle.id);
+  guardStateFile(path, 'recovery marker');
+  rmSync(path, { force: true });
+}
+
 /**
  * Read the crash-recovery journal (either version). Absent ⇒ `null` (the happy
  * path — no interrupted install to recover). Present-but-unparseable ⇒ a hard
@@ -668,7 +859,9 @@ export function validateAnyInstallJournal(parsed: unknown, path: string): AnyIns
  * for filesystem paths.
  */
 export function readAddJournal(path: string): AnyInstallJournal | null {
-  if (!existsSync(path)) return null;
+  const st = lstatSync(path, { throwIfNoEntry: false });
+  if (st === undefined) return null;
+  guardStateFile(path, 'crash-recovery journal');
   const raw = readFileSync(path, 'utf8');
   let parsed: unknown;
   try {
@@ -688,11 +881,13 @@ export function writeAddJournal(
   journal: AnyInstallJournal,
   opts: AtomicJsonWriteOpts = {},
 ): void {
+  guardStateFile(path, 'crash-recovery journal');
   writeJsonAtomic(path, journal, opts);
 }
 
 /** Remove the journal (force: absence is not an error — clean-completion / idempotent). */
 export function removeAddJournal(path: string): void {
+  guardStateFile(path, 'crash-recovery journal');
   rmSync(path, { force: true });
 }
 
@@ -730,22 +925,17 @@ function recoveryRefusal(journalPath: string, detail: string): Error {
  * symlink is exactly this). Refuse a symlinked immediate parent before trusting
  * the leaf probe. (Absent parent ⇒ the leaf is absent too; nothing to refuse.)
  */
-function probeRecoveryDir(p: string, journalPath: string, label: string): 'dir' | 'absent' {
-  const parent = dirname(p);
-  const parentSt = lstatSync(parent, { throwIfNoEntry: false });
-  if (parentSt?.isSymbolicLink()) {
-    throw recoveryRefusal(journalPath, `${label} parent '${parent}' is a symlink`);
-  }
-  let st;
+function probeRecoveryDir(
+  p: string,
+  journalPath: string,
+  label: string,
+  trustedBoundary?: string,
+): 'dir' | 'absent' {
   try {
-    st = lstatSync(p);
+    return probeDirectoryPath(p, label, trustedBoundary);
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
-    throw e;
+    throw recoveryRefusal(journalPath, (e as Error).message);
   }
-  if (st.isSymbolicLink()) throw recoveryRefusal(journalPath, `${label} at '${p}' is a symlink`);
-  if (!st.isDirectory()) throw recoveryRefusal(journalPath, `${label} at '${p}' is not a directory`);
-  return 'dir';
 }
 
 /** Re-assert resolved-path containment at a mutation target (belt-and-braces). */
@@ -771,6 +961,8 @@ export interface RecoverInterruptedInstallArgs {
   journalPath: string;
   /** Path to the metadata file (v1: `installed.json`) — the commit-point oracle. */
   lockfilePath: string;
+  /** Directory holding external fresh-install corroboration markers. */
+  recoveryMarkerDir?: string;
   /** See {@link LedgerLookup}. */
   readLedger?: () => LedgerLookup;
 }
@@ -899,22 +1091,29 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
   if (parkedOldName !== undefined) assertUnderRoot(parkedOldName, defsDir, journalPath);
   if (oldNameOriginal !== undefined) assertUnderRoot(oldNameOriginal, defsDir, journalPath);
 
+  const removeRecoveryMarkerAfterJournal = (): void => {
+    if (journal.version === 2 && journal.recoveryMarkerId !== undefined) {
+      removeRecoveryMarker({ id: journal.recoveryMarkerId, markerDir: args.recoveryMarkerDir });
+    }
+  };
+
   // Roll forward: the metadata is durably new; discard the retained backup (+
   // parked old-name dir, v1) and clear the staging root, then drop the journal.
   // Symlink-guarded before each rm; both dirs live under the staging root, so
   // the final clear is the real cleanup — the explicit rms honor "refuse a
   // symlink" first.
   const rollForward = (): void => {
-    if (probeRecoveryDir(backupDir, journalPath, 'backup dir') === 'dir') {
+    if (probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir) === 'dir') {
       rmRecursiveForce(backupDir);
     }
     if (parkedOldName !== undefined) {
-      if (probeRecoveryDir(parkedOldName, journalPath, 'parked old-name dir') === 'dir') {
+      if (probeRecoveryDir(parkedOldName, journalPath, 'parked old-name dir', defsDir) === 'dir') {
         rmRecursiveForce(parkedOldName);
       }
     }
     rmRecursiveForce(stagingRoot);
     removeAddJournal(journalPath);
+    removeRecoveryMarkerAfterJournal();
   };
 
   if (journal.phase === 'finalizing') {
@@ -961,7 +1160,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     //    metadata already records this content, so the restored state is
     //    consistent. The two cases are distinguishable by disk, so branch on
     //    it rather than trusting the commit-point test alone.
-    if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
+    if (probeRecoveryDir(dest, journalPath, 'destination', defsDir) === 'dir') {
       rollForward();
       return 'rolled-forward';
     }
@@ -971,8 +1170,8 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
   // renames mirroring rollbackInstallCommit's order; a symlinked source is
   // refused fail-closed at each probe.
   mkdirSync(stagingRoot, { recursive: true }); // ensure undo/backup renames have a home
-  const stagingState = probeRecoveryDir(stagingDir, journalPath, 'staging dir');
-  const backupState = probeRecoveryDir(backupDir, journalPath, 'backup dir');
+  const stagingState = probeRecoveryDir(stagingDir, journalPath, 'staging dir', defsDir);
+  const backupState = probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir);
 
   // Every rename here moves a directory that may hold a hardened CAS object
   // (the backup of a previous install, or the swapped-in new content) — they
@@ -982,7 +1181,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     if (backupState === 'dir') {
       // Crash between 4a (dest → backup) and 4b: dest is necessarily absent.
       // Restore the backup. Fail closed if dest unexpectedly exists too.
-      if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
+      if (probeRecoveryDir(dest, journalPath, 'destination', defsDir) === 'dir') {
         throw recoveryRefusal(journalPath, `both the backup dir and destination '${dest}' exist`);
       }
       renameDirRestoringWrite(backupDir, dest);
@@ -991,9 +1190,9 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     // is absent (fresh install, pre-swap) — already consistent, nothing to move.
   } else if (backupState === 'dir') {
     // (b) Staging gone, backup present — an upgrade crashed AFTER the swap.
-    if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
+    if (probeRecoveryDir(dest, journalPath, 'destination', defsDir) === 'dir') {
       // Park the new content aside, then restore the backup over dest.
-      if (probeRecoveryDir(undoDir, journalPath, 'undo dir') === 'dir') {
+      if (probeRecoveryDir(undoDir, journalPath, 'undo dir', defsDir) === 'dir') {
         throw recoveryRefusal(journalPath, `undo dir '${undoDir}' already exists`);
       }
       renameDirRestoringWrite(dest, undoDir);
@@ -1030,7 +1229,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
       // distinguishing artifact is itself repo-committable and therefore forgeable
       // — so it now fails closed here instead of auto-discarding. The error names
       // the manual remedy.
-      if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
+      if (probeRecoveryDir(dest, journalPath, 'destination', defsDir) === 'dir') {
         const installedAtSource = v1Lookup?.(journal.source);
         const migrationCorroborated =
           journal.oldNamePath !== undefined &&
@@ -1046,32 +1245,48 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
               `journal; if a fresh install really was interrupted, remove '${dest}' as well`,
           );
         }
-        if (probeRecoveryDir(undoDir, journalPath, 'undo dir') === 'dir') {
+	if (probeRecoveryDir(undoDir, journalPath, 'undo dir', defsDir) === 'dir') {
           throw recoveryRefusal(journalPath, `undo dir '${undoDir}' already exists`);
         }
         renameDirRestoringWrite(dest, undoDir);
       }
     }
     // v2 case (c): staging gone, backup gone. A fresh v2 install (hadDest
-    // false) whose swap consumed the staging dir leaves dest present with NO
-    // corroborating artifact: staging and backup are absent by definition of
-    // case (c), and every other distinguishing artifact (journal, index) is
-    // committable in a project checkout and therefore forgeable — the
-    // genuine crash between the swap and the metadata commit is on-disk
-    // INDISTINGUISHABLE from a forged journal naming a directory it wants
-    // deleted. Same discipline as the v1 arm's uncorroborated refusal: fail
-    // closed, mutate nothing, leave the journal AND dest in place as
-    // evidence. The error names the manual remedy.
+    // false) may have completed the swap immediately before the process died.
+    // The external marker is the only corroboration trusted for discarding the
+    // orphaned destination; a journal without an exact marker match remains a
+    // forged-journal refusal and is never allowed to delete an unrelated dir.
     if (!journal.hadDest && journal.version === 2) {
-      if (probeRecoveryDir(dest, journalPath, 'destination') === 'dir') {
-        throw recoveryRefusal(
-          journalPath,
-          `journal claims an interrupted fresh install of '${journal.destSegments.join('/')}', but nothing ` +
-            `corroborates it (no staging dir, no backup, and the metadata does not match this journal) ` +
-            `while '${dest}' exists — refusing to discard that directory. If you did not run an ` +
-            `interrupted install in this store, remove the journal; if an install really was interrupted, ` +
-            `remove '${dest}' as well`,
-        );
+      if (probeRecoveryDir(dest, journalPath, 'destination', defsDir) === 'dir') {
+	let marker: RecoveryMarkerRecord | null = null;
+	if (journal.recoveryMarkerId !== undefined) {
+	  try {
+	    marker = readRecoveryMarker(journal.recoveryMarkerId, args.recoveryMarkerDir);
+	  } catch (e) {
+	    throw recoveryRefusal(journalPath, `external recovery marker could not be read: ${(e as Error).message}`);
+	  }
+	}
+	const markerMatches =
+	  marker !== null &&
+	  resolve(marker.root) === resolve(defsDir) &&
+	  marker.stagingId === journal.stagingId &&
+	  marker.hadDest === false &&
+	  marker.destSegments.length === journal.destSegments.length &&
+	  marker.destSegments.every((segment, i) => segment === journal.destSegments[i]);
+	if (!markerMatches) {
+	  throw recoveryRefusal(
+	    journalPath,
+	    `journal claims an interrupted fresh install of '${journal.destSegments.join('/')}', but no ` +
+	      `matching external recovery marker corroborates it (no staging dir, no backup, and the ` +
+	      `metadata does not match this journal) while '${dest}' exists — refusing to discard that ` +
+	      `directory. If you did not run an interrupted install in this store, remove the journal; if ` +
+	      `an install really was interrupted, remove '${dest}' as well`,
+	  );
+	}
+	if (probeRecoveryDir(undoDir, journalPath, 'undo dir', defsDir) === 'dir') {
+	  throw recoveryRefusal(journalPath, `undo dir '${undoDir}' already exists`);
+	}
+	renameDirRestoringWrite(dest, undoDir);
       }
     }
     // v1/v2 hadDest === true: the backup was already restored (a completed
@@ -1082,8 +1297,8 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
   // (d) Restore a parked old-name dir to where the (unchanged) ledger expects
   // it (v1 only — v2 journals never migrate an old name).
   if (parkedOldName !== undefined && oldNameOriginal !== undefined) {
-    if (probeRecoveryDir(parkedOldName, journalPath, 'parked old-name dir') === 'dir') {
-      if (probeRecoveryDir(oldNameOriginal, journalPath, 'old-name original') === 'dir') {
+    if (probeRecoveryDir(parkedOldName, journalPath, 'parked old-name dir', defsDir) === 'dir') {
+      if (probeRecoveryDir(oldNameOriginal, journalPath, 'old-name original', defsDir) === 'dir') {
         // Both present is contradictory — unreachable under the single-writer
         // lock, so don't guess which to keep.
         throw recoveryRefusal(
@@ -1100,5 +1315,6 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
   // remove the journal LAST so a crash before this leaves everything replayable.
   rmRecursiveForce(stagingRoot);
   removeAddJournal(journalPath);
+  removeRecoveryMarkerAfterJournal();
   return 'rolled-back';
 }

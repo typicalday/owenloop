@@ -67,7 +67,7 @@ test('boundary A: no engine-core module imports a hub/CLI module', () => {
   // from`, `export .. from`, and a bare side-effect `import './hub.ts'`. The
   // `(../)*` prefix covers store modules one level down (`../add.ts`) so a
   // relative-depth change cannot smuggle a hub/CLI import past the check.
-  const HUB_IMPORT = /(?:from|import)\s+['"](?:\.\.\/)*\.\/(hub|cli|add|untar)\.ts['"]/;
+  const HUB_IMPORT = /(?:from|import)\s+['"](?:(?:\.\.\/)+|\.\/)(hub|cli|add|untar)\.ts['"]/;
   const violations: string[] = [];
   for (const file of CORE_ALL) {
     const lines = readCore(file);
@@ -77,6 +77,14 @@ test('boundary A: no engine-core module imports a hub/CLI module', () => {
     });
   }
   assert.equal(violations.length, 0, `core→hub/CLI import boundary violated:\n${violations.join('\n')}`);
+});
+
+test('boundary A regression: nested relative imports are recognized', () => {
+  const HUB_IMPORT = /(?:from|import)\s+['"](?:(?:\.\.\/)+|\.\/)(hub|cli|add|untar)\.ts['"]/;
+  assert.match("from './add.ts'", HUB_IMPORT);
+  assert.match("from '../add.ts'", HUB_IMPORT);
+  assert.match("from '../../untar.ts'", HUB_IMPORT);
+  assert.match("import './cli.ts'", HUB_IMPORT);
 });
 
 test('boundary A: index.ts (public barrel) never couples to cli.ts', () => {
