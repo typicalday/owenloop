@@ -47,6 +47,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
 } from 'node:fs';
@@ -54,7 +55,8 @@ import { tmpdir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { acquireFileLock, releaseFileLock } from '../lock.ts';
 import type { FileLockHandle } from '../lock.ts';
-import { writeFileAtomic } from '../hub.ts';
+import { normalizeOrigin, writeFileAtomic } from '../hub.ts';
+import { assertEd25519PubText } from './ssh.ts';
 import { CliError } from '../util.ts';
 
 /** The three local principal kinds. */
@@ -168,6 +170,7 @@ function backendError(backend: string, detail: string): CliError {
 
 /** Canonical, order-stable serialization of a key ref (for hashing). */
 export function canonicalKeyRef(ref: PrincipalKeyRef): string {
+  assertKeyRef(ref);
   return JSON.stringify({ origin: ref.origin, kind: ref.kind, id: ref.id });
 }
 
@@ -175,6 +178,15 @@ export function canonicalKeyRef(ref: PrincipalKeyRef): string {
 export function assertKeyRef(ref: PrincipalKeyRef): void {
   if (typeof ref.origin !== 'string' || ref.origin.trim() === '') {
     throw new CliError('signing-key ref: origin must be a non-empty string');
+  }
+  let normalized: string;
+  try {
+    normalized = normalizeOrigin(ref.origin);
+  } catch {
+    throw new CliError('signing-key ref: origin must be a valid normalized http(s) origin');
+  }
+  if (normalized !== ref.origin) {
+    throw new CliError('signing-key ref: origin must be a normalized origin');
   }
   if (ref.kind !== 'human' && ref.kind !== 'machine' && ref.kind !== 'agent') {
     throw new CliError(`signing-key ref: kind must be human, machine, or agent (got '${String(ref.kind)}')`);
@@ -204,15 +216,6 @@ export function publicKeyDescriptor(pubText: string): PublicKeyDescriptor {
   const blob = Buffer.from(parts[1]!, 'base64');
   const comment = parts.slice(2).join(' ');
   return { keyid: keyidFromBlob(blob), keyType, openSshPublicKey: parts.slice(0, 2).join(' ') + (comment ? ` ${comment}` : ''), comment };
-}
-
-/** Read the public-key text for a key path (tries `<path>.pub`, then `path`). */
-function readPubText(keyPath: string): string {
-  try {
-    return readFileSync(`${keyPath}.pub`, 'utf8');
-  } catch {
-    return readFileSync(keyPath, 'utf8');
-  }
 }
 
 const KEYGEN_TIMEOUT_MS = 15_000;
@@ -319,18 +322,65 @@ export class PrincipalKeyManager {
     return join(this.keysDir(), `${keyRefHash(ref)}.lock`);
   }
 
+  /** A non-secret per-ref ownership marker that prevents backend shadowing. */
+  private backendMarkerPath(ref: PrincipalKeyRef): string {
+    return join(this.keysDir(), `${keyRefHash(ref)}.backend`);
+  }
+
+  private readBackendOwner(ref: PrincipalKeyRef): KeyStorageBackendKind | null {
+    const marker = this.backendMarkerPath(ref);
+    if (!existsSync(marker)) return null;
+    const value = readFileSync(marker, 'utf8').trim();
+    if (value !== 'macos-security' && value !== 'secret-tool' && value !== 'file') {
+      throw new CliError(`signing-key backend ownership for ${ref.kind}:${ref.id} is corrupt`);
+    }
+    return value;
+  }
+
+  /** Refuse a selected backend that differs from the persisted owner. */
+  private assertBackendOwner(ref: PrincipalKeyRef): void {
+    const owner = this.readBackendOwner(ref);
+    if (owner !== null && owner !== this.backendKind) {
+      throw new CliError(
+        `signing-key ref ${ref.kind}:${ref.id} belongs to backend ${owner}, not the selected backend ${this.backendKind}`,
+      );
+    }
+    // A pre-marker file record is detectable even when PATH now selects a
+    // different backend. Refuse the new backend rather than creating a shadow.
+    if (owner === null && this.backendKind !== 'file' && existsSync(this.recordPath(ref))) {
+      throw new CliError(
+        `signing-key ref ${ref.kind}:${ref.id} has a file-backed record, but the selected backend is ${this.backendKind}`,
+      );
+    }
+  }
+
+  /** Claim ownership before the first write; marker writes are non-secret. */
+  private claimBackend(ref: PrincipalKeyRef): void {
+    this.assertBackendOwner(ref);
+    const marker = this.backendMarkerPath(ref);
+    if (!existsSync(marker)) {
+      writeFileAtomic(marker, `${this.backendKind}\n`, { mode: 0o600 });
+      chmodSync(marker, 0o600);
+    }
+  }
+
   // ---- backend read/write ---------------------------------------------------
 
   /** Read the raw record text from the selected backend, or `null` when absent. */
   private readRecordText(ref: PrincipalKeyRef): string | null {
+    this.ensureDirs();
+    this.assertBackendOwner(ref);
     const hash = keyRefHash(ref);
     if (this.backendKind === 'file') {
       const path = this.recordPath(ref);
       if (!existsSync(path)) return null;
-      return readFileSync(path, 'utf8');
+      const text = readFileSync(path, 'utf8');
+      this.claimBackend(ref);
+      return text;
     }
     // security / secret-tool: redirect the lookup's secret-bearing stdout to a
-    // pre-opened 0600 temp fd; never capture it into a pipe.
+    // pre-opened 0600 temp fd; command, read, close, and unlink all share one
+    // outer finally so every return and every failure cleans up the temp file.
     const tmpPath = join(this.tempBase, `owenloop-keyread-${randomBytes(8).toString('hex')}`);
     const fd = openSync(tmpPath, 'w', 0o600);
     try {
@@ -348,21 +398,28 @@ export class PrincipalKeyManager {
           ['lookup', 'owenloop-service', 'owenloop-signing', 'owenloop-ref', hash],
           { stdoutFd: fd },
         );
+        // libsecret uses status 1 for an absent item. It is not a backend
+        // failure; all other nonzero statuses remain hard failures.
+        if (r.status === 1) return null;
         if (r.status !== 0) throw backendError('secret-tool', `lookup exited with status ${r.status}`);
       }
-    } finally {
-      closeSync(fd);
-    }
-    try {
       const text = readFileSync(tmpPath, 'utf8');
-      return text === '' ? null : text;
+      if (text === '') return null;
+      this.claimBackend(ref);
+      return text;
     } finally {
-      rmSync(tmpPath, { force: true });
+      try {
+        closeSync(fd);
+      } finally {
+        rmSync(tmpPath, { force: true });
+      }
     }
   }
 
   /** Write the raw record text to the selected backend. Loud failure, fixed message. */
   private writeRecordText(ref: PrincipalKeyRef, recordText: string): void {
+    this.ensureDirs();
+    this.claimBackend(ref);
     const hash = keyRefHash(ref);
     if (this.backendKind === 'file') {
       writeFileAtomic(this.recordPath(ref), recordText, { mode: 0o600 });
@@ -386,17 +443,39 @@ export class PrincipalKeyManager {
     if (r.status !== 0) throw backendError('secret-tool', `store exited with status ${r.status}`);
   }
 
+  /** Derive a public key from generated private material without exposing it. */
+  private deriveGeneratedPublic(privateKey: string): PublicKeyDescriptor {
+    const dir = this.mkTempKeyDir();
+    try {
+      const keyPath = join(dir, 'id');
+      writeFileAtomic(keyPath, privateKey, { mode: 0o600 });
+      chmodSync(keyPath, 0o600);
+      const result = this.runner.run(this.sshKeygen, ['-y', '-f', keyPath], { captureStdout: true });
+      if (result.status !== 0) throw new Error('derivation failed');
+      const text = result.stdout.toString('utf8');
+      const descriptor = publicKeyDescriptor(text);
+      assertEd25519PubText(text, 'stored signing key');
+      return descriptor;
+    } catch {
+      throw new CliError('signing-key record is corrupt (private key does not derive a valid Ed25519 public key)');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
   /** Parse + validate a record against the requested ref. Corrupt = hard error. */
   private parseRecord(ref: PrincipalKeyRef, text: string): KeyRecord {
-    let rec: KeyRecord;
+    let raw: unknown;
     try {
-      rec = JSON.parse(text) as KeyRecord;
+      raw = JSON.parse(text);
     } catch {
       throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt — refusing to use or replace it`);
     }
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt — refusing to use or replace it`);
+    }
+    const rec = raw as Partial<KeyRecord> & { ref?: Partial<PrincipalKeyRef> };
     if (
-      rec === null ||
-      typeof rec !== 'object' ||
       rec.version !== 1 ||
       rec.ref === undefined ||
       rec.ref.origin !== ref.origin ||
@@ -405,17 +484,49 @@ export class PrincipalKeyManager {
     ) {
       throw new CliError(`signing-key record for ${ref.kind}:${ref.id} does not match the requested ref — refusing to use it`);
     }
+    if (rec.kind !== 'generated' && rec.kind !== 'reused') {
+      throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (unknown key kind) — refusing to use it`);
+    }
     if (rec.kind === 'generated' && (typeof rec.privateKey !== 'string' || rec.privateKey === '')) {
       throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (missing key material) — refusing to use it`);
     }
     if (rec.kind === 'reused' && (typeof rec.path !== 'string' || rec.path === '')) {
       throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (missing reused path) — refusing to use it`);
     }
-    return rec;
+    if (typeof rec.publicKey !== 'string' || typeof rec.fingerprint !== 'string' || typeof rec.createdAt !== 'string') {
+      throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (invalid record fields) — refusing to use it`);
+    }
+    let descriptor: PublicKeyDescriptor;
+    try {
+      descriptor = publicKeyDescriptor(rec.publicKey);
+      assertEd25519PubText(rec.publicKey, 'stored signing key');
+    } catch {
+      throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (invalid Ed25519 public key) — refusing to use it`);
+    }
+    if (!/^SHA256:[A-Za-z0-9+/]+$/.test(rec.fingerprint) || rec.fingerprint !== descriptor.keyid) {
+      throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (fingerprint mismatch) — refusing to use it`);
+    }
+    try {
+      if (new Date(rec.createdAt).toISOString() !== rec.createdAt) throw new Error('not canonical ISO-8601');
+    } catch {
+      throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (invalid createdAt) — refusing to use it`);
+    }
+    if (rec.kind === 'generated') {
+      if (rec.path !== undefined) {
+        throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (unexpected reused path) — refusing to use it`);
+      }
+      const derived = this.deriveGeneratedPublic(rec.privateKey!);
+      if (derived.keyid !== descriptor.keyid) {
+        throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (private/public key mismatch) — refusing to use it`);
+      }
+    } else if (rec.privateKey !== undefined) {
+      throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (reused record contains key material) — refusing to use it`);
+    }
+    return rec as KeyRecord;
   }
 
   /** Read + validate the stored record for a ref, or `null` when absent. */
-  readRecord(ref: PrincipalKeyRef): KeyRecord | null {
+  private readRecord(ref: PrincipalKeyRef): KeyRecord | null {
     assertKeyRef(ref);
     const text = this.readRecordText(ref);
     if (text === null) return null;
@@ -495,24 +606,48 @@ export class PrincipalKeyManager {
     }
   }
 
+  /** Derive a candidate's public key from a public path, adjacent `.pub`, or private path. */
+  private candidatePublicText(canonicalPath: string): string {
+    try {
+      const ownText = readFileSync(canonicalPath, 'utf8');
+      const first = ownText.split(/\r?\n/).find((l) => l.trim() !== '')?.trim() ?? '';
+      if (/^(?:ssh-|ecdsa-|sk-)/.test(first)) return ownText;
+    } catch {
+      // Let ssh-keygen produce the fixed derivation failure below.
+    }
+    // A private path is always derived by stock ssh-keygen. An adjacent .pub
+    // file is deliberately ignored because it may be stale or mismatched.
+    const result = this.runner.run(this.sshKeygen, ['-y', '-f', canonicalPath], { captureStdout: true });
+    if (result.status !== 0) throw new Error('public-key derivation failed');
+    return result.stdout.toString('utf8');
+  }
+
   /** Validate + record an explicit SSH key (human principal only). */
   private storeReused(ref: PrincipalKeyRef, rawPath: string): EnsureKeyResult {
-    const canonical = isAbsolute(rawPath) ? resolve(rawPath) : resolve(process.cwd(), rawPath);
-    if (!existsSync(canonical)) {
-      throw new CliError(`--reuse-ssh-key: no such file: ${canonical}`);
+    const lexical = isAbsolute(rawPath) ? resolve(rawPath) : resolve(process.cwd(), rawPath);
+    if (!existsSync(lexical)) {
+      throw new CliError('--reuse-ssh-key: no such file');
+    }
+    let canonical: string;
+    try {
+      canonical = realpathSync(lexical);
+    } catch {
+      throw new CliError('--reuse-ssh-key: cannot resolve the key path');
     }
     const st = statSync(canonical);
-    if (!st.isFile()) throw new CliError(`--reuse-ssh-key: not a regular file: ${canonical}`);
+    if (!st.isFile()) throw new CliError('--reuse-ssh-key: key path is not a regular file');
     let pubText: string;
     try {
-      pubText = readPubText(canonical);
+      pubText = this.candidatePublicText(canonical);
     } catch {
-      throw new CliError(`--reuse-ssh-key: cannot read the public key for ${canonical}`);
+      throw new CliError('--reuse-ssh-key: cannot derive an Ed25519 public key from the candidate');
+    }
+    try {
+      assertEd25519PubText(pubText, 'candidate key');
+    } catch {
+      throw new CliError('--reuse-ssh-key: only Ed25519 keys are supported');
     }
     const desc = publicKeyDescriptor(pubText);
-    if (desc.keyType !== 'ssh-ed25519') {
-      throw new CliError(`--reuse-ssh-key: only Ed25519 keys are supported in WP-A2 (found ${desc.keyType})`);
-    }
     // Non-secret sign/verify challenge with the CANDIDATE key: proves the
     // private half is usable (directly, or through ssh-agent for a public-key
     // path) before the reference is recorded.
@@ -548,8 +683,8 @@ export class PrincipalKeyManager {
       });
       if (signRes.status !== 0) {
         throw new CliError(
-          `--reuse-ssh-key: the private half of ${candidatePath} is not usable (sign failed) — ` +
-            `for a public-key path the key must be loaded in ssh-agent`,
+          '--reuse-ssh-key: the private half of the candidate is not usable (sign failed) — ' +
+            'for a public-key path the key must be loaded in ssh-agent',
         );
       }
       const armored = signRes.stdout.toString('utf8');
@@ -628,7 +763,26 @@ export class PrincipalKeyManager {
       if (rec.path === undefined || !existsSync(rec.path)) {
         throw new CliError(`the reused ${ref.kind} signing key file is missing — re-run owenloop setup --reuse-ssh-key`);
       }
-      return callback(rec.path);
+      let currentPath: string;
+      try {
+        currentPath = realpathSync(rec.path);
+      } catch {
+        throw new CliError(`the reused ${ref.kind} signing key file is missing — re-run owenloop setup --reuse-ssh-key`);
+      }
+      if (currentPath !== rec.path) {
+        throw new CliError(`the reused ${ref.kind} signing key path changed — re-run owenloop setup --reuse-ssh-key`);
+      }
+      let current: PublicKeyDescriptor;
+      try {
+        current = publicKeyDescriptor(this.candidatePublicText(currentPath));
+        assertEd25519PubText(current.openSshPublicKey, 'reused signing key');
+      } catch {
+        throw new CliError(`the reused ${ref.kind} signing key is no longer a valid Ed25519 key`);
+      }
+      if (current.keyid !== rec.fingerprint) {
+        throw new CliError(`the reused ${ref.kind} signing key identity changed — re-run owenloop setup --reuse-ssh-key`);
+      }
+      return callback(currentPath);
     }
     if (rec.privateKey === undefined) {
       throw new CliError(`signing-key record for ${ref.kind}:${ref.id} is corrupt (missing key material)`);

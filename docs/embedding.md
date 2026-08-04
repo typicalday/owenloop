@@ -366,10 +366,12 @@ storage](crypto.md) is the full reference):
 - `PrincipalKeyManager` — generate/store/materialize the three principals'
   Ed25519 signing keys (`ensure`, `inspect`, `withSigningKey`; refs are
   `{ origin, kind, id }`, helpers `assertKeyRef`, `canonicalKeyRef`,
-  `keyRefHash`, `keyidFromBlob`, `publicKeyDescriptor`). The rule for
-  consumers: you receive **paths and public descriptors, never private-key
-  strings** — `ensure`/`inspect` return the public-key descriptor, and
-  `withSigningKey` hands your callback a key path that it removes after use.
+  `keyRefHash`, `keyidFromBlob`, `publicKeyDescriptor`). The internal record
+  reader is private to `PrincipalKeyManager`; consumers receive **paths and
+  public descriptors, never private-key strings**. `ensure`/`inspect` return
+  only the public-key descriptor, and `withSigningKey` hands your callback a
+  temporary usable key path that the manager removes after use (or the
+  canonical path of an explicitly reused key).
 - `SshSigner` / `createSshSigner` (behind the format-neutral `Signer`
   interface) — SSHSIG signing/verification through stock `ssh-keygen -Y`.
 - `dsseSignEnvelope` / `dsseVerifyEnvelope` plus the record-class wrappers and

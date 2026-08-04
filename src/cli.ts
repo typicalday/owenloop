@@ -4273,7 +4273,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     throw new CliError('--reuse-ssh-key requires a key file path');
   }
   if (reuseSshKey !== undefined && !existsSync(reuseSshKey)) {
-    throw new CliError(`--reuse-ssh-key: no such file: ${reuseSshKey}`);
+    throw new CliError('--reuse-ssh-key: no such file');
   }
 
   const origin = resolveSetupHub(io, args);
@@ -4351,7 +4351,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   let agentPrincipalId: string;
   if (probe.verified !== null) {
     agentAccount = probe.verified.name;
-    agentPrincipalId = probe.verified.identity?.id ?? probe.verified.actorId;
+    agentPrincipalId = probe.verified.actorId;
     const crewsStr = probe.verified.identity ? ` (crews: ${probe.verified.identity.crews.join(', ') || 'none'})` : '';
     io.err(`✓ agent: ${agentAccount}${crewsStr}`);
     steps.push({ step: 'agent', action: 'skipped', detail: `agent:${agentAccount} verified` });

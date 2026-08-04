@@ -8,17 +8,22 @@ suites, and interoperates with stock OpenSSH `ssh-keygen` on macOS and Linux CI.
 ## Why stock OpenSSH, not a JS signature library
 
 Signatures are produced and verified by **shelling out to stock `ssh-keygen
--Y`** (`sign`, `verify`, `check-novalidate`, `find-principals`), not by a
-JavaScript crypto library. Three reasons:
+-Y`** (`sign` and `verify`), not by a JavaScript crypto library. The signer also
+uses stock `ssh-keygen -y` to derive the public half of a private key, and the
+feature probe invokes a harmless `-Y` command through the same process seam.
+Three reasons:
 
 1. **Format neutrality for free.** SSHSIG's armored format, namespace binding,
    and `allowed_signers` policy are implemented by OpenSSH itself; delegating
    means the policy authority is the same binary every operator already trusts
    for SSH. There is no custom authorization logic to keep in sync.
-2. **No secret scalar in the Node heap.** Signing runs in a child process
-   whose stdin carries the message and whose stdout carries the armored
-   signature. Private bytes live inside `ssh-keygen`'s address space, not
-   ours.
+2. **Private material stays out of process interfaces.** The message rides on
+   child stdin, the private key is referenced only by a filesystem path in
+   `ssh-keygen` argv, and the armored signature is the only signing output
+   captured. Generated private bytes may exist transiently in the manager while
+   a record is written or a temporary signing file is materialized; the public
+   API never returns those bytes, and private bytes never appear in argv,
+   stdout, stderr, logs, thrown errors, or test snapshots.
 3. **Portability cost is bounded and testable.** The requirement is one
    binary — `ssh-keygen` with `-Y` support (OpenSSH 8.1+, present on macOS
    and every mainstream Linux distro). When it is absent, crypto features fail
@@ -40,8 +45,10 @@ interface without touching callers.
   `null` means "not this signer's signature" (a cryptographic miss), never an
   exception. A hit returns `{ keyid, principal, format }`.
 
-`SshSigner` (created via `createSshSigner({ keyPath, principal, ... })`) is
-the stock-OpenSSH implementation. Its configuration (`SshSignerConfig`) and
+`SshSigner` (created via `createSshSigner({ namespace, signKeyPath, verify })`)
+is the stock-OpenSSH implementation. `verify` has the shape
+`{ principal, allowedSignersText }`; omit `signKeyPath` for verify-only use, or
+omit `verify` for sign-only use. Its configuration (`SshSignerConfig`) and
 process seam (`SshProcessAdapter`) are exported for hermetic tests; production
 callers use the defaults. All errors are `SshSignerError` with fixed messages —
 child stderr is never interpolated into error text.
@@ -97,8 +104,12 @@ its canonical path. No API returns private-key text.
 **human** principal instead of generating one. Before recording, the candidate
 is validated with a non-secret sign/verify challenge against its own public
 key (works for a private-key path, or a public-key path whose private half is
-in ssh-agent). The record stores only the canonical path + public key +
-fingerprint — the private bytes are never copied.
+in ssh-agent). The record stores only the canonical `realpath` + public key + fingerprint —
+the private bytes are never copied. For a private-key path, the public half is
+derived with stock `ssh-keygen -y`; an adjacent `.pub` file is not trusted as
+the identity source. Before every later signing callback, the manager resolves
+the path again and checks that the current Ed25519 fingerprint still matches the
+stored fingerprint.
 
 Rules:
 
@@ -141,17 +152,21 @@ SSHSIG signatures are produced and verified under the namespace
 ## The role of `allowed_signers`
 
 `parseAllowedSigners` parses the stock OpenSSH `allowed_signers` format
-(principals, options — `cert-authority`, `touch-required`, `namespaces=`,
-`valid-after=`, `valid-before=` — key type, blob, comment) **structurally**:
-it never throws, reporting malformed lines with their line numbers alongside
-the well-formed entries. It deliberately does **not** implement OpenSSH
-pattern matching or authorization — `ssh-keygen -Y verify` remains the policy
-authority, and parsed lines are fed back to it unchanged.
+(principals, one comma-separated options field, key type, standard Base64 blob,
+and trailing comment) **structurally**. The supported option syntax is
+`cert-authority`, `namespaces="..."`, `valid-after="..."`, and
+`valid-before="..."`; assignment values must use the stock quoted form.
+`touch-required` is rejected because it is not a stock option supported by the
+OpenSSH verifier used here. The parser never throws: malformed lines come back
+with their line numbers alongside the well-formed entries. It deliberately does
+**not** implement OpenSSH pattern matching or authorization — `ssh-keygen -Y
+verify` remains the policy authority, and accepted policy text is fed back to it
+unchanged. `SshSigner` additionally restricts verification policy entries to
+Ed25519 keys.
 
 ## Out of scope (future work)
 
 - Key **rotation** and revocation wiring for stored principal keys.
-- Certificate (`cert-authority`) chains and hardware (`touch-required`) flows
-  beyond parsing.
+- Certificate (`cert-authority`) chains and hardware-backed signing flows.
 - A pure-JS signer for hot paths (the `Signer` seam is already in place).
 - Threshold schemes beyond "N distinct trusted keys".

@@ -29,11 +29,12 @@
  * (candidate hint) is never treated as identity.
  */
 
-import { spawn } from 'node:child_process';
-import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, openSync, rmSync, writeFileSync, closeSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { chmodSync, mkdtempSync, openSync, rmSync, writeFileSync, closeSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parseAllowedSigners } from './allowed-signers.ts';
 
 /** The result of signing: which key signed (`keyid`) and the signature bytes. */
 export interface DetachedSignature {
@@ -105,6 +106,13 @@ export interface SshProcessAdapter {
     timedOut: boolean;
     truncated: boolean;
   }>;
+  /** Synchronous, non-secret feature probe used by createSshSigner. */
+  probe?(cmd: string, args: string[], opts: { timeoutMs: number }): {
+    status: number | null;
+    stderr: Buffer;
+    errorCode?: string;
+    timedOut?: boolean;
+  };
 }
 
 /** Thrown for SSHSIG tool/configuration failures. Message is fixed, non-secret. */
@@ -163,48 +171,62 @@ export const defaultSshProcess: SshProcessAdapter = {
       child.stdin.end();
     });
   },
+  probe(cmd, args, opts) {
+    const result = spawnSync(cmd, args, {
+      shell: false,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      timeout: opts.timeoutMs,
+      maxBuffer: SSH_MAX_BUFFER,
+    });
+    const err = result.error as NodeJS.ErrnoException | undefined;
+    return {
+      status: result.status,
+      stderr: Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.alloc(0),
+      errorCode: err?.code,
+      timedOut: err?.code === 'ETIMEDOUT',
+    };
+  },
 };
 
 /**
- * Probe whether the system `ssh-keygen` supports the `-Y` SSHSIG subcommands.
- * The probe is a harmless capability invocation (`ssh-keygen -Y find-principals`
- * against an empty temp allowed_signers file — it exits nonzero but proves the
- * option group exists; an unknown `-Y` fails with "unknown option"). The
- * non-secret capability result is cached for the process lifetime.
+ * Probe whether the system `ssh-keygen` supports the feature-specific `-Y`
+ * command group. The probe is routed through the injected process adapter so
+ * tests cannot accidentally execute the host toolchain. A supported command is
+ * allowed to return a normal nonzero policy/input status; only an unknown option,
+ * missing executable, timeout, or signal failure means the feature is absent.
  */
 let sshCapability: { ok: boolean; detail: string } | null = null;
 export function probeSshKeygenY(adapter?: SshProcessAdapter, tempDir?: (prefix: string) => string): { ok: boolean; detail: string } {
   if (sshCapability !== null) return sshCapability;
   const makeDir = tempDir ?? ((prefix: string) => mkdtempSync(join(tmpdir(), prefix)));
   const proc = adapter ?? defaultSshProcess;
+  if (proc.probe === undefined) {
+    return (sshCapability = { ok: false, detail: 'ssh-keygen capability probe is unavailable' });
+  }
   const dir = makeDir('owenloop-sshprobe-');
   try {
     const allowed = join(dir, 'allowed_signers');
     writeFileSync(allowed, '');
-    // Run synchronously through execFileSync for the capability probe — the
-    // result is a fixed capability fact, never secret output.
-    try {
-      execFileSync('ssh-keygen', ['-Y', 'find-principals', '-f', allowed, '-s', allowed], {
-        stdio: ['ignore', 'ignore', 'ignore'],
-        timeout: SSH_DEFAULT_TIMEOUT_MS,
-      });
-      sshCapability = { ok: true, detail: 'ssh-keygen supports -Y' };
-    } catch (e) {
-      const err = e as { status?: unknown; message?: unknown };
-      // A nonzero exit is EXPECTED (empty signers list); only a spawn failure
-      // (ENOENT) or an unrecognized option means no -Y support.
-      if (typeof err.status === 'number') {
-        sshCapability = { ok: true, detail: 'ssh-keygen supports -Y' };
-      } else if (typeof err.message === 'string' && /option|usage/i.test(err.message)) {
-        sshCapability = { ok: false, detail: 'ssh-keygen does not support -Y (OpenSSH >= 8.1 required)' };
-      } else {
-        sshCapability = { ok: false, detail: 'ssh-keygen is not available (ENOENT)' };
-      }
+    const result = proc.probe('ssh-keygen', ['-Y', 'find-principals', '-f', allowed, '-s', allowed], {
+      timeoutMs: SSH_DEFAULT_TIMEOUT_MS,
+    });
+    const diagnostics = result.stderr.toString('utf8');
+    if (result.timedOut || result.errorCode === 'ETIMEDOUT') {
+      return (sshCapability = { ok: false, detail: 'ssh-keygen capability probe timed out' });
     }
+    if (result.errorCode === 'ENOENT') {
+      return (sshCapability = { ok: false, detail: 'ssh-keygen is not available (ENOENT)' });
+    }
+    if (result.status === null) {
+      return (sshCapability = { ok: false, detail: 'ssh-keygen capability probe terminated by signal' });
+    }
+    if (/unknown option|illegal option|unrecognized option/i.test(diagnostics)) {
+      return (sshCapability = { ok: false, detail: 'ssh-keygen does not support -Y (OpenSSH >= 8.1 required)' });
+    }
+    return (sshCapability = { ok: true, detail: 'ssh-keygen supports -Y' });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  return sshCapability;
 }
 
 /** Reset the cached capability (tests only). */
@@ -254,7 +276,9 @@ export class SshSigner implements Signer {
     if (keyPath === undefined) {
       throw new SshSignerError('this signer is not configured for signing (no signKeyPath)');
     }
-    const keyid = this.config.verify?.principal !== undefined ? await this.signerKeyid(keyPath) : await fingerprintForPath(keyPath);
+    const publicText = await publicTextForSigningPath(keyPath, this.proc, this.config.timeoutMs ?? SSH_DEFAULT_TIMEOUT_MS);
+    assertEd25519PubText(publicText, 'signing key');
+    const keyid = fingerprintForPubText(publicText);
     const r = await this.proc.run(
       'ssh-keygen',
       ['-Y', 'sign', '-f', keyPath, '-n', this.config.namespace],
@@ -283,6 +307,13 @@ export class SshSigner implements Signer {
     if (ctx === undefined) {
       throw new SshSignerError('this signer is not configured for verification (no principal/allowedSignersText)');
     }
+    const policy = parseAllowedSigners(ctx.allowedSignersText);
+    if (policy.errors.length > 0 || policy.entries.length === 0) {
+      throw new SshSignerError('sshsig verify: malformed allowed_signers policy');
+    }
+    if (policy.entries.some((entry) => entry.keyType !== 'ssh-ed25519')) {
+      throw new SshSignerError('sshsig verify: only Ed25519 allowed_signers keys are supported');
+    }
     if (this.verifyDir === null) {
       this.verifyDir = this.makeTempDir('owenloop-sshsig-');
       chmodSync(this.verifyDir, 0o700);
@@ -290,6 +321,7 @@ export class SshSigner implements Signer {
     const sigPath = join(this.verifyDir, `sig-${Math.random().toString(36).slice(2)}.armored`);
     const allowedPath = join(this.verifyDir, `allowed-${Math.random().toString(36).slice(2)}.txt`);
     writeFileSync(sigPath, signature, { mode: 0o600 });
+    // Preserve the accepted policy text byte-for-byte for stock OpenSSH.
     writeFileSync(allowedPath, ctx.allowedSignersText, { mode: 0o600 });
     try {
       const r = await this.proc.run(
@@ -306,9 +338,15 @@ export class SshSigner implements Signer {
       if (r.timedOut) throw new SshSignerError('sshsig verify: timed out');
       if (r.truncated) throw new SshSignerError('sshsig verify: output exceeded the cap');
       if (r.status === 0) {
-        return { keyid: await fingerprintForAllowedSigners(allowedPath, this.config), principal: ctx.principal, format: 'sshsig' };
+        try {
+          const keyid = fingerprintForSshsigPublicKey(signature);
+          return { keyid, principal: ctx.principal, format: 'sshsig' };
+        } catch {
+          throw new SshSignerError('sshsig verify: verified signature has no valid Ed25519 public key');
+        }
       }
-      if (r.status !== null) return null; // a normal verification miss
+      if (r.status === 255 && isCryptographicMiss(r.stdout, r.stderr)) return null;
+      if (r.status !== null) throw new SshSignerError(`sshsig verify: exited with status ${r.status}`);
       throw new SshSignerError('sshsig verify: child terminated by signal');
     } finally {
       rmSync(sigPath, { force: true });
@@ -324,69 +362,86 @@ export class SshSigner implements Signer {
     }
   }
 
-  /** The signing key's fingerprint, for the envelope `keyid` hint. */
-  private async signerKeyid(keyPath: string): Promise<string> {
-    return fingerprintForPath(keyPath);
-  }
 }
 
-/**
- * Compute the keyid for a key path: the `SHA256:<unpadded-base64>` fingerprint
- * of the decoded public-key blob (comments excluded). Reads the public half
- * only — a private-key path is accepted because `ssh-keygen -l` derives the
- * public key from it; only the derived public material is read.
- */
-async function fingerprintForPath(keyPath: string): Promise<string> {
-  const { createHash } = await import('node:crypto');
-  const { readFileSync } = await import('node:fs');
-  let pubText: string;
+/** Read the actual public half for a signing path. Private paths are derived
+ * through stock ssh-keygen; adjacent `.pub` text is never trusted for them. */
+async function publicTextForSigningPath(keyPath: string, proc: SshProcessAdapter, timeoutMs: number): Promise<string> {
   try {
-    pubText = readFileSync(`${keyPath}.pub`, 'utf8');
+    const text = readFileSync(keyPath, 'utf8');
+    const line = text.split(/\r?\n/).find((l) => l.trim() !== '')?.trim() ?? '';
+    if (/^(?:ssh-|ecdsa-|sk-)/.test(line)) return text;
   } catch {
-    // The path may be a bare public key file already.
-    try {
-      pubText = readFileSync(keyPath, 'utf8');
-    } catch {
-      throw new SshSignerError(`cannot read the public key for ${keyPath}`);
-    }
+    // Derivation below reports a fixed error.
   }
-  return fingerprintFromPubText(pubText, createHash);
+  const result = await proc.run('ssh-keygen', ['-y', '-f', keyPath], { timeoutMs });
+  classify(result, 'sshsig public-key derivation');
+  return result.stdout.toString('utf8');
 }
 
-/** Fingerprint of the first key in an allowed_signers text (for the verify keyid). */
-async function fingerprintForAllowedSigners(allowedPath: string, config: SshSignerConfig): Promise<string> {
-  const { createHash } = await import('node:crypto');
-  const { readFileSync } = await import('node:fs');
-  const text = readFileSync(allowedPath, 'utf8');
-  // First non-comment, non-blank line's key blob.
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line === '' || line.startsWith('#')) continue;
-    const parts = line.split(/\s+/);
-    // principals [options] keytype base64key [comment] — find the base64 field
-    // after the ssh-* key type.
-    for (let i = 0; i < parts.length - 1; i++) {
-      if (/^(ssh|ecdsa|sk)-/.test(parts[i]!)) {
-        return fingerprintFromBase64(parts[i + 1]!, createHash);
-      }
-    }
-  }
-  void config;
-  throw new SshSignerError('allowed_signers carries no key');
-}
-
-function fingerprintFromPubText(pubText: string, createHash: typeof import('node:crypto').createHash): string {
+function fingerprintForPubText(pubText: string): string {
   const line = pubText.split(/\r?\n/).find((l) => l.trim() !== '');
   if (line === undefined) throw new SshSignerError('public key file is empty');
   const parts = line.trim().split(/\s+/);
   if (parts.length < 2) throw new SshSignerError('public key line is malformed');
-  return fingerprintFromBase64(parts[1]!, createHash);
+  assertEd25519PubText(pubText, 'public key');
+  return fingerprintFromBase64(parts[1]!);
 }
 
-function fingerprintFromBase64(b64: string, createHash: typeof import('node:crypto').createHash): string {
+function fingerprintFromBase64(b64: string): string {
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64) || b64.length % 4 === 1) {
+    throw new SshSignerError('public key Base64 is malformed');
+  }
+  const body = b64.replace(/=+$/, '');
+  const expectedPad = body.length % 4 === 0 ? 0 : 4 - (body.length % 4);
+  if (b64.length - body.length !== expectedPad) throw new SshSignerError('public key Base64 is malformed');
   const blob = Buffer.from(b64, 'base64');
+  if (blob.length === 0) throw new SshSignerError('public key blob is empty');
   const digest = createHash('sha256').update(blob).digest('base64').replace(/=+$/, '');
   return `SHA256:${digest}`;
+}
+
+/** Extract the embedded public-key field from a verified SSHSIG armor. */
+function fingerprintForSshsigPublicKey(armored: Buffer): string {
+  const text = armored.toString('utf8');
+  const begin = '-----BEGIN SSH SIGNATURE-----';
+  const end = '-----END SSH SIGNATURE-----';
+  const start = text.indexOf(begin);
+  const finish = text.indexOf(end);
+  if (start < 0 || finish <= start) throw new Error('malformed armor');
+  const body = text.slice(start + begin.length, finish).replace(/[\r\n]/g, '');
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(body) || body.length % 4 === 1) throw new Error('malformed armor');
+  const raw = Buffer.from(body, 'base64');
+  let offset = 0;
+  const take = (label: string): Buffer => {
+    if (offset + 4 > raw.length) throw new Error(`missing ${label}`);
+    const length = raw.readUInt32BE(offset);
+    offset += 4;
+    if (length > raw.length - offset) throw new Error(`bad ${label} length`);
+    const value = raw.subarray(offset, offset + length);
+    offset += length;
+    return value;
+  };
+  if (raw.subarray(0, 6).toString('ascii') !== 'SSHSIG') throw new Error('bad magic');
+  offset = 6;
+  if (offset + 4 > raw.length || raw.readUInt32BE(offset) !== 1) throw new Error('unsupported SSHSIG version');
+  offset += 4;
+  const publicKeyField = take('public key');
+  const keyType = (() => {
+    let p = 0;
+    if (publicKeyField.length < 4) throw new Error('bad public key');
+    const n = publicKeyField.readUInt32BE(p);
+    p += 4;
+    if (n > publicKeyField.length - p) throw new Error('bad key type length');
+    return publicKeyField.subarray(p, p + n).toString('ascii');
+  })();
+  if (keyType !== 'ssh-ed25519') throw new Error('non-Ed25519 public key');
+  return `SHA256:${createHash('sha256').update(publicKeyField).digest('base64').replace(/=+$/, '')}`;
+}
+
+function isCryptographicMiss(stdout: Buffer, stderr: Buffer): boolean {
+  const diagnostics = `${stdout.toString('utf8')}\n${stderr.toString('utf8')}`;
+  return stdout.length === 0 && stderr.length === 0 || /could not verify signature|namespace does not match/i.test(diagnostics);
 }
 
 /**

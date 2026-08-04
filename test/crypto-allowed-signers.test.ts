@@ -3,9 +3,9 @@
  * options, key type, key blob, comment, line numbers — and never throws: bad
  * lines become `{ line, message }` errors. The committed corpus lives at
  * `test/fixtures/crypto/allowed_signers.txt` (public keys only). An
- * integration test reconstructs a signer line from the parser's output and
- * proves stock `ssh-keygen` accepts it (skipped when the host lacks a working
- * `ssh-keygen -Y`).
+ * integration test passes an accepted fixture line unchanged to stock
+ * `ssh-keygen` and proves stock accepts it (skipped when the host lacks a
+ * working `ssh-keygen -Y`).
  */
 
 import { test } from 'node:test';
@@ -43,7 +43,7 @@ test('corpus entry 1: bare line — principals, key type, blob, trailing comment
   assert.deepEqual(e.principals, ['alice']);
   assert.equal(e.keyType, 'ssh-ed25519');
   assert.equal(e.comment, 'alice@example');
-  assert.deepEqual(e.options, { certAuthority: false, touchRequired: false, namespaces: undefined, validAfter: undefined, validBefore: undefined });
+  assert.deepEqual(e.options, { certAuthority: false, namespaces: undefined, validAfter: undefined, validBefore: undefined });
   assert.ok(e.keyBlob.equals(Buffer.from(e.keyBase64, 'base64')), 'blob is the strict-decoded key');
 });
 
@@ -58,22 +58,20 @@ test('corpus entry 2: multiple principals + namespaces option', () => {
 test('corpus entry 3: cert-authority singleton', () => {
   const e = parseAllowedSigners(CORPUS).entries[2]!;
   assert.equal(e.options.certAuthority, true);
-  assert.equal(e.options.touchRequired, false);
 });
 
-test('corpus entry 4: comma-joined options with quoted comma/space/escape values', () => {
+test('corpus entry 4: comma-joined options with quoted comma/space values', () => {
   const e = parseAllowedSigners(CORPUS).entries[3]!;
-  assert.equal(e.options.touchRequired, true);
   assert.deepEqual(e.options.namespaces, ['a', 'b c'], 'quoted value keeps its inner comma+space');
-  assert.equal(e.options.validAfter, '20200101T000000Z');
-  assert.equal(e.options.validBefore, '20300101T000000Z');
+  assert.equal(e.options.validAfter, '20200101000000Z');
+  assert.equal(e.options.validBefore, '20300101000000Z');
 });
 
-test('corpus entry 5: space-separated options after a quoted assignment', () => {
+test('corpus entry 5: one comma-separated options field', () => {
   const e = parseAllowedSigners(CORPUS).entries[4]!;
   assert.deepEqual(e.options.namespaces, ['ns1']);
   assert.equal(e.options.certAuthority, true);
-  assert.equal(e.comment, 'space-separated options');
+  assert.equal(e.comment, 'comma-joined options');
 });
 
 test('CRLF input parses identically to LF', () => {
@@ -101,16 +99,24 @@ test('malformed lines produce line-numbered errors and never throw', () => {
     'p namespaces="unterminated ssh-ed25519 QUJD', // 5: unterminated quote
     'p ssh-ed25519 !!!', // 6: bad base64 blob
     'p cert-authority,cert-authority ssh-ed25519 QUJD', // 7: duplicate singleton
+    'p touch-required ssh-ed25519 QUJD', // 8: unsupported stock option
+    'p namespaces=ns ssh-ed25519 QUJD', // 9: unquoted assignment
+    'p namespaces="a" cert-authority ssh-ed25519 QUJD', // 10: whitespace-separated options
+    'p ssh-ed25519 ____', // 11: URL-safe/non-standard Base64
   ].join('\n');
   const res = parseAllowedSigners(text);
   assert.deepEqual(res.entries, [], 'no line is well-formed');
-  assert.deepEqual(res.errors.map((e) => e.line), [1, 2, 3, 4, 5, 6, 7], 'one error per bad line, numbered');
+  assert.deepEqual(res.errors.map((e) => e.line), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 'one error per bad line, numbered');
   assert.match(res.errors[0]!.message, /missing fields/);
   assert.match(res.errors[2]!.message, /missing base64 key/);
   assert.match(res.errors[3]!.message, /unsupported option syntax: 'foobar'/);
   assert.match(res.errors[4]!.message, /unterminated quoted option value/);
   assert.match(res.errors[5]!.message, /bad base64 key blob/);
   assert.match(res.errors[6]!.message, /duplicate option: cert-authority/);
+  assert.match(res.errors[7]!.message, /unsupported option syntax/);
+  assert.match(res.errors[8]!.message, /assignment value must be quoted/);
+  assert.match(res.errors[9]!.message, /options must be one comma-separated field/);
+  assert.match(res.errors[10]!.message, /bad base64 key blob/);
 });
 
 test('a good line next to a bad one: the good one survives with its line number', () => {
@@ -123,24 +129,22 @@ test('a good line next to a bad one: the good one survives with its line number'
 
 // ---- integration: the parser's output reconstructs a stock-accepted line -----
 
-test('integration: reconstructed from the parser, stock ssh-keygen verifies the fixture signature', { skip: !sshKeygenWorks() && 'host ssh-keygen lacks -Y' }, () => {
-  const parsed = parseAllowedSigners(CORPUS);
-  const alice = parsed.entries[0]!;
+test('integration: an accepted fixture line is passed unchanged to stock ssh-keygen', { skip: !sshKeygenWorks() && 'host ssh-keygen lacks -Y' }, () => {
+  const aliceLine = CORPUS.split(/\r?\n/)[4]!;
   const message = readFileSync(join(FIXTURES, 'sshsig-hello.txt'));
   const armored = readFileSync(join(FIXTURES, 'sshsig-hello.armored'));
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-allowed-int-'));
   try {
-    // Reconstruct the allowed_signers line from the PARSED fields only.
     const allowedPath = join(dir, 'allowed_signers');
     const sigPath = join(dir, 'sig.armored');
-    writeFileSync(allowedPath, `${alice.principals.join(',')} ${alice.keyType} ${alice.keyBase64}\n`, { mode: 0o600 });
+    writeFileSync(allowedPath, `${aliceLine}\n`, { mode: 0o600 });
     writeFileSync(sigPath, armored, { mode: 0o600 });
     const out = execFileSync(
       'ssh-keygen',
       ['-Y', 'verify', '-f', allowedPath, '-I', 'alice', '-n', 'owenloop-dsse-v1', '-s', sigPath],
       { input: message, stdio: ['pipe', 'pipe', 'pipe'], timeout: 10_000 },
     );
-    assert.match(out.toString('utf8'), /Good "owenloop-dsse-v1" signature/, 'stock verifies the parser-reconstructed line');
+    assert.match(out.toString('utf8'), /Good "owenloop-dsse-v1" signature/, 'stock verifies the unchanged fixture line');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

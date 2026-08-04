@@ -60,14 +60,24 @@ export {
   PAYLOAD_TYPE_SUBMISSION,
   DsseEnvelopeError,
   decodeBase64Strict,
+  dsseSignEnrollmentGrant,
   dsseSignEnvelope,
+  dsseSignOrigin,
+  dsseSignPolicyFloor,
   dsseSignRecord,
+  dsseSignRevocation,
+  dsseSignSubmission,
+  dsseVerifyEnrollmentGrant,
   dsseVerifyEnvelope,
+  dsseVerifyOrigin,
+  dsseVerifyPolicyFloor,
   dsseVerifyRecord,
+  dsseVerifyRevocation,
+  dsseVerifySubmission,
   encodeBase64,
   preAuthEncode,
 } from './dsse.ts';
-export type { DsseEnvelope, DsseSignature, DsseVerifyResult } from './dsse.ts';
+export type { DsseEnvelope, DsseRecordPayloadType, DsseSignature, DsseVerifyResult } from './dsse.ts';
 
 // ---- allowed_signers ----
 export { parseAllowedSigners } from './allowed-signers.ts';

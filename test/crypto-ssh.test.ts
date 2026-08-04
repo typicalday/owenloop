@@ -98,12 +98,13 @@ test('interop: stock-signed message verifies through the module', { skip: SKIP }
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-ssh-t-'));
   try {
     const { keyPath, pubText, keyid } = makeEphemeralKey(dir, 'signer');
+    const other = makeEphemeralKey(dir, 'other');
     const message = Buffer.from('stock-signed message bytes');
     const armored = execFileSync('ssh-keygen', ['-q', '-Y', 'sign', '-f', keyPath, '-n', 'ns-a'], { input: message, timeout: 10_000 });
 
     const signer = createSshSigner({
       namespace: 'ns-a',
-      verify: { principal: 'alice', allowedSignersText: `alice ${pubText.trim()}\n` },
+      verify: { principal: 'alice', allowedSignersText: `alice ${other.pubText.trim()}\nalice ${pubText.trim()}\n` },
     });
     try {
       const res = await signer.verify(message, armored);
@@ -282,6 +283,15 @@ function fakeAdapter(results: Array<{ status: number | null; stdout?: Buffer; ti
         }
       }
       calls.push({ cmd, args, stdin: opts.stdin, filesSeen });
+      if (args[0] === '-y' && args[1] === '-f') {
+        return {
+          status: 0,
+          stdout: readFileSync(join(FIXTURES, 'fixture-key.pub')),
+          stderr: Buffer.alloc(0),
+          timedOut: false,
+          truncated: false,
+        };
+      }
       const r = results[Math.min(i++, results.length - 1)]!;
       return { status: r.status, stdout: r.stdout ?? Buffer.alloc(0), stderr: Buffer.alloc(0), timedOut: r.timedOut ?? false, truncated: r.truncated ?? false };
     },
@@ -294,7 +304,7 @@ const POISON = 'POISON-SECRET-NEVER-IN-ARGV';
 test('fake sign: message rides on stdin only; argv is exactly [-Y sign -f <path> -n <ns>]; no poison in argv', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-ssh-fake-'));
   try {
-    // A .pub next to the key path supplies the keyid (public text only).
+    // The private path is derived through ssh-keygen -y; adjacent .pub text is not trusted.
     const pubText = readFileSync(join(FIXTURES, 'fixture-key.pub'), 'utf8');
     const keyPath = join(dir, 'id');
     writeFileSync(`${keyPath}.pub`, pubText, { mode: 0o644 });
@@ -307,13 +317,15 @@ test('fake sign: message rides on stdin only; argv is exactly [-Y sign -f <path>
     assert.equal(res.keyid, publicKeyDescriptor(pubText).keyid);
     assert.equal(res.sig.toString('utf8'), armored);
 
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0]!.cmd, 'ssh-keygen');
-    assert.deepEqual(calls[0]!.args, ['-Y', 'sign', '-f', keyPath, '-n', 'ns-x']);
-    assert.ok(calls[0]!.stdin!.equals(message), 'the message arrives on child stdin');
-    for (const arg of calls[0]!.args) {
-      assert.ok(!arg.includes(POISON), `argv carries no poison: ${arg}`);
-      assert.ok(!arg.includes(pubText.trim()), 'argv carries no key text');
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0]!.args, ['-y', '-f', keyPath]);
+    assert.deepEqual(calls[1]!.args, ['-Y', 'sign', '-f', keyPath, '-n', 'ns-x']);
+    assert.ok(calls[1]!.stdin!.equals(message), 'the message arrives on child stdin');
+    for (const call of calls) {
+      for (const arg of call.args) {
+        assert.ok(!arg.includes(POISON), `argv carries no poison: ${arg}`);
+        assert.ok(!arg.includes(pubText.trim()), 'argv carries no key text');
+      }
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -386,11 +398,11 @@ test('fake verify: temp sig + allowed_signers files carry the exact bytes; argv 
   });
   try {
     const message = Buffer.from(POISON);
-    const sig = Buffer.from('-----BEGIN SSH SIGNATURE-----\nSIG\n-----END SSH SIGNATURE-----\n');
+    const sig = readFileSync(join(FIXTURES, 'sshsig-hello.armored'));
     const res = await signer.verify(message, sig);
     assert.ok(res !== null);
     assert.equal(res!.principal, 'alice');
-    assert.equal(res!.keyid, publicKeyDescriptor(pubText).keyid, 'keyid from the allowed_signers key');
+    assert.equal(res!.keyid, publicKeyDescriptor(pubText).keyid, 'keyid from the verified SSHSIG public key');
 
     assert.equal(calls.length, 1);
     const args = calls[0]!.args;

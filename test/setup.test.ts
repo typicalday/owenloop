@@ -275,6 +275,34 @@ test('setup: --new-agent mints a NEW identity id, so the agent key is new', asyn
   assertNoOlp(t);
 });
 
+test('setup: agent key ref uses the live whoami actor id when listed metadata has a different id', async () => {
+  const { routes, state } = makeIdentityHub({
+    identities: [{ id: 'agent_listed', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_worker_live' } }],
+  });
+  const token = [...state.tokens.values()][0];
+  assert.ok(token, 'seeded agent token exists');
+  token.agentId = 'agent_live';
+
+  const { fetch } = routedFetch(routes);
+  const { keychain, store } = fakeKeychain();
+  seedHuman(store);
+  store.set(kcKey(ORIGIN, { principal: 'agent', account: 'worker' }), JSON.stringify({ kind: 'agent', accessToken: 'olp_worker_live' }));
+  const keys = makeFakePrincipalKeys();
+  const t = makeIo({ fetch, keychain, store, principalKeys: keys.manager });
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB], t.io), 0, t.err.join('\\n'));
+  assert.deepEqual(
+    keys.calls.map((c) => ({ kind: c.ref.kind, id: c.ref.id })),
+    [
+      { kind: 'human', id: 'user_abc' },
+      { kind: 'machine', id: 'local' },
+      { kind: 'agent', id: 'agent_live' },
+    ],
+    'the live whoami actor id, not the listed identity id, names the agent key',
+  );
+  assertNoOlp(t);
+});
+
 test('setup --reuse-ssh-key: passes the path to the human ensure ONLY', async () => {
   const { routes } = makeIdentityHub();
   const { fetch } = routedFetch(routes);
@@ -300,7 +328,7 @@ test('setup --reuse-ssh-key: a missing path errors BEFORE any browser opens', as
   const t = makeIo({ fetch, onOpenUrl: driveCallback() });
 
   assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--reuse-ssh-key', join(t.home, 'nope')], t.io), 1);
-  assert.match(t.err.join('\n'), /--reuse-ssh-key: no such file:/);
+  assert.match(t.err.join('\n'), /--reuse-ssh-key: no such file/);
   assert.equal(t.openedUrls.length, 0, 'no browser opened before the path check');
   assert.equal(calls.length, 0, 'no network before the path check');
   assert.equal(t.principalKeys!.calls.length, 0, 'no key ensured');

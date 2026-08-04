@@ -23,10 +23,20 @@ import {
   PAYLOAD_TYPE_REVOCATION,
   PAYLOAD_TYPE_SUBMISSION,
   decodeBase64Strict,
+  dsseSignEnrollmentGrant,
   dsseSignEnvelope,
+  dsseSignOrigin,
+  dsseSignPolicyFloor,
   dsseSignRecord,
+  dsseSignRevocation,
+  dsseSignSubmission,
+  dsseVerifyEnrollmentGrant,
   dsseVerifyEnvelope,
+  dsseVerifyOrigin,
+  dsseVerifyPolicyFloor,
   dsseVerifyRecord,
+  dsseVerifyRevocation,
+  dsseVerifySubmission,
   encodeBase64,
   preAuthEncode,
 } from '../src/crypto/dsse.ts';
@@ -107,7 +117,7 @@ test('decodeBase64Strict: standard and URL-safe alphabets both decode', () => {
   assert.deepEqual(decodeBase64Strict('aGVsbG8gd29ybGQ='), Buffer.from('hello world'));
   assert.deepEqual(decodeBase64Strict('aGVsbG8gd29ybGQ'), Buffer.from('hello world'), 'padding optional');
   assert.deepEqual(decodeBase64Strict('aaa='), Buffer.from([0x69, 0xa6]), 'a single = pad is legal');
-  assert.deepEqual(decodeBase64Strict('  aGVs\r\nbG8=  '), Buffer.from('hello'), 'whitespace tolerated');
+  assert.throws(() => decodeBase64Strict('  aGVs\r\nbG8=  '), DsseEnvelopeError, 'whitespace is rejected');
 });
 
 test('decodeBase64Strict: malformed inputs throw DsseEnvelopeError (Node decoder is permissive)', () => {
@@ -144,7 +154,18 @@ test('dsseVerifyEnvelope: decode → PAE → signatures → type check, returns 
   assert.ok(verifier.calls[0]!.sig.equals(sig));
 });
 
-test('dsseVerifyEnvelope: payload bytes come back EXACTLY, even with trailing whitespace the decoder strips', async () => {
+test('dsseVerifyEnvelope: an empty payload Base64 field is valid when its signature verifies', async () => {
+  const sig = Buffer.from('empty-payload-signature');
+  const env = {
+    payload: '',
+    payloadType: PAYLOAD_TYPE_ORIGIN,
+    signatures: [{ sig: encodeBase64(sig) }],
+  };
+  const res = await dsseVerifyEnvelope(env, PAYLOAD_TYPE_ORIGIN, strictVerifier(sig));
+  assert.equal(res.payloadBytes.length, 0);
+});
+
+test('dsseVerifyEnvelope: payload bytes come back EXACTLY for binary payloads', async () => {
   const sig = Buffer.from('s');
   const payload = Buffer.from([0, 1, 2, 255, 254]); // binary payload
   const env = {
@@ -264,6 +285,7 @@ test('dsseVerifyEnvelope: malformed shapes throw DsseEnvelopeError', async () =>
     { payload: '!!!', payloadType: PAYLOAD_TYPE_ORIGIN, signatures: [{ sig: encodeBase64(Buffer.from('s')) }] }, // bad payload b64
     { payload: encodeBase64(Buffer.from('x')), payloadType: PAYLOAD_TYPE_ORIGIN, signatures: [{ sig: '!!' }] }, // bad sig b64
     { payload: encodeBase64(Buffer.from('x')), payloadType: PAYLOAD_TYPE_ORIGIN, signatures: [{}] }, // missing sig field
+    { payload: encodeBase64(Buffer.from('x')), payloadType: PAYLOAD_TYPE_ORIGIN, signatures: [null] }, // null signature entry
   ];
   for (const env of cases) {
     await assert.rejects(dsseVerifyEnvelope(env, PAYLOAD_TYPE_ORIGIN, ok), DsseEnvelopeError);
@@ -326,4 +348,28 @@ test('record wrappers pin the payload type: sign under one class, verify as anot
   const res = await dsseVerifyRecord(envelope, PAYLOAD_TYPE_SUBMISSION, signer);
   assert.equal(res.payloadBytes.toString('utf8'), 'submission');
   await assert.rejects(dsseVerifyRecord(envelope, PAYLOAD_TYPE_POLICY_FLOOR, signer), /payload type mismatch/);
+});
+
+test('explicit record-class wrappers bind all five fixed payload types', async () => {
+  const signer = {
+    async sign() {
+      return { keyid: 'SHA256:k', sig: Buffer.from('s') };
+    },
+    async verify(_bytes: Buffer, _sig: Buffer) {
+      return { keyid: 'SHA256:k', principal: 'p', format: 'sshsig' as const };
+    },
+  };
+  const cases = [
+    [dsseSignEnrollmentGrant, dsseVerifyEnrollmentGrant, PAYLOAD_TYPE_ENROLLMENT_GRANT],
+    [dsseSignRevocation, dsseVerifyRevocation, PAYLOAD_TYPE_REVOCATION],
+    [dsseSignSubmission, dsseVerifySubmission, PAYLOAD_TYPE_SUBMISSION],
+    [dsseSignPolicyFloor, dsseVerifyPolicyFloor, PAYLOAD_TYPE_POLICY_FLOOR],
+    [dsseSignOrigin, dsseVerifyOrigin, PAYLOAD_TYPE_ORIGIN],
+  ] as const;
+  for (const [sign, verify, expected] of cases) {
+    const { envelope } = await sign(Buffer.from(expected), signer);
+    assert.equal(envelope.payloadType, expected);
+    const result = await verify(envelope, signer);
+    assert.deepEqual(result.payloadBytes, Buffer.from(expected));
+  }
 });

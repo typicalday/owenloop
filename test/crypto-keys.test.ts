@@ -32,6 +32,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -110,6 +111,9 @@ function makeFakeRunner(opts: { failLookup?: boolean; failStore?: boolean } = {}
         writeFileSync(keyPath, `${POISON}-${generations}\n`, { mode: 0o600 });
         writeFileSync(`${keyPath}.pub`, FIXTURE_PUB);
         return { status: 0, stdout: Buffer.alloc(0) };
+      }
+      if (args[0] === '-y' && args[1] === '-f') {
+        return { status: 0, stdout: Buffer.from(FIXTURE_PUB, 'utf8') };
       }
       if (args[0] === '-Y' && args[1] === 'sign') {
         return {
@@ -399,13 +403,13 @@ test('reuse: the candidate is validated with a sign/verify challenge; only path+
   assert.equal(res.backend, 'reused');
 
   // The challenge ran: one sign + one verify through ssh-keygen.
-  assert.ok(runs.some((r) => r.args[0] === '-Y' && r.args[1] === 'sign' && r.args.includes(candidate)));
+  assert.ok(runs.some((r) => r.args[0] === '-Y' && r.args[1] === 'sign' && r.args.includes(realpathSync(candidate))));
   assert.ok(runs.some((r) => r.args[0] === '-Y' && r.args[1] === 'verify'));
 
   // The stored record has NO privateKey and NO poison — just path + pubkey.
   const rec = JSON.parse(readFileSync(join(home, '.owenloop', 'keys', `${keyRefHash(REF)}.json`), 'utf8'));
   assert.equal(rec.kind, 'reused');
-  assert.equal(rec.path, candidate);
+  assert.equal(rec.path, realpathSync(candidate));
   assert.equal(rec.privateKey, undefined);
   assertNoPoison('reused record', JSON.stringify(rec));
 
@@ -414,7 +418,7 @@ test('reuse: the candidate is validated with a sign/verify challenge; only path+
   await m.withSigningKey(REF, async (p) => {
     seen = p;
   });
-  assert.equal(seen, candidate);
+  assert.equal(seen, realpathSync(candidate));
 
   // A missing reused file is a hard error.
   rmSync(candidate);
@@ -547,7 +551,7 @@ test('real keygen: reuse stores the canonical path after a live sign/verify chal
     assert.equal(res.backend, 'reused');
     const rec = JSON.parse(readFileSync(join(home, '.owenloop', 'keys', `${keyRefHash(REF)}.json`), 'utf8'));
     assert.equal(rec.kind, 'reused');
-    assert.equal(rec.path, candidate);
+    assert.equal(rec.path, realpathSync(candidate));
     assert.equal(rec.privateKey, undefined, 'private bytes are NEVER copied for a reused key');
     assert.equal(rec.fingerprint, res.publicKey.keyid);
 
@@ -569,8 +573,8 @@ test('assertKeyRef validates origin/kind/id; canonicalKeyRef is order-stable for
   assert.throws(() => assertKeyRef({ origin: 'o', kind: 'human', id: ' ' }), CliError);
   assert.doesNotThrow(() => assertKeyRef(REF));
 
-  const a: PrincipalKeyRef = { origin: 'o', kind: 'human', id: 'i' };
-  const b: PrincipalKeyRef = { id: 'i', origin: 'o', kind: 'human' };
+  const a: PrincipalKeyRef = { origin: REF.origin, kind: 'human', id: 'i' };
+  const b: PrincipalKeyRef = { id: 'i', origin: REF.origin, kind: 'human' };
   assert.equal(canonicalKeyRef(a), canonicalKeyRef(b));
   assert.equal(keyRefHash(a), keyRefHash(b), 'hash ignores literal insertion order');
 });

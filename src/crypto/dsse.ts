@@ -107,8 +107,8 @@ export function preAuthEncode(payloadType: string, payload: Buffer): Buffer {
 }
 
 /** The strict Base64 alphabet check shared by both alphabets. */
-function base64CharsOk(s: string, alphabet: RegExp): boolean {
-  return s.length > 0 && alphabet.test(s);
+function base64CharsOk(s: string, alphabet: RegExp, allowEmpty: boolean): boolean {
+  return (allowEmpty || s.length > 0) && alphabet.test(s);
 }
 
 /**
@@ -120,28 +120,29 @@ function base64CharsOk(s: string, alphabet: RegExp): boolean {
  * it would silently drop illegal characters and accept missing padding,
  * decoding two different strings to the same bytes.
  */
-export function decodeBase64Strict(s: string): Buffer {
+export function decodeBase64Strict(s: string, opts?: { allowEmpty?: boolean }): Buffer {
   if (typeof s !== 'string') throw new DsseEnvelopeError('base64 field is not a string');
-  const cleaned = s.replace(/[\r\n\t ]/g, '');
+  const allowEmpty = opts?.allowEmpty ?? false;
   const std = /^[A-Za-z0-9+/]*$/;
   const url = /^[A-Za-z0-9_-]*$/;
-  const body = cleaned.replace(/=+$/, '');
-  const hadPadding = cleaned.length > body.length;
-  if (cleaned.length === 0) throw new DsseEnvelopeError('base64 field is empty');
+  const body = s.replace(/=+$/, '');
+  const hadPadding = s.length > body.length;
+  if (s.length === 0 && !allowEmpty) throw new DsseEnvelopeError('base64 field is empty');
+  if (/[\r\n\t ]/.test(s)) throw new DsseEnvelopeError('malformed base64: whitespace is not allowed');
   if (hadPadding) {
     // With explicit padding the total must be a multiple of 4 and the padding
     // at most two characters.
-    if (cleaned.length % 4 !== 0 || cleaned.length - body.length > 2) {
+    if (s.length % 4 !== 0 || s.length - body.length > 2) {
       throw new DsseEnvelopeError('malformed base64: bad padding');
     }
-    if (!base64CharsOk(body, std) && !base64CharsOk(body, url)) {
+    if (!base64CharsOk(body, std, allowEmpty) && !base64CharsOk(body, url, allowEmpty)) {
       throw new DsseEnvelopeError('malformed base64: character outside both alphabets');
     }
   } else {
-    if (!base64CharsOk(cleaned, std) && !base64CharsOk(cleaned, url)) {
+    if (!base64CharsOk(s, std, allowEmpty) && !base64CharsOk(s, url, allowEmpty)) {
       throw new DsseEnvelopeError('malformed base64: character outside both alphabets');
     }
-    const rem = cleaned.length % 4;
+    const rem = s.length % 4;
     if (rem === 1) throw new DsseEnvelopeError('malformed base64: length % 4 == 1');
   }
   // Re-encode through the standard alphabet for the decoder (URL-safe chars
@@ -169,12 +170,16 @@ export interface DsseVerifyResult {
  * descriptor or `null`. Malformed Base64 in `sig` is a hard envelope error
  * (the envelope itself is broken), not a miss.
  */
-function decodeSigEntry(entry: DsseSignature, index: number): Buffer {
-  if (typeof entry.sig !== 'string' || entry.sig === '') {
+function decodeSigEntry(entry: unknown, index: number): Buffer {
+  if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+    throw new DsseEnvelopeError(`signatures[${index}]: entry is not an object`);
+  }
+  const sigEntry = entry as DsseSignature;
+  if (typeof sigEntry.sig !== 'string' || sigEntry.sig === '') {
     throw new DsseEnvelopeError(`signatures[${index}]: missing 'sig' field`);
   }
   try {
-    return decodeBase64Strict(entry.sig);
+    return decodeBase64Strict(sigEntry.sig);
   } catch (e) {
     throw new DsseEnvelopeError(`signatures[${index}]: ${(e as Error).message}`);
   }
@@ -222,13 +227,13 @@ export async function dsseVerifyEnvelope(
   }
   const payloadBytes = (() => {
     try {
-      return decodeBase64Strict(env.payload);
+      return decodeBase64Strict(env.payload, { allowEmpty: true });
     } catch (e) {
       throw new DsseEnvelopeError(`payload: ${(e as Error).message}`);
     }
   })();
   const pae = preAuthEncode(env.payloadType, payloadBytes);
-  const sigBytes = env.signatures.map((entry, i) => decodeSigEntry(entry as DsseSignature, i));
+  const sigBytes = env.signatures.map((entry, i) => decodeSigEntry(entry, i));
 
   const verified: VerifiedSignature[] = [];
   const seen = new Set<string>();
@@ -277,31 +282,62 @@ export async function dsseSignEnvelope(
   return { envelope, signature };
 }
 
-/**
- * A record-class wrapper: sign `payloadBytes` under one fixed payload type.
- * Thin by design — the wrappers exist so call sites name the record class and
- * cannot drift onto the wrong type string.
- */
+/** The closed set of launch record payload types. */
+export type DsseRecordPayloadType =
+  | typeof PAYLOAD_TYPE_ENROLLMENT_GRANT
+  | typeof PAYLOAD_TYPE_REVOCATION
+  | typeof PAYLOAD_TYPE_SUBMISSION
+  | typeof PAYLOAD_TYPE_POLICY_FLOOR
+  | typeof PAYLOAD_TYPE_ORIGIN;
+
+/** Generic wrapper retained for callers that already carry a closed-union type. */
 export async function dsseSignRecord(
-  payloadType: string,
+  payloadType: DsseRecordPayloadType,
   payloadBytes: Buffer,
   signer: Pick<Signer, 'sign'>,
 ): Promise<{ envelope: DsseEnvelope; signature: DetachedSignature }> {
   return dsseSignEnvelope(payloadType, payloadBytes, signer);
 }
 
-/**
- * A record-class wrapper: verify `envelope` as EXACTLY one record class.
- * Rejects (throws) when the envelope's payload type is any other class, so a
- * valid envelope can never be consumed as a different record type. Returns the
- * exact verified payload bytes — parsing them into a business record is the
- * caller's job, not this module's.
- */
+/** Generic closed-union verification wrapper. */
 export async function dsseVerifyRecord(
   envelope: unknown,
-  expectedPayloadType: string,
+  expectedPayloadType: DsseRecordPayloadType,
   signer: Pick<Signer, 'verify'>,
   opts?: { threshold?: number },
 ): Promise<DsseVerifyResult> {
   return dsseVerifyEnvelope(envelope, expectedPayloadType, signer, opts);
 }
+
+/** Fixed enrollment-grant record wrapper. */
+export const dsseSignEnrollmentGrant = (payloadBytes: Buffer, signer: Pick<Signer, 'sign'>) =>
+  dsseSignEnvelope(PAYLOAD_TYPE_ENROLLMENT_GRANT, payloadBytes, signer);
+export const dsseVerifyEnrollmentGrant = (
+  envelope: unknown,
+  signer: Pick<Signer, 'verify'>,
+  opts?: { threshold?: number },
+) => dsseVerifyEnvelope(envelope, PAYLOAD_TYPE_ENROLLMENT_GRANT, signer, opts);
+
+/** Fixed revocation record wrapper. */
+export const dsseSignRevocation = (payloadBytes: Buffer, signer: Pick<Signer, 'sign'>) =>
+  dsseSignEnvelope(PAYLOAD_TYPE_REVOCATION, payloadBytes, signer);
+export const dsseVerifyRevocation = (envelope: unknown, signer: Pick<Signer, 'verify'>, opts?: { threshold?: number }) =>
+  dsseVerifyEnvelope(envelope, PAYLOAD_TYPE_REVOCATION, signer, opts);
+
+/** Fixed submission record wrapper. */
+export const dsseSignSubmission = (payloadBytes: Buffer, signer: Pick<Signer, 'sign'>) =>
+  dsseSignEnvelope(PAYLOAD_TYPE_SUBMISSION, payloadBytes, signer);
+export const dsseVerifySubmission = (envelope: unknown, signer: Pick<Signer, 'verify'>, opts?: { threshold?: number }) =>
+  dsseVerifyEnvelope(envelope, PAYLOAD_TYPE_SUBMISSION, signer, opts);
+
+/** Fixed policy-floor record wrapper. */
+export const dsseSignPolicyFloor = (payloadBytes: Buffer, signer: Pick<Signer, 'sign'>) =>
+  dsseSignEnvelope(PAYLOAD_TYPE_POLICY_FLOOR, payloadBytes, signer);
+export const dsseVerifyPolicyFloor = (envelope: unknown, signer: Pick<Signer, 'verify'>, opts?: { threshold?: number }) =>
+  dsseVerifyEnvelope(envelope, PAYLOAD_TYPE_POLICY_FLOOR, signer, opts);
+
+/** Fixed origin record wrapper. */
+export const dsseSignOrigin = (payloadBytes: Buffer, signer: Pick<Signer, 'sign'>) =>
+  dsseSignEnvelope(PAYLOAD_TYPE_ORIGIN, payloadBytes, signer);
+export const dsseVerifyOrigin = (envelope: unknown, signer: Pick<Signer, 'verify'>, opts?: { threshold?: number }) =>
+  dsseVerifyEnvelope(envelope, PAYLOAD_TYPE_ORIGIN, signer, opts);
