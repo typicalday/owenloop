@@ -1,0 +1,10 @@
+# owenloop allowed_signers test corpus — public material only.
+# Covers: comments, blank lines, multiple principals, one comma-joined options
+# field, quoted values with commas/spaces/escapes, and trailing comments. The
+# KEY is the committed fixture public key.
+alice ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDspeZ1e+CYKy4Q2CXCbjI4xVqWr0xcPIPCjTml0KCdT alice@example
+
+alice,bob namespaces="owenloop-dsse-v1,other-ns" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDspeZ1e+CYKy4Q2CXCbjI4xVqWr0xcPIPCjTml0KCdT two principals with namespaces
+carol cert-authority ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDspeZ1e+CYKy4Q2CXCbjI4xVqWr0xcPIPCjTml0KCdT
+ dave namespaces="a,b c",valid-after="20200101000000Z",valid-before="20300101000000Z" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDspeZ1e+CYKy4Q2CXCbjI4xVqWr0xcPIPCjTml0KCdT comma-joined options
+ erin namespaces="ns1",cert-authority ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDspeZ1e+CYKy4Q2CXCbjI4xVqWr0xcPIPCjTml0KCdT comma-joined options

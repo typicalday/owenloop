@@ -59,7 +59,7 @@ for the full breakdown.
 | `crew rm <crewId> [--hub <url>]` | delete a crew; work stamped to it moves to the org's orphan crew — see [Crews](#crews) |
 | `crew member add <crewId> <principalKind> <principalId> [--hub <url>]` | add a member or agent to a crew — see [Crews](#crews) |
 | `crew member rm <crewId> <principalId> [--hub <url>]` | remove a principal from a crew — see [Crews](#crews) |
-| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>]` | onboard this machine: may store human and Scoped Identity credentials, write only execution-settings `hubOrigin`, and after probing print missing-plugin commands instead of installing the plugin — see [`setup`](#setup--onboard-a-machine) |
+| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]` | onboard this machine: may store human and Scoped Identity credentials, ensure the three principal signing keys, write only execution-settings `hubOrigin`, and after probing print missing-plugin commands instead of installing the plugin — see [`setup`](#setup--onboard-a-machine) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
@@ -1264,9 +1264,10 @@ lines (the tolerant-false notices, the transfer summary) go to stderr only.
 
 ## `setup` — onboard a machine
 
-`owenloop setup` is the one-shot onboarding command. It runs six ordered steps.
+`owenloop setup` is the one-shot onboarding command. It runs seven ordered steps.
 Depending on the machine state, setup may store the human credential, mint or
-rekey and store a Scoped Identity credential, and write only `hubOrigin` in the
+rekey and store a Scoped Identity credential, ensure the three principal
+signing keys, and write only `hubOrigin` in the
 execution settings file while preserving its other keys. The plugin step only
 probes whether the Claude Code plugin is installed; when the probe reports it
 missing, setup prints manual install commands but never runs those commands or
@@ -1281,17 +1282,20 @@ installs the plugin. The steps:
    hub and reuse it; otherwise **mint** a new Scoped Identity or **rekey**
    (replace the credential of) an existing one. How the target is chosen is
    [below](#choosing-the-scoped-identity-flow-a-vs-flow-b).
-4. **execution settings** — write only `hubOrigin` into the execution settings
+4. **signing keys** — ensure an Ed25519 signing key for each of the three local
+   principals, in order: human, machine, agent. Details
+   [below](#signing-keys-step-4).
+5. **execution settings** — write only `hubOrigin` into the execution settings
    file so the local Step Agent talks to this hub, preserving every other key
    (skipped when `hubOrigin` already matches).
-5. **plugin** — check whether the Claude Code `owenloop` plugin is installed.
+6. **plugin** — check whether the Claude Code `owenloop` plugin is installed.
    **Non-fatal:** while the marketplace is unpublished this step only *prints*
    the manual install commands (`claude plugin marketplace add owenloop` then
    `claude plugin install owenloop@owenloop`); it never fails setup.
-6. **doctor** — a final [`doctor`](#doctor--check-a-machines-install) pass over
+7. **doctor** — a final [`doctor`](#doctor--check-a-machines-install) pass over
    the same surfaces, whose result becomes setup's exit code.
 
-Progress lines (the `[n/6]` headers and `✓`/`✗` marks) go to **stderr**; the
+Progress lines (the `[n/7]` headers and `✓`/`✗` marks) go to **stderr**; the
 final machine-readable summary — `{ ok, hub, steps, doctor }` — goes to
 **stdout**.
 
@@ -1329,6 +1333,37 @@ the minted token's scopes (default `work`); combining it with `--replace-agent`
 is a usage error, because rekeying preserves the Scoped Identity's existing scopes (mint a
 new Scoped Identity to change scopes). `setup` has no `--shift` shorthand — spell the
 scopes out with `--scopes work,run`.
+
+### Signing keys (step 4)
+
+Step 4 ensures one Ed25519 signing key per local principal — human, machine,
+agent — keyed by `{ hub origin, kind, principal id }`. It is **idempotent**:
+an existing key reports `existing` and is never regenerated or rewritten. A
+second full setup run performs zero key writes.
+
+**Storage backends.** The key record goes to the macOS Keychain
+(`security`), to Linux libsecret (`secret-tool`) when that binary is on
+`PATH`, and otherwise to a `0600` file under `$HOME/.owenloop/keys/` (both
+parent directories forced `0700`, symlinks refused). One backend is selected
+once and a failure is a hard error — there is never a fallback to another
+backend, because a fallback could mint a second, different key for the same
+principal. `OWENLOOP_NO_KEYCHAIN=1` forces the file backend. Private bytes
+never appear on argv or in setup output.
+
+**`--reuse-ssh-key <path>`** records your own existing Ed25519 SSH key for the
+**human** principal instead of generating one. The candidate is validated with
+a non-secret sign/verify challenge before anything is recorded, and only its
+canonical path + public key are stored — the private key is never copied. It
+applies to the human key only (machine and agent always get generated keys),
+and it is a **hard conflict** when a human key already exists: setup keeps the
+existing key and errors rather than rotating (rotation is not part of this
+work package). A nonexistent path fails up front, before any browser opens.
+
+**Secret-output guarantee.** Step 4 prints only `kind state (backend)` — e.g.
+`✓ signing keys: human created (macos-security), machine created (file), agent
+existing (macos-security)` — never key bytes, fingerprints, or secret-store
+values. The full storage and signing model is in
+[Signing and key storage](crypto.md).
 
 ### Hub resolution differs from `agent new`
 

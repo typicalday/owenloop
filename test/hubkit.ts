@@ -16,6 +16,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { credentialSlot, hashDefForHub, keychainServiceFor } from '../src/hub.ts';
 import type { CredentialSlotSelector } from '../src/hub.ts';
+import { canonicalKeyRef } from '../src/crypto/keys.ts';
+import type { EnsureKeyResult, PrincipalKeyRef } from '../src/crypto/keys.ts';
+import type { PrincipalKeyManager } from '../src/crypto/keys.ts';
 import type { CliIO, Keychain } from '../src/cli.ts';
 
 export interface RouteResult {
@@ -243,6 +246,74 @@ export interface HubIo {
   store: Map<string, string>;
 }
 
+// ---- makeFakePrincipalKeys: the hermetic signing-key seam for setup ---------
+
+/** A fixed non-secret public-key descriptor for fake signing keys. */
+const FAKE_KEY_PUBLIC = {
+  keyid: 'SHA256:owenloopfakekey0000000000000000000000000000',
+  keyType: 'ssh-ed25519',
+  openSshPublicKey: 'ssh-ed25519 AAAAB3NzaC1lZDI1NTE5 owenloop-fake-test-key',
+  comment: 'owenloop-fake-test-key',
+} as const;
+
+export interface FakePrincipalKeysOpts {
+  /** Refs that already exist before setup runs (second-run / replace scenarios). */
+  existing?: PrincipalKeyRef[];
+  /** Refs whose `ensure` throws a fixed store failure (backend-failure injection). */
+  failFor?: PrincipalKeyRef[];
+}
+
+/**
+ * A fake `PrincipalKeyManager` for setup tests — records every `ensure` call,
+ * models idempotent create/existing/reused states in memory, and mirrors the
+ * real conflict rules (reuse against an existing key fails; reuse is
+ * human-only). `makeIo` injects a fresh one BY DEFAULT so no setup test ever
+ * reaches the developer's real ssh-keygen/Keychain/libsecret/agent/$HOME;
+ * pass `principalKeys: 'real'` to `makeIo` to run the real manager instead.
+ */
+export function makeFakePrincipalKeys(opts: FakePrincipalKeysOpts = {}): {
+  manager: Pick<PrincipalKeyManager, 'ensure'>;
+  calls: { ref: PrincipalKeyRef; reuse?: { path: string }; result?: EnsureKeyResult }[];
+  state: Map<string, { ref: PrincipalKeyRef; state: 'created' | 'existing' | 'reused'; backend: string }>;
+} {
+  const state = new Map<string, { ref: PrincipalKeyRef; state: 'created' | 'existing' | 'reused'; backend: string }>();
+  for (const ref of opts.existing ?? []) {
+    state.set(canonicalKeyRef(ref), { ref, state: 'existing', backend: 'file' });
+  }
+  const fail = new Set((opts.failFor ?? []).map(canonicalKeyRef));
+  const calls: { ref: PrincipalKeyRef; reuse?: { path: string }; result?: EnsureKeyResult }[] = [];
+  const manager = {
+    async ensure(ref: PrincipalKeyRef, reuseOpts?: { reuse?: { path: string } }): Promise<EnsureKeyResult> {
+      const entry: { ref: PrincipalKeyRef; reuse?: { path: string }; result?: EnsureKeyResult } = { ref, reuse: reuseOpts?.reuse };
+      calls.push(entry);
+      if (fail.has(canonicalKeyRef(ref))) throw new Error(`fake signing-key store failure for ${ref.kind}`);
+      const key = canonicalKeyRef(ref);
+      const prior = state.get(key);
+      if (prior !== undefined) {
+        if (reuseOpts?.reuse !== undefined) {
+          throw new Error(
+            `a ${ref.kind} signing key already exists for ${ref.origin} — rotation is not part of WP-A2; the existing key is kept`,
+          );
+        }
+        entry.result = { ref, state: 'existing', backend: prior.backend as EnsureKeyResult['backend'], publicKey: FAKE_KEY_PUBLIC };
+        return entry.result;
+      }
+      if (reuseOpts?.reuse !== undefined && ref.kind !== 'human') {
+        throw new Error('explicit SSH key reuse applies only to the human principal key');
+      }
+      const rec = {
+        ref,
+        state: reuseOpts?.reuse !== undefined ? ('reused' as const) : ('created' as const),
+        backend: reuseOpts?.reuse !== undefined ? 'reused' : 'file',
+      };
+      state.set(key, rec);
+      entry.result = { ref, state: rec.state, backend: rec.backend as EnsureKeyResult['backend'], publicKey: FAKE_KEY_PUBLIC };
+      return entry.result;
+    },
+  };
+  return { manager, calls, state };
+}
+
 export interface MakeIoOpts {
   fetch?: typeof globalThis.fetch;
   env?: Record<string, string | undefined>;
@@ -259,15 +330,27 @@ export interface MakeIoOpts {
    *  default, so the plugin check just doesn't find the binary unless the test PATH
    *  provides one AND a runCommand is supplied. */
   runCommand?: (cmd: string, args: string[]) => { status: number | null; stdout: string; stderr: string };
+  /**
+   * Signing-key manager seam for setup's `[4/7] signing keys` step. Default: a
+   * fresh in-memory fake (`makeFakePrincipalKeys`) so setup tests never touch the
+   * real ssh-keygen/Keychain/agent/$HOME. Pass `'real'` to opt into the real
+   * `PrincipalKeyManager` (only for tests that deliberately exercise it with a
+   * fixture $HOME).
+   */
+  principalKeys?: Pick<PrincipalKeyManager, 'ensure'> | 'real';
 }
 
-export function makeIo(opts: MakeIoOpts = {}): HubIo {
+export function makeIo(opts: MakeIoOpts = {}): HubIo & {
+  /** The injected fake signing-key manager (present unless `principalKeys: 'real'`). */
+  principalKeys?: ReturnType<typeof makeFakePrincipalKeys>;
+} {
   const cwd = mkdtempSync(join(tmpdir(), 'owenloop-hub-cwd-'));
   const home = mkdtempSync(join(tmpdir(), 'owenloop-hub-home-'));
   const out: string[] = [];
   const err: string[] = [];
   const openedUrls: string[] = [];
   const kc = opts.keychain ? { keychain: opts.keychain, store: opts.store ?? new Map<string, string>() } : fakeKeychain();
+  const fakeKeys = opts.principalKeys === 'real' || opts.principalKeys !== undefined ? undefined : makeFakePrincipalKeys();
 
   const io: CliIO = {
     cwd,
@@ -283,8 +366,9 @@ export function makeIo(opts: MakeIoOpts = {}): HubIo {
     readStdin: async () => opts.stdin ?? '',
     prompt: opts.prompt,
     runCommand: opts.runCommand,
+    principalKeys: opts.principalKeys === 'real' ? undefined : opts.principalKeys ?? fakeKeys?.manager,
   };
-  return { io, cwd, home, out, err, openedUrls, store: opts.store ?? kc.store };
+  return { io, cwd, home, out, err, openedUrls, store: opts.store ?? kc.store, principalKeys: fakeKeys };
 }
 
 /** Canonical OAuth AS metadata (relative endpoints, to exercise resolveEndpoint). */

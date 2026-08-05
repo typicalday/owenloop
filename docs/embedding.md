@@ -360,6 +360,26 @@ means "no credential", but an exception means "the configured command could not
 produce one" — surface its message rather than treating it as an empty slot,
 because falling back to a local store is exactly what the setting forbids.
 
+The index also exports the **crypto surface** ([Signing and key
+storage](crypto.md) is the full reference):
+
+- `PrincipalKeyManager` — generate/store/materialize the three principals'
+  Ed25519 signing keys (`ensure`, `inspect`, `withSigningKey`; refs are
+  `{ origin, kind, id }`, helpers `assertKeyRef`, `canonicalKeyRef`,
+  `keyRefHash`, `keyidFromBlob`, `publicKeyDescriptor`). The internal record
+  reader is private to `PrincipalKeyManager`; consumers receive **paths and
+  public descriptors, never private-key strings**. `ensure`/`inspect` return
+  only the public-key descriptor, and `withSigningKey` hands your callback a
+  temporary usable key path that the manager removes after use (or the
+  canonical path of an explicitly reused key).
+- `SshSigner` / `createSshSigner` (behind the format-neutral `Signer`
+  interface) — SSHSIG signing/verification through stock `ssh-keygen -Y`.
+- `dsseSignEnvelope` / `dsseVerifyEnvelope` plus the record-class wrappers and
+  the five `PAYLOAD_TYPE_*` constants — DSSE envelopes with strict Base64 and
+  exact-byte payload return.
+- `parseAllowedSigners` — structural parsing of stock `allowed_signers` files
+  (never throws; malformed lines come back with line numbers).
+
 `SUPPORTED_ENGINE_VERSION` is the programmatic form of the design.md §27
 engine-version contract — the highest `engine:` a def may declare and still load.
 Tooling can preflight-check a def's `engine:` field against it before handing the

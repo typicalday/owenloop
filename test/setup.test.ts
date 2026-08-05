@@ -1,19 +1,23 @@
 /**
  * `owenloop setup` — the idempotent converger (identity model §7 Flow A/B),
  * driven in-process through `mainAsync` against the stateful `makeIdentityHub`
- * fake. Proves: the six steps run in order, a fresh machine mints/logs in, a
- * SECOND run performs zero writes (idempotency), the succession prompt (Flow B)
- * renders verbatim framing and rekeys the chosen agent, the `--replace-agent` /
- * `--new-agent` bypasses skip the prompt, and the non-interactive guard fires.
+ * fake. Proves: the seven steps run in order, a fresh machine mints/logs in, a
+ * SECOND run performs zero writes (idempotency), the signing-keys step creates
+ * the three principal keys exactly once and honors `--reuse-ssh-key` for the
+ * human key only, the succession prompt (Flow B) renders verbatim framing and
+ * rekeys the chosen agent, the `--replace-agent` / `--new-agent` bypasses skip
+ * the prompt, and the non-interactive guard fires.
  *
  * Secrets discipline: `assertNoOlp(t)` ends EVERY acceptance test — the fake's
  * mint/rekey tokens all start `olp_` and ride in the response `text` field, so a
- * leak to stdout/stderr would trip it.
+ * leak to stdout/stderr would trip it. Signing keys never reach the developer's
+ * real ssh-keygen/Keychain/agent/$HOME: `makeIo` injects a fake
+ * `PrincipalKeyManager` by default.
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,6 +30,7 @@ import {
   fakeKeychain,
   kcHuman,
   kcKey,
+  makeFakePrincipalKeys,
   makeIdentityHub,
   makeIo,
   routedFetch,
@@ -62,7 +67,7 @@ function seedHuman(store: Map<string, string>): void {
 
 // ---- Flow A: fresh machine ---------------------------------------------------
 
-test('setup: fresh machine, scripted --new-agent runs steps 2-6 in order and converges', async () => {
+test('setup: fresh machine, scripted --new-agent runs steps 2-7 in order and converges', async () => {
   const { routes } = makeIdentityHub();
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch, onOpenUrl: driveCallback() });
@@ -72,7 +77,7 @@ test('setup: fresh machine, scripted --new-agent runs steps 2-6 in order and con
 
   // Step banners appear in order on stderr.
   const errText = t.err.join('\n');
-  const order = ['[1/6]', '[2/6]', '[3/6]', '[4/6]', '[5/6]', '[6/6]'];
+  const order = ['[1/7]', '[2/7]', '[3/7]', '[4/7]', '[5/7]', '[6/7]', '[7/7]'];
   let last = -1;
   for (const marker of order) {
     const at = errText.indexOf(marker);
@@ -172,6 +177,198 @@ test('setup: a second run performs ZERO writes (no store mutation, no settings w
   }
 
   assertNoOlp(t2);
+});
+
+// ---- signing keys: the [4/7] step -------------------------------------------
+
+/** The three canonical refs setup must ensure, for the fake hub's identity model
+ *  (human actor `user_abc`, machine `local`, and the minted agent's hub id). */
+function expectedRefs(origin: string, agentId: string) {
+  return [
+    { origin, kind: 'human', id: 'user_abc' },
+    { origin, kind: 'machine', id: 'local' },
+    { origin, kind: 'agent', id: agentId },
+  ];
+}
+
+test('setup: [4/7] ensures exactly the three canonical refs in human→machine→agent order', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t.io), 0, t.err.join('\n'));
+
+  // The mint route assigns agent_1 as the first minted identity id.
+  assert.ok(t.principalKeys, 'fake signing-key manager injected');
+  assert.deepEqual(
+    t.principalKeys!.calls.map((c) => ({ origin: c.ref.origin, kind: c.ref.kind, id: c.ref.id })),
+    expectedRefs(ORIGIN, 'agent_1'),
+    'exactly three canonical refs, human→machine→agent order',
+  );
+  for (const c of t.principalKeys!.calls) assert.equal(c.reuse, undefined, 'no reuse passed without --reuse-ssh-key');
+
+  // The summary line prints kind + state + backend only.
+  assert.match(t.err.join('\n'), /✓ signing keys: human created \(file\), machine created \(file\), agent created \(file\)/);
+  assertNoOlp(t);
+});
+
+test('setup: second run performs zero key writes — all three refs come back existing', async () => {
+  const sharedHome = mkdtempSync(join(tmpdir(), 'owenloop-setup-keys-'));
+  const { keychain, store } = fakeKeychain();
+  const { routes } = makeIdentityHub();
+
+  const r1 = routedFetch(routes);
+  const t1 = makeIo({ fetch: r1.fetch, keychain, store, env: { HOME: sharedHome }, onOpenUrl: driveCallback() });
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t1.io), 0, t1.err.join('\n'));
+  const run1Created = t1.principalKeys!.calls.filter((c) => c.result?.state === 'created');
+  assert.equal(run1Created.length, 3, 'run 1 created all three keys');
+
+  // Run 2 over the SAME fake store: every ensure must RETURN `existing`, so
+  // no new state entry appears and no call carries a reuse request.
+  const before = t1.principalKeys!.state.size;
+  const r2 = routedFetch(routes);
+  const t2 = makeIo({ fetch: r2.fetch, keychain, store, env: { HOME: sharedHome }, principalKeys: t1.principalKeys!.manager });
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t2.io), 0, t2.err.join('\n'));
+
+  assert.equal(t1.principalKeys!.calls.length, 6, 'run 2 ensured the same three refs');
+  const run2 = t1.principalKeys!.calls.slice(3);
+  for (const c of run2) {
+    assert.equal(c.result?.state, 'existing', `run-2 ensure of ${c.ref.kind} sees an existing key`);
+    assert.equal(c.reuse, undefined);
+  }
+  assert.equal(t1.principalKeys!.state.size, before, 'no new key state on the second run');
+  assert.match(t2.err.join('\n'), /✓ signing keys: human existing \(file\), machine existing \(file\), agent existing \(file\)/);
+  assertNoOlp(t2);
+});
+
+test('setup: --replace-agent reuses the existing agent key (rekey preserves the agent id)', async () => {
+  // Seed the agent key for agent_w's hub id (agent_w) as ALREADY existing.
+  const { routes } = makeIdentityHub({
+    identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_worker_live' } }],
+  });
+  const { fetch } = routedFetch(routes);
+  const keys = makeFakePrincipalKeys({ existing: [{ origin: ORIGIN, kind: 'agent', id: 'agent_w' }] });
+  const t = makeIo({ fetch, principalKeys: keys.manager });
+  seedHuman(t.store);
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--replace-agent', 'worker'], t.io), 0, t.err.join('\n'));
+
+  const agentCall = keys.calls.find((c) => c.ref.kind === 'agent');
+  assert.ok(agentCall, 'agent key ensured');
+  assert.equal(agentCall!.ref.id, 'agent_w', 'the agent key ref is the rekeyed identity id');
+  assert.equal(agentCall!.result?.state, 'existing', 'the agent key is reused, not regenerated');
+  assertNoOlp(t);
+});
+
+test('setup: --new-agent mints a NEW identity id, so the agent key is new', async () => {
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_x', name: 'other', crews: ['team'] }] });
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t.store);
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'fresh'], t.io), 0, t.err.join('\n'));
+
+  const agentCall = t.principalKeys!.calls.find((c) => c.ref.kind === 'agent');
+  assert.ok(agentCall, 'agent key ensured');
+  assert.equal(agentCall!.ref.id, 'agent_1', 'the new agent gets the hub-minted identity id');
+  assert.equal(agentCall!.result?.state, 'created', 'a new agent means a new key');
+  assertNoOlp(t);
+});
+
+test('setup: agent key ref uses the live whoami actor id when listed metadata has a different id', async () => {
+  const { routes, state } = makeIdentityHub({
+    identities: [{ id: 'agent_listed', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_worker_live' } }],
+  });
+  const token = [...state.tokens.values()][0];
+  assert.ok(token, 'seeded agent token exists');
+  token.agentId = 'agent_live';
+
+  const { fetch } = routedFetch(routes);
+  const { keychain, store } = fakeKeychain();
+  seedHuman(store);
+  store.set(kcKey(ORIGIN, { principal: 'agent', account: 'worker' }), JSON.stringify({ kind: 'agent', accessToken: 'olp_worker_live' }));
+  const keys = makeFakePrincipalKeys();
+  const t = makeIo({ fetch, keychain, store, principalKeys: keys.manager });
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB], t.io), 0, t.err.join('\\n'));
+  assert.deepEqual(
+    keys.calls.map((c) => ({ kind: c.ref.kind, id: c.ref.id })),
+    [
+      { kind: 'human', id: 'user_abc' },
+      { kind: 'machine', id: 'local' },
+      { kind: 'agent', id: 'agent_live' },
+    ],
+    'the live whoami actor id, not the listed identity id, names the agent key',
+  );
+  assertNoOlp(t);
+});
+
+test('setup --reuse-ssh-key: passes the path to the human ensure ONLY', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const keyFile = join(t.home, 'my-existing-ed25519');
+  writeFileSync(keyFile, 'ssh-ed25519 AAAAB3NzaC1lZDI1NTE5 not-a-real-private\n', { mode: 0o600 });
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--reuse-ssh-key', keyFile], t.io), 0, t.err.join('\n'));
+
+  assert.ok(t.principalKeys, 'fake key manager injected');
+  const byKind = (k: string) => t.principalKeys!.calls.find((c) => c.ref.kind === k)!;
+  assert.deepEqual(byKind('human').reuse, { path: keyFile }, 'human ensure receives the reuse path');
+  assert.equal(byKind('machine').reuse, undefined, 'machine ensure gets no reuse');
+  assert.equal(byKind('agent').reuse, undefined, 'agent ensure gets no reuse');
+  assert.equal(byKind('human').result?.state, 'reused', 'human key recorded as reused');
+  assert.match(t.err.join('\n'), /✓ signing keys: human reused \(reused\)/);
+  assertNoOlp(t);
+});
+
+test('setup --reuse-ssh-key: a missing path errors BEFORE any browser opens', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--reuse-ssh-key', join(t.home, 'nope')], t.io), 1);
+  assert.match(t.err.join('\n'), /--reuse-ssh-key: no such file/);
+  assert.equal(t.openedUrls.length, 0, 'no browser opened before the path check');
+  assert.equal(calls.length, 0, 'no network before the path check');
+  assert.equal(t.principalKeys!.calls.length, 0, 'no key ensured');
+  assertNoOlp(t);
+});
+
+test('setup: a signing-key store failure surfaces as a hard error (no fallback, setup aborts)', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const keys = makeFakePrincipalKeys({ failFor: [{ origin: ORIGIN, kind: 'machine', id: 'local' }] });
+  const t = makeIo({ fetch, onOpenUrl: driveCallback(), principalKeys: keys.manager });
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t.io), 1);
+  assert.match(t.err.join('\n'), /fake signing-key store failure for machine/);
+  assert.equal(keys.calls.length, 2, 'human ensured, machine failed, agent never attempted');
+  assertNoOlp(t);
+});
+
+test('setup: reuse against an EXISTING human key is a hard conflict error', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const keys = makeFakePrincipalKeys({ existing: [{ origin: ORIGIN, kind: 'human', id: 'user_abc' }] });
+  const t = makeIo({ fetch, onOpenUrl: driveCallback(), principalKeys: keys.manager });
+  const keyFile = join(t.home, 'another-ed25519');
+  writeFileSync(keyFile, 'ssh-ed25519 AAAAB3NzaC1lZDI1NTE5 not-a-real-private\n', { mode: 0o600 });
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--reuse-ssh-key', keyFile], t.io), 1);
+  assert.match(t.err.join('\n'), /rotation is not part of WP-A2/);
+  assertNoOlp(t);
+});
+
+test('setup: no private key marker ever reaches stdout/stderr', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t.io), 0, t.err.join('\n'));
+  const combined = [...t.out, ...t.err].join('\n');
+  assert.ok(!combined.includes('BEGIN OPENSSH PRIVATE KEY'), 'no private-key banner in setup output');
+  assert.ok(!combined.includes('owenloopfakekey'), 'no key material in setup output');
+  assertNoOlp(t);
 });
 
 // ---- external credential command: refuse before opening the browser ---------
