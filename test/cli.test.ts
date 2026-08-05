@@ -2030,3 +2030,46 @@ test('add --recover --global refuses a journal recorded against a different stor
   assert.match(r.err, /journal records store root '\/tmp\/some-other-store'/);
   assert.match(r.err, /re-run against the same store root/);
 });
+
+// ---- bundle commands ---------------------------------------------------------
+
+test('bundle commands are store-free, JSON-only, and round-trip the golden fixture', () => {
+  const source = join(import.meta.dirname, 'fixtures', 'bundle', 'golden-source');
+  const { run, home } = makeCli({ setDbEnv: false });
+  const bundlePath = join(home, 'golden.wnlp');
+  const unpacked = join(home, 'unpacked');
+
+  const packed = run('bundle', 'pack', source, '--output', bundlePath);
+  assert.equal(packed.code, 0, packed.err);
+  assert.equal(packed.err, '');
+  assert.equal(existsSync(bundlePath), true);
+  assert.equal(existsSync(join(home, '.owenloop')), false);
+  assert.equal(packed.json().digest, '0c8910982369705203ad87c402f0e7854fd5cc9725af053e11d32f2ac09c61ab');
+
+  const inspected = run('bundle', 'inspect', bundlePath);
+  assert.equal(inspected.code, 0, inspected.err);
+  assert.equal(inspected.err, '');
+  assert.equal(inspected.json().digest, packed.json().digest);
+  assert.equal(run('bundle', 'digest', bundlePath).json().digest, packed.json().digest);
+
+  const extracted = run('bundle', 'unpack', bundlePath, unpacked);
+  assert.equal(extracted.code, 0, extracted.err);
+  assert.equal(existsSync(join(unpacked, 'workflow.yaml')), true);
+  assert.equal(existsSync(join(home, '.owenloop')), false);
+});
+
+test('bundle CLI rejects malformed subcommand arguments before side effects', () => {
+  const source = join(import.meta.dirname, 'fixtures', 'bundle', 'golden-source');
+  const { run, home } = makeCli({ setDbEnv: false });
+  for (const argv of [
+    ['bundle', 'inspect'],
+    ['bundle', 'inspect', 'missing.wnlp', 'extra'],
+    ['bundle', 'digest', 'missing.wnlp', '--output', 'x'],
+    ['bundle', 'pack', source, '--output'],
+    ['bundle', 'pack', source, join(source, 'inside.wnlp')],
+  ]) {
+    const result = run(...argv);
+    assert.equal(result.code, 1, argv.join(' '));
+    assert.equal(existsSync(join(home, '.owenloop')), false, argv.join(' '));
+  }
+});

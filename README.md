@@ -388,6 +388,31 @@ variables, no CLI verbs to memorize. The same package also includes the
 execution-side companion; use `owenloop work <subcommand>` for lower-level
 execution tasks. There is no separate `owenwork` package or binary.
 
+### Deterministic workflow bundles
+
+A workflow and its referenced regular files can be packaged as one deterministic
+`.wnlp` file. The package format uses a canonical POSIX/PAX tar stream wrapped
+in gzip; the package digest is SHA-256 over the exact uncompressed canonical
+tar, not over the gzip bytes. `bundle.yaml` carries package identity, platform
+selectors, requested capabilities, generated per-file SHA-256 values, and
+namespace-qualified, digest-pinned `calls:` references. `workflow.yaml` remains
+the only execution definition.
+
+```sh
+owenloop bundle pack ./report --output ./report-1.2.0.wnlp
+owenloop bundle inspect ./report-1.2.0.wnlp
+owenloop bundle digest ./report-1.2.0.wnlp
+owenloop bundle unpack ./report-1.2.0.wnlp ./unpacked-report
+```
+
+Bundle commands are filesystem-only: they do not open or create the local
+`.owenloop/state.db` and do not contact a remote service. Packing never edits
+the source manifest. Inspection and unpacking reject unsafe paths, symlinks,
+unsupported archive entry types, malformed canonical headers, duplicate files,
+invalid manifests, workflow/manifest name mismatches, missing lock entries, and
+integrity mismatches before files are written. See the [bundle format
+reference](docs/bundles.md) and the [CLI bundle commands](docs/cli.md#bundles).
+
 For a foreground local shift, start the daemon in one terminal. Run the client
 commands from another terminal:
 

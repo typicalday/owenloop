@@ -1,0 +1,1 @@
+Notes in UTF-8: café, 日本語, emoji 📦 — golden fixture.

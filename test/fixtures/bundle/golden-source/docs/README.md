@@ -1,0 +1,1 @@
+Golden bundle fixture readme.

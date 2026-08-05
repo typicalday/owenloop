@@ -1,0 +1,55 @@
+{
+  "digest": "0c8910982369705203ad87c402f0e7854fd5cc9725af053e11d32f2ac09c61ab",
+  "name": "golden-bundle",
+  "version": "1.0.0",
+  "entries": [
+    {
+      "path": "assets/binary.bin",
+      "size": 256,
+      "executable": false,
+      "sha256": "40aff2e9d2d8922e47afd4648e6967497158785fbd1da870e7110266bf944880"
+    },
+    {
+      "path": "assets/notes.txt",
+      "size": 65,
+      "executable": false,
+      "sha256": "3af160d0f5e1a54956de72416c9239082a1723fa22f2adb872a704b28bed9bef"
+    },
+    {
+      "path": "assets/very-long-directory-name-that-pushes-the-archive-path-past-one-hundred-bytes-to-require-a-pax-header/deeply-nested-file.txt",
+      "size": 115,
+      "executable": false,
+      "sha256": "d93d191fb110f11b1be4a61a412d286bbecf68ba8b3ff25fa83458dc39ca67e8"
+    },
+    {
+      "path": "bundle.yaml",
+      "size": 1023,
+      "executable": false,
+      "sha256": "01a946fcbd9ebbe82dda4f5a6026191ad3f62d319f3efe0b6ad4fea9080586c7"
+    },
+    {
+      "path": "docs/README.md",
+      "size": 30,
+      "executable": false,
+      "sha256": "6e558ec124b3f60032335694f39758540566efe13a15a112b430d720515a186f"
+    },
+    {
+      "path": "instructions/build.md",
+      "size": 200,
+      "executable": false,
+      "sha256": "36e587eb3c99783b7c27a7a6a7c693edfe9809b28610b8f9c1b767816d51a49a"
+    },
+    {
+      "path": "scripts/run.sh",
+      "size": 86,
+      "executable": true,
+      "sha256": "7193cf030d6678ad993b8773a498bf9c2536f598fbb650e27f8f2e8a3ffeb7be"
+    },
+    {
+      "path": "workflow.yaml",
+      "size": 472,
+      "executable": false,
+      "sha256": "ab004f5fb0f56c9008f0b92b55c4354fa85e62ef6c91a9148760c2c6158b3960"
+    }
+  ]
+}

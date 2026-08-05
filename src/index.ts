@@ -199,6 +199,22 @@ export {
 export { assertValidSchema, summarizeIssues, validateValue } from './schema.ts';
 export type { SchemaCheck, SchemaIssue } from './schema.ts';
 
+// Deterministic `.wnlp` bundle format (WP-A1) — the HIGH-LEVEL API only:
+// pack/inspect/digest/unpack plus result/manifest types, limits/options, and
+// typed errors. Low-level tar builders and add install primitives are
+// deliberately NOT exported through this surface (see docs/bundles.md).
+export { BundleError, DEFAULT_BUNDLE_LIMITS, digestBundle, inspectBundle, packBundle, unpackBundle } from './bundle/index.ts';
+export type {
+  BundleEntryInfo,
+  BundleErrorCode,
+  BundleLimits,
+  BundleManifest,
+  InspectOptions,
+  InspectResult,
+  PackOptions,
+  PackResult,
+} from './bundle/index.ts';
+
 export { DEBT_STATES, SETTLED_STATES } from './types.ts';
 export type {
   Acceptance,

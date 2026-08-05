@@ -1,0 +1,22 @@
+# Golden-bundle source manifest.
+#
+# The integrity map below is DELIBERATELY stale (all-zero digests): pack must
+# regenerate it from the actual file bytes without touching this source file.
+formatVersion: 1
+package:
+  name: golden-bundle
+  version: 1.0.0
+entrypoint: workflow.yaml
+platforms:
+  - linux-amd64
+  - darwin-arm64
+integrity:
+  algorithm: sha256
+  files:
+    workflow.yaml: "0000000000000000000000000000000000000000000000000000000000000000"
+capabilities:
+  commands:
+    - git
+  network:
+    - api.example.com
+lock: {}

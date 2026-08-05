@@ -46,6 +46,10 @@ for the full breakdown.
 | `add <owner>/<repo>[@ref]` | fetch, validate, and install a repo's workflow defs from GitHub (public repos only) — see below |
 | `add <bundle.wnlp \| https://url> [--global]` | install a workflow bundle into the content-addressed store — project store under the defs dir by default, `<home>/.owenloop/workflows` with `--global` — see below |
 | `add --recover [--global]` | finish or undo a crash-interrupted install, offline — no network call (`--global` recovers the global store) — see below |
+| `bundle pack <source-dir> [--output <bundle.wnlp>]` | create a deterministic `.wnlp` package without opening the local store — see [Bundles](#bundles) |
+| `bundle unpack <bundle.wnlp> <destination-dir>` | strictly validate and atomically extract a `.wnlp` package — see [Bundles](#bundles) |
+| `bundle inspect <bundle.wnlp>` | strictly validate a `.wnlp` package and print its manifest and file metadata — see [Bundles](#bundles) |
+| `bundle digest <bundle.wnlp>` | print the SHA-256 digest of the uncompressed canonical tar — see [Bundles](#bundles) |
 | `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
@@ -83,6 +87,45 @@ for the full breakdown.
 | `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed job |
 | `delete <wf>` | delete an instance and all its rows |
 | `adopt <wf>` | re-pin an instance to the current definition and settle any new debts |
+
+## Bundles
+
+Bundle commands are deliberately dispatched before the CLI opens the engine
+store. `bundle pack`, `bundle inspect`, `bundle digest`, and `bundle unpack`
+read or write only the paths named by the command; they do not create
+`.owenloop/state.db`, contact a remote coordinator, or use workflow definitions
+from `--defs`. Successful commands print one JSON object on stdout. Failures
+print a diagnostic on stderr and exit nonzero.
+
+```text
+owenloop bundle pack <source-dir> [--output <bundle.wnlp>]
+owenloop bundle unpack <bundle.wnlp> <destination-dir>
+owenloop bundle inspect <bundle.wnlp>
+owenloop bundle digest <bundle.wnlp>
+```
+
+`pack` requires a source directory containing root `bundle.yaml` and
+`workflow.yaml`. The source manifest is not modified. If `--output` is omitted,
+the output is `<package-name>-<version>.wnlp` next to the source directory. An
+explicit output path must be outside the source directory. A regular file at
+the output path may be replaced; a directory or other non-regular path is
+rejected.
+
+`inspect` performs bounded gzip inflation, strict POSIX/PAX tar validation,
+manifest validation, workflow validation, lock coverage checks, and per-file
+integrity checks without extracting files. `digest` performs bounded inflation
+and returns the lowercase SHA-256 of the exact uncompressed canonical tar; the
+gzip wrapper bytes are not the identity.
+
+`unpack` performs the complete `inspect` validation before creating anything.
+The destination must be absent. Files are written into a fresh sibling staging
+directory and the staging directory is renamed into place only after all files
+are written. Existing symlinked destination ancestors are rejected.
+
+The manifest and archive rules are documented in
+[`docs/bundles.md`](bundles.md). The public in-process equivalents are
+`packBundle`, `inspectBundle`, `digestBundle`, and `unpackBundle` from the
+package barrel.
 
 ## `shift` — foreground daemon and client
 

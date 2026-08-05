@@ -240,3 +240,111 @@ export function makeGithubTarball(rootPrefix: string, files: Record<string, stri
   blocks.push(Buffer.alloc(BLOCK * 2)); // two all-zero blocks mark end of archive
   return gzipSync(Buffer.concat(blocks));
 }
+
+// ---- hostile/canonical USTAR fixture builder (for test/bundle.test.ts) ------
+//
+// A second from-scratch tar writer, this one able to emit ARBITRARY (including
+// malformed) headers: any typeflag, modes, uid/gid, uname/gname, mtime, pax
+// records (well-formed or corrupt), duplicate paths, truncated entries, and
+// arbitrary trailing bytes. It is deliberately independent of BOTH the
+// production bundle writer (src/bundle/tar.ts) and the reader
+// (src/archive.ts): hostile-corpus tests must exercise the reader against an
+// implementation it shares no code with.
+
+export interface HostileHeaderOpts {
+  name?: string;
+  size?: number;
+  typeflag?: string;
+  mode?: number;
+  uid?: number;
+  gid?: number;
+  uname?: string;
+  gname?: string;
+  linkname?: string;
+  mtime?: number;
+  /** Corrupt the header AFTER the checksum is computed (for checksum tests). */
+  mutate?: (buf: Buffer) => void;
+  /** Overwrite an octal field with non-octal bytes (then recompute checksum). */
+  badOctalField?: { offset: number; bytes: string };
+}
+
+/** Build one arbitrary 512-byte USTAR header block (full field control). */
+export function hostileHeader(opts: HostileHeaderOpts): Buffer {
+  const buf = Buffer.alloc(BLOCK);
+  const name = opts.name ?? '';
+  buf.write(name, 0, Math.min(Buffer.byteLength(name, 'utf8'), 100), 'utf8');
+  buf.write(octalField(opts.mode ?? 0o644, 8), 100, 'ascii');
+  buf.write(octalField(opts.uid ?? 0, 8), 108, 'ascii');
+  buf.write(octalField(opts.gid ?? 0, 8), 116, 'ascii');
+  buf.write(octalField(opts.size ?? 0, 12), 124, 'ascii');
+  buf.write(octalField(opts.mtime ?? 0, 12), 136, 'ascii');
+  buf.fill(0x20, 148, 156);
+  buf[156] = (opts.typeflag ?? '0').charCodeAt(0);
+  buf.write('ustar', 257, 'ascii');
+  buf[262] = 0;
+  buf.write('00', 263, 2, 'ascii');
+  if (opts.uname) buf.write(opts.uname, 265, 'utf8');
+  if (opts.gname) buf.write(opts.gname, 297, 'utf8');
+  if (opts.linkname) buf.write(opts.linkname, 157, 'utf8');
+
+  if (opts.badOctalField) {
+    buf.write(opts.badOctalField.bytes, opts.badOctalField.offset, 'ascii');
+  }
+
+  let sum = 0;
+  for (let i = 0; i < BLOCK; i++) sum += buf[i] as number;
+  // Tar checksums use six octal digits, then NUL and space. `octalField`'s
+  // length includes its trailing NUL, so width 7 yields the six-digit field.
+  buf.write(octalField(sum, 7) + ' ', 148, 'ascii');
+
+  if (opts.mutate) opts.mutate(buf);
+  return buf;
+}
+
+/** Pad `data` to a 512-byte boundary (empty content -> empty buffer). */
+export function hostileData(data: Uint8Array): Buffer {
+  return padTo512(Buffer.from(data));
+}
+
+export interface HostileTarballOpts {
+  /** Append raw bytes AFTER the terminator blocks. */
+  trailing?: Uint8Array;
+  /** Emit only ONE zero block instead of two (or none: 'missing'). */
+  terminator?: 'two' | 'one' | 'missing';
+}
+
+/**
+ * Assemble blocks into a gzip stream. By default appends the canonical
+ * two-zero-block terminator (see `terminator`).
+ */
+export function hostileTarball(blocks: Buffer[], opts: HostileTarballOpts = {}): Buffer {
+  const all = [...blocks];
+  if ((opts.terminator ?? 'two') === 'two') all.push(Buffer.alloc(BLOCK * 2));
+  else if (opts.terminator === 'one') all.push(Buffer.alloc(BLOCK));
+  if (opts.trailing) all.push(Buffer.from(opts.trailing));
+  return gzipSync(Buffer.concat(all));
+}
+
+/** One canonical-shaped regular-file entry (mode 0644, zeros everywhere). */
+export function hostileFileEntry(name: string, content: Uint8Array | string, extra: HostileHeaderOpts = {}): Buffer[] {
+  const data = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
+  return [hostileHeader({ name, size: data.length, typeflag: '0', ...extra }), hostileData(data)];
+}
+
+/** One pax extended-header block pair with caller-controlled data bytes. */
+export function hostilePaxBlocks(name: string, paxData: Uint8Array, extra: HostileHeaderOpts = {}): Buffer[] {
+  return [hostileHeader({ name, size: paxData.length, typeflag: 'x', ...extra }), hostileData(paxData)];
+}
+
+/** The canonical single-record pax payload: `"<len> path=<value>\n"`. */
+export function hostilePaxPathRecord(path: string): Buffer {
+  const valueBytes = Buffer.byteLength(path, 'utf8');
+  const suffixLen = 1 + 'path='.length + valueBytes + 1;
+  let digits = String(suffixLen).length;
+  let total = digits + suffixLen;
+  while (String(total).length !== digits) {
+    digits = String(total).length;
+    total = digits + suffixLen;
+  }
+  return Buffer.from(`${total} path=${path}\n`, 'utf8');
+}
