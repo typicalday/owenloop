@@ -382,8 +382,10 @@ have a def? *"Conduct the report workflow"* hands it to
 [`owenloop-conduct`](skills/owenloop-conduct/SKILL.md). The engine itself is the
 `owenloop` CLI (Node ≥ 22.13 required). Install the package so `owenloop` is on
 `PATH`; the shipped Claude Code and Codex plugins launch that same command as
-`owenloop mcp`, rather than using a separate npx-pinned server. For one-off
-shell use, `npx owenloop` still works — no clone, no build, no environment
+`owenloop mcp`, rather than using a separate npx-pinned server. The plugins
+check the installed CLI/plugin version pair at session start when their hooks
+are enabled, and the MCP server reports a readable mismatch error on tool calls; run `owenloop setup` when the versions differ. For one-off shell
+use, `npx owenloop` still works — no clone, no build, no environment
 variables, no CLI verbs to memorize. The same package also includes the
 execution-side companion; use `owenloop work <subcommand>` for lower-level
 execution tasks. There is no separate `owenwork` package or binary.

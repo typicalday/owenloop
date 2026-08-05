@@ -156,6 +156,15 @@ const MCP_MANIFESTS = [
   },
 ] as const;
 
+test('both .mcp.json plugin versions equal the package.json version (§7 check 9)', () => {
+  const pkg = readJson('package.json') as { version: string };
+  for (const { harness, config } of MCP_MANIFESTS) {
+    const owenloop = config.mcpServers['owenloop']!;
+    const env = owenloop['env'] as Record<string, unknown>;
+    assert.equal(env['OWENLOOP_PLUGIN_VERSION'], pkg.version, `${harness} plugin version`);
+  }
+});
+
 /**
  * Both harnesses expose one PATH-resolved `owenloop mcp` entry. The Claude Code
  * manifest is stdio-shaped; Codex adds its environment-name allowlist. The
@@ -171,14 +180,25 @@ for (const { harness, config } of MCP_MANIFESTS) {
   });
 }
 
-test('Claude Code .mcp.json owenloop entry uses the PATH CLI, no url/headers/env (INV-38)', () => {
+test('Claude Code .mcp.json owenloop entry uses the PATH CLI and only the plugin version env (INV-38)', () => {
   const owenloop = MCP_MANIFESTS[0]!.config.mcpServers['owenloop']!;
   assert.equal(owenloop['type'], 'stdio');
   assert.equal(owenloop['command'], 'owenloop');
   assert.deepEqual(owenloop['args'], ['mcp']);
   assert.equal(owenloop['url'], undefined);
   assert.equal(owenloop['headers'], undefined);
-  assert.equal(owenloop['env'], undefined);
+  assert.deepEqual(Object.keys(owenloop['env'] as Record<string, unknown>), ['OWENLOOP_PLUGIN_VERSION']);
+});
+
+test('both .mcp.json owenloop entries expose exactly the plugin version env key', () => {
+  for (const { harness, config } of MCP_MANIFESTS) {
+    const owenloop = config.mcpServers['owenloop']!;
+    assert.deepEqual(
+      Object.keys(owenloop['env'] as Record<string, unknown>),
+      ['OWENLOOP_PLUGIN_VERSION'],
+      `${harness} env keys`,
+    );
+  }
 });
 
 for (const { harness, raw } of MCP_MANIFESTS) {
@@ -271,11 +291,11 @@ const HOOKS = readJson('plugins/claude-code/plugin/hooks/hooks.json') as {
   hooks: Record<string, Array<{ hooks: Array<{ type: string; command: string }> }>>;
 };
 
-test('hooks/hooks.json declares only the SessionEnd event', () => {
-  // SessionStart is retired: its sole action was `mkdir -p` on the agents
-  // dir the deleted session dispatcher stamped per-order agent files into, and
-  // nothing writes there any more.
-  assert.deepEqual(new Set(Object.keys(HOOKS.hooks)), new Set(['SessionEnd']));
+test('hooks/hooks.json declares exactly the SessionStart and SessionEnd events', () => {
+  // The old SessionStart was retired because its sole action was `mkdir -p` on
+  // the agents dir for a deleted session dispatcher. This SessionStart is new,
+  // with a different purpose: checking the CLI/plugin version relationship.
+  assert.deepEqual(new Set(Object.keys(HOOKS.hooks)), new Set(['SessionStart', 'SessionEnd']));
 });
 
 test('hooks/hooks.json commands are plugin-root-relative executable scripts', () => {
@@ -301,7 +321,7 @@ test('hooks/hooks.json commands are plugin-root-relative executable scripts', ()
   }
 });
 
-for (const script of ['session-end.sh']) {
+for (const script of ['session-end.sh', 'session-start.sh']) {
   test(`hook script ${script} has no personal path or token literal`, () => {
     const content = readText(`plugins/claude-code/plugin/hooks/${script}`);
     assert.ok(!((content)).includes('/Users/'));
