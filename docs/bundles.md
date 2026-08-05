@@ -215,4 +215,5 @@ tar -tzf ./report-1.2.0.wnlp
 
 The digest printed by `owenloop bundle digest` is stable across gzip metadata,
 operating-system, and filesystem timestamp differences when the canonical file
-bytes and executable-bit choices are unchanged.
+bytes and executable-bit choices are unchanged. CI recomputes a checked-in
+golden vector on both Ubuntu and macOS to guard this cross-platform stability.
