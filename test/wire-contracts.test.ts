@@ -183,6 +183,11 @@ function assertClosedObjects(schema: unknown, pointer: string): void {
     const exempt = OPEN_OBJECT_POINTERS.has(pointer);
     if (!exempt) {
       assert.equal(node.additionalProperties, false, `${pointer} must close additional properties`);
+      assert.equal(
+        node.patternProperties,
+        undefined,
+        `${pointer} must not define patternProperties on a closed object`,
+      );
     } else {
       assert.notEqual(node.additionalProperties, false, `${pointer} is an explicitly open map`);
     }
@@ -277,6 +282,21 @@ test('nested wire shapes are pinned by the same manifests', () => {
 
 test('all object schemas close fields except named open maps', () => {
   for (const contract of contracts) assertClosedObjects(contract.schema, '#');
+});
+
+test('closed object schemas reject patternProperties', () => {
+  assert.throws(
+    () =>
+      assertClosedObjects(
+        {
+          type: 'object',
+          additionalProperties: false,
+          patternProperties: { '^secret_': { type: 'string' } },
+        },
+        '#',
+      ),
+    /patternProperties/,
+  );
 });
 
 for (const contract of contracts) {

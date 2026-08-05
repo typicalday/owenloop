@@ -14,7 +14,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Features
 
-* freeze versioned wire records, JSON Schemas, and DSSE contract drift checks
 * add durable shift daemon ([#92](https://github.com/typicalday/owenloop/issues/92)) ([2c68808](https://github.com/typicalday/owenloop/commit/2c6880891d904067071904a3cfda8461ffc2587d))
 * **cli,mcp:** selectable scopes for agent-identity minting ([#83](https://github.com/typicalday/owenloop/issues/83)) ([f9b7a55](https://github.com/typicalday/owenloop/commit/f9b7a559e9ab8f27bdaf15cf26dd6dcc8968c6a4))
 * **cli:** fold owenwork execution CLI into owenloop work ([#91](https://github.com/typicalday/owenloop/issues/91)) ([1ed865a](https://github.com/typicalday/owenloop/commit/1ed865ae6d03cbb176d81e26f2ecce60a5cebd1c))
