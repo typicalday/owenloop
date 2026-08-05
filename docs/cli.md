@@ -548,11 +548,13 @@ bundle's identity. Identity comes from the bundle's own
 Bundle ingestion (unpacking, manifest integrity, canonical digest,
 coordinate) and pre-commit verification are separate modules with no
 permissive fallback: with either adapter missing, `add` refuses with a named
-error before any staging, journal, or index write. The default CLI now binds the
-real bundle ingestor; the pre-commit verifier remains unbound, so the default
-CLI still fails closed rather than accepting an unverified bundle. Hosts that
-provide both adapters can install real `.wnlp` output from `packBundle`.
-Publishing from this engine does not sign a bundle.
+error before any staging, journal, or index write. The default CLI binds the
+real bundle ingestor, but the pre-commit verifier remains unbound, so the default
+CLI fails closed rather than accepting an unverified bundle. There is no default
+accepting signature verifier. The `add` route does not consume publication
+sidecars or verify a bundle's signature. Hosts that provide both adapters can
+install real `.wnlp` output from `packBundle`; use the `publish` command to
+create the `.wnlp` bundle plus a signed or explicitly unsigned sidecar.
 
 ### The two store roots
 
@@ -956,9 +958,9 @@ owenloop publish <source-dir> [--output <bundle.wnlp>] [--unsigned]
 
 `publish` is separate from both [`bundle pack`](#bundles) and [`push`](#push--publish-local-defs-to-the-bound-hub). It packs one source directory with the same deterministic `packBundle` implementation as `bundle pack`, then publishes the bundle beside a local publication sidecar. The command requires the project to be bound with `owenloop connect`, because the binding supplies the hub origin used to select the local author key.
 
-Signed publication is the default. In signed mode, `publish` requires the human principal signing key for the bound hub. Run `owenloop setup` before the first signed publication. Older key stores that already contain the key are repaired by that setup run: `ensure` writes the non-secret `<hash>.ref` pointer on its existing-key branch without regenerating or replacing the private key. If no author key is discoverable, `publish` fails and suggests `owenloop setup` or the explicit unsigned mode; the command does not silently downgrade to unsigned output.
+Signed publication is the default. In signed mode, `publish` requires the human principal signing key for the bound hub. Run `owenloop setup` before the first signed publication. `publish` never creates or repairs a signing key: an older key store that already contains the key but lacks the non-secret `<hash>.ref` pointer must be repaired by a setup run, whose `ensure` step backfills the pointer without regenerating or replacing the private key. If the author-key reference or key record is missing, `publish` fails and suggests `owenloop setup` or the explicit unsigned mode; the command does not silently downgrade to unsigned output.
 
-The signer is probed and the publication record is signed before the bundle or either sidecar is written. The signature covers a DSSE publication record whose `digest` is the lowercase SHA-256 digest of the uncompressed canonical tar inside the `.wnlp` file. The remote hub is not involved in this local signing operation and never produces or completes the signature.
+In signed mode, `publish` confirms the existing key, probes the signer, and signs the publication record before `packBundle` runs or any bundle or sidecar is written. A signing failure therefore leaves no half-published artifact. The signature covers a DSSE publication record whose `digest` is the lowercase SHA-256 digest of the uncompressed canonical tar inside the `.wnlp` file. The remote hub is not involved in this local signing operation and never produces or completes the signature.
 
 `--unsigned` is an explicit opt-in. Unsigned mode still packs the canonical bundle, but writes an unauthenticated author-intent marker rather than a DSSE envelope. Anyone can write such a marker; consumers must treat missing or unverifiable signatures as unsigned regardless of whether the marker is present. The two sidecars are mutually exclusive:
 

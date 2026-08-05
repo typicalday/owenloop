@@ -121,10 +121,11 @@ project's bound hub origin. The signing chain is deliberately narrow:
 
 1. `resolveRef(origin, 'human')` discovers the non-secret principal reference
    from the local `<hash>.ref` pointer.
-2. `ensure(ref)` confirms the stored key and returns only its public descriptor,
-   including the `publisherKeyId` fingerprint. During setup, an older key
-   record created before ref pointers existed is backfilled without changing
-   the existing key.
+2. `inspect(ref)` read-only-confirms that setup already stored the key and
+   returns only its public descriptor, including the `publisherKeyId`
+   fingerprint. `publish` never calls `ensure`: publishing never creates or
+   repairs a signing key. During setup, an older key record created before ref
+   pointers existed is backfilled without changing the existing key.
 3. `withSigningKey(ref, callback)` materializes the private key only for the
    callback's controlled lifetime.
 4. `createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath })` probes and
