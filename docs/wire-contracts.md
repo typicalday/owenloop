@@ -147,9 +147,12 @@ Payload type: `application/vnd.owenloop.policy-floor.v1+json`.
 | `floor` | yes | Normative minimum settings. |
 | `preset` | no | Optional `L0`, `L1`, or `L2` label. |
 
-`floor` always carries the four normative axes:
+`floor` always carries the four normative axes. `trustMode` is a frozen wire
+value; this package carries the value but does not evaluate trust-mode behavior.
+The exact accepted literals are pinned in
+`src/schemas/policy-floor.v1.schema.json`. The other three axes use these
+literals:
 
-- `trustMode`: `seamless`, `strict`, or `paranoid`;
 - `unsignedDefs`: `warn` or `refuse`;
 - `unsignedArtifacts`: `warn` or `refuse`;
 - `originRules`: `advisory` or `enforced`.
