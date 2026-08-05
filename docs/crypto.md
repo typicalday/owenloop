@@ -7,11 +7,13 @@ suites, and interoperates with stock OpenSSH `ssh-keygen` on macOS and Linux CI.
 
 ## Why stock OpenSSH, not a JS signature library
 
-Signatures are produced and verified by **shelling out to stock `ssh-keygen
--Y`** (`sign` and `verify`), not by a JavaScript crypto library. The signer also
-uses stock `ssh-keygen -y` to derive the public half of a private key, and the
-feature probe invokes a harmless `-Y` command through the same process seam.
-Three reasons:
+Signatures are produced and verified by **stock `ssh-keygen -Y`** (`sign` and
+`verify`), not by a JavaScript crypto library. Every invocation uses
+`shell: false` with an argument vector, through an injected process seam. The
+signer also uses stock `ssh-keygen -y` to derive the public half of a private
+key, and the feature probe invokes a harmless `-Y` command through the same
+seam. Callers depend on the format-neutral `Signer` interface rather than on
+this OpenSSH implementation. Three reasons:
 
 1. **Format neutrality for free.** SSHSIG's armored format, namespace binding,
    and `allowed_signers` policy are implemented by OpenSSH itself; delegating
@@ -29,6 +31,10 @@ Three reasons:
    and every mainstream Linux distro). When it is absent, crypto features fail
    loudly instead of silently degrading; the test suites skip interop cases
    with a named reason.
+
+Private key bytes never appear in a repository, process arguments, stdout,
+stderr, logs, thrown errors, or test snapshots. No public API returns a private
+key; APIs return public descriptors or short-lived filesystem paths only.
 
 The trade-off: every sign/verify spawns a child process (tens of
 milliseconds). That is acceptable for the trust-surface call rates this layer
@@ -79,8 +85,11 @@ principal — a shadow identity. Selection:
    forced to `0700`; symlinked or non-directory paths are refused.
 
 `OWENLOOP_NO_KEYCHAIN=1` forces the file backend on any platform — the same
-explicit override the credential store honors. A failing backend produces a
-fixed `signing-key storage (<backend>) failed: …` error and setup stops.
+explicit override the credential store honors. A `secret-tool lookup` exit
+status of `1` means that the item is not found, not that libsecret failed; any
+other nonzero lookup status is a backend failure. A failing selected backend
+produces a fixed `signing-key storage (<backend>) failed: …` error and setup
+stops. The manager does not error-fallback to another backend.
 
 **Secrets never ride on argv or pipes.** Store writes pass the record on child
 **stdin**; lookups redirect the secret-bearing stdout straight into a
@@ -131,14 +140,18 @@ Records that cross a trust boundary are wrapped in [DSSE](https://github.com/sec
 envelopes. The pre-auth encoding the signature covers:
 
 ```
-"DSSEv1" SP LEN(type) SP type SP LEN(payload) SP payload
+DSSEv1 SP len(typeBytes) SP typeBytes SP len(payloadBytes) SP payloadBytes
 ```
 
-(lengths are decimal byte counts of the UTF-8/binary fields). Base64 on the
+`typeBytes` is the UTF-8 encoding of the payload type; `payloadBytes` is the
+exact binary payload. Both lengths are ASCII decimal byte counts. Base64 on the
 wire is decoded strictly — standard **and** URL-safe alphabets accepted,
 malformed input rejected — because Node's built-in decoder is permissive.
+SSHSIG signs and verifies this encoding under the namespace
+`owenloop-dsse-v1` (`DSSE_SSH_NAMESPACE`).
 
-Five versioned payload types, one per signed record class:
+Exactly five record classes are supported, each bound to one versioned
+payload-type constant:
 
 | constant | value |
 |---|---|
@@ -148,15 +161,20 @@ Five versioned payload types, one per signed record class:
 | `PAYLOAD_TYPE_POLICY_FLOOR` | `application/vnd.owenloop.policy-floor.v1+json` |
 | `PAYLOAD_TYPE_ORIGIN` | `application/vnd.owenloop.origin.v1+json` |
 
+`DSSE_RECORD_PAYLOAD_TYPES` is the frozen, exported runtime allow-list, and
+`isDsseRecordPayloadType` is the exported guard. The generic
+`dsseSignRecord` and `dsseVerifyRecord` wrappers apply that allow-list at
+runtime: an arbitrary payload-type string, including an empty string or a
+v2/attacker value, is rejected rather than accepted only by the TypeScript
+union. The five fixed record wrappers use their own constants.
+
 `dsseVerifyEnvelope` runs a fixed order — Base64 decode → PAE → signature
 verification → payload-type check — and returns the payload bytes **exactly**.
-A cryptographic miss throws `DsseEnvelopeError`; the verifier never returns an
-empty payload that could be mistaken for a successfully verified empty payload.
-Malformed shapes also throw `DsseEnvelopeError`. Duplicate signatures from the
-same trusted key count once; a `threshold` option requires that many distinct
-signers.
-SSHSIG signatures are produced and verified under the namespace
-`owenloop-dsse-v1` (`DSSE_SSH_NAMESPACE`).
+A failed verification throws `DsseEnvelopeError`; a successful verification of
+an empty payload returns a result with `payloadBytes.length === 0` and verified
+signers, so the two outcomes are unambiguous. Malformed shapes also throw
+`DsseEnvelopeError`. Duplicate signatures from the same trusted key count once;
+a `threshold` option requires that many distinct signers.
 
 ## The role of `allowed_signers`
 
@@ -173,8 +191,29 @@ key blob and do not affect option parsing. The parser never throws: malformed
 lines come back with their line numbers alongside the well-formed entries. It
 deliberately does **not** implement OpenSSH pattern matching or authorization —
 `ssh-keygen -Y verify` remains the policy authority, and accepted policy text is
-fed back to it unchanged. `SshSigner` accepts mixed policy files and restricts
-the actual key embedded in the verified signature to Ed25519.
+fed back to it unchanged.
+
+The Ed25519 rule applies to the key actually used for the operation, not to
+every entry in the policy file. `SshSigner.sign` refuses a non-Ed25519 signing
+key. During verification, OpenSSH may select an Ed25519, RSA, or ECDSA entry
+from a mixed `allowed_signers` policy; `SshSigner` accepts the policy file but
+refuses a successful verification when the key embedded in the verified
+signature is not Ed25519. The policy file is not globally restricted to
+Ed25519 entries.
+
+### Known parser differences from stock OpenSSH
+
+`parseAllowedSigners` is line-tolerant, but `SshSigner.verify` currently
+rejects the **entire** policy file when any line produces a parse error (or when
+no entries parse). Stock OpenSSH skips an unparseable line and continues with
+other lines. This is a known pre-existing divergence, including realistic
+`touch-required` and `verify-required` option lines; the line-tolerant parser
+result must not be read as equivalent to successful `SshSigner` verification.
+
+The structural parser also does not cross-check the declared key type against
+the key type embedded in the Base64 public-key blob. Parsed `principals` retain
+literal surrounding quotes where stock OpenSSH strips them. These fields are
+structural output only; OpenSSH remains the authorization authority.
 
 ## Out of scope (future work)
 
