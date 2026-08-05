@@ -7,10 +7,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
-import { PrincipalKeyManager } from '../src/crypto/keys.ts';
+import { canonicalKeyRef, keyRefHash, keysDirFor, PrincipalKeyManager } from '../src/crypto/keys.ts';
 import { DSSE_SSH_NAMESPACE, dsseVerifyPublication } from '../src/crypto/dsse.ts';
 import { createSshSigner } from '../src/crypto/ssh.ts';
 import { digestBundle } from '../src/bundle/index.ts';
@@ -86,6 +86,55 @@ test('publish: signed default refuses missing author key and names setup and --u
   assert.match(t.err.join('\n'), /no author signing key/);
   assert.match(t.err.join('\n'), /owenloop setup/);
   assert.match(t.err.join('\n'), /--unsigned/);
+  assert.equal(existsSync(output), false);
+  assert.equal(existsSync(`${output}.dsse`), false);
+  assert.equal(existsSync(`${output}.unsigned`), false);
+});
+
+test('publish: a planted ref without a key record fails without minting or writing', async () => {
+  const t = makeIo({ principalKeys: 'real', env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  const source = sourceFor(t);
+  bind(t);
+  const output = join(t.cwd, 'published.wnlp');
+  const keysDir = keysDirFor(t.home);
+  const pointer = join(keysDir, `${keyRefHash(HUMAN_REF)}.ref`);
+  mkdirSync(keysDir, { recursive: true, mode: 0o700 });
+  writeFileSync(pointer, canonicalKeyRef(HUMAN_REF), { mode: 0o600 });
+  const before = filesUnder(t.cwd);
+
+  const code = await mainAsync(['publish', source, '--output', output], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\\n'), /no author signing key/);
+  assert.match(t.err.join('\\n'), /owenloop setup/);
+  assert.equal(existsSync(join(keysDir, `${keyRefHash(HUMAN_REF)}.json`)), false);
+  assert.deepEqual(filesUnder(t.cwd), before, 'missing key failed before packing or writing');
+  assert.equal(existsSync(output), false);
+  assert.equal(existsSync(`${output}.dsse`), false);
+  assert.equal(existsSync(`${output}.unsigned`), false);
+  assert.equal(readFileSync(pointer, 'utf8'), canonicalKeyRef(HUMAN_REF));
+});
+
+test('publish: a deleted key record with a surviving ref fails without minting or writing', { skip: SSH_SKIP }, async () => {
+  const t = makeIo({ principalKeys: 'real', env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  const source = sourceFor(t);
+  bind(t);
+  const output = join(t.cwd, 'published.wnlp');
+  const keys = new PrincipalKeyManager({ env: t.io.env });
+  await keys.ensure(HUMAN_REF);
+  const keysDir = keysDirFor(t.home);
+  const record = join(keysDir, `${keyRefHash(HUMAN_REF)}.json`);
+  const pointer = join(keysDir, `${keyRefHash(HUMAN_REF)}.ref`);
+  const pointerText = readFileSync(pointer, 'utf8');
+  rmSync(record);
+  const before = filesUnder(t.cwd);
+
+  const code = await mainAsync(['publish', source, '--output', output], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\\n'), /no author signing key/);
+  assert.match(t.err.join('\\n'), /owenloop setup/);
+  assert.equal(existsSync(record), false, 'publish did not recreate the deleted key record');
+  assert.equal(readFileSync(pointer, 'utf8'), pointerText, 'publish did not alter the surviving pointer');
+  assert.deepEqual(filesUnder(t.cwd), before, 'missing key failed before packing or writing');
   assert.equal(existsSync(output), false);
   assert.equal(existsSync(`${output}.dsse`), false);
   assert.equal(existsSync(`${output}.unsigned`), false);

@@ -234,11 +234,11 @@ export interface CliIO {
    * Injectable so setup tests never reach the developer's real `ssh-keygen`,
    * Keychain, libsecret, SSH agent, or `$HOME` (`makeFakePrincipalKeys` in
    * test/hubkit.ts). Default: a real `PrincipalKeyManager` over `io.env`.
-   * Structurally `Pick<PrincipalKeyManager, 'ensure' | 'withSigningKey' |
+   * Structurally `Pick<PrincipalKeyManager, 'ensure' | 'inspect' | 'withSigningKey' |
    * 'resolveRef'>` — the narrow surface setup and publish use — so fakes stay
    * hermetic.
    */
-  principalKeys?: Pick<PrincipalKeyManager, 'ensure' | 'withSigningKey' | 'resolveRef'>;
+  principalKeys?: Pick<PrincipalKeyManager, 'ensure' | 'inspect' | 'withSigningKey' | 'resolveRef'>;
 }
 
 function defaultIO(): CliIO {
@@ -748,11 +748,14 @@ async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
     if (ref === null) {
       throw new CliError(`no author signing key for ${origin} — run \`owenloop setup\` or pass --unsigned`);
     }
-    // `ensure` is non-secret and returns the public descriptor needed for the
-    // publication record. It also repairs a pointer/record pair created before
-    // the pointer migration, while `withSigningKey` remains the only API that
-    // materializes private bytes.
-    const ensured = await keys.ensure(ref);
+    // `inspect` is read-only: publish must confirm that setup already stored
+    // this key, never create or repair one. `withSigningKey` remains the only
+    // API that materializes private bytes.
+    const inspected = await keys.inspect(ref);
+    if (!inspected.exists || inspected.publicKey === undefined) {
+      throw new CliError(`no author signing key for ${origin} — run \`owenloop setup\` or pass --unsigned`);
+    }
+    const publicKey = inspected.publicKey;
     const signed = await keys.withSigningKey(ref, async (keyPath) => {
       // Constructing the signer probes ssh-keygen -Y before packBundle runs.
       const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: keyPath });
@@ -761,7 +764,7 @@ async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
         digest: nextPacked.digest,
         name: nextPacked.manifest.package.name,
         version: nextPacked.manifest.package.version,
-        publisherKeyId: ensured.publicKey.keyid,
+        publisherKeyId: publicKey.keyid,
         timestamp: nowMs(),
       };
       const payloadBytes = Buffer.from(canonicalJsonBytes(record));
