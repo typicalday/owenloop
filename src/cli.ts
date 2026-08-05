@@ -55,6 +55,7 @@ import {
   validateDef,
 } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
+import { createDefInstructionSource } from './order-resolver.ts';
 import type { CheckReport, WorkflowDef } from './types.ts';
 import { CliError, dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
 import {
@@ -505,11 +506,15 @@ function openCtx(io: CliIO, args: Args): Ctx {
         ? loadDefs(defsDir)
         : new Map<string, WorkflowDef>()
       : loadDefsWithInstalled(io, defsDir);
+  // WP-B1: the CLI ticks reference-mode orders exactly like the embedded
+  // path — one loaded-definition resolver seeds the instruction boundary
+  // (emission digests + instruction resolution), never a second local path.
+  const instructionSource = createDefInstructionSource(defs.values());
   const engine = new Engine(store, (name) => {
     const d = defs.get(name);
     if (!d) throw new CliError(`unknown workflow definition '${name}' (looked in ${defsDir})`);
     return d;
-  });
+  }, { instructionSource });
   return { store, engine, defs, defsDir, dbPath };
 }
 

@@ -130,7 +130,10 @@ test('judges: (a) producer commit lands submitted; both judges approve → green
   const completenessOrder = judgeOrders.find((o) => o.step.endsWith('.completeness'))!;
   const rigorOrder = judgeOrders.find((o) => o.step.endsWith('.rigor'))!;
   assert.deepEqual(completenessOrder.outputs, ['report']);
-  assert.equal(completenessOrder.owes[0]?.acceptance, 'submitted');
+  // Reference mode (WP-B1): the order never mirrors the lifecycle state on
+  // owes[] — the artifact row still reads `submitted`, and the judge's
+  // authored body resolves through the instruction boundary instead.
+  assert.equal(getArt(store, wf, 'report')?.acceptance, 'submitted');
 
   // First judge approves — ledger records one slot, artifact stays submitted.
   const r1 = engine.green(wf, completenessOrder.run, 'report', {});

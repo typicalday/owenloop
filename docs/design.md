@@ -660,7 +660,7 @@ The `M2B-REARM` branch (§23.6.1 step 7 — child un-greened while parent stays 
 
 - **Descent condition.** The parent descends into a child step only when all three hold: (1) the step's **gate is green** (same readiness `maintainCalls` uses to spawn/mirror — see `callsGateReady`), (2) a **child instance exists** (`findChildByParent`), and (3) the parent's `calls:` artifact for that step is specifically **`owed`** — an outstanding producer debt, not merely non-green. `owed` is the sole live debt: it covers the fresh spawn, the F4 propagated-reject reopen (§23.6.8), and a gate-move re-arm. A `skipped`/`rejected`/`retracted` mirror is a dead or refused branch and is **not** descended (issuing child work for it would resurrect a settled decision); a re-armed gate with a still-green mirror, or a step whose child was never spawned, is likewise skipped — descent chases only real, outstanding child work. `callsDescendTargets(parentWf, def)` computes this set.
 - **Own-tx-per-frame.** Descent runs *outside* the parent's transaction (`store.tx` is non-re-entrant — `BEGIN IMMEDIATE` would deadlock on itself). Each child frame opens its own tx via its own `tickInternal` call. The descent condition above is an OPTIMISTIC pre-read (computed outside any tx); the child frame carries the `calls:` edge (`parentEdge`) and, inside its own claim tx, re-verifies the parent gate + child-input consistency — the same predicate `publishCallsGreen` uses — before issuing any order, so a concurrent parent advance that superseded the parent value between the pre-read and the claim issues nothing and skips the subtree. This is the descent-path twin of the in-tx read-verify-write invariant §23.6.6 establishes for the publish/provision paths. The recursion carries a `visited` set so a diamond (two parents reaching the same child) or an accidental cycle ticks each instance at most once.
-- **Aggregation.** Child orders are concatenated onto the parent's; `reaped` sums; `dueAt` takes the minimum across the tree so the caller's next-wake is the earliest across all levels. Each folded `DeferredFiring` carries a `workflow` field naming the instance it belongs to — **absent means the ticked root, present means a descendant** — so a caller can still tell which instance a deferral came from. The single `now` is threaded through the whole descent, so a reap TTL that trips at the parent's clock trips consistently for children in the same sweep.
+- **Aggregation.** Child orders are concatenated onto the parent's; `reaped` sums; `dueAt` takes the minimum across the tree so the caller's next-wake is the earliest across all levels. Each folded `DeferredFiring` carries a `workflow` field naming the instance it belongs to — **absent means the ticked root, present means a descendant** — so a caller can still tell which instance a deferral came from. The single `now` is threaded through the whole descent, so a reap TTL that trips at the parent's clock trips consistently for children in the same sweep. Because the folded order list can contain child orders, a driver must commit and close each order against `order.workflow`, not the root id passed to `tick`. The `{ deep: false }` opt-out is the only case where every order is guaranteed to belong to the requested root.
 - **Opt-out.** `tick(parentWf, { deep: false })` (CLI `--shallow`) ticks only that one instance — no descent, orders all carry the root's `workflow`. Use it to drive a single instance deliberately (tests, targeted retries); the default deep tick is what production drivers want.
 
 **Status child-summary.** `status(parentWf)` enriches each `calls:`-debt entry with a `child: ChildStatusSummary` (`{ workflow, def, done, stalled, debts }`) when a child has been spawned for that step. `stalled` is true when the child (or, recursively, a grandchild on an unpaid `calls:` path) has any stalled debt — a worker that hit `maxAttempts` with no green outcome. This lets a Shift see, from the parent alone, that a `calls:` debt is blocked on a stuck child without separately walking into the child's own `status`. Like `failedRuns`/`attempts`, the field is engine-populated cross-instance state; `model.ts`'s pure single-instance `workflowStatus` never sets it.
@@ -1374,11 +1374,18 @@ get a free pass around it. A def with no `executors:` key accepts any executor
 string; there is no engine-wide registry of valid executor types to check
 against.
 
-**Pass-through.** `executor`, `command`, and `spec` all ride `buildOrder` onto
-the emitted `Order` untouched — `Order.executor`, `Order.command`, `Order.spec`
-— the same pass-through contract as `Order.model` and `Order.x`. A step that
-never sets them emits an order with all three fields absent, identical to
-before this feature existed.
+**Pass-through — reference mode (§29).** The three fields split at the order
+boundary. `spec` rides `buildOrder` onto the emitted `Order` untouched
+(`Order.spec`), the same reference-side pass-through contract as
+`Order.model` and `Order.x`. The authored `executor:` maps onto the order as
+`Order.worker` (verbatim string, absent when the step never set it) — the
+order names *which kind of worker* it is for, without carrying the
+instruction text. `command:` (and the `body:` prompt) do **not** ride the
+order at all: they are static authored content, resolved at the worker by the
+§29 `(defDigest, step, key)` boundary. A step that never sets any of the three emits an order with `worker` and
+`spec` absent and its instructions resolving to an empty result (no prompt,
+no command, nothing fabricated) — the executor feature adds no fields for it
+beyond §29's required `defDigest`.
 
 **Judges get the same fields, for free.** §24's `synthesizeJudgeSteps` turns
 each `judges:` entry into an ordinary `StepDef` — so a judge entry accepting
@@ -1506,3 +1513,149 @@ step output, it is exactly what `adopt` knows how to materialize.
 
 `adopt` returns `{ workflow, defHash, previousHash? }` (`previousHash` is
 omitted for a legacy pre-pinning row that had no prior hash to report).
+
+## §29 Reference-mode orders — static instructions resolve by digest
+
+Every section up to here describes *what* an engine asks a worker to do as a
+unit of text authored in the definition (`body:`, `command:`). Before this
+change, that text was copied onto every emitted `Order` (`Order.prompt`,
+`Order.command`) and persisted into every run row — so the authored
+instructions traveled with the wire packet, appeared in every CLI output, and
+sat duplicated in the store once per firing. The wire contract now splits
+the order's contents by their nature:
+
+- **Static, authored content** — the step's `body:` prompt, its `command:`
+  text, any judge's authored body — lives in exactly one place: the
+  definition (its pinned snapshot, §28). Orders carry a *reference* to it,
+  never the text itself.
+- **Dynamic, per-run data** — the run coordinates (`run`, `workflow`,
+  `step`, `key`, `index`), the captured input values (`consumes`), the owed
+  outputs with their accumulated reason threads (`owes[]`), the routing hints
+  (`model`, `spec`, `worker`, `x`), the firing `cause` — exists only for
+  this firing and stays on the order, exactly as before.
+
+An order is therefore a **reference packet**. Every newly emitted and
+persisted order carries a required `defDigest`; no order carries `prompt`,
+`command`, or `owes[].acceptance`. `owes[]` keeps `path`,
+`judgmentRejects`, `schemaRejects`, and `reasons` (the rejection thread is
+dynamic feedback, so it stays); the acceptance lifecycle state it used to
+duplicate is read from the artifact row, which is where it lives anyway
+(§5, §24.1). The claim-time invariant is unchanged: the order is built and
+the run row is inserted in the same transaction, and the persisted
+`RunData.order` is byte-identical to the packet `tick` handed out.
+
+### §29.1 `defDigest` — instruction-content identity
+
+`defDigest` identifies the definition snapshot an order was emitted against,
+at the granularity that matters for instructions: the sha256 of a canonical
+JSON projection of the definition's instruction-bearing fields (the
+top-level routing fields — `name`, `engine`, `inputs`, `outputs`,
+`invariants`, `x`, `executors` — plus each step's `consumes`, `produces`, and
+`generates` **raw path strings** and its authored `model`, `executor`,
+`command`, `spec`, `workdir`, effect/on/idle/reap/capabilities/calls/judges
+configuration and `body`). This shipped fallback projection intentionally
+reduces each produce pattern to `p.raw`, so a produce-level schema,
+`maxAttempts`, or `maxSchemaFailures` change does not change the fallback
+digest. The fallback identity is therefore weaker than a full compiled-
+definition identity; a future content-addressed source replaces it through
+the same resolver seam. Two fields are deliberately excluded: `dir` (where
+the YAML was loaded from — source-location metadata, not content) and
+`_includes` (expansion bookkeeping, cleared post-expansion). Identical
+content loaded from two different directories digests identically; a change
+to a step's prompt, command, or included routing field digests differently.
+
+`defDigest` is **not** `hashDef` (§28.1's drift hash — the 16-hex prefix of
+the full `JSON.stringify(def)`): `hashDef` sees every field including `dir`
+and serves the informational `defDrift` comparison, while `defDigest` sees
+the fallback projection described above and serves resolution identity. Both
+are content hashes of the same `WorkflowDef` object but answer different
+questions, and neither is a truncation of the other.
+
+### §29.2 The resolver boundary — `(defDigest, step, key)`
+
+Resolution is one seam, shared by every consumer of orders (the CLI, the
+embedded engine, and anything built on top):
+
+```
+interface OrderInstructionSource {
+  digestOf(def: WorkflowDef): string;                    // identity + registration
+  lookup(ref: OrderInstructionRef): OrderInstructionLookup;
+}
+
+interface OrderInstructionRef { defDigest: string; step: string; key: string; }
+interface ResolvedInstructions { prompt?: string; command?: string; acceptance?: string; }
+interface ResolvedInstructionRecord extends ResolvedInstructions {
+  maxAttempts: number;                                  // materialization metadata
+}
+type OrderInstructionLookup =
+  | { status: 'resolved'; instructions: ResolvedInstructionRecord }
+  | { status: 'unknown-digest' }
+  | { status: 'unknown-step' };
+```
+
+`createDefInstructionSource(defs?)` is the shipped adapter: it indexes
+private deep snapshots of loaded definitions by digest and serves the exact
+authored values — byte-for-byte, whitespace preserved, nothing trimmed,
+nothing fabricated (an authored empty `body:` resolves to `prompt: ''`; a
+step with no `command:` resolves to no command). The typed lookup result keeps
+an unknown digest distinct from a missing step inside a known digest. The
+resolved record also carries the step's `maxAttempts` default, so an injected
+source cannot silently erase `${MAX_ATTEMPTS}` during materialization. The
+seam is an injectable interface because the digest-keyed lookup is precisely
+the shape a future content-addressed definition store plugs into: an embedder
+(or the CLI) can hand the engine any source implementing these methods, and
+`buildOrder`/resolution work unchanged against it. The engine ships no network
+fetch and no verification logic — "verified local source" means whatever the
+deployer trusts, addressed by digest.
+
+`OrderResolver` sits on top of a source: `resolve(ref)` returns the source's
+record or throws the named refusal; `resolveOrder(order)` builds the
+`{defDigest, step, key}` ref from an order and additionally materializes the
+runtime placeholders in the resolved prompt — the same substitution
+`${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MAX_ATTEMPTS}` that
+`buildOrder` used to inline, moved whole to resolution time (unknown
+placeholders stay untouched; `MAX_ATTEMPTS` renders the `maxAttempts` metadata
+from the resolved instruction record). Substitution
+moved because the packet no longer contains materialized text: the authored
+body is served as authored, and the per-run values join it at resolve time.
+`Engine` exposes the resolver as `engine.resolver` (and `createEngine`
+returns it alongside the engine), so an embedder's loop is
+`tick → resolve → execute → green/close`; the commit and close use the
+order's own `workflow` because the default deep tick can return child orders.
+
+### §29.3 Unknown digest — a named refusal, never a fallback
+
+If `lookup` returns `{ status: 'unknown-digest' }` — the definition was never
+delivered to this worker, or the delivered bytes differ from what emitted
+the order — resolution throws `UnknownDefDigestError`. The error names the
+digest (`err.defDigest`, and in its message) and nothing else is attempted:
+there is no fall back to name-based resolution, no "closest matching def",
+no empty-instructions degradation. If the digest is known but `step` is not
+present, resolution throws `UnknownInstructionError` and identifies the
+`defDigest`, `step`, and `key`; that malformed reference must not claim the
+verified digest is unknown. Digest identity is the point — a worker that
+cannot resolve the exact digest and instruction reference it was handed must
+refuse the job, because executing instructions it cannot vouch for would
+reintroduce, through the back door, the very channel this contract removes.
+
+### §29.4 Interaction with pinning (§28)
+
+`buildOrder` computes the digest of the definition it is actually emitting
+against — for a pinned instance (§28.2), the exact `defSnapshot` — and
+`digestOf` registers that snapshot as a side effect. So an order's digest
+always resolves to the snapshot that emitted it, even when the live
+definition has since drifted (§28.3) or been deleted entirely: the pinned
+bytes are in the source because the engine put them there at emission time.
+`adopt` (§28.4) re-pins; the next order an adopted instance emits carries
+the new snapshot's digest and resolves to the new instructions. Pre-pinning
+rows resolving by name get their digest from the live def the same way —
+the reference-mode contract applies uniformly; there is no legacy order
+shape and no verify-mode branch anywhere in the path.
+
+### §29.5 Reserved proof slots
+
+The wire shape carries two data-only placeholders, `consumesProof` and
+`owes[].proof`: opaque strings reserved for future signed dynamic data.
+WP-B1 neither writes nor reads them — no code attaches or verifies a
+signature — but the slots exist so signed reason threads and signed consume
+values can land later without changing the reference-mode order shape again.

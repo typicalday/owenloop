@@ -526,13 +526,17 @@ rather than inlining the payload itself.
 
 Don't put credentials or secrets in an artifact value. Values are persisted
 as plaintext in the SQLite store (no encryption at rest) and are copied
-verbatim into the prompt/context of every order that consumes them — anyone
-who can read the database or a downstream job's prompt can read it.
+verbatim onto every order that consumes them — anyone who can read the
+database, or a downstream worker's resolved context, can read them.
 
 Those values are also *retained*, not just transiently persisted: every
 artifact version is kept (the store never overwrites a prior version in place),
-and every run's issued order packet — prompt plus the input values it consumed
-— is written to the SQLite `run` table at claim time and stays there after the
-run closes and the workflow finishes. A secret that flowed through an input
+and every run's issued order packet — the dynamic input values it consumed
+and its accumulated rejection reasons — is written to the SQLite `run` table
+at claim time and stays there after the run closes and the workflow finishes.
+The step's authored prompt and command text are *not* in that packet: orders
+are reference packets (design doc §29) and carry a `defDigest` pointing at
+the definition snapshot instead, so instruction text is retained once, in the
+definition, not duplicated per firing. A secret that flowed through an input
 therefore lives on in the database until the file itself is disposed of — see
 [Storage](../README.md#storage) for the operator's disposal responsibility.

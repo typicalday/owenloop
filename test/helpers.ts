@@ -1,11 +1,12 @@
 /** Shared test fixtures — inline workflow/step builders and an artifact-map helper. */
 
+import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from '../src/paths.ts';
-import type { ArtifactData, EffectDef, FiringTrigger, GroupDef, InputDef, StepDef, WorkflowDef } from '../src/types.ts';
+import type { ArtifactData, EffectDef, FiringTrigger, GroupDef, InputDef, Order, StepDef, WorkflowDef } from '../src/types.ts';
 import type { ArtifactMap } from '../src/model.ts';
 
 export interface StepSpec {
@@ -72,6 +73,29 @@ export function step(spec: StepSpec): StepDef {
 
 export function def(name: string, inputs: InputDef[], steps: StepDef[]): WorkflowDef {
   return { name, engine: 1, inputs, steps };
+}
+
+/**
+ * WP-B1 broad invariant for every emitted-order assertion: a reference-mode
+ * order carries `defDigest` and must NEVER re-grow authored instruction text —
+ * no own `prompt`, no own `command`, no legacy `executor`, no
+ * `owes[].acceptance`. Apply this to every order a new emission test emits so
+ * a future order variant fails here instead of silently leaking channel-1
+ * text back onto the wire.
+ */
+export function assertReferenceContract(o: Order): void {
+  assert.equal(typeof o.defDigest, 'string');
+  assert.ok(o.defDigest.length > 0, 'defDigest must be non-empty');
+  assert.equal(Object.prototype.hasOwnProperty.call(o, 'prompt'), false, 'reference order must not carry prompt');
+  assert.equal(Object.prototype.hasOwnProperty.call(o, 'command'), false, 'reference order must not carry command');
+  assert.equal(Object.prototype.hasOwnProperty.call(o, 'executor'), false, 'reference order uses worker, not executor');
+  for (const owed of o.owes) {
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(owed, 'acceptance'),
+      false,
+      `owes[${owed.path}] must not carry the lifecycle acceptance`,
+    );
+  }
 }
 
 export function input(name: string, opts: { producer?: string; seedOwed?: boolean } = {}): InputDef {

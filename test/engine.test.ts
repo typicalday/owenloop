@@ -2,11 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Engine } from '../src/engine.ts';
 import type { Order } from '../src/engine.ts';
-import { hashDef } from '../src/defs.ts';
+import { buildDef, hashDef } from '../src/defs.ts';
+import { createDefInstructionSource } from '../src/order-resolver.ts';
+import type { OrderInstructionSource } from '../src/order-resolver.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { StepDef, WorkflowDef } from '../src/types.ts';
-import { def, input, step } from './helpers.ts';
+import { assertReferenceContract, def, input, step } from './helpers.ts';
 
 // ---- fixtures & harness ------------------------------------------------------
 
@@ -35,7 +37,10 @@ const research = def(
   ],
 );
 
-function makeEngine(defs: WorkflowDef[], opts: { reapTtlMs?: number } = {}): {
+function makeEngine(
+  defs: WorkflowDef[],
+  opts: { reapTtlMs?: number; instructionSource?: OrderInstructionSource } = {},
+): {
   engine: Engine;
   store: Store;
 } {
@@ -48,7 +53,12 @@ function makeEngine(defs: WorkflowDef[], opts: { reapTtlMs?: number } = {}): {
       if (!d) throw new Error(`no def: ${name}`);
       return d;
     },
-    opts,
+    // Default mirrors the factory/CLI wiring: seed the loaded-def adapter
+    // with the registered defs. An explicit source replaces it outright.
+    {
+      ...(opts.reapTtlMs !== undefined ? { reapTtlMs: opts.reapTtlMs } : {}),
+      instructionSource: opts.instructionSource ?? createDefInstructionSource(defs),
+    },
   );
   return { engine, store };
 }
@@ -149,35 +159,133 @@ test('§27.3: a step-level x: rides through buildOrder onto the Order untouched;
   assert.equal(builder.x, undefined);
 });
 
-test('worker/command/spec ride through buildOrder onto the Order untouched; steps without them emit orders without them', () => {
-  const wfDef = def(
-    'workerflow',
+// ---- WP-B1 reference-mode order contract -------------------------------------
+// (assertReferenceContract lives in helpers.ts — every emission test uses it)
+
+/** Sentinel strings unique per order-shape test, so a leak is unambiguous. */
+const RUNNER_SENTINEL = 'SENTINEL-cmd-b9f3 runner command';
+const AGENT_SENTINEL = 'SENTINEL-a71d do the agent thing';
+const JUDGE_SENTINEL = 'SENTINEL-j44e judge the thing';
+
+function orderShapeDef(): WorkflowDef {
+  return def(
+    'ordershape',
     [input('proposal')],
     [
+      // plain agent step
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'], body: AGENT_SENTINEL }),
+      // command worker step
       step({
         name: 'runner',
-        consumes: ['proposal'],
+        consumes: ['plan'],
         produces: ['result'],
         executor: 'command',
-        command: 'npm test',
+        command: RUNNER_SENTINEL,
         spec: { timeout: 300 },
+        body: 'unused body for command step',
       }),
-      step({ name: 'reviewer', consumes: ['result'], produces: ['verdict'] }),
+      // map producer + per-element consumer
+      step({ name: 'gather', consumes: ['result'], produces: ['gather.src[]'] }),
+      step({
+        name: 'check',
+        consumes: ['gather.src[$i]'],
+        produces: ['gather.src[$i].checked'],
+        body: 'check ${KEY} at ${INDEX}',
+      }),
     ],
   );
-  const { engine } = makeEngine([wfDef]);
-  const wf = engine.createInstance('workerflow', { provide: { proposal: { text: 'x' } } });
+}
 
-  const runner = fire(engine, wf, 'runner', 1000);
-  assert.equal(runner.executor, 'command');
-  assert.equal(runner.command, 'npm test');
+/** Judge def built through buildDef so synthesizeJudgeSteps produces the real
+ *  synthesized judge step (correct name + `submitted`-trigger eligibility). */
+function judgeShapeDef(): WorkflowDef {
+  return buildDef({
+    name: 'judgeshape',
+    inputs: [{ name: 'proposal', seedOwed: true }],
+    steps: [
+      {
+        name: 'researcher',
+        consumes: ['proposal'],
+        produces: [{ name: 'report', judges: [{ name: 'completeness', body: JUDGE_SENTINEL }] }],
+        body: 'produce the report',
+      },
+    ],
+  });
+}
+
+test('WP-B1: plain, map, judge, and command-worker orders are reference packets — no prompt/command/owes[].acceptance anywhere', () => {
+  const { engine } = makeEngine([orderShapeDef(), judgeShapeDef()]);
+
+  // plain agent order: worker absent when the step declares no executor
+  const wf1 = engine.createInstance('ordershape', { provide: { proposal: { text: 'x' } } });
+  const planner = fire(engine, wf1, 'planner', 1000);
+  assertReferenceContract(planner);
+  assert.equal(planner.worker, undefined);
+  complete(engine, wf1, planner, { plan: 'v1' });
+
+  // command-worker order: authored executor maps to worker; command text
+  // is available ONLY through resolution, never on the order
+  const runner = fire(engine, wf1, 'runner', 2000);
+  assertReferenceContract(runner);
+  assert.equal(runner.worker, 'command');
   assert.deepEqual(runner.spec, { timeout: 300 });
-  complete(engine, wf, runner, { result: 'ok' });
+  const runnerResolved = engine.resolveOrder(runner);
+  assert.equal(runnerResolved.command, RUNNER_SENTINEL);
+  complete(engine, wf1, runner, { result: 'ok' });
 
-  const reviewer = fire(engine, wf, 'reviewer', 2000);
-  assert.equal(reviewer.executor, undefined);
-  assert.equal(reviewer.command, undefined);
-  assert.equal(reviewer.spec, undefined);
+  // map element order: the element key rides unchanged to the resolver, and
+  // INDEX/KEY materialize at resolution time, not emission time
+  const gather = fire(engine, wf1, 'gather', 3000);
+  assertReferenceContract(gather);
+  const emitted = engine.emit(wf1, gather.run, [{ value: { n: 1 } }, { value: { n: 2 } }]);
+  assert.equal(emitted.outcome, 'emitted');
+  engine.close(wf1, gather.run);
+  const checks = engine.tick(wf1, { now: 4000 }).orders.filter((o) => o.step === 'check');
+  assert.equal(checks.length, 2, 'one order per map element');
+  for (const check of checks) {
+    assertReferenceContract(check);
+    assert.ok(check.key.length > 0, 'map order carries its element key');
+    const resolved = engine.resolveOrder(check);
+    assert.equal(resolved.prompt, `check ${check.key} at ${check.index ?? ''}`);
+    engine.close(wf1, check.run, 'no_work');
+  }
+
+  // judge order: a synthesized step name resolves through the same boundary
+  const wf2 = engine.createInstance('judgeshape', { provide: { proposal: { text: 'y' } } });
+  const researcher = fire(engine, wf2, 'researcher', 5000);
+  assertReferenceContract(researcher);
+  engine.green(wf2, researcher.run, 'report', { v: 1 });
+  engine.close(wf2, researcher.run);
+  const judge = fire(engine, wf2, 'researcher.report.judges.completeness', 6000);
+  assertReferenceContract(judge);
+  assert.equal(engine.resolveOrder(judge).prompt, JUDGE_SENTINEL);
+
+  // serialized packets contain none of the authored sentinel bytes
+  for (const o of [planner, runner, gather, ...checks, researcher, judge]) {
+    const json = JSON.stringify(o);
+    assert.ok(!json.includes(AGENT_SENTINEL), 'serialized order must not contain prompt bytes');
+    assert.ok(!json.includes(RUNNER_SENTINEL), 'serialized order must not contain command bytes');
+    assert.ok(!json.includes(JUDGE_SENTINEL), 'serialized order must not contain judge prompt bytes');
+    assert.ok(!json.includes('unused body for command step'), 'command-step body must not ride the order either');
+  }
+});
+
+test('WP-B1: defDigest is present and stable across repeated firings from the same pinned definition', () => {
+  const { engine } = makeEngine([orderShapeDef()]);
+  const wf = engine.createInstance('ordershape', { provide: { proposal: { text: 'x' } } });
+
+  const planner1 = fire(engine, wf, 'planner', 1000);
+  complete(engine, wf, planner1, { plan: 'v1' });
+  complete(engine, wf, fire(engine, wf, 'runner', 2000), { result: 'ok' });
+
+  // the downstream consumer knocks plan back; planner re-fires from the SAME
+  // pinned snapshot, so the digest must not move
+  engine.reject(wf, 'plan', 'runner', 'needs rework');
+  const planner2 = fire(engine, wf, 'planner', 3000);
+  assert.equal(planner2.defDigest, planner1.defDigest, 'same pinned def → identical digest');
+  assertReferenceContract(planner2);
+  // and the knocked-back order still carries the dynamic feedback
+  assert.ok(planner2.owes.find((w) => w.path === 'plan')!.reasons.some((r) => r.text === 'needs rework'));
 });
 
 // ---- knock-back cycle (judgment reject) -------------------------------------
@@ -1374,7 +1482,7 @@ function makeMutableEngine(initial: WorkflowDef[]): {
     const d = byName.get(name);
     if (!d) throw new Error(`no def: ${name}`);
     return d;
-  });
+  }, { instructionSource: createDefInstructionSource(initial) });
   return {
     engine,
     store,
@@ -1510,6 +1618,72 @@ test('§28: adopt re-pins to the current def, clears drift, and settles a newly-
 test('§28: adopt on an unknown workflow id throws', () => {
   const { engine } = makeMutableEngine([delivery]);
   assert.throws(() => engine.adopt('wf_does_not_exist'), /no such workflow instance/);
+});
+
+test('WP-B1: an emitted digest keeps the original prompt and command after the source definition mutates', () => {
+  const mutable = def(
+    'mutable-instructions',
+    [input('proposal', { seedOwed: true })],
+    [
+      step({
+        name: 'runner',
+        consumes: ['proposal'],
+        produces: ['result'],
+        executor: 'command',
+        body: 'original prompt',
+        command: 'original command',
+      }),
+    ],
+  );
+  const { engine } = makeEngine([mutable]);
+  const wf = engine.createInstance('mutable-instructions', { provide: { proposal: { text: 'x' } } });
+  const order = fire(engine, wf, 'runner', 1000);
+  assert.equal(engine.resolveOrder(order).prompt, 'original prompt');
+  assert.equal(engine.resolveOrder(order).command, 'original command');
+
+  mutable.steps[0]!.body = 'mutated prompt';
+  mutable.steps[0]!.command = 'mutated command';
+
+  assert.equal(engine.resolveOrder(order).prompt, 'original prompt');
+  assert.equal(engine.resolveOrder(order).command, 'original command');
+});
+
+test('WP-B1 pin/adopt: a pinned instance keeps the OLD digest + OLD prompt bytes after the source changes; adopt flips both to the NEW ones', () => {
+  const { engine, setDef } = makeMutableEngine([delivery]);
+  const wf = engine.createInstance('delivery', { provide: { proposal: { text: 'x' } } });
+
+  const planner1 = fire(engine, wf, 'planner', 1000);
+  const oldDigest = planner1.defDigest;
+  assert.equal(engine.resolveOrder(planner1).prompt, 'run planner', 'sanity: default helper body');
+
+  // Swap the live def under the same name — new body bytes, new digest.
+  const changed = def(
+    'delivery',
+    [input('proposal')],
+    [
+      step({ name: 'planner', consumes: ['proposal'], produces: ['plan'], body: 'a new prompt' }),
+      step({ name: 'builder', consumes: ['plan'], produces: ['pr'] }),
+      step({ name: 'reviewer', consumes: ['pr'], produces: ['verdict'] }),
+      step({ name: 'merger', consumes: ['verdict'], produces: ['merge'] }),
+    ],
+  );
+  setDef(changed);
+
+  // The pinned instance's NEXT order: original digest, original bytes — even
+  // though the live map no longer holds them under the name.
+  complete(engine, wf, planner1, { plan: 'v1' });
+  engine.reject(wf, 'plan', 'builder', 'rework');
+  const planner2 = fire(engine, wf, 'planner', 2000);
+  assert.equal(planner2.defDigest, oldDigest, 'pinned order keeps the original digest');
+  assert.equal(engine.resolveOrder(planner2).prompt, 'run planner', 'pinned order resolves the original prompt bytes');
+  assert.notEqual(engine.resolver.resolve({ defDigest: oldDigest, step: 'planner', key: '' }).prompt, 'a new prompt');
+
+  // Adopt: the next order carries the NEW digest and resolves the NEW bytes.
+  engine.close(wf, planner2.run, 'no_work');
+  engine.adopt(wf);
+  const planner3 = fire(engine, wf, 'planner', 3000);
+  assert.notEqual(planner3.defDigest, oldDigest, 'adopted order carries the new digest');
+  assert.equal(engine.resolveOrder(planner3).prompt, 'a new prompt', 'adopted order resolves the new prompt bytes');
 });
 
 test('§28: adopt throws when the live def no longer resolves at all (unlike status, which tolerates it)', () => {

@@ -1453,8 +1453,13 @@ non-zero exit as a failure, not a success.
 
 ## What a job looks like
 
-`tick` returns `{ workflow, orders, reaped }`. Each order is self-contained —
-a Step Agent needs nothing else to do the work:
+`tick` returns `{ workflow, orders, reaped }`. Each order is a **reference
+packet**: it carries the routing fields and run-time context for the job — the
+run id, the captured input values, the owed outputs with their reason threads
+— plus a `defDigest` that names *which definition snapshot* holds the authored
+instructions. The instructions themselves (the step's `body:` prompt, any
+`command:` text) are **not** on the order, and `tick`/`order` never print
+them.
 
 ```jsonc
 {
@@ -1462,22 +1467,42 @@ a Step Agent needs nothing else to do the work:
   "workflow": "wf_…",      // the instance this order belongs to — see deep tick below
   "step": "builder",       // which step this job is for
   "key": "",               // map jobs carry the element key + index
+  "defDigest": "9f2c…",    // identifies the definition snapshot to resolve instructions from
   "inputs":  ["plan"],
   "outputs": ["pr"],
-  "prompt":  "…body with ${WORKFLOW}/${RUN}/${INDEX} filled in…",
+  "worker":  "command",    // the authored step's executor:, mapped verbatim (absent = 'agent')
   "consumes": { "plan": { /* the accepted input value */ } },
   "owes": [                // the feedback channel
-    { "path": "pr", "acceptance": "rejected", "judgmentRejects": 2, "schemaRejects": 0,
+    { "path": "pr", "judgmentRejects": 2, "schemaRejects": 0,
       "reasons": [ { "action": "reject", "kind": "judgment", "by": "reviewer",
                      "text": "tests are missing", "at": 0 } ] }
   ]
 }
 ```
 
-A Step Agent reads `prompt` + `consumes` + `owes`, does the work, reports with
-`green` (or `emit`/`seal` for collections), then `close`s the job. The reject
-counts in `owes[]` let a workflow escalate on its own — e.g. switch to a
-stronger model after two rejections — before the engine stalls the step.
+A worker first **resolves the reference**: the `(defDigest, step, key)`
+boundary maps the order to the exact authored instructions from the worker's
+trusted local definition source — the same resolver the embedded engine and
+the CLI use. Resolution returns the authored `prompt` (with
+`${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MAX_ATTEMPTS}`
+materialized), the authored `command` if the step has one, and nothing
+fabricated. If the worker's source does not know the digest — the definition
+was never delivered, or the current on-disk definition no longer matches the
+pinned digest — resolution raises `UnknownDefDigestError`. If the digest is
+known but the referenced step is absent, resolution raises the distinct
+`UnknownInstructionError` and identifies the digest, step, and key. The worker
+must refuse either malformed reference rather than guess instructions by step
+name or fetch unverified text. Once resolved, the worker reads the resolved
+prompt + `consumes` + `owes`, does the work, reports with `green` (or
+`emit`/`seal` for collections), then `close`s the job. The reject counts in
+`owes[]` let a workflow escalate on its own — e.g. switch to a stronger model
+after two rejections — before the engine stalls the step.
+
+Static authored text (prompts, commands) travels by digest reference; dynamic
+data — `consumes` values and the rejection `reasons` threads — stays on the
+order because it exists only for this run. A remote coordinator or transport
+that relays these packets never sees authored instruction text and never needs
+to: instructions resolve at the worker, from a source the worker trusts.
 
 **Deep tick and `order.workflow`.** `tick <wf>` is **deep by default**: it ticks
 `<wf>` and then descends into every live `calls:` child, folding their orders

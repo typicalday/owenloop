@@ -193,6 +193,33 @@ test('a full delivery happy path runs end to end through main()', () => {
   assert.deepEqual(run('list').json(), []);
 });
 
+// ---- WP-B1: tick/order are reference packets ---------------------------------
+
+test('CLI tick and order read-back are identical reference packets — no authored prompt/command text', () => {
+  const { run } = makeCli();
+  const wf = run('create', 'delivery', '--provide', `proposal=${J({ text: 'x' })}`).json().workflow;
+
+  const order = run('tick', wf).json().orders[0];
+  assert.equal(order.step, 'planner');
+
+  // reference contract on the wire shape
+  assert.equal(typeof order.defDigest, 'string');
+  assert.ok(order.defDigest.length > 0);
+  assert.equal(order.prompt, undefined);
+  assert.equal(order.command, undefined);
+  assert.equal(order.executor, undefined);
+  for (const owed of order.owes) assert.equal(owed.acceptance, undefined);
+
+  // the authored delivery planner body bytes are NOT in the packet
+  const serialized = JSON.stringify(order);
+  assert.ok(!serialized.includes('Read the proposal'), 'authored prompt text must not ride the tick JSON');
+  assert.ok(!serialized.includes('${WORKFLOW}'), 'authored body (even unrendered) must not ride the tick JSON');
+
+  // `owenloop order` reads back the SAME persisted reference packet
+  const readBack = run('order', wf, order.run).json();
+  assert.deepStrictEqual(readBack, order, 'order read-back is byte-identical to the emitted packet');
+});
+
 // ---- delete: refuses children unless --recursive ----------------------------
 
 test('delete refuses a workflow with children unless --recursive is passed', () => {

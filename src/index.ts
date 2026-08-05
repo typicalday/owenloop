@@ -32,6 +32,23 @@ export type {
 export { createEngine } from './factory.ts';
 export type { CreateEngineOpts, CreatedEngine } from './factory.ts';
 
+export {
+  createDefInstructionSource,
+  defInstructionDigest,
+  OrderResolver,
+  substituteOrderVars,
+  UnknownDefDigestError,
+  UnknownInstructionError,
+} from './order-resolver.ts';
+export type {
+  OrderInstructionLookup,
+  OrderInstructionRef,
+  OrderInstructionSource,
+  OrderRuntimeVars,
+  ResolvedInstructionRecord,
+  ResolvedInstructions,
+} from './order-resolver.ts';
+
 export { Store, openStore, StoreVersionError } from './store.ts';
 export type { ArtifactRow, RunRow, TaskRow, WorkflowRow } from './store.ts';
 
