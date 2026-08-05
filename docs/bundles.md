@@ -127,6 +127,8 @@ For every regular file:
 - Header fields use canonical zero-padded octal values, USTAR magic `ustar\0`,
   version `00`, and zeroed link, device, and prefix fields.
 - Each regular archive file uses typeflag `0`.
+- Every entry's data padding, including the padding after a `PaxHeader` data
+  record, is zero-filled.
 - The archive ends with exactly two zero blocks and no bytes after the
   terminator.
 

@@ -16,6 +16,7 @@ import {
   unpackBundle,
 } from '../src/bundle/index.ts';
 import { parseManifestBytes } from '../src/bundle/manifest.ts';
+import { buildCanonicalTar, collectSourceFiles } from '../src/bundle/tar.ts';
 import { hostileData, hostileFileEntry, hostileHeader, hostilePaxBlocks, hostilePaxPathRecord, hostileTarball } from './helpers.ts';
 
 const ROOT = join(import.meta.dirname, '..');
@@ -87,6 +88,26 @@ test('def digest is SHA-256 over independently gunzipped tar bytes', () => {
   assert.equal(digestBundle(bytes).digest, expected);
 });
 
+test('every canonical-tar byte mutation is rejected or changes logical identity', () => {
+  const packed = packBundle(SOURCE);
+  const baseline = inspectBundle(packed.bytes);
+  const baselineMeaning = { manifest: baseline.manifest, entries: baseline.entries };
+  const tar = gunzipSync(packed.bytes);
+  for (let offset = 0; offset < tar.length; offset += 1) {
+    const mutated = Buffer.from(tar);
+    mutated[offset] = (mutated[offset] ?? 0) ^ 0xff;
+    try {
+      const inspected = inspectBundle(gzipSync(mutated));
+      assert.notEqual(inspected.digest, baseline.digest, `byte mutation at offset ${offset} kept the digest`);
+      const mutatedMeaning = { manifest: inspected.manifest, entries: inspected.entries };
+      assert.notDeepEqual(mutatedMeaning, baselineMeaning, `byte mutation at offset ${offset} changed only unconstrained bytes`);
+    } catch (error) {
+      if (error instanceof BundleError) continue;
+      throw error;
+    }
+  }
+});
+
 test('packing does not edit source manifest and is stable across mtime and irrelevant mode changes', () => {
   const source = tempDir();
   cpSync(SOURCE, source, { recursive: true });
@@ -112,7 +133,7 @@ test('one-file mutation changes archive bytes and digest', () => {
   assert.notDeepEqual(Buffer.from(second.bytes), Buffer.from(first.bytes));
 });
 
-test('packing is stable across source directory-entry ordering', () => {
+test('packing is stable across controlled source directory-entry ordering', () => {
   const relativePaths = [
     'assets/binary.bin',
     'assets/notes.txt',
@@ -143,6 +164,34 @@ test('packing is stable across source directory-entry ordering', () => {
   const reverse = packBundle(buildSource([...sourceFiles].reverse()));
   assert.equal(reverse.digest, forward.digest);
   assert.deepEqual(Buffer.from(reverse.bytes), Buffer.from(forward.bytes));
+
+  // Drive the recursive walk with a deliberately reversed directory-entry
+  // source. The test does not rely on the host filesystem's readdir ordering.
+  const source = tempDir();
+  mkdirSync(join(source, 'a'));
+  mkdirSync(join(source, 'b'));
+  writeFileSync(join(source, 'a', 'nested'), 'a');
+  writeFileSync(join(source, 'a-file'), 'a-file');
+  writeFileSync(join(source, 'b', 'child'), 'b');
+  writeFileSync(join(source, 'root'), 'root');
+  const visits: string[] = [];
+  const reverseRead = (directory: string) => [...readdirSync(directory, { withFileTypes: true })].reverse();
+  const collected = collectSourceFiles(source, undefined, {
+    readDir: reverseRead,
+    onVisit: (relativePath) => visits.push(relativePath),
+  });
+  assert.deepEqual(visits, ['a', 'a/nested', 'a-file', 'b', 'b/child', 'root']);
+  assert.deepEqual(collected.map((file) => file.rel), ['a-file', 'a/nested', 'b/child', 'root']);
+
+  const canonicalTar = (files: typeof collected): Buffer => buildCanonicalTar(files.map((file) => ({
+    path: file.rel,
+    bytes: readFileSync(file.abs),
+    mode: file.executable ? 0o755 : 0o644,
+  })));
+  const forwardCollected = collectSourceFiles(source, undefined, {
+    readDir: (directory) => readdirSync(directory, { withFileTypes: true }),
+  });
+  assert.deepEqual(canonicalTar(collected), canonicalTar(forwardCollected));
 });
 
 test('unpack validates before writing and leaves no destination on failure', () => {
@@ -163,13 +212,16 @@ test('unpack writes a fresh destination atomically and rejects overwrite', () =>
   assert.equal(errorCode(() => unpackBundle(readFileSync(GOLDEN), destination)), 'DESTINATION_EXISTS');
 });
 
-test('unpack refuses a symlinked destination ancestor', () => {
+test('unpack refuses invalid destination ancestors', () => {
   const root = tempDir();
   const real = join(root, 'real');
   const alias = join(root, 'alias');
+  const fileParent = join(root, 'file-parent');
   mkdirSync(real);
   symlinkSync(real, alias);
+  writeFileSync(fileParent, 'not a directory');
   assert.equal(errorCode(() => unpackBundle(readFileSync(GOLDEN), join(alias, 'out'))), 'DESTINATION_PARENT_INVALID');
+  assert.equal(errorCode(() => unpackBundle(readFileSync(GOLDEN), join(fileParent, 'nested', 'out'))), 'DESTINATION_PARENT_INVALID');
   assert.deepEqual(readdirSync(real), []);
 });
 

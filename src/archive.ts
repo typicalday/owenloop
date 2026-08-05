@@ -428,7 +428,7 @@ export function parseTar(tar: Uint8Array, limits: TarLimits, opts: ParseTarOptio
       assertCanonicalHeaderFields(
 	header,
 	stored,
-	(typeflag === '0' || typeflag === '\\0') ? pendingPaxPath : undefined,
+	(typeflag === '0' || typeflag === '\0') ? pendingPaxPath : undefined,
       );
       for (const [label, start, end] of [
 	['mode', 100, 108],
@@ -480,6 +480,9 @@ export function parseTar(tar: Uint8Array, limits: TarLimits, opts: ParseTarOptio
       const message = `corrupt tar archive: entry data (${sizeField} bytes) extends past end of archive`;
       if (strict) failStrict('ARCHIVE_TRUNCATED', message, { entryPath: nameField });
       failCompat(message);
+    }
+    if (strict && tar.subarray(dataEnd, paddedEnd).some((b) => b !== 0)) {
+      failStrict('NON_CANONICAL_HEADER', 'tar entry data padding must be zero', { entryPath: nameField });
     }
     const data = tar.subarray(dataStart, dataEnd);
     offset = paddedEnd;

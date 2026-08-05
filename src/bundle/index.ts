@@ -300,7 +300,13 @@ function assertDestinationParent(parent: string): string {
     current = next;
   }
   for (const component of components.reverse()) {
-    const st = lstatSync(component, { throwIfNoEntry: false });
+    let st;
+    try {
+      st = lstatSync(component, { throwIfNoEntry: false });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new BundleError('DESTINATION_PARENT_INVALID', `cannot inspect unpack destination parent '${parent}': ${message}`);
+    }
     if (!st) {
       throw new BundleError('DESTINATION_PARENT_INVALID', `unpack destination parent '${parent}' does not exist`);
     }
@@ -312,6 +318,15 @@ function assertDestinationParent(parent: string): string {
     }
   }
   return resolved;
+}
+
+function lstatDestination(path: string): ReturnType<typeof lstatSync> | undefined {
+  try {
+    return lstatSync(path, { throwIfNoEntry: false });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new BundleError('DESTINATION_PARENT_INVALID', `cannot inspect unpack destination '${path}': ${message}`);
+  }
 }
 
 /**
@@ -349,7 +364,7 @@ export function unpackBundle(bytes: Uint8Array, destination: string, opts: Inspe
   const destAbs = resolve(destination);
   const parent = dirname(destAbs);
   // Destination must not exist (any kind).
-  const existing = lstatSync(destAbs, { throwIfNoEntry: false });
+  const existing = lstatDestination(destAbs);
   if (existing) {
     throw new BundleError('DESTINATION_EXISTS', `unpack destination '${destination}' already exists`);
   }
@@ -387,7 +402,7 @@ export function unpackBundle(bytes: Uint8Array, destination: string, opts: Inspe
 	closeSync(fd);
       }
     }
-    if (lstatSync(destAbs, { throwIfNoEntry: false })) {
+    if (lstatDestination(destAbs)) {
       throw new BundleError('DESTINATION_EXISTS', `unpack destination '${destination}' already exists`);
     }
     renameSync(staging, destAbs);

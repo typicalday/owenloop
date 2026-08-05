@@ -14,6 +14,7 @@
  */
 
 import { lstatSync, readdirSync } from 'node:fs';
+import type { Dirent } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { archivePathViolation, canonicalPaxNamePlaceholder, DEFAULT_TAR_LIMITS } from '../archive.ts';
@@ -180,8 +181,20 @@ const byNameBytes = (a: { name: string }, b: { name: string }): number =>
  * violates the shared archive path policy. Returns files sorted by ascending
  * UTF-8 byte order of their archive path.
  */
-export function collectSourceFiles(sourceRoot: string, limits: TarLimits = DEFAULT_TAR_LIMITS): SourceFile[] {
+export interface CollectSourceFilesOptions {
+  /** Optional directory-entry source used by tests to control filesystem order. */
+  readDir?: (directory: string) => Dirent[];
+  /** Optional visit trace used by tests to assert sorted recursive traversal. */
+  onVisit?: (relativePath: string) => void;
+}
+
+export function collectSourceFiles(
+  sourceRoot: string,
+  limits: TarLimits = DEFAULT_TAR_LIMITS,
+  options: CollectSourceFilesOptions = {},
+): SourceFile[] {
   const root = resolve(sourceRoot);
+  const readDir = options.readDir ?? ((directory: string) => readdirSync(directory, { withFileTypes: true }));
   let rootStat;
   try {
     rootStat = lstatSync(root);
@@ -200,7 +213,7 @@ export function collectSourceFiles(sourceRoot: string, limits: TarLimits = DEFAU
   const walk = (dirAbs: string, relPrefix: string): void => {
     let dirents;
     try {
-      dirents = readdirSync(dirAbs, { withFileTypes: true });
+      dirents = readDir(dirAbs);
     } catch (e) {
       throw new BundleError('SOURCE_NOT_A_DIRECTORY', `cannot read '${dirAbs}': ${(e as Error).message}`);
     }
@@ -208,6 +221,7 @@ export function collectSourceFiles(sourceRoot: string, limits: TarLimits = DEFAU
     for (const d of dirents) {
       const abs = join(dirAbs, d.name);
       const rel = relPrefix === '' ? d.name : `${relPrefix}/${d.name}`;
+      options.onVisit?.(rel);
       const violation = archivePathViolation(rel);
       if (violation) {
 	throw new BundleError('SOURCE_INVALID_PATH', `unsafe path '${rel}': ${violation}`, rel);
