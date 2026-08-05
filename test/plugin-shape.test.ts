@@ -190,6 +190,17 @@ test('Claude Code .mcp.json owenloop entry uses the PATH CLI and only the plugin
   assert.deepEqual(Object.keys(owenloop['env'] as Record<string, unknown>), ['OWENLOOP_PLUGIN_VERSION']);
 });
 
+test('both .mcp.json owenloop entries expose exactly the plugin version env key', () => {
+  for (const { harness, config } of MCP_MANIFESTS) {
+    const owenloop = config.mcpServers['owenloop']!;
+    assert.deepEqual(
+      Object.keys(owenloop['env'] as Record<string, unknown>),
+      ['OWENLOOP_PLUGIN_VERSION'],
+      `${harness} env keys`,
+    );
+  }
+});
+
 for (const { harness, raw } of MCP_MANIFESTS) {
   test(`${harness} .mcp.json carries no token-like literal anywhere in the file`, () => {
     assert.ok(!raw.includes('olp_'));
