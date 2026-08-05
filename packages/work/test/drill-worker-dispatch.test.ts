@@ -24,7 +24,7 @@
  *
  * Credential path: owenloop file store (no OWENLOOP_TOKEN), as every drill.
  */
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +34,9 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
+import { defInstructionDigest } from '../../../src/order-resolver.ts';
+import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
+import { installBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { readChildRecords } from '../src/shift/state.ts';
 import { readSessions, sessionsPath } from '../src/harness/session-store.ts';
 import type { OrderPacket, WorkOrder } from '../src/hub/types.ts';
@@ -68,17 +71,21 @@ const ORDER: WorkOrder = {
 };
 
 /** What `get_order` re-serves to the agent-run child. No `executor`/`command` ⇒ AGENT. */
-const PACKET: OrderPacket = {
-  run: 'run_x1234',
-  workflow: 'wf1',
-  step: 'builder',
-  key: 'k',
-  inputs: [],
-  outputs: ['pr'],
-  prompt: 'build it',
-  consumes: {},
-  owes: [{ path: 'pr', acceptance: 'a', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
-};
+let localDefDigest = '';
+
+function packet(): OrderPacket {
+  return {
+    run: 'run_x1234',
+    workflow: 'wf1',
+    step: 'builder',
+    key: 'k',
+    inputs: [],
+    outputs: ['pr'],
+    defDigest: localDefDigest,
+    consumes: {},
+    owes: [{ path: 'pr', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+  };
+}
 
 let root: string;
 let home: string;
@@ -92,11 +99,22 @@ beforeEach(() => {
   stateDir = join(root, 'state');
   tracePath = join(root, 'harness-trace.jsonl');
 });
+function makeWritableTree(path: string): void {
+  const stat = lstatSync(path);
+  if (stat.isDirectory()) {
+    for (const child of readdirSync(path)) makeWritableTree(join(path, child));
+    chmodSync(path, 0o755);
+  } else {
+    chmodSync(path, 0o644);
+  }
+}
+
 afterEach(() => {
+  if (existsSync(root)) makeWritableTree(root);
   rmSync(root, { recursive: true, force: true });
 });
 
-function seedCache(): void {
+async function seedCache(): Promise<void> {
   const tpl: NormalizedStepSpec = { step: 'builder', brief: TPL_CONTENT, permissions: { extensions: {} } };
   const bundle: CachedBundle = {
     def: { name: 'demo', hash: DEMO_HASH, steps: [{ name: 'builder', body: '' }] },
@@ -104,6 +122,28 @@ function seedCache(): void {
     origin: 'seed',
   };
   writeBundle(cacheDir, bundle, [tpl]);
+  const workflow = `name: demo
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: builder
+    consumes: [seed]
+    produces: [pr]
+    terminal: true
+    executor: agent
+    body: |
+${TPL_CONTENT.split('\n').map((line) => `      ${line}`).join('\n')}
+    x:
+      harness:
+        id: fake
+`;
+  const sourceDir = writeBundleSource({ name: 'demo', workflow });
+  const installed = await installBundleFixture({ sourceDir, root: join(home, '.owenloop', 'workflows') });
+  const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+  const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
+  assert.ok(definition !== undefined);
+  localDefDigest = defInstructionDigest(definition);
 }
 
 /** Every file under `dir`, absolute, recursively. A missing dir reads as empty. */
@@ -148,7 +188,7 @@ function spawnDaemon(origin: string): ShiftChild {
 }
 
 test('an AGENT order is run by a detached agent-run child, with nothing stamped and no lean order', async () => {
-  seedCache();
+  await seedCache();
   let wakes = 0;
   let getOrders = 0;
   const { origin, reqs, server } = await startMockHub((verb, body) => {
@@ -171,8 +211,8 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
         // Withholding it for one full poll is deliberate: it proves the runner
         // keeps confirming past turn end instead of reading the harness stream.
         return getOrders++ < 2
-          ? { text: '', workflow: 'wf1', run: 'run_x1234', order: PACKET, lease: { claimed: true } }
-          : { text: '', workflow: 'wf1', run: 'run_x1234', order: PACKET, lease: { claimed: false, outcome: 'ok' } };
+          ? { text: '', workflow: 'wf1', run: 'run_x1234', order: packet(), lease: { claimed: true } }
+          : { text: '', workflow: 'wf1', run: 'run_x1234', order: packet(), lease: { claimed: false, outcome: 'ok' } };
       case 'heartbeat':
         return { text: '', ok: true };
       default:

@@ -11,10 +11,12 @@
  *     claims survive a session drain). The loop's first `get_order` beats the
  *     lease and delivers the order packet via `onOrder`; the loop then keeps the
  *     lease warm underneath everything below.
- *  2. VALIDATE — a `null` packet, a missing/blank `command`, a non-`command`
- *     executor, or a missing/empty `owes` is a MISROUTE (plan decision 3): not exec's to
- *     fail (a Step Agent could legitimately run it), so a targeted release, no
- *     submit, exit 1.
+ *  2. VALIDATE — a `null` packet, a non-`command` worker, or a missing/empty
+ *     `owes` list is a MISROUTE (plan decision 3): not exec's to fail (a Step
+ *     Agent could legitimately run it), so a targeted release, no submit, exit 1.
+ *     A command worker's `defDigest` is then resolved through the verified local
+ *     workflow store. Missing or corrupt instructions are a named refusal, not a
+ *     misroute, and no child process is started.
  *  3. RUN + RACE — the runner shells the command out while the lease loop runs.
  *     Whichever settles first wins (plan decision 9):
  *       - command settles (any exit code, or a machinery error) ⇒ build a
@@ -39,6 +41,7 @@ import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.ts';
 import type { CommandRunner, CommandResult, RunningCommand } from './runner.ts';
+import type { InstructionResolver } from './instructions.ts';
 import { buildReceipt } from './receipt.ts';
 
 /** sha256 of the empty byte string — the hash for a run with no captured output. */
@@ -49,6 +52,7 @@ export type ExecOutcome =
   | 'submitted' // receipt delivered to every owed path (exit 0)
   | 'completed' // the order already finished at first contact (exit 0)
   | 'misroute' // null / non-command packet — released, not our failure (exit 1)
+  | 'unresolved-instructions' // local-store instruction refusal — released, never spawned (exit 1)
   | 'killed' // a signal aimed at exec killed the command + released (exit 1)
   | 'lease-lost' // the lease went terminal while the command ran (exit 1)
   | 'ownership-error' // 403 — the run is not ours (exit 1)
@@ -64,6 +68,8 @@ export interface ExecLoopOptions {
   run: string;
   /** The exec process holder tag `{kind:'exec', id}` — id is `<hostname>:<pid>`. */
   holder: ContactHolder;
+  /** Resolves command text from a verified local workflow-store object. */
+  instructions: InstructionResolver;
   /** cwd for the command when the order packet carries no `workdir`. */
   cwd: string;
   sleep: (ms: number) => Promise<void>;
@@ -160,7 +166,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   }
 
   /** Build the receipt and submit it to every owed path. */
-  async function submitReceipt(result: CommandResult, order: OrderPacket): Promise<ExecOutcome> {
+  async function submitReceipt(result: CommandResult, order: OrderPacket, resolvedCommand: string): Promise<ExecOutcome> {
     if (signalled) {
       // The operator killed the work and the command settled before the lease
       // (the release HTTP round-trip is slower than a TERM'd child dying), so
@@ -172,7 +178,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       return 'killed';
     }
     const receipt = buildReceipt(result, {
-      command: order.command ?? '',
+      command: resolvedCommand,
       orchestrator: opts.holder.id,
       workflow,
       run: runId,
@@ -219,27 +225,44 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     if (first.t === 'lease') return mapNoHold(first.o);
 
     const order = first.res.order;
-    const command = order?.command;
     if (
       order === null ||
-      typeof command !== 'string' ||
-      command === '' ||
-      (order.executor !== undefined && order.executor !== 'command') ||
+      order.worker !== 'command' ||
       !Array.isArray(order.owes) ||
       order.owes.length === 0
     ) {
-      opts.err(`owenloop work exec: ${workflow}/${runId} is not a runnable command order (misroute) — releasing`);
+      opts.err(`owenloop work exec: ${workflow}/${runId} is not a command order (misroute) — releasing`);
       lease.stop('misroute'); // targeted release — not exec's to fail
       await leasePromise;
       return 'misroute';
     }
 
+    let resolvedCommand: string;
+    try {
+      const resolved = await opts.instructions.resolveCommand(order);
+      if (!resolved.ok) {
+        opts.err(`owenloop work exec: ${resolved.reason}`);
+        lease.stop('unresolved-instructions');
+        await leasePromise;
+        return 'unresolved-instructions';
+      }
+      resolvedCommand = resolved.command;
+    } catch (e) {
+      opts.err(
+        `owenloop work exec: instruction refusal (integrity) for ${workflow}/${runId} ` +
+          `defDigest '${order.defDigest}': ${errMsg(e)}`,
+      );
+      lease.stop('unresolved-instructions');
+      await leasePromise;
+      return 'unresolved-instructions';
+    }
+
     // Run the command and race it against the lease going terminal.
     let cmd: RunningCommand;
     try {
-      cmd = runner.start(command, { cwd: order.workdir ?? opts.cwd });
+      cmd = runner.start(resolvedCommand, { cwd: order.workdir ?? opts.cwd });
     } catch (e) {
-      return submitReceipt(machineryFailure(e), order);
+      return submitReceipt(machineryFailure(e), order, resolvedCommand);
     }
     running = cmd;
     opts.out(`owenloop work exec: running ${workflow}/${runId} (step '${order.step}')`);
@@ -259,7 +282,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       return mapLeaseDuringRun(outcome.o);
     }
 
-    return submitReceipt(outcome.r, order);
+    return submitReceipt(outcome.r, order, resolvedCommand);
   }
 
   function stop(reason?: string): void {

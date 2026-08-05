@@ -95,13 +95,13 @@ export type AgentRunOutcome =
 
 /**
  * Locate the normalized step spec for an order. Injected because the lookup is
- * I/O (the bundle cache) and because resolving WHICH cached def serves this
- * instance is the role's business, not the loop's. `null` ⇒ no spec, which is
- * the `'no-template'` outcome (release, leave it for the pickup window).
+ * I/O (the verified workflow store) and because resolving the local definition
+ * is the role's business, not the loop's. `null` means instruction resolution
+ * refused; the loop releases and leaves the order for the pickup window.
  *
- * The spec arrives ALREADY NORMALIZED from `prepare` — brief, harness id, and
- * `StepPermissions`. That is what lets this loop stay vendor-neutral: it never
- * reaches into a step def's extension bag, so there is no key to name.
+ * The spec arrives already normalized from the verified `StepDef` — brief,
+ * harness id, and `StepPermissions`. The loop stays vendor-neutral: it never
+ * reaches into a step definition's extension bag, so there is no key to name.
  */
 export type StepLoader = (order: OrderPacket) => Promise<NormalizedStepSpec | null>;
 
@@ -417,7 +417,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     if (first.t === 'lease') return mapNoHold(first.o);
 
     const packet = first.res.order;
-    if (packet === null || packet.executor === 'command' || (typeof packet.command === 'string' && packet.command !== '')) {
+    if (packet === null || packet.worker === 'command') {
       opts.err(`owenloop work agent-run: ${order} is not an agent order (misroute) — releasing`);
       return releaseWith('misroute', 'misroute');
     }

@@ -41,13 +41,12 @@ interface OrderOpts {
   step?: string;
   workdir?: string;
   model?: string;
-  executor?: string;
-  command?: string;
+  worker?: string;
   claimed?: boolean;
   outcome?: string;
 }
 
-/** A get_order response carrying an AGENT order packet (no `command`). */
+/** A get_order response carrying an agent order packet. */
 function agentOrder(o: OrderOpts = {}): GetOrderResponse {
   return {
     text: '',
@@ -62,9 +61,8 @@ function agentOrder(o: OrderOpts = {}): GetOrderResponse {
       outputs: [],
       ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
       ...(o.model !== undefined ? { model: o.model } : {}),
-      ...(o.executor !== undefined ? { executor: o.executor } : {}),
-      ...(o.command !== undefined ? { command: o.command } : {}),
-      prompt: '',
+      ...(o.worker !== undefined ? { worker: o.worker } : {}),
+      defDigest: 'test-agent-digest',
       consumes: {},
       owes: [],
     },
@@ -445,7 +443,7 @@ test('first contact: a 403 maps to ownership-error', async () => {
 
 test('a command order is a misroute: released, nothing started', async () => {
   const adapter = createFakeAdapter();
-  const { hub, calls } = mockHub({ getOrder: [agentOrder({ executor: 'command', command: 'echo hi' })] });
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ worker: 'command' })] });
   const h = buildOpts({ hub, adapter });
 
   assert.equal(await createAgentRunLoop(h.opts).run(), 'misroute');

@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 
-import { exitCodeFor, parseArgs, run } from '../src/roles/agent-run.ts';
+import { exitCodeFor, parseArgs, run as roleRun, type RunDeps } from '../src/roles/agent-run.ts';
 import type { AgentRunOutcome } from '../src/agent/loop.ts';
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { StepPermissions } from '../src/harness/contract.ts';
@@ -30,6 +30,8 @@ import type { SessionRecord } from '../src/harness/session-store.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { SignalHost } from '../src/roles/signals.ts';
+import type { InstructionResolver } from '../src/exec/instructions.ts';
+import type { StepDef } from '../../../src/types.ts';
 
 // ---- arg parsing ------------------------------------------------------------
 
@@ -93,7 +95,7 @@ const TEMPLATE = [
   'shift: __OWENLOOP_SHIFT__',
 ].join('\n');
 
-function agentOrder(o: { claimed?: boolean; outcome?: string; executor?: string; command?: string } = {}): GetOrderResponse {
+function agentOrder(o: { claimed?: boolean; outcome?: string; worker?: string; defDigest?: string } = {}): GetOrderResponse {
   return {
     text: '',
     workflow: 'wf1',
@@ -105,11 +107,10 @@ function agentOrder(o: { claimed?: boolean; outcome?: string; executor?: string;
       key: 'k',
       inputs: [],
       outputs: [],
-      executor: o.executor ?? 'agent',
-      command: o.command ?? '',
-      prompt: '',
+      ...(o.worker !== undefined ? { worker: o.worker } : {}),
+      defDigest: o.defDigest ?? HASH,
       consumes: {},
-      owes: [{ path: 'out', acceptance: '', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+      owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     },
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
   };
@@ -219,6 +220,20 @@ let home: string;
 let cacheDir: string;
 let savedEnv: NodeJS.ProcessEnv;
 const registeredIds: string[] = [];
+let verifiedStep: StepDef | undefined;
+
+const testInstructions = (): InstructionResolver => ({
+  resolveCommand: async () => ({ ok: false, kind: 'missing-command', reason: 'command resolution is not used by agent-run tests' }),
+  resolveStep: async (order) =>
+    order.defDigest.trim() === ''
+      ? { ok: false, kind: 'no-digest', reason: 'the order has no definition digest' }
+      : verifiedStep === undefined
+        ? { ok: false, kind: 'unknown-digest', reason: `unknown local workflow digest '${order.defDigest}'` }
+        : { ok: true, step: verifiedStep },
+});
+
+const run = (args: string[], deps: RunDeps = {}): Promise<number> =>
+  roleRun(args, { instructions: testInstructions(), ...deps });
 
 /** Register an adapter and remember it, so `afterEach` leaves the global
  *  registry exactly as it found it. */
@@ -240,6 +255,17 @@ function useAdapter(a: HarnessAdapter): void {
  */
 function seedBundle(seed: { harness?: string; model?: string; permissions?: StepPermissions } = {}): void {
   const harnessKey = seed.harness !== undefined ? { harness: seed.harness } : {};
+  const permissions = seed.permissions ?? { extensions: {} };
+  const carrier = {
+    ...(seed.harness !== undefined ? { id: seed.harness } : {}),
+    ...permissions,
+  };
+  verifiedStep = {
+    name: 'builder',
+    body: TEMPLATE,
+    ...(seed.model !== undefined ? { model: seed.model } : {}),
+    x: { harness: carrier },
+  } as unknown as StepDef;
   writeBundle(
     cacheDir,
     {
@@ -256,6 +282,7 @@ function seedBundle(seed: { harness?: string; model?: string; permissions?: Step
 }
 
 beforeEach(() => {
+  verifiedStep = undefined;
   savedEnv = { ...process.env };
   home = mkdtempSync(join(tmpdir(), 'owenloop-agentrun-home-'));
   cacheDir = join(home, 'cache');
@@ -317,8 +344,9 @@ test('run() happy path: agent order → brief → fake harness turn → hub outc
   assert.deepEqual(sig.registered.sort(), ['SIGINT', 'SIGTERM']);
   // The exec-kind holder tag rode first contact (the runner IS an exec holder).
   assert.deepEqual(getOrderArgs[0]!['holder'], { kind: 'exec', id: 'host:123' });
-  // The def name came off a non-claiming whats_next scoped to this workflow.
-  assert.deepEqual(whatsNextArgs, [{ workflow: 'wf1' }]);
+  // Authored step instructions came from the injected verified-store resolver;
+  // agent-run no longer asks the transport for a definition name.
+  assert.deepEqual(whatsNextArgs, []);
   // Submitted closes via the hub outcome — the runner must NOT release.
   assert.equal(releases.length, 0);
   // One start, no deliver: a fresh attempt is a cold start.
@@ -527,25 +555,25 @@ test('a bad OWENLOOP_HARNESS_MODULE is reported and does not crash the runner', 
   assert.match(err.join('\n'), /could not load OWENLOOP_HARNESS_MODULE/);
 });
 
-// ---- template resolution ----------------------------------------------------
+// ---- local instruction resolution --------------------------------------------
 
-test('run() exits 1 and releases when the def has no cached bundle', async () => {
+test('run() exits 1 and releases when the order digest is not installed locally', async () => {
   useAdapter(createFakeAdapter({ id: 'fake' }));
   const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
   const err: string[] = [];
   const code = await run(WIRE, { hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: (l) => err.push(l) });
   assert.equal(code, 1);
-  assert.match(err.join('\n'), /no cached bundle for def 'mydef'/);
+  assert.match(err.join('\n'), /unknown local workflow digest 'sha256:deadbeef'/);
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
 });
 
-test('run() exits 1 when whats_next reports no def for the workflow', async () => {
+test('run() exits 1 when the order has no definition digest', async () => {
   useAdapter(createFakeAdapter({ id: 'fake' }));
-  const { hub } = probeHub({ responses: [agentOrder(), noHold('ok')] }); // def undefined
+  const { hub } = probeHub({ responses: [agentOrder({ defDigest: '' }), noHold('ok')] });
   const err: string[] = [];
   const code = await run(WIRE, { hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: (l) => err.push(l) });
   assert.equal(code, 1);
-  assert.match(err.join('\n'), /whats_next reported no def for workflow 'wf1'/);
+  assert.match(err.join('\n'), /the order has no definition digest/);
 });
 
 // ---- misroute + signal wiring ----------------------------------------------
@@ -553,7 +581,7 @@ test('run() exits 1 when whats_next reports no def for the workflow', async () =
 test('run() releases a COMMAND order as a misroute and exits 1', async () => {
   useAdapter(createFakeAdapter({ id: 'fake' }));
   seedBundle();
-  const { hub, releases } = probeHub({ responses: [agentOrder({ executor: 'command', command: 'echo hi' }), noHold('ok')], def: DEF });
+  const { hub, releases } = probeHub({ responses: [agentOrder({ worker: 'command' }), noHold('ok')], def: DEF });
   const err: string[] = [];
   const code = await run(WIRE, { hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: (l) => err.push(l) });
   assert.equal(code, 1);

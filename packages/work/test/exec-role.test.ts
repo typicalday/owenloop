@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
-import { parseArgs, exitCodeFor, run } from '../src/roles/exec.ts';
+import { parseArgs, exitCodeFor, run as roleRun, type RunDeps } from '../src/roles/exec.ts';
+import type { InstructionResolver } from '../src/exec/instructions.ts';
 import type { ExecOutcome } from '../src/exec/loop.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
@@ -103,7 +104,7 @@ test('parseArgs reads --shift, both value forms', () => {
 
 test('exitCodeFor maps every outcome to the documented code', () => {
   const zero: ExecOutcome[] = ['submitted', 'completed'];
-  const one: ExecOutcome[] = ['misroute', 'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'submit-rejected', 'submit-failed', 'stopped'];
+  const one: ExecOutcome[] = ['misroute', 'unresolved-instructions', 'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'submit-rejected', 'submit-failed', 'stopped'];
   for (const o of zero) assert.equal(exitCodeFor(o), 0);
   for (const o of one) assert.equal(exitCodeFor(o), 1);
 });
@@ -145,6 +146,17 @@ test('run() exits 2 when no hub origin is resolvable', async () => {
   assert.equal(await run(['wf1/run1']), 2);
 });
 
+test('run() refuses the default instruction resolver when HOME and USERPROFILE are both missing', async () => {
+  const err: string[] = [];
+  const env = { ...process.env, HOME: '', USERPROFILE: '' };
+  const code = await roleRun(['wf1/run1', '--origin', 'https://hub.example'], {
+    env,
+    err: (line) => err.push(line),
+  });
+  assert.equal(code, 1);
+  assert.match(err.join('\\n'), /instruction store unavailable: cannot locate the global workflow store: set HOME or USERPROFILE/);
+});
+
 test('run() exits 2 with the refuse message when no Scoped Identity key is stored', async () => {
   // No OWENLOOP_TOKEN override + a hermetic empty file store (temp HOME/XDG,
   // OWENLOOP_NO_KEYCHAIN forces the file backend) ⇒ the agent slot is absent.
@@ -164,7 +176,13 @@ interface OrderOpts {
   claimed?: boolean;
   outcome?: string;
 }
+
+const testCommands = new Map<string, string>();
+let nextTestDigest = 0;
+
 function commandOrder(o: OrderOpts = {}): GetOrderResponse {
+  const defDigest = `test-role-digest-${++nextTestDigest}`;
+  testCommands.set(defDigest, o.command ?? 'echo hi');
   return {
     text: '',
     workflow: 'wf1',
@@ -176,15 +194,22 @@ function commandOrder(o: OrderOpts = {}): GetOrderResponse {
       key: 'k',
       inputs: [],
       outputs: [],
-      executor: 'command',
-      command: o.command ?? 'echo hi',
-      prompt: '',
+      worker: 'command',
+      defDigest,
       consumes: {},
-      owes: [{ path: 'out', acceptance: '', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+      owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     },
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
   };
 }
+
+const testInstructions = (): InstructionResolver => ({
+  resolveCommand: async (order) => ({ ok: true, command: testCommands.get(order.defDigest) ?? 'echo hi' }),
+  resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'step resolution is not used by exec role tests' }),
+});
+
+const run = (args: string[], deps: RunDeps = {}): Promise<number> =>
+  roleRun(args, { instructions: testInstructions(), ...deps });
 
 function roleHub(cfg: { getOrder: GetOrderResponse; onHeartbeat?: (n: number) => void; submitOutcome?: string }): {
   hub: HubClient;

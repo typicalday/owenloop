@@ -128,9 +128,10 @@ export interface FetchedBundle extends FetchedDef {
 }
 
 /**
- * The normalized per-step spec `prepare` writes to `steps/<step>.json`, one file
- * per dispatchable agent step (D4). It replaces the legacy `templates/<step>.md`
- * compiled frontmatter entirely.
+ * The prepare cache may persist routing metadata for `steps/<step>.json`, but
+ * cached instruction text is not authoritative for execution. Runtime workers
+ * resolve the verified step body from the local workflow store. The cache
+ * replaces the legacy `templates/<step>.md` compiled frontmatter entirely.
  *
  * What is DELIBERATELY not in here: the four substitution tokens
  * (`ORDER_TOKEN`, `ORIGIN_TOKEN`, `ACCOUNT_TOKEN`, `SHIFT_TOKEN`) and the

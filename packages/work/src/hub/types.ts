@@ -1,13 +1,7 @@
 /**
- * Typed request/response shapes for the hub verb surface owenloop's roles call.
- *
- * These mirror `apps/hub-edge/src/api/routes.ts` on owenloop-service `origin/main`
- * (B3 lifecycle verbs are merged). Every REST verb returns `{ text, ...data }`
- * where `data` is always an object, so each response extends `HubResponse`.
- *
- * Response payloads are typed LOOSELY on purpose: the roles that consume the
- * data fields (whats_next orders, get_order body, …) land in C3–C5. Honest-loose
- * (`unknown[]` + a TODO) beats invented-precise shapes no consumer reads yet.
+ * Typed request/response shapes for the remote coordinator's transport surface.
+ * Every response carries human-readable `text` plus the verb-specific data.
+ * Payloads stay loose where callers do not consume a field directly.
  */
 
 /** Common envelope: every verb returns a human-readable `text` plus verb data. */
@@ -24,12 +18,10 @@ export interface WhatsNextRequest {
 }
 
 /**
- * One work order from a per-workflow `whats_next` sweep. Mirrors hub-core
- * `verbs/whats-next.ts` `WorkOrder` exactly. `run` IS the order id used by
- * every other hub verb; `step` is the def step name (matched against the
- * cached bundle to classify command vs agent). Fields the shift does not
- * read yet (consumes/expected_outputs/feedback/advisory/submit_hint) are
- * mirrored for completeness — C4/C5 consume them.
+ * One work order from a per-workflow `whats_next` sweep. `run` is the order
+ * identifier used by the other transport verbs. The work order is routing and
+ * dynamic input data; authored instruction text is resolved from the local
+ * workflow store by the worker.
  */
 export interface WorkOrder {
   workflow: string;
@@ -167,12 +159,9 @@ export interface Lease {
 }
 
 /**
- * The persisted A1 order packet get_order re-serves, mirroring owenloop engine
- * `Order` (verified against owenloop-service `packages/engine-do/dist/vendor/
- * engine/engine.d.ts` on 2026-07-17). exec reads `command`/`executor`/`workdir`
- * to run the order and `owes` to know which output paths to submit the receipt
- * to; every other field is carried for completeness. `command` is opaque — the
- * engine never parses it; exec is the one process that shells it out.
+ * The persisted order packet re-served by the transport. The packet carries
+ * the definition projection digest and dynamic routing/state fields only.
+ * Workers must resolve authored command or prompt text from the local store.
  */
 export interface OrderPacket {
   run: string;
@@ -180,23 +169,21 @@ export interface OrderPacket {
   step: string;
   key: string;
   index?: number;
+  /** Projection digest identifying the installed definition snapshot. */
+  defDigest: string;
   inputs: string[];
   outputs: string[];
-  /** Opaque location hint — exec's command cwd when set. */
+  /** Opaque location hint — the worker's cwd when set. */
   workdir?: string;
   model?: string;
-  /** Executor kind; `'command'` for a command order, absent = `'agent'`. */
-  executor?: string;
-  /** The command string for a `executor: command` order (opaque). */
-  command?: string;
+  /** Worker kind; `'command'` for command orders, absent means agent. */
+  worker?: string;
   spec?: Record<string, unknown>;
   x?: Record<string, unknown>;
-  prompt: string;
   consumes: Record<string, unknown>;
-  /** The owed outputs + their reason threads — exec submits the receipt to each. */
+  /** The owed outputs and their reason threads. */
   owes: Array<{
     path: string;
-    acceptance: string;
     judgmentRejects: number;
     schemaRejects: number;
     reasons: ReasonEntry[];

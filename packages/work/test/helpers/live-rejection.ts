@@ -63,7 +63,6 @@ export const REJECTED_PACKET: Pick<OrderPacket, 'owes'> = {
   owes: [
     {
       path: 'pr',
-      acceptance: 'judgment',
       judgmentRejects: 1,
       schemaRejects: 0,
       reasons: [REVIEWER_REASON],

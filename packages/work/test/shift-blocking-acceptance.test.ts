@@ -6,7 +6,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -14,6 +14,9 @@ import { afterEach, beforeEach, test } from 'node:test';
 
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
+import { defInstructionDigest } from '../../../src/order-resolver.ts';
+import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
+import { installBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { readChildRecords } from '../src/shift/state.ts';
 import { OVERLAP_ERROR } from '../src/shift/protocol.ts';
 import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
@@ -28,19 +31,42 @@ interface CommandResult {
 }
 
 let root: string;
+let home: string;
+let localDefDigest = '';
 let configDir: string;
 let cacheDir: string;
 let stateDir: string;
 let shift: ShiftChild | undefined;
 let commands: CommandResult[];
 
-beforeEach(() => {
+beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'owenloop-shift-blocking-'));
+  home = join(root, 'home');
   configDir = join(root, 'config');
   cacheDir = join(root, 'cache');
   stateDir = join(root, 'state');
   shift = undefined;
   commands = [];
+
+  const workflow = `name: demo
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: cmd
+    consumes: [seed]
+    produces: [result]
+    terminal: true
+    executor: command
+    command: 'sleep 5'
+    body: ""
+`;
+  const sourceDir = writeBundleSource({ name: 'demo', workflow });
+  const installed = await installBundleFixture({ sourceDir, root: join(home, '.owenloop', 'workflows') });
+  const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+  const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
+  assert.ok(definition !== undefined);
+  localDefDigest = defInstructionDigest(definition);
 });
 
 function processIsAlive(pid: number): boolean {
@@ -69,6 +95,16 @@ async function stopDetachedExecutions(): Promise<void> {
   );
 }
 
+function makeWritableTree(path: string): void {
+  const stat = lstatSync(path);
+  if (stat.isDirectory()) {
+    for (const child of readdirSync(path)) makeWritableTree(join(path, child));
+    chmodSync(path, 0o755);
+  } else {
+    chmodSync(path, 0o644);
+  }
+}
+
 afterEach(async () => {
   const daemon = shift;
   daemon?.child.kill('SIGKILL');
@@ -80,11 +116,13 @@ afterEach(async () => {
     ...commands.map((command) => command.result),
   ]);
   await stopDetachedExecutions();
+  if (lstatSync(root, { throwIfNoEntry: false })) makeWritableTree(root);
   rmSync(root, { recursive: true, force: true });
 });
 
 function env(): Record<string, string | undefined> {
   return {
+    HOME: home,
     OWENLOOP_TOKEN: TOKEN,
     XDG_CONFIG_HOME: configDir,
     NODE_NO_WARNINGS: '1',
@@ -126,11 +164,10 @@ function orderPacket() {
     key: 'cmd',
     inputs: [],
     outputs: ['result'],
-    executor: 'command',
-    command: 'sleep 5',
-    prompt: '',
+    worker: 'command',
+    defDigest: localDefDigest,
     consumes: {},
-    owes: [{ path: 'result', acceptance: 'required', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+    owes: [{ path: 'result', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
   };
 }
 

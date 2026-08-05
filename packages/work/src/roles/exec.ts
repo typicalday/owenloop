@@ -37,6 +37,7 @@ import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { createExecLoop, type ExecOutcome } from '../exec/loop.ts';
+import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
 import { createDefaultRunner, type CommandRunner } from '../exec/runner.ts';
 import { resolveShiftId, resolveTarget } from './hold.ts';
 import type { ContactHolder } from '../hub/types.ts';
@@ -129,6 +130,7 @@ export function exitCodeFor(outcome: ExecOutcome): number {
     case 'completed':
       return 0;
     case 'misroute':
+    case 'unresolved-instructions':
     case 'killed':
     case 'lease-lost':
     case 'ownership-error':
@@ -150,10 +152,14 @@ export interface RunDeps {
   signalHost?: SignalHost;
   hub?: HubClient;
   runner?: CommandRunner;
+  /** Store-backed instruction resolver; injected tests may provide a fake. */
+  instructions?: InstructionResolver;
   out?: (line: string) => void;
   err?: (line: string) => void;
   /** cwd for a command order that carries no `workdir` (default `process.cwd()`). */
   cwd?: string;
+  /** Environment used to derive the global workflow-store root. */
+  env?: Record<string, string | undefined>;
   /** Holder id override (default `<hostname>:<pid>`) — pinned in tests. */
   holderId?: string;
 }
@@ -180,7 +186,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 2;
   }
 
-  const env = process.env;
+  const env = deps.env ?? process.env;
   let settings;
   try {
     settings = loadSettings(env);
@@ -193,6 +199,17 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work exec: no hub origin — pass --origin <url> or set hubOrigin in settings');
     return 2;
+  }
+
+  const cwd = deps.cwd ?? process.cwd();
+  let instructions = deps.instructions;
+  if (instructions === undefined) {
+    try {
+      instructions = createDefaultStoreInstructionResolver({ cwd, env });
+    } catch (e) {
+      err(`owenloop work exec: instruction store unavailable: ${errMsg(e)}`);
+      return 1;
+    }
   }
 
   const account = env['OWENLOOP_ACCOUNT'] ?? 'default';
@@ -218,7 +235,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     workflow: target.workflow,
     run: target.run,
     holder,
-    cwd: deps.cwd ?? process.cwd(),
+    instructions,
+    cwd,
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     now: () => Date.now(),
     out,

@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync } from 'node:fs';
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -12,6 +12,12 @@ import { createDefaultRunner } from '../src/exec/runner.ts';
 import { createHubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { CommandReceipt } from '../src/exec/receipt.ts';
+import type { InstructionResolver } from '../src/exec/instructions.ts';
+import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
+import { defInstructionDigest } from '../../../src/order-resolver.ts';
+import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
+import { createBundleIngestor, createStoreInstructionSource } from '../../../src/store/index.ts';
+import { installBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 
 // Plan test 12 — integration-style, end to end through the REAL pieces: the
 // default runner (a real child), the real receipt builder, and the REAL hub
@@ -38,14 +44,20 @@ function commandOrder(command: string): GetOrderResponse {
       key: 'k',
       inputs: [],
       outputs: [],
-      executor: 'command',
-      command,
-      prompt: '',
+      worker: 'command',
+      defDigest: 'test-e2e-digest',
       consumes: {},
-      owes: [{ path: 'artifacts/build', acceptance: '', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+      owes: [{ path: 'artifacts/build', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     },
     lease: { claimed: true },
   };
+}
+
+function storeCommandOrder(defDigest: string, remoteCommand: string): GetOrderResponse {
+  const response = commandOrder('ignored remote placeholder');
+  response.order!.defDigest = defDigest;
+  (response.order! as unknown as Record<string, unknown>)['command'] = remoteCommand;
+  return response;
 }
 
 interface HubReq {
@@ -80,13 +92,14 @@ async function startMockHub(order: GetOrderResponse): Promise<{ origin: string; 
   return { origin: `http://127.0.0.1:${port}`, reqs, server };
 }
 
-function loopAgainst(origin: string): ReturnType<typeof createExecLoop> {
+function loopWithInstructions(origin: string, instructions: InstructionResolver): ReturnType<typeof createExecLoop> {
   return createExecLoop({
     hub: createHubClient({ origin, getToken: async () => 'tok-e2e' }),
     runner: createDefaultRunner(),
     workflow: 'wf1',
     run: 'run1',
     holder: EXEC,
+    instructions,
     cwd: CWD,
     sleep: realSleep,
     now: () => Date.now(),
@@ -94,6 +107,14 @@ function loopAgainst(origin: string): ReturnType<typeof createExecLoop> {
     err: () => {},
     heartbeatIntervalMs: 25, // fast beats so a sub-second command sees ≥1
   });
+}
+
+function loopAgainst(origin: string, command: string): ReturnType<typeof createExecLoop> {
+  const instructions: InstructionResolver = {
+    resolveCommand: async () => ({ ok: true, command }),
+    resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'step resolution is not used by exec e2e tests' }),
+  };
+  return loopWithInstructions(origin, instructions);
 }
 
 async function until(cond: () => boolean, what: string, ms = 5_000): Promise<void> {
@@ -109,7 +130,7 @@ const of = (reqs: HubReq[], verb: string): HubReq[] => reqs.filter((r) => r.verb
 test('e2e: get_order → ≥1 heartbeat (holder on the wire) → run → submit → close', async () => {
   const { origin, reqs, server } = await startMockHub(commandOrder('sleep 0.3; echo hi'));
   try {
-    const loop = loopAgainst(origin);
+    const loop = loopAgainst(origin, 'sleep 0.3; echo hi');
     assert.equal(await loop.run(), 'submitted');
 
     // First contact carried the exec holder and the bearer token.
@@ -140,7 +161,7 @@ test('e2e: get_order → ≥1 heartbeat (holder on the wire) → run → submit 
 test('e2e kill drill: signal mid-run → real child killed → release observed, NO submit', async () => {
   const { origin, reqs, server } = await startMockHub(commandOrder('sleep 30'));
   try {
-    const loop = loopAgainst(origin);
+    const loop = loopAgainst(origin, 'sleep 30');
     const p = loop.run();
     // The command is running once a heartbeat lands (first contact done, race on).
     await until(() => of(reqs, 'heartbeat').length >= 1, 'the first heartbeat');

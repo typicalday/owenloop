@@ -74,6 +74,18 @@ export {
   objectDestRelPath,
   recoverWorkflowStore,
 } from './install.ts';
+export { createBundleIngestor } from './ingestor.ts';
+export type { BundleIngestorOptions } from './ingestor.ts';
+export {
+  createStoreInstructionSource,
+  isResolvableOrderDigest,
+  StoreInstructionSourceError,
+} from './instruction-source.ts';
+export type {
+  MissingObjectHandler,
+  StoreInstructionSource,
+  StoreInstructionSourceArgs,
+} from './instruction-source.ts';
 export type {
   BundleInstallResult,
   BundleIngestor,
