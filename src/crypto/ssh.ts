@@ -31,7 +31,7 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdtempSync, openSync, rmSync, writeFileSync, closeSync, readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseAllowedSigners } from './allowed-signers.ts';
@@ -467,33 +467,4 @@ export function assertEd25519PubText(pubText: string, label: string): void {
   if (keyType !== 'ssh-ed25519') {
     throw new SshSignerError(`${label}: only Ed25519 keys are supported in WP-A2 (found ${keyType ?? 'no key type'})`);
   }
-}
-
-/**
- * Open a private-key materialization slot: a unique `0700` temp directory.
- * Callers write the `0600` private file inside, pass its path to `ssh-keygen`,
- * and remove the directory in `finally`.
- */
-export function openTempKeyDir(makeDir?: (prefix: string) => string): { dir: string; close(): void } {
-  const dir = (makeDir ?? ((prefix: string) => mkdtempSync(join(tmpdir(), prefix))))('owenloop-key-');
-  chmodSync(dir, 0o700);
-  return {
-    dir,
-    close() {
-      rmSync(dir, { recursive: true, force: true });
-    },
-  };
-}
-
-/** Write a `0600` file inside a temp key dir (used by the key materialization path). */
-export function writeTempKeyFile(dir: string, name: string, contents: string): string {
-  const path = join(dir, name);
-  const fd = openSync(path, 'w', 0o600);
-  try {
-    writeFileSync(fd, contents);
-  } finally {
-    closeSync(fd);
-  }
-  chmodSync(path, 0o600);
-  return path;
 }

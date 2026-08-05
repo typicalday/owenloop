@@ -89,7 +89,7 @@ interface RunRecord {
  * generation/challenge results, so these tests never touch a real binary.
  * `store` maps backend-hash → record text.
  */
-function makeFakeRunner(opts: { failLookup?: boolean; failStore?: boolean } = {}): {
+function makeFakeRunner(opts: { failLookup?: boolean; failStore?: boolean; secretToolLookupStatus?: number; derivedPubText?: string } = {}): {
   runner: KeyCommandRunner;
   runs: RunRecord[];
   store: Map<string, string>;
@@ -113,7 +113,7 @@ function makeFakeRunner(opts: { failLookup?: boolean; failStore?: boolean } = {}
         return { status: 0, stdout: Buffer.alloc(0) };
       }
       if (args[0] === '-y' && args[1] === '-f') {
-        return { status: 0, stdout: Buffer.from(FIXTURE_PUB, 'utf8') };
+        return { status: 0, stdout: Buffer.from(opts.derivedPubText ?? FIXTURE_PUB, 'utf8') };
       }
       if (args[0] === '-Y' && args[1] === 'sign') {
         return {
@@ -146,6 +146,7 @@ function makeFakeRunner(opts: { failLookup?: boolean; failStore?: boolean } = {}
       // --- Linux secret-tool ---
       if (cmd === 'secret-tool' && args[0] === 'lookup') {
         const hash = args[args.length - 1]!;
+        if (opts.secretToolLookupStatus !== undefined) return { status: opts.secretToolLookupStatus, stdout: Buffer.alloc(0) };
         if (opts.failLookup) return { status: 2, stdout: Buffer.alloc(0) };
         if (o.stdoutFd === undefined) throw new Error('lookup must redirect stdout to an fd');
         const rec = store.get(hash);
@@ -170,6 +171,30 @@ function assertNoPoison(label: string, ...texts: Array<string | undefined>): voi
   for (const t of texts) {
     assert.ok(t === undefined || !t.includes(POISON), `${label}: poison marker leaked`);
   }
+}
+
+function backendMarkerPath(home: string, ref: PrincipalKeyRef = REF): string {
+  return join(home, '.owenloop', 'keys', `${keyRefHash(ref)}.backend`);
+}
+
+function validGeneratedRecord(): string {
+  return JSON.stringify({
+    version: 1,
+    ref: REF,
+    kind: 'generated',
+    publicKey: FIXTURE_PUB.trim(),
+    fingerprint: publicKeyDescriptor(FIXTURE_PUB).keyid,
+    createdAt: new Date().toISOString(),
+    privateKey: 'PRIVATE',
+  });
+}
+
+function syntheticEd25519PublicKey(byte: number, comment: string): string {
+  const blob = Buffer.alloc(4 + 11 + 4 + 32, byte);
+  blob.writeUInt32BE(11, 0);
+  blob.write('ssh-ed25519', 4, 'ascii');
+  blob.writeUInt32BE(32, 15);
+  return `ssh-ed25519 ${blob.toString('base64')} ${comment}`;
 }
 
 // ---- backend selection (pure) ----------------------------------------------------
@@ -207,6 +232,54 @@ test('backend selection: an explicit backend option overrides platform logic; mi
   });
   assert.equal(m.backend, 'file');
   assert.throws(() => new PrincipalKeyManager({ env: {} }), CliError);
+});
+
+test('backend ownership markers are claimed on first read and first write for every backend', async () => {
+  const record = validGeneratedRecord();
+  for (const backend of ['file', 'macos-security', 'secret-tool'] as const) {
+    const home = freshHome();
+    const fake = makeFakeRunner();
+    const manager = new PrincipalKeyManager({ env: {}, backend, runner: fake.runner, homeDir: home });
+    const marker = backendMarkerPath(home);
+    if (backend === 'file') {
+      const keys = join(home, '.owenloop', 'keys');
+      mkdirSync(keys, { recursive: true });
+      writeFileSync(join(keys, `${keyRefHash(REF)}.json`), record, { mode: 0o600 });
+    } else {
+      fake.store.set(keyRefHash(REF), record);
+    }
+    assert.equal(existsSync(marker), false, `${backend}: marker starts absent`);
+    const inspected = await manager.inspect(REF);
+    assert.equal(inspected.exists, true, `${backend}: first read sees the stored record`);
+    assert.equal(readFileSync(marker, 'utf8').trim(), backend, `${backend}: first read claims ownership`);
+
+    const fresh = freshHome();
+    const generated = new PrincipalKeyManager({ env: {}, backend, runner: makeFakeRunner().runner, homeDir: fresh });
+    await generated.ensure(REF);
+    assert.equal(readFileSync(backendMarkerPath(fresh), 'utf8').trim(), backend, `${backend}: first write claims ownership`);
+  }
+});
+
+test('backend ownership refuses cross-backend reads, pre-marker file records, and corrupt markers', async () => {
+  const home = freshHome();
+  const file = new PrincipalKeyManager({ env: {}, backend: 'file', runner: makeFakeRunner().runner, homeDir: home });
+  await file.ensure(REF);
+  const secret = new PrincipalKeyManager({ env: {}, backend: 'secret-tool', runner: makeFakeRunner().runner, homeDir: home });
+  await assert.rejects(secret.inspect(REF), /belongs to backend file/);
+
+  const preMarkerHome = freshHome();
+  const keys = join(preMarkerHome, '.owenloop', 'keys');
+  mkdirSync(keys, { recursive: true });
+  writeFileSync(join(keys, `${keyRefHash(REF)}.json`), validGeneratedRecord(), { mode: 0o600 });
+  const selectedSecret = new PrincipalKeyManager({ env: {}, backend: 'secret-tool', runner: makeFakeRunner().runner, homeDir: preMarkerHome });
+  await assert.rejects(selectedSecret.inspect(REF), /has a file-backed record/);
+
+  const corruptHome = freshHome();
+  const corruptKeys = join(corruptHome, '.owenloop', 'keys');
+  mkdirSync(corruptKeys, { recursive: true });
+  writeFileSync(backendMarkerPath(corruptHome), 'not-a-backend\n', { mode: 0o600 });
+  const corrupt = new PrincipalKeyManager({ env: {}, backend: 'file', runner: makeFakeRunner().runner, homeDir: corruptHome });
+  await assert.rejects(corrupt.inspect(REF), /backend ownership .* corrupt/);
 });
 
 // ---- fake-platform storage: macos-security ----------------------------------------
@@ -283,6 +356,16 @@ test('secret-tool: create/lookup round-trip through stdin and fd redirection', a
   assert.equal(res2.state, 'existing');
 });
 
+test('secret-tool: lookup status 1 is an absent item, not a backend failure', async () => {
+  const home = freshHome();
+  const { runner, runs } = makeFakeRunner({ secretToolLookupStatus: 1 });
+  const m = new PrincipalKeyManager({ env: {}, backend: 'secret-tool', runner, homeDir: home });
+  const result = await m.inspect(REF);
+  assert.deepEqual(result, { exists: false, source: undefined, backend: undefined, publicKey: undefined });
+  const lookup = runs.find((r) => r.cmd === 'secret-tool' && r.args[0] === 'lookup');
+  assert.ok(lookup, 'the status-1 lookup path was exercised');
+});
+
 test('secret-tool: store failure is a hard error, never a fallback', async () => {
   const home = freshHome();
   const { runner } = makeFakeRunner({ failStore: true });
@@ -356,6 +439,65 @@ test('file backend: corrupt record and ref-mismatch are hard failures — never 
   });
   writeFileSync(recordPath, noKey, { mode: 0o600 });
   await assert.rejects(m.ensure(REF), /corrupt \(missing key material\)/);
+});
+
+test('record schema rejects each strict invariant at the field that is malformed', async () => {
+  const cases: Array<{ name: string; mutate: (record: Record<string, unknown>) => void; error: RegExp }> = [
+    {
+      name: 'fingerprint mismatch',
+      mutate: (record) => { record.fingerprint = 'SHA256:wrong'; },
+      error: /fingerprint mismatch/,
+    },
+    {
+      name: 'non-canonical createdAt',
+      mutate: (record) => { record.createdAt = '2020-01-01'; },
+      error: /invalid createdAt/,
+    },
+    {
+      name: 'generated record carries reused path',
+      mutate: (record) => { record.path = '/not-a-secret-path'; },
+      error: /unexpected reused path/,
+    },
+  ];
+  for (const c of cases) {
+    const home = freshHome();
+    const m = new PrincipalKeyManager({ env: {}, backend: 'file', runner: makeFakeRunner().runner, homeDir: home });
+    const record = JSON.parse(validGeneratedRecord()) as Record<string, unknown>;
+    c.mutate(record);
+    const keys = join(home, '.owenloop', 'keys');
+    mkdirSync(keys, { recursive: true });
+    writeFileSync(join(keys, `${keyRefHash(REF)}.json`), JSON.stringify(record), { mode: 0o600 });
+    await assert.rejects(m.inspect(REF), (e: Error) => {
+      assert.match(e.message, c.error, c.name);
+      return true;
+    });
+  }
+
+  const reusedHome = freshHome();
+  const reusedManager = new PrincipalKeyManager({ env: {}, backend: 'file', runner: makeFakeRunner().runner, homeDir: reusedHome });
+  const reused = JSON.parse(validGeneratedRecord()) as Record<string, unknown>;
+  reused.kind = 'reused';
+  reused.path = '/not-a-secret-path';
+  const reusedKeys = join(reusedHome, '.owenloop', 'keys');
+  mkdirSync(reusedKeys, { recursive: true });
+  writeFileSync(join(reusedKeys, `${keyRefHash(REF)}.json`), JSON.stringify(reused), { mode: 0o600 });
+  await assert.rejects(reusedManager.inspect(REF), /reused record contains key material/);
+
+  const alternate = syntheticEd25519PublicKey(0x42, 'alternate');
+  const mismatchHome = freshHome();
+  const mismatchManager = new PrincipalKeyManager({
+    env: {},
+    backend: 'file',
+    runner: makeFakeRunner({ derivedPubText: FIXTURE_PUB }).runner,
+    homeDir: mismatchHome,
+  });
+  const mismatch = JSON.parse(validGeneratedRecord()) as Record<string, unknown>;
+  mismatch.publicKey = alternate;
+  mismatch.fingerprint = publicKeyDescriptor(alternate).keyid;
+  const mismatchKeys = join(mismatchHome, '.owenloop', 'keys');
+  mkdirSync(mismatchKeys, { recursive: true });
+  writeFileSync(join(mismatchKeys, `${keyRefHash(REF)}.json`), JSON.stringify(mismatch), { mode: 0o600 });
+  await assert.rejects(mismatchManager.inspect(REF), /private\/public key mismatch/);
 });
 
 // ---- reuse rules --------------------------------------------------------------------
@@ -585,6 +727,11 @@ test('keyidFromBlob matches stock ssh-keygen -lf for the fixture key', { skip: S
   assert.equal(keyidFromBlob(blob), desc.keyid, 'descriptor keyid is the blob fingerprint');
   const lf = execFileSync('ssh-keygen', ['-lf', join(FIXTURES, 'fixture-key.pub')], { encoding: 'utf8' });
   assert.ok(lf.includes(desc.keyid), `stock fingerprint matches ${desc.keyid}`);
+});
+
+test('publicKeyDescriptor rejects malformed Base64 instead of silently dropping characters', () => {
+  assert.throws(() => publicKeyDescriptor('ssh-ed25519 !!! malformed'), /public key Base64 is malformed/);
+  assert.throws(() => publicKeyDescriptor('ssh-ed25519 A=== malformed'), /public key Base64 is malformed/);
 });
 
 test('keysDirFor pins the storage layout $HOME/.owenloop/keys', () => {

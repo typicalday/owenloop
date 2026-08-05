@@ -196,14 +196,32 @@ test('dsseVerifyEnvelope: a valid envelope for ANOTHER record class throws (orde
   );
 });
 
-test('dsseVerifyEnvelope: cryptographic miss (wrong key / tampered bytes) returns zero signers, not an error', async () => {
+test('dsseVerifyEnvelope: cryptographic miss is an unambiguous verification failure', async () => {
   const env = {
     payload: encodeBase64(Buffer.from('x')),
     payloadType: PAYLOAD_TYPE_ORIGIN,
     signatures: [{ sig: encodeBase64(Buffer.from('not-expected')) }],
   };
-  const res = await dsseVerifyEnvelope(env, PAYLOAD_TYPE_ORIGIN, strictVerifier(Buffer.from('expected')));
-  assert.equal(res.signers.length, 0);
+  await assert.rejects(
+    dsseVerifyEnvelope(env, PAYLOAD_TYPE_ORIGIN, strictVerifier(Buffer.from('expected'))),
+    (e: Error) => {
+      assert.ok(e instanceof DsseEnvelopeError);
+      assert.match(e.message, /DSSE verification failed/);
+      return true;
+    },
+  );
+});
+
+test('dsseVerifyEnvelope: a forged empty-payload envelope cannot look like a verified empty payload', async () => {
+  const env = {
+    payload: '',
+    payloadType: PAYLOAD_TYPE_ORIGIN,
+    signatures: [{ sig: encodeBase64(Buffer.from('forged')) }],
+  };
+  await assert.rejects(
+    dsseVerifyEnvelope(env, PAYLOAD_TYPE_ORIGIN, strictVerifier(Buffer.from('real-empty-payload-signature'))),
+    /DSSE verification failed/,
+  );
 });
 
 test('dsseVerifyEnvelope: absent and empty keyid are identical (both unauthenticated hints)', async () => {
@@ -241,8 +259,10 @@ test('dsseVerifyEnvelope: duplicate signatures from the SAME trusted key count o
       { keyid: 'SHA256:same', sig: encodeBase64(sig) },
     ],
   };
-  const res = await dsseVerifyEnvelope(env, PAYLOAD_TYPE_ORIGIN, strictVerifier(sig), { threshold: 2 });
-  assert.equal(res.signers.length, 0, 'one key cannot satisfy threshold 2');
+  await assert.rejects(
+    dsseVerifyEnvelope(env, PAYLOAD_TYPE_ORIGIN, strictVerifier(sig), { threshold: 2 }),
+    /DSSE verification failed/,
+  );
   const ok = await dsseVerifyEnvelope(env, PAYLOAD_TYPE_ORIGIN, strictVerifier(sig), { threshold: 1 });
   assert.equal(ok.signers.length, 1, 'deduped to one verified signer');
 });

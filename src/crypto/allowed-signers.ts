@@ -89,7 +89,8 @@ function tokenizeOptions(text: string): string[] {
     }
     if (ch === '"') inQuotes = !inQuotes;
     if (ch === ',' && !inQuotes) {
-      if (current === '') throw new Error('empty option');
+      // OpenSSH tolerates empty option slots between commas. A trailing comma
+      // is different: stock reports an unexpected end-of-options error.
       tokens.push(current);
       current = '';
       continue;
@@ -108,39 +109,66 @@ function splitPrincipals(text: string): string[] {
 }
 
 /**
- * Split one source line on whitespace outside quotes. Escaped quotes and
- * backslashes remain in the token so option parsing can validate and unescape
- * them exactly once.
+ * Read the fields needed to identify one line, then treat the rest as opaque
+ * comment text. OpenSSH only applies quote rules to the optional options field;
+ * quotes in a trailing comment must never turn a valid line into a parse error.
  */
 function splitLineTokens(line: string): string[] {
   const tokens: string[] = [];
-  let current = '';
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]!;
-    if (ch === '\\' && inQuotes) {
-      const next = line[i + 1];
-      if (next === undefined) throw new Error('dangling escape in quoted token');
-      current += ch + next;
-      i += 1;
-      continue;
-    }
-    if (ch === '"') {
-      inQuotes = !inQuotes;
-      current += ch;
-      continue;
-    }
-    if (!inQuotes && (ch === ' ' || ch === '\t')) {
-      if (current !== '') {
-        tokens.push(current);
-        current = '';
+  let offset = 0;
+
+  const skipWhitespace = (): void => {
+    while (offset < line.length && (line[offset] === ' ' || line[offset] === '\t')) offset += 1;
+  };
+
+  const readToken = (): string => {
+    skipWhitespace();
+    if (offset >= line.length) return '';
+    let token = '';
+    let inQuotes = false;
+    while (offset < line.length) {
+      const ch = line[offset]!;
+      if (ch === '\\' && inQuotes) {
+        const next = line[offset + 1];
+        if (next === undefined) throw new Error('dangling escape in quoted token');
+        token += ch + next;
+        offset += 2;
+        continue;
       }
-      continue;
+      if (ch === '"') {
+        inQuotes = !inQuotes;
+        token += ch;
+        offset += 1;
+        continue;
+      }
+      if (!inQuotes && (ch === ' ' || ch === '\t')) break;
+      token += ch;
+      offset += 1;
     }
-    current += ch;
+    if (inQuotes) throw new Error('unterminated quoted option value');
+    return token;
+  };
+
+  const first = readToken();
+  if (first === '') return tokens;
+  tokens.push(first);
+
+  const second = readToken();
+  if (second === '') return tokens;
+  tokens.push(second);
+
+  // A bare line needs principals, key type, and key blob. An options line
+  // needs one additional field. Stop scanning immediately after the blob.
+  const requiredFields = KEYTYPE_RE.test(second) ? 3 : 4;
+  while (tokens.length < requiredFields) {
+    const before = offset;
+    const token = readToken();
+    if (token === '' && before === offset) break;
+    tokens.push(token);
   }
-  if (inQuotes) throw new Error('unterminated quoted option value');
-  if (current !== '') tokens.push(current);
+
+  skipWhitespace();
+  if (offset < line.length) tokens.push(line.slice(offset));
   return tokens;
 }
 
@@ -233,6 +261,7 @@ export function parseAllowedSigners(text: string): AllowedSignersFile {
       }
       let optionError: string | null = null;
       for (const rawOption of optionTokens) {
+        if (rawOption === '') continue;
         const eq = rawOption.indexOf('=');
         const rawName = eq < 0 ? rawOption : rawOption.slice(0, eq);
         const name = rawName.toLowerCase();
@@ -241,10 +270,8 @@ export function parseAllowedSigners(text: string): AllowedSignersFile {
             optionError = `unsupported option syntax: '${rawOption}'`;
             break;
           }
-          if (options.certAuthority) {
-            optionError = 'duplicate option: cert-authority';
-            break;
-          }
+          // OpenSSH accepts repeated cert-authority options. Preserve the
+          // boolean representation without treating repetition as a grammar error.
           options.certAuthority = true;
           continue;
         }

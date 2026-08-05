@@ -91,6 +91,13 @@ pipe, log, or error message.
 (`$HOME/.owenloop/keys/<hash>.lock`): acquire → re-read → generate only when
 still absent, so concurrent setups generate exactly once.
 
+`inspect(ref)` returns only non-secret state, but validation of a generated
+record is not a zero-byte operation: the manager temporarily writes the stored
+private material to a `0600` file in a `0700` directory, runs stock
+`ssh-keygen -y`, compares the derived public key and fingerprint, and removes
+the directory in `finally`. The private text never appears in the inspection
+result or in an exception.
+
 ### Materialization
 
 `withSigningKey(ref, callback)` hands the callback a **path** to a usable
@@ -142,10 +149,12 @@ Five versioned payload types, one per signed record class:
 | `PAYLOAD_TYPE_ORIGIN` | `application/vnd.owenloop.origin.v1+json` |
 
 `dsseVerifyEnvelope` runs a fixed order — Base64 decode → PAE → signature
-verification → payload-type check — and returns the payload bytes **exactly**;
-a cryptographic miss yields zero signers (not an error), while malformed
-shapes throw `DsseEnvelopeError`. Duplicate signatures from the same trusted
-key count once; a `threshold` option requires that many distinct signers.
+verification → payload-type check — and returns the payload bytes **exactly**.
+A cryptographic miss throws `DsseEnvelopeError`; the verifier never returns an
+empty payload that could be mistaken for a successfully verified empty payload.
+Malformed shapes also throw `DsseEnvelopeError`. Duplicate signatures from the
+same trusted key count once; a `threshold` option requires that many distinct
+signers.
 SSHSIG signatures are produced and verified under the namespace
 `owenloop-dsse-v1` (`DSSE_SSH_NAMESPACE`).
 
@@ -157,12 +166,15 @@ and trailing comment) **structurally**. The supported option syntax is
 `cert-authority`, `namespaces="..."`, `valid-after="..."`, and
 `valid-before="..."`; assignment values must use the stock quoted form.
 `touch-required` is rejected because it is not a stock option supported by the
-OpenSSH verifier used here. The parser never throws: malformed lines come back
-with their line numbers alongside the well-formed entries. It deliberately does
-**not** implement OpenSSH pattern matching or authorization — `ssh-keygen -Y
-verify` remains the policy authority, and accepted policy text is fed back to it
-unchanged. `SshSigner` additionally restricts verification policy entries to
-Ed25519 keys.
+OpenSSH verifier used here. Repeated `cert-authority` options and empty option
+slots between commas are retained as stock-tolerated syntax; a trailing comma
+still produces a parse error. Quotes in a trailing comment are opaque after the
+key blob and do not affect option parsing. The parser never throws: malformed
+lines come back with their line numbers alongside the well-formed entries. It
+deliberately does **not** implement OpenSSH pattern matching or authorization —
+`ssh-keygen -Y verify` remains the policy authority, and accepted policy text is
+fed back to it unchanged. `SshSigner` additionally restricts verification policy
+entries to Ed25519 keys.
 
 ## Out of scope (future work)
 

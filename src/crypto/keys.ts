@@ -206,6 +206,19 @@ export function keyidFromBlob(blob: Buffer): string {
   return `SHA256:${createHash('sha256').update(blob).digest('base64').replace(/=+$/, '')}`;
 }
 
+/** Decode a standard OpenSSH public-key blob without Node's permissive Base64 rules. */
+function decodePublicKeyBlob(text: string): Buffer {
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text) || text.length % 4 === 1) {
+    throw new CliError('public key Base64 is malformed');
+  }
+  const body = text.replace(/=+$/, '');
+  const expectedPadding = body.length % 4 === 0 ? 0 : 4 - (body.length % 4);
+  if (text.length - body.length !== expectedPadding) throw new CliError('public key Base64 is malformed');
+  const blob = Buffer.from(text, 'base64');
+  if (blob.length === 0) throw new CliError('public key blob is empty');
+  return blob;
+}
+
 /** Parse an OpenSSH public-key line into a descriptor (never reads private bytes). */
 export function publicKeyDescriptor(pubText: string): PublicKeyDescriptor {
   const line = pubText.split(/\r?\n/).find((l) => l.trim() !== '');
@@ -213,7 +226,7 @@ export function publicKeyDescriptor(pubText: string): PublicKeyDescriptor {
   const parts = line.trim().split(/\s+/);
   if (parts.length < 2) throw new CliError('public key line is malformed');
   const keyType = parts[0]!;
-  const blob = Buffer.from(parts[1]!, 'base64');
+  const blob = decodePublicKeyBlob(parts[1]!);
   const comment = parts.slice(2).join(' ');
   return { keyid: keyidFromBlob(blob), keyType, openSshPublicKey: parts.slice(0, 2).join(' ') + (comment ? ` ${comment}` : ''), comment };
 }
@@ -537,8 +550,10 @@ export class PrincipalKeyManager {
 
   /**
    * Non-secret inspection: does a key exist for this ref, and what is its
-   * public descriptor / source / backend? Never reads private bytes into the
-   * result.
+   * public descriptor / source / backend? For generated records, validation
+   * temporarily materializes private bytes in a 0600 file so stock ssh-keygen
+   * can derive and compare the public half; private bytes never enter the
+   * returned result.
    */
   async inspect(ref: PrincipalKeyRef): Promise<InspectKeyResult> {
     assertKeyRef(ref);

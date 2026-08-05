@@ -68,8 +68,9 @@ export interface DsseEnvelope {
 
 /**
  * A malformed envelope — wrong shape, bad Base64, missing required fields.
- * Distinct from a CRYPTOGRAPHIC miss (wrong key / tampered bytes), which is
- * reported as `signatures: []` with `ok: false`.
+ * A cryptographic miss (wrong key / tampered bytes) is also a hard verification
+ * failure: `dsseVerifyEnvelope` throws this error instead of returning a result
+ * whose empty payload could be mistaken for a verified empty payload.
  */
 export class DsseEnvelopeError extends Error {
   constructor(message: string) {
@@ -246,7 +247,9 @@ export async function dsseVerifyEnvelope(
     verified.push(res);
   }
   if (verified.length < threshold) {
-    return { payloadBytes: Buffer.alloc(0), signers: [] };
+    throw new DsseEnvelopeError(
+      `DSSE verification failed: ${verified.length} distinct trusted signer(s), threshold is ${threshold}`,
+    );
   }
   if (env.payloadType !== expectedPayloadType) {
     throw new DsseEnvelopeError(

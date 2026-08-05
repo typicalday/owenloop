@@ -244,16 +244,69 @@ test('interop: a DSSE PAE signed under the DSSE namespace verifies end to end', 
 
 // ---- capability probe -----------------------------------------------------------
 
-test('probe: on a host with a working ssh-keygen, probeSshKeygenY reports ok and caches', { skip: SKIP }, () => {
+test('probe: the injected process adapter reports support and caches by identity', () => {
   resetSshKeygenProbe();
+  let probeCalls = 0;
+  const adapter: SshProcessAdapter = {
+    async run() {
+      return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), timedOut: false, truncated: false };
+    },
+    probe(cmd, args) {
+      probeCalls += 1;
+      assert.equal(cmd, 'ssh-keygen');
+      assert.deepEqual(args.slice(0, 2), ['-Y', 'find-principals']);
+      return { status: 255, stderr: Buffer.from('No principal matched\\n') };
+    },
+  };
   try {
-    const first = probeSshKeygenY();
+    const first = probeSshKeygenY(adapter, (prefix) => mkdtempSync(join(tmpdir(), prefix)));
     assert.equal(first.ok, true);
-    const second = probeSshKeygenY();
+    const second = probeSshKeygenY(adapter);
     assert.strictEqual(second, first, 'cached by identity');
+    assert.equal(probeCalls, 1, 'the adapter is called once');
   } finally {
     resetSshKeygenProbe();
   }
+});
+
+test('probe: injected adapter classifies ENOENT, timeout, signal, and unknown-option branches', () => {
+  const cases = [
+    {
+      name: 'missing executable',
+      result: { status: null, stderr: Buffer.alloc(0), errorCode: 'ENOENT' },
+      detail: /ENOENT/,
+    },
+    {
+      name: 'timeout',
+      result: { status: null, stderr: Buffer.alloc(0), errorCode: 'ETIMEDOUT', timedOut: true },
+      detail: /timed out/,
+    },
+    {
+      name: 'signal',
+      result: { status: null, stderr: Buffer.alloc(0) },
+      detail: /terminated by signal/,
+    },
+    {
+      name: 'unsupported option',
+      result: { status: 255, stderr: Buffer.from('ssh-keygen: unknown option -- Y\\n') },
+      detail: /does not support -Y/,
+    },
+  ];
+  for (const c of cases) {
+    resetSshKeygenProbe();
+    const adapter: SshProcessAdapter = {
+      async run() {
+        return { status: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), timedOut: false, truncated: false };
+      },
+      probe() {
+        return c.result;
+      },
+    };
+    const result = probeSshKeygenY(adapter, (prefix) => mkdtempSync(join(tmpdir(), prefix)));
+    assert.equal(result.ok, false, c.name);
+    assert.match(result.detail, c.detail, c.name);
+  }
+  resetSshKeygenProbe();
 });
 
 // ---- hermetic fake-adapter tests -------------------------------------------------
@@ -448,6 +501,28 @@ test('fake verify: normal miss (nonzero exit) → null; signal death → throw; 
   {
     const signer = new SshSigner({ namespace: 'n', process: fakeAdapter([]).adapter });
     await assert.rejects(signer.verify(Buffer.from('m'), Buffer.from('s')), /not configured for verification/);
+  }
+});
+
+test('fake verify: malformed allowed_signers policy throws before invoking ssh-keygen', async () => {
+  const { adapter, calls } = fakeAdapter([{ status: 0 }]);
+  const signer = new SshSigner({
+    namespace: 'n',
+    verify: {
+      principal: 'alice',
+      allowedSignersText: 'alice touch-required ssh-ed25519 QUJD\\n',
+    },
+    process: adapter,
+  });
+  try {
+    await assert.rejects(signer.verify(Buffer.from('m'), Buffer.from('s')), (e: Error) => {
+      assert.ok(e instanceof SshSignerError);
+      assert.match(e.message, /malformed allowed_signers policy/);
+      return true;
+    });
+    assert.equal(calls.length, 0, 'malformed policy is rejected before child invocation');
+  } finally {
+    signer.dispose();
   }
 });
 
