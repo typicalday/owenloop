@@ -1,0 +1,116 @@
+{
+  "valid": {
+    "run": "run-build-7",
+    "workflow": "build-instance",
+    "step": "producer",
+    "key": "producer",
+    "index": 0,
+    "defDigest": "injected-digest",
+    "inputs": ["question"],
+    "outputs": ["result"],
+    "workdir": "/work",
+    "model": "quality",
+    "worker": "agent",
+    "spec": { "region": "example" },
+    "x": { "trace": true },
+    "consumes": { "question": { "text": "ship" } },
+    "owes": [
+      {
+        "path": "result",
+        "judgmentRejects": 1,
+        "schemaRejects": 0,
+        "reasons": [
+          {
+            "at": 1785800000000,
+            "action": "reject",
+            "kind": "judgment",
+            "by": "reviewer",
+            "text": "add a source",
+            "fromVersion": 1
+          }
+        ],
+        "proof": "serialized-dsse-envelope"
+      }
+    ],
+    "consumesProof": "serialized-consume-proof",
+    "cause": "inputsGreen"
+  },
+  "invalid": [
+    {
+      "name": "missing-owes",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build-instance",
+        "step": "producer",
+        "key": "producer",
+        "defDigest": "injected-digest",
+        "inputs": [],
+        "outputs": []
+      },
+      "keyword": "required"
+    },
+    {
+      "name": "null-optional-workdir",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build-instance",
+        "step": "producer",
+        "key": "producer",
+        "defDigest": "injected-digest",
+        "inputs": [],
+        "outputs": [],
+        "workdir": null,
+        "consumes": {},
+        "owes": []
+      },
+      "keyword": "type"
+    },
+    {
+      "name": "unexpected-order-property",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build-instance",
+        "step": "producer",
+        "key": "producer",
+        "defDigest": "injected-digest",
+        "inputs": [],
+        "outputs": [],
+        "consumes": {},
+        "owes": [],
+        "prompt": "must not be on a reference order"
+      },
+      "keyword": "additionalProperties"
+    },
+    {
+      "name": "unexpected-reason-property",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build-instance",
+        "step": "producer",
+        "key": "producer",
+        "defDigest": "injected-digest",
+        "inputs": [],
+        "outputs": [],
+        "consumes": {},
+        "owes": [
+          {
+            "path": "result",
+            "judgmentRejects": 0,
+            "schemaRejects": 0,
+            "reasons": [
+              {
+                "at": 1785800000000,
+                "action": "reject",
+                "kind": "judgment",
+                "by": "reviewer",
+                "text": "reason",
+                "metadata": {}
+              }
+            ]
+          }
+        ]
+      },
+      "keyword": "additionalProperties"
+    }
+  ]
+}

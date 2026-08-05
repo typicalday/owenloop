@@ -176,6 +176,13 @@ signers, so the two outcomes are unambiguous. Malformed shapes also throw
 `DsseEnvelopeError`. Duplicate signatures from the same trusted key count once;
 a `threshold` option requires that many distinct signers.
 
+## Wire record shapes
+
+The record shapes that ride these DSSE envelopes are documented in
+[`docs/wire-contracts.md`](wire-contracts.md). That document is the public
+reference for the five launch contracts, their schemas, and the versioning
+rule.
+
 ## The role of `allowed_signers`
 
 `parseAllowedSigners` parses the stock OpenSSH `allowed_signers` format

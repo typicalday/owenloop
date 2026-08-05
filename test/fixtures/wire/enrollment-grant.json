@@ -1,0 +1,125 @@
+{
+  "valid": {
+    "newKey": {
+      "keyid": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "keyType": "ssh-ed25519",
+      "openSshPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexample",
+      "comment": "build agent"
+    },
+    "principal": {
+      "kind": "agent",
+      "id": "agent-build-7"
+    },
+    "scope": {
+      "pools": "*",
+      "labels": "*",
+      "namespaces": "*",
+      "delegation": {
+        "allowed": true,
+        "maxDepth": "unbounded"
+      }
+    },
+    "grantedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "validFrom": 1785800000000
+  },
+  "additionalValid": [
+    {
+      "newKey": {
+        "keyid": "SHA256:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+        "keyType": "ssh-ed25519",
+        "openSshPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexample"
+      },
+      "principal": {
+        "kind": "machine",
+        "id": "machine-local"
+      },
+      "scope": {
+        "pools": [],
+        "labels": [],
+        "namespaces": [],
+        "delegation": {
+          "allowed": false
+        }
+      },
+      "grantedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "validFrom": 1785800000000
+    }
+  ],
+  "invalid": [
+    {
+      "name": "missing-scope",
+      "value": {
+        "newKey": {
+          "keyid": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+          "keyType": "ssh-ed25519",
+          "openSshPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexample"
+        },
+        "principal": { "kind": "agent", "id": "agent-build-7" },
+        "grantedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "validFrom": 1785800000000
+      },
+      "keyword": "required"
+    },
+    {
+      "name": "invalid-principal-kind",
+      "value": {
+        "newKey": {
+          "keyid": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+          "keyType": "ssh-ed25519",
+          "openSshPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexample"
+        },
+        "principal": { "kind": "service", "id": "service-build-7" },
+        "scope": {
+          "pools": [],
+          "labels": [],
+          "namespaces": [],
+          "delegation": { "allowed": false }
+        },
+        "grantedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "validFrom": 1785800000000
+      },
+      "keyword": "enum"
+    },
+    {
+      "name": "delegation-missing-depth",
+      "value": {
+        "newKey": {
+          "keyid": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+          "keyType": "ssh-ed25519",
+          "openSshPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexample"
+        },
+        "principal": { "kind": "agent", "id": "agent-build-7" },
+        "scope": {
+          "pools": "*",
+          "labels": "*",
+          "namespaces": "*",
+          "delegation": { "allowed": true }
+        },
+        "grantedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "validFrom": 1785800000000
+      },
+      "keyword": "required"
+    },
+    {
+      "name": "unexpected-key-field",
+      "value": {
+        "newKey": {
+          "keyid": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+          "keyType": "ssh-ed25519",
+          "openSshPublicKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEexample",
+          "privateKey": "not allowed"
+        },
+        "principal": { "kind": "agent", "id": "agent-build-7" },
+        "scope": {
+          "pools": [],
+          "labels": [],
+          "namespaces": [],
+          "delegation": { "allowed": false }
+        },
+        "grantedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "validFrom": 1785800000000
+      },
+      "keyword": "additionalProperties"
+    }
+  ]
+}

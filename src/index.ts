@@ -156,6 +156,21 @@ export {
   parseAllowedSigners,
   preAuthEncode,
   publicKeyDescriptor,
+  ENROLLMENT_GRANT_FIELDS,
+  ENROLLMENT_KEY_FIELDS,
+  GRANT_DELEGATION_ALLOWED_FIELDS,
+  GRANT_DELEGATION_DENIED_FIELDS,
+  GRANT_SCOPE_FIELDS,
+  ORDER_FIELDS,
+  ORDER_OWED_FIELDS,
+  ORDER_REASON_FIELDS,
+  POLICY_FLOOR_FIELDS,
+  POLICY_FLOOR_RECORD_FIELDS,
+  PRINCIPAL_REFERENCE_FIELDS,
+  RECORD_PAYLOAD_TYPES,
+  REVOCATION_FIELDS,
+  SUBMISSION_FIELDS,
+  SUBMISSION_PRODUCED_FIELDS,
 } from './crypto/index.ts';
 export type {
   AllowedSignerEntry,
@@ -173,6 +188,21 @@ export type {
   PrincipalKeyRef,
   PrincipalKind,
   PublicKeyDescriptor,
+  EnrollmentGrantRecord,
+  EnrollmentKeyDescriptor,
+  FieldManifest,
+  GrantDelegation,
+  GrantDelegationAllowed,
+  GrantDelegationDenied,
+  GrantScope,
+  OptionalKeys,
+  PolicyFloor,
+  PolicyFloorRecord,
+  PrincipalReference,
+  RequiredKeys,
+  RevocationRecord,
+  SubmissionProducedArtifact,
+  SubmissionRecord,
   Signer,
   SshProcessAdapter,
   SshSignerConfig,
@@ -198,6 +228,16 @@ export {
 
 export { assertValidSchema, summarizeIssues, validateValue } from './schema.ts';
 export type { SchemaCheck, SchemaIssue } from './schema.ts';
+export {
+  enrollmentGrantSchema,
+  orderSchema,
+  policyFloorSchema,
+  RECORD_SCHEMAS,
+  revocationSchema,
+  SCHEMA_BY_PAYLOAD_TYPE,
+  submissionSchema,
+  WIRE_SCHEMAS,
+} from './schemas/index.ts';
 
 // Deterministic `.wnlp` bundle format (WP-A1) — the HIGH-LEVEL API only:
 // pack/inspect/digest/unpack plus result/manifest types, limits/options, and

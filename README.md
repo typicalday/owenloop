@@ -721,8 +721,9 @@ owenloop is a faithful, decoupled implementation of a dataflow-engine spec.
 [`docs/design.md`](docs/design.md) is a self-contained walkthrough — the lifecycle,
 firing rule, forward cascade, the reject kinds, the liveness rules, and the concurrency
 model — cross-referenced from the source. [`docs/cli.md`](docs/cli.md) has the full
-command reference, and [`docs/authoring.md`](docs/authoring.md) has the full YAML
-grammar.
+command reference, [`docs/authoring.md`](docs/authoring.md) has the full YAML
+grammar, and [`docs/wire-contracts.md`](docs/wire-contracts.md) defines the
+versioned trust-boundary records.
 
 ---
 

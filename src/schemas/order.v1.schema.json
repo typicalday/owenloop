@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:owenloop:schema:order:v1",
+  "title": "owenloop reference-mode order v1",
+  "description": "The frozen order packet emitted by the engine. Static instructions resolve separately from the defDigest reference.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run",
+    "workflow",
+    "step",
+    "key",
+    "defDigest",
+    "inputs",
+    "outputs",
+    "consumes",
+    "owes"
+  ],
+  "properties": {
+    "run": { "type": "string" },
+    "workflow": { "type": "string" },
+    "step": { "type": "string" },
+    "key": { "type": "string" },
+    "index": { "type": "integer", "minimum": 0 },
+    "defDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque non-empty definition reference; the resolver boundary may inject values that are not a fixed hex digest."
+    },
+    "inputs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "outputs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "workdir": { "type": "string" },
+    "model": { "type": "string" },
+    "worker": { "type": "string" },
+    "spec": {
+      "type": "object",
+      "description": "Opaque worker configuration. The engine carries keys and values through without interpreting them.",
+      "additionalProperties": true
+    },
+    "x": {
+      "type": "object",
+      "description": "Opaque extension data carried through without engine interpretation.",
+      "additionalProperties": true
+    },
+    "consumes": {
+      "type": "object",
+      "description": "Open artifact-path keys mapped to captured input handles.",
+      "additionalProperties": true
+    },
+    "owes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "judgmentRejects", "schemaRejects", "reasons"],
+        "properties": {
+          "path": { "type": "string" },
+          "judgmentRejects": { "type": "integer", "minimum": 0 },
+          "schemaRejects": { "type": "integer", "minimum": 0 },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["at", "action", "kind", "by", "text"],
+              "properties": {
+                "at": { "type": "integer", "minimum": 0 },
+                "action": {
+                  "type": "string",
+                  "enum": ["reject", "retract", "skip", "reopen", "retry", "born-rejected", "schema-reject", "pinned"]
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": ["judgment", "structural", "validation", "invalidated-irreversible", "exclusive"]
+                },
+                "by": { "type": "string" },
+                "text": { "type": "string" },
+                "fromVersion": { "type": "integer", "minimum": 0 }
+              }
+            }
+          },
+          "proof": { "type": "string" }
+        }
+      }
+    },
+    "consumesProof": { "type": "string" },
+    "cause": { "type": "string", "enum": ["inputsGreen", "allGreen", "idle"] }
+  }
+}

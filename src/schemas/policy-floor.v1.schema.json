@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:owenloop:schema:policy-floor:v1",
+  "title": "owenloop policy floor v1",
+  "description": "An admin-signed minimum policy that a driver may strengthen locally.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["org", "issuedAt", "signedBy", "floor"],
+  "properties": {
+    "org": { "type": "string" },
+    "issuedAt": { "type": "integer", "minimum": 0 },
+    "signedBy": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+    },
+    "floor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trustMode", "unsignedDefs", "unsignedArtifacts", "originRules"],
+      "properties": {
+        "trustMode": { "type": "string", "enum": ["seamless", "strict", "paranoid"] },
+        "unsignedDefs": { "type": "string", "enum": ["warn", "refuse"] },
+        "unsignedArtifacts": { "type": "string", "enum": ["warn", "refuse"] },
+        "originRules": { "type": "string", "enum": ["advisory", "enforced"] }
+      }
+    },
+    "preset": { "type": "string", "enum": ["L0", "L1", "L2"] }
+  }
+}
