@@ -651,7 +651,7 @@ function dispatchBundle(io: CliIO, args: Args): number {
       assertBundlePositionals(args, 4, 'owenloop bundle unpack <bundle.wnlp> <destination-dir>');
       const bundlePath = need(args, 2, 'bundle.wnlp');
       const destination = need(args, 3, 'destination-dir');
-      const bytes = readBundleFile(io, bundlePath);
+      const bytes = readBundleCommandFile(io, bundlePath);
       const result = runBundle(() => unpackBundle(bytes, resolve(io.cwd, destination)));
       printBundleUnpackResult(io, result);
       return 0;
@@ -659,7 +659,7 @@ function dispatchBundle(io: CliIO, args: Args): number {
     case 'inspect': {
       assertBundlePositionals(args, 3, 'owenloop bundle inspect <bundle.wnlp>');
       const bundlePath = need(args, 2, 'bundle.wnlp');
-      const bytes = readBundleFile(io, bundlePath);
+      const bytes = readBundleCommandFile(io, bundlePath);
       const result = runBundle(() => inspectBundle(bytes));
       printBundleInspectResult(io, result);
       return 0;
@@ -667,7 +667,7 @@ function dispatchBundle(io: CliIO, args: Args): number {
     case 'digest': {
       assertBundlePositionals(args, 3, 'owenloop bundle digest <bundle.wnlp>');
       const bundlePath = need(args, 2, 'bundle.wnlp');
-      const bytes = readBundleFile(io, bundlePath);
+      const bytes = readBundleCommandFile(io, bundlePath);
       const result = runBundle(() => digestBundle(bytes));
       print(io, { digest: result.digest });
       return 0;
@@ -691,7 +691,7 @@ function assertOutputOutsideSource(outputAbs: string, sourceAbs: string): void {
 }
 
 /** Read a `.wnlp` file from disk, converting fs failures into CliErrors. */
-function readBundleFile(io: CliIO, bundlePath: string): Buffer {
+function readBundleCommandFile(io: CliIO, bundlePath: string): Buffer {
   const abs = resolve(io.cwd, bundlePath);
   try {
     return readFileSync(abs);

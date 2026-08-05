@@ -46,41 +46,18 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
+import { dirname, join, parse, relative, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { acquireFileLock, releaseFileLock } from './lock.ts';
 import type { AcquireFileLockOpts, FileLockHandle } from './lock.ts';
+import { archivePathViolation } from './archive.ts';
 import { mkdirRefusingSymlink } from './util.ts';
 
 // ---- safe paths --------------------------------------------------------------
 
-/** Max length for a relative path we are willing to join and write. */
-const MAX_ARCHIVE_PATH_LENGTH = 1024;
-
-/**
- * Returns `undefined` if `relPath` is safe to `join()` under a destination
- * directory, else a human-readable reason it must be rejected. This is
- * reject-don't-normalize: a synthetic entry like `workflows/../../victim` is
- * refused outright, never canonicalized into a "safe" path (SEC-1 — an
- * unnormalized entry name must never escape the staging or install directory).
- */
-export function archivePathViolation(relPath: string): string | undefined {
-  if (relPath === '') return 'empty path';
-  if (relPath.includes('\0')) return 'contains a NUL byte';
-  if (isAbsolute(relPath) || /^[\\/]/.test(relPath) || /^[A-Za-z]:/.test(relPath)) {
-    return 'is an absolute path';
-  }
-  // Split on both separators so '..\\' tricks and doubled separators can't
-  // smuggle a traversal segment past the check.
-  const segments = relPath.split(/[\\/]+/);
-  if (segments.some((s) => s === '.' || s === '..')) {
-    return "contains a '.' or '..' segment";
-  }
-  if (relPath.length > MAX_ARCHIVE_PATH_LENGTH) {
-    return `exceeds ${MAX_ARCHIVE_PATH_LENGTH}-char path length limit`;
-  }
-  return undefined;
-}
+// Re-export the neutral archive policy so add callers retain their historical
+// import path while add, untar, and bundle all use the same function identity.
+export { archivePathViolation } from './archive.ts';
 
 /**
  * Returns `undefined` if `relPath` is a safe SINGLE-SEGMENT path, else a
