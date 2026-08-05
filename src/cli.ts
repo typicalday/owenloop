@@ -153,7 +153,7 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { owenloopSettingsPath, readOwenloopSettingsRaw, writeOwenloopHubOrigin } from './work-settings.ts';
-import { ensureDirectoryPathNoSymlink, guardStateFile } from './install.ts';
+import { defaultRecoveryMarkerDir, ensureDirectoryPathNoSymlink, guardStateFile } from './install.ts';
 
 // Re-export the keychain backend type so existing test imports of `Keychain`
 // from `../src/cli.ts` (test/hubkit.ts, test/login.test.ts) keep resolving —
@@ -1586,6 +1586,29 @@ async function fetchBundleUrl(io: CliIO, url: string): Promise<Uint8Array> {
   }
 }
 
+/** Return the caller-injected home, rejecting empty values instead of defaulting to process state. */
+function workflowHome(io: CliIO): string {
+  const home = [io.env.HOME, io.env.USERPROFILE].find((value) => value !== undefined && value.trim() !== '');
+  if (home === undefined) throw new CliError('cannot locate the global workflow store: set HOME or USERPROFILE');
+  return home;
+}
+
+/**
+ * Resolve the external fresh-install marker directory from injected CLI state.
+ * A bundle install always needs a concrete directory; no marker API may consult
+ * the ambient process home.
+ */
+function workflowRecoveryMarkerDir(io: CliIO): string {
+  return io.recoveryMarkerDir ?? defaultRecoveryMarkerDir(workflowHome(io));
+}
+
+/** Recovery keeps the legacy GitHub path usable when no v2 marker is involved. */
+function optionalWorkflowRecoveryMarkerDir(io: CliIO): string | undefined {
+  if (io.recoveryMarkerDir !== undefined) return io.recoveryMarkerDir;
+  const home = [io.env.HOME, io.env.USERPROFILE].find((value) => value !== undefined && value.trim() !== '');
+  return home === undefined ? undefined : defaultRecoveryMarkerDir(home);
+}
+
 /**
  * The `.wnlp` bundle route of `owenloop add` — the content-addressed store
  * counterpart of the GitHub route. `dispatchAdd` classifies the positional
@@ -1611,9 +1634,11 @@ async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Prom
   // via env so tests never touch the real one); the project store is the
   // resolved defs dir. Lock/journal paths live per root; the PROJECT route
   // shares the existing project add lock + journal (its recovery ordering).
-  const home = io.env.HOME ?? io.env.USERPROFILE;
+  // A fresh bundle install also needs an external marker directory, so derive
+  // that path from the same injected home and never from process state.
+  const recoveryMarkerDir = workflowRecoveryMarkerDir(io);
   const root = globalFlag
-    ? globalStoreRoot(home)
+    ? globalStoreRoot(workflowHome(io))
     : projectStoreRoot(defsOverride ?? join(io.cwd, 'workflows'));
   const statePaths = workflowStoreStatePaths(root);
   const lockPath = statePaths.lockPath;
@@ -1663,7 +1688,7 @@ async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Prom
     level: globalFlag ? 'global' : 'project',
     lockPath,
     journalPath,
-    recoveryMarkerDir: io.recoveryMarkerDir,
+    recoveryMarkerDir,
     ingestor: io.bundleIngestor,
     verifier: io.preCommitVerifier,
     readLedger,
@@ -1689,12 +1714,13 @@ async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Prom
  * work.
  */
 async function dispatchAddRecoverGlobal(io: CliIO): Promise<number> {
-  const home = io.env.HOME ?? io.env.USERPROFILE;
+  const home = workflowHome(io);
   const root = globalStoreRoot(home);
   const lockPath = join(root, '.owenloop', 'add.lock');
   const journalPath = join(root, '.owenloop', ADD_JOURNAL_FILENAME);
+  const recoveryMarkerDir = workflowRecoveryMarkerDir(io);
 
-  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath, recoveryMarkerDir: io.recoveryMarkerDir });
+  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath, recoveryMarkerDir });
   switch (outcome) {
     case 'no-journal':
       print(io, { ok: true, recovered: false, message: 'nothing to recover — no interrupted install found' });
@@ -1776,6 +1802,7 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const installLockPath = join(io.cwd, '.owenloop', 'add.lock');
   const journalPath = join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME);
   const canonicalState = workflowStoreStatePaths(projectStoreRoot(defsDir));
+  const recoveryMarkerDir = optionalWorkflowRecoveryMarkerDir(io);
   const fetchFn = io.fetch ?? globalThis.fetch;
 
   // 1. Resolve the ref to a pinned commit sha.
@@ -1920,9 +1947,9 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
 	defsDir,
 	journalPath: canonicalState.journalPath,
 	lockfilePath: storeIndexPath(defsDir),
-	recoveryMarkerDir: io.recoveryMarkerDir,
+	recoveryMarkerDir,
       });
-      recoverInterruptedInstall({ defsDir, journalPath, lockfilePath, recoveryMarkerDir: io.recoveryMarkerDir });
+      recoverInterruptedInstall({ defsDir, journalPath, lockfilePath, recoveryMarkerDir });
     } catch (e) {
       preserveStagingRoot = true;
       throw e;
@@ -2219,6 +2246,7 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
   const installLockPath = join(io.cwd, '.owenloop', 'add.lock');
   const journalPath = join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME);
   const canonicalState = workflowStoreStatePaths(projectStoreRoot(defsDir));
+  const recoveryMarkerDir = optionalWorkflowRecoveryMarkerDir(io);
 
   // Mirror the SEC-3 symlink guards from the normal path (same order, same
   // rationale): `.owenloop` is written by the lock acquire; the default defsDir
@@ -2249,9 +2277,9 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
       defsDir,
       journalPath: canonicalState.journalPath,
       lockfilePath: storeIndexPath(defsDir),
-      recoveryMarkerDir: io.recoveryMarkerDir,
+      recoveryMarkerDir,
     });
-    const legacyOutcome = recoverInterruptedInstall({ defsDir, journalPath, lockfilePath });
+    const legacyOutcome = recoverInterruptedInstall({ defsDir, journalPath, lockfilePath, recoveryMarkerDir });
     outcome = legacyOutcome !== 'no-journal' ? legacyOutcome : canonicalOutcome;
   } finally {
     for (const handle of locks.reverse()) releaseInstallLock(handle);

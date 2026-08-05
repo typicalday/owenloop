@@ -1595,6 +1595,21 @@ test('add --global with OWENLOOP_DEFS set (env) is refused the same way', async 
   assert.match(r.err, /--global cannot be combined with --defs/);
 });
 
+test('bundle add without HOME or USERPROFILE refuses instead of using ambient home', async () => {
+  const { run, cwd } = makeBundleCli({
+    env: { HOME: undefined, USERPROFILE: undefined },
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  const bundlePath = join(cwd, 'missing-home.wnlp');
+  writeFileSync(bundlePath, cliBundleBytes(cliMakeBundle('missing-home')));
+
+  const r = await run('add', bundlePath);
+  assert.equal(r.code, 1);
+  assert.match(r.err, /cannot locate the global workflow store: set HOME or USERPROFILE/);
+  assert.equal(existsSync(join(cwd, 'workflows')), false, 'no project store was created');
+});
+
 test('add GitHub source with --global is refused before any network request', async () => {
   let fetchCalls = 0;
   const fetchFn = (async () => {
@@ -1726,6 +1741,27 @@ test('add <bundle.wnlp> installs into the PROJECT store and prints the structure
   assert.deepEqual(index.entries, { 'acme/widget@1.0.0': { digest: bundle.digest, pinned: false } });
   assert.equal(existsSync(join(root, '.owenloop-staging')), false, 'staging cleared');
   assert.equal(existsSync(join(cwd, '.owenloop', ADD_JOURNAL_FILENAME)), false, 'journal removed');
+});
+
+test('fresh bundle install derives recovery markers from injected HOME only', async () => {
+  const { run, cwd, home } = makeBundleCli({
+    bundleIngestor: cliFakeIngestor(),
+    preCommitVerifier: cliFakeVerifier(),
+  });
+  const bundle = cliMakeBundle('hermetic-marker');
+  const bundlePath = join(cwd, 'hermetic-marker.wnlp');
+  writeFileSync(bundlePath, cliBundleBytes(bundle));
+
+  const r = await run('add', bundlePath);
+  assert.equal(r.code, 0, r.err);
+
+  // The marker directory is derived from CliIO.env.HOME, not node:os homedir().
+  // The successful install removes the one-shot marker file but leaves the
+  // fixture-owned directory. No marker state is written under the project.
+  const injectedMarkerDir = join(home, '.owenloop', 'recovery-markers');
+  assert.equal(existsSync(injectedMarkerDir), true, 'marker directory belongs to injected HOME');
+  assert.deepEqual(readdirSync(injectedMarkerDir), [], 'successful install removes the fixture marker');
+  assert.equal(existsSync(join(cwd, '.owenloop', 'recovery-markers')), false, 'project state has no marker directory');
 });
 
 test('add relative .wnlp path resolves against injected CliIO.cwd, not process.cwd', async () => {

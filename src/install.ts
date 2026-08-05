@@ -48,7 +48,6 @@ import {
 } from 'node:fs';
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
 import { acquireFileLock, releaseFileLock } from './lock.ts';
 import type { AcquireFileLockOpts, FileLockHandle } from './lock.ts';
 import { mkdirRefusingSymlink } from './util.ts';
@@ -806,8 +805,10 @@ export interface RecoveryMarkerHandle {
   record: RecoveryMarkerRecord;
 }
 
-export function defaultRecoveryMarkerDir(): string {
-  return join(homedir(), '.owenloop', 'recovery-markers');
+/** Derive the external marker directory from the caller's injected home. */
+export function defaultRecoveryMarkerDir(home: string): string {
+  if (home.trim() === '') throw new Error('cannot derive recovery marker directory from an empty home');
+  return join(home, '.owenloop', 'recovery-markers');
 }
 
 function markerFilePath(markerDir: string, id: string): string {
@@ -842,9 +843,9 @@ export function createRecoveryMarker(input: {
   root: string;
   destSegments: string[];
   stagingId: string;
-  markerDir?: string;
+  markerDir: string;
 }): RecoveryMarkerHandle {
-  const markerDir = input.markerDir ?? defaultRecoveryMarkerDir();
+  const markerDir = input.markerDir;
   ensureDirectoryPathNoSymlink(markerDir, 'recovery marker directory');
   const record: RecoveryMarkerRecord = {
     version: 1,
@@ -859,7 +860,7 @@ export function createRecoveryMarker(input: {
   return { id, path, markerDir, record };
 }
 
-export function readRecoveryMarker(id: string, markerDir = defaultRecoveryMarkerDir()): RecoveryMarkerRecord | null {
+export function readRecoveryMarker(id: string, markerDir: string): RecoveryMarkerRecord | null {
   // The marker directory is an operator-selected external path. Check the
   // directory leaf and immediate parent, while allowing platform-managed
   // aliases such as macOS /var → /private/var above that boundary.
@@ -877,10 +878,8 @@ export function readRecoveryMarker(id: string, markerDir = defaultRecoveryMarker
   return validateRecoveryMarker(parsed, path);
 }
 
-export function removeRecoveryMarker(handle: RecoveryMarkerHandle | { id: string; markerDir?: string }): void {
-  const markerDir = 'markerDir' in handle && handle.markerDir !== undefined
-    ? handle.markerDir
-    : defaultRecoveryMarkerDir();
+export function removeRecoveryMarker(handle: RecoveryMarkerHandle | { id: string; markerDir: string }): void {
+  const markerDir = handle.markerDir;
   if (probeDirectoryPath(markerDir, 'recovery marker directory', dirname(markerDir)) === 'absent') return;
   const path = markerFilePath(markerDir, handle.id);
   guardStateFile(path, 'recovery marker');
@@ -1130,6 +1129,9 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 
   const removeRecoveryMarkerAfterJournal = (): void => {
     if (journal.version === 2 && journal.recoveryMarkerId !== undefined) {
+      if (args.recoveryMarkerDir === undefined) {
+		throw recoveryRefusal(journalPath, 'external recovery marker directory was not supplied');
+      }
       removeRecoveryMarker({ id: journal.recoveryMarkerId, markerDir: args.recoveryMarkerDir });
     }
   };
@@ -1302,6 +1304,9 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
       if (probeRecoveryDir(dest, journalPath, 'destination', defsDir) === 'dir') {
 	let marker: RecoveryMarkerRecord | null = null;
 	if (journal.recoveryMarkerId !== undefined) {
+	  if (args.recoveryMarkerDir === undefined) {
+	    throw recoveryRefusal(journalPath, 'external recovery marker directory was not supplied');
+	  }
 	  try {
 	    marker = readRecoveryMarker(journal.recoveryMarkerId, args.recoveryMarkerDir);
 	  } catch (e) {

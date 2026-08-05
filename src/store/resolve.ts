@@ -21,7 +21,6 @@
  */
 
 import { lstatSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import {
   StoreAmbiguityError,
@@ -47,11 +46,12 @@ export function projectStoreRoot(defsDir: string): string {
 }
 
 /**
- * The GLOBAL store root: `<home>/.owenloop/workflows`. `home` is injectable
- * (defaults to `homedir()`) so library callers and tests can pin a fixture
- * HOME from the first write and never touch the ambient one.
+ * The GLOBAL store root: `<home>/.owenloop/workflows`. `home` is required so
+ * library callers and tests must pin a fixture HOME from the first write and
+ * never fall back to the ambient process home.
  */
-export function globalStoreRoot(home: string = homedir()): string {
+export function globalStoreRoot(home: string): string {
+  if (home.trim() === '') throw new StorePathError('cannot derive global workflow store root from an empty home');
   return join(home, '.owenloop', 'workflows');
 }
 

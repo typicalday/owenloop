@@ -171,17 +171,20 @@ function fakeVerifier(opts: { fail?: boolean; onVerify?: () => void } = {}): Pre
   };
 }
 
-/** One temp store root with its per-root lock/journal paths. */
+/** One temp store root with its per-root lock/journal/marker paths. */
 function tempStore(prefix = 'owenloop-wstore-'): {
   root: string;
   lockPath: string;
   journalPath: string;
+  markerDir: string;
 } {
   const root = mkdtempSync(join(tmpdir(), prefix));
+  const markerDir = mkdtempSync(join(tmpdir(), `${prefix}markers-`));
   return {
     root,
     lockPath: join(root, '.owenloop', 'add.lock'),
     journalPath: join(root, '.owenloop', ADD_JOURNAL_FILENAME),
+    markerDir,
   };
 }
 
@@ -190,7 +193,7 @@ const SRC: BundleSource = { kind: 'file', path: '/nonexistent/origin.wnlp' }; //
 // ---- the happy path and the commit order ------------------------------------------
 
 test('install: a valid bundle installs with the fixed commit order and hardened modes', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m = makeBundle();
   const ingestor = fakeIngestor();
   const verifier = fakeVerifier();
@@ -219,6 +222,7 @@ test('install: a valid bundle installs with the fixed commit order and hardened 
     level: 'project',
     lockPath,
     journalPath,
+    recoveryMarkerDir: installMarkerDir,
     ingestor: orderedIngestor,
     verifier: orderedVerifier,
   });
@@ -285,7 +289,7 @@ test('install: state directory and lock/journal leaves are guarded before lock a
   ];
 
   for (const { name, setup, expected } of cases) {
-    const { root, lockPath, journalPath } = tempStore(`owenloop-state-guard-${name.replaceAll(' ', '-')}-`);
+    const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore(`owenloop-state-guard-${name.replaceAll(' ', '-')}-`);
     if (name !== 'state directory symlink') mkdirSync(join(root, '.owenloop'), { recursive: true });
     setup(root, lockPath, journalPath);
     const ingestor = fakeIngestor();
@@ -297,6 +301,7 @@ test('install: state directory and lock/journal leaves are guarded before lock a
 	level: 'project',
 	lockPath,
 	journalPath,
+	recoveryMarkerDir: installMarkerDir,
 	ingestor,
 	verifier: fakeVerifier(),
       }),
@@ -308,7 +313,7 @@ test('install: state directory and lock/journal leaves are guarded before lock a
 });
 
 test('install: a symlinked object parent is corrupt and never used as a destination', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   symlinkSync(mkdtempSync(join(tmpdir(), 'owenloop-object-target-')), join(root, 'objects'));
   const m = makeBundle('object-parent-link');
 
@@ -320,6 +325,7 @@ test('install: a symlinked object parent is corrupt and never used as a destinat
       level: 'project',
       lockPath,
       journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: fakeIngestor(),
       verifier: fakeVerifier(),
     }),
@@ -329,7 +335,7 @@ test('install: a symlinked object parent is corrupt and never used as a destinat
 });
 
 test('install: one altered byte is rejected by A1 before anything is committed', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m = makeBundle();
   const bytes = bundleBytes(m);
   // Flip one content byte inside the staged-file payload (the JSON stays
@@ -347,6 +353,7 @@ test('install: one altered byte is rejected by A1 before anything is committed',
       level: 'project',
       lockPath,
       journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: fakeIngestor(),
       verifier: fakeVerifier(),
     }),
@@ -361,7 +368,7 @@ test('install: one altered byte is rejected by A1 before anything is committed',
 });
 
 test('install: an A2 verifier rejection commits nothing', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m = makeBundle();
   const verifier = fakeVerifier({ fail: true });
 
@@ -373,6 +380,7 @@ test('install: an A2 verifier rejection commits nothing', async () => {
       level: 'project',
       lockPath,
       journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: fakeIngestor(),
       verifier,
     }),
@@ -386,7 +394,7 @@ test('install: an A2 verifier rejection commits nothing', async () => {
 });
 
 test('install: staged content that fails ENGINE validation is refused before A2 runs', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   // A file that is not even parseable YAML fails the loadDefsRaw pass.
   const m = makeBundle('broken', { 'def.yaml': 'name: broken\n\tsteps: not yaml (tab indent)\n' });
   const verifier = fakeVerifier();
@@ -399,6 +407,7 @@ test('install: staged content that fails ENGINE validation is refused before A2 
       level: 'project',
       lockPath,
       journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: fakeIngestor(),
       verifier,
     }),
@@ -413,18 +422,20 @@ test('install: staged content that fails ENGINE validation is refused before A2 
 // ---- dedupe and conflict -----------------------------------------------------------
 
 test('install: the SAME bundle twice dedupes — the second is an index-only no-op', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m = makeBundle();
   const ingestor = fakeIngestor();
 
   const first = await installWorkflowBundle({
     bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+    recoveryMarkerDir: installMarkerDir,
     ingestor, verifier: fakeVerifier(),
   });
   const indexBefore = readFileSync(storeIndexPath(root), 'utf8');
 
   const second = await installWorkflowBundle({
     bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+    recoveryMarkerDir: installMarkerDir,
     ingestor, verifier: fakeVerifier(),
   });
 
@@ -437,10 +448,11 @@ test('install: the SAME bundle twice dedupes — the second is an index-only no-
 });
 
 test('install: dedupe against a CORRUPT existing object is a hard refusal (never replaced, never fallen through)', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m = makeBundle();
   await installWorkflowBundle({
     bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+    recoveryMarkerDir: installMarkerDir,
     ingestor: fakeIngestor(), verifier: fakeVerifier(),
   });
   // Corrupt the installed object, then make A1 report it.
@@ -454,6 +466,7 @@ test('install: dedupe against a CORRUPT existing object is a hard refusal (never
   await assert.rejects(
     installWorkflowBundle({
       bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: failing, verifier: fakeVerifier(),
     }),
     /existing object failed verification before dedupe/,
@@ -465,10 +478,11 @@ test('install: dedupe against a CORRUPT existing object is a hard refusal (never
 });
 
 test('install: an existing coordinate at a DIFFERENT digest is a conflict — no implicit retarget', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m1 = makeBundle('widget');
   await installWorkflowBundle({
     bytes: bundleBytes(m1), source: SRC, root, level: 'project', lockPath, journalPath,
+    recoveryMarkerDir: installMarkerDir,
     ingestor: fakeIngestor(), verifier: fakeVerifier(),
   });
   // Same coordinate, different content ⇒ different digest.
@@ -478,6 +492,7 @@ test('install: an existing coordinate at a DIFFERENT digest is a conflict — no
   await assert.rejects(
     installWorkflowBundle({
       bytes: bundleBytes(m2), source: SRC, root, level: 'project', lockPath, journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: fakeIngestor(), verifier: fakeVerifier(),
     }),
     /already recorded at digest/,
@@ -491,7 +506,7 @@ test('install: an existing coordinate at a DIFFERENT digest is a conflict — no
 // ---- index-write failure rolls the swap back ---------------------------------------
 
 test('install: an index-write failure rolls the object back and restores the previous state', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m = makeBundle();
   const indexPath = storeIndexPath(root);
   // Force the index WRITE to fail deterministically: squat a directory at the
@@ -504,6 +519,7 @@ test('install: an index-write failure rolls the object back and restores the pre
   await assert.rejects(
     installWorkflowBundle({
       bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: fakeIngestor(), verifier,
     }),
     /could not record install of .* — install rolled back, previous state restored/,
@@ -518,17 +534,19 @@ test('install: an index-write failure rolls the object back and restores the pre
 // ---- concurrent installs serialize on one root --------------------------------------
 
 test('install: two concurrent installs into one root both land (no lost index update)', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const mA = makeBundle('alpha');
   const mB = makeBundle('beta');
 
   const [rA, rB] = await Promise.all([
     installWorkflowBundle({
       bytes: bundleBytes(mA), source: SRC, root, level: 'project', lockPath, journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: fakeIngestor(), verifier: fakeVerifier(),
     }),
     installWorkflowBundle({
       bytes: bundleBytes(mB), source: SRC, root, level: 'project', lockPath, journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: fakeIngestor(), verifier: fakeVerifier(),
     }),
   ]);
@@ -543,12 +561,13 @@ test('install: two concurrent installs into one root both land (no lost index up
 // ---- fail-closed adapters ------------------------------------------------------------
 
 test('install: a missing A1 adapter fails closed before any commit', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m = makeBundle();
 
   await assert.rejects(
     installWorkflowBundle({
       bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: undefined as unknown as BundleIngestor, verifier: fakeVerifier(),
     }),
     BundleIngestorUnavailableError,
@@ -558,12 +577,13 @@ test('install: a missing A1 adapter fails closed before any commit', async () =>
 });
 
 test('install: a missing A2 adapter fails closed before any commit', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m = makeBundle();
 
   await assert.rejects(
     installWorkflowBundle({
       bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+      recoveryMarkerDir: installMarkerDir,
       ingestor: fakeIngestor(), verifier: undefined as unknown as PreCommitVerifier,
     }),
     PreCommitVerifierUnavailableError,
@@ -756,7 +776,7 @@ test('recovery: a v1 journal at a project path is refused without a ledger (fail
 // ---- project installs share the project add lock/recovery ordering ------------------
 
 test('install: a project install with a readLedger recovers a leftover v1 journal, then installs', async () => {
-  const { root, lockPath, journalPath } = tempStore();
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const stagingRoot = join(root, '.owenloop-staging');
   const stagingId = 'stg_v1left';
   // A v1 `finalizing` journal + backup debris (a GitHub install that crashed
@@ -772,6 +792,7 @@ test('install: a project install with a readLedger recovers a leftover v1 journa
 
   const result = await installWorkflowBundle({
     bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+    recoveryMarkerDir: installMarkerDir,
     ingestor: fakeIngestor(), verifier: fakeVerifier(),
     readLedger: () => () => undefined,
   });
@@ -785,11 +806,12 @@ test('install: a project install with a readLedger recovers a leftover v1 journa
 // ---- global installs keep equivalent state below the global root -----------------------
 
 test('install: a global-root install keeps lock/journal/staging below the global root', async () => {
-  const { root, lockPath, journalPath } = tempStore('owenloop-wstore-global-');
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore('owenloop-wstore-global-');
   const m = makeBundle('globalwf');
 
   const result = await installWorkflowBundle({
     bytes: bundleBytes(m), source: SRC, root, level: 'global', lockPath, journalPath,
+    recoveryMarkerDir: installMarkerDir,
     ingestor: fakeIngestor(), verifier: fakeVerifier(),
   });
 

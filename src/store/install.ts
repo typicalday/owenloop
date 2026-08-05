@@ -143,7 +143,7 @@ export interface InstallWorkflowBundleArgs {
   /** Path of the per-root crash-recovery journal. */
   journalPath: string;
   /** External marker directory for corroborating a fresh swap with no backup. */
-  recoveryMarkerDir?: string;
+  recoveryMarkerDir: string;
   /** Bundle-ingest adapter — REQUIRED (fail-closed without it). */
   ingestor: BundleIngestor;
   /** Pre-commit verifier — REQUIRED (fail-closed without it). */
