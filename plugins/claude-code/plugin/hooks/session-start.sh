@@ -34,7 +34,11 @@ fi
 # The initialize response is the root CLI's supported version surface. It is
 # also safe for old CLIs: one that lacks `mcp` fails below and gets a diagnosis.
 initialize_request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}'
-cli_output="$(printf '%s\n' "$initialize_request" | owenloop mcp 2>&1)"
+# An explicit probe origin bypasses credential-store discovery. The placeholder
+# is scoped to this subprocess, so the probe is deterministic and cannot spend
+# the MCP enrollment probe timeout on a real hub network request.
+probe_hub='https://plugin-version-probe.invalid'
+cli_output="$(printf '%s\n' "$initialize_request" | OWENLOOP_HUB="$probe_hub" owenloop mcp 2>&1)"
 cli_status=$?
 cli_version="$(printf '%s\n' "$cli_output" | tr ',' '\n' | sed -n 's/[^\"]*"version"[[:space:]]*:[[:space:]]*"\([^\"]*\)".*/\1/p' | sed -n '1p')"
 if [ "$cli_status" -ne 0 ] || [ -z "$cli_version" ]; then
