@@ -81,6 +81,42 @@ export {
 } from './dsse.ts';
 export type { DsseEnvelope, DsseRecordPayloadType, DsseSignature, DsseVerifyResult } from './dsse.ts';
 
+// ---- wire records ----
+export {
+  ENROLLMENT_GRANT_FIELDS,
+  ENROLLMENT_KEY_FIELDS,
+  GRANT_DELEGATION_ALLOWED_FIELDS,
+  GRANT_DELEGATION_DENIED_FIELDS,
+  GRANT_SCOPE_FIELDS,
+  ORDER_FIELDS,
+  ORDER_OWED_FIELDS,
+  ORDER_REASON_FIELDS,
+  POLICY_FLOOR_FIELDS,
+  POLICY_FLOOR_RECORD_FIELDS,
+  PRINCIPAL_REFERENCE_FIELDS,
+  RECORD_PAYLOAD_TYPES,
+  REVOCATION_FIELDS,
+  SUBMISSION_FIELDS,
+  SUBMISSION_PRODUCED_FIELDS,
+} from './records.ts';
+export type {
+  EnrollmentGrantRecord,
+  EnrollmentKeyDescriptor,
+  FieldManifest,
+  GrantDelegation,
+  GrantDelegationAllowed,
+  GrantDelegationDenied,
+  GrantScope,
+  OptionalKeys,
+  PolicyFloor,
+  PolicyFloorRecord,
+  PrincipalReference,
+  RequiredKeys,
+  RevocationRecord,
+  SubmissionProducedArtifact,
+  SubmissionRecord,
+} from './records.ts';
+
 // ---- allowed_signers ----
 export { parseAllowedSigners } from './allowed-signers.ts';
 export type {

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:owenloop:schema:submission:v1",
+  "title": "owenloop submission record v1",
+  "description": "A record describing values produced by one workflow step.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run",
+    "workflow",
+    "defDigest",
+    "step",
+    "key",
+    "produced",
+    "consumedFingerprint",
+    "producerKeyId",
+    "timestamp"
+  ],
+  "properties": {
+    "run": { "type": "string" },
+    "workflow": { "type": "string" },
+    "defDigest": {
+      "type": "string",
+      "minLength": 1,
+      "description": "An opaque non-empty instruction-snapshot reference; injected resolver sources are not required to use a fixed digest alphabet."
+    },
+    "step": { "type": "string" },
+    "key": { "type": "string" },
+    "index": { "type": "integer", "minimum": 0 },
+    "produced": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["artifact", "version", "valueDigest"],
+        "properties": {
+          "artifact": { "type": "string" },
+          "version": { "type": "integer", "minimum": 0 },
+          "valueDigest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "consumedFingerprint": {
+      "type": "object",
+      "description": "Open artifact-path keys mapped to the consumed non-negative version. This map intentionally allows additional properties because artifact paths are not a closed vocabulary.",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "producerKeyId": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+    },
+    "timestamp": { "type": "integer", "minimum": 0 }
+  }
+}

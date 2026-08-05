@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:owenloop:schema:revocation:v1",
+  "title": "owenloop revocation record v1",
+  "description": "A signed declaration that a principal key is no longer trusted from a stated cut point.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "revokedKey",
+    "principal",
+    "revokedBy",
+    "issuedAt",
+    "effectiveFrom",
+    "backdated"
+  ],
+  "properties": {
+    "revokedKey": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+    },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["human", "machine", "agent"] },
+        "id": { "type": "string" }
+      }
+    },
+    "revokedBy": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+    },
+    "issuedAt": { "type": "integer", "minimum": 0 },
+    "effectiveFrom": { "type": "integer", "minimum": 0 },
+    "backdated": { "type": "boolean" },
+    "reason": { "type": "string" }
+  }
+}

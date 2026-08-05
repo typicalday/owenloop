@@ -1,0 +1,77 @@
+{
+  "valid": {
+    "org": "example-org",
+    "issuedAt": 1785800000000,
+    "signedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "floor": {
+      "trustMode": "strict",
+      "unsignedDefs": "refuse",
+      "unsignedArtifacts": "warn",
+      "originRules": "advisory"
+    },
+    "preset": "L1"
+  },
+  "invalid": [
+    {
+      "name": "unknown-preset",
+      "value": {
+        "org": "example-org",
+        "issuedAt": 1785800000000,
+        "signedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "floor": {
+          "trustMode": "seamless",
+          "unsignedDefs": "warn",
+          "unsignedArtifacts": "warn",
+          "originRules": "advisory"
+        },
+        "preset": "L3"
+      },
+      "keyword": "enum"
+    },
+    {
+      "name": "missing-signed-by",
+      "value": {
+        "org": "example-org",
+        "issuedAt": 1785800000000,
+        "floor": {
+          "trustMode": "strict",
+          "unsignedDefs": "refuse",
+          "unsignedArtifacts": "refuse",
+          "originRules": "enforced"
+        }
+      },
+      "keyword": "required"
+    },
+    {
+      "name": "invalid-floor-mode",
+      "value": {
+        "org": "example-org",
+        "issuedAt": 1785800000000,
+        "signedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "floor": {
+          "trustMode": "maximum",
+          "unsignedDefs": "refuse",
+          "unsignedArtifacts": "refuse",
+          "originRules": "enforced"
+        }
+      },
+      "keyword": "enum"
+    },
+    {
+      "name": "unexpected-floor-property",
+      "value": {
+        "org": "example-org",
+        "issuedAt": 1785800000000,
+        "signedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "floor": {
+          "trustMode": "strict",
+          "unsignedDefs": "refuse",
+          "unsignedArtifacts": "refuse",
+          "originRules": "enforced",
+          "ceiling": "none"
+        }
+      },
+      "keyword": "additionalProperties"
+    }
+  ]
+}

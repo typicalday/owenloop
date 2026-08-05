@@ -1,0 +1,77 @@
+{
+  "valid": {
+    "revokedKey": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    "principal": {
+      "kind": "agent",
+      "id": "agent-build-7"
+    },
+    "revokedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "issuedAt": 1785800000000,
+    "effectiveFrom": 1785800000000,
+    "backdated": false,
+    "reason": "key replaced"
+  },
+  "invalid": [
+    {
+      "name": "bad-revoked-key-id",
+      "value": {
+        "revokedKey": "not-a-key-id",
+        "principal": { "kind": "agent", "id": "agent-build-7" },
+        "revokedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "issuedAt": 1785800000000,
+        "effectiveFrom": 1785800000000,
+        "backdated": false
+      },
+      "keyword": "pattern"
+    },
+    {
+      "name": "bad-principal-kind",
+      "value": {
+        "revokedKey": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "principal": { "kind": "service", "id": "service-build-7" },
+        "revokedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "issuedAt": 1785800000000,
+        "effectiveFrom": 1785800000000,
+        "backdated": false
+      },
+      "keyword": "enum"
+    },
+    {
+      "name": "missing-backdated",
+      "value": {
+        "revokedKey": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "principal": { "kind": "agent", "id": "agent-build-7" },
+        "revokedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "issuedAt": 1785800000000,
+        "effectiveFrom": 1785800000000
+      },
+      "keyword": "required"
+    },
+    {
+      "name": "unexpected-property",
+      "value": {
+        "revokedKey": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "principal": { "kind": "agent", "id": "agent-build-7" },
+        "revokedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "issuedAt": 1785800000000,
+        "effectiveFrom": 1785800000000,
+        "backdated": false,
+        "cutMode": "forward"
+      },
+      "keyword": "additionalProperties"
+    }
+  ],
+  "verificationInvalid": [
+    {
+      "name": "false-backdated-flag",
+      "value": {
+        "revokedKey": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "principal": { "kind": "agent", "id": "agent-build-7" },
+        "revokedBy": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "issuedAt": 1785800000000,
+        "effectiveFrom": 1785799999000,
+        "backdated": false
+      }
+    }
+  ]
+}

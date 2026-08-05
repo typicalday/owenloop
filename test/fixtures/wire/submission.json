@@ -1,0 +1,115 @@
+{
+  "valid": {
+    "run": "run-build-7",
+    "workflow": "build",
+    "defDigest": "a3-canonical-digest-0123456789abcdef",
+    "step": "producer",
+    "key": "",
+    "index": 0,
+    "produced": [
+      {
+        "artifact": "result",
+        "version": 1,
+        "valueDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "consumedFingerprint": {
+      "input": 2,
+      "config": 4
+    },
+    "producerKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "timestamp": 1785800000000
+  },
+  "invalid": [
+    {
+      "name": "missing-produced",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build",
+        "defDigest": "digest",
+        "step": "producer",
+        "key": "",
+        "consumedFingerprint": {},
+        "producerKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 1785800000000
+      },
+      "keyword": "required"
+    },
+    {
+      "name": "empty-produced",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build",
+        "defDigest": "digest",
+        "step": "producer",
+        "key": "",
+        "produced": [],
+        "consumedFingerprint": {},
+        "producerKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 1785800000000
+      },
+      "keyword": "minItems"
+    },
+    {
+      "name": "bad-value-digest",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build",
+        "defDigest": "digest",
+        "step": "producer",
+        "key": "",
+        "produced": [
+          { "artifact": "result", "version": 1, "valueDigest": "not-a-sha256" }
+        ],
+        "consumedFingerprint": {},
+        "producerKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 1785800000000
+      },
+      "keyword": "pattern"
+    },
+    {
+      "name": "null-optional-index",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build",
+        "defDigest": "digest",
+        "step": "producer",
+        "key": "",
+        "index": null,
+        "produced": [
+          {
+            "artifact": "result",
+            "version": 1,
+            "valueDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "consumedFingerprint": {},
+        "producerKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 1785800000000
+      },
+      "keyword": "type"
+    },
+    {
+      "name": "unexpected-property",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build",
+        "defDigest": "digest",
+        "step": "producer",
+        "key": "",
+        "produced": [
+          {
+            "artifact": "result",
+            "version": 1,
+            "valueDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          }
+        ],
+        "consumedFingerprint": {},
+        "producerKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 1785800000000,
+        "extra": true
+      },
+      "keyword": "additionalProperties"
+    }
+  ]
+}

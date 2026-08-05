@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:owenloop:schema:enrollment-grant:v1",
+  "title": "owenloop enrollment grant v1",
+  "description": "A signed grant for one principal key and its bounded scope.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["newKey", "principal", "scope", "grantedBy", "validFrom"],
+  "properties": {
+    "newKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyid", "keyType", "openSshPublicKey"],
+      "properties": {
+        "keyid": {
+          "type": "string",
+          "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+        },
+        "keyType": { "type": "string" },
+        "openSshPublicKey": { "type": "string" },
+        "comment": { "type": "string" }
+      }
+    },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["human", "machine", "agent"] },
+        "id": { "type": "string" }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pools", "labels", "namespaces", "delegation"],
+      "properties": {
+        "pools": {
+          "oneOf": [
+            { "const": "*" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "labels": {
+          "oneOf": [
+            { "const": "*" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "namespaces": {
+          "oneOf": [
+            { "const": "*" },
+            { "type": "array", "items": { "type": "string" } }
+          ]
+        },
+        "delegation": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["allowed"],
+              "properties": {
+                "allowed": { "const": false }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["allowed", "maxDepth"],
+              "properties": {
+                "allowed": { "const": true },
+                "maxDepth": {
+                  "oneOf": [
+                    { "type": "integer", "minimum": 0 },
+                    { "const": "unbounded" }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "grantedBy": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+    },
+    "validFrom": { "type": "integer", "minimum": 0 }
+  }
+}
