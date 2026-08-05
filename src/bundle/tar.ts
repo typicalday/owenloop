@@ -16,7 +16,7 @@
 import { lstatSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { archivePathViolation, DEFAULT_TAR_LIMITS } from '../archive.ts';
+import { archivePathViolation, canonicalPaxNamePlaceholder, DEFAULT_TAR_LIMITS } from '../archive.ts';
 import type { TarLimits } from '../archive.ts';
 import { BundleError } from './types.ts';
 
@@ -125,15 +125,9 @@ export function buildCanonicalTar(files: CanonicalFile[], limits: TarLimits = DE
       chunks.push(buildHeader('PaxHeader', paxData.length, 'x', 0o644));
       chunks.push(padBlock(paxData));
       // The 100-byte name field is only a deterministic placeholder; the PAX
-      // record carries the effective UTF-8 path. Keep the historical ASCII
-      // prefix for the golden vector, but use a safe ASCII placeholder when a
-      // UTF-8 byte boundary would otherwise create an invalid field.
-      const rawPath = Buffer.from(f.path, 'utf8');
-      const prefixBytes = rawPath.subarray(0, 100);
-      const prefix = Buffer.from(prefixBytes).toString('utf8');
-      const prefixField = Buffer.from(prefix, 'utf8');
-      const placeholder = prefixField.length === prefixBytes.length ? prefix : 'PaxData';
-      chunks.push(buildHeader(placeholder, f.bytes.length, '0', f.mode));
+      // record carries the effective UTF-8 path. Use the shared placeholder
+      // rule so the strict reader requires exactly what the writer emits.
+      chunks.push(buildHeader(canonicalPaxNamePlaceholder(f.path), f.bytes.length, '0', f.mode));
     } else {
       headerCount += 1;
       chunks.push(buildHeader(f.path, f.bytes.length, '0', f.mode));

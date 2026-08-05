@@ -159,6 +159,19 @@ function fieldEquals(actual: Uint8Array, expected: Uint8Array): boolean {
   return actual.length === expected.length && actual.every((b, i) => b === expected[i]);
 }
 
+/**
+ * The deterministic USTAR name placeholder paired with a canonical PAX path.
+ * The writer uses the first 100 UTF-8 bytes when that slice ends on a
+ * character boundary; otherwise it uses the fixed ASCII `PaxData` marker.
+ */
+export function canonicalPaxNamePlaceholder(path: string): string {
+  const rawPath = Buffer.from(path, 'utf8');
+  const prefixBytes = rawPath.subarray(0, 100);
+  const prefix = Buffer.from(prefixBytes).toString('utf8');
+  const prefixField = Buffer.from(prefix, 'utf8');
+  return prefixField.length === prefixBytes.length ? prefix : 'PaxData';
+}
+
 function readCStringCompatible(bytes: Uint8Array): string {
   const nul = bytes.indexOf(0);
   const slice = nul >= 0 ? bytes.subarray(0, nul) : bytes;
@@ -270,7 +283,11 @@ function parsePaxRecordsLenient(data: Uint8Array): Map<string, string> {
   return out;
 }
 
-function assertCanonicalHeaderFields(header: Uint8Array, storedChecksum: number): void {
+function assertCanonicalHeaderFields(
+  header: Uint8Array,
+  storedChecksum: number,
+  paxPath?: string,
+): void {
   const checksumField = header.subarray(148, 156);
   if (checksumField[6] !== 0 || checksumField[7] !== 0x20 || !/^[0-7]{6}$/.test(Buffer.from(checksumField.subarray(0, 6)).toString('ascii'))) {
     throw new ArchiveViolation('NON_CANONICAL_HEADER', 'tar checksum field is not canonical');
@@ -284,8 +301,21 @@ function assertCanonicalHeaderFields(header: Uint8Array, storedChecksum: number)
   // Canonical regular and PAX headers do not carry links, devices, or a
   // prefix field. A long path is represented by a PAX path record instead of
   // the USTAR prefix field in the production writer.
+  if (header.subarray(157, 257).some((b) => b !== 0)) {
+    throw new ArchiveViolation('NON_CANONICAL_HEADER', 'tar linkname field must be empty');
+  }
+  if (paxPath !== undefined) {
+    const expected = Buffer.alloc(100);
+    Buffer.from(canonicalPaxNamePlaceholder(paxPath), 'utf8').copy(expected);
+    if (!fieldEquals(header.subarray(0, 100), expected)) {
+      throw new ArchiveViolation(
+	'NON_CANONICAL_HEADER',
+	`tar name field is not the canonical PAX placeholder for '${paxPath}'`,
+      );
+    }
+  }
   if (header.subarray(329, 500).some((b) => b !== 0)) {
-    throw new ArchiveViolation('NON_CANONICAL_HEADER', 'tar link, device, or prefix fields must be empty');
+    throw new ArchiveViolation('NON_CANONICAL_HEADER', 'tar device or prefix fields must be empty');
   }
   if (header.subarray(500, 512).some((b) => b !== 0)) {
     throw new ArchiveViolation('NON_CANONICAL_HEADER', 'tar reserved header bytes must be zero');
@@ -385,6 +415,7 @@ export function parseTar(tar: Uint8Array, limits: TarLimits, opts: ParseTarOptio
       failCompat(message);
     }
 
+    const typeflag = String.fromCharCode(header[156] ?? 0);
     if (strict) {
       if (!isOctalField(header.subarray(148, 156))) {
 	failStrict('ARCHIVE_BAD_CHECKSUM', 'tar header checksum field is not valid octal');
@@ -394,7 +425,11 @@ export function parseTar(tar: Uint8Array, limits: TarLimits, opts: ParseTarOptio
       if (stored !== computed) {
 	failStrict('ARCHIVE_BAD_CHECKSUM', `tar header checksum mismatch (stored ${stored}, computed ${computed})`);
       }
-      assertCanonicalHeaderFields(header, stored);
+      assertCanonicalHeaderFields(
+	header,
+	stored,
+	(typeflag === '0' || typeflag === '\\0') ? pendingPaxPath : undefined,
+      );
       for (const [label, start, end] of [
 	['mode', 100, 108],
 	['uid', 108, 116],
@@ -430,7 +465,6 @@ export function parseTar(tar: Uint8Array, limits: TarLimits, opts: ParseTarOptio
     const uidField = parseOctal(header.subarray(108, 116));
     const gidField = parseOctal(header.subarray(116, 124));
     const mtimeField = parseOctal(header.subarray(136, 148));
-    const typeflag = String.fromCharCode(header[156] ?? 0);
 
     if (!Number.isInteger(sizeField) || sizeField < 0) {
       const message = `corrupt tar header: invalid size field (got ${sizeField})`;
@@ -484,11 +518,12 @@ export function parseTar(tar: Uint8Array, limits: TarLimits, opts: ParseTarOptio
 	if (strict) failStrict('ARCHIVE_PATH_TOO_LONG', message, { entryPath: candidateName });
 	failCompat(message);
       }
-      const violation = archivePathViolation(candidateName);
-      if (violation) {
-	const message = `unsafe archive path '${candidateName}': ${violation}`;
-	if (strict) failStrict('ARCHIVE_PATH_VIOLATION', message, { entryPath: candidateName });
-	failCompat(message);
+      if (strict) {
+	const violation = archivePathViolation(candidateName);
+	if (violation) {
+	  const message = `unsafe archive path '${candidateName}': ${violation}`;
+	  failStrict('ARCHIVE_PATH_VIOLATION', message, { entryPath: candidateName });
+	}
       }
     }
     if (typeflag === '5') {

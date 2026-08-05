@@ -252,8 +252,45 @@ function entryInfos(entries: TarEntry[]): BundleEntryInfo[] {
   }));
 }
 
-function assertDestinationParent(parent: string): void {
-  const absolute = resolve(parent);
+const ROOT_PATH_ALIASES = ['/var', '/tmp'] as const;
+
+/**
+ * Normalize the two conventional root aliases before checking ancestors. On
+ * systems where an alias is a real directory this is a no-op. On systems where
+ * an alias resolves elsewhere, the resolved path is checked instead, so the
+ * ancestor validation has one rule on every platform. User-created symlinks
+ * below the normalized root remain visible to the lexical lstat walk and are
+ * refused.
+ */
+function normalizeRootAliases(absolute: string): string {
+  let normalized = absolute;
+  for (const alias of ROOT_PATH_ALIASES) {
+    let target: string;
+    try {
+      target = realpathSync(alias);
+    } catch {
+      continue;
+    }
+    if (target === alias) continue;
+    if (dirname(target) !== '/private' || basename(target) !== basename(alias)) continue;
+    if (normalized === alias || normalized.startsWith(`${alias}/`)) {
+      normalized = `${target}${normalized.slice(alias.length)}`;
+    }
+  }
+  return normalized;
+}
+
+function assertDestinationParent(parent: string): string {
+  const absolute = normalizeRootAliases(resolve(parent));
+  let resolved: string;
+  try {
+    // Resolve before validating the canonical path. A dangling ancestor is an
+    // invalid destination, not a request to create a new parent tree.
+    resolved = realpathSync(absolute);
+  } catch {
+    throw new BundleError('DESTINATION_PARENT_INVALID', `unpack destination parent '${parent}' does not exist`);
+  }
+
   const components: string[] = [];
   let current = absolute;
   while (true) {
@@ -268,27 +305,13 @@ function assertDestinationParent(parent: string): void {
       throw new BundleError('DESTINATION_PARENT_INVALID', `unpack destination parent '${parent}' does not exist`);
     }
     if (st.isSymbolicLink()) {
-      // macOS exposes the ordinary temporary tree through `/var ->
-      // /private/var` (and `/tmp -> /private/tmp`). Those platform aliases
-      // are not operator-controlled escape paths; user-created symlinks remain
-      // refused below.
-      let allowedSystemAlias = false;
-      if (process.platform === 'darwin' && (component === '/var' || component === '/tmp')) {
-	try {
-	  const target = realpathSync(component);
-	  allowedSystemAlias = (component === '/var' && target === '/private/var') || (component === '/tmp' && target === '/private/tmp');
-	} catch {
-	  allowedSystemAlias = false;
-	}
-      }
-      if (!allowedSystemAlias) {
-	throw new BundleError('DESTINATION_PARENT_INVALID', `unpack destination ancestor '${component}' is a symbolic link`);
-      }
+      throw new BundleError('DESTINATION_PARENT_INVALID', `unpack destination ancestor '${component}' is a symbolic link`);
     }
-    if (!st.isDirectory() && !st.isSymbolicLink()) {
+    if (!st.isDirectory()) {
       throw new BundleError('DESTINATION_PARENT_INVALID', `unpack destination ancestor '${component}' is not a directory`);
     }
   }
+  return resolved;
 }
 
 /**
@@ -330,15 +353,15 @@ export function unpackBundle(bytes: Uint8Array, destination: string, opts: Inspe
   if (existing) {
     throw new BundleError('DESTINATION_EXISTS', `unpack destination '${destination}' already exists`);
   }
-  // Every existing component of the destination parent must be a real
-  // directory. Checking only the immediate parent is insufficient when an
-  // ancestor is a symlink to a different tree.
-  assertDestinationParent(parent);
+  // Resolve the existing parent before checking its components. Staging uses
+  // the resolved sibling path, while the public result retains the caller's
+  // absolute spelling of the destination.
+  const resolvedParent = assertDestinationParent(parent);
 
   // mkdtempSync creates a fresh sibling even when another process is unpacking
   // the same destination concurrently; the predictable pid/timestamp name
   // used by older partial code could collide.
-  const staging = mkdtempSync(join(parent, `.${basename(destAbs)}.owenloop-unpack-`));
+  const staging = mkdtempSync(join(resolvedParent, `.${basename(destAbs)}.owenloop-unpack-`));
   let staged = true;
   try {
 

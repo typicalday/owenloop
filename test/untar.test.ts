@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { gzipSync } from 'node:zlib';
 import { extractTarGz } from '../src/untar.ts';
-import { makeGithubTarball } from './helpers.ts';
+import { hostileData, hostileFileEntry, hostileHeader, hostilePaxBlocks, hostilePaxPathRecord, hostileTarball, makeGithubTarball } from './helpers.ts';
 
 test('round-trips a small set of short-path files', () => {
   const tarball = makeGithubTarball('acme-widgets-abc123', {
@@ -67,6 +67,19 @@ test('extractTarGz rejects an archive with too many files', () => {
     'workflows/b.yaml': 'b\n',
     'workflows/c.yaml': 'c\n',
   });
+  assert.throws(
+    () => extractTarGz(tarball, { maxFileCount: 2 }),
+    /file count exceeds limit of 2/,
+  );
+});
+
+test('extractTarGz counts directory and PAX headers toward the compatibility entry bound', () => {
+  const tarball = hostileTarball([
+    hostileHeader({ name: 'root', typeflag: '5' }),
+    hostileData(new Uint8Array()),
+    ...hostilePaxBlocks('PaxHeader', hostilePaxPathRecord('root/file.txt')),
+    ...hostileFileEntry('placeholder', 'x'),
+  ]);
   assert.throws(
     () => extractTarGz(tarball, { maxFileCount: 2 }),
     /file count exceeds limit of 2/,

@@ -2,10 +2,10 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import {
@@ -96,7 +96,7 @@ test('packing does not edit source manifest and is stable across mtime and irrel
   for (const path of [join(source, 'bundle.yaml'), join(source, 'workflow.yaml'), join(source, 'instructions', 'build.md')]) {
     utimesSync(path, changed, changed);
   }
-  writeFileSync(join(source, 'instructions', 'build.md'), readFileSync(join(source, 'instructions', 'build.md')), { mode: 0o600 });
+  chmodSync(join(source, 'instructions', 'build.md'), 0o600);
   const second = packBundle(source);
   assert.deepEqual(Buffer.from(second.bytes), Buffer.from(first.bytes));
   assert.deepEqual(readFileSync(join(source, 'bundle.yaml')), before);
@@ -110,6 +110,39 @@ test('one-file mutation changes archive bytes and digest', () => {
   const second = packBundle(source);
   assert.notEqual(second.digest, first.digest);
   assert.notDeepEqual(Buffer.from(second.bytes), Buffer.from(first.bytes));
+});
+
+test('packing is stable across source directory-entry ordering', () => {
+  const relativePaths = [
+    'assets/binary.bin',
+    'assets/notes.txt',
+    'assets/very-long-directory-name-that-pushes-the-archive-path-past-one-hundred-bytes-to-require-a-pax-header/deeply-nested-file.txt',
+    'bundle.yaml',
+    'docs/README.md',
+    'instructions/build.md',
+    'scripts/run.sh',
+    'workflow.yaml',
+  ];
+  const sourceFiles = relativePaths.map((rel) => ({
+    rel,
+    bytes: readFileSync(join(SOURCE, rel)),
+    mode: rel === 'scripts/run.sh' ? 0o755 : 0o644,
+  }));
+  const buildSource = (files: typeof sourceFiles): string => {
+    const root = tempDir();
+    for (const file of files) {
+      const target = join(root, file.rel);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, file.bytes);
+      chmodSync(target, file.mode);
+    }
+    return root;
+  };
+
+  const forward = packBundle(buildSource(sourceFiles));
+  const reverse = packBundle(buildSource([...sourceFiles].reverse()));
+  assert.equal(reverse.digest, forward.digest);
+  assert.deepEqual(Buffer.from(reverse.bytes), Buffer.from(forward.bytes));
 });
 
 test('unpack validates before writing and leaves no destination on failure', () => {
@@ -150,6 +183,7 @@ test('stock tar can list a produced bundle', () => {
 });
 
 test('strict reader rejects hostile path, duplicate, type, checksum, PAX, termination, and size cases', () => {
+  const longPaxPath = 'p'.repeat(101);
   const cases: Array<[string, Uint8Array, string]> = [
     ['traversal', hostileTarball(hostileFileEntry('../victim', 'x')), 'ARCHIVE_PATH_VIOLATION'],
     ['absolute', hostileTarball(hostileFileEntry('/etc/passwd', 'x')), 'ARCHIVE_PATH_VIOLATION'],
@@ -164,6 +198,11 @@ test('strict reader rejects hostile path, duplicate, type, checksum, PAX, termin
     ['bad checksum', hostileTarball(hostileFileEntry('bad', 'x', { mutate: (header) => { header[0] = header[0] === 0x62 ? 0x63 : 0x62; } })), 'ARCHIVE_BAD_CHECKSUM'],
     ['bad octal', hostileTarball(hostileFileEntry('bad-octal', 'x', { badOctalField: { offset: 100, bytes: '00000x0' } })), 'ARCHIVE_BAD_OCTAL'],
     ['non-canonical mode', hostileTarball(hostileFileEntry('mode', 'x', { mode: 0o600 })), 'NON_CANONICAL_HEADER'],
+    ['non-canonical linkname', hostileTarball(hostileFileEntry('linkname', 'x', { linkname: '../../etc/shadow' })), 'NON_CANONICAL_HEADER'],
+    ['non-canonical PAX raw name', hostileTarball([
+      ...hostilePaxBlocks('PaxHeader', hostilePaxPathRecord(longPaxPath)),
+      ...hostileFileEntry('wrong-placeholder', 'x'),
+    ]), 'NON_CANONICAL_HEADER'],
     ['bad pax', hostileTarball([...hostilePaxBlocks('PaxHeader', Buffer.from('not-a-record\n')), ...hostileFileEntry('data', 'x')]), 'ARCHIVE_BAD_PAX'],
     ['dangling pax', hostileTarball(hostilePaxBlocks('PaxHeader', hostilePaxPathRecord('dangling'))), 'ARCHIVE_DANGLING_PAX'],
     ['truncated data', hostileTarball([hostileHeader({ name: 'truncated', size: 2 }), Buffer.from('x')]), 'ARCHIVE_TRUNCATED'],
@@ -177,7 +216,7 @@ test('strict reader rejects hostile path, duplicate, type, checksum, PAX, termin
     assert.equal(errorCode(() => inspectBundle(bytes)), expected, name);
   }
   const longPath = 'a/'.repeat(600) + 'file';
-  const pax = hostileTarball([...hostilePaxBlocks('PaxHeader', hostilePaxPathRecord(longPath)), ...hostileFileEntry('payload', 'x')]);
+  const pax = hostileTarball([...hostilePaxBlocks('PaxHeader', hostilePaxPathRecord(longPath)), ...hostileFileEntry(longPath.slice(0, 100), 'x')]);
   assert.equal(errorCode(() => inspectBundle(pax)), 'ARCHIVE_PATH_TOO_LONG');
   assert.equal(errorCode(() => inspectBundle(hostileTarball(hostileFileEntry('large', '123')),{ limits: { maxFileBytes: 2 } })), 'ARCHIVE_ENTRY_TOO_LARGE');
 });

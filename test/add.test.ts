@@ -599,6 +599,7 @@ test('add: an archive entry that escapes with ../ refuses the whole add — noth
   const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
     'workflows/good.yaml': validDefYaml('good'),
     'workflows/../../victim.yaml': 'name: pwned\n',
+    'workflows/../second-victim.yaml': 'name: pwned-two\n',
   });
   const { fetch } = fakeFetch({
     [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
@@ -608,12 +609,33 @@ test('add: an archive entry that escapes with ../ refuses the whole add — noth
 
   const code = await mainAsync(['add', `${owner}/${repo}`], io);
   assert.equal(code, 1);
-  assert.match(err.join('\n'), /unsafe archive path/);
+  assert.match(err.join('\n'), /2 unsafe archive path\(s\) found/);
   assert.match(err.join('\n'), /victim\.yaml/);
+  assert.match(err.join('\n'), /second-victim\.yaml/);
 
   assert.ok(!existsSync(join(cwd, 'workflows', installFolder(owner, repo))), 'defsDir untouched on refusal');
   assert.ok(!existsSync(lockfilePath(cwd)), 'no lockfile written on refusal');
   assert.ok(!existsSync(join(cwd, 'victim.yaml')), 'victim not written into cwd');
+});
+
+test('add: unsafe entries outside workflows/ remain irrelevant to the legacy filter', async () => {
+  const owner = 'acme';
+  const repo = 'widgets';
+  const tarball = makeGithubTarball(`${owner}-${repo}-${SHA_A}`, {
+    'workflows/good.yaml': validDefYaml('good'),
+    '../outside.yaml': 'name: ignored\n',
+  });
+  const { fetch } = fakeFetch({
+    [shaUrl(owner, repo, 'HEAD')]: { status: 200, body: SHA_A },
+    [tarballUrl(owner, repo, SHA_A)]: { status: 200, body: tarball },
+  });
+  const { io, out } = makeIo(fetch);
+
+  const code = await mainAsync(['add', `${owner}/${repo}`], io);
+  assert.equal(code, 0, out.join('\n'));
+  const result = JSON.parse(out.join('\n'));
+  assert.deepEqual(result.defs, ['good']);
+  assert.equal(result.installed, 1);
 });
 
 test('add: a def whose bodyFile escapes with ../ is refused during staging validation (SEC-1 repro)', async () => {

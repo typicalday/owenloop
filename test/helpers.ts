@@ -260,6 +260,7 @@ export interface HostileHeaderOpts {
   gid?: number;
   uname?: string;
   gname?: string;
+  linkname?: string;
   mtime?: number;
   /** Corrupt the header AFTER the checksum is computed (for checksum tests). */
   mutate?: (buf: Buffer) => void;
@@ -284,6 +285,7 @@ export function hostileHeader(opts: HostileHeaderOpts): Buffer {
   buf.write('00', 263, 2, 'ascii');
   if (opts.uname) buf.write(opts.uname, 265, 'utf8');
   if (opts.gname) buf.write(opts.gname, 297, 'utf8');
+  if (opts.linkname) buf.write(opts.linkname, 157, 'utf8');
 
   if (opts.badOctalField) {
     buf.write(opts.badOctalField.bytes, opts.badOctalField.offset, 'ascii');

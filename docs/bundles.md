@@ -120,6 +120,10 @@ For every regular file:
 - Short UTF-8 paths use canonical USTAR headers.
 - Paths that do not fit the USTAR name field use one deterministic POSIX PAX
   `path` record in a `PaxHeader` entry. The record length counts UTF-8 bytes.
+  The paired USTAR name field is a deterministic placeholder: the first 100
+  UTF-8 bytes when that slice ends on a character boundary, otherwise `PaxData`.
+  A reader that ignores PAX therefore sees a truncated but still relative
+  placeholder path; such a reader is not a bundle-compatible reader.
 - Header fields use canonical zero-padded octal values, USTAR magic `ustar\0`,
   version `00`, and zeroed link, device, and prefix fields.
 - Each regular archive file uses typeflag `0`.
