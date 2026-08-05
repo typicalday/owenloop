@@ -32,13 +32,14 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline/promises';
 import { hostname } from 'node:os';
 import type { AddressInfo } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { Engine } from './engine.ts';
 import { buildGraph, buildTrace, graphToDot, graphToMermaid, hasDefiniteCheckDefect, modelCheck } from './model.ts';
@@ -58,6 +59,7 @@ import type { DefLoadFailure } from './defs.ts';
 import { createDefInstructionSource } from './order-resolver.ts';
 import type { CheckReport, WorkflowDef } from './types.ts';
 import { CliError, dbPathRefusingSymlink, detId, mkdirRefusingSymlink, nowMs, parseDurationMs, randId } from './util.ts';
+import { packageVersion } from './package-version.ts';
 import {
   authHeader,
   deleteCredential,
@@ -168,6 +170,8 @@ import { canonicalJsonBytes, defaultRecoveryMarkerDir, ensureDirectoryPathNoSyml
 // the type is now homed in hub.ts (cli → hub is boundary-legal).
 export type { Keychain } from './hub.ts';
 
+export type HarnessId = 'claude-code' | 'codex';
+
 export interface CliIO {
   cwd: string;
   env: Record<string, string | undefined>;
@@ -222,13 +226,15 @@ export interface CliIO {
    */
   prompt?: (question: string) => Promise<string>;
   /**
-   * Run a local command and capture its result — used ONLY by `setup`/`doctor`'s
-   * Claude Code plugin probe (`claude plugin list`). Default: a `spawnSync`
+   * Run a local command and capture its result — used by `setup`/`doctor`'s
+   * Claude Code and Codex plugin probes and convergers. Default: a `spawnSync`
    * wrapper with `shell: false` (never interpolates argv into a shell) that
-   * never inherits stdio. Injectable so tests model the plugin state without a
-   * real `claude` binary.
+   * never inherits stdio. Injectable so tests model plugin state and installs
+   * without real harness binaries or configuration writes.
    */
   runCommand?: (cmd: string, args: string[]) => { status: number | null; stdout: string; stderr: string };
+  /** Optional resolver override for hermetic tests of a missing bundled marketplace. */
+  resolveBundledMarketplaceRoot?: (harness: HarnessId) => string | null;
   /**
    * The principal signing-key manager for `setup`'s `[4/7] signing keys` step.
    * Injectable so setup tests never reach the developer's real `ssh-keygen`,
@@ -273,7 +279,7 @@ async function defaultPrompt(question: string): Promise<string> {
 /**
  * The default local-command runner: `spawnSync` with `shell: false` (argv is
  * passed as a vector, never interpolated into a shell) and captured, not
- * inherited, stdio. Only the plugin probe uses it.
+ * inherited, stdio. Plugin probes and convergers use it.
  */
 function defaultRunCommand(cmd: string, args: string[]): { status: number | null; stdout: string; stderr: string } {
   const r = spawnSync(cmd, args, { encoding: 'utf8' });
@@ -914,7 +920,7 @@ Commands:
   crew rm <crewId> [--hub <url>]           delete a crew; work stamped to it moves to the org's orphan crew
   crew member add <crewId> <principalKind> <principalId> [--hub <url>]   add a member or agent to a crew
   crew member rm <crewId> <principalId> [--hub <url>]   remove a principal from a crew
-  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]   converge this machine's install: human login, agent credential, signing keys, owenloop settings, plugin (idempotent)
+  setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]   converge this machine's install: human login, agent credential, signing keys, owenloop settings, plugins (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   work <subcommand> [args]                run execution-side shift/hold/exec/agent-run/... commands
@@ -4184,9 +4190,9 @@ async function dispatchCrew(io: CliIO, args: Args): Promise<number> {
 //
 // `owenloop setup` is the idempotent converger for a machine's install (identity
 // model doc §7 Flow A/B): human login → agent credential → owenloop settings →
-// Claude Code plugin → a final doctor pass. `owenloop doctor` (§8) is the
-// read-only probe of the same five surfaces. Both share `resolveSetupHub` (one
-// target) and the agent-slot probe.
+// Claude Code/Codex plugins → a final doctor pass. `owenloop doctor` (§8) is the
+// read-only probe of the same core surfaces plus both harness plugin states. Both
+// share `resolveSetupHub` (one target) and the agent-slot probe.
 //
 // Secrets discipline (§6 "rule of gates"): NO code path here passes a token to
 // `io.out`/`io.err`/an Error. The only token hops live inside
@@ -4208,7 +4214,7 @@ interface DoctorCheck {
   detail: string;
 }
 
-/** The doctor report: the ordered checks and whether the CORE checks (1–5, excluding the plugin) all passed. */
+/** The doctor report: the ordered checks and whether the five CORE checks (excluding plugins) all passed. */
 interface DoctorResult {
   ok: boolean;
   checks: DoctorCheck[];
@@ -4223,10 +4229,10 @@ interface VerifiedAgent {
 }
 
 /**
- * The plugin check is rendered but NON-FATAL while the marketplace is not yet
- * fetchably published (the brief's open question): `doctor` shows ✓/✗ but the
- * plugin never flips the exit code, and `setup` PRINTS install instructions
- * instead of failing. Flip to `true` once the shell-out install lands.
+ * The plugin checks are rendered but NON-FATAL: a developer may use either
+ * Claude Code or Codex, and a missing harness or failed plugin convergence must
+ * not make the core setup/doctor result fail. The setup ACT reports each issue as
+ * `noted` and continues with the other harness.
  */
 const PLUGIN_CHECK_FATAL = false;
 
@@ -4480,27 +4486,311 @@ async function promptSuccession(
   throw new CliError('no valid choice provided');
 }
 
-/** Probe the Claude Code plugin state: is `claude` on PATH, and does `plugin list` mention owenloop? */
-function probePlugin(io: CliIO): { claudeFound: boolean; installed: boolean } {
-  if (!commandOnPath(io.env, 'claude')) return { claudeFound: false, installed: false };
-  const run = io.runCommand ?? defaultRunCommand;
+export interface HarnessPluginState {
+  id: HarnessId;
+  cliName: 'claude' | 'codex';
+  cliFound: boolean;
+  installed: boolean;
+  installedVersion: string | null;
+  cliVersion: string | null;
+}
+
+interface HarnessConfig {
+  id: HarnessId;
+  cliName: HarnessPluginState['cliName'];
+  displayName: string;
+  marketplaceDir: string;
+  marketplaceManifest: string;
+}
+
+const HARNESS_CONFIGS: Record<HarnessId, HarnessConfig> = {
+  'claude-code': {
+    id: 'claude-code',
+    cliName: 'claude',
+    displayName: 'Claude Code',
+    marketplaceDir: 'claude-code',
+    marketplaceManifest: '.claude-plugin/marketplace.json',
+  },
+  codex: {
+    id: 'codex',
+    cliName: 'codex',
+    displayName: 'Codex',
+    marketplaceDir: 'codex',
+    marketplaceManifest: '.agents/plugins/marketplace.json',
+  },
+};
+
+const HARNESS_IDS: readonly HarnessId[] = ['claude-code', 'codex'];
+const PLUGIN_SELECTOR = 'owenloop@owenloop';
+
+/**
+ * Resolve a bundled marketplace root from either the source tree (`src/cli.ts`)
+ * or the shipped tree (`dist/src/cli.js`). The manifest check prevents a partial
+ * package from producing a path that the harness cannot consume.
+ */
+export function resolveBundledMarketplaceRoot(harness: HarnessId): string | null {
+  const config = HARNESS_CONFIGS[harness];
   try {
-    return { claudeFound: true, installed: run('claude', ['plugin', 'list']).stdout.includes('owenloop') };
+    const candidates = [
+      new URL(`../plugins/${config.marketplaceDir}/`, import.meta.url),
+      new URL(`../../plugins/${config.marketplaceDir}/`, import.meta.url),
+    ];
+    for (const candidate of candidates) {
+      const root = fileURLToPath(candidate);
+      if (existsSync(join(root, config.marketplaceManifest))) return root;
+    }
   } catch {
-    return { claudeFound: true, installed: false };
+    // A missing or malformed bundle must degrade to manual instructions.
+  }
+  return null;
+}
+
+function recordOf(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+}
+
+function normalizedPluginVersion(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const version = value.trim();
+  return version === '' ? null : version;
+}
+
+function firstOutputLine(value: string): string | null {
+  const line = value.split(/\\r?\\n/, 1)[0]?.trim() ?? '';
+  return line === '' ? null : line;
+}
+
+interface ParsedPluginList {
+  known: boolean;
+  installed: boolean;
+  installedVersion: string | null;
+}
+
+function parsePluginList(stdout: string, harness: HarnessId): ParsedPluginList {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return { known: false, installed: false, installedVersion: null };
+  }
+
+  if (harness === 'claude-code') {
+    if (!Array.isArray(parsed)) return { known: false, installed: false, installedVersion: null };
+    const entry = parsed.find((item): item is Record<string, unknown> => {
+      const row = recordOf(item);
+      if (row === null) return false;
+      const id = typeof row.id === 'string' ? row.id : '';
+      return id === PLUGIN_SELECTOR || id.split('@', 1)[0] === 'owenloop';
+    });
+    return entry === undefined
+      ? { known: true, installed: false, installedVersion: null }
+      : { known: true, installed: true, installedVersion: normalizedPluginVersion(entry.version) };
+  }
+
+  const root = recordOf(parsed);
+  if (root === null || !Array.isArray(root.installed)) return { known: false, installed: false, installedVersion: null };
+  const entry = root.installed.find((item): item is Record<string, unknown> => {
+    const row = recordOf(item);
+    if (row === null || row.installed !== true) return false;
+    return (
+      row.pluginId === PLUGIN_SELECTOR ||
+      (row.name === 'owenloop' && row.marketplaceName === 'owenloop')
+    );
+  });
+  return entry === undefined
+    ? { known: true, installed: false, installedVersion: null }
+    : { known: true, installed: true, installedVersion: normalizedPluginVersion(entry.version) };
+}
+
+function probeCliVersion(
+  run: (cmd: string, args: string[]) => { status: number | null; stdout: string; stderr: string },
+  cliName: HarnessPluginState['cliName'],
+): string | null {
+  try {
+    const result = run(cliName, ['--version']);
+    return result.status === 0 ? firstOutputLine(result.stdout) : null;
+  } catch {
+    return null;
   }
 }
 
-/**
- * The plugin ACT step. While the marketplace is unpublished this PRINTS the
- * manual install instructions instead of shelling out — the single seam a real
- * shell-out install would replace later. Never fails setup.
- */
-function installPluginStep(io: CliIO, state: { claudeFound: boolean; installed: boolean }): void {
-  if (!state.claudeFound) io.err('Claude Code (claude) not detected on PATH.');
-  io.err('Claude Code plugin — install manually:');
-  io.err('  claude plugin marketplace add owenloop');
-  io.err('  claude plugin install owenloop@owenloop');
+/** Probe both harnesses using their structured installed-plugin JSON channels. */
+function probePlugin(io: CliIO): HarnessPluginState[] {
+  const run = io.runCommand ?? defaultRunCommand;
+  return HARNESS_IDS.map((id) => {
+    const config = HARNESS_CONFIGS[id];
+    const cliFound = commandOnPath(io.env, config.cliName);
+    if (!cliFound) {
+      return { id, cliName: config.cliName, cliFound: false, installed: false, installedVersion: null, cliVersion: null };
+    }
+
+    let installed = false;
+    let installedVersion: string | null = null;
+    try {
+      const result = run(config.cliName, ['plugin', 'list', '--json']);
+      if (result.status === 0) {
+        const parsed = parsePluginList(result.stdout, id);
+        // A successful command with malformed output is presence-only: do not
+        // reinstall an already-present plugin merely because its version is unknown.
+        installed = parsed.known ? parsed.installed : true;
+        installedVersion = parsed.installedVersion;
+      }
+    } catch {
+      // A failed probe cannot establish presence; the ACT remains PATH-gated.
+      installed = false;
+      installedVersion = null;
+    }
+
+    return {
+      id,
+      cliName: config.cliName,
+      cliFound,
+      installed,
+      installedVersion,
+      cliVersion: probeCliVersion(run, config.cliName),
+    };
+  });
+}
+
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+function resolvedMarketplaceRoot(io: CliIO, harness: HarnessId): string | null {
+  const resolver = io.resolveBundledMarketplaceRoot ?? resolveBundledMarketplaceRoot;
+  try {
+    return resolver(harness);
+  } catch {
+    return null;
+  }
+}
+
+function pluginRemedy(harness: HarnessId, root: string | null): string {
+  const config = HARNESS_CONFIGS[harness];
+  const source = root ?? '<bundled marketplace root>';
+  return harness === 'claude-code'
+    ? `${config.cliName} plugin marketplace add ${source} && ${config.cliName} plugin install ${PLUGIN_SELECTOR}`
+    : `${config.cliName} plugin marketplace add ${source} && ${config.cliName} plugin add ${PLUGIN_SELECTOR}`;
+}
+
+function printManualPluginInstructions(io: CliIO, harness: HarnessId): void {
+  const config = HARNESS_CONFIGS[harness];
+  io.err(`${config.displayName} plugin — install manually:`);
+  io.err(`  ${config.cliName} plugin marketplace add <bundled marketplace root>`);
+  io.err(
+    `  ${config.cliName} plugin ${harness === 'claude-code' ? 'install' : 'add'} ${PLUGIN_SELECTOR}`,
+  );
+}
+
+function reportPluginCommandFailure(
+  io: CliIO,
+  cmd: string,
+  args: string[],
+  result: { stdout: string; stderr: string } | null,
+  error: unknown = undefined,
+): void {
+  io.err(`plugin command failed: ${cmd} ${args.join(' ')}`);
+  const childOutput = result === null ? '' : [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join('\\n');
+  if (childOutput !== '') io.err(childOutput);
+  if (error !== undefined) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message !== '') io.err(message);
+  }
+}
+
+function runPluginCommand(io: CliIO, cmd: string, args: string[]): boolean {
+  const run = io.runCommand ?? defaultRunCommand;
+  try {
+    const result = run(cmd, args);
+    if (result.status === 0) return true;
+    reportPluginCommandFailure(io, cmd, args, result);
+  } catch (error) {
+    reportPluginCommandFailure(io, cmd, args, null, error);
+  }
+  return false;
+}
+
+type MarketplaceGate = 'same' | 'absent' | 'different' | 'unknown';
+
+function codexMarketplaceGate(io: CliIO, root: string): MarketplaceGate {
+  const run = io.runCommand ?? defaultRunCommand;
+  let result: { status: number | null; stdout: string; stderr: string };
+  try {
+    result = run('codex', ['plugin', 'marketplace', 'list', '--json']);
+  } catch {
+    return 'absent';
+  }
+  if (result.status !== 0) return 'absent';
+
+  try {
+    const parsed = recordOf(JSON.parse(result.stdout));
+    if (parsed === null || !Array.isArray(parsed.marketplaces)) return 'absent';
+    const entry = parsed.marketplaces.find((item) => recordOf(item)?.name === 'owenloop');
+    if (entry === undefined) return 'absent';
+    const row = recordOf(entry);
+    const source = recordOf(row?.marketplaceSource)?.source;
+    if (typeof source !== 'string' || source.trim() === '') return 'unknown';
+    return canonicalPath(source) === canonicalPath(root) ? 'same' : 'different';
+  } catch {
+    return 'absent';
+  }
+}
+
+type PluginStepOutcome = Pick<SetupStep, 'action' | 'detail'>;
+
+/** Converge one harness without making plugin failures fatal to setup. */
+function installPluginStep(io: CliIO, state: HarnessPluginState): PluginStepOutcome {
+  const config = HARNESS_CONFIGS[state.id];
+  if (!state.cliFound) return { action: 'noted', detail: `${config.cliName} not on PATH` };
+  if (state.installed && state.installedVersion === null) {
+    return { action: 'skipped', detail: 'installed (version unknown)' };
+  }
+
+  const expectedVersion = packageVersion().trim();
+  const currentVersion = state.installedVersion?.trim() ?? null;
+  if (state.installed && currentVersion === expectedVersion) {
+    return { action: 'skipped', detail: `owenloop ${currentVersion} already current` };
+  }
+
+  const root = resolvedMarketplaceRoot(io, state.id);
+  if (root === null) {
+    printManualPluginInstructions(io, state.id);
+    return { action: 'noted', detail: 'bundled marketplace root unavailable — printed manual instructions' };
+  }
+
+  const upgrading = state.installed && currentVersion !== null;
+  if (state.id === 'claude-code') {
+    if (!runPluginCommand(io, 'claude', ['plugin', 'marketplace', 'add', root])) {
+      return { action: 'noted', detail: 'marketplace add failed' };
+    }
+    const verb = upgrading ? 'update' : 'install';
+    if (!runPluginCommand(io, 'claude', ['plugin', verb, PLUGIN_SELECTOR])) {
+      return { action: 'noted', detail: `${verb} failed` };
+    }
+    return { action: 'done', detail: upgrading ? `updated to ${expectedVersion}` : `installed ${expectedVersion}` };
+  }
+
+  const marketplace = codexMarketplaceGate(io, root);
+  if (marketplace === 'different') {
+    return {
+      action: 'noted',
+      detail: "marketplace 'owenloop' is already added from a different source; remove it before adding this source",
+    };
+  }
+  if (marketplace === 'unknown') {
+    return { action: 'noted', detail: 'could not determine the existing Codex marketplace source' };
+  }
+  if (marketplace === 'absent' && !runPluginCommand(io, 'codex', ['plugin', 'marketplace', 'add', root])) {
+    return { action: 'noted', detail: 'marketplace add failed' };
+  }
+  if (!runPluginCommand(io, 'codex', ['plugin', 'add', PLUGIN_SELECTOR])) {
+    return { action: 'noted', detail: 'plugin add failed' };
+  }
+  return { action: 'done', detail: upgrading ? `updated to ${expectedVersion}` : `installed ${expectedVersion}` };
 }
 
 /**
@@ -4616,6 +4906,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   }
   io.err(`  owenloop settings: ${settingsNote}`);
   io.err(`  claude on PATH: ${commandOnPath(io.env, 'claude') ? 'yes' : 'no'}`);
+  io.err(`  codex on PATH: ${commandOnPath(io.env, 'codex') ? 'yes' : 'no'}`);
   const inspectAccts = enumerateAgentAccounts(io, origin);
   io.err(
     inspectAccts === null
@@ -4753,17 +5044,11 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
 
   // --- [6/7] plugin (non-fatal) ---
   io.err('[6/7] plugin');
-  const pluginState = probePlugin(io);
-  if (pluginState.installed) {
-    io.err('✓ plugin: owenloop installed');
-    steps.push({ step: 'plugin', action: 'skipped', detail: 'installed' });
-  } else {
-    installPluginStep(io, pluginState);
-    steps.push({
-      step: 'plugin',
-      action: 'noted',
-      detail: pluginState.claudeFound ? 'not installed — printed manual instructions' : 'claude not on PATH — printed manual instructions',
-    });
+  for (const pluginState of probePlugin(io)) {
+    const outcome = installPluginStep(io, pluginState);
+    const marker = outcome.action === 'noted' ? '!' : '✓';
+    io.err(`${marker} plugin (${pluginState.id}): ${outcome.detail}`);
+    steps.push({ step: `plugin (${pluginState.id})`, ...outcome });
   }
 
   // --- [7/7] doctor pass ---
@@ -4776,7 +5061,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
 
 /**
  * `owenloop doctor` — the read-only probe of the five install surfaces plus the
- * plugin, rendering one distinct ✓/✗ line each. NO configuration writes (no
+ * two harness plugin checks, rendering one distinct ✓/✗ line each. NO configuration writes (no
  * mint, rekey, slot create/delete, settings write, or browser). The one
  * carve-out: `authedGet`'s persist=true MAY rotate-and-persist an expiring human
  * oauth token — as every authed verb does — because a refresh WITHOUT persisting
@@ -4791,11 +5076,11 @@ async function dispatchDoctor(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
- * Run the six doctor checks in order, printing each ✓/✗ line to stderr and
+ * Run the doctor checks in order, printing each ✓/✗ line to stderr and
  * returning the structured result. Never short-circuits — a machine with no
- * working human credential still renders lines 3–6 (the agent probe degrades
- * honestly). `ok` reflects checks 1–5 only; the plugin check (6) renders but,
- * while `PLUGIN_CHECK_FATAL` is false, never affects `ok`.
+ * working human credential still renders the later checks (the agent probe
+ * degrades honestly). `ok` reflects the five core checks only; both plugin checks
+ * render but, while `PLUGIN_CHECK_FATAL` is false, never affect `ok`.
  */
 async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
   const checks: DoctorCheck[] = [];
@@ -4909,14 +5194,42 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
     }
   }
 
-  // 6. plugin (rendered; non-core while PLUGIN_CHECK_FATAL is false)
-  const pluginState = probePlugin(io);
-  if (!pluginState.claudeFound) {
-    record('plugin', false, 'Claude Code (claude) not on PATH', PLUGIN_CHECK_FATAL);
-  } else if (!pluginState.installed) {
-    record('plugin', false, 'plugin not installed — claude plugin marketplace add owenloop && claude plugin install owenloop@owenloop', PLUGIN_CHECK_FATAL);
-  } else {
-    record('plugin', true, 'owenloop installed', PLUGIN_CHECK_FATAL);
+  // 6–7. plugins (rendered; non-core while PLUGIN_CHECK_FATAL is false)
+  for (const pluginState of probePlugin(io)) {
+    const config = HARNESS_CONFIGS[pluginState.id];
+    if (!pluginState.cliFound) {
+      record(`plugin (${pluginState.id})`, false, `${config.displayName} (${config.cliName}) not on PATH`, PLUGIN_CHECK_FATAL);
+    } else if (!pluginState.installed) {
+      const root = resolvedMarketplaceRoot(io, pluginState.id);
+      const cliVersion = pluginState.cliVersion ?? 'unknown';
+      record(
+        `plugin (${pluginState.id})`,
+        false,
+        `not installed — ${pluginRemedy(pluginState.id, root)} · ${config.cliName} ${cliVersion}`,
+        PLUGIN_CHECK_FATAL,
+      );
+    } else if (pluginState.installedVersion === null) {
+      record(
+        `plugin (${pluginState.id})`,
+        true,
+        `owenloop version unknown · ${config.cliName} ${pluginState.cliVersion ?? 'unknown'}`,
+        PLUGIN_CHECK_FATAL,
+      );
+    } else if (pluginState.installedVersion === packageVersion().trim()) {
+      record(
+        `plugin (${pluginState.id})`,
+        true,
+        `owenloop ${pluginState.installedVersion} · ${config.cliName} ${pluginState.cliVersion ?? 'unknown'}`,
+        PLUGIN_CHECK_FATAL,
+      );
+    } else {
+      record(
+        `plugin (${pluginState.id})`,
+        false,
+        `owenloop ${pluginState.installedVersion} but CLI is ${packageVersion().trim()} — run owenloop setup · ${config.cliName} ${pluginState.cliVersion ?? 'unknown'}`,
+        PLUGIN_CHECK_FATAL,
+      );
+    }
   }
 
   return { ok: coreOk, checks };

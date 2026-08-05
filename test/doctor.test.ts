@@ -1,6 +1,6 @@
 /**
  * `owenloop doctor` — the read-only probe of the five install surfaces plus the
- * (non-fatal) plugin check, driven through `mainAsync` against `makeIdentityHub`.
+ * (non-fatal) Claude Code and Codex plugin checks, driven through `mainAsync` against `makeIdentityHub`.
  * Each ✗ path is asserted on its DISTINGUISHING substring so the wording stays
  * pairwise-distinct. The all-green case additionally asserts a strict zero-write
  * (the store is byte-identical after the run — fresh tokens, so no refresh).
@@ -48,10 +48,11 @@ function writeSettings(env: Record<string, string | undefined>, hubOrigin: strin
   writeFileSync(path, JSON.stringify({ hubOrigin }));
 }
 
-/** A PATH fixture dir; when `withClaude`, it holds an executable `claude` stub. */
-function pathDir(withClaude: boolean): string {
+/** A PATH fixture dir with executable harness stubs; PATH scans never execute these files. */
+function pathDir(withClaude: boolean, withCodex = false): string {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-doctor-path-'));
   if (withClaude) writeFileSync(join(dir, 'claude'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  if (withCodex) writeFileSync(join(dir, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
   return dir;
 }
 
@@ -103,7 +104,7 @@ test('doctor: plugin missing is NON-FATAL — ✗ plugin line but exit 0, in bot
     writeSettings(t.io.env, ORIGIN);
 
     assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
-    assert.match(t.err.join('\n'), /plugin: Claude Code \(claude\) not on PATH/);
+    assert.match(t.err.join('\n'), /plugin \(claude-code\): Claude Code \(claude\) not on PATH/);
     assertNoOlpErr(t);
   }
 
@@ -111,13 +112,13 @@ test('doctor: plugin missing is NON-FATAL — ✗ plugin line but exit 0, in bot
   {
     const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
     const { fetch } = routedFetch(routes);
-    const t = makeIo({ fetch, env: { PATH: pathDir(true) }, runCommand: () => ({ status: 0, stdout: 'some-other-plugin', stderr: '' }) });
+    const t = makeIo({ fetch, env: { PATH: pathDir(true) }, runCommand: () => ({ status: 0, stdout: '[]', stderr: '' }) });
     seedHuman(t.store);
     seedAgentSlot(t.store, 'worker', 'olp_live');
     writeSettings(t.io.env, ORIGIN);
 
     assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
-    assert.match(t.err.join('\n'), /plugin: plugin not installed/);
+    assert.match(t.err.join('\n'), /plugin \(claude-code\): not installed/);
     assertNoOlpErr(t);
   }
 });
@@ -140,7 +141,23 @@ test('doctor: agent slot present but hub 401s the token → ✗ revoked or inval
 test('doctor: all green → every line ✓, exit 0, and a strict zero-write', async () => {
   const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
   const { fetch } = routedFetch(routes);
-  const t = makeIo({ fetch, env: { PATH: pathDir(true) }, runCommand: () => ({ status: 0, stdout: 'owenloop@owenloop v1', stderr: '' }) });
+  const t = makeIo({
+    fetch,
+    env: { PATH: pathDir(true, true) },
+    runCommand: (cmd, args) => {
+      if (args[0] === '--version') {
+        return { status: 0, stdout: cmd === 'claude' ? '2.1.222 (Claude Code)\n' : 'codex-cli 0.146.0\n', stderr: '' };
+      }
+      if (cmd === 'claude') {
+        return { status: 0, stdout: '[{"id":"owenloop@owenloop","version":"0.5.0"}]', stderr: '' };
+      }
+      return {
+        status: 0,
+        stdout: JSON.stringify({ installed: [{ pluginId: 'owenloop@owenloop', version: '0.5.0', installed: true }], available: [] }),
+        stderr: '',
+      };
+    },
+  });
   seedHuman(t.store);
   seedAgentSlot(t.store, 'worker', 'olp_live');
   writeSettings(t.io.env, ORIGIN);
@@ -150,9 +167,19 @@ test('doctor: all green → every line ✓, exit 0, and a strict zero-write', as
 
   const err = t.err.join('\n');
   assert.doesNotMatch(err, /✗/, 'no failing check lines');
-  for (const label of ['human credential', 'human plane', 'agent slot', 'agent plane', 'owenloop settings', 'plugin']) {
-    assert.match(err, new RegExp(`✓ ${label}`), `${label} passed`);
+  for (const label of [
+    'human credential',
+    'human plane',
+    'agent slot',
+    'agent plane',
+    'owenloop settings',
+    'plugin (claude-code)',
+    'plugin (codex)',
+  ]) {
+    assert.ok(err.includes(`✓ ${label}`), `${label} passed`);
   }
+  assert.match(err, /✓ plugin \(claude-code\): owenloop 0\.5\.0 · claude 2\.1\.222 \(Claude Code\)/);
+  assert.match(err, /✓ plugin \(codex\): owenloop 0\.5\.0 · codex codex-cli 0\.146\.0/);
 
   assert.deepEqual([...t.store.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)), before, 'doctor performed no writes');
   assertNoOlpErr(t);
