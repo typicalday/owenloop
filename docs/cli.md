@@ -64,7 +64,7 @@ for the full breakdown.
 | `crew rm <crewId> [--hub <url>]` | delete a crew; work stamped to it moves to the org's orphan crew — see [Crews](#crews) |
 | `crew member add <crewId> <principalKind> <principalId> [--hub <url>]` | add a member or agent to a crew — see [Crews](#crews) |
 | `crew member rm <crewId> <principalId> [--hub <url>]` | remove a principal from a crew — see [Crews](#crews) |
-| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]` | onboard this machine: may store human and Scoped Identity credentials, ensure the three principal signing keys, write only execution-settings `hubOrigin`, and after probing print missing-plugin commands instead of installing the plugin — see [`setup`](#setup--onboard-a-machine) |
+| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]` | onboard this machine: may store human and Scoped Identity credentials, ensure the three principal signing keys, write only execution-settings `hubOrigin`, and converge the bundled plugins for Claude Code and Codex — see [`setup`](#setup--onboard-a-machine) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
@@ -1353,13 +1353,15 @@ lines (the tolerant-false notices, the transfer summary) go to stderr only.
 Depending on the machine state, setup may store the human credential, mint or
 rekey and store a Scoped Identity credential, ensure the three principal
 signing keys, and write only `hubOrigin` in the
-execution settings file while preserving its other keys. The plugin step only
-probes whether the Claude Code plugin is installed; when the probe reports it
-missing, setup prints manual install commands but never runs those commands or
-installs the plugin. The steps:
+execution settings file while preserving its other keys. The plugin step
+probes and, when needed, converges the bundled `owenloop` plugin for each
+available harness: Claude Code and Codex. Plugin convergence is non-fatal and
+setup continues when a harness is missing, the bundled marketplace root is
+unavailable, or a plugin command fails. A second run with the expected plugin
+version already installed performs no plugin writes. The steps:
 
 1. **inspect** — read-only report of what's already present (human credential,
-   execution settings, `claude` on PATH, agent slots). No writes.
+   execution settings, `claude` and `codex` on PATH, agent slots). No writes.
 2. **human login** — verify the stored **human** credential, or run the same
    loopback-OAuth browser flow as `owenloop login` when none is present or it no
    longer verifies. This is the gate that makes step 3's mint/rekey legal.
@@ -1373,10 +1375,17 @@ installs the plugin. The steps:
 5. **execution settings** — write only `hubOrigin` into the execution settings
    file so the local Step Agent talks to this hub, preserving every other key
    (skipped when `hubOrigin` already matches).
-6. **plugin** — check whether the Claude Code `owenloop` plugin is installed.
-   **Non-fatal:** while the marketplace is unpublished this step only *prints*
-   the manual install commands (`claude plugin marketplace add owenloop` then
-   `claude plugin install owenloop@owenloop`); it never fails setup.
+6. **plugin** — probe and converge the bundled `owenloop` plugin separately
+   for Claude Code and Codex. When the installed plugin is missing or its
+   version differs from the CLI package, setup adds the bundled marketplace
+   when needed and installs or updates the plugin. Claude Code uses
+   `claude plugin install` for a fresh install and `claude plugin update` for
+   an existing plugin. Codex uses `codex plugin add owenloop@owenloop` for both
+   fresh installs and upgrades; setup does not call
+   `codex plugin marketplace upgrade`, which applies only to Git marketplaces.
+   **Non-fatal:** a missing harness or failed convergence is reported as
+   `noted` and never fails setup. If the bundled marketplace root is
+   unavailable, setup prints manual commands instead.
 7. **doctor** — a final [`doctor`](#doctor--check-a-machines-install) pass over
    the same surfaces, whose result becomes setup's exit code.
 
@@ -1509,16 +1518,23 @@ The checks, in order:
 | 3 | agent slot | an `agent:<name>` credential is stored | yes |
 | 4 | agent plane | that agent credential verifies live against the hub | yes |
 | 5 | execution settings | the settings file's `hubOrigin` matches this hub | yes |
-| 6 | plugin | the Claude Code `owenloop` plugin is installed | **no** (rendered only) |
+| 6 | plugin (claude-code) | the Claude Code `owenloop` plugin is installed at the package version | **no** (rendered only) |
+| 7 | plugin (codex) | the Codex `owenloop` plugin is installed at the package version | **no** (rendered only) |
+
+The plugin checks also report the detected harness CLI version. An installed
+plugin whose version cannot be parsed is reported as `version unknown` and is
+not treated as a failure. A parsed plugin version that differs from the
+package version is reported as version skew with the remedy `run owenloop
+setup`. A missing harness reports that the harness is not on `PATH`; a missing
+plugin reports the harness-specific marketplace and install command.
 
 Each `✗` line names its own remedy (`run owenloop setup`, `owenloop login --hub
 <origin>`, re-run setup's Replace, and so on). doctor never short-circuits — a
-machine with no working human credential still renders lines 3–6, degrading
-honestly rather than dropping them.
+machine with no working human credential still renders the later checks,
+degrading honestly rather than dropping them.
 
-**Exit code.** `0` when the **core** checks (1–5) all pass, `1` otherwise. The
-plugin check (6) is *rendered* but does not affect the exit code while the
-marketplace is unpublished.
+**Exit code.** `0` when the **core** checks (1–5) all pass, `1` otherwise. Both
+plugin checks (6–7) are *rendered* but do not affect the exit code.
 
 ## `mcp` — stdio control-plane server for MCP hosts
 
