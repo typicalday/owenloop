@@ -25,17 +25,28 @@ interface Frame {
 }
 
 /** A server wired to an array-backed `write` sink, plus the frames it emitted. */
-function makeServer(tools: ToolRegistration[]): { server: ReturnType<typeof createMcpServer>; frames: Frame[]; errs: string[] } {
+function makeServer(
+  tools: ToolRegistration[],
+  expectedPluginVersion?: string,
+): { server: ReturnType<typeof createMcpServer>; frames: Frame[]; errs: string[] } {
   const frames: Frame[] = [];
   const errs: string[] = [];
-  const server = createMcpServer({
-    name: 'owenloop-cli-mcp',
-    version: '0.0.1',
-    tools,
-    write: (msg) => frames.push(msg as Frame),
-    err: (line) => errs.push(line),
-  });
-  return { server, frames, errs };
+  const previousPluginVersion = process.env['OWENLOOP_PLUGIN_VERSION'];
+  try {
+    if (expectedPluginVersion === undefined) delete process.env['OWENLOOP_PLUGIN_VERSION'];
+    else process.env['OWENLOOP_PLUGIN_VERSION'] = expectedPluginVersion;
+    const server = createMcpServer({
+      name: 'owenloop-cli-mcp',
+      version: '0.0.1',
+      tools,
+      write: (msg) => frames.push(msg as Frame),
+      err: (line) => errs.push(line),
+    });
+    return { server, frames, errs };
+  } finally {
+    if (previousPluginVersion === undefined) delete process.env['OWENLOOP_PLUGIN_VERSION'];
+    else process.env['OWENLOOP_PLUGIN_VERSION'] = previousPluginVersion;
+  }
 }
 
 const echoTool: ToolRegistration = {
@@ -92,6 +103,46 @@ test('mcpcore: tools/call dispatches to the handler; an unknown tool → METHOD_
 
   await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'nope', arguments: {} } }));
   assert.equal(frames[1]!.error!.code, METHOD_NOT_FOUND);
+});
+
+test('mcpcore: a matching plugin version leaves tool dispatch normal', async () => {
+  const { server, frames } = makeServer([echoTool], '0.0.1');
+  await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'echo', arguments: { v: 'match' } } }));
+  const result = frames[0]!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(JSON.parse(result.content[0]!.text), { echoed: 'match' });
+});
+
+test('mcpcore: a mismatched plugin version returns an error and never runs the handler', async () => {
+  let ran = false;
+  const tool: ToolRegistration = {
+    ...echoTool,
+    handler: (args) => {
+      ran = true;
+      return textResult({ echoed: args['v'] });
+    },
+  };
+  const { server, frames, errs } = makeServer([tool], '9.9.9');
+  await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 10, method: 'tools/call', params: { name: 'echo', arguments: { v: 'mismatch' } } }));
+  const result = frames[0]!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+  assert.equal(result.isError, true);
+  assert.match(result.content[0]!.text, /owenloop plugin 9\.9\.9 does not match owenloop CLI 0\.0\.1\. Run: owenloop setup/);
+  assert.equal(ran, false);
+  assert.ok(errs.some((line) => line.includes('owenloop plugin 9.9.9')));
+});
+
+test('mcpcore: an absent plugin version leaves tool dispatch normal', async () => {
+  const { server, frames } = makeServer([echoTool]);
+  await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'echo', arguments: { v: 'absent' } } }));
+  const result = frames[0]!.result as { content: Array<{ type: string; text: string }>; isError?: boolean };
+  assert.equal(result.isError, undefined);
+  assert.deepEqual(JSON.parse(result.content[0]!.text), { echoed: 'absent' });
+});
+
+test('mcpcore: an unknown tool stays METHOD_NOT_FOUND under a version mismatch', async () => {
+  const { server, frames } = makeServer([echoTool], '9.9.9');
+  await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 12, method: 'tools/call', params: { name: 'nope', arguments: {} } }));
+  assert.equal(frames[0]!.error!.code, METHOD_NOT_FOUND);
 });
 
 test('mcpcore: a handler that throws → an isError result, not a crash, and the server keeps serving', async () => {

@@ -139,6 +139,12 @@ interface InFlight {
 
 export function createMcpServer(opts: McpServerOptions): McpServer {
   const err = opts.err ?? ((): void => {});
+  // A plugin supplies its manifest version through the MCP environment. An
+  // absent expectation leaves hand-run and headless MCP servers unchanged;
+  // only a supplied value can describe a plugin/CLI drift. The comparison is
+  // deferred to tools/call instead of rejecting startup, because startup
+  // rejection surfaces as the opaque "server transport closed unexpectedly".
+  const expectedPluginVersion = process.env['OWENLOOP_PLUGIN_VERSION'];
   const tools = new Map<string, ToolRegistration>();
   for (const t of opts.tools) tools.set(t.name, t);
 
@@ -209,6 +215,13 @@ export function createMcpServer(opts: McpServerOptions): McpServer {
     };
 
     try {
+      // Keep the check at the transport choke point so every registered tool is
+      // covered, but leave unknown tools on the normal -32601 path above.
+      if (expectedPluginVersion !== undefined && expectedPluginVersion !== opts.version) {
+        throw new Error(
+          `owenloop plugin ${expectedPluginVersion} does not match owenloop CLI ${opts.version}. Run: owenloop setup`,
+        );
+      }
       const result = await reg.handler(args, ctx);
       // A CLIENT-cancelled call sends NO response frame (the JSON-RPC/MCP
       // cancel contract). A close-cancelled call still replies — see InFlight.

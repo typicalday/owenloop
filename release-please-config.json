@@ -19,6 +19,16 @@
           "type": "json",
           "path": "plugins/codex/plugins/owenloop/.codex-plugin/plugin.json",
           "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "plugins/claude-code/plugin/.mcp.json",
+          "jsonpath": "$.mcpServers.owenloop.env.OWENLOOP_PLUGIN_VERSION"
+        },
+        {
+          "type": "json",
+          "path": "plugins/codex/plugins/owenloop/.mcp.json",
+          "jsonpath": "$.mcpServers.owenloop.env.OWENLOOP_PLUGIN_VERSION"
         }
       ]
     }
