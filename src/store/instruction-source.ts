@@ -131,11 +131,38 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     return true;
   };
 
+  const attemptCandidate = async (
+    requestedDigest: string,
+    bundleDigest: DefDigest,
+  ): Promise<{ matched?: boolean; error?: unknown }> => {
+    try {
+      return { matched: await loadCandidate(requestedDigest, bundleDigest) };
+    } catch (error) {
+      return { error };
+    }
+  };
+
+  const candidateFailureForRefusal = (error: unknown): unknown =>
+    error instanceof StoreIntegrityError && error.code === 'object-missing' ? undefined : error;
+
   const primeOnce = async (requestedDigest: string): Promise<'resolved' | 'unknown-digest'> => {
     if (cache.has(requestedDigest)) return 'resolved';
+
+    // Indexes can retain stale or damaged sibling objects. A candidate failure
+    // must not prevent a later, clean object from satisfying the requested
+    // projection digest. Keep the first non-missing failure only for the case
+    // where no candidate could be loaded cleanly; otherwise the requested
+    // digest is genuinely unknown among the candidates we could inspect.
+    let firstCandidateFailure: unknown;
+    let inspectedCleanCandidate = false;
     for (const bundleDigest of candidateDigests(projectRoot, globalRoot)) {
-      if (await loadCandidate(requestedDigest, bundleDigest)) return 'resolved';
+      const outcome = await attemptCandidate(requestedDigest, bundleDigest);
+      const candidateError = outcome.error;
+      if (candidateError !== undefined) firstCandidateFailure ??= candidateFailureForRefusal(candidateError);
+      inspectedCleanCandidate ||= candidateError === undefined;
+      if (candidateError === undefined && outcome.matched === true) return 'resolved';
     }
+    if (firstCandidateFailure !== undefined && !inspectedCleanCandidate) throw firstCandidateFailure;
     return 'unknown-digest';
   };
 

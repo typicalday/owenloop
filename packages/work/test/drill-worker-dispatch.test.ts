@@ -62,7 +62,6 @@ const ORDER: WorkOrder = {
   workflow: 'wf1',
   run: 'run_x1234',
   step: 'builder',
-  prompt: 'build it',
   consumes: {},
   expected_outputs: [{ path: 'pr' }],
   feedback: [],

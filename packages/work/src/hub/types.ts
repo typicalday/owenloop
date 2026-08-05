@@ -27,7 +27,6 @@ export interface WorkOrder {
   workflow: string;
   run: string;
   step: string;
-  prompt: string;
   consumes: Record<string, unknown>;
   expected_outputs: Array<{ path: string; schema?: unknown }>;
   feedback: string[];

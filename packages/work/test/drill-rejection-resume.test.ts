@@ -73,13 +73,15 @@ const ORDER: WorkOrder = {
   workflow: 'wf1',
   run: 'run_r1',
   step: 'builder',
-  prompt: PROMPT,
   consumes: {},
   expected_outputs: [{ path: 'pr' }],
   feedback: [],
   advisory: {},
   submit_hint: SUBMIT_HINT,
 };
+
+/** Legacy wire data may still carry prompt, but the driver type cannot read it. */
+Object.defineProperty(ORDER, 'prompt', { value: PROMPT, enumerable: true });
 
 const REJECT_1 = 'REASON-ONE: the null check is still missing on the empty-cart path';
 const REJECT_2 = 'REASON-TWO: the new test does not fail without the fix';

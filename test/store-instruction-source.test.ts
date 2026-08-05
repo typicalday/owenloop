@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync } from 'node:fs';
+import { chmodSync, cpSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -8,8 +8,13 @@ import { finalizeDefs, loadDefFile } from '../src/defs.ts';
 import {
   createBundleIngestor,
   createStoreInstructionSource,
+  defDigest,
+  objectDirForDigest,
+  readWorkflowStoreIndex,
   StoreIntegrityError,
   StoreInstructionSourceError,
+  storeIndexPath,
+  writeWorkflowStoreIndex,
 } from '../src/store/index.ts';
 import { createStoreInstructionResolver } from '../packages/work/src/exec/instructions.ts';
 import type { OrderPacket } from '../packages/work/src/hub/types.ts';
@@ -64,6 +69,12 @@ function order(defDigest: string, step = 'runner'): OrderPacket {
   };
 }
 
+function addIndexEntry(root: string, coordinate: string, digest: string): void {
+  const index = readWorkflowStoreIndex(storeIndexPath(root));
+  index.entries[coordinate] = { digest, pinned: false };
+  writeWorkflowStoreIndex(storeIndexPath(root), index);
+}
+
 test('store instruction source: an empty store refuses an unknown projection digest', async () => {
   const source = createStoreInstructionSource({
     projectRoot: tempDir('owenloop-empty-project-'),
@@ -93,6 +104,42 @@ test('store instruction source: a real installed bundle bridges bundle and order
   }
   assert.deepEqual(source.lookup({ defDigest: requested, step: 'missing-step', key: '' }), { status: 'unknown-step' });
   assert.deepEqual(source.getVerifiedStep(requested, 'runner')?.x?.['harness'], installed.definition.steps[0]!.x?.['harness']);
+});
+
+test('store instruction source: a stale index row does not poison a clean requested workflow', async () => {
+  const installed = await installedSource();
+  const requested = defInstructionDigest(installed.definition);
+  addIndexEntry(installed.root, 'stale/stale@1.0.0', '0'.repeat(64));
+
+  const source = createStoreInstructionSource({
+    projectRoot: installed.root,
+    globalRoot: tempDir('owenloop-stale-global-'),
+    verifier: createBundleIngestor(),
+  });
+
+  assert.equal(await source.prime(requested), 'resolved');
+  assert.equal(source.lookup({ defDigest: requested, step: 'runner', key: '' }).status, 'resolved');
+});
+
+test('store instruction source: an unrelated tampered candidate does not poison a clean requested workflow', async () => {
+  const installed = await installedSource();
+  const requested = defInstructionDigest(installed.definition);
+  const unrelatedDigest = '0'.repeat(64);
+  const unrelatedObject = objectDirForDigest(installed.root, defDigest(unrelatedDigest));
+  cpSync(installed.result.objectPath, unrelatedObject, { recursive: true });
+  chmodSync(unrelatedObject, 0o755);
+  chmodSync(join(unrelatedObject, 'workflow.yaml'), 0o644);
+  writeFileSync(join(unrelatedObject, 'workflow.yaml'), `${WORKFLOW}# unrelated tamper\\n`);
+  addIndexEntry(installed.root, 'attacker/attacker@1.0.0', unrelatedDigest);
+
+  const source = createStoreInstructionSource({
+    projectRoot: installed.root,
+    globalRoot: tempDir('owenloop-unrelated-tamper-global-'),
+    verifier: createBundleIngestor(),
+  });
+
+  assert.equal(await source.prime(requested), 'resolved');
+  assert.equal(source.lookup({ defDigest: requested, step: 'runner', key: '' }).status, 'resolved');
 });
 
 test('store instruction source: missing-object recovery is called once and cannot invent instructions', async () => {

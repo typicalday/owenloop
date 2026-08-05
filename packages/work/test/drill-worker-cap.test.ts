@@ -39,7 +39,7 @@ const RUNS = ['run_aaaa1111', 'run_bbbb2222', 'run_cccc3333'];
 
 function wo(run: string): WorkOrder {
   return {
-    workflow: 'wf1', run, step: 'builder', prompt: 'build it',
+    workflow: 'wf1', run, step: 'builder',
     consumes: {}, expected_outputs: [{ path: 'pr' }], feedback: [], advisory: {}, submit_hint: 'submit pr',
   };
 }

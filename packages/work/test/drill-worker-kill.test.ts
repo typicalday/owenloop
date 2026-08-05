@@ -42,7 +42,7 @@ const TPL_CONTENT = '---\nname: x\n---\n\nstep brief\n';
 const FAKE_HARNESS = fileURLToPath(new URL('./fixtures/fake-harness.mjs', import.meta.url));
 
 const ORDER: WorkOrder = {
-  workflow: 'wf1', run: 'run_x1234', step: 'builder', prompt: 'build it',
+  workflow: 'wf1', run: 'run_x1234', step: 'builder',
   consumes: {}, expected_outputs: [{ path: 'pr' }], feedback: [], advisory: {}, submit_hint: 'submit pr',
 };
 

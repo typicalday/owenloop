@@ -281,6 +281,15 @@ function seedBundle(seed: { harness?: string; model?: string; permissions?: Step
   );
 }
 
+/** Seed the verified-step seam with raw x contents, including malformed carriers. */
+function seedRawStep(x: Record<string, unknown>): void {
+  verifiedStep = {
+    name: 'builder',
+    body: TEMPLATE,
+    x,
+  } as unknown as StepDef;
+}
+
 beforeEach(() => {
   verifiedStep = undefined;
   savedEnv = { ...process.env };
@@ -432,6 +441,52 @@ test('run() ignores OWENLOOP_TOKEN when resolving its own bearer, and refuses at
   assert.equal(code, 2, 'an empty credential slot must fail at STARTUP, not mid-order');
   assert.deepEqual(fake.calls, [], 'no harness may be started once the bearer is refused');
   assert.match(err.join('\n'), /OWENLOOP_TOKEN is set and is being IGNORED here/);
+});
+
+async function runMalformedHarnessCarrier(x: Record<string, unknown>): Promise<{
+  code: number;
+  stderr: string;
+  calls: string[];
+  releases: unknown[];
+}> {
+  const fake: FakeAdapter = createFakeAdapter({ id: 'fake' });
+  useAdapter(fake);
+  seedRawStep(x);
+  const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+  const err: string[] = [];
+  const code = await run(WIRE, {
+    hub,
+    signalHost: fakeSignalHost().host,
+    holderId: 'host:123',
+    cwd: '/work',
+    out: () => {},
+    err: (line) => err.push(line),
+  });
+  return { code, stderr: err.join('\\n'), calls: fake.calls.map((call) => call.kind), releases };
+}
+
+test('run() refuses a legacy harness carrier instead of dropping permissions', async () => {
+  const result = await runMalformedHarnessCarrier({ 'claude-code': { tools: ['Read'], disallowedTools: ['Bash'], permissionMode: 'strict' } });
+  assert.equal(result.code, 1);
+  assert.deepEqual(result.calls, [], 'the malformed carrier must never start a harness');
+  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.match(result.stderr, /legacy 'x\.claude-code'.*rename/);
+});
+
+test('run() refuses a non-map x.harness carrier instead of dropping it', async () => {
+  const result = await runMalformedHarnessCarrier({ harness: 'not-a-map' });
+  assert.equal(result.code, 1);
+  assert.deepEqual(result.calls, [], 'the malformed carrier must never start a harness');
+  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.match(result.stderr, /non-map x\.harness/);
+});
+
+test('run() refuses a non-string x.harness.id instead of selecting the default harness', async () => {
+  const result = await runMalformedHarnessCarrier({ harness: { id: 42, tools: ['Read'] } });
+  assert.equal(result.code, 1);
+  assert.deepEqual(result.calls, [], 'the malformed carrier must never start a harness');
+  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.match(result.stderr, /non-string x\.harness\.id/);
 });
 
 test('run() renders the brief from the cached template and passes the step permission bag', async () => {

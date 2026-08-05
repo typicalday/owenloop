@@ -86,6 +86,7 @@ import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/registry.ts';
+import { parseHarnessCarrier } from '../bundle/fetch.ts';
 import { normalizeStepPermissions } from '../harness/permissions.ts';
 import { appendSession, latestFor, sessionsPath, type SessionRecord } from '../harness/session-store.ts';
 import { ensureWorkDir, resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
@@ -396,24 +397,20 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       return null;
     }
 
-    const carrier = resolved.step.x?.['harness'];
-    const carrierMap =
-      typeof carrier === 'object' && carrier !== null && !Array.isArray(carrier)
-        ? (carrier as Record<string, unknown>)
-        : undefined;
-    const harness = typeof carrierMap?.id === 'string' ? carrierMap.id : undefined;
-    const options: Record<string, unknown> = {};
-    if (carrierMap !== undefined) {
-      for (const [key, value] of Object.entries(carrierMap)) {
-        if (key !== 'id') options[key] = value;
-      }
+    let carrier: ReturnType<typeof parseHarnessCarrier>;
+    const rawStep = resolved.step as unknown as Record<string, unknown>;
+    try {
+      carrier = parseHarnessCarrier(rawStep, order.workflow, resolved.step.name);
+    } catch (e) {
+      err(`owenloop work agent-run: instruction refusal (harness-carrier): ${errMsg(e)}`);
+      return null;
     }
 
     return {
       step: resolved.step.name,
       brief: resolved.step.body,
-      ...(harness !== undefined ? { harness } : {}),
-      permissions: normalizeStepPermissions(options, resolved.step),
+      ...(carrier.harness !== undefined ? { harness: carrier.harness } : {}),
+      permissions: normalizeStepPermissions(carrier.harnessOptions, resolved.step),
     };
   };
 
