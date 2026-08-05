@@ -16,7 +16,9 @@ import assert from 'node:assert/strict';
 import {
   DSSE_SSH_NAMESPACE,
   DSSE_VERSION,
+  DSSE_RECORD_PAYLOAD_TYPES,
   DsseEnvelopeError,
+  isDsseRecordPayloadType,
   PAYLOAD_TYPE_ENROLLMENT_GRANT,
   PAYLOAD_TYPE_ORIGIN,
   PAYLOAD_TYPE_POLICY_FLOOR,
@@ -40,6 +42,7 @@ import {
   encodeBase64,
   preAuthEncode,
 } from '../src/crypto/dsse.ts';
+import type { DsseRecordPayloadType } from '../src/crypto/dsse.ts';
 import type { VerifiedSignature } from '../src/crypto/ssh.ts';
 
 const HELLO_TYPE = 'http://example.com/HelloWorld';
@@ -85,6 +88,16 @@ test('payload type constants are the five signed record classes, versioned', () 
   assert.equal(PAYLOAD_TYPE_ORIGIN, 'application/vnd.owenloop.origin.v1+json');
   assert.equal(DSSE_VERSION, 'DSSEv1');
   assert.equal(DSSE_SSH_NAMESPACE, 'owenloop-dsse-v1');
+  assert.deepEqual(DSSE_RECORD_PAYLOAD_TYPES, [
+    PAYLOAD_TYPE_ENROLLMENT_GRANT,
+    PAYLOAD_TYPE_REVOCATION,
+    PAYLOAD_TYPE_SUBMISSION,
+    PAYLOAD_TYPE_POLICY_FLOOR,
+    PAYLOAD_TYPE_ORIGIN,
+  ]);
+  assert.equal(Object.isFrozen(DSSE_RECORD_PAYLOAD_TYPES), true);
+  assert.equal(isDsseRecordPayloadType(PAYLOAD_TYPE_ORIGIN), true);
+  assert.equal(isDsseRecordPayloadType('application/vnd.attacker.evil.v1+json'), false);
 });
 
 // ---- PAE --------------------------------------------------------------------
@@ -368,6 +381,26 @@ test('record wrappers pin the payload type: sign under one class, verify as anot
   const res = await dsseVerifyRecord(envelope, PAYLOAD_TYPE_SUBMISSION, signer);
   assert.equal(res.payloadBytes.toString('utf8'), 'submission');
   await assert.rejects(dsseVerifyRecord(envelope, PAYLOAD_TYPE_POLICY_FLOOR, signer), /payload type mismatch/);
+});
+
+test('generic record wrappers enforce the runtime payload-type allow-list', async () => {
+  const attackerType: string = 'application/vnd.attacker.evil.v1+json';
+  const signer = {
+    async sign() {
+      return { keyid: 'SHA256:k', sig: Buffer.from('s') };
+    },
+    async verify(_bytes: Buffer, _sig: Buffer) {
+      return { keyid: 'SHA256:k', principal: 'p', format: 'sshsig' as const };
+    },
+  };
+  await assert.rejects(
+    dsseSignRecord(attackerType as DsseRecordPayloadType, Buffer.from('x'), signer),
+    (error: Error) => error instanceof DsseEnvelopeError,
+  );
+  await assert.rejects(
+    dsseVerifyRecord({}, attackerType as DsseRecordPayloadType, signer),
+    (error: Error) => error instanceof DsseEnvelopeError,
+  );
 });
 
 test('explicit record-class wrappers bind all five fixed payload types', async () => {

@@ -311,9 +311,9 @@ export class SshSigner implements Signer {
     if (policy.errors.length > 0 || policy.entries.length === 0) {
       throw new SshSignerError('sshsig verify: malformed allowed_signers policy');
     }
-    if (policy.entries.some((entry) => entry.keyType !== 'ssh-ed25519')) {
-      throw new SshSignerError('sshsig verify: only Ed25519 allowed_signers keys are supported');
-    }
+    // OpenSSH remains the policy authority: unrelated entries may use other
+    // stock key types. The Ed25519 restriction is applied to the key embedded
+    // in the signature after OpenSSH has selected and verified that key.
     if (this.verifyDir === null) {
       this.verifyDir = this.makeTempDir('owenloop-sshsig-');
       chmodSync(this.verifyDir, 0o700);

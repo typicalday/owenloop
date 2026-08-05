@@ -173,8 +173,8 @@ key blob and do not affect option parsing. The parser never throws: malformed
 lines come back with their line numbers alongside the well-formed entries. It
 deliberately does **not** implement OpenSSH pattern matching or authorization —
 `ssh-keygen -Y verify` remains the policy authority, and accepted policy text is
-fed back to it unchanged. `SshSigner` additionally restricts verification policy
-entries to Ed25519 keys.
+fed back to it unchanged. `SshSigner` accepts mixed policy files and restricts
+the actual key embedded in the verified signature to Ed25519.
 
 ## Out of scope (future work)
 

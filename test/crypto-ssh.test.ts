@@ -48,10 +48,11 @@ function sshKeygenWorks(): boolean {
 }
 const SKIP = !sshKeygenWorks() && 'host ssh-keygen lacks -Y support';
 
-/** Generate an ephemeral Ed25519 key in `dir`; the private file is the test's
+/** Generate an ephemeral test key in `dir`; the private file is the test's
  *  responsibility to remove (every caller does so in `finally`). */
-function makeEphemeralKey(dir: string, name: string): { keyPath: string; pubText: string; keyid: string } {
-  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'owenloop-test', '-f', join(dir, name)], {
+function makeEphemeralKey(dir: string, name: string, type: 'ed25519' | 'rsa' = 'ed25519'): { keyPath: string; pubText: string; keyid: string } {
+  const typeArgs = type === 'rsa' ? ['-b', '2048'] : [];
+  execFileSync('ssh-keygen', ['-q', '-t', type, ...typeArgs, '-N', '', '-C', 'owenloop-test', '-f', join(dir, name)], {
     stdio: 'ignore',
     timeout: 15_000,
   });
@@ -114,6 +115,63 @@ test('interop: stock-signed message verifies through the module', { skip: SKIP }
       assert.equal(res!.keyid, keyid, 'verify reports the allowed key fingerprint');
     } finally {
       signer.dispose();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('interop: a mixed allowed_signers policy does not veto an Ed25519 signature', { skip: SKIP }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-ssh-t-'));
+  try {
+    const ed25519 = makeEphemeralKey(dir, 'ed25519-signer');
+    const rsa = makeEphemeralKey(dir, 'rsa-verifier-entry', 'rsa');
+    const message = Buffer.from('mixed allowed signers policy');
+    const armored = execFileSync('ssh-keygen', ['-q', '-Y', 'sign', '-f', ed25519.keyPath, '-n', 'mixed-policy'], {
+      input: message,
+      timeout: 10_000,
+    });
+    const signer = new SshSigner({
+      namespace: 'mixed-policy',
+      verify: { principal: 'alice', allowedSignersText: `alice ${ed25519.pubText.trim()}\nbob ${rsa.pubText.trim()}\n` },
+    });
+    try {
+      const result = await signer.verify(message, armored);
+      assert.ok(result !== null, 'stock accepts the Ed25519 entry in a mixed policy');
+      assert.equal(result!.keyid, ed25519.keyid);
+      assert.equal(result!.principal, 'alice');
+    } finally {
+      signer.dispose();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Ed25519 restriction applies to the actual non-Ed25519 signing key', { skip: SKIP }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-ssh-t-'));
+  try {
+    const rsa = makeEphemeralKey(dir, 'rsa-signer', 'rsa');
+    const message = Buffer.from('non-Ed25519 signing key');
+    const moduleSigner = new SshSigner({ namespace: 'rsa-policy', signKeyPath: rsa.keyPath });
+    await assert.rejects(moduleSigner.sign(message), (error: Error) => {
+      assert.ok(error instanceof SshSignerError);
+      assert.match(error.message, /only Ed25519 keys are supported/);
+      return true;
+    });
+
+    const stockSignature = execFileSync('ssh-keygen', ['-q', '-Y', 'sign', '-f', rsa.keyPath, '-n', 'rsa-policy'], {
+      input: message,
+      timeout: 10_000,
+    });
+    const verifier = new SshSigner({
+      namespace: 'rsa-policy',
+      verify: { principal: 'bob', allowedSignersText: `bob ${rsa.pubText.trim()}\n` },
+    });
+    try {
+      await assert.rejects(verifier.verify(message, stockSignature), /verified signature has no valid Ed25519 public key/);
+    } finally {
+      verifier.dispose();
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });

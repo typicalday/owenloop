@@ -293,12 +293,33 @@ export type DsseRecordPayloadType =
   | typeof PAYLOAD_TYPE_POLICY_FLOOR
   | typeof PAYLOAD_TYPE_ORIGIN;
 
+/** Runtime copy of the closed record-type set used at dynamic boundaries. */
+export const DSSE_RECORD_PAYLOAD_TYPES = Object.freeze([
+  PAYLOAD_TYPE_ENROLLMENT_GRANT,
+  PAYLOAD_TYPE_REVOCATION,
+  PAYLOAD_TYPE_SUBMISSION,
+  PAYLOAD_TYPE_POLICY_FLOOR,
+  PAYLOAD_TYPE_ORIGIN,
+] as const);
+
+/** Check a dynamic value against the five supported record payload types. */
+export function isDsseRecordPayloadType(value: unknown): value is DsseRecordPayloadType {
+  return typeof value === 'string' && (DSSE_RECORD_PAYLOAD_TYPES as readonly string[]).includes(value);
+}
+
+function assertDsseRecordPayloadType(value: unknown): asserts value is DsseRecordPayloadType {
+  if (!isDsseRecordPayloadType(value)) {
+    throw new DsseEnvelopeError('unsupported DSSE record payload type');
+  }
+}
+
 /** Generic wrapper retained for callers that already carry a closed-union type. */
 export async function dsseSignRecord(
   payloadType: DsseRecordPayloadType,
   payloadBytes: Buffer,
   signer: Pick<Signer, 'sign'>,
 ): Promise<{ envelope: DsseEnvelope; signature: DetachedSignature }> {
+  assertDsseRecordPayloadType(payloadType);
   return dsseSignEnvelope(payloadType, payloadBytes, signer);
 }
 
@@ -309,6 +330,7 @@ export async function dsseVerifyRecord(
   signer: Pick<Signer, 'verify'>,
   opts?: { threshold?: number },
 ): Promise<DsseVerifyResult> {
+  assertDsseRecordPayloadType(expectedPayloadType);
   return dsseVerifyEnvelope(envelope, expectedPayloadType, signer, opts);
 }
 

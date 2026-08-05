@@ -120,7 +120,9 @@ export type { CredentialIO } from './credentials.ts';
 export {
   DSSE_SSH_NAMESPACE,
   DSSE_VERSION,
+  DSSE_RECORD_PAYLOAD_TYPES,
   DsseEnvelopeError,
+  isDsseRecordPayloadType,
   PAYLOAD_TYPE_ENROLLMENT_GRANT,
   PAYLOAD_TYPE_ORIGIN,
   PAYLOAD_TYPE_POLICY_FLOOR,
