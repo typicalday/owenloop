@@ -1201,8 +1201,9 @@ marketplace is unpublished.
 ## `mcp` — stdio control-plane server for MCP hosts
 
 `owenloop mcp` is a long-running server that exposes the hub's **human control
-plane** to a local MCP host (Claude Code, or any client that speaks MCP over
-stdio). This is the `owenloop-cli-mcp` surface: an MCP host spawns it as a
+plane** to a local MCP host (Claude Code, Codex, or any client that speaks MCP
+over stdio). The shipped Claude Code and Codex plugins launch this command from
+`PATH`. This is the `owenloop-cli-mcp` surface: an MCP host spawns it as a
 subprocess — **you do not run it yourself at a prompt**. It reads
 newline-delimited JSON-RPC 2.0 on stdin, translates each `tools/call` into one
 authenticated HTTPS request to the hub's `/api/*` REST mirror, and writes the
