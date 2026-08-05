@@ -560,30 +560,53 @@ signed or explicitly unsigned sidecar.
 `defPolicy` is the local execution and installation policy for workflow
 publication signatures. The settings file is
 `$XDG_CONFIG_HOME/owenloop/settings.json` when `XDG_CONFIG_HOME` is non-blank,
-otherwise `$HOME/.config/owenloop/settings.json`. The built-in default is
-`warn`. An `OWENLOOP_DEF_POLICY` value overrides the settings file, and an
-explicit host-provided policy overrides the environment.
+otherwise `$HOME/.config/owenloop/settings.json`. To set the policy in the
+settings file, write a JSON object such as:
 
-- `enforce` refuses unsigned and unverifiable definitions. A present signature
-  that fails verification is `invalid` and is refused.
-- `warn` installs or runs unsigned and unverifiable definitions after writing a
-  warning to stderr. `invalid` definitions are still refused.
-- `off` suppresses warnings for unsigned and unverifiable definitions on agent
-  orders. `invalid` definitions are still refused.
+```json
+{
+  "defPolicy": "enforce"
+}
+```
+
+For a one-off CLI invocation, set `OWENLOOP_DEF_POLICY` in the environment, for
+example `OWENLOOP_DEF_POLICY=enforce owenloop add widget.wnlp`. The precedence
+is explicit host-provided policy, then `OWENLOOP_DEF_POLICY`, then the settings
+file, then the built-in default `warn`. An invalid environment or settings-file
+value fails loudly; it never degrades to `off`.
+
+The policy applies at install time and again at execution time. The table uses
+these verdicts:
+
+- `verified` — the publication sidecar verifies against the bundle digest and a
+  signer in the local trust root.
+- `unsigned` — the bundle has no publication signature (including an explicit
+  `.wnlp.unsigned` sidecar).
+- `unverifiable` — verification could not be completed, such as when the trust
+  root is missing or malformed.
+- `invalid` — a present publication signature fails verification, including a
+  digest or signer mismatch.
+
+| publication verdict | `enforce` | `warn` | `off` |
+|---|---|---|---|
+| `verified` | Install succeeds; agent and command execution proceed. | Install succeeds; agent and command execution proceed. | Install succeeds; agent and command execution proceed. |
+| `unsigned` or `unverifiable` | Install refuses; agent and command execution refuse. | Install warns to stderr and succeeds; agent execution warns and proceeds; command execution refuses. | Install succeeds silently; agent execution proceeds silently; command execution refuses. |
+| `invalid` | Install refuses; agent and command execution refuse. | Install refuses; agent and command execution refuse. | Install refuses; agent and command execution refuse. |
+
+**Command-worker hard rule.** A `worker: command` order requires a `verified`
+definition in every policy value, including `off`. `off` does not disable
+command-worker enforcement. `warn` and `off` never allow an unsigned,
+unverifiable, or invalid definition to reach the shell. The command check runs
+before the policy value is read, and a refusal uses the normal
+`InstructionRefusal` path so the lease stops before command execution. If an
+execution host has no publication verifier configured, the definition is
+`unverifiable`; command workers therefore refuse rather than treating installed
+bytes as published trust.
 
 The local SSHSIG trust root is
 `$XDG_CONFIG_HOME/owenloop/allowed_signers`, or
 `$HOME/.config/owenloop/allowed_signers` when `XDG_CONFIG_HOME` is blank. A
 missing or malformed trust root is `unverifiable`, not `unsigned`.
-
-**Command-worker hard rule.** A `worker: command` order requires a `verified`
-definition in every policy value, including `off`. `warn` and `off` never allow
-an unsigned, unverifiable, or invalid definition to reach the shell. The command
-check runs before the policy value is read, and a refusal uses the normal
-`InstructionRefusal` path so the lease stops before command execution. If an
-execution host has no publication verifier configured, the definition is
-`unverifiable`; command workers therefore refuse rather than treating installed
-bytes as published trust.
 
 ### The two store roots
 
