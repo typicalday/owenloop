@@ -482,13 +482,15 @@ and, when needed, mint or rekey and store a Scoped Identity. Setup writes only
 file is `$XDG_CONFIG_HOME/owenloop/settings.json` when `XDG_CONFIG_HOME` is
 set to a non-blank value; otherwise `$HOME/.config/owenloop/settings.json`. For
 a non-default account,
-setup only prints the `OWENLOOP_ACCOUNT=<name>` instruction. Setup probes the
-Claude Code plugin and, when it is missing, prints the manual commands
-`claude plugin marketplace add owenloop` and
-`claude plugin install owenloop@owenloop`; setup does not install the plugin.
-`owenloop doctor` is the read-only counterpart: it checks each piece and prints a
-`✓`/`✗` line with the remedy. See [`setup`](docs/cli.md#setup--onboard-a-machine)
-and [`doctor`](docs/cli.md#doctor--check-a-machines-install) in `docs/cli.md`.
+setup only prints the `OWENLOOP_ACCOUNT=<name>` instruction. Setup probes and,
+when needed, converges the bundled `owenloop` plugins for Claude Code and Codex.
+Plugin convergence is non-fatal; a missing harness or failed plugin command does
+not fail setup. A second run with the expected plugin version already installed
+performs no plugin writes. `owenloop doctor` is the read-only counterpart: it
+checks both harness plugin states, reports version skew, and prints a `✓`/`✗`
+line with the remedy. See
+[`setup`](docs/cli.md#setup--onboard-a-machine) and
+[`doctor`](docs/cli.md#doctor--check-a-machines-install) in `docs/cli.md`.
 
 Driving the hub from an MCP host instead? `owenloop mcp` serves the hub control
 plane to a local MCP host (Claude Code) over stdio — MCP hosts spawn it, you

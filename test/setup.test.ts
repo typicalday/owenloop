@@ -21,7 +21,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mainAsync, sanitizeAgentName, lastActiveMs, formatLastActive } from '../src/cli.ts';
+import { mainAsync, sanitizeAgentName, lastActiveMs, formatLastActive, resolveBundledMarketplaceRoot } from '../src/cli.ts';
 import type { AgentIdentitySummary } from '../src/hub.ts';
 import { asAgentIdentities, asRekeyAgentTokenOk } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
@@ -39,6 +39,7 @@ import { owenloopSettingsPath } from '../src/work-settings.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
+const PACKAGE_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 
 /** An `openUrl` that plays the browser+consent, driving the real loopback callback. */
 function driveCallback() {
@@ -63,6 +64,49 @@ function seedHuman(store: Map<string, string>): void {
       clientId: 'client-abc',
     }),
   );
+}
+
+type HarnessName = 'claude' | 'codex';
+type PluginCall = { cmd: string; args: string[] };
+type CommandResult = { status: number | null; stdout: string; stderr: string };
+
+/** PATH fixture for plugin acceptance tests; the stubs are never executed. */
+function pluginPathDir(harnesses: readonly HarnessName[]): string {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-setup-plugin-path-'));
+  for (const harness of harnesses) writeFileSync(join(dir, harness), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  return dir;
+}
+
+function pluginMutationCalls(calls: PluginCall[]): PluginCall[] {
+  return calls.filter(
+    ({ args }) =>
+      args[0] === 'plugin' &&
+      args[1] !== 'list' &&
+      !(args[1] === 'marketplace' && args[2] === 'list'),
+  );
+}
+
+async function runPluginSetup(
+  harnesses: readonly HarnessName[],
+  runCommand: (cmd: string, args: string[], calls: PluginCall[]) => CommandResult,
+  resolver?: (harness: 'claude-code' | 'codex') => string | null,
+): Promise<{ code: number; t: ReturnType<typeof makeIo>; calls: PluginCall[] }> {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const calls: PluginCall[] = [];
+  const t = makeIo({
+    fetch,
+    env: { PATH: pluginPathDir(harnesses) },
+    runCommand: (cmd, args) => {
+      const call = { cmd, args: [...args] };
+      calls.push(call);
+      return runCommand(cmd, args, calls);
+    },
+    resolveBundledMarketplaceRoot: resolver,
+  });
+  seedHuman(t.store);
+  const code = await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t.io);
+  return { code, t, calls };
 }
 
 // ---- Flow A: fresh machine ---------------------------------------------------
@@ -177,6 +221,264 @@ test('setup: a second run performs ZERO writes (no store mutation, no settings w
   }
 
   assertNoOlp(t2);
+});
+
+test('setup plugin: Claude fresh install runs marketplace add then plugin install', async () => {
+  const root = resolveBundledMarketplaceRoot('claude-code');
+  assert.ok(root, 'Claude marketplace root resolves in the source layout');
+  const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
+    if (cmd === 'claude' && args.join(' ') === 'plugin list --json') return { status: 0, stdout: '[]', stderr: '' };
+    if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [
+    { cmd: 'claude', args: ['plugin', 'marketplace', 'add', root] },
+    { cmd: 'claude', args: ['plugin', 'install', 'owenloop@owenloop'] },
+  ]);
+  const summary = JSON.parse(t.out.join('\n')) as { steps: { step: string; action: string }[] };
+  assert.deepEqual(summary.steps.filter((step) => step.step === 'plugin (claude-code)').map((step) => step.action), ['done']);
+  assertNoOlp(t);
+});
+
+test('setup plugin: Claude matching version performs zero plugin writes', async () => {
+  const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
+    if (cmd === 'claude' && args.join(' ') === 'plugin list --json') {
+      return {
+        status: 0,
+        stdout: JSON.stringify([{ id: 'owenloop@owenloop', version: ` ${PACKAGE_VERSION} ` }]),
+        stderr: '',
+      };
+    }
+    if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [], 'matching version is idempotent');
+  const summary = JSON.parse(t.out.join('\n')) as { steps: { step: string; action: string; detail: string }[] };
+  assert.deepEqual(summary.steps.filter((step) => step.step === 'plugin (claude-code)').map((step) => step.action), ['skipped']);
+  assert.match(summary.steps.find((step) => step.step === 'plugin (claude-code)')!.detail, /already current/);
+  assertNoOlp(t);
+});
+
+test('setup plugin: Claude version skew runs marketplace add then plugin update', async () => {
+  const root = resolveBundledMarketplaceRoot('claude-code');
+  assert.ok(root);
+  const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
+    if (cmd === 'claude' && args.join(' ') === 'plugin list --json') {
+      return { status: 0, stdout: '[{"id":"owenloop@owenloop","version":"0.4.0"}]', stderr: '' };
+    }
+    if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [
+    { cmd: 'claude', args: ['plugin', 'marketplace', 'add', root] },
+    { cmd: 'claude', args: ['plugin', 'update', 'owenloop@owenloop'] },
+  ]);
+  assertNoOlp(t);
+});
+
+test('setup plugin: Codex available-only entry is not installed and fresh install runs both commands', async () => {
+  const root = resolveBundledMarketplaceRoot('codex');
+  assert.ok(root);
+  const { code, t, calls } = await runPluginSetup(['codex'], (cmd, args) => {
+    if (cmd === 'codex' && args.join(' ') === 'plugin list --json') {
+      return {
+        status: 0,
+        stdout: JSON.stringify({ installed: [], available: [{ pluginId: 'owenloop@owenloop', version: PACKAGE_VERSION }] }),
+        stderr: '',
+      };
+    }
+    if (cmd === 'codex' && args.join(' ') === 'plugin marketplace list --json') {
+      return { status: 0, stdout: JSON.stringify({ marketplaces: [] }), stderr: '' };
+    }
+    if (cmd === 'codex' && args[0] === '--version') return { status: 0, stdout: 'codex-cli 0.146.0\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [
+    { cmd: 'codex', args: ['plugin', 'marketplace', 'add', root] },
+    { cmd: 'codex', args: ['plugin', 'add', 'owenloop@owenloop'] },
+  ]);
+  assert.doesNotMatch(calls.map((call) => call.args.join(' ')).join('\n'), /marketplace upgrade/);
+  assertNoOlp(t);
+});
+
+test('setup plugin: both installed harnesses converge independently in one setup run', async () => {
+  const claudeRoot = resolveBundledMarketplaceRoot('claude-code');
+  const codexRoot = resolveBundledMarketplaceRoot('codex');
+  assert.ok(claudeRoot && codexRoot);
+  const { code, t, calls } = await runPluginSetup(['claude', 'codex'], (cmd, args) => {
+    if (args.join(' ') === 'plugin list --json') {
+      return cmd === 'claude'
+        ? { status: 0, stdout: '[]', stderr: '' }
+        : { status: 0, stdout: JSON.stringify({ installed: [], available: [] }), stderr: '' };
+    }
+    if (args.join(' ') === 'plugin marketplace list --json') return { status: 0, stdout: JSON.stringify({ marketplaces: [] }), stderr: '' };
+    if (args[0] === '--version') return { status: 0, stdout: `${cmd} test-version\n`, stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [
+    { cmd: 'claude', args: ['plugin', 'marketplace', 'add', claudeRoot] },
+    { cmd: 'claude', args: ['plugin', 'install', 'owenloop@owenloop'] },
+    { cmd: 'codex', args: ['plugin', 'marketplace', 'add', codexRoot] },
+    { cmd: 'codex', args: ['plugin', 'add', 'owenloop@owenloop'] },
+  ]);
+  assertNoOlp(t);
+});
+
+test('setup plugin: structured list parsing ignores matching JSON emitted on stderr', async () => {
+  const root = resolveBundledMarketplaceRoot('claude-code');
+  assert.ok(root);
+  const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
+    if (cmd === 'claude' && args.join(' ') === 'plugin list --json') {
+      return {
+        status: 0,
+        stdout: '[]',
+        stderr: '[{"id":"owenloop@owenloop","version":"0.4.0"}]',
+      };
+    }
+    if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [
+    { cmd: 'claude', args: ['plugin', 'marketplace', 'add', root] },
+    { cmd: 'claude', args: ['plugin', 'install', 'owenloop@owenloop'] },
+  ]);
+  assertNoOlp(t);
+});
+
+test('setup plugin: Codex different-source marketplace is noted without remove or add', async () => {
+  const { code, t, calls } = await runPluginSetup(['codex'], (cmd, args) => {
+    if (cmd === 'codex' && args.join(' ') === 'plugin list --json') {
+      return { status: 0, stdout: JSON.stringify({ installed: [], available: [] }), stderr: '' };
+    }
+    if (cmd === 'codex' && args.join(' ') === 'plugin marketplace list --json') {
+      return {
+        status: 0,
+        stdout: JSON.stringify({ marketplaces: [{ name: 'owenloop', marketplaceSource: { sourceType: 'local', source: '/different/owenloop' } }] }),
+        stderr: '',
+      };
+    }
+    if (cmd === 'codex' && args[0] === '--version') return { status: 0, stdout: 'codex-cli 0.146.0\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), []);
+  assert.match(t.err.join('\n'), /different source/);
+  assertNoOlp(t);
+});
+
+test('setup plugin: Codex same-source marketplace skips marketplace add during upgrade', async () => {
+  const root = resolveBundledMarketplaceRoot('codex');
+  assert.ok(root);
+  const { code, t, calls } = await runPluginSetup(['codex'], (cmd, args) => {
+    if (cmd === 'codex' && args.join(' ') === 'plugin list --json') {
+      return {
+        status: 0,
+        stdout: JSON.stringify({ installed: [{ pluginId: 'owenloop@owenloop', version: '0.4.0', installed: true }], available: [] }),
+        stderr: '',
+      };
+    }
+    if (cmd === 'codex' && args.join(' ') === 'plugin marketplace list --json') {
+      return {
+        status: 0,
+        stdout: JSON.stringify({ marketplaces: [{ name: 'owenloop', marketplaceSource: { sourceType: 'local', source: root } }] }),
+        stderr: '',
+      };
+    }
+    if (cmd === 'codex' && args[0] === '--version') return { status: 0, stdout: 'codex-cli 0.146.0\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [{ cmd: 'codex', args: ['plugin', 'add', 'owenloop@owenloop'] }]);
+  assertNoOlp(t);
+});
+
+test('setup plugin: installed plugin with unknown version does not reinstall', async () => {
+  const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
+    if (cmd === 'claude' && args.join(' ') === 'plugin list --json') {
+      return { status: 0, stdout: '[{"id":"owenloop@owenloop"}]', stderr: '' };
+    }
+    if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), []);
+  const summary = JSON.parse(t.out.join('\n')) as { steps: { step: string; detail: string }[] };
+  assert.match(summary.steps.find((step) => step.step === 'plugin (claude-code)')!.detail, /version unknown/);
+  assertNoOlp(t);
+});
+
+test('setup plugin: malformed successful list output is treated as not installed', async () => {
+  const root = resolveBundledMarketplaceRoot('claude-code');
+  assert.ok(root);
+  const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
+    if (cmd === 'claude' && args.join(' ') === 'plugin list --json') {
+      return { status: 0, stdout: 'not JSON', stderr: '' };
+    }
+    if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [
+    { cmd: 'claude', args: ['plugin', 'marketplace', 'add', root] },
+    { cmd: 'claude', args: ['plugin', 'install', 'owenloop@owenloop'] },
+  ]);
+  assertNoOlp(t);
+});
+
+test('setup plugin: failed install is noted and does not fail core setup', async () => {
+  const root = resolveBundledMarketplaceRoot('claude-code');
+  assert.ok(root);
+  const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
+    if (cmd === 'claude' && args.join(' ') === 'plugin list --json') return { status: 0, stdout: '[]', stderr: '' };
+    if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+    if (cmd === 'claude' && args[1] === 'marketplace') return { status: 1, stdout: 'stdout failure', stderr: 'permission denied' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [{ cmd: 'claude', args: ['plugin', 'marketplace', 'add', root] }]);
+  const summary = JSON.parse(t.out.join('\n')) as { steps: { step: string; action: string }[] };
+  assert.deepEqual(summary.steps.filter((step) => step.step === 'plugin (claude-code)').map((step) => step.action), ['noted']);
+  assert.ok(t.err.includes('permission denied\nstdout failure'), 'stderr and stdout are separated by a real newline');
+  assert.doesNotMatch(t.err.join('\n'), /permission denied\\nstdout failure/, 'diagnostics do not contain a literal backslash-n');
+  assertNoOlp(t);
+});
+
+test('setup plugin: missing bundled root prints instructions and performs no install writes', async () => {
+  const { code, t, calls } = await runPluginSetup(
+    ['claude', 'codex'],
+    (cmd, args) => {
+      if (args[0] === 'plugin' && args[1] === 'list') {
+        return cmd === 'claude'
+          ? { status: 0, stdout: '[]', stderr: '' }
+          : { status: 0, stdout: JSON.stringify({ installed: [], available: [] }), stderr: '' };
+      }
+      if (args[0] === '--version') return { status: 0, stdout: `${cmd} test-version\n`, stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    },
+    () => null,
+  );
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), []);
+  assert.match(t.err.join('\n'), /bundled marketplace root unavailable/);
+  assertNoOlp(t);
 });
 
 // ---- signing keys: the [4/7] step -------------------------------------------

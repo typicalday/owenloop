@@ -19,7 +19,7 @@ import type { CredentialSlotSelector } from '../src/hub.ts';
 import { canonicalKeyRef } from '../src/crypto/keys.ts';
 import type { EnsureKeyResult, InspectKeyResult, PrincipalKeyRef } from '../src/crypto/keys.ts';
 import type { PrincipalKeyManager } from '../src/crypto/keys.ts';
-import type { CliIO, Keychain } from '../src/cli.ts';
+import type { CliIO, HarnessId, Keychain } from '../src/cli.ts';
 
 export interface RouteResult {
   status: number;
@@ -349,10 +349,11 @@ export interface MakeIoOpts {
    *  The default `makeIo` leaves it undefined so a scripted test that supplies no
    *  prompt exercises the non-interactive guard. */
   prompt?: (question: string) => Promise<string>;
-  /** Injected exec seam for the plugin probe (`claude plugin list`). Undefined by
-   *  default, so the plugin check just doesn't find the binary unless the test PATH
-   *  provides one AND a runCommand is supplied. */
+  /** Injected exec seam for the Claude Code/Codex plugin probes and convergers.
+   *  Undefined by default, so a test PATH stub never reaches a real harness CLI. */
   runCommand?: (cmd: string, args: string[]) => { status: number | null; stdout: string; stderr: string };
+  /** Optional resolver seam for the missing-bundled-marketplace setup case. */
+  resolveBundledMarketplaceRoot?: (harness: HarnessId) => string | null;
   /**
    * Signing-key manager seam for setup's `[4/7] signing keys` step. Default: a
    * fresh in-memory fake (`makeFakePrincipalKeys`) so setup tests never touch the
@@ -389,6 +390,7 @@ export function makeIo(opts: MakeIoOpts = {}): HubIo & {
     readStdin: async () => opts.stdin ?? '',
     prompt: opts.prompt,
     runCommand: opts.runCommand,
+    resolveBundledMarketplaceRoot: opts.resolveBundledMarketplaceRoot,
     principalKeys: opts.principalKeys === 'real' ? undefined : opts.principalKeys ?? fakeKeys?.manager,
   };
   return { io, cwd, home, out, err, openedUrls, store: opts.store ?? kc.store, principalKeys: fakeKeys };
