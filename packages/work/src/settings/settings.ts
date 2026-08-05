@@ -28,6 +28,7 @@ import { join } from 'node:path';
  *   - `dispatchCap`    — shift max in-flight exec children; below `--cap`,
  *     above the built-in default of 3. A positive integer.
  *   - `commandRouting` — who runs `executor: 'command'` steps this machine sees.
+ *   - `defPolicy`      — local publication trust policy (`warn` by default).
  */
 export interface Settings {
   /** Default hub origin when `--origin` is omitted. */
@@ -46,6 +47,13 @@ export interface Settings {
    * most restrictive wins (see src/shift/routing.ts).
    */
   commandRouting?: 'shift' | 'manual';
+  /**
+   * Publication trust policy for installed workflow definitions. `warn` is the
+   * built-in default; `enforce` refuses unsigned/unverifiable definitions and
+   * `off` suppresses those warnings for agent orders only. Command workers
+   * always require a verified definition regardless of this value.
+   */
+  defPolicy?: 'enforce' | 'warn' | 'off';
   /**
    * Max in-flight `agent-run` children (positive integer, default 4 —
    * `DEFAULT_MAX_AGENTS` in `src/roles/shift.ts`). A SEPARATE
@@ -92,6 +100,7 @@ export const KNOWN_SETTINGS_KEYS = [
   'stateDir',
   'dispatchCap',
   'commandRouting',
+  'defPolicy',
   'maxConcurrentAgents',
   'workRoot',
   'workRepo',
@@ -167,6 +176,12 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
   if ('commandRouting' in obj) {
     const v = obj['commandRouting'];
     if (v !== 'shift' && v !== 'manual') throw bad('commandRouting', "'shift' or 'manual'", v);
+  }
+  if ('defPolicy' in obj) {
+    const v = obj['defPolicy'];
+    if (v !== 'enforce' && v !== 'warn' && v !== 'off') {
+      throw bad('defPolicy', "'enforce', 'warn', or 'off'", v);
+    }
   }
 
   const known = new Set<string>(KNOWN_SETTINGS_KEYS);

@@ -548,13 +548,42 @@ bundle's identity. Identity comes from the bundle's own
 Bundle ingestion (unpacking, manifest integrity, canonical digest,
 coordinate) and pre-commit verification are separate modules with no
 permissive fallback: with either adapter missing, `add` refuses with a named
-error before any staging, journal, or index write. The default CLI binds the
-real bundle ingestor, but the pre-commit verifier remains unbound, so the default
-CLI fails closed rather than accepting an unverified bundle. There is no default
-accepting signature verifier. The `add` route does not consume publication
-sidecars or verify a bundle's signature. Hosts that provide both adapters can
-install real `.wnlp` output from `packBundle`; use the `publish` command to
-create the `.wnlp` bundle plus a signed or explicitly unsigned sidecar.
+error before any staging, journal, or index write. The default CLI binds both
+production adapters. The pre-commit verifier consumes the publication sidecars
+written by `publish` and applies the local `defPolicy` before the object or index
+commit. Hosts that provide both adapters can install real `.wnlp` output from
+`packBundle`; use the `publish` command to create the `.wnlp` bundle plus a
+signed or explicitly unsigned sidecar.
+
+### Definition publication policy
+
+`defPolicy` is the local execution and installation policy for workflow
+publication signatures. The settings file is
+`$XDG_CONFIG_HOME/owenloop/settings.json` when `XDG_CONFIG_HOME` is non-blank,
+otherwise `$HOME/.config/owenloop/settings.json`. The built-in default is
+`warn`. An `OWENLOOP_DEF_POLICY` value overrides the settings file, and an
+explicit host-provided policy overrides the environment.
+
+- `enforce` refuses unsigned and unverifiable definitions. A present signature
+  that fails verification is `invalid` and is refused.
+- `warn` installs or runs unsigned and unverifiable definitions after writing a
+  warning to stderr. `invalid` definitions are still refused.
+- `off` suppresses warnings for unsigned and unverifiable definitions on agent
+  orders. `invalid` definitions are still refused.
+
+The local SSHSIG trust root is
+`$XDG_CONFIG_HOME/owenloop/allowed_signers`, or
+`$HOME/.config/owenloop/allowed_signers` when `XDG_CONFIG_HOME` is blank. A
+missing or malformed trust root is `unverifiable`, not `unsigned`.
+
+**Command-worker hard rule.** A `worker: command` order requires a `verified`
+definition in every policy value, including `off`. `warn` and `off` never allow
+an unsigned, unverifiable, or invalid definition to reach the shell. The command
+check runs before the policy value is read, and a refusal uses the normal
+`InstructionRefusal` path so the lease stops before command execution. If an
+execution host has no publication verifier configured, the definition is
+`unverifiable`; command workers therefore refuse rather than treating installed
+bytes as published trust.
 
 ### The two store roots
 

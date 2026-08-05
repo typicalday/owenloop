@@ -212,6 +212,7 @@ test('store instruction resolver: verified step metadata is local-store data and
     globalRoot: tempDir('owenloop-resolver-global-2-'),
     verifier: createBundleIngestor(),
     source,
+    definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
   });
 
   const step = await resolver.resolveStep(order(requested));

@@ -112,6 +112,7 @@ import {
   PreCommitVerifierUnavailableError,
   projectStoreRoot,
   createBundleIngestor,
+  createPreCommitVerifier,
   recoverWorkflowStore,
   storeIndexPath,
   workflowStoreStatePaths,
@@ -241,7 +242,7 @@ export interface CliIO {
   principalKeys?: Pick<PrincipalKeyManager, 'ensure' | 'inspect' | 'withSigningKey' | 'resolveRef'>;
 }
 
-function defaultIO(): CliIO {
+export function defaultIO(): CliIO {
   return {
     cwd: process.cwd(),
     env: process.env,
@@ -249,6 +250,11 @@ function defaultIO(): CliIO {
     err: (s) => process.stderr.write(`${s}\n`),
     fetch: globalThis.fetch,
     bundleIngestor: createBundleIngestor(),
+    preCommitVerifier: createPreCommitVerifier({
+      cwd: process.cwd(),
+      env: process.env,
+      warn: (line) => process.stderr.write(`${line}\n`),
+    }),
     openUrl: defaultOpenUrl,
     readStdin: defaultReadStdin,
     prompt: defaultPrompt,

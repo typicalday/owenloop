@@ -16,7 +16,7 @@ import { writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
 import { defInstructionDigest } from '../../../src/order-resolver.ts';
 import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
-import { installBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
+import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { readChildRecords } from '../src/shift/state.ts';
 import { OVERLAP_ERROR } from '../src/shift/protocol.ts';
 import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
@@ -62,7 +62,12 @@ steps:
     body: ""
 `;
   const sourceDir = writeBundleSource({ name: 'demo', workflow });
-  const installed = await installBundleFixture({ sourceDir, root: join(home, '.owenloop', 'workflows') });
+  const installed = await installSignedBundleFixture({
+    sourceDir,
+    root: join(home, '.owenloop', 'workflows'),
+    home,
+    configHome: configDir,
+  });
   const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
   const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
   assert.ok(definition !== undefined);

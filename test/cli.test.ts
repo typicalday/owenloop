@@ -22,7 +22,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { ASYNC_COMMANDS, classifyAddSource, COMMAND_OPTIONS, main, mainAsync, USAGE } from '../src/cli.ts';
+import { ASYNC_COMMANDS, classifyAddSource, COMMAND_OPTIONS, defaultIO, main, mainAsync, USAGE } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
 import { ADD_JOURNAL_FILENAME } from '../src/add.ts';
 import {
@@ -1660,6 +1660,12 @@ test('add --recover --global with a defs override is refused too', async () => {
 });
 
 // ---- fail-closed adapter gates at the CLI dispatch site --------------------------
+
+test('defaultIO binds both production bundle adapters', () => {
+  const io = defaultIO();
+  assert.ok(io.bundleIngestor !== undefined, 'defaultIO binds the production bundle ingestor');
+  assert.ok(io.preCommitVerifier !== undefined, 'defaultIO binds the production pre-commit verifier');
+});
 
 test('add <bundle.wnlp> without a BundleIngestor fails closed BEFORE any commit', async () => {
   const { run, cwd } = makeBundleCli({ preCommitVerifier: cliFakeVerifier() });

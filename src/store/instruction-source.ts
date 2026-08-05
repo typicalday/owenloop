@@ -71,6 +71,8 @@ export interface StoreInstructionSource extends OrderInstructionSource {
   getVerifiedStep(defDigest: string, step: string): StepDef | undefined;
   /** Return the full verified definition cached by `prime`. */
   getVerifiedDefinition(defDigest: string): WorkflowDef | undefined;
+  /** Return the installed bundle identity and object path cached by `prime`. */
+  getVerifiedObject(defDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined;
 }
 
 function indexedBundleDigests(root: string): DefDigest[] {
@@ -217,6 +219,10 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       return cached?.def.steps.find((step) => step.name === stepName);
     },
     getVerifiedDefinition: (requestedDigest: string): WorkflowDef | undefined => cache.get(requestedDigest)?.def,
+    getVerifiedObject: (requestedDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined => {
+      const cached = cache.get(requestedDigest);
+      return cached === undefined ? undefined : { bundleDigest: cached.bundleDigest, objectPath: cached.objectPath };
+    },
   };
 }
 

@@ -29,6 +29,7 @@ export {
   StoreNotFoundError,
   StoreIntegrityError,
   StoreConflictError,
+  StoreDefinitionVerificationError,
   StorePathError,
   BundleIngestorUnavailableError,
   PreCommitVerifierUnavailableError,
@@ -94,3 +95,13 @@ export type {
   PreCommitVerifier,
   RecoverWorkflowStoreArgs,
 } from './install.ts';
+export {
+  createExecutionDefinitionVerifier,
+  createPreCommitVerifier,
+  createProductionPreCommitVerifier,
+  resolveDefPolicy,
+} from './pre-commit-verifier.ts';
+export type {
+  ExecutionDefinitionVerifierInput,
+  PreCommitVerifierOptions,
+} from './pre-commit-verifier.ts';

@@ -250,11 +250,31 @@ the key type embedded in the Base64 public-key blob. Parsed `principals` retain
 literal surrounding quotes where stock OpenSSH strips them. These fields are
 structural output only; OpenSSH remains the authorization authority.
 
+## Definition publication policy
+
+The install path verifies a `.wnlp.dsse` publication sidecar against the bundle
+digest and the local `allowed_signers` trust root. The trust-root path is
+`$XDG_CONFIG_HOME/owenloop/allowed_signers` when `XDG_CONFIG_HOME` is non-blank,
+or `$HOME/.config/owenloop/allowed_signers` otherwise. A missing or malformed
+trust root produces the distinct `unverifiable` verdict; a present signature
+that fails verification produces `invalid`.
+
+The execution and install policy is `defPolicy`, with built-in default `warn`:
+`enforce` refuses unsigned and unverifiable definitions, `warn` emits a warning
+and permits those two verdicts for agent work, and `off` permits them silently
+for agent work. `invalid` is refused at every policy value. Command workers
+always require `verified`; `off` never relaxes that hard rule. An execution
+resolver without a configured publication verifier treats the definition as
+`unverifiable`, so command workers refuse rather than assuming that integrity
+verification alone proves publication trust.
+
+The verifier does not write a verdict or sidecar into the immutable object
+directory. The object remains governed by the bundle manifest integrity map.
+
 ## Out of scope (future work)
 
 Publish-time author-side DSSE signing is implemented by `owenloop publish`.
-Consumer-side verification, transport relay, and the following extensions remain
-out of scope:
+Transport relay and the following extensions remain out of scope:
 
 - Key **rotation** and revocation wiring for stored principal keys.
 - Certificate (`cert-authority`) chains and hardware-backed signing flows.
