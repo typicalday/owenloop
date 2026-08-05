@@ -114,7 +114,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
 }
 
 function wo(run: string, step: string, workflow = 'wf1'): WorkOrder {
-  return { workflow, run, step, prompt: '', consumes: {}, expected_outputs: [], feedback: [], advisory: {}, submit_hint: '' };
+  return { workflow, run, step, consumes: {}, expected_outputs: [], feedback: [], advisory: {}, submit_hint: '' };
 }
 
 function fakeSpawner(): { spawner: Spawner; spawns: SpawnSpec[] } {

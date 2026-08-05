@@ -35,7 +35,6 @@ type Owed = OrderPacket['owes'][number];
 
 const owed = (path: string, reasons: ReasonEntry[]): Owed => ({
   path,
-  acceptance: 'judgment',
   judgmentRejects: reasons.length,
   schemaRejects: 0,
   reasons,

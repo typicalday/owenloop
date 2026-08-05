@@ -39,7 +39,7 @@
  *
  * Credential path: owenloop file store (no OWENLOOP_TOKEN), as every drill.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -50,6 +50,9 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
+import { defInstructionDigest } from '../../../src/order-resolver.ts';
+import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
+import { installBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { readSessions, sessionsPath } from '../src/harness/session-store.ts';
 import { sweepWorkDirs } from '../src/agent/workdir.ts';
 import type { OrderPacket, ReasonEntry, WorkOrder } from '../src/hub/types.ts';
@@ -70,13 +73,15 @@ const ORDER: WorkOrder = {
   workflow: 'wf1',
   run: 'run_r1',
   step: 'builder',
-  prompt: PROMPT,
   consumes: {},
   expected_outputs: [{ path: 'pr' }],
   feedback: [],
   advisory: {},
   submit_hint: SUBMIT_HINT,
 };
+
+/** Legacy wire data may still carry prompt, but the driver type cannot read it. */
+Object.defineProperty(ORDER, 'prompt', { value: PROMPT, enumerable: true });
 
 const REJECT_1 = 'REASON-ONE: the null check is still missing on the empty-cart path';
 const REJECT_2 = 'REASON-TWO: the new test does not fail without the fix';
@@ -98,12 +103,11 @@ function packet(reasons: ReasonEntry[]): OrderPacket {
     key: 'k',
     inputs: [],
     outputs: ['pr'],
-    prompt: PROMPT,
+    defDigest: localDefDigest,
     consumes: {},
     owes: [
       {
         path: 'pr',
-        acceptance: 'judgment',
         judgmentRejects: reasons.length,
         schemaRejects: 0,
         reasons,
@@ -113,10 +117,21 @@ function packet(reasons: ReasonEntry[]): OrderPacket {
 }
 
 let root = '';
+let localDefDigest = '';
 let home = '';
 let cacheDir = '';
 let workRoot = '';
 let tracePath = '';
+
+function makeWritableTree(path: string): void {
+  const stat = lstatSync(path);
+  if (stat.isDirectory()) {
+    for (const child of readdirSync(path)) makeWritableTree(join(path, child));
+    chmodSync(path, 0o755);
+  } else {
+    chmodSync(path, 0o644);
+  }
+}
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'owenloop-drill-resume-'));
@@ -126,10 +141,11 @@ beforeEach(() => {
   tracePath = join(root, 'harness-trace.jsonl');
 });
 afterEach(() => {
+  if (existsSync(root)) makeWritableTree(root);
   rmSync(root, { recursive: true, force: true });
 });
 
-function seedCache(): void {
+async function seedCache(): Promise<void> {
   const tpl: NormalizedStepSpec = { step: 'builder', brief: TPL_CONTENT, permissions: { extensions: {} } };
   const bundle: CachedBundle = {
     def: { name: 'demo', hash: DEMO_HASH, steps: [{ name: 'builder', body: '' }] },
@@ -137,6 +153,29 @@ function seedCache(): void {
     origin: 'seed',
   };
   writeBundle(cacheDir, bundle, [tpl]);
+
+  const workflow = `name: demo
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: builder
+    consumes: [seed]
+    produces: [pr]
+    terminal: true
+    executor: agent
+    body: |
+${TPL_CONTENT.split('\n').map((line) => `      ${line}`).join('\n')}
+    x:
+      harness:
+        id: fake
+`;
+  const sourceDir = writeBundleSource({ name: 'demo', workflow });
+  const installed = await installBundleFixture({ sourceDir, root: join(root, 'workflows') });
+  const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+  const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
+  assert.ok(definition !== undefined);
+  localDefDigest = defInstructionDigest(definition);
 }
 
 interface TraceCall {
@@ -164,6 +203,7 @@ function runAgent(origin: string): Promise<{ code: number | null; stderr: string
     process.execPath,
     [BIN, 'work', 'agent-run', 'wf1/run_r1', '--origin', origin, '--confirm-interval', '25', '--submit-grace', '10000'],
     {
+      cwd: root,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env,
@@ -202,7 +242,7 @@ function runAgent(origin: string): Promise<{ code: number | null; stderr: string
 }
 
 test('a re-offered rejection resumes the prior session in a NEW process and sends only the delta', async () => {
-  seedCache();
+  await seedCache();
 
   /** Which firing the hub is serving. Flipped by the test between children. */
   let firing = 1;
@@ -341,7 +381,7 @@ test('a re-offered rejection resumes the prior session in a NEW process and send
 });
 
 test('a SECOND re-offer with no new reasons does not spend a resume turn saying nothing', async () => {
-  seedCache();
+  await seedCache();
 
   // The reviewer rejected once. The order is re-offered twice with the SAME
   // reason thread — a re-offer for an unrelated reason (a lapsed claim, a
@@ -415,7 +455,7 @@ test('a SECOND re-offer with no new reasons does not spend a resume turn saying 
 });
 
 test('a REAPED work directory makes the session unresumable — the re-offer cold-replays into the recreated tree', async () => {
-  seedCache();
+  await seedCache();
 
   // The scenario the teardown gate exists for: the run goes quiet longer than the
   // reaper's TTL (a human escalation, a long alarm — both leave no open order),

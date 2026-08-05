@@ -16,17 +16,21 @@
  * request carries `Bearer drill_agent_tok`, proving the store path.
  */
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
+import { defInstructionDigest } from '../../../src/order-resolver.ts';
+import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
+import { installBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { spawnMcp, startMockHub, until, type HubReq } from './helpers/mcp-stdio-client.ts';
 import { DRILL_AUTH, fixtureEnv, seedCredentialStore } from './helpers/credential-fixture.ts';
 
-/** A COMMAND order: exec shells `command` and owes a receipt to each `owes` path. */
-function commandOrder(command: string): unknown {
+/** A COMMAND order: exec resolves local command bytes and owes a receipt to each path. */
+let localDefDigest = '';
+function commandOrder(): unknown {
   return {
     text: '',
     workflow: 'wf1',
@@ -38,11 +42,10 @@ function commandOrder(command: string): unknown {
       key: 'k',
       inputs: [],
       outputs: [],
-      executor: 'command',
-      command,
-      prompt: '',
+      worker: 'command',
+      defDigest: localDefDigest,
       consumes: {},
-      owes: [{ path: 'artifacts/build', acceptance: '', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+      owes: [{ path: 'artifacts/build', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     },
     lease: { claimed: true },
   };
@@ -51,7 +54,7 @@ function commandOrder(command: string): unknown {
 function hubScript(verb: string): unknown {
   switch (verb) {
     case 'get_order':
-      return commandOrder('sleep 0.5; echo hi');
+      return commandOrder();
     case 'submit':
       return { text: '', outcome: 'green' };
     default:
@@ -65,11 +68,43 @@ let home: string;
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'owenloop-drill2-'));
 });
+function makeWritableTree(path: string): void {
+  const stat = lstatSync(path);
+  if (stat.isDirectory()) {
+    for (const child of readdirSync(path)) makeWritableTree(join(path, child));
+    chmodSync(path, 0o755);
+  } else {
+    chmodSync(path, 0o644);
+  }
+}
+
 afterEach(() => {
+  makeWritableTree(home);
   rmSync(home, { recursive: true, force: true });
 });
 
 test('exec ignores a mid-run stdin close (session death) — the command drains and the receipt lands, no release', async () => {
+  const command = 'sleep 0.5; echo hi';
+  const workflow = `name: exec-drill
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: builder
+    consumes: [seed]
+    produces: [artifacts/build]
+    terminal: true
+    executor: command
+    command: '${command}'
+    body: ""
+`;
+  const sourceDir = writeBundleSource({ name: 'exec-drill', workflow });
+  const installed = await installBundleFixture({ sourceDir, root: join(home, '.owenloop', 'workflows') });
+  const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+  const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
+  assert.ok(definition !== undefined);
+  localDefDigest = defInstructionDigest(definition);
+
   const { origin, reqs, server } = await startMockHub(hubScript);
   seedCredentialStore(home, origin); // exact dynamic origin
   // credential path: owenloop file store (no OWENLOOP_TOKEN)

@@ -171,6 +171,23 @@ fresh sibling staging directory. The staging directory is renamed into place
 only after all files are written; failed unpack operations remove staging and
 leave the destination absent.
 
+## Installed-object verification on read
+
+The store's bundle ingestor verifies an installed object again every time a
+resolver needs its contents. The verifier reads `bundle.yaml`, hashes every
+regular file, compares the result with `integrity.files`, and refuses the
+object when a listed file is missing or changed, when an unlisted file appears,
+or when any symlink, device, FIFO, or other non-regular node appears. The
+manifest itself is excluded from `integrity.files` by design because hashing the
+manifest would be recursive; the manifest is still required, regular, and
+strictly parsed.
+
+This check is separate from the read-only file modes applied during install.
+Changing an installed object on disk therefore produces an integrity refusal at
+resolution time, not a best-effort read and not an `unknown-digest` fallback.
+The same verification protects both project and global objects, and a corrupt
+project copy is not masked by a valid global copy.
+
 ## API results
 
 `packBundle(sourceDir)` returns:

@@ -30,12 +30,10 @@
  *
  * ── WHERE THE STEP SPEC COMES FROM ──
  *
- * The spawn argv (D6) carries only `<workflow>/<run>`, `--origin`, `--shift`
- * and `--harness` — no def name and no def hash, both of which the bundle cache
- * needs. So the worker resolves the def name ITSELF: one non-claiming
- * `whats_next({workflow})` returns `def` in per-workflow mode, which feeds
- * `readDispatchBundle(cacheDir, def)` → `bundle.def.hash` → `readStepSpec(...)`.
- * That keeps the argv exactly as D6 specifies and adds no new settings surface.
+ * The order packet carries a `defDigest` reference but no authoritative prompt,
+ * harness, or permission text. The worker resolves the digest and step name
+ * through the verified local workflow store. The prepare cache remains available
+ * for routing and session state, but never supplies execution instructions.
  *
  * ── CREDENTIALS ──
  *
@@ -80,13 +78,16 @@ import '../harnesses.ts';
 // ─────────────────────────────────────────────────────────────────────────────
 import { hostname } from 'node:os';
 
-import { readDispatchBundle, readStepSpec, resolveCacheDir } from '../bundle/cache.ts';
+import { resolveCacheDir } from '../bundle/cache.ts';
 import { createAgentRunLoop, type AdapterResolution, type AgentRunOutcome } from '../agent/loop.ts';
+import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/registry.ts';
+import { parseHarnessCarrier } from '../bundle/fetch.ts';
+import { normalizeStepPermissions } from '../harness/permissions.ts';
 import { appendSession, latestFor, sessionsPath, type SessionRecord } from '../harness/session-store.ts';
 import { ensureWorkDir, resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
 import type { ContactHolder, OrderPacket } from '../hub/types.ts';
@@ -217,6 +218,10 @@ export interface RunDeps {
   hub?: HubClient;
   out?: (line: string) => void;
   err?: (line: string) => void;
+  /** Store-backed instruction resolver; injected tests may provide a fake. */
+  instructions?: InstructionResolver;
+  /** Environment used to derive the global workflow-store root. */
+  env?: Record<string, string | undefined>;
   /** cwd for an order that carries no `workdir` (default `process.cwd()`). */
   cwd?: string;
   /**
@@ -273,7 +278,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 2;
   }
 
-  const env = process.env;
+  const env = deps.env ?? process.env;
   let settings;
   try {
     settings = loadSettings(env);
@@ -286,6 +291,17 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work agent-run: no hub origin — pass --origin <url> or set hubOrigin in settings');
     return 2;
+  }
+
+  const instructionCwd = deps.cwd ?? process.cwd();
+  let instructions = deps.instructions;
+  if (instructions === undefined) {
+    try {
+      instructions = createDefaultStoreInstructionResolver({ cwd: instructionCwd, env });
+    } catch (e) {
+      err(`owenloop work agent-run: instruction store unavailable: ${errMsg(e)}`);
+      return 1;
+    }
   }
 
   let cacheDir: string;
@@ -367,29 +383,35 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     };
   };
 
-  /** Resolve the def name off the hub, then the cached step spec for the step. */
+  /** Resolve the verified step from the local workflow store, never the prepare cache. */
   const loadStep = async (order: OrderPacket): Promise<NormalizedStepSpec | null> => {
-    const res = await client.whatsNext({ workflow: target.workflow });
-    const defName = res.def;
-    if (defName === undefined || defName === '') {
-      err(`owenloop work agent-run: whats_next reported no def for workflow '${target.workflow}'`);
+    let resolved;
+    try {
+      resolved = await instructions.resolveStep(order);
+    } catch (e) {
+      err(`owenloop work agent-run: instruction refusal (integrity): ${errMsg(e)}`);
       return null;
     }
-    const dispatch = readDispatchBundle(cacheDir, defName);
-    if (dispatch.warning !== undefined) err(`owenloop work agent-run: ${dispatch.warning}`);
-    if (dispatch.bundle === null) {
-      err(`owenloop work agent-run: no cached bundle for def '${defName}' — run \`owenloop work prepare ${defName}\``);
+    if (!resolved.ok) {
+      err(`owenloop work agent-run: ${resolved.reason}`);
       return null;
     }
-    const spec = readStepSpec(cacheDir, defName, dispatch.bundle.def.hash, order.step);
-    if (spec === null) {
-      err(
-        `owenloop work agent-run: no step spec for '${order.step}' at ${dispatch.bundle.def.hash} — ` +
-          `re-run \`owenloop work prepare ${defName}\``,
-      );
+
+    let carrier: ReturnType<typeof parseHarnessCarrier>;
+    const rawStep = resolved.step as unknown as Record<string, unknown>;
+    try {
+      carrier = parseHarnessCarrier(rawStep, order.workflow, resolved.step.name);
+    } catch (e) {
+      err(`owenloop work agent-run: instruction refusal (harness-carrier): ${errMsg(e)}`);
       return null;
     }
-    return spec;
+
+    return {
+      step: resolved.step.name,
+      brief: resolved.step.body,
+      ...(carrier.harness !== undefined ? { harness: carrier.harness } : {}),
+      permissions: normalizeStepPermissions(carrier.harnessOptions, resolved.step),
+    };
   };
 
   /**

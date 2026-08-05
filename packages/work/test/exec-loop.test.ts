@@ -6,6 +6,7 @@ import { HubError, type ContactHolder, type GetOrderResponse } from '../src/hub/
 import type { HubClient } from '../src/hub/client.ts';
 import type { CommandResult, CommandRunner, RunningCommand } from '../src/exec/runner.ts';
 import type { CommandReceipt } from '../src/exec/receipt.ts';
+import type { InstructionResolver } from '../src/exec/instructions.ts';
 
 // ---- fakes ------------------------------------------------------------------
 
@@ -24,16 +25,21 @@ const macrotaskSleep = (): Promise<void> => new Promise((r) => setImmediate(r));
 
 interface OrderOpts {
   command?: string;
-  executor?: string;
+  worker?: string;
   workdir?: string;
   owes?: string[];
   claimed?: boolean;
   outcome?: string;
 }
 
-/** A get_order response carrying a command order packet. */
+const testCommands = new Map<string, string>();
+let nextTestDigest = 0;
+
+/** A get_order response carrying a reference-mode command order packet. */
 function commandOrder(o: OrderOpts = {}): GetOrderResponse {
   const paths = o.owes ?? ['out'];
+  const defDigest = `test-digest-${++nextTestDigest}`;
+  testCommands.set(defDigest, o.command ?? 'echo hi');
   return {
     text: '',
     workflow: 'wf1',
@@ -46,13 +52,32 @@ function commandOrder(o: OrderOpts = {}): GetOrderResponse {
       inputs: [],
       outputs: [],
       ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
-      executor: o.executor ?? 'command',
-      command: o.command ?? 'echo hi',
-      prompt: '',
+      worker: o.worker ?? 'command',
+      defDigest,
       consumes: {},
-      owes: paths.map((path) => ({ path, acceptance: '', judgmentRejects: 0, schemaRejects: 0, reasons: [] })),
+      owes: paths.map((path) => ({ path, judgmentRejects: 0, schemaRejects: 0, reasons: [] })),
     },
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
+  };
+}
+
+const testInstructions = (): InstructionResolver => ({
+  resolveCommand: async (order) => ({ ok: true, command: testCommands.get(order.defDigest) ?? 'echo hi' }),
+  resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'step resolution is not used by exec tests' }),
+});
+
+function refusingInstructions(kind: 'unknown-digest' | 'unknown-step' | 'integrity' | 'no-digest' | 'missing-command'): InstructionResolver {
+  return {
+    resolveCommand: async () => ({
+      ok: false,
+      kind,
+      reason: `instruction refusal (${kind})`,
+    }),
+    resolveStep: async () => ({
+      ok: false,
+      kind: 'unknown-step',
+      reason: 'step resolution is not used by exec tests',
+    }),
   };
 }
 
@@ -185,6 +210,7 @@ function baseOpts(hub: HubClient, runner: CommandRunner, extra: Partial<ExecLoop
     jumpToleranceMs: 500,
     failureWindowMs: 5000,
     ...extra,
+    instructions: extra.instructions ?? testInstructions(),
   };
 }
 
@@ -220,6 +246,38 @@ test('runs the command and submits a receipt to the owed path (exit-success outc
   // The run closed via submit → no release (release:false path).
   assert.equal(only(calls, 'release').length, 0);
 });
+
+test('the runner receives only locally resolved command text, not an extra packet command field', async () => {
+  const fr = fakeRunner();
+  const response = commandOrder({ command: 'printf "from-local-store\\n"' });
+  const packet = response.order! as unknown as Record<string, unknown>;
+  packet['command'] = 'touch /tmp/remote-packet-command-must-not-run';
+  const { hub } = mockHub({ getOrder: [response], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  assert.equal(await p, 'submitted');
+  assert.deepEqual(fr.starts, [{ command: 'printf "from-local-store\\n"', cwd: '/work' }]);
+});
+
+for (const kind of ['unknown-digest', 'unknown-step', 'integrity', 'no-digest', 'missing-command'] as const) {
+  test(`instruction refusal (${kind}) releases without spawning or submitting`, async () => {
+    const fr = fakeRunner();
+    const response = commandOrder();
+    if (kind === 'no-digest') {
+      (response.order! as unknown as Record<string, unknown>)['defDigest'] = '';
+    }
+    const { hub, calls, submits } = mockHub({ getOrder: [response] });
+    const loop = createExecLoop(baseOpts(hub, fr.runner, {
+      instructions: refusingInstructions(kind),
+    }));
+    assert.equal(await loop.run(), 'unresolved-instructions');
+    assert.equal(fr.starts.length, 0);
+    assert.equal(submits.length, 0);
+    assert.equal(only(calls, 'release').length, 1);
+  });
+}
 
 test('uses the order workdir as the command cwd when the packet carries one', async () => {
   const fr = fakeRunner();
@@ -288,9 +346,9 @@ test('a null order packet is a misroute — release, no run, no submit', async (
   assert.equal(only(calls, 'release').length, 1);
 });
 
-test('an agent (non-command) executor is a misroute', async () => {
+test('an agent (non-command) worker is a misroute', async () => {
   const fr = fakeRunner();
-  const { hub, calls } = mockHub({ getOrder: [commandOrder({ executor: 'agent' })] });
+  const { hub, calls } = mockHub({ getOrder: [commandOrder({ worker: 'agent' })] });
   const loop = createExecLoop(baseOpts(hub, fr.runner));
   assert.equal(await loop.run(), 'misroute');
   assert.equal(fr.starts.length, 0);

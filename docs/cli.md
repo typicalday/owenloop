@@ -547,9 +547,11 @@ bundle's identity. Identity comes from the bundle's own
 Bundle ingestion (unpacking, manifest integrity, canonical digest,
 coordinate) and pre-commit verification are separate modules with no
 permissive fallback: with either adapter missing, `add` refuses with a named
-error *before* any staging, journal, or index write. There is no default
-accepting parser, digest algorithm, or verifier. Publishing from this engine
-does not sign a bundle.
+error before any staging, journal, or index write. The default CLI now binds the
+real bundle ingestor; the pre-commit verifier remains unbound, so the default
+CLI still fails closed rather than accepting an unverified bundle. Hosts that
+provide both adapters can install real `.wnlp` output from `packBundle`.
+Publishing from this engine does not sign a bundle.
 
 ### The two store roots
 
@@ -616,8 +618,10 @@ Coordinates, source strings, and version text never join into a path.
    committed.
 6. Validate the staged tree with the engine's strict pass — the exact bytes
    that will be committed (parse/lint/validate/bounded `check` + the strict
-   cross-def backstop). Any problem refuses the whole install and prints
-   every reason.
+   cross-def backstop). For a real `.wnlp`, validation loads the bundle's root
+   `workflow.yaml` entrypoint directly; the package manifest `bundle.yaml` is
+   not treated as a workflow definition. Any problem refuses the whole install
+   and prints every reason.
 7. Run the pre-commit verifier (after content validation, before any swap or
    index write). A rejection commits nothing.
 8. Write the `applying` crash journal (v2 — its commit-point evidence is the

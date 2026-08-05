@@ -75,7 +75,6 @@ function order(stepName: string): WorkOrder {
     workflow: 'wf1',
     run: 'run1',
     step: stepName,
-    prompt: `do ${stepName}`,
     consumes: {},
     expected_outputs: [{ path: 'pr' }],
     feedback: [],

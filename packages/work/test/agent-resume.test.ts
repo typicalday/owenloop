@@ -60,12 +60,11 @@ function rejectedOrder(o: OrderOpts = {}): GetOrderResponse {
     inputs: [],
     outputs: ['out'],
     ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
-    prompt: '',
+    defDigest: 'test-agent-digest',
     consumes: {},
     owes: [
       {
         path: 'out',
-        acceptance: 'judgment',
         judgmentRejects: 1,
         schemaRejects: 0,
         reasons: o.reasons ?? [reason(500, 'the null check is still missing')],

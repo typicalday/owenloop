@@ -16,7 +16,7 @@
  * Contrast with the dispatch drill: THAT one ends via the hub's lease outcome
  * and deliberately does NOT release. This one has no outcome, so it MUST.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,6 +26,9 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
+import { defInstructionDigest } from '../../../src/order-resolver.ts';
+import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
+import { installBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { readChildRecords } from '../src/shift/state.ts';
 import { readSessions, sessionsPath } from '../src/harness/session-store.ts';
 import type { OrderPacket, WorkOrder } from '../src/hub/types.ts';
@@ -39,15 +42,19 @@ const TPL_CONTENT = '---\nname: x\n---\n\nstep brief\n';
 const FAKE_HARNESS = fileURLToPath(new URL('./fixtures/fake-harness.mjs', import.meta.url));
 
 const ORDER: WorkOrder = {
-  workflow: 'wf1', run: 'run_x1234', step: 'builder', prompt: 'build it',
+  workflow: 'wf1', run: 'run_x1234', step: 'builder',
   consumes: {}, expected_outputs: [{ path: 'pr' }], feedback: [], advisory: {}, submit_hint: 'submit pr',
 };
 
-const PACKET: OrderPacket = {
-  run: 'run_x1234', workflow: 'wf1', step: 'builder', key: 'k', inputs: [], outputs: ['pr'],
-  prompt: 'build it', consumes: {},
-  owes: [{ path: 'pr', acceptance: 'a', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
-};
+let localDefDigest = '';
+
+function packet(): OrderPacket {
+  return {
+    run: 'run_x1234', workflow: 'wf1', step: 'builder', key: 'k', inputs: [], outputs: ['pr'],
+    defDigest: localDefDigest, consumes: {},
+    owes: [{ path: 'pr', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+  };
+}
 
 let root: string;
 let home: string;
@@ -61,11 +68,22 @@ beforeEach(() => {
   stateDir = join(root, 'state');
   tracePath = join(root, 'harness-trace.jsonl');
 });
+function makeWritableTree(path: string): void {
+  const stat = lstatSync(path);
+  if (stat.isDirectory()) {
+    for (const child of readdirSync(path)) makeWritableTree(join(path, child));
+    chmodSync(path, 0o755);
+  } else {
+    chmodSync(path, 0o644);
+  }
+}
+
 afterEach(() => {
+  if (existsSync(root)) makeWritableTree(root);
   rmSync(root, { recursive: true, force: true });
 });
 
-function seedCache(): void {
+async function seedCache(): Promise<void> {
   const tpl: NormalizedStepSpec = { step: 'builder', brief: TPL_CONTENT, permissions: { extensions: {} } };
   const bundle: CachedBundle = {
     def: { name: 'demo', hash: DEMO_HASH, steps: [{ name: 'builder', body: '' }] },
@@ -73,6 +91,28 @@ function seedCache(): void {
     origin: 'seed',
   };
   writeBundle(cacheDir, bundle, [tpl]);
+  const workflow = `name: demo
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: builder
+    consumes: [seed]
+    produces: [pr]
+    terminal: true
+    executor: agent
+    body: |
+${TPL_CONTENT.split('\n').map((line) => `      ${line}`).join('\n')}
+    x:
+      harness:
+        id: fake
+`;
+  const sourceDir = writeBundleSource({ name: 'demo', workflow });
+  const installed = await installBundleFixture({ sourceDir, root: join(home, '.owenloop', 'workflows') });
+  const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+  const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
+  assert.ok(definition !== undefined);
+  localDefDigest = defInstructionDigest(definition);
 }
 
 function traceCalls(): Array<Record<string, unknown>> {
@@ -106,7 +146,7 @@ function spawnDaemon(origin: string): ShiftChild {
 }
 
 test('SIGTERM to a worker mid-turn tears the harness session down and releases the order', async () => {
-  seedCache();
+  await seedCache();
   let wakes = 0;
   const { origin, reqs, server } = await startMockHub((verb, body) => {
     switch (verb) {
@@ -119,7 +159,7 @@ test('SIGTERM to a worker mid-turn tears the harness session down and releases t
         return { text: '', ok: true, name: 'p', lastSeen: 1 };
       case 'get_order':
         // ALWAYS claimed, NEVER an outcome — no submit ever lands here.
-        return { text: '', workflow: 'wf1', run: 'run_x1234', order: PACKET, lease: { claimed: true } };
+        return { text: '', workflow: 'wf1', run: 'run_x1234', order: packet(), lease: { claimed: true } };
       case 'heartbeat':
         return { text: '', ok: true };
       case 'release':

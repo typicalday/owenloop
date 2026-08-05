@@ -22,10 +22,10 @@
  * or a hub module.
  */
 
-import { chmodSync, lstatSync, readdirSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randId } from '../util.ts';
-import { DefError, lintDef, loadDefs, loadDefsRaw, validateDef } from '../defs.ts';
+import { DefError, finalizeDefs, lintDef, loadDefFile, loadDefsRaw, validateDef } from '../defs.ts';
 import type { DefLoadFailure } from '../defs.ts';
 import { hasDefiniteCheckDefect, modelCheck } from '../model.ts';
 import {
@@ -327,9 +327,29 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // Validate the staged tree with the engine's strict pass — the exact
     // bytes that will be committed, with no re-write after validation.
     const reasons: string[] = [];
-    const failures: DefLoadFailure[] = [];
-    const staged = loadDefsRaw(stagingDir, failures);
-    reasons.push(...failures.map((f) => `${f.file}: ${f.error}`));
+    let staged: Map<string, ReturnType<typeof loadDefFile>>;
+    const entrypoint = join(stagingDir, 'workflow.yaml');
+    if (existsSync(entrypoint)) {
+      // Real `.wnlp` bundles have exactly one root workflow.yaml. Loading that
+      // entrypoint directly avoids treating the root bundle.yaml manifest as a
+      // workflow definition. The fallback below preserves the installer port's
+      // ability to validate non-archive adapters used by callers and tests.
+      staged = new Map<string, ReturnType<typeof loadDefFile>>();
+      try {
+        const stagedDef = loadDefFile(entrypoint);
+        staged.set(stagedDef.name, stagedDef);
+      } catch (e) {
+        if (e instanceof DefError) {
+          reasons.push(`${entrypoint}: ${e.message}`);
+        } else {
+          throw e;
+        }
+      }
+    } else {
+      const failures: DefLoadFailure[] = [];
+      staged = loadDefsRaw(stagingDir, failures);
+      reasons.push(...failures.map((failure) => `${failure.file}: ${failure.error}`));
+    }
     for (const stagedDef of staged.values()) {
       const lintResult = lintDef(stagedDef);
       reasons.push(...lintResult.errors.map((err) => `${stagedDef.name}: ${err}`));
@@ -345,7 +365,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     }
     if (reasons.length === 0) {
       try {
-        loadDefs(stagingDir);
+        finalizeDefs(staged);
       } catch (e) {
         if (e instanceof DefError) {
           reasons.push(`cross-definition validation failed: ${e.message}`);

@@ -79,7 +79,7 @@ function cacheAgent(): void {
 }
 
 function order(step: string): WorkOrder {
-  return { workflow: 'wf1', run: 'run_1', step, prompt: '', consumes: {}, expected_outputs: [], feedback: [], advisory: {}, submit_hint: '' };
+  return { workflow: 'wf1', run: 'run_1', step, consumes: {}, expected_outputs: [], feedback: [], advisory: {}, submit_hint: '' };
 }
 
 test('attendance is omitted before noteAttended and included after an immediate ping', async () => {
