@@ -12,3 +12,6 @@ coverage/
 # dev delivery-system scaffolding (local foreman state — not part of the library)
 .dev/*
 !.dev/checks.sh
+
+# planning documents are local working state, never shipped in this public repo
+docs/plans/
