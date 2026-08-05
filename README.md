@@ -287,12 +287,17 @@ them in the tree, both all-or-nothing with crash recovery:
 - **Workflow bundles** — `owenloop add widget.wnlp [--global]` (a local
   `.wnlp` file or an `https://` URL) installs into a **content-addressed
   store**: the project store lives under the defs dir, `--global` installs
-  into `~/.owenloop/workflows`. Each store holds an `index.json` mapping
+  into `<home>/.owenloop/workflows`. Each store holds an `index.json` mapping
   `namespace/name@version` coordinates to content digests, plus immutable
   objects at `objects/sha256/<digest>/` — identical content deduplicates to
   one object, and an object's identity is its digest alone (never its name
   or source). Objects are hardened read-only in place, and every resolution
   re-verifies the bytes before returning a path.
+
+The bundle route derives `<home>` from the first non-blank caller-injected
+`HOME` or `USERPROFILE` value (`HOME` wins), and uses that home for the default
+recovery-marker directory. A bundle install refuses when neither variable is
+supplied rather than falling back to the process user's ambient home.
 
 Bundle installs fail closed without their two required adapters (bundle
 ingestion and pre-commit verification) — there is no default accepting

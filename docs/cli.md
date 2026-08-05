@@ -44,7 +44,7 @@ for the full breakdown.
 |---|---|
 | `defs` | list available workflow definitions |
 | `add <owner>/<repo>[@ref]` | fetch, validate, and install a repo's workflow defs from GitHub (public repos only) — see below |
-| `add <bundle.wnlp \| https://url> [--global]` | install a workflow bundle into the content-addressed store — project store under the defs dir by default, `~/.owenloop/workflows` with `--global` — see below |
+| `add <bundle.wnlp \| https://url> [--global]` | install a workflow bundle into the content-addressed store — project store under the defs dir by default, `<home>/.owenloop/workflows` with `--global` — see below |
 | `add --recover [--global]` | finish or undo a crash-interrupted install, offline — no network call (`--global` recovers the global store) — see below |
 | `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
@@ -529,11 +529,21 @@ A store root holds exactly this layout:
   `OWENLOOP_DEFS`, or `./workflows`). The project's pins are reviewable in
   git there, and the nested `objects/sha256/<digest>/` layout stays below
   the def loader's scan depth.
-- **Global store root** = `~/.owenloop/workflows`. `--global` selects it; it
-  cannot be combined with `--defs` (the global store has a fixed
+- **Global store root** = `<home>/.owenloop/workflows`. `--global` selects it;
+  it cannot be combined with `--defs` (the global store has a fixed
   home-directory location, so an override would only create ambiguity —
   refused with a clear message). The global root is never used by the
   GitHub route.
+
+**Injected home requirement.** `<home>` is the first non-blank value from the
+caller-injected `HOME` and `USERPROFILE` environment variables (`HOME` wins).
+The `.wnlp` bundle route uses the same injected home for its default external
+recovery-marker directory, `<home>/.owenloop/recovery-markers`, even when the
+bundle targets the project store. If neither variable is supplied, bundle
+installation refuses before any object or index commit; it never falls back to
+the process user's ambient home. `add --recover --global` has the same
+requirement. Project recovery of a v2 fresh-install journal also refuses when
+its recovery marker requires a home and neither variable is supplied.
 
 Every object path derives ONLY from its validated digest (lowercase 64-hex).
 Coordinates, source strings, and version text never join into a path.
@@ -609,8 +619,9 @@ generalized: the v2 journal's commit-point test compares the hash of the
 current `index.json` bytes against the journal's recorded metadata hash
 (route-neutral — no GitHub ledger involved). A fresh v2 install also writes a
 single-use external recovery marker under the user's recovery-marker directory
-(default `~/.owenloop/recovery-markers`) before the applying journal. If a
-crash leaves the destination present with no staging or backup, recovery
+(default `<home>/.owenloop/recovery-markers`, derived from the injected home
+described above) before the applying journal. If a crash leaves the destination
+present with no staging or backup, recovery
 discards that destination only when the marker exactly matches the store root,
 destination segments, staging id, and `hadDest: false`; a missing or mismatched
 marker refuses and preserves the destination and journal. `add --recover --global`
