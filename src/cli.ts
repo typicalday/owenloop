@@ -4556,7 +4556,7 @@ function normalizedPluginVersion(value: unknown): string | null {
 }
 
 function firstOutputLine(value: string): string | null {
-  const line = value.split(/\\r?\\n/, 1)[0]?.trim() ?? '';
+  const line = value.split(/\r?\n/, 1)[0]?.trim() ?? '';
   return line === '' ? null : line;
 }
 
@@ -4630,9 +4630,9 @@ function probePlugin(io: CliIO): HarnessPluginState[] {
       const result = run(config.cliName, ['plugin', 'list', '--json']);
       if (result.status === 0) {
         const parsed = parsePluginList(result.stdout, id);
-        // A successful command with malformed output is presence-only: do not
-        // reinstall an already-present plugin merely because its version is unknown.
-        installed = parsed.known ? parsed.installed : true;
+        // A successful command with malformed output cannot establish presence.
+        // Treat it as not installed, matching the non-zero-exit path below.
+        installed = parsed.known ? parsed.installed : false;
         installedVersion = parsed.installedVersion;
       }
     } catch {
@@ -4694,7 +4694,7 @@ function reportPluginCommandFailure(
   error: unknown = undefined,
 ): void {
   io.err(`plugin command failed: ${cmd} ${args.join(' ')}`);
-  const childOutput = result === null ? '' : [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join('\\n');
+  const childOutput = result === null ? '' : [result.stderr.trim(), result.stdout.trim()].filter(Boolean).join('\n');
   if (childOutput !== '') io.err(childOutput);
   if (error !== undefined) {
     const message = error instanceof Error ? error.message : String(error);

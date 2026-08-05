@@ -39,6 +39,7 @@ import { owenloopSettingsPath } from '../src/work-settings.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
+const PACKAGE_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 
 /** An `openUrl` that plays the browser+consent, driving the real loopback callback. */
 function driveCallback() {
@@ -244,7 +245,11 @@ test('setup plugin: Claude fresh install runs marketplace add then plugin instal
 test('setup plugin: Claude matching version performs zero plugin writes', async () => {
   const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
     if (cmd === 'claude' && args.join(' ') === 'plugin list --json') {
-      return { status: 0, stdout: '[{"id":"owenloop@owenloop","version":" 0.5.0 "}]', stderr: '' };
+      return {
+        status: 0,
+        stdout: JSON.stringify([{ id: 'owenloop@owenloop', version: ` ${PACKAGE_VERSION} ` }]),
+        stderr: '',
+      };
     }
     if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
     return { status: 0, stdout: '', stderr: '' };
@@ -284,7 +289,7 @@ test('setup plugin: Codex available-only entry is not installed and fresh instal
     if (cmd === 'codex' && args.join(' ') === 'plugin list --json') {
       return {
         status: 0,
-        stdout: JSON.stringify({ installed: [], available: [{ pluginId: 'owenloop@owenloop', version: '0.5.0' }] }),
+        stdout: JSON.stringify({ installed: [], available: [{ pluginId: 'owenloop@owenloop', version: PACKAGE_VERSION }] }),
         stderr: '',
       };
     }
@@ -417,13 +422,32 @@ test('setup plugin: installed plugin with unknown version does not reinstall', a
   assertNoOlp(t);
 });
 
+test('setup plugin: malformed successful list output is treated as not installed', async () => {
+  const root = resolveBundledMarketplaceRoot('claude-code');
+  assert.ok(root);
+  const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
+    if (cmd === 'claude' && args.join(' ') === 'plugin list --json') {
+      return { status: 0, stdout: 'not JSON', stderr: '' };
+    }
+    if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
+    return { status: 0, stdout: '', stderr: '' };
+  });
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(pluginMutationCalls(calls), [
+    { cmd: 'claude', args: ['plugin', 'marketplace', 'add', root] },
+    { cmd: 'claude', args: ['plugin', 'install', 'owenloop@owenloop'] },
+  ]);
+  assertNoOlp(t);
+});
+
 test('setup plugin: failed install is noted and does not fail core setup', async () => {
   const root = resolveBundledMarketplaceRoot('claude-code');
   assert.ok(root);
   const { code, t, calls } = await runPluginSetup(['claude'], (cmd, args) => {
     if (cmd === 'claude' && args.join(' ') === 'plugin list --json') return { status: 0, stdout: '[]', stderr: '' };
     if (cmd === 'claude' && args[0] === '--version') return { status: 0, stdout: '2.1.222 (Claude Code)\n', stderr: '' };
-    if (cmd === 'claude' && args[1] === 'marketplace') return { status: 1, stdout: '', stderr: 'permission denied' };
+    if (cmd === 'claude' && args[1] === 'marketplace') return { status: 1, stdout: 'stdout failure', stderr: 'permission denied' };
     return { status: 0, stdout: '', stderr: '' };
   });
 
@@ -431,6 +455,8 @@ test('setup plugin: failed install is noted and does not fail core setup', async
   assert.deepEqual(pluginMutationCalls(calls), [{ cmd: 'claude', args: ['plugin', 'marketplace', 'add', root] }]);
   const summary = JSON.parse(t.out.join('\n')) as { steps: { step: string; action: string }[] };
   assert.deepEqual(summary.steps.filter((step) => step.step === 'plugin (claude-code)').map((step) => step.action), ['noted']);
+  assert.ok(t.err.includes('permission denied\nstdout failure'), 'stderr and stdout are separated by a real newline');
+  assert.doesNotMatch(t.err.join('\n'), /permission denied\\nstdout failure/, 'diagnostics do not contain a literal backslash-n');
   assertNoOlp(t);
 });
 

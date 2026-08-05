@@ -10,7 +10,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
@@ -19,6 +19,7 @@ import { owenloopSettingsPath } from '../src/work-settings.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
+const PACKAGE_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 
 /** Seed a fresh, non-expiring human oauth credential. */
 function seedHuman(store: Map<string, string>): void {
@@ -146,14 +147,18 @@ test('doctor: all green → every line ✓, exit 0, and a strict zero-write', as
     env: { PATH: pathDir(true, true) },
     runCommand: (cmd, args) => {
       if (args[0] === '--version') {
-        return { status: 0, stdout: cmd === 'claude' ? '2.1.222 (Claude Code)\n' : 'codex-cli 0.146.0\n', stderr: '' };
+        return {
+          status: 0,
+          stdout: cmd === 'claude' ? '2.1.222 (Claude Code)\nUpdate available: 2.2.0\n' : 'codex-cli 0.146.0\n',
+          stderr: '',
+        };
       }
       if (cmd === 'claude') {
-        return { status: 0, stdout: '[{"id":"owenloop@owenloop","version":"0.5.0"}]', stderr: '' };
+        return { status: 0, stdout: JSON.stringify([{ id: 'owenloop@owenloop', version: PACKAGE_VERSION }]), stderr: '' };
       }
       return {
         status: 0,
-        stdout: JSON.stringify({ installed: [{ pluginId: 'owenloop@owenloop', version: '0.5.0', installed: true }], available: [] }),
+        stdout: JSON.stringify({ installed: [{ pluginId: 'owenloop@owenloop', version: PACKAGE_VERSION, installed: true }], available: [] }),
         stderr: '',
       };
     },
@@ -178,8 +183,9 @@ test('doctor: all green → every line ✓, exit 0, and a strict zero-write', as
   ]) {
     assert.ok(err.includes(`✓ ${label}`), `${label} passed`);
   }
-  assert.match(err, /✓ plugin \(claude-code\): owenloop 0\.5\.0 · claude 2\.1\.222 \(Claude Code\)/);
-  assert.match(err, /✓ plugin \(codex\): owenloop 0\.5\.0 · codex codex-cli 0\.146\.0/);
+  assert.ok(err.includes(`✓ plugin (claude-code): owenloop ${PACKAGE_VERSION} · claude 2.1.222 (Claude Code)`));
+  assert.ok(err.includes(`✓ plugin (codex): owenloop ${PACKAGE_VERSION} · codex codex-cli 0.146.0`));
+  assert.doesNotMatch(err, /Update available: 2\.2\.0/, 'only the first CLI version output line is reported');
 
   assert.deepEqual([...t.store.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)), before, 'doctor performed no writes');
   assertNoOlpErr(t);
