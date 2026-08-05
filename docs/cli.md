@@ -1418,6 +1418,29 @@ loopback listener. If no human credential is stored, a tool call returns an
 error telling you to run `owenloop login --hub <origin>` in a terminal and retry
 (see [Authentication and secrets](#authentication-and-secrets) below).
 
+### Plugin/CLI version alignment
+
+The shipped Claude Code and Codex plugins launch `owenloop mcp` from `PATH` and
+carry the plugin version in `.mcp.json` as `OWENLOOP_PLUGIN_VERSION`. The MCP
+server compares that expected version with its own package version on every
+recognized `tools/call`. The comparison is strict equality: a mismatch returns
+a tool error that names both versions and says `Run: owenloop setup`. The
+server does not reject the MCP startup handshake, so the diagnostic reaches the
+model and the human instead of appearing only as a transport-closed error.
+
+Each plugin also declares a `SessionStart` hook. The hook reads the plugin
+manifest version, sends an MCP `initialize` request to `owenloop mcp` using a
+non-routable probe origin, and reads `serverInfo.version`; the root CLI has no
+supported `owenloop --version` flag. The hook reports a missing CLI, an
+unparseable version, or a mismatch to stderr and always exits successfully, so
+a diagnostic cannot block session startup. Claude Code runs the hook after
+installation. Codex runs plugin hooks only after the user approves them in
+`/hooks`; if the user does not approve Codex hooks, the always-on MCP check
+still catches a version mismatch when a tool call is made.
+
+If the versions differ, run `owenloop setup` and follow the printed plugin
+installation instructions before retrying the MCP tool call.
+
 ### Choosing the hub origin
 
 `owenloop mcp` binds to exactly one hub origin, resolved in this order:
