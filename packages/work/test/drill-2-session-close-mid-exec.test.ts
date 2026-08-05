@@ -24,7 +24,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 
 import { defInstructionDigest } from '../../../src/order-resolver.ts';
 import { finalizeDefs, loadDefFile } from '../../../src/defs.ts';
-import { installBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
+import { installSignedBundleFixture, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import { spawnMcp, startMockHub, until, type HubReq } from './helpers/mcp-stdio-client.ts';
 import { DRILL_AUTH, fixtureEnv, seedCredentialStore } from './helpers/credential-fixture.ts';
 
@@ -99,7 +99,11 @@ steps:
     body: ""
 `;
   const sourceDir = writeBundleSource({ name: 'exec-drill', workflow });
-  const installed = await installBundleFixture({ sourceDir, root: join(home, '.owenloop', 'workflows') });
+  const installed = await installSignedBundleFixture({
+    sourceDir,
+    root: join(home, '.owenloop', 'workflows'),
+    home,
+  });
   const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
   const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
   assert.ok(definition !== undefined);

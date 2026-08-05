@@ -18,6 +18,7 @@ import { inspectSettings, KNOWN_SETTINGS_KEYS } from '../settings/settings.ts';
 const DEFAULT_NOTE: Partial<Record<(typeof KNOWN_SETTINGS_KEYS)[number], string>> = {
   dispatchCap: '3',
   commandRouting: 'shift',
+  defPolicy: 'warn',
 };
 
 function errMsg(err: unknown): string {

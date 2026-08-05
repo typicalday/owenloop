@@ -118,6 +118,7 @@ test('exec store e2e: empty store refuses, installed bytes run, and tampering re
     projectRoot,
     globalRoot,
     verifier: createBundleIngestor(),
+    definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
   });
   const marker = join(CWD, 'remote-command-ran');
   const remoteCommand = `touch ${marker}`;
@@ -145,6 +146,7 @@ test('exec store e2e: empty store refuses, installed bytes run, and tampering re
     projectRoot,
     globalRoot,
     verifier: createBundleIngestor(),
+    definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
   });
   const second = await startHub(order(requested, remoteCommand));
   try {

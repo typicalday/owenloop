@@ -246,3 +246,38 @@ test('KNOWN_SETTINGS_KEYS carries maxConcurrentAgents, so it is not "unrecognize
     rmSync(xdg, { recursive: true, force: true });
   }
 });
+
+test('loadSettings: defPolicy accepts enforce, warn, and off', () => {
+  for (const defPolicy of ['enforce', 'warn', 'off'] as const) {
+    const xdg = withSettingsFile(JSON.stringify({ defPolicy }));
+    try {
+      assert.equal(loadSettings({ XDG_CONFIG_HOME: xdg }).defPolicy, defPolicy);
+    } finally {
+      rmSync(xdg, { recursive: true, force: true });
+    }
+  }
+});
+
+test('loadSettings: defPolicy rejects an unknown value and wrong types', () => {
+  for (const defPolicy of ['strict', 1, null]) {
+    const xdg = withSettingsFile(JSON.stringify({ defPolicy }));
+    try {
+      assert.throws(
+		() => loadSettings({ XDG_CONFIG_HOME: xdg }),
+		/'defPolicy' must be 'enforce', 'warn', or 'off'/,
+      );
+    } finally {
+      rmSync(xdg, { recursive: true, force: true });
+    }
+  }
+});
+
+test('KNOWN_SETTINGS_KEYS carries defPolicy and absent defPolicy remains undefined for the loader', () => {
+  const xdg = withSettingsFile('{}');
+  try {
+    assert.ok(KNOWN_SETTINGS_KEYS.includes('defPolicy'));
+    assert.equal(loadSettings({ XDG_CONFIG_HOME: xdg }).defPolicy, undefined);
+  } finally {
+    rmSync(xdg, { recursive: true, force: true });
+  }
+});

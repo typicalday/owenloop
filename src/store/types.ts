@@ -181,6 +181,28 @@ export class PreCommitVerifierUnavailableError extends WorkflowStoreError {
   }
 }
 
+/** A publication signature verdict was refused by the configured definition policy. */
+export class StoreDefinitionVerificationError extends WorkflowStoreError {
+  readonly verdict: 'unsigned' | 'unverifiable' | 'invalid';
+  readonly policy: 'enforce' | 'warn' | 'off';
+  readonly coordinate: WorkflowCoordinate;
+  constructor(
+    verdict: 'unsigned' | 'unverifiable' | 'invalid',
+    policy: 'enforce' | 'warn' | 'off',
+    coordinate: WorkflowCoordinate,
+    reason: string,
+  ) {
+    super(
+      'definition-verification-refused',
+      `definition '${coordinate}' was refused by defPolicy=${policy}: ${verdict} — ${reason}`,
+    );
+    this.name = 'StoreDefinitionVerificationError';
+    this.verdict = verdict;
+    this.policy = policy;
+    this.coordinate = coordinate;
+  }
+}
+
 /** A store root, objects dir, index file, or state path failed a type/symlink guard. */
 export class StorePathError extends WorkflowStoreError {
   constructor(message: string) {

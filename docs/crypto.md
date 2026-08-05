@@ -250,11 +250,50 @@ the key type embedded in the Base64 public-key blob. Parsed `principals` retain
 literal surrounding quotes where stock OpenSSH strips them. These fields are
 structural output only; OpenSSH remains the authorization authority.
 
+## Definition publication policy
+
+The install path verifies the mutually exclusive publication sidecars written by
+`publish`: `<bundle>.wnlp.dsse` or `<bundle>.wnlp.unsigned`. The `.dsse` sidecar
+is checked against the bundle digest and the local `allowed_signers` trust root.
+The trust-root path is `$XDG_CONFIG_HOME/owenloop/allowed_signers` when
+`XDG_CONFIG_HOME` is non-blank, or `$HOME/.config/owenloop/allowed_signers`
+otherwise. A missing or malformed trust root produces the distinct
+`unverifiable` verdict; a present signature that fails verification produces
+`invalid`.
+
+The execution and install policy is `defPolicy`, with built-in default `warn`.
+Set `defPolicy` in the JSON settings file at
+`$XDG_CONFIG_HOME/owenloop/settings.json` (or
+`$HOME/.config/owenloop/settings.json`), for example:
+
+```json
+{
+  "defPolicy": "enforce"
+}
+```
+
+`OWENLOOP_DEF_POLICY` overrides the settings file for a CLI invocation. The
+precedence is explicit host-provided policy, then the environment, then the
+settings file, then `warn`. An invalid policy value fails loudly rather than
+weakening trust. The install-time and execution-time outcomes for `enforce`,
+`warn`, and `off` are listed in [`docs/cli.md`](cli.md#definition-publication-policy).
+
+`enforce` refuses unsigned and unverifiable definitions. `warn` warns and
+permits those two verdicts for installation and agent work. `off` permits those
+two verdicts silently for installation and agent work. `invalid` is refused at
+every policy value. **Command workers always require `verified`; `off` never
+relaxes that hard rule.** An execution resolver without a configured
+publication verifier treats the definition as `unverifiable`, so command
+workers refuse rather than assuming that integrity verification alone proves
+publication trust.
+
+The verifier does not write a verdict or sidecar into the immutable object
+directory. The object remains governed by the bundle manifest integrity map.
+
 ## Out of scope (future work)
 
 Publish-time author-side DSSE signing is implemented by `owenloop publish`.
-Consumer-side verification, transport relay, and the following extensions remain
-out of scope:
+Transport relay and the following extensions remain out of scope:
 
 - Key **rotation** and revocation wiring for stored principal keys.
 - Certificate (`cert-authority`) chains and hardware-backed signing flows.
