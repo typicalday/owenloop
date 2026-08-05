@@ -13,6 +13,7 @@ import {
   PAYLOAD_TYPE_ENROLLMENT_GRANT,
   PAYLOAD_TYPE_ORIGIN,
   PAYLOAD_TYPE_POLICY_FLOOR,
+  PAYLOAD_TYPE_PUBLICATION,
   PAYLOAD_TYPE_REVOCATION,
   PAYLOAD_TYPE_SUBMISSION,
 } from './dsse.ts';
@@ -74,6 +75,32 @@ export const SUBMISSION_FIELDS = {
   producerKeyId: 'required',
   timestamp: 'required',
 } as const satisfies FieldManifest<SubmissionRecord>;
+
+/**
+ * A signed publication of one canonical workflow bundle. `name` and `version`
+ * bind the digest to the package identity so a valid signature cannot be
+ * replayed as a claim about a different package.
+ */
+export interface PublicationRecord {
+  /** Lowercase 64-character SHA-256 digest of the canonical bundle tar. */
+  digest: string;
+  /** The published bundle's package name. */
+  name: string;
+  /** The published bundle's package version. */
+  version: string;
+  /** `SHA256:<unpadded-base64>` fingerprint of the publisher's public key. */
+  publisherKeyId: string;
+  /** Unix epoch milliseconds at signing time. */
+  timestamp: number;
+}
+
+export const PUBLICATION_FIELDS = {
+  digest: 'required',
+  name: 'required',
+  version: 'required',
+  publisherKeyId: 'required',
+  timestamp: 'required',
+} as const satisfies FieldManifest<PublicationRecord>;
 
 export const SUBMISSION_PRODUCED_FIELDS = {
   artifact: 'required',
@@ -270,16 +297,19 @@ export const ORDER_REASON_FIELDS = {
 } as const satisfies FieldManifest<Order['owes'][number]['reasons'][number]>;
 
 /**
- * Bind the four record definitions in this package to the frozen DSSE media
+ * Bind the five record definitions in this package to the frozen DSSE media
  * types. The origin payload type is deliberately reserved for the origin work
- * package; it is not silently accepted as an arbitrary fifth binding here.
+ * package; it is not silently accepted as an arbitrary binding here. The
+ * publication record is the fifth bound record; the runtime DSSE allow-list
+ * also retains origin as the sixth reserved payload type.
  */
 export const RECORD_PAYLOAD_TYPES = {
   enrollmentGrant: PAYLOAD_TYPE_ENROLLMENT_GRANT,
   revocation: PAYLOAD_TYPE_REVOCATION,
   submission: PAYLOAD_TYPE_SUBMISSION,
   policyFloor: PAYLOAD_TYPE_POLICY_FLOOR,
+  publication: PAYLOAD_TYPE_PUBLICATION,
 } as const satisfies Record<
-  'enrollmentGrant' | 'revocation' | 'submission' | 'policyFloor',
+  'enrollmentGrant' | 'revocation' | 'submission' | 'policyFloor' | 'publication',
   Exclude<DsseRecordPayloadType, typeof PAYLOAD_TYPE_ORIGIN>
 >;

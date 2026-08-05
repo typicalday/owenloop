@@ -202,6 +202,10 @@ without writing files. `digestBundle(bytes)` performs bounded gzip inflation and
 returns only the def digest. `unpackBundle(bytes, destination)` returns the same
 inspection result plus the absolute materialized destination path.
 
+`owenloop publish` signs exactly `packBundle(sourceDir).digest`: the lowercase
+64-hex SHA-256 digest of the uncompressed canonical tar. It does not sign the
+gzip wrapper bytes or the separate compiled-definition hash used by `push`.
+
 All bundle failures are `BundleError` instances with a stable `code` suitable
 for scripts. The CLI keeps that code in the stderr diagnostic.
 

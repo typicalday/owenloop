@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:owenloop:schema:publication:v1",
+  "title": "owenloop publication record v1",
+  "description": "A signed publication statement for one canonical workflow bundle.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["digest", "name", "version", "publisherKeyId", "timestamp"],
+  "properties": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "publisherKeyId": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

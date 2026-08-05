@@ -80,7 +80,7 @@ export class DsseEnvelopeError extends Error {
 }
 
 /**
- * The five launch signed-record payload types. These strings are signed wire
+ * The six launch signed-record payload types. These strings are signed wire
  * identifiers — versioned, stable, and consumed by later trust work, so a
  * change here is a new `v2` constant, never an edit.
  */
@@ -89,6 +89,7 @@ export const PAYLOAD_TYPE_REVOCATION = 'application/vnd.owenloop.revocation.v1+j
 export const PAYLOAD_TYPE_SUBMISSION = 'application/vnd.owenloop.submission.v1+json';
 export const PAYLOAD_TYPE_POLICY_FLOOR = 'application/vnd.owenloop.policy-floor.v1+json';
 export const PAYLOAD_TYPE_ORIGIN = 'application/vnd.owenloop.origin.v1+json';
+export const PAYLOAD_TYPE_PUBLICATION = 'application/vnd.owenloop.publication.v1+json';
 
 /** The DSSE SSHSIG namespace used for all owenloop DSSE envelopes. */
 export const DSSE_SSH_NAMESPACE = 'owenloop-dsse-v1';
@@ -291,7 +292,8 @@ export type DsseRecordPayloadType =
   | typeof PAYLOAD_TYPE_REVOCATION
   | typeof PAYLOAD_TYPE_SUBMISSION
   | typeof PAYLOAD_TYPE_POLICY_FLOOR
-  | typeof PAYLOAD_TYPE_ORIGIN;
+  | typeof PAYLOAD_TYPE_ORIGIN
+  | typeof PAYLOAD_TYPE_PUBLICATION;
 
 /** Runtime copy of the closed record-type set used at dynamic boundaries. */
 export const DSSE_RECORD_PAYLOAD_TYPES = Object.freeze([
@@ -300,9 +302,10 @@ export const DSSE_RECORD_PAYLOAD_TYPES = Object.freeze([
   PAYLOAD_TYPE_SUBMISSION,
   PAYLOAD_TYPE_POLICY_FLOOR,
   PAYLOAD_TYPE_ORIGIN,
+  PAYLOAD_TYPE_PUBLICATION,
 ] as const);
 
-/** Check a dynamic value against the five supported record payload types. */
+/** Check a dynamic value against the six supported record payload types. */
 export function isDsseRecordPayloadType(value: unknown): value is DsseRecordPayloadType {
   return typeof value === 'string' && (DSSE_RECORD_PAYLOAD_TYPES as readonly string[]).includes(value);
 }
@@ -366,3 +369,12 @@ export const dsseSignOrigin = (payloadBytes: Buffer, signer: Pick<Signer, 'sign'
   dsseSignEnvelope(PAYLOAD_TYPE_ORIGIN, payloadBytes, signer);
 export const dsseVerifyOrigin = (envelope: unknown, signer: Pick<Signer, 'verify'>, opts?: { threshold?: number }) =>
   dsseVerifyEnvelope(envelope, PAYLOAD_TYPE_ORIGIN, signer, opts);
+
+/** Fixed publication record wrapper. */
+export const dsseSignPublication = (payloadBytes: Buffer, signer: Pick<Signer, 'sign'>) =>
+  dsseSignEnvelope(PAYLOAD_TYPE_PUBLICATION, payloadBytes, signer);
+export const dsseVerifyPublication = (
+  envelope: unknown,
+  signer: Pick<Signer, 'verify'>,
+  opts?: { threshold?: number },
+) => dsseVerifyEnvelope(envelope, PAYLOAD_TYPE_PUBLICATION, signer, opts);

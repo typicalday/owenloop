@@ -47,6 +47,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   rmSync,
   statSync,
@@ -340,6 +341,11 @@ export class PrincipalKeyManager {
     return join(this.keysDir(), `${keyRefHash(ref)}.backend`);
   }
 
+  /** A non-secret pointer that lets offline callers recover the principal ref. */
+  private refPointerPath(ref: PrincipalKeyRef): string {
+    return join(this.keysDir(), `${keyRefHash(ref)}.ref`);
+  }
+
   private readBackendOwner(ref: PrincipalKeyRef): KeyStorageBackendKind | null {
     const marker = this.backendMarkerPath(ref);
     if (!existsSync(marker)) return null;
@@ -569,10 +575,78 @@ export class PrincipalKeyManager {
     };
   }
 
+  /** Write the non-secret ref pointer with strict file permissions. */
+  private writeRefPointer(ref: PrincipalKeyRef): void {
+    writeFileAtomic(this.refPointerPath(ref), canonicalKeyRef(ref), { mode: 0o600 });
+    chmodSync(this.refPointerPath(ref), 0o600);
+  }
+
+  /**
+   * List valid non-secret principal-ref pointers. Malformed, symlinked, and
+   * mismatched entries are ignored so a stray file cannot block key discovery.
+   */
+  listRefs(): PrincipalKeyRef[] {
+    // Resolution is a read-only discovery operation. Do not create the key
+    // store merely because a signed publish is probing for a missing key.
+    const base = this.baseDir();
+    const baseStat = lstatSync(base, { throwIfNoEntry: false });
+    if (baseStat === undefined) return [];
+    if (baseStat.isSymbolicLink()) throw new CliError(`refusing to read under ${base}: it is a symbolic link`);
+    if (!baseStat.isDirectory()) throw new CliError(`refusing to read under ${base}: it is not a directory`);
+    const keys = this.keysDir();
+    const keysStat = lstatSync(keys, { throwIfNoEntry: false });
+    if (keysStat === undefined) return [];
+    if (keysStat.isSymbolicLink()) throw new CliError(`refusing to read under ${keys}: it is a symbolic link`);
+    if (!keysStat.isDirectory()) throw new CliError(`refusing to read under ${keys}: it is not a directory`);
+    const refs: PrincipalKeyRef[] = [];
+    for (const name of readdirSync(keys)) {
+      if (!name.endsWith('.ref')) continue;
+      const path = join(this.keysDir(), name);
+      try {
+        const st = lstatSync(path);
+        if (!st.isFile()) continue;
+        const raw: unknown = JSON.parse(readFileSync(path, 'utf8'));
+        if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+        const value = raw as Record<string, unknown>;
+        if (typeof value.origin !== 'string' || typeof value.kind !== 'string' || typeof value.id !== 'string') continue;
+        const ref = { origin: value.origin, kind: value.kind, id: value.id } as PrincipalKeyRef;
+        assertKeyRef(ref);
+        if (name !== `${keyRefHash(ref)}.ref` || JSON.stringify(raw) !== canonicalKeyRef(ref)) continue;
+        refs.push(ref);
+      } catch {
+        // A malformed pointer cannot identify a signing key; skip it.
+      }
+    }
+    refs.sort((a, b) => canonicalKeyRef(a).localeCompare(canonicalKeyRef(b)));
+    return refs;
+  }
+
+  /** Resolve one principal ref by origin and kind for offline signing. */
+  resolveRef(origin: string, kind: PrincipalKind): PrincipalKeyRef | null {
+    let normalized: string;
+    try {
+      normalized = normalizeOrigin(origin);
+    } catch {
+      throw new CliError('signing-key ref: origin must be a valid normalized http(s) origin');
+    }
+    if (kind !== 'human' && kind !== 'machine' && kind !== 'agent') {
+      throw new CliError(`signing-key ref: kind must be human, machine, or agent (got '${String(kind)}')`);
+    }
+    const matches = this.listRefs().filter((ref) => ref.origin === normalized && ref.kind === kind);
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      throw new CliError(
+        `multiple ${kind} signing-key refs found for ${normalized} — run owenloop setup to repair the key store`,
+      );
+    }
+    return matches[0]!;
+  }
+
   /**
    * Idempotently ensure a key exists for `ref`.
    *
-   * - Present key ⇒ `{ state: 'existing' }` (zero writes).
+   * - Present key ⇒ `{ state: 'existing' }` (zero key-record writes; the
+   *   non-secret ref pointer is backfilled when needed).
    * - `opts.reuse` on an ABSENT human key ⇒ validate the candidate SSH key
    *   (Ed25519 only) with a non-secret sign/verify challenge, then store only
    *   its canonical path + public key + fingerprint (`state: 'reused'`). The
@@ -602,6 +676,7 @@ export class PrincipalKeyManager {
               `the existing key is kept`,
           );
         }
+        this.writeRefPointer(ref);
         return {
           ref,
           state: 'existing',
@@ -613,9 +688,13 @@ export class PrincipalKeyManager {
         if (ref.kind !== 'human') {
           throw new CliError('explicit SSH key reuse applies only to the human principal key');
         }
-        return this.storeReused(ref, opts.reuse.path);
+        const result = this.storeReused(ref, opts.reuse.path);
+        this.writeRefPointer(ref);
+        return result;
       }
-      return this.generate(ref);
+      const result = this.generate(ref);
+      this.writeRefPointer(ref);
+      return result;
     } finally {
       if (lock !== null) releaseFileLock(lock);
     }

@@ -22,10 +22,10 @@ prints this usage and exits 0 without doing any work.
 
 Boolean flags (`--force`, `--dry-run`, `--all`, `--open`, `--terminal`,
 `--recursive`, `--with-token`, `--shallow`, `--assume-provided`,
-`--strict-inputs`, and the bare `--now` on `reap`) never take a following
-value — the next token is always a positional or the next `--flag`, never
-consumed as this flag's argument. Use `--flag=value` (e.g. `--now=<ms>` on
-`tick`) for flags that do take a value.
+`--strict-inputs`, `--unsigned`, and the bare `--now` on `reap`) never take a
+following value — the next token is always a positional or the next `--flag`,
+never consumed as this flag's argument. Use `--flag=value` (e.g. `--now=<ms>`
+on `tick`) for flags that do take a value.
 
 `owenloop check <def>` defaults to treating `seedOwed` inputs as provided
 (`assumeProvided: true`), so a def whose only initial gate is an unprovided
@@ -53,6 +53,7 @@ for the full breakdown.
 | `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
+| `publish <source-dir> [--output <bundle.wnlp>] [--unsigned]` | pack a canonical workflow bundle and publish a signed or explicitly unsigned sidecar |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--shift` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
 | `capability bind <capability> <crew> [--hub <url>]` | add a crew to a workflow capability on the hub org — a capability may route to many crews (admin; human credential) — see [Capability routes](#capability-routes) |
@@ -946,6 +947,41 @@ def isn't round-trippable. A def using `bodyFile:` is refused the same way
 (`uses bodyFile:, not hub-pushable`) — there's no checkout `baseDir` to
 resolve the external file against once the YAML leaves this machine. Inline
 both before pushing.
+
+### `publish` — pack and publish a workflow bundle
+
+```text
+owenloop publish <source-dir> [--output <bundle.wnlp>] [--unsigned]
+```
+
+`publish` is separate from both [`bundle pack`](#bundles) and [`push`](#push--publish-local-defs-to-the-bound-hub). It packs one source directory with the same deterministic `packBundle` implementation as `bundle pack`, then publishes the bundle beside a local publication sidecar. The command requires the project to be bound with `owenloop connect`, because the binding supplies the hub origin used to select the local author key.
+
+Signed publication is the default. In signed mode, `publish` requires the human principal signing key for the bound hub. Run `owenloop setup` before the first signed publication. Older key stores that already contain the key are repaired by that setup run: `ensure` writes the non-secret `<hash>.ref` pointer on its existing-key branch without regenerating or replacing the private key. If no author key is discoverable, `publish` fails and suggests `owenloop setup` or the explicit unsigned mode; the command does not silently downgrade to unsigned output.
+
+The signer is probed and the publication record is signed before the bundle or either sidecar is written. The signature covers a DSSE publication record whose `digest` is the lowercase SHA-256 digest of the uncompressed canonical tar inside the `.wnlp` file. The remote hub is not involved in this local signing operation and never produces or completes the signature.
+
+`--unsigned` is an explicit opt-in. Unsigned mode still packs the canonical bundle, but writes an unauthenticated author-intent marker rather than a DSSE envelope. Anyone can write such a marker; consumers must treat missing or unverifiable signatures as unsigned regardless of whether the marker is present. The two sidecars are mutually exclusive:
+
+- signed mode writes `<output>.wnlp.dsse` and removes a stale `<output>.wnlp.unsigned`;
+- `--unsigned` writes `<output>.wnlp.unsigned` and removes a stale `<output>.wnlp.dsse`.
+
+The output defaults to `<package-name>-<version>.wnlp` next to the source directory. `--output` must name a path outside the source directory. Existing regular output and sidecar files may be replaced; directories and other non-regular paths are rejected.
+
+Successful invocations print exactly one machine-readable JSON object to stdout. Signed output has this shape:
+
+```json
+{
+  "ok": true,
+  "bundle": "/absolute/path/report-1.2.0.wnlp",
+  "digest": "<64 lowercase hex characters>",
+  "name": "report",
+  "version": "1.2.0",
+  "signed": true,
+  "envelope": "/absolute/path/report-1.2.0.wnlp.dsse"
+}
+```
+
+Unsigned output has the same `ok`, `bundle`, `digest`, `name`, and `version` fields, with `"signed": false` and `"marker": "/absolute/path/report-1.2.0.wnlp.unsigned"` instead of `envelope`. Diagnostics and failures go to stderr and exit nonzero. `bundle pack` and `push` are unchanged by this command.
 
 Exact-match redirect URIs (no RFC 8252 variable-port allowance) and no
 device-code grant remain recorded follow-ups on the service, not gaps in the

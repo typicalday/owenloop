@@ -272,7 +272,7 @@ export interface FakePrincipalKeysOpts {
  * pass `principalKeys: 'real'` to `makeIo` to run the real manager instead.
  */
 export function makeFakePrincipalKeys(opts: FakePrincipalKeysOpts = {}): {
-  manager: Pick<PrincipalKeyManager, 'ensure'>;
+  manager: Pick<PrincipalKeyManager, 'ensure' | 'withSigningKey' | 'resolveRef'>;
   calls: { ref: PrincipalKeyRef; reuse?: { path: string }; result?: EnsureKeyResult }[];
   state: Map<string, { ref: PrincipalKeyRef; state: 'created' | 'existing' | 'reused'; backend: string }>;
 } {
@@ -310,6 +310,17 @@ export function makeFakePrincipalKeys(opts: FakePrincipalKeysOpts = {}): {
       entry.result = { ref, state: rec.state, backend: rec.backend as EnsureKeyResult['backend'], publicKey: FAKE_KEY_PUBLIC };
       return entry.result;
     },
+    resolveRef(origin: string, kind: PrincipalKeyRef['kind']): PrincipalKeyRef | null {
+      const matches = [...state.values()].filter((entry) => entry.ref.origin === origin && entry.ref.kind === kind);
+      if (matches.length > 1) throw new Error(`multiple ${kind} signing-key refs found for ${origin}`);
+      return matches[0]?.ref ?? null;
+    },
+    async withSigningKey<T>(ref: PrincipalKeyRef, _callback: (keyPath: string) => Promise<T>): Promise<T> {
+      if (!state.has(canonicalKeyRef(ref))) {
+        throw new Error(`no ${ref.kind} signing key stored for ${ref.origin} — run owenloop setup`);
+      }
+      throw new Error('fake signing-key manager cannot materialize private key bytes');
+    },
   };
   return { manager, calls, state };
 }
@@ -337,7 +348,7 @@ export interface MakeIoOpts {
    * `PrincipalKeyManager` (only for tests that deliberately exercise it with a
    * fixture $HOME).
    */
-  principalKeys?: Pick<PrincipalKeyManager, 'ensure'> | 'real';
+  principalKeys?: Pick<PrincipalKeyManager, 'ensure' | 'withSigningKey' | 'resolveRef'> | 'real';
 }
 
 export function makeIo(opts: MakeIoOpts = {}): HubIo & {

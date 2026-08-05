@@ -114,6 +114,30 @@ private key and nothing more: a generated key materializes as a `0600` file in
 a unique `0700` temp dir and is removed in `finally`; a reused key passes only
 its canonical path. No API returns private-key text.
 
+### Publish-time signing
+
+`owenloop publish` signs locally with the human principal key selected by the
+project's bound hub origin. The signing chain is deliberately narrow:
+
+1. `resolveRef(origin, 'human')` discovers the non-secret principal reference
+   from the local `<hash>.ref` pointer.
+2. `ensure(ref)` confirms the stored key and returns only its public descriptor,
+   including the `publisherKeyId` fingerprint. During setup, an older key
+   record created before ref pointers existed is backfilled without changing
+   the existing key.
+3. `withSigningKey(ref, callback)` materializes the private key only for the
+   callback's controlled lifetime.
+4. `createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath })` probes and
+   constructs the stock-OpenSSH signer.
+5. `dsseSignPublication(payloadBytes, signer)` signs the canonical JSON bytes of
+   the publication record under `application/vnd.owenloop.publication.v1+json`.
+
+The publication record's `digest` is the 64-hex SHA-256 digest of the
+uncompressed canonical tar returned by `packBundle`. The signer is constructed
+and the record is signed before `publish` writes the `.wnlp` bundle or either
+sidecar. The hub is only a remote coordinator recorded by the project binding;
+the hub signs nothing and cannot produce or complete the author signature.
+
 ### Reusing an existing SSH key (human only)
 
 `setup --reuse-ssh-key <path>` records the operator's own Ed25519 key for the
@@ -150,8 +174,9 @@ malformed input rejected — because Node's built-in decoder is permissive.
 SSHSIG signs and verifies this encoding under the namespace
 `owenloop-dsse-v1` (`DSSE_SSH_NAMESPACE`).
 
-Exactly five record classes are supported, each bound to one versioned
-payload-type constant:
+Exactly six launch payload types are supported by the DSSE framing. Five are
+bound record classes in this package; the origin type remains reserved for the
+origin work package and is not included in this package's record schemas:
 
 | constant | value |
 |---|---|
@@ -159,14 +184,16 @@ payload-type constant:
 | `PAYLOAD_TYPE_REVOCATION` | `application/vnd.owenloop.revocation.v1+json` |
 | `PAYLOAD_TYPE_SUBMISSION` | `application/vnd.owenloop.submission.v1+json` |
 | `PAYLOAD_TYPE_POLICY_FLOOR` | `application/vnd.owenloop.policy-floor.v1+json` |
-| `PAYLOAD_TYPE_ORIGIN` | `application/vnd.owenloop.origin.v1+json` |
+| `PAYLOAD_TYPE_ORIGIN` | `application/vnd.owenloop.origin.v1+json` (reserved) |
+| `PAYLOAD_TYPE_PUBLICATION` | `application/vnd.owenloop.publication.v1+json` |
 
 `DSSE_RECORD_PAYLOAD_TYPES` is the frozen, exported runtime allow-list, and
 `isDsseRecordPayloadType` is the exported guard. The generic
 `dsseSignRecord` and `dsseVerifyRecord` wrappers apply that allow-list at
 runtime: an arbitrary payload-type string, including an empty string or a
 v2/attacker value, is rejected rather than accepted only by the TypeScript
-union. The five fixed record wrappers use their own constants.
+union. The six fixed wrappers use their own constants; the publication wrapper
+is `dsseSignPublication` / `dsseVerifyPublication`.
 
 `dsseVerifyEnvelope` runs a fixed order — Base64 decode → PAE → signature
 verification → payload-type check — and returns the payload bytes **exactly**.
@@ -180,7 +207,7 @@ a `threshold` option requires that many distinct signers.
 
 The record shapes that ride these DSSE envelopes are documented in
 [`docs/wire-contracts.md`](wire-contracts.md). That document is the public
-reference for the five launch contracts, their schemas, and the versioning
+reference for the six launch contracts, their schemas, and the versioning
 rule.
 
 ## The role of `allowed_signers`
@@ -223,6 +250,10 @@ literal surrounding quotes where stock OpenSSH strips them. These fields are
 structural output only; OpenSSH remains the authorization authority.
 
 ## Out of scope (future work)
+
+Publish-time author-side DSSE signing is implemented by `owenloop publish`.
+Consumer-side verification, transport relay, and the following extensions remain
+out of scope:
 
 - Key **rotation** and revocation wiring for stored principal keys.
 - Certificate (`cert-authority`) chains and hardware-backed signing flows.

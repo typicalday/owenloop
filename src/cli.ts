@@ -32,7 +32,7 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -73,6 +73,9 @@ import {
 } from './credentials.ts';
 import { PrincipalKeyManager } from './crypto/keys.ts';
 import type { PrincipalKeyRef } from './crypto/keys.ts';
+import { DSSE_SSH_NAMESPACE, dsseSignPublication } from './crypto/dsse.ts';
+import { createSshSigner } from './crypto/ssh.ts';
+import type { PublicationRecord } from './crypto/records.ts';
 import { runMcpCommand } from './mcp/serve.ts';
 import type { LineStream } from './mcp/server.ts';
 import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
@@ -158,7 +161,7 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { owenloopSettingsPath, readOwenloopSettingsRaw, writeOwenloopHubOrigin } from './work-settings.ts';
-import { defaultRecoveryMarkerDir, ensureDirectoryPathNoSymlink, guardStateFile } from './install.ts';
+import { canonicalJsonBytes, defaultRecoveryMarkerDir, ensureDirectoryPathNoSymlink, guardStateFile } from './install.ts';
 
 // Re-export the keychain backend type so existing test imports of `Keychain`
 // from `../src/cli.ts` (test/hubkit.ts, test/login.test.ts) keep resolving —
@@ -231,10 +234,11 @@ export interface CliIO {
    * Injectable so setup tests never reach the developer's real `ssh-keygen`,
    * Keychain, libsecret, SSH agent, or `$HOME` (`makeFakePrincipalKeys` in
    * test/hubkit.ts). Default: a real `PrincipalKeyManager` over `io.env`.
-   * Structurally `Pick<PrincipalKeyManager, 'ensure'>` — the narrow surface
-   * setup uses — so fakes stay trivial.
+   * Structurally `Pick<PrincipalKeyManager, 'ensure' | 'withSigningKey' |
+   * 'resolveRef'>` — the narrow surface setup and publish use — so fakes stay
+   * hermetic.
    */
-  principalKeys?: Pick<PrincipalKeyManager, 'ensure'>;
+  principalKeys?: Pick<PrincipalKeyManager, 'ensure' | 'withSigningKey' | 'resolveRef'>;
 }
 
 function defaultIO(): CliIO {
@@ -329,6 +333,7 @@ const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   // `add --global` (and `add --global --recover`) is likewise value-less: the
   // bundle path/URL must stay a positional.
   'global',
+  'unsigned',
 ]);
 
 function parseArgs(argv: string[]): Args {
@@ -679,6 +684,135 @@ function dispatchBundle(io: CliIO, args: Args): number {
   }
 }
 
+/** `--output` requires a following value; a bare flag is not a default path. */
+function publishOutput(args: Args): string | undefined {
+  const value = last(args, 'output');
+  if (value === 'true') throw new CliError('owenloop publish: --output requires a path value');
+  return value;
+}
+
+/** Refuse an output or sidecar path that is not absent or a regular file. */
+function assertPublishOutputPath(path: string, label: string): void {
+  const existing = lstatSync(path, { throwIfNoEntry: false });
+  if (existing !== undefined && !existing.isFile()) {
+    throw new CliError(`owenloop publish: ${label} '${path}' exists and is not a regular file`);
+  }
+}
+
+/** Remove one regular publication sidecar after its replacement is durable. */
+function removePublicationSidecar(path: string): void {
+  if (lstatSync(path, { throwIfNoEntry: false }) === undefined) return;
+  try {
+    unlinkSync(path);
+  } catch (e) {
+    throw new CliError(`owenloop publish: cannot remove stale sidecar '${path}': ${(e as Error).message}`);
+  }
+}
+
+/**
+ * `owenloop publish <source-dir>` — pack one canonical workflow bundle and
+ * publish a signed DSSE statement beside it. Signed publication is the default;
+ * `--unsigned` writes an unauthenticated intent marker instead. The signed path
+ * resolves and probes the author key before `packBundle`, so key or signer
+ * failures leave no bundle or sidecar behind. This command is deliberately
+ * separate from `bundle pack` and `push`: it is asynchronous only because local
+ * key material is materialized through the signing-key manager.
+ */
+async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
+  if (args.positionals.length !== 2) {
+    throw new CliError('invalid publish arguments; usage: owenloop publish <source-dir> [--output <bundle.wnlp>] [--unsigned]');
+  }
+  const source = need(args, 1, 'source-dir');
+  const sourceAbs = resolve(io.cwd, source);
+  const outputOpt = publishOutput(args);
+  if (outputOpt !== undefined) assertOutputOutsideSource(resolve(io.cwd, outputOpt), sourceAbs);
+
+  const binding = readHubBinding(hubBindingPath(io.cwd));
+  if (!binding) throw new CliError('this project is not bound to a hub — run `owenloop connect` first');
+  let origin: string;
+  try {
+    origin = normalizeOrigin(binding.hub);
+  } catch (e) {
+    throw new CliError(`${(e as Error).message} — re-run \`owenloop connect\` to rebind`);
+  }
+
+  const unsigned = flag(args, 'unsigned');
+  const keys = io.principalKeys ?? new PrincipalKeyManager({ env: io.env });
+  let packed: ReturnType<typeof packBundle>;
+  let envelope: unknown;
+
+  if (unsigned) {
+    packed = runBundle(() => packBundle(sourceAbs));
+  } else {
+    const ref = keys.resolveRef(origin, 'human');
+    if (ref === null) {
+      throw new CliError(`no author signing key for ${origin} — run \`owenloop setup\` or pass --unsigned`);
+    }
+    // `ensure` is non-secret and returns the public descriptor needed for the
+    // publication record. It also repairs a pointer/record pair created before
+    // the pointer migration, while `withSigningKey` remains the only API that
+    // materializes private bytes.
+    const ensured = await keys.ensure(ref);
+    const signed = await keys.withSigningKey(ref, async (keyPath) => {
+      // Constructing the signer probes ssh-keygen -Y before packBundle runs.
+      const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: keyPath });
+      const nextPacked = runBundle(() => packBundle(sourceAbs));
+      const record: PublicationRecord = {
+        digest: nextPacked.digest,
+        name: nextPacked.manifest.package.name,
+        version: nextPacked.manifest.package.version,
+        publisherKeyId: ensured.publicKey.keyid,
+        timestamp: nowMs(),
+      };
+      const payloadBytes = Buffer.from(canonicalJsonBytes(record));
+      const result = await dsseSignPublication(payloadBytes, signer);
+      return { envelope: result.envelope, packed: nextPacked };
+    });
+    packed = signed.packed;
+    envelope = signed.envelope;
+  }
+
+  const outputAbs = resolve(
+    io.cwd,
+    outputOpt ?? defaultPackOutput(sourceAbs, packed.manifest.package.name, packed.manifest.package.version),
+  );
+  assertOutputOutsideSource(outputAbs, sourceAbs);
+  const envelopePath = `${outputAbs}.dsse`;
+  const markerPath = `${outputAbs}.unsigned`;
+  assertPublishOutputPath(outputAbs, 'output');
+  assertPublishOutputPath(envelopePath, 'sidecar');
+  assertPublishOutputPath(markerPath, 'sidecar');
+
+  writeBundleFileAtomic(outputAbs, packed.bytes, 'owenloop publish');
+  if (unsigned) {
+    const marker = { formatVersion: 1, digest: packed.digest, signed: false };
+    writeBundleFileAtomic(markerPath, canonicalJsonBytes(marker), 'owenloop publish');
+    removePublicationSidecar(envelopePath);
+    print(io, {
+      ok: true,
+      bundle: outputAbs,
+      digest: packed.digest,
+      name: packed.manifest.package.name,
+      version: packed.manifest.package.version,
+      signed: false,
+      marker: markerPath,
+    });
+  } else {
+    writeBundleFileAtomic(envelopePath, canonicalJsonBytes(envelope), 'owenloop publish');
+    removePublicationSidecar(markerPath);
+    print(io, {
+      ok: true,
+      bundle: outputAbs,
+      digest: packed.digest,
+      name: packed.manifest.package.name,
+      version: packed.manifest.package.version,
+      signed: true,
+      envelope: envelopePath,
+    });
+  }
+  return 0;
+}
+
 /** Default pack output: `<package-name>-<version>.wnlp` next to the source directory. */
 function defaultPackOutput(sourceAbs: string, name: string, version: string): string {
   return join(dirname(sourceAbs), `${name}-${version}.wnlp`);
@@ -719,7 +853,7 @@ function runBundle<T>(fn: () => T): T {
  * directory, then rename the temporary file over the destination. Temporary
  * state is cleaned on every failure and after success.
  */
-function writeBundleFileAtomic(outputAbs: string, bytes: Uint8Array): void {
+function writeBundleFileAtomic(outputAbs: string, bytes: Uint8Array, operation = 'owenloop bundle pack'): void {
   let tempDir: string | undefined;
   try {
     tempDir = mkdtempSync(join(dirname(outputAbs), '.owenloop-pack-'));
@@ -727,7 +861,7 @@ function writeBundleFileAtomic(outputAbs: string, bytes: Uint8Array): void {
     writeFileSync(tmp, bytes, { mode: 0o644, flag: 'wx' });
     renameSync(tmp, outputAbs);
   } catch (e) {
-    throw new CliError(`owenloop bundle pack: cannot write output: ${(e as Error).message}`);
+    throw new CliError(`${operation}: cannot write output: ${(e as Error).message}`);
   } finally {
     if (tempDir !== undefined) rmSync(tempDir, { recursive: true, force: true });
   }
@@ -761,6 +895,8 @@ Commands:
   bundle unpack <bundle.wnlp> <destination-dir>       unpack a .wnlp bundle into a new directory
   bundle inspect <bundle.wnlp>           strictly validate a .wnlp bundle and print its manifest/entries
   bundle digest <bundle.wnlp>            print the bundle's def digest (SHA-256 of the canonical tar)
+  publish <source-dir> [--output <bundle.wnlp>] [--unsigned]
+                                         pack a bundle and sign its canonical digest (signed by default)
   login [--hub <url>] [--with-token] [--as <slot>]   authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
   logout [--hub <url>] [--as <slot>]     delete the stored credential for a hub in one slot
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
@@ -854,6 +990,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['login', cmdOpts('hub', 'with-token', 'as')],
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
+  ['publish', cmdOpts('unsigned', 'output')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
@@ -4790,7 +4927,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'push', 'agent', 'capability', 'crew', 'setup', 'doctor', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'push', 'agent', 'capability', 'crew', 'setup', 'doctor', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -4828,6 +4965,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchLogout(io, args);
       case 'connect':
         return await dispatchConnect(io, args);
+      case 'publish':
+        return await dispatchPublish(io, args);
       case 'push':
         return await dispatchPush(io, args);
       case 'agent':
