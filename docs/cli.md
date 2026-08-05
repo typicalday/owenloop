@@ -44,7 +44,8 @@ for the full breakdown.
 |---|---|
 | `defs` | list available workflow definitions |
 | `add <owner>/<repo>[@ref]` | fetch, validate, and install a repo's workflow defs from GitHub (public repos only) — see below |
-| `add --recover` | finish or undo a crash-interrupted install, offline — no network call — see below |
+| `add <bundle.wnlp \| https://url> [--global]` | install a workflow bundle into the content-addressed store — project store under the defs dir by default, `<home>/.owenloop/workflows` with `--global` — see below |
+| `add --recover [--global]` | finish or undo a crash-interrupted install, offline — no network call (`--global` recovers the global store) — see below |
 | `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
@@ -471,7 +472,208 @@ refuses the whole install (nothing written) on any of these:
   buffered into memory (the extraction limits above still re-check the size once
   the bytes are in hand).
 - **Request timeouts.** The sha-resolve fetch times out after 30s and the
-  tarball download after 5 min, each surfacing as a friendly error.
+  tarball download after 5 min, each surfacing as a friendly error. The
+  bundle route applies the same 256 MiB cap and 5 min timeout to its file
+  read and URL fetch (see the next section).
+
+## `add` with bundles — the content-addressed workflow store
+
+`owenloop add <owner>/<repo>[@ref]` (the previous section) installs
+GitHub repos by name into `<defsDir>/<owner>-<repo>-<hash>/`. The **bundle**
+route is a separate, content-addressed installation path for `.wnlp` workflow
+bundles:
+
+```text
+owenloop add widget.wnlp                 # install into the PROJECT store
+owenloop add ./packs/widget.wnlp --global   # install into the GLOBAL store
+owenloop add https://example.com/widget.wnlp
+owenloop add --recover [--global]        # offline crash recovery (per root)
+```
+
+The source is classified before anything else: `owner/repo[@ref]` keeps the
+GitHub route byte-for-byte unchanged; a path ending in `.wnlp` is a bundle
+file; an `http:`/`https:` URL is a bundle URL. Any other URL scheme
+(`ftp:`, `file:`, …) is refused — never a silent fallback. `--global` applies
+only to `.wnlp` bundle sources; a GitHub source with `--global` is refused
+before any network request. The source string is origin data only (diagnostics
+and messages); it is never joined into a filesystem path and never part of a
+bundle's identity. Identity comes from the bundle's own
+`namespace/name@version` coordinate and its canonical content digest.
+
+**The `.wnlp` route requires two adapters and fails closed without them.**
+Bundle ingestion (unpacking, manifest integrity, canonical digest,
+coordinate) and pre-commit verification are separate modules with no
+permissive fallback: with either adapter missing, `add` refuses with a named
+error *before* any staging, journal, or index write. There is no default
+accepting parser, digest algorithm, or verifier. Publishing from this engine
+does not sign a bundle.
+
+### The two store roots
+
+A store root holds exactly this layout:
+
+```text
+<root>/
+  index.json                       # coordinate → {digest, pinned} index
+  objects/
+    sha256/
+      <64-hex-content-digest>/     # one immutable object per digest
+        …                          # the bundle's files
+  .owenloop/                       # per-root lock + crash journal
+    add.lock
+    add.journal
+  .owenloop-staging/               # transient staging (cleared on exit)
+```
+
+- **Project store root** = the resolved defs directory itself (`--defs`,
+  `OWENLOOP_DEFS`, or `./workflows`). The project's pins are reviewable in
+  git there, and the nested `objects/sha256/<digest>/` layout stays below
+  the def loader's scan depth.
+- **Global store root** = `<home>/.owenloop/workflows`. `--global` selects it;
+  it cannot be combined with `--defs` (the global store has a fixed
+  home-directory location, so an override would only create ambiguity —
+  refused with a clear message). The global root is never used by the
+  GitHub route.
+
+**Injected home requirement.** `<home>` is the first non-blank value from the
+caller-injected `HOME` and `USERPROFILE` environment variables (`HOME` wins).
+The `.wnlp` bundle route uses the same injected home for its default external
+recovery-marker directory, `<home>/.owenloop/recovery-markers`, even when the
+bundle targets the project store. If neither variable is supplied, bundle
+installation refuses before any object or index commit; it never falls back to
+the process user's ambient home. `add --recover --global` has the same
+requirement. Project recovery of a v2 fresh-install journal also refuses when
+its recovery marker requires a home and neither variable is supplied.
+
+Every object path derives ONLY from its validated digest (lowercase 64-hex).
+Coordinates, source strings, and version text never join into a path.
+
+### What an install does, in order
+
+1. Read the bundle bytes (file or URL) *before* taking the lock — a slow
+   download never holds the project lock. A local `.wnlp` must be a bounded
+   regular file: missing, symlinked, non-regular, or over the 256 MiB cap
+   (checked before *and* after the read) is refused naming the path as
+   given. A URL fetch uses the same 5 min timeout, refuses redirects
+   (`redirect: 'error'`) instead of following them silently, and streams
+   through the same bounded reader.
+2. Acquire the canonical root lock at `<root>/.owenloop/add.lock`. A GitHub
+   install also retains its legacy cwd-derived lock for compatibility and, when
+   the resolved `--defs` root differs from that cwd, acquires both locks in a
+   fixed order. The canonical lock makes bundle installs from different cwd
+   values serialize when they target one shared `--defs` root; the additional
+   GitHub lock keeps the legacy route compatible.
+3. Recover a prior interrupted install (before clearing staging — the
+   backups a rollback needs live under the staging root).
+4. Reread and validate the index **inside** the lock (a corrupt index is a
+   hard error, never a silent reset).
+5. Ingest via the bundle adapter: unpack into staging, check manifest
+   integrity, compute the canonical digest, extract the full coordinate. A
+   tampered or malformed bundle stops here — staging debris only, nothing
+   committed.
+6. Validate the staged tree with the engine's strict pass — the exact bytes
+   that will be committed (parse/lint/validate/bounded `check` + the strict
+   cross-def backstop). Any problem refuses the whole install and prints
+   every reason.
+7. Run the pre-commit verifier (after content validation, before any swap or
+   index write). A rejection commits nothing.
+8. Write the `applying` crash journal (v2 — its commit-point evidence is the
+   hash of the post-install index bytes).
+9. Atomically swap the staged object into `objects/sha256/<digest>`
+   (retaining any displaced content on the commit handle), then harden it
+   in place: files read-only (`0o444`), directories non-writable (`0o555`).
+   Hardening is defense in depth, not the integrity proof — verification is.
+   A hardening failure rolls the swap back; a partially hardened object is
+   never committed. If the digest's object already exists, the install
+   verifies the existing object through the ingest adapter and commits an
+   index-only change instead (dedupe) — a corrupt existing object is a hard
+   integrity error, never replaced and never fallen through.
+10. Atomically write `index.json` — the **durable commit point**. Past here
+    a crash rolls forward; before it, everything rolls back. An index-write
+    failure rolls the directory state back and leaves the previous object
+    and index exactly as they were.
+11. Advance the journal to `finalizing`, discard the retained backup and
+    staging, remove the journal, release the lock.
+
+On success `add` prints the structured result:
+
+```jsonc
+{
+  "ok": true,
+  "source": "widget.wnlp",              // or the URL
+  "level": "project",                    // or "global"
+  "coordinate": "acme/widget@1.0.0",
+  "digest": "<64-hex>",
+  "objectPath": "<root>/objects/sha256/<64-hex>",
+  "installed": true                      // false when deduplicated
+}
+```
+
+**Conflict and re-install.** An existing coordinate at a DIFFERENT digest is
+a conflict error — no implicit retarget; the original digest is retained and
+nothing is written. An existing coordinate at the SAME digest deduplicates
+(`installed: false`), verifying the existing object before trusting it.
+
+**Crash recovery** is the same two-phase discipline as the GitHub route,
+generalized: the v2 journal's commit-point test compares the hash of the
+current `index.json` bytes against the journal's recorded metadata hash
+(route-neutral — no GitHub ledger involved). A fresh v2 install also writes a
+single-use external recovery marker under the user's recovery-marker directory
+(default `<home>/.owenloop/recovery-markers`, derived from the injected home
+described above) before the applying journal. If a crash leaves the destination
+present with no staging or backup, recovery
+discards that destination only when the marker exactly matches the store root,
+destination segments, staging id, and `hadDest: false`; a missing or mismatched
+marker refuses and preserves the destination and journal. `add --recover --global`
+runs the store's recovery standalone against the global root with no network
+and prints `{"ok":true,"recovered":false|true,"outcome":…}` exactly
+like the project variant. A v1 (GitHub-schema) journal found at the global root
+is refused fail-closed — there is no ledger there to vouch for it — and a
+journal recorded against a *different* store root is refused rather than
+trusting its absolute path. Refusals leave the journal in place as evidence.
+
+### Resolving what is installed — two separate APIs
+
+Resolution is deliberately split so execution code cannot accidentally call
+human-name resolution. Both are library APIs (exported from the package
+root); every successful resolution verifies the object through the ingest
+adapter before returning a path — permissions and object shape on disk are
+defense in depth, not an integrity proof.
+
+- **Digest resolution (execution).** `resolveWorkflowDigest({digest,
+  projectRoot?, globalRoot, verifier})` — digest only; no index and no
+  workflow name participate. The project object path is tested first when a
+  project root exists; an ABSENT project object may fall through to global,
+  but a PRESENT project object that fails its type probe or verification is
+  a hard integrity error — project tampering is never hidden by falling back
+  to a valid global copy. When both levels hold the same digest, ONE result
+  comes back (level `project`, with presence metadata), not two candidates.
+  Absent at both levels ⇒ `object-missing` integrity error.
+- **Coordinate resolution (human/CLI).** `resolveWorkflowCoordinate({coordinate,
+  projectRoot?, globalRoot, verifier})` reads BOTH indexes, fail-closed (a
+  corrupt index is a hard error, never silently empty). No entry at either
+  level ⇒ a structured **not-found** error. The SAME digest at both levels
+  deduplicates to one result (project path wins). DIFFERENT digests at the
+  two levels ⇒ a structured **ambiguity** error carrying the coordinate and
+  both digests — resolution never silently picks the project copy. An index
+  entry whose object is missing or corrupt is an integrity error, never a
+  returned path.
+
+Store roots and object directories are probed with `lstat`, never `stat`:
+a symlink or non-directory squatting at a root, an index path, or an object
+path is refused outright, and reads never follow a link outside the
+intended tree.
+
+**GitHub-route compatibility.** The bundle route changes nothing about
+`add <owner>/<repo>[@ref]`: the same inputs reach the same parser, the
+`<owner>-<repo>-<hash>` namespace is untouched, `.owenloop/installed.json`
+keeps its schema and validation, and an explicit `--defs`/`OWENLOOP_DEFS`
+still installs through a symlinked defs dir (operator intent). The routes
+share the canonical resolved-store lock, while the GitHub route retains its
+legacy cwd-derived lock and journal for compatibility. Recovery checks both
+journal locations and dispatches by journal version; a v2 store journal uses
+`index.json` metadata and a v1 GitHub journal uses `installed.json` ledger
+corroboration.
 
 ## Hub (`login` / `connect` / `push` / `logout`)
 

@@ -2391,3 +2391,25 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
 
   return report;
 }
+
+/**
+ * The single "definite defect" predicate over a modelCheck `report`, shared by
+ * every acceptance gate that accepts or rejects a def (`check`, `add`'s GitHub
+ * route, `add`'s workflow-bundle route, `push`). A pure function of the report
+ * object — it does NOT read or change how any caller seeded its modelCheck
+ * (install/push seed `assumeProvided: true`; check seeds
+ * `assumeProvided: !strictInputs`).
+ *
+ * invariant violations and structurally-dead steps are ALWAYS definite (sound
+ * regardless of bounds); a true deadlock counts ONLY when the search was
+ * exhaustive (`!bounded`) because a tight maxCollectionSize cap can manufacture
+ * a spurious one. `unreachedSteps` is deliberately EXCLUDED — it is a bounds
+ * artifact ("raise --max-states/--max-depth"), never a definite defect.
+ */
+export function hasDefiniteCheckDefect(report: CheckReport): boolean {
+  return (
+    report.invariantViolations.length > 0 ||
+    report.structurallyDeadSteps.length > 0 ||
+    (!report.bounded && report.deadlocks.length > 0)
+  );
+}

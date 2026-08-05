@@ -9,6 +9,12 @@
  *      vocabulary (concrete model or provider names);
  *   C. `hashDefForHub` has been re-homed out of `src/defs.ts` for good.
  *
+ * The generic filesystem transaction (`src/install.ts`) and every module in
+ * the content-addressed workflow store (all files below `src/store/`) are
+ * engine core too: they may import Node builtins and defs/model/util helpers,
+ * but never `cli.ts`, `add.ts`, `untar.ts`, or a hub module — the CLI depends
+ * inward on the store's ports, never the reverse.
+ *
  * Hermetic: reads only the repo's own `src/` tree, resolved relative to this
  * file (`import.meta.url`) so it is cwd-independent and touches no ambient
  * machine state.
@@ -16,7 +22,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const SRC_DIR = new URL('../src/', import.meta.url);
@@ -38,14 +44,32 @@ function readCore(file: string): string[] {
   return readFileSync(fileURLToPath(new URL(file, SRC_DIR)), 'utf8').split('\n');
 }
 
+/** Recursively list every `.ts` file under `src/store/` (engine core). */
+function listStoreFiles(relDir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(fileURLToPath(new URL(relDir, SRC_DIR)), { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      out.push(...listStoreFiles(`${relDir}${entry.name}/`));
+    } else if (entry.isFile() && entry.name.endsWith('.ts')) {
+      out.push(`${relDir}${entry.name}`);
+    }
+  }
+  return out;
+}
+
+/** Core + the generic transaction + every workflow-store module. */
+const CORE_ALL = [...CORE, 'install.ts', ...listStoreFiles('store/')];
+
 // ---- Check A: import boundary ------------------------------------------------
 
 test('boundary A: no engine-core module imports a hub/CLI module', () => {
   // Catches every coupling form: `import {..} from './hub.ts'`, `import type ..
-  // from`, `export .. from`, and a bare side-effect `import './hub.ts'`.
-  const HUB_IMPORT = /(?:from|import)\s+['"]\.\/(hub|cli|add|untar)\.ts['"]/;
+  // from`, `export .. from`, and a bare side-effect `import './hub.ts'`. The
+  // `(../)*` prefix covers store modules one level down (`../add.ts`) so a
+  // relative-depth change cannot smuggle a hub/CLI import past the check.
+  const HUB_IMPORT = /(?:from|import)\s+['"](?:(?:\.\.\/)+|\.\/)(hub|cli|add|untar)\.ts['"]/;
   const violations: string[] = [];
-  for (const file of CORE) {
+  for (const file of CORE_ALL) {
     const lines = readCore(file);
     lines.forEach((line, i) => {
       const m = line.match(HUB_IMPORT);
@@ -53,6 +77,14 @@ test('boundary A: no engine-core module imports a hub/CLI module', () => {
     });
   }
   assert.equal(violations.length, 0, `core→hub/CLI import boundary violated:\n${violations.join('\n')}`);
+});
+
+test('boundary A regression: nested relative imports are recognized', () => {
+  const HUB_IMPORT = /(?:from|import)\s+['"](?:(?:\.\.\/)+|\.\/)(hub|cli|add|untar)\.ts['"]/;
+  assert.match("from './add.ts'", HUB_IMPORT);
+  assert.match("from '../add.ts'", HUB_IMPORT);
+  assert.match("from '../../untar.ts'", HUB_IMPORT);
+  assert.match("import './cli.ts'", HUB_IMPORT);
 });
 
 test('boundary A: index.ts (public barrel) never couples to cli.ts', () => {
@@ -87,7 +119,7 @@ const BANNED_TERMS: RegExp[] = [
 
 test('boundary B: engine-core carries no vendor/host-specific vocabulary', () => {
   const violations: string[] = [];
-  for (const file of [...CORE, 'index.ts']) {
+  for (const file of [...CORE_ALL, 'index.ts']) {
     const lines = readCore(file);
     lines.forEach((line, i) => {
       for (const term of BANNED_TERMS) {

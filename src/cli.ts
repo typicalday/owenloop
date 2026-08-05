@@ -32,8 +32,8 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { basename, delimiter, dirname, join, resolve } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline/promises';
@@ -41,7 +41,7 @@ import { hostname } from 'node:os';
 import type { AddressInfo } from 'node:net';
 import { parse as parseYaml } from 'yaml';
 import { Engine } from './engine.ts';
-import { buildGraph, buildTrace, graphToDot, graphToMermaid, modelCheck } from './model.ts';
+import { buildGraph, buildTrace, graphToDot, graphToMermaid, hasDefiniteCheckDefect, modelCheck } from './model.ts';
 import { openStore } from './store.ts';
 import type { ArtifactRow, Store, WorkflowRow } from './store.ts';
 import {
@@ -90,6 +90,7 @@ import {
   type RecoveryOutcome,
   releaseInstallLock,
   removeAddJournal,
+  rmRecursiveForce,
   rollbackInstallCommit,
   RollbackFailedError,
   stageFiles,
@@ -97,7 +98,18 @@ import {
   writeAddJournal,
   writeLockfile,
 } from './add.ts';
-import type { AddJournal, InstalledEntry, InstallCommitHandle, Lockfile } from './add.ts';
+import type { AddJournal, InstalledEntry, InstallCommitHandle, InstallLockHandle, Lockfile } from './add.ts';
+import {
+  BundleIngestorUnavailableError,
+  globalStoreRoot,
+  installWorkflowBundle,
+  PreCommitVerifierUnavailableError,
+  projectStoreRoot,
+  recoverWorkflowStore,
+  storeIndexPath,
+  workflowStoreStatePaths,
+} from './store/index.ts';
+import type { BundleIngestor, BundleSource, PreCommitVerifier } from './store/index.ts';
 import {
   asAgentIdentities,
   asCreateWorkflowOk,
@@ -142,6 +154,7 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { owenloopSettingsPath, readOwenloopSettingsRaw, writeOwenloopHubOrigin } from './work-settings.ts';
+import { defaultRecoveryMarkerDir, ensureDirectoryPathNoSymlink, guardStateFile } from './install.ts';
 
 // Re-export the keychain backend type so existing test imports of `Keychain`
 // from `../src/cli.ts` (test/hubkit.ts, test/login.test.ts) keep resolving —
@@ -155,6 +168,24 @@ export interface CliIO {
   err: (line: string) => void;
   /** Injectable for hermetic tests — the network-touching verbs (`add`, hub commands) use this. */
   fetch?: typeof globalThis.fetch;
+  /**
+   * The bundle adapter for the `.wnlp` install route (unpacking, manifest
+   * integrity, canonical digest, coordinate). Injectable for tests and for
+   * wiring layers that carry the bundle-format module. `add` with bundle
+   * input FAILS CLOSED when this is absent — there is no default accepting
+   * parser or digest algorithm. The GitHub repo route never uses it.
+   */
+  bundleIngestor?: BundleIngestor;
+  /**
+   * The pre-commit verifier for the `.wnlp` install route, called after
+   * content/engine validation and before any object swap or index write.
+   * Injectable for tests and for wiring layers that carry the verification
+   * module. `add` with bundle input FAILS CLOSED when this is absent — there
+   * is no default accepting verifier. The GitHub repo route never uses it.
+   */
+  preCommitVerifier?: PreCommitVerifier;
+  /** Optional test/runtime override for the external fresh-install marker directory. */
+  recoveryMarkerDir?: string;
   /** Open a URL in the user's browser (login). Default: fire-and-forget `open`/`xdg-open`/`start`. */
   openUrl?: (url: string) => void;
   /**
@@ -281,6 +312,9 @@ const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
   // `acme/widgets` as a positional so the recover branch can refuse it, rather
   // than binding it as `--recover`'s value and silently dropping it.
   'recover',
+  // `add --global` (and `add --global --recover`) is likewise value-less: the
+  // bundle path/URL must stay a positional.
+  'global',
 ]);
 
 function parseArgs(argv: string[]): Args {
@@ -542,7 +576,10 @@ Usage: owenloop <command> [args] [--db <path>] [--defs <dir>]
 Commands:
   defs                                   list available workflow definitions
   add <owner>/<repo>[@ref]               fetch, validate, and install a repo's workflow defs (public repos)
-  add --recover                          finish or undo a crash-interrupted install (offline; no network)
+  add <bundle.wnlp | https://url> [--global]
+                                         install a workflow BUNDLE into the content-addressed store
+                                         (default: project store under the defs dir; --global: ~/.owenloop/workflows)
+  add --recover [--global]               finish or undo a crash-interrupted install (offline; no network)
   login [--hub <url>] [--with-token] [--as <slot>]   authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
   logout [--hub <url>] [--as <slot>]     delete the stored credential for a hub in one slot
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
@@ -598,26 +635,11 @@ function failureNote(failures: DefLoadFailure[]): string {
   return `\n${failures.length} file(s) failed to load:\n  - ${failures.map((f) => `${f.file}: ${f.error}`).join('\n  - ')}`;
 }
 
-/**
- * The single "definite defect" predicate over a modelCheck `report`, shared by
- * `check`, `add` (dispatchAdd) and `push` (dispatchPush) so all three
- * accept-or-reject a def identically. A pure function of the report object — it
- * does NOT read or change how any caller seeded its modelCheck (add/push seed
- * `assumeProvided: true`; check seeds `assumeProvided: !strictInputs`).
- *
- * invariant violations and structurally-dead steps are ALWAYS definite (sound
- * regardless of bounds); a true deadlock counts ONLY when the search was
- * exhaustive (`!bounded`) because a tight maxCollectionSize cap can manufacture
- * a spurious one. `unreachedSteps` is deliberately EXCLUDED — it is a bounds
- * artifact ("raise --max-states/--max-depth"), never a definite defect.
- */
-export function hasDefiniteCheckDefect(report: CheckReport): boolean {
-  return (
-    report.invariantViolations.length > 0 ||
-    report.structurallyDeadSteps.length > 0 ||
-    (!report.bounded && report.deadlocks.length > 0)
-  );
-}
+// The shared definite-defect predicate now lives in the engine core (model.ts)
+// so the workflow-store installer (src/store/install.ts — engine core, no CLI
+// imports) can run the identical acceptance gate without coupling to this
+// module. Re-exported here to keep the existing CLI/test import surface.
+export { hasDefiniteCheckDefect };
 
 /**
  * Options accepted on EVERY command. docs/cli.md documents `--db`/`--defs` as
@@ -646,7 +668,7 @@ const cmdOpts = (...extra: string[]): ReadonlySet<string> => new Set<string>([..
 export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map<string, ReadonlySet<string>>([
   ['help', cmdOpts()],
   ['defs', cmdOpts()],
-  ['add', cmdOpts('recover')],
+  ['add', cmdOpts('recover', 'global')],
   ['login', cmdOpts('hub', 'with-token', 'as')],
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
@@ -1433,6 +1455,300 @@ function tarballMaxBytes(io: CliIO): number {
   return Number.isFinite(override) && override > 0 ? override : DEFAULT_TAR_LIMITS.maxCompressedBytes;
 }
 
+// ---- `add` source classification (GitHub repo vs `.wnlp` bundle) ------------------
+
+/** The byte budget for a local `.wnlp` bundle file — same 256 MiB default as the GitHub tarball cap. */
+function bundleFileMaxBytes(io: CliIO): number {
+  return tarballMaxBytes(io);
+}
+
+/** The byte budget for a `.wnlp` bundle fetched over `http:`/`https:` — same cap as the GitHub tarball. */
+function bundleUrlMaxBytes(io: CliIO): number {
+  return tarballMaxBytes(io);
+}
+
+/** The `--global` + `--defs` refusal — the global store has a fixed home-directory location, so `--defs` would only create ambiguity. */
+const GLOBAL_DEFS_CONFLICT_MSG =
+  '--global cannot be combined with --defs: the global store lives in the home directory';
+
+/**
+ * The classification of a single `add` positional. Pure and independently
+ * tested: no filesystem access, no network, no state.
+ *
+ *  - `github`: `owner/repo[@ref]` with no URL scheme and no `.wnlp` path —
+ *    the byte-for-byte preserved GitHub route.
+ *  - `file`: a local path ending in `.wnlp` — a bundle FILE (origin data only,
+ *    never identity).
+ *  - `url`: an `http:`/`https:` URL — a bundle URL; any other scheme is
+ *    rejected, never a silent fallback.
+ */
+export type AddSource =
+  | { kind: 'github'; spec: string }
+  | { kind: 'file'; path: string }
+  | { kind: 'url'; url: string };
+
+/**
+ * Classify one `add` positional WITHOUT changing GitHub behavior: the GitHub
+ * shape (`owner/repo[@ref]`, no scheme, not a `.wnlp` path) returns
+ * `{ kind: 'github' }` for exactly the same inputs `parseRepoSpec` accepts,
+ * and the GitHub route keeps parsing it — so every error message for a
+ * malformed repo spec is unchanged. `.wnlp` file paths and http/https URLs
+ * take the bundle route; everything else is a specific usage refusal.
+ *
+ * The classifier never inspects the filesystem: a `.wnlp` path that does not
+ * exist is still classified as a file (the reader refuses it afterward with
+ * the reason), and a URL is classified by scheme alone.
+ */
+export function classifyAddSource(spec: string): AddSource {
+  const schemeMatch = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.exec(spec);
+  if (schemeMatch !== null) {
+    if (spec.startsWith('http:') || spec.startsWith('https:')) {
+      return { kind: 'url', url: spec };
+    }
+    throw new CliError(
+      `unsupported source scheme '${spec.slice(0, schemeMatch[0].length)}' — supported sources: ` +
+        `owner/repo[@ref] (GitHub), a local .wnlp file, or an http(s) URL`,
+    );
+  }
+  if (spec.endsWith('.wnlp')) {
+    return { kind: 'file', path: spec };
+  }
+  return { kind: 'github', spec };
+}
+
+/**
+ * Read a local `.wnlp` bundle: it must be a BOUNDED REGULAR FILE. Refusals
+ * name the user-supplied path exactly as given (origin data for messages only
+ * — identity always comes from the bundle's manifest, never from the path).
+ * The size cap is enforced BEFORE and AFTER the read so an oversized file is
+ * never fully allocated.
+ */
+function readBundleFile(io: CliIO, path: string): Uint8Array {
+  const filesystemPath = isAbsolute(path) ? path : join(io.cwd, path);
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(filesystemPath);
+  } catch {
+    throw new CliError(`could not read bundle at ${path}: file not found`);
+  }
+  if (st.isSymbolicLink()) {
+    throw new CliError(`refusing bundle at ${path}: it is a symlink`);
+  }
+  if (!st.isFile()) {
+    throw new CliError(`refusing bundle at ${path}: not a regular file`);
+  }
+  const cap = bundleFileMaxBytes(io);
+  if (st.size > cap) {
+    throw new CliError(`refusing bundle at ${path}: file is ${st.size} bytes, over the ${cap}-byte cap`);
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = readFileSync(filesystemPath);
+  } catch (e) {
+    throw new CliError(`could not read bundle at ${path}: ${(e as Error).message}`);
+  }
+  if (bytes.length > cap) {
+    throw new CliError(`refusing bundle at ${path}: file grew to ${bytes.length} bytes while reading (cap ${cap})`);
+  }
+  return bytes;
+}
+
+/**
+ * Fetch a `.wnlp` bundle over `http:`/`https:`. Mirrors the GitHub tarball
+ * fetch discipline: the timeout covers the fetch AND the body read (undici
+ * ties the abort signal to the stream), `readBodyBounded` cancels an
+ * oversized body DURING the stream, and redirects are refused
+ * (`redirect: 'error'`) rather than followed silently. The A1 adapter remains
+ * the authority for bundle size/archive limits once bytes arrive.
+ */
+async function fetchBundleUrl(io: CliIO, url: string): Promise<Uint8Array> {
+  const fetchFn = io.fetch ?? globalThis.fetch;
+  let res: Response;
+  try {
+    res = await fetchFn(url, {
+      headers: { 'User-Agent': 'owenloop' },
+      signal: AbortSignal.timeout(ADD_TARBALL_TIMEOUT_MS),
+      redirect: 'error',
+    });
+  } catch (e) {
+    const err = e as Error;
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      throw new CliError(`timed out after ${ADD_TARBALL_TIMEOUT_MS / 1000}s downloading bundle from ${url}`);
+    }
+    throw new CliError(`could not fetch bundle from ${url}: ${err.message}`);
+  }
+  if (!res.ok) {
+    throw new CliError(`could not fetch bundle from ${url}: server returned ${res.status}`);
+  }
+  try {
+    return await readBodyBounded(res, bundleUrlMaxBytes(io), `bundle from ${url}`);
+  } catch (e) {
+    const err = e as Error;
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      throw new CliError(`timed out after ${ADD_TARBALL_TIMEOUT_MS / 1000}s downloading bundle from ${url}`);
+    }
+    throw e;
+  }
+}
+
+/** Return the caller-injected home, rejecting empty values instead of defaulting to process state. */
+function workflowHome(io: CliIO): string {
+  const home = [io.env.HOME, io.env.USERPROFILE].find((value) => value !== undefined && value.trim() !== '');
+  if (home === undefined) throw new CliError('cannot locate the global workflow store: set HOME or USERPROFILE');
+  return home;
+}
+
+/**
+ * Resolve the external fresh-install marker directory from injected CLI state.
+ * A bundle install always needs a concrete directory; no marker API may consult
+ * the ambient process home.
+ */
+function workflowRecoveryMarkerDir(io: CliIO): string {
+  return io.recoveryMarkerDir ?? defaultRecoveryMarkerDir(workflowHome(io));
+}
+
+/** Recovery keeps the legacy GitHub path usable when no v2 marker is involved. */
+function optionalWorkflowRecoveryMarkerDir(io: CliIO): string | undefined {
+  if (io.recoveryMarkerDir !== undefined) return io.recoveryMarkerDir;
+  const home = [io.env.HOME, io.env.USERPROFILE].find((value) => value !== undefined && value.trim() !== '');
+  return home === undefined ? undefined : defaultRecoveryMarkerDir(home);
+}
+
+/**
+ * The `.wnlp` bundle route of `owenloop add` — the content-addressed store
+ * counterpart of the GitHub route. `dispatchAdd` classifies the positional
+ * (pure {@link classifyAddSource}), reads/fetches the bytes unlocked (same as
+ * the GitHub download — a slow fetch must not hold a lock), then hands
+ * everything that touches store state to `installWorkflowBundle`: lock →
+ * recovery → index reread → A1 stage → strict engine validation → A2 verify →
+ * harden → journal → swap → atomic index commit → finalize → unlock.
+ *
+ * Fail-closed adapters: with no A1/A2 module bound to `io`, the installer
+ * throws its named adapter-unavailable error BEFORE any journal/object/index
+ * commit — there is no default accepting parser, digest algorithm, or
+ * verifier. Recovery (`add --recover`) is unaffected by adapter availability:
+ * it is pure local journal/object/index work.
+ */
+async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Promise<number> {
+  const globalFlag = flag(args, 'global');
+  const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
+  if (globalFlag && defsOverride !== undefined) {
+    throw new CliError(GLOBAL_DEFS_CONFLICT_MSG);
+  }
+  // Store roots: the global store is `~/.owenloop/workflows` (HOME injected
+  // via env so tests never touch the real one); the project store is the
+  // resolved defs dir. Lock/journal paths live per root; the PROJECT route
+  // shares the existing project add lock + journal (its recovery ordering).
+  // A fresh bundle install also needs an external marker directory, so derive
+  // that path from the same injected home and never from process state.
+  const recoveryMarkerDir = workflowRecoveryMarkerDir(io);
+  const root = globalFlag
+    ? globalStoreRoot(workflowHome(io))
+    : projectStoreRoot(defsOverride ?? join(io.cwd, 'workflows'));
+  const statePaths = workflowStoreStatePaths(root);
+  const lockPath = statePaths.lockPath;
+  const journalPath = statePaths.journalPath;
+
+  // Bytes first, lock later (same as the GitHub route). Origin data only —
+  // the bundle's manifest is the identity authority.
+  let bytes: Uint8Array;
+  let bundleSource: BundleSource;
+  if (source.kind === 'file') {
+    bytes = readBundleFile(io, source.path);
+    bundleSource = { kind: 'file', path: source.path };
+  } else if (source.kind === 'url') {
+    bytes = await fetchBundleUrl(io, source.url);
+    bundleSource = { kind: 'url', url: source.url };
+  } else {
+    // Unreachable: `dispatchAdd` routes only file/url sources here.
+    throw new CliError('internal error: a GitHub repo spec cannot reach the bundle route');
+  }
+
+  // Fail-closed adapter gate, explicit at the dispatch site: with no A1/A2
+  // module bound to `io`, dispatch refuses with the named adapter-unavailable
+  // error BEFORE any journal/object/index commit (the installer enforces the
+  // same rule too — belt and suspenders).
+  if (io.bundleIngestor === undefined) throw new BundleIngestorUnavailableError();
+  if (io.preCommitVerifier === undefined) throw new PreCommitVerifierUnavailableError();
+
+  // The project route shares the project add lock/recovery ordering — hand
+  // the recovery pass the installed.json ledger lookup so a legacy v1
+  // (GitHub) journal at the shared project journal path can still be
+  // recovered. The global route has no ledger: v1 journals there are refused.
+  const readLedger = globalFlag
+    ? undefined
+    : () => {
+        const lf = readLockfile(join(io.cwd, '.owenloop', 'installed.json'));
+        return (src: string) => {
+          const entry = lf.installed[src];
+          if (entry === undefined) return undefined;
+          return { sha: entry.sha, path: entry.path };
+        };
+      };
+
+  const result = await installWorkflowBundle({
+    bytes,
+    source: bundleSource,
+    root,
+    level: globalFlag ? 'global' : 'project',
+    lockPath,
+    journalPath,
+    recoveryMarkerDir,
+    ingestor: io.bundleIngestor,
+    verifier: io.preCommitVerifier,
+    readLedger,
+  });
+
+  print(io, {
+    ok: true,
+    source: bundleSource.kind === 'file' ? bundleSource.path : bundleSource.url,
+    level: result.level,
+    coordinate: result.coordinate,
+    digest: result.digest,
+    objectPath: result.objectPath,
+    installed: result.installed,
+  });
+  return 0;
+}
+
+/**
+ * `owenloop add --recover [--global]`: the global variant runs the store's
+ * offline recovery on the global root; the plain variant keeps the current
+ * project/GitHub recovery. Never touches the network, and adapter
+ * availability is irrelevant — recovery is pure local journal/object/index
+ * work.
+ */
+async function dispatchAddRecoverGlobal(io: CliIO): Promise<number> {
+  const home = workflowHome(io);
+  const root = globalStoreRoot(home);
+  const lockPath = join(root, '.owenloop', 'add.lock');
+  const journalPath = join(root, '.owenloop', ADD_JOURNAL_FILENAME);
+  const recoveryMarkerDir = workflowRecoveryMarkerDir(io);
+
+  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath, recoveryMarkerDir });
+  switch (outcome) {
+    case 'no-journal':
+      print(io, { ok: true, recovered: false, message: 'nothing to recover — no interrupted install found' });
+      return 0;
+    case 'rolled-forward':
+      print(io, {
+        ok: true,
+        recovered: true,
+        outcome: 'rolled-forward',
+        message: 'interrupted install completed (rolled forward)',
+      });
+      return 0;
+    case 'rolled-back':
+      print(io, {
+        ok: true,
+        recovered: true,
+        outcome: 'rolled-back',
+        message: 'interrupted install undone — previous state restored (or already consistent)',
+      });
+      return 0;
+  }
+}
+
 /**
  * `owenloop add <owner>/<repo>[@ref]` — fetch a repo's `workflows/**`, validate
  * it, and install it under `<defsDir>/<installFolder(owner,repo)>`.
@@ -1473,7 +1789,16 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   // crashed mid-install and is now offline can finish or undo the interrupted
   // install with no network (recovery is purely local filesystem work).
   if (flag(args, 'recover')) return dispatchAddRecover(io, args);
-  const spec = need(args, 1, 'owner/repo[@ref]');
+  // Classify the source BEFORE the GitHub parse: `owner/repo[@ref]` keeps the
+  // byte-for-byte preserved GitHub route (same inputs reach `parseRepoSpec`,
+  // so every existing error is unchanged); `.wnlp` file paths and http(s)
+  // URLs take the content-addressed bundle store route.
+  const spec = need(args, 1, '<source>');
+  const classified = classifyAddSource(spec);
+  if (classified.kind !== 'github') return dispatchAddBundle(io, args, classified);
+  if (flag(args, 'global')) {
+    throw new CliError('--global is only supported for .wnlp bundle sources');
+  }
   const { owner, repo, ref } = parseRepoSpec(spec);
   const source = `${owner}/${repo}`;
   const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
@@ -1481,6 +1806,8 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   const lockfilePath = join(io.cwd, '.owenloop', 'installed.json');
   const installLockPath = join(io.cwd, '.owenloop', 'add.lock');
   const journalPath = join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME);
+  const canonicalState = workflowStoreStatePaths(projectStoreRoot(defsDir));
+  const recoveryMarkerDir = optionalWorkflowRecoveryMarkerDir(io);
   const fetchFn = io.fetch ?? globalThis.fetch;
 
   // 1. Resolve the ref to a pinned commit sha.
@@ -1594,8 +1921,21 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
   // intent, not repo content — deliberately installing through a symlink keeps
   // today's behavior, matching the --db/OWENLOOP_DB rule.
   mkdirRefusingSymlink(join(io.cwd, '.owenloop'));
+  guardStateFile(installLockPath, 'install lock');
+  guardStateFile(journalPath, 'crash-recovery journal');
+  guardStateFile(lockfilePath, 'installed ledger');
   if (defsOverride === undefined) mkdirRefusingSymlink(defsDir);
-  const lock = await acquireInstallLock(installLockPath);
+  mkdirRefusingSymlink(canonicalState.stateDir);
+  guardStateFile(canonicalState.lockPath, 'canonical install lock');
+  guardStateFile(canonicalState.journalPath, 'canonical crash-recovery journal');
+  const lockPaths = [...new Set([installLockPath, canonicalState.lockPath])].sort();
+  const locks: InstallLockHandle[] = [];
+  try {
+    for (const path of lockPaths) locks.push(await acquireInstallLock(path));
+  } catch (e) {
+    for (const handle of locks.reverse()) releaseInstallLock(handle);
+    throw e;
+  }
   // Set true only on a rollback double-fault, where the ONLY copy of the
   // previous content ends up parked under the staging root — then the `finally`
   // must NOT delete it (the error message tells the user to recover it).
@@ -1608,7 +1948,13 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     // journal as evidence: without this, the `finally` below would rmSync the
     // staging root and take the backups a later recovery needs with it.
     try {
-      recoverInterruptedInstall({ defsDir, journalPath, lockfilePath });
+      recoverInterruptedInstall({
+	defsDir,
+	journalPath: canonicalState.journalPath,
+	lockfilePath: storeIndexPath(defsDir),
+	recoveryMarkerDir,
+      });
+      recoverInterruptedInstall({ defsDir, journalPath, lockfilePath, recoveryMarkerDir });
     } catch (e) {
       preserveStagingRoot = true;
       throw e;
@@ -1616,8 +1962,10 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
 
     // The lock holder is the only legitimate writer under the staging root, so
     // anything already there is debris from a crashed/killed prior run — clear
-    // it. Keeps "no staging debris" true even across a Ctrl-C.
-    rmSync(stagingRoot, { recursive: true, force: true });
+    // it. Keeps "no staging debris" true even across a Ctrl-C. The shared
+    // project staging root may hold a hardened CAS object from a crashed
+    // bundle install, so remove without requiring write permission inside it.
+    rmRecursiveForce(stagingRoot);
 
     // Read the lockfile and decide ownership INSIDE the lock (TOCTOU: a pre-lock
     // read could be stale by the time we act on it). A corrupt lockfile is a
@@ -1849,9 +2197,10 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
     // finalized; on failure this clears whatever staging debris is left. The one
     // exception is a rollback double-fault (`preserveStagingRoot`), where the
     // only surviving copy of the previous content is parked here — leave it for
-    // the user to recover (the next add clears it as debris). Then release the lock.
-    if (!preserveStagingRoot) rmSync(stagingRoot, { recursive: true, force: true });
-    releaseInstallLock(lock);
+    // the user to recover (the next add clears it as debris). Then release the
+    // lock. rmRecursiveForce: the debris may hold a hardened CAS object.
+    if (!preserveStagingRoot) rmRecursiveForce(stagingRoot);
+    for (const handle of locks.reverse()) releaseInstallLock(handle);
   }
 }
 
@@ -1883,6 +2232,16 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
     throw new CliError('--recover takes no repository argument — run recovery alone, then re-run add');
   }
 
+  // --global selects the GLOBAL STORE's offline recovery; plain --recover
+  // keeps this project/GitHub path exactly as before. The --defs conflict
+  // applies here too (the global root never reads a defs override).
+  if (flag(args, 'global')) {
+    if (last(args, 'defs') !== undefined || io.env.OWENLOOP_DEFS !== undefined) {
+      throw new CliError(GLOBAL_DEFS_CONFLICT_MSG);
+    }
+    return dispatchAddRecoverGlobal(io);
+  }
+
   // Resolve paths EXACTLY as dispatchAdd does — same defsDir/lock/journal
   // derivation — so recovery acts on the same tree a real add would. No fetch
   // reference, no store open.
@@ -1891,20 +2250,44 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
   const lockfilePath = join(io.cwd, '.owenloop', 'installed.json');
   const installLockPath = join(io.cwd, '.owenloop', 'add.lock');
   const journalPath = join(io.cwd, '.owenloop', ADD_JOURNAL_FILENAME);
+  const canonicalState = workflowStoreStatePaths(projectStoreRoot(defsDir));
+  const recoveryMarkerDir = optionalWorkflowRecoveryMarkerDir(io);
 
   // Mirror the SEC-3 symlink guards from the normal path (same order, same
   // rationale): `.owenloop` is written by the lock acquire; the default defsDir
   // is mutated-through by recovery. An explicit --defs/OWENLOOP_DEFS is operator
   // intent, not repo content, so it is not symlink-guarded (matching dispatchAdd).
   mkdirRefusingSymlink(join(io.cwd, '.owenloop'));
+  guardStateFile(installLockPath, 'install lock');
+  guardStateFile(journalPath, 'crash-recovery journal');
+  guardStateFile(lockfilePath, 'installed ledger');
   if (defsOverride === undefined) mkdirRefusingSymlink(defsDir);
-
-  const lock = await acquireInstallLock(installLockPath);
-  let outcome: RecoveryOutcome;
+  const canonicalStateExists = lstatSync(canonicalState.stateDir, { throwIfNoEntry: false }) !== undefined;
+  if (canonicalStateExists) {
+    mkdirRefusingSymlink(canonicalState.stateDir);
+    guardStateFile(canonicalState.lockPath, 'canonical install lock');
+    guardStateFile(canonicalState.journalPath, 'canonical crash-recovery journal');
+  }
+  const lockPaths = [...new Set([installLockPath, ...(canonicalStateExists ? [canonicalState.lockPath] : [])])].sort();
+  const locks: InstallLockHandle[] = [];
   try {
-    outcome = recoverInterruptedInstall({ defsDir, journalPath, lockfilePath });
+    for (const path of lockPaths) locks.push(await acquireInstallLock(path));
+  } catch (e) {
+    for (const handle of locks.reverse()) releaseInstallLock(handle);
+    throw e;
+  }
+  let outcome: RecoveryOutcome = 'no-journal';
+  try {
+    const canonicalOutcome = recoverInterruptedInstall({
+      defsDir,
+      journalPath: canonicalState.journalPath,
+      lockfilePath: storeIndexPath(defsDir),
+      recoveryMarkerDir,
+    });
+    const legacyOutcome = recoverInterruptedInstall({ defsDir, journalPath, lockfilePath, recoveryMarkerDir });
+    outcome = legacyOutcome !== 'no-journal' ? legacyOutcome : canonicalOutcome;
   } finally {
-    releaseInstallLock(lock);
+    for (const handle of locks.reverse()) releaseInstallLock(handle);
   }
 
   switch (outcome) {
