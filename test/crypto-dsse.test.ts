@@ -22,6 +22,7 @@ import {
   PAYLOAD_TYPE_ENROLLMENT_GRANT,
   PAYLOAD_TYPE_ORIGIN,
   PAYLOAD_TYPE_POLICY_FLOOR,
+  PAYLOAD_TYPE_PUBLICATION,
   PAYLOAD_TYPE_REVOCATION,
   PAYLOAD_TYPE_SUBMISSION,
   decodeBase64Strict,
@@ -29,6 +30,7 @@ import {
   dsseSignEnvelope,
   dsseSignOrigin,
   dsseSignPolicyFloor,
+  dsseSignPublication,
   dsseSignRecord,
   dsseSignRevocation,
   dsseSignSubmission,
@@ -36,6 +38,7 @@ import {
   dsseVerifyEnvelope,
   dsseVerifyOrigin,
   dsseVerifyPolicyFloor,
+  dsseVerifyPublication,
   dsseVerifyRecord,
   dsseVerifyRevocation,
   dsseVerifySubmission,
@@ -80,12 +83,13 @@ function strictVerifier(expectedSig: Buffer): {
   };
 }
 
-test('payload type constants are the five signed record classes, versioned', () => {
+test('payload type constants are the six signed record classes, versioned', () => {
   assert.equal(PAYLOAD_TYPE_ENROLLMENT_GRANT, 'application/vnd.owenloop.enrollment-grant.v1+json');
   assert.equal(PAYLOAD_TYPE_REVOCATION, 'application/vnd.owenloop.revocation.v1+json');
   assert.equal(PAYLOAD_TYPE_SUBMISSION, 'application/vnd.owenloop.submission.v1+json');
   assert.equal(PAYLOAD_TYPE_POLICY_FLOOR, 'application/vnd.owenloop.policy-floor.v1+json');
   assert.equal(PAYLOAD_TYPE_ORIGIN, 'application/vnd.owenloop.origin.v1+json');
+  assert.equal(PAYLOAD_TYPE_PUBLICATION, 'application/vnd.owenloop.publication.v1+json');
   assert.equal(DSSE_VERSION, 'DSSEv1');
   assert.equal(DSSE_SSH_NAMESPACE, 'owenloop-dsse-v1');
   assert.deepEqual(DSSE_RECORD_PAYLOAD_TYPES, [
@@ -94,6 +98,7 @@ test('payload type constants are the five signed record classes, versioned', () 
     PAYLOAD_TYPE_SUBMISSION,
     PAYLOAD_TYPE_POLICY_FLOOR,
     PAYLOAD_TYPE_ORIGIN,
+    PAYLOAD_TYPE_PUBLICATION,
   ]);
   assert.equal(Object.isFrozen(DSSE_RECORD_PAYLOAD_TYPES), true);
   assert.equal(isDsseRecordPayloadType(PAYLOAD_TYPE_ORIGIN), true);
@@ -403,7 +408,7 @@ test('generic record wrappers enforce the runtime payload-type allow-list', asyn
   );
 });
 
-test('explicit record-class wrappers bind all five fixed payload types', async () => {
+test('explicit record-class wrappers bind all six fixed payload types', async () => {
   const signer = {
     async sign() {
       return { keyid: 'SHA256:k', sig: Buffer.from('s') };
@@ -418,6 +423,7 @@ test('explicit record-class wrappers bind all five fixed payload types', async (
     [dsseSignSubmission, dsseVerifySubmission, PAYLOAD_TYPE_SUBMISSION],
     [dsseSignPolicyFloor, dsseVerifyPolicyFloor, PAYLOAD_TYPE_POLICY_FLOOR],
     [dsseSignOrigin, dsseVerifyOrigin, PAYLOAD_TYPE_ORIGIN],
+    [dsseSignPublication, dsseVerifyPublication, PAYLOAD_TYPE_PUBLICATION],
   ] as const;
   for (const [sign, verify, expected] of cases) {
     const { envelope } = await sign(Buffer.from(expected), signer);

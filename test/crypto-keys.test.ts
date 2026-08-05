@@ -393,6 +393,25 @@ test('file backend: record is 0600, dirs are 0700, rewrite leaves no stray tmp f
   assert.deepEqual(stray, []);
 });
 
+test('file backend: ensure writes the ref pointer on create and backfills it on existing', { skip: SKIP }, async () => {
+  const home = freshHome();
+  const m = new PrincipalKeyManager({ env: {}, backend: 'file', homeDir: home });
+  const pointer = join(home, '.owenloop', 'keys', `${keyRefHash(REF)}.ref`);
+
+  const created = await m.ensure(REF);
+  assert.equal(created.state, 'created');
+  assert.equal(readFileSync(pointer, 'utf8'), canonicalKeyRef(REF));
+  assert.equal(lstatSync(pointer).mode & 0o777, 0o600);
+
+  rmSync(pointer);
+  assert.equal(existsSync(pointer), false);
+  const existing = await m.ensure(REF);
+  assert.equal(existing.state, 'existing');
+  assert.equal(readFileSync(pointer, 'utf8'), canonicalKeyRef(REF));
+  assert.deepEqual(m.listRefs(), [REF]);
+  assert.deepEqual(m.resolveRef(REF.origin, REF.kind), REF);
+});
+
 test('file backend: a symlinked keys dir is refused, never written through', async () => {
   const home = freshHome();
   const target = join(home, 'elsewhere');

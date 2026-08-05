@@ -405,7 +405,7 @@ storage](crypto.md) is the full reference):
 - `SshSigner` / `createSshSigner` (behind the format-neutral `Signer`
   interface) — SSHSIG signing/verification through stock `ssh-keygen -Y`.
 - `dsseSignEnvelope` / `dsseVerifyEnvelope` plus the record-class wrappers and
-  the five `PAYLOAD_TYPE_*` constants — DSSE envelopes with strict Base64 and
+  the six `PAYLOAD_TYPE_*` constants — DSSE envelopes with strict Base64 and
   exact-byte payload return.
 - `parseAllowedSigners` — structural parsing of stock `allowed_signers` files
   (never throws; malformed lines come back with line numbers).

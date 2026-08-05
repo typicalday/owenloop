@@ -32,6 +32,7 @@ import {
   POLICY_FLOOR_FIELDS,
   POLICY_FLOOR_RECORD_FIELDS,
   PRINCIPAL_REFERENCE_FIELDS,
+  PUBLICATION_FIELDS,
   RECORD_PAYLOAD_TYPES,
   REVOCATION_FIELDS,
   SUBMISSION_FIELDS,
@@ -41,6 +42,7 @@ import {
   enrollmentGrantSchema,
   orderSchema,
   policyFloorSchema,
+  publicationSchema,
   revocationSchema,
   submissionSchema,
 } from '../src/schemas/index.ts';
@@ -48,6 +50,7 @@ import { validateValue } from '../src/schema.ts';
 import enrollmentGrantFixtures from './fixtures/wire/enrollment-grant.json' with { type: 'json' };
 import orderFixtures from './fixtures/wire/order.json' with { type: 'json' };
 import policyFloorFixtures from './fixtures/wire/policy-floor.json' with { type: 'json' };
+import publicationFixtures from './fixtures/wire/publication.json' with { type: 'json' };
 import revocationFixtures from './fixtures/wire/revocation.json' with { type: 'json' };
 import submissionFixtures from './fixtures/wire/submission.json' with { type: 'json' };
 
@@ -97,6 +100,12 @@ const contracts: Contract[] = [
     schema: policyFloorSchema,
     manifest: POLICY_FLOOR_RECORD_FIELDS,
     fixtures: policyFloorFixtures as FixtureSet,
+  },
+  {
+    name: 'publication',
+    schema: publicationSchema,
+    manifest: PUBLICATION_FIELDS,
+    fixtures: publicationFixtures as FixtureSet,
   },
   {
     name: 'order',

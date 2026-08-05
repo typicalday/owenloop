@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import { credentialSlot, hashDefForHub, keychainServiceFor } from '../src/hub.ts';
 import type { CredentialSlotSelector } from '../src/hub.ts';
 import { canonicalKeyRef } from '../src/crypto/keys.ts';
-import type { EnsureKeyResult, PrincipalKeyRef } from '../src/crypto/keys.ts';
+import type { EnsureKeyResult, InspectKeyResult, PrincipalKeyRef } from '../src/crypto/keys.ts';
 import type { PrincipalKeyManager } from '../src/crypto/keys.ts';
 import type { CliIO, Keychain } from '../src/cli.ts';
 
@@ -272,7 +272,7 @@ export interface FakePrincipalKeysOpts {
  * pass `principalKeys: 'real'` to `makeIo` to run the real manager instead.
  */
 export function makeFakePrincipalKeys(opts: FakePrincipalKeysOpts = {}): {
-  manager: Pick<PrincipalKeyManager, 'ensure'>;
+  manager: Pick<PrincipalKeyManager, 'ensure' | 'inspect' | 'withSigningKey' | 'resolveRef'>;
   calls: { ref: PrincipalKeyRef; reuse?: { path: string }; result?: EnsureKeyResult }[];
   state: Map<string, { ref: PrincipalKeyRef; state: 'created' | 'existing' | 'reused'; backend: string }>;
 } {
@@ -310,6 +310,29 @@ export function makeFakePrincipalKeys(opts: FakePrincipalKeysOpts = {}): {
       entry.result = { ref, state: rec.state, backend: rec.backend as EnsureKeyResult['backend'], publicKey: FAKE_KEY_PUBLIC };
       return entry.result;
     },
+    async inspect(ref: PrincipalKeyRef): Promise<InspectKeyResult> {
+      const prior = state.get(canonicalKeyRef(ref));
+      if (prior === undefined) {
+        return { exists: false, source: undefined, backend: undefined, publicKey: undefined };
+      }
+      return {
+        exists: true,
+        source: prior.state === 'reused' ? 'reused' : 'generated',
+        backend: prior.state === 'reused' ? 'reused' : (prior.backend as InspectKeyResult['backend']),
+        publicKey: FAKE_KEY_PUBLIC,
+      };
+    },
+    resolveRef(origin: string, kind: PrincipalKeyRef['kind']): PrincipalKeyRef | null {
+      const matches = [...state.values()].filter((entry) => entry.ref.origin === origin && entry.ref.kind === kind);
+      if (matches.length > 1) throw new Error(`multiple ${kind} signing-key refs found for ${origin}`);
+      return matches[0]?.ref ?? null;
+    },
+    async withSigningKey<T>(ref: PrincipalKeyRef, _callback: (keyPath: string) => Promise<T>): Promise<T> {
+      if (!state.has(canonicalKeyRef(ref))) {
+        throw new Error(`no ${ref.kind} signing key stored for ${ref.origin} — run owenloop setup`);
+      }
+      throw new Error('fake signing-key manager cannot materialize private key bytes');
+    },
   };
   return { manager, calls, state };
 }
@@ -337,7 +360,7 @@ export interface MakeIoOpts {
    * `PrincipalKeyManager` (only for tests that deliberately exercise it with a
    * fixture $HOME).
    */
-  principalKeys?: Pick<PrincipalKeyManager, 'ensure'> | 'real';
+  principalKeys?: Pick<PrincipalKeyManager, 'ensure' | 'inspect' | 'withSigningKey' | 'resolveRef'> | 'real';
 }
 
 export function makeIo(opts: MakeIoOpts = {}): HubIo & {

@@ -8,7 +8,7 @@
  *      function here hands a caller private-key text.
  *   2. SSHSIG signing/verification — `SshSigner` (behind the format-neutral
  *      `Signer` interface) drives stock OpenSSH `ssh-keygen -Y`.
- *   3. DSSE envelopes — `dsseSignEnvelope`/`dsseVerifyEnvelope` plus the five
+ *   3. DSSE envelopes — `dsseSignEnvelope`/`dsseVerifyEnvelope` plus the six
  *      versioned payload-type constants and record-class wrappers.
  *
  * Process/storage adapters stay internal unless a test seam needs the type.
@@ -58,6 +58,7 @@ export {
   PAYLOAD_TYPE_ENROLLMENT_GRANT,
   PAYLOAD_TYPE_POLICY_FLOOR,
   PAYLOAD_TYPE_ORIGIN,
+  PAYLOAD_TYPE_PUBLICATION,
   PAYLOAD_TYPE_REVOCATION,
   PAYLOAD_TYPE_SUBMISSION,
   DsseEnvelopeError,
@@ -66,6 +67,7 @@ export {
   dsseSignEnvelope,
   dsseSignOrigin,
   dsseSignPolicyFloor,
+  dsseSignPublication,
   dsseSignRecord,
   dsseSignRevocation,
   dsseSignSubmission,
@@ -73,6 +75,7 @@ export {
   dsseVerifyEnvelope,
   dsseVerifyOrigin,
   dsseVerifyPolicyFloor,
+  dsseVerifyPublication,
   dsseVerifyRecord,
   dsseVerifyRevocation,
   dsseVerifySubmission,
@@ -94,6 +97,7 @@ export {
   POLICY_FLOOR_FIELDS,
   POLICY_FLOOR_RECORD_FIELDS,
   PRINCIPAL_REFERENCE_FIELDS,
+  PUBLICATION_FIELDS,
   RECORD_PAYLOAD_TYPES,
   REVOCATION_FIELDS,
   SUBMISSION_FIELDS,
@@ -111,6 +115,7 @@ export type {
   PolicyFloor,
   PolicyFloorRecord,
   PrincipalReference,
+  PublicationRecord,
   RequiredKeys,
   RevocationRecord,
   SubmissionProducedArtifact,

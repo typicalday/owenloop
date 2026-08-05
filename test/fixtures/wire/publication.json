@@ -1,0 +1,64 @@
+{
+  "valid": {
+    "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "name": "golden-workflow",
+    "version": "1.2.3",
+    "publisherKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "timestamp": 1785800000000
+  },
+  "additionalValid": [
+    {
+      "digest": "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      "name": "release-candidate",
+      "version": "0.0.1-beta.2",
+      "publisherKeyId": "SHA256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "timestamp": 0
+    }
+  ],
+  "invalid": [
+    {
+      "name": "bad-digest",
+      "value": {
+        "digest": "not-a-digest",
+        "name": "golden-workflow",
+        "version": "1.2.3",
+        "publisherKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 1785800000000
+      },
+      "keyword": "pattern"
+    },
+    {
+      "name": "bad-publisher-key-id",
+      "value": {
+        "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "name": "golden-workflow",
+        "version": "1.2.3",
+        "publisherKeyId": "not-a-key-id",
+        "timestamp": 1785800000000
+      },
+      "keyword": "pattern"
+    },
+    {
+      "name": "missing-version",
+      "value": {
+        "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "name": "golden-workflow",
+        "publisherKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 1785800000000
+      },
+      "keyword": "required"
+    },
+    {
+      "name": "unexpected-property",
+      "value": {
+        "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "name": "golden-workflow",
+        "version": "1.2.3",
+        "publisherKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 1785800000000,
+        "signedBy": "author"
+      },
+      "keyword": "additionalProperties"
+    }
+  ]
+}

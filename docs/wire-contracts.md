@@ -40,7 +40,7 @@ matters for non-ASCII payload types or payload data.
 
 ## Versioned payload types
 
-The four records defined here use the existing media types:
+The five bound records defined here use the existing media types:
 
 | Record | Payload type |
 | --- | --- |
@@ -48,6 +48,7 @@ The four records defined here use the existing media types:
 | Revocation | `application/vnd.owenloop.revocation.v1+json` |
 | Submission | `application/vnd.owenloop.submission.v1+json` |
 | Policy floor | `application/vnd.owenloop.policy-floor.v1+json` |
+| Publication | `application/vnd.owenloop.publication.v1+json` |
 
 `application/vnd.owenloop.origin.v1+json` is reserved. Its record shape belongs
 to the origin work package and is intentionally not bound by the schemas in
@@ -79,6 +80,28 @@ Payload type: `application/vnd.owenloop.submission.v1+json`.
 
 Each `produced` entry has `artifact`, non-negative integer `version`, and a
 lowercase SHA-256 `valueDigest`.
+
+## Publication record
+
+Payload type: `application/vnd.owenloop.publication.v1+json`.
+
+A publication record binds one signed statement to one canonical workflow
+bundle. The `digest` is the lowercase 64-hex SHA-256 digest of the exact
+uncompressed canonical tar inside the `.wnlp` bundle. The record is serialized
+with the package's canonical JSON rules before DSSE signing; the signature does
+not cover a gzip wrapper hash or a compiled-definition hash.
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `digest` | yes | Canonical bundle digest: lowercase 64-hex SHA-256 over the uncompressed canonical tar. |
+| `name` | yes | Package name from the bundle manifest. |
+| `version` | yes | Package version from the bundle manifest. |
+| `publisherKeyId` | yes | Publisher public-key fingerprint in `SHA256:<unpadded-base64>` form. |
+| `timestamp` | yes | Unix epoch milliseconds when the author created the publication record. |
+
+The v1 publication object is closed: unknown properties are rejected. The
+publication payload type is bound to this record by the runtime DSSE allow-list,
+field manifest, and JSON Schema together.
 
 ## Enrollment grant
 
@@ -165,7 +188,7 @@ future preset can change without changing the required wire fields.
 
 ## Reference-mode Order
 
-`Order` is the fifth launch contract. The existing `Order` interface in
+`Order` is the sixth launch contract. The existing `Order` interface in
 `src/types.ts` is authoritative; this package adds a schema and a manifest but
 does not declare a second `Order` interface.
 

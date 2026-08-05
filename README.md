@@ -308,13 +308,15 @@ recovery-marker directory. A bundle install refuses when neither variable is
 supplied rather than falling back to the process user's ambient home.
 
 Bundle installs fail closed without their two required adapters (bundle
-ingestion and pre-commit verification). The default CLI now binds the real
+ingestion and pre-commit verification). The default CLI binds the real
 bundle ingestor, so a `.wnlp` produced by `packBundle` reaches the normal
 entrypoint-aware install validation; the pre-commit verifier remains unbound,
-so the CLI still fails closed rather than accepting an unsigned bundle. There
-is no default accepting parser, digest algorithm, or verifier, and publishing
-from this engine does not sign a bundle. `--global` applies only to `.wnlp` bundle sources; a GitHub
-source with `--global` is refused before any network request. Resolution is
+so the CLI still fails closed rather than accepting an unverified bundle. There
+is no default accepting signature verifier; the `add` route does not consume
+publication sidecars or verify a bundle's signature. Use `owenloop publish` to
+create the `.wnlp` bundle plus a signed or explicitly unsigned sidecar.
+`--global` applies only to `.wnlp` bundle sources; a GitHub source with `--global`
+is refused before any network request. Resolution is
 deliberately split: execution resolves by **digest only** (project first,
 fall-through to global only when the project object is absent — a corrupt
 project object is a hard error, never masked by a global copy), while
