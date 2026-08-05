@@ -16,11 +16,11 @@
  * execute a prompt or command; there is no fallback to definition-name
  * lookup and no empty-instructions return for an unknown digest.
  *
- * Scope (WP-B1): the adapter implemented here resolves over LOADED,
- * validated `WorkflowDef` objects — a temporary stand-in for the
- * content-addressed store that WP-A3 owns. The seam is deliberately narrow
- * ({@link OrderInstructionSource}) so a WP-A3-compatible source can be
- * injected later without changing the `Order` shape or its callers.
+ * Scope: {@link createDefInstructionSource} resolves over loaded, validated
+ * `WorkflowDef` objects. The content-addressed store adapter lives in
+ * `src/store/instruction-source.ts`; it primes asynchronously, verifies local
+ * bundle objects, and then serves the same synchronous lookup seam. Neither
+ * source changes the `Order` shape or the resolver's callers.
  */
 
 import { createHash } from 'node:crypto';

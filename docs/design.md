@@ -1557,8 +1557,8 @@ configuration and `body`). This shipped fallback projection intentionally
 reduces each produce pattern to `p.raw`, so a produce-level schema,
 `maxAttempts`, or `maxSchemaFailures` change does not change the fallback
 digest. The fallback identity is therefore weaker than a full compiled-
-definition identity; a future content-addressed source replaces it through
-the same resolver seam. Two fields are deliberately excluded: `dir` (where
+definition identity; a store-backed source can match this projection against
+verified bundle objects through the same resolver seam. Two fields are deliberately excluded: `dir` (where
 the YAML was loaded from — source-location metadata, not content) and
 `_includes` (expansion bookkeeping, cleared post-expansion). Identical
 content loaded from two different directories digests identically; a change
@@ -1602,11 +1602,11 @@ an unknown digest distinct from a missing step inside a known digest. The
 resolved record also carries the step's `maxAttempts` default, so an injected
 source cannot silently erase `${MAX_ATTEMPTS}` during materialization. The
 seam is an injectable interface because the digest-keyed lookup is precisely
-the shape a future content-addressed definition store plugs into: an embedder
-(or the CLI) can hand the engine any source implementing these methods, and
-`buildOrder`/resolution work unchanged against it. The engine ships no network
-fetch and no verification logic — "verified local source" means whatever the
-deployer trusts, addressed by digest.
+the shape the store-backed source uses: an embedder or driver can prime
+verified bundle objects and then hand the engine's resolver the synchronous
+lookup seam. The engine ships no network fetch and does not wire the store source
+by default — "verified local source" means the local object the deployer trusts,
+addressed by digest.
 
 `OrderResolver` sits on top of a source: `resolve(ref)` returns the source's
 record or throws the named refusal; `resolveOrder(order)` builds the
@@ -1659,3 +1659,73 @@ The wire shape carries two data-only placeholders, `consumesProof` and
 WP-B1 neither writes nor reads them — no code attaches or verifies a
 signature — but the slots exist so signed reason threads and signed consume
 values can land later without changing the reference-mode order shape again.
+
+## §30 Store-backed execution resolution
+
+Reference-mode packets remove authored instruction text from the transport, but
+that removal is only useful if the worker refuses to execute text supplied by the
+transport. The execution-side source is therefore backed by the local
+content-addressed workflow store.
+
+### §30.1 Prime, then look up
+
+`createStoreInstructionSource({ projectRoot, globalRoot, verifier })` has an
+asynchronous `prime(defDigest)` operation and the synchronous `lookup(ref)`
+operation required by `OrderResolver`:
+
+1. `prime` reads the project and global store indexes and enumerates their
+   indexed bundle objects.
+2. Each candidate is resolved through the store's digest resolver. The resolver
+   re-checks the installed object's manifest integrity map before the workflow
+   is loaded. A project object that exists but is corrupt is an integrity
+   refusal; it is not hidden by a valid global copy.
+3. The source loads the verified object's `workflow.yaml`, finalizes the
+   definition, and computes its instruction projection digest. The source
+   caches the definition only when that projection digest equals the order's
+   `defDigest`.
+4. `lookup` then serves the cached step's authored body and command bytes. A
+   cache miss is `unknown-digest`; a known digest with no matching step is
+   `unknown-step`.
+
+The two digest spaces are deliberate. Store object directories use the bundle's
+canonical archive digest, while orders use the instruction projection digest.
+The source bridges those spaces by deriving the projection digest from verified
+local objects; no remote text and no second persisted mapping is needed. Because
+filesystem verification is asynchronous but the engine's resolver seam is
+synchronous, the worker primes first and resolves second. A source cache is not
+a permission to resolve an unprimed digest.
+
+### §30.2 Refuse before execution
+
+An unknown or empty `defDigest`, an unknown step, a missing command on a command
+order, or a failed object-integrity check is a named refusal. The worker does
+not fall back to a workflow name, a remotely supplied prompt or command, a
+closest digest, or an empty command. A `worker: command` order is never passed
+to the process runner unless the exact command bytes came from the verified
+local store. Runtime placeholder substitution applies to prompts only; command
+bytes are returned exactly as authored.
+
+The same rule applies to agent workers. The prepare cache may retain routing and
+dispatch metadata, but the agent brief is rebuilt from the verified store
+step. The brief therefore does not originate from a transport-populated cache or
+a transport round trip.
+
+### §30.3 Harness carriers fail closed
+
+Before an agent harness starts, the worker parses the verified step's harness
+carrier and normalizes its permissions. A malformed carrier is a refusal, not
+an empty permission set. For example, a non-map `x.harness`, a non-string
+`x.harness.id`, or a legacy carrier key refuses before the harness starts; a
+hand-written `x` block cannot silently drop fields such as `disallowedTools`.
+Well-formed but unknown permission fields remain data for the selected harness,
+while malformed carrier structure remains an error.
+
+### §30.4 Bundle installation adapter
+
+The default CLI binds the real `.wnlp` bundle ingestor. Real bundles are staged
+through their `workflow.yaml` entrypoint, rather than scanning the bundle
+manifest as if `bundle.yaml` were a workflow definition. The install path still
+requires a pre-commit verifier and remains fail-closed when that adapter is not
+provided. The ingestor and verifier are separate concerns: ingestion makes the
+bundle's verified object available, while the verifier decides whether the
+install may commit it.

@@ -264,11 +264,13 @@ before this feature stays byte for byte the same. Opt a step into
 `executor: command` and give it a `command:` string to switch it to a
 deterministic worker instead of an LLM — the engine never runs it; your
 dispatcher branches on `order.worker` and resolves the authored command text
-through the order's `defDigest` at the `(defDigest, step, key)` boundary —
-the packet itself carries no command text. An optional `spec:` map carries further
-opaque config (a timeout, a working directory), and a judge entry accepts the
-same fields, so a quality gate can be a script's exit code instead of a
-verdict. See
+from the local workflow store through the order's `defDigest` at the
+`(defDigest, step, key)` boundary. The packet itself carries no command text:
+a command worker must refuse when the digest or command cannot be resolved and
+must never spawn from transport-supplied text. An optional `spec:` map carries
+further opaque config (a timeout, a working directory), and a judge entry
+accepts the same fields, so a quality gate can be a script's exit code instead
+of a verdict. See
 [`docs/authoring.md`](docs/authoring.md#executor--declaring-the-executor) and
 [`command-executor.yaml`](examples/workflows/command-executor.yaml).
 
@@ -296,7 +298,9 @@ them in the tree, both all-or-nothing with crash recovery:
   objects at `objects/sha256/<digest>/` — identical content deduplicates to
   one object, and an object's identity is its digest alone (never its name
   or source). Objects are hardened read-only in place, and every resolution
-  re-verifies the bytes before returning a path.
+  re-verifies the bytes before returning a path. Execution workers resolve
+static prompt and command text from those verified local objects by the
+order's `defDigest`; a remote packet cannot substitute instruction text.
 
 The bundle route derives `<home>` from the first non-blank caller-injected
 `HOME` or `USERPROFILE` value (`HOME` wins), and uses that home for the default
@@ -304,9 +308,12 @@ recovery-marker directory. A bundle install refuses when neither variable is
 supplied rather than falling back to the process user's ambient home.
 
 Bundle installs fail closed without their two required adapters (bundle
-ingestion and pre-commit verification) — there is no default accepting
-parser, digest algorithm, or verifier, and publishing from this engine does
-not sign a bundle. `--global` applies only to `.wnlp` bundle sources; a GitHub
+ingestion and pre-commit verification). The default CLI now binds the real
+bundle ingestor, so a `.wnlp` produced by `packBundle` reaches the normal
+entrypoint-aware install validation; the pre-commit verifier remains unbound,
+so the CLI still fails closed rather than accepting an unsigned bundle. There
+is no default accepting parser, digest algorithm, or verifier, and publishing
+from this engine does not sign a bundle. `--global` applies only to `.wnlp` bundle sources; a GitHub
 source with `--global` is refused before any network request. Resolution is
 deliberately split: execution resolves by **digest only** (project first,
 fall-through to global only when the project object is absent — a corrupt

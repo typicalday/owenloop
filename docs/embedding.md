@@ -34,7 +34,7 @@ the same one the engine uses internally — and accepts:
 | `reapTtlMs` | Forwarded to the `Engine` — the stranded-lease reap TTL. |
 | `maxLeaseMs` | Forwarded to the `Engine` — an opt-in hard cap on total lease lifetime (per-step `maxLease:` overrides). Unset (default): no cap; heartbeats extend a lease indefinitely. Set it only as a runaway backstop — it can reap a healthy, still-beating job. |
 | `maxCallDepth` | Forwarded to the `Engine` — the hard cap on `calls:` composition depth (root instance = depth 0). Defaults to 64. Defense in depth against a `calls:` cycle; only relevant when you hand-wire a custom `DefResolver` that construction-time validation can't inspect. |
-| `instructionSource` | The order-instruction source (`OrderInstructionSource`: `digestOf` + typed `lookup`). Each resolved record includes the exact static instruction bytes and the step's `maxAttempts` materialization metadata. Default: an adapter over the definitions this engine loads — the same reference-mode behavior the CLI gets. Supply your own to serve digests and instructions from a content-addressed store of verified definitions; `buildOrder` takes digests from it and `resolver` reads its records (see [Resolving instructions](#resolving-instructions)). |
+| `instructionSource` | The order-instruction source (`OrderInstructionSource`: `digestOf` + typed `lookup`). Each resolved record includes the exact static instruction bytes and the step's `maxAttempts` materialization metadata. Default: an adapter over the definitions this engine loads — the same reference-mode behavior the CLI gets. For a store-backed consumer, use `createStoreInstructionSource` and call its asynchronous `prime(defDigest)` before the synchronous resolver lookup; the source verifies and caches a local object before serving its bytes (see [Resolving instructions](#resolving-instructions)). The store source is a consumer-side resolver; the engine's default emitter remains the loaded-definition adapter. |
 | `onEvent`   | A push-style observer registered at construction (equivalent to `engine.subscribe`). See [Events](#events). |
 | `onListenerError` | Where a throwing listener's error is routed (default: swallowed). |
 
@@ -105,14 +105,44 @@ bare reference). The resolver is backed by an `OrderInstructionSource`, and
 the same path serves every caller: the CLI, this embedded engine, and orders
 relayed from a remote coordinator or transport all resolve through one
 boundary, against whatever source the deployer trusts. The shipped default is
-the loaded-definition adapter (seeded with the defs this engine runs); a host
-that distributes definitions from a content-addressed store can inject its own
-source via `instructionSource` — `buildOrder` takes digests from it and
-resolution reads its verified records, with no other engine change.
+the loaded-definition adapter (seeded with the defs this engine runs).
+
+A host that distributes definitions from the content-addressed store can use
+`createStoreInstructionSource({ projectRoot, globalRoot, verifier })`. The store
+source performs filesystem verification asynchronously, so the host must prime
+the order's digest before the resolver's synchronous lookup:
+
+```ts
+import {
+  createBundleIngestor,
+  createStoreInstructionSource,
+  OrderResolver,
+} from 'owenloop';
+
+const source = createStoreInstructionSource({
+  projectRoot: 'workflows',
+  globalRoot: '/path/to/.owenloop/workflows',
+  verifier: createBundleIngestor(),
+});
+const resolver = new OrderResolver(source);
+
+await source.prime(order.defDigest);       // verify and cache the local object
+const instructions = resolver.resolveOrder(order); // synchronous cache lookup
+```
+
+`prime` returns `resolved` or `unknown-digest`; an integrity failure is a
+separate refusal. The source enumerates indexed bundle objects, verifies each
+candidate on read, loads its `workflow.yaml`, and matches the resulting
+instruction projection digest to `order.defDigest`. The order's digest is the
+only instruction key supplied by the transport; the source never accepts
+prompt or command text from the packet. `createEngine` keeps its default
+loaded-definition emitter, because the store source's `digestOf` is deliberately
+unable to emit a digest for an uninstalled definition.
 
 Resolution returns `{ prompt?, command?, acceptance? }` — the exact authored
 values, byte-for-byte (the loaded-definition adapter preserves an authored
-empty body as `prompt: ''`; a source may omit prompt when no prompt exists), with the runtime placeholders
+empty body as `prompt: ''`; a source may omit prompt when no prompt exists), with
+the runtime placeholders
 (`${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MAX_ATTEMPTS}`)
 materialized into the prompt. An unknown digest — the definition was never
 delivered, or the bytes don't match what emitted the order — raises the named
@@ -120,8 +150,8 @@ refusal `UnknownDefDigestError` (it carries `defDigest`, and its message names
 it). A known digest with an unknown `step` raises the distinct
 `UnknownInstructionError` (it carries `defDigest`, `step`, and `key`). Treat
 either refusal as refuse-the-job: there is no fallback to name-based
-resolution and no degraded mode. See [`docs/design.md` §29](design.md) for the
-full contract.
+resolution and no degraded mode. See [`docs/design.md` §29](design.md) and
+[§30](design.md) for the full contract.
 
 `engine.tick(wf)` is **deep by default**: after ticking `wf` it descends into
 every live `calls:` child (recursively), folding their orders, `reaped`, folded
