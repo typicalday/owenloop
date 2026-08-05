@@ -1,11 +1,11 @@
 /**
- * Hermetic config-shape assertions for the Claude Code driver pack's static
- * files (plain `node:test` — no Cloudflare bindings, no `workerd`).
+ * Hermetic config-shape assertions for the Claude Code and Codex driver packs'
+ * static files (plain `node:test` — no Cloudflare bindings, no `workerd`).
  *
- * IMPORTANT SCOPE LIMIT: these tests only assert that the pack's static
+ * IMPORTANT SCOPE LIMIT: these tests only assert that the packs' static
  * config is internally consistent (e.g. the agent frontmatter's `tools:`
- * allowlist is exactly the governed set; `.mcp.json`'s default entry carries
- * no credential, per the OAuth-default contract). They do NOT prove Claude Code actually
+ * allowlist is exactly the governed set; `.mcp.json` entries carry no
+ * credential, per the OAuth-default contract). They do NOT prove Claude Code or Codex actually
  * resolves the plugin, installs the marketplace, or namespaces its tools the
  * way it really behaves at runtime — that live verification is exactly what
  * `docs/runbooks/claude-code-driver-check.md` (semi-manual, never CI) is
@@ -130,56 +130,134 @@ test('marketplace.json parses, has exactly one plugin entry, and its source reso
   assert.equal(pluginManifest.name, 'owenloop');
 });
 
-const RAW = readText('plugins/claude-code/plugin/.mcp.json');
-const CONFIG = readJson('plugins/claude-code/plugin/.mcp.json') as {
-  mcpServers: Record<string, Record<string, unknown>>;
-};
+const MCP_MANIFESTS = [
+  {
+    harness: 'Claude Code',
+    path: 'plugins/claude-code/plugin/.mcp.json',
+    raw: readText('plugins/claude-code/plugin/.mcp.json'),
+    config: readJson('plugins/claude-code/plugin/.mcp.json') as {
+      mcpServers: Record<string, Record<string, unknown>>;
+    },
+  },
+  {
+    harness: 'Codex',
+    path: 'plugins/codex/plugins/owenloop/.mcp.json',
+    raw: readText('plugins/codex/plugins/owenloop/.mcp.json'),
+    config: readJson('plugins/codex/plugins/owenloop/.mcp.json') as {
+      mcpServers: Record<string, Record<string, unknown>>;
+    },
+  },
+] as const;
 
-// The manifest is single-stdio: one npx-pinned `owenloop` entry, no URL
-// entry and no `owenwork` entry. The retired `owenwork` mount launched
-// the retired dispatcher mount; the
-// `conduct`/`shift` skills drive the merged `owenloop` CLI over Bash
-// instead. INV-41 in docs/invariants.md is scoped to this single-stdio
-// shape and is enforced by the assertions below.
+/**
+ * Both harnesses expose one PATH-resolved `owenloop mcp` entry. The Claude Code
+ * manifest is stdio-shaped; Codex adds its environment-name allowlist. The
+ * shared assertions below keep both manifests free of credentials and retired
+ * launch forms.
+ */
 
-test('.mcp.json declares exactly one server: the owenloop stdio control plane (INV-41)', () => {
-  // Asserted as an array, not a Set — this pins the NAME and the COUNT, so
-  // re-adding a second server fails loudly rather than silently passing.
-  assert.deepEqual(Object.keys(CONFIG.mcpServers), ['owenloop']);
-});
+for (const { harness, config } of MCP_MANIFESTS) {
+  test(`${harness} .mcp.json declares exactly one server: the owenloop control plane (INV-41)`, () => {
+    // Asserted as an array, not a Set — this pins the NAME and the COUNT, so
+    // re-adding a second server fails loudly rather than silently passing.
+    assert.deepEqual(Object.keys(config.mcpServers), ['owenloop']);
+  });
+}
 
-test('.mcp.json owenloop entry is npx-pinned stdio invoking the published control-plane server, no url/headers/env (INV-38)', () => {
-  // Rewritten INV-38: under double-stdio the manifest carries no
-  // credential at all — `owenloop mcp` reads the human slot from the
-  // shared local credential store at spawn time, so there is nothing to
-  // bake into the entry. The unset-env-var probe (knowledge-graph node
-  // M4kfzlyc2b2Bjp7NW5HrO) showed Claude Code fails an HTTP server
-  // outright on an unset ${VAR} in headers/url rather than gracefully
-  // 401-challenging into OAuth — moot here since there is no headers/url
-  // key at all, only asserted for completeness.
-  const owenloop = CONFIG.mcpServers['owenloop']!;
+test('Claude Code .mcp.json owenloop entry uses the PATH CLI, no url/headers/env (INV-38)', () => {
+  const owenloop = MCP_MANIFESTS[0]!.config.mcpServers['owenloop']!;
   assert.equal(owenloop['type'], 'stdio');
-  assert.equal(owenloop['command'], 'npx');
-  assert.deepEqual(owenloop['args'], ['-y', 'owenloop@^0.4.1', 'mcp']);
+  assert.equal(owenloop['command'], 'owenloop');
+  assert.deepEqual(owenloop['args'], ['mcp']);
   assert.equal(owenloop['url'], undefined);
   assert.equal(owenloop['headers'], undefined);
   assert.equal(owenloop['env'], undefined);
 });
 
-test('.mcp.json carries no token-like literal anywhere in the file', () => {
-  assert.ok(!((RAW)).includes('olp_'));
+for (const { harness, raw } of MCP_MANIFESTS) {
+  test(`${harness} .mcp.json carries no token-like literal anywhere in the file`, () => {
+    assert.ok(!raw.includes('olp_'));
+  });
+
+  test(`${harness} .mcp.json carries no --origin flag or OWENLOOP_URL reference anywhere in the file`, () => {
+    assert.ok(!raw.includes('--origin'));
+    assert.ok(!raw.includes('OWENLOOP_URL'));
+  });
+
+  test(`${harness} .mcp.json carries no reference to the retired owenwork binary (INV-41)`, () => {
+    // Positive assertion that the retired mount is GONE, not merely unpinned:
+    // the retired dispatcher mount was deleted upstream, so any reappearance of the
+    // retired binary name here would re-declare a server that cannot start.
+    assert.ok(!raw.includes('owenwork'));
+  });
+}
+
+test('Codex plugin.json declares skills and MCP paths that resolve inside the plugin', () => {
+  const plugin = readJson('plugins/codex/plugins/owenloop/.codex-plugin/plugin.json') as {
+    name: string;
+    version: string;
+    skills: string;
+    mcpServers: string;
+  };
+  assert.equal(plugin.name, 'owenloop');
+  assert.equal(plugin.skills, './skills/');
+  assert.equal(plugin.mcpServers, './.mcp.json');
+
+  const pluginRoot = resolve(ROOT, 'plugins/codex/plugins/owenloop');
+  assert.equal(statSync(resolve(pluginRoot, plugin.skills)).isDirectory(), true);
+  assert.equal(statSync(resolve(pluginRoot, plugin.mcpServers)).isFile(), true);
 });
 
-test('.mcp.json carries no --origin flag or OWENLOOP_URL reference anywhere in the file', () => {
-  assert.ok(!((RAW)).includes('--origin'));
-  assert.ok(!((RAW)).includes('OWENLOOP_URL'));
+test('Codex plugin.json version matches the Claude Code plugin.json version', () => {
+  const claude = readJson('plugins/claude-code/plugin/.claude-plugin/plugin.json') as { version: string };
+  const codex = readJson('plugins/codex/plugins/owenloop/.codex-plugin/plugin.json') as { version: string };
+  assert.equal(codex.version, claude.version);
 });
 
-test('.mcp.json carries no reference to the retired owenwork binary (INV-41)', () => {
-  // Positive assertion that the retired mount is GONE, not merely unpinned:
-  // the retired dispatcher mount was deleted upstream, so any reappearance of the
-  // retired binary name here would re-declare a server that cannot start.
-  assert.ok(!((RAW)).includes('owenwork'));
+test('Codex marketplace.json parses and its local plugin source stays inside the marketplace root', () => {
+  const marketplace = readJson('plugins/codex/.agents/plugins/marketplace.json') as {
+    name: string;
+    plugins: Array<{ name: string; source: { source: string; path: string } }>;
+  };
+  assert.equal(marketplace.plugins.length, 1);
+  const entry = marketplace.plugins[0]!;
+  assert.equal(entry.name, 'owenloop');
+  assert.equal(entry.source.source, 'local');
+
+  const marketplaceRootDir = resolve(ROOT, 'plugins/codex');
+  const resolvedSourceDir = resolve(marketplaceRootDir, entry.source.path);
+  const rel = relative(marketplaceRootDir, resolvedSourceDir);
+  assert.equal(rel.startsWith('..'), false);
+  assert.equal(isAbsolute(rel), false);
+  assert.equal(statSync(resolvedSourceDir).isDirectory(), true);
+  const pluginManifest = JSON.parse(
+    readFileSync(resolve(resolvedSourceDir, '.codex-plugin/plugin.json'), 'utf8'),
+  ) as { name: string };
+  assert.equal(pluginManifest.name, 'owenloop');
+});
+
+test('both marketplace manifests use the owenloop@owenloop selector', () => {
+  const manifests = [
+    readJson('plugins/claude-code/.claude-plugin/marketplace.json') as {
+      name: string;
+      plugins: Array<{ name: string }>;
+    },
+    readJson('plugins/codex/.agents/plugins/marketplace.json') as {
+      name: string;
+      plugins: Array<{ name: string }>;
+    },
+  ];
+  for (const marketplace of manifests) {
+    assert.equal(marketplace.name, 'owenloop');
+    assert.equal(marketplace.plugins.length, 1);
+    assert.equal(marketplace.plugins[0]!.name, 'owenloop');
+  }
+});
+
+test('Codex .mcp.json uses the PATH lookup environment allowlist', () => {
+  const owenloop = MCP_MANIFESTS[1]!.config.mcpServers['owenloop']!;
+  assert.deepEqual(owenloop['env_vars'], ['HOME', 'PATH', 'XDG_CONFIG_HOME']);
+  assert.equal(owenloop['cwd'], undefined);
 });
 
 const HOOKS = readJson('plugins/claude-code/plugin/hooks/hooks.json') as {

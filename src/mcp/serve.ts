@@ -34,6 +34,7 @@
  * command body — lives here.
  */
 
+import { packageVersion } from '../package-version.ts';
 import { CliError } from '../util.ts';
 import {
   authHeader,
@@ -780,7 +781,7 @@ export async function runMcpCommand(io: McpIo, opts: { hubFlag?: string }): Prom
 
   const server = createMcpServer({
     name: 'owenloop-cli-mcp',
-    version: '0.0.1',
+    version: packageVersion(),
     tools,
     write: (msg) => io.out(JSON.stringify(msg)),
     err: (line) => io.err(line),

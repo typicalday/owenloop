@@ -50,6 +50,12 @@ test('initialize echoes a recognized protocol version and advertises tools capab
   assert.deepEqual(f.result.serverInfo, { name: 'test-srv', version: '9.9.9' });
 });
 
+test('initialize echoes the corrected 2025-11-25 protocol revision', async () => {
+  const { server, writes } = harness();
+  await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } }));
+  assert.equal((writes[0] as Frame).result.protocolVersion, '2025-11-25');
+});
+
 test('initialize falls back to the server version for an unknown protocol', async () => {
   const { server, writes } = harness();
   await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '1999-01-01' } }));

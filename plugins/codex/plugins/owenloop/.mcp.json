@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "owenloop": {
-      "type": "stdio",
       "command": "owenloop",
-      "args": ["mcp"]
+      "args": ["mcp"],
+      "env_vars": ["HOME", "PATH", "XDG_CONFIG_HOME"]
     }
   }
 }

@@ -45,7 +45,7 @@ const RECOGNIZED_PROTOCOL_VERSIONS = new Set([
   '2024-11-05',
   '2025-03-26',
   '2025-06-18',
-  '2025-11-05',
+  '2025-11-25',
 ]);
 
 /** The version we answer with when the client's is missing or unrecognized. */

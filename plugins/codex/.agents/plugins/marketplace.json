@@ -1,0 +1,21 @@
+{
+  "name": "owenloop",
+  "interface": {
+    "displayName": "Owenloop"
+  },
+  "plugins": [
+    {
+      "name": "owenloop",
+      "source": {
+        "source": "local",
+        "path": "./plugins/owenloop"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Engineering",
+      "description": "Codex plugin for the owenloop workflow engine."
+    }
+  ]
+}
