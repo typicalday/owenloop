@@ -1,6 +1,6 @@
 {
   "name": "owenloop",
-  "version": "2.4.0",
+  "version": "0.5.0",
   "description": "Codex plugin for the owenloop workflow engine.",
   "skills": "./skills/",
   "mcpServers": "./.mcp.json"
