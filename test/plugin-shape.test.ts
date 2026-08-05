@@ -92,9 +92,16 @@ test('plugin.json parses and has name "owenloop"', () => {
   assert.equal(plugin.name, 'owenloop');
 });
 
-test('plugin.json is version 2.x (the owenwork run-story rewrite)', () => {
+test('Claude Code plugin.json version equals the package.json version (§7 check 1)', () => {
+  const pkg = readJson('package.json') as { version: string };
   const plugin = readJson('plugins/claude-code/plugin/.claude-plugin/plugin.json') as { version: string };
-  assert.match(plugin.version, /^2\./);
+  assert.equal(plugin.version, pkg.version);
+});
+
+test('Codex plugin.json version equals the package.json version (§7 check 2)', () => {
+  const pkg = readJson('package.json') as { version: string };
+  const plugin = readJson('plugins/codex/plugins/owenloop/.codex-plugin/plugin.json') as { version: string };
+  assert.equal(plugin.version, pkg.version);
 });
 
 test('marketplace.json parses, has exactly one plugin entry, and its source resolves INSIDE the marketplace root (CC v2.1.201 rejects sources that escape it)', () => {

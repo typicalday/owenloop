@@ -1,6 +1,6 @@
 {
   "name": "owenloop",
-  "version": "2.4.0",
+  "version": "0.5.0",
   "description": "Claude Code driver for owenloop — cross-harness shift and conduct skills driven by the owenloop CLI, plus one hub control-plane MCP server backing an author skill and a fallback worker, for conducting and authoring workflows against your hosted owenloop server.",
   "author": {
     "name": "Typical Day"
