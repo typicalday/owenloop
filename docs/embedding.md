@@ -45,15 +45,17 @@ Prefer to wire it yourself? The pieces are all exported — `createEngine` is ju
 sugar over them:
 
 ```ts
-import { Engine, openStore, loadDefs } from 'owenloop';
+import { Engine, openStore, loadDefs, createDefInstructionSource } from 'owenloop';
 
 const store = openStore('.owenloop/state.db');
 const defs = loadDefs('workflows');
+const instructionSource = createDefInstructionSource(defs.values());
 const engine = new Engine(store, (name) => {
   const d = defs.get(name);
   if (!d) throw new Error(`unknown workflow definition '${name}'`);
   return d;
-});
+}, { instructionSource });
+const { resolver } = engine;
 ```
 
 `loadDefs` already validates what it reads from disk. If you build a def set by
@@ -115,7 +117,9 @@ empty body as `prompt: ''`; a source may omit prompt when no prompt exists), wit
 materialized into the prompt. An unknown digest — the definition was never
 delivered, or the bytes don't match what emitted the order — raises the named
 refusal `UnknownDefDigestError` (it carries `defDigest`, and its message names
-it). Treat that as refuse-the-job: there is no fallback to name-based
+it). A known digest with an unknown `step` raises the distinct
+`UnknownInstructionError` (it carries `defDigest`, `step`, and `key`). Treat
+either refusal as refuse-the-job: there is no fallback to name-based
 resolution and no degraded mode. See [`docs/design.md` §29](design.md) for the
 full contract.
 

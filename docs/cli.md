@@ -1454,9 +1454,9 @@ non-zero exit as a failure, not a success.
 ## What a job looks like
 
 `tick` returns `{ workflow, orders, reaped }`. Each order is a **reference
-packet**: it carries everything needed to *route* and *execute* the job — the
-run id, the captured input values, the owed outputs with their reason threads —
-plus a `defDigest` that names *which definition snapshot* holds the authored
+packet**: it carries the routing fields and run-time context for the job — the
+run id, the captured input values, the owed outputs with their reason threads
+— plus a `defDigest` that names *which definition snapshot* holds the authored
 instructions. The instructions themselves (the step's `body:` prompt, any
 `command:` text) are **not** on the order, and `tick`/`order` never print
 them.
@@ -1482,18 +1482,21 @@ them.
 
 A worker first **resolves the reference**: the `(defDigest, step, key)`
 boundary maps the order to the exact authored instructions from the worker's
-verified local definition source — the same resolver the embedded engine and
+trusted local definition source — the same resolver the embedded engine and
 the CLI use. Resolution returns the authored `prompt` (with
 `${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MAX_ATTEMPTS}`
 materialized), the authored `command` if the step has one, and nothing
 fabricated. If the worker's source does not know the digest — the definition
-was never delivered, or was tampered with — resolution raises a named refusal
-(`UnknownDefDigestError`): the worker must refuse the job rather than guess
-instructions by step name or fetch unverified text. Once resolved, the worker
-reads the resolved prompt + `consumes` + `owes`, does the work, reports with
-`green` (or `emit`/`seal` for collections), then `close`s the job. The reject
-counts in `owes[]` let a workflow escalate on its own — e.g. switch to a
-stronger model after two rejections — before the engine stalls the step.
+was never delivered, or the current on-disk definition no longer matches the
+pinned digest — resolution raises `UnknownDefDigestError`. If the digest is
+known but the referenced step is absent, resolution raises the distinct
+`UnknownInstructionError` and identifies the digest, step, and key. The worker
+must refuse either malformed reference rather than guess instructions by step
+name or fetch unverified text. Once resolved, the worker reads the resolved
+prompt + `consumes` + `owes`, does the work, reports with `green` (or
+`emit`/`seal` for collections), then `close`s the job. The reject counts in
+`owes[]` let a workflow escalate on its own — e.g. switch to a stronger model
+after two rejections — before the engine stalls the step.
 
 Static authored text (prompts, commands) travels by digest reference; dynamic
 data — `consumes` values and the rejection `reasons` threads — stays on the

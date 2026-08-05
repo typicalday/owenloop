@@ -660,7 +660,7 @@ The `M2B-REARM` branch (§23.6.1 step 7 — child un-greened while parent stays 
 
 - **Descent condition.** The parent descends into a child step only when all three hold: (1) the step's **gate is green** (same readiness `maintainCalls` uses to spawn/mirror — see `callsGateReady`), (2) a **child instance exists** (`findChildByParent`), and (3) the parent's `calls:` artifact for that step is specifically **`owed`** — an outstanding producer debt, not merely non-green. `owed` is the sole live debt: it covers the fresh spawn, the F4 propagated-reject reopen (§23.6.8), and a gate-move re-arm. A `skipped`/`rejected`/`retracted` mirror is a dead or refused branch and is **not** descended (issuing child work for it would resurrect a settled decision); a re-armed gate with a still-green mirror, or a step whose child was never spawned, is likewise skipped — descent chases only real, outstanding child work. `callsDescendTargets(parentWf, def)` computes this set.
 - **Own-tx-per-frame.** Descent runs *outside* the parent's transaction (`store.tx` is non-re-entrant — `BEGIN IMMEDIATE` would deadlock on itself). Each child frame opens its own tx via its own `tickInternal` call. The descent condition above is an OPTIMISTIC pre-read (computed outside any tx); the child frame carries the `calls:` edge (`parentEdge`) and, inside its own claim tx, re-verifies the parent gate + child-input consistency — the same predicate `publishCallsGreen` uses — before issuing any order, so a concurrent parent advance that superseded the parent value between the pre-read and the claim issues nothing and skips the subtree. This is the descent-path twin of the in-tx read-verify-write invariant §23.6.6 establishes for the publish/provision paths. The recursion carries a `visited` set so a diamond (two parents reaching the same child) or an accidental cycle ticks each instance at most once.
-- **Aggregation.** Child orders are concatenated onto the parent's; `reaped` sums; `dueAt` takes the minimum across the tree so the caller's next-wake is the earliest across all levels. Each folded `DeferredFiring` carries a `workflow` field naming the instance it belongs to — **absent means the ticked root, present means a descendant** — so a caller can still tell which instance a deferral came from. The single `now` is threaded through the whole descent, so a reap TTL that trips at the parent's clock trips consistently for children in the same sweep.
+- **Aggregation.** Child orders are concatenated onto the parent's; `reaped` sums; `dueAt` takes the minimum across the tree so the caller's next-wake is the earliest across all levels. Each folded `DeferredFiring` carries a `workflow` field naming the instance it belongs to — **absent means the ticked root, present means a descendant** — so a caller can still tell which instance a deferral came from. The single `now` is threaded through the whole descent, so a reap TTL that trips at the parent's clock trips consistently for children in the same sweep. Because the folded order list can contain child orders, a driver must commit and close each order against `order.workflow`, not the root id passed to `tick`. The `{ deep: false }` opt-out is the only case where every order is guaranteed to belong to the requested root.
 - **Opt-out.** `tick(parentWf, { deep: false })` (CLI `--shallow`) ticks only that one instance — no descent, orders all carry the root's `workflow`. Use it to drive a single instance deliberately (tests, targeted retries); the default deep tick is what production drivers want.
 
 **Status child-summary.** `status(parentWf)` enriches each `calls:`-debt entry with a `child: ChildStatusSummary` (`{ workflow, def, done, stalled, debts }`) when a child has been spawned for that step. `stalled` is true when the child (or, recursively, a grandchild on an unpaid `calls:` path) has any stalled debt — a worker that hit `maxAttempts` with no green outcome. This lets a Shift see, from the parent alone, that a `calls:` debt is blocked on a stuck child without separately walking into the child's own `status`. Like `failedRuns`/`attempts`, the field is engine-populated cross-instance state; `model.ts`'s pure single-instance `workflowStatus` never sets it.
@@ -1550,20 +1550,25 @@ the run row is inserted in the same transaction, and the persisted
 at the granularity that matters for instructions: the sha256 of a canonical
 JSON projection of the definition's instruction-bearing fields (the
 top-level routing fields — `name`, `engine`, `inputs`, `outputs`,
-`invariants`, `x`, `executors`, schedule fields — plus each step's
-consumes/produces/generates shape and its authored `model`, `executor`,
+`invariants`, `x`, `executors` — plus each step's `consumes`, `produces`, and
+`generates` **raw path strings** and its authored `model`, `executor`,
 `command`, `spec`, `workdir`, effect/on/idle/reap/capabilities/calls/judges
-configuration and `body`). Two fields are deliberately excluded: `dir`
-(where the YAML was loaded from — source-location metadata, not content) and
+configuration and `body`). This shipped fallback projection intentionally
+reduces each produce pattern to `p.raw`, so a produce-level schema,
+`maxAttempts`, or `maxSchemaFailures` change does not change the fallback
+digest. The fallback identity is therefore weaker than a full compiled-
+definition identity; a future content-addressed source replaces it through
+the same resolver seam. Two fields are deliberately excluded: `dir` (where
+the YAML was loaded from — source-location metadata, not content) and
 `_includes` (expansion bookkeeping, cleared post-expansion). Identical
 content loaded from two different directories digests identically; a change
-to any step's prompt, command, or routing shape digests differently.
+to a step's prompt, command, or included routing field digests differently.
 
 `defDigest` is **not** `hashDef` (§28.1's drift hash — the 16-hex prefix of
 the full `JSON.stringify(def)`): `hashDef` sees every field including `dir`
 and serves the informational `defDrift` comparison, while `defDigest` sees
-only instruction-bearing content and serves resolution identity. Both are
-content hashes of the same `WorkflowDef` object but answer different
+the fallback projection described above and serves resolution identity. Both
+are content hashes of the same `WorkflowDef` object but answer different
 questions, and neither is a truncation of the other.
 
 ### §29.2 The resolver boundary — `(defDigest, step, key)`
@@ -1615,7 +1620,8 @@ moved because the packet no longer contains materialized text: the authored
 body is served as authored, and the per-run values join it at resolve time.
 `Engine` exposes the resolver as `engine.resolver` (and `createEngine`
 returns it alongside the engine), so an embedder's loop is
-`tick → resolve → execute → green/close`.
+`tick → resolve → execute → green/close`; the commit and close use the
+order's own `workflow` because the default deep tick can return child orders.
 
 ### §29.3 Unknown digest — a named refusal, never a fallback
 
