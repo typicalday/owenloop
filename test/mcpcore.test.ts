@@ -56,6 +56,18 @@ test('mcpcore: initialize returns capabilities, serverInfo, and echoes a recogni
   assert.deepEqual(r.serverInfo, { name: 'owenloop-cli-mcp', version: '0.0.1' });
 });
 
+test('mcpcore: initialize echoes the corrected 2025-11-25 protocol revision', async () => {
+  const { server, frames } = makeServer([echoTool]);
+  await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-25' } }));
+  assert.equal((frames[0]!.result as { protocolVersion: string }).protocolVersion, '2025-11-25');
+});
+
+test('mcpcore: initialize rejects the former 2025-11-05 typo and falls back to OUR version', async () => {
+  const { server, frames } = makeServer([echoTool]);
+  await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-11-05' } }));
+  assert.equal((frames[0]!.result as { protocolVersion: string }).protocolVersion, '2025-06-18');
+});
+
 test('mcpcore: initialize with an unknown protocolVersion answers with OUR version', async () => {
   const { server, frames } = makeServer([echoTool]);
   await server.handleLine(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '1999-01-01' } }));

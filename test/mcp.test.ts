@@ -26,6 +26,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { mainAsync } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
@@ -35,6 +36,7 @@ import { kcHuman, kcKey, makeIo, OAUTH_METADATA, realHttpServer, routedFetch } f
 import type { HubIo, RouteHandler } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
+const PACKAGE_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 
 /** A never-expiring human credential that needs no token endpoint to use. */
 const PASTED_HUMAN: Credential = { kind: 'oauth-pasted', accessToken: 'mcpat_human' };
@@ -47,7 +49,12 @@ function seedHuman(t: HubIo, origin = ORIGIN, cred: Credential = PASTED_HUMAN): 
 interface Frame {
   jsonrpc: string;
   id?: number;
-  result?: { content?: Array<{ type: string; text: string }>; isError?: boolean; tools?: Array<{ name: string }> };
+  result?: {
+    content?: Array<{ type: string; text: string }>;
+    isError?: boolean;
+    tools?: Array<{ name: string }>;
+    serverInfo?: { version: string };
+  };
   error?: { code: number; message: string };
 }
 
@@ -89,6 +96,9 @@ test('mcp: handshake advertises 22 tools (17 baseline + create_agent + 4 crew to
 
   const { code, frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, LIST]);
   assert.equal(code, 0, t.err.join('\n'));
+  const serverInfo = frames[0]!.result!.serverInfo!;
+  assert.notEqual(serverInfo.version, '0.0.1');
+  assert.equal(serverInfo.version, PACKAGE_VERSION);
   const names = frames[1]!.result!.tools!.map((x) => x.name);
   assert.equal(names.length, 22, names.join(','));
   assert.ok(names.includes('create_agent'));

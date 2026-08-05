@@ -2,8 +2,8 @@
  * Enforces the committed materialized plugin contract.
  *
  * `plugins/_skills/` and `plugins/_hooks/` are the single source of truth;
- * `plugins/claude-code/plugin/skills/` and `.../hooks/` are committed copies so
- * a Claude Code marketplace works directly from a git checkout. The test walks
+ * `plugins/claude-code/plugin/` and `plugins/codex/plugins/owenloop/` contain
+ * committed copies so both marketplaces work directly from a git checkout. The test walks
  * both directions, compares bytes and executable bits, and catches stale
  * materialized or missing source files. The copies are intentionally not made
  * by `prepack`: generating them there would make a checkout un-installable and
@@ -38,6 +38,16 @@ const MIRRORS = [
     name: 'hooks',
     source: join(ROOT, 'plugins/_hooks'),
     materialized: join(ROOT, 'plugins/claude-code/plugin/hooks'),
+  },
+  {
+    name: 'codex skills',
+    source: join(ROOT, 'plugins/_skills'),
+    materialized: join(ROOT, 'plugins/codex/plugins/owenloop/skills'),
+  },
+  {
+    name: 'codex hooks',
+    source: join(ROOT, 'plugins/_hooks'),
+    materialized: join(ROOT, 'plugins/codex/plugins/owenloop/hooks'),
   },
 ] as const;
 
