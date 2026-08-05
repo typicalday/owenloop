@@ -87,7 +87,9 @@ The following rules apply:
 - `integrity.algorithm` is exactly `sha256`.
 - `integrity.files` contains one lowercase 64-hex SHA-256 digest for every
   regular archive file except `bundle.yaml`. The packer regenerates this map
-  from the source bytes and does not edit the source manifest.
+  from the source bytes and does not edit the source manifest. This exclusion
+  avoids a recursive self-hash; the def digest still covers the complete
+  canonical tar, including `bundle.yaml`.
 - `capabilities` contains requested capability classes and values. The
   manifest does not grant capabilities.
 - `lock` maps exact versioned `namespace/name@version` call references to
@@ -132,15 +134,31 @@ For every regular file:
 - The archive ends with exactly two zero blocks and no bytes after the
   terminator.
 
-The gzip wrapper uses a fixed compression level and has no optional filename,
-comment, or extra fields. Gzip mtime bytes are zero and the OS byte is forced to
-zero so Darwin and Linux produce the same bytes.
+The gzip wrapper uses compression level 9 and has no optional filename,
+comment, or extra fields. Gzip mtime bytes are zero, and gzip header byte 9 (the
+OS byte) is explicitly forced to zero so Darwin and Linux produce the same
+bytes.
+
+The canonical tar contains regular-file entries only. Parent directories are
+implied by the `/`-separated file paths and are never emitted as tar entries.
+The strict reader rejects archive symlink, hardlink, device, FIFO, socket,
+directory, and unknown entry types. The packer rejects source symlinks and
+non-regular filesystem nodes. Absolute paths, `.` segments, and `..` traversal
+are refused rather than normalized.
+
+The strict reader is as constrained as the writer. Every byte range parsed by
+the reader is limited to the exact form emitted by the canonical writer,
+including regular-file data padding and PAX-header data padding, which must be
+zero. This closes the padding malleability defect: attacker-chosen bytes cannot
+sit inside the digest-covered tar while remaining absent from every per-file
+hash. The closed writer/reader contract is the format's core guarantee: one
+logical package cannot mint more than one distinct digest.
 
 ## Reading and extraction safety
 
 `inspectBundle` and `unpackBundle` apply bounded compressed size, expanded size,
-entry count, per-file size, and path length limits before returning or writing
-file data. Strict readers reject malformed checksums and octal fields,
+tar-header count, per-file size, and path length limits before returning or
+writing file data. Strict readers reject malformed checksums and octal fields,
 truncated headers or data, malformed or dangling PAX metadata, duplicate paths,
 unsupported entry types, non-canonical headers, unsorted effective paths,
 trailing bytes, missing manifests, invalid manifests, unsafe entrypoints,

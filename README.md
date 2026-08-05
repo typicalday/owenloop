@@ -392,10 +392,11 @@ execution tasks. There is no separate `owenwork` package or binary.
 
 A workflow and its referenced regular files can be packaged as one deterministic
 `.wnlp` file. The package format uses a canonical POSIX/PAX tar stream wrapped
-in gzip; the package digest is SHA-256 over the uncompressed canonical tar, not
-over the gzip bytes. `bundle.yaml` carries package identity, platform selectors,
-requested capabilities, generated per-file SHA-256 values, and digest-pinned
-`calls:` references. `workflow.yaml` remains the only execution definition.
+in gzip; the package digest is SHA-256 over the exact uncompressed canonical
+tar, not over the gzip bytes. `bundle.yaml` carries package identity, platform
+selectors, requested capabilities, generated per-file SHA-256 values, and
+namespace-qualified, digest-pinned `calls:` references. `workflow.yaml` remains
+the only execution definition.
 
 ```sh
 owenloop bundle pack ./report --output ./report-1.2.0.wnlp
