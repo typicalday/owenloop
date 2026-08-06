@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { accessSync, chmodSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
@@ -80,7 +80,11 @@ function order(defDigest: string, remoteCommand: string): GetOrderResponse {
   return { text: '', workflow: 'wf1', run: 'run1', order: packet, lease: { claimed: true } };
 }
 
-function makeLoop(origin: string, resolver: InstructionResolver): ReturnType<typeof createExecLoop> {
+function makeLoop(
+  origin: string,
+  resolver: InstructionResolver,
+  env?: Record<string, string | undefined>,
+): ReturnType<typeof createExecLoop> {
   return createExecLoop({
     hub: createHubClient({ origin, getToken: async () => 'store-e2e-token' }),
     runner: createDefaultRunner(),
@@ -94,6 +98,7 @@ function makeLoop(origin: string, resolver: InstructionResolver): ReturnType<typ
     out: () => {},
     err: () => {},
     heartbeatIntervalMs: 25,
+    ...(env !== undefined ? { env } : {}),
   });
 }
 
@@ -208,37 +213,59 @@ steps:
     definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
   });
 
-  const bundled = await startHub(order(requested, 'printf "remote command must not run\\n"'));
+  const savedPath = process.env['PATH'];
+  process.env['PATH'] = dirname(process.execPath);
   try {
-    assert.equal(await makeLoop(bundled.origin, resolver).run(), 'submitted');
-    const submit = bundled.reqs.find((request) => request.verb === 'submit');
-    assert.ok(submit !== undefined);
-    const receipt = submit.body?.['value'] as CommandReceipt;
-    assert.equal(receipt.command, command);
-    assert.equal(receipt.exitCode, 0, receipt.outputTail);
-    assert.match(receipt.outputTail, /bundle-script/);
-  } finally {
-    bundled.server.close();
-  }
+    const bundled = await startHub(order(requested, 'printf "remote command must not run\\n"'));
+    try {
+      assert.equal(await makeLoop(bundled.origin, resolver).run(), 'submitted');
+      const submit = bundled.reqs.find((request) => request.verb === 'submit');
+      assert.ok(submit !== undefined);
+      const receipt = submit.body?.['value'] as CommandReceipt;
+      assert.equal(receipt.command, command);
+      assert.equal(receipt.exitCode, 0, receipt.outputTail);
+      assert.match(receipt.outputTail, /bundle-script/);
+    } finally {
+      bundled.server.close();
+    }
 
-  const looseCommand = 'if [ -z "${OWENLOOP_BUNDLE_DIR:-}" ]; then printf "this workflow must run from an installed bundle\\n" >&2; exit 64; fi; node "$OWENLOOP_BUNDLE_DIR/scripts/provision.mjs"';
-  const looseResolver: InstructionResolver = {
-    resolveCommand: async () => ({ ok: true, command: looseCommand }),
-    resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'not used' }),
-  };
-  const savedBundleDir = process.env['OWENLOOP_BUNDLE_DIR'];
-  delete process.env['OWENLOOP_BUNDLE_DIR'];
-  const loose = await startHub(order('loose-def', 'ignored remote command'));
-  try {
-    assert.equal(await makeLoop(loose.origin, looseResolver).run(), 'submitted');
-    const submit = loose.reqs.find((request) => request.verb === 'submit');
-    assert.ok(submit !== undefined);
-    const receipt = submit.body?.['value'] as CommandReceipt;
-    assert.equal(receipt.exitCode, 64);
-    assert.match(receipt.outputTail, /this workflow must run from an installed bundle/);
+    // ExecLoopOptions.env is a narrow config/credential map, not a child env.
+    // A real spawn must still resolve node from the actual parent PATH.
+    const narrowEnvRun = await startHub(order(requested, 'printf "remote command must not run\\n"'));
+    try {
+      const narrowEnv = { XDG_CONFIG_HOME: tempDir('owenloop-exec-narrow-config-') };
+      assert.equal(await makeLoop(narrowEnvRun.origin, resolver, narrowEnv).run(), 'submitted');
+      const submit = narrowEnvRun.reqs.find((request) => request.verb === 'submit');
+      assert.ok(submit !== undefined);
+      const receipt = submit.body?.['value'] as CommandReceipt;
+      assert.equal(receipt.exitCode, 0, receipt.outputTail);
+      assert.match(receipt.outputTail, /bundle-script/);
+    } finally {
+      narrowEnvRun.server.close();
+    }
+
+    const looseCommand = 'if [ -z "${OWENLOOP_BUNDLE_DIR:-}" ]; then printf "this workflow must run from an installed bundle\\n" >&2; exit 64; fi; node "$OWENLOOP_BUNDLE_DIR/scripts/provision.mjs"';
+    const looseResolver: InstructionResolver = {
+      resolveCommand: async () => ({ ok: true, command: looseCommand }),
+      resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'not used' }),
+    };
+    const savedBundleDir = process.env['OWENLOOP_BUNDLE_DIR'];
+    process.env['OWENLOOP_BUNDLE_DIR'] = '/ambient/leaked/bundle';
+    const loose = await startHub(order('loose-def', 'ignored remote command'));
+    try {
+      assert.equal(await makeLoop(loose.origin, looseResolver).run(), 'submitted');
+      const submit = loose.reqs.find((request) => request.verb === 'submit');
+      assert.ok(submit !== undefined);
+      const receipt = submit.body?.['value'] as CommandReceipt;
+      assert.equal(receipt.exitCode, 64, receipt.outputTail);
+      assert.match(receipt.outputTail, /this workflow must run from an installed bundle/);
+    } finally {
+      loose.server.close();
+      if (savedBundleDir === undefined) delete process.env['OWENLOOP_BUNDLE_DIR'];
+      else process.env['OWENLOOP_BUNDLE_DIR'] = savedBundleDir;
+    }
   } finally {
-    loose.server.close();
-    if (savedBundleDir === undefined) delete process.env['OWENLOOP_BUNDLE_DIR'];
-    else process.env['OWENLOOP_BUNDLE_DIR'] = savedBundleDir;
+    if (savedPath === undefined) delete process.env['PATH'];
+    else process.env['PATH'] = savedPath;
   }
 });

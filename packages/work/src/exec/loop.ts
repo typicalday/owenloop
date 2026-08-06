@@ -356,9 +356,14 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     // Run the command and race it against the lease going terminal.
     let cmd: RunningCommand;
     try {
-      const startOptions = { cwd: order.workdir ?? opts.cwd };
-      if (resolvedBundleDir === undefined) cmd = runner.start(resolvedCommand, startOptions);
-      else cmd = runner.start(resolvedCommand, { ...startOptions, env: { ...(opts.env ?? process.env), OWENLOOP_BUNDLE_DIR: resolvedBundleDir } });
+      // spawn's env replaces the child environment. Start from the actual exec
+      // process environment so config-only opts.env cannot strip PATH/HOME, then
+      // explicitly remove bundle provenance for loose definitions.
+      const childEnv: Record<string, string | undefined> = { ...process.env };
+      if (resolvedBundleDir === undefined) delete childEnv['OWENLOOP_BUNDLE_DIR'];
+      else childEnv['OWENLOOP_BUNDLE_DIR'] = resolvedBundleDir;
+      const startOptions = { cwd: order.workdir ?? opts.cwd, env: childEnv };
+      cmd = runner.start(resolvedCommand, startOptions);
     } catch (e) {
       return submitReceipt(machineryFailure(e), order, resolvedCommand);
     }
