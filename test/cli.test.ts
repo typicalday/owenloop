@@ -58,6 +58,28 @@ function makeCli(opts: { defs?: string; setDbEnv?: boolean } = {}) {
   return { run, home, db };
 }
 
+/** A hermetic async CLI for offline trust-record commands. */
+function makeTrustCli() {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-trust-cli-'));
+  const config = join(home, 'config');
+  const out: string[] = [];
+  const err: string[] = [];
+  const io: CliIO = {
+    cwd: home,
+    env: { HOME: home, XDG_CONFIG_HOME: config },
+    out: (s) => out.push(s),
+    err: (s) => err.push(s),
+  };
+  const run = async (...argv: string[]) => {
+    out.length = 0;
+    err.length = 0;
+    const code = await mainAsync(argv, io);
+    const outText = out.join('\\n');
+    return { code, out: outText, err: err.join('\\n'), json: () => JSON.parse(outText) };
+  };
+  return { run, home, config };
+}
+
 const J = (v: unknown) => JSON.stringify(v);
 
 // ---- usage / help / unknown command -----------------------------------------
@@ -92,6 +114,105 @@ test('an unknown command is rejected BEFORE the state db is created', () => {
   assert.equal(r.code, 1);
   assert.match(r.err, /unknown command: frobnicate/);
   assert.equal(existsSync(join(home, '.owenloop')), false, 'no .owenloop/ dir mkdir-ed for an unknown command');
+});
+
+// ---- trust record minting -----------------------------------------------------
+
+test('trust rejects an unknown subcommand before creating trust state', async () => {
+  const { run, config } = makeTrustCli();
+  const r = await run('trust', 'status');
+  assert.equal(r.code, 1);
+  assert.match(r.err, /unknown trust subcommand 'status'/);
+  assert.equal(existsSync(config), false);
+});
+
+test('trust grant validates required key and principal inputs', async () => {
+  const { run } = makeTrustCli();
+  const missingKey = await run('trust', 'grant', '--principal', 'machine:worker');
+  assert.equal(missingKey.code, 1);
+  assert.match(missingKey.err, /missing required option: --key/);
+
+  const badPrincipal = await run('trust', 'grant', '--key', 'missing.pub', '--principal', 'operator:worker');
+  assert.equal(badPrincipal.code, 1);
+  assert.match(badPrincipal.err, /invalid --principal/);
+
+  const badDelegate = await run(
+    'trust',
+    'grant',
+    '--key',
+    'missing.pub',
+    '--principal',
+    'machine:worker',
+    '--delegate',
+    'sometimes',
+  );
+  assert.equal(badDelegate.code, 1);
+  assert.match(badDelegate.err, /invalid --delegate/);
+});
+
+test('trust init, grant, and revoke mint offline DSSE records under the injected config root', async () => {
+  const { run, config } = makeTrustCli();
+  const init = await run('trust', 'init');
+  assert.equal(init.code, 0, init.err);
+  const initRecord = init.json();
+  assert.equal(statSync(initRecord.privateKey).mode & 0o777, 0o600);
+  assert.equal(statSync(initRecord.publicKey).mode & 0o777, 0o644);
+  assert.equal(init.out.includes(readFileSync(initRecord.privateKey, 'utf8').trim()), false, 'private key bytes never go to stdout');
+
+  const grant = await run(
+    'trust',
+    'grant',
+    '--key',
+    initRecord.publicKey,
+    '--principal',
+    'machine:worker',
+    '--pools',
+    'marketing',
+    '--labels',
+    'billing',
+    '--namespaces',
+    'default',
+    '--delegate',
+    '0',
+  );
+  assert.equal(grant.code, 0, grant.err);
+  const grantResult = grant.json();
+  assert.match(grantResult.keyid, /^SHA256:[A-Za-z0-9+/]{43}$/);
+  assert.equal(grantResult.path.startsWith(join(config, 'owenloop', 'roster')), true);
+  const grantEnvelope = JSON.parse(readFileSync(grantResult.path, 'utf8'));
+  assert.equal(grantEnvelope.payloadType, 'application/vnd.owenloop.enrollment-grant.v1+json');
+  const grantRecord = JSON.parse(Buffer.from(grantEnvelope.payload, 'base64').toString('utf8'));
+  assert.deepEqual(grantRecord.scope, {
+    pools: ['marketing'],
+    labels: ['billing'],
+    namespaces: ['default'],
+    delegation: { allowed: true, maxDepth: 0 },
+  });
+
+  const revoke = await run(
+    'trust',
+    'revoke',
+    '--key',
+    grantResult.keyid,
+    '--principal',
+    'machine:worker',
+    '--reason',
+    'test rotation',
+    '--effective-from',
+    '0',
+  );
+  assert.equal(revoke.code, 0, revoke.err);
+  const revokeResult = revoke.json();
+  assert.equal(revokeResult.revokedKey, grantResult.keyid);
+  assert.equal(revokeResult.backdated, true);
+  assert.equal(revokeResult.path.startsWith(join(config, 'owenloop', 'revocations')), true);
+  const revokeEnvelope = JSON.parse(readFileSync(revokeResult.path, 'utf8'));
+  assert.equal(revokeEnvelope.payloadType, 'application/vnd.owenloop.revocation.v1+json');
+  const revokeRecord = JSON.parse(Buffer.from(revokeEnvelope.payload, 'base64').toString('utf8'));
+  assert.equal(revokeRecord.reason, 'test rotation');
+  assert.equal(revokeRecord.effectiveFrom, 0);
+  assert.equal(readdirSync(join(config, 'owenloop', 'roster')).length, 1);
+  assert.equal(readdirSync(join(config, 'owenloop', 'revocations')).length, 1);
 });
 
 // ---- unknown-option rejection (before any side effect) ----------------------

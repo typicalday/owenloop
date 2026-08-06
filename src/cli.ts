@@ -32,7 +32,7 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -75,12 +75,21 @@ import {
 } from './credentials.ts';
 import { PrincipalKeyManager } from './crypto/keys.ts';
 import type { PrincipalKeyRef } from './crypto/keys.ts';
-import { DSSE_SSH_NAMESPACE, decodeBase64Strict, dsseSignEnrollmentGrant, dsseSignPublication } from './crypto/dsse.ts';
-import { createSshSigner, SshSignerError } from './crypto/ssh.ts';
+import { createHash } from 'node:crypto';
+import { DSSE_SSH_NAMESPACE, decodeBase64Strict, dsseSignEnrollmentGrant, dsseSignPublication, dsseSignRevocation } from './crypto/dsse.ts';
+import { assertEd25519PubText, createSshSigner, SshSignerError } from './crypto/ssh.ts';
+import { publicKeyDescriptor } from './crypto/keys.ts';
 import { DEFAULT_MACHINE_SCOPE, buildEnrollmentGrant, verifyRosterEntry } from './crypto/enrollment.ts';
 import type { RosterVerdict } from './crypto/enrollment.ts';
 import { resolveAllowedSigners } from './crypto/trust-roots.ts';
-import type { PublicationRecord } from './crypto/records.ts';
+import type { EnrollmentGrantRecord, PrincipalReference, PublicationRecord, RevocationRecord } from './crypto/records.ts';
+import {
+  orgRootPrivateKeyPath,
+  orgRootPublicKeyPath,
+  resolveOrgRoot,
+  revocationsDir,
+  rosterDir,
+} from './crypto/org-root.ts';
 import { runMcpCommand } from './mcp/serve.ts';
 import type { LineStream } from './mcp/server.ts';
 import { DEFAULT_TAR_LIMITS, extractTarGz } from './untar.ts';
@@ -833,6 +842,291 @@ async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
   return 0;
 }
 
+const TRUST_USAGE =
+  'usage: owenloop trust init [--force] | ' +
+  'owenloop trust grant --key <pubkey-path> --principal <human|machine|agent>:<id> ' +
+  '[--pools a,b|*] [--labels a,b|*] [--namespaces a,b|*] [--delegate no|<n>|unbounded] ' +
+  '[--signing-key <path>] [--output <file>] | ' +
+  'owenloop trust revoke --key <SHA256:…> --principal <kind>:<id> ' +
+  '[--reason <text>] [--effective-from <epochMs>] [--signing-key <path>] [--output <file>]';
+
+function trustRequiredOption(args: Args, key: string): string {
+  const value = last(args, key);
+  if (value === undefined || value === '' || value === 'true') {
+    throw new CliError(`missing required option: --${key} (${TRUST_USAGE})`);
+  }
+  return value;
+}
+
+function trustOptionalOption(args: Args, key: string): string | undefined {
+  const value = last(args, key);
+  if (value === 'true') throw new CliError(`--${key} requires a value (${TRUST_USAGE})`);
+  return value;
+}
+
+function parseTrustPrincipal(raw: string): PrincipalReference {
+  const match = /^(human|machine|agent):(.+)$/.exec(raw);
+  const kind = match?.[1];
+  const id = match?.[2];
+  if (kind === undefined || id === undefined || id === '') {
+    throw new CliError(`invalid --principal '${raw}': expected human|machine|agent:<id> (${TRUST_USAGE})`);
+  }
+  return { kind: kind as PrincipalReference['kind'], id };
+}
+
+function parseTrustAxis(args: Args, key: string): string[] | '*' {
+  const raw = trustOptionalOption(args, key);
+  if (raw === undefined) return [];
+  if (raw === '*') return '*';
+  const values = raw.split(',').map((value) => value.trim());
+  if (values.length === 0 || values.some((value) => value === '')) {
+    throw new CliError(`invalid --${key} '${raw}': expected a comma-separated list or * (${TRUST_USAGE})`);
+  }
+  return values;
+}
+
+function parseTrustDelegation(args: Args): { allowed: false } | { allowed: true; maxDepth: number | 'unbounded' } {
+  const raw = trustOptionalOption(args, 'delegate') ?? 'no';
+  if (raw === 'no') return { allowed: false };
+  if (raw === 'unbounded') return { allowed: true, maxDepth: 'unbounded' };
+  if (!/^\d+$/.test(raw)) {
+    throw new CliError(`invalid --delegate '${raw}': expected no, a non-negative integer, or unbounded (${TRUST_USAGE})`);
+  }
+  const maxDepth = Number(raw);
+  if (!Number.isSafeInteger(maxDepth)) {
+    throw new CliError(`invalid --delegate '${raw}': integer is too large (${TRUST_USAGE})`);
+  }
+  return { allowed: true, maxDepth };
+}
+
+function parseTrustKeyId(raw: string): string {
+  if (!/^SHA256:[A-Za-z0-9+/]{43}$/.test(raw)) {
+    throw new CliError(`invalid --key '${raw}': expected SHA256:<base64 fingerprint> (${TRUST_USAGE})`);
+  }
+  return raw;
+}
+
+function trustKeyHash(keyid: string): string {
+  return createHash('sha256').update(keyid).digest('hex');
+}
+
+function assertTrustPath(path: string, label: string): void {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (stat?.isSymbolicLink()) throw new CliError(`owenloop trust: ${label} '${path}' is a symlink`);
+  if (stat !== undefined && !stat.isFile()) {
+    throw new CliError(`owenloop trust: ${label} '${path}' is not a regular file`);
+  }
+}
+
+function writeTrustEnvelope(path: string, envelope: unknown): void {
+  const parent = dirname(path);
+  mkdirRefusingSymlink(parent);
+  assertTrustPath(path, 'output');
+  let tempDir: string | undefined;
+  try {
+    tempDir = mkdtempSync(join(parent, '.owenloop-trust-'));
+    chmodSync(tempDir, 0o700);
+    const temp = join(tempDir, basename(path));
+    writeFileSync(temp, canonicalJsonBytes(envelope), { mode: 0o644, flag: 'wx' });
+    renameSync(temp, path);
+  } catch (error) {
+    throw new CliError(`owenloop trust: cannot write '${path}': ${(error as Error).message}`);
+  } finally {
+    if (tempDir !== undefined) rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function publicKeyForSigningPath(path: string): string {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (stat === undefined) throw new CliError(`owenloop trust: signing key '${path}' does not exist`);
+  if (stat.isSymbolicLink()) throw new CliError(`owenloop trust: signing key '${path}' is a symlink`);
+  if (!stat.isFile()) throw new CliError(`owenloop trust: signing key '${path}' is not a regular file`);
+
+  try {
+    const text = readFileSync(path, 'utf8');
+    const first = text.split(/\r?\n/).find((line) => line.trim() !== '')?.trim() ?? '';
+    if (/^(ssh-|ecdsa-|sk-)/.test(first)) return text;
+  } catch {
+    // ssh-keygen below supplies the stable failure classification.
+  }
+  const result = spawnSync('ssh-keygen', ['-y', '-f', path], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  if (result.error !== undefined || result.status !== 0 || typeof result.stdout !== 'string') {
+    throw new CliError(`owenloop trust: cannot derive public key from signing key '${path}'`);
+  }
+  return result.stdout;
+}
+
+function signingKeyInfo(io: CliIO, explicitPath: string | undefined): { path: string; publicKey: string; keyid: string } {
+  const path = explicitPath ?? orgRootPrivateKeyPath(io.env);
+  let publicKey: string;
+  if (explicitPath === undefined) {
+    const root = resolveOrgRoot(io.env);
+    if (root.kind === 'absent') {
+      throw new CliError(`owenloop trust: org root is absent at '${root.path}' — run \`owenloop trust init\``);
+    }
+    publicKey = root.publicKey;
+  } else {
+    publicKey = publicKeyForSigningPath(path);
+  }
+  try {
+    assertEd25519PubText(publicKey, 'signing key');
+    const descriptor = publicKeyDescriptor(publicKey);
+    return { path, publicKey: descriptor.openSshPublicKey, keyid: descriptor.keyid };
+  } catch (error) {
+    throw new CliError(`owenloop trust: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function trustEnvelopeOutput(args: Args, cwd: string, explicitDefault: string): string {
+  const output = trustOptionalOption(args, 'output');
+  return resolve(cwd, output ?? explicitDefault);
+}
+
+function ensureTrustRootDirectory(env: Record<string, string | undefined>): string {
+  const privatePath = orgRootPrivateKeyPath(env);
+  const directory = dirname(privatePath);
+  mkdirRefusingSymlink(directory);
+  chmodSync(directory, 0o700);
+  return directory;
+}
+
+function generateTrustRoot(io: CliIO, force: boolean): number {
+  const directory = ensureTrustRootDirectory(io.env);
+  const privatePath = orgRootPrivateKeyPath(io.env);
+  const publicPath = orgRootPublicKeyPath(io.env);
+  const privateStat = lstatSync(privatePath, { throwIfNoEntry: false });
+  const publicStat = lstatSync(publicPath, { throwIfNoEntry: false });
+  if (!force && (privateStat !== undefined || publicStat !== undefined)) {
+    throw new CliError(`owenloop trust init: org root already exists under '${directory}' — pass --force to replace it`);
+  }
+  for (const [path, label] of [[privatePath, 'private key'], [publicPath, 'public key']] as const) {
+    if (lstatSync(path, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      throw new CliError(`owenloop trust init: existing ${label} '${path}' is a symlink`);
+    }
+    if (lstatSync(path, { throwIfNoEntry: false }) !== undefined) unlinkSync(path);
+  }
+  const result = spawnSync(
+    'ssh-keygen',
+    ['-q', '-t', 'ed25519', '-N', '', '-C', 'owenloop org root', '-f', privatePath],
+    { stdio: 'ignore' },
+  );
+  if (result.error !== undefined || result.status !== 0) {
+    throw new CliError('owenloop trust init: ssh-keygen could not create the Ed25519 org root');
+  }
+  chmodSync(privatePath, 0o600);
+  chmodSync(publicPath, 0o644);
+  print(io, { ok: true, privateKey: privatePath, publicKey: publicPath });
+  return 0;
+}
+
+/** `owenloop trust init|grant|revoke` — offline enrollment-record minting. */
+async function dispatchTrust(io: CliIO, args: Args): Promise<number> {
+  const sub = args.positionals[1];
+  if (sub !== 'init' && sub !== 'grant' && sub !== 'revoke') {
+    throw new CliError(`unknown trust subcommand '${sub ?? ''}' — ${TRUST_USAGE}`);
+  }
+  if (sub === 'init') {
+    if (args.positionals.length !== 2) throw new CliError(`invalid trust init arguments — ${TRUST_USAGE}`);
+    return generateTrustRoot(io, flag(args, 'force'));
+  }
+
+  if (args.positionals.length !== 2) throw new CliError(`invalid trust ${sub} arguments — ${TRUST_USAGE}`);
+  const keyOption = trustRequiredOption(args, 'key');
+  const principal = parseTrustPrincipal(trustRequiredOption(args, 'principal'));
+  const signingPath = trustOptionalOption(args, 'signing-key');
+
+  if (sub === 'grant') {
+    const pools = parseTrustAxis(args, 'pools');
+    const labels = parseTrustAxis(args, 'labels');
+    const namespaces = parseTrustAxis(args, 'namespaces');
+    const delegation = parseTrustDelegation(args);
+    const publicKeyPath = resolve(io.cwd, keyOption);
+    assertTrustPath(publicKeyPath, 'enrollment key');
+    const keyText = (() => {
+      try {
+        return readFileSync(publicKeyPath, 'utf8');
+      } catch (error) {
+        throw new CliError(`owenloop trust grant: cannot read --key '${keyOption}': ${(error as Error).message}`);
+      }
+    })();
+    let newKey;
+    try {
+      assertEd25519PubText(keyText, 'enrollment key');
+      newKey = publicKeyDescriptor(keyText);
+    } catch (error) {
+      throw new CliError(`owenloop trust grant: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const signer = signingKeyInfo(io, signingPath);
+    const record: EnrollmentGrantRecord = {
+      newKey: {
+        keyid: newKey.keyid,
+        keyType: newKey.keyType,
+        openSshPublicKey: newKey.openSshPublicKey,
+        ...(newKey.comment !== '' ? { comment: newKey.comment } : {}),
+      },
+      principal,
+      scope: { pools, labels, namespaces, delegation },
+      grantedBy: signer.keyid,
+      validFrom: nowMs(),
+    };
+    const sshSigner = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: signer.path });
+    try {
+      const signed = await dsseSignEnrollmentGrant(Buffer.from(canonicalJsonBytes(record)), sshSigner);
+      const output = trustEnvelopeOutput(args, io.cwd, join(rosterDir(io.env), `${trustKeyHash(newKey.keyid)}.grant.dsse`));
+      writeTrustEnvelope(output, signed.envelope);
+      print(io, { ok: true, path: output, keyid: newKey.keyid, grantedBy: signer.keyid, principal, validFrom: record.validFrom });
+    } finally {
+      sshSigner.dispose();
+    }
+    return 0;
+  }
+
+  const revokedKey = parseTrustKeyId(keyOption);
+  const reason = trustOptionalOption(args, 'reason');
+  const rawEffective = trustOptionalOption(args, 'effective-from');
+  let effectiveFrom: number | undefined;
+  if (rawEffective !== undefined) {
+    if (!/^\d+$/.test(rawEffective)) {
+      throw new CliError(`invalid --effective-from '${rawEffective}': expected a non-negative epoch millisecond (${TRUST_USAGE})`);
+    }
+    effectiveFrom = Number(rawEffective);
+    if (!Number.isSafeInteger(effectiveFrom)) {
+      throw new CliError(`invalid --effective-from '${rawEffective}': integer is too large (${TRUST_USAGE})`);
+    }
+  }
+  const signer = signingKeyInfo(io, signingPath);
+  const issuedAt = nowMs();
+  const cut = effectiveFrom ?? issuedAt;
+  const record: RevocationRecord = {
+    revokedKey,
+    principal,
+    revokedBy: signer.keyid,
+    issuedAt,
+    effectiveFrom: cut,
+    backdated: cut < issuedAt,
+    ...(reason !== undefined ? { reason } : {}),
+  };
+  const sshSigner = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: signer.path });
+  try {
+    const signed = await dsseSignRevocation(Buffer.from(canonicalJsonBytes(record)), sshSigner);
+    const output = trustEnvelopeOutput(args, io.cwd, join(revocationsDir(io.env), `${trustKeyHash(revokedKey)}.revocation.dsse`));
+    writeTrustEnvelope(output, signed.envelope);
+    print(io, {
+      ok: true,
+      path: output,
+      revokedKey,
+      revokedBy: signer.keyid,
+      principal,
+      issuedAt,
+      effectiveFrom: cut,
+      backdated: record.backdated,
+    });
+  } finally {
+    sshSigner.dispose();
+  }
+  return 0;
+}
+
 /** Default pack output: `<package-name>-<version>.wnlp` next to the source directory. */
 function defaultPackOutput(sourceAbs: string, name: string, version: string): string {
   return join(dirname(sourceAbs), `${name}-${version}.wnlp`);
@@ -917,6 +1211,11 @@ Commands:
   bundle digest <bundle.wnlp>            print the bundle's def digest (SHA-256 of the canonical tar)
   publish <source-dir> [--output <bundle.wnlp>] [--unsigned]
                                          pack a bundle and sign its canonical digest (signed by default)
+  trust init [--force]                  create the local Ed25519 enrollment root
+  trust grant --key <pubkey-path> --principal <kind>:<id> [--pools a,b|*] [--labels a,b|*] [--namespaces a,b|*] [--delegate no|<n>|unbounded] [--signing-key <path>] [--output <file>]
+                                         mint an offline signed enrollment grant
+  trust revoke --key <SHA256:…> --principal <kind>:<id> [--reason <text>] [--effective-from <epochMs>] [--signing-key <path>] [--output <file>]
+                                         mint an offline signed revocation
   login [--hub <url>] [--with-token] [--as <slot>]   authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
   logout [--hub <url>] [--as <slot>]     delete the stored credential for a hub in one slot
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
@@ -1012,6 +1311,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
   ['publish', cmdOpts('unsigned', 'output')],
+  ['trust', cmdOpts('force', 'key', 'principal', 'pools', 'labels', 'namespaces', 'delegate', 'signing-key', 'output', 'reason', 'effective-from')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
@@ -5421,7 +5721,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'push', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -5461,6 +5761,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchConnect(io, args);
       case 'publish':
         return await dispatchPublish(io, args);
+      case 'trust':
+        return await dispatchTrust(io, args);
       case 'push':
         return await dispatchPush(io, args);
       case 'agent':

@@ -150,3 +150,29 @@ export type {
   VerifyRosterEntryInput,
   VerifyRosterEntryOptions,
 } from './enrollment.ts';
+
+// ---- enrollment chain ----
+export {
+  validateEnrollmentChain,
+  validateProducer,
+  revocationTemporalConsistency,
+} from './chain.ts';
+export type { ChainInput, ChainOptions, ChainVerdict } from './chain.ts';
+export {
+  attenuate,
+  axisPermits,
+  delegationPermits,
+  ORG_ROOT_SCOPE,
+  scopePermits,
+} from './scope.ts';
+export type { ScopeAxis } from './scope.ts';
+export {
+  loadRoster,
+  loadRevocations,
+  orgRootPrivateKeyPath,
+  orgRootPublicKeyPath,
+  resolveOrgRoot,
+  revocationsDir,
+  rosterDir,
+} from './org-root.ts';
+export type { OrgRootAbsent, OrgRootPresent, OrgRootResolution } from './org-root.ts';
