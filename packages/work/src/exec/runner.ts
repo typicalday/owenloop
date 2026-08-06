@@ -87,6 +87,9 @@ export interface CommandPlan {
  * `/bin/sh` keeps the default runner portable (ubuntu-latest CI, macOS dev).
  */
 export function buildCommandPlan(command: string, cwd: string): CommandPlan {
+  // If a future package interpolates consumed values into command text or the
+  // child environment, that path must inherit resolveCommand's consume-side
+  // verification gate before this spawn plan is ever built.
   return {
     command: '/bin/sh',
     args: ['-c', command],

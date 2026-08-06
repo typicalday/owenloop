@@ -133,7 +133,10 @@ test('submit posts a receipt for the bound run and echoes the outcome', async ()
   const body = parse(res);
   assert.equal(body.outcome, 'accepted');
   assert.equal(body.closed, false);
-  assert.deepEqual(calls, [{ verb: 'submit', arg: { workflow: 'wf1', run: 'run1', path: 'pr', value: { url: 'x' }, done: false } }]);
+  assert.deepEqual(calls, [
+    { verb: 'get_order', arg: { workflow: 'wf1', run: 'run1' } },
+    { verb: 'submit', arg: { workflow: 'wf1', run: 'run1', path: 'pr', value: { url: 'x' }, done: false } },
+  ]);
 });
 
 test('hold-MCP submit attaches a DSSE submission proof over the submitted value', async () => {
@@ -160,6 +163,7 @@ test('hold-MCP submit attaches a DSSE submission proof over the submitted value'
     origin: 'https://hub.example.test',
     principalKeys: signingKeys(),
     sshProcess: fakeSshProcess(),
+    consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
   }));
   await tool(mount.tools, 'submit').handler({ path: 'result', value: { answer: 42 } }, ctx);
   const req = calls.find((call) => call.verb === 'submit')!.arg as { proof?: string };
@@ -186,6 +190,10 @@ test('submit carries the bound holder through to the hub', async () => {
   const mount = createHoldMcp(deps(hub, { holder: { kind: 'session', id: 's-1', shiftId: 'shf_1' } }));
   await tool(mount.tools, 'submit').handler({ path: 'pr', value: { url: 'x' }, done: false }, ctx);
   assert.deepEqual(calls, [
+    {
+      verb: 'get_order',
+      arg: { workflow: 'wf1', run: 'run1', holder: { kind: 'session', id: 's-1', shiftId: 'shf_1' } },
+    },
     {
       verb: 'submit',
       arg: { workflow: 'wf1', run: 'run1', path: 'pr', value: { url: 'x' }, done: false, holder: { kind: 'session', id: 's-1', shiftId: 'shf_1' } },

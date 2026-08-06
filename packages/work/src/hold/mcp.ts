@@ -29,6 +29,7 @@ import type { ContactHolder, GetOrderResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
+import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
 
 export interface HoldMcpDeps {
@@ -41,6 +42,8 @@ export interface HoldMcpDeps {
   env?: Record<string, string | undefined>;
   /** Injectable ssh-keygen seam for hermetic submit-proof tests. */
   sshProcess?: SshProcessAdapter;
+  /** Gate dynamic consumed values before the packet reaches the model. */
+  consumedVerifier?: ConsumedVerifier;
   /** B3 holder tag; rides get_order/heartbeat when known. */
   holder?: ContactHolder;
   sleep: (ms: number) => Promise<void>;
@@ -77,9 +80,11 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   const { hub, workflow, run } = deps;
   const holderReq = deps.holder !== undefined ? { holder: deps.holder } : {};
 
-  // Captured from the loop's first contact so `get_order` needn't re-fetch (and
-  // re-contend the pickup window). Falls back to a live fetch if a tool call
-  // beats first contact.
+  // The loop's first contact arrives synchronously, but consume-side verification
+  // is asynchronous. Keep the unverified response in a private pending slot until
+  // a tool call gates it; only a gated response may populate `captured` and reach
+  // either the model or submit-proof construction.
+  let firstContact: GetOrderResponse | undefined;
   let captured: GetOrderResponse | undefined;
 
   // Set the moment the lease loop's run() settles (lease-lost, completed,
@@ -98,7 +103,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     out: deps.err,
     err: deps.err,
     onOrder: (res) => {
-      captured = res;
+      firstContact = res;
     },
     ...(deps.holder !== undefined ? { holder: deps.holder } : {}),
     ...(deps.heartbeatIntervalMs !== undefined ? { heartbeatIntervalMs: deps.heartbeatIntervalMs } : {}),
@@ -122,6 +127,26 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     return textResult({ error: `order no longer held (${terminal}) — stop` }, true);
   }
 
+  async function gate(res: GetOrderResponse): Promise<ToolResult | undefined> {
+    if (res.order === null) return undefined;
+    const hasConsumedData = Object.keys(res.order.consumes).length > 0
+      || res.order.owes.some((owed) => owed.reasons.length > 0 || owed.proof !== undefined);
+    if (deps.consumedVerifier === undefined) {
+      if (!hasConsumedData) return undefined;
+      return textResult({
+        error: `consumed artifact refusal (prerequisite) for ${res.workflow}/${res.run}: consume-side verifier is not configured; dynamic values cannot be admitted to the MCP model`,
+      }, true);
+    }
+    try {
+      const checked = await deps.consumedVerifier(res.order, { hardRule: false });
+      if (!checked.ok) return textResult({ error: checked.reason }, true);
+      for (const warning of checked.warnings) deps.err(warning);
+      return undefined;
+    } catch (error) {
+      return textResult({ error: `consumed artifact refusal (prerequisite) for ${res.workflow}/${res.run}: ${errMsg(error)}` }, true);
+    }
+  }
+
   const getOrderTool: ToolRegistration = {
     name: 'get_order',
     description:
@@ -130,9 +155,21 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     handler: async () => {
       const gone = terminalGuard();
       if (gone !== undefined) return gone;
-      if (captured !== undefined) return textResult(orderView(captured));
+      if (captured !== undefined) {
+        const refused = await gate(captured);
+        if (refused !== undefined) return refused;
+        return textResult(orderView(captured));
+      }
+      if (firstContact !== undefined) {
+        const refused = await gate(firstContact);
+        if (refused !== undefined) return refused;
+        captured = firstContact;
+        return textResult(orderView(firstContact));
+      }
       try {
         const res = await hub.getOrder({ workflow, run, ...holderReq });
+        const refused = await gate(res);
+        if (refused !== undefined) return refused;
         captured = res;
         return textResult(orderView(res));
       } catch (e) {
@@ -167,26 +204,31 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       }
       const done = args['done'];
       try {
+        // Submit is also a dynamic-data boundary. Fetch and gate the bound
+        // packet even when no origin was supplied for submit-proof signing;
+        // otherwise a direct submit call could bypass MCP consume-side
+        // verification without first calling get_order.
+        let orderResponse = captured ?? firstContact;
+        if (orderResponse === undefined) {
+          orderResponse = await hub.getOrder({ workflow, run, ...holderReq });
+        }
+        const refused = await gate(orderResponse);
+        if (refused !== undefined) return refused;
+        captured = orderResponse;
+
         let proof: string | undefined;
-        if (deps.origin !== undefined) {
-          let orderResponse = captured;
-          if (orderResponse === undefined) {
-            orderResponse = await hub.getOrder({ workflow, run, ...holderReq });
-            captured = orderResponse;
-          }
-          if (orderResponse.order !== null) {
-            proof = await buildSubmitProof({
-              origin: deps.origin,
-              order: orderResponse.order,
-              path,
-              value: args['value'],
-              now: deps.now,
-              warn: deps.err,
-              ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
-              ...(deps.env !== undefined ? { env: deps.env } : {}),
-              ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
-            });
-          }
+        if (deps.origin !== undefined && orderResponse.order !== null) {
+          proof = await buildSubmitProof({
+            origin: deps.origin,
+            order: orderResponse.order,
+            path,
+            value: args['value'],
+            now: deps.now,
+            warn: deps.err,
+            ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
+            ...(deps.env !== undefined ? { env: deps.env } : {}),
+            ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
+          });
         }
         const res = await hub.submit({
           workflow,

@@ -26,9 +26,11 @@ import {
   createExecutionOriginVerifier,
   resolveDefPolicy,
   resolveOriginPolicy,
+  resolveArtifactPolicy,
   resolveOriginRules,
 } from '../../../../src/store/pre-commit-verifier.ts';
 import type { OrderPacket } from '../hub/types.ts';
+import type { ConsumedVerifier } from '../consumed-verifier.ts';
 
 export type InstructionRefusalKind =
   | 'unknown-digest'
@@ -37,7 +39,8 @@ export type InstructionRefusalKind =
   | 'no-digest'
   | 'missing-command'
   | 'unverified-def'
-  | 'origin-policy';
+  | 'origin-policy'
+  | 'unverified-consumed';
 
 export interface InstructionRefusal {
   ok: false;
@@ -94,6 +97,8 @@ export interface StoreInstructionResolverOptions {
   definitionVerifier?: DefinitionVerifier;
   /** Optional execution-time origin verifier. */
   originVerifier?: OriginVerifier;
+  /** Gate dynamic consumed values before a command can reach the shell. */
+  consumedVerifier?: ConsumedVerifier;
   /** Explicit publication policy override; otherwise env > settings file > warn. */
   defPolicy?: DefPolicy;
   /** Explicit origin policy override; otherwise env > settings file > warn. */
@@ -163,6 +168,7 @@ export function createStoreInstructionResolver(
       resolveDefPolicy(env, options.defPolicy),
       options.policyFloor,
       resolveOriginPolicy(env, options.originPolicy),
+      resolveArtifactPolicy(env),
     );
     return mergedPolicies;
   };
@@ -319,6 +325,29 @@ export function createStoreInstructionResolver(
     return undefined;
   };
 
+  const hasConsumedData = (order: OrderPacket): boolean =>
+    Object.keys(order.consumes).length > 0
+    || order.owes.some((owed) => owed.reasons.length > 0 || owed.proof !== undefined);
+
+  const gateConsumed = async (order: OrderPacket, hardRule: boolean): Promise<InstructionRefusal | undefined> => {
+    if (!hasConsumedData(order)) return undefined;
+    if (options.consumedVerifier === undefined) {
+      return refusal(
+        'unverified-consumed',
+        order,
+        'consume-side verifier is not configured; dynamic values cannot be admitted to a command worker',
+      );
+    }
+    try {
+      const checked = await options.consumedVerifier(order, { hardRule });
+      if (!checked.ok) return refusal('unverified-consumed', order, checked.reason);
+      for (const warning of checked.warnings) warn(warning);
+      return undefined;
+    } catch (error) {
+      return refusal('unverified-consumed', order, `consume-side verification failed: ${errorText(error)}`);
+    }
+  };
+
   const resolveAgentStep = async (order: OrderPacket): Promise<ResolvedStep | InstructionRefusal> => {
     const resolved = await resolveVerifiedStep(order);
     if (!resolved.ok) return resolved;
@@ -347,8 +376,17 @@ export function createStoreInstructionResolver(
       // HARD RULE: command orders never consult defPolicy before this gate.
       // An unverified definition must never reach `/bin/sh -c`, including off.
       if (verdict.kind !== 'verified') return refuseUnverified(order, verdict);
+      // HARD RULE: consume-side verification runs before any policy lookup,
+      // including origin and artifact policy. A command worker never admits
+      // absent, unverifiable, or invalid dynamic evidence under
+      // artifactPolicy=off; otherwise a future command interpolation could
+      // carry an unverified value into `/bin/sh -c`.
+      const consumedRefusal = await gateConsumed(order, true);
+      if (consumedRefusal !== undefined) return consumedRefusal;
+
       const originRefusal = await checkOrigin(order, resolved);
       if (originRefusal !== undefined) return originRefusal;
+
       if (typeof resolved.step.command !== 'string' || resolved.step.command.trim() === '') {
         return refusal('missing-command', order, 'the verified step has no non-empty command text');
       }
@@ -368,6 +406,7 @@ export function createDefaultStoreInstructionResolver(args: {
   verifier?: BundleIngestor;
   definitionVerifier?: DefinitionVerifier;
   originVerifier?: OriginVerifier;
+  consumedVerifier?: ConsumedVerifier;
   defPolicy?: DefPolicy;
   originPolicy?: DefPolicy;
   originRules?: OriginRules;
@@ -395,6 +434,7 @@ export function createDefaultStoreInstructionResolver(args: {
     source,
     definitionVerifier: args.definitionVerifier ?? createExecutionDefinitionVerifier({ env: args.env }),
     originVerifier: args.originVerifier ?? createExecutionOriginVerifier({ env: args.env }),
+    ...(args.consumedVerifier !== undefined ? { consumedVerifier: args.consumedVerifier } : {}),
     ...(args.defPolicy !== undefined ? { defPolicy: args.defPolicy } : {}),
     ...(args.originPolicy !== undefined ? { originPolicy: args.originPolicy } : {}),
     ...(args.originRules !== undefined ? { originRules: args.originRules } : {}),

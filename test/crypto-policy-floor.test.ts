@@ -13,6 +13,7 @@ import { keyidFromBlob, publicKeyDescriptor } from '../src/crypto/keys.ts';
 import {
   DEF_POLICY_RANK,
   POLICY_FLOOR_PRESETS,
+  artifactPolicyMinimum,
   floorDefPolicyMinimum,
   mergePolicyFloorWithLocal,
   originRulesMinimum,
@@ -246,6 +247,15 @@ test('an adversarial hub can replace, replay, or withhold a floor but cannot low
   assert.equal(mergePolicyFloorWithLocal('enforce', undefined).effective, 'enforce', 'withholding cannot lower enforce');
 });
 
+test('artifact floor modes map warn to warn and refuse to enforce', () => {
+  assert.equal(artifactPolicyMinimum(POLICY_FLOOR_PRESETS.L0), 'warn');
+  assert.equal(artifactPolicyMinimum(POLICY_FLOOR_PRESETS.L1), 'enforce');
+  assert.equal(artifactPolicyMinimum(POLICY_FLOOR_PRESETS.L2), 'enforce');
+  assert.equal(mergePolicyFloorWithLocal('off', POLICY_FLOOR_PRESETS.L0, 'off', 'off').artifactPolicy, 'warn');
+  assert.equal(mergePolicyFloorWithLocal('off', POLICY_FLOOR_PRESETS.L1, 'off', 'off').artifactPolicy, 'enforce');
+  assert.equal(mergePolicyFloorWithLocal('warn', POLICY_FLOOR_PRESETS.L2, 'off', 'warn').artifactPolicy, 'enforce');
+});
+
 test('origin floor modes map advisory to warn and enforced to enforce', () => {
   assert.equal(originRulesMinimum(POLICY_FLOOR_PRESETS.L0), 'warn');
   assert.equal(originRulesMinimum(POLICY_FLOOR_PRESETS.L1), 'warn');
@@ -269,7 +279,6 @@ test('presets match the documented bundles and report every unenforced axis', ()
   for (const floor of Object.values(POLICY_FLOOR_PRESETS)) {
     assert.deepEqual(policyFloorGaps(floor).map((gap) => gap.axis), [
       'trustMode',
-      'unsignedArtifacts',
     ]);
   }
 });

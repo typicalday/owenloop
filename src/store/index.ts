@@ -109,6 +109,7 @@ export {
   createExecutionOriginVerifier,
   createPreCommitVerifier,
   createProductionPreCommitVerifier,
+  resolveArtifactPolicy,
   resolveDefPolicy,
   resolveOriginPolicy,
   resolveOriginRules,

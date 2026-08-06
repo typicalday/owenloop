@@ -93,6 +93,22 @@ version differs from the committed artifact, and a later verifier must reject
 that proof rather than silently correcting it. Integrations that require an
 authoritative submission record must use an explicit version-aware packet.
 
+A consuming driver verifies the envelope before trusting the value. The
+verified signer key must equal `producerKeyId`; the signed `produced[]` entry
+must cover the requested artifact path; and the signed `valueDigest` and
+`version` must match the delivered value and the consumer's claim-time version
+when supplied. The driver then validates the producer's local enrollment chain,
+revocations, and any supplied demand's scope. These checks belong to the
+consuming driver, not the hub or another transport relay.
+
+The built-in production `exec`, `agent-run`, and `hold` roles currently supply
+no pool, label, or namespace demand, and `OrderPacket` has no demand field from
+which to derive one. Production consume gates therefore enforce chain
+termination, per-link signatures, attenuation, and revocation, but the
+demand-dependent `scopePermits` restriction is currently vacuous. A verifier
+caller that supplies a demand receives the full scope check. This is a named
+follow-up, not hub-side trust.
+
 ## Publication record
 
 Payload type: `application/vnd.owenloop.publication.v1+json`.
@@ -258,23 +274,26 @@ owed path, judgment/schema rejection counters, reason entries, and an optional
 opaque `proof` string. `cause`, when present, is `inputsGreen`, `allGreen`, or
 `idle`.
 
-The `consumedFingerprint`, when present, is an open artifact-path map whose values
+**Decision A — version cross-check without fingerprint recomputation.** The
+`consumedFingerprint`, when present, is an open artifact-path map whose values
 are the non-negative versions captured when the engine claimed the order. The
-producer covers the map in its `submission.v1` signature; a driver does not
-recompute the map from consumed values. A driver distinguishes an absent map
-from a genuinely empty map: if the order has consumed inputs but omits the map,
-the driver submits without a proof and emits a warning; an order with no
-consumed inputs may sign an explicitly empty `{}` map.
+producer covers the map in its `submission.v1` signature. A driver enforces the
+versions supplied in this map against signed `produced[].version`, but does not
+recompute the producer's complete map from consumed values. A driver
+distinguishes an absent map from a genuinely empty map: if the order has
+consumed inputs but omits the map, the driver submits without a proof and emits
+a warning; an order with no consumed inputs may sign an explicitly empty `{}`
+map.
 
 An explicit `{}` or partial map alongside a non-empty consumed set is still a
-signed assertion of the map supplied on the wire. This package leaves that
-assertion visible for later consume-side verification; the hub only stores and
-relays the signed content and does not verify or repair it. Consume-side
-verification is a later work package, not part of this contract.
+signed assertion of the map supplied on the wire. A consuming driver verifies
+the supplied entries and enforces the versions that are present; the driver
+does not recompute the producer's complete fingerprint map from values that
+arrived in the same order. The hub only stores and relays the signed content;
+it does not verify, repair, or authorize the assertion.
 
-`owes[].proof` remains unpopulated in this work package. `consumesProof` remains
-a frozen string field, but its concrete encoding is a JSON-serialized map from
-artifact path to serialized DSSE envelope:
+`consumesProof` is a JSON-serialized map from artifact path to serialized DSSE
+envelope:
 
 ```json
 {"input":"{\"payloadType\":\"application/vnd.owenloop.submission.v1+json\",\"payload\":\"...\",\"signatures\":[...] }"}
@@ -283,8 +302,23 @@ artifact path to serialized DSSE envelope:
 The map lets one order carry proofs from multiple producers without changing
 the frozen string slot. A hub stores each submit proof beside the committed
 artifact version and omits paths with no stored proof; `consumesProof` never
-contains null or empty-string entries. The `submission.v1` record shape itself
-is unchanged.
+contains null or empty-string entries. A consuming driver treats a missing
+entry as the `absent` verdict and applies the configured artifact policy rather
+than stripping that artifact from the order.
+
+`owes[].proof`, when present, uses the same serialized DSSE envelope format. The
+signed `submission.v1` record contains one `produced[]` entry for the owed path;
+its `valueDigest` covers the complete `owes[].reasons` array at signing time.
+A driver verifies the complete reason thread before any prompt renderer
+truncates or summarizes the thread. The `submission.v1` record shape itself is
+unchanged.
+
+**Decision B — consumer-owned revocation anchor.** At consume time, the driver
+samples its own clock once for the complete gate and evaluates revocations at
+that instant. A producer-signed timestamp cannot move the `effectiveFrom <= at`
+boundary; a timestamp ahead of the consumer clock is diagnostic only. A prior
+successful consumption is not rewritten, but a later consumption can refuse the
+same producer's artifact after a forward revocation cut.
 
 ## Trust posture
 
@@ -292,5 +326,5 @@ A hub or other remote coordinator is a transport, not an integrity authority.
 A compromised transport may delay or stall progress, but a driver must verify
 that executable instructions, shell commands, dynamic artifact values, and
 trusted signer identities were not altered before acting on them. These wire
-contracts carry the data needed for those later checks; this package does not
-perform the checks itself.
+contracts carry the data needed for those checks; consume-side verification is
+implemented at the consuming driver boundary and never delegated to the hub.
