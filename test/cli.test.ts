@@ -1668,7 +1668,7 @@ function cliFakeIngestor(): BundleIngestor & { ingests: number } {
       source: BundleSource;
       bytes: Uint8Array;
       stagingDir: string;
-    }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest }> {
+    }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest; workflows: string[] }> {
       state.ingests++;
       (this as { ingests: number }).ingests = state.ingests;
       const m = JSON.parse(new TextDecoder().decode(input.bytes));
@@ -1681,7 +1681,7 @@ function cliFakeIngestor(): BundleIngestor & { ingests: number } {
         mkdirSync(join(full, '..'), { recursive: true });
         writeFileSync(full, content as string);
       }
-      return { coordinate: workflowCoordinate(m.coordinate), digest: defDigest(m.claim) };
+      return { coordinate: workflowCoordinate(m.coordinate), digest: defDigest(m.claim), workflows: [m.coordinate.name] };
     },
     async verifyInstalledObject(): Promise<void> {},
   };
@@ -1882,6 +1882,7 @@ test('add <bundle.wnlp> installs into the PROJECT store and prints the structure
     level: 'project',
     coordinate: 'acme/widget@1.0.0',
     digest: bundle.digest,
+    workflows: ['widget'],
     objectPath: join(root, 'objects', 'sha256', bundle.digest),
     installed: true,
   });
@@ -1892,7 +1893,9 @@ test('add <bundle.wnlp> installs into the PROJECT store and prints the structure
   assert.equal(statSync(defFile).mode & 0o777, 0o444, 'installed file is read-only');
   assert.equal(statSync(join(root, 'objects', 'sha256', bundle.digest)).mode & 0o777, 0o555, 'object dir is non-writable');
   const index = JSON.parse(readFileSync(join(root, WORKFLOW_STORE_INDEX_FILENAME), 'utf8'));
-  assert.deepEqual(index.entries, { 'acme/widget@1.0.0': { digest: bundle.digest, pinned: false } });
+  assert.deepEqual(index.entries, {
+    'acme/widget@1.0.0': { digest: bundle.digest, pinned: false, workflows: ['widget'] },
+  });
   assert.equal(existsSync(join(root, '.owenloop-staging')), false, 'staging cleared');
   assert.equal(existsSync(join(cwd, '.owenloop', ADD_JOURNAL_FILENAME)), false, 'journal removed');
 });
@@ -1962,12 +1965,15 @@ test('add <bundle.wnlp> --global installs under ~/.owenloop/workflows (injected 
     level: 'global',
     coordinate: 'acme/gadget@1.0.0',
     digest: bundle.digest,
+    workflows: ['gadget'],
     objectPath: join(root, 'objects', 'sha256', bundle.digest),
     installed: true,
   });
   assert.equal(existsSync(join(root, 'objects', 'sha256', bundle.digest, 'def.yaml')), true);
   const index = JSON.parse(readFileSync(storeIndexPath(root), 'utf8'));
-  assert.deepEqual(index.entries, { 'acme/gadget@1.0.0': { digest: bundle.digest, pinned: false } });
+  assert.deepEqual(index.entries, {
+    'acme/gadget@1.0.0': { digest: bundle.digest, pinned: false, workflows: ['gadget'] },
+  });
   assert.equal(existsSync(join(cwd, 'workflows')), false, 'no project store was created');
 });
 
@@ -1997,8 +2003,8 @@ test('two bundle adds from different cwd values serialize on one canonical --def
   assert.equal(resultB.code, 0, resultB.err);
   const index = JSON.parse(readFileSync(storeIndexPath(sharedDefs), 'utf8'));
   assert.deepEqual(index.entries, {
-    'acme/alpha@1.0.0': { digest: bundleA.digest, pinned: false },
-    'acme/beta@1.0.0': { digest: bundleB.digest, pinned: false },
+    'acme/alpha@1.0.0': { digest: bundleA.digest, pinned: false, workflows: ['alpha'] },
+    'acme/beta@1.0.0': { digest: bundleB.digest, pinned: false, workflows: ['beta'] },
   });
 });
 
@@ -2029,6 +2035,7 @@ test('add https://url fetches the bundle through io.fetch (User-Agent + redirect
     level: 'project',
     coordinate: 'acme/remote@1.0.0',
     digest: bundle.digest,
+    workflows: ['remote'],
     objectPath: join(cwd, 'workflows', 'objects', 'sha256', bundle.digest),
     installed: true,
   });
@@ -2171,7 +2178,7 @@ test('bundle commands are store-free, JSON-only, and round-trip the golden fixtu
   assert.equal(packed.err, '');
   assert.equal(existsSync(bundlePath), true);
   assert.equal(existsSync(join(home, '.owenloop')), false);
-  assert.equal(packed.json().digest, '0c8910982369705203ad87c402f0e7854fd5cc9725af053e11d32f2ac09c61ab');
+  assert.equal(packed.json().digest, '132888c4faf07f2e20f15eb7101d98ee0a80e9d4461375f69bb602b7ac8b9042');
 
   const inspected = run('bundle', 'inspect', bundlePath);
   assert.equal(inspected.code, 0, inspected.err);
@@ -2181,7 +2188,8 @@ test('bundle commands are store-free, JSON-only, and round-trip the golden fixtu
 
   const extracted = run('bundle', 'unpack', bundlePath, unpacked);
   assert.equal(extracted.code, 0, extracted.err);
-  assert.equal(existsSync(join(unpacked, 'workflow.yaml')), true);
+  assert.equal(existsSync(join(unpacked, 'workflows', 'golden.yaml')), true);
+  assert.equal(existsSync(join(unpacked, 'workflows', 'init.yaml')), true);
   assert.equal(existsSync(join(home, '.owenloop')), false);
 });
 

@@ -1725,10 +1725,10 @@ operation required by `OrderResolver`:
    re-checks the installed object's manifest integrity map before the workflow
    is loaded. A project object that exists but is corrupt is an integrity
    refusal; it is not hidden by a valid global copy.
-3. The source loads the verified object's `workflow.yaml`, finalizes the
-   definition, and computes its instruction projection digest. The source
-   caches the definition only when that projection digest equals the order's
-   `defDigest`.
+3. The source reads the verified object's `bundle.yaml`, loads every workflow
+   path listed in the `workflows` map, finalizes all definitions together, and
+   computes each instruction projection digest. The source caches the matching
+   definition when one projection digest equals the order's `defDigest`.
 4. `lookup` then serves the cached step's authored body and command bytes. A
    cache miss is `unknown-digest`; a known digest with no matching step is
    `unknown-step`.
@@ -1774,9 +1774,9 @@ while malformed carrier structure remains an error.
 ### §30.4 Bundle installation adapter
 
 The default CLI binds the real `.wnlp` bundle ingestor. Real bundles are staged
-through their `workflow.yaml` entrypoint, rather than scanning the bundle
-manifest as if `bundle.yaml` were a workflow definition. The install path still
-requires a pre-commit verifier and remains fail-closed when that adapter is not
-provided. The ingestor and verifier are separate concerns: ingestion makes the
-bundle's verified object available, while the verifier decides whether the
-install may commit it.
+through every workflow path listed in their `bundle.yaml` manifest, rather than
+scanning the manifest as if `bundle.yaml` were a workflow definition. The install
+path still requires a pre-commit verifier and remains fail-closed when that
+adapter is not provided. The ingestor and verifier are separate concerns:
+ingestion makes the bundle's verified object available, while the verifier
+decides whether the install may commit it.

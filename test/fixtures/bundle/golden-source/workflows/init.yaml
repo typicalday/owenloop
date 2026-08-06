@@ -1,0 +1,6 @@
+# Second workflow in the golden multi-workflow bundle.
+name: init
+title: Initialization workflow
+steps:
+  - name: initialize
+    body: Initialize the package.

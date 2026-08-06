@@ -9,6 +9,8 @@
  */
 
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { parseManifestBytes } from '../bundle/manifest.ts';
 import { defInstructionDigest } from '../order-resolver.ts';
 import type {
   OrderInstructionLookup,
@@ -117,20 +119,28 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       globalRoot,
       verifier: args.verifier,
     });
-    const entrypoint = join(resolved.objectPath, 'workflow.yaml');
-    const loaded = loadDefFile(entrypoint);
-    const finalized = finalizeDefs(new Map([[loaded.name, loaded]]));
-    const def = finalized.get(loaded.name);
-    if (def === undefined) {
-      throw new StoreIntegrityError(
-        'object-corrupt',
-        bundleDigest,
-        `verified workflow object '${resolved.objectPath}' did not produce a definition`,
-      );
+    const manifestPath = join(resolved.objectPath, 'bundle.yaml');
+    const manifest = parseManifestBytes(readFileSync(manifestPath));
+    const loaded = new Map<string, WorkflowDef>();
+    for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
+      const def = loadDefFile(join(resolved.objectPath, workflowPath));
+      if (def.name !== workflowName) {
+        throw new StoreIntegrityError(
+          'object-corrupt',
+          bundleDigest,
+          `workflow '${workflowPath}' has definition name '${def.name}', expected '${workflowName}'`,
+        );
+      }
+      loaded.set(def.name, def);
     }
-    if (defInstructionDigest(def) !== requestedDigest) return false;
-    cache.set(requestedDigest, { def, bundleDigest, objectPath: resolved.objectPath });
-    return true;
+    const finalized = finalizeDefs(loaded);
+    for (const def of finalized.values()) {
+      if (defInstructionDigest(def) === requestedDigest) {
+        cache.set(requestedDigest, { def, bundleDigest, objectPath: resolved.objectPath });
+        return true;
+      }
+    }
+    return false;
   };
 
   const attemptCandidate = async (

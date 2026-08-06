@@ -29,8 +29,8 @@ export type BundleErrorCode =
   | 'MANIFEST_ERROR'
   | 'UNSUPPORTED_FORMAT_VERSION'
   | 'MANIFEST_MISSING'
-  | 'ENTRYPOINT_MISSING'
-  | 'ENTRYPOINT_INVALID'
+  | 'WORKFLOW_MISSING'
+  | 'WORKFLOW_INVALID'
   | 'INTEGRITY_MISMATCH'
   | 'SOURCE_NOT_A_DIRECTORY'
   | 'SOURCE_NOT_A_FILE'
@@ -58,21 +58,23 @@ export class BundleError extends Error {
 }
 
 /**
- * The v1 package-only manifest (`bundle.yaml`). All collections are
+ * The v2 package-only manifest (`bundle.yaml`). All collections are
  * duplicate-free; serialization order is deterministic (see
  * `docs/bundles.md` §Manifest).
  */
 export interface BundleManifest {
-  /** Always `1` in this format version. */
-  formatVersion: 1;
+  /** Always `2` in this format version. */
+  formatVersion: 2;
   package: {
-    /** Portable package name (matches the workflow definition name). */
+    /** Portable package namespace. */
     name: string;
     /** Non-empty version string. */
     version: string;
   };
-  /** Always `'workflow.yaml'` in v1 — the execution entrypoint. */
-  entrypoint: 'workflow.yaml';
+  /** Workflow name to archive-relative definition path. */
+  workflows: Record<string, string>;
+  /** Optional default workflow name. */
+  default?: string;
   /** Platform selectors this package targets (may be empty). */
   platforms: string[];
   integrity: {

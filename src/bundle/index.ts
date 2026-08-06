@@ -62,8 +62,8 @@ function mergeLimits(partial?: Partial<BundleLimits>): TarLimits {
 }
 
 /** Wrap a DefError/parse failure into a stable-code BundleError. */
-function workflowError(message: string, entryPath?: string): BundleError {
-  return new BundleError('WORKFLOW_ERROR', `workflow.yaml: ${message}`, entryPath);
+function workflowError(message: string, entryPath: string): BundleError {
+  return new BundleError('WORKFLOW_ERROR', `${entryPath}: ${message}`, entryPath);
 }
 
 /**
@@ -150,23 +150,38 @@ function readBundleStrict(bytes: Uint8Array, lim: TarLimits): StrictRead {
  * equivalent in-memory operation must enforce the same relative-path policy,
  * require a regular archive entry, and then provide the resolved body string.
  */
-function inlineArchiveBodyFiles(value: unknown, files: Map<string, TarEntry>, context: string): unknown {
+function inlineArchiveBodyFiles(
+  value: unknown,
+  files: Map<string, TarEntry>,
+  workflowPath: string,
+  context: string,
+): unknown {
   if (Array.isArray(value)) {
-    return value.map((item, i) => inlineArchiveBodyFiles(item, files, `${context}[${i}]`));
+    return value.map((item, i) => inlineArchiveBodyFiles(item, files, workflowPath, `${context}[${i}]`));
   }
   if (typeof value !== 'object' || value === null) return value;
 
   const source = value as Record<string, unknown>;
   const out: Record<string, unknown> = {};
   const hasBody = Object.prototype.hasOwnProperty.call(source, 'body');
-  const canResolveBodyFile = /^workflow\.yaml\.steps\[\d+\](?:\.produces\[\d+\]\.judges\[\d+\])?$/.test(context);
+  const escapedWorkflowPath = workflowPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const canResolveBodyFile = new RegExp(
+    `^${escapedWorkflowPath}\\.steps\\[\\d+\\](?:\\.produces\\[\\d+\\]\\.judges\\[\\d+\\])?$`,
+  ).test(context);
+  const slash = workflowPath.lastIndexOf('/');
+  const workflowDirectory = slash === -1 ? '' : workflowPath.slice(0, slash);
   for (const [key, item] of Object.entries(source)) {
     if (canResolveBodyFile && key === 'bodyFile' && typeof item === 'string' && !hasBody) {
       const violation = archivePathViolation(item);
       if (violation) {
 	throw new Error(`${context}.bodyFile '${item}' is unsafe: ${violation}`);
       }
-      const target = files.get(item);
+      const targetPath = workflowDirectory === '' ? item : `${workflowDirectory}/${item}`;
+      const targetViolation = archivePathViolation(targetPath);
+      if (targetViolation) {
+	throw new Error(`${context}.bodyFile '${item}' is unsafe after resolving against '${workflowDirectory}': ${targetViolation}`);
+      }
+      const target = files.get(targetPath);
       if (!target) {
 	throw new Error(`${context}.bodyFile '${item}' is missing from the archive`);
       }
@@ -179,44 +194,52 @@ function inlineArchiveBodyFiles(value: unknown, files: Map<string, TarEntry>, co
       out.body = body;
       continue;
     }
-    out[key] = inlineArchiveBodyFiles(item, files, `${context}.${key}`);
+    out[key] = inlineArchiveBodyFiles(item, files, workflowPath, `${context}.${key}`);
   }
   return out;
 }
 
-/** Entrypoint validation shared by inspect and unpack (in-memory; no disk). */
-function validateEntrypointBytes(entries: TarEntry[], manifest: BundleManifest): void {
-  const ep = entries.find((e) => e.path === manifest.entrypoint);
-  if (!ep) {
-    throw new BundleError('ENTRYPOINT_MISSING', `bundle is missing its entrypoint '${manifest.entrypoint}'`);
+/** Workflow validation shared by inspect and unpack (in-memory; no disk). */
+function validateWorkflowsBytes(entries: TarEntry[], manifest: BundleManifest): void {
+  const files = new Map(entries.map((entry) => [entry.path, entry]));
+  const callsTargets: string[] = [];
+  for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
+    const workflowEntry = files.get(workflowPath);
+    if (!workflowEntry) {
+      throw new BundleError(
+        'WORKFLOW_MISSING',
+        `bundle is missing workflow '${workflowName}' at '${workflowPath}'`,
+        workflowPath,
+      );
+    }
+    let text: string;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(workflowEntry.data);
+    } catch {
+      throw workflowError('not valid UTF-8', workflowPath);
+    }
+    let raw: unknown;
+    try {
+      raw = parseYaml(text);
+    } catch (e) {
+      throw workflowError(`YAML parse error: ${(e as Error).message.split('\n')[0]}`, workflowPath);
+    }
+    let def;
+    try {
+      const inlined = inlineArchiveBodyFiles(raw, files, workflowPath, workflowPath);
+      def = parseDef(inlined, workflowPath, undefined);
+    } catch (e) {
+      throw workflowError((e as Error).message, workflowPath);
+    }
+    if (def.name !== workflowName) {
+      throw new BundleError(
+        'WORKFLOW_ERROR',
+        `${workflowPath}: definition name '${def.name}' must equal workflow map key '${workflowName}'`,
+        workflowPath,
+      );
+    }
+    callsTargets.push(...def.steps.map((step) => step.calls).filter((target): target is string => typeof target === 'string'));
   }
-  let text: string;
-  try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(ep.data);
-  } catch {
-    throw workflowError('not valid UTF-8');
-  }
-  let raw: unknown;
-  try {
-    raw = parseYaml(text);
-  } catch (e) {
-    throw workflowError(`YAML parse error: ${(e as Error).message.split('\n')[0]}`);
-  }
-  let def;
-  try {
-    const files = new Map(entries.map((entry) => [entry.path, entry]));
-    const inlined = inlineArchiveBodyFiles(raw, files, 'workflow.yaml');
-    def = parseDef(inlined, 'workflow.yaml', undefined);
-  } catch (e) {
-    throw workflowError((e as Error).message);
-  }
-  if (def.name !== manifest.package.name) {
-    throw new BundleError(
-      'WORKFLOW_ERROR',
-      `workflow.yaml: definition name '${def.name}' must equal package name '${manifest.package.name}'`,
-    );
-  }
-  const callsTargets = def.steps.map((step) => step.calls).filter((target): target is string => typeof target === 'string');
   assertLockCoverage(manifest, callsTargets);
 }
 
@@ -332,14 +355,14 @@ function lstatDestination(path: string): ReturnType<typeof lstatSync> | undefine
 /**
  * Strictly validate a `.wnlp` bundle from its bytes, WITHOUT filesystem
  * extraction: bounded inflate, strict tar parse, one canonical root
- * `bundle.yaml`, entrypoint workflow validation, exact integrity coverage,
+ * `bundle.yaml`, every declared workflow validation, exact integrity coverage,
  * and per-file hash verification. Returns the digest, the manifest, and
  * sorted entry metadata.
  */
 export function inspectBundle(bytes: Uint8Array, opts: InspectOptions = {}): InspectResult {
   const lim = mergeLimits(opts.limits);
   const { digest, entries, manifest } = readBundleStrict(bytes, lim);
-  validateEntrypointBytes(entries, manifest);
+  validateWorkflowsBytes(entries, manifest);
   verifyIntegrity(entries, manifest);
   return { digest, manifest, entries: entryInfos(entries) };
 }
@@ -358,7 +381,7 @@ export function inspectBundle(bytes: Uint8Array, opts: InspectOptions = {}): Ins
 export function unpackBundle(bytes: Uint8Array, destination: string, opts: InspectOptions = {}): InspectResult & { path: string } {
   const lim = mergeLimits(opts.limits);
   const { digest, entries, manifest } = readBundleStrict(bytes, lim);
-  validateEntrypointBytes(entries, manifest);
+  validateWorkflowsBytes(entries, manifest);
   verifyIntegrity(entries, manifest);
 
   const destAbs = resolve(destination);
@@ -421,11 +444,12 @@ export function unpackBundle(bytes: Uint8Array, destination: string, opts: Inspe
  *
  * - Walks the source without following symlinks; refuses symlinked roots or
  *   members and unsafe paths (shared archive policy).
- * - Requires exactly one root `bundle.yaml` and `workflow.yaml`.
- * - Validates the source manifest, loads `<source>/workflow.yaml` with the
- *   engine's single-definition loader (retaining contained-`bodyFile`
- *   checks), requires the def name to equal `package.name`, and requires a
- *   lock entry for each explicit `namespace/name@version` `calls:` target.
+ * - Requires exactly one root `bundle.yaml` and every workflow path listed by
+ *   that manifest.
+ * - Validates the source manifest, loads every listed workflow with the engine's
+ *   definition loader (retaining contained-`bodyFile` checks), requires
+ *   each def name to equal its workflow map key, and requires a lock entry for
+ *   each explicit `namespace/name@version` `calls:` target.
  * - Regenerates `integrity.files` from the actual file bytes (author-supplied
  *   hashes are replaceable generated data) and serializes a canonical
  *   manifest IN MEMORY — the source directory is never modified.
@@ -436,12 +460,9 @@ export function packBundle(sourceDir: string, opts: PackOptions = {}): PackResul
   const lim = mergeLimits(opts.limits);
   const files = collectSourceFiles(sourceDir, lim);
 
-  const rootNames = new Set(files.map((f) => f.rel));
-  if (!rootNames.has('bundle.yaml')) {
+  const sourcePaths = new Set(files.map((f) => f.rel));
+  if (!sourcePaths.has('bundle.yaml')) {
     throw new BundleError('MANIFEST_MISSING', `source '${sourceDir}' has no root 'bundle.yaml'`);
-  }
-  if (!rootNames.has('workflow.yaml')) {
-    throw new BundleError('ENTRYPOINT_MISSING', `source '${sourceDir}' has no root 'workflow.yaml'`);
   }
 
   // Read file bytes, re-checking each node is still the same regular file it
@@ -469,22 +490,31 @@ export function packBundle(sourceDir: string, opts: PackOptions = {}): PackResul
 
   const sourceManifest = parseManifestBytes(contents.get('bundle.yaml')!);
 
-  // Entrypoint: the existing single-definition loader with contained-bodyFile
-  // checks; the def name must equal package.name.
-  let defName: string;
-  let callsTargets: string[] = [];
-  try {
-    const def = loadDefFile(join(resolve(sourceDir), 'workflow.yaml'));
-    defName = def.name;
-    callsTargets = def.steps.map((s) => s.calls).filter((c): c is string => typeof c === 'string');
-  } catch (e) {
-    throw workflowError((e as Error).message);
-  }
-  if (defName !== sourceManifest.package.name) {
-    throw new BundleError(
-      'WORKFLOW_ERROR',
-      `workflow.yaml: definition name '${defName}' must equal package name '${sourceManifest.package.name}'`,
-    );
+  // Load every declared workflow with the disk loader so bodyFile paths use
+  // the workflow file's own directory, then check the union of all calls.
+  const callsTargets: string[] = [];
+  for (const [workflowName, workflowPath] of Object.entries(sourceManifest.workflows)) {
+    if (!sourcePaths.has(workflowPath)) {
+      throw new BundleError(
+        'WORKFLOW_MISSING',
+        `source '${sourceDir}' is missing workflow '${workflowName}' at '${workflowPath}'`,
+        workflowPath,
+      );
+    }
+    let def;
+    try {
+      def = loadDefFile(join(resolve(sourceDir), workflowPath));
+    } catch (e) {
+      throw workflowError((e as Error).message, workflowPath);
+    }
+    if (def.name !== workflowName) {
+      throw new BundleError(
+        'WORKFLOW_ERROR',
+        `${workflowPath}: definition name '${def.name}' must equal workflow map key '${workflowName}'`,
+        workflowPath,
+      );
+    }
+    callsTargets.push(...def.steps.map((step) => step.calls).filter((target): target is string => typeof target === 'string'));
   }
   assertLockCoverage(sourceManifest, callsTargets);
 

@@ -42,9 +42,9 @@ function tempDir(prefix = 'owenloop-bundle-'): string {
 }
 
 test('manifest parser rejects duplicate keys, aliases, merges, tags, and prototype keys', () => {
-  const base = `formatVersion: 1\npackage:\n  name: x\n  version: "1"\nentrypoint: workflow.yaml\nplatforms: []\nintegrity:\n  algorithm: sha256\n  files: {}\ncapabilities: {}\nlock: {}\n`;
+  const base = `formatVersion: 2\npackage:\n  name: x\n  version: "1"\nworkflows:\n  main: workflow.yaml\nplatforms: []\nintegrity:\n  algorithm: sha256\n  files: {}\ncapabilities: {}\nlock: {}\n`;
   const cases = [
-    ['duplicate key', base.replace('formatVersion: 1\n', 'formatVersion: 1\nformatVersion: 1\n')],
+    ['duplicate key', base.replace('formatVersion: 2\n', 'formatVersion: 2\nformatVersion: 2\n')],
     ['alias', base.replace('platforms: []', 'platforms: &platforms []').replace('capabilities: {}', 'capabilities: *platforms')],
     ['merge key', base.replace('capabilities: {}', 'capabilities:\n  <<: {}')],
     ['map tag', base.replace('package:\n', 'package: !x\n')],
@@ -55,11 +55,31 @@ test('manifest parser rejects duplicate keys, aliases, merges, tags, and prototy
     assert.equal(errorCode(() => parseManifestBytes(Buffer.from(text))), 'MANIFEST_ERROR', name);
   }
   assert.equal(
-    errorCode(() => parseManifestBytes(Buffer.from(base.replace('formatVersion: 1', 'formatVersion: 2')))),
+    errorCode(() => parseManifestBytes(Buffer.from(base.replace('formatVersion: 2', 'formatVersion: 1')))),
     'UNSUPPORTED_FORMAT_VERSION',
   );
   assert.equal(
-    errorCode(() => parseManifestBytes(Buffer.from(base.replace('entrypoint: workflow.yaml', 'entrypoint: ../workflow.yaml')))),
+    errorCode(() => parseManifestBytes(Buffer.from(base.replace('main: workflow.yaml', 'main: ../workflow.yaml')))),
+    'MANIFEST_ERROR',
+  );
+  assert.equal(
+    errorCode(() => parseManifestBytes(Buffer.from(`${base}entrypoint: workflow.yaml\n`))),
+    'MANIFEST_ERROR',
+  );
+  assert.equal(
+    errorCode(() => parseManifestBytes(Buffer.from(base.replace('workflows:\n  main: workflow.yaml', 'workflows: {}')))),
+    'MANIFEST_ERROR',
+  );
+  assert.equal(
+    errorCode(() => parseManifestBytes(Buffer.from(base.replace('main: workflow.yaml', 'Main: workflow.yaml')))),
+    'MANIFEST_ERROR',
+  );
+  assert.equal(
+    errorCode(() => parseManifestBytes(Buffer.from(base.replace('workflows:\n  main: workflow.yaml', 'workflows:\n  main: workflow.yaml\n  other: workflow.yaml')))),
+    'MANIFEST_ERROR',
+  );
+  assert.equal(
+    errorCode(() => parseManifestBytes(Buffer.from(`${base}default: missing\n`))),
     'MANIFEST_ERROR',
   );
 });
@@ -78,7 +98,40 @@ test('golden source packs to byte-identical archive and digest', () => {
 test('inspect resolves step bodyFile from archive bytes and verifies integrity', () => {
   const inspected = inspectBundle(readFileSync(GOLDEN));
   assert.equal(inspected.manifest.package.name, 'golden-bundle');
-  assert.equal(inspected.manifest.integrity.files['instructions/build.md']?.length, 64);
+  assert.equal(inspected.manifest.integrity.files['workflows/instructions/build.md']?.length, 64);
+});
+
+test('pack validates every declared workflow and aggregates cross-workflow lock coverage', () => {
+  const missing = tempDir();
+  cpSync(SOURCE, missing, { recursive: true });
+  writeFileSync(
+    join(missing, 'bundle.yaml'),
+    readFileSync(join(missing, 'bundle.yaml'), 'utf8').replace('init: workflows/init.yaml', 'init: workflows/missing.yaml'),
+  );
+  assert.equal(errorCode(() => packBundle(missing)), 'WORKFLOW_MISSING');
+
+  const wrongName = tempDir();
+  cpSync(SOURCE, wrongName, { recursive: true });
+  writeFileSync(
+    join(wrongName, 'workflows', 'init.yaml'),
+    readFileSync(join(wrongName, 'workflows', 'init.yaml'), 'utf8').replace('name: init', 'name: wrong'),
+  );
+  assert.equal(errorCode(() => packBundle(wrongName)), 'WORKFLOW_ERROR');
+
+  const missingLock = tempDir();
+  cpSync(SOURCE, missingLock, { recursive: true });
+  writeFileSync(join(missingLock, 'workflows', 'init.yaml'), `name: init
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: initialize
+    calls: acme/child@1.0.0
+    inputs:
+      seed: seed
+    produces: [out]
+`);
+  assert.equal(errorCode(() => packBundle(missingLock)), 'MANIFEST_ERROR');
 });
 
 test('def digest is SHA-256 over independently gunzipped tar bytes', () => {
@@ -114,10 +167,15 @@ test('packing does not edit source manifest and is stable across mtime and irrel
   const before = readFileSync(join(source, 'bundle.yaml'));
   const first = packBundle(source);
   const changed = new Date('2001-02-03T04:05:06.000Z');
-  for (const path of [join(source, 'bundle.yaml'), join(source, 'workflow.yaml'), join(source, 'instructions', 'build.md')]) {
+  for (const path of [
+    join(source, 'bundle.yaml'),
+    join(source, 'workflows', 'golden.yaml'),
+    join(source, 'workflows', 'init.yaml'),
+    join(source, 'workflows', 'instructions', 'build.md'),
+  ]) {
     utimesSync(path, changed, changed);
   }
-  chmodSync(join(source, 'instructions', 'build.md'), 0o600);
+  chmodSync(join(source, 'workflows', 'instructions', 'build.md'), 0o600);
   const second = packBundle(source);
   assert.deepEqual(Buffer.from(second.bytes), Buffer.from(first.bytes));
   assert.deepEqual(readFileSync(join(source, 'bundle.yaml')), before);
@@ -140,9 +198,10 @@ test('packing is stable across controlled source directory-entry ordering', () =
     'assets/very-long-directory-name-that-pushes-the-archive-path-past-one-hundred-bytes-to-require-a-pax-header/deeply-nested-file.txt',
     'bundle.yaml',
     'docs/README.md',
-    'instructions/build.md',
+    'workflows/golden.yaml',
+    'workflows/init.yaml',
+    'workflows/instructions/build.md',
     'scripts/run.sh',
-    'workflow.yaml',
   ];
   const sourceFiles = relativePaths.map((rel) => ({
     rel,
@@ -208,7 +267,10 @@ test('unpack writes a fresh destination atomically and rejects overwrite', () =>
   const destination = join(root, 'out');
   const result = unpackBundle(readFileSync(GOLDEN), destination);
   assert.equal(result.path, destination);
-  assert.equal(readFileSync(join(destination, 'instructions', 'build.md'), 'utf8'), readFileSync(join(SOURCE, 'instructions', 'build.md'), 'utf8'));
+  assert.equal(
+    readFileSync(join(destination, 'workflows', 'instructions', 'build.md'), 'utf8'),
+    readFileSync(join(SOURCE, 'workflows', 'instructions', 'build.md'), 'utf8'),
+  );
   assert.equal(errorCode(() => unpackBundle(readFileSync(GOLDEN), destination)), 'DESTINATION_EXISTS');
 });
 
@@ -231,7 +293,8 @@ test('stock tar can list a produced bundle', () => {
   writeFileSync(path, packBundle(SOURCE).bytes);
   const listing = execFileSync('tar', ['-tzf', path], { encoding: 'utf8' });
   assert.match(listing, /bundle\.yaml/);
-  assert.match(listing, /workflow\.yaml/);
+  assert.match(listing, /workflows\/golden\.yaml/);
+  assert.match(listing, /workflows\/init\.yaml/);
 });
 
 test('strict reader rejects hostile path, duplicate, type, checksum, PAX, termination, and size cases', () => {

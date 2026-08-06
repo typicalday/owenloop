@@ -107,8 +107,9 @@ owenloop bundle inspect <bundle.wnlp>
 owenloop bundle digest <bundle.wnlp>
 ```
 
-`pack` requires a source directory containing root `bundle.yaml` and
-`workflow.yaml`. The source manifest is not modified. If `--output` is omitted,
+`pack` requires a source directory containing root `bundle.yaml` and every
+workflow path listed by the manifest's `workflows` map. The source manifest is
+not modified. If `--output` is omitted,
 the output is `<package-name>-<version>.wnlp` next to the source directory. An
 explicit output path must be outside the source directory. A regular file at
 the output path may be replaced; a directory or other non-regular path is
@@ -868,9 +869,9 @@ Coordinates, source strings, and version text never join into a path.
    committed.
 6. Validate the staged tree with the engine's strict pass — the exact bytes
    that will be committed (parse/lint/validate/bounded `check` + the strict
-   cross-def backstop). For a real `.wnlp`, validation loads the bundle's root
-   `workflow.yaml` entrypoint directly; the package manifest `bundle.yaml` is
-   not treated as a workflow definition. Any problem refuses the whole install
+   cross-def backstop). For a real `.wnlp`, validation parses `bundle.yaml`
+   and loads every workflow path listed in its `workflows` map; the package
+   manifest itself is not treated as a workflow definition. Any problem refuses the whole install
    and prints every reason.
 7. Run the pre-commit verifier (after content validation, before any swap or
    index write). A rejection commits nothing.

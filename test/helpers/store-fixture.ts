@@ -29,16 +29,20 @@ export function writeBundleSource(args: {
   name: string;
   version?: string;
   workflow: string;
+  /** Additional workflow name to YAML content entries, stored at the root. */
+  workflows?: Record<string, string>;
   files?: Record<string, string>;
 }): string {
   const root = tempDir(`owenloop-bundle-source-${args.name}-`);
   const version = args.version ?? '1.0.0';
+  const workflowContents = { [args.name]: args.workflow, ...(args.workflows ?? {}) };
   const manifest = [
-    'formatVersion: 1',
+    'formatVersion: 2',
     'package:',
     `  name: ${args.name}`,
     `  version: ${version}`,
-    'entrypoint: workflow.yaml',
+    'workflows:',
+    ...Object.keys(workflowContents).map((name) => `  ${name}: ${JSON.stringify(name === args.name ? 'workflow.yaml' : `${name}.yaml`)}`),
     'platforms: []',
     'integrity:',
     '  algorithm: sha256',
@@ -48,7 +52,9 @@ export function writeBundleSource(args: {
     '',
   ].join('\n');
   writeFileSync(join(root, 'bundle.yaml'), manifest);
-  writeFileSync(join(root, 'workflow.yaml'), args.workflow);
+  for (const [name, content] of Object.entries(workflowContents)) {
+    writeFileSync(join(root, name === args.name ? 'workflow.yaml' : `${name}.yaml`), content);
+  }
   for (const [relative, content] of Object.entries(args.files ?? {})) {
     const target = join(root, relative);
     mkdirSync(join(target, '..'), { recursive: true });

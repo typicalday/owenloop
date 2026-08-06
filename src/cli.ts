@@ -2420,6 +2420,7 @@ async function dispatchAddBundle(io: CliIO, args: Args, source: AddSource): Prom
     level: result.level,
     coordinate: result.coordinate,
     digest: result.digest,
+    workflows: result.workflows,
     objectPath: result.objectPath,
     installed: result.installed,
   });

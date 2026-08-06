@@ -191,6 +191,10 @@ test('index: hostile shapes fail closed; unknown additive keys are tolerated', (
     ['uppercase digest (never normalized)', { version: 1, entries: { 'acme/w@1': { digest: 'A'.repeat(64), pinned: false } } }],
     ['short digest', { version: 1, entries: { 'acme/w@1': { digest: 'ab', pinned: false } } }],
     ['pinned not a boolean', { version: 1, entries: { 'acme/w@1': { digest: good.digest, pinned: 'yes' } } }],
+    ['workflow names not an array', { version: 1, entries: { 'acme/w@1': { digest: good.digest, pinned: false, workflows: 'w' } } }],
+    ['invalid workflow name', { version: 1, entries: { 'acme/w@1': { digest: good.digest, pinned: false, workflows: ['Bad'] } } }],
+    ['duplicate workflow name', { version: 1, entries: { 'acme/w@1': { digest: good.digest, pinned: false, workflows: ['one', 'one'] } } }],
+    ['unsorted workflow names', { version: 1, entries: { 'acme/w@1': { digest: good.digest, pinned: false, workflows: ['zeta', 'alpha'] } } }],
   ];
   for (const [name, parsed] of rejects) {
     assert.throws(() => parseWorkflowStoreIndex(parsed, path), (e: unknown) =>

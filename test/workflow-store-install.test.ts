@@ -119,7 +119,7 @@ function fakeIngestor(opts: { failVerifyFor?: Set<string> } = {}): BundleIngesto
       source: BundleSource;
       bytes: Uint8Array;
       stagingDir: string;
-    }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest }> {
+    }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest; workflows: string[] }> {
       state.ingests++;
       (this as { ingests: number }).ingests = state.ingests;
       let m: { coordinate: WireManifest['coordinate']; files: Record<string, string>; claim: string };
@@ -140,7 +140,7 @@ function fakeIngestor(opts: { failVerifyFor?: Set<string> } = {}): BundleIngesto
         mkdirSync(join(full, '..'), { recursive: true });
         writeFileSync(full, content);
       }
-      return { coordinate, digest: defDigest(m.claim) };
+      return { coordinate, digest: defDigest(m.claim), workflows: [m.coordinate.name] };
     },
     async verifyInstalledObject(input: { objectDir: string; digest: DefDigest }): Promise<void> {
       state.verifies.push(input);
@@ -233,6 +233,7 @@ test('install: a valid bundle installs with the fixed commit order and hardened 
   assert.equal(result.level, 'project');
   assert.equal(result.coordinate, 'acme/widget@1.0.0');
   assert.equal(result.digest, m.digest);
+  assert.deepEqual(result.workflows, ['widget']);
   assert.equal(result.objectPath, join(root, objectDestRelPath(defDigest(m.digest))));
 
   // Object content + HARDENED modes (files 0o444, dirs 0o555, object dir included).
@@ -246,7 +247,7 @@ test('install: a valid bundle installs with the fixed commit order and hardened 
   // Index records the coordinate; journal and lock are gone; staging cleared.
   assert.deepEqual(readWorkflowStoreIndex(storeIndexPath(root)), {
     version: 1,
-    entries: { 'acme/widget@1.0.0': { digest: m.digest, pinned: false } },
+    entries: { 'acme/widget@1.0.0': { digest: m.digest, pinned: false, workflows: ['widget'] } },
   });
   assert.ok(!existsSync(journalPath), 'journal removed on success');
   assert.ok(!existsSync(lockPath), 'lock released on success');

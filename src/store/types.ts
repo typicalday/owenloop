@@ -334,6 +334,8 @@ export type ResolutionLevel = 'project' | 'global';
 export interface WorkflowStoreIndexEntry {
   digest: string;
   pinned: boolean;
+  /** Sorted workflow names carried by the installed bundle, when known. */
+  workflows?: string[];
 }
 
 /**
