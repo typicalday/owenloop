@@ -2,7 +2,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -15,7 +15,7 @@ import {
   packBundle,
   unpackBundle,
 } from '../src/bundle/index.ts';
-import { parseManifestBytes } from '../src/bundle/manifest.ts';
+import { manifestToBytes, parseManifestBytes } from '../src/bundle/manifest.ts';
 import { buildCanonicalTar, collectSourceFiles } from '../src/bundle/tar.ts';
 import { hostileData, hostileFileEntry, hostileHeader, hostilePaxBlocks, hostilePaxPathRecord, hostileTarball } from './helpers.ts';
 
@@ -99,6 +99,59 @@ test('inspect resolves step bodyFile from archive bytes and verifies integrity',
   const inspected = inspectBundle(readFileSync(GOLDEN));
   assert.equal(inspected.manifest.package.name, 'golden-bundle');
   assert.equal(inspected.manifest.integrity.files['workflows/instructions/build.md']?.length, 64);
+});
+
+test('a subdirectory workflow refuses a bodyFile that sits at the archive root', () => {
+  // The positive half is the golden fixture itself: workflows/golden.yaml
+  // resolves `bodyFile: instructions/build.md` to its SIBLING,
+  // workflows/instructions/build.md. This is the negative half — the same
+  // authored `bodyFile` string with the file at the ARCHIVE ROOT
+  // (instructions/build.md) must be REFUSED, because `bodyFile` is relative to
+  // the workflow file's own directory, never to the archive root. Both the
+  // pack-time disk loader and the in-memory archive reader must refuse it.
+
+  // Pack side: the disk loader resolves against dirname(workflow file), so the
+  // root-level body file is simply not there.
+  const packSource = tempDir();
+  cpSync(SOURCE, packSource, { recursive: true });
+  mkdirSync(join(packSource, 'instructions'), { recursive: true });
+  renameSync(
+    join(packSource, 'workflows', 'instructions', 'build.md'),
+    join(packSource, 'instructions', 'build.md'),
+  );
+  rmSync(join(packSource, 'workflows', 'instructions'), { recursive: true });
+  assert.equal(errorCode(() => packBundle(packSource)), 'WORKFLOW_ERROR');
+
+  // Inspect side: build the same layout directly as archive bytes, since pack
+  // refuses to produce it. `buildArchive` keeps the integrity map honest so the
+  // failure that surfaces is the bodyFile rule, not an integrity mismatch.
+  const workflowBytes = readFileSync(join(SOURCE, 'workflows', 'golden.yaml'));
+  const initBytes = readFileSync(join(SOURCE, 'workflows', 'init.yaml'));
+  const bodyBytes = readFileSync(join(SOURCE, 'workflows', 'instructions', 'build.md'));
+  const buildArchive = (bodyPath: string): Buffer => {
+    const payload: Array<[string, Buffer]> = [
+      ['workflows/golden.yaml', workflowBytes],
+      ['workflows/init.yaml', initBytes],
+      [bodyPath, bodyBytes],
+    ];
+    const base = parseManifestBytes(readFileSync(join(SOURCE, 'bundle.yaml')));
+    const files: Record<string, string> = {};
+    for (const [path, bytes] of payload) files[path] = createHash('sha256').update(bytes).digest('hex');
+    const manifest = { ...base, integrity: { algorithm: 'sha256' as const, files } };
+    const all: Array<[string, Buffer]> = [
+      ['bundle.yaml', Buffer.from(manifestToBytes(manifest))],
+      ...payload,
+    ];
+    all.sort((a, b) => Buffer.compare(Buffer.from(a[0], 'utf8'), Buffer.from(b[0], 'utf8')));
+    return gzipSync(buildCanonicalTar(all.map(([path, bytes]) => ({ path, bytes, mode: 0o644 }))));
+  };
+
+  // Control: the sibling layout — the positive half — inspects cleanly, so the
+  // negative assertion below isolates the base directory and nothing else.
+  const sibling = inspectBundle(buildArchive('workflows/instructions/build.md'));
+  assert.equal(sibling.manifest.package.name, 'golden-bundle');
+
+  assert.equal(errorCode(() => inspectBundle(buildArchive('instructions/build.md'))), 'WORKFLOW_ERROR');
 });
 
 test('pack validates every declared workflow and aggregates cross-workflow lock coverage', () => {
