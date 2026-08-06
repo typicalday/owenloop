@@ -193,6 +193,11 @@ export interface Order {
   x?: Record<string, unknown>;
   /** captured handles of the green inputs this run builds on */
   consumes: Record<string, unknown>;
+  /**
+   * The versions of the consumed inputs captured at claim time. Drivers cover
+   * this map in a submission signature instead of recomputing it from values.
+   */
+  consumedFingerprint?: Fingerprint;
   /** the owed outputs and their accumulated reason threads (the feedback channel) */
   owes: Array<{
     path: string;

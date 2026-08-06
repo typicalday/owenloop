@@ -100,14 +100,27 @@ test('happy path: planner → builder → reviewer → merger to done', () => {
   assert.equal(engine.tick(wf, { now: 5000 }).orders.length, 0);
 });
 
-test('a firing carries its consumed input handles and owed reason thread', () => {
+test('a firing carries its consumed input handles, claim-time fingerprint, and owed reason thread', () => {
   const { engine } = makeEngine([delivery]);
   const wf = engine.createInstance('delivery', { provide: { proposal: { goal: 'ship it' } } });
 
   const planner = fire(engine, wf, 'planner', 1000);
   assert.deepEqual(planner.consumes, { proposal: { goal: 'ship it' } });
+  assert.deepEqual(planner.consumedFingerprint, { proposal: 1 });
   assert.deepEqual(planner.outputs, ['plan']);
   assert.deepEqual(planner.owes.map((w) => w.path), ['plan']);
+});
+
+test('a missing human input is not fireable, so no claim can emit a negative fingerprint version', () => {
+  const missingInputDef = def(
+    'missing-input',
+    [input('question', { seedOwed: true })],
+    [step({ name: 'producer', consumes: ['question'], produces: ['answer'] })],
+  );
+  const { engine } = makeEngine([missingInputDef]);
+  const wf = engine.createInstance('missing-input');
+  const tick = engine.tick(wf, { now: 1000 });
+  assert.equal(tick.orders.length, 0);
 });
 
 test('claim persists the emitted order packet in the same txn — present the moment tick returns', () => {

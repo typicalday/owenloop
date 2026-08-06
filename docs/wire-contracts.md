@@ -238,7 +238,7 @@ Required fields are `run`, `workflow`, `step`, `key`, `defDigest`, `inputs`,
 `outputs`, `consumes`, and `owes`.
 
 Optional fields are `index`, `workdir`, `model`, `worker`, `spec`, `x`,
-`consumesProof`, and `cause`.
+`consumedFingerprint`, `consumesProof`, and `cause`.
 
 `defDigest` is a non-empty opaque reference. `inputs` and `outputs` are string
 arrays. `consumes` is an open artifact-path map; `spec` and `x` are opaque
@@ -247,11 +247,24 @@ owed path, judgment/schema rejection counters, reason entries, and an optional
 opaque `proof` string. `cause`, when present, is `inputsGreen`, `allGreen`, or
 `idle`.
 
-The `owes[].proof` and `consumesProof` slots deliberately remain opaque strings.
-The intended payload is a serialized DSSE envelope over a submission record,
-but the choice of how a proof is embedded and resolved belongs to the driver
-layer. Keeping the slots unchanged preserves the frozen reference-mode Order
-shape.
+The `consumedFingerprint`, when present, is an open artifact-path map whose values
+are the non-negative versions captured when the engine claimed the order. The
+producer covers the map in its `submission.v1` signature; a driver does not
+recompute the map from consumed values.
+
+`owes[].proof` remains unpopulated in this work package. `consumesProof` remains
+a frozen string field, but its concrete encoding is a JSON-serialized map from
+artifact path to serialized DSSE envelope:
+
+```json
+{"input":"{\"payloadType\":\"application/vnd.owenloop.submission.v1+json\",\"payload\":\"...\",\"signatures\":[...] }"}
+```
+
+The map lets one order carry proofs from multiple producers without changing
+the frozen string slot. A hub stores each submit proof beside the committed
+artifact version and omits paths with no stored proof; `consumesProof` never
+contains null or empty-string entries. The `submission.v1` record shape itself
+is unchanged.
 
 ## Trust posture
 

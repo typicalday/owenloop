@@ -352,3 +352,7 @@ export type {
   WorkflowGraph,
   WorkflowTrace,
 } from './types.ts';
+
+// ---- WP-D2 signed submission records ----
+export { canonicalValueBytes, valueDigestHex, buildSubmissionRecord, signSubmission } from './crypto/index.ts';
+export type { BuildSubmissionRecordInput, SubmissionProducedInput } from './crypto/index.ts';

@@ -1471,7 +1471,7 @@ export class Engine {
     // CONFLICT DO UPDATE, no history table), so the issued order is unrecoverable
     // later unless captured here; this persisted packet is the replay/eval/paper
     // trail record (buildOrder is deterministic modulo run id).
-    const order = this.buildOrder(def, workflow, runId, f, arts);
+    const order = this.buildOrder(def, workflow, runId, f, arts, fp);
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
     this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, order, ...(f.cause ? { cause: f.cause } : {}) }, now);
     this.store.putTask({
@@ -1503,6 +1503,7 @@ export class Engine {
     runId: string,
     f: Firing,
     arts: ArtifactMap,
+    consumedFingerprint: Fingerprint,
   ): Order {
     const step = this.step(def, f.step);
     const defDigest = this.instructionSource.digestOf(def);
@@ -1529,6 +1530,7 @@ export class Engine {
       inputs: f.inputs,
       outputs: f.outputs,
       consumes,
+      consumedFingerprint: { ...consumedFingerprint },
       owes,
     };
     if (f.index !== undefined) order.index = f.index;

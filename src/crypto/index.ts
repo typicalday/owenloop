@@ -187,3 +187,8 @@ export {
   rosterDir,
 } from './org-root.ts';
 export type { OrgRootAbsent, OrgRootPresent, OrgRootResolution } from './org-root.ts';
+
+// ---- WP-D2 signed submission records ----
+export { canonicalValueBytes, valueDigestHex } from './canonical.ts';
+export { buildSubmissionRecord, signSubmission } from './submission.ts';
+export type { BuildSubmissionRecordInput, SubmissionProducedInput } from './submission.ts';

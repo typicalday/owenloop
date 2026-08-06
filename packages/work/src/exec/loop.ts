@@ -43,6 +43,7 @@ import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.
 import type { CommandRunner, CommandResult, RunningCommand } from './runner.ts';
 import type { InstructionResolver } from './instructions.ts';
 import { buildReceipt } from './receipt.ts';
+import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 
 /** sha256 of the empty byte string — the hash for a run with no captured output. */
 const EMPTY_HASH = createHash('sha256').digest('hex');
@@ -66,6 +67,10 @@ export interface ExecLoopOptions {
   runner: CommandRunner;
   workflow: string;
   run: string;
+  /** Hub origin used to resolve the local machine signing key. */
+  origin?: string;
+  principalKeys?: SubmissionKeyManager;
+  env?: Record<string, string | undefined>;
   /** The exec process holder tag `{kind:'exec', id}` — id is `<hostname>:<pid>`. */
   holder: ContactHolder;
   /** Resolves command text from a verified local workflow-store object. */
@@ -188,7 +193,27 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     for (const owe of order.owes) {
       let res;
       try {
-        res = await hub.submit({ workflow, run: runId, path: owe.path, value: receipt, holder: opts.holder });
+        let proof: string | undefined;
+        if (opts.origin !== undefined) {
+          proof = await buildSubmitProof({
+            origin: opts.origin,
+            order,
+            path: owe.path,
+            value: receipt,
+            now: opts.now,
+            warn: opts.err,
+            ...(opts.principalKeys !== undefined ? { principalKeys: opts.principalKeys } : {}),
+            ...(opts.env !== undefined ? { env: opts.env } : {}),
+          });
+        }
+        res = await hub.submit({
+          workflow,
+          run: runId,
+          path: owe.path,
+          value: receipt,
+          ...(proof !== undefined ? { proof } : {}),
+          holder: opts.holder,
+        });
       } catch (e) {
         opts.err(`owenloop work exec: submit to ${owe.path} failed: ${errMsg(e)}`);
         lease.stop('submit-failed'); // targeted release (idempotent) — best effort

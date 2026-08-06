@@ -240,7 +240,11 @@ order-independent — re-running `settle()` on a healthy graph yields no ops.
   **born-rejected** (a structural reject with a `born-rejected` reason) instead of
   landing a green that already rests on stale inputs. This makes concurrent
   advancement safe without locking the graph: two workers can race, and at most
-  one lands green; the loser is re-armed with an honest reason.
+  one lands green; the loser is re-armed with an honest reason. The same
+  claim-time map is exported as the order's optional `consumedFingerprint` and
+  is covered by the producer's submit-time `submission.v1` signature, so the
+  signed statement binds both the produced value and the exact input versions
+  the producer claimed.
 - **§12.3 Daily-budget windows are host-local** — `maxRunsPerDay` gates
   against a window starting at host-local midnight (`localMidnightMs` in
   util.ts), not UTC midnight. Two consequences worth knowing: (1) the day

@@ -234,6 +234,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     runner,
     workflow: target.workflow,
     run: target.run,
+    origin,
+    env,
     holder,
     instructions,
     cwd,

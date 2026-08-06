@@ -153,6 +153,25 @@ ceremony), and `agent` (agent identity and session). `attesterKeyId` is used onl
 to select verification candidates; verification cross-checks the hint against
 the signer in the verified DSSE envelope.
 
+### Submit-time signing
+
+Remote drivers sign each `submit` at the driver boundary, before sending the
+request to a hub. The key reference is `{ origin, kind: 'machine', id: 'local' }`.
+The driver reads the public fingerprint with `inspect`, materializes the private
+key only inside `withSigningKey`, builds the frozen `submission.v1` record, and
+signs its canonical JSON payload with `dsseSignSubmission` under the
+`owenloop-dsse-v1` namespace. The `proof` request field is the serialized DSSE
+envelope for that one submitted artifact path.
+
+The engine does not sign: local `Engine.green` is synchronous and commits inside
+a synchronous store transaction. The hub does not sign: the hub stores the
+opaque envelope beside the artifact version and relays the envelope on later
+orders. `owenloop green` remains deliberately unsigned because local green does
+not cross a wire; moving the command to an asynchronous signing path would add
+no trust coverage. A driver without a configured machine key submits without a
+proof and emits one warning per process; later policy work decides whether that
+fallback becomes refusal.
+
 ### Reusing an existing SSH key (human only)
 
 `setup --reuse-ssh-key <path>` records the operator's own Ed25519 key for the

@@ -27,6 +27,18 @@ export interface WorkOrder {
   workflow: string;
   run: string;
   step: string;
+  /** Reference-order fields surfaced by newer hubs; optional for old responses. */
+  key?: string;
+  index?: number;
+  defDigest?: string;
+  consumedFingerprint?: Record<string, number>;
+  owes?: Array<{
+    path: string;
+    judgmentRejects: number;
+    schemaRejects: number;
+    reasons: ReasonEntry[];
+    proof?: string;
+  }>;
   consumes: Record<string, unknown>;
   expected_outputs: Array<{ path: string; schema?: unknown }>;
   feedback: string[];
@@ -180,6 +192,8 @@ export interface OrderPacket {
   spec?: Record<string, unknown>;
   x?: Record<string, unknown>;
   consumes: Record<string, unknown>;
+  /** Claim-time versions of the consumed inputs, when supplied by the hub. */
+  consumedFingerprint?: Record<string, number>;
   /** The owed outputs and their reason threads. */
   owes: Array<{
     path: string;
@@ -261,6 +275,8 @@ export interface SubmitRequest {
   path: string;
   value: unknown;
   done?: boolean;
+  /** Serialized DSSE submission envelope for this one produced path. */
+  proof?: string;
   /** W7: who produced this submission (D4) — carried on all three submit paths. */
   holder?: ContactHolder;
 }

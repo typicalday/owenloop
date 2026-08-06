@@ -301,6 +301,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       hub,
       workflow: target.workflow,
       run: target.run,
+      origin,
+      env,
       sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       now: () => Date.now(),
       err,
