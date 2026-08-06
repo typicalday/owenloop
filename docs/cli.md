@@ -70,6 +70,7 @@ for the full breakdown.
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
 | `work <subcommand> [options]` | run the execution-side CLI companion — see [`work`](#work--execution-side-cli-companion) |
+| `trust init\|grant\|revoke` | create and sign local enrollment trust records offline — see [`trust`](#trust--local-enrollment-trust) |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
 | `tick <wf> [--now=<ms>] [--shallow] [--capability <l>]…` | claim and emit eligible **orders** (the jobs to run); deep by default — also descends into live `calls:` children (`--shallow` = this instance only); repeatable `--capability` claims steps without capabilities plus matching-capability steps — see below |
@@ -288,6 +289,48 @@ The execution settings file is `$XDG_CONFIG_HOME/owenloop/settings.json` when
 | `release --session <id> [options]` | drain a session's held claims |
 | `settings` | print the resolved execution settings file |
 | `join <code> [--hub <origin>] [--as <account>]` | redeem a join code and store the Scoped Identity credential |
+
+## `trust` — local enrollment trust
+
+The `trust` commands create the local enrollment root and signed enrollment
+records. The commands are offline: they do not contact a hub or other remote
+coordinator, and the remote side cannot create, sign, or endorse these records.
+The org root is stored separately from `PrincipalKeyManager` at the injected
+configuration root described in [Signing and key storage](crypto.md#enrollment-chains-attenuation-and-revocation).
+
+```text
+owenloop trust init [--force]
+owenloop trust grant --key <pubkey-path> --principal <human|machine|agent>:<id> \
+  [--pools a,b|*] [--labels a,b|*] [--namespaces a,b|*] \
+  [--delegate no|<n>|unbounded] [--signing-key <path>] [--output <file>]
+owenloop trust revoke --key <SHA256:…> --principal <kind>:<id> \
+  [--reason <text>] [--effective-from <epochMs>] \
+  [--signing-key <path>] [--output <file>]
+```
+
+- `trust init` generates an Ed25519 org-root key pair under the local config
+  directory. The containing directory is `0700`, the private key is `0600`,
+  and the public key is `0644`. Existing root files are refused unless
+  `--force` is supplied. The command prints paths and status, never private key
+  bytes.
+- `trust grant` reads an Ed25519 public key from `--key`, assigns it to the
+  `--principal`, and signs an `EnrollmentGrantRecord`. Each scope axis defaults
+  to an empty array (deny by default); `--delegate` defaults to `no`. The
+  signing key defaults to the local org root unless `--signing-key` is given.
+  The signed DSSE envelope is written to `--output`, or to the local roster
+  directory using a SHA-256 hash of the enrolled key ID as its filename.
+- `trust revoke` signs a `RevocationRecord` for the `SHA256:…` key in `--key`.
+  The signing key defaults to the local org root. Without `--effective-from`,
+  the cut starts at issuance. With an earlier `--effective-from`, the CLI
+  derives `backdated: true`; the flag is never accepted as an independent
+  boolean. The signed envelope is written to `--output`, or to the local
+  revocations directory using a SHA-256 hash of the revoked key ID.
+
+These commands print one JSON result on success. They refuse malformed
+principals, fingerprints, scope lists, delegation values, and timestamps before
+performing the related filesystem or signing work. Trust records are only
+local inputs to the chain validator; transporting a signed envelope is a
+separate concern.
 
 ## `add` — installing shared workflow defs from GitHub
 

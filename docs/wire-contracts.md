@@ -134,6 +134,11 @@ or:
 `maxDepth` is a non-negative integer or `"unbounded"`. A non-delegating grant
 has no `maxDepth` field.
 
+The wire record does not identify an organization or mark an org root. Chain
+validation receives the org-root public key as a local trust anchor; the root
+has no grant record. See [Enrollment chains, attenuation, and revocation](crypto.md#enrollment-chains-attenuation-and-revocation)
+for chain termination, per-link signature verification, and scope attenuation.
+
 ## Revocation
 
 Payload type: `application/vnd.owenloop.revocation.v1+json`.
@@ -156,7 +161,10 @@ structurally visible so the verifier can apply the stronger signer rule without
 inferring intent from clock arithmetic alone.
 
 Revocation cuts apply forward. An artifact that was valid before the cut is not
-retroactively changed solely because a later revocation record exists.
+retroactively changed solely because a later revocation record exists. The
+validator also checks timestamp consistency, signer authority, and the
+org-root-only rule for backdated cuts. See [Enrollment chains, attenuation, and revocation](crypto.md#enrollment-chains-attenuation-and-revocation)
+for those verification rules.
 
 ## Policy floor
 
