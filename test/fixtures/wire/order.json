@@ -14,6 +14,7 @@
     "spec": { "region": "example" },
     "x": { "trace": true },
     "consumes": { "question": { "text": "ship" } },
+    "consumedFingerprint": { "question": 2 },
     "owes": [
       {
         "path": "result",
@@ -111,6 +112,22 @@
         ]
       },
       "keyword": "additionalProperties"
+    },
+    {
+      "name": "negative-consumed-fingerprint",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build-instance",
+        "step": "producer",
+        "key": "producer",
+        "defDigest": "injected-digest",
+        "inputs": [],
+        "outputs": [],
+        "consumes": {},
+        "consumedFingerprint": { "missing": -1 },
+        "owes": []
+      },
+      "keyword": "minimum"
     }
   ]
 }

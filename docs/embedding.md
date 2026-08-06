@@ -407,6 +407,11 @@ storage](crypto.md) is the full reference):
 - `dsseSignEnvelope` / `dsseVerifyEnvelope` plus the record-class wrappers and
   the six `PAYLOAD_TYPE_*` constants — DSSE envelopes with strict Base64 and
   exact-byte payload return.
+- `canonicalValueBytes` / `valueDigestHex` — deterministic JSON value bytes and
+  lowercase SHA-256 value digests for submission records. The canonicalizer
+  rejects values that JSON transport cannot represent faithfully.
+- `buildSubmissionRecord` / `signSubmission` — build the frozen `submission.v1`
+  record and return its serialized DSSE proof for a submitted artifact.
 - `parseAllowedSigners` — structural parsing of stock `allowed_signers` files
   (never throws; malformed lines come back with line numbers).
 - `DEFAULT_MACHINE_SCOPE` and `buildEnrollmentGrant` — construct an immutable

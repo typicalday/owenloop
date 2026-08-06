@@ -82,6 +82,17 @@ Payload type: `application/vnd.owenloop.submission.v1+json`.
 Each `produced` entry has `artifact`, non-negative integer `version`, and a
 lowercase SHA-256 `valueDigest`.
 
+A driver signs before a remote coordinator commits the submitted value. When a
+transport supplies an authoritative committed version, the driver must pass
+that version into the submission signer. The current reduced driver packet does
+not carry that post-commit value, so the compatibility path makes a best-effort
+inference from the claim fingerprint and the latest reason thread (or version
+one for a fresh artifact). The inferred version is not a coordinator
+attestation: stale or malformed order metadata can produce a signed record whose
+version differs from the committed artifact, and a later verifier must reject
+that proof rather than silently correcting it. Integrations that require an
+authoritative submission record must use an explicit version-aware packet.
+
 ## Publication record
 
 Payload type: `application/vnd.owenloop.publication.v1+json`.
@@ -238,7 +249,7 @@ Required fields are `run`, `workflow`, `step`, `key`, `defDigest`, `inputs`,
 `outputs`, `consumes`, and `owes`.
 
 Optional fields are `index`, `workdir`, `model`, `worker`, `spec`, `x`,
-`consumesProof`, and `cause`.
+`consumedFingerprint`, `consumesProof`, and `cause`.
 
 `defDigest` is a non-empty opaque reference. `inputs` and `outputs` are string
 arrays. `consumes` is an open artifact-path map; `spec` and `x` are opaque
@@ -247,11 +258,33 @@ owed path, judgment/schema rejection counters, reason entries, and an optional
 opaque `proof` string. `cause`, when present, is `inputsGreen`, `allGreen`, or
 `idle`.
 
-The `owes[].proof` and `consumesProof` slots deliberately remain opaque strings.
-The intended payload is a serialized DSSE envelope over a submission record,
-but the choice of how a proof is embedded and resolved belongs to the driver
-layer. Keeping the slots unchanged preserves the frozen reference-mode Order
-shape.
+The `consumedFingerprint`, when present, is an open artifact-path map whose values
+are the non-negative versions captured when the engine claimed the order. The
+producer covers the map in its `submission.v1` signature; a driver does not
+recompute the map from consumed values. A driver distinguishes an absent map
+from a genuinely empty map: if the order has consumed inputs but omits the map,
+the driver submits without a proof and emits a warning; an order with no
+consumed inputs may sign an explicitly empty `{}` map.
+
+An explicit `{}` or partial map alongside a non-empty consumed set is still a
+signed assertion of the map supplied on the wire. This package leaves that
+assertion visible for later consume-side verification; the hub only stores and
+relays the signed content and does not verify or repair it. Consume-side
+verification is a later work package, not part of this contract.
+
+`owes[].proof` remains unpopulated in this work package. `consumesProof` remains
+a frozen string field, but its concrete encoding is a JSON-serialized map from
+artifact path to serialized DSSE envelope:
+
+```json
+{"input":"{\"payloadType\":\"application/vnd.owenloop.submission.v1+json\",\"payload\":\"...\",\"signatures\":[...] }"}
+```
+
+The map lets one order carry proofs from multiple producers without changing
+the frozen string slot. A hub stores each submit proof beside the committed
+artifact version and omits paths with no stored proof; `consumesProof` never
+contains null or empty-string entries. The `submission.v1` record shape itself
+is unchanged.
 
 ## Trust posture
 

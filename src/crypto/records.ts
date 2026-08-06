@@ -333,6 +333,7 @@ export const ORDER_FIELDS = {
   spec: 'optional',
   x: 'optional',
   consumes: 'required',
+  consumedFingerprint: 'optional',
   owes: 'required',
   consumesProof: 'optional',
   cause: 'optional',

@@ -37,6 +37,13 @@
 import { packageVersion } from '../package-version.ts';
 import { CliError } from '../util.ts';
 import {
+  DSSE_SSH_NAMESPACE,
+  PrincipalKeyManager,
+  buildSubmissionRecord,
+  createSshSigner,
+  signSubmission,
+} from '../crypto/index.ts';
+import {
   authHeader,
   ensureFreshOAuth,
   hubFetch,
@@ -52,6 +59,8 @@ import {
   resolveEndpoint,
 } from '../hub.ts';
 import type { Credential, CredentialSlotSelector } from '../hub.ts';
+import type { Order } from '../types.ts';
+import type { SshProcessAdapter } from '../crypto/ssh.ts';
 import { globalConfigPath, readGlobalConfig } from '../global-config.ts';
 import { createMcpServer, pumpStdin, textResult } from './server.ts';
 import type { LineStream, ToolRegistration, ToolResult } from './server.ts';
@@ -66,6 +75,9 @@ export interface McpIo extends CredentialIO {
   out: (line: string) => void;
   err: (line: string) => void;
   stdinStream?: LineStream;
+  principalKeys?: Pick<PrincipalKeyManager, 'inspect' | 'resolveRef' | 'withSigningKey'>;
+  /** Injectable ssh-keygen seam for hermetic submit-proof tests. */
+  sshProcess?: SshProcessAdapter;
 }
 
 /** The resolved server context handed to every tool handler. */
@@ -282,6 +294,101 @@ function passthrough(deps: McpDeps, build: (args: Record<string, unknown>) => Hu
   };
 }
 
+let warnedMcpUnsigned = false;
+
+/** Sign the baseline MCP submit when a claimed order can be resolved locally. */
+async function signMcpSubmit(deps: McpDeps, args: Record<string, unknown>): Promise<string | undefined> {
+  const workflow = args['workflow'];
+  const run = args['run'];
+  const path = args['path'];
+  if (typeof workflow !== 'string' || typeof run !== 'string' || typeof path !== 'string' || !('value' in args)) {
+    return undefined;
+  }
+
+  let keys: Pick<PrincipalKeyManager, 'inspect' | 'resolveRef' | 'withSigningKey'>;
+  try {
+    keys = deps.io.principalKeys ?? new PrincipalKeyManager({ env: deps.io.env });
+  } catch (e) {
+    warnMcpUnsigned(deps, `machine signing is unavailable (${(e as Error).message}); submitting without a proof`);
+    return undefined;
+  }
+
+  const ref = keys.resolveRef(deps.origin, 'machine');
+  if (ref === null) {
+    warnMcpUnsigned(deps, `no machine signing key for ${deps.origin}; submitting without a proof`);
+    return undefined;
+  }
+  const inspected = await keys.inspect(ref);
+  if (!inspected.exists || inspected.publicKey === undefined) {
+    warnMcpUnsigned(deps, `machine signing key for ${deps.origin} is unavailable; submitting without a proof`);
+    return undefined;
+  }
+
+  const orderResponse = await callHub(deps, {
+    method: 'POST',
+    path: '/api/get_order',
+    body: { workflow, run },
+  });
+  if (!isOk(orderResponse.status) || !isObject(orderResponse.json) || !isObject(orderResponse.json['order'])) {
+    warnMcpUnsigned(deps, `order metadata for ${workflow}/${run} was unavailable; submitting without a proof`);
+    return undefined;
+  }
+
+  const order = orderResponse.json['order'] as unknown as Order;
+  const consumedFingerprint = submissionFingerprint(order, deps);
+  if (consumedFingerprint === undefined) return undefined;
+
+  const record = buildSubmissionRecord({
+    run: order.run,
+    workflow: order.workflow,
+    defDigest: order.defDigest,
+    step: order.step,
+    key: order.key,
+    ...(order.index !== undefined ? { index: order.index } : {}),
+    produced: [{ artifact: path, version: outputVersion(order, path), value: args['value'] }],
+    consumedFingerprint,
+    producerKeyId: inspected.publicKey.keyid,
+    timestamp: Date.now(),
+  });
+
+  return keys.withSigningKey(ref, async (keyPath) => {
+    const signer = createSshSigner({
+      namespace: DSSE_SSH_NAMESPACE,
+      signKeyPath: keyPath,
+      ...(deps.io.sshProcess !== undefined ? { process: deps.io.sshProcess } : {}),
+    });
+    return signSubmission(record, signer);
+  });
+}
+
+function submissionFingerprint(order: Order, deps: McpDeps): NonNullable<Order['consumedFingerprint']> | undefined {
+  if (order.consumedFingerprint !== undefined) return order.consumedFingerprint;
+  if (order.inputs.length > 0 || Object.keys(order.consumes).length > 0) {
+    warnMcpUnsigned(deps, `order ${order.workflow}/${order.run} omitted its consumed fingerprint; submitting without a proof`);
+    return undefined;
+  }
+  return {};
+}
+
+/**
+ * Best-effort pre-commit version inference for reduced MCP order packets. The
+ * packet has no authoritative post-commit version; callers needing one must use
+ * a version-aware transport instead of treating this value as an attestation.
+ */
+function outputVersion(order: Order, path: string): number {
+  const consumed = order.consumedFingerprint?.[path];
+  if (consumed !== undefined) return consumed;
+  const owe = order.owes.find((entry) => entry.path === path);
+  const fromVersion = owe?.reasons.at(-1)?.fromVersion;
+  return fromVersion === undefined ? 1 : fromVersion + 1;
+}
+
+function warnMcpUnsigned(deps: McpDeps, reason: string): void {
+  if (warnedMcpUnsigned) return;
+  warnedMcpUnsigned = true;
+  deps.io.err(`owenloop mcp: ${reason}`);
+}
+
 /**
  * The 17 baseline tools — names, descriptions, and schemas mirror the hub's own
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
@@ -323,7 +430,21 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
         required: ['workflow', 'run', 'path', 'value'],
         additionalProperties: false,
       },
-      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/submit', body: a })),
+      handler: async (args) => {
+        let proof: string | undefined;
+        try {
+          proof = await signMcpSubmit(deps, args);
+        } catch (e) {
+          // A configured signer/tool failure is a submit error, not an
+          // unsigned fallback. The missing-key cases are handled inside the
+          // helper and remain compatible with pre-WP-D2 clients.
+          return errorText((e as Error).message);
+        }
+        const body = proof === undefined ? args : { ...args, proof };
+        const r = await callHub(deps, { method: 'POST', path: '/api/submit', body });
+        if (r.authFailed) return errorText(r.authMessage ?? loginHint(deps.origin));
+        return toolResultFromRest(r);
+      },
     },
     {
       name: 'reject_artifact',

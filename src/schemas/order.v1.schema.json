@@ -53,6 +53,11 @@
       "description": "Open artifact-path keys mapped to captured input handles.",
       "additionalProperties": true
     },
+    "consumedFingerprint": {
+      "type": "object",
+      "description": "Open artifact-path keys mapped to non-negative input versions captured at claim time.",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
     "owes": {
       "type": "array",
       "items": {

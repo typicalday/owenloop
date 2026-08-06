@@ -27,12 +27,20 @@ import { textResult, type ToolRegistration, type ToolResult } from '../mcp/serve
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
+import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
+import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
 
 export interface HoldMcpDeps {
   hub: HubClient;
   workflow: string;
   run: string;
+  /** Hub origin used to resolve the local machine signing key. */
+  origin?: string;
+  principalKeys?: SubmissionKeyManager;
+  env?: Record<string, string | undefined>;
+  /** Injectable ssh-keygen seam for hermetic submit-proof tests. */
+  sshProcess?: SshProcessAdapter;
   /** B3 holder tag; rides get_order/heartbeat when known. */
   holder?: ContactHolder;
   sleep: (ms: number) => Promise<void>;
@@ -159,12 +167,34 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
       }
       const done = args['done'];
       try {
+        let proof: string | undefined;
+        if (deps.origin !== undefined) {
+          let orderResponse = captured;
+          if (orderResponse === undefined) {
+            orderResponse = await hub.getOrder({ workflow, run, ...holderReq });
+            captured = orderResponse;
+          }
+          if (orderResponse.order !== null) {
+            proof = await buildSubmitProof({
+              origin: deps.origin,
+              order: orderResponse.order,
+              path,
+              value: args['value'],
+              now: deps.now,
+              warn: deps.err,
+              ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
+              ...(deps.env !== undefined ? { env: deps.env } : {}),
+              ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
+            });
+          }
+        }
         const res = await hub.submit({
           workflow,
           run,
           path,
           value: args['value'],
           ...(typeof done === 'boolean' ? { done } : {}),
+          ...(proof !== undefined ? { proof } : {}),
           ...holderReq,
         });
         // The run closed — stop holding WITHOUT releasing (the claim is gone).
