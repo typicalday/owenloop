@@ -203,6 +203,31 @@ export class StoreDefinitionVerificationError extends WorkflowStoreError {
   }
 }
 
+/** A provenance rule refused a workflow definition before execution or install. */
+export class StoreOriginPolicyError extends WorkflowStoreError {
+  readonly coordinate: WorkflowCoordinate;
+  readonly namespace: string;
+  readonly rule: string;
+  readonly verdict: 'absent' | 'unverifiable' | 'invalid' | 'weaker';
+  constructor(
+    coordinate: WorkflowCoordinate,
+    namespace: string,
+    rule: string,
+    verdict: 'absent' | 'unverifiable' | 'invalid' | 'weaker',
+    detail: string,
+  ) {
+    super(
+      'origin-policy-refused',
+      `definition '${coordinate}' was refused by originRules=${rule} for namespace '${namespace}': ${verdict} — ${detail}`,
+    );
+    this.name = 'StoreOriginPolicyError';
+    this.coordinate = coordinate;
+    this.namespace = namespace;
+    this.rule = rule;
+    this.verdict = verdict;
+  }
+}
+
 /** A store root, objects dir, index file, or state path failed a type/symlink guard. */
 export class StorePathError extends WorkflowStoreError {
   constructor(message: string) {

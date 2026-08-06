@@ -663,6 +663,65 @@ regardless of any floor. If an execution host has no publication verifier
 configured, the definition is `unverifiable`; command workers therefore refuse
 rather than treating installed bytes as published trust.
 
+### Definition origin policy
+
+`originRules` is a separate namespace-scoped provenance policy. A signed file
+publication may include `<bundle>.origin.dsse`; installation verifies that
+sidecar against the local `allowed_signers` root and retains the exact bytes at
+`<store-root>/.owenloop/origins/<digest>.dsse`. Execution re-verifies the
+retained evidence against the current trust root. A hub or other remote
+coordinator may relay the sidecar, but never authors or supplies the origin
+rule.
+
+The origin mode uses the same values as `defPolicy` and follows the same scalar
+precedence: explicit host option, `OWENLOOP_ORIGIN_POLICY`, settings-file
+`originPolicy`, then `warn`. The rule map has no environment-variable spelling:
+explicit host `originRules`, then settings-file `originRules`, then an empty
+map. A namespace with no matching rule has no origin requirement. A malformed
+rule map is a named settings error, not an empty-policy fallback.
+
+Rules accept exact namespaces (`prod`), namespace prefixes (`prod*`), and
+trailing `/*` sugar (`prod/*`, equivalent to `prod`). `*` and `*/*` are
+catch-all rules. Exact matches beat prefixes; the longest prefix wins; keys
+that normalize to equal specificity, such as `prod` and `prod/*`, are rejected.
+Rule values are minimum provenance strengths, ordered `git` > `console` >
+`agent`; therefore a `console` rule accepts verified `git` and `console`
+origins, and an `agent` rule accepts all three. `any` imposes no requirement.
+
+Origin verdicts remain distinct:
+
+- `verified` has a strength and is checked against the selected minimum.
+- `absent` means no sidecar was recorded.
+- `unverifiable` means a prerequisite such as the trust root is unavailable.
+- `invalid` means present origin evidence failed verification and is refused at
+  every origin mode, including `off`.
+
+For a matched rule, the local origin mode behaves as follows:
+
+| origin verdict | `originPolicy=enforce` | `originPolicy=warn` | `originPolicy=off` |
+|---|---|---|---|
+| `verified` meeting the minimum | Install and execution succeed. | Install and execution succeed. | Install and execution succeed. |
+| `verified` weaker than the minimum | Install refuses; execution refuses. | Install warns and succeeds; execution warns and proceeds. | Install and execution proceed silently. |
+| `absent` or `unverifiable` | Install refuses; execution refuses. | Install warns and succeeds; execution warns and proceeds. | Install and execution proceed silently. |
+| `invalid` | Install refuses; execution refuses. | Install refuses; execution refuses. | Install refuses; execution refuses. |
+
+The table applies only when a rule matches. During execution, the driver
+recovers the namespace by reverse-scanning project and global store indexes for
+the bundle digest. Equivalent requirements deduplicate. Different requirements
+produce a named ambiguity refusal. If no coordinate is indexed, `enforce`
+refuses, `warn` warns, and `off` proceeds.
+
+A verified policy floor maps `originRules: advisory` to minimum
+`originPolicy=warn` and `originRules: enforced` to minimum
+`originPolicy=enforce`. The origin floor is parallel to the publication floor;
+it does not alter `defPolicy`.
+
+**Origin policy never relaxes the command-worker hard rule.** A
+`worker: command` order must pass the publication verification gate first, even
+when `defPolicy=off`, and only then runs the origin check. Unsigned,
+unverifiable, or invalid publication evidence never reaches the shell. An
+origin mode of `off` and every policy-floor preset leave that gate unchanged.
+
 The local SSHSIG trust root is
 `$XDG_CONFIG_HOME/owenloop/allowed_signers`, or
 `$HOME/.config/owenloop/allowed_signers` when `XDG_CONFIG_HOME` is blank. A

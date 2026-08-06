@@ -1704,11 +1704,15 @@ a permission to resolve an unprimed digest.
 ### §30.2 Refuse before execution
 
 An unknown or empty `defDigest`, an unknown step, a missing command on a command
-order, or a failed object-integrity check is a named refusal. The worker does
-not fall back to a workflow name, a remotely supplied prompt or command, a
-closest digest, or an empty command. A `worker: command` order is never passed
-to the process runner unless the exact command bytes came from the verified
-local store. Runtime placeholder substitution applies to prompts only; command
+order, a failed object-integrity check, or an origin-policy failure is a named
+refusal. Origin-policy failures include invalid retained origin evidence,
+insufficient provenance for a recovered namespace, an ambiguous set of
+namespace rules, and an unknown namespace when the effective origin mode is
+`enforce`. The worker does not fall back to a workflow name, a remotely
+supplied prompt or command, a closest digest, or an empty command. A
+`worker: command` order is never passed to the process runner unless the exact
+command bytes came from the verified local store and the publication hard rule
+has passed. Runtime placeholder substitution applies to prompts only; command
 bytes are returned exactly as authored.
 
 The same rule applies to agent workers. The prepare cache may retain routing and

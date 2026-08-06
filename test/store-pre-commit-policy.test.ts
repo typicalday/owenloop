@@ -5,14 +5,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { encodeBase64, PAYLOAD_TYPE_PUBLICATION } from '../src/crypto/dsse.ts';
+import { encodeBase64, PAYLOAD_TYPE_ORIGIN, PAYLOAD_TYPE_PUBLICATION } from '../src/crypto/dsse.ts';
 import {
   createExecutionDefinitionVerifier,
+  createExecutionOriginVerifier,
   createPreCommitVerifier,
 } from '../src/store/pre-commit-verifier.ts';
 import {
   defDigest,
   StoreDefinitionVerificationError,
+  StoreOriginPolicyError,
   workflowCoordinate,
 } from '../src/store/index.ts';
 import type { BundleSource } from '../src/store/install.ts';
@@ -44,6 +46,25 @@ function signedSidecar(digest = DIGEST): Uint8Array {
   }));
 }
 
+function signedOriginSidecar(
+  source: { kind: 'git'; repo: string; commit: string } | { kind: 'console'; user: string } | { kind: 'agent'; agent: string; session: string },
+  digest = DIGEST,
+): Uint8Array {
+  const payload = Buffer.from(JSON.stringify({
+    digest,
+    name: 'fixture',
+    version: '1.0.0',
+    source,
+    attesterKeyId: KEY_ID,
+    timestamp: 0,
+  }));
+  return Buffer.from(JSON.stringify({
+    payloadType: PAYLOAD_TYPE_ORIGIN,
+    payload: encodeBase64(payload),
+    signatures: [{ sig: encodeBase64(Buffer.from('signature')) }],
+  }));
+}
+
 function input(cwd: string) {
   return {
     source: SOURCE,
@@ -59,6 +80,8 @@ function makeVerifier(args: {
   warn: string[];
   allowedSigners?: string;
   policyFloor?: PolicyFloor;
+  originPolicy?: 'enforce' | 'warn' | 'off';
+  originRules?: Record<string, 'git' | 'console' | 'agent' | 'any'>;
 }) {
   const env = { XDG_CONFIG_HOME: args.cwd };
   if (args.allowedSigners !== undefined) {
@@ -71,6 +94,8 @@ function makeVerifier(args: {
     env,
     policy: args.policy,
     ...(args.policyFloor === undefined ? {} : { policyFloor: args.policyFloor }),
+    ...(args.originPolicy === undefined ? {} : { originPolicy: args.originPolicy }),
+    ...(args.originRules === undefined ? {} : { originRules: args.originRules }),
     warn: (line) => args.warn.push(line),
     signerForPrincipal: ({ principal, allowedSignersText }) => {
       assert.equal(principal, 'publisher');

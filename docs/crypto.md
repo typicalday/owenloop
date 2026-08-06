@@ -421,6 +421,72 @@ publication trust.
 The verifier does not write a verdict or sidecar into the immutable object
 directory. The object remains governed by the bundle manifest integrity map.
 
+## Definition origin policy
+
+Publication trust and provenance trust are separate controls. A signed
+publication may carry a second DSSE sidecar, `<bundle>.origin.dsse`, whose
+payload identifies an origin source and binds the same bundle digest as the
+publication record. A hub or other remote coordinator may relay that sidecar,
+but never authors, derives, defaults, or verifies the origin rule. The install
+path retains the exact verified sidecar bytes outside the immutable object at
+`<store-root>/.owenloop/origins/<digest>.dsse`. Execution reads that retained
+file and verifies it again against the current local `allowed_signers` trust
+root; a later change to local trust material therefore takes effect at the
+execution boundary.
+
+Origin verification has four distinct verdicts:
+
+- `verified` — the origin DSSE signature, schema, signer key, and bundle digest
+  all verify.
+- `absent` — a signed file publication has no origin sidecar.
+- `unverifiable` — a prerequisite such as the local trust root or verifier is
+  unavailable or unusable.
+- `invalid` — a present origin sidecar fails its signature, schema, signer, or
+  digest checks. Invalid evidence is an attack signal and refuses at every
+  policy mode, including `off`.
+
+`originRules` is an optional settings-file object mapping namespace patterns to
+minimum origin strengths. Namespace matching has a deliberately small grammar:
+`prod` is an exact namespace rule; `prod*` is a namespace-prefix rule; and a
+trailing `/*` is accepted as sugar, so `prod/*` means the exact namespace
+`prod`. `*` and `*/*` are catch-all rules. Interior wildcards, repeated
+wildcards, `?`, `[`, empty keys, control characters, and other slash forms are
+named settings errors. Exact rules beat every prefix rule; among prefixes, the
+longest matching prefix wins. Keys that normalize to equal specificity, such
+as `prod` and `prod/*`, are a named duplicate error rather than an arbitrary
+winner.
+
+The rule value is a minimum, not a set-membership label. Origin strength is
+ordered `git` > `console` > `agent`: a `console` rule admits verified `git` and
+`console` origins, while an `agent` rule admits all three. `any` imposes no
+origin requirement, so `absent` and `unverifiable` pass that rule; a namespace
+with no matching rule has no origin requirement. A verified origin is the only
+verdict with a strength rank. `absent` and `unverifiable` fail a non-`any` rule
+with distinct diagnostics. No rule may make invalid evidence acceptable.
+
+The local origin mode uses the same vocabulary as `defPolicy`:
+`enforce | warn | off`. `originPolicy` follows explicit host option, then
+`OWENLOOP_ORIGIN_POLICY`, then the settings-file value, then the built-in
+`warn` default. The `originRules` map follows explicit host option, then the
+settings-file value, then an empty map; there is intentionally no environment
+variable spelling for the map. Origin mode remains parallel to publication
+mode; an origin requirement never raises or lowers `defPolicy`.
+
+A verified organization policy floor supplies the parallel minimum:
+`originRules: advisory` maps to local `originPolicy: warn`, and
+`originRules: enforced` maps to `originPolicy: enforce`. The floor is merged
+monotonically after local precedence, so a local `off` cannot opt out of an
+enforced origin floor. The floor's `originRules` axis is now wired at install
+and execution; the remaining unenforced floor gaps are `trustMode` and
+`unsignedArtifacts`.
+
+The command-worker hard rule remains independent of origin policy. A
+`worker: command` order must pass the publication verification gate before any
+origin-policy lookup, and must then satisfy the origin check. Unsigned,
+unverifiable, or invalid publication evidence never reaches the shell;
+`originPolicy: off` and every policy-floor preset leave that publication gate
+unchanged.
+
 ## Enrollment chains, attenuation, and revocation
 
 Enrollment trust is separate from publication-signature trust. A key is trusted
@@ -566,24 +632,24 @@ for every failure path:
 | signer key is revoked at the validation instant | `invalid`; local policy unchanged |
 | local org-root anchor or other verification prerequisite is unavailable | `unverifiable`; local policy unchanged |
 
-The frozen floor has four axes, but this package has an enforcement mechanism
-for only one axis, `unsignedDefs` → `defPolicy`:
+The frozen floor has four axes. This package enforces two of them:
+`unsignedDefs` through `defPolicy`, and `originRules` through the parallel
+`originPolicy`:
 
 | axis | current state |
 |---|---|
 | `unsignedDefs` | mapped into `defPolicy` and enforced |
 | `trustMode` | accepted and carried, but not evaluated |
 | `unsignedArtifacts` | accepted and carried, but no enforcement mechanism exists yet |
-| `originRules` | accepted and carried, but no enforcement mechanism exists yet |
+| `originRules` | mapped into `originPolicy` and enforced |
 
-The merge result names the three unenforced axes in `gaps` rather than silently
+The merge result names the two unenforced axes in `gaps` rather than silently
 dropping them. Both current integration call sites — installation and
-execution — discard `.gaps`, so callers do not currently surface those
-warnings. An administrator can therefore set a floor believing that
-`trustMode`, `unsignedArtifacts`, or `originRules` is enforced when the axis is
-not enforced. The feature is not wired into production configuration: the
-`policyFloor` option is an injection seam only, so the feature is inert until a
-host loads and verifies a floor and passes it through that seam.
+execution — apply the origin-policy result and discard `.gaps`, so callers do
+not currently surface warnings for `trustMode` or `unsignedArtifacts`. The
+feature is not wired into production configuration: the `policyFloor` option is
+an injection seam only, so the feature is inert until a host loads and verifies
+a floor and passes it through that seam.
 
 L0, L1, and L2 are documented bundles of concrete floor values, not alternate
 policy primitives:
@@ -594,8 +660,9 @@ policy primitives:
 | L1 | `seamless` | `refuse` | `refuse` | `advisory` |
 | L2 | `strict` | `refuse` | `refuse` | `enforced` |
 
-The preset values for the three unenforced axes are still only carried and
-reported as gaps in this package.
+The preset values for `trustMode` and `unsignedArtifacts` are still only
+carried and reported as gaps in this package. The `originRules` value maps to
+the parallel origin-policy minimum described above.
 
 **Command-worker hard rule.** A `worker: command` order still requires full
 enforcement: a verified definition, a verified enrollment chain, and a

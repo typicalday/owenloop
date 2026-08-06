@@ -154,6 +154,7 @@ export {
   POLICY_FLOOR_PRESETS,
   floorDefPolicyMinimum,
   mergePolicyFloorWithLocal,
+  originRulesMinimum,
   policyFloorGaps,
   stricterDefPolicy,
   verifyPolicyFloorRecord,
@@ -165,6 +166,22 @@ export type {
   VerifyPolicyFloorInput,
   VerifyPolicyFloorOptions,
 } from './policy-floor.ts';
+
+// ---- WP-E2a origin execution policy ----
+export {
+  OriginRulesError,
+  evaluateOriginRule,
+  matchOriginRule,
+  parseOriginRules,
+  ORIGIN_SOURCE_RANK,
+} from './origin-rules.ts';
+export type {
+  OriginPolicy,
+  OriginRuleEvaluation,
+  OriginRuleMatch,
+  OriginRuleValue,
+  OriginRules,
+} from './origin-rules.ts';
 
 // ---- WP-D1 enrollment ----
 export {
