@@ -17,6 +17,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { tmpdir } from 'node:os';
@@ -36,10 +37,35 @@ import {
   routedFetch,
 } from './hubkit.ts';
 import { owenloopSettingsPath } from '../src/work-settings.ts';
+import { encodeBase64, PAYLOAD_TYPE_ENROLLMENT_GRANT } from '../src/crypto/dsse.ts';
+import { publicKeyDescriptor } from '../src/crypto/keys.ts';
+import { buildEnrollmentGrant, DEFAULT_MACHINE_SCOPE } from '../src/crypto/enrollment.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
 const PACKAGE_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
+
+function sshKeygenWorks(): boolean {
+  try {
+    execFileSync('ssh-keygen', ['-Y', 'find-principals'], { stdio: 'ignore', timeout: 5_000 });
+    return true;
+  } catch (e) {
+    const err = e as { status?: unknown };
+    return typeof err.status === 'number';
+  }
+}
+
+const ENROLLMENT_SSH_SKIP = !sshKeygenWorks() && 'host ssh-keygen lacks -Y support';
+
+function makeHumanSigningKey(home: string): { path: string; publicKey: ReturnType<typeof publicKeyDescriptor>; privateText: string } {
+  const path = join(home, 'enrollment-human');
+  execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'enrollment-human', '-f', path], {
+    stdio: 'ignore',
+    timeout: 15_000,
+  });
+  const publicKey = publicKeyDescriptor(readFileSync(`${path}.pub`, 'utf8'));
+  return { path, publicKey, privateText: readFileSync(path, 'utf8') };
+}
 
 /** An `openUrl` that plays the browser+consent, driving the real loopback callback. */
 function driveCallback() {
@@ -670,6 +696,189 @@ test('setup: no private key marker ever reaches stdout/stderr', async () => {
   const combined = [...t.out, ...t.err].join('\n');
   assert.ok(!combined.includes('BEGIN OPENSSH PRIVATE KEY'), 'no private-key banner in setup output');
   assert.ok(!combined.includes('owenloopfakekey'), 'no key material in setup output');
+  assertNoOlp(t);
+});
+
+// ---- WP-D1 machine enrollment registration -----------------------------------
+
+test('setup: enrollment POST carries only the signed public grant envelope', { skip: ENROLLMENT_SSH_SKIP }, async () => {
+  const { routes } = makeIdentityHub();
+  const relayed: unknown[] = [];
+  routes['GET /api/enrollments'] = () => ({ status: 200, json: { enrollments: relayed } });
+  routes['POST /api/enrollments'] = (req) => {
+    assert.ok(req.body, 'registration request has a body');
+    const body = JSON.parse(req.body!) as Record<string, unknown>;
+    assert.deepEqual(Object.keys(body), ['envelope'], 'the hub receives no private-key field');
+    relayed.push(body.envelope);
+    return { status: 201, json: { ok: true } };
+  };
+
+  const { fetch, calls } = routedFetch(routes);
+  const keyHome = mkdtempSync(join(tmpdir(), 'owenloop-enrollment-key-'));
+  const signing = makeHumanSigningKey(keyHome);
+  const keys = makeFakePrincipalKeys({ humanSigningKey: signing });
+  const t = makeIo({ fetch, principalKeys: keys.manager });
+  seedHuman(t.store);
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t.io), 0, t.err.join('\n'));
+
+  const enrollmentCalls = calls.filter((call) => call.pathname === '/api/enrollments');
+  assert.deepEqual(enrollmentCalls.map((call) => call.method), ['GET', 'POST'], 'registration probes before posting');
+  assert.equal(relayed.length, 1, 'one grant was relayed');
+  const postedBody = JSON.parse(enrollmentCalls[1]!.body!) as { envelope: { payload: string } };
+  const grant = JSON.parse(Buffer.from(postedBody.envelope.payload, 'base64').toString('utf8')) as {
+    principal: { kind: string; id: string };
+    scope: { delegation: { allowed: boolean } };
+    grantedBy: string;
+  };
+  assert.deepEqual(grant.principal, { kind: 'machine', id: 'local' });
+  assert.equal(grant.scope.delegation.allowed, false);
+  assert.equal(grant.grantedBy, signing.publicKey.keyid);
+
+  const requestBodies = calls.map((call) => call.body ?? '').join('\n');
+  assert.ok(!requestBodies.includes(signing.privateText), 'private-key bytes never enter an HTTP body');
+  assert.ok(!requestBodies.includes(signing.path), 'private-key paths never enter an HTTP body');
+  assert.doesNotMatch(requestBodies, /BEGIN OPENSSH PRIVATE KEY/);
+  const summary = JSON.parse(t.out.join('\n')) as { steps: { step: string; action: string }[] };
+  assert.equal(summary.steps.find((step) => step.step === 'enrollment')?.action, 'done');
+  assertNoOlp(t);
+});
+
+test('setup: a second run does not duplicate the machine enrollment POST', { skip: ENROLLMENT_SSH_SKIP }, async () => {
+  const sharedHome = mkdtempSync(join(tmpdir(), 'owenloop-enrollment-home-'));
+  const { keychain, store } = fakeKeychain();
+  const { routes } = makeIdentityHub();
+  const relayed: unknown[] = [];
+  routes['GET /api/enrollments'] = () => ({ status: 200, json: { enrollments: relayed } });
+  routes['POST /api/enrollments'] = (req) => {
+    relayed.push((JSON.parse(req.body ?? '{}') as { envelope?: unknown }).envelope);
+    return { status: 201, json: { ok: true } };
+  };
+  const keyHome = mkdtempSync(join(tmpdir(), 'owenloop-enrollment-key-'));
+  const signing = makeHumanSigningKey(keyHome);
+  const keys = makeFakePrincipalKeys({ humanSigningKey: signing });
+
+  const r1 = routedFetch(routes);
+  const t1 = makeIo({ fetch: r1.fetch, keychain, store, env: { HOME: sharedHome }, principalKeys: keys.manager });
+  seedHuman(store);
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t1.io), 0, t1.err.join('\n'));
+
+  const r2 = routedFetch(routes);
+  const t2 = makeIo({ fetch: r2.fetch, keychain, store, env: { HOME: sharedHome }, principalKeys: keys.manager });
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t2.io), 0, t2.err.join('\n'));
+
+  assert.equal(relayed.length, 1, 'the hub stores one envelope across both runs');
+  assert.ok(r1.calls.some((call) => call.method === 'POST' && call.pathname === '/api/enrollments'));
+  assert.ok(!r2.calls.some((call) => call.method === 'POST' && call.pathname === '/api/enrollments'), 'run 2 skips the duplicate POST');
+  assert.ok(r2.calls.some((call) => call.method === 'GET' && call.pathname === '/api/enrollments'), 'run 2 probes the roster');
+  const summary = JSON.parse(t2.out.join('\n')) as { steps: { step: string; action: string; detail: string }[] };
+  assert.deepEqual(summary.steps.find((step) => step.step === 'enrollment'), {
+    step: 'enrollment',
+    action: 'skipped',
+    detail: 'machine key already registered',
+  });
+  assertNoOlp(t1);
+  assertNoOlp(t2);
+});
+
+test('setup: HTTP 409 enrollment registration is an idempotent non-error', { skip: ENROLLMENT_SSH_SKIP }, async () => {
+  const { routes } = makeIdentityHub();
+  routes['GET /api/enrollments'] = () => ({ status: 200, json: { enrollments: [] } });
+  routes['POST /api/enrollments'] = () => ({ status: 409, json: { error: 'already registered' } });
+  const { fetch, calls } = routedFetch(routes);
+  const keyHome = mkdtempSync(join(tmpdir(), 'owenloop-enrollment-key-'));
+  const signing = makeHumanSigningKey(keyHome);
+  const keys = makeFakePrincipalKeys({ humanSigningKey: signing });
+  const t = makeIo({ fetch, principalKeys: keys.manager });
+  seedHuman(t.store);
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t.io), 0, t.err.join('\n'));
+  assert.equal(calls.filter((call) => call.method === 'POST' && call.pathname === '/api/enrollments').length, 1);
+  const summary = JSON.parse(t.out.join('\n')) as { steps: { step: string; action: string; detail: string }[] };
+  assert.deepEqual(summary.steps.find((step) => step.step === 'enrollment'), {
+    step: 'enrollment',
+    action: 'skipped',
+    detail: 'machine key already registered',
+  });
+  assertNoOlp(t);
+});
+
+for (const [label, route] of [
+  ['HTTP 404', () => ({ status: 404, json: { error: 'unsupported' } })],
+  ['HTTP 500', () => ({ status: 500, json: { error: 'down' } })],
+  ['network failure', () => { throw new Error('socket reset'); }],
+] as const) {
+  test(`setup: ${label} during enrollment listing is non-fatal`, async () => {
+    const { routes } = makeIdentityHub();
+    routes['GET /api/enrollments'] = route;
+    const { fetch, calls } = routedFetch(routes);
+    const t = makeIo({ fetch });
+    seedHuman(t.store);
+
+    assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t.io), 0, t.err.join('\n'));
+    assert.ok(calls.some((call) => call.method === 'GET' && call.pathname === '/api/enrollments'));
+    assert.ok(!calls.some((call) => call.method === 'POST' && call.pathname === '/api/enrollments'), 'listing failure prevents signing/posting');
+    const summary = JSON.parse(t.out.join('\n')) as { steps: { step: string; action: string }[] };
+    assert.equal(summary.steps.find((step) => step.step === 'enrollment')?.action, 'noted');
+    assertNoOlp(t);
+  });
+}
+
+test('setup: missing human signing key skips enrollment before contacting the hub', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch, calls } = routedFetch(routes);
+  const base = makeFakePrincipalKeys();
+  const keys = {
+    ...base.manager,
+    inspect: async () => ({ exists: false, source: undefined, backend: undefined, publicKey: undefined }),
+  };
+  const t = makeIo({ fetch, principalKeys: keys });
+  seedHuman(t.store);
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox'], t.io), 0, t.err.join('\n'));
+  assert.ok(!calls.some((call) => call.pathname === '/api/enrollments'), 'missing human key avoids roster I/O');
+  const summary = JSON.parse(t.out.join('\n')) as { steps: { step: string; action: string; detail: string }[] };
+  assert.deepEqual(summary.steps.find((step) => step.step === 'enrollment'), {
+    step: 'enrollment',
+    action: 'skipped',
+    detail: 'no human signing key is stored',
+  });
+  assertNoOlp(t);
+});
+
+test('enrollments: read-only command classifies a valid D1 envelope as unverifiable without a chain validator', async () => {
+  const { routes } = makeIdentityHub();
+  const grant = buildEnrollmentGrant({
+    newKey: {
+      keyid: `SHA256:${'M'.repeat(43)}`,
+      keyType: 'ssh-ed25519',
+      openSshPublicKey: 'ssh-ed25519 AAAAB3NzaC1lZDI1NTE5 synthetic-machine',
+      comment: 'synthetic-machine',
+    },
+    principal: { kind: 'machine', id: 'local' },
+    scope: DEFAULT_MACHINE_SCOPE,
+    grantedBy: `SHA256:${'H'.repeat(43)}`,
+    validFrom: 0,
+  });
+  const envelope = {
+    payloadType: PAYLOAD_TYPE_ENROLLMENT_GRANT,
+    payload: encodeBase64(Buffer.from(JSON.stringify(grant), 'utf8')),
+    signatures: [],
+  };
+  routes['GET /api/enrollments'] = () => ({ status: 200, json: { enrollments: [{ envelope }] } });
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t.store);
+
+  assert.equal(await mainAsync(['enrollments', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  assert.deepEqual(JSON.parse(t.out.join('\n')), {
+    ok: true,
+    hub: ORIGIN,
+    enrollments: [{ kind: 'unverifiable', reason: 'no allowed_signers trust root was resolved' }],
+  });
+  assert.equal(calls.filter((call) => call.method === 'GET' && call.pathname === '/api/enrollments').length, 1);
+  assert.ok(!calls.some((call) => call.method === 'POST'), 'read-only command never posts');
+  assert.equal(t.principalKeys!.calls.length, 0, 'read-only command never creates or inspects signing keys');
   assertNoOlp(t);
 });
 

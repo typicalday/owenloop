@@ -159,6 +159,78 @@ Rules:
   is a hard conflict error; the existing key is kept.
 - **Ed25519 only** in this work package.
 
+## WP-D1 machine enrollment grants
+
+WP-D1 registers a machine public key in a signed organization roster. The
+machine key is not the grantor. The local human principal signs a frozen
+`EnrollmentGrantRecord` whose `newKey` is the machine's public descriptor:
+
+```ts
+{
+  newKey: { keyid, keyType, openSshPublicKey, comment },
+  principal: { kind: 'machine', id: 'local' },
+  scope: {
+    pools: '*',
+    labels: '*',
+    namespaces: [],
+    delegation: { allowed: false },
+  },
+  grantedBy: '<human SHA256 fingerprint>',
+  validFrom: <milliseconds since Unix epoch>,
+}
+```
+
+`buildEnrollmentGrant` performs no I/O and never reads a private key. The
+builder copies and freezes the public descriptor, principal, scope arrays, and
+delegation object. `DEFAULT_MACHINE_SCOPE` is the least-privilege D1 scope
+shown above: unrestricted pool and label matching for the machine's own
+operation, no namespace grants, and delegation denied. The frozen wire shape
+is specified in [`docs/wire-contracts.md`](wire-contracts.md); WP-D1 does not
+change that contract.
+
+### Local roster verification
+
+`verifyRosterEntry` verifies a relayed envelope in a fixed trust order:
+
+1. Decode and validate the DSSE envelope and enrollment-grant payload.
+2. Resolve the grantor key named by `grantedBy` from the local
+   `allowed_signers` trust root.
+3. Verify the DSSE signature and cross-check the authenticated signer key ID
+   against `grantedBy`.
+4. Call the optional `EnrollmentChainValidator` seam.
+
+The public result is one of four explicit states:
+
+| verdict | meaning |
+|---|---|
+| `enrolled` | payload, schema, signature, local signer authorization, and chain validation all succeeded; `keyid` is the enrolled machine fingerprint and `principal` is the authenticated signer principal |
+| `unenrolled` | no envelope was supplied |
+| `unverifiable` | a trust prerequisite is absent, including no local `allowed_signers` root or no installed chain validator |
+| `invalid` | the envelope, payload, schema, signer authorization, signature, or chain-validator result failed |
+
+The chain seam is deliberately narrow:
+
+```ts
+interface EnrollmentChainValidator {
+  validate(
+    grant: EnrollmentGrantRecord,
+    verifiedSignerKeyId: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string }>;
+}
+```
+
+WP-D1 fails closed when `chainValidator` is absent. A valid signature proves
+which key signed the grant; a signature does not prove that the signer chains
+to the organization root. WP-D4 owns chain validation, attenuation, revocation,
+and root trust. Until WP-D4 installs the validator, D1 entries remain
+`unverifiable`, never `enrolled`.
+
+The hub receives and relays the signed envelope only. The hub never receives a
+private key, creates a grant, signs a grant, or endorses a grant. Setup's
+registration path signs with `PrincipalKeyManager.withSigningKey`, so private
+bytes remain inside the local key-manager callback and only `{ envelope }` is
+sent over HTTP.
+
 ## DSSE envelopes
 
 Records that cross a trust boundary are wrapped in [DSSE](https://github.com/secure-systems-lab/dsse)

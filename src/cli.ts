@@ -75,8 +75,11 @@ import {
 } from './credentials.ts';
 import { PrincipalKeyManager } from './crypto/keys.ts';
 import type { PrincipalKeyRef } from './crypto/keys.ts';
-import { DSSE_SSH_NAMESPACE, dsseSignPublication } from './crypto/dsse.ts';
-import { createSshSigner } from './crypto/ssh.ts';
+import { DSSE_SSH_NAMESPACE, decodeBase64Strict, dsseSignEnrollmentGrant, dsseSignPublication } from './crypto/dsse.ts';
+import { createSshSigner, SshSignerError } from './crypto/ssh.ts';
+import { DEFAULT_MACHINE_SCOPE, buildEnrollmentGrant, verifyRosterEntry } from './crypto/enrollment.ts';
+import type { RosterVerdict } from './crypto/enrollment.ts';
+import { resolveAllowedSigners } from './crypto/trust-roots.ts';
 import type { PublicationRecord } from './crypto/records.ts';
 import { runMcpCommand } from './mcp/serve.ts';
 import type { LineStream } from './mcp/server.ts';
@@ -928,6 +931,7 @@ Commands:
   crew member rm <crewId> <principalId> [--hub <url>]   remove a principal from a crew
   setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]   converge this machine's install: human login, agent credential, signing keys, owenloop settings, plugins (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
+  enrollments [--hub <url>]               list the hub's relayed machine enrollment grants (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   work <subcommand> [args]                run execution-side shift/hold/exec/agent-run/... commands
   shift start|next|status|end [args]      run and attend a local Unix-socket shift daemon
@@ -1012,6 +1016,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['crew', cmdOpts('hub', 'kind', 'owner')],
   ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'crews', 'scopes', 'reuse-ssh-key')],
   ['doctor', cmdOpts('hub')],
+  ['enrollments', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
   ['work', cmdOpts()],
   ['shift', cmdOpts('all', 'origin', 'as', 'name', 'cap', 'max-agents', 'poll-interval', 'once', 'cache-dir', 'state-dir', 'wait')],
@@ -4799,6 +4804,108 @@ function installPluginStep(io: CliIO, state: HarnessPluginState): PluginStepOutc
   return { action: 'done', detail: upgrading ? `updated to ${expectedVersion}` : `installed ${expectedVersion}` };
 }
 
+function enrollmentEnvelopeNewKeyId(value: unknown): string | undefined {
+  const envelope = recordOf(value);
+  if (envelope === null || typeof envelope.payload !== 'string') return undefined;
+  try {
+    const payload = JSON.parse(decodeBase64Strict(envelope.payload, { allowEmpty: true }).toString('utf8')) as unknown;
+    const record = recordOf(payload);
+    const newKey = recordOf(record?.newKey);
+    return typeof newKey?.keyid === 'string' ? newKey.keyid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function enrollmentEnvelopesFromResponse(body: unknown): unknown[] {
+  if (Array.isArray(body)) return body.map((row) => recordOf(row)?.envelope ?? row);
+  const record = recordOf(body);
+  if (record === null) throw new CliError('enrollments: malformed response — expected an array of entries');
+  for (const key of ['enrollments', 'entries', 'envelopes', 'items']) {
+    const rows = record[key];
+    if (Array.isArray(rows)) return rows.map((row) => recordOf(row)?.envelope ?? row);
+  }
+  if (record.envelope !== undefined) return [record.envelope];
+  throw new CliError('enrollments: malformed response — expected an array of entries');
+}
+
+/**
+ * Register the already-created machine key as a signed enrollment grant. This
+ * helper owns only the D1 relay action: the hub stores the DSSE envelope, while
+ * the human signing key signs locally and the machine private key never enters
+ * the request body.
+ */
+async function registerMachineEnrollment(
+  io: CliIO,
+  origin: string,
+  humanCred: Credential,
+  keys: Pick<PrincipalKeyManager, 'inspect' | 'withSigningKey'>,
+  humanRef: PrincipalKeyRef,
+  machinePublicKey: Parameters<typeof buildEnrollmentGrant>[0]['newKey'],
+): Promise<SetupStep> {
+  const noted = (detail: string): SetupStep => ({ step: 'enrollment', action: 'noted', detail });
+  const skipped = (detail: string): SetupStep => ({ step: 'enrollment', action: 'skipped', detail });
+  const done = (detail: string): SetupStep => ({ step: 'enrollment', action: 'done', detail });
+
+  let human: Awaited<ReturnType<PrincipalKeyManager['inspect']>>;
+  try {
+    human = await keys.inspect(humanRef);
+  } catch {
+    return skipped('human signing key could not be inspected');
+  }
+  if (!human.exists || human.publicKey === undefined) {
+    return skipped('no human signing key is stored');
+  }
+
+  let list: { res: Response; cred: Credential };
+  try {
+    list = await authedGet(io, origin, { principal: 'human' }, humanCred, '/api/enrollments');
+  } catch {
+    return noted('hub enrollment listing unavailable');
+  }
+  if (!list.res.ok) return noted(`hub enrollment listing rejected (HTTP ${list.res.status})`);
+
+  let existing: unknown[];
+  try {
+    existing = enrollmentEnvelopesFromResponse(await list.res.json());
+  } catch (error) {
+    return noted(error instanceof CliError ? error.message : 'hub enrollment listing was not valid JSON');
+  }
+  if (existing.some((entry) => enrollmentEnvelopeNewKeyId(entry) === machinePublicKey.keyid)) {
+    return skipped('machine key already registered');
+  }
+
+  const grant = buildEnrollmentGrant({
+    newKey: machinePublicKey,
+    principal: { kind: 'machine', id: 'local' },
+    scope: DEFAULT_MACHINE_SCOPE,
+    grantedBy: human.publicKey.keyid,
+    validFrom: nowMs(),
+  });
+
+  let envelope: unknown;
+  try {
+    envelope = await keys.withSigningKey(humanRef, async (signKeyPath) => {
+      const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath });
+      const signed = await dsseSignEnrollmentGrant(Buffer.from(canonicalJsonBytes(grant)), signer);
+      return signed.envelope;
+    });
+  } catch (error) {
+    if (error instanceof SshSignerError) return noted(`enrollment signing unavailable: ${error.message}`);
+    return noted('could not sign enrollment grant');
+  }
+
+  let posted: { res: Response; cred: Credential };
+  try {
+    posted = await authedPost(io, origin, { principal: 'human' }, list.cred, '/api/enrollments', { envelope });
+  } catch {
+    return noted('hub enrollment registration unavailable');
+  }
+  if (posted.res.status === 409) return skipped('machine key already registered');
+  if (!posted.res.ok) return noted(`hub enrollment registration rejected (HTTP ${posted.res.status})`);
+  return done('machine key registered');
+}
+
 /**
  * `owenloop setup` — converge this machine's install in seven probe→(skip|act)
  * steps, idempotently: a second run performs ZERO writes (no store mutation, no
@@ -5020,16 +5127,24 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   const machineRef: PrincipalKeyRef = { origin, kind: 'machine', id: 'local' };
   const agentRef: PrincipalKeyRef = { origin, kind: 'agent', id: agentPrincipalId };
   const ensured: string[] = [];
+  let machine: Awaited<ReturnType<PrincipalKeyManager['ensure']>>;
   {
     const human = await keys.ensure(humanRef, reuseSshKey !== undefined ? { reuse: { path: reuseSshKey } } : undefined);
     ensured.push(`human ${human.state} (${human.backend})`);
-    const machine = await keys.ensure(machineRef);
+    machine = await keys.ensure(machineRef);
     ensured.push(`machine ${machine.state} (${machine.backend})`);
     const agent = await keys.ensure(agentRef);
     ensured.push(`agent ${agent.state} (${agent.backend})`);
   }
   io.err(`✓ signing keys: ${ensured.join(', ')}`);
   steps.push({ step: 'signing keys', action: 'done', detail: ensured.join(', ') });
+
+  // Registration is deliberately subordinate to key convergence: a missing
+  // SSHSIG tool, absent human key, or unavailable hub is a noted convergence
+  // result, never a reason to undo the three silent key ensures above.
+  const enrollment = await registerMachineEnrollment(io, origin, humanCred, keys, humanRef, machine.publicKey);
+  io.err(`${enrollment.action === 'noted' ? '!' : '✓'} enrollment: ${enrollment.detail}`);
+  steps.push(enrollment);
 
   // --- [5/7] owenloop settings ---
   io.err('[5/7] owenloop settings');
@@ -5063,6 +5178,52 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
 
   print(io, { ok: doctor.ok, hub: origin, steps, doctor: { ok: doctor.ok, checks: doctor.checks } });
   return doctor.ok ? 0 : 1;
+}
+
+/**
+ * `owenloop enrollments` — read the hub's relayed DSSE envelopes and classify
+ * each roster entry locally. This command never creates keys and never writes a
+ * roster entry. D1 intentionally installs no chain validator, so a valid signed
+ * grant is visible as `unverifiable` until WP-D4 supplies that validator.
+ */
+async function dispatchEnrollments(io: CliIO, args: Args): Promise<number> {
+  const origin = resolveSetupHub(io, args);
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  const { res, cred: used } = await authedGet(io, origin, slot, cred, '/api/enrollments');
+  assertAuthOk(res, used, origin);
+
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    throw new CliError('enrollments: malformed response — body is not valid JSON');
+  }
+  let envelopes: unknown[];
+  try {
+    envelopes = enrollmentEnvelopesFromResponse(body);
+  } catch (error) {
+    throw new CliError(error instanceof Error ? error.message : 'enrollments: malformed response');
+  }
+
+  let allowedSignersText: string | undefined;
+  try {
+    const roots = resolveAllowedSigners(io.env);
+    allowedSignersText = roots.kind === 'present' ? roots.text : undefined;
+  } catch {
+    allowedSignersText = undefined;
+  }
+
+  const verdicts: RosterVerdict[] = [];
+  for (const envelope of envelopes) {
+    verdicts.push(await verifyRosterEntry({ envelope, allowedSignersText }));
+  }
+  print(io, { ok: true, hub: origin, enrollments: verdicts });
+  return 0;
 }
 
 /**
@@ -5249,7 +5410,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'push', 'agent', 'capability', 'crew', 'setup', 'doctor', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'push', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -5301,6 +5462,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchSetup(io, args);
       case 'doctor':
         return await dispatchDoctor(io, args);
+      case 'enrollments':
+        return await dispatchEnrollments(io, args);
       case 'mcp':
         return await dispatchMcp(io, args);
       default:
