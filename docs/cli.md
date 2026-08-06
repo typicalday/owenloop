@@ -665,12 +665,12 @@ rather than treating installed bytes as published trust.
 
 ### Consume-side artifact policy
 
-`artifactPolicy` controls how agent and MCP drivers handle missing local
-prerequisites for signed dynamic artifact evidence. The policy is a scalar with
-the same values as `defPolicy`: `enforce`, `warn`, or `off`. The precedence is
-explicit host option, then `OWENLOOP_ARTIFACT_POLICY`, then the
-`artifactPolicy` key in the execution settings file, then the built-in default
-`warn`.
+`artifactPolicy` controls how agent and MCP drivers handle absent evidence and
+missing local prerequisites for signed dynamic artifact values. Supplied but
+invalid evidence always refuses; the policy is a scalar with the same values as
+`defPolicy`: `enforce`, `warn`, or `off`. The precedence is explicit host
+option, then `OWENLOOP_ARTIFACT_POLICY`, then the `artifactPolicy` key in the
+execution settings file, then the built-in default `warn`.
 
 For example, the settings file can contain:
 
@@ -686,10 +686,17 @@ Invalid values fail loudly; an invalid value never becomes `off`.
 
 The consuming driver verifies each delivered value against its serialized DSSE
 submission proof, the signed value digest and version, the locally anchored
-producer enrollment chain, revocations, and the consuming demand's scope. A
-missing proof is not the same as invalid evidence. The driver keeps dynamic
-values and rejection reasons on the wire, verifies them, and refuses the whole
-order on failure rather than dropping only one path.
+producer enrollment chain, revocations, and any supplied consuming demand's
+scope. A missing proof is not the same as invalid evidence. Dynamic values and
+rejection reasons remain on the wire; the driver verifies those values and
+refuses the whole order on failure rather than dropping only one path.
+
+The current production `exec`, `agent-run`, and `hold` roles do not supply a
+pool, label, or namespace demand. `OrderPacket` has no such demand field to
+derive, so production consume gates enforce the enrollment chain, attenuation,
+and revocation checks but do not apply a demand-dependent `scopePermits`
+restriction. A caller that supplies a demand through the verifier seam gets the
+full scope check. This limitation is a named follow-up.
 
 | consumed-evidence verdict | `artifactPolicy=enforce` | `artifactPolicy=warn` | `artifactPolicy=off` |
 |---|---|---|---|
@@ -697,6 +704,12 @@ order on failure rather than dropping only one path.
 | `absent` | refuse | warn and admit | admit |
 | `unverifiable` | refuse | warn and admit | admit |
 | `invalid` | refuse | refuse | refuse |
+
+A refusal is an actionable integrity event. The refusal names the failed link
+and artifact, using names such as `no-proof`, `signature`, `value-digest`,
+`version`, `chain`, `scope`, or `prerequisite`, and includes the workflow, run,
+and step. The driver refuses the whole order; operators must not suppress the
+message or continue with a manually stripped packet.
 
 The policy floor's `unsignedArtifacts: warn` value raises the local minimum to
 `artifactPolicy=warn`; `unsignedArtifacts: refuse` raises it to `enforce`. A

@@ -1672,9 +1672,17 @@ MCP model context, or command. For each consumed value, the gate verifies the
 DSSE envelope first, validates the signed submission record, cross-checks the
 authenticated signer key with `producerKeyId`, checks the path, canonical value
 digest, and supplied claim-time version, then validates the local enrollment
-chain, revocations, and demanded scope. For an `owes[].proof` envelope, the
-signed produced value is the complete `owes[].reasons` array; the gate runs
-before replay truncation so the verified bytes are the full thread.
+chain, revocations, and any supplied demand's scope. For an `owes[].proof`
+envelope, the signed produced value is the complete `owes[].reasons` array;
+the gate runs before replay truncation so the verified bytes are the full
+thread.
+
+The built-in production `exec`, `agent-run`, and `hold` roles currently pass no
+pool, label, or namespace demand. `OrderPacket` has no demand field from which
+to derive one, so production gates enforce chain termination, per-link
+signatures, attenuation, and revocation, while the demand-dependent
+`scopePermits` check is vacuous. The verifier seam can receive a demand and
+apply the full scope check; this limitation is a named follow-up.
 
 The gate returns `verified`, `absent`, `unverifiable`, or `invalid`. The
 configured `artifactPolicy` maps `absent` and `unverifiable` to refusal,
@@ -1684,12 +1692,19 @@ unverifiable, and invalid consumed evidence refuses before policy lookup or
 shell execution. An order is refused as a whole; the gate never drops only one
 unverified value and proceeds with a partial packet.
 
-The consumer supplies the validation clock. Revocations whose
-`effectiveFrom <= at` invalidate the key at consume time; a producer-signed
-timestamp cannot move that boundary. D3 checks the versions present in
-`consumedFingerprint` but does not recompute the producer's complete map because
-the reduced packet lacks independently authenticated upstream evidence. That
-lineage limitation remains a named follow-up.
+**Decision B — consumer-owned revocation time.** The consumer supplies the
+validation clock. Revocations whose `effectiveFrom <= at` invalidate the key at
+consume time; a producer-signed timestamp cannot move that boundary. The
+consumer samples the clock once per gate invocation. Revocation cuts forward: a
+prior successful decision is not rewritten, but a later consumption is checked
+against the cut.
+
+**Decision A — version cross-check without fingerprint recomputation.** D3
+checks the versions present in `consumedFingerprint` against the signed
+`produced[].version`, but does not recompute the producer's complete map because
+the reduced packet lacks independently authenticated upstream evidence. A
+hostile hub can weaken a producer's declared lineage with an explicit empty or
+partial map. That lineage limitation remains a named follow-up.
 
 ## §30 Store-backed execution resolution
 

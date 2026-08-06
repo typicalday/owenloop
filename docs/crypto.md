@@ -220,9 +220,9 @@ For each entry in `order.consumes`, `verifyConsumed` applies this fixed order:
    grants to the locally configured organization-root public key. Every grant
    link is signature-checked, scope attenuation is enforced, and effective
    revocations are applied.
-6. The producer's effective scope must satisfy the consuming demand. A child
-   grant can only narrow a parent grant; it cannot widen pools, labels,
-   namespaces, or delegation.
+6. When the consuming driver supplies a demand, the producer's effective scope
+   must satisfy that demand. A child grant can only narrow a parent grant; it
+   cannot widen pools, labels, namespaces, or delegation.
 
 The same verification applies to an `owes[]` rejection thread when
 `owes[].proof` is present. The proof is a `submission.v1` envelope whose one
@@ -234,7 +234,7 @@ The pure verifier returns four explicit verdicts:
 
 | verdict | meaning |
 | --- | --- |
-| `verified` | DSSE, schema, path, value digest, version, enrollment chain, revocation, and scope checks passed. |
+| `verified` | DSSE, schema, path, value digest, version, enrollment chain, revocation, and any supplied-demand scope checks passed. |
 | `absent` | No proof was supplied. |
 | `unverifiable` | A required local prerequisite or verifier setup is unavailable. |
 | `invalid` | Evidence was supplied but failed signature, schema, path, digest, version, chain, revocation, or scope validation. |
@@ -256,21 +256,41 @@ shell invocation. An unverified dynamic value must never reach `/bin/sh -c`.
 Agent and MCP workers also fail closed when dynamic data exists but no
 consume-side verifier is configured.
 
-The consuming driver samples its injected clock once per complete gate
-invocation. Revocation is evaluated at that consumer-owned instant using
+A refusal is an operator-facing integrity event, not an error to suppress or
+work around. The refusal names the failed link and the artifact, using link
+names such as `no-proof`, `signature`, `value-digest`, `version`, `chain`,
+`scope`, or `prerequisite`, together with the workflow, run, and step. The gate
+refuses the complete order; it never drops the offending path and serves a
+partial packet.
+
+**Decision A — version cross-check without fingerprint recomputation.** D3
+checks each `consumedFingerprint[path]` version supplied by the consumer against
+the signed `produced[].version`, but does not recompute the producer's complete
+fingerprint map. The reduced packet does not include enough independently
+authenticated upstream evidence to reconstruct every input version. A hostile
+hub can therefore weaken a producer's declared lineage by supplying an explicit
+empty or partial map. This is a named follow-up; the driver still verifies the
+signed value and lineage evidence it does receive.
+
+**Decision B — consumer-owned revocation anchor.** The consuming driver samples
+its injected clock once per complete gate invocation and passes that instant as
+`at`. Revocation is evaluated at that consumer-owned instant using
 `effectiveFrom <= at`; the producer's signed timestamp is not a revocation
 anchor. A key revocation that becomes effective after an earlier successful
 consumption makes the same producer's artifact unconsumable on a later gate.
-A timestamp ahead of the consumer clock is diagnostic only and does not weaken
-revocation checks.
+A producer timestamp ahead of the consumer clock is diagnostic only and does
+not weaken revocation checks. Revocation cuts forward: a prior successful
+decision is not rewritten, but a later consumption is checked against the cut.
 
-D3 enforces the `consumedFingerprint[path]` versions supplied by the consumer,
-but does not recompute the producer's complete fingerprint map. The reduced
-packet does not include enough independently authenticated upstream evidence
-to reconstruct every input version. A hostile hub can therefore weaken a
-producer's declared lineage by supplying an explicit empty or partial map; the
-remaining lineage-strengthening work is a named follow-up, not a reason to
-strip the dynamic value from the order.
+**Scope enforcement status.** The pure verifier enforces `scopePermits` when a
+caller supplies a pool, label, or namespace demand. The current production
+`exec`, `agent-run`, and `hold` roles instantiate the verifier without a
+demand, and `OrderPacket` carries no pool or label from which those roles could
+derive one. Production gates therefore pass an empty demand: chain
+termination, per-link signatures, attenuation-only-shrinks, and revocation are
+enforced, but the demand-dependent scope-permission half of link 3 is currently
+vacuous. Supplying a demand through the verifier seam enables that check. This
+is a named follow-up, not a reason to bypass chain verification.
 
 ### Reusing an existing SSH key (human only)
 
