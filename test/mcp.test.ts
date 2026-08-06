@@ -269,6 +269,71 @@ test('mcp: submit attaches a DSSE submission proof over the original value', asy
   assert.deepEqual(record.consumedFingerprint, { input: 3 });
 });
 
+test('mcp: an omitted consumed fingerprint falls back unsigned only for consuming orders', async () => {
+  let orderCalls = 0;
+  const submitted: Array<Record<string, unknown>> = [];
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/get_order': () => {
+      orderCalls += 1;
+      const consumes = orderCalls === 1 ? { input: { value: 'seen' } } : {};
+      const inputs = orderCalls === 1 ? ['input'] : [];
+      return {
+        status: 200,
+        json: {
+          text: '',
+          workflow: 'wf1',
+          run: `run${orderCalls}`,
+          order: {
+            run: `run${orderCalls}`,
+            workflow: 'wf1',
+            step: 'producer',
+            key: 'k',
+            defDigest: 'def-digest',
+            inputs,
+            outputs: ['result'],
+            consumes,
+            owes: [{ path: 'result', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+          },
+          lease: { claimed: true },
+        },
+      };
+    },
+    'POST /api/submit': (req) => {
+      submitted.push(JSON.parse(req.body ?? '{}') as Record<string, unknown>);
+      return { status: 200, json: { text: 'ok', outcome: 'green' } };
+    },
+  };
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+  const mcpIo = t.io as unknown as {
+    principalKeys?: Pick<PrincipalKeyManager, 'inspect' | 'resolveRef' | 'withSigningKey'>;
+    sshProcess?: SshProcessAdapter;
+  };
+  mcpIo.principalKeys = SIGNING_KEYS;
+  mcpIo.sshProcess = fakeSshProcess();
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
+    INIT,
+    call(3, 'submit', { workflow: 'wf1', run: 'run1', path: 'result', value: { answer: 1 } }),
+    call(4, 'submit', { workflow: 'wf1', run: 'run2', path: 'result', value: { answer: 2 } }),
+  ]);
+  assert.deepEqual(resultJson(frames[1]!), { text: 'ok', outcome: 'green' });
+  assert.deepEqual(resultJson(frames[2]!), { text: 'ok', outcome: 'green' });
+  assert.equal(submitted.length, 2);
+  assert.equal(submitted[0]!.proof, undefined, 'missing fingerprint must not sign a consuming order');
+  assert.equal(typeof submitted[1]!.proof, 'string', 'an actually empty input set may sign {}');
+
+  const verified = await dsseVerifySubmission(JSON.parse(submitted[1]!.proof as string), {
+    async verify() {
+      return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as { consumedFingerprint: Record<string, number> };
+  assert.deepEqual(record.consumedFingerprint, {});
+});
+
 test('mcp: a non-2xx REST reply maps to an isError result carrying the body message', async () => {
   const routes: Record<string, RouteHandler> = {
     'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),

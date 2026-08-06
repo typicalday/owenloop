@@ -33,6 +33,9 @@ let warnedUnsigned = false;
  * propagate because silently dropping a configured key would hide corruption.
  */
 export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string | undefined> {
+  const consumedFingerprint = submissionFingerprint(opts.order, opts.warn);
+  if (consumedFingerprint === undefined) return undefined;
+
   let keys: SubmissionKeyManager;
   try {
     keys = opts.principalKeys ?? new PrincipalKeyManager({ env: opts.env ?? process.env });
@@ -60,7 +63,7 @@ export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string
     key: opts.order.key,
     ...(opts.order.index !== undefined ? { index: opts.order.index } : {}),
     produced: [{ artifact: opts.path, version: outputVersion(opts.order, opts.path, opts.version), value: opts.value }],
-    consumedFingerprint: opts.order.consumedFingerprint ?? {},
+    consumedFingerprint,
     producerKeyId: inspected.publicKey.keyid,
     timestamp: opts.now(),
   });
@@ -75,13 +78,27 @@ export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string
   });
 }
 
+function submissionFingerprint(
+  order: OrderPacket,
+  warn: (line: string) => void,
+): NonNullable<OrderPacket['consumedFingerprint']> | undefined {
+  if (order.consumedFingerprint !== undefined) return order.consumedFingerprint;
+  if (order.inputs.length > 0 || Object.keys(order.consumes).length > 0) {
+    warnUnsigned(warn, `order ${order.workflow}/${order.run} omitted its consumed fingerprint; submitting without a proof`);
+    return undefined;
+  }
+  return {};
+}
+
 /**
  * Infer the version that the next producer commit will name when the reduced
  * driver packet has no explicit version hint. Fresh artifact rows start at
  * version zero, so the first commit is version one. A judged approval reuses
  * the submitted stem's version, which is present in the claim fingerprint.
  * A retry after an earlier committed/rejected version advances from the latest
- * reason's source version.
+ * reason's source version. This is a best-effort inference because the reduced
+ * packet does not carry the coordinator's post-commit version; callers with an
+ * authoritative version must pass `version` explicitly.
  */
 function outputVersion(order: OrderPacket, path: string, explicit: number | undefined): number {
   if (explicit !== undefined) return explicit;

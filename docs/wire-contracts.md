@@ -82,6 +82,17 @@ Payload type: `application/vnd.owenloop.submission.v1+json`.
 Each `produced` entry has `artifact`, non-negative integer `version`, and a
 lowercase SHA-256 `valueDigest`.
 
+A driver signs before a remote coordinator commits the submitted value. When a
+transport supplies an authoritative committed version, the driver must pass
+that version into the submission signer. The current reduced driver packet does
+not carry that post-commit value, so the compatibility path makes a best-effort
+inference from the claim fingerprint and the latest reason thread (or version
+one for a fresh artifact). The inferred version is not a coordinator
+attestation: stale or malformed order metadata can produce a signed record whose
+version differs from the committed artifact, and a later verifier must reject
+that proof rather than silently correcting it. Integrations that require an
+authoritative submission record must use an explicit version-aware packet.
+
 ## Publication record
 
 Payload type: `application/vnd.owenloop.publication.v1+json`.

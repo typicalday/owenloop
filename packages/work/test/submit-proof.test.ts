@@ -127,6 +127,54 @@ test('buildSubmitProof uses an explicit committed version when provided', async 
   assert.equal(record.produced[0]!.version, 9);
 });
 
+test('buildSubmitProof refuses a proof when consumed inputs have no fingerprint', async () => {
+  const warnings: string[] = [];
+  const omittedFingerprint = { ...ORDER, consumedFingerprint: undefined };
+  let signingCalls = 0;
+  const proof = await buildSubmitProof({
+    origin: ORIGIN,
+    order: omittedFingerprint,
+    path: 'result',
+    value: { ok: true },
+    now: () => 1,
+    warn: (line) => warnings.push(line),
+    principalKeys: {
+      ...keysFor(),
+      withSigningKey: async () => {
+        signingCalls += 1;
+        throw new Error('withSigningKey must not run');
+      },
+    },
+    sshProcess: fakeSshProcess([]),
+  });
+  assert.equal(proof, undefined);
+  assert.equal(signingCalls, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /omitted its consumed fingerprint/);
+});
+
+test('buildSubmitProof signs an explicitly empty fingerprint only for an order with no consumed inputs', async () => {
+  const emptyOrder = { ...ORDER, inputs: [], consumes: {}, consumedFingerprint: undefined };
+  const proof = await buildSubmitProof({
+    origin: ORIGIN,
+    order: emptyOrder,
+    path: 'result',
+    value: { ok: true },
+    now: () => 1,
+    warn: () => {},
+    principalKeys: keysFor(),
+    sshProcess: fakeSshProcess([]),
+  });
+  assert.ok(proof !== undefined);
+  const verified = await dsseVerifySubmission(JSON.parse(proof), {
+    async verify() {
+      return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as { consumedFingerprint: Record<string, number> };
+  assert.deepEqual(record.consumedFingerprint, {});
+});
+
 test('buildSubmitProof warns once and falls back unsigned when the machine key is absent', async () => {
   const warnings: string[] = [];
   const opts = {

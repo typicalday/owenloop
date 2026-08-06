@@ -335,6 +335,9 @@ async function signMcpSubmit(deps: McpDeps, args: Record<string, unknown>): Prom
   }
 
   const order = orderResponse.json['order'] as unknown as Order;
+  const consumedFingerprint = submissionFingerprint(order, deps);
+  if (consumedFingerprint === undefined) return undefined;
+
   const record = buildSubmissionRecord({
     run: order.run,
     workflow: order.workflow,
@@ -343,7 +346,7 @@ async function signMcpSubmit(deps: McpDeps, args: Record<string, unknown>): Prom
     key: order.key,
     ...(order.index !== undefined ? { index: order.index } : {}),
     produced: [{ artifact: path, version: outputVersion(order, path), value: args['value'] }],
-    consumedFingerprint: order.consumedFingerprint ?? {},
+    consumedFingerprint,
     producerKeyId: inspected.publicKey.keyid,
     timestamp: Date.now(),
   });
@@ -358,6 +361,20 @@ async function signMcpSubmit(deps: McpDeps, args: Record<string, unknown>): Prom
   });
 }
 
+function submissionFingerprint(order: Order, deps: McpDeps): NonNullable<Order['consumedFingerprint']> | undefined {
+  if (order.consumedFingerprint !== undefined) return order.consumedFingerprint;
+  if (order.inputs.length > 0 || Object.keys(order.consumes).length > 0) {
+    warnMcpUnsigned(deps, `order ${order.workflow}/${order.run} omitted its consumed fingerprint; submitting without a proof`);
+    return undefined;
+  }
+  return {};
+}
+
+/**
+ * Best-effort pre-commit version inference for reduced MCP order packets. The
+ * packet has no authoritative post-commit version; callers needing one must use
+ * a version-aware transport instead of treating this value as an attestation.
+ */
 function outputVersion(order: Order, path: string): number {
   const consumed = order.consumedFingerprint?.[path];
   if (consumed !== undefined) return consumed;

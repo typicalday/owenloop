@@ -32,6 +32,29 @@ test('canonicalValueBytes sorts object keys recursively but preserves array orde
   assert.notEqual(valueDigestHex({ list: [2, 1] }), valueDigestHex({ list: [1, 2] }));
 });
 
+test('canonicalValueBytes follows transport toJSON semantics and rejects unsupported objects', () => {
+  const date = new Date(0);
+  assert.equal(new TextDecoder().decode(canonicalValueBytes({ when: date })), '{"when":"1970-01-01T00:00:00.000Z"}');
+  assert.equal(valueDigestHex({ when: date }), valueDigestHex({ when: date.toJSON() }));
+
+  class WithJson {
+    toJSON(key: string): unknown {
+      return { key, value: 'serialized' };
+    }
+  }
+  assert.equal(
+    new TextDecoder().decode(canonicalValueBytes({ nested: new WithJson() })),
+    '{"nested":{"key":"nested","value":"serialized"}}',
+  );
+
+  assert.throws(() => canonicalValueBytes(new Map([['a', 1]])), /non-plain object/);
+  assert.throws(() => canonicalValueBytes(new Set([1])), /non-plain object/);
+  assert.throws(
+    () => canonicalValueBytes({ toJSON: () => undefined }),
+    /cannot canonicalize undefined/,
+  );
+});
+
 test('buildSubmissionRecord computes value digests and omits absent index', () => {
   const record = buildSubmissionRecord(BASE);
   assert.equal('index' in record, false);
