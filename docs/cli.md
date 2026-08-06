@@ -614,13 +614,27 @@ settings file, write a JSON object such as:
 ```
 
 For a one-off CLI invocation, set `OWENLOOP_DEF_POLICY` in the environment, for
-example `OWENLOOP_DEF_POLICY=enforce owenloop add widget.wnlp`. The precedence
-is explicit host-provided policy, then `OWENLOOP_DEF_POLICY`, then the settings
-file, then the built-in default `warn`. An invalid environment or settings-file
-value fails loudly; it never degrades to `off`.
+example `OWENLOOP_DEF_POLICY=enforce owenloop add widget.wnlp`. The local
+precedence is explicit host-provided policy, then `OWENLOOP_DEF_POLICY`, then
+the settings file, then the built-in default `warn`. An invalid environment or
+settings-file value fails loudly; it never degrades to `off`.
 
-The policy applies at install time and again at execution time. The table uses
-these verdicts:
+When a host supplies an already-verified organization policy floor through the
+`policyFloor` option seam, the floor is applied **after** that local precedence.
+`unsignedDefs: warn` raises the minimum to `warn`; `unsignedDefs: refuse` raises
+the minimum to `enforce`; the effective policy is the stricter of local policy
+and the floor. **Therefore, local `off` no longer means “no enforcement” when a
+verified org floor is present.** A local operator cannot use `off` to opt out of
+a verified floor. A missing, malformed, unsigned, wrongly signed, or
+under-scoped floor leaves the local policy unchanged.
+
+The current CLI and production configuration do not load or verify a floor.
+`policyFloor` is an injection seam only, so this feature is inert until a host
+wires floor loading and verification into that seam.
+
+The policy applies at install time and again at execution time. The following
+table describes the local policy result before any verified floor is applied.
+The table uses these verdicts:
 
 - `verified` — the publication sidecar verifies against the bundle digest and a
   signer in the local trust root.
@@ -637,15 +651,17 @@ these verdicts:
 | `unsigned` or `unverifiable` | Install refuses; agent and command execution refuse. | Install warns to stderr and succeeds; agent execution warns and proceeds; command execution refuses. | Install succeeds silently; agent execution proceeds silently; command execution refuses. |
 | `invalid` | Install refuses; agent and command execution refuse. | Install refuses; agent and command execution refuse. | Install refuses; agent and command execution refuse. |
 
-**Command-worker hard rule.** A `worker: command` order requires a `verified`
-definition in every policy value, including `off`. `off` does not disable
-command-worker enforcement. `warn` and `off` never allow an unsigned,
-unverifiable, or invalid definition to reach the shell. The command check runs
-before the policy value is read, and a refusal uses the normal
-`InstructionRefusal` path so the lease stops before command execution. If an
-execution host has no publication verifier configured, the definition is
-`unverifiable`; command workers therefore refuse rather than treating installed
-bytes as published trust.
+**Command-worker hard rule.** A `worker: command` order requires full
+enforcement in every policy value, including `off`: the definition must be
+verified, the enrollment chain must be verified, and the signer scope must be
+checked. `off` does not disable command-worker enforcement. `warn` and `off`
+never allow an unsigned, unverifiable, or invalid definition to reach the
+shell. The command check runs before the policy value is read, and a refusal
+uses the normal `InstructionRefusal` path so the lease stops before command
+execution. A policy floor cannot relax this gate; the gate also fails closed
+regardless of any floor. If an execution host has no publication verifier
+configured, the definition is `unverifiable`; command workers therefore refuse
+rather than treating installed bytes as published trust.
 
 The local SSHSIG trust root is
 `$XDG_CONFIG_HOME/owenloop/allowed_signers`, or
