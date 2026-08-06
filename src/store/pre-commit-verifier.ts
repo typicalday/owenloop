@@ -31,6 +31,8 @@ import {
   type DefVerdict,
   type VerifyPublicationOptions,
 } from '../crypto/verify-publication.ts';
+import { mergePolicyFloorWithLocal } from '../crypto/policy-floor.ts';
+import type { PolicyFloor } from '../crypto/records.ts';
 import { StoreDefinitionVerificationError } from './types.ts';
 
 export interface PreCommitVerifierOptions {
@@ -40,6 +42,8 @@ export interface PreCommitVerifierOptions {
   cwd?: string;
   /** Explicit policy, useful for embedding and hermetic tests. */
   policy?: DefPolicy;
+  /** Already-verified organization floor; absent means local policy only. */
+  policyFloor?: PolicyFloor;
   /** Diagnostic sink for `warn` policy decisions. */
   warn?: (line: string) => void;
   /** Optional signer seam for hermetic publication-verification tests. */
@@ -295,7 +299,10 @@ export function createPreCommitVerifier(options: PreCommitVerifierOptions = {}):
       // objectDir is deliberately unused: no provenance is written into the
       // immutable object, and object integrity is owned by BundleIngestor.
       void input.objectDir;
-      const policy = resolveDefPolicy(env, options.policy);
+      const policy = mergePolicyFloorWithLocal(
+        resolveDefPolicy(env, options.policy),
+        options.policyFloor,
+      ).effective;
       const verdict = await verifyPublicationAsync(input.source, input.digest, env, options);
       if (verdict.kind === 'invalid') {
         throw new StoreDefinitionVerificationError('invalid', policy, input.coordinate, verdict.reason);

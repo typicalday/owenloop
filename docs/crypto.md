@@ -471,6 +471,97 @@ is never returned by the library or placed in an envelope. `loadRoster` and
 `loadRevocations` return raw envelope bytes to the pure validator and refuse
 symlinked or non-regular files.
 
+## Admin-signed policy floors
+
+A policy floor is an org-wide minimum for local enforcement. An org admin signs
+one DSSE record with payload type
+`application/vnd.owenloop.policy-floor.v1+json`. A driver verifies the exact
+record against local trust material before using the record:
+
+1. The DSSE envelope and policy-floor schema must verify.
+2. The authenticated signer key must be present in the local enrollment
+   material, and the signer's enrollment chain must terminate at the local
+   organization-root anchor. Revocations are evaluated at the supplied
+   validation instant.
+3. The signer's effective scope must be unrestricted on all three axes:
+   `pools`, `labels`, and `namespaces` must each be `"*"`. Under scope
+   attenuation, that is genuine organization-wide admin scope; a narrower key
+   cannot sign an organization-wide floor.
+
+A hub or other remote coordinator relays the signed record but never authors,
+derives, weakens, or signs the floor. The relaying transport is not a trust
+anchor.
+
+### Monotone merge with local policy
+
+A verified floor can only raise local strictness, never lower it. The driver
+maps the floor's `unsignedDefs` axis into the existing `defPolicy` vocabulary:
+
+| floor `unsignedDefs` | minimum local `defPolicy` |
+|---|---|
+| `warn` | `warn` |
+| `refuse` | `enforce` |
+
+The effective policy is the stricter of local policy and the floor minimum:
+`off < warn < enforce`. The floor vocabulary has no value that maps to `off`,
+so a floor is structurally unable to lower policy. In particular, local `off`
+plus a verified floor produces at least `warn`; the local operator cannot opt
+out of that org floor.
+
+### Failure behavior and current limits
+
+Absence is never permission. A missing or failed floor supplies no floor to the
+merge, so the driver's local policy remains exactly unchanged. For a delivered
+envelope, verification reports `invalid` or `unverifiable` instead of throwing
+for every failure path:
+
+| situation | result |
+|---|---|
+| no floor delivered | local policy unchanged; no floor is merged |
+| malformed envelope or payload, including wrong payload type or schema failure | `invalid`; local policy unchanged |
+| unsigned floor or signature that does not verify | `invalid`; local policy unchanged |
+| signer chain does not terminate at the local org root | `invalid`; local policy unchanged |
+| signer lacks unrestricted admin scope | `invalid`; local policy unchanged |
+| signer key is revoked at the validation instant | `invalid`; local policy unchanged |
+| local org-root anchor or other verification prerequisite is unavailable | `unverifiable`; local policy unchanged |
+
+The frozen floor has four axes, but this package has an enforcement mechanism
+for only one axis, `unsignedDefs` → `defPolicy`:
+
+| axis | current state |
+|---|---|
+| `unsignedDefs` | mapped into `defPolicy` and enforced |
+| `trustMode` | accepted and carried, but not evaluated |
+| `unsignedArtifacts` | accepted and carried, but no enforcement mechanism exists yet |
+| `originRules` | accepted and carried, but no enforcement mechanism exists yet |
+
+The merge result names the three unenforced axes in `gaps` rather than silently
+dropping them. Both current integration call sites — installation and
+execution — discard `.gaps`, so callers do not currently surface those
+warnings. An administrator can therefore set a floor believing that
+`trustMode`, `unsignedArtifacts`, or `originRules` is enforced when the axis is
+not enforced. The feature is not wired into production configuration: the
+`policyFloor` option is an injection seam only, so the feature is inert until a
+host loads and verifies a floor and passes it through that seam.
+
+L0, L1, and L2 are documented bundles of concrete floor values, not alternate
+policy primitives:
+
+| preset | `trustMode` | `unsignedDefs` | `unsignedArtifacts` | `originRules` |
+|---|---|---|---|---|
+| L0 | `seamless` | `warn` | `warn` | `advisory` |
+| L1 | `seamless` | `refuse` | `refuse` | `advisory` |
+| L2 | `strict` | `refuse` | `refuse` | `enforced` |
+
+The preset values for the three unenforced axes are still only carried and
+reported as gaps in this package.
+
+**Command-worker hard rule.** A `worker: command` order still requires full
+enforcement: a verified definition, a verified enrollment chain, and a
+scope-checked signer. The gate runs before the floor-derived policy value is
+read and fails closed regardless of local policy, including `off`, and
+regardless of any floor. A floor cannot relax this rule.
+
 ## Out of scope (future work)
 
 Publish-time author-side DSSE signing is implemented by `owenloop publish`.

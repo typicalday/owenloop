@@ -14,6 +14,8 @@ import type { BundleIngestor, StoreInstructionSource } from '../../../../src/sto
 import { globalStoreRoot } from '../../../../src/store/resolve.ts';
 import type { StepDef, WorkflowDef } from '../../../../src/types.ts';
 import type { DefPolicy, DefVerdict } from '../../../../src/crypto/verify-publication.ts';
+import { mergePolicyFloorWithLocal } from '../../../../src/crypto/policy-floor.ts';
+import type { PolicyFloor } from '../../../../src/crypto/records.ts';
 import {
   createExecutionDefinitionVerifier,
   resolveDefPolicy,
@@ -75,6 +77,8 @@ export interface StoreInstructionResolverOptions {
   definitionVerifier?: DefinitionVerifier;
   /** Explicit policy override; otherwise env > settings file > warn. */
   defPolicy?: DefPolicy;
+  /** Already-verified organization floor; absent means local policy only. */
+  policyFloor?: PolicyFloor;
   /** Diagnostic sink for `defPolicy=warn`. Defaults to stderr. */
   warn?: (line: string) => void;
   /** Injected environment used for policy resolution. */
@@ -132,7 +136,10 @@ export function createStoreInstructionResolver(
   const env = options.env ?? {};
   let policy: DefPolicy | undefined;
   const readPolicy = (): DefPolicy => {
-    policy ??= resolveDefPolicy(env, options.defPolicy);
+    policy ??= mergePolicyFloorWithLocal(
+      resolveDefPolicy(env, options.defPolicy),
+      options.policyFloor,
+    ).effective;
     return policy;
   };
   const warn = options.warn ?? ((line: string): void => void console.error(line));
@@ -217,6 +224,7 @@ export function createDefaultStoreInstructionResolver(args: {
   verifier?: BundleIngestor;
   definitionVerifier?: DefinitionVerifier;
   defPolicy?: DefPolicy;
+  policyFloor?: PolicyFloor;
   warn?: (line: string) => void;
 }): InstructionResolver {
   const home = [args.env.HOME, args.env.USERPROFILE].find(
@@ -240,6 +248,7 @@ export function createDefaultStoreInstructionResolver(args: {
     source,
     definitionVerifier: args.definitionVerifier ?? createExecutionDefinitionVerifier({ env: args.env }),
     ...(args.defPolicy !== undefined ? { defPolicy: args.defPolicy } : {}),
+    ...(args.policyFloor !== undefined ? { policyFloor: args.policyFloor } : {}),
     ...(args.warn !== undefined ? { warn: args.warn } : {}),
     env: args.env,
   });

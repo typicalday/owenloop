@@ -272,6 +272,24 @@ export type {
   VerifiedSignature,
 } from './crypto/index.ts';
 
+// ---- policy floors ----
+export {
+  DEF_POLICY_RANK,
+  POLICY_FLOOR_PRESETS,
+  floorDefPolicyMinimum,
+  mergePolicyFloorWithLocal,
+  policyFloorGaps,
+  stricterDefPolicy,
+  verifyPolicyFloorRecord,
+} from './crypto/index.ts';
+export type {
+  PolicyFloorGap,
+  PolicyFloorMergeResult,
+  PolicyFloorVerdict,
+  VerifyPolicyFloorInput,
+  VerifyPolicyFloorOptions,
+} from './crypto/index.ts';
+
 export {
   buildGraph,
   buildTrace,
