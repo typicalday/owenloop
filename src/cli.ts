@@ -76,13 +76,27 @@ import {
 import { PrincipalKeyManager } from './crypto/keys.ts';
 import type { PrincipalKeyRef } from './crypto/keys.ts';
 import { createHash } from 'node:crypto';
-import { DSSE_SSH_NAMESPACE, decodeBase64Strict, dsseSignEnrollmentGrant, dsseSignPublication, dsseSignRevocation } from './crypto/dsse.ts';
+import {
+  DSSE_SSH_NAMESPACE,
+  decodeBase64Strict,
+  dsseSignEnrollmentGrant,
+  dsseSignOrigin,
+  dsseSignPublication,
+  dsseSignRevocation,
+} from './crypto/dsse.ts';
 import { assertEd25519PubText, createSshSigner, SshSignerError } from './crypto/ssh.ts';
 import { publicKeyDescriptor } from './crypto/keys.ts';
 import { DEFAULT_MACHINE_SCOPE, buildEnrollmentGrant, verifyRosterEntry } from './crypto/enrollment.ts';
 import type { RosterVerdict } from './crypto/enrollment.ts';
 import { resolveAllowedSigners } from './crypto/trust-roots.ts';
-import type { EnrollmentGrantRecord, PrincipalReference, PublicationRecord, RevocationRecord } from './crypto/records.ts';
+import type {
+  EnrollmentGrantRecord,
+  OriginRecord,
+  OriginSource,
+  PrincipalReference,
+  PublicationRecord,
+  RevocationRecord,
+} from './crypto/records.ts';
 import {
   orgRootPrivateKeyPath,
   orgRootPublicKeyPath,
@@ -179,6 +193,9 @@ import type {
 import { owenloopSettingsPath, readOwenloopSettingsRaw, writeOwenloopHubOrigin } from './work-settings.ts';
 import { globalConfigPath, writeGlobalConfig } from './global-config.ts';
 import { canonicalJsonBytes, defaultRecoveryMarkerDir, ensureDirectoryPathNoSymlink, guardStateFile } from './install.ts';
+import { summarizeIssues, validateValue } from './schema.ts';
+import type { JsonSchema } from './types.ts';
+import { originSchema } from './schemas/index.ts';
 
 // Re-export the keychain backend type so existing test imports of `Keychain`
 // from `../src/cli.ts` (test/hubkit.ts, test/login.test.ts) keep resolving —
@@ -717,6 +734,24 @@ function publishOutput(args: Args): string | undefined {
   return value;
 }
 
+/** Parse and validate the signer-supplied provenance object before key work. */
+function publishSource(args: Args): OriginSource | undefined {
+  const raw = last(args, 'source');
+  if (raw === undefined) return undefined;
+  const value = parseJson(raw);
+  const properties = (originSchema as unknown as { properties?: Record<string, JsonSchema> }).properties;
+  const sourceSchema = properties?.source;
+  if (sourceSchema === undefined) throw new CliError('owenloop publish: origin schema has no source property');
+  const shape = validateValue(sourceSchema, value);
+  if (!shape.valid) {
+    throw new CliError(`owenloop publish: --source does not match origin source schema: ${summarizeIssues(shape.issues)}`);
+  }
+  if (value.kind === 'console') {
+    throw new CliError('owenloop publish: --source kind "console" requires a client-side signing ceremony');
+  }
+  return value as unknown as OriginSource;
+}
+
 /** Refuse an output or sidecar path that is not absent or a regular file. */
 function assertPublishOutputPath(path: string, label: string): void {
   const existing = lstatSync(path, { throwIfNoEntry: false });
@@ -746,12 +781,19 @@ function removePublicationSidecar(path: string): void {
  */
 async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
   if (args.positionals.length !== 2) {
-    throw new CliError('invalid publish arguments; usage: owenloop publish <source-dir> [--output <bundle.wnlp>] [--unsigned]');
+    throw new CliError(
+      'invalid publish arguments; usage: owenloop publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned]',
+    );
   }
   const source = need(args, 1, 'source-dir');
   const sourceAbs = resolve(io.cwd, source);
   const outputOpt = publishOutput(args);
   if (outputOpt !== undefined) assertOutputOutsideSource(resolve(io.cwd, outputOpt), sourceAbs);
+  const originSource = publishSource(args);
+  const unsigned = flag(args, 'unsigned');
+  if (originSource !== undefined && unsigned) {
+    throw new CliError('owenloop publish: --source cannot be combined with --unsigned');
+  }
 
   const binding = readHubBinding(hubBindingPath(io.cwd));
   if (!binding) throw new CliError('this project is not bound to a hub — run `owenloop connect` first');
@@ -762,10 +804,10 @@ async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
     throw new CliError(`${(e as Error).message} — re-run \`owenloop connect\` to rebind`);
   }
 
-  const unsigned = flag(args, 'unsigned');
   const keys = io.principalKeys ?? new PrincipalKeyManager({ env: io.env });
   let packed: ReturnType<typeof packBundle>;
   let envelope: unknown;
+  let originEnvelope: unknown;
 
   if (unsigned) {
     packed = runBundle(() => packBundle(sourceAbs));
@@ -786,19 +828,34 @@ async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
       // Constructing the signer probes ssh-keygen -Y before packBundle runs.
       const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: keyPath });
       const nextPacked = runBundle(() => packBundle(sourceAbs));
+      const timestamp = nowMs();
       const record: PublicationRecord = {
         digest: nextPacked.digest,
         name: nextPacked.manifest.package.name,
         version: nextPacked.manifest.package.version,
         publisherKeyId: publicKey.keyid,
-        timestamp: nowMs(),
+        timestamp,
       };
       const payloadBytes = Buffer.from(canonicalJsonBytes(record));
       const result = await dsseSignPublication(payloadBytes, signer);
-      return { envelope: result.envelope, packed: nextPacked };
+      let signedOrigin: unknown;
+      if (originSource !== undefined) {
+        const originRecord: OriginRecord = {
+          digest: nextPacked.digest,
+          name: nextPacked.manifest.package.name,
+          version: nextPacked.manifest.package.version,
+          source: originSource,
+          attesterKeyId: publicKey.keyid,
+          timestamp,
+        };
+        const originResult = await dsseSignOrigin(Buffer.from(canonicalJsonBytes(originRecord)), signer);
+        signedOrigin = originResult.envelope;
+      }
+      return { envelope: result.envelope, originEnvelope: signedOrigin, packed: nextPacked };
     });
     packed = signed.packed;
     envelope = signed.envelope;
+    originEnvelope = signed.originEnvelope;
   }
 
   const outputAbs = resolve(
@@ -807,9 +864,11 @@ async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
   );
   assertOutputOutsideSource(outputAbs, sourceAbs);
   const envelopePath = `${outputAbs}.dsse`;
+  const originPath = `${outputAbs}.origin.dsse`;
   const markerPath = `${outputAbs}.unsigned`;
   assertPublishOutputPath(outputAbs, 'output');
   assertPublishOutputPath(envelopePath, 'sidecar');
+  assertPublishOutputPath(originPath, 'sidecar');
   assertPublishOutputPath(markerPath, 'sidecar');
 
   writeBundleFileAtomic(outputAbs, packed.bytes, 'owenloop publish');
@@ -817,6 +876,7 @@ async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
     const marker = { formatVersion: 1, digest: packed.digest, signed: false };
     writeBundleFileAtomic(markerPath, canonicalJsonBytes(marker), 'owenloop publish');
     removePublicationSidecar(envelopePath);
+    removePublicationSidecar(originPath);
     print(io, {
       ok: true,
       bundle: outputAbs,
@@ -829,6 +889,11 @@ async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
   } else {
     writeBundleFileAtomic(envelopePath, canonicalJsonBytes(envelope), 'owenloop publish');
     removePublicationSidecar(markerPath);
+    if (originSource !== undefined && originEnvelope !== undefined) {
+      writeBundleFileAtomic(originPath, canonicalJsonBytes(originEnvelope), 'owenloop publish');
+    } else {
+      removePublicationSidecar(originPath);
+    }
     print(io, {
       ok: true,
       bundle: outputAbs,
@@ -837,6 +902,7 @@ async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
       version: packed.manifest.package.version,
       signed: true,
       envelope: envelopePath,
+      ...(originSource !== undefined ? { origin: originPath } : {}),
     });
   }
   return 0;
@@ -1209,7 +1275,7 @@ Commands:
   bundle unpack <bundle.wnlp> <destination-dir>       unpack a .wnlp bundle into a new directory
   bundle inspect <bundle.wnlp>           strictly validate a .wnlp bundle and print its manifest/entries
   bundle digest <bundle.wnlp>            print the bundle's def digest (SHA-256 of the canonical tar)
-  publish <source-dir> [--output <bundle.wnlp>] [--unsigned]
+  publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned]
                                          pack a bundle and sign its canonical digest (signed by default)
   trust init [--force]                  create the local Ed25519 enrollment root
   trust grant --key <pubkey-path> --principal <kind>:<id> [--pools a,b|*] [--labels a,b|*] [--namespaces a,b|*] [--delegate no|<n>|unbounded] [--signing-key <path>] [--output <file>]
@@ -1310,7 +1376,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['login', cmdOpts('hub', 'with-token', 'as')],
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
-  ['publish', cmdOpts('unsigned', 'output')],
+  ['publish', cmdOpts('unsigned', 'output', 'source')],
   ['trust', cmdOpts('force', 'key', 'principal', 'pools', 'labels', 'namespaces', 'delegate', 'signing-key', 'output', 'reason', 'effective-from')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],

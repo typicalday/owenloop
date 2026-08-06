@@ -28,7 +28,7 @@
           "required": ["kind", "repo", "commit"],
           "properties": {
             "kind": { "const": "git" },
-            "repo": { "type": "string", "minLength": 1 },
+            "repo": { "type": "string" },
             "commit": {
               "type": "string",
               "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
@@ -41,7 +41,7 @@
           "required": ["kind", "user"],
           "properties": {
             "kind": { "const": "console" },
-            "user": { "type": "string", "minLength": 1 }
+            "user": { "type": "string" }
           }
         },
         {
@@ -50,8 +50,8 @@
           "required": ["kind", "agent", "session"],
           "properties": {
             "kind": { "const": "agent" },
-            "agent": { "type": "string", "minLength": 1 },
-            "session": { "type": "string", "minLength": 1 }
+            "agent": { "type": "string" },
+            "session": { "type": "string" }
           }
         }
       ]
