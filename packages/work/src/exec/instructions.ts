@@ -11,14 +11,22 @@
 import { join } from 'node:path';
 import { createBundleIngestor, createStoreInstructionSource } from '../../../../src/store/index.ts';
 import type { BundleIngestor, StoreInstructionSource } from '../../../../src/store/index.ts';
-import { globalStoreRoot } from '../../../../src/store/resolve.ts';
+import { readWorkflowStoreIndex } from '../../../../src/store/index-file.ts';
+import { projectStoreRoot, probeStoreRoot, storeIndexPath, globalStoreRoot } from '../../../../src/store/resolve.ts';
+import { parseWorkflowCoordinate } from '../../../../src/store/types.ts';
 import type { StepDef, WorkflowDef } from '../../../../src/types.ts';
 import type { DefPolicy, DefVerdict } from '../../../../src/crypto/verify-publication.ts';
+import { evaluateOriginRule, matchOriginRule } from '../../../../src/crypto/origin-rules.ts';
+import type { OriginRuleMatch, OriginRules } from '../../../../src/crypto/origin-rules.ts';
+import type { OriginVerdict } from '../../../../src/crypto/verify-origin.ts';
 import { mergePolicyFloorWithLocal } from '../../../../src/crypto/policy-floor.ts';
 import type { PolicyFloor } from '../../../../src/crypto/records.ts';
 import {
   createExecutionDefinitionVerifier,
+  createExecutionOriginVerifier,
   resolveDefPolicy,
+  resolveOriginPolicy,
+  resolveOriginRules,
 } from '../../../../src/store/pre-commit-verifier.ts';
 import type { OrderPacket } from '../hub/types.ts';
 
@@ -28,7 +36,8 @@ export type InstructionRefusalKind =
   | 'integrity'
   | 'no-digest'
   | 'missing-command'
-  | 'unverified-def';
+  | 'unverified-def'
+  | 'origin-policy';
 
 export interface InstructionRefusal {
   ok: false;
@@ -68,6 +77,14 @@ export interface DefinitionVerifierInput {
  */
 export type DefinitionVerifier = (input: DefinitionVerifierInput) => Promise<DefVerdict> | DefVerdict;
 
+/** Execution-time origin verifier bound to installed bundle evidence. */
+export interface OriginVerifierInput {
+  bundleDigest: string;
+  objectPath: string;
+}
+
+export type OriginVerifier = (input: OriginVerifierInput) => Promise<OriginVerdict> | OriginVerdict;
+
 export interface StoreInstructionResolverOptions {
   projectRoot?: string;
   globalRoot: string;
@@ -75,11 +92,17 @@ export interface StoreInstructionResolverOptions {
   source?: StoreInstructionSource;
   /** Optional execution-time publication verifier. Omitted means publication trust is unverifiable and command orders refuse. */
   definitionVerifier?: DefinitionVerifier;
-  /** Explicit policy override; otherwise env > settings file > warn. */
+  /** Optional execution-time origin verifier. */
+  originVerifier?: OriginVerifier;
+  /** Explicit publication policy override; otherwise env > settings file > warn. */
   defPolicy?: DefPolicy;
+  /** Explicit origin policy override; otherwise env > settings file > warn. */
+  originPolicy?: DefPolicy;
+  /** Explicit namespace-scoped origin rules. */
+  originRules?: OriginRules;
   /** Already-verified organization floor; absent means local policy only. */
   policyFloor?: PolicyFloor;
-  /** Diagnostic sink for `defPolicy=warn`. Defaults to stderr. */
+  /** Diagnostic sink for `defPolicy=warn` and `originPolicy=warn`. Defaults to stderr. */
   warn?: (line: string) => void;
   /** Injected environment used for policy resolution. */
   env?: Record<string, string | undefined>;
@@ -134,13 +157,21 @@ export function createStoreInstructionResolver(
     verifier: options.verifier,
   });
   const env = options.env ?? {};
-  let policy: DefPolicy | undefined;
-  const readPolicy = (): DefPolicy => {
-    policy ??= mergePolicyFloorWithLocal(
+  let mergedPolicies: ReturnType<typeof mergePolicyFloorWithLocal> | undefined;
+  const readPolicies = (): ReturnType<typeof mergePolicyFloorWithLocal> => {
+    mergedPolicies ??= mergePolicyFloorWithLocal(
       resolveDefPolicy(env, options.defPolicy),
       options.policyFloor,
-    ).effective;
-    return policy;
+      resolveOriginPolicy(env, options.originPolicy),
+    );
+    return mergedPolicies;
+  };
+  const readPolicy = (): DefPolicy => readPolicies().effective;
+  const readOriginPolicy = (): DefPolicy => readPolicies().originPolicy;
+  let originRules: OriginRules | undefined;
+  const readOriginRules = (): OriginRules => {
+    originRules ??= resolveOriginRules(env, options.originRules);
+    return originRules;
   };
   const warn = options.warn ?? ((line: string): void => void console.error(line));
 
@@ -180,20 +211,131 @@ export function createStoreInstructionResolver(
   const refuseUnverified = (order: OrderPacket, verdict: DefVerdict): InstructionRefusal =>
     refusal('unverified-def', order, verdictDescription(verdict));
 
+  interface IndexedOriginRule {
+    coordinate: string;
+    namespace: string;
+    match: OriginRuleMatch;
+  }
+
+  type OriginRuleResolution =
+    | { kind: 'none' }
+    | { kind: 'unknown' }
+    | { kind: 'match'; match: OriginRuleMatch; entries: IndexedOriginRule[] }
+    | { kind: 'ambiguous'; entries: IndexedOriginRule[] };
+
+  const recoverOriginRule = (
+    bundleDigest: string,
+    rules: OriginRules,
+  ): OriginRuleResolution => {
+    const roots = [
+      options.projectRoot === undefined ? undefined : projectStoreRoot(options.projectRoot),
+      projectStoreRoot(options.globalRoot),
+    ].filter((root): root is string => root !== undefined);
+    const uniqueRoots = [...new Set(roots)];
+    const entries: IndexedOriginRule[] = [];
+    let foundCoordinate = false;
+
+    for (const root of uniqueRoots) {
+      if (probeStoreRoot(root) !== 'dir') continue;
+      const index = readWorkflowStoreIndex(storeIndexPath(root));
+      for (const [coordinate, entry] of Object.entries(index.entries)) {
+        if (entry.digest !== bundleDigest) continue;
+        foundCoordinate = true;
+        const { namespace } = parseWorkflowCoordinate(coordinate);
+        const match = matchOriginRule(rules, namespace);
+        if (match !== undefined) entries.push({ coordinate, namespace, match });
+      }
+    }
+
+    if (!foundCoordinate) return { kind: 'unknown' };
+    if (entries.length === 0) return { kind: 'none' };
+
+    const requirements = new Set(entries.map((entry) => entry.match.value));
+    if (requirements.size > 1) return { kind: 'ambiguous', entries };
+    return { kind: 'match', match: entries[0]!.match, entries };
+  };
+
+  const originFor = async (
+    resolved: ResolvedDefinition,
+  ): Promise<OriginVerdict> => {
+    if (options.originVerifier === undefined) {
+      return { kind: 'unverifiable', reason: 'execution-time origin verifier is not configured' };
+    }
+    try {
+      return await options.originVerifier({ bundleDigest: resolved.bundleDigest, objectPath: resolved.objectPath });
+    } catch (error) {
+      return { kind: 'unverifiable', reason: errorText(error) };
+    }
+  };
+
+  const originPolicyWarning = (
+    order: OrderPacket,
+    detail: string,
+  ): void => {
+    warn(`workflow definition '${order.defDigest}' was not admitted by origin policy; originPolicy=warn allows execution: ${detail}`);
+  };
+
+  const checkOrigin = async (
+    order: OrderPacket,
+    resolved: ResolvedDefinition,
+  ): Promise<InstructionRefusal | undefined> => {
+    const rules = readOriginRules();
+    const verdict = await originFor(resolved);
+    if (verdict.kind === 'invalid') {
+      return refusal('origin-policy', order, `invalid origin evidence: ${verdict.reason}`);
+    }
+    if (Object.keys(rules).length === 0) return undefined;
+
+    let resolution: OriginRuleResolution;
+    try {
+      resolution = recoverOriginRule(resolved.bundleDigest, rules);
+    } catch (error) {
+      return refusal('origin-policy', order, `could not recover the definition namespace from workflow-store indexes: ${errorText(error)}`);
+    }
+
+    const selectedPolicy = readOriginPolicy();
+    if (resolution.kind === 'none') return undefined;
+    if (resolution.kind === 'unknown') {
+      const detail = 'the definition digest is not indexed under any namespace, so its origin rule cannot be determined';
+      if (selectedPolicy === 'enforce') return refusal('origin-policy', order, detail);
+      if (selectedPolicy === 'warn') originPolicyWarning(order, detail);
+      return undefined;
+    }
+    if (resolution.kind === 'ambiguous') {
+      const detail = resolution.entries
+        .map((entry) => `${entry.namespace}=${entry.match.key} (${entry.match.value})`)
+        .join(', ');
+      const message = `the definition digest is indexed under namespaces with different origin rules: ${detail}`;
+      if (selectedPolicy === 'enforce') return refusal('origin-policy', order, message);
+      if (selectedPolicy === 'warn') originPolicyWarning(order, message);
+      return undefined;
+    }
+
+    const evaluation = evaluateOriginRule(resolution.match.value, verdict);
+    if (evaluation.ok) return undefined;
+    const detail = `${evaluation.kind} — ${evaluation.detail}; rule ${resolution.match.key} requires ${resolution.match.value}`;
+    if (selectedPolicy === 'enforce') return refusal('origin-policy', order, detail);
+    if (selectedPolicy === 'warn') originPolicyWarning(order, detail);
+    return undefined;
+  };
+
   const resolveAgentStep = async (order: OrderPacket): Promise<ResolvedStep | InstructionRefusal> => {
     const resolved = await resolveVerifiedStep(order);
     if (!resolved.ok) return resolved;
     const verdict = await trustFor(order, resolved);
-    if (verdict.kind === 'verified') return { ok: true, step: resolved.step };
 
     // Read the policy only after the execution-time verdict is known. This
     // keeps invalid signatures fail-closed and leaves command handling below
     // independent from policy lookup.
-    const selected = readPolicy();
-    if (verdict.kind === 'invalid' || selected === 'enforce') return refuseUnverified(order, verdict);
-    if (selected === 'warn') {
-      warn(`workflow definition '${order.defDigest}' is ${verdict.kind}; defPolicy=warn allows agent execution: ${verdict.kind === 'unverifiable' ? verdict.reason : 'no publication signature'}`);
+    if (verdict.kind !== 'verified') {
+      const selected = readPolicy();
+      if (verdict.kind === 'invalid' || selected === 'enforce') return refuseUnverified(order, verdict);
+      if (selected === 'warn') {
+        warn(`workflow definition '${order.defDigest}' is ${verdict.kind}; defPolicy=warn allows agent execution: ${verdict.kind === 'unverifiable' ? verdict.reason : 'no publication signature'}`);
+      }
     }
+    const originRefusal = await checkOrigin(order, resolved);
+    if (originRefusal !== undefined) return originRefusal;
     return { ok: true, step: resolved.step };
   };
 
@@ -205,6 +347,8 @@ export function createStoreInstructionResolver(
       // HARD RULE: command orders never consult defPolicy before this gate.
       // An unverified definition must never reach `/bin/sh -c`, including off.
       if (verdict.kind !== 'verified') return refuseUnverified(order, verdict);
+      const originRefusal = await checkOrigin(order, resolved);
+      if (originRefusal !== undefined) return originRefusal;
       if (typeof resolved.step.command !== 'string' || resolved.step.command.trim() === '') {
         return refusal('missing-command', order, 'the verified step has no non-empty command text');
       }
@@ -223,7 +367,10 @@ export function createDefaultStoreInstructionResolver(args: {
   env: Record<string, string | undefined>;
   verifier?: BundleIngestor;
   definitionVerifier?: DefinitionVerifier;
+  originVerifier?: OriginVerifier;
   defPolicy?: DefPolicy;
+  originPolicy?: DefPolicy;
+  originRules?: OriginRules;
   policyFloor?: PolicyFloor;
   warn?: (line: string) => void;
 }): InstructionResolver {
@@ -247,7 +394,10 @@ export function createDefaultStoreInstructionResolver(args: {
     verifier,
     source,
     definitionVerifier: args.definitionVerifier ?? createExecutionDefinitionVerifier({ env: args.env }),
+    originVerifier: args.originVerifier ?? createExecutionOriginVerifier({ env: args.env }),
     ...(args.defPolicy !== undefined ? { defPolicy: args.defPolicy } : {}),
+    ...(args.originPolicy !== undefined ? { originPolicy: args.originPolicy } : {}),
+    ...(args.originRules !== undefined ? { originRules: args.originRules } : {}),
     ...(args.policyFloor !== undefined ? { policyFloor: args.policyFloor } : {}),
     ...(args.warn !== undefined ? { warn: args.warn } : {}),
     env: args.env,

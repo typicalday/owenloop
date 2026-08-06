@@ -30,6 +30,7 @@ export {
   StoreIntegrityError,
   StoreConflictError,
   StoreDefinitionVerificationError,
+  StoreOriginPolicyError,
   StorePathError,
   BundleIngestorUnavailableError,
   PreCommitVerifierUnavailableError,
@@ -77,6 +78,14 @@ export {
 } from './install.ts';
 export { createBundleIngestor } from './ingestor.ts';
 export type { BundleIngestorOptions } from './ingestor.ts';
+
+// ---- WP-E2a origin execution policy ----
+export {
+  originEvidencePath,
+  persistOriginEvidence,
+  readOriginEvidence,
+} from './origin-evidence.ts';
+
 export {
   createStoreInstructionSource,
   isResolvableOrderDigest,
@@ -97,11 +106,15 @@ export type {
 } from './install.ts';
 export {
   createExecutionDefinitionVerifier,
+  createExecutionOriginVerifier,
   createPreCommitVerifier,
   createProductionPreCommitVerifier,
   resolveDefPolicy,
+  resolveOriginPolicy,
+  resolveOriginRules,
 } from './pre-commit-verifier.ts';
 export type {
   ExecutionDefinitionVerifierInput,
+  ExecutionOriginVerifierInput,
   PreCommitVerifierOptions,
 } from './pre-commit-verifier.ts';

@@ -84,6 +84,11 @@ export function floorDefPolicyMinimum(floor: PolicyFloor): DefPolicy {
   return floor.unsignedDefs === 'refuse' ? 'enforce' : 'warn';
 }
 
+/** Convert the frozen floor's origin axis to the parallel local policy. */
+export function originRulesMinimum(floor: PolicyFloor): DefPolicy {
+  return floor.originRules === 'enforced' ? 'enforce' : 'warn';
+}
+
 /** Return the stricter policy without assigning one policy over the other. */
 export function stricterDefPolicy(a: DefPolicy, b: DefPolicy): DefPolicy {
   return DEF_POLICY_RANK[a] >= DEF_POLICY_RANK[b] ? a : b;
@@ -91,7 +96,7 @@ export function stricterDefPolicy(a: DefPolicy, b: DefPolicy): DefPolicy {
 
 /** One unenforced floor axis carried for diagnostics instead of silently dropped. */
 export interface PolicyFloorGap {
-  axis: 'trustMode' | 'unsignedArtifacts' | 'originRules';
+  axis: 'trustMode' | 'unsignedArtifacts';
   value: string;
   reason: string;
 }
@@ -101,13 +106,16 @@ export interface PolicyFloorMergeResult {
   effective: DefPolicy;
   local: DefPolicy;
   raised: boolean;
+  /** Effective local origin policy after applying the verified floor. */
+  originPolicy: DefPolicy;
   gaps: PolicyFloorGap[];
 }
 
 /**
  * Presets are concrete wire values, not a second policy-level primitive. L1 and
- * L2 carry controls whose enforcement belongs to later packages; policyFloorGaps
- * reports those controls rather than pretending this package implements them.
+ * L2 still carry controls whose enforcement belongs to later packages;
+ * policyFloorGaps reports those controls rather than pretending this package
+ * implements them.
  */
 export const POLICY_FLOOR_PRESETS: Readonly<Record<'L0' | 'L1' | 'L2', PolicyFloor>> = Object.freeze({
   L0: Object.freeze({
@@ -143,31 +151,30 @@ export function policyFloorGaps(floor: PolicyFloor): PolicyFloorGap[] {
       value: floor.unsignedArtifacts,
       reason: 'unsignedArtifacts has no enforcement mechanism yet; signed submission records are a later package',
     },
-    {
-      axis: 'originRules',
-      value: floor.originRules,
-      reason: 'originRules has no enforcement mechanism yet; origin recording and source rules are later packages',
-    },
   ];
 }
 
 /**
- * Merge a verified floor as a strictness minimum. The optional argument is
- * intentional: every failed or absent verification path supplies no floor.
+ * Merge a verified floor as a strictness minimum on both policy axes. The
+ * optional origin argument preserves the existing two-argument API; callers
+ * that do not resolve origin policy receive the neutral local value `off`.
  */
 export function mergePolicyFloorWithLocal(
   local: DefPolicy,
   floor?: PolicyFloor,
+  localOriginPolicy: DefPolicy = 'off',
 ): PolicyFloorMergeResult {
   if (floor === undefined) {
-    return { effective: local, local, raised: false, gaps: [] };
+    return { effective: local, local, raised: false, originPolicy: localOriginPolicy, gaps: [] };
   }
   const floorMinimum = floorDefPolicyMinimum(floor);
   const effective = stricterDefPolicy(local, floorMinimum);
+  const originPolicy = stricterDefPolicy(localOriginPolicy, originRulesMinimum(floor));
   return {
     effective,
     local,
     raised: effective !== local,
+    originPolicy,
     gaps: policyFloorGaps(floor),
   };
 }

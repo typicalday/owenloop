@@ -87,9 +87,14 @@ export {
   StoreIntegrityError,
   StoreConflictError,
   StoreDefinitionVerificationError,
+  StoreOriginPolicyError,
   StorePathError,
   BundleIngestorUnavailableError,
   PreCommitVerifierUnavailableError,
+  createExecutionOriginVerifier,
+  originEvidencePath,
+  persistOriginEvidence,
+  readOriginEvidence,
 } from './store/index.ts';
 export type {
   BundleInstallResult,
@@ -98,6 +103,7 @@ export type {
   DefDigest,
   InstallWorkflowBundleArgs,
   PreCommitVerifier,
+  ExecutionOriginVerifierInput,
   RecoverWorkflowStoreArgs,
   ResolvedWorkflowObject,
   ResolveWorkflowCoordinateArgs,
@@ -278,6 +284,7 @@ export {
   POLICY_FLOOR_PRESETS,
   floorDefPolicyMinimum,
   mergePolicyFloorWithLocal,
+  originRulesMinimum,
   policyFloorGaps,
   stricterDefPolicy,
   verifyPolicyFloorRecord,
@@ -288,6 +295,22 @@ export type {
   PolicyFloorVerdict,
   VerifyPolicyFloorInput,
   VerifyPolicyFloorOptions,
+} from './crypto/index.ts';
+
+// ---- WP-E2a origin execution policy ----
+export {
+  ORIGIN_SOURCE_RANK,
+  OriginRulesError,
+  evaluateOriginRule,
+  matchOriginRule,
+  parseOriginRules,
+} from './crypto/index.ts';
+export type {
+  OriginPolicy,
+  OriginRuleEvaluation,
+  OriginRuleMatch,
+  OriginRuleValue,
+  OriginRules,
 } from './crypto/index.ts';
 
 export {
