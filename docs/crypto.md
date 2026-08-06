@@ -362,12 +362,103 @@ publication trust.
 The verifier does not write a verdict or sidecar into the immutable object
 directory. The object remains governed by the bundle manifest integrity map.
 
+## Enrollment chains, attenuation, and revocation
+
+Enrollment trust is separate from publication-signature trust. A key is trusted
+if and only if its enrollment chain terminates at the supplied local
+organization-root anchor. A hub or other remote coordinator may relay signed
+envelopes, but a remote assertion cannot make a key trusted.
+
+`validateEnrollmentChain` is the pure validator. Its input contains the target
+key ID, the org-root public-key text, signed grant envelopes, optional signed
+revocation envelopes, and an explicit validation instant `at` in epoch
+milliseconds. Every grant link is verified separately with a signer whose
+`allowed_signers` text contains exactly that link's parent key. A roster entry
+without a grant, a cycle, an ambiguous duplicate grant, or a chain that stops
+before the anchor is `invalid`; the validator never picks a convenient chain.
+A grant is also checked for its `validFrom` time and for the Ed25519 key type.
+
+The org root is an injected local anchor, not a wire field. Neither an
+`EnrollmentGrantRecord` nor a `RevocationRecord` contains an `org` field, and
+the root has no grant record. The walk terminates when the current key ID
+matches the key ID derived from the supplied anchor; that absence of a grant is
+what makes the key the root. Asking to validate the root itself succeeds at
+depth zero with `ORG_ROOT_SCOPE`.
+
+The result has three states:
+
+| verdict | meaning |
+|---|---|
+| `verified` | the chain reaches the local anchor, every link verifies, and all scope and revocation checks pass |
+| `unverifiable` | a local prerequisite cannot be used, such as a missing or malformed anchor or unusable `ssh-keygen` |
+| `invalid` | the supplied roster or revocation set is well-formed but does not establish the requested trust |
+
+There is no `unsigned` chain verdict. An absent grant for a non-root target is
+an invalid chain, not an unsigned one. `validateProducer` runs the same chain
+validation and then checks a requested `{ pool?, label?, namespace? }` demand
+against the target's effective scope.
+
+### Scope attenuation
+
+A child grant may be narrower than its parent's effective grant, never wider.
+For each of `pools`, `labels`, and `namespaces`, the containment rule is:
+
+| parent | child | result |
+|---|---|---|
+| `"*"` | any array or `"*"` | permitted |
+| string array | `"*"` | rejected as widening |
+| string array | string array | permitted only when every child value is in the parent array |
+
+An empty array is distinct from `"*"`: an empty array permits no values. The
+delegation limit attenuates separately. A parent with delegation disabled cannot
+sign a grant; an unbounded parent may delegate any child scope; a numeric parent
+with `maxDepth: N` may sign a non-delegating child or a child with numeric
+`maxDepth: M` where `M <= N - 1`. A numeric parent never permits an unbounded
+child. The org root starts with `ORG_ROOT_SCOPE`: all three axes are `"*"` and
+delegation is unbounded.
+
+### Revocation
+
+Validation applies signed revocations at the explicit `at` instant. A verified
+revocation whose `effectiveFrom <= at` kills the named key, and a chain with a
+dead link is invalid. Because descendants must walk through their ancestors,
+revocation cascades forward transitively without a separate descendant pass.
+A grant or artifact evaluated at an earlier `at` remains valid before the cut;
+revocation is forward-only.
+
+The revocation signer must be the org root or an ancestor of the revoked key
+whose delegation scope allows delegation. A backdated revocation
+(`effectiveFrom < issuedAt`) is org-root-only and is reported through the
+validator's injected backdated-revocation sink. The `backdated` field must agree
+with the timestamp comparison before signer authority is considered. A
+revocation of the org root itself is invalid rather than silently disabling the
+whole organization.
+
+### Local anchor and envelope files
+
+The optional filesystem loader derives paths from injected environment state:
+`XDG_CONFIG_HOME` wins over `HOME`; there is no ambient home-directory lookup.
+The local layout is:
+
+```text
+<config>/owenloop/org-root.pub                     # public anchor, 0644
+<config>/owenloop/org-root                         # private anchor, 0600
+<config>/owenloop/roster/<sha256hex(keyid)>.grant.dsse
+<config>/owenloop/revocations/<sha256hex(keyid)>.revocation.dsse
+```
+
+The root key is stored outside `PrincipalKeyManager` because the root is not a
+hub-scoped principal key. The containing directory is `0700`; the private root
+is never returned by the library or placed in an envelope. `loadRoster` and
+`loadRevocations` return raw envelope bytes to the pure validator and refuse
+symlinked or non-regular files.
+
 ## Out of scope (future work)
 
 Publish-time author-side DSSE signing is implemented by `owenloop publish`.
 Transport relay and the following extensions remain out of scope:
 
-- Key **rotation** and revocation wiring for stored principal keys.
+- Key **rotation** wiring for stored principal keys.
 - Certificate (`cert-authority`) chains and hardware-backed signing flows.
 - A pure-JS signer for hot paths (the `Signer` seam is already in place).
 - Threshold schemes beyond "N distinct trusted keys".
