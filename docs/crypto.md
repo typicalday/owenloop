@@ -132,12 +132,26 @@ project's bound hub origin. The signing chain is deliberately narrow:
    constructs the stock-OpenSSH signer.
 5. `dsseSignPublication(payloadBytes, signer)` signs the canonical JSON bytes of
    the publication record under `application/vnd.owenloop.publication.v1+json`.
+6. When `--source` is present, `dsseSignOrigin(originPayloadBytes, signer)` signs
+   the canonical JSON bytes of a separate origin record under
+   `application/vnd.owenloop.origin.v1+json`, using the same signer object and
+   signing scope as the publication record.
 
-The publication record's `digest` is the 64-hex SHA-256 digest of the
-uncompressed canonical tar returned by `packBundle`. The signer is constructed
-and the record is signed before `publish` writes the `.wnlp` bundle or either
-sidecar. The hub is only a remote coordinator recorded by the project binding;
-the hub signs nothing and cannot produce or complete the author signature.
+Both records bind the 64-hex SHA-256 digest of the uncompressed canonical tar
+returned by `packBundle`. The signer is constructed and the records are signed
+before `publish` writes the `.wnlp` bundle or any sidecar. Signed output writes
+the publication sidecar and, when `--source` is present, `<bundle>.origin.dsse`.
+A publish without `--source` removes a stale origin sidecar; unsigned publish
+also removes one because an unsigned origin would only be an unsigned label.
+The hub is only a remote coordinator recorded by the project binding. The hub
+stores or relays signed records but never signs, authors, derives, or defaults
+origin data and cannot produce or complete either author signature.
+
+The three origin source kinds are `git` (explicit repository identifier and
+commit SHA), `console` (authoring user identity from a client-side signing
+ceremony), and `agent` (agent identity and session). `attesterKeyId` is used only
+to select verification candidates; verification cross-checks the hint against
+the signer in the verified DSSE envelope.
 
 ### Reusing an existing SSH key (human only)
 
@@ -247,9 +261,8 @@ malformed input rejected — because Node's built-in decoder is permissive.
 SSHSIG signs and verifies this encoding under the namespace
 `owenloop-dsse-v1` (`DSSE_SSH_NAMESPACE`).
 
-Exactly six launch payload types are supported by the DSSE framing. Five are
-bound record classes in this package; the origin type remains reserved for the
-origin work package and is not included in this package's record schemas:
+Exactly six launch payload types are supported by the DSSE framing, and all six
+are bound record classes in this package:
 
 | constant | value |
 |---|---|
@@ -257,7 +270,7 @@ origin work package and is not included in this package's record schemas:
 | `PAYLOAD_TYPE_REVOCATION` | `application/vnd.owenloop.revocation.v1+json` |
 | `PAYLOAD_TYPE_SUBMISSION` | `application/vnd.owenloop.submission.v1+json` |
 | `PAYLOAD_TYPE_POLICY_FLOOR` | `application/vnd.owenloop.policy-floor.v1+json` |
-| `PAYLOAD_TYPE_ORIGIN` | `application/vnd.owenloop.origin.v1+json` (reserved) |
+| `PAYLOAD_TYPE_ORIGIN` | `application/vnd.owenloop.origin.v1+json` |
 | `PAYLOAD_TYPE_PUBLICATION` | `application/vnd.owenloop.publication.v1+json` |
 
 `DSSE_RECORD_PAYLOAD_TYPES` is the frozen, exported runtime allow-list, and
@@ -280,7 +293,7 @@ a `threshold` option requires that many distinct signers.
 
 The record shapes that ride these DSSE envelopes are documented in
 [`docs/wire-contracts.md`](wire-contracts.md). That document is the public
-reference for the six launch contracts, their schemas, and the versioning
+reference for the six bound record contracts, their schemas, and the versioning
 rule.
 
 ## The role of `allowed_signers`
@@ -325,9 +338,14 @@ structural output only; OpenSSH remains the authorization authority.
 ## Definition publication policy
 
 The install path verifies the mutually exclusive publication sidecars written by
-`publish`: `<bundle>.wnlp.dsse` or `<bundle>.wnlp.unsigned`. The `.dsse` sidecar
-is checked against the bundle digest and the local `allowed_signers` trust root.
-The trust-root path is `$XDG_CONFIG_HOME/owenloop/allowed_signers` when
+`publish`: `<bundle>.wnlp.dsse` or `<bundle>.wnlp.unsigned`. A signed publish may
+also write the optional `<bundle>.origin.dsse` sidecar. The publication `.dsse`
+sidecar is checked against the bundle digest and the local `allowed_signers`
+trust root. Origin verification is separate: `verifyOrigin` returns `absent`
+when the origin sidecar is missing, `verified` only after DSSE signature, schema,
+signer-key, and bundle-digest checks pass, and `unverifiable` or `invalid` for
+the corresponding failures. The trust-root path is
+`$XDG_CONFIG_HOME/owenloop/allowed_signers` when
 `XDG_CONFIG_HOME` is non-blank, or `$HOME/.config/owenloop/allowed_signers`
 otherwise. A missing or malformed trust root produces the distinct
 `unverifiable` verdict; a present signature that fails verification produces

@@ -40,7 +40,7 @@ matters for non-ASCII payload types or payload data.
 
 ## Versioned payload types
 
-The five bound records defined here use the existing media types:
+The six bound records defined here use the existing media types:
 
 | Record | Payload type |
 | --- | --- |
@@ -48,11 +48,12 @@ The five bound records defined here use the existing media types:
 | Revocation | `application/vnd.owenloop.revocation.v1+json` |
 | Submission | `application/vnd.owenloop.submission.v1+json` |
 | Policy floor | `application/vnd.owenloop.policy-floor.v1+json` |
+| Origin | `application/vnd.owenloop.origin.v1+json` |
 | Publication | `application/vnd.owenloop.publication.v1+json` |
 
-`application/vnd.owenloop.origin.v1+json` is reserved. Its record shape belongs
-to the origin work package and is intentionally not bound by the schemas in
-this package.
+Origin is a bound record class, not a label. Its source fields are signed
+content in a separate DSSE envelope, and the hub or another relay cannot write,
+derive, or default them.
 
 A contract change that removes a field, makes an optional field required, or
 narrows an accepted value is breaking. Such a change requires a new payload
@@ -102,6 +103,39 @@ not cover a gzip wrapper hash or a compiled-definition hash.
 The v1 publication object is closed: unknown properties are rejected. The
 publication payload type is bound to this record by the runtime DSSE allow-list,
 field manifest, and JSON Schema together.
+
+## Origin record
+
+Payload type: `application/vnd.owenloop.origin.v1+json`.
+
+An origin record is a signed provenance statement for one canonical workflow
+bundle. Its `digest` is the lowercase 64-hex SHA-256 digest of the exact
+uncompressed canonical tar inside the `.wnlp` bundle. The origin and publication
+records use the same digest and are signed inside the same signing scope with the
+same signer, but each record has its own DSSE envelope and sidecar.
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `digest` | yes | Canonical bundle digest: lowercase 64-hex SHA-256 over the uncompressed canonical tar. |
+| `name` | yes | Package name from the bundle manifest. |
+| `version` | yes | Package version from the bundle manifest. |
+| `source` | yes | Signed provenance union; one of the `git`, `console`, or `agent` forms below. |
+| `attesterKeyId` | yes | Untrusted candidate-selection hint for the signing key; verification cross-checks it against the verified signer. |
+| `timestamp` | yes | Unix epoch milliseconds when the author created the origin record. |
+
+`source` is a closed discriminated union:
+
+- `{ "kind": "git", "repo": "...", "commit": "..." }` records the
+  explicitly supplied repository identifier and a 40- or 64-hex commit SHA.
+- `{ "kind": "console", "user": "..." }` records the authoring user
+  identity from a client-side signing ceremony.
+- `{ "kind": "agent", "agent": "...", "session": "..." }` records the
+  agent identity and session.
+
+The source value is not derived by the hub. A caller supplies source data (for
+example through `owenloop publish --source '<json>'`), and the signer signs the
+resulting origin record. A remote coordinator stores or relays the signed record
+but never authors, stamps, or completes the origin.
 
 ## Enrollment grant
 

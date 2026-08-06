@@ -314,7 +314,8 @@ entrypoint-aware install validation; the pre-commit verifier remains unbound,
 so the CLI still fails closed rather than accepting an unverified bundle. There
 is no default accepting signature verifier; the `add` route does not consume
 publication sidecars or verify a bundle's signature. Use `owenloop publish` to
-create the `.wnlp` bundle plus a signed or explicitly unsigned sidecar.
+create the `.wnlp` bundle plus a signed publication sidecar and optional signed
+origin sidecar, or an explicitly unsigned marker.
 `--global` applies only to `.wnlp` bundle sources; a GitHub source with `--global`
 is refused before any network request. Resolution is
 deliberately split: execution resolves by **digest only** (project first,
