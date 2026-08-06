@@ -140,11 +140,13 @@ export type {
   AllowedSignersParseError,
 } from './allowed-signers.ts';
 
-// ---- WP-C2 publication verification ----
+// ---- publication and origin verification ----
 export { allowedSignersPath, resolveAllowedSigners, resolveAllowedSignersFile } from './trust-roots.ts';
 export type { AllowedSignersResolution, AllowedSignersPresent, AllowedSignersAbsent } from './trust-roots.ts';
 export { isDefPolicy, verifyPublication, verifyPublicationSidecar } from './verify-publication.ts';
 export type { DefPolicy, DefVerdict, VerifyPublicationInput, VerifyPublicationOptions } from './verify-publication.ts';
+export { verifyOrigin, verifyOriginSidecar } from './verify-origin.ts';
+export type { OriginVerdict, VerifyOriginInput, VerifyOriginOptions } from './verify-origin.ts';
 
 // ---- WP-D1 enrollment ----
 export {
