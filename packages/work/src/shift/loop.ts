@@ -220,6 +220,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   let cursor: number | undefined;
   let lastPresence = Number.NEGATIVE_INFINITY;
   let attendedAt: number | undefined;
+  /** Bumped whenever a ping starts or is forced due, so a ping that completes
+   *  after a force does not stamp the cadence over that force. */
+  let presenceGeneration = 0;
 
   function emit(event: ShiftEvent): void {
     if (opts.onEvent === undefined) return;
@@ -512,6 +515,13 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   async function iteration(): Promise<number> {
     // Presence when due (starts immediately — this shift exists to conduct).
     if (opts.now() - lastPresence >= opts.presenceIntervalMs) {
+      // `setShift` and `noteAttended` force the next ping by setting
+      // lastPresence to -Infinity. Either can land WHILE this ping is awaiting
+      // the hub, so record the generation first: on completion, only stamp the
+      // cadence if no force arrived in the meantime. Stamping unconditionally
+      // would swallow that sentinel and defer the newly recorded attendance or
+      // identity by a full presenceIntervalMs.
+      const generation = ++presenceGeneration;
       try {
         await opts.hub.presencePing({
           name: shiftName,
@@ -520,7 +530,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
           ...(opts.startedAt !== undefined ? { started_at: opts.startedAt } : {}),
           ...(attendedAt !== undefined ? { attended_at: attendedAt } : {}),
         });
-        lastPresence = opts.now();
+        if (generation === presenceGeneration) lastPresence = opts.now();
       } catch (e) {
         opts.err(`presence ping failed: ${errMsg(e)} (continuing)`);
       }
@@ -600,11 +610,13 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       if (next.name !== undefined) shiftName = next.name;
       if (next.serveCrews !== undefined) serveCrews = [...next.serveCrews];
       lastPresence = Number.NEGATIVE_INFINITY; // D6: next iterate() pings immediately
+      presenceGeneration++; // survive an in-flight ping completing after this
       return { name: shiftName, serveCrews: [...serveCrews] };
     },
     noteAttended: (at: number) => {
       attendedAt = at;
       lastPresence = Number.NEGATIVE_INFINITY;
+      presenceGeneration++; // survive an in-flight ping completing after this
     },
     getAttendedAt: () => attendedAt,
     noteRunEnded: (run: string) => {

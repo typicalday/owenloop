@@ -13,6 +13,7 @@ import { writeChildRecord } from '../src/shift/state.ts';
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle, NormalizedStepSpec } from '../src/bundle/types.ts';
 import type { Spawner } from '../src/shift/spawn.ts';
+import { until } from './helpers/mcp-stdio-client.ts';
 
 let root: string;
 let stateDir: string;
@@ -93,6 +94,47 @@ test('attendance is omitted before noteAttended and included after an immediate 
   assert.equal(pings.length, 2, 'attendance makes presence due without waiting for cadence');
   assert.equal(pings[1]!.attended_at, 1234);
   assert.equal(loop.getAttendedAt(), 1234);
+});
+
+test('attendance recorded DURING an in-flight ping still forces the very next ping', async () => {
+  // The lost-wakeup race. `noteAttended` forces presence due by setting
+  // lastPresence to -Infinity. A ping already awaiting the hub then completes
+  // and stamps lastPresence = now(), overwriting that sentinel — so the
+  // attendance the client just recorded would not reach the hub for a full
+  // presenceIntervalMs (60s in production) instead of on the next iteration.
+  const pings: Array<Record<string, unknown>> = [];
+  let releasePing: (() => void) | undefined;
+  const hub: HubClient = {
+    async wake() { return { text: '', cursor: 1, changed: false }; },
+    async presencePing(req) {
+      pings.push({ ...req });
+      // Park only the first ping, mid-flight, exactly where the race lives.
+      if (pings.length === 1) await new Promise<void>((resolve) => { releasePing = resolve; });
+      return { text: '', ok: true, name: req.name, lastSeen: 1 };
+    },
+    async whatsNext() { return { text: '', workflow: 'wf1', def: 'demo', orders: [] }; },
+    async getOrder(req) { return { text: '', workflow: req.workflow, run: req.run, order: null, lease: { claimed: true } }; },
+    async heartbeat() { return { text: '', ok: true }; },
+    async release() { return { text: '' }; },
+    async submit() { return { text: '' }; },
+    async whoami() { return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' }; },
+  };
+  // A frozen clock: without the fix nothing but the sentinel can make the
+  // second ping due, so this asserts the sentinel survives and nothing else.
+  const loop = createShiftLoop(baseOpts(hub, () => ({ pid: 1000 }), { now: () => 100 }));
+
+  const first = loop.iterate();
+  await until(() => releasePing !== undefined, 'the first presence ping to be in flight');
+  assert.equal('attended_at' in pings[0]!, false, 'no attendance recorded yet');
+
+  // The socket `next` arrives while the first ping is still awaiting the hub.
+  loop.noteAttended(1234);
+  releasePing!();
+  await first;
+
+  await loop.iterate();
+  assert.equal(pings.length, 2, 'attendance during an in-flight ping must still force the next ping');
+  assert.equal(pings[1]!.attended_at, 1234, 'the forced ping carries the recorded attendance');
 });
 
 test('successful command dispatch emits one dispatched event with the child pid', async () => {
