@@ -6,7 +6,7 @@
       "env": {
         "OWENLOOP_PLUGIN_VERSION": "0.5.0"
       },
-      "env_vars": ["HOME", "PATH", "XDG_CONFIG_HOME"]
+      "env_vars": ["HOME", "PATH", "XDG_CONFIG_HOME", "OWENLOOP_HUB", "OWENLOOP_NO_KEYCHAIN"]
     }
   }
 }

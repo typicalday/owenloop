@@ -45,13 +45,14 @@ import {
 } from '../credentials.ts';
 import type { CredentialIO } from '../credentials.ts';
 import {
-  credentialBackend,
+  DEFAULT_HUB,
   listStoredHubOrigins,
   normalizeOrigin,
   readStoredCredential,
   resolveEndpoint,
 } from '../hub.ts';
 import type { Credential, CredentialSlotSelector } from '../hub.ts';
+import { globalConfigPath, readGlobalConfig } from '../global-config.ts';
 import { createMcpServer, pumpStdin, textResult } from './server.ts';
 import type { LineStream, ToolRegistration, ToolResult } from './server.ts';
 
@@ -81,60 +82,68 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
 
 // ---- origin resolution ------------------------------------------------------
 
-/** The exit-2 ambiguity outcome; the caller prints `message` to stderr and returns 2. */
-type OriginResolution = { origin: string } | { exitCode: 2; message: string };
-
 /**
  * Resolve the hub origin this server binds to, precedence:
  *   1. `--hub <origin>` flag,
  *   2. `OWENLOOP_HUB` env,
- *   3. if the FILE credential backend holds exactly ONE hub with a valid `human`
- *      slot, use it,
- *   4. else exit 2 with a message naming BOTH remedies.
+ *   3. `~/.owenloop/config.json` (written by `owenloop login`; see
+ *      `src/global-config.ts`'s header for why this is a separate file from
+ *      the execution plane's `settings.json`),
+ *   4. if the FILE credential backend holds exactly ONE hub with a valid
+ *      `human` slot, use it (back-compat for a login that predates rung 3),
+ *   5. else `DEFAULT_HUB` (`src/hub.ts`) — the production hub.
  *
  * Rungs 1–2 normalize the origin (a malformed value throws a `CliError` → the
- * command's exit-1 path via `mainAsync`'s catch, matching every other command).
- * Rung 3 is file-backend-only because only the file backend can enumerate
- * (`listStoredHubOrigins`); `null` (cannot enumerate — keychain/external), `[]`
- * (nothing stored), and length>1 (ambiguous) each get a tailored exit-2 message.
+ * command's exit-1 path via `mainAsync`'s catch, matching every other
+ * command). Rung 3 reads `home` from `io.env.HOME`/`io.env.USERPROFILE` (the
+ * first non-blank of the two, mirroring `src/cli.ts`'s `workflowHome`) — but
+ * unlike `workflowHome`, an absent home does NOT throw here: it just means
+ * this rung has nothing to offer, same as a missing or malformed config file
+ * (`readGlobalConfig` never throws; see its doc comment in
+ * `src/global-config.ts`). Rung 4 is file-backend-only because only the file
+ * backend can enumerate (`listStoredHubOrigins`); `null` (cannot enumerate —
+ * keychain/external), `[]` (nothing stored), and length>1 (ambiguous) are ALL
+ * just "this rung has nothing to offer" and fall through to rung 5 — none of
+ * them is an error here.
  *
- * DELIBERATELY there is NO silent production fallback (the CLI's `resolveHub`
- * `DEFAULT_HUB` rung): a control-plane server must never bind to a hub the
- * operator did not name.
+ * This function used to stop at what is now rung 4 and exit 2 instead of
+ * falling through, with a comment reading: "DELIBERATELY there is NO silent
+ * production fallback (the CLI's `resolveHub` `DEFAULT_HUB` rung): a
+ * control-plane server must never bind to a hub the operator did not name."
+ * Two things were wrong with that rule:
+ *   1. `resolveHub` (`src/cli.ts:2667-2674`) — used by `login` (`:2869`),
+ *      `logout` (`:3173`), and `connect` (`:3193`) — ALREADY falls back to
+ *      `DEFAULT_HUB`. `capability` and `crew` use `resolveAgentHub` instead;
+ *      that resolver has no `DEFAULT_HUB` rung and still exits 2. The `login`
+ *      command that CREATES credentials defaults to production while MCP's
+ *      startup origin resolution exited 2 before it could reach any read or
+ *      write tool. That asymmetry was the real inconsistency.
+ *   2. The no-fallback rule bought no safety. With no credential for the
+ *      resolved origin, the server fails at the FIRST TOOL CALL with
+ *      `loginHint` (below): "not logged in to <origin> — run `owenloop login
+ *      --hub <origin>` in a terminal, then retry". That is a strictly better
+ *      failure than dying before `initialize` — the host shows an actionable
+ *      tool error instead of a dead server.
  */
-export function resolveMcpOrigin(io: McpIo, hubFlag: string | undefined): OriginResolution {
+export function resolveMcpOrigin(io: McpIo, hubFlag: string | undefined): string {
   const explicit = hubFlag ?? io.env.OWENLOOP_HUB;
   if (explicit !== undefined && explicit.trim() !== '') {
     try {
-      return { origin: normalizeOrigin(explicit) };
+      return normalizeOrigin(explicit);
     } catch (e) {
       throw new CliError((e as Error).message);
     }
   }
+  const home = [io.env.HOME, io.env.USERPROFILE].find((value) => value !== undefined && value.trim() !== '');
+  if (home !== undefined) {
+    const config = readGlobalConfig(globalConfigPath(home));
+    if (config !== null) return config.hub;
+  }
   const origins = listStoredHubOrigins(io.env, io.keychain);
-  if (origins === null) {
-    const backend = credentialBackend(io.env, io.keychain);
-    const which = backend.kind === 'external' ? 'external-command' : 'keychain';
-    return {
-      exitCode: 2,
-      message:
-        `cannot list stored hubs from the ${which} credential store — ` +
-        'pass --hub <origin> (or set OWENLOOP_HUB)',
-    };
+  if (origins !== null && origins.length === 1) {
+    return origins[0]!;
   }
-  if (origins.length === 0) {
-    return {
-      exitCode: 2,
-      message: 'no hub credentials stored — run `owenloop login --hub <origin>` first, or pass --hub <origin>',
-    };
-  }
-  if (origins.length > 1) {
-    return {
-      exitCode: 2,
-      message: `multiple hubs in the credential store (${origins.join(', ')}) — pass --hub <origin>`,
-    };
-  }
-  return { origin: origins[0]! };
+  return DEFAULT_HUB;
 }
 
 // ---- the authenticated hub client -------------------------------------------
@@ -764,17 +773,15 @@ async function shouldRegisterEnrollment(deps: McpDeps): Promise<boolean> {
 /**
  * Run the `owenloop mcp` command: resolve the origin, decide the enrollment
  * gate, build the tool list, construct the JSON-RPC server, and pump stdin until
- * EOF. Returns the process exit code: 2 on an origin-ambiguity (message to
- * stderr, nothing to stdout — stdout is the protocol channel), else 0 on stdin
- * EOF. A malformed `--hub`/`OWENLOOP_HUB` throws a `CliError` (exit-1 path).
+ * EOF. Returns the process exit code: always 0 on stdin EOF — origin
+ * resolution has no exit-2 path of its own anymore (see `resolveMcpOrigin`;
+ * it always resolves to some origin, falling back as far as `DEFAULT_HUB`).
+ * A malformed `--hub`/`OWENLOOP_HUB` still throws a `CliError` (exit-1 path,
+ * via `mainAsync`'s catch).
  */
 export async function runMcpCommand(io: McpIo, opts: { hubFlag?: string }): Promise<number> {
-  const resolved = resolveMcpOrigin(io, opts.hubFlag);
-  if ('exitCode' in resolved) {
-    io.err(resolved.message);
-    return resolved.exitCode;
-  }
-  const deps: McpDeps = { io, origin: resolved.origin };
+  const origin = resolveMcpOrigin(io, opts.hubFlag);
+  const deps: McpDeps = { io, origin };
 
   const tools = [...buildBaselineTools(deps), createAgentTool(deps), ...buildCrewTools(deps)];
   if (await shouldRegisterEnrollment(deps)) tools.push(stageEnrollmentTool(deps));

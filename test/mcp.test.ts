@@ -17,8 +17,12 @@
  *   - `create_agent` writes the minted `olp_` token straight to the store and
  *     NEVER lets any byte of the mint response body reach an outbound frame
  *     (the full-transcript no-`olp_` assertion);
- *   - origin resolution exits 2 (naming both remedies) on absent/ambiguous
- *     inference, and exit 1 on a malformed `--hub`;
+ *   - origin resolution walks a 5-rung ladder (`--hub` flag → `OWENLOOP_HUB`
+ *     env → `~/.owenloop/config.json` → a single inferred file-backend hub →
+ *     `DEFAULT_HUB`) and falls through silently at every rung except a
+ *     malformed `--hub`/`OWENLOOP_HUB`, which is the only origin error left
+ *     (exit 1) — absent or ambiguous inference now resolves to `DEFAULT_HUB`
+ *     instead of exiting 2;
  *   - the four crew tools are plain REST passthroughs (no response narrowing),
  *     `remove_crew_member`'s tolerant `removed:false` is never turned into a
  *     tool error, and `delete_crew` is NOT advertised (deliberately excluded).
@@ -26,12 +30,16 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { mainAsync } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
 import { storeCredential } from '../src/credentials.ts';
+import { DEFAULT_HUB } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
+import { globalConfigPath, writeGlobalConfig } from '../src/global-config.ts';
+import { resolveMcpOrigin } from '../src/mcp/serve.ts';
 import { kcHuman, kcKey, makeIo, OAUTH_METADATA, realHttpServer, routedFetch } from './hubkit.ts';
 import type { HubIo, RouteHandler } from './hubkit.ts';
 
@@ -61,8 +69,10 @@ interface Frame {
 /**
  * Drive the `mcp` command to completion: attach a `PassThrough` as stdin, run
  * `mainAsync`, feed each line + newline, then EOF. The command resolves on EOF
- * (exit 0) or earlier (exit 2 origin-ambiguity / exit 1 malformed hub). Returns
- * the exit code and every outbound JSON-RPC frame (parsed from `io.out`).
+ * (exit 0) or earlier (exit 1 on a malformed `--hub`/`OWENLOOP_HUB` — the only
+ * origin error left; absent/ambiguous inference now falls through to
+ * `DEFAULT_HUB` instead of exiting). Returns the exit code and every outbound
+ * JSON-RPC frame (parsed from `io.out`).
  */
 async function driveMcp(t: HubIo, argv: string[], lines: string[]): Promise<{ code: number; frames: Frame[] }> {
   const stdin = new PassThrough();
@@ -554,26 +564,36 @@ test('mcp: two concurrent create_agent calls both mint and both store (serialize
 
 // ---- origin resolution ------------------------------------------------------
 
-test('mcp: with no --hub, no OWENLOOP_HUB, and no stored hub (file backend) → exit 2 naming BOTH remedies, nothing on stdout', async () => {
-  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+test('mcp: with no --hub, no OWENLOOP_HUB, no config file, and no stored hub (file backend) → resolves to DEFAULT_HUB, NOT exit 2', async () => {
+  let fetchCalls = 0;
+  const fetch: typeof globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('unexpected network request in origin-fallback test');
+  };
+  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' }, fetch });
+  assert.equal(resolveMcpOrigin(t.io, undefined), DEFAULT_HUB, 'falls all the way through the ladder to the production default');
+
   const { code, frames } = await driveMcp(t, ['mcp'], [INIT]);
-  assert.equal(code, 2);
-  assert.equal(frames.length, 0, 'stdout (the protocol channel) stays empty on an origin error');
-  const msg = t.err.join('\n');
-  assert.match(msg, /owenloop login --hub/);
-  assert.match(msg, /--hub <origin>/);
+  assert.equal(fetchCalls, 0, 'origin fallback must not reach the network');
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.notEqual(frames[0]?.result?.serverInfo, undefined, 'the handshake completes instead of exiting before it');
 });
 
-test('mcp: with two stored file-backend hubs and no --hub → exit 2 (ambiguous), listing the origins', async () => {
-  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+test('mcp: with two stored file-backend hubs and no config file and no --hub → resolves to DEFAULT_HUB, NOT exit 2 (the behavior change)', async () => {
+  let fetchCalls = 0;
+  const fetch: typeof globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('unexpected network request in ambiguous-origin test');
+  };
+  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' }, fetch });
   await storeCredential(t.io, 'http://127.0.0.1:9', { principal: 'human' }, PASTED_HUMAN);
   await storeCredential(t.io, 'http://127.0.0.1:10', { principal: 'human' }, PASTED_HUMAN);
 
+  assert.equal(resolveMcpOrigin(t.io, undefined), DEFAULT_HUB, 'an ambiguous file-backend store now falls through instead of refusing');
+
   const { code } = await driveMcp(t, ['mcp'], [INIT]);
-  assert.equal(code, 2);
-  const msg = t.err.join('\n');
-  assert.match(msg, /multiple hubs/);
-  assert.match(msg, /127\.0\.0\.1/);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(fetchCalls, 0, 'ambiguous origin fallback must not reach the network');
 });
 
 test('mcp: exactly one stored file-backend hub is INFERRED with no --hub', async () => {
@@ -596,6 +616,102 @@ test('mcp: a malformed --hub is a CliError → exit 1', async () => {
   const { code } = await driveMcp(t, ['mcp', '--hub', 'not a url'], [INIT]);
   assert.equal(code, 1);
   assert.match(t.err.join('\n'), /error:/);
+});
+
+// REGRESSION — this is the exact bug: a real macOS install (keychain backend,
+// unenumerable) with a perfectly valid human credential already logged in,
+// and no env var set. Before this change, `owenloop mcp` exited 2 here even
+// though the operator had done everything right. Two angles on the same fact:
+// (a) drives the real command end to end with `owenloop login`'s config file
+// present, the honest post-fix shape; (b) calls `resolveMcpOrigin` directly
+// with NO config file, proving the ladder's rung 5 alone — not a config file
+// the user happens to have — is what stops the exit-2 regression from coming
+// back if rung 3 ever breaks.
+test('mcp: REGRESSION — keychain backend + a stored human credential + no --hub/env, with the config file login writes → starts instead of exiting 2', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/whats_next': () => ({ status: 200, json: { ok: true } }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch }); // default backend = fake keychain, unenumerable — the exact bug scenario
+  seedHuman(t, ORIGIN);
+  writeGlobalConfig(globalConfigPath(t.home), { version: 1, hub: ORIGIN });
+
+  const { code, frames } = await driveMcp(t, ['mcp'], [INIT, call(3, 'whats_next', {})]);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(resultJson(frames[1]!), { ok: true });
+  assert.ok(calls.some((c) => c.pathname === '/api/whats_next'));
+});
+
+test('mcp: REGRESSION — keychain backend + a stored human credential + no --hub/env/config file → resolveMcpOrigin still returns DEFAULT_HUB, never exit 2', () => {
+  const t = makeIo({}); // default backend = fake keychain, unenumerable — no config file written at all
+  seedHuman(t, ORIGIN); // a valid human credential IS present; it is simply unenumerable — that was the whole bug
+  assert.doesNotThrow(() => resolveMcpOrigin(t.io, undefined));
+  assert.equal(resolveMcpOrigin(t.io, undefined), DEFAULT_HUB);
+});
+
+test('mcp: resolveMcpOrigin — the --hub flag beats a config file naming a different hub', () => {
+  const t = makeIo({});
+  writeGlobalConfig(globalConfigPath(t.home), { version: 1, hub: 'http://127.0.0.1:20' });
+  assert.equal(resolveMcpOrigin(t.io, 'http://127.0.0.1:9'), 'http://127.0.0.1:9');
+});
+
+test('mcp: resolveMcpOrigin — OWENLOOP_HUB beats a config file (the dev override is preserved)', () => {
+  const t = makeIo({ env: { OWENLOOP_HUB: 'http://127.0.0.1:30' } });
+  writeGlobalConfig(globalConfigPath(t.home), { version: 1, hub: 'http://127.0.0.1:20' });
+  assert.equal(resolveMcpOrigin(t.io, undefined), 'http://127.0.0.1:30');
+});
+
+test('mcp: resolveMcpOrigin — the config file is used when neither --hub nor OWENLOOP_HUB is set', () => {
+  const t = makeIo({});
+  writeGlobalConfig(globalConfigPath(t.home), { version: 1, hub: 'http://127.0.0.1:40' });
+  assert.equal(resolveMcpOrigin(t.io, undefined), 'http://127.0.0.1:40');
+});
+
+test('mcp: resolveMcpOrigin — the config file (rung 3) beats a single inferred file-backend hub (rung 4)', async () => {
+  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  await storeCredential(t.io, 'http://127.0.0.1:50', { principal: 'human' }, PASTED_HUMAN);
+  writeGlobalConfig(globalConfigPath(t.home), { version: 1, hub: 'http://127.0.0.1:40' });
+  assert.equal(resolveMcpOrigin(t.io, undefined), 'http://127.0.0.1:40', 'rung 3 wins over the single-hub rung-4 inference');
+});
+
+test('mcp: resolveMcpOrigin — with nothing configured anywhere (keychain backend, nothing stored) → DEFAULT_HUB, no throw', () => {
+  const t = makeIo({});
+  assert.doesNotThrow(() => resolveMcpOrigin(t.io, undefined));
+  assert.equal(resolveMcpOrigin(t.io, undefined), DEFAULT_HUB);
+});
+
+test('mcp: resolveMcpOrigin — a corrupt config.json falls through to DEFAULT_HUB, never throws, never resolves to garbage', () => {
+  const write = (t: HubIo, content: string): void => {
+    mkdirSync(join(t.home, '.owenloop'), { recursive: true });
+    writeFileSync(globalConfigPath(t.home), content);
+  };
+
+  // Not valid JSON at all.
+  {
+    const t = makeIo({});
+    write(t, '{not json');
+    assert.doesNotThrow(() => resolveMcpOrigin(t.io, undefined));
+    assert.equal(resolveMcpOrigin(t.io, undefined), DEFAULT_HUB);
+  }
+  // Valid JSON, but no `hub` field.
+  {
+    const t = makeIo({});
+    write(t, JSON.stringify({ version: 1 }));
+    assert.equal(resolveMcpOrigin(t.io, undefined), DEFAULT_HUB);
+  }
+  // `hub` present but not a string.
+  {
+    const t = makeIo({});
+    write(t, JSON.stringify({ version: 1, hub: 12345 }));
+    assert.equal(resolveMcpOrigin(t.io, undefined), DEFAULT_HUB);
+  }
+  // `hub` is a string but does not parse as a valid http(s) origin.
+  {
+    const t = makeIo({});
+    write(t, JSON.stringify({ version: 1, hub: 'not a url' }));
+    assert.equal(resolveMcpOrigin(t.io, undefined), DEFAULT_HUB);
+  }
 });
 
 // ---- real loopback smoke ----------------------------------------------------

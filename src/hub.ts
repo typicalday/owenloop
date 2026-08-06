@@ -118,6 +118,17 @@ export function hashDefForHub(yaml: string): string {
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
 /**
+ * The production hub. The sole fallback rung for every hub-resolution ladder
+ * in this package that has one (`src/cli.ts`'s `resolveHub` and
+ * `resolveSetupHub`, `src/mcp/serve.ts`'s `resolveMcpOrigin`) — there must be
+ * exactly one literal `'https://api.owenloop.com'` in `src/`, and this is it.
+ * `resolveAgentHub` (`src/cli.ts`) deliberately has NO fallback to this
+ * constant: it mints credentials, and silently minting on the wrong org is
+ * not undone by a retry.
+ */
+export const DEFAULT_HUB = 'https://api.owenloop.com';
+
+/**
  * Normalize a hub URL to a bare origin (`scheme://host[:port]`), stripping any
  * path, query, trailing slash, and fragment. Requires an http(s) scheme. This
  * is the credential-store key and the project binding value, so it must be
@@ -731,11 +742,31 @@ export function readStoredCredential(origin: string, opts: ReadStoredCredentialO
  * Enumerate the hub origins that have a usable `human` credential stored, or
  * `null` when the active backend cannot be enumerated.
  *
- * Consumer: `owenloop mcp`'s origin inference (`resolveMcpOrigin` in
- * `src/mcp/serve.ts`). When the host spawns the server with neither `--hub` nor
- * `OWENLOOP_HUB`, the server tries to infer the single hub the user is logged
- * in to. That inference is only sound on the FILE backend, which can list its
- * `hubs` map; the keychain and external-command backends cannot enumerate:
+ * Three call sites — two in `src/cli.ts`, one in `src/mcp/serve.ts` — ask this
+ * question, each turning the same three possible results (`null`, `[]`,
+ * length>1) into a DIFFERENT outcome, from strictest to most lenient:
+ *
+ * - `resolveAgentHub` (`agent new`, `capability bind|unbind|list`, and
+ *   `crew`'s subcommands) — mutating, mint-like commands. Every non-single
+ *   result (`null`, `[]`, or length>1) is an immediate `CliError` (exit 2)
+ *   naming `--hub <origin>` as the fix. There is no `DEFAULT_HUB` fallback
+ *   here at all: silently minting against the production hub while the
+ *   operator is logged into a dev hub would mint on the wrong org, and a mint
+ *   is not undone by a retry.
+ * - `resolveSetupHub` (`setup`, `doctor`) — `null` or `[]` fall back to
+ *   `DEFAULT_HUB` with a printed notice so the operator can see what
+ *   happened; length>1 is still a `CliError` (exit 2) naming the origins,
+ *   because guessing among several logged-in hubs would be silently wrong for
+ *   someone who has more than one.
+ * - `resolveMcpOrigin` (`owenloop mcp`'s origin ladder) — the most lenient:
+ *   this is rung 4 of 5, tried only after `--hub`, `OWENLOOP_HUB`, and
+ *   `~/.owenloop/config.json` have all had nothing to offer. `null`, `[]`,
+ *   and length>1 are ALL just "this rung has nothing to offer either" and
+ *   fall through silently to rung 5 (`DEFAULT_HUB`) — there is no error path
+ *   left to reach from here.
+ *
+ * The backend determines whether enumeration is even possible in the first
+ * place, independent of which of the three callers is asking:
  *
  * - **file** → the origins in `readCredentialFile(credentialFilePath(env)).hubs`
  *   whose `human` slot parses as a well-formed `Credential` (`parseCredential`).
@@ -750,10 +781,10 @@ export function readStoredCredential(origin: string, opts: ReadStoredCredentialO
  * - **external** → `null`, for the same reason: the command answers a single
  *   `(origin, slot)` query; it has no listing contract.
  *
- * `null` (cannot enumerate), `[]` (nothing stored), and a length>1 result are
- * all distinct signals the caller turns into tailored exit-2 messages — this
- * function reports the fact, it never decides the outcome. It never logs or
- * echoes any credential; only the origin KEYS (never secrets) are returned.
+ * This function only reports the fact (and the backend-level reason behind
+ * it); it never decides the outcome — that is each caller's job, per the list
+ * above. It never logs or echoes any credential; only the origin KEYS (never
+ * secrets) are returned.
  *
  * `env`/`keychain` are threaded exactly as `readStoredCredential` threads them,
  * so a caller passing a fixture `env` stays hermetic.
