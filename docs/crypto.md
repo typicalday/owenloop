@@ -432,13 +432,19 @@ path retains the exact verified sidecar bytes outside the immutable object at
 `<store-root>/.owenloop/origins/<digest>.dsse`. Execution reads that retained
 file and verifies it again against the current local `allowed_signers` trust
 root; a later change to local trust material therefore takes effect at the
-execution boundary.
+execution boundary. Only a `verified` origin verdict is retained. A bundle
+carrying only `<bundle>.origin.dsse` — with neither a publication `.dsse` nor an
+unsigned marker — is refused at install for every origin-policy value, including
+`off`. `publish` never emits that shape; `--unsigned` removes both sidecars.
 
 Origin verification has four distinct verdicts:
 
 - `verified` — the origin DSSE signature, schema, signer key, and bundle digest
   all verify.
-- `absent` — a signed file publication has no origin sidecar.
+- `absent` — no origin bytes are available. For a signed file publication, this
+  means no sidecar was recorded. An unsigned publication or a non-file install
+  source also produces `absent`, but those definitions structurally cannot carry
+  an origin; those cases must not be described as “no origin was recorded.”
 - `unverifiable` — a prerequisite such as the local trust root or verifier is
   unavailable or unusable.
 - `invalid` — a present origin sidecar fails its signature, schema, signer, or
@@ -463,9 +469,15 @@ origin requirement, so `absent` and `unverifiable` pass that rule; a namespace
 with no matching rule has no origin requirement. A verified origin is the only
 verdict with a strength rank. `absent` and `unverifiable` fail a non-`any` rule
 with distinct diagnostics. No rule may make invalid evidence acceptable.
+Even with an empty `originRules` map, the default execution resolver invokes
+its origin verifier once per order; the expensive index reverse-scan is skipped,
+but invalid retained origin evidence still refuses.
 
 The local origin mode uses the same vocabulary as `defPolicy`:
-`enforce | warn | off`. `originPolicy` follows explicit host option, then
+`enforce | warn | off`. These are policy values, not trust modes. `Seamless`,
+`Strict`, and `Paranoid` are the separate trust-mode axis; `Seamless` maps to
+`warn` and `Strict` maps to `enforce`. `off` is a local operator escape hatch,
+not a trust mode. `originPolicy` follows explicit host option, then
 `OWENLOOP_ORIGIN_POLICY`, then the settings-file value, then the built-in
 `warn` default. The `originRules` map follows explicit host option, then the
 settings-file value, then an empty map; there is intentionally no environment

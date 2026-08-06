@@ -1706,8 +1706,9 @@ a permission to resolve an unprimed digest.
 An unknown or empty `defDigest`, an unknown step, a missing command on a command
 order, a failed object-integrity check, or an origin-policy failure is a named
 refusal. Origin-policy failures include invalid retained origin evidence,
-insufficient provenance for a recovered namespace, an ambiguous set of
-namespace rules, and an unknown namespace when the effective origin mode is
+insufficient provenance for a recovered namespace, the same digest indexed
+under namespaces with different selected origin requirements, and an unknown
+namespace when the effective origin mode is
 `enforce`. The worker does not fall back to a workflow name, a remotely
 supplied prompt or command, a closest digest, or an empty command. A
 `worker: command` order is never passed to the process runner unless the exact

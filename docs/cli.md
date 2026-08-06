@@ -669,16 +669,23 @@ rather than treating installed bytes as published trust.
 publication may include `<bundle>.origin.dsse`; installation verifies that
 sidecar against the local `allowed_signers` root and retains the exact bytes at
 `<store-root>/.owenloop/origins/<digest>.dsse`. Execution re-verifies the
-retained evidence against the current trust root. A hub or other remote
-coordinator may relay the sidecar, but never authors or supplies the origin
-rule.
+retained evidence against the current trust root. Only a `verified` origin
+verdict is retained. A bundle carrying only `<bundle>.origin.dsse` — with
+neither a publication `.dsse` nor an unsigned marker — is refused at install for
+every origin-policy value, including `off`. `publish` never emits that shape;
+`--unsigned` removes both sidecars. A hub or other remote coordinator may relay
+the sidecar, but never authors or supplies the origin rule.
 
-The origin mode uses the same values as `defPolicy` and follows the same scalar
-precedence: explicit host option, `OWENLOOP_ORIGIN_POLICY`, settings-file
-`originPolicy`, then `warn`. The rule map has no environment-variable spelling:
-explicit host `originRules`, then settings-file `originRules`, then an empty
-map. A namespace with no matching rule has no origin requirement. A malformed
-rule map is a named settings error, not an empty-policy fallback.
+The origin mode uses the same policy values as `defPolicy` — `enforce`, `warn`,
+and `off` — and follows the same scalar precedence: explicit host option,
+`OWENLOOP_ORIGIN_POLICY`, settings-file `originPolicy`, then `warn`. These are
+not trust modes: `Seamless`, `Strict`, and `Paranoid` are a separate axis;
+`Seamless` maps to `warn`, `Strict` maps to `enforce`, and `off` is a local
+operator escape hatch with no trust-mode equivalent. The rule map has no
+environment-variable spelling: explicit host `originRules`, then settings-file
+`originRules`, then an empty map. A namespace with no matching rule has no origin
+requirement. A malformed rule map is a named settings error, not an empty-policy
+fallback.
 
 Rules accept exact namespaces (`prod`), namespace prefixes (`prod*`), and
 trailing `/*` sugar (`prod/*`, equivalent to `prod`). `*` and `*/*` are
@@ -691,7 +698,10 @@ origins, and an `agent` rule accepts all three. `any` imposes no requirement.
 Origin verdicts remain distinct:
 
 - `verified` has a strength and is checked against the selected minimum.
-- `absent` means no sidecar was recorded.
+- `absent` means no origin bytes are available. For a signed file publication,
+  this means no sidecar was recorded. Unsigned publications and non-file install
+  sources also produce `absent`, but those definitions structurally cannot carry
+  an origin; those cases must not be described as “no origin was recorded.”
 - `unverifiable` means a prerequisite such as the trust root is unavailable.
 - `invalid` means present origin evidence failed verification and is refused at
   every origin mode, including `off`.
@@ -709,7 +719,9 @@ The table applies only when a rule matches. During execution, the driver
 recovers the namespace by reverse-scanning project and global store indexes for
 the bundle digest. Equivalent requirements deduplicate. Different requirements
 produce a named ambiguity refusal. If no coordinate is indexed, `enforce`
-refuses, `warn` warns, and `off` proceeds.
+refuses, `warn` warns, and `off` proceeds. With an empty `originRules` map, the
+default resolver still invokes the origin verifier once per order, but skips the
+expensive index reverse-scan; invalid retained origin evidence still refuses.
 
 A verified policy floor maps `originRules: advisory` to minimum
 `originPolicy=warn` and `originRules: enforced` to minimum
