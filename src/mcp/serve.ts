@@ -111,10 +111,13 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
  * production fallback (the CLI's `resolveHub` `DEFAULT_HUB` rung): a
  * control-plane server must never bind to a hub the operator did not name."
  * Two things were wrong with that rule:
- *   1. `resolveHub` (`src/cli.ts`) — used by `login`, capability/crew, and
- *      `connect` — ALREADY falls back to `DEFAULT_HUB`. The commands that
- *      CREATE credentials defaulted to production while the command that
- *      merely READS one exited 2. That asymmetry was the real inconsistency.
+ *   1. `resolveHub` (`src/cli.ts:2667-2674`) — used by `login` (`:2869`),
+ *      `logout` (`:3173`), and `connect` (`:3193`) — ALREADY falls back to
+ *      `DEFAULT_HUB`. `capability` and `crew` use `resolveAgentHub` instead;
+ *      that resolver has no `DEFAULT_HUB` rung and still exits 2. The `login`
+ *      command that CREATES credentials defaults to production while MCP's
+ *      startup origin resolution exited 2 before it could reach any read or
+ *      write tool. That asymmetry was the real inconsistency.
  *   2. The no-fallback rule bought no safety. With no credential for the
  *      resolved origin, the server fails at the FIRST TOOL CALL with
  *      `loginHint` (below): "not logged in to <origin> — run `owenloop login

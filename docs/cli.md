@@ -1090,14 +1090,20 @@ Unlike other commands this does **not** fall back to `OWENLOOP_HUB` or the
 built-in default hub — silently defaulting a mint would risk minting on the
 production hub while you're logged into a dev one. This is deliberately
 stricter than [`owenloop mcp`'s origin resolution](#choosing-the-hub-origin):
-`mcp` only ever reads state on your behalf, so a wrong guess there is just a
-tool call against the wrong (recoverable) hub, and it now falls all the way
-through to a default rather than stopping; `agent new` **mints** a new
-credential, a side effect a retry cannot undo, so it stops at step 3 instead
-of ever guessing. Note that hub enumeration itself is **file-store only**:
-the keychain and the external-command backend cannot list their entries, so
-on such a machine step 2 cannot enumerate the store and you must pass
-`--hub`.
+`mcp` exposes both reads and writes, including `create_agent` (which mints and
+stores an agent token), `create_workflow`, `publish_event`, `submit`,
+`stage_enrollment`, and crew mutations. The default remains acceptable for
+`mcp` because each tool call authenticates against the resolved origin; when no
+human credential exists there, the existing `loginHint` surfaces the origin
+and asks for `owenloop login --hub <origin>` before the tool-specific action
+runs. If a credential does exist at an unintended origin and `create_agent`
+mints there, the stored agent token is revocable; `--hub` and `OWENLOOP_HUB`
+remain available when the operator wants to avoid inference. `agent new`
+**mints** a new credential directly, a side effect a retry cannot undo, so it
+stops at step 3 instead of ever guessing. Note that hub enumeration itself is
+**file-store only**: the keychain and the external-command backend cannot list
+their entries, so on such a machine step 2 cannot enumerate the store and you
+must pass `--hub`.
 
 **`--crews <a,b>`.** A comma-separated list of crew names the token is granted
 on (trimmed, empties dropped). Omit the flag to let the hub default the token to
@@ -1663,20 +1669,30 @@ installation instructions before retrying the MCP tool call.
    from before step 3 existed).
 5. The built-in **default hub**, `https://api.owenloop.com`.
 
-Every rung after the first two **falls through silently** rather than
-stopping the server: a missing or corrupt config file, a `hub` value in it
-that doesn't parse as a valid origin, an unenumerable credential store (macOS
-Keychain or an external credential command — only the file backend can be
-listed at all), zero stored hubs, and more than one stored hub all just move
-on to the next rung. `owenloop mcp` never exits for an origin reason — this is
-deliberate: it is a long-running reader spawned automatically by an MCP host
-on every session start, not a one-shot command a human is watching, so a hard
-stop here would silently break the plugin on any machine using the Keychain
-backend (the macOS default) unless the operator remembered to set `--hub` or
-`OWENLOOP_HUB` first. Contrast this with [`agent new`](#agent-new--mint-an-agent-token-into-a-slot),
-which **mints** a new credential and therefore stops rather than ever
-guessing — a wrong guess there is a side effect a retry cannot undo, where a
-wrong guess here is just a tool call against the wrong (recoverable) hub.
+Every inference rung after the first two **falls through silently** rather
+than stopping the server: a missing or corrupt config file, a `hub` value in
+it that doesn't parse as a valid origin, an unenumerable credential store
+(macOS Keychain or an external credential command — only the file backend can
+be listed at all), zero stored hubs, and more than one stored hub all just
+move on to the next rung. `owenloop mcp` never exits for an inferred-origin
+reason — this is deliberate: it is a long-running process spawned
+automatically by an MCP host on every session start, not a one-shot command a
+human is watching, so a hard stop here would silently break the plugin on any
+machine using the Keychain backend (the macOS default) unless the operator
+remembered to set `--hub` or `OWENLOOP_HUB` first.
+
+The MCP surface is not read-only. It includes `create_agent`, which mints and
+stores a new agent token, plus state-changing tools such as `create_workflow`,
+`publish_event`, `submit`, `stage_enrollment`, and the crew mutations. The
+server still authenticates each tool call against the resolved origin. When no
+human credential exists at that origin, the first authenticated tool call
+returns `loginHint` with the origin and asks for `owenloop login --hub
+<origin>` before the tool-specific action runs. If a credential does exist at
+an unintended origin and `create_agent` mints there, the stored agent token is
+revocable; explicit `--hub` and `OWENLOOP_HUB` remain available to avoid
+inference. Contrast this with [`agent new`](#agent-new--mint-an-agent-token-into-a-slot),
+which **mints** a new credential directly and therefore stops rather than
+ever guessing — a wrong guess there is a side effect a retry cannot undo.
 
 **`~/.owenloop/config.json`** is written by
 [`login`](#login--authenticate-the-cli-against-a-hub): a small, non-secret
@@ -1792,7 +1808,7 @@ interactively.
 
 | variable | effect |
 |---|---|
-| `OWENLOOP_HUB` | hub origin when `--hub` is absent (rung 2 of origin resolution) |
+| `OWENLOOP_HUB` | development override for the hub origin (rung 2, above `~/.owenloop/config.json`) |
 | `OWENLOOP_MCP_ENROLLMENT` | `1` forces `stage_enrollment` on, `0` off; unset = probe the hub |
 | `OWENLOOP_MCP_PROBE_TIMEOUT_MS` | deadline for the `stage_enrollment` capability probe (default `3000`) |
 | `OWENLOOP_HUB_TIMEOUT_MS` | per-request hub timeout (shared with the other hub commands) |

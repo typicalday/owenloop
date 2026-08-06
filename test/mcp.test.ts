@@ -565,16 +565,27 @@ test('mcp: two concurrent create_agent calls both mint and both store (serialize
 // ---- origin resolution ------------------------------------------------------
 
 test('mcp: with no --hub, no OWENLOOP_HUB, no config file, and no stored hub (file backend) → resolves to DEFAULT_HUB, NOT exit 2', async () => {
-  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  let fetchCalls = 0;
+  const fetch: typeof globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('unexpected network request in origin-fallback test');
+  };
+  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' }, fetch });
   assert.equal(resolveMcpOrigin(t.io, undefined), DEFAULT_HUB, 'falls all the way through the ladder to the production default');
 
   const { code, frames } = await driveMcp(t, ['mcp'], [INIT]);
+  assert.equal(fetchCalls, 0, 'origin fallback must not reach the network');
   assert.equal(code, 0, t.err.join('\n'));
   assert.notEqual(frames[0]?.result?.serverInfo, undefined, 'the handshake completes instead of exiting before it');
 });
 
 test('mcp: with two stored file-backend hubs and no config file and no --hub → resolves to DEFAULT_HUB, NOT exit 2 (the behavior change)', async () => {
-  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  let fetchCalls = 0;
+  const fetch: typeof globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('unexpected network request in ambiguous-origin test');
+  };
+  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' }, fetch });
   await storeCredential(t.io, 'http://127.0.0.1:9', { principal: 'human' }, PASTED_HUMAN);
   await storeCredential(t.io, 'http://127.0.0.1:10', { principal: 'human' }, PASTED_HUMAN);
 
@@ -582,6 +593,7 @@ test('mcp: with two stored file-backend hubs and no config file and no --hub →
 
   const { code } = await driveMcp(t, ['mcp'], [INIT]);
   assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(fetchCalls, 0, 'ambiguous origin fallback must not reach the network');
 });
 
 test('mcp: exactly one stored file-backend hub is INFERRED with no --hub', async () => {

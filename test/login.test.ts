@@ -8,10 +8,12 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { statSync } from 'node:fs';
+import { mkdtempSync, readdirSync, statSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import type { Keychain } from '../src/cli.ts';
+import { globalConfigPath, readGlobalConfig } from '../src/global-config.ts';
 import { credentialFilePath, readCredentialFile, writeCredentialFile } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
 import { kcHuman, kcKey, makeIo, OAUTH_METADATA, routedFetch, stallingFetch, WHOAMI_BODY } from './hubkit.ts';
@@ -67,6 +69,7 @@ test('login: loopback OAuth stores an oauth credential in the keychain', async (
   const stored = JSON.parse(t.store.get(kcHuman(ORIGIN))!) as Credential;
   assert.equal(stored.kind, 'oauth');
   assert.equal(stored.accessToken, 'mcpat_access');
+  assert.deepEqual(readGlobalConfig(globalConfigPath(t.home)), { version: 1, hub: ORIGIN }, 'OAuth login records its normalized hub');
 
   // Verified against GET /api/whoami with the exchanged token before storing.
   const verify = calls.find((c) => c.pathname === '/api/whoami')!;
@@ -157,11 +160,42 @@ test('login --with-token: reads an olp_ agent token from stdin, verifies, and st
   const stored = JSON.parse(t.store.get(kcKey(ORIGIN, { principal: 'agent' }))!) as Credential;
   assert.equal(stored.accessToken, 'olp_org_secret');
   assert.equal(result.slot, 'agent:default');
+  assert.deepEqual(readGlobalConfig(globalConfigPath(t.home)), { version: 1, hub: ORIGIN }, '--with-token login records its normalized hub');
 
   // Verified via GET /api/whoami before storing, with the bearer token.
   const verify = calls.find((c) => c.pathname === '/api/whoami')!;
   assert.equal(verify.authorization, 'Bearer olp_org_secret');
   assert.doesNotMatch(t.out.join('\n') + t.err.join('\n'), /olp_org_secret/);
+});
+
+test('login --with-token: writes a normalized origin and last login wins', async () => {
+  const { fetch } = routedFetch({
+    'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }),
+  });
+  const t = makeIo({ fetch, stdin: 'olp_first' });
+  const secondOrigin = 'http://127.0.0.1:10';
+
+  assert.equal(await mainAsync(['login', '--hub', `${HUB}/some/path`, '--with-token'], t.io), 0, t.err.join('\n'));
+  assert.deepEqual(readGlobalConfig(globalConfigPath(t.home)), { version: 1, hub: ORIGIN }, 'the stored origin is normalized');
+
+  t.io.readStdin = async () => 'olp_second';
+  assert.equal(await mainAsync(['login', '--hub', secondOrigin, '--with-token'], t.io), 0, t.err.join('\n'));
+  assert.deepEqual(readGlobalConfig(globalConfigPath(t.home)), { version: 1, hub: secondOrigin }, 'the newest login replaces the previous origin');
+});
+
+test('login: a global config write failure warns but does not fail a successful login', async () => {
+  const { fetch } = routedFetch({
+    'GET /api/whoami': () => ({ status: 200, json: WHOAMI_BODY }),
+  });
+  const t = makeIo({ fetch, stdin: 'olp_tok' });
+  const redirectTarget = mkdtempSync(join(tmpdir(), 'owenloop-login-config-target-'));
+  symlinkSync(redirectTarget, join(t.home, '.owenloop'));
+
+  const code = await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.ok(t.store.has(kcHuman(ORIGIN)) || t.store.has(kcKey(ORIGIN, { principal: 'agent' })), 'the credential remains stored');
+  assert.ok(t.err.some((line) => line.includes('warning: could not write ~/.owenloop/config.json')));
+  assert.deepEqual(readdirSync(redirectTarget), [], 'the symlink target remains untouched');
 });
 
 test('login --with-token: an unverifiable token (401) is not stored', async () => {
