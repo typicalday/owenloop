@@ -194,12 +194,16 @@ export interface OrderPacket {
   consumes: Record<string, unknown>;
   /** Claim-time versions of the consumed inputs, when supplied by the hub. */
   consumedFingerprint?: Record<string, number>;
+  /** JSON-serialized map from artifact path to serialized DSSE submission envelope. */
+  consumesProof?: string;
   /** The owed outputs and their reason threads. */
   owes: Array<{
     path: string;
     judgmentRejects: number;
     schemaRejects: number;
     reasons: ReasonEntry[];
+    /** Serialized DSSE proof covering the complete reason thread. */
+    proof?: string;
   }>;
   cause?: string;
 }

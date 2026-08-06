@@ -167,6 +167,10 @@ async function runLoop(o: RunOpts = {}): Promise<Ran> {
     cwd: CWD,
     loadStep: async (): Promise<NormalizedStepSpec | null> => ({ step: 'builder', brief: TEMPLATE, permissions: { extensions: {} } }),
     resolveAdapter: () => resolution,
+    // This fixture exercises resume rendering, not the consume-side trust
+    // boundary. Admit the synthetic rejection thread so the loop can reach
+    // the resume paths under test.
+    consumedVerifier: async (order) => ({ ok: true as const, order, warnings: [] }),
     appendSession: (rec) => records.push(rec),
     nextAttempt: () => 2,
     latestSession: () => (o.prev === undefined ? priorSession() : o.prev),

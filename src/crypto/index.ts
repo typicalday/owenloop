@@ -152,6 +152,7 @@ export type { OriginVerdict, VerifyOriginInput, VerifyOriginOptions } from './ve
 export {
   DEF_POLICY_RANK,
   POLICY_FLOOR_PRESETS,
+  artifactPolicyMinimum,
   floorDefPolicyMinimum,
   mergePolicyFloorWithLocal,
   originRulesMinimum,
@@ -227,3 +228,11 @@ export type { OrgRootAbsent, OrgRootPresent, OrgRootResolution } from './org-roo
 export { canonicalValueBytes, valueDigestHex } from './canonical.ts';
 export { buildSubmissionRecord, signSubmission } from './submission.ts';
 export type { BuildSubmissionRecordInput, SubmissionProducedInput } from './submission.ts';
+
+// ---- WP-D3 consume-side verification ----
+export { verifyConsumed, verifyConsumedArtifact } from './verify-consumed.ts';
+export type {
+  ConsumedVerdict,
+  VerifyConsumedInput,
+  VerifyConsumedOptions,
+} from './verify-consumed.ts';

@@ -61,6 +61,7 @@ import { existsSync } from 'node:fs';
 import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.ts';
+import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import type {
   AgentEvent,
@@ -86,6 +87,7 @@ export type AgentRunOutcome =
   | 'misroute' // null packet, or a command order — released, not ours (exit 1)
   | 'no-template' // no cached bundle / no step spec for the step (exit 1)
   | 'no-harness' // the resolved harness id names no registered adapter (exit 1)
+  | 'unverified-consumed' // dynamic values or rejection reasons failed verification (exit 1)
   | 'no-submit' // the turn ended and the confirm grace expired with no outcome (exit 1)
   | 'killed' // a signal aimed at the worker tore the session down + released (exit 1)
   | 'lease-lost' // the lease went terminal without an outcome (exit 1)
@@ -144,6 +146,8 @@ export interface AgentRunLoopOptions {
   cwd: string;
   loadStep: StepLoader;
   resolveAdapter: AdapterResolver;
+  /** Gate dynamic values and rejection reasons before any prompt rendering. */
+  consumedVerifier?: ConsumedVerifier;
   /** Append one session record. Wired to `appendSession` by the role. */
   appendSession: (rec: SessionRecord) => void;
   /** The attempt number for this `(workflow, run, step)`. Wired to `latestFor`. */
@@ -416,11 +420,41 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     ]);
     if (first.t === 'lease') return mapNoHold(first.o);
 
-    const packet = first.res.order;
+    let packet = first.res.order;
     if (packet === null || packet.worker === 'command') {
       opts.err(`owenloop work agent-run: ${order} is not an agent order (misroute) — releasing`);
       return releaseWith('misroute', 'misroute');
     }
+
+    // Consume-side verification is the prompt boundary. Do this before loading
+    // or rendering any step brief: `owes[].reasons` is dynamic text supplied by
+    // the transport, and an unverified rejection thread must never reach a
+    // provider session. The same whole-order gate also protects `consumes`.
+    const hasConsumedData =
+      Object.keys(packet.consumes).length > 0
+      || packet.owes.some((owed) => owed.reasons.length > 0 || owed.proof !== undefined);
+    if (hasConsumedData) {
+      if (opts.consumedVerifier === undefined) {
+        const detail =
+          `consume-side verifier is not configured; dynamic values cannot be admitted to an agent prompt`;
+        opts.err(`owenloop work agent-run: consumed artifact refusal (prerequisite) for ${order}: ${detail}`);
+        return releaseWith('unverified-consumed', 'unverified-consumed');
+      }
+      try {
+        const checked = await opts.consumedVerifier(packet, { hardRule: false });
+        if (!checked.ok) {
+          opts.err(`owenloop work agent-run: ${checked.reason} — releasing ${order}`);
+          return releaseWith('unverified-consumed', 'unverified-consumed');
+        }
+        packet = checked.order;
+        for (const warning of checked.warnings) opts.err(warning);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        opts.err(`owenloop work agent-run: consumed artifact refusal (prerequisite) for ${order}: ${detail} — releasing`);
+        return releaseWith('unverified-consumed', 'unverified-consumed');
+      }
+    }
+
     stepName = packet.step;
     recordCwd = packet.workdir ?? opts.cwd;
 

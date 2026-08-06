@@ -1658,13 +1658,38 @@ rows resolving by name get their digest from the live def the same way —
 the reference-mode contract applies uniformly; there is no legacy order
 shape and no verify-mode branch anywhere in the path.
 
-### §29.5 Reserved proof slots
+### §29.5 Consume-side dynamic evidence
 
-The wire shape carries two data-only placeholders, `consumesProof` and
-`owes[].proof`: opaque strings reserved for future signed dynamic data.
-WP-B1 neither writes nor reads them — no code attaches or verifies a
-signature — but the slots exist so signed reason threads and signed consume
-values can land later without changing the reference-mode order shape again.
+The wire shape carries two signed-evidence channels for dynamic data:
+`consumesProof` is a JSON-serialized map from consumed artifact path to a
+serialized DSSE `submission.v1` envelope, and `owes[].proof` is a serialized
+DSSE envelope for the complete rejection-reason thread on one owed artifact.
+The hub stores and relays these strings; the hub does not verify, repair, or
+authorize them.
+
+A consuming driver gates the complete order before the order reaches a prompt,
+MCP model context, or command. For each consumed value, the gate verifies the
+DSSE envelope first, validates the signed submission record, cross-checks the
+authenticated signer key with `producerKeyId`, checks the path, canonical value
+digest, and supplied claim-time version, then validates the local enrollment
+chain, revocations, and demanded scope. For an `owes[].proof` envelope, the
+signed produced value is the complete `owes[].reasons` array; the gate runs
+before replay truncation so the verified bytes are the full thread.
+
+The gate returns `verified`, `absent`, `unverifiable`, or `invalid`. The
+configured `artifactPolicy` maps `absent` and `unverifiable` to refusal,
+warning, or admission for `enforce`, `warn`, and `off`; `invalid` always
+refuses. A command worker has an unconditional stronger rule: all absent,
+unverifiable, and invalid consumed evidence refuses before policy lookup or
+shell execution. An order is refused as a whole; the gate never drops only one
+unverified value and proceeds with a partial packet.
+
+The consumer supplies the validation clock. Revocations whose
+`effectiveFrom <= at` invalidate the key at consume time; a producer-signed
+timestamp cannot move that boundary. D3 checks the versions present in
+`consumedFingerprint` but does not recompute the producer's complete map because
+the reduced packet lacks independently authenticated upstream evidence. That
+lineage limitation remains a named follow-up.
 
 ## §30 Store-backed execution resolution
 

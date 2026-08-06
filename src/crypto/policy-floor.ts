@@ -89,14 +89,19 @@ export function originRulesMinimum(floor: PolicyFloor): DefPolicy {
   return floor.originRules === 'enforced' ? 'enforce' : 'warn';
 }
 
+/** Convert the frozen floor's unsigned-artifact axis to consume policy. */
+export function artifactPolicyMinimum(floor: PolicyFloor): DefPolicy {
+  return floor.unsignedArtifacts === 'refuse' ? 'enforce' : 'warn';
+}
+
 /** Return the stricter policy without assigning one policy over the other. */
 export function stricterDefPolicy(a: DefPolicy, b: DefPolicy): DefPolicy {
   return DEF_POLICY_RANK[a] >= DEF_POLICY_RANK[b] ? a : b;
 }
 
-/** One unenforced floor axis carried for diagnostics instead of silently dropped. */
+/** One floor axis carried for diagnostics instead of silently dropped. */
 export interface PolicyFloorGap {
-  axis: 'trustMode' | 'unsignedArtifacts';
+  axis: 'trustMode';
   value: string;
   reason: string;
 }
@@ -108,14 +113,15 @@ export interface PolicyFloorMergeResult {
   raised: boolean;
   /** Effective local origin policy after applying the verified floor. */
   originPolicy: DefPolicy;
+  /** Effective local artifact policy after applying the verified floor. */
+  artifactPolicy: DefPolicy;
   gaps: PolicyFloorGap[];
 }
 
 /**
- * Presets are concrete wire values, not a second policy-level primitive. L1 and
- * L2 still carry controls whose enforcement belongs to later packages;
- * policyFloorGaps reports those controls rather than pretending this package
- * implements them.
+ * Presets are concrete wire values, not a second policy-level primitive. The
+ * trustMode axis remains informational here; policyFloorGaps reports that
+ * unevaluated control rather than pretending this package implements it.
  */
 export const POLICY_FLOOR_PRESETS: Readonly<Record<'L0' | 'L1' | 'L2', PolicyFloor>> = Object.freeze({
   L0: Object.freeze({
@@ -146,35 +152,40 @@ export function policyFloorGaps(floor: PolicyFloor): PolicyFloorGap[] {
       value: floor.trustMode,
       reason: 'trustMode is carried but not evaluated by this engine; L2 git-pinned roster and sandbox authorship are not delivered here',
     },
-    {
-      axis: 'unsignedArtifacts',
-      value: floor.unsignedArtifacts,
-      reason: 'unsignedArtifacts has no enforcement mechanism yet; signed submission records are a later package',
-    },
   ];
 }
 
 /**
  * Merge a verified floor as a strictness minimum on both policy axes. The
- * optional origin argument preserves the existing two-argument API; callers
- * that do not resolve origin policy receive the neutral local value `off`.
+ * optional origin and artifact arguments preserve the existing positional API;
+ * callers that do not resolve either policy receive the neutral local value `off`.
  */
 export function mergePolicyFloorWithLocal(
   local: DefPolicy,
   floor?: PolicyFloor,
   localOriginPolicy: DefPolicy = 'off',
+  localArtifactPolicy: DefPolicy = 'off',
 ): PolicyFloorMergeResult {
   if (floor === undefined) {
-    return { effective: local, local, raised: false, originPolicy: localOriginPolicy, gaps: [] };
+    return {
+      effective: local,
+      local,
+      raised: false,
+      originPolicy: localOriginPolicy,
+      artifactPolicy: localArtifactPolicy,
+      gaps: [],
+    };
   }
   const floorMinimum = floorDefPolicyMinimum(floor);
   const effective = stricterDefPolicy(local, floorMinimum);
   const originPolicy = stricterDefPolicy(localOriginPolicy, originRulesMinimum(floor));
+  const artifactPolicy = stricterDefPolicy(localArtifactPolicy, artifactPolicyMinimum(floor));
   return {
     effective,
     local,
     raised: effective !== local,
     originPolicy,
+    artifactPolicy,
     gaps: policyFloorGaps(floor),
   };
 }

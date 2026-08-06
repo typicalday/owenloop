@@ -194,6 +194,84 @@ signing. `signSubmission` canonicalizes that record, signs the payload as a DSSE
 submission envelope, and returns the serialized opaque proof sent with one
 artifact submission.
 
+## WP-D3 consume-side artifact verification
+
+A consuming driver treats both the dynamic artifact values and the signed
+submission records as untrusted transport data. The driver verifies a complete
+order before the order reaches an agent prompt, an MCP model context, or a
+command worker. The driver never removes only an offending path and continues
+with the remaining packet; one failed link refuses the whole order.
+
+For each entry in `order.consumes`, `verifyConsumed` applies this fixed order:
+
+1. A missing proof is `absent`; no unsigned value is silently treated as
+   verified.
+2. The driver parses the serialized envelope and verifies the DSSE signature
+   under `PAYLOAD_TYPE_SUBMISSION`.
+3. Only after signature verification, the driver validates the decoded
+   `submission.v1` schema. The unsigned `producerKeyId` is used only to select a
+   local verification candidate; the authenticated signer key ID must equal the
+   signed record's `producerKeyId`.
+4. The signed `produced[]` entry must cover the consumed artifact path. The
+   driver compares `valueDigestHex(deliveredValue)` with the signed
+   `valueDigest`, and compares the signed version with
+   `order.consumedFingerprint[path]` when that claim is present.
+5. The authenticated producer key must chain through locally loaded enrollment
+   grants to the locally configured organization-root public key. Every grant
+   link is signature-checked, scope attenuation is enforced, and effective
+   revocations are applied.
+6. The producer's effective scope must satisfy the consuming demand. A child
+   grant can only narrow a parent grant; it cannot widen pools, labels,
+   namespaces, or delegation.
+
+The same verification applies to an `owes[]` rejection thread when
+`owes[].proof` is present. The proof is a `submission.v1` envelope whose one
+`produced[]` entry names the owed artifact path and whose signed value digest
+covers the complete `owes[].reasons` array. Verification therefore happens
+before `REPLAY_TOKEN_BUDGET` truncates the thread for a resumed prompt.
+
+The pure verifier returns four explicit verdicts:
+
+| verdict | meaning |
+| --- | --- |
+| `verified` | DSSE, schema, path, value digest, version, enrollment chain, revocation, and scope checks passed. |
+| `absent` | No proof was supplied. |
+| `unverifiable` | A required local prerequisite or verifier setup is unavailable. |
+| `invalid` | Evidence was supplied but failed signature, schema, path, digest, version, chain, revocation, or scope validation. |
+
+The consuming driver maps those verdicts according to `artifactPolicy`:
+
+| verdict | `enforce` | `warn` | `off` |
+| --- | --- | --- | --- |
+| `verified` | admit | admit | admit |
+| `absent` | refuse | warn and admit | admit |
+| `unverifiable` | refuse | warn and admit | admit |
+| `invalid` | refuse | refuse | refuse |
+
+The `worker: command` rule is stronger than the table. Command workers refuse
+`absent`, `unverifiable`, and `invalid` consumed evidence regardless of
+`artifactPolicy`, including `off`. The consume-side gate runs before origin or
+artifact policy lookup and before any command execution path can construct a
+shell invocation. An unverified dynamic value must never reach `/bin/sh -c`.
+Agent and MCP workers also fail closed when dynamic data exists but no
+consume-side verifier is configured.
+
+The consuming driver samples its injected clock once per complete gate
+invocation. Revocation is evaluated at that consumer-owned instant using
+`effectiveFrom <= at`; the producer's signed timestamp is not a revocation
+anchor. A key revocation that becomes effective after an earlier successful
+consumption makes the same producer's artifact unconsumable on a later gate.
+A timestamp ahead of the consumer clock is diagnostic only and does not weaken
+revocation checks.
+
+D3 enforces the `consumedFingerprint[path]` versions supplied by the consumer,
+but does not recompute the producer's complete fingerprint map. The reduced
+packet does not include enough independently authenticated upstream evidence
+to reconstruct every input version. A hostile hub can therefore weaken a
+producer's declared lineage by supplying an explicit empty or partial map; the
+remaining lineage-strengthening work is a named follow-up, not a reason to
+strip the dynamic value from the order.
+
 ### Reusing an existing SSH key (human only)
 
 `setup --reuse-ssh-key <path>` records the operator's own Ed25519 key for the
@@ -276,9 +354,9 @@ interface EnrollmentChainValidator {
 
 WP-D1 fails closed when `chainValidator` is absent. A valid signature proves
 which key signed the grant; a signature does not prove that the signer chains
-to the organization root. WP-D4 owns chain validation, attenuation, revocation,
-and root trust. Until WP-D4 installs the validator, D1 entries remain
-`unverifiable`, never `enrolled`.
+to the organization root. The WP-D4 chain validator supplies the organization
+root, attenuation, and revocation checks when the local driver installs that
+seam. D1 entries remain `unverifiable` until a host supplies that validator.
 
 The hub receives and relays the signed envelope only. The hub never receives a
 private key, creates a grant, signs a grant, or endorses a grant. Setup's
@@ -488,9 +566,10 @@ A verified organization policy floor supplies the parallel minimum:
 `originRules: advisory` maps to local `originPolicy: warn`, and
 `originRules: enforced` maps to `originPolicy: enforce`. The floor is merged
 monotonically after local precedence, so a local `off` cannot opt out of an
-enforced origin floor. The floor's `originRules` axis is now wired at install
-and execution; the remaining unenforced floor gaps are `trustMode` and
-`unsignedArtifacts`.
+enforced origin floor. The `unsignedArtifacts` axis similarly maps `warn` to
+`artifactPolicy: warn` and `refuse` to `artifactPolicy: enforce`. Both axes are
+wired at the driver boundaries; the remaining unenforced floor gap is
+`trustMode`.
 
 The command-worker hard rule remains independent of origin policy. A
 `worker: command` order must pass the publication verification gate before any
@@ -644,24 +723,23 @@ for every failure path:
 | signer key is revoked at the validation instant | `invalid`; local policy unchanged |
 | local org-root anchor or other verification prerequisite is unavailable | `unverifiable`; local policy unchanged |
 
-The frozen floor has four axes. This package enforces two of them:
-`unsignedDefs` through `defPolicy`, and `originRules` through the parallel
-`originPolicy`:
+The frozen floor has four axes. This package enforces three of them:
+`unsignedDefs` through `defPolicy`, `unsignedArtifacts` through the parallel
+`artifactPolicy`, and `originRules` through the parallel `originPolicy`:
 
 | axis | current state |
 |---|---|
 | `unsignedDefs` | mapped into `defPolicy` and enforced |
 | `trustMode` | accepted and carried, but not evaluated |
-| `unsignedArtifacts` | accepted and carried, but no enforcement mechanism exists yet |
+| `unsignedArtifacts` | mapped into `artifactPolicy` and enforced at consume-side driver boundaries |
 | `originRules` | mapped into `originPolicy` and enforced |
 
-The merge result names the two unenforced axes in `gaps` rather than silently
-dropping them. Both current integration call sites — installation and
-execution — apply the origin-policy result and discard `.gaps`, so callers do
-not currently surface warnings for `trustMode` or `unsignedArtifacts`. The
-feature is not wired into production configuration: the `policyFloor` option is
-an injection seam only, so the feature is inert until a host loads and verifies
-a floor and passes it through that seam.
+The merge result names the remaining unenforced `trustMode` axis in `gaps`
+rather than silently dropping it. Installation and execution apply the
+origin-policy and artifact-policy results; callers do not currently surface the
+`trustMode` gap. The `policyFloor` option remains an injection seam: the floor
+has effect only when a host loads and verifies a signed floor and passes the
+verified record through that seam.
 
 L0, L1, and L2 are documented bundles of concrete floor values, not alternate
 policy primitives:
@@ -672,9 +750,10 @@ policy primitives:
 | L1 | `seamless` | `refuse` | `refuse` | `advisory` |
 | L2 | `strict` | `refuse` | `refuse` | `enforced` |
 
-The preset values for `trustMode` and `unsignedArtifacts` are still only
-carried and reported as gaps in this package. The `originRules` value maps to
-the parallel origin-policy minimum described above.
+The `trustMode` preset value is still only carried and reported as a gap in
+this package. The `unsignedArtifacts` value maps to the parallel
+consume-side artifact-policy minimum described above, and `originRules` maps to
+the parallel origin-policy minimum.
 
 **Command-worker hard rule.** A `worker: command` order still requires full
 enforcement: a verified definition, a verified enrollment chain, and a

@@ -81,6 +81,7 @@ import { hostname } from 'node:os';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createAgentRunLoop, type AdapterResolution, type AgentRunOutcome } from '../agent/loop.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
+import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
@@ -197,6 +198,7 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
     case 'misroute':
     case 'no-template':
     case 'no-harness':
+    case 'unverified-consumed':
     case 'no-submit':
     case 'killed':
     case 'lease-lost':
@@ -220,6 +222,8 @@ export interface RunDeps {
   err?: (line: string) => void;
   /** Store-backed instruction resolver; injected tests may provide a fake. */
   instructions?: InstructionResolver;
+  /** Consume-side verifier; injected tests may provide a fake. */
+  consumedVerifier?: ConsumedVerifier;
   /** Environment used to derive the global workflow-store root. */
   env?: Record<string, string | undefined>;
   /** cwd for an order that carries no `workdir` (default `process.cwd()`). */
@@ -293,11 +297,16 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 2;
   }
 
+  const consumedVerifier = deps.consumedVerifier ?? createConsumedVerifier({
+    env,
+    now: () => Date.now(),
+  });
+
   const instructionCwd = deps.cwd ?? process.cwd();
   let instructions = deps.instructions;
   if (instructions === undefined) {
     try {
-      instructions = createDefaultStoreInstructionResolver({ cwd: instructionCwd, env });
+      instructions = createDefaultStoreInstructionResolver({ cwd: instructionCwd, env, consumedVerifier });
     } catch (e) {
       err(`owenloop work agent-run: instruction store unavailable: ${errMsg(e)}`);
       return 1;
@@ -480,6 +489,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     cwd: workCwd,
     loadStep,
     resolveAdapter,
+    consumedVerifier,
     appendSession: writeSession,
     nextAttempt: (workflow, run, step) => {
       const prev = latestFor(sessionsFile, workflow, run, step);

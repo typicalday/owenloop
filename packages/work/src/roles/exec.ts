@@ -39,6 +39,7 @@ import { loadSettings } from '../settings/settings.ts';
 import { createExecLoop, type ExecOutcome } from '../exec/loop.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
 import { createDefaultRunner, type CommandRunner } from '../exec/runner.ts';
+import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import { resolveShiftId, resolveTarget } from './hold.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { installSignalHandlers, type SignalHost } from './signals.ts';
@@ -154,6 +155,8 @@ export interface RunDeps {
   runner?: CommandRunner;
   /** Store-backed instruction resolver; injected tests may provide a fake. */
   instructions?: InstructionResolver;
+  /** Consume-side verifier; injected tests may provide a fake. */
+  consumedVerifier?: ConsumedVerifier;
   out?: (line: string) => void;
   err?: (line: string) => void;
   /** cwd for a command order that carries no `workdir` (default `process.cwd()`). */
@@ -195,6 +198,11 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 1;
   }
 
+  const consumedVerifier = deps.consumedVerifier ?? createConsumedVerifier({
+    env,
+    now: () => Date.now(),
+  });
+
   const origin = parsed.origin ?? settings.hubOrigin;
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work exec: no hub origin — pass --origin <url> or set hubOrigin in settings');
@@ -205,7 +213,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   let instructions = deps.instructions;
   if (instructions === undefined) {
     try {
-      instructions = createDefaultStoreInstructionResolver({ cwd, env });
+      instructions = createDefaultStoreInstructionResolver({ cwd, env, consumedVerifier });
     } catch (e) {
       err(`owenloop work exec: instruction store unavailable: ${errMsg(e)}`);
       return 1;

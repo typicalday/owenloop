@@ -77,7 +77,7 @@ test('parseArgs validates every ms knob as a positive integer', () => {
 test('exitCodeFor maps every outcome to the documented code', () => {
   const zero: AgentRunOutcome[] = ['submitted', 'completed'];
   const one: AgentRunOutcome[] = [
-    'misroute', 'no-template', 'no-harness', 'no-submit',
+    'misroute', 'no-template', 'no-harness', 'unverified-consumed', 'no-submit',
     'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'stopped',
   ];
   for (const o of zero) assert.equal(exitCodeFor(o), 0);

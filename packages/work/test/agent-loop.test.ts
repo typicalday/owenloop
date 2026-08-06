@@ -192,6 +192,7 @@ interface BuildOpts {
   loadStep?: AgentRunLoopOptions['loadStep'];
   submitGraceMs?: number;
   shiftId?: string;
+  consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
 }
 
 function buildOpts(b: BuildOpts): Harnessed {
@@ -211,6 +212,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     cwd: '/fallback/cwd',
     loadStep: b.loadStep ?? (async () => (b.spec === undefined ? baseSpec() : b.spec)),
     resolveAdapter: () => resolution,
+    ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
     appendSession: (rec) => records.push(rec),
     nextAttempt: () => 3,
     sleep: macrotaskSleep,
@@ -494,6 +496,39 @@ test('an unregistered harness id fails honestly, naming the id and what IS regis
   assert.ok(line.includes("'ghost'"));
   assert.ok(line.includes('fake, other'));
   assert.ok(verbs(calls).includes('release'));
+});
+
+test('unverified consumed values and complete rejection threads are refused before prompt rendering or adapter start', async () => {
+  const adapter = createFakeAdapter();
+  const packetResponse = agentOrder();
+  const packet = packetResponse.order!;
+  packet.consumes = { input: 'dynamic-value' };
+  packet.owes = [{
+    path: 'out',
+    judgmentRejects: 0,
+    schemaRejects: 1,
+    reasons: [
+      { at: 1, action: 'schema-reject', kind: 'validation', by: 'untrusted-transport', text: 'untrusted-rejection-marker' },
+      { at: 2, action: 'schema-reject', kind: 'validation', by: 'engine', text: 'second-reason' },
+    ],
+    proof: '{invalid-proof}',
+  }];
+  const { hub, calls } = mockHub({ getOrder: [packetResponse] });
+  let seenReasons = 0;
+  const h = buildOpts({
+    hub,
+    adapter,
+    consumedVerifier: async (order) => {
+      seenReasons = order.owes[0]!.reasons.length;
+      return { ok: false, reason: "consumed artifact refusal (signature) for wf1/run1 step 'builder' artifact 'out': rejection proof did not verify" };
+    },
+  });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'unverified-consumed');
+  assert.equal(seenReasons, 2, 'the gate receives the complete reason thread before replay truncation');
+  assert.deepEqual(adapter.calls, [], 'the refused packet never starts an adapter session');
+  assert.ok(verbs(calls).includes('release'));
+  assert.ok(h.errs.some((line) => line.includes('rejection proof did not verify')));
 });
 
 // ---- stop() -----------------------------------------------------------------

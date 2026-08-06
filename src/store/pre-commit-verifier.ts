@@ -52,6 +52,8 @@ export interface PreCommitVerifierOptions {
   cwd?: string;
   /** Explicit publication policy, useful for embedding and hermetic tests. */
   policy?: DefPolicy;
+  /** Explicit consumed-artifact policy, useful for embedding and hermetic tests. */
+  artifactPolicy?: DefPolicy;
   /** Explicit origin policy, useful for embedding and hermetic tests. */
   originPolicy?: OriginPolicy;
   /** Explicit namespace-scoped origin rules. */
@@ -118,6 +120,14 @@ export function resolveOriginPolicy(
   explicit?: OriginPolicy,
 ): OriginPolicy {
   return resolvePolicyValue(env, explicit, 'OWENLOOP_ORIGIN_POLICY', 'originPolicy', 'originPolicy');
+}
+
+/** Resolve consumed-artifact policy with the same four-layer precedence. */
+export function resolveArtifactPolicy(
+  env: Record<string, string | undefined>,
+  explicit?: DefPolicy,
+): DefPolicy {
+  return resolvePolicyValue(env, explicit, 'OWENLOOP_ARTIFACT_POLICY', 'artifactPolicy', 'artifactPolicy');
 }
 
 /** Resolve namespace rules with explicit > settings > empty precedence. */
@@ -508,6 +518,7 @@ export function createPreCommitVerifier(options: PreCommitVerifierOptions = {}):
         resolveDefPolicy(env, options.policy),
         options.policyFloor,
         resolveOriginPolicy(env, options.originPolicy),
+        resolveArtifactPolicy(env, options.artifactPolicy),
       );
       const policy = merged.effective;
       const originPolicy = merged.originPolicy;

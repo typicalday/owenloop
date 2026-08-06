@@ -663,6 +663,57 @@ regardless of any floor. If an execution host has no publication verifier
 configured, the definition is `unverifiable`; command workers therefore refuse
 rather than treating installed bytes as published trust.
 
+### Consume-side artifact policy
+
+`artifactPolicy` controls how agent and MCP drivers handle missing local
+prerequisites for signed dynamic artifact evidence. The policy is a scalar with
+the same values as `defPolicy`: `enforce`, `warn`, or `off`. The precedence is
+explicit host option, then `OWENLOOP_ARTIFACT_POLICY`, then the
+`artifactPolicy` key in the execution settings file, then the built-in default
+`warn`.
+
+For example, the settings file can contain:
+
+```json
+{
+  "artifactPolicy": "enforce"
+}
+```
+
+A one-off invocation can set
+`OWENLOOP_ARTIFACT_POLICY=enforce owenloop work agent-run <order-id>`.
+Invalid values fail loudly; an invalid value never becomes `off`.
+
+The consuming driver verifies each delivered value against its serialized DSSE
+submission proof, the signed value digest and version, the locally anchored
+producer enrollment chain, revocations, and the consuming demand's scope. A
+missing proof is not the same as invalid evidence. The driver keeps dynamic
+values and rejection reasons on the wire, verifies them, and refuses the whole
+order on failure rather than dropping only one path.
+
+| consumed-evidence verdict | `artifactPolicy=enforce` | `artifactPolicy=warn` | `artifactPolicy=off` |
+|---|---|---|---|
+| `verified` | admit | admit | admit |
+| `absent` | refuse | warn and admit | admit |
+| `unverifiable` | refuse | warn and admit | admit |
+| `invalid` | refuse | refuse | refuse |
+
+The policy floor's `unsignedArtifacts: warn` value raises the local minimum to
+`artifactPolicy=warn`; `unsignedArtifacts: refuse` raises it to `enforce`. A
+verified floor is merged after local precedence, so local `off` cannot weaken
+the floor.
+
+**Command-worker hard rule.** A `worker: command` order refuses `absent`,
+`unverifiable`, and `invalid` consumed evidence regardless of `artifactPolicy`,
+including `off`. The consume-side gate runs before origin or artifact policy
+lookup and before a shell command is built or passed to `/bin/sh -c`. A command
+worker must have a configured consume-side verifier; an unverified dynamic value
+must never reach the shell. Agent prompt rendering and MCP `get_order` likewise
+fail closed when dynamic data exists but no verifier is configured. The driver
+samples the consumer's injected clock once per complete gate invocation; a
+revocation effective at `effectiveFrom <= at` makes a previously consumable
+artifact unconsumable on a later invocation.
+
 ### Definition origin policy
 
 `originRules` is a separate namespace-scoped provenance policy. A signed file

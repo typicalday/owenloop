@@ -54,6 +54,8 @@ export interface Settings {
    * always require a verified definition regardless of this value.
    */
   defPolicy?: 'enforce' | 'warn' | 'off';
+  /** Policy for signed consumed artifact values; defaults to `warn`. */
+  artifactPolicy?: 'enforce' | 'warn' | 'off';
   /**
    * Max in-flight `agent-run` children (positive integer, default 4 —
    * `DEFAULT_MAX_AGENTS` in `src/roles/shift.ts`). A SEPARATE
@@ -101,6 +103,7 @@ export const KNOWN_SETTINGS_KEYS = [
   'dispatchCap',
   'commandRouting',
   'defPolicy',
+  'artifactPolicy',
   'maxConcurrentAgents',
   'workRoot',
   'workRepo',
@@ -181,6 +184,12 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
     const v = obj['defPolicy'];
     if (v !== 'enforce' && v !== 'warn' && v !== 'off') {
       throw bad('defPolicy', "'enforce', 'warn', or 'off'", v);
+    }
+  }
+  if ('artifactPolicy' in obj) {
+    const v = obj['artifactPolicy'];
+    if (v !== 'enforce' && v !== 'warn' && v !== 'off') {
+      throw bad('artifactPolicy', "'enforce', 'warn', or 'off'", v);
     }
   }
 

@@ -43,6 +43,7 @@ import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { createHoldLoop, type HoldOutcome } from '../hold/loop.ts';
 import { createHoldMcp } from '../hold/mcp.ts';
+import { createConsumedVerifier } from '../consumed-verifier.ts';
 import { createMcpServer, pumpStdin, type LineStream } from '../mcp/server.ts';
 import type { ContactHolder } from '../hub/types.ts';
 import { installSignalHandlers, watchStdinEof, type SignalHost, type StdinHost } from './signals.ts';
@@ -227,6 +228,8 @@ export interface RunDeps {
   hub?: HubClient;
   out?: (line: string) => void;
   err?: (line: string) => void;
+  /** Environment used for settings and local trust-root resolution. */
+  env?: Record<string, string | undefined>;
 }
 
 export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
@@ -259,7 +262,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 2;
   }
 
-  const env = process.env;
+  const env = deps.env ?? process.env;
   let settings;
   try {
     settings = loadSettings(env);
@@ -303,6 +306,10 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       run: target.run,
       origin,
       env,
+      consumedVerifier: createConsumedVerifier({
+        env,
+        now: () => Date.now(),
+      }),
       sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       now: () => Date.now(),
       err,
