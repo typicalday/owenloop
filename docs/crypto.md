@@ -172,6 +172,28 @@ no trust coverage. A driver without a configured machine key submits without a
 proof and emits one warning per process; later policy work decides whether that
 fallback becomes refusal.
 
+#### Canonical submission values
+
+`canonicalValueBytes(value)` recursively sorts plain-object keys, preserves array
+order, applies each object's `toJSON(key)` hook with the same key semantics as
+`JSON.stringify`, and emits separator-tight UTF-8 JSON. `valueDigestHex(value)`
+is the lowercase SHA-256 digest of those bytes. The canonical bytes make a
+produced-value digest reproducible after the value crosses the JSON submit
+transport; the driver signs the same canonical record representation that the
+wire envelope carries.
+
+Canonicalization fails loudly with `TypeError` when a value cannot be represented
+faithfully. `Map`, `Set`, `RegExp`, class instances with fields, non-finite
+numbers (`NaN`, `Infinity`, and `-Infinity`), `bigint`, and circular references
+are rejected rather than silently becoming `{}` or another lossy value. A
+submission record also rejects an empty `produced` list and negative or
+non-integer artifact versions.
+
+`buildSubmissionRecord` constructs the frozen `submission.v1` shape without
+signing. `signSubmission` canonicalizes that record, signs the payload as a DSSE
+submission envelope, and returns the serialized opaque proof sent with one
+artifact submission.
+
 ### Reusing an existing SSH key (human only)
 
 `setup --reuse-ssh-key <path>` records the operator's own Ed25519 key for the

@@ -244,7 +244,9 @@ order-independent — re-running `settle()` on a healthy graph yields no ops.
   claim-time map is exported as the order's optional `consumedFingerprint` and
   is covered by the producer's submit-time `submission.v1` signature, so the
   signed statement binds both the produced value and the exact input versions
-  the producer claimed.
+  the producer claimed. Across steps, those bindings provide the edges a later
+  verifier needs to reconstruct a verifiable submission DAG; the hub stores and
+  relays the statements but is not the verifier.
 - **§12.3 Daily-budget windows are host-local** — `maxRunsPerDay` gates
   against a window starting at host-local midnight (`localMidnightMs` in
   util.ts), not UTC midnight. Two consequences worth knowing: (1) the day

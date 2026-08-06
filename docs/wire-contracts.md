@@ -261,7 +261,16 @@ opaque `proof` string. `cause`, when present, is `inputsGreen`, `allGreen`, or
 The `consumedFingerprint`, when present, is an open artifact-path map whose values
 are the non-negative versions captured when the engine claimed the order. The
 producer covers the map in its `submission.v1` signature; a driver does not
-recompute the map from consumed values.
+recompute the map from consumed values. A driver distinguishes an absent map
+from a genuinely empty map: if the order has consumed inputs but omits the map,
+the driver submits without a proof and emits a warning; an order with no
+consumed inputs may sign an explicitly empty `{}` map.
+
+An explicit `{}` or partial map alongside a non-empty consumed set is still a
+signed assertion of the map supplied on the wire. This package leaves that
+assertion visible for later consume-side verification; the hub only stores and
+relays the signed content and does not verify or repair it. Consume-side
+verification is a later work package, not part of this contract.
 
 `owes[].proof` remains unpopulated in this work package. `consumesProof` remains
 a frozen string field, but its concrete encoding is a JSON-serialized map from
