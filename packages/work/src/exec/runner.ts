@@ -34,6 +34,8 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 
+import { PAYLOAD_MARKER, PAYLOAD_MAX_BYTES } from './payload.ts';
+
 const RETAIN_CAP_BYTES = 1024 * 1024; // 1 MiB retained per stream (for the tail)
 const TAIL_BYTES = 4096; // last 4 KiB of combined output kept in the receipt
 const DEFAULT_GRACE_MS = 5_000; // SIGTERM → grace → SIGKILL on a group kill
@@ -56,6 +58,10 @@ export interface CommandResult {
   stderrBytes: number;
   /** Last ≤4 KiB of combined stdout+stderr, decoded lossily as UTF-8. */
   outputTail: string;
+  /** Raw text after the last matching stdout payload marker, before JSON parsing. */
+  payloadLine?: string;
+  /** True when the last matching marker line exceeded the payload cap. */
+  payloadOverCap?: boolean;
   startedAt: number;
   finishedAt: number;
   durationMs: number;
@@ -141,6 +147,60 @@ export function createDefaultRunner(opts: DefaultRunnerOptions = {}): CommandRun
       let pendingStderrBytes = 0;
       let degraded = false;
 
+      // Scan stdout lines independently of the bounded output tails. The
+      // scanner retains only the marker prefix plus the payload cap, so a
+      // command cannot force the runner to buffer an unbounded stream.
+      const payloadMarker = Buffer.from(PAYLOAD_MARKER, 'utf8');
+      const payloadLineCap = payloadMarker.length + PAYLOAD_MAX_BYTES + 1; // +1 detects overflow
+      let payloadLineBuffer = Buffer.alloc(0);
+      let payloadLineCapped = false;
+      let payloadLine: string | undefined;
+      let payloadOverCap = false;
+
+      const appendPayloadLine = (chunk: Buffer): void => {
+        if (payloadLineCapped || chunk.length === 0) return;
+        const remaining = payloadLineCap - payloadLineBuffer.length;
+        if (chunk.length > remaining) {
+          payloadLineBuffer = Buffer.concat([payloadLineBuffer, chunk.subarray(0, remaining)]);
+          payloadLineCapped = true;
+          return;
+        }
+        payloadLineBuffer = Buffer.concat([payloadLineBuffer, chunk]);
+      };
+
+      const finishPayloadLine = (): void => {
+        if (payloadLineBuffer.length === 0) return;
+        let line = payloadLineBuffer;
+        if (line[line.length - 1] === 0x0d) line = line.subarray(0, line.length - 1);
+        if (line.length < payloadMarker.length || !line.subarray(0, payloadMarker.length).equals(payloadMarker)) {
+          payloadLineBuffer = Buffer.alloc(0);
+          payloadLineCapped = false;
+          return;
+        }
+        const rawPayload = line.subarray(payloadMarker.length);
+        if (payloadLineCapped || rawPayload.length > PAYLOAD_MAX_BYTES) {
+          payloadLine = undefined;
+          payloadOverCap = true;
+        } else {
+          payloadLine = rawPayload.toString('utf8');
+          payloadOverCap = false;
+        }
+        payloadLineBuffer = Buffer.alloc(0);
+        payloadLineCapped = false;
+      };
+
+      const scanPayload = (chunk: Buffer): void => {
+        let offset = 0;
+        while (offset < chunk.length) {
+          const newline = chunk.indexOf(0x0a, offset);
+          const end = newline === -1 ? chunk.length : newline;
+          appendPayloadLine(chunk.subarray(offset, end));
+          if (newline === -1) break;
+          finishPayloadLine();
+          offset = newline + 1;
+        }
+      };
+
       let settled = false;
       let resolveDone!: (r: CommandResult) => void;
       const done = new Promise<CommandResult>((r) => {
@@ -149,6 +209,7 @@ export function createDefaultRunner(opts: DefaultRunnerOptions = {}): CommandRun
 
       const finish = (exitCode: number | null, signal: string | null, error?: string): void => {
         if (settled) return;
+        finishPayloadLine();
         settled = true;
         // Flush any stderr that arrived before stdout ended, preserving the
         // stdout-then-stderr hash ordering (a no-op when degraded — dropped).
@@ -168,6 +229,8 @@ export function createDefaultRunner(opts: DefaultRunnerOptions = {}): CommandRun
           stdoutBytes,
           stderrBytes,
           outputTail: tail.toString('utf8'),
+          ...(payloadLine !== undefined ? { payloadLine } : {}),
+          ...(payloadOverCap ? { payloadOverCap: true } : {}),
           startedAt,
           finishedAt,
           durationMs: finishedAt - startedAt,
@@ -186,8 +249,10 @@ export function createDefaultRunner(opts: DefaultRunnerOptions = {}): CommandRun
         hash.update(chunk);
         stdoutBytes += chunk.length;
         stdoutTail = appendTail(stdoutTail, chunk, RETAIN_CAP_BYTES);
+        scanPayload(chunk);
       });
       child.stdout?.on('end', () => {
+        finishPayloadLine();
         stdoutEnded = true;
         if (!degraded) for (const c of pendingStderr) hash.update(c);
         pendingStderr.length = 0;

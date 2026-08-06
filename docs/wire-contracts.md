@@ -264,7 +264,7 @@ does not declare a second `Order` interface.
 Required fields are `run`, `workflow`, `step`, `key`, `defDigest`, `inputs`,
 `outputs`, `consumes`, and `owes`.
 
-Optional fields are `index`, `workdir`, `model`, `worker`, `spec`, `x`,
+Optional fields are `index`, `workdir`, `model`, `worker`, `judge`, `spec`, `x`,
 `consumedFingerprint`, `consumesProof`, and `cause`.
 
 `defDigest` is a non-empty opaque reference. `inputs` and `outputs` are string
@@ -328,3 +328,30 @@ that executable instructions, shell commands, dynamic artifact values, and
 trusted signer identities were not altered before acting on them. These wire
 contracts carry the data needed for those checks; consume-side verification is
 implemented at the consuming driver boundary and never delegated to the hub.
+
+## Command payload and worker reject contracts
+
+A command worker may emit one payload marker line on stdout:
+
+```text
+##owenloop:payload## {"...json..."}
+```
+
+The worker scans stdout lines and uses the last line whose marker starts at the
+beginning of the line. A marker in the middle of a line is not a match. The JSON
+text after the marker is capped at 64 KiB. A missing marker leaves `payload`
+out of the `CommandReceipt`; malformed or over-cap JSON produces
+`payloadError` and no `payload`, while leaving the command exit code unchanged.
+The parsed payload is part of the receipt value covered by the DSSE submission
+proof.
+
+A worker rejects an artifact through the `reject` verb. The request is exactly:
+
+```json
+{"workflow":"<workflow>","run":"<run>","path":"<artifact stem>","text":"<reasons>"}
+```
+
+The request has no `by` field. The hub derives the rejecting step from the
+claiming run. The response carries the common `text` field plus `ok` and an
+optional `closed`; `closed: true` means the claiming run is already closed and
+the holder must stop without releasing it again.

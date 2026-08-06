@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { buildCommandPlan, createDefaultRunner } from '../src/exec/runner.ts';
+import { PAYLOAD_MARKER, PAYLOAD_MAX_BYTES } from '../src/exec/payload.ts';
 
 // The default runner is the ONE place a real child is spawned. Every command
 // here is a harmless POSIX-shell fixture in a test-created temp cwd — no network,
@@ -40,6 +41,30 @@ test('a non-zero exit is captured verbatim (the receipt carries the truth)', asy
   const r = await runner.start('exit 3', { cwd: CWD }).done;
   assert.equal(r.exitCode, 3);
   assert.equal(r.error, undefined);
+});
+
+test('payload markers are recognized across stdout chunks and the last matching line wins', async () => {
+  const runner = createDefaultRunner();
+  const command = `printf '%s' '${PAYLOAD_MARKER.slice(0, 12)}'; sleep 0.01; printf '%s\\n' '${PAYLOAD_MARKER.slice(12)}{"n":1}'; printf '%s{"n":2}\\n' '${PAYLOAD_MARKER}'`;
+  const r = await runner.start(command, { cwd: CWD }).done;
+  assert.equal(r.payloadLine, '{"n":2}');
+  assert.equal(r.payloadOverCap, undefined);
+});
+
+test('payload markers in the middle of a line or on stderr are ignored', async () => {
+  const runner = createDefaultRunner();
+  const command = `printf 'prefix %s{"bad":1}\\n' '${PAYLOAD_MARKER}'; printf '%s{"bad":2}\\n' '${PAYLOAD_MARKER}' 1>&2`;
+  const r = await runner.start(command, { cwd: CWD }).done;
+  assert.equal(r.payloadLine, undefined);
+  assert.equal(r.payloadOverCap, undefined);
+});
+
+test('an oversized final payload marker is reported without retaining the whole line', async () => {
+  const runner = createDefaultRunner();
+  const command = `printf '%s' '${PAYLOAD_MARKER}'; head -c ${PAYLOAD_MAX_BYTES + 1} /dev/zero`;
+  const r = await runner.start(command, { cwd: CWD }).done;
+  assert.equal(r.payloadLine, undefined);
+  assert.equal(r.payloadOverCap, true);
 });
 
 test('stdout then stderr are hashed in order and both feed the tail', async () => {

@@ -129,6 +129,8 @@ export function exitCodeFor(outcome: ExecOutcome): number {
   switch (outcome) {
     case 'submitted':
     case 'completed':
+    case 'rejected':
+    case 'judge-rejected':
       return 0;
     case 'misroute':
     case 'unresolved-instructions':
@@ -138,6 +140,8 @@ export function exitCodeFor(outcome: ExecOutcome): number {
     case 'hub-unreachable':
     case 'submit-rejected':
     case 'submit-failed':
+    case 'judge-no-verdict':
+    case 'reject-failed':
     case 'stopped':
       return 1;
   }

@@ -27,6 +27,8 @@ import type {
   PresencePingResponse,
   ReleaseRequest,
   ReleaseResponse,
+  RejectRequest,
+  RejectResponse,
   SubmitRequest,
   SubmitResponse,
   WakeResponse,
@@ -50,6 +52,7 @@ export interface HubClient {
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
+  reject(req: RejectRequest): Promise<RejectResponse>;
   whoami(): Promise<WhoamiResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
   wake(cursor?: number): Promise<WakeResponse>;
@@ -112,6 +115,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
     release: (req) => post<ReleaseResponse>('release', req),
     submit: (req) => post<SubmitResponse>('submit', req),
+    reject: (req) => post<RejectResponse>('reject', req),
     whoami: () => get<WhoamiResponse>('whoami'),
     // Cursor is an opaque non-negative integer; omit it entirely to bootstrap
     // (the hub treats missing/invalid as a `changed: true` first sweep).

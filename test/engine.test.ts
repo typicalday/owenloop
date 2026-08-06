@@ -271,6 +271,7 @@ test('WP-B1: plain, map, judge, and command-worker orders are reference packets 
   engine.close(wf2, researcher.run);
   const judge = fire(engine, wf2, 'researcher.report.judges.completeness', 6000);
   assertReferenceContract(judge);
+  assert.equal(judge.judge, 'report');
   assert.equal(engine.resolveOrder(judge).prompt, JUDGE_SENTINEL);
 
   // serialized packets contain none of the authored sentinel bytes

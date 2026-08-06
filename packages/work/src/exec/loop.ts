@@ -42,6 +42,7 @@ import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.ts';
 import type { CommandRunner, CommandResult, RunningCommand } from './runner.ts';
 import type { InstructionResolver } from './instructions.ts';
+import { parsePayloadLine } from './payload.ts';
 import { buildReceipt } from './receipt.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
@@ -61,6 +62,10 @@ export type ExecOutcome =
   | 'hub-unreachable' // transient failures spanned the window (exit 1)
   | 'submit-rejected' // a submit returned a non-green/submitted outcome (exit 1)
   | 'submit-failed' // a submit threw (exit 1)
+  | 'rejected' // a payload directive was delivered after all submits (exit 0)
+  | 'judge-rejected' // a judge delivered a non-zero verdict through reject (exit 0)
+  | 'judge-no-verdict' // a judge ended with machinery/signal failure (exit 1)
+  | 'reject-failed' // the receipt landed but its follow-up reject failed (exit 1)
   | 'stopped'; // stop() arrived before the hold was established (exit 1)
 
 export interface ExecLoopOptions {
@@ -173,6 +178,35 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     return 'lease-lost';
   }
 
+  /** Deliver one reject verb and settle the lease after the response arrives. */
+  async function issueReject(
+    path: string,
+    text: string,
+    successOutcome: 'rejected' | 'judge-rejected',
+  ): Promise<ExecOutcome> {
+    try {
+      const res = await hub.reject({ workflow, run: runId, path, text });
+      if (res.ok !== true) {
+        opts.err(`owenloop work exec: reject of ${path} was refused: ${res.text}`);
+        lease.stop('reject-failed', res.closed === true ? { release: false } : undefined);
+        await leasePromise;
+        return 'reject-failed';
+      }
+      // A closed response means the hub already ended the claiming run. For a
+      // non-closed reject, release the still-open claim before this worker exits.
+      lease.stop(successOutcome, res.closed === true ? { release: false } : undefined);
+      await leasePromise;
+      return successOutcome;
+    } catch (e) {
+      opts.err(`owenloop work exec: reject of ${path} failed: ${errMsg(e)}`);
+      // Receipts, when any, are already committed. Do not retry blindly or
+      // pretend the reject landed.
+      lease.stop('reject-failed');
+      await leasePromise;
+      return 'reject-failed';
+    }
+  }
+
   /** Build the receipt and submit it to every owed path. */
   async function submitReceipt(result: CommandResult, order: OrderPacket, resolvedCommand: string): Promise<ExecOutcome> {
     if (signalled) {
@@ -185,13 +219,37 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       await leasePromise;
       return 'killed';
     }
+
+    const parsedPayload = parsePayloadLine(result.payloadLine, result.payloadOverCap);
+    if (order.judge !== undefined) {
+      if (result.exitCode === null) {
+        // A signal or machinery failure is not a verdict. Leave the claim for
+        // the engine's reap path rather than releasing a silent judgement.
+        opts.err(`owenloop work exec: judge ${order.judge} ended without a verdict`);
+        lease.stop('judge-no-verdict', { release: false });
+        await leasePromise;
+        return 'judge-no-verdict';
+      }
+      if (result.exitCode !== 0) {
+        // Judge payload directives are deliberately ignored: one judge order
+        // has one verdict, and the command exit code supplies that verdict.
+        let text = result.outputTail;
+        if (parsedPayload.payload !== undefined && typeof parsedPayload.payload === 'object' && parsedPayload.payload !== null && !Array.isArray(parsedPayload.payload)) {
+          const reason = (parsedPayload.payload as Record<string, unknown>)['reason'];
+          if (typeof reason === 'string' && reason.trim() !== '') text = reason;
+        }
+        if (text === '') text = `judge command exited with code ${result.exitCode}`;
+        return issueReject(order.judge, text, 'judge-rejected');
+      }
+    }
+
     const receipt = buildReceipt(result, {
       command: resolvedCommand,
       orchestrator: opts.holder.id,
       workflow,
       run: runId,
       step: order.step,
-    });
+    }, parsedPayload);
 
     for (const owe of order.owes) {
       let res;
@@ -234,6 +292,13 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         return 'submit-rejected';
       }
       opts.out(`owenloop work exec: submitted receipt to ${owe.path} (${outcome})`);
+    }
+
+    if (order.judge === undefined && parsedPayload.reject !== undefined) {
+      // All owed submissions must land before invalidating a consumed input;
+      // rejection moves the consume fingerprint and would born-reject later
+      // submits from this run.
+      return issueReject(parsedPayload.reject.path, parsedPayload.reject.text, 'rejected');
     }
 
     // Every owed path landed — the run has closed, so stop WITHOUT releasing.
