@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
+import { readFileSync } from 'node:fs';
 
+import { dsseVerifySubmission, valueDigestHex } from '../../../src/crypto/index.ts';
+import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
+import { resetSshKeygenProbe } from '../../../src/crypto/ssh.ts';
+import type { SshProcessAdapter } from '../../../src/crypto/ssh.ts';
 import { createExecLoop, type ExecLoop, type ExecLoopOptions } from '../src/exec/loop.ts';
+import { resetSubmitProofWarningForTests, type SubmissionKeyManager } from '../src/submit-proof.ts';
 import { HubError, type ContactHolder, type GetOrderResponse } from '../src/hub/types.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { CommandResult, CommandRunner, RunningCommand } from '../src/exec/runner.ts';
@@ -18,9 +24,40 @@ interface SubmitCall {
   path: string;
   value: unknown;
   holder?: ContactHolder;
+  proof?: string;
 }
 
 const EXEC: ContactHolder = { kind: 'exec', id: 'host:123' };
+const PUB_TEXT = readFileSync(new URL('../../../test/fixtures/crypto/fixture-key.pub', import.meta.url), 'utf8');
+const PUBLIC_KEY = publicKeyDescriptor(PUB_TEXT);
+const SIGNING_REF = { origin: 'https://hub.example.test', kind: 'machine' as const, id: 'local' };
+const ARMOR = '-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n';
+
+function signingKeys(path = '/fake/private-key'): SubmissionKeyManager {
+  return {
+    resolveRef: () => SIGNING_REF,
+    inspect: async () => ({ exists: true, source: 'generated', backend: 'file', publicKey: PUBLIC_KEY }),
+    withSigningKey: async (_ref, callback) => callback(path),
+  };
+}
+
+function fakeSshProcess(calls: Array<{ cmd: string; args: string[]; stdin?: Buffer }>): SshProcessAdapter {
+  return {
+    probe: () => ({ status: 255, stderr: Buffer.from('No principal matched\\n') }),
+    async run(cmd, args, opts) {
+      calls.push({ cmd, args, ...(opts.stdin !== undefined ? { stdin: opts.stdin } : {}) });
+      if (args[0] === '-y' && args[1] === '-f') {
+        return { status: 0, stdout: Buffer.from(PUB_TEXT), stderr: Buffer.alloc(0), timedOut: false, truncated: false };
+      }
+      return { status: 0, stdout: Buffer.from(ARMOR), stderr: Buffer.alloc(0), timedOut: false, truncated: false };
+    },
+  };
+}
+
+afterEach(() => {
+  resetSubmitProofWarningForTests();
+  resetSshKeygenProbe();
+});
 const macrotaskSleep = (): Promise<void> => new Promise((r) => setImmediate(r));
 
 interface OrderOpts {
@@ -119,7 +156,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[]; submits: Submit
       return cfg.release !== undefined ? cfg.release() : { text: '' };
     },
     async submit(req) {
-      submits.push({ path: req.path, value: req.value, holder: req.holder });
+      submits.push({ path: req.path, value: req.value, holder: req.holder, ...(req.proof !== undefined ? { proof: req.proof } : {}) });
       const s = cfg.submit ?? ['green'];
       const item = s[Math.min(subIdx, s.length - 1)]!;
       subIdx++;
@@ -245,6 +282,70 @@ test('runs the command and submits a receipt to the owed path (exit-success outc
   assert.equal(receipt.step, 'builder');
   // The run closed via submit → no release (release:false path).
   assert.equal(only(calls, 'release').length, 0);
+});
+
+test('exec submit attaches a DSSE submission proof over the receipt', async () => {
+  const fr = fakeRunner();
+  const response = commandOrder({ command: 'make signed-build' });
+  response.order!.consumedFingerprint = { input: 4 };
+  const { hub, submits } = mockHub({ getOrder: [response], submit: ['green'] });
+  const sshCalls: Array<{ cmd: string; args: string[]; stdin?: Buffer }> = [];
+  const loop = createExecLoop(baseOpts(hub, fr.runner, {
+    origin: 'https://hub.example.test',
+    principalKeys: signingKeys(),
+    sshProcess: fakeSshProcess(sshCalls),
+  }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, { outputHash: 'sha256:signed-receipt' }));
+  assert.equal(await p, 'submitted');
+
+  const proof = submits[0]!.proof;
+  assert.ok(proof !== undefined);
+  assert.equal(sshCalls.length, 2);
+  const verified = await dsseVerifySubmission(JSON.parse(proof), {
+    async verify(_bytes, signature) {
+      return signature.toString('utf8') === ARMOR
+        ? { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const }
+        : null;
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
+    produced: Array<{ artifact: string; valueDigest: string }>;
+    consumedFingerprint: Record<string, number>;
+    producerKeyId: string;
+  };
+  assert.equal(record.produced[0]!.artifact, 'out');
+  assert.equal(record.produced[0]!.valueDigest, valueDigestHex(submits[0]!.value));
+  assert.deepEqual(record.consumedFingerprint, { input: 4 });
+  assert.equal(record.producerKeyId, PUBLIC_KEY.keyid);
+});
+
+test('exec submit falls back unsigned when the machine key is missing', async () => {
+  const fr = fakeRunner();
+  const { hub, submits } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const warnings: string[] = [];
+  const loop = createExecLoop(baseOpts(hub, fr.runner, {
+    origin: 'https://hub.example.test',
+    principalKeys: {
+      resolveRef: () => null,
+      inspect: async () => {
+        throw new Error('inspect must not run');
+      },
+      withSigningKey: async () => {
+        throw new Error('withSigningKey must not run');
+      },
+    },
+    out: () => {},
+    err: (line) => warnings.push(line),
+  }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  assert.equal(await p, 'submitted');
+  assert.equal(submits[0]!.proof, undefined);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /without a proof/);
 });
 
 test('the runner receives only locally resolved command text, not an extra packet command field', async () => {

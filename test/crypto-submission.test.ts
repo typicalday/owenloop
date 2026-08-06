@@ -41,6 +41,16 @@ test('buildSubmissionRecord computes value digests and omits absent index', () =
   BASE.consumedFingerprint.input = 0;
 });
 
+test('buildSubmissionRecord copies fingerprint data and remains stable after source mutation', () => {
+  const fingerprint = { input: 1 };
+  const value = { nested: { z: 2, a: 1 } };
+  const record = buildSubmissionRecord({ ...BASE, consumedFingerprint: fingerprint, produced: [{ artifact: 'result', version: 1, value }] });
+  fingerprint.input = 9;
+  value.nested.a = 99;
+  assert.deepEqual(record.consumedFingerprint, { input: 1 });
+  assert.equal(record.produced[0]!.valueDigest, valueDigestHex({ nested: { z: 2, a: 1 } }));
+});
+
 test('buildSubmissionRecord rejects negative consumed and produced versions', () => {
   assert.throws(
     () => buildSubmissionRecord({ ...BASE, consumedFingerprint: { missing: -1 } }),

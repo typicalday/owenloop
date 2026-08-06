@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
+import { readFileSync } from 'node:fs';
 
+import { dsseVerifySubmission } from '../../../src/crypto/index.ts';
+import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
+import { resetSshKeygenProbe } from '../../../src/crypto/ssh.ts';
+import type { SshProcessAdapter } from '../../../src/crypto/ssh.ts';
 import { createHoldMcp } from '../src/hold/mcp.ts';
+import type { SubmissionKeyManager } from '../src/submit-proof.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { ToolCallContext, ToolRegistration } from '../src/mcp/server.ts';
@@ -17,6 +23,33 @@ interface HubCfg {
   getOrder?: GetOrderResponse | Error;
   submit?: { outcome?: string; closed?: boolean } | Error;
 }
+
+const PUB_TEXT = readFileSync(new URL('../../../test/fixtures/crypto/fixture-key.pub', import.meta.url), 'utf8');
+const PUBLIC_KEY = publicKeyDescriptor(PUB_TEXT);
+const SIGNING_REF = { origin: 'https://hub.example.test', kind: 'machine' as const, id: 'local' };
+const ARMOR = '-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n';
+
+function signingKeys(path = '/fake/private-key'): SubmissionKeyManager {
+  return {
+    resolveRef: () => SIGNING_REF,
+    inspect: async () => ({ exists: true, source: 'generated', backend: 'file', publicKey: PUBLIC_KEY }),
+    withSigningKey: async (_ref, callback) => callback(path),
+  };
+}
+
+function fakeSshProcess(): SshProcessAdapter {
+  return {
+    probe: () => ({ status: 255, stderr: Buffer.from('No principal matched\\n') }),
+    async run(_cmd, args) {
+      const stdout = args[0] === '-y' && args[1] === '-f' ? PUB_TEXT : ARMOR;
+      return { status: 0, stdout: Buffer.from(stdout), stderr: Buffer.alloc(0), timedOut: false, truncated: false };
+    },
+  };
+}
+
+afterEach(() => {
+  resetSshKeygenProbe();
+});
 
 function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
   const calls: Call[] = [];
@@ -101,6 +134,49 @@ test('submit posts a receipt for the bound run and echoes the outcome', async ()
   assert.equal(body.outcome, 'accepted');
   assert.equal(body.closed, false);
   assert.deepEqual(calls, [{ verb: 'submit', arg: { workflow: 'wf1', run: 'run1', path: 'pr', value: { url: 'x' }, done: false } }]);
+});
+
+test('hold-MCP submit attaches a DSSE submission proof over the submitted value', async () => {
+  const orderResponse: GetOrderResponse = {
+    text: '',
+    workflow: 'wf1',
+    run: 'run1',
+    order: {
+      run: 'run1',
+      workflow: 'wf1',
+      step: 'producer',
+      key: 'k',
+      defDigest: 'def-digest',
+      inputs: ['input'],
+      outputs: ['result'],
+      consumes: { input: { value: 'seen' } },
+      consumedFingerprint: { input: 2 },
+      owes: [{ path: 'result', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+    },
+    lease: { claimed: true },
+  };
+  const { hub, calls } = mockHub({ getOrder: orderResponse, submit: { outcome: 'accepted', closed: false } });
+  const mount = createHoldMcp(deps(hub, {
+    origin: 'https://hub.example.test',
+    principalKeys: signingKeys(),
+    sshProcess: fakeSshProcess(),
+  }));
+  await tool(mount.tools, 'submit').handler({ path: 'result', value: { answer: 42 } }, ctx);
+  const req = calls.find((call) => call.verb === 'submit')!.arg as { proof?: string };
+  assert.ok(req.proof !== undefined);
+  const verified = await dsseVerifySubmission(JSON.parse(req.proof), {
+    async verify(_bytes, signature) {
+      return signature.toString('utf8') === ARMOR
+        ? { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const }
+        : null;
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
+    produced: Array<{ artifact: string }>;
+    consumedFingerprint: Record<string, number>;
+  };
+  assert.equal(record.produced[0]!.artifact, 'result');
+  assert.deepEqual(record.consumedFingerprint, { input: 2 });
 });
 
 // W7/D4: when the bound holder is known, submit carries it through unchanged

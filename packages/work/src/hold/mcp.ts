@@ -28,6 +28,7 @@ import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
+import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
 
 export interface HoldMcpDeps {
@@ -38,6 +39,8 @@ export interface HoldMcpDeps {
   origin?: string;
   principalKeys?: SubmissionKeyManager;
   env?: Record<string, string | undefined>;
+  /** Injectable ssh-keygen seam for hermetic submit-proof tests. */
+  sshProcess?: SshProcessAdapter;
   /** B3 holder tag; rides get_order/heartbeat when known. */
   holder?: ContactHolder;
   sleep: (ms: number) => Promise<void>;
@@ -181,6 +184,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
               warn: deps.err,
               ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
               ...(deps.env !== undefined ? { env: deps.env } : {}),
+              ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
             });
           }
         }

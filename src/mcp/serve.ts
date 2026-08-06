@@ -60,6 +60,7 @@ import {
 } from '../hub.ts';
 import type { Credential, CredentialSlotSelector } from '../hub.ts';
 import type { Order } from '../types.ts';
+import type { SshProcessAdapter } from '../crypto/ssh.ts';
 import { globalConfigPath, readGlobalConfig } from '../global-config.ts';
 import { createMcpServer, pumpStdin, textResult } from './server.ts';
 import type { LineStream, ToolRegistration, ToolResult } from './server.ts';
@@ -75,6 +76,8 @@ export interface McpIo extends CredentialIO {
   err: (line: string) => void;
   stdinStream?: LineStream;
   principalKeys?: Pick<PrincipalKeyManager, 'inspect' | 'resolveRef' | 'withSigningKey'>;
+  /** Injectable ssh-keygen seam for hermetic submit-proof tests. */
+  sshProcess?: SshProcessAdapter;
 }
 
 /** The resolved server context handed to every tool handler. */
@@ -346,7 +349,11 @@ async function signMcpSubmit(deps: McpDeps, args: Record<string, unknown>): Prom
   });
 
   return keys.withSigningKey(ref, async (keyPath) => {
-    const signer = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: keyPath });
+    const signer = createSshSigner({
+      namespace: DSSE_SSH_NAMESPACE,
+      signKeyPath: keyPath,
+      ...(deps.io.sshProcess !== undefined ? { process: deps.io.sshProcess } : {}),
+    });
     return signSubmission(record, signer);
   });
 }

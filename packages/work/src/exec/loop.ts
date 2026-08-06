@@ -44,6 +44,7 @@ import type { CommandRunner, CommandResult, RunningCommand } from './runner.ts';
 import type { InstructionResolver } from './instructions.ts';
 import { buildReceipt } from './receipt.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
+import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 
 /** sha256 of the empty byte string — the hash for a run with no captured output. */
 const EMPTY_HASH = createHash('sha256').digest('hex');
@@ -71,6 +72,8 @@ export interface ExecLoopOptions {
   origin?: string;
   principalKeys?: SubmissionKeyManager;
   env?: Record<string, string | undefined>;
+  /** Injectable ssh-keygen seam for hermetic submit-proof tests. */
+  sshProcess?: SshProcessAdapter;
   /** The exec process holder tag `{kind:'exec', id}` — id is `<hostname>:<pid>`. */
   holder: ContactHolder;
   /** Resolves command text from a verified local workflow-store object. */
@@ -204,6 +207,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
             warn: opts.err,
             ...(opts.principalKeys !== undefined ? { principalKeys: opts.principalKeys } : {}),
             ...(opts.env !== undefined ? { env: opts.env } : {}),
+            ...(opts.sshProcess !== undefined ? { sshProcess: opts.sshProcess } : {}),
           });
         }
         res = await hub.submit({

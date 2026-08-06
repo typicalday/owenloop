@@ -28,11 +28,16 @@
  *     tool error, and `delete_crew` is NOT advertised (deliberately excluded).
  */
 
-import { test } from 'node:test';
+import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
+import { dsseVerifySubmission } from '../src/crypto/index.ts';
+import { publicKeyDescriptor } from '../src/crypto/keys.ts';
+import type { PrincipalKeyManager } from '../src/crypto/keys.ts';
+import { resetSshKeygenProbe } from '../src/crypto/ssh.ts';
+import type { SshProcessAdapter } from '../src/crypto/ssh.ts';
 import { mainAsync } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
 import { storeCredential } from '../src/credentials.ts';
@@ -48,6 +53,30 @@ const PACKAGE_VERSION = (JSON.parse(readFileSync(new URL('../package.json', impo
 
 /** A never-expiring human credential that needs no token endpoint to use. */
 const PASTED_HUMAN: Credential = { kind: 'oauth-pasted', accessToken: 'mcpat_human' };
+const PUB_TEXT = readFileSync(new URL('./fixtures/crypto/fixture-key.pub', import.meta.url), 'utf8');
+const PUBLIC_KEY = publicKeyDescriptor(PUB_TEXT);
+const SIGNING_REF = { origin: ORIGIN, kind: 'machine' as const, id: 'local' };
+const ARMOR = '-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n';
+
+const SIGNING_KEYS: Pick<PrincipalKeyManager, 'inspect' | 'resolveRef' | 'withSigningKey'> = {
+  resolveRef: () => SIGNING_REF,
+  inspect: async () => ({ exists: true, source: 'generated', backend: 'file', publicKey: PUBLIC_KEY }),
+  withSigningKey: async (_ref, callback) => callback('/fake/private-key'),
+};
+
+function fakeSshProcess(): SshProcessAdapter {
+  return {
+    probe: () => ({ status: 255, stderr: Buffer.from('No principal matched\\n') }),
+    async run(_cmd, args) {
+      const stdout = args[0] === '-y' && args[1] === '-f' ? PUB_TEXT : ARMOR;
+      return { status: 0, stdout: Buffer.from(stdout), stderr: Buffer.alloc(0), timedOut: false, truncated: false };
+    },
+  };
+}
+
+afterEach(() => {
+  resetSshKeygenProbe();
+});
 
 /** Seed a `human` credential into the keychain-backed store for `origin`. */
 function seedHuman(t: HubIo, origin = ORIGIN, cred: Credential = PASTED_HUMAN): void {
@@ -172,6 +201,72 @@ test('mcp: a baseline tool call becomes ONE authenticated POST and maps the 2xx 
   assert.equal(whats.length, 1, 'exactly one hub call for the tool');
   assert.equal(whats[0]!.authorization, 'Bearer mcpat_human', 'the human bearer rode the Authorization header');
   assert.deepEqual(JSON.parse(whats[0]!.body!), { workflow: 'wf' });
+});
+
+test('mcp: submit attaches a DSSE submission proof over the original value', async () => {
+  let submitBody: Record<string, unknown> | undefined;
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/get_order': () => ({
+      status: 200,
+      json: {
+        text: '',
+        workflow: 'wf1',
+        run: 'run1',
+        order: {
+          run: 'run1',
+          workflow: 'wf1',
+          step: 'producer',
+          key: 'k',
+          defDigest: 'def-digest',
+          inputs: ['input'],
+          outputs: ['result'],
+          consumes: { input: { value: 'seen' } },
+          consumedFingerprint: { input: 3 },
+          owes: [{ path: 'result', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+        },
+        lease: { claimed: true },
+      },
+    }),
+    'POST /api/submit': (req) => {
+      submitBody = JSON.parse(req.body ?? '{}') as Record<string, unknown>;
+      return { status: 200, json: { text: 'ok', outcome: 'green' } };
+    },
+  };
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+  const mcpIo = t.io as unknown as {
+    principalKeys?: Pick<PrincipalKeyManager, 'inspect' | 'resolveRef' | 'withSigningKey'>;
+    sshProcess?: SshProcessAdapter;
+  };
+  mcpIo.principalKeys = SIGNING_KEYS;
+  mcpIo.sshProcess = fakeSshProcess();
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'submit', {
+    workflow: 'wf1',
+    run: 'run1',
+    path: 'result',
+    value: { answer: 42 },
+  })]);
+  assert.deepEqual(resultJson(frames[1]!), { text: 'ok', outcome: 'green' });
+  assert.ok(submitBody !== undefined);
+  assert.deepEqual(submitBody.value, { answer: 42 });
+  assert.equal(typeof submitBody.proof, 'string');
+
+  const verified = await dsseVerifySubmission(JSON.parse(submitBody.proof as string), {
+    async verify(_bytes, signature) {
+      return signature.toString('utf8') === ARMOR
+        ? { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const }
+        : null;
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
+    produced: Array<{ artifact: string }>;
+    consumedFingerprint: Record<string, number>;
+  };
+  assert.equal(record.produced[0]!.artifact, 'result');
+  assert.deepEqual(record.consumedFingerprint, { input: 3 });
 });
 
 test('mcp: a non-2xx REST reply maps to an isError result carrying the body message', async () => {
