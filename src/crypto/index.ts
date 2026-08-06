@@ -148,6 +148,24 @@ export type { DefPolicy, DefVerdict, VerifyPublicationInput, VerifyPublicationOp
 export { verifyOrigin, verifyOriginSidecar } from './verify-origin.ts';
 export type { OriginVerdict, VerifyOriginInput, VerifyOriginOptions } from './verify-origin.ts';
 
+// ---- policy floors ----
+export {
+  DEF_POLICY_RANK,
+  POLICY_FLOOR_PRESETS,
+  floorDefPolicyMinimum,
+  mergePolicyFloorWithLocal,
+  policyFloorGaps,
+  stricterDefPolicy,
+  verifyPolicyFloorRecord,
+} from './policy-floor.ts';
+export type {
+  PolicyFloorGap,
+  PolicyFloorMergeResult,
+  PolicyFloorVerdict,
+  VerifyPolicyFloorInput,
+  VerifyPolicyFloorOptions,
+} from './policy-floor.ts';
+
 // ---- WP-D1 enrollment ----
 export {
   DEFAULT_MACHINE_SCOPE,

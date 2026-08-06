@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { defInstructionDigest } from '../../../src/order-resolver.ts';
+import { POLICY_FLOOR_PRESETS } from '../../../src/crypto/policy-floor.ts';
 import { createBundleIngestor } from '../../../src/store/index.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from '../../../test/helpers/store-fixture.ts';
 import type { DefPolicy, DefVerdict } from '../../../src/crypto/verify-publication.ts';
@@ -147,3 +148,20 @@ test('command hard rule refuses without an execution verifier before reading def
   refusal(result);
   assert.match(result.reason, /unverifiable: execution-time publication verifier is not configured/);
 });
+
+for (const preset of ['L0', 'L1', 'L2'] as const) {
+  test(`command hard rule refuses an unverified definition with floor ${preset} and local off`, async () => {
+    const installed = await fixture();
+    const resolver = createStoreInstructionResolver({
+      projectRoot: installed.projectRoot,
+      globalRoot: installed.globalRoot,
+      verifier: createBundleIngestor(),
+      defPolicy: 'off',
+      policyFloor: POLICY_FLOOR_PRESETS[preset],
+      definitionVerifier: () => verdict('unsigned'),
+    });
+    const result = await resolver.resolveCommand(order(installed.defDigest, 'command-step', 'command'));
+    refusal(result);
+    assert.match(result.reason, /unsigned/);
+  });
+}

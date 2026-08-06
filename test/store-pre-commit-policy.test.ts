@@ -16,6 +16,7 @@ import {
   workflowCoordinate,
 } from '../src/store/index.ts';
 import type { BundleSource } from '../src/store/install.ts';
+import type { PolicyFloor } from '../src/crypto/records.ts';
 
 const DIGEST = 'a'.repeat(64);
 const KEY_BLOB = Buffer.from('pre-commit-synthetic-key');
@@ -57,6 +58,7 @@ function makeVerifier(args: {
   policy: 'enforce' | 'warn' | 'off';
   warn: string[];
   allowedSigners?: string;
+  policyFloor?: PolicyFloor;
 }) {
   const env = { XDG_CONFIG_HOME: args.cwd };
   if (args.allowedSigners !== undefined) {
@@ -68,6 +70,7 @@ function makeVerifier(args: {
     cwd: args.cwd,
     env,
     policy: args.policy,
+    ...(args.policyFloor === undefined ? {} : { policyFloor: args.policyFloor }),
     warn: (line) => args.warn.push(line),
     signerForPrincipal: ({ principal, allowedSignersText }) => {
       assert.equal(principal, 'publisher');
@@ -205,4 +208,50 @@ test('install policy: exact signed evidence is retained outside the object and r
   const afterTrustRootChange = await execution({ bundleDigest: DIGEST, objectPath });
   assert.equal(afterTrustRootChange.kind, 'unverifiable');
   assert.deepEqual(readFileSync(evidencePath), sidecar);
+});
+
+test('install policy floor raises local off to enforce for unsigned definitions', async () => {
+  const cwd = temp('owenloop-precommit-floor-enforce-');
+  const warnings: string[] = [];
+  const verifier = makeVerifier({
+    cwd,
+    policy: 'off',
+    warn: warnings,
+    policyFloor: {
+      trustMode: 'strict',
+      unsignedDefs: 'refuse',
+      unsignedArtifacts: 'refuse',
+      originRules: 'enforced',
+    },
+  });
+  await assert.rejects(verifier.verify(input(cwd)), (error: unknown) => {
+    assert.ok(error instanceof StoreDefinitionVerificationError);
+    assert.equal(error.verdict, 'unsigned');
+    assert.equal(error.policy, 'enforce');
+    return true;
+  });
+  assert.deepEqual(warnings, []);
+});
+
+test('install policy floor cannot lower an already-enforced local policy', async () => {
+  const cwd = temp('owenloop-precommit-floor-monotone-');
+  const warnings: string[] = [];
+  const verifier = makeVerifier({
+    cwd,
+    policy: 'enforce',
+    warn: warnings,
+    policyFloor: {
+      trustMode: 'seamless',
+      unsignedDefs: 'warn',
+      unsignedArtifacts: 'warn',
+      originRules: 'advisory',
+    },
+  });
+  await assert.rejects(verifier.verify(input(cwd)), (error: unknown) => {
+    assert.ok(error instanceof StoreDefinitionVerificationError);
+    assert.equal(error.verdict, 'unsigned');
+    assert.equal(error.policy, 'enforce');
+    return true;
+  });
+  assert.deepEqual(warnings, []);
 });
