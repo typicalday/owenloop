@@ -64,7 +64,8 @@ for the full breakdown.
 | `crew rm <crewId> [--hub <url>]` | delete a crew; work stamped to it moves to the org's orphan crew — see [Crews](#crews) |
 | `crew member add <crewId> <principalKind> <principalId> [--hub <url>]` | add a member or agent to a crew — see [Crews](#crews) |
 | `crew member rm <crewId> <principalId> [--hub <url>]` | remove a principal from a crew — see [Crews](#crews) |
-| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]` | onboard this machine: may store human and Scoped Identity credentials, ensure the three principal signing keys, write only execution-settings `hubOrigin`, and converge the bundled plugins for Claude Code and Codex — see [`setup`](#setup--onboard-a-machine) |
+| `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]` | onboard this machine: may store human and Scoped Identity credentials, ensure the three principal signing keys, relay the machine enrollment grant, write only execution-settings `hubOrigin`, and converge the bundled plugins for Claude Code and Codex — see [`setup`](#setup--onboard-a-machine) |
+| `enrollments [--hub <url>]` | read and locally classify the hub's relayed machine enrollment grants; never creates keys or writes the roster — see [`enrollments`](#enrollments--inspect-machine-enrollment) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
@@ -1404,13 +1405,13 @@ lines (the tolerant-false notices, the transfer summary) go to stderr only.
 `owenloop setup` is the one-shot onboarding command. It runs seven ordered steps.
 Depending on the machine state, setup may store the human credential, mint or
 rekey and store a Scoped Identity credential, ensure the three principal
-signing keys, and write only `hubOrigin` in the
-execution settings file while preserving its other keys. The plugin step
-probes and, when needed, converges the bundled `owenloop` plugin for each
-available harness: Claude Code and Codex. Plugin convergence is non-fatal and
-setup continues when a harness is missing, the bundled marketplace root is
-unavailable, or a plugin command fails. A second run with the expected plugin
-version already installed performs no plugin writes. The steps:
+signing keys, relay a signed machine enrollment grant, and write only
+`hubOrigin` in the execution settings file while preserving its other keys.
+The plugin step probes and, when needed, converges the bundled `owenloop` plugin
+for each available harness: Claude Code and Codex. Plugin convergence is
+non-fatal and setup continues when a harness is missing, the bundled marketplace
+root is unavailable, or a plugin command fails. A second run with the expected
+plugin version already installed performs no plugin writes. The steps:
 
 1. **inspect** — read-only report of what's already present (human credential,
    execution settings, `claude` and `codex` on PATH, agent slots). No writes.
@@ -1423,7 +1424,8 @@ version already installed performs no plugin writes. The steps:
    [below](#choosing-the-scoped-identity-flow-a-vs-flow-b).
 4. **signing keys** — ensure an Ed25519 signing key for each of the three local
    principals, in order: human, machine, agent. Details
-   [below](#signing-keys-step-4).
+   [below](#signing-keys-step-4). After key convergence, setup performs the
+   enrollment relay sub-step described below.
 5. **execution settings** — write only `hubOrigin` into the execution settings
    file so the local Step Agent talks to this hub, preserving every other key
    (skipped when `hubOrigin` already matches).
@@ -1510,6 +1512,57 @@ work package). A nonexistent path fails up front, before any browser opens.
 existing (macos-security)` — never key bytes, fingerprints, or secret-store
 values. The full storage and signing model is in
 [Signing and key storage](crypto.md).
+
+### Machine enrollment relay
+
+After the three keys are ensured, setup tries to register the machine public key
+with the hub. The relay is deliberately subordinate to local key convergence:
+
+1. Read-only inspect the human signing key. If no human signing key is present,
+   setup records `skipped` and performs no enrollment request.
+2. `GET /api/enrollments` with the human credential. If the hub is unavailable,
+   returns an unsupported status such as `404`, returns `500`, or returns an
+   unusable response, setup records `noted` and continues.
+3. If the machine public-key fingerprint is already present, setup records
+   `skipped` and does not sign or POST a duplicate.
+4. Otherwise, the human signing key signs an `EnrollmentGrantRecord` locally.
+   The grant names the machine principal `{ kind: "machine", id: "local" }`,
+   uses the default least-privilege machine scope, and sets `grantedBy` to the
+   human public-key fingerprint.
+5. `POST /api/enrollments` receives only `{ envelope }`, where `envelope` is the
+   signed DSSE enrollment grant. The machine private key, human private key
+   bytes, key-store values, and private-key paths never enter the request body.
+   HTTP `409` means already registered and becomes `skipped`; other transport or
+   hub failures become `noted` and do not undo local key creation.
+
+The relay is idempotent (repeating the operation after the first successful
+registration changes nothing) and the hub is only a storage/relay endpoint. The
+hub does not create, sign, or endorse the grant.
+
+## `enrollments` — inspect machine enrollment
+
+`owenloop enrollments [--hub <url>]` fetches the hub's relayed DSSE envelopes and
+verifies each entry locally. The command is read-only: it does not call key
+creation, does not sign a grant, and does not POST to the hub. The command uses
+the local `allowed_signers` trust root when one is configured.
+
+The command prints `{ ok, hub, enrollments }` on stdout. Each entry has one of
+four verdicts:
+
+| verdict | meaning |
+|---|---|
+| `enrolled` | the grant payload and DSSE signature are valid, the signer is in the local `allowed_signers` root, and an enrollment-chain validator approved the grant |
+| `unenrolled` | no envelope was supplied for the roster entry |
+| `unverifiable` | verification cannot establish trust, including a missing `allowed_signers` root or the D1 fail-closed state where no chain validator is installed |
+| `invalid` | the envelope, payload, schema, signer authorization, signature, or chain-validator result is invalid |
+
+WP-D1 intentionally does not install an enrollment-chain validator. Therefore a
+well-formed, correctly signed D1 grant is reported as `unverifiable` until WP-D4
+installs the validator. This prevents a signature from being mistaken for proof
+that the grantor is enrolled.
+
+A missing human credential is exit `3`; hub, malformed-response, and other
+runtime failures are exit `1`; successful classification is exit `0`.
 
 ### Hub resolution differs from `agent new`
 

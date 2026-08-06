@@ -136,3 +136,17 @@ export { allowedSignersPath, resolveAllowedSigners, resolveAllowedSignersFile } 
 export type { AllowedSignersResolution, AllowedSignersPresent, AllowedSignersAbsent } from './trust-roots.ts';
 export { isDefPolicy, verifyPublication, verifyPublicationSidecar } from './verify-publication.ts';
 export type { DefPolicy, DefVerdict, VerifyPublicationInput, VerifyPublicationOptions } from './verify-publication.ts';
+
+// ---- WP-D1 enrollment ----
+export {
+  DEFAULT_MACHINE_SCOPE,
+  buildEnrollmentGrant,
+  verifyRosterEntry,
+} from './enrollment.ts';
+export type {
+  BuildEnrollmentGrantArgs,
+  EnrollmentChainValidator,
+  RosterVerdict,
+  VerifyRosterEntryInput,
+  VerifyRosterEntryOptions,
+} from './enrollment.ts';

@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import { credentialSlot, hashDefForHub, keychainServiceFor } from '../src/hub.ts';
 import type { CredentialSlotSelector } from '../src/hub.ts';
 import { canonicalKeyRef } from '../src/crypto/keys.ts';
-import type { EnsureKeyResult, InspectKeyResult, PrincipalKeyRef } from '../src/crypto/keys.ts';
+import type { EnsureKeyResult, InspectKeyResult, PrincipalKeyRef, PublicKeyDescriptor } from '../src/crypto/keys.ts';
 import type { PrincipalKeyManager } from '../src/crypto/keys.ts';
 import type { CliIO, HarnessId, Keychain } from '../src/cli.ts';
 
@@ -261,6 +261,8 @@ export interface FakePrincipalKeysOpts {
   existing?: PrincipalKeyRef[];
   /** Refs whose `ensure` throws a fixed store failure (backend-failure injection). */
   failFor?: PrincipalKeyRef[];
+  /** Optional real human signing path for setup enrollment transport tests. */
+  humanSigningKey?: { path: string; publicKey: PublicKeyDescriptor };
 }
 
 /**
@@ -282,6 +284,8 @@ export function makeFakePrincipalKeys(opts: FakePrincipalKeysOpts = {}): {
   }
   const fail = new Set((opts.failFor ?? []).map(canonicalKeyRef));
   const calls: { ref: PrincipalKeyRef; reuse?: { path: string }; result?: EnsureKeyResult }[] = [];
+  const publicKeyFor = (ref: PrincipalKeyRef): PublicKeyDescriptor =>
+    ref.kind === 'human' && opts.humanSigningKey !== undefined ? opts.humanSigningKey.publicKey : FAKE_KEY_PUBLIC;
   const manager = {
     async ensure(ref: PrincipalKeyRef, reuseOpts?: { reuse?: { path: string } }): Promise<EnsureKeyResult> {
       const entry: { ref: PrincipalKeyRef; reuse?: { path: string }; result?: EnsureKeyResult } = { ref, reuse: reuseOpts?.reuse };
@@ -295,7 +299,7 @@ export function makeFakePrincipalKeys(opts: FakePrincipalKeysOpts = {}): {
             `a ${ref.kind} signing key already exists for ${ref.origin} — rotation is not part of WP-A2; the existing key is kept`,
           );
         }
-        entry.result = { ref, state: 'existing', backend: prior.backend as EnsureKeyResult['backend'], publicKey: FAKE_KEY_PUBLIC };
+        entry.result = { ref, state: 'existing', backend: prior.backend as EnsureKeyResult['backend'], publicKey: publicKeyFor(ref) };
         return entry.result;
       }
       if (reuseOpts?.reuse !== undefined && ref.kind !== 'human') {
@@ -307,7 +311,7 @@ export function makeFakePrincipalKeys(opts: FakePrincipalKeysOpts = {}): {
         backend: reuseOpts?.reuse !== undefined ? 'reused' : 'file',
       };
       state.set(key, rec);
-      entry.result = { ref, state: rec.state, backend: rec.backend as EnsureKeyResult['backend'], publicKey: FAKE_KEY_PUBLIC };
+      entry.result = { ref, state: rec.state, backend: rec.backend as EnsureKeyResult['backend'], publicKey: publicKeyFor(ref) };
       return entry.result;
     },
     async inspect(ref: PrincipalKeyRef): Promise<InspectKeyResult> {
@@ -319,7 +323,7 @@ export function makeFakePrincipalKeys(opts: FakePrincipalKeysOpts = {}): {
         exists: true,
         source: prior.state === 'reused' ? 'reused' : 'generated',
         backend: prior.state === 'reused' ? 'reused' : (prior.backend as InspectKeyResult['backend']),
-        publicKey: FAKE_KEY_PUBLIC,
+        publicKey: publicKeyFor(ref),
       };
     },
     resolveRef(origin: string, kind: PrincipalKeyRef['kind']): PrincipalKeyRef | null {
@@ -327,9 +331,12 @@ export function makeFakePrincipalKeys(opts: FakePrincipalKeysOpts = {}): {
       if (matches.length > 1) throw new Error(`multiple ${kind} signing-key refs found for ${origin}`);
       return matches[0]?.ref ?? null;
     },
-    async withSigningKey<T>(ref: PrincipalKeyRef, _callback: (keyPath: string) => Promise<T>): Promise<T> {
+    async withSigningKey<T>(ref: PrincipalKeyRef, callback: (keyPath: string) => Promise<T>): Promise<T> {
       if (!state.has(canonicalKeyRef(ref))) {
         throw new Error(`no ${ref.kind} signing key stored for ${ref.origin} — run owenloop setup`);
+      }
+      if (ref.kind === 'human' && opts.humanSigningKey !== undefined) {
+        return callback(opts.humanSigningKey.path);
       }
       throw new Error('fake signing-key manager cannot materialize private key bytes');
     },

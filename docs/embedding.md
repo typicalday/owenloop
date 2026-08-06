@@ -409,6 +409,14 @@ storage](crypto.md) is the full reference):
   exact-byte payload return.
 - `parseAllowedSigners` — structural parsing of stock `allowed_signers` files
   (never throws; malformed lines come back with line numbers).
+- `DEFAULT_MACHINE_SCOPE` and `buildEnrollmentGrant` — construct an immutable
+  machine enrollment grant from a public key descriptor without reading private
+  key material or performing I/O.
+- `verifyRosterEntry` — classify one relayed enrollment envelope locally as
+  `enrolled`, `unenrolled`, `unverifiable`, or `invalid`. Pass an
+  `EnrollmentChainValidator` through `VerifyRosterEntryOptions` when the host
+  can prove that the grantor chains to the organization root; without that
+  validator, verification deliberately remains `unverifiable`.
 
 `SUPPORTED_ENGINE_VERSION` is the programmatic form of the design.md §27
 engine-version contract — the highest `engine:` a def may declare and still load.
