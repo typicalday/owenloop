@@ -77,14 +77,19 @@ export interface RunningCommand {
 
 /** The runner seam. Injected into the exec loop; faked in the loop's tests. */
 export interface CommandRunner {
-  start(command: string, opts: { cwd: string }): RunningCommand;
+  start(command: string, opts: { cwd: string; env?: Record<string, string | undefined> }): RunningCommand;
 }
 
 /** The fully-resolved spawn arguments — pure data, asserted directly in tests. */
 export interface CommandPlan {
   command: string;
   args: string[];
-  options: { cwd: string; detached: true; stdio: ['ignore', 'pipe', 'pipe'] };
+  options: {
+    cwd: string;
+    detached: true;
+    stdio: ['ignore', 'pipe', 'pipe'];
+    env?: Record<string, string | undefined>;
+  };
 }
 
 /**
@@ -92,14 +97,25 @@ export interface CommandPlan {
  * spawn, no I/O — so tests assert the shape without launching anything. POSIX
  * `/bin/sh` keeps the default runner portable (ubuntu-latest CI, macOS dev).
  */
-export function buildCommandPlan(command: string, cwd: string): CommandPlan {
+export function buildCommandPlan(
+  command: string,
+  cwd: string,
+  env?: Record<string, string | undefined>,
+): CommandPlan {
   // If a future package interpolates consumed values into command text or the
   // child environment, that path must inherit resolveCommand's consume-side
-  // verification gate before this spawn plan is ever built.
+  // verification gate before this spawn plan is ever built. OWENLOOP_BUNDLE_DIR,
+  // when supplied by exec/loop.ts, is resolver-derived after that gate and is
+  // not a consumed artifact value.
   return {
     command: '/bin/sh',
     args: ['-c', command],
-    options: { cwd, detached: true, stdio: ['ignore', 'pipe', 'pipe'] },
+    options: {
+      cwd,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...(env !== undefined ? { env } : {}),
+    },
   };
 }
 
@@ -129,9 +145,9 @@ export function createDefaultRunner(opts: DefaultRunnerOptions = {}): CommandRun
   const sleep = opts.sleep ?? ((ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms)));
 
   return {
-    start(command: string, startOpts: { cwd: string }): RunningCommand {
+    start(command: string, startOpts: { cwd: string; env?: Record<string, string | undefined> }): RunningCommand {
       const startedAt = now();
-      const plan = buildCommandPlan(command, startOpts.cwd);
+      const plan = buildCommandPlan(command, startOpts.cwd, startOpts.env);
 
       const hash = createHash('sha256'); // stdout-then-stderr, the ordered form
       const stderrHash = createHash('sha256'); // stderr alone — the degraded fallback

@@ -332,6 +332,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     }
 
     let resolvedCommand: string;
+    let resolvedBundleDir: string | undefined;
     try {
       const resolved = await opts.instructions.resolveCommand(order);
       if (!resolved.ok) {
@@ -341,6 +342,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         return 'unresolved-instructions';
       }
       resolvedCommand = resolved.command;
+      resolvedBundleDir = resolved.bundleDir;
     } catch (e) {
       opts.err(
         `owenloop work exec: instruction refusal (integrity) for ${workflow}/${runId} ` +
@@ -354,7 +356,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     // Run the command and race it against the lease going terminal.
     let cmd: RunningCommand;
     try {
-      cmd = runner.start(resolvedCommand, { cwd: order.workdir ?? opts.cwd });
+      const startOptions = { cwd: order.workdir ?? opts.cwd };
+      if (resolvedBundleDir === undefined) cmd = runner.start(resolvedCommand, startOptions);
+      else cmd = runner.start(resolvedCommand, { ...startOptions, env: { ...(opts.env ?? process.env), OWENLOOP_BUNDLE_DIR: resolvedBundleDir } });
     } catch (e) {
       return submitReceipt(machineryFailure(e), order, resolvedCommand);
     }

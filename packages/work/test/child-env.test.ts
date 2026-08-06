@@ -10,7 +10,7 @@
  *
  * The second half is what stops a future `OWENLOOP_*` variable from silently
  * flowing to harness children. The first half is what makes the whole design
- * safe: the six explicitly consumed child inputs are admitted, while the bearer
+ * safe: the seven explicitly consumed child inputs are admitted, while the bearer
  * and helper-only credential names remain denied.
  */
 import assert from 'node:assert/strict';
@@ -22,12 +22,13 @@ import {
   isAdmittedChildEnvKey,
 } from '../src/harness/child-env.ts';
 
-test('the admitted set is exactly the six names with a reachable child consumer', () => {
+test('the admitted set is exactly the seven names with a reachable child consumer', () => {
   // Pinned as a LIST, not a count: growing this set is a deliberate act that
   // must show up in a diff next to the consumer that justifies it.
   assert.deepEqual(
     [...ADMITTED_OWENLOOP_KEYS].sort(),
     [
+      'OWENLOOP_BUNDLE_DIR',
       'OWENLOOP_CACHE_DIR',
       'OWENLOOP_CREDENTIAL_COMMAND',
       'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
@@ -65,8 +66,9 @@ test('everything outside the OWENLOOP_ namespace passes through untouched', () =
   assert.deepEqual(filterOwenloopEnv(source), source);
 });
 
-test('inside the namespace the six admitted inputs survive and everything else is denied', () => {
+test('inside the namespace the seven admitted inputs survive and everything else is denied', () => {
   const out = filterOwenloopEnv({
+    OWENLOOP_BUNDLE_DIR: '/bundle',
     OWENLOOP_CACHE_DIR: '/cache',
     OWENLOOP_SHIFT_ID: 'cond-1',
     OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
@@ -83,6 +85,7 @@ test('inside the namespace the six admitted inputs survive and everything else i
     OWENLOOP_INVENTED_NEXT_PHASE: 'surprise',
   });
   assert.deepEqual(out, {
+    OWENLOOP_BUNDLE_DIR: '/bundle',
     OWENLOOP_CACHE_DIR: '/cache',
     OWENLOOP_SHIFT_ID: 'cond-1',
     OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
@@ -106,6 +109,7 @@ test('isAdmittedChildEnvKey agrees with the filter, name by name', () => {
   for (const key of [
     'PATH',
     'CLAUDE_CODE_OAUTH_TOKEN',
+    'OWENLOOP_BUNDLE_DIR',
     'OWENLOOP_CACHE_DIR',
     'OWENLOOP_SHIFT_ID',
     'OWENLOOP_CREDENTIAL_COMMAND',

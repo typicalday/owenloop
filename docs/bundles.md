@@ -188,6 +188,30 @@ resolution time, not a best-effort read and not an `unknown-digest` fallback.
 The same verification protects both project and global objects, and a corrupt
 project copy is not masked by a valid global copy.
 
+## Bundle assets during execution
+
+When a command or agent step resolves its definition from an installed bundle,
+owenloop sets `OWENLOOP_BUNDLE_DIR` to the verified installed object directory.
+The directory is the bundle root, so a command can reference a shipped script with
+an explicit quoted path:
+
+```sh
+node "$OWENLOOP_BUNDLE_DIR/scripts/provision.mjs"
+```
+
+owenloop sets `OWENLOOP_BUNDLE_DIR` only for definitions with installed-bundle
+provenance. A definition without bundle provenance receives no value. Bundle
+scripts must treat an unset or empty variable as a hard error and report a
+message such as `this workflow must run from an installed bundle`; owenloop does
+not synthesize a fallback directory.
+
+`OWENLOOP_BUNDLE_DIR` is read-only. Workers must never write into the directory.
+The workflow store is content-addressed and verifies the installed object again
+when a resolver reads it. A write changes the object bytes, so the next read
+fails the digest or file-integrity check instead of executing the modified
+bundle. Mount or copy enforcement is not part of the current contract;
+documentation is the enforcement boundary for now.
+
 ## API results
 
 `packBundle(sourceDir)` returns:

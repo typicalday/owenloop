@@ -210,7 +210,7 @@ function result(exitCode: number | null, extra: Partial<CommandResult> = {}): Co
 
 interface FakeRunner {
   runner: CommandRunner;
-  starts: Array<{ command: string; cwd: string }>;
+  starts: Array<{ command: string; cwd: string; env?: Record<string, string | undefined> }>;
   state: { kills: number };
   resolve: (r: CommandResult) => void;
   reject: (e: unknown) => void;
@@ -218,7 +218,7 @@ interface FakeRunner {
 
 /** A runner whose single command settles only when the test says so. */
 function fakeRunner(opts: { throwOnStart?: Error; resolveOnKill?: CommandResult } = {}): FakeRunner {
-  const starts: Array<{ command: string; cwd: string }> = [];
+  const starts: Array<{ command: string; cwd: string; env?: Record<string, string | undefined> }> = [];
   const state = { kills: 0 };
   let resolveDone!: (r: CommandResult) => void;
   let rejectDone!: (e: unknown) => void;
@@ -228,7 +228,7 @@ function fakeRunner(opts: { throwOnStart?: Error; resolveOnKill?: CommandResult 
   });
   const runner: CommandRunner = {
     start(command, o): RunningCommand {
-      starts.push({ command, cwd: o.cwd });
+      starts.push({ command, cwd: o.cwd, ...(o.env !== undefined ? { env: o.env } : {}) });
       if (opts.throwOnStart !== undefined) throw opts.throwOnStart;
       return {
         done,
@@ -363,6 +363,44 @@ test('a malformed reject directive stays in the receipt but never issues a rejec
   assert.deepEqual(receipt.payload, { reject: { path: '', text: 'bad' } });
   assert.match(receipt.payloadError ?? '', /non-empty string/);
   assert.equal(only(calls, 'reject').length, 0);
+});
+
+test('exec passes bundle provenance with a full environment and omits env without it', async () => {
+  const env = {
+    PATH: '/fixture/bin',
+    HOME: '/fixture/home',
+    OWENLOOP_BUNDLE_DIR: '/ambient/bundle',
+  };
+  const bundled = fakeRunner();
+  const bundledHub = mockHub({ getOrder: [commandOrder({ command: 'ignored' })], submit: ['green'] });
+  const bundledInstructions: InstructionResolver = {
+    resolveCommand: async () => ({ ok: true, command: 'run-bundle-script', bundleDir: '/fixture/bundle' }),
+    resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'not used' }),
+  };
+  const bundledRun = createExecLoop(baseOpts(bundledHub.hub, bundled.runner, {
+    instructions: bundledInstructions,
+    env,
+  })).run();
+  await macrotaskSleep();
+  bundled.resolve(result(0));
+  assert.equal(await bundledRun, 'submitted');
+  assert.equal(bundled.starts[0]!.env?.PATH, '/fixture/bin');
+  assert.equal(bundled.starts[0]!.env?.OWENLOOP_BUNDLE_DIR, '/fixture/bundle');
+
+  const loose = fakeRunner();
+  const looseHub = mockHub({ getOrder: [commandOrder({ command: 'ignored' })], submit: ['green'] });
+  const looseInstructions: InstructionResolver = {
+    resolveCommand: async () => ({ ok: true, command: 'run-loose-script' }),
+    resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'not used' }),
+  };
+  const looseRun = createExecLoop(baseOpts(looseHub.hub, loose.runner, {
+    instructions: looseInstructions,
+    env,
+  })).run();
+  await macrotaskSleep();
+  loose.resolve(result(0));
+  assert.equal(await looseRun, 'submitted');
+  assert.equal('env' in loose.starts[0]!, false);
 });
 
 test('exec submit attaches a DSSE submission proof over the receipt', async () => {

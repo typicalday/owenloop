@@ -406,6 +406,13 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       return null;
     }
 
+    // Harness adapters build their child environment from process.env. This
+    // worker owns one agent order, so the resolver-derived bundle root is
+    // per-order state; clear it when provenance is absent to prevent stale
+    // values from reaching a later step in the same process.
+    if (resolved.bundleDir !== undefined) process.env['OWENLOOP_BUNDLE_DIR'] = resolved.bundleDir;
+    else delete process.env['OWENLOOP_BUNDLE_DIR'];
+
     let carrier: ReturnType<typeof parseHarnessCarrier>;
     const rawStep = resolved.step as unknown as Record<string, unknown>;
     try {

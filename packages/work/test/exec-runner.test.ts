@@ -15,11 +15,18 @@ import { PAYLOAD_MARKER, PAYLOAD_MAX_BYTES } from '../src/exec/payload.ts';
 const CWD = mkdtempSync(join(tmpdir(), 'owenloop-exec-runner-'));
 const sha256 = (s: string): string => `sha256:${createHash('sha256').update(s).digest('hex')}`;
 
-test('buildCommandPlan is a pure detached `/bin/sh -c` plan', () => {
+test('buildCommandPlan omits env when no environment is supplied', () => {
   const plan = buildCommandPlan('echo hi', '/some/cwd');
   assert.equal(plan.command, '/bin/sh');
   assert.deepEqual(plan.args, ['-c', 'echo hi']);
   assert.deepEqual(plan.options, { cwd: '/some/cwd', detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  assert.equal('env' in plan.options, false);
+});
+
+test('buildCommandPlan includes the supplied full child environment', () => {
+  const env = { PATH: '/fixture/bin', OWENLOOP_BUNDLE_DIR: '/fixture/bundle' };
+  const plan = buildCommandPlan('echo hi', '/some/cwd', env);
+  assert.deepEqual(plan.options.env, env);
 });
 
 test('a zero-exit command captures exit 0, byte counts, the stdout hash and tail', async () => {

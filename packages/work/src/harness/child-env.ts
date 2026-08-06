@@ -90,6 +90,9 @@ export const ADMITTED_OWENLOOP_KEYS: ReadonlySet<string> = new Set([
   // `resolveCacheDir` — src/bundle/cache.ts. Keeps anything the agent runs on
   // the same bundle cache as the worker. A path, not a secret.
   'OWENLOOP_CACHE_DIR',
+  // The step agent and anything it runs. Resolves bundle-shipped assets from
+  // the verified installed object directory. A path, not credential material.
+  'OWENLOOP_BUNDLE_DIR',
   // `holdShiftId` — src/roles/hold.ts. The fallback when `--shift=` is
   // absent from the mount's argv.
   'OWENLOOP_SHIFT_ID',
