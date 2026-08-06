@@ -51,11 +51,15 @@ export interface InstructionRefusal {
 export interface ResolvedCommand {
   ok: true;
   command: string;
+  /** Verified installed bundle root, when resolution has bundle provenance. */
+  bundleDir?: string;
 }
 
 export interface ResolvedStep {
   ok: true;
   step: StepDef;
+  /** Verified installed bundle root, when resolution has bundle provenance. */
+  bundleDir?: string;
 }
 
 export interface InstructionResolver {
@@ -365,7 +369,7 @@ export function createStoreInstructionResolver(
     }
     const originRefusal = await checkOrigin(order, resolved);
     if (originRefusal !== undefined) return originRefusal;
-    return { ok: true, step: resolved.step };
+    return { ok: true, step: resolved.step, ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}) };
   };
 
   return {
@@ -392,7 +396,7 @@ export function createStoreInstructionResolver(
       }
       // Deliberately return the authored bytes exactly. Runtime substitutions
       // belong to prompts only; this string is passed to `/bin/sh -c`.
-      return { ok: true, command: resolved.step.command };
+      return { ok: true, command: resolved.step.command, ...(resolved.objectPath !== undefined ? { bundleDir: resolved.objectPath } : {}) };
     },
 
     resolveStep: resolveAgentStep,

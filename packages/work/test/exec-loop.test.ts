@@ -210,7 +210,7 @@ function result(exitCode: number | null, extra: Partial<CommandResult> = {}): Co
 
 interface FakeRunner {
   runner: CommandRunner;
-  starts: Array<{ command: string; cwd: string }>;
+  starts: Array<{ command: string; cwd: string; env?: Record<string, string | undefined> }>;
   state: { kills: number };
   resolve: (r: CommandResult) => void;
   reject: (e: unknown) => void;
@@ -218,7 +218,7 @@ interface FakeRunner {
 
 /** A runner whose single command settles only when the test says so. */
 function fakeRunner(opts: { throwOnStart?: Error; resolveOnKill?: CommandResult } = {}): FakeRunner {
-  const starts: Array<{ command: string; cwd: string }> = [];
+  const starts: Array<{ command: string; cwd: string; env?: Record<string, string | undefined> }> = [];
   const state = { kills: 0 };
   let resolveDone!: (r: CommandResult) => void;
   let rejectDone!: (e: unknown) => void;
@@ -228,7 +228,7 @@ function fakeRunner(opts: { throwOnStart?: Error; resolveOnKill?: CommandResult 
   });
   const runner: CommandRunner = {
     start(command, o): RunningCommand {
-      starts.push({ command, cwd: o.cwd });
+      starts.push({ command, cwd: o.cwd, ...(o.env !== undefined ? { env: o.env } : {}) });
       if (opts.throwOnStart !== undefined) throw opts.throwOnStart;
       return {
         done,
@@ -280,7 +280,9 @@ test('runs the command and submits a receipt to the owed path (exit-success outc
   // First contact carried the exec holder.
   assert.deepEqual((only(calls, 'get_order')[0]!.arg as { holder?: unknown }).holder, EXEC);
   // The runner ran the order's command in the order's cwd (falls back to opts.cwd).
-  assert.deepEqual(fr.starts, [{ command: 'make build', cwd: '/work' }]);
+  assert.equal(fr.starts[0]!.command, 'make build');
+  assert.equal(fr.starts[0]!.cwd, '/work');
+  assert.equal('OWENLOOP_BUNDLE_DIR' in (fr.starts[0]!.env ?? {}), false);
   // Exactly one receipt to the owed path.
   assert.equal(submits.length, 1);
   assert.equal(submits[0]!.path, 'out');
@@ -365,6 +367,56 @@ test('a malformed reject directive stays in the receipt but never issues a rejec
   assert.equal(only(calls, 'reject').length, 0);
 });
 
+test('exec passes bundle provenance with the parent environment and removes it without provenance', async () => {
+  const configEnv = {
+    PATH: '/fixture/bin',
+    HOME: '/fixture/home',
+    OWENLOOP_BUNDLE_DIR: '/ambient/config-bundle',
+  };
+  const savedPath = process.env['PATH'];
+  const savedBundleDir = process.env['OWENLOOP_BUNDLE_DIR'];
+  process.env['PATH'] = '/parent/bin';
+  process.env['OWENLOOP_BUNDLE_DIR'] = '/ambient/parent-bundle';
+  try {
+    const bundled = fakeRunner();
+    const bundledHub = mockHub({ getOrder: [commandOrder({ command: 'ignored' })], submit: ['green'] });
+    const bundledInstructions: InstructionResolver = {
+      resolveCommand: async () => ({ ok: true, command: 'run-bundle-script', bundleDir: '/fixture/bundle' }),
+      resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'not used' }),
+    };
+    const bundledRun = createExecLoop(baseOpts(bundledHub.hub, bundled.runner, {
+      instructions: bundledInstructions,
+      env: configEnv,
+    })).run();
+    await macrotaskSleep();
+    bundled.resolve(result(0));
+    assert.equal(await bundledRun, 'submitted');
+    assert.equal(bundled.starts[0]!.env?.PATH, '/parent/bin');
+    assert.equal(bundled.starts[0]!.env?.OWENLOOP_BUNDLE_DIR, '/fixture/bundle');
+
+    const loose = fakeRunner();
+    const looseHub = mockHub({ getOrder: [commandOrder({ command: 'ignored' })], submit: ['green'] });
+    const looseInstructions: InstructionResolver = {
+      resolveCommand: async () => ({ ok: true, command: 'run-loose-script' }),
+      resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'not used' }),
+    };
+    const looseRun = createExecLoop(baseOpts(looseHub.hub, loose.runner, {
+      instructions: looseInstructions,
+      env: configEnv,
+    })).run();
+    await macrotaskSleep();
+    loose.resolve(result(0));
+    assert.equal(await looseRun, 'submitted');
+    assert.equal(loose.starts[0]!.env?.PATH, '/parent/bin');
+    assert.equal('OWENLOOP_BUNDLE_DIR' in (loose.starts[0]!.env ?? {}), false);
+  } finally {
+    if (savedPath === undefined) delete process.env['PATH'];
+    else process.env['PATH'] = savedPath;
+    if (savedBundleDir === undefined) delete process.env['OWENLOOP_BUNDLE_DIR'];
+    else process.env['OWENLOOP_BUNDLE_DIR'] = savedBundleDir;
+  }
+});
+
 test('exec submit attaches a DSSE submission proof over the receipt', async () => {
   const fr = fakeRunner();
   const response = commandOrder({ command: 'make signed-build' });
@@ -440,7 +492,9 @@ test('the runner receives only locally resolved command text, not an extra packe
   await macrotaskSleep();
   fr.resolve(result(0));
   assert.equal(await p, 'submitted');
-  assert.deepEqual(fr.starts, [{ command: 'printf "from-local-store\\n"', cwd: '/work' }]);
+  assert.equal(fr.starts[0]!.command, 'printf "from-local-store\\n"');
+  assert.equal(fr.starts[0]!.cwd, '/work');
+  assert.equal('OWENLOOP_BUNDLE_DIR' in (fr.starts[0]!.env ?? {}), false);
 });
 
 for (const kind of ['unknown-digest', 'unknown-step', 'integrity', 'no-digest', 'missing-command'] as const) {

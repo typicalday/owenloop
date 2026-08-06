@@ -222,15 +222,15 @@ let cacheDir: string;
 let savedEnv: NodeJS.ProcessEnv;
 const registeredIds: string[] = [];
 let verifiedStep: StepDef | undefined;
+let verifiedBundleDir: string | undefined;
 
 const testInstructions = (): InstructionResolver => ({
   resolveCommand: async () => ({ ok: false, kind: 'missing-command', reason: 'command resolution is not used by agent-run tests' }),
-  resolveStep: async (order) =>
-    order.defDigest.trim() === ''
-      ? { ok: false, kind: 'no-digest', reason: 'the order has no definition digest' }
-      : verifiedStep === undefined
-        ? { ok: false, kind: 'unknown-digest', reason: `unknown local workflow digest '${order.defDigest}'` }
-        : { ok: true, step: verifiedStep },
+  resolveStep: async (order) => {
+    if (order.defDigest.trim() === '') return { ok: false, kind: 'no-digest', reason: 'the order has no definition digest' };
+    if (verifiedStep === undefined) return { ok: false, kind: 'unknown-digest', reason: `unknown local workflow digest '${order.defDigest}'` };
+    return { ok: true, step: verifiedStep, ...(verifiedBundleDir !== undefined ? { bundleDir: verifiedBundleDir } : {}) };
+  },
 });
 
 const run = (args: string[], deps: RunDeps = {}): Promise<number> =>
@@ -293,12 +293,14 @@ function seedRawStep(x: Record<string, unknown>): void {
 
 beforeEach(() => {
   verifiedStep = undefined;
+  verifiedBundleDir = undefined;
   savedEnv = { ...process.env };
   home = mkdtempSync(join(tmpdir(), 'owenloop-agentrun-home-'));
   cacheDir = join(home, 'cache');
   process.env['HOME'] = home;
   process.env['XDG_CONFIG_HOME'] = home;
   process.env['OWENLOOP_CACHE_DIR'] = cacheDir;
+  delete process.env['OWENLOOP_BUNDLE_DIR'];
   delete process.env['OWENLOOP_TOKEN'];
   delete process.env['OWENLOOP_ACCOUNT'];
   delete process.env['OWENLOOP_SHIFT_ID'];
@@ -361,6 +363,43 @@ test('run() happy path: agent order → brief → fake harness turn → hub outc
   assert.equal(releases.length, 0);
   // One start, no deliver: a fresh attempt is a cold start.
   assert.deepEqual(fake.calls.map((c) => c.kind), ['start', 'stop']);
+});
+
+test('run() exposes the verified bundle directory and clears stale provenance', async () => {
+  const fake: FakeAdapter = createFakeAdapter({ id: 'fake' });
+  useAdapter(fake);
+  seedBundle();
+  verifiedBundleDir = join(home, 'installed-bundle');
+  process.env['OWENLOOP_BUNDLE_DIR'] = '/stale/bundle';
+
+  const firstHub = probeHub({ responses: [agentOrder(), agentOrder({ outcome: 'ok' })], def: DEF });
+  assert.equal(
+    await run(WIRE, {
+      hub: firstHub.hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'host:123',
+      cwd: '/work',
+      out: () => {},
+      err: () => {},
+    }),
+    0,
+  );
+  assert.equal(process.env['OWENLOOP_BUNDLE_DIR'], verifiedBundleDir);
+
+  verifiedBundleDir = undefined;
+  const secondHub = probeHub({ responses: [agentOrder(), agentOrder({ outcome: 'ok' })], def: DEF });
+  assert.equal(
+    await run(WIRE, {
+      hub: secondHub.hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'host:123',
+      cwd: '/work',
+      out: () => {},
+      err: () => {},
+    }),
+    0,
+  );
+  assert.equal('OWENLOOP_BUNDLE_DIR' in process.env, false);
 });
 
 // D10, and the exact boundary of what Phase 4 fixed: the mount is a bare

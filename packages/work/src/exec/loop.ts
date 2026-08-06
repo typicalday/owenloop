@@ -19,10 +19,13 @@
  *     misroute, and no child process is started.
  *  3. RUN + RACE — the runner shells the command out while the lease loop runs.
  *     Whichever settles first wins (plan decision 9):
- *       - command settles (any exit code, or a machinery error) ⇒ build a
- *         receipt and `submit` it to every owed path, then stop the lease
- *         WITHOUT release (the run just closed). Exit 0 — delivering the receipt
- *         IS the job, even for a failing command (the exit code carries truth).
+ *       - an ordinary command settles (any exit code, or a machinery error) ⇒
+ *         build a receipt and `submit` it to every owed path. A payload reject
+ *         follows those submits. Exit 0 means the receipt/reject delivery won;
+ *         the receipt's exit code still carries the command result.
+ *       - a judge command exits 0 ⇒ submit its receipt; a non-zero exit ⇒ send
+ *         `reject` for `order.judge` without a receipt; signal or machinery
+ *         failure ⇒ no verdict, leave the claim for the reap path.
  *       - lease goes terminal first (lease-lost / ownership-error / unreachable /
  *         the engine closed the run) ⇒ kill the command's process group, NO
  *         submit (a submit would race the re-offer), exit 1.
@@ -332,6 +335,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     }
 
     let resolvedCommand: string;
+    let resolvedBundleDir: string | undefined;
     try {
       const resolved = await opts.instructions.resolveCommand(order);
       if (!resolved.ok) {
@@ -341,6 +345,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         return 'unresolved-instructions';
       }
       resolvedCommand = resolved.command;
+      resolvedBundleDir = resolved.bundleDir;
     } catch (e) {
       opts.err(
         `owenloop work exec: instruction refusal (integrity) for ${workflow}/${runId} ` +
@@ -354,7 +359,14 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     // Run the command and race it against the lease going terminal.
     let cmd: RunningCommand;
     try {
-      cmd = runner.start(resolvedCommand, { cwd: order.workdir ?? opts.cwd });
+      // spawn's env replaces the child environment. Start from the actual exec
+      // process environment so config-only opts.env cannot strip PATH/HOME, then
+      // explicitly remove bundle provenance for loose definitions.
+      const childEnv: Record<string, string | undefined> = { ...process.env };
+      if (resolvedBundleDir === undefined) delete childEnv['OWENLOOP_BUNDLE_DIR'];
+      else childEnv['OWENLOOP_BUNDLE_DIR'] = resolvedBundleDir;
+      const startOptions = { cwd: order.workdir ?? opts.cwd, env: childEnv };
+      cmd = runner.start(resolvedCommand, startOptions);
     } catch (e) {
       return submitReceipt(machineryFailure(e), order, resolvedCommand);
     }
