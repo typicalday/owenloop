@@ -98,6 +98,7 @@ function mockHub(responses: GetOrderResponse[]): HubClient {
     async whatsNext() {
       return { text: '' };
     },
+    async reject() { return { text: '', ok: true }; },
     async whoami() {
       return {
         text: '',

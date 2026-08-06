@@ -6,6 +6,7 @@
  * carries the truth, and exec still exits 0 because its job (deliver the
  * receipt) succeeded. Pure construction so it is trivially asserted in tests.
  */
+import { parsePayloadLine, type ParsedPayload } from './payload.ts';
 import type { CommandResult } from './runner.ts';
 
 /** The submitted artifact value for a command order. */
@@ -19,6 +20,8 @@ export interface CommandReceipt {
   stdoutBytes: number;
   stderrBytes: number;
   outputTail: string;
+  payload?: unknown;
+  payloadError?: string;
   startedAt: number;
   finishedAt: number;
   durationMs: number;
@@ -38,7 +41,11 @@ export interface ReceiptContext {
 }
 
 /** Fold a raw `CommandResult` and its order context into the submitted receipt. */
-export function buildReceipt(result: CommandResult, ctx: ReceiptContext): CommandReceipt {
+export function buildReceipt(
+  result: CommandResult,
+  ctx: ReceiptContext,
+  parsedPayload: ParsedPayload = parsePayloadLine(result.payloadLine, result.payloadOverCap),
+): CommandReceipt {
   return {
     kind: 'command-receipt',
     command: ctx.command,
@@ -49,6 +56,8 @@ export function buildReceipt(result: CommandResult, ctx: ReceiptContext): Comman
     stdoutBytes: result.stdoutBytes,
     stderrBytes: result.stderrBytes,
     outputTail: result.outputTail,
+    ...('payload' in parsedPayload ? { payload: parsedPayload.payload } : {}),
+    ...(parsedPayload.payloadError !== undefined ? { payloadError: parsedPayload.payloadError } : {}),
     startedAt: result.startedAt,
     finishedAt: result.finishedAt,
     durationMs: result.durationMs,

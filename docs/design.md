@@ -936,6 +936,27 @@ Step Agents:**
   itself. A TTL sized to the judge's real worst-case latency, rather than
   the platform default, keeps `parallel: 1` actually sufficient in practice.
 
+## §24.10 Worker verdict transport
+
+Reference-mode judge orders carry `order.judge`, the explicit judged artifact stem;
+workers do not derive judge status from the synthesized step name. A command
+worker approves a judge order by submitting a receipt only when the command exits
+with code `0`. A nonzero exit sends the worker's `reject` request for
+`order.judge` and submits no receipt. A signal or machinery failure has no
+verdict, so the worker issues neither verb and the reap path re-offers the order.
+
+Command receipts may also carry a bounded JSON payload emitted by a stdout line
+beginning with `##owenloop:payload##`. The last marker line wins, and the 64 KiB
+JSON-text cap protects the runner because the runner does not buffer full stdout.
+A valid plain-step payload reject is delivered only after every owed receipt has
+been submitted. The reject request contains `workflow`, `run`, `path`, and `text`;
+the hub derives the rejecting actor and the client cannot provide `by`.
+
+This worker transport does not change `assertAuthority`: the engine continues to
+enforce consume-edge and judge-scoped authority. The hub-side reference-order
+projection and `/api/reject` handler are delivered by the separate follow-on
+instance.
+
 ## §25 The model checker (`owenloop check`) — scope
 
 `owenloop check <def>` (see `cli.ts` usage) runs a bounded reachability

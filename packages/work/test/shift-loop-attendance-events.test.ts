@@ -35,6 +35,7 @@ function mockHub(wakeChanged = false): { hub: HubClient; pings: Array<Record<str
     async heartbeat() { return { text: '', ok: true }; },
     async release() { return { text: '' }; },
     async submit() { return { text: '' }; },
+    async reject() { return { text: '', ok: true }; },
     async whoami() { return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' }; },
   };
   return { hub, pings };
@@ -117,6 +118,7 @@ test('attendance recorded DURING an in-flight ping still forces the very next pi
     async heartbeat() { return { text: '', ok: true }; },
     async release() { return { text: '' }; },
     async submit() { return { text: '' }; },
+    async reject() { return { text: '', ok: true }; },
     async whoami() { return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' }; },
   };
   // A frozen clock: without the fix nothing but the sentinel can make the

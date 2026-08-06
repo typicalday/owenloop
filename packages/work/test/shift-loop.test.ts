@@ -106,6 +106,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
       calls.push({ verb: 'submit', arg: req });
       return { text: '' };
     },
+    async reject() { return { text: '', ok: true }; },
     async whoami() {
       return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' };
     },
@@ -849,6 +850,7 @@ test('e2e: iterate() dispatches an agent order, parks quiet, and re-sweeps only 
     async release() {
       return { text: '' };
     },
+    async reject() { return { text: '', ok: true }; },
     async whoami() {
       return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' };
     },

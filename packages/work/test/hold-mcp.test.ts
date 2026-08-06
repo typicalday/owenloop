@@ -22,6 +22,7 @@ interface Call {
 interface HubCfg {
   getOrder?: GetOrderResponse | Error;
   submit?: { outcome?: string; closed?: boolean } | Error;
+  reject?: { ok?: boolean; closed?: boolean } | Error;
 }
 
 const PUB_TEXT = readFileSync(new URL('../../../test/fixtures/crypto/fixture-key.pub', import.meta.url), 'utf8');
@@ -66,6 +67,12 @@ function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
       if (s instanceof Error) throw s;
       return { text: 'ok', outcome: s.outcome, closed: s.closed };
     },
+    async reject(req: unknown) {
+      calls.push({ verb: 'reject', arg: req });
+      const s = cfg.reject ?? { ok: true };
+      if (s instanceof Error) throw s;
+      return { text: 'ok', ok: s.ok ?? true, closed: s.closed };
+    },
     async heartbeat() {
       return { text: '' };
     },
@@ -94,10 +101,20 @@ function parse(res: { content: Array<{ text: string }> }): ReturnType<typeof JSO
 
 // ---- shape ------------------------------------------------------------------
 
-test('the mount exposes exactly get_order and submit, plus the lease loop', () => {
+test('the mount exposes exactly get_order, reject, and submit, plus the lease loop', () => {
   const { hub } = mockHub({});
   const mount = createHoldMcp(deps(hub));
-  assert.deepEqual(mount.tools.map((t) => t.name).sort(), ['get_order', 'submit']);
+  assert.deepEqual(mount.tools.map((t) => t.name).sort(), ['get_order', 'reject', 'submit']);
+  const reject = tool(mount.tools, 'reject');
+  assert.deepEqual(reject.inputSchema, {
+    type: 'object',
+    required: ['path', 'text'],
+    properties: {
+      path: { type: 'string', description: 'The consumed artifact path to reject.' },
+      text: { type: 'string', description: 'The reason for rejecting the artifact.' },
+    },
+    additionalProperties: false,
+  });
   assert.equal(typeof mount.loop.run, 'function');
   assert.equal(typeof mount.loop.stop, 'function');
 });
@@ -244,9 +261,55 @@ test('submit surfaces a hub failure as an isError result', async () => {
   assert.match(parse(res).error, /rejected/);
 });
 
+// ---- reject ------------------------------------------------------------------
+
+test('reject posts only the bound workflow/run/path/text and never accepts client by', async () => {
+  const { hub, calls } = mockHub({ reject: { ok: true, closed: false } });
+  const mount = createHoldMcp(deps(hub));
+  const res = await tool(mount.tools, 'reject').handler({ path: 'input', text: 'bad value', by: 'forged' }, ctx);
+  assert.deepEqual(parse(res), { ok: true, closed: false, text: 'ok' });
+  assert.deepEqual(calls, [{
+    verb: 'reject',
+    arg: { workflow: 'wf1', run: 'run1', path: 'input', text: 'bad value' },
+  }]);
+  assert.equal((calls[0]!.arg as Record<string, unknown>)['by'], undefined);
+});
+
+test('reject validates path and text before touching the hub', async () => {
+  const { hub, calls } = mockHub({});
+  const mount = createHoldMcp(deps(hub));
+  const noPath = await tool(mount.tools, 'reject').handler({ text: 'bad' }, ctx);
+  const noText = await tool(mount.tools, 'reject').handler({ path: 'input' }, ctx);
+  assert.equal((noPath as { isError?: boolean }).isError, true);
+  assert.equal((noText as { isError?: boolean }).isError, true);
+  assert.equal(calls.length, 0);
+});
+
+test('a CLOSED reject stops the lease loop without releasing', async () => {
+  const { hub } = mockHub({ reject: { ok: true, closed: true } });
+  const mount = createHoldMcp(deps(hub));
+  const stops: Array<{ reason?: string; opts?: unknown }> = [];
+  const realStop = mount.loop.stop;
+  mount.loop.stop = ((reason?: string, opts?: unknown) => {
+    stops.push({ reason, opts });
+    return realStop.call(mount.loop, reason as never, opts as never);
+  }) as typeof mount.loop.stop;
+
+  await tool(mount.tools, 'reject').handler({ path: 'input', text: 'bad' }, ctx);
+  assert.deepEqual(stops, [{ reason: 'submitted', opts: { release: false } }]);
+});
+
+test('reject surfaces a hub failure as an isError result', async () => {
+  const { hub } = mockHub({ reject: new Error('reject offline') });
+  const mount = createHoldMcp(deps(hub));
+  const res = await tool(mount.tools, 'reject').handler({ path: 'input', text: 'bad' }, ctx);
+  assert.equal((res as { isError?: boolean }).isError, true);
+  assert.match(parse(res).error, /reject offline/);
+});
+
 // ---- terminal fast-fail (reviewer regression: lease-lost must stop the tools) --
 
-test('once the lease is lost, BOTH tools fast-fail with isError and NO hub call', async () => {
+test('once the lease is lost, ALL THREE tools fast-fail with isError and NO hub call', async () => {
   // First contact sees an unclaimed lease with no outcome → run() = lease-lost.
   const { hub, calls } = mockHub({
     getOrder: { text: '', workflow: 'wf1', run: 'run1', order: null, lease: { claimed: false } },
@@ -261,6 +324,9 @@ test('once the lease is lost, BOTH tools fast-fail with isError and NO hub call'
   const s = await tool(mount.tools, 'submit').handler({ path: 'pr', value: 1 }, ctx);
   assert.equal((s as { isError?: boolean }).isError, true);
   assert.match(parse(s).error, /no longer held/);
+  const r = await tool(mount.tools, 'reject').handler({ path: 'input', text: 'bad' }, ctx);
+  assert.equal((r as { isError?: boolean }).isError, true);
+  assert.match(parse(r).error, /no longer held/);
   assert.equal(calls.length, before, 'a terminated hold makes NO further hub calls');
 });
 
@@ -272,12 +338,14 @@ test('after a closing submit ends the hold, further tool calls fast-fail (double
   assert.equal(parse(first).closed, true);
   // …the stopped loop then settles…
   assert.equal(await mount.loop.run(), 'stopped');
-  // …and from then on both tools refuse without touching the hub.
+  // …and from then on all tools refuse without touching the hub.
   const before = calls.length;
   const again = await tool(mount.tools, 'submit').handler({ path: 'pr', value: 2 }, ctx);
   assert.equal((again as { isError?: boolean }).isError, true);
   assert.match(parse(again).error, /no longer held/);
   const g = await tool(mount.tools, 'get_order').handler({}, ctx);
   assert.equal((g as { isError?: boolean }).isError, true);
+  const r = await tool(mount.tools, 'reject').handler({ path: 'input', text: 'bad' }, ctx);
+  assert.equal((r as { isError?: boolean }).isError, true);
   assert.equal(calls.length, before);
 });

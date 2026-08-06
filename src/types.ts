@@ -184,6 +184,8 @@ export interface Order {
    *  the authored step's `executor:` field (the YAML grammar is unchanged),
    *  same pass-through contract as `model`/`x`. */
   worker?: string;
+  /** The artifact stem this order's judge step is verdicting, when present. */
+  judge?: string;
   /** Opaque config object for a non-agent/non-command worker type (or
    *  alongside a command). Carried through untouched, contents never read. */
   spec?: Record<string, unknown>;

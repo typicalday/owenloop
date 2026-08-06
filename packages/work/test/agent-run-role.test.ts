@@ -164,6 +164,7 @@ function probeHub(cfg: {
       whatsNextArgs.push(req);
       return { text: '', ...(cfg.def !== undefined ? { def: cfg.def } : {}) };
     },
+    async reject() { return { text: '', ok: true }; },
     async whoami() {
       return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' };
     },

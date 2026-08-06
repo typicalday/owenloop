@@ -1537,6 +1537,7 @@ export class Engine {
     if (step.workdir !== undefined) order.workdir = step.workdir;
     if (step.model !== undefined) order.model = step.model;
     if (step.executor !== undefined) order.worker = step.executor;
+    if (step.judges !== undefined) order.judge = step.judges;
     if (step.spec !== undefined) order.spec = step.spec;
     if (step.x !== undefined) order.x = step.x;
     if (f.cause !== undefined) order.cause = f.cause;

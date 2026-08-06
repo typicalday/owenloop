@@ -103,8 +103,8 @@ test('parseArgs reads --shift, both value forms', () => {
 // ---- exit-code mapping ------------------------------------------------------
 
 test('exitCodeFor maps every outcome to the documented code', () => {
-  const zero: ExecOutcome[] = ['submitted', 'completed'];
-  const one: ExecOutcome[] = ['misroute', 'unresolved-instructions', 'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'submit-rejected', 'submit-failed', 'stopped'];
+  const zero: ExecOutcome[] = ['submitted', 'completed', 'rejected', 'judge-rejected'];
+  const one: ExecOutcome[] = ['misroute', 'unresolved-instructions', 'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'submit-rejected', 'submit-failed', 'judge-no-verdict', 'reject-failed', 'stopped'];
   for (const o of zero) assert.equal(exitCodeFor(o), 0);
   for (const o of one) assert.equal(exitCodeFor(o), 1);
 });
@@ -244,6 +244,7 @@ function roleHub(cfg: { getOrder: GetOrderResponse; onHeartbeat?: (n: number) =>
     async whatsNext() {
       return { text: '' };
     },
+    async reject() { return { text: '', ok: true }; },
     async whoami() {
       return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' };
     },

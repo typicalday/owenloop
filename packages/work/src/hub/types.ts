@@ -189,6 +189,8 @@ export interface OrderPacket {
   model?: string;
   /** Worker kind; `'command'` for command orders, absent means agent. */
   worker?: string;
+  /** Artifact stem this order's judge step must verdict, when present. */
+  judge?: string;
   spec?: Record<string, unknown>;
   x?: Record<string, unknown>;
   consumes: Record<string, unknown>;
@@ -296,6 +298,26 @@ export interface SubmitRequest {
  */
 export interface SubmitResponse extends HubResponse {
   outcome?: string;
+  closed?: boolean;
+}
+
+// ---- reject -----------------------------------------------------------------
+
+/**
+ * Invalidate an artifact through the claiming worker's consume-edge authority.
+ * `by` is deliberately absent: the hub derives the actor from the claiming
+ * run's step, so a worker cannot impersonate another step.
+ */
+export interface RejectRequest {
+  workflow: string;
+  run: string;
+  path: string;
+  text: string;
+}
+
+/** The reject verb's flattened response envelope. */
+export interface RejectResponse extends HubResponse {
+  ok: boolean;
   closed?: boolean;
 }
 

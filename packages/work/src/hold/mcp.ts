@@ -4,13 +4,16 @@
  * A born-bound work-holder: the D2 stamped Step Agent's frontmatter declares
  * `mcpServers.owenloop = owenloop work hold --order <wf>/<run> --origin <url> --mcp`,
  * so when the Step Agent session boots it launches THIS as a stdio MCP server. The
- * server exposes two bare tools the model uses to do its order:
+ * server exposes three bare tools the model uses to do its order:
  *   - `get_order` → the order packet (prompt, inputs, owed outputs) for the run
  *     this holder is bound to. No ids are arguments — they came in on argv, never
  *     through the model.
  *   - `submit`    → post a receipt for an owed output path; when the hub reports
  *     the submit CLOSED the run, the lease loop is stopped with `release:false`
  *     (the claim is already gone).
+ *   - `reject`    → invalidate a consumed artifact through the claiming step's
+ *     server-derived authority; the client never supplies `by`. A CLOSED reject
+ *     also stops the lease loop without releasing the already-closed claim.
  *
  * Underneath the tools, the SAME lease loop the CLI `hold` runs keeps the order's
  * lease warm: `createHoldMcp` builds the loop with `onOrder` wired to capture the
@@ -56,7 +59,7 @@ export interface HoldMcpDeps {
 }
 
 export interface HoldMcpMount {
-  /** The two tools (`get_order`, `submit`) for the MCP server. */
+  /** The three tools (`get_order`, `submit`, `reject`) for the MCP server. */
   tools: ToolRegistration[];
   /** The lease loop kept warm underneath — the role runs and stops it. */
   loop: HoldLoop;
@@ -72,7 +75,7 @@ function orderView(res: GetOrderResponse): unknown {
 }
 
 /**
- * Build the hold MCP mount: the lease loop plus its two tools. The caller (the
+ * Build the hold MCP mount: the lease loop plus its three tools. The caller (the
  * role) creates the MCP server around `tools`, starts `loop.run()`, and pumps
  * stdin — stopping the loop on stdin EOF.
  */
@@ -248,5 +251,39 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     },
   };
 
-  return { tools: [getOrderTool, submitTool], loop };
+  const rejectTool: ToolRegistration = {
+    name: 'reject',
+    description:
+      'Reject a consumed artifact path with a reason. The hub derives the rejecting step from this held run; the client cannot supply `by`.',
+    inputSchema: {
+      type: 'object',
+      required: ['path', 'text'],
+      properties: {
+        path: { type: 'string', description: 'The consumed artifact path to reject.' },
+        text: { type: 'string', description: 'The reason for rejecting the artifact.' },
+      },
+      additionalProperties: false,
+    },
+    handler: async (args) => {
+      const gone = terminalGuard();
+      if (gone !== undefined) return gone;
+      const path = args['path'];
+      const text = args['text'];
+      if (typeof path !== 'string' || path.trim() === '') {
+        return textResult({ error: 'reject requires a non-empty string "path"' }, true);
+      }
+      if (typeof text !== 'string' || text.trim() === '') {
+        return textResult({ error: 'reject requires a non-empty string "text"' }, true);
+      }
+      try {
+        const res = await hub.reject({ workflow, run, path, text });
+        if (res.closed === true) loop.stop('submitted', { release: false });
+        return textResult({ ok: res.ok, closed: res.closed ?? false, text: res.text });
+      } catch (e) {
+        return textResult({ error: errMsg(e) }, true);
+      }
+    },
+  };
+
+  return { tools: [getOrderTool, submitTool, rejectTool], loop };
 }

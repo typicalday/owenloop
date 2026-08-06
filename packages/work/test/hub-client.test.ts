@@ -92,6 +92,18 @@ test('submit sends its full body including done', async () => {
   assert.deepEqual(captured[0]!.body, { workflow: 'wf1', run: 'r1', path: 'pr', value: { n: 1 }, done: true });
 });
 
+test('reject POSTs /api/reject without a client-supplied by field', async () => {
+  const captured: Captured[] = [];
+  const c = client(fakeFetch(captured, { body: { text: 'rejected', ok: true, closed: false } }));
+  const res = await c.reject({ workflow: 'wf1', run: 'r1', path: 'input', text: 'bad value' });
+  assert.equal(captured[0]!.method, 'POST');
+  assert.equal(captured[0]!.url, 'https://hub.example/api/reject');
+  assert.deepEqual(captured[0]!.body, { workflow: 'wf1', run: 'r1', path: 'input', text: 'bad value' });
+  assert.equal((captured[0]!.body as Record<string, unknown>)['by'], undefined);
+  assert.equal(res.ok, true);
+  assert.equal(res.closed, false);
+});
+
 test('whoami GETs /api/whoami', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'ok', orgId: 'o1', orgName: 'Org', actor: { id: 'a', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' } }));

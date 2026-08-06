@@ -63,6 +63,7 @@ const macrotaskSleep = (): Promise<void> => new Promise((r) => setImmediate(r));
 interface OrderOpts {
   command?: string;
   worker?: string;
+  judge?: string;
   workdir?: string;
   owes?: string[];
   claimed?: boolean;
@@ -90,6 +91,7 @@ function commandOrder(o: OrderOpts = {}): GetOrderResponse {
       outputs: [],
       ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
       worker: o.worker ?? 'command',
+      ...(o.judge !== undefined ? { judge: o.judge } : {}),
       defDigest,
       consumes: {},
       owes: paths.map((path) => ({ path, judgmentRejects: 0, schemaRejects: 0, reasons: [] })),
@@ -127,6 +129,7 @@ interface MockCfg {
   getOrder: Array<GetOrderResponse | Error> | ((n: number) => GetOrderResponse);
   heartbeat?: (n: number) => void;
   submit?: Array<string | Error>;
+  reject?: Array<{ ok?: boolean; closed?: boolean; text?: string } | Error>;
   release?: () => Promise<{ text: string }>;
 }
 
@@ -136,6 +139,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[]; submits: Submit
   let goIdx = 0;
   let hbIdx = 0;
   let subIdx = 0;
+  let rejectIdx = 0;
 
   const hub: HubClient = {
     async getOrder(req) {
@@ -156,6 +160,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[]; submits: Submit
       return cfg.release !== undefined ? cfg.release() : { text: '' };
     },
     async submit(req) {
+      calls.push({ verb: 'submit', arg: req });
       submits.push({ path: req.path, value: req.value, holder: req.holder, ...(req.proof !== undefined ? { proof: req.proof } : {}) });
       const s = cfg.submit ?? ['green'];
       const item = s[Math.min(subIdx, s.length - 1)]!;
@@ -165,6 +170,14 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[]; submits: Submit
     },
     async whatsNext() {
       return { text: '' };
+    },
+    async reject(req) {
+      calls.push({ verb: 'reject', arg: req });
+      const s = cfg.reject ?? [{ ok: true }];
+      const item = s[Math.min(rejectIdx, s.length - 1)]!;
+      rejectIdx++;
+      if (item instanceof Error) throw item;
+      return { text: item.text ?? 'reject', ok: item.ok ?? true, ...(item.closed !== undefined ? { closed: item.closed } : {}) };
     },
     async whoami() {
       return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' };
@@ -278,10 +291,78 @@ test('runs the command and submits a receipt to the owed path (exit-success outc
   assert.equal(receipt.command, 'make build');
   assert.equal(receipt.exitCode, 0);
   assert.equal(receipt.outputHash, 'sha256:abc');
+  assert.equal('payload' in receipt, false);
+  assert.equal('payloadError' in receipt, false);
   assert.equal(receipt.orchestrator, 'host:123');
   assert.equal(receipt.step, 'builder');
   // The run closed via submit → no release (release:false path).
   assert.equal(only(calls, 'release').length, 0);
+});
+
+test('receipt payload is parsed before proof construction and the proof covers the payload', async () => {
+  const fr = fakeRunner();
+  const response = commandOrder({ command: 'emit-payload' });
+  response.order!.consumedFingerprint = { input: 4 };
+  const { hub, submits } = mockHub({ getOrder: [response], submit: ['green'] });
+  const sshCalls: Array<{ cmd: string; args: string[]; stdin?: Buffer }> = [];
+  const loop = createExecLoop(baseOpts(hub, fr.runner, {
+    origin: 'https://hub.example.test',
+    principalKeys: signingKeys(),
+    sshProcess: fakeSshProcess(sshCalls),
+  }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, { payloadLine: '{"answer":42}' }));
+  assert.equal(await p, 'submitted');
+
+  const receipt = submits[0]!.value as CommandReceipt;
+  assert.deepEqual(receipt.payload, { answer: 42 });
+  assert.equal('payloadError' in receipt, false);
+  const proof = submits[0]!.proof;
+  assert.ok(proof !== undefined);
+  const verified = await dsseVerifySubmission(JSON.parse(proof), {
+    async verify(_bytes, signature) {
+      return signature.toString('utf8') === ARMOR
+        ? { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const }
+        : null;
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
+    produced: Array<{ valueDigest: string }>;
+  };
+  assert.equal(record.produced[0]!.valueDigest, valueDigestHex(receipt));
+});
+
+test('malformed or oversized payloads submit a receipt with payloadError and no payload', async () => {
+  for (const [label, extra] of [
+    ['malformed', { payloadLine: '{"broken"' }],
+    ['oversized', { payloadOverCap: true }],
+  ] as const) {
+    const fr = fakeRunner();
+    const { hub, submits } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+    const loop = createExecLoop(baseOpts(hub, fr.runner));
+    const p = loop.run();
+    await macrotaskSleep();
+    fr.resolve(result(0, extra));
+    assert.equal(await p, 'submitted', label);
+    const receipt = submits[0]!.value as CommandReceipt;
+    assert.equal(typeof receipt.payloadError, 'string', label);
+    assert.equal('payload' in receipt, false, label);
+  }
+});
+
+test('a malformed reject directive stays in the receipt but never issues a reject', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, { payloadLine: '{"reject":{"path":"" ,"text":"bad"}}' }));
+  assert.equal(await p, 'submitted');
+  const receipt = submits[0]!.value as CommandReceipt;
+  assert.deepEqual(receipt.payload, { reject: { path: '', text: 'bad' } });
+  assert.match(receipt.payloadError ?? '', /non-empty string/);
+  assert.equal(only(calls, 'reject').length, 0);
 });
 
 test('exec submit attaches a DSSE submission proof over the receipt', async () => {
@@ -411,6 +492,111 @@ test('a non-zero exit still submits a receipt carrying the exit code (outcome su
   fr.resolve(result(3));
   assert.equal(await p, 'submitted');
   assert.equal((submits[0]!.value as CommandReceipt).exitCode, 3);
+});
+
+test('a plain command submits every receipt before delivering a payload reject', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder({ owes: ['a', 'b'] })],
+    submit: ['green', 'green'],
+    reject: [{ ok: true, closed: false }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, { payloadLine: '{"reject":{"path":"input","text":"upstream is invalid"}}' }));
+  assert.equal(await p, 'rejected');
+  assert.deepEqual(submits.map((s) => s.path), ['a', 'b']);
+  const verbs = calls.filter((call) => call.verb === 'submit' || call.verb === 'reject').map((call) => call.verb);
+  assert.deepEqual(verbs, ['submit', 'submit', 'reject']);
+  assert.deepEqual(only(calls, 'reject')[0]!.arg, {
+    workflow: 'wf1',
+    run: 'run1',
+    path: 'input',
+    text: 'upstream is invalid',
+  });
+  assert.equal((only(calls, 'reject')[0]!.arg as Record<string, unknown>)['by'], undefined);
+});
+
+test('a closed payload reject stops without releasing the already-closed claim', async () => {
+  const fr = fakeRunner();
+  const { hub, calls } = mockHub({
+    getOrder: [commandOrder()],
+    submit: ['green'],
+    reject: [{ ok: true, closed: true }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, { payloadLine: '{"reject":{"path":"input","text":"bad value"}}' }));
+  assert.equal(await p, 'rejected');
+  assert.equal(only(calls, 'release').length, 0);
+});
+
+test('a payload reject failure is distinct and releases the claim after receipts land', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    submit: ['green'],
+    reject: [new Error('reject offline')],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, { payloadLine: '{"reject":{"path":"input","text":"bad value"}}' }));
+  assert.equal(await p, 'reject-failed');
+  assert.equal(submits.length, 1);
+  assert.equal(only(calls, 'reject').length, 1);
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+test('a judge with a non-zero exit rejects its judge path and submits no receipt', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder({ judge: 'input' })],
+    reject: [{ ok: true, closed: false }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(7, { outputTail: 'assertion failed' }));
+  assert.equal(await p, 'judge-rejected');
+  assert.equal(submits.length, 0);
+  assert.deepEqual(only(calls, 'reject')[0]!.arg, {
+    workflow: 'wf1',
+    run: 'run1',
+    path: 'input',
+    text: 'assertion failed',
+  });
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+test('a judge machinery failure issues neither submit nor reject and leaves the claim unreleased', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder({ judge: 'input' })] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(null, { error: 'terminated by signal' }));
+  assert.equal(await p, 'judge-no-verdict');
+  assert.equal(submits.length, 0);
+  assert.equal(only(calls, 'reject').length, 0);
+  assert.equal(only(calls, 'release').length, 0);
+});
+
+test('a zero-exit judge submits its receipt and ignores a payload reject directive', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder({ judge: 'input' })],
+    submit: ['green'],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, { payloadLine: '{"reject":{"path":"other","text":"do not send"}}' }));
+  assert.equal(await p, 'submitted');
+  assert.equal(submits.length, 1);
+  assert.equal(only(calls, 'reject').length, 0);
 });
 
 test('a machinery failure (runner done rejects) submits a null-exit receipt', async () => {

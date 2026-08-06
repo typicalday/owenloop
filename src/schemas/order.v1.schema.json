@@ -38,6 +38,7 @@
     "workdir": { "type": "string" },
     "model": { "type": "string" },
     "worker": { "type": "string" },
+    "judge": { "type": "string" },
     "spec": {
       "type": "object",
       "description": "Opaque worker configuration. The engine carries keys and values through without interpreting them.",

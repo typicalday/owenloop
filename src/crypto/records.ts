@@ -330,6 +330,7 @@ export const ORDER_FIELDS = {
   workdir: 'optional',
   model: 'optional',
   worker: 'optional',
+  judge: 'optional',
   spec: 'optional',
   x: 'optional',
   consumes: 'required',

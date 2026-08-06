@@ -267,6 +267,7 @@ function roleHub(cfg: { getOrder: GetOrderResponse; onHeartbeat?: (n: number) =>
     async submit() {
       return { text: '' };
     },
+    async reject() { return { text: '', ok: true }; },
     async whoami() {
       return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' };
     },
