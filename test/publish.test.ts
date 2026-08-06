@@ -11,7 +11,13 @@ import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statS
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { canonicalKeyRef, keyRefHash, keysDirFor, PrincipalKeyManager } from '../src/crypto/keys.ts';
-import { DSSE_SSH_NAMESPACE, dsseVerifyPublication } from '../src/crypto/dsse.ts';
+import {
+  DSSE_SSH_NAMESPACE,
+  decodeBase64Strict,
+  dsseVerifyOrigin,
+  dsseVerifyPublication,
+  encodeBase64,
+} from '../src/crypto/dsse.ts';
 import { createSshSigner } from '../src/crypto/ssh.ts';
 import { digestBundle } from '../src/bundle/index.ts';
 import { defDigest } from '../src/store/types.ts';
@@ -21,6 +27,16 @@ import { makeIo } from './hubkit.ts';
 const SOURCE_FIXTURE = join(import.meta.dirname, 'fixtures', 'bundle', 'golden-source');
 const ORIGIN = 'http://127.0.0.1:9';
 const HUMAN_REF = { origin: ORIGIN, kind: 'human' as const, id: 'user_abc' };
+const GIT_SOURCE = {
+  kind: 'git' as const,
+  repo: 'https://github.com/example/workflow',
+  commit: '0123456789abcdef0123456789abcdef01234567',
+};
+const AGENT_SOURCE = {
+  kind: 'agent' as const,
+  agent: 'agent_123',
+  session: 'session_456',
+};
 
 function sourceFor(t: { cwd: string }): string {
   const source = join(t.cwd, 'source');
@@ -167,10 +183,12 @@ test('publish --unsigned removes a stale DSSE sidecar', async () => {
   bind(t);
   const output = join(t.cwd, 'published.wnlp');
   writeFileSync(`${output}.dsse`, '{"stale":true}\n');
+  writeFileSync(`${output}.origin.dsse`, '{"stale":true}\n');
 
   const code = await mainAsync(['publish', source, '--unsigned', '--output', output], t.io);
   assert.equal(code, 0, t.err.join('\n'));
   assert.equal(existsSync(`${output}.dsse`), false);
+  assert.equal(existsSync(`${output}.origin.dsse`), false);
   assert.equal(existsSync(`${output}.unsigned`), true);
 });
 
@@ -185,6 +203,7 @@ test('publish signed output is a verifiable publication DSSE over the canonical 
   const code = await mainAsync(['publish', source, '--output', output], t.io);
   assert.equal(code, 0, t.err.join('\n'));
   assert.equal(existsSync(`${output}.dsse`), true);
+  assert.equal(existsSync(`${output}.origin.dsse`), false);
   assert.equal(existsSync(`${output}.unsigned`), false);
   const envelope = JSON.parse(readFileSync(`${output}.dsse`, 'utf8')) as Record<string, unknown>;
 
@@ -210,6 +229,178 @@ test('publish signed output is a verifiable publication DSSE over the canonical 
   }
 });
 
+test('publish --source writes a signed origin sidecar bound to the canonical bundle digest', { skip: SSH_SKIP }, async () => {
+  const t = makeIo({ principalKeys: 'real', env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  const source = sourceFor(t);
+  bind(t);
+  const output = join(t.cwd, 'published.wnlp');
+  const keys = new PrincipalKeyManager({ env: t.io.env });
+  const ensured = await keys.ensure(HUMAN_REF);
+
+  const code = await mainAsync(['publish', source, '--source', JSON.stringify(GIT_SOURCE), '--output', output], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(existsSync(`${output}.origin.dsse`), true);
+  const result = JSON.parse(t.out.join('\n')) as Record<string, unknown>;
+  assert.equal(result.origin, `${output}.origin.dsse`);
+
+  const envelope = JSON.parse(readFileSync(`${output}.origin.dsse`, 'utf8')) as Record<string, unknown>;
+  const signer = createSshSigner({
+    namespace: DSSE_SSH_NAMESPACE,
+    verify: { principal: 'owenloop-test-author', allowedSignersText: `owenloop-test-author ${ensured.publicKey.openSshPublicKey}\\n` },
+  });
+  try {
+    const verified = await dsseVerifyOrigin(envelope, signer);
+    const record = JSON.parse(verified.payloadBytes.toString('utf8')) as Record<string, unknown>;
+    assert.equal(record.digest, digestBundle(readFileSync(output)).digest);
+    assert.equal(record.name, 'golden-bundle');
+    assert.equal(record.version, '1.0.0');
+    assert.deepEqual(record.source, GIT_SOURCE);
+    assert.equal(record.attesterKeyId, ensured.publicKey.keyid);
+    assert.equal(typeof record.timestamp, 'number');
+  } finally {
+    signer.dispose();
+  }
+
+  const originText = readFileSync(`${output}.origin.dsse`, 'utf8');
+  assert.equal(originText.includes(t.home), false, 'private-key storage path must not appear in origin sidecar');
+  assert.equal(originText.includes('PRIVATE'), false, 'private-key marker must not appear in origin sidecar');
+});
+
+test('publish --source uses the last repeated value and round-trips an agent source', { skip: SSH_SKIP }, async () => {
+  const t = makeIo({ principalKeys: 'real', env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  const source = sourceFor(t);
+  bind(t);
+  const output = join(t.cwd, 'published.wnlp');
+  const keys = new PrincipalKeyManager({ env: t.io.env });
+  const ensured = await keys.ensure(HUMAN_REF);
+
+  const code = await mainAsync(
+    [
+      'publish',
+      source,
+      '--source',
+      JSON.stringify(GIT_SOURCE),
+      '--source',
+      JSON.stringify(AGENT_SOURCE),
+      '--output',
+      output,
+    ],
+    t.io,
+  );
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const envelope = JSON.parse(readFileSync(`${output}.origin.dsse`, 'utf8')) as Record<string, unknown>;
+  const signer = createSshSigner({
+    namespace: DSSE_SSH_NAMESPACE,
+    verify: { principal: 'owenloop-test-author', allowedSignersText: `owenloop-test-author ${ensured.publicKey.openSshPublicKey}\\n` },
+  });
+  try {
+    const verified = await dsseVerifyOrigin(envelope, signer);
+    const record = JSON.parse(verified.payloadBytes.toString('utf8')) as Record<string, unknown>;
+    assert.deepEqual(record.source, AGENT_SOURCE);
+  } finally {
+    signer.dispose();
+  }
+});
+
+test('publish without --source removes a stale signed origin sidecar', { skip: SSH_SKIP }, async () => {
+  const t = makeIo({ principalKeys: 'real', env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  const source = sourceFor(t);
+  bind(t);
+  const output = join(t.cwd, 'published.wnlp');
+  const keys = new PrincipalKeyManager({ env: t.io.env });
+  await keys.ensure(HUMAN_REF);
+
+  const first = await mainAsync(['publish', source, '--source', JSON.stringify(GIT_SOURCE), '--output', output], t.io);
+  assert.equal(first, 0, t.err.join('\n'));
+  assert.equal(existsSync(`${output}.origin.dsse`), true);
+
+  const second = await mainAsync(['publish', source, '--output', output], t.io);
+  assert.equal(second, 0, t.err.join('\n'));
+  assert.equal(existsSync(`${output}.origin.dsse`), false);
+  const result = JSON.parse(t.out.at(-1) ?? '{}') as Record<string, unknown>;
+  assert.equal('origin' in result, false);
+});
+
+test('publish --source rejects --unsigned before writing or touching keys', async () => {
+  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  const source = sourceFor(t);
+  const output = join(t.cwd, 'published.wnlp');
+
+  const code = await mainAsync(
+    ['publish', source, '--source', JSON.stringify(GIT_SOURCE), '--unsigned', '--output', output],
+    t.io,
+  );
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /--source cannot be combined with --unsigned/);
+  assert.deepEqual(filesUnder(t.cwd).filter((path) => !path.includes(`${'/source/'}`)), []);
+  assert.deepEqual(filesUnder(t.home), []);
+  assert.equal(t.principalKeys?.calls.length, 0);
+});
+
+test('publish rejects malformed --source values before key work or filesystem writes', async () => {
+  const cases = [
+    { value: '{', pattern: /invalid JSON/ },
+    {
+      value: JSON.stringify({ kind: 'future', value: 'not-supported' }),
+      pattern: /--source does not match origin source schema/,
+    },
+    { value: JSON.stringify({ kind: 'git', repo: 'https://github.com/example/workflow' }), pattern: /--source does not match/ },
+    {
+      value: JSON.stringify({ kind: 'console', user: 'user_123' }),
+      pattern: /--source kind "console" requires a client-side signing ceremony/,
+    },
+  ];
+
+  for (const [index, testCase] of cases.entries()) {
+    const t = makeIo({ principalKeys: 'real', env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+    const source = sourceFor(t);
+    const output = join(t.cwd, `published-${index}.wnlp`);
+    const code = await mainAsync(['publish', source, '--source', testCase.value, '--output', output], t.io);
+    assert.equal(code, 1);
+    assert.match(t.err.join('\n'), testCase.pattern);
+    assert.deepEqual(filesUnder(t.cwd).filter((path) => !path.includes(`${'/source/'}`)), []);
+    assert.deepEqual(filesUnder(t.home), []);
+    assert.equal(existsSync(output), false);
+    assert.equal(existsSync(`${output}.dsse`), false);
+    assert.equal(existsSync(`${output}.origin.dsse`), false);
+  }
+});
+
+test('tampering with source.commit invalidates the signed origin sidecar', { skip: SSH_SKIP }, async () => {
+  const t = makeIo({ principalKeys: 'real', env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  const source = sourceFor(t);
+  bind(t);
+  const output = join(t.cwd, 'published.wnlp');
+  const keys = new PrincipalKeyManager({ env: t.io.env });
+  const ensured = await keys.ensure(HUMAN_REF);
+  const code = await mainAsync(['publish', source, '--source', JSON.stringify(GIT_SOURCE), '--output', output], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+
+  const envelope = JSON.parse(readFileSync(`${output}.origin.dsse`, 'utf8')) as {
+    payload: string;
+    payloadType: string;
+    signatures: unknown[];
+  };
+  const payloadBytes = decodeBase64Strict(envelope.payload);
+  const commitBytes = Buffer.from(GIT_SOURCE.commit, 'utf8');
+  const commitOffset = payloadBytes.indexOf(commitBytes);
+  assert.notEqual(commitOffset, -1, 'origin payload must contain the signed commit text');
+  const tamperedPayload = Buffer.from(payloadBytes);
+  tamperedPayload[commitOffset] = '1'.charCodeAt(0);
+  const tampered = { ...envelope, payload: encodeBase64(tamperedPayload) };
+
+  const signer = createSshSigner({
+    namespace: DSSE_SSH_NAMESPACE,
+    verify: { principal: 'owenloop-test-author', allowedSignersText: `owenloop-test-author ${ensured.publicKey.openSshPublicKey}\\n` },
+  });
+  try {
+    await assert.rejects(dsseVerifyOrigin(tampered, signer), /DSSE verification failed/);
+  } finally {
+    signer.dispose();
+  }
+});
+
 test('publish signed envelope rejects a wrong digest payload, tampered Base64, and tampered payload type', { skip: SSH_SKIP }, async () => {
   const t = makeIo({ principalKeys: 'real', env: { OWENLOOP_NO_KEYCHAIN: '1' } });
   const source = sourceFor(t);
@@ -232,5 +423,6 @@ test('publish signed envelope rejects a wrong digest payload, tampered Base64, a
   const wrongDigest = { ...envelope, payload: Buffer.from(JSON.stringify({ digest: 'f'.repeat(64) })).toString('base64') };
   await assert.rejects(dsseVerifyPublication(wrongDigest, signer));
   await assert.rejects(dsseVerifyPublication({ ...envelope, payload: '!' }, signer), /base64/);
+  // Origin is a real sibling record type; keep this as the type-confusion probe.
   await assert.rejects(dsseVerifyPublication({ ...envelope, payloadType: 'application/vnd.owenloop.origin.v1+json' }, signer));
 });

@@ -1,0 +1,149 @@
+{
+  "valid": {
+    "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "name": "fixture",
+    "version": "1.0.0",
+    "source": {
+      "kind": "git",
+      "repo": "https://github.com/example/workflow",
+      "commit": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "attesterKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "timestamp": 0
+  },
+  "additionalValid": [
+    {
+      "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "name": "fixture-console",
+      "version": "2.0.0",
+      "source": {
+        "kind": "console",
+        "user": "user_123"
+      },
+      "attesterKeyId": "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "timestamp": 1700000000000
+    },
+    {
+      "digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "name": "fixture-agent",
+      "version": "3.0.0",
+      "source": {
+        "kind": "agent",
+        "agent": "agent_123",
+        "session": "session_456"
+      },
+      "attesterKeyId": "SHA256:CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "timestamp": 1700000000001
+    }
+  ],
+  "invalid": [
+    {
+      "name": "bad digest",
+      "value": {
+        "digest": "not-a-digest",
+        "name": "fixture",
+        "version": "1.0.0",
+        "source": {
+          "kind": "git",
+          "repo": "https://github.com/example/workflow",
+          "commit": "0123456789abcdef0123456789abcdef01234567"
+        },
+        "attesterKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 0
+      },
+      "keyword": "pattern"
+    },
+    {
+      "name": "bad attester key id",
+      "value": {
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "name": "fixture",
+        "version": "1.0.0",
+        "source": {
+          "kind": "git",
+          "repo": "https://github.com/example/workflow",
+          "commit": "0123456789abcdef0123456789abcdef01234567"
+        },
+        "attesterKeyId": "not-a-key-id",
+        "timestamp": 0
+      },
+      "keyword": "pattern"
+    },
+    {
+      "name": "missing source",
+      "value": {
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "name": "fixture",
+        "version": "1.0.0",
+        "attesterKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 0
+      },
+      "keyword": "required"
+    },
+    {
+      "name": "extra top-level property",
+      "value": {
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "name": "fixture",
+        "version": "1.0.0",
+        "source": {
+          "kind": "git",
+          "repo": "https://github.com/example/workflow",
+          "commit": "0123456789abcdef0123456789abcdef01234567"
+        },
+        "attesterKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 0,
+        "extra": true
+      },
+      "keyword": "additionalProperties"
+    },
+    {
+      "name": "extra source property",
+      "value": {
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "name": "fixture",
+        "version": "1.0.0",
+        "source": {
+          "kind": "git",
+          "repo": "https://github.com/example/workflow",
+          "commit": "0123456789abcdef0123456789abcdef01234567",
+          "extra": true
+        },
+        "attesterKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 0
+      },
+      "keyword": "additionalProperties"
+    },
+    {
+      "name": "unknown source kind",
+      "value": {
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "name": "fixture",
+        "version": "1.0.0",
+        "source": {
+          "kind": "github",
+          "repo": "https://github.com/example/workflow",
+          "commit": "0123456789abcdef0123456789abcdef01234567"
+        },
+        "attesterKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 0
+      },
+      "keyword": "oneOf"
+    },
+    {
+      "name": "git source missing commit",
+      "value": {
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "name": "fixture",
+        "version": "1.0.0",
+        "source": {
+          "kind": "git",
+          "repo": "https://github.com/example/workflow"
+        },
+        "attesterKeyId": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "timestamp": 0
+      },
+      "keyword": "oneOf"
+    }
+  ]
+}

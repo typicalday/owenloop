@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:owenloop:schema:origin:v1",
+  "title": "owenloop origin record v1",
+  "description": "A signed provenance statement for one canonical workflow bundle.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["digest", "name", "version", "source", "attesterKeyId", "timestamp"],
+  "properties": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "$comment": "The source.oneOf branch order is load-bearing for the wire-contract manifest checks: git, console, agent.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "repo", "commit"],
+          "properties": {
+            "kind": { "const": "git" },
+            "repo": { "type": "string" },
+            "commit": {
+              "type": "string",
+              "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "user"],
+          "properties": {
+            "kind": { "const": "console" },
+            "user": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "agent", "session"],
+          "properties": {
+            "kind": { "const": "agent" },
+            "agent": { "type": "string" },
+            "session": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "attesterKeyId": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}
