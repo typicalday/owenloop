@@ -934,6 +934,22 @@ it — a `401` there means the credential is never written to disk. On success
 `orgId`, `identity`, and `email` when the hub returns one), read straight from
 `whoami`.
 
+**Recording the hub for `owenloop mcp` (`~/.owenloop/config.json`).** After the
+credential above is verified and stored, `login` makes one more best-effort
+write: it records the hub origin it just authenticated against in
+`~/.owenloop/config.json` (`{"version": 1, "hub": "<origin>"}` — never a
+secret, just the origin). This file is separate from both the credential store
+above and from `owenloop setup`'s `~/.config/owenloop/settings.json`; its only
+reader is `owenloop mcp`'s [origin resolution](#choosing-the-hub-origin),
+which needs to know your hub without enumerating the credential store (the
+Keychain and external-command backends can't be listed at all — see below). A
+failure to write this file is a **warning** printed to stderr, never a fatal
+error and never blocking `login` itself, since the credential is already
+safely stored by the time this write is attempted. Logging into a second hub
+overwrites this file — "last login wins" — so if you routinely switch between
+hubs, pass `--hub` explicitly to `owenloop mcp` (or set `OWENLOOP_HUB`) rather
+than relying on whichever `login` ran most recently.
+
 ### `connect` — bind a project to a hub
 
 `owenloop connect` writes `.owenloop/hub.json` recording which hub this project
@@ -1072,10 +1088,16 @@ minting on the wrong org is not undone by a retry:
 
 Unlike other commands this does **not** fall back to `OWENLOOP_HUB` or the
 built-in default hub — silently defaulting a mint would risk minting on the
-production hub while you're logged into a dev one. Note that hub enumeration is
-**file-store only** (shared with `owenloop mcp`): the keychain and the
-external-command backend cannot list their entries, so on such a machine step 2
-cannot enumerate the store and you must pass `--hub`.
+production hub while you're logged into a dev one. This is deliberately
+stricter than [`owenloop mcp`'s origin resolution](#choosing-the-hub-origin):
+`mcp` only ever reads state on your behalf, so a wrong guess there is just a
+tool call against the wrong (recoverable) hub, and it now falls all the way
+through to a default rather than stopping; `agent new` **mints** a new
+credential, a side effect a retry cannot undo, so it stops at step 3 instead
+of ever guessing. Note that hub enumeration itself is **file-store only**:
+the keychain and the external-command backend cannot list their entries, so
+on such a machine step 2 cannot enumerate the store and you must pass
+`--hub`.
 
 **`--crews <a,b>`.** A comma-separated list of crew names the token is granted
 on (trimmed, empties dropped). Omit the flag to let the hub default the token to
@@ -1635,23 +1657,38 @@ installation instructions before retrying the MCP tool call.
 
 1. `--hub <url>` flag.
 2. `OWENLOOP_HUB` env var.
-3. If the **file** credential backend holds exactly ONE hub with a valid `human`
-   credential, that hub is used.
-4. Otherwise it exits `2` and prints why to stderr (nothing is written to
-   stdout — stdout is the protocol channel).
+3. `~/.owenloop/config.json` — see below.
+4. If the **file** credential backend holds exactly ONE hub with a valid
+   `human` credential, that hub is used (kept for back-compat with installs
+   from before step 3 existed).
+5. The built-in **default hub**, `https://api.owenloop.com`.
 
-There is **no** silent default-hub fallback: a control-plane server must never
-bind to a hub you did not name. The exit-`2` messages name both remedies:
+Every rung after the first two **falls through silently** rather than
+stopping the server: a missing or corrupt config file, a `hub` value in it
+that doesn't parse as a valid origin, an unenumerable credential store (macOS
+Keychain or an external credential command — only the file backend can be
+listed at all), zero stored hubs, and more than one stored hub all just move
+on to the next rung. `owenloop mcp` never exits for an origin reason — this is
+deliberate: it is a long-running reader spawned automatically by an MCP host
+on every session start, not a one-shot command a human is watching, so a hard
+stop here would silently break the plugin on any machine using the Keychain
+backend (the macOS default) unless the operator remembered to set `--hub` or
+`OWENLOOP_HUB` first. Contrast this with [`agent new`](#agent-new--mint-an-agent-token-into-a-slot),
+which **mints** a new credential and therefore stops rather than ever
+guessing — a wrong guess there is a side effect a retry cannot undo, where a
+wrong guess here is just a tool call against the wrong (recoverable) hub.
 
-- No hub credentials stored → `run \`owenloop login --hub <origin>\` first, or pass --hub <origin>`.
-- More than one hub stored → the message lists every stored origin and says `pass --hub <origin>`.
-- The credential store cannot be enumerated (macOS Keychain or an external
-  credential command) → `pass --hub <origin> (or set OWENLOOP_HUB)`. Only the
-  file backend can list stored origins, so on a Keychain-backed machine `mcp`
-  effectively requires `--hub` or `OWENLOOP_HUB`.
+**`~/.owenloop/config.json`** is written by
+[`login`](#login--authenticate-the-cli-against-a-hub): a small, non-secret
+JSON file (`{"version": 1, "hub": "<origin>"}`) recording the hub `login` most
+recently authenticated against. It exists specifically so `mcp` can learn
+your hub without enumerating the credential store — see `login`'s own section
+for exactly when it's written and what happens if the write fails.
 
-A malformed `--hub`/`OWENLOOP_HUB` value is a normal exit-`1` error, like every
-other command.
+A malformed `--hub`/`OWENLOOP_HUB` value is still a normal exit-`1` error,
+like every other command — an explicit bad value is reported, never silently
+skipped, precisely because rungs 1–2 come from something the operator typed
+or set, not from inference.
 
 ### Tools
 

@@ -281,9 +281,9 @@ test('both marketplace manifests use the owenloop@owenloop selector', () => {
   }
 });
 
-test('Codex .mcp.json uses the PATH lookup environment allowlist', () => {
+test('Codex .mcp.json allowlists PATH lookup plus the hub-resolution env vars', () => {
   const owenloop = MCP_MANIFESTS[1]!.config.mcpServers['owenloop']!;
-  assert.deepEqual(owenloop['env_vars'], ['HOME', 'PATH', 'XDG_CONFIG_HOME']);
+  assert.deepEqual(owenloop['env_vars'], ['HOME', 'PATH', 'XDG_CONFIG_HOME', 'OWENLOOP_HUB', 'OWENLOOP_NO_KEYCHAIN']);
   assert.equal(owenloop['cwd'], undefined);
 });
 

@@ -137,6 +137,7 @@ import {
   createWorkflowError,
   credentialFilePath,
   credentialSlot,
+  DEFAULT_HUB,
   externalCredentialCommand,
   hashDefForHub,
   hubBindingPath,
@@ -164,6 +165,7 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { owenloopSettingsPath, readOwenloopSettingsRaw, writeOwenloopHubOrigin } from './work-settings.ts';
+import { globalConfigPath, writeGlobalConfig } from './global-config.ts';
 import { canonicalJsonBytes, defaultRecoveryMarkerDir, ensureDirectoryPathNoSymlink, guardStateFile } from './install.ts';
 
 // Re-export the keychain backend type so existing test imports of `Keychain`
@@ -2658,12 +2660,11 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
 // ---- hub onboarding: login / logout / connect / push -------------------------
 
 /**
- * Resolve the target hub origin: `--hub` > `OWENLOOP_HUB` env > the default
- * production hub. Normalized (scheme required, trailing slash/path stripped) so
- * it can serve as a stable credential-store key and project binding value.
+ * Resolve the target hub origin: `--hub` > `OWENLOOP_HUB` env > `DEFAULT_HUB`
+ * (`src/hub.ts` — the production hub). Normalized (scheme required, trailing
+ * slash/path stripped) so it can serve as a stable credential-store key and
+ * project binding value.
  */
-const DEFAULT_HUB = 'https://api.owenloop.com';
-
 function resolveHub(io: CliIO, args: Args): string {
   const raw = last(args, 'hub') ?? io.env.OWENLOOP_HUB ?? DEFAULT_HUB;
   try {
@@ -2900,6 +2901,11 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
     const existed = readCredential(io, origin, slot) !== null;
     const { identity } = await verifyCredential(io, origin, slot, cred); // never store an unverified token
     const storage = await storeCredential(io, origin, slot, cred);
+    try {
+      writeGlobalConfig(globalConfigPath(workflowHome(io)), { version: 1, hub: origin });
+    } catch (e) {
+      io.err(`warning: could not write ~/.owenloop/config.json (${(e as Error).message}) — \`owenloop mcp\` will fall back to other origin sources`);
+    }
     print(io, {
       ok: true,
       hub: origin,
@@ -2923,6 +2929,11 @@ async function dispatchLogin(io: CliIO, args: Args): Promise<number> {
     );
   }
   const r = await runLoopbackOAuth(io, origin);
+  try {
+    writeGlobalConfig(globalConfigPath(workflowHome(io)), { version: 1, hub: origin });
+  } catch (e) {
+    io.err(`warning: could not write ~/.owenloop/config.json (${(e as Error).message}) — \`owenloop mcp\` will fall back to other origin sources`);
+  }
   print(io, {
     ok: true,
     hub: origin,
