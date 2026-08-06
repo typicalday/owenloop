@@ -291,6 +291,25 @@ termination, per-link signatures, attenuation-only-shrinks, and revocation are
 enforced, but the demand-dependent scope-permission half of link 3 is currently
 vacuous. Supplying a demand through the verifier seam enables that check. This
 is a named follow-up, not a reason to bypass chain verification.
+`packages/work/test/launch-gate-signer.test.ts` pins both halves of that
+boundary: the chain and revocation cases run through the production command
+driver, while the scope case calls the verifier directly with an explicit
+demand and is named to say it is verifier-level, so wiring a demand into the
+three roles later has a test to move.
+
+### Adversarial coverage
+
+`packages/work/test/launch-gate-*.test.ts` models the remote coordinator as a
+fully attacker-controlled component and asserts the trust properties end to end
+rather than per verifier. A fixture hub serves whatever bytes each scenario
+tells it to and records them, and each scenario asserts three things: that the
+tampered payload really was served, that the specific named refusal kind or
+link fired, and that an untampered control run still reaches the executable
+surface. The properties covered are that a hostile hub cannot alter an
+executing instruction or shell command, cannot forge a consumed artifact value
+or a judge rejection reason that reaches an agent prompt or a shell, and cannot
+introduce a trusted signer; and that when it withholds, the driver stalls
+without executing anything rather than degrading to unverified execution.
 
 ### Reusing an existing SSH key (human only)
 
