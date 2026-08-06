@@ -74,8 +74,8 @@ function makeTrustCli() {
     out.length = 0;
     err.length = 0;
     const code = await mainAsync(argv, io);
-    const outText = out.join('\\n');
-    return { code, out: outText, err: err.join('\\n'), json: () => JSON.parse(outText) };
+    const outText = out.join('\n');
+    return { code, out: outText, err: err.join('\n'), json: () => JSON.parse(outText) };
   };
   return { run, home, config };
 }

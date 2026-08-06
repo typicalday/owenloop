@@ -250,6 +250,27 @@ test('producer scope demand is rejected by attenuation arithmetic for hr-softwar
   assert.match(verdict.reason, /label 'hr-software' is outside the granted scope/);
 });
 
+test('a widening child grant is rejected during the chain walk', async () => {
+  const wideningLeafScope: GrantScope = {
+    pools: ['marketing'],
+    labels: '*',
+    namespaces: ['default'],
+    delegation: { allowed: false },
+  };
+  const verdict = await validateEnrollmentChain(
+    chainInput({
+      grants: [
+        grant(intermediate, { kind: 'machine', id: 'intermediate' }, root.keyid, intermediateScope),
+        grant(leaf, { kind: 'agent', id: 'leaf' }, intermediate.keyid, wideningLeafScope),
+      ],
+    }),
+    fakeOptions([]),
+  );
+  assert.equal(verdict.kind, 'invalid');
+  assert.match(verdict.reason, /widens its parent scope/);
+  assert.match(verdict.reason, /label/);
+});
+
 test('revoking an intermediate cascades to the leaf, while a pre-cut artifact remains valid', async () => {
   const cuts = [revocation({
     revokedKey: intermediate.keyid,
@@ -264,6 +285,25 @@ test('revoking an intermediate cascades to the leaf, while a pre-cut artifact re
   const after = await validateEnrollmentChain(chainInput({ at: 100, revocations: cuts }), fakeOptions([]));
   assert.equal(after.kind, 'invalid');
   assert.match(after.reason, /contains revoked key/);
+});
+
+test('a descendant-signed revocation is rejected rather than ignored', async () => {
+  const calls: Array<{ principal: string; allowed: string }> = [];
+  const descendantCut = revocation({
+    revokedKey: intermediate.keyid,
+    principal: { kind: 'machine', id: 'intermediate' },
+    revokedBy: leaf.keyid,
+    issuedAt: 100,
+    effectiveFrom: 100,
+    backdated: false,
+  });
+  const verdict = await validateEnrollmentChain(
+    chainInput({ revocations: [descendantCut] }),
+    fakeOptions(calls),
+  );
+  assert.equal(verdict.kind, 'invalid');
+  assert.match(verdict.reason, /signed by non-ancestor/);
+  assert.equal(calls.length, 2, 'the non-ancestor revocation is rejected before signer construction');
 });
 
 test('backdated revocation is root-only and accepted root cuts are conspicuously reported', async () => {
@@ -325,6 +365,15 @@ test('root target needs no grant and missing local anchor is unverifiable', asyn
   });
   const missing = await validateEnrollmentChain(chainInput({ orgRootPublicKey: '' }), fakeOptions([]));
   assert.equal(missing.kind, 'unverifiable');
+});
+
+test('an empty roster rejects a non-anchor target as an invalid unrooted chain', async () => {
+  const verdict = await validateEnrollmentChain(
+    chainInput({ grants: [] }),
+    fakeOptions([]),
+  );
+  assert.equal(verdict.kind, 'invalid');
+  assert.match(verdict.reason, /does not terminate at the org root/);
 });
 
 test('schema failures, returned signer mismatches, cycles, and depth caps are named invalid decisions', async () => {
