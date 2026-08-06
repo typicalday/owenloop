@@ -75,6 +75,8 @@ interface WireManifest {
   files: Record<string, string>;
   /** The digest claim over `{coordinate, files}` — what a real bundle header carries. */
   claim: string;
+  /** Optional names returned by the fake ingestor for multi-workflow install coverage. */
+  workflows?: string[];
   /** Test convenience: equals `claim` for an untampered manifest; never serialized. */
   digest: string;
 }
@@ -86,17 +88,22 @@ function sha256Content(coordinate: WireManifest['coordinate'], files: Record<str
     .digest('hex');
 }
 
-function makeBundle(name = 'widget', files?: Record<string, string>): WireManifest {
+function makeBundle(name = 'widget', files?: Record<string, string>, workflows?: string[]): WireManifest {
   const coordinate = { namespace: 'acme', name, version: '1.0.0' };
   const f = files ?? { 'def.yaml': validDefYaml(name) };
   const digest = sha256Content(coordinate, f);
-  return { coordinate, files: f, claim: digest, digest };
+  return { coordinate, files: f, claim: digest, ...(workflows === undefined ? {} : { workflows }), digest };
 }
 
 /** Serialize the wire form: content + claim. Key order is stable (insertion order). */
 function bundleBytes(m: WireManifest): Uint8Array {
   return new TextEncoder().encode(
-    JSON.stringify({ coordinate: m.coordinate, files: m.files, claim: m.claim }),
+    JSON.stringify({
+      coordinate: m.coordinate,
+      files: m.files,
+      claim: m.claim,
+      ...(m.workflows === undefined ? {} : { workflows: m.workflows }),
+    }),
   );
 }
 
@@ -122,7 +129,12 @@ function fakeIngestor(opts: { failVerifyFor?: Set<string> } = {}): BundleIngesto
     }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest; workflows: string[] }> {
       state.ingests++;
       (this as { ingests: number }).ingests = state.ingests;
-      let m: { coordinate: WireManifest['coordinate']; files: Record<string, string>; claim: string };
+      let m: {
+	coordinate: WireManifest['coordinate'];
+	files: Record<string, string>;
+	claim: string;
+	workflows?: string[];
+      };
       try {
         m = JSON.parse(new TextDecoder().decode(input.bytes));
       } catch {
@@ -140,7 +152,7 @@ function fakeIngestor(opts: { failVerifyFor?: Set<string> } = {}): BundleIngesto
         mkdirSync(join(full, '..'), { recursive: true });
         writeFileSync(full, content);
       }
-      return { coordinate, digest: defDigest(m.claim), workflows: [m.coordinate.name] };
+      return { coordinate, digest: defDigest(m.claim), workflows: m.workflows ?? [m.coordinate.name] };
     },
     async verifyInstalledObject(input: { objectDir: string; digest: DefDigest }): Promise<void> {
       state.verifies.push(input);
@@ -252,6 +264,43 @@ test('install: a valid bundle installs with the fixed commit order and hardened 
   assert.ok(!existsSync(journalPath), 'journal removed on success');
   assert.ok(!existsSync(lockPath), 'lock released on success');
   assert.ok(!existsSync(join(root, '.owenloop-staging')), 'staging root cleared');
+});
+
+test('install: a two-workflow bundle persists both names in index.json', async () => {
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
+  const m = makeBundle(
+    'widget',
+    {
+      'def.yaml': validDefYaml('widget'),
+      'other.yaml': validDefYaml('other'),
+    },
+    ['widget', 'other'],
+  );
+
+  const result = await installWorkflowBundle({
+    bytes: bundleBytes(m),
+    source: SRC,
+    root,
+    level: 'project',
+    lockPath,
+    journalPath,
+    recoveryMarkerDir: installMarkerDir,
+    ingestor: fakeIngestor(),
+    verifier: fakeVerifier(),
+  });
+
+  assert.equal(result.installed, true);
+  assert.deepEqual(result.workflows, ['other', 'widget']);
+  assert.deepEqual(readWorkflowStoreIndex(storeIndexPath(root)), {
+    version: 1,
+    entries: {
+      'acme/widget@1.0.0': {
+	digest: m.digest,
+	pinned: false,
+	workflows: ['other', 'widget'],
+      },
+    },
+  });
 });
 
 // ---- tamper, verifier, and validation refusals -------------------------------------

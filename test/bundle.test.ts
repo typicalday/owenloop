@@ -372,5 +372,25 @@ test('strict reader rejects a non-canonical manifest and a mutated file', () => 
   assert.equal(mutated, true, 'fixture must contain the selected regular file');
   assert.equal(errorCode(() => inspectBundle(gzipSync(tar))), 'INTEGRITY_MISMATCH');
 
+  const workflowTar = gunzipSync(packed.bytes);
+  offset = 0;
+  mutated = false;
+  while (offset + 512 <= workflowTar.length && !workflowTar.subarray(offset, offset + 512).every((byte) => byte === 0)) {
+    const header = workflowTar.subarray(offset, offset + 512);
+    const name = header.subarray(0, 100).toString('utf8').replace(/\0.*$/, '');
+    const sizeText = header.subarray(124, 136).toString('ascii').replace(/[\0 ]/g, '');
+    const size = sizeText === '' ? 0 : Number.parseInt(sizeText, 8);
+    const dataStart = offset + 512;
+    if (name === 'workflows/init.yaml') {
+      assert.ok(size > 0);
+      workflowTar[dataStart + size - 1] = 0x20;
+      mutated = true;
+      break;
+    }
+    offset = dataStart + Math.ceil(size / 512) * 512;
+  }
+  assert.equal(mutated, true, 'fixture must contain the non-default workflow');
+  assert.equal(errorCode(() => inspectBundle(gzipSync(workflowTar))), 'INTEGRITY_MISMATCH');
+
   assert.equal(errorCode(() => inspectBundle(packed.bytes, { limits: { maxExpandedBytes: tar.length - 1 } })), 'BUNDLE_LIMIT');
 });
