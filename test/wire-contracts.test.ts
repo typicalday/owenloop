@@ -16,10 +16,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { JsonSchema } from '../src/types.ts';
-import {
-  DSSE_RECORD_PAYLOAD_TYPES,
-  PAYLOAD_TYPE_ORIGIN,
-} from '../src/crypto/dsse.ts';
+import { DSSE_RECORD_PAYLOAD_TYPES } from '../src/crypto/dsse.ts';
 import {
   ENROLLMENT_GRANT_FIELDS,
   ENROLLMENT_KEY_FIELDS,
@@ -29,6 +26,10 @@ import {
   ORDER_FIELDS,
   ORDER_OWED_FIELDS,
   ORDER_REASON_FIELDS,
+  ORIGIN_FIELDS,
+  ORIGIN_SOURCE_AGENT_FIELDS,
+  ORIGIN_SOURCE_CONSOLE_FIELDS,
+  ORIGIN_SOURCE_GIT_FIELDS,
   POLICY_FLOOR_FIELDS,
   POLICY_FLOOR_RECORD_FIELDS,
   PRINCIPAL_REFERENCE_FIELDS,
@@ -41,6 +42,7 @@ import {
 import {
   enrollmentGrantSchema,
   orderSchema,
+  originSchema,
   policyFloorSchema,
   publicationSchema,
   revocationSchema,
@@ -49,6 +51,7 @@ import {
 import { validateValue } from '../src/schema.ts';
 import enrollmentGrantFixtures from './fixtures/wire/enrollment-grant.json' with { type: 'json' };
 import orderFixtures from './fixtures/wire/order.json' with { type: 'json' };
+import originFixtures from './fixtures/wire/origin.json' with { type: 'json' };
 import policyFloorFixtures from './fixtures/wire/policy-floor.json' with { type: 'json' };
 import publicationFixtures from './fixtures/wire/publication.json' with { type: 'json' };
 import revocationFixtures from './fixtures/wire/revocation.json' with { type: 'json' };
@@ -106,6 +109,12 @@ const contracts: Contract[] = [
     schema: publicationSchema,
     manifest: PUBLICATION_FIELDS,
     fixtures: publicationFixtures as FixtureSet,
+  },
+  {
+    name: 'origin',
+    schema: originSchema,
+    manifest: ORIGIN_FIELDS,
+    fixtures: originFixtures as FixtureSet,
   },
   {
     name: 'order',
@@ -269,6 +278,11 @@ test('nested wire shapes are pinned by the same manifests', () => {
     GRANT_DELEGATION_ALLOWED_FIELDS,
     'enrollment grant.scope.delegation[allowed]',
   );
+  const originSourceBranches = oneOfOf(propertyOf(originSchema, 'source', 'origin'), 'origin.source');
+  assertManifestMatchesSchema(originSourceBranches[0]!, ORIGIN_SOURCE_GIT_FIELDS, 'origin.source[git]');
+  assertManifestMatchesSchema(originSourceBranches[1]!, ORIGIN_SOURCE_CONSOLE_FIELDS, 'origin.source[console]');
+  assertManifestMatchesSchema(originSourceBranches[2]!, ORIGIN_SOURCE_AGENT_FIELDS, 'origin.source[agent]');
+
   assertManifestMatchesSchema(
     propertyOf(revocationSchema, 'principal', 'revocation'),
     PRINCIPAL_REFERENCE_FIELDS,
@@ -334,12 +348,10 @@ test('revocation timestamp intent is checked separately from JSON Schema', () =>
   }
 });
 
-test('record payload bindings cover every defined record except the reserved origin type', () => {
+test('record payload bindings cover every defined record', () => {
   const boundPayloadTypes = new Set<string>(Object.values(RECORD_PAYLOAD_TYPES));
   for (const payloadType of DSSE_RECORD_PAYLOAD_TYPES) {
-    if (payloadType === PAYLOAD_TYPE_ORIGIN) continue;
     assert.ok(boundPayloadTypes.has(payloadType), `${payloadType} must have a record binding`);
   }
-  assert.equal(boundPayloadTypes.has(PAYLOAD_TYPE_ORIGIN), false, 'origin is reserved for its later work package');
-  assert.equal(boundPayloadTypes.size, DSSE_RECORD_PAYLOAD_TYPES.length - 1);
+  assert.equal(boundPayloadTypes.size, DSSE_RECORD_PAYLOAD_TYPES.length);
 });

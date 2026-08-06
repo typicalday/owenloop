@@ -102,6 +102,66 @@ export const PUBLICATION_FIELDS = {
   timestamp: 'required',
 } as const satisfies FieldManifest<PublicationRecord>;
 
+/** Where a published workflow bundle came from. The source is signed content. */
+export interface OriginSourceGit {
+  kind: 'git';
+  /** Remote identifier exactly as the signer stated it. Never parsed for meaning. */
+  repo: string;
+  commit: string;
+}
+
+export interface OriginSourceConsole {
+  kind: 'console';
+  /** The authoring user identity stated by the console's signing ceremony. */
+  user: string;
+}
+
+export interface OriginSourceAgent {
+  kind: 'agent';
+  agent: string;
+  session: string;
+}
+
+export type OriginSource = OriginSourceGit | OriginSourceConsole | OriginSourceAgent;
+
+/** A signed statement of the provenance of one canonical workflow bundle. */
+export interface OriginRecord {
+  /** Canonical bundle digest bound by this signed record. */
+  digest: string;
+  name: string;
+  version: string;
+  source: OriginSource;
+  /** `SHA256:<unpadded-base64>` fingerprint of the key that signed this record. */
+  attesterKeyId: string;
+  timestamp: number;
+}
+
+export const ORIGIN_FIELDS = {
+  digest: 'required',
+  name: 'required',
+  version: 'required',
+  source: 'required',
+  attesterKeyId: 'required',
+  timestamp: 'required',
+} as const satisfies FieldManifest<OriginRecord>;
+
+export const ORIGIN_SOURCE_GIT_FIELDS = {
+  kind: 'required',
+  repo: 'required',
+  commit: 'required',
+} as const satisfies FieldManifest<OriginSourceGit>;
+
+export const ORIGIN_SOURCE_CONSOLE_FIELDS = {
+  kind: 'required',
+  user: 'required',
+} as const satisfies FieldManifest<OriginSourceConsole>;
+
+export const ORIGIN_SOURCE_AGENT_FIELDS = {
+  kind: 'required',
+  agent: 'required',
+  session: 'required',
+} as const satisfies FieldManifest<OriginSourceAgent>;
+
 export const SUBMISSION_PRODUCED_FIELDS = {
   artifact: 'required',
   version: 'required',
@@ -296,20 +356,15 @@ export const ORDER_REASON_FIELDS = {
   fromVersion: 'optional',
 } as const satisfies FieldManifest<Order['owes'][number]['reasons'][number]>;
 
-/**
- * Bind the five record definitions in this package to the frozen DSSE media
- * types. The origin payload type is deliberately reserved for the origin work
- * package; it is not silently accepted as an arbitrary binding here. The
- * publication record is the fifth bound record; the runtime DSSE allow-list
- * also retains origin as the sixth reserved payload type.
- */
+/** Bind every record definition in this package to a frozen DSSE media type. */
 export const RECORD_PAYLOAD_TYPES = {
   enrollmentGrant: PAYLOAD_TYPE_ENROLLMENT_GRANT,
   revocation: PAYLOAD_TYPE_REVOCATION,
   submission: PAYLOAD_TYPE_SUBMISSION,
   policyFloor: PAYLOAD_TYPE_POLICY_FLOOR,
+  origin: PAYLOAD_TYPE_ORIGIN,
   publication: PAYLOAD_TYPE_PUBLICATION,
 } as const satisfies Record<
-  'enrollmentGrant' | 'revocation' | 'submission' | 'policyFloor' | 'publication',
-  Exclude<DsseRecordPayloadType, typeof PAYLOAD_TYPE_ORIGIN>
+  'enrollmentGrant' | 'revocation' | 'submission' | 'policyFloor' | 'origin' | 'publication',
+  DsseRecordPayloadType
 >;
