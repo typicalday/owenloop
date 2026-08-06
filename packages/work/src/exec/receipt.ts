@@ -1,10 +1,10 @@
 /**
  * The command receipt (C5, plan decision 8) — the audit record exec submits for
- * a command order. It IS the result contract: the hub `submit` verb has no
- * failure channel, so a receipt is submitted for EVERY finished command — a
- * non-zero `exitCode` (or `exitCode: null` + `error` for machinery failure)
- * carries the truth, and exec still exits 0 because its job (deliver the
- * receipt) succeeded. Pure construction so it is trivially asserted in tests.
+ * an ordinary command order, and for a judge order that exits 0. The hub `submit`
+ * verb has no failure channel, so a non-zero `exitCode` (or `exitCode: null` +
+ * `error` for machinery failure) carries the command result. A non-zero judge
+ * exit uses `reject` instead of a receipt, and signal-killed work submits neither.
+ * Pure construction so it is trivially asserted in tests.
  */
 import { parsePayloadLine, type ParsedPayload } from './payload.ts';
 import type { CommandResult } from './runner.ts';

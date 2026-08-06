@@ -19,10 +19,13 @@
  *     misroute, and no child process is started.
  *  3. RUN + RACE — the runner shells the command out while the lease loop runs.
  *     Whichever settles first wins (plan decision 9):
- *       - command settles (any exit code, or a machinery error) ⇒ build a
- *         receipt and `submit` it to every owed path, then stop the lease
- *         WITHOUT release (the run just closed). Exit 0 — delivering the receipt
- *         IS the job, even for a failing command (the exit code carries truth).
+ *       - an ordinary command settles (any exit code, or a machinery error) ⇒
+ *         build a receipt and `submit` it to every owed path. A payload reject
+ *         follows those submits. Exit 0 means the receipt/reject delivery won;
+ *         the receipt's exit code still carries the command result.
+ *       - a judge command exits 0 ⇒ submit its receipt; a non-zero exit ⇒ send
+ *         `reject` for `order.judge` without a receipt; signal or machinery
+ *         failure ⇒ no verdict, leave the claim for the reap path.
  *       - lease goes terminal first (lease-lost / ownership-error / unreachable /
  *         the engine closed the run) ⇒ kill the command's process group, NO
  *         submit (a submit would race the re-offer), exit 1.
