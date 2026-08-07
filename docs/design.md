@@ -543,7 +543,7 @@ inputs:
 
 steps:
   - name: deliver
-    calls: delivery          # child workflow name (must exist in the same def directory)
+    calls: delivery          # local name, or <package>/<workflow> for a CAS workflow
     inputs:                  # optional: child input name → parent artifact name
       proposal: proposal
     produces: [delivered]    # exactly one parent artifact (the outcome artifact)
@@ -557,7 +557,7 @@ steps:
 ```
 
 Shape rules:
-- `calls:` must name a workflow that exists in the same def directory (resolver namespace).
+- `calls:` may use a bare workflow name or an explicit qualified name. A bare name uses the ordinary flat resolver for filesystem and `owenloop add` definitions; for a CAS-loaded definition, the resolver first searches that definition's bundle for a sibling with the same name. A qualified `<package>/<workflow>` name resolves only that exact key and never falls back to a bare name.
 - `inputs:` keys must be declared inputs of the child workflow; values must be parent artifact names (inputs or step produces).
 - `produces:` must declare exactly one artifact (the parent artifact the child outcome feeds).
 - A `calls:` step must NOT have a `body:` (it is machine-handled).
@@ -580,7 +580,7 @@ When the engine spawns a child instance, it passes `producedBy: { parentWf, pare
 
 ### §23.4 Cross-def calls-cycle check
 
-At `loadDefs` time, after all defs are expanded and per-def validated, `detectCallsCycles(defs)` performs a DFS over the `calls:` edge graph and throws `DefError: calls cycle: a -> b -> a` if a cycle exists.
+At `loadDefs` time, after all defs are expanded and per-def validated, `detectCallsCycles(defs)` performs a DFS over the `calls:` edge graph and throws `DefError: calls cycle: a -> b -> a` if a cycle exists. The DFS follows the same scope-aware resolution as runtime spawning and keys each edge by the resolved definition, not by the bare text alone; two bundles may therefore each contain a workflow named `build` without being collapsed into one node.
 
 This check is **separate** from the include-cycle guard in `expandIncludes` (§22.5) — they walk different edge kinds (`calls:` vs `include:`). An include cycle and a calls cycle can coexist independently and are reported with different messages (`calls cycle:` vs `include cycle:`).
 
@@ -599,6 +599,10 @@ Called at the top of every parent `tick` (outside any transaction), after `provi
 1. **Gate check**: `gateStems = Object.values(callsInputs)` (parent artifact names wired to child inputs). Gate is ready when every gate stem is green.
 2. **Re-attach guard**: `findChildByParent(parentWf, callsPath)` — spawn only when no child exists (`undefined`). This re-attaches (rather than re-spawns) across crashes and sequential re-ticks; it does NOT by itself stop *concurrent* ticks in separate processes, which can each read `undefined` here before either inserts — that race is closed by the atomic spawn (§23.6.9). A second guard sits alongside it (§23.6.7 F2): if no child exists AND the parent calls artifact is already `rejected` on a schema refusal, skip the spawn attempt entirely while the gate stems' fingerprint is unchanged from the one stamped at refusal time — a moved gate is the only thing worth retrying against.
 3. **Provision**: if gate is ready, `provisionCallsChild(parentWf, step, callsStem, gateStems)` — a single `BEGIN IMMEDIATE` (§23.6.9) that re-reads the parent snapshot inside the write lock, then finds-or-creates the child AND syncs every mapped `callsInputs` value from that same fresh snapshot. It absorbs both the old spawn and the old re-provide (step 5) into one atomic read-verify-write, so a child is never seeded or re-provided from a snapshot older than its committing tx. The pre-reads above (gate, `findChildByParent`, F2 fingerprint, depth) are OPTIMISTIC — they decide only *whether* to attempt; the helper re-verifies in-tx and aborts silently (returns `null`, nothing written) if the gate re-armed or an F2 debt landed since. Instance/`settled` events fire only when this call created the child; a `commit`/`provide` fires for each input it re-wrote. The parent calls: artifact stays `owed`. §23.6.7 (F2): a child input-schema refusal here (seed or re-provide) is caught narrowly at the call site (`SchemaRefusalError` only — a genuine bug still throws) and recorded as a debt on the parent calls artifact instead of crashing the tick.
+3a. **Spawn pin check**: when step 3 creates a child, the engine resolves `calls:` in the parent's pinned definition scope. For a bare target from a CAS bundle, the child must be a sibling carrying the parent's same bundle digest. For an explicit versioned target, the parent's bundle `lock` entry must equal the resolved child's canonical bundle digest. The v2 format has no per-workflow instruction-digest pin, so the check compares bundle digests, not `defInstructionDigest`.
+
+    A mismatch rolls back the child creation and input sync, then records the parent `calls:` artifact as `rejected` with a structural reason naming the expected and resolved digests. The engine does not throw or run the mismatched child. The current gate fingerprint prevents the same refusal from being retried on every tick. An already-existing child is read through its own §28 snapshot and is not re-checked by this spawn-only guard.
+
 4. **Outcome read**: read the child's declared `outputs:` artifact (exactly one, validated at load time). If it is green, machine-green the parent's calls: artifact.
 5. **Re-provide**: folded into step 3's atomic provision — `provisionCallsChild` syncs every changed `callsInputs` mapping (deep-equal check) inside the same tx that finds-or-creates the child, so the re-provide can no longer race a concurrent parent advance across a separate `provideInput` cascade. The child re-runs internally on each changed input. §23.6.7 (F2): same narrow schema-refusal handling as spawn — a child-illegal re-provided value becomes a debt on the parent calls artifact, not a thrown cascade.
 6. **Machine-green**: set parent calls: artifact to `acceptance: 'green'`, `version + 1`, `value = child outcome value`, `fingerprint = computeFingerprint(parentArts, gateStems) plus the child-outcome version pin` (§23.6.8, F4) — but only when the child outcome's version has moved past whatever version is currently pinned on the parent artifact. Then `settle(parentWf)` so downstream (teardown) fires. Do NOT set `terminal` — the calls: artifact must be re-armable if gate inputs move.
@@ -1486,7 +1490,9 @@ instance yet to pin against) and `adopt` (§28.4, which deliberately wants the
 def) and `triggerParentIfChild` (resolving a parent's def when re-triggering
 it) — goes through `defFor`, so a pinned child or parent instance is
 respected during Mode 1/Mode 2 cascades too, not just on its own direct
-`tick`.
+`tick`. A CAS snapshot also carries the bundle provenance used for scoped
+bare `calls:` resolution, so installing a newer bundle version does not
+retarget an already-running parent's sibling call.
 
 ### §28.3 `defDrift` — informational, never a refusal
 

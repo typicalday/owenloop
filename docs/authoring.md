@@ -458,7 +458,7 @@ steps:
     produces: [sandbox]
     body: Provision environment.
   - name: deliver
-    calls: delivery          # child workflow name (must exist in the same def dir)
+    calls: delivery          # bare local name; use <package>/<workflow> for a CAS target
     inputs:                  # child input → parent artifact (gate: sandbox green)
       proposal: proposal
     produces: [delivered]    # one parent artifact; greens when delivery's output greens

@@ -69,12 +69,13 @@ The following rules apply:
 - `package.version` is a non-empty printable ASCII version string without path separators.
 - `workflows` is a non-empty map from workflow names to archive-relative YAML paths. Each workflow name matches `/^[a-z][a-z0-9-]*$/`. Each path must pass the shared archive path safety policy, and two workflow names may not point to the same path.
 - A workflow file's `name:` must equal the workflow map key. For example, `workflows.delivery` must point to a file containing `name: delivery`.
+- An installed workflow is addressable from `calls:` by the qualified name `<package>/<workflow>`. A bare `calls: <workflow>` inside a CAS-installed bundle is resolved to a sibling from that same bundle; it does not search unrelated bundles for a same-named workflow.
 - `default` is optional. When present, `default` must be one of the workflow map keys. When absent, a single-workflow package has that one workflow as its implicit default; a package with two or more workflows has no implicit default and callers must name a workflow explicitly.
 - `platforms` is a duplicate-free list of portable selector strings. The list is advisory; platform policy is outside the package parser.
 - `integrity.algorithm` is exactly `sha256`.
 - `integrity.files` contains one lowercase 64-hex SHA-256 digest for every regular archive file except `bundle.yaml`. The packer regenerates this map from the source bytes and does not edit the source manifest. Excluding `bundle.yaml` avoids a recursive self-hash; the def digest still covers the complete canonical tar, including `bundle.yaml`.
 - `capabilities` contains requested capability classes and values. The manifest does not grant capabilities.
-- `lock` maps exact versioned `namespace/name@version` call references to lowercase 64-hex def digests. Every explicit versioned `calls:` target in every workflow must have a matching lock key. Bare calls remain governed by the workflow grammar.
+- `lock` maps exact versioned `namespace/name@version` call references to lowercase 64-hex **bundle digests**. Every explicit versioned `calls:` target in every workflow must have a matching lock key. A bare same-bundle call has no lock entry: its pin is the containing bundle's own digest. The runtime compares bundle digests at child spawn; it does not compare this lock value with a per-workflow instruction digest.
 
 Canonical manifest serialization uses a fixed key order, sorted mapping keys, sorted list values, JSON-style double-quoted strings, two-space indentation, and exactly one final newline. Inspection rejects a manifest that parses correctly but is not in that canonical byte form.
 

@@ -76,8 +76,12 @@ export {
   objectDestRelPath,
   recoverWorkflowStore,
 } from './install.ts';
-export { createBundleIngestor } from './ingestor.ts';
+export { createBundleIngestor, verifyWorkflowObjectSync } from './ingestor.ts';
 export type { BundleIngestorOptions } from './ingestor.ts';
+
+// ---- WS-6 CAS -> calls: def bridge ----
+export { loadCasDefs } from './def-source.ts';
+export type { CasDefRegistration, LoadCasDefsArgs } from './def-source.ts';
 
 // ---- WP-E2a origin execution policy ----
 export {

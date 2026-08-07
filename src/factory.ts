@@ -26,7 +26,7 @@ import type { DefResolver, EngineEvent, EngineListener } from './engine.ts';
 import { openStore } from './store.ts';
 import type { Store } from './store.ts';
 import { dbPathRefusingSymlink, mkdirRefusingSymlink } from './util.ts';
-import { finalizeDefs, loadDefs } from './defs.ts';
+import { finalizeDefs, loadDefs, resolveCallsTarget } from './defs.ts';
 import { createDefInstructionSource, OrderResolver } from './order-resolver.ts';
 import type { OrderInstructionSource } from './order-resolver.ts';
 import type { WorkflowDef } from './types.ts';
@@ -144,8 +144,13 @@ export function createEngine(opts: CreateEngineOpts = {}): CreatedEngine {
   }
   const store = openStore(db);
 
-  const resolveDef: DefResolver = (name) => {
-    const d = defs.get(name);
+  // WS-6: scope-aware, matching the CLI resolver. An embedder's in-memory def
+  // set carries no CAS provenance, so `resolveCallsTarget` takes its plain
+  // flat-map branch and behavior here is unchanged; the branch exists so an
+  // embedder that DOES hand in store-loaded defs gets the same sibling-first
+  // rule `finalizeDefs` already validated the set against.
+  const resolveDef: DefResolver = (name, from) => {
+    const d = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
     if (!d) throw new Error(`unknown workflow definition '${name}'`);
     return d;
   };

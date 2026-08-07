@@ -53,6 +53,7 @@ import {
   loadDefs,
   loadDefsRaw,
   loadDefsUnfinalized,
+  resolveCallsTarget,
   validateDef,
 } from './defs.ts';
 import type { DefLoadFailure } from './defs.ts';
@@ -137,6 +138,7 @@ import {
   BundleIngestorUnavailableError,
   globalStoreRoot,
   installWorkflowBundle,
+  loadCasDefs,
   PreCommitVerifierUnavailableError,
   projectStoreRoot,
   createBundleIngestor,
@@ -541,6 +543,7 @@ function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, Workflow
     lf = readLockfile(join(io.cwd, '.owenloop', 'installed.json'));
   } catch (e) {
     io.err(`warning: skipping installed workflow defs: ${(e as Error).message}`);
+    foldCasDefs(io, defsDir, merged);
     return finalizeDefs(merged);
   }
 
@@ -571,7 +574,61 @@ function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, Workflow
     }
   }
 
+  foldCasDefs(io, defsDir, merged);
+
   return finalizeDefs(merged);
+}
+
+/**
+ * WS-6: fold the CONTENT-ADDRESSED store's defs into the same raw map, under
+ * their QUALIFIED keys only.
+ *
+ * Precedence, level 3 of 4 (see `loadDefsWithInstalled` above for 1 and 2):
+ * this runs LAST, after the base scan and after the `add`-ledger fold, so a
+ * project-local def and an `add`-installed def both keep the precedence they
+ * have today. Nothing here can shadow either of them regardless of ordering,
+ * because the key a CAS def is registered under always contains `/` and a def
+ * name may not (`/^[a-z0-9][a-z0-9_-]*$/i`) — a CAS registration is unforgeable
+ * as a filesystem name.
+ *
+ * Precedence level 4 — a BARE `calls:` reaching a CAS workflow — is deliberately
+ * NOT a map entry. Bare sibling resolution happens in `resolveCallsTarget`
+ * (defs.ts), scoped by the calling def's own `bundleDigest`, so bundle A's
+ * `calls: build` can never bind to bundle B's `build`.
+ *
+ * Fail-OPEN like the ledger fold above: `loadCasDefs` never throws; every bad
+ * index, unreadable object, or unloadable bundle becomes an `io.err` warning and
+ * is skipped, so a corrupt CAS object cannot break `owenloop status`.
+ *
+ * When no store exists (no `index.json` at either root) this is a no-op and the
+ * merged map is byte-identical to what it was before WS-6.
+ */
+function foldCasDefs(io: CliIO, defsDir: string, merged: Map<string, WorkflowDef>): void {
+  // The global root needs a concrete home. `workflowHome` throws when neither
+  // HOME nor USERPROFILE is set; def DISCOVERY must not fail for that (the
+  // install verbs still do), so fall back to project-only discovery.
+  let globalRoot: string;
+  try {
+    globalRoot = globalStoreRoot(workflowHome(io));
+  } catch {
+    return;
+  }
+  const registrations = loadCasDefs({
+    projectRoot: projectStoreRoot(defsDir),
+    globalRoot,
+    warn: (line) => io.err(line),
+  });
+  for (const registration of registrations) {
+    const winner = merged.get(registration.key);
+    if (winner !== undefined) {
+      io.err(
+        `warning: workflow '${registration.key}' from bundle ${registration.bundleDigest} is shadowed by ` +
+          `${winner.dir ?? 'an already-registered definition'}`,
+      );
+      continue;
+    }
+    merged.set(registration.key, registration.def);
+  }
 }
 
 function openCtx(io: CliIO, args: Args): Ctx {
@@ -606,8 +663,14 @@ function openCtx(io: CliIO, args: Args): Ctx {
   // path — one loaded-definition resolver seeds the instruction boundary
   // (emission digests + instruction resolution), never a second local path.
   const instructionSource = createDefInstructionSource(defs.values());
-  const engine = new Engine(store, (name) => {
-    const d = defs.get(name);
+  // WS-6: the resolver is SCOPE-AWARE. `from` is supplied only by the engine's
+  // `calls:` spawn path; when it is present and carries CAS provenance, a bare
+  // target resolves sibling-first inside that def's own bundle (the exact rule
+  // `finalizeDefs` validated against at load time, so load-time and run-time
+  // agree). With `from` absent — every other resolver caller — this is the plain
+  // flat-map lookup it has always been.
+  const engine = new Engine(store, (name, from) => {
+    const d = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
     if (!d) throw new CliError(`unknown workflow definition '${name}' (looked in ${defsDir})`);
     return d;
   }, { instructionSource });
