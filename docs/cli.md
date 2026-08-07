@@ -810,7 +810,7 @@ A store root holds exactly this layout:
 
 ```text
 <root>/
-  index.json                       # coordinate → {digest, pinned} index
+  index.json                       # coordinate → {digest, pinned, workflows?} index
   objects/
     sha256/
       <64-hex-content-digest>/     # one immutable object per digest
@@ -902,6 +902,7 @@ On success `add` prints the structured result:
   "level": "project",                    // or "global"
   "coordinate": "acme/widget@1.0.0",
   "digest": "<64-hex>",
+  "workflows": ["delivery", "init"],     // every workflow name in the bundle, sorted
   "objectPath": "<root>/objects/sha256/<64-hex>",
   "installed": true                      // false when deduplicated
 }
