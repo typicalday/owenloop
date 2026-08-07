@@ -495,8 +495,8 @@ bounded — it only loads folders named by the fail-closed-validated
 
 - **Only under the default defs dir.** An explicit `--defs`/`OWENLOOP_DEFS` is
   operator intent to target a literal dir and keeps the pure-scan behavior with
-  no fold-in — the rule is "was an override given", so even
-  `OWENLOOP_DEFS=$PWD/workflows` counts as an override and stays literal.
+  no installed-def or CAS-store fold-in — the rule is "was an override given",
+  so even `OWENLOOP_DEFS=$PWD/workflows` counts as an override and stays literal.
   Pointing `--defs` straight at an install folder
   (`--defs workflows/<owner>-<repo>-<hash>`) still works exactly as before.
 - **Precedence.** Project-local (top-level) defs win over installed defs; among
@@ -957,6 +957,27 @@ defense in depth, not an integrity proof.
   both digests — resolution never silently picks the project copy. An index
   entry whose object is missing or corrupt is an integrity error, never a
   returned path.
+
+**Calls resolution for installed bundle workflows.** In the default CLI context
+(no explicit `--defs`/`OWENLOOP_DEFS`), `defs`/`create`/`tick` load CAS workflows
+from the project and global bundle-store indexes in addition to filesystem defs
+and the GitHub `add` ledger. A CAS workflow is addressable by the qualified
+`<package>/<workflow>` name, so a project-local or `add`-installed workflow can
+call it explicitly. A bare call from a CAS-loaded workflow resolves a sibling
+from the same bundle digest first; if no sibling has that name, ordinary flat
+lookup remains available. Bare CAS names are not registered globally, so a
+workflow in bundle A cannot accidentally call a same-named workflow from bundle
+B.
+
+The precedence is explicit: project-local definitions win first, then
+GitHub-`add` installed definitions, then CAS definitions under qualified keys.
+A corrupt CAS index, object, or workflow is skipped with a warning during
+read-side discovery, so it does not make `status` fail. A running workflow keeps
+the definition snapshot from its creation (§28), including the CAS bundle
+provenance used for sibling lookup; installing a newer bundle therefore does not
+retarget an existing parent instance. The bundle spawn-time pin check compares
+canonical bundle digests and records a rejected `calls:` debt instead of running
+a mismatched child.
 
 Store roots and object directories are probed with `lstat`, never `stat`:
 a symlink or non-directory squatting at a root, an index path, or an object
