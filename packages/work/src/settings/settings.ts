@@ -93,6 +93,12 @@ export interface Settings {
    * of the MACHINE running the shift, not of the workflow.
    */
   workRepo?: string;
+  /** Quality-tier to concrete model mapping; merged over the built-in map. */
+  tierMap?: Record<string, string>;
+  /** Reject count at which the default retry policy escalates. */
+  escalateAt?: number;
+  /** Extension namespace containing an authored escalation object. */
+  escalationExtensionKey?: string;
 }
 
 /** The known settings keys, in the order `owenloop work settings` prints them. */
@@ -107,6 +113,9 @@ export const KNOWN_SETTINGS_KEYS = [
   'maxConcurrentAgents',
   'workRoot',
   'workRepo',
+  'tierMap',
+  'escalateAt',
+  'escalationExtensionKey',
 ] as const;
 
 /**
@@ -174,6 +183,27 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
     const v = obj['maxConcurrentAgents'];
     if (typeof v !== 'number' || !Number.isInteger(v) || v <= 0) {
       throw bad('maxConcurrentAgents', 'a positive integer', v);
+    }
+  }
+  if ('tierMap' in obj) {
+    const v = obj['tierMap'];
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+      throw bad('tierMap', 'an object whose values are non-empty strings', v);
+    }
+    for (const value of Object.values(v as Record<string, unknown>)) {
+      if (typeof value !== 'string' || value.trim() === '') throw bad('tierMap', 'an object whose values are non-empty strings', v);
+    }
+  }
+  if ('escalateAt' in obj) {
+    const v = obj['escalateAt'];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v <= 0) {
+      throw bad('escalateAt', 'a positive integer', v);
+    }
+  }
+  if ('escalationExtensionKey' in obj) {
+    const v = obj['escalationExtensionKey'];
+    if (typeof v !== 'string' || v.trim() === '') {
+      throw bad('escalationExtensionKey', 'a non-empty string', v);
     }
   }
   if ('commandRouting' in obj) {
