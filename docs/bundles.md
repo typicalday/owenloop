@@ -135,6 +135,15 @@ scripts must treat an unset or empty variable as a hard error and report a
 message such as `this workflow must run from an installed bundle`; owenloop does
 not synthesize a fallback directory.
 
+Every command step also receives two engine-derived identity variables:
+`OWENLOOP_WORKFLOW` contains the workflow-instance id, and `OWENLOOP_RUN`
+contains the run id. Both variables are always set, including for definitions
+without bundle provenance, and a command can read them directly:
+
+```sh
+printf '%s %s\n' "$OWENLOOP_WORKFLOW" "$OWENLOOP_RUN"
+```
+
 `OWENLOOP_BUNDLE_DIR` is read-only. Workers must never write into the directory.
 The workflow store is content-addressed and verifies the installed object again
 when a resolver reads it. A write changes the object bytes, so the next read

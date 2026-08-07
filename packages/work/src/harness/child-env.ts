@@ -93,6 +93,10 @@ export const ADMITTED_OWENLOOP_KEYS: ReadonlySet<string> = new Set([
   // The step agent and anything it runs. Resolves bundle-shipped assets from
   // the verified installed object directory. A path, not credential material.
   'OWENLOOP_BUNDLE_DIR',
+  // The step agent and anything it runs. Identifies the workflow instance.
+  'OWENLOOP_WORKFLOW',
+  // The step agent and anything it runs. Identifies the current run.
+  'OWENLOOP_RUN',
   // `holdShiftId` — src/roles/hold.ts. The fallback when `--shift=` is
   // absent from the mount's argv.
   'OWENLOOP_SHIFT_ID',

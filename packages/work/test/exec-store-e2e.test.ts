@@ -84,12 +84,13 @@ function makeLoop(
   origin: string,
   resolver: InstructionResolver,
   env?: Record<string, string | undefined>,
+  identity: { workflow: string; run: string } = { workflow: 'wf1', run: 'run1' },
 ): ReturnType<typeof createExecLoop> {
   return createExecLoop({
     hub: createHubClient({ origin, getToken: async () => 'store-e2e-token' }),
     runner: createDefaultRunner(),
-    workflow: 'wf1',
-    run: 'run1',
+    workflow: identity.workflow,
+    run: identity.run,
     holder: EXEC,
     instructions: resolver,
     cwd: CWD,
@@ -267,5 +268,37 @@ steps:
   } finally {
     if (savedPath === undefined) delete process.env['PATH'];
     else process.env['PATH'] = savedPath;
+  }
+});
+
+test('exec store e2e: loose command children receive loop identity, not ambient values', async () => {
+  const command = 'printf "id=%s/%s\\n" "$OWENLOOP_WORKFLOW" "$OWENLOOP_RUN"';
+  const resolver: InstructionResolver = {
+    resolveCommand: async () => ({ ok: true, command }),
+    resolveStep: async () => ({ ok: false, kind: 'unknown-step', reason: 'not used' }),
+  };
+  const identity = { workflow: 'wf-loop-authority', run: 'run-loop-authority' };
+  const savedWorkflow = process.env['OWENLOOP_WORKFLOW'];
+  const savedRun = process.env['OWENLOOP_RUN'];
+  process.env['OWENLOOP_WORKFLOW'] = 'wf-ambient-leak';
+  process.env['OWENLOOP_RUN'] = 'run-ambient-leak';
+  try {
+    const execution = await startHub(order('loose-def', 'ignored remote command'));
+    try {
+      assert.equal(await makeLoop(execution.origin, resolver, undefined, identity).run(), 'submitted');
+      const submit = execution.reqs.find((request) => request.verb === 'submit');
+      assert.ok(submit !== undefined);
+      const receipt = submit.body?.['value'] as CommandReceipt;
+      assert.equal(receipt.command, command);
+      assert.equal(receipt.exitCode, 0, receipt.outputTail);
+      assert.equal(receipt.outputTail, 'id=wf-loop-authority/run-loop-authority\n');
+    } finally {
+      execution.server.close();
+    }
+  } finally {
+    if (savedWorkflow === undefined) delete process.env['OWENLOOP_WORKFLOW'];
+    else process.env['OWENLOOP_WORKFLOW'] = savedWorkflow;
+    if (savedRun === undefined) delete process.env['OWENLOOP_RUN'];
+    else process.env['OWENLOOP_RUN'] = savedRun;
   }
 });

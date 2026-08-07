@@ -10,7 +10,7 @@
  *
  * The second half is what stops a future `OWENLOOP_*` variable from silently
  * flowing to harness children. The first half is what makes the whole design
- * safe: the seven explicitly consumed child inputs are admitted, while the bearer
+ * safe: the nine explicitly consumed child inputs are admitted, while the bearer
  * and helper-only credential names remain denied.
  */
 import assert from 'node:assert/strict';
@@ -22,7 +22,7 @@ import {
   isAdmittedChildEnvKey,
 } from '../src/harness/child-env.ts';
 
-test('the admitted set is exactly the seven names with a reachable child consumer', () => {
+test('the admitted set is exactly the nine names with a reachable child consumer', () => {
   // Pinned as a LIST, not a count: growing this set is a deliberate act that
   // must show up in a diff next to the consumer that justifies it.
   assert.deepEqual(
@@ -33,8 +33,10 @@ test('the admitted set is exactly the seven names with a reachable child consume
       'OWENLOOP_CREDENTIAL_COMMAND',
       'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
       'OWENLOOP_NO_KEYCHAIN',
+      'OWENLOOP_RUN',
       'OWENLOOP_SESSION',
       'OWENLOOP_SHIFT_ID',
+      'OWENLOOP_WORKFLOW',
     ],
     'each admitted name needs a consumer a harness child can actually reach — ' +
       'see the derivation in src/harness/child-env.ts',
@@ -66,7 +68,7 @@ test('everything outside the OWENLOOP_ namespace passes through untouched', () =
   assert.deepEqual(filterOwenloopEnv(source), source);
 });
 
-test('inside the namespace the seven admitted inputs survive and everything else is denied', () => {
+test('inside the namespace the nine admitted inputs survive and everything else is denied', () => {
   const out = filterOwenloopEnv({
     OWENLOOP_BUNDLE_DIR: '/bundle',
     OWENLOOP_CACHE_DIR: '/cache',
@@ -74,7 +76,9 @@ test('inside the namespace the seven admitted inputs survive and everything else
     OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
     OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
     OWENLOOP_NO_KEYCHAIN: '1',
+    OWENLOOP_RUN: 'run-1',
     OWENLOOP_SESSION: 'sess-1',
+    OWENLOOP_WORKFLOW: 'wf-1',
     OWENLOOP_TOKEN: 'tok',
     OWENLOOP_ACCOUNT: 'acct',
     OWENLOOP_STATE_DIR: '/state',
@@ -91,7 +95,9 @@ test('inside the namespace the seven admitted inputs survive and everything else
     OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
     OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
     OWENLOOP_NO_KEYCHAIN: '1',
+    OWENLOOP_RUN: 'run-1',
     OWENLOOP_SESSION: 'sess-1',
+    OWENLOOP_WORKFLOW: 'wf-1',
   });
 });
 
@@ -111,12 +117,14 @@ test('isAdmittedChildEnvKey agrees with the filter, name by name', () => {
     'CLAUDE_CODE_OAUTH_TOKEN',
     'OWENLOOP_BUNDLE_DIR',
     'OWENLOOP_CACHE_DIR',
+    'OWENLOOP_RUN',
     'OWENLOOP_SHIFT_ID',
     'OWENLOOP_CREDENTIAL_COMMAND',
     'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
     'OWENLOOP_NO_KEYCHAIN',
     'OWENLOOP_SESSION',
     'OWENLOOP_TOKEN',
+    'OWENLOOP_WORKFLOW',
     'OWENLOOP_INVENTED_NEXT_PHASE',
     'OWENLOOP_CREDENTIAL_ORIGIN',
     'OWENLOOP_CREDENTIAL_SLOT',
