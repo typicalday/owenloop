@@ -251,6 +251,16 @@ function escalationFromPacket(packet: OrderPacket, extensionKey: string): ModelE
   };
 }
 
+/**
+ * The reject depth driving retry escalation: the max across the step's owed
+ * outputs, with consult paths excluded.
+ *
+ * The exclusion matters. A consult artifact's rejects are the mentor handing
+ * advice back for another round, not a signal that this producer is stuck — and
+ * they ride a separate per-produce attempt budget for exactly that reason.
+ * Counting them would let one ordinary mentor round escalate the model on every
+ * later firing of the step, permanently, on a producer that was never failing.
+ */
 function judgmentRejectsFromPacket(packet: OrderPacket): number {
   let max = 0;
   for (const owed of packet.owes) {

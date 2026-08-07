@@ -18,6 +18,9 @@ const TIER_INDEX: Readonly<Record<string, number>> = {
   strongest: 3,
 };
 
+/** Tier index -> tier name, so a clamp can resolve to an id at the very end. */
+const TIER_NAMES = ['fast', 'standard', 'strong', 'strongest'] as const;
+
 export type ModelLane = 'express' | 'standard' | 'deep';
 
 export interface ModelEscalation {
@@ -82,6 +85,31 @@ function tierForInput(modelPart: string): number | undefined {
   return TIER_INDEX[modelPart];
 }
 
+/**
+ * Apply the lane to a tier index, in tier space.
+ *
+ * express caps at `standard` and deep floors at `strong`, with one exception:
+ * the express cap never touches the TOP tier. A step authored at the top tier
+ * is there because the judgment it makes is hard, so the lane's cost heuristic
+ * must not downgrade it — the lane scales cost, it does not overrule an
+ * explicit escalation of quality. The reference implementation gets this for
+ * free by leaving the top tier out of its rank table; ranking in tier space
+ * gives the top tier a rank, so the exclusion has to be stated here.
+ */
+function clampTierForLane(tier: number, lane: ModelLane | undefined): number {
+  if (lane === 'express' && tier > TIER_INDEX['standard']! && tier !== TIER_INDEX['strongest']!) {
+    return TIER_INDEX['standard']!;
+  }
+  if (lane === 'deep' && tier < TIER_INDEX['strong']!) return TIER_INDEX['strong']!;
+  return tier;
+}
+
+/** Resolve a tier index back to a concrete model id through the policy map. */
+function modelForTier(tier: number, tierMap: Readonly<Record<string, string>>): string {
+  const name = TIER_NAMES[tier]!;
+  return tierMap[name] ?? name;
+}
+
 function effortName(index: number): string {
   const clamped = Math.min(Math.max(index, 1), EFFORT_LADDER.length) - 1;
   return EFFORT_LADDER[clamped]!;
@@ -133,8 +161,7 @@ export function pickModel(
     }
 
     if (inputTier !== undefined && !pinned) {
-      if (lane === 'express' && inputTier > TIER_INDEX['standard']!) model = policy.tierMap['standard'] ?? 'standard';
-      else if (lane === 'deep' && inputTier < TIER_INDEX['strong']!) model = policy.tierMap['strong'] ?? 'strong';
+      model = modelForTier(clampTierForLane(inputTier, lane), policy.tierMap);
     }
     return withEffort(model, effortIndex);
   }
@@ -142,13 +169,23 @@ export function pickModel(
   const escalate = judgmentRejects >= policy.escalateAt;
   const nextEffort = effortIndex === undefined ? undefined : escalate ? effortIndex + 1 : effortIndex;
 
+  // The lane adjusts the BASE. Track the resulting tier, because escalation
+  // below is decided on the CLAMPED tier, not the authored one.
+  let currentTier = inputTier;
   if (inputTier !== undefined && !pinned) {
-    if (lane === 'express' && inputTier > TIER_INDEX['standard']!) model = policy.tierMap['standard'] ?? 'standard';
-    else if (lane === 'deep' && inputTier < TIER_INDEX['strong']!) model = policy.tierMap['strong'] ?? 'strong';
+    currentTier = clampTierForLane(inputTier, lane);
+    model = modelForTier(currentTier, policy.tierMap);
   }
 
+  // Model escalation fires when there was no effort suffix to bump instead, or
+  // once the reject count reaches twice the threshold. It is upward-only and
+  // ALWAYS wins over an express cap: a producer stuck on repeated rejects needs
+  // more capability more than the lane needs the cheaper tier. Gating this on
+  // the POST-clamp tier is what makes escalation beat the cap — gating it on
+  // the authored tier would let an express-clamped `strong` step sit at the
+  // standard tier forever, however many rejects accumulate.
   const modelEscalates = escalate && (effortIndex === undefined || judgmentRejects >= policy.escalateAt * 2);
-  if (modelEscalates && inputTier !== undefined && inputTier < TIER_INDEX['strong']!) {
+  if (modelEscalates && currentTier !== undefined && currentTier < TIER_INDEX['strong']!) {
     model = policy.tierMap['strong'] ?? 'strong';
   }
 

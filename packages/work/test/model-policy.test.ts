@@ -40,10 +40,45 @@ test('model policy parses effort suffixes on the last colon and clamps to the la
 
 test('model policy applies express caps and deep floors in tier space', () => {
   assert.deepEqual(pickModel('strong', 'express', 0, policy), { model: 'sonnet' });
-  assert.deepEqual(pickModel('strongest', 'express', 0, policy), { model: 'sonnet' });
   assert.deepEqual(pickModel('standard', 'deep', 0, policy), { model: 'opus' });
   assert.deepEqual(pickModel('fast', 'deep', 0, policy), { model: 'opus' });
   assert.deepEqual(pickModel('opus', 'express', 0, policy), { model: 'opus' });
+});
+
+test('the express cap never downgrades the top tier', () => {
+  // delivery.yaml states the rule directly: express caps the base at the
+  // standard tier, deep floors it at strong, but `strongest` stays pinned
+  // because a mentor consult exists precisely because judgment is hard — the
+  // lane never downgrades it. The reference implementation gets this free by
+  // leaving the top tier out of its rank table; ranking in tier space gives it
+  // a rank, so the exclusion is explicit and must stay tested.
+  assert.deepEqual(pickModel('strongest', 'express', 0, policy), { model: 'fable' });
+  assert.deepEqual(pickModel('strongest', 'express', 6, policy), { model: 'fable' });
+  assert.deepEqual(pickModel('strongest:3', 'express', 0, policy), { model: 'fable', effort: 'high' });
+  // The deep floor leaves the top tier alone too — it is already above it.
+  assert.deepEqual(pickModel('strongest', 'deep', 0, policy), { model: 'fable' });
+});
+
+test('reject escalation beats the express cap instead of being suppressed by it', () => {
+  // The regression this pins: escalation used to be decided on the tier of the
+  // ORIGINALLY AUTHORED model rather than the post-clamp one, so an
+  // express-clamped `strong` step sat at the standard tier at every reject
+  // count and never escalated. Escalation is upward-only and always wins over
+  // an express cap — a producer stuck on repeated rejects needs capability more
+  // than the lane needs the cheaper tier.
+  assert.deepEqual(pickModel('strong', 'express', 0, policy), { model: 'sonnet' });
+  assert.deepEqual(pickModel('strong', 'express', 3, policy), { model: 'opus' });
+  assert.deepEqual(pickModel('strong', 'express', 6, policy), { model: 'opus' });
+  assert.deepEqual(pickModel('fast', 'express', 3, policy), { model: 'opus' });
+  assert.deepEqual(pickModel('standard', 'express', 3, policy), { model: 'opus' });
+
+  // The delivery line's `reviewer` step is authored `model: strong:4`. With an
+  // effort suffix present the threshold bumps effort first and only escalates
+  // the model at twice the threshold — but it DOES escalate, which is the
+  // failure this workstream exists to fix.
+  assert.deepEqual(pickModel('strong:4', 'express', 0, policy), { model: 'sonnet', effort: 'xhigh' });
+  assert.deepEqual(pickModel('strong:4', 'express', 3, policy), { model: 'sonnet', effort: 'max' });
+  assert.deepEqual(pickModel('strong:4', 'express', 6, policy), { model: 'opus', effort: 'max' });
 });
 
 test('default retry escalation bumps effort first, then model at twice the threshold', () => {
