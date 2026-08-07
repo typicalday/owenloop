@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1](https://github.com/typicalday/owenloop/compare/v0.5.0...v0.5.1) (2026-08-07)
+
+
+### Features
+
+* add CLI/plugin compatibility checks ([#109](https://github.com/typicalday/owenloop/issues/109)) ([8f0b0b9](https://github.com/typicalday/owenloop/commit/8f0b0b9c2f8179ac316772fcbf61d5efe4fa9019))
+* add command payload and judge reject transport ([#126](https://github.com/typicalday/owenloop/issues/126)) ([847a1fa](https://github.com/typicalday/owenloop/commit/847a1fabdd41ba7a021b967ba0c55e5f25526bb5))
+* add deterministic workflow bundles ([#106](https://github.com/typicalday/owenloop/issues/106)) ([dfc598b](https://github.com/typicalday/owenloop/commit/dfc598b1ecf040d4c635cdb52443bdb0191f398b))
+* add enrollment chain validation, attenuation, and revocation ([#117](https://github.com/typicalday/owenloop/issues/117)) ([2bc10c8](https://github.com/typicalday/owenloop/commit/2bc10c8226fe4960e9655e3672ebd0a17a7ed512))
+* add signed origin records for published bundles ([#119](https://github.com/typicalday/owenloop/issues/119)) ([a5fbd8f](https://github.com/typicalday/owenloop/commit/a5fbd8fd5b5cec199e3028e8784a13662dcae58e))
+* add signed submission records ([#121](https://github.com/typicalday/owenloop/issues/121)) ([f171227](https://github.com/typicalday/owenloop/commit/f171227a8ca1bf4f4f0c84edecf482c245ab203e))
+* add signed workflow bundle publication ([#112](https://github.com/typicalday/owenloop/issues/112)) ([224f7a8](https://github.com/typicalday/owenloop/commit/224f7a834c747d954d1cf77316f0066e5252f09e))
+* add SSHSIG signing, DSSE envelopes, and principal keys ([#102](https://github.com/typicalday/owenloop/issues/102)) ([5125545](https://github.com/typicalday/owenloop/commit/51255459ac21012365b6984d444efc0ae51dfa15))
+* add v2 multi-workflow delivery bundles ([#127](https://github.com/typicalday/owenloop/issues/127)) ([26a59d7](https://github.com/typicalday/owenloop/commit/26a59d7bb9728fd4936d8d4eb2b2bb158983ff89))
+* converge Claude Code and Codex plugins ([#113](https://github.com/typicalday/owenloop/issues/113)) ([1c6623d](https://github.com/typicalday/owenloop/commit/1c6623dff9649a4311382fa34c4bc6ac489a4f9f))
+* enforce local workflow instruction resolution ([#111](https://github.com/typicalday/owenloop/issues/111)) ([c5827d7](https://github.com/typicalday/owenloop/commit/c5827d7dd248ebc49a3a199dd8f1231249f280b5))
+* enforce workflow origin policy at install and execution ([#122](https://github.com/typicalday/owenloop/issues/122)) ([d91e881](https://github.com/typicalday/owenloop/commit/d91e881583efabbe1efe3427d3fc69fd20f1d6fc))
+* enforce workflow publication trust at install and execution ([#114](https://github.com/typicalday/owenloop/issues/114)) ([3b0d931](https://github.com/typicalday/owenloop/commit/3b0d931f6b37ca48b6c50a5b33a8b461e3410b8b))
+* expose installed bundle assets to workers ([#125](https://github.com/typicalday/owenloop/issues/125)) ([2c8b498](https://github.com/typicalday/owenloop/commit/2c8b4981c1a395b78205c8b076893ac3efa4416f))
+* expose run identity to command children ([#131](https://github.com/typicalday/owenloop/issues/131)) ([e7e18c1](https://github.com/typicalday/owenloop/commit/e7e18c1a84ce772fac80dfb493f267d7fbd8cde2))
+* freeze launch wire contracts ([#110](https://github.com/typicalday/owenloop/issues/110)) ([571a8f9](https://github.com/typicalday/owenloop/commit/571a8f90532d90e3db786890885d31d3446edf21))
+* reference-mode orders — instructions resolve by defDigest (WP-B1) ([#101](https://github.com/typicalday/owenloop/issues/101)) ([5e4071e](https://github.com/typicalday/owenloop/commit/5e4071ee5e56753cbcc330ac3c0b749518355ffc))
+* register signed machine enrollments ([#116](https://github.com/typicalday/owenloop/issues/116)) ([25ef244](https://github.com/typicalday/owenloop/commit/25ef2442de6277001c24b9e375513bfcb20a0ef1))
+* resolve agent model tiers and retry escalation ([#128](https://github.com/typicalday/owenloop/issues/128)) ([3098494](https://github.com/typicalday/owenloop/commit/3098494f2d34c3abdbe7ae2adee0deb73156f9b8))
+* resolve CAS bundle workflows through calls: ([#130](https://github.com/typicalday/owenloop/issues/130)) ([444b868](https://github.com/typicalday/owenloop/commit/444b868f50b37e2e377976a935bf17ea60fe6190))
+* ship Claude Code plugin pack ([#104](https://github.com/typicalday/owenloop/issues/104)) ([a76bea7](https://github.com/typicalday/owenloop/commit/a76bea789eaa78599b8ed23f590f5f559b907279))
+* ship the Codex plugin tree and launch the plugin MCP server from PATH ([#107](https://github.com/typicalday/owenloop/issues/107)) ([d165d28](https://github.com/typicalday/owenloop/commit/d165d284d125304321b3c5d10a304cc3d606e0e3))
+* support dynamic workdirs from consumed artifacts ([#129](https://github.com/typicalday/owenloop/issues/129)) ([6c4ada1](https://github.com/typicalday/owenloop/commit/6c4ada1478e4a2c1468c1565a6542ae3936ac383))
+* two-level content-addressed workflow store with .wnlp bundle installs ([#103](https://github.com/typicalday/owenloop/issues/103)) ([029d06c](https://github.com/typicalday/owenloop/commit/029d06cfebcad2aeff20350a0f9c83402ede1b3a))
+* verify admin-signed org policy floors and merge them as a strictness floor ([#120](https://github.com/typicalday/owenloop/issues/120)) ([da381b3](https://github.com/typicalday/owenloop/commit/da381b36d160de02a967926da71a6da6c19b21b8))
+* verify consumed artifact values and producer enrollment at the driver boundary ([#123](https://github.com/typicalday/owenloop/issues/123)) ([9629d14](https://github.com/typicalday/owenloop/commit/9629d1444e5576629336dfbc31dcc3d1b0297a4c))
+
+
+### Bug Fixes
+
+* lock plugin manifest versions to package ([#108](https://github.com/typicalday/owenloop/issues/108)) ([8c2a93e](https://github.com/typicalday/owenloop/commit/8c2a93ea9f92293ac06c578d54384c381dd52f42))
+* resolve the MCP hub origin from config instead of enumerating the credential store ([#118](https://github.com/typicalday/owenloop/issues/118)) ([07c140d](https://github.com/typicalday/owenloop/commit/07c140db6ba7169cba68eb09034dc23c70fdba28))
+
 ## [0.5.0](https://github.com/typicalday/owenloop/compare/v0.4.1...v0.5.0) (2026-08-04)
 
 
