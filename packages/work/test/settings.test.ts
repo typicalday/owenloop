@@ -115,6 +115,46 @@ test('loadSettings: each C6 knob loads with its value', () => {
   }
 });
 
+test('loadSettings: model policy knobs load with their values', () => {
+  const xdg = withSettingsFile(
+    JSON.stringify({
+      tierMap: { strong: 'custom-strong' },
+      escalateAt: 5,
+      escalationExtensionKey: 'delivery-extra',
+    }),
+  );
+  try {
+    const s = loadSettings({ XDG_CONFIG_HOME: xdg });
+    assert.deepEqual(s.tierMap, { strong: 'custom-strong' });
+    assert.equal(s.escalateAt, 5);
+    assert.equal(s.escalationExtensionKey, 'delivery-extra');
+    assert.ok(KNOWN_SETTINGS_KEYS.includes('tierMap'));
+    assert.ok(KNOWN_SETTINGS_KEYS.includes('escalateAt'));
+    assert.ok(KNOWN_SETTINGS_KEYS.includes('escalationExtensionKey'));
+  } finally {
+    rmSync(xdg, { recursive: true, force: true });
+  }
+});
+
+test('loadSettings: model policy knobs reject invalid values', () => {
+  const cases: Array<[string, unknown, RegExp]> = [
+    ['tierMap', { strong: '' }, /'tierMap' must be an object whose values are non-empty strings/],
+    ['tierMap', [], /'tierMap' must be an object whose values are non-empty strings/],
+    ['escalateAt', 0, /'escalateAt' must be a positive integer/],
+    ['escalateAt', 1.5, /'escalateAt' must be a positive integer/],
+    ['escalationExtensionKey', '  ', /'escalationExtensionKey' must be a non-empty string/],
+    ['escalationExtensionKey', 4, /'escalationExtensionKey' must be a non-empty string/],
+  ];
+  for (const [key, value, expected] of cases) {
+    const xdg = withSettingsFile(JSON.stringify({ [key]: value }));
+    try {
+      assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), expected, `${key} should be rejected`);
+    } finally {
+      rmSync(xdg, { recursive: true, force: true });
+    }
+  }
+});
+
 test('loadSettings: absent knobs default to undefined (empty file)', () => {
   const xdg = withSettingsFile('{}');
   try {

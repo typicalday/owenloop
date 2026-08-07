@@ -80,6 +80,7 @@ import { hostname } from 'node:os';
 
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createAgentRunLoop, type AdapterResolution, type AgentRunOutcome } from '../agent/loop.ts';
+import { createModelPolicy, type ModelPolicy } from '../agent/model-policy.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
@@ -291,6 +292,14 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 1;
   }
 
+  const modelPolicy: ModelPolicy = createModelPolicy({
+    ...(settings.tierMap !== undefined ? { tierMap: settings.tierMap } : {}),
+    ...(settings.escalateAt !== undefined ? { escalateAt: settings.escalateAt } : {}),
+    ...(settings.escalationExtensionKey !== undefined
+      ? { escalationExtensionKey: settings.escalationExtensionKey }
+      : {}),
+  });
+
   const origin = parsed.origin ?? settings.hubOrigin;
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work agent-run: no hub origin — pass --origin <url> or set hubOrigin in settings');
@@ -496,6 +505,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     cwd: workCwd,
     loadStep,
     resolveAdapter,
+    modelPolicy,
     consumedVerifier,
     appendSession: writeSession,
     nextAttempt: (workflow, run, step) => {

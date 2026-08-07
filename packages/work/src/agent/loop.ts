@@ -79,6 +79,13 @@ import {
   renderReplayBrief,
   type BriefSpec,
 } from './brief.ts';
+import {
+  pickModel,
+  type ModelEscalation,
+  type ModelLane,
+  type ModelPolicy,
+  type PickModelResult,
+} from './model-policy.ts';
 
 /** Discriminated result of one worker life; the role maps these to exit codes. */
 export type AgentRunOutcome =
@@ -146,6 +153,8 @@ export interface AgentRunLoopOptions {
   cwd: string;
   loadStep: StepLoader;
   resolveAdapter: AdapterResolver;
+  /** Resolve authored model tiers and retry escalation before dispatch. */
+  modelPolicy?: ModelPolicy;
   /** Gate dynamic values and rejection reasons before any prompt rendering. */
   consumedVerifier?: ConsumedVerifier;
   /** Append one session record. Wired to `appendSession` by the role. */
@@ -215,6 +224,65 @@ export interface ConfirmOptions {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+function laneFromPacket(packet: OrderPacket): ModelLane | undefined {
+  const plan = packet.consumes?.['plan'];
+  if (plan === null || typeof plan !== 'object' || Array.isArray(plan)) return undefined;
+  const lane = (plan as Record<string, unknown>)['lane'];
+  return lane === 'express' || lane === 'standard' || lane === 'deep' ? lane : undefined;
+}
+
+function escalationFromPacket(packet: OrderPacket, extensionKey: string): ModelEscalation | undefined {
+  const extension = packet.x?.[extensionKey];
+  if (extension === null || typeof extension !== 'object' || Array.isArray(extension)) return undefined;
+  if (!('escalation' in extension)) return undefined;
+  const raw = (extension as Record<string, unknown>)['escalation'];
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const bag = raw as Record<string, unknown>;
+  const model = typeof bag['model'] === 'string' && bag['model'] !== '' ? bag['model'] : undefined;
+  const attempts =
+    typeof bag['attempts'] === 'number' && Number.isInteger(bag['attempts']) && bag['attempts'] > 0
+      ? bag['attempts']
+      : undefined;
+  return {
+    ...(model !== undefined ? { model } : {}),
+    ...(attempts !== undefined ? { attempts } : {}),
+  };
+}
+
+/**
+ * The reject depth driving retry escalation: the max across the step's owed
+ * outputs, with consult paths excluded.
+ *
+ * The exclusion matters. A consult artifact's rejects are the mentor handing
+ * advice back for another round, not a signal that this producer is stuck — and
+ * they ride a separate per-produce attempt budget for exactly that reason.
+ * Counting them would let one ordinary mentor round escalate the model on every
+ * later firing of the step, permanently, on a producer that was never failing.
+ */
+function judgmentRejectsFromPacket(packet: OrderPacket): number {
+  let max = 0;
+  for (const owed of packet.owes) {
+    const path = String(owed.path ?? '');
+    if (path === 'consultRequest' || path.endsWith('Consult')) continue;
+    const rejects = owed.judgmentRejects;
+    if (typeof rejects === 'number' && Number.isFinite(rejects) && rejects > max) max = rejects;
+  }
+  return max;
+}
+
+function modelForPacket(packet: OrderPacket, policy: ModelPolicy | undefined): PickModelResult | undefined {
+  if (packet.model === undefined) return undefined;
+  if (policy === undefined) return { model: packet.model };
+  return pickModel(
+    packet.model,
+    laneFromPacket(packet),
+    judgmentRejectsFromPacket(packet),
+    policy,
+    undefined,
+    escalationFromPacket(packet, policy.escalationExtensionKey),
+  );
 }
 
 /**
@@ -567,11 +635,12 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
 
     const owenloopMcp = buildOwenloopMcp(spec);
+    const resolvedModel = modelForPacket(packet, opts.modelPolicy);
     const deliverArgs: DeliverArgs = {
       cwd: recordCwd,
       owenloopMcp,
       permissions,
-      ...(packet.model !== undefined ? { model: packet.model } : {}),
+      ...(resolvedModel ?? {}),
     };
     /** Built lazily: a cold start after a refused resume needs a FRESH one. */
     const coldArgs = (): StartArgs => ({
@@ -586,7 +655,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       cwd: recordCwd,
       owenloopMcp,
       permissions,
-      ...(packet.model !== undefined ? { model: packet.model } : {}),
+      ...(resolvedModel ?? {}),
     });
 
     const path = resumable ? 'resume' : delta.message !== '' ? 'cold replay' : 'cold start';

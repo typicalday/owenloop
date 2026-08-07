@@ -20,6 +20,7 @@ import {
 } from '../src/agent/loop.ts';
 import { ACCOUNT_TOKEN, SHIFT_TOKEN, ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { createFakeAdapter } from '../src/harness/fake.ts';
+import { createModelPolicy } from '../src/agent/model-policy.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
 import { ResumeUnavailableError } from '../src/harness/contract.ts';
 import type { SessionRecord } from '../src/harness/session-store.ts';
@@ -44,6 +45,12 @@ interface OrderOpts {
   worker?: string;
   claimed?: boolean;
   outcome?: string;
+  /** Consumed input artifact values, keyed by path — `plan` carries the lane. */
+  consumes?: Record<string, unknown>;
+  /** Owed outputs; their `judgmentRejects` drive retry escalation. */
+  owes?: Array<{ path: string; judgmentRejects?: number }>;
+  /** Extension bag — the authored escalation ladder lives under a namespace. */
+  x?: Record<string, unknown>;
 }
 
 /** A get_order response carrying an agent order packet. */
@@ -63,8 +70,14 @@ function agentOrder(o: OrderOpts = {}): GetOrderResponse {
       ...(o.model !== undefined ? { model: o.model } : {}),
       ...(o.worker !== undefined ? { worker: o.worker } : {}),
       defDigest: 'test-agent-digest',
-      consumes: {},
-      owes: [],
+      ...(o.x !== undefined ? { x: o.x } : {}),
+      consumes: o.consumes ?? {},
+      owes: (o.owes ?? []).map((w) => ({
+        path: w.path,
+        judgmentRejects: w.judgmentRejects ?? 0,
+        schemaRejects: 0,
+        reasons: [],
+      })),
     },
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
   };
@@ -194,6 +207,7 @@ interface BuildOpts {
   submitGraceMs?: number;
   shiftId?: string;
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
+  modelPolicy?: AgentRunLoopOptions['modelPolicy'];
 }
 
 function buildOpts(b: BuildOpts): Harnessed {
@@ -214,6 +228,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     loadStep: b.loadStep ?? (async () => (b.spec === undefined ? baseSpec() : b.spec)),
     resolveAdapter: () => resolution,
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
+    ...(b.modelPolicy === undefined ? {} : { modelPolicy: b.modelPolicy }),
     appendSession: (rec) => records.push(rec),
     nextAttempt: () => 3,
     sleep: macrotaskSleep,
@@ -306,6 +321,156 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
   assert.equal(start.args.permissions.model, 'm-step');
   // ...while the order packet's model is the per-start override.
   assert.equal(start.args.model, 'm-override');
+});
+
+// ---- tier resolution from real packet data ----------------------------------
+//
+// `model-policy.test.ts` covers the algorithm by calling `pickModel` with
+// literal arguments. These tests cover the WIRING instead: that the loop pulls
+// the lane out of `consumes.plan.lane`, the reject count out of `owes[]`, and
+// the escalation ladder out of the extension bag, and hands all three to the
+// resolver. Without them, the packet readers are the only unexercised part of
+// the path, and an escalation bug that only appears UNDER a lane ships green.
+
+/**
+ * Resolve one order packet all the way to the harness `start` args.
+ *
+ * These packets carry `consumes`/`owes` data, so the loop's consume-side gate
+ * demands a verifier before any of it can reach a prompt. That gate is not what
+ * these tests are about, so it is satisfied with a pass-through that admits the
+ * packet unchanged; the refusal behavior has its own tests further down.
+ */
+async function startArgsFor(o: OrderOpts): Promise<StartArgs> {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder(o), agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({
+    hub,
+    adapter,
+    modelPolicy: createModelPolicy(),
+    consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
+  });
+  await createAgentRunLoop(h.opts).run();
+  const start = adapter.calls.find((c) => c.kind === 'start');
+  assert.ok(start !== undefined && start.kind === 'start');
+  return start.args;
+}
+
+test('the authored tier is resolved through the lane carried on the consumed plan artifact', async () => {
+  // No lane anywhere: the tier resolves, nothing clamps.
+  assert.equal((await startArgsFor({ model: 'strong' })).model, 'opus');
+
+  // A real express lane, shaped exactly as the engine copies a green `plan`
+  // artifact's value into `consumes['plan']`.
+  assert.equal((await startArgsFor({ model: 'strong', consumes: { plan: { lane: 'express' } } })).model, 'sonnet');
+  assert.equal((await startArgsFor({ model: 'fast', consumes: { plan: { lane: 'deep' } } })).model, 'opus');
+
+  // The top tier is pinned against the express cap even when the lane is real.
+  assert.equal((await startArgsFor({ model: 'strongest', consumes: { plan: { lane: 'express' } } })).model, 'fable');
+});
+
+test('a malformed lane on the plan artifact fails open to no clamp', async () => {
+  // Fail-open is deliberate: a bad plan artifact must never stop an agent from
+  // running. Every one of these yields `undefined`, i.e. no lane adjustment.
+  for (const plan of [
+    { lane: 'EXPRESS' }, // wrong case is not a lane
+    { lane: 'turbo' }, // unknown string
+    { lane: 42 }, // wrong type
+    { lane: null },
+    {}, // key absent
+    'express', // the artifact value is not an object
+    null,
+    ['express'], // arrays are not lane carriers
+  ]) {
+    const args = await startArgsFor({ model: 'strong', consumes: { plan } });
+    assert.equal(args.model, 'opus', `expected no clamp for plan=${JSON.stringify(plan)}`);
+  }
+
+  // A packet with no `plan` key at all is the planner's own firing.
+  assert.equal((await startArgsFor({ model: 'strong', consumes: {} })).model, 'opus');
+});
+
+test('reject escalation beats the express cap on a real packet, and consult paths do not count', async () => {
+  const express = { plan: { lane: 'express' } };
+
+  // The delivery line's reviewer step is authored `strong:4`. Under an express
+  // lane it starts clamped, bumps effort at the threshold, and escalates the
+  // model at twice the threshold — it never gets stuck at the cap.
+  const cold = await startArgsFor({ model: 'strong:4', consumes: express, owes: [{ path: 'verdict' }] });
+  assert.equal(cold.model, 'sonnet');
+  assert.equal(cold.effort, 'xhigh');
+
+  const bumped = await startArgsFor({
+    model: 'strong:4',
+    consumes: express,
+    owes: [{ path: 'verdict', judgmentRejects: 3 }],
+  });
+  assert.equal(bumped.model, 'sonnet');
+  assert.equal(bumped.effort, 'max');
+
+  const escalated = await startArgsFor({
+    model: 'strong:4',
+    consumes: express,
+    owes: [{ path: 'verdict', judgmentRejects: 6 }],
+  });
+  assert.equal(escalated.model, 'opus');
+  assert.equal(escalated.effort, 'max');
+
+  // With no effort suffix to bump, reaching the threshold escalates the model
+  // straight away — still under the express lane that clamped it.
+  assert.equal(
+    (await startArgsFor({ model: 'strong', consumes: express, owes: [{ path: 'pr', judgmentRejects: 3 }] })).model,
+    'opus',
+  );
+
+  // The count is the MAX across owed outputs, but consult paths are excluded:
+  // an occasional mentor round would otherwise escalate every later firing.
+  assert.equal(
+    (
+      await startArgsFor({
+        model: 'strong',
+        consumes: express,
+        owes: [
+          { path: 'pr', judgmentRejects: 0 },
+          { path: 'consultRequest', judgmentRejects: 9 },
+          { path: 'planConsult', judgmentRejects: 9 },
+        ],
+      })
+    ).model,
+    'sonnet',
+  );
+});
+
+test('the authored escalation ladder is read from the packet extension bag', async () => {
+  const express = { plan: { lane: 'express' } };
+  const bag = { delivery: { escalation: { model: 'strongest', attempts: 2 } } };
+
+  // Below the authored threshold: rung 1 is the step's own model, lane-adjusted.
+  assert.equal(
+    (await startArgsFor({ model: 'strong', consumes: express, x: bag, owes: [{ path: 'pr', judgmentRejects: 1 }] }))
+      .model,
+    'sonnet',
+  );
+
+  // At the authored threshold: rung 2 is the authored model, pinned against
+  // the lane — the express cap does not pull it back down.
+  assert.equal(
+    (await startArgsFor({ model: 'strong', consumes: express, x: bag, owes: [{ path: 'pr', judgmentRejects: 2 }] }))
+      .model,
+    'fable',
+  );
+
+  // A malformed bag fails open to the default staged rule, same as the lane.
+  assert.equal(
+    (
+      await startArgsFor({
+        model: 'strong',
+        consumes: express,
+        x: { delivery: { escalation: 'nope' } },
+        owes: [{ path: 'pr', judgmentRejects: 3 }],
+      })
+    ).model,
+    'opus',
+  );
 });
 
 // ---- the invariant: the hub decides, never the harness -----------------------

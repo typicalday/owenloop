@@ -12,6 +12,7 @@
  * the file is malformed JSON or a known key has the wrong type · 2 on stray
  * args (there are no options in v1).
  */
+import { DEFAULT_TIER_MAP } from '../agent/model-policy.ts';
 import { inspectSettings, KNOWN_SETTINGS_KEYS } from '../settings/settings.ts';
 
 /** Built-in defaults shown for knobs absent from the file (else `unset`). */
@@ -19,6 +20,9 @@ const DEFAULT_NOTE: Partial<Record<(typeof KNOWN_SETTINGS_KEYS)[number], string>
   dispatchCap: '3',
   commandRouting: 'shift',
   defPolicy: 'warn',
+  tierMap: JSON.stringify(DEFAULT_TIER_MAP),
+  escalateAt: '3',
+  escalationExtensionKey: 'delivery',
 };
 
 function errMsg(err: unknown): string {
