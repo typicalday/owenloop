@@ -1406,13 +1406,18 @@ test('calls: REL-5 — losing provisionCallsChild re-attaches to the winner (cre
       engine2 as unknown as {
         provisionCallsChild(
           parentWf: string,
+          parentDef: WorkflowDef,
           step: StepDef,
           callsStem: string,
           gateStems: string[],
           now?: number,
         ): { childId: string; created: boolean; provided: string[] } | null;
       }
-    ).provisionCallsChild(parentWf, deliverStep, 'delivered', ['sandbox']);
+      // WS-6 added `parentDef` (the parent's own def, used to scope a bare
+      // `calls:` target to the parent's CAS bundle and to check its pin). This
+      // fixture's defs are plain in-memory defs with no bundle provenance, so
+      // the added argument changes nothing about what this test exercises.
+    ).provisionCallsChild(parentWf, parentDef, deliverStep, 'delivered', ['sandbox']);
 
     assert.deepEqual(
       provision,

@@ -1656,6 +1656,68 @@ export function lintDef(def: WorkflowDef): { errors: string[]; warnings: string[
   return { errors, warnings };
 }
 
+// ---- WS-6: scope-aware calls: target resolution -------------------------------
+
+/**
+ * Resolve one `calls:` edge to the def map KEY that edge names, honoring CAS
+ * bundle scope. Returns `undefined` when nothing matches (the caller reports the
+ * `does not exist` error, or skips, as it always has).
+ *
+ * THREE CASES, checked in this order:
+ *
+ *  1. `target` contains `/` — an explicitly QUALIFIED reference
+ *     (`<package>/<workflow>`, or an explicit `namespace/name@version` whose
+ *     text is the map key a CAS registration was filed under). Look up the flat
+ *     map with that exact key and DO NOT fall back to a bare lookup: an author
+ *     who wrote a qualified name asked for one specific def, and silently
+ *     serving a same-named local def would be the shadowing this workstream
+ *     exists to prevent. A def name can never contain `/` (see NAME_RE), so a
+ *     qualified key is unforgeable as a filesystem def name.
+ *
+ *  2. `from` carries a `bundleDigest` (it was loaded out of a CAS bundle) and
+ *     `target` is bare — resolve SIBLING-FIRST: search the map for a def whose
+ *     `bundleDigest` equals `from.bundleDigest` and whose own name equals
+ *     `target`. This is what makes `calls: build` inside bundle A bind to
+ *     bundle A's `build` and never to bundle B's.
+ *
+ *  3. Otherwise — today's plain flat-map lookup, byte-for-byte unchanged. Every
+ *     def loaded off the filesystem or handed to `createEngine({ defs })` has
+ *     no `bundleDigest`, so it takes this path exactly as before.
+ *
+ * A bare `calls:` from a CAS def that names NO sibling falls through case 2 into
+ * case 3, so an out-of-bundle name still resolves if the flat map holds it and
+ * still produces the existing `does not exist` error if it does not.
+ */
+function resolveCallsTargetKey(
+  defs: Map<string, WorkflowDef>,
+  target: string,
+  from: WorkflowDef,
+): string | undefined {
+  if (target.includes('/')) return defs.has(target) ? target : undefined;
+  if (from.bundleDigest !== undefined) {
+    for (const [key, candidate] of defs) {
+      if (candidate.bundleDigest === from.bundleDigest && candidate.name === target) return key;
+    }
+  }
+  return defs.has(target) ? target : undefined;
+}
+
+/**
+ * The def a `calls:` edge names, honoring CAS bundle scope — the value form of
+ * {@link resolveCallsTargetKey}. This is the ONE resolution rule shared by
+ * load-time validation (`finalizeDefs`), cycle detection, and the engine's
+ * spawn path, so a def that validates at load time is the same def the engine
+ * spawns at runtime.
+ */
+export function resolveCallsTarget(
+  defs: Map<string, WorkflowDef>,
+  target: string,
+  from: WorkflowDef,
+): WorkflowDef | undefined {
+  const key = resolveCallsTargetKey(defs, target, from);
+  return key === undefined ? undefined : defs.get(key);
+}
+
 // ---- M2-CYCLE: cross-def calls-cycle detection --------------------------------
 
 /**
@@ -1670,14 +1732,21 @@ function detectCallsCycles(defs: Map<string, WorkflowDef>): void {
   const color = new Map<string, number>([...defs.keys()].map((k) => [k, WHITE]));
   const stack: string[] = [];
 
+  // WS-6: the walk must key on RESOLVED identity, not on the bare `calls:` text.
+  // Two installed bundles may each export a workflow named `build`; keying the
+  // walk by that bare text would fuse them into one node and report a cycle that
+  // does not exist. `resolveCallsTarget` maps (edge text, calling def) to the
+  // exact map key the engine will spawn, so each bundle's `build` stays its own
+  // node under its own qualified key.
   const visit = (name: string): void => {
     color.set(name, GREY);
     stack.push(name);
     const def = defs.get(name);
     // Unique calls: edges from this def (multiple steps might call the same child)
     const callsEdges = new Set((def?.steps ?? []).filter((l) => l.calls).map((l) => l.calls!));
-    for (const child of callsEdges) {
-      if (!defs.has(child)) continue; // missing-def error is reported separately in loadDefs
+    for (const edge of callsEdges) {
+      const child = def === undefined ? undefined : resolveCallsTargetKey(defs, edge, def);
+      if (child === undefined) continue; // missing-def error is reported separately in loadDefs
       const c = color.get(child) ?? WHITE;
       if (c === GREY) {
         const from = stack.indexOf(child);
@@ -1798,9 +1867,14 @@ export function finalizeDefs(raw: Map<string, WorkflowDef>): Map<string, Workflo
 
     // M2-VALIDATE cross-def: target-def existence + child input-key validity.
     // These cannot live in validateDef (pure per-def, no resolver) — same split as expandIncludes.
+    //
+    // WS-6: `calls:` targets resolve through `resolveCallsTarget` (scope-aware),
+    // NOT through the plain `resolver` used for `include:` expansion above.
+    // `include:` is a DIFFERENT edge kind and is deliberately left on the flat
+    // lookup — this workstream is `calls:`-only.
     for (const l of expanded.steps) {
       if (!l.calls) continue;
-      const childDef = resolver(l.calls);
+      const childDef = resolveCallsTarget(raw, l.calls, expanded);
       if (!childDef) {
         throw new DefError(`calls names workflow '${l.calls}' which does not exist`);
       }

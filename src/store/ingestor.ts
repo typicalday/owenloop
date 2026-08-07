@@ -50,8 +50,16 @@ function coordinateFor(manifest: BundleManifest, namespace: string): WorkflowCoo
  * `bundle.yaml` is intentionally absent from `integrity.files` because its
  * content participates in the canonical bundle digest and self-hashing would
  * be recursive.
+ *
+ * SYNCHRONOUS by construction: every filesystem call in the body is a `*Sync`
+ * call, and it awaits nothing. The `BundleIngestor.verifyInstalledObject` port
+ * stays `Promise`-returning (an adapter may legitimately need I/O concurrency),
+ * but this default adapter's implementation does not, so WS-6's def loader —
+ * which must run inside the synchronous `openCtx`/`dispatch` path — calls this
+ * function directly instead of forcing `openCtx` to become `async`. Exported
+ * for exactly that caller; the async port remains the public contract.
  */
-async function verifyObject(objectDir: string, digest: DefDigest): Promise<void> {
+export function verifyWorkflowObjectSync(objectDir: string, digest: DefDigest): void {
   assertDirectory(objectDir);
 
   const manifestPath = join(objectDir, 'bundle.yaml');
@@ -136,7 +144,7 @@ export function createBundleIngestor(options: BundleIngestorOptions = {}): Bundl
     },
 
     async verifyInstalledObject(input: { objectDir: string; digest: DefDigest }): Promise<void> {
-      await verifyObject(input.objectDir, input.digest);
+      verifyWorkflowObjectSync(input.objectDir, input.digest);
     },
   };
 }

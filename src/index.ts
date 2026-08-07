@@ -12,7 +12,7 @@
  * process — software delivery, research, triage — on top of it.
  */
 
-export { Engine } from './engine.ts';
+export { CallsPinError, Engine } from './engine.ts';
 export type {
   CommitResult,
   CreateOpts,
@@ -62,6 +62,7 @@ export {
   hardenObjectModes,
   installWorkflowBundle,
   isDefDigest,
+  loadCasDefs,
   objectDestRelPath,
   objectDirForDigest,
   parseWorkflowCoordinate,
@@ -100,7 +101,9 @@ export type {
   BundleInstallResult,
   BundleIngestor,
   BundleSource,
+  CasDefRegistration,
   DefDigest,
+  LoadCasDefsArgs,
   InstallWorkflowBundleArgs,
   PreCommitVerifier,
   ExecutionOriginVerifierInput,
@@ -116,7 +119,7 @@ export type {
   WorkflowStoreStatePaths,
 } from './store/index.ts';
 
-export { buildDef, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
+export { buildDef, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, resolveCallsTarget, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
 export { credentialSlot, hashDefForHub, keychainServiceFor, normalizeOrigin, readStoredCredential } from './hub.ts';
 export type { Credential, CredentialSlotSelector, Keychain, ReadStoredCredentialOpts } from './hub.ts';
 export type { DefLoadFailure } from './defs.ts';

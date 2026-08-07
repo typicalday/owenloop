@@ -485,6 +485,38 @@ export interface WorkflowDef {
    * Never visible to the engine; always undefined on a fully-expanded def.
    */
   _includes?: Array<{ pos: number; defName: string; as: string; inputs: Record<string, string> }>;
+  /**
+   * @internal WS-6 CAS provenance: the `package.name` of the installed bundle
+   * this def was loaded from (the namespace half of its coordinate). Set ONLY by
+   * the content-addressed-store def loader (`loadCasDefs`); always `undefined`
+   * for a def scanned off the filesystem or handed to `createEngine({ defs })`.
+   * Read by the scope-aware `DefResolver` to build the qualified key
+   * `<bundlePackage>/<name>`.
+   */
+  bundlePackage?: string;
+  /**
+   * @internal WS-6 CAS provenance: the canonical BUNDLE digest (lowercase
+   * 64-hex SHA-256 over the uncompressed canonical tar) of the store object this
+   * def was loaded from. NOT a `defInstructionDigest` (which projects ONE
+   * definition) and NOT a `hashDef` (a 16-hex whole-def drift hash) — one bundle
+   * digest covers every workflow in that bundle. Two defs are siblings exactly
+   * when their `bundleDigest` values are equal, which is the pin a bare `calls:`
+   * between them is checked against at spawn (`provisionCallsChild`); the v2
+   * bundle format carries no per-workflow digest to check instead.
+   */
+  bundleDigest?: string;
+  /**
+   * @internal WS-6 CAS provenance: a COPY of the containing bundle manifest's
+   * `lock` map (explicit `namespace/name@version` reference text → the canonical
+   * bundle digest that reference is pinned to). Carried on the def so the
+   * engine's spawn-time pin check is a pure in-memory comparison and never
+   * performs filesystem I/O inside the SQLite write transaction that creates the
+   * child. Set only by `loadCasDefs`; `undefined` everywhere else. Bare
+   * (same-bundle) `calls:` targets never appear here — `assertLockCoverage`
+   * requires lock entries only for the explicit versioned form, and a sibling's
+   * pin is its containing bundle's own digest.
+   */
+  bundleLock?: Record<string, string>;
 }
 
 export interface InputDef {

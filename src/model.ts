@@ -469,6 +469,34 @@ function idleEligible(
 }
 
 /**
+ * Is some `calls:` step still waiting on a child that the model cannot simulate?
+ *
+ * True when a `calls:` step has all of its own consumed inputs green (so the
+ * engine would provision the child NOW) and at least one of its produced
+ * outputs is still a debt (so the child has not yet discharged it).
+ *
+ * Why this exists: `eligibleFirings` skips every `calls:` step (M2 — the engine
+ * spawns a child rather than issuing a worker order), and `modelCheck` explores
+ * ONE def with no child engine attached. Without this predicate the exploration
+ * mistakes "waiting on a child I can't see" for "structurally dead", which made
+ * `hasDefiniteCheckDefect` reject EVERY `calls:`-using def at install time —
+ * including the repo's own `examples/workflows/provisioned-delivery.yaml`.
+ *
+ * Deliberately mirrors the `mode === 'plain'` input gate in `eligibleFirings`
+ * rather than reusing it: the two answer different questions ("may a worker fire
+ * here?" vs "is the machine mid-handoff to a child?") and must stay independent.
+ */
+function callsDeferralPending(def: WorkflowDef, arts: ArtifactMap): boolean {
+  for (const step of def.steps) {
+    if (!step.calls) continue;
+    const inputsSatisfied = plainConsumes(step).every((c) => isGreen(arts.get(c.stem)));
+    if (!inputsSatisfied) continue;
+    if (plainOutputs(step).some((p) => isDebt(arts.get(p)))) return true;
+  }
+  return false;
+}
+
+/**
  * Every firing eligible *right now* — inputs satisfied AND an owed/rejected
  * output to discharge. This is the scheduling gate (§11.4): necessary, not
  * sufficient; the commit fingerprint (§12.2) is the correctness boundary.
@@ -2318,9 +2346,26 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
     // would re-arm → an EXPECTED stall state (a by-design brake). If not → a
     // TRUE deadlock (a structural dead-end with no path to completion even at
     // unlimited attempts).
+    //
+    // WS-6 correction — a pending `calls:` debt is NOT a true deadlock. M2 makes
+    // `eligibleFirings` skip every `calls:` step (the engine spawns a child to
+    // discharge it, so it must never become a worker firing). The model has no
+    // child to simulate, so such a state reaches here with zero firings. Calling
+    // it a TRUE deadlock asserts this report's own documented claim — "no path to
+    // completion even at unlimited attempts" — which is FALSE here: the engine
+    // does spawn the child and the debt is discharged. The model simply cannot
+    // see that far. Record it as a stall (the existing "expected, not a defect,
+    // does not affect the exit code" bucket) so the check stays SOUND: it reports
+    // only what it can actually establish.
+    //
+    // Scope: this changes nothing for a def with no `calls:` step —
+    // `callsDeferralPending` returns false and the original branch runs verbatim.
+    // `eligibleFirings` (the LIVE engine scheduler, engine.ts:1365) and
+    // `hasDefiniteCheckDefect` (shared by check / add / push / install) are
+    // deliberately untouched.
     if (firings.length === 0 && !status.done) {
       const lifted = eligibleFirings(def, node.arts, undefined, { ignoreFreeze: true });
-      if (lifted.length > 0) {
+      if (lifted.length > 0 || callsDeferralPending(def, node.arts)) {
         report.stallStates.push({ path: node.path });
       } else {
         report.deadlocks.push({ path: node.path });

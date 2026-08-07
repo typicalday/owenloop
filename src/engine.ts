@@ -96,6 +96,80 @@ export class SchemaRefusalError extends Error {
 }
 
 /**
+ * WS-6: a `calls:` step resolved to a child definition that is NOT the one the
+ * parent's own bundle pinned. Thrown from inside `provisionCallsChild`'s
+ * transaction, so the whole provisioning tx rolls back — no child row, no
+ * partial input sync — and `maintainCalls` converts it into a visible debt on
+ * the parent's `calls:` artifact (see `recordCallsDigestReject`). The failure
+ * mode this prevents is silent: without it, a newer install of the same package
+ * would let a running parent spawn a DIFFERENT workflow body than the one it was
+ * pinned against, and nothing would say so.
+ */
+export class CallsPinError extends Error {
+  override readonly name = 'CallsPinError';
+  /** The `calls:` target text exactly as the parent def wrote it. */
+  readonly target: string;
+  /** Human-readable statement of which pin was violated and how. */
+  readonly detail: string;
+
+  constructor(target: string, detail: string) {
+    super(`calls target '${target}' failed its pin check: ${detail}`);
+    this.target = target;
+    this.detail = detail;
+  }
+}
+
+/**
+ * WS-6: check that `childDef` is the definition the parent's own bundle pinned
+ * for the `calls:` target `target`. Returns `undefined` when the edge is fine,
+ * or a human-readable violation string.
+ *
+ * THREE CASES, and the FIRST two are the whole point of the check:
+ *
+ *  1. `target` is BARE and `parentDef` came from a CAS bundle
+ *     (`parentDef.bundleDigest` is set). The pin is BUNDLE-digest equality: the
+ *     v2 bundle format carries no per-workflow digest, and `assertLockCoverage`
+ *     deliberately skips non-versioned refs, so a sibling's pin IS its
+ *     containing bundle's own digest. `childDef.bundleDigest` must equal
+ *     `parentDef.bundleDigest`.
+ *
+ *  2. `target` is an explicit `namespace/name@version` reference AND the parent
+ *     bundle's manifest `lock` names it. The lock value is a canonical BUNDLE
+ *     digest (`bundle.yaml.lock` validates lowercase 64-hex; `assertLockCoverage`
+ *     requires an entry for every versioned target), so it is compared against
+ *     `childDef.bundleDigest` — NOT against `defInstructionDigest`, which
+ *     projects one definition and is a different digest kind entirely.
+ *
+ *  3. Everything else — a parent with no CAS provenance, or a versioned target
+ *     with no lock entry reachable — is UNPINNED and passes. This is what keeps
+ *     every filesystem def, every `owenloop add` def, and every legacy unpinned
+ *     instance behaving exactly as before: no provenance, no check.
+ */
+function callsPinViolation(
+  parentDef: WorkflowDef,
+  childDef: WorkflowDef,
+  target: string,
+): string | undefined {
+  if (target.includes('/')) {
+    const pinned = parentDef.bundleLock?.[target];
+    if (pinned === undefined) return undefined; // no lock entry reachable — unpinned
+    if (childDef.bundleDigest === undefined) {
+      return `parent bundle pins it to ${pinned} but the resolved definition carries no bundle provenance`;
+    }
+    if (childDef.bundleDigest !== pinned) {
+      return `parent bundle pins it to ${pinned} but the resolved definition comes from ${childDef.bundleDigest}`;
+    }
+    return undefined;
+  }
+  if (parentDef.bundleDigest === undefined) return undefined; // parent not CAS-installed — unpinned
+  if (childDef.bundleDigest !== parentDef.bundleDigest) {
+    const found = childDef.bundleDigest ?? 'no bundle (a project-local or add-installed definition)';
+    return `a bare calls: target must be a sibling in the parent's own bundle ${parentDef.bundleDigest}, but it resolved to ${found}`;
+  }
+  return undefined;
+}
+
+/**
  * §tick-deferred: an eligible firing the tick did NOT promote to an order, tagged
  * with why. `'in-flight'` — the step's task is already claimed by an open run;
  * `'cadence'` — the step's inter-run gap has not elapsed; `'daily-budget'` — the
@@ -224,7 +298,19 @@ export interface CreateOpts {
   producedBy?: { parentWf: string; parentPath: string };
 }
 
-export type DefResolver = (defName: string) => WorkflowDef;
+/**
+ * Map a definition name to its `WorkflowDef`, or throw if there is none.
+ *
+ * WS-6 widened this with an OPTIONAL second parameter. `from` is the def that
+ * NAMED `defName` — supplied only by the `calls:` spawn path, where the naming
+ * def's own CAS bundle scope decides which `defName` a bare reference means (a
+ * bare `calls: build` inside bundle A must reach bundle A's `build`, never an
+ * unrelated `build` from bundle B). Because the parameter is optional, every
+ * existing single-argument resolver — including a host's hand-written one —
+ * keeps today's exact behavior with no change: a resolver that ignores `from`
+ * simply performs the flat lookup it always did.
+ */
+export type DefResolver = (defName: string, from?: WorkflowDef) => WorkflowDef;
 
 /**
  * A push notification of a committed engine change, delivered to observers
@@ -452,6 +538,7 @@ export class Engine {
    */
   private provisionCallsChild(
     parentWf: string,
+    parentDef: WorkflowDef,
     step: StepDef,
     callsStem: string,
     gateStems: string[],
@@ -495,7 +582,16 @@ export class Engine {
         let childDef: WorkflowDef;
         if (!child) {
           const childId = randId('wf');
-          childDef = this.resolveDef(step.calls!);
+          // WS-6: resolve IN THE PARENT'S SCOPE. `parentDef` is the parent's own
+          // §28 pin (defFor prefers `defSnapshot` over the live resolver), so a
+          // bare `calls:` from a def installed out of a CAS bundle binds to that
+          // same bundle's workflow — the version the parent was pinned against —
+          // and not to whatever a later install happened to name the same thing.
+          childDef = this.resolveDef(step.calls!, parentDef);
+          // WS-6: and the resolved child must still be the PINNED one. See
+          // `callsPinViolation`.
+          const violation = callsPinViolation(parentDef, childDef, step.calls!);
+          if (violation !== undefined) throw new CallsPinError(step.calls!, violation);
           const seedProvide: Record<string, Record<string, unknown>> = {};
           for (const [childInputName, parentArtifactName] of Object.entries(step.callsInputs ?? {})) {
             const parentArt = parentArts.get(parentArtifactName);
@@ -788,6 +884,56 @@ export class Engine {
   }
 
   /**
+   * WS-6: record a `calls:` PIN violation as a debt on the PARENT calls
+   * artifact. Same clean-stop mechanism as `recordCallsDepthReject` — mark the
+   * artifact `rejected` and stamp the current gate fingerprint so the STEP-2 F2
+   * guard skips re-attempts instead of crash-looping the same refusal every
+   * tick — with a different, actionable message.
+   *
+   * Kept as its OWN recorder rather than folded into `recordCallsDepthReject`:
+   * the two refusals differ in what they mean (a depth trip says the definition
+   * set has a cycle that bypassed load-time validation; a pin violation says the
+   * installed store no longer holds the version this parent was pinned against)
+   * and therefore in what an operator should do next. Merging them into one
+   * parameterized recorder would blur exactly the distinction the message exists
+   * to carry.
+   *
+   * Like the depth recorder, this one needs NO carry-and-compare gate guard: a
+   * pin violation is decided from immutable provenance (the parent's §28 pinned
+   * snapshot and the resolved child's bundle digest), not from the gate
+   * snapshot, so a refusal decided at time T stays valid at recording time no
+   * matter what moved concurrently.
+   */
+  private recordCallsDigestReject(
+    parentWf: string,
+    def: WorkflowDef,
+    callsStem: string,
+    gateStems: string[],
+    err: CallsPinError,
+    now?: number,
+  ): void {
+    const text = `calls target '${err.target}' failed its pin check: ${err.detail}; `
+      + `the parent is pinned to the definition it was created against (§28), so this spawn was refused rather than `
+      + `run a different workflow body than the one that was pinned — reinstall the pinned bundle, or start a new `
+      + `parent instance against the current one`;
+    this.store.tx(() => {
+      const art = this.store.getArtifact(parentWf, callsStem);
+      if (!art) return; // not yet materialized by pendingOwed — nothing to stamp
+      const gateArts = this.artMap(parentWf);
+      const fp = computeFingerprint(gateArts, gateStems);
+      this.store.putArtifact({
+        ...art,
+        acceptance: 'rejected',
+        fingerprint: fp,
+        reasons: [...art.reasons, reason('reject', 'structural', 'engine', text, art.version)],
+      });
+      this.settle(parentWf, def, now);
+    });
+    this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject' });
+    this.fireSettled(parentWf);
+  }
+
+  /**
    * M2B: Maintain all `calls:` steps for a parent workflow.
    * Called at the top of tick (outside any tx) and as cascade-up prompt.
    * For each calls: step: spawn the child if gate is ready and no child exists;
@@ -853,7 +999,7 @@ export class Engine {
         // schema-reject branch) instead of crash-looping every subsequent tick.
         let provision: { childId: string; created: boolean; provided: string[] } | null;
         try {
-          provision = this.provisionCallsChild(parentWf, step, callsStem, gateStems, now);
+          provision = this.provisionCallsChild(parentWf, def, step, callsStem, gateStems, now);
         } catch (err) {
           if (err instanceof SchemaRefusalError) {
             // B2: pass the fingerprint the failed validation saw. If the gate has
@@ -864,6 +1010,15 @@ export class Engine {
               this.fire({ type: 'commit', workflow: parentWf, path: callsStem, action: 'reject', outcome: 'schema-rejected' });
               this.fireSettled(parentWf);
             }
+            continue;
+          }
+          // WS-6: a pin violation is not a bug either — it means the installed
+          // store no longer holds the bundle this parent was pinned against. It
+          // becomes a visible debt on the PARENT calls artifact (never a silent
+          // divergent run, and never an uncaught throw that would take the whole
+          // tick down), and the STEP-2 F2 guard then stops the re-attempt loop.
+          if (err instanceof CallsPinError) {
+            this.recordCallsDigestReject(parentWf, def, callsStem, gateStems, err, now);
             continue;
           }
           throw err;
