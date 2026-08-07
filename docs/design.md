@@ -1579,7 +1579,7 @@ JSON projection of the definition's instruction-bearing fields (the
 top-level routing fields — `name`, `engine`, `inputs`, `outputs`,
 `invariants`, `x`, `executors` — plus each step's `consumes`, `produces`, and
 `generates` **raw path strings** and its authored `model`, `executor`,
-`command`, `spec`, `workdir`, effect/on/idle/reap/capabilities/calls/judges
+`command`, `spec`, `workdir`, `workdirFrom`, effect/on/idle/reap/capabilities/calls/judges
 configuration and `body`). This shipped fallback projection intentionally
 reduces each produce pattern to `p.raw`, so a produce-level schema,
 `maxAttempts`, or `maxSchemaFailures` change does not change the fallback

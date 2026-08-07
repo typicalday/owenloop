@@ -78,6 +78,7 @@ steps:
                                #   to the engine, passed through on the order
                                #   (see below)
     workdir: …                 # opaque hint passed through on the order; omitted when unset
+    workdirFrom: workspace.payload.worktreePath  # resolve workdir from a consumed value
     executor: agent               # opaque executor value (default: agent); see below
     command: …                  # required when executor: command; opaque, never shelled out
     spec:                       # optional opaque config map, shape-checked like x: (a plain map)
@@ -111,6 +112,37 @@ A value that isn't one of the four tiers should be passed through verbatim as
 a literal model id. Pin an exact model when you need reproducibility — just
 know the def is now host-specific, on purpose. Omit `model:` entirely and the
 dispatcher uses its default.
+
+## `workdirFrom:` — resolve a local workdir from a consumed value
+
+`workdirFrom:` sets the existing `Order.workdir` from a nested field in a green,
+plain consumed artifact. The grammar is `<consumedStem>.<dotted.value.path>`:
+
+```yaml
+steps:
+  - name: provisioner
+    consumes: [proposal]
+    produces: [workspace]
+  - name: builder
+    consumes: [workspace]
+    produces: [pr]
+    workdirFrom: workspace.payload.worktreePath
+```
+
+The stem named before the dotted value path must also appear in the step's
+`consumes:` list, and the consume must be plain rather than map (`[$i]`) or
+reduce (`[*]`). The engine resolves the longest consumed-stem prefix when an
+artifact stem itself contains dots. `workdir:` and `workdirFrom:` are mutually
+exclusive.
+
+At order-build time the engine walks the consumed value using the dotted path.
+A missing field, non-object intermediate, array, non-string final value, empty
+string, or whitespace-only string defers the firing with reason
+`workdir-unresolved`; the engine emits no order and inserts no run. The engine
+passes a valid path through unchanged: the engine does not resolve or normalize
+a relative path and does not change the worker's current-directory semantics.
+The producer and worker must therefore run on the same machine. A permanently
+unresolvable path remains deferred until the producer supplies a valid value.
 
 ## `executor:` — declaring the executor
 
@@ -228,6 +260,12 @@ indirection. Two consequences of the local filter are worth stating plainly:
   Operators running capability-filtered callers should monitor the deferred/blocked entries
   (each folded deferral in a `TickResult` carries its `reason`) so a
   permanently unclaimed step is caught rather than silently stuck.
+
+A `workdirFrom` firing can also remain deferred forever with
+`workdir-unresolved`. That reason means the producing step has not supplied a
+usable nested path: the value is missing, has an invalid shape, or is not a
+non-empty string. Fix the producing step or its artifact value; changing the
+consumer's worker does not bypass the engine's workdir resolution check.
 
 `capabilities:` is distinct from [`executor:`](#executor--declaring-the-executor):
 `executor:` says what *kind* of executor should run an order once it's claimed;

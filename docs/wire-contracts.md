@@ -265,7 +265,9 @@ Required fields are `run`, `workflow`, `step`, `key`, `defDigest`, `inputs`,
 `outputs`, `consumes`, and `owes`.
 
 Optional fields are `index`, `workdir`, `model`, `worker`, `judge`, `spec`, `x`,
-`consumedFingerprint`, `consumesProof`, and `cause`.
+`consumedFingerprint`, `consumesProof`, and `cause`. `workdir` may be authored
+as a literal `workdir:` or resolved by the engine from a consumed artifact's
+`workdirFrom:` value; the Order wire shape remains unchanged.
 
 `defDigest` is a non-empty opaque reference. `inputs` and `outputs` are string
 arrays. `consumes` is an open artifact-path map; `spec` and `x` are opaque

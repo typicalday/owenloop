@@ -404,6 +404,12 @@ export interface StepDef {
   spec?: Record<string, unknown>;
   /** opaque location hint passed through on the order; no default — absent unless the def sets it */
   workdir?: string;
+  /**
+   * Resolve the order's workdir from `<consumedStem>.<dotted.path>` in a consumed
+   * artifact value. Mutually exclusive with workdir; the stem must be a plain
+   * consume so the value passes the engine's consume-side verification gate.
+   */
+  workdirFrom?: string;
   /** the step's output is a destructive completion (e.g. a merge): green is terminal (§15.2) */
   terminal?: boolean;
   /** Step-level effect contract (§6.5). Only consulted for non-terminal greens whose inputs move. */

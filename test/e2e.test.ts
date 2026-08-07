@@ -11,7 +11,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { exampleDefNames } from './helpers.ts';
+import { assertReferenceContract, exampleDefNames } from './helpers.ts';
 
 const ROOT = join(import.meta.dirname, '..');
 const BIN = join(ROOT, 'bin', 'owenloop.mjs');
@@ -128,6 +128,85 @@ test('delivery: full pipeline with a reviewer knock-back ends green & terminal',
   assert.equal(merge.terminal, true);
 
   rmSync(join(db, '..'), { recursive: true, force: true });
+});
+
+test('workdirFrom: command payload receipt reaches the downstream CLI order workdir', () => {
+  const defsDir = mkdtempSync(join(tmpdir(), 'owenloop-workdir-e2e-'));
+  const db = join(defsDir, 'state.db');
+  const worktree = mkdtempSync(join(tmpdir(), 'owenloop-worktree-e2e-'));
+  try {
+    const payload = { worktreePath: worktree, branch: 'ws-4-e2e' };
+    const marker = '##owenloop:payload##';
+    const command = 'node emit-payload.mjs';
+    writeFileSync(
+      join(defsDir, 'emit-payload.mjs'),
+      `process.stdout.write(${JSON.stringify(marker + JSON.stringify(payload))});\n`,
+    );
+    writeFileSync(
+      join(defsDir, 'dynamic-workdir.yaml'),
+      [
+        'name: dynamic-workdir-e2e',
+        'inputs:',
+        '  - name: proposal',
+        'steps:',
+        '  - name: provisioner',
+        '    consumes: [proposal]',
+        '    produces: [workspace]',
+        '    executor: command',
+        `    command: ${command}`,
+        '    body: ""',
+        '  - name: builder',
+        '    consumes: [workspace]',
+        '    produces: [pr]',
+        '    workdirFrom: workspace.payload.worktreePath',
+        '    body: build in the provisioned worktree',
+      ].join('\n'),
+    );
+    const ow = makeCliAgainst(db, defsDir);
+    const wf = ow('create', 'dynamic-workdir-e2e', '--provide', `proposal=${JSON.stringify({ goal: 'build it' })}`).workflow;
+
+    const provisioner = orderFor(ow('tick', wf), 'provisioner');
+    assertReferenceContract(provisioner);
+    assert.equal(provisioner.worker, 'command');
+    assert.equal(provisioner.command, undefined, 'command text stays behind the resolver boundary');
+
+    const executed = spawnSync(process.execPath, ['emit-payload.mjs'], {
+      cwd: defsDir,
+      encoding: 'utf8',
+    });
+    assert.equal(executed.status, 0, executed.stderr);
+    assert.ok(executed.stdout.startsWith(marker), executed.stdout);
+    const parsedPayload = JSON.parse(executed.stdout.slice(marker.length));
+    assert.deepEqual(parsedPayload, payload);
+
+    const receipt = {
+      kind: 'command-receipt',
+      command,
+      exitCode: executed.status,
+      outputHash: 'e2e-test-output',
+      stdoutBytes: Buffer.byteLength(executed.stdout, 'utf8'),
+      stderrBytes: Buffer.byteLength(executed.stderr, 'utf8'),
+      outputTail: executed.stdout,
+      payload: parsedPayload,
+      startedAt: 1,
+      finishedAt: 2,
+      durationMs: 1,
+      orchestrator: 'e2e-test',
+      workflow: wf,
+      run: provisioner.run,
+      step: provisioner.step,
+    };
+    ow('green', wf, provisioner.run, 'workspace', '--value', JSON.stringify(receipt));
+    ow('close', wf, provisioner.run);
+
+    const builder = orderFor(ow('tick', wf), 'builder');
+    assertReferenceContract(builder);
+    assert.equal(builder.workdir, worktree);
+    assert.equal(builder.consumes.workspace.payload.worktreePath, worktree);
+  } finally {
+    rmSync(join(db, '..'), { recursive: true, force: true });
+    rmSync(worktree, { recursive: true, force: true });
+  }
 });
 
 test('research: collection fan-out, retract, born-rejected CAS, and reduce re-derivation', () => {

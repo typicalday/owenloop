@@ -165,6 +165,7 @@ export function defInstructionDigest(def: WorkflowDef): string {
     ...(s.command !== undefined ? { command: s.command } : {}),
     ...(s.spec !== undefined ? { spec: s.spec } : {}),
     ...(s.workdir !== undefined ? { workdir: s.workdir } : {}),
+    ...(s.workdirFrom !== undefined ? { workdirFrom: s.workdirFrom } : {}),
     ...(s.terminal !== undefined ? { terminal: s.terminal } : {}),
     ...(s.effect !== undefined ? { effect: s.effect } : {}),
     ...(s.on !== undefined ? { on: s.on } : {}),

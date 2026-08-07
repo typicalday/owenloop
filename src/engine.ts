@@ -13,6 +13,7 @@
 import {
   elementPath,
   parseElement,
+  parseWorkdirFrom,
   sealPath,
 } from './paths.ts';
 import {
@@ -103,9 +104,17 @@ export class SchemaRefusalError extends Error {
  * `applySchedule` or `tick`; never alters which firings are selected or claimed.
  * `'capability-mismatch'` (A2) — the tick caller passed a capability filter that does not
  * intersect the step's declared capabilities, so a peer orchestrator serving other
- * capabilities leaves it for the matching caller.
+ * capabilities leaves it for the matching caller; `'workdir-unresolved'` — a
+ * workdirFrom path in a consumed artifact was missing, non-object, or not a
+ * non-empty string, so no order or run was emitted.
  */
-export type DeferredReason = 'in-flight' | 'cadence' | 'daily-budget' | 'parallel-cap' | 'capability-mismatch';
+export type DeferredReason =
+  | 'in-flight'
+  | 'cadence'
+  | 'daily-budget'
+  | 'parallel-cap'
+  | 'capability-mismatch'
+  | 'workdir-unresolved';
 
 export interface DeferredFiring {
   step: string;
@@ -114,6 +123,8 @@ export interface DeferredFiring {
   inputs: string[];
   outputs: string[];
   reason: DeferredReason;
+  /** Readable detail for deferrals whose reason alone is not actionable. */
+  detail?: string;
   /**
    * §23.6.8 deep tick: which instance this deferred firing belongs to.
    * Convention — **absent = the ticked ROOT instance; present = the named
@@ -124,6 +135,10 @@ export interface DeferredFiring {
    * `in-flight`/`cadence`/… deferral it is reading without ambiguity.
    */
   workflow?: string;
+}
+
+interface DeferredClaim {
+  deferred: DeferredFiring;
 }
 
 /**
@@ -1210,13 +1225,6 @@ export class Engine {
       const firings = eligibleFirings(def, arts, timeFacts);
       const { selected, deferred } = this.applySchedule(workflow, def, firings, now, capabilities);
 
-      // Clear alarm_at for any idle firing that was selected (consume the alarm).
-      for (const f of selected) {
-        if (f.cause === 'idle') {
-          this.store.clearAlarm(workflow, f.step);
-        }
-      }
-
       const orders: Order[] = [];
       const allDeferred: DeferredFiring[] = [...deferred];
       for (const f of selected) {
@@ -1225,7 +1233,12 @@ export class Engine {
           const d: DeferredFiring = { step: f.step, key: f.key, inputs: f.inputs, outputs: f.outputs, reason: 'in-flight' };
           if (f.index !== undefined) d.index = f.index;
           allDeferred.push(d);
+        } else if (claimed && typeof claimed === 'object' && 'deferred' in claimed) {
+          allDeferred.push(claimed.deferred);
         } else if (claimed) {
+          // Consume an idle alarm only after the order and run are claimed. A
+          // workdir-unresolved firing must retain its alarm so the next tick can retry.
+          if (f.cause === 'idle') this.store.clearAlarm(workflow, f.step);
           orders.push(claimed);
         }
       }
@@ -1447,7 +1460,7 @@ export class Engine {
     f: Firing,
     arts: ArtifactMap,
     now: number,
-  ): Order | 'in-flight' | null {
+  ): Order | 'in-flight' | DeferredClaim | null {
     const existing = this.store.getTask(workflow, f.step, f.key);
     if (existing && existing.status === 'claimed') {
       const run = existing.run ? this.store.getRun(existing.run) : undefined;
@@ -1472,6 +1485,7 @@ export class Engine {
     // later unless captured here; this persisted packet is the replay/eval/paper
     // trail record (buildOrder is deterministic modulo run id).
     const order = this.buildOrder(def, workflow, runId, f, arts, fp);
+    if (typeof order === 'object' && 'deferred' in order) return order;
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
     this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, order, ...(f.cause ? { cause: f.cause } : {}) }, now);
     this.store.putTask({
@@ -1504,14 +1518,67 @@ export class Engine {
     f: Firing,
     arts: ArtifactMap,
     consumedFingerprint: Fingerprint,
-  ): Order {
+  ): Order | DeferredClaim {
     const step = this.step(def, f.step);
-    const defDigest = this.instructionSource.digestOf(def);
     const consumes: Record<string, unknown> = {};
     for (const p of f.inputs) {
       const a = arts.get(p);
       if (a?.value !== undefined) consumes[p] = a.value;
     }
+
+    const unresolved = (detail: string): DeferredClaim => {
+      const deferred: DeferredFiring = {
+        step: f.step,
+        key: f.key,
+        inputs: f.inputs,
+        outputs: f.outputs,
+        reason: 'workdir-unresolved',
+        detail,
+      };
+      if (f.index !== undefined) deferred.index = f.index;
+      return { deferred };
+    };
+
+    let resolvedWorkdir: string | undefined;
+    if (step.workdirFrom !== undefined) {
+      const parsed = parseWorkdirFrom(step.workdirFrom, step.consumes);
+      if (!parsed) {
+        return unresolved(
+          `workdirFrom '${step.workdirFrom}': expected a consumed stem followed by a non-empty dotted value path`,
+        );
+      }
+      if (parsed.mode !== 'plain') {
+        return unresolved(`workdirFrom '${step.workdirFrom}': source stem '${parsed.stem}' is not a plain consume`);
+      }
+
+      let value: unknown = consumes[parsed.stem];
+      const segments = parsed.path.split('.');
+      for (let i = 0; i < segments.length; i++) {
+        const segment = segments[i]!;
+        const pathAt = segments.slice(0, i + 1).join('.');
+        if (value === undefined) {
+          return unresolved(`workdirFrom '${step.workdirFrom}': value at '${pathAt}' is undefined`);
+        }
+        if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+          return unresolved(`workdirFrom '${step.workdirFrom}': value at '${pathAt}' is not an object`);
+        }
+        if (!Object.prototype.hasOwnProperty.call(value, segment)) {
+          return unresolved(`workdirFrom '${step.workdirFrom}': value at '${pathAt}' is undefined`);
+        }
+        value = (value as Record<string, unknown>)[segment];
+      }
+      if (typeof value !== 'string' || value.trim().length === 0) {
+        return unresolved(`workdirFrom '${step.workdirFrom}': value at '${parsed.path}' must be a non-empty string`);
+      }
+      resolvedWorkdir = value;
+    } else if (step.workdir !== undefined) {
+      resolvedWorkdir = step.workdir;
+    }
+
+    // Digest registration is part of emitting an order. Keep it after dynamic
+    // workdir resolution so an unresolved firing does not register an order
+    // identity or reach the run insert below.
+    const defDigest = this.instructionSource.digestOf(def);
     const owes = f.outputs.map((p) => {
       const a = arts.get(p);
       return {
@@ -1529,12 +1596,12 @@ export class Engine {
       defDigest,
       inputs: f.inputs,
       outputs: f.outputs,
+      ...(resolvedWorkdir !== undefined ? { workdir: resolvedWorkdir } : {}),
       consumes,
       consumedFingerprint: { ...consumedFingerprint },
       owes,
     };
     if (f.index !== undefined) order.index = f.index;
-    if (step.workdir !== undefined) order.workdir = step.workdir;
     if (step.model !== undefined) order.model = step.model;
     if (step.executor !== undefined) order.worker = step.executor;
     if (step.judges !== undefined) order.judge = step.judges;
