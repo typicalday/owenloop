@@ -24,7 +24,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
-import { parseConsume, parseProduce } from './paths.ts';
+import { parseConsume, parseProduce, parseWorkdirFrom } from './paths.ts';
 import { parseDurationMs, parseDurationSecs } from './util.ts';
 import { assertValidSchema } from './schema.ts';
 import type { Acceptance, EffectDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
@@ -95,6 +95,7 @@ interface RawStep {
   maxSchemaFailures?: unknown;
   model?: unknown;
   workdir?: unknown;
+  workdirFrom?: unknown;
   terminal?: unknown;
   effect?: unknown;
   on?: unknown;
@@ -122,7 +123,7 @@ interface RawStep {
 const RAW_STEP_KEYS = [
   'name', 'consumes', 'produces', 'generates', 'invalidates', 'cadence',
   'maxRunsPerDay', 'parallel', 'maxAttempts', 'maxSchemaFailures', 'model',
-  'workdir', 'terminal', 'effect', 'on', 'idleAfter', 'body', 'bodyFile',
+  'workdir', 'workdirFrom', 'terminal', 'effect', 'on', 'idleAfter', 'body', 'bodyFile',
   'calls', 'reapTtl', 'capabilities', 'maxLease', 'x', 'executor', 'command', 'spec',
 ] as const;
 
@@ -748,6 +749,14 @@ function prefixStep(step: StepDef, prefix: string): StepDef {
   // workflow) — it must be prefixed to keep pointing at the (now-prefixed) produce.
   const newJudges = step.judges !== undefined ? prefixStem(step.judges) : undefined;
 
+  // workdirFrom names a local consumed stem followed by a dotted value path.
+  // Prefix only the stem; the value path is a field path inside the consumed value.
+  let newWorkdirFrom = step.workdirFrom;
+  if (step.workdirFrom !== undefined) {
+    const parsed = parseWorkdirFrom(step.workdirFrom, step.consumes);
+    if (parsed) newWorkdirFrom = `${prefixStem(parsed.stem)}.${parsed.path}`;
+  }
+
   const result: StepDef = {
     ...step,
     name: prefixStem(step.name),
@@ -758,6 +767,7 @@ function prefixStep(step: StepDef, prefix: string): StepDef {
   if (newGenerates !== undefined) result.generates = newGenerates;
   if (newEffect !== undefined) result.effect = newEffect;
   if (newJudges !== undefined) result.judges = newJudges;
+  if (newWorkdirFrom !== undefined) result.workdirFrom = newWorkdirFrom;
   return result;
 }
 
@@ -1021,6 +1031,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
     body,
   };
   if (rl.workdir !== undefined) step.workdir = asString(rl.workdir, `step '${name}'.workdir`);
+  if (rl.workdirFrom !== undefined) step.workdirFrom = asString(rl.workdirFrom, `step '${name}'.workdirFrom`);
   if (rl.model !== undefined) step.model = asString(rl.model, `step '${name}'.model`);
   if (rl.executor !== undefined) step.executor = asString(rl.executor, `step '${name}'.executor`);
   if (rl.command !== undefined) step.command = asString(rl.command, `step '${name}'.command`);
@@ -1110,6 +1121,49 @@ export function validateDef(def: WorkflowDef): string[] {
   const inputNames = new Set(def.inputs.map((i) => i.name));
   for (const dup of [...inputNames].filter((n) => stepNames.has(n))) {
     errors.push(`'${dup}' is both an input and a step name`);
+  }
+
+  for (const l of def.steps) {
+    if (l.workdir === undefined && l.workdirFrom === undefined) continue;
+    if (l.workdir !== undefined && l.workdirFrom !== undefined) {
+      errors.push(`step '${l.name}': workdir and workdirFrom are mutually exclusive; use one`);
+      continue;
+    }
+    if (l.workdirFrom === undefined) continue;
+
+    const raw = l.workdirFrom.trim();
+    const bareConsume = l.consumes.find((c) => c.stem === raw);
+    if (bareConsume) {
+      errors.push(
+        `step '${l.name}': workdirFrom must use '<consumedStem>.<dotted.path>' with a non-empty value path`,
+      );
+      continue;
+    }
+    const firstDot = raw.indexOf('.');
+    const valuePath = firstDot >= 0 ? raw.slice(firstDot + 1) : '';
+    if (firstDot <= 0 || valuePath.length === 0) {
+      errors.push(
+        `step '${l.name}': workdirFrom must use '<consumedStem>.<dotted.path>' with a non-empty value path`,
+      );
+      continue;
+    }
+
+    // Security boundary: a workdirFrom value becomes a filesystem path. The
+    // source stem must be a plain consumed artifact so its value has passed the
+    // engine's consume-side verification gate before a worker can cd into it.
+    const parsed = parseWorkdirFrom(raw, l.consumes);
+    if (!parsed) {
+      const stem = raw.slice(0, firstDot);
+      errors.push(
+        `step '${l.name}': workdirFrom stem '${stem}' is not in consumes; ` +
+        'a step may only take its workdir from an artifact it consumes',
+      );
+    } else if (parsed.mode !== 'plain') {
+      errors.push(
+        `step '${l.name}': workdirFrom stem '${parsed.stem}' uses a ${parsed.mode} consume; ` +
+        'workdirFrom requires a plain consume',
+      );
+    }
   }
 
   // one writer per artifact: map produced singleton/collection stems to producers

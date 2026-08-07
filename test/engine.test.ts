@@ -123,6 +123,130 @@ test('a missing human input is not fireable, so no claim can emit a negative fin
   assert.equal(tick.orders.length, 0);
 });
 
+test('workdirFrom resolves a nested consumed value into the reference order without normalizing the path', () => {
+  const dynamic = def(
+    'dynamic-workdir',
+    [input('workspace')],
+    [step({
+      name: 'builder',
+      consumes: ['workspace'],
+      produces: ['pr'],
+      workdirFrom: 'workspace.payload.worktreePath',
+      body: 'SENTINEL dynamic workdir prompt',
+    })],
+  );
+  const { engine, store } = makeEngine([dynamic]);
+  const wf = engine.createInstance('dynamic-workdir', {
+    provide: { workspace: { payload: { worktreePath: ' ./repo/worktree ' } } },
+  });
+
+  const order = fire(engine, wf, 'builder', 1000);
+  assertReferenceContract(order);
+  assert.equal(order.workdir, ' ./repo/worktree ', 'the authored path bytes pass through unchanged');
+  assert.deepEqual(order.consumes, { workspace: { payload: { worktreePath: ' ./repo/worktree ' } } });
+  assert.equal(store.listRuns(wf).length, 1);
+  assert.equal(store.listRuns(wf)[0]!.order?.workdir, ' ./repo/worktree ');
+});
+
+test('workdirFrom defers unresolved values without emitting an order, run, task, budget use, or parallel claim', () => {
+  const cases: Array<{ label: string; workspace: Record<string, unknown>; detail: RegExp }> = [
+    {
+      label: 'missing nested property',
+      workspace: { payload: {} },
+      detail: /value at 'payload\.worktreePath' is undefined/,
+    },
+    {
+      label: 'non-object intermediate',
+      workspace: { payload: 'not-an-object' },
+      detail: /value at 'payload\.worktreePath' is not an object/,
+    },
+    {
+      label: 'array intermediate',
+      workspace: { payload: [] },
+      detail: /value at 'payload\.worktreePath' is not an object/,
+    },
+    {
+      label: 'non-string final value',
+      workspace: { payload: { worktreePath: 42 } },
+      detail: /value at 'payload\.worktreePath' must be a non-empty string/,
+    },
+    {
+      label: 'empty final value',
+      workspace: { payload: { worktreePath: '' } },
+      detail: /value at 'payload\.worktreePath' must be a non-empty string/,
+    },
+    {
+      label: 'whitespace-only final value',
+      workspace: { payload: { worktreePath: ' \t ' } },
+      detail: /value at 'payload\.worktreePath' must be a non-empty string/,
+    },
+  ];
+
+  for (const [index, candidate] of cases.entries()) {
+    const workflow = `dynamic-workdir-${index}`;
+    const dynamic = def(
+      workflow,
+      [input('workspace')],
+      [step({
+        name: 'builder',
+        consumes: ['workspace'],
+        produces: ['pr'],
+        workdirFrom: 'workspace.payload.worktreePath',
+        maxRunsPerDay: 1,
+        parallel: 1,
+      })],
+    );
+    const { engine, store } = makeEngine([dynamic]);
+    const wf = engine.createInstance(workflow, { provide: { workspace: candidate.workspace } });
+
+    const first = engine.tick(wf, { now: 1000 });
+    assert.deepEqual(first.orders, [], candidate.label);
+    assert.equal(first.deferred.length, 1, candidate.label);
+    assert.equal(first.deferred[0]!.reason, 'workdir-unresolved', candidate.label);
+    assert.match(first.deferred[0]!.detail ?? '', candidate.detail, candidate.label);
+    assert.equal(store.listRuns(wf).length, 0, `${candidate.label}: unresolved workdir must not insert a run`);
+    assert.equal(store.getTask(wf, 'builder', ''), undefined, `${candidate.label}: unresolved workdir must not claim a task`);
+    assert.equal(store.countRuns(wf, 'builder', 0), 0, `${candidate.label}: unresolved workdir must not use budget`);
+
+    // A second tick must still reach workdir resolution. If the first attempt had
+    // consumed the parallel slot or daily budget, this would report that gate instead.
+    const second = engine.tick(wf, { now: 2000 });
+    assert.deepEqual(second.orders, [], `${candidate.label}: second tick`);
+    assert.equal(second.deferred[0]!.reason, 'workdir-unresolved', `${candidate.label}: second tick`);
+    assert.equal(store.listRuns(wf).length, 0, `${candidate.label}: repeated deferral must not insert a run`);
+  }
+});
+
+test('workdir-unresolved preserves an idle alarm so the firing can retry', () => {
+  const dynamic = def(
+    'dynamic-idle-workdir',
+    [input('workspace'), input('pending', { seedOwed: true })],
+    [step({
+      name: 'builder',
+      consumes: ['workspace'],
+      produces: ['pr'],
+      workdirFrom: 'workspace.payload.worktreePath',
+      on: ['idle'],
+      idleAfterMs: 60_000,
+    })],
+  );
+  const { engine, store } = makeEngine([dynamic]);
+  const wf = engine.createInstance('dynamic-idle-workdir', {
+    provide: { workspace: { payload: {} } },
+  });
+  const alarm = 5_000;
+  engine.setAlarm(wf, 'builder', alarm);
+
+  const first = engine.tick(wf, { now: alarm });
+  assert.equal(first.orders.length, 0);
+  assert.equal(first.deferred[0]!.reason, 'workdir-unresolved');
+  assert.equal(store.getAlarm(wf, 'builder'), alarm);
+
+  const second = engine.tick(wf, { now: alarm });
+  assert.equal(second.deferred[0]!.reason, 'workdir-unresolved');
+  assert.equal(store.getAlarm(wf, 'builder'), alarm);
+});
+
 test('claim persists the emitted order packet in the same txn — present the moment tick returns', () => {
   const { engine, store } = makeEngine([delivery]);
   const wf = engine.createInstance('delivery', { provide: { proposal: { goal: 'ship it' } } });

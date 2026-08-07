@@ -80,6 +80,31 @@ export function parseConsume(raw: string): ConsumePattern {
   return { raw: r, mode: 'plain', stem: r, suffix: '' };
 }
 
+/** The resolved split of `<consumedStem>.<dotted.value.path>` in `workdirFrom`. */
+export interface WorkdirFromParts {
+  raw: string;
+  stem: string;
+  path: string;
+  mode: ConsumeMode;
+}
+
+/**
+ * Split a workdirFrom expression by the longest prefix that names one of the
+ * step's own consumes. Artifact stems may contain dots, so the consume list is
+ * the closed grammar that makes the split deterministic at def-load time.
+ */
+export function parseWorkdirFrom(raw: string, consumes: readonly ConsumePattern[]): WorkdirFromParts | null {
+  const r = raw.trim();
+  for (let boundary = r.lastIndexOf('.'); boundary > 0; boundary = r.lastIndexOf('.', boundary - 1)) {
+    const stem = r.slice(0, boundary);
+    const path = r.slice(boundary + 1);
+    if (path.length === 0) continue;
+    const consume = consumes.find((c) => c.stem === stem);
+    if (consume) return { raw: r, stem, path, mode: consume.mode };
+  }
+  return null;
+}
+
 /** Parse a produce declaration. */
 export function parseProduce(raw: string): ProducePattern {
   const r = raw.trim();

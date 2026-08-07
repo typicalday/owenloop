@@ -91,7 +91,11 @@ Each `order` is a **reference packet**: `workflow` (the instance it belongs
 to — see deep tick below), `defDigest` (identifies the definition snapshot to
 resolve instructions from), `consumes` (the captured green inputs), `owes`
 (the owed outputs + their accumulated reason threads), plus
-`inputs`/`outputs`/`workdir`/`model`/`worker`/`spec`/`x`/`cause`. It carries
+`inputs`/`outputs`/`workdir`/`model`/`worker`/`spec`/`x`/`cause`. `workdir` may
+be authored as a literal `workdir:` or resolved from a consumed artifact by a
+step's `workdirFrom:`; the order field and wire shape are the same either way.
+If the consumed value cannot resolve to a non-empty string, `engine.tick()`
+returns a `workdir-unresolved` deferral and emits no order. It carries
 no authored prompt or command text — those resolve through `resolver` by
 digest (next section). A consumer rejecting an upstream artifact is just
 `engine.reject(wf, path, by, text)`; the forward cascade and stall liveness

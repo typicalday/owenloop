@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { parseProduce } from '../src/paths.ts';
+import { parseProduce, parseWorkdirFrom } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildDef, DefError, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, validateDef } from '../src/defs.ts';
@@ -34,6 +34,99 @@ test('parseDef builds a valid def and fills defaults', () => {
   assert.equal(planner.workdir, undefined); // no default: absent unless the def sets it
   assert.deepEqual(planner.invalidates, ['proposal']); // defaults to consumed stems
   assert.equal(def.steps[3]!.terminal, true);
+});
+
+test('parseDef accepts workdirFrom and records its grammar field', () => {
+  const parsed = parseDef({
+    name: 'workdir',
+    inputs: [{ name: 'workspace' }],
+    steps: [{ name: 'builder', consumes: ['workspace'], produces: ['pr'], workdirFrom: 'workspace.payload.worktreePath' }],
+  });
+  assert.equal(parsed.steps[0]!.workdirFrom, 'workspace.payload.worktreePath');
+});
+
+test('workdir and workdirFrom are mutually exclusive', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'workdir-both',
+      inputs: [{ name: 'workspace' }],
+      steps: [{
+        name: 'builder',
+        consumes: ['workspace'],
+        produces: ['pr'],
+        workdir: '.',
+        workdirFrom: 'workspace.payload.worktreePath',
+      }],
+    }),
+    (e: unknown) => e instanceof DefError && /workdir and workdirFrom are mutually exclusive/.test(e.message),
+  );
+});
+
+test('workdirFrom requires a consumed plain stem and a dotted value path', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'workdir-missing-stem',
+      inputs: [{ name: 'workspace' }],
+      steps: [{ name: 'builder', consumes: ['workspace'], produces: ['pr'], workdirFrom: 'other.payload.path' }],
+    }),
+    (e: unknown) => e instanceof DefError && /workdirFrom stem 'other' is not in consumes/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({
+      name: 'workdir-bare-stem',
+      inputs: [{ name: 'workspace' }],
+      steps: [{ name: 'builder', consumes: ['workspace'], produces: ['pr'], workdirFrom: 'workspace' }],
+    }),
+    (e: unknown) => e instanceof DefError && /non-empty value path/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({
+      name: 'workdir-bare-dotted-stem',
+      inputs: [{ name: 'a.b' }],
+      steps: [{ name: 'builder', consumes: ['a.b'], produces: ['pr'], workdirFrom: 'a.b' }],
+    }),
+    (e: unknown) => e instanceof DefError && /non-empty value path/.test(e.message),
+  );
+});
+
+test('workdirFrom rejects map and reduce consume stems', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'workdir-map',
+      inputs: [{ name: 'seed' }],
+      steps: [
+        { name: 'gather', consumes: ['seed'], produces: ['items[]'] },
+        { name: 'check', consumes: ['items[$i]'], produces: ['items[$i].checked'], workdirFrom: 'items.payload.path' },
+      ],
+    }),
+    (e: unknown) => e instanceof DefError && /uses a map consume/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({
+      name: 'workdir-reduce',
+      inputs: [{ name: 'seed' }],
+      steps: [
+        { name: 'gather', consumes: ['seed'], produces: ['items[]'] },
+        { name: 'check', consumes: ['items[*]'], produces: ['summary'], workdirFrom: 'items.payload.path' },
+      ],
+    }),
+    (e: unknown) => e instanceof DefError && /uses a reduce consume/.test(e.message),
+  );
+});
+
+test('workdirFrom uses the longest consumed-stem prefix for dotted artifact paths', () => {
+  const parsed = parseDef({
+    name: 'workdir-longest',
+    inputs: [{ name: 'a' }, { name: 'a.b' }],
+    steps: [{ name: 'builder', consumes: ['a', 'a.b'], produces: ['pr'], workdirFrom: 'a.b.c' }],
+  });
+  const stepDef = parsed.steps[0]!;
+  assert.deepEqual(parseWorkdirFrom(stepDef.workdirFrom!, stepDef.consumes), {
+    raw: 'a.b.c',
+    stem: 'a.b',
+    path: 'c',
+    mode: 'plain',
+  });
 });
 
 test('parseDef parses cadence durations to seconds', () => {
@@ -2526,6 +2619,35 @@ test('Mode 1 include: prefixStep keeps a reduce consume suffix after stem-prefix
     assert.equal(rc.stem, 'kid.src');
     assert.equal(rc.suffix, '.child');
     assert.equal(rc.raw, 'kid.src[*].child');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Mode 1 include: prefixStep prefixes a workdirFrom stem but preserves its value path', () => {
+  const dir = mktempDefsDir();
+  try {
+    writeFileSync(
+      join(dir, 'child.yaml'),
+      [
+        'name: child',
+        'inputs:',
+        '  - name: workspace',
+        'steps:',
+        '  - name: builder',
+        '    consumes: [workspace]',
+        '    produces: [pr]',
+        '    workdirFrom: workspace.payload.worktreePath',
+      ].join('\n'),
+    );
+    writeFileSync(
+      join(dir, 'parent.yaml'),
+      ['name: parent', 'steps:', '  - include: child', '    as: kid'].join('\n'),
+    );
+    const parent = loadDefs(dir).get('parent')!;
+    const builder = parent.steps.find((s) => s.name === 'kid.builder')!;
+    assert.equal(builder.workdirFrom, 'kid.workspace.payload.worktreePath');
+    assert.equal(builder.consumes[0]!.stem, 'kid.workspace');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -207,6 +207,37 @@ test('prompt, command, and routing-shape changes each change the digest', () => 
   assert.notEqual(defInstructionDigest(consumesChanged), base, 'routing-shape change must change the digest');
 });
 
+test('workdirFrom changes the instruction digest when its consumed value path changes', () => {
+  const withWorktreePath = def(
+    'resolverfixture',
+    [input('proposal')],
+    [step({
+      name: 'agentstep',
+      consumes: ['proposal'],
+      produces: ['plan'],
+      body: PROMPT,
+      workdirFrom: 'proposal.workspace.worktreePath',
+    })],
+  );
+  const withCheckoutPath = def(
+    'resolverfixture',
+    [input('proposal')],
+    [step({
+      name: 'agentstep',
+      consumes: ['proposal'],
+      produces: ['plan'],
+      body: PROMPT,
+      workdirFrom: 'proposal.workspace.checkoutPath',
+    })],
+  );
+
+  assert.notEqual(
+    defInstructionDigest(withWorktreePath),
+    defInstructionDigest(withCheckoutPath),
+    'workdirFrom must be part of the pinned instruction identity',
+  );
+});
+
 test('digestOf registers the exact snapshot it digested — resolution survives source change', () => {
   const source = createDefInstructionSource();
   const digest = source.digestOf(fixtureDef);
