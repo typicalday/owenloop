@@ -365,6 +365,11 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       const childEnv: Record<string, string | undefined> = { ...process.env };
       if (resolvedBundleDir === undefined) delete childEnv['OWENLOOP_BUNDLE_DIR'];
       else childEnv['OWENLOOP_BUNDLE_DIR'] = resolvedBundleDir;
+      // Run identity is engine-derived from ExecLoopOptions, never a consumed
+      // artifact value, and always present. Overwrite inherited values so a
+      // nested exec sees its own identity rather than its parent's.
+      childEnv['OWENLOOP_WORKFLOW'] = workflow;
+      childEnv['OWENLOOP_RUN'] = runId;
       const startOptions = { cwd: order.workdir ?? opts.cwd, env: childEnv };
       cmd = runner.start(resolvedCommand, startOptions);
     } catch (e) {

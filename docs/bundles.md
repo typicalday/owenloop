@@ -135,6 +135,27 @@ scripts must treat an unset or empty variable as a hard error and report a
 message such as `this workflow must run from an installed bundle`; owenloop does
 not synthesize a fallback directory.
 
+Command and agent children receive two engine-derived identity variables:
+`OWENLOOP_WORKFLOW` contains the workflow-instance id, and `OWENLOOP_RUN`
+contains the run id. Both variables are always set, including for definitions
+without bundle provenance. A command can read them directly:
+
+```sh
+printf '%s %s\n' "$OWENLOOP_WORKFLOW" "$OWENLOOP_RUN"
+```
+
+For agent children, admitting a name to `ADMITTED_OWENLOOP_KEYS` is only a
+filter permission: `filterOwenloopEnv` permits an existing value through, but
+does not make that value authoritative. `agent-run` sets both variables from
+the worker's own engine-derived target before starting the child and overwrites
+ambient values, so a nested agent receives its own identity rather than a
+stale parent value.
+
+Run identity is safe to expose because the engine derives it from the worker's
+own `--order` argument. Consumed artifact values are attacker-influenceable and
+are not exposed, and command text is not interpolated; no consume-side gate
+exists for either capability.
+
 `OWENLOOP_BUNDLE_DIR` is read-only. Workers must never write into the directory.
 The workflow store is content-addressed and verifies the installed object again
 when a resolver reads it. A write changes the object bytes, so the next read
