@@ -22,10 +22,11 @@
  * or a hub module.
  */
 
-import { chmodSync, existsSync, lstatSync, readdirSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randId } from '../util.ts';
 import { DefError, finalizeDefs, lintDef, loadDefFile, loadDefsRaw, validateDef } from '../defs.ts';
+import { parseManifestBytes } from '../bundle/manifest.ts';
 import type { DefLoadFailure } from '../defs.ts';
 import { hasDefiniteCheckDefect, modelCheck } from '../model.ts';
 import {
@@ -95,7 +96,7 @@ export interface BundleIngestor {
     source: BundleSource;
     bytes: Uint8Array;
     stagingDir: string;
-  }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest }>;
+  }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest; workflows: string[] }>;
   verifyInstalledObject(input: { objectDir: string; digest: DefDigest }): Promise<void>;
 }
 
@@ -124,6 +125,8 @@ export interface BundleInstallResult {
   level: StoreLevel;
   coordinate: WorkflowCoordinate;
   digest: DefDigest;
+  /** Sorted workflow names carried by the installed bundle. */
+  workflows: string[];
   objectPath: string;
   /** True when the object was newly installed; false when deduplicated against an existing verified object. */
   installed: boolean;
@@ -308,7 +311,8 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // Stage via A1: unpack, manifest integrity, canonical digest, coordinate.
     // A refusal here (tamper, bad manifest, oversized archive) leaves staging
     // debris only — no object, no index, no journal touched.
-    const { coordinate, digest } = await ingestor.ingest({ source, bytes, stagingDir });
+    const { coordinate, digest, workflows: ingestedWorkflows } = await ingestor.ingest({ source, bytes, stagingDir });
+    const workflows = [...ingestedWorkflows].sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')));
 
     // Ownership/conflict decisions, inside the lock:
     const existing = index.entries[coordinate];
@@ -328,24 +332,41 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // bytes that will be committed, with no re-write after validation.
     const reasons: string[] = [];
     let staged: Map<string, ReturnType<typeof loadDefFile>>;
-    const entrypoint = join(stagingDir, 'workflow.yaml');
-    if (existsSync(entrypoint)) {
-      // Real `.wnlp` bundles have exactly one root workflow.yaml. Loading that
-      // entrypoint directly avoids treating the root bundle.yaml manifest as a
-      // workflow definition. The fallback below preserves the installer port's
-      // ability to validate non-archive adapters used by callers and tests.
+    const manifestPath = join(stagingDir, 'bundle.yaml');
+    if (existsSync(manifestPath)) {
+      // Real `.wnlp` bundles carry an explicit workflow map. Load every listed
+      // path and key the staged definitions by the manifest's workflow name.
       staged = new Map<string, ReturnType<typeof loadDefFile>>();
       try {
-        const stagedDef = loadDefFile(entrypoint);
-        staged.set(stagedDef.name, stagedDef);
+        const manifest = parseManifestBytes(readFileSync(manifestPath));
+        for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
+          const workflowFile = join(stagingDir, workflowPath);
+          try {
+            const stagedDef = loadDefFile(workflowFile);
+            if (stagedDef.name !== workflowName) {
+              reasons.push(
+                `${workflowFile}: definition name '${stagedDef.name}' must equal workflow map key '${workflowName}'`,
+              );
+            }
+            staged.set(stagedDef.name, stagedDef);
+          } catch (e) {
+            if (e instanceof DefError) {
+              reasons.push(`${workflowFile}: ${e.message}`);
+            } else {
+              throw e;
+            }
+          }
+        }
       } catch (e) {
         if (e instanceof DefError) {
-          reasons.push(`${entrypoint}: ${e.message}`);
+          reasons.push(`${manifestPath}: ${e.message}`);
         } else {
           throw e;
         }
       }
     } else {
+      // The fallback preserves the installer port's ability to validate
+      // non-archive adapters used by callers and tests.
       const failures: DefLoadFailure[] = [];
       staged = loadDefsRaw(stagingDir, failures);
       reasons.push(...failures.map((failure) => `${failure.file}: ${failure.error}`));
@@ -388,7 +409,10 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // canonical bytes are what the journal's metadataHash commits to.
     const nextIndex: WorkflowStoreIndex = {
       version: 1,
-      entries: { ...index.entries, [coordinate]: { digest, pinned: existing?.pinned ?? false } },
+      entries: {
+        ...index.entries,
+        [coordinate]: { digest, pinned: existing?.pinned ?? false, workflows: [...workflows] },
+      },
     };
     const metadataHash = sha256Hex(canonicalJsonBytes(nextIndex));
 
@@ -513,6 +537,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       level,
       coordinate,
       digest,
+      workflows: [...workflows],
       objectPath: objectDir,
       installed: !objectAlreadyPresent,
     };

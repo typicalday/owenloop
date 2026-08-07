@@ -105,7 +105,7 @@ function resolverFor(
     ...(options.source === undefined ? {} : { source: options.source }),
     defPolicy: 'enforce',
     originPolicy: options.originPolicy ?? 'enforce',
-    originRules: options.originRules ?? { local: 'git' },
+    originRules: options.originRules ?? { 'origin-fixture': 'git' },
     warn: (line) => options.warn?.push(line),
     definitionVerifier: () => ({ kind: 'verified', publisherKeyId: 'SHA256:test', principal: 'publisher' }),
     originVerifier: () => origin,
@@ -157,7 +157,7 @@ test('same digest under namespaces with equivalent rules deduplicates', async ()
     entries: { 'prod/origin-fixture@1.0.0': { digest, pinned: false } },
   }));
   const result = await resolverFor(installed, gitOrigin, {
-    originRules: { local: 'git', prod: 'git' },
+    originRules: { 'origin-fixture': 'git', prod: 'git' },
   }).resolveStep(order(installed.defDigest, 'agent-step'));
   assert.equal(result.ok, true);
 });
@@ -175,16 +175,16 @@ test('same digest under namespaces with different rules refuses by named ambigui
     entries: { 'prod/origin-fixture@1.0.0': { digest, pinned: false } },
   }));
   const result = await resolverFor(installed, gitOrigin, {
-    originRules: { local: 'git', prod: 'console' },
+    originRules: { 'origin-fixture': 'git', prod: 'console' },
   }).resolveStep(order(installed.defDigest, 'agent-step'));
   assert.equal(result.ok, false);
   assert.equal((result as InstructionRefusal).kind, 'origin-policy');
   assert.match((result as InstructionRefusal).reason, /different origin rules/);
-  assert.match((result as InstructionRefusal).reason, /local/);
+  assert.match((result as InstructionRefusal).reason, /origin-fixture/);
   assert.match((result as InstructionRefusal).reason, /prod/);
 });
 
-test('digest with no indexed namespace is mode-dependent and never defaults to local', async () => {
+test('digest with no indexed namespace is mode-dependent and never guesses a namespace', async () => {
   const installed = await fixture();
   const source: StoreInstructionSource = {
     digestOf: () => { throw new Error('not used'); },
@@ -201,7 +201,7 @@ test('digest with no indexed namespace is mode-dependent and never defaults to l
       projectRoot: tempDir('owenloop-origin-empty-project-'),
       globalRoot: tempDir('owenloop-origin-empty-global-'),
       originPolicy: policy,
-      originRules: { local: 'git' },
+      originRules: { 'origin-fixture': 'git' },
       warn: warnings,
     }).resolveStep(order(installed.defDigest, 'agent-step'));
     if (policy === 'enforce') {

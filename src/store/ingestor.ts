@@ -18,7 +18,7 @@ import type { BundleIngestor, BundleSource } from './install.ts';
 import type { DefDigest } from './types.ts';
 
 export interface BundleIngestorOptions {
-  /** Namespace used for the package-only v1 manifest's store coordinate. */
+  /** Explicit namespace override for the package-derived store coordinate. */
   namespace?: string;
 }
 
@@ -111,19 +111,27 @@ async function verifyObject(objectDir: string, digest: DefDigest): Promise<void>
 
 /** Create the real store adapter used by the default CLI and driver paths. */
 export function createBundleIngestor(options: BundleIngestorOptions = {}): BundleIngestor {
-  const namespace = options.namespace ?? 'local';
-  if (namespace.trim() === '') throw new StorePathError('bundle ingestor namespace must not be empty');
+  const namespaceOverride = options.namespace;
+  if (namespaceOverride !== undefined && namespaceOverride.trim() === '') {
+    throw new StorePathError('bundle ingestor namespace must not be empty');
+  }
 
   return {
-    async ingest(input: { source: BundleSource; bytes: Uint8Array; stagingDir: string }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest }> {
+    async ingest(input: { source: BundleSource; bytes: Uint8Array; stagingDir: string }): Promise<{
+      coordinate: WorkflowCoordinate;
+      digest: DefDigest;
+      workflows: string[];
+    }> {
       // installWorkflowBundle removes the complete staging root immediately
       // before this call. unpackBundle requires an existing, real parent and a
       // destination that does not exist, so create only the parent here.
       mkdirSync(dirname(input.stagingDir), { recursive: true });
       const result = unpackBundle(input.bytes, input.stagingDir);
+      const namespace = namespaceOverride ?? result.manifest.package.name;
       return {
         coordinate: coordinateFor(result.manifest, namespace),
         digest: result.digest as DefDigest,
+        workflows: Object.keys(result.manifest.workflows).sort(),
       };
     },
 

@@ -12,6 +12,7 @@
 
 import { lstatSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { WORKFLOW_NAME_RE } from '../bundle/manifest.ts';
 import { DIGEST_RE, StoreIndexError, parseWorkflowCoordinate } from './types.ts';
 import type { WorkflowStoreIndex } from './types.ts';
 import { readRegularFileNoFollow, writeJsonAtomic } from '../install.ts';
@@ -39,9 +40,10 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * `namespace/name@version` coordinate (validated by
  * `parseWorkflowCoordinate`); each entry `{ digest, pinned }` with digest a
  * LOWERCASE 64-hex value (uppercase/noncanonical is rejected, never
- * normalized) and pinned a boolean. Unknown extra keys are tolerated for
- * forward compatibility; required fields are enforced. `path` appears only in
- * error messages. Throws {@link StoreIndexError} on any violation.
+ * normalized) and pinned a boolean. When present, `workflows` is a unique,
+ * valid, UTF-8-sorted workflow-name array. Unknown extra keys are tolerated
+ * for forward compatibility; required fields are enforced. `path` appears
+ * only in error messages. Throws {@link StoreIndexError} on any violation.
  */
 export function parseWorkflowStoreIndex(parsed: unknown, path: string): WorkflowStoreIndex {
   const fail = (detail: string): never => {
@@ -64,6 +66,23 @@ export function parseWorkflowStoreIndex(parsed: unknown, path: string): Workflow
       return fail(`${at('digest')} is not a lowercase 64-char sha256 hex digest`);
     }
     if (typeof entry.pinned !== 'boolean') return fail(`${at('pinned')} is not a boolean`);
+    if (entry.workflows !== undefined) {
+      if (!Array.isArray(entry.workflows) || entry.workflows.some((name) => typeof name !== 'string')) {
+        return fail(`${at('workflows')} is not an array of workflow names`);
+      }
+      for (const [index, name] of entry.workflows.entries()) {
+        if (!WORKFLOW_NAME_RE.test(name)) {
+          return fail(`${at(`workflows[${index}]`)} is not a valid workflow name`);
+        }
+      }
+      if (new Set(entry.workflows).size !== entry.workflows.length) {
+        return fail(`${at('workflows')} contains duplicate workflow names`);
+      }
+      const sorted = [...entry.workflows].sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')));
+      if (entry.workflows.some((name, index) => name !== sorted[index])) {
+        return fail(`${at('workflows')} must be sorted by UTF-8 bytes`);
+      }
+    }
   }
   return parsed as unknown as WorkflowStoreIndex;
 }

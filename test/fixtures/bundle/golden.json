@@ -1,5 +1,5 @@
 {
-  "digest": "0c8910982369705203ad87c402f0e7854fd5cc9725af053e11d32f2ac09c61ab",
+  "digest": "132888c4faf07f2e20f15eb7101d98ee0a80e9d4461375f69bb602b7ac8b9042",
   "name": "golden-bundle",
   "version": "1.0.0",
   "entries": [
@@ -23,9 +23,9 @@
     },
     {
       "path": "bundle.yaml",
-      "size": 1023,
+      "size": 1204,
       "executable": false,
-      "sha256": "01a946fcbd9ebbe82dda4f5a6026191ad3f62d319f3efe0b6ad4fea9080586c7"
+      "sha256": "c721fc90b65e3c21509f93481f08193dc4fdc5dc4fded7e5011f02bfabbfdef9"
     },
     {
       "path": "docs/README.md",
@@ -34,22 +34,28 @@
       "sha256": "6e558ec124b3f60032335694f39758540566efe13a15a112b430d720515a186f"
     },
     {
-      "path": "instructions/build.md",
-      "size": 200,
-      "executable": false,
-      "sha256": "36e587eb3c99783b7c27a7a6a7c693edfe9809b28610b8f9c1b767816d51a49a"
-    },
-    {
       "path": "scripts/run.sh",
       "size": 86,
       "executable": true,
       "sha256": "7193cf030d6678ad993b8773a498bf9c2536f598fbb650e27f8f2e8a3ffeb7be"
     },
     {
-      "path": "workflow.yaml",
-      "size": 472,
+      "path": "workflows/golden.yaml",
+      "size": 378,
       "executable": false,
-      "sha256": "ab004f5fb0f56c9008f0b92b55c4354fa85e62ef6c91a9148760c2c6158b3960"
+      "sha256": "33e99ca3444c4437d4ed3f8d1066a5cb5c8cc954d1997553a49a6cb85c8e6194"
+    },
+    {
+      "path": "workflows/init.yaml",
+      "size": 159,
+      "executable": false,
+      "sha256": "eb7a202ca813195834a40eb40ce9ab53de976b23013e786514438d93c2960edd"
+    },
+    {
+      "path": "workflows/instructions/build.md",
+      "size": 200,
+      "executable": false,
+      "sha256": "c5319fd454db29a519456d1c0a09ff7f5009d1b6e288db8191d84fb7000f6c06"
     }
   ]
 }

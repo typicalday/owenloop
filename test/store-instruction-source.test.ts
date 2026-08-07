@@ -106,6 +106,39 @@ test('store instruction source: a real installed bundle bridges bundle and order
   assert.deepEqual(source.getVerifiedStep(requested, 'runner')?.x?.['harness'], installed.definition.steps[0]!.x?.['harness']);
 });
 
+test('store instruction source: every workflow in a bundle is available by its instruction digest', async () => {
+  const childWorkflow = WORKFLOW
+    .replace('name: source-fixture', 'name: child-fixture')
+    .replace('name: runner', 'name: child-runner')
+    .replace('from-store', 'from-child');
+  const sourceDir = writeBundleSource({
+    name: 'source-fixture',
+    workflow: WORKFLOW,
+    workflows: { 'child-fixture': childWorkflow },
+  });
+  const installed = await installBundleFixture({ sourceDir });
+  assert.deepEqual(installed.result.workflows, ['child-fixture', 'source-fixture']);
+
+  const loaded = loadDefFile(join(installed.result.objectPath, 'child-fixture.yaml'));
+  const finalized = finalizeDefs(new Map([[loaded.name, loaded]]));
+  const child = finalized.get('child-fixture');
+  assert.ok(child !== undefined);
+  const requested = defInstructionDigest(child);
+  const source = createStoreInstructionSource({
+    projectRoot: installed.root,
+    globalRoot: tempDir('owenloop-child-source-global-'),
+    verifier: createBundleIngestor(),
+  });
+
+  assert.equal(await source.prime(requested), 'resolved');
+  const lookedUp = source.lookup({ defDigest: requested, step: 'child-runner', key: '' });
+  assert.equal(lookedUp.status, 'resolved');
+  if (lookedUp.status === 'resolved') {
+    assert.equal(lookedUp.instructions.prompt, child.steps[0]!.body);
+    assert.equal(lookedUp.instructions.command, 'printf "from-child\\n"');
+  }
+});
+
 test('store instruction source: a stale index row does not poison a clean requested workflow', async () => {
   const installed = await installedSource();
   const requested = defInstructionDigest(installed.definition);

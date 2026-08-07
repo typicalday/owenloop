@@ -51,7 +51,8 @@ test('store ingestor: a real packBundle archive installs and verifies as an immu
   });
 
   assert.equal(installed.result.installed, true);
-  assert.equal(installed.result.coordinate, 'local/ingestor-fixture@1.0.0');
+  assert.equal(installed.result.coordinate, 'ingestor-fixture/ingestor-fixture@1.0.0');
+  assert.deepEqual(installed.result.workflows, ['ingestor-fixture']);
   assert.equal(readFileSync(join(installed.result.objectPath, 'workflow.yaml'), 'utf8'), WORKFLOW);
   assert.equal(readFileSync(join(installed.result.objectPath, 'notes', 'readme.txt'), 'utf8'), 'fixture note\n');
 });

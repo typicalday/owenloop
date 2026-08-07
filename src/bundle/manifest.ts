@@ -4,11 +4,11 @@
  * canonical YAML serialization (WP-A1, see `docs/bundles.md`).
  *
  * The manifest is package-only: it carries identity, platform selectors, a
- * per-file integrity map, REQUESTED capabilities (never granted here), and a
- * digest-pinned `lock` map for explicit `namespace/name@version` call
- * references. Execution fields (`worker`, `command`, interpreter, script…)
- * are unknown keys and refused — `workflow.yaml` is the only execution
- * surface.
+ * named workflow-to-path map, a per-file integrity map, REQUESTED capabilities
+ * (never granted here), and a digest-pinned `lock` map for explicit
+ * `namespace/name@version` call references. Execution fields (`worker`,
+ * `command`, interpreter, script…) are unknown keys and refused — workflow
+ * files remain the only execution surface.
  *
  * Parsing is fail-closed on the YAML AST: parse errors AND warnings refuse
  * the document; aliases, merge keys, tags (custom or built-in), non-string
@@ -38,8 +38,10 @@ export function sha256Hex(bytes: Uint8Array): string {
 }
 
 const DIGEST_RE = /^[0-9a-f]{64}$/;
-/** Portable package name — same charset the engine's workflow names use. */
+/** Portable package namespace. */
 const PACKAGE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+/** Workflow map keys: lowercase-start, lowercase alphanumeric and hyphen. */
+export const WORKFLOW_NAME_RE = /^[a-z][a-z0-9-]*$/;
 /** Version: printable ASCII, no separators that would break filenames or lock keys. */
 const VERSION_RE = /^[!-~]{1,128}$/;
 /** Platform selector: `os-arch`-style identifier. */
@@ -118,8 +120,13 @@ function asMap(value: unknown, ctx: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function assertExactKeys(obj: Record<string, unknown>, keys: readonly string[], ctx: string): void {
-  const allowed = new Set(keys);
+function assertExactKeys(
+  obj: Record<string, unknown>,
+  keys: readonly string[],
+  ctx: string,
+  optionalKeys: readonly string[] = [],
+): void {
+  const allowed = new Set([...keys, ...optionalKeys]);
   for (const k of Object.keys(obj)) {
     if (!allowed.has(k)) {
       throw new BundleError('MANIFEST_ERROR', `${ctx}: unknown key '${k}'`);
@@ -178,15 +185,20 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
 
   const plain = astToPlain(doc.contents as ParsedNode | null, 'bundle.yaml');
   const root = asMap(plain, 'bundle.yaml');
-  assertExactKeys(root, ['formatVersion', 'package', 'entrypoint', 'platforms', 'integrity', 'capabilities', 'lock'], 'bundle.yaml');
+  assertExactKeys(
+    root,
+    ['formatVersion', 'package', 'workflows', 'platforms', 'integrity', 'capabilities', 'lock'],
+    'bundle.yaml',
+    ['default'],
+  );
 
   // formatVersion — refuse future versions rather than guess.
   const formatVersion = root['formatVersion'];
   if (typeof formatVersion !== 'number' || !Number.isInteger(formatVersion)) {
     throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.formatVersion: must be an integer');
   }
-  if (formatVersion !== 1) {
-    throw new BundleError('UNSUPPORTED_FORMAT_VERSION', `bundle.yaml.formatVersion: unsupported format version ${formatVersion} (this reader supports 1)`);
+  if (formatVersion !== 2) {
+    throw new BundleError('UNSUPPORTED_FORMAT_VERSION', `bundle.yaml.formatVersion: unsupported format version ${formatVersion} (this reader supports 2)`);
   }
 
   // package identity.
@@ -201,10 +213,50 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
     throw new BundleError('MANIFEST_ERROR', `bundle.yaml.package.version: '${version}' must be 1-128 printable ASCII chars with no '/' or '\\'`);
   }
 
-  // entrypoint — fixed to workflow.yaml in v1.
-  const entrypoint = asString(root['entrypoint'], 'bundle.yaml.entrypoint');
-  if (entrypoint !== 'workflow.yaml') {
-    throw new BundleError('MANIFEST_ERROR', `bundle.yaml.entrypoint: must be 'workflow.yaml' (got '${entrypoint}')`);
+  // workflows — at least one named, archive-relative definition path.
+  const workflowsRaw = asMap(root['workflows'], 'bundle.yaml.workflows');
+  const workflowEntries = Object.entries(workflowsRaw);
+  if (workflowEntries.length === 0) {
+    throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.workflows: must contain at least one workflow');
+  }
+  const workflows: Record<string, string> = Object.create(null) as Record<string, string>;
+  const workflowPaths = new Set<string>();
+  for (const [workflowName, workflowPathRaw] of workflowEntries) {
+    if (!WORKFLOW_NAME_RE.test(workflowName)) {
+      throw new BundleError(
+        'MANIFEST_ERROR',
+        `bundle.yaml.workflows: name '${workflowName}' must match /^[a-z][a-z0-9-]*$/`,
+      );
+    }
+    const workflowPath = asString(workflowPathRaw, `bundle.yaml.workflows['${workflowName}']`);
+    const violation = archivePathViolation(workflowPath);
+    if (violation) {
+      throw new BundleError(
+        'MANIFEST_ERROR',
+        `bundle.yaml.workflows['${workflowName}']: unsafe path '${workflowPath}': ${violation}`,
+        workflowPath,
+      );
+    }
+    if (workflowPaths.has(workflowPath)) {
+      throw new BundleError(
+        'MANIFEST_ERROR',
+        `bundle.yaml.workflows: duplicate path '${workflowPath}'`,
+        workflowPath,
+      );
+    }
+    workflowPaths.add(workflowPath);
+    workflows[workflowName] = workflowPath;
+  }
+
+  let defaultWorkflow: string | undefined;
+  if (Object.prototype.hasOwnProperty.call(root, 'default')) {
+    defaultWorkflow = asString(root['default'], 'bundle.yaml.default');
+    if (!Object.prototype.hasOwnProperty.call(workflows, defaultWorkflow)) {
+      throw new BundleError(
+        'MANIFEST_ERROR',
+        `bundle.yaml.default: '${defaultWorkflow}' is not a workflow name`,
+      );
+    }
   }
 
   // platforms — duplicate-free string selectors.
@@ -284,9 +336,10 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
   }
 
   return {
-    formatVersion: 1,
+    formatVersion: 2,
     package: { name, version },
-    entrypoint: 'workflow.yaml',
+    workflows,
+    ...(defaultWorkflow === undefined ? {} : { default: defaultWorkflow }),
     platforms,
     integrity: { algorithm: 'sha256', files },
     capabilities,
@@ -309,7 +362,12 @@ export function manifestToBytes(manifest: BundleManifest): Uint8Array {
   lines.push('package:');
   lines.push(`  name: ${q(manifest.package.name)}`);
   lines.push(`  version: ${q(manifest.package.version)}`);
-  lines.push(`entrypoint: ${q(manifest.entrypoint)}`);
+  const workflowKeys = sortedByUtf8(Object.keys(manifest.workflows));
+  lines.push('workflows:');
+  for (const workflowName of workflowKeys) {
+    lines.push(`  ${q(workflowName)}: ${q(manifest.workflows[workflowName]!)}`);
+  }
+  if (manifest.default !== undefined) lines.push(`default: ${q(manifest.default)}`);
 
   const platforms = sortedByUtf8(manifest.platforms);
   if (platforms.length === 0) {
