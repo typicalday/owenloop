@@ -2,18 +2,19 @@
  * `src/roles/agent-run.ts` — the role's OWN responsibilities, not the loop's.
  *
  * `test/agent-loop.test.ts` already covers the orchestration (lease race, turn
- * end vs task end, the confirm phase). These tests cover the seven things only
- * the role does: parse the arg contract, refuse unresolvable input with exit 2,
- * map `AgentRunOutcome` onto an exit code, tag the holder, resolve WHICH adapter
- * hosts the agent (and fail honestly when none does), find the brief template in
- * the bundle cache, and wire the signal seam.
+ * end vs task end, the confirm phase). These tests cover the role's responsibilities:
+ * parse the arg contract, refuse unresolvable input with exit 2, map
+ * `AgentRunOutcome` onto an exit code, tag the holder, resolve WHICH adapter hosts
+ * the agent (and fail honestly when none does), find the brief template in the
+ * bundle cache, set the per-order child environment, and wire the signal seam.
  *
  * Everything is hermetic: a temp HOME/XDG (so the credential store and cache are
- * throwaway), an injected `HubClient` (no network), a `FakeAdapter` registered
- * and unregistered per test (no harness process), and a fake `SignalHost` (the
- * real `process` is never signalled).
+ * throwaway), an injected `HubClient` (no network), a `FakeAdapter` or test probe
+ * registered and unregistered per test, and a fake `SignalHost` (the real process
+ * is never signalled).
  */
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,6 +24,7 @@ import { exitCodeFor, parseArgs, run as roleRun, type RunDeps } from '../src/rol
 import type { AgentRunOutcome } from '../src/agent/loop.ts';
 import { writeBundle } from '../src/bundle/cache.ts';
 import type { StepPermissions } from '../src/harness/contract.ts';
+import { filterOwenloopEnv } from '../src/harness/child-env.ts';
 import { createFakeAdapter, type FakeAdapter } from '../src/harness/fake.ts';
 import { defaultHarnessId, register, registeredHarnessIds, unregister } from '../src/harness/registry.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
@@ -95,14 +97,23 @@ const TEMPLATE = [
   'shift: __OWENLOOP_SHIFT__',
 ].join('\n');
 
-function agentOrder(o: { claimed?: boolean; outcome?: string; worker?: string; defDigest?: string } = {}): GetOrderResponse {
+function agentOrder(o: {
+  claimed?: boolean;
+  outcome?: string;
+  worker?: string;
+  defDigest?: string;
+  workflow?: string;
+  run?: string;
+} = {}): GetOrderResponse {
+  const workflow = o.workflow ?? 'wf1';
+  const run = o.run ?? 'run1';
   return {
     text: '',
-    workflow: 'wf1',
-    run: 'run1',
+    workflow,
+    run,
     order: {
-      run: 'run1',
-      workflow: 'wf1',
+      run,
+      workflow,
       step: 'builder',
       key: 'k',
       inputs: [],
@@ -215,6 +226,66 @@ function parkedAdapter(id: string): { adapter: HarnessAdapter; stops: number; st
     },
   };
   return { adapter, get stops() { return state.stops; }, startArgs: state.startArgs };
+}
+
+/**
+ * A harness-shaped adapter whose start method really spawns a child. The child
+ * receives the same filtered process environment as the production adapters, so
+ * this catches a missing agent-run setter rather than only testing an in-process
+ * env object.
+ */
+function spawningEnvProbe(): { adapter: HarnessAdapter; observed: string[] } {
+  const observed: string[] = [];
+  const ref: HarnessSessionRef = { harness: 'env-probe', token: 'env-probe-1' };
+
+  const spawnProbe = (): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const child = spawn(
+		process.execPath,
+		[
+		  '-e',
+		  'process.stdout.write(JSON.stringify({workflow: process.env.OWENLOOP_WORKFLOW ?? null, run: process.env.OWENLOOP_RUN ?? null}))',
+		],
+		{ env: filterOwenloopEnv(process.env), stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+	if (child.stdout === null || child.stderr === null) {
+	  child.kill();
+	  reject(new Error('env probe did not receive piped stdio'));
+	  return;
+	}
+	let stdout = '';
+	let stderr = '';
+	child.stdout.setEncoding('utf8');
+	child.stderr.setEncoding('utf8');
+	child.stdout.on('data', (chunk) => { stdout += String(chunk); });
+	child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+	child.once('error', reject);
+	child.once('close', (code, signal) => {
+	  if (code !== 0) {
+	    reject(new Error(`env probe exited with code=${String(code)} signal=${String(signal)}: ${stderr}`));
+	    return;
+	  }
+	  resolve(stdout);
+	});
+    });
+
+  const adapter: HarnessAdapter = {
+    id: ref.harness,
+    resumeTier: 'replay',
+    async start(_args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef> {
+      onEvent({ kind: 'started', ref });
+      observed.push(await spawnProbe());
+      onEvent({ kind: 'turn_ended' });
+      return ref;
+    },
+    async deliver() {
+      throw new Error('the env probe only supports a cold start');
+    },
+    async stop() {
+      // The probe child has exited before start resolves.
+    },
+  };
+  return { adapter, observed };
 }
 
 let home: string;
@@ -400,6 +471,42 @@ test('run() exposes the verified bundle directory and clears stale provenance', 
     0,
   );
   assert.equal('OWENLOOP_BUNDLE_DIR' in process.env, false);
+});
+
+test('run() sets agent child identity and overrides ambient values in a real spawn', async () => {
+  const workflow = 'wf-agent-identity';
+  const runId = 'run-agent-identity';
+  const savedWorkflow = process.env['OWENLOOP_WORKFLOW'];
+  const savedRun = process.env['OWENLOOP_RUN'];
+  const savedHarness = process.env['OWENLOOP_HARNESS'];
+  process.env['OWENLOOP_WORKFLOW'] = 'wf-ambient-leak';
+  process.env['OWENLOOP_RUN'] = 'run-ambient-leak';
+  process.env['OWENLOOP_HARNESS'] = 'env-probe';
+
+  try {
+    const probe = spawningEnvProbe();
+    useAdapter(probe.adapter);
+    seedBundle();
+    const { hub } = probeHub({
+      responses: [agentOrder({ workflow, run: runId }), agentOrder({ workflow, run: runId, outcome: 'ok' })],
+      def: DEF,
+    });
+
+    const code = await run(
+      [`${workflow}/${runId}`, '--origin', 'https://hub.example', '--confirm-interval', '1', '--submit-grace', '2000'],
+      { hub, signalHost: fakeSignalHost().host, holderId: 'host:123', cwd: '/work', out: () => {}, err: () => {} },
+    );
+
+    assert.equal(code, 0);
+    assert.deepEqual(probe.observed, [JSON.stringify({ workflow, run: runId })]);
+  } finally {
+    if (savedWorkflow === undefined) delete process.env['OWENLOOP_WORKFLOW'];
+    else process.env['OWENLOOP_WORKFLOW'] = savedWorkflow;
+    if (savedRun === undefined) delete process.env['OWENLOOP_RUN'];
+    else process.env['OWENLOOP_RUN'] = savedRun;
+    if (savedHarness === undefined) delete process.env['OWENLOOP_HARNESS'];
+    else process.env['OWENLOOP_HARNESS'] = savedHarness;
+  }
 });
 
 // D10, and the exact boundary of what Phase 4 fixed: the mount is a bare

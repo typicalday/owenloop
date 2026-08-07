@@ -422,6 +422,13 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     if (resolved.bundleDir !== undefined) process.env['OWENLOOP_BUNDLE_DIR'] = resolved.bundleDir;
     else delete process.env['OWENLOOP_BUNDLE_DIR'];
 
+    // Run identity is engine-derived from this worker's target, never a consumed
+    // artifact value. Both adapter paths (Claude and Codex) read process.env when
+    // they build their child environments, so one setter covers both; overwrite
+    // ambient values so a nested agent sees its own identity, not its parent's.
+    process.env['OWENLOOP_WORKFLOW'] = target.workflow;
+    process.env['OWENLOOP_RUN'] = target.run;
+
     let carrier: ReturnType<typeof parseHarnessCarrier>;
     const rawStep = resolved.step as unknown as Record<string, unknown>;
     try {
