@@ -32,7 +32,23 @@ import { installBundleFixture, tempDir, writeBundleSource } from './helpers/stor
 
 // ---- fixtures ----------------------------------------------------------------
 
-/** A parent that `calls:` `child` by BARE name — the edge under test. */
+/**
+ * A parent that `calls:` `child` by BARE name — the edge under test.
+ *
+ * The `calls:` gate is wired to the workflow INPUT `seed`, mirroring
+ * examples/workflows/provisioned-delivery.yaml (`proposal: proposal`). That
+ * detail is load-bearing, not cosmetic: wiring the gate to `sandbox` instead
+ * makes the def genuinely undeliverable, because `provision` can outcome
+ * `skip`, and a skipped gate strands `delivered` owed forever —
+ * `Engine.maintainCalls` `continue`s on a non-green gate and never spawns the
+ * child, while the skip does not cascade onto `delivered` either (a calls:
+ * step's `consumes` is `[]`, so `requiredInputs` sees no offender). `modelCheck`
+ * reports that as a true deadlock and `installWorkflowBundle` refuses the
+ * bundle, so the shape below is the only one that installs.
+ *
+ * `teardown` consumes `sandbox` so `provision` still has a downstream reader —
+ * without it the produced `sandbox` would dangle.
+ */
 function parentYaml(marker: string): string {
   return `name: parent
 inputs:
@@ -47,8 +63,14 @@ steps:
   - name: deliver
     calls: child
     inputs:
-      data: sandbox
+      data: seed
     produces: [delivered]
+  - name: teardown
+    consumes: [delivered, sandbox]
+    produces: [torn_down]
+    terminal: true
+    body: |
+      teardown ${marker}
 outputs: [delivered]
 `;
 }
@@ -341,13 +363,19 @@ test('WS-6 (b) end-to-end: an already-running parent spawns the PINNED child bod
     });
 
     const parentKey = [...defs.entries()].find(([, d]) => d.name === 'parent' && d.bundleDigest === v1.digest)![0];
-    const parentWf = engine.createInstance(parentKey, { provide: { seed: { v: 'go' } } });
+    // Create the instance WITHOUT seeding `seed`. `seed` is the `calls:` gate
+    // (see parentYaml), so withholding it holds the gate closed and keeps the
+    // child unspawned across the first tick — which is the whole point of this
+    // test. Seeding it up front would spawn the child before V2 is installed
+    // and make the pin assertion below vacuous; the PRECONDITION guards that.
+    const parentWf = engine.createInstance(parentKey);
 
-    // Advance the parent to the point where its `calls:` gate is ready.
-    const tick = engine.tick(parentWf, { deep: false });
-    const provision = tick.orders.find((o) => o.step === 'provision')!;
-    engine.green(parentWf, provision.run, 'sandbox', { env: 'v1' });
-    engine.close(parentWf, provision.run);
+    engine.tick(parentWf, { deep: false });
+    assert.equal(
+      store.findChildByParent(parentWf, 'delivered'),
+      undefined,
+      'PRECONDITION: the child must NOT have spawned yet, or the pin assertion below is vacuous',
+    );
 
     // NOW install a newer version — while the parent is mid-flight and its
     // `calls:` step has not yet spawned.
@@ -355,6 +383,8 @@ test('WS-6 (b) end-to-end: an already-running parent spawns the PINNED child bod
     assert.notEqual(v1.digest, v2.digest);
     defs = defMap(load(v1.root, globalRoot).registrations);
 
+    // Open the gate only now, against the already-running parent.
+    engine.provideInput(parentWf, 'seed', { v: 'go' });
     engine.tick(parentWf, { deep: false }); // spawns the child
 
     const child = store.findChildByParent(parentWf, 'delivered');

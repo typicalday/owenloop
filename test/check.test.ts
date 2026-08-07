@@ -23,7 +23,7 @@ import { openStore } from '../src/store.ts';
 import { applyOutcome, eligibleFirings, evalInvariantPredicate, settleInMemory, modelCheck, workflowStatus } from '../src/model.ts';
 import { validateDef } from '../src/defs.ts';
 import { hasDefiniteCheckDefect, main } from '../src/cli.ts';
-import type { ArtifactData, CheckReport, CheckStep, InvariantDef, InvariantPredicate, WorkflowDef } from '../src/types.ts';
+import type { ArtifactData, CheckReport, CheckStep, InvariantDef, InvariantPredicate, StepDef, WorkflowDef } from '../src/types.ts';
 import { def, input, step } from './helpers.ts';
 
 // ---- shared workflow definitions (same as engine.test.ts) --------------------
@@ -1406,4 +1406,195 @@ test('CLI check: invariant with unknown stem → exit 1, err contains /unknown s
   const r = run('check', 'inv-bad-stem');
   assert.equal(r.code, 1, 'unknown stem in invariant → exit 1');
   assert.match(r.err, /unknown stem 'nonexistent'/);
+});
+
+// ---- WS-6: `calls:` handoff modeling (regression for the vacuous-gate defect) ----
+//
+// `eligibleFirings` skips every `calls:` step (M2 — the engine spawns a child
+// rather than issuing a worker order), so modelCheck must model the handoff
+// itself or it calls "waiting on a child" a structural deadlock.
+//
+// The defect these tests pin: the first version of that modeling was a def-wide
+// boolean (`callsDeferralPending`) OR'd into the deadlock/stall classification
+// branch, and it gated on `plainConsumes(step)`. A `calls:` step's
+// `StepDef.consumes` is ALWAYS `[]` (buildStep hardcodes it), so `[].every(...)`
+// was vacuously true and the "gate" never gated. The predicate degenerated into
+// "does this def contain ANY calls: step with an owed output?", which relabelled
+// EVERY zero-firing state in the def deadlock → stall. One unrelated `calls:`
+// step therefore suppressed every genuine deadlock in the def, and
+// `hasDefiniteCheckDefect` flipped to false — so `install`/`check`/`add`/`push`
+// accepted genuinely broken bundles.
+
+/**
+ * A `calls:` step fixture. `def()`/`step()` don't model Mode 2, so build the
+ * StepDef directly the way test/calls.test.ts does: `calls` + `callsInputs`,
+ * with `consumes: []` (exactly what defs.ts `buildStep` produces).
+ */
+function callsStep(spec: { name: string; produces: string[]; callsInputs?: Record<string, string> }): StepDef {
+  return {
+    ...step({ name: spec.name, produces: spec.produces }),
+    calls: 'someChildWorkflow',
+    callsInputs: spec.callsInputs ?? {},
+    consumes: [],
+  };
+}
+
+test('modelCheck: an unrelated calls: step does NOT suppress a genuine deadlock elsewhere in the def', () => {
+  // `stuckChain` is a genuine structural dead-end: `orphan` consumes `never`,
+  // which no step and no input produces, so `builder` can never fire and
+  // `built` can never be discharged — a TRUE deadlock at unlimited attempts.
+  //
+  // `sidecar` is a calls: step that shares NO artifact with that chain. Its
+  // presence must not change how the orphaned chain is classified.
+  const withoutCalls = def('deadlock-no-calls', [input('start', { seedOwed: false })], [
+    step({ name: 'builder', consumes: ['never'], produces: ['built'] }),
+  ]);
+  const withCalls = def('deadlock-with-calls', [input('start', { seedOwed: false })], [
+    step({ name: 'builder', consumes: ['never'], produces: ['built'] }),
+    callsStep({ name: 'sidecar', produces: ['sidecar_out'] }),
+  ]);
+
+  const baseline = modelCheck(withoutCalls, { maxStates: 500 });
+  const head = modelCheck(withCalls, { maxStates: 500 });
+
+  // Baseline: the orphaned chain is a definite defect. (Non-vacuity guard — if
+  // this ever stops holding, the comparison below proves nothing.)
+  assert.ok(baseline.deadlocks.length > 0, 'baseline: orphaned chain must deadlock');
+  assert.equal(hasDefiniteCheckDefect(baseline), true, 'baseline: orphaned chain is a definite defect');
+
+  // The regression: adding one structurally unrelated calls: step must not
+  // launder that deadlock into a stall.
+  assert.ok(
+    head.deadlocks.length > 0,
+    'an unrelated calls: step must NOT suppress a genuine deadlock (vacuous-gate regression)',
+  );
+  assert.equal(
+    hasDefiniteCheckDefect(head),
+    true,
+    'hasDefiniteCheckDefect must stay true — install/check/add/push must still refuse this def',
+  );
+});
+
+test('modelCheck: a calls: step with an UNMET callsInputs gate is not treated as a pending handoff', () => {
+  // `blocked` consumes `never` (unproduced), so `gate` can never green, so the
+  // calls: step's gate can never become ready. The state where `handoff` is owed
+  // and its gate is un-greenable is a genuine dead-end — the engine would never
+  // provision the child — so it must be reported, not excused as "mid-handoff".
+  //
+  // This is the assertion the old `plainConsumes` gate could not make: with
+  // `consumes: []`, `[].every(...)` was true, so the gate read as satisfied no
+  // matter what `callsInputs` pointed at.
+  const d = def('calls-gate-unmet', [input('start', { seedOwed: false })], [
+    step({ name: 'blocked', consumes: ['never'], produces: ['gate'] }),
+    callsStep({ name: 'handoff', produces: ['handed_off'], callsInputs: { childIn: 'gate' } }),
+  ]);
+
+  const report = modelCheck(d, { maxStates: 500 });
+  assert.ok(
+    report.deadlocks.length > 0,
+    'a calls: step whose callsInputs gate can never green is a genuine dead-end, not a pending handoff',
+  );
+  assert.equal(hasDefiniteCheckDefect(report), true, 'and it stays a definite defect');
+});
+
+test('modelCheck: a calls: step whose gate IS green completes — the handoff is modeled as a transition', () => {
+  // The capability the WS-6 change exists to deliver: a well-formed calls: def
+  // must NOT be reported as deadlocked just because the model has no child
+  // engine to simulate. This is the shape of examples/workflows/provisioned-
+  // delivery.yaml: the calls: gate is wired to a workflow INPUT (`proposal`),
+  // which is seeded green and has no producing step that could skip it, so the
+  // gate is reachable on every path. The child discharges `delivered`, and
+  // `teardown` closes the workflow.
+  const d = def('calls-gate-met', [input('proposal', { seedOwed: false })], [
+    step({ name: 'provision', consumes: ['proposal'], produces: ['sandbox'], maxAttempts: 1000, maxSchemaFailures: 0 }),
+    callsStep({ name: 'deliver', produces: ['delivered'], callsInputs: { proposal: 'proposal' } }),
+    step({ name: 'teardown', consumes: ['delivered', 'sandbox'], produces: ['torn_down'], terminal: true, maxAttempts: 1000, maxSchemaFailures: 0 }),
+  ]);
+
+  const report = modelCheck(d, { maxStates: 2000 });
+  assert.equal(report.completable, true, 'a well-formed calls: def must be completable');
+  assert.equal(report.deadlocks.length, 0, 'no deadlock — the child discharges the calls artifact');
+  assert.equal(hasDefiniteCheckDefect(report), false, 'and no definite defect, so install accepts it');
+  // The handoff is a real transition, so the BFS explores PAST the calls: step —
+  // `teardown` is reached rather than sitting unreached behind an unmodeled edge.
+  assert.ok(!report.unreachedSteps.includes('teardown'), 'teardown must be reached through the modeled handoff');
+  assert.ok(!report.structurallyDeadSteps.includes('deliver'), 'the calls: step itself is not structurally dead');
+});
+
+test('modelCheck: a SKIPPED calls: gate strands the calls artifact — reported as a deadlock', () => {
+  // The mirror image of the test above, and the reason that one wires its gate
+  // to a workflow input. Here the gate `sandbox` is produced by `provision`,
+  // which can outcome `skip`. Two engine facts make that branch a true
+  // dead-end rather than a transient stall:
+  //
+  //   1. `Engine.maintainCalls` (src/engine.ts:955) `continue`s whenever
+  //      `callsGateReady` is false. A skipped gate is not green, so the child
+  //      is never spawned and `delivered` is never machine-greened.
+  //   2. The skip does NOT cascade onto `delivered` either: `requiredInputs`
+  //      (src/model.ts:324) derives cascade inputs from `plainConsumes(step)`,
+  //      and a calls: step's `consumes` is always `[]` (src/defs.ts, buildStep).
+  //      So the cascade sees no offender and leaves `delivered` owed.
+  //
+  // `delivered` is therefore owed forever with nothing able to discharge it.
+  // `retry` cannot lift it, which is exactly the deadlock/stall distinction, so
+  // modelCheck must report it as a deadlock. Pinning this stops a future change
+  // from "fixing" the fixture above by making skipped gates silently pass.
+  const d = def('calls-gate-skippable', [input('proposal', { seedOwed: false })], [
+    step({ name: 'provision', consumes: ['proposal'], produces: ['sandbox'], maxAttempts: 1000, maxSchemaFailures: 0 }),
+    callsStep({ name: 'deliver', produces: ['delivered'], callsInputs: { childIn: 'sandbox' } }),
+    step({ name: 'teardown', consumes: ['delivered'], produces: ['torn_down'], terminal: true, maxAttempts: 1000, maxSchemaFailures: 0 }),
+  ]);
+
+  const report = modelCheck(d, { maxStates: 2000 });
+  const skipPaths = report.deadlocks.filter((dl) =>
+    dl.path.some((s) => s.step === 'provision' && s.outcome === 'skip'),
+  );
+  assert.ok(
+    skipPaths.length > 0,
+    'skipping the step that produces the calls: gate must surface as a deadlock, not be swallowed',
+  );
+  assert.equal(hasDefiniteCheckDefect(report), true, 'and it is a definite defect, so install rejects it');
+});
+
+test('modelCheck: the calls: gate reads callsInputs, not consumes (per-step, not def-wide)', () => {
+  // Two calls: steps in ONE def: `ready` has an empty gate (always ready, same
+  // rule as Engine.callsGateReady); `notReady` gates on an artifact that can
+  // never green. A def-wide predicate cannot tell these apart — it answers for
+  // the whole def. A per-step gate must let `ready` discharge while `notReady`
+  // stays stuck, so the def is still reported as defective.
+  const d = def('calls-mixed-gates', [input('start', { seedOwed: false })], [
+    step({ name: 'blocked', consumes: ['never'], produces: ['gate'] }),
+    callsStep({ name: 'ready', produces: ['ready_out'] }),
+    callsStep({ name: 'notReady', produces: ['not_ready_out'], callsInputs: { childIn: 'gate' } }),
+  ]);
+
+  const report = modelCheck(d, { maxStates: 500 });
+  assert.ok(
+    report.deadlocks.length > 0,
+    'the ungated calls: step must not launder the gated one — classification is per-state, not def-wide',
+  );
+  assert.equal(hasDefiniteCheckDefect(report), true, 'the def stays a definite defect');
+});
+
+test('modelCheck: a calls: firing offers only the green outcome (no worker verbs)', () => {
+  // A calls: step is the machine handing off to a child, not a worker order:
+  // there is no worker to schema-reject a value and no consumer to
+  // judgment-reject (a calls: step declares `consumes: []`). If the successor
+  // expansion ever offered those verbs, the calls artifact could be walked into
+  // a rejected/skipped state the engine cannot actually produce.
+  const d = def('calls-outcomes', [input('proposal', { seedOwed: false })], [
+    step({ name: 'provision', consumes: ['proposal'], produces: ['sandbox'], maxAttempts: 1000, maxSchemaFailures: 0 }),
+    callsStep({ name: 'deliver', produces: ['delivered'], callsInputs: { proposal: 'sandbox' } }),
+  ]);
+
+  const report = modelCheck(d, { maxStates: 1000 });
+  const callsOutcomes = new Set<string>();
+  const collect = (path: CheckStep[]): void => {
+    for (const s of path) if (s.step === 'deliver') callsOutcomes.add(s.outcome);
+  };
+  for (const f of [...report.stallStates, ...report.deadlocks, ...report.stuck]) collect(f.path);
+  if (report.completePath) collect(report.completePath);
+
+  assert.ok(callsOutcomes.size > 0, 'the calls: step must appear in at least one explored path (non-vacuity)');
+  assert.deepEqual([...callsOutcomes], ['green'], 'a calls: firing must only ever be explored as green');
 });

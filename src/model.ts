@@ -469,31 +469,62 @@ function idleEligible(
 }
 
 /**
- * Is some `calls:` step still waiting on a child that the model cannot simulate?
+ * Is a `calls:` step's gate ready in this state — i.e. is every parent artifact
+ * wired into `callsInputs` green?
  *
- * True when a `calls:` step has all of its own consumed inputs green (so the
- * engine would provision the child NOW) and at least one of its produced
- * outputs is still a debt (so the child has not yet discharged it).
+ * This is the model-side mirror of `Engine.callsGateReady` (engine.ts) and MUST
+ * read the same field it does: `callsInputs`, the mapping {child input name →
+ * parent artifact name}. A `calls:` step's `StepDef.consumes` is ALWAYS `[]`
+ * (`buildStep` hardcodes it — "eligibility is engine-managed", defs.ts), so
+ * gating on `plainConsumes(step)` is vacuously true for every `calls:` step and
+ * is NOT a gate at all. An empty `callsInputs` gate is genuinely always ready —
+ * same rule the engine applies.
+ */
+function callsGateReady(step: StepDef, arts: ArtifactMap): boolean {
+  const gateStems = Object.values(step.callsInputs ?? {});
+  return gateStems.every((s) => isGreen(arts.get(s)));
+}
+
+/**
+ * The `calls:` discharges available in THIS state — one firing per `calls:` step
+ * whose gate is ready (the engine would provision/re-provide the child now) and
+ * whose produced artifact is still a debt (the child has not yet discharged it).
  *
  * Why this exists: `eligibleFirings` skips every `calls:` step (M2 — the engine
  * spawns a child rather than issuing a worker order), and `modelCheck` explores
- * ONE def with no child engine attached. Without this predicate the exploration
- * mistakes "waiting on a child I can't see" for "structurally dead", which made
- * `hasDefiniteCheckDefect` reject EVERY `calls:`-using def at install time —
- * including the repo's own `examples/workflows/provisioned-delivery.yaml`.
+ * ONE def with no child engine attached. Without modeling the handoff, the
+ * exploration mistakes "waiting on a child I can't see" for "structurally dead",
+ * which made `hasDefiniteCheckDefect` reject EVERY `calls:`-using def at install
+ * time — including the repo's own `examples/workflows/provisioned-delivery.yaml`.
  *
- * Deliberately mirrors the `mode === 'plain'` input gate in `eligibleFirings`
- * rather than reusing it: the two answer different questions ("may a worker fire
- * here?" vs "is the machine mid-handoff to a child?") and must stay independent.
+ * This is a TRANSITION, not a reclassification. That distinction is the whole
+ * point: an earlier version of this fix was a def-wide boolean OR'd into the
+ * deadlock/stall branch, which relabelled EVERY zero-firing state in the def —
+ * so one unrelated `calls:` step anywhere in a def suppressed every genuine
+ * deadlock in it. Modeling the discharge as a successor state instead keeps the
+ * classification strictly per-state: the child greens ITS OWN artifact and
+ * nothing else, so a deadlock elsewhere in the same def is still reached and
+ * still reported.
+ *
+ * Kept separate from `eligibleFirings` deliberately: that function is the LIVE
+ * engine scheduler and a `calls:` step must never become a worker order. These
+ * firings are consumed only by `modelCheck`'s successor expansion.
  */
-function callsDeferralPending(def: WorkflowDef, arts: ArtifactMap): boolean {
+function callsDischargeFirings(def: WorkflowDef, arts: ArtifactMap): Firing[] {
+  const firings: Firing[] = [];
   for (const step of def.steps) {
     if (!step.calls) continue;
-    const inputsSatisfied = plainConsumes(step).every((c) => isGreen(arts.get(c.stem)));
-    if (!inputsSatisfied) continue;
-    if (plainOutputs(step).some((p) => isDebt(arts.get(p)))) return true;
+    if (!callsGateReady(step, arts)) continue;
+    const outs = plainOutputs(step).filter((p) => isDebt(arts.get(p)));
+    if (outs.length === 0) continue;
+    firings.push({
+      step: step.name,
+      key: '',
+      inputs: Object.values(step.callsInputs ?? {}),
+      outputs: outs,
+    });
   }
-  return false;
+  return firings;
 }
 
 /**
@@ -1922,6 +1953,16 @@ function eligibleOutcomes(
     return ['judge-approve', 'judge-reject'];
   }
 
+  // M2: a `calls:` firing is the machine handing off to a child instance, not a
+  // worker order. The only outcome the PARENT def can observe is the child's
+  // terminal outcome cascading up as a green on the calls artifact. None of the
+  // worker-verb outcomes apply: there is no worker to schema-reject a value, no
+  // consumer to judgment-reject (a calls: step declares `consumes: []`), and a
+  // calls: produce may carry neither `judges:` nor `group:` (rejected by
+  // `buildStep`). Modeling only the green keeps the successor set faithful to
+  // what the engine can actually do here.
+  if (step.calls) return ['green'];
+
   const stem = collectionStem(step);
   const outPath = firing.outputs[0] ?? '';
   const el = parseElement(outPath);
@@ -2339,33 +2380,37 @@ export function modelCheck(def: WorkflowDef, opts: CheckOptions = {}): CheckRepo
       continue; // done states have no successors
     }
 
-    const firings = status.eligible;
+    // WS-6 — model the `calls:` handoff as a real TRANSITION, not a
+    // reclassification. M2 makes `eligibleFirings` skip every `calls:` step (the
+    // engine spawns a child to discharge it, so it must never become a worker
+    // firing), and the model has no child engine attached. Left unmodeled, a
+    // state waiting on a child reaches the classification branch below with zero
+    // firings and gets called a TRUE deadlock — asserting this report's own
+    // documented claim ("no path to completion even at unlimited attempts"),
+    // which is false: the engine does spawn the child and the debt is
+    // discharged.
+    //
+    // The child is modeled as a single opaque green of the calls artifact — the
+    // only thing the parent def can observe about it. `callsDischargeFirings`
+    // gates per-step on `callsInputs` (the same field `Engine.callsGateReady`
+    // reads), so a `calls:` step whose gate is NOT green yields no firing and
+    // the state is classified on its own merits. Because the discharge greens
+    // only that step's own artifact, an unrelated deadlock elsewhere in the same
+    // def is still reached and still reported.
+    //
+    // `eligibleFirings` (the LIVE engine scheduler) and `hasDefiniteCheckDefect`
+    // (shared by check / add / push / install) are deliberately untouched.
+    const callsFirings = callsDischargeFirings(def, node.arts);
+    const firings = [...status.eligible, ...callsFirings];
 
     // Non-done state with no eligible firings: classify by recomputing eligibility
     // as if every freeze/stall were lifted (unlimited attempts). If a producer
     // would re-arm → an EXPECTED stall state (a by-design brake). If not → a
     // TRUE deadlock (a structural dead-end with no path to completion even at
     // unlimited attempts).
-    //
-    // WS-6 correction — a pending `calls:` debt is NOT a true deadlock. M2 makes
-    // `eligibleFirings` skip every `calls:` step (the engine spawns a child to
-    // discharge it, so it must never become a worker firing). The model has no
-    // child to simulate, so such a state reaches here with zero firings. Calling
-    // it a TRUE deadlock asserts this report's own documented claim — "no path to
-    // completion even at unlimited attempts" — which is FALSE here: the engine
-    // does spawn the child and the debt is discharged. The model simply cannot
-    // see that far. Record it as a stall (the existing "expected, not a defect,
-    // does not affect the exit code" bucket) so the check stays SOUND: it reports
-    // only what it can actually establish.
-    //
-    // Scope: this changes nothing for a def with no `calls:` step —
-    // `callsDeferralPending` returns false and the original branch runs verbatim.
-    // `eligibleFirings` (the LIVE engine scheduler, engine.ts:1365) and
-    // `hasDefiniteCheckDefect` (shared by check / add / push / install) are
-    // deliberately untouched.
     if (firings.length === 0 && !status.done) {
       const lifted = eligibleFirings(def, node.arts, undefined, { ignoreFreeze: true });
-      if (lifted.length > 0 || callsDeferralPending(def, node.arts)) {
+      if (lifted.length > 0) {
         report.stallStates.push({ path: node.path });
       } else {
         report.deadlocks.push({ path: node.path });
