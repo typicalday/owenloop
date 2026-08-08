@@ -405,7 +405,9 @@ export class PrincipalKeyManager {
     try {
       let r: { status: number | null };
       if (this.backendKind === 'macos-security') {
-        r = this.runner.run('security', ['find-generic-password', '-s', 'owenloop-signing', '-a', hash], {
+        // `-w` is what makes `security` print the secret itself; without it
+        // stdout carries the item's attribute dump, which is not the record.
+        r = this.runner.run('security', ['find-generic-password', '-s', 'owenloop-signing', '-a', hash, '-w'], {
           stdoutFd: fd,
         });
         // 44 = errSecItemNotFound — a clean absence.
@@ -447,8 +449,11 @@ export class PrincipalKeyManager {
     }
     if (this.backendKind === 'macos-security') {
       // The secret rides on the `-i` command stream's stdin (single-quoted),
-      // never on argv. Same escaping as hub.ts's defaultKeychain.
-      const sq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+      // never on argv. Same escaping as hub.ts's defaultKeychain. `security -i`
+      // treats `\` as an escape character even inside single quotes, so
+      // backslashes must be doubled FIRST (before quote-escaping inserts its
+      // own), or the record's JSON `\n` escapes degrade to bare `n` on store.
+      const sq = (s: string): string => `'${s.replace(/\\/g, '\\\\').replace(/'/g, `'\\''`)}'`;
       const cmd = `add-generic-password -U -s ${sq('owenloop-signing')} -a ${sq(hash)} -w ${sq(recordText)}\n`;
       const r = this.runner.run('security', ['-i'], { stdin: Buffer.from(cmd, 'utf8') });
       if (r.status !== 0) throw backendError('macos-security', `store exited with status ${r.status}`);

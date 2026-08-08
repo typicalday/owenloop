@@ -476,7 +476,10 @@ export function defaultKeychain(env: Record<string, string | undefined>): Keycha
       // rides in that stdin stream (single-quoted), never on this process's argv.
       // The service string now carries `:` and `//` — inert for `security`, but
       // the single-quote escaping stays as the general guard it always was.
-      const sq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`;
+      // `security -i` treats `\` as an escape character even inside single
+      // quotes, so backslashes are doubled FIRST (before quote-escaping
+      // inserts its own) or they are silently eaten on store.
+      const sq = (s: string): string => `'${s.replace(/\\/g, '\\\\').replace(/'/g, `'\\''`)}'`;
       const cmd = `add-generic-password -U -s ${sq(service)} -a ${sq(account)} -w ${sq(value)}\n`;
       execFileSync('security', ['-i'], { input: cmd, stdio: ['pipe', 'ignore', 'ignore'] });
     },
