@@ -130,7 +130,11 @@ function makeFakeRunner(opts: { failLookup?: boolean; failStore?: boolean; secre
         if (o.stdoutFd === undefined) throw new Error('lookup must redirect stdout to an fd');
         const rec = store.get(hash);
         if (rec === undefined) return { status: 44, stdout: Buffer.alloc(0) }; // errSecItemNotFound
-        writeFileSync(o.stdoutFd, rec);
+        // Faithful to the real tool: only `-w` prints the secret to stdout.
+        // Without it, stdout carries the item's attribute dump — which is how
+        // the missing `-w` regression looked in production (attribute text
+        // fails JSON.parse and reads as a "corrupt" record).
+        writeFileSync(o.stdoutFd, args.includes('-w') ? rec : `keychain: "login.keychain-db"\nclass: "genp"\nattributes:\n    0x00000007 <blob>="owenloop-signing"\n`);
         return { status: 0, stdout: Buffer.alloc(0) };
       }
       if (cmd === 'security' && args[0] === '-i') {
@@ -139,7 +143,11 @@ function makeFakeRunner(opts: { failLookup?: boolean; failStore?: boolean; secre
         const text = o.stdin!.toString('utf8');
         const hash = /-a '([0-9a-f]{64})'/.exec(text)![1]!;
         const body = text.slice(text.indexOf("-w '") + 4, text.lastIndexOf("'"));
-        store.set(hash, body.replace(/'\\''/g, "'"));
+        // Faithful to the real tool's tokenizer: inside single quotes, `\` is
+        // still an escape character — `\X` collapses to `X` (so `\\`→`\`, and
+        // an unescaped `\n` in the payload silently degrades to `n`). The
+        // writer must pre-double backslashes for the payload to round-trip.
+        store.set(hash, body.replace(/'\\''/g, "'").replace(/\\(.)/g, '$1'));
         return { status: 0, stdout: Buffer.alloc(0) };
       }
 
@@ -298,15 +306,21 @@ test('macos-security: create → record on stdin (never argv), lookup stdout to 
   // The stored record carries the poison; it arrived via the `-i` stdin stream.
   const stored = store.get(keyRefHash(REF))!;
   assert.ok(stored.includes(POISON), 'the generated key reached the store');
+  // Round-trip fidelity: `security -i` treats `\` as an escape char even
+  // inside single quotes, so the writer must pre-double backslashes or the
+  // record's JSON `\n` escapes degrade to bare `n` in the stored secret.
+  assert.equal((JSON.parse(stored) as { privateKey: string }).privateKey, `${POISON}-1\n`);
   const addRun = runs.find((r) => r.cmd === 'security' && r.args[0] === '-i')!;
   assert.ok(addRun.stdin!.toString('utf8').includes(POISON), 'secret rides on child stdin');
   for (const r of runs) {
     for (const a of r.args) assertNoPoison('security argv', a);
   }
 
-  // Lookup redirected stdout to a pre-opened fd, never a pipe.
+  // Lookup redirected stdout to a pre-opened fd, never a pipe — and it must
+  // pass `-w`, or stdout carries the attribute dump instead of the secret.
   const findRun = runs.find((r) => r.cmd === 'security' && r.args[0] === 'find-generic-password')!;
   assert.ok(typeof findRun.stdoutFd === 'number' && findRun.captureStdout === undefined);
+  assert.ok(findRun.args.includes('-w'), 'lookup must print the secret, not the attribute dump');
 
   // Idempotent second ensure: no new store write.
   const writesBefore = store.size;
