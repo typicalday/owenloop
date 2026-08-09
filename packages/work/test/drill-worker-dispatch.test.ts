@@ -44,6 +44,7 @@ import { startMockHub, until } from './helpers/mcp-stdio-client.ts';
 import { isShiftError } from '../src/shift/protocol.ts';
 import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
 import { DRILL_AUTH, fixtureEnv, seedCredentialStore } from './helpers/credential-fixture.ts';
+import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 
 const DEMO_HASH = 'abcdef1234567890';
 const TPL_CONTENT = '---\nname: x\n---\n\nstep brief\n';
@@ -258,8 +259,9 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
     // to THIS order. That mount is how `submit` reaches the hub — which is why
     // the hub, not the stream, is the runner's completion signal.
     const mcpMount = start['mcp'] as { command: string; args: string[] };
-    assert.equal(mcpMount.command, 'owenloop');
-    assert.equal(mcpMount.args[0], 'work');
+    assert.equal(mcpMount.command, process.execPath);
+    assert.equal(mcpMount.args[0], resolveOwenloopBin());
+    assert.equal(mcpMount.args[1], 'work');
     assert.ok(mcpMount.args.includes('--mcp'));
     assert.ok(mcpMount.args.includes('wf1/run_x1234'));
     // Stripping OWENLOOP_TOKEN from the child env LANDED in Phase 6

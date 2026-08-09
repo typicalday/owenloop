@@ -1,11 +1,11 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import { createShiftLoop, type ShiftLoop, type ShiftLoopOptions } from '../src/shift/loop.ts';
-import { buildSpawnPlan, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
+import { buildSpawnPlan, createDefaultSpawner, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
 import { readChildRecords, writeChildRecord } from '../src/shift/state.ts';
 import { sessionsPath } from '../src/harness/session-store.ts';
 import { readStepSpec, writeBundle } from '../src/bundle/cache.ts';
@@ -14,7 +14,7 @@ import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import { ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { installSignalHandlers, type SignalHost } from '../src/roles/signals.ts';
 import type { HubClient } from '../src/hub/client.ts';
-import type { InboxInstance, WorkOrder } from '../src/hub/types.ts';
+import { HubError, type InboxInstance, type WorkOrder } from '../src/hub/types.ts';
 
 // ---- fixtures ---------------------------------------------------------------
 //
@@ -50,12 +50,14 @@ interface WakeStep {
   changed?: boolean;
   cursor?: number;
   throw?: boolean;
+  error?: Error;
 }
 
 interface MockCfg {
   wake?: WakeStep[];
   inbox?: string[];
   perWf?: Record<string, { def?: string; orders: WorkOrder[] }>;
+  perWfThrows?: Record<string, Error>;
   presenceThrows?: boolean;
 }
 
@@ -68,6 +70,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
       const seq = cfg.wake ?? [{ changed: true, cursor: 1 }];
       const s = seq[Math.min(wakeIdx, seq.length - 1)]!;
       wakeIdx++;
+      if (s.error !== undefined) throw s.error;
       if (s.throw) throw new Error('wake boom');
       return { text: '', cursor: s.cursor ?? 0, changed: s.changed ?? true };
     },
@@ -89,6 +92,8 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
         }));
         return { text: '', instances };
       }
+      const failure = cfg.perWfThrows?.[req.workflow];
+      if (failure !== undefined) throw failure;
       const p = cfg.perWf?.[req.workflow] ?? { orders: [] };
       return { text: '', workflow: req.workflow, ...(p.def !== undefined ? { def: p.def } : {}), orders: p.orders };
     },
@@ -256,6 +261,26 @@ test('wake failure is non-fatal — the loop survives and retries', async () => 
   assert.equal(count(calls, 'whats_next'), 0); // never swept after a wake throw
 });
 
+test('Retry-After metadata delays the next Shift poll', async () => {
+  const { hub } = mockHub({
+    wake: [{ error: new HubError(429, 'slow down', 'rate_limited', 23_000) }],
+  });
+  const { spawner } = fakeSpawner();
+  const sleeps: number[] = [];
+  const holder: { loop?: ShiftLoop } = {};
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      holder.loop!.stop();
+    },
+  }));
+  holder.loop = loop;
+
+  await loop.run();
+  assert.deepEqual(sleeps, [23_000]);
+});
+
 // ---- presence cadence -------------------------------------------------------
 
 test('presence pings on its own cadence, carrying name + serve crews', async () => {
@@ -356,6 +381,36 @@ test('at zero free capacity the loop skips whats_next entirely', async () => {
   assert.equal(spawns.length, 0);
 });
 
+test('a changed wake skipped at full capacity is swept after capacity frees even when the cursor is unchanged', async () => {
+  cacheCommandBundle();
+  writeChildRecord(stateDir, { workflow: 'wf1', run: 'run_prior', pid: 10, spawnedAt: 0 });
+  const alive = new Set([10]);
+  const { hub, calls } = mockHub({
+    wake: [
+      { changed: true, cursor: 1 },
+      { changed: false, cursor: 1 },
+    ],
+    perWf: cmdWf([wo('run_next', 'cmd')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(
+    baseOpts(hub, spawner, {
+      workflow: 'wf1',
+      cap: 1,
+      isAlive: (pid) => pid >= 1000 || alive.has(pid),
+    }),
+  );
+
+  assert.equal(await loop.iterate(), 0);
+  assert.equal(count(calls, 'whats_next'), 0);
+
+  alive.delete(10);
+
+  assert.equal(await loop.iterate(), 1);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_next']);
+  assert.equal(count(calls, 'whats_next'), 1);
+});
+
 // ---- inbox mode -------------------------------------------------------------
 
 test('inbox mode fans out to each servable instance', async () => {
@@ -378,6 +433,44 @@ test('inbox mode fans out to each servable instance', async () => {
   // one inbox call + one per-instance whats_next each
   assert.equal(count(calls, 'whats_next'), 3);
   assert.deepEqual(spawns.map((s) => s.run).sort(), ['run_a', 'run_b']);
+});
+
+test('a terminal-between-inbox-and-fetch race is consumed once without repeated error logging', async () => {
+  const terminal = new HubError(
+    403,
+    'workflow wfOld is done — a non-running instance is not servable',
+    'forbidden',
+  );
+  const { hub, calls } = mockHub({
+    wake: [
+      { changed: true, cursor: 1 },
+      { changed: false, cursor: 1 },
+    ],
+    inbox: ['wfOld'],
+    perWfThrows: { wfOld: terminal },
+  });
+  const { spawner } = fakeSpawner();
+  const out: string[] = [];
+  const err: string[] = [];
+  const holder: { loop?: ShiftLoop } = {};
+  let sleeps = 0;
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    out: (line) => out.push(line),
+    err: (line) => err.push(line),
+    sleep: async () => {
+      sleeps++;
+      if (sleeps >= 2) holder.loop!.stop();
+    },
+  }));
+  holder.loop = loop;
+
+  await loop.run();
+  assert.equal(
+    calls.filter((call) => call.verb === 'whats_next' && (call.arg as { workflow?: string } | undefined)?.workflow === 'wfOld').length,
+    1,
+  );
+  assert.match(out.join('\n'), /skipped stale terminal inbox candidate/);
+  assert.doesNotMatch(err.join('\n'), /whats_next for wfOld failed/);
 });
 
 // ---- command routing at the loop level --------------------------------------
@@ -741,6 +834,36 @@ test('buildSpawnPlan: an empty or absent harness carries no --harness flag, and 
   assert.deepEqual(execSpec.args, ['/pkg/bin/owenloop.mjs', 'work', 'exec', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
 });
 
+test('createDefaultSpawner reports a nonzero detached worker exit with bounded safe metadata', async () => {
+  const script = join(stateDir, '..', 'exit-seven.mjs');
+  writeFileSync(script, 'process.exit(7);\n');
+  // Production Shift has a listening daemon and poll loop keeping its event
+  // loop alive. Model that here because the detached child is deliberately
+  // unref'd; Node 22 may otherwise let the isolated test process drain before
+  // delivering the child's `exit` event.
+  const keepAlive = setTimeout(() => {}, 5_000);
+  const failure = new Promise<Parameters<NonNullable<Parameters<typeof createDefaultSpawner>[4]>>[0]>((resolve) => {
+    const spawner = createDefaultSpawner(ORIGIN, 'default', script, 'shf_test', resolve);
+    spawner({ workflow: 'wf1', run: 'run_failed', step: 'builder', kind: 'agent-run', harness: 'codex' });
+  });
+
+  try {
+    assert.deepEqual(await failure, {
+      workflow: 'wf1',
+      run: 'run_failed',
+      step: 'builder',
+      kind: 'agent-run',
+      harness: 'codex',
+      executable: `${process.execPath} ${script}`,
+      exitStatus: 7,
+      signal: null,
+      message: 'worker exited without completing successfully',
+    });
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
+
 // createDefaultSpawner is a thin wrapper: it captures shiftId at
 // construction and passes it straight through to buildSpawnPlan (see spawn.ts
 // doc comment) before calling the real `spawn`. Per this file's own testing
@@ -939,6 +1062,48 @@ test('maxConcurrentAgents caps agent-run dispatch on top of the global cap', asy
   assert.equal(spawns.length, 2);
   assert.equal(readChildRecords(stateDir).length, 2);
   assert.match(out.join('\n'), /at the agent-run cap \(2\)/);
+});
+
+test('a claimed order queued by the agent cap dispatches after a child exits without a new hub wake', async () => {
+  cacheBuilderStep();
+  const orders = [wo('run_first', 'builder'), wo('run_second', 'builder')];
+  const { hub, calls } = mockHub({
+    wake: [
+      { changed: true, cursor: 1 },
+      { changed: false, cursor: 1 },
+    ],
+    perWf: agentWf(orders),
+  });
+  const alive = new Set<number>();
+  const spawns: SpawnSpec[] = [];
+  let pid = 1000;
+  const spawner: Spawner = (spec) => {
+    spawns.push(spec);
+    alive.add(pid);
+    return { pid: pid++ };
+  };
+  const loop = createShiftLoop(
+    baseOpts(hub, spawner, {
+      workflow: 'wf1',
+      cap: 10,
+      maxConcurrentAgents: 1,
+      isAlive: (candidatePid) => alive.has(candidatePid),
+    }),
+  );
+
+  assert.equal(await loop.iterate(), 1);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  assert.equal(count(calls, 'whats_next'), 1);
+
+  alive.delete(1000);
+
+  assert.equal(await loop.iterate(), 1);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first', 'run_second']);
+  assert.equal(
+    count(calls, 'whats_next'),
+    1,
+    'the second run was already claimed, so local dispatch must not wait for a new hub sweep',
+  );
 });
 
 test('live agent-run records consume the agent cap; the global cap still applies too', async () => {

@@ -9,6 +9,7 @@
  *
  *   owenloop defs                       list available workflow definitions
  *   owenloop add <owner>/<repo>[@ref]   fetch, validate, and install a repo's workflow defs (public repos)
+ *   owenloop start <def> [--provide n=json] [--crew name]   start a published hub workflow
  *   owenloop create <def> [--provide n=json] [--title t]   start an instance
  *   owenloop provide <wf> <name> [--value json]   supply an owed input
  *   owenloop tick <wf> [--now ms]       pull eligible orders
@@ -1350,6 +1351,8 @@ Commands:
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
   push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
+  start <defName> [--provide name=json ...] [--crew <name>] [--title <text>] [--hub <url>]
+                                         start a published workflow on the bound hub (human credential)
   agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --shift = --scopes work,run)
   capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
   capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
@@ -1442,6 +1445,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['publish', cmdOpts('unsigned', 'output', 'source')],
   ['trust', cmdOpts('force', 'key', 'principal', 'pools', 'labels', 'namespaces', 'delegate', 'signing-key', 'output', 'reason', 'effective-from')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
+  ['start', cmdOpts('hub', 'crew', 'title', 'provide')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
   ['crew', cmdOpts('hub', 'kind', 'owner')],
@@ -3900,6 +3904,119 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
+ * Resolve the hub for `start` without ever falling through to the production
+ * default or an ambient `OWENLOOP_HUB`. A connected project supplies the
+ * durable default. `--hub` is allowed for an unbound directory, but must agree
+ * with an existing binding so a copied command cannot silently start a run on
+ * the wrong control plane.
+ */
+function resolveStartHub(io: CliIO, args: Args): string {
+  const binding = readHubBinding(hubBindingPath(io.cwd));
+  let bound: string | undefined;
+  if (binding !== null) {
+    try {
+      bound = normalizeOrigin(binding.hub);
+    } catch (e) {
+      throw new CliError(`${(e as Error).message} — re-run \`owenloop connect\` to rebind`);
+    }
+  }
+
+  const hubArg = last(args, 'hub');
+  if (hubArg !== undefined) {
+    let requested: string;
+    try {
+      requested = normalizeOrigin(hubArg);
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+    if (bound !== undefined && requested !== bound) {
+      throw new CliError(`this project is bound to ${bound}, not ${requested} — re-run \`owenloop connect\` to rebind`);
+    }
+    return requested;
+  }
+
+  if (bound !== undefined) return bound;
+  throw new CliError('this project is not bound to a hub — run `owenloop connect`, or pass --hub <url>');
+}
+
+/** Extract the stable hub message without ever echoing an untyped raw body. */
+async function hubRequestMessage(res: Response): Promise<string | undefined> {
+  try {
+    const body = (await res.json()) as unknown;
+    if (typeof body !== 'object' || body === null) return undefined;
+    const message = (body as Record<string, unknown>).message;
+    return typeof message === 'string' && message !== '' ? message : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `owenloop start` — the small, public per-run control-plane command.
+ * Durable setup (login/connect/push/prepare and a standing Shift) remains
+ * separate; starting another instance is one authenticated POST using the
+ * human credential and the same repeated `--provide name=json` grammar as the
+ * local `create` command.
+ */
+async function dispatchStart(io: CliIO, args: Args): Promise<number> {
+  const defName = need(args, 1, 'defName');
+  const origin = resolveStartHub(io, args);
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  const provide = parsePairs(all(args, 'provide'), true);
+  const crew = last(args, 'crew');
+  const title = last(args, 'title');
+  const request = {
+    workflow_name: defName,
+    ...(Object.keys(provide).length > 0 ? { provide } : {}),
+    ...(crew !== undefined ? { default_crew: crew } : {}),
+    ...(title !== undefined ? { title } : {}),
+  };
+
+  const { res, cred: used } = await authedPost(io, origin, slot, cred, '/api/start_run', request);
+  if (res.status === 401) assertAuthOk(res, used, origin);
+  if (!res.ok) {
+    const message = await hubRequestMessage(res);
+    throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+  }
+
+  let body: unknown;
+  try {
+    body = (await res.json()) as unknown;
+  } catch {
+    throw new CliError('start_run: malformed success response — body is not valid JSON');
+  }
+  if (typeof body !== 'object' || body === null) {
+    throw new CliError('start_run: malformed success response — body is not an object');
+  }
+  const wire = body as Record<string, unknown>;
+  if (typeof wire.workflow !== 'string' || wire.workflow === '') {
+    throw new CliError('start_run: malformed success response — missing workflow id');
+  }
+  if (wire.def !== defName) {
+    throw new CliError('start_run: malformed success response — definition does not match the request');
+  }
+  if (typeof wire.status !== 'object' || wire.status === null || Array.isArray(wire.status)) {
+    throw new CliError('start_run: malformed success response — missing status object');
+  }
+
+  print(io, {
+    ok: true,
+    hub: origin,
+    workflow: wire.workflow,
+    def: wire.def,
+    status: wire.status,
+    ...(Array.isArray(wire.stampedCrews) ? { stampedCrews: wire.stampedCrews } : {}),
+    ...(Array.isArray(wire.validatedCrews) ? { validatedCrews: wire.validatedCrews } : {}),
+  });
+  return 0;
+}
+
+/**
  * `owenloop mcp` — serve the human control plane to a local MCP host over stdio.
  * A thin adapter: read the optional `--hub <url>` flag and hand `io` (which
  * satisfies the module's `McpIo`) to `runMcpCommand`, which resolves the origin,
@@ -5851,7 +5968,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -5895,6 +6012,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchTrust(io, args);
       case 'push':
         return await dispatchPush(io, args);
+      case 'start':
+        return await dispatchStart(io, args);
       case 'agent':
         return await dispatchAgent(io, args);
       case 'capability':

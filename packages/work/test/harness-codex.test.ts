@@ -1313,6 +1313,29 @@ test('D7 a handshake failure disposes the spawned child and reports the exit', a
   await waitFor(() => !stub.alive(), 'the handshake failure to reap its child');
 });
 
+test('a missing Codex executable produces one observable startup failure', async (t) => {
+  const previousBin = process.env['OWENLOOP_CODEX_BIN'];
+  process.env['OWENLOOP_CODEX_BIN'] = join(tmpdir(), `missing-codex-${process.pid}-${Date.now()}`);
+  t.after(() => {
+    if (previousBin === undefined) delete process.env['OWENLOOP_CODEX_BIN'];
+    else process.env['OWENLOOP_CODEX_BIN'] = previousBin;
+  });
+
+  const events: AgentEvent[] = [];
+  const err = await codexAdapter
+    .start(startArgs(undefined), (event) => events.push(event))
+    .then(
+      () => undefined,
+      (failure: unknown) => failure,
+    );
+
+  assert.ok(err instanceof Error);
+  assert.match(err.message, /ENOENT|not found/i);
+  const exits = events.filter((event) => event.kind === 'exited');
+  assert.equal(exits.length, 1);
+  assert.match(String(exits[0]?.error), /ENOENT|not found/i);
+});
+
 test('D8 an owenloop mount failure interrupts the turn and tears the child down', async (t) => {
   // REGRESSION GUARD (reviewer warning 5). The gate rejected on `status:failed`,
   // but nothing stopped the SERVER-side turn: with no `submit` tool the agent

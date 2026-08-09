@@ -34,6 +34,7 @@ import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { SignalHost } from '../src/roles/signals.ts';
 import type { InstructionResolver } from '../src/exec/instructions.ts';
 import type { StepDef } from '../../../src/types.ts';
+import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 
 // ---- arg parsing ------------------------------------------------------------
 
@@ -541,8 +542,8 @@ test('run() builds an MCP mount whose args carry no credential', async () => {
   assert.ok(started !== undefined && started.kind === 'start');
   const mcp = started.args.owenloopMcp;
   assert.deepEqual(mcp, {
-    command: 'owenloop',
-    args: ['work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'default', '--shift=shf_1', '--mcp'],
+    command: process.execPath,
+    args: [resolveOwenloopBin(), 'work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'default', '--shift=shf_1', '--mcp'],
   });
   const flat = JSON.stringify(mcp);
   assert.ok(!flat.includes('olp_secret_value'), flat);

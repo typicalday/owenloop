@@ -19,6 +19,7 @@ import {
   type AgentRunLoopOptions,
 } from '../src/agent/loop.ts';
 import { ACCOUNT_TOKEN, SHIFT_TOKEN, ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
+import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 import { createFakeAdapter } from '../src/harness/fake.ts';
 import { createModelPolicy } from '../src/agent/model-policy.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
@@ -308,8 +309,8 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
   );
   assert.equal(start.args.cwd, '/repo/wt');
   assert.deepEqual(start.args.owenloopMcp, {
-    command: 'owenloop',
-    args: ['work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'acct-1', '--shift=shf_1', '--mcp'],
+    command: process.execPath,
+    args: [resolveOwenloopBin(), 'work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'acct-1', '--shift=shf_1', '--mcp'],
   });
   // Permissions arrive PRE-NORMALIZED on the step spec — `prepare` already ran
   // `normalizeStepPermissions` over `x.harness`, so this loop passes them

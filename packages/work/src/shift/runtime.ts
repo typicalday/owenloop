@@ -15,7 +15,7 @@ import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createShiftLoop } from './loop.ts';
-import { createDefaultSpawner } from './spawn.ts';
+import { createDefaultSpawner, type WorkerFailure } from './spawn.ts';
 import { resolveStateDir, ensureStateDir, reconcileInFlight } from './state.ts';
 import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.ts';
 import { resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
@@ -243,10 +243,26 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   const shiftId = `shf_${randomUUID()}`;
   const startedAt = now();
   const name = resolveShiftName(parsed.name, { shiftId });
-  const spawner = createDefaultSpawner(origin, account, undefined, shiftId);
+  let daemon: ShiftDaemon | undefined;
+  const reportWorkerFailure = (failure: WorkerFailure): void => {
+    const event = {
+      type: 'failed' as const,
+      workflow: failure.workflow,
+      run: failure.run,
+      step: failure.step ?? '(unknown)',
+      kind: failure.kind,
+      ...(failure.harness !== undefined ? { harness: failure.harness } : {}),
+      executable: failure.executable,
+      exitStatus: failure.exitStatus,
+      signal: failure.signal,
+      message: failure.message,
+    };
+    daemon?.onEvent(event);
+    process.stderr.write(`${roleLabel}: worker failure ${JSON.stringify(event)}\n`);
+  };
+  const spawner = createDefaultSpawner(origin, account, undefined, shiftId, reportWorkerFailure);
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 
-  let daemon: ShiftDaemon | undefined;
   const loop = createShiftLoop({
     hub,
     spawner,

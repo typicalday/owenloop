@@ -34,6 +34,7 @@
  * cannot authenticate as different principals. See `docs/agent-runner.md`.
  */
 import type { OrderPacket, ReasonEntry } from '../hub/types.ts';
+import { resolveOwenloopBin } from '../owenloop-bin.ts';
 
 /** The composite `<workflow>/<run>` order id token. */
 export const ORDER_TOKEN = '__OWENLOOP_ORDER__';
@@ -93,10 +94,15 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
  * (The shape originated with the deleted stamp path, which had to survive a YAML
  * args array; it is kept because it is still the correct, unambiguous form.)
  */
-export function buildOwenloopMcp(spec: BriefSpec): { command: string; args: string[] } {
+export function buildOwenloopMcp(
+  spec: BriefSpec,
+  binPath: string = resolveOwenloopBin(),
+  execPath: string = process.execPath,
+): { command: string; args: string[] } {
   return {
-    command: 'owenloop',
+    command: execPath,
     args: [
+      binPath,
       'work',
       'hold',
       '--order',

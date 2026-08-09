@@ -143,14 +143,14 @@ function spawnDaemon(origin: string): ShiftChild {
   );
 }
 
-test('--max-agents caps in-flight runners; over-cap AGENT orders wait for a later sweep', async () => {
+test('--max-agents caps in-flight runners; over-cap claimed orders queue for local dispatch', async () => {
   await seedCache();
   let wakes = 0;
   const { origin, reqs, server } = await startMockHub((verb, body) => {
     switch (verb) {
       case 'wake':
-        // Two "changed" wakes, so the cap is re-applied on a SECOND sweep and
-        // the skipped orders are proven still-offerable, not consumed.
+        // Two "changed" wakes prove the local queue remains deduplicated even
+        // when the hub is polled again while the first child is still running.
         return { text: '', cursor: 1, changed: wakes++ < 2 };
       case 'whats_next':
         if (body?.workflow === undefined) return { text: '', instances: [{ workflow: 'wf1' }] };
@@ -200,14 +200,14 @@ test('--max-agents caps in-flight runners; over-cap AGENT orders wait for a late
     await until(() => starts().length >= 1, `the capped runner to start its harness; stderr:\n${daemon.stdout()}`);
     assert.equal(starts().length, 1, `only one harness session was started; trace:\n${JSON.stringify(traceCalls(), null, 1)}`);
 
-    // The over-cap orders were LEFT, not consumed: nothing was released and the
-    // cap message was logged for each of the two skipped candidates.
+    // The over-cap claims remain owned by this Shift's local queue: nothing was
+    // released and the cap message was logged for each queued candidate.
     assert.equal(reqs.some((r) => r.verb === 'release'), false, 'a capped order is left offered, never handed back');
     const capLines = daemon.stdout().split('\n').filter((l) => /at the agent-run cap \(1\)/.test(l));
     assert.ok(capLines.length >= 2, `expected a cap line per skipped candidate, got:\n${capLines.join('\n')}`);
     assert.ok(
-      capLines.every((l) => /leaving for a later sweep/.test(l)),
-      'the message must say the order is deferred, not dropped',
+      capLines.every((l) => /queued for local dispatch/.test(l)),
+      'the message must say the claimed order is locally queued, not dropped',
     );
 
     await daemon.request({ op: 'end' });

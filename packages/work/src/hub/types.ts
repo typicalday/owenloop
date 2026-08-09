@@ -347,11 +347,14 @@ export interface WhoamiResponse extends HubResponse {
 export class HubError extends Error {
   readonly status: number;
   readonly code?: string;
+  /** Server-requested delay before retrying, normalized from Retry-After. */
+  readonly retryAfterMs?: number;
 
-  constructor(status: number, message: string, code?: string) {
+  constructor(status: number, message: string, code?: string, retryAfterMs?: number) {
     super(message);
     this.name = 'HubError';
     this.status = status;
     if (code !== undefined) this.code = code;
+    if (retryAfterMs !== undefined) this.retryAfterMs = retryAfterMs;
   }
 }

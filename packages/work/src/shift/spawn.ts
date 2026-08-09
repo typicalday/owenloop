@@ -17,9 +17,11 @@
  * real child. The default impl's argv/option construction is factored into the
  * pure `buildSpawnPlan` so a test can assert the exact shape as data.
  */
-import { existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+
+import { resolveOwenloopBin } from '../owenloop-bin.ts';
+
+export { resolveOwenloopBin } from '../owenloop-bin.ts';
 
 /**
  * What to spawn: the order to run. `run` IS the order id (hub verb contract);
@@ -30,6 +32,8 @@ import { fileURLToPath } from 'node:url';
 export interface SpawnSpec {
   workflow: string;
   run: string;
+  /** Step name, carried only for safe local lifecycle reporting. */
+  step?: string;
   /**
    * Which role the detached child runs (Phase 3). Absent ⇒ `'exec'`, so every
    * pre-Phase-3 caller and every faked spawner in the existing tests keeps its
@@ -57,27 +61,27 @@ export interface SpawnResult {
 /** The spawn seam. Injected; faked in tests. */
 export type Spawner = (spec: SpawnSpec) => SpawnResult;
 
+/** Safe, bounded metadata emitted when a detached worker fails. No child
+ * stderr, prompt, artifact value, environment, or credential is captured. */
+export interface WorkerFailure {
+  workflow: string;
+  run: string;
+  step?: string;
+  kind: 'exec' | 'agent-run';
+  harness?: string;
+  executable: string;
+  exitStatus: number | null;
+  signal: NodeJS.Signals | null;
+  message: string;
+}
+
+export type WorkerFailureReporter = (failure: WorkerFailure) => void;
+
 /** The fully-resolved spawn arguments — pure data, asserted directly in tests. */
 export interface SpawnPlan {
   command: string;
   args: string[];
   options: { detached: true; stdio: 'ignore'; env: NodeJS.ProcessEnv };
-}
-
-/**
- * Resolve the single packaged `bin/owenloop.mjs` from this module's URL.
- *
- * Source-driven tests import `packages/work/src/**`, while installed/runtime
- * execution imports `dist/packages/work/src/**`; those layouts are one parent
- * level apart. Choose the existing candidate so detached children use the root
- * binary in both layouts.
- */
-export function resolveOwenloopBin(): string {
-  const candidates = [
-    new URL('../../../../bin/owenloop.mjs', import.meta.url),
-    new URL('../../../../../bin/owenloop.mjs', import.meta.url),
-  ].map((url) => fileURLToPath(url));
-  return candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]!;
 }
 
 /**
@@ -144,14 +148,43 @@ export function createDefaultSpawner(
   account: string,
   binPath: string = resolveOwenloopBin(),
   shiftId?: string,
+  onFailure?: WorkerFailureReporter,
 ): Spawner {
   return (spec: SpawnSpec): SpawnResult => {
     const plan = buildSpawnPlan(spec, origin, account, binPath, process.execPath, shiftId);
     const child = spawn(plan.command, plan.args, plan.options);
+    const kind = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
+    const harness = kind === 'agent-run'
+      ? (spec.harness ?? process.env['OWENLOOP_HARNESS'] ?? 'auto')
+      : undefined;
+    // This process is the executable Shift actually launched. The harness may
+    // start its own vendor process later, but reporting or guessing that
+    // executable here would couple the neutral dispatcher to one adapter.
+    const executable = `${process.execPath} ${binPath}`;
+    let failureReported = false;
+    const report = (exitStatus: number | null, signal: NodeJS.Signals | null, message: string): void => {
+      if (failureReported || onFailure === undefined) return;
+      failureReported = true;
+      onFailure({
+        workflow: spec.workflow,
+        run: spec.run,
+        ...(spec.step !== undefined ? { step: spec.step } : {}),
+        kind,
+        ...(harness !== undefined ? { harness } : {}),
+        executable,
+        exitStatus,
+        signal,
+        message,
+      });
+    };
+    child.once('error', () => report(null, null, 'worker process failed to start'));
+    child.once('exit', (code, signal) => {
+      if (code === 0) return;
+      report(code, signal, 'worker exited without completing successfully');
+    });
     child.unref();
     if (child.pid === undefined) {
-      const role = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
-      throw new Error(`spawn of 'owenloop work ${role} ${spec.workflow}/${spec.run}' returned no pid`);
+      throw new Error(`spawn of 'owenloop work ${kind} ${spec.workflow}/${spec.run}' returned no pid`);
     }
     return { pid: child.pid };
   };

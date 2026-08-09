@@ -436,7 +436,7 @@ test('resolveWorkflowCoordinate: a missing coordinate is StoreNotFoundError (nev
   );
 });
 
-test('resolveWorkflowCoordinate: DIFFERENT digests at the two levels are an ambiguity error carrying BOTH digests', async () => {
+test('resolveWorkflowCoordinate: a project definition overrides a different global definition at the same coordinate', async () => {
   const projectRoot = tempDir();
   const globalRoot = tempDir();
   const projectDigest = digest('8');
@@ -446,15 +446,15 @@ test('resolveWorkflowCoordinate: DIFFERENT digests at the two levels are an ambi
   writeIndex(projectRoot, { 'acme/widget@1.0.0': { digest: projectDigest, pinned: false } });
   writeIndex(globalRoot, { 'acme/widget@1.0.0': { digest: globalDigest, pinned: false } });
 
-  await assert.rejects(
-    resolveWorkflowCoordinate({
-      coordinate: workflowCoordinate({ namespace: 'acme', name: 'widget', version: '1.0.0' }),
-      projectRoot, globalRoot, verifier: resolvingVerifier(),
-    }),
-    (e: unknown) => e instanceof StoreAmbiguityError && e.code === 'coordinate-ambiguous'
-      && e.projectDigest === projectDigest && e.globalDigest === globalDigest
-      && /resolves to different digests/.test(e.message),
-  );
+  const res = await resolveWorkflowCoordinate({
+    coordinate: workflowCoordinate({ namespace: 'acme', name: 'widget', version: '1.0.0' }),
+    projectRoot, globalRoot, verifier: resolvingVerifier(),
+  });
+
+  assert.equal(res.digest, projectDigest);
+  assert.equal(res.level, 'project');
+  assert.equal(res.objectPath, objectDirForDigest(projectRoot, projectDigest));
+  assert.deepEqual(res.presentAt, { project: true, global: false });
 });
 
 test('resolveWorkflowCoordinate: an index entry whose object is missing is object-missing', async () => {

@@ -171,10 +171,13 @@ function loadObjectDefs(
  * addressed workflow store.
  *
  * Resolution order mirrors `resolveWorkflowDigest`: the project root is walked
- * first, so when the SAME bundle digest is installed at both levels the project
- * copy is the one registered and the global copy is skipped (identical bytes by
- * construction — the digest IS the identity — so this is deduplication, not a
- * precedence choice).
+ * first. When the SAME bundle digest is installed at both levels the project
+ * copy is registered and the global copy is skipped (identical bytes by
+ * construction — the digest IS the identity). When DIFFERENT digests export
+ * the same qualified workflow name, the project registration holds that normal
+ * name and the global registration remains reachable only by its digest-scoped
+ * key. This is the user-facing project-over-global precedence rule without
+ * making older pinned executions unreachable.
  *
  * Two DIFFERENT digests exporting the same `<package>/<workflow>` — the same
  * package installed at two versions — is NOT a conflict to drop one side of.

@@ -167,8 +167,11 @@ function atomicWrite(filePath: string, content: string): void {
 
 /**
  * Every valid record in `file`, oldest first. A missing/unreadable file reads as
- * `[]`. Blank lines are skipped silently; every other unusable line is skipped
- * and reported through `warn` with its 1-indexed line number. Never throws.
+ * `[]`. A trailing newline is the record-commit marker: an unterminated final
+ * tail may be a concurrent writer still appending, so it is ignored silently
+ * until a later read sees the newline. Blank lines are skipped silently; every
+ * other unusable COMPLETE line is skipped and reported through `warn` with its
+ * 1-indexed line number. Never throws.
  */
 export function readSessions(file: string, opts: SessionStoreOptions = {}): SessionRecord[] {
   const warn = opts.warn ?? defaultWarn;
@@ -180,9 +183,11 @@ export function readSessions(file: string, opts: SessionStoreOptions = {}): Sess
   }
   const out: SessionRecord[] = [];
   const lines = raw.split('\n');
+  const hasUncommittedTail = raw !== '' && !raw.endsWith('\n');
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (line === undefined) continue; // noUncheckedIndexedAccess
+    if (hasUncommittedTail && i === lines.length - 1) continue;
     if (line.trim() === '') continue; // blank lines are not corruption
     let parsed: unknown;
     try {

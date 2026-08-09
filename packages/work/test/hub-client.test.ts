@@ -16,7 +16,7 @@ interface Captured {
 /** Build a fake `fetch` that records the request and returns a canned response. */
 function fakeFetch(
   captured: Captured[],
-  response: { status?: number; body: unknown },
+  response: { status?: number; body: unknown; headers?: Record<string, string> },
 ): typeof fetch {
   return (async (input: string | URL | Request, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
@@ -32,7 +32,7 @@ function fakeFetch(
     const status = response.status ?? 200;
     return new Response(JSON.stringify(response.body), {
       status,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...response.headers },
     });
   }) as typeof fetch;
 }
@@ -168,6 +168,21 @@ test('non-2xx with {error,message} JSON becomes a HubError carrying status and c
       return true;
     },
   );
+});
+
+test('429 Retry-After metadata is normalized onto HubError', async () => {
+  const c = client(fakeFetch([], {
+    status: 429,
+    body: { error: 'rate_limited', message: 'slow down' },
+    headers: { 'retry-after': '17' },
+  }));
+  await assert.rejects(() => c.wake(1), (err: unknown) => {
+    assert.ok(err instanceof HubError);
+    assert.equal(err.status, 429);
+    assert.equal(err.code, 'rate_limited');
+    assert.equal(err.retryAfterMs, 17_000);
+    return true;
+  });
 });
 
 test('non-2xx non-JSON keeps the raw text as the message', async () => {

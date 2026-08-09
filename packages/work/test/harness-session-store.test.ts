@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -132,6 +132,28 @@ test('corrupt lines are skipped and warned about, never thrown', () => {
     `a warning names the offending line number: ${JSON.stringify(warnings)}`,
   );
   assert.ok(warnings.some((w) => w.includes(`${file}:5`)));
+});
+
+test('a concurrent partial final append is ignored until its newline commits it', () => {
+  const first = rec({ step: 'builder', token: 'ok-1' });
+  const second = rec({ step: 'reviewer', token: 'ok-2' });
+  const encoded = JSON.stringify(second);
+  const cut = Math.floor(encoded.length / 2);
+  writeFileSync(file, `${JSON.stringify(first)}\n${encoded.slice(0, cut)}`);
+
+  const warnings: string[] = [];
+  assert.deepEqual(
+    readSessions(file, { warn: (line) => warnings.push(line) }).map((record) => record.token),
+    ['ok-1'],
+  );
+  assert.equal(warnings.length, 0, 'an unterminated final tail is not committed corruption');
+
+  appendFileSync(file, `${encoded.slice(cut)}\n`);
+  assert.deepEqual(
+    readSessions(file, { warn: (line) => warnings.push(line) }).map((record) => record.token),
+    ['ok-1', 'ok-2'],
+  );
+  assert.equal(warnings.length, 0);
 });
 
 test('latestFor over a corrupt file still answers, warning through the default stderr sink', () => {

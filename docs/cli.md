@@ -53,6 +53,7 @@ for the full breakdown.
 | `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
 | `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
+| `start <defName> [--provide name=json …] [--crew <name>] [--title <text>] [--hub <url>]` | start a published workflow on the bound hub with the human credential |
 | `publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned]` | pack a canonical workflow bundle and publish a signed publication sidecar, with an optional signed origin sidecar, or an explicitly unsigned marker |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--shift` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
@@ -951,11 +952,10 @@ defense in depth, not an integrity proof.
 - **Coordinate resolution (human/CLI).** `resolveWorkflowCoordinate({coordinate,
   projectRoot?, globalRoot, verifier})` reads BOTH indexes, fail-closed (a
   corrupt index is a hard error, never silently empty). No entry at either
-  level ⇒ a structured **not-found** error. The SAME digest at both levels
-  deduplicates to one result (project path wins). DIFFERENT digests at the
-  two levels ⇒ a structured **ambiguity** error carrying the coordinate and
-  both digests — resolution never silently picks the project copy. An index
-  entry whose object is missing or corrupt is an integrity error, never a
+  level ⇒ a structured **not-found** error. A project entry wins whenever it
+  exists, even when the global index maps the same coordinate to a different
+  digest; global is the fallback only when project has no match. An index entry
+  whose selected object is missing or corrupt is an integrity error, never a
   returned path.
 
 **Calls resolution for installed bundle workflows.** In the default CLI context
@@ -971,6 +971,9 @@ B.
 
 The precedence is explicit: project-local definitions win first, then
 GitHub-`add` installed definitions, then CAS definitions under qualified keys.
+Within the CAS layer, a project bundle holds the normal qualified name and a
+global bundle is the fallback. A shadowed bundle remains reachable under its
+digest-scoped key so an already-pinned execution cannot be retargeted.
 A corrupt CAS index, object, or workflow is skipped with a warning during
 read-side discovery, so it does not make `status` fail. A running workflow keeps
 the definition snapshot from its creation (§28), including the CAS bundle
@@ -995,9 +998,9 @@ journal locations and dispatches by journal version; a v2 store journal uses
 `index.json` metadata and a v1 GitHub journal uses `installed.json` ledger
 corroboration.
 
-## Hub (`login` / `connect` / `push` / `logout`)
+## Hub (`login` / `connect` / `push` / `start` / `logout`)
 
-These four commands publish local workflow defs to a hosted **hub** (default
+These commands authenticate, publish, and start workflows on a hosted **hub** (default
 `https://api.owenloop.com`; override per-command with `--hub <url>` or the
 `OWENLOOP_HUB` env var). They are the only network-bound commands besides
 `add`, and they talk only to endpoints the hub exposes today — no new
@@ -1013,6 +1016,47 @@ request is treated as an error — so a compromised or misconfigured hub cannot
 bounce credentials or workflow YAML to another origin (same-origin validation
 covers only the initial URL; a redirect would otherwise re-send the request body
 cross-origin).
+
+### The small hosted-workflow path
+
+Setup is durable. Authenticate and bind the project once, publish or update a
+definition when its content changes, prepare that published version for the
+execution account, and keep one crew-scoped Shift running:
+
+```bash
+owenloop login --hub https://hub.example
+owenloop connect --hub https://hub.example
+owenloop push newhire-onboarding
+OWENLOOP_ACCOUNT=default owenloop work prepare newhire-onboarding --origin https://hub.example
+OWENLOOP_HARNESS=codex owenloop shift start openai --origin https://hub.example --as default
+```
+
+Starting another run does not repeat installation, publication, preparation,
+or Shift setup. From the connected project it is one public control-plane
+command; repeat `--provide name=json` for seeded human inputs:
+
+```bash
+owenloop start newhire-onboarding \
+  --crew openai \
+  --provide 'signed_docs={"acknowledged":true}' \
+  --provide 'hardware_choice={"laptop":"MacBook Pro"}'
+```
+
+`start` always uses the human credential. The standing Shift uses the
+`agent:default` credential selected by `--as default`. With no project binding,
+`start --hub <url>` is accepted explicitly; with neither a binding nor `--hub`,
+it refuses instead of falling through to `OWENLOOP_HUB` or the production
+default. If both a binding and `--hub` exist they must agree.
+
+### `start` — start a published workflow
+
+`owenloop start <defName>` sends `POST /api/start_run` and prints the new
+workflow id, its initial status, and the steps whose default crew was stamped or
+whose capability routes were validated. `--crew <name>` selects the crew for
+steps that declare no capability; capability-bearing steps continue to use
+their live hub bindings. `--title` is display-only. The command does not claim,
+dispatch, close, or otherwise drive work—the standing Shift discovers the run
+through its normal crew inbox.
 
 **Request timeouts.** Every hub call — OAuth discovery, client registration,
 code exchange, token refresh, `whoami`, the workflow list, and each push — is

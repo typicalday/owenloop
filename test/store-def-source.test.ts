@@ -192,6 +192,27 @@ test('WS-6 loader: a CAS key can never shadow a project-local def (the "/" separ
   }
 });
 
+test('WS-6 loader: a project bundle overrides a different global bundle with the same qualified workflow name', async () => {
+  const project = await installPair({ name: 'parent', version: '1.0.0', marker: 'PROJECT' });
+  const global = await installPair({ name: 'parent', version: '1.0.0', marker: 'GLOBAL' });
+  assert.notEqual(project.digest, global.digest, 'the fixtures must exercise different definitions');
+
+  const { registrations, warnings } = load(project.root, global.root);
+  const qualified = registrations.find((r) => r.key === 'parent/parent');
+  assert.ok(qualified, 'the normal qualified name is registered');
+  assert.equal(qualified.level, 'project');
+  assert.equal(qualified.bundleDigest, project.digest, 'project holds the user-facing name');
+  assert.match(qualified.def.steps[0]!.body, /PROJECT/);
+
+  const globalScoped = registrations.find(
+    (r) => r.bundleDigest === global.digest && r.bare === 'parent',
+  );
+  assert.ok(globalScoped, 'the shadowed global copy remains available for pinned execution');
+  assert.equal(globalScoped.key, `${global.digest}/parent`);
+  assert.match(globalScoped.def.steps[0]!.body, /GLOBAL/);
+  assert.equal(warnings.length > 0, true, 'the shadowing decision is visible');
+});
+
 test('WS-6 loader is fail-OPEN: a corrupt index warns and is skipped, it does not throw', async () => {
   const { root } = await installPair({ name: 'parent', version: '1.0.0', marker: 'v1' });
   writeFileSync(storeIndexPath(root), '{ this is not json');

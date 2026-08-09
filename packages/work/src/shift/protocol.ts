@@ -50,6 +50,10 @@ export interface FailedEvent {
   run: string;
   step: string;
   kind: 'exec' | 'agent-run';
+  harness?: string;
+  executable?: string;
+  exitStatus?: number | null;
+  signal?: NodeJS.Signals | null;
   message: string;
 }
 

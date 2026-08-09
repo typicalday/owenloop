@@ -4,10 +4,10 @@
  * `createShiftLoop` is a standing Shift loop with every side-effecting
  * dependency injected (hub client, spawner, sleep/clock, output streams, dirs),
  * so the same core can run behind the local shift daemon. Per iteration it: pings
- * presence when due → cheap `wake(cursor)` pre-check → only when something
- * changed AND there is free capacity, sweeps `whats_next`, classifies/meters
- * orders, and DISPATCHES BY KIND → reaps work dirs → adopts the cursor → sleeps
- * the poll interval.
+ * presence when due → reconciles local children → dispatches any already-claimed
+ * orders waiting for local capacity → checks `wake(cursor)` → sweeps `whats_next`
+ * when the hub changed or a prior sweep was skipped/failed → classifies/meters
+ * new orders → reaps work dirs → adopts the cursor → sleeps the poll interval.
  *
  * DISPATCH SPLIT (D2 decision 3 — the D12 routing contract). BOTH kinds spawn a
  * detached child; there is exactly ONE way each kind runs, and no flag selects
@@ -25,10 +25,11 @@
  *
  * METERING (decision 3): free capacity `k = cap − liveInFlight`, where
  * liveInFlight counts every live child record, each one pid-probed (see
- * state.ts). When `k <= 0` the loop skips `whats_next` ENTIRELY (keeps wake +
- * presence). Metering is efficiency-only (engine race-safety + the hub's
- * pickup/lease TTLs are the correctness backstop), so this approximation is
- * acceptable.
+ * state.ts). When `k <= 0` the loop skips `whats_next` but remembers that the
+ * adopted wake still needs a sweep. Orders already returned by `whats_next`
+ * are already claimed, so over-cap orders enter an in-memory queue and dispatch
+ * as soon as local child capacity frees; waiting for another hub wake would
+ * strand those claims until pickup expiry.
  *
  * RESILIENCE: presence/wake/whats_next failures are logged and never kill the
  * loop. `stop()` flips a flag checked between awaits; the in-flight sweep
@@ -53,7 +54,7 @@
  */
 import { readDispatchBundle } from '../bundle/cache.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { WorkOrder } from '../hub/types.ts';
+import { HubError, type WorkOrder } from '../hub/types.ts';
 import type { FetchedStep } from '../bundle/types.ts';
 import { isCommandStep, resolveCommandRouting } from './routing.ts';
 import {
@@ -144,14 +145,16 @@ interface SweepResult {
   polled: Set<string>;
   /** Runs those calls reported an open order for. */
   openRuns: Set<string>;
+  /** False when inbox or any per-workflow `whats_next` call failed. */
+  complete: boolean;
 }
 
 export interface ShiftLoop {
   run(): Promise<number>;
   stop(): void;
   /**
-   * Run exactly one park iteration (presence → wake → sweep-if-changed →
-   * dispatch → reap) and return how many children it spawned. The shift daemon
+   * Run exactly one park iteration (presence → reconcile/queued dispatch → wake
+   * → required sweep → reap) and return how many children it spawned. The shift daemon
    * uses this seam for its loop core; the standing `run()` loop ignores the
    * count. Cursor/presence state is held in the closure and persists across calls.
    */
@@ -206,6 +209,16 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** The explicit hub refusal produced when an inbox row becomes terminal after
+ * the inbox snapshot but before its targeted serving call. This is a normal
+ * stale-candidate race, not a Shift failure worth retrying forever. */
+function isNonServableRace(e: unknown): boolean {
+  return e instanceof HubError
+    && e.status === 403
+    && e.code === 'forbidden'
+    && e.message.includes('non-running instance is not servable');
+}
+
 export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   let stopped = false;
   let cap = opts.cap;
@@ -220,9 +233,28 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   let cursor: number | undefined;
   let lastPresence = Number.NEGATIVE_INFINITY;
   let attendedAt: number | undefined;
+  /**
+   * Orders returned by `whats_next` are already claimed. If the hub returns more
+   * orders than this process can spawn, retain those claims locally until a child
+   * exits and capacity opens. Waiting for another wake cannot work: no hub event
+   * is required when a local child exits, and `tick` will not re-return a claim
+   * that is already in flight.
+   */
+  const pendingCandidates = new Map<string, Candidate>();
+  /** A changed wake whose sweep was skipped or failed must be retried after the
+   * cursor is adopted; otherwise the next unchanged wake hides that work. */
+  let sweepOwed = false;
+  /** Earliest server-approved time for the next polling iteration. */
+  let backoffUntil = Number.NEGATIVE_INFINITY;
   /** Bumped whenever a ping starts or is forced due, so a ping that completes
    *  after a force does not stamp the cadence over that force. */
   let presenceGeneration = 0;
+
+  function noteServerBackoff(error: unknown): void {
+    if (!(error instanceof HubError) || error.status !== 429) return;
+    const delay = error.retryAfterMs ?? opts.pollIntervalMs;
+    backoffUntil = Math.max(backoffUntil, opts.now() + delay);
+  }
 
   function emit(event: ShiftEvent): void {
     if (opts.onEvent === undefined) return;
@@ -249,6 +281,119 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     return result;
   }
 
+  function dispatchCandidate(c: Candidate): boolean {
+    if (c.kind === 'command') {
+      try {
+        const { pid } = opts.spawner({ workflow: c.workflow, run: c.order.run, step: c.order.step });
+        const rec: ChildRecord = {
+          workflow: c.workflow,
+          run: c.order.run,
+          pid,
+          spawnedAt: opts.now(),
+          kind: 'exec',
+        };
+        writeChildRecord(opts.stateDir, rec);
+        emit({
+          type: 'dispatched',
+          workflow: c.workflow,
+          run: c.order.run,
+          step: c.order.step,
+          kind: 'exec',
+          pid,
+        });
+        opts.out(`dispatched command ${c.workflow}/${c.order.run} (step '${c.order.step}', pid ${pid})`);
+        return true;
+      } catch (e) {
+        const message = errMsg(e);
+        emit({
+          type: 'failed',
+          workflow: c.workflow,
+          run: c.order.run,
+          step: c.order.step,
+          kind: 'exec',
+          message,
+        });
+        opts.err(`spawn for ${c.workflow}/${c.order.run} failed: ${message}`);
+        return false;
+      }
+    }
+
+    try {
+      const { pid } = opts.spawner({
+        workflow: c.workflow,
+        run: c.order.run,
+        step: c.order.step,
+        kind: 'agent-run',
+        ...(c.step?.harness !== undefined && c.step.harness !== '' ? { harness: c.step.harness } : {}),
+      });
+      const rec: ChildRecord = {
+        workflow: c.workflow,
+        run: c.order.run,
+        pid,
+        spawnedAt: opts.now(),
+        kind: 'agent-run',
+        ...(c.defName !== undefined ? { def: c.defName } : {}),
+        ...(c.defHash !== undefined ? { hash: c.defHash } : {}),
+        step: c.order.step,
+      };
+      writeChildRecord(opts.stateDir, rec);
+      emit({
+        type: 'dispatched',
+        workflow: c.workflow,
+        run: c.order.run,
+        step: c.order.step,
+        kind: 'agent-run',
+        pid,
+      });
+      opts.out(`dispatched agent-run ${c.workflow}/${c.order.run} (step '${c.order.step}', pid ${pid})`);
+      return true;
+    } catch (e) {
+      const message = errMsg(e);
+      emit({
+        type: 'failed',
+        workflow: c.workflow,
+        run: c.order.run,
+        step: c.order.step,
+        kind: 'agent-run',
+        message,
+      });
+      opts.err(`agent-run spawn for ${c.workflow}/${c.order.run} failed: ${message}`);
+      return false;
+    }
+  }
+
+  /** Dispatch already-claimed orders when local child capacity becomes free. */
+  function drainPending(live: ChildRecord[]): number {
+    let remaining = cap - live.length;
+    if (remaining <= 0 || pendingCandidates.size === 0) return 0;
+
+    const maxAgents = opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS;
+    let agentRoom = maxAgents - live.filter((r) => r.kind === 'agent-run').length;
+    const liveRuns = new Set(live.map((r) => r.run));
+    let dispatched = 0;
+
+    for (const [run, candidate] of pendingCandidates) {
+      if (remaining <= 0) break;
+      if (liveRuns.has(run)) {
+        pendingCandidates.delete(run);
+        continue;
+      }
+      if (candidate.kind === 'agent' && agentRoom <= 0) continue;
+
+      // Remove before spawning. A spawn failure falls back to the hub pickup
+      // window instead of retrying every poll with a broken local runtime.
+      pendingCandidates.delete(run);
+      if (!dispatchCandidate(candidate)) continue;
+
+      dispatched++;
+      remaining--;
+      liveRuns.add(run);
+      if (candidate.kind === 'agent') agentRoom--;
+    }
+
+    return dispatched;
+  }
+
   /**
    * One sweep. Collects dispatch candidates across the target instance(s)
    * within the free-capacity `budget`, then dispatches by kind: a command order
@@ -273,6 +418,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
      */
     const polled = new Set<string>();
     const openRuns = new Set<string>();
+    let complete = true;
     let remaining = budget;
     const liveRuns = new Set(live.map((r) => r.run));
 
@@ -299,8 +445,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
         const inbox = await opts.hub.whatsNext();
         instances = (inbox.instances ?? []).map((i) => i.workflow);
       } catch (e) {
+        noteServerBackoff(e);
         opts.err(`inbox whats_next failed: ${errMsg(e)}`);
-        return { dispatched, polled, openRuns };
+        return { dispatched, polled, openRuns, complete: false };
       }
     }
 
@@ -312,6 +459,17 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       try {
         res = await opts.hub.whatsNext({ workflow: wf, serve_crews: serveCrews });
       } catch (e) {
+        if (isNonServableRace(e)) {
+          // Treat the targeted call as a successful empty observation for the
+          // work-dir reaper and consume this wake. A later hub event may list
+          // new work, but this stale terminal row must not force every poll to
+          // repeat the same ForbiddenError.
+          polled.add(wf);
+          opts.out(`[${wf}] skipped stale terminal inbox candidate`);
+          continue;
+        }
+        noteServerBackoff(e);
+        complete = false;
         opts.err(`whats_next for ${wf} failed: ${errMsg(e)}`);
         continue;
       }
@@ -330,6 +488,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       }
       for (const order of orders) {
         if (claimed.has(order.run)) continue; // seen this sweep
+        if (pendingCandidates.has(order.run)) continue; // already claimed and queued locally
         const step = bundle?.def.steps.find((s) => s.name === order.step);
         const isCmd = step !== undefined && isCommandStep(step);
         const reoffer = liveRuns.has(order.run);
@@ -343,9 +502,22 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
             opts.out(`[${wf}/${order.run}] command step '${order.step}' routed to Shift — leaving for pickup window`);
             continue;
           }
-          if (remaining <= 0) continue; // out of free capacity for new work
-          remaining--;
-          candidates.push({ order, workflow: wf, step, defName, defHash: bundle?.def.hash, kind: 'command', reoffer });
+          const candidate: Candidate = {
+            order,
+            workflow: wf,
+            step,
+            defName,
+            defHash: bundle?.def.hash,
+            kind: 'command',
+            reoffer,
+          };
+          if (remaining <= 0) {
+            pendingCandidates.set(order.run, candidate);
+            opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
+          } else {
+            remaining--;
+            candidates.push(candidate);
+          }
           claimed.add(order.run);
           continue;
         }
@@ -365,103 +537,42 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
         // warning per sweep was already written above.
         if (bundle === null) continue;
 
-        // A re-offer replaces its (stale) record without consuming a new slot;
-        // a genuinely new agent order needs free capacity.
-        if (!reoffer) {
-          if (remaining <= 0) continue;
-          // The agent budget applies IN ADDITION to the global one. Skipped
-          // candidates are simply left alone — the hub re-offers them on a later
-          // sweep once a worker child exits.
-          if (agentRoom <= 0) {
-            opts.out(`[${wf}/${order.run}] at the agent-run cap (${maxAgents}) — leaving for a later sweep`);
-            continue;
+        const candidate: Candidate = {
+          order,
+          workflow: wf,
+          step,
+          defName,
+          defHash: bundle?.def.hash,
+          kind: 'agent',
+          reoffer,
+        };
+
+        // A re-offer replaces its stale record without consuming a new slot. A
+        // new order returned by `whats_next` is already claimed, so capacity-
+        // deferred work must stay in the local queue; the hub will not return
+        // the same in-flight claim on a later tick.
+        if (!reoffer && remaining <= 0) {
+          pendingCandidates.set(order.run, candidate);
+          opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
+        } else if (!reoffer && agentRoom <= 0) {
+          pendingCandidates.set(order.run, candidate);
+          opts.out(`[${wf}/${order.run}] at the agent-run cap (${maxAgents}) — queued for local dispatch`);
+        } else {
+          if (!reoffer) {
+            remaining--;
+            agentRoom--;
           }
-          remaining--;
-          agentRoom--;
+          candidates.push(candidate);
         }
-        candidates.push({ order, workflow: wf, step, defName, defHash: bundle?.def.hash, kind: 'agent', reoffer });
         claimed.add(order.run);
       }
     }
 
-    if (candidates.length === 0) return { dispatched, polled, openRuns };
-
-    // Dispatch by kind.
-    for (const c of candidates) {
-      if (c.kind === 'command') {
-        try {
-          const { pid } = opts.spawner({ workflow: c.workflow, run: c.order.run });
-          const rec: ChildRecord = { workflow: c.workflow, run: c.order.run, pid, spawnedAt: opts.now(), kind: 'exec' };
-          writeChildRecord(opts.stateDir, rec);
-          dispatched++;
-          emit({
-            type: 'dispatched',
-            workflow: c.workflow,
-            run: c.order.run,
-            step: c.order.step,
-            kind: 'exec',
-            pid,
-          });
-          opts.out(`dispatched command ${c.workflow}/${c.order.run} (step '${c.order.step}', pid ${pid})`);
-        } catch (e) {
-          const message = errMsg(e);
-          emit({
-            type: 'failed',
-            workflow: c.workflow,
-            run: c.order.run,
-            step: c.order.step,
-            kind: 'exec',
-            message,
-          });
-          opts.err(`spawn for ${c.workflow}/${c.order.run} failed: ${message}`);
-        }
-        continue;
-      }
-      // Agent: spawn a detached `agent-run` child that hosts the step agent.
-      // This is the ONLY agent path — no flag, no alternative.
-      try {
-        const { pid } = opts.spawner({
-          workflow: c.workflow,
-          run: c.order.run,
-          kind: 'agent-run',
-          ...(c.step?.harness !== undefined && c.step.harness !== '' ? { harness: c.step.harness } : {}),
-        });
-        const rec: ChildRecord = {
-          workflow: c.workflow,
-          run: c.order.run,
-          pid,
-          spawnedAt: opts.now(),
-          kind: 'agent-run',
-          ...(c.defName !== undefined ? { def: c.defName } : {}),
-          ...(c.defHash !== undefined ? { hash: c.defHash } : {}),
-          step: c.order.step,
-        };
-        writeChildRecord(opts.stateDir, rec);
-        dispatched++;
-        emit({
-          type: 'dispatched',
-          workflow: c.workflow,
-          run: c.order.run,
-          step: c.order.step,
-          kind: 'agent-run',
-          pid,
-        });
-        opts.out(`dispatched agent-run ${c.workflow}/${c.order.run} (step '${c.order.step}', pid ${pid})`);
-      } catch (e) {
-        const message = errMsg(e);
-        emit({
-          type: 'failed',
-          workflow: c.workflow,
-          run: c.order.run,
-          step: c.order.step,
-          kind: 'agent-run',
-          message,
-        });
-        opts.err(`agent-run spawn for ${c.workflow}/${c.order.run} failed: ${message}`);
-      }
+    for (const candidate of candidates) {
+      if (dispatchCandidate(candidate)) dispatched++;
     }
 
-    return { dispatched, polled, openRuns };
+    return { dispatched, polled, openRuns, complete };
   }
 
   /**
@@ -532,30 +643,43 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
         });
         if (generation === presenceGeneration) lastPresence = opts.now();
       } catch (e) {
+        noteServerBackoff(e);
         opts.err(`presence ping failed: ${errMsg(e)} (continuing)`);
       }
     }
 
-    // Reconcile in-flight (startup recovery + per-sweep reap).
-    const { live } = reconcile();
+    // Reconcile in-flight first. A child exit is local state, not a hub event,
+    // so use the freed slot to dispatch claims retained from an earlier sweep
+    // before consulting the wake cursor.
+    let live = reconcile().live;
+    let dispatched = drainPending(live);
+    if (dispatched > 0) live = reconcile().live;
     const k = cap - live.length;
 
-    // Cheap wake pre-check. On failure, stay put this tick (don't sweep).
+    // Cheap wake pre-check. A failed call also suppresses a forced retry for this
+    // tick: a rate-limited wake should not immediately be followed by whats_next.
     let changed = false;
+    let wakeSucceeded = false;
     try {
       const w = await opts.hub.wake(cursor);
       changed = w.changed;
       cursor = w.cursor;
+      wakeSucceeded = true;
     } catch (e) {
+      noteServerBackoff(e);
       opts.err(`wake failed: ${errMsg(e)} (retrying next tick)`);
     }
 
-    // Sweep only when something changed AND there is free capacity.
+    // A changed cursor is not sufficient by itself: if the prior changed tick
+    // had no local capacity, or its sweep failed, the adopted cursor will be
+    // unchanged next time. `sweepOwed` preserves that unconsumed work signal.
     let swept: SweepResult | undefined;
-    if (changed && k > 0) {
+    if (wakeSucceeded && (changed || sweepOwed) && k > 0) {
       swept = await sweep(k, live);
-    } else if (changed) {
-      opts.out(`at capacity (${live.length}/${cap} in flight) — skipping whats_next this tick`);
+      sweepOwed = !swept.complete;
+    } else if (changed && k <= 0) {
+      sweepOwed = true;
+      opts.out(`at capacity (${live.length}/${cap} in flight) — deferring whats_next until capacity is free`);
     }
 
     const liveAfter = reconcile().live;
@@ -571,7 +695,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // tick reaps whatever is still reapable.
     reapWorkDirs(swept, liveAfter);
 
-    return swept?.dispatched ?? 0;
+    dispatched += swept?.dispatched ?? 0;
+    return dispatched;
   }
 
   async function run(): Promise<number> {
@@ -586,7 +711,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       if (stopped) return 0;
       await iteration();
       if (stopped) return 0;
-      await opts.sleep(opts.pollIntervalMs);
+      const delay = Math.max(opts.pollIntervalMs, backoffUntil - opts.now());
+      await opts.sleep(delay);
       // Re-check after the park so a stop during sleep makes no further hub call.
       if (stopped) return 0;
     }
@@ -620,6 +746,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     },
     getAttendedAt: () => attendedAt,
     noteRunEnded: (run: string) => {
+      pendingCandidates.delete(run);
       removeChildRecord(opts.stateDir, run);
     },
   };

@@ -352,6 +352,12 @@ export function startStdioRpc(opts: StdioRpcOptions): StdioRpcClient {
 
   child.on('error', (err: Error) => {
     opts.onStderr(`[spawn error] ${err.message}`);
+    // Node 22 emits `error` followed by `close`, but no `exit`, when the
+    // executable does not exist. Mark that pre-spawn failure terminal so
+    // `dispose()` does not wait on an `exit` event that can never arrive. Do
+    // not invoke `onExit`: the caller that owns the failed startup still has
+    // the original error and can report its safe, specific message once.
+    if (child.pid === undefined) exited = true;
     core.rejectAll(err);
   });
 

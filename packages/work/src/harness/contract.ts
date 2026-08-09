@@ -117,7 +117,9 @@ export interface StartArgs {
   effort?: string;
   /**
    * The stdio mount for owenloop's own work-holder MCP surface (bare
-   * `get_order`/`submit`).
+   * `get_order`/`submit`). Its command is the current Node executable and its
+   * first argv item is this installation's resolved `bin/owenloop.mjs`, so PATH
+   * cannot select a different Owenloop installation.
    *
    * BUILT BY THE WORKER, NOT BY AN ADAPTER: `src/agent/brief.ts` constructs the
    * born-bound `hold --order <workflow>/<run> --origin <url> --as <account>
