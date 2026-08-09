@@ -9,9 +9,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
+import { packBundle } from '../src/bundle/index.ts';
+import { PAYLOAD_TYPE_PUBLICATION } from '../src/crypto/dsse.ts';
 import { hubBindingPath, readHubBinding, writeHubBinding } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
 import { kcHuman, kcKey, makeFakeHub, makeIo, OAUTH_METADATA, routedFetch, stallingFetch } from './hubkit.ts';
@@ -62,6 +64,130 @@ function bind(t: HubIo, cred: Credential = OAUTH_CRED): void {
   t.store.set(kcHuman(ORIGIN), JSON.stringify(cred));
   writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: ORIGIN });
 }
+
+function writePushBundle(cwd: string, workflowName = 'bundled'): { path: string; digest: string; yaml: string } {
+  const source = join(cwd, 'bundle-source');
+  const workflows = join(source, 'workflows');
+  mkdirSync(workflows, { recursive: true });
+  const yaml = validDef(workflowName);
+  writeFileSync(join(workflows, `${workflowName}.yaml`), yaml);
+  writeFileSync(
+    join(source, 'bundle.yaml'),
+    [
+      'formatVersion: 2',
+      'package:',
+      '  name: push-test-bundle',
+      '  version: 1.0.0',
+      'workflows:',
+      `  ${workflowName}: workflows/${workflowName}.yaml`,
+      `default: ${workflowName}`,
+      'platforms: []',
+      'integrity:',
+      '  algorithm: sha256',
+      '  files: {}',
+      'capabilities: {}',
+      'lock: {}',
+      '',
+    ].join('\n'),
+  );
+  const packed = packBundle(source);
+  const path = join(cwd, 'push-test.wnlp');
+  writeFileSync(path, packed.bytes);
+  const record = {
+    digest: packed.digest,
+    name: packed.manifest.package.name,
+    version: packed.manifest.package.version,
+    publisherKeyId: 'SHA256:dGVzdA',
+    timestamp: 1,
+  };
+  writeFileSync(
+    `${path}.dsse`,
+    JSON.stringify({
+      payloadType: PAYLOAD_TYPE_PUBLICATION,
+      payload: Buffer.from(JSON.stringify(record)).toString('base64'),
+      signatures: [{ keyid: 'SHA256:dGVzdA', sig: Buffer.from('signature').toString('base64') }],
+    }),
+  );
+  return { path, digest: packed.digest, yaml };
+}
+
+test('push --bundle uploads exact signed bundle identity and creates a bundle-backed workflow version', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  // Keep all fixture state under the actual CliIO cwd.
+  const actual = writePushBundle(t.cwd);
+  bind(t);
+  let createBody: Record<string, unknown> | undefined;
+  const create = hub.routes['POST /api/create_workflow']!;
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${actual.digest}`] = () => ({ status: 200, json: { ok: true } });
+  hub.routes['POST /api/create_workflow'] = (req) => {
+    createBody = JSON.parse(req.body ?? '{}') as Record<string, unknown>;
+    return create(req);
+  };
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+
+  const code = await mainAsync(['push', '--bundle', actual.path], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  const result = JSON.parse(t.out.join('\n')) as Record<string, unknown>;
+  assert.equal(result.bundleDigest, actual.digest);
+  assert.equal(result.publication, 'signed');
+  assert.equal(createBody?.bundle_digest, actual.digest);
+  assert.equal(createBody?.yaml, actual.yaml, 'the archive workflow, not cwd/workflows, is authoritative');
+  assert.deepEqual(
+    calls.filter((call) => call.method === 'POST').map((call) => call.pathname),
+    ['/api/bundles', `/api/publications/${actual.digest}`, '/api/create_workflow'],
+  );
+});
+
+test('push --bundle re-sends create_workflow even when the remote YAML hash is unchanged', async () => {
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd);
+  const hub = makeFakeHub([{ name: 'bundled', yaml: bundle.yaml }]);
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', '--bundle', bundle.path], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(calls.filter((call) => call.pathname === '/api/create_workflow').length, 1);
+  assert.deepEqual((JSON.parse(t.out.join('\n')) as { noop: string[] }).noop, ['bundled']);
+});
+
+test('push --bundle --dry-run validates identity but sends no bundle, sidecar, or workflow writes', async () => {
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd);
+  const hub = makeFakeHub();
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', '--bundle', bundle.path, '--dry-run'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(calls.map((call) => `${call.method} ${call.pathname}`), ['GET /api/workflows']);
+  const result = JSON.parse(t.out.join('\n')) as Record<string, unknown>;
+  assert.equal(result.dryRun, true);
+  assert.equal(result.bundleDigest, bundle.digest);
+});
+
+test('push --bundle refuses a missing publication sidecar before any network call', async () => {
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd);
+  // Repoint at the same valid archive under a name with no adjacent sidecar.
+  const bare = join(t.cwd, 'bare.wnlp');
+  writeFileSync(bare, readFileSync(bundle.path));
+  const { fetch, calls } = routedFetch({});
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', '--bundle', bare], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /exactly one publication sidecar/);
+  assert.equal(calls.length, 0);
+});
 
 test('push: first push sends every def, all land as new on the fake hub, exits 0', async () => {
   const hub = makeFakeHub();

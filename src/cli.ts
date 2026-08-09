@@ -38,7 +38,7 @@ import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'no
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline/promises';
-import { hostname } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
@@ -51,6 +51,7 @@ import {
   DefError,
   finalizeDefs,
   lintDef,
+  loadDefFile,
   loadDefs,
   loadDefsRaw,
   loadDefsUnfinalized,
@@ -85,6 +86,8 @@ import {
   dsseSignOrigin,
   dsseSignPublication,
   dsseSignRevocation,
+  PAYLOAD_TYPE_ORIGIN,
+  PAYLOAD_TYPE_PUBLICATION,
 } from './crypto/dsse.ts';
 import { assertEd25519PubText, createSshSigner, SshSignerError } from './crypto/ssh.ts';
 import { publicKeyDescriptor } from './crypto/keys.ts';
@@ -1349,7 +1352,8 @@ Commands:
   login [--hub <url>] [--with-token] [--as <slot>]   authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
   logout [--hub <url>] [--as <slot>]     delete the stored credential for a hub in one slot
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
-  push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
+  push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--as <slot>]
+    publish local workflow defs, or exact bundle-backed defs, to the bound hub
                                          --as names the credential slot: human (default), agent, or agent:<account>
   start <defName> [--provide name=json ...] [--crew <name>] [--title <text>] [--hub <url>]
                                          start a published workflow on the bound hub (human credential)
@@ -1444,7 +1448,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['connect', cmdOpts('hub', 'as')],
   ['publish', cmdOpts('unsigned', 'output', 'source')],
   ['trust', cmdOpts('force', 'key', 'principal', 'pools', 'labels', 'namespaces', 'delegate', 'signing-key', 'output', 'reason', 'effective-from')],
-  ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
+  ['push', cmdOpts('dry-run', 'force', 'hub', 'as', 'bundle')],
   ['start', cmdOpts('hub', 'crew', 'title', 'provide')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
@@ -3654,9 +3658,164 @@ async function dispatchConnect(io: CliIO, args: Args): Promise<number> {
   return 0;
 }
 
+interface PushBundleContext {
+  bytes: Buffer;
+  digest: string;
+  manifest: ReturnType<typeof inspectBundle>['manifest'];
+  publication: Buffer;
+  publicationState: 'signed' | 'unsigned';
+  origin?: Buffer;
+  defsDir: string;
+  cleanupRoot: string;
+}
+
+/** Read a publication/origin sidecar without following a symlink. */
+function readPushSidecar(path: string, label: string): { bytes: Buffer; value: unknown } {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (stat === undefined) throw new CliError(`owenloop push --bundle: missing ${label} '${path}'`);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new CliError(`owenloop push --bundle: ${label} '${path}' must be a regular file, not a symlink`);
+  }
+  if (stat.size > 32 * 1024 * 1024) {
+    throw new CliError(`owenloop push --bundle: ${label} '${path}' exceeds the hub 32MB request cap`);
+  }
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(path);
+  } catch (e) {
+    throw new CliError(`owenloop push --bundle: cannot read ${label} '${path}': ${(e as Error).message}`);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(bytes.toString('utf8')) as unknown;
+  } catch {
+    throw new CliError(`owenloop push --bundle: ${label} '${path}' is not valid JSON`);
+  }
+  return { bytes, value };
+}
+
 /**
- * `owenloop push [<defName>...] [--force] [--dry-run]` — publish local workflow
- * defs to the bound hub, diffed against the hub's own def `hash`
+ * Validate the relay-level DSSE shape and its digest/package binding locally.
+ * Signature authorization remains the execution host's responsibility; this
+ * mirrors the hub's transport boundary and prevents a mismatched sidecar from
+ * landing after the content-addressed bundle upload.
+ */
+function assertPushDsse(
+  value: unknown,
+  expected: { digest: string; name: string; version: string },
+  payloadType: string,
+  label: string,
+): void {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new CliError(`owenloop push --bundle: ${label} must be a DSSE JSON object`);
+  }
+  const envelope = value as Record<string, unknown>;
+  if (envelope.payloadType !== payloadType || typeof envelope.payload !== 'string') {
+    throw new CliError(`owenloop push --bundle: ${label} has the wrong payload type or no string payload`);
+  }
+  if (!Array.isArray(envelope.signatures) || envelope.signatures.length === 0) {
+    throw new CliError(`owenloop push --bundle: ${label} has no signatures`);
+  }
+  for (const signature of envelope.signatures) {
+    if (
+      typeof signature !== 'object' ||
+      signature === null ||
+      Array.isArray(signature) ||
+      typeof (signature as Record<string, unknown>).keyid !== 'string' ||
+      typeof (signature as Record<string, unknown>).sig !== 'string'
+    ) {
+      throw new CliError(`owenloop push --bundle: ${label} contains a malformed signature`);
+    }
+  }
+  let record: unknown;
+  try {
+    record = JSON.parse(decodeBase64Strict(envelope.payload, { allowEmpty: false }).toString('utf8')) as unknown;
+  } catch (e) {
+    throw new CliError(`owenloop push --bundle: ${label} payload is invalid: ${(e as Error).message}`);
+  }
+  if (typeof record !== 'object' || record === null || Array.isArray(record)) {
+    throw new CliError(`owenloop push --bundle: ${label} payload is not a JSON object`);
+  }
+  const bound = record as Record<string, unknown>;
+  if (bound.digest !== expected.digest || bound.name !== expected.name || bound.version !== expected.version) {
+    throw new CliError(`owenloop push --bundle: ${label} does not bind the selected bundle digest and package identity`);
+  }
+}
+
+/**
+ * Inspect one exact archive, require exactly one adjacent publication sidecar,
+ * and materialize its manifest-declared workflow files into a private temp
+ * directory. The archive, not the caller's checkout, is the source of truth.
+ */
+function preparePushBundle(io: CliIO, bundleArg: string): PushBundleContext {
+  if (bundleArg === '' || bundleArg === 'true') {
+    throw new CliError('owenloop push: --bundle requires a .wnlp path value');
+  }
+  const bundlePath = resolve(io.cwd, bundleArg);
+  const bytes = readBundleCommandFile(io, bundleArg);
+  const inspected = runBundle(() => inspectBundle(bytes));
+  const signedPath = `${bundlePath}.dsse`;
+  const unsignedPath = `${bundlePath}.unsigned`;
+  const originPath = `${bundlePath}.origin.dsse`;
+  const hasSigned = lstatSync(signedPath, { throwIfNoEntry: false }) !== undefined;
+  const hasUnsigned = lstatSync(unsignedPath, { throwIfNoEntry: false }) !== undefined;
+  if (hasSigned === hasUnsigned) {
+    throw new CliError(
+      `owenloop push --bundle: expected exactly one publication sidecar: '${signedPath}' or '${unsignedPath}'`,
+    );
+  }
+
+  const expected = {
+    digest: inspected.digest,
+    name: inspected.manifest.package.name,
+    version: inspected.manifest.package.version,
+  };
+  let publication: Buffer;
+  let publicationState: 'signed' | 'unsigned';
+  if (hasSigned) {
+    const sidecar = readPushSidecar(signedPath, 'signed publication sidecar');
+    assertPushDsse(sidecar.value, expected, PAYLOAD_TYPE_PUBLICATION, 'signed publication sidecar');
+    publication = sidecar.bytes;
+    publicationState = 'signed';
+  } else {
+    const sidecar = readPushSidecar(unsignedPath, 'unsigned publication marker');
+    const marker = sidecar.value;
+    if (
+      typeof marker !== 'object' ||
+      marker === null ||
+      Array.isArray(marker) ||
+      (marker as Record<string, unknown>).formatVersion !== 1 ||
+      (marker as Record<string, unknown>).digest !== inspected.digest ||
+      (marker as Record<string, unknown>).signed !== false
+    ) {
+      throw new CliError('owenloop push --bundle: unsigned publication marker does not bind the selected bundle digest');
+    }
+    publication = sidecar.bytes;
+    publicationState = 'unsigned';
+  }
+
+  let origin: Buffer | undefined;
+  if (lstatSync(originPath, { throwIfNoEntry: false }) !== undefined) {
+    const sidecar = readPushSidecar(originPath, 'origin sidecar');
+    assertPushDsse(sidecar.value, expected, PAYLOAD_TYPE_ORIGIN, 'origin sidecar');
+    origin = sidecar.bytes;
+  }
+
+  const cleanupRoot = mkdtempSync(join(tmpdir(), 'owenloop-push-'));
+  const defsDir = join(cleanupRoot, 'bundle');
+  try {
+    runBundle(() => unpackBundle(bytes, defsDir));
+  } catch (e) {
+    rmSync(cleanupRoot, { recursive: true, force: true });
+    throw e;
+  }
+  return { bytes, digest: inspected.digest, manifest: inspected.manifest, publication, publicationState, origin, defsDir, cleanupRoot };
+}
+
+/**
+ * `owenloop push [<defName>...] [--bundle <bundle.wnlp>] [--force]
+ * [--dry-run]` — publish local workflow defs to the bound hub, diffed against
+ * the hub's own def `hash`
  * (`GET /api/workflows` — see `computeServerDiff`), never a client-side
  * ledger. Mirrors `add`'s all-or-nothing client-side validation gate before
  * any network write; server-side failures mid-batch record what landed and
@@ -3666,7 +3825,11 @@ async function dispatchConnect(io: CliIO, args: Args): Promise<number> {
  * reports back as a no-op.
  */
 async function dispatchPush(io: CliIO, args: Args): Promise<number> {
-  const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
+  const configuredDefsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
+  const bundleArg = last(args, 'bundle');
+  if (bundleArg !== undefined && args.options.has('defs')) {
+    throw new CliError('owenloop push: --bundle cannot be combined with --defs; the archive is the definition source');
+  }
   const dryRun = flag(args, 'dry-run');
   const force = flag(args, 'force');
   const slot = resolveSlot(args);
@@ -3700,10 +3863,33 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   let cred = readCredential(io, origin, slot);
   if (!cred) throw new CliError(emptySlotMessage(origin, slot));
 
-  // Load defs (same machinery as lint/add).
-  if (!existsSync(defsDir)) throw new CliError(`defs directory not found: ${defsDir}`);
-  const failures: DefLoadFailure[] = [];
-  const allDefs = loadDefsRaw(defsDir, failures);
+  let bundle: PushBundleContext | undefined;
+  try {
+    bundle = bundleArg === undefined ? undefined : preparePushBundle(io, bundleArg);
+    const defsDir = bundle?.defsDir ?? configuredDefsDir;
+
+    // Load defs (same machinery as lint/add). Bundle mode reads only the
+    // manifest-declared workflow paths from the materialized exact archive;
+    // bundle.yaml and unrelated YAML assets are never mistaken for defs.
+    if (!existsSync(defsDir)) throw new CliError(`defs directory not found: ${defsDir}`);
+    const failures: DefLoadFailure[] = [];
+    let allDefs: Map<string, WorkflowDef>;
+    if (bundle !== undefined) {
+      allDefs = new Map<string, WorkflowDef>();
+      for (const [name, workflowPath] of Object.entries(bundle.manifest.workflows)) {
+	try {
+	  const def = loadDefFile(join(defsDir, workflowPath));
+	  if (def.name !== name) {
+	    throw new CliError(`manifest workflow '${name}' loads as '${def.name}'`);
+	  }
+	  allDefs.set(name, def);
+	} catch (e) {
+	  throw new CliError(`owenloop push --bundle: cannot load workflow '${name}': ${(e as Error).message}`);
+	}
+      }
+    } else {
+      allDefs = loadDefsRaw(defsDir, failures);
+    }
 
   // Narrow to positional names, if any (error on an unknown name).
   const requested = args.positionals.slice(1);
@@ -3801,7 +3987,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     throw new CliError((e as Error).message);
   }
 
-  const { toPush, unchanged } = computeServerDiff(candidates, serverMap, force);
+  // A bundle-backed push must always send create_workflow: GET /api/workflows
+  // exposes the YAML hash but intentionally not the latest bundle identity.
+  // The server's (yaml,bundleDigest) idempotency decides whether this is a new
+  // version or an exact no-op.
+  const { toPush, unchanged } = computeServerDiff(candidates, serverMap, force || bundle !== undefined);
 
   // Diff-style human lines go to stderr so stdout stays machine-parseable JSON.
   for (const c of unchanged) io.err(`= ${c.name} (unchanged)`);
@@ -3814,6 +4004,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       ok: true,
       dryRun: true,
       hub: origin,
+      ...(bundle === undefined ? {} : { bundleDigest: bundle.digest, publication: bundle.publicationState }),
       new: toPush.filter((c) => c.status === 'new').map((c) => c.name),
       changed: toPush.filter((c) => c.status === 'changed').map((c) => c.name),
       unchanged: unchanged.map((c) => c.name),
@@ -3825,6 +4016,10 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   // Refresh an expiring oauth token once up front (per-request 401 refresh below covers mid-batch expiry).
   cred = await ensureFreshOAuth(io, origin, slot, cred);
 
+  if (bundle !== undefined) {
+    cred = await uploadPushBundle(io, origin, slot, cred, bundle);
+  }
+
   const pushedNames: string[] = [];
   const noopNames: string[] = [];
   const failed: { name: string; error: string }[] = [];
@@ -3834,10 +4029,10 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     const c = toPush[i]!;
     const label = c.status === 'new' ? '+' : '~';
     try {
-      let res = await createWorkflowRequest(io, origin, cred, c.yaml);
+      let res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
       if (res.status === 401 && cred.kind === 'oauth') {
         cred = await refreshOAuth(io, origin, slot, cred as Extract<Credential, { kind: 'oauth' }>);
-        res = await createWorkflowRequest(io, origin, cred, c.yaml);
+	res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
       }
       if (res.status === 401) {
         if (cred.kind === 'agent') {
@@ -3894,6 +4089,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   print(io, {
     ok: failed.length === 0,
     hub: origin,
+    ...(bundle === undefined ? {} : { bundleDigest: bundle.digest, publication: bundle.publicationState }),
     pushed: pushedNames,
     noop: noopNames,
     unchanged: unchanged.map((c) => c.name),
@@ -3901,6 +4097,9 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     failed,
   });
   return failed.length === 0 ? 0 : 1;
+  } finally {
+    if (bundle !== undefined) rmSync(bundle.cleanupRoot, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -4027,11 +4226,94 @@ async function dispatchMcp(io: CliIO, args: Args): Promise<number> {
   return runMcpCommand(io, { hubFlag: last(args, 'hub') });
 }
 
+/** POST opaque bundle/sidecar bytes with the same one-refresh auth contract as JSON hub calls. */
+async function authedPushBytes(
+  io: CliIO,
+  origin: string,
+  slot: CredentialSlotSelector,
+  cred: Credential,
+  path: string,
+  bytes: Uint8Array,
+  headers: Record<string, string>,
+): Promise<{ res: Response; cred: Credential }> {
+  let current = await ensureFreshOAuth(io, origin, slot, cred);
+  const send = (bearer: Credential): Promise<Response> =>
+    hubFetch(io, resolveEndpoint(origin, path), {
+      method: 'POST',
+      headers: { Authorization: authHeader(bearer), Accept: 'application/json', ...headers },
+      body: Buffer.from(bytes),
+    });
+  let res = await send(current);
+  if (res.status === 401 && current.kind === 'oauth') {
+    current = await refreshOAuth(io, origin, slot, current as Extract<Credential, { kind: 'oauth' }>);
+    res = await send(current);
+  }
+  return { res, cred: current };
+}
+
+async function assertPushArtifactOk(res: Response, cred: Credential, origin: string, label: string): Promise<void> {
+  if (res.status === 401) assertAuthOk(res, cred, origin);
+  if (res.status === 413) throw new CliError(`${label} exceeds the hub request cap`);
+  if (res.status === 429) {
+    const retryAfter = res.headers.get('retry-after');
+    throw new CliError(`rate limited while uploading ${label}${retryAfter ? ` (retry after ${retryAfter})` : ''}`);
+  }
+  if (!res.ok) {
+    const message = await hubRequestMessage(res);
+    throw new CliError(message === undefined ? `hub returned HTTP ${res.status} while uploading ${label}` : `${label}: ${message}`);
+  }
+}
+
+/** Upload the exact archive and adjacent publication/origin records before any definition version is created. */
+async function uploadPushBundle(
+  io: CliIO,
+  origin: string,
+  slot: CredentialSlotSelector,
+  initial: Credential,
+  bundle: PushBundleContext,
+): Promise<Credential> {
+  let cred = initial;
+  let sent = await authedPushBytes(io, origin, slot, cred, '/api/bundles', bundle.bytes, {
+    'Content-Type': 'application/gzip',
+    'X-Bundle-Digest': bundle.digest,
+  });
+  cred = sent.cred;
+  await assertPushArtifactOk(sent.res, cred, origin, 'bundle');
+
+  sent = await authedPushBytes(
+    io,
+    origin,
+    slot,
+    cred,
+    `/api/publications/${bundle.digest}?state=${bundle.publicationState}`,
+    bundle.publication,
+    { 'Content-Type': 'application/json' },
+  );
+  cred = sent.cred;
+  await assertPushArtifactOk(sent.res, cred, origin, 'publication sidecar');
+
+  if (bundle.origin !== undefined) {
+    sent = await authedPushBytes(
+      io,
+      origin,
+      slot,
+      cred,
+      `/api/origins/${bundle.digest}`,
+      bundle.origin,
+      { 'Content-Type': 'application/json' },
+    );
+    cred = sent.cred;
+    await assertPushArtifactOk(sent.res, cred, origin, 'origin sidecar');
+  }
+  return cred;
+}
+
 function createWorkflowRequest(
   io: CliIO,
   origin: string,
   cred: Credential,
   yaml: string,
+  bundleDigest?: string,
 ): Promise<Response> {
   return hubFetch(io, resolveEndpoint(origin, '/api/create_workflow'), {
     method: 'POST',
@@ -4040,7 +4322,7 @@ function createWorkflowRequest(
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
-    body: JSON.stringify({ yaml }),
+    body: JSON.stringify({ yaml, ...(bundleDigest === undefined ? {} : { bundle_digest: bundleDigest }) }),
   });
 }
 

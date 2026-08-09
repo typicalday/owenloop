@@ -1239,6 +1239,20 @@ any definite defect aborts the whole push. stdout is machine-parseable JSON;
 the human-readable diff (`+ new`, `~ changed`, `= unchanged`, `! failed`) goes
 to stderr.
 
+`owenloop push --bundle <bundle.wnlp> [<defName>...]` is the executable,
+bundle-backed form. The exact archive is inspected and becomes the definition
+source; checkout files are ignored. Push requires exactly one adjacent
+publication sidecar produced by `owenloop publish` (`.dsse` or `.unsigned`),
+accepts an optional `.origin.dsse`, uploads those content-addressed objects,
+then calls `create_workflow` with the archive's canonical digest. This is what
+makes the hub stamp reference orders with a digest that execution hosts can
+resolve from their installed bundle store. Bundle mode conservatively sends
+each selected `create_workflow` request even when its YAML hash is unchanged,
+because the workflow listing does not expose the latest bundle identity; the
+hub's `(yaml, bundle digest)` idempotency decides whether to version-forward or
+return `noop`. `--dry-run` validates the archive and sidecars and performs only
+the read-only server diff—no bundle, sidecar, or definition is uploaded.
+
 **Idempotency is server-side truth, not a client ledger.** `push` fetches the
 hub's own view of every def (`GET /api/workflows`, which reports each def's
 `hash`) and diffs local content against it directly — there is no

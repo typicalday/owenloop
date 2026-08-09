@@ -471,8 +471,10 @@ Publishing your defs to a hosted hub instead? `owenloop login` authenticates
 the CLI (loopback OAuth, or a pasted token via `--with-token`; the credential
 goes into the macOS Keychain or a `0600` file, never the repo, and is verified
 against the hub before it's ever stored), `owenloop connect` binds the project
-to a hub, and `owenloop push` publishes your defs — idempotent against the
-hub's own def hashes, so an unchanged re-push is a no-op. `owenloop agent new
+to a hub, and `owenloop push` publishes your defs. Use `owenloop push --bundle
+<bundle.wnlp>` after `owenloop publish` when execution must be pinned to the
+exact signed bundle digest; plain YAML pushes remain idempotent against the
+hub's own def hashes. `owenloop agent new
 <name>` mints a Scoped Identity on the hub and stores its token in slot
 `agent:<name>` without ever printing it. See the
 [Hub](docs/cli.md#hub-login--connect--push--logout) section in `docs/cli.md`.
