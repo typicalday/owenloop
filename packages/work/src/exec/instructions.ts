@@ -330,8 +330,25 @@ export function createStoreInstructionResolver(
   };
 
   const hasConsumedData = (order: OrderPacket): boolean =>
-    Object.keys(order.consumes).length > 0
-    || order.owes.some((owed) => owed.reasons.length > 0 || owed.proof !== undefined);
+    Object.keys(order.consumes).length > 0;
+
+  /**
+   * A command child receives neither `owes[].reasons` nor `owes[].proof`:
+   * those fields stay in the exec holder and are used only to infer the next
+   * produced version when signing the receipt. Keep the launch gate scoped to
+   * the dynamic values that can actually influence the child. Agent holders
+   * still verify the complete order because their rendered prompt includes the
+   * feedback thread.
+   */
+  const commandConsumedOrder = (order: OrderPacket): OrderPacket => ({
+    ...order,
+    owes: order.owes.map((owed) => ({
+      path: owed.path,
+      judgmentRejects: owed.judgmentRejects,
+      schemaRejects: owed.schemaRejects,
+      reasons: [],
+    })),
+  });
 
   const gateConsumed = async (order: OrderPacket, hardRule: boolean): Promise<InstructionRefusal | undefined> => {
     if (!hasConsumedData(order)) return undefined;
@@ -343,7 +360,7 @@ export function createStoreInstructionResolver(
       );
     }
     try {
-      const checked = await options.consumedVerifier(order, { hardRule });
+      const checked = await options.consumedVerifier(commandConsumedOrder(order), { hardRule });
       if (!checked.ok) return refusal('unverified-consumed', order, checked.reason);
       for (const warning of checked.warnings) warn(warning);
       return undefined;

@@ -231,3 +231,36 @@ test('command e2e: malformed proof refuses even when artifact policy is off', as
     third.server.close();
   }
 });
+
+test('command e2e: unsigned feedback does not block a command with signed consumed artifacts', async () => {
+  const fixtureData = await fixture();
+  const marker = COMMAND_MARKER;
+  rmSync(marker, { force: true });
+  const packet = order(
+    fixtureData.defDigest,
+    'dynamic-value',
+    JSON.stringify({ input: submissionProof('dynamic-value') }),
+    'run-feedback-without-proof',
+  );
+  assert.ok(packet.order !== null);
+  packet.order.owes[0]!.reasons = [{
+    at: 20,
+    action: 'reject',
+    kind: 'structural',
+    by: 'engine',
+    text: 'auto-invalidated: input changed',
+    fromVersion: 1,
+  }];
+
+  const hub = await startHub(packet);
+  try {
+    const loop = makeLoop(hub.origin, resolverFor(fixtureData), 'run-feedback-without-proof');
+    assert.equal(await loop.run(), 'submitted');
+    assert.equal(pathExists(marker), true);
+    assert.equal(hub.reqs.filter((request) => request.verb === 'submit').length, 1);
+    assert.equal(hub.reqs.filter((request) => request.verb === 'release').length, 0);
+  } finally {
+    hub.server.close();
+    rmSync(marker, { force: true });
+  }
+});
