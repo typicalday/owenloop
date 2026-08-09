@@ -193,12 +193,12 @@ export function createStoreInstructionResolver(
       if (primed === 'unknown-digest') {
         return refusal('unknown-digest', order, 'no verified local workflow bundle matches the order digest');
       }
-      const definition = source.getVerifiedDefinition(digest);
-      if (definition === undefined) return refusal('integrity', order, 'the verified workflow definition is unavailable after priming');
       const step = source.getVerifiedStep(digest, order.step);
       if (step === undefined) {
         return refusal('unknown-step', order, 'the verified workflow definition has no matching step');
       }
+      const definition = source.getVerifiedDefinition(digest, order.step);
+      if (definition === undefined) return refusal('integrity', order, 'the verified workflow definition is unavailable after priming');
       const object = source.getVerifiedObject(digest);
       if (object === undefined) return refusal('integrity', order, 'the verified workflow object metadata is unavailable after priming');
       return { ok: true, definition, step, bundleDigest: object.bundleDigest, objectPath: object.objectPath };

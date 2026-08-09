@@ -104,6 +104,11 @@ test('store instruction source: a real installed bundle bridges bundle and order
   }
   assert.deepEqual(source.lookup({ defDigest: requested, step: 'missing-step', key: '' }), { status: 'unknown-step' });
   assert.deepEqual(source.getVerifiedStep(requested, 'runner')?.x?.['harness'], installed.definition.steps[0]!.x?.['harness']);
+
+  assert.equal(await source.prime(installed.result.digest), 'resolved');
+  const bundleLookedUp = source.lookup({ defDigest: installed.result.digest, step: 'runner', key: '' });
+  assert.equal(bundleLookedUp.status, 'resolved');
+  assert.equal(source.getVerifiedDefinition(installed.result.digest, 'runner')?.name, 'source-fixture');
 });
 
 test('store instruction source: every workflow in a bundle is available by its instruction digest', async () => {
@@ -137,6 +142,31 @@ test('store instruction source: every workflow in a bundle is available by its i
     assert.equal(lookedUp.instructions.prompt, child.steps[0]!.body);
     assert.equal(lookedUp.instructions.command, 'printf "from-child\\n"');
   }
+
+  assert.equal(await source.prime(installed.result.digest), 'resolved');
+  assert.equal(source.lookup({ defDigest: installed.result.digest, step: 'runner', key: '' }).status, 'resolved');
+  assert.equal(source.lookup({ defDigest: installed.result.digest, step: 'child-runner', key: '' }).status, 'resolved');
+  assert.equal(source.getVerifiedDefinition(installed.result.digest, 'child-runner')?.name, 'child-fixture');
+});
+
+test('store instruction source: a bundle digest refuses a step name shared by multiple workflows', async () => {
+  const childWorkflow = WORKFLOW.replace('name: source-fixture', 'name: child-fixture');
+  const sourceDir = writeBundleSource({
+    name: 'source-fixture',
+    workflow: WORKFLOW,
+    workflows: { 'child-fixture': childWorkflow },
+  });
+  const installed = await installBundleFixture({ sourceDir });
+  const source = createStoreInstructionSource({
+    projectRoot: installed.root,
+    globalRoot: tempDir('owenloop-ambiguous-source-global-'),
+    verifier: createBundleIngestor(),
+  });
+
+  assert.equal(await source.prime(installed.result.digest), 'resolved');
+  assert.deepEqual(source.lookup({ defDigest: installed.result.digest, step: 'runner', key: '' }), { status: 'unknown-step' });
+  assert.equal(source.getVerifiedStep(installed.result.digest, 'runner'), undefined);
+  assert.equal(source.getVerifiedDefinition(installed.result.digest, 'runner'), undefined);
 });
 
 test('store instruction source: a stale index row does not poison a clean requested workflow', async () => {

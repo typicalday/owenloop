@@ -67,12 +67,12 @@ interface CachedDefinition {
 
 /** A synchronous lookup source backed by verified local workflow-store objects. */
 export interface StoreInstructionSource extends OrderInstructionSource {
-  /** Load and verify the bundle that corresponds to an order projection digest. */
+  /** Load and verify the bundle that corresponds to an order or bundle digest. */
   prime(defDigest: string): Promise<'resolved' | 'unknown-digest'>;
   /** Return a step only after `prime(defDigest)` has resolved that digest. */
   getVerifiedStep(defDigest: string, step: string): StepDef | undefined;
-  /** Return the full verified definition cached by `prime`. */
-  getVerifiedDefinition(defDigest: string): WorkflowDef | undefined;
+  /** Return the full verified definition cached by `prime`, narrowed by step when a bundle contains several workflows. */
+  getVerifiedDefinition(defDigest: string, step?: string): WorkflowDef | undefined;
   /** Return the installed bundle identity and object path cached by `prime`. */
   getVerifiedObject(defDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined;
 }
@@ -109,7 +109,7 @@ function asDefDigest(raw: string): DefDigest | undefined {
 export function createStoreInstructionSource(args: StoreInstructionSourceArgs): StoreInstructionSource {
   const projectRoot = args.projectRoot === undefined ? undefined : projectStoreRoot(args.projectRoot);
   const globalRoot = projectStoreRoot(args.globalRoot);
-  const cache = new Map<string, CachedDefinition>();
+  const cache = new Map<string, CachedDefinition[]>();
   const inFlight = new Map<string, Promise<'resolved' | 'unknown-digest'>>();
 
   const loadCandidate = async (requestedDigest: string, bundleDigest: DefDigest): Promise<boolean> => {
@@ -134,9 +134,25 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       loaded.set(def.name, def);
     }
     const finalized = finalizeDefs(loaded);
+
+    // Hub-backed orders use the immutable bundle digest as their execution
+    // identity. Keep every workflow from that exact verified object in the
+    // cache; the later step lookup selects a unique definition and refuses an
+    // ambiguous step name instead of choosing one by manifest order.
+    if (requestedDigest === bundleDigest) {
+      cache.set(requestedDigest, [...finalized.values()].map((def) => ({
+	def,
+	bundleDigest,
+	objectPath: resolved.objectPath,
+      })));
+      return true;
+    }
+
+    // Plain-YAML/local-engine orders retain the per-definition projection
+    // digest path for backwards compatibility.
     for (const def of finalized.values()) {
       if (defInstructionDigest(def) === requestedDigest) {
-        cache.set(requestedDigest, { def, bundleDigest, objectPath: resolved.objectPath });
+	cache.set(requestedDigest, [{ def, bundleDigest, objectPath: resolved.objectPath }]);
         return true;
       }
     }
@@ -203,6 +219,13 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     return operation;
   };
 
+  const definitionForStep = (requestedDigest: string, stepName: string): CachedDefinition | undefined => {
+    const matches = cache.get(requestedDigest)?.filter(
+      (candidate) => candidate.def.steps.some((step) => step.name === stepName),
+    ) ?? [];
+    return matches.length === 1 ? matches[0] : undefined;
+  };
+
   return {
     digestOf: (_def: WorkflowDef): string => {
       throw new StoreInstructionSourceError(
@@ -210,8 +233,9 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       );
     },
     lookup: (ref: OrderInstructionRef): OrderInstructionLookup => {
-      const cached = cache.get(ref.defDigest);
-      if (cached === undefined) return { status: 'unknown-digest' };
+      if (!cache.has(ref.defDigest)) return { status: 'unknown-digest' };
+      const cached = definitionForStep(ref.defDigest, ref.step);
+      if (cached === undefined) return { status: 'unknown-step' };
       const step = cached.def.steps.find((candidate) => candidate.name === ref.step);
       if (step === undefined) return { status: 'unknown-step' };
       return {
@@ -225,12 +249,19 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     },
     prime,
     getVerifiedStep: (requestedDigest: string, stepName: string): StepDef | undefined => {
-      const cached = cache.get(requestedDigest);
+      const cached = definitionForStep(requestedDigest, stepName);
       return cached?.def.steps.find((step) => step.name === stepName);
     },
-    getVerifiedDefinition: (requestedDigest: string): WorkflowDef | undefined => cache.get(requestedDigest)?.def,
+    getVerifiedDefinition: (requestedDigest: string, stepName?: string): WorkflowDef | undefined => {
+      const cached = stepName === undefined
+	? cache.get(requestedDigest)
+	: [definitionForStep(requestedDigest, stepName)].filter(
+	  (candidate): candidate is CachedDefinition => candidate !== undefined,
+	);
+      return cached?.length === 1 ? cached[0]!.def : undefined;
+    },
     getVerifiedObject: (requestedDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined => {
-      const cached = cache.get(requestedDigest);
+      const cached = cache.get(requestedDigest)?.[0];
       return cached === undefined ? undefined : { bundleDigest: cached.bundleDigest, objectPath: cached.objectPath };
     },
   };
