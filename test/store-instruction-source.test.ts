@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, cpSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -109,6 +109,47 @@ test('store instruction source: a real installed bundle bridges bundle and order
   const bundleLookedUp = source.lookup({ defDigest: installed.result.digest, step: 'runner', key: '' });
   assert.equal(bundleLookedUp.status, 'resolved');
   assert.equal(source.getVerifiedDefinition(installed.result.digest, 'runner')?.name, 'source-fixture');
+});
+
+test('store instruction source: a project projection wins even when the matching global bundle digest sorts first', async () => {
+  const first = await installBundleFixture({
+    sourceDir: writeBundleSource({
+      name: 'source-fixture',
+      workflow: WORKFLOW,
+      files: { 'notes/variant.txt': 'first auxiliary payload\n' },
+    }),
+  });
+  const second = await installBundleFixture({
+    sourceDir: writeBundleSource({
+      name: 'source-fixture',
+      workflow: WORKFLOW,
+      files: { 'notes/variant.txt': 'second auxiliary payload\n' },
+    }),
+  });
+  const installed = [first, second].sort((a, b) => a.result.digest.localeCompare(b.result.digest));
+  const globalInstalled = installed[0]!;
+  const projectInstalled = installed[1]!;
+  assert.ok(
+    globalInstalled.result.digest < projectInstalled.result.digest,
+    'the fixture assigns the lexically earlier bundle to the global tier',
+  );
+
+  const loaded = loadDefFile(join(projectInstalled.result.objectPath, 'workflow.yaml'));
+  const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
+  assert.ok(definition !== undefined);
+  const requested = defInstructionDigest(definition);
+  const source = createStoreInstructionSource({
+    projectRoot: projectInstalled.root,
+    globalRoot: globalInstalled.root,
+    verifier: createBundleIngestor(),
+  });
+
+  assert.equal(await source.prime(requested), 'resolved');
+  assert.equal(source.getVerifiedObject(requested)?.bundleDigest, projectInstalled.result.digest);
+  assert.equal(
+    readFileSync(join(source.getVerifiedObject(requested)!.objectPath, 'notes/variant.txt'), 'utf8'),
+    readFileSync(join(projectInstalled.result.objectPath, 'notes/variant.txt'), 'utf8'),
+  );
 });
 
 test('store instruction source: every workflow in a bundle is available by its instruction digest', async () => {

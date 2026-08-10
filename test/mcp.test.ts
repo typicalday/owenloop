@@ -203,7 +203,7 @@ test('mcp: a baseline tool call becomes ONE authenticated POST and maps the 2xx 
   assert.deepEqual(JSON.parse(whats[0]!.body!), { workflow: 'wf' });
 });
 
-test('mcp: submit attaches a DSSE submission proof over the original value', async () => {
+test('mcp: judge submit signs the exact judged version from the claim fingerprint', async () => {
   let submitBody: Record<string, unknown> | undefined;
   const routes: Record<string, RouteHandler> = {
     'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
@@ -216,20 +216,15 @@ test('mcp: submit attaches a DSSE submission proof over the original value', asy
         order: {
           run: 'run1',
           workflow: 'wf1',
-          step: 'producer',
+	  step: 'judge-result',
           key: 'k',
           defDigest: 'def-digest',
-          inputs: ['input'],
-          outputs: ['result'],
-          consumes: { input: { value: 'seen' } },
-          consumedFingerprint: { input: 3 },
-	  owes: [{
-	    path: 'result',
-	    version: 2,
-	    judgmentRejects: 0,
-	    schemaRejects: 0,
-	    reasons: [{ at: 10, action: 'reject', kind: 'structural', by: 'engine', text: 'attacker-controlled feedback', fromVersion: 99 }],
-	  }],
+	  inputs: ['result'],
+	  outputs: [],
+	  judge: 'result',
+	  consumes: { result: { value: 'seen' } },
+	  consumedFingerprint: { result: 3 },
+	  owes: [],
         },
         lease: { claimed: true },
       },
@@ -273,34 +268,32 @@ test('mcp: submit attaches a DSSE submission proof over the original value', asy
   };
   assert.equal(record.produced[0]!.artifact, 'result');
   assert.equal(record.produced[0]!.version, 3);
-  assert.notEqual(record.produced[0]!.version, 100);
-  assert.deepEqual(record.consumedFingerprint, { input: 3 });
+  assert.deepEqual(record.consumedFingerprint, { result: 3 });
 });
 
-test('mcp: an omitted consumed fingerprint falls back unsigned only for consuming orders', async () => {
+test('mcp: repeated producer refinements remain unsigned without a retry-safe hub-issued version', async () => {
   let orderCalls = 0;
   const submitted: Array<Record<string, unknown>> = [];
   const routes: Record<string, RouteHandler> = {
     'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
     'POST /api/get_order': () => {
       orderCalls += 1;
-      const consumes = orderCalls === 1 ? { input: { value: 'seen' } } : {};
-      const inputs = orderCalls === 1 ? ['input'] : [];
       return {
         status: 200,
         json: {
           text: '',
           workflow: 'wf1',
-          run: `run${orderCalls}`,
+	  run: 'run1',
           order: {
-            run: `run${orderCalls}`,
+	    run: 'run1',
             workflow: 'wf1',
             step: 'producer',
             key: 'k',
             defDigest: 'def-digest',
-            inputs,
+	    inputs: [],
             outputs: ['result'],
-            consumes,
+	    consumes: {},
+	    consumedFingerprint: {},
 	    owes: [{ path: 'result', version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
           },
           lease: { claimed: true },
@@ -325,21 +318,14 @@ test('mcp: an omitted consumed fingerprint falls back unsigned only for consumin
   const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
     INIT,
     call(3, 'submit', { workflow: 'wf1', run: 'run1', path: 'result', value: { answer: 1 } }),
-    call(4, 'submit', { workflow: 'wf1', run: 'run2', path: 'result', value: { answer: 2 } }),
+    call(4, 'submit', { workflow: 'wf1', run: 'run1', path: 'result', value: { answer: 2 } }),
   ]);
   assert.deepEqual(resultJson(frames[1]!), { text: 'ok', outcome: 'green' });
   assert.deepEqual(resultJson(frames[2]!), { text: 'ok', outcome: 'green' });
+  assert.equal(orderCalls, 2, 'each submit re-reads the immutable order packet');
   assert.equal(submitted.length, 2);
-  assert.equal(submitted[0]!.proof, undefined, 'missing fingerprint must not sign a consuming order');
-  assert.equal(typeof submitted[1]!.proof, 'string', 'an actually empty input set may sign {}');
-
-  const verified = await dsseVerifySubmission(JSON.parse(submitted[1]!.proof as string), {
-    async verify() {
-      return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
-    },
-  });
-  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as { consumedFingerprint: Record<string, number> };
-  assert.deepEqual(record.consumedFingerprint, {});
+  assert.equal(submitted[0]!.proof, undefined);
+  assert.equal(submitted[1]!.proof, undefined);
 });
 
 test('mcp: a non-2xx REST reply maps to an isError result carrying the body message', async () => {

@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -190,6 +190,43 @@ test('an unchanged unterminated tail warns once after grace and a changed tail s
   writeFileSync(file, `${JSON.stringify(first)}\n`);
   readSessions(file, opts);
   assert.equal(warnings.length, 2, 'committing or removing the tail clears the observation');
+});
+
+test('an already-old unterminated tail warns on its first read in a fresh observation', () => {
+  const oldFile = join(dir, 'old-tail.jsonl');
+  const first = rec({ step: 'builder', token: 'ok-1' });
+  const now = Date.now();
+  writeFileSync(oldFile, `${JSON.stringify(first)}\nnot json`);
+  const old = new Date(now - 10_000);
+  utimesSync(oldFile, old, old);
+  const warnings: string[] = [];
+
+  assert.deepEqual(
+    readSessions(oldFile, {
+      warn: (line) => warnings.push(line),
+      now: () => now,
+      unterminatedTailGraceMs: 5_000,
+    }).map((record) => record.token),
+    ['ok-1'],
+  );
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /persistent unterminated record/);
+});
+
+test('a freshly modified unterminated tail remains silent on its first read', () => {
+  const freshFile = join(dir, 'fresh-tail.jsonl');
+  const now = Date.now();
+  writeFileSync(freshFile, 'partial append');
+  const fresh = new Date(now);
+  utimesSync(freshFile, fresh, fresh);
+  const warnings: string[] = [];
+
+  assert.deepEqual(readSessions(freshFile, {
+    warn: (line) => warnings.push(line),
+    now: () => now + 100,
+    unterminatedTailGraceMs: 5_000,
+  }), []);
+  assert.deepEqual(warnings, []);
 });
 
 test('latestFor over a corrupt file still answers, warning through the default stderr sink', () => {

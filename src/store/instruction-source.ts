@@ -85,17 +85,22 @@ function indexedBundleDigests(root: string): DefDigest[] {
     .sort((a, b) => a.localeCompare(b));
 }
 
-function uniqueRoots(projectRoot: string | undefined, globalRoot: string): string[] {
-  const roots = projectRoot === undefined ? [globalRoot] : [projectRoot, globalRoot];
-  return [...new Set(roots.map((root) => projectStoreRoot(root)))];
-}
+function candidateDigestTiers(projectRoot: string | undefined, globalRoot: string): DefDigest[][] {
+  const normalizedGlobal = projectStoreRoot(globalRoot);
+  if (projectRoot === undefined) return [indexedBundleDigests(normalizedGlobal)];
 
-function candidateDigests(projectRoot: string | undefined, globalRoot: string): DefDigest[] {
-  const all = new Set<DefDigest>();
-  for (const root of uniqueRoots(projectRoot, globalRoot)) {
-    for (const digest of indexedBundleDigests(root)) all.add(digest);
-  }
-  return [...all].sort((a, b) => a.localeCompare(b));
+  const normalizedProject = projectStoreRoot(projectRoot);
+  if (normalizedProject === normalizedGlobal) return [indexedBundleDigests(normalizedProject)];
+
+  // Projection digests predate bundle identities. When the same definition is
+  // installed in two bundles, auxiliary files can make the bundle digests sort
+  // in either order. Preserve store precedence explicitly: inspect every project
+  // candidate first, then consult the global tier only after no project bundle
+  // matched. Sorting remains deterministic inside each tier.
+  return [
+    indexedBundleDigests(normalizedProject),
+    indexedBundleDigests(normalizedGlobal),
+  ];
 }
 
 function asDefDigest(raw: string): DefDigest | undefined {
@@ -183,12 +188,14 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     // digest is genuinely unknown among the candidates we could inspect.
     let firstCandidateFailure: unknown;
     let inspectedCleanCandidate = false;
-    for (const bundleDigest of candidateDigests(projectRoot, globalRoot)) {
-      const outcome = await attemptCandidate(requestedDigest, bundleDigest);
-      const candidateError = outcome.error;
-      if (candidateError !== undefined) firstCandidateFailure ??= candidateFailureForRefusal(candidateError);
-      inspectedCleanCandidate ||= candidateError === undefined;
-      if (candidateError === undefined && outcome.matched === true) return 'resolved';
+    for (const tier of candidateDigestTiers(projectRoot, globalRoot)) {
+      for (const bundleDigest of tier) {
+	const outcome = await attemptCandidate(requestedDigest, bundleDigest);
+	const candidateError = outcome.error;
+	if (candidateError !== undefined) firstCandidateFailure ??= candidateFailureForRefusal(candidateError);
+	inspectedCleanCandidate ||= candidateError === undefined;
+	if (candidateError === undefined && outcome.matched === true) return 'resolved';
+      }
     }
     if (firstCandidateFailure !== undefined && !inspectedCleanCandidate) throw firstCandidateFailure;
     return 'unknown-digest';

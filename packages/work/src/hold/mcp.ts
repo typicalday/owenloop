@@ -30,7 +30,7 @@ import { textResult, type ToolRegistration, type ToolResult } from '../mcp/serve
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
-import { buildSubmitProof, outputVersionForSubmission, type SubmissionKeyManager } from '../submit-proof.ts';
+import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
@@ -89,12 +89,6 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   // either the model or submit-proof construction.
   let firstContact: GetOrderResponse | undefined;
   let captured: GetOrderResponse | undefined;
-  // A held multi-output run may refine one output before its siblings close
-  // the run. The persisted claim packet is intentionally immutable, so keep
-  // the versions committed by THIS holder and sign each later refinement for
-  // the version the hub will commit next. Rejections do not advance it.
-  const committedOutputVersions = new Map<string, number>();
-
   // Set the moment the lease loop's run() settles (lease-lost, completed,
   // released, …): from then on this mount no longer holds the order, so BOTH
   // tools fast-fail with isError and never touch the hub again (plan section 4
@@ -225,25 +219,18 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         captured = orderResponse;
 
         let proof: string | undefined;
-        let submittedVersion: number | undefined;
         if (deps.origin !== undefined && orderResponse.order !== null) {
-          const priorVersion = committedOutputVersions.get(path);
-          const version = priorVersion === undefined
-            ? outputVersionForSubmission(orderResponse.order, path)
-            : priorVersion + 1;
           proof = await buildSubmitProof({
             origin: deps.origin,
             order: orderResponse.order,
             path,
             value: args['value'],
-	    ...(version !== undefined ? { version } : {}),
             now: deps.now,
             warn: deps.err,
             ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
             ...(deps.env !== undefined ? { env: deps.env } : {}),
             ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
           });
-	  submittedVersion = proof === undefined ? undefined : version;
         }
         const res = await hub.submit({
           workflow,
@@ -254,9 +241,6 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
           ...(proof !== undefined ? { proof } : {}),
           ...holderReq,
         });
-        if (submittedVersion !== undefined && (res.outcome === 'green' || res.outcome === 'submitted')) {
-          committedOutputVersions.set(path, submittedVersion);
-        }
         // The run closed — stop holding WITHOUT releasing (the claim is gone).
         if (res.closed === true) loop.stop('submitted', { release: false });
         return textResult({ outcome: res.outcome, closed: res.closed ?? false, text: res.text });

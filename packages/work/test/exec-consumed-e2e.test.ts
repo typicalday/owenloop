@@ -293,7 +293,7 @@ test('command e2e: unsigned feedback does not block a command with signed consum
   }
 });
 
-test('command e2e: attacker feedback cannot select the version in a signed receipt proof', async () => {
+test('command e2e: immutable producer claim metadata cannot authorize a signed receipt proof', async () => {
   const fixtureData = await fixture();
   const marker = COMMAND_MARKER;
   rmSync(marker, { force: true });
@@ -319,15 +319,7 @@ test('command e2e: attacker feedback cannot select the version in a signed recei
     assert.equal(pathExists(marker), true, 'unsigned feedback that cannot reach the command does not block execution');
     const submit = hub.reqs.find((request) => request.verb === 'submit');
     assert.ok(submit?.body !== undefined);
-    const proof = submit.body['proof'];
-    assert.equal(typeof proof, 'string');
-    const envelope = JSON.parse(proof as string) as { payload: string };
-    const record = JSON.parse(Buffer.from(envelope.payload, 'base64').toString('utf8')) as {
-      produced: Array<{ artifact: string; version: number }>;
-    };
-    assert.equal(record.produced[0]!.artifact, 'out');
-    assert.equal(record.produced[0]!.version, 1);
-    assert.notEqual(record.produced[0]!.version, 100);
+    assert.equal(submit.body['proof'], undefined);
   } finally {
     hub.server.close();
     rmSync(marker, { force: true });

@@ -21,7 +21,7 @@ interface Call {
 
 interface HubCfg {
   getOrder?: GetOrderResponse | Error;
-  submit?: { outcome?: string; closed?: boolean } | Error;
+  submit?: { outcome?: string; closed?: boolean } | Error | Array<{ outcome?: string; closed?: boolean } | Error>;
   reject?: { ok?: boolean; closed?: boolean } | Error;
 }
 
@@ -54,6 +54,7 @@ afterEach(() => {
 
 function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
   const calls: Call[] = [];
+  let submitIdx = 0;
   const hub = {
     async getOrder(req: unknown) {
       calls.push({ verb: 'get_order', arg: req });
@@ -63,7 +64,10 @@ function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
     },
     async submit(req: unknown) {
       calls.push({ verb: 'submit', arg: req });
-      const s = cfg.submit ?? { outcome: 'accepted' };
+      const configured = cfg.submit ?? { outcome: 'accepted' };
+      const s = Array.isArray(configured)
+	? configured[Math.min(submitIdx++, configured.length - 1)]!
+	: configured;
       if (s instanceof Error) throw s;
       return { text: 'ok', outcome: s.outcome, closed: s.closed };
     },
@@ -97,6 +101,27 @@ function tool(tools: ToolRegistration[], name: string): ToolRegistration {
 
 function parse(res: { content: Array<{ text: string }> }): ReturnType<typeof JSON.parse> {
   return JSON.parse(res.content[0]!.text);
+}
+
+function producerOrderResponse(): GetOrderResponse {
+  return {
+    text: '',
+    workflow: 'wf1',
+    run: 'run1',
+    order: {
+      run: 'run1',
+      workflow: 'wf1',
+      step: 'producer',
+      key: '',
+      defDigest: 'def-digest',
+      inputs: [],
+      outputs: ['result'],
+      consumes: {},
+      consumedFingerprint: {},
+      owes: [{ path: 'result', version: 4, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+    },
+    lease: { claimed: true },
+  };
 }
 
 // ---- shape ------------------------------------------------------------------
@@ -156,7 +181,7 @@ test('submit posts a receipt for the bound run and echoes the outcome', async ()
   ]);
 });
 
-test('hold-MCP submit attaches a DSSE submission proof over the submitted value', async () => {
+test('hold-MCP judge submit attaches a DSSE proof for the fingerprinted artifact version', async () => {
   const orderResponse: GetOrderResponse = {
     text: '',
     workflow: 'wf1',
@@ -164,14 +189,15 @@ test('hold-MCP submit attaches a DSSE submission proof over the submitted value'
     order: {
       run: 'run1',
       workflow: 'wf1',
-      step: 'producer',
+      step: 'judge-result',
       key: 'k',
       defDigest: 'def-digest',
-      inputs: ['input'],
-      outputs: ['result'],
-      consumes: { input: { value: 'seen' } },
-      consumedFingerprint: { input: 2 },
-      owes: [{ path: 'result', version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+      inputs: ['result'],
+      outputs: [],
+      judge: 'result',
+      consumes: { result: { value: 'seen' } },
+      consumedFingerprint: { result: 2 },
+      owes: [],
     },
     lease: { claimed: true },
   };
@@ -197,10 +223,10 @@ test('hold-MCP submit attaches a DSSE submission proof over the submitted value'
     consumedFingerprint: Record<string, number>;
   };
   assert.equal(record.produced[0]!.artifact, 'result');
-  assert.deepEqual(record.consumedFingerprint, { input: 2 });
+  assert.deepEqual(record.consumedFingerprint, { result: 2 });
 });
 
-test('hold-MCP signs a repeated successful output refinement for its next committed version', async () => {
+test('hold-MCP repeated judge approval signs the same fingerprinted version', async () => {
   const orderResponse: GetOrderResponse = {
     text: '',
     workflow: 'wf1',
@@ -208,17 +234,15 @@ test('hold-MCP signs a repeated successful output refinement for its next commit
     order: {
       run: 'run1',
       workflow: 'wf1',
-      step: 'planner',
+      step: 'judge-result',
       key: '',
       defDigest: 'def-digest',
-      inputs: [],
-      outputs: ['research', 'plan'],
-      consumes: {},
-      consumedFingerprint: {},
-      owes: [
-	{ path: 'research', version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] },
-	{ path: 'plan', version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] },
-      ],
+      inputs: ['result'],
+      outputs: [],
+      judge: 'result',
+      consumes: { result: { draft: 1 } },
+      consumedFingerprint: { result: 7 },
+      owes: [],
     },
     lease: { claimed: true },
   };
@@ -230,14 +254,15 @@ test('hold-MCP signs a repeated successful output refinement for its next commit
     consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
   }));
   const submit = tool(mount.tools, 'submit');
-  await submit.handler({ path: 'research', value: { draft: 1 } }, ctx);
-  await submit.handler({ path: 'research', value: { draft: 2 } }, ctx);
+  await submit.handler({ path: 'result', value: { approved: true } }, ctx);
+  await submit.handler({ path: 'result', value: { approved: true } }, ctx);
 
   const proofs = calls
     .filter((call) => call.verb === 'submit')
-    .map((call) => (call.arg as { proof: string }).proof);
+    .map((call) => (call.arg as { proof?: string }).proof);
   const versions: number[] = [];
   for (const proof of proofs) {
+    assert.ok(proof !== undefined);
     const verified = await dsseVerifySubmission(JSON.parse(proof), {
       async verify() {
         return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
@@ -246,7 +271,73 @@ test('hold-MCP signs a repeated successful output refinement for its next commit
     const record = JSON.parse(verified.payloadBytes.toString('utf8')) as { produced: Array<{ version: number }> };
     versions.push(record.produced[0]!.version);
   }
-  assert.deepEqual(versions, [1, 2]);
+  assert.deepEqual(versions, [7, 7]);
+});
+
+test('hold-MCP producer retry after a lost response remains unsigned instead of guessing the next version', async () => {
+  const { hub, calls } = mockHub({
+    getOrder: producerOrderResponse(),
+    submit: [new Error('response lost'), { outcome: 'green', closed: false }],
+  });
+  const mount = createHoldMcp(deps(hub, {
+    origin: 'https://hub.example.test',
+    principalKeys: signingKeys(),
+    sshProcess: fakeSshProcess(),
+    consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
+  }));
+  const submit = tool(mount.tools, 'submit');
+
+  const first = await submit.handler({ path: 'result', value: { draft: 1 } }, ctx);
+  assert.equal((first as { isError?: boolean }).isError, true);
+  const second = await submit.handler({ path: 'result', value: { draft: 1 } }, ctx);
+  assert.equal(parse(second).outcome, 'green');
+
+  const requests = calls.filter((call) => call.verb === 'submit').map((call) => call.arg as { proof?: string });
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => request.proof === undefined));
+});
+
+test('hold-MCP unsigned producer commit is not signed later from the same stale claim packet', async () => {
+  let keyAvailable = false;
+  const keys: SubmissionKeyManager = {
+    ...signingKeys(),
+    resolveRef: () => keyAvailable ? SIGNING_REF : null,
+  };
+  const { hub, calls } = mockHub({ getOrder: producerOrderResponse(), submit: { outcome: 'green', closed: false } });
+  const mount = createHoldMcp(deps(hub, {
+    origin: 'https://hub.example.test',
+    principalKeys: keys,
+    sshProcess: fakeSshProcess(),
+    consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
+  }));
+  const submit = tool(mount.tools, 'submit');
+
+  await submit.handler({ path: 'result', value: { draft: 1 } }, ctx);
+  keyAvailable = true;
+  await submit.handler({ path: 'result', value: { draft: 2 } }, ctx);
+
+  const requests = calls.filter((call) => call.verb === 'submit').map((call) => call.arg as { proof?: string });
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => request.proof === undefined));
+});
+
+test('hold-MCP restart does not turn immutable producer claim metadata into version authority', async () => {
+  const { hub, calls } = mockHub({ getOrder: producerOrderResponse(), submit: { outcome: 'green', closed: false } });
+  const signingDeps = {
+    origin: 'https://hub.example.test',
+    principalKeys: signingKeys(),
+    sshProcess: fakeSshProcess(),
+    consumedVerifier: async (order: NonNullable<GetOrderResponse['order']>) => ({ ok: true as const, order, warnings: [] }),
+  };
+
+  const firstProcess = createHoldMcp(deps(hub, signingDeps));
+  await tool(firstProcess.tools, 'submit').handler({ path: 'result', value: { draft: 1 } }, ctx);
+  const restartedProcess = createHoldMcp(deps(hub, signingDeps));
+  await tool(restartedProcess.tools, 'submit').handler({ path: 'result', value: { draft: 2 } }, ctx);
+
+  const requests = calls.filter((call) => call.verb === 'submit').map((call) => call.arg as { proof?: string });
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => request.proof === undefined));
 });
 
 // W7/D4: when the bound holder is known, submit carries it through unchanged

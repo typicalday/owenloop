@@ -198,8 +198,8 @@ interface Candidate {
   defName: string | undefined;
   defHash: string | undefined;
   kind: 'agent' | 'command';
-  /** Local time when the hub-served claim entered this dispatch candidate. */
-  queuedAt: number;
+  /** Local time immediately before the targeted `whats_next` request began. */
+  requestStartedAt: number;
   /** True when this run already had a live record (handout lapsed → re-offer). */
   reoffer: boolean;
 }
@@ -369,6 +369,15 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     }
   }
 
+  function discardExpiredCandidate(candidate: Candidate, queued: boolean): boolean {
+    if (opts.now() - candidate.requestStartedAt < MAX_PENDING_CANDIDATE_AGE_MS) return false;
+    const prefix = queued ? 'queued claim' : 'claim';
+    opts.err(
+      `[${candidate.workflow}/${candidate.order.run}] ${prefix} expired before local dispatch — leaving the hub pickup window to re-offer it`,
+    );
+    return true;
+  }
+
   /** Dispatch already-claimed orders when local child capacity becomes free. */
   function drainPending(live: ChildRecord[]): number {
     let remaining = cap - live.length;
@@ -381,9 +390,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 
     for (const [run, candidate] of pendingCandidates) {
       if (remaining <= 0) break;
-      if (opts.now() - candidate.queuedAt >= MAX_PENDING_CANDIDATE_AGE_MS) {
+      if (discardExpiredCandidate(candidate, true)) {
 	pendingCandidates.delete(run);
-	opts.err(`[${candidate.workflow}/${run}] queued claim expired before local dispatch — leaving the hub pickup window to re-offer it`);
 	continue;
       }
       if (liveRuns.has(run)) {
@@ -472,6 +480,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     const candidates: Candidate[] = [];
     for (const wf of instances) {
       let res;
+      const requestStartedAt = opts.now();
       try {
         res = await opts.hub.whatsNext({ workflow: wf, serve_crews: serveCrews });
       } catch (e) {
@@ -525,9 +534,13 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
             defName,
             defHash: bundle?.def.hash,
             kind: 'command',
-	    queuedAt: opts.now(),
+	    requestStartedAt,
             reoffer,
           };
+	  if (discardExpiredCandidate(candidate, false)) {
+	    claimed.add(order.run);
+	    continue;
+	  }
           if (remaining <= 0) {
             pendingCandidates.set(order.run, candidate);
             opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
@@ -561,9 +574,13 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
           defName,
           defHash: bundle?.def.hash,
           kind: 'agent',
-	  queuedAt: opts.now(),
+	  requestStartedAt,
           reoffer,
         };
+	if (discardExpiredCandidate(candidate, false)) {
+	  claimed.add(order.run);
+	  continue;
+	}
 
         // A re-offer replaces its stale record without consuming a new slot. A
         // new order returned by `whats_next` is already claimed, so capacity-
@@ -587,6 +604,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     }
 
     for (const candidate of candidates) {
+      if (discardExpiredCandidate(candidate, false)) continue;
       if (dispatchCandidate(candidate)) dispatched++;
     }
 

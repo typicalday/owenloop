@@ -15,7 +15,7 @@ export interface SubmitProofOptions {
   order: OrderPacket;
   path: string;
   value: unknown;
-  /** Explicit committed version when the caller has a version-aware hub packet. */
+  /** Exact target version issued by a version-aware, retry-safe hub protocol. */
   version?: number;
   now: () => number;
   warn: (line: string) => void;
@@ -101,10 +101,11 @@ function submissionFingerprint(
 /**
  * Resolve the version named by the next submission from authoritative lifecycle
  * metadata only. A judge approval attests the already-submitted version captured
- * in the claim fingerprint and does not increment it. A producer commit advances
- * exactly once from the owed artifact's current claim-time version. Older reduced
- * packets that carry neither value return `undefined`; callers must submit without
- * a proof rather than sign a guess derived from unverified feedback text.
+ * in the claim fingerprint and does not increment it. A producer submit requires
+ * an explicit target version issued by a retry-safe hub protocol: `owes[].version`
+ * is immutable claim-time state and becomes stale after a refinement, lost
+ * response, unsigned commit, or holder restart. Without an explicit target,
+ * callers must submit without a proof rather than sign a process-local guess.
  */
 export function outputVersionForSubmission(
   order: OrderPacket,
@@ -113,8 +114,7 @@ export function outputVersionForSubmission(
 ): number | undefined {
   if (explicit !== undefined) return explicit;
   if (order.judge === path) return order.consumedFingerprint?.[path];
-  const owe = order.owes.find((entry) => entry.path === path);
-  return owe?.version === undefined ? undefined : owe.version + 1;
+  return undefined;
 }
 
 function errorMessage(error: unknown): string {

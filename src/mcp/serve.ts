@@ -375,11 +375,15 @@ function submissionFingerprint(order: Order, deps: McpDeps): NonNullable<Order['
   return {};
 }
 
-/** Resolve a signed submit version from authoritative claim metadata only. */
+/**
+ * Resolve a signed submit version from authoritative immutable metadata only.
+ * Judge claims name the already-submitted version in their fingerprint. Producer
+ * claims do not name a retry-safe target: `owes[].version` is claim-time state and
+ * can be stale after a refinement, lost response, unsigned commit, or restart.
+ */
 function outputVersion(order: Order, path: string): number | undefined {
   if (order.judge === path) return order.consumedFingerprint?.[path];
-  const owe = order.owes.find((entry) => entry.path === path);
-  return owe?.version === undefined ? undefined : owe.version + 1;
+  return undefined;
 }
 
 function warnMcpUnsigned(deps: McpDeps, reason: string): void {

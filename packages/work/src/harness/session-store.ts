@@ -43,7 +43,18 @@
  * `src/`): the library takes an injectable callback and the default writes to
  * stderr, so tests stay silent and assertable.
  */
-import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 
 /** Where a step attempt is in its life. */
@@ -108,6 +119,11 @@ export const DEFAULT_MAX_BYTES = 2_000_000;
 export const DEFAULT_UNTERMINATED_TAIL_GRACE_MS = 5_000;
 
 interface TailObservation {
+  /** Stable identity of the open file whose bytes were inspected. */
+  identity: string;
+  /** Metadata that changes when a writer extends or replaces the observed tail. */
+  size: number;
+  mtimeMs: number;
   tail: string;
   firstSeenAt: number;
   warned: boolean;
@@ -183,21 +199,39 @@ function atomicWrite(filePath: string, content: string): void {
 /**
  * Every valid record in `file`, oldest first. A missing/unreadable file reads as
  * `[]`. A trailing newline is the record-commit marker: an unterminated final
- * tail may be a concurrent writer still appending, so the first observation is
- * ignored silently. An identical non-blank tail that remains past the configured
- * grace warns once, without treating the uncommitted bytes as a record. A changed
- * tail restarts the grace; a newline clears the observation. Blank lines are
+ * tail may be a concurrent writer still appending. File modification time starts
+ * the grace, so a recently modified tail is ignored silently while an already-old
+ * tail warns on the first read even in a fresh process. File identity, size, tail,
+ * or modification changes restart the observation; a newline clears it. Blank lines are
  * skipped silently; every other unusable COMPLETE line is skipped and reported
  * through `warn` with its 1-indexed line number. Never throws.
  */
 export function readSessions(file: string, opts: SessionStoreOptions = {}): SessionRecord[] {
   const warn = opts.warn ?? defaultWarn;
   let raw: string;
+  let metadata: { identity: string; size: number; mtimeMs: number };
+  let fd: number | undefined;
   try {
-    raw = readFileSync(file, 'utf8');
+    fd = openSync(file, 'r');
+    raw = readFileSync(fd, 'utf8');
+    const stat = fstatSync(fd);
+    metadata = {
+      identity: `${stat.dev}:${stat.ino}`,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+    };
   } catch {
     tailObservations.delete(file);
     return []; // fail-open: no store yet is the normal first-run case
+  } finally {
+    if (fd !== undefined) {
+      try {
+	closeSync(fd);
+      } catch {
+	// The bytes and metadata were already captured; a close failure cannot
+	// make a resumable record safer, so preserve the read path's fail-open stance.
+      }
+    }
   }
   const out: SessionRecord[] = [];
   const lines = raw.split('\n');
@@ -210,13 +244,30 @@ export function readSessions(file: string, opts: SessionStoreOptions = {}): Sess
       tailObservations.delete(file);
     } else {
       const now = (opts.now ?? Date.now)();
+      const graceMs = opts.unterminatedTailGraceMs ?? DEFAULT_UNTERMINATED_TAIL_GRACE_MS;
       const observed = tailObservations.get(file);
-      if (observed === undefined || observed.tail !== tail) {
-	tailObservations.set(file, { tail, firstSeenAt: now, warned: false });
-      } else if (
-	!observed.warned
-	&& now - observed.firstSeenAt >= (opts.unterminatedTailGraceMs ?? DEFAULT_UNTERMINATED_TAIL_GRACE_MS)
-      ) {
+      const sameObservation = observed !== undefined
+	&& observed.identity === metadata.identity
+	&& observed.size === metadata.size
+	&& observed.mtimeMs === metadata.mtimeMs
+	&& observed.tail === tail;
+      if (!sameObservation) {
+	// mtime is persisted by the filesystem, so an abandoned tail can be
+	// recognized on the first read of a fresh one-shot process. Clamp a
+	// future timestamp to `now` for clock skew and injected test clocks.
+	const firstSeenAt = Math.min(now, metadata.mtimeMs);
+	const next: TailObservation = {
+	  ...metadata,
+	  tail,
+	  firstSeenAt,
+	  warned: false,
+	};
+	tailObservations.set(file, next);
+	if (now - firstSeenAt >= graceMs) {
+	  warn(`owenloop work sessions: persistent unterminated record at ${file}:${lines.length}`);
+	  next.warned = true;
+	}
+      } else if (observed !== undefined && !observed.warned && now - observed.firstSeenAt >= graceMs) {
 	warn(`owenloop work sessions: persistent unterminated record at ${file}:${lines.length}`);
 	observed.warned = true;
       }

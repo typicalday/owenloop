@@ -301,9 +301,9 @@ test('runs the command and submits a receipt to the owed path (exit-success outc
   assert.equal(only(calls, 'release').length, 0);
 });
 
-test('receipt payload is parsed before proof construction and the proof covers the payload', async () => {
+test('judge receipt payload is parsed before proof construction and the proof covers the payload', async () => {
   const fr = fakeRunner();
-  const response = commandOrder({ command: 'emit-payload' });
+  const response = commandOrder({ command: 'emit-payload', judge: 'input', owes: ['input'] });
   response.order!.consumedFingerprint = { input: 4 };
   const { hub, submits } = mockHub({ getOrder: [response], submit: ['green'] });
   const sshCalls: Array<{ cmd: string; args: string[]; stdin?: Buffer }> = [];
@@ -417,7 +417,7 @@ test('exec passes bundle provenance with the parent environment and removes it w
   }
 });
 
-test('exec submit attaches a DSSE submission proof over the receipt', async () => {
+test('exec producer submit remains unsigned without a retry-safe hub-issued version', async () => {
   const fr = fakeRunner();
   const response = commandOrder({ command: 'make signed-build' });
   response.order!.consumedFingerprint = { input: 4 };
@@ -433,30 +433,15 @@ test('exec submit attaches a DSSE submission proof over the receipt', async () =
   fr.resolve(result(0, { outputHash: 'sha256:signed-receipt' }));
   assert.equal(await p, 'submitted');
 
-  const proof = submits[0]!.proof;
-  assert.ok(proof !== undefined);
-  assert.equal(sshCalls.length, 2);
-  const verified = await dsseVerifySubmission(JSON.parse(proof), {
-    async verify(_bytes, signature) {
-      return signature.toString('utf8') === ARMOR
-        ? { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const }
-        : null;
-    },
-  });
-  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
-    produced: Array<{ artifact: string; valueDigest: string }>;
-    consumedFingerprint: Record<string, number>;
-    producerKeyId: string;
-  };
-  assert.equal(record.produced[0]!.artifact, 'out');
-  assert.equal(record.produced[0]!.valueDigest, valueDigestHex(submits[0]!.value));
-  assert.deepEqual(record.consumedFingerprint, { input: 4 });
-  assert.equal(record.producerKeyId, PUBLIC_KEY.keyid);
+  assert.equal(submits[0]!.proof, undefined);
+  assert.equal(sshCalls.length, 0, 'claim-time owes[].version must not reach the signer');
 });
 
-test('exec submit falls back unsigned when the machine key is missing', async () => {
+test('exec judge submit falls back unsigned when the machine key is missing', async () => {
   const fr = fakeRunner();
-  const { hub, submits } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const response = commandOrder({ judge: 'input', owes: ['input'] });
+  response.order!.consumedFingerprint = { input: 4 };
+  const { hub, submits } = mockHub({ getOrder: [response], submit: ['green'] });
   const warnings: string[] = [];
   const loop = createExecLoop(baseOpts(hub, fr.runner, {
     origin: 'https://hub.example.test',

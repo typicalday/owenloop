@@ -58,6 +58,7 @@ interface MockCfg {
   inbox?: string[];
   perWf?: Record<string, { def?: string; orders: WorkOrder[] }>;
   perWfThrows?: Record<string, Error>;
+  onTargetedWhatsNext?: () => void;
   presenceThrows?: boolean;
 }
 
@@ -92,6 +93,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
         }));
         return { text: '', instances };
       }
+      cfg.onTargetedWhatsNext?.();
       const failure = cfg.perWfThrows?.[req.workflow];
       if (failure !== undefined) throw failure;
       const p = cfg.perWf?.[req.workflow] ?? { orders: [] };
@@ -1223,6 +1225,88 @@ test('a claimed order queued by the agent cap dispatches after a child exits wit
     1,
     'the second run was already claimed, so local dispatch must not wait for a new hub sweep',
   );
+});
+
+test('pending age includes a 40-second whats_next response before 81 seconds in the local queue', async () => {
+  cacheBuilderStep();
+  let now = 0;
+  const orders = [wo('run_first', 'builder'), wo('run_stale', 'builder')];
+  const { hub, calls } = mockHub({
+    wake: [
+      { changed: true, cursor: 1 },
+      { changed: false, cursor: 1 },
+    ],
+    perWf: agentWf(orders),
+    onTargetedWhatsNext: () => { now += 40_000; },
+  });
+  const alive = new Set<number>();
+  const spawns: SpawnSpec[] = [];
+  let pid = 1000;
+  const err: string[] = [];
+  const spawner: Spawner = (spec) => {
+    spawns.push(spec);
+    alive.add(pid);
+    return { pid: pid++ };
+  };
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 10,
+    maxConcurrentAgents: 1,
+    isAlive: (candidatePid) => alive.has(candidatePid),
+    now: () => now,
+    err: (line) => err.push(line),
+  }));
+
+  assert.equal(await loop.iterate(), 1);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  alive.delete(1000);
+  now += 81_000;
+
+  assert.equal(await loop.iterate(), 0);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  assert.match(err.join('\n'), /queued claim expired before local dispatch/);
+  assert.equal(count(calls, 'whats_next'), 1);
+});
+
+test('a whats_next response older than 90 seconds is not dispatched into immediate capacity', async () => {
+  cacheBuilderStep();
+  let now = 0;
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_stale', 'builder')]),
+    onTargetedWhatsNext: () => { now += MAX_PENDING_CANDIDATE_AGE_MS + 1; },
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const err: string[] = [];
+
+  const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    now: () => now,
+    err: (line) => err.push(line),
+  })).iterate();
+
+  assert.equal(dispatched, 0);
+  assert.equal(spawns.length, 0);
+  assert.match(err.join('\n'), /claim expired before local dispatch/);
+});
+
+test('a fresh whats_next response still dispatches immediately', async () => {
+  cacheBuilderStep();
+  let now = 0;
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_fresh', 'builder')]),
+    onTargetedWhatsNext: () => { now += 40_000; },
+  });
+  const { spawner, spawns } = fakeSpawner();
+
+  const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    now: () => now,
+  })).iterate();
+
+  assert.equal(dispatched, 1);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_fresh']);
 });
 
 test('a queued claim is discarded before the hub pickup window can expire and re-offer it', async () => {

@@ -155,22 +155,27 @@ the signer in the verified DSSE envelope.
 
 ### Submit-time signing
 
-Remote drivers sign each `submit` at the driver boundary, before sending the
-request to a hub. The key reference is `{ origin, kind: 'machine', id: 'local' }`.
-The driver reads the public fingerprint with `inspect`, materializes the private
-key only inside `withSigningKey`, builds the frozen `submission.v1` record, and
-signs its canonical JSON payload with `dsseSignSubmission` under the
-`owenloop-dsse-v1` namespace. The `proof` request field is the serialized DSSE
-envelope for that one submitted artifact path.
+A remote driver can sign a `submit` at the driver boundary only when the driver
+has the exact artifact version that the signature must name. The key reference
+is `{ origin, kind: 'machine', id: 'local' }`. The driver reads the public
+fingerprint with `inspect`, materializes the private key only inside
+`withSigningKey`, builds the frozen `submission.v1` record, and signs its
+canonical JSON payload with `dsseSignSubmission` under the
+`owenloop-dsse-v1` namespace. The target `proof` request field is the serialized
+DSSE envelope for that one submitted artifact path.
+
+A judge approval may sign the existing judged version from the claim fingerprint.
+A producer submit must not infer a new version from immutable `owes[].version`
+or process-local state. The producer requires a retry-safe, hub-issued target
+version; without one, the driver submits without a proof and warns once per
+process. As of 2026-08-10, the production hub does not carry submit `proof`,
+proof acceptance, authoritative producer-version allocation, or downstream
+proof projection, so owenloop does not claim end-to-end production proof support.
 
 The engine does not sign: local `Engine.green` is synchronous and commits inside
-a synchronous store transaction. The hub does not sign: the hub stores the
-opaque envelope beside the artifact version and relays the envelope on later
-orders. `owenloop green` remains deliberately unsigned because local green does
-not cross a wire; moving the command to an asynchronous signing path would add
-no trust coverage. A driver without a configured machine key submits without a
-proof and emits one warning per process; later policy work decides whether that
-fallback becomes refusal.
+a synchronous store transaction. `owenloop green` remains deliberately unsigned
+because local green does not cross a wire; moving the command to an asynchronous
+signing path would add no trust coverage.
 
 #### Canonical submission values
 
