@@ -198,6 +198,7 @@ import type {
   Keychain,
   WhoamiIdentity,
 } from './hub.ts';
+import { loadSettings, settingsPath as executionSettingsPath } from '../packages/work/src/settings/settings.ts';
 import { owenloopSettingsPath, readOwenloopSettingsRaw, writeOwenloopHubOrigin } from './work-settings.ts';
 import { globalConfigPath, writeGlobalConfig } from './global-config.ts';
 import { canonicalJsonBytes, defaultRecoveryMarkerDir, ensureDirectoryPathNoSymlink, guardStateFile } from './install.ts';
@@ -897,7 +898,7 @@ function removePublicationSidecar(path: string): void {
 async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
   if (args.positionals.length !== 2) {
     throw new CliError(
-      'invalid publish arguments; usage: owenloop publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned]',
+      'invalid publish arguments; usage: owenloop publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned] [--hub <origin>]',
     );
   }
   const source = need(args, 1, 'source-dir');
@@ -910,14 +911,7 @@ async function dispatchPublish(io: CliIO, args: Args): Promise<number> {
     throw new CliError('owenloop publish: --source cannot be combined with --unsigned');
   }
 
-  const binding = readHubBinding(hubBindingPath(io.cwd));
-  if (!binding) throw new CliError('this project is not bound to a hub — run `owenloop connect` first');
-  let origin: string;
-  try {
-    origin = normalizeOrigin(binding.hub);
-  } catch (e) {
-    throw new CliError(`${(e as Error).message} — re-run \`owenloop connect\` to rebind`);
-  }
+  const { origin } = resolvePublishingHub(io, args, { principal: 'human' });
 
   const keys = io.principalKeys ?? new PrincipalKeyManager({ env: io.env });
   let packed: ReturnType<typeof packBundle>;
@@ -1390,7 +1384,7 @@ Commands:
   bundle unpack <bundle.wnlp> <destination-dir>       unpack a .wnlp bundle into a new directory
   bundle inspect <bundle.wnlp>           strictly validate a .wnlp bundle and print its manifest/entries
   bundle digest <bundle.wnlp>            print the bundle's def digest (SHA-256 of the canonical tar)
-  publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned]
+  publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned] [--hub <origin>]
                                          pack a bundle and sign its canonical digest (signed by default)
   trust init [--force]                  create the local Ed25519 enrollment root
   trust grant --key <pubkey-path> --principal <kind>:<id> [--pools a,b|*] [--labels a,b|*] [--namespaces a,b|*] [--delegate no|<n>|unbounded] [--signing-key <path>] [--output <file>]
@@ -1400,8 +1394,8 @@ Commands:
   login [--hub <url>] [--with-token] [--as <slot>]   authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
   logout [--hub <url>] [--as <slot>]     delete the stored credential for a hub in one slot
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
-  push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--as <slot>]
-    publish local workflow defs, or exact bundle-backed defs, to the bound hub
+  push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--hub <origin>] [--as <slot>]
+    publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
   start <defName> [--provide name=json ...] [--crew <name>] [--title <text>] [--hub <url>]
 ${' '.repeat(41)}start a published workflow on the bound hub (human credential)
@@ -1494,7 +1488,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['login', cmdOpts('hub', 'with-token', 'as')],
   ['logout', cmdOpts('hub', 'as')],
   ['connect', cmdOpts('hub', 'as')],
-  ['publish', cmdOpts('unsigned', 'output', 'source')],
+  ['publish', cmdOpts('unsigned', 'output', 'source', 'hub')],
   ['trust', cmdOpts('force', 'key', 'principal', 'pools', 'labels', 'namespaces', 'delegate', 'signing-key', 'output', 'reason', 'effective-from')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as', 'bundle')],
   ['start', cmdOpts('hub', 'crew', 'title', 'provide')],
@@ -3182,6 +3176,115 @@ function resolveHub(io: CliIO, args: Args): string {
   }
 }
 
+type StoredHubDiscovery =
+  | { kind: 'one'; origin: string }
+  | { kind: 'multiple'; origins: string[] }
+  | { kind: 'empty' }
+  | { kind: 'non-enumerable'; backend: 'keychain' | 'external-command' };
+
+/**
+ * Inspect the active credential backend once and return only the facts every
+ * hub-policy resolver needs. Policy stays with the caller: agent commands are
+ * strict, setup may choose DEFAULT_HUB, and publishing commands may consult
+ * execution settings only when the selected backend cannot enumerate.
+ */
+function discoverStoredHubs(io: CliIO): StoredHubDiscovery {
+  const stored = listStoredHubOrigins(io.env, io.keychain);
+  if (stored === null) {
+    const backend = credentialBackend(io.env, io.keychain);
+    return { kind: 'non-enumerable', backend: backend.kind === 'external' ? 'external-command' : 'keychain' };
+  }
+
+  let origins: string[];
+  try {
+    origins = stored.map((origin) => normalizeOrigin(origin));
+  } catch (e) {
+    throw new CliError((e as Error).message);
+  }
+  if (origins.length === 0) return { kind: 'empty' };
+  if (origins.length === 1) return { kind: 'one', origin: origins[0]! };
+  return { kind: 'multiple', origins: [...origins].sort() };
+}
+
+type PublishingHubResolution = {
+  origin: string;
+  source: 'flag' | 'project' | 'stored' | 'settings';
+  /** Present only for the non-enumerable settings rung, which must verify it. */
+  credential?: Credential;
+};
+
+/**
+ * Resolve the safe publication target shared by connect, push, and publish:
+ * explicit flag > project override > unambiguous global state. OWENLOOP_HUB
+ * and DEFAULT_HUB are intentionally absent from this ladder.
+ */
+function resolvePublishingHub(
+  io: CliIO,
+  args: Args,
+  slot: CredentialSlotSelector,
+): PublishingHubResolution {
+  const flagValue = last(args, 'hub');
+  if (flagValue !== undefined) {
+    try {
+      return { origin: normalizeOrigin(flagValue), source: 'flag' };
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+  }
+
+  const binding = readHubBinding(hubBindingPath(io.cwd));
+  if (binding !== null) {
+    try {
+      return { origin: normalizeOrigin(binding.hub), source: 'project' };
+    } catch (e) {
+      throw new CliError(`${(e as Error).message} — re-run \`owenloop connect --hub <origin>\` to rebind`);
+    }
+  }
+
+  const discovered = discoverStoredHubs(io);
+  if (discovered.kind === 'one') {
+    return { origin: discovered.origin, source: 'stored' };
+  }
+  if (discovered.kind === 'multiple') {
+    throw new CliError(
+      'cannot determine which hub to use — more than one hub has a stored human credential; ' +
+      `stored hubs: ${discovered.origins.join(', ')}; pass --hub <origin> or run ` +
+      '`owenloop connect --hub <origin>`',
+      { exitCode: 2 },
+    );
+  }
+  if (discovered.kind === 'empty') {
+    throw new CliError(
+      'cannot determine which hub to use — no stored human hub credential was found; ' +
+      'pass --hub <origin>, run `owenloop connect --hub <origin>`, or log in to exactly one hub first ' +
+      '(`owenloop login --hub <origin>`)',
+      { exitCode: 2 },
+    );
+  }
+
+  const path = executionSettingsPath(io.env);
+  const settings = loadSettings(io.env);
+  const raw = settings.hubOrigin;
+  if (raw === undefined || raw.trim() === '') {
+    throw new CliError(
+      `cannot determine which hub to use — the ${discovered.backend} credential store cannot be enumerated ` +
+      `and ${path} has no non-empty hubOrigin; pass --hub <origin> or run ` +
+      '`owenloop connect --hub <origin>` (owenloop setup populates hubOrigin)',
+      { exitCode: 2 },
+    );
+  }
+
+  let origin: string;
+  try {
+    origin = normalizeOrigin(raw);
+  } catch (e) {
+    throw new CliError(`invalid hubOrigin in ${path}: ${(e as Error).message}`);
+  }
+  const credential = readCredential(io, origin, slot);
+  if (credential === null) throw new CliError(emptySlotMessage(origin, slot));
+  return { origin, source: 'settings', credential };
+}
+
 /**
  * Parse `--as <human | agent | agent:NAME>` into a `CredentialSlotSelector`.
  * Absent `--as` means the **human** slot — the everyday interactive case.
@@ -3223,7 +3326,7 @@ function emptySlotMessage(origin: string, slot: CredentialSlotSelector): string 
  * Read the stored credential for `origin` in `slot`. Thin wrapper over the
  * shared `readStoredCredential` in `hub.ts` (the same implementation the public
  * package export uses), threading the CLI's injected `env`/`keychain`. Callers
- * pass a pre-normalized origin (`resolveHub` output); the wrapper's
+ * pass a pre-normalized origin from the command's applicable resolver; the wrapper's
  * normalization is idempotent, so CLI behavior is unchanged. REL-6 no-fallback
  * and corrupt-entry-as-absent semantics live in `hub.ts`.
  */
@@ -3698,9 +3801,10 @@ async function dispatchLogout(io: CliIO, args: Args): Promise<number> {
  * changes so the caller notices the rebind.
  */
 async function dispatchConnect(io: CliIO, args: Args): Promise<number> {
-  const origin = resolveHub(io, args);
   const slot = resolveSlot(args);
-  const cred = readCredential(io, origin, slot);
+  const resolved = resolvePublishingHub(io, args, slot);
+  const { origin } = resolved;
+  const cred = resolved.credential ?? readCredential(io, origin, slot);
   if (!cred) throw new CliError(emptySlotMessage(origin, slot));
 
   const { identity } = await verifyCredential(io, origin, slot, cred);
@@ -3950,15 +4054,15 @@ function orderSelectedDefsByCalls(
 
 /**
  * `owenloop push [<defName>...] [--bundle <bundle.wnlp>] [--force]
- * [--dry-run]` — publish local workflow defs to the bound hub, diffed against
- * the hub's own def `hash`
- * (`GET /api/workflows` — see `computeServerDiff`), never a client-side
- * ledger. Mirrors `add`'s all-or-nothing client-side validation gate before
- * any network write; server-side failures mid-batch record what landed and
- * exit 1. `POST /api/create_workflow` is itself idempotent, so even a wrong
- * "changed" verdict (e.g. from engine-version drift between this CLI and the
- * hub) is harmless — it just costs one extra round-trip that the server
- * reports back as a no-op.
+ * [--dry-run] [--hub <origin>]` — publish local workflow defs, or exact
+ * bundle-backed defs, to the safely resolved hub, diffed against the hub's own
+ * def `hash` (`GET /api/workflows` — see `computeServerDiff`), never a
+ * client-side ledger. Mirrors `add`'s all-or-nothing client-side validation
+ * gate before any network write; server-side failures mid-batch record what
+ * landed and exit 1. `POST /api/create_workflow` is itself idempotent, so even
+ * a wrong "changed" verdict (e.g. from engine-version drift between this CLI
+ * and the hub) is harmless — it just costs one extra round-trip that the
+ * server reports back as a no-op.
  */
 async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   const configuredDefsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
@@ -3970,33 +4074,9 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   const force = flag(args, 'force');
   const slot = resolveSlot(args);
 
-  // Require a project binding.
-  const bindingPath = hubBindingPath(io.cwd);
-  const binding = readHubBinding(bindingPath);
-  if (!binding) throw new CliError('this project is not bound to a hub — run `owenloop connect` first');
-  // Defense in depth (SEC-2): a hub.json written by an older CLI could carry a
-  // remote-http origin that predates the transport policy, and dispatchPush uses
-  // it verbatim as the request origin. Validate the persisted binding at USE
-  // time — normalizeOrigin enforces https-except-loopback. This check lives
-  // here, NOT inside readHubBinding: dispatchConnect reads the existing binding
-  // only to report switchedFrom, and a read-time throw would deadlock rebinding
-  // AWAY from a bad origin. Leave readHubBinding shape-validation-only.
-  let origin: string;
-  try {
-    origin = normalizeOrigin(binding.hub);
-  } catch (e) {
-    throw new CliError(`${(e as Error).message} — re-run \`owenloop connect\` to rebind`);
-  }
-  // A --hub that disagrees with the binding is a mistake, not a silent override.
-  const hubArg = last(args, 'hub');
-  if (hubArg !== undefined) {
-    const requested = normalizeOrigin(hubArg);
-    if (requested !== origin) {
-      throw new CliError(`this project is bound to ${origin}, not ${requested} — re-run \`owenloop connect\` to rebind`);
-    }
-  }
-
-  let cred = readCredential(io, origin, slot);
+  const resolved = resolvePublishingHub(io, args, slot);
+  const { origin } = resolved;
+  let cred = resolved.credential ?? readCredential(io, origin, slot);
   if (!cred) throw new CliError(emptySlotMessage(origin, slot));
 
   let bundle: PushBundleContext | undefined;
@@ -4526,21 +4606,19 @@ function resolveAgentHub(io: CliIO, args: Args, purpose = 'mint on'): string {
       throw new CliError((e as Error).message);
     }
   }
-  const origins = listStoredHubOrigins(io.env, io.keychain);
-  if (origins === null) {
-    const backend = credentialBackend(io.env, io.keychain);
-    const which = backend.kind === 'external' ? 'external-command' : 'keychain';
+  const discovered = discoverStoredHubs(io);
+  if (discovered.kind === 'non-enumerable') {
     throw new CliError(
-      `cannot determine which hub to ${purpose} — the ${which} credential store cannot be enumerated; ` +
+      `cannot determine which hub to ${purpose} — the ${discovered.backend} credential store cannot be enumerated; ` +
         'pass --hub <origin>',
       { exitCode: 2 },
     );
   }
-  if (origins.length === 1) return origins[0]!;
+  if (discovered.kind === 'one') return discovered.origin;
   throw new CliError(
     `cannot determine which hub to ${purpose} — pass --hub <origin>, or log in to exactly one hub first ` +
       '(owenloop login --hub <origin>)' +
-      (origins.length > 1 ? `; stored hubs: ${origins.join(', ')}` : ''),
+      (discovered.kind === 'multiple' ? `; stored hubs: ${discovered.origins.join(', ')}` : ''),
     { exitCode: 2 },
   );
 }
@@ -5277,11 +5355,11 @@ function resolveSetupHub(io: CliIO, args: Args): string {
       throw new CliError((e as Error).message);
     }
   }
-  const origins = listStoredHubOrigins(io.env, io.keychain);
-  if (origins !== null && origins.length === 1) return origins[0]!;
-  if (origins !== null && origins.length > 1) {
+  const discovered = discoverStoredHubs(io);
+  if (discovered.kind === 'one') return discovered.origin;
+  if (discovered.kind === 'multiple') {
     throw new CliError(
-      `more than one hub is configured on this machine — pass --hub <origin> to pick one; stored hubs: ${origins.join(', ')}`,
+      `more than one hub is configured on this machine — pass --hub <origin> to pick one; stored hubs: ${discovered.origins.join(', ')}`,
       { exitCode: 2 },
     );
   }

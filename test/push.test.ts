@@ -10,16 +10,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { packBundle } from '../src/bundle/index.ts';
 import { PAYLOAD_TYPE_PUBLICATION } from '../src/crypto/dsse.ts';
-import { hubBindingPath, readHubBinding, writeHubBinding } from '../src/hub.ts';
+import { credentialFilePath, hubBindingPath, readHubBinding, writeCredentialFile, writeHubBinding } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
+import { settingsPath } from '../packages/work/src/settings/settings.ts';
 import { kcHuman, kcKey, makeFakeHub, makeIo, OAUTH_METADATA, routedFetch, stallingFetch } from './hubkit.ts';
 import type { HubIo, RouteHandler } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
+const OTHER_ORIGIN = 'http://127.0.0.1:10';
 
 function validDef(name: string): string {
   return [
@@ -79,6 +81,13 @@ function writeDefs(cwd: string, defs: Record<string, string>): void {
   const dir = join(cwd, 'workflows');
   mkdirSync(dir, { recursive: true });
   for (const [file, body] of Object.entries(defs)) writeFileSync(join(dir, file), body);
+}
+
+function writeSettings(t: HubIo, settings: Record<string, unknown>): string {
+  const path = settingsPath(t.io.env);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(settings)}\n`);
+  return path;
 }
 
 /** Extract the def name from a create_workflow request body, so a fake hub can
@@ -1147,14 +1156,17 @@ test('push: a malformed GET /api/workflows response is a clean CliError', async 
   assert.match(t.err.join('\n'), /expected a `workflows` array/);
 });
 
-test('push: missing hub.json errors with a connect hint', async () => {
-  const { fetch } = routedFetch({});
-  const t = makeIo({ fetch });
+test('push: no binding or global candidate exits 2 without using OWENLOOP_HUB or DEFAULT_HUB', async () => {
+  const { fetch, calls } = routedFetch({});
+  const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1', OWENLOOP_HUB: ORIGIN } });
   writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
-  // no bind()
   const code = await mainAsync(['push'], t.io);
-  assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /not bound to a hub/);
+  assert.equal(code, 2);
+  assert.match(t.err.join('\n'), /cannot determine which hub/);
+  assert.match(t.err.join('\n'), /--hub <origin>/);
+  assert.match(t.err.join('\n'), /owenloop connect --hub <origin>/);
+  assert.equal(calls.length, 0, 'no DEFAULT_HUB or OWENLOOP_HUB request was attempted');
+  assert.equal(readHubBinding(hubBindingPath(t.cwd)), null, 'push never writes a project binding');
 });
 
 test('push: bound but no stored credential errors with a login hint', async () => {
@@ -1168,19 +1180,80 @@ test('push: bound but no stored credential errors with a login hint', async () =
   assert.match(t.err.join('\n'), /no stored credential/);
 });
 
-test('push --hub disagreeing with the project binding errors, names both origins, sends nothing', async () => {
+test('push: --hub wins over a different project binding and does not rewrite it', async () => {
   const hub = makeFakeHub();
   const { fetch, calls } = routedFetch(hub.routes);
   const t = makeIo({ fetch });
   writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
   bind(t); // binds to ORIGIN = http://127.0.0.1:9
+  t.store.set(kcHuman(OTHER_ORIGIN), JSON.stringify(OAUTH_CRED));
 
-  const code = await mainAsync(['push', '--hub', 'http://127.0.0.1:10'], t.io);
-  assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /bound to http:\/\/127\.0\.0\.1:9/);
-  assert.match(t.err.join('\n'), /http:\/\/127\.0\.0\.1:10/);
-  assert.match(t.err.join('\n'), /owenloop connect/);
-  assert.equal(calls.length, 0, 'zero network calls on a binding mismatch');
+  const code = await mainAsync(['push', '--hub', OTHER_ORIGIN], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.ok(calls.length > 0);
+  assert.ok(calls.every((call) => call.url.startsWith(OTHER_ORIGIN)), 'every hub request uses the explicit origin');
+  assert.deepEqual(readHubBinding(hubBindingPath(t.cwd)), { version: 1, hub: ORIGIN });
+});
+
+test('push: an unbound file-backed store with one human origin resolves and succeeds', async () => {
+  const hub = makeFakeHub();
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  writeCredentialFile(credentialFilePath(t.io.env), { version: 2, hubs: { [ORIGIN]: { human: OAUTH_CRED } } });
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.ok(calls.length > 0);
+  assert.ok(calls.every((call) => call.url.startsWith(ORIGIN)));
+  assert.equal(readHubBinding(hubBindingPath(t.cwd)), null, 'global fallback does not create a project override');
+});
+
+test('push: two file-backed human origins exit 2, list sorted remedies, and send nothing', async () => {
+  const { fetch, calls } = routedFetch({});
+  const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  writeCredentialFile(credentialFilePath(t.io.env), {
+    version: 2,
+    hubs: { [OTHER_ORIGIN]: { human: OAUTH_CRED }, [ORIGIN]: { human: OAUTH_CRED } },
+  });
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 2);
+  const error = t.err.join('\n');
+  assert.match(error, new RegExp(`stored hubs: ${[ORIGIN, OTHER_ORIGIN].sort().join(', ')}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(error, /--hub <origin>/);
+  assert.match(error, /owenloop connect --hub <origin>/);
+  assert.equal(calls.length, 0);
+});
+
+test('push: keychain backend uses settings hubOrigin when the requested credential exists', async () => {
+  const hub = makeFakeHub();
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  writeSettings(t, { hubOrigin: ORIGIN });
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.ok(calls.length > 0);
+  assert.ok(calls.every((call) => call.url.startsWith(ORIGIN)));
+});
+
+test('push: project binding wins over a different keychain settings candidate', async () => {
+  const hub = makeFakeHub();
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: ORIGIN });
+  writeSettings(t, { hubOrigin: OTHER_ORIGIN });
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
+  t.store.set(kcHuman(OTHER_ORIGIN), JSON.stringify(OAUTH_CRED));
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.ok(calls.every((call) => call.url.startsWith(ORIGIN)));
 });
 
 // ---- boolean flag parsing (BOOLEAN_FLAGS) ------------------------------------

@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { canonicalKeyRef, keyRefHash, keysDirFor, PrincipalKeyManager } from '../src/crypto/keys.ts';
 import {
@@ -22,11 +22,21 @@ import { createSshSigner } from '../src/crypto/ssh.ts';
 import { digestBundle } from '../src/bundle/index.ts';
 import { defDigest } from '../src/store/types.ts';
 import { hubBindingPath, writeHubBinding } from '../src/hub.ts';
-import { makeIo } from './hubkit.ts';
+import type { Credential } from '../src/hub.ts';
+import { settingsPath } from '../packages/work/src/settings/settings.ts';
+import { kcHuman, makeIo } from './hubkit.ts';
 
 const SOURCE_FIXTURE = join(import.meta.dirname, 'fixtures', 'bundle', 'golden-source');
 const ORIGIN = 'http://127.0.0.1:9';
+const OTHER_ORIGIN = 'http://127.0.0.1:10';
 const HUMAN_REF = { origin: ORIGIN, kind: 'human' as const, id: 'user_abc' };
+const OAUTH_CRED: Credential = {
+  kind: 'oauth',
+  accessToken: 'mcpat_a',
+  refreshToken: 'rt',
+  expiresAt: Date.now() + 3_600_000,
+  clientId: 'c',
+};
 const GIT_SOURCE = {
   kind: 'git' as const,
   repo: 'https://github.com/example/workflow',
@@ -46,6 +56,13 @@ function sourceFor(t: { cwd: string }): string {
 
 function bind(t: { cwd: string }): void {
   writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: ORIGIN });
+}
+
+function writeSettings(t: { io: { env: Record<string, string | undefined> } }, settings: Record<string, unknown>): string {
+  const path = settingsPath(t.io.env);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(settings)}\n`);
+  return path;
 }
 
 function filesUnder(path: string): string[] {
@@ -79,16 +96,71 @@ test('publish: unknown option names the typo, suggests --unsigned, and writes no
   assert.equal(existsSync(output), false);
 });
 
-test('publish: no hub binding fails before packing or writing', async () => {
-  const t = makeIo();
+test('publish: no binding or global candidate exits 2 before packing and never guesses a default', async () => {
+  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1', OWENLOOP_HUB: ORIGIN } });
   const source = sourceFor(t);
   const output = join(t.cwd, 'published.wnlp');
 
   const code = await mainAsync(['publish', source, '--unsigned', '--output', output], t.io);
-  assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /not bound to a hub/);
+  assert.equal(code, 2);
+  assert.match(t.err.join('\n'), /cannot determine which hub/);
+  assert.match(t.err.join('\n'), /--hub <origin>/);
   assert.equal(existsSync(output), false);
   assert.equal(existsSync(`${output}.unsigned`), false);
+});
+
+test('publish: --hub is accepted and overrides a different binding for author-key selection', async () => {
+  const t = makeIo();
+  const source = sourceFor(t);
+  const output = join(t.cwd, 'published.wnlp');
+  bind(t);
+
+  const code = await mainAsync(['publish', source, '--hub', OTHER_ORIGIN, '--output', output], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), new RegExp(`no author signing key for ${OTHER_ORIGIN.replaceAll('.', '\\.')}`));
+  assert.doesNotMatch(t.err.join('\n'), new RegExp(`no author signing key for ${ORIGIN.replaceAll('.', '\\.')}`));
+  assert.equal(existsSync(output), false);
+});
+
+test('publish: keychain backend uses settings hubOrigin when the human credential exists', async () => {
+  const t = makeIo();
+  const source = sourceFor(t);
+  const output = join(t.cwd, 'published.wnlp');
+  writeSettings(t, { hubOrigin: ORIGIN });
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
+
+  const code = await mainAsync(['publish', source, '--unsigned', '--output', output], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(existsSync(output), true);
+  assert.equal(existsSync(`${output}.unsigned`), true);
+});
+
+test('publish: keychain backend without settings hubOrigin names the exact path and writes nothing', async () => {
+  const t = makeIo();
+  const source = sourceFor(t);
+  const output = join(t.cwd, 'published.wnlp');
+  const path = settingsPath(t.io.env);
+
+  const code = await mainAsync(['publish', source, '--unsigned', '--output', output], t.io);
+  assert.equal(code, 2);
+  assert.match(t.err.join('\n'), /keychain credential store cannot be enumerated/);
+  assert.match(t.err.join('\n'), new RegExp(path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(t.err.join('\n'), /--hub <origin>/);
+  assert.equal(existsSync(output), false);
+  assert.equal(existsSync(`${output}.unsigned`), false);
+});
+
+test('publish: settings-derived origin requires a credential before key or packing work', async () => {
+  const t = makeIo();
+  const source = sourceFor(t);
+  const output = join(t.cwd, 'published.wnlp');
+  writeSettings(t, { hubOrigin: ORIGIN });
+
+  const code = await mainAsync(['publish', source, '--unsigned', '--output', output], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /no stored credential/);
+  assert.deepEqual(filesUnder(t.cwd).filter((path) => !path.includes(`${'/source/'}`)), []);
+  assert.equal(t.principalKeys?.calls.length, 0);
 });
 
 test('publish: signed default refuses missing author key and names setup and --unsigned', async () => {
