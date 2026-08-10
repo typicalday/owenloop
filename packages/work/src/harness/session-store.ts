@@ -96,10 +96,25 @@ export interface SessionStoreOptions {
   warn?: (line: string) => void;
   /** Compaction threshold in bytes, checked after each append. Default 2 MB. */
   maxBytes?: number;
+  /** Clock used to detect an abandoned unterminated tail. Default `Date.now`. */
+  now?: () => number;
+  /** Unchanged-tail grace before one warning is emitted. Default 5 seconds. */
+  unterminatedTailGraceMs?: number;
 }
 
 /** Default compaction threshold — plan §3's 2 MB. */
 export const DEFAULT_MAX_BYTES = 2_000_000;
+/** Grace for a concurrent writer to finish an unterminated JSONL append. */
+export const DEFAULT_UNTERMINATED_TAIL_GRACE_MS = 5_000;
+
+interface TailObservation {
+  tail: string;
+  firstSeenAt: number;
+  warned: boolean;
+}
+
+/** Process-local observations; session files remain the only persisted state. */
+const tailObservations = new Map<string, TailObservation>();
 
 /** `<cacheDir>/sessions.jsonl`. */
 export function sessionsPath(cacheDir: string): string {
@@ -168,10 +183,12 @@ function atomicWrite(filePath: string, content: string): void {
 /**
  * Every valid record in `file`, oldest first. A missing/unreadable file reads as
  * `[]`. A trailing newline is the record-commit marker: an unterminated final
- * tail may be a concurrent writer still appending, so it is ignored silently
- * until a later read sees the newline. Blank lines are skipped silently; every
- * other unusable COMPLETE line is skipped and reported through `warn` with its
- * 1-indexed line number. Never throws.
+ * tail may be a concurrent writer still appending, so the first observation is
+ * ignored silently. An identical non-blank tail that remains past the configured
+ * grace warns once, without treating the uncommitted bytes as a record. A changed
+ * tail restarts the grace; a newline clears the observation. Blank lines are
+ * skipped silently; every other unusable COMPLETE line is skipped and reported
+ * through `warn` with its 1-indexed line number. Never throws.
  */
 export function readSessions(file: string, opts: SessionStoreOptions = {}): SessionRecord[] {
   const warn = opts.warn ?? defaultWarn;
@@ -179,11 +196,32 @@ export function readSessions(file: string, opts: SessionStoreOptions = {}): Sess
   try {
     raw = readFileSync(file, 'utf8');
   } catch {
+    tailObservations.delete(file);
     return []; // fail-open: no store yet is the normal first-run case
   }
   const out: SessionRecord[] = [];
   const lines = raw.split('\n');
   const hasUncommittedTail = raw !== '' && !raw.endsWith('\n');
+  if (!hasUncommittedTail) {
+    tailObservations.delete(file);
+  } else {
+    const tail = lines.at(-1) ?? '';
+    if (tail.trim() === '') {
+      tailObservations.delete(file);
+    } else {
+      const now = (opts.now ?? Date.now)();
+      const observed = tailObservations.get(file);
+      if (observed === undefined || observed.tail !== tail) {
+	tailObservations.set(file, { tail, firstSeenAt: now, warned: false });
+      } else if (
+	!observed.warned
+	&& now - observed.firstSeenAt >= (opts.unterminatedTailGraceMs ?? DEFAULT_UNTERMINATED_TAIL_GRACE_MS)
+      ) {
+	warn(`owenloop work sessions: persistent unterminated record at ${file}:${lines.length}`);
+	observed.warned = true;
+      }
+    }
+  }
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (line === undefined) continue; // noUncheckedIndexedAccess

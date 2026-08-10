@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
-import { createShiftLoop, type ShiftLoop, type ShiftLoopOptions } from '../src/shift/loop.ts';
+import { createShiftLoop, MAX_PENDING_CANDIDATE_AGE_MS, type ShiftLoop, type ShiftLoopOptions } from '../src/shift/loop.ts';
 import { buildSpawnPlan, createDefaultSpawner, safeWorkerDiagnostic, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
 import { readChildRecords, writeChildRecord } from '../src/shift/state.ts';
 import { sessionsPath } from '../src/harness/session-store.ts';
@@ -1223,6 +1223,49 @@ test('a claimed order queued by the agent cap dispatches after a child exits wit
     1,
     'the second run was already claimed, so local dispatch must not wait for a new hub sweep',
   );
+});
+
+test('a queued claim is discarded before the hub pickup window can expire and re-offer it', async () => {
+  cacheBuilderStep();
+  const orders = [wo('run_first', 'builder'), wo('run_stale', 'builder')];
+  const { hub, calls } = mockHub({
+    wake: [
+      { changed: true, cursor: 1 },
+      { changed: false, cursor: 1 },
+    ],
+    perWf: agentWf(orders),
+  });
+  const alive = new Set<number>();
+  const spawns: SpawnSpec[] = [];
+  let pid = 1000;
+  let now = 0;
+  const err: string[] = [];
+  const spawner: Spawner = (spec) => {
+    spawns.push(spec);
+    alive.add(pid);
+    return { pid: pid++ };
+  };
+  const loop = createShiftLoop(
+    baseOpts(hub, spawner, {
+      workflow: 'wf1',
+      cap: 10,
+      maxConcurrentAgents: 1,
+      isAlive: (candidatePid) => alive.has(candidatePid),
+      now: () => now,
+      err: (line) => err.push(line),
+    }),
+  );
+
+  assert.equal(await loop.iterate(), 1);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+
+  alive.delete(1000);
+  now = MAX_PENDING_CANDIDATE_AGE_MS;
+
+  assert.equal(await loop.iterate(), 0);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  assert.match(err.join('\n'), /queued claim expired before local dispatch/);
+  assert.equal(count(calls, 'whats_next'), 1, 'classifying the stale local candidate does not require another hub sweep');
 });
 
 test('live agent-run records consume the agent cap; the global cap still applies too', async () => {

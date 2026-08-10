@@ -35,6 +35,7 @@ import type { ConsumedVerifier } from '../consumed-verifier.ts';
 export type InstructionRefusalKind =
   | 'unknown-digest'
   | 'unknown-step'
+  | 'ambiguous-step'
   | 'integrity'
   | 'no-digest'
   | 'missing-command'
@@ -193,9 +194,19 @@ export function createStoreInstructionResolver(
       if (primed === 'unknown-digest') {
         return refusal('unknown-digest', order, 'no verified local workflow bundle matches the order digest');
       }
+      const lookup = source.lookup({ defDigest: digest, step: order.step, key: order.key });
+      if (lookup.status === 'unknown-digest') {
+	return refusal('integrity', order, 'the primed workflow digest disappeared before instruction lookup');
+      }
+      if (lookup.status === 'unknown-step') {
+	return refusal('unknown-step', order, 'the verified workflow definition has no matching step');
+      }
+      if (lookup.status === 'ambiguous-step') {
+	return refusal('ambiguous-step', order, 'multiple workflows in the verified bundle define the requested step');
+      }
       const step = source.getVerifiedStep(digest, order.step);
       if (step === undefined) {
-        return refusal('unknown-step', order, 'the verified workflow definition has no matching step');
+	return refusal('integrity', order, 'the resolved workflow step is unavailable after instruction lookup');
       }
       const definition = source.getVerifiedDefinition(digest, order.step);
       if (definition === undefined) return refusal('integrity', order, 'the verified workflow definition is unavailable after priming');
@@ -333,17 +344,17 @@ export function createStoreInstructionResolver(
     Object.keys(order.consumes).length > 0;
 
   /**
-   * A command child receives neither `owes[].reasons` nor `owes[].proof`:
-   * those fields stay in the exec holder and are used only to infer the next
-   * produced version when signing the receipt. Keep the launch gate scoped to
-   * the dynamic values that can actually influence the child. Agent holders
-   * still verify the complete order because their rendered prompt includes the
-   * feedback thread.
+   * A command child receives neither `owes[].reasons` nor `owes[].proof`.
+   * Keep the launch gate scoped to dynamic values that can influence the child;
+   * the claim-time output version is separate lifecycle metadata retained by the
+   * exec holder for receipt signing. Agent holders still verify the complete
+   * order because their rendered prompt includes the feedback thread.
    */
   const commandConsumedOrder = (order: OrderPacket): OrderPacket => ({
     ...order,
     owes: order.owes.map((owed) => ({
       path: owed.path,
+      ...(owed.version !== undefined ? { version: owed.version } : {}),
       judgmentRejects: owed.judgmentRejects,
       schemaRejects: owed.schemaRejects,
       reasons: [],

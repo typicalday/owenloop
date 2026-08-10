@@ -436,7 +436,7 @@ test('resolveWorkflowCoordinate: a missing coordinate is StoreNotFoundError (nev
   );
 });
 
-test('resolveWorkflowCoordinate: a project definition overrides a different global definition at the same coordinate', async () => {
+test('resolveWorkflowCoordinate: a project definition overrides a different global definition while reporting both coordinate presences', async () => {
   const projectRoot = tempDir();
   const globalRoot = tempDir();
   const projectDigest = digest('8');
@@ -451,10 +451,14 @@ test('resolveWorkflowCoordinate: a project definition overrides a different glob
     projectRoot, globalRoot, verifier: resolvingVerifier(),
   });
 
-  assert.equal(res.digest, projectDigest);
+  assert.equal(res.digest, projectDigest, 'project-first resolution selects the project digest');
   assert.equal(res.level, 'project');
   assert.equal(res.objectPath, objectDirForDigest(projectRoot, projectDigest));
-  assert.deepEqual(res.presentAt, { project: true, global: false });
+  assert.deepEqual(
+    res.presentAt,
+    { project: true, global: true },
+    'presentAt reports coordinate presence, even when the global coordinate names a shadowed digest',
+  );
 });
 
 test('resolveWorkflowCoordinate: an index entry whose object is missing is object-missing', async () => {

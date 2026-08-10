@@ -231,19 +231,19 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
           const version = priorVersion === undefined
             ? outputVersionForSubmission(orderResponse.order, path)
             : priorVersion + 1;
-          submittedVersion = version;
           proof = await buildSubmitProof({
             origin: deps.origin,
             order: orderResponse.order,
             path,
             value: args['value'],
-            version,
+	    ...(version !== undefined ? { version } : {}),
             now: deps.now,
             warn: deps.err,
             ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
             ...(deps.env !== undefined ? { env: deps.env } : {}),
             ...(deps.sshProcess !== undefined ? { sshProcess: deps.sshProcess } : {}),
           });
+	  submittedVersion = proof === undefined ? undefined : version;
         }
         const res = await hub.submit({
           workflow,

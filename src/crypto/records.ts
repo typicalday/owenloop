@@ -343,6 +343,7 @@ export const ORDER_FIELDS = {
 /** Indexed access pins the already-emitted nested Order shape without cloning it. */
 export const ORDER_OWED_FIELDS = {
   path: 'required',
+  version: 'optional',
   judgmentRejects: 'required',
   schemaRejects: 'required',
   reasons: 'required',

@@ -34,6 +34,8 @@ export interface WorkOrder {
   consumedFingerprint?: Record<string, number>;
   owes?: Array<{
     path: string;
+    /** Current committed artifact version captured at claim time. */
+    version?: number;
     judgmentRejects: number;
     schemaRejects: number;
     reasons: ReasonEntry[];
@@ -201,6 +203,8 @@ export interface OrderPacket {
   /** The owed outputs and their reason threads. */
   owes: Array<{
     path: string;
+    /** Current committed artifact version captured at claim time. */
+    version?: number;
     judgmentRejects: number;
     schemaRejects: number;
     reasons: ReasonEntry[];

@@ -188,7 +188,7 @@ test('digest with no indexed namespace is mode-dependent and never guesses a nam
   const installed = await fixture();
   const source: StoreInstructionSource = {
     digestOf: () => { throw new Error('not used'); },
-    lookup: () => ({ status: 'unknown-digest' }),
+    lookup: () => ({ status: 'resolved', instructions: { maxAttempts: installed.definition.steps[0]!.maxAttempts } }),
     prime: async () => 'resolved',
     getVerifiedStep: () => installed.definition.steps.find((step) => step.name === 'agent-step'),
     getVerifiedDefinition: () => installed.definition,

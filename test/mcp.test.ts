@@ -223,7 +223,13 @@ test('mcp: submit attaches a DSSE submission proof over the original value', asy
           outputs: ['result'],
           consumes: { input: { value: 'seen' } },
           consumedFingerprint: { input: 3 },
-          owes: [{ path: 'result', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+	  owes: [{
+	    path: 'result',
+	    version: 2,
+	    judgmentRejects: 0,
+	    schemaRejects: 0,
+	    reasons: [{ at: 10, action: 'reject', kind: 'structural', by: 'engine', text: 'attacker-controlled feedback', fromVersion: 99 }],
+	  }],
         },
         lease: { claimed: true },
       },
@@ -262,10 +268,12 @@ test('mcp: submit attaches a DSSE submission proof over the original value', asy
     },
   });
   const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
-    produced: Array<{ artifact: string }>;
+    produced: Array<{ artifact: string; version: number }>;
     consumedFingerprint: Record<string, number>;
   };
   assert.equal(record.produced[0]!.artifact, 'result');
+  assert.equal(record.produced[0]!.version, 3);
+  assert.notEqual(record.produced[0]!.version, 100);
   assert.deepEqual(record.consumedFingerprint, { input: 3 });
 });
 
@@ -293,7 +301,7 @@ test('mcp: an omitted consumed fingerprint falls back unsigned only for consumin
             inputs,
             outputs: ['result'],
             consumes,
-            owes: [{ path: 'result', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+	    owes: [{ path: 'result', version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
           },
           lease: { claimed: true },
         },

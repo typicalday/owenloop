@@ -271,9 +271,7 @@ export async function resolveWorkflowCoordinate(args: ResolveWorkflowCoordinateA
     level,
     presentAt: {
       project: projectDigest !== undefined,
-      // A different global digest is a shadowed definition, not another copy
-      // of the selected project object.
-      global: globalDigest === digest,
+      global: globalDigest !== undefined,
     },
   };
 }

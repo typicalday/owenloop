@@ -33,6 +33,14 @@ let warnedUnsigned = false;
  * propagate because silently dropping a configured key would hide corruption.
  */
 export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string | undefined> {
+  const version = outputVersionForSubmission(opts.order, opts.path, opts.version);
+  if (version === undefined) {
+    warnUnsigned(
+      opts.warn,
+      `order ${opts.order.workflow}/${opts.order.run} omitted authoritative version metadata for output '${opts.path}'; submitting without a proof`,
+    );
+    return undefined;
+  }
   const consumedFingerprint = submissionFingerprint(opts.order, opts.warn);
   if (consumedFingerprint === undefined) return undefined;
 
@@ -62,7 +70,7 @@ export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string
     step: opts.order.step,
     key: opts.order.key,
     ...(opts.order.index !== undefined ? { index: opts.order.index } : {}),
-    produced: [{ artifact: opts.path, version: outputVersionForSubmission(opts.order, opts.path, opts.version), value: opts.value }],
+    produced: [{ artifact: opts.path, version, value: opts.value }],
     consumedFingerprint,
     producerKeyId: inspected.publicKey.keyid,
     timestamp: opts.now(),
@@ -91,22 +99,22 @@ function submissionFingerprint(
 }
 
 /**
- * Infer the version that the next producer commit will name when the reduced
- * driver packet has no explicit version hint. Fresh artifact rows start at
- * version zero, so the first commit is version one. A judged approval reuses
- * the submitted stem's version, which is present in the claim fingerprint.
- * A retry after an earlier committed/rejected version advances from the latest
- * reason's source version. This is a best-effort inference because the reduced
- * packet does not carry the coordinator's post-commit version; callers with an
- * authoritative version must pass `version` explicitly.
+ * Resolve the version named by the next submission from authoritative lifecycle
+ * metadata only. A judge approval attests the already-submitted version captured
+ * in the claim fingerprint and does not increment it. A producer commit advances
+ * exactly once from the owed artifact's current claim-time version. Older reduced
+ * packets that carry neither value return `undefined`; callers must submit without
+ * a proof rather than sign a guess derived from unverified feedback text.
  */
-export function outputVersionForSubmission(order: OrderPacket, path: string, explicit?: number): number {
+export function outputVersionForSubmission(
+  order: OrderPacket,
+  path: string,
+  explicit?: number,
+): number | undefined {
   if (explicit !== undefined) return explicit;
-  const consumed = order.consumedFingerprint?.[path];
-  if (consumed !== undefined) return consumed;
+  if (order.judge === path) return order.consumedFingerprint?.[path];
   const owe = order.owes.find((entry) => entry.path === path);
-  const fromVersion = owe?.reasons.at(-1)?.fromVersion;
-  return fromVersion === undefined ? 1 : fromVersion + 1;
+  return owe?.version === undefined ? undefined : owe.version + 1;
 }
 
 function errorMessage(error: unknown): string {

@@ -219,10 +219,13 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     return operation;
   };
 
-  const definitionForStep = (requestedDigest: string, stepName: string): CachedDefinition | undefined => {
-    const matches = cache.get(requestedDigest)?.filter(
+  const definitionsForStep = (requestedDigest: string, stepName: string): CachedDefinition[] =>
+    cache.get(requestedDigest)?.filter(
       (candidate) => candidate.def.steps.some((step) => step.name === stepName),
     ) ?? [];
+
+  const definitionForStep = (requestedDigest: string, stepName: string): CachedDefinition | undefined => {
+    const matches = definitionsForStep(requestedDigest, stepName);
     return matches.length === 1 ? matches[0] : undefined;
   };
 
@@ -234,8 +237,10 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     },
     lookup: (ref: OrderInstructionRef): OrderInstructionLookup => {
       if (!cache.has(ref.defDigest)) return { status: 'unknown-digest' };
-      const cached = definitionForStep(ref.defDigest, ref.step);
-      if (cached === undefined) return { status: 'unknown-step' };
+      const matches = definitionsForStep(ref.defDigest, ref.step);
+      if (matches.length === 0) return { status: 'unknown-step' };
+      if (matches.length > 1) return { status: 'ambiguous-step' };
+      const cached = matches[0]!;
       const step = cached.def.steps.find((candidate) => candidate.name === ref.step);
       if (step === undefined) return { status: 'unknown-step' };
       return {

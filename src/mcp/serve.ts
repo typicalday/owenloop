@@ -335,6 +335,11 @@ async function signMcpSubmit(deps: McpDeps, args: Record<string, unknown>): Prom
   }
 
   const order = orderResponse.json['order'] as unknown as Order;
+  const version = outputVersion(order, path);
+  if (version === undefined) {
+    warnMcpUnsigned(deps, `order ${workflow}/${run} omitted authoritative version metadata for output '${path}'; submitting without a proof`);
+    return undefined;
+  }
   const consumedFingerprint = submissionFingerprint(order, deps);
   if (consumedFingerprint === undefined) return undefined;
 
@@ -345,7 +350,7 @@ async function signMcpSubmit(deps: McpDeps, args: Record<string, unknown>): Prom
     step: order.step,
     key: order.key,
     ...(order.index !== undefined ? { index: order.index } : {}),
-    produced: [{ artifact: path, version: outputVersion(order, path), value: args['value'] }],
+    produced: [{ artifact: path, version, value: args['value'] }],
     consumedFingerprint,
     producerKeyId: inspected.publicKey.keyid,
     timestamp: Date.now(),
@@ -370,17 +375,11 @@ function submissionFingerprint(order: Order, deps: McpDeps): NonNullable<Order['
   return {};
 }
 
-/**
- * Best-effort pre-commit version inference for reduced MCP order packets. The
- * packet has no authoritative post-commit version; callers needing one must use
- * a version-aware transport instead of treating this value as an attestation.
- */
-function outputVersion(order: Order, path: string): number {
-  const consumed = order.consumedFingerprint?.[path];
-  if (consumed !== undefined) return consumed;
+/** Resolve a signed submit version from authoritative claim metadata only. */
+function outputVersion(order: Order, path: string): number | undefined {
+  if (order.judge === path) return order.consumedFingerprint?.[path];
   const owe = order.owes.find((entry) => entry.path === path);
-  const fromVersion = owe?.reasons.at(-1)?.fromVersion;
-  return fromVersion === undefined ? 1 : fromVersion + 1;
+  return owe?.version === undefined ? undefined : owe.version + 1;
 }
 
 function warnMcpUnsigned(deps: McpDeps, reason: string): void {

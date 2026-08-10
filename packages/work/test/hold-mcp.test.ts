@@ -171,7 +171,7 @@ test('hold-MCP submit attaches a DSSE submission proof over the submitted value'
       outputs: ['result'],
       consumes: { input: { value: 'seen' } },
       consumedFingerprint: { input: 2 },
-      owes: [{ path: 'result', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+      owes: [{ path: 'result', version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     },
     lease: { claimed: true },
   };
@@ -216,8 +216,8 @@ test('hold-MCP signs a repeated successful output refinement for its next commit
       consumes: {},
       consumedFingerprint: {},
       owes: [
-        { path: 'research', judgmentRejects: 0, schemaRejects: 0, reasons: [] },
-        { path: 'plan', judgmentRejects: 0, schemaRejects: 0, reasons: [] },
+	{ path: 'research', version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] },
+	{ path: 'plan', version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] },
       ],
     },
     lease: { claimed: true },

@@ -125,7 +125,7 @@ export function safeWorkerDiagnostic(stderr: string): string | undefined {
     .find((candidate) =>
       /^owenloop work agent-run: consumed artifact refusal \((?:no-proof|signature|value-digest|version|chain|scope|prerequisite)\) /u.test(candidate)
       || /^owenloop work agent-run: (?:loading the step spec .* failed:|no step spec |no adapter registered for harness |instruction store unavailable:|instruction refusal \((?:integrity|harness-carrier)\):|could not load OWENLOOP_HARNESS_MODULE |no hub origin)/u.test(candidate)
-      || /^owenloop work exec: instruction refusal \((?:unknown-digest|unknown-step|integrity|no-digest|missing-command|unverified-def|origin-policy|unverified-consumed)\) /u.test(candidate)
+      || /^owenloop work exec: instruction refusal \((?:unknown-digest|unknown-step|ambiguous-step|integrity|no-digest|missing-command|unverified-def|origin-policy|unverified-consumed)\) /u.test(candidate)
       || /^owenloop work exec: (?:instruction store unavailable:|no hub origin|missing required <order-id>)/u.test(candidate),
     );
   if (line === undefined) return undefined;

@@ -156,6 +156,42 @@ test('a concurrent partial final append is ignored until its newline commits it'
   assert.equal(warnings.length, 0);
 });
 
+test('an unchanged unterminated tail warns once after grace and a changed tail starts a new grace', () => {
+  const first = rec({ step: 'builder', token: 'ok-1' });
+  writeFileSync(file, `${JSON.stringify(first)}\nnot json`);
+  let now = 0;
+  const warnings: string[] = [];
+  const opts = {
+    warn: (line: string) => warnings.push(line),
+    now: () => now,
+    unterminatedTailGraceMs: 100,
+  };
+
+  assert.deepEqual(readSessions(file, opts).map((record) => record.token), ['ok-1']);
+  assert.deepEqual(warnings, [], 'the first observation remains silent for a concurrent writer');
+
+  now = 100;
+  readSessions(file, opts);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, new RegExp(`persistent unterminated record at ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:2`));
+
+  now = 200;
+  readSessions(file, opts);
+  assert.equal(warnings.length, 1, 'repeated reads do not spam the same abandoned tail');
+
+  writeFileSync(file, `${JSON.stringify(first)}\nstill partial`);
+  readSessions(file, opts);
+  assert.equal(warnings.length, 1, 'changing the tail restarts the grace period');
+
+  now = 300;
+  readSessions(file, opts);
+  assert.equal(warnings.length, 2);
+
+  writeFileSync(file, `${JSON.stringify(first)}\n`);
+  readSessions(file, opts);
+  assert.equal(warnings.length, 2, 'committing or removing the tail clears the observation');
+});
+
 test('latestFor over a corrupt file still answers, warning through the default stderr sink', () => {
   writeFileSync(
     file,

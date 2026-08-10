@@ -31,9 +31,10 @@ const ORDER: OrderPacket = {
   owes: [
     {
       path: 'result',
+      version: 4,
       judgmentRejects: 0,
       schemaRejects: 1,
-      reasons: [{ at: 10, action: 'schema-reject', kind: 'validation', by: 'engine', text: 'bad shape', fromVersion: 4 }],
+      reasons: [{ at: 10, action: 'schema-reject', kind: 'validation', by: 'engine', text: 'bad shape', fromVersion: 99 }],
     },
   ],
 };
@@ -125,6 +126,34 @@ test('buildSubmitProof uses an explicit committed version when provided', async 
   });
   const record = JSON.parse(verified.payloadBytes.toString('utf8')) as { produced: Array<{ version: number }> };
   assert.equal(record.produced[0]!.version, 9);
+});
+
+test('buildSubmitProof falls back unsigned when the output has no authoritative version metadata', async () => {
+  const warnings: string[] = [];
+  let signingCalls = 0;
+  const proof = await buildSubmitProof({
+    origin: ORIGIN,
+    order: {
+      ...ORDER,
+      owes: ORDER.owes.map(({ version: _version, ...owe }) => owe),
+    },
+    path: 'result',
+    value: { ok: true },
+    now: () => 1,
+    warn: (line) => warnings.push(line),
+    principalKeys: {
+      ...keysFor(),
+      withSigningKey: async () => {
+	signingCalls += 1;
+	throw new Error('withSigningKey must not run');
+      },
+    },
+    sshProcess: fakeSshProcess([]),
+  });
+  assert.equal(proof, undefined);
+  assert.equal(signingCalls, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /omitted authoritative version metadata/);
 });
 
 test('buildSubmitProof refuses a proof when consumed inputs have no fingerprint', async () => {

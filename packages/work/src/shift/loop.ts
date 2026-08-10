@@ -198,12 +198,19 @@ interface Candidate {
   defName: string | undefined;
   defHash: string | undefined;
   kind: 'agent' | 'command';
+  /** Local time when the hub-served claim entered this dispatch candidate. */
+  queuedAt: number;
   /** True when this run already had a live record (handout lapsed → re-offer). */
   reoffer: boolean;
 }
 
 /** The `maxConcurrentAgents` fallback when the option is absent. */
 const DEFAULT_MAX_AGENTS = 4;
+/**
+ * The hub reaps a never-contacted claim after 120 seconds. Stop local queueing
+ * after 90 seconds so a detached child retains 30 seconds to make first contact.
+ */
+export const MAX_PENDING_CANDIDATE_AGE_MS = 90_000;
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -374,6 +381,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 
     for (const [run, candidate] of pendingCandidates) {
       if (remaining <= 0) break;
+      if (opts.now() - candidate.queuedAt >= MAX_PENDING_CANDIDATE_AGE_MS) {
+	pendingCandidates.delete(run);
+	opts.err(`[${candidate.workflow}/${run}] queued claim expired before local dispatch — leaving the hub pickup window to re-offer it`);
+	continue;
+      }
       if (liveRuns.has(run)) {
         pendingCandidates.delete(run);
         continue;
@@ -513,6 +525,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
             defName,
             defHash: bundle?.def.hash,
             kind: 'command',
+	    queuedAt: opts.now(),
             reoffer,
           };
           if (remaining <= 0) {
@@ -548,6 +561,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
           defName,
           defHash: bundle?.def.hash,
           kind: 'agent',
+	  queuedAt: opts.now(),
           reoffer,
         };
 

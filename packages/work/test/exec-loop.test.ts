@@ -94,7 +94,7 @@ function commandOrder(o: OrderOpts = {}): GetOrderResponse {
       ...(o.judge !== undefined ? { judge: o.judge } : {}),
       defDigest,
       consumes: {},
-      owes: paths.map((path) => ({ path, judgmentRejects: 0, schemaRejects: 0, reasons: [] })),
+      owes: paths.map((path) => ({ path, version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] })),
     },
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
   };

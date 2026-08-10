@@ -157,16 +157,28 @@ test('store instruction source: a bundle digest refuses a step name shared by mu
     workflows: { 'child-fixture': childWorkflow },
   });
   const installed = await installBundleFixture({ sourceDir });
+  const globalRoot = tempDir('owenloop-ambiguous-source-global-');
   const source = createStoreInstructionSource({
     projectRoot: installed.root,
-    globalRoot: tempDir('owenloop-ambiguous-source-global-'),
+    globalRoot,
     verifier: createBundleIngestor(),
   });
 
   assert.equal(await source.prime(installed.result.digest), 'resolved');
-  assert.deepEqual(source.lookup({ defDigest: installed.result.digest, step: 'runner', key: '' }), { status: 'unknown-step' });
+  assert.deepEqual(source.lookup({ defDigest: installed.result.digest, step: 'runner', key: '' }), { status: 'ambiguous-step' });
   assert.equal(source.getVerifiedStep(installed.result.digest, 'runner'), undefined);
   assert.equal(source.getVerifiedDefinition(installed.result.digest, 'runner'), undefined);
+
+  const resolver = createStoreInstructionResolver({
+    projectRoot: installed.root,
+    globalRoot,
+    verifier: createBundleIngestor(),
+    source,
+    definitionVerifier: () => ({ kind: 'verified', publisherKeyId: '', principal: '' }),
+  });
+  const resolved = await resolver.resolveCommand(order(installed.result.digest));
+  assert.equal(resolved.ok, false);
+  if (!resolved.ok) assert.equal(resolved.kind, 'ambiguous-step');
 });
 
 test('store instruction source: a stale index row does not poison a clean requested workflow', async () => {
