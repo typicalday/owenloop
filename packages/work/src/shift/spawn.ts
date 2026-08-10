@@ -18,6 +18,7 @@
  * pure `buildSpawnPlan` so a test can assert the exact shape as data.
  */
 import { spawn } from 'node:child_process';
+import type { Readable } from 'node:stream';
 
 import { resolveOwenloopBin } from '../owenloop-bin.ts';
 
@@ -100,6 +101,21 @@ function stripControlCharacters(value: string): string {
  * Select one deliberately narrow worker diagnostic. Agent progress and prompt
  * text use the same stream, so arbitrary stderr must never cross into Shift
  * events. These prefixes are emitted only by pre-session refusal/startup gates.
+ *
+ * Both worker roles are covered, because `WorkerFailure.kind` has two values and
+ * an `exec` child that refuses at startup must not report the useless generic
+ * message while an `agent-run` child reports the real cause. The two roles carry
+ * DIFFERENT risk, so the allowlists are not shared:
+ *
+ *  - `owenloop work agent-run:` — the step agent's prompt text and model
+ *    progress ride this same stream, so only the pre-session gates are matched.
+ *  - `owenloop work exec:` — the child's COMMAND output never reaches this
+ *    stream at all. `runCommand` (`packages/work/src/exec/runner.ts`) spawns the
+ *    command with its own `['ignore','pipe','pipe']` stdio and consumes both
+ *    streams into `outputHash`/`outputTail`; nothing is re-emitted to the exec
+ *    child's own stderr. Every `owenloop work exec:` line is therefore the
+ *    driver's own prose. Even so, only the startup/refusal gates are matched —
+ *    the mid-run submit/reject lines can quote hub response text.
  */
 export function safeWorkerDiagnostic(stderr: string): string | undefined {
   const line = stderr
@@ -108,7 +124,9 @@ export function safeWorkerDiagnostic(stderr: string): string | undefined {
     .map((candidate) => stripControlCharacters(candidate).trim())
     .find((candidate) =>
       /^owenloop work agent-run: consumed artifact refusal \((?:no-proof|signature|value-digest|version|chain|scope|prerequisite)\) /u.test(candidate)
-      || /^owenloop work agent-run: (?:loading the step spec .* failed:|no step spec |no adapter registered for harness |instruction store unavailable:|instruction refusal \((?:integrity|harness-carrier)\):|could not load OWENLOOP_HARNESS_MODULE |no hub origin)/u.test(candidate),
+      || /^owenloop work agent-run: (?:loading the step spec .* failed:|no step spec |no adapter registered for harness |instruction store unavailable:|instruction refusal \((?:integrity|harness-carrier)\):|could not load OWENLOOP_HARNESS_MODULE |no hub origin)/u.test(candidate)
+      || /^owenloop work exec: instruction refusal \((?:unknown-digest|unknown-step|integrity|no-digest|missing-command|unverified-def|origin-policy|unverified-consumed)\) /u.test(candidate)
+      || /^owenloop work exec: (?:instruction store unavailable:|no hub origin|missing required <order-id>)/u.test(candidate),
     );
   if (line === undefined) return undefined;
 
@@ -201,6 +219,20 @@ export function createDefaultSpawner(
     child.stderr?.on('data', (chunk: string) => {
       stderrTail = (stderrTail + chunk).slice(-MAX_STDERR_TAIL_BYTES);
     });
+    // The stderr pipe is a libuv handle owned by THIS process, and `child.unref()`
+    // does not cover it. Left referenced, the Shift's event loop stays alive for
+    // the child's entire lifetime — an `owenloop work shift --once` run would
+    // block until every dispatched worker exited, defeating the detached
+    // hand-off this seam exists to perform. Unref the pipe too: data still
+    // arrives while the Shift is running (its poll loop and daemon socket hold
+    // the loop open), it simply stops being a reason to keep running.
+    //
+    // `ChildProcess.stderr` is typed `Readable`, which declares no `unref`. The
+    // concrete object for a `'pipe'` stdio slot is a `net.Socket`, which does.
+    // Probe rather than assert the type, so a future non-Socket stream is a
+    // silent no-op instead of a TypeError in the dispatch path.
+    const stderrPipe = child.stderr as (Readable & { unref?: () => void }) | null;
+    if (typeof stderrPipe?.unref === 'function') stderrPipe.unref();
     let failureReported = false;
     const report = (exitStatus: number | null, signal: NodeJS.Signals | null, message: string): void => {
       if (failureReported || onFailure === undefined) return;
@@ -225,6 +257,18 @@ export function createDefaultSpawner(
     });
     child.unref();
     if (child.pid === undefined) {
+      // A synchronous spawn failure leaves no pid AND makes Node emit `error` on
+      // a later tick (verified on node v22: `pid` undefined, events `error` then
+      // `close`, no `exit`). The spawned COMMAND here is always
+      // `process.execPath`, never `binPath`, so the trigger is not a missing bin
+      // — it is resource exhaustion in the Shift itself (EMFILE from too many
+      // concurrent children, ENOMEM), which is exactly the condition a busy
+      // dispatcher hits. Throwing is what the caller sees, and
+      // `createShiftLoop.dispatchCandidate` already turns that throw into one
+      // `failed` event. Latch the reporter closed first, or the `error` handler
+      // registered above fires afterwards and emits a SECOND `failed` event —
+      // two daemon events for one dispatch attempt.
+      failureReported = true;
       throw new Error(`spawn of 'owenloop work ${kind} ${spec.workflow}/${spec.run}' returned no pid`);
     }
     return { pid: child.pid };

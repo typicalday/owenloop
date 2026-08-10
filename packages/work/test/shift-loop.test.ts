@@ -893,6 +893,96 @@ test('safeWorkerDiagnostic ignores prompts, progress, and arbitrary stderr', () 
   assert.equal(safeWorkerDiagnostic('prompt contents\nprovider progress\narbitrary failure\n'), undefined);
 });
 
+// REGRESSION: `WorkerFailure.kind` has two values, but the allowlist matched only
+// `owenloop work agent-run:` prefixes. An `exec` child that refused at startup
+// therefore always reported the useless generic message. Every kind matched here
+// is a real member of `InstructionRefusalKind`
+// (packages/work/src/exec/instructions.ts) rendered by `refusal()`.
+test('safeWorkerDiagnostic surfaces an exec startup refusal instead of the generic message', () => {
+  const reported = safeWorkerDiagnostic(
+    "owenloop work exec: instruction refusal (unverified-def) for wf1/run_9 step 'cmd' " +
+      "defDigest 'sha256:abc': publication signature did not verify\n",
+  );
+  assert.match(reported ?? '', /instruction refusal \(unverified-def\)/u);
+  assert.equal(
+    safeWorkerDiagnostic('owenloop work exec: no hub origin — pass --origin <url> or set hubOrigin in settings\n'),
+    'owenloop work exec: no hub origin — pass --origin <url> or set hubOrigin in settings',
+  );
+});
+
+// The widening is deliberately limited to the pre-run startup/refusal gates. A
+// mid-run exec line can quote hub response text, so it must stay unmatched.
+test('safeWorkerDiagnostic still refuses mid-run exec lines and arbitrary exec stderr', () => {
+  assert.equal(safeWorkerDiagnostic('owenloop work exec: submit to workspace rejected (schema): hub said token=abc\n'), undefined);
+  assert.equal(safeWorkerDiagnostic('owenloop work exec: running wf1/run_9 (step \'cmd\')\n'), undefined);
+  assert.equal(safeWorkerDiagnostic('owenloop work exec: something entirely unrecognized\n'), undefined);
+});
+
+// REGRESSION: a synchronous spawn failure yields no pid AND makes Node emit
+// `error` on a later tick (verified on node v22: `pid` undefined, events
+// `error` then `close`, no `exit`). In production the trigger is resource
+// exhaustion in the Shift (EMFILE/ENOMEM), because the spawned command is
+// always `process.execPath`; an unresolvable `execPath` reproduces the same
+// code path here. The `pid === undefined` throw is the caller's single signal —
+// `createShiftLoop.dispatchCandidate` converts it into one `failed` event — so
+// the deferred `error` handler must NOT also report, or one dispatch attempt
+// produces two daemon `failed` events.
+test('a spawn that returns no pid throws once and never also reports a duplicate worker failure', async () => {
+  const realExecPath = process.execPath;
+  const failures: unknown[] = [];
+  const keepAlive = setTimeout(() => {}, 400);
+  try {
+    Object.defineProperty(process, 'execPath', { value: '/nonexistent/owenloop-node', configurable: true, writable: true });
+    const spawner = createDefaultSpawner(ORIGIN, 'default', '/pkg/bin/owenloop.mjs', 'shf_test', (failure) => failures.push(failure));
+    assert.throws(
+      () => spawner({ workflow: 'wf1', run: 'run_nopid', step: 'cmd' }),
+      /returned no pid/u,
+    );
+  } finally {
+    Object.defineProperty(process, 'execPath', { value: realExecPath, configurable: true, writable: true });
+  }
+
+  // Let the deferred `error` event land before asserting; that event is what
+  // used to produce the second report.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  clearTimeout(keepAlive);
+  assert.deepEqual(failures, [], 'the throw is the single report path for a spawn that yields no pid');
+});
+
+// REGRESSION: `stdio: [...,'pipe']` creates a libuv handle owned by the SHIFT
+// process, and `child.unref()` does not cover it. Left referenced, the Shift's
+// event loop stays alive for the child's whole lifetime, so `owenloop work
+// shift --once` would block until every dispatched worker exited — defeating the
+// detached hand-off this seam exists to perform.
+test('the spawner does not keep its own event loop referenced for the detached child lifetime', async () => {
+  const script = join(stateDir, '..', 'slow-child.mjs');
+  writeFileSync(script, "process.stderr.write('early\\n');\nsetTimeout(() => {}, 60_000);\n");
+  const spawner = createDefaultSpawner(ORIGIN, 'default', script, 'shf_test');
+
+  // `_getActiveHandles()` lists exactly the handles that are a reason for this
+  // process's event loop to keep running. The child's stderr pipe appears there
+  // as a `Socket` while it is referenced, and drops off once unref'd — data
+  // still reaches the tail buffer for as long as the Shift is up, it simply
+  // stops holding the loop open.
+  //
+  // Measured as a DELTA across the one spawn, never as an absolute count: under
+  // `node --test` the runner's own piped stdio already contributes referenced
+  // Sockets that have nothing to do with this seam. Verified to fail (delta 1)
+  // when `child.stderr.unref()` is removed from `createDefaultSpawner`.
+  const activeSockets = (): number =>
+    (process as unknown as { _getActiveHandles: () => { constructor: { name: string } }[] })
+      ._getActiveHandles()
+      .filter((handle) => handle.constructor.name === 'Socket').length;
+
+  const before = activeSockets();
+  spawner({ workflow: 'wf1', run: 'run_detach', step: 'cmd' });
+  assert.equal(
+    activeSockets() - before,
+    0,
+    "the child stderr pipe must be unref'd alongside the child itself",
+  );
+});
+
 // createDefaultSpawner is a thin wrapper: it captures shiftId at
 // construction and passes it straight through to buildSpawnPlan (see spawn.ts
 // doc comment) before calling the real `spawn`. Per this file's own testing

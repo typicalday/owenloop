@@ -3877,15 +3877,15 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     if (bundle !== undefined) {
       allDefs = new Map<string, WorkflowDef>();
       for (const [name, workflowPath] of Object.entries(bundle.manifest.workflows)) {
-	try {
-	  const def = loadDefFile(join(defsDir, workflowPath));
-	  if (def.name !== name) {
-	    throw new CliError(`manifest workflow '${name}' loads as '${def.name}'`);
-	  }
-	  allDefs.set(name, def);
-	} catch (e) {
-	  throw new CliError(`owenloop push --bundle: cannot load workflow '${name}': ${(e as Error).message}`);
-	}
+        try {
+          const def = loadDefFile(join(defsDir, workflowPath));
+          if (def.name !== name) {
+            throw new CliError(`manifest workflow '${name}' loads as '${def.name}'`);
+          }
+          allDefs.set(name, def);
+        } catch (e) {
+          throw new CliError(`owenloop push --bundle: cannot load workflow '${name}': ${(e as Error).message}`);
+        }
       }
     } else {
       allDefs = loadDefsRaw(defsDir, failures);
@@ -4032,7 +4032,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       let res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
       if (res.status === 401 && cred.kind === 'oauth') {
         cred = await refreshOAuth(io, origin, slot, cred as Extract<Credential, { kind: 'oauth' }>);
-	res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
+        res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
       }
       if (res.status === 401) {
         if (cred.kind === 'agent') {

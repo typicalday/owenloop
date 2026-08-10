@@ -141,9 +141,9 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     // ambiguous step name instead of choosing one by manifest order.
     if (requestedDigest === bundleDigest) {
       cache.set(requestedDigest, [...finalized.values()].map((def) => ({
-	def,
-	bundleDigest,
-	objectPath: resolved.objectPath,
+        def,
+        bundleDigest,
+        objectPath: resolved.objectPath,
       })));
       return true;
     }
@@ -152,7 +152,7 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     // digest path for backwards compatibility.
     for (const def of finalized.values()) {
       if (defInstructionDigest(def) === requestedDigest) {
-	cache.set(requestedDigest, [{ def, bundleDigest, objectPath: resolved.objectPath }]);
+        cache.set(requestedDigest, [{ def, bundleDigest, objectPath: resolved.objectPath }]);
         return true;
       }
     }
@@ -254,10 +254,10 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     },
     getVerifiedDefinition: (requestedDigest: string, stepName?: string): WorkflowDef | undefined => {
       const cached = stepName === undefined
-	? cache.get(requestedDigest)
-	: [definitionForStep(requestedDigest, stepName)].filter(
-	  (candidate): candidate is CachedDefinition => candidate !== undefined,
-	);
+        ? cache.get(requestedDigest)
+        : [definitionForStep(requestedDigest, stepName)].filter(
+          (candidate): candidate is CachedDefinition => candidate !== undefined,
+        );
       return cached?.length === 1 ? cached[0]!.def : undefined;
     },
     getVerifiedObject: (requestedDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined => {

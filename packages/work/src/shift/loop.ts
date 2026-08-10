@@ -378,6 +378,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
         pendingCandidates.delete(run);
         continue;
       }
+      // The agent lane's second budget can be full while the dispatch cap still
+      // has room. Skip this entry and KEEP it queued (a command entry further
+      // down the map is still dispatchable) — `continue`, never `break`, so one
+      // blocked agent does not head-of-line-block the whole queue.
       if (candidate.kind === 'agent' && agentRoom <= 0) continue;
 
       // Remove before spawning. A spawn failure falls back to the hub pickup
