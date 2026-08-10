@@ -62,7 +62,7 @@ export async function buildSubmitProof(opts: SubmitProofOptions): Promise<string
     step: opts.order.step,
     key: opts.order.key,
     ...(opts.order.index !== undefined ? { index: opts.order.index } : {}),
-    produced: [{ artifact: opts.path, version: outputVersion(opts.order, opts.path, opts.version), value: opts.value }],
+    produced: [{ artifact: opts.path, version: outputVersionForSubmission(opts.order, opts.path, opts.version), value: opts.value }],
     consumedFingerprint,
     producerKeyId: inspected.publicKey.keyid,
     timestamp: opts.now(),
@@ -100,7 +100,7 @@ function submissionFingerprint(
  * packet does not carry the coordinator's post-commit version; callers with an
  * authoritative version must pass `version` explicitly.
  */
-function outputVersion(order: OrderPacket, path: string, explicit: number | undefined): number {
+export function outputVersionForSubmission(order: OrderPacket, path: string, explicit?: number): number {
   if (explicit !== undefined) return explicit;
   const consumed = order.consumedFingerprint?.[path];
   if (consumed !== undefined) return consumed;

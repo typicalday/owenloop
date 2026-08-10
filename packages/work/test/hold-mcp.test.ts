@@ -200,6 +200,55 @@ test('hold-MCP submit attaches a DSSE submission proof over the submitted value'
   assert.deepEqual(record.consumedFingerprint, { input: 2 });
 });
 
+test('hold-MCP signs a repeated successful output refinement for its next committed version', async () => {
+  const orderResponse: GetOrderResponse = {
+    text: '',
+    workflow: 'wf1',
+    run: 'run1',
+    order: {
+      run: 'run1',
+      workflow: 'wf1',
+      step: 'planner',
+      key: '',
+      defDigest: 'def-digest',
+      inputs: [],
+      outputs: ['research', 'plan'],
+      consumes: {},
+      consumedFingerprint: {},
+      owes: [
+        { path: 'research', judgmentRejects: 0, schemaRejects: 0, reasons: [] },
+        { path: 'plan', judgmentRejects: 0, schemaRejects: 0, reasons: [] },
+      ],
+    },
+    lease: { claimed: true },
+  };
+  const { hub, calls } = mockHub({ getOrder: orderResponse, submit: { outcome: 'green', closed: false } });
+  const mount = createHoldMcp(deps(hub, {
+    origin: 'https://hub.example.test',
+    principalKeys: signingKeys(),
+    sshProcess: fakeSshProcess(),
+    consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
+  }));
+  const submit = tool(mount.tools, 'submit');
+  await submit.handler({ path: 'research', value: { draft: 1 } }, ctx);
+  await submit.handler({ path: 'research', value: { draft: 2 } }, ctx);
+
+  const proofs = calls
+    .filter((call) => call.verb === 'submit')
+    .map((call) => (call.arg as { proof: string }).proof);
+  const versions: number[] = [];
+  for (const proof of proofs) {
+    const verified = await dsseVerifySubmission(JSON.parse(proof), {
+      async verify() {
+        return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
+      },
+    });
+    const record = JSON.parse(verified.payloadBytes.toString('utf8')) as { produced: Array<{ version: number }> };
+    versions.push(record.produced[0]!.version);
+  }
+  assert.deepEqual(versions, [1, 2]);
+});
+
 // W7/D4: when the bound holder is known, submit carries it through unchanged
 // so the hub's attribution columns get filled.
 test('submit carries the bound holder through to the hub', async () => {
