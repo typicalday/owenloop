@@ -3,7 +3,7 @@
  *
  * Every order the shift dispatches becomes a DETACHED
  * `owenloop work exec <workflow>/<run> --origin <url>` child: `detached: true`,
- * `stdio: 'ignore'`, `unref()` — so the child is its own process-group leader and
+ * stdout ignored, bounded stderr diagnostics, `unref()` — so the child is its own process-group leader and
  * survives the parent's death (SP5-verified kernel reparenting). The shift meters
  * and hands off; the child self-leases (C5). Both ids ride the argv as the
  * composite `<workflow>/<run>` order-id `owenloop work exec` parses, and `--origin`
@@ -61,8 +61,10 @@ export interface SpawnResult {
 /** The spawn seam. Injected; faked in tests. */
 export type Spawner = (spec: SpawnSpec) => SpawnResult;
 
-/** Safe, bounded metadata emitted when a detached worker fails. No child
- * stderr, prompt, artifact value, environment, or credential is captured. */
+/** Safe, bounded metadata emitted when a detached worker fails. Only a
+ * whitelisted, redacted refusal/startup diagnostic may be derived from child
+ * stderr; prompts, progress, artifact values, environments, and credentials
+ * are never reported. */
 export interface WorkerFailure {
   workflow: string;
   run: string;
@@ -81,7 +83,40 @@ export type WorkerFailureReporter = (failure: WorkerFailure) => void;
 export interface SpawnPlan {
   command: string;
   args: string[];
-  options: { detached: true; stdio: 'ignore'; env: NodeJS.ProcessEnv };
+  options: { detached: true; stdio: ['ignore', 'ignore', 'pipe']; env: NodeJS.ProcessEnv };
+}
+
+const MAX_STDERR_TAIL_BYTES = 16 * 1024;
+const MAX_DIAGNOSTIC_CHARS = 1_024;
+
+function stripControlCharacters(value: string): string {
+  return [...value].filter((character) => {
+    const code = character.codePointAt(0)!;
+    return code === 9 || (code >= 32 && code !== 127);
+  }).join('');
+}
+
+/**
+ * Select one deliberately narrow worker diagnostic. Agent progress and prompt
+ * text use the same stream, so arbitrary stderr must never cross into Shift
+ * events. These prefixes are emitted only by pre-session refusal/startup gates.
+ */
+export function safeWorkerDiagnostic(stderr: string): string | undefined {
+  const line = stderr
+    .split(/\r?\n/u)
+    .reverse()
+    .map((candidate) => stripControlCharacters(candidate).trim())
+    .find((candidate) =>
+      /^owenloop work agent-run: consumed artifact refusal \((?:no-proof|signature|value-digest|version|chain|scope|prerequisite)\) /u.test(candidate)
+      || /^owenloop work agent-run: (?:loading the step spec .* failed:|no step spec |no adapter registered for harness |instruction store unavailable:|instruction refusal \((?:integrity|harness-carrier)\):|could not load OWENLOOP_HARNESS_MODULE |no hub origin)/u.test(candidate),
+    );
+  if (line === undefined) return undefined;
+
+  const redacted = line
+    .replace(/\b(Bearer\s+)[^\s]+/giu, '$1[redacted]')
+    .replace(/\b(api[_-]?key|token|password|secret)(\s*[:=]\s*)[^\s,;]+/giu, '$1$2[redacted]')
+    .replace(/([?&](?:api[_-]?key|token|password|secret)=)[^&\s]+/giu, '$1[redacted]');
+  return redacted.slice(0, MAX_DIAGNOSTIC_CHARS);
 }
 
 /**
@@ -131,7 +166,7 @@ export function buildSpawnPlan(
         ? ['--harness', spec.harness]
         : []),
     ],
-    options: { detached: true, stdio: 'ignore', env: { ...process.env, OWENLOOP_ACCOUNT: account } },
+    options: { detached: true, stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, OWENLOOP_ACCOUNT: account } },
   };
 }
 
@@ -161,6 +196,11 @@ export function createDefaultSpawner(
     // start its own vendor process later, but reporting or guessing that
     // executable here would couple the neutral dispatcher to one adapter.
     const executable = `${process.execPath} ${binPath}`;
+    let stderrTail = '';
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (chunk: string) => {
+      stderrTail = (stderrTail + chunk).slice(-MAX_STDERR_TAIL_BYTES);
+    });
     let failureReported = false;
     const report = (exitStatus: number | null, signal: NodeJS.Signals | null, message: string): void => {
       if (failureReported || onFailure === undefined) return;
@@ -180,7 +220,8 @@ export function createDefaultSpawner(
     child.once('error', () => report(null, null, 'worker process failed to start'));
     child.once('exit', (code, signal) => {
       if (code === 0) return;
-      report(code, signal, 'worker exited without completing successfully');
+      const message = safeWorkerDiagnostic(stderrTail) ?? 'worker exited without completing successfully';
+      report(code, signal, message);
     });
     child.unref();
     if (child.pid === undefined) {

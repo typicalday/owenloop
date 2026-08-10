@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import { createShiftLoop, type ShiftLoop, type ShiftLoopOptions } from '../src/shift/loop.ts';
-import { buildSpawnPlan, createDefaultSpawner, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
+import { buildSpawnPlan, createDefaultSpawner, safeWorkerDiagnostic, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
 import { readChildRecords, writeChildRecord } from '../src/shift/state.ts';
 import { sessionsPath } from '../src/harness/session-store.ts';
 import { readStepSpec, writeBundle } from '../src/bundle/cache.ts';
@@ -745,7 +745,7 @@ test('buildSpawnPlan produces the detached `exec <workflow>/<run> --origin` argv
   // Account rides the spawn ENV (OWENLOOP_ACCOUNT), NOT the argv — exec has no --as flag.
   assert.deepEqual(plan.args, ['/pkg/bin/owenloop.mjs', 'work', 'exec', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
   assert.equal(plan.options.detached, true);
-  assert.equal(plan.options.stdio, 'ignore');
+  assert.deepEqual(plan.options.stdio, ['ignore', 'ignore', 'pipe']);
   assert.equal(plan.options.env['OWENLOOP_ACCOUNT'], 'ci');
   // Inherited parent env survives (env starts from process.env, then stamps the account).
   assert.equal(plan.options.env['PATH'], process.env['PATH']);
@@ -788,7 +788,7 @@ test('buildSpawnPlan: kind agent-run swaps the role positional and keeps every o
   );
   assert.deepEqual(plan.args, ['/pkg/bin/owenloop.mjs', 'work', 'agent-run', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
   assert.equal(plan.options.detached, true);
-  assert.equal(plan.options.stdio, 'ignore');
+  assert.deepEqual(plan.options.stdio, ['ignore', 'ignore', 'pipe']);
   assert.equal(plan.options.env['OWENLOOP_ACCOUNT'], 'ci');
 });
 
@@ -862,6 +862,35 @@ test('createDefaultSpawner reports a nonzero detached worker exit with bounded s
   } finally {
     clearTimeout(keepAlive);
   }
+});
+
+test('createDefaultSpawner reports a whitelisted refusal without leaking unrelated worker stderr', async () => {
+  const script = join(stateDir, '..', 'refuse.mjs');
+  writeFileSync(
+    script,
+    "process.stderr.write('owenloop work agent-run: model progress included a private prompt\\n');\n" +
+      "process.stderr.write(\"owenloop work agent-run: consumed artifact refusal (signature) for delivery/run_1 step 'builder' artifact 'workspace': token=very-secret-value did not verify — releasing delivery/run_1\\n\");\n" +
+      'process.exit(1);\n',
+  );
+  const keepAlive = setTimeout(() => {}, 5_000);
+  const failure = new Promise<Parameters<NonNullable<Parameters<typeof createDefaultSpawner>[4]>>[0]>((resolve) => {
+    const spawner = createDefaultSpawner(ORIGIN, 'default', script, 'shf_test', resolve);
+    spawner({ workflow: 'delivery', run: 'run_1', step: 'builder', kind: 'agent-run', harness: 'codex' });
+  });
+
+  try {
+    const reported = await failure;
+    assert.match(reported.message, /consumed artifact refusal \(signature\)/u);
+    assert.match(reported.message, /token=\[redacted\]/u);
+    assert.equal(reported.message.includes('very-secret-value'), false);
+    assert.equal(reported.message.includes('private prompt'), false);
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
+
+test('safeWorkerDiagnostic ignores prompts, progress, and arbitrary stderr', () => {
+  assert.equal(safeWorkerDiagnostic('prompt contents\nprovider progress\narbitrary failure\n'), undefined);
 });
 
 // createDefaultSpawner is a thin wrapper: it captures shiftId at
