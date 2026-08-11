@@ -2681,8 +2681,11 @@ test('recovery: malformed, contradictory, and identity-mismatched current-root m
       replacementDir: staging,
     });
     recordRecoveryMarkerPriorIdentity(marker, destination);
-    rmRecursiveForce(staging);
-    mkdirSync(staging);
+    const raw = JSON.parse(readFileSync(marker.path, 'utf8')) as Record<string, unknown>;
+    writeFileSync(marker.path, `${JSON.stringify({
+      ...raw,
+      replacementIdentity: { dev: '0', ino: '0', mode: 0o755 },
+    }, null, 2)}\n`);
     await assert.rejects(
       recoverWorkflowStore({
 	root: state.root,
@@ -2695,7 +2698,6 @@ test('recovery: malformed, contradictory, and identity-mismatched current-root m
     assert.ok(existsSync(marker.path));
     assert.ok(existsSync(staging));
 
-    const raw = JSON.parse(readFileSync(marker.path, 'utf8')) as Record<string, unknown>;
     writeFileSync(marker.path, `${JSON.stringify({
       ...raw,
       rootIdentity: { dev: '0', ino: '0', mode: 0o755 },
