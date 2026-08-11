@@ -65,12 +65,19 @@ function bind(t: HubIo, cred: Credential = OAUTH_CRED): void {
   writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: ORIGIN });
 }
 
-function writePushBundle(cwd: string, workflowName = 'bundled'): { path: string; digest: string; yaml: string } {
+function writePushBundle(
+	cwd: string,
+	workflowName = 'bundled',
+	additionalWorkflows: Record<string, string> = {},
+): { path: string; digest: string; yaml: string } {
   const source = join(cwd, 'bundle-source');
   const workflows = join(source, 'workflows');
   mkdirSync(workflows, { recursive: true });
   const yaml = validDef(workflowName);
-  writeFileSync(join(workflows, `${workflowName}.yaml`), yaml);
+	const workflowDefs = { [workflowName]: yaml, ...additionalWorkflows };
+	for (const [name, definition] of Object.entries(workflowDefs)) {
+		writeFileSync(join(workflows, `${name}.yaml`), definition);
+	}
   writeFileSync(
     join(source, 'bundle.yaml'),
     [
@@ -79,7 +86,7 @@ function writePushBundle(cwd: string, workflowName = 'bundled'): { path: string;
       '  name: push-test-bundle',
       '  version: 1.0.0',
       'workflows:',
-      `  ${workflowName}: workflows/${workflowName}.yaml`,
+			...Object.keys(workflowDefs).map((name) => `  ${name}: workflows/${name}.yaml`),
       `default: ${workflowName}`,
       'platforms: []',
       'integrity:',
@@ -187,6 +194,26 @@ test('push --bundle refuses a missing publication sidecar before any network cal
   assert.equal(code, 1);
   assert.match(t.err.join('\n'), /exactly one publication sidecar/);
   assert.equal(calls.length, 0);
+});
+
+test('push --bundle refuses duplicate step names across the complete archive before any network write', async () => {
+	const hub = makeFakeHub();
+	const t = makeIo();
+	const bundle = writePushBundle(t.cwd, 'selected', { excluded: validDef('excluded') });
+	hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+	hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+	const { fetch, calls } = routedFetch(hub.routes);
+	t.io.fetch = fetch;
+	bind(t);
+
+	const code = await mainAsync(['push', 'selected', '--bundle', bundle.path], t.io);
+	assert.equal(code, 1);
+	const stderr = t.err.join('\n');
+	assert.match(stderr, /duplicate step name 'worker'/u);
+	assert.match(stderr, /workflow definitions 'excluded' and 'selected'/u);
+	assert.equal(calls.length, 0, 'refusal precedes bundle, evidence, and workflow-version network writes');
+	assert.equal(hub.state.get('selected'), undefined);
+	assert.equal(hub.state.get('excluded'), undefined);
 });
 
 test('push: first push sends every def, all land as new on the fake hub, exits 0', async () => {

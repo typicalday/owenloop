@@ -152,6 +152,68 @@ test('store instruction source: a project projection wins even when the matching
   );
 });
 
+test('store instruction source: a clean project match resolves before a corrupt global index is opened', async () => {
+	const installed = await installedSource();
+	const requested = defInstructionDigest(installed.definition);
+	const globalRoot = tempDir('owenloop-corrupt-global-index-');
+	writeFileSync(storeIndexPath(globalRoot), '{not-json');
+
+	const source = createStoreInstructionSource({
+		projectRoot: installed.root,
+		globalRoot,
+		verifier: createBundleIngestor(),
+	});
+
+	assert.equal(await source.prime(requested), 'resolved');
+	assert.equal(source.getVerifiedObject(requested)?.bundleDigest, installed.result.digest);
+});
+
+test('store instruction source: a corrupt project candidate blocks a clean matching global fallback', async () => {
+	const projectInstalled = await installedSource(
+		WORKFLOW.replace('name: source-fixture', 'name: unrelated-project'),
+		'unrelated-project',
+	);
+	const globalInstalled = await installedSource();
+	const requested = defInstructionDigest(globalInstalled.definition);
+	const target = join(projectInstalled.result.objectPath, 'workflow.yaml');
+	chmodSync(projectInstalled.result.objectPath, 0o755);
+	chmodSync(target, 0o644);
+	writeFileSync(target, `${WORKFLOW.replace('name: source-fixture', 'name: unrelated-project')}# tampered\n`);
+
+	const source = createStoreInstructionSource({
+		projectRoot: projectInstalled.root,
+		globalRoot: globalInstalled.root,
+		verifier: createBundleIngestor(),
+	});
+
+	await assert.rejects(
+		source.prime(requested),
+		(error: unknown) => error instanceof StoreIntegrityError && error.code === 'object-corrupt',
+	);
+});
+
+test('store instruction source: a stale project row cannot borrow an unindexed global object', async () => {
+	const globalInstalled = await installedSource();
+	const requested = defInstructionDigest(globalInstalled.definition);
+	const projectRoot = tempDir('owenloop-stale-project-row-');
+	addIndexEntry(projectRoot, 'stale/source-fixture@1.0.0', globalInstalled.result.digest);
+
+	const globalIndex = readWorkflowStoreIndex(storeIndexPath(globalInstalled.root));
+	for (const [coordinate, entry] of Object.entries(globalIndex.entries)) {
+		if (entry.digest === globalInstalled.result.digest) delete globalIndex.entries[coordinate];
+	}
+	writeWorkflowStoreIndex(storeIndexPath(globalInstalled.root), globalIndex);
+
+	const source = createStoreInstructionSource({
+		projectRoot,
+		globalRoot: globalInstalled.root,
+		verifier: createBundleIngestor(),
+	});
+
+	assert.equal(await source.prime(requested), 'unknown-digest');
+	assert.deepEqual(source.lookup({ defDigest: requested, step: 'runner', key: '' }), { status: 'unknown-digest' });
+});
+
 test('store instruction source: every workflow in a bundle is available by its instruction digest', async () => {
   const childWorkflow = WORKFLOW
     .replace('name: source-fixture', 'name: child-fixture')
@@ -241,6 +303,7 @@ test('store instruction source: an unrelated tampered candidate does not poison 
   const installed = await installedSource();
   const requested = defInstructionDigest(installed.definition);
   const unrelatedDigest = '0'.repeat(64);
+	assert.ok(unrelatedDigest < installed.result.digest, 'the corrupt sibling is scanned before the clean matching bundle');
   const unrelatedObject = objectDirForDigest(installed.root, defDigest(unrelatedDigest));
   cpSync(installed.result.objectPath, unrelatedObject, { recursive: true });
   chmodSync(unrelatedObject, 0o755);

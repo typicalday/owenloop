@@ -1246,7 +1246,12 @@ publication sidecar produced by `owenloop publish` (`.dsse` or `.unsigned`),
 accepts an optional `.origin.dsse`, uploads those content-addressed objects,
 then calls `create_workflow` with the archive's canonical digest. This is what
 makes the hub stamp reference orders with a digest that execution hosts can
-resolve from their installed bundle store. Bundle mode conservatively sends
+resolve from their installed bundle store. Because a reference order identifies
+its executable instructions only by bundle digest plus step name, every workflow
+definition in the complete archive must use distinct step names. `push --bundle`
+refuses an archive when two definitions share a step name, even when positional
+arguments select only one of those definitions; the refusal happens before any
+bundle, evidence, or workflow-version write. Bundle mode conservatively sends
 each selected `create_workflow` request even when its YAML hash is unchanged,
 because the workflow listing does not expose the latest bundle identity; the
 hub's `(yaml, bundle digest)` idempotency decides whether to version-forward or

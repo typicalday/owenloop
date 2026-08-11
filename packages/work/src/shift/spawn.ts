@@ -62,10 +62,9 @@ export interface SpawnResult {
 /** The spawn seam. Injected; faked in tests. */
 export type Spawner = (spec: SpawnSpec) => SpawnResult;
 
-/** Safe, bounded metadata emitted when a detached worker fails. Only a
- * whitelisted, redacted refusal/startup diagnostic may be derived from child
- * stderr; prompts, progress, artifact values, environments, and credentials
- * are never reported. */
+/** Safe, bounded metadata emitted when a detached worker fails. Only an exec
+ * child may contribute a whitelisted, redacted refusal/startup diagnostic.
+ * Agent-run stderr is untrusted model/harness output and is never reported. */
 export interface WorkerFailure {
   workflow: string;
   run: string;
@@ -98,24 +97,14 @@ function stripControlCharacters(value: string): string {
 }
 
 /**
- * Select one deliberately narrow worker diagnostic. Agent progress and prompt
- * text use the same stream, so arbitrary stderr must never cross into Shift
- * events. These prefixes are emitted only by pre-session refusal/startup gates.
+ * Select one deliberately narrow exec-worker diagnostic. The command's own
+ * output never reaches the exec child's stderr: `runCommand`
+ * (`packages/work/src/exec/runner.ts`) consumes the command's stdout/stderr into
+ * `outputHash`/`outputTail`. Even so, only driver-owned startup/refusal lines are
+ * matched because later driver lines can quote hub response text.
  *
- * Both worker roles are covered, because `WorkerFailure.kind` has two values and
- * an `exec` child that refuses at startup must not report the useless generic
- * message while an `agent-run` child reports the real cause. The two roles carry
- * DIFFERENT risk, so the allowlists are not shared:
- *
- *  - `owenloop work agent-run:` — the step agent's prompt text and model
- *    progress ride this same stream, so only the pre-session gates are matched.
- *  - `owenloop work exec:` — the child's COMMAND output never reaches this
- *    stream at all. `runCommand` (`packages/work/src/exec/runner.ts`) spawns the
- *    command with its own `['ignore','pipe','pipe']` stdio and consumes both
- *    streams into `outputHash`/`outputTail`; nothing is re-emitted to the exec
- *    child's own stderr. Every `owenloop work exec:` line is therefore the
- *    driver's own prose. Even so, only the startup/refusal gates are matched —
- *    the mid-run submit/reject lines can quote hub response text.
+ * Agent-run stderr must never be passed here. Model and harness progress share
+ * that stream and can impersonate any allowlisted-looking prefix.
  */
 export function safeWorkerDiagnostic(stderr: string): string | undefined {
   const line = stderr
@@ -123,9 +112,7 @@ export function safeWorkerDiagnostic(stderr: string): string | undefined {
     .reverse()
     .map((candidate) => stripControlCharacters(candidate).trim())
     .find((candidate) =>
-      /^owenloop work agent-run: consumed artifact refusal \((?:no-proof|signature|value-digest|version|chain|scope|prerequisite)\) /u.test(candidate)
-      || /^owenloop work agent-run: (?:loading the step spec .* failed:|no step spec |no adapter registered for harness |instruction store unavailable:|instruction refusal \((?:integrity|harness-carrier)\):|could not load OWENLOOP_HARNESS_MODULE |no hub origin)/u.test(candidate)
-      || /^owenloop work exec: instruction refusal \((?:unknown-digest|unknown-step|ambiguous-step|integrity|no-digest|missing-command|unverified-def|origin-policy|unverified-consumed)\) /u.test(candidate)
+			/^owenloop work exec: instruction refusal \((?:unknown-digest|unknown-step|ambiguous-step|integrity|no-digest|missing-command|unverified-def|origin-policy|unverified-consumed)\) /u.test(candidate)
       || /^owenloop work exec: (?:instruction store unavailable:|no hub origin|missing required <order-id>)/u.test(candidate),
     );
   if (line === undefined) return undefined;
@@ -217,7 +204,9 @@ export function createDefaultSpawner(
     let stderrTail = '';
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', (chunk: string) => {
-      stderrTail = (stderrTail + chunk).slice(-MAX_STDERR_TAIL_BYTES);
+			// Always drain the pipe, but retain bytes only for exec. Agent-run stderr
+			// is untrusted model/harness progress and cannot influence Shift events.
+			if (kind === 'exec') stderrTail = (stderrTail + chunk).slice(-MAX_STDERR_TAIL_BYTES);
     });
     // The stderr pipe is a libuv handle owned by THIS process, and `child.unref()`
     // does not cover it. Left referenced, the Shift's event loop stays alive for
@@ -252,7 +241,9 @@ export function createDefaultSpawner(
     child.once('error', () => report(null, null, 'worker process failed to start'));
     child.once('exit', (code, signal) => {
       if (code === 0) return;
-      const message = safeWorkerDiagnostic(stderrTail) ?? 'worker exited without completing successfully';
+			const message = kind === 'exec'
+				? (safeWorkerDiagnostic(stderrTail) ?? 'worker exited without completing successfully')
+				: 'worker exited without completing successfully';
       report(code, signal, message);
     });
     child.unref();

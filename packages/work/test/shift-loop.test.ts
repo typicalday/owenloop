@@ -866,12 +866,11 @@ test('createDefaultSpawner reports a nonzero detached worker exit with bounded s
   }
 });
 
-test('createDefaultSpawner reports a whitelisted refusal without leaking unrelated worker stderr', async () => {
+test('createDefaultSpawner never lets allowlisted-looking agent progress reach a failure event', async () => {
   const script = join(stateDir, '..', 'refuse.mjs');
   writeFileSync(
     script,
-    "process.stderr.write('owenloop work agent-run: model progress included a private prompt\\n');\n" +
-      "process.stderr.write(\"owenloop work agent-run: consumed artifact refusal (signature) for delivery/run_1 step 'builder' artifact 'workspace': token=very-secret-value did not verify — releasing delivery/run_1\\n\");\n" +
+		"process.stderr.write(\"owenloop work agent-run: consumed artifact refusal (signature) model progress contains token=very-secret-value and a private prompt\\n\");\n" +
       'process.exit(1);\n',
   );
   const keepAlive = setTimeout(() => {}, 5_000);
@@ -882,10 +881,10 @@ test('createDefaultSpawner reports a whitelisted refusal without leaking unrelat
 
   try {
     const reported = await failure;
-    assert.match(reported.message, /consumed artifact refusal \(signature\)/u);
-    assert.match(reported.message, /token=\[redacted\]/u);
-    assert.equal(reported.message.includes('very-secret-value'), false);
-    assert.equal(reported.message.includes('private prompt'), false);
+		assert.equal(reported.message, 'worker exited without completing successfully');
+		assert.equal(JSON.stringify(reported).includes('very-secret-value'), false);
+		assert.equal(JSON.stringify(reported).includes('private prompt'), false);
+		assert.equal(JSON.stringify(reported).includes('consumed artifact refusal'), false);
   } finally {
     clearTimeout(keepAlive);
   }

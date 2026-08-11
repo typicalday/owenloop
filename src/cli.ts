@@ -3812,6 +3812,24 @@ function preparePushBundle(io: CliIO, bundleArg: string): PushBundleContext {
   return { bytes, digest: inspected.digest, manifest: inspected.manifest, publication, publicationState, origin, defsDir, cleanupRoot };
 }
 
+/** Bundle-backed orders identify a step by bundle digest plus step name. */
+function assertUniqueBundleStepNames(defs: ReadonlyMap<string, WorkflowDef>): void {
+	const ownerByStep = new Map<string, string>();
+	const orderedDefs = [...defs.entries()].sort(([left], [right]) => left.localeCompare(right));
+	for (const [definitionName, def] of orderedDefs) {
+		for (const step of def.steps) {
+			const firstOwner = ownerByStep.get(step.name);
+			if (firstOwner !== undefined && firstOwner !== definitionName) {
+				throw new CliError(
+					`owenloop push --bundle: duplicate step name '${step.name}' in workflow definitions ` +
+						`'${firstOwner}' and '${definitionName}'; step names must be unique across the complete archive`,
+				);
+			}
+			ownerByStep.set(step.name, definitionName);
+		}
+	}
+}
+
 /**
  * `owenloop push [<defName>...] [--bundle <bundle.wnlp>] [--force]
  * [--dry-run]` — publish local workflow defs to the bound hub, diffed against
@@ -3890,6 +3908,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     } else {
       allDefs = loadDefsRaw(defsDir, failures);
     }
+		if (bundle !== undefined) assertUniqueBundleStepNames(allDefs);
 
   // Narrow to positional names, if any (error on an unknown name).
   const requested = args.positionals.slice(1);
