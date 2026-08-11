@@ -2115,7 +2115,7 @@ test('add --recover --global rolls a finalizing v2 journal forward (offline)', a
     JSON.stringify({
       version: 2,
       phase: 'finalizing',
-      operation: 'repair',
+      operation: 'dedupe',
       destSegments: ['objects', 'sha256', installed.result.digest],
       stagingId: 'stg_cli',
       hadDest: true,

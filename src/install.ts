@@ -1284,13 +1284,13 @@ export type RecoveryOutcome = 'no-journal' | 'rolled-forward' | 'rolled-back';
  *     retained backup and staging root. V1 has no CAS verifier and performs the
  *     original cleanup behavior.
  *  2. V2 repair in `applying`, `replacement-swapped`,
- *     `replacement-hardened`, or `replacement-verified` ⇒ inspect disk state.
- *     If the swap did not complete, fall through to the rollback table and
- *     restore the prior backup. If the replacement occupies the destination and
- *     the prior backup is retained, resume hardening when needed, re-run content
- *     and exact-mode verification regardless of the recorded verified phase,
- *     advance to `finalizing`, and only then discard the backup. A matching index
- *     hash never accepts a repair by itself.
+ *     `replacement-hardened`, or `replacement-verified` ⇒ use an exhaustive
+ *     phase/topology table. Every accepted arm requires the matching external
+ *     marker and exact directory identities before mutation. Proven pre-swap or
+ *     interrupted legacy rollback states first enter `rollback-started`; the
+ *     durable rollback phases perform every rename and cleanup. A replacement at
+ *     destination with the retained prior backup resumes hardening/verification
+ *     and advances to `finalizing`. Every other combination refuses unchanged.
  *  3. Ordinary `applying` + the commit-point test passes (v1: ledger records
  *     this exact source@sha/path; v2: `hash(current metadata bytes) ===
  *     metadataHash`) ⇒ the commit MAY have landed, but the test alone does not
@@ -1436,7 +1436,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     ) {
       throw recoveryRefusal(
 	journalPath,
-	'durable repair rollback state lacks replacement/prior directory identity evidence',
+	'repair recovery state lacks complete replacement/prior directory identity evidence',
       );
     }
     return marker as RecoveryMarkerRecord & {
@@ -1511,26 +1511,129 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     }
   };
 
-  const resumeV2Repair = (): RecoveryOutcome => {
-    if (journal.version !== 2) {
-      throw recoveryRefusal(journalPath, 'internal recovery error: attempted v2 repair recovery for a v1 journal');
-    }
-    const stagingState = probeRecoveryDir(stagingDir, journalPath, 'staging dir', defsDir);
-    const backupState = probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir);
-    const undoState = probeRecoveryDir(undoDir, journalPath, 'undo dir', defsDir);
-    const destState = probeRecoveryDir(dest, journalPath, 'destination', defsDir);
+  type RepairPathState = 'dir' | 'absent';
+  type RepairTopology =
+    `${RepairPathState}/${RepairPathState}/${RepairPathState}/${RepairPathState}`;
+  type RepairReplacementPhase =
+    | 'applying'
+    | 'replacement-swapped'
+    | 'replacement-hardened'
+    | 'replacement-verified';
+  type RepairReplacementAction =
+    | 'refuse'
+    | 'begin-rollback'
+    | 'roll-forward'
+    | 'upgrade-legacy-rollback-parked'
+    | 'upgrade-legacy-rollback-restored';
 
-    // Compatibility for a repair rolled back by a release that pre-dates the
-    // durable rollback phases: destination is already the prior object, backup
-    // was consumed, and undo still holds the replacement. The prior object may
-    // be the legacy mode-loss object, so identify the replacement at undo rather
-    // than demanding that destination pass the new installed-object verifier.
+  const refusedRepairTopologies: Record<RepairTopology, RepairReplacementAction> = {
+    'absent/absent/absent/absent': 'refuse',
+    'absent/absent/absent/dir': 'refuse',
+    'absent/absent/dir/absent': 'refuse',
+    'absent/absent/dir/dir': 'refuse',
+    'absent/dir/absent/absent': 'refuse',
+    'absent/dir/absent/dir': 'refuse',
+    'absent/dir/dir/absent': 'refuse',
+    'absent/dir/dir/dir': 'refuse',
+    'dir/absent/absent/absent': 'refuse',
+    'dir/absent/absent/dir': 'refuse',
+    'dir/absent/dir/absent': 'refuse',
+    'dir/absent/dir/dir': 'refuse',
+    'dir/dir/absent/absent': 'refuse',
+    'dir/dir/absent/dir': 'refuse',
+    'dir/dir/dir/absent': 'refuse',
+    'dir/dir/dir/dir': 'refuse',
+  };
+  const repairReplacementStateTable: Record<
+    RepairReplacementPhase,
+    Record<RepairTopology, RepairReplacementAction>
+  > = {
+    applying: {
+      ...refusedRepairTopologies,
+      // Before destination → backup: park the owned staging replacement, then
+      // advance through the durable rollback phases without moving destination.
+      'dir/absent/absent/dir': 'begin-rollback',
+      // After destination → backup but before staging → destination: park the
+      // owned staging replacement, then restore the exact retained prior object.
+      'dir/dir/absent/absent': 'begin-rollback',
+      // The swap completed before the applying → replacement-swapped rewrite.
+      'absent/dir/absent/dir': 'roll-forward',
+      // Positively identified rollback states written by legacy releases.
+      'absent/dir/dir/absent': 'upgrade-legacy-rollback-parked',
+      'absent/absent/dir/dir': 'upgrade-legacy-rollback-restored',
+    },
+    'replacement-swapped': {
+      ...refusedRepairTopologies,
+      'absent/dir/absent/dir': 'roll-forward',
+      'absent/dir/dir/absent': 'upgrade-legacy-rollback-parked',
+      'absent/absent/dir/dir': 'upgrade-legacy-rollback-restored',
+    },
+    'replacement-hardened': {
+      ...refusedRepairTopologies,
+      'absent/dir/absent/dir': 'roll-forward',
+      'absent/dir/dir/absent': 'upgrade-legacy-rollback-parked',
+      'absent/absent/dir/dir': 'upgrade-legacy-rollback-restored',
+    },
+    'replacement-verified': {
+      ...refusedRepairTopologies,
+      'absent/dir/absent/dir': 'roll-forward',
+      'absent/dir/dir/absent': 'upgrade-legacy-rollback-parked',
+      'absent/absent/dir/dir': 'upgrade-legacy-rollback-restored',
+    },
+  };
+
+  const repairTopology = (state: {
+    staging: RepairPathState;
+    backup: RepairPathState;
+    undo: RepairPathState;
+    destination: RepairPathState;
+  }): RepairTopology =>
+    `${state.staging}/${state.backup}/${state.undo}/${state.destination}`;
+
+  const resumeV2Repair = (): RecoveryOutcome => {
+    if (journal.version !== 2 || journal.operation !== 'repair') {
+      throw recoveryRefusal(journalPath, 'internal recovery error: attempted v2 repair recovery for a non-repair journal');
+    }
+    const phase = journal.phase;
     if (
-      stagingState === 'absent' &&
-      backupState === 'absent' &&
-      undoState === 'dir' &&
-      destState === 'dir'
+      phase !== 'applying' &&
+      phase !== 'replacement-swapped' &&
+      phase !== 'replacement-hardened' &&
+      phase !== 'replacement-verified'
     ) {
+      throw recoveryRefusal(journalPath, `internal recovery error: unexpected repair replacement phase '${phase}'`);
+    }
+
+    // Probe every transaction path before choosing an action. probeRecoveryDir
+    // rejects symlinks and non-directories, so no state-table arm can mutate a
+    // path whose type or containment has not already been validated.
+    const state = {
+      staging: probeRecoveryDir(stagingDir, journalPath, 'staging dir', defsDir),
+      backup: probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir),
+      undo: probeRecoveryDir(undoDir, journalPath, 'undo dir', defsDir),
+      destination: probeRecoveryDir(dest, journalPath, 'destination', defsDir),
+    };
+    const topology = repairTopology(state);
+    const action = repairReplacementStateTable[phase][topology];
+    const refuseTopology = (): never => {
+      throw recoveryRefusal(
+	journalPath,
+	`repair replacement phase '${phase}' contradicts filesystem state ` +
+	  `(staging=${state.staging}, backup=${state.backup}, undo=${state.undo}, ` +
+	  `destination=${state.destination})`,
+      );
+    };
+
+    if (action === 'refuse') refuseTopology();
+
+    if (action === 'upgrade-legacy-rollback-restored') {
+      // Compatibility for a repair rolled back by a release that pre-dates the
+      // durable rollback phases: destination is already the prior object, backup
+      // was consumed, and undo still holds the replacement. Never infer ownership
+      // from this topology. A current marker must identify both directories. The
+      // one marker-less legacy upgrade is accepted only when the hardened undo
+      // object verifies canonically; recovery then records both exact identities
+      // before writing a durable rollback phase or deleting anything.
       const marker = readMatchingV2Marker();
       let rollbackMarkerId = journal.recoveryMarkerId;
       let createdRollbackMarker: RecoveryMarkerHandle | undefined;
@@ -1560,7 +1663,6 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	  throw recoveryRefusal(journalPath, 'v2 destination has no digest segment');
 	}
 	try {
-	  actions.harden(undoDir);
 	  actions.verify(undoDir, digest);
 	} catch (error) {
 	  throw recoveryRefusal(
@@ -1616,72 +1718,75 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
       return 'rolled-back';
     }
 
-    // A swap that never completed, or a rollback that was interrupted between
-    // its two renames, must restore the retained prior object instead of trying
-    // to commit an absent/partial replacement.
-    if (stagingState === 'dir' || destState === 'absent') {
-      return 'rolled-back';
-    }
-    if (backupState !== 'dir') {
-      throw recoveryRefusal(
-	journalPath,
-	`repair phase '${journal.phase}' has no retained prior-object backup at '${backupDir}'`,
-      );
-    }
-    if (undoState !== 'absent') {
-      throw recoveryRefusal(
-	journalPath,
-	`repair phase '${journal.phase}' has both a retained backup and rollback undo directory`,
-      );
-    }
-    const marker = readMatchingV2Marker();
-    if (marker?.operation === 'repair') {
-      if (marker.replacementIdentity === undefined || marker.priorIdentity === undefined) {
-	throw recoveryRefusal(journalPath, 'repair marker lacks replacement/prior directory identity evidence');
-      }
+    const marker = requireRepairMarker();
+    if (action === 'roll-forward') {
       requireIdentity(dest, marker.replacementIdentity, 'replacement destination');
       requireIdentity(backupDir, marker.priorIdentity, 'retained prior object');
-    }
 
-    const actions = requireV2ReplacementActions();
-    const digest = journal.destSegments.at(-1);
-    if (digest === undefined) {
-      throw recoveryRefusal(journalPath, 'v2 destination has no digest segment');
-    }
-    if (journal.phase === 'applying' || journal.phase === 'replacement-swapped') {
-      try {
-	actions.harden(dest);
-      } catch (e) {
-	throw recoveryRefusal(journalPath, `could not finish replacement hardening: ${(e as Error).message}`);
+      const actions = requireV2ReplacementActions();
+      const digest = journal.destSegments.at(-1);
+      if (digest === undefined) {
+	throw recoveryRefusal(journalPath, 'v2 destination has no digest segment');
       }
-      writeAddJournal(journalPath, { ...journal, phase: 'replacement-hardened', operation: 'repair' });
+      if (phase === 'applying' || phase === 'replacement-swapped') {
+	try {
+	  actions.harden(dest);
+	} catch (e) {
+	  throw recoveryRefusal(journalPath, `could not finish replacement hardening: ${(e as Error).message}`);
+	}
+	writeAddJournal(journalPath, { ...journal, phase: 'replacement-hardened', operation: 'repair' });
+      }
+
+      // Re-run verification even when the durable phase already says verified.
+      // The journal proves ordering, not that the object was not modified after a
+      // crash. No backup is discarded until both invariants pass again now.
+      try {
+	actions.verify(dest, digest);
+      } catch (e) {
+	throw recoveryRefusal(
+	  journalPath,
+	  `replacement at '${dest}' failed canonical or hardened-mode verification: ${(e as Error).message}`,
+	);
+      }
+      writeAddJournal(journalPath, { ...journal, phase: 'replacement-verified', operation: 'repair' });
+      writeAddJournal(journalPath, { ...journal, phase: 'finalizing', operation: 'repair' });
+      rollForward();
+      return 'rolled-forward';
     }
 
-    // Re-run verification even when the durable phase already says verified.
-    // The journal proves ordering, not that the object was not modified after a
-    // crash. No backup is discarded until both invariants pass again now.
-    try {
-      actions.verify(dest, digest);
-    } catch (e) {
-      throw recoveryRefusal(
-	journalPath,
-	`replacement at '${dest}' failed canonical or hardened-mode verification: ${(e as Error).message}`,
-      );
+    if (action === 'begin-rollback') {
+      if (state.staging !== 'dir' || state.undo !== 'absent') refuseTopology();
+      requireIdentity(stagingDir, marker.replacementIdentity, 'staged replacement');
+      if (state.backup === 'dir') {
+	requireIdentity(backupDir, marker.priorIdentity, 'retained prior object');
+      } else {
+	requireIdentity(dest, marker.priorIdentity, 'unchanged prior destination');
+      }
+    } else if (action === 'upgrade-legacy-rollback-parked') {
+      requireIdentity(undoDir, marker.replacementIdentity, 'parked replacement');
+      requireIdentity(backupDir, marker.priorIdentity, 'retained prior object');
+    } else {
+      return refuseTopology();
     }
-    writeAddJournal(journalPath, { ...journal, phase: 'replacement-verified', operation: 'repair' });
-    writeAddJournal(journalPath, { ...journal, phase: 'finalizing', operation: 'repair' });
-    rollForward();
-    return 'rolled-forward';
+
+    // A replacement phase may enter rollback only after the complete state table
+    // and marker identities prove the exact safe transition. The durable rollback
+    // machine performs every rename and all later cleanup.
+    writeAddJournal(journalPath, { ...journal, phase: 'rollback-started', operation: 'repair' });
+    return resumeDurableV2RepairRollback(
+      journal as InstallJournalV2 & { operation: 'repair' },
+      'rollback-started',
+    );
   };
 
-  const resumeDurableV2RepairRollback = (): RecoveryOutcome => {
-    if (journal.version !== 2 || journal.operation !== 'repair') {
-      throw recoveryRefusal(journalPath, 'internal recovery error: attempted repair rollback for a non-repair journal');
-    }
+  function resumeDurableV2RepairRollback(
+    repairJournal: InstallJournalV2 & { operation: 'repair' },
+    initialPhase: InstallJournalV2Phase = repairJournal.phase,
+  ): RecoveryOutcome {
     const marker = requireRepairMarker();
     const replacementIdentity = marker.replacementIdentity;
     const priorIdentity = marker.priorIdentity;
-    let phase = journal.phase;
+    let phase = initialPhase;
 
     const states = (): {
       staging: 'dir' | 'absent';
@@ -1702,23 +1807,56 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
       );
     };
     const writePhase = (next: InstallJournalV2Phase): void => {
-      writeAddJournal(journalPath, { ...journal, phase: next, operation: 'repair' });
+      writeAddJournal(journalPath, { ...repairJournal, phase: next, operation: 'repair' });
       phase = next;
     };
 
     for (;;) {
       const state = states();
-      if (state.staging !== 'absent') refuseCombination(state);
 
       if (phase === 'rollback-started') {
-	if (state.destination === 'dir' && state.backup === 'dir' && state.undo === 'absent') {
+	if (
+	  state.staging === 'dir' &&
+	  state.destination === 'dir' &&
+	  state.backup === 'absent' &&
+	  state.undo === 'absent'
+	) {
+	  requireIdentity(stagingDir, replacementIdentity, 'staged replacement');
+	  requireIdentity(dest, priorIdentity, 'unchanged prior destination');
+	  renameDirRestoringWrite(stagingDir, undoDir);
+	  writePhase('rollback-replacement-parked');
+	  continue;
+	}
+	if (
+	  state.staging === 'dir' &&
+	  state.destination === 'absent' &&
+	  state.backup === 'dir' &&
+	  state.undo === 'absent'
+	) {
+	  requireIdentity(stagingDir, replacementIdentity, 'staged replacement');
+	  requireIdentity(backupDir, priorIdentity, 'retained prior object');
+	  renameDirRestoringWrite(stagingDir, undoDir);
+	  writePhase('rollback-replacement-parked');
+	  continue;
+	}
+	if (
+	  state.staging === 'absent' &&
+	  state.destination === 'dir' &&
+	  state.backup === 'dir' &&
+	  state.undo === 'absent'
+	) {
 	  requireIdentity(dest, replacementIdentity, 'replacement destination');
 	  requireIdentity(backupDir, priorIdentity, 'retained prior object');
 	  renameDirRestoringWrite(dest, undoDir);
 	  writePhase('rollback-replacement-parked');
 	  continue;
 	}
-	if (state.destination === 'absent' && state.backup === 'dir' && state.undo === 'dir') {
+	if (
+	  state.staging === 'absent' &&
+	  state.destination === 'absent' &&
+	  state.backup === 'dir' &&
+	  state.undo === 'dir'
+	) {
 	  requireIdentity(undoDir, replacementIdentity, 'parked replacement');
 	  requireIdentity(backupDir, priorIdentity, 'retained prior object');
 	  writePhase('rollback-replacement-parked');
@@ -1726,6 +1864,8 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	}
 	refuseCombination(state);
       }
+
+      if (state.staging !== 'absent') refuseCombination(state);
 
       if (phase === 'rollback-replacement-parked') {
 	if (state.destination === 'absent' && state.backup === 'dir' && state.undo === 'dir') {
@@ -1773,42 +1913,51 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 
       throw recoveryRefusal(journalPath, `internal recovery error: unexpected rollback phase '${phase}'`);
     }
-  };
+  }
 
   if (journal.version === 2 && journal.phase.startsWith('rollback-')) {
-    return resumeDurableV2RepairRollback();
+    if (journal.operation !== 'repair') {
+      throw recoveryRefusal(journalPath, 'internal recovery error: repair rollback phase has a non-repair operation');
+    }
+    return resumeDurableV2RepairRollback(journal as InstallJournalV2 & { operation: 'repair' });
   }
 
   if (journal.phase === 'finalizing') {
     // A v2 finalizing journal may be left after the index commit but before the
     // backup was deleted. Re-verify the exact destination, including immutable
     // store modes, before accepting it and deleting the retained prior object.
-    verifyV2Destination();
     if (journal.version === 2 && journal.operation === 'repair') {
-      const marker = readMatchingV2Marker();
-      if (marker?.operation === 'repair') {
-	if (marker.replacementIdentity === undefined || marker.priorIdentity === undefined) {
-	  throw recoveryRefusal(journalPath, 'repair marker lacks replacement/prior directory identity evidence');
-	}
-	requireIdentity(dest, marker.replacementIdentity, 'replacement destination');
-	const backupState = probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir);
-	if (backupState === 'dir') requireIdentity(backupDir, marker.priorIdentity, 'retained prior object');
-	if (probeRecoveryDir(undoDir, journalPath, 'undo dir', defsDir) === 'dir') {
-	  throw recoveryRefusal(journalPath, 'finalizing repair unexpectedly has rollback undo debris');
-	}
+      const state = {
+	staging: probeRecoveryDir(stagingDir, journalPath, 'staging dir', defsDir),
+	backup: probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir),
+	undo: probeRecoveryDir(undoDir, journalPath, 'undo dir', defsDir),
+	destination: probeRecoveryDir(dest, journalPath, 'destination', defsDir),
+      };
+      if (
+	state.staging !== 'absent' ||
+	state.undo !== 'absent' ||
+	state.destination !== 'dir'
+      ) {
+	throw recoveryRefusal(
+	  journalPath,
+	  `finalizing repair contradicts filesystem state ` +
+	    `(staging=${state.staging}, backup=${state.backup}, undo=${state.undo}, ` +
+	    `destination=${state.destination})`,
+	);
+      }
+      const marker = requireRepairMarker();
+      requireIdentity(dest, marker.replacementIdentity, 'replacement destination');
+      if (state.backup === 'dir') {
+	requireIdentity(backupDir, marker.priorIdentity, 'retained prior object');
       }
     }
+    verifyV2Destination();
     rollForward();
     return 'rolled-forward';
   }
 
   if (journal.version === 2 && journal.phase !== 'applying') {
-    const outcome = resumeV2Repair();
-    if (outcome === 'rolled-forward' || lstatSync(journalPath, { throwIfNoEntry: false }) === undefined) {
-      return outcome;
-    }
-    // A swapped-state journal with staging still present or destination absent
-    // falls through to the ordinary rollback table below.
+    return resumeV2Repair();
   }
 
   // phase === 'applying': the metadata write may or may not have landed. The
@@ -1842,21 +1991,8 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
   const applyingRepair =
     journal.version === 2 &&
     journal.hadDest &&
-    (
-      journal.operation === 'repair' ||
-      (
-	journal.operation === undefined &&
-	commitPointReached &&
-	probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir) === 'dir'
-      )
-    );
-  if (applyingRepair) {
-    const outcome = resumeV2Repair();
-    if (outcome === 'rolled-forward') return outcome;
-    // The swap did not complete. Unchanged same-digest metadata is not a commit
-    // signal for repair; force the guarded rollback table below.
-    commitPointReached = false;
-  }
+    journal.operation === 'repair';
+  if (applyingRepair) return resumeV2Repair();
 
   if (commitPointReached) {
     // The metadata records this exact install — but the test ALONE does NOT

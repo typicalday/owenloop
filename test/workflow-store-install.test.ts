@@ -21,10 +21,12 @@ import { spawn } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   renameSync,
   statSync,
   symlinkSync,
@@ -319,6 +321,90 @@ function stageRealReplacement(fixture: RealRepairFixture, stagingId: string): st
   return stagingDir;
 }
 
+function createCompleteRepairMarker(
+  fixture: RealRepairFixture,
+  stagingId: string,
+  replacementDir: string,
+) {
+  const marker = createRecoveryMarker({
+    root: fixture.root,
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    markerDir: fixture.markerDir,
+    operation: 'repair',
+    replacementDir,
+  });
+  recordRecoveryMarkerPriorIdentity(marker, fixture.objectDir);
+  return marker;
+}
+
+type PathSnapshot =
+  | { exists: false }
+  | {
+      exists: true;
+      kind: 'directory' | 'file' | 'symlink' | 'other';
+      mode: number;
+      dev: string;
+      ino: string;
+      content?: string;
+      target?: string;
+      entries?: Record<string, PathSnapshot>;
+    };
+
+function snapshotPath(path: string): PathSnapshot {
+  const st = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+  if (st === undefined) return { exists: false };
+  const common = {
+    exists: true as const,
+    mode: Number(st.mode & 0o7777n),
+    dev: String(st.dev),
+    ino: String(st.ino),
+  };
+  if (st.isSymbolicLink()) {
+    return { ...common, kind: 'symlink', target: readlinkSync(path) };
+  }
+  if (st.isDirectory()) {
+    return {
+      ...common,
+      kind: 'directory',
+      entries: Object.fromEntries(
+	readdirSync(path).sort().map((entry) => [entry, snapshotPath(join(path, entry))]),
+      ),
+    };
+  }
+  if (st.isFile()) {
+    return { ...common, kind: 'file', content: readFileSync(path).toString('base64') };
+  }
+  return { ...common, kind: 'other' };
+}
+
+function snapshotPaths(paths: string[]): Record<string, PathSnapshot> {
+  return Object.fromEntries(paths.map((path) => [path, snapshotPath(path)]));
+}
+
+async function assertRepairRefusalIsStable(input: {
+  fixture: RealRepairFixture;
+  evidencePaths: string[];
+  diagnostic: RegExp;
+}): Promise<void> {
+  const before = snapshotPaths(input.evidencePaths);
+  const recover = (): Promise<string> => recoverWorkflowStore({
+    root: input.fixture.root,
+    lockPath: input.fixture.lockPath,
+    journalPath: input.fixture.journalPath,
+    recoveryMarkerDir: input.fixture.markerDir,
+  });
+  await assert.rejects(recover(), input.diagnostic);
+  assert.deepEqual(snapshotPaths(input.evidencePaths), before, 'first refusal preserves every transaction path');
+  await assert.rejects(recover(), input.diagnostic);
+  assert.deepEqual(snapshotPaths(input.evidencePaths), before, 'second refusal is identical and preserves evidence');
+  await assert.rejects(
+    waitForDigestRepair(input.fixture.root, input.fixture.digest, { timeoutMs: 20, retryMs: 1 }),
+    /matching replacement transaction did not reach a stable state within 20ms/,
+  );
+  assert.deepEqual(snapshotPaths(input.evidencePaths), before, 'coordinated readers preserve recovery evidence');
+}
+
 async function durableRepairRollbackFixture(name: string) {
   const safeName = name.replaceAll(/[^a-z0-9]+/g, '-').replaceAll(/^-|-$/g, '').slice(0, 96);
   const fixture = await realRepairFixture(safeName);
@@ -328,14 +414,7 @@ async function durableRepairRollbackFixture(name: string) {
   const stagingDir = stageRealReplacement(fixture, stagingId);
   const backupDir = `${stagingDir}-old`;
   const undoDir = `${stagingDir}-undo`;
-  const marker = createRecoveryMarker({
-    root: fixture.root,
-    destSegments: ['objects', 'sha256', fixture.digest],
-    stagingId,
-    markerDir: fixture.markerDir,
-    operation: 'repair',
-    replacementDir: stagingDir,
-  });
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
   const journalBase = {
     version: 2 as const,
     phase: 'applying' as const,
@@ -348,9 +427,7 @@ async function durableRepairRollbackFixture(name: string) {
     recoveryMarkerId: marker.id,
   };
   writeAddJournal(fixture.journalPath, journalBase);
-  const handle = commitInstall(fixture.root, objectDestRelPath(fixture.digest), stagingDir, {
-    afterBackupRename: () => recordRecoveryMarkerPriorIdentity(marker, backupDir),
-  });
+  const handle = commitInstall(fixture.root, objectDestRelPath(fixture.digest), stagingDir);
   hardenObjectModes(handle.dest);
   return { fixture, priorInode, stagingDir, backupDir, undoDir, marker, journalBase, handle };
 }
@@ -1298,12 +1375,298 @@ test('recovery: crash BEFORE the swap — staged debris cleared, dest never crea
   assert.equal(await recoverWorkflowStore({ root, lockPath, journalPath }), 'no-journal');
 });
 
+test('recovery: replacement-swapped with only an owned undo and no destination refuses without mutation', async () => {
+  const fixture = await realRepairFixture('repair-contradictory-undo-only');
+  const stagingId = 'stg_repair_contradictory_undo_only';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  const undoDir = `${stagingDir}-undo`;
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
+  renameDirRestoringWrite(stagingDir, undoDir);
+  rmRecursiveForce(fixture.objectDir);
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'replacement-swapped',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
+  });
+
+  await assertRepairRefusalIsStable({
+    fixture,
+    evidencePaths: [
+      fixture.journalPath,
+      marker.path,
+      join(fixture.root, '.owenloop-staging'),
+      stagingDir,
+      backupDir,
+      undoDir,
+      fixture.objectDir,
+    ],
+    diagnostic: /repair replacement phase 'replacement-swapped' contradicts filesystem state \(staging=absent, backup=absent, undo=dir, destination=absent\)/,
+  });
+  assert.ok(!existsSync(fixture.objectDir), 'destination remains absent');
+});
+
+test('recovery: replacement-swapped with residual staging and no ownership marker refuses without mutation', async () => {
+  const fixture = await realRepairFixture('repair-contradictory-staging-only');
+  const stagingId = 'stg_repair_contradictory_staging_only';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  const undoDir = `${stagingDir}-undo`;
+  writeFileSync(join(stagingDir, 'residual.bin'), Buffer.from([0, 1, 2, 255]), { mode: 0o640 });
+  chmodSync(stagingDir, 0o750);
+  rmRecursiveForce(fixture.objectDir);
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'replacement-swapped',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+  });
+
+  await assertRepairRefusalIsStable({
+    fixture,
+    evidencePaths: [
+      fixture.journalPath,
+      join(fixture.root, '.owenloop-staging'),
+      stagingDir,
+      backupDir,
+      undoDir,
+      fixture.objectDir,
+    ],
+    diagnostic: /repair replacement phase 'replacement-swapped' contradicts filesystem state \(staging=dir, backup=absent, undo=absent, destination=absent\)/,
+  });
+  assert.ok(!existsSync(fixture.objectDir), 'destination remains absent');
+});
+
+for (const markerState of ['missing', 'mismatched'] as const) {
+  test(`recovery: destination absent with retained backup and ${markerState} marker refuses`, async () => {
+    const fixture = await realRepairFixture(`repair-backup-${markerState}-marker`);
+    const stagingId = `stg_repair_backup_${markerState}_marker`;
+    const stagingDir = stageRealReplacement(fixture, stagingId);
+    const backupDir = `${stagingDir}-old`;
+    const undoDir = `${stagingDir}-undo`;
+    const marker = markerState === 'mismatched'
+      ? createCompleteRepairMarker(fixture, stagingId, stagingDir)
+      : undefined;
+    if (marker !== undefined) {
+      writeFileSync(marker.path, `${JSON.stringify({ ...marker.record, stagingId: 'stg_other_transaction' }, null, 2)}\n`);
+    }
+    renameDirRestoringWrite(fixture.objectDir, backupDir);
+    writeAddJournal(fixture.journalPath, {
+      version: 2,
+      phase: 'applying',
+      operation: 'repair',
+      destSegments: ['objects', 'sha256', fixture.digest],
+      stagingId,
+      hadDest: true,
+      root: fixture.root,
+      metadataHash: fixture.metadataHash,
+      ...(marker === undefined ? {} : { recoveryMarkerId: marker.id }),
+    });
+
+    await assertRepairRefusalIsStable({
+      fixture,
+      evidencePaths: [
+	fixture.journalPath,
+	...(marker === undefined ? [] : [marker.path]),
+	join(fixture.root, '.owenloop-staging'),
+	stagingDir,
+	backupDir,
+	undoDir,
+	fixture.objectDir,
+      ],
+      diagnostic: markerState === 'missing'
+	? /repair recovery state lacks complete replacement\/prior directory identity evidence/
+	: /external recovery marker does not match the journal transaction/,
+    });
+  });
+}
+
+test('recovery: destination absent with an undo identity mismatch refuses', async () => {
+  const fixture = await realRepairFixture('repair-undo-identity-mismatch-state-table');
+  const stagingId = 'stg_repair_undo_identity_mismatch_state_table';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  const undoDir = `${stagingDir}-undo`;
+  const actualReplacement = `${stagingDir}-actual-replacement`;
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
+  renameDirRestoringWrite(fixture.objectDir, backupDir);
+  renameDirRestoringWrite(stagingDir, actualReplacement);
+  mkdirSync(undoDir);
+  writeFileSync(join(undoDir, 'keep.bin'), Buffer.from([9, 8, 7]), { mode: 0o640 });
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'replacement-swapped',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
+  });
+
+  await assertRepairRefusalIsStable({
+    fixture,
+    evidencePaths: [
+      fixture.journalPath,
+      marker.path,
+      join(fixture.root, '.owenloop-staging'),
+      stagingDir,
+      backupDir,
+      undoDir,
+      actualReplacement,
+      fixture.objectDir,
+    ],
+    diagnostic: /parked replacement .* does not belong to this transaction/,
+  });
+});
+
+test('recovery: destination present with backup and undo debris refuses', async () => {
+  const fixture = await realRepairFixture('repair-destination-contradictory-debris');
+  const stagingId = 'stg_repair_destination_contradictory_debris';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  const undoDir = `${stagingDir}-undo`;
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
+  renameDirRestoringWrite(fixture.objectDir, backupDir);
+  renameDirRestoringWrite(stagingDir, fixture.objectDir);
+  mkdirSync(undoDir);
+  writeFileSync(join(undoDir, 'keep.txt'), 'contradictory undo');
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'replacement-swapped',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
+  });
+
+  await assertRepairRefusalIsStable({
+    fixture,
+    evidencePaths: [
+      fixture.journalPath,
+      marker.path,
+      join(fixture.root, '.owenloop-staging'),
+      stagingDir,
+      backupDir,
+      undoDir,
+      fixture.objectDir,
+    ],
+    diagnostic: /repair replacement phase 'replacement-swapped' contradicts filesystem state \(staging=absent, backup=dir, undo=dir, destination=dir\)/,
+  });
+});
+
+test('recovery: replacement-hardened with a pre-swap topology refuses the wrong phase', async () => {
+  const fixture = await realRepairFixture('repair-wrong-phase-pre-swap');
+  const stagingId = 'stg_repair_wrong_phase_pre_swap';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  const undoDir = `${stagingDir}-undo`;
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'replacement-hardened',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
+  });
+
+  await assertRepairRefusalIsStable({
+    fixture,
+    evidencePaths: [
+      fixture.journalPath,
+      marker.path,
+      join(fixture.root, '.owenloop-staging'),
+      stagingDir,
+      backupDir,
+      undoDir,
+      fixture.objectDir,
+    ],
+    diagnostic: /repair replacement phase 'replacement-hardened' contradicts filesystem state \(staging=dir, backup=absent, undo=absent, destination=dir\)/,
+  });
+});
+
+const repairTransactionPathTargets = [
+  { name: 'staging', path: (input: { stagingDir: string }) => input.stagingDir },
+  { name: 'backup', path: (input: { backupDir: string }) => input.backupDir },
+  { name: 'undo', path: (input: { undoDir: string }) => input.undoDir },
+  { name: 'destination', path: (input: { fixture: RealRepairFixture }) => input.fixture.objectDir },
+] as const;
+
+for (const target of repairTransactionPathTargets) {
+  for (const entryKind of ['file', 'symlink'] as const) {
+    test(`recovery: a ${entryKind} at the repair ${target.name} path refuses before mutation`, async () => {
+      const fixture = await realRepairFixture(`repair-${target.name}-${entryKind}-entry`);
+      const stagingId = `stg_repair_${target.name}_${entryKind}_entry`;
+      const stagingDir = stageRealReplacement(fixture, stagingId);
+      const backupDir = `${stagingDir}-old`;
+      const undoDir = `${stagingDir}-undo`;
+      const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
+      renameDirRestoringWrite(fixture.objectDir, backupDir);
+      renameDirRestoringWrite(stagingDir, fixture.objectDir);
+      const targetPath = target.path({ fixture, stagingDir, backupDir, undoDir });
+      rmRecursiveForce(targetPath);
+      const outside = mkdtempSync(join(tmpdir(), `owenloop-repair-${target.name}-${entryKind}-outside-`));
+      writeFileSync(join(outside, 'victim.bin'), Buffer.from([3, 1, 4, 1, 5]), { mode: 0o640 });
+      if (entryKind === 'file') {
+	writeFileSync(targetPath, Buffer.from([2, 7, 1, 8]), { mode: 0o640 });
+      } else {
+	symlinkSync(outside, targetPath, 'dir');
+      }
+      writeAddJournal(fixture.journalPath, {
+	version: 2,
+	phase: 'replacement-swapped',
+	operation: 'repair',
+	destSegments: ['objects', 'sha256', fixture.digest],
+	stagingId,
+	hadDest: true,
+	root: fixture.root,
+	metadataHash: fixture.metadataHash,
+	recoveryMarkerId: marker.id,
+      });
+
+      await assertRepairRefusalIsStable({
+	fixture,
+	evidencePaths: [
+	  fixture.journalPath,
+	  marker.path,
+	  join(fixture.root, '.owenloop-staging'),
+	  stagingDir,
+	  backupDir,
+	  undoDir,
+	  fixture.objectDir,
+	  outside,
+	],
+	diagnostic: entryKind === 'file' ? /is not a directory/ : /is a symlink/,
+      });
+    });
+  }
+}
+
 test('recovery: same-digest repair crash before swap restores the prior object and permits reinstall', async () => {
   const fixture = await realRepairFixture('repair-before-swap');
   chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
   const priorInode = statSync(fixture.objectDir).ino;
   const stagingId = 'stg_repair_before_swap';
-  stageRealReplacement(fixture, stagingId);
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
   writeAddJournal(fixture.journalPath, {
     version: 2,
     phase: 'applying',
@@ -1313,12 +1676,14 @@ test('recovery: same-digest repair crash before swap restores the prior object a
     hadDest: true,
     root: fixture.root,
     metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
   });
 
   const outcome = await recoverWorkflowStore({
     root: fixture.root,
     lockPath: fixture.lockPath,
     journalPath: fixture.journalPath,
+    recoveryMarkerDir: fixture.markerDir,
   });
 
   assert.equal(outcome, 'rolled-back');
@@ -1340,6 +1705,7 @@ test('recovery: same-digest repair crash after backup rename restores exact mode
   const stagingId = 'stg_repair_after_backup';
   const stagingDir = stageRealReplacement(fixture, stagingId);
   const backupDir = `${stagingDir}-old`;
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
   renameDirRestoringWrite(fixture.objectDir, backupDir);
   writeAddJournal(fixture.journalPath, {
     version: 2,
@@ -1350,12 +1716,14 @@ test('recovery: same-digest repair crash after backup rename restores exact mode
     hadDest: true,
     root: fixture.root,
     metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
   });
 
   const outcome = await recoverWorkflowStore({
     root: fixture.root,
     lockPath: fixture.lockPath,
     journalPath: fixture.journalPath,
+    recoveryMarkerDir: fixture.markerDir,
   });
 
   assert.equal(outcome, 'rolled-back');
@@ -1437,6 +1805,7 @@ for (const scenario of repairCrashScenarios) {
     const stagingId = `stg_${scenario.phase.replaceAll('-', '_')}`;
     const stagingDir = stageRealReplacement(fixture, stagingId);
     const backupDir = `${stagingDir}-old`;
+    const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
     renameDirRestoringWrite(fixture.objectDir, backupDir);
     renameSync(stagingDir, fixture.objectDir);
     scenario.prepareReplacement(fixture);
@@ -1449,12 +1818,14 @@ for (const scenario of repairCrashScenarios) {
       hadDest: true,
       root: fixture.root,
       metadataHash: fixture.metadataHash,
+      recoveryMarkerId: marker.id,
     });
 
     const outcome = await recoverWorkflowStore({
       root: fixture.root,
       lockPath: fixture.lockPath,
       journalPath: fixture.journalPath,
+      recoveryMarkerDir: fixture.markerDir,
     });
 
     assert.equal(outcome, 'rolled-forward');
@@ -1946,6 +2317,7 @@ test('recovery: crash after the repair commit point re-verifies before deleting 
   const stagingId = 'stg_repair_finalizing';
   const stagingDir = stageRealReplacement(fixture, stagingId);
   const backupDir = `${stagingDir}-old`;
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
   renameDirRestoringWrite(fixture.objectDir, backupDir);
   renameSync(stagingDir, fixture.objectDir);
   hardenObjectModes(fixture.objectDir);
@@ -1959,12 +2331,14 @@ test('recovery: crash after the repair commit point re-verifies before deleting 
     hadDest: true,
     root: fixture.root,
     metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
   });
 
   const outcome = await recoverWorkflowStore({
     root: fixture.root,
     lockPath: fixture.lockPath,
     journalPath: fixture.journalPath,
+    recoveryMarkerDir: fixture.markerDir,
   });
 
   assert.equal(outcome, 'rolled-forward');
@@ -1984,6 +2358,7 @@ test('recovery: a durable verified phase never accepts a replacement made writab
   const stagingId = 'stg_repair_verified_tamper';
   const stagingDir = stageRealReplacement(fixture, stagingId);
   const backupDir = `${stagingDir}-old`;
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
   renameDirRestoringWrite(fixture.objectDir, backupDir);
   renameSync(stagingDir, fixture.objectDir);
   hardenObjectModes(fixture.objectDir);
@@ -1997,11 +2372,17 @@ test('recovery: a durable verified phase never accepts a replacement made writab
     hadDest: true,
     root: fixture.root,
     metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
   });
   chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
 
   await assert.rejects(
-    recoverWorkflowStore({ root: fixture.root, lockPath: fixture.lockPath, journalPath: fixture.journalPath }),
+    recoverWorkflowStore({
+      root: fixture.root,
+      lockPath: fixture.lockPath,
+      journalPath: fixture.journalPath,
+      recoveryMarkerDir: fixture.markerDir,
+    }),
     /failed canonical or hardened-mode verification.*regular file mode is 0644/s,
   );
 

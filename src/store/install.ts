@@ -476,9 +476,9 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 
     // Every swap gets an external transaction marker. Fresh installs need the
     // marker to corroborate an otherwise ambiguous orphan destination. Repairs
-    // additionally record the replacement directory identity now and the prior
-    // directory identity after destination → backup, so rollback recovery never
-    // infers which directory is the legacy prior object from journal text.
+    // record both directory identities before the journal is written or any
+    // rename occurs. A crash in the destination → backup callback window then
+    // still leaves complete ownership evidence for fail-closed recovery.
     const recoveryMarker = !objectAlreadyPresent || repairRequired
       ? createRecoveryMarker({
 	  root,
@@ -489,6 +489,14 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 	  replacementDir: stagingDir,
 	})
       : undefined;
+    if (repairRequired && recoveryMarker !== undefined) {
+      try {
+	recordRecoveryMarkerPriorIdentity(recoveryMarker, objectDir);
+      } catch (error) {
+	removeRecoveryMarker(recoveryMarker);
+	throw error;
+      }
+    }
 
     // Journal (v2, phase `applying`) BEFORE the first destructive step.
     const journalBase = {
@@ -545,16 +553,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       // commitInstall quarantines the broken object under the staging root as
       // the retained backup until the unchanged index is durably committed.
       try {
-	handle = commitInstall(root, destRelPath, stagingDir, repairRequired
-	  ? {
-	      afterBackupRename: () => {
-		if (recoveryMarker === undefined) {
-		  throw new Error('internal error: repair swap is missing its recovery marker');
-		}
-		recordRecoveryMarkerPriorIdentity(recoveryMarker, `${stagingDir}-old`);
-	      },
-	    }
-	  : {});
+	handle = commitInstall(root, destRelPath, stagingDir);
       } catch (e) {
 	if (e instanceof RollbackFailedError) {
 	  preserveStagingRoot = true;
