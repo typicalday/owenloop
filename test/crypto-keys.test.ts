@@ -469,11 +469,10 @@ test('macos-security: damaged record migration refuses an unverifiable identity 
     return true;
   });
   assert.equal(fake.store.get(keyRefHash(REF)), seeded.damaged);
-  assert.equal(
-    existsSync(join(home, '.owenloop', 'keys', `${keyRefHash(REF)}.lock`)),
-    false,
-    'failed migration releases the per-ref lock',
-  );
+  const lockPath = join(home, '.owenloop', 'keys', `${keyRefHash(REF)}.lock`);
+  assert.equal(existsSync(lockPath), true, 'failed migration keeps the persistent SQLite lock database');
+  const probe = await acquireFileLock(lockPath, { waitMs: 100, pollMs: 5, label: 'test migration probe' });
+  releaseFileLock(probe);
   assert.equal(
     fake.runs.filter((run) => run.cmd === 'security' && run.args[0] === '-i').length,
     0,

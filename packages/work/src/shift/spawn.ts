@@ -52,11 +52,14 @@ export interface SpawnSpec {
    * `'exec'` (a command order has no step agent).
    */
   harness?: string;
+  /** Closed start gate created by the durable Shift reservation. */
+  startGate?: string;
 }
 
-/** The result the loop records: the child's pid. */
+/** The result the loop records plus a best-effort pre-start termination handle. */
 export interface SpawnResult {
   pid: number;
+  terminate?: () => void;
 }
 
 /** The spawn seam. Injected; faked in tests. */
@@ -171,7 +174,15 @@ export function buildSpawnPlan(
         ? ['--harness', spec.harness]
         : []),
     ],
-    options: { detached: true, stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, OWENLOOP_ACCOUNT: account } },
+    options: {
+      detached: true,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: {
+	...process.env,
+	OWENLOOP_ACCOUNT: account,
+	...(spec.startGate !== undefined ? { OWENLOOP_START_GATE: spec.startGate } : {}),
+      },
+    },
   };
 }
 
@@ -262,6 +273,15 @@ export function createDefaultSpawner(
       failureReported = true;
       throw new Error(`spawn of 'owenloop work ${kind} ${spec.workflow}/${spec.run}' returned no pid`);
     }
-    return { pid: child.pid };
+    return {
+      pid: child.pid,
+      terminate: () => {
+	try {
+	  child.kill('SIGTERM');
+	} catch {
+	  // The child may already have exited after a cancelled or missing gate.
+	}
+      },
+    };
   };
 }

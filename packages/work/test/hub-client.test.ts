@@ -56,6 +56,29 @@ test('whatsNext POSTs to /api/whats_next with bearer header and JSON body', asyn
   assert.deepEqual(res.orders, []);
 });
 
+test('whatsNext preserves authoritative worker and defDigest fields from parsed JSON', async () => {
+  const captured: Captured[] = [];
+  const order = {
+    workflow: 'wf1',
+    run: 'run_1',
+    step: 'builder',
+    worker: 'agent',
+    defDigest: 'sha256:order-pinned',
+    consumes: {},
+    expected_outputs: [],
+    feedback: [],
+    advisory: {},
+    submit_hint: '',
+  };
+  const c = client(fakeFetch(captured, { body: { text: 'ok', workflow: 'wf1', orders: [order] } }));
+
+  const response = await c.whatsNext({ workflow: 'wf1' });
+
+  assert.equal(response.orders?.[0]?.worker, 'agent');
+  assert.equal(response.orders?.[0]?.defDigest, 'sha256:order-pinned');
+  assert.deepEqual(response.orders?.[0], order);
+});
+
 test('whatsNext defaults to an empty body when called with no args', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'ok' } }));

@@ -313,6 +313,116 @@ test('push --bundle parent-only selection does not auto-select its excluded call
   assert.equal(hub.state.get('parent')?.version, 1);
 });
 
+test('push --bundle publishes a selected same-package qualified child before its parent', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    parent: callsDef('parent', 'delegate-qualified', 'push-test-bundle/child'),
+    child: callsDef('child', 'build-qualified'),
+  });
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'parent', 'child', '--bundle', bundle.path], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(
+    calls
+      .filter((call) => call.pathname === '/api/create_workflow')
+      .map((call) => defName(call.body)),
+    ['child', 'parent'],
+  );
+});
+
+test('push --bundle refuses a same-package qualified calls cycle before any network call', async () => {
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    alpha: callsDef('alpha', 'delegate-qualified-beta', 'push-test-bundle/beta'),
+    beta: callsDef('beta', 'delegate-qualified-alpha', 'push-test-bundle/alpha'),
+  });
+  const { fetch, calls } = routedFetch({});
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'alpha', 'beta', '--bundle', bundle.path], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /selected calls cycle: alpha -> beta -> alpha/u);
+  assert.equal(calls.length, 0);
+});
+
+test('push --bundle does not auto-select an excluded same-package qualified child', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    parent: callsDef('parent', 'delegate-qualified-excluded', 'push-test-bundle/excluded-child'),
+    'excluded-child': callsDef('excluded-child', 'build-qualified-excluded'),
+  });
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'parent', '--bundle', bundle.path], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(
+    calls
+      .filter((call) => call.pathname === '/api/create_workflow')
+      .map((call) => defName(call.body)),
+    ['parent'],
+  );
+  assert.equal(hub.state.get('excluded-child'), undefined);
+});
+
+test('push --bundle leaves external-package qualified calls edge-free', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    parent: callsDef('parent', 'delegate-external', 'other-package/child'),
+    child: callsDef('child', 'build-external-name-match'),
+  });
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'parent', 'child', '--bundle', bundle.path], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(
+    calls
+      .filter((call) => call.pathname === '/api/create_workflow')
+      .map((call) => defName(call.body)),
+    ['parent', 'child'],
+  );
+});
+
+test('push --bundle deterministically orders mixed bare and same-package calls edges', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    parent: callsDef('parent', 'delegate-qualified-middle', 'push-test-bundle/middle'),
+    middle: callsDef('middle', 'delegate-bare-leaf', 'leaf'),
+    leaf: callsDef('leaf', 'build-mixed-leaf'),
+  });
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'parent', 'middle', 'leaf', '--bundle', bundle.path], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(
+    calls
+      .filter((call) => call.pathname === '/api/create_workflow')
+      .map((call) => defName(call.body)),
+    ['leaf', 'middle', 'parent'],
+  );
+});
+
 test('push: first push sends every def, all land as new on the fake hub, exits 0', async () => {
   const hub = makeFakeHub();
   const { fetch, calls } = routedFetch(hub.routes);

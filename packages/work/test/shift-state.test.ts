@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -6,10 +6,14 @@ import { afterEach, beforeEach, test } from 'node:test';
 
 import {
   defaultIsAlive,
+  finalizeChildReservation,
   readChildRecords,
+  readChildReservations,
   reconcileInFlight,
   removeChildRecord,
+  reserveChild,
   resolveStateDir,
+  startReservedChild,
   writeChildRecord,
   type ChildRecord,
 } from '../src/shift/state.ts';
@@ -51,6 +55,21 @@ test('removeChildRecord deletes just that run', () => {
   assert.deepEqual(readChildRecords(dir).map((r) => r.run).sort(), ['run_22222222']);
 });
 
+test('removeChildRecord cancels and removes a still-gated reservation', () => {
+  const reserved = reserveChild(dir, {
+    workflow: 'wf1',
+    run: 'run_ended_while_reserved',
+    reservedAt: 1000,
+    childKind: 'agent-run',
+    step: 'builder',
+  });
+
+  removeChildRecord(dir, reserved.reservation.run);
+
+  assert.equal(existsSync(reserved.gatePath), false);
+  assert.deepEqual(readChildReservations(dir), []);
+});
+
 test('reconcileInFlight keeps live records and reaps dead ones', () => {
   writeChildRecord(dir, rec({ run: 'run_alive000', pid: 1 }));
   writeChildRecord(dir, rec({ run: 'run_dead0000', pid: 2 }));
@@ -80,7 +99,96 @@ test('a corrupt record file is skipped, not fatal', () => {
 test('reads of a missing state dir are empty, not an error', () => {
   const missing = join(dir, 'does-not-exist');
   assert.deepEqual(readChildRecords(missing), []);
-  assert.deepEqual(reconcileInFlight(missing, () => true), { live: [], reaped: [] });
+  assert.deepEqual(reconcileInFlight(missing, () => true), {
+    live: [],
+    reserved: [],
+    reaped: [],
+    abandoned: [],
+  });
+});
+
+test('reserveChild creates a closed gate and a capacity-bearing reservation before spawn', () => {
+  const reserved = reserveChild(dir, {
+    workflow: 'wf1',
+    run: 'run_reserved',
+    reservedAt: 1000,
+    childKind: 'agent-run',
+    step: 'builder',
+  });
+
+  assert.equal(readFileSync(reserved.gatePath, 'utf8'), 'wait\n');
+  assert.deepEqual(readChildReservations(dir), [reserved.reservation]);
+  assert.deepEqual(readChildRecords(dir), []);
+});
+
+test('reserveChild exclusively deduplicates the same run and removes the losing gate', () => {
+  reserveChild(dir, {
+    workflow: 'wf1',
+    run: 'run_same',
+    reservedAt: 1000,
+    childKind: 'exec',
+  });
+
+  assert.throws(() => reserveChild(dir, {
+    workflow: 'wf1',
+    run: 'run_same',
+    reservedAt: 1001,
+    childKind: 'exec',
+  }), /EEXIST/u);
+  assert.equal(readdirSync(dir).filter((name) => name.endsWith('.gate')).length, 1);
+  assert.equal(readChildReservations(dir).length, 1);
+});
+
+test('a restart finishes a PID-persisted start-gate handoff and settles the child record', () => {
+  const reserved = reserveChild(dir, {
+    workflow: 'wf1',
+    run: 'run_handoff',
+    reservedAt: 1000,
+    childKind: 'agent-run',
+    step: 'builder',
+  });
+  const child = finalizeChildReservation(dir, reserved.reservation, {
+    pid: 4242,
+    spawnedAt: 1100,
+    kind: 'agent-run',
+    step: 'builder',
+  });
+
+  assert.equal(readChildRecords(dir)[0]?.gateToken, reserved.reservation.token);
+  startReservedChild(dir, child);
+  assert.equal(readFileSync(reserved.gatePath, 'utf8'), 'start\n');
+
+  const reconciled = reconcileInFlight(dir, { isAlive: () => true, now: 1200 });
+  assert.equal(reconciled.live.length, 1);
+  assert.equal(reconciled.live[0]?.gateToken, undefined);
+  assert.equal(readChildRecords(dir)[0]?.gateToken, undefined);
+});
+
+test('fresh reservations survive restart and expired reservations are cancelled with diagnostics data', () => {
+  const fresh = reserveChild(dir, {
+    workflow: 'wf1',
+    run: 'run_fresh',
+    reservedAt: 1000,
+    childKind: 'exec',
+  });
+  const expired = reserveChild(dir, {
+    workflow: 'wf1',
+    run: 'run_expired',
+    reservedAt: 0,
+    childKind: 'agent-run',
+  });
+
+  const reconciled = reconcileInFlight(dir, {
+    isAlive: () => true,
+    now: 1050,
+    reservationMaxAgeMs: 100,
+  });
+
+  assert.deepEqual(reconciled.reserved.map((reservation) => reservation.run), ['run_fresh']);
+  assert.deepEqual(reconciled.abandoned.map((reservation) => reservation.run), ['run_expired']);
+  assert.equal(existsSync(fresh.gatePath), true);
+  assert.equal(existsSync(expired.gatePath), false);
+  assert.deepEqual(readChildReservations(dir).map((reservation) => reservation.run), ['run_fresh']);
 });
 
 test('defaultIsAlive: this very process is alive; a pathological pid is not', () => {

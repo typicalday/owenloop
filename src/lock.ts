@@ -1,119 +1,111 @@
 /**
- * Generic advisory FILE LOCK — an exclusive-create lockfile with liveness-aware
- * staleness, used to serialize a filesystem critical section across owenloop
- * processes.
+ * Generic cross-process file lock.
  *
- * Extracted verbatim (logic-identical) from `src/add.ts`'s per-project install
- * lock: `add.ts` now consumes it through thin `acquireInstallLock` /
- * `releaseInstallLock` wrappers that preserve the old names, types, and the
- * "owenloop add" timeout wording; `src/credentials.ts` uses it to serialize the
- * OAuth refresh-and-persist critical section (`credentials.lock`). The only
- * behavioral addition during the move is the optional `label` (used in the
- * timeout message) so each caller names itself.
+ * The lock is a SQLite `BEGIN IMMEDIATE` transaction held on `lockPath`. SQLite
+ * owns the operating-system file lock and ties that lock to the open
+ * `DatabaseSync` connection. Closing the connection, normal process exit, or a
+ * process crash releases the lock without deleting or replacing the path.
  *
- * Depends only on node builtins so the library barrel (`src/index.ts` →
- * `credentials.ts` → here) never drags the `add`/`untar` graph into its runtime
- * closure.
+ * The previous exclusive-create lockfile design had no atomic compare-and-unlink
+ * operation: a stale reclaimer or releaser could inspect one pathname object and
+ * then delete a fresh replacement. This implementation never unlinks the lock
+ * database. A small `.owner.json` sidecar is diagnostics only and is never an
+ * ownership primitive.
+ *
+ * Compatibility tradeoff: a non-empty pre-SQLite lockfile is treated as a
+ * conservative legacy lock and is never automatically deleted. The holder may
+ * still be live, and the available portable path APIs cannot prove and remove
+ * that exact object atomically. Wait for the old process to release it, or remove
+ * the legacy file manually after verifying that no old Owenloop process owns it.
+ * Once a lock has been acquired by this implementation, crash cleanup is again
+ * automatic because SQLite releases the kernel lock with the connection.
  */
 
-import { closeSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync, closeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { hostname } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-/** Default wait/stale/poll timings for a file lock (overridable per acquire). */
 const LOCK_WAIT_MS = 10_000;
-const LOCK_STALE_MS = 10 * 60_000;
 const LOCK_POLL_MS = 100;
-/** Blocking wait cell used only by the synchronous lock API. */
 const LOCK_SYNC_SLEEP = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'utf8');
 
 export interface FileLockHandle {
   lockPath: string;
   acquired: boolean;
-  /** Per-acquisition ownership token — present when `acquired`; proof of ownership for release. */
+  /** Per-acquisition diagnostic identity. SQLite, not this token, owns exclusion. */
   token?: string;
 }
 
-/** Parsed shape of a lock-file payload. Every field is optional so a legacy or partial payload still parses. */
 interface LockHolder {
   pid?: number;
   startedAt?: number;
   token?: string;
   host?: string;
+  active?: boolean;
+  releasedAt?: number;
 }
 
 export interface AcquireFileLockOpts {
-  /** Max time to wait for a live lock before failing cleanly (default 10s). */
+  /** Max time to wait for the SQLite writer lock before failing cleanly. */
   waitMs?: number;
-  /**
-   * Age (by mtime) past which an *unparseable/abandoned* lock may be reclaimed
-   * (default 10m). Age NEVER reclaims a lock whose recorded pid is alive on
-   * this host — it only governs the fail-closed fallback for a lock we cannot
-   * attribute to a live owner (unparseable payload, or one without a pid).
-   */
+  /** Retained for source compatibility. SQLite crash release needs no stale age. */
   staleMs?: number;
-  /** Poll interval while waiting on a live lock (default 100ms). */
+  /** Poll interval while waiting on the writer lock. */
   pollMs?: number;
-  /** Liveness probe for the holder pid — injectable so tests are deterministic. */
+  /** Retained for source compatibility with legacy-lock diagnostics. */
   isPidAlive?: (pid: number) => boolean;
-  /** Clock — injectable so tests are deterministic. */
+  /** Wall clock used only for diagnostic timestamps. */
   now?: () => number;
-  /** Current hostname — injectable so cross-host tests are deterministic (default `os.hostname`). */
+  /** Current hostname used in diagnostic metadata. */
   hostname?: () => string;
-  /**
-   * Names the holder in the timeout message ("another ${label} is in
-   * progress …"). Defaults to a generic phrase; `add` passes "owenloop add" so
-   * its existing wording is byte-identical.
-   */
+  /** Names the holder in timeout text. */
   label?: string;
+  /** Test barrier after candidate inspection and before opening the database. */
+  beforeOpen?: () => void;
 }
 
-/**
- * Thrown by `acquireFileLock` when it gives up after `waitMs` on a lock a live
- * owner still holds. A subclass of `Error` (not a plain `Error`) so a caller can
- * `instanceof`-distinguish a clean timeout from a real filesystem failure (an
- * EACCES/EROFS from the exclusive create) and map only the timeout to its own
- * domain error — while `.message` stays byte-identical to the pre-extraction
- * plain-`Error` message the `add` tests assert on.
- */
 export class FileLockTimeoutError extends Error {
   readonly lockPath: string;
   readonly holderPid: number | undefined;
   readonly waitMs: number;
-  constructor(message: string, lockPath: string, holderPid: number | undefined, waitMs: number) {
+  readonly legacy: boolean;
+  constructor(
+    message: string,
+    lockPath: string,
+    holderPid: number | undefined,
+    waitMs: number,
+    legacy = false,
+  ) {
     super(message);
     this.name = 'FileLockTimeoutError';
     this.lockPath = lockPath;
     this.holderPid = holderPid;
     this.waitMs = waitMs;
+    this.legacy = legacy;
   }
 }
 
-/** `true` if a process with `pid` exists (signal 0 probes without delivering). */
-function defaultIsPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    // EPERM: the process exists but we may not signal it — treat as alive.
-    // ESRCH (and anything else): no such process — dead.
-    return (e as NodeJS.ErrnoException).code === 'EPERM';
-  }
+/** Connections are deliberately private so callers cannot commit the lock transaction. */
+const heldConnections = new WeakMap<FileLockHandle, DatabaseSync>();
+
+function ownerPath(lockPath: string): string {
+  return `${lockPath}.owner.json`;
 }
 
-/** Read the lock file's raw bytes, or `null` if it is gone/unreadable. */
-function readLockRaw(lockPath: string): string | null {
+function readRaw(path: string): string | null {
   try {
-    return readFileSync(lockPath, 'utf8');
+    return readFileSync(path, 'utf8');
   } catch {
     return null;
   }
 }
 
-/** Parse raw lock bytes into a holder, or `null` if absent/unparseable. */
-function parseLockHolder(raw: string | null): LockHolder | null {
+function parseHolder(raw: string | null): LockHolder | null {
   if (raw === null) return null;
   try {
     return JSON.parse(raw) as LockHolder;
@@ -122,211 +114,270 @@ function parseLockHolder(raw: string | null): LockHolder | null {
   }
 }
 
-/** Read + parse the lock file in one step (fresh read). Used off the hot loop. */
-function readLockHolder(lockPath: string): LockHolder | null {
-  return parseLockHolder(readLockRaw(lockPath));
+function readDiagnosticHolder(lockPath: string): LockHolder | null {
+  return parseHolder(readRaw(ownerPath(lockPath)));
 }
 
 /**
- * Decide whether the lock described by `holder` (parsed from a raw read) may be
- * reclaimed, given the current host. Liveness-aware, not age-based:
- *
- *   1. `statSync` fails — the lock vanished mid-judgment → treat as reclaimable
- *      (the acquire loop re-verifies and simply retries the exclusive create).
- *   2. Holder records a `host` that differs from ours → NOT stale, ever. A
- *      foreign PID space means `process.kill(pid, 0)` proves nothing; a shared
- *      filesystem could be locked by another machine. Held; caller refuses.
- *   3. Holder has a numeric `pid` and either matches our host or omits `host`
- *      (a legacy same-machine payload) → stale iff that pid is dead. Age never
- *      reclaims a live-pid lock — this is the core safety policy.
- *   4. Unparseable, or parses without a numeric pid → fail closed: held until
- *      `now() - mtimeMs > staleMs` (age is the only abandonment signal left).
+ * Missing and empty paths are valid SQLite candidates. A zero-byte database is
+ * what remains when a first owner crashes before the initial transaction commits.
  */
-function lockIsStale(
+function isSqliteCandidate(lockPath: string): boolean {
+  let size: number;
+  try {
+    size = statSync(lockPath).size;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+  if (size === 0) return true;
+  let fd: number;
+  try {
+    fd = openSync(lockPath, 'r');
+  } catch (error) {
+    // A legacy exclusive-create owner can unlink its path between the stat and
+    // open. Treat that disappearance like the missing-path case and let SQLite
+    // perform the atomic open/lock attempt; other filesystem refusals stay loud.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+  try {
+    const header = Buffer.alloc(SQLITE_HEADER.length);
+    const bytesRead = readSync(fd, header, 0, header.length, 0);
+    return bytesRead === SQLITE_HEADER.length && header.equals(SQLITE_HEADER);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function legacyHolder(lockPath: string): LockHolder | null {
+  return parseHolder(readRaw(lockPath));
+}
+
+function writeDiagnosticHolder(lockPath: string, holder: LockHolder): void {
+  const path = ownerPath(lockPath);
+  const tmp = `${path}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  writeFileSync(tmp, JSON.stringify(holder));
+  renameSync(tmp, path);
+}
+
+function openLockDatabase(lockPath: string): DatabaseSync {
+  const db = new DatabaseSync(lockPath);
+  db.exec('PRAGMA busy_timeout = 0');
+  return db;
+}
+
+function isBusy(error: unknown): boolean {
+  const candidate = error as { errcode?: number; message?: string };
+  return candidate.errcode === 5 || /database is (?:locked|busy)/iu.test(candidate.message ?? '');
+}
+
+function beginLock(db: DatabaseSync): void {
+  db.exec(
+    'BEGIN IMMEDIATE;\n' +
+    'CREATE TABLE IF NOT EXISTS __owenloop_lock_format (id INTEGER PRIMARY KEY CHECK (id = 1));\n' +
+    'INSERT OR IGNORE INTO __owenloop_lock_format (id) VALUES (1);',
+  );
+}
+
+function closeAfterFailure(db: DatabaseSync | undefined): void {
+  if (db === undefined) return;
+  try {
+    db.exec('ROLLBACK');
+  } catch {
+    // No transaction began, or SQLite already rolled it back.
+  }
+  try {
+    db.close();
+  } catch {
+    // Preserve the acquisition error.
+  }
+}
+
+function makeHandle(
   lockPath: string,
-  holder: LockHolder | null,
-  staleMs: number,
-  isPidAlive: (pid: number) => boolean,
+  db: DatabaseSync,
   now: () => number,
   currentHost: string,
-): boolean {
-  let mtimeMs: number;
+): FileLockHandle {
+  const token = randomBytes(16).toString('hex');
+  const holder: LockHolder = {
+    pid: process.pid,
+    startedAt: now(),
+    token,
+    host: currentHost,
+    active: true,
+  };
   try {
-    mtimeMs = statSync(lockPath).mtimeMs;
-  } catch {
-    // Vanished between the EEXIST and here — someone else reclaimed it; retry.
-    return true;
+    writeDiagnosticHolder(lockPath, holder);
+  } catch (error) {
+    closeAfterFailure(db);
+    throw error;
   }
-  // Case 2: recorded on a different host — its pid tells us nothing. Held.
-  if (holder && typeof holder.host === 'string' && holder.host !== currentHost) {
-    return false;
-  }
-  // Case 3: same host (or legacy no-host payload) with a numeric pid — liveness decides.
-  if (holder && typeof holder.pid === 'number') {
-    return !isPidAlive(holder.pid);
-  }
-  // Case 4: no attributable live owner — age is the only abandonment signal.
-  return now() - mtimeMs > staleMs;
+  const handle: FileLockHandle = { lockPath, acquired: true, token };
+  heldConnections.set(handle, db);
+  return handle;
 }
 
-/**
- * Acquire the file lock at `lockPath` (an exclusive-create of the file,
- * `openSync(..,'wx')` — the O_EXCL create is the real serialization point). The
- * payload carries an ownership token, the owner pid, a start timestamp, and the
- * host. If another process holds it: reclaim it only when liveness-aware
- * staleness says its owner is gone (see `lockIsStale`), otherwise poll until it
- * frees, and if it does not free within `waitMs` throw a `FileLockTimeoutError`.
- * Always pair with `releaseFileLock` in a `finally`.
- */
+function timeoutError(
+  lockPath: string,
+  holder: LockHolder | null,
+  waitMs: number,
+  label: string,
+  legacy: boolean,
+): FileLockTimeoutError {
+  const suffix = legacy
+    ? '; found a legacy lockfile that Owenloop will not delete automatically — verify that no old process owns it, then remove it manually'
+    : '';
+  return new FileLockTimeoutError(
+    `${inProgressMessage(lockPath, holder, waitMs, label)}${suffix}`,
+    lockPath,
+    typeof holder?.pid === 'number' ? holder.pid : undefined,
+    waitMs,
+    legacy,
+  );
+}
+
 export async function acquireFileLock(
   lockPath: string,
   opts: AcquireFileLockOpts = {},
 ): Promise<FileLockHandle> {
   const waitMs = opts.waitMs ?? LOCK_WAIT_MS;
-  const staleMs = opts.staleMs ?? LOCK_STALE_MS;
   const pollMs = opts.pollMs ?? LOCK_POLL_MS;
-  const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
   const now = opts.now ?? Date.now;
-  const host = (opts.hostname ?? hostname)();
+  const currentHost = (opts.hostname ?? hostname)();
   const label = opts.label ?? 'owenloop process';
+  const deadline = performance.now() + waitMs;
 
   mkdirSync(dirname(lockPath), { recursive: true });
-  const deadline = now() + waitMs;
   for (;;) {
+    if (!isSqliteCandidate(lockPath)) {
+      const holder = legacyHolder(lockPath);
+      if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, true);
+      await sleep(pollMs);
+      continue;
+    }
+
+    let db: DatabaseSync | undefined;
     try {
-      const fd = openSync(lockPath, 'wx');
-      const token = randomBytes(16).toString('hex');
-      try {
-        writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: now(), token, host }));
-      } finally {
-        closeSync(fd);
+      opts.beforeOpen?.();
+      db = openLockDatabase(lockPath);
+      beginLock(db);
+      return makeHandle(lockPath, db, now, currentHost);
+    } catch (error) {
+      closeAfterFailure(db);
+      if (!isBusy(error)) {
+	// A pathname replacement can turn a previously valid candidate into a
+	// legacy object. Refuse conservatively instead of deleting either object.
+	if (!isSqliteCandidate(lockPath)) {
+	  const holder = legacyHolder(lockPath);
+	  if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, true);
+	  await sleep(pollMs);
+	  continue;
+	}
+	throw error;
       }
-      return { lockPath, acquired: true, token };
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
     }
-    // Judge staleness from a single captured raw read...
-    const raw = readLockRaw(lockPath);
-    const holder = parseLockHolder(raw);
-    if (lockIsStale(lockPath, holder, staleMs, isPidAlive, now, host)) {
-      // ...then re-verify the bytes are unchanged immediately before deleting.
-      // Between judging stale and rmSync a third process could reclaim and
-      // re-create the lock; deleting then would destroy a *fresh* owner's lock.
-      // Residual window is a few syscalls (read-compare-delete) rather than the
-      // poll interval — and the `wx` create below is the true arbiter: if two
-      // reclaimers race, one wins the create and the other loops on EEXIST. A
-      // rename-based reclaim was rejected: POSIX rename clobbers its target, so
-      // any "rename back on mismatch" arm can itself destroy a newer lock.
-      const raw2 = readLockRaw(lockPath);
-      if (raw2 !== null && raw2 === raw) {
-        rmSync(lockPath, { force: true });
-        continue; // reclaimed — retry the exclusive create
-      }
-      // Bytes changed under us, or the lock is stat-able but unreadable (a
-      // root-owned 0600 lock: statSync needs only dir perms, readFileSync
-      // EACCES → raw/raw2 null). Do NOT delete — fall through to the deadline
-      // check and poll sleep below. Never `continue` here: with an unreadable,
-      // backdated lock this branch would otherwise spin sleeplessly, starving
-      // the event loop and never enforcing `waitMs`.
-    }
-    if (now() >= deadline) {
-      throw new FileLockTimeoutError(
-        inProgressMessage(lockPath, holder, waitMs, label),
-        lockPath,
-        typeof holder?.pid === 'number' ? holder.pid : undefined,
-        waitMs,
-      );
-    }
+
+    const holder = readDiagnosticHolder(lockPath);
+    if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, false);
     await sleep(pollMs);
   }
 }
 
-/**
- * Synchronous twin of {@link acquireFileLock}. Use only for APIs whose public
- * contract is synchronous but whose complete read/append/rename transaction
- * must still be serialized across processes. Staleness, ownership tokens, and
- * timeout behavior are identical to the asynchronous lock.
- */
 export function acquireFileLockSync(
   lockPath: string,
   opts: AcquireFileLockOpts = {},
 ): FileLockHandle {
   const waitMs = opts.waitMs ?? LOCK_WAIT_MS;
-  const staleMs = opts.staleMs ?? LOCK_STALE_MS;
   const pollMs = opts.pollMs ?? LOCK_POLL_MS;
-  const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
   const now = opts.now ?? Date.now;
-  const host = (opts.hostname ?? hostname)();
+  const currentHost = (opts.hostname ?? hostname)();
   const label = opts.label ?? 'owenloop process';
+  const deadline = performance.now() + waitMs;
 
   mkdirSync(dirname(lockPath), { recursive: true });
-  const deadline = now() + waitMs;
   for (;;) {
-    try {
-      const fd = openSync(lockPath, 'wx');
-      const token = randomBytes(16).toString('hex');
-      try {
-	writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: now(), token, host }));
-      } finally {
-	closeSync(fd);
-      }
-      return { lockPath, acquired: true, token };
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    if (!isSqliteCandidate(lockPath)) {
+      const holder = legacyHolder(lockPath);
+      if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, true);
+      Atomics.wait(LOCK_SYNC_SLEEP, 0, 0, pollMs);
+      continue;
     }
 
-    const raw = readLockRaw(lockPath);
-    const holder = parseLockHolder(raw);
-    if (lockIsStale(lockPath, holder, staleMs, isPidAlive, now, host)) {
-      const raw2 = readLockRaw(lockPath);
-      if (raw2 !== null && raw2 === raw) {
-	rmSync(lockPath, { force: true });
-	continue;
+    let db: DatabaseSync | undefined;
+    try {
+      opts.beforeOpen?.();
+      db = openLockDatabase(lockPath);
+      beginLock(db);
+      return makeHandle(lockPath, db, now, currentHost);
+    } catch (error) {
+      closeAfterFailure(db);
+      if (!isBusy(error)) {
+	if (!isSqliteCandidate(lockPath)) {
+	  const holder = legacyHolder(lockPath);
+	  if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, true);
+	  Atomics.wait(LOCK_SYNC_SLEEP, 0, 0, pollMs);
+	  continue;
+	}
+	throw error;
       }
     }
-    if (now() >= deadline) {
-      throw new FileLockTimeoutError(
-	inProgressMessage(lockPath, holder, waitMs, label),
-	lockPath,
-	typeof holder?.pid === 'number' ? holder.pid : undefined,
-	waitMs,
-      );
-    }
+
+    const holder = readDiagnosticHolder(lockPath);
+    if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, false);
     Atomics.wait(LOCK_SYNC_SLEEP, 0, 0, pollMs);
   }
 }
 
-/** Build the clear "another … is in progress" timeout error text, with graceful fallbacks. */
 function inProgressMessage(lockPath: string, holder: LockHolder | null, waitMs: number, label: string): string {
   const who = typeof holder?.pid === 'number' ? `pid ${holder.pid}` : 'another process';
-  // Lock content is untrusted input: a finite `startedAt` outside the ECMAScript
-  // Date range (|t| > 8.64e15 ms) makes `new Date(t).toISOString()` throw
-  // RangeError. Only render held-since when the value is a valid time value;
-  // otherwise omit it (same graceful fallback as an absent startedAt).
   const heldSince =
     typeof holder?.startedAt === 'number' &&
     Number.isFinite(holder.startedAt) &&
     Math.abs(holder.startedAt) <= 8.64e15
       ? `, held since ${new Date(holder.startedAt).toISOString()}`
       : '';
-  const s = Math.round(waitMs / 1000);
-  return `another ${label} is in progress (${who}${heldSince}) — holds ${lockPath}; timed out waiting after ${s}s`;
+  const seconds = Math.round(waitMs / 1000);
+  return `another ${label} is in progress (${who}${heldSince}) — holds ${lockPath}; timed out waiting after ${seconds}s`;
 }
 
 /**
- * Release a lock acquired by `acquireFileLock`. Token-checked and best-effort: a
- * no-op if not acquired, if the lock is already gone/unparseable, or if its
- * token no longer matches this handle (someone else legitimately re-acquired it
- * — deleting would steal *their* lock). Never throws; it runs in a `finally` and
- * must not mask the real error.
+ * Release exactly the SQLite transaction held by this handle. No pathname is
+ * deleted, renamed, or replaced, so release cannot remove a later owner.
  */
 export function releaseFileLock(handle: FileLockHandle): void {
   if (!handle.acquired) return;
+  const db = heldConnections.get(handle);
+  if (db === undefined) return;
+
   try {
-    const holder = readLockHolder(handle.lockPath);
-    if (!holder || holder.token !== handle.token) return;
-    rmSync(handle.lockPath, { force: true });
-  } catch {
-    // Already reclaimed/replaced, or an unexpected fs error — swallow.
+    try {
+      writeDiagnosticHolder(handle.lockPath, {
+	pid: process.pid,
+	token: handle.token,
+	host: hostname(),
+	active: false,
+	releasedAt: Date.now(),
+      });
+    } catch {
+      // Diagnostics never outrank releasing the kernel lock.
+    }
+    try {
+      db.exec('COMMIT');
+    } catch {
+      try {
+	db.exec('ROLLBACK');
+      } catch {
+	// Closing the connection still releases the operating-system lock.
+      }
+    }
+  } finally {
+    heldConnections.delete(handle);
+    try {
+      db.close();
+    } catch {
+      // Release is called from finally blocks and must not mask the real error.
+    }
   }
 }

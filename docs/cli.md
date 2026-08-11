@@ -1135,26 +1135,46 @@ package's exported `readStoredCredential` — see
 
 **Serializing writes (`credentials.lock`).** A store write — a refreshed OAuth
 token, or a `login`/`logout` that stores or deletes a slot — is serialized by a
-lockfile at `credentials.lock`, a sibling of `credentials.json` in the config
-dir (created for the keychain backend too, since the race it closes is
-backend-independent). The concern is a token-refresh race: two owenloop
-processes hitting an expiring OAuth token at once would each POST a refresh and
-each persist, and because refresh tokens rotate, the second write clobbers the
-first with a token whose refresh link is already spent — silently killing the
-credential. Under the lock a process re-reads the slot after acquiring it and,
-if another process already refreshed, **adopts** that fresh token instead of
-refreshing again — one network refresh, one write, no lost token. The lock
-matters only for OAuth refresh and store/delete; read paths and the external-
-command mode (which never writes the local store) do not take it. Staleness is
-liveness-based: a lock held by a dead same-host process is reclaimed at once, an
-unparseable or pid-less lockfile is reclaimed once older than the ~30s TTL, and
-a lock held by a live process is never age-reclaimed. If the lock can't be
-acquired within the wait budget the CLI fails loudly (`another owenloop process
-is using the credential store … — timed out waiting after Ns`) rather than
-refreshing unlocked. Three test knobs override the timings:
-`OWENLOOP_CRED_LOCK_WAIT_MS` (default 45000), `OWENLOOP_CRED_LOCK_STALE_MS`
-(default 30000), and `OWENLOOP_CRED_LOCK_POLL_MS` (default 100). No token value
-ever appears in the lockfile or the timeout message.
+persistent SQLite lock database at `credentials.lock`, a sibling of
+`credentials.json` in the config dir (created for the keychain backend too,
+since the race it closes is backend-independent). The concern is a token-refresh
+race: two owenloop processes hitting an expiring OAuth token at once would each
+POST a refresh and each persist, and because refresh tokens rotate, the second
+write clobbers the first with a token whose refresh link is already spent —
+silently killing the credential. Under the lock a process re-reads the slot
+after acquiring it and, if another process already refreshed, **adopts** that
+fresh token instead of refreshing again — one network refresh, one write, no
+lost token. The lock matters only for OAuth refresh and store/delete; read paths
+and the external-command mode (which never writes the local store) do not take
+it.
+
+SQLite owns exclusion through a `BEGIN IMMEDIATE` transaction tied to the live
+database connection. Release, normal process exit, and process crash close that
+connection and release the operating-system lock. Owenloop deliberately keeps
+the SQLite database path after release; Owenloop never deletes or replaces the
+path. A sibling `credentials.lock.owner.json` contains only diagnostic process
+metadata and does not determine ownership. If the lock cannot be acquired within
+the wait budget, the CLI fails loudly (`another owenloop process is using the
+credential store … — timed out waiting after Ns`) rather than refreshing
+unlocked. `OWENLOOP_CRED_LOCK_WAIT_MS` (default 45000) and
+`OWENLOOP_CRED_LOCK_POLL_MS` (default 100) override the wait behavior.
+`OWENLOOP_CRED_LOCK_STALE_MS` is accepted for compatibility but no longer causes
+pathname deletion. No token value appears in either lock file or the timeout
+message.
+
+**Lock-file upgrade boundary.** Upgrade every Owenloop process that can touch the
+same config, install, key, or session-store directory before running a new client
+there. A pre-SQLite client can mistake the persistent SQLite database for a
+stale JSON lockfile and try to delete or replace the pathname. On Unix and macOS,
+that replacement can create two separately locked filesystem objects at the same
+path, so old and new clients are not safe to run concurrently. Windows commonly
+blocks replacement of the open database, but Owenloop does not promise mixed-
+version safety there either. A new client that finds a non-empty legacy JSON or
+corrupt lockfile refuses to delete it. Stop every old process, verify that no old
+process owns the legacy lock, remove the legacy file manually, and then start
+only upgraded clients. After that one-time boundary, crash recovery is automatic
+through SQLite connection close; operators must not routinely delete the
+persistent lock databases.
 
 **Supplying the credential from your own tooling.** If your secrets live in a
 secret manager, or you run on a host with no keychain, set

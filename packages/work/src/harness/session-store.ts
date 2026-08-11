@@ -34,11 +34,11 @@
  * read-only filesystem), and a small `maxBytes` lets tests exercise compaction
  * without writing 2 MB. The 2 MB default is unchanged.
  *
- * WRITER SERIALIZATION: every append and compaction takes one cross-process
- * writer lock for the complete append → size check → optional rename transaction.
- * An append can therefore never report success and then be replaced by another
- * process's compaction snapshot. Dead-owner locks are reclaimed by the shared
- * liveness-aware lock utility; live-owner locks are never reclaimed by age.
+ * WRITER SERIALIZATION: every append, retirement, and compaction takes one
+ * cross-process writer lock for its complete read/append/size-check/rename
+ * transaction. A completed append can therefore never be replaced or shadowed
+ * by another process's stale snapshot. The shared SQLite lock database persists;
+ * process exit or crash releases its kernel lock without pathname deletion.
  *
  * Logging follows the house rule (there are zero `console.*` calls anywhere in
  * `src/`): the library takes an injectable callback and the default writes to
@@ -108,6 +108,8 @@ export interface SessionRecord {
 export interface SessionStoreOptions {
   /** Called once per skipped corrupt line. Default writes to stderr. */
   warn?: (line: string) => void;
+  /** Test barrier invoked under the writer lock after a retirement snapshot. */
+  afterWriterSnapshot?: () => void;
   /** Compaction threshold in bytes, checked after each append. Default 2 MB. */
   maxBytes?: number;
   /** Clock used to detect an abandoned unterminated tail. Default `Date.now`. */
@@ -362,6 +364,22 @@ function compactUnlocked(file: string, opts: SessionStoreOptions): void {
   atomicWrite(file, `${body}\n`);
 }
 
+/** Lock must already be held. Append exactly one committed JSONL row. */
+function appendSessionUnlocked(file: string, rec: SessionRecord): void {
+  const separator = needsRecordSeparator(file) ? '\n' : '';
+  appendFileSync(file, `${separator}${JSON.stringify(rec)}\n`);
+}
+
+/** Lock must already be held. Compaction remains best-effort after committed JSONL appends. */
+function compactIfNeededUnlocked(file: string, opts: SessionStoreOptions): void {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
+  try {
+    if (statSync(file).size > maxBytes) compactUnlocked(file, opts);
+  } catch {
+    // An un-compacted (or unstatable) file still contains the committed rows.
+  }
+}
+
 /**
  * Rewrite `file` with only the last record per `(workflow, run, step)`,
  * preserving FIRST-SEEN key order, via temp file + rename. Corrupt lines are
@@ -409,18 +427,23 @@ export function markRunSessionsDead(
   now: number,
   opts: SessionStoreOptions = {},
 ): string[] {
-  const newest = new Map<string, SessionRecord>();
-  for (const rec of readSessions(file, opts)) {
-    if (rec.workflow !== workflow || rec.run !== run) continue;
-    newest.set(keyOf(rec.workflow, rec.run, rec.step), rec);
-  }
-  const marked: string[] = [];
-  for (const rec of newest.values()) {
-    if (rec.status === 'dead') continue; // already retired — nothing to append
-    appendSession(file, { ...rec, status: 'dead', updatedAt: now }, opts);
-    marked.push(rec.step);
-  }
-  return marked;
+  mkdirSync(join(file, '..'), { recursive: true });
+  return withWriterLock(file, () => {
+    const newest = new Map<string, SessionRecord>();
+    for (const rec of readSessions(file, opts)) {
+      if (rec.workflow !== workflow || rec.run !== run) continue;
+      newest.set(keyOf(rec.workflow, rec.run, rec.step), rec);
+    }
+    opts.afterWriterSnapshot?.();
+    const marked: string[] = [];
+    for (const rec of newest.values()) {
+      if (rec.status === 'dead') continue; // already retired — nothing to append
+      appendSessionUnlocked(file, { ...rec, status: 'dead', updatedAt: now });
+      marked.push(rec.step);
+    }
+    if (marked.length > 0) compactIfNeededUnlocked(file, opts);
+    return marked;
+  });
 }
 
 /**
@@ -480,18 +503,23 @@ export function reconcileActiveSessions(
   now: number,
   opts: SessionStoreOptions = {},
 ): SessionRecord[] {
-  const newest = new Map<string, SessionRecord>();
-  for (const rec of readSessions(file, opts)) {
-    newest.set(keyOf(rec.workflow, rec.run, rec.step), rec);
-  }
-  const retired: SessionRecord[] = [];
-  for (const rec of newest.values()) {
-    if (rec.status !== 'active') continue; // a completed turn is still resumable
-    if (liveRunIds.has(rec.run)) continue; // its worker is alive; the row is true
-    appendSession(file, { ...rec, status: 'dead', updatedAt: now }, opts);
-    retired.push(rec);
-  }
-  return retired;
+  mkdirSync(join(file, '..'), { recursive: true });
+  return withWriterLock(file, () => {
+    const newest = new Map<string, SessionRecord>();
+    for (const rec of readSessions(file, opts)) {
+      newest.set(keyOf(rec.workflow, rec.run, rec.step), rec);
+    }
+    opts.afterWriterSnapshot?.();
+    const retired: SessionRecord[] = [];
+    for (const rec of newest.values()) {
+      if (rec.status !== 'active') continue; // a completed turn is still resumable
+      if (liveRunIds.has(rec.run)) continue; // its worker is alive; the row is true
+      appendSessionUnlocked(file, { ...rec, status: 'dead', updatedAt: now });
+      retired.push(rec);
+    }
+    if (retired.length > 0) compactIfNeededUnlocked(file, opts);
+    return retired;
+  });
 }
 
 /**
@@ -502,19 +530,12 @@ export function reconcileActiveSessions(
  * writer left bytes without the JSONL commit newline, a leading newline commits
  * only that fragment as corrupt before the new complete record. Append and lock
  * failures PROPAGATE; post-append compaction remains best-effort because the
- * appended line is already durable in the original log.
+ * appended line is already committed by its trailing JSONL newline in the original log.
  */
 export function appendSession(file: string, rec: SessionRecord, opts: SessionStoreOptions = {}): void {
   mkdirSync(join(file, '..'), { recursive: true });
   withWriterLock(file, () => {
-    const separator = needsRecordSeparator(file) ? '\n' : '';
-    appendFileSync(file, `${separator}${JSON.stringify(rec)}\n`);
-
-    const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
-    try {
-      if (statSync(file).size > maxBytes) compactUnlocked(file, opts);
-    } catch {
-      // best-effort: an un-compacted (or unstatable) file is still correct.
-    }
+    appendSessionUnlocked(file, rec);
+    compactIfNeededUnlocked(file, opts);
   });
 }

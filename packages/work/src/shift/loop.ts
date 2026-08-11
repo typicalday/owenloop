@@ -15,9 +15,9 @@
  *  - COMMAND orders spawn a detached `owenloop work exec <wf>/<run> --origin <url>`
  *    child that self-leases (unchanged from C3).
  *  - AGENT orders spawn a detached `owenloop work agent-run <wf>/<run>` child that
- *    hosts the step agent itself through a harness adapter. It reads the step's
- *    normalized spec straight out of the bundle cache and renders the brief in
- *    process.
+ *    hosts the step agent itself through a harness adapter. The child resolves the
+ *    order-pinned instruction digest and selects the verified step and harness;
+ *    Shift never substitutes definition-name cache metadata for modern orders.
  *  - The shift makes NO first-contact `get_order` for any kind. It holds no
  *    leases; the spawned child makes first contact and closes the B2 pickup
  *    window. A failed hand-off lapses back via that window instead of sitting
@@ -36,14 +36,13 @@
  * finishes, `run()` resolves 0, and no hub call is made afterward. Detached
  * children are never killed on shutdown — that is the drain semantic.
  *
- * PINNED-HASH DISPATCH (E, DD-4): `whats_next` serves only a def NAME (no hash,
- * no parent linkage), so the sweep resolves which cached bundle to serve via
- * `readDispatchBundle(cacheDir, defName)` instead of a bare latest read: 0 pins
- * → latest (unchanged); exactly 1 pinned hash → that frozen version (even when a
- * newer unpinned hash is cached); >1 conflicting pins across different cached
- * parents → refuse (no bundle + a warning), leave orders for the pickup window.
- * Everything downstream keys records by `bundle.def.hash`, so a pinned bundle
- * flows through `ChildRecord.hash` untouched.
+ * LEGACY PINNED-HASH DISPATCH (E, DD-4): the old wire shape omits both `worker`
+ * and `defDigest` and serves only a def NAME. Only that explicitly legacy shape
+ * uses `readDispatchBundle(cacheDir, defName)`: 0 pins → latest; exactly 1 pinned
+ * hash → that frozen version; >1 conflicting pins → refuse and leave the orders
+ * for the pickup window. Modern orders route from authoritative `worker` plus
+ * exact `defDigest`; modern command metadata is verified through
+ * `resolveOrderStep`, and modern agent metadata is resolved by `agent-run`.
  *
  * LIVE SHIFT IDENTITY: `name`/`serveCrews` on `ShiftLoopOptions` are INITIAL
  * values only. The loop holds them as live closure state (`getShift`/`setShift`
@@ -52,17 +51,23 @@
  * `setShift` also resets the presence timer so the new identity reaches the hub
  * on the very next `iterate()`.
  */
+import { performance } from 'node:perf_hooks';
+
 import { readDispatchBundle } from '../bundle/cache.ts';
 import type { HubClient } from '../hub/client.ts';
 import { HubError, type WorkOrder } from '../hub/types.ts';
 import type { FetchedStep } from '../bundle/types.ts';
 import { isCommandStep, resolveCommandRouting } from './routing.ts';
 import {
+  cancelReservedChild,
+  finalizeChildReservation,
   reconcileInFlight,
-  writeChildRecord,
+  reserveChild,
+  startReservedChild,
   removeChildRecord,
   ensureStateDir,
   type ChildRecord,
+  type ChildReservation,
   type Liveness,
 } from './state.ts';
 import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../agent/workdir.ts';
@@ -75,8 +80,10 @@ export interface ShiftLoopOptions {
   spawner: Spawner;
   /** Injected sleep — tests pass an instant/scriptable stub (no real timers). */
   sleep: (ms: number) => Promise<void>;
-  /** Injected clock. */
+  /** Injected wall clock for persisted and externally meaningful timestamps. */
   now: () => number;
+  /** Injected monotonic clock for elapsed-time decisions. Default `performance.now`. */
+  monotonicNow?: () => number;
   /** stdout sink (one line per call; newline appended). */
   out: (line: string) => void;
   /** stderr sink (one line per call; newline appended). */
@@ -106,6 +113,8 @@ export interface ShiftLoopOptions {
   workflow?: string;
   /** Machine-level command routing (raw — validated in routing.ts). */
   commandRouting?: unknown;
+  /** Resolve exact order-pinned step metadata by `defDigest`; modern command orders fail closed without it. */
+  resolveOrderStep?: (order: WorkOrder) => Promise<FetchedStep | undefined>;
   pollIntervalMs: number;
   presenceIntervalMs: number;
   /**
@@ -230,6 +239,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   let stopped = false;
   let cap = opts.cap;
   const isAlive = opts.isAlive;
+  const monotonicNow = opts.monotonicNow ?? performance.now.bind(performance);
   // Live shift identity (MCP `clock_in`, D3-D7 of the plan). Seeded from opts,
   // which are now INITIAL values only. Arrays are copied so neither the loop
   // nor a caller of getShift/setShift can mutate the other's state afterward.
@@ -260,7 +270,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   function noteServerBackoff(error: unknown): boolean {
     if (!(error instanceof HubError) || error.status !== 429) return false;
     const delay = error.retryAfterMs ?? opts.pollIntervalMs;
-    backoffUntil = Math.max(backoffUntil, opts.now() + delay);
+    backoffUntil = Math.max(backoffUntil, monotonicNow() + delay);
     return true;
   }
 
@@ -274,9 +284,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   }
 
   function reconcile() {
-    // No clock is passed: reconciliation is purely pid-probed, so there is no
-    // time-dependent decision for `opts.now` to influence.
-    const result = reconcileInFlight(opts.stateDir, { ...(isAlive !== undefined ? { isAlive } : {}) });
+    const result = reconcileInFlight(opts.stateDir, {
+      ...(isAlive !== undefined ? { isAlive } : {}),
+      now: opts.now(),
+    });
     for (const rec of result.reaped) {
       emit({
         type: 'reaped',
@@ -286,92 +297,85 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
         pid: rec.pid,
       });
     }
+    for (const reservation of result.abandoned) {
+      opts.err(
+	`[${reservation.workflow}/${reservation.run}] abandoned ${reservation.childKind} dispatch reservation expired and was cancelled`,
+      );
+    }
     return result;
   }
 
   function dispatchCandidate(c: Candidate): boolean {
-    if (c.kind === 'command') {
-      try {
-        const { pid } = opts.spawner({ workflow: c.workflow, run: c.order.run, step: c.order.step });
-        const rec: ChildRecord = {
-          workflow: c.workflow,
-          run: c.order.run,
-          pid,
-          spawnedAt: opts.now(),
-          kind: 'exec',
-        };
-        writeChildRecord(opts.stateDir, rec);
-        emit({
-          type: 'dispatched',
-          workflow: c.workflow,
-          run: c.order.run,
-          step: c.order.step,
-          kind: 'exec',
-          pid,
-        });
-        opts.out(`dispatched command ${c.workflow}/${c.order.run} (step '${c.order.step}', pid ${pid})`);
-        return true;
-      } catch (e) {
-        const message = errMsg(e);
-        emit({
-          type: 'failed',
-          workflow: c.workflow,
-          run: c.order.run,
-          step: c.order.step,
-          kind: 'exec',
-          message,
-        });
-        opts.err(`spawn for ${c.workflow}/${c.order.run} failed: ${message}`);
-        return false;
-      }
-    }
-
+    const childKind = c.kind === 'command' ? 'exec' : 'agent-run';
+    let reservation: ChildReservation | undefined;
+    let terminate: (() => void) | undefined;
     try {
-      const { pid } = opts.spawner({
+      const reserved = reserveChild(opts.stateDir, {
         workflow: c.workflow,
         run: c.order.run,
+	reservedAt: opts.now(),
+	childKind,
         step: c.order.step,
-        kind: 'agent-run',
-        ...(c.step?.harness !== undefined && c.step.harness !== '' ? { harness: c.step.harness } : {}),
       });
-      const rec: ChildRecord = {
+      reservation = reserved.reservation;
+      const spawned = opts.spawner({
         workflow: c.workflow,
         run: c.order.run,
-        pid,
-        spawnedAt: opts.now(),
-        kind: 'agent-run',
-        ...(c.defName !== undefined ? { def: c.defName } : {}),
-        ...(c.defHash !== undefined ? { hash: c.defHash } : {}),
         step: c.order.step,
-      };
-      writeChildRecord(opts.stateDir, rec);
+	...(childKind === 'agent-run' ? { kind: 'agent-run' as const } : {}),
+	startGate: reserved.gatePath,
+      });
+      terminate = spawned.terminate;
+      const rec = finalizeChildReservation(opts.stateDir, reservation, {
+	pid: spawned.pid,
+	spawnedAt: opts.now(),
+	kind: childKind,
+	...(childKind === 'agent-run' && c.defName !== undefined ? { def: c.defName } : {}),
+	...(childKind === 'agent-run' && c.defHash !== undefined ? { hash: c.defHash } : {}),
+	...(childKind === 'agent-run' ? { step: c.order.step } : {}),
+      });
+      startReservedChild(opts.stateDir, rec);
       emit({
         type: 'dispatched',
         workflow: c.workflow,
         run: c.order.run,
         step: c.order.step,
-        kind: 'agent-run',
-        pid,
+	kind: childKind,
+	pid: spawned.pid,
       });
-      opts.out(`dispatched agent-run ${c.workflow}/${c.order.run} (step '${c.order.step}', pid ${pid})`);
+      opts.out(
+	`dispatched ${c.kind === 'command' ? 'command' : 'agent-run'} ${c.workflow}/${c.order.run} ` +
+	`(step '${c.order.step}', pid ${spawned.pid})`,
+      );
       return true;
     } catch (e) {
+      terminate?.();
+      if (reservation !== undefined) {
+	try {
+	  cancelReservedChild(opts.stateDir, reservation);
+	} catch (cleanupError) {
+	  opts.err(
+	    `[${c.workflow}/${c.order.run}] failed to cancel dispatch reservation: ${errMsg(cleanupError)}`,
+	  );
+	}
+      }
       const message = errMsg(e);
       emit({
         type: 'failed',
         workflow: c.workflow,
         run: c.order.run,
         step: c.order.step,
-        kind: 'agent-run',
+	kind: childKind,
         message,
       });
-      opts.err(`agent-run spawn for ${c.workflow}/${c.order.run} failed: ${message}`);
+      const prefix = c.kind === 'command' ? 'spawn' : 'agent-run spawn';
+      opts.err(`${prefix} for ${c.workflow}/${c.order.run} failed: ${message}`);
       return false;
     }
   }
 
   function discardExpiredCandidate(candidate: Candidate, queued: boolean): boolean {
-    if (opts.now() - candidate.requestStartedAt < MAX_PENDING_CANDIDATE_AGE_MS) return false;
+    if (monotonicNow() - candidate.requestStartedAt < MAX_PENDING_CANDIDATE_AGE_MS) return false;
     const prefix = queued ? 'queued claim' : 'claim';
     opts.err(
       `[${candidate.workflow}/${candidate.order.run}] ${prefix} expired before local dispatch — leaving the hub pickup window to re-offer it`,
@@ -380,13 +384,15 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   }
 
   /** Dispatch already-claimed orders when local child capacity becomes free. */
-  function drainPending(live: ChildRecord[]): number {
-    let remaining = cap - live.length;
+  function drainPending(live: ChildRecord[], reserved: ChildReservation[]): number {
+    let remaining = cap - live.length - reserved.length;
     if (remaining <= 0 || pendingCandidates.size === 0) return 0;
 
     const maxAgents = opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS;
-    let agentRoom = maxAgents - live.filter((r) => r.kind === 'agent-run').length;
-    const liveRuns = new Set(live.map((r) => r.run));
+    let agentRoom = maxAgents -
+      live.filter((r) => r.kind === 'agent-run').length -
+      reserved.filter((r) => r.childKind === 'agent-run').length;
+    const liveRuns = new Set([...live.map((r) => r.run), ...reserved.map((r) => r.run)]);
     let dispatched = 0;
 
     for (const [run, candidate] of pendingCandidates) {
@@ -429,6 +435,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   async function sweep(
     budget: number,
     live: ChildRecord[],
+    reserved: ChildReservation[],
   ): Promise<SweepResult> {
     let dispatched = 0;
     /**
@@ -445,13 +452,15 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     const openRuns = new Set<string>();
     let complete = true;
     let remaining = budget;
-    const liveRuns = new Set(live.map((r) => r.run));
+    const liveRuns = new Set([...live.map((r) => r.run), ...reserved.map((r) => r.run)]);
 
-    // The agent lane's SECOND budget (D7). Counted from the live records, so an
-    // agent-run child that died frees its slot on the next reconcile exactly like
-    // an exec child does.
+    // The agent lane's SECOND budget (D7). Counted from live records and durable
+    // reservations, so a crash between reservation and spawn cannot overbook it.
+    // A child or reservation that is reaped frees the slot on the next reconcile.
     const maxAgents = opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS;
-    let agentRoom = maxAgents - live.filter((r) => r.kind === 'agent-run').length;
+    let agentRoom = maxAgents -
+      live.filter((r) => r.kind === 'agent-run').length -
+      reserved.filter((r) => r.childKind === 'agent-run').length;
     /**
      * Runs that ALREADY have a live `agent-run` child. An agent-run child is a
      * PROCESS: re-dispatching one would put a second harness session on a single
@@ -459,7 +468,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
      * re-offer for a run a worker already holds is skipped outright, the way the
      * command lane does it.
      */
-    const workerRuns = new Set(live.filter((r) => r.kind === 'agent-run').map((r) => r.run));
+    const workerRuns = new Set([
+      ...live.filter((r) => r.kind === 'agent-run').map((r) => r.run),
+      ...reserved.filter((r) => r.childKind === 'agent-run').map((r) => r.run),
+    ]);
 
     // Resolve which instances to poll.
     let instances: string[];
@@ -481,7 +493,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     const candidates: Candidate[] = [];
     for (const wf of instances) {
       let res;
-      const requestStartedAt = opts.now();
+      const requestStartedAt = monotonicNow();
       try {
         res = await opts.hub.whatsNext({ workflow: wf, serve_crews: serveCrews });
       } catch (e) {
@@ -504,38 +516,95 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       polled.add(wf);
       for (const o of orders) openRuns.add(o.run);
       const defName = res.def;
-      // Dispatch selection (DD-4): honor a UNIQUE pinned hash for this def name;
-      // 0 pins → latest (unchanged); conflicting pins → refuse (null + warning).
-      const dispatch = defName !== undefined ? readDispatchBundle(opts.cacheDir, defName) : { bundle: null };
+      const legacyOrders = orders.filter((order) =>
+	!Object.prototype.hasOwnProperty.call(order, 'worker') &&
+	!Object.prototype.hasOwnProperty.call(order, 'defDigest'));
+      // The definition-name cache exists only for the explicitly identified old
+      // wire shape. Modern orders route from `worker` and exact `defDigest`.
+      const dispatch = legacyOrders.length > 0 && defName !== undefined
+	? readDispatchBundle(opts.cacheDir, defName)
+	: { bundle: null };
       const bundle = dispatch.bundle;
-      if (orders.length > 0 && dispatch.warning !== undefined) {
+      if (legacyOrders.length > 0 && dispatch.warning !== undefined) {
         opts.err(`[${wf}] ${dispatch.warning}`);
-      } else if (orders.length > 0 && bundle === null && defName !== undefined) {
-        opts.err(`no cached bundle for def '${defName}' — run \`owenloop work prepare ${defName}\` (agent orders left for pickup)`);
+      } else if (legacyOrders.length > 0 && bundle === null && defName !== undefined) {
+	opts.err(`no cached bundle for def '${defName}' — run \`owenloop work prepare ${defName}\` (legacy orders left for pickup)`);
       }
       for (const order of orders) {
         if (claimed.has(order.run)) continue; // seen this sweep
         if (pendingCandidates.has(order.run)) continue; // already claimed and queued locally
-        const step = bundle?.def.steps.find((s) => s.name === order.step);
-        const isCmd = step !== undefined && isCommandStep(step);
         const reoffer = liveRuns.has(order.run);
+	const workerPresent = Object.prototype.hasOwnProperty.call(order, 'worker');
+	const digestPresent = Object.prototype.hasOwnProperty.call(order, 'defDigest');
+	const legacy = !workerPresent && !digestPresent;
+	let step: FetchedStep | undefined;
+	let kind: Candidate['kind'];
+	let candidateDefName: string | undefined;
+	let candidateDefHash: string | undefined;
 
-        if (isCmd) {
-          // A command already in flight (its exec child lives) is never respawned.
+	if (legacy) {
+	  step = bundle?.def.steps.find((candidate) => candidate.name === order.step);
+	  if (step === undefined || bundle === null) continue;
+	  kind = isCommandStep(step) ? 'command' : 'agent';
+	  candidateDefName = defName;
+	  candidateDefHash = bundle.def.hash;
+	} else {
+	  if (
+	    typeof order.worker !== 'string' || order.worker.trim() === '' ||
+	    typeof order.defDigest !== 'string' || order.defDigest.trim() === ''
+	  ) {
+	    opts.err(
+	      `[${wf}/${order.run}] incomplete modern work order: non-empty worker and defDigest are both required — leaving for manual pickup`,
+	    );
+	    claimed.add(order.run);
+	    continue;
+	  }
+	  if (order.worker === 'command') {
+	    kind = 'command';
+	    try {
+	      step = await opts.resolveOrderStep?.(order);
+	    } catch (error) {
+	      opts.err(
+		`[${wf}/${order.run}] exact command instructions for digest '${order.defDigest}' failed verification: ${errMsg(error)} — leaving for manual pickup`,
+	      );
+	      claimed.add(order.run);
+	      continue;
+	    }
+	    if (step === undefined) {
+	      opts.err(
+		`[${wf}/${order.run}] exact command routing metadata for digest '${order.defDigest}' is unavailable — leaving for manual pickup`,
+	      );
+	      claimed.add(order.run);
+	      continue;
+	    }
+	  } else if (order.worker === 'agent') {
+	    kind = 'agent';
+	  } else {
+	    opts.err(
+	      `[${wf}/${order.run}] unsupported worker '${order.worker}' — leaving for manual pickup`,
+	    );
+	    claimed.add(order.run);
+	    continue;
+	  }
+	}
+
+	if (kind === 'command') {
+	  // A command already in flight (or durably reserved) is never respawned.
           if (reoffer) continue;
-          const r = resolveCommandRouting(opts.commandRouting, step);
-          for (const w of r.warnings) opts.err(`[${wf}/${order.run}] ${w}`);
-          if (!r.autoDispatch) {
-            opts.out(`[${wf}/${order.run}] command step '${order.step}' routed to Shift — leaving for pickup window`);
+	  if (step === undefined) continue;
+	  const routing = resolveCommandRouting(opts.commandRouting, step);
+	  for (const warning of routing.warnings) opts.err(`[${wf}/${order.run}] ${warning}`);
+	  if (!routing.autoDispatch) {
+	    opts.out(`[${wf}/${order.run}] command step '${order.step}' routed to manual — leaving for pickup window`);
             continue;
           }
           const candidate: Candidate = {
             order,
             workflow: wf,
             step,
-            defName,
-            defHash: bundle?.def.hash,
-            kind: 'command',
+	    defName: candidateDefName,
+	    defHash: candidateDefHash,
+	    kind,
 	    requestStartedAt,
             reoffer,
           };
@@ -554,28 +623,16 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
           continue;
         }
 
-        // Agent order. An order a live worker already holds is never re-dispatched
-        // (see `workerRuns`) — that would double-brief one claim.
+	// Agent wire routing is authoritative. The detached agent-run resolves its
+	// own exact step and harness from the order digest, never from this cache.
         if (workerRuns.has(order.run)) continue;
-
-        // No resolved bundle ⇒ no dispatch. Two distinct causes, one outcome:
-        //   - nothing cached for this def name (the operator never ran
-        //     `owenloop work prepare`), so there is no def+hash for the `agent-run`
-        //     child to read `steps/<step>.json` from; and
-        //   - conflicting pins across cached parents (DD-4), where refusing is
-        //     the point — spawning a child that picks its own bundle would make
-        //     the very version guess DD-4 forbids.
-        // Either way the order is LEFT for the hub's pickup window. The one
-        // warning per sweep was already written above.
-        if (bundle === null) continue;
-
         const candidate: Candidate = {
           order,
           workflow: wf,
-          step,
-          defName,
-          defHash: bundle?.def.hash,
-          kind: 'agent',
+	  step: legacy ? step : undefined,
+	  defName: candidateDefName,
+	  defHash: candidateDefHash,
+	  kind,
 	  requestStartedAt,
           reoffer,
         };
@@ -584,10 +641,6 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	  continue;
 	}
 
-        // A re-offer replaces its stale record without consuming a new slot. A
-        // new order returned by `whats_next` is already claimed, so capacity-
-        // deferred work must stay in the local queue; the hub will not return
-        // the same in-flight claim on a later tick.
         if (!reoffer && remaining <= 0) {
           pendingCandidates.set(order.run, candidate);
           opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
@@ -662,7 +715,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   }
 
   async function iteration(): Promise<number> {
-    const backoffActiveAtStart = opts.now() < backoffUntil;
+    const backoffActiveAtStart = monotonicNow() < backoffUntil;
     let rateLimitedThisIteration = false;
 
     // Presence when due (starts immediately — this shift exists to conduct).
@@ -670,7 +723,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // reconciliation and queued dispatch continue below.
     if (
       !backoffActiveAtStart &&
-      opts.now() - lastPresence >= opts.presenceIntervalMs
+      monotonicNow() - lastPresence >= opts.presenceIntervalMs
     ) {
       // `setShift` and `noteAttended` force the next ping by setting
       // lastPresence to -Infinity. Either can land WHILE this ping is awaiting
@@ -687,7 +740,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
           ...(opts.startedAt !== undefined ? { started_at: opts.startedAt } : {}),
           ...(attendedAt !== undefined ? { attended_at: attendedAt } : {}),
         });
-        if (generation === presenceGeneration) lastPresence = opts.now();
+	if (generation === presenceGeneration) lastPresence = monotonicNow();
       } catch (e) {
 	rateLimitedThisIteration = noteServerBackoff(e);
         opts.err(`presence ping failed: ${errMsg(e)} (continuing)`);
@@ -697,10 +750,13 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // Reconcile in-flight first. A child exit is local state, not a hub event,
     // so use the freed slot to dispatch claims retained from an earlier sweep
     // before consulting the wake cursor.
-    let live = reconcile().live;
-    let dispatched = drainPending(live);
-    if (dispatched > 0) live = reconcile().live;
-    const k = cap - live.length;
+    let inFlight = reconcile();
+    let dispatched = drainPending(inFlight.live, inFlight.reserved);
+    if (dispatched > 0) inFlight = reconcile();
+    const live = inFlight.live;
+    const reserved = inFlight.reserved;
+    const occupied = live.length + reserved.length;
+    const k = cap - occupied;
 
     // Retry-After suppresses every remaining hub call in the iteration that
     // received it, and every hub call in later iterations before the deadline.
@@ -708,7 +764,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     if (
       backoffActiveAtStart ||
       rateLimitedThisIteration ||
-      opts.now() < backoffUntil
+      monotonicNow() < backoffUntil
     ) {
       return dispatched;
     }
@@ -732,11 +788,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // unchanged next time. `sweepOwed` preserves that unconsumed work signal.
     let swept: SweepResult | undefined;
     if (wakeSucceeded && (changed || sweepOwed) && k > 0) {
-      swept = await sweep(k, live);
+      swept = await sweep(k, live, reserved);
       sweepOwed = !swept.complete;
     } else if (changed && k <= 0) {
       sweepOwed = true;
-      opts.out(`at capacity (${live.length}/${cap} in flight) — deferring whats_next until capacity is free`);
+      opts.out(`at capacity (${occupied}/${cap} in flight) — deferring whats_next until capacity is free`);
     }
 
     const liveAfter = reconcile().live;
@@ -768,7 +824,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       if (stopped) return 0;
       await iteration();
       if (stopped) return 0;
-      const delay = Math.max(opts.pollIntervalMs, backoffUntil - opts.now());
+      const delay = Math.max(opts.pollIntervalMs, backoffUntil - monotonicNow());
       await opts.sleep(delay);
       // Re-check after the park so a stop during sleep makes no further hub call.
       if (stopped) return 0;
@@ -783,7 +839,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     run,
     stop,
     iterate: iteration,
-    freeCapacity: () => cap - reconcile().live.length,
+    freeCapacity: () => {
+      const current = reconcile();
+      return cap - current.live.length - current.reserved.length;
+    },
     getCap: () => cap,
     setCap: (next: number) => {
       cap = next;

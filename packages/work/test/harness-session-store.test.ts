@@ -12,6 +12,7 @@ import {
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
+import { Worker } from 'node:worker_threads';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
@@ -22,6 +23,7 @@ import {
   markRunSessionsDead,
   orderId,
   readSessions,
+  reconcileActiveSessions,
   sessionsPath,
   type SessionRecord,
 } from '../src/harness/session-store.ts';
@@ -80,6 +82,33 @@ function runAppendWorker(target: string, workerId: number, count: number): Promi
       else reject(new Error(`session append worker ${workerId} exited ${code}: ${stderr}`));
     });
   });
+}
+
+function startBarrierAppendWorker(target: string, record: SessionRecord): {
+  waitUntilAppendAttempted: () => void;
+  done: Promise<void>;
+} {
+  const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+  const state = new Int32Array(barrier);
+  const worker = new Worker(new URL('./fixtures/session-barrier-worker.ts', import.meta.url), {
+    workerData: { target, record, barrier },
+  });
+  const done = new Promise<void>((resolve, reject) => {
+    worker.once('error', reject);
+    worker.once('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`session barrier worker exited ${code}`));
+    });
+  });
+  return {
+    waitUntilAppendAttempted: () => {
+      Atomics.store(state, 0, 1);
+      Atomics.notify(state, 0);
+      const result = Atomics.wait(state, 1, 0, 5_000);
+      assert.notEqual(result, 'timed-out', 'append worker reached the held writer lock');
+    },
+    done,
+  };
 }
 
 test('sessionsPath and orderId build the two derived strings', () => {
@@ -149,14 +178,22 @@ test('concurrent append and compaction preserve every successful multiprocess ap
   const expected = workerCount * recordsPerWorker;
   assert.equal(records.length, expected);
   assert.equal(new Set(records.map((record) => record.token)).size, expected);
-  assert.equal(existsSync(`${file}.lock`), false, 'the writer lock is released after every child exits');
+  assert.equal(existsSync(`${file}.lock`), true, 'the persistent SQLite lock database remains after release');
 });
 
-test('appendSession reclaims a dead-owner writer lock and cleans it up', () => {
-  writeFileSync(`${file}.lock`, JSON.stringify({ pid: 2_147_483_647, startedAt: 1, token: 'dead' }));
-  appendSession(file, rec({ token: 'after-stale-lock' }));
-  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.token, 'after-stale-lock');
-  assert.equal(existsSync(`${file}.lock`), false);
+test('the synchronous lock conservatively refuses a dead-owner legacy lockfile', () => {
+  const lockPath = `${file}.lock`;
+  const original = JSON.stringify({ pid: 2_147_483_647, startedAt: 1, token: 'dead' });
+  writeFileSync(lockPath, original);
+
+  assert.throws(
+    () => acquireFileLockSync(lockPath, { waitMs: 5, pollMs: 1, label: 'test session-store writer' }),
+    (error: unknown) =>
+      error instanceof FileLockTimeoutError &&
+      error.holderPid === 2_147_483_647 &&
+      /legacy lockfile/u.test(error.message),
+  );
+  assert.equal(readFileSync(lockPath, 'utf8'), original);
 });
 
 test('the synchronous lock never reclaims a live owner because of age', () => {
@@ -199,7 +236,7 @@ test('a post-append compaction failure keeps the appended record and releases th
     readSessions(file, { warn: () => {} }).at(-1)?.token,
     'durable-after-compaction-failure',
   );
-  assert.equal(existsSync(`${file}.lock`), false);
+  assert.equal(existsSync(`${file}.lock`), true, 'the released SQLite lock database persists');
 });
 
 test('a propagating write failure still releases the session writer lock', () => {
@@ -207,7 +244,7 @@ test('a propagating write failure still releases the session writer lock', () =>
   mkdirSync(directoryTarget);
 
   assert.throws(() => appendSession(directoryTarget, rec()));
-  assert.equal(existsSync(`${directoryTarget}.lock`), false);
+  assert.equal(existsSync(`${directoryTarget}.lock`), true, 'the released SQLite lock database persists');
 });
 
 test('compact on a file that has never been written is a no-op, not a throw', () => {
@@ -462,4 +499,45 @@ test('markRunSessionsDead is idempotent — a second sweep over the same run app
 
 test('markRunSessionsDead on a store that does not exist is [] — a run that never had a session', () => {
   assert.deepEqual(markRunSessionsDead(join(dir, 'nope.jsonl'), 'wf_1', 'run_1', 5000), []);
+});
+
+test('markRunSessionsDead cannot shadow a completed append that reaches the held writer lock', async () => {
+  appendSession(file, rec({ status: 'active', token: 'active-before-reap' }));
+  const completed = rec({ status: 'submitted', token: 'submitted-during-reap', updatedAt: 6000 });
+  const worker = startBarrierAppendWorker(file, completed);
+
+  const marked = markRunSessionsDead(file, 'wf_1', 'run_1', 5000, {
+    afterWriterSnapshot: worker.waitUntilAppendAttempted,
+  });
+  await worker.done;
+
+  assert.deepEqual(marked, ['builder']);
+  assert.deepEqual(latestFor(file, 'wf_1', 'run_1', 'builder'), completed);
+});
+
+test('reconcileActiveSessions retires only newest orphaned active rows', () => {
+  appendSession(file, rec({ run: 'orphan', order: orderId('wf_1', 'orphan'), status: 'active' }));
+  appendSession(file, rec({ run: 'complete', order: orderId('wf_1', 'complete'), status: 'submitted' }));
+  appendSession(file, rec({ run: 'live', order: orderId('wf_1', 'live'), status: 'active' }));
+
+  const retired = reconcileActiveSessions(file, new Set(['live']), 5000);
+
+  assert.deepEqual(retired.map((record) => record.run), ['orphan']);
+  assert.equal(latestFor(file, 'wf_1', 'orphan', 'builder')?.status, 'dead');
+  assert.equal(latestFor(file, 'wf_1', 'complete', 'builder')?.status, 'submitted');
+  assert.equal(latestFor(file, 'wf_1', 'live', 'builder')?.status, 'active');
+});
+
+test('reconcileActiveSessions cannot shadow a submitted append from its retirement snapshot', async () => {
+  appendSession(file, rec({ status: 'active', token: 'active-before-reconcile' }));
+  const completed = rec({ status: 'turn-ended', token: 'completed-during-reconcile', updatedAt: 6000 });
+  const worker = startBarrierAppendWorker(file, completed);
+
+  const retired = reconcileActiveSessions(file, new Set(), 5000, {
+    afterWriterSnapshot: worker.waitUntilAppendAttempted,
+  });
+  await worker.done;
+
+  assert.deepEqual(retired.map((record) => record.token), ['active-before-reconcile']);
+  assert.deepEqual(latestFor(file, 'wf_1', 'run_1', 'builder'), completed);
 });

@@ -31,6 +31,8 @@ export interface WorkOrder {
   key?: string;
   index?: number;
   defDigest?: string;
+  /** Authoritative worker lane on modern whats_next responses. */
+  worker?: string;
   consumedFingerprint?: Record<string, number>;
   owes?: Array<{
     path: string;

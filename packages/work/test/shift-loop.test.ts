@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -6,7 +6,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 
 import { createShiftLoop, MAX_PENDING_CANDIDATE_AGE_MS, type ShiftLoop, type ShiftLoopOptions } from '../src/shift/loop.ts';
 import { buildSpawnPlan, createDefaultSpawner, safeWorkerDiagnostic, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
-import { readChildRecords, writeChildRecord } from '../src/shift/state.ts';
+import { readChildRecords, readChildReservations, reserveChild, writeChildRecord } from '../src/shift/state.ts';
 import { sessionsPath } from '../src/harness/session-store.ts';
 import { readStepSpec, writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
@@ -131,6 +131,15 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
 
 function wo(run: string, step: string, workflow = 'wf1'): WorkOrder {
   return { workflow, run, step, consumes: {}, expected_outputs: [], feedback: [], advisory: {}, submit_hint: '' };
+}
+
+function modernWo(
+  run: string,
+  step: string,
+  worker: 'command' | 'agent',
+  defDigest = 'sha256:order-pinned',
+): WorkOrder {
+  return { ...wo(run, step), worker, defDigest };
 }
 
 function fakeSpawner(): { spawner: Spawner; spawns: SpawnSpec[] } {
@@ -280,6 +289,7 @@ test('Retry-After metadata delays the next Shift poll', async () => {
   const holder: { loop?: ShiftLoop } = {};
   const loop = createShiftLoop(baseOpts(hub, spawner, {
     workflow: 'wf1',
+    monotonicNow: () => 0,
     sleep: async (ms) => {
       sleeps.push(ms);
       holder.loop!.stop();
@@ -300,6 +310,7 @@ test('presence Retry-After skips wake and whats_next in the same iteration and c
   const holder: { loop?: ShiftLoop } = {};
   const loop = createShiftLoop(baseOpts(hub, spawner, {
     workflow: 'wf1',
+    monotonicNow: () => 0,
     sleep: async (ms) => {
       sleeps.push(ms);
       holder.loop!.stop();
@@ -315,6 +326,7 @@ test('presence Retry-After skips wake and whats_next in the same iteration and c
 
 test('an iteration inside Retry-After performs local reconciliation but no hub polling', async () => {
   let now = 0;
+  let monotonic = 0;
   const { hub, calls } = mockHub({
     presence: [{ error: new HubError(429, 'slow down', 'rate_limited', 23_000) }],
   });
@@ -323,6 +335,7 @@ test('an iteration inside Retry-After performs local reconciliation but no hub p
   const loop = createShiftLoop(baseOpts(hub, spawner, {
     workflow: 'wf1',
     now: () => now,
+    monotonicNow: () => monotonic,
     isAlive: () => false,
     onEvent: (event) => events.push(event.type),
   }));
@@ -336,6 +349,7 @@ test('an iteration inside Retry-After performs local reconciliation but no hub p
     kind: 'exec',
   });
   now = 10_000;
+  monotonic = 10_000;
 
   await loop.iterate();
 
@@ -404,6 +418,34 @@ test('a targeted whats_next Retry-After stops the remaining workflow sweep', asy
   assert.deepEqual(targeted, ['wf1']);
 });
 
+for (const wallJump of [-1_000_000_000, 1_000_000_000]) {
+  const direction = wallJump < 0 ? 'backward' : 'forward';
+  test(`a ${direction} wall-clock jump does not change a Retry-After deadline`, async () => {
+    let wall = 50_000;
+    let monotonic = 0;
+    const { hub, calls } = mockHub({
+      presence: [{ error: new HubError(429, 'slow down', 'rate_limited', 23_000) }, {}],
+      wake: [{ changed: false, cursor: 1 }],
+    });
+    const { spawner } = fakeSpawner();
+    const loop = createShiftLoop(baseOpts(hub, spawner, {
+      workflow: 'wf1',
+      now: () => wall,
+      monotonicNow: () => monotonic,
+    }));
+
+    await loop.iterate();
+    wall += wallJump;
+    monotonic = 22_999;
+    await loop.iterate();
+    assert.deepEqual(calls.map((call) => call.verb), ['presence']);
+
+    monotonic = 23_000;
+    await loop.iterate();
+    assert.deepEqual(calls.map((call) => call.verb), ['presence', 'presence', 'wake']);
+  });
+}
+
 // ---- presence cadence -------------------------------------------------------
 
 test('presence pings on its own cadence, carrying name + serve crews', async () => {
@@ -417,13 +459,46 @@ test('presence pings on its own cadence, carrying name + serve crews', async () 
     t += 30_000;
     if (sleeps >= 3) h.loop!.stop();
   };
-  const loop = createShiftLoop(baseOpts(hub, spawner, { sleep, now: () => t, serveCrews: ['x'], presenceIntervalMs: 60_000, workflow: 'wf1' }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    sleep,
+    now: () => t,
+    monotonicNow: () => t,
+    serveCrews: ['x'],
+    presenceIntervalMs: 60_000,
+    workflow: 'wf1',
+  }));
   h.loop = loop;
   await loop.run();
   const pings = calls.filter((c) => c.verb === 'presence');
   assert.equal(pings.length, 2); // t=0 and t=60000, not the t=30000 tick
   assert.deepEqual(pings[0]!.arg, { name: 'box', serve_crews: ['x'] });
 });
+
+for (const wallJump of [-1_000_000_000, 1_000_000_000]) {
+  const direction = wallJump < 0 ? 'backward' : 'forward';
+  test(`a ${direction} wall-clock jump does not change presence cadence`, async () => {
+    let wall = 50_000;
+    let monotonic = 0;
+    const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+    const { spawner } = fakeSpawner();
+    const loop = createShiftLoop(baseOpts(hub, spawner, {
+      workflow: 'wf1',
+      now: () => wall,
+      monotonicNow: () => monotonic,
+      presenceIntervalMs: 60_000,
+    }));
+
+    await loop.iterate();
+    wall += wallJump;
+    monotonic = 59_999;
+    await loop.iterate();
+    assert.equal(count(calls, 'presence'), 1);
+
+    monotonic = 60_000;
+    await loop.iterate();
+    assert.equal(count(calls, 'presence'), 2);
+  });
+}
 
 // W7: when the role wires shiftId/startedAt, presence carries them too
 // (advisory only, D8/INV-82); omitted when unset (the test above).
@@ -616,6 +691,115 @@ test('a shift-routed command order dispatches', async () => {
   assert.deepEqual(spawns.map((s) => s.run), ['run_cmd']);
 });
 
+// ---- authoritative modern wire routing --------------------------------------
+
+test('wire command routing wins when the definition-name cache says agent', async () => {
+  cacheBuilderStep();
+  const order = modernWo('run_wire_command', 'builder', 'command');
+  const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [order] } } });
+  const { spawner, spawns } = fakeSpawner();
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    workflow: 'wf1',
+    resolveOrderStep: async () => ({ name: 'builder', executor: 'command' }),
+  })).run();
+
+  assert.equal(spawns.length, 1);
+  assert.equal(spawns[0]!.kind, undefined, 'wire command selects the exec lane');
+});
+
+test('wire agent routing wins when the definition-name cache says command', async () => {
+  cacheCommandBundle();
+  const order = modernWo('run_wire_agent', 'cmd', 'agent');
+  const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [order] } } });
+  const { spawner, spawns } = fakeSpawner();
+  let exactCommandLookups = 0;
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    workflow: 'wf1',
+    resolveOrderStep: async () => {
+      exactCommandLookups++;
+      return { name: 'cmd', executor: 'command' };
+    },
+  })).run();
+
+  assert.equal(spawns.length, 1);
+  assert.equal(spawns[0]!.kind, 'agent-run');
+  assert.equal(exactCommandLookups, 0, 'agent lane leaves exact instruction lookup to agent-run');
+});
+
+test('modern command routing comes from the exact order digest, not the latest cache', async () => {
+  cacheCommandBundle();
+  const order = modernWo('run_exact_manual', 'cmd', 'command', 'sha256:older-manual');
+  const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [order] } } });
+  const { spawner, spawns } = fakeSpawner();
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    workflow: 'wf1',
+    commandRouting: 'shift',
+    resolveOrderStep: async (received) => {
+      assert.equal(received.defDigest, 'sha256:older-manual');
+      return { name: 'cmd', executor: 'command', x: { owenloop: { routing: 'manual' } } };
+    },
+  })).run();
+
+  assert.equal(spawns.length, 0, 'exact digest manual routing fails closed despite cache metadata');
+});
+
+test('modern command order fails closed when exact digest metadata is unavailable', async () => {
+  const errors: string[] = [];
+  const order = modernWo('run_missing_digest', 'cmd', 'command', 'sha256:missing');
+  const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [order] } } });
+  const { spawner, spawns } = fakeSpawner();
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    workflow: 'wf1',
+    resolveOrderStep: async () => undefined,
+    err: (line) => errors.push(line),
+  })).run();
+
+  assert.equal(spawns.length, 0);
+  assert.match(errors.join('\n'), /exact command routing metadata.*sha256:missing.*unavailable/u);
+});
+
+test('modern agent order never passes a disagreeing cache harness', async () => {
+  cacheBuilderWithHarness('cache-harness');
+  const order = modernWo('run_modern_harness', 'builder', 'agent');
+  const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [order] } } });
+  const { spawner, spawns } = fakeSpawner();
+
+  await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1' })).run();
+
+  assert.equal(spawns.length, 1);
+  assert.equal('harness' in spawns[0]!, false);
+});
+
+test('only orders with both modern fields absent use the legacy cache fallback', async () => {
+  cacheCommandBundle();
+  const workerOnly = { ...wo('run_worker_only', 'cmd'), worker: 'command' };
+  const digestOnly = { ...wo('run_digest_only', 'cmd'), defDigest: 'sha256:only' };
+  const legacy = wo('run_legacy', 'cmd');
+  const errors: string[] = [];
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: { wf1: { def: 'demo', orders: [workerOnly, digestOnly, legacy] } },
+  });
+  const { spawner, spawns } = fakeSpawner();
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    workflow: 'wf1',
+    err: (line) => errors.push(line),
+  })).run();
+
+  assert.deepEqual(spawns.map((spawned) => spawned.run), ['run_legacy']);
+  assert.equal(errors.filter((line) => /incomplete modern work order/u.test(line)).length, 2);
+});
+
 // ---- agent lane: detached agent-run child ------------------------------------
 
 test('a dispatched agent order spawns a detached agent-run child and records it', async () => {
@@ -642,13 +826,13 @@ test('a dispatched agent order spawns a detached agent-run child and records it'
   assert.equal(recs[0]!.hash, DEMO_HASH);
 });
 
-test('a step naming a harness passes that id to the agent-run child', async () => {
-  cacheBuilderWithHarness('some-harness');
+test('Shift never passes a cache-derived harness to the agent-run child', async () => {
+  cacheBuilderWithHarness('cache-harness');
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [wo('run_deadbeef', 'builder')] } } });
   const { spawner, spawns } = fakeSpawner();
   const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
   await loop.iterate();
-  assert.equal(spawns[0]!.harness, 'some-harness');
+  assert.equal('harness' in spawns[0]!, false, 'agent-run resolves the verified order-pinned harness');
 });
 
 test('a step naming no harness passes no harness to the agent-run child', async () => {
@@ -688,11 +872,11 @@ test('an order a LIVE agent-run child already holds is never re-dispatched', asy
   assert.equal(readChildRecords(stateDir).length, 1); // the pre-existing record, untouched
 });
 
-// ---- pinned-hash dispatch (E, DD-4) -----------------------------------------
+// ---- legacy pinned-hash dispatch (E, DD-4) ----------------------------------
 //
-// whats_next serves only a def NAME. The sweep resolves which cached bundle to
-// serve via readDispatchBundle: a UNIQUE pinned hash wins over latest; conflicting
-// pins across cached parents refuse and leave orders for the pickup window.
+// The explicitly legacy order shape omits worker and defDigest, so Shift has only
+// the response's def NAME. That compatibility path uses readDispatchBundle: a
+// unique pinned hash wins over latest; conflicting pins refuse dispatch.
 
 const CHILD_H1 = 'aaaa1111bbbb2222'; // the version a parent pins (older fetchedAt)
 const CHILD_H2 = 'cccc3333dddd4444'; // a newer, UNPINNED cached hash of the same name
@@ -719,8 +903,9 @@ test('a sweep serving def=child dispatches the PINNED hash, not the newer unpinn
   assert.equal(dispatched, 1);
   assert.equal(spawns.length, 1);
   assert.equal(spawns[0]!.kind, 'agent-run');
-  // The in-flight record carries the PINNED hash, which is what the agent-run
-  // child then reads its step spec from (and what GC/re-vouch keys off).
+  // The legacy in-flight record preserves the selected pinned hash for
+  // compatibility diagnostics. Modern agent-run instruction selection uses the
+  // authoritative order digest instead of this cache-derived record field.
   const recs = readChildRecords(stateDir);
   assert.equal(recs.length, 1);
   assert.equal(recs[0]!.hash, CHILD_H1);
@@ -834,7 +1019,12 @@ test('setShift makes the next presence ping due immediately, even mid-cadence (c
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
   let t = 0;
-  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1', now: () => t, presenceIntervalMs: 60_000 }));
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    now: () => t,
+    monotonicNow: () => t,
+    presenceIntervalMs: 60_000,
+  }));
   await loop.iterate(); // t=0: first iterate always pings
   t = 10_000; // well short of the 60s cadence
   await loop.iterate(); // control: no ping yet — cadence has not elapsed
@@ -1248,9 +1438,9 @@ test('e2e: iterate() dispatches an agent order, parks quiet, and re-sweeps only 
 // ---- agent-run dispatch: capacity, failure, lane separation ------------------
 //
 // AGENT orders have exactly ONE path: a detached `owenloop work agent-run` child.
-// There is no flag, no lean order, and no stamped file — the child reads its own
-// step spec out of the bundle cache. What is left to pin here is the capacity
-// arithmetic, the spawn-failure behaviour, and that COMMAND orders are untouched.
+// There is no flag or lean-order handoff. The child resolves its verified step and
+// harness from the authoritative order digest; Shift's cache is legacy-only. The
+// tests below pin capacity, failure handling, and command-lane separation.
 
 /** Cache a builder-step bundle, optionally declaring a harness on the step. */
 function cacheBuilderWithHarness(harness?: string): void {
@@ -1349,7 +1539,8 @@ test('a claimed order queued by the agent cap dispatches after a child exits wit
 
 test('pending age includes a 40-second whats_next response before 81 seconds in the local queue', async () => {
   cacheBuilderStep();
-  let now = 0;
+  let wall = 0;
+  let monotonic = 0;
   const orders = [wo('run_first', 'builder'), wo('run_stale', 'builder')];
   const { hub, calls } = mockHub({
     wake: [
@@ -1357,7 +1548,7 @@ test('pending age includes a 40-second whats_next response before 81 seconds in 
       { changed: false, cursor: 1 },
     ],
     perWf: agentWf(orders),
-    onTargetedWhatsNext: () => { now += 40_000; },
+    onTargetedWhatsNext: () => { monotonic += 40_000; },
   });
   const alive = new Set<number>();
   const spawns: SpawnSpec[] = [];
@@ -1373,14 +1564,15 @@ test('pending age includes a 40-second whats_next response before 81 seconds in 
     cap: 10,
     maxConcurrentAgents: 1,
     isAlive: (candidatePid) => alive.has(candidatePid),
-    now: () => now,
+    now: () => wall,
+    monotonicNow: () => monotonic,
     err: (line) => err.push(line),
   }));
 
   assert.equal(await loop.iterate(), 1);
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
   alive.delete(1000);
-  now += 81_000;
+  monotonic += 81_000;
 
   assert.equal(await loop.iterate(), 0);
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
@@ -1390,18 +1582,18 @@ test('pending age includes a 40-second whats_next response before 81 seconds in 
 
 test('a whats_next response older than 90 seconds is not dispatched into immediate capacity', async () => {
   cacheBuilderStep();
-  let now = 0;
+  let monotonic = 0;
   const { hub } = mockHub({
     wake: [{ changed: true, cursor: 1 }],
     perWf: agentWf([wo('run_stale', 'builder')]),
-    onTargetedWhatsNext: () => { now += MAX_PENDING_CANDIDATE_AGE_MS + 1; },
+    onTargetedWhatsNext: () => { monotonic += MAX_PENDING_CANDIDATE_AGE_MS + 1; },
   });
   const { spawner, spawns } = fakeSpawner();
   const err: string[] = [];
 
   const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
     workflow: 'wf1',
-    now: () => now,
+    monotonicNow: () => monotonic,
     err: (line) => err.push(line),
   })).iterate();
 
@@ -1412,21 +1604,65 @@ test('a whats_next response older than 90 seconds is not dispatched into immedia
 
 test('a fresh whats_next response still dispatches immediately', async () => {
   cacheBuilderStep();
-  let now = 0;
+  let monotonic = 0;
   const { hub } = mockHub({
     wake: [{ changed: true, cursor: 1 }],
     perWf: agentWf([wo('run_fresh', 'builder')]),
-    onTargetedWhatsNext: () => { now += 40_000; },
+    onTargetedWhatsNext: () => { monotonic += 40_000; },
   });
   const { spawner, spawns } = fakeSpawner();
 
   const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
     workflow: 'wf1',
-    now: () => now,
+    monotonicNow: () => monotonic,
   })).iterate();
 
   assert.equal(dispatched, 1);
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_fresh']);
+});
+
+for (const wallJump of [-1_000_000_000, 1_000_000_000]) {
+  const direction = wallJump < 0 ? 'backward' : 'forward';
+  test(`a ${direction} wall-clock jump cannot expire a fresh claim`, async () => {
+    cacheBuilderStep();
+    let wall = 50_000;
+    let monotonic = 0;
+    const { hub } = mockHub({
+      wake: [{ changed: true, cursor: 1 }],
+      perWf: agentWf([wo(`run_wall_${direction}`, 'builder')]),
+      onTargetedWhatsNext: () => {
+	wall += wallJump;
+	monotonic += 1_000;
+      },
+    });
+    const { spawner, spawns } = fakeSpawner();
+
+    const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
+      workflow: 'wf1',
+      now: () => wall,
+      monotonicNow: () => monotonic,
+    })).iterate();
+
+    assert.equal(dispatched, 1);
+    assert.equal(spawns.length, 1);
+  });
+}
+
+test('persisted child timestamps use wall time rather than the monotonic clock', async () => {
+  cacheBuilderStep();
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_wall_timestamp', 'builder')]),
+  });
+  const { spawner } = fakeSpawner();
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    now: () => 123_456_789,
+    monotonicNow: () => 17,
+  })).iterate();
+
+  assert.equal(readChildRecords(stateDir)[0]?.spawnedAt, 123_456_789);
 });
 
 test('a queued claim is discarded before the hub pickup window can expire and re-offer it', async () => {
@@ -1442,7 +1678,7 @@ test('a queued claim is discarded before the hub pickup window can expire and re
   const alive = new Set<number>();
   const spawns: SpawnSpec[] = [];
   let pid = 1000;
-  let now = 0;
+  let monotonic = 0;
   const err: string[] = [];
   const spawner: Spawner = (spec) => {
     spawns.push(spec);
@@ -1455,7 +1691,7 @@ test('a queued claim is discarded before the hub pickup window can expire and re
       cap: 10,
       maxConcurrentAgents: 1,
       isAlive: (candidatePid) => alive.has(candidatePid),
-      now: () => now,
+      monotonicNow: () => monotonic,
       err: (line) => err.push(line),
     }),
   );
@@ -1464,7 +1700,7 @@ test('a queued claim is discarded before the hub pickup window can expire and re
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
 
   alive.delete(1000);
-  now = MAX_PENDING_CANDIDATE_AGE_MS;
+  monotonic = MAX_PENDING_CANDIDATE_AGE_MS;
 
   assert.equal(await loop.iterate(), 0);
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
@@ -1493,10 +1729,13 @@ test('live agent-run records consume the agent cap; the global cap still applies
   assert.equal(s2.spawns.length, 0);
 });
 
-test('a failing agent-run spawn is reported and writes no record', async () => {
+test('a failing agent-run spawn is reported and removes its reservation and closed gate', async () => {
   cacheBuilderStep();
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: agentWf([wo('run_deadbeef', 'builder')]) });
-  const spawner: Spawner = () => {
+  let gatePath: string | undefined;
+  const spawner: Spawner = (spec) => {
+    gatePath = spec.startGate;
+    assert.equal(gatePath === undefined ? undefined : readFileSync(gatePath, 'utf8'), 'wait\n');
     throw new Error('fork bomb');
   };
   const err: string[] = [];
@@ -1506,7 +1745,126 @@ test('a failing agent-run spawn is reported and writes no record', async () => {
 
   assert.equal(dispatched, 0);
   assert.equal(readChildRecords(stateDir).length, 0);
+  assert.equal(readChildReservations(stateDir).length, 0);
+  assert.equal(gatePath === undefined ? true : existsSync(gatePath), false);
   assert.match(err.join('\n'), /agent-run spawn for wf1\/run_deadbeef failed: fork bomb/);
+});
+
+test('a reservation write failure prevents spawn and removes the losing gate', async () => {
+  cacheBuilderStep();
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(join(stateDir, 'run_reserve_fail.json'));
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_reserve_fail', 'builder')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const err: string[] = [];
+
+  const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    err: (line) => err.push(line),
+  })).iterate();
+
+  assert.equal(dispatched, 0);
+  assert.equal(spawns.length, 0, 'spawn is unreachable until the reservation is durable');
+  assert.equal(readChildReservations(stateDir).length, 0);
+  assert.equal(readdirSync(stateDir).some((name) => name.endsWith('.gate')), false);
+  assert.match(err.join('\n'), /agent-run spawn for wf1\/run_reserve_fail failed:/u);
+});
+
+test('a PID-record finalization failure terminates the gated child and never opens its gate', async () => {
+  cacheBuilderStep();
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_finalize_fail', 'builder')]),
+  });
+  let gatePath: string | undefined;
+  let terminated = 0;
+  const spawner: Spawner = (spec) => {
+    gatePath = spec.startGate;
+    assert.equal(gatePath === undefined ? undefined : readFileSync(gatePath, 'utf8'), 'wait\n');
+    rmSync(join(stateDir, 'run_finalize_fail.json'));
+    mkdirSync(join(stateDir, 'run_finalize_fail.json'));
+    return { pid: 4242, terminate: () => { terminated++; } };
+  };
+  const err: string[] = [];
+
+  const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    err: (line) => err.push(line),
+  })).iterate();
+
+  assert.equal(dispatched, 0);
+  assert.equal(terminated, 1, 'the spawned process is terminated after PID persistence fails');
+  assert.equal(gatePath === undefined ? true : existsSync(gatePath), false, 'the child never observes a start signal');
+  assert.equal(readChildRecords(stateDir).length, 0);
+  assert.equal(readChildReservations(stateDir).length, 0);
+  assert.match(err.join('\n'), /child reservation .* is missing or was replaced/u);
+});
+
+test('a broken state-directory path fails closed before hub polling or spawn', async () => {
+  cacheBuilderStep();
+  writeFileSync(stateDir, 'not a directory');
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_never', 'builder')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
+
+  await assert.rejects(loop.iterate(), /ENOTDIR|not a directory/iu);
+  assert.equal(calls.length, 1, 'presence may run before local state reconciliation');
+  assert.equal(calls[0]?.verb, 'presence');
+  assert.equal(spawns.length, 0);
+});
+
+test('a fresh same-run reservation consumes capacity and suppresses a hub re-offer', async () => {
+  cacheBuilderStep();
+  reserveChild(stateDir, {
+    workflow: 'wf1',
+    run: 'run_reserved_offer',
+    reservedAt: 0,
+    childKind: 'agent-run',
+    step: 'builder',
+  });
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_reserved_offer', 'builder'), wo('run_new_offer', 'builder')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+
+  const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 2,
+  })).iterate();
+
+  assert.equal(dispatched, 1);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_new_offer']);
+  assert.deepEqual(readChildReservations(stateDir).map((reservation) => reservation.run), ['run_reserved_offer']);
+});
+
+test('an expired dispatch reservation is cancelled and reported before new work is polled', async () => {
+  reserveChild(stateDir, {
+    workflow: 'wf1',
+    run: 'run_abandoned',
+    reservedAt: 0,
+    childKind: 'exec',
+    step: 'cmd',
+  });
+  const { hub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { spawner } = fakeSpawner();
+  const err: string[] = [];
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    now: () => 120_001,
+    err: (line) => err.push(line),
+  })).iterate();
+
+  assert.equal(readChildReservations(stateDir).length, 0);
+  assert.equal(readdirSync(stateDir).some((name) => name.endsWith('.gate')), false);
+  assert.match(err.join('\n'), /abandoned exec dispatch reservation expired and was cancelled/u);
 });
 
 // Command orders keep their own lane: they spawn `exec` (kind absent on the spec,

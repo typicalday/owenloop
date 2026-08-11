@@ -9,6 +9,7 @@
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { basename, join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 
 import { createHubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
@@ -21,6 +22,11 @@ import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.
 import { resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
 import { installSignalHandlers, type SignalHost } from '../roles/signals.ts';
 import { createShiftDaemon, type ShiftDaemon } from './server.ts';
+import {
+  createBundleIngestor,
+  createStoreInstructionSource,
+  globalStoreRoot,
+} from '../../../../src/store/index.ts';
 
 // Re-exported so existing importers keep their import site while the
 // implementation lives in the shared signals seam.
@@ -215,7 +221,12 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     return 1;
   }
 
-  ensureStateDir(stateDir);
+  try {
+    ensureStateDir(stateDir);
+  } catch (err) {
+    process.stderr.write(`${roleLabel}: cannot initialize dispatch state at ${stateDir}: ${errMsg(err)}\n`);
+    return 1;
+  }
   {
     const liveRunIds = new Set(
       reconcileInFlight(stateDir).live.filter((r) => r.kind === 'agent-run').map((r) => r.run),
@@ -240,6 +251,29 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   const workRepo = resolveWorkRepo(env, settings.workRepo);
   const hub = createHubClient({ origin, getToken: async () => token });
   const now = () => Date.now();
+  const monotonicNow = () => performance.now();
+  const home = [env.HOME, env.USERPROFILE].find(
+    (value) => value !== undefined && value.trim() !== '',
+  );
+  // Legacy orders and modern agent orders do not need Shift-side instruction
+  // lookup. Keep serving those lanes without a home directory; a modern command
+  // order still fails closed because its exact digest cannot be resolved.
+  const instructionSource = home === undefined
+    ? undefined
+    : createStoreInstructionSource({
+	projectRoot: join(process.cwd(), 'workflows'),
+	globalRoot: globalStoreRoot(home),
+	verifier: createBundleIngestor(),
+      });
+  const resolveOrderStep = async (order: { defDigest?: string; step: string }) => {
+    if (
+      instructionSource === undefined ||
+      order.defDigest === undefined ||
+      order.defDigest.trim() === ''
+    ) return undefined;
+    if (await instructionSource.prime(order.defDigest) !== 'resolved') return undefined;
+    return instructionSource.getVerifiedStep(order.defDigest, order.step);
+  };
   const shiftId = `shf_${randomUUID()}`;
   const startedAt = now();
   const name = resolveShiftName(parsed.name, { shiftId });
@@ -268,6 +302,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     spawner,
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     now,
+    monotonicNow,
     out: (line) => process.stdout.write(`${line}\n`),
     err: (line) => process.stderr.write(`${line}\n`),
     ...(daemonMode ? { onEvent: (event) => daemon?.onEvent(event) } : {}),
@@ -277,6 +312,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     serveCrews: parsed.serveCrews ?? [],
     name,
     commandRouting: settings.commandRouting,
+    resolveOrderStep,
     pollIntervalMs,
     presenceIntervalMs: DEFAULT_PRESENCE_MS,
     maxConcurrentAgents,

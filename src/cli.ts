@@ -3831,16 +3831,29 @@ function assertUniqueBundleStepNames(defs: ReadonlyMap<string, WorkflowDef>): vo
 }
 
 /**
- * Order only the explicitly selected definitions by their selected bare
+ * Order only the explicitly selected definitions by their selected local
  * `calls:` dependencies. A child is published before each selected parent.
- * Qualified or excluded targets add no edge: positional selection remains an
- * exact filter and never pulls another workflow into the push.
+ * `<currentPackage>/<workflow>` is local in bundle mode; excluded local and
+ * external-package targets add no edge, so selection never pulls another
+ * workflow into the push.
  */
-function orderSelectedDefsByCalls(selected: WorkflowDef[]): WorkflowDef[] {
+function orderSelectedDefsByCalls(
+  selected: WorkflowDef[],
+  currentPackage?: string,
+): WorkflowDef[] {
   const selectedByName = new Map(selected.map((def) => [def.name, def]));
   const state = new Map<string, 'visiting' | 'done'>();
   const stack: string[] = [];
   const ordered: WorkflowDef[] = [];
+  const localPrefix = currentPackage === undefined ? undefined : `${currentPackage}/`;
+
+  const localTarget = (target: string | undefined): string | undefined => {
+    if (target === undefined) return undefined;
+    if (!target.includes('/')) return selectedByName.has(target) ? target : undefined;
+    if (localPrefix === undefined || !target.startsWith(localPrefix)) return undefined;
+    const name = target.slice(localPrefix.length);
+    return selectedByName.has(name) ? name : undefined;
+  };
 
   const visit = (def: WorkflowDef): void => {
     const prior = state.get(def.name);
@@ -3855,9 +3868,8 @@ function orderSelectedDefsByCalls(selected: WorkflowDef[]): WorkflowDef[] {
     stack.push(def.name);
     const targets = new Set(
       def.steps
-	.map((step) => step.calls)
-	.filter((target): target is string =>
-	  target !== undefined && !target.includes('/') && selectedByName.has(target)),
+	.map((step) => localTarget(step.calls))
+	.filter((target): target is string => target !== undefined),
     );
     for (const target of targets) visit(selectedByName.get(target)!);
     stack.pop();
@@ -3967,7 +3979,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   if (selected.length === 0) {
     throw new CliError(`nothing to push — no workflow definitions found in ${defsDir}`);
   }
-  selected = orderSelectedDefsByCalls(selected);
+  selected = orderSelectedDefsByCalls(selected, bundle?.manifest.package.name);
 
   // Client-side validation gate — all-or-nothing, mirroring dispatchAdd exactly.
   // Any failure aborts the entire push; nothing is sent.
