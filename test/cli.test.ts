@@ -283,6 +283,13 @@ test('every ASYNC_COMMANDS member has a COMMAND_OPTIONS entry (no unreachable as
   }
 });
 
+test('push and publish advertise and allow the explicit --hub override', () => {
+  assert.equal(COMMAND_OPTIONS.get('push')?.has('hub'), true);
+  assert.equal(COMMAND_OPTIONS.get('publish')?.has('hub'), true);
+  assert.match(USAGE, /publish <source-dir>.*--hub <origin>/);
+  assert.match(USAGE, /push \[<defName>\.\.\.\].*--hub <origin>/);
+});
+
 test('opening a downgraded database via the CLI exits 1 with a clear stderr message', () => {
   const { run, db } = makeCli();
   const first = run('list');

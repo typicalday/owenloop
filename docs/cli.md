@@ -51,10 +51,10 @@ for the full breakdown.
 | `bundle inspect <bundle.wnlp>` | strictly validate a `.wnlp` package and print its manifest and file metadata — see [Bundles](#bundles) |
 | `bundle digest <bundle.wnlp>` | print the SHA-256 digest of the uncompressed canonical tar — see [Bundles](#bundles) |
 | `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
-| `connect [--hub <url>] [--as <slot>]` | bind this project to a hub (writes `.owenloop/hub.json`) and verify the credential |
-| `push [<defName>...] [--force] [--dry-run] [--as <slot>]` | publish local workflow defs to the bound hub (idempotent against the hub's own def hashes) |
+| `connect [--hub <url>] [--as <slot>]` | verify a resolved hub credential and record an optional per-project override in `.owenloop/hub.json` |
+| `push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--hub <url>] [--as <slot>]` | publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (idempotent against the hub's own def hashes) |
 | `start <defName> [--provide name=json …] [--crew <name>] [--title <text>] [--hub <url>]` | start a published workflow on the bound hub with the human credential |
-| `publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned]` | pack a canonical workflow bundle and publish a signed publication sidecar, with an optional signed origin sidecar, or an explicitly unsigned marker |
+| `publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned] [--hub <url>]` | pack a canonical workflow bundle and publish a signed publication sidecar, with an optional signed origin sidecar, or an explicitly unsigned marker |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--shift` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
 | `capability bind <capability> <crew> [--hub <url>]` | add a crew to a workflow capability on the hub org — a capability may route to many crews (admin; human credential) — see [Capability routes](#capability-routes) |
@@ -1143,12 +1143,14 @@ checks both journal locations and dispatches by journal version; a v2 store
 journal uses `index.json` metadata and a v1 GitHub journal uses
 `installed.json` ledger corroboration.
 
-## Hub (`login` / `connect` / `push` / `start` / `logout`)
+## Hub (`login` / `connect` / `push` / `start` / `publish` / `logout`)
 
 These commands authenticate, publish, and start workflows on a hosted **hub** (default
-`https://api.owenloop.com`; override per-command with `--hub <url>` or the
-`OWENLOOP_HUB` env var). They are the only network-bound commands besides
-`add`, and they talk only to endpoints the hub exposes today — no new
+`https://api.owenloop.com`). `login` and `logout` retain the generic resolver:
+`--hub <url>` → `OWENLOOP_HUB` → the built-in `DEFAULT_HUB`. `connect`, `push`,
+and `publish` use the safer publishing ladder below and never consult
+`OWENLOOP_HUB` or guess `DEFAULT_HUB`. They are the only network-bound commands
+besides `add`, and they talk only to endpoints the hub exposes today — no new
 service-side surface. The hub URL is normalized to its origin
 (`scheme://host[:port]`); path/query are dropped. `https` is required for
 every hub origin except the loopback hosts (`127.0.0.1`, `::1`, `localhost`),
@@ -1204,6 +1206,31 @@ their live hub bindings. `--title <text>` is display-only. Both `--crew` and
 usage errors before credential or network access. The command does not claim,
 dispatch, close, or otherwise drive work—the standing Shift discovers the run
 through its normal crew inbox.
+
+**Publishing hub resolution.** `connect`, `push`, and `publish` resolve their
+target in this order:
+
+1. An explicit `--hub <origin>` always wins.
+2. `.owenloop/hub.json`, when present, is the project override.
+3. Global machine state supplies one unambiguous candidate:
+   - with the file credential backend, exactly one origin containing a valid
+     human-slot credential is selected automatically;
+   - Keychain and external-command credential backends cannot enumerate their
+     origins, so the validated `hubOrigin` in
+     `$XDG_CONFIG_HOME/owenloop/settings.json` (or
+     `~/.config/owenloop/settings.json`) is used, and the requested credential
+     slot must exist there before the command proceeds.
+4. If nothing safe resolves, the command exits 2 without network or publication
+   output effects.
+
+More than one file-backed origin is also an exit-2 ambiguity: the error lists
+the origins in deterministic order and asks for `--hub <origin>` or
+`owenloop connect --hub <origin>`. A non-enumerable backend with no settings
+`hubOrigin` names the exact settings path and asks for the same explicit
+choice. `owenloop setup` populates that non-secret settings field. `OWENLOOP_HUB`
+and `DEFAULT_HUB` are intentionally excluded from the publishing ladder because
+an ambient guess can target the wrong hub organization; ambiguous or missing
+resolution fails closed instead of choosing one.
 
 **Request timeouts.** Every hub call — OAuth discovery, client registration,
 code exchange, token refresh, `whoami`, the workflow list, and each push — is
@@ -1399,12 +1426,17 @@ than relying on whichever `login` ran most recently.
 
 ### `connect` — bind a project to a hub
 
-`owenloop connect` writes `.owenloop/hub.json` recording which hub this project
-publishes to, after re-verifying the stored credential against `GET
-/api/whoami`. Run `login` first. The JSON reports the same org/identity fields
-as `login`; re-connecting to the **same** origin reports no `switchedFrom`,
-switching to a **different** hub reports `switchedFrom: <old origin>` and
-rebinds the project to the new one.
+`owenloop connect` resolves a target through the publishing ladder, re-verifies
+the stored credential against `GET /api/whoami`, and writes
+`.owenloop/hub.json`. Run `login` first. With no `--hub`, an existing binding
+remains the target; an unbound project uses the unambiguous global fallback.
+An explicit `--hub` creates or replaces the project override, which is useful
+for multi-org or multi-hub repositories. `connect` is optional for the ordinary
+single-hub happy path, not a prerequisite for `push` or `publish`.
+
+The JSON reports the same org/identity fields as `login`; re-connecting to the
+**same** origin reports no `switchedFrom`, switching to a **different** hub
+reports `switchedFrom: <old origin>` and rebinds the project to the new one.
 
 A symlinked project `.owenloop` directory is refused with a clear error rather
 than followed: a hostile checkout cannot ship `.owenloop -> /elsewhere` to
@@ -1414,10 +1446,15 @@ guarantee). The same refusal covers the default `state.db` FILE (and its SQLite
 file would otherwise redirect the store's writes, since SQLite follows file
 symlinks.
 
-### `push` — publish local defs to the bound hub
+### `push` — publish local defs to the resolved hub
 
 `owenloop push [<defName>...]` publishes the project's workflow defs (all of
-them, or just the named ones) to the hub the project is `connect`ed to. It
+them, or just the named ones) to the hub selected by the publishing ladder.
+`--hub` overrides a project binding for that invocation without rewriting it;
+otherwise the project override wins over global state. An unbound project with
+one file-backed human credential therefore needs no setup step. Ambiguous or
+missing candidates exit 2 as described above, and `OWENLOOP_HUB`/
+`DEFAULT_HUB` never participate. `push` never writes a project binding. It
 reuses the **exact** all-or-nothing validation gate `add` uses — lint, validate,
 and a bounded `check` — across every selected def before a single byte is sent;
 any definite defect aborts the whole push. stdout is machine-parseable JSON;
@@ -1496,12 +1533,20 @@ both before pushing.
 ### `publish` — pack and publish a workflow bundle
 
 ```text
-owenloop publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned]
+owenloop publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned] [--hub <origin>]
 ```
 
-`publish` is separate from both [`bundle pack`](#bundles) and [`push`](#push--publish-local-defs-to-the-bound-hub). It packs one source directory with the same deterministic `packBundle` implementation as `bundle pack`, then publishes the bundle beside a local publication sidecar and, optionally, a signed origin sidecar. The command requires the project to be bound with `owenloop connect`, because the binding supplies the hub origin used to select the local author key.
+`publish` is separate from both [`bundle pack`](#bundles) and [`push`](#push--publish-local-defs-to-the-resolved-hub). It packs one source directory with the same deterministic `packBundle` implementation as `bundle pack`, then publishes the bundle beside a local publication sidecar and, optionally, a signed origin sidecar. A project binding is optional; when present it supplies the project-specific author-key origin unless `--hub` overrides it.
 
-Signed publication is the default. In signed mode, `publish` requires the human principal signing key for the bound hub. Run `owenloop setup` before the first signed publication. `publish` never creates or repairs a signing key: an older key store that already contains the key but lacks the non-secret `<hash>.ref` pointer must be repaired by a setup run, whose `ensure` step backfills the pointer without regenerating or replacing the private key. If the author-key reference or key record is missing, `publish` fails and suggests `owenloop setup` or the explicit unsigned mode; the command does not silently downgrade to unsigned output.
+The author-key origin comes from the same publishing ladder as `connect` and
+`push`: `--hub` wins, a project binding overrides global state, one file-backed
+human origin resolves automatically, and a non-enumerable backend uses the
+validated execution-settings `hubOrigin` only when the human credential exists.
+An ambiguous or absent candidate exits 2 before signing, packing, or output
+writes. `publish` never writes `.owenloop/hub.json`, consults `OWENLOOP_HUB`, or
+guesses `DEFAULT_HUB`.
+
+Signed publication is the default. In signed mode, `publish` requires the human principal signing key for the resolved hub. Run `owenloop setup` before the first signed publication. `publish` never creates or repairs a signing key: an older key store that already contains the key but lacks the non-secret `<hash>.ref` pointer must be repaired by a setup run, whose `ensure` step backfills the pointer without regenerating or replacing the private key. If the author-key reference or key record is missing, `publish` fails and suggests `owenloop setup` or the explicit unsigned mode; the command does not silently downgrade to unsigned output.
 
 In signed mode, `publish` confirms the existing key and probes the signer before `packBundle` runs, then signs the publication record before any bundle or sidecar is written. A signing failure therefore leaves no half-published artifact. The signature covers a DSSE publication record whose `digest` is the lowercase SHA-256 digest of the uncompressed canonical tar inside the `.wnlp` file. When `--source <json>` is supplied, the command signs a separate origin record with the same signer and digest, then writes `<output>.origin.dsse` beside the publication sidecar. The remote hub is not involved in this local signing operation and never produces or completes either signature.
 

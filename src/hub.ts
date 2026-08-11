@@ -799,9 +799,10 @@ export function readStoredCredential(origin: string, opts: ReadStoredCredentialO
  * Enumerate the hub origins that have a usable `human` credential stored, or
  * `null` when the active backend cannot be enumerated.
  *
- * Three call sites — two in `src/cli.ts`, one in `src/mcp/serve.ts` — ask this
- * question, each turning the same three possible results (`null`, `[]`,
- * length>1) into a DIFFERENT outcome, from strictest to most lenient:
+ * Callers in `src/cli.ts` share a backend-aware discovery layer, while
+ * `src/mcp/serve.ts` consumes this fact directly. Their policies deliberately
+ * differ, turning the same three possible results (`null`, `[]`, length>1)
+ * into different outcomes:
  *
  * - `resolveAgentHub` (`agent new`, `capability bind|unbind|list`, and
  *   `crew`'s subcommands) — mutating, mint-like commands. Every non-single
@@ -815,6 +816,11 @@ export function readStoredCredential(origin: string, opts: ReadStoredCredentialO
  *   happened; length>1 is still a `CliError` (exit 2) naming the origins,
  *   because guessing among several logged-in hubs would be silently wrong for
  *   someone who has more than one.
+ * - `resolvePublishingHub` (`connect`, `push`, `publish`) — one file-backed
+ *   origin is the global fallback; more than one or none is an exit-2 error.
+ *   For `null`, and only for `null`, this policy may use the validated
+ *   execution-settings `hubOrigin` after checking the requested credential
+ *   slot. It never guesses `DEFAULT_HUB`.
  * - `resolveMcpOrigin` (`owenloop mcp`'s origin ladder) — the most lenient:
  *   this is rung 4 of 5, tried only after `--hub`, `OWENLOOP_HUB`, and
  *   `~/.owenloop/config.json` have all had nothing to offer. `null`, `[]`,

@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, readdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { hubBindingPath, readHubBinding, writeHubBinding } from '../src/hub.ts';
+import { credentialFilePath, hubBindingPath, readHubBinding, writeCredentialFile, writeHubBinding } from '../src/hub.ts';
 import type { Credential, HubBinding } from '../src/hub.ts';
 import { mainAsync } from '../src/cli.ts';
 import { kcHuman, kcKey, makeIo, routedFetch, WHOAMI_BODY } from './hubkit.ts';
@@ -78,6 +78,31 @@ test('connect: switching to a DIFFERENT origin reports switchedFrom and rebinds'
 
   const binding = readHubBinding(hubBindingPath(t.cwd))!;
   assert.equal(binding.hub, OTHER_ORIGIN);
+});
+
+test('connect: without --hub an existing project binding remains the target', async () => {
+  const { fetch, calls } = routedFetch({ 'GET /api/whoami': verifyOk });
+  const t = makeIo({ fetch });
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(OAUTH_CRED));
+  t.store.set(kcHuman(OTHER_ORIGIN), JSON.stringify(OAUTH_CRED));
+  writeHubBinding(hubBindingPath(t.cwd), { version: 1, hub: ORIGIN });
+
+  const code = await mainAsync(['connect'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.ok(calls.every((call) => call.url.startsWith(ORIGIN)));
+  assert.deepEqual(readHubBinding(hubBindingPath(t.cwd)), { version: 1, hub: ORIGIN });
+});
+
+test('connect: without --hub a single file-backed origin verifies then creates the project override', async () => {
+  const { fetch, calls } = routedFetch({ 'GET /api/whoami': verifyOk });
+  const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' } });
+  writeCredentialFile(credentialFilePath(t.io.env), { version: 2, hubs: { [ORIGIN]: { human: OAUTH_CRED } } });
+
+  const code = await mainAsync(['connect'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0]!.url.startsWith(ORIGIN));
+  assert.deepEqual(readHubBinding(hubBindingPath(t.cwd)), { version: 1, hub: ORIGIN });
 });
 
 test('connect: no stored credential errors, mentions `owenloop login`, writes no hub.json', async () => {
