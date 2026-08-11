@@ -14,7 +14,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseManifestBytes } from '../bundle/manifest.ts';
 import type { BundleManifest } from '../bundle/types.ts';
-import { loadDefFile } from '../defs.ts';
+import { digestScopedCallsTargetKey, loadDefFile } from '../defs.ts';
 import type { WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
@@ -34,7 +34,7 @@ import type {
 
 /** One workflow or coordinate alias from one verified CAS bundle. */
 export interface CasDefRegistration {
-	/** Flat-map key: package/workflow, digest/workflow, or namespace/name@version. */
+	/** Flat-map key: package/workflow, digest/workflow, coordinate, or digest/coordinate. */
 	key: string;
 	/** Human-facing package/workflow key for the selected definition. */
 	qualified: string;
@@ -230,8 +230,8 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 		...global.entries
 			.filter((item) => !projectCoordinates.has(item.coordinate))
 			.map((item) => ({ ...item, registerAlias: true })),
-		// A shadowed global coordinate never receives the full-coordinate alias, but
-		// its workflows remain digest-scoped for already-running pinned instances.
+		// A shadowed global coordinate never receives the direct precedence alias, but
+		// its workflows and callable coordinate remain digest-scoped for pinned runs.
 		...global.entries
 			.filter((item) => projectCoordinates.has(item.coordinate))
 			.map((item) => ({ ...item, registerAlias: false })),
@@ -242,6 +242,7 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 	const registrations: CasDefRegistration[] = [];
 	const loadedByDigest = new Map<DefDigest, LoadedObject>();
 	const registeredDigests = new Set<DefDigest>();
+	const registeredCoordinateKeys = new Set<string>();
 	const byQualified = new Map<string, CasDefRegistration>();
 
 	const registerObjectWorkflows = (loaded: LoadedObject): void => {
@@ -283,16 +284,28 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 			}
 			const target = coordinateTarget(indexed, loaded);
 			registerObjectWorkflows(loaded);
-			if (indexed.registerAlias && target === undefined) {
-				args.warn(
-					`warning: coordinate '${indexed.coordinate}' is not callable because the bundle exports ` +
-						`multiple workflows and has no default; use an explicit package/workflow target`,
-				);
+			if (target === undefined) {
+				if (indexed.registerAlias) {
+					args.warn(
+						`warning: coordinate '${indexed.coordinate}' is not callable because the bundle exports ` +
+							`multiple workflows and has no default; use an explicit package/workflow target`,
+					);
+				}
 				continue;
 			}
-			if (indexed.registerAlias && target !== undefined) {
+
+			// Every callable coordinate gets a digest-scoped alias, including a
+			// shadowed global coordinate. A running parent can therefore follow its
+			// lock digest without changing the direct project's precedence alias.
+			const coordinateKeys = [
+				digestScopedCallsTargetKey(digest, indexed.coordinate),
+				...(indexed.registerAlias ? [indexed.coordinate] : []),
+			];
+			for (const key of coordinateKeys) {
+				if (registeredCoordinateKeys.has(key)) continue;
+				registeredCoordinateKeys.add(key);
 				registrations.push({
-					key: indexed.coordinate,
+					key,
 					qualified: `${loaded.manifest.package.name}/${target.name}`,
 					bare: target.name,
 					def: target,

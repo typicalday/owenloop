@@ -369,6 +369,33 @@ test('CLI status uses explicitly incomplete tolerant inspection for a corrupt pr
   assert.match(t.err.join('\n'), /status is incomplete/u);
 });
 
+test('CLI status returns a runtime row when tolerant inspection skips its corrupt calls child', async () => {
+	const t = makeIo();
+	const projectRoot = join(t.cwd, 'workflows');
+	const installed = await installVersionedCall({ marker: 'STATUS-PARTIAL', root: projectRoot });
+
+	const createCode = await mainAsync(['create', 'caller/caller@1.0.0'], t.io);
+	assert.equal(createCode, 0, t.err.join('\n'));
+	const created = JSON.parse(t.out.join('\n')) as { workflow: string };
+	t.out.length = 0;
+	t.err.length = 0;
+
+	const childPath = join(projectRoot, 'objects', 'sha256', installed.childDigest, 'workflow.yaml');
+	chmodSync(childPath, 0o644);
+	writeFileSync(childPath, `${readFileSync(childPath, 'utf8')}# corrupt child\n`);
+
+	const statusCode = await mainAsync(['status', '--all'], t.io);
+
+	assert.equal(statusCode, 0, t.err.join('\n'));
+	const statuses = JSON.parse(t.out.join('\n')) as Array<Record<string, unknown>>;
+	assert.equal(statuses.length, 1);
+	assert.equal(statuses[0]?.workflow, created.workflow);
+	assert.equal(statuses[0]?.def, 'caller/caller@1.0.0');
+	assert.equal('error' in statuses[0]!, false, 'the surviving caller definition remains readable');
+	assert.match(t.err.join('\n'), /incomplete project workflow coordinate 'dep\/child@1\.0\.0'/u);
+	assert.match(t.err.join('\n'), /status is incomplete because workflow definition discovery skipped corrupt store state/u);
+});
+
 test('WS-6 executable discovery fails closed when an indexed object is missing', async () => {
   const { root, digest } = await installPair({ name: 'parent', version: '1.0.0', marker: 'v1' });
   // The store hardens every installed object to 0o444 files inside a 0o555 dir
@@ -720,6 +747,65 @@ test('explicit versioned calls resolve end-to-end and spawn the lock-pinned chil
   } finally {
     store.close();
   }
+});
+
+test('an already-running explicit-version parent follows its global lock after a project coordinate shadows it', async () => {
+	const global = await installVersionedCall({ marker: 'GLOBAL-PINNED' });
+	const projectRoot = tempDir('owenloop-versioned-project-shadow-');
+	const dir = tempDir('owenloop-versioned-global-parent-');
+	const store = openStore(join(dir, 'state.db'));
+	try {
+		let defs = defMap(load(projectRoot, global.root).registrations);
+		const engine = new Engine(store, (name, from) => {
+			const def = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
+			if (def === undefined) throw new Error(`unknown workflow definition '${name}'`);
+			return def;
+		});
+
+		const parent = engine.createInstance('caller/caller@1.0.0');
+		engine.tick(parent, { deep: false });
+		assert.equal(store.findChildByParent(parent, 'delivered'), undefined);
+
+		const projectChildSource = writeBundleSource({
+			name: 'child',
+			version: '1.0.0',
+			workflow: childYaml('PROJECT-SHADOW'),
+		});
+		const projectChild = await installBundleFixture({
+			sourceDir: projectChildSource,
+			root: projectRoot,
+		});
+		const projectIndex = readWorkflowStoreIndex(storeIndexPath(projectRoot));
+		addIndexCoordinate(projectRoot, global.target, {
+			...projectIndex.entries['child/child@1.0.0']!,
+		});
+		defs = defMap(load(projectRoot, global.root).registrations);
+
+		assert.equal(
+			defs.get(global.target)?.bundleDigest,
+			projectChild.result.digest,
+			'direct coordinate lookup retains project precedence',
+		);
+		const parentSnapshot = store.getWorkflow(parent)?.defSnapshot;
+		assert.ok(parentSnapshot);
+		const resolved = resolveCallsTarget(defs, global.target, parentSnapshot);
+		assert.ok(resolved, 'the running parent resolves its lock-pinned coordinate');
+		assert.equal(resolved.bundleDigest, global.childDigest);
+		assert.match(resolved.steps[0]!.body, /GLOBAL-PINNED/u);
+
+		engine.provideInput(parent, 'seed', { ready: true });
+		engine.tick(parent, { deep: false });
+
+		const child = store.findChildByParent(parent, 'delivered');
+		assert.ok(child, 'the running parent spawns a child after the project shadow appears');
+		const childSnapshot = store.getWorkflow(child.id)?.defSnapshot;
+		assert.ok(childSnapshot);
+		assert.equal(childSnapshot.bundleDigest, global.childDigest);
+		assert.notEqual(childSnapshot.bundleDigest, projectChild.result.digest);
+		assert.match(childSnapshot.steps[0]!.body, /GLOBAL-PINNED/u);
+	} finally {
+		store.close();
+	}
 });
 
 test('an already-running explicit-version parent stays pinned after a newer child version installs', async () => {

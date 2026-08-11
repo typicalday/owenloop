@@ -514,6 +514,17 @@ interface LoadedDefs {
   definitionDiscoveryComplete: boolean;
 }
 
+function finalizeDiscoveredDefs(
+  merged: Map<string, WorkflowDef>,
+  tolerantCasInspection: boolean,
+  definitionDiscoveryComplete: boolean,
+): Map<string, WorkflowDef> {
+  if (!tolerantCasInspection || definitionDiscoveryComplete) return finalizeDefs(merged);
+  // Only `status` requests tolerant CAS inspection. Its partial map is read-only:
+  // unresolved calls into skipped corrupt objects must not abort the fleet read.
+  return finalizeDefs(merged, { allowUnresolvedCalls: true });
+}
+
 /**
  * Load the DEFAULT def set, folding in the defs `owenloop add` installed under
  * ledger-recorded subfolders of `defsDir` so `defs`/`create`/`tick`/etc. see
@@ -563,7 +574,10 @@ function loadDefsWithInstalled(
   } catch (e) {
     io.err(`warning: skipping installed workflow defs: ${(e as Error).message}`);
     const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection);
-    return { defs: finalizeDefs(merged), definitionDiscoveryComplete };
+    return {
+      defs: finalizeDiscoveredDefs(merged, tolerantCasInspection, definitionDiscoveryComplete),
+      definitionDiscoveryComplete,
+    };
   }
 
   for (const source of Object.keys(lf.installed).sort()) {
@@ -595,7 +609,10 @@ function loadDefsWithInstalled(
 
   const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection);
 
-  return { defs: finalizeDefs(merged), definitionDiscoveryComplete };
+  return {
+    defs: finalizeDiscoveredDefs(merged, tolerantCasInspection, definitionDiscoveryComplete),
+    definitionDiscoveryComplete,
+  };
 }
 
 /**
