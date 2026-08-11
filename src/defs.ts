@@ -764,6 +764,10 @@ function prefixStep(step: StepDef, prefix: string): StepDef {
     produces: newProduces,
     invalidates: newInvalidates,
   };
+  // Each include alias is an independent materialization. Clone the opaque
+  // extension carrier so nested values cannot leak mutations across aliases or
+  // back into the resolved child definition. Preserve true absence.
+  if (step.x !== undefined) result.x = structuredClone(step.x);
   if (newGenerates !== undefined) result.generates = newGenerates;
   if (newEffect !== undefined) result.effect = newEffect;
   if (newJudges !== undefined) result.judges = newJudges;

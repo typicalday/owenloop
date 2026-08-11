@@ -90,6 +90,76 @@ test('(a) expandIncludes: basic expansion — step names prefixed, stems prefixe
   assert.deepEqual(errors, []);
 });
 
+test('expandIncludes: repeated child aliases deep-clone nested judge x carriers', () => {
+  const childDef = buildDef({
+    name: 'reviewed-child',
+    inputs: [{ name: 'source' }],
+    steps: [
+      {
+	name: 'producer',
+	consumes: ['source'],
+	produces: [{
+	  name: 'report',
+	  judges: [{
+	    name: 'quality',
+	    body: 'judge report',
+	    inputs: true,
+	    model: 'judge-model',
+	    executor: 'judge-executor',
+	    spec: { strategy: 'strict' },
+	  }],
+	}],
+	body: 'produce report',
+	x: {
+	  harness: { id: 'claude-code', tools: [] },
+	  vendor: { nested: { enabled: true }, labels: ['restricted'] },
+	},
+      },
+      { name: 'publisher', consumes: ['report'], produces: ['published'], body: 'publish report' },
+    ],
+    outputs: ['published'],
+  });
+  const parentDef = buildDef({
+    name: 'double-review',
+    inputs: [{ name: 'outer' }],
+    steps: [
+      { include: 'reviewed-child', as: 'left', inputs: { source: 'outer' } },
+      { include: 'reviewed-child', as: 'right', inputs: { source: 'outer' } },
+    ],
+  });
+  const expanded = expandIncludes(parentDef, makeResolver([childDef]));
+  const childJudge = childDef.steps.find((step) => step.name.endsWith('.quality'))!;
+  const leftJudge = expanded.steps.find((step) => step.name === 'left.producer.report.judges.quality')!;
+  const rightJudge = expanded.steps.find((step) => step.name === 'right.producer.report.judges.quality')!;
+  const expectedX = {
+    harness: { id: 'claude-code', tools: [] },
+    vendor: { nested: { enabled: true }, labels: ['restricted'] },
+  };
+
+  assert.deepEqual(leftJudge.x, expectedX);
+  assert.deepEqual(rightJudge.x, expectedX);
+  assert.notStrictEqual(leftJudge.x, rightJudge.x);
+  assert.notStrictEqual(leftJudge.x, childJudge.x);
+  assert.notStrictEqual(rightJudge.x, childJudge.x);
+  assert.notStrictEqual(leftJudge.x!['vendor'], rightJudge.x!['vendor']);
+  assert.notStrictEqual(leftJudge.x!['vendor'], childJudge.x!['vendor']);
+
+  assert.equal(leftJudge.judges, 'left.report');
+  assert.deepEqual(leftJudge.consumes.map((consume) => consume.stem), ['left.report', 'outer']);
+  assert.deepEqual(rightJudge.consumes.map((consume) => consume.stem), ['right.report', 'outer']);
+  assert.equal(leftJudge.model, 'judge-model');
+  assert.equal(leftJudge.executor, 'judge-executor');
+  assert.deepEqual(leftJudge.spec, { strategy: 'strict' });
+  assert.equal('x' in expanded.steps.find((step) => step.name === 'left.publisher')!, false);
+
+  ((leftJudge.x!['vendor'] as { nested: { enabled: boolean } }).nested).enabled = false;
+  (leftJudge.x!['harness'] as { tools: string[] }).tools.push('Bash');
+
+  assert.deepEqual(rightJudge.x, expectedX, 'the other include alias must remain unchanged');
+  assert.deepEqual(childJudge.x, expectedX, 'the resolved child definition must remain unchanged');
+  assert.deepEqual(validateDef(expanded), []);
+});
+
 // ---- (b) Mapped input becomes internal consume edge, NOT a new input --------
 
 test('(b) expandIncludes: mapped input is not hoisted — parent inputs unchanged', () => {
