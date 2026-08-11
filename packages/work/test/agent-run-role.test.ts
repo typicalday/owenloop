@@ -808,6 +808,34 @@ test('--harness policy preflight uses the final overridden adapter and refuses b
   assert.match(err.join('\n'), /harness policy refusal.*overridden.*network 'owenloop-only' is unsupported/);
 });
 
+test('Codex filesystem refusal names the restriction and releases the held claim', async () => {
+  process.env['OWENLOOP_CODEX_BIN'] = join(home, 'must-not-start');
+
+  for (const filesystem of ['read-only', 'workspace-write'] as const) {
+    seedRawStep({ harness: { id: 'codex', filesystem } });
+    const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+    const err: string[] = [];
+
+    const code = await run([...WIRE, '--harness', 'codex'], {
+      hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'host:123',
+      cwd: '/work',
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+
+    assert.equal(code, 1, filesystem);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+    assert.match(
+      err.join('\n'),
+      new RegExp(
+	`harness policy refusal.*codex.*filesystem '${filesystem}'.*unsupported.*configuration layers.*outside the thread sandbox`,
+      ),
+    );
+  }
+});
+
 test('OWENLOOP_HARNESS outranks the step def, and the step def outranks the default', async () => {
   const chosen = createFakeAdapter({ id: 'chosen' });
   const other = createFakeAdapter({ id: 'other' });

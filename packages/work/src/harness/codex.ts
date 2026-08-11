@@ -62,11 +62,7 @@
  * has forgotten rejects with `ResumeUnavailableError`; every other failure emits
  * `{kind:'exited'}` and rejects with the underlying error.
  */
-import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, realpathSync, symlinkSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-
-import { resolveCacheDir } from '../bundle/cache.ts';
+import { existsSync } from 'node:fs';
 import { ResumeUnavailableError } from './contract.ts';
 import type {
   AgentEvent,
@@ -158,103 +154,23 @@ const DEFAULT_SANDBOX = 'workspace-write';
 /** `AskForApproval` values this adapter passes through untouched. */
 const NATIVE_APPROVAL_POLICIES = new Set(['untrusted', 'on-request', 'never']);
 
-const FILESYSTEM_SANDBOX: Record<NonNullable<StepPermissions['filesystem']>, string> = {
-  'read-only': 'read-only',
-  'workspace-write': 'workspace-write',
-  unrestricted: 'danger-full-access',
-};
+const UNRESTRICTED_SANDBOX = 'danger-full-access';
 
-/** Sandboxes whose filesystem boundary does not cover host-started subprocesses. */
-const RESTRICTED_SANDBOXES = new Set(['read-only', 'workspace-write']);
-/** The pinned binary's default marker for the project-config ancestor chain. */
-const PROJECT_ROOT_MARKER = '.git';
-/** Thread config that can replace `.git` and extend project-config discovery. */
-const PROJECT_ROOT_MARKERS_CONFIG_KEY = 'project_root_markers';
-
-/** Resolve the effective sandbox only when the authored policy is internally valid. */
-function effectiveSandbox(permissions: StepPermissions): string | undefined {
-  try {
-    return resolveSandbox(permissions);
-  } catch {
-    return undefined;
-  }
-}
-
-interface RestrictedCodexConfigResult {
-  config: Record<string, unknown>;
-  issues: PermissionIssue[];
-}
-
-/**
- * Positive allowlist for workflow or inherited config under a restricted sandbox.
- *
- * The allowlist is intentionally empty. Codex 0.146.0 treats absent or false
- * temporary-root exclusions as writable host roots, so even those narrowing-looking
- * fields must be adapter-owned. Every current or future key is reported and removed.
- * Callers refuse reported workflow issues; resume ignores inherited issues and keeps
- * the empty sanitized map. Adapter-owned MCP, project-root, temporary-root, and
- * network values are applied after this function returns.
- */
-function sanitizeRestrictedCodexConfig(
-  extraConfig: Record<string, unknown>,
-  sandbox: string,
-): RestrictedCodexConfigResult {
-  const config: Record<string, unknown> = {};
-  const issues: PermissionIssue[] = [];
-
-  for (const key of Object.keys(extraConfig)) {
-    issues.push({
-      field: 'codexConfig',
-      message:
-	key === 'mcp_servers'
-	  ? `codexConfig.mcp_servers cannot declare external servers with sandbox '${sandbox}'; ` +
-	    `only the worker-created '${OWENLOOP_MCP_NAME}' server is allowed`
-	  : `codexConfig.${key} is refused with sandbox '${sandbox}'; ` +
-	    'restricted workflows cannot author codexConfig',
-    });
-  }
-
-  return { config, issues };
-}
-
-/**
- * A restricted thread cannot carry workflow-controlled host processes, endpoints,
- * credentials, tools, filesystem/network expansion, or unknown future config.
- */
-function restrictedConfigIssues(permissions: StepPermissions): PermissionIssue[] {
-  const sandbox = effectiveSandbox(permissions);
-  if (sandbox === undefined || !RESTRICTED_SANDBOXES.has(sandbox)) return [];
-
-  const issues: PermissionIssue[] = [];
-  const ext = permissions.extensions;
-  const bagServers = ext['mcpServers'];
-  if (isPlainMap(bagServers) && Object.keys(bagServers).length > 0) {
-    issues.push({
-      field: 'mcpServers',
-      message:
-	`mcpServers cannot declare external servers with sandbox '${sandbox}'; ` +
-	`only the worker-created '${OWENLOOP_MCP_NAME}' server is allowed`,
-    });
-  }
-
-  const extraConfig = ext['codexConfig'];
-  if (extraConfig === undefined) return issues;
-  if (!isPlainMap(extraConfig)) {
-    issues.push({ field: 'codexConfig', message: 'codexConfig must be a map' });
-    return issues;
-  }
-  issues.push(...sanitizeRestrictedCodexConfig(extraConfig, sandbox).issues);
-  return issues;
-}
-
-/** Keep pure params builders fail-closed even when a caller skips adapter preflight. */
-function assertRestrictedConfigAllowed(permissions: StepPermissions): void {
-  const issue = restrictedConfigIssues(permissions)[0];
-  if (issue !== undefined) throw new Error(issue.message);
+function unsupportedFilesystemMessage(filesystem: 'read-only' | 'workspace-write'): string {
+  return (
+    `filesystem '${filesystem}' is unsupported by this adapter because Codex app-server ` +
+    'configuration layers are outside the thread sandbox'
+  );
 }
 
 function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
-  const issues: PermissionIssue[] = [...restrictedConfigIssues(permissions)];
+  const issues: PermissionIssue[] = [];
+  if (permissions.filesystem === 'read-only' || permissions.filesystem === 'workspace-write') {
+    issues.push({
+      field: 'filesystem',
+      message: unsupportedFilesystemMessage(permissions.filesystem),
+    });
+  }
   if (permissions.tools !== undefined) {
     issues.push({ field: 'tools', message: 'tool allow-lists are unsupported by this adapter' });
   }
@@ -267,12 +183,16 @@ function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
       message: "network 'owenloop-only' is unsupported by this adapter",
     });
   }
-  if (permissions.network === 'unrestricted' && effectiveSandbox(permissions) === 'read-only') {
+  if (
+    permissions.filesystem === undefined &&
+    permissions.network === 'unrestricted' &&
+    permissions.extensions['sandbox'] === 'read-only'
+  ) {
     issues.push({
       field: 'network',
       message:
 	"network 'unrestricted' cannot be enabled with sandbox 'read-only'; " +
-	"use filesystem 'workspace-write' or 'unrestricted'",
+	"use sandbox 'workspace-write' or 'danger-full-access'",
     });
   }
   if (
@@ -292,16 +212,16 @@ function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
     });
   }
   if (
-    permissions.filesystem !== undefined &&
+    permissions.filesystem === 'unrestricted' &&
     typeof sandbox === 'string' &&
     SANDBOX_MODES.has(sandbox) &&
-    FILESYSTEM_SANDBOX[permissions.filesystem] !== sandbox
+    UNRESTRICTED_SANDBOX !== sandbox
   ) {
     issues.push({
       field: 'sandbox',
       message:
-	`sandbox '${sandbox}' conflicts with filesystem '${permissions.filesystem}' ` +
-	`(which requires '${FILESYSTEM_SANDBOX[permissions.filesystem]}')`,
+	`sandbox '${sandbox}' conflicts with filesystem 'unrestricted' ` +
+	`(which requires '${UNRESTRICTED_SANDBOX}')`,
     });
   }
   return issues;
@@ -382,24 +302,6 @@ function owenloopMount(mcp: { command: string; args: string[] }): McpServerSpec 
 }
 
 /**
- * Rebuild restricted workspace-write config entirely from adapter-owned values.
- *
- * Measured against Codex 0.146.0: absent or false `exclude_slash_tmp` leaves `/tmp`
- * writable, and absent or false `exclude_tmpdir_env_var` leaves `$TMPDIR` writable.
- * Both exclusions must therefore be literal true after every workflow and inherited
- * config merge. `writable_roots` is never copied because every extra root widens the
- * sandbox; `network_access` follows only the neutral network policy.
- */
-function restrictedWorkspaceWriteConfig(permissions: StepPermissions): Record<string, unknown> {
-  const out: Record<string, unknown> = {
-    exclude_slash_tmp: true,
-    exclude_tmpdir_env_var: true,
-  };
-  if (permissions.network === 'unrestricted') out['network_access'] = true;
-  return out;
-}
-
-/**
  * Build the `thread/start` params. PURE — exported for tests.
  *
  * Takes `DeliverArgs`, not `StartArgs`, because it never reads `brief` and Phase
@@ -431,18 +333,13 @@ export function buildThreadStartParams(
   if (args.permissions.network === 'unrestricted' && sandbox === 'read-only') {
     throw new Error(
       "network 'unrestricted' cannot be enabled with sandbox 'read-only'; " +
-	"use filesystem 'workspace-write' or 'unrestricted'",
+	"use sandbox 'workspace-write' or 'danger-full-access'",
     );
   }
-  assertRestrictedConfigAllowed(args.permissions);
 
-  const rawExtraConfig = isPlainMap(ext['codexConfig']) ? ext['codexConfig'] : {};
-  // Unrestricted mode keeps the backward-compatible escape hatch. Restricted
-  // mode uses the positive allowlist above, so unknown and future keys cannot
-  // silently broaden the neutral StepPermissions.
-  const extraConfig = RESTRICTED_SANDBOXES.has(sandbox)
-    ? sanitizeRestrictedCodexConfig(rawExtraConfig, sandbox).config
-    : { ...rawExtraConfig };
+  // The escape hatch: any other config key, without re-opening the contract.
+  // `mcp_servers` is merged in AFTER it, so the owenloop mount always wins.
+  const extraConfig = isPlainMap(ext['codexConfig']) ? { ...ext['codexConfig'] } : {};
 
   const bagServers = isPlainMap(ext['mcpServers']) ? ext['mcpServers'] : {};
   const configuredServers = isPlainMap(extraConfig['mcp_servers']) ? extraConfig['mcp_servers'] : {};
@@ -456,19 +353,11 @@ export function buildThreadStartParams(
   };
 
   const config: Record<string, unknown> = { ...extraConfig, mcp_servers: mcpServers };
-  if (RESTRICTED_SANDBOXES.has(sandbox)) {
-    // Pin thread config to the `.git` chain inspected before spawn. The pinned
-    // binary applies this override early enough to load MCP and writable-root
-    // config from an otherwise out-of-project ancestor, so omission would let an
-    // inherited marker setting reopen the boundary.
-    config[PROJECT_ROOT_MARKERS_CONFIG_KEY] = [PROJECT_ROOT_MARKER];
-    // Never carry an authored workspace config through a restricted boundary.
-    // In workspace-write, reconstruct the map from adapter-owned values after all
-    // workflow config; in read-only, remove the irrelevant map entirely.
-    delete config['sandbox_workspace_write'];
-    if (sandbox === 'workspace-write') {
-      config['sandbox_workspace_write'] = restrictedWorkspaceWriteConfig(args.permissions);
-    }
+  if (args.permissions.network === 'unrestricted' && sandbox === 'workspace-write') {
+    const authored = isPlainMap(config['sandbox_workspace_write'])
+      ? config['sandbox_workspace_write']
+      : {};
+    config['sandbox_workspace_write'] = { ...authored, network_access: true };
   }
 
   const params: Record<string, unknown> = {
@@ -488,14 +377,17 @@ export function buildThreadStartParams(
   return params;
 }
 
-/** Resolve the neutral filesystem policy, then the legacy adapter override. */
+/** Resolve supported neutral filesystem policy, then the legacy adapter override. */
 function resolveSandbox(permissions: StepPermissions): string {
-  if (permissions.filesystem !== undefined) {
-    const mapped = FILESYSTEM_SANDBOX[permissions.filesystem];
+  if (permissions.filesystem === 'read-only' || permissions.filesystem === 'workspace-write') {
+    throw new Error(unsupportedFilesystemMessage(permissions.filesystem));
+  }
+  if (permissions.filesystem === 'unrestricted') {
+    const mapped = UNRESTRICTED_SANDBOX;
     const raw = permissions.extensions['sandbox'];
     if (raw !== undefined && raw !== mapped) {
       throw new Error(
-	`sandbox '${String(raw)}' conflicts with filesystem '${permissions.filesystem}' ` +
+	`sandbox '${String(raw)}' conflicts with filesystem 'unrestricted' ` +
 	  `(which requires '${mapped}')`,
       );
     }
@@ -556,15 +448,7 @@ export function buildThreadResumeParams(
 ): Record<string, unknown> {
   const fromArgs = buildThreadStartParams(args, onEvent);
 
-  const inheritedConfig = base !== undefined && isPlainMap(base['config']) ? base['config'] : {};
-  const sandbox = String(fromArgs['sandbox']);
-  const restricted = RESTRICTED_SANDBOXES.has(sandbox);
-  // Use the same positive allowlist as cold start. Inherited fields cannot be
-  // preflighted against the current workflow, so resume removes every reported
-  // field and keeps only the sanitized result.
-  const baseConfig = restricted
-    ? sanitizeRestrictedCodexConfig(inheritedConfig, sandbox).config
-    : inheritedConfig;
+  const baseConfig = base !== undefined && isPlainMap(base['config']) ? base['config'] : {};
   const argsConfig = isPlainMap(fromArgs['config']) ? fromArgs['config'] : {};
   const baseServers = isPlainMap(baseConfig['mcp_servers']) ? baseConfig['mcp_servers'] : {};
   const argsServers = isPlainMap(argsConfig['mcp_servers']) ? argsConfig['mcp_servers'] : {};
@@ -760,118 +644,6 @@ function resolveBin(): string {
   return process.env['OWENLOOP_CODEX_BIN'] ?? 'codex';
 }
 
-/** The operator's ordinary config/auth/session root before isolation. */
-function configuredCodexHome(env: Record<string, string | undefined>): string | undefined {
-  const explicit = env['CODEX_HOME'];
-  if (explicit !== undefined && explicit.trim() !== '') return resolve(explicit);
-  const home = env['HOME'];
-  if (home !== undefined && home.trim() !== '') return join(resolve(home), '.codex');
-  return undefined;
-}
-
-function pathEntryExists(path: string): boolean {
-  try {
-    lstatSync(path);
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
-    throw err;
-  }
-}
-
-/**
- * Find a project-local config on the pinned binary's default project chain.
- *
- * Codex 0.146.0 has no app-server flag that disables project config. Its
- * project chain starts at cwd and ends at the nearest `.git` marker. Inspect
- * both the normalized path and the canonical path: a symlinked cwd can hide the
- * real worktree marker and config from a lexical-only check.
- */
-function restrictedProjectConfig(cwd: string): string | undefined {
-  const starts = new Set<string>([resolve(cwd)]);
-  starts.add(realpathSync(cwd));
-
-  for (const start of starts) {
-    const chain: string[] = [];
-    let current = start;
-    for (;;) {
-      chain.push(current);
-      if (pathEntryExists(join(current, PROJECT_ROOT_MARKER))) {
-	for (const dir of chain) {
-	  const config = join(dir, '.codex', 'config.toml');
-	  if (pathEntryExists(config)) return config;
-	}
-	break;
-      }
-      const parent = dirname(current);
-      if (parent === current) break;
-      current = parent;
-    }
-  }
-  return undefined;
-}
-
-/** Refuse a restricted thread before its app-server process can start. */
-function assertNoRestrictedProjectConfig(cwd: string, permissions: StepPermissions): void {
-  const sandbox = resolveSandbox(permissions);
-  if (!RESTRICTED_SANDBOXES.has(sandbox)) return;
-
-  let config: string | undefined;
-  try {
-    config = restrictedProjectConfig(cwd);
-  } catch (err) {
-    throw new Error(
-      `cannot verify project config isolation for Codex sandbox '${sandbox}' from '${resolve(cwd)}': ` +
-      (err instanceof Error ? err.message : String(err)),
-    );
-  }
-  if (config === undefined) return;
-  throw new Error(
-    `Codex sandbox '${sandbox}' refuses project config '${config}' before app-server startup; ` +
-    `remove or rename the project-local .codex/config.toml, or use filesystem 'unrestricted' ` +
-    `only when the workflow may trust that config`,
-  );
-}
-
-/**
- * Create a stable config-free Codex home for one worktree.
- *
- * `config.mcp_servers` merges with global config, so a per-thread empty map does
- * not remove an operator-installed MCP server or plugin hook. Restricted threads
- * therefore run under a separate `CODEX_HOME` whose stable cwd-derived path keeps
- * rollout files available to a later process resume. Only `auth.json` is linked
- * from the operator home; config, plugins, hooks, and MCP declarations are not.
- */
-function isolatedCodexHome(cwd: string, env: Record<string, string | undefined>): string {
-  const operatorHome = configuredCodexHome(env);
-  const cacheDir = resolveCacheDir(env);
-  const key = createHash('sha256')
-    .update(resolve(cwd))
-    .update('\0')
-    .update(operatorHome ?? '')
-    .digest('hex');
-  const isolated = join(cacheDir, 'harness', HARNESS_ID, key);
-  mkdirSync(isolated, { recursive: true, mode: 0o700 });
-
-  if (operatorHome !== undefined) {
-    const sourceAuth = join(operatorHome, 'auth.json');
-    const isolatedAuth = join(isolated, 'auth.json');
-    if (existsSync(sourceAuth) && !pathEntryExists(isolatedAuth)) {
-      symlinkSync(sourceAuth, isolatedAuth, 'file');
-    }
-  }
-  return isolated;
-}
-
-/** Build the complete child environment, isolating inherited executable config when required. */
-function codexChildEnv(cwd: string, permissions: StepPermissions): Record<string, string | undefined> {
-  const env = filterOwenloopEnv(process.env);
-  if (RESTRICTED_SANDBOXES.has(resolveSandbox(permissions))) {
-    env['CODEX_HOME'] = isolatedCodexHome(cwd, env);
-  }
-  return env;
-}
-
 /**
  * Everything one turn needs to settle: the promise the caller is waiting on,
  * plus the notification/server-request wiring that settles it.
@@ -1063,13 +835,9 @@ interface OpenedClient {
 /** Spawn one app-server, complete the handshake, and return the wired client. */
 async function openClient(
   cwd: string,
-  permissions: StepPermissions,
   onEvent: (e: AgentEvent) => void,
   gate: TurnGate,
 ): Promise<OpenedClient> {
-  // Filesystem inspection must finish before startStdioRpc can spawn anything.
-  assertNoRestrictedProjectConfig(cwd, permissions);
-
   let exitReported = false;
   const reportExit = (exitCode: number | null, error: string | undefined): void => {
     if (exitReported) return;
@@ -1093,10 +861,8 @@ async function openClient(
     //
     // The value is a FULL environment (`process.env` minus the denied names),
     // because supplying `env` to the transport replaces the child's environment
-    // rather than merging into it. Restricted sandboxes additionally receive a
-    // stable, config-free CODEX_HOME so global MCP/plugin/hook processes cannot
-    // escape the thread filesystem policy.
-    env: codexChildEnv(cwd, permissions),
+    // rather than merging into it.
+    env: filterOwenloopEnv(process.env),
     // Every unknown notification lands here and is ignored by `mapNotification`
     // — unsolicited traffic arrives before any request completes, and throwing
     // on one would kill a healthy session.
@@ -1313,7 +1079,7 @@ export const codexAdapter: HarnessAdapter = {
     const startParams = buildThreadStartParams(args, onEvent);
     // Handshake failure disposes the child inside `openClient` — see the catch
     // there. Nothing is spawned and unowned by the time this rejects.
-    const { client, reportExit } = await openClient(args.cwd, args.permissions, onEvent, gate);
+    const { client, reportExit } = await openClient(args.cwd, onEvent, gate);
 
     let threadId: string;
     try {
@@ -1378,8 +1144,8 @@ export const codexAdapter: HarnessAdapter = {
     // miss is now an ordinary cross-process resume rather than a degraded one —
     // which is why the "minimal thread configuration" warning is gone.
     const startParams = previous?.startParams;
-    // Match cold start: validate and sanitize all thread configuration before
-    // disposing an existing session or spawning a replacement app-server.
+    // Match cold start: validate all thread configuration before disposing an
+    // existing session or spawning a replacement app-server.
     const resumeParams = buildThreadResumeParams(ref.token, args, startParams, onEvent);
     if (previous !== undefined) {
       // ALWAYS a fresh app-server, even when this process still holds a live one.
@@ -1391,7 +1157,7 @@ export const codexAdapter: HarnessAdapter = {
       await previous.client.dispose();
     }
 
-    const { client, reportExit } = await openClient(args.cwd, args.permissions, onEvent, gate);
+    const { client, reportExit } = await openClient(args.cwd, onEvent, gate);
 
     try {
       await client.request('thread/resume', resumeParams, SETUP_TIMEOUT_MS);

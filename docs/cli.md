@@ -300,6 +300,14 @@ The command resolves the verified local workflow definition, applies the final
 starts no provider process, prints each exact refusal, releases the claim, and
 exits `1`.
 
+The Codex adapter refuses explicit `filesystem: read-only` and
+`filesystem: workspace-write` before starting or resuming `codex app-server`.
+The refusal is intentional: Codex configuration layers outside the thread
+sandbox prevent the adapter from proving either neutral filesystem boundary.
+Use the Claude Code adapter for the enforceable read-only/Owenloop-only policy,
+or omit `filesystem` / declare `filesystem: unrestricted` only when the workflow
+accepts the corresponding Codex behavior.
+
 An absent `x.harness.tools` field preserves the adapter's default tool surface;
 `tools: []` is an explicit empty allow-list. The two forms are not equivalent.
 Invalid reserved fields and overlapping `tools` / `disallowedTools` are refused.
