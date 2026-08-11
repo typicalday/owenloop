@@ -211,8 +211,9 @@ const PERMISSION_MODES: readonly string[] = [
 /** The five-value closed union the SDK types `Options.effort` as. */
 const EFFORT_LEVELS: readonly string[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-/** Audited built-in tools that cannot mutate the filesystem or open the network. */
-const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep']);
+/** Audited built-ins that cannot mutate the filesystem. WebFetch/WebSearch
+ *  can read the unrestricted network without weakening a read-only filesystem. */
+const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
 /** Audited built-ins allowed when only the network is restricted. */
 const OWENLOOP_ONLY_NETWORK_TOOLS = new Set([
   'Read',
@@ -227,6 +228,10 @@ const OWENLOOP_ONLY_NETWORK_TOOLS = new Set([
   'TaskList',
   'TaskGet',
 ]);
+/** The intersection when both restrictions apply: local reads only, with no
+ *  unrestricted-network readers. */
+const READ_ONLY_OWENLOOP_ONLY_NETWORK_TOOLS = [...READ_ONLY_TOOLS]
+  .filter((tool) => OWENLOOP_ONLY_NETWORK_TOOLS.has(tool));
 const BORN_BOUND_OWENLOOP_TOOLS = [
   'mcp__owenloop__get_order',
   'mcp__owenloop__submit',
@@ -451,7 +456,11 @@ export function buildClaudeOptions(
   // agent can inspect and finish its order without an unattended permission prompt.
   let effectiveTools = permissions.tools;
   if (effectiveTools === undefined && permissions.filesystem === 'read-only') {
-    effectiveTools = [...READ_ONLY_TOOLS];
+    // Filesystem and network are independent. A read-only filesystem still gets
+    // audited network readers unless the step separately restricts the network.
+    effectiveTools = permissions.network === 'owenloop-only'
+      ? READ_ONLY_OWENLOOP_ONLY_NETWORK_TOOLS
+      : [...READ_ONLY_TOOLS];
   } else if (effectiveTools === undefined && permissions.network === 'owenloop-only') {
     effectiveTools = [...OWENLOOP_ONLY_NETWORK_TOOLS];
   }

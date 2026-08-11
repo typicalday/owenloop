@@ -245,12 +245,31 @@ test('an explicit empty tools list disables built-ins while an absent list prese
   assert.equal(empty.strictMcpConfig, true);
 });
 
-test('read-only policy uses the audited tools and isolates settings, skills, and external MCP', () => {
+test('read-only filesystem with unrestricted network keeps audited network readers and isolates other extension surfaces', () => {
   const { options } = optionsFor({
     filesystem: 'read-only',
+    network: 'unrestricted',
     skills: ['external-skill'],
     mcpServers: { external: { command: 'external-server' } },
   });
+  assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
+  assert.deepEqual(options.allowedTools, [
+    'Read',
+    'Glob',
+    'Grep',
+    'WebFetch',
+    'WebSearch',
+    'mcp__owenloop__get_order',
+    'mcp__owenloop__submit',
+  ]);
+  assert.deepEqual(options.settingSources, []);
+  assert.equal(options.strictMcpConfig, true);
+  assert.deepEqual(options.skills, []);
+  assert.deepEqual(Object.keys(options.mcpServers as Record<string, unknown>), ['owenloop']);
+});
+
+test('read-only filesystem and owenloop-only network use the intersection of both audited tool sets', () => {
+  const { options } = optionsFor({ filesystem: 'read-only', network: 'owenloop-only' });
   assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep']);
   assert.deepEqual(options.allowedTools, [
     'Read',
@@ -259,10 +278,6 @@ test('read-only policy uses the audited tools and isolates settings, skills, and
     'mcp__owenloop__get_order',
     'mcp__owenloop__submit',
   ]);
-  assert.deepEqual(options.settingSources, []);
-  assert.equal(options.strictMcpConfig, true);
-  assert.deepEqual(options.skills, []);
-  assert.deepEqual(Object.keys(options.mcpServers as Record<string, unknown>), ['owenloop']);
 });
 
 test('owenloop-only network policy excludes Bash, web, delegation, skills, hooks, and external MCP', () => {
@@ -307,6 +322,15 @@ test('Claude preflight refuses direct and wildcard denies of the born-bound cont
   }
 });
 
+test('Claude preflight accepts audited network readers with a read-only filesystem and unrestricted network', () => {
+  const issues = claudeAdapter.preflight(normalizeStepPermissions({
+    filesystem: 'read-only',
+    network: 'unrestricted',
+    tools: ['Read', 'WebFetch', 'WebSearch'],
+  }));
+  assert.deepEqual(issues, []);
+});
+
 test('Claude preflight refuses unsupported filesystem and unsafe restricted allow-lists', () => {
   const issues = claudeAdapter.preflight(normalizeStepPermissions({
     filesystem: 'workspace-write',
@@ -345,6 +369,36 @@ test('resume option construction applies the same isolation policy as cold start
   assert.equal(options.strictMcpConfig, true);
   assert.deepEqual(Object.keys(options.mcpServers as Record<string, unknown>), ['owenloop']);
   assert.ok((options.allowedTools as string[]).includes('mcp__owenloop__submit'));
+});
+
+test('resume preserves unrestricted network readers under a read-only filesystem policy', () => {
+  const permissions = normalizeStepPermissions({
+    filesystem: 'read-only',
+    network: 'unrestricted',
+  });
+  const options = buildClaudeOptions(
+    { cwd: '/tmp/work', owenloopMcp: MOUNT, permissions },
+    {
+      env: bareEnv(),
+      abortController: new AbortController(),
+      onEvent: () => {},
+      resume: 'session-read-only',
+    },
+  );
+
+  assert.equal(options.resume, 'session-read-only');
+  assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
+  assert.deepEqual(options.allowedTools, [
+    'Read',
+    'Glob',
+    'Grep',
+    'WebFetch',
+    'WebSearch',
+    'mcp__owenloop__get_order',
+    'mcp__owenloop__submit',
+  ]);
+  assert.deepEqual(options.settingSources, []);
+  assert.equal(options.strictMcpConfig, true);
 });
 
 test('env and abortController are always set, and stderr forwards to onEvent as progress', () => {

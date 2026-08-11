@@ -86,6 +86,19 @@ test('validateFetchedDef leaves harness absent when the step declares none', () 
   assert.equal(oneStep({ name: 'builder', x: { harness: { id: 'codex' } } }).harnessOptions, undefined);
 });
 
+test('validateFetchedDef rejects explicit empty and whitespace-only harness ids instead of selecting the default', () => {
+  for (const id of ['', ' \t ']) {
+    assert.throws(
+      () => oneStep({ name: 'builder', x: { harness: { id } } }),
+      /step 'builder' has an empty or whitespace-only x\.harness\.id/,
+      `explicit id ${JSON.stringify(id)} must be invalid, not absent`,
+    );
+  }
+
+  // Absence remains valid and distinct from either invalid explicit value.
+  assert.equal(oneStep({ name: 'builder', x: { harness: {} } }).harness, undefined);
+});
+
 test('validateFetchedDef leaves x.owenloop untouched alongside x.harness', () => {
   const s = oneStep({ name: 'builder', x: { harness: { id: 'codex' }, owenloop: { machine: 'winserver' } } });
   assert.deepEqual(s.x, { harness: { id: 'codex' }, owenloop: { machine: 'winserver' } });

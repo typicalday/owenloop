@@ -633,6 +633,30 @@ test('run() refuses a non-string x.harness.id instead of selecting the default h
   assert.match(result.stderr, /non-string x\.harness\.id/);
 });
 
+test('run() refuses explicit empty and whitespace-only local harness ids instead of selecting the default', async () => {
+  const fake: FakeAdapter = createFakeAdapter({ id: 'fake' });
+  useAdapter(fake);
+
+  for (const id of ['', ' \t ']) {
+    seedRawStep({ harness: { id, tools: ['Read'] } });
+    const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+    const err: string[] = [];
+    const code = await run(WIRE, {
+      hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'host:123',
+      cwd: '/work',
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+
+    assert.equal(code, 1, `explicit id ${JSON.stringify(id)} must fail closed`);
+    assert.deepEqual(fake.calls, [], 'the default harness must never start for an invalid explicit id');
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+    assert.match(err.join('\n'), /empty or whitespace-only x\.harness\.id/);
+  }
+});
+
 test('run() refuses invalid reserved fields in the verified local definition', async () => {
   const result = await runMalformedHarnessCarrier({
     harness: {

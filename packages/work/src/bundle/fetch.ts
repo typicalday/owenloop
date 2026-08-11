@@ -87,11 +87,13 @@ function isPlainMap(v: unknown): v is Record<string, unknown> {
  * forward compat for the day the grammar promotes the field, and it means the
  * promotion needs no owenloop change.
  *
- * Validation is loose but HONEST: a non-map `x.harness`, a non-string
- * `x.harness.id`, a non-string top-level `harness`, or a surviving legacy
- * `x.claude-code` bag is a def error naming the step, never a silent drop.
- * Absent keys are simply absent — a step with no harness declaration is
- * completely normal.
+ * Validation is loose but HONEST: a non-map `x.harness`, a non-string or
+ * blank `x.harness.id`, a non-string or blank top-level `harness`, or a
+ * surviving legacy `x.claude-code` bag is a def error naming the step, never a
+ * silent drop. Absent keys are simply absent — a step with no harness
+ * declaration is completely normal. Blank is not absent: accepting an explicit
+ * empty id would let adapter resolution treat an invalid declaration as though
+ * the author had selected the default harness.
  *
  * `label` names the def, `stepName` the step, so an error in a pinned child is
  * attributable. Shared with `owenloop work lint`, which parses raw YAML defs.
@@ -104,8 +106,13 @@ export function parseHarnessCarrier(
   const where = `hub workflow '${label}': step '${stepName}'`;
 
   const topLevel = s['harness'];
-  if (topLevel !== undefined && typeof topLevel !== 'string') {
-    throw new Error(`${where} has a non-string harness`);
+  if (topLevel !== undefined) {
+    if (typeof topLevel !== 'string') {
+      throw new Error(`${where} has a non-string harness`);
+    }
+    if (topLevel.trim() === '') {
+      throw new Error(`${where} has an empty or whitespace-only harness`);
+    }
   }
 
   const x = s['x'];
@@ -143,6 +150,9 @@ export function parseHarnessCarrier(
         if (typeof v !== 'string') {
           throw new Error(`${where} has a non-string x.${HARNESS_BAG_KEY}.id`);
         }
+	if (v.trim() === '') {
+	  throw new Error(`${where} has an empty or whitespace-only x.${HARNESS_BAG_KEY}.id`);
+	}
         bagId = v;
         continue;
       }
