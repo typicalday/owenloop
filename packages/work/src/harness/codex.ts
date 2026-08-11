@@ -170,9 +170,9 @@ const RESTRICTED_SANDBOXES = new Set(['read-only', 'workspace-write']);
 const PROJECT_ROOT_MARKER = '.git';
 /** Thread config that can replace `.git` and extend project-config discovery. */
 const PROJECT_ROOT_MARKERS_CONFIG_KEY = 'project_root_markers';
-/** Codex config keys that can load or launch host-side executable code. */
-const HOST_PROCESS_CONFIG_KEYS = new Set(['notify', 'hook', 'hooks', 'plugin', 'plugins']);
-/** Workspace-write fields that can only narrow Codex's default writable surface. */
+/** The only workflow-authored Codex config map allowed under a restricted sandbox. */
+const RESTRICTED_CODEX_CONFIG_KEYS = new Set(['sandbox_workspace_write']);
+/** Workspace-write fields locally proven to only narrow Codex's writable surface. */
 const APPROVED_WORKSPACE_WRITE_KEYS = ['exclude_slash_tmp', 'exclude_tmpdir_env_var'] as const;
 
 /** Resolve the effective sandbox only when the authored policy is internally valid. */
@@ -184,13 +184,84 @@ function effectiveSandbox(permissions: StepPermissions): string | undefined {
   }
 }
 
+interface RestrictedCodexConfigResult {
+  config: Record<string, unknown>;
+  issues: PermissionIssue[];
+}
+
 /**
- * External MCP, notification, hook, and plugin processes run beside the app-server,
- * not inside the thread sandbox. A read-only/workspace-write thread therefore
- * cannot safely carry those definitions. Owenloop's worker-created mount is not
- * extension data and is added only after this check.
+ * Positive allowlist for workflow or inherited config under a restricted sandbox.
+ *
+ * Only the two boolean workspace-write exclusions are locally proven to narrow
+ * authority. Every other current or future key is reported and removed. Callers
+ * refuse reported workflow issues; resume ignores inherited issues and keeps the
+ * sanitized map. Adapter-owned MCP, project-root, and network values are applied
+ * after this function returns.
  */
-function restrictedHostProcessIssues(permissions: StepPermissions): PermissionIssue[] {
+function sanitizeRestrictedCodexConfig(
+  extraConfig: Record<string, unknown>,
+  sandbox: string,
+): RestrictedCodexConfigResult {
+  const config: Record<string, unknown> = {};
+  const issues: PermissionIssue[] = [];
+
+  for (const [key, value] of Object.entries(extraConfig)) {
+    if (!RESTRICTED_CODEX_CONFIG_KEYS.has(key)) {
+      issues.push({
+	field: 'codexConfig',
+	message:
+	  key === 'mcp_servers'
+	    ? `codexConfig.mcp_servers cannot declare external servers with sandbox '${sandbox}'; ` +
+	      `only the worker-created '${OWENLOOP_MCP_NAME}' server is allowed`
+	    : `codexConfig.${key} is refused with sandbox '${sandbox}'; ` +
+	      'the restricted codexConfig allowlist contains only sandbox_workspace_write',
+      });
+      continue;
+    }
+
+    if (sandbox !== 'workspace-write') {
+      issues.push({
+	field: 'codexConfig',
+	message: `codexConfig.${key} is allowed only with sandbox 'workspace-write'`,
+      });
+      continue;
+    }
+    if (!isPlainMap(value)) {
+      issues.push({ field: 'codexConfig', message: `codexConfig.${key} must be a map` });
+      continue;
+    }
+
+    const workspace: Record<string, unknown> = {};
+    for (const [workspaceKey, workspaceValue] of Object.entries(value)) {
+      if (!(APPROVED_WORKSPACE_WRITE_KEYS as readonly string[]).includes(workspaceKey)) {
+	issues.push({
+	  field: 'codexConfig',
+	  message:
+	    `codexConfig.${key}.${workspaceKey} is refused; allowed fields are ` +
+	    APPROVED_WORKSPACE_WRITE_KEYS.join('|'),
+	});
+	continue;
+      }
+      if (typeof workspaceValue !== 'boolean') {
+	issues.push({
+	  field: 'codexConfig',
+	  message: `codexConfig.${key}.${workspaceKey} must be a boolean`,
+	});
+	continue;
+      }
+      workspace[workspaceKey] = workspaceValue;
+    }
+    config[key] = workspace;
+  }
+
+  return { config, issues };
+}
+
+/**
+ * A restricted thread cannot carry workflow-controlled host processes, endpoints,
+ * credentials, tools, filesystem/network expansion, or unknown future config.
+ */
+function restrictedConfigIssues(permissions: StepPermissions): PermissionIssue[] {
   const sandbox = effectiveSandbox(permissions);
   if (sandbox === undefined || !RESTRICTED_SANDBOXES.has(sandbox)) return [];
 
@@ -207,34 +278,23 @@ function restrictedHostProcessIssues(permissions: StepPermissions): PermissionIs
   }
 
   const extraConfig = ext['codexConfig'];
-  if (!isPlainMap(extraConfig)) return issues;
-  const configuredServers = extraConfig['mcp_servers'];
-  if (isPlainMap(configuredServers) && Object.keys(configuredServers).length > 0) {
-    issues.push({
-      field: 'codexConfig',
-      message:
-	`codexConfig.mcp_servers cannot declare external servers with sandbox '${sandbox}'; ` +
-	`only the worker-created '${OWENLOOP_MCP_NAME}' server is allowed`,
-    });
+  if (extraConfig === undefined) return issues;
+  if (!isPlainMap(extraConfig)) {
+    issues.push({ field: 'codexConfig', message: 'codexConfig must be a map' });
+    return issues;
   }
-  for (const key of Object.keys(extraConfig)) {
-    if (!HOST_PROCESS_CONFIG_KEYS.has(key)) continue;
-    issues.push({
-      field: 'codexConfig',
-      message: `codexConfig.${key} cannot configure host executable code with sandbox '${sandbox}'`,
-    });
-  }
+  issues.push(...sanitizeRestrictedCodexConfig(extraConfig, sandbox).issues);
   return issues;
 }
 
 /** Keep pure params builders fail-closed even when a caller skips adapter preflight. */
-function assertNoRestrictedHostProcesses(permissions: StepPermissions): void {
-  const issue = restrictedHostProcessIssues(permissions)[0];
+function assertRestrictedConfigAllowed(permissions: StepPermissions): void {
+  const issue = restrictedConfigIssues(permissions)[0];
   if (issue !== undefined) throw new Error(issue.message);
 }
 
 function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
-  const issues: PermissionIssue[] = [...restrictedHostProcessIssues(permissions)];
+  const issues: PermissionIssue[] = [...restrictedConfigIssues(permissions)];
   if (permissions.tools !== undefined) {
     issues.push({ field: 'tools', message: 'tool allow-lists are unsupported by this adapter' });
   }
@@ -416,11 +476,15 @@ export function buildThreadStartParams(
 	"use filesystem 'workspace-write' or 'unrestricted'",
     );
   }
-  assertNoRestrictedHostProcesses(args.permissions);
+  assertRestrictedConfigAllowed(args.permissions);
 
-  // The escape hatch: any other config key, without re-opening the contract.
-  // `mcp_servers` is merged in AFTER it, so the owenloop mount always wins.
-  const extraConfig = isPlainMap(ext['codexConfig']) ? { ...ext['codexConfig'] } : {};
+  const rawExtraConfig = isPlainMap(ext['codexConfig']) ? ext['codexConfig'] : {};
+  // Unrestricted mode keeps the backward-compatible escape hatch. Restricted
+  // mode uses the positive allowlist above, so unknown and future keys cannot
+  // silently broaden the neutral StepPermissions.
+  const extraConfig = RESTRICTED_SANDBOXES.has(sandbox)
+    ? sanitizeRestrictedCodexConfig(rawExtraConfig, sandbox).config
+    : { ...rawExtraConfig };
 
   const bagServers = isPlainMap(ext['mcpServers']) ? ext['mcpServers'] : {};
   const configuredServers = isPlainMap(extraConfig['mcp_servers']) ? extraConfig['mcp_servers'] : {};
@@ -486,21 +550,6 @@ function resolveSandbox(permissions: StepPermissions): string {
   throw new Error(`sandbox must be one of ${[...SANDBOX_MODES].join('|')}`);
 }
 
-/** Remove project discovery, host processes, and writable roots inherited from a broader turn. */
-function withoutRestrictedConfig(config: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(config)) {
-    if (
-      key === 'mcp_servers' ||
-      key === PROJECT_ROOT_MARKERS_CONFIG_KEY ||
-      key === 'sandbox_workspace_write' ||
-      HOST_PROCESS_CONFIG_KEYS.has(key)
-    ) continue;
-    out[key] = value;
-  }
-  return out;
-}
-
 /**
  * Build the `turn/start` params. PURE — exported for tests.
  *
@@ -550,8 +599,14 @@ export function buildThreadResumeParams(
   const fromArgs = buildThreadStartParams(args, onEvent);
 
   const inheritedConfig = base !== undefined && isPlainMap(base['config']) ? base['config'] : {};
-  const restricted = RESTRICTED_SANDBOXES.has(String(fromArgs['sandbox']));
-  const baseConfig = restricted ? withoutRestrictedConfig(inheritedConfig) : inheritedConfig;
+  const sandbox = String(fromArgs['sandbox']);
+  const restricted = RESTRICTED_SANDBOXES.has(sandbox);
+  // Use the same positive allowlist as cold start. Inherited fields cannot be
+  // preflighted against the current workflow, so resume removes every reported
+  // field and keeps only the sanitized result.
+  const baseConfig = restricted
+    ? sanitizeRestrictedCodexConfig(inheritedConfig, sandbox).config
+    : inheritedConfig;
   const argsConfig = isPlainMap(fromArgs['config']) ? fromArgs['config'] : {};
   const baseServers = isPlainMap(baseConfig['mcp_servers']) ? baseConfig['mcp_servers'] : {};
   const argsServers = isPlainMap(argsConfig['mcp_servers']) ? argsConfig['mcp_servers'] : {};
@@ -1365,6 +1420,9 @@ export const codexAdapter: HarnessAdapter = {
     // miss is now an ordinary cross-process resume rather than a degraded one —
     // which is why the "minimal thread configuration" warning is gone.
     const startParams = previous?.startParams;
+    // Match cold start: validate and sanitize all thread configuration before
+    // disposing an existing session or spawning a replacement app-server.
+    const resumeParams = buildThreadResumeParams(ref.token, args, startParams, onEvent);
     if (previous !== undefined) {
       // ALWAYS a fresh app-server, even when this process still holds a live one.
       // A live client's notifications are bound to the gate it was opened with,
@@ -1377,7 +1435,6 @@ export const codexAdapter: HarnessAdapter = {
 
     const { client, reportExit } = await openClient(args.cwd, args.permissions, onEvent, gate);
 
-    const resumeParams = buildThreadResumeParams(ref.token, args, startParams, onEvent);
     try {
       await client.request('thread/resume', resumeParams, SETUP_TIMEOUT_MS);
     } catch (err) {

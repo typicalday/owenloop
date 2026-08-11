@@ -814,6 +814,72 @@ test('C10f restricted filesystems refuse host notification, hook, and plugin con
   }
 });
 
+test('C10fa restricted config refuses custom provider selection and definitions', () => {
+  for (const filesystem of ['read-only', 'workspace-write'] as const) {
+    for (const codexConfig of [
+      { model_provider: 'workflow-provider' },
+      {
+	model_providers: {
+	  'workflow-provider': {
+	    name: 'Workflow provider',
+	    base_url: 'http://127.0.0.1:9/v1',
+	    env_key: 'WORKFLOW_PROVIDER_TOKEN',
+	  },
+	},
+      },
+    ]) {
+      const permissions = normalizeStepPermissions({ filesystem, codexConfig });
+      const issues = codexAdapter.preflight(permissions);
+      assert.ok(
+	issues.some((issue) => /codexConfig\.model_provider/.test(issue.message)),
+	`${filesystem} must refuse ${JSON.stringify(codexConfig)}`,
+      );
+      assert.throws(
+	() => buildThreadStartParams({ ...deliverArgs(), permissions }),
+	/codexConfig\.model_provider/,
+      );
+    }
+  }
+});
+
+test('C10fb restricted config refuses equivalent model endpoint fields', () => {
+  for (const filesystem of ['read-only', 'workspace-write'] as const) {
+    for (const key of ['openai_base_url', 'chatgpt_base_url'] as const) {
+      const permissions = normalizeStepPermissions({
+	filesystem,
+	codexConfig: { [key]: 'http://127.0.0.1:9/v1' },
+      });
+      assert.ok(
+	codexAdapter.preflight(permissions).some((issue) => issue.message.includes(`.${key}`)),
+	`${filesystem} must refuse codexConfig.${key}`,
+      );
+      assert.throws(
+	() => buildThreadStartParams({ ...deliverArgs(), permissions }),
+	new RegExp(`codexConfig\\.${key}`),
+      );
+    }
+  }
+});
+
+test('C10fc restricted config refuses unknown top-level and workspace-write keys', () => {
+  for (const codexConfig of [
+    { future_restricted_key: true },
+    { sandbox_workspace_write: { future_restricted_key: true } },
+    { sandbox_workspace_write: { writable_roots: ['/tmp/escape'] } },
+    { sandbox_workspace_write: { network_access: true } },
+  ]) {
+    const permissions = normalizeStepPermissions({ filesystem: 'workspace-write', codexConfig });
+    assert.ok(
+      codexAdapter.preflight(permissions).some((issue) => /refused/.test(issue.message)),
+      JSON.stringify(codexConfig),
+    );
+    assert.throws(
+      () => buildThreadStartParams({ ...deliverArgs(), permissions }),
+      /codexConfig\..*refused/,
+    );
+  }
+});
+
 test('C10g every neutral filesystem/network combination matches Codex enforcement', () => {
   const supported: Array<{
     filesystem: 'read-only' | 'workspace-write' | 'unrestricted';
@@ -873,18 +939,14 @@ test('C10g every neutral filesystem/network combination matches Codex enforcemen
   }
 });
 
-test('C10h restricted start and resume remove custom project and writable roots', () => {
+test('C10h restricted start and resume preserve the exact workspace-write allowlist', () => {
   const args = deliverArgs({
     filesystem: 'workspace-write',
     network: 'unrestricted',
     codexConfig: {
-      project_root_markers: ['.custom-root'],
       sandbox_workspace_write: {
-	network_access: false,
-	writable_roots: ['/tmp/extra'],
 	exclude_slash_tmp: true,
 	exclude_tmpdir_env_var: false,
-	future_field: 'drop-me',
       },
     },
   });
@@ -894,16 +956,20 @@ test('C10h restricted start and resume remove custom project and writable roots'
   ]) {
     const config = params['config'] as Record<string, unknown>;
     assert.deepEqual(config['project_root_markers'], ['.git']);
-    const workspace = config['sandbox_workspace_write'] as Record<string, unknown>;
-    assert.deepEqual(workspace, {
+    assert.deepEqual(config['sandbox_workspace_write'], {
       exclude_slash_tmp: true,
       exclude_tmpdir_env_var: false,
       network_access: true,
     });
+    assert.deepEqual(Object.keys(config).sort(), [
+      'mcp_servers',
+      'project_root_markers',
+      'sandbox_workspace_write',
+    ]);
   }
 });
 
-test('C10i restricted resume drops inherited process config and retains Owenloop control', () => {
+test('C10i restricted resume sanitizes all inherited config and retains Owenloop control', () => {
   const broad = buildThreadStartParams(
     startArgs({
       filesystem: 'unrestricted',
@@ -912,13 +978,23 @@ test('C10i restricted resume drops inherited process config and retains Owenloop
 	notify: ['/bin/notifier'],
 	hooks: { afterAgent: [{ command: '/bin/hook' }] },
 	plugins: { external: { path: '/tmp/plugin' } },
+	model_provider: 'inherited-provider',
+	model_providers: {
+	  'inherited-provider': {
+	    name: 'Inherited provider',
+	    base_url: 'http://127.0.0.1:9/v1',
+	    env_key: 'INHERITED_PROVIDER_TOKEN',
+	  },
+	},
+	openai_base_url: 'http://127.0.0.1:9/openai',
+	chatgpt_base_url: 'http://127.0.0.1:9/chatgpt',
 	project_root_markers: ['.inherited-root'],
 	sandbox_workspace_write: {
 	  network_access: true,
 	  writable_roots: ['/tmp/inherited-extra'],
 	  exclude_slash_tmp: true,
 	},
-	benign: 'kept',
+	future_inherited_key: 'drop-me',
       },
     }),
   );
@@ -928,13 +1004,49 @@ test('C10i restricted resume drops inherited process config and retains Owenloop
     broad,
   );
   const config = resumed['config'] as Record<string, unknown>;
-  assert.equal(config['benign'], 'kept');
-  for (const key of ['notify', 'hooks', 'plugins']) assert.equal(key in config, false);
+  for (const key of [
+    'notify',
+    'hooks',
+    'plugins',
+    'model_provider',
+    'model_providers',
+    'openai_base_url',
+    'chatgpt_base_url',
+    'future_inherited_key',
+  ]) {
+    assert.equal(key in config, false, `${key} must not survive restricted resume`);
+  }
   assert.deepEqual(config['project_root_markers'], ['.git']);
   assert.deepEqual(config['sandbox_workspace_write'], {});
   const servers = config['mcp_servers'] as Record<string, unknown>;
   assert.deepEqual(Object.keys(servers), ['owenloop']);
   assertMount(servers['owenloop']);
+});
+
+test('C10j unrestricted start and resume preserve provider configuration', () => {
+  const providerConfig = {
+    model_provider: 'workflow-provider',
+    model_providers: {
+      'workflow-provider': {
+	name: 'Workflow provider',
+	base_url: 'http://127.0.0.1:9/v1',
+	env_key: 'WORKFLOW_PROVIDER_TOKEN',
+      },
+    },
+    openai_base_url: 'http://127.0.0.1:9/openai',
+    chatgpt_base_url: 'http://127.0.0.1:9/chatgpt',
+  };
+  const args = deliverArgs({ filesystem: 'unrestricted', codexConfig: providerConfig });
+  const started = buildThreadStartParams(args);
+  const resumed = buildThreadResumeParams('th-unrestricted-provider', args, started);
+
+  for (const params of [started, resumed]) {
+    const config = params['config'] as Record<string, unknown>;
+    for (const [key, value] of Object.entries(providerConfig)) {
+      assert.deepEqual(config[key], value, `${key} must remain backward compatible`);
+    }
+    assertMount((config['mcp_servers'] as Record<string, unknown>)['owenloop']);
+  }
 });
 
 test('C12 effort reaches the turn from either the step bag or the per-start override', () => {
@@ -1394,6 +1506,47 @@ function useStub(t: { after(fn: () => void): void }, mode: string): Stub {
     },
   };
 }
+
+test('D4 restricted cold start and resume refuse provider config before spawn', async (t) => {
+  const stub = useStub(t, 'refuse-initialize');
+  const bag = {
+    filesystem: 'workspace-write' as const,
+    codexConfig: {
+      model_provider: 'workflow-provider',
+      model_providers: {
+	'workflow-provider': {
+	  base_url: 'http://127.0.0.1:9/v1',
+	  env_key: 'WORKFLOW_PROVIDER_TOKEN',
+	},
+      },
+    },
+  };
+
+  const startError = await codexAdapter
+    .start(startArgs(bag, { cwd: stub.dir }), () => {})
+    .then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+  assert.ok(startError instanceof Error);
+  assert.match(startError.message, /codexConfig\.model_provider/);
+
+  const resumeError = await codexAdapter
+    .deliver(
+      { harness: 'codex', token: 'th-provider-config' },
+      'continue',
+      deliverArgs(bag, { cwd: stub.dir }),
+      () => {},
+    )
+    .then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+  assert.ok(resumeError instanceof Error);
+  assert.match(resumeError.message, /codexConfig\.model_provider/);
+  assert.equal(stub.pid(), undefined, 'the app-server process must not start');
+  assert.deepEqual(stub.received(), []);
+});
 
 function projectConfigWorkspace(base: string): { root: string; leaf: string; link: string } {
   const root = join(base, 'project');
