@@ -3831,6 +3831,45 @@ function assertUniqueBundleStepNames(defs: ReadonlyMap<string, WorkflowDef>): vo
 }
 
 /**
+ * Order only the explicitly selected definitions by their selected bare
+ * `calls:` dependencies. A child is published before each selected parent.
+ * Qualified or excluded targets add no edge: positional selection remains an
+ * exact filter and never pulls another workflow into the push.
+ */
+function orderSelectedDefsByCalls(selected: WorkflowDef[]): WorkflowDef[] {
+  const selectedByName = new Map(selected.map((def) => [def.name, def]));
+  const state = new Map<string, 'visiting' | 'done'>();
+  const stack: string[] = [];
+  const ordered: WorkflowDef[] = [];
+
+  const visit = (def: WorkflowDef): void => {
+    const prior = state.get(def.name);
+    if (prior === 'done') return;
+    if (prior === 'visiting') {
+      const cycleStart = stack.indexOf(def.name);
+      const cycle = [...stack.slice(cycleStart), def.name];
+      throw new CliError(`owenloop push: selected calls cycle: ${cycle.join(' -> ')}`);
+    }
+
+    state.set(def.name, 'visiting');
+    stack.push(def.name);
+    const targets = new Set(
+      def.steps
+	.map((step) => step.calls)
+	.filter((target): target is string =>
+	  target !== undefined && !target.includes('/') && selectedByName.has(target)),
+    );
+    for (const target of targets) visit(selectedByName.get(target)!);
+    stack.pop();
+    state.set(def.name, 'done');
+    ordered.push(def);
+  };
+
+  for (const def of selected) visit(def);
+  return ordered;
+}
+
+/**
  * `owenloop push [<defName>...] [--bundle <bundle.wnlp>] [--force]
  * [--dry-run]` — publish local workflow defs to the bound hub, diffed against
  * the hub's own def `hash`
@@ -3928,6 +3967,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   if (selected.length === 0) {
     throw new CliError(`nothing to push — no workflow definitions found in ${defsDir}`);
   }
+  selected = orderSelectedDefsByCalls(selected);
 
   // Client-side validation gate — all-or-nothing, mirroring dispatchAdd exactly.
   // Any failure aborts the entire push; nothing is sent.

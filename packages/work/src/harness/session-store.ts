@@ -34,10 +34,11 @@
  * read-only filesystem), and a small `maxBytes` lets tests exercise compaction
  * without writing 2 MB. The 2 MB default is unchanged.
  *
- * ACCEPTED RACE: `compact` reads, rewrites, and renames, so lines appended by
- * another process in that window are lost. No locking is built. Session records
- * are advisory — a lost token degrades that one step to the designed replay
- * fallback — and compaction only runs past `maxBytes`.
+ * WRITER SERIALIZATION: every append and compaction takes one cross-process
+ * writer lock for the complete append → size check → optional rename transaction.
+ * An append can therefore never report success and then be replaced by another
+ * process's compaction snapshot. Dead-owner locks are reclaimed by the shared
+ * liveness-aware lock utility; live-owner locks are never reclaimed by age.
  *
  * Logging follows the house rule (there are zero `console.*` calls anywhere in
  * `src/`): the library takes an injectable callback and the default writes to
@@ -50,12 +51,14 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { acquireFileLockSync, releaseFileLock } from '../../../../src/lock.ts';
 
 /** Where a step attempt is in its life. */
 export type SessionStatus = 'active' | 'turn-ended' | 'submitted' | 'dead';
@@ -313,13 +316,40 @@ export function latestFor(
   return best;
 }
 
-/**
- * Rewrite `file` with only the last record per `(workflow, run, step)`,
- * preserving FIRST-SEEN key order, via temp file + rename. Corrupt lines are
- * dropped in the process (they were already unreadable). A missing file is a
- * no-op. Fs failures propagate here; `appendSession` is what swallows them.
- */
-export function compact(file: string, opts: SessionStoreOptions = {}): void {
+/** The lock shared by append and compaction for one session log. */
+function writerLockPath(file: string): string {
+  return `${file}.lock`;
+}
+
+/** Run one complete writer transaction under the cross-process session lock. */
+function withWriterLock<T>(file: string, operation: () => T): T {
+  const lock = acquireFileLockSync(writerLockPath(file), {
+    waitMs: 30_000,
+    label: 'owenloop session-store write',
+  });
+  try {
+    return operation();
+  } finally {
+    releaseFileLock(lock);
+  }
+}
+
+/** True when an existing nonempty log does not end at a JSONL commit marker. */
+function needsRecordSeparator(file: string): boolean {
+  const stat = statSync(file, { throwIfNoEntry: false });
+  if (stat === undefined || stat.size === 0) return false;
+  const fd = openSync(file, 'r');
+  try {
+    const last = Buffer.allocUnsafe(1);
+    const read = readSync(fd, last, 0, 1, stat.size - 1);
+    return read !== 1 || last[0] !== 0x0a;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Lock must already be held by the caller. */
+function compactUnlocked(file: string, opts: SessionStoreOptions): void {
   const records = readSessions(file, opts);
   if (records.length === 0) return;
   const byKey = new Map<string, SessionRecord>();
@@ -330,6 +360,17 @@ export function compact(file: string, opts: SessionStoreOptions = {}): void {
   }
   const body = [...byKey.values()].map((r) => JSON.stringify(r)).join('\n');
   atomicWrite(file, `${body}\n`);
+}
+
+/**
+ * Rewrite `file` with only the last record per `(workflow, run, step)`,
+ * preserving FIRST-SEEN key order, via temp file + rename. Corrupt lines are
+ * dropped in the process (they were already unreadable). A missing file is a
+ * no-op. The complete read/rewrite/rename transaction shares the same lock as
+ * append, so a successful append cannot be replaced by this snapshot.
+ */
+export function compact(file: string, opts: SessionStoreOptions = {}): void {
+  withWriterLock(file, () => compactUnlocked(file, opts));
 }
 
 /**
@@ -344,8 +385,8 @@ export function compact(file: string, opts: SessionStoreOptions = {}): void {
  *
  * WHY A NEW ROW RATHER THAN A REWRITE: the store is append-only and last-wins per
  * `(workflow, run, step)`, so appending a copy with `status: 'dead'` shadows the
- * live row without rewriting history — and it keeps the ACCEPTED RACE in this
- * module's header (compaction losing concurrent appends) as the only writer race.
+ * live row without rewriting history. The shared writer lock serializes each
+ * appended retirement with append/compaction transactions from other processes.
  *
  * IDEMPOTENT: a key whose newest row is already `dead` is skipped, so a sweep
  * that reaps the same run twice appends nothing the second time.
@@ -456,19 +497,24 @@ export function reconcileActiveSessions(
 /**
  * Append one record, then compact when the file has grown past `maxBytes`.
  *
- * The whole line is written in ONE `appendFileSync` call (with its trailing
- * newline) so concurrent workers' O_APPEND writes interleave line-atomically on
- * local filesystems. Append failures PROPAGATE — see this module's failure
- * stance. The post-append compaction is best-effort and swallowed.
+ * The cross-process writer lock covers the WHOLE transaction: abandoned-tail
+ * quarantine, append, size check, and optional compaction rename. If a crashed
+ * writer left bytes without the JSONL commit newline, a leading newline commits
+ * only that fragment as corrupt before the new complete record. Append and lock
+ * failures PROPAGATE; post-append compaction remains best-effort because the
+ * appended line is already durable in the original log.
  */
 export function appendSession(file: string, rec: SessionRecord, opts: SessionStoreOptions = {}): void {
   mkdirSync(join(file, '..'), { recursive: true });
-  appendFileSync(file, `${JSON.stringify(rec)}\n`);
+  withWriterLock(file, () => {
+    const separator = needsRecordSeparator(file) ? '\n' : '';
+    appendFileSync(file, `${separator}${JSON.stringify(rec)}\n`);
 
-  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
-  try {
-    if (statSync(file).size > maxBytes) compact(file, opts);
-  } catch {
-    // best-effort: an un-compacted (or unstatable) file is still correct.
-  }
+    const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
+    try {
+      if (statSync(file).size > maxBytes) compactUnlocked(file, opts);
+    } catch {
+      // best-effort: an un-compacted (or unstatable) file is still correct.
+    }
+  });
 }

@@ -60,11 +60,13 @@ interface MockCfg {
   perWfThrows?: Record<string, Error>;
   onTargetedWhatsNext?: () => void;
   presenceThrows?: boolean;
+  presence?: Array<{ error?: Error }>;
 }
 
 function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
   const calls: Call[] = [];
   let wakeIdx = 0;
+  let presenceIdx = 0;
   const hub: HubClient = {
     async wake(cursor) {
       calls.push({ verb: 'wake', arg: cursor });
@@ -77,6 +79,12 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
     },
     async presencePing(req) {
       calls.push({ verb: 'presence', arg: req });
+      const sequence = cfg.presence;
+      if (sequence !== undefined && sequence.length > 0) {
+	const step = sequence[Math.min(presenceIdx, sequence.length - 1)]!;
+	presenceIdx++;
+	if (step.error !== undefined) throw step.error;
+      }
       if (cfg.presenceThrows) throw new Error('presence boom');
       return { text: '', ok: true, name: req.name, lastSeen: 0 };
     },
@@ -281,6 +289,119 @@ test('Retry-After metadata delays the next Shift poll', async () => {
 
   await loop.run();
   assert.deepEqual(sleeps, [23_000]);
+});
+
+test('presence Retry-After skips wake and whats_next in the same iteration and controls sleep', async () => {
+  const { hub, calls } = mockHub({
+    presence: [{ error: new HubError(429, 'slow down', 'rate_limited', 23_000) }],
+  });
+  const { spawner } = fakeSpawner();
+  const sleeps: number[] = [];
+  const holder: { loop?: ShiftLoop } = {};
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      holder.loop!.stop();
+    },
+  }));
+  holder.loop = loop;
+
+  await loop.run();
+
+  assert.deepEqual(calls.map((call) => call.verb), ['presence']);
+  assert.deepEqual(sleeps, [23_000]);
+});
+
+test('an iteration inside Retry-After performs local reconciliation but no hub polling', async () => {
+  let now = 0;
+  const { hub, calls } = mockHub({
+    presence: [{ error: new HubError(429, 'slow down', 'rate_limited', 23_000) }],
+  });
+  const { spawner } = fakeSpawner();
+  const events: string[] = [];
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    now: () => now,
+    isAlive: () => false,
+    onEvent: (event) => events.push(event.type),
+  }));
+
+  await loop.iterate();
+  writeChildRecord(stateDir, {
+    workflow: 'wf1',
+    run: 'run_dead_during_backoff',
+    pid: 44,
+    spawnedAt: 0,
+    kind: 'exec',
+  });
+  now = 10_000;
+
+  await loop.iterate();
+
+  assert.deepEqual(calls.map((call) => call.verb), ['presence']);
+  assert.deepEqual(events, ['reaped']);
+  assert.equal(readChildRecords(stateDir).length, 0);
+});
+
+test('presence Retry-After still dispatches an already-queued local claim', async () => {
+  cacheBuilderStep();
+  const rateLimited = new HubError(429, 'slow down', 'rate_limited', 23_000);
+  const orders = [wo('run_first', 'builder'), wo('run_queued', 'builder')];
+  const { hub, calls } = mockHub({
+    presence: [{}, { error: rateLimited }],
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf(orders),
+  });
+  const alive = new Set<number>();
+  const spawns: SpawnSpec[] = [];
+  let pid = 1000;
+  const spawner: Spawner = (spec) => {
+    spawns.push(spec);
+    alive.add(pid);
+    return { pid: pid++ };
+  };
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 10,
+    maxConcurrentAgents: 1,
+    presenceIntervalMs: 0,
+    isAlive: (candidatePid) => alive.has(candidatePid),
+  }));
+
+  assert.equal(await loop.iterate(), 1);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  const callsBeforeBackoff = calls.length;
+  alive.delete(1000);
+
+  assert.equal(await loop.iterate(), 1);
+
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first', 'run_queued']);
+  assert.deepEqual(
+    calls.slice(callsBeforeBackoff).map((call) => call.verb),
+    ['presence'],
+    'the rate-limited iteration must do no later hub polling',
+  );
+});
+
+test('a targeted whats_next Retry-After stops the remaining workflow sweep', async () => {
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    inbox: ['wf1', 'wf2', 'wf3'],
+    perWfThrows: {
+      wf1: new HubError(429, 'slow down', 'rate_limited', 23_000),
+    },
+  });
+  const { spawner } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner));
+
+  await loop.iterate();
+
+  const targeted = calls
+    .filter((call) => call.verb === 'whats_next')
+    .map((call) => (call.arg as { workflow?: string } | undefined)?.workflow)
+    .filter((workflow): workflow is string => workflow !== undefined);
+  assert.deepEqual(targeted, ['wf1']);
 });
 
 // ---- presence cadence -------------------------------------------------------

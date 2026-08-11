@@ -37,6 +37,30 @@ function validDef(name: string): string {
   ].join('\n');
 }
 
+function callsDef(name: string, stepName: string, target?: string): string {
+  return target === undefined
+    ? [
+	`name: ${name}`,
+	'outputs: [result]',
+	'steps:',
+	`  - name: ${stepName}`,
+	'    produces: [result]',
+	'    terminal: true',
+	'    maxSchemaFailures: 0',
+	'    body: produce result',
+	'',
+      ].join('\n')
+    : [
+	`name: ${name}`,
+	'outputs: [result]',
+	'steps:',
+	`  - name: ${stepName}`,
+	`    calls: ${target}`,
+	'    produces: [result]',
+	'',
+      ].join('\n');
+}
+
 function writeDefs(cwd: string, defs: Record<string, string>): void {
   const dir = join(cwd, 'workflows');
   mkdirSync(dir, { recursive: true });
@@ -214,6 +238,79 @@ test('push --bundle refuses duplicate step names across the complete archive bef
 	assert.equal(calls.length, 0, 'refusal precedes bundle, evidence, and workflow-version network writes');
 	assert.equal(hub.state.get('selected'), undefined);
 	assert.equal(hub.state.get('excluded'), undefined);
+});
+
+test('push --bundle publishes a selected calls child before its lexically earlier parent', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    'a-parent': callsDef('a-parent', 'delegate-child', 'z-child'),
+    'z-child': callsDef('z-child', 'build-child'),
+  });
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const create = hub.routes['POST /api/create_workflow']!;
+  hub.routes['POST /api/create_workflow'] = (req) => {
+    if (defName(req.body) === 'a-parent' && !hub.state.has('z-child')) {
+      return { status: 200, json: { ok: false, error: "calls target 'z-child' does not exist" } };
+    }
+    return create(req);
+  };
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'a-parent', 'z-child', '--bundle', bundle.path], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(
+    calls
+      .filter((call) => call.pathname === '/api/create_workflow')
+      .map((call) => defName(call.body)),
+    ['z-child', 'a-parent'],
+  );
+  assert.equal(hub.state.get('z-child')?.version, 1);
+  assert.equal(hub.state.get('a-parent')?.version, 1);
+});
+
+test('push --bundle refuses a selected calls cycle before any network call', async () => {
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    'cycle-a': callsDef('cycle-a', 'delegate-b', 'cycle-b'),
+    'cycle-b': callsDef('cycle-b', 'delegate-a', 'cycle-a'),
+  });
+  const { fetch, calls } = routedFetch({});
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'cycle-a', 'cycle-b', '--bundle', bundle.path], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /selected calls cycle: cycle-a -> cycle-b -> cycle-a/u);
+  assert.equal(calls.length, 0);
+});
+
+test('push --bundle parent-only selection does not auto-select its excluded calls child', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    parent: callsDef('parent', 'delegate-excluded', 'excluded-child'),
+    'excluded-child': callsDef('excluded-child', 'build-excluded'),
+  });
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'parent', '--bundle', bundle.path], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(
+    calls
+      .filter((call) => call.pathname === '/api/create_workflow')
+      .map((call) => defName(call.body)),
+    ['parent'],
+  );
+  assert.equal(hub.state.get('excluded-child'), undefined);
+  assert.equal(hub.state.get('parent')?.version, 1);
 });
 
 test('push: first push sends every def, all land as new on the fake hub, exits 0', async () => {

@@ -26,6 +26,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const LOCK_WAIT_MS = 10_000;
 const LOCK_STALE_MS = 10 * 60_000;
 const LOCK_POLL_MS = 100;
+/** Blocking wait cell used only by the synchronous lock API. */
+const LOCK_SYNC_SLEEP = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
 export interface FileLockHandle {
   lockPath: string;
@@ -236,6 +238,61 @@ export async function acquireFileLock(
       );
     }
     await sleep(pollMs);
+  }
+}
+
+/**
+ * Synchronous twin of {@link acquireFileLock}. Use only for APIs whose public
+ * contract is synchronous but whose complete read/append/rename transaction
+ * must still be serialized across processes. Staleness, ownership tokens, and
+ * timeout behavior are identical to the asynchronous lock.
+ */
+export function acquireFileLockSync(
+  lockPath: string,
+  opts: AcquireFileLockOpts = {},
+): FileLockHandle {
+  const waitMs = opts.waitMs ?? LOCK_WAIT_MS;
+  const staleMs = opts.staleMs ?? LOCK_STALE_MS;
+  const pollMs = opts.pollMs ?? LOCK_POLL_MS;
+  const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
+  const now = opts.now ?? Date.now;
+  const host = (opts.hostname ?? hostname)();
+  const label = opts.label ?? 'owenloop process';
+
+  mkdirSync(dirname(lockPath), { recursive: true });
+  const deadline = now() + waitMs;
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, 'wx');
+      const token = randomBytes(16).toString('hex');
+      try {
+	writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: now(), token, host }));
+      } finally {
+	closeSync(fd);
+      }
+      return { lockPath, acquired: true, token };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    }
+
+    const raw = readLockRaw(lockPath);
+    const holder = parseLockHolder(raw);
+    if (lockIsStale(lockPath, holder, staleMs, isPidAlive, now, host)) {
+      const raw2 = readLockRaw(lockPath);
+      if (raw2 !== null && raw2 === raw) {
+	rmSync(lockPath, { force: true });
+	continue;
+      }
+    }
+    if (now() >= deadline) {
+      throw new FileLockTimeoutError(
+	inProgressMessage(lockPath, holder, waitMs, label),
+	lockPath,
+	typeof holder?.pid === 'number' ? holder.pid : undefined,
+	waitMs,
+      );
+    }
+    Atomics.wait(LOCK_SYNC_SLEEP, 0, 0, pollMs);
   }
 }
 

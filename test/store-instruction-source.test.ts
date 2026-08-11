@@ -168,6 +168,90 @@ test('store instruction source: a clean project match resolves before a corrupt 
 	assert.equal(source.getVerifiedObject(requested)?.bundleDigest, installed.result.digest);
 });
 
+test('store instruction source: an exact clean global bundle resolves before an unrelated corrupt project object', async () => {
+  const projectInstalled = await installedSource(
+    WORKFLOW.replace('name: source-fixture', 'name: unrelated-project'),
+    'unrelated-project',
+  );
+  const globalInstalled = await installedSource();
+  const target = join(projectInstalled.result.objectPath, 'workflow.yaml');
+  chmodSync(projectInstalled.result.objectPath, 0o755);
+  chmodSync(target, 0o644);
+  writeFileSync(target, `${WORKFLOW.replace('name: source-fixture', 'name: unrelated-project')}# tampered\n`);
+
+  const source = createStoreInstructionSource({
+    projectRoot: projectInstalled.root,
+    globalRoot: globalInstalled.root,
+    verifier: createBundleIngestor(),
+  });
+
+  assert.equal(await source.prime(globalInstalled.result.digest), 'resolved');
+  assert.equal(
+    source.getVerifiedObject(globalInstalled.result.digest)?.bundleDigest,
+    globalInstalled.result.digest,
+  );
+});
+
+test('store instruction source: a missing exact project object falls through to the indexed global copy', async () => {
+  const globalInstalled = await installedSource();
+  const projectRoot = tempDir('owenloop-missing-exact-project-');
+  addIndexEntry(projectRoot, 'stale/source-fixture@1.0.0', globalInstalled.result.digest);
+
+  const source = createStoreInstructionSource({
+    projectRoot,
+    globalRoot: globalInstalled.root,
+    verifier: createBundleIngestor(),
+  });
+
+  assert.equal(await source.prime(globalInstalled.result.digest), 'resolved');
+  assert.equal(
+    source.getVerifiedObject(globalInstalled.result.digest)?.objectPath,
+    globalInstalled.result.objectPath,
+  );
+});
+
+test('store instruction source: a same-root projection miss scans each indexed object once', async () => {
+  const installed = await installedSource();
+  const delegate = createBundleIngestor();
+  let verifies = 0;
+  const source = createStoreInstructionSource({
+    projectRoot: installed.root,
+    globalRoot: installed.root,
+    verifier: {
+      ingest: (input) => delegate.ingest(input),
+      verifyInstalledObject: async (input) => {
+	verifies++;
+	await delegate.verifyInstalledObject(input);
+      },
+    },
+  });
+
+  assert.equal(await source.prime('f'.repeat(64)), 'unknown-digest');
+  assert.equal(verifies, 1);
+});
+
+test('store instruction source: a corrupt exact project bundle blocks a clean global copy', async () => {
+  const projectInstalled = await installedSource();
+  const globalInstalled = await installedSource();
+  assert.equal(projectInstalled.result.digest, globalInstalled.result.digest);
+
+  const target = join(projectInstalled.result.objectPath, 'workflow.yaml');
+  chmodSync(projectInstalled.result.objectPath, 0o755);
+  chmodSync(target, 0o644);
+  writeFileSync(target, `${WORKFLOW}# tampered project copy\n`);
+
+  const source = createStoreInstructionSource({
+    projectRoot: projectInstalled.root,
+    globalRoot: globalInstalled.root,
+    verifier: createBundleIngestor(),
+  });
+
+  await assert.rejects(
+    source.prime(globalInstalled.result.digest),
+    (error: unknown) => error instanceof StoreIntegrityError && error.code === 'object-corrupt',
+  );
+});
+
 test('store instruction source: a corrupt project candidate blocks a clean matching global fallback', async () => {
 	const projectInstalled = await installedSource(
 		WORKFLOW.replace('name: source-fixture', 'name: unrelated-project'),

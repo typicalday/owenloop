@@ -208,38 +208,92 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
   const primeOnce = async (requestedDigest: string): Promise<'resolved' | 'unknown-digest'> => {
     if (cache.has(requestedDigest)) return 'resolved';
 
-		// Projection digests predate bundle identities, so every indexed bundle is a
-		// candidate. Keep the store boundary explicit: finish the project scan before
-		// opening the global index, and verify each row only against the tier that
-		// supplied that row. A missing project object is stale index state and may
-		// fall through; any other project integrity failure blocks the global tier.
-		if (projectRoot !== undefined) {
-			const projectOutcome = await scanTier(
-				requestedDigest,
-				indexedBundleDigests(projectRoot),
-				projectRoot,
-				'project',
-			);
-			if (projectOutcome.matched) return 'resolved';
-
-			if (projectRoot === globalRoot) {
-				if (projectOutcome.firstFailure !== undefined && !projectOutcome.inspectedCleanCandidate) {
-					throw projectOutcome.firstFailure;
-				}
-				return 'unknown-digest';
+    /**
+     * A bundle identity is already content-addressed: only an index row carrying
+     * that exact digest is a candidate. Missing exact objects are stale rows and
+     * may fall through; corrupt exact objects remain hard integrity refusals.
+     */
+    const loadExactIndexed = async (
+      bundleDigests: DefDigest[],
+      root: string,
+      level: ResolutionLevel,
+    ): Promise<boolean> => {
+      const exact = asDefDigest(requestedDigest);
+      if (exact === undefined || !bundleDigests.includes(exact)) return false;
+      try {
+	return await loadCandidate(requestedDigest, exact, root, level);
+      } catch (error) {
+	if (error instanceof StoreIntegrityError && error.code === 'object-missing') return false;
+	throw error;
       }
-			if (projectOutcome.firstFailure !== undefined) throw projectOutcome.firstFailure;
-		}
+    };
 
-		const globalOutcome = await scanTier(
-			requestedDigest,
-			indexedBundleDigests(globalRoot),
-			globalRoot,
-			'global',
-		);
-		if (globalOutcome.matched) return 'resolved';
-		if (globalOutcome.firstFailure !== undefined && !globalOutcome.inspectedCleanCandidate) {
-			throw globalOutcome.firstFailure;
+    const projectDigests = projectRoot === undefined
+      ? undefined
+      : indexedBundleDigests(projectRoot);
+    if (
+      projectRoot !== undefined &&
+      projectDigests !== undefined &&
+      await loadExactIndexed(projectDigests, projectRoot, 'project')
+    ) {
+      return 'resolved';
+    }
+
+    if (projectRoot === globalRoot && projectDigests !== undefined) {
+      const projectOutcome = await scanTier(
+	requestedDigest,
+	projectDigests,
+	projectRoot,
+	'project',
+      );
+      if (projectOutcome.matched) return 'resolved';
+      if (projectOutcome.firstFailure !== undefined && !projectOutcome.inspectedCleanCandidate) {
+	throw projectOutcome.firstFailure;
+      }
+      return 'unknown-digest';
+    }
+
+    // Probe an exact global identity before scanning unrelated project bundles.
+    // A corrupt global index is deferred until after the project projection scan,
+    // so a clean project projection still resolves without global availability.
+    let globalDigests: DefDigest[] | undefined;
+    let globalIndexFailure: unknown;
+    try {
+      globalDigests = indexedBundleDigests(globalRoot);
+    } catch (error) {
+      globalIndexFailure = error;
+    }
+    if (
+      globalDigests !== undefined &&
+      await loadExactIndexed(globalDigests, globalRoot, 'global')
+    ) {
+      return 'resolved';
+    }
+
+    // Projection digests predate bundle identities, so every indexed bundle is a
+    // candidate. Preserve project-first precedence and integrity behavior for
+    // this legacy path after exact identities have been ruled out.
+    if (projectRoot !== undefined && projectDigests !== undefined) {
+      const projectOutcome = await scanTier(
+	requestedDigest,
+	projectDigests,
+	projectRoot,
+	'project',
+      );
+      if (projectOutcome.matched) return 'resolved';
+      if (projectOutcome.firstFailure !== undefined) throw projectOutcome.firstFailure;
+    }
+
+    if (globalIndexFailure !== undefined) throw globalIndexFailure;
+    const globalOutcome = await scanTier(
+      requestedDigest,
+      globalDigests ?? [],
+      globalRoot,
+      'global',
+    );
+    if (globalOutcome.matched) return 'resolved';
+    if (globalOutcome.firstFailure !== undefined && !globalOutcome.inspectedCleanCandidate) {
+      throw globalOutcome.firstFailure;
     }
     return 'unknown-digest';
   };

@@ -257,10 +257,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    *  after a force does not stamp the cadence over that force. */
   let presenceGeneration = 0;
 
-  function noteServerBackoff(error: unknown): void {
-    if (!(error instanceof HubError) || error.status !== 429) return;
+  function noteServerBackoff(error: unknown): boolean {
+    if (!(error instanceof HubError) || error.status !== 429) return false;
     const delay = error.retryAfterMs ?? opts.pollIntervalMs;
     backoffUntil = Math.max(backoffUntil, opts.now() + delay);
+    return true;
   }
 
   function emit(event: ShiftEvent): void {
@@ -493,9 +494,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
           opts.out(`[${wf}] skipped stale terminal inbox candidate`);
           continue;
         }
-        noteServerBackoff(e);
+	const rateLimited = noteServerBackoff(e);
         complete = false;
         opts.err(`whats_next for ${wf} failed: ${errMsg(e)}`);
+	if (rateLimited) break;
         continue;
       }
       const orders = res.orders ?? [];
@@ -660,8 +662,16 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   }
 
   async function iteration(): Promise<number> {
+    const backoffActiveAtStart = opts.now() < backoffUntil;
+    let rateLimitedThisIteration = false;
+
     // Presence when due (starts immediately — this shift exists to conduct).
-    if (opts.now() - lastPresence >= opts.presenceIntervalMs) {
+    // A server backoff suppresses every hub poll, including presence, while local
+    // reconciliation and queued dispatch continue below.
+    if (
+      !backoffActiveAtStart &&
+      opts.now() - lastPresence >= opts.presenceIntervalMs
+    ) {
       // `setShift` and `noteAttended` force the next ping by setting
       // lastPresence to -Infinity. Either can land WHILE this ping is awaiting
       // the hub, so record the generation first: on completion, only stamp the
@@ -679,7 +689,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
         });
         if (generation === presenceGeneration) lastPresence = opts.now();
       } catch (e) {
-        noteServerBackoff(e);
+	rateLimitedThisIteration = noteServerBackoff(e);
         opts.err(`presence ping failed: ${errMsg(e)} (continuing)`);
       }
     }
@@ -691,6 +701,17 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     let dispatched = drainPending(live);
     if (dispatched > 0) live = reconcile().live;
     const k = cap - live.length;
+
+    // Retry-After suppresses every remaining hub call in the iteration that
+    // received it, and every hub call in later iterations before the deadline.
+    // Local child reconciliation and queued-claim dispatch above still run.
+    if (
+      backoffActiveAtStart ||
+      rateLimitedThisIteration ||
+      opts.now() < backoffUntil
+    ) {
+      return dispatched;
+    }
 
     // Cheap wake pre-check. A failed call also suppresses a forced retry for this
     // tick: a rate-limited wake should not immediately be followed by whats_next.

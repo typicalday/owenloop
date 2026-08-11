@@ -124,6 +124,47 @@ interface KeyRecord {
   path?: string;
 }
 
+const OPENSSH_PRIVATE_BEGIN = '-----BEGIN OPENSSH PRIVATE KEY-----';
+const OPENSSH_PRIVATE_END = '-----END OPENSSH PRIVATE KEY-----';
+const OPENSSH_PRIVATE_LINE_WIDTH = 70;
+
+type DamagedPrivateKey =
+  | { kind: 'not-damaged' }
+  | { kind: 'unrecoverable' }
+  | { kind: 'candidate'; privateKey: string };
+
+/**
+ * Reconstruct only the exact pre-fix macOS damage: JSON `\\n` escapes in a
+ * stock ssh-keygen OpenSSH private key were consumed by `security -i` and
+ * stored as literal `n` separators. Stock OpenSSH armor wraps body lines at 70
+ * bytes, so separator positions are deterministic even when Base64 contains
+ * genuine `n` characters. Identity verification still gates every rewrite.
+ */
+function reconstructDamagedOpenSshPrivateKey(value: string): DamagedPrivateKey {
+  const prefix = `${OPENSSH_PRIVATE_BEGIN}n`;
+  const suffix = `n${OPENSSH_PRIVATE_END}n`;
+  if (!value.startsWith(prefix) || !value.endsWith(suffix)) return { kind: 'not-damaged' };
+
+  let body = value.slice(prefix.length, -suffix.length);
+  const lines: string[] = [];
+  while (body.length > OPENSSH_PRIVATE_LINE_WIDTH) {
+    const line = body.slice(0, OPENSSH_PRIVATE_LINE_WIDTH);
+    if (body[OPENSSH_PRIVATE_LINE_WIDTH] !== 'n' || !/^[A-Za-z0-9+/=]+$/.test(line)) {
+      return { kind: 'unrecoverable' };
+    }
+    lines.push(line);
+    body = body.slice(OPENSSH_PRIVATE_LINE_WIDTH + 1);
+  }
+  if (lines.length === 0 || body.length === 0 || !/^[A-Za-z0-9+/=]+$/.test(body)) {
+    return { kind: 'unrecoverable' };
+  }
+  lines.push(body);
+  return {
+    kind: 'candidate',
+    privateKey: `${OPENSSH_PRIVATE_BEGIN}\n${lines.join('\n')}\n${OPENSSH_PRIVATE_END}\n`,
+  };
+}
+
 /**
  * A minimal child-process seam for the storage commands and `ssh-keygen`.
  * `shell: false` always. The default implementation never captures
@@ -549,12 +590,77 @@ export class PrincipalKeyManager {
     return rec as KeyRecord;
   }
 
-  /** Read + validate the stored record for a ref, or `null` when absent. */
-  private readRecord(ref: PrincipalKeyRef): KeyRecord | null {
+  /**
+   * The repair command deliberately names the exact non-secret Keychain account
+   * handle. Deleting that one damaged item and rerunning setup is the supported
+   * explicit rotation path when identity-preserving migration cannot verify.
+   */
+  private damagedMacosRecordError(ref: PrincipalKeyRef): CliError {
+    return new CliError(
+      `signing-key record for ${ref.kind}:${ref.id} has pre-fix macOS Keychain newline damage, ` +
+	'but the original key identity cannot be verified — rotate explicitly with ' +
+	`\`security delete-generic-password -s owenloop-signing -a ${keyRefHash(ref)}\` ` +
+	'and then run `owenloop setup`',
+    );
+  }
+
+  /**
+   * Migrate the one known v1 macOS writer defect while the caller holds the
+   * per-ref lock. A candidate is rewritten only after full record validation
+   * derives the already-stored public fingerprint from the repaired private key.
+   */
+  private migrateDamagedMacosRecord(ref: PrincipalKeyRef, text: string): string {
+    if (this.backendKind !== 'macos-security') return text;
+
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      return text;
+    }
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return text;
+    const rec = raw as Partial<KeyRecord>;
+    if (rec.version !== 1 || rec.kind !== 'generated' || typeof rec.privateKey !== 'string') return text;
+
+    const repaired = reconstructDamagedOpenSshPrivateKey(rec.privateKey);
+    if (repaired.kind === 'not-damaged') return text;
+    if (repaired.kind === 'unrecoverable') throw this.damagedMacosRecordError(ref);
+
+    const repairedText = JSON.stringify({ ...rec, privateKey: repaired.privateKey });
+    try {
+      this.parseRecord(ref, repairedText);
+    } catch {
+      throw this.damagedMacosRecordError(ref);
+    }
+    this.writeRecordText(ref, repairedText);
+    return repairedText;
+  }
+
+  /**
+   * Read + validate the stored record for a ref, or `null` when absent. macOS
+   * reads share the per-ref lock with `ensure`, so every normal read path can
+   * perform the identity-preserving v1 migration without racing key creation.
+   */
+  private async readRecord(ref: PrincipalKeyRef): Promise<KeyRecord | null> {
     assertKeyRef(ref);
-    const text = this.readRecordText(ref);
-    if (text === null) return null;
-    return this.parseRecord(ref, text);
+    if (this.backendKind !== 'macos-security') {
+      const text = this.readRecordText(ref);
+      return text === null ? null : this.parseRecord(ref, text);
+    }
+
+    let lock: FileLockHandle | null = null;
+    try {
+      lock = await acquireFileLock(this.lockPath(ref), {
+	waitMs: 30_000,
+	label: 'owenloop signing-key migration',
+      });
+      const text = this.readRecordText(ref);
+      return text === null
+	? null
+	: this.parseRecord(ref, this.migrateDamagedMacosRecord(ref, text));
+    } finally {
+      if (lock !== null) releaseFileLock(lock);
+    }
   }
 
   // ---- public API ------------------------------------------------------------
@@ -569,7 +675,7 @@ export class PrincipalKeyManager {
   async inspect(ref: PrincipalKeyRef): Promise<InspectKeyResult> {
     assertKeyRef(ref);
     if (this.backendKind === 'file') this.ensureDirs();
-    const rec = this.readRecord(ref);
+    const rec = await this.readRecord(ref);
     if (rec === null) return { exists: false, source: undefined, backend: undefined, publicKey: undefined };
     const desc = publicKeyDescriptor(rec.publicKey);
     return {
@@ -673,7 +779,10 @@ export class PrincipalKeyManager {
         waitMs: 30_000,
         label: 'owenloop signing-key creation',
       });
-      const existing = this.readRecord(ref);
+      const existingText = this.readRecordText(ref);
+      const existing = existingText === null
+	? null
+	: this.parseRecord(ref, this.migrateDamagedMacosRecord(ref, existingText));
       if (existing !== null) {
         if (opts?.reuse !== undefined) {
           throw new CliError(
@@ -854,7 +963,7 @@ export class PrincipalKeyManager {
   async withSigningKey<T>(ref: PrincipalKeyRef, callback: (keyPath: string) => Promise<T>): Promise<T> {
     assertKeyRef(ref);
     this.ensureDirs();
-    const rec = this.readRecord(ref);
+    const rec = await this.readRecord(ref);
     if (rec === null) {
       throw new CliError(`no ${ref.kind} signing key stored for ${ref.origin} — run owenloop setup`);
     }

@@ -197,6 +197,29 @@ function validGeneratedRecord(): string {
   });
 }
 
+function damagedMacosGeneratedRecord(): { damaged: string; privateKey: string } {
+  const privateKey = [
+    '-----BEGIN OPENSSH PRIVATE KEY-----',
+    'A'.repeat(70),
+    'B'.repeat(64),
+    '-----END OPENSSH PRIVATE KEY-----',
+    '',
+  ].join('\n');
+  const healthy = JSON.stringify({
+    version: 1,
+    ref: REF,
+    kind: 'generated',
+    publicKey: FIXTURE_PUB.trim(),
+    fingerprint: publicKeyDescriptor(FIXTURE_PUB).keyid,
+    createdAt: new Date().toISOString(),
+    privateKey,
+  });
+  return {
+    privateKey,
+    damaged: healthy.replace(/\\n/g, 'n'),
+  };
+}
+
 function syntheticEd25519PublicKey(byte: number, comment: string): string {
   const blob = Buffer.alloc(4 + 11 + 4 + 32, byte);
   blob.writeUInt32BE(11, 0);
@@ -329,6 +352,133 @@ test('macos-security: create → record on stdin (never argv), lookup stdout to 
   assert.equal(store.size, writesBefore);
   const addRuns = runs.filter((r) => r.cmd === 'security' && r.args[0] === '-i');
   assert.equal(addRuns.length, 1, 'no second write');
+});
+
+test('macos-security: inspect migrates the exact pre-fix newline damage without changing identity', async () => {
+  const home = freshHome();
+  const fake = makeFakeRunner();
+  const seeded = damagedMacosGeneratedRecord();
+  fake.store.set(keyRefHash(REF), seeded.damaged);
+  const manager = new PrincipalKeyManager({
+    env: {},
+    backend: 'macos-security',
+    runner: fake.runner,
+    homeDir: home,
+  });
+  const fingerprint = publicKeyDescriptor(FIXTURE_PUB).keyid;
+
+  const migrated = await manager.inspect(REF);
+  assert.equal(migrated.exists, true);
+  assert.equal(migrated.publicKey?.keyid, fingerprint);
+  const repaired = JSON.parse(fake.store.get(keyRefHash(REF))!) as {
+    privateKey: string;
+    fingerprint: string;
+  };
+  assert.equal(repaired.privateKey, seeded.privateKey);
+  assert.equal(repaired.fingerprint, fingerprint);
+  assert.equal(
+    fake.runs.filter((run) => run.cmd === 'security' && run.args[0] === '-i').length,
+    1,
+    'migration rewrites the verified record once',
+  );
+
+  const later = await manager.ensure(REF);
+  assert.equal(later.state, 'existing');
+  assert.equal(later.publicKey.keyid, fingerprint);
+  assert.equal(
+    fake.runs.filter((run) => run.cmd === 'security' && run.args[0] === '-i').length,
+    1,
+    'a healthy later ensure is idempotent',
+  );
+});
+
+test('macos-security: migration reconstructs a real stock OpenSSH key before identity verification', { skip: SKIP }, async () => {
+  const home = freshHome();
+  const fixtureDir = mkdtempSync(join(tmpdir(), 'owenloop-damaged-real-key-'));
+  try {
+    const keyPath = join(fixtureDir, 'id_ed25519');
+    execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'migration-fixture', '-f', keyPath]);
+    const privateKey = readFileSync(keyPath, 'utf8');
+    const publicKey = readFileSync(`${keyPath}.pub`, 'utf8').trim();
+    const fingerprint = publicKeyDescriptor(publicKey).keyid;
+    const healthy = JSON.stringify({
+      version: 1,
+      ref: REF,
+      kind: 'generated',
+      publicKey,
+      fingerprint,
+      createdAt: new Date().toISOString(),
+      privateKey,
+    });
+    const fake = makeFakeRunner();
+    const runner: KeyCommandRunner = {
+      run(cmd, args, opts) {
+	if (cmd === 'ssh-keygen' && args[0] === '-y') {
+	  const result = spawnSync(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+	  return {
+	    status: result.status ?? 1,
+	    stdout: result.stdout,
+	  };
+	}
+	return fake.runner.run(cmd, args, opts);
+      },
+    };
+    fake.store.set(keyRefHash(REF), healthy.replace(/\\n/g, 'n'));
+    const manager = new PrincipalKeyManager({
+      env: {},
+      backend: 'macos-security',
+      runner,
+      homeDir: home,
+    });
+
+    const materialized = await manager.withSigningKey(
+      REF,
+      async (materializedPath) => readFileSync(materializedPath, 'utf8'),
+    );
+
+    assert.equal(materialized, privateKey);
+    const repaired = JSON.parse(fake.store.get(keyRefHash(REF))!) as {
+      privateKey: string;
+      fingerprint: string;
+    };
+    assert.equal(repaired.privateKey, privateKey);
+    assert.equal(repaired.fingerprint, fingerprint);
+  } finally {
+    rmSync(fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test('macos-security: damaged record migration refuses an unverifiable identity without rewriting', async () => {
+  const home = freshHome();
+  const alternate = syntheticEd25519PublicKey(0x42, 'alternate');
+  const fake = makeFakeRunner({ derivedPubText: alternate });
+  const seeded = damagedMacosGeneratedRecord();
+  fake.store.set(keyRefHash(REF), seeded.damaged);
+  const manager = new PrincipalKeyManager({
+    env: {},
+    backend: 'macos-security',
+    runner: fake.runner,
+    homeDir: home,
+  });
+
+  await assert.rejects(manager.inspect(REF), (error: Error) => {
+    assert.match(error.message, /pre-fix macOS Keychain newline damage/);
+    assert.match(error.message, /security delete-generic-password/);
+    assert.match(error.message, /owenloop setup/);
+    assertNoPoison('migration error', error.message);
+    return true;
+  });
+  assert.equal(fake.store.get(keyRefHash(REF)), seeded.damaged);
+  assert.equal(
+    existsSync(join(home, '.owenloop', 'keys', `${keyRefHash(REF)}.lock`)),
+    false,
+    'failed migration releases the per-ref lock',
+  );
+  assert.equal(
+    fake.runs.filter((run) => run.cmd === 'security' && run.args[0] === '-i').length,
+    0,
+    'identity mismatch never rewrites or rotates the stored record',
+  );
 });
 
 test('macos-security: a selected-backend failure is a hard fixed error with NO fallback and no poison in the message', async () => {
