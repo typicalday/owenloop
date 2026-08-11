@@ -1255,24 +1255,39 @@ test('version selection: the refusal never calls a level-outranked SemVer versio
   // version — the warning must not sweep it into "none of these is SemVer",
   // which would send an operator hunting a defect in a valid version string.
   const project = await installVersions(['nightly', 'edge']);
-  const global = await installVersions(['1.0.0']);
+  const oneGlobal = await installVersions(['1.0.0']);
 
-  const { registrations, warnings } = load(project.root, global.root);
+  const refusalFor = (globalRoot: string): string => {
+    const { registrations, warnings } = load(project.root, globalRoot);
+    assert.equal(
+      registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow'),
+      undefined,
+      'the unqualified name is still refused',
+    );
+    const line = warnings.find((warning) => warning.includes("'parent/parent' has no selectable"));
+    assert.ok(line, 'the refusal is reported');
+    return line;
+  };
 
-  assert.equal(
-    registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow'),
-    undefined,
-    'the unqualified name is still refused',
+  const singular = refusalFor(oneGlobal.root);
+  // Assert against the competing LIST itself, not the surrounding sentence, so
+  // rewording the message cannot silently turn this into a no-op assertion.
+  const competingList = /competing versions \(([^)]*)\)/u.exec(singular)?.[1];
+  assert.ok(competingList, 'the refusal names the competing versions');
+  assert.deepEqual([...competingList.split(', ')].sort(), ['edge', 'nightly']);
+  assert.ok(
+    !competingList.includes('1.0.0'),
+    'the level-outranked SemVer version is not listed among the non-SemVer competitors',
   );
-  const refusal = warnings.find((line) => line.includes("'parent/parent' has no selectable"));
-  assert.ok(refusal, 'the refusal is reported');
-  assert.match(refusal, /competing versions \((nightly, edge|edge, nightly)\)/u);
-  assert.doesNotMatch(refusal, /1\.0\.0.*is canonical SemVer/u);
   assert.match(
-    refusal,
+    singular,
     /1 further global-indexed version never competed/u,
     'the outranked SemVer version is reported separately, with the real reason',
   );
+
+  // A second outranked version must pluralize rather than read "2 further ... version".
+  const twoGlobal = await installVersions(['1.0.0', '2.0.0']);
+  assert.match(refusalFor(twoGlobal.root), /2 further global-indexed versions never competed/u);
 });
 
 test('version selection: several non-SemVer versions fail closed instead of guessing', async () => {
