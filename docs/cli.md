@@ -291,6 +291,23 @@ The execution settings file is `$XDG_CONFIG_HOME/owenloop/settings.json` when
 | `settings` | print the resolved execution settings file |
 | `join <code> [--hub <origin>] [--as <account>]` | redeem a join code and store the Scoped Identity credential |
 
+### `work agent-run` — the only Step Agent dispatcher
+
+`owenloop work agent-run` is the only supported way to dispatch an agent order.
+The command resolves the verified local workflow definition, applies the final
+`--harness` / environment / step harness selection, and checks every
+`x.harness` restriction before cold start or resume. An unsupported restriction
+starts no provider process, prints each exact refusal, releases the claim, and
+exits `1`.
+
+An absent `x.harness.tools` field preserves the adapter's default tool surface;
+`tools: []` is an explicit empty allow-list. The two forms are not equivalent.
+Invalid reserved fields and overlapping `tools` / `disallowedTools` are refused.
+`owenloop work lint` runs the same common and adapter checks, but runtime
+preflight remains authoritative because `--harness` or `OWENLOOP_HARNESS` can
+select a different adapter after lint. See [Agent runner and harness policy](agent-runner.md)
+for the capability matrix and the born-bound Owenloop control-plane exception.
+
 ## `trust` — local enrollment trust
 
 The `trust` commands create the local enrollment root and signed enrollment

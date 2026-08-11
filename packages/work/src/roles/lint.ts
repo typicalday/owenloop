@@ -39,6 +39,11 @@ import { parse as parseYaml } from 'yaml';
 import type { FetchedStep } from '../bundle/types.ts';
 import type { LintFinding } from '../harness/types.ts';
 import { adapterFor, defaultHarnessId } from '../harness/registry.ts';
+import {
+  normalizeStepPermissions,
+  preflightStepPermissions,
+  validateHarnessOptions,
+} from '../harness/permissions.ts';
 import { parseHarnessCarrier } from '../bundle/fetch.ts';
 import { readLatestBundle, resolveCacheDir } from '../bundle/cache.ts';
 import { loadSettings } from '../settings/settings.ts';
@@ -130,7 +135,23 @@ export function lintOneStep(step: FetchedStep): LintFinding[] {
       field: 'id',
     }];
   }
-  const findings: LintFinding[] = [...(adapter.lintStep?.(bag, step.name) ?? [])];
+  const permissions = normalizeStepPermissions(bag, step);
+  const findings: LintFinding[] = [
+    ...validateHarnessOptions(bag, step.name),
+    ...preflightStepPermissions(permissions).map((issue) => ({
+      severity: 'error' as const,
+      step: step.name,
+      message: issue.message,
+      ...(issue.field !== undefined ? { field: issue.field } : {}),
+    })),
+    ...adapter.preflight(permissions).map((issue) => ({
+      severity: 'error' as const,
+      step: step.name,
+      message: issue.message,
+      ...(issue.field !== undefined ? { field: issue.field } : {}),
+    })),
+    ...(adapter.lintStep?.(bag, step.name) ?? []),
+  ];
 
   if (step.model !== undefined && 'model' in bag) {
     findings.push({
@@ -141,7 +162,13 @@ export function lintOneStep(step: FetchedStep): LintFinding[] {
     });
   }
 
-  return findings;
+  const seen = new Set<string>();
+  return findings.filter((finding) => {
+    const key = `${finding.severity}\0${finding.step}\0${finding.field ?? ''}\0${finding.message}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** Load the steps to lint from a yaml def, a json bundle, or a bare name. */

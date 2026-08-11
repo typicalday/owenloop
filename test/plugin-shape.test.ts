@@ -12,7 +12,7 @@
  * for. Do not mistake a passing test here for a live proof.
  */
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -57,17 +57,6 @@ function walkFiles(dir: string): string[] {
   }
   return out;
 }
-
-const GOVERNED_HUB_WORKER_TOOLS = [
-  'mcp__plugin_owenloop_owenloop__submit',
-  'mcp__plugin_owenloop_owenloop__get_status',
-  'mcp__owenloop__submit',
-  'mcp__owenloop__get_status',
-  'WebSearch',
-  'WebFetch',
-  'Read',
-  'Bash',
-];
 
 /** conduct's governed `allowed-tools` set (order-insensitive). The skill
  *  uses only the merged CLI, so the Claude Code frontmatter grants one
@@ -329,24 +318,11 @@ for (const script of ['session-end.sh', 'session-start.sh']) {
   });
 }
 
-const { data: frontmatter } = parseFrontmatter(readText('plugins/claude-code/plugin/agents/owenloop-worker.md'));
-
-test('agents/owenloop-worker.md tools are exactly the governed allowlist (order-insensitive) — INV-39', () => {
-  const tools = splitToolList(frontmatter.tools);
-  assert.deepEqual(new Set(tools), new Set(GOVERNED_HUB_WORKER_TOOLS));
-});
-
-test('agents/owenloop-worker.md does NOT include Agent, Task, Edit, or Write', () => {
-  const tools = splitToolList(frontmatter.tools);
-  for (const forbidden of ['Agent', 'Task', 'Edit', 'Write']) {
-    assert.ok(!((tools)).includes(forbidden));
-  }
-});
-
-test('agents/owenloop-worker.md has no mcpServers/hooks/permissionMode frontmatter keys (Claude Code plugin agent-frontmatter convention)', () => {
-  assert.ok(!('mcpServers' in (frontmatter)));
-  assert.ok(!('hooks' in (frontmatter)));
-  assert.ok(!('permissionMode' in (frontmatter)));
+test('the Claude Code plugin packages no static workflow worker', () => {
+  assert.equal(
+    existsSync(resolve(ROOT, 'plugins/claude-code/plugin/agents/owenloop-worker.md')),
+    false,
+  );
 });
 
 const CLI_COMMANDS = {

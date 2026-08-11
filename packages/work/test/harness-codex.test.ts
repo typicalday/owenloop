@@ -632,17 +632,6 @@ const CASES: Case[] = [
     },
   },
   {
-    name: 'C4 an unmappable permissionMode falls back to never and SAYS so',
-    bag: { permissionMode: 'acceptEdits' },
-    expect(p, events) {
-      assert.equal(p['approvalPolicy'], 'never');
-      assert.ok(
-        events.some((e) => e.kind === 'progress' && /acceptEdits/.test(e.text)),
-        'the downgrade must be reported, not silent',
-      );
-    },
-  },
-  {
     name: 'C5 a native approval policy passes through untouched and silently',
     bag: { permissionMode: 'on-request' },
     expect(p, events) {
@@ -692,14 +681,6 @@ const CASES: Case[] = [
     },
   },
   {
-    name: 'C9 an illegal sandbox falls back to the default and SAYS so',
-    bag: { sandbox: 'yolo-full-access' },
-    expect(p, events) {
-      assert.equal(p['sandbox'], 'workspace-write');
-      assert.ok(events.some((e) => e.kind === 'progress' && /yolo-full-access/.test(e.text)));
-    },
-  },
-  {
     name: 'C10 neutral keys with no thread-start equivalent are dropped, not smuggled',
     bag: { tools: ['Read', 'Edit'], disallowedTools: 'Bash', maxTurns: 40, effort: 'high' },
     expect(p) {
@@ -718,6 +699,20 @@ for (const c of CASES) {
   });
 }
 
+test('C4 an unmappable permissionMode is rejected instead of falling back', () => {
+  assert.throws(
+    () => buildThreadStartParams(startArgs({ permissionMode: 'acceptEdits' })),
+    /permissionMode must be one of/,
+  );
+});
+
+test('C9 an illegal sandbox is rejected instead of falling back', () => {
+  assert.throws(
+    () => buildThreadStartParams(startArgs({ sandbox: 'yolo-full-access' })),
+    /sandbox must be one of/,
+  );
+});
+
 test('C11 buildTurnStartParams wraps the text as a UserInput array', () => {
   assert.deepEqual(buildTurnStartParams('th-1', 'hello'), {
     threadId: 'th-1',
@@ -731,6 +726,35 @@ test('C11 buildTurnStartParams wraps the text as a UserInput array', () => {
   });
   // An empty effort is omitted rather than sent as ''.
   assert.equal('effort' in buildTurnStartParams('th-1', 'hi', ''), false);
+});
+
+test('C10b neutral filesystem modes map exactly to Codex sandbox modes', () => {
+  assert.equal(buildThreadStartParams(startArgs({ filesystem: 'read-only' }))['sandbox'], 'read-only');
+  assert.equal(
+    buildThreadStartParams(startArgs({ filesystem: 'workspace-write' }))['sandbox'],
+    'workspace-write',
+  );
+  assert.equal(
+    buildThreadStartParams(startArgs({ filesystem: 'unrestricted' }))['sandbox'],
+    'danger-full-access',
+  );
+});
+
+test('C10c preflight refuses restrictions Codex cannot enforce', () => {
+  const unsupported = codexAdapter.preflight(
+    normalizeStepPermissions({ tools: [], disallowedTools: [], network: 'owenloop-only' }),
+  );
+  assert.deepEqual(unsupported.map((issue) => issue.field), [
+    'tools',
+    'disallowedTools',
+    'network',
+  ]);
+});
+
+test('C10d conflicting neutral and legacy sandbox values are refused', () => {
+  const permissions = normalizeStepPermissions({ filesystem: 'unrestricted', sandbox: 'read-only' });
+  assert.match(codexAdapter.preflight(permissions)[0]?.message ?? '', /conflicts with filesystem/);
+  assert.throws(() => buildThreadStartParams({ ...deliverArgs(), permissions }), /conflicts with filesystem/);
 });
 
 test('C12 effort reaches the turn from either the step bag or the per-start override', () => {

@@ -91,6 +91,21 @@ test('validateFetchedDef leaves x.owenloop untouched alongside x.harness', () =>
   assert.deepEqual(s.x, { harness: { id: 'codex' }, owenloop: { machine: 'winserver' } });
 });
 
+test('validateFetchedDef refuses invalid reserved harness policy before caching', () => {
+  assert.throws(
+    () => oneStep({ name: 'builder', x: { harness: { filesystem: 'root', network: false } } }),
+    /x\.harness\.filesystem: filesystem must be one of/,
+  );
+  assert.throws(
+    () => oneStep({ name: 'builder', x: { harness: { tools: ['Read'], disallowedTools: ['Read'] } } }),
+    /tools and disallowedTools overlap: Read/,
+  );
+  assert.throws(
+    () => oneStep({ name: 'builder', x: { harness: { name: 'forbidden' } } }),
+    /x\.harness\.name: 'name' is generated and cannot be set/,
+  );
+});
+
 test('validateFetchedDef errors honestly on a malformed harness carrier, naming the step', () => {
   assert.throws(
     () => oneStep({ name: 'builder', x: { harness: 'codex' } }),
@@ -298,6 +313,24 @@ test('writeBundle + readBundle round-trip, writing one steps/<step>.json per spe
   assert.deepEqual(readStepSpec(cacheDir, 'demo', 'h1', 'builder'), spec);
   const b = readBundle(cacheDir, 'demo', 'h1');
   assert.equal(b!.def.hash, 'h1');
+});
+
+test('readStepSpec refuses an old cache with buried restrictions and names the repair', () => {
+  writeBundle(cacheDir, mkBundle('h1'), [{
+    step: 'builder',
+    brief: 'BRIEF\n',
+    permissions: {
+      extensions: {
+	filesystem: 'read-only',
+	network: 'owenloop-only',
+      },
+    },
+  }]);
+
+  assert.throws(
+    () => readStepSpec(cacheDir, 'demo', 'h1', 'builder'),
+    /filesystem, network.*rerun `owenloop work prepare`/,
+  );
 });
 
 test('readBundle treats a corrupt bundle.json as absent', () => {

@@ -163,6 +163,7 @@ function pendingAdapter(id = 'fake'): {
   const adapter: HarnessAdapter = {
     id,
     resumeTier: 'native-token',
+    preflight: () => [],
     async start(_args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef> {
       onEvent({ kind: 'started', ref });
       announce?.();
@@ -662,6 +663,29 @@ test('an unregistered harness id fails honestly, naming the id and what IS regis
   assert.ok(line.includes("'ghost'"));
   assert.ok(line.includes('fake, other'));
   assert.ok(verbs(calls).includes('release'));
+});
+
+test('an unsupported harness policy starts nothing, reports every reason, and releases the claim', async () => {
+  const adapter = createFakeAdapter();
+  adapter.preflight = () => [
+    { field: 'tools', message: 'tool allow-lists are unsupported' },
+    { field: 'network', message: "network 'owenloop-only' is unsupported" },
+  ];
+  const { hub, calls } = mockHub({ getOrder: [agentOrder()] });
+  const h = buildOpts({
+    hub,
+    adapter,
+    spec: {
+      ...baseSpec(),
+      permissions: { tools: [], network: 'owenloop-only', extensions: {} },
+    },
+  });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'incompatible-harness-policy');
+  assert.deepEqual(adapter.calls, [], 'preflight runs before cold start or resume');
+  assert.ok(verbs(calls).includes('release'));
+  assert.ok(h.errs.some((line) => line.includes('(tools): tool allow-lists are unsupported')));
+  assert.ok(h.errs.some((line) => line.includes("(network): network 'owenloop-only' is unsupported")));
 });
 
 test('unverified consumed values and complete rejection threads are refused before prompt rendering or adapter start', async () => {

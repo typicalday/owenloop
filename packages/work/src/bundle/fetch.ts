@@ -20,6 +20,7 @@
  * a broken closure fails at fetch, never mid-run — see `validateFetchedDef`.
  */
 import { HubError } from '../hub/types.ts';
+import { validateHarnessOptions } from '../harness/permissions.ts';
 import type { FetchedBundle, FetchedDef, FetchedPin, FetchedStep } from './types.ts';
 
 export interface FetchDefOptions {
@@ -191,6 +192,19 @@ function validateDefEnvelope(data: unknown, label: string): FetchedDef {
     // still carried through verbatim — `x.owenloop` is a separate live
     // namespace that `src/shift/routing.ts` reads.
     const carrier = parseHarnessCarrier(s, label, s['name'] as string);
+    if (carrier.harnessOptions !== undefined) {
+      const errors = validateHarnessOptions(carrier.harnessOptions, s['name'] as string)
+	.filter((finding) => finding.severity === 'error');
+      if (errors.length > 0) {
+	throw new Error(
+	  errors
+	    .map((finding) =>
+	      `hub workflow '${label}': step '${finding.step}' x.harness.${finding.field ?? '<bag>'}: ${finding.message}`,
+	    )
+	    .join('; '),
+	);
+      }
+    }
     return {
       name: s['name'] as string,
       consumes: Array.isArray(s['consumes']) ? (s['consumes'] as unknown[]) : undefined,

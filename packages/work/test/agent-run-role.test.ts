@@ -212,6 +212,7 @@ function parkedAdapter(id: string): { adapter: HarnessAdapter; stops: number; st
   const adapter: HarnessAdapter = {
     id,
     resumeTier: 'native-token',
+    preflight: () => [],
     async start(args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef> {
       state.startArgs.push(args);
       onEvent({ kind: 'started', ref });
@@ -272,6 +273,7 @@ function spawningEnvProbe(): { adapter: HarnessAdapter; observed: string[] } {
   const adapter: HarnessAdapter = {
     id: ref.harness,
     resumeTier: 'replay',
+    preflight: () => [],
     async start(_args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef> {
       onEvent({ kind: 'started', ref });
       observed.push(await spawnProbe());
@@ -316,14 +318,9 @@ function useAdapter(a: HarnessAdapter): void {
 
 /** Write a cached bundle whose `builder` step compiles to `TEMPLATE`. */
 /**
- * Seed a cached bundle for DEF/HASH whose single `builder` step is an agent step.
- *
- * `harness` and `permissions` are written into BOTH halves of the cache — the
- * def envelope and the normalized step spec — because that is what `prepare`
- * produces: the def parser lifts `x.harness.id` onto the step, and
- * `normalizeStepPermissions` folds the rest of the bag into `permissions`. The
- * runner reads ONLY the spec (`steps/<step>.json`); the def half is here so the
- * fixture is a faithful `prepare` output rather than a half-written one.
+ * Seed the verified local step plus the matching prepare cache fixture.
+ * Runtime instruction resolution reads `verifiedStep`; the cache remains present
+ * because the role also owns cache/session paths exercised by neighboring tests.
  */
 function seedBundle(seed: { harness?: string; model?: string; permissions?: StepPermissions } = {}): void {
   const harnessKey = seed.harness !== undefined ? { harness: seed.harness } : {};
@@ -636,11 +633,30 @@ test('run() refuses a non-string x.harness.id instead of selecting the default h
   assert.match(result.stderr, /non-string x\.harness\.id/);
 });
 
-test('run() renders the brief from the cached template and passes the step permission bag', async () => {
+test('run() refuses invalid reserved fields in the verified local definition', async () => {
+  const result = await runMalformedHarnessCarrier({
+    harness: {
+      id: 'fake',
+      tools: ['Read'],
+      disallowedTools: ['Read'],
+      filesystem: 'root-everywhere',
+      name: 'forbidden',
+    },
+  });
+  assert.equal(result.code, 1);
+  assert.deepEqual(result.calls, []);
+  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.match(result.stderr, /instruction refusal \(harness-policy\)/);
+  assert.match(result.stderr, /filesystem must be one of/);
+  assert.match(result.stderr, /'name' is generated and cannot be set/);
+  assert.match(result.stderr, /tools and disallowedTools overlap: Read/);
+});
+
+test('run() renders the brief from the verified step and passes normalized permissions', async () => {
   const fake: FakeAdapter = createFakeAdapter({ id: 'fake' });
   useAdapter(fake);
-  // `prepare` already normalized `x.harness` into these permissions at cache
-  // time — the runner does not re-read an option bag and has no bag key.
+  // The local resolver supplies the verified step; the runner validates the raw
+  // carrier and normalizes the permission bag before dispatch.
   seedBundle({ model: 'm-step', permissions: { tools: ['Read'], model: 'm-step', extensions: {} } });
   const { hub } = probeHub({ responses: [agentOrder(), agentOrder({ outcome: 'ok' })], def: DEF });
 
@@ -655,7 +671,7 @@ test('run() renders the brief from the cached template and passes the step permi
     started.args.brief,
     'order: wf1/run1\norigin: https://hub.example\naccount: default\nshift: shf_1',
   );
-  // The permissions ride PRE-NORMALIZED on the step spec — no lookup, no key.
+  // The permissions are normalized from the verified local definition.
   assert.deepEqual(started.args.permissions.tools, ['Read']);
   assert.equal(started.args.permissions.model, 'm-step');
 });
@@ -700,6 +716,35 @@ test('run() fails honestly (exit 1) when --harness names no registered adapter',
   assert.match(text, /fake/); // and what IS registered
   // no-harness releases, so the hub can re-offer the order.
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+});
+
+test('--harness policy preflight uses the final overridden adapter and refuses before start', async () => {
+  const authored = createFakeAdapter({ id: 'authored' });
+  const overridden = createFakeAdapter({ id: 'overridden' });
+  overridden.preflight = (permissions) =>
+    permissions.network === 'owenloop-only'
+      ? [{ field: 'network', message: "network 'owenloop-only' is unsupported" }]
+      : [];
+  useAdapter(authored);
+  useAdapter(overridden);
+  seedRawStep({ harness: { id: 'authored', network: 'owenloop-only' } });
+  const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+  const err: string[] = [];
+
+  const code = await run([...WIRE, '--harness', 'overridden'], {
+    hub,
+    signalHost: fakeSignalHost().host,
+    holderId: 'host:123',
+    cwd: '/work',
+    out: () => {},
+    err: (line) => err.push(line),
+  });
+
+  assert.equal(code, 1);
+  assert.deepEqual(authored.calls, []);
+  assert.deepEqual(overridden.calls, []);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.match(err.join('\n'), /harness policy refusal.*overridden.*network 'owenloop-only' is unsupported/);
 });
 
 test('OWENLOOP_HARNESS outranks the step def, and the step def outranks the default', async () => {

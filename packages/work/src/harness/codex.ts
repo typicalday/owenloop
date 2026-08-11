@@ -70,9 +70,13 @@ import type {
   DeliverArgs,
   HarnessAdapter,
   HarnessSessionRef,
+  PermissionIssue,
   StartArgs,
+  StepPermissions,
 } from './contract.ts';
+import type { LintFinding } from './types.ts';
 import { register } from './registry.ts';
+import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
 import { ADMITTED_OWENLOOP_KEYS, filterOwenloopEnv } from './child-env.ts';
 import { JsonRpcError, startStdioRpc, type StdioRpcClient } from './jsonrpc-stdio.ts';
 
@@ -148,26 +152,63 @@ const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-acce
  */
 const DEFAULT_SANDBOX = 'workspace-write';
 
-/**
- * `AskForApproval` values this adapter passes through untouched (the server's
- * own vocabulary). Anything else maps to `'never'`.
- */
+/** `AskForApproval` values this adapter passes through untouched. */
 const NATIVE_APPROVAL_POLICIES = new Set(['untrusted', 'on-request', 'never']);
 
-/**
- * `permissionMode` → `approvalPolicy`.
- *
- * `'never'` is the default for everything unrecognized, and that is a decision:
- * this runs headless with no human on the other end, so any policy that can
- * raise a `requestApproval` server request converts a stalled approval into an
- * order that hangs past the worker's lease. The adapter still answers those
- * requests defensively (see `handleServerRequest`) — belt and braces, because
- * `approvalPolicy` does not govern every request kind.
- */
+const FILESYSTEM_SANDBOX: Record<NonNullable<StepPermissions['filesystem']>, string> = {
+  'read-only': 'read-only',
+  'workspace-write': 'workspace-write',
+  unrestricted: 'danger-full-access',
+};
+
+function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
+  const issues: PermissionIssue[] = [];
+  if (permissions.tools !== undefined) {
+    issues.push({ field: 'tools', message: 'tool allow-lists are unsupported by this adapter' });
+  }
+  if (permissions.disallowedTools !== undefined) {
+    issues.push({ field: 'disallowedTools', message: 'tool deny-lists are unsupported by this adapter' });
+  }
+  if (permissions.network === 'owenloop-only') {
+    issues.push({
+      field: 'network',
+      message: "network 'owenloop-only' is unsupported by this adapter",
+    });
+  }
+  if (permissions.permissionMode !== undefined && !NATIVE_APPROVAL_POLICIES.has(permissions.permissionMode)) {
+    issues.push({
+      field: 'permissionMode',
+      message: `permissionMode must be one of ${[...NATIVE_APPROVAL_POLICIES].join('|')}`,
+    });
+  }
+  const sandbox = permissions.extensions['sandbox'];
+  if (sandbox !== undefined && (typeof sandbox !== 'string' || !SANDBOX_MODES.has(sandbox))) {
+    issues.push({
+      field: 'sandbox',
+      message: `sandbox must be one of ${[...SANDBOX_MODES].join('|')}`,
+    });
+  }
+  if (
+    permissions.filesystem !== undefined &&
+    typeof sandbox === 'string' &&
+    SANDBOX_MODES.has(sandbox) &&
+    FILESYSTEM_SANDBOX[permissions.filesystem] !== sandbox
+  ) {
+    issues.push({
+      field: 'sandbox',
+      message:
+	`sandbox '${sandbox}' conflicts with filesystem '${permissions.filesystem}' ` +
+	`(which requires '${FILESYSTEM_SANDBOX[permissions.filesystem]}')`,
+    });
+  }
+  return issues;
+}
+
+/** `permissionMode` → `approvalPolicy`, with no invalid-value fallback. */
 function toApprovalPolicy(mode: string | undefined): string {
   if (mode === undefined) return 'never';
   if (NATIVE_APPROVAL_POLICIES.has(mode)) return mode;
-  return 'never';
+  throw new Error(`permissionMode must be one of ${[...NATIVE_APPROVAL_POLICIES].join('|')}`);
 }
 
 function isPlainMap(v: unknown): v is Record<string, unknown> {
@@ -261,6 +302,9 @@ export function buildThreadStartParams(
   args: DeliverArgs,
   onEvent?: (e: AgentEvent) => void,
 ): Record<string, unknown> {
+  // Retained for source compatibility with callers that previously received
+  // fallback diagnostics. Invalid explicit policy now throws instead.
+  void onEvent;
   const ext = args.permissions.extensions;
 
   // The escape hatch: any other config key, without re-opening the contract.
@@ -284,18 +328,8 @@ export function buildThreadStartParams(
     cwd: args.cwd,
     config,
     approvalPolicy: toApprovalPolicy(args.permissions.permissionMode),
-    sandbox: resolveSandbox(ext['sandbox'], onEvent),
+    sandbox: resolveSandbox(args.permissions),
   };
-
-  if (
-    args.permissions.permissionMode !== undefined &&
-    !NATIVE_APPROVAL_POLICIES.has(args.permissions.permissionMode)
-  ) {
-    onEvent?.({
-      kind: 'progress',
-      text: `permissionMode '${args.permissions.permissionMode}' has no approval-policy equivalent; using 'never'`,
-    });
-  }
 
   // Phase 1's precedence rule, verbatim: the per-start override beats the
   // normalized step-def value. Omit the KEY entirely when neither is set —
@@ -307,15 +341,24 @@ export function buildThreadStartParams(
   return params;
 }
 
-/** Validate an `extensions.sandbox` override, dropping anything illegal loudly. */
-function resolveSandbox(raw: unknown, onEvent?: (e: AgentEvent) => void): string {
+/** Resolve the neutral filesystem policy, then the legacy adapter override. */
+function resolveSandbox(permissions: StepPermissions): string {
+  if (permissions.filesystem !== undefined) {
+    const mapped = FILESYSTEM_SANDBOX[permissions.filesystem];
+    const raw = permissions.extensions['sandbox'];
+    if (raw !== undefined && raw !== mapped) {
+      throw new Error(
+	`sandbox '${String(raw)}' conflicts with filesystem '${permissions.filesystem}' ` +
+	  `(which requires '${mapped}')`,
+      );
+    }
+    return mapped;
+  }
+
+  const raw = permissions.extensions['sandbox'];
   if (raw === undefined) return DEFAULT_SANDBOX;
   if (typeof raw === 'string' && SANDBOX_MODES.has(raw)) return raw;
-  onEvent?.({
-    kind: 'progress',
-    text: `ignoring unrecognized sandbox '${String(raw)}'; using '${DEFAULT_SANDBOX}'`,
-  });
-  return DEFAULT_SANDBOX;
+  throw new Error(`sandbox must be one of ${[...SANDBOX_MODES].join('|')}`);
 }
 
 /**
@@ -347,9 +390,9 @@ export function buildTurnStartParams(
  * `sandbox`, `model` and `config`, and a resumed thread that does not re-supply
  * them reverts to the server's defaults.
  *
- * PHASE 4 CLOSED CONTRACT OBSERVATION 1. `deliver`'s third argument used to carry
- * only `cwd` and `owenloopMcp`, so a resume in a different process from the start
- * (the normal case for a re-offered step) had nothing to rebuild `approvalPolicy`
+ * PHASE 4 CLOSED CONTRACT OBSERVATION 1. `deliver`'s third argument originally
+ * carried only `cwd` and `owenloopMcp`, so a resume in a different process from
+ * the start had nothing to rebuild `approvalPolicy`
  * / `sandbox` / `model` from and silently reverted to server defaults. It now
  * carries the normalized `StepPermissions`, so this function derives the SAME
  * params `buildThreadStartParams` would, and `args` WINS over `base` on every
@@ -916,9 +959,68 @@ async function runTurn(
   await Promise.all([client.request('turn/start', params, TURN_START_TIMEOUT_MS), gate.promise]);
 }
 
+const KNOWN_FIELDS = new Set([
+  'name',
+  'description',
+  'tools',
+  'disallowedTools',
+  'filesystem',
+  'network',
+  'permissionMode',
+  'maxTurns',
+  'model',
+  'effort',
+  'sandbox',
+  'mcpServers',
+  'codexConfig',
+]);
+
+function lintStep(bag: Record<string, unknown>, step: string): LintFinding[] {
+  const findings: LintFinding[] = [
+    ...validateHarnessOptions(bag, step),
+    ...codexPreflight(normalizeStepPermissions(bag)).map((issue) => ({
+      severity: 'error' as const,
+      step,
+      message: issue.message,
+      ...(issue.field !== undefined ? { field: issue.field } : {}),
+    })),
+  ];
+  const error = (field: string, message: string): void => {
+    findings.push({ severity: 'error', step, field, message });
+  };
+  const warning = (field: string, message: string): void => {
+    findings.push({ severity: 'warning', step, field, message });
+  };
+
+  for (const key of Object.keys(bag)) {
+    if (!KNOWN_FIELDS.has(key)) {
+      warning(key, `unknown field '${key}' — known fields: ${[...KNOWN_FIELDS].join(', ')}`);
+    }
+  }
+  for (const field of ['mcpServers', 'codexConfig'] as const) {
+    if (field in bag && !isPlainMap(bag[field])) error(field, `${field} must be a map`);
+  }
+  if (isPlainMap(bag['mcpServers']) && 'owenloop' in bag['mcpServers']) {
+    warning('mcpServers', 'mcpServers.owenloop is reserved and is replaced by the worker at start');
+  }
+  if (
+    isPlainMap(bag['codexConfig']) &&
+    isPlainMap(bag['codexConfig']['mcp_servers']) &&
+    'owenloop' in bag['codexConfig']['mcp_servers']
+  ) {
+    warning(
+      'codexConfig',
+      'codexConfig.mcp_servers.owenloop is reserved and is replaced by the worker at start',
+    );
+  }
+  return findings;
+}
+
 export const codexAdapter: HarnessAdapter = {
   id: HARNESS_ID,
   resumeTier: 'native-token',
+  preflight: codexPreflight,
+  lintStep,
 
   /**
    * The command a human runs to re-open this thread in an interactive terminal.

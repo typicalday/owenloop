@@ -77,13 +77,19 @@ export type AgentEvent =
  *
  * Produced by `normalizeStepPermissions` (`./permissions.ts`).
  */
+export type FilesystemPermission = 'read-only' | 'workspace-write' | 'unrestricted';
+export type NetworkPermission = 'owenloop-only' | 'unrestricted';
+
 export interface StepPermissions {
-  /** Allowed tool names. Absent (not `[]`) when the step named none. */
+  /** Allowed tool names. Absent when the step named no allow-list; `[]` means no built-in tools. */
   tools?: string[];
-  /** Denied tool names. Absent (not `[]`) when the step named none. */
+  /** Denied tool names. Absent when the step named no deny-list; an explicit `[]` is preserved. */
   disallowedTools?: string[];
-  /** Opaque, passed through verbatim; each adapter maps it to its own
-   *  vocabulary. Not validated here — `owenloop work lint` already validates the bag. */
+  /** Filesystem authority requested by the workflow definition. */
+  filesystem?: FilesystemPermission;
+  /** Network authority requested by the workflow definition. */
+  network?: NetworkPermission;
+  /** Opaque adapter permission mode. Each adapter validates its own vocabulary. */
   permissionMode?: string;
   /** Only ever a positive integer; anything else was dropped in normalization. */
   maxTurns?: number;
@@ -93,6 +99,13 @@ export interface StepPermissions {
    *  adapter reads its own keys. REQUIRED — always present, possibly `{}` — so
    *  no adapter needs a null check. */
   extensions: Record<string, unknown>;
+}
+
+/** One fail-closed adapter preflight refusal. */
+export interface PermissionIssue {
+  /** The normalized permission field or extension key responsible, when one exists. */
+  field?: string;
+  message: string;
 }
 
 /** Everything an adapter needs to launch one step agent. */
@@ -186,6 +199,12 @@ export interface HarnessAdapter {
   /** Registry key — the adapter's own harness id. Stable across versions. */
   id: string;
   resumeTier: ResumeTier;
+  /**
+   * Mandatory permission preflight. Returns every restriction this adapter cannot
+   * enforce exactly. The worker calls this before start or resume; a non-empty
+   * result means no provider process may be started.
+   */
+  preflight(permissions: StepPermissions): PermissionIssue[];
   /**
    * Launch a NEW session. Resolves at turn end with the session ref.
    *

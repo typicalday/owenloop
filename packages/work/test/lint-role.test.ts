@@ -213,6 +213,15 @@ test('an EMPTY registry is an error finding — lint never pretends it checked',
   }
 });
 
+test('lint reports adapter capability refusals before runtime', () => {
+  const findings = lintOneStep(step({
+    harness: 'codex',
+    harnessOptions: { tools: [], network: 'owenloop-only' },
+  }));
+  assert.ok(findings.some((finding) => finding.field === 'tools' && finding.severity === 'error'));
+  assert.ok(findings.some((finding) => finding.field === 'network' && finding.severity === 'error'));
+});
+
 test('a bag model alongside a first-class step model is a warning', () => {
   // Restored check: the runtime precedence (`step.model` wins) is implemented by
   // the neutral normalizer, so an author who sets both silently loses the bag

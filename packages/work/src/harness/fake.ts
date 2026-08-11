@@ -115,6 +115,7 @@ export function createFakeAdapter(spec: FakeSpec = {}): FakeAdapter {
     id,
     resumeTier: spec.resumeTier ?? 'native-token',
     calls,
+    preflight: () => [],
 
     async start(args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef> {
       calls.push({ kind: 'start', args });

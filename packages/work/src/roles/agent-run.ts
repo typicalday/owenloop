@@ -89,7 +89,7 @@ import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/registry.ts';
 import { parseHarnessCarrier } from '../bundle/fetch.ts';
-import { normalizeStepPermissions } from '../harness/permissions.ts';
+import { normalizeStepPermissions, validateHarnessOptions } from '../harness/permissions.ts';
 import { appendSession, latestFor, sessionsPath, type SessionRecord } from '../harness/session-store.ts';
 import { ensureWorkDir, resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
 import type { ContactHolder, OrderPacket } from '../hub/types.ts';
@@ -199,6 +199,7 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
     case 'misroute':
     case 'no-template':
     case 'no-harness':
+    case 'incompatible-harness-policy':
     case 'unverified-consumed':
     case 'no-submit':
     case 'killed':
@@ -436,6 +437,20 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     } catch (e) {
       err(`owenloop work agent-run: instruction refusal (harness-carrier): ${errMsg(e)}`);
       return null;
+    }
+
+    if (carrier.harnessOptions !== undefined) {
+      const errors = validateHarnessOptions(carrier.harnessOptions, resolved.step.name)
+	.filter((finding) => finding.severity === 'error');
+      if (errors.length > 0) {
+	for (const finding of errors) {
+	  err(
+	    `owenloop work agent-run: instruction refusal (harness-policy): step '${finding.step}' ` +
+	      `x.harness.${finding.field ?? '<bag>'}: ${finding.message}`,
+	  );
+	}
+	return null;
+      }
     }
 
     return {
