@@ -71,6 +71,13 @@ const AUTHOR_ALLOWED_TOOLS = [
   'mcp__owenloop__start_run',
 ];
 
+/** The authoritative author skill plus both committed materializations. */
+const AUTHOR_SKILL_PATHS = [
+  'plugins/_skills/author/SKILL.md',
+  'plugins/claude-code/plugin/skills/author/SKILL.md',
+  'plugins/codex/plugins/owenloop/skills/author/SKILL.md',
+] as const;
+
 /** shift's governed `allowed-tools` set (order-insensitive). The skill
  *  uses only the merged CLI, so the Claude Code frontmatter grants one
  *  tightly scoped Bash prefix. */
@@ -383,6 +390,23 @@ const SKILL_CASES = [
 test('author/SKILL.md exists and references the owenloop tool namespace', () => {
   const content = readText('plugins/claude-code/plugin/skills/author/SKILL.md');
   assert.ok((content).includes('mcp__plugin_owenloop_owenloop__'));
+});
+
+test('all shipped author skills teach the neutral harness carrier and agent-run dispatcher', () => {
+  for (const path of AUTHOR_SKILL_PATHS) {
+    const content = readText(path);
+    assert.ok(content.includes('x.harness'), `${path} must teach x.harness`);
+    assert.ok(content.includes('owenloop work agent-run'), `${path} must name the supported dispatcher`);
+    assert.ok(content.includes('advisory.tools'), `${path} must distinguish advisory tool guidance`);
+    assert.ok(content.includes('not a security boundary'), `${path} must state the advisory boundary`);
+    assert.ok(!content.includes('x.claude-code'), `${path} must not teach the retired carrier`);
+    assert.ok(!content.includes('Stamped-agent dispatch'), `${path} must not teach stamped dispatch`);
+    assert.doesNotMatch(
+      content,
+      /\bstamp(?:ed|s|ing)?\b[\s\S]{0,160}\bper-order agent files?\b/i,
+      `${path} must not instruct the daemon to stamp per-order agent files`,
+    );
+  }
 });
 
 test('author/SKILL.md allowed-tools is exactly the governed set — no Edit/Write, no bare unscoped Bash', () => {
