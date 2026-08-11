@@ -33,8 +33,12 @@ test('SIGINT and SIGTERM clean each foreground shift socket without an end ping'
   try {
     for (const [index, signal] of (['SIGINT', 'SIGTERM'] as const).entries()) {
       const stateDir = join(root, `state-${String(index)}`);
+      const cacheDir = join(root, `cache-${String(index)}`);
       const shift = spawnShift(
-        ['crew-signal', '--origin', origin, '--poll-interval', '25', '--state-dir', stateDir],
+	[
+	  'crew-signal', '--origin', origin, '--poll-interval', '25',
+	  '--cache-dir', cacheDir, '--state-dir', stateDir,
+	],
         { OWENLOOP_TOKEN: TOKEN, XDG_CONFIG_HOME: configDir, NODE_NO_WARNINGS: '1' },
       );
       children.push(shift);

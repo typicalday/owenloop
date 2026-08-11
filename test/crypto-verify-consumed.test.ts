@@ -207,6 +207,16 @@ test('a signed version that differs from the consumer fingerprint fails the vers
   assert.match(verdict.reason, /expected version 4/);
 });
 
+test('a valid historical proof without claim-time expected-version metadata is never verified', async () => {
+  const value = { answer: 42 };
+  const verdict = await verifyConsumed(input({
+    expectedVersion: undefined,
+    proof: proofFor(value, { version: 3 }),
+  }), options);
+  assertFailure(verdict, 'unverifiable');
+  assert.match(verdict.reason, /claim omitted its authoritative expected version/);
+});
+
 test('a target key absent from an available local roster is an invalid chain link', async () => {
   const value = { answer: 42 };
   const verdict = await verifyConsumed(input({ proof: proofFor(value, { producerKeyId: alternateProducer.keyid }), grants: [grantBytes(producer)] }), options);

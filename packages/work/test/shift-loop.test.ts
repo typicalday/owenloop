@@ -6,7 +6,14 @@ import { afterEach, beforeEach, test } from 'node:test';
 
 import { createShiftLoop, MAX_PENDING_CANDIDATE_AGE_MS, type ShiftLoop, type ShiftLoopOptions } from '../src/shift/loop.ts';
 import { buildSpawnPlan, createDefaultSpawner, safeWorkerDiagnostic, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
-import { readChildRecords, readChildReservations, reserveChild, writeChildRecord } from '../src/shift/state.ts';
+import {
+  readChildRecords,
+  readChildReservations,
+  removeChildRecord,
+  reserveChild,
+  ShiftStateRecordError,
+  writeChildRecord,
+} from '../src/shift/state.ts';
 import { sessionsPath } from '../src/harness/session-store.ts';
 import { readStepSpec, writeBundle } from '../src/bundle/cache.ts';
 import type { CachedBundle } from '../src/bundle/types.ts';
@@ -58,7 +65,7 @@ interface MockCfg {
   inbox?: string[];
   perWf?: Record<string, { def?: string; orders: WorkOrder[] }>;
   perWfThrows?: Record<string, Error>;
-  onTargetedWhatsNext?: () => void;
+  onTargetedWhatsNext?: () => void | Promise<void>;
   presenceThrows?: boolean;
   presence?: Array<{ error?: Error }>;
 }
@@ -101,7 +108,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
         }));
         return { text: '', instances };
       }
-      cfg.onTargetedWhatsNext?.();
+      await cfg.onTargetedWhatsNext?.();
       const failure = cfg.perWfThrows?.[req.workflow];
       if (failure !== undefined) throw failure;
       const p = cfg.perWf?.[req.workflow] ?? { orders: [] };
@@ -1625,7 +1632,7 @@ for (const wallJump of [-1_000_000_000, 1_000_000_000]) {
   const direction = wallJump < 0 ? 'backward' : 'forward';
   test(`a ${direction} wall-clock jump cannot expire a fresh claim`, async () => {
     cacheBuilderStep();
-    let wall = 50_000;
+    let wall = 2_000_000_000;
     let monotonic = 0;
     const { hub } = mockHub({
       wake: [{ changed: true, cursor: 1 }],
@@ -1750,25 +1757,28 @@ test('a failing agent-run spawn is reported and removes its reservation and clos
   assert.match(err.join('\n'), /agent-run spawn for wf1\/run_deadbeef failed: fork bomb/);
 });
 
-test('a reservation write failure prevents spawn and removes the losing gate', async () => {
+test('a canonical-path obstruction racing reservation fails closed before spawn', async () => {
   cacheBuilderStep();
-  mkdirSync(stateDir, { recursive: true });
-  mkdirSync(join(stateDir, 'run_reserve_fail.json'));
+  const recordPath = join(stateDir, 'run_reserve_fail.json');
   const { hub } = mockHub({
     wake: [{ changed: true, cursor: 1 }],
     perWf: agentWf([wo('run_reserve_fail', 'builder')]),
+    onTargetedWhatsNext: () => {
+      mkdirSync(recordPath, { recursive: true });
+    },
   });
   const { spawner, spawns } = fakeSpawner();
   const err: string[] = [];
-
-  const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
     workflow: 'wf1',
     err: (line) => err.push(line),
-  })).iterate();
+  }));
 
-  assert.equal(dispatched, 0);
+  await assert.rejects(
+    loop.iterate(),
+    (error: unknown) => error instanceof ShiftStateRecordError && error.path === recordPath,
+  );
   assert.equal(spawns.length, 0, 'spawn is unreachable until the reservation is durable');
-  assert.equal(readChildReservations(stateDir).length, 0);
   assert.equal(readdirSync(stateDir).some((name) => name.endsWith('.gate')), false);
   assert.match(err.join('\n'), /agent-run spawn for wf1\/run_reserve_fail failed:/u);
 });
@@ -1790,17 +1800,22 @@ test('a PID-record finalization failure terminates the gated child and never ope
   };
   const err: string[] = [];
 
-  const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
     workflow: 'wf1',
     err: (line) => err.push(line),
-  })).iterate();
+  }));
 
-  assert.equal(dispatched, 0);
+  await assert.rejects(
+    loop.iterate(),
+    (error: unknown) =>
+      error instanceof ShiftStateRecordError
+      && error.path === join(stateDir, 'run_finalize_fail.json'),
+  );
   assert.equal(terminated, 1, 'the spawned process is terminated after PID persistence fails');
   assert.equal(gatePath === undefined ? true : existsSync(gatePath), false, 'the child never observes a start signal');
-  assert.equal(readChildRecords(stateDir).length, 0);
-  assert.equal(readChildReservations(stateDir).length, 0);
-  assert.match(err.join('\n'), /child reservation .* is missing or was replaced/u);
+  assert.equal(existsSync(join(stateDir, 'run_finalize_fail.json')), true, 'the corrupt canonical path remains for operator repair');
+  assert.match(err.join('\n'), /canonical record is unreadable/u);
+  assert.match(err.join('\n'), /failed to cancel dispatch reservation/u);
 });
 
 test('a broken state-directory path fails closed before hub polling or spawn', async () => {
@@ -1817,6 +1832,86 @@ test('a broken state-directory path fails closed before hub polling or spawn', a
   assert.equal(calls.length, 1, 'presence may run before local state reconciliation');
   assert.equal(calls[0]?.verb, 'presence');
   assert.equal(spawns.length, 0);
+});
+
+test('a corrupt canonical state record disables dispatch before work polling or spawn', async () => {
+  cacheBuilderStep();
+  mkdirSync(stateDir, { recursive: true });
+  const broken = join(stateDir, 'broken.json');
+  writeFileSync(broken, '{ truncated');
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_never', 'builder')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1', cap: 1 }));
+
+  await assert.rejects(
+    loop.iterate(),
+    (error: unknown) =>
+      error instanceof ShiftStateRecordError
+      && error.path === broken
+      && error.message.includes('dispatch is disabled'),
+  );
+  assert.deepEqual(calls.map((call) => call.verb), ['presence']);
+  assert.equal(spawns.length, 0);
+});
+
+test('two direct Shift loops sharing one state directory serialize capacity reservation', async () => {
+  cacheBuilderStep();
+  let arrivals = 0;
+  let releaseBarrier: (() => void) | undefined;
+  const barrier = new Promise<void>((resolve) => {
+    releaseBarrier = resolve;
+  });
+  const meetAtTargetedPoll = async (): Promise<void> => {
+    arrivals += 1;
+    if (arrivals === 2) releaseBarrier?.();
+    await barrier;
+  };
+  const firstHub = mockHub({
+    wake: [{ changed: true, cursor: 1 }, { changed: false, cursor: 1 }],
+    perWf: agentWf([wo('run_direct_a', 'builder')]),
+    onTargetedWhatsNext: meetAtTargetedPoll,
+  });
+  const secondHub = mockHub({
+    wake: [{ changed: true, cursor: 1 }, { changed: false, cursor: 1 }],
+    perWf: agentWf([wo('run_direct_b', 'builder')]),
+    onTargetedWhatsNext: meetAtTargetedPoll,
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const firstOut: string[] = [];
+  const secondOut: string[] = [];
+  const firstLoop = createShiftLoop(baseOpts(firstHub.hub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    maxConcurrentAgents: 1,
+    out: (line) => firstOut.push(line),
+  }));
+  const secondLoop = createShiftLoop(baseOpts(secondHub.hub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    maxConcurrentAgents: 1,
+    out: (line) => secondOut.push(line),
+  }));
+
+  const results = await Promise.all([firstLoop.iterate(), secondLoop.iterate()]);
+
+  assert.deepEqual([...results].sort(), [0, 1]);
+  assert.equal(spawns.length, 1);
+  const inFlight = [...readChildRecords(stateDir), ...readChildReservations(stateDir)];
+  assert.equal(inFlight.length, 1, 'one durable slot carries capacity after the dispatch race');
+  assert.match([...firstOut, ...secondOut].join('\n'), /lost a shared-capacity race/u);
+
+  const losingIndex = results[0] === 0 ? 0 : 1;
+  const losingLoop = losingIndex === 0 ? firstLoop : secondLoop;
+  const losingRun = losingIndex === 0 ? 'run_direct_a' : 'run_direct_b';
+  removeChildRecord(stateDir, inFlight[0]!.run);
+
+  assert.equal(await losingLoop.iterate(), 1, 'the losing loop retained its already-claimed candidate locally');
+  assert.deepEqual(spawns.map((spawn) => spawn.run), [inFlight[0]!.run, losingRun]);
+  const losingHubCalls = losingIndex === 0 ? firstHub.calls : secondHub.calls;
+  assert.equal(count(losingHubCalls, 'whats_next'), 1, 'retry used the local queue without another hub sweep');
 });
 
 test('a fresh same-run reservation consumes capacity and suppresses a hub re-offer', async () => {

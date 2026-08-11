@@ -95,6 +95,7 @@ export type AgentRunOutcome =
   | 'no-template' // no cached bundle / no step spec for the step (exit 1)
   | 'no-harness' // the resolved harness id names no registered adapter (exit 1)
   | 'unverified-consumed' // dynamic values or rejection reasons failed verification (exit 1)
+  | 'session-store-failed' // durable active-row gate failed before provider work (exit 1)
   | 'no-submit' // the turn ended and the confirm grace expired with no outcome (exit 1)
   | 'killed' // a signal aimed at the worker tore the session down + released (exit 1)
   | 'lease-lost' // the lease went terminal without an outcome (exit 1)
@@ -342,6 +343,8 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
    *  `SessionRecord.deliveredReasonAt`. Carried forward from the prior record
    *  when this firing delivered no new reasons, so it can never regress. */
   let deliveredReasonAt: number | undefined;
+  /** Captures a thrown safety-gate append from the synchronous `started` event. */
+  let activePersistenceFailure: unknown;
 
   let resolveOrder: ((res: GetOrderResponse) => void) | undefined;
   const orderReady = new Promise<GetOrderResponse>((r) => {
@@ -444,9 +447,16 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       case 'started':
         sessionRef = e.ref;
         opts.err(`owenloop work agent-run: session started for ${order} (harness '${e.ref.harness}')`);
-        // Persist on the EVENT, not on the start() resolve, so a mid-turn crash
-        // still leaves a resumable record behind (the contract requires this).
-        record('active');
+	// This synchronous event is the cold-start gate. The adapter must not
+	// begin provider work until the callback returns. A thrown durable append
+	// therefore aborts the turn before delivery and is handled separately
+	// from an ordinary harness failure below.
+	try {
+	  record('active');
+	} catch (error) {
+	  activePersistenceFailure = error;
+	  throw error;
+	}
         return;
       case 'progress':
         opts.err(`owenloop work agent-run: ${e.text}`);
@@ -663,8 +673,11 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       `owenloop work agent-run: hosting ${order} (step '${packet.step}', harness '${resolution.id}', attempt ${attempt}, ${path})`,
     );
 
+    type TurnResult = { t: 'turn'; failure?: unknown; persistenceFailure?: unknown };
+
     /** Cold-start this firing. Shared by the ordinary path and the fallback. */
-    async function coldStart(): Promise<{ t: 'turn'; failure?: unknown }> {
+    async function coldStart(): Promise<TurnResult> {
+      activePersistenceFailure = undefined;
       try {
         const ref = await active.start(coldArgs(), onEvent);
         sessionRef = ref;
@@ -676,6 +689,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
         markDelivered();
         return { t: 'turn' };
       } catch (e: unknown) {
+	if (activePersistenceFailure !== undefined) {
+	  await teardown();
+	  return { t: 'turn', persistenceFailure: activePersistenceFailure };
+	}
         return { t: 'turn', failure: e };
       }
     }
@@ -685,7 +702,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
      * settle shapes are folded into one 'turn' result on purpose (the closed
      * contract question — see this file's header).
      */
-    async function chooseTurn(): Promise<{ t: 'turn'; failure?: unknown }> {
+    async function chooseTurn(): Promise<TurnResult> {
       if (!resumable || prev === null) return coldStart();
 
       // Resume keeps the PRIOR token, so the store shows two rows for the same
@@ -700,8 +717,14 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       );
       // Deliberately written with the PRIOR watermark: nothing has been delivered
       // yet, and this row is what the next firing reads if this turn never
-      // completes. See `markDelivered`.
-      record('active');
+      // completes. See `markDelivered`. This durable write is also the resume
+      // delivery gate; failure stops the old provider session without delivery.
+      try {
+	record('active');
+      } catch (error) {
+	await teardown();
+	return { t: 'turn', persistenceFailure: error };
+      }
 
       try {
         await active.deliver(sessionRef, delta.message, deliverArgs, onEvent);
@@ -742,6 +765,14 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       }
       opts.err(`owenloop work agent-run: lease ${raced.o} mid-turn — tore the session down, no outcome observed`);
       return mapLeaseDuringTurn(raced.o);
+    }
+
+    if (raced.persistenceFailure !== undefined) {
+      opts.err(
+	`owenloop work agent-run: durable active-session persistence failed before provider delivery for ${order}: ` +
+	`${errMsg(raced.persistenceFailure)} — releasing`,
+      );
+      return releaseWith('session-store-failed', 'session-store-failed');
     }
 
     // TURN END — NOT task end. Log the failure shape for humans, then confirm.

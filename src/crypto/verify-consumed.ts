@@ -285,6 +285,11 @@ export async function verifyConsumed(
     const link = chain.reason.includes('outside the effective scope') ? 'scope' : 'chain';
     return invalid(`${link}: ${chain.reason}`);
   }
+  if (input.expectedVersion === undefined) {
+    return unverifiable(
+      `version: artifact '${input.path}' has a valid historical proof, but the claim omitted its authoritative expected version`,
+    );
+  }
   return { kind: 'verified', producerKeyId: verifiedKeyId, principal: chain.principal, version: produced.version };
 }
 

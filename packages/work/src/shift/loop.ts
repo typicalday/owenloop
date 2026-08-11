@@ -51,8 +51,10 @@
  * `setShift` also resets the presence timer so the new identity reaches the hub
  * on the very next `iterate()`.
  */
+import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
+import { acquireFileLockSync, releaseFileLock } from '../../../../src/lock.ts';
 import { readDispatchBundle } from '../bundle/cache.ts';
 import type { HubClient } from '../hub/client.ts';
 import { HubError, type WorkOrder } from '../hub/types.ts';
@@ -68,6 +70,7 @@ import {
   ensureStateDir,
   type ChildRecord,
   type ChildReservation,
+  type ReservedChild,
   type Liveness,
 } from './state.ts';
 import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../agent/workdir.ts';
@@ -305,18 +308,58 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     return result;
   }
 
-  function dispatchCandidate(c: Candidate): boolean {
+  type DispatchResult =
+    | 'dispatched'
+    | 'duplicate'
+    | 'total-capacity'
+    | 'agent-capacity'
+    | 'failed';
+
+  /**
+   * Recheck shared capacity and create the per-run reservation while holding one
+   * state-directory-wide lock. The lock ends before spawn: the durable
+   * reservation, not a long critical section, protects capacity during spawn.
+   */
+  function reserveCandidate(c: Candidate): ReservedChild | Exclude<DispatchResult, 'dispatched' | 'failed'> {
     const childKind = c.kind === 'command' ? 'exec' : 'agent-run';
-    let reservation: ChildReservation | undefined;
-    let terminate: (() => void) | undefined;
+    const dispatchLock = acquireFileLockSync(join(opts.stateDir, '.dispatch.lock'), {
+      waitMs: 30_000,
+      label: 'owenloop Shift dispatch',
+    });
     try {
-      const reserved = reserveChild(opts.stateDir, {
+      const fresh = reconcileInFlight(opts.stateDir, {
+	...(isAlive === undefined ? {} : { isAlive }),
+	now: opts.now(),
+      });
+      if (
+	fresh.live.some((record) => record.run === c.order.run) ||
+	fresh.reserved.some((record) => record.run === c.order.run)
+      ) return 'duplicate';
+      if (fresh.live.length + fresh.reserved.length >= cap) return 'total-capacity';
+      if (childKind === 'agent-run') {
+	const agents = fresh.live.filter((record) => record.kind === 'agent-run').length +
+	  fresh.reserved.filter((record) => record.childKind === 'agent-run').length;
+	if (agents >= (opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS)) return 'agent-capacity';
+      }
+      return reserveChild(opts.stateDir, {
         workflow: c.workflow,
         run: c.order.run,
 	reservedAt: opts.now(),
 	childKind,
         step: c.order.step,
       });
+    } finally {
+      releaseFileLock(dispatchLock);
+    }
+  }
+
+  function dispatchCandidate(c: Candidate): DispatchResult {
+    const childKind = c.kind === 'command' ? 'exec' : 'agent-run';
+    let reservation: ChildReservation | undefined;
+    let terminate: (() => void) | undefined;
+    try {
+      const reserved = reserveCandidate(c);
+      if (typeof reserved === 'string') return reserved;
       reservation = reserved.reservation;
       const spawned = opts.spawner({
         workflow: c.workflow,
@@ -347,7 +390,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	`dispatched ${c.kind === 'command' ? 'command' : 'agent-run'} ${c.workflow}/${c.order.run} ` +
 	`(step '${c.order.step}', pid ${spawned.pid})`,
       );
-      return true;
+      return 'dispatched';
     } catch (e) {
       terminate?.();
       if (reservation !== undefined) {
@@ -370,7 +413,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       });
       const prefix = c.kind === 'command' ? 'spawn' : 'agent-run spawn';
       opts.err(`${prefix} for ${c.workflow}/${c.order.run} failed: ${message}`);
-      return false;
+      return 'failed';
     }
   }
 
@@ -411,10 +454,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       // blocked agent does not head-of-line-block the whole queue.
       if (candidate.kind === 'agent' && agentRoom <= 0) continue;
 
-      // Remove before spawning. A spawn failure falls back to the hub pickup
-      // window instead of retrying every poll with a broken local runtime.
+      const result = dispatchCandidate(candidate);
+      if (result === 'total-capacity') break;
+      if (result === 'agent-capacity') continue;
       pendingCandidates.delete(run);
-      if (!dispatchCandidate(candidate)) continue;
+      if (result !== 'dispatched') continue;
 
       dispatched++;
       remaining--;
@@ -660,7 +704,20 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 
     for (const candidate of candidates) {
       if (discardExpiredCandidate(candidate, false)) continue;
-      if (dispatchCandidate(candidate)) dispatched++;
+      const result = dispatchCandidate(candidate);
+      if (result === 'dispatched') {
+	dispatched++;
+	continue;
+      }
+      if (result === 'total-capacity' || result === 'agent-capacity') {
+	pendingCandidates.set(candidate.order.run, candidate);
+	const limit = result === 'total-capacity'
+	  ? `dispatch cap (${cap})`
+	  : `agent-run cap (${opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS})`;
+	opts.out(
+	  `[${candidate.workflow}/${candidate.order.run}] lost a shared-capacity race at the ${limit} — queued for local dispatch`,
+	);
+      }
     }
 
     return { dispatched, polled, openRuns, complete };

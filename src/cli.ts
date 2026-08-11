@@ -3840,11 +3840,12 @@ function assertUniqueBundleStepNames(defs: ReadonlyMap<string, WorkflowDef>): vo
 function orderSelectedDefsByCalls(
   selected: WorkflowDef[],
   currentPackage?: string,
-): WorkflowDef[] {
+): { ordered: WorkflowDef[]; dependencies: Map<string, Set<string>> } {
   const selectedByName = new Map(selected.map((def) => [def.name, def]));
   const state = new Map<string, 'visiting' | 'done'>();
   const stack: string[] = [];
   const ordered: WorkflowDef[] = [];
+  const dependencies = new Map<string, Set<string>>();
   const localPrefix = currentPackage === undefined ? undefined : `${currentPackage}/`;
 
   const localTarget = (target: string | undefined): string | undefined => {
@@ -3871,6 +3872,7 @@ function orderSelectedDefsByCalls(
 	.map((step) => localTarget(step.calls))
 	.filter((target): target is string => target !== undefined),
     );
+    dependencies.set(def.name, targets);
     for (const target of targets) visit(selectedByName.get(target)!);
     stack.pop();
     state.set(def.name, 'done');
@@ -3878,7 +3880,7 @@ function orderSelectedDefsByCalls(
   };
 
   for (const def of selected) visit(def);
-  return ordered;
+  return { ordered, dependencies };
 }
 
 /**
@@ -3979,7 +3981,9 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   if (selected.length === 0) {
     throw new CliError(`nothing to push — no workflow definitions found in ${defsDir}`);
   }
-  selected = orderSelectedDefsByCalls(selected, bundle?.manifest.package.name);
+  const selectedOrder = orderSelectedDefsByCalls(selected, bundle?.manifest.package.name);
+  selected = selectedOrder.ordered;
+  const selectedDependencies = selectedOrder.dependencies;
 
   // Client-side validation gate — all-or-nothing, mirroring dispatchAdd exactly.
   // Any failure aborts the entire push; nothing is sent.
@@ -4095,10 +4099,20 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   const noopNames: string[] = [];
   const failed: { name: string; error: string }[] = [];
   const skipped: string[] = [];
+  const unsuccessful = new Set<string>();
 
   for (let i = 0; i < toPush.length; i++) {
     const c = toPush[i]!;
     const label = c.status === 'new' ? '+' : '~';
+    const blockedBy = [...(selectedDependencies.get(c.name) ?? [])]
+      .filter((dependency) => unsuccessful.has(dependency))
+      .sort();
+    if (blockedBy.length > 0) {
+      skipped.push(c.name);
+      unsuccessful.add(c.name);
+      io.err(`- ${c.name} (skipped: selected dependency ${blockedBy.map((name) => `'${name}'`).join(', ')} failed or was skipped)`);
+      continue;
+    }
     try {
       let res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
       if (res.status === 401 && cred.kind === 'oauth') {
@@ -4138,9 +4152,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       if (e instanceof RateLimitError) {
         const msg = e.message;
         failed.push({ name: c.name, error: msg });
+	unsuccessful.add(c.name);
         io.err(`! ${c.name} (failed: ${msg})`);
         const remainder = toPush.slice(i + 1).map((r) => r.name);
         skipped.push(...remainder);
+	for (const name of remainder) unsuccessful.add(name);
         if (remainder.length > 0) {
           io.err(`stopping — rate limited by the hub; ${remainder.length} def(s) not attempted`);
         }
@@ -4153,6 +4169,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       }
       const msg = (e as Error).message;
       failed.push({ name: c.name, error: msg });
+      unsuccessful.add(c.name);
       io.err(`! ${c.name} (failed: ${msg})`);
     }
   }

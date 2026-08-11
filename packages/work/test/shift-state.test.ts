@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -14,6 +14,7 @@ import {
   reserveChild,
   resolveStateDir,
   startReservedChild,
+  ShiftStateRecordError,
   writeChildRecord,
   type ChildRecord,
 } from '../src/shift/state.ts';
@@ -81,19 +82,156 @@ test('reconcileInFlight keeps live records and reaps dead ones', () => {
   assert.deepEqual(readChildRecords(dir).map((r) => r.run), ['run_alive000']);
 });
 
-test('reconcileInFlight dedupes by run id (never double-counts capacity)', () => {
-  // Two files that both decode to the same run would be pathological; simulate a
-  // stray extra file for the same run and assert only one live record returns.
+test('a canonical pathname that does not match the record run fails closed', () => {
+  const broken = join(dir, 'stray.json');
   writeChildRecord(dir, rec({ run: 'run_dup00000', pid: 7 }));
-  writeFileSync(join(dir, 'stray.json'), JSON.stringify(rec({ run: 'run_dup00000', pid: 7 })));
-  const { live } = reconcileInFlight(dir, () => true);
-  assert.equal(live.filter((r) => r.run === 'run_dup00000').length, 1);
+  writeFileSync(broken, JSON.stringify(rec({ run: 'run_dup00000', pid: 7 })));
+
+  assert.throws(
+    () => reconcileInFlight(dir, () => true),
+    (error: unknown) =>
+      error instanceof ShiftStateRecordError
+      && error.path === broken
+      && error.message.includes('pathname does not match its run identity')
+      && error.message.includes('dispatch is disabled')
+      && error.message.includes('verifying that no child still owns the slot'),
+  );
 });
 
-test('a corrupt record file is skipped, not fatal', () => {
+test('malformed child kind and optional fields fail closed instead of weakening capacity accounting', () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['kind', { kind: 'other' }],
+    ['def', { def: 7 }],
+    ['hash', { hash: false }],
+    ['step', { step: ['builder'] }],
+    ['spawned-at', { spawnedAt: -1 }],
+  ];
+
+  for (const [suffix, fields] of cases) {
+    const run = `run_bad_${suffix}`;
+    const broken = join(dir, `${run}.json`);
+    writeFileSync(broken, JSON.stringify({ ...rec({ run }), ...fields }));
+    assert.throws(
+      () => reconcileInFlight(dir, () => true),
+      (error: unknown) =>
+	      error instanceof ShiftStateRecordError
+	      && error.path === broken
+	      && error.message.includes('canonical child fields are malformed')
+	      && error.message.includes('dispatch is disabled'),
+    );
+    rmSync(broken);
+  }
+});
+
+test('a malformed child start-gate token fails closed at the canonical record', () => {
+  const run = 'run_bad_gate';
+  const broken = join(dir, `${run}.json`);
+  writeFileSync(broken, JSON.stringify({ ...rec({ run }), gateToken: 'not-a-token' }));
+
+  assert.throws(
+    () => reconcileInFlight(dir, () => true),
+    (error: unknown) =>
+      error instanceof ShiftStateRecordError
+      && error.path === broken
+      && error.message.includes('canonical child fields are malformed')
+      && error.message.includes('dispatch is disabled'),
+  );
+});
+
+test('an unknown state record type fails closed instead of being treated as a child', () => {
+  const run = 'run_bad_type';
+  const broken = join(dir, `${run}.json`);
+  writeFileSync(broken, JSON.stringify({ ...rec({ run }), recordType: 'other' }));
+
+  assert.throws(
+    () => reconcileInFlight(dir, () => true),
+    (error: unknown) =>
+      error instanceof ShiftStateRecordError
+      && error.path === broken
+      && error.message.includes('canonical child fields are malformed')
+      && error.message.includes('dispatch is disabled'),
+  );
+});
+
+test('malformed reservation fields fail closed at the canonical record', () => {
+  for (const [suffix, fields] of [
+    ['step', { step: 7 }],
+    ['reserved-at', { reservedAt: -1 }],
+  ] as const) {
+    const run = `run_bad_reservation_${suffix}`;
+    const broken = join(dir, `${run}.json`);
+    writeFileSync(broken, JSON.stringify({
+      recordType: 'reservation',
+      workflow: 'wf1',
+      run,
+      reservedAt: 1000,
+      token: 'a'.repeat(32),
+      childKind: 'exec',
+      ...fields,
+    }));
+
+    assert.throws(
+      () => reconcileInFlight(dir, () => true),
+      (error: unknown) =>
+	      error instanceof ShiftStateRecordError
+	      && error.path === broken
+	      && error.message.includes('canonical reservation fields are malformed')
+	      && error.message.includes('dispatch is disabled'),
+    );
+    rmSync(broken);
+  }
+});
+
+test('empty workflow or run identity fails closed', () => {
+  const cases: Array<[string, ChildRecord]> = [
+    ['empty-workflow.json', rec({ workflow: '', run: 'empty-workflow' })],
+    ['.json', rec({ run: '' })],
+  ];
+
+  for (const [name, record] of cases) {
+    const broken = join(dir, name);
+    writeFileSync(broken, JSON.stringify(record));
+    assert.throws(
+      () => reconcileInFlight(dir, () => true),
+      (error: unknown) =>
+	      error instanceof ShiftStateRecordError
+	      && error.path === broken
+	      && error.message.includes('missing workflow or run identity')
+	      && error.message.includes('dispatch is disabled'),
+    );
+    rmSync(broken);
+  }
+});
+
+test('a truncated canonical record fails closed with its exact repair path', () => {
+  const broken = join(dir, 'broken.json');
   writeChildRecord(dir, rec({ run: 'run_ok000000' }));
-  writeFileSync(join(dir, 'broken.json'), '{ not json');
-  assert.deepEqual(readChildRecords(dir).map((r) => r.run), ['run_ok000000']);
+  writeFileSync(broken, '{ not json');
+
+  assert.throws(
+    () => readChildRecords(dir),
+    (error: unknown) =>
+      error instanceof ShiftStateRecordError
+      && error.path === broken
+      && error.message.includes('truncated or is not valid JSON')
+      && error.message.includes('dispatch is disabled')
+      && error.message.includes('verifying that no child still owns the slot'),
+  );
+});
+
+test('an unreadable canonical record fails closed with its exact repair path', () => {
+  const broken = join(dir, 'broken.json');
+  mkdirSync(broken);
+
+  assert.throws(
+    () => reconcileInFlight(dir, () => true),
+    (error: unknown) =>
+      error instanceof ShiftStateRecordError
+      && error.path === broken
+      && error.message.includes('canonical record is unreadable')
+      && error.message.includes('dispatch is disabled')
+      && error.message.includes('repaired or removed'),
+  );
 });
 
 test('reads of a missing state dir are empty, not an error', () => {
@@ -189,6 +327,46 @@ test('fresh reservations survive restart and expired reservations are cancelled 
   assert.equal(existsSync(fresh.gatePath), true);
   assert.equal(existsSync(expired.gatePath), false);
   assert.deepEqual(readChildReservations(dir).map((reservation) => reservation.run), ['run_fresh']);
+});
+
+test('a reservation whose worker removed the timed-out gate is cancelled despite a fresh wall-clock age', () => {
+  const timedOut = reserveChild(dir, {
+    workflow: 'wf1',
+    run: 'run_gate_timed_out',
+    reservedAt: 1_000,
+    childKind: 'exec',
+  });
+  rmSync(timedOut.gatePath);
+
+  const reconciled = reconcileInFlight(dir, {
+    isAlive: () => true,
+    now: 1_050,
+    reservationMaxAgeMs: 10_000,
+  });
+
+  assert.deepEqual(reconciled.reserved, []);
+  assert.deepEqual(reconciled.abandoned.map((reservation) => reservation.run), ['run_gate_timed_out']);
+  assert.deepEqual(readChildReservations(dir), []);
+});
+
+test('a future reservation timestamp after wall-clock rollback is cancelled instead of extending capacity', () => {
+  const future = reserveChild(dir, {
+    workflow: 'wf1',
+    run: 'run_future',
+    reservedAt: 2_000,
+    childKind: 'exec',
+  });
+
+  const reconciled = reconcileInFlight(dir, {
+    isAlive: () => true,
+    now: 1_000,
+    reservationMaxAgeMs: 10_000,
+  });
+
+  assert.deepEqual(reconciled.reserved, []);
+  assert.deepEqual(reconciled.abandoned.map((reservation) => reservation.run), ['run_future']);
+  assert.equal(existsSync(future.gatePath), false);
+  assert.deepEqual(readChildReservations(dir), []);
 });
 
 test('defaultIsAlive: this very process is alive; a pathological pid is not', () => {

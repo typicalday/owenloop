@@ -15,7 +15,7 @@ import {
   ShiftClientError,
   shiftSocketPath,
 } from '../src/shift/client.ts';
-import { parseStartArgs } from '../src/roles/shift.ts';
+import { parseStartArgs, shiftDaemonClientPlatformError } from '../src/roles/shift.ts';
 
 const BIN = fileURLToPath(new URL('../../../bin/owenloop.mjs', import.meta.url));
 const roots: string[] = [];
@@ -48,6 +48,17 @@ test('state-dir and start parser preserve explicit crews versus --all and reject
   assert.deepEqual(parseStartArgs(['--all']).serveCrews, []);
   assert.match(parseStartArgs([]).error!, /at least one crew.*--all/);
   assert.match(parseStartArgs(['--all', 'alpha']).error!, /cannot be combined/);
+});
+
+test('every public Shift daemon client command refuses Windows named-pipe assumptions', () => {
+  for (const command of ['next', 'status', 'end'] as const) {
+    assert.match(
+      shiftDaemonClientPlatformError(command, 'win32') ?? '',
+      new RegExp(`owenloop shift ${command}: .*not supported on Windows.*named-pipe transport`, 'u'),
+    );
+    assert.equal(shiftDaemonClientPlatformError(command, 'darwin'), undefined);
+    assert.equal(shiftDaemonClientPlatformError(command, 'linux'), undefined);
+  }
 });
 
 test('requestShift sends one JSON line and parses a fragmented live response', async () => {

@@ -61,6 +61,20 @@ function callsDef(name: string, stepName: string, target?: string): string {
       ].join('\n');
 }
 
+function callsManyDef(name: string, targets: string[]): string {
+  return [
+    `name: ${name}`,
+    `outputs: [${targets.map((_, index) => `result-${index}`).join(', ')}]`,
+    'steps:',
+    ...targets.flatMap((target, index) => [
+      `  - name: call-${index}`,
+      `    calls: ${target}`,
+      `    produces: [result-${index}]`,
+    ]),
+    '',
+  ].join('\n');
+}
+
 function writeDefs(cwd: string, defs: Record<string, string>): void {
   const dir = join(cwd, 'workflows');
   mkdirSync(dir, { recursive: true });
@@ -421,6 +435,141 @@ test('push --bundle deterministically orders mixed bare and same-package calls e
       .map((call) => defName(call.body)),
     ['leaf', 'middle', 'parent'],
   );
+});
+
+test('push --bundle skips a bare-calls dependent after its selected dependency fails and continues independently', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    parent: callsDef('parent', 'delegate-child', 'child'),
+    child: callsDef('child', 'build-child'),
+    independent: callsDef('independent', 'build-independent'),
+  });
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const create = hub.routes['POST /api/create_workflow']!;
+  hub.routes['POST /api/create_workflow'] = (req) =>
+    defName(req.body) === 'child'
+      ? { status: 200, json: { ok: false, error: 'synthetic child failure' } }
+      : create(req);
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'parent', 'child', 'independent', '--bundle', bundle.path], t.io);
+
+  assert.equal(code, 1);
+  const createNames = calls
+    .filter((call) => call.pathname === '/api/create_workflow')
+    .map((call) => defName(call.body));
+  assert.deepEqual(new Set(createNames), new Set(['child', 'independent']));
+  assert.equal(createNames.includes('parent'), false, 'the skipped dependent sends no request');
+  const result = JSON.parse(t.out.join('\n')) as {
+    pushed: string[];
+    skipped: string[];
+    failed: Array<{ name: string }>;
+  };
+  assert.deepEqual(result.pushed, ['independent']);
+  assert.deepEqual(result.skipped, ['parent']);
+  assert.deepEqual(result.failed.map((failure) => failure.name), ['child']);
+  assert.match(t.err.join('\n'), /parent \(skipped: selected dependency 'child' failed or was skipped\)/u);
+});
+
+test('push --bundle propagates a selected dependency failure through bare and same-package calls', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    parent: callsDef('parent', 'delegate-middle', 'push-test-bundle/middle'),
+    middle: callsDef('middle', 'delegate-leaf', 'leaf'),
+    leaf: callsDef('leaf', 'build-leaf'),
+    independent: callsDef('independent', 'build-independent-transitive'),
+  });
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const create = hub.routes['POST /api/create_workflow']!;
+  hub.routes['POST /api/create_workflow'] = (req) =>
+    defName(req.body) === 'leaf'
+      ? { status: 500, json: { error: 'synthetic leaf failure' } }
+      : create(req);
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'parent', 'middle', 'leaf', 'independent', '--bundle', bundle.path], t.io);
+
+  assert.equal(code, 1);
+  const createNames = calls
+    .filter((call) => call.pathname === '/api/create_workflow')
+    .map((call) => defName(call.body));
+  assert.deepEqual(new Set(createNames), new Set(['leaf', 'independent']));
+  const result = JSON.parse(t.out.join('\n')) as { skipped: string[]; failed: Array<{ name: string }> };
+  assert.deepEqual([...result.skipped].sort(), ['middle', 'parent']);
+  assert.deepEqual(result.failed.map((failure) => failure.name), ['leaf']);
+  assert.match(t.err.join('\n'), /middle \(skipped: selected dependency 'leaf' failed or was skipped\)/u);
+  assert.match(t.err.join('\n'), /parent \(skipped: selected dependency 'middle' failed or was skipped\)/u);
+});
+
+test('push --bundle reports multiple failed selected dependencies in sorted order', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    parent: callsManyDef('parent', ['z-dep', 'a-dep']),
+    'z-dep': callsDef('z-dep', 'build-z-dep'),
+    'a-dep': callsDef('a-dep', 'build-a-dep'),
+  });
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  hub.routes['POST /api/create_workflow'] = (req) => ({
+    status: 200,
+    json: { ok: false, error: `synthetic ${defName(req.body)} failure` },
+  });
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'parent', 'z-dep', 'a-dep', '--bundle', bundle.path], t.io);
+
+  assert.equal(code, 1);
+  assert.deepEqual(
+    calls
+      .filter((call) => call.pathname === '/api/create_workflow')
+      .map((call) => defName(call.body))
+      .sort(),
+    ['a-dep', 'z-dep'],
+  );
+  assert.match(
+    t.err.join('\n'),
+    /parent \(skipped: selected dependency 'a-dep', 'z-dep' failed or was skipped\)/u,
+  );
+});
+
+test('push --bundle treats an unchanged selected dependency as successful', async () => {
+  const childYaml = callsDef('child', 'build-unchanged-child');
+  const hub = makeFakeHub([{ name: 'child', yaml: childYaml }]);
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd, 'placeholder', {
+    parent: callsDef('parent', 'delegate-unchanged-child', 'child'),
+    child: childYaml,
+  });
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+  bind(t);
+
+  const code = await mainAsync(['push', 'parent', 'child', '--bundle', bundle.path], t.io);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(
+    calls
+      .filter((call) => call.pathname === '/api/create_workflow')
+      .map((call) => defName(call.body)),
+    ['child', 'parent'],
+  );
+  const result = JSON.parse(t.out.join('\n')) as { pushed: string[]; noop: string[]; skipped: string[] };
+  assert.deepEqual(result.noop, ['child']);
+  assert.deepEqual(result.pushed, ['parent']);
+  assert.deepEqual(result.skipped, []);
 });
 
 test('push: first push sends every def, all land as new on the fake hub, exits 0', async () => {

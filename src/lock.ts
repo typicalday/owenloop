@@ -1,38 +1,42 @@
-/**
- * Generic cross-process file lock.
- *
- * The lock is a SQLite `BEGIN IMMEDIATE` transaction held on `lockPath`. SQLite
- * owns the operating-system file lock and ties that lock to the open
- * `DatabaseSync` connection. Closing the connection, normal process exit, or a
- * process crash releases the lock without deleting or replacing the path.
- *
- * The previous exclusive-create lockfile design had no atomic compare-and-unlink
- * operation: a stale reclaimer or releaser could inspect one pathname object and
- * then delete a fresh replacement. This implementation never unlinks the lock
- * database. A small `.owner.json` sidecar is diagnostics only and is never an
- * ownership primitive.
- *
- * Compatibility tradeoff: a non-empty pre-SQLite lockfile is treated as a
- * conservative legacy lock and is never automatically deleted. The holder may
- * still be live, and the available portable path APIs cannot prove and remove
- * that exact object atomically. Wait for the old process to release it, or remove
- * the legacy file manually after verifying that no old Owenloop process owns it.
- * Once a lock has been acquired by this implementation, crash cleanup is again
- * automatic because SQLite releases the kernel lock with the connection.
- */
+// Generic cross-process lock with a one-way mixed-version boundary.
+//
+// New clients hold a SQLite `BEGIN IMMEDIATE` transaction on the versioned
+// database at `<lockPath>.sqlite-v2`. The logical legacy pathname remains a
+// parseable JSON guard. Its deliberately impossible hostname makes pre-SQLite
+// clients treat the guard as foreign-host-owned and therefore never reclaim it.
+// Once a new client installs that guard, old clients fail closed and must be
+// upgraded; new clients continue to serialize through SQLite.
+//
+// The guard is permanent. Release and crash cleanup affect only the SQLite
+// transaction, so no compare/read/delete pathname race exists. A pre-existing
+// old JSON owner is allowed to release normally before the guard is installed.
+// A corrupt file or a pre-boundary SQLite database at the legacy pathname is
+// never removed automatically: the operator must first verify that no old or
+// pre-boundary process owns it, then remove that legacy pathname manually.
 
-import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, writeFileSync, closeSync } from 'node:fs';
-import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import {
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+} from 'node:fs';
 import { hostname } from 'node:os';
+import { dirname } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const LOCK_WAIT_MS = 10_000;
 const LOCK_POLL_MS = 100;
 const LOCK_SYNC_SLEEP = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
-const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'utf8');
+const COMPATIBILITY_GUARD_FORMAT = 'owenloop-sqlite-lock-v2';
+// A slash cannot occur in an operating-system hostname. Old clients compare
+// this field before probing the pid and therefore hold the guard forever.
+const COMPATIBILITY_GUARD_HOST = 'owenloop/sqlite-lock/v2';
 
 export interface FileLockHandle {
   lockPath: string;
@@ -48,16 +52,17 @@ interface LockHolder {
   host?: string;
   active?: boolean;
   releasedAt?: number;
+  format?: string;
 }
 
 export interface AcquireFileLockOpts {
-  /** Max time to wait for the SQLite writer lock before failing cleanly. */
+  /** Max time to wait for the SQLite writer lock or legacy owner. */
   waitMs?: number;
-  /** Retained for source compatibility. SQLite crash release needs no stale age. */
+  /** Retained for source compatibility. New clients never age-reclaim pathnames. */
   staleMs?: number;
-  /** Poll interval while waiting on the writer lock. */
+  /** Poll interval while waiting. */
   pollMs?: number;
-  /** Retained for source compatibility with legacy-lock diagnostics. */
+  /** Retained for source compatibility. New clients never reclaim by pid. */
   isPidAlive?: (pid: number) => boolean;
   /** Wall clock used only for diagnostic timestamps. */
   now?: () => number;
@@ -65,7 +70,7 @@ export interface AcquireFileLockOpts {
   hostname?: () => string;
   /** Names the holder in timeout text. */
   label?: string;
-  /** Test barrier after candidate inspection and before opening the database. */
+  /** Test barrier immediately before opening the versioned SQLite database. */
   beforeOpen?: () => void;
 }
 
@@ -74,6 +79,7 @@ export class FileLockTimeoutError extends Error {
   readonly holderPid: number | undefined;
   readonly waitMs: number;
   readonly legacy: boolean;
+
   constructor(
     message: string,
     lockPath: string,
@@ -93,6 +99,10 @@ export class FileLockTimeoutError extends Error {
 /** Connections are deliberately private so callers cannot commit the lock transaction. */
 const heldConnections = new WeakMap<FileLockHandle, DatabaseSync>();
 
+function databasePath(lockPath: string): string {
+  return `${lockPath}.sqlite-v2`;
+}
+
 function ownerPath(lockPath: string): string {
   return `${lockPath}.owner.json`;
 }
@@ -108,46 +118,22 @@ function readRaw(path: string): string | null {
 function parseHolder(raw: string | null): LockHolder | null {
   if (raw === null) return null;
   try {
-    return JSON.parse(raw) as LockHolder;
+    const parsed = JSON.parse(raw) as unknown;
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? parsed as LockHolder
+      : null;
   } catch {
     return null;
   }
 }
 
-function readDiagnosticHolder(lockPath: string): LockHolder | null {
-  return parseHolder(readRaw(ownerPath(lockPath)));
+function isCompatibilityGuard(raw: string | null): boolean {
+  const holder = parseHolder(raw);
+  return holder?.format === COMPATIBILITY_GUARD_FORMAT && holder.host === COMPATIBILITY_GUARD_HOST;
 }
 
-/**
- * Missing and empty paths are valid SQLite candidates. A zero-byte database is
- * what remains when a first owner crashes before the initial transaction commits.
- */
-function isSqliteCandidate(lockPath: string): boolean {
-  let size: number;
-  try {
-    size = statSync(lockPath).size;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
-    throw error;
-  }
-  if (size === 0) return true;
-  let fd: number;
-  try {
-    fd = openSync(lockPath, 'r');
-  } catch (error) {
-    // A legacy exclusive-create owner can unlink its path between the stat and
-    // open. Treat that disappearance like the missing-path case and let SQLite
-    // perform the atomic open/lock attempt; other filesystem refusals stay loud.
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
-    throw error;
-  }
-  try {
-    const header = Buffer.alloc(SQLITE_HEADER.length);
-    const bytesRead = readSync(fd, header, 0, header.length, 0);
-    return bytesRead === SQLITE_HEADER.length && header.equals(SQLITE_HEADER);
-  } finally {
-    closeSync(fd);
-  }
+function readDiagnosticHolder(lockPath: string): LockHolder | null {
+  return parseHolder(readRaw(ownerPath(lockPath)));
 }
 
 function legacyHolder(lockPath: string): LockHolder | null {
@@ -161,8 +147,53 @@ function writeDiagnosticHolder(lockPath: string, holder: LockHolder): void {
   renameSync(tmp, path);
 }
 
+/**
+ * Install the permanent old-client guard with one exclusive create. A crash or
+ * write failure may leave a partial guard, which is intentionally fail-closed
+ * and requires verified manual cleanup; this function never unlinks a pathname.
+ */
+function syncDirectory(path: string): void {
+  if (process.platform === 'win32') return;
+  const fd = openSync(dirname(path), 'r');
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function ensureCompatibilityGuard(lockPath: string, now: () => number): boolean {
+  let fd: number;
+  try {
+    fd = openSync(lockPath, 'wx', 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    return isCompatibilityGuard(readRaw(lockPath));
+  }
+
+  let failure: unknown;
+  try {
+    writeFileSync(fd, JSON.stringify({
+      format: COMPATIBILITY_GUARD_FORMAT,
+      host: COMPATIBILITY_GUARD_HOST,
+      startedAt: now(),
+    }));
+    fsyncSync(fd);
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    closeSync(fd);
+  } catch (error) {
+    if (failure === undefined) failure = error;
+  }
+  if (failure !== undefined) throw failure;
+  syncDirectory(lockPath);
+  return true;
+}
+
 function openLockDatabase(lockPath: string): DatabaseSync {
-  const db = new DatabaseSync(lockPath);
+  const db = new DatabaseSync(databasePath(lockPath));
   db.exec('PRAGMA busy_timeout = 0');
   return db;
 }
@@ -227,7 +258,7 @@ function timeoutError(
   legacy: boolean,
 ): FileLockTimeoutError {
   const suffix = legacy
-    ? '; found a legacy lockfile that Owenloop will not delete automatically — verify that no old process owns it, then remove it manually'
+    ? '; found an old, corrupt, or pre-boundary lock pathname that Owenloop will not delete automatically — verify that no old process owns it, then remove it manually'
     : '';
   return new FileLockTimeoutError(
     `${inProgressMessage(lockPath, holder, waitMs, label)}${suffix}`,
@@ -251,32 +282,24 @@ export async function acquireFileLock(
 
   mkdirSync(dirname(lockPath), { recursive: true });
   for (;;) {
-    if (!isSqliteCandidate(lockPath)) {
-      const holder = legacyHolder(lockPath);
-      if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, true);
-      await sleep(pollMs);
-      continue;
-    }
-
     let db: DatabaseSync | undefined;
     try {
       opts.beforeOpen?.();
       db = openLockDatabase(lockPath);
       beginLock(db);
+      if (!ensureCompatibilityGuard(lockPath, now)) {
+	closeAfterFailure(db);
+	db = undefined;
+	const holder = legacyHolder(lockPath);
+	if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, true);
+	await sleep(pollMs);
+	continue;
+      }
       return makeHandle(lockPath, db, now, currentHost);
     } catch (error) {
       closeAfterFailure(db);
-      if (!isBusy(error)) {
-	// A pathname replacement can turn a previously valid candidate into a
-	// legacy object. Refuse conservatively instead of deleting either object.
-	if (!isSqliteCandidate(lockPath)) {
-	  const holder = legacyHolder(lockPath);
-	  if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, true);
-	  await sleep(pollMs);
-	  continue;
-	}
-	throw error;
-      }
+      if (error instanceof FileLockTimeoutError) throw error;
+      if (!isBusy(error)) throw error;
     }
 
     const holder = readDiagnosticHolder(lockPath);
@@ -298,30 +321,24 @@ export function acquireFileLockSync(
 
   mkdirSync(dirname(lockPath), { recursive: true });
   for (;;) {
-    if (!isSqliteCandidate(lockPath)) {
-      const holder = legacyHolder(lockPath);
-      if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, true);
-      Atomics.wait(LOCK_SYNC_SLEEP, 0, 0, pollMs);
-      continue;
-    }
-
     let db: DatabaseSync | undefined;
     try {
       opts.beforeOpen?.();
       db = openLockDatabase(lockPath);
       beginLock(db);
+      if (!ensureCompatibilityGuard(lockPath, now)) {
+	closeAfterFailure(db);
+	db = undefined;
+	const holder = legacyHolder(lockPath);
+	if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, true);
+	Atomics.wait(LOCK_SYNC_SLEEP, 0, 0, pollMs);
+	continue;
+      }
       return makeHandle(lockPath, db, now, currentHost);
     } catch (error) {
       closeAfterFailure(db);
-      if (!isBusy(error)) {
-	if (!isSqliteCandidate(lockPath)) {
-	  const holder = legacyHolder(lockPath);
-	  if (performance.now() >= deadline) throw timeoutError(lockPath, holder, waitMs, label, true);
-	  Atomics.wait(LOCK_SYNC_SLEEP, 0, 0, pollMs);
-	  continue;
-	}
-	throw error;
-      }
+      if (error instanceof FileLockTimeoutError) throw error;
+      if (!isBusy(error)) throw error;
     }
 
     const holder = readDiagnosticHolder(lockPath);
@@ -343,8 +360,8 @@ function inProgressMessage(lockPath: string, holder: LockHolder | null, waitMs: 
 }
 
 /**
- * Release exactly the SQLite transaction held by this handle. No pathname is
- * deleted, renamed, or replaced, so release cannot remove a later owner.
+ * Release only the versioned SQLite transaction. The permanent compatibility
+ * guard is never deleted, renamed, or replaced.
  */
 export function releaseFileLock(handle: FileLockHandle): void {
   if (!handle.acquired) return;

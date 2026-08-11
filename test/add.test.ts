@@ -872,7 +872,7 @@ test('acquireInstallLock: refuses a legacy lock even when its recorded pid is de
 
   await assert.rejects(
     acquireInstallLock(lockPath, { isPidAlive: () => false, waitMs: 40, pollMs: 5 }),
-    /legacy lockfile.*remove it manually/u,
+    /old, corrupt, or pre-boundary lock pathname.*remove it manually/u,
   );
   assert.equal(readFileSync(lockPath, 'utf8'), payload);
 });
@@ -909,7 +909,7 @@ test('acquireInstallLock: refuses a legacy token-and-host lock with a dead pid',
 
   await assert.rejects(
     acquireInstallLock(lockPath, { isPidAlive: () => false, waitMs: 40, pollMs: 5 }),
-    /legacy lockfile.*remove it manually/u,
+    /old, corrupt, or pre-boundary lock pathname.*remove it manually/u,
   );
   assert.equal(readFileSync(lockPath, 'utf8'), payload);
 });
@@ -934,13 +934,14 @@ test('acquireInstallLock: a foreign-host legacy lock is refused without local PI
   assert.equal(readFileSync(lockPath, 'utf8'), payload, 'foreign-host lock untouched');
 });
 
-test('releaseInstallLock closes the transaction without deleting the persistent lock database', async () => {
+test('releaseInstallLock closes the transaction without deleting the permanent guard or SQLite database', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
   const lockPath = join(dir, 'add.lock');
 
   const handle = await acquireInstallLock(lockPath);
   releaseInstallLock(handle);
-  assert.ok(existsSync(lockPath), 'the released SQLite lock database persists');
+  assert.ok(existsSync(lockPath), 'the permanent old-client compatibility guard persists');
+  assert.ok(existsSync(`${lockPath}.sqlite-v2`), 'the versioned SQLite lock database persists');
 
   const next = await acquireInstallLock(lockPath, { waitMs: 40, pollMs: 5 });
   releaseInstallLock(next);
@@ -953,16 +954,16 @@ test('acquireInstallLock: an unparseable legacy lock fails closed regardless of 
 
   await assert.rejects(
     acquireInstallLock(lockPath, { now: () => Date.now() + 60 * 60_000, waitMs: 40, pollMs: 5 }),
-    /legacy lockfile.*remove it manually/u,
+    /old, corrupt, or pre-boundary lock pathname.*remove it manually/u,
   );
   assert.equal(readFileSync(lockPath, 'utf8'), 'not json at all');
 });
 
 test(
-  'acquireInstallLock: an unreadable candidate propagates the filesystem refusal without mutation',
+  'acquireInstallLock: an unreadable legacy pathname fails closed without mutation',
   {
-    // chmod 0o000 does not block root reads, so the EACCES path this exercises
-    // cannot arise as root — skip rather than false-pass.
+    // chmod 0o000 does not block root reads, so the unreadable-path case cannot
+    // arise as root — skip rather than false-pass.
     skip:
       typeof process.getuid === 'function' && process.getuid() === 0
         ? 'requires non-root: chmod 0o000 must actually block reads'
@@ -971,16 +972,18 @@ test(
   async () => {
     const dir = mkdtempSync(join(tmpdir(), 'owenloop-lock-'));
     const lockPath = join(dir, 'add.lock');
-    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: Date.now() }));
+    const payload = JSON.stringify({ pid: process.pid, startedAt: Date.now() });
+    writeFileSync(lockPath, payload);
     chmodSync(lockPath, 0o000);
     try {
       await assert.rejects(
         acquireInstallLock(lockPath, { waitMs: 40, pollMs: 5 }),
-	(error: unknown) => (error as NodeJS.ErrnoException).code === 'EACCES',
+	/old, corrupt, or pre-boundary lock pathname.*remove it manually/u,
       );
     } finally {
-      chmodSync(lockPath, 0o600); // restore so mkdtemp teardown can remove it
+      chmodSync(lockPath, 0o600); // restore so the content can be verified and removed
     }
+    assert.equal(readFileSync(lockPath, 'utf8'), payload, 'unreadable legacy pathname remains byte-identical');
   },
 );
 

@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import {
   appendFileSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -122,6 +123,77 @@ test('append then latestFor round-trips a record', () => {
   assert.deepEqual(latestFor(file, 'wf_1', 'run_1', 'builder'), r);
 });
 
+test('active rows fsync the log and a newly created log directory entry before returning', () => {
+  const synced: Array<'file' | 'directory'> = [];
+  appendSession(file, rec(), {
+    sync: (fd) => {
+      synced.push(fstatSync(fd).isDirectory() ? 'directory' : 'file');
+    },
+  });
+
+  assert.deepEqual(
+    synced,
+    process.platform === 'win32' ? ['file'] : ['file', 'directory'],
+  );
+  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.status, 'active');
+});
+
+test('later lifecycle rows retain ordinary append durability without fsync', () => {
+  let syncCalls = 0;
+  appendSession(file, rec({ status: 'turn-ended' }), {
+    sync: () => {
+      syncCalls += 1;
+    },
+  });
+
+  assert.equal(syncCalls, 0);
+  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.status, 'turn-ended');
+});
+
+test('an active-row fsync failure propagates to the provider-work gate', () => {
+  assert.throws(
+    () => appendSession(file, rec(), {
+      sync: () => {
+	throw new Error('injected active fsync failure');
+      },
+    }),
+    /injected active fsync failure/u,
+  );
+});
+
+test('a restart appends a new durable active row after an unterminated active tail', () => {
+  const abandoned = rec({ token: 'abandoned-active', updatedAt: 900 });
+  const next = rec({ attempt: 2, token: 'next-active', updatedAt: 1_100 });
+  writeFileSync(file, JSON.stringify(abandoned));
+  let syncCalls = 0;
+
+  appendSession(file, next, {
+    sync: () => {
+      syncCalls += 1;
+    },
+  });
+
+  assert.ok(syncCalls >= 1);
+  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.token, 'next-active');
+  assert.ok(readFileSync(file, 'utf8').endsWith('\n'));
+});
+
+test('compaction fsyncs its replacement and preserves the latest durable active row', () => {
+  const synced: Array<'file' | 'directory'> = [];
+  appendSession(file, rec({ token: 'active-through-compaction' }), {
+    maxBytes: 1,
+    sync: (fd) => {
+      synced.push(fstatSync(fd).isDirectory() ? 'directory' : 'file');
+    },
+  });
+
+  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.token, 'active-through-compaction');
+  assert.ok(synced.filter((kind) => kind === 'file').length >= 2, 'the append and compacted replacement are fsynced');
+  if (process.platform !== 'win32') {
+    assert.ok(synced.filter((kind) => kind === 'directory').length >= 2, 'creation and replacement directory entries are fsynced');
+  }
+});
+
 test('latestFor is last-wins per (workflow, run, step), and a different step does not interfere', () => {
   appendSession(file, rec({ attempt: 1, token: 'tok-1', updatedAt: 1000 }));
   // A different step for the same run, appended in between.
@@ -178,10 +250,11 @@ test('concurrent append and compaction preserve every successful multiprocess ap
   const expected = workerCount * recordsPerWorker;
   assert.equal(records.length, expected);
   assert.equal(new Set(records.map((record) => record.token)).size, expected);
-  assert.equal(existsSync(`${file}.lock`), true, 'the persistent SQLite lock database remains after release');
+  assert.equal(existsSync(`${file}.lock`), true, 'the permanent old-client compatibility guard remains after release');
+  assert.equal(existsSync(`${file}.lock.sqlite-v2`), true, 'the SQLite lock database remains after release');
 });
 
-test('the synchronous lock conservatively refuses a dead-owner legacy lockfile', () => {
+test('the synchronous lock conservatively refuses a dead-owner pre-boundary pathname', () => {
   const lockPath = `${file}.lock`;
   const original = JSON.stringify({ pid: 2_147_483_647, startedAt: 1, token: 'dead' });
   writeFileSync(lockPath, original);
@@ -190,8 +263,10 @@ test('the synchronous lock conservatively refuses a dead-owner legacy lockfile',
     () => acquireFileLockSync(lockPath, { waitMs: 5, pollMs: 1, label: 'test session-store writer' }),
     (error: unknown) =>
       error instanceof FileLockTimeoutError &&
+      error.legacy &&
       error.holderPid === 2_147_483_647 &&
-      /legacy lockfile/u.test(error.message),
+      /will not delete automatically/u.test(error.message) &&
+      /remove it manually/u.test(error.message),
   );
   assert.equal(readFileSync(lockPath, 'utf8'), original);
 });
@@ -236,7 +311,7 @@ test('a post-append compaction failure keeps the appended record and releases th
     readSessions(file, { warn: () => {} }).at(-1)?.token,
     'durable-after-compaction-failure',
   );
-  assert.equal(existsSync(`${file}.lock`), true, 'the released SQLite lock database persists');
+  assert.equal(existsSync(`${file}.lock`), true, 'the released compatibility guard persists');
 });
 
 test('a propagating write failure still releases the session writer lock', () => {
@@ -244,7 +319,7 @@ test('a propagating write failure still releases the session writer lock', () =>
   mkdirSync(directoryTarget);
 
   assert.throws(() => appendSession(directoryTarget, rec()));
-  assert.equal(existsSync(`${directoryTarget}.lock`), true, 'the released SQLite lock database persists');
+  assert.equal(existsSync(`${directoryTarget}.lock`), true, 'the released compatibility guard persists');
 });
 
 test('compact on a file that has never been written is a no-op, not a throw', () => {

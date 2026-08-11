@@ -196,6 +196,75 @@ test('absent proof follows the artifact-policy matrix', async () => {
   }
 });
 
+test('proof without authoritative expected version follows the unverifiable policy matrix and never counts as verified', async () => {
+  for (const [artifactPolicy, expected] of [
+    ['off', 'pass'],
+    ['warn', 'warn'],
+    ['enforce', 'refuse'],
+  ] as const) {
+    const verifier = createConsumedVerifier({
+      env: trustRootEnv(),
+      artifactPolicy,
+      now: () => 100,
+      signerForPrincipal,
+    });
+    const result = await verifier(rootOrder({ consumedFingerprint: undefined }), { hardRule: false });
+    if (expected === 'refuse') {
+      assert.equal(result.ok, false, artifactPolicy);
+      if (!result.ok) assert.match(result.reason, /authoritative expected version/);
+    } else {
+      assert.equal(result.ok, true, artifactPolicy);
+      if (result.ok) {
+	assert.equal(result.warnings.length, expected === 'warn' ? 1 : 0, artifactPolicy);
+	if (expected === 'warn') assert.match(result.warnings[0]!, /authoritative expected version/);
+      }
+    }
+  }
+});
+
+test('hard-rule consumers refuse a historical proof when expected-version metadata is absent', async () => {
+  const verifier = createConsumedVerifier({
+    env: trustRootEnv(),
+    artifactPolicy: 'off',
+    now: () => 100,
+    signerForPrincipal,
+  });
+  const result = await verifier(rootOrder({ consumedFingerprint: undefined }), { hardRule: true });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /authoritative expected version/);
+});
+
+test('owed rejection proof binds to the owed claim-time version', async () => {
+  const reasons = [{
+    at: 20,
+    action: 'reject',
+    kind: 'structural',
+    by: 'engine',
+    text: 'fix it',
+  }];
+  const verifier = createConsumedVerifier({
+    env: trustRootEnv(),
+    artifactPolicy: 'enforce',
+    now: () => 100,
+    signerForPrincipal,
+  });
+  const result = await verifier(rootOrder({
+    consumes: {},
+    consumedFingerprint: {},
+    consumesProof: undefined,
+    owes: [{
+      path: 'output',
+      version: 5,
+      judgmentRejects: 1,
+      schemaRejects: 0,
+      reasons,
+      proof: proof('output', reasons, 4),
+    }],
+  }), { hardRule: false });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /signed version 4, expected version 5/);
+});
+
 test('invalid evidence refuses even when artifact policy is off', async () => {
   const env = trustRootEnv();
   const value = { answer: 42 };

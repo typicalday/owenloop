@@ -200,6 +200,7 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
     case 'no-template':
     case 'no-harness':
     case 'unverified-consumed':
+    case 'session-store-failed':
     case 'no-submit':
     case 'killed':
     case 'lease-lost':
@@ -447,11 +448,10 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   };
 
   /**
-   * The session-store sink. `appendSession` PROPAGATES fs failures by design
-   * (see `src/harness/session-store.ts`), but the store is a resume convenience,
-   * not the lease — a full disk must not abort a run that is otherwise doing its
-   * job. So the role swallows the failure here, after reporting it, and the loop
-   * carries on. The lease, not this file, remains the record of truth.
+   * The session-store sink. A durable `active` row is a provider-work start
+   * gate: failure propagates to the loop, which abandons the turn and releases
+   * the order before delivery. Later lifecycle rows remain best-effort resume
+   * metadata and are reported without replacing the lease as the hub truth.
    */
   const sessionsFile = sessionsPath(cacheDir);
   const writeSession = (rec: SessionRecord): void => {
@@ -459,6 +459,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       appendSession(sessionsFile, rec, { warn: err });
     } catch (e) {
       err(`owenloop work agent-run: could not record the session in ${sessionsFile}: ${errMsg(e)}`);
+      if (rec.status === 'active') throw e;
     }
   };
 

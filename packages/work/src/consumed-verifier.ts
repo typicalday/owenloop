@@ -241,6 +241,7 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
           path: owed.path,
           value: owed.reasons,
           ...(owed.proof === undefined ? {} : { proof: owed.proof }),
+	  ...(owed.version === undefined ? {} : { expectedVersion: owed.version }),
           orgRootPublicKey: rootPublicKey,
           grants,
           revocations,

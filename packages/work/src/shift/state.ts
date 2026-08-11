@@ -24,7 +24,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 
 export const DEFAULT_RESERVATION_MAX_AGE_MS = 2 * 60_000;
 
@@ -191,30 +191,89 @@ function isReservation(record: StateRecord): record is ChildReservation {
   return (record as Partial<ChildReservation>).recordType === 'reservation';
 }
 
-function readOneStateRecord(path: string): StateRecord | undefined {
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
-    if (typeof parsed['workflow'] !== 'string' || typeof parsed['run'] !== 'string') return undefined;
-    if (parsed['recordType'] === 'reservation') {
-      if (
-	typeof parsed['reservedAt'] !== 'number' ||
-	typeof parsed['token'] !== 'string' ||
-	(parsed['childKind'] !== 'exec' && parsed['childKind'] !== 'agent-run')
-      ) return undefined;
-      return parsed as unknown as ChildReservation;
-    }
-    if (typeof parsed['pid'] !== 'number' || typeof parsed['spawnedAt'] !== 'number') return undefined;
-    return parsed as unknown as ChildRecord;
-  } catch {
-    return undefined;
+export class ShiftStateRecordError extends Error {
+  readonly path: string;
+
+  constructor(path: string, detail: string) {
+    super(
+      `cannot reconcile Shift state record '${path}': ${detail}; ` +
+      'dispatch is disabled until the record is repaired or removed after verifying that no child still owns the slot',
+    );
+    this.name = 'ShiftStateRecordError';
+    this.path = path;
   }
+}
+
+function readOneStateRecord(path: string): StateRecord | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new ShiftStateRecordError(path, `the canonical record is unreadable${code === undefined ? '' : ` (${code})`}`);
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    throw new ShiftStateRecordError(path, 'the canonical record is truncated or is not valid JSON');
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ShiftStateRecordError(path, 'the canonical record is not a JSON object');
+  }
+  if (
+    typeof parsed['workflow'] !== 'string' || parsed['workflow'] === '' ||
+    typeof parsed['run'] !== 'string' || parsed['run'] === ''
+  ) {
+    throw new ShiftStateRecordError(path, 'the canonical record is missing workflow or run identity');
+  }
+  if (basename(path) !== `${safeRun(parsed['run'])}.json`) {
+    throw new ShiftStateRecordError(path, 'the canonical record pathname does not match its run identity');
+  }
+  if (parsed['recordType'] === 'reservation') {
+    if (
+      typeof parsed['reservedAt'] !== 'number' ||
+      !Number.isInteger(parsed['reservedAt']) ||
+      parsed['reservedAt'] < 0 ||
+      typeof parsed['token'] !== 'string' ||
+      !/^[a-f0-9]{32}$/u.test(parsed['token']) ||
+      (parsed['childKind'] !== 'exec' && parsed['childKind'] !== 'agent-run') ||
+      (parsed['step'] !== undefined && typeof parsed['step'] !== 'string')
+    ) {
+      throw new ShiftStateRecordError(path, 'the canonical reservation fields are malformed');
+    }
+    return parsed as unknown as ChildReservation;
+  }
+  if (
+    parsed['recordType'] !== undefined ||
+    typeof parsed['pid'] !== 'number' ||
+    !Number.isInteger(parsed['pid']) ||
+    parsed['pid'] <= 0 ||
+    typeof parsed['spawnedAt'] !== 'number' ||
+    !Number.isInteger(parsed['spawnedAt']) ||
+    parsed['spawnedAt'] < 0 ||
+    (parsed['kind'] !== undefined && parsed['kind'] !== 'exec' && parsed['kind'] !== 'agent-run') ||
+    (parsed['def'] !== undefined && typeof parsed['def'] !== 'string') ||
+    (parsed['hash'] !== undefined && typeof parsed['hash'] !== 'string') ||
+    (parsed['step'] !== undefined && typeof parsed['step'] !== 'string') ||
+    (parsed['gateToken'] !== undefined && (
+      typeof parsed['gateToken'] !== 'string' ||
+      !/^[a-f0-9]{32}$/u.test(parsed['gateToken'])
+    ))
+  ) {
+    throw new ShiftStateRecordError(path, 'the canonical child fields are malformed');
+  }
+  return parsed as unknown as ChildRecord;
 }
 
 function readStateRecords(stateDir: string): StateRecord[] {
   let names: string[];
   try {
-    names = readdirSync(stateDir).filter((name) => name.endsWith('.json'));
+    names = readdirSync(stateDir)
+      .filter((name) => name.endsWith('.json') && name !== '.dispatch.lock.owner.json')
+      .sort();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw error;
@@ -372,7 +431,14 @@ export function reconcileInFlight(stateDir: string, arg?: Liveness | ReconcileOp
 
   for (const record of byRun.values()) {
     if (isReservation(record)) {
-      if (now - record.reservedAt < maxAge) {
+      // The worker removes its gate when its monotonic wait expires. A missing
+      // gate therefore proves that this reservation cannot start work, even if
+      // wall-clock rollback makes its persisted age look fresh.
+      const gateExists = existsSync(gateFile(stateDir, record.token));
+      // A persisted wall-clock timestamp from the future cannot be aged safely
+      // after a clock rollback. Cancel the reservation instead of letting a
+      // negative elapsed interval occupy capacity indefinitely.
+      if (gateExists && record.reservedAt <= now && now - record.reservedAt < maxAge) {
 	reserved.push(record);
 	continue;
       }

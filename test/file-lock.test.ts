@@ -3,8 +3,8 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
-  renameSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -31,127 +31,175 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function seedSqliteLock(): void {
-  const handle = acquireFileLockSync(lockPath);
-  releaseFileLock(handle);
+const legacyScript = fileURLToPath(new URL('./fixtures/legacy-file-lock-client.ts', import.meta.url));
+const newHolderScript = fileURLToPath(new URL('./fixtures/file-lock-holder.ts', import.meta.url));
+
+type TestChild = ChildProcessByStdio<null, Readable, Readable>;
+
+function spawnClient(script: string, args: string[] = []): TestChild {
+  return spawn(
+    process.execPath,
+    ['--experimental-strip-types', script, lockPath, ...args],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
 }
 
-function replaceWithLegacyPayload(payload: string): void {
-  const replacement = join(dir, `replacement-${Math.random().toString(36).slice(2)}`);
-  writeFileSync(replacement, payload);
-  renameSync(replacement, lockPath);
-}
-
-function waitForReady(child: ChildProcessByStdio<null, Readable, Readable>): Promise<void> {
+function waitForLine(child: TestChild, expected: string): Promise<void> {
   return new Promise((resolve, reject) => {
     let stdout = '';
     let stderr = '';
+    const timeout = setTimeout(() => reject(new Error(`timed out waiting for ${expected}: ${stderr}`)), 5_000);
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
       stdout += chunk;
-      if (stdout.includes('READY\n')) resolve();
+      if (stdout.includes(`${expected}\n`)) {
+	clearTimeout(timeout);
+	resolve();
+      }
     });
     child.stderr.on('data', (chunk: string) => {
       stderr += chunk;
     });
-    child.once('error', reject);
+    child.once('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
     child.once('exit', (code, signal) => {
-      reject(new Error(`lock holder exited before ready (${String(code)}/${String(signal)}): ${stderr}`));
+      if (!stdout.includes(`${expected}\n`)) {
+	clearTimeout(timeout);
+	reject(new Error(`client exited before ${expected} (${String(code)}/${String(signal)}): ${stderr}`));
+      }
     });
   });
 }
 
-test('async acquisition never deletes a replacement installed after candidate inspection', async () => {
-  seedSqliteLock();
-  const payload = JSON.stringify({ pid: 111, startedAt: 1, token: 'replacement' });
-  let replaced = false;
+function waitForExit(child: TestChild): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', () => resolve());
+  });
+}
 
-  await assert.rejects(
-    acquireFileLock(lockPath, {
-      waitMs: 15,
-      pollMs: 1,
-      beforeOpen: () => {
-	if (replaced) return;
-	replaced = true;
-	replaceWithLegacyPayload(payload);
-      },
-    }),
-    (error: unknown) => error instanceof FileLockTimeoutError && /legacy lockfile/u.test(error.message),
-  );
-  assert.equal(readFileSync(lockPath, 'utf8'), payload);
-});
+async function legacyAttempt(waitMs = 80, staleMs = 0): Promise<void> {
+  const child = spawnClient(legacyScript, [String(waitMs), String(staleMs)]);
+  await waitForLine(child, 'BLOCKED');
+  await waitForExit(child);
+}
 
-test('sync acquisition never deletes a replacement installed after candidate inspection', () => {
-  seedSqliteLock();
-  const payload = JSON.stringify({ pid: 222, startedAt: 1, token: 'replacement' });
-  let replaced = false;
+function guard(): { format?: unknown; host?: unknown } {
+  return JSON.parse(readFileSync(lockPath, 'utf8')) as { format?: unknown; host?: unknown };
+}
 
-  assert.throws(
-    () => acquireFileLockSync(lockPath, {
-      waitMs: 15,
-      pollMs: 1,
-      beforeOpen: () => {
-	if (replaced) return;
-	replaced = true;
-	replaceWithLegacyPayload(payload);
-      },
-    }),
-    (error: unknown) => error instanceof FileLockTimeoutError && /legacy lockfile/u.test(error.message),
-  );
-  assert.equal(readFileSync(lockPath, 'utf8'), payload);
-});
-
-test('release closes only the acquired SQLite object and never removes a replacement pathname', () => {
+test('release preserves the permanent parseable old-client guard', () => {
   const handle = acquireFileLockSync(lockPath);
-  const payload = JSON.stringify({ replacement: true });
-  const replacement = join(dir, 'replacement');
-  writeFileSync(replacement, payload);
-
-  let pathnameReplaced = false;
-  try {
-    renameSync(replacement, lockPath);
-    pathnameReplaced = true;
-  } catch (error) {
-    if (process.platform !== 'win32') throw error;
-    assert.ok(existsSync(lockPath), 'Windows kept the open SQLite pathname stable');
-  }
-
   releaseFileLock(handle);
 
-  if (pathnameReplaced) {
-    assert.equal(readFileSync(lockPath, 'utf8'), payload);
-  } else {
-    renameSync(replacement, lockPath);
-    assert.equal(readFileSync(lockPath, 'utf8'), payload);
-  }
+  assert.equal(existsSync(lockPath), true);
+  assert.deepEqual(guard(), {
+    format: 'owenloop-sqlite-lock-v2',
+    host: 'owenloop/sqlite-lock/v2',
+    startedAt: (guard() as { startedAt?: unknown }).startedAt,
+  });
+  assert.equal(existsSync(`${lockPath}.sqlite-v2`), true);
 });
 
-test('a second process blocks while held and acquires after the holder crashes', async () => {
-  const script = fileURLToPath(new URL('./fixtures/file-lock-holder.ts', import.meta.url));
-  const child = spawn(
-    process.execPath,
-    ['--experimental-strip-types', script, lockPath],
-    { stdio: ['ignore', 'pipe', 'pipe'] },
-  );
+test('new clients exclude each other and a crashed holder releases the SQLite transaction', async () => {
+  const child = spawnClient(newHolderScript);
   try {
-    await waitForReady(child);
+    await waitForLine(child, 'READY');
     await assert.rejects(
-      acquireFileLock(lockPath, { waitMs: 30, pollMs: 5, label: 'test parent' }),
+      acquireFileLock(lockPath, { waitMs: 40, pollMs: 5, label: 'test parent' }),
       (error: unknown) => error instanceof FileLockTimeoutError && error.holderPid === child.pid,
     );
 
-    const exited = new Promise<void>((resolve, reject) => {
-      child.once('error', reject);
-      child.once('exit', () => resolve());
-    });
+    const exited = waitForExit(child);
     assert.equal(child.kill('SIGKILL'), true);
     await exited;
 
     const afterCrash = await acquireFileLock(lockPath, { waitMs: 2_000, pollMs: 5 });
     releaseFileLock(afterCrash);
-    assert.ok(existsSync(lockPath), 'crash release keeps the persistent lock database');
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+});
+
+test('an actual old JSON client acquired first blocks a new client until graceful old release', async () => {
+  const legacy = spawnClient(legacyScript, ['5_000', '30_000']);
+  try {
+    await waitForLine(legacy, 'ENTERED');
+    await assert.rejects(
+      acquireFileLock(lockPath, { waitMs: 40, pollMs: 5 }),
+      (error: unknown) =>
+	error instanceof FileLockTimeoutError &&
+	error.legacy &&
+	error.holderPid === legacy.pid &&
+	/manual/u.test(error.message),
+    );
+
+    const exited = waitForExit(legacy);
+    assert.equal(legacy.kill('SIGTERM'), true);
+    await exited;
+
+    const next = await acquireFileLock(lockPath, { waitMs: 2_000, pollMs: 5 });
+    releaseFileLock(next);
+  } finally {
+    if (legacy.exitCode === null && legacy.signalCode === null) legacy.kill('SIGKILL');
+  }
+});
+
+test('the permanent guard blocks old acquisition even after release and after its mtime ages', async () => {
+  const handle = acquireFileLockSync(lockPath);
+  releaseFileLock(handle);
+  const old = new Date(Date.now() - 24 * 60 * 60_000);
+  utimesSync(lockPath, old, old);
+
+  await legacyAttempt(100, 0);
+  assert.equal(guard().host, 'owenloop/sqlite-lock/v2');
+});
+
+test('an old client cannot enter while a new client holds the aged guard pathname', async () => {
+  const handle = acquireFileLockSync(lockPath);
+  try {
+    const old = new Date(Date.now() - 24 * 60 * 60_000);
+    utimesSync(lockPath, old, old);
+    await legacyAttempt(100, 0);
+  } finally {
+    releaseFileLock(handle);
+  }
+});
+
+test('a new-client crash leaves old clients blocked while a later new client reacquires', async () => {
+  const child = spawnClient(newHolderScript);
+  try {
+    await waitForLine(child, 'READY');
+    await legacyAttempt(80, 0);
+    const exited = waitForExit(child);
+    child.kill('SIGKILL');
+    await exited;
+
+    await legacyAttempt(80, 0);
+    const next = acquireFileLockSync(lockPath, { waitMs: 2_000, pollMs: 5 });
+    releaseFileLock(next);
+    await legacyAttempt(80, 0);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+});
+
+test('corrupt or pre-boundary legacy pathnames fail closed with manual-cleanup diagnostics', () => {
+  for (const payload of ['not json', `SQLite format 3${String.fromCharCode(0)}pre-boundary`]) {
+    rmSync(lockPath, { force: true });
+    writeFileSync(lockPath, payload);
+    assert.throws(
+      () => acquireFileLockSync(lockPath, { waitMs: 10, pollMs: 1 }),
+      (error: unknown) =>
+	error instanceof FileLockTimeoutError &&
+	error.legacy &&
+	/will not delete automatically/u.test(error.message) &&
+	/remove it manually/u.test(error.message),
+    );
+    assert.equal(readFileSync(lockPath, 'utf8'), payload);
   }
 });

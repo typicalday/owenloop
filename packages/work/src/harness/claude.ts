@@ -496,6 +496,19 @@ async function start(
       onEvent({ kind: 'started', ref });
     });
   } catch (err) {
+    // A thrown `started` callback is the caller's durable-session gate refusing
+    // delivery. Tear the provider query down here as well as in the caller's
+    // idempotent `stop`, so the adapter itself cannot continue provider work.
+    try {
+      abortController.abort();
+    } catch {
+      // An already-aborted controller is equivalent to success.
+    }
+    try {
+      q.close();
+    } catch {
+      // Preserve the persistence or provider error that caused the abort.
+    }
     onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
     throw err;
   }

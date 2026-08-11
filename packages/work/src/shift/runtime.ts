@@ -174,6 +174,16 @@ export interface ShiftRuntimeOptions {
   socketPath?: string;
 }
 
+/** Public Shift daemon transport is a Unix-domain socket on macOS and Linux. */
+export function assertShiftDaemonPlatform(platform: NodeJS.Platform = process.platform): void {
+  if (platform === 'win32') {
+    throw new Error(
+      'the public Shift daemon is not supported on Windows: Windows named-pipe transport is not implemented; ' +
+      'use `owenloop work shift` directly',
+    );
+  }
+}
+
 /**
  * Shared runtime setup for the internal shift and public shift daemon.
  * `parsed` is already grammar-validated by the caller; this function owns all
@@ -183,6 +193,14 @@ export interface ShiftRuntimeOptions {
 export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeOptions = {}): Promise<number> {
   const daemonMode = options.daemon === true;
   const roleLabel = options.role === 'shift' ? 'owenloop shift' : 'owenloop work shift';
+  if (daemonMode) {
+    try {
+      assertShiftDaemonPlatform();
+    } catch (error) {
+      process.stderr.write(`${roleLabel}: ${errMsg(error)}\n`);
+      return 1;
+    }
+  }
   const env = process.env;
   let settings;
   try {

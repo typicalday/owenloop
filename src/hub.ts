@@ -449,50 +449,93 @@ export interface Keychain {
   delete(service: string, account: string): void;
 }
 
+/** Minimal command seam for the macOS `security` adapter. */
+export interface MacosSecurityCommand {
+  args: string[];
+  /** Secret-bearing command input. Never include this value in an error. */
+  input?: string;
+  captureStdout?: boolean;
+}
+
+export type MacosSecurityRunner = (command: MacosSecurityCommand) => string;
+
+const runMacosSecurity: MacosSecurityRunner = (command) => {
+  if (command.captureStdout === true) {
+    return execFileSync('security', command.args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  }
+  execFileSync('security', command.args, {
+    ...(command.input === undefined ? {} : { input: command.input }),
+    stdio: command.input === undefined ? 'ignore' : ['pipe', 'ignore', 'ignore'],
+  });
+  return '';
+};
+
+function macosSecurityFailure(operation: string, error: unknown): never {
+  const detail = error as { status?: unknown; signal?: unknown; code?: unknown };
+  if (typeof detail.status === 'number') {
+    throw new Error(`macOS Keychain ${operation} failed: security exited with status ${detail.status}`);
+  }
+  if (typeof detail.signal === 'string') {
+    throw new Error(`macOS Keychain ${operation} failed: security terminated by signal ${detail.signal}`);
+  }
+  const code = typeof detail.code === 'string' ? detail.code : 'unknown error';
+  throw new Error(`macOS Keychain ${operation} failed: security could not be run (${code})`);
+}
+
 /**
- * The default macOS keychain backend (generic passwords under service
- * `owenloop:<origin>`, account = the credential slot). The secret is fed through
- * the `security -i` command stream on stdin, never as a `-w` argv value, so it
- * never appears in `ps`/shell history. Returns `undefined` off macOS or when
- * `OWENLOOP_NO_KEYCHAIN=1`, so callers fall back to the 0600 credential file.
+ * Build the macOS generic-password backend around an injectable `security`
+ * command runner. Status 44 (`errSecItemNotFound`) alone means absence. Every
+ * other exit, signal, or start failure is a stable, secret-free error.
  */
-export function defaultKeychain(env: Record<string, string | undefined>): Keychain | undefined {
-  if (env.OWENLOOP_NO_KEYCHAIN === '1') return undefined;
-  if (process.platform !== 'darwin') return undefined;
+export function macosKeychain(runner: MacosSecurityRunner = runMacosSecurity): Keychain {
   return {
     get(service: string, account: string): string | null {
       try {
-        const out = execFileSync('security', ['find-generic-password', '-s', service, '-a', account, '-w'], {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'ignore'],
+	const out = runner({
+	  args: ['find-generic-password', '-s', service, '-a', account, '-w'],
+	  captureStdout: true,
         });
         return out.replace(/\n$/, '');
-      } catch {
-        return null; // not found (errSecItemNotFound) — treated as "no credential"
+      } catch (error) {
+	if ((error as { status?: unknown }).status === 44) return null;
+	return macosSecurityFailure('lookup', error);
       }
     },
     set(service: string, account: string, value: string): void {
       // `security -i` reads newline-terminated commands from stdin; the secret
       // rides in that stdin stream (single-quoted), never on this process's argv.
-      // The service string now carries `:` and `//` — inert for `security`, but
-      // the single-quote escaping stays as the general guard it always was.
       // `security -i` treats `\` as an escape character even inside single
-      // quotes, so backslashes are doubled FIRST (before quote-escaping
-      // inserts its own) or they are silently eaten on store.
+      // quotes, so backslashes are doubled before quote escaping.
       const sq = (s: string): string => `'${s.replace(/\\/g, '\\\\').replace(/'/g, `'\\''`)}'`;
       const cmd = `add-generic-password -U -s ${sq(service)} -a ${sq(account)} -w ${sq(value)}\n`;
-      execFileSync('security', ['-i'], { input: cmd, stdio: ['pipe', 'ignore', 'ignore'] });
+      try {
+	runner({ args: ['-i'], input: cmd });
+      } catch (error) {
+	return macosSecurityFailure('write', error);
+      }
     },
     delete(service: string, account: string): void {
       try {
-        execFileSync('security', ['delete-generic-password', '-s', service, '-a', account], {
-          stdio: 'ignore',
-        });
-      } catch {
-        // Not found — already absent; a no-op delete is success.
+	runner({ args: ['delete-generic-password', '-s', service, '-a', account] });
+      } catch (error) {
+	if ((error as { status?: unknown }).status === 44) return;
+	return macosSecurityFailure('delete', error);
       }
     },
   };
+}
+
+/**
+ * The default macOS keychain backend. Returns `undefined` off macOS or when
+ * `OWENLOOP_NO_KEYCHAIN=1`, so callers use the 0600 credential file instead.
+ */
+export function defaultKeychain(env: Record<string, string | undefined>): Keychain | undefined {
+  if (env.OWENLOOP_NO_KEYCHAIN === '1') return undefined;
+  if (process.platform !== 'darwin') return undefined;
+  return macosKeychain();
 }
 
 /**
@@ -707,13 +750,11 @@ export type ReadStoredCredentialOpts = CredentialSlotSelector & {
  * never `process.env` directly, so a caller passing `opts.env` stays hermetic;
  * only the top-level default falls back to `process.env`.
  *
- * **When `OWENLOOP_CREDENTIAL_COMMAND` is configured this function can THROW
- * instead of returning `null`**, and it does not consult a store at all. The
- * command is authoritative, so a nonzero exit, a timeout, empty output, or
- * output that is not a well-formed credential is a loud error naming the origin
- * and the slot — never a silent fallthrough to a stale local entry. See
- * `runCredentialCommand`. When it is NOT configured, behaviour is exactly what
- * it has always been.
+ * **An authoritative backend failure throws instead of returning `null`.** For
+ * `OWENLOOP_CREDENTIAL_COMMAND`, a nonzero exit, timeout, empty output, or
+ * malformed credential is a loud error naming the origin and slot. For the
+ * macOS Keychain, every `security` failure except status 44 is a stable,
+ * secret-free error. Neither backend falls through to a stale file entry.
  */
 export function readStoredCredential(origin: string, opts: ReadStoredCredentialOpts): Credential | null {
   const env = opts.env ?? process.env;

@@ -24,8 +24,12 @@
  *  - APPEND PROPAGATES. Unlike the shift's advisory metering records, a lost
  *    session token silently degrades a Phase 4 resume into a cold replay — real
  *    work thrown away — so the caller must see the failure.
- *  - COMPACTION is best-effort (swallowed): the un-compacted file is still
- *    correct, just larger.
+ *  - `active` is the safety-critical boundary. Its complete JSONL row is fsynced
+ *    before provider work may proceed. Other lifecycle rows retain ordinary
+ *    append durability; losing one degrades to conservative retirement/replay.
+ *  - COMPACTION is best-effort after a committed append, but a successful
+ *    compaction fsyncs its replacement before rename so it cannot erase a
+ *    previously durable `active` row across a host crash.
  *
  * DEVIATION FROM PLAN §3, stated deliberately: plan §3 says "compact on load if
  * > 2 MB". This module compacts on the WRITE path instead — `appendSession`
@@ -45,9 +49,9 @@
  * stderr, so tests stay silent and assertable.
  */
 import {
-  appendFileSync,
   closeSync,
   fstatSync,
+  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -116,6 +120,8 @@ export interface SessionStoreOptions {
   now?: () => number;
   /** Unchanged-tail grace before one warning is emitted. Default 5 seconds. */
   unterminatedTailGraceMs?: number;
+  /** Injectable durability primitive for focused tests. Default `fsyncSync`. */
+  sync?: (fd: number) => void;
 }
 
 /** Default compaction threshold — plan §3's 2 MB. */
@@ -180,17 +186,50 @@ function isSessionRecord(v: unknown): v is SessionRecord {
   return true;
 }
 
-/** Atomic write: temp file + rename into place. Fs errors propagate to the
- *  caller (the one caller, `compact`, is the one that swallows them). Mirrors
- *  the private helper in `src/bundle/cache.ts` — copied on purpose rather than
- *  exported from there, so the cache module's surface stays about bundles. */
-function atomicWrite(filePath: string, content: string): void {
+/** Flush a directory entry update where the platform exposes directory fsync. */
+function syncDirectory(dir: string, sync: (fd: number) => void = fsyncSync): void {
+  if (process.platform === 'win32') return;
+  const fd = openSync(dir, 'r');
+  try {
+    sync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Atomic durable write used by compaction. The replacement bytes are fsynced
+ * before rename, then the directory entry is fsynced. Fs errors propagate to
+ * the caller; `compactIfNeededUnlocked` decides whether best-effort compaction
+ * may swallow them. */
+function atomicWrite(filePath: string, content: string, opts: SessionStoreOptions): void {
   const dir = join(filePath, '..');
+  const sync = opts.sync ?? fsyncSync;
   mkdirSync(dir, { recursive: true });
   const tmp = join(dir, `.${Math.random().toString(36).slice(2)}-${process.pid}-${Date.now()}.tmp`);
-  writeFileSync(tmp, content);
+  const fd = openSync(tmp, 'wx');
+  let failure: unknown;
+  try {
+    writeFileSync(fd, content);
+    sync(fd);
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    closeSync(fd);
+  } catch (error) {
+    if (failure === undefined) failure = error;
+  }
+  if (failure !== undefined) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // Preserve the original write or close failure.
+    }
+    throw failure;
+  }
   try {
     renameSync(tmp, filePath);
+    syncDirectory(dir, sync);
   } catch (err) {
     try {
       unlinkSync(tmp);
@@ -361,13 +400,37 @@ function compactUnlocked(file: string, opts: SessionStoreOptions): void {
     byKey.set(keyOf(rec.workflow, rec.run, rec.step), rec);
   }
   const body = [...byKey.values()].map((r) => JSON.stringify(r)).join('\n');
-  atomicWrite(file, `${body}\n`);
+  atomicWrite(file, `${body}\n`, opts);
 }
 
-/** Lock must already be held. Append exactly one committed JSONL row. */
-function appendSessionUnlocked(file: string, rec: SessionRecord): void {
+/** Lock must already be held. Append exactly one committed JSONL row.
+ * `active` is fsynced before returning because provider work is gated on this
+ * call. Later statuses use ordinary close-to-flush durability. */
+function appendSessionUnlocked(
+  file: string,
+  rec: SessionRecord,
+  opts: SessionStoreOptions,
+): void {
   const separator = needsRecordSeparator(file) ? '\n' : '';
-  appendFileSync(file, `${separator}${JSON.stringify(rec)}\n`);
+  const existed = statSync(file, { throwIfNoEntry: false }) !== undefined;
+  const fd = openSync(file, 'a');
+  let failure: unknown;
+  try {
+    writeFileSync(fd, `${separator}${JSON.stringify(rec)}\n`);
+    if (rec.status === 'active') {
+      const sync = opts.sync ?? fsyncSync;
+      sync(fd);
+      if (!existed) syncDirectory(join(file, '..'), sync);
+    }
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    closeSync(fd);
+  } catch (error) {
+    if (failure === undefined) failure = error;
+  }
+  if (failure !== undefined) throw failure;
 }
 
 /** Lock must already be held. Compaction remains best-effort after committed JSONL appends. */
@@ -438,7 +501,7 @@ export function markRunSessionsDead(
     const marked: string[] = [];
     for (const rec of newest.values()) {
       if (rec.status === 'dead') continue; // already retired — nothing to append
-      appendSessionUnlocked(file, { ...rec, status: 'dead', updatedAt: now });
+      appendSessionUnlocked(file, { ...rec, status: 'dead', updatedAt: now }, opts);
       marked.push(rec.step);
     }
     if (marked.length > 0) compactIfNeededUnlocked(file, opts);
@@ -514,7 +577,7 @@ export function reconcileActiveSessions(
     for (const rec of newest.values()) {
       if (rec.status !== 'active') continue; // a completed turn is still resumable
       if (liveRunIds.has(rec.run)) continue; // its worker is alive; the row is true
-      appendSessionUnlocked(file, { ...rec, status: 'dead', updatedAt: now });
+      appendSessionUnlocked(file, { ...rec, status: 'dead', updatedAt: now }, opts);
       retired.push(rec);
     }
     if (retired.length > 0) compactIfNeededUnlocked(file, opts);
@@ -535,7 +598,7 @@ export function reconcileActiveSessions(
 export function appendSession(file: string, rec: SessionRecord, opts: SessionStoreOptions = {}): void {
   mkdirSync(join(file, '..'), { recursive: true });
   withWriterLock(file, () => {
-    appendSessionUnlocked(file, rec);
+    appendSessionUnlocked(file, rec, opts);
     compactIfNeededUnlocked(file, opts);
   });
 }

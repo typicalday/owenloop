@@ -191,9 +191,11 @@ export interface HarnessAdapter {
   /**
    * Launch a NEW session. Resolves at turn end with the session ref.
    *
-   * Emits `{kind:'started', ref}` BEFORE it resolves, and the caller is
-   * expected to persist the token on THAT event rather than on the resolve —
-   * so a mid-turn crash still leaves a resumable record behind.
+   * Emits `{kind:'started', ref}` BEFORE provider work begins and before it
+   * resolves. The callback is a synchronous persistence gate: an adapter must
+   * not start delivery until the callback returns, and a thrown callback must
+   * abort/abandon the turn. The caller persists the token on that event so a
+   * mid-turn crash leaves an authoritative active record behind.
    */
   start(args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef>;
   /**

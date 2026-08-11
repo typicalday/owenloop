@@ -219,6 +219,30 @@ test('command e2e: no proof refuses before spawn', async () => {
   }
 });
 
+test('command e2e: historical proof without claim-time expected version refuses before spawn', async () => {
+  const fixtureData = await fixture();
+  const marker = COMMAND_MARKER;
+  rmSync(marker, { force: true });
+  const packet = order(
+    fixtureData.defDigest,
+    'dynamic-value',
+    JSON.stringify({ input: submissionProof('dynamic-value') }),
+    'run-historical-proof',
+  );
+  assert.ok(packet.order !== null);
+  packet.order.consumedFingerprint = {};
+  const hub = await startHub(packet);
+  try {
+    const loop = makeLoop(hub.origin, resolverFor(fixtureData, 'off'), 'run-historical-proof');
+    assert.equal(await loop.run(), 'unresolved-instructions');
+    assert.equal(pathExists(marker), false);
+    assert.equal(hub.reqs.filter((request) => request.verb === 'submit').length, 0);
+    assert.equal(hub.reqs.filter((request) => request.verb === 'release').length, 1);
+  } finally {
+    hub.server.close();
+  }
+});
+
 test('command e2e: proof over a different value refuses before spawn', async () => {
   const fixtureData = await fixture();
   const marker = COMMAND_MARKER;

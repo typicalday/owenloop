@@ -140,6 +140,12 @@ self-driven dispatch loop as a foreground process and listens on
 and one JSON-line response. The daemon keeps polling and dispatching while no
 `shift next` client is attached.
 
+The public daemon transport is supported on macOS and Linux. Windows support is
+explicitly limited to the direct `owenloop work shift` loop: the public
+`owenloop shift start|next|status|end` daemon is unavailable because Windows
+named-pipe transport has not been implemented. A Windows daemon start fails
+with that diagnostic instead of treating a Unix-domain socket path as usable.
+
 The `shift start` positional argument is a **crew** name. The routing API calls
 that field a **crew**: `serve_crews` contains the selected crew names. Passing
 `--all` maps to an empty `serve_crews` list, which means all crews available to
@@ -185,6 +191,39 @@ precondition failures — including no crew or `--all`, invalid flags, a missing
 hub origin, or a missing Scoped Identity credential — exit `2`. The foreground
 daemon's normal lifecycle line is written to stdout when it stays running;
 diagnostics go to stderr.
+
+**Dispatch-state safety.** Every current-version direct Shift loop that shares a
+state directory serializes the capacity recheck and durable reservation under
+the same `.dispatch.lock`. The lock is released before process spawn; the per-run
+reservation carries the capacity slot through spawn and PID persistence. Two
+current-version loops therefore cannot both consume the same last slot, and a
+loop that loses the shared-capacity race keeps its already-claimed candidate in
+its local queue. Older Shift loops that predate `.dispatch.lock` do not
+participate in that boundary and must not share the state directory during the
+upgrade. The state directory does not persist one canonical cap: if current-
+version loops sharing the directory are configured with different total or
+agent caps, each loop enforces its own configured limits under the shared lock.
+Use identical cap settings for every loop sharing a state directory.
+
+Canonical `*.json` child and reservation records are capacity-bearing state.
+Missing records are benign, including a record that disappears between listing
+and read. A truncated, malformed, or unreadable canonical record is not benign:
+reconciliation fails closed, names the exact path, and disables dispatch until
+an operator repairs the record or removes the record after verifying that no
+child still owns the slot. Owenloop does not skip corrupt records and guess that
+capacity is free. Reconciliation also cancels a reservation when the worker has
+removed its gate after the worker's monotonic two-minute wait, regardless of the
+persisted wall-clock age. A reservation timestamp later than the current wall
+clock is cancelled along with its closed start gate.
+
+Persisted reservation age still uses wall time because a monotonic instant cannot
+be reconstructed after a host restart. A smaller backward clock adjustment that
+leaves `reservedAt` in the past can therefore prolong a reservation whose gate
+still exists, such as a parent crash before spawn. The reservation remains
+capacity-bearing until wall time reaches the age limit or an operator verifies
+that no child can start and removes the record and gate. This limitation cannot
+allow provider or command work past the gate: a spawned child independently
+removes the gate and exits after its monotonic two-minute wait.
 
 ### `shift next [--wait <seconds>]`
 
@@ -291,6 +330,20 @@ The execution settings file is `$XDG_CONFIG_HOME/owenloop/settings.json` when
 | `release --session <id> [options]` | drain a session's held claims |
 | `settings` | print the resolved execution settings file |
 | `join <code> [--hub <origin>] [--as <account>]` | redeem a join code and store the Scoped Identity credential |
+
+**Harness-session durability.** `agent-run` records the provider session in the
+machine-local `sessions.jsonl` log. The `active` row is a safety-critical gate:
+the complete row and its trailing newline are written and fsynced before a
+cold-start adapter may begin provider work or a resumed adapter may deliver new
+feedback. Creating the log also fsyncs the containing directory where the
+platform supports directory fsync. If the active append or fsync fails,
+`agent-run` tears down the provider session, releases the order exactly once,
+skips confirmation, writes no later lifecycle row, and exits with
+`session-store-failed`. Later `turn-ended`, `submitted`, and `dead` rows keep
+ordinary append durability; losing one causes conservative replay or retirement,
+not unrecorded provider work. Compaction fsyncs the replacement before rename
+and fsyncs the directory after rename so a successful compaction preserves a
+previously durable active row.
 
 ## `trust` — local enrollment trust
 
@@ -692,6 +745,16 @@ producer enrollment chain, revocations, and any supplied consuming demand's
 scope. A missing proof is not the same as invalid evidence. Dynamic values and
 rejection reasons remain on the wire; the driver verifies those values and
 refuses the whole order on failure rather than dropping only one path.
+
+A valid historical proof is not enough to establish the version claimed for the
+current delivery. Ordinary consumed artifacts bind the signed version to the
+claim-time version in `consumedFingerprint`; owed rejection reasons bind to the
+owed claim-time version. If that authoritative expected version is absent, the
+verdict is `unverifiable`, never `verified`, even when the signature, value
+digest, and enrollment chain all verify. The policy table therefore applies
+without a hidden exception: `enforce` refuses that artifact, `warn` warns and
+admits it, and `off` admits it without calling the proof verified. The
+command-worker hard rule below still refuses it under every policy.
 
 The current production `exec`, `agent-run`, and `hold` roles do not supply a
 pool, label, or namespace demand. `OrderPacket` has no such demand field to
@@ -1133,11 +1196,21 @@ can read (only read) a stored credential through the same backend logic via the
 package's exported `readStoredCredential` — see
 [Embedding](embedding.md#whats-exported).
 
+The macOS `security` adapter treats exit status 44 (`errSecItemNotFound`) as the
+only absence result: lookup returns no credential, and deletion succeeds
+idempotently (running the same deletion again changes nothing). Every other
+numeric status, signal termination, or command-start failure is a fatal backend
+error. Lookup and logout stop at that error; Owenloop neither reports success
+nor falls through to or deletes a file-store credential. Mapped errors name only
+the operation and backend failure class, never the service, account, credential,
+or stdin command.
+
 **Serializing writes (`credentials.lock`).** A store write — a refreshed OAuth
-token, or a `login`/`logout` that stores or deletes a slot — is serialized by a
-persistent SQLite lock database at `credentials.lock`, a sibling of
-`credentials.json` in the config dir (created for the keychain backend too,
-since the race it closes is backend-independent). The concern is a token-refresh
+token, or a `login`/`logout` that stores or deletes a slot — is serialized by the
+logical `credentials.lock` guard and the persistent SQLite lock database at
+`credentials.lock.sqlite-v2`, both siblings of `credentials.json` in the config
+dir (created for the keychain backend too, since the race the lock closes is
+backend-independent). The concern is a token-refresh
 race: two owenloop processes hitting an expiring OAuth token at once would each
 POST a refresh and each persist, and because refresh tokens rotate, the second
 write clobbers the first with a token whose refresh link is already spent —
@@ -1162,19 +1235,27 @@ unlocked. `OWENLOOP_CRED_LOCK_WAIT_MS` (default 45000) and
 pathname deletion. No token value appears in either lock file or the timeout
 message.
 
-**Lock-file upgrade boundary.** Upgrade every Owenloop process that can touch the
-same config, install, key, or session-store directory before running a new client
-there. A pre-SQLite client can mistake the persistent SQLite database for a
-stale JSON lockfile and try to delete or replace the pathname. On Unix and macOS,
-that replacement can create two separately locked filesystem objects at the same
-path, so old and new clients are not safe to run concurrently. Windows commonly
-blocks replacement of the open database, but Owenloop does not promise mixed-
-version safety there either. A new client that finds a non-empty legacy JSON or
-corrupt lockfile refuses to delete it. Stop every old process, verify that no old
-process owns the legacy lock, remove the legacy file manually, and then start
-only upgraded clients. After that one-time boundary, crash recovery is automatic
-through SQLite connection close; operators must not routinely delete the
-persistent lock databases.
+**Lock-file upgrade boundary.** The logical lock pathname, such as
+`credentials.lock`, remains a permanent, parseable JSON compatibility guard.
+The new SQLite lock database lives at `<logical-lock-path>.sqlite-v2`; for the
+credential store, that path is `credentials.lock.sqlite-v2`. A new client first
+holds SQLite's `BEGIN IMMEDIATE` transaction and then installs the guard at the
+old pathname with an exclusive create. The guard carries an impossible operating-
+system hostname, so a pre-SQLite client treats the guard as a live foreign-host
+owner and never age-reclaims it. An already-running old holder can release its
+ordinary JSON lock normally; the waiting new client then installs the guard and
+closes the one-way upgrade boundary. Old clients remain blocked after every new-
+client release or crash, while new clients continue to exclude one another
+through SQLite.
+
+Release and crash cleanup close only the SQLite transaction. Owenloop never
+deletes, renames, or replaces either the permanent guard or the versioned SQLite
+database during normal lock lifecycle. A corrupt, partial, old-owner, or pre-
+boundary SQLite file already present at the logical legacy pathname fails closed:
+stop the relevant processes, verify that no old or pre-boundary process still
+owns that pathname, remove the legacy pathname manually, and let one upgraded
+client install the permanent guard. Routine stale-age or PID reclamation is no
+longer used, and `OWENLOOP_CRED_LOCK_STALE_MS` cannot weaken the boundary.
 
 **Supplying the credential from your own tooling.** If your secrets live in a
 secret manager, or you run on a host with no keychain, set
@@ -1298,6 +1379,15 @@ defs that did land, and exits 1. A `429` (rate limited) instead halts the whole
 batch: the current def is recorded as `failed`, the not-yet-attempted remainder
 is reported under a `skipped` output key, and any `Retry-After` the hub sent is
 surfaced in the error.
+
+Selected definitions are published in topological `calls:` order. If a selected
+dependency fails or is skipped, Owenloop sends no `create_workflow` request for
+its selected dependents; each dependent is added to `skipped`, names its failed
+or skipped dependencies in sorted order, and becomes unsuccessful so the skip
+propagates transitively. Independent selected definitions continue publishing.
+A locally `unchanged` dependency and a server `noop` dependency both count as
+successful, so either result permits the dependent to publish. Dependency
+matching covers bare names and same-package-qualified names in a bundle.
 
 The def hash is computed by re-parsing the raw YAML with no checkout-specific
 `baseDir` — the same canonicalization the hub applies — so it's portable

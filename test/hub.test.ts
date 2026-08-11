@@ -24,6 +24,7 @@ import {
   hashDefForHub,
   hubBindingPath,
   listStoredHubOrigins,
+  macosKeychain,
   normalizeOrigin,
   parseWorkflowList,
   pkcePair,
@@ -119,6 +120,124 @@ test('configDir prefers XDG_CONFIG_HOME, falls back to HOME/.config, else throws
   assert.equal(configDir({ XDG_CONFIG_HOME: '/x' }), join('/x', 'owenloop'));
   assert.equal(configDir({ HOME: '/home/me' }), join('/home/me', '.config', 'owenloop'));
   assert.throws(() => configDir({}), /set HOME or XDG_CONFIG_HOME/);
+});
+
+// ---- macOS Keychain status handling ------------------------------------------
+
+test('macosKeychain lookup returns the secret and strips one security newline', () => {
+  const commands: Array<{ args: string[]; captureStdout?: boolean }> = [];
+  const keychain = macosKeychain((command) => {
+    commands.push(command);
+    return 'stored-secret\n';
+  });
+
+  assert.equal(keychain.get('service-name', 'account-name'), 'stored-secret');
+  assert.deepEqual(commands, [{
+    args: ['find-generic-password', '-s', 'service-name', '-a', 'account-name', '-w'],
+    captureStdout: true,
+  }]);
+});
+
+test('macosKeychain lookup maps only security status 44 to absence', () => {
+  const absent = macosKeychain(() => {
+    throw Object.assign(new Error('not found'), { status: 44 });
+  });
+  assert.equal(absent.get('service', 'account'), null);
+
+  for (const status of [36, 45, 128]) {
+    const failed = macosKeychain(() => {
+      throw Object.assign(new Error('sensitive backend detail'), { status });
+    });
+    assert.throws(
+      () => failed.get('service-secret', 'account-secret'),
+      new RegExp(`macOS Keychain lookup failed: security exited with status ${status}`),
+    );
+  }
+});
+
+test('macosKeychain lookup reports signal and command-start failures without backend detail', () => {
+  const signalled = macosKeychain(() => {
+    throw Object.assign(new Error('service-secret account-secret'), { signal: 'SIGKILL' });
+  });
+  assert.throws(
+    () => signalled.get('service-secret', 'account-secret'),
+    (error: unknown) =>
+      error instanceof Error
+      && error.message === 'macOS Keychain lookup failed: security terminated by signal SIGKILL'
+      && !error.message.includes('service-secret')
+      && !error.message.includes('account-secret'),
+  );
+
+  const unavailable = macosKeychain(() => {
+    throw Object.assign(new Error('credential-secret'), { code: 'ENOENT' });
+  });
+  assert.throws(
+    () => unavailable.get('service-secret', 'account-secret'),
+    (error: unknown) =>
+      error instanceof Error
+      && error.message === 'macOS Keychain lookup failed: security could not be run (ENOENT)'
+      && !error.message.includes('credential-secret'),
+  );
+});
+
+test('macosKeychain delete is idempotent only for security status 44', () => {
+  const absent = macosKeychain(() => {
+    throw Object.assign(new Error('not found'), { status: 44 });
+  });
+  assert.doesNotThrow(() => absent.delete('service', 'account'));
+
+  const failed = macosKeychain(() => {
+    throw Object.assign(new Error('sensitive delete detail'), { status: 45 });
+  });
+  assert.throws(
+    () => failed.delete('service-secret', 'account-secret'),
+    (error: unknown) =>
+      error instanceof Error
+      && error.message === 'macOS Keychain delete failed: security exited with status 45'
+      && !error.message.includes('service-secret')
+      && !error.message.includes('account-secret')
+      && !error.message.includes('sensitive delete detail'),
+  );
+});
+
+test('macosKeychain writes secrets through stdin and never argv', () => {
+  const commands: Array<{ args: string[]; input?: string }> = [];
+  const keychain = macosKeychain((command) => {
+    commands.push(command);
+    return '';
+  });
+  const service = "service-'secret";
+  const account = 'account-secret';
+  const credential = "credential-\\-'secret";
+
+  keychain.set(service, account, credential);
+
+  assert.equal(commands.length, 1);
+  assert.deepEqual(commands[0]!.args, ['-i']);
+  assert.equal(commands[0]!.args.join(' ').includes(service), false);
+  assert.equal(commands[0]!.args.join(' ').includes(account), false);
+  assert.equal(commands[0]!.args.join(' ').includes(credential), false);
+  assert.ok(commands[0]!.input?.includes('add-generic-password'));
+  assert.ok(commands[0]!.input?.endsWith('\n'));
+});
+
+test('macosKeychain write failures remain secret-free', () => {
+  const service = 'service-secret';
+  const account = 'account-secret';
+  const credential = 'credential-secret';
+  const keychain = macosKeychain(() => {
+    throw Object.assign(new Error(`${service} ${account} ${credential}`), { status: 1 });
+  });
+
+  assert.throws(
+    () => keychain.set(service, account, credential),
+    (error: unknown) =>
+      error instanceof Error
+      && error.message === 'macOS Keychain write failed: security exited with status 1'
+      && !error.message.includes(service)
+      && !error.message.includes(account)
+      && !error.message.includes(credential),
+  );
 });
 
 // ---- credential file round-trip + strict modes -------------------------------
