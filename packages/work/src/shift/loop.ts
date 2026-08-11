@@ -342,11 +342,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	if (agents >= (opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS)) return 'agent-capacity';
       }
       return reserveChild(opts.stateDir, {
-        workflow: c.workflow,
-        run: c.order.run,
+	workflow: c.workflow,
+	run: c.order.run,
 	reservedAt: opts.now(),
 	childKind,
-        step: c.order.step,
+	step: c.order.step,
       });
     } finally {
       releaseFileLock(dispatchLock);
@@ -362,9 +362,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       if (typeof reserved === 'string') return reserved;
       reservation = reserved.reservation;
       const spawned = opts.spawner({
-        workflow: c.workflow,
-        run: c.order.run,
-        step: c.order.step,
+	workflow: c.workflow,
+	run: c.order.run,
+	step: c.order.step,
 	...(childKind === 'agent-run' ? { kind: 'agent-run' as const } : {}),
 	startGate: reserved.gatePath,
       });
@@ -379,10 +379,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       });
       startReservedChild(opts.stateDir, rec);
       emit({
-        type: 'dispatched',
-        workflow: c.workflow,
-        run: c.order.run,
-        step: c.order.step,
+	type: 'dispatched',
+	workflow: c.workflow,
+	run: c.order.run,
+	step: c.order.step,
 	kind: childKind,
 	pid: spawned.pid,
       });
@@ -404,12 +404,12 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       }
       const message = errMsg(e);
       emit({
-        type: 'failed',
-        workflow: c.workflow,
-        run: c.order.run,
-        step: c.order.step,
+	type: 'failed',
+	workflow: c.workflow,
+	run: c.order.run,
+	step: c.order.step,
 	kind: childKind,
-        message,
+	message,
       });
       const prefix = c.kind === 'command' ? 'spawn' : 'agent-run spawn';
       opts.err(`${prefix} for ${c.workflow}/${c.order.run} failed: ${message}`);
@@ -445,8 +445,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	continue;
       }
       if (liveRuns.has(run)) {
-        pendingCandidates.delete(run);
-        continue;
+	pendingCandidates.delete(run);
+	continue;
       }
       // The agent lane's second budget can be full while the dispatch cap still
       // has room. Skip this entry and KEEP it queued (a command entry further
@@ -526,9 +526,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
         const inbox = await opts.hub.whatsNext();
         instances = (inbox.instances ?? []).map((i) => i.workflow);
       } catch (e) {
-        noteServerBackoff(e);
+	noteServerBackoff(e);
         opts.err(`inbox whats_next failed: ${errMsg(e)}`);
-        return { dispatched, polled, openRuns, complete: false };
+	return { dispatched, polled, openRuns, complete: false };
       }
     }
 
@@ -541,17 +541,17 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       try {
         res = await opts.hub.whatsNext({ workflow: wf, serve_crews: serveCrews });
       } catch (e) {
-        if (isNonServableRace(e)) {
-          // Treat the targeted call as a successful empty observation for the
-          // work-dir reaper and consume this wake. A later hub event may list
-          // new work, but this stale terminal row must not force every poll to
-          // repeat the same ForbiddenError.
-          polled.add(wf);
-          opts.out(`[${wf}] skipped stale terminal inbox candidate`);
-          continue;
-        }
+	if (isNonServableRace(e)) {
+	  // Treat the targeted call as a successful empty observation for the
+	  // work-dir reaper and consume this wake. A later hub event may list
+	  // new work, but this stale terminal row must not force every poll to
+	  // repeat the same ForbiddenError.
+	  polled.add(wf);
+	  opts.out(`[${wf}] skipped stale terminal inbox candidate`);
+	  continue;
+	}
 	const rateLimited = noteServerBackoff(e);
-        complete = false;
+	complete = false;
         opts.err(`whats_next for ${wf} failed: ${errMsg(e)}`);
 	if (rateLimited) break;
         continue;
@@ -576,7 +576,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       }
       for (const order of orders) {
         if (claimed.has(order.run)) continue; // seen this sweep
-        if (pendingCandidates.has(order.run)) continue; // already claimed and queued locally
+	if (pendingCandidates.has(order.run)) continue; // already claimed and queued locally
         const reoffer = liveRuns.has(order.run);
 	const workerPresent = Object.prototype.hasOwnProperty.call(order, 'worker');
 	const digestPresent = Object.prototype.hasOwnProperty.call(order, 'defDigest');
@@ -642,27 +642,27 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	    opts.out(`[${wf}/${order.run}] command step '${order.step}' routed to manual — leaving for pickup window`);
             continue;
           }
-          const candidate: Candidate = {
-            order,
-            workflow: wf,
-            step,
+	  const candidate: Candidate = {
+	    order,
+	    workflow: wf,
+	    step,
 	    defName: candidateDefName,
 	    defHash: candidateDefHash,
 	    kind,
 	    requestStartedAt,
-            reoffer,
-          };
+	    reoffer,
+	  };
 	  if (discardExpiredCandidate(candidate, false)) {
 	    claimed.add(order.run);
 	    continue;
 	  }
-          if (remaining <= 0) {
-            pendingCandidates.set(order.run, candidate);
-            opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
-          } else {
-            remaining--;
-            candidates.push(candidate);
-          }
+	  if (remaining <= 0) {
+	    pendingCandidates.set(order.run, candidate);
+	    opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
+	  } else {
+	    remaining--;
+	    candidates.push(candidate);
+	  }
           claimed.add(order.run);
           continue;
         }
@@ -670,33 +670,33 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	// Agent wire routing is authoritative. The detached agent-run resolves its
 	// own exact step and harness from the order digest, never from this cache.
         if (workerRuns.has(order.run)) continue;
-        const candidate: Candidate = {
-          order,
-          workflow: wf,
+	const candidate: Candidate = {
+	  order,
+	  workflow: wf,
 	  step: legacy ? step : undefined,
 	  defName: candidateDefName,
 	  defHash: candidateDefHash,
 	  kind,
 	  requestStartedAt,
-          reoffer,
-        };
+	  reoffer,
+	};
 	if (discardExpiredCandidate(candidate, false)) {
 	  claimed.add(order.run);
 	  continue;
 	}
 
-        if (!reoffer && remaining <= 0) {
-          pendingCandidates.set(order.run, candidate);
-          opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
-        } else if (!reoffer && agentRoom <= 0) {
-          pendingCandidates.set(order.run, candidate);
-          opts.out(`[${wf}/${order.run}] at the agent-run cap (${maxAgents}) — queued for local dispatch`);
-        } else {
-          if (!reoffer) {
-            remaining--;
-            agentRoom--;
+	if (!reoffer && remaining <= 0) {
+	  pendingCandidates.set(order.run, candidate);
+	  opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
+	} else if (!reoffer && agentRoom <= 0) {
+	  pendingCandidates.set(order.run, candidate);
+	  opts.out(`[${wf}/${order.run}] at the agent-run cap (${maxAgents}) — queued for local dispatch`);
+	} else {
+	  if (!reoffer) {
+	    remaining--;
+	    agentRoom--;
           }
-          candidates.push(candidate);
+	  candidates.push(candidate);
         }
         claimed.add(order.run);
       }

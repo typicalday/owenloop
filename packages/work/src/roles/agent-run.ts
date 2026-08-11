@@ -159,8 +159,8 @@ export function parseArgs(args: string[]): ParsedArgs {
         if (name === '--workflow') parsed.workflow = r.value;
         else if (name === '--origin') parsed.origin = r.value;
         else if (name === '--shift') parsed.shift = r.value;
-        else if (name === '--harness') parsed.harness = r.value;
-        else {
+	else if (name === '--harness') parsed.harness = r.value;
+	else {
           const n = positiveMs(name, r.value);
           if ('error' in n) return { error: n.error };
           if (name === '--heartbeat-interval') parsed.heartbeatIntervalMs = n.value;

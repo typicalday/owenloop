@@ -105,7 +105,7 @@ export function parseArgs(args: string[]): ParsedArgs {
         else if (name === '--origin') parsed.origin = r.value;
         else if (name === '--as') parsed.as = r.value;
         else if (name === '--shift') parsed.shift = r.value;
-        else if (name === '--heartbeat-interval') {
+	else if (name === '--heartbeat-interval') {
           const n = Number(r.value);
           if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
             return { ignoreStdin: false, mcp: false, error: `--heartbeat-interval must be a positive integer, got '${r.value}'` };

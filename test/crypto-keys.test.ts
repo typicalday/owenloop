@@ -130,11 +130,11 @@ function makeFakeRunner(opts: { failLookup?: boolean; failStore?: boolean; secre
         if (o.stdoutFd === undefined) throw new Error('lookup must redirect stdout to an fd');
         const rec = store.get(hash);
         if (rec === undefined) return { status: 44, stdout: Buffer.alloc(0) }; // errSecItemNotFound
-        // Faithful to the real tool: only `-w` prints the secret to stdout.
-        // Without it, stdout carries the item's attribute dump — which is how
-        // the missing `-w` regression looked in production (attribute text
-        // fails JSON.parse and reads as a "corrupt" record).
-        writeFileSync(o.stdoutFd, args.includes('-w') ? rec : `keychain: "login.keychain-db"\nclass: "genp"\nattributes:\n    0x00000007 <blob>="owenloop-signing"\n`);
+	// Faithful to the real tool: only `-w` prints the secret to stdout.
+	// Without it, stdout carries the item's attribute dump — which is how
+	// the missing `-w` regression looked in production (attribute text
+	// fails JSON.parse and reads as a "corrupt" record).
+	writeFileSync(o.stdoutFd, args.includes('-w') ? rec : `keychain: "login.keychain-db"\nclass: "genp"\nattributes:\n    0x00000007 <blob>="owenloop-signing"\n`);
         return { status: 0, stdout: Buffer.alloc(0) };
       }
       if (cmd === 'security' && args[0] === '-i') {
@@ -143,11 +143,11 @@ function makeFakeRunner(opts: { failLookup?: boolean; failStore?: boolean; secre
         const text = o.stdin!.toString('utf8');
         const hash = /-a '([0-9a-f]{64})'/.exec(text)![1]!;
         const body = text.slice(text.indexOf("-w '") + 4, text.lastIndexOf("'"));
-        // Faithful to the real tool's tokenizer: inside single quotes, `\` is
-        // still an escape character — `\X` collapses to `X` (so `\\`→`\`, and
-        // an unescaped `\n` in the payload silently degrades to `n`). The
-        // writer must pre-double backslashes for the payload to round-trip.
-        store.set(hash, body.replace(/'\\''/g, "'").replace(/\\(.)/g, '$1'));
+	// Faithful to the real tool's tokenizer: inside single quotes, `\` is
+	// still an escape character — `\X` collapses to `X` (so `\\`→`\`, and
+	// an unescaped `\n` in the payload silently degrades to `n`). The
+	// writer must pre-double backslashes for the payload to round-trip.
+	store.set(hash, body.replace(/'\\''/g, "'").replace(/\\(.)/g, '$1'));
         return { status: 0, stdout: Buffer.alloc(0) };
       }
 

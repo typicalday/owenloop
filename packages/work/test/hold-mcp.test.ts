@@ -265,7 +265,7 @@ test('hold-MCP repeated judge approval signs the same fingerprinted version', as
     assert.ok(proof !== undefined);
     const verified = await dsseVerifySubmission(JSON.parse(proof), {
       async verify() {
-        return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
+	return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
       },
     });
     const record = JSON.parse(verified.payloadBytes.toString('utf8')) as { produced: Array<{ version: number }> };

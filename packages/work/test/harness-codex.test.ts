@@ -637,8 +637,8 @@ const CASES: Case[] = [
     expect(p, events) {
       assert.equal(p['approvalPolicy'], 'never');
       assert.ok(
-        events.some((e) => e.kind === 'progress' && /acceptEdits/.test(e.text)),
-        'the downgrade must be reported, not silent',
+	events.some((e) => e.kind === 'progress' && /acceptEdits/.test(e.text)),
+	'the downgrade must be reported, not silent',
       );
     },
   },

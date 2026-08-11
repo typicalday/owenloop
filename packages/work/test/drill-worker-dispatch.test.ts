@@ -136,7 +136,7 @@ steps:
 ${TPL_CONTENT.split('\n').map((line) => `      ${line}`).join('\n')}
     x:
       harness:
-        id: fake
+${'        '}id: fake
 `;
   const sourceDir = writeBundleSource({ name: 'demo', workflow });
   const installed = await installBundleFixture({ sourceDir, root: join(home, '.owenloop', 'workflows') });
@@ -301,9 +301,9 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
     daemon.child.kill('SIGKILL');
     for (const r of readChildRecords(stateDir)) {
       try {
-        process.kill(r.pid, 'SIGKILL');
+	process.kill(r.pid, 'SIGKILL');
       } catch {
-        // already gone
+	// already gone
       }
     }
   }

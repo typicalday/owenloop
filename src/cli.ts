@@ -1356,7 +1356,7 @@ Commands:
     publish local workflow defs, or exact bundle-backed defs, to the bound hub
                                          --as names the credential slot: human (default), agent, or agent:<account>
   start <defName> [--provide name=json ...] [--crew <name>] [--title <text>] [--hub <url>]
-                                         start a published workflow on the bound hub (human credential)
+${' '.repeat(41)}start a published workflow on the bound hub (human credential)
   agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --shift = --scopes work,run)
   capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
   capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
@@ -3948,15 +3948,15 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     if (bundle !== undefined) {
       allDefs = new Map<string, WorkflowDef>();
       for (const [name, workflowPath] of Object.entries(bundle.manifest.workflows)) {
-        try {
-          const def = loadDefFile(join(defsDir, workflowPath));
-          if (def.name !== name) {
-            throw new CliError(`manifest workflow '${name}' loads as '${def.name}'`);
-          }
-          allDefs.set(name, def);
-        } catch (e) {
-          throw new CliError(`owenloop push --bundle: cannot load workflow '${name}': ${(e as Error).message}`);
-        }
+	try {
+	  const def = loadDefFile(join(defsDir, workflowPath));
+	  if (def.name !== name) {
+	    throw new CliError(`manifest workflow '${name}' loads as '${def.name}'`);
+	  }
+	  allDefs.set(name, def);
+	} catch (e) {
+	  throw new CliError(`owenloop push --bundle: cannot load workflow '${name}': ${(e as Error).message}`);
+	}
       }
     } else {
       allDefs = loadDefsRaw(defsDir, failures);
@@ -4117,7 +4117,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       let res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
       if (res.status === 401 && cred.kind === 'oauth') {
         cred = await refreshOAuth(io, origin, slot, cred as Extract<Credential, { kind: 'oauth' }>);
-        res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
+	res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
       }
       if (res.status === 401) {
         if (cred.kind === 'agent') {
@@ -6383,7 +6383,7 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
       case 'push':
         return await dispatchPush(io, args);
       case 'start':
-        return await dispatchStart(io, args);
+	return await dispatchStart(io, args);
       case 'agent':
         return await dispatchAgent(io, args);
       case 'capability':

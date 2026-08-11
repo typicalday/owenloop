@@ -171,8 +171,8 @@ export function buildSpawnPlan(
       origin,
       ...(shiftId !== undefined && shiftId !== '' ? ['--shift', shiftId] : []),
       ...(role === 'agent-run' && spec.harness !== undefined && spec.harness !== ''
-        ? ['--harness', spec.harness]
-        : []),
+	? ['--harness', spec.harness]
+	: []),
     ],
     options: {
       detached: true,
@@ -238,15 +238,15 @@ export function createDefaultSpawner(
       if (failureReported || onFailure === undefined) return;
       failureReported = true;
       onFailure({
-        workflow: spec.workflow,
-        run: spec.run,
-        ...(spec.step !== undefined ? { step: spec.step } : {}),
-        kind,
-        ...(harness !== undefined ? { harness } : {}),
-        executable,
-        exitStatus,
-        signal,
-        message,
+	workflow: spec.workflow,
+	run: spec.run,
+	...(spec.step !== undefined ? { step: spec.step } : {}),
+	kind,
+	...(harness !== undefined ? { harness } : {}),
+	executable,
+	exitStatus,
+	signal,
+	message,
       });
     };
     child.once('error', () => report(null, null, 'worker process failed to start'));

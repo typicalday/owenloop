@@ -446,9 +446,9 @@ export class PrincipalKeyManager {
     try {
       let r: { status: number | null };
       if (this.backendKind === 'macos-security') {
-        // `-w` is what makes `security` print the secret itself; without it
-        // stdout carries the item's attribute dump, which is not the record.
-        r = this.runner.run('security', ['find-generic-password', '-s', 'owenloop-signing', '-a', hash, '-w'], {
+	// `-w` is what makes `security` print the secret itself; without it
+	// stdout carries the item's attribute dump, which is not the record.
+	r = this.runner.run('security', ['find-generic-password', '-s', 'owenloop-signing', '-a', hash, '-w'], {
           stdoutFd: fd,
         });
         // 44 = errSecItemNotFound — a clean absence.

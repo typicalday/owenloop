@@ -149,8 +149,8 @@ test('--max-agents caps in-flight runners; over-cap claimed orders queue for loc
   const { origin, reqs, server } = await startMockHub((verb, body) => {
     switch (verb) {
       case 'wake':
-        // Two "changed" wakes prove the local queue remains deduplicated even
-        // when the hub is polled again while the first child is still running.
+	// Two "changed" wakes prove the local queue remains deduplicated even
+	// when the hub is polled again while the first child is still running.
         return { text: '', cursor: 1, changed: wakes++ < 2 };
       case 'whats_next':
         if (body?.workflow === undefined) return { text: '', instances: [{ workflow: 'wf1' }] };

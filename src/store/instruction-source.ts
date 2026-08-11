@@ -163,8 +163,8 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     // ambiguous step name instead of choosing one by manifest order.
     if (requestedDigest === bundleDigest) {
       cache.set(requestedDigest, [...finalized.values()].map((def) => ({
-        def,
-        bundleDigest,
+	def,
+	bundleDigest,
 				objectPath,
       })));
       return true;
@@ -363,10 +363,10 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     },
     getVerifiedDefinition: (requestedDigest: string, stepName?: string): WorkflowDef | undefined => {
       const cached = stepName === undefined
-        ? cache.get(requestedDigest)
-        : [definitionForStep(requestedDigest, stepName)].filter(
-          (candidate): candidate is CachedDefinition => candidate !== undefined,
-        );
+	? cache.get(requestedDigest)
+	: [definitionForStep(requestedDigest, stepName)].filter(
+	  (candidate): candidate is CachedDefinition => candidate !== undefined,
+	);
       return cached?.length === 1 ? cached[0]!.def : undefined;
     },
     getVerifiedObject: (requestedDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined => {
