@@ -23,6 +23,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -114,7 +115,10 @@ function bundleBytes(m: WireManifest): Uint8Array {
  * mirroring the real adapter's contract. `verifyInstalledObject` records
  * calls and honours `failObjectDirs` (a set of object dirs to report corrupt).
  */
-function fakeIngestor(opts: { failVerifyFor?: Set<string> } = {}): BundleIngestor & {
+function fakeIngestor(opts: {
+  failVerifyFor?: Set<string>;
+  failVerify?: (input: { objectDir: string; digest: DefDigest }, call: number) => boolean;
+} = {}): BundleIngestor & {
   ingests: number;
   verifies: Array<{ objectDir: string; digest: DefDigest }>;
 } {
@@ -156,7 +160,8 @@ function fakeIngestor(opts: { failVerifyFor?: Set<string> } = {}): BundleIngesto
     },
     async verifyInstalledObject(input: { objectDir: string; digest: DefDigest }): Promise<void> {
       state.verifies.push(input);
-      if (opts.failVerifyFor?.has(input.objectDir)) {
+      const call = state.verifies.length;
+      if (opts.failVerifyFor?.has(input.objectDir) || opts.failVerify?.(input, call) === true) {
         throw new Error(`fake A1: installed object at ${input.objectDir} failed verification`);
       }
     },
@@ -201,6 +206,32 @@ function tempStore(prefix = 'owenloop-wstore-'): {
 }
 
 const SRC: BundleSource = { kind: 'file', path: '/nonexistent/origin.wnlp' }; // origin data only — never opened by the installer
+
+async function indexedObjectForRecovery(name: string): Promise<{
+  root: string;
+  lockPath: string;
+  journalPath: string;
+  digest: DefDigest;
+  objDir: string;
+  metadataHash: string;
+}> {
+  const { root, lockPath, journalPath, markerDir } = tempStore();
+  const bundle = makeBundle(name);
+  await installWorkflowBundle({
+    bytes: bundleBytes(bundle), source: SRC, root, level: 'project', lockPath, journalPath,
+    recoveryMarkerDir: markerDir,
+    ingestor: fakeIngestor(), verifier: fakeVerifier(),
+  });
+  const digest = defDigest(bundle.digest);
+  return {
+    root,
+    lockPath,
+    journalPath,
+    digest,
+    objDir: join(root, objectDestRelPath(digest)),
+    metadataHash: sha256Hex(canonicalJsonBytes(readWorkflowStoreIndex(storeIndexPath(root)))),
+  };
+}
 
 // ---- the happy path and the commit order ------------------------------------------
 
@@ -497,7 +528,7 @@ test('install: the SAME bundle twice dedupes — the second is an index-only no-
   assert.ok(!existsSync(journalPath));
 });
 
-test('install: dedupe against a CORRUPT existing object is a hard refusal (never replaced, never fallen through)', async () => {
+test('install: a corrupt same-digest object is repaired from validated staged bytes, then dedupes', async () => {
   const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const m = makeBundle();
   await installWorkflowBundle({
@@ -505,13 +536,50 @@ test('install: dedupe against a CORRUPT existing object is a hard refusal (never
     recoveryMarkerDir: installMarkerDir,
     ingestor: fakeIngestor(), verifier: fakeVerifier(),
   });
-  // Corrupt the installed object, then make A1 report it.
   const objDir = join(root, objectDestRelPath(defDigest(m.digest)));
-  chmodSync(objDir, 0o755); // undo hardening so the corrupter can write
+  chmodSync(objDir, 0o755);
   chmodSync(join(objDir, 'def.yaml'), 0o644);
   writeFileSync(join(objDir, 'def.yaml'), 'tampered');
   const indexBefore = readFileSync(storeIndexPath(root), 'utf8');
-  const failing = fakeIngestor({ failVerifyFor: new Set([objDir]) });
+  const repairing = fakeIngestor({ failVerify: (_input, call) => call === 1 });
+
+  const repaired = await installWorkflowBundle({
+    bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+    recoveryMarkerDir: installMarkerDir,
+    ingestor: repairing, verifier: fakeVerifier(),
+  });
+
+  assert.equal(repaired.installed, false, 'repair reuses the existing digest identity');
+  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), validDefYaml('widget'));
+  assert.equal(statSync(join(objDir, 'def.yaml')).mode & 0o777, 0o444);
+  assert.equal(readFileSync(storeIndexPath(root), 'utf8'), indexBefore, 'same-digest index bytes stay unchanged');
+  assert.deepEqual(repairing.verifies.map((call) => call.objectDir), [objDir, repairing.verifies[1]!.objectDir, objDir]);
+  assert.notEqual(repairing.verifies[1]!.objectDir, objDir, 'the staged repair is verified independently');
+
+  const deduped = await installWorkflowBundle({
+    bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+    recoveryMarkerDir: installMarkerDir,
+    ingestor: repairing, verifier: fakeVerifier(),
+  });
+  assert.equal(deduped.installed, false);
+  assert.equal(repairing.verifies.length, 4, 'second reinstall verifies once and takes normal dedupe');
+  assert.ok(!existsSync(journalPath));
+});
+
+test('install: a staged repair verification failure leaves the prior broken object and index untouched', async () => {
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
+  const m = makeBundle();
+  await installWorkflowBundle({
+    bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+    recoveryMarkerDir: installMarkerDir,
+    ingestor: fakeIngestor(), verifier: fakeVerifier(),
+  });
+  const objDir = join(root, objectDestRelPath(defDigest(m.digest)));
+  chmodSync(objDir, 0o755);
+  chmodSync(join(objDir, 'def.yaml'), 0o644);
+  writeFileSync(join(objDir, 'def.yaml'), 'prior broken object');
+  const indexBefore = readFileSync(storeIndexPath(root), 'utf8');
+  const failing = fakeIngestor({ failVerify: (_input, call) => call === 1 || call === 2 });
 
   await assert.rejects(
     installWorkflowBundle({
@@ -519,12 +587,45 @@ test('install: dedupe against a CORRUPT existing object is a hard refusal (never
       recoveryMarkerDir: installMarkerDir,
       ingestor: failing, verifier: fakeVerifier(),
     }),
-    /existing object failed verification before dedupe/,
+    (error: unknown) => error instanceof StoreIntegrityError &&
+      error.code === 'object-corrupt' &&
+      /supplied archive could not produce a verified repair object/.test(error.message),
   );
 
-  assert.equal(readFileSync(storeIndexPath(root), 'utf8'), indexBefore, 'index untouched');
-  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'tampered', 'corrupt object left in place (never silently replaced)');
-  assert.ok(!existsSync(journalPath), 'the pre-dedupe journal was dropped');
+  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'prior broken object');
+  assert.equal(readFileSync(storeIndexPath(root), 'utf8'), indexBefore);
+  assert.ok(!existsSync(journalPath));
+  assert.ok(!existsSync(join(root, '.owenloop-staging')));
+});
+
+test('install: failed replacement verification restores the prior broken object and index', async () => {
+  const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
+  const m = makeBundle();
+  await installWorkflowBundle({
+    bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+    recoveryMarkerDir: installMarkerDir,
+    ingestor: fakeIngestor(), verifier: fakeVerifier(),
+  });
+  const objDir = join(root, objectDestRelPath(defDigest(m.digest)));
+  chmodSync(objDir, 0o755);
+  chmodSync(join(objDir, 'def.yaml'), 0o644);
+  writeFileSync(join(objDir, 'def.yaml'), 'prior broken object');
+  const indexBefore = readFileSync(storeIndexPath(root), 'utf8');
+  const failing = fakeIngestor({ failVerify: (_input, call) => call === 1 || call === 3 });
+
+  await assert.rejects(
+    installWorkflowBundle({
+      bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
+      recoveryMarkerDir: installMarkerDir,
+      ingestor: failing, verifier: fakeVerifier(),
+    }),
+    /replacement verification or hardening failed .*install rolled back, previous state restored/,
+  );
+
+  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'prior broken object');
+  assert.equal(readFileSync(storeIndexPath(root), 'utf8'), indexBefore);
+  assert.ok(!existsSync(journalPath));
+  assert.ok(!existsSync(join(root, '.owenloop-staging')));
 });
 
 test('install: an existing coordinate at a DIFFERENT digest is a conflict — no implicit retarget', async () => {
@@ -667,6 +768,85 @@ test('recovery: crash BEFORE the swap — staged debris cleared, dest never crea
   assert.ok(!existsSync(journalPath), 'journal dropped');
   // Second recovery is a no-op.
   assert.equal(await recoverWorkflowStore({ root, lockPath, journalPath }), 'no-journal');
+});
+
+test('recovery: same-digest repair crash before swap keeps the indexed prior object', async () => {
+  const { root, lockPath, journalPath, digest, objDir, metadataHash } =
+    await indexedObjectForRecovery('repair-before-swap');
+  chmodSync(objDir, 0o755);
+  chmodSync(join(objDir, 'def.yaml'), 0o644);
+  writeFileSync(join(objDir, 'def.yaml'), 'BROKEN PRIOR');
+  const stagingId = 'stg_repair_before_swap';
+  const stagedDir = join(root, '.owenloop-staging', stagingId);
+  mkdirSync(stagedDir, { recursive: true });
+  writeFileSync(join(stagedDir, 'def.yaml'), 'CLEAN STAGED');
+  writeAddJournal(journalPath, {
+    version: 2, phase: 'applying',
+    destSegments: ['objects', 'sha256', digest],
+    stagingId, hadDest: true, root, metadataHash,
+  });
+
+  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath });
+
+  assert.equal(outcome, 'rolled-forward');
+  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'BROKEN PRIOR');
+  assert.ok(!existsSync(join(root, '.owenloop-staging')));
+  assert.ok(!existsSync(journalPath));
+});
+
+test('recovery: same-digest repair crash after backup rename restores the indexed prior object', async () => {
+  const { root, lockPath, journalPath, digest, objDir, metadataHash } =
+    await indexedObjectForRecovery('repair-after-backup');
+  chmodSync(objDir, 0o755);
+  chmodSync(join(objDir, 'def.yaml'), 0o644);
+  writeFileSync(join(objDir, 'def.yaml'), 'BROKEN PRIOR');
+  const stagingId = 'stg_repair_after_backup';
+  const stagingRoot = join(root, '.owenloop-staging');
+  const stagedDir = join(stagingRoot, stagingId);
+  const backupDir = join(stagingRoot, `${stagingId}-old`);
+  mkdirSync(stagedDir, { recursive: true });
+  writeFileSync(join(stagedDir, 'def.yaml'), 'CLEAN STAGED');
+  renameSync(objDir, backupDir);
+  writeAddJournal(journalPath, {
+    version: 2, phase: 'applying',
+    destSegments: ['objects', 'sha256', digest],
+    stagingId, hadDest: true, root, metadataHash,
+  });
+
+  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath });
+
+  assert.equal(outcome, 'rolled-back');
+  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'BROKEN PRIOR');
+  assert.ok(!existsSync(stagingRoot));
+  assert.ok(!existsSync(journalPath));
+});
+
+test('recovery: same-digest repair crash after replacement swap keeps the repaired object', async () => {
+  const { root, lockPath, journalPath, digest, objDir, metadataHash } =
+    await indexedObjectForRecovery('repair-after-swap');
+  chmodSync(objDir, 0o755);
+  chmodSync(join(objDir, 'def.yaml'), 0o644);
+  writeFileSync(join(objDir, 'def.yaml'), 'BROKEN PRIOR');
+  const stagingId = 'stg_repair_after_swap';
+  const stagingRoot = join(root, '.owenloop-staging');
+  const stagedDir = join(stagingRoot, stagingId);
+  const backupDir = join(stagingRoot, `${stagingId}-old`);
+  mkdirSync(stagedDir, { recursive: true });
+  writeFileSync(join(stagedDir, 'def.yaml'), 'CLEAN REPLACEMENT');
+  renameSync(objDir, backupDir);
+  renameSync(stagedDir, objDir);
+  writeAddJournal(journalPath, {
+    version: 2, phase: 'applying',
+    destSegments: ['objects', 'sha256', digest],
+    stagingId, hadDest: true, root, metadataHash,
+  });
+
+  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath });
+
+  assert.equal(outcome, 'rolled-forward');
+  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'CLEAN REPLACEMENT');
+  assert.ok(!existsSync(stagingRoot));
+  assert.ok(!existsSync(journalPath));
 });
 
 test('recovery: symlinked object parents are refused before any recovery mutation', async () => {

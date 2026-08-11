@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, cpSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, lstatSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -9,11 +9,13 @@ import {
   createBundleIngestor,
   createStoreInstructionSource,
   defDigest,
+  installWorkflowBundle,
   objectDirForDigest,
   readWorkflowStoreIndex,
   StoreIntegrityError,
   StoreInstructionSourceError,
   storeIndexPath,
+  workflowStoreStatePaths,
   writeWorkflowStoreIndex,
 } from '../src/store/index.ts';
 import { createStoreInstructionResolver } from '../packages/work/src/exec/instructions.ts';
@@ -75,6 +77,15 @@ function addIndexEntry(root: string, coordinate: string, digest: string): void {
   writeWorkflowStoreIndex(storeIndexPath(root), index);
 }
 
+function flattenRegularFileModes(directory: string): void {
+  for (const name of readdirSync(directory)) {
+    const path = join(directory, name);
+    const stat = lstatSync(path);
+    if (stat.isDirectory()) flattenRegularFileModes(path);
+    else if (stat.isFile()) chmodSync(path, 0o444);
+  }
+}
+
 function makeRuntimeIncompatible(objectPath: string): void {
   const manifestPath = join(objectPath, 'bundle.yaml');
   chmodSync(objectPath, 0o755);
@@ -119,6 +130,88 @@ test('store instruction source: a real installed bundle bridges bundle and order
   }
   assert.deepEqual(source.lookup({ defDigest: requested, step: 'missing-step', key: '' }), { status: 'unknown-step' });
   assert.deepEqual(source.getVerifiedStep(requested, 'runner')?.x?.['harness'], installed.definition.steps[0]!.x?.['harness']);
+});
+
+test('store install: reinstalling original bytes repairs legacy execute-mode loss and preserves unrelated objects', async () => {
+  const bundleSource = writeBundleSource({
+    name: 'source-fixture',
+    workflow: WORKFLOW,
+    files: { 'bin/helper': '#!/bin/sh\nprintf "helper\\n"\n' },
+  });
+  chmodSync(join(bundleSource, 'bin', 'helper'), 0o755);
+  const installed = await installBundleFixture({ sourceDir: bundleSource });
+  const objectPath = installed.result.objectPath;
+  const unrelatedDigest = '0'.repeat(64);
+  const unrelatedObject = objectDirForDigest(installed.root, defDigest(unrelatedDigest));
+  cpSync(objectPath, unrelatedObject, { recursive: true });
+  chmodSync(unrelatedObject, 0o755);
+  chmodSync(join(unrelatedObject, 'workflow.yaml'), 0o644);
+  writeFileSync(join(unrelatedObject, 'workflow.yaml'), 'UNRELATED CORRUPTION');
+  addIndexEntry(installed.root, 'unrelated/unrelated@1.0.0', unrelatedDigest);
+
+  flattenRegularFileModes(objectPath);
+  assert.equal(statSync(join(objectPath, 'bin', 'helper')).mode & 0o777, 0o444);
+  const ingestor = createBundleIngestor();
+  await assert.rejects(
+    ingestor.verifyInstalledObject({ objectDir: objectPath, digest: defDigest(installed.packed.digest) }),
+    /canonical bundle digest mismatch/,
+  );
+  const indexBefore = readFileSync(storeIndexPath(installed.root), 'utf8');
+  const state = workflowStoreStatePaths(installed.root);
+
+  const repaired = await installWorkflowBundle({
+    bytes: installed.packed.bytes,
+    source: installed.source,
+    root: installed.root,
+    level: 'project',
+    lockPath: state.lockPath,
+    journalPath: state.journalPath,
+    recoveryMarkerDir: tempDir('owenloop-repair-markers-'),
+    ingestor,
+    verifier: { verify: async (): Promise<void> => {} },
+  });
+
+  assert.equal(repaired.installed, false);
+  assert.equal(repaired.objectPath, objectPath);
+  assert.equal(statSync(join(objectPath, 'bin', 'helper')).mode & 0o777, 0o555);
+  assert.equal(readFileSync(storeIndexPath(installed.root), 'utf8'), indexBefore);
+  assert.equal(readFileSync(join(unrelatedObject, 'workflow.yaml'), 'utf8'), 'UNRELATED CORRUPTION');
+
+  const loaded = loadDefFile(join(objectPath, 'workflow.yaml'));
+  const definitions = finalizeDefs(new Map([[loaded.name, loaded]]));
+  const definition = definitions.get(loaded.name);
+  assert.ok(definition !== undefined);
+  const requested = defInstructionDigest(definition);
+  const source = createStoreInstructionSource({
+    projectRoot: installed.root,
+    globalRoot: tempDir('owenloop-repaired-source-global-'),
+    verifier: createBundleIngestor(),
+  });
+  assert.equal(await source.prime(requested), 'resolved');
+  const lookedUp = source.lookup({ defDigest: requested, step: 'runner', key: '' });
+  assert.equal(lookedUp.status, 'resolved');
+  if (lookedUp.status === 'resolved') {
+    assert.equal(lookedUp.instructions.prompt, definition.steps[0]!.body);
+    assert.equal(lookedUp.instructions.command, 'printf "from-store\\n"');
+  }
+
+  const objectBeforeDedupe = statSync(objectPath);
+  const deduped = await installWorkflowBundle({
+    bytes: installed.packed.bytes,
+    source: installed.source,
+    root: installed.root,
+    level: 'project',
+    lockPath: state.lockPath,
+    journalPath: state.journalPath,
+    recoveryMarkerDir: tempDir('owenloop-rededupe-markers-'),
+    ingestor: createBundleIngestor(),
+    verifier: { verify: async (): Promise<void> => {} },
+  });
+  assert.equal(deduped.installed, false);
+  assert.equal(readFileSync(storeIndexPath(installed.root), 'utf8'), indexBefore);
+  const objectAfterDedupe = statSync(objectPath);
+  assert.equal(objectAfterDedupe.ino, objectBeforeDedupe.ino, 'verified second reinstall did not swap the object');
+  assert.equal(objectAfterDedupe.mtimeMs, objectBeforeDedupe.mtimeMs, 'verified second reinstall did not rewrite the object');
 });
 
 test('store instruction source: every workflow in a bundle is available by its instruction digest', async () => {

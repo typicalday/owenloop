@@ -9,7 +9,7 @@
 
 import { lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
-import { archivePathViolation } from '../archive.ts';
+import { canonicalBundlePathViolation } from '../archive.ts';
 import { unpackBundle } from '../bundle/index.ts';
 import { parseManifestBytes, sha256Hex } from '../bundle/manifest.ts';
 import { buildCanonicalTar, compareUtf8Paths } from '../bundle/tar.ts';
@@ -96,7 +96,7 @@ export function verifyWorkflowObjectSync(
       const full = join(directory, entry);
       const rel = posixRelative(objectDir, full);
 			options.onVisit?.(rel);
-      const violation = archivePathViolation(rel);
+      const violation = canonicalBundlePathViolation(rel);
       if (violation !== undefined) refuse(full, `unsafe installed path '${rel}': ${violation}`);
       const st = lstatSync(full, { throwIfNoEntry: false });
       if (st === undefined) refuse(full, 'path disappeared during verification');

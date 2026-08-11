@@ -28,7 +28,7 @@ import {
   parseDocument,
 } from 'yaml';
 import type { ParsedNode, Pair } from 'yaml';
-import { archivePathViolation } from '../archive.ts';
+import { canonicalBundlePathViolation } from '../archive.ts';
 import { assertCurrentRuntimeCompatible, isCanonicalSemver } from './runtime.ts';
 import { BundleError } from './types.ts';
 import type { BundleManifest, BundleRuntimeRequirements } from './types.ts';
@@ -286,7 +286,7 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
       );
     }
     const workflowPath = asString(workflowPathRaw, `bundle.yaml.workflows['${workflowName}']`);
-    const violation = archivePathViolation(workflowPath);
+    const violation = canonicalBundlePathViolation(workflowPath);
     if (violation) {
       throw new BundleError(
         'MANIFEST_ERROR',
@@ -340,7 +340,7 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
   }
   const files: Record<string, string> = Object.create(null) as Record<string, string>;
   for (const [path, digest] of Object.entries(asMap(integrity['files'], 'bundle.yaml.integrity.files'))) {
-    const violation = archivePathViolation(path);
+    const violation = canonicalBundlePathViolation(path);
     if (violation) {
       throw new BundleError('MANIFEST_ERROR', `bundle.yaml.integrity.files: unsafe path '${path}': ${violation}`, path);
     }

@@ -5,7 +5,12 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { gunzipSync } from 'node:zlib';
 
-import { DEFAULT_TAR_LIMITS, parseTar } from '../src/archive.ts';
+import {
+  archivePathViolation,
+  canonicalBundlePathViolation,
+  DEFAULT_TAR_LIMITS,
+  parseTar,
+} from '../src/archive.ts';
 import {
   BundleError,
   digestBundle,
@@ -14,12 +19,14 @@ import {
   unpackBundle,
 } from '../src/bundle/index.ts';
 import { manifestToBytes, parseManifestBytes } from '../src/bundle/manifest.ts';
+import { packageVersion } from '../src/package-version.ts';
 import {
   SUPPORTED_RUNTIME_FEATURES,
   evaluateRuntimeCompatibility,
 } from '../src/bundle/runtime.ts';
 import { buildCanonicalTar, gzipDeterministic } from '../src/bundle/tar.ts';
 import type { BundleManifest, BundleRuntimeRequirements } from '../src/bundle/types.ts';
+import { hostileFileEntry, hostileTarball } from './helpers.ts';
 import {
   createBundleIngestor,
   installWorkflowBundle,
@@ -37,6 +44,13 @@ const GOLDEN_JSON = JSON.parse(readFileSync(join(ROOT, 'test', 'fixtures', 'bund
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'owenloop-runtime-'));
+}
+
+function nextPatchVersion(version: string): string {
+  const core = version.split('+', 1)[0]!.split('-', 1)[0]!;
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(core);
+  assert.ok(match !== null, `package version must be canonical SemVer, got ${version}`);
+  return `${match[1]}.${match[2]}.${Number(match[3]) + 1}`;
 }
 
 function errorFrom(fn: () => unknown): BundleError {
@@ -87,6 +101,37 @@ function archiveWithRuntime(runtime: BundleRuntimeRequirements): Buffer {
   return gzipDeterministic(buildCanonicalTar(files));
 }
 
+async function assertAdmissionRejectedBeforeWrites(bytes: Uint8Array, code: BundleError['code']): Promise<void> {
+  const inspectError = errorFrom(() => inspectBundle(bytes));
+  assert.equal(inspectError.code, code);
+
+  const unpackRoot = tempDir();
+  const destination = join(unpackRoot, 'out');
+  const unpackError = errorFrom(() => unpackBundle(bytes, destination));
+  assert.equal(unpackError.code, code);
+  assert.equal(existsSync(destination), false);
+
+  const root = tempDir();
+  const state = workflowStoreStatePaths(root);
+  await assert.rejects(
+    installWorkflowBundle({
+      bytes,
+      source: { kind: 'file', path: join(root, 'invalid.wnlp') },
+      root,
+      level: 'project',
+      lockPath: state.lockPath,
+      journalPath: state.journalPath,
+      recoveryMarkerDir: tempDir(),
+      ingestor: createBundleIngestor(),
+      verifier: { verify: async (): Promise<void> => {} },
+    }),
+    (error: unknown) => error instanceof BundleError && error.code === code,
+  );
+  assert.equal(existsSync(join(root, 'objects')), false);
+  assert.equal(existsSync(storeIndexPath(root)), false);
+  assert.equal(existsSync(state.journalPath), false);
+}
+
 test('runtime absence preserves the existing canonical manifest bytes and golden bundle digest', () => {
   const sourceManifest = readFileSync(join(SOURCE, 'bundle.yaml'));
   const parsed = parseManifestBytes(sourceManifest);
@@ -98,13 +143,56 @@ test('runtime absence preserves the existing canonical manifest bytes and golden
   assert.deepEqual(Buffer.from(packed.bytes), readFileSync(GOLDEN));
 });
 
-test('runtime minimum-version-only declarations accept the running version and reject a higher minimum', () => {
-  assert.deepEqual(parseRuntime('minVersion: "0.5.0"').runtime, { minVersion: '0.5.0' });
+test('canonical bundle admission rejects complete-segment file-prefix collisions before writes', async () => {
+  assert.throws(
+    () => buildCanonicalTar([
+      { path: 'a', bytes: Buffer.from('root'), mode: 0o644 },
+      { path: 'a-', bytes: Buffer.from('intervening'), mode: 0o644 },
+      { path: 'a/b', bytes: Buffer.from('child'), mode: 0o644 },
+    ]),
+    (error: unknown) => error instanceof BundleError && error.code === 'ARCHIVE_PATH_PREFIX_COLLISION',
+  );
 
-  const error = errorFrom(() => parseRuntime('minVersion: "0.5.1"'));
+  const bytes = hostileTarball([
+    ...hostileFileEntry('a', 'root'),
+    ...hostileFileEntry('a-', 'intervening'),
+    ...hostileFileEntry('a/b', 'child'),
+  ]);
+  await assertAdmissionRejectedBeforeWrites(bytes, 'ARCHIVE_PATH_PREFIX_COLLISION');
+});
+
+test('canonical bundle paths reject backslashes while GitHub archive compatibility remains separate', async () => {
+  assert.equal(archivePathViolation('windows\\path.txt'), undefined);
+  assert.match(canonicalBundlePathViolation('windows\\path.txt') ?? '', /backslash/);
+  assert.throws(
+    () => buildCanonicalTar([
+      { path: 'windows\\path.txt', bytes: Buffer.from('x'), mode: 0o644 },
+    ]),
+    (error: unknown) => error instanceof BundleError && error.code === 'SOURCE_INVALID_PATH',
+  );
+
+  const bytes = hostileTarball(hostileFileEntry('windows\\path.txt', 'x'));
+  await assertAdmissionRejectedBeforeWrites(bytes, 'ARCHIVE_PATH_VIOLATION');
+});
+
+test('POSIX source packing rejects a literal backslash filename', { skip: process.platform === 'win32' }, () => {
+  const source = tempDir();
+  cpSync(SOURCE, source, { recursive: true });
+  writeFileSync(join(source, 'windows\\path.txt'), 'x');
+  const error = errorFrom(() => packBundle(source));
+  assert.equal(error.code, 'SOURCE_INVALID_PATH');
+  assert.match(error.message, /backslash/);
+});
+
+test('runtime minimum-version-only declarations accept the running version and reject a strictly higher minimum', () => {
+  const running = packageVersion();
+  const higher = nextPatchVersion(running);
+  assert.deepEqual(parseRuntime(`minVersion: "${running}"`).runtime, { minVersion: running });
+
+  const error = errorFrom(() => parseRuntime(`minVersion: "${higher}"`));
   assert.equal(error.code, 'RUNTIME_INCOMPATIBLE');
-  assert.match(error.message, /requires Owenloop >= 0\.5\.1/);
-  assert.match(error.message, /running version is 0\.5\.0/);
+  assert.ok(error.message.includes(`requires Owenloop >= ${higher}`));
+  assert.ok(error.message.includes(`running version is ${running}`));
   assert.match(error.message, /install or upgrade Owenloop/);
 });
 

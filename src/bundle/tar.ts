@@ -17,7 +17,12 @@ import { lstatSync, readdirSync } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { archivePathViolation, canonicalPaxNamePlaceholder, DEFAULT_TAR_LIMITS } from '../archive.ts';
+import {
+  canonicalBundleFilePrefix,
+  canonicalBundlePathViolation,
+  canonicalPaxNamePlaceholder,
+  DEFAULT_TAR_LIMITS,
+} from '../archive.ts';
 import type { TarLimits } from '../archive.ts';
 import { BundleError } from './types.ts';
 
@@ -102,13 +107,38 @@ function buildPaxPathRecord(path: string): Buffer {
  * canonical modes; the bundle packer guarantees both.
  */
 export function buildCanonicalTar(files: CanonicalFile[], limits: TarLimits = DEFAULT_TAR_LIMITS): Buffer {
-  let headerCount = 0;
-  const chunks: Buffer[] = [];
-  for (const f of files) {
-    const violation = archivePathViolation(f.path);
-    if (violation) {
-      throw new BundleError('SOURCE_INVALID_PATH', `unsafe path '${f.path}': ${violation}`, f.path);
-    }
+	let headerCount = 0;
+	const chunks: Buffer[] = [];
+	let previousPath: string | undefined;
+	const filePaths = new Set<string>();
+	for (const f of files) {
+		const violation = canonicalBundlePathViolation(f.path);
+		if (violation) {
+			throw new BundleError('SOURCE_INVALID_PATH', `unsafe path '${f.path}': ${violation}`, f.path);
+		}
+		if (previousPath !== undefined) {
+			const order = compareUtf8Paths(previousPath, f.path);
+			if (order === 0) {
+				throw new BundleError('ARCHIVE_DUPLICATE_PATH', `duplicate archive path '${f.path}'`, f.path);
+			}
+			if (order > 0) {
+				throw new BundleError(
+					'NON_CANONICAL_HEADER',
+					`archive entries are not sorted by UTF-8 path: '${f.path}' follows '${previousPath}'`,
+					f.path,
+				);
+			}
+		}
+		const filePrefix = canonicalBundleFilePrefix(f.path, filePaths);
+		if (filePrefix !== undefined) {
+			throw new BundleError(
+				'ARCHIVE_PATH_PREFIX_COLLISION',
+				`archive file path '${filePrefix}' is a complete-segment prefix of '${f.path}'`,
+				f.path,
+			);
+		}
+		filePaths.add(f.path);
+		previousPath = f.path;
     if (f.path.length > limits.maxPathLength) {
       throw new BundleError('ARCHIVE_PATH_TOO_LONG', `archive entry path length ${f.path.length} exceeds limit of ${limits.maxPathLength} chars`, f.path);
     }
@@ -227,7 +257,7 @@ export function collectSourceFiles(
       const abs = join(dirAbs, d.name);
       const rel = relPrefix === '' ? d.name : `${relPrefix}/${d.name}`;
       options.onVisit?.(rel);
-      const violation = archivePathViolation(rel);
+      const violation = canonicalBundlePathViolation(rel);
       if (violation) {
 	throw new BundleError('SOURCE_INVALID_PATH', `unsafe path '${rel}': ${violation}`, rel);
       }
@@ -257,5 +287,17 @@ export function collectSourceFiles(
   };
   walk(root, '');
 	out.sort((a, b) => compareUtf8Paths(a.rel, b.rel));
+	const filePaths = new Set<string>();
+	for (const file of out) {
+		const filePrefix = canonicalBundleFilePrefix(file.rel, filePaths);
+		if (filePrefix !== undefined) {
+			throw new BundleError(
+				'ARCHIVE_PATH_PREFIX_COLLISION',
+				`source file path '${filePrefix}' is a complete-segment prefix of '${file.rel}'`,
+				file.rel,
+			);
+		}
+		filePaths.add(file.rel);
+	}
   return out;
 }

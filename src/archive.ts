@@ -71,6 +71,33 @@ export function archivePathViolation(relPath: string): string | undefined {
   return undefined;
 }
 
+/**
+ * The canonical `.wnlp` path policy. GitHub archive compatibility deliberately
+ * keeps using {@link archivePathViolation}; bundle paths add the portable rule
+ * that `/` is the only separator, so a backslash is rejected rather than being
+ * interpreted differently by POSIX and Windows filesystems.
+ */
+export function canonicalBundlePathViolation(relPath: string): string | undefined {
+  const violation = archivePathViolation(relPath);
+  if (violation !== undefined) return violation;
+  if (relPath.includes('\\')) return "contains a backslash; canonical bundle paths must use '/' separators";
+  return undefined;
+}
+
+/** Return the prior regular-file path that would have to be a directory for `path`. */
+export function canonicalBundleFilePrefix(
+  path: string,
+  priorFilePaths: ReadonlySet<string>,
+): string | undefined {
+  let slash = path.indexOf('/');
+  while (slash !== -1) {
+    const prefix = path.slice(0, slash);
+    if (priorFilePaths.has(prefix)) return prefix;
+    slash = path.indexOf('/', slash + 1);
+  }
+  return undefined;
+}
+
 /** POSIX-absolute, UNC-absolute, or Windows-drive-absolute path test. */
 function isAbsoluteArchivePath(relPath: string): boolean {
   return /^[\\/]/.test(relPath) || /^[A-Za-z]:/.test(relPath);
@@ -103,6 +130,7 @@ export type ArchiveViolationCode =
   | 'ARCHIVE_PATH_TOO_LONG'
   | 'ARCHIVE_PATH_VIOLATION'
   | 'ARCHIVE_DUPLICATE_PATH'
+  | 'ARCHIVE_PATH_PREFIX_COLLISION'
   | 'ARCHIVE_TRUNCATED'
   | 'ARCHIVE_BAD_CHECKSUM'
   | 'ARCHIVE_BAD_OCTAL'
@@ -366,6 +394,7 @@ export function parseTar(tar: Uint8Array, limits: TarLimits, opts: ParseTarOptio
   let headerCount = 0;
   let pendingPaxPath: string | undefined;
   let lastPath: string | undefined;
+  const strictFilePaths = new Set<string>();
 
   const failCompat = (message: string): never => {
     throw new Error(message);
@@ -522,7 +551,7 @@ export function parseTar(tar: Uint8Array, limits: TarLimits, opts: ParseTarOptio
 	failCompat(message);
       }
       if (strict) {
-	const violation = archivePathViolation(candidateName);
+	const violation = canonicalBundlePathViolation(candidateName);
 	if (violation) {
 	  const message = `unsafe archive path '${candidateName}': ${violation}`;
 	  failStrict('ARCHIVE_PATH_VIOLATION', message, { entryPath: candidateName });
@@ -576,7 +605,7 @@ export function parseTar(tar: Uint8Array, limits: TarLimits, opts: ParseTarOptio
       if (name.length > limits.maxPathLength) {
 	failStrict('ARCHIVE_PATH_TOO_LONG', `archive entry path length ${name.length} exceeds limit of ${limits.maxPathLength} chars`, { entryPath: name.slice(0, 128) });
       }
-      const violation = archivePathViolation(name);
+      const violation = canonicalBundlePathViolation(name);
       if (violation) {
 	failStrict('ARCHIVE_PATH_VIOLATION', `unsafe archive path '${name}': ${violation}`, { entryPath: name });
       }
@@ -598,6 +627,15 @@ export function parseTar(tar: Uint8Array, limits: TarLimits, opts: ParseTarOptio
 	  failStrict('NON_CANONICAL_HEADER', `archive entries are not sorted by UTF-8 path: '${name}' follows '${lastPath}'`, { entryPath: name });
 	}
       }
+      const filePrefix = canonicalBundleFilePrefix(name, strictFilePaths);
+      if (filePrefix !== undefined) {
+	failStrict(
+	  'ARCHIVE_PATH_PREFIX_COLLISION',
+	  `archive file path '${filePrefix}' is a complete-segment prefix of '${name}'`,
+	  { entryPath: name },
+	);
+      }
+      strictFilePaths.add(name);
       lastPath = name;
       out.push({
 	path: name,

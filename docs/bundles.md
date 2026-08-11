@@ -28,7 +28,7 @@ report/
 
 The packer recursively includes regular files below the source directory. The packer refuses symlinks, device files, FIFOs, sockets, and any other non-regular filesystem node. Directory entries are implied by file paths and are not stored in the archive.
 
-Each workflow definition is authoritative for that workflow's execution. A `bodyFile` reference in a step or judge is relative to the directory containing that workflow YAML file. For example, `bodyFile: instructions/writer.md` in `workflows/delivery.yaml` resolves to `workflows/instructions/writer.md`. The authored `bodyFile` and the resolved archive path must both satisfy the archive path safety policy. The packer and archive reader apply the same rule before parsing the workflow.
+Each workflow definition is authoritative for that workflow's execution. A `bodyFile` reference in a step or judge is relative to the directory containing that workflow YAML file. For example, `bodyFile: instructions/writer.md` in `workflows/delivery.yaml` resolves to `workflows/instructions/writer.md`. The authored `bodyFile` and the resolved archive path must both satisfy the canonical bundle path safety policy. The packer and strict archive reader apply the same rule before parsing the workflow.
 
 ## `bundle.yaml`
 
@@ -73,7 +73,7 @@ The following rules apply:
 - `package.name` is a portable package namespace. The default store coordinate for the package is `package.name/package.name@package.version`; an explicit store namespace override may replace the first component. A workflow definition name is not the package name.
 - `package.version` is a non-empty printable ASCII version string without path separators.
 - `runtime` is optional. When present, `runtime` is a closed mapping that contains `minVersion`, `features`, or both; `runtime: {}` is invalid. Runtime requirements are described in [Runtime compatibility](#runtime-compatibility).
-- `workflows` is a non-empty map from workflow names to archive-relative YAML paths. Each workflow name matches `/^[a-z][a-z0-9-]*$/`. Each path must pass the shared archive path safety policy, and two workflow names may not point to the same path.
+- `workflows` is a non-empty map from workflow names to archive-relative YAML paths. Each workflow name matches `/^[a-z][a-z0-9-]*$/`. Each path must pass the canonical bundle path safety policy, and two workflow names may not point to the same path.
 - A workflow file's `name:` must equal the workflow map key. For example, `workflows.delivery` must point to a file containing `name: delivery`.
 - An installed workflow is addressable from `calls:` by the qualified name `<package>/<workflow>`. A bare `calls: <workflow>` inside a CAS-installed bundle is resolved to a sibling from that same bundle; it does not search unrelated bundles for a same-named workflow.
 - `default` is optional. When present, `default` must be one of the workflow map keys. When absent, a single-workflow package has that one workflow as its implicit default; a package with two or more workflows has no implicit default and callers must name a workflow explicitly.
@@ -120,8 +120,10 @@ The def digest is the lowercase SHA-256 hash of the exact **uncompressed canonic
 
 For every regular file:
 
-- Archive paths use `/` separators and are sorted by ascending UTF-8 bytes.
-- Empty paths, NUL bytes, absolute paths, Windows drive paths, UNC paths, and `.` or `..` path segments are rejected. The same path policy is shared with GitHub archive extraction through `owenloop add`.
+- Archive paths use `/` separators and are sorted by ascending UTF-8 bytes. A backslash is rejected as a character in a canonical bundle path; the reader never treats a backslash as an alternate separator.
+- Empty paths, NUL bytes, absolute paths, Windows drive paths, UNC paths, and `.` or `..` path segments are rejected.
+- A regular-file path may not be a complete-segment prefix of another regular-file path. For example, one archive cannot contain both `a` and `a/b` because `a` cannot be both a regular file and a parent directory.
+- The canonical `.wnlp` path policy is deliberately stricter than the GitHub archive compatibility policy used by `owenloop add`. GitHub archive handling keeps its separate compatibility rules; ordinary backslashes that policy accepts are still invalid in canonical bundle paths.
 - `uid` and `gid` are `0`.
 - `uname` and `gname` are empty.
 - `mtime` is `0`.
@@ -141,7 +143,7 @@ The strict reader is as constrained as the writer. Every byte range parsed by th
 
 ## Reading and extraction safety
 
-`inspectBundle` and `unpackBundle` apply bounded compressed size, expanded size, tar-header count, per-file size, and path length limits before returning or writing file data. Strict readers reject malformed checksums and octal fields, truncated headers or data, malformed or dangling PAX metadata, duplicate paths, unsupported entry types, non-canonical headers, unsorted effective paths, trailing bytes, missing manifests, invalid manifests, runtime-incompatible manifests, missing or invalid workflows, unsafe workflow paths, workflow validation failures, and integrity mismatches.
+`inspectBundle` and `unpackBundle` apply bounded compressed size, expanded size, tar-header count, per-file size, and path length limits before returning or writing file data. Strict readers reject malformed checksums and octal fields, truncated headers or data, malformed or dangling PAX metadata, duplicate paths, complete-segment file-prefix collisions, backslashes, unsupported entry types, non-canonical headers, unsorted effective paths, trailing bytes, missing manifests, invalid manifests, runtime-incompatible manifests, missing or invalid workflows, unsafe workflow paths, workflow validation failures, and integrity mismatches.
 
 `parseManifestBytes` is the common runtime-admission boundary. Source packing, packed inspection, unpacking, workflow-store installation, installed-object verification, definition discovery, instruction lookup, and worker execution all pass through that boundary before returning usable definitions or instructions.
 
@@ -155,7 +157,9 @@ After the per-file checks pass, the verifier reconstructs the complete canonical
 
 A store index entry records the sorted workflow names alongside the package coordinate and bundle digest. Runtime instruction resolution reads the verified installed manifest and loads every listed workflow; a requested instruction digest may match any workflow in the installed object. A verification failure prevents the object from populating usable definition and instruction caches. Cache hits are re-verified, and a later failure evicts the cached object.
 
-This check is separate from the read-only file modes applied during install. Installation maps canonical `0644` files to read-only `0444` and canonical `0755` files to read/execute-only `0555`, preserving the executable distinction needed to reconstruct identity. Changing an installed object on disk therefore produces an integrity refusal at resolution time, not a best-effort read and not an `unknown-digest` fallback. An executable file installed by an older Owenloop release may already have lost its execute bit because older hardening mapped every file to `0444`; reinstall that object from its original `.wnlp` bytes before using complete-object verification.
+This check is separate from the read-only file modes applied during install. Installation maps canonical `0644` files to read-only `0444` and canonical `0755` files to read/execute-only `0555`, preserving the executable distinction needed to reconstruct identity. Changing an installed object on disk therefore produces an integrity refusal at resolution time, not a best-effort read and not an `unknown-digest` fallback.
+
+An executable file installed by an older Owenloop release may already have lost its execute bit because older hardening mapped every regular file to `0444`. Reinstalling the exact original `.wnlp` is a supported atomic repair for that same-digest object. Owenloop first applies strict archive parsing, manifest and runtime admission, configured signature and policy verification, per-file integrity verification, and canonical digest verification to the supplied archive. Owenloop then reconstructs and completely verifies a clean staged object before replacing the broken destination through the normal journaled directory swap. The broken object's bytes are never reused. The prior object remains as the swap backup until the unchanged same-digest index state is durably committed; a failed repair restores the recoverable prior object and index state. A successful repair preserves the existing coordinate-to-digest mapping, and a later reinstall follows normal idempotent deduplication.
 
 ## Bundle assets during execution
 
