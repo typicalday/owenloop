@@ -1206,6 +1206,7 @@ their live hub bindings. `--title <text>` is display-only. Both `--crew` and
 usage errors before credential or network access. The command does not claim,
 dispatch, close, or otherwise drive work—the standing Shift discovers the run
 through its normal crew inbox.
+
 **Publishing hub resolution.** `connect`, `push`, and `publish` resolve their
 target in this order:
 
