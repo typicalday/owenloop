@@ -195,6 +195,24 @@ test('push --bundle uploads exact signed bundle identity and creates a bundle-ba
   );
 });
 
+test('push --bundle --hub overrides the project binding without rewriting it', async () => {
+  const hub = makeFakeHub();
+  const t = makeIo();
+  const bundle = writePushBundle(t.cwd);
+  bind(t); // project binding remains ORIGIN
+  t.store.set(kcHuman(OTHER_ORIGIN), JSON.stringify(OAUTH_CRED));
+  hub.routes['POST /api/bundles'] = () => ({ status: 200, json: { ok: true } });
+  hub.routes[`POST /api/publications/${bundle.digest}`] = () => ({ status: 200, json: { ok: true } });
+  const { fetch, calls } = routedFetch(hub.routes);
+  t.io.fetch = fetch;
+
+  const code = await mainAsync(['push', '--bundle', bundle.path, '--hub', OTHER_ORIGIN], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.ok(calls.length > 0);
+  assert.ok(calls.every((call) => call.url.startsWith(OTHER_ORIGIN)), 'every bundle request uses the explicit origin');
+  assert.deepEqual(readHubBinding(hubBindingPath(t.cwd)), { version: 1, hub: ORIGIN });
+});
+
 test('push --bundle re-sends create_workflow even when the remote YAML hash is unchanged', async () => {
   const t = makeIo();
   const bundle = writePushBundle(t.cwd);
@@ -1167,6 +1185,20 @@ test('push: no binding or global candidate exits 2 without using OWENLOOP_HUB or
   assert.match(t.err.join('\n'), /owenloop connect --hub <origin>/);
   assert.equal(calls.length, 0, 'no DEFAULT_HUB or OWENLOOP_HUB request was attempted');
   assert.equal(readHubBinding(hubBindingPath(t.cwd)), null, 'push never writes a project binding');
+});
+
+test('push: malformed non-enumerable settings fail closed before any network call', async () => {
+  const { fetch, calls } = routedFetch({});
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': validDef('foo') });
+  const path = settingsPath(t.io.env);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, '{"hubOrigin":');
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /malformed settings file/);
+  assert.equal(calls.length, 0);
 });
 
 test('push: bound but no stored credential errors with a login hint', async () => {
