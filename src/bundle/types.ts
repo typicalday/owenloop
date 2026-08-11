@@ -27,6 +27,7 @@ export type BundleErrorCode =
   | 'UNSUPPORTED_ENTRY_TYPE'
   | 'NON_CANONICAL_HEADER'
   | 'MANIFEST_ERROR'
+  | 'RUNTIME_INCOMPATIBLE'
   | 'UNSUPPORTED_FORMAT_VERSION'
   | 'MANIFEST_MISSING'
   | 'WORKFLOW_MISSING'
@@ -57,6 +58,14 @@ export class BundleError extends Error {
   }
 }
 
+/** Compatibility requirements that a format-v2 bundle places on its reader/runtime. */
+export interface BundleRuntimeRequirements {
+  /** Minimum canonical Owenloop SemVer accepted by the bundle. */
+  minVersion?: string;
+  /** Versioned runtime feature identifiers that the reader must implement. */
+  features?: string[];
+}
+
 /**
  * The v2 package-only manifest (`bundle.yaml`). All collections are
  * duplicate-free; serialization order is deterministic (see
@@ -71,6 +80,8 @@ export interface BundleManifest {
     /** Non-empty version string. */
     version: string;
   };
+  /** Optional reader/runtime compatibility requirements. */
+  runtime?: BundleRuntimeRequirements;
   /** Workflow name to archive-relative definition path. */
   workflows: Record<string, string>;
   /** Optional default workflow name. */

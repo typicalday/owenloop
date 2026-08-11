@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, cpSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
@@ -73,6 +73,21 @@ function addIndexEntry(root: string, coordinate: string, digest: string): void {
   const index = readWorkflowStoreIndex(storeIndexPath(root));
   index.entries[coordinate] = { digest, pinned: false };
   writeWorkflowStoreIndex(storeIndexPath(root), index);
+}
+
+function makeRuntimeIncompatible(objectPath: string): void {
+  const manifestPath = join(objectPath, 'bundle.yaml');
+  chmodSync(objectPath, 0o755);
+  chmodSync(manifestPath, 0o644);
+  const manifest = readFileSync(manifestPath, 'utf8');
+  assert.match(manifest, /version: "1\.0\.0"\nworkflows:/);
+  writeFileSync(
+    manifestPath,
+    manifest.replace(
+      'version: "1.0.0"\nworkflows:',
+      'version: "1.0.0"\nruntime:\n  minVersion: "999.0.0"\nworkflows:',
+    ),
+  );
 }
 
 test('store instruction source: an empty store refuses an unknown projection digest', async () => {
@@ -213,6 +228,91 @@ test('store instruction source: a tampered installed object is an integrity refu
     source.prime(requested),
     (error: unknown) => error instanceof StoreIntegrityError && error.code === 'object-corrupt',
   );
+});
+
+test('store instruction source: a runtime-incompatible object never populates definition or instruction caches', async () => {
+  const installed = await installedSource();
+  const requested = defInstructionDigest(installed.definition);
+  makeRuntimeIncompatible(installed.result.objectPath);
+  const source = createStoreInstructionSource({
+    projectRoot: installed.root,
+    globalRoot: tempDir('owenloop-incompatible-global-'),
+    verifier: createBundleIngestor(),
+  });
+
+  await assert.rejects(source.prime(requested), /requires Owenloop >= 999\.0\.0/);
+  assert.equal(source.getVerifiedDefinition(requested), undefined);
+  assert.equal(source.getVerifiedStep(requested, 'runner'), undefined);
+  assert.equal(source.getVerifiedObject(requested), undefined);
+  assert.deepEqual(source.lookup({ defDigest: requested, step: 'runner', key: '' }), { status: 'unknown-digest' });
+});
+
+test('store instruction source: a failed cache re-verification evicts every definition from the changed object', async () => {
+  const childWorkflow = WORKFLOW
+    .replace('name: source-fixture', 'name: child-fixture')
+    .replace('name: runner', 'name: child-runner')
+    .replace('from-store', 'from-child');
+  const bundleSource = writeBundleSource({
+    name: 'source-fixture',
+    workflow: WORKFLOW,
+    workflows: { 'child-fixture': childWorkflow },
+  });
+  const installed = await installBundleFixture({ sourceDir: bundleSource });
+  const parent = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
+  const child = loadDefFile(join(installed.result.objectPath, 'child-fixture.yaml'));
+  const definitions = finalizeDefs(new Map([
+    [parent.name, parent],
+    [child.name, child],
+  ]));
+  const parentDefinition = definitions.get(parent.name);
+  const childDefinition = definitions.get(child.name);
+  assert.ok(parentDefinition !== undefined);
+  assert.ok(childDefinition !== undefined);
+  const parentDigest = defInstructionDigest(parentDefinition);
+  const childDigest = defInstructionDigest(childDefinition);
+  const source = createStoreInstructionSource({
+    projectRoot: installed.root,
+    globalRoot: tempDir('owenloop-incompatible-cache-global-'),
+    verifier: createBundleIngestor(),
+  });
+  assert.equal(await source.prime(parentDigest), 'resolved');
+  assert.equal(await source.prime(childDigest), 'resolved');
+  assert.ok(source.getVerifiedDefinition(parentDigest) !== undefined);
+  assert.ok(source.getVerifiedDefinition(childDigest) !== undefined);
+
+  makeRuntimeIncompatible(installed.result.objectPath);
+  await assert.rejects(source.prime(parentDigest), /requires Owenloop >= 999\.0\.0/);
+  assert.equal(source.getVerifiedDefinition(parentDigest), undefined);
+  assert.equal(source.getVerifiedDefinition(childDigest), undefined);
+  assert.deepEqual(source.lookup({ defDigest: parentDigest, step: 'runner', key: '' }), { status: 'unknown-digest' });
+  assert.deepEqual(source.lookup({ defDigest: childDigest, step: 'child-runner', key: '' }), { status: 'unknown-digest' });
+});
+
+test('store instruction resolver: runtime incompatibility refuses before definition verification or instruction return', async () => {
+  const installed = await installedSource();
+  const requested = defInstructionDigest(installed.definition);
+  makeRuntimeIncompatible(installed.result.objectPath);
+  let definitionVerifierCalls = 0;
+  const resolver = createStoreInstructionResolver({
+    projectRoot: installed.root,
+    globalRoot: tempDir('owenloop-incompatible-resolver-global-'),
+    verifier: createBundleIngestor(),
+    definitionVerifier: () => {
+      definitionVerifierCalls++;
+      return { kind: 'verified', publisherKeyId: '', principal: '' };
+    },
+  });
+
+  const command = await resolver.resolveCommand(order(requested));
+  assert.equal(command.ok, false);
+  if (!command.ok) {
+    assert.equal(command.kind, 'integrity');
+    assert.match(command.reason, /requires Owenloop >= 999\.0\.0/);
+  }
+  const step = await resolver.resolveStep(order(requested));
+  assert.equal(step.ok, false);
+  if (!step.ok) assert.equal(step.kind, 'integrity');
+  assert.equal(definitionVerifierCalls, 0);
 });
 
 test('store instruction source: digestOf refuses definitions that are not installed and primed', async () => {

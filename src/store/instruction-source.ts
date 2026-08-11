@@ -157,8 +157,31 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
   const candidateFailureForRefusal = (error: unknown): unknown =>
     error instanceof StoreIntegrityError && error.code === 'object-missing' ? undefined : error;
 
+  const evictObject = (bundleDigest: DefDigest, objectPath: string): void => {
+    for (const [instructionDigest, cached] of cache) {
+      if (cached.bundleDigest === bundleDigest && cached.objectPath === objectPath) {
+        cache.delete(instructionDigest);
+      }
+    }
+  };
+
+  const verifyCached = async (requestedDigest: string): Promise<boolean> => {
+    const cached = cache.get(requestedDigest);
+    if (cached === undefined) return false;
+    try {
+      await args.verifier.verifyInstalledObject({
+        objectDir: cached.objectPath,
+        digest: cached.bundleDigest,
+      });
+      return true;
+    } catch (error) {
+      evictObject(cached.bundleDigest, cached.objectPath);
+      throw error;
+    }
+  };
+
   const primeOnce = async (requestedDigest: string): Promise<'resolved' | 'unknown-digest'> => {
-    if (cache.has(requestedDigest)) return 'resolved';
+    if (await verifyCached(requestedDigest)) return 'resolved';
 
     // Indexes can retain stale or damaged sibling objects. A candidate failure
     // must not prevent a later, clean object from satisfying the requested
@@ -179,8 +202,6 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
   };
 
   const prime = (requestedDigest: string): Promise<'resolved' | 'unknown-digest'> => {
-    const cached = cache.get(requestedDigest);
-    if (cached !== undefined) return Promise.resolve('resolved');
     const existing = inFlight.get(requestedDigest);
     if (existing !== undefined) return existing;
 

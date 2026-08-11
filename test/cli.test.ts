@@ -10,6 +10,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
+  cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -2179,11 +2180,13 @@ test('bundle commands are store-free, JSON-only, and round-trip the golden fixtu
   assert.equal(existsSync(bundlePath), true);
   assert.equal(existsSync(join(home, '.owenloop')), false);
   assert.equal(packed.json().digest, '132888c4faf07f2e20f15eb7101d98ee0a80e9d4461375f69bb602b7ac8b9042');
+  assert.equal(Object.prototype.hasOwnProperty.call(packed.json(), 'runtime'), false);
 
   const inspected = run('bundle', 'inspect', bundlePath);
   assert.equal(inspected.code, 0, inspected.err);
   assert.equal(inspected.err, '');
   assert.equal(inspected.json().digest, packed.json().digest);
+  assert.equal(Object.prototype.hasOwnProperty.call(inspected.json().manifest, 'runtime'), false);
   assert.equal(run('bundle', 'digest', bundlePath).json().digest, packed.json().digest);
 
   const extracted = run('bundle', 'unpack', bundlePath, unpacked);
@@ -2191,6 +2194,45 @@ test('bundle commands are store-free, JSON-only, and round-trip the golden fixtu
   assert.equal(existsSync(join(unpacked, 'workflows', 'golden.yaml')), true);
   assert.equal(existsSync(join(unpacked, 'workflows', 'init.yaml')), true);
   assert.equal(existsSync(join(home, '.owenloop')), false);
+});
+
+test('bundle pack and inspect JSON expose a present normalized runtime declaration', () => {
+  const goldenSource = join(import.meta.dirname, 'fixtures', 'bundle', 'golden-source');
+  const { run, home } = makeCli({ setDbEnv: false });
+  const source = join(home, 'source');
+  cpSync(goldenSource, source, { recursive: true });
+  const manifestPath = join(source, 'bundle.yaml');
+  writeFileSync(
+    manifestPath,
+    readFileSync(manifestPath, 'utf8').replace(
+      'workflows:',
+      [
+        'runtime:',
+        '  features:',
+        '    - native-judge-policy-inheritance.v1',
+        '    - harness-policy-enforcement.v1',
+        '  minVersion: 0.5.0',
+        'workflows:',
+      ].join('\n'),
+    ),
+  );
+  const bundlePath = join(home, 'runtime.wnlp');
+
+  const packed = run('bundle', 'pack', source, '--output', bundlePath);
+  assert.equal(packed.code, 0, packed.err);
+  assert.deepEqual(packed.json().runtime, {
+    minVersion: '0.5.0',
+    features: [
+      'harness-policy-enforcement.v1',
+      'native-judge-policy-inheritance.v1',
+    ],
+  });
+
+  const inspected = run('bundle', 'inspect', bundlePath);
+  assert.equal(inspected.code, 0, inspected.err);
+  assert.deepEqual(inspected.json().manifest.runtime, packed.json().runtime);
+  const archivedManifest = readFileSync(join(home, 'source', 'bundle.yaml'), 'utf8');
+  assert.match(archivedManifest, /native-judge-policy-inheritance\.v1/);
 });
 
 test('bundle CLI rejects malformed subcommand arguments before side effects', () => {

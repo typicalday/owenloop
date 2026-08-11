@@ -183,8 +183,11 @@ export function objectDestRelPath(digest: DefDigest): string {
 // ---- permission hardening --------------------------------------------------------
 
 /**
- * Set regular files read-only (0o444) and directories non-writable (0o555)
- * under `dir`, recursively, INCLUDING `dir` itself. Defense in depth only —
+ * Set non-executable regular files read-only (0o444), executable regular
+ * files read/execute-only (0o555), and directories non-writable (0o555) under
+ * `dir`, recursively, INCLUDING `dir` itself. Preserving the executable bit is
+ * required to reconstruct the canonical 0644/0755 bundle identity. Defense in
+ * depth only —
  * permissions are NOT the integrity proof (verification is). Any chmod
  * failure propagates: an object that cannot be hardened is not committed
  * (the caller rolls staging back), so a partially-hardened object never
@@ -208,7 +211,7 @@ export function hardenObjectModes(dir: string): void {
     if (entrySt.isDirectory()) {
       hardenObjectModes(full);
     } else if (entrySt.isFile()) {
-      chmodSync(full, 0o444);
+      chmodSync(full, (entrySt.mode & 0o111) === 0 ? 0o444 : 0o555);
     } else {
       throw new StorePathError(`refusing to harden '${full}': unexpected file type`);
     }

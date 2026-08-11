@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
+import { manifestToBytes, parseManifestBytes } from '../src/bundle/manifest.ts';
+import { SUPPORTED_RUNTIME_FEATURES } from '../src/bundle/runtime.ts';
 import { createBundleIngestor } from '../src/store/index.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from './helpers/store-fixture.ts';
 
@@ -20,10 +22,11 @@ steps:
     body: ""
 `;
 
-function sourceDir(): string {
+function sourceDir(runtimeYaml?: string): string {
   return writeBundleSource({
     name: 'ingestor-fixture',
     workflow: WORKFLOW,
+    ...(runtimeYaml === undefined ? {} : { runtimeYaml }),
     files: { 'notes/readme.txt': 'fixture note\n' },
   });
 }
@@ -55,6 +58,63 @@ test('store ingestor: a real packBundle archive installs and verifies as an immu
   assert.deepEqual(installed.result.workflows, ['ingestor-fixture']);
   assert.equal(readFileSync(join(installed.result.objectPath, 'workflow.yaml'), 'utf8'), WORKFLOW);
   assert.equal(readFileSync(join(installed.result.objectPath, 'notes', 'readme.txt'), 'utf8'), 'fixture note\n');
+});
+
+test('store ingestor: a compatible runtime declaration installs and verifies', async () => {
+  const installed = await installBundleFixture({
+    sourceDir: sourceDir([
+      'minVersion: "0.5.0"',
+      'features:',
+      ...SUPPORTED_RUNTIME_FEATURES.map((feature) => `  - "${feature}"`),
+    ].join('\n')),
+  });
+
+  await createBundleIngestor().verifyInstalledObject({
+    objectDir: installed.result.objectPath,
+    digest: installed.result.digest,
+  });
+  assert.deepEqual(
+    parseManifestBytes(readFileSync(join(installed.result.objectPath, 'bundle.yaml'))).runtime,
+    { minVersion: '0.5.0', features: [...SUPPORTED_RUNTIME_FEATURES] },
+  );
+});
+
+test('store ingestor: runtime-only bundle.yaml mutation or removal fails canonical digest verification', async () => {
+  for (const mutation of ['change', 'remove'] as const) {
+    const installed = await installBundleFixture({
+      sourceDir: sourceDir(`features:\n  - "${SUPPORTED_RUNTIME_FEATURES[0]}"`),
+    });
+    const manifestPath = join(installed.result.objectPath, 'bundle.yaml');
+    makeWritable(installed.result.objectPath, manifestPath);
+    const manifest = parseManifestBytes(readFileSync(manifestPath));
+    const mutated = mutation === 'remove'
+      ? { ...manifest, runtime: undefined }
+      : { ...manifest, runtime: { features: [...SUPPORTED_RUNTIME_FEATURES] } };
+    writeFileSync(manifestPath, manifestToBytes(mutated));
+
+    await assert.rejects(
+      createBundleIngestor().verifyInstalledObject({
+        objectDir: installed.result.objectPath,
+        digest: installed.result.digest,
+      }),
+      /canonical bundle digest mismatch/,
+      mutation,
+    );
+  }
+});
+
+test('store ingestor: executable identity survives read-only hardening and canonical verification', async () => {
+  const source = sourceDir();
+  const executable = join(source, 'run.sh');
+  writeFileSync(executable, '#!/bin/sh\nexit 0\n');
+  chmodSync(executable, 0o755);
+  const installed = await installBundleFixture({ sourceDir: source });
+
+  assert.equal(statSync(join(installed.result.objectPath, 'run.sh')).mode & 0o777, 0o555);
+  await createBundleIngestor().verifyInstalledObject({
+    objectDir: installed.result.objectPath,
+    digest: installed.result.digest,
+  });
 });
 
 test('store ingestor: modified installed bytes fail the manifest integrity check', async () => {

@@ -29,6 +29,8 @@ export function writeBundleSource(args: {
   name: string;
   version?: string;
   workflow: string;
+  /** Optional already-indented runtime member lines (without the `runtime:` key). */
+  runtimeYaml?: string;
   /** Additional workflow name to YAML content entries, stored at the root. */
   workflows?: Record<string, string>;
   files?: Record<string, string>;
@@ -41,6 +43,9 @@ export function writeBundleSource(args: {
     'package:',
     `  name: ${args.name}`,
     `  version: ${version}`,
+    ...(args.runtimeYaml === undefined
+      ? []
+      : ['runtime:', ...args.runtimeYaml.split('\n').map((line) => `  ${line}`)]),
     'workflows:',
     ...Object.keys(workflowContents).map((name) => `  ${name}: ${JSON.stringify(name === args.name ? 'workflow.yaml' : `${name}.yaml`)}`),
     'platforms: []',

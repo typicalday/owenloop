@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
 
@@ -213,6 +213,37 @@ test('launch gate: altered instruction bytes refuse before an agent prompt is re
     alteredWorkflow,
     'L2: altered instruction bytes were actually delivered',
   );
+});
+
+test('launch gate: runtime incompatibility refuses before an agent harness or provider starts', async () => {
+  const installed = await installWorkflow({
+    name: 'launch-gate-instruction',
+    workflow: agentWorkflow('Never render this incompatible prompt.'),
+    projectRoot: tempDir('owenloop-launch-gate-instruction-project-'),
+  });
+  fixtures.push(installed);
+  const manifestPath = join(installed.objectPath, 'bundle.yaml');
+  chmodSync(installed.objectPath, 0o755);
+  chmodSync(manifestPath, 0o644);
+  const manifest = readFileSync(manifestPath, 'utf8');
+  writeFileSync(
+    manifestPath,
+    manifest.replace(
+      'version: "1.0.0"\nworkflows:',
+      'version: "1.0.0"\nruntime:\n  minVersion: "999.0.0"\nworkflows:',
+    ),
+  );
+
+  const hostile = await runAgent(
+    installed,
+    order(installed.defDigest, 'run-instruction-runtime-incompatible'),
+  );
+  assert.equal(hostile.code, 1);
+  assert.ok(
+    hostile.errors.some((line) => line.includes('instruction refusal (integrity)') && line.includes('requires Owenloop >= 999.0.0')),
+    `expected runtime integrity refusal, got ${hostile.errors.join('\n')}`,
+  );
+  assert.equal(hostile.calls.some((call) => call.kind === 'start'), false);
 });
 
 test('launch gate: an unknown instruction digest refuses before an agent prompt is rendered', async () => {

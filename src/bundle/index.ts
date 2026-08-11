@@ -41,6 +41,7 @@ export type {
   BundleErrorCode,
   BundleLimits,
   BundleManifest,
+  BundleRuntimeRequirements,
   InspectOptions,
   InspectResult,
   PackOptions,
@@ -527,6 +528,22 @@ export function packBundle(sourceDir: string, opts: PackOptions = {}): PackResul
   }
   const canonicalManifest: BundleManifest = {
     ...sourceManifest,
+    ...(sourceManifest.runtime === undefined
+      ? {}
+      : {
+          runtime: {
+            ...(sourceManifest.runtime.minVersion === undefined
+              ? {}
+              : { minVersion: sourceManifest.runtime.minVersion }),
+            ...(sourceManifest.runtime.features === undefined
+              ? {}
+              : {
+                  features: [...sourceManifest.runtime.features].sort((a, b) =>
+                    Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')),
+                  ),
+                }),
+          },
+        }),
     integrity: { algorithm: 'sha256', files: integrityFiles },
   };
   const canonicalBytes = manifestToBytes(canonicalManifest);

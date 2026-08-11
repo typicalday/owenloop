@@ -77,6 +77,8 @@ test('npm pack includes everything a consumer needs', () => {
     'dist/src/bundle/index.d.ts',
     'dist/src/bundle/types.d.ts',
     'dist/src/bundle/manifest.js',
+    'dist/src/bundle/runtime.js',
+    'dist/src/bundle/runtime.d.ts',
     'dist/src/bundle/tar.js',
     'dist/packages/work/src/main.js',
     'dist/packages/work/src/main.d.ts',

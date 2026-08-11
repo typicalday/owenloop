@@ -703,6 +703,7 @@ function printBundlePackResult(io: CliIO, outputAbs: string, packed: ReturnType<
     digest: packed.digest,
     name: packed.manifest.package.name,
     version: packed.manifest.package.version,
+    ...(packed.manifest.runtime === undefined ? {} : { runtime: packed.manifest.runtime }),
     files: packed.entries.length,
   });
 }

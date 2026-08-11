@@ -9,8 +9,10 @@
 
 import { lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative, sep } from 'node:path';
+import { archivePathViolation } from '../archive.ts';
 import { unpackBundle } from '../bundle/index.ts';
 import { parseManifestBytes, sha256Hex } from '../bundle/manifest.ts';
+import { buildCanonicalTar } from '../bundle/tar.ts';
 import type { BundleManifest } from '../bundle/types.ts';
 import { StorePathError, workflowCoordinate } from './types.ts';
 import type { WorkflowCoordinate } from './types.ts';
@@ -75,12 +77,14 @@ export function verifyWorkflowObjectSync(objectDir: string, digest: DefDigest): 
     refuse(manifestPath, `invalid bundle.yaml for digest ${digest}: ${(error as Error).message}`);
   }
 
-  const actual = new Map<string, string>();
+  const actual = new Map<string, { bytes: Buffer; sha256: string; mode: 0o644 | 0o755 }>();
   const walk = (directory: string): void => {
     const entries = readdirSync(directory);
     for (const entry of entries) {
       const full = join(directory, entry);
       const rel = posixRelative(objectDir, full);
+      const violation = archivePathViolation(rel);
+      if (violation !== undefined) refuse(full, `unsafe installed path '${rel}': ${violation}`);
       const st = lstatSync(full, { throwIfNoEntry: false });
       if (st === undefined) refuse(full, 'path disappeared during verification');
       if (st.isSymbolicLink()) refuse(full, 'object contains a symlink');
@@ -88,7 +92,12 @@ export function verifyWorkflowObjectSync(objectDir: string, digest: DefDigest): 
         walk(full);
       } else if (st.isFile()) {
         try {
-          actual.set(rel, sha256Hex(readFileSync(full)));
+          const bytes = readFileSync(full);
+          actual.set(rel, {
+            bytes,
+            sha256: sha256Hex(bytes),
+            mode: (st.mode & 0o111) === 0 ? 0o644 : 0o755,
+          });
         } catch (error) {
           refuse(full, `could not read regular file: ${(error as Error).message}`);
         }
@@ -104,8 +113,8 @@ export function verifyWorkflowObjectSync(objectDir: string, digest: DefDigest): 
     if (found === undefined) {
       refuse(join(objectDir, path), `integrity map lists missing file '${path}' for digest ${digest}`);
     }
-    if (found !== expected) {
-      refuse(join(objectDir, path), `integrity mismatch for '${path}' (expected ${expected}, got ${found})`);
+    if (found.sha256 !== expected) {
+      refuse(join(objectDir, path), `integrity mismatch for '${path}' (expected ${expected}, got ${found.sha256})`);
     }
   }
 
@@ -114,6 +123,22 @@ export function verifyWorkflowObjectSync(objectDir: string, digest: DefDigest): 
     if (!Object.prototype.hasOwnProperty.call(manifest.integrity.files, path)) {
       refuse(join(objectDir, path), `file '${path}' is not listed in bundle.yaml integrity.files`);
     }
+  }
+
+  let canonicalTar: Buffer;
+  try {
+    canonicalTar = buildCanonicalTar(
+      [...actual.entries()].map(([path, file]) => ({ path, bytes: file.bytes, mode: file.mode })),
+    );
+  } catch (error) {
+    refuse(objectDir, `could not reconstruct canonical bundle bytes: ${(error as Error).message}`);
+  }
+  const actualDigest = sha256Hex(canonicalTar);
+  if (actualDigest !== digest) {
+    refuse(
+      objectDir,
+      `canonical bundle digest mismatch (expected content-addressed digest ${digest}, got ${actualDigest})`,
+    );
   }
 }
 

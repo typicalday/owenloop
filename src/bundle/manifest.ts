@@ -29,8 +29,9 @@ import {
 } from 'yaml';
 import type { ParsedNode, Pair } from 'yaml';
 import { archivePathViolation } from '../archive.ts';
+import { assertCurrentRuntimeCompatible, isCanonicalSemver } from './runtime.ts';
 import { BundleError } from './types.ts';
-import type { BundleManifest } from './types.ts';
+import type { BundleManifest, BundleRuntimeRequirements } from './types.ts';
 
 /** Lowercase 64-hex SHA-256 of `bytes`. */
 export function sha256Hex(bytes: Uint8Array): string {
@@ -44,6 +45,8 @@ const PACKAGE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 export const WORKFLOW_NAME_RE = /^[a-z][a-z0-9-]*$/;
 /** Version: printable ASCII, no separators that would break filenames or lock keys. */
 const VERSION_RE = /^[!-~]{1,128}$/;
+/** Versioned runtime feature identifier ending in a positive `.vN` version. */
+const RUNTIME_FEATURE_RE = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\.v[1-9][0-9]*$/;
 /** Platform selector: `os-arch`-style identifier. */
 const PLATFORM_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 /** Capability class identifier. */
@@ -189,7 +192,7 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
     root,
     ['formatVersion', 'package', 'workflows', 'platforms', 'integrity', 'capabilities', 'lock'],
     'bundle.yaml',
-    ['default'],
+    ['runtime', 'default'],
   );
 
   // formatVersion — refuse future versions rather than guess.
@@ -211,6 +214,60 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
   const version = asString(pkg['version'], 'bundle.yaml.package.version');
   if (!VERSION_RE.test(version) || version.includes('/') || version.includes('\\')) {
     throw new BundleError('MANIFEST_ERROR', `bundle.yaml.package.version: '${version}' must be 1-128 printable ASCII chars with no '/' or '\\'`);
+  }
+
+  // runtime — an optional closed compatibility declaration. Shape errors are
+  // MANIFEST_ERROR; a well-formed declaration unsupported by this process is
+  // RUNTIME_INCOMPATIBLE. Evaluate before workflow fields are consumed so all
+  // admission paths refuse an incompatible bundle before loading definitions.
+  let runtime: BundleRuntimeRequirements | undefined;
+  if (Object.prototype.hasOwnProperty.call(root, 'runtime')) {
+    const runtimeRaw = asMap(root['runtime'], 'bundle.yaml.runtime');
+    assertExactKeys(runtimeRaw, [], 'bundle.yaml.runtime', ['minVersion', 'features']);
+    if (!Object.prototype.hasOwnProperty.call(runtimeRaw, 'minVersion') &&
+        !Object.prototype.hasOwnProperty.call(runtimeRaw, 'features')) {
+      throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.runtime: must declare minVersion, features, or both');
+    }
+
+    let minVersion: string | undefined;
+    if (Object.prototype.hasOwnProperty.call(runtimeRaw, 'minVersion')) {
+      minVersion = asString(runtimeRaw['minVersion'], 'bundle.yaml.runtime.minVersion');
+      if (!isCanonicalSemver(minVersion)) {
+        throw new BundleError(
+          'MANIFEST_ERROR',
+          `bundle.yaml.runtime.minVersion: '${minVersion}' must be one canonical strict SemVer value with no range, prefix, or whitespace`,
+        );
+      }
+    }
+
+    let features: string[] | undefined;
+    if (Object.prototype.hasOwnProperty.call(runtimeRaw, 'features')) {
+      const featuresRaw = runtimeRaw['features'];
+      if (!Array.isArray(featuresRaw)) {
+        throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.runtime.features: must be a list');
+      }
+      if (featuresRaw.length === 0) {
+        throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.runtime.features: must contain at least one feature');
+      }
+      features = assertDuplicateFree(
+        featuresRaw.map((feature, i) => asString(feature, `bundle.yaml.runtime.features[${i}]`)),
+        'bundle.yaml.runtime.features',
+      );
+      for (const feature of features) {
+        if (!RUNTIME_FEATURE_RE.test(feature) || Buffer.byteLength(feature, 'utf8') > 128) {
+          throw new BundleError(
+            'MANIFEST_ERROR',
+            `bundle.yaml.runtime.features: feature '${feature}' must be a lowercase versioned identifier ending in '.vN' (maximum 128 UTF-8 bytes)`,
+          );
+        }
+      }
+    }
+
+    runtime = {
+      ...(minVersion === undefined ? {} : { minVersion }),
+      ...(features === undefined ? {} : { features }),
+    };
+    assertCurrentRuntimeCompatible(runtime);
   }
 
   // workflows — at least one named, archive-relative definition path.
@@ -338,6 +395,7 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
   return {
     formatVersion: 2,
     package: { name, version },
+    ...(runtime === undefined ? {} : { runtime }),
     workflows,
     ...(defaultWorkflow === undefined ? {} : { default: defaultWorkflow }),
     platforms,
@@ -362,6 +420,18 @@ export function manifestToBytes(manifest: BundleManifest): Uint8Array {
   lines.push('package:');
   lines.push(`  name: ${q(manifest.package.name)}`);
   lines.push(`  version: ${q(manifest.package.version)}`);
+  if (manifest.runtime !== undefined) {
+    lines.push('runtime:');
+    if (manifest.runtime.minVersion !== undefined) {
+      lines.push(`  minVersion: ${q(manifest.runtime.minVersion)}`);
+    }
+    if (manifest.runtime.features !== undefined) {
+      lines.push('  features:');
+      for (const feature of sortedByUtf8(manifest.runtime.features)) {
+        lines.push(`    - ${q(feature)}`);
+      }
+    }
+  }
   const workflowKeys = sortedByUtf8(Object.keys(manifest.workflows));
   lines.push('workflows:');
   for (const workflowName of workflowKeys) {

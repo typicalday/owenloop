@@ -41,6 +41,11 @@ formatVersion: 2
 package:
   name: owenloop-delivery
   version: 1.0.0
+runtime:
+  minVersion: "0.5.1"
+  features:
+    - harness-policy-enforcement.v1
+    - native-judge-policy-inheritance.v1
 workflows:
   delivery: "workflows/delivery.yaml"
   init: "workflows/init.yaml"
@@ -67,6 +72,7 @@ The following rules apply:
 - `formatVersion` is exactly `2`. A v1 manifest is not accepted; there is no compatibility parser.
 - `package.name` is a portable package namespace. The default store coordinate for the package is `package.name/package.name@package.version`; an explicit store namespace override may replace the first component. A workflow definition name is not the package name.
 - `package.version` is a non-empty printable ASCII version string without path separators.
+- `runtime` is optional. When present, `runtime` is a closed mapping that contains `minVersion`, `features`, or both; `runtime: {}` is invalid. Runtime requirements are described in [Runtime compatibility](#runtime-compatibility).
 - `workflows` is a non-empty map from workflow names to archive-relative YAML paths. Each workflow name matches `/^[a-z][a-z0-9-]*$/`. Each path must pass the shared archive path safety policy, and two workflow names may not point to the same path.
 - A workflow file's `name:` must equal the workflow map key. For example, `workflows.delivery` must point to a file containing `name: delivery`.
 - An installed workflow is addressable from `calls:` by the qualified name `<package>/<workflow>`. A bare `calls: <workflow>` inside a CAS-installed bundle is resolved to a sibling from that same bundle; it does not search unrelated bundles for a same-named workflow.
@@ -77,7 +83,36 @@ The following rules apply:
 - `capabilities` contains requested capability classes and values. The manifest does not grant capabilities.
 - `lock` maps exact versioned `namespace/name@version` call references to lowercase 64-hex **bundle digests**. Every explicit versioned `calls:` target in every workflow must have a matching lock key. A bare same-bundle call has no lock entry: its pin is the containing bundle's own digest. The runtime compares bundle digests at child spawn; it does not compare this lock value with a per-workflow instruction digest.
 
-Canonical manifest serialization uses a fixed key order, sorted mapping keys, sorted list values, JSON-style double-quoted strings, two-space indentation, and exactly one final newline. Inspection rejects a manifest that parses correctly but is not in that canonical byte form.
+Canonical manifest serialization uses the fixed top-level order `formatVersion`, `package`, optional `runtime`, `workflows`, optional `default`, `platforms`, `integrity`, `capabilities`, `lock`. Runtime fields use the order `minVersion`, then `features`; feature identifiers are sorted by ascending UTF-8 bytes. Other mapping keys and list values use their defined canonical order. Strings use JSON-style double quotes, indentation is two spaces, and the document has exactly one final newline. Inspection rejects a manifest that parses correctly but is not in that canonical byte form.
+
+## Runtime compatibility
+
+The optional `runtime` mapping declares requirements that the Owenloop process must satisfy before Owenloop returns usable workflow definitions or instructions:
+
+```yaml
+runtime:
+  minVersion: "0.5.1"
+  features:
+    - harness-policy-enforcement.v1
+    - native-judge-policy-inheritance.v1
+```
+
+The mapping is strict and closed. Unknown keys are rejected. At least one of `minVersion` and `features` is required.
+
+- `minVersion` is exactly one canonical strict SemVer value. Ranges, a leading `v`, surrounding whitespace, and non-canonical forms are invalid. Owenloop compares the running package version with standard SemVer prerelease precedence; build metadata does not affect precedence.
+- `features` is a non-empty, duplicate-free sequence. Each identifier is at most 128 UTF-8 bytes and matches `/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*\.v[1-9][0-9]*$/`: lowercase portable segments ending in a positive, non-zero-padded `.vN` version.
+- When both fields are present, both requirements must pass. The fields use AND semantics, not alternatives.
+
+This Owenloop release advertises exactly these feature identifiers:
+
+- `harness-policy-enforcement.v1`
+- `native-judge-policy-inheritance.v1`
+
+The running version comes from Owenloop's production `packageVersion()` source. A production build that cannot read a valid package version uses the `0.0.0` sentinel. The sentinel fails every declared `minVersion`, including `minVersion: "0.0.0"`, and the refusal tells the operator to install or upgrade Owenloop. The sentinel may still satisfy a feature-only declaration because feature support is evaluated independently.
+
+Malformed runtime declarations fail with `BundleError.code === "MANIFEST_ERROR"`. A well-formed declaration that requires a newer Owenloop version or an unsupported feature fails with `BundleError.code === "RUNTIME_INCOMPATIBLE"`. Runtime-incompatible source bundles cannot be packed; runtime-incompatible packed bundles cannot be inspected, unpacked, installed, loaded as instructions, or executed. Definition listing and status discovery retain their existing fail-open behavior: they warn, skip the incompatible installed object, and continue loading unrelated definitions. Instruction and execution resolution fail closed before a command process, agent harness, or provider starts.
+
+An absent `runtime` field preserves the previous canonical manifest bytes and bundle digest exactly. Adding, changing, or removing a present runtime declaration changes `bundle.yaml`, the canonical tar bytes, and therefore the content-addressed bundle digest. Readers that predate the runtime contract reject a present `runtime` key as an unknown top-level manifest key; authors must set requirements only when every required consumer supports this contract.
 
 ## Canonical archive
 
@@ -106,17 +141,21 @@ The strict reader is as constrained as the writer. Every byte range parsed by th
 
 ## Reading and extraction safety
 
-`inspectBundle` and `unpackBundle` apply bounded compressed size, expanded size, tar-header count, per-file size, and path length limits before returning or writing file data. Strict readers reject malformed checksums and octal fields, truncated headers or data, malformed or dangling PAX metadata, duplicate paths, unsupported entry types, non-canonical headers, unsorted effective paths, trailing bytes, missing manifests, invalid manifests, missing or invalid workflows, unsafe workflow paths, workflow validation failures, and integrity mismatches.
+`inspectBundle` and `unpackBundle` apply bounded compressed size, expanded size, tar-header count, per-file size, and path length limits before returning or writing file data. Strict readers reject malformed checksums and octal fields, truncated headers or data, malformed or dangling PAX metadata, duplicate paths, unsupported entry types, non-canonical headers, unsorted effective paths, trailing bytes, missing manifests, invalid manifests, runtime-incompatible manifests, missing or invalid workflows, unsafe workflow paths, workflow validation failures, and integrity mismatches.
+
+`parseManifestBytes` is the common runtime-admission boundary. Source packing, packed inspection, unpacking, workflow-store installation, installed-object verification, definition discovery, instruction lookup, and worker execution all pass through that boundary before returning usable definitions or instructions.
 
 `unpackBundle` validates the complete archive before filesystem writes. The destination must not already exist. The unpacker checks every existing destination ancestor and rejects operator-created symlinks, then writes into a fresh sibling staging directory. The staging directory is renamed into place only after all files are written; failed unpack operations remove staging and leave the destination absent.
 
 ## Installed-object verification on read
 
-The store's bundle ingestor verifies an installed object again every time a resolver needs its contents. The verifier reads `bundle.yaml`, hashes every regular file, compares the result with `integrity.files`, and refuses the object when a listed file is missing or changed, when an unlisted file appears, or when any symlink, device, FIFO, or other non-regular node appears. The manifest itself is excluded from `integrity.files` by design because hashing the manifest would be recursive; the manifest is still required, regular, and strictly parsed.
+The store's bundle ingestor verifies an installed object again every time a resolver needs its contents. The verifier safely enumerates every installed regular file, reads each file once, and preserves the existing detailed refusals for missing integrity-listed files, changed file digests, unlisted extra files, unsafe paths, symlinks, devices, FIFOs, and other wrong filesystem types.
 
-A store index entry records the sorted workflow names alongside the package coordinate and bundle digest. Runtime instruction resolution reads the installed manifest and loads every listed workflow; a requested instruction digest may match any workflow in the installed object.
+After the per-file checks pass, the verifier reconstructs the complete canonical uncompressed tar from the installed files, including `bundle.yaml`. Installed non-executable files reconstruct as canonical mode `0644`; files with any execute bit reconstruct as `0755`. The SHA-256 digest of those canonical tar bytes must equal the object's `objects/sha256/<digest>` content address. This complete-object check covers runtime-only changes and removal of the runtime declaration even though `integrity.files` excludes `bundle.yaml` to avoid a recursive self-hash.
 
-This check is separate from the read-only file modes applied during install. Changing an installed object on disk therefore produces an integrity refusal at resolution time, not a best-effort read and not an `unknown-digest` fallback.
+A store index entry records the sorted workflow names alongside the package coordinate and bundle digest. Runtime instruction resolution reads the verified installed manifest and loads every listed workflow; a requested instruction digest may match any workflow in the installed object. A verification failure prevents the object from populating usable definition and instruction caches. Cache hits are re-verified, and a later failure evicts the cached object.
+
+This check is separate from the read-only file modes applied during install. Installation maps canonical `0644` files to read-only `0444` and canonical `0755` files to read/execute-only `0555`, preserving the executable distinction needed to reconstruct identity. Changing an installed object on disk therefore produces an integrity refusal at resolution time, not a best-effort read and not an `unknown-digest` fallback. An executable file installed by an older Owenloop release may already have lost its execute bit because older hardening mapped every file to `0444`; reinstall that object from its original `.wnlp` bytes before using complete-object verification.
 
 ## Bundle assets during execution
 
@@ -172,7 +211,9 @@ documentation is the enforcement boundary for now.
 - `manifest`: the canonical manifest archived in `bytes`; and
 - `entries`: sorted path, size, executable-bit, and per-file digest metadata.
 
-`inspectBundle(bytes)` returns the digest, validated manifest, and entry metadata without writing files. `digestBundle(bytes)` performs bounded gzip inflation and returns only the def digest. `unpackBundle(bytes, destination)` returns the same inspection result plus the absolute materialized destination path.
+`inspectBundle(bytes)` returns the digest, runtime-admitted validated manifest, and entry metadata without writing files. `unpackBundle(bytes, destination)` returns the same inspection result plus the absolute materialized destination path.
+
+`digestBundle(bytes)` is the deliberate identity-only exception to runtime admission. The function performs bounded gzip inflation and canonical archive validation, then returns only the def digest without parsing `bundle.yaml`; therefore `digestBundle` can digest a well-formed archive whose runtime declaration the current Owenloop process cannot satisfy. A successful digest does not mean the bundle is admissible for packing, inspection, unpacking, installation, definition loading, instruction lookup, or execution.
 
 `owenloop publish` signs exactly `packBundle(sourceDir).digest`: the lowercase 64-hex SHA-256 digest of the uncompressed canonical tar. It does not sign the gzip wrapper bytes or the separate compiled-definition hash used by `push`.
 
