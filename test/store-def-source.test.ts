@@ -19,15 +19,24 @@
  */
 
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
+import { mainAsync } from '../src/cli.ts';
 import { Engine, CallsPinError } from '../src/engine.ts';
 import { finalizeDefs, resolveCallsTarget, DefError } from '../src/defs.ts';
 import { openStore } from '../src/store.ts';
 import type { WorkflowDef } from '../src/types.ts';
-import { loadCasDefs, storeIndexPath } from '../src/store/index.ts';
+import {
+  inspectCasDefs,
+  loadCasDefs,
+  readWorkflowStoreIndex,
+  storeIndexPath,
+  workflowCoordinate,
+  writeWorkflowStoreIndex,
+} from '../src/store/index.ts';
+import { makeIo, routedFetch } from './hubkit.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from './helpers/store-fixture.ts';
 
 // ---- fixtures ----------------------------------------------------------------
@@ -92,6 +101,27 @@ outputs: [result]
 `;
 }
 
+function versionedParentYaml(target: string, marker: string): string {
+  return `name: caller
+inputs:
+  - name: seed
+    seedOwed: true
+steps:
+  - name: deliver
+    calls: ${target}
+    inputs:
+      data: seed
+    produces: [delivered]
+  - name: finish
+    consumes: [delivered]
+    produces: [done]
+    terminal: true
+    body: |
+      finish ${marker}
+outputs: [delivered]
+`;
+}
+
 /**
  * Install one two-workflow bundle (`parent` + `child`) into a fresh PROJECT
  * store root and return the loaded registrations.
@@ -107,6 +137,7 @@ async function installPair(args: {
     version: args.version,
     workflow: parentYaml(args.marker),
     workflows: { child: childYaml(args.marker) },
+    defaultWorkflow: 'parent',
   });
   // `writeBundleSource` names the entry workflow file `workflow.yaml` and keys
   // it under the PACKAGE name, so the package must be `parent` for the manifest
@@ -116,6 +147,39 @@ async function installPair(args: {
     ...(args.root === undefined ? {} : { root: args.root }),
   });
   return { root: installed.root, digest: installed.result.digest };
+}
+
+async function installVersionedCall(args: {
+  marker: string;
+  lockDigest?: string;
+  root?: string;
+}): Promise<{ root: string; childDigest: string; callerDigest: string; target: string }> {
+  const target = 'dep/child@1.0.0';
+  const childSource = writeBundleSource({
+    name: 'child',
+    version: '1.0.0',
+    workflow: childYaml(args.marker),
+  });
+  const child = await installBundleFixture({
+    sourceDir: childSource,
+    ...(args.root === undefined ? {} : { root: args.root }),
+  });
+  const childIndex = readWorkflowStoreIndex(storeIndexPath(child.root));
+  addIndexCoordinate(child.root, target, { ...childIndex.entries['child/child@1.0.0']! });
+
+  const callerSource = writeBundleSource({
+    name: 'caller',
+    version: '1.0.0',
+    workflow: versionedParentYaml(target, args.marker),
+    lock: { [target]: args.lockDigest ?? child.result.digest },
+  });
+  const caller = await installBundleFixture({ sourceDir: callerSource, root: child.root });
+  return {
+    root: child.root,
+    childDigest: child.result.digest,
+    callerDigest: caller.result.digest,
+    target,
+  };
 }
 
 /** A global root that exists but holds nothing — never the developer's real home. */
@@ -140,6 +204,32 @@ function load(projectRoot: string | undefined, globalRoot: string): {
 }
 
 /** Build the flat def map the CLI would build from a set of registrations. */
+function removeInstalledObject(root: string, digest: string): void {
+  const objectDir = join(root, 'objects', 'sha256', digest);
+  chmodSync(objectDir, 0o755);
+  for (const entry of readdirSync(objectDir, { withFileTypes: true })) {
+    if (entry.isDirectory()) chmodSync(join(objectDir, entry.name), 0o755);
+  }
+  rmSync(objectDir, { recursive: true, force: true });
+}
+
+function addIndexCoordinate(
+  root: string,
+  coordinate: string,
+  entry: { digest: string; pinned: boolean; workflows?: string[] },
+): void {
+  const path = storeIndexPath(root);
+  const index = readWorkflowStoreIndex(path);
+  index.entries[workflowCoordinate(parseCoordinateParts(coordinate))] = entry;
+  writeWorkflowStoreIndex(path, index);
+}
+
+function parseCoordinateParts(coordinate: string): { namespace: string; name: string; version: string } {
+  const match = /^([^/]+)\/([^@]+)@(.+)$/u.exec(coordinate);
+  if (match === null) throw new Error(`bad fixture coordinate: ${coordinate}`);
+  return { namespace: match[1]!, name: match[2]!, version: match[3]! };
+}
+
 function defMap(registrations: ReturnType<typeof loadCasDefs>): Map<string, WorkflowDef> {
   const raw = new Map<string, WorkflowDef>();
   for (const r of registrations) raw.set(r.key, r.def);
@@ -161,9 +251,14 @@ test('WS-6 loader: every CAS workflow is registered qualified, carries provenanc
 
   assert.deepEqual(warnings, [], 'a clean store produces no warnings');
   assert.deepEqual(
-    registrations.map((r) => r.key).sort(),
+    registrations.filter((r) => r.kind === 'workflow').map((r) => r.key).sort(),
     ['parent/child', 'parent/parent'],
     'both workflows register under <package>/<workflow>',
+  );
+  assert.equal(
+    registrations.find((r) => r.key === 'parent/parent@1.0.0')?.def.name,
+    'parent',
+    'the full coordinate aliases the explicit default workflow',
   );
   for (const r of registrations) {
     assert.equal(r.bundleDigest, digest, 'provenance carries the canonical BUNDLE digest');
@@ -203,6 +298,8 @@ test('WS-6 loader: a project bundle overrides a different global bundle with the
   assert.equal(qualified.level, 'project');
   assert.equal(qualified.bundleDigest, project.digest, 'project holds the user-facing name');
   assert.match(qualified.def.steps[0]!.body, /PROJECT/);
+  const coordinateAlias = registrations.find((registration) => registration.key === 'parent/parent@1.0.0');
+  assert.equal(coordinateAlias?.bundleDigest, project.digest, 'the full coordinate also obeys project precedence');
 
   const globalScoped = registrations.find(
     (r) => r.bundleDigest === global.digest && r.bare === 'parent',
@@ -213,39 +310,208 @@ test('WS-6 loader: a project bundle overrides a different global bundle with the
   assert.equal(warnings.length > 0, true, 'the shadowing decision is visible');
 });
 
-test('WS-6 loader is fail-OPEN: a corrupt index warns and is skipped, it does not throw', async () => {
-  const { root } = await installPair({ name: 'parent', version: '1.0.0', marker: 'v1' });
-  writeFileSync(storeIndexPath(root), '{ this is not json');
+test('WS-6 executable discovery fails closed on a corrupt project index before a global decoy can win', async () => {
+  const project = await installPair({ name: 'parent', version: '1.0.0', marker: 'PROJECT' });
+  const global = await installPair({ name: 'parent', version: '1.0.0', marker: 'GLOBAL-DECOY' });
+  writeFileSync(storeIndexPath(project.root), '{ this is not json');
 
-  const { registrations, warnings } = load(root, emptyGlobalRoot());
-  assert.deepEqual(registrations, [], 'nothing loads from a corrupt index');
-  assert.equal(warnings.length, 1, 'exactly one warning');
-  assert.match(warnings[0]!, /skipping project workflow store index/);
+  assert.throws(
+    () => load(project.root, global.root),
+    /corrupt workflow store index/u,
+  );
 });
 
-test('WS-6 loader is fail-OPEN: an indexed object whose bytes are gone warns and is skipped', async () => {
+test('WS-6 read-only inspection marks a corrupt project index incomplete', async () => {
+  const { root } = await installPair({ name: 'parent', version: '1.0.0', marker: 'v1' });
+  writeFileSync(storeIndexPath(root), '{ this is not json');
+  const warnings: string[] = [];
+
+  const inspected = inspectCasDefs({
+    projectRoot: root,
+    globalRoot: emptyGlobalRoot(),
+    warn: (line) => warnings.push(line),
+  });
+
+  assert.equal(inspected.complete, false);
+  assert.deepEqual(inspected.registrations, []);
+  assert.match(warnings.join('\n'), /incomplete project workflow store/u);
+});
+
+test('CLI execution fails before runtime DB or network mutation when the project index is corrupt', async () => {
+  const { fetch, calls } = routedFetch({});
+  const t = makeIo({ fetch });
+  const projectRoot = join(t.cwd, 'workflows');
+  const globalRoot = join(t.home, '.owenloop', 'workflows');
+  await installPair({ name: 'parent', version: '1.0.0', marker: 'PROJECT', root: projectRoot });
+  await installPair({ name: 'parent', version: '1.0.0', marker: 'GLOBAL-DECOY', root: globalRoot });
+  writeFileSync(storeIndexPath(projectRoot), '{ broken');
+
+  const code = await mainAsync(['create', 'parent/parent'], t.io);
+
+  assert.equal(code, 1);
+  assert.match(t.err.join('\n'), /corrupt workflow store index/u);
+  assert.equal(existsSync(join(t.cwd, '.owenloop', 'state.db')), false);
+  assert.equal(calls.length, 0);
+});
+
+test('CLI status uses explicitly incomplete tolerant inspection for a corrupt project index', async () => {
+  const t = makeIo();
+  const projectRoot = join(t.cwd, 'workflows');
+  const globalRoot = join(t.home, '.owenloop', 'workflows');
+  await installPair({ name: 'parent', version: '1.0.0', marker: 'PROJECT', root: projectRoot });
+  await installPair({ name: 'parent', version: '1.0.0', marker: 'GLOBAL-DECOY', root: globalRoot });
+  writeFileSync(storeIndexPath(projectRoot), '{ broken');
+
+  const code = await mainAsync(['status', '--all'], t.io);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(JSON.parse(t.out.join('\n')), []);
+  assert.match(t.err.join('\n'), /status is incomplete/u);
+});
+
+test('WS-6 executable discovery fails closed when an indexed object is missing', async () => {
   const { root, digest } = await installPair({ name: 'parent', version: '1.0.0', marker: 'v1' });
   // The store hardens every installed object to 0o444 files inside a 0o555 dir
   // (install.ts `hardenObject`), so the bytes cannot be unlinked until the
   // containing directories are writable again. Restore the write bit top-down,
   // then remove — this simulates an object whose bytes vanished (operator
   // cleanup, a half-restored backup) while `index.json` still lists the digest.
-  const objectDir = join(root, 'objects', 'sha256', digest);
-  chmodSync(objectDir, 0o755);
-  for (const entry of readdirSync(objectDir, { withFileTypes: true })) {
-    if (entry.isDirectory()) chmodSync(join(objectDir, entry.name), 0o755);
-  }
-  rmSync(objectDir, { recursive: true, force: true });
+  removeInstalledObject(root, digest);
 
-  const { registrations, warnings } = load(root, emptyGlobalRoot());
-  assert.deepEqual(registrations, [], 'the missing object contributes nothing');
-  assert.deepEqual(warnings, [], 'an absent object at one level is not an error — the other root may hold it');
+  assert.throws(
+    () => load(root, emptyGlobalRoot()),
+    /no verified object directory exists/u,
+  );
 });
 
 test('WS-6 loader: no store at either root loads nothing and warns nothing (zero drift on the no-CAS path)', () => {
   const { registrations, warnings } = load(tempDir('owenloop-ws6-noproject-'), emptyGlobalRoot());
   assert.deepEqual(registrations, []);
   assert.deepEqual(warnings, []);
+});
+
+test('WS-6 genuine project absence falls back to the global coordinate', async () => {
+  const global = await installPair({ name: 'parent', version: '1.0.0', marker: 'GLOBAL' });
+  const projectRoot = tempDir('owenloop-ws6-absent-project-');
+
+  const { registrations } = load(projectRoot, global.root);
+  const alias = registrations.find((registration) => registration.key === 'parent/parent@1.0.0');
+
+  assert.ok(alias);
+  assert.equal(alias.level, 'global');
+  assert.equal(alias.bundleDigest, global.digest);
+});
+
+test('WS-6 missing project bytes fall back only to the exact digest indexed globally', async () => {
+  const project = await installPair({ name: 'parent', version: '1.0.0', marker: 'SAME' });
+  const global = await installPair({ name: 'parent', version: '1.0.0', marker: 'SAME' });
+  assert.equal(project.digest, global.digest, 'fixture stores must index identical bytes');
+  removeInstalledObject(project.root, project.digest);
+
+  const { registrations } = load(project.root, global.root);
+  const alias = registrations.find((registration) => registration.key === 'parent/parent@1.0.0');
+
+  assert.ok(alias);
+  assert.equal(alias.bundleDigest, project.digest);
+  assert.equal(alias.level, 'global', 'verified bytes came from the exact-digest global fallback');
+});
+
+test('WS-6 a corrupt project object is never masked by a same-coordinate global decoy', async () => {
+  const project = await installPair({ name: 'parent', version: '1.0.0', marker: 'PROJECT' });
+  const global = await installPair({ name: 'parent', version: '1.0.0', marker: 'GLOBAL-DECOY' });
+  const workflowPath = join(project.root, 'objects', 'sha256', project.digest, 'workflow.yaml');
+  chmodSync(workflowPath, 0o644);
+  writeFileSync(workflowPath, `${readFileSync(workflowPath, 'utf8')}# corruption\n`);
+
+  assert.throws(
+    () => load(project.root, global.root),
+    /object .*corrupt|digest|integrity/iu,
+  );
+});
+
+test('versioned coordinate uses the sole workflow as an implicit default', async () => {
+  const sourceDir = writeBundleSource({
+    name: 'child',
+    version: '1.0.0',
+    workflow: childYaml('IMPLICIT'),
+  });
+  const installed = await installBundleFixture({ sourceDir });
+
+  const defs = defMap(load(installed.root, emptyGlobalRoot()).registrations);
+
+  assert.equal(defs.get('child/child@1.0.0')?.name, 'child');
+  assert.equal(defs.get('child/child@1.0.0')?.bundleDigest, installed.result.digest);
+});
+
+test('versioned coordinate uses an explicit default in a multi-workflow bundle', async () => {
+  const sourceDir = writeBundleSource({
+    name: 'parent',
+    version: '1.0.0',
+    workflow: parentYaml('EXPLICIT'),
+    workflows: { child: childYaml('EXPLICIT') },
+    defaultWorkflow: 'child',
+  });
+  const installed = await installBundleFixture({ sourceDir });
+
+  const defs = defMap(load(installed.root, emptyGlobalRoot()).registrations);
+
+  assert.equal(defs.get('parent/parent@1.0.0')?.name, 'child');
+});
+
+test('versioned coordinate refuses a multi-workflow bundle without a default', async () => {
+  const sourceDir = writeBundleSource({
+    name: 'parent',
+    version: '1.0.0',
+    workflow: parentYaml('AMBIGUOUS'),
+    workflows: { child: childYaml('AMBIGUOUS') },
+  });
+  const installed = await installBundleFixture({ sourceDir });
+
+  const { registrations, warnings } = load(installed.root, emptyGlobalRoot());
+
+  assert.equal(registrations.some((registration) => registration.key === 'parent/parent@1.0.0'), false);
+  assert.equal(registrations.some((registration) => registration.key === 'parent/parent'), true);
+  assert.equal(registrations.some((registration) => registration.key === 'parent/child'), true);
+  assert.match(warnings.join('\n'), /multiple workflows and has no default/u);
+});
+
+test('multiple namespace coordinates may intentionally alias the same verified digest', async () => {
+  const sourceDir = writeBundleSource({
+    name: 'child',
+    version: '1.0.0',
+    workflow: childYaml('ALIASED'),
+  });
+  const installed = await installBundleFixture({ sourceDir });
+  const index = readWorkflowStoreIndex(storeIndexPath(installed.root));
+  const original = index.entries['child/child@1.0.0']!;
+  addIndexCoordinate(installed.root, 'dep/child@1.0.0', { ...original });
+
+  const { registrations } = load(installed.root, emptyGlobalRoot());
+  const defs = defMap(registrations);
+
+  assert.equal(defs.get('child/child@1.0.0')?.bundleDigest, installed.result.digest);
+  assert.equal(defs.get('dep/child@1.0.0')?.bundleDigest, installed.result.digest);
+  assert.equal(
+    registrations.filter((registration) => registration.kind === 'workflow').length,
+    1,
+    'the object workflows load once while both coordinate aliases remain present',
+  );
+});
+
+test('coordinate identity must match manifest package name and version', async () => {
+  const sourceDir = writeBundleSource({
+    name: 'child',
+    version: '1.0.0',
+    workflow: childYaml('IDENTITY'),
+  });
+  const installed = await installBundleFixture({ sourceDir });
+  const index = readWorkflowStoreIndex(storeIndexPath(installed.root));
+  addIndexCoordinate(installed.root, 'dep/wrong@1.0.0', { ...index.entries['child/child@1.0.0']! });
+
+  assert.throws(
+    () => load(installed.root, emptyGlobalRoot()),
+    /does not match manifest package/u,
+  );
 });
 
 // ---- acceptance (a): a bare sibling call spawns the PINNED sibling -----------
@@ -308,7 +574,11 @@ test('WS-6 (a): the two same-named children stay DISTINCT nodes — cycle detect
   const { registrations } = load(a.root, emptyGlobalRoot());
   // finalizeDefs runs detectCallsCycles; a false cycle would throw DefError here.
   const defs = defMap(registrations);
-  assert.equal(defs.size, 4, 'both bundles contributed both workflows');
+  assert.equal(
+    new Set([...defs.values()].map((def) => `${def.bundleDigest}/${def.name}`)).size,
+    4,
+    'both bundles contributed both workflow identities despite coordinate aliases',
+  );
 });
 
 test('WS-6 (a): a bare calls: naming a NON-sibling still produces the existing "does not exist" error', async () => {
@@ -362,9 +632,12 @@ test('WS-6 (b): installing a NEWER version of the same bundle does not change wh
 
   // The loser of the qualified-key race stays REACHABLE under a digest-scoped
   // key — dropping it is what would break the pinned parent.
-  const keys = after.registrations.map((r) => r.key).sort();
-  assert.equal(keys.length, 4, 'all four workflows are registered');
-  assert.equal(new Set(keys).size, 4, 'under four distinct keys');
+  const workflowKeys = after.registrations
+    .filter((registration) => registration.kind === 'workflow')
+    .map((registration) => registration.key)
+    .sort();
+  assert.equal(workflowKeys.length, 4, 'all four workflows are registered');
+  assert.equal(new Set(workflowKeys).size, 4, 'under four distinct workflow keys');
 });
 
 test('WS-6 (b) end-to-end: an already-running parent spawns the PINNED child body after a newer install', async () => {
@@ -419,6 +692,100 @@ test('WS-6 (b) end-to-end: an already-running parent spawns the PINNED child bod
       'the running parent spawned the V1 child even though V2 is now installed',
     );
     assert.match(pinned.steps[0]!.body, /child body V1/, 'the V1 body, not the V2 body');
+  } finally {
+    store.close();
+  }
+});
+
+test('explicit versioned calls resolve end-to-end and spawn the lock-pinned child', async () => {
+  const installed = await installVersionedCall({ marker: 'VERSIONED' });
+  const dir = tempDir('owenloop-versioned-call-');
+  const store = openStore(join(dir, 'state.db'));
+  try {
+    const defs = defMap(load(installed.root, emptyGlobalRoot()).registrations);
+    const engine = new Engine(store, (name, from) => {
+      const def = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
+      if (def === undefined) throw new Error(`unknown workflow definition '${name}'`);
+      return def;
+    });
+
+    const parent = engine.createInstance('caller/caller@1.0.0', {
+      provide: { seed: { ready: true } },
+    });
+    engine.tick(parent, { deep: false });
+
+    const child = store.findChildByParent(parent, 'delivered');
+    assert.ok(child, 'the explicit versioned target spawned');
+    assert.equal(store.getWorkflow(child.id)?.defSnapshot?.bundleDigest, installed.childDigest);
+  } finally {
+    store.close();
+  }
+});
+
+test('an already-running explicit-version parent stays pinned after a newer child version installs', async () => {
+  const installed = await installVersionedCall({ marker: 'V1' });
+  const dir = tempDir('owenloop-versioned-running-parent-');
+  const store = openStore(join(dir, 'state.db'));
+  try {
+    let defs = defMap(load(installed.root, emptyGlobalRoot()).registrations);
+    const engine = new Engine(store, (name, from) => {
+      const def = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
+      if (def === undefined) throw new Error(`unknown workflow definition '${name}'`);
+      return def;
+    });
+    const parent = engine.createInstance('caller/caller@1.0.0');
+    engine.tick(parent, { deep: false });
+    assert.equal(store.findChildByParent(parent, 'delivered'), undefined);
+
+    const childV2Source = writeBundleSource({
+      name: 'child',
+      version: '2.0.0',
+      workflow: childYaml('V2'),
+    });
+    const childV2 = await installBundleFixture({ sourceDir: childV2Source, root: installed.root });
+    const childV2Index = readWorkflowStoreIndex(storeIndexPath(installed.root));
+    addIndexCoordinate(installed.root, 'dep/child@2.0.0', {
+      ...childV2Index.entries['child/child@2.0.0']!,
+    });
+    defs = defMap(load(installed.root, emptyGlobalRoot()).registrations);
+
+    engine.provideInput(parent, 'seed', { ready: true });
+    engine.tick(parent, { deep: false });
+
+    const child = store.findChildByParent(parent, 'delivered');
+    assert.ok(child);
+    assert.equal(store.getWorkflow(child.id)?.defSnapshot?.bundleDigest, installed.childDigest);
+    assert.notEqual(store.getWorkflow(child.id)?.defSnapshot?.bundleDigest, childV2.result.digest);
+  } finally {
+    store.close();
+  }
+});
+
+test('explicit versioned calls enforce the manifest lock before child creation', async () => {
+  const installed = await installVersionedCall({
+    marker: 'LOCK-MISMATCH',
+    lockDigest: 'f'.repeat(64),
+  });
+  const dir = tempDir('owenloop-versioned-mismatch-');
+  const store = openStore(join(dir, 'state.db'));
+  try {
+    const defs = defMap(load(installed.root, emptyGlobalRoot()).registrations);
+    const engine = new Engine(store, (name, from) => {
+      const def = from === undefined ? defs.get(name) : resolveCallsTarget(defs, name, from);
+      if (def === undefined) throw new Error(`unknown workflow definition '${name}'`);
+      return def;
+    });
+
+    const parent = engine.createInstance('caller/caller@1.0.0', {
+      provide: { seed: { ready: true } },
+    });
+    engine.tick(parent, { deep: false });
+
+    assert.equal(store.findChildByParent(parent, 'delivered'), undefined, 'no mismatched child is created');
+    assert.match(
+      store.getArtifact(parent, 'delivered')?.reasons.at(-1)?.text ?? '',
+      /parent bundle pins .* but the resolved definition comes from/u,
+    );
   } finally {
     store.close();
   }

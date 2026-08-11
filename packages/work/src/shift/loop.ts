@@ -356,7 +356,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   function dispatchCandidate(c: Candidate): DispatchResult {
     const childKind = c.kind === 'command' ? 'exec' : 'agent-run';
     let reservation: ChildReservation | undefined;
-    let terminate: (() => void) | undefined;
+    let cancel: (() => void) | undefined;
     try {
       const reserved = reserveCandidate(c);
       if (typeof reserved === 'string') return reserved;
@@ -368,7 +368,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	...(childKind === 'agent-run' ? { kind: 'agent-run' as const } : {}),
 	startGate: reserved.gatePath,
       });
-      terminate = spawned.terminate;
+      cancel = spawned.cancel ?? spawned.terminate;
       const rec = finalizeChildReservation(opts.stateDir, reservation, {
 	pid: spawned.pid,
 	spawnedAt: opts.now(),
@@ -392,7 +392,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       );
       return 'dispatched';
     } catch (e) {
-      terminate?.();
+      cancel?.();
       if (reservation !== undefined) {
 	try {
 	  cancelReservedChild(opts.stateDir, reservation);

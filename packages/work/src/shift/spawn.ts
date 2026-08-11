@@ -54,9 +54,16 @@ export interface SpawnSpec {
   startGate?: string;
 }
 
-/** The result the loop records plus a best-effort pre-start termination handle. */
+/** The result the loop records plus best-effort pre-start cancellation handles. */
 export interface SpawnResult {
   pid: number;
+  /**
+   * Dispatcher-owned cancellation. The default spawner disarms spontaneous
+   * lifecycle reporting before sending SIGTERM, so one failed dispatch emits
+   * one Shift failure event.
+   */
+  cancel?: () => void;
+  /** Legacy injected-spawner compatibility. New dispatcher code prefers cancel. */
   terminate?: () => void;
 }
 
@@ -215,15 +222,22 @@ export function createDefaultSpawner(
       failureReported = true;
       throw new Error(`spawn of 'owenloop work ${kind} ${spec.workflow}/${spec.run}' returned no pid`);
     }
+    const kill = (): void => {
+      try {
+	child.kill('SIGTERM');
+      } catch {
+	// The child may already have exited after a cancelled or missing gate.
+      }
+    };
     return {
       pid: child.pid,
-      terminate: () => {
-	try {
-	  child.kill('SIGTERM');
-	} catch {
-	  // The child may already have exited after a cancelled or missing gate.
-	}
+      cancel: () => {
+	// Dispatcher-owned termination has its own authoritative failure event.
+	// Latch first so the resulting signal exit cannot report a second event.
+	failureReported = true;
+	kill();
       },
+      terminate: kill,
     };
   };
 }

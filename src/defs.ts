@@ -1868,7 +1868,19 @@ export function loadDefsUnfinalized(dir: string): Map<string, WorkflowDef> {
  * for a def without `_includes` (the normal in-memory case), so passing a plain
  * def map through is cheap and only adds the cross-def + cycle checks.
  */
-export function finalizeDefs(raw: Map<string, WorkflowDef>): Map<string, WorkflowDef> {
+export interface FinalizeDefsOptions {
+  /**
+   * Explicit versioned targets whose definitions live in another installed
+   * bundle. Install-time validation may defer those edges; executable discovery
+   * later validates them against the complete store map before any run starts.
+   */
+  allowUnresolvedVersionedCalls?: ReadonlySet<string>;
+}
+
+export function finalizeDefs(
+  raw: Map<string, WorkflowDef>,
+  options: FinalizeDefsOptions = {},
+): Map<string, WorkflowDef> {
   const out = new Map<string, WorkflowDef>();
   const resolver = (name: string): WorkflowDef | undefined => raw.get(name);
   for (const [name, def] of raw) {
@@ -1885,6 +1897,7 @@ export function finalizeDefs(raw: Map<string, WorkflowDef>): Map<string, Workflo
       if (!l.calls) continue;
       const childDef = resolveCallsTarget(raw, l.calls, expanded);
       if (!childDef) {
+	if (options.allowUnresolvedVersionedCalls?.has(l.calls) === true) continue;
         throw new DefError(`calls names workflow '${l.calls}' which does not exist`);
       }
       const childInputNames = new Set(childDef.inputs.map((i) => i.name));

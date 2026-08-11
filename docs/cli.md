@@ -1142,7 +1142,9 @@ default. If both a binding and `--hub` exist they must agree.
 workflow id, its initial status, and the steps whose default crew was stamped or
 whose capability routes were validated. `--crew <name>` selects the crew for
 steps that declare no capability; capability-bearing steps continue to use
-their live hub bindings. `--title` is display-only. The command does not claim,
+their live hub bindings. `--title <text>` is display-only. Both `--crew` and
+`--title` require non-empty values; bare flags and `--crew=`/`--title=` are local
+usage errors before credential or network access. The command does not claim,
 dispatch, close, or otherwise drive work—the standing Shift discovers the run
 through its normal crew inbox.
 

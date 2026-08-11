@@ -142,6 +142,7 @@ import {
   BundleIngestorUnavailableError,
   globalStoreRoot,
   installWorkflowBundle,
+  inspectCasDefs,
   loadCasDefs,
   PreCommitVerifierUnavailableError,
   projectStoreRoot,
@@ -351,6 +352,8 @@ async function defaultReadStdin(): Promise<string> {
 interface Args {
   positionals: string[];
   options: Map<string, string[]>;
+  /** Non-boolean options written without `=<value>` or a following value token. */
+  missingOptionValues: Set<string>;
 }
 
 /**
@@ -388,6 +391,7 @@ const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
 function parseArgs(argv: string[]): Args {
   const positionals: string[] = [];
   const options = new Map<string, string[]>();
+  const missingOptionValues = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
     if (a.startsWith('--')) {
@@ -402,7 +406,8 @@ function parseArgs(argv: string[]): Args {
       } else if (i + 1 < argv.length && !(argv[i + 1] as string).startsWith('--')) {
         val = argv[++i] as string;
       } else {
-        val = 'true'; // boolean flag
+	val = 'true'; // legacy representation for a valueless non-boolean option
+	missingOptionValues.add(key);
       }
       const arr = options.get(key) ?? [];
       arr.push(val);
@@ -411,7 +416,7 @@ function parseArgs(argv: string[]): Args {
       positionals.push(a);
     }
   }
-  return { positionals, options };
+  return { positionals, options, missingOptionValues };
 }
 
 const last = (args: Args, key: string): string | undefined => {
@@ -501,6 +506,12 @@ interface Ctx {
   defs: Map<string, WorkflowDef>;
   defsDir: string;
   dbPath: string;
+  definitionDiscoveryComplete: boolean;
+}
+
+interface LoadedDefs {
+  defs: Map<string, WorkflowDef>;
+  definitionDiscoveryComplete: boolean;
 }
 
 /**
@@ -539,7 +550,11 @@ interface Ctx {
  * fail-closed validation in add.ts is untouched — we consume `readLockfile`,
  * discovery merely refuses to act on a bad ledger rather than crashing.)
  */
-function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, WorkflowDef> {
+function loadDefsWithInstalled(
+  io: CliIO,
+  defsDir: string,
+  tolerantCasInspection = false,
+): LoadedDefs {
   const merged = existsSync(defsDir) ? loadDefsUnfinalized(defsDir) : new Map<string, WorkflowDef>();
 
   let lf: Lockfile;
@@ -547,8 +562,8 @@ function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, Workflow
     lf = readLockfile(join(io.cwd, '.owenloop', 'installed.json'));
   } catch (e) {
     io.err(`warning: skipping installed workflow defs: ${(e as Error).message}`);
-    foldCasDefs(io, defsDir, merged);
-    return finalizeDefs(merged);
+    const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection);
+    return { defs: finalizeDefs(merged), definitionDiscoveryComplete };
   }
 
   for (const source of Object.keys(lf.installed).sort()) {
@@ -578,9 +593,9 @@ function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, Workflow
     }
   }
 
-  foldCasDefs(io, defsDir, merged);
+  const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection);
 
-  return finalizeDefs(merged);
+  return { defs: finalizeDefs(merged), definitionDiscoveryComplete };
 }
 
 /**
@@ -600,28 +615,36 @@ function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, Workflow
  * (defs.ts), scoped by the calling def's own `bundleDigest`, so bundle A's
  * `calls: build` can never bind to bundle B's `build`.
  *
- * Fail-OPEN like the ledger fold above: `loadCasDefs` never throws; every bad
- * index, unreadable object, or unloadable bundle becomes an `io.err` warning and
- * is skipped, so a corrupt CAS object cannot break `owenloop status`.
+ * Executable discovery is fail-closed. Only the explicit status inspection path
+ * uses `inspectCasDefs`, which warns, returns `complete: false`, and is never
+ * reused by a mutating command's resolver.
  *
  * When no store exists (no `index.json` at either root) this is a no-op and the
  * merged map is byte-identical to what it was before WS-6.
  */
-function foldCasDefs(io: CliIO, defsDir: string, merged: Map<string, WorkflowDef>): void {
-  // The global root needs a concrete home. `workflowHome` throws when neither
-  // HOME nor USERPROFILE is set; def DISCOVERY must not fail for that (the
-  // install verbs still do), so fall back to project-only discovery.
+function foldCasDefs(
+  io: CliIO,
+  defsDir: string,
+  merged: Map<string, WorkflowDef>,
+  tolerantInspection = false,
+): boolean {
+  // Without HOME/USERPROFILE, retain project discovery and consult a guaranteed
+  // absent synthetic global root instead of silently dropping the project store.
   let globalRoot: string;
   try {
     globalRoot = globalStoreRoot(workflowHome(io));
   } catch {
-    return;
+    globalRoot = join(defsDir, '.owenloop-global-store-unavailable');
   }
-  const registrations = loadCasDefs({
+  const discoveryArgs = {
     projectRoot: projectStoreRoot(defsDir),
     globalRoot,
-    warn: (line) => io.err(line),
-  });
+    warn: (line: string) => io.err(line),
+  };
+  const discovery = tolerantInspection
+    ? inspectCasDefs(discoveryArgs)
+    : { registrations: loadCasDefs(discoveryArgs), complete: true };
+  const registrations = discovery.registrations;
   for (const registration of registrations) {
     const winner = merged.get(registration.key);
     if (winner !== undefined) {
@@ -633,9 +656,10 @@ function foldCasDefs(io: CliIO, defsDir: string, merged: Map<string, WorkflowDef
     }
     merged.set(registration.key, registration.def);
   }
+  return discovery.complete;
 }
 
-function openCtx(io: CliIO, args: Args): Ctx {
+function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
   const dbOverride = last(args, 'db') ?? io.env.OWENLOOP_DB;
   const dbPath = dbOverride ?? join(io.cwd, '.owenloop', 'state.db');
   // An explicit `--defs`/`OWENLOOP_DEFS` is the operator targeting a literal dir
@@ -645,6 +669,17 @@ function openCtx(io: CliIO, args: Args): Ctx {
   // `OWENLOOP_DEFS=<cwd>/workflows` counts as an override and stays literal.
   const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
   const defsDir = defsOverride ?? join(io.cwd, 'workflows');
+  // Discover and validate executable definitions before creating or opening the
+  // runtime database. Corrupt workflow-store state therefore cannot mutate local
+  // runtime state before the command fails closed.
+  const loaded: LoadedDefs = defsOverride !== undefined
+    ? {
+	defs: existsSync(defsDir) ? loadDefs(defsDir) : new Map<string, WorkflowDef>(),
+	definitionDiscoveryComplete: true,
+      }
+    : loadDefsWithInstalled(io, defsDir, tolerantCasInspection);
+  const { defs, definitionDiscoveryComplete } = loaded;
+
   // Guard the built-in default (`cwd/.owenloop/state.db`) against a symlinked
   // `.owenloop` from a hostile checkout (SEC-3). Directory guard first, then the
   // file-level guard on `state.db` and its SQLite sidecars — a symlinked db file
@@ -657,12 +692,6 @@ function openCtx(io: CliIO, args: Args): Ctx {
     dbPathRefusingSymlink(dbPath);
   } else mkdirSync(dirname(dbPath), { recursive: true });
   const store = openStore(dbPath);
-  const defs =
-    defsOverride !== undefined
-      ? existsSync(defsDir)
-        ? loadDefs(defsDir)
-        : new Map<string, WorkflowDef>()
-      : loadDefsWithInstalled(io, defsDir);
   // WP-B1: the CLI ticks reference-mode orders exactly like the embedded
   // path — one loaded-definition resolver seeds the instruction boundary
   // (emission digests + instruction resolution), never a second local path.
@@ -678,7 +707,7 @@ function openCtx(io: CliIO, args: Args): Ctx {
     if (!d) throw new CliError(`unknown workflow definition '${name}' (looked in ${defsDir})`);
     return d;
   }, { instructionSource });
-  return { store, engine, defs, defsDir, dbPath };
+  return { store, engine, defs, defsDir, dbPath, definitionDiscoveryComplete };
 }
 
 function print(io: CliIO, value: unknown): void {
@@ -1758,8 +1787,11 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     return dispatchBundle(io, args);
   }
 
-  const ctx = openCtx(io, args);
+  const ctx = openCtx(io, args, command === 'status');
   const { engine, store } = ctx;
+  if (command === 'status' && !ctx.definitionDiscoveryComplete) {
+    io.err('warning: status is incomplete because workflow definition discovery skipped corrupt store state');
+  }
   try {
     switch (command) {
       case 'defs': {
@@ -4247,6 +4279,19 @@ async function hubRequestMessage(res: Response): Promise<string | undefined> {
  */
 async function dispatchStart(io: CliIO, args: Args): Promise<number> {
   const defName = need(args, 1, 'defName');
+  const requiredTextOption = (key: 'crew' | 'title', label: string): string | undefined => {
+    if (args.missingOptionValues.has(key)) {
+      throw new CliError(`missing value for --${key}: expected --${key} <${label}>`);
+    }
+    const value = last(args, key);
+    if (value !== undefined && value.trim() === '') {
+      throw new CliError(`invalid empty value for --${key}: expected --${key} <${label}>`);
+    }
+    return value;
+  };
+  // Validate request-only options before project binding, Keychain, or network access.
+  const crew = requiredTextOption('crew', 'name');
+  const title = requiredTextOption('title', 'text');
   const origin = resolveStartHub(io, args);
   const slot: CredentialSlotSelector = { principal: 'human' };
   const cred = readCredential(io, origin, slot);
@@ -4255,8 +4300,6 @@ async function dispatchStart(io: CliIO, args: Args): Promise<number> {
   }
 
   const provide = parsePairs(all(args, 'provide'), true);
-  const crew = last(args, 'crew');
-  const title = last(args, 'title');
   const request = {
     workflow_name: defName,
     ...(Object.keys(provide).length > 0 ? { provide } : {}),

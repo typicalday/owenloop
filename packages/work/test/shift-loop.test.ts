@@ -1768,39 +1768,81 @@ test('a canonical-path obstruction racing reservation fails closed before spawn'
   assert.match(err.join('\n'), /agent-run spawn for wf1\/run_reserve_fail failed:/u);
 });
 
-test('a PID-record finalization failure terminates the gated child and never opens its gate', async () => {
+test('a PID-record finalization failure cancels a real gated child and emits one failure event', async () => {
   cacheBuilderStep();
   const { hub } = mockHub({
     wake: [{ changed: true, cursor: 1 }],
     perWf: agentWf([wo('run_finalize_fail', 'builder')]),
   });
+  const script = join(stateDir, '..', 'gated-worker.mjs');
+  writeFileSync(
+    script,
+    "import { readFileSync } from 'node:fs';\n" +
+      "const gate = process.env.OWENLOOP_START_GATE;\n" +
+      "setInterval(() => {\n" +
+      "  if (gate !== undefined && readFileSync(gate, 'utf8') === 'start\\n') process.exit(0);\n" +
+      "}, 20);\n",
+  );
+  const workerFailures: unknown[] = [];
+  const realSpawner = createDefaultSpawner(
+    ORIGIN,
+    'default',
+    script,
+    'shf_test',
+    (failure) => workerFailures.push(failure),
+  );
   let gatePath: string | undefined;
-  let terminated = 0;
+  let childPid: number | undefined;
   const spawner: Spawner = (spec) => {
     gatePath = spec.startGate;
     assert.equal(gatePath === undefined ? undefined : readFileSync(gatePath, 'utf8'), 'wait\n');
+    const spawned = realSpawner(spec);
+    childPid = spawned.pid;
     rmSync(join(stateDir, 'run_finalize_fail.json'));
     mkdirSync(join(stateDir, 'run_finalize_fail.json'));
-    return { pid: 4242, terminate: () => { terminated++; } };
+    return spawned;
   };
   const err: string[] = [];
+  const events: string[] = [];
+  const keepAlive = setTimeout(() => {}, 5_000);
 
-  const loop = createShiftLoop(baseOpts(hub, spawner, {
-    workflow: 'wf1',
-    err: (line) => err.push(line),
-  }));
+  try {
+    const loop = createShiftLoop(baseOpts(hub, spawner, {
+      workflow: 'wf1',
+      err: (line) => err.push(line),
+      onEvent: (event) => events.push(event.type),
+    }));
 
-  await assert.rejects(
-    loop.iterate(),
-    (error: unknown) =>
-      error instanceof ShiftStateRecordError
-      && error.path === join(stateDir, 'run_finalize_fail.json'),
-  );
-  assert.equal(terminated, 1, 'the spawned process is terminated after PID persistence fails');
-  assert.equal(gatePath === undefined ? true : existsSync(gatePath), false, 'the child never observes a start signal');
-  assert.equal(existsSync(join(stateDir, 'run_finalize_fail.json')), true, 'the corrupt canonical path remains for operator repair');
-  assert.match(err.join('\n'), /canonical record is unreadable/u);
-  assert.match(err.join('\n'), /failed to cancel dispatch reservation/u);
+    await assert.rejects(
+      loop.iterate(),
+      (error: unknown) =>
+	error instanceof ShiftStateRecordError
+	&& error.path === join(stateDir, 'run_finalize_fail.json'),
+    );
+    assert.notEqual(childPid, undefined);
+    const deadline = Date.now() + 5_000;
+    while (childPid !== undefined && Date.now() < deadline) {
+      try {
+	process.kill(childPid, 0);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+      } catch {
+	break;
+      }
+    }
+    assert.throws(() => process.kill(childPid!, 0), /ESRCH/u, 'dispatcher cancellation terminates the child');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(events.filter((type) => type === 'failed'), ['failed']);
+    assert.deepEqual(workerFailures, [], 'SIGTERM from dispatcher cancellation is not a second failure');
+    assert.equal(gatePath === undefined ? true : existsSync(gatePath), false, 'the child never observes a start signal');
+    assert.equal(existsSync(join(stateDir, 'run_finalize_fail.json')), true, 'the corrupt canonical path remains for operator repair');
+    assert.match(err.join('\n'), /canonical record is unreadable/u);
+    assert.match(err.join('\n'), /failed to cancel dispatch reservation/u);
+  } finally {
+    clearTimeout(keepAlive);
+    if (childPid !== undefined) {
+      try { process.kill(childPid, 'SIGKILL'); } catch { /* already exited */ }
+    }
+  }
 });
 
 test('a broken state-directory path fails closed before hub polling or spawn', async () => {

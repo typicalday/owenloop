@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mainAsync } from '../src/cli.ts';
 import { hubBindingPath, writeHubBinding } from '../src/hub.ts';
-import type { Credential } from '../src/hub.ts';
+import type { Credential, Keychain } from '../src/hub.ts';
 import { kcHuman, makeIo, routedFetch } from './hubkit.ts';
 
 const ORIGIN = 'http://127.0.0.1:9';
@@ -80,6 +80,58 @@ test('start: bound-project happy path posts inputs and crew with the human crede
     stampedCrews: STARTED.stampedCrews,
     validatedCrews: [],
   });
+});
+
+test('start: missing or empty crew/title values fail before credential and network access', async () => {
+  const cases = [
+    { argv: ['start', 'newhire-onboarding', '--crew'], error: /missing value for --crew/u },
+    { argv: ['start', 'newhire-onboarding', '--title'], error: /missing value for --title/u },
+    { argv: ['start', 'newhire-onboarding', '--crew='], error: /invalid empty value for --crew/u },
+    { argv: ['start', 'newhire-onboarding', '--title='], error: /invalid empty value for --title/u },
+  ] as const;
+
+  for (const fixture of cases) {
+    const store = new Map<string, string>();
+    let credentialAccesses = 0;
+    const composite = (service: string, account: string): string => `${service}\u0000${account}`;
+    const keychain: Keychain = {
+      get(service, account) {
+	credentialAccesses++;
+	return store.get(composite(service, account)) ?? null;
+      },
+      set(service, account, value) {
+	credentialAccesses++;
+	store.set(composite(service, account), value);
+      },
+      delete(service, account) {
+	credentialAccesses++;
+	store.delete(composite(service, account));
+      },
+    };
+    const { fetch, calls } = routedFetch({});
+    const t = makeIo({ fetch, keychain, store });
+    bind(t);
+
+    const code = await mainAsync([...fixture.argv], t.io);
+
+    assert.equal(code, 1, fixture.argv.join(' '));
+    assert.match(t.err.join('\n'), fixture.error);
+    assert.equal(credentialAccesses, 0, `${fixture.argv.join(' ')} must not access credentials`);
+    assert.equal(calls.length, 0, `${fixture.argv.join(' ')} must not access the network`);
+  }
+});
+
+test('start: an explicit literal title "true" remains a valid value', async () => {
+  const { fetch, calls } = routedFetch({
+    'POST /api/start_run': () => ({ status: 200, json: STARTED }),
+  });
+  const t = makeIo({ fetch });
+  bind(t);
+
+  const code = await mainAsync(['start', 'newhire-onboarding', '--title=true'], t.io);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal(JSON.parse(calls[0]!.body ?? '{}').title, 'true');
 });
 
 test('start: explicit --hub works from an unbound directory and still requires the human credential', async () => {
