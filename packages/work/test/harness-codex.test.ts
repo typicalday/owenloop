@@ -17,6 +17,7 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -669,15 +670,18 @@ const CASES: Case[] = [
       filesystem: 'unrestricted',
       codexConfig: {
         model_reasoning_summary: 'detailed',
+	project_root_markers: ['.custom-root'],
         mcp_servers: { owenloop: { command: 'nope', args: [] }, other: { command: 'ok', args: [] } },
       },
     },
     expect(p) {
       const config = p['config'] as {
         model_reasoning_summary: string;
+	project_root_markers: string[];
         mcp_servers: Record<string, unknown>;
       };
       assert.equal(config.model_reasoning_summary, 'detailed');
+      assert.deepEqual(config.project_root_markers, ['.custom-root']);
       assert.deepEqual(config.mcp_servers['other'], { command: 'ok', args: [] });
       assertMount(config.mcp_servers['owenloop']);
     },
@@ -838,8 +842,11 @@ test('C10g every neutral filesystem/network combination matches Codex enforcemen
     const params = buildThreadStartParams({ ...deliverArgs(), permissions });
     assert.equal(params['sandbox'], c.sandbox);
     const config = params['config'] as Record<string, unknown>;
-    if (c.workspaceNetwork === true) {
-      assert.deepEqual(config['sandbox_workspace_write'], { network_access: true });
+    if (c.sandbox === 'workspace-write') {
+      assert.deepEqual(
+	config['sandbox_workspace_write'],
+	c.workspaceNetwork === true ? { network_access: true } : {},
+      );
     } else {
       assert.equal('sandbox_workspace_write' in config, false);
     }
@@ -866,23 +873,33 @@ test('C10g every neutral filesystem/network combination matches Codex enforcemen
   }
 });
 
-test('C10h workspace-write unrestricted network overrides extension config on start and resume', () => {
+test('C10h restricted start and resume remove custom project and writable roots', () => {
   const args = deliverArgs({
     filesystem: 'workspace-write',
     network: 'unrestricted',
     codexConfig: {
-      sandbox_workspace_write: { network_access: false, writable_roots: ['/tmp/extra'] },
+      project_root_markers: ['.custom-root'],
+      sandbox_workspace_write: {
+	network_access: false,
+	writable_roots: ['/tmp/extra'],
+	exclude_slash_tmp: true,
+	exclude_tmpdir_env_var: false,
+	future_field: 'drop-me',
+      },
     },
   });
   for (const params of [
     buildThreadStartParams(args),
     buildThreadResumeParams('th-network', args),
   ]) {
-    const workspace = (params['config'] as Record<string, unknown>)[
-      'sandbox_workspace_write'
-    ] as Record<string, unknown>;
-    assert.equal(workspace['network_access'], true);
-    assert.deepEqual(workspace['writable_roots'], ['/tmp/extra']);
+    const config = params['config'] as Record<string, unknown>;
+    assert.deepEqual(config['project_root_markers'], ['.git']);
+    const workspace = config['sandbox_workspace_write'] as Record<string, unknown>;
+    assert.deepEqual(workspace, {
+      exclude_slash_tmp: true,
+      exclude_tmpdir_env_var: false,
+      network_access: true,
+    });
   }
 });
 
@@ -895,6 +912,12 @@ test('C10i restricted resume drops inherited process config and retains Owenloop
 	notify: ['/bin/notifier'],
 	hooks: { afterAgent: [{ command: '/bin/hook' }] },
 	plugins: { external: { path: '/tmp/plugin' } },
+	project_root_markers: ['.inherited-root'],
+	sandbox_workspace_write: {
+	  network_access: true,
+	  writable_roots: ['/tmp/inherited-extra'],
+	  exclude_slash_tmp: true,
+	},
 	benign: 'kept',
       },
     }),
@@ -907,6 +930,8 @@ test('C10i restricted resume drops inherited process config and retains Owenloop
   const config = resumed['config'] as Record<string, unknown>;
   assert.equal(config['benign'], 'kept');
   for (const key of ['notify', 'hooks', 'plugins']) assert.equal(key in config, false);
+  assert.deepEqual(config['project_root_markers'], ['.git']);
+  assert.deepEqual(config['sandbox_workspace_write'], {});
   const servers = config['mcp_servers'] as Record<string, unknown>;
   assert.deepEqual(Object.keys(servers), ['owenloop']);
   assertMount(servers['owenloop']);
@@ -1370,6 +1395,61 @@ function useStub(t: { after(fn: () => void): void }, mode: string): Stub {
   };
 }
 
+function projectConfigWorkspace(base: string): { root: string; leaf: string; link: string } {
+  const root = join(base, 'project');
+  const leaf = join(root, 'nested', 'worktree');
+  const link = join(base, 'linked-worktree');
+  mkdirSync(join(root, '.git'), { recursive: true });
+  mkdirSync(join(root, '.codex'), { recursive: true });
+  mkdirSync(leaf, { recursive: true });
+  writeFileSync(
+    join(root, '.codex', 'config.toml'),
+    '[mcp_servers.escape]\ncommand = "/bin/false"\n\n' +
+    '[sandbox_workspace_write]\nwritable_roots = ["/tmp/escape"]\n',
+  );
+  symlinkSync(leaf, link, 'dir');
+  return { root, leaf, link };
+}
+
+test('D4 restricted cold start refuses project-local MCP and writable-root config before spawn', async (t) => {
+  const stub = useStub(t, 'refuse-initialize');
+  const workspace = projectConfigWorkspace(stub.dir);
+
+  const err = await codexAdapter
+    .start(startArgs({ filesystem: 'read-only' }, { cwd: workspace.leaf }), () => {})
+    .then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+
+  assert.ok(err instanceof Error);
+  assert.match(err.message, /refuses project config '.*\.codex\/config\.toml' before app-server startup/);
+  assert.equal(stub.pid(), undefined, 'the app-server process must not start');
+  assert.deepEqual(stub.received(), []);
+});
+
+test('D4 restricted resume resolves a symlinked cwd and refuses project config before spawn', async (t) => {
+  const stub = useStub(t, 'refuse-initialize');
+  const workspace = projectConfigWorkspace(stub.dir);
+
+  const err = await codexAdapter
+    .deliver(
+      { harness: 'codex', token: 'th-project-config' },
+      'continue',
+      deliverArgs({ filesystem: 'workspace-write' }, { cwd: workspace.link }),
+      () => {},
+    )
+    .then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+
+  assert.ok(err instanceof Error);
+  assert.match(err.message, /refuses project config '.*\.codex\/config\.toml' before app-server startup/);
+  assert.equal(stub.pid(), undefined, 'the app-server process must not start');
+  assert.deepEqual(stub.received(), []);
+});
+
 test('D4 restricted app-server spawn filters env and isolates inherited Codex config', async (t) => {
   const saved = { ...process.env };
   t.after(() => {
@@ -1436,11 +1516,12 @@ test('D4b unrestricted filesystem preserves the operator Codex home', async (t) 
   });
 
   const stub = useStub(t, 'refuse-initialize');
+  const workspace = projectConfigWorkspace(stub.dir);
   const operatorHome = join(stub.dir, 'operator-codex');
   process.env['CODEX_HOME'] = operatorHome;
 
   const err = await codexAdapter
-    .start(startArgs({ filesystem: 'unrestricted' }, { cwd: stub.dir }), () => {})
+    .start(startArgs({ filesystem: 'unrestricted' }, { cwd: workspace.leaf }), () => {})
     .then(
       () => undefined,
       (e: unknown) => e,

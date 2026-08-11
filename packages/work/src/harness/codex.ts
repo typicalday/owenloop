@@ -63,8 +63,8 @@
  * `{kind:'exited'}` and rejects with the underlying error.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, symlinkSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, realpathSync, symlinkSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { ResumeUnavailableError } from './contract.ts';
@@ -166,8 +166,14 @@ const FILESYSTEM_SANDBOX: Record<NonNullable<StepPermissions['filesystem']>, str
 
 /** Sandboxes whose filesystem boundary does not cover host-started subprocesses. */
 const RESTRICTED_SANDBOXES = new Set(['read-only', 'workspace-write']);
+/** The pinned binary's default marker for the project-config ancestor chain. */
+const PROJECT_ROOT_MARKER = '.git';
+/** Thread config that can replace `.git` and extend project-config discovery. */
+const PROJECT_ROOT_MARKERS_CONFIG_KEY = 'project_root_markers';
 /** Codex config keys that can load or launch host-side executable code. */
 const HOST_PROCESS_CONFIG_KEYS = new Set(['notify', 'hook', 'hooks', 'plugin', 'plugins']);
+/** Workspace-write fields that can only narrow Codex's default writable surface. */
+const APPROVED_WORKSPACE_WRITE_KEYS = ['exclude_slash_tmp', 'exclude_tmpdir_env_var'] as const;
 
 /** Resolve the effective sandbox only when the authored policy is internally valid. */
 function effectiveSandbox(permissions: StepPermissions): string | undefined {
@@ -356,6 +362,26 @@ function owenloopMount(mcp: { command: string; args: string[] }): McpServerSpec 
 }
 
 /**
+ * Rebuild restricted workspace-write config from the adapter's whitelist.
+ * Authored network_access cannot override the neutral network policy, and
+ * writable_roots is never copied because every extra root widens the sandbox.
+ */
+function restrictedWorkspaceWriteConfig(
+  extraConfig: Record<string, unknown>,
+  permissions: StepPermissions,
+): Record<string, unknown> {
+  const authored = isPlainMap(extraConfig['sandbox_workspace_write'])
+    ? extraConfig['sandbox_workspace_write']
+    : {};
+  const out: Record<string, unknown> = {};
+  for (const key of APPROVED_WORKSPACE_WRITE_KEYS) {
+    if (typeof authored[key] === 'boolean') out[key] = authored[key];
+  }
+  if (permissions.network === 'unrestricted') out['network_access'] = true;
+  return out;
+}
+
+/**
  * Build the `thread/start` params. PURE — exported for tests.
  *
  * Takes `DeliverArgs`, not `StartArgs`, because it never reads `brief` and Phase
@@ -408,15 +434,19 @@ export function buildThreadStartParams(
   };
 
   const config: Record<string, unknown> = { ...extraConfig, mcp_servers: mcpServers };
-  if (sandbox === 'workspace-write' && args.permissions.network === 'unrestricted') {
-    const authored = isPlainMap(extraConfig['sandbox_workspace_write'])
-      ? extraConfig['sandbox_workspace_write']
-      : {};
-    config['sandbox_workspace_write'] = {
-      ...authored,
-      // Applied after extension config: the authored policy always wins.
-      network_access: true,
-    };
+  if (RESTRICTED_SANDBOXES.has(sandbox)) {
+    // Pin thread config to the `.git` chain inspected before spawn. The pinned
+    // binary applies this override early enough to load MCP and writable-root
+    // config from an otherwise out-of-project ancestor, so omission would let an
+    // inherited marker setting reopen the boundary.
+    config[PROJECT_ROOT_MARKERS_CONFIG_KEY] = [PROJECT_ROOT_MARKER];
+    // Never carry an authored workspace config through a restricted boundary.
+    // In workspace-write, reconstruct the map from the adapter-approved fields;
+    // in read-only, remove the irrelevant map entirely.
+    delete config['sandbox_workspace_write'];
+    if (sandbox === 'workspace-write') {
+      config['sandbox_workspace_write'] = restrictedWorkspaceWriteConfig(extraConfig, args.permissions);
+    }
   }
 
   const params: Record<string, unknown> = {
@@ -456,11 +486,16 @@ function resolveSandbox(permissions: StepPermissions): string {
   throw new Error(`sandbox must be one of ${[...SANDBOX_MODES].join('|')}`);
 }
 
-/** Remove process-launching config inherited from an earlier, broader turn. */
-function withoutHostProcessConfig(config: Record<string, unknown>): Record<string, unknown> {
+/** Remove project discovery, host processes, and writable roots inherited from a broader turn. */
+function withoutRestrictedConfig(config: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(config)) {
-    if (key === 'mcp_servers' || HOST_PROCESS_CONFIG_KEYS.has(key)) continue;
+    if (
+      key === 'mcp_servers' ||
+      key === PROJECT_ROOT_MARKERS_CONFIG_KEY ||
+      key === 'sandbox_workspace_write' ||
+      HOST_PROCESS_CONFIG_KEYS.has(key)
+    ) continue;
     out[key] = value;
   }
   return out;
@@ -516,7 +551,7 @@ export function buildThreadResumeParams(
 
   const inheritedConfig = base !== undefined && isPlainMap(base['config']) ? base['config'] : {};
   const restricted = RESTRICTED_SANDBOXES.has(String(fromArgs['sandbox']));
-  const baseConfig = restricted ? withoutHostProcessConfig(inheritedConfig) : inheritedConfig;
+  const baseConfig = restricted ? withoutRestrictedConfig(inheritedConfig) : inheritedConfig;
   const argsConfig = isPlainMap(fromArgs['config']) ? fromArgs['config'] : {};
   const baseServers = isPlainMap(baseConfig['mcp_servers']) ? baseConfig['mcp_servers'] : {};
   const argsServers = isPlainMap(argsConfig['mcp_servers']) ? argsConfig['mcp_servers'] : {};
@@ -729,6 +764,60 @@ function pathEntryExists(path: string): boolean {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
     throw err;
   }
+}
+
+/**
+ * Find a project-local config on the pinned binary's default project chain.
+ *
+ * Codex 0.146.0 has no app-server flag that disables project config. Its
+ * project chain starts at cwd and ends at the nearest `.git` marker. Inspect
+ * both the normalized path and the canonical path: a symlinked cwd can hide the
+ * real worktree marker and config from a lexical-only check.
+ */
+function restrictedProjectConfig(cwd: string): string | undefined {
+  const starts = new Set<string>([resolve(cwd)]);
+  starts.add(realpathSync(cwd));
+
+  for (const start of starts) {
+    const chain: string[] = [];
+    let current = start;
+    for (;;) {
+      chain.push(current);
+      if (pathEntryExists(join(current, PROJECT_ROOT_MARKER))) {
+	for (const dir of chain) {
+	  const config = join(dir, '.codex', 'config.toml');
+	  if (pathEntryExists(config)) return config;
+	}
+	break;
+      }
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  return undefined;
+}
+
+/** Refuse a restricted thread before its app-server process can start. */
+function assertNoRestrictedProjectConfig(cwd: string, permissions: StepPermissions): void {
+  const sandbox = resolveSandbox(permissions);
+  if (!RESTRICTED_SANDBOXES.has(sandbox)) return;
+
+  let config: string | undefined;
+  try {
+    config = restrictedProjectConfig(cwd);
+  } catch (err) {
+    throw new Error(
+      `cannot verify project config isolation for Codex sandbox '${sandbox}' from '${resolve(cwd)}': ` +
+      (err instanceof Error ? err.message : String(err)),
+    );
+  }
+  if (config === undefined) return;
+  throw new Error(
+    `Codex sandbox '${sandbox}' refuses project config '${config}' before app-server startup; ` +
+    `remove or rename the project-local .codex/config.toml, or use filesystem 'unrestricted' ` +
+    `only when the workflow may trust that config`,
+  );
 }
 
 /**
@@ -965,6 +1054,9 @@ async function openClient(
   onEvent: (e: AgentEvent) => void,
   gate: TurnGate,
 ): Promise<OpenedClient> {
+  // Filesystem inspection must finish before startStdioRpc can spawn anything.
+  assertNoRestrictedProjectConfig(cwd, permissions);
+
   let exitReported = false;
   const reportExit = (exitCode: number | null, error: string | undefined): void => {
     if (exitReported) return;

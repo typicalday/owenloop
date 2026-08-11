@@ -159,8 +159,10 @@ export function parseArgs(args: string[]): ParsedArgs {
         if (name === '--workflow') parsed.workflow = r.value;
         else if (name === '--origin') parsed.origin = r.value;
         else if (name === '--shift') parsed.shift = r.value;
-        else if (name === '--harness') parsed.harness = r.value;
-        else {
+	else if (name === '--harness') {
+	  if (r.value.trim() === '') return { error: '--harness must be a non-empty harness id' };
+	  parsed.harness = r.value;
+	} else {
           const n = positiveMs(name, r.value);
           if ('error' in n) return { error: n.error };
           if (name === '--heartbeat-interval') parsed.heartbeatIntervalMs = n.value;
@@ -388,12 +390,25 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
    */
   const envHarness = env['OWENLOOP_HARNESS'];
   const resolveAdapter = (stepHarness: string | undefined): AdapterResolution => {
-    const id =
-      (parsed.harness !== undefined && parsed.harness !== '' ? parsed.harness : undefined) ??
-      (envHarness !== undefined && envHarness !== '' ? envHarness : undefined) ??
-      (stepHarness !== undefined && stepHarness !== '' ? stepHarness : undefined) ??
-      defaultHarnessId() ??
-      '';
+    let id: string;
+    if (parsed.harness !== undefined) {
+      id = parsed.harness;
+    } else if (envHarness !== undefined) {
+      // Definition and default selection are lower precedence. An explicit empty
+      // environment override is invalid; it must not silently fall through.
+      if (envHarness.trim() === '') {
+	return {
+	  id: '<empty OWENLOOP_HARNESS>',
+	  registered: registeredHarnessIds(),
+	};
+      }
+      id = envHarness;
+    } else {
+      id =
+	(stepHarness !== undefined && stepHarness !== '' ? stepHarness : undefined) ??
+	defaultHarnessId() ??
+	'';
+    }
     const adapter = id !== '' ? adapterFor(id) : undefined;
     return {
       id: id !== '' ? id : '<none>',

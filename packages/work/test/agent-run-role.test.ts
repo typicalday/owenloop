@@ -58,6 +58,17 @@ test('parseArgs rejects a second positional and an unknown option', () => {
   assert.match(parseArgs(['a', '--bogus']).error!, /unknown option '--bogus'/);
 });
 
+test('parseArgs rejects empty and whitespace-only explicit harness overrides', () => {
+  for (const args of [
+    ['a', '--harness='],
+    ['a', '--harness', ''],
+    ['a', '--harness=   '],
+    ['a', '--harness', ' \t '],
+  ]) {
+    assert.match(parseArgs(args).error!, /--harness must be a non-empty harness id/, JSON.stringify(args));
+  }
+});
+
 // All four ms knobs share one validator; assert each rejects the same three ways.
 test('parseArgs validates every ms knob as a positive integer', () => {
   for (const flag of ['--heartbeat-interval', '--jump-tolerance', '--submit-grace', '--confirm-interval']) {
@@ -740,6 +751,32 @@ test('run() fails honestly (exit 1) when --harness names no registered adapter',
   assert.match(text, /fake/); // and what IS registered
   // no-harness releases, so the hub can re-offer the order.
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+});
+
+test('empty OWENLOOP_HARNESS never falls through and releases the held claim', async () => {
+  const fake = createFakeAdapter({ id: 'fake' });
+  useAdapter(fake);
+  seedBundle({ harness: 'fake' });
+
+  for (const value of ['', ' \t ']) {
+    process.env['OWENLOOP_HARNESS'] = value;
+    const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+    const err: string[] = [];
+
+    const code = await run(WIRE, {
+      hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'host:123',
+      cwd: '/work',
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+
+    assert.equal(code, 1, JSON.stringify(value));
+    assert.deepEqual(fake.calls, []);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+    assert.match(err.join('\n'), /<empty OWENLOOP_HARNESS>/);
+  }
 });
 
 test('--harness policy preflight uses the final overridden adapter and refuses before start', async () => {
