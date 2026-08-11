@@ -11,13 +11,44 @@
  * `npm run build`/`pretest` has already produced `dist/` before this test runs.
  */
 
-import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
-import { join, relative } from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { hostileFileEntry, hostileTarball } from './helpers.ts';
 
 const ROOT = join(import.meta.dirname, '..');
+const PACKAGE_CHECK = join(ROOT, 'scripts/check-npm-package.mjs');
+
+const EXPECTED_PLUGIN_FILES = [
+  'plugins/claude-code/.claude-plugin/marketplace.json',
+  'plugins/claude-code/plugin/.claude-plugin/plugin.json',
+  'plugins/claude-code/plugin/.mcp.json',
+  'plugins/claude-code/plugin/hooks/hooks.json',
+  'plugins/claude-code/plugin/hooks/session-end.sh',
+  'plugins/claude-code/plugin/hooks/session-start.sh',
+  'plugins/claude-code/plugin/skills/author/SKILL.md',
+  'plugins/claude-code/plugin/skills/conduct/SKILL.md',
+  'plugins/claude-code/plugin/skills/shift/SKILL.md',
+  'plugins/codex/.agents/plugins/marketplace.json',
+  'plugins/codex/plugins/owenloop/.codex-plugin/plugin.json',
+  'plugins/codex/plugins/owenloop/.mcp.json',
+  'plugins/codex/plugins/owenloop/hooks/hooks.json',
+  'plugins/codex/plugins/owenloop/hooks/session-end.sh',
+  'plugins/codex/plugins/owenloop/hooks/session-start.sh',
+  'plugins/codex/plugins/owenloop/skills/author/SKILL.md',
+  'plugins/codex/plugins/owenloop/skills/conduct/SKILL.md',
+  'plugins/codex/plugins/owenloop/skills/shift/SKILL.md',
+] as const;
+
+const PLUGIN_EXECUTABLES = new Set([
+  'plugins/claude-code/plugin/hooks/session-end.sh',
+  'plugins/claude-code/plugin/hooks/session-start.sh',
+  'plugins/codex/plugins/owenloop/hooks/session-end.sh',
+  'plugins/codex/plugins/owenloop/hooks/session-start.sh',
+]);
 
 /** The file list `npm pack` would publish, via a no-op dry run. */
 function packedFiles(): string[] {
@@ -51,15 +82,47 @@ function packedFiles(): string[] {
   return files;
 }
 
-/** Recursively list repository-relative files under a directory. */
-function walkFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const full = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...walkFiles(full));
-    else if (entry.isFile()) out.push(relative(ROOT, full).replace(/\\/g, '/'));
+function packTarball(): Buffer {
+  const destination = mkdtempSync(join(tmpdir(), 'owenloop-package-gate-'));
+  try {
+    execFileSync('npm', ['pack', '--ignore-scripts', '--pack-destination', destination], {
+      cwd: ROOT,
+      stdio: 'ignore',
+    });
+    const files = readdirSync(destination);
+    assert.deepEqual(files.length, 1, `npm pack should write one tarball (got ${files.join(', ')})`);
+    return readFileSync(join(destination, files[0]!));
+  } finally {
+    rmSync(destination, { recursive: true, force: true });
   }
-  return out;
+}
+
+function runPackageCheck(tarball: Buffer): { status: number | null; stdout: string; stderr: string } {
+  const directory = mkdtempSync(join(tmpdir(), 'owenloop-package-policy-'));
+  const path = join(directory, 'package.tgz');
+  writeFileSync(path, tarball);
+  try {
+    const result = spawnSync(process.execPath, [PACKAGE_CHECK, path], {
+      cwd: ROOT,
+      encoding: 'utf8',
+    });
+    return {
+      status: result.status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function validPluginTarball(extraBlocks: Buffer[] = []): Buffer {
+  const blocks = EXPECTED_PLUGIN_FILES.flatMap((path) =>
+    hostileFileEntry(`package/${path}`, '', {
+      mode: PLUGIN_EXECUTABLES.has(path) ? 0o755 : 0o644,
+    }),
+  );
+  return hostileTarball([...blocks, ...extraBlocks]);
 }
 
 test('npm pack includes everything a consumer needs', () => {
@@ -121,12 +184,56 @@ test('npm pack excludes local state, scaffolding, and repo-only files', () => {
   }
 });
 
-test('npm pack ships the whole plugins/ tree', () => {
-  const expected = walkFiles(join(ROOT, 'plugins'));
-  assert.ok(expected.length > 0, 'plugins/ must contain at least one file');
+test('npm pack ships exactly the Claude Code and Codex consumer plugin files', () => {
+  const packed = packedFiles().filter((file) => file.startsWith('plugins/')).sort();
+  assert.deepEqual(packed, [...EXPECTED_PLUGIN_FILES].sort());
+});
 
-  const packed = new Set(packedFiles());
-  for (const rel of expected) {
-    assert.ok(packed.has(rel), `tarball should include ${rel}`);
+test('the shared npm package validator accepts the actual npm pack tarball', () => {
+  const result = runPackageCheck(packTarball());
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /npm package content OK/);
+});
+
+test('the npm package validator rejects plugin source, credentials, traversal, links, modes, and extras', () => {
+  const cases = [
+    {
+      name: 'source-only files',
+      blocks: hostileFileEntry('package/plugins/_skills/author/SKILL.md', ''),
+    },
+    {
+      name: 'hidden credentials',
+      blocks: hostileFileEntry('package/plugins/claude-code/plugin/.env', ''),
+    },
+    {
+      name: 'local config',
+      blocks: hostileFileEntry('package/plugins/codex/plugins/owenloop/.npmrc', ''),
+    },
+    {
+      name: 'path traversal',
+      blocks: hostileFileEntry('package/plugins/claude-code/plugin/../credentials.json', ''),
+    },
+    {
+      name: 'symlinks',
+      blocks: hostileFileEntry('package/plugins/claude-code/plugin/evil.js', '', {
+        linkname: '../../.env',
+        typeflag: '2',
+      }),
+    },
+    {
+      name: 'unexpected executables',
+      blocks: hostileFileEntry('package/plugins/claude-code/plugin/skills/author/SKILL.md', '', {
+        mode: 0o755,
+      }),
+    },
+    {
+      name: 'arbitrary plugin files',
+      blocks: hostileFileEntry('package/plugins/codex/plugins/owenloop/evil.js', ''),
+    },
+  ] as const;
+
+  for (const testCase of cases) {
+    const result = runPackageCheck(validPluginTarball(testCase.blocks));
+    assert.notEqual(result.status, 0, `${testCase.name} should fail closed`);
   }
 });

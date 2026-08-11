@@ -43,7 +43,8 @@
     "dist",
     "bin",
     "examples/workflows",
-    "plugins",
+    "plugins/claude-code",
+    "plugins/codex",
     "docs",
     "CHANGELOG.md"
   ],
