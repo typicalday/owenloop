@@ -728,9 +728,18 @@ named `${producerStep}.${producedStem}.judges.${judgeName}`. Each judge step:
 - `judges: <judgedStem>` — the marker field that makes it a judge (mirrors
   `calls:`'s marker-field pattern), read by both layers:
   `eligibleFirings`/`applyOutcome` (model.ts) and `green()` (engine.ts).
+- The producer step's complete parsed `x:` extension carrier is deep-cloned
+  onto every synthesized judge. Judge entries do not author their own `x:`;
+  inheritance happens after the producer has been fully parsed. Every judge
+  receives a separate clone, and an absent producer `x:` remains absent rather
+  than becoming an empty map. `buildOrder()` therefore carries the inherited
+  carrier as the judge's `Order.x` through the normal generated and persisted
+  order path.
 - Everything else — throttles (`cadence`, `maxRunsPerDay`), retry/timeout,
   prompt surface (`body`/`bodyFile`/`model`), observability — is inherited
-  from the ordinary `StepDef` shape, not respecified. A judge is not a
+  from the ordinary `StepDef` shape, not respecified. A judge entry's
+  first-class `model` remains separate from inherited extension data and keeps
+  the existing runtime precedence over `x.harness.model`. A judge is not a
   special-cased mini-pipeline; it is a step.
 
 **Wiring decision**: judges flow through the *normal* step-firing pipeline
@@ -1339,14 +1348,21 @@ Scope notes: `x:` is a key on the two *authored, engine-fired* shapes
 (`RAW_DEF_KEYS`, `RAW_STEP_KEYS`). It is **not** in the smaller
 `calls:`/`include:` directive shapes (same shape-routing rule as §27.2 —
 those are machine-handled entries with no order for a runner to configure)
-and not on produce/group/judge/input entries. Because `x:` rides inside the
-def, it participates in §28 pinning like every other field: an instance sees
-the `x:` snapshotted at `createInstance` time, and `hashDef` treats an `x:`
-edit as real drift — which is correct, since the runner's behavior for that
-instance depends on it. `expandIncludes` carries a child step's `x:` through
-prefixing untouched (there are no stems inside `x:` to rewrite — it's
-opaque); a child definition's own top-level `x:` stays on the child def and
-is not merged into the parent's.
+and not on produce/group/judge/input entries. A native judge entry therefore
+cannot author a separate `x:` map. `synthesizeJudgeSteps()` instead gives each
+compiled judge `StepDef` an independent deep clone of the fully parsed producer
+step's complete `x:` map; no producer map means no judge map. Core still does
+not interpret any nested vocabulary, including `x.harness`.
+
+Because `x:` rides inside the def, it participates in §28 pinning like every
+other field: an instance sees the `x:` snapshotted at `createInstance` time,
+and `hashDef` treats an `x:` edit as real drift — which is correct, since the
+runner's behavior for that instance depends on it. The reference-mode
+instruction digest also includes every compiled step's `x:`, including the
+inherited judge clones, and instruction sources retain private deep snapshots.
+`expandIncludes` carries a child step's `x:` through prefixing untouched (there
+are no stems inside `x:` to rewrite — it's opaque); a child definition's own
+top-level `x:` stays on the child def and is not merged into the parent's.
 
 ### §27.4 `executor:`/`command:`/`spec:` — declaring the executor
 

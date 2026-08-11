@@ -915,6 +915,7 @@ function synthesizeJudgeSteps(
   producerStepName: string,
   pat: ProducePattern,
   producerConsumeStems: string[],
+  producerX?: Record<string, unknown>,
 ): StepDef[] {
   if (!pat.judges || pat.judges.length === 0) return [];
   return pat.judges.map((j): StepDef => {
@@ -935,6 +936,10 @@ function synthesizeJudgeSteps(
       maxSchemaFailures: DEFAULTS.maxSchemaFailures,
       body: j.body,
     };
+    // Every native judge executes under the producer's complete opaque extension
+    // carrier. Clone per judge so neither producer nor sibling mutations can
+    // alter another synthesized step. Absence stays absence: no empty x bag.
+    if (producerX !== undefined) step.x = structuredClone(producerX);
     if (j.model !== undefined) step.model = j.model;
     if (j.executor !== undefined) step.executor = j.executor;
     if (j.command !== undefined) step.command = j.command;
@@ -1096,7 +1101,7 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
     }
   }
   const producerConsumeStems = consumes.map((c) => c.stem);
-  const judgeSteps = producesPatterns.flatMap((p) => synthesizeJudgeSteps(name, p, producerConsumeStems));
+  const judgeSteps = producesPatterns.flatMap((p) => synthesizeJudgeSteps(name, p, producerConsumeStems, step.x));
   return [step, ...judgeSteps];
 }
 

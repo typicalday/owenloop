@@ -65,6 +65,32 @@ function researcherWithInputsJudgeDef(): WorkflowDef {
   });
 }
 
+function researcherWithPolicyDef(): WorkflowDef {
+  return buildDef({
+    name: 'researcherPolicyDef',
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [
+      {
+	name: 'researcher',
+	consumes: ['question'],
+	produces: [
+	  {
+	    name: 'report',
+	    judges: [
+	      { name: 'completeness', body: 'evaluate completeness', inputs: true, model: 'judge-model' },
+	      { name: 'rigor', body: 'evaluate rigor' },
+	    ],
+	  },
+	],
+	x: {
+	  harness: { id: 'claude-code', tools: [], model: 'producer-bag-model' },
+	  vendor: { nested: { enabled: true }, labels: ['restricted'] },
+	},
+      },
+    ],
+  });
+}
+
 // ---- harness ----------------------------------------------------------------
 
 function makeEngine(defs: WorkflowDef[]): { engine: Engine; store: Store } {
@@ -96,9 +122,77 @@ test('judges: buildDef synthesizes one StepDef per judge, validateDef is clean',
     assert.equal(s.judges, 'report');
     assert.deepEqual(s.produces, []);
     assert.ok(s.consumes.some((c) => c.stem === 'report'), 'judge step must consume the judged stem');
+    assert.equal('x' in s, false, 'an absent producer x carrier must stay absent on synthesized judges');
   }
   const errors = validateDef(d);
   assert.deepEqual(errors, []);
+});
+
+test('judges: synthesized steps inherit independent deep clones of the complete producer x carrier', () => {
+  const d = researcherWithPolicyDef();
+  const producer = d.steps.find((s) => s.name === 'researcher')!;
+  const completeness = d.steps.find((s) => s.name.endsWith('.completeness'))!;
+  const rigor = d.steps.find((s) => s.name.endsWith('.rigor'))!;
+  const expected = {
+    harness: { id: 'claude-code', tools: [], model: 'producer-bag-model' },
+    vendor: { nested: { enabled: true }, labels: ['restricted'] },
+  };
+
+  assert.deepEqual(producer.x, expected);
+  assert.deepEqual(completeness.x, expected);
+  assert.deepEqual(rigor.x, expected);
+  assert.notStrictEqual(completeness.x, producer.x);
+  assert.notStrictEqual(rigor.x, producer.x);
+  assert.notStrictEqual(completeness.x, rigor.x);
+
+  const producerHarness = producer.x!['harness'] as { tools: string[] };
+  const completenessHarness = completeness.x!['harness'] as { tools: string[]; model: string };
+  const rigorHarness = rigor.x!['harness'] as { tools: string[] };
+  assert.notStrictEqual(completenessHarness, producerHarness);
+  assert.notStrictEqual(rigorHarness, producerHarness);
+  assert.notStrictEqual(completenessHarness, rigorHarness);
+
+  producerHarness.tools.push('Bash');
+  assert.deepEqual(completenessHarness.tools, []);
+  assert.deepEqual(rigorHarness.tools, []);
+
+  completenessHarness.model = 'mutated-completeness-model';
+  assert.equal((producer.x!['harness'] as { model: string }).model, 'producer-bag-model');
+  assert.equal((rigor.x!['harness'] as { model: string }).model, 'producer-bag-model');
+
+  ((rigor.x!['vendor'] as { nested: { enabled: boolean } }).nested).enabled = false;
+  assert.equal(((producer.x!['vendor'] as { nested: { enabled: boolean } }).nested).enabled, true);
+  assert.equal(((completeness.x!['vendor'] as { nested: { enabled: boolean } }).nested).enabled, true);
+});
+
+test('judges: input-aware synthesis keeps judged artifact first and producer inputs canonical', () => {
+  const d = researcherWithPolicyDef();
+  const completeness = d.steps.find((s) => s.name.endsWith('.completeness'))!;
+  assert.deepEqual(completeness.consumes.map((consume) => consume.stem), ['report', 'question']);
+  assert.equal(completeness.model, 'judge-model', 'the judge first-class model remains on the synthesized step');
+  assert.equal(
+    ((completeness.x!['harness'] as Record<string, unknown>)['model']),
+    'producer-bag-model',
+    'the inherited opaque bag remains complete for runtime precedence handling',
+  );
+});
+
+test('judges: generated and persisted judge orders carry the inherited x carrier', () => {
+  const d = researcherWithPolicyDef();
+  const { engine, store } = makeEngine([d]);
+  const wf = engine.createInstance('researcherPolicyDef', { provide: { question: { text: 'why' } } });
+
+  const producerOrder = engine.tick(wf).orders.find((order) => order.step === 'researcher')!;
+  engine.green(wf, producerOrder.run, 'report', { sections: ['a'] });
+  engine.close(wf, producerOrder.run);
+
+  const judgeOrder = engine.tick(wf).orders.find((order) => order.step.endsWith('.completeness'))!;
+  assert.deepEqual(judgeOrder.x, {
+    harness: { id: 'claude-code', tools: [], model: 'producer-bag-model' },
+    vendor: { nested: { enabled: true }, labels: ['restricted'] },
+  });
+  assert.equal(judgeOrder.model, 'judge-model');
+  assert.deepEqual(store.getRun(judgeOrder.run)?.order, judgeOrder);
 });
 
 // ---- (a) all-approve → green --------------------------------------------------
