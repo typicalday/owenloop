@@ -424,7 +424,6 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
           workflow: c.workflow,
           run: c.order.run,
           kind: 'agent-run',
-          ...(c.step?.harness !== undefined && c.step.harness !== '' ? { harness: c.step.harness } : {}),
         });
         const rec: ChildRecord = {
           workflow: c.workflow,

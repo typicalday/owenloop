@@ -426,24 +426,32 @@ test('a dispatched agent order spawns a detached agent-run child and records it'
   assert.equal(recs[0]!.hash, DEMO_HASH);
 });
 
-test('a step naming a harness passes that id to the agent-run child', async () => {
-  cacheBuilderWithHarness('some-harness');
+test('a prepared-cache harness never becomes agent-run spawn metadata', async () => {
+  cacheBuilderWithHarness('cached-harness');
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [wo('run_deadbeef', 'builder')] } } });
   const { spawner, spawns } = fakeSpawner();
   const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
   await loop.iterate();
-  assert.equal(spawns[0]!.harness, 'some-harness');
+
+  assert.deepEqual(spawns[0], {
+    workflow: 'wf1',
+    run: 'run_deadbeef',
+    kind: 'agent-run',
+  });
 });
 
-test('a step naming no harness passes no harness to the agent-run child', async () => {
+test('a step naming no harness also leaves agent-run resolution to the child', async () => {
   cacheBuilderWithHarness();
   const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { def: 'demo', orders: [wo('run_deadbeef', 'builder')] } } });
   const { spawner, spawns } = fakeSpawner();
   const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
   await loop.iterate();
-  // No `harness` on the step ⇒ no key at all, leaving the child's own precedence
-  // (--harness → OWENLOOP_HARNESS → step def → registry head) in charge.
-  assert.equal('harness' in spawns[0]!, false);
+
+  assert.deepEqual(spawns[0], {
+    workflow: 'wf1',
+    run: 'run_deadbeef',
+    kind: 'agent-run',
+  });
 });
 
 test('a missing bundle leaves an agent order for pickup with a warning — no spawn', async () => {
@@ -699,9 +707,9 @@ test('buildSpawnPlan: kind agent-run swaps the role positional and keeps every o
   assert.equal(plan.options.env['OWENLOOP_ACCOUNT'], 'ci');
 });
 
-test('buildSpawnPlan: kind agent-run appends --harness <id> when one is named, and --shift still rides', () => {
+test('buildSpawnPlan: agent-run carries --shift but never manufactures a --harness override', () => {
   const plan = buildSpawnPlan(
-    { workflow: 'wf1', run: 'run_zzzz', kind: 'agent-run', harness: 'h1' },
+    { workflow: 'wf1', run: 'run_zzzz', kind: 'agent-run' },
     'https://hub.example',
     'ci',
     '/pkg/bin/owenloop.mjs',
@@ -716,29 +724,8 @@ test('buildSpawnPlan: kind agent-run appends --harness <id> when one is named, a
     'https://hub.example',
     '--shift',
     'shf_abc123',
-    '--harness',
-    'h1',
   ]);
-});
-
-test('buildSpawnPlan: an empty or absent harness carries no --harness flag, and a harness on an exec spec is ignored', () => {
-  const noHarness = buildSpawnPlan(
-    { workflow: 'wf1', run: 'run_zzzz', kind: 'agent-run', harness: '' },
-    'https://hub.example',
-    'ci',
-    '/pkg/bin/owenloop.mjs',
-    '/usr/bin/node',
-  );
-  assert.equal(noHarness.args.includes('--harness'), false);
-  // A command order has no step agent; a stray harness on an exec spec is inert.
-  const execSpec = buildSpawnPlan(
-    { workflow: 'wf1', run: 'run_zzzz', harness: 'h1' },
-    'https://hub.example',
-    'ci',
-    '/pkg/bin/owenloop.mjs',
-    '/usr/bin/node',
-  );
-  assert.deepEqual(execSpec.args, ['/pkg/bin/owenloop.mjs', 'work', 'exec', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
+  assert.equal(plan.args.includes('--harness'), false);
 });
 
 // createDefaultSpawner is a thin wrapper: it captures shiftId at
