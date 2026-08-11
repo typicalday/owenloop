@@ -116,11 +116,27 @@ explicit output path must be outside the source directory. A regular file at
 the output path may be replaced; a directory or other non-regular path is
 rejected.
 
+A format-v2 source manifest may declare the optional closed `runtime` mapping
+documented in [`docs/bundles.md`](bundles.md#runtime-compatibility). `pack`
+validates the current Owenloop version and advertised features before loading
+usable workflows. When the declaration is present, successful pack JSON includes
+a `runtime` property with `minVersion` before canonically UTF-8-sorted
+`features`. When the declaration is absent, pack JSON does not gain a `runtime`
+property; existing output remains unchanged.
+
 `inspect` performs bounded gzip inflation, strict POSIX/PAX tar validation,
-manifest validation, workflow validation, lock coverage checks, and per-file
-integrity checks without extracting files. `digest` performs bounded inflation
-and returns the lowercase SHA-256 of the exact uncompressed canonical tar; the
-gzip wrapper bytes are not the identity.
+manifest and runtime-admission validation, workflow validation, lock coverage
+checks, and per-file integrity checks without extracting files. Inspect JSON's
+`manifest` includes `runtime` only when the archive declares it. A malformed
+runtime declaration fails with `MANIFEST_ERROR`; a valid declaration requiring
+a newer version or unsupported feature fails with `RUNTIME_INCOMPATIBLE` and
+install/upgrade guidance.
+
+`digest` performs bounded inflation and returns the lowercase SHA-256 of the
+exact uncompressed canonical tar; the gzip wrapper bytes are not the identity.
+`digest` is identity-only: it does not parse the manifest and may therefore
+succeed for a canonical bundle that this Owenloop process cannot inspect,
+unpack, install, load, or execute.
 
 `unpack` performs the complete `inspect` validation before creating anything.
 The destination must be absent. Files are written into a fresh sibling staging
@@ -953,27 +969,34 @@ Coordinates, source strings, and version text never join into a path.
 4. Reread and validate the index **inside** the lock (a corrupt index is a
    hard error, never a silent reset).
 5. Ingest via the bundle adapter: unpack into staging, check manifest
-   integrity, compute the canonical digest, extract the full coordinate. A
-   tampered or malformed bundle stops here — staging debris only, nothing
+   integrity and runtime compatibility, compute the canonical digest, and
+   extract the full coordinate. The runtime check uses Owenloop's production
+   package version and advertised feature set. A tampered, malformed, or
+   runtime-incompatible bundle stops here — staging debris only, nothing
    committed.
 6. Validate the staged tree with the engine's strict pass — the exact bytes
    that will be committed (parse/lint/validate/bounded `check` + the strict
    cross-def backstop). For a real `.wnlp`, validation parses `bundle.yaml`
-   and loads every workflow path listed in its `workflows` map; the package
-   manifest itself is not treated as a workflow definition. Any problem refuses the whole install
-   and prints every reason.
+   through the same runtime-admission boundary and loads every workflow path
+   listed in its `workflows` map; the package manifest itself is not treated as
+   a workflow definition. Any problem refuses the whole install and prints
+   every reason.
 7. Run the pre-commit verifier (after content validation, before any swap or
    index write). A rejection commits nothing.
 8. Write the `applying` crash journal (v2 — its commit-point evidence is the
    hash of the post-install index bytes).
 9. Atomically swap the staged object into `objects/sha256/<digest>`
    (retaining any displaced content on the commit handle), then harden it
-   in place: files read-only (`0o444`), directories non-writable (`0o555`).
-   Hardening is defense in depth, not the integrity proof — verification is.
-   A hardening failure rolls the swap back; a partially hardened object is
-   never committed. If the digest's object already exists, the install
-   verifies the existing object through the ingest adapter and commits an
-   index-only change instead (dedupe) — a corrupt existing object is a hard
+   in place: canonical `0644` files become read-only `0444`, canonical `0755`
+   files become read/execute-only `0555`, and directories become non-writable
+   `0555`. Hardening preserves the executable distinction needed for canonical
+   object reconstruction. Hardening is defense in depth, not the integrity proof
+   — verification reconstructs the complete canonical tar, including
+   `bundle.yaml`, and matches its SHA-256 digest to the object path. A hardening
+   failure rolls the swap back; a partially hardened object is never committed.
+   If the digest's object already exists, the install verifies the existing
+   object through the ingest adapter and commits an index-only change instead
+   (dedupe) — a corrupt or runtime-incompatible existing object is a hard
    integrity error, never replaced and never fallen through.
 10. Atomically write `index.json` — the **durable commit point**. Past here
     a crash rolls forward; before it, everything rolls back. An index-write
@@ -1079,12 +1102,18 @@ intended tree.
 `add <owner>/<repo>[@ref]`: the same inputs reach the same parser, the
 `<owner>-<repo>-<hash>` namespace is untouched, `.owenloop/installed.json`
 keeps its schema and validation, and an explicit `--defs`/`OWENLOOP_DEFS`
-still installs through a symlinked defs dir (operator intent). The routes
-share the canonical resolved-store lock, while the GitHub route retains its
-legacy cwd-derived lock and journal for compatibility. Recovery checks both
-journal locations and dispatches by journal version; a v2 store journal uses
-`index.json` metadata and a v1 GitHub journal uses `installed.json` ledger
-corroboration.
+still installs through a symlinked defs dir (operator intent). The legacy
+GitHub repository route installs workflow YAML rather than a format-v2
+`bundle.yaml`; therefore the GitHub route does not carry or enforce the `.wnlp`
+runtime compatibility declaration and does not provide the `.wnlp` runtime
+admission guarantee. Use a `.wnlp` bundle when the publisher must declare a
+minimum Owenloop version or required runtime features.
+
+The routes share the canonical resolved-store lock, while the GitHub route
+retains its legacy cwd-derived lock and journal for compatibility. Recovery
+checks both journal locations and dispatches by journal version; a v2 store
+journal uses `index.json` metadata and a v1 GitHub journal uses
+`installed.json` ledger corroboration.
 
 ## Hub (`login` / `connect` / `push` / `start` / `logout`)
 

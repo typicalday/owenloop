@@ -31,7 +31,7 @@ import {
 } from './types.ts';
 import type { DefDigest, ResolutionLevel, WorkflowCoordinate } from './types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
-import { probeDirectoryPath } from '../install.ts';
+import { probeDirectoryPath, readAddJournal } from '../install.ts';
 import type { BundleIngestor } from './install.ts';
 
 /**
@@ -74,6 +74,200 @@ export function workflowStoreStatePaths(root: string): WorkflowStoreStatePaths {
   };
 }
 
+export interface DigestRepairWaitOptions {
+  /** Total bounded wait. A stale/crashed transaction fails closed after this. */
+  timeoutMs?: number;
+  /** Poll interval while the journal is in a replacement phase. */
+  retryMs?: number;
+}
+
+const DEFAULT_REPAIR_WAIT_TIMEOUT_MS = 5_000;
+const DEFAULT_REPAIR_RETRY_MS = 10;
+const syncSleepWord = new Int32Array(new SharedArrayBuffer(4));
+
+function isMissingDuringJournalRead(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === 'ENOENT';
+}
+
+/**
+ * True only while the matching digest is inside the non-stable part of a v2
+ * same-digest replacement. `finalizing` is stable after replacement commit;
+ * `rollback-prior-restored` and `rollback-complete` are stable after the exact
+ * prior directory is back. Cleanup after any stable phase never renames the
+ * digest path again. An old v2 `applying` journal without
+ * `operation` waits conservatively whenever `hadDest` is true: before the first
+ * rename, a repair and a dedupe are indistinguishable, and probing for the backup
+ * would leave a race between that probe and destination → backup.
+ */
+function digestRepairNeedsWait(root: string, digest: DefDigest): boolean {
+  let journal: ReturnType<typeof readAddJournal>;
+  try {
+    journal = readAddJournal(workflowStoreStatePaths(root).journalPath);
+  } catch (error) {
+    // Atomic journal removal can race the lstat/read pair. Absence means the
+    // transaction reached a stable state; malformed or hostile journals remain
+    // fail-closed integrity errors.
+    if (isMissingDuringJournalRead(error)) return false;
+    throw new StoreIntegrityError(
+      'object-corrupt',
+      digest,
+      `could not inspect active replacement transaction: ${(error as Error).message}`,
+    );
+  }
+  if (journal === null || journal.version !== 2) return false;
+  if (
+    journal.destSegments.length !== 3 ||
+    journal.destSegments[0] !== 'objects' ||
+    journal.destSegments[1] !== 'sha256' ||
+    journal.destSegments[2] !== digest
+  ) {
+    return false;
+  }
+  if (journal.phase === 'finalizing') return false;
+  if (journal.phase === 'rollback-prior-restored' || journal.phase === 'rollback-complete') {
+    const stagingDir = join(root, '.owenloop-staging', journal.stagingId);
+    const destination = join(root, ...journal.destSegments);
+    try {
+      const destinationStable = probeDirectoryPath(destination, 'workflow object', root) === 'dir';
+      const stagingAbsent = probeDirectoryPath(stagingDir, 'repair staging directory', root) === 'absent';
+      const backupAbsent = probeDirectoryPath(`${stagingDir}-old`, 'repair backup directory', root) === 'absent';
+      const undoAbsent = probeDirectoryPath(`${stagingDir}-undo`, 'repair undo directory', root) === 'absent';
+      if (journal.phase === 'rollback-prior-restored') {
+	return !(destinationStable && stagingAbsent && backupAbsent);
+      }
+      return !(destinationStable && stagingAbsent && backupAbsent && undoAbsent);
+    } catch (error) {
+      throw new StoreIntegrityError(
+	'object-corrupt',
+	digest,
+	`could not validate stable repair rollback state: ${(error as Error).message}`,
+      );
+    }
+  }
+  if (journal.operation === 'repair') return true;
+  if (journal.operation === 'install' || journal.operation === 'dedupe') return false;
+  if (journal.phase !== 'applying') return true;
+
+  // Backward compatibility for journals written before `operation` existed.
+  // Waiting on every had-destination transaction is conservative for old dedupe
+  // journals, but it closes the destination-probe → backup-rename race for old
+  // repair journals. The timeout handles a stale journal fail-closed.
+  return journal.hadDest;
+}
+
+function repairWaitError(digest: DefDigest, timeoutMs: number): StoreIntegrityError {
+  return new StoreIntegrityError(
+    'object-corrupt',
+    digest,
+    `matching replacement transaction did not reach a stable state within ${timeoutMs}ms; ` +
+      `the transaction may have crashed and must be recovered before this object can be read`,
+  );
+}
+
+async function waitForDigestRepairUntil(
+  root: string,
+  digest: DefDigest,
+  deadline: number,
+  timeoutMs: number,
+  retryMs: number,
+): Promise<void> {
+  while (digestRepairNeedsWait(root, digest)) {
+    if (Date.now() >= deadline) throw repairWaitError(digest, timeoutMs);
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, retryMs));
+  }
+}
+
+function waitForDigestRepairUntilSync(
+  root: string,
+  digest: DefDigest,
+  deadline: number,
+  timeoutMs: number,
+  retryMs: number,
+): void {
+  while (digestRepairNeedsWait(root, digest)) {
+    if (Date.now() >= deadline) throw repairWaitError(digest, timeoutMs);
+    Atomics.wait(syncSleepWord, 0, 0, retryMs);
+  }
+}
+
+/** Bounded asynchronous coordination for digest-backed async readers. */
+export async function waitForDigestRepair(
+  root: string,
+  digest: DefDigest,
+  options: DigestRepairWaitOptions = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REPAIR_WAIT_TIMEOUT_MS;
+  const retryMs = options.retryMs ?? DEFAULT_REPAIR_RETRY_MS;
+  await waitForDigestRepairUntil(root, digest, Date.now() + timeoutMs, timeoutMs, retryMs);
+}
+
+/** Bounded synchronous coordination for `openCtx`/definition discovery readers. */
+export function waitForDigestRepairSync(
+  root: string,
+  digest: DefDigest,
+  options: DigestRepairWaitOptions = {},
+): void {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REPAIR_WAIT_TIMEOUT_MS;
+  const retryMs = options.retryMs ?? DEFAULT_REPAIR_RETRY_MS;
+  waitForDigestRepairUntilSync(root, digest, Date.now() + timeoutMs, timeoutMs, retryMs);
+}
+
+/**
+ * Run one asynchronous digest-backed read outside every active replacement
+ * phase. A replacement can start after the initial journal check, so a failed
+ * read checks the journal again and retries after the transaction stabilizes.
+ * One immediate retry is also allowed when the transaction completed quickly
+ * enough for both journal checks to observe absence; a genuinely missing or
+ * corrupt object therefore keeps its normal error after two immediate reads,
+ * rather than waiting for the full timeout.
+ */
+export async function coordinateDigestRead<T>(
+  root: string,
+  digest: DefDigest,
+  read: () => Promise<T> | T,
+  options: DigestRepairWaitOptions = {},
+): Promise<T> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REPAIR_WAIT_TIMEOUT_MS;
+  const retryMs = options.retryMs ?? DEFAULT_REPAIR_RETRY_MS;
+  const deadline = Date.now() + timeoutMs;
+  let retriedWithoutObservedJournal = false;
+
+  for (;;) {
+    await waitForDigestRepairUntil(root, digest, deadline, timeoutMs, retryMs);
+    try {
+      return await read();
+    } catch (error) {
+      if (digestRepairNeedsWait(root, digest)) continue;
+      if (retriedWithoutObservedJournal) throw error;
+      retriedWithoutObservedJournal = true;
+    }
+  }
+}
+
+/** Synchronous counterpart of {@link coordinateDigestRead}. */
+export function coordinateDigestReadSync<T>(
+  root: string,
+  digest: DefDigest,
+  read: () => T,
+  options: DigestRepairWaitOptions = {},
+): T {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REPAIR_WAIT_TIMEOUT_MS;
+  const retryMs = options.retryMs ?? DEFAULT_REPAIR_RETRY_MS;
+  const deadline = Date.now() + timeoutMs;
+  let retriedWithoutObservedJournal = false;
+
+  for (;;) {
+    waitForDigestRepairUntilSync(root, digest, deadline, timeoutMs, retryMs);
+    try {
+      return read();
+    } catch (error) {
+      if (digestRepairNeedsWait(root, digest)) continue;
+      if (retriedWithoutObservedJournal) throw error;
+      retriedWithoutObservedJournal = true;
+    }
+  }
+}
+
 /**
  * Probe a store root: `'absent'` (nothing installed here — NOT an error), or
  * a real directory. A symlink or non-directory squatting at the root is a
@@ -114,6 +308,27 @@ export function probeObjectDir(objectDir: string, digest: DefDigest, level: Reso
   }
 }
 
+class ObjectAbsentDuringCoordinatedRead extends Error {}
+
+async function probeObjectDirCoordinated(
+  root: string,
+  objectDir: string,
+  digest: DefDigest,
+  level: ResolutionLevel,
+): Promise<boolean> {
+  try {
+    return await coordinateDigestRead(root, digest, () => {
+      if (probeObjectDir(objectDir, digest, level) !== 'dir') {
+	throw new ObjectAbsentDuringCoordinatedRead();
+      }
+      return true;
+    });
+  } catch (error) {
+    if (error instanceof ObjectAbsentDuringCoordinatedRead) return false;
+    throw error;
+  }
+}
+
 /** One resolution result: where the object lives and which levels hold it. */
 export interface ResolvedWorkflowObject {
   digest: DefDigest;
@@ -128,12 +343,16 @@ export interface ResolvedWorkflowObject {
 /** Verify `objectDir` through the A1 adapter, wrapping failures as integrity errors. */
 async function verifyObjectAt(
   verifier: BundleIngestor,
+  root: string,
   objectDir: string,
   digest: DefDigest,
   level: ResolutionLevel,
 ): Promise<void> {
   try {
-    await verifier.verifyInstalledObject({ objectDir, digest });
+    await coordinateDigestRead(root, digest, async () => {
+      const verify = verifier.verifyInstalledObjectAfterCoordination ?? verifier.verifyInstalledObject;
+      await verify.call(verifier, { objectDir, digest });
+    });
   } catch (e) {
     throw new StoreIntegrityError(
       'object-corrupt',
@@ -172,7 +391,7 @@ export async function resolveWorkflowDigest(args: ResolveWorkflowDigestArgs): Pr
   if (projectRoot !== undefined) {
     if (probeStoreRoot(projectRoot) === 'dir') {
       const projectObjectDir = objectDirForDigest(projectRoot, digest);
-      projectPresent = probeObjectDir(projectObjectDir, digest, 'project') === 'dir';
+      projectPresent = await probeObjectDirCoordinated(projectRoot, projectObjectDir, digest, 'project');
     }
   }
   if (probeStoreRoot(globalRoot) !== 'dir') {
@@ -185,20 +404,22 @@ export async function resolveWorkflowDigest(args: ResolveWorkflowDigestArgs): Pr
       );
     }
     // Project present, global root absent: resolve from the project alone.
-    const objectPath = objectDirForDigest(projectRoot as string, digest);
-    await verifyObjectAt(verifier, objectPath, digest, 'project');
+    const root = projectRoot as string;
+    const objectPath = objectDirForDigest(root, digest);
+    await verifyObjectAt(verifier, root, objectPath, digest, 'project');
     return { digest, objectPath, level: 'project', presentAt: { project: true, global: false } };
   }
 
   const globalObjectDir = objectDirForDigest(globalRoot, digest);
-  const globalPresent = probeObjectDir(globalObjectDir, digest, 'global') === 'dir';
+  const globalPresent = await probeObjectDirCoordinated(globalRoot, globalObjectDir, digest, 'global');
 
   if (projectPresent) {
     // Project wins; verify the object actually returned. The global presence
     // bit is metadata only (same digest by construction — the digest IS the
     // identity), so its copy is not verified here.
-    const objectPath = objectDirForDigest(projectRoot as string, digest);
-    await verifyObjectAt(verifier, objectPath, digest, 'project');
+    const root = projectRoot as string;
+    const objectPath = objectDirForDigest(root, digest);
+    await verifyObjectAt(verifier, root, objectPath, digest, 'project');
     return { digest, objectPath, level: 'project', presentAt: { project: true, global: globalPresent } };
   }
   if (!globalPresent) {
@@ -208,7 +429,7 @@ export async function resolveWorkflowDigest(args: ResolveWorkflowDigestArgs): Pr
       'digest not present in the project or global workflow store',
     );
   }
-  await verifyObjectAt(verifier, globalObjectDir, digest, 'global');
+  await verifyObjectAt(verifier, globalRoot, globalObjectDir, digest, 'global');
   return { digest, objectPath: globalObjectDir, level: 'global', presentAt: { project: false, global: true } };
 }
 
@@ -256,14 +477,14 @@ export async function resolveWorkflowCoordinate(args: ResolveWorkflowCoordinateA
   const level: ResolutionLevel = projectDigest !== undefined ? 'project' : 'global';
   const root = level === 'project' ? (projectRoot as string) : globalRoot;
   const objectDir = objectDirForDigest(root, digest);
-  if (probeObjectDir(objectDir, digest, level) !== 'dir') {
+  if (!await probeObjectDirCoordinated(root, objectDir, digest, level)) {
     throw new StoreIntegrityError(
       'object-missing',
       digest,
       `${level} index references a missing object for '${coordinate}'`,
     );
   }
-  await verifyObjectAt(verifier, objectDir, digest, level);
+  await verifyObjectAt(verifier, root, objectDir, digest, level);
 
   return {
     digest,

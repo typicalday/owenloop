@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { accessSync, chmodSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
 
@@ -220,6 +220,34 @@ test('launch gate: altered definition bytes for a pinned digest refuse before sp
   assert.ok(servedOrder !== undefined);
   const servedPacket = servedOrder.order as unknown as Record<string, unknown>;
   assert.equal(servedPacket['defBytes'], altered, 'L2: altered definition bytes were actually delivered');
+  assert.equal(hostile.requests.filter((request) => request.path === 'submit').length, 0);
+});
+
+test('launch gate: runtime incompatibility refuses before a command process starts', async () => {
+  const { installed, localMarker } = await commandFixture();
+  const manifestPath = join(installed.objectPath, 'bundle.yaml');
+  chmodSync(installed.objectPath, 0o755);
+  chmodSync(manifestPath, 0o644);
+  const manifest = readFileSync(manifestPath, 'utf8');
+  writeFileSync(
+    manifestPath,
+    manifest.replace(
+      'version: "1.0.0"\nworkflows:',
+      'version: "1.0.0"\nruntime:\n  minVersion: "999.0.0"\nworkflows:',
+    ),
+  );
+
+  const hostile = await runCommand(
+    installed,
+    packet(installed.defDigest, 'ignored', 'run-command-runtime-incompatible'),
+    { definitionVerifier: verified },
+  );
+  assert.equal(hostile.outcome, 'unresolved-instructions');
+  assert.ok(
+    hostile.errors.some((line) => line.includes('instruction refusal (integrity)') && line.includes('requires Owenloop >= 999.0.0')),
+    `expected runtime integrity refusal, got ${hostile.errors.join('\n')}`,
+  );
+  assert.equal(pathExists(localMarker), false, 'the locally authored command process never started');
   assert.equal(hostile.requests.filter((request) => request.path === 'submit').length, 0);
 });
 

@@ -61,6 +61,8 @@ export {
   resolveWorkflowCoordinate,
   resolveWorkflowDigest,
   storeIndexPath,
+  waitForDigestRepair,
+  waitForDigestRepairSync,
   workflowStoreStatePaths,
 } from './resolve.ts';
 export type {
@@ -75,8 +77,13 @@ export {
   installWorkflowBundle,
   objectDestRelPath,
   recoverWorkflowStore,
+  workflowStoreReplacementRecovery,
 } from './install.ts';
-export { createBundleIngestor, verifyWorkflowObjectSync } from './ingestor.ts';
+export {
+  createBundleIngestor,
+  verifyHardenedWorkflowObjectModesSync,
+  verifyWorkflowObjectSync,
+} from './ingestor.ts';
 export type { BundleIngestorOptions } from './ingestor.ts';
 
 // ---- WS-6 CAS -> calls: def bridge ----

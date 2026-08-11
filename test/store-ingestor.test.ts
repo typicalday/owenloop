@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { createBundleIngestor } from '../src/store/index.ts';
+import { manifestToBytes, parseManifestBytes } from '../src/bundle/manifest.ts';
+import { SUPPORTED_RUNTIME_FEATURES } from '../src/bundle/runtime.ts';
+import { compareUtf8Paths } from '../src/bundle/tar.ts';
+import { createBundleIngestor, verifyWorkflowObjectSync } from '../src/store/index.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from './helpers/store-fixture.ts';
 
 const WORKFLOW = `name: ingestor-fixture
@@ -20,10 +23,11 @@ steps:
     body: ""
 `;
 
-function sourceDir(): string {
+function sourceDir(runtimeYaml?: string): string {
   return writeBundleSource({
     name: 'ingestor-fixture',
     workflow: WORKFLOW,
+    ...(runtimeYaml === undefined ? {} : { runtimeYaml }),
     files: { 'notes/readme.txt': 'fixture note\n' },
   });
 }
@@ -55,6 +59,137 @@ test('store ingestor: a real packBundle archive installs and verifies as an immu
   assert.deepEqual(installed.result.workflows, ['ingestor-fixture']);
   assert.equal(readFileSync(join(installed.result.objectPath, 'workflow.yaml'), 'utf8'), WORKFLOW);
   assert.equal(readFileSync(join(installed.result.objectPath, 'notes', 'readme.txt'), 'utf8'), 'fixture note\n');
+  assert.equal(statSync(installed.result.objectPath).mode & 0o777, 0o555, 'object root is exactly 0555');
+  assert.equal(statSync(join(installed.result.objectPath, 'notes')).mode & 0o777, 0o555, 'nested directory is exactly 0555');
+  assert.equal(statSync(join(installed.result.objectPath, 'workflow.yaml')).mode & 0o777, 0o444, 'non-executable file is exactly 0444');
+});
+
+test('store ingestor: a compatible runtime declaration installs and verifies', async () => {
+  const installed = await installBundleFixture({
+    sourceDir: sourceDir([
+      'minVersion: "0.5.0"',
+      'features:',
+      ...SUPPORTED_RUNTIME_FEATURES.map((feature) => `  - "${feature}"`),
+    ].join('\n')),
+  });
+
+  await createBundleIngestor().verifyInstalledObject({
+    objectDir: installed.result.objectPath,
+    digest: installed.result.digest,
+  });
+  assert.deepEqual(
+    parseManifestBytes(readFileSync(join(installed.result.objectPath, 'bundle.yaml'))).runtime,
+    { minVersion: '0.5.0', features: [...SUPPORTED_RUNTIME_FEATURES] },
+  );
+});
+
+test('store ingestor: runtime-only bundle.yaml mutation or removal fails canonical digest verification', async () => {
+  for (const mutation of ['change', 'remove'] as const) {
+    const installed = await installBundleFixture({
+      sourceDir: sourceDir(`features:\n  - "${SUPPORTED_RUNTIME_FEATURES[0]}"`),
+    });
+    const manifestPath = join(installed.result.objectPath, 'bundle.yaml');
+    makeWritable(installed.result.objectPath, manifestPath);
+    const manifest = parseManifestBytes(readFileSync(manifestPath));
+    const mutated = mutation === 'remove'
+      ? { ...manifest, runtime: undefined }
+      : { ...manifest, runtime: { features: [...SUPPORTED_RUNTIME_FEATURES] } };
+    writeFileSync(manifestPath, manifestToBytes(mutated));
+
+    await assert.rejects(
+      createBundleIngestor().verifyInstalledObject({
+	objectDir: installed.result.objectPath,
+	digest: installed.result.digest,
+      }),
+      /canonical bundle digest mismatch/,
+      mutation,
+    );
+  }
+});
+
+test('store ingestor: executable identity survives read-only hardening and canonical verification', async () => {
+  const source = sourceDir();
+  const executable = join(source, 'run.sh');
+  writeFileSync(executable, '#!/bin/sh\nexit 0\n');
+  chmodSync(executable, 0o755);
+  const installed = await installBundleFixture({ sourceDir: source });
+
+  assert.equal(statSync(join(installed.result.objectPath, 'run.sh')).mode & 0o777, 0o555);
+  await createBundleIngestor().verifyInstalledObject({
+    objectDir: installed.result.objectPath,
+    digest: installed.result.digest,
+  });
+});
+
+test('store ingestor: canonical identity can match while writable store modes are rejected', async () => {
+  const installed = await installBundleFixture({ sourceDir: sourceDir() });
+  const target = join(installed.result.objectPath, 'notes', 'readme.txt');
+  chmodSync(target, 0o644);
+
+  verifyWorkflowObjectSync(installed.result.objectPath, installed.result.digest, {
+    requireHardenedModes: false,
+  });
+  await assert.rejects(
+    createBundleIngestor().verifyInstalledObject({
+      objectDir: installed.result.objectPath,
+      digest: installed.result.digest,
+    }),
+    /regular file mode is 0644, expected hardened store mode 0444/,
+  );
+});
+
+test('store ingestor: canonical reconstruction sorts flattened prefix and Unicode paths independently of traversal order', async () => {
+	const source = sourceDir();
+	mkdirSync(join(source, 'a'));
+	writeFileSync(join(source, 'a-file'), 'plain root file\n');
+	writeFileSync(join(source, 'a', 'nested'), '#!/bin/sh\nexit 0\n');
+	writeFileSync(join(source, 'z-file'), 'ascii\n');
+	writeFileSync(join(source, 'λ-file'), 'lambda\n');
+	writeFileSync(join(source, '中-file'), '#!/bin/sh\nexit 0\n');
+	writeFileSync(join(source, '😀-file'), 'emoji\n');
+	chmodSync(join(source, 'a', 'nested'), 0o755);
+	chmodSync(join(source, '中-file'), 0o755);
+
+	const installed = await installBundleFixture({ sourceDir: source });
+	assert.equal(statSync(join(installed.result.objectPath, 'a-file')).mode & 0o777, 0o444);
+	assert.equal(statSync(join(installed.result.objectPath, 'a', 'nested')).mode & 0o777, 0o555);
+	assert.equal(statSync(join(installed.result.objectPath, 'λ-file')).mode & 0o777, 0o444);
+	assert.equal(statSync(join(installed.result.objectPath, '中-file')).mode & 0o777, 0o555);
+
+	const rootOrder = new Map([
+		'😀-file',
+		'中-file',
+		'λ-file',
+		'z-file',
+		'workflow.yaml',
+		'notes',
+		'bundle.yaml',
+		'a',
+		'a-file',
+	].map((name, index) => [name, index]));
+	const visits: string[] = [];
+	verifyWorkflowObjectSync(installed.result.objectPath, installed.result.digest, {
+		readDir: (directory) => [...readdirSync(directory)].sort((a, b) => {
+			if (directory === installed.result.objectPath) {
+				return (rootOrder.get(a) ?? Number.MAX_SAFE_INTEGER) - (rootOrder.get(b) ?? Number.MAX_SAFE_INTEGER);
+			}
+			return compareUtf8Paths(b, a);
+		}),
+		onVisit: (relativePath) => visits.push(relativePath),
+	});
+	assert.deepEqual(visits, [
+		'😀-file',
+		'中-file',
+		'λ-file',
+		'z-file',
+		'workflow.yaml',
+		'notes',
+		'notes/readme.txt',
+		'bundle.yaml',
+		'a',
+		'a/nested',
+		'a-file',
+	]);
 });
 
 test('store ingestor: modified installed bytes fail the manifest integrity check', async () => {

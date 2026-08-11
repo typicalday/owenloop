@@ -40,6 +40,7 @@ import {
   multiSegmentPathViolation,
   probeDirectoryPath,
   recoverInterruptedInstall,
+  recordRecoveryMarkerPriorIdentity,
   releaseInstallLock,
   removeAddJournal,
   removeRecoveryMarker,
@@ -64,6 +65,8 @@ import type {
   WorkflowStoreIndex,
 } from './types.ts';
 import { readWorkflowStoreIndex, writeWorkflowStoreIndex } from './index-file.ts';
+import { verifyWorkflowObjectSync } from './ingestor.ts';
+import { defDigest } from './types.ts';
 import { storeIndexPath } from './resolve.ts';
 
 // ---- A1/A2 ports ---------------------------------------------------------------
@@ -98,6 +101,10 @@ export interface BundleIngestor {
     stagingDir: string;
   }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest; workflows: string[] }>;
   verifyInstalledObject(input: { objectDir: string; digest: DefDigest }): Promise<void>;
+  /** Optional canonical-only check for a staged pre-swap reconstruction. */
+  verifyStagedObject?(input: { objectDir: string; digest: DefDigest }): Promise<void>;
+  /** Optional installed check used after the caller already coordinated the repair journal. */
+  verifyInstalledObjectAfterCoordination?(input: { objectDir: string; digest: DefDigest }): Promise<void>;
 }
 
 /**
@@ -128,7 +135,7 @@ export interface BundleInstallResult {
   /** Sorted workflow names carried by the installed bundle. */
   workflows: string[];
   objectPath: string;
-  /** True when the object was newly installed; false when deduplicated against an existing verified object. */
+  /** True when the digest object was newly installed; false when an existing same-digest object was deduplicated or repaired. */
   installed: boolean;
 }
 
@@ -145,7 +152,7 @@ export interface InstallWorkflowBundleArgs {
   lockPath: string;
   /** Path of the per-root crash-recovery journal. */
   journalPath: string;
-  /** External marker directory for corroborating a fresh swap with no backup. */
+  /** External marker directory for fresh-install corroboration and repair directory identities. */
   recoveryMarkerDir: string;
   /** Bundle-ingest adapter — REQUIRED (fail-closed without it). */
   ingestor: BundleIngestor;
@@ -183,8 +190,11 @@ export function objectDestRelPath(digest: DefDigest): string {
 // ---- permission hardening --------------------------------------------------------
 
 /**
- * Set regular files read-only (0o444) and directories non-writable (0o555)
- * under `dir`, recursively, INCLUDING `dir` itself. Defense in depth only —
+ * Set non-executable regular files read-only (0o444), executable regular
+ * files read/execute-only (0o555), and directories non-writable (0o555) under
+ * `dir`, recursively, INCLUDING `dir` itself. Preserving the executable bit is
+ * required to reconstruct the canonical 0644/0755 bundle identity. Defense in
+ * depth only —
  * permissions are NOT the integrity proof (verification is). Any chmod
  * failure propagates: an object that cannot be hardened is not committed
  * (the caller rolls staging back), so a partially-hardened object never
@@ -208,13 +218,24 @@ export function hardenObjectModes(dir: string): void {
     if (entrySt.isDirectory()) {
       hardenObjectModes(full);
     } else if (entrySt.isFile()) {
-      chmodSync(full, 0o444);
+      chmodSync(full, (entrySt.mode & 0o111) === 0 ? 0o444 : 0o555);
     } else {
       throw new StorePathError(`refusing to harden '${full}': unexpected file type`);
     }
   }
   chmodSync(dir, 0o555);
 }
+
+/** Concrete recovery actions for v2 content-addressed replacement journals. */
+export const workflowStoreReplacementRecovery = {
+  harden: hardenObjectModes,
+  verify(objectDir: string, rawDigest: string): void {
+    verifyWorkflowObjectSync(objectDir, defDigest(rawDigest), {
+      coordinateRepair: false,
+      requireHardenedModes: true,
+    });
+  },
+};
 
 // ---- the install transaction -----------------------------------------------------
 
@@ -233,16 +254,20 @@ export function hardenObjectModes(dir: string): void {
  *      lint + validate + bounded modelCheck(assumeProvided) + strict loadDefs);
  *   7. run the A2 pre-commit verifier (after content validation, before ANY
  *      destination swap or index write);
- *   8. write the `applying` journal (v2, with the post-install metadata hash);
- *   9. atomically install/deduplicate the object — a fresh install swaps the
- *      staging dir into place (retaining any displaced content on the handle),
- *      THEN hardens file/dir modes AT the committed location (hardening is
- *      defense in depth; verification is the integrity proof); a dedupe
- *      verifies the existing object and commits no rewrite;
- *  10. atomically write the index — the DURABLE COMMIT POINT;
- *  11. write the `finalizing` journal;
- *  12. discard the retained backup + staging;
- *  13. remove the journal; release the lock.
+ *   8. when the digest object exists, verify the installed object; if that
+ *      verification fails, completely verify the staged reconstruction and
+ *      mark the transaction as a repair; a verified object remains a dedupe;
+ *   9. compute the post-install index and write the `applying` journal (v2,
+ *      with the hash of that exact index state);
+ *  10. atomically install or repair the object — a fresh install or repair
+ *      swaps the staged directory into place (retaining displaced content on
+ *      the handle), THEN hardens file/directory modes at the destination; a
+ *      repair verifies that exact hardened destination before the commit point,
+ *      while a dedupe commits no object rewrite;
+ *  11. atomically write the index — the DURABLE COMMIT POINT;
+ *  12. write the `finalizing` journal;
+ *  13. discard the retained backup + staging;
+ *  14. remove the journal; release the lock.
  *
  * Fetching/reading the source bytes may happen before the lock (the caller's
  * job); index ownership/conflict decisions happen inside it.
@@ -250,15 +275,18 @@ export function hardenObjectModes(dir: string): void {
  * Failure semantics: any rejection before the swap (A1 tamper refusal, A2
  * refusal, engine validation, digest mismatch) leaves objects/index/journal
  * untouched and staging is cleared by the `finally`. A swap failure, a
- * post-swap hardening failure, or an index-write failure rolls the directory
- * state back in-process so the previous object + index are left exactly as
- * they were. A crash anywhere leaves the journal behind for the next recovery.
+ * post-swap hardening or repair-verification failure, or an index-write failure
+ * rolls the directory state back in-process so the previous object + index are
+ * left exactly as they were. A crash anywhere leaves the journal behind for the
+ * next recovery.
  *
  * Conflict semantics: an existing coordinate at a DIFFERENT digest is a
- * {@link StoreConflictError} (no implicit retarget); an existing coordinate
- * at the SAME digest deduplicates (verify the existing object, then commit an
- * index-only change — no object rewrite). A corrupt existing object is a hard
- * {@link StoreIntegrityError} — never replaced, never fallen through.
+ * {@link StoreConflictError} (no implicit retarget). An existing coordinate at
+ * the SAME digest deduplicates when the installed object verifies. When only
+ * installed-object verification fails, the already-admitted supplied archive
+ * is verified again from staging and atomically replaces the broken object;
+ * bytes from the broken object are never reused. The index keeps the same
+ * coordinate-to-digest meaning.
  */
 export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Promise<BundleInstallResult> {
   const { bytes, source, root, level, lockPath, journalPath, recoveryMarkerDir, ingestor, verifier, readLedger } = args;
@@ -294,6 +322,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 	lockfilePath: indexPath,
 	readLedger,
 	recoveryMarkerDir,
+	v2Replacement: workflowStoreReplacementRecovery,
       });
     } catch (e) {
       preserveStagingRoot = true;
@@ -407,8 +436,35 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // destination swap or index write. A rejection commits nothing.
     await verifier.verify({ source, coordinate, digest, objectDir: stagingDir });
 
+    // Existing same-digest objects have two paths. A verified object keeps the
+    // normal idempotent dedupe. A broken object is repaired only from the
+    // supplied archive that already passed strict ingest, engine validation,
+    // and A2 policy above. Verify the staged reconstruction through the same
+    // complete installed-object verifier before journaling or replacing
+    // anything; never copy or otherwise trust bytes from the broken object.
+    let repairRequired = false;
+    if (objectAlreadyPresent) {
+      try {
+	await ingestor.verifyInstalledObject({ objectDir, digest });
+      } catch (existingError) {
+	try {
+	  const verifyStaged = ingestor.verifyStagedObject ?? ingestor.verifyInstalledObject;
+	  await verifyStaged.call(ingestor, { objectDir: stagingDir, digest });
+	} catch (stagedError) {
+	  throw new StoreIntegrityError(
+	    'object-corrupt',
+	    digest,
+	    `existing object failed verification (${(existingError as Error).message}); ` +
+	      `the supplied archive could not produce a verified repair object (${(stagedError as Error).message})`,
+	  );
+	}
+	repairRequired = true;
+      }
+    }
+
     // The post-install index, computed BEFORE the commit point so its exact
-    // canonical bytes are what the journal's metadataHash commits to.
+    // canonical bytes are what the journal's metadataHash commits to. A
+    // same-digest repair intentionally preserves the existing index semantics.
     const nextIndex: WorkflowStoreIndex = {
       version: 1,
       entries: {
@@ -418,22 +474,35 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     };
     const metadataHash = sha256Hex(canonicalJsonBytes(nextIndex));
 
-    // A fresh swap needs an external corroboration marker because the staging
-    // and backup directories can both be absent after a crash. Dedupe has no
-    // destructive object swap and therefore needs no marker.
-    const recoveryMarker = objectAlreadyPresent
-      ? undefined
-      : createRecoveryMarker({
+    // Every swap gets an external transaction marker. Fresh installs need the
+    // marker to corroborate an otherwise ambiguous orphan destination. Repairs
+    // record both directory identities before the journal is written or any
+    // rename occurs. A crash in the destination → backup callback window then
+    // still leaves complete ownership evidence for fail-closed recovery.
+    const recoveryMarker = !objectAlreadyPresent || repairRequired
+      ? createRecoveryMarker({
 	  root,
 	  destSegments: ['objects', 'sha256', digest],
 	  stagingId,
 	  markerDir: recoveryMarkerDir,
-	});
+	  operation: repairRequired ? 'repair' : 'install',
+	  replacementDir: stagingDir,
+	})
+      : undefined;
+    if (repairRequired && recoveryMarker !== undefined) {
+      try {
+	recordRecoveryMarkerPriorIdentity(recoveryMarker, objectDir);
+      } catch (error) {
+	removeRecoveryMarker(recoveryMarker);
+	throw error;
+      }
+    }
 
     // Journal (v2, phase `applying`) BEFORE the first destructive step.
     const journalBase = {
       version: 2 as const,
       phase: 'applying' as const,
+      operation: repairRequired ? 'repair' as const : objectAlreadyPresent ? 'dedupe' as const : 'install' as const,
       destSegments: ['objects', 'sha256', digest],
       stagingId,
       hadDest: objectAlreadyPresent,
@@ -450,60 +519,117 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     }
 
     let handle: InstallCommitHandle | undefined;
-    if (objectAlreadyPresent) {
-      // Dedupe: the object exists — verify it through A1 BEFORE trusting it,
-      // then commit an index-only change (no object rewrite). A corrupt
-      // existing object is a hard refusal (never replaced, never fallen
-      // through). Nothing destructive has happened yet, so a refusal only
-      // drops the journal.
-      try {
-        await ingestor.verifyInstalledObject({ objectDir, digest });
-      } catch (e) {
-        removeAddJournal(journalPath);
-	if (recoveryMarker !== undefined) removeRecoveryMarker(recoveryMarker);
-        throw new StoreIntegrityError(
-          'object-corrupt',
-          digest,
-          `existing object failed verification before dedupe: ${(e as Error).message}`,
-        );
+    const rollbackCommittedSwap = (committedHandle: InstallCommitHandle): void => {
+      if (!repairRequired) {
+	rollbackInstallCommit(committedHandle);
+	return;
       }
-    } else {
-      // Fresh install: atomically swap the staged object into place FIRST and
-      // harden it AT its committed location. The order is forced by POSIX:
-      // rename(2) updates the renamed directory's `..` entry and therefore
-      // needs the directory's OWN write bit — a pre-hardened 0o555 staging
-      // dir can never be swapped. A hardening failure rolls the swap back
-      // in-process (the index commit has not happened), so a partially
-      // hardened object can never be committed either.
+      if (recoveryMarker === undefined) {
+	throw new Error('internal error: repair rollback is missing its recovery marker');
+      }
+      let rollbackReplacementMode: number | undefined;
+      rollbackInstallCommit(committedHandle, {
+	beforeRollback: () => {
+	  rollbackReplacementMode = lstatSync(committedHandle.dest).mode & 0o7777;
+	  writeAddJournal(journalPath, {
+	    ...journalBase,
+	    phase: 'rollback-started',
+	    operation: 'repair',
+	    rollbackReplacementMode,
+	  });
+	},
+	afterDestinationParked: () => {
+	  writeAddJournal(journalPath, {
+	    ...journalBase,
+	    phase: 'rollback-replacement-parked',
+	    operation: 'repair',
+	    rollbackReplacementMode,
+	  });
+	},
+	afterPriorRestored: () => {
+	  writeAddJournal(journalPath, {
+	    ...journalBase,
+	    phase: 'rollback-prior-restored',
+	    operation: 'repair',
+	    rollbackReplacementMode,
+	  });
+	},
+	cleanupUndo: true,
+	afterUndoCleanup: () => {
+	  writeAddJournal(journalPath, {
+	    ...journalBase,
+	    phase: 'rollback-complete',
+	    operation: 'repair',
+	    rollbackReplacementMode,
+	  });
+	},
+      });
+    };
+
+    if (!objectAlreadyPresent || repairRequired) {
+      // Fresh install and repair use the same atomic swap. For repair,
+      // commitInstall quarantines the broken object under the staging root as
+      // the retained backup until the unchanged index is durably committed.
       try {
-        handle = commitInstall(root, destRelPath, stagingDir);
+	handle = commitInstall(root, destRelPath, stagingDir);
       } catch (e) {
-        if (e instanceof RollbackFailedError) preserveStagingRoot = true;
+	if (e instanceof RollbackFailedError) {
+	  preserveStagingRoot = true;
+	} else {
+	  // commitInstall either made no change or restored the displaced object.
+	  // Remove the now-obsolete journal so a later run does not mistake the
+	  // already-restored state for an interrupted repair.
+	  removeAddJournal(journalPath);
+	  if (recoveryMarker !== undefined) removeRecoveryMarker(recoveryMarker);
+	}
         throw e;
       }
       try {
-        hardenObjectModes(handle.dest);
+	if (repairRequired) {
+	  writeAddJournal(journalPath, { ...journalBase, phase: 'replacement-swapped' });
+	}
+	hardenObjectModes(handle.dest);
+	if (repairRequired) {
+	  writeAddJournal(journalPath, { ...journalBase, phase: 'replacement-hardened' });
+	  // Re-check the exact hardened destination before the commit point.
+	  // Canonical 0755 files reconstruct from hardened 0555 execute bits;
+	  // exact 0444/0555 store modes are verified separately by the adapter.
+	  const verifyInstalled =
+	    ingestor.verifyInstalledObjectAfterCoordination ?? ingestor.verifyInstalledObject;
+	  await verifyInstalled.call(ingestor, { objectDir: handle.dest, digest });
+	  writeAddJournal(journalPath, { ...journalBase, phase: 'replacement-verified' });
+	}
       } catch (e) {
-        rollbackInstallCommit(handle);
-        removeAddJournal(journalPath);
+	try {
+	  rollbackCommittedSwap(handle);
+	} catch (rollbackError) {
+	  preserveStagingRoot = true;
+	  throw new StoreIntegrityError(
+	    'object-corrupt',
+	    digest,
+	    `replacement verification or hardening failed (${(e as Error).message}) and restoring the previous object failed too ` +
+	      `(${(rollbackError as Error).message}) — the journal remains for the next recovery`,
+	  );
+	}
+	removeAddJournal(journalPath);
 	if (recoveryMarker !== undefined) removeRecoveryMarker(recoveryMarker);
-        throw new Error(
-          `refusing to install bundle '${coordinate}': object hardening failed ` +
-            `(${(e as Error).message}) — install rolled back, previous state restored`,
-        );
+	throw new Error(
+	  `refusing to install bundle '${coordinate}': replacement verification or hardening failed ` +
+	    `(${(e as Error).message}) — install rolled back, previous state restored`,
+	);
       }
     }
 
     // Atomic index write — the DURABLE COMMIT POINT. Past here a crash rolls
-    // forward. On failure, roll the directory state back (a fresh install
-    // only — a dedupe has no swap to undo), drop the journal, and leave the
-    // previous object + index exactly as they were.
+    // forward. On failure, roll back a fresh-install or repair swap (dedupe has
+    // no swap), drop the journal, and leave the previous object + index exactly
+    // as they were.
     try {
       writeWorkflowStoreIndex(indexPath, nextIndex);
     } catch (e) {
       if (handle !== undefined) {
         try {
-          rollbackInstallCommit(handle);
+	  rollbackCommittedSwap(handle);
         } catch (rollbackErr) {
           // Double fault: preserve the parked content and LEAVE the journal
           // (phase `applying`, index not committed) so the next recovery
@@ -526,9 +652,11 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     }
 
     // The index write is the durable commit point: past here a crash rolls
-    // FORWARD. Record that in the journal, then finalize (discard any
-    // retained backup), clear staging, and drop the journal.
+    // FORWARD. Keep the retained backup if the finalizing phase cannot be written;
+    // a replacement-verified journal can then re-verify and finish recovery.
+    preserveStagingRoot = true;
     writeAddJournal(journalPath, { ...journalBase, phase: 'finalizing' });
+    preserveStagingRoot = false;
     if (handle !== undefined) finalizeInstallCommit(handle);
     rmRecursiveForce(stagingRoot);
     removeAddJournal(journalPath);
@@ -558,7 +686,7 @@ export interface RecoverWorkflowStoreArgs {
   lockPath: string;
   /** Path of the root's crash-recovery journal. */
   journalPath: string;
-  /** External marker directory for fresh-install recovery corroboration. */
+  /** External marker directory for install/repair transaction recovery. */
   recoveryMarkerDir?: string;
 }
 
@@ -583,6 +711,7 @@ export async function recoverWorkflowStore(args: RecoverWorkflowStoreArgs): Prom
       journalPath: args.journalPath,
       lockfilePath: storeIndexPath(args.root),
       recoveryMarkerDir: args.recoveryMarkerDir,
+      v2Replacement: workflowStoreReplacementRecovery,
     });
   } finally {
     releaseInstallLock(lock);

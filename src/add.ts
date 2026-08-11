@@ -29,7 +29,9 @@ import type {
   InstallCommitHandle as GenericInstallCommitHandle,
   InstallLockHandle,
   AcquireLockOpts,
+  CommitInstallOptions,
   RecoveryOutcome,
+  V2ReplacementRecoveryActions,
 } from './install.ts';
 
 // Re-export the shared transaction surface under the names callers/tests have
@@ -266,8 +268,13 @@ export interface InstallCommitHandle extends GenericInstallCommitHandle {
  * handle carries the GitHub-only `oldName` migration field once
  * `parkOldNameDir` runs.
  */
-export function commitInstall(defsDir: string, folder: string, stagingDir: string): InstallCommitHandle {
-  return commitInstallGeneric(defsDir, folder, stagingDir);
+export function commitInstall(
+  defsDir: string,
+  folder: string,
+  stagingDir: string,
+  options: CommitInstallOptions = {},
+): InstallCommitHandle {
+  return commitInstallGeneric(defsDir, folder, stagingDir, options);
 }
 
 /**
@@ -376,6 +383,8 @@ export interface RecoverInterruptedInstallArgs {
   lockfilePath: string;
   /** External marker directory for fresh v2 recovery corroboration. */
   recoveryMarkerDir?: string;
+  /** CAS-only hardening and verification actions when a shared v2 journal is found. */
+  v2Replacement?: V2ReplacementRecoveryActions;
 }
 
 /**
@@ -394,6 +403,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     journalPath: args.journalPath,
     lockfilePath: args.lockfilePath,
     recoveryMarkerDir: args.recoveryMarkerDir,
+    v2Replacement: args.v2Replacement,
     readLedger: () => {
       // readLockfile validates fail-closed; a corrupt lockfile aborts the add
       // exactly as it does on the normal path.

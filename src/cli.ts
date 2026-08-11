@@ -150,6 +150,7 @@ import {
   createPreCommitVerifier,
   recoverWorkflowStore,
   storeIndexPath,
+  workflowStoreReplacementRecovery,
   workflowStoreStatePaths,
 } from './store/index.ts';
 import type { BundleIngestor, BundleSource, PreCommitVerifier } from './store/index.ts';
@@ -234,7 +235,7 @@ export interface CliIO {
    * is no default accepting verifier. The GitHub repo route never uses it.
    */
   preCommitVerifier?: PreCommitVerifier;
-  /** Optional test/runtime override for the external fresh-install marker directory. */
+  /** Optional test/runtime override for the external install/repair transaction marker directory. */
   recoveryMarkerDir?: string;
   /** Open a URL in the user's browser (login). Default: fire-and-forget `open`/`xdg-open`/`start`. */
   openUrl?: (url: string) => void;
@@ -753,6 +754,7 @@ function printBundlePackResult(io: CliIO, outputAbs: string, packed: ReturnType<
     digest: packed.digest,
     name: packed.manifest.package.name,
     version: packed.manifest.package.version,
+    ...(packed.manifest.runtime === undefined ? {} : { runtime: packed.manifest.runtime }),
     files: packed.entries.length,
   });
 }
@@ -2434,7 +2436,7 @@ function workflowHome(io: CliIO): string {
 }
 
 /**
- * Resolve the external fresh-install marker directory from injected CLI state.
+ * Resolve the external install/repair marker directory from injected CLI state.
  * A bundle install always needs a concrete directory; no marker API may consult
  * the ambient process home.
  */
@@ -2789,8 +2791,15 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
 	journalPath: canonicalState.journalPath,
 	lockfilePath: storeIndexPath(defsDir),
 	recoveryMarkerDir,
+	v2Replacement: workflowStoreReplacementRecovery,
       });
-      recoverInterruptedInstall({ defsDir, journalPath, lockfilePath, recoveryMarkerDir });
+      recoverInterruptedInstall({
+	defsDir,
+	journalPath,
+	lockfilePath,
+	recoveryMarkerDir,
+	v2Replacement: workflowStoreReplacementRecovery,
+      });
     } catch (e) {
       preserveStagingRoot = true;
       throw e;
@@ -3119,8 +3128,15 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
       journalPath: canonicalState.journalPath,
       lockfilePath: storeIndexPath(defsDir),
       recoveryMarkerDir,
+      v2Replacement: workflowStoreReplacementRecovery,
     });
-    const legacyOutcome = recoverInterruptedInstall({ defsDir, journalPath, lockfilePath, recoveryMarkerDir });
+    const legacyOutcome = recoverInterruptedInstall({
+	defsDir,
+	journalPath,
+	lockfilePath,
+	recoveryMarkerDir,
+	v2Replacement: workflowStoreReplacementRecovery,
+      });
     outcome = legacyOutcome !== 'no-journal' ? legacyOutcome : canonicalOutcome;
   } finally {
     for (const handle of locks.reverse()) releaseInstallLock(handle);

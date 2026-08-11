@@ -131,11 +131,13 @@ async function installPair(args: {
   version: string;
   marker: string;
   root?: string;
+  runtimeYaml?: string;
 }): Promise<{ root: string; digest: string }> {
   const sourceDir = writeBundleSource({
     name: args.name,
     version: args.version,
     workflow: parentYaml(args.marker),
+    ...(args.runtimeYaml === undefined ? {} : { runtimeYaml: args.runtimeYaml }),
     workflows: { child: childYaml(args.marker) },
     defaultWorkflow: 'parent',
   });
@@ -409,6 +411,29 @@ test('WS-6 executable discovery fails closed when an indexed object is missing',
     () => load(root, emptyGlobalRoot()),
     /no verified object directory exists/u,
   );
+});
+
+test('WS-6 loader is fail-OPEN: an indexed runtime-incompatible object warns and contributes no definitions', async () => {
+  const { root, digest } = await installPair({
+    name: 'parent',
+    version: '1.0.0',
+    marker: 'v1',
+    runtimeYaml: 'minVersion: "0.5.0"',
+  });
+  const objectDir = join(root, 'objects', 'sha256', digest);
+  const manifestPath = join(objectDir, 'bundle.yaml');
+  chmodSync(objectDir, 0o755);
+  chmodSync(manifestPath, 0o644);
+  writeFileSync(
+    manifestPath,
+    readFileSync(manifestPath, 'utf8').replace('minVersion: "0.5.0"', 'minVersion: "999.0.0"'),
+  );
+
+  const { registrations, warnings } = load(root, emptyGlobalRoot());
+  assert.deepEqual(registrations, []);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /skipping project workflow object/);
+  assert.match(warnings[0]!, /requires Owenloop >= 999\.0\.0/);
 });
 
 test('WS-6 loader: no store at either root loads nothing and warns nothing (zero drift on the no-CAS path)', () => {

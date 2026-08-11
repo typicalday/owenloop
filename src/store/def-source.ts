@@ -18,7 +18,13 @@ import { digestScopedCallsTargetKey, loadDefFile } from '../defs.ts';
 import type { WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
-import { probeObjectDir, probeStoreRoot, projectStoreRoot, storeIndexPath } from './resolve.ts';
+import {
+	coordinateDigestReadSync,
+	probeObjectDir,
+	probeStoreRoot,
+	projectStoreRoot,
+	storeIndexPath,
+} from './resolve.ts';
 import {
 	defDigest,
 	objectDirForDigest,
@@ -68,6 +74,16 @@ export interface CasDefInspectionResult {
 	registrations: CasDefRegistration[];
 	/** False when any store root, index, object, or coordinate was skipped. */
 	complete: boolean;
+}
+
+class CasObjectAbsentDuringCoordinatedRead extends Error {}
+
+/** Runtime incompatibility is a listing warning, unlike store corruption. */
+class CasRuntimeIncompatibleError extends Error {}
+
+function isRuntimeIncompatible(error: unknown): boolean {
+	return error instanceof Error
+		&& error.message.includes('incompatible with this Owenloop runtime');
 }
 
 interface IndexedCoordinate {
@@ -126,7 +142,7 @@ function loadObjectDefs(
 	level: ResolutionLevel,
 ): LoadedObject {
 	try {
-		verifyWorkflowObjectSync(objectDir, bundleDigest);
+		verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false });
 		const manifest = parseManifestBytes(readFileSync(join(objectDir, 'bundle.yaml')));
 		const defs = new Map<string, WorkflowDef>();
 		for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
@@ -143,8 +159,31 @@ function loadObjectDefs(
 		}
 		return { bundleDigest, manifest, defs, level };
 	} catch (error) {
+		if (isRuntimeIncompatible(error)) {
+			throw new CasRuntimeIncompatibleError(failureMessage(error));
+		}
 		if (error instanceof StoreIntegrityError) throw error;
 		throw new StoreIntegrityError('object-corrupt', bundleDigest, failureMessage(error));
+	}
+}
+
+function loadObjectIfPresent(
+	root: string,
+	digest: DefDigest,
+	level: ResolutionLevel,
+): LoadedObject | undefined {
+	const objectDir = objectDirForDigest(root, digest);
+	try {
+		return coordinateDigestReadSync(root, digest, () => {
+			if (probeObjectDir(objectDir, digest, level) !== 'dir') {
+				throw new CasObjectAbsentDuringCoordinatedRead();
+			}
+			return loadObjectDefs(objectDir, digest, level);
+		});
+	} catch (error) {
+		if (error instanceof CasObjectAbsentDuringCoordinatedRead) return undefined;
+		if (error instanceof CasRuntimeIncompatibleError || error instanceof StoreIntegrityError) throw error;
+		throw new StoreIntegrityError('object-corrupt', digest, failureMessage(error));
 	}
 }
 
@@ -154,27 +193,15 @@ function resolveObject(
 	globalDigests: ReadonlySet<DefDigest>,
 ): LoadedObject {
 	const digest = defDigest(indexed.entry.digest);
-	const primaryDir = objectDirForDigest(indexed.root, digest);
-	let primaryProbe: 'dir' | 'absent';
-	try {
-		primaryProbe = probeObjectDir(primaryDir, digest, indexed.level);
-	} catch (error) {
-		throw new StoreIntegrityError('object-corrupt', digest, failureMessage(error));
-	}
-	if (primaryProbe === 'dir') return loadObjectDefs(primaryDir, digest, indexed.level);
+	const primary = loadObjectIfPresent(indexed.root, digest, indexed.level);
+	if (primary !== undefined) return primary;
 
 	// An indexed project object may fall through only to the exact same digest,
 	// and only when that digest is also indexed globally. A different global
 	// digest for the coordinate is never considered.
 	if (indexed.level === 'project' && globalDigests.has(digest)) {
-		const fallbackDir = objectDirForDigest(globalRoot, digest);
-		let fallbackProbe: 'dir' | 'absent';
-		try {
-			fallbackProbe = probeObjectDir(fallbackDir, digest, 'global');
-		} catch (error) {
-			throw new StoreIntegrityError('object-corrupt', digest, failureMessage(error));
-		}
-		if (fallbackProbe === 'dir') return loadObjectDefs(fallbackDir, digest, 'global');
+		const fallback = loadObjectIfPresent(globalRoot, digest, 'global');
+		if (fallback !== undefined) return fallback;
 	}
 
 	throw new StoreIntegrityError(
@@ -317,6 +344,11 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 				});
 			}
 		} catch (error) {
+			if (error instanceof CasRuntimeIncompatibleError) {
+				complete = false;
+				args.warn(`warning: skipping ${indexed.level} workflow object ${indexed.entry.digest}: ${error.message}`);
+				continue;
+			}
 			if (!tolerant) throw error;
 			complete = false;
 			args.warn(

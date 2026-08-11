@@ -366,6 +366,7 @@ export type {
   BundleErrorCode,
   BundleLimits,
   BundleManifest,
+  BundleRuntimeRequirements,
   InspectOptions,
   InspectResult,
   PackOptions,

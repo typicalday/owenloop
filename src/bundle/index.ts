@@ -12,7 +12,7 @@
 
 import { closeSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
-import { DEFAULT_TAR_LIMITS, archivePathViolation, inflateArchive, parseTar } from '../archive.ts';
+import { DEFAULT_TAR_LIMITS, canonicalBundlePathViolation, inflateArchive, parseTar } from '../archive.ts';
 import type { TarEntry, TarLimits } from '../archive.ts';
 import { parseDef } from '../defs.ts';
 import { loadDefFile } from '../defs.ts';
@@ -41,6 +41,7 @@ export type {
   BundleErrorCode,
   BundleLimits,
   BundleManifest,
+  BundleRuntimeRequirements,
   InspectOptions,
   InspectResult,
   PackOptions,
@@ -95,6 +96,7 @@ function limitOrArchiveError(e: unknown): BundleError {
     'ARCHIVE_PATH_TOO_LONG',
     'ARCHIVE_PATH_VIOLATION',
     'ARCHIVE_DUPLICATE_PATH',
+    'ARCHIVE_PATH_PREFIX_COLLISION',
     'ARCHIVE_TRUNCATED',
     'ARCHIVE_BAD_CHECKSUM',
     'ARCHIVE_BAD_OCTAL',
@@ -172,12 +174,12 @@ function inlineArchiveBodyFiles(
   const workflowDirectory = slash === -1 ? '' : workflowPath.slice(0, slash);
   for (const [key, item] of Object.entries(source)) {
     if (canResolveBodyFile && key === 'bodyFile' && typeof item === 'string' && !hasBody) {
-      const violation = archivePathViolation(item);
+      const violation = canonicalBundlePathViolation(item);
       if (violation) {
 	throw new Error(`${context}.bodyFile '${item}' is unsafe: ${violation}`);
       }
       const targetPath = workflowDirectory === '' ? item : `${workflowDirectory}/${item}`;
-      const targetViolation = archivePathViolation(targetPath);
+      const targetViolation = canonicalBundlePathViolation(targetPath);
       if (targetViolation) {
 	throw new Error(`${context}.bodyFile '${item}' is unsafe after resolving against '${workflowDirectory}': ${targetViolation}`);
       }
@@ -406,7 +408,7 @@ export function unpackBundle(bytes: Uint8Array, destination: string, opts: Inspe
     for (const e of entries) {
       // Paths are already strict-validated (no traversal/absolute/NUL);
       // re-check against the shared policy as defense-in-depth.
-      const violation = archivePathViolation(e.path);
+      const violation = canonicalBundlePathViolation(e.path);
       if (violation) {
 	throw new BundleError('ARCHIVE_PATH_VIOLATION', `unsafe archive path '${e.path}': ${violation}`, e.path);
       }
@@ -527,6 +529,22 @@ export function packBundle(sourceDir: string, opts: PackOptions = {}): PackResul
   }
   const canonicalManifest: BundleManifest = {
     ...sourceManifest,
+    ...(sourceManifest.runtime === undefined
+      ? {}
+      : {
+					runtime: {
+						...(sourceManifest.runtime.minVersion === undefined
+							? {}
+							: { minVersion: sourceManifest.runtime.minVersion }),
+						...(sourceManifest.runtime.features === undefined
+							? {}
+							: {
+									features: [...sourceManifest.runtime.features].sort((a, b) =>
+										Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')),
+									),
+								}),
+					},
+				}),
     integrity: { algorithm: 'sha256', files: integrityFiles },
   };
   const canonicalBytes = manifestToBytes(canonicalManifest);
