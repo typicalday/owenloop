@@ -2207,12 +2207,12 @@ test('bundle pack and inspect JSON expose a present normalized runtime declarati
     readFileSync(manifestPath, 'utf8').replace(
       'workflows:',
       [
-        'runtime:',
-        '  features:',
-        '    - native-judge-policy-inheritance.v1',
-        '    - harness-policy-enforcement.v1',
-        '  minVersion: 0.5.0',
-        'workflows:',
+				'runtime:',
+				'  features:',
+				'    - native-judge-policy-inheritance.v1',
+				'    - harness-policy-enforcement.v1',
+				'  minVersion: 0.5.0',
+				'workflows:',
       ].join('\n'),
     ),
   );

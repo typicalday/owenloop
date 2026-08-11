@@ -171,8 +171,13 @@ export interface SourceFile {
   executable: boolean;
 }
 
+/** Compare archive paths by ascending UTF-8 bytes, as required by canonical packing. */
+export function compareUtf8Paths(a: string, b: string): number {
+	return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
+}
+
 const byNameBytes = (a: { name: string }, b: { name: string }): number =>
-  Buffer.compare(Buffer.from(a.name, 'utf8'), Buffer.from(b.name, 'utf8'));
+	compareUtf8Paths(a.name, b.name);
 
 /**
  * Recursively walk `sourceRoot` WITHOUT following symlinks and collect every
@@ -251,6 +256,6 @@ export function collectSourceFiles(
     }
   };
   walk(root, '');
-  out.sort((a, b) => Buffer.compare(Buffer.from(a.rel, 'utf8'), Buffer.from(b.rel, 'utf8')));
+	out.sort((a, b) => compareUtf8Paths(a.rel, b.rel));
   return out;
 }

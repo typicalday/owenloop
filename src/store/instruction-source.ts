@@ -160,7 +160,7 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
   const evictObject = (bundleDigest: DefDigest, objectPath: string): void => {
     for (const [instructionDigest, cached] of cache) {
       if (cached.bundleDigest === bundleDigest && cached.objectPath === objectPath) {
-        cache.delete(instructionDigest);
+				cache.delete(instructionDigest);
       }
     }
   };
@@ -170,8 +170,8 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     if (cached === undefined) return false;
     try {
       await args.verifier.verifyInstalledObject({
-        objectDir: cached.objectPath,
-        digest: cached.bundleDigest,
+				objectDir: cached.objectPath,
+				digest: cached.bundleDigest,
       });
       return true;
     } catch (error) {

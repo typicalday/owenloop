@@ -213,7 +213,7 @@ documentation is the enforcement boundary for now.
 
 `inspectBundle(bytes)` returns the digest, runtime-admitted validated manifest, and entry metadata without writing files. `unpackBundle(bytes, destination)` returns the same inspection result plus the absolute materialized destination path.
 
-`digestBundle(bytes)` is the deliberate identity-only exception to runtime admission. The function performs bounded gzip inflation and canonical archive validation, then returns only the def digest without parsing `bundle.yaml`; therefore `digestBundle` can digest a well-formed archive whose runtime declaration the current Owenloop process cannot satisfy. A successful digest does not mean the bundle is admissible for packing, inspection, unpacking, installation, definition loading, instruction lookup, or execution.
+`digestBundle(bytes)` is the deliberate identity-only exception to runtime admission. The function enforces the compressed and expanded size limits, inflates the gzip payload, and hashes the exact decompressed bytes. The function does not parse or validate a canonical tar and does not parse `bundle.yaml`; therefore `digestBundle` can return a digest for bounded gzip content that is not an admissible bundle, including an archive whose runtime declaration the current Owenloop process cannot satisfy. A successful digest does not mean the content is a canonical tar or that the bundle is admissible for packing, inspection, unpacking, installation, definition loading, instruction lookup, or execution.
 
 `owenloop publish` signs exactly `packBundle(sourceDir).digest`: the lowercase 64-hex SHA-256 digest of the uncompressed canonical tar. It does not sign the gzip wrapper bytes or the separate compiled-definition hash used by `push`.
 

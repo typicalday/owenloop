@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { manifestToBytes, parseManifestBytes } from '../src/bundle/manifest.ts';
 import { SUPPORTED_RUNTIME_FEATURES } from '../src/bundle/runtime.ts';
-import { createBundleIngestor } from '../src/store/index.ts';
+import { compareUtf8Paths } from '../src/bundle/tar.ts';
+import { createBundleIngestor, verifyWorkflowObjectSync } from '../src/store/index.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from './helpers/store-fixture.ts';
 
 const WORKFLOW = `name: ingestor-fixture
@@ -94,8 +95,8 @@ test('store ingestor: runtime-only bundle.yaml mutation or removal fails canonic
 
     await assert.rejects(
       createBundleIngestor().verifyInstalledObject({
-        objectDir: installed.result.objectPath,
-        digest: installed.result.digest,
+				objectDir: installed.result.objectPath,
+				digest: installed.result.digest,
       }),
       /canonical bundle digest mismatch/,
       mutation,
@@ -115,6 +116,60 @@ test('store ingestor: executable identity survives read-only hardening and canon
     objectDir: installed.result.objectPath,
     digest: installed.result.digest,
   });
+});
+
+test('store ingestor: canonical reconstruction sorts flattened prefix and Unicode paths independently of traversal order', async () => {
+	const source = sourceDir();
+	mkdirSync(join(source, 'a'));
+	writeFileSync(join(source, 'a-file'), 'plain root file\n');
+	writeFileSync(join(source, 'a', 'nested'), '#!/bin/sh\nexit 0\n');
+	writeFileSync(join(source, 'z-file'), 'ascii\n');
+	writeFileSync(join(source, 'λ-file'), 'lambda\n');
+	writeFileSync(join(source, '中-file'), '#!/bin/sh\nexit 0\n');
+	writeFileSync(join(source, '😀-file'), 'emoji\n');
+	chmodSync(join(source, 'a', 'nested'), 0o755);
+	chmodSync(join(source, '中-file'), 0o755);
+
+	const installed = await installBundleFixture({ sourceDir: source });
+	assert.equal(statSync(join(installed.result.objectPath, 'a-file')).mode & 0o777, 0o444);
+	assert.equal(statSync(join(installed.result.objectPath, 'a', 'nested')).mode & 0o777, 0o555);
+	assert.equal(statSync(join(installed.result.objectPath, 'λ-file')).mode & 0o777, 0o444);
+	assert.equal(statSync(join(installed.result.objectPath, '中-file')).mode & 0o777, 0o555);
+
+	const rootOrder = new Map([
+		'😀-file',
+		'中-file',
+		'λ-file',
+		'z-file',
+		'workflow.yaml',
+		'notes',
+		'bundle.yaml',
+		'a',
+		'a-file',
+	].map((name, index) => [name, index]));
+	const visits: string[] = [];
+	verifyWorkflowObjectSync(installed.result.objectPath, installed.result.digest, {
+		readDir: (directory) => [...readdirSync(directory)].sort((a, b) => {
+			if (directory === installed.result.objectPath) {
+				return (rootOrder.get(a) ?? Number.MAX_SAFE_INTEGER) - (rootOrder.get(b) ?? Number.MAX_SAFE_INTEGER);
+			}
+			return compareUtf8Paths(b, a);
+		}),
+		onVisit: (relativePath) => visits.push(relativePath),
+	});
+	assert.deepEqual(visits, [
+		'😀-file',
+		'中-file',
+		'λ-file',
+		'z-file',
+		'workflow.yaml',
+		'notes',
+		'notes/readme.txt',
+		'bundle.yaml',
+		'a',
+		'a/nested',
+		'a-file',
+	]);
 });
 
 test('store ingestor: modified installed bytes fail the manifest integrity check', async () => {

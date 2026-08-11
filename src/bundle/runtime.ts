@@ -60,12 +60,12 @@ export function evaluateRuntimeCompatibility(
     if (environment.version === '0.0.0' || !isCanonicalSemver(environment.version)) {
       versionSatisfied = false;
       diagnostics.push(
-        `bundle requires Owenloop >= ${requirements.minVersion}, but the running package version is unavailable (${environment.version}); install or upgrade Owenloop and retry`,
+				`bundle requires Owenloop >= ${requirements.minVersion}, but the running package version is unavailable (${environment.version}); install or upgrade Owenloop and retry`,
       );
     } else if (!semver.gte(environment.version, requirements.minVersion)) {
       versionSatisfied = false;
       diagnostics.push(
-        `bundle requires Owenloop >= ${requirements.minVersion}, but the running version is ${environment.version}; install or upgrade Owenloop and retry`,
+				`bundle requires Owenloop >= ${requirements.minVersion}, but the running version is ${environment.version}; install or upgrade Owenloop and retry`,
       );
     }
   }

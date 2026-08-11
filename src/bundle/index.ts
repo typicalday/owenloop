@@ -531,19 +531,19 @@ export function packBundle(sourceDir: string, opts: PackOptions = {}): PackResul
     ...(sourceManifest.runtime === undefined
       ? {}
       : {
-          runtime: {
-            ...(sourceManifest.runtime.minVersion === undefined
-              ? {}
-              : { minVersion: sourceManifest.runtime.minVersion }),
-            ...(sourceManifest.runtime.features === undefined
-              ? {}
-              : {
-                  features: [...sourceManifest.runtime.features].sort((a, b) =>
-                    Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')),
-                  ),
-                }),
-          },
-        }),
+					runtime: {
+						...(sourceManifest.runtime.minVersion === undefined
+							? {}
+							: { minVersion: sourceManifest.runtime.minVersion }),
+						...(sourceManifest.runtime.features === undefined
+							? {}
+							: {
+									features: [...sourceManifest.runtime.features].sort((a, b) =>
+										Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')),
+									),
+								}),
+					},
+				}),
     integrity: { algorithm: 'sha256', files: integrityFiles },
   };
   const canonicalBytes = manifestToBytes(canonicalManifest);

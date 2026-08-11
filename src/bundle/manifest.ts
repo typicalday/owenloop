@@ -225,7 +225,7 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
     const runtimeRaw = asMap(root['runtime'], 'bundle.yaml.runtime');
     assertExactKeys(runtimeRaw, [], 'bundle.yaml.runtime', ['minVersion', 'features']);
     if (!Object.prototype.hasOwnProperty.call(runtimeRaw, 'minVersion') &&
-        !Object.prototype.hasOwnProperty.call(runtimeRaw, 'features')) {
+				!Object.prototype.hasOwnProperty.call(runtimeRaw, 'features')) {
       throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.runtime: must declare minVersion, features, or both');
     }
 
@@ -233,10 +233,10 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
     if (Object.prototype.hasOwnProperty.call(runtimeRaw, 'minVersion')) {
       minVersion = asString(runtimeRaw['minVersion'], 'bundle.yaml.runtime.minVersion');
       if (!isCanonicalSemver(minVersion)) {
-        throw new BundleError(
-          'MANIFEST_ERROR',
-          `bundle.yaml.runtime.minVersion: '${minVersion}' must be one canonical strict SemVer value with no range, prefix, or whitespace`,
-        );
+				throw new BundleError(
+					'MANIFEST_ERROR',
+					`bundle.yaml.runtime.minVersion: '${minVersion}' must be one canonical strict SemVer value with no range, prefix, or whitespace`,
+				);
       }
     }
 
@@ -244,22 +244,22 @@ export function parseManifestBytes(bytes: Uint8Array): BundleManifest {
     if (Object.prototype.hasOwnProperty.call(runtimeRaw, 'features')) {
       const featuresRaw = runtimeRaw['features'];
       if (!Array.isArray(featuresRaw)) {
-        throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.runtime.features: must be a list');
+				throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.runtime.features: must be a list');
       }
       if (featuresRaw.length === 0) {
-        throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.runtime.features: must contain at least one feature');
+				throw new BundleError('MANIFEST_ERROR', 'bundle.yaml.runtime.features: must contain at least one feature');
       }
       features = assertDuplicateFree(
-        featuresRaw.map((feature, i) => asString(feature, `bundle.yaml.runtime.features[${i}]`)),
-        'bundle.yaml.runtime.features',
+				featuresRaw.map((feature, i) => asString(feature, `bundle.yaml.runtime.features[${i}]`)),
+				'bundle.yaml.runtime.features',
       );
       for (const feature of features) {
-        if (!RUNTIME_FEATURE_RE.test(feature) || Buffer.byteLength(feature, 'utf8') > 128) {
-          throw new BundleError(
-            'MANIFEST_ERROR',
-            `bundle.yaml.runtime.features: feature '${feature}' must be a lowercase versioned identifier ending in '.vN' (maximum 128 UTF-8 bytes)`,
-          );
-        }
+				if (!RUNTIME_FEATURE_RE.test(feature) || Buffer.byteLength(feature, 'utf8') > 128) {
+					throw new BundleError(
+						'MANIFEST_ERROR',
+						`bundle.yaml.runtime.features: feature '${feature}' must be a lowercase versioned identifier ending in '.vN' (maximum 128 UTF-8 bytes)`,
+					);
+				}
       }
     }
 
@@ -428,7 +428,7 @@ export function manifestToBytes(manifest: BundleManifest): Uint8Array {
     if (manifest.runtime.features !== undefined) {
       lines.push('  features:');
       for (const feature of sortedByUtf8(manifest.runtime.features)) {
-        lines.push(`    - ${q(feature)}`);
+				lines.push(`    - ${q(feature)}`);
       }
     }
   }
