@@ -861,12 +861,17 @@ test('C10fb restricted config refuses equivalent model endpoint fields', () => {
   }
 });
 
-test('C10fc restricted config refuses unknown top-level and workspace-write keys', () => {
+test('C10fc restricted config refuses every workflow-authored Codex key', () => {
   for (const codexConfig of [
     { future_restricted_key: true },
+    { sandbox_workspace_write: {} },
     { sandbox_workspace_write: { future_restricted_key: true } },
     { sandbox_workspace_write: { writable_roots: ['/tmp/escape'] } },
     { sandbox_workspace_write: { network_access: true } },
+    { sandbox_workspace_write: { exclude_slash_tmp: true } },
+    { sandbox_workspace_write: { exclude_slash_tmp: false } },
+    { sandbox_workspace_write: { exclude_tmpdir_env_var: true } },
+    { sandbox_workspace_write: { exclude_tmpdir_env_var: false } },
   ]) {
     const permissions = normalizeStepPermissions({ filesystem: 'workspace-write', codexConfig });
     assert.ok(
@@ -877,7 +882,14 @@ test('C10fc restricted config refuses unknown top-level and workspace-write keys
       () => buildThreadStartParams({ ...deliverArgs(), permissions }),
       /codexConfig\..*refused/,
     );
+    assert.throws(
+      () => buildThreadResumeParams('th-authored-config', { ...deliverArgs(), permissions }),
+      /codexConfig\..*refused/,
+    );
   }
+
+  const empty = normalizeStepPermissions({ filesystem: 'workspace-write', codexConfig: {} });
+  assert.deepEqual(codexAdapter.preflight(empty), []);
 });
 
 test('C10g every neutral filesystem/network combination matches Codex enforcement', () => {
@@ -909,10 +921,11 @@ test('C10g every neutral filesystem/network combination matches Codex enforcemen
     assert.equal(params['sandbox'], c.sandbox);
     const config = params['config'] as Record<string, unknown>;
     if (c.sandbox === 'workspace-write') {
-      assert.deepEqual(
-	config['sandbox_workspace_write'],
-	c.workspaceNetwork === true ? { network_access: true } : {},
-      );
+      assert.deepEqual(config['sandbox_workspace_write'], {
+	exclude_slash_tmp: true,
+	exclude_tmpdir_env_var: true,
+	...(c.workspaceNetwork === true ? { network_access: true } : {}),
+      });
     } else {
       assert.equal('sandbox_workspace_write' in config, false);
     }
@@ -939,33 +952,43 @@ test('C10g every neutral filesystem/network combination matches Codex enforcemen
   }
 });
 
-test('C10h restricted start and resume preserve the exact workspace-write allowlist', () => {
-  const args = deliverArgs({
-    filesystem: 'workspace-write',
-    network: 'unrestricted',
-    codexConfig: {
-      sandbox_workspace_write: {
-	exclude_slash_tmp: true,
-	exclude_tmpdir_env_var: false,
-      },
+test('C10h restricted workspace-write start and resume serialize both temporary-root exclusions', () => {
+  for (const c of [
+    { name: 'default sandbox', args: deliverArgs(), networkAccess: false },
+    {
+      name: 'explicit workspace-write',
+      args: deliverArgs({ filesystem: 'workspace-write' }),
+      networkAccess: false,
     },
-  });
-  for (const params of [
-    buildThreadStartParams(args),
-    buildThreadResumeParams('th-network', args),
+    {
+      name: 'workspace-write with unrestricted network',
+      args: deliverArgs({ filesystem: 'workspace-write', network: 'unrestricted' }),
+      networkAccess: true,
+    },
   ]) {
-    const config = params['config'] as Record<string, unknown>;
-    assert.deepEqual(config['project_root_markers'], ['.git']);
-    assert.deepEqual(config['sandbox_workspace_write'], {
-      exclude_slash_tmp: true,
-      exclude_tmpdir_env_var: false,
-      network_access: true,
-    });
-    assert.deepEqual(Object.keys(config).sort(), [
-      'mcp_servers',
-      'project_root_markers',
-      'sandbox_workspace_write',
-    ]);
+    for (const [operation, rawParams] of [
+      ['start', buildThreadStartParams(c.args)],
+      ['resume', buildThreadResumeParams(`th-${c.name}`, c.args)],
+    ] as const) {
+      const params = JSON.parse(JSON.stringify(rawParams)) as Record<string, unknown>;
+      const config = params['config'] as Record<string, unknown>;
+      assert.equal(params['sandbox'], 'workspace-write', `${c.name} ${operation}`);
+      assert.deepEqual(config['project_root_markers'], ['.git'], `${c.name} ${operation}`);
+      assert.deepEqual(
+	config['sandbox_workspace_write'],
+	{
+	  exclude_slash_tmp: true,
+	  exclude_tmpdir_env_var: true,
+	  ...(c.networkAccess ? { network_access: true } : {}),
+	},
+	`${c.name} ${operation}`,
+      );
+      assert.deepEqual(
+	Object.keys(config).sort(),
+	['mcp_servers', 'project_root_markers', 'sandbox_workspace_write'],
+	`${c.name} ${operation}`,
+      );
+    }
   }
 });
 
@@ -992,7 +1015,8 @@ test('C10i restricted resume sanitizes all inherited config and retains Owenloop
 	sandbox_workspace_write: {
 	  network_access: true,
 	  writable_roots: ['/tmp/inherited-extra'],
-	  exclude_slash_tmp: true,
+	  exclude_slash_tmp: false,
+	  exclude_tmpdir_env_var: false,
 	},
 	future_inherited_key: 'drop-me',
       },
@@ -1017,7 +1041,10 @@ test('C10i restricted resume sanitizes all inherited config and retains Owenloop
     assert.equal(key in config, false, `${key} must not survive restricted resume`);
   }
   assert.deepEqual(config['project_root_markers'], ['.git']);
-  assert.deepEqual(config['sandbox_workspace_write'], {});
+  assert.deepEqual(config['sandbox_workspace_write'], {
+    exclude_slash_tmp: true,
+    exclude_tmpdir_env_var: true,
+  });
   const servers = config['mcp_servers'] as Record<string, unknown>;
   assert.deepEqual(Object.keys(servers), ['owenloop']);
   assertMount(servers['owenloop']);

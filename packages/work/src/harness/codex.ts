@@ -170,10 +170,6 @@ const RESTRICTED_SANDBOXES = new Set(['read-only', 'workspace-write']);
 const PROJECT_ROOT_MARKER = '.git';
 /** Thread config that can replace `.git` and extend project-config discovery. */
 const PROJECT_ROOT_MARKERS_CONFIG_KEY = 'project_root_markers';
-/** The only workflow-authored Codex config map allowed under a restricted sandbox. */
-const RESTRICTED_CODEX_CONFIG_KEYS = new Set(['sandbox_workspace_write']);
-/** Workspace-write fields locally proven to only narrow Codex's writable surface. */
-const APPROVED_WORKSPACE_WRITE_KEYS = ['exclude_slash_tmp', 'exclude_tmpdir_env_var'] as const;
 
 /** Resolve the effective sandbox only when the authored policy is internally valid. */
 function effectiveSandbox(permissions: StepPermissions): string | undefined {
@@ -192,11 +188,12 @@ interface RestrictedCodexConfigResult {
 /**
  * Positive allowlist for workflow or inherited config under a restricted sandbox.
  *
- * Only the two boolean workspace-write exclusions are locally proven to narrow
- * authority. Every other current or future key is reported and removed. Callers
- * refuse reported workflow issues; resume ignores inherited issues and keeps the
- * sanitized map. Adapter-owned MCP, project-root, and network values are applied
- * after this function returns.
+ * The allowlist is intentionally empty. Codex 0.146.0 treats absent or false
+ * temporary-root exclusions as writable host roots, so even those narrowing-looking
+ * fields must be adapter-owned. Every current or future key is reported and removed.
+ * Callers refuse reported workflow issues; resume ignores inherited issues and keeps
+ * the empty sanitized map. Adapter-owned MCP, project-root, temporary-root, and
+ * network values are applied after this function returns.
  */
 function sanitizeRestrictedCodexConfig(
   extraConfig: Record<string, unknown>,
@@ -205,53 +202,16 @@ function sanitizeRestrictedCodexConfig(
   const config: Record<string, unknown> = {};
   const issues: PermissionIssue[] = [];
 
-  for (const [key, value] of Object.entries(extraConfig)) {
-    if (!RESTRICTED_CODEX_CONFIG_KEYS.has(key)) {
-      issues.push({
-	field: 'codexConfig',
-	message:
-	  key === 'mcp_servers'
-	    ? `codexConfig.mcp_servers cannot declare external servers with sandbox '${sandbox}'; ` +
-	      `only the worker-created '${OWENLOOP_MCP_NAME}' server is allowed`
-	    : `codexConfig.${key} is refused with sandbox '${sandbox}'; ` +
-	      'the restricted codexConfig allowlist contains only sandbox_workspace_write',
-      });
-      continue;
-    }
-
-    if (sandbox !== 'workspace-write') {
-      issues.push({
-	field: 'codexConfig',
-	message: `codexConfig.${key} is allowed only with sandbox 'workspace-write'`,
-      });
-      continue;
-    }
-    if (!isPlainMap(value)) {
-      issues.push({ field: 'codexConfig', message: `codexConfig.${key} must be a map` });
-      continue;
-    }
-
-    const workspace: Record<string, unknown> = {};
-    for (const [workspaceKey, workspaceValue] of Object.entries(value)) {
-      if (!(APPROVED_WORKSPACE_WRITE_KEYS as readonly string[]).includes(workspaceKey)) {
-	issues.push({
-	  field: 'codexConfig',
-	  message:
-	    `codexConfig.${key}.${workspaceKey} is refused; allowed fields are ` +
-	    APPROVED_WORKSPACE_WRITE_KEYS.join('|'),
-	});
-	continue;
-      }
-      if (typeof workspaceValue !== 'boolean') {
-	issues.push({
-	  field: 'codexConfig',
-	  message: `codexConfig.${key}.${workspaceKey} must be a boolean`,
-	});
-	continue;
-      }
-      workspace[workspaceKey] = workspaceValue;
-    }
-    config[key] = workspace;
+  for (const key of Object.keys(extraConfig)) {
+    issues.push({
+      field: 'codexConfig',
+      message:
+	key === 'mcp_servers'
+	  ? `codexConfig.mcp_servers cannot declare external servers with sandbox '${sandbox}'; ` +
+	    `only the worker-created '${OWENLOOP_MCP_NAME}' server is allowed`
+	  : `codexConfig.${key} is refused with sandbox '${sandbox}'; ` +
+	    'restricted workflows cannot author codexConfig',
+    });
   }
 
   return { config, issues };
@@ -422,21 +382,19 @@ function owenloopMount(mcp: { command: string; args: string[] }): McpServerSpec 
 }
 
 /**
- * Rebuild restricted workspace-write config from the adapter's whitelist.
- * Authored network_access cannot override the neutral network policy, and
- * writable_roots is never copied because every extra root widens the sandbox.
+ * Rebuild restricted workspace-write config entirely from adapter-owned values.
+ *
+ * Measured against Codex 0.146.0: absent or false `exclude_slash_tmp` leaves `/tmp`
+ * writable, and absent or false `exclude_tmpdir_env_var` leaves `$TMPDIR` writable.
+ * Both exclusions must therefore be literal true after every workflow and inherited
+ * config merge. `writable_roots` is never copied because every extra root widens the
+ * sandbox; `network_access` follows only the neutral network policy.
  */
-function restrictedWorkspaceWriteConfig(
-  extraConfig: Record<string, unknown>,
-  permissions: StepPermissions,
-): Record<string, unknown> {
-  const authored = isPlainMap(extraConfig['sandbox_workspace_write'])
-    ? extraConfig['sandbox_workspace_write']
-    : {};
-  const out: Record<string, unknown> = {};
-  for (const key of APPROVED_WORKSPACE_WRITE_KEYS) {
-    if (typeof authored[key] === 'boolean') out[key] = authored[key];
-  }
+function restrictedWorkspaceWriteConfig(permissions: StepPermissions): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    exclude_slash_tmp: true,
+    exclude_tmpdir_env_var: true,
+  };
   if (permissions.network === 'unrestricted') out['network_access'] = true;
   return out;
 }
@@ -505,11 +463,11 @@ export function buildThreadStartParams(
     // inherited marker setting reopen the boundary.
     config[PROJECT_ROOT_MARKERS_CONFIG_KEY] = [PROJECT_ROOT_MARKER];
     // Never carry an authored workspace config through a restricted boundary.
-    // In workspace-write, reconstruct the map from the adapter-approved fields;
-    // in read-only, remove the irrelevant map entirely.
+    // In workspace-write, reconstruct the map from adapter-owned values after all
+    // workflow config; in read-only, remove the irrelevant map entirely.
     delete config['sandbox_workspace_write'];
     if (sandbox === 'workspace-write') {
-      config['sandbox_workspace_write'] = restrictedWorkspaceWriteConfig(extraConfig, args.permissions);
+      config['sandbox_workspace_write'] = restrictedWorkspaceWriteConfig(args.permissions);
     }
   }
 
