@@ -241,12 +241,15 @@ order-independent — re-running `settle()` on a healthy graph yields no ops.
   landing a green that already rests on stale inputs. This makes concurrent
   advancement safe without locking the graph: two workers can race, and at most
   one lands green; the loser is re-armed with an honest reason. The same
-  claim-time map is exported as the order's optional `consumedFingerprint` and
-  is covered by the producer's submit-time `submission.v1` signature, so the
-  signed statement binds both the produced value and the exact input versions
-  the producer claimed. Across steps, those bindings provide the edges a later
-  verifier needs to reconstruct a verifiable submission DAG; the hub stores and
-  relays the statements but is not the verifier.
+  target reference-order contract exports the same claim-time map as optional
+  `consumedFingerprint`. When a version-aware submit protocol lets a producer
+  sign `submission.v1`, the signed statement binds both the produced value and
+  the exact input versions the producer claimed. Across steps, those bindings
+  can provide the edges a later verifier needs to reconstruct a verifiable
+  submission DAG. The deployed hub does not yet preserve the complete proof and
+  version protocol, so current producer submits remain unsigned rather than
+  inferring version authority; a future compatible hub stores and relays the
+  statements but is not the verifier.
 - **§12.3 Daily-budget windows are host-local** — `maxRunsPerDay` gates
   against a window starting at host-local midnight (`localMidnightMs` in
   util.ts), not UTC midnight. Two consequences worth knowing: (1) the day
@@ -1703,12 +1706,14 @@ shape and no verify-mode branch anywhere in the path.
 
 ### §29.5 Consume-side dynamic evidence
 
-The wire shape carries two signed-evidence channels for dynamic data:
+The target wire shape defines two signed-evidence channels for dynamic data:
 `consumesProof` is a JSON-serialized map from consumed artifact path to a
 serialized DSSE `submission.v1` envelope, and `owes[].proof` is a serialized
-DSSE envelope for the complete rejection-reason thread on one owed artifact.
-The hub stores and relays these strings; the hub does not verify, repair, or
-authorize them.
+DSSE envelope for the complete rejection-reason thread on one owed artifact. A
+compatible hub stores and relays these strings but does not verify, repair, or
+authorize them. The production hub deployed as of 2026-08-10 omits these fields
+and drops submit proofs, so these channels are not yet end-to-end production
+capabilities.
 
 A consuming driver gates the complete order before the order reaches a prompt,
 MCP model context, or command. For each consumed value, the gate verifies the

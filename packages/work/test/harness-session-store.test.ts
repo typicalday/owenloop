@@ -1,6 +1,19 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import {
+  appendFileSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
+import { Worker } from 'node:worker_threads';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
@@ -11,9 +24,14 @@ import {
   markRunSessionsDead,
   orderId,
   readSessions,
+  reconcileActiveSessions,
   sessionsPath,
   type SessionRecord,
 } from '../src/harness/session-store.ts';
+import {
+  acquireFileLockSync,
+  FileLockTimeoutError,
+} from '../../../src/lock.ts';
 
 let dir: string;
 let file: string;
@@ -46,6 +64,54 @@ const rec = (over: Partial<SessionRecord> = {}): SessionRecord => {
 
 const lines = (f: string): string[] => readFileSync(f, 'utf8').split('\n').filter((l) => l !== '');
 
+function runAppendWorker(target: string, workerId: number, count: number): Promise<void> {
+  const script = fileURLToPath(new URL('./fixtures/session-append-worker.ts', import.meta.url));
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ['--experimental-strip-types', script, target, String(workerId), String(count)],
+      { stdio: ['ignore', 'ignore', 'pipe'] },
+    );
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once('error', reject);
+    child.once('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`session append worker ${workerId} exited ${code}: ${stderr}`));
+    });
+  });
+}
+
+function startBarrierAppendWorker(target: string, record: SessionRecord): {
+  waitUntilAppendAttempted: () => void;
+  done: Promise<void>;
+} {
+  const barrier = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2);
+  const state = new Int32Array(barrier);
+  const worker = new Worker(new URL('./fixtures/session-barrier-worker.ts', import.meta.url), {
+    workerData: { target, record, barrier },
+  });
+  const done = new Promise<void>((resolve, reject) => {
+    worker.once('error', reject);
+    worker.once('exit', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`session barrier worker exited ${code}`));
+    });
+  });
+  return {
+    waitUntilAppendAttempted: () => {
+      Atomics.store(state, 0, 1);
+      Atomics.notify(state, 0);
+      const result = Atomics.wait(state, 1, 0, 5_000);
+      assert.notEqual(result, 'timed-out', 'append worker reached the held writer lock');
+    },
+    done,
+  };
+}
+
 test('sessionsPath and orderId build the two derived strings', () => {
   assert.equal(sessionsPath('/c'), join('/c', 'sessions.jsonl'));
   assert.equal(orderId('wf_1', 'run_2'), 'wf_1/run_2');
@@ -55,6 +121,77 @@ test('append then latestFor round-trips a record', () => {
   const r = rec({ token: 'tok-abc' });
   appendSession(file, r);
   assert.deepEqual(latestFor(file, 'wf_1', 'run_1', 'builder'), r);
+});
+
+test('active rows fsync the log and a newly created log directory entry before returning', () => {
+  const synced: Array<'file' | 'directory'> = [];
+  appendSession(file, rec(), {
+    sync: (fd) => {
+      synced.push(fstatSync(fd).isDirectory() ? 'directory' : 'file');
+    },
+  });
+
+  assert.deepEqual(
+    synced,
+    process.platform === 'win32' ? ['file'] : ['file', 'directory'],
+  );
+  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.status, 'active');
+});
+
+test('later lifecycle rows retain ordinary append durability without fsync', () => {
+  let syncCalls = 0;
+  appendSession(file, rec({ status: 'turn-ended' }), {
+    sync: () => {
+      syncCalls += 1;
+    },
+  });
+
+  assert.equal(syncCalls, 0);
+  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.status, 'turn-ended');
+});
+
+test('an active-row fsync failure propagates to the provider-work gate', () => {
+  assert.throws(
+    () => appendSession(file, rec(), {
+      sync: () => {
+	throw new Error('injected active fsync failure');
+      },
+    }),
+    /injected active fsync failure/u,
+  );
+});
+
+test('a restart appends a new durable active row after an unterminated active tail', () => {
+  const abandoned = rec({ token: 'abandoned-active', updatedAt: 900 });
+  const next = rec({ attempt: 2, token: 'next-active', updatedAt: 1_100 });
+  writeFileSync(file, JSON.stringify(abandoned));
+  let syncCalls = 0;
+
+  appendSession(file, next, {
+    sync: () => {
+      syncCalls += 1;
+    },
+  });
+
+  assert.ok(syncCalls >= 1);
+  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.token, 'next-active');
+  assert.ok(readFileSync(file, 'utf8').endsWith('\n'));
+});
+
+test('compaction fsyncs its replacement and preserves the latest durable active row', () => {
+  const synced: Array<'file' | 'directory'> = [];
+  appendSession(file, rec({ token: 'active-through-compaction' }), {
+    maxBytes: 1,
+    sync: (fd) => {
+      synced.push(fstatSync(fd).isDirectory() ? 'directory' : 'file');
+    },
+  });
+
+  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.token, 'active-through-compaction');
+  assert.ok(synced.filter((kind) => kind === 'file').length >= 2, 'the append and compacted replacement are fsynced');
+  if (process.platform !== 'win32') {
+    assert.ok(synced.filter((kind) => kind === 'directory').length >= 2, 'creation and replacement directory entries are fsynced');
+  }
 });
 
 test('latestFor is last-wins per (workflow, run, step), and a different step does not interfere', () => {
@@ -101,6 +238,90 @@ test('appendSession compacts past maxBytes: one line per key, first-seen key ord
   assert.equal(latestFor(file, 'wf_1', 'run_1', 'reviewer')?.token, 'r1');
 });
 
+test('concurrent append and compaction preserve every successful multiprocess append', async () => {
+  const workerCount = 6;
+  const recordsPerWorker = 30;
+  await Promise.all(
+    Array.from({ length: workerCount }, (_, workerId) =>
+      runAppendWorker(file, workerId, recordsPerWorker)),
+  );
+
+  const records = readSessions(file, { warn: () => {} });
+  const expected = workerCount * recordsPerWorker;
+  assert.equal(records.length, expected);
+  assert.equal(new Set(records.map((record) => record.token)).size, expected);
+  assert.equal(existsSync(`${file}.lock`), true, 'the permanent old-client compatibility guard remains after release');
+  assert.equal(existsSync(`${file}.lock.sqlite-v2`), true, 'the SQLite lock database remains after release');
+});
+
+test('the synchronous lock conservatively refuses a dead-owner pre-boundary pathname', () => {
+  const lockPath = `${file}.lock`;
+  const original = JSON.stringify({ pid: 2_147_483_647, startedAt: 1, token: 'dead' });
+  writeFileSync(lockPath, original);
+
+  assert.throws(
+    () => acquireFileLockSync(lockPath, { waitMs: 5, pollMs: 1, label: 'test session-store writer' }),
+    (error: unknown) =>
+      error instanceof FileLockTimeoutError &&
+      error.legacy &&
+      error.holderPid === 2_147_483_647 &&
+      /will not delete automatically/u.test(error.message) &&
+      /remove it manually/u.test(error.message),
+  );
+  assert.equal(readFileSync(lockPath, 'utf8'), original);
+});
+
+test('the synchronous lock never reclaims a live owner because of age', () => {
+  const lockPath = `${file}.lock`;
+  const original = JSON.stringify({
+    pid: process.pid,
+    startedAt: 1,
+    token: 'live-owner',
+  });
+  writeFileSync(lockPath, original);
+  const old = new Date(Date.now() - 60_000);
+  utimesSync(lockPath, old, old);
+
+  assert.throws(
+    () => acquireFileLockSync(lockPath, {
+      waitMs: 5,
+      pollMs: 1,
+      staleMs: 0,
+      isPidAlive: (pid) => pid === process.pid,
+      label: 'test session-store writer',
+    }),
+    (error: unknown) =>
+      error instanceof FileLockTimeoutError &&
+      error.holderPid === process.pid,
+  );
+  assert.equal(readFileSync(lockPath, 'utf8'), original);
+});
+
+test('a post-append compaction failure keeps the appended record and releases the lock', () => {
+  writeFileSync(file, 'corrupt complete line\n');
+
+  appendSession(file, rec({ token: 'durable-after-compaction-failure' }), {
+    maxBytes: 1,
+    warn: () => {
+      throw new Error('force compact read failure');
+    },
+  });
+
+  assert.equal(
+    readSessions(file, { warn: () => {} }).at(-1)?.token,
+    'durable-after-compaction-failure',
+  );
+  assert.equal(existsSync(`${file}.lock`), true, 'the released compatibility guard persists');
+});
+
+test('a propagating write failure still releases the session writer lock', () => {
+  const directoryTarget = join(dir, 'directory-target');
+  mkdirSync(directoryTarget);
+
+  assert.throws(() => appendSession(directoryTarget, rec()));
+  assert.equal(existsSync(`${directoryTarget}.lock`), true, 'the released compatibility guard persists');
+});
+
 test('compact on a file that has never been written is a no-op, not a throw', () => {
   compact(join(dir, 'nope.jsonl'));
   assert.deepEqual(readSessions(join(dir, 'nope.jsonl')), []);
@@ -132,6 +353,119 @@ test('corrupt lines are skipped and warned about, never thrown', () => {
     `a warning names the offending line number: ${JSON.stringify(warnings)}`,
   );
   assert.ok(warnings.some((w) => w.includes(`${file}:5`)));
+});
+
+test('a concurrent partial final append is ignored until its newline commits it', () => {
+  const first = rec({ step: 'builder', token: 'ok-1' });
+  const second = rec({ step: 'reviewer', token: 'ok-2' });
+  const encoded = JSON.stringify(second);
+  const cut = Math.floor(encoded.length / 2);
+  writeFileSync(file, `${JSON.stringify(first)}\n${encoded.slice(0, cut)}`);
+
+  const warnings: string[] = [];
+  assert.deepEqual(
+    readSessions(file, { warn: (line) => warnings.push(line) }).map((record) => record.token),
+    ['ok-1'],
+  );
+  assert.equal(warnings.length, 0, 'an unterminated final tail is not committed corruption');
+
+  appendFileSync(file, `${encoded.slice(cut)}\n`);
+  assert.deepEqual(
+    readSessions(file, { warn: (line) => warnings.push(line) }).map((record) => record.token),
+    ['ok-1', 'ok-2'],
+  );
+  assert.equal(warnings.length, 0);
+});
+
+test('appendSession quarantines an abandoned unterminated tail before the new record', () => {
+  const first = rec({ step: 'builder', token: 'ok-1' });
+  const next = rec({ step: 'reviewer', token: 'ok-2' });
+  writeFileSync(file, `${JSON.stringify(first)}\n{"workflow":"abandoned"`);
+  const old = new Date(Date.now() - 10_000);
+  utimesSync(file, old, old);
+
+  appendSession(file, next);
+
+  const warnings: string[] = [];
+  assert.deepEqual(
+    readSessions(file, { warn: (line) => warnings.push(line) }).map((record) => record.token),
+    ['ok-1', 'ok-2'],
+  );
+  assert.equal(warnings.length, 1, 'only the abandoned fragment is corrupt');
+  assert.match(warnings[0]!, /skipping corrupt record/);
+});
+
+test('an unchanged unterminated tail warns once after grace and a changed tail starts a new grace', () => {
+  const first = rec({ step: 'builder', token: 'ok-1' });
+  writeFileSync(file, `${JSON.stringify(first)}\nnot json`);
+  let now = 0;
+  const warnings: string[] = [];
+  const opts = {
+    warn: (line: string) => warnings.push(line),
+    now: () => now,
+    unterminatedTailGraceMs: 100,
+  };
+
+  assert.deepEqual(readSessions(file, opts).map((record) => record.token), ['ok-1']);
+  assert.deepEqual(warnings, [], 'the first observation remains silent for a concurrent writer');
+
+  now = 100;
+  readSessions(file, opts);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, new RegExp(`persistent unterminated record at ${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:2`));
+
+  now = 200;
+  readSessions(file, opts);
+  assert.equal(warnings.length, 1, 'repeated reads do not spam the same abandoned tail');
+
+  writeFileSync(file, `${JSON.stringify(first)}\nstill partial`);
+  readSessions(file, opts);
+  assert.equal(warnings.length, 1, 'changing the tail restarts the grace period');
+
+  now = 300;
+  readSessions(file, opts);
+  assert.equal(warnings.length, 2);
+
+  writeFileSync(file, `${JSON.stringify(first)}\n`);
+  readSessions(file, opts);
+  assert.equal(warnings.length, 2, 'committing or removing the tail clears the observation');
+});
+
+test('an already-old unterminated tail warns on its first read in a fresh observation', () => {
+  const oldFile = join(dir, 'old-tail.jsonl');
+  const first = rec({ step: 'builder', token: 'ok-1' });
+  const now = Date.now();
+  writeFileSync(oldFile, `${JSON.stringify(first)}\nnot json`);
+  const old = new Date(now - 10_000);
+  utimesSync(oldFile, old, old);
+  const warnings: string[] = [];
+
+  assert.deepEqual(
+    readSessions(oldFile, {
+      warn: (line) => warnings.push(line),
+      now: () => now,
+      unterminatedTailGraceMs: 5_000,
+    }).map((record) => record.token),
+    ['ok-1'],
+  );
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /persistent unterminated record/);
+});
+
+test('a freshly modified unterminated tail remains silent on its first read', () => {
+  const freshFile = join(dir, 'fresh-tail.jsonl');
+  const now = Date.now();
+  writeFileSync(freshFile, 'partial append');
+  const fresh = new Date(now);
+  utimesSync(freshFile, fresh, fresh);
+  const warnings: string[] = [];
+
+  assert.deepEqual(readSessions(freshFile, {
+    warn: (line) => warnings.push(line),
+    now: () => now + 100,
+    unterminatedTailGraceMs: 5_000,
+  }), []);
+  assert.deepEqual(warnings, []);
 });
 
 test('latestFor over a corrupt file still answers, warning through the default stderr sink', () => {
@@ -240,4 +574,45 @@ test('markRunSessionsDead is idempotent — a second sweep over the same run app
 
 test('markRunSessionsDead on a store that does not exist is [] — a run that never had a session', () => {
   assert.deepEqual(markRunSessionsDead(join(dir, 'nope.jsonl'), 'wf_1', 'run_1', 5000), []);
+});
+
+test('markRunSessionsDead cannot shadow a completed append that reaches the held writer lock', async () => {
+  appendSession(file, rec({ status: 'active', token: 'active-before-reap' }));
+  const completed = rec({ status: 'submitted', token: 'submitted-during-reap', updatedAt: 6000 });
+  const worker = startBarrierAppendWorker(file, completed);
+
+  const marked = markRunSessionsDead(file, 'wf_1', 'run_1', 5000, {
+    afterWriterSnapshot: worker.waitUntilAppendAttempted,
+  });
+  await worker.done;
+
+  assert.deepEqual(marked, ['builder']);
+  assert.deepEqual(latestFor(file, 'wf_1', 'run_1', 'builder'), completed);
+});
+
+test('reconcileActiveSessions retires only newest orphaned active rows', () => {
+  appendSession(file, rec({ run: 'orphan', order: orderId('wf_1', 'orphan'), status: 'active' }));
+  appendSession(file, rec({ run: 'complete', order: orderId('wf_1', 'complete'), status: 'submitted' }));
+  appendSession(file, rec({ run: 'live', order: orderId('wf_1', 'live'), status: 'active' }));
+
+  const retired = reconcileActiveSessions(file, new Set(['live']), 5000);
+
+  assert.deepEqual(retired.map((record) => record.run), ['orphan']);
+  assert.equal(latestFor(file, 'wf_1', 'orphan', 'builder')?.status, 'dead');
+  assert.equal(latestFor(file, 'wf_1', 'complete', 'builder')?.status, 'submitted');
+  assert.equal(latestFor(file, 'wf_1', 'live', 'builder')?.status, 'active');
+});
+
+test('reconcileActiveSessions cannot shadow a submitted append from its retirement snapshot', async () => {
+  appendSession(file, rec({ status: 'active', token: 'active-before-reconcile' }));
+  const completed = rec({ status: 'turn-ended', token: 'completed-during-reconcile', updatedAt: 6000 });
+  const worker = startBarrierAppendWorker(file, completed);
+
+  const retired = reconcileActiveSessions(file, new Set(), 5000, {
+    afterWriterSnapshot: worker.waitUntilAppendAttempted,
+  });
+  await worker.done;
+
+  assert.deepEqual(retired.map((record) => record.token), ['active-before-reconcile']);
+  assert.deepEqual(latestFor(file, 'wf_1', 'run_1', 'builder'), completed);
 });

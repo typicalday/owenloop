@@ -65,11 +65,12 @@ export interface ResolvedInstructionRecord extends ResolvedInstructions {
   maxAttempts: number;
 }
 
-/** The typed result of a source lookup. Missing digest and missing step are distinct. */
+/** The typed result of a source lookup. Missing and ambiguous references are distinct. */
 export type OrderInstructionLookup =
   | { status: 'resolved'; instructions: ResolvedInstructionRecord }
   | { status: 'unknown-digest' }
-  | { status: 'unknown-step' };
+  | { status: 'unknown-step' }
+  | { status: 'ambiguous-step' };
 
 /**
  * The narrow digest/instruction source seam. WP-B1 ships the loaded-definition
@@ -126,6 +127,21 @@ export class UnknownInstructionError extends Error {
 
   constructor(ref: OrderInstructionRef) {
     super(`unknown instruction step '${ref.step}' for defDigest '${ref.defDigest}' and key '${ref.key}'`);
+    this.defDigest = ref.defDigest;
+    this.step = ref.step;
+    this.key = ref.key;
+  }
+}
+
+/** A bundle digest contains the referenced step name in more than one workflow. */
+export class AmbiguousInstructionError extends Error {
+  override readonly name = 'AmbiguousInstructionError';
+  readonly defDigest: string;
+  readonly step: string;
+  readonly key: string;
+
+  constructor(ref: OrderInstructionRef) {
+    super(`ambiguous instruction step '${ref.step}' for defDigest '${ref.defDigest}' and key '${ref.key}' — multiple workflows in the verified bundle define that step`);
     this.defDigest = ref.defDigest;
     this.step = ref.step;
     this.key = ref.key;
@@ -298,6 +314,7 @@ export class OrderResolver {
     const result = this.source.lookup(ref);
     if (result.status === 'unknown-digest') throw new UnknownDefDigestError(ref.defDigest);
     if (result.status === 'unknown-step') throw new UnknownInstructionError(ref);
+    if (result.status === 'ambiguous-step') throw new AmbiguousInstructionError(ref);
     return result.instructions;
   }
 

@@ -9,6 +9,7 @@
  *
  *   owenloop defs                       list available workflow definitions
  *   owenloop add <owner>/<repo>[@ref]   fetch, validate, and install a repo's workflow defs (public repos)
+ *   owenloop start <def> [--provide n=json] [--crew name]   start a published hub workflow
  *   owenloop create <def> [--provide n=json] [--title t]   start an instance
  *   owenloop provide <wf> <name> [--value json]   supply an owed input
  *   owenloop tick <wf> [--now ms]       pull eligible orders
@@ -37,7 +38,7 @@ import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'no
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { createInterface } from 'node:readline/promises';
-import { hostname } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
@@ -50,6 +51,7 @@ import {
   DefError,
   finalizeDefs,
   lintDef,
+  loadDefFile,
   loadDefs,
   loadDefsRaw,
   loadDefsUnfinalized,
@@ -84,6 +86,8 @@ import {
   dsseSignOrigin,
   dsseSignPublication,
   dsseSignRevocation,
+  PAYLOAD_TYPE_ORIGIN,
+  PAYLOAD_TYPE_PUBLICATION,
 } from './crypto/dsse.ts';
 import { assertEd25519PubText, createSshSigner, SshSignerError } from './crypto/ssh.ts';
 import { publicKeyDescriptor } from './crypto/keys.ts';
@@ -138,6 +142,7 @@ import {
   BundleIngestorUnavailableError,
   globalStoreRoot,
   installWorkflowBundle,
+  inspectCasDefs,
   loadCasDefs,
   PreCommitVerifierUnavailableError,
   projectStoreRoot,
@@ -347,6 +352,8 @@ async function defaultReadStdin(): Promise<string> {
 interface Args {
   positionals: string[];
   options: Map<string, string[]>;
+  /** Non-boolean options written without `=<value>` or a following value token. */
+  missingOptionValues: Set<string>;
 }
 
 /**
@@ -384,6 +391,7 @@ const BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
 function parseArgs(argv: string[]): Args {
   const positionals: string[] = [];
   const options = new Map<string, string[]>();
+  const missingOptionValues = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i] as string;
     if (a.startsWith('--')) {
@@ -398,7 +406,8 @@ function parseArgs(argv: string[]): Args {
       } else if (i + 1 < argv.length && !(argv[i + 1] as string).startsWith('--')) {
         val = argv[++i] as string;
       } else {
-        val = 'true'; // boolean flag
+	val = 'true'; // legacy representation for a valueless non-boolean option
+	missingOptionValues.add(key);
       }
       const arr = options.get(key) ?? [];
       arr.push(val);
@@ -407,7 +416,7 @@ function parseArgs(argv: string[]): Args {
       positionals.push(a);
     }
   }
-  return { positionals, options };
+  return { positionals, options, missingOptionValues };
 }
 
 const last = (args: Args, key: string): string | undefined => {
@@ -497,6 +506,23 @@ interface Ctx {
   defs: Map<string, WorkflowDef>;
   defsDir: string;
   dbPath: string;
+  definitionDiscoveryComplete: boolean;
+}
+
+interface LoadedDefs {
+  defs: Map<string, WorkflowDef>;
+  definitionDiscoveryComplete: boolean;
+}
+
+function finalizeDiscoveredDefs(
+  merged: Map<string, WorkflowDef>,
+  tolerantCasInspection: boolean,
+  definitionDiscoveryComplete: boolean,
+): Map<string, WorkflowDef> {
+  if (!tolerantCasInspection || definitionDiscoveryComplete) return finalizeDefs(merged);
+  // Only `status` requests tolerant CAS inspection. Its partial map is read-only:
+  // unresolved calls into skipped corrupt objects must not abort the fleet read.
+  return finalizeDefs(merged, { allowUnresolvedCalls: true });
 }
 
 /**
@@ -535,7 +561,11 @@ interface Ctx {
  * fail-closed validation in add.ts is untouched — we consume `readLockfile`,
  * discovery merely refuses to act on a bad ledger rather than crashing.)
  */
-function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, WorkflowDef> {
+function loadDefsWithInstalled(
+  io: CliIO,
+  defsDir: string,
+  tolerantCasInspection = false,
+): LoadedDefs {
   const merged = existsSync(defsDir) ? loadDefsUnfinalized(defsDir) : new Map<string, WorkflowDef>();
 
   let lf: Lockfile;
@@ -543,8 +573,11 @@ function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, Workflow
     lf = readLockfile(join(io.cwd, '.owenloop', 'installed.json'));
   } catch (e) {
     io.err(`warning: skipping installed workflow defs: ${(e as Error).message}`);
-    foldCasDefs(io, defsDir, merged);
-    return finalizeDefs(merged);
+    const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection);
+    return {
+      defs: finalizeDiscoveredDefs(merged, tolerantCasInspection, definitionDiscoveryComplete),
+      definitionDiscoveryComplete,
+    };
   }
 
   for (const source of Object.keys(lf.installed).sort()) {
@@ -574,9 +607,12 @@ function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, Workflow
     }
   }
 
-  foldCasDefs(io, defsDir, merged);
+  const definitionDiscoveryComplete = foldCasDefs(io, defsDir, merged, tolerantCasInspection);
 
-  return finalizeDefs(merged);
+  return {
+    defs: finalizeDiscoveredDefs(merged, tolerantCasInspection, definitionDiscoveryComplete),
+    definitionDiscoveryComplete,
+  };
 }
 
 /**
@@ -596,28 +632,36 @@ function loadDefsWithInstalled(io: CliIO, defsDir: string): Map<string, Workflow
  * (defs.ts), scoped by the calling def's own `bundleDigest`, so bundle A's
  * `calls: build` can never bind to bundle B's `build`.
  *
- * Fail-OPEN like the ledger fold above: `loadCasDefs` never throws; every bad
- * index, unreadable object, or unloadable bundle becomes an `io.err` warning and
- * is skipped, so a corrupt CAS object cannot break `owenloop status`.
+ * Executable discovery is fail-closed. Only the explicit status inspection path
+ * uses `inspectCasDefs`, which warns, returns `complete: false`, and is never
+ * reused by a mutating command's resolver.
  *
  * When no store exists (no `index.json` at either root) this is a no-op and the
  * merged map is byte-identical to what it was before WS-6.
  */
-function foldCasDefs(io: CliIO, defsDir: string, merged: Map<string, WorkflowDef>): void {
-  // The global root needs a concrete home. `workflowHome` throws when neither
-  // HOME nor USERPROFILE is set; def DISCOVERY must not fail for that (the
-  // install verbs still do), so fall back to project-only discovery.
+function foldCasDefs(
+  io: CliIO,
+  defsDir: string,
+  merged: Map<string, WorkflowDef>,
+  tolerantInspection = false,
+): boolean {
+  // Without HOME/USERPROFILE, retain project discovery and consult a guaranteed
+  // absent synthetic global root instead of silently dropping the project store.
   let globalRoot: string;
   try {
     globalRoot = globalStoreRoot(workflowHome(io));
   } catch {
-    return;
+    globalRoot = join(defsDir, '.owenloop-global-store-unavailable');
   }
-  const registrations = loadCasDefs({
+  const discoveryArgs = {
     projectRoot: projectStoreRoot(defsDir),
     globalRoot,
-    warn: (line) => io.err(line),
-  });
+    warn: (line: string) => io.err(line),
+  };
+  const discovery = tolerantInspection
+    ? inspectCasDefs(discoveryArgs)
+    : { registrations: loadCasDefs(discoveryArgs), complete: true };
+  const registrations = discovery.registrations;
   for (const registration of registrations) {
     const winner = merged.get(registration.key);
     if (winner !== undefined) {
@@ -629,9 +673,10 @@ function foldCasDefs(io: CliIO, defsDir: string, merged: Map<string, WorkflowDef
     }
     merged.set(registration.key, registration.def);
   }
+  return discovery.complete;
 }
 
-function openCtx(io: CliIO, args: Args): Ctx {
+function openCtx(io: CliIO, args: Args, tolerantCasInspection = false): Ctx {
   const dbOverride = last(args, 'db') ?? io.env.OWENLOOP_DB;
   const dbPath = dbOverride ?? join(io.cwd, '.owenloop', 'state.db');
   // An explicit `--defs`/`OWENLOOP_DEFS` is the operator targeting a literal dir
@@ -641,6 +686,17 @@ function openCtx(io: CliIO, args: Args): Ctx {
   // `OWENLOOP_DEFS=<cwd>/workflows` counts as an override and stays literal.
   const defsOverride = last(args, 'defs') ?? io.env.OWENLOOP_DEFS;
   const defsDir = defsOverride ?? join(io.cwd, 'workflows');
+  // Discover and validate executable definitions before creating or opening the
+  // runtime database. Corrupt workflow-store state therefore cannot mutate local
+  // runtime state before the command fails closed.
+  const loaded: LoadedDefs = defsOverride !== undefined
+    ? {
+	defs: existsSync(defsDir) ? loadDefs(defsDir) : new Map<string, WorkflowDef>(),
+	definitionDiscoveryComplete: true,
+      }
+    : loadDefsWithInstalled(io, defsDir, tolerantCasInspection);
+  const { defs, definitionDiscoveryComplete } = loaded;
+
   // Guard the built-in default (`cwd/.owenloop/state.db`) against a symlinked
   // `.owenloop` from a hostile checkout (SEC-3). Directory guard first, then the
   // file-level guard on `state.db` and its SQLite sidecars — a symlinked db file
@@ -653,12 +709,6 @@ function openCtx(io: CliIO, args: Args): Ctx {
     dbPathRefusingSymlink(dbPath);
   } else mkdirSync(dirname(dbPath), { recursive: true });
   const store = openStore(dbPath);
-  const defs =
-    defsOverride !== undefined
-      ? existsSync(defsDir)
-        ? loadDefs(defsDir)
-        : new Map<string, WorkflowDef>()
-      : loadDefsWithInstalled(io, defsDir);
   // WP-B1: the CLI ticks reference-mode orders exactly like the embedded
   // path — one loaded-definition resolver seeds the instruction boundary
   // (emission digests + instruction resolution), never a second local path.
@@ -674,7 +724,7 @@ function openCtx(io: CliIO, args: Args): Ctx {
     if (!d) throw new CliError(`unknown workflow definition '${name}' (looked in ${defsDir})`);
     return d;
   }, { instructionSource });
-  return { store, engine, defs, defsDir, dbPath };
+  return { store, engine, defs, defsDir, dbPath, definitionDiscoveryComplete };
 }
 
 function print(io: CliIO, value: unknown): void {
@@ -1348,8 +1398,11 @@ Commands:
   login [--hub <url>] [--with-token] [--as <slot>]   authenticate the CLI against a hub, verified via whoami (loopback OAuth, or --with-token from stdin)
   logout [--hub <url>] [--as <slot>]     delete the stored credential for a hub in one slot
   connect [--hub <url>] [--as <slot>]    bind this project to a hub and verify the stored credential (whoami)
-  push [<defName>...] [--force] [--dry-run] [--as <slot>]   publish local workflow defs to the bound hub (server-diffed, idempotent)
+  push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--as <slot>]
+    publish local workflow defs, or exact bundle-backed defs, to the bound hub
                                          --as names the credential slot: human (default), agent, or agent:<account>
+  start <defName> [--provide name=json ...] [--crew <name>] [--title <text>] [--hub <url>]
+${' '.repeat(41)}start a published workflow on the bound hub (human credential)
   agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --shift = --scopes work,run)
   capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
   capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
@@ -1441,7 +1494,8 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['connect', cmdOpts('hub', 'as')],
   ['publish', cmdOpts('unsigned', 'output', 'source')],
   ['trust', cmdOpts('force', 'key', 'principal', 'pools', 'labels', 'namespaces', 'delegate', 'signing-key', 'output', 'reason', 'effective-from')],
-  ['push', cmdOpts('dry-run', 'force', 'hub', 'as')],
+  ['push', cmdOpts('dry-run', 'force', 'hub', 'as', 'bundle')],
+  ['start', cmdOpts('hub', 'crew', 'title', 'provide')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
   ['crew', cmdOpts('hub', 'kind', 'owner')],
@@ -1750,8 +1804,11 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     return dispatchBundle(io, args);
   }
 
-  const ctx = openCtx(io, args);
+  const ctx = openCtx(io, args, command === 'status');
   const { engine, store } = ctx;
+  if (command === 'status' && !ctx.definitionDiscoveryComplete) {
+    io.err('warning: status is incomplete because workflow definition discovery skipped corrupt store state');
+  }
   try {
     switch (command) {
       case 'defs': {
@@ -3650,9 +3707,235 @@ async function dispatchConnect(io: CliIO, args: Args): Promise<number> {
   return 0;
 }
 
+interface PushBundleContext {
+  bytes: Buffer;
+  digest: string;
+  manifest: ReturnType<typeof inspectBundle>['manifest'];
+  publication: Buffer;
+  publicationState: 'signed' | 'unsigned';
+  origin?: Buffer;
+  defsDir: string;
+  cleanupRoot: string;
+}
+
+/** Read a publication/origin sidecar without following a symlink. */
+function readPushSidecar(path: string, label: string): { bytes: Buffer; value: unknown } {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (stat === undefined) throw new CliError(`owenloop push --bundle: missing ${label} '${path}'`);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new CliError(`owenloop push --bundle: ${label} '${path}' must be a regular file, not a symlink`);
+  }
+  if (stat.size > 32 * 1024 * 1024) {
+    throw new CliError(`owenloop push --bundle: ${label} '${path}' exceeds the hub 32MB request cap`);
+  }
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(path);
+  } catch (e) {
+    throw new CliError(`owenloop push --bundle: cannot read ${label} '${path}': ${(e as Error).message}`);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(bytes.toString('utf8')) as unknown;
+  } catch {
+    throw new CliError(`owenloop push --bundle: ${label} '${path}' is not valid JSON`);
+  }
+  return { bytes, value };
+}
+
 /**
- * `owenloop push [<defName>...] [--force] [--dry-run]` — publish local workflow
- * defs to the bound hub, diffed against the hub's own def `hash`
+ * Validate the relay-level DSSE shape and its digest/package binding locally.
+ * Signature authorization remains the execution host's responsibility; this
+ * mirrors the hub's transport boundary and prevents a mismatched sidecar from
+ * landing after the content-addressed bundle upload.
+ */
+function assertPushDsse(
+  value: unknown,
+  expected: { digest: string; name: string; version: string },
+  payloadType: string,
+  label: string,
+): void {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new CliError(`owenloop push --bundle: ${label} must be a DSSE JSON object`);
+  }
+  const envelope = value as Record<string, unknown>;
+  if (envelope.payloadType !== payloadType || typeof envelope.payload !== 'string') {
+    throw new CliError(`owenloop push --bundle: ${label} has the wrong payload type or no string payload`);
+  }
+  if (!Array.isArray(envelope.signatures) || envelope.signatures.length === 0) {
+    throw new CliError(`owenloop push --bundle: ${label} has no signatures`);
+  }
+  for (const signature of envelope.signatures) {
+    if (
+      typeof signature !== 'object' ||
+      signature === null ||
+      Array.isArray(signature) ||
+      typeof (signature as Record<string, unknown>).keyid !== 'string' ||
+      typeof (signature as Record<string, unknown>).sig !== 'string'
+    ) {
+      throw new CliError(`owenloop push --bundle: ${label} contains a malformed signature`);
+    }
+  }
+  let record: unknown;
+  try {
+    record = JSON.parse(decodeBase64Strict(envelope.payload, { allowEmpty: false }).toString('utf8')) as unknown;
+  } catch (e) {
+    throw new CliError(`owenloop push --bundle: ${label} payload is invalid: ${(e as Error).message}`);
+  }
+  if (typeof record !== 'object' || record === null || Array.isArray(record)) {
+    throw new CliError(`owenloop push --bundle: ${label} payload is not a JSON object`);
+  }
+  const bound = record as Record<string, unknown>;
+  if (bound.digest !== expected.digest || bound.name !== expected.name || bound.version !== expected.version) {
+    throw new CliError(`owenloop push --bundle: ${label} does not bind the selected bundle digest and package identity`);
+  }
+}
+
+/**
+ * Inspect one exact archive, require exactly one adjacent publication sidecar,
+ * and materialize its manifest-declared workflow files into a private temp
+ * directory. The archive, not the caller's checkout, is the source of truth.
+ */
+function preparePushBundle(io: CliIO, bundleArg: string): PushBundleContext {
+  if (bundleArg === '' || bundleArg === 'true') {
+    throw new CliError('owenloop push: --bundle requires a .wnlp path value');
+  }
+  const bundlePath = resolve(io.cwd, bundleArg);
+  const bytes = readBundleCommandFile(io, bundleArg);
+  const inspected = runBundle(() => inspectBundle(bytes));
+  const signedPath = `${bundlePath}.dsse`;
+  const unsignedPath = `${bundlePath}.unsigned`;
+  const originPath = `${bundlePath}.origin.dsse`;
+  const hasSigned = lstatSync(signedPath, { throwIfNoEntry: false }) !== undefined;
+  const hasUnsigned = lstatSync(unsignedPath, { throwIfNoEntry: false }) !== undefined;
+  if (hasSigned === hasUnsigned) {
+    throw new CliError(
+      `owenloop push --bundle: expected exactly one publication sidecar: '${signedPath}' or '${unsignedPath}'`,
+    );
+  }
+
+  const expected = {
+    digest: inspected.digest,
+    name: inspected.manifest.package.name,
+    version: inspected.manifest.package.version,
+  };
+  let publication: Buffer;
+  let publicationState: 'signed' | 'unsigned';
+  if (hasSigned) {
+    const sidecar = readPushSidecar(signedPath, 'signed publication sidecar');
+    assertPushDsse(sidecar.value, expected, PAYLOAD_TYPE_PUBLICATION, 'signed publication sidecar');
+    publication = sidecar.bytes;
+    publicationState = 'signed';
+  } else {
+    const sidecar = readPushSidecar(unsignedPath, 'unsigned publication marker');
+    const marker = sidecar.value;
+    if (
+      typeof marker !== 'object' ||
+      marker === null ||
+      Array.isArray(marker) ||
+      (marker as Record<string, unknown>).formatVersion !== 1 ||
+      (marker as Record<string, unknown>).digest !== inspected.digest ||
+      (marker as Record<string, unknown>).signed !== false
+    ) {
+      throw new CliError('owenloop push --bundle: unsigned publication marker does not bind the selected bundle digest');
+    }
+    publication = sidecar.bytes;
+    publicationState = 'unsigned';
+  }
+
+  let origin: Buffer | undefined;
+  if (lstatSync(originPath, { throwIfNoEntry: false }) !== undefined) {
+    const sidecar = readPushSidecar(originPath, 'origin sidecar');
+    assertPushDsse(sidecar.value, expected, PAYLOAD_TYPE_ORIGIN, 'origin sidecar');
+    origin = sidecar.bytes;
+  }
+
+  const cleanupRoot = mkdtempSync(join(tmpdir(), 'owenloop-push-'));
+  const defsDir = join(cleanupRoot, 'bundle');
+  try {
+    runBundle(() => unpackBundle(bytes, defsDir));
+  } catch (e) {
+    rmSync(cleanupRoot, { recursive: true, force: true });
+    throw e;
+  }
+  return { bytes, digest: inspected.digest, manifest: inspected.manifest, publication, publicationState, origin, defsDir, cleanupRoot };
+}
+
+/** Bundle-backed orders identify a step by bundle digest plus step name. */
+function assertUniqueBundleStepNames(defs: ReadonlyMap<string, WorkflowDef>): void {
+	const ownerByStep = new Map<string, string>();
+	const orderedDefs = [...defs.entries()].sort(([left], [right]) => left.localeCompare(right));
+	for (const [definitionName, def] of orderedDefs) {
+		for (const step of def.steps) {
+			const firstOwner = ownerByStep.get(step.name);
+			if (firstOwner !== undefined && firstOwner !== definitionName) {
+				throw new CliError(
+					`owenloop push --bundle: duplicate step name '${step.name}' in workflow definitions ` +
+						`'${firstOwner}' and '${definitionName}'; step names must be unique across the complete archive`,
+				);
+			}
+			ownerByStep.set(step.name, definitionName);
+		}
+	}
+}
+
+/**
+ * Order only the explicitly selected definitions by their selected local
+ * `calls:` dependencies. A child is published before each selected parent.
+ * `<currentPackage>/<workflow>` is local in bundle mode; excluded local and
+ * external-package targets add no edge, so selection never pulls another
+ * workflow into the push.
+ */
+function orderSelectedDefsByCalls(
+  selected: WorkflowDef[],
+  currentPackage?: string,
+): { ordered: WorkflowDef[]; dependencies: Map<string, Set<string>> } {
+  const selectedByName = new Map(selected.map((def) => [def.name, def]));
+  const state = new Map<string, 'visiting' | 'done'>();
+  const stack: string[] = [];
+  const ordered: WorkflowDef[] = [];
+  const dependencies = new Map<string, Set<string>>();
+  const localPrefix = currentPackage === undefined ? undefined : `${currentPackage}/`;
+
+  const localTarget = (target: string | undefined): string | undefined => {
+    if (target === undefined) return undefined;
+    if (!target.includes('/')) return selectedByName.has(target) ? target : undefined;
+    if (localPrefix === undefined || !target.startsWith(localPrefix)) return undefined;
+    const name = target.slice(localPrefix.length);
+    return selectedByName.has(name) ? name : undefined;
+  };
+
+  const visit = (def: WorkflowDef): void => {
+    const prior = state.get(def.name);
+    if (prior === 'done') return;
+    if (prior === 'visiting') {
+      const cycleStart = stack.indexOf(def.name);
+      const cycle = [...stack.slice(cycleStart), def.name];
+      throw new CliError(`owenloop push: selected calls cycle: ${cycle.join(' -> ')}`);
+    }
+
+    state.set(def.name, 'visiting');
+    stack.push(def.name);
+    const targets = new Set(
+      def.steps
+	.map((step) => localTarget(step.calls))
+	.filter((target): target is string => target !== undefined),
+    );
+    dependencies.set(def.name, targets);
+    for (const target of targets) visit(selectedByName.get(target)!);
+    stack.pop();
+    state.set(def.name, 'done');
+    ordered.push(def);
+  };
+
+  for (const def of selected) visit(def);
+  return { ordered, dependencies };
+}
+
+/**
+ * `owenloop push [<defName>...] [--bundle <bundle.wnlp>] [--force]
+ * [--dry-run]` — publish local workflow defs to the bound hub, diffed against
+ * the hub's own def `hash`
  * (`GET /api/workflows` — see `computeServerDiff`), never a client-side
  * ledger. Mirrors `add`'s all-or-nothing client-side validation gate before
  * any network write; server-side failures mid-batch record what landed and
@@ -3662,7 +3945,11 @@ async function dispatchConnect(io: CliIO, args: Args): Promise<number> {
  * reports back as a no-op.
  */
 async function dispatchPush(io: CliIO, args: Args): Promise<number> {
-  const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
+  const configuredDefsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
+  const bundleArg = last(args, 'bundle');
+  if (bundleArg !== undefined && args.options.has('defs')) {
+    throw new CliError('owenloop push: --bundle cannot be combined with --defs; the archive is the definition source');
+  }
   const dryRun = flag(args, 'dry-run');
   const force = flag(args, 'force');
   const slot = resolveSlot(args);
@@ -3696,10 +3983,34 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   let cred = readCredential(io, origin, slot);
   if (!cred) throw new CliError(emptySlotMessage(origin, slot));
 
-  // Load defs (same machinery as lint/add).
-  if (!existsSync(defsDir)) throw new CliError(`defs directory not found: ${defsDir}`);
-  const failures: DefLoadFailure[] = [];
-  const allDefs = loadDefsRaw(defsDir, failures);
+  let bundle: PushBundleContext | undefined;
+  try {
+    bundle = bundleArg === undefined ? undefined : preparePushBundle(io, bundleArg);
+    const defsDir = bundle?.defsDir ?? configuredDefsDir;
+
+    // Load defs (same machinery as lint/add). Bundle mode reads only the
+    // manifest-declared workflow paths from the materialized exact archive;
+    // bundle.yaml and unrelated YAML assets are never mistaken for defs.
+    if (!existsSync(defsDir)) throw new CliError(`defs directory not found: ${defsDir}`);
+    const failures: DefLoadFailure[] = [];
+    let allDefs: Map<string, WorkflowDef>;
+    if (bundle !== undefined) {
+      allDefs = new Map<string, WorkflowDef>();
+      for (const [name, workflowPath] of Object.entries(bundle.manifest.workflows)) {
+	try {
+	  const def = loadDefFile(join(defsDir, workflowPath));
+	  if (def.name !== name) {
+	    throw new CliError(`manifest workflow '${name}' loads as '${def.name}'`);
+	  }
+	  allDefs.set(name, def);
+	} catch (e) {
+	  throw new CliError(`owenloop push --bundle: cannot load workflow '${name}': ${(e as Error).message}`);
+	}
+      }
+    } else {
+      allDefs = loadDefsRaw(defsDir, failures);
+    }
+		if (bundle !== undefined) assertUniqueBundleStepNames(allDefs);
 
   // Narrow to positional names, if any (error on an unknown name).
   const requested = args.positionals.slice(1);
@@ -3719,6 +4030,9 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   if (selected.length === 0) {
     throw new CliError(`nothing to push — no workflow definitions found in ${defsDir}`);
   }
+  const selectedOrder = orderSelectedDefsByCalls(selected, bundle?.manifest.package.name);
+  selected = selectedOrder.ordered;
+  const selectedDependencies = selectedOrder.dependencies;
 
   // Client-side validation gate — all-or-nothing, mirroring dispatchAdd exactly.
   // Any failure aborts the entire push; nothing is sent.
@@ -3797,7 +4111,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     throw new CliError((e as Error).message);
   }
 
-  const { toPush, unchanged } = computeServerDiff(candidates, serverMap, force);
+  // A bundle-backed push must always send create_workflow: GET /api/workflows
+  // exposes the YAML hash but intentionally not the latest bundle identity.
+  // The server's (yaml,bundleDigest) idempotency decides whether this is a new
+  // version or an exact no-op.
+  const { toPush, unchanged } = computeServerDiff(candidates, serverMap, force || bundle !== undefined);
 
   // Diff-style human lines go to stderr so stdout stays machine-parseable JSON.
   for (const c of unchanged) io.err(`= ${c.name} (unchanged)`);
@@ -3810,6 +4128,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       ok: true,
       dryRun: true,
       hub: origin,
+      ...(bundle === undefined ? {} : { bundleDigest: bundle.digest, publication: bundle.publicationState }),
       new: toPush.filter((c) => c.status === 'new').map((c) => c.name),
       changed: toPush.filter((c) => c.status === 'changed').map((c) => c.name),
       unchanged: unchanged.map((c) => c.name),
@@ -3821,19 +4140,33 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   // Refresh an expiring oauth token once up front (per-request 401 refresh below covers mid-batch expiry).
   cred = await ensureFreshOAuth(io, origin, slot, cred);
 
+  if (bundle !== undefined) {
+    cred = await uploadPushBundle(io, origin, slot, cred, bundle);
+  }
+
   const pushedNames: string[] = [];
   const noopNames: string[] = [];
   const failed: { name: string; error: string }[] = [];
   const skipped: string[] = [];
+  const unsuccessful = new Set<string>();
 
   for (let i = 0; i < toPush.length; i++) {
     const c = toPush[i]!;
     const label = c.status === 'new' ? '+' : '~';
+    const blockedBy = [...(selectedDependencies.get(c.name) ?? [])]
+      .filter((dependency) => unsuccessful.has(dependency))
+      .sort();
+    if (blockedBy.length > 0) {
+      skipped.push(c.name);
+      unsuccessful.add(c.name);
+      io.err(`- ${c.name} (skipped: selected dependency ${blockedBy.map((name) => `'${name}'`).join(', ')} failed or was skipped)`);
+      continue;
+    }
     try {
-      let res = await createWorkflowRequest(io, origin, cred, c.yaml);
+      let res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
       if (res.status === 401 && cred.kind === 'oauth') {
         cred = await refreshOAuth(io, origin, slot, cred as Extract<Credential, { kind: 'oauth' }>);
-        res = await createWorkflowRequest(io, origin, cred, c.yaml);
+	res = await createWorkflowRequest(io, origin, cred, c.yaml, bundle?.digest);
       }
       if (res.status === 401) {
         if (cred.kind === 'agent') {
@@ -3868,9 +4201,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       if (e instanceof RateLimitError) {
         const msg = e.message;
         failed.push({ name: c.name, error: msg });
+	unsuccessful.add(c.name);
         io.err(`! ${c.name} (failed: ${msg})`);
         const remainder = toPush.slice(i + 1).map((r) => r.name);
         skipped.push(...remainder);
+	for (const name of remainder) unsuccessful.add(name);
         if (remainder.length > 0) {
           io.err(`stopping — rate limited by the hub; ${remainder.length} def(s) not attempted`);
         }
@@ -3883,6 +4218,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
       }
       const msg = (e as Error).message;
       failed.push({ name: c.name, error: msg });
+      unsuccessful.add(c.name);
       io.err(`! ${c.name} (failed: ${msg})`);
     }
   }
@@ -3890,6 +4226,7 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
   print(io, {
     ok: failed.length === 0,
     hub: origin,
+    ...(bundle === undefined ? {} : { bundleDigest: bundle.digest, publication: bundle.publicationState }),
     pushed: pushedNames,
     noop: noopNames,
     unchanged: unchanged.map((c) => c.name),
@@ -3897,6 +4234,133 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
     failed,
   });
   return failed.length === 0 ? 0 : 1;
+  } finally {
+    if (bundle !== undefined) rmSync(bundle.cleanupRoot, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Resolve the hub for `start` without ever falling through to the production
+ * default or an ambient `OWENLOOP_HUB`. A connected project supplies the
+ * durable default. `--hub` is allowed for an unbound directory, but must agree
+ * with an existing binding so a copied command cannot silently start a run on
+ * the wrong control plane.
+ */
+function resolveStartHub(io: CliIO, args: Args): string {
+  const binding = readHubBinding(hubBindingPath(io.cwd));
+  let bound: string | undefined;
+  if (binding !== null) {
+    try {
+      bound = normalizeOrigin(binding.hub);
+    } catch (e) {
+      throw new CliError(`${(e as Error).message} — re-run \`owenloop connect\` to rebind`);
+    }
+  }
+
+  const hubArg = last(args, 'hub');
+  if (hubArg !== undefined) {
+    let requested: string;
+    try {
+      requested = normalizeOrigin(hubArg);
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+    if (bound !== undefined && requested !== bound) {
+      throw new CliError(`this project is bound to ${bound}, not ${requested} — re-run \`owenloop connect\` to rebind`);
+    }
+    return requested;
+  }
+
+  if (bound !== undefined) return bound;
+  throw new CliError('this project is not bound to a hub — run `owenloop connect`, or pass --hub <url>');
+}
+
+/** Extract the stable hub message without ever echoing an untyped raw body. */
+async function hubRequestMessage(res: Response): Promise<string | undefined> {
+  try {
+    const body = (await res.json()) as unknown;
+    if (typeof body !== 'object' || body === null) return undefined;
+    const message = (body as Record<string, unknown>).message;
+    return typeof message === 'string' && message !== '' ? message : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * `owenloop start` — the small, public per-run control-plane command.
+ * Durable setup (login/connect/push/prepare and a standing Shift) remains
+ * separate; starting another instance is one authenticated POST using the
+ * human credential and the same repeated `--provide name=json` grammar as the
+ * local `create` command.
+ */
+async function dispatchStart(io: CliIO, args: Args): Promise<number> {
+  const defName = need(args, 1, 'defName');
+  const requiredTextOption = (key: 'crew' | 'title', label: string): string | undefined => {
+    if (args.missingOptionValues.has(key)) {
+      throw new CliError(`missing value for --${key}: expected --${key} <${label}>`);
+    }
+    const value = last(args, key);
+    if (value !== undefined && value.trim() === '') {
+      throw new CliError(`invalid empty value for --${key}: expected --${key} <${label}>`);
+    }
+    return value;
+  };
+  // Validate request-only options before project binding, Keychain, or network access.
+  const crew = requiredTextOption('crew', 'name');
+  const title = requiredTextOption('title', 'text');
+  const origin = resolveStartHub(io, args);
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  const provide = parsePairs(all(args, 'provide'), true);
+  const request = {
+    workflow_name: defName,
+    ...(Object.keys(provide).length > 0 ? { provide } : {}),
+    ...(crew !== undefined ? { default_crew: crew } : {}),
+    ...(title !== undefined ? { title } : {}),
+  };
+
+  const { res, cred: used } = await authedPost(io, origin, slot, cred, '/api/start_run', request);
+  if (res.status === 401) assertAuthOk(res, used, origin);
+  if (!res.ok) {
+    const message = await hubRequestMessage(res);
+    throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+  }
+
+  let body: unknown;
+  try {
+    body = (await res.json()) as unknown;
+  } catch {
+    throw new CliError('start_run: malformed success response — body is not valid JSON');
+  }
+  if (typeof body !== 'object' || body === null) {
+    throw new CliError('start_run: malformed success response — body is not an object');
+  }
+  const wire = body as Record<string, unknown>;
+  if (typeof wire.workflow !== 'string' || wire.workflow === '') {
+    throw new CliError('start_run: malformed success response — missing workflow id');
+  }
+  if (wire.def !== defName) {
+    throw new CliError('start_run: malformed success response — definition does not match the request');
+  }
+  if (typeof wire.status !== 'object' || wire.status === null || Array.isArray(wire.status)) {
+    throw new CliError('start_run: malformed success response — missing status object');
+  }
+
+  print(io, {
+    ok: true,
+    hub: origin,
+    workflow: wire.workflow,
+    def: wire.def,
+    status: wire.status,
+    ...(Array.isArray(wire.stampedCrews) ? { stampedCrews: wire.stampedCrews } : {}),
+    ...(Array.isArray(wire.validatedCrews) ? { validatedCrews: wire.validatedCrews } : {}),
+  });
+  return 0;
 }
 
 /**
@@ -3910,11 +4374,94 @@ async function dispatchMcp(io: CliIO, args: Args): Promise<number> {
   return runMcpCommand(io, { hubFlag: last(args, 'hub') });
 }
 
+/** POST opaque bundle/sidecar bytes with the same one-refresh auth contract as JSON hub calls. */
+async function authedPushBytes(
+  io: CliIO,
+  origin: string,
+  slot: CredentialSlotSelector,
+  cred: Credential,
+  path: string,
+  bytes: Uint8Array,
+  headers: Record<string, string>,
+): Promise<{ res: Response; cred: Credential }> {
+  let current = await ensureFreshOAuth(io, origin, slot, cred);
+  const send = (bearer: Credential): Promise<Response> =>
+    hubFetch(io, resolveEndpoint(origin, path), {
+      method: 'POST',
+      headers: { Authorization: authHeader(bearer), Accept: 'application/json', ...headers },
+      body: Buffer.from(bytes),
+    });
+  let res = await send(current);
+  if (res.status === 401 && current.kind === 'oauth') {
+    current = await refreshOAuth(io, origin, slot, current as Extract<Credential, { kind: 'oauth' }>);
+    res = await send(current);
+  }
+  return { res, cred: current };
+}
+
+async function assertPushArtifactOk(res: Response, cred: Credential, origin: string, label: string): Promise<void> {
+  if (res.status === 401) assertAuthOk(res, cred, origin);
+  if (res.status === 413) throw new CliError(`${label} exceeds the hub request cap`);
+  if (res.status === 429) {
+    const retryAfter = res.headers.get('retry-after');
+    throw new CliError(`rate limited while uploading ${label}${retryAfter ? ` (retry after ${retryAfter})` : ''}`);
+  }
+  if (!res.ok) {
+    const message = await hubRequestMessage(res);
+    throw new CliError(message === undefined ? `hub returned HTTP ${res.status} while uploading ${label}` : `${label}: ${message}`);
+  }
+}
+
+/** Upload the exact archive and adjacent publication/origin records before any definition version is created. */
+async function uploadPushBundle(
+  io: CliIO,
+  origin: string,
+  slot: CredentialSlotSelector,
+  initial: Credential,
+  bundle: PushBundleContext,
+): Promise<Credential> {
+  let cred = initial;
+  let sent = await authedPushBytes(io, origin, slot, cred, '/api/bundles', bundle.bytes, {
+    'Content-Type': 'application/gzip',
+    'X-Bundle-Digest': bundle.digest,
+  });
+  cred = sent.cred;
+  await assertPushArtifactOk(sent.res, cred, origin, 'bundle');
+
+  sent = await authedPushBytes(
+    io,
+    origin,
+    slot,
+    cred,
+    `/api/publications/${bundle.digest}?state=${bundle.publicationState}`,
+    bundle.publication,
+    { 'Content-Type': 'application/json' },
+  );
+  cred = sent.cred;
+  await assertPushArtifactOk(sent.res, cred, origin, 'publication sidecar');
+
+  if (bundle.origin !== undefined) {
+    sent = await authedPushBytes(
+      io,
+      origin,
+      slot,
+      cred,
+      `/api/origins/${bundle.digest}`,
+      bundle.origin,
+      { 'Content-Type': 'application/json' },
+    );
+    cred = sent.cred;
+    await assertPushArtifactOk(sent.res, cred, origin, 'origin sidecar');
+  }
+  return cred;
+}
+
 function createWorkflowRequest(
   io: CliIO,
   origin: string,
   cred: Credential,
   yaml: string,
+  bundleDigest?: string,
 ): Promise<Response> {
   return hubFetch(io, resolveEndpoint(origin, '/api/create_workflow'), {
     method: 'POST',
@@ -3923,7 +4470,7 @@ function createWorkflowRequest(
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
-    body: JSON.stringify({ yaml }),
+    body: JSON.stringify({ yaml, ...(bundleDigest === undefined ? {} : { bundle_digest: bundleDigest }) }),
   });
 }
 
@@ -5851,7 +6398,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -5895,6 +6442,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchTrust(io, args);
       case 'push':
         return await dispatchPush(io, args);
+      case 'start':
+	return await dispatchStart(io, args);
       case 'agent':
         return await dispatchAgent(io, args);
       case 'capability':

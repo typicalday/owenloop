@@ -31,6 +31,10 @@ export function writeBundleSource(args: {
   workflow: string;
   /** Additional workflow name to YAML content entries, stored at the root. */
   workflows?: Record<string, string>;
+  /** Explicit callable workflow for the installed versioned coordinate. */
+  defaultWorkflow?: string;
+  /** Explicit versioned calls targets pinned to bundle digests. */
+  lock?: Record<string, string>;
   files?: Record<string, string>;
 }): string {
   const root = tempDir(`owenloop-bundle-source-${args.name}-`);
@@ -43,12 +47,15 @@ export function writeBundleSource(args: {
     `  version: ${version}`,
     'workflows:',
     ...Object.keys(workflowContents).map((name) => `  ${name}: ${JSON.stringify(name === args.name ? 'workflow.yaml' : `${name}.yaml`)}`),
+    ...(args.defaultWorkflow === undefined ? [] : [`default: ${JSON.stringify(args.defaultWorkflow)}`]),
     'platforms: []',
     'integrity:',
     '  algorithm: sha256',
     '  files: {}',
     'capabilities: {}',
-    'lock: {}',
+    ...(args.lock === undefined || Object.keys(args.lock).length === 0
+      ? ['lock: {}']
+      : ['lock:', ...Object.entries(args.lock).map(([target, digest]) => `  ${JSON.stringify(target)}: ${JSON.stringify(digest)}`)]),
     '',
   ].join('\n');
   writeFileSync(join(root, 'bundle.yaml'), manifest);

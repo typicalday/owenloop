@@ -27,13 +27,17 @@ export interface WorkOrder {
   workflow: string;
   run: string;
   step: string;
-  /** Reference-order fields surfaced by newer hubs; optional for old responses. */
+  /** Target reference-order fields; optional because the deployed hub may omit them. */
   key?: string;
   index?: number;
   defDigest?: string;
+  /** Authoritative worker lane on modern whats_next responses. */
+  worker?: string;
   consumedFingerprint?: Record<string, number>;
   owes?: Array<{
     path: string;
+    /** Claim-time committed version when a version-aware hub projects it. */
+    version?: number;
     judgmentRejects: number;
     schemaRejects: number;
     reasons: ReasonEntry[];
@@ -173,6 +177,8 @@ export interface Lease {
  * The persisted order packet re-served by the transport. The packet carries
  * the definition projection digest and dynamic routing/state fields only.
  * Workers must resolve authored command or prompt text from the local store.
+ * Proof/version fields describe the target protocol and remain optional because
+ * the deployed hub can omit them; optionality does not imply end-to-end support.
  */
 export interface OrderPacket {
   run: string;
@@ -194,17 +200,19 @@ export interface OrderPacket {
   spec?: Record<string, unknown>;
   x?: Record<string, unknown>;
   consumes: Record<string, unknown>;
-  /** Claim-time versions of the consumed inputs, when supplied by the hub. */
+  /** Claim-time consumed versions when a compatible hub preserves the map. */
   consumedFingerprint?: Record<string, number>;
-  /** JSON-serialized map from artifact path to serialized DSSE submission envelope. */
+  /** Target-protocol proof map; the deployed hub currently omits this field. */
   consumesProof?: string;
   /** The owed outputs and their reason threads. */
   owes: Array<{
     path: string;
+    /** Claim-time committed version when a version-aware hub projects it. */
+    version?: number;
     judgmentRejects: number;
     schemaRejects: number;
     reasons: ReasonEntry[];
-    /** Serialized DSSE proof covering the complete reason thread. */
+    /** Target-protocol reason-thread proof; the deployed hub may omit it. */
     proof?: string;
   }>;
   cause?: string;
@@ -281,7 +289,7 @@ export interface SubmitRequest {
   path: string;
   value: unknown;
   done?: boolean;
-  /** Serialized DSSE submission envelope for this one produced path. */
+  /** Target-protocol DSSE envelope; production submit transport currently drops it. */
   proof?: string;
   /** W7: who produced this submission (D4) — carried on all three submit paths. */
   holder?: ContactHolder;
@@ -293,8 +301,10 @@ export interface SubmitRequest {
  * commit verdict: `green`/`submitted` are success (the value landed);
  * `schema-rejected`/`born-rejected`/`artifact-too-large`/
  * `artifact-normalization-failed` are failures. `closed` reports whether that
- * submit closed the run (only present on a `green`/`submitted` outcome). exec
- * treats any non-green/submitted outcome as a failed submit (exit 1).
+ * submit closed the run (only present on a `green`/`submitted` outcome). The
+ * deployed response does not return the committed version, the next target
+ * version, proof acceptance, or an idempotency result. exec treats any
+ * non-green/submitted outcome as a failed submit (exit 1).
  */
 export interface SubmitResponse extends HubResponse {
   outcome?: string;
@@ -347,11 +357,14 @@ export interface WhoamiResponse extends HubResponse {
 export class HubError extends Error {
   readonly status: number;
   readonly code?: string;
+  /** Server-requested delay before retrying, normalized from Retry-After. */
+  readonly retryAfterMs?: number;
 
-  constructor(status: number, message: string, code?: string) {
+  constructor(status: number, message: string, code?: string, retryAfterMs?: number) {
     super(message);
     this.name = 'HubError';
     this.status = status;
     if (code !== undefined) this.code = code;
+    if (retryAfterMs !== undefined) this.retryAfterMs = retryAfterMs;
   }
 }

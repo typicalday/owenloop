@@ -24,8 +24,12 @@
  *  - APPEND PROPAGATES. Unlike the shift's advisory metering records, a lost
  *    session token silently degrades a Phase 4 resume into a cold replay — real
  *    work thrown away — so the caller must see the failure.
- *  - COMPACTION is best-effort (swallowed): the un-compacted file is still
- *    correct, just larger.
+ *  - `active` is the safety-critical boundary. Its complete JSONL row is fsynced
+ *    before provider work may proceed. Other lifecycle rows retain ordinary
+ *    append durability; losing one degrades to conservative retirement/replay.
+ *  - COMPACTION is best-effort after a committed append, but a successful
+ *    compaction fsyncs its replacement before rename so it cannot erase a
+ *    previously durable `active` row across a host crash.
  *
  * DEVIATION FROM PLAN §3, stated deliberately: plan §3 says "compact on load if
  * > 2 MB". This module compacts on the WRITE path instead — `appendSession`
@@ -34,17 +38,31 @@
  * read-only filesystem), and a small `maxBytes` lets tests exercise compaction
  * without writing 2 MB. The 2 MB default is unchanged.
  *
- * ACCEPTED RACE: `compact` reads, rewrites, and renames, so lines appended by
- * another process in that window are lost. No locking is built. Session records
- * are advisory — a lost token degrades that one step to the designed replay
- * fallback — and compaction only runs past `maxBytes`.
+ * WRITER SERIALIZATION: every append, retirement, and compaction takes one
+ * cross-process writer lock for its complete read/append/size-check/rename
+ * transaction. A completed append can therefore never be replaced or shadowed
+ * by another process's stale snapshot. The shared SQLite lock database persists;
+ * process exit or crash releases its kernel lock without pathname deletion.
  *
  * Logging follows the house rule (there are zero `console.*` calls anywhere in
  * `src/`): the library takes an injectable callback and the default writes to
  * stderr, so tests stay silent and assertable.
  */
-import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  fstatSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
+import { acquireFileLockSync, releaseFileLock } from '../../../../src/lock.ts';
 
 /** Where a step attempt is in its life. */
 export type SessionStatus = 'active' | 'turn-ended' | 'submitted' | 'dead';
@@ -94,12 +112,36 @@ export interface SessionRecord {
 export interface SessionStoreOptions {
   /** Called once per skipped corrupt line. Default writes to stderr. */
   warn?: (line: string) => void;
+  /** Test barrier invoked under the writer lock after a retirement snapshot. */
+  afterWriterSnapshot?: () => void;
   /** Compaction threshold in bytes, checked after each append. Default 2 MB. */
   maxBytes?: number;
+  /** Clock used to detect an abandoned unterminated tail. Default `Date.now`. */
+  now?: () => number;
+  /** Unchanged-tail grace before one warning is emitted. Default 5 seconds. */
+  unterminatedTailGraceMs?: number;
+  /** Injectable durability primitive for focused tests. Default `fsyncSync`. */
+  sync?: (fd: number) => void;
 }
 
 /** Default compaction threshold — plan §3's 2 MB. */
 export const DEFAULT_MAX_BYTES = 2_000_000;
+/** Grace for a concurrent writer to finish an unterminated JSONL append. */
+export const DEFAULT_UNTERMINATED_TAIL_GRACE_MS = 5_000;
+
+interface TailObservation {
+  /** Stable identity of the open file whose bytes were inspected. */
+  identity: string;
+  /** Metadata that changes when a writer extends or replaces the observed tail. */
+  size: number;
+  mtimeMs: number;
+  tail: string;
+  firstSeenAt: number;
+  warned: boolean;
+}
+
+/** Process-local observations; session files remain the only persisted state. */
+const tailObservations = new Map<string, TailObservation>();
 
 /** `<cacheDir>/sessions.jsonl`. */
 export function sessionsPath(cacheDir: string): string {
@@ -144,17 +186,50 @@ function isSessionRecord(v: unknown): v is SessionRecord {
   return true;
 }
 
-/** Atomic write: temp file + rename into place. Fs errors propagate to the
- *  caller (the one caller, `compact`, is the one that swallows them). Mirrors
- *  the private helper in `src/bundle/cache.ts` — copied on purpose rather than
- *  exported from there, so the cache module's surface stays about bundles. */
-function atomicWrite(filePath: string, content: string): void {
+/** Flush a directory entry update where the platform exposes directory fsync. */
+function syncDirectory(dir: string, sync: (fd: number) => void = fsyncSync): void {
+  if (process.platform === 'win32') return;
+  const fd = openSync(dir, 'r');
+  try {
+    sync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Atomic durable write used by compaction. The replacement bytes are fsynced
+ * before rename, then the directory entry is fsynced. Fs errors propagate to
+ * the caller; `compactIfNeededUnlocked` decides whether best-effort compaction
+ * may swallow them. */
+function atomicWrite(filePath: string, content: string, opts: SessionStoreOptions): void {
   const dir = join(filePath, '..');
+  const sync = opts.sync ?? fsyncSync;
   mkdirSync(dir, { recursive: true });
   const tmp = join(dir, `.${Math.random().toString(36).slice(2)}-${process.pid}-${Date.now()}.tmp`);
-  writeFileSync(tmp, content);
+  const fd = openSync(tmp, 'wx');
+  let failure: unknown;
+  try {
+    writeFileSync(fd, content);
+    sync(fd);
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    closeSync(fd);
+  } catch (error) {
+    if (failure === undefined) failure = error;
+  }
+  if (failure !== undefined) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // Preserve the original write or close failure.
+    }
+    throw failure;
+  }
   try {
     renameSync(tmp, filePath);
+    syncDirectory(dir, sync);
   } catch (err) {
     try {
       unlinkSync(tmp);
@@ -167,22 +242,85 @@ function atomicWrite(filePath: string, content: string): void {
 
 /**
  * Every valid record in `file`, oldest first. A missing/unreadable file reads as
- * `[]`. Blank lines are skipped silently; every other unusable line is skipped
- * and reported through `warn` with its 1-indexed line number. Never throws.
+ * `[]`. A trailing newline is the record-commit marker: an unterminated final
+ * tail may be a concurrent writer still appending. File modification time starts
+ * the grace, so a recently modified tail is ignored silently while an already-old
+ * tail warns on the first read even in a fresh process. File identity, size, tail,
+ * or modification changes restart the observation; a newline clears it. Blank lines are
+ * skipped silently; every other unusable COMPLETE line is skipped and reported
+ * through `warn` with its 1-indexed line number. Never throws.
  */
 export function readSessions(file: string, opts: SessionStoreOptions = {}): SessionRecord[] {
   const warn = opts.warn ?? defaultWarn;
   let raw: string;
+  let metadata: { identity: string; size: number; mtimeMs: number };
+  let fd: number | undefined;
   try {
-    raw = readFileSync(file, 'utf8');
+    fd = openSync(file, 'r');
+    raw = readFileSync(fd, 'utf8');
+    const stat = fstatSync(fd);
+    metadata = {
+      identity: `${stat.dev}:${stat.ino}`,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+    };
   } catch {
+    tailObservations.delete(file);
     return []; // fail-open: no store yet is the normal first-run case
+  } finally {
+    if (fd !== undefined) {
+      try {
+	closeSync(fd);
+      } catch {
+	// The bytes and metadata were already captured; a close failure cannot
+	// make a resumable record safer, so preserve the read path's fail-open stance.
+      }
+    }
   }
   const out: SessionRecord[] = [];
   const lines = raw.split('\n');
+  const hasUncommittedTail = raw !== '' && !raw.endsWith('\n');
+  if (!hasUncommittedTail) {
+    tailObservations.delete(file);
+  } else {
+    const tail = lines.at(-1) ?? '';
+    if (tail.trim() === '') {
+      tailObservations.delete(file);
+    } else {
+      const now = (opts.now ?? Date.now)();
+      const graceMs = opts.unterminatedTailGraceMs ?? DEFAULT_UNTERMINATED_TAIL_GRACE_MS;
+      const observed = tailObservations.get(file);
+      const sameObservation = observed !== undefined
+	&& observed.identity === metadata.identity
+	&& observed.size === metadata.size
+	&& observed.mtimeMs === metadata.mtimeMs
+	&& observed.tail === tail;
+      if (!sameObservation) {
+	// mtime is persisted by the filesystem, so an abandoned tail can be
+	// recognized on the first read of a fresh one-shot process. Clamp a
+	// future timestamp to `now` for clock skew and injected test clocks.
+	const firstSeenAt = Math.min(now, metadata.mtimeMs);
+	const next: TailObservation = {
+	  ...metadata,
+	  tail,
+	  firstSeenAt,
+	  warned: false,
+	};
+	tailObservations.set(file, next);
+	if (now - firstSeenAt >= graceMs) {
+	  warn(`owenloop work sessions: persistent unterminated record at ${file}:${lines.length}`);
+	  next.warned = true;
+	}
+      } else if (observed !== undefined && !observed.warned && now - observed.firstSeenAt >= graceMs) {
+	warn(`owenloop work sessions: persistent unterminated record at ${file}:${lines.length}`);
+	observed.warned = true;
+      }
+    }
+  }
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (line === undefined) continue; // noUncheckedIndexedAccess
+    if (hasUncommittedTail && i === lines.length - 1) continue;
     if (line.trim() === '') continue; // blank lines are not corruption
     let parsed: unknown;
     try {
@@ -219,13 +357,40 @@ export function latestFor(
   return best;
 }
 
-/**
- * Rewrite `file` with only the last record per `(workflow, run, step)`,
- * preserving FIRST-SEEN key order, via temp file + rename. Corrupt lines are
- * dropped in the process (they were already unreadable). A missing file is a
- * no-op. Fs failures propagate here; `appendSession` is what swallows them.
- */
-export function compact(file: string, opts: SessionStoreOptions = {}): void {
+/** The lock shared by append and compaction for one session log. */
+function writerLockPath(file: string): string {
+  return `${file}.lock`;
+}
+
+/** Run one complete writer transaction under the cross-process session lock. */
+function withWriterLock<T>(file: string, operation: () => T): T {
+  const lock = acquireFileLockSync(writerLockPath(file), {
+    waitMs: 30_000,
+    label: 'owenloop session-store write',
+  });
+  try {
+    return operation();
+  } finally {
+    releaseFileLock(lock);
+  }
+}
+
+/** True when an existing nonempty log does not end at a JSONL commit marker. */
+function needsRecordSeparator(file: string): boolean {
+  const stat = statSync(file, { throwIfNoEntry: false });
+  if (stat === undefined || stat.size === 0) return false;
+  const fd = openSync(file, 'r');
+  try {
+    const last = Buffer.allocUnsafe(1);
+    const read = readSync(fd, last, 0, 1, stat.size - 1);
+    return read !== 1 || last[0] !== 0x0a;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Lock must already be held by the caller. */
+function compactUnlocked(file: string, opts: SessionStoreOptions): void {
   const records = readSessions(file, opts);
   if (records.length === 0) return;
   const byKey = new Map<string, SessionRecord>();
@@ -235,7 +400,58 @@ export function compact(file: string, opts: SessionStoreOptions = {}): void {
     byKey.set(keyOf(rec.workflow, rec.run, rec.step), rec);
   }
   const body = [...byKey.values()].map((r) => JSON.stringify(r)).join('\n');
-  atomicWrite(file, `${body}\n`);
+  atomicWrite(file, `${body}\n`, opts);
+}
+
+/** Lock must already be held. Append exactly one committed JSONL row.
+ * `active` is fsynced before returning because provider work is gated on this
+ * call. Later statuses use ordinary close-to-flush durability. */
+function appendSessionUnlocked(
+  file: string,
+  rec: SessionRecord,
+  opts: SessionStoreOptions,
+): void {
+  const separator = needsRecordSeparator(file) ? '\n' : '';
+  const existed = statSync(file, { throwIfNoEntry: false }) !== undefined;
+  const fd = openSync(file, 'a');
+  let failure: unknown;
+  try {
+    writeFileSync(fd, `${separator}${JSON.stringify(rec)}\n`);
+    if (rec.status === 'active') {
+      const sync = opts.sync ?? fsyncSync;
+      sync(fd);
+      if (!existed) syncDirectory(join(file, '..'), sync);
+    }
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    closeSync(fd);
+  } catch (error) {
+    if (failure === undefined) failure = error;
+  }
+  if (failure !== undefined) throw failure;
+}
+
+/** Lock must already be held. Compaction remains best-effort after committed JSONL appends. */
+function compactIfNeededUnlocked(file: string, opts: SessionStoreOptions): void {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
+  try {
+    if (statSync(file).size > maxBytes) compactUnlocked(file, opts);
+  } catch {
+    // An un-compacted (or unstatable) file still contains the committed rows.
+  }
+}
+
+/**
+ * Rewrite `file` with only the last record per `(workflow, run, step)`,
+ * preserving FIRST-SEEN key order, via temp file + rename. Corrupt lines are
+ * dropped in the process (they were already unreadable). A missing file is a
+ * no-op. The complete read/rewrite/rename transaction shares the same lock as
+ * append, so a successful append cannot be replaced by this snapshot.
+ */
+export function compact(file: string, opts: SessionStoreOptions = {}): void {
+  withWriterLock(file, () => compactUnlocked(file, opts));
 }
 
 /**
@@ -250,8 +466,8 @@ export function compact(file: string, opts: SessionStoreOptions = {}): void {
  *
  * WHY A NEW ROW RATHER THAN A REWRITE: the store is append-only and last-wins per
  * `(workflow, run, step)`, so appending a copy with `status: 'dead'` shadows the
- * live row without rewriting history — and it keeps the ACCEPTED RACE in this
- * module's header (compaction losing concurrent appends) as the only writer race.
+ * live row without rewriting history. The shared writer lock serializes each
+ * appended retirement with append/compaction transactions from other processes.
  *
  * IDEMPOTENT: a key whose newest row is already `dead` is skipped, so a sweep
  * that reaps the same run twice appends nothing the second time.
@@ -274,18 +490,23 @@ export function markRunSessionsDead(
   now: number,
   opts: SessionStoreOptions = {},
 ): string[] {
-  const newest = new Map<string, SessionRecord>();
-  for (const rec of readSessions(file, opts)) {
-    if (rec.workflow !== workflow || rec.run !== run) continue;
-    newest.set(keyOf(rec.workflow, rec.run, rec.step), rec);
-  }
-  const marked: string[] = [];
-  for (const rec of newest.values()) {
-    if (rec.status === 'dead') continue; // already retired — nothing to append
-    appendSession(file, { ...rec, status: 'dead', updatedAt: now }, opts);
-    marked.push(rec.step);
-  }
-  return marked;
+  mkdirSync(join(file, '..'), { recursive: true });
+  return withWriterLock(file, () => {
+    const newest = new Map<string, SessionRecord>();
+    for (const rec of readSessions(file, opts)) {
+      if (rec.workflow !== workflow || rec.run !== run) continue;
+      newest.set(keyOf(rec.workflow, rec.run, rec.step), rec);
+    }
+    opts.afterWriterSnapshot?.();
+    const marked: string[] = [];
+    for (const rec of newest.values()) {
+      if (rec.status === 'dead') continue; // already retired — nothing to append
+      appendSessionUnlocked(file, { ...rec, status: 'dead', updatedAt: now }, opts);
+      marked.push(rec.step);
+    }
+    if (marked.length > 0) compactIfNeededUnlocked(file, opts);
+    return marked;
+  });
 }
 
 /**
@@ -345,36 +566,39 @@ export function reconcileActiveSessions(
   now: number,
   opts: SessionStoreOptions = {},
 ): SessionRecord[] {
-  const newest = new Map<string, SessionRecord>();
-  for (const rec of readSessions(file, opts)) {
-    newest.set(keyOf(rec.workflow, rec.run, rec.step), rec);
-  }
-  const retired: SessionRecord[] = [];
-  for (const rec of newest.values()) {
-    if (rec.status !== 'active') continue; // a completed turn is still resumable
-    if (liveRunIds.has(rec.run)) continue; // its worker is alive; the row is true
-    appendSession(file, { ...rec, status: 'dead', updatedAt: now }, opts);
-    retired.push(rec);
-  }
-  return retired;
+  mkdirSync(join(file, '..'), { recursive: true });
+  return withWriterLock(file, () => {
+    const newest = new Map<string, SessionRecord>();
+    for (const rec of readSessions(file, opts)) {
+      newest.set(keyOf(rec.workflow, rec.run, rec.step), rec);
+    }
+    opts.afterWriterSnapshot?.();
+    const retired: SessionRecord[] = [];
+    for (const rec of newest.values()) {
+      if (rec.status !== 'active') continue; // a completed turn is still resumable
+      if (liveRunIds.has(rec.run)) continue; // its worker is alive; the row is true
+      appendSessionUnlocked(file, { ...rec, status: 'dead', updatedAt: now }, opts);
+      retired.push(rec);
+    }
+    if (retired.length > 0) compactIfNeededUnlocked(file, opts);
+    return retired;
+  });
 }
 
 /**
  * Append one record, then compact when the file has grown past `maxBytes`.
  *
- * The whole line is written in ONE `appendFileSync` call (with its trailing
- * newline) so concurrent workers' O_APPEND writes interleave line-atomically on
- * local filesystems. Append failures PROPAGATE — see this module's failure
- * stance. The post-append compaction is best-effort and swallowed.
+ * The cross-process writer lock covers the WHOLE transaction: abandoned-tail
+ * quarantine, append, size check, and optional compaction rename. If a crashed
+ * writer left bytes without the JSONL commit newline, a leading newline commits
+ * only that fragment as corrupt before the new complete record. Append and lock
+ * failures PROPAGATE; post-append compaction remains best-effort because the
+ * appended line is already committed by its trailing JSONL newline in the original log.
  */
 export function appendSession(file: string, rec: SessionRecord, opts: SessionStoreOptions = {}): void {
   mkdirSync(join(file, '..'), { recursive: true });
-  appendFileSync(file, `${JSON.stringify(rec)}\n`);
-
-  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
-  try {
-    if (statSync(file).size > maxBytes) compact(file, opts);
-  } catch {
-    // best-effort: an un-compacted (or unstatable) file is still correct.
-  }
+  withWriterLock(file, () => {
+    appendSessionUnlocked(file, rec, opts);
+    compactIfNeededUnlocked(file, opts);
+  });
 }

@@ -97,10 +97,10 @@ export class StoreCoordinateError extends WorkflowStoreError {
 }
 
 /**
- * Resolution found the coordinate at BOTH levels with DIFFERENT digests. Human
- * resolution refuses to guess (never silently project-first); the caller must
- * disambiguate with an explicit pin/update. Carries all three facts for the
- * error surface.
+ * @deprecated Coordinate resolution is project-first and no longer throws this
+ * error when project and global indexes name different digests. The export and
+ * constructor remain for compatibility with older callers that import or
+ * instantiate the error class.
  */
 export class StoreAmbiguityError extends WorkflowStoreError {
   readonly coordinate: WorkflowCoordinate;

@@ -67,6 +67,11 @@
         "required": ["path", "judgmentRejects", "schemaRejects", "reasons"],
         "properties": {
           "path": { "type": "string" },
+	  "version": {
+	    "type": "integer",
+	    "minimum": 0,
+	    "description": "Current committed artifact version captured by the engine at claim time."
+	  },
           "judgmentRejects": { "type": "integer", "minimum": 0 },
           "schemaRejects": { "type": "integer", "minimum": 0 },
           "reasons": {

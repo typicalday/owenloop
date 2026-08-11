@@ -1,62 +1,72 @@
 /**
- * In-flight tracking for detached exec children (plan decision 7).
+ * Durable Shift dispatch state.
  *
- * The shift spawns `owenloop work exec <run>` DETACHED — the child survives a shift
- * restart (kernel reparenting, SP5-verified). So the shift cannot trust its own
- * memory to know what is in flight across a restart; it reconstructs that from
- * durable local records instead. A state dir holds one JSON record per spawned
- * child — `{ workflow, run, pid, spawnedAt, def?, hash?, step? }` — and on every
- * sweep (and startup) we scan the records, probe each pid with `kill(pid, 0)`,
- * count the live ones as in-flight, and reap the dead ones.
- *
- * The design docs disdain PID files for broker/discovery plumbing of
- * harness-managed processes; these are shift-spawned children, so local
- * bookkeeping is the legitimate mechanism, not that anti-pattern. Metering off
- * this count is an EFFICIENCY mechanism only — engine race-safety plus the
- * pickup/lease TTLs are the correctness backstop — so a rare pid-reuse miscount
- * is acceptable and never a bug to chase.
- *
- * Every fs op is FAIL-OPEN: a broken state dir degrades metering (the shift may
- * over- or under-count in flight), it never kills the loop.
+ * Every dispatch is reserved before spawn. A reservation counts against capacity
+ * and same-run deduplication, and carries a start-gate token. The child waits on
+ * that gate before entering the CLI. The Shift replaces the reservation with a
+ * PID-bearing child record, then opens the gate. A crash before PID persistence
+ * leaves a gated child that exits when the abandoned reservation is reaped; a
+ * crash after PID persistence leaves enough state for restart reconciliation to
+ * open the gate safely.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  ftruncateSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { basename, join } from 'node:path';
 
-/** One dispatched order the shift meters against capacity.
- *
- *  Two kinds, and BOTH are real local processes tracked by a live pid:
- *   - `exec` (default; absent `kind` for legacy records) — a detached
- *     `owenloop work exec` command child, tracked by `kill(pid, 0)`.
- *   - `agent-run` — a detached `owenloop work agent-run` child hosting the step
- *     agent itself, tracked exactly the same way.
- *
- *  There is no pid-less kind any more. The removed `'agent'` kind recorded a
- *  stamped Step Agent file handed to an out-of-process Shift: no local
- *  child, a `0` sentinel pid, and a coarse TTL standing in for liveness. With
- *  the stamp path gone nothing produces such a record, so a leftover one on disk
- *  fails the pid probe and is reaped on the next reconcile — which is correct.
- *
- *  `def/hash/step` are dispatch provenance (which cached def revision and step
- *  this child was dispatched for); they are absent for command orders. */
+export const DEFAULT_RESERVATION_MAX_AGE_MS = 2 * 60_000;
+
 export interface ChildRecord {
   workflow: string;
   run: string;
-  /** The child's live pid. */
   pid: number;
   spawnedAt: number;
-  /** Dispatch kind; absent = `'exec'` (back-compat with pre-split records). */
+  /** Dispatch kind; absent = `'exec'` for backward compatibility. */
   kind?: 'exec' | 'agent-run';
   def?: string;
   hash?: string;
   step?: string;
+  /** Present only between PID persistence and opening the child's start gate. */
+  gateToken?: string;
 }
 
-/**
- * Resolve the state dir: `override` → `$XDG_STATE_HOME/owenloop/exec` →
- * `$HOME/.local/state/owenloop/exec`. Throws when none is available (same
- * stance as the cache/settings resolvers — never guess a home dir). Tests pass
- * an explicit `override` pointing at a temp dir.
- */
+export interface ChildReservation {
+  recordType: 'reservation';
+  workflow: string;
+  run: string;
+  reservedAt: number;
+  token: string;
+  childKind: 'exec' | 'agent-run';
+  step?: string;
+}
+
+type StateRecord = ChildRecord | ChildReservation;
+
+export interface ReservationRequest {
+  workflow: string;
+  run: string;
+  reservedAt: number;
+  childKind: 'exec' | 'agent-run';
+  step?: string;
+}
+
+export interface ReservedChild {
+  reservation: ChildReservation;
+  gatePath: string;
+}
+
 export function resolveStateDir(env: Record<string, string | undefined>, override?: string): string {
   if (override !== undefined && override.trim() !== '') return override;
   const xdg = env['XDG_STATE_HOME'];
@@ -66,137 +76,401 @@ export function resolveStateDir(env: Record<string, string | undefined>, overrid
   throw new Error('cannot locate a state directory: set OWENLOOP_STATE_DIR, XDG_STATE_HOME, or HOME');
 }
 
-/** Map a run id onto a safe record filename (hub run ids are already safe; this
- *  is defense in depth against a `/`, `\`, or `..` sneaking in). */
-function recordFile(stateDir: string, run: string): string {
-  const safe = run.replace(/[^A-Za-z0-9_.-]/g, '_');
-  return join(stateDir, `${safe}.json`);
+function safeRun(run: string): string {
+  return run.replace(/[^A-Za-z0-9_.-]/g, '_');
 }
 
-/** Persist a child record (atomic temp+rename). Fail-open. */
-export function writeChildRecord(stateDir: string, rec: ChildRecord): void {
+function recordFile(stateDir: string, run: string): string {
+  return join(stateDir, `${safeRun(run)}.json`);
+}
+
+function gateFile(stateDir: string, token: string): string {
+  if (!/^[a-f0-9]{32}$/u.test(token)) throw new Error('invalid child start-gate token');
+  return join(stateDir, `.${token}.gate`);
+}
+
+function syncDirectory(dir: string): void {
+  if (process.platform === 'win32') return;
+  const fd = openSync(dir, 'r');
   try {
-    mkdirSync(stateDir, { recursive: true });
-    const file = recordFile(stateDir, rec.run);
-    const tmp = join(stateDir, `.${Math.random().toString(36).slice(2)}-${process.pid}-${Date.now()}.tmp`);
-    writeFileSync(tmp, JSON.stringify(rec));
-    try {
-      renameSync(tmp, file);
-    } catch (err) {
-      try {
-        unlinkSync(tmp);
-      } catch {
-        // best-effort cleanup
-      }
-      throw err;
-    }
-  } catch {
-    // fail-open: a lost record degrades metering, never kills the loop.
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
   }
 }
 
-/** Read every child record in the state dir. Corrupt files are skipped, a
- *  missing dir reads as empty. Fail-open. */
-export function readChildRecords(stateDir: string): ChildRecord[] {
+function durableExclusiveWrite(path: string, value: string): void {
+  const fd = openSync(path, 'wx');
+  let failure: unknown;
+  try {
+    writeFileSync(fd, value);
+    fsyncSync(fd);
+  } catch (error) {
+    failure = error;
+  }
+  try {
+    closeSync(fd);
+  } catch (error) {
+    if (failure === undefined) failure = error;
+  }
+  if (failure !== undefined) {
+    try {
+      rmSync(path, { force: true });
+    } catch {
+      // Preserve the original write or close failure.
+    }
+    throw failure;
+  }
+  syncDirectory(join(path, '..'));
+}
+
+function durableRemove(path: string): void {
+  rmSync(path, { force: true });
+  syncDirectory(join(path, '..'));
+}
+
+function atomicWrite(path: string, value: string): void {
+  const dir = join(path, '..');
+  mkdirSync(dir, { recursive: true });
+  const tmp = join(dir, `.${randomBytes(8).toString('hex')}-${process.pid}-${Date.now()}.tmp`);
+  durableExclusiveWrite(tmp, value);
+  try {
+    renameSync(tmp, path);
+    syncDirectory(dir);
+  } catch (error) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // Preserve the original write failure.
+    }
+    throw error;
+  }
+}
+
+function writeStateRecord(stateDir: string, record: StateRecord): void {
+  atomicWrite(recordFile(stateDir, record.run), JSON.stringify(record));
+}
+
+/** Persist a child record atomically. State persistence is correctness-sensitive and throws on failure. */
+export function writeChildRecord(stateDir: string, record: ChildRecord): void {
+  writeStateRecord(stateDir, record);
+}
+
+/** Create the durable capacity reservation and closed start gate before spawn. */
+export function reserveChild(stateDir: string, request: ReservationRequest): ReservedChild {
+  ensureStateDir(stateDir);
+  const token = randomBytes(16).toString('hex');
+  const gatePath = gateFile(stateDir, token);
+  const reservation: ChildReservation = {
+    recordType: 'reservation',
+    workflow: request.workflow,
+    run: request.run,
+    reservedAt: request.reservedAt,
+    token,
+    childKind: request.childKind,
+    ...(request.step !== undefined ? { step: request.step } : {}),
+  };
+
+  durableExclusiveWrite(gatePath, 'wait\n');
+  try {
+    // Exclusive create is the same-run reservation point. A stale, live, or even
+    // corrupt existing record blocks dispatch rather than being overwritten.
+    durableExclusiveWrite(recordFile(stateDir, reservation.run), JSON.stringify(reservation));
+  } catch (error) {
+    try {
+      durableRemove(gatePath);
+    } catch {
+      // Preserve the reservation write failure.
+    }
+    throw error;
+  }
+  return { reservation, gatePath };
+}
+
+function isReservation(record: StateRecord): record is ChildReservation {
+  return (record as Partial<ChildReservation>).recordType === 'reservation';
+}
+
+export class ShiftStateRecordError extends Error {
+  readonly path: string;
+
+  constructor(path: string, detail: string) {
+    super(
+      `cannot reconcile Shift state record '${path}': ${detail}; ` +
+      'dispatch is disabled until the record is repaired or removed after verifying that no child still owns the slot',
+    );
+    this.name = 'ShiftStateRecordError';
+    this.path = path;
+  }
+}
+
+function readOneStateRecord(path: string): StateRecord | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    const code = (error as NodeJS.ErrnoException).code;
+    throw new ShiftStateRecordError(path, `the canonical record is unreadable${code === undefined ? '' : ` (${code})`}`);
+  }
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    throw new ShiftStateRecordError(path, 'the canonical record is truncated or is not valid JSON');
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ShiftStateRecordError(path, 'the canonical record is not a JSON object');
+  }
+  if (
+    typeof parsed['workflow'] !== 'string' || parsed['workflow'] === '' ||
+    typeof parsed['run'] !== 'string' || parsed['run'] === ''
+  ) {
+    throw new ShiftStateRecordError(path, 'the canonical record is missing workflow or run identity');
+  }
+  if (basename(path) !== `${safeRun(parsed['run'])}.json`) {
+    throw new ShiftStateRecordError(path, 'the canonical record pathname does not match its run identity');
+  }
+  if (parsed['recordType'] === 'reservation') {
+    if (
+      typeof parsed['reservedAt'] !== 'number' ||
+      !Number.isInteger(parsed['reservedAt']) ||
+      parsed['reservedAt'] < 0 ||
+      typeof parsed['token'] !== 'string' ||
+      !/^[a-f0-9]{32}$/u.test(parsed['token']) ||
+      (parsed['childKind'] !== 'exec' && parsed['childKind'] !== 'agent-run') ||
+      (parsed['step'] !== undefined && typeof parsed['step'] !== 'string')
+    ) {
+      throw new ShiftStateRecordError(path, 'the canonical reservation fields are malformed');
+    }
+    return parsed as unknown as ChildReservation;
+  }
+  if (
+    parsed['recordType'] !== undefined ||
+    typeof parsed['pid'] !== 'number' ||
+    !Number.isInteger(parsed['pid']) ||
+    parsed['pid'] <= 0 ||
+    typeof parsed['spawnedAt'] !== 'number' ||
+    !Number.isInteger(parsed['spawnedAt']) ||
+    parsed['spawnedAt'] < 0 ||
+    (parsed['kind'] !== undefined && parsed['kind'] !== 'exec' && parsed['kind'] !== 'agent-run') ||
+    (parsed['def'] !== undefined && typeof parsed['def'] !== 'string') ||
+    (parsed['hash'] !== undefined && typeof parsed['hash'] !== 'string') ||
+    (parsed['step'] !== undefined && typeof parsed['step'] !== 'string') ||
+    (parsed['gateToken'] !== undefined && (
+      typeof parsed['gateToken'] !== 'string' ||
+      !/^[a-f0-9]{32}$/u.test(parsed['gateToken'])
+    ))
+  ) {
+    throw new ShiftStateRecordError(path, 'the canonical child fields are malformed');
+  }
+  return parsed as unknown as ChildRecord;
+}
+
+function readStateRecords(stateDir: string): StateRecord[] {
   let names: string[];
   try {
-    names = readdirSync(stateDir).filter((f) => f.endsWith('.json'));
-  } catch {
-    return [];
+    names = readdirSync(stateDir)
+      .filter((name) => name.endsWith('.json') && name !== '.dispatch.lock.owner.json')
+      .sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
   }
-  const records: ChildRecord[] = [];
-  for (const name of names) {
-    try {
-      const rec = JSON.parse(readFileSync(join(stateDir, name), 'utf8')) as ChildRecord;
-      if (rec && typeof rec.run === 'string' && typeof rec.pid === 'number' && typeof rec.workflow === 'string') {
-        records.push(rec);
-      }
-    } catch {
-      // skip corrupt record
-    }
-  }
-  return records;
+  return names
+    .map((name) => readOneStateRecord(join(stateDir, name)))
+    .filter((record): record is StateRecord => record !== undefined);
 }
 
-/** Delete a child record by run id. Fail-open. */
-export function removeChildRecord(stateDir: string, run: string): void {
+/** Read only PID-bearing records for status and compatibility callers. */
+export function readChildRecords(stateDir: string): ChildRecord[] {
+  return readStateRecords(stateDir).filter(
+    (record): record is ChildRecord => !(isReservation(record)),
+  );
+}
+
+export function readChildReservations(stateDir: string): ChildReservation[] {
+  return readStateRecords(stateDir).filter(
+    (record): record is ChildReservation => isReservation(record),
+  );
+}
+
+/** Replace the matching reservation with a PID-bearing record before work starts. */
+export function finalizeChildReservation(
+  stateDir: string,
+  reservation: ChildReservation,
+  child: Omit<ChildRecord, 'workflow' | 'run' | 'gateToken'>,
+): ChildRecord {
+  const current = readOneStateRecord(recordFile(stateDir, reservation.run));
+  if (
+    current === undefined ||
+    !isReservation(current) ||
+    current.token !== reservation.token
+  ) {
+    throw new Error(`child reservation for ${reservation.workflow}/${reservation.run} is missing or was replaced`);
+  }
+  const record: ChildRecord = {
+    workflow: reservation.workflow,
+    run: reservation.run,
+    ...child,
+    gateToken: reservation.token,
+  };
+  writeStateRecord(stateDir, record);
+  return record;
+}
+
+function signalGate(path: string, signal: 'start' | 'cancel', allowMissing: boolean): boolean {
+  let fd: number;
   try {
-    rmSync(recordFile(stateDir, run), { force: true });
-  } catch {
-    // best-effort
+    fd = openSync(path, 'r+');
+  } catch (error) {
+    if (allowMissing && (error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
   }
+  try {
+    ftruncateSync(fd, 0);
+    writeFileSync(fd, `${signal}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  return true;
 }
 
-/** A liveness probe over a pid. Injectable so tests never touch real pids. */
-export type Liveness = (pid: number) => boolean;
+/** Open a child's gate only after the PID-bearing record is durable. */
+export function startReservedChild(stateDir: string, record: ChildRecord): void {
+  if (record.gateToken === undefined) return;
+  signalGate(gateFile(stateDir, record.gateToken), 'start', false);
+}
+
+/** Cancel a gated child and remove the matching reservation/record. */
+export function cancelReservedChild(stateDir: string, reservation: ChildReservation): void {
+  const path = gateFile(stateDir, reservation.token);
+  try {
+    signalGate(path, 'cancel', true);
+  } finally {
+    durableRemove(path);
+    const current = readOneStateRecord(recordFile(stateDir, reservation.run));
+    const matchesReservation = current !== undefined &&
+      isReservation(current) &&
+      current.token === reservation.token;
+    const matchesFinalized = current !== undefined &&
+      !isReservation(current) &&
+      current.gateToken === reservation.token;
+    if (matchesReservation || matchesFinalized) durableRemove(recordFile(stateDir, reservation.run));
+  }
+}
 
 /**
- * Default liveness probe: `process.kill(pid, 0)` sends no signal, only checks
- * existence/permissions. `ESRCH` ⇒ the process is gone (dead). `EPERM` ⇒ it
- * exists but is owned by another user (count as alive — pid reuse aside, a live
- * foreign process at that pid is not ours to reap). Any other error ⇒ alive
- * (conservative: don't reap on an ambiguous signal).
+ * Delete one run's in-flight state. A still-gated reservation or finalized child
+ * is cancelled first so an external run-ended signal cannot leave a worker gate
+ * behind that later opens without a capacity record.
  */
+export function removeChildRecord(stateDir: string, run: string): void {
+  const path = recordFile(stateDir, run);
+  const current = readOneStateRecord(path);
+  if (current !== undefined && isReservation(current)) {
+    cancelReservedChild(stateDir, current);
+    return;
+  }
+  if (current?.gateToken !== undefined) {
+    const gatePath = gateFile(stateDir, current.gateToken);
+    try {
+      signalGate(gatePath, 'cancel', true);
+    } finally {
+      durableRemove(gatePath);
+    }
+  }
+  durableRemove(path);
+}
+
+export type Liveness = (pid: number) => boolean;
+
 export const defaultIsAlive: Liveness = (pid: number): boolean => {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 };
 
 export interface Reconciliation {
-  /** Records whose child is still alive — these count as in-flight. */
   live: ChildRecord[];
-  /** Records whose child is gone — reaped (record deleted) this pass. */
+  reserved: ChildReservation[];
   reaped: ChildRecord[];
+  abandoned: ChildReservation[];
 }
 
-/** Injectable knobs for `reconcileInFlight` (all optional; real defaults). */
 export interface ReconcileOptions {
-  /** pid liveness probe (default `defaultIsAlive`). */
   isAlive?: Liveness;
+  now?: number;
+  reservationMaxAgeMs?: number;
 }
 
 /**
- * Scan the state dir, decide each record's liveness, delete the dead ones, and
- * return the live/reaped split. Deduped by run id (last record for a run wins)
- * so a stray double-write can never double-count capacity.
- *
- * Liveness is UNIFORM: every record names a real local child, so every record
- * is live exactly while `kill(pid, 0)` says its pid is.
- *
- * Back-compat: the second positional arg still accepts a bare `Liveness`
- * (pre-split callers passed `reconcileInFlight(dir, isAlive)`).
+ * Reconcile live children and durable reservations. Fresh reservations count as
+ * occupied capacity. An expired reservation is cancelled before its record is
+ * removed, so a child that was spawned but never finalized cannot begin work.
  */
 export function reconcileInFlight(stateDir: string, arg?: Liveness | ReconcileOptions): Reconciliation {
-  const opts: ReconcileOptions = typeof arg === 'function' ? { isAlive: arg } : (arg ?? {});
-  const isAlive = opts.isAlive ?? defaultIsAlive;
+  const options: ReconcileOptions = typeof arg === 'function' ? { isAlive: arg } : (arg ?? {});
+  const isAlive = options.isAlive ?? defaultIsAlive;
+  const now = options.now ?? Date.now();
+  const maxAge = options.reservationMaxAgeMs ?? DEFAULT_RESERVATION_MAX_AGE_MS;
 
-  const byRun = new Map<string, ChildRecord>();
-  for (const rec of readChildRecords(stateDir)) byRun.set(rec.run, rec);
+  const byRun = new Map<string, StateRecord>();
+  for (const record of readStateRecords(stateDir)) byRun.set(record.run, record);
 
   const live: ChildRecord[] = [];
+  const reserved: ChildReservation[] = [];
   const reaped: ChildRecord[] = [];
-  for (const rec of byRun.values()) {
-    const alive = isAlive(rec.pid);
-    if (alive) {
-      live.push(rec);
+  const abandoned: ChildReservation[] = [];
+
+  for (const record of byRun.values()) {
+    if (isReservation(record)) {
+      // The worker removes its gate when its monotonic wait expires. A missing
+      // gate therefore proves that this reservation cannot start work, even if
+      // wall-clock rollback makes its persisted age look fresh.
+      const gateExists = existsSync(gateFile(stateDir, record.token));
+      // A persisted wall-clock timestamp from the future cannot be aged safely
+      // after a clock rollback. Cancel the reservation instead of letting a
+      // negative elapsed interval occupy capacity indefinitely.
+      if (gateExists && record.reservedAt <= now && now - record.reservedAt < maxAge) {
+	reserved.push(record);
+	continue;
+      }
+      cancelReservedChild(stateDir, record);
+      abandoned.push(record);
+      continue;
+    }
+
+    if (!isAlive(record.pid)) {
+      removeChildRecord(stateDir, record.run);
+      reaped.push(record);
+      continue;
+    }
+
+    if (record.gateToken !== undefined) {
+      // A restart after PID persistence but before the parent opened the gate can
+      // safely finish the handoff: the durable PID record is the prerequisite.
+      signalGate(gateFile(stateDir, record.gateToken), 'start', true);
+      const settled = { ...record };
+      delete settled.gateToken;
+      writeStateRecord(stateDir, settled);
+      live.push(settled);
     } else {
-      removeChildRecord(stateDir, rec.run);
-      reaped.push(rec);
+      live.push(record);
     }
   }
-  return { live, reaped };
+
+  return { live, reserved, reaped, abandoned };
 }
 
-/** Ensure the state dir exists so the first read doesn't churn. Fail-open. */
+/** Ensure the state directory exists and is readable. Failure is fatal to dispatch safety. */
 export function ensureStateDir(stateDir: string): void {
-  try {
-    if (!existsSync(stateDir)) mkdirSync(stateDir, { recursive: true });
-  } catch {
-    // fail-open
-  }
+  if (!existsSync(stateDir)) mkdirSync(stateDir, { recursive: true });
+  readdirSync(stateDir);
 }

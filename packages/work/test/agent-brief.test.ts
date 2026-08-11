@@ -1,3 +1,7 @@
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
@@ -60,9 +64,9 @@ test('renderBrief leaves template text alone when it holds no tokens', () => {
 });
 
 test('buildOwenloopMcp emits the born-bound work-holder argv', () => {
-  assert.deepEqual(buildOwenloopMcp(spec({ shiftId: 'shf_abc' })), {
-    command: 'owenloop',
-    args: ['work', 
+  assert.deepEqual(buildOwenloopMcp(spec({ shiftId: 'shf_abc' }), '/same/bin/owenloop.mjs', '/same/node'), {
+    command: '/same/node',
+    args: ['/same/bin/owenloop.mjs', 'work',
       'hold',
       '--order',
       'wf1/run_11111111',
@@ -74,6 +78,29 @@ test('buildOwenloopMcp emits the born-bound work-holder argv', () => {
       '--mcp',
     ],
   });
+});
+
+test('buildOwenloopMcp cannot be hijacked by a stale owenloop earlier on PATH', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-stale-path-'));
+  const marker = join(dir, 'stale-ran');
+  const fake = join(dir, 'owenloop');
+  try {
+    writeFileSync(fake, `#!/bin/sh\nprintf stale > "${marker}"\nexit 91\n`);
+    chmodSync(fake, 0o755);
+
+    const mount = buildOwenloopMcp(spec());
+    const entrypoint = mount.args[0]!;
+    const probe = spawnSync(mount.command, [entrypoint, '--version'], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${dir}:${process.env['PATH'] ?? ''}` },
+    });
+
+    assert.equal(probe.status, 0, probe.stderr);
+    assert.match(probe.stdout, /owenloop — a dataflow workflow engine/);
+    assert.equal(existsSync(marker), false, 'stale PATH executable ran');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('buildOwenloopMcp: --shift is ONE argv element, empty value when absent', () => {

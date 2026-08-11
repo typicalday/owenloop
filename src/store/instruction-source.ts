@@ -23,12 +23,13 @@ import { readWorkflowStoreIndex } from './index-file.ts';
 import {
   StoreIntegrityError,
   defDigest,
+	objectDirForDigest,
 } from './types.ts';
-import type { DefDigest } from './types.ts';
+import type { DefDigest, ResolutionLevel } from './types.ts';
 import {
   projectStoreRoot,
+	probeObjectDir,
   probeStoreRoot,
-  resolveWorkflowDigest,
   storeIndexPath,
 } from './resolve.ts';
 import type { BundleIngestor } from './install.ts';
@@ -67,12 +68,12 @@ interface CachedDefinition {
 
 /** A synchronous lookup source backed by verified local workflow-store objects. */
 export interface StoreInstructionSource extends OrderInstructionSource {
-  /** Load and verify the bundle that corresponds to an order projection digest. */
+  /** Load and verify the bundle that corresponds to an order or bundle digest. */
   prime(defDigest: string): Promise<'resolved' | 'unknown-digest'>;
   /** Return a step only after `prime(defDigest)` has resolved that digest. */
   getVerifiedStep(defDigest: string, step: string): StepDef | undefined;
-  /** Return the full verified definition cached by `prime`. */
-  getVerifiedDefinition(defDigest: string): WorkflowDef | undefined;
+  /** Return the full verified definition cached by `prime`, narrowed by step when a bundle contains several workflows. */
+  getVerifiedDefinition(defDigest: string, step?: string): WorkflowDef | undefined;
   /** Return the installed bundle identity and object path cached by `prime`. */
   getVerifiedObject(defDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined;
 }
@@ -85,17 +86,38 @@ function indexedBundleDigests(root: string): DefDigest[] {
     .sort((a, b) => a.localeCompare(b));
 }
 
-function uniqueRoots(projectRoot: string | undefined, globalRoot: string): string[] {
-  const roots = projectRoot === undefined ? [globalRoot] : [projectRoot, globalRoot];
-  return [...new Set(roots.map((root) => projectStoreRoot(root)))];
-}
+async function verifiedCandidateObject(
+	root: string,
+	bundleDigest: DefDigest,
+	level: ResolutionLevel,
+	verifier: BundleIngestor,
+): Promise<string> {
+	if (probeStoreRoot(root) !== 'dir') {
+		throw new StoreIntegrityError(
+			'object-missing',
+			bundleDigest,
+			`${level}-level workflow store is absent`,
+		);
+	}
 
-function candidateDigests(projectRoot: string | undefined, globalRoot: string): DefDigest[] {
-  const all = new Set<DefDigest>();
-  for (const root of uniqueRoots(projectRoot, globalRoot)) {
-    for (const digest of indexedBundleDigests(root)) all.add(digest);
-  }
-  return [...all].sort((a, b) => a.localeCompare(b));
+	const objectPath = objectDirForDigest(root, bundleDigest);
+	if (probeObjectDir(objectPath, bundleDigest, level) !== 'dir') {
+		throw new StoreIntegrityError(
+			'object-missing',
+			bundleDigest,
+			`${level}-level index references a missing workflow object`,
+		);
+	}
+	try {
+		await verifier.verifyInstalledObject({ objectDir: objectPath, digest: bundleDigest });
+	} catch (error) {
+		throw new StoreIntegrityError(
+			'object-corrupt',
+			bundleDigest,
+			`${level}-level object failed verification: ${(error as Error).message}`,
+		);
+	}
+	return objectPath;
 }
 
 function asDefDigest(raw: string): DefDigest | undefined {
@@ -109,21 +131,21 @@ function asDefDigest(raw: string): DefDigest | undefined {
 export function createStoreInstructionSource(args: StoreInstructionSourceArgs): StoreInstructionSource {
   const projectRoot = args.projectRoot === undefined ? undefined : projectStoreRoot(args.projectRoot);
   const globalRoot = projectStoreRoot(args.globalRoot);
-  const cache = new Map<string, CachedDefinition>();
+  const cache = new Map<string, CachedDefinition[]>();
   const inFlight = new Map<string, Promise<'resolved' | 'unknown-digest'>>();
 
-  const loadCandidate = async (requestedDigest: string, bundleDigest: DefDigest): Promise<boolean> => {
-    const resolved = await resolveWorkflowDigest({
-      digest: bundleDigest,
-      projectRoot,
-      globalRoot,
-      verifier: args.verifier,
-    });
-    const manifestPath = join(resolved.objectPath, 'bundle.yaml');
+	const loadCandidate = async (
+		requestedDigest: string,
+		bundleDigest: DefDigest,
+		root: string,
+		level: ResolutionLevel,
+	): Promise<boolean> => {
+		const objectPath = await verifiedCandidateObject(root, bundleDigest, level, args.verifier);
+		const manifestPath = join(objectPath, 'bundle.yaml');
     const manifest = parseManifestBytes(readFileSync(manifestPath));
     const loaded = new Map<string, WorkflowDef>();
     for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
-      const def = loadDefFile(join(resolved.objectPath, workflowPath));
+			const def = loadDefFile(join(objectPath, workflowPath));
       if (def.name !== workflowName) {
         throw new StoreIntegrityError(
           'object-corrupt',
@@ -134,47 +156,145 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       loaded.set(def.name, def);
     }
     const finalized = finalizeDefs(loaded);
+
+    // Hub-backed orders use the immutable bundle digest as their execution
+    // identity. Keep every workflow from that exact verified object in the
+    // cache; the later step lookup selects a unique definition and refuses an
+    // ambiguous step name instead of choosing one by manifest order.
+    if (requestedDigest === bundleDigest) {
+      cache.set(requestedDigest, [...finalized.values()].map((def) => ({
+	def,
+	bundleDigest,
+				objectPath,
+      })));
+      return true;
+    }
+
+    // Plain-YAML/local-engine orders retain the per-definition projection
+    // digest path for backwards compatibility.
     for (const def of finalized.values()) {
       if (defInstructionDigest(def) === requestedDigest) {
-        cache.set(requestedDigest, { def, bundleDigest, objectPath: resolved.objectPath });
+				cache.set(requestedDigest, [{ def, bundleDigest, objectPath }]);
         return true;
       }
     }
     return false;
   };
 
-  const attemptCandidate = async (
-    requestedDigest: string,
-    bundleDigest: DefDigest,
-  ): Promise<{ matched?: boolean; error?: unknown }> => {
-    try {
-      return { matched: await loadCandidate(requestedDigest, bundleDigest) };
-    } catch (error) {
-      return { error };
-    }
-  };
+	const candidateFailureForRefusal = (error: unknown): unknown =>
+		error instanceof StoreIntegrityError && error.code === 'object-missing' ? undefined : error;
 
-  const candidateFailureForRefusal = (error: unknown): unknown =>
-    error instanceof StoreIntegrityError && error.code === 'object-missing' ? undefined : error;
+	const scanTier = async (
+    requestedDigest: string,
+		bundleDigests: DefDigest[],
+		root: string,
+		level: ResolutionLevel,
+	): Promise<{ matched: boolean; firstFailure: unknown; inspectedCleanCandidate: boolean }> => {
+		let firstFailure: unknown;
+		let inspectedCleanCandidate = false;
+		for (const bundleDigest of bundleDigests) {
+			try {
+				if (await loadCandidate(requestedDigest, bundleDigest, root, level)) {
+					return { matched: true, firstFailure, inspectedCleanCandidate: true };
+				}
+				inspectedCleanCandidate = true;
+			} catch (error) {
+				firstFailure ??= candidateFailureForRefusal(error);
+			}
+    }
+		return { matched: false, firstFailure, inspectedCleanCandidate };
+  };
 
   const primeOnce = async (requestedDigest: string): Promise<'resolved' | 'unknown-digest'> => {
     if (cache.has(requestedDigest)) return 'resolved';
 
-    // Indexes can retain stale or damaged sibling objects. A candidate failure
-    // must not prevent a later, clean object from satisfying the requested
-    // projection digest. Keep the first non-missing failure only for the case
-    // where no candidate could be loaded cleanly; otherwise the requested
-    // digest is genuinely unknown among the candidates we could inspect.
-    let firstCandidateFailure: unknown;
-    let inspectedCleanCandidate = false;
-    for (const bundleDigest of candidateDigests(projectRoot, globalRoot)) {
-      const outcome = await attemptCandidate(requestedDigest, bundleDigest);
-      const candidateError = outcome.error;
-      if (candidateError !== undefined) firstCandidateFailure ??= candidateFailureForRefusal(candidateError);
-      inspectedCleanCandidate ||= candidateError === undefined;
-      if (candidateError === undefined && outcome.matched === true) return 'resolved';
+    /**
+     * A bundle identity is already content-addressed: only an index row carrying
+     * that exact digest is a candidate. Missing exact objects are stale rows and
+     * may fall through; corrupt exact objects remain hard integrity refusals.
+     */
+    const loadExactIndexed = async (
+      bundleDigests: DefDigest[],
+      root: string,
+      level: ResolutionLevel,
+    ): Promise<boolean> => {
+      const exact = asDefDigest(requestedDigest);
+      if (exact === undefined || !bundleDigests.includes(exact)) return false;
+      try {
+	return await loadCandidate(requestedDigest, exact, root, level);
+      } catch (error) {
+	if (error instanceof StoreIntegrityError && error.code === 'object-missing') return false;
+	throw error;
+      }
+    };
+
+    const projectDigests = projectRoot === undefined
+      ? undefined
+      : indexedBundleDigests(projectRoot);
+    if (
+      projectRoot !== undefined &&
+      projectDigests !== undefined &&
+      await loadExactIndexed(projectDigests, projectRoot, 'project')
+    ) {
+      return 'resolved';
     }
-    if (firstCandidateFailure !== undefined && !inspectedCleanCandidate) throw firstCandidateFailure;
+
+    if (projectRoot === globalRoot && projectDigests !== undefined) {
+      const projectOutcome = await scanTier(
+	requestedDigest,
+	projectDigests,
+	projectRoot,
+	'project',
+      );
+      if (projectOutcome.matched) return 'resolved';
+      if (projectOutcome.firstFailure !== undefined && !projectOutcome.inspectedCleanCandidate) {
+	throw projectOutcome.firstFailure;
+      }
+      return 'unknown-digest';
+    }
+
+    // Probe an exact global identity before scanning unrelated project bundles.
+    // A corrupt global index is deferred until after the project projection scan,
+    // so a clean project projection still resolves without global availability.
+    let globalDigests: DefDigest[] | undefined;
+    let globalIndexFailure: unknown;
+    try {
+      globalDigests = indexedBundleDigests(globalRoot);
+    } catch (error) {
+      globalIndexFailure = error;
+    }
+    if (
+      globalDigests !== undefined &&
+      await loadExactIndexed(globalDigests, globalRoot, 'global')
+    ) {
+      return 'resolved';
+    }
+
+    // Projection digests predate bundle identities, so every indexed bundle is a
+    // candidate. Preserve project-first precedence and integrity behavior for
+    // this legacy path after exact identities have been ruled out.
+    if (projectRoot !== undefined && projectDigests !== undefined) {
+      const projectOutcome = await scanTier(
+	requestedDigest,
+	projectDigests,
+	projectRoot,
+	'project',
+      );
+      if (projectOutcome.matched) return 'resolved';
+      if (projectOutcome.firstFailure !== undefined) throw projectOutcome.firstFailure;
+    }
+
+    if (globalIndexFailure !== undefined) throw globalIndexFailure;
+    const globalOutcome = await scanTier(
+      requestedDigest,
+      globalDigests ?? [],
+      globalRoot,
+      'global',
+    );
+    if (globalOutcome.matched) return 'resolved';
+    if (globalOutcome.firstFailure !== undefined && !globalOutcome.inspectedCleanCandidate) {
+      throw globalOutcome.firstFailure;
+    }
     return 'unknown-digest';
   };
 
@@ -203,6 +323,16 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     return operation;
   };
 
+  const definitionsForStep = (requestedDigest: string, stepName: string): CachedDefinition[] =>
+    cache.get(requestedDigest)?.filter(
+      (candidate) => candidate.def.steps.some((step) => step.name === stepName),
+    ) ?? [];
+
+  const definitionForStep = (requestedDigest: string, stepName: string): CachedDefinition | undefined => {
+    const matches = definitionsForStep(requestedDigest, stepName);
+    return matches.length === 1 ? matches[0] : undefined;
+  };
+
   return {
     digestOf: (_def: WorkflowDef): string => {
       throw new StoreInstructionSourceError(
@@ -210,8 +340,11 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       );
     },
     lookup: (ref: OrderInstructionRef): OrderInstructionLookup => {
-      const cached = cache.get(ref.defDigest);
-      if (cached === undefined) return { status: 'unknown-digest' };
+      if (!cache.has(ref.defDigest)) return { status: 'unknown-digest' };
+      const matches = definitionsForStep(ref.defDigest, ref.step);
+      if (matches.length === 0) return { status: 'unknown-step' };
+      if (matches.length > 1) return { status: 'ambiguous-step' };
+      const cached = matches[0]!;
       const step = cached.def.steps.find((candidate) => candidate.name === ref.step);
       if (step === undefined) return { status: 'unknown-step' };
       return {
@@ -225,12 +358,19 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
     },
     prime,
     getVerifiedStep: (requestedDigest: string, stepName: string): StepDef | undefined => {
-      const cached = cache.get(requestedDigest);
+      const cached = definitionForStep(requestedDigest, stepName);
       return cached?.def.steps.find((step) => step.name === stepName);
     },
-    getVerifiedDefinition: (requestedDigest: string): WorkflowDef | undefined => cache.get(requestedDigest)?.def,
+    getVerifiedDefinition: (requestedDigest: string, stepName?: string): WorkflowDef | undefined => {
+      const cached = stepName === undefined
+	? cache.get(requestedDigest)
+	: [definitionForStep(requestedDigest, stepName)].filter(
+	  (candidate): candidate is CachedDefinition => candidate !== undefined,
+	);
+      return cached?.length === 1 ? cached[0]!.def : undefined;
+    },
     getVerifiedObject: (requestedDigest: string): { bundleDigest: DefDigest; objectPath: string } | undefined => {
-      const cached = cache.get(requestedDigest);
+      const cached = cache.get(requestedDigest)?.[0];
       return cached === undefined ? undefined : { bundleDigest: cached.bundleDigest, objectPath: cached.objectPath };
     },
   };

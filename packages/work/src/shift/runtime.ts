@@ -9,18 +9,24 @@
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { basename, join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 
 import { createHubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createShiftLoop } from './loop.ts';
-import { createDefaultSpawner } from './spawn.ts';
+import { createDefaultSpawner, type WorkerFailure } from './spawn.ts';
 import { resolveStateDir, ensureStateDir, reconcileInFlight } from './state.ts';
 import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.ts';
 import { resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
 import { installSignalHandlers, type SignalHost } from '../roles/signals.ts';
 import { createShiftDaemon, type ShiftDaemon } from './server.ts';
+import {
+  createBundleIngestor,
+  createStoreInstructionSource,
+  globalStoreRoot,
+} from '../../../../src/store/index.ts';
 
 // Re-exported so existing importers keep their import site while the
 // implementation lives in the shared signals seam.
@@ -168,6 +174,16 @@ export interface ShiftRuntimeOptions {
   socketPath?: string;
 }
 
+/** Public Shift daemon transport is a Unix-domain socket on macOS and Linux. */
+export function assertShiftDaemonPlatform(platform: NodeJS.Platform = process.platform): void {
+  if (platform === 'win32') {
+    throw new Error(
+      'the public Shift daemon is not supported on Windows: Windows named-pipe transport is not implemented; ' +
+      'use `owenloop work shift` directly',
+    );
+  }
+}
+
 /**
  * Shared runtime setup for the internal shift and public shift daemon.
  * `parsed` is already grammar-validated by the caller; this function owns all
@@ -177,6 +193,14 @@ export interface ShiftRuntimeOptions {
 export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeOptions = {}): Promise<number> {
   const daemonMode = options.daemon === true;
   const roleLabel = options.role === 'shift' ? 'owenloop shift' : 'owenloop work shift';
+  if (daemonMode) {
+    try {
+      assertShiftDaemonPlatform();
+    } catch (error) {
+      process.stderr.write(`${roleLabel}: ${errMsg(error)}\n`);
+      return 1;
+    }
+  }
   const env = process.env;
   let settings;
   try {
@@ -215,7 +239,12 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     return 1;
   }
 
-  ensureStateDir(stateDir);
+  try {
+    ensureStateDir(stateDir);
+  } catch (err) {
+    process.stderr.write(`${roleLabel}: cannot initialize dispatch state at ${stateDir}: ${errMsg(err)}\n`);
+    return 1;
+  }
   {
     const liveRunIds = new Set(
       reconcileInFlight(stateDir).live.filter((r) => r.kind === 'agent-run').map((r) => r.run),
@@ -240,18 +269,58 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   const workRepo = resolveWorkRepo(env, settings.workRepo);
   const hub = createHubClient({ origin, getToken: async () => token });
   const now = () => Date.now();
+  const monotonicNow = () => performance.now();
+  const home = [env.HOME, env.USERPROFILE].find(
+    (value) => value !== undefined && value.trim() !== '',
+  );
+  // Legacy orders and modern agent orders do not need Shift-side instruction
+  // lookup. Keep serving those lanes without a home directory; a modern command
+  // order still fails closed because its exact digest cannot be resolved.
+  const instructionSource = home === undefined
+    ? undefined
+    : createStoreInstructionSource({
+	projectRoot: join(process.cwd(), 'workflows'),
+	globalRoot: globalStoreRoot(home),
+	verifier: createBundleIngestor(),
+      });
+  const resolveOrderStep = async (order: { defDigest?: string; step: string }) => {
+    if (
+      instructionSource === undefined ||
+      order.defDigest === undefined ||
+      order.defDigest.trim() === ''
+    ) return undefined;
+    if (await instructionSource.prime(order.defDigest) !== 'resolved') return undefined;
+    return instructionSource.getVerifiedStep(order.defDigest, order.step);
+  };
   const shiftId = `shf_${randomUUID()}`;
   const startedAt = now();
   const name = resolveShiftName(parsed.name, { shiftId });
-  const spawner = createDefaultSpawner(origin, account, undefined, shiftId);
+  let daemon: ShiftDaemon | undefined;
+  const reportWorkerFailure = (failure: WorkerFailure): void => {
+    const event = {
+      type: 'failed' as const,
+      workflow: failure.workflow,
+      run: failure.run,
+      step: failure.step ?? '(unknown)',
+      kind: failure.kind,
+      ...(failure.harness !== undefined ? { harness: failure.harness } : {}),
+      executable: failure.executable,
+      exitStatus: failure.exitStatus,
+      signal: failure.signal,
+      message: failure.message,
+    };
+    daemon?.onEvent(event);
+    process.stderr.write(`${roleLabel}: worker failure ${JSON.stringify(event)}\n`);
+  };
+  const spawner = createDefaultSpawner(origin, account, undefined, shiftId, reportWorkerFailure);
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 
-  let daemon: ShiftDaemon | undefined;
   const loop = createShiftLoop({
     hub,
     spawner,
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     now,
+    monotonicNow,
     out: (line) => process.stdout.write(`${line}\n`),
     err: (line) => process.stderr.write(`${line}\n`),
     ...(daemonMode ? { onEvent: (event) => daemon?.onEvent(event) } : {}),
@@ -261,6 +330,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     serveCrews: parsed.serveCrews ?? [],
     name,
     commandRouting: settings.commandRouting,
+    resolveOrderStep,
     pollIntervalMs,
     presenceIntervalMs: DEFAULT_PRESENCE_MS,
     maxConcurrentAgents,

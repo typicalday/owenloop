@@ -14,7 +14,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -97,31 +97,31 @@ test('concurrent refresh: only one HTTP refresh happens; the loser adopts the ro
   const stored = persistedHuman(t.store);
   assert.equal(stored.kind, 'oauth');
   assert.equal((stored as Extract<Credential, { kind: 'oauth' }>).refreshToken, 'refresh_1');
-  // The lock is released, not leaked.
-  assert.equal(existsSync(lockPathFor(t.io.env)), false);
+  // The SQLite transaction is released; the persistent database remains reusable.
+  assert.equal(existsSync(lockPathFor(t.io.env)), true);
 });
 
-// ---- 2. Stale lock is reclaimed ---------------------------------------------
+// ---- 2. Legacy lockfiles fail closed ----------------------------------------
 
-test('a stale (old-mtime, unparseable) lockfile is reclaimed, then released', async () => {
+test('an old unparseable legacy lockfile is never reclaimed automatically', async () => {
   const { fetch, calls } = routedFetch(tokenRoutes());
-  const t = makeIo({ fetch, env: { OWENLOOP_CRED_LOCK_STALE_MS: '50', OWENLOOP_CRED_LOCK_POLL_MS: '5' } });
+  const t = makeIo({
+    fetch,
+    env: { OWENLOOP_CRED_LOCK_WAIT_MS: '60', OWENLOOP_CRED_LOCK_STALE_MS: '0', OWENLOOP_CRED_LOCK_POLL_MS: '5' },
+  });
   const seed = nearExpiryOauth();
   await storeCredential(t.io, ORIGIN, HUMAN, seed);
 
-  // Pre-plant a garbage (pid-less, unparseable) lockfile with a backdated mtime,
-  // so age is the only abandonment signal and it is past the tiny stale TTL.
   const lockPath = lockPathFor(t.io.env);
   mkdirSync(configDir(t.io.env), { recursive: true });
   writeFileSync(lockPath, 'garbage-not-json');
-  const old = (nowMs() - 10_000) / 1000; // seconds, 10s ago ≫ 50ms stale TTL
-  utimesSync(lockPath, old, old);
 
-  const out = await ensureFreshOAuth(t.io, ORIGIN, HUMAN, seed);
-
-  assert.equal(out.accessToken, 'access_1'); // it refreshed (reclaimed the lock)
-  assert.equal(tokenPosts(calls), 1);
-  assert.equal(existsSync(lockPath), false); // reclaimed then released
+  await assert.rejects(
+    ensureFreshOAuth(t.io, ORIGIN, HUMAN, seed),
+    /legacy lockfile.*remove it manually/u,
+  );
+  assert.equal(tokenPosts(calls), 0, 'credential refresh never runs without the writer lock');
+  assert.equal(readFileSync(lockPath, 'utf8'), 'garbage-not-json');
 });
 
 // ---- 3. A live, held lock times out cleanly (no unlocked fallback) -----------
@@ -182,16 +182,17 @@ test('persist:false performs the HTTP refresh but never touches the store or ado
   const stored = nearExpiryOauth({ accessToken: 'access_stored', refreshToken: 'refresh_stored', expiresAt: nowMs() + 3_600_000 });
   await storeCredential(t.io, ORIGIN, HUMAN, stored);
   const before = t.store.get(kcHuman(ORIGIN));
+  const ownerPath = `${lockPathFor(t.io.env)}.owner.json`;
+  const ownerBefore = readFileSync(ownerPath, 'utf8');
 
   const other = nearExpiryOauth({ accessToken: 'access_other', refreshToken: 'refresh_other' });
   const out = await refreshOAuth(t.io, ORIGIN, HUMAN, other, false);
 
   assert.equal(out.accessToken, 'access_1'); // it refreshed `other`, did not adopt
   assert.equal(tokenPosts(calls), 1);
-  // The store is byte-identical — persist:false wrote nothing.
+  // The store and lock diagnostics are byte-identical — persist:false took no writer lock and wrote nothing.
   assert.equal(t.store.get(kcHuman(ORIGIN)), before);
-  // And no lockfile was ever created (unlocked path).
-  assert.equal(existsSync(lockPathFor(t.io.env)), false);
+  assert.equal(readFileSync(ownerPath, 'utf8'), ownerBefore);
 });
 
 // ---- 6. storeCredential / deleteCredential: async, locked, slot-merging ------
@@ -211,14 +212,14 @@ test('storeCredential/deleteCredential are async, lock-and-release, and merge sl
   assert.deepEqual(pub.readStoredCredential(ORIGIN, { ...HUMAN, env: t.io.env }), human);
   assert.deepEqual(pub.readStoredCredential(ORIGIN, { ...AGENT_CI, env: t.io.env }), agent);
   // The lock is released after each write, never leaked.
-  assert.equal(existsSync(lockPathFor(t.io.env)), false);
+  assert.equal(existsSync(lockPathFor(t.io.env)), true, 'the released SQLite lock database persists');
 
   // Delete is async and locked too; only the named slot goes.
   const removed = await deleteCredential(t.io, ORIGIN, AGENT_CI);
   assert.equal(removed, true);
   assert.equal(pub.readStoredCredential(ORIGIN, { ...AGENT_CI, env: t.io.env }), null);
   assert.deepEqual(pub.readStoredCredential(ORIGIN, { ...HUMAN, env: t.io.env }), human); // sibling survives
-  assert.equal(existsSync(lockPathFor(t.io.env)), false);
+  assert.equal(existsSync(lockPathFor(t.io.env)), true, 'the released SQLite lock database persists');
 });
 
 // ---- 7. Barrel resolution ----------------------------------------------------

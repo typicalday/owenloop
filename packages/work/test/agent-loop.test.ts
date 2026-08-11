@@ -19,6 +19,7 @@ import {
   type AgentRunLoopOptions,
 } from '../src/agent/loop.ts';
 import { ACCOUNT_TOKEN, SHIFT_TOKEN, ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
+import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 import { createFakeAdapter } from '../src/harness/fake.ts';
 import { createModelPolicy } from '../src/agent/model-policy.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
@@ -209,6 +210,9 @@ interface BuildOpts {
   shiftId?: string;
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
   modelPolicy?: AgentRunLoopOptions['modelPolicy'];
+  appendSession?: AgentRunLoopOptions['appendSession'];
+  latestSession?: AgentRunLoopOptions['latestSession'];
+  dirExists?: AgentRunLoopOptions['dirExists'];
 }
 
 function buildOpts(b: BuildOpts): Harnessed {
@@ -230,7 +234,9 @@ function buildOpts(b: BuildOpts): Harnessed {
     resolveAdapter: () => resolution,
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
     ...(b.modelPolicy === undefined ? {} : { modelPolicy: b.modelPolicy }),
-    appendSession: (rec) => records.push(rec),
+    appendSession: b.appendSession ?? ((rec) => records.push(rec)),
+    ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
+    ...(b.dirExists === undefined ? {} : { dirExists: b.dirExists }),
     nextAttempt: () => 3,
     sleep: macrotaskSleep,
     now: () => 1_000,
@@ -309,8 +315,8 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
   );
   assert.equal(start.args.cwd, '/repo/wt');
   assert.deepEqual(start.args.owenloopMcp, {
-    command: 'owenloop',
-    args: ['work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'acct-1', '--shift=shf_1', '--mcp'],
+    command: process.execPath,
+    args: [resolveOwenloopBin(), 'work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'acct-1', '--shift=shf_1', '--mcp'],
   });
   // Permissions arrive PRE-NORMALIZED on the step spec — `prepare` already ran
   // `normalizeStepPermissions` over `x.harness`, so this loop passes them
@@ -515,6 +521,108 @@ test('start() rejecting as unresumable is a cold-start failure: dead, released, 
   assert.equal(h.records[0]!.token, '');
   assert.ok(h.errs.some((l) => l.includes('could not resume the session')));
   assert.ok(verbs(calls).includes('release'));
+});
+
+test('cold start requires a durable active row before provider work', async () => {
+  const ref: HarnessSessionRef = { harness: 'fake', token: 'cold-session' };
+  let providerWorkStarted = false;
+  const stops: HarnessSessionRef[] = [];
+  const adapter: HarnessAdapter = {
+    id: 'fake',
+    resumeTier: 'native-token',
+    preflight: () => [],
+    async start(_args, onEvent) {
+      onEvent({ kind: 'started', ref });
+      providerWorkStarted = true;
+      return ref;
+    },
+    async deliver() {
+      assert.fail('cold-start persistence failure must not deliver');
+    },
+    async stop(target) {
+      stops.push(target);
+    },
+  };
+  const { hub, calls } = mockHub({ getOrder: [agentOrder()] });
+  const attemptedStatuses: string[] = [];
+  const h = buildOpts({
+    hub,
+    adapter,
+    appendSession: (record) => {
+      attemptedStatuses.push(record.status);
+      if (record.status === 'active') throw new Error('active fsync failed');
+    },
+  });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'session-store-failed');
+  assert.equal(providerWorkStarted, false);
+  assert.deepEqual(attemptedStatuses, ['active']);
+  assert.deepEqual(stops, [ref]);
+  assert.equal(verbs(calls).filter((verb) => verb === 'release').length, 1);
+  assert.equal(verbs(calls).filter((verb) => verb === 'get_order').length, 1, 'the confirm phase never starts');
+  assert.ok(h.errs.some((line) => line.includes('durable active-session persistence failed before provider delivery')));
+});
+
+test('resume requires a durable active row before provider delivery', async () => {
+  const previous: SessionRecord = {
+    workflow: 'wf1',
+    run: 'run1',
+    step: 'builder',
+    order: 'wf1/run1',
+    attempt: 2,
+    harness: 'fake',
+    token: 'resume-session',
+    cwd: '/fallback/cwd',
+    status: 'turn-ended',
+    createdAt: 500,
+    deliveredReasonAt: 10,
+    updatedAt: 800,
+  };
+  const first = agentOrder({ owes: [{ path: 'out' }] });
+  assert.ok(first.order !== null);
+  first.order.owes[0]!.reasons = [{
+    at: 20,
+    action: 'reject',
+    kind: 'judgment',
+    by: 'reviewer',
+    text: 'revise the output',
+  }];
+  let deliveries = 0;
+  const stops: HarnessSessionRef[] = [];
+  const adapter: HarnessAdapter = {
+    id: 'fake',
+    resumeTier: 'native-token',
+    preflight: () => [],
+    async start() {
+      assert.fail('a resumable session must not cold-start');
+    },
+    async deliver() {
+      deliveries += 1;
+    },
+    async stop(target) {
+      stops.push(target);
+    },
+  };
+  const { hub, calls } = mockHub({ getOrder: [first] });
+  const attemptedStatuses: string[] = [];
+  const h = buildOpts({
+    hub,
+    adapter,
+    latestSession: () => previous,
+    dirExists: () => true,
+    consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
+    appendSession: (record) => {
+      attemptedStatuses.push(record.status);
+      if (record.status === 'active') throw new Error('resume active fsync failed');
+    },
+  });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'session-store-failed');
+  assert.equal(deliveries, 0);
+  assert.deepEqual(attemptedStatuses, ['active']);
+  assert.deepEqual(stops, [{ harness: 'fake', token: 'resume-session' }]);
+  assert.equal(verbs(calls).filter((verb) => verb === 'release').length, 1);
+  assert.equal(verbs(calls).filter((verb) => verb === 'get_order').length, 1, 'the confirm phase never starts');
 });
 
 test('the confirm poll treats a lost claim as lease-lost and does NOT release', async () => {

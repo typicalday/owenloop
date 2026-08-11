@@ -72,6 +72,16 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     };
   }
 
+  function retryAfterMs(res: Response): number | undefined {
+    const raw = res.headers.get('retry-after')?.trim();
+    if (!raw) return undefined;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+    const at = Date.parse(raw);
+    if (!Number.isFinite(at)) return undefined;
+    return Math.max(0, at - Date.now());
+  }
+
   async function parse<T>(res: Response): Promise<T> {
     const raw = await res.text();
     if (!res.ok) {
@@ -86,7 +96,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
       } catch {
         // Not JSON — keep the raw text as the message.
       }
-      throw new HubError(res.status, message, code);
+      throw new HubError(res.status, message, code, retryAfterMs(res));
     }
     return JSON.parse(raw) as T;
   }

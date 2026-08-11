@@ -31,9 +31,10 @@ const ORDER: OrderPacket = {
   owes: [
     {
       path: 'result',
+      version: 4,
       judgmentRejects: 0,
       schemaRejects: 1,
-      reasons: [{ at: 10, action: 'schema-reject', kind: 'validation', by: 'engine', text: 'bad shape', fromVersion: 4 }],
+      reasons: [{ at: 10, action: 'schema-reject', kind: 'validation', by: 'engine', text: 'bad shape', fromVersion: 99 }],
     },
   ],
 };
@@ -64,13 +65,14 @@ afterEach(() => {
   resetSshKeygenProbe();
 });
 
-test('buildSubmitProof signs at the driver boundary over the original submitted value', async () => {
+test('buildSubmitProof signs at the driver boundary over the original value when the hub supplies the target version', async () => {
   const calls: Array<{ cmd: string; args: string[]; stdin?: Buffer }> = [];
   const proof = await buildSubmitProof({
     origin: ORIGIN,
     order: ORDER,
     path: 'result',
     value: { z: 2, a: ['unicode-雪'] },
+    version: 5,
     now: () => 1234,
     warn: () => {},
     principalKeys: keysFor(),
@@ -127,6 +129,31 @@ test('buildSubmitProof uses an explicit committed version when provided', async 
   assert.equal(record.produced[0]!.version, 9);
 });
 
+test('buildSubmitProof falls back unsigned when a producer has only immutable claim-time version metadata', async () => {
+  const warnings: string[] = [];
+  let signingCalls = 0;
+  const proof = await buildSubmitProof({
+    origin: ORIGIN,
+    order: ORDER,
+    path: 'result',
+    value: { ok: true },
+    now: () => 1,
+    warn: (line) => warnings.push(line),
+    principalKeys: {
+      ...keysFor(),
+      withSigningKey: async () => {
+	signingCalls += 1;
+	throw new Error('withSigningKey must not run');
+      },
+    },
+    sshProcess: fakeSshProcess([]),
+  });
+  assert.equal(proof, undefined);
+  assert.equal(signingCalls, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /omitted authoritative version metadata/);
+});
+
 test('buildSubmitProof refuses a proof when consumed inputs have no fingerprint', async () => {
   const warnings: string[] = [];
   const omittedFingerprint = { ...ORDER, consumedFingerprint: undefined };
@@ -136,6 +163,7 @@ test('buildSubmitProof refuses a proof when consumed inputs have no fingerprint'
     order: omittedFingerprint,
     path: 'result',
     value: { ok: true },
+    version: 5,
     now: () => 1,
     warn: (line) => warnings.push(line),
     principalKeys: {
@@ -160,6 +188,7 @@ test('buildSubmitProof signs an explicitly empty fingerprint only for an order w
     order: emptyOrder,
     path: 'result',
     value: { ok: true },
+    version: 5,
     now: () => 1,
     warn: () => {},
     principalKeys: keysFor(),
@@ -182,6 +211,7 @@ test('buildSubmitProof warns once and falls back unsigned when the machine key i
     order: ORDER,
     path: 'result',
     value: { ok: true },
+    version: 5,
     now: () => 1,
     warn: (line: string) => warnings.push(line),
     principalKeys: {
@@ -207,6 +237,7 @@ test('buildSubmitProof treats missing HOME as an absent-key fallback', async () 
     order: ORDER,
     path: 'result',
     value: { ok: true },
+    version: 5,
     now: () => 1,
     warn: (line) => warnings.push(line),
     env: {},
