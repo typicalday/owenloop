@@ -232,10 +232,11 @@ const OWENLOOP_ONLY_NETWORK_TOOLS = new Set([
  *  unrestricted-network readers. */
 const READ_ONLY_OWENLOOP_ONLY_NETWORK_TOOLS = [...READ_ONLY_TOOLS]
   .filter((tool) => OWENLOOP_ONLY_NETWORK_TOOLS.has(tool));
-const BORN_BOUND_OWENLOOP_TOOLS = [
-  'mcp__owenloop__get_order',
-  'mcp__owenloop__submit',
-] as const;
+const BORN_BOUND_OWENLOOP_TOOL_NAMES = ['get_order', 'submit'] as const;
+const BORN_BOUND_OWENLOOP_TOOLS = BORN_BOUND_OWENLOOP_TOOL_NAMES.map(
+  (name) => `mcp__owenloop__${name}`,
+);
+const RESTRICTED_OWENLOOP_DENIED_TOOLS = ['mcp__owenloop__reject'] as const;
 const OWENLOOP_CONTROL_TOOLS = new Set([
   ...BORN_BOUND_OWENLOOP_TOOLS,
   'mcp__plugin_owenloop_owenloop__get_order',
@@ -336,6 +337,16 @@ function owenloopMount(mount: { command: string; args: string[] }): McpServerCon
   return { type: 'stdio', command: mount.command, args: mount.args, alwaysLoad: true };
 }
 
+/** Restricted sessions register a positive two-tool subset. The selector is
+ * derived from the same names used by `allowedTools`, so the declared exception
+ * and the MCP server's actual `tools/list` cannot drift within this adapter. */
+function restrictedOwenloopMount(mount: { command: string; args: string[] }): McpServerConfig {
+  return owenloopMount({
+    command: mount.command,
+    args: [...mount.args, `--mcp-tools=${BORN_BOUND_OWENLOOP_TOOL_NAMES.join(',')}`],
+  });
+}
+
 /**
  * `mcpServers`, with the owenloop mount layered ON TOP of whatever the step's
  * bag declared. An author's own `owenloop` entry is overwritten, exactly as the
@@ -394,7 +405,7 @@ export function buildClaudeOptions(
     env: extra.env,
     abortController: extra.abortController,
     mcpServers: isolated
-      ? { owenloop: owenloopMount(inputs.owenloopMcp) }
+      ? { owenloop: restrictedOwenloopMount(inputs.owenloopMcp) }
       : mergeMcpServers(permissions.extensions['mcpServers'], inputs.owenloopMcp),
     ...(isolated ? { settingSources: [], strictMcpConfig: true, skills: [] } : {}),
     stderr: (data: string) => {
@@ -454,6 +465,8 @@ export function buildClaudeOptions(
   // exception: the audited built-in list becomes explicit, and `allowedTools`
   // also auto-allows the born-bound get_order/submit MCP tools so the restricted
   // agent can inspect and finish its order without an unattended permission prompt.
+  // The restricted MCP child itself registers exactly those two tools; allowedTools
+  // is permission automation, not an MCP visibility filter.
   let effectiveTools = permissions.tools;
   if (effectiveTools === undefined && permissions.filesystem === 'read-only') {
     // Filesystem and network are independent. A read-only filesystem still gets
@@ -470,7 +483,17 @@ export function buildClaudeOptions(
       ...new Set([...effectiveTools, ...BORN_BOUND_OWENLOOP_TOOLS]),
     ];
   }
-  if (permissions.disallowedTools !== undefined) {
+  if (isolated) {
+    // Defense in depth only: the restricted MCP child does not register `reject`
+    // at all. The deny protects against SDK/tool-surface regressions without being
+    // the visibility boundary.
+    options.disallowedTools = [
+      ...new Set([
+	...(permissions.disallowedTools ?? []),
+	...RESTRICTED_OWENLOOP_DENIED_TOOLS,
+      ]),
+    ];
+  } else if (permissions.disallowedTools !== undefined) {
     options.disallowedTools = [...permissions.disallowedTools];
   }
   // Normalization already guaranteed a positive integer or absence.
@@ -495,9 +518,11 @@ export function buildClaudeOptions(
   // that warns about them.
   //
   // Outside isolation, `settingSources` and `strictMcpConfig` stay unset so the
-  // SDK preserves its normal settings and MCP behavior. Isolation sets
-  // `settingSources: []` and `strictMcpConfig: true` above because settings,
-  // hooks, skills, or external MCP would bypass the authored restriction.
+  // SDK preserves its normal settings and MCP behavior, including the full
+  // get_order/submit/reject work-holder server. Isolation sets `settingSources: []`
+  // and `strictMcpConfig: true` above, mounts the positive two-tool work-holder
+  // subset, and removes settings, hooks, skills, or external MCP that could bypass
+  // the authored restriction.
   // `persistSession` always stays unset: its default is `true`, and disabling it
   // would break resume-on-rejection.
   return options;

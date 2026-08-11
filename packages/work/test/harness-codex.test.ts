@@ -687,9 +687,9 @@ const CASES: Case[] = [
   },
   {
     name: 'C10 neutral keys with no thread-start equivalent are dropped, not smuggled',
-    bag: { tools: ['Read', 'Edit'], disallowedTools: 'Bash', maxTurns: 40, effort: 'high' },
+    bag: { tools: ['Read', 'Edit'], disallowedTools: 'Bash', effort: 'high' },
     expect(p) {
-      for (const key of ['tools', 'disallowedTools', 'maxTurns', 'effort', 'permissions']) {
+      for (const key of ['tools', 'disallowedTools', 'effort', 'permissions']) {
         assert.equal(key in p, false, `${key} must not reach thread/start`);
       }
     },
@@ -731,6 +731,21 @@ test('C11 buildTurnStartParams wraps the text as a UserInput array', () => {
   });
   // An empty effort is omitted rather than sent as ''.
   assert.equal('effort' in buildTurnStartParams('th-1', 'hi', ''), false);
+});
+
+test('C10a Codex refuses maxTurns in preflight and direct start/resume parameter construction', () => {
+  const permissions = normalizeStepPermissions({ maxTurns: 40 });
+  const issues = codexAdapter.preflight(permissions);
+  assert.deepEqual(issues.map((issue) => issue.field), ['maxTurns']);
+  assert.match(issues[0]?.message ?? '', /maxTurns is unsupported.*no thread or turn limit parameter/);
+  assert.throws(
+    () => buildThreadStartParams({ ...deliverArgs(), permissions }),
+    /maxTurns is unsupported.*no thread or turn limit parameter/,
+  );
+  assert.throws(
+    () => buildThreadResumeParams('th-limited', { ...deliverArgs(), permissions }),
+    /maxTurns is unsupported.*no thread or turn limit parameter/,
+  );
 });
 
 test('C10b Codex refuses explicit neutral filesystem restrictions', () => {
@@ -1421,6 +1436,37 @@ test('D4 explicit filesystem restrictions refuse cold start and resume before pr
     assert.ok(resumeError instanceof Error);
     assert.match(resumeError.message, new RegExp(`filesystem '${c.filesystem}'.*unsupported`));
   }
+
+  assert.equal(stub.pid(), undefined, 'the app-server process must not start');
+  assert.deepEqual(stub.received(), []);
+});
+
+test('D4a maxTurns refuses direct cold start and resume before app-server process start', async (t) => {
+  const stub = useStub(t, 'refuse-initialize');
+  const bag = { maxTurns: 3 };
+
+  const startError = await codexAdapter
+    .start(startArgs(bag, { cwd: stub.dir }), () => {})
+    .then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+  assert.ok(startError instanceof Error);
+  assert.match(startError.message, /maxTurns is unsupported.*no thread or turn limit parameter/);
+
+  const resumeError = await codexAdapter
+    .deliver(
+      { harness: 'codex', token: 'th-limited' },
+      'continue',
+      deliverArgs(bag, { cwd: stub.dir }),
+      () => {},
+    )
+    .then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+  assert.ok(resumeError instanceof Error);
+  assert.match(resumeError.message, /maxTurns is unsupported.*no thread or turn limit parameter/);
 
   assert.equal(stub.pid(), undefined, 'the app-server process must not start');
   assert.deepEqual(stub.received(), []);

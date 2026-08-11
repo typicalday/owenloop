@@ -90,7 +90,7 @@ test('parseArgs validates every ms knob as a positive integer', () => {
 test('exitCodeFor maps every outcome to the documented code', () => {
   const zero: AgentRunOutcome[] = ['submitted', 'completed'];
   const one: AgentRunOutcome[] = [
-    'misroute', 'no-template', 'no-harness', 'unverified-consumed', 'no-submit',
+    'misroute', 'no-template', 'no-harness', 'incompatible-harness-policy', 'unverified-consumed', 'no-submit',
     'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'stopped',
   ];
   for (const o of zero) assert.equal(exitCodeFor(o), 0);
@@ -832,6 +832,53 @@ test('Codex filesystem refusal names the restriction and releases the held claim
       new RegExp(
 	`harness policy refusal.*codex.*filesystem '${filesystem}'.*unsupported.*configuration layers.*outside the thread sandbox`,
       ),
+    );
+  }
+});
+
+test('CLI and environment overrides selecting Codex refuse maxTurns, start nothing, release, and exit nonzero', async () => {
+  const authored = createFakeAdapter({ id: 'authored-max-turns' });
+  useAdapter(authored);
+  seedRawStep({ harness: { id: authored.id, maxTurns: 9 } });
+  process.env['OWENLOOP_CODEX_BIN'] = join(home, 'must-not-start');
+
+  const scenarios = [
+    {
+      name: '--harness',
+      args: [...WIRE, '--harness', 'codex'],
+      select: () => {
+	process.env['OWENLOOP_HARNESS'] = authored.id;
+      },
+    },
+    {
+      name: 'OWENLOOP_HARNESS',
+      args: WIRE,
+      select: () => {
+	process.env['OWENLOOP_HARNESS'] = 'codex';
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    scenario.select();
+    const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+    const err: string[] = [];
+    const code = await run(scenario.args, {
+      hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'host:123',
+      cwd: '/work',
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+
+    assert.equal(code, 1, scenario.name);
+    assert.deepEqual(authored.calls, [], `${scenario.name}: the authored adapter must not start`);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }], scenario.name);
+    assert.match(
+      err.join('\n'),
+      /harness policy refusal.*codex.*\(maxTurns\): maxTurns is unsupported.*no thread or turn limit parameter/,
+      scenario.name,
     );
   }
 });

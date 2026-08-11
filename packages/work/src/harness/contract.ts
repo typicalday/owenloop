@@ -129,13 +129,16 @@ export interface StartArgs {
   /** Per-start override for reasoning effort. Same precedence rule as `model`. */
   effort?: string;
   /**
-   * The stdio mount for owenloop's own work-holder MCP surface (bare
-   * `get_order`/`submit`).
+   * The stdio mount for owenloop's own born-bound work-holder MCP surface. The
+   * default server registers `get_order`, `submit`, and `reject`. An adapter that
+   * enforces a restricted session may append the hold role's positive selector so
+   * the mounted server registers only the policy's exact subset.
    *
    * BUILT BY THE WORKER, NOT BY AN ADAPTER: `src/agent/brief.ts` constructs the
    * born-bound `hold --order <workflow>/<run> --origin <url> --as <account>
-   * --shift=<cid> --mcp` argv from the live order. An adapter mounts it
-   * verbatim and never constructs it — the order id, origin, and account ride
+   * --shift=<cid> --mcp` argv from the live order. An adapter preserves the
+   * born-bound command and identity arguments; an adapter may append only a
+   * policy-owned tool-surface selector. The order id, origin, and account ride
    * argv, never the prompt.
    */
   owenloopMcp: { command: string; args: string[] };

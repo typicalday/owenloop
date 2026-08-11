@@ -101,13 +101,23 @@ about those keys, but unknown keys do not create a neutral security boundary.
 | `network: owenloop-only` | Enforced by isolating settings, skills, MCP, and built-in tools while retaining only the born-bound Owenloop control plane. | Refused. |
 | `network: unrestricted` | Supported. | Supported with `filesystem: unrestricted`, or with omitted `filesystem` and sandbox `workspace-write` or `danger-full-access`; refused with sandbox `read-only`. |
 | `permissionMode` | `default`, `acceptEdits`, `bypassPermissions`, `plan`, `dontAsk`, or `auto`. | `untrusted`, `on-request`, or `never`. |
-| `maxTurns` | Enforced. | Not mapped by the Codex adapter; do not author it for a Codex-selected step. |
+| `maxTurns` | Enforced. | Refused because Codex app-server has no thread or turn limit parameter. |
 | `model` | Supported. | Supported. |
 | `effort` | `low`, `medium`, `high`, `xhigh`, or `max`. | Passed to Codex `turn/start`; use a value supported by the selected Codex runtime. |
 
 The Claude Code adapter also refuses a `read-only` allow-list containing
 non-read-only tools, an `owenloop-only` allow-list containing network-capable or
 unaudited tools, and any policy that denies the required Owenloop control tools.
+For every restricted Claude Code cold start or resume, the mounted MCP child
+positively registers exactly `get_order` and `submit`. `allowedTools` only
+auto-allows calls; `allowedTools` does not remove registrations from MCP
+`tools/list`. The adapter also denies `mcp__owenloop__reject` as defense in depth.
+Outside Claude Code isolation, the default work-holder MCP child registers
+`get_order`, `submit`, and `reject`.
+
+Every defined Codex `maxTurns` value is refused before cold start or resume. The
+Codex adapter starts no app-server process, and `agent-run` releases the held
+claim and exits non-zero.
 
 ### Fail-closed rule
 

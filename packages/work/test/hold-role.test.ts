@@ -67,6 +67,20 @@ test('parseArgs flags --ignore-stdin and an unknown option', () => {
   assert.match(parseArgs(['--bogus']).error!, /unknown option '--bogus'/);
 });
 
+test('parseArgs reads and validates the positive MCP tool selector', () => {
+  assert.deepEqual(
+    parseArgs(['--order', 'wf1/run1', '--mcp', '--mcp-tools=get_order,submit']).mcpTools,
+    ['get_order', 'submit'],
+  );
+  assert.deepEqual(
+    parseArgs(['--order', 'wf1/run1', '--mcp-tools', 'get_order,submit,reject']).mcpTools,
+    ['get_order', 'submit', 'reject'],
+  );
+  assert.match(parseArgs(['--mcp-tools', 'get_order,unknown']).error!, /unknown tool.*unknown/);
+  assert.match(parseArgs(['--mcp-tools', 'get_order,get_order']).error!, /duplicate/);
+  assert.match(parseArgs(['--mcp-tools', 'get_order,']).error!, /empty names/);
+});
+
 test('parseArgs rejects a non-positive / non-integer interval', () => {
   assert.match(parseArgs(['--heartbeat-interval', '0']).error!, /positive integer/);
   assert.match(parseArgs(['--heartbeat-interval', 'abc']).error!, /positive integer/);
@@ -200,6 +214,10 @@ test('run() exits 2 on a conflicting composite + --workflow', async () => {
 
 test('run() exits 2 on a bad --heartbeat-interval', async () => {
   assert.equal(await run(['--order', 'wf1/run1', '--heartbeat-interval', 'nope']), 2);
+});
+
+test('run() exits 2 when --mcp-tools is used without --mcp', async () => {
+  assert.equal(await run(['--order', 'wf1/run1', '--mcp-tools=get_order,submit']), 2);
 });
 
 test('run() exits 2 when no hub origin is resolvable', async () => {

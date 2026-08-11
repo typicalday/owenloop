@@ -220,10 +220,18 @@ test('an EMPTY registry is an error finding — lint never pretends it checked',
 test('lint reports adapter capability refusals before runtime', () => {
   const findings = lintOneStep(step({
     harness: 'codex',
-    harnessOptions: { tools: [], network: 'owenloop-only' },
+    harnessOptions: { tools: [], network: 'owenloop-only', maxTurns: 20 },
   }));
   assert.ok(findings.some((finding) => finding.field === 'tools' && finding.severity === 'error'));
   assert.ok(findings.some((finding) => finding.field === 'network' && finding.severity === 'error'));
+  assert.ok(
+    findings.some(
+      (finding) =>
+	finding.field === 'maxTurns' &&
+	finding.severity === 'error' &&
+	/maxTurns is unsupported/.test(finding.message),
+    ),
+  );
 });
 
 test('a bag model alongside a first-class step model is a warning', () => {

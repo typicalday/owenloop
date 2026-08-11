@@ -90,6 +90,16 @@ function optionsFor(
   return { options, events };
 }
 
+/** Resolve the complete tool list that the selected hold MCP argv registers.
+ * The hold-role e2e test separately proves the selector controls real tools/list. */
+function mountedOwenloopTools(options: ReturnType<typeof buildClaudeOptions>): string[] {
+  const servers = options.mcpServers as Record<string, { args: string[] }>;
+  const selector = servers['owenloop']!.args.find((arg) => arg.startsWith('--mcp-tools='));
+  return selector === undefined
+    ? ['get_order', 'submit', 'reject']
+    : selector.slice('--mcp-tools='.length).split(',');
+}
+
 // ---------------------------------------------------------------------------
 // Option mapping
 // ---------------------------------------------------------------------------
@@ -121,9 +131,11 @@ test('a full bag maps onto the SDK options, setting BOTH tools and allowedTools'
   assert.deepEqual(servers['owenloop'], {
     type: 'stdio',
     command: MOUNT.command,
-    args: MOUNT.args,
+    args: [...MOUNT.args, '--mcp-tools=get_order,submit'],
     alwaysLoad: true,
   });
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit']);
+  assert.deepEqual(options.disallowedTools, ['mcp__owenloop__reject']);
 });
 
 test('an empty bag leaves every optional key ABSENT, not empty', () => {
@@ -139,6 +151,7 @@ test('an empty bag leaves every optional key ABSENT, not empty', () => {
 
   // The owenloop mount is unconditional — it is how the agent reaches its order.
   assert.deepEqual(Object.keys(options.mcpServers as object), ['owenloop']);
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit', 'reject']);
 });
 
 test('the owenloop mount overwrites a bag that declares its own owenloop server', () => {
@@ -153,6 +166,7 @@ test('the owenloop mount overwrites a bag that declares its own owenloop server'
     alwaysLoad: true,
   });
   assert.deepEqual(servers['extra'], { command: 'x' }, 'the author keeps every other server');
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit', 'reject']);
 });
 
 test("permissionMode 'bypassPermissions' also sets allowDangerouslySkipPermissions; no other mode does", () => {
@@ -243,6 +257,8 @@ test('an explicit empty tools list disables built-ins while an absent list prese
   ]);
   assert.deepEqual(empty.settingSources, []);
   assert.equal(empty.strictMcpConfig, true);
+  assert.deepEqual(mountedOwenloopTools(empty), ['get_order', 'submit']);
+  assert.deepEqual(empty.disallowedTools, ['mcp__owenloop__reject']);
 });
 
 test('read-only filesystem with unrestricted network keeps audited network readers and isolates other extension surfaces', () => {
@@ -283,6 +299,7 @@ test('read-only filesystem and owenloop-only network use the intersection of bot
 test('owenloop-only network policy excludes Bash, web, delegation, skills, hooks, and external MCP', () => {
   const { options } = optionsFor({
     network: 'owenloop-only',
+    disallowedTools: ['Bash'],
     skills: 'all',
     hooks: { PreToolUse: [] },
     mcpServers: { external: { command: 'external-server' } },
@@ -299,6 +316,8 @@ test('owenloop-only network policy excludes Bash, web, delegation, skills, hooks
     (options.allowedTools as string[]).includes('mcp__owenloop__submit'),
     'the isolated agent must retain auto-allowed access to the born-bound submit tool',
   );
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit']);
+  assert.deepEqual(options.disallowedTools, ['Bash', 'mcp__owenloop__reject']);
 });
 
 test('Claude preflight refuses direct and wildcard denies of the born-bound control plane', () => {
@@ -369,6 +388,8 @@ test('resume option construction applies the same isolation policy as cold start
   assert.equal(options.strictMcpConfig, true);
   assert.deepEqual(Object.keys(options.mcpServers as Record<string, unknown>), ['owenloop']);
   assert.ok((options.allowedTools as string[]).includes('mcp__owenloop__submit'));
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit']);
+  assert.deepEqual(options.disallowedTools, ['mcp__owenloop__reject']);
 });
 
 test('resume preserves unrestricted network readers under a read-only filesystem policy', () => {

@@ -163,8 +163,14 @@ function unsupportedFilesystemMessage(filesystem: 'read-only' | 'workspace-write
   );
 }
 
+const UNSUPPORTED_MAX_TURNS_MESSAGE =
+  'maxTurns is unsupported by this adapter because Codex app-server has no thread or turn limit parameter';
+
 function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
   const issues: PermissionIssue[] = [];
+  if (permissions.maxTurns !== undefined) {
+    issues.push({ field: 'maxTurns', message: UNSUPPORTED_MAX_TURNS_MESSAGE });
+  }
   if (permissions.filesystem === 'read-only' || permissions.filesystem === 'workspace-write') {
     issues.push({
       field: 'filesystem',
@@ -311,8 +317,9 @@ function owenloopMount(mcp: { command: string; args: string[] }): McpServerSpec 
  * Deliberately unmapped, so a reader sees intent rather than oversight:
  *  - `permissions.tools` / `permissions.disallowedTools`: 0.146.0 has no
  *    per-thread built-in-tool allow-list; the sandbox and the approval policy
- *    are the levers it does have.
+ *    are the levers it does have. Adapter preflight refuses both fields.
  *  - `permissions.maxTurns`: no `thread/start` or `turn/start` equivalent.
+ *    Adapter preflight and this direct-call boundary both refuse the field.
  *  - `permissions.effort`: not a `ThreadStartParams` field — it is a
  *    `turn/start` param, so it lands in `buildTurnStartParams`.
  *  - every `extensions` key other than `mcpServers`, `codexConfig` and
@@ -328,6 +335,9 @@ export function buildThreadStartParams(
   // Retained for source compatibility with callers that previously received
   // fallback diagnostics. Invalid explicit policy now throws instead.
   void onEvent;
+  if (args.permissions.maxTurns !== undefined) {
+    throw new Error(UNSUPPORTED_MAX_TURNS_MESSAGE);
+  }
   const ext = args.permissions.extensions;
   const sandbox = resolveSandbox(args.permissions);
   if (args.permissions.network === 'unrestricted' && sandbox === 'read-only') {
@@ -1130,13 +1140,6 @@ export const codexAdapter: HarnessAdapter = {
     args: DeliverArgs,
     onEvent: (e: AgentEvent) => void,
   ): Promise<void> {
-    // A rollout records its cwd; a vanished worktree cannot host the resumed
-    // turn, and finding that out from the server takes a spawn plus a handshake.
-    if (!existsSync(args.cwd)) {
-      throw new ResumeUnavailableError(`resume cwd no longer exists: ${args.cwd}`);
-    }
-
-    const gate = createTurnGate(onEvent);
     const previous = SESSIONS.get(ref.token);
     // PHASE 4: the map is no longer the source of truth for thread configuration.
     // `args.permissions` is, and `buildThreadResumeParams` maps it. `startParams`
@@ -1144,9 +1147,18 @@ export const codexAdapter: HarnessAdapter = {
     // miss is now an ordinary cross-process resume rather than a degraded one —
     // which is why the "minimal thread configuration" warning is gone.
     const startParams = previous?.startParams;
-    // Match cold start: validate all thread configuration before disposing an
-    // existing session or spawning a replacement app-server.
+    // Match cold start: validate all thread configuration before checking the
+    // worktree, disposing an existing session, or spawning a replacement
+    // app-server. Unsupported policy is the first direct-call boundary.
     const resumeParams = buildThreadResumeParams(ref.token, args, startParams, onEvent);
+
+    // A rollout records its cwd; a vanished worktree cannot host the resumed
+    // turn, and finding that out from the server takes a spawn plus a handshake.
+    if (!existsSync(args.cwd)) {
+      throw new ResumeUnavailableError(`resume cwd no longer exists: ${args.cwd}`);
+    }
+
+    const gate = createTurnGate(onEvent);
     if (previous !== undefined) {
       // ALWAYS a fresh app-server, even when this process still holds a live one.
       // A live client's notifications are bound to the gate it was opened with,

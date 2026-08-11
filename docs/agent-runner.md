@@ -48,12 +48,15 @@ A cache created by an older CLI may contain `filesystem` or `network` under `per
 | `filesystem: unrestricted` | supported | maps to sandbox `danger-full-access`; open-ended `codexConfig`, external MCP, and operator configuration remain backward compatible because no filesystem boundary is claimed |
 | `network: owenloop-only` | supported through isolated settings, skills, MCP, and built-in tools | refused |
 | `network: unrestricted` | supported | supported with `filesystem: unrestricted`, or with an omitted filesystem field and legacy sandbox `workspace-write` / `danger-full-access`; legacy sandbox `read-only` is refused because Codex has no independent read-only network control |
+| `maxTurns` | enforced by the SDK | refused; Codex app-server has no thread or turn limit parameter |
 
 Codex refusal of explicit `filesystem: read-only` and `filesystem: workspace-write` is intentional and runs before both cold start and resume. Codex app-server loads configuration from thread, project, global/managed, and persisted session layers. The pinned Codex version has no reliable switch that isolates every layer, and some layers can introduce host processes, providers, endpoints, MCP servers, or additional writable roots outside the thread sandbox. Partial filtering would claim a boundary the adapter cannot prove, so the adapter starts no app-server process and the worker releases the held claim.
 
+Codex also refuses every defined `maxTurns` value before both cold start and resume. Codex app-server has no thread or turn limit parameter, so accepting `maxTurns` would silently discard an authored execution limit. The adapter starts no app-server process and the worker releases the held claim.
+
 An omitted `filesystem` field preserves the existing Codex default sandbox behavior. `filesystem: unrestricted` preserves the existing explicit `danger-full-access` behavior. The legacy adapter extension `sandbox` remains available with `read-only`, `workspace-write`, or `danger-full-access` for backward compatibility, but `sandbox` is a vendor-specific pass-through rather than Owenloop's neutral filesystem guarantee. A workflow that requires an enforceable neutral read-only policy must select the Claude Code adapter.
 
-The worker-created `owenloop` MCP mount still wins any `mcp_servers.owenloop` name clash so the Step Agent retains `get_order` and `submit`. Codex approval policy still accepts only `untrusted`, `on-request`, or `never`.
+The worker-created `owenloop` MCP mount still wins any `mcp_servers.owenloop` name clash. The default unrestricted mount registers `get_order`, `submit`, and `reject`. Codex approval policy still accepts only `untrusted`, `on-request`, or `never`.
 
 The Claude Code adapter refuses a `read-only` allow-list containing anything outside `Read`, `Glob`, `Grep`, `WebFetch`, `WebSearch`, and the born-bound control tools. With `network: owenloop-only`, the allowed read-only built-ins narrow to `Read`, `Glob`, and `Grep`; `WebFetch` and `WebSearch` remain available only with `network: unrestricted`. The Claude Code adapter refuses an `owenloop-only` allow-list containing Bash, web tools, skills, agent delegation, or any unaudited tool. The Claude Code adapter also refuses authored external MCP tool names because the current option surface cannot prove an exact per-tool allow-list for an external server.
 
@@ -61,9 +64,11 @@ The Claude Code adapter refuses a `read-only` allow-list containing anything out
 
 `network: owenloop-only` means that the Step Agent may reach only the born-bound Owenloop MCP control plane for the held order. The exception exists so the Step Agent can call `get_order` and `submit`; without those calls the Step Agent cannot inspect or complete the order.
 
-For Claude Code isolation, the adapter sets `settingSources: []`, `strictMcpConfig: true`, disables skills, excludes hooks and external MCP servers, and mounts only the worker-created `owenloop` MCP server. The adapter also restricts built-in tools to an audited no-network set. The same option construction runs for cold start and resume.
+For Claude Code isolation, the adapter sets `settingSources: []`, `strictMcpConfig: true`, disables skills, excludes hooks and external MCP servers, and mounts only the worker-created `owenloop` MCP server. The restricted MCP child positively registers exactly `get_order` and `submit`; the restricted MCP child does not register `reject`. A future work-holder tool therefore does not enter restricted sessions unless the adapter explicitly adds the tool to the positive registration list. The adapter also restricts built-in tools to an audited no-network set. The same option construction runs for cold start and resume.
 
-The born-bound Owenloop MCP server is created by the worker from the live workflow, run, origin, account, Shift, and held claim. Workflow extension data cannot replace that mount. During isolation, the adapter adds `mcp__owenloop__get_order` and `mcp__owenloop__submit` to `allowedTools` so both control calls execute without an unattended permission prompt. A direct deny or an MCP wildcard deny that blocks Owenloop `get_order` or `submit` is refused.
+The born-bound Owenloop MCP server is created by the worker from the live workflow, run, origin, account, Shift, and held claim. Workflow extension data cannot replace that mount. During isolation, the adapter adds `mcp__owenloop__get_order` and `mcp__owenloop__submit` to `allowedTools` so both control calls execute without an unattended permission prompt. `allowedTools` controls permission automation; `allowedTools` does not filter the MCP server's `tools/list` response. The positive registration list on the MCP child is the visibility boundary. The adapter also adds `mcp__owenloop__reject` to `disallowedTools` as defense in depth. A direct deny or an MCP wildcard deny that blocks Owenloop `get_order` or `submit` is refused.
+
+Outside Claude Code isolation, the default work-holder MCP child continues to register `get_order`, `submit`, and `reject`.
 
 ## Security boundary
 
