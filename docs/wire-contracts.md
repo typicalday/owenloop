@@ -82,16 +82,15 @@ Payload type: `application/vnd.owenloop.submission.v1+json`.
 Each `produced` entry has `artifact`, non-negative integer `version`, and a
 lowercase SHA-256 `valueDigest`.
 
-A driver signs before a remote coordinator commits the submitted value. When a
-transport supplies an authoritative committed version, the driver must pass
-that version into the submission signer. The current reduced driver packet does
-not carry that post-commit value, so the compatibility path makes a best-effort
-inference from the claim fingerprint and the latest reason thread (or version
-one for a fresh artifact). The inferred version is not a coordinator
-attestation: stale or malformed order metadata can produce a signed record whose
-version differs from the committed artifact, and a later verifier must reject
-that proof rather than silently correcting it. Integrations that require an
-authoritative submission record must use an explicit version-aware packet.
+A driver signs only when the driver can name the exact artifact version without
+inferring mutable coordinator state. A judge approval can use the judged path's
+claim-time `consumedFingerprint` entry because the approval attests that existing
+version and does not allocate a new version. A producer submit requires an exact
+target version issued by a retry-safe hub protocol. Immutable `owes[].version`
+metadata is not sufficient: the metadata becomes stale after a refinement, a
+committed submit whose response is lost, an unsigned commit, or a client process
+restart. Without explicit producer-version authority, built-in clients submit
+the producer value without a proof rather than sign a process-local guess.
 
 A consuming driver verifies the envelope before trusting the value. The
 verified signer key must equal `producerKeyId`; the signed `produced[]` entry
@@ -108,6 +107,23 @@ termination, per-link signatures, attenuation, and revocation, but the
 demand-dependent `scopePermits` restriction is currently vacuous. A verifier
 caller that supplies a demand receives the full scope check. This is a named
 follow-up, not hub-side trust.
+
+### Deployed hub compatibility
+
+The schema above is the target wire contract, not evidence that every deployed
+hub carries every optional field. As of 2026-08-10, the production hub drops
+`consumedFingerprint`, `owes[].version`, `owes[].proof`, and `consumesProof` from
+served orders. The production REST and MCP submit paths also do not carry a
+client-supplied `proof` through hub-core. A current client therefore cannot claim
+that a submit proof was accepted, persisted beside a committed artifact version,
+or relayed to a downstream consumer.
+
+Client transport types keep these fields optional so one client remains
+compatible with both the deployed hub and a future version-aware hub. End-to-end
+proof support requires service changes: preserve all four order fields, accept
+and persist submit proofs, return proof-acceptance and committed-version data,
+and provide retry idempotency (running the same submission again changes
+nothing) that survives a lost response and client restart.
 
 ## Publication record
 
@@ -271,10 +287,10 @@ as a literal `workdir:` or resolved by the engine from a consumed artifact's
 
 `defDigest` is a non-empty opaque reference. `inputs` and `outputs` are string
 arrays. `consumes` is an open artifact-path map; `spec` and `x` are opaque
-objects carried through without engine interpretation. `owes` contains the
-owed path, judgment/schema rejection counters, reason entries, and an optional
-opaque `proof` string. `cause`, when present, is `inputsGreen`, `allGreen`, or
-`idle`.
+objects carried through without engine interpretation. `owes` contains the owed
+path, an optional claim-time `version`, judgment/schema rejection counters,
+reason entries, and an optional opaque `proof` string. `cause`, when present, is
+`inputsGreen`, `allGreen`, or `idle`.
 
 **Decision A — version cross-check without fingerprint recomputation.** The
 `consumedFingerprint`, when present, is an open artifact-path map whose values
@@ -284,15 +300,16 @@ versions supplied in this map against signed `produced[].version`, but does not
 recompute the producer's complete map from consumed values. A driver
 distinguishes an absent map from a genuinely empty map: if the order has
 consumed inputs but omits the map, the driver submits without a proof and emits
-a warning; an order with no consumed inputs may sign an explicitly empty `{}`
-map.
+a warning; when independent authoritative output-version metadata is available,
+an order with no consumed inputs may sign an explicitly empty `{}` map.
 
 An explicit `{}` or partial map alongside a non-empty consumed set is still a
 signed assertion of the map supplied on the wire. A consuming driver verifies
 the supplied entries and enforces the versions that are present; the driver
 does not recompute the producer's complete fingerprint map from values that
-arrived in the same order. The hub only stores and relays the signed content;
-it does not verify, repair, or authorize the assertion.
+arrived in the same order. A hub that implements this target contract stores and relays the signed
+content; the hub does not verify, repair, or authorize the assertion. The
+current production hub does not yet implement that proof transport.
 
 `consumesProof` is a JSON-serialized map from artifact path to serialized DSSE
 envelope:
@@ -302,11 +319,13 @@ envelope:
 ```
 
 The map lets one order carry proofs from multiple producers without changing
-the frozen string slot. A hub stores each submit proof beside the committed
-artifact version and omits paths with no stored proof; `consumesProof` never
-contains null or empty-string entries. A consuming driver treats a missing
-entry as the `absent` verdict and applies the configured artifact policy rather
-than stripping that artifact from the order.
+the frozen string slot. In the target service protocol, the hub stores each
+accepted submit proof beside the exact committed artifact version and omits
+paths with no stored proof; `consumesProof` never contains null or empty-string
+entries. The current production service does not provide that persistence or
+projection. A consuming driver treats a missing entry as the `absent` verdict
+and applies the configured artifact policy rather than stripping that artifact
+from the order.
 
 `owes[].proof`, when present, uses the same serialized DSSE envelope format. The
 signed `submission.v1` record contains one `produced[]` entry for the owed path;
@@ -344,8 +363,10 @@ beginning of the line. A marker in the middle of a line is not a match. The JSON
 text after the marker is capped at 64 KiB. A missing marker leaves `payload`
 out of the `CommandReceipt`; malformed or over-cap JSON produces
 `payloadError` and no `payload`, while leaving the command exit code unchanged.
-The parsed payload is part of the receipt value covered by the DSSE submission
-proof.
+When the hub supplies authoritative output-version metadata and the driver can
+sign, the parsed payload is part of the receipt value covered by the DSSE
+submission proof. Current producer command receipts are unsigned because the
+deployed hub does not supply a retry-safe target version.
 
 A worker rejects an artifact through the `reject` verb. The request is exactly:
 

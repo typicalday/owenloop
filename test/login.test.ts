@@ -348,9 +348,9 @@ test('connect: a credential present ONLY in the file is not read by the keychain
   assert.match(t.err.join('\n'), /no stored credential/);
 });
 
-test('logout: clears BOTH the keychain and the file store (defensive dual-clear)', async () => {
+test('logout: OWENLOOP_NO_KEYCHAIN still clears BOTH the keychain and file store', async () => {
   const { fetch } = routedFetch({});
-  const t = makeIo({ fetch });
+  const t = makeIo({ fetch, env: { OWENLOOP_NO_KEYCHAIN: '1' } });
   t.store.set(kcHuman(ORIGIN), JSON.stringify({ kind: 'agent', accessToken: 'olp_kc' }));
   const path = credentialFilePath(t.io.env);
   writeCredentialFile(path, { version: 2, hubs: { [ORIGIN]: { human: { kind: 'agent', accessToken: 'olp_file' } } } });
@@ -360,6 +360,58 @@ test('logout: clears BOTH the keychain and the file store (defensive dual-clear)
   assert.equal(JSON.parse(t.out.join('\n')).removed, true);
   assert.ok(!t.store.has(kcHuman(ORIGIN)), 'keychain entry cleared');
   assert.equal(readCredentialFile(path).hubs[ORIGIN], undefined, 'file entry cleared too');
+});
+
+test('logout under OWENLOOP_NO_KEYCHAIN fails closed when Keychain lookup is not status 44', async () => {
+  const pathEnv = { ...makeIo().io.env, OWENLOOP_NO_KEYCHAIN: '1' };
+  const path = credentialFilePath(pathEnv);
+  writeCredentialFile(path, {
+    version: 2,
+    hubs: { [ORIGIN]: { human: { kind: 'agent', accessToken: 'olp_file' } } },
+  });
+  const keychain: Keychain = {
+    get: () => {
+      throw new Error('macOS Keychain lookup failed: security exited with status 45');
+    },
+    set: () => {},
+    delete: () => {
+      assert.fail('delete must not follow a failed lookup');
+    },
+  };
+  const t = makeIo({ env: pathEnv, keychain });
+
+  const code = await mainAsync(['logout', '--hub', HUB], t.io);
+
+  assert.equal(code, 1);
+  assert.equal(t.out.length, 0, 'logout emits no success JSON');
+  assert.match(t.err.join('\n'), /Keychain lookup failed/u);
+  assert.ok(readCredentialFile(path).hubs[ORIGIN]?.human, 'file credential remains untouched');
+});
+
+test('logout under OWENLOOP_NO_KEYCHAIN reports no success when Keychain deletion is not status 44', async () => {
+  const key = kcHuman(ORIGIN);
+  const keychainValues = new Map([[key, JSON.stringify({ kind: 'agent', accessToken: 'olp_kc' })]]);
+  const keychain: Keychain = {
+    get: (service, account) => keychainValues.get(`${service}\0${account}`) ?? null,
+    set: () => {},
+    delete: () => {
+      throw new Error('macOS Keychain delete failed: security exited with status 45');
+    },
+  };
+  const t = makeIo({ env: { OWENLOOP_NO_KEYCHAIN: '1' }, keychain });
+  const path = credentialFilePath(t.io.env);
+  writeCredentialFile(path, {
+    version: 2,
+    hubs: { [ORIGIN]: { human: { kind: 'agent', accessToken: 'olp_file' } } },
+  });
+
+  const code = await mainAsync(['logout', '--hub', HUB], t.io);
+
+  assert.equal(code, 1);
+  assert.equal(t.out.length, 0, 'logout emits no removed:true success JSON');
+  assert.match(t.err.join('\n'), /Keychain delete failed/u);
+  assert.ok(keychainValues.has(key), 'authoritative keychain credential remains present');
+  assert.ok(readCredentialFile(path).hubs[ORIGIN]?.human, 'file credential remains untouched');
 });
 
 // ---- request deadlines on hub/auth calls (REL-7) ----------------------------

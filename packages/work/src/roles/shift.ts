@@ -7,7 +7,12 @@
  */
 import { loadSettings } from '../settings/settings.ts';
 import { resolveStateDir } from '../shift/state.ts';
-import { resolveStateDirOverride, runShiftRuntime, type ParsedArgs } from '../shift/runtime.ts';
+import {
+  assertShiftDaemonPlatform,
+  resolveStateDirOverride,
+  runShiftRuntime,
+  type ParsedArgs,
+} from '../shift/runtime.ts';
 import {
   noDaemonMessage,
   parseNextArgs,
@@ -118,6 +123,25 @@ function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
+export function shiftDaemonClientPlatformError(
+  command: 'next' | 'status' | 'end',
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  try {
+    assertShiftDaemonPlatform(platform);
+    return undefined;
+  } catch (error) {
+    return `owenloop shift ${command}: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+function rejectUnsupportedDaemonClient(command: 'next' | 'status' | 'end'): boolean {
+  const error = shiftDaemonClientPlatformError(command);
+  if (error === undefined) return false;
+  process.stderr.write(`${error}\n`);
+  return true;
+}
+
 async function runNext(args: string[]): Promise<number> {
   const parsed = parseNextArgs(args);
   if (parsed.error !== undefined) {
@@ -125,6 +149,7 @@ async function runNext(args: string[]): Promise<number> {
     usage();
     return 2;
   }
+  if (rejectUnsupportedDaemonClient('next')) return 1;
   const socket = resolveSocketPath(parsed.stateDir);
   if (socket.error !== undefined || socket.path === undefined) {
     process.stderr.write(`owenloop shift next: ${socket.error ?? 'cannot resolve state directory'}\n`);
@@ -151,6 +176,7 @@ async function runStatus(args: string[]): Promise<number> {
     usage();
     return 2;
   }
+  if (rejectUnsupportedDaemonClient('status')) return 1;
   const socket = resolveSocketPath(parsed.stateDir);
   if (socket.error !== undefined || socket.path === undefined) {
     process.stderr.write(`owenloop shift status: ${socket.error ?? 'cannot resolve state directory'}\n`);
@@ -181,6 +207,7 @@ async function runEnd(args: string[]): Promise<number> {
     usage();
     return 2;
   }
+  if (rejectUnsupportedDaemonClient('end')) return 1;
   const socket = resolveSocketPath(parsed.stateDir);
   if (socket.error !== undefined || socket.path === undefined) {
     process.stderr.write(`owenloop shift end: ${socket.error ?? 'cannot resolve state directory'}\n`);

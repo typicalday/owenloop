@@ -132,7 +132,10 @@ export interface StartArgs {
    * The stdio mount for owenloop's own born-bound work-holder MCP surface. The
    * default server registers `get_order`, `submit`, and `reject`. An adapter that
    * enforces a restricted session may append the hold role's positive selector so
-   * the mounted server registers only the policy's exact subset.
+   * the mounted server registers only the policy's exact subset. The command is
+   * the current Node executable and the first argv item is this installation's
+   * resolved `bin/owenloop.mjs`, so PATH cannot select a different Owenloop
+   * installation.
    *
    * BUILT BY THE WORKER, NOT BY AN ADAPTER: `src/agent/brief.ts` constructs the
    * born-bound `hold --order <workflow>/<run> --origin <url> --as <account>
@@ -211,9 +214,11 @@ export interface HarnessAdapter {
   /**
    * Launch a NEW session. Resolves at turn end with the session ref.
    *
-   * Emits `{kind:'started', ref}` BEFORE it resolves, and the caller is
-   * expected to persist the token on THAT event rather than on the resolve —
-   * so a mid-turn crash still leaves a resumable record behind.
+   * Emits `{kind:'started', ref}` BEFORE provider work begins and before it
+   * resolves. The callback is a synchronous persistence gate: an adapter must
+   * not start delivery until the callback returns, and a thrown callback must
+   * abort/abandon the turn. The caller persists the token on that event so a
+   * mid-turn crash leaves an authoritative active record behind.
    */
   start(args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef>;
   /**

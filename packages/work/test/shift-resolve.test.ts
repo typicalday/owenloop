@@ -2,12 +2,22 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  assertShiftDaemonPlatform,
   resolveCap,
   resolveStateDirOverride,
   resolveMaxConcurrentAgents,
   resolveShiftName,
   parseArgs,
 } from '../src/shift/runtime.ts';
+
+test('public Shift daemon fails explicitly on Windows while direct Shift remains the fallback', () => {
+  assert.throws(
+    () => assertShiftDaemonPlatform('win32'),
+    /public Shift daemon is not supported on Windows.*named-pipe transport is not implemented.*use `owenloop work shift` directly/iu,
+  );
+  assert.doesNotThrow(() => assertShiftDaemonPlatform('darwin'));
+  assert.doesNotThrow(() => assertShiftDaemonPlatform('linux'));
+});
 
 // C6 wired settings-file fallbacks into shift's cap + dir resolution. These pin
 // the precedence: CLI flag > env var > settings file > built-in default.

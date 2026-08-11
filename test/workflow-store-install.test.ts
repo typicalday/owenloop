@@ -70,6 +70,7 @@ import {
   rollbackInstallCommit,
   sha256Hex,
 } from '../src/install.ts';
+import { acquireFileLock, releaseFileLock } from '../src/lock.ts';
 import { defInstructionDigest } from '../src/order-resolver.ts';
 import { loadDefFile } from '../src/defs.ts';
 import { installBundleFixture, tempDir, writeBundleSource } from './helpers/store-fixture.ts';
@@ -225,6 +226,12 @@ function tempStore(prefix = 'owenloop-wstore-'): {
     journalPath: join(root, '.owenloop', ADD_JOURNAL_FILENAME),
     markerDir,
   };
+}
+
+async function assertLockReleased(lockPath: string, message: string): Promise<void> {
+  assert.equal(existsSync(lockPath), true, `${message}: persistent SQLite lock database remains`);
+  const probe = await acquireFileLock(lockPath, { waitMs: 100, pollMs: 5, label: 'test workflow-store install' });
+  releaseFileLock(probe);
 }
 
 const SRC: BundleSource = { kind: 'file', path: '/nonexistent/origin.wnlp' }; // origin data only — never opened by the installer
@@ -571,13 +578,13 @@ test('install: a valid bundle installs with the fixed commit order and hardened 
   assert.equal(dirMode, 0o555, 'object dir hardened non-writable');
   assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), validDefYaml('widget'));
 
-  // Index records the coordinate; journal and lock are gone; staging cleared.
+  // Index records the coordinate; journal is gone; the persistent lock is free; staging is cleared.
   assert.deepEqual(readWorkflowStoreIndex(storeIndexPath(root)), {
     version: 1,
     entries: { 'acme/widget@1.0.0': { digest: m.digest, pinned: false, workflows: ['widget'] } },
   });
   assert.ok(!existsSync(journalPath), 'journal removed on success');
-  assert.ok(!existsSync(lockPath), 'lock released on success');
+  await assertLockReleased(lockPath, 'lock released on success');
   assert.ok(!existsSync(join(root, '.owenloop-staging')), 'staging root cleared');
 });
 
@@ -728,7 +735,7 @@ test('install: one altered byte is rejected by A1 before anything is committed',
   assert.ok(!existsSync(storeIndexPath(root)), 'no index written');
   assert.ok(!existsSync(join(root, 'objects')), 'no object written');
   assert.ok(!existsSync(journalPath), 'no journal left');
-  assert.ok(!existsSync(lockPath), 'lock released');
+  await assertLockReleased(lockPath, 'lock released after digest refusal');
   assert.ok(!existsSync(join(root, '.owenloop-staging')), 'staging debris cleared');
 });
 
@@ -971,7 +978,7 @@ test('install: an index-write failure rolls the object back and restores the pre
   assert.ok(!existsSync(join(root, objectDestRelPath(defDigest(m.digest)))), 'the swapped-in object was rolled back');
   assert.ok(statSync(indexPath).isDirectory(), 'the squatting dir survives (previous state restored)');
   assert.ok(!existsSync(journalPath), 'journal dropped');
-  assert.ok(!existsSync(lockPath), 'lock released');
+  await assertLockReleased(lockPath, 'lock released after rollback');
 });
 
 // ---- concurrent installs serialize on one root --------------------------------------
@@ -2063,7 +2070,7 @@ test('install: a global-root install keeps lock/journal/staging below the global
 
   assert.equal(result.level, 'global');
   assert.ok(result.objectPath.startsWith(join(root, 'objects')), 'object below the global root');
-  assert.ok(!existsSync(lockPath), 'lock released');
+  await assertLockReleased(lockPath, 'global lock released');
   // A subsequent GLOBAL recovery on the same root is a clean no-op.
   assert.equal(await recoverWorkflowStore({ root, lockPath, journalPath }), 'no-journal');
 });

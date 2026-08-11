@@ -119,7 +119,7 @@ test('exec store e2e: empty store refuses, installed bytes run, and tampering re
   const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
   const def = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
   assert.ok(def !== undefined);
-  const requested = defInstructionDigest(def);
+  const requested = installed.result.digest;
   const globalRoot = tempDir('owenloop-exec-store-global-');
   const resolver = createStoreInstructionResolver({
     projectRoot,

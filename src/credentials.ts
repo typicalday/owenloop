@@ -36,7 +36,7 @@ import {
   readCredentialFile,
   readStoredCredential,
   resolveEndpoint,
-  resolveKeychain,
+  resolveLocalKeychain,
   writeCredentialFile,
 } from './hub.ts';
 import type { Credential, CredentialSlotSelector, Keychain } from './hub.ts';
@@ -54,9 +54,10 @@ import type { AcquireFileLockOpts, FileLockHandle } from './lock.ts';
 export interface CredentialIO {
   env: Record<string, string | undefined>;
   /**
-   * OS keychain backend for credential storage. `undefined` — non-mac, or
-   * `OWENLOOP_NO_KEYCHAIN=1` — selects the file backend. A keychain write
-   * failure is a hard error, never a silent file fallback (REL-6).
+   * OS Keychain backend. `OWENLOOP_NO_KEYCHAIN=1` excludes this backend from
+   * ordinary reads and writes, but defensive logout still inspects and clears
+   * an injected backend. A keychain write failure is a hard error, never a
+   * silent file fallback (REL-6).
    */
   keychain?: Keychain;
   /** Injectable for hermetic tests — the OAuth-refresh network calls use this. */
@@ -71,7 +72,7 @@ export interface CredentialIO {
  */
 const FRESH_WINDOW_MS = 60_000;
 
-// ---- the refresh/store lockfile --------------------------------------------
+// ---- the refresh/store SQLite lock -----------------------------------------
 
 /** The credential lock path — sibling of `credentials.json` in the config dir. */
 function credLockPath(env: Record<string, string | undefined>): string {
@@ -85,12 +86,10 @@ function envNum(env: Record<string, string | undefined>, key: string, fallback: 
 }
 
 /**
- * Lock timings for the credential lock. Defaults 45s wait / 30s stale / 100ms
- * poll; each overridable via `OWENLOOP_CRED_LOCK_{WAIT,STALE,POLL}_MS`. The 30s
- * TTL is safe even against a slow live holder (a worst-case refresh — discovery
- * + token POST, each budgeted `HUB_TIMEOUT_MS` = 30s — can exceed it) because
- * `lockIsStale` never age-reclaims a lock whose recorded pid is alive; age only
- * governs an abandoned/unparseable lockfile.
+ * Lock timings for the credential lock. Defaults 45s wait / 100ms poll, each
+ * overridable via `OWENLOOP_CRED_LOCK_{WAIT,POLL}_MS`. The STALE knob remains in
+ * the options for source and environment compatibility, but SQLite connection
+ * ownership makes age-based pathname reclamation both unnecessary and unsafe.
  */
 function credLockOpts(env: Record<string, string | undefined>): AcquireFileLockOpts {
   return {
@@ -104,11 +103,10 @@ function credLockOpts(env: Record<string, string | undefined>): AcquireFileLockO
 /**
  * Acquire the credential lock, mapping a clean acquire timeout to a loud
  * `CliError` — never falling through to an unlocked refresh (that would silently
- * reintroduce the double-refresh race). A real filesystem error from the
- * exclusive create (EACCES/EROFS) is NOT a timeout and propagates untouched. No
- * token value ever appears in the message (the lock payload is pid/host/
- * startedAt/token-only, and this message names neither the credential nor a
- * token).
+ * reintroduce the double-refresh race). A real filesystem or SQLite error
+ * (EACCES/EROFS/corruption) is NOT a timeout and propagates untouched. No token
+ * value ever appears in the message; the diagnostic sidecar contains only
+ * pid/host/timestamps plus a random acquisition token.
  */
 async function acquireCredLock(io: CredentialIO): Promise<FileLockHandle> {
   try {
@@ -116,9 +114,12 @@ async function acquireCredLock(io: CredentialIO): Promise<FileLockHandle> {
   } catch (e) {
     if (e instanceof FileLockTimeoutError) {
       const who = e.holderPid !== undefined ? `pid ${e.holderPid}` : 'another process';
+      const legacyHelp = e.legacy
+	? '; found a legacy lockfile that Owenloop will not delete automatically — verify that no old process owns it, then remove it manually'
+	: '';
       throw new CliError(
         `another owenloop process is using the credential store (${who}) — holds ${e.lockPath}; ` +
-          `timed out waiting after ${Math.round(e.waitMs / 1000)}s`,
+	  `timed out waiting after ${Math.round(e.waitMs / 1000)}s${legacyHelp}`,
       );
     }
     throw e;
@@ -209,15 +210,17 @@ export async function storeCredential(
 
 /**
  * Delete body WITHOUT the lock — the caller holds it. Deletes the stored
- * credential for `(origin, slot)` from BOTH backends (a defensive dual-clear, so
- * a live refresh token can never be stranded in the store that wasn't the
- * currently-chosen one). Returns whether anything was removed. Only the NAMED
- * slot is removed.
+ * credential for `(origin, slot)` from BOTH locally available backends (a
+ * defensive dual-clear, so a live refresh token can never be stranded in the
+ * store that ordinary reads currently ignore). `OWENLOOP_NO_KEYCHAIN=1` selects
+ * the file for ordinary operations but does not hide an available Keychain from
+ * this cleanup path. Returns whether anything was removed. Only the NAMED slot
+ * is removed.
  */
 function deleteCredentialUnlocked(io: CredentialIO, origin: string, slot: CredentialSlotSelector): boolean {
   const account = credentialSlot(slot);
   let removed = false;
-  const kc = resolveKeychain(io.env, io.keychain);
+  const kc = resolveLocalKeychain(io.keychain);
   const service = keychainServiceFor(origin);
   if (kc && kc.get(service, account) !== null) {
     kc.delete(service, account);

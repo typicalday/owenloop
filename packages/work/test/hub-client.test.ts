@@ -16,7 +16,7 @@ interface Captured {
 /** Build a fake `fetch` that records the request and returns a canned response. */
 function fakeFetch(
   captured: Captured[],
-  response: { status?: number; body: unknown },
+  response: { status?: number; body: unknown; headers?: Record<string, string> },
 ): typeof fetch {
   return (async (input: string | URL | Request, init?: RequestInit) => {
     const url = typeof input === 'string' ? input : input.toString();
@@ -32,7 +32,7 @@ function fakeFetch(
     const status = response.status ?? 200;
     return new Response(JSON.stringify(response.body), {
       status,
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...response.headers },
     });
   }) as typeof fetch;
 }
@@ -54,6 +54,38 @@ test('whatsNext POSTs to /api/whats_next with bearer header and JSON body', asyn
   assert.deepEqual(req.body, { workflow: 'wf1', serve_crews: ['a'] });
   assert.equal(res.text, 'ok');
   assert.deepEqual(res.orders, []);
+});
+
+test('whatsNext preserves modern defDigest routing with explicit or default worker projection', async () => {
+  const captured: Captured[] = [];
+  const explicitAgent = {
+    workflow: 'wf1',
+    run: 'run_explicit',
+    step: 'builder',
+    worker: 'agent',
+    defDigest: 'sha256:explicit-agent',
+    consumes: {},
+    expected_outputs: [],
+    feedback: [],
+    advisory: {},
+    submit_hint: '',
+  };
+  const defaultAgent = {
+    ...explicitAgent,
+    run: 'run_default',
+    defDigest: 'sha256:default-agent',
+  };
+  delete (defaultAgent as { worker?: string }).worker;
+  const c = client(fakeFetch(captured, {
+    body: { text: 'ok', workflow: 'wf1', orders: [explicitAgent, defaultAgent] },
+  }));
+
+  const response = await c.whatsNext({ workflow: 'wf1' });
+
+  assert.deepEqual(response.orders?.[0], explicitAgent);
+  assert.equal(response.orders?.[1]?.defDigest, 'sha256:default-agent');
+  assert.equal(Object.prototype.hasOwnProperty.call(response.orders?.[1], 'worker'), false);
+  assert.deepEqual(response.orders?.[1], defaultAgent);
 });
 
 test('whatsNext defaults to an empty body when called with no args', async () => {
@@ -168,6 +200,21 @@ test('non-2xx with {error,message} JSON becomes a HubError carrying status and c
       return true;
     },
   );
+});
+
+test('429 Retry-After metadata is normalized onto HubError', async () => {
+  const c = client(fakeFetch([], {
+    status: 429,
+    body: { error: 'rate_limited', message: 'slow down' },
+    headers: { 'retry-after': '17' },
+  }));
+  await assert.rejects(() => c.wake(1), (err: unknown) => {
+    assert.ok(err instanceof HubError);
+    assert.equal(err.status, 429);
+    assert.equal(err.code, 'rate_limited');
+    assert.equal(err.retryAfterMs, 17_000);
+    return true;
+  });
 });
 
 test('non-2xx non-JSON keeps the raw text as the message', async () => {

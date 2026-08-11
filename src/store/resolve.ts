@@ -9,10 +9,9 @@
  *     project object is ABSENT; a corrupt/invalid project hit is a hard error
  *     (never masked by falling back to a valid global copy).
  *
- *   - {@link resolveWorkflowCoordinate} — human/CLI path: reads BOTH indexes.
- *     One entry resolves; same digest at both levels deduplicates to one
- *     result; different digests at the two levels throw a structured
- *     ambiguity error (never silently project-first).
+ *   - {@link resolveWorkflowCoordinate} — human/CLI path: reads the project
+ *     index first and uses the global index only as a fallback. When both
+ *     levels name the coordinate, the project definition wins deterministically.
  *
  * Every successful resolution verifies the object it returns through the
  * ingest adapter's `verifyInstalledObject` before handing back a path — the
@@ -23,7 +22,6 @@
 import { lstatSync } from 'node:fs';
 import { dirname, join, resolve as resolvePath } from 'node:path';
 import {
-  StoreAmbiguityError,
   StoreIndexError,
   StoreIntegrityError,
   StoreNotFoundError,
@@ -449,14 +447,14 @@ export interface ResolveWorkflowCoordinateArgs {
 /**
  * Human/CLI coordinate resolution. Reads BOTH indexes (fail-closed — a
  * corrupt index is a {@link StoreIndexError}, never silently empty). No
- * entries for the coordinate ⇒ {@link StoreNotFoundError}. One entry resolves
- * and verifies its referenced object. Two entries with the SAME digest
- * deduplicate to one result (project path wins). Two entries with DIFFERENT
- * digests throw {@link StoreAmbiguityError} carrying the coordinate and both
- * digests — resolution never silently chooses project. An index entry whose
- * object is missing or corrupt is a {@link StoreIntegrityError}, never a
- * returned path. This API is for humans/CLI only — execution resolves
- * digests via {@link resolveWorkflowDigest}.
+ * entries for the coordinate ⇒ {@link StoreNotFoundError}. A project entry is
+ * authoritative when present, even when the global index maps the same
+ * coordinate to a different digest; the global entry is the fallback only
+ * when the project has no match. The selected object's presence metadata is
+ * still reported at both levels. An index entry whose selected object is
+ * missing or corrupt is a {@link StoreIntegrityError}, never a returned path.
+ * This API is for humans/CLI only — execution resolves digests via
+ * {@link resolveWorkflowDigest}.
  */
 export async function resolveWorkflowCoordinate(args: ResolveWorkflowCoordinateArgs): Promise<ResolvedWorkflowObject> {
   const { coordinate, projectRoot, globalRoot, verifier } = args;
@@ -473,11 +471,8 @@ export async function resolveWorkflowCoordinate(args: ResolveWorkflowCoordinateA
   if (projectDigest === undefined && globalDigest === undefined) {
     throw new StoreNotFoundError(coordinate);
   }
-  if (projectDigest !== undefined && globalDigest !== undefined && projectDigest !== globalDigest) {
-    throw new StoreAmbiguityError(coordinate, projectDigest, globalDigest);
-  }
-
-  // One digest now describes the coordinate at every level that holds it.
+  // Project is the deterministic override. Global participates only when the
+  // project index has no matching coordinate.
   const digest = (projectDigest ?? globalDigest) as DefDigest;
   const level: ResolutionLevel = projectDigest !== undefined ? 'project' : 'global';
   const root = level === 'project' ? (projectRoot as string) : globalRoot;

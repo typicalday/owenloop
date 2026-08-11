@@ -34,6 +34,7 @@ import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { SignalHost } from '../src/roles/signals.ts';
 import type { InstructionResolver } from '../src/exec/instructions.ts';
 import type { StepDef } from '../../../src/types.ts';
+import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 import { buildDef } from '../../../src/defs.ts';
 
 // ---- arg parsing ------------------------------------------------------------
@@ -91,8 +92,8 @@ test('parseArgs validates every ms knob as a positive integer', () => {
 test('exitCodeFor maps every outcome to the documented code', () => {
   const zero: AgentRunOutcome[] = ['submitted', 'completed'];
   const one: AgentRunOutcome[] = [
-    'misroute', 'no-template', 'no-harness', 'incompatible-harness-policy', 'unverified-consumed', 'no-submit',
-    'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'stopped',
+    'misroute', 'no-template', 'no-harness', 'incompatible-harness-policy', 'unverified-consumed',
+    'session-store-failed', 'no-submit', 'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'stopped',
   ];
   for (const o of zero) assert.equal(exitCodeFor(o), 0);
   for (const o of one) assert.equal(exitCodeFor(o), 1);
@@ -574,8 +575,8 @@ test('run() builds an MCP mount whose args carry no credential', async () => {
   assert.ok(started !== undefined && started.kind === 'start');
   const mcp = started.args.owenloopMcp;
   assert.deepEqual(mcp, {
-    command: 'owenloop',
-    args: ['work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'default', '--shift=shf_1', '--mcp'],
+    command: process.execPath,
+    args: [resolveOwenloopBin(), 'work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'default', '--shift=shf_1', '--mcp'],
   });
   const flat = JSON.stringify(mcp);
   assert.ok(!flat.includes('olp_secret_value'), flat);

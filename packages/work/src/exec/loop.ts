@@ -259,6 +259,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       try {
         let proof: string | undefined;
         if (opts.origin !== undefined) {
+	  // The immutable order can authorize a judge proof only when the owed
+	  // path is the fingerprinted judged artifact. Producer command receipts
+	  // remain unsigned until the hub issues a retry-safe target version.
           proof = await buildSubmitProof({
             origin: opts.origin,
             order,

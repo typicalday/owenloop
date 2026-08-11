@@ -19,12 +19,16 @@ import { createDefaultRunner } from '../src/exec/runner.ts';
 import { createStoreInstructionResolver } from '../src/exec/instructions.ts';
 import { createHubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse, OrderPacket } from '../src/hub/types.ts';
+import type { SubmissionKeyManager } from '../src/submit-proof.ts';
+import type { SshProcessAdapter } from '../../../src/crypto/ssh.ts';
 
 const CWD = tempDir('owenloop-exec-consumed-e2e-cwd-');
 const EXEC = { kind: 'exec' as const, id: 'consumed-e2e:worker' };
 const rootBlob = Buffer.from('synthetic-exec-consumed-root');
 const ROOT_PUBLIC_KEY = `ssh-ed25519 ${rootBlob.toString('base64')} consumed-root`;
 const ROOT_KEY_ID = keyidFromBlob(rootBlob);
+const ROOT_KEY = publicKeyDescriptor(ROOT_PUBLIC_KEY);
+const SIGNATURE_ARMOR = '-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n';
 const COMMAND_MARKER = join(CWD, 'consumed-command-ran');
 const LOCAL_COMMAND = `touch ${COMMAND_MARKER}; printf "consumed-command-ran\\n"`;
 const WORKFLOW = `name: exec-consumed-fixture
@@ -97,18 +101,42 @@ function order(defDigest: string, deliveredValue: unknown, consumesProof?: strin
     defDigest,
     consumes: { input: deliveredValue },
     consumedFingerprint: { input: 4 },
-    owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+    owes: [{ path: 'out', version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
     ...(consumesProof === undefined ? {} : { consumesProof }),
   };
   return { text: '', workflow: packet.workflow, run, order: packet, lease: { claimed: true } };
 }
 
-function makeLoop(origin: string, resolver: ReturnType<typeof createStoreInstructionResolver>, run = 'run-consumed-e2e'): ReturnType<typeof createExecLoop> {
+function signingKeys(origin: string): SubmissionKeyManager {
+  return {
+    resolveRef: () => ({ origin, kind: 'machine', id: 'local' }),
+    inspect: async () => ({ exists: true, source: 'generated', backend: 'file', publicKey: ROOT_KEY }),
+    withSigningKey: async (_ref, callback) => callback('/fake/private-key'),
+  };
+}
+
+function fakeSshProcess(): SshProcessAdapter {
+  return {
+    probe: () => ({ status: 255, stderr: Buffer.from('No principal matched\n') }),
+    async run(_cmd, args) {
+      const stdout = args[0] === '-y' && args[1] === '-f' ? ROOT_PUBLIC_KEY : SIGNATURE_ARMOR;
+      return { status: 0, stdout: Buffer.from(stdout), stderr: Buffer.alloc(0), timedOut: false, truncated: false };
+    },
+  };
+}
+
+function makeLoop(
+  origin: string,
+  resolver: ReturnType<typeof createStoreInstructionResolver>,
+  run = 'run-consumed-e2e',
+  signSubmissions = false,
+): ReturnType<typeof createExecLoop> {
   return createExecLoop({
     hub: createHubClient({ origin, getToken: async () => 'consumed-e2e-token' }),
     runner: createDefaultRunner(),
     workflow: 'wf-consumed-e2e',
     run,
+    ...(signSubmissions ? { origin, principalKeys: signingKeys(origin), sshProcess: fakeSshProcess() } : {}),
     holder: EXEC,
     instructions: resolver,
     cwd: CWD,
@@ -191,6 +219,30 @@ test('command e2e: no proof refuses before spawn', async () => {
   }
 });
 
+test('command e2e: historical proof without claim-time expected version refuses before spawn', async () => {
+  const fixtureData = await fixture();
+  const marker = COMMAND_MARKER;
+  rmSync(marker, { force: true });
+  const packet = order(
+    fixtureData.defDigest,
+    'dynamic-value',
+    JSON.stringify({ input: submissionProof('dynamic-value') }),
+    'run-historical-proof',
+  );
+  assert.ok(packet.order !== null);
+  packet.order.consumedFingerprint = {};
+  const hub = await startHub(packet);
+  try {
+    const loop = makeLoop(hub.origin, resolverFor(fixtureData, 'off'), 'run-historical-proof');
+    assert.equal(await loop.run(), 'unresolved-instructions');
+    assert.equal(pathExists(marker), false);
+    assert.equal(hub.reqs.filter((request) => request.verb === 'submit').length, 0);
+    assert.equal(hub.reqs.filter((request) => request.verb === 'release').length, 1);
+  } finally {
+    hub.server.close();
+  }
+});
+
 test('command e2e: proof over a different value refuses before spawn', async () => {
   const fixtureData = await fixture();
   const marker = COMMAND_MARKER;
@@ -229,5 +281,71 @@ test('command e2e: malformed proof refuses even when artifact policy is off', as
     assert.equal(third.reqs.filter((request) => request.verb === 'release').length, 1);
   } finally {
     third.server.close();
+  }
+});
+
+test('command e2e: unsigned feedback does not block a command with signed consumed artifacts', async () => {
+  const fixtureData = await fixture();
+  const marker = COMMAND_MARKER;
+  rmSync(marker, { force: true });
+  const packet = order(
+    fixtureData.defDigest,
+    'dynamic-value',
+    JSON.stringify({ input: submissionProof('dynamic-value') }),
+    'run-feedback-without-proof',
+  );
+  assert.ok(packet.order !== null);
+  packet.order.owes[0]!.reasons = [{
+    at: 20,
+    action: 'reject',
+    kind: 'structural',
+    by: 'engine',
+    text: 'auto-invalidated: input changed',
+    fromVersion: 1,
+  }];
+
+  const hub = await startHub(packet);
+  try {
+    const loop = makeLoop(hub.origin, resolverFor(fixtureData), 'run-feedback-without-proof');
+    assert.equal(await loop.run(), 'submitted');
+    assert.equal(pathExists(marker), true);
+    assert.equal(hub.reqs.filter((request) => request.verb === 'submit').length, 1);
+    assert.equal(hub.reqs.filter((request) => request.verb === 'release').length, 0);
+  } finally {
+    hub.server.close();
+    rmSync(marker, { force: true });
+  }
+});
+
+test('command e2e: immutable producer claim metadata cannot authorize a signed receipt proof', async () => {
+  const fixtureData = await fixture();
+  const marker = COMMAND_MARKER;
+  rmSync(marker, { force: true });
+  const packet = order(fixtureData.defDigest, undefined, undefined, 'run-feedback-version');
+  assert.ok(packet.order !== null);
+  packet.order.inputs = [];
+  packet.order.consumes = {};
+  packet.order.consumedFingerprint = {};
+  packet.order.owes[0]!.version = 0;
+  packet.order.owes[0]!.reasons = [{
+    at: 20,
+    action: 'reject',
+    kind: 'structural',
+    by: 'engine',
+    text: 'attacker-controlled feedback',
+    fromVersion: 99,
+  }];
+
+  const hub = await startHub(packet);
+  try {
+    const loop = makeLoop(hub.origin, resolverFor(fixtureData), 'run-feedback-version', true);
+    assert.equal(await loop.run(), 'submitted');
+    assert.equal(pathExists(marker), true, 'unsigned feedback that cannot reach the command does not block execution');
+    const submit = hub.reqs.find((request) => request.verb === 'submit');
+    assert.ok(submit?.body !== undefined);
+    assert.equal(submit.body['proof'], undefined);
+  } finally {
+    hub.server.close();
+    rmSync(marker, { force: true });
   }
 });

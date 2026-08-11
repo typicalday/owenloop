@@ -361,6 +361,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     // bytes that will be committed, with no re-write after validation.
     const reasons: string[] = [];
     let staged: Map<string, ReturnType<typeof loadDefFile>>;
+    let externalVersionedCalls: ReadonlySet<string> = new Set();
     const manifestPath = join(stagingDir, 'bundle.yaml');
     if (existsSync(manifestPath)) {
       // Real `.wnlp` bundles carry an explicit workflow map. Load every listed
@@ -368,6 +369,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       staged = new Map<string, ReturnType<typeof loadDefFile>>();
       try {
         const manifest = parseManifestBytes(readFileSync(manifestPath));
+	externalVersionedCalls = new Set(Object.keys(manifest.lock));
         for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
           const workflowFile = join(stagingDir, workflowPath);
           try {
@@ -415,7 +417,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     }
     if (reasons.length === 0) {
       try {
-        finalizeDefs(staged);
+	finalizeDefs(staged, { allowUnresolvedVersionedCalls: externalVersionedCalls });
       } catch (e) {
         if (e instanceof DefError) {
           reasons.push(`cross-definition validation failed: ${e.message}`);

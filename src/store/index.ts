@@ -87,8 +87,12 @@ export {
 export type { BundleIngestorOptions } from './ingestor.ts';
 
 // ---- WS-6 CAS -> calls: def bridge ----
-export { loadCasDefs } from './def-source.ts';
-export type { CasDefRegistration, LoadCasDefsArgs } from './def-source.ts';
+export { inspectCasDefs, loadCasDefs } from './def-source.ts';
+export type {
+  CasDefInspectionResult,
+  CasDefRegistration,
+  LoadCasDefsArgs,
+} from './def-source.ts';
 
 // ---- WP-E2a origin execution policy ----
 export {

@@ -1667,6 +1667,14 @@ export function lintDef(def: WorkflowDef): { errors: string[]; warnings: string[
 
 // ---- WS-6: scope-aware calls: target resolution -------------------------------
 
+/** Stable private-map key for one installed coordinate at one verified digest. */
+export function digestScopedCallsTargetKey(
+  digest: string,
+  target: string,
+): string {
+  return `${digest}/${target}`;
+}
+
 /**
  * Resolve one `calls:` edge to the def map KEY that edge names, honoring CAS
  * bundle scope. Returns `undefined` when nothing matches (the caller reports the
@@ -1674,14 +1682,15 @@ export function lintDef(def: WorkflowDef): { errors: string[]; warnings: string[
  *
  * THREE CASES, checked in this order:
  *
- *  1. `target` contains `/` — an explicitly QUALIFIED reference
- *     (`<package>/<workflow>`, or an explicit `namespace/name@version` whose
- *     text is the map key a CAS registration was filed under). Look up the flat
- *     map with that exact key and DO NOT fall back to a bare lookup: an author
- *     who wrote a qualified name asked for one specific def, and silently
- *     serving a same-named local def would be the shadowing this workstream
- *     exists to prevent. A def name can never contain `/` (see NAME_RE), so a
- *     qualified key is unforgeable as a filesystem def name.
+ *  1. `target` contains `/` — an explicitly QUALIFIED reference. When the
+ *     calling definition carries a lock digest for that exact target, prefer the
+ *     digest-scoped coordinate alias registered by the CAS loader. That preserves
+ *     an already-running parent's selection when a project coordinate later
+ *     shadows the global coordinate it originally pinned. Without a reachable
+ *     pinned alias, use the direct coordinate/package key so new lookups retain
+ *     project-over-global precedence and the engine can surface a pin mismatch.
+ *     Never fall back to a bare lookup: an author who wrote a qualified name
+ *     asked for one specific definition.
  *
  *  2. `from` carries a `bundleDigest` (it was loaded out of a CAS bundle) and
  *     `target` is bare — resolve SIBLING-FIRST: search the map for a def whose
@@ -1702,7 +1711,14 @@ function resolveCallsTargetKey(
   target: string,
   from: WorkflowDef,
 ): string | undefined {
-  if (target.includes('/')) return defs.has(target) ? target : undefined;
+  if (target.includes('/')) {
+    const pinnedDigest = from.bundleLock?.[target];
+    if (pinnedDigest !== undefined) {
+      const pinnedKey = digestScopedCallsTargetKey(pinnedDigest, target);
+      if (defs.has(pinnedKey)) return pinnedKey;
+    }
+    return defs.has(target) ? target : undefined;
+  }
   if (from.bundleDigest !== undefined) {
     for (const [key, candidate] of defs) {
       if (candidate.bundleDigest === from.bundleDigest && candidate.name === target) return key;
@@ -1868,7 +1884,24 @@ export function loadDefsUnfinalized(dir: string): Map<string, WorkflowDef> {
  * for a def without `_includes` (the normal in-memory case), so passing a plain
  * def map through is cheap and only adds the cross-def + cycle checks.
  */
-export function finalizeDefs(raw: Map<string, WorkflowDef>): Map<string, WorkflowDef> {
+export interface FinalizeDefsOptions {
+  /**
+   * Explicit versioned targets whose definitions live in another installed
+   * bundle. Install-time validation may defer those edges; executable discovery
+   * later validates them against the complete store map before any run starts.
+   */
+  allowUnresolvedVersionedCalls?: ReadonlySet<string>;
+  /**
+   * Permit unresolved `calls:` edges in an explicitly partial, read-only map.
+   * Never use this option to construct an executable resolver.
+   */
+  allowUnresolvedCalls?: boolean;
+}
+
+export function finalizeDefs(
+  raw: Map<string, WorkflowDef>,
+  options: FinalizeDefsOptions = {},
+): Map<string, WorkflowDef> {
   const out = new Map<string, WorkflowDef>();
   const resolver = (name: string): WorkflowDef | undefined => raw.get(name);
   for (const [name, def] of raw) {
@@ -1885,6 +1918,10 @@ export function finalizeDefs(raw: Map<string, WorkflowDef>): Map<string, Workflo
       if (!l.calls) continue;
       const childDef = resolveCallsTarget(raw, l.calls, expanded);
       if (!childDef) {
+	if (
+	  options.allowUnresolvedCalls === true
+	  || options.allowUnresolvedVersionedCalls?.has(l.calls) === true
+	) continue;
         throw new DefError(`calls names workflow '${l.calls}' which does not exist`);
       }
       const childInputNames = new Set(childDef.inputs.map((i) => i.name));

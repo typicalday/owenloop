@@ -203,6 +203,8 @@ export interface Order {
   /** the owed outputs and their accumulated reason threads (the feedback channel) */
   owes: Array<{
     path: string;
+    /** Current committed artifact version captured by the engine at claim time. */
+    version?: number;
     judgmentRejects: number;
     schemaRejects: number;
     reasons: ReasonEntry[];

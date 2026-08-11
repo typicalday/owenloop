@@ -1738,6 +1738,7 @@ export class Engine {
       const a = arts.get(p);
       return {
         path: p,
+	version: a?.version ?? 0,
         judgmentRejects: a?.judgmentRejects ?? 0,
         schemaRejects: a?.schemaRejects ?? 0,
         reasons: a?.reasons ?? [],

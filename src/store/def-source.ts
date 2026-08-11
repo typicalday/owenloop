@@ -1,265 +1,371 @@
 /**
- * WS-6: the CAS → `WorkflowDef` bridge.
+ * WS-6: the content-addressed workflow store → `WorkflowDef` bridge.
  *
- * Two DIFFERENT install systems put workflows on disk, and before this module
- * only one of them was reachable from a `calls:` edge:
- *
- *   - `owenloop add` (GitHub route) writes a ledger (`.owenloop/installed.json`)
- *     naming subfolders of the defs dir. `loadDefsWithInstalled` (cli.ts) folds
- *     those defs into the SAME flat map the engine's `DefResolver` reads, so a
- *     project-local def can already `calls:` an `add`-installed def by name.
- *
- *   - `owenloop bundle add` (CAS route) writes an immutable object under
- *     `objects/sha256/<bundle-digest>/` plus an `index.json` entry. Until this
- *     module, those defs were read ONLY by `createStoreInstructionSource` — an
- *     `OrderInstructionSource`, which maps a digest to a step body. Nothing ever
- *     handed them to a `DefResolver`, so a `calls:` edge could not reach them.
- *
- * This module closes that second gap: it walks both store roots' indexes, loads
- * every workflow out of every indexed bundle object, and returns registrations
- * carrying enough provenance for the resolver to place them precisely.
- *
- * TWO KEYS PER WORKFLOW, DELIBERATELY ASYMMETRIC:
- *
- *   - `qualified` (`<package>/<workflow>`) IS registered in the flat def map.
- *     It is unforgeable as a project-local name because a def name must match
- *     `/^[a-z0-9][a-z0-9_-]*$/i` (defs.ts), which excludes `/`. So a CAS entry
- *     can never collide with, or shadow, a filesystem def.
- *
- *   - `bare` (the plain workflow name) is NEVER registered in the flat map. A
- *     bare `calls:` reaches it only from a def in the SAME bundle, matched on
- *     `bundleDigest` equality by the scope-aware resolver in defs.ts. This is
- *     what keeps `calls: build` inside bundle A from silently binding to an
- *     unrelated `build` inside bundle B.
- *
- * FAIL-OPEN, matching `loadDefsWithInstalled`: a corrupt index, an unreadable
- * object, or a bundle whose workflows do not validate emits a warning through
- * the caller's `warn` sink and is SKIPPED. A bad CAS object must never break
- * `owenloop status`. (The install-time path in install.ts stays fail-closed —
- * this is read-side discovery refusing to act on bad data, not acceptance.)
- *
- * SYNCHRONOUS by construction. `openCtx` and `dispatch` in cli.ts are both
- * synchronous, so this loader cannot use the `Promise`-returning
- * `resolveWorkflowDigest` / `BundleIngestor.verifyInstalledObject` path that
- * `createStoreInstructionSource` uses. It performs the same probes and the same
- * integrity verification through `verifyWorkflowObjectSync`, whose body is
- * already entirely `*Sync` filesystem calls.
+ * Executable discovery is strict: an indexed coordinate is an integrity
+ * boundary, so a corrupt index or object aborts discovery rather than
+ * disappearing and allowing another store level to win. A valid multi-workflow
+ * bundle without a default remains explicit-workflow-only and gets no coordinate
+ * alias. Read-only callers that deliberately accept partial data must use
+ * {@link inspectCasDefs}; its result carries `complete: false` whenever data was
+ * skipped and must never be used to build an executable `DefResolver`.
  */
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseManifestBytes } from '../bundle/manifest.ts';
-import { loadDefFile } from '../defs.ts';
+import type { BundleManifest } from '../bundle/types.ts';
+import { digestScopedCallsTargetKey, loadDefFile } from '../defs.ts';
 import type { WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
 import {
-  coordinateDigestReadSync,
-  probeObjectDir,
-  probeStoreRoot,
-  projectStoreRoot,
-  storeIndexPath,
+	coordinateDigestReadSync,
+	probeObjectDir,
+	probeStoreRoot,
+	projectStoreRoot,
+	storeIndexPath,
 } from './resolve.ts';
-import { defDigest, objectDirForDigest } from './types.ts';
-import type { DefDigest, ResolutionLevel } from './types.ts';
+import {
+	defDigest,
+	objectDirForDigest,
+	parseWorkflowCoordinate,
+	StoreIntegrityError,
+} from './types.ts';
+import type {
+	DefDigest,
+	ResolutionLevel,
+	WorkflowCoordinate,
+	WorkflowStoreIndexEntry,
+} from './types.ts';
 
-/** One workflow from one installed CAS bundle, with the provenance the resolver needs. */
+/** One workflow or coordinate alias from one verified CAS bundle. */
 export interface CasDefRegistration {
-  /**
-   * The flat-map key this def is registered under. Normally the QUALIFIED key
-   * `<package>/<workflow>`. When two DIFFERENT bundle digests both export that
-   * same qualified key — the same package installed at two versions — the first
-   * one registered keeps it and every later one is registered under the
-   * DIGEST-SCOPED key `<bundleDigest>/<workflow>` instead.
-   *
-   * The loser is deliberately kept reachable rather than dropped: a parent
-   * instance pinned (§28) to the older bundle must still be able to resolve its
-   * own sibling, or installing a newer version would retroactively break a
-   * running parent — exactly the failure this workstream exists to prevent.
-   *
-   * Either form contains `/`, which a def name may not
-   * (`/^[a-z0-9][a-z0-9_-]*$/i`), so neither can shadow a filesystem def.
-   */
-  key: string;
-  /**
-   * Qualified key `<package>/<workflow>` — the human-facing name. Equal to
-   * {@link key} unless another bundle digest already claimed it.
-   */
-  qualified: string;
-  /**
-   * The bare workflow name. Resolvable ONLY from a def whose `bundleDigest`
-   * equals this registration's; never a flat-map key.
-   */
-  bare: string;
-  /** The loaded (not yet finalized) definition, already carrying provenance. */
-  def: WorkflowDef;
-  /** The canonical bundle digest of the store object this def came from. */
-  bundleDigest: DefDigest;
-  /** The installed bundle's `package.name`. */
-  bundlePackage: string;
-  /** Which store root supplied the object (`project` wins a same-digest pair). */
-  level: ResolutionLevel;
+	/** Flat-map key: package/workflow, digest/workflow, coordinate, or digest/coordinate. */
+	key: string;
+	/** Human-facing package/workflow key for the selected definition. */
+	qualified: string;
+	/** Bare workflow name, used only for same-bundle sibling resolution. */
+	bare: string;
+	/** Loaded, unfinalized definition carrying bundle provenance. */
+	def: WorkflowDef;
+	/** Verified bundle object digest. */
+	bundleDigest: DefDigest;
+	/** Manifest package name. */
+	bundlePackage: string;
+	/** Store level that supplied the verified object bytes. */
+	level: ResolutionLevel;
+	/** Registration purpose. Coordinate aliases are exact versioned call targets. */
+	kind: 'workflow' | 'coordinate';
+	/** Present only for a full versioned coordinate alias. */
+	coordinate?: WorkflowCoordinate;
 }
 
 export interface LoadCasDefsArgs {
-  /** The project store root (the resolved defs dir); `undefined` = global-only. */
-  projectRoot?: string;
-  /** The global store root, normally `<home>/.owenloop/workflows`. */
-  globalRoot: string;
-  /** Warning sink — one line per skipped index/object. Never throws. */
-  warn: (line: string) => void;
+	/** Project store root (the resolved defs directory); undefined = global-only. */
+	projectRoot?: string;
+	/** Global store root, normally `<home>/.owenloop/workflows`. */
+	globalRoot: string;
+	/** Warning sink used only by tolerant inspection and collision notices. */
+	warn: (line: string) => void;
 }
 
-/** Read one root's index, returning its digests; fail-open on a bad index. */
-function indexedDigests(root: string, level: ResolutionLevel, warn: (line: string) => void): DefDigest[] {
-  let probe: 'dir' | 'absent';
-  try {
-    probe = probeStoreRoot(root);
-  } catch (e) {
-    warn(`warning: skipping ${level} workflow store at ${root}: ${(e as Error).message}`);
-    return [];
-  }
-  if (probe !== 'dir') return [];
-  try {
-    const index = readWorkflowStoreIndex(storeIndexPath(root));
-    const out: DefDigest[] = [];
-    for (const entry of Object.values(index.entries)) {
-      try {
-        out.push(defDigest(entry.digest));
-      } catch (e) {
-        warn(`warning: skipping ${level} workflow store entry: ${(e as Error).message}`);
-      }
-    }
-    return out.sort((a, b) => a.localeCompare(b));
-  } catch (e) {
-    warn(`warning: skipping ${level} workflow store index at ${root}: ${(e as Error).message}`);
-    return [];
-  }
+/** Explicitly partial result for read-only inspection. */
+export interface CasDefInspectionResult {
+	registrations: CasDefRegistration[];
+	/** False when any store root, index, object, or coordinate was skipped. */
+	complete: boolean;
 }
 
 class CasObjectAbsentDuringCoordinatedRead extends Error {}
 
-/**
- * Load every workflow from ONE verified bundle object.
- *
- * Throws on any problem — the caller converts that into a warning and skips the
- * whole bundle, so a half-loaded bundle is never registered.
- */
-function loadObjectDefs(
-  objectDir: string,
-  bundleDigest: DefDigest,
-): { bundlePackage: string; defs: Map<string, WorkflowDef> } {
-  verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false });
-  const manifest = parseManifestBytes(readFileSync(join(objectDir, 'bundle.yaml')));
-  const defs = new Map<string, WorkflowDef>();
-  for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
-    const def = loadDefFile(join(objectDir, workflowPath));
-    if (def.name !== workflowName) {
-      throw new Error(
-        `workflow '${workflowPath}' has definition name '${def.name}', expected '${workflowName}'`,
-      );
-    }
-    // Provenance is stamped here, on the ONE object that owns it. Both fields
-    // are optional on WorkflowDef and are excluded from `defInstructionDigest`'s
-    // projection (order-resolver.ts), so an installed def's instruction identity
-    // is byte-identical whether it is read through this loader or through
-    // `createStoreInstructionSource`.
-    def.bundlePackage = manifest.package.name;
-    def.bundleDigest = bundleDigest;
-    // Copy (not alias) the manifest lock so the engine's spawn-time pin check is
-    // pure in-memory work inside the child-creating transaction.
-    def.bundleLock = { ...manifest.lock };
-    defs.set(def.name, def);
-  }
-  return { bundlePackage: manifest.package.name, defs };
+/** Runtime incompatibility is a listing warning, unlike store corruption. */
+class CasRuntimeIncompatibleError extends Error {}
+
+function isRuntimeIncompatible(error: unknown): boolean {
+	return error instanceof Error
+		&& error.message.includes('incompatible with this Owenloop runtime');
 }
 
-/**
- * Discover every `calls:`-reachable definition installed in the content-
- * addressed workflow store.
- *
- * Resolution order mirrors `resolveWorkflowDigest`: the project root is walked
- * first, so when the SAME bundle digest is installed at both levels the project
- * copy is the one registered and the global copy is skipped (identical bytes by
- * construction — the digest IS the identity — so this is deduplication, not a
- * precedence choice).
- *
- * Two DIFFERENT digests exporting the same `<package>/<workflow>` — the same
- * package installed at two versions — is NOT a conflict to drop one side of.
- * The first registration (project root first, then index order) keeps the plain
- * qualified key; every later one is registered under `<bundleDigest>/<workflow>`
- * and reported through `warn`. Both stay reachable, because a parent instance
- * pinned to the older bundle must keep resolving its own siblings after a newer
- * version is installed.
- *
- * Never throws. Every failure path warns and continues.
- */
+interface IndexedCoordinate {
+	coordinate: WorkflowCoordinate;
+	entry: WorkflowStoreIndexEntry;
+	root: string;
+	level: ResolutionLevel;
+}
+
+interface LoadedObject {
+	bundleDigest: DefDigest;
+	manifest: BundleManifest;
+	defs: Map<string, WorkflowDef>;
+	level: ResolutionLevel;
+}
+
+interface ReadIndexResult {
+	entries: IndexedCoordinate[];
+	complete: boolean;
+}
+
+function failureMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/** Read one root's coordinate-preserving index. */
+function readIndexedCoordinates(
+	root: string,
+	level: ResolutionLevel,
+	tolerant: boolean,
+	warn: (line: string) => void,
+): ReadIndexResult {
+	try {
+		if (probeStoreRoot(root) !== 'dir') return { entries: [], complete: true };
+		const index = readWorkflowStoreIndex(storeIndexPath(root));
+		const entries = Object.entries(index.entries)
+			.sort(([a], [b]) => a.localeCompare(b))
+			.map(([coordinate, entry]) => ({
+				coordinate: coordinate as WorkflowCoordinate,
+				entry,
+				root,
+				level,
+			}));
+		return { entries, complete: true };
+	} catch (error) {
+		if (!tolerant) throw error;
+		warn(`warning: incomplete ${level} workflow store at ${root}: ${failureMessage(error)}`);
+		return { entries: [], complete: false };
+	}
+}
+
+/** Load and verify every definition in one immutable object. */
+function loadObjectDefs(
+	objectDir: string,
+	bundleDigest: DefDigest,
+	level: ResolutionLevel,
+): LoadedObject {
+	try {
+		verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false });
+		const manifest = parseManifestBytes(readFileSync(join(objectDir, 'bundle.yaml')));
+		const defs = new Map<string, WorkflowDef>();
+		for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
+			const def = loadDefFile(join(objectDir, workflowPath));
+			if (def.name !== workflowName) {
+				throw new Error(
+					`workflow '${workflowPath}' has definition name '${def.name}', expected '${workflowName}'`,
+				);
+			}
+			def.bundlePackage = manifest.package.name;
+			def.bundleDigest = bundleDigest;
+			def.bundleLock = { ...manifest.lock };
+			defs.set(def.name, def);
+		}
+		return { bundleDigest, manifest, defs, level };
+	} catch (error) {
+		if (isRuntimeIncompatible(error)) {
+			throw new CasRuntimeIncompatibleError(failureMessage(error));
+		}
+		if (error instanceof StoreIntegrityError) throw error;
+		throw new StoreIntegrityError('object-corrupt', bundleDigest, failureMessage(error));
+	}
+}
+
+function loadObjectIfPresent(
+	root: string,
+	digest: DefDigest,
+	level: ResolutionLevel,
+): LoadedObject | undefined {
+	const objectDir = objectDirForDigest(root, digest);
+	try {
+		return coordinateDigestReadSync(root, digest, () => {
+			if (probeObjectDir(objectDir, digest, level) !== 'dir') {
+				throw new CasObjectAbsentDuringCoordinatedRead();
+			}
+			return loadObjectDefs(objectDir, digest, level);
+		});
+	} catch (error) {
+		if (error instanceof CasObjectAbsentDuringCoordinatedRead) return undefined;
+		if (error instanceof CasRuntimeIncompatibleError || error instanceof StoreIntegrityError) throw error;
+		throw new StoreIntegrityError('object-corrupt', digest, failureMessage(error));
+	}
+}
+
+function resolveObject(
+	indexed: IndexedCoordinate,
+	globalRoot: string,
+	globalDigests: ReadonlySet<DefDigest>,
+): LoadedObject {
+	const digest = defDigest(indexed.entry.digest);
+	const primary = loadObjectIfPresent(indexed.root, digest, indexed.level);
+	if (primary !== undefined) return primary;
+
+	// An indexed project object may fall through only to the exact same digest,
+	// and only when that digest is also indexed globally. A different global
+	// digest for the coordinate is never considered.
+	if (indexed.level === 'project' && globalDigests.has(digest)) {
+		const fallback = loadObjectIfPresent(globalRoot, digest, 'global');
+		if (fallback !== undefined) return fallback;
+	}
+
+	throw new StoreIntegrityError(
+		'object-missing',
+		digest,
+		`indexed by ${indexed.level} coordinate '${indexed.coordinate}', but no verified object directory exists`,
+	);
+}
+
+/** Verify coordinate identity and select the one workflow the coordinate calls. */
+function coordinateTarget(indexed: IndexedCoordinate, loaded: LoadedObject): WorkflowDef | undefined {
+	const parsed = parseWorkflowCoordinate(indexed.coordinate);
+	if (
+		parsed.name !== loaded.manifest.package.name
+		|| parsed.version !== loaded.manifest.package.version
+	) {
+		throw new StoreIntegrityError(
+			'object-corrupt',
+			loaded.bundleDigest,
+			`coordinate '${indexed.coordinate}' does not match manifest package ` +
+				`'${loaded.manifest.package.name}@${loaded.manifest.package.version}'`,
+		);
+	}
+
+	const workflowName = loaded.manifest.default
+		?? (loaded.defs.size === 1 ? loaded.defs.keys().next().value as string | undefined : undefined);
+	if (workflowName === undefined) return undefined;
+	const target = loaded.defs.get(workflowName);
+	if (target === undefined) {
+		throw new StoreIntegrityError(
+			'object-corrupt',
+			loaded.bundleDigest,
+			`coordinate '${indexed.coordinate}' selects missing workflow '${workflowName}'`,
+		);
+	}
+	return target;
+}
+
+function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspectionResult {
+	const projectRoot = args.projectRoot === undefined ? undefined : projectStoreRoot(args.projectRoot);
+	const globalRoot = projectStoreRoot(args.globalRoot);
+	const sameRoot = projectRoot === undefined || projectRoot === globalRoot;
+
+	const project = sameRoot
+		? { entries: [] as IndexedCoordinate[], complete: true }
+		: readIndexedCoordinates(projectRoot, 'project', tolerant, args.warn);
+	const global = readIndexedCoordinates(globalRoot, 'global', tolerant, args.warn);
+	let complete = project.complete && global.complete;
+
+	const projectCoordinates = new Set(project.entries.map((item) => item.coordinate));
+	const selected: Array<IndexedCoordinate & { registerAlias: boolean }> = [
+		...project.entries.map((item) => ({ ...item, registerAlias: true })),
+		...global.entries
+			.filter((item) => !projectCoordinates.has(item.coordinate))
+			.map((item) => ({ ...item, registerAlias: true })),
+		// A shadowed global coordinate never receives the direct precedence alias, but
+		// its workflows and callable coordinate remain digest-scoped for pinned runs.
+		...global.entries
+			.filter((item) => projectCoordinates.has(item.coordinate))
+			.map((item) => ({ ...item, registerAlias: false })),
+	];
+	const globalDigests = new Set<DefDigest>();
+	for (const item of global.entries) globalDigests.add(defDigest(item.entry.digest));
+
+	const registrations: CasDefRegistration[] = [];
+	const loadedByDigest = new Map<DefDigest, LoadedObject>();
+	const registeredDigests = new Set<DefDigest>();
+	const registeredCoordinateKeys = new Set<string>();
+	const byQualified = new Map<string, CasDefRegistration>();
+
+	const registerObjectWorkflows = (loaded: LoadedObject): void => {
+		if (registeredDigests.has(loaded.bundleDigest)) return;
+		registeredDigests.add(loaded.bundleDigest);
+		for (const def of loaded.defs.values()) {
+			const qualified = `${loaded.manifest.package.name}/${def.name}`;
+			const winner = byQualified.get(qualified);
+			const key = winner === undefined ? qualified : `${loaded.bundleDigest}/${def.name}`;
+			if (winner !== undefined) {
+				args.warn(
+					`warning: workflow '${qualified}' from ${loaded.level} bundle ${loaded.bundleDigest} ` +
+						`does not hold that name — ${winner.level} bundle ${winner.bundleDigest} claimed it first; ` +
+						`this copy stays reachable as '${key}'`,
+				);
+			}
+			const registration: CasDefRegistration = {
+				key,
+				qualified,
+				bare: def.name,
+				def,
+				bundleDigest: loaded.bundleDigest,
+				bundlePackage: loaded.manifest.package.name,
+				level: loaded.level,
+				kind: 'workflow',
+			};
+			if (winner === undefined) byQualified.set(qualified, registration);
+			registrations.push(registration);
+		}
+	};
+
+	for (const indexed of selected) {
+		try {
+			const digest = defDigest(indexed.entry.digest);
+			let loaded = loadedByDigest.get(digest);
+			if (loaded === undefined) {
+				loaded = resolveObject(indexed, globalRoot, globalDigests);
+				loadedByDigest.set(digest, loaded);
+			}
+			const target = coordinateTarget(indexed, loaded);
+			registerObjectWorkflows(loaded);
+			if (target === undefined) {
+				if (indexed.registerAlias) {
+					args.warn(
+						`warning: coordinate '${indexed.coordinate}' is not callable because the bundle exports ` +
+							`multiple workflows and has no default; use an explicit package/workflow target`,
+					);
+				}
+				continue;
+			}
+
+			// Every callable coordinate gets a digest-scoped alias, including a
+			// shadowed global coordinate. A running parent can therefore follow its
+			// lock digest without changing the direct project's precedence alias.
+			const coordinateKeys = [
+				digestScopedCallsTargetKey(digest, indexed.coordinate),
+				...(indexed.registerAlias ? [indexed.coordinate] : []),
+			];
+			for (const key of coordinateKeys) {
+				if (registeredCoordinateKeys.has(key)) continue;
+				registeredCoordinateKeys.add(key);
+				registrations.push({
+					key,
+					qualified: `${loaded.manifest.package.name}/${target.name}`,
+					bare: target.name,
+					def: target,
+					bundleDigest: digest,
+					bundlePackage: loaded.manifest.package.name,
+					level: loaded.level,
+					kind: 'coordinate',
+					coordinate: indexed.coordinate,
+				});
+			}
+		} catch (error) {
+			if (error instanceof CasRuntimeIncompatibleError) {
+				complete = false;
+				args.warn(`warning: skipping ${indexed.level} workflow object ${indexed.entry.digest}: ${error.message}`);
+				continue;
+			}
+			if (!tolerant) throw error;
+			complete = false;
+			args.warn(
+				`warning: incomplete ${indexed.level} workflow coordinate '${indexed.coordinate}': ${failureMessage(error)}`,
+			);
+		}
+	}
+
+	return { registrations, complete };
+}
+
+/** Strict executable discovery. Any indexed integrity failure aborts. */
 export function loadCasDefs(args: LoadCasDefsArgs): CasDefRegistration[] {
-  const { warn } = args;
-  const projectRoot = args.projectRoot === undefined ? undefined : projectStoreRoot(args.projectRoot);
-  const globalRoot = projectStoreRoot(args.globalRoot);
+	return discoverCasDefs(args, false).registrations;
+}
 
-  const roots: Array<{ root: string; level: ResolutionLevel }> =
-    projectRoot === undefined || projectRoot === globalRoot
-      ? [{ root: globalRoot, level: 'global' }]
-      : [
-          { root: projectRoot, level: 'project' },
-          { root: globalRoot, level: 'global' },
-        ];
-
-  const out: CasDefRegistration[] = [];
-  const byQualified = new Map<string, CasDefRegistration>();
-  const seenDigests = new Set<DefDigest>();
-
-  for (const { root, level } of roots) {
-    for (const bundleDigest of indexedDigests(root, level, warn)) {
-      // Same digest at both levels is the same bytes: register once, project first.
-      if (seenDigests.has(bundleDigest)) continue;
-
-      const objectDir = objectDirForDigest(root, bundleDigest);
-      let loaded: { bundlePackage: string; defs: Map<string, WorkflowDef> };
-      try {
-	loaded = coordinateDigestReadSync(root, bundleDigest, () => {
-	  if (probeObjectDir(objectDir, bundleDigest, level) !== 'dir') {
-	    throw new CasObjectAbsentDuringCoordinatedRead();
-	  }
-	  return loadObjectDefs(objectDir, bundleDigest);
-	});
-      } catch (e) {
-	// An absent object is not an error — the other root may hold the digest.
-	if (e instanceof CasObjectAbsentDuringCoordinatedRead) continue;
-        warn(`warning: skipping ${level} workflow object ${bundleDigest}: ${(e as Error).message}`);
-        continue;
-      }
-      seenDigests.add(bundleDigest);
-
-      for (const def of loaded.defs.values()) {
-        const qualified = `${loaded.bundlePackage}/${def.name}`;
-        const winner = byQualified.get(qualified);
-        // A second bundle digest claiming the same qualified key keeps its own
-        // digest-scoped key rather than being dropped — see `CasDefRegistration.key`.
-        const key = winner === undefined ? qualified : `${bundleDigest}/${def.name}`;
-        if (winner !== undefined) {
-          warn(
-            `warning: workflow '${qualified}' from ${level} bundle ${bundleDigest} does not hold that name — ` +
-              `${winner.level} bundle ${winner.bundleDigest} claimed it first; ` +
-              `this copy stays reachable as '${key}' (bare calls: inside its own bundle are unaffected)`,
-          );
-        }
-        const registration: CasDefRegistration = {
-          key,
-          qualified,
-          bare: def.name,
-          def,
-          bundleDigest,
-          bundlePackage: loaded.bundlePackage,
-          level,
-        };
-        if (winner === undefined) byQualified.set(qualified, registration);
-        out.push(registration);
-      }
-    }
-  }
-
-  return out;
+/** Tolerant read-only inspection. Never use this result for execution. */
+export function inspectCasDefs(args: LoadCasDefsArgs): CasDefInspectionResult {
+	return discoverCasDefs(args, true);
 }
