@@ -21,13 +21,27 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { createAgentRunLoop, type AdapterResolution, type AgentRunLoopOptions } from '../src/agent/loop.ts';
+import {
+  createAgentRunLoop,
+  type AdapterResolution,
+  type AgentRunLoopOptions,
+  type AgentRunOutcome,
+} from '../src/agent/loop.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import { createFakeAdapter, type FakeAdapter } from '../src/harness/fake.ts';
-import { ResumeUnavailableError, type AgentEvent, type HarnessAdapter, type HarnessSessionRef, type ResumeTier } from '../src/harness/contract.ts';
+import {
+  ResumeUnavailableError,
+  type AgentEvent,
+  type HarnessAdapter,
+  type HarnessSessionRef,
+  type ResumeTier,
+  type StepPermissions,
+} from '../src/harness/contract.ts';
 import type { SessionRecord } from '../src/harness/session-store.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket, ReasonEntry } from '../src/hub/types.ts';
+import { normalizeStepPermissions } from '../src/harness/permissions.ts';
+import { buildDef } from '../../../src/defs.ts';
 
 const HOLDER: ContactHolder = { kind: 'exec', id: 'host:99' };
 const CWD = '/work/wf1/run1';
@@ -140,9 +154,11 @@ interface RunOpts {
   prev?: SessionRecord | null;
   dirExists?: (p: string) => boolean;
   resumeTier?: ResumeTier;
+  permissions?: StepPermissions;
 }
 
 interface Ran {
+  outcome: AgentRunOutcome;
   records: SessionRecord[];
   errs: string[];
   outs: string[];
@@ -166,7 +182,11 @@ async function runLoop(o: RunOpts = {}): Promise<Ran> {
     origin: 'https://hub.example',
     account: 'acct-1',
     cwd: CWD,
-    loadStep: async (): Promise<NormalizedStepSpec | null> => ({ step: 'builder', brief: TEMPLATE, permissions: { extensions: {} } }),
+    loadStep: async (): Promise<NormalizedStepSpec | null> => ({
+      step: 'builder',
+      brief: TEMPLATE,
+      permissions: o.permissions ?? { extensions: {} },
+    }),
     resolveAdapter: () => resolution,
     // This fixture exercises resume rendering, not the consume-side trust
     // boundary. Admit the synthetic rejection thread so the loop can reach
@@ -184,8 +204,8 @@ async function runLoop(o: RunOpts = {}): Promise<Ran> {
     confirmIntervalMs: 1,
     submitGraceMs: 0,
   };
-  await createAgentRunLoop(opts).run();
-  return { records, errs, outs };
+  const outcome = await createAgentRunLoop(opts).run();
+  return { outcome, records, errs, outs };
 }
 
 /** Every adapter call kind, in order. */
@@ -217,6 +237,38 @@ test('all preconditions hold ⇒ RESUME: deliver on the prior token, delta only,
   // The log says resume, and says how much was new.
   assert.match(ran.errs.join('\n'), /resuming session tok-prior .* with 1 new rejection reason \(no brief re-sent\)/);
   assert.match(ran.outs.join('\n'), /attempt 2, resume\)/);
+});
+
+test('inherited judge policy preflight refuses a resumable order before deliver', async () => {
+  const adapter = createFakeAdapter({ id: 'fake' });
+  adapter.preflight = (permissions) =>
+    permissions.network === 'owenloop-only'
+      ? [{ field: 'network', message: "network 'owenloop-only' is unsupported" }]
+      : [];
+  const def = buildDef({
+    name: 'resumeJudgePolicy',
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [{
+      name: 'researcher',
+      consumes: ['question'],
+      produces: [{ name: 'report', judges: [{ name: 'completeness', body: 'evaluate' }] }],
+      x: { harness: { network: 'owenloop-only' } },
+    }],
+  });
+  const judge = def.steps.find((step) => step.name.endsWith('.completeness'))!;
+  const bag = judge.x!['harness'] as Record<string, unknown>;
+
+  const ran = await runLoop({
+    adapter,
+    permissions: normalizeStepPermissions(bag, judge),
+  });
+
+  assert.equal(ran.outcome, 'incompatible-harness-policy');
+  assert.deepEqual(adapter.calls, [], 'preflight must run before deliver or stop');
+  assert.match(
+    ran.errs.join('\n'),
+    /harness policy refusal.*network.*owenloop-only.*unsupported/,
+  );
 });
 
 test('a resumed attempt writes rows under the PRIOR token and carries the session birth time', async () => {
@@ -381,6 +433,7 @@ function refusingAdapter(): {
   const adapter: HarnessAdapter = {
     id: 'fake',
     resumeTier: 'native-token',
+    preflight: () => [],
     async start(args, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef> {
       starts.push(args.brief);
       onEvent({ kind: 'started', ref });
@@ -433,6 +486,7 @@ test('a NON-resume deliver failure is a failed turn, not a fallback — the hub 
   const adapter: HarnessAdapter = {
     id: 'fake',
     resumeTier: 'native-token',
+    preflight: () => [],
     async start(args): Promise<HarnessSessionRef> {
       starts.push(args.brief);
       return { harness: 'fake', token: 'never' };
@@ -467,6 +521,7 @@ function brokenDeliverAdapter(): HarnessAdapter {
   return {
     id: 'fake',
     resumeTier: 'native-token',
+    preflight: () => [],
     async start(): Promise<HarnessSessionRef> {
       throw new Error('start must not be reached on a plain deliver failure');
     },

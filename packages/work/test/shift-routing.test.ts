@@ -63,6 +63,6 @@ test('a malformed x.owenloop bag fails closed to manual with a warning', () => {
 });
 
 test('an absent x.owenloop bag leaves the machine setting in control', () => {
-  assert.equal(resolveCommandRouting('shift', step({ x: { 'claude-code': {} } })).routing, 'shift');
+  assert.equal(resolveCommandRouting('shift', step({ x: { harness: { id: 'claude-code' } } })).routing, 'shift');
   assert.equal(resolveCommandRouting('manual', step({ x: {} })).routing, 'manual');
 });

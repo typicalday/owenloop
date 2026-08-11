@@ -75,6 +75,9 @@ const inner = createFakeAdapter({
 const adapter = {
   id: inner.id,
   resumeTier: inner.resumeTier,
+  preflight(permissions) {
+    return inner.preflight(permissions);
+  },
 
   async start(args, onEvent) {
     trace({

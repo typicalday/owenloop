@@ -10,7 +10,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -632,17 +632,6 @@ const CASES: Case[] = [
     },
   },
   {
-    name: 'C4 an unmappable permissionMode falls back to never and SAYS so',
-    bag: { permissionMode: 'acceptEdits' },
-    expect(p, events) {
-      assert.equal(p['approvalPolicy'], 'never');
-      assert.ok(
-	events.some((e) => e.kind === 'progress' && /acceptEdits/.test(e.text)),
-	'the downgrade must be reported, not silent',
-      );
-    },
-  },
-  {
     name: 'C5 a native approval policy passes through untouched and silently',
     bag: { permissionMode: 'on-request' },
     expect(p, events) {
@@ -653,6 +642,7 @@ const CASES: Case[] = [
   {
     name: 'C6 extra MCP servers merge in, and owenloop wins a name clash',
     bag: {
+      filesystem: 'unrestricted',
       mcpServers: {
         extra: { command: 'extra-server', args: [] },
         owenloop: { command: 'an-imposter', args: ['--pretend'] },
@@ -668,17 +658,21 @@ const CASES: Case[] = [
   {
     name: 'C7 codexConfig merges UNDER mcp_servers and cannot displace the mount',
     bag: {
+      filesystem: 'unrestricted',
       codexConfig: {
         model_reasoning_summary: 'detailed',
+	project_root_markers: ['.custom-root'],
         mcp_servers: { owenloop: { command: 'nope', args: [] }, other: { command: 'ok', args: [] } },
       },
     },
     expect(p) {
       const config = p['config'] as {
         model_reasoning_summary: string;
+	project_root_markers: string[];
         mcp_servers: Record<string, unknown>;
       };
       assert.equal(config.model_reasoning_summary, 'detailed');
+      assert.deepEqual(config.project_root_markers, ['.custom-root']);
       assert.deepEqual(config.mcp_servers['other'], { command: 'ok', args: [] });
       assertMount(config.mcp_servers['owenloop']);
     },
@@ -692,18 +686,10 @@ const CASES: Case[] = [
     },
   },
   {
-    name: 'C9 an illegal sandbox falls back to the default and SAYS so',
-    bag: { sandbox: 'yolo-full-access' },
-    expect(p, events) {
-      assert.equal(p['sandbox'], 'workspace-write');
-      assert.ok(events.some((e) => e.kind === 'progress' && /yolo-full-access/.test(e.text)));
-    },
-  },
-  {
     name: 'C10 neutral keys with no thread-start equivalent are dropped, not smuggled',
-    bag: { tools: ['Read', 'Edit'], disallowedTools: 'Bash', maxTurns: 40, effort: 'high' },
+    bag: { tools: ['Read', 'Edit'], disallowedTools: 'Bash', effort: 'high' },
     expect(p) {
-      for (const key of ['tools', 'disallowedTools', 'maxTurns', 'effort', 'permissions']) {
+      for (const key of ['tools', 'disallowedTools', 'effort', 'permissions']) {
         assert.equal(key in p, false, `${key} must not reach thread/start`);
       }
     },
@@ -718,6 +704,20 @@ for (const c of CASES) {
   });
 }
 
+test('C4 an unmappable permissionMode is rejected instead of falling back', () => {
+  assert.throws(
+    () => buildThreadStartParams(startArgs({ permissionMode: 'acceptEdits' })),
+    /permissionMode must be one of/,
+  );
+});
+
+test('C9 an illegal sandbox is rejected instead of falling back', () => {
+  assert.throws(
+    () => buildThreadStartParams(startArgs({ sandbox: 'yolo-full-access' })),
+    /sandbox must be one of/,
+  );
+});
+
 test('C11 buildTurnStartParams wraps the text as a UserInput array', () => {
   assert.deepEqual(buildTurnStartParams('th-1', 'hello'), {
     threadId: 'th-1',
@@ -731,6 +731,147 @@ test('C11 buildTurnStartParams wraps the text as a UserInput array', () => {
   });
   // An empty effort is omitted rather than sent as ''.
   assert.equal('effort' in buildTurnStartParams('th-1', 'hi', ''), false);
+});
+
+test('C10a Codex refuses maxTurns in preflight and direct start/resume parameter construction', () => {
+  const permissions = normalizeStepPermissions({ maxTurns: 40 });
+  const issues = codexAdapter.preflight(permissions);
+  assert.deepEqual(issues.map((issue) => issue.field), ['maxTurns']);
+  assert.match(issues[0]?.message ?? '', /maxTurns is unsupported.*no thread or turn limit parameter/);
+  assert.throws(
+    () => buildThreadStartParams({ ...deliverArgs(), permissions }),
+    /maxTurns is unsupported.*no thread or turn limit parameter/,
+  );
+  assert.throws(
+    () => buildThreadResumeParams('th-limited', { ...deliverArgs(), permissions }),
+    /maxTurns is unsupported.*no thread or turn limit parameter/,
+  );
+});
+
+test('C10b Codex refuses explicit neutral filesystem restrictions', () => {
+  for (const filesystem of ['read-only', 'workspace-write'] as const) {
+    const permissions = normalizeStepPermissions({ filesystem });
+    const issues = codexAdapter.preflight(permissions);
+    assert.deepEqual(issues.map((issue) => issue.field), ['filesystem']);
+    assert.match(
+      issues[0]?.message ?? '',
+      new RegExp(`filesystem '${filesystem}'.*unsupported.*configuration layers.*outside the thread sandbox`),
+    );
+    assert.throws(
+      () => buildThreadStartParams({ ...deliverArgs(), permissions }),
+      new RegExp(`filesystem '${filesystem}'.*unsupported`),
+    );
+    assert.throws(
+      () => buildThreadResumeParams('th-restricted', { ...deliverArgs(), permissions }),
+      new RegExp(`filesystem '${filesystem}'.*unsupported`),
+    );
+  }
+});
+
+test('C10c preflight refuses tool and Owenloop-only network restrictions Codex cannot enforce', () => {
+  const unsupported = codexAdapter.preflight(
+    normalizeStepPermissions({ tools: [], disallowedTools: [], network: 'owenloop-only' }),
+  );
+  assert.deepEqual(unsupported.map((issue) => issue.field), [
+    'tools',
+    'disallowedTools',
+    'network',
+  ]);
+});
+
+test('C10d conflicting unrestricted filesystem and legacy sandbox values are refused', () => {
+  const permissions = normalizeStepPermissions({ filesystem: 'unrestricted', sandbox: 'read-only' });
+  assert.match(codexAdapter.preflight(permissions)[0]?.message ?? '', /conflicts with filesystem/);
+  assert.throws(() => buildThreadStartParams({ ...deliverArgs(), permissions }), /conflicts with filesystem/);
+});
+
+test('C10e omitted and unrestricted filesystem behavior remains backward compatible', () => {
+  const omitted = buildThreadStartParams(
+    startArgs({
+      mcpServers: { external: { command: 'host-process', args: [] } },
+      codexConfig: {
+	model_provider: 'operator-provider',
+	sandbox_workspace_write: { writable_roots: ['/operator/root'] },
+      },
+    }),
+  );
+  assert.equal(omitted['sandbox'], 'workspace-write');
+  const omittedConfig = omitted['config'] as Record<string, unknown>;
+  assert.equal(omittedConfig['model_provider'], 'operator-provider');
+  assert.deepEqual(omittedConfig['sandbox_workspace_write'], { writable_roots: ['/operator/root'] });
+  assert.deepEqual(
+    (omittedConfig['mcp_servers'] as Record<string, unknown>)['external'],
+    { command: 'host-process', args: [] },
+  );
+  assertMount((omittedConfig['mcp_servers'] as Record<string, unknown>)['owenloop']);
+
+  const networked = buildThreadStartParams(
+    startArgs({
+      network: 'unrestricted',
+      codexConfig: { sandbox_workspace_write: { writable_roots: ['/operator/root'] } },
+    }),
+  );
+  assert.equal(networked['sandbox'], 'workspace-write');
+  assert.deepEqual(
+    (networked['config'] as Record<string, unknown>)['sandbox_workspace_write'],
+    { writable_roots: ['/operator/root'], network_access: true },
+  );
+
+  const unrestricted = buildThreadStartParams(
+    startArgs({ filesystem: 'unrestricted', network: 'unrestricted' }),
+  );
+  assert.equal(unrestricted['sandbox'], 'danger-full-access');
+  assert.equal('sandbox_workspace_write' in (unrestricted['config'] as Record<string, unknown>), false);
+});
+
+test('C10f supported Codex network combinations stay explicit and fail closed', () => {
+  for (const filesystem of [undefined, 'unrestricted'] as const) {
+    const permissions = normalizeStepPermissions({
+      ...(filesystem === undefined ? {} : { filesystem }),
+      network: 'owenloop-only',
+    });
+    assert.ok(
+      codexAdapter.preflight(permissions).some((issue) => issue.message.includes("'owenloop-only'")),
+    );
+  }
+
+  const legacyReadOnlyNetwork = normalizeStepPermissions({
+    sandbox: 'read-only',
+    network: 'unrestricted',
+  });
+  assert.ok(
+    codexAdapter.preflight(legacyReadOnlyNetwork).some((issue) => /cannot be enabled/.test(issue.message)),
+  );
+  assert.throws(
+    () => buildThreadStartParams({ ...deliverArgs(), permissions: legacyReadOnlyNetwork }),
+    /cannot be enabled/,
+  );
+});
+
+test('C10g unrestricted start and resume preserve provider configuration', () => {
+  const providerConfig = {
+    model_provider: 'workflow-provider',
+    model_providers: {
+      'workflow-provider': {
+	name: 'Workflow provider',
+	base_url: 'http://127.0.0.1:9/v1',
+	env_key: 'WORKFLOW_PROVIDER_TOKEN',
+      },
+    },
+    openai_base_url: 'http://127.0.0.1:9/openai',
+    chatgpt_base_url: 'http://127.0.0.1:9/chatgpt',
+  };
+  const args = deliverArgs({ filesystem: 'unrestricted', codexConfig: providerConfig });
+  const started = buildThreadStartParams(args);
+  const resumed = buildThreadResumeParams('th-unrestricted-provider', args, started);
+
+  for (const params of [started, resumed]) {
+    const config = params['config'] as Record<string, unknown>;
+    for (const [key, value] of Object.entries(providerConfig)) {
+      assert.deepEqual(config[key], value, `${key} must remain backward compatible`);
+    }
+    assertMount((config['mcp_servers'] as Record<string, unknown>)['owenloop']);
+  }
 });
 
 test('C12 effort reaches the turn from either the step bag or the per-start override', () => {
@@ -834,7 +975,11 @@ test('C15 the mount carries the ADMITTED owenloop environment, and nothing else'
 });
 
 test('C14 the builders never mutate their inputs', () => {
-  const bag = { mcpServers: { extra: { command: 'x', args: [] } }, codexConfig: { a: 1 } };
+  const bag = {
+    filesystem: 'unrestricted',
+    mcpServers: { extra: { command: 'x', args: [] } },
+    codexConfig: { a: 1 },
+  };
   const snapshot = JSON.stringify(bag);
   const args = startArgs(bag);
   buildThreadStartParams(args);
@@ -996,6 +1141,7 @@ import { StringDecoder } from 'node:string_decoder';
 const spec = ${JSON.stringify(spec)};
 writeFileSync(spec.pidFile, String(process.pid));
 const envKeys = [
+  'CODEX_HOME',
   'OWENLOOP_CACHE_DIR',
   'OWENLOOP_SHIFT_ID',
   'OWENLOOP_CREDENTIAL_COMMAND',
@@ -1186,45 +1332,185 @@ function useStub(t: { after(fn: () => void): void }, mode: string): Stub {
   };
 }
 
-test('D4 the app-server spawn applies the same six-name filter as the mount', async (t) => {
+function configuredWorkspace(base: string): { root: string; leaf: string } {
+  const root = join(base, 'project');
+  const leaf = join(root, 'nested', 'worktree');
+  mkdirSync(join(root, '.git'), { recursive: true });
+  mkdirSync(join(root, '.codex'), { recursive: true });
+  mkdirSync(leaf, { recursive: true });
+  writeFileSync(
+    join(root, '.codex', 'config.toml'),
+    '[mcp_servers.project_escape]\ncommand = "/bin/false"\n\n' +
+      '[sandbox_workspace_write]\nwritable_roots = ["/project/escape"]\n',
+  );
+  return { root, leaf };
+}
+
+test('D4 explicit filesystem restrictions refuse cold start and resume before process start', async (t) => {
   const saved = { ...process.env };
   t.after(() => {
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
     Object.assign(process.env, saved);
   });
 
-  process.env['OWENLOOP_CACHE_DIR'] = '/tmp/app-server-cache';
-  process.env['OWENLOOP_SHIFT_ID'] = 'cond-app-server';
-  process.env['OWENLOOP_CREDENTIAL_COMMAND'] = '/bin/credential-helper';
-  process.env['OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS'] = '2500';
-  process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
-  process.env['OWENLOOP_SESSION'] = 'sess-app-server';
-  process.env['OWENLOOP_TOKEN'] = 'tok-app-server';
-  process.env['OWENLOOP_INVENTED_NEXT_PHASE'] = 'future-app-server';
-  process.env['OWENLOOP_CREDENTIAL_ORIGIN'] = 'origin-app-server';
-  process.env['OWENLOOP_CREDENTIAL_SLOT'] = 'slot-app-server';
-
   const stub = useStub(t, 'refuse-initialize');
-  const err = await codexAdapter
-    .start(startArgs(undefined, { cwd: stub.dir }), () => {})
+  const workspace = configuredWorkspace(stub.dir);
+  const operatorHome = join(stub.dir, 'operator-codex');
+  mkdirSync(operatorHome, { recursive: true });
+  writeFileSync(
+    join(operatorHome, 'config.toml'),
+    '[mcp_servers.global_escape]\ncommand = "/bin/false"\n',
+  );
+  process.env['CODEX_HOME'] = operatorHome;
+  process.env['OWENLOOP_CACHE_DIR'] = join(workspace.leaf, '.owenloop-cache');
+
+  const cases = [
+    {
+      filesystem: 'read-only' as const,
+      bag: {
+	filesystem: 'read-only' as const,
+	network: 'owenloop-only' as const,
+	mcpServers: { external: { command: '/bin/external-mcp', args: [] } },
+	codexConfig: {
+	  model_provider: 'workflow-provider',
+	  model_providers: {
+	    'workflow-provider': {
+	      base_url: 'http://127.0.0.1:9/v1',
+	      env_key: 'WORKFLOW_PROVIDER_TOKEN',
+	    },
+	  },
+	  sandbox_workspace_write: { writable_roots: ['/workflow/extra-root'] },
+	},
+      },
+    },
+    {
+      filesystem: 'workspace-write' as const,
+      bag: {
+	filesystem: 'workspace-write' as const,
+	network: 'unrestricted' as const,
+	mcpServers: { external: { command: '/bin/external-mcp', args: [] } },
+	codexConfig: {
+	  model_provider: 'workflow-provider',
+	  model_providers: {
+	    'workflow-provider': {
+	      base_url: 'http://127.0.0.1:9/v1',
+	      env_key: 'WORKFLOW_PROVIDER_TOKEN',
+	    },
+	  },
+	  sandbox_workspace_write: { writable_roots: ['/workflow/extra-root'] },
+	},
+      },
+    },
+  ];
+
+  for (const c of cases) {
+    const permissions = normalizeStepPermissions(c.bag);
+    const filesystemIssue = codexAdapter
+      .preflight(permissions)
+      .find((issue) => issue.field === 'filesystem');
+    assert.match(
+      filesystemIssue?.message ?? '',
+      new RegExp(`filesystem '${c.filesystem}'.*unsupported.*configuration layers.*outside the thread sandbox`),
+    );
+
+    const startError = await codexAdapter
+      .start(startArgs(c.bag, { cwd: workspace.leaf }), () => {})
+      .then(
+	() => undefined,
+	(e: unknown) => e,
+      );
+    assert.ok(startError instanceof Error);
+    assert.match(startError.message, new RegExp(`filesystem '${c.filesystem}'.*unsupported`));
+
+    const resumeError = await codexAdapter
+      .deliver(
+	{ harness: 'codex', token: `th-${c.filesystem}` },
+	'continue',
+	deliverArgs(c.bag, { cwd: workspace.leaf }),
+	() => {},
+      )
+      .then(
+	() => undefined,
+	(e: unknown) => e,
+      );
+    assert.ok(resumeError instanceof Error);
+    assert.match(resumeError.message, new RegExp(`filesystem '${c.filesystem}'.*unsupported`));
+  }
+
+  assert.equal(stub.pid(), undefined, 'the app-server process must not start');
+  assert.deepEqual(stub.received(), []);
+});
+
+test('D4a maxTurns refuses direct cold start and resume before app-server process start', async (t) => {
+  const stub = useStub(t, 'refuse-initialize');
+  const bag = { maxTurns: 3 };
+
+  const startError = await codexAdapter
+    .start(startArgs(bag, { cwd: stub.dir }), () => {})
     .then(
       () => undefined,
       (e: unknown) => e,
     );
-  assert.ok(err instanceof Error, 'the refusal makes the test wait until the stub recorded its env');
+  assert.ok(startError instanceof Error);
+  assert.match(startError.message, /maxTurns is unsupported.*no thread or turn limit parameter/);
 
-  assert.deepEqual(stub.envSnapshot(), {
-    OWENLOOP_CACHE_DIR: '/tmp/app-server-cache',
-    OWENLOOP_SHIFT_ID: 'cond-app-server',
-    OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
-    OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
-    OWENLOOP_NO_KEYCHAIN: '1',
-    OWENLOOP_SESSION: 'sess-app-server',
-    OWENLOOP_TOKEN: null,
-    OWENLOOP_INVENTED_NEXT_PHASE: null,
-    OWENLOOP_CREDENTIAL_ORIGIN: null,
-    OWENLOOP_CREDENTIAL_SLOT: null,
+  const resumeError = await codexAdapter
+    .deliver(
+      { harness: 'codex', token: 'th-limited' },
+      'continue',
+      deliverArgs(bag, { cwd: stub.dir }),
+      () => {},
+    )
+    .then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+  assert.ok(resumeError instanceof Error);
+  assert.match(resumeError.message, /maxTurns is unsupported.*no thread or turn limit parameter/);
+
+  assert.equal(stub.pid(), undefined, 'the app-server process must not start');
+  assert.deepEqual(stub.received(), []);
+});
+
+test('D4b unrestricted filesystem preserves operator config and starts app-server normally', async (t) => {
+  const saved = { ...process.env };
+  t.after(() => {
+    for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
+    Object.assign(process.env, saved);
   });
+
+  const stub = useStub(t, 'refuse-initialize');
+  const workspace = configuredWorkspace(stub.dir);
+  const operatorHome = join(stub.dir, 'operator-codex');
+  mkdirSync(operatorHome, { recursive: true });
+  writeFileSync(join(operatorHome, 'config.toml'), 'model_provider = "operator"\n');
+  process.env['CODEX_HOME'] = operatorHome;
+  process.env['OWENLOOP_CACHE_DIR'] = join(workspace.leaf, '.owenloop-cache');
+
+  const err = await codexAdapter
+    .start(
+      startArgs(
+	{
+	  filesystem: 'unrestricted',
+	  network: 'unrestricted',
+	  mcpServers: { external: { command: '/bin/external-mcp', args: [] } },
+	  codexConfig: {
+	    model_provider: 'workflow-provider',
+	    sandbox_workspace_write: { writable_roots: ['/workflow/extra-root'] },
+	  },
+	},
+	{ cwd: workspace.leaf },
+      ),
+      () => {},
+    )
+    .then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+  assert.ok(err instanceof Error);
+  assert.equal(stub.envSnapshot()['CODEX_HOME'], operatorHome);
+  assert.ok(stub.pid() !== undefined, 'unrestricted policy must reach app-server startup');
+  assert.deepEqual(stub.received().map((entry) => entry.method), ['initialize']);
 });
 
 /** Poll until `cond` holds, or throw naming `what`. */

@@ -89,7 +89,7 @@ import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/registry.ts';
 import { parseHarnessCarrier } from '../bundle/fetch.ts';
-import { normalizeStepPermissions } from '../harness/permissions.ts';
+import { normalizeStepPermissions, validateHarnessOptions } from '../harness/permissions.ts';
 import { appendSession, latestFor, sessionsPath, type SessionRecord } from '../harness/session-store.ts';
 import { ensureWorkDir, resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
 import type { ContactHolder, OrderPacket } from '../hub/types.ts';
@@ -159,8 +159,10 @@ export function parseArgs(args: string[]): ParsedArgs {
         if (name === '--workflow') parsed.workflow = r.value;
         else if (name === '--origin') parsed.origin = r.value;
         else if (name === '--shift') parsed.shift = r.value;
-	else if (name === '--harness') parsed.harness = r.value;
-	else {
+	else if (name === '--harness') {
+	  if (r.value.trim() === '') return { error: '--harness must be a non-empty harness id' };
+	  parsed.harness = r.value;
+	} else {
           const n = positiveMs(name, r.value);
           if ('error' in n) return { error: n.error };
           if (name === '--heartbeat-interval') parsed.heartbeatIntervalMs = n.value;
@@ -199,6 +201,7 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
     case 'misroute':
     case 'no-template':
     case 'no-harness':
+    case 'incompatible-harness-policy':
     case 'unverified-consumed':
     case 'session-store-failed':
     case 'no-submit':
@@ -388,12 +391,25 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
    */
   const envHarness = env['OWENLOOP_HARNESS'];
   const resolveAdapter = (stepHarness: string | undefined): AdapterResolution => {
-    const id =
-      (parsed.harness !== undefined && parsed.harness !== '' ? parsed.harness : undefined) ??
-      (envHarness !== undefined && envHarness !== '' ? envHarness : undefined) ??
-      (stepHarness !== undefined && stepHarness !== '' ? stepHarness : undefined) ??
-      defaultHarnessId() ??
-      '';
+    let id: string;
+    if (parsed.harness !== undefined) {
+      id = parsed.harness;
+    } else if (envHarness !== undefined) {
+      // Definition and default selection are lower precedence. An explicit empty
+      // environment override is invalid; it must not silently fall through.
+      if (envHarness.trim() === '') {
+	return {
+	  id: '<empty OWENLOOP_HARNESS>',
+	  registered: registeredHarnessIds(),
+	};
+      }
+      id = envHarness;
+    } else {
+      id =
+	(stepHarness !== undefined && stepHarness !== '' ? stepHarness : undefined) ??
+	defaultHarnessId() ??
+	'';
+    }
     const adapter = id !== '' ? adapterFor(id) : undefined;
     return {
       id: id !== '' ? id : '<none>',
@@ -437,6 +453,20 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     } catch (e) {
       err(`owenloop work agent-run: instruction refusal (harness-carrier): ${errMsg(e)}`);
       return null;
+    }
+
+    if (carrier.harnessOptions !== undefined) {
+      const errors = validateHarnessOptions(carrier.harnessOptions, resolved.step.name)
+	.filter((finding) => finding.severity === 'error');
+      if (errors.length > 0) {
+	for (const finding of errors) {
+	  err(
+	    `owenloop work agent-run: instruction refusal (harness-policy): step '${finding.step}' ` +
+	      `x.harness.${finding.field ?? '<bag>'}: ${finding.message}`,
+	  );
+	}
+	return null;
+      }
     }
 
     return {

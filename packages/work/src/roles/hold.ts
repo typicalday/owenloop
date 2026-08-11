@@ -42,7 +42,7 @@ import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { createHoldLoop, type HoldOutcome } from '../hold/loop.ts';
-import { createHoldMcp } from '../hold/mcp.ts';
+import { createHoldMcp, HOLD_MCP_TOOL_NAMES, type HoldMcpToolName } from '../hold/mcp.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
 import { createMcpServer, pumpStdin, type LineStream } from '../mcp/server.ts';
 import type { ContactHolder } from '../hub/types.ts';
@@ -64,7 +64,26 @@ interface ParsedArgs {
   jumpToleranceMs?: number;
   ignoreStdin: boolean;
   mcp: boolean;
+  mcpTools?: HoldMcpToolName[];
   error?: string;
+}
+
+function parseMcpTools(value: string): HoldMcpToolName[] | { error: string } {
+  const names = value.split(',');
+  if (names.length === 0 || names.some((name) => name === '')) {
+    return { error: '--mcp-tools must be a comma-separated list with no empty names' };
+  }
+  const allowed = new Set<string>(HOLD_MCP_TOOL_NAMES);
+  const unknown = names.filter((name) => !allowed.has(name));
+  if (unknown.length > 0) {
+    return {
+      error: `--mcp-tools contains unknown tool(s): ${unknown.join(', ')}; expected ${HOLD_MCP_TOOL_NAMES.join(',')}`,
+    };
+  }
+  if (new Set(names).size !== names.length) {
+    return { error: '--mcp-tools must not contain duplicate names' };
+  }
+  return names as HoldMcpToolName[];
 }
 
 /** Parse `--flag value` and `--flag=value`; unknown flags are an error. */
@@ -95,7 +114,8 @@ export function parseArgs(args: string[]): ParsedArgs {
       case '--as':
       case '--shift':
       case '--heartbeat-interval':
-      case '--jump-tolerance': {
+      case '--jump-tolerance':
+      case '--mcp-tools': {
         const r = takeValue(a, i);
         if ('error' in r) return { ignoreStdin: false, mcp: false, error: r.error };
         i = r.next;
@@ -105,7 +125,11 @@ export function parseArgs(args: string[]): ParsedArgs {
         else if (name === '--origin') parsed.origin = r.value;
         else if (name === '--as') parsed.as = r.value;
         else if (name === '--shift') parsed.shift = r.value;
-	else if (name === '--heartbeat-interval') {
+	else if (name === '--mcp-tools') {
+	  const selected = parseMcpTools(r.value);
+	  if ('error' in selected) return { ignoreStdin: false, mcp: false, error: selected.error };
+	  parsed.mcpTools = selected;
+	} else if (name === '--heartbeat-interval') {
           const n = Number(r.value);
           if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
             return { ignoreStdin: false, mcp: false, error: `--heartbeat-interval must be a positive integer, got '${r.value}'` };
@@ -159,6 +183,7 @@ function usage(): void {
   process.stderr.write(
     'usage: owenloop work hold --order <workflow>/<run> [--origin <url>] [--as <account>] [--session <id>]\n' +
       '                     [--shift <id>] [--heartbeat-interval <ms>] [--jump-tolerance <ms>] [--ignore-stdin] [--mcp]\n' +
+      '                     [--mcp-tools <get_order,submit,reject>]\n' +
       '   or: owenloop work hold --order <run> --workflow <wf> [...]\n',
   );
 }
@@ -254,6 +279,11 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     usage();
     return 2;
   }
+  if (parsed.mcpTools !== undefined && !parsed.mcp) {
+    err('owenloop work hold: --mcp-tools requires --mcp');
+    usage();
+    return 2;
+  }
 
   const target = resolveTarget(parsed.order, parsed.workflow);
   if ('error' in target) {
@@ -294,8 +324,9 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 
   const hub = deps.hub ?? createHubClient({ origin, getToken: async () => token });
 
-  // --mcp: run the born-bound work-holder as a stdio MCP server (get_order /
-  // submit) with the lease loop kept warm underneath. stdout is the JSON-RPC
+  // --mcp: run the born-bound work-holder as a stdio MCP server. The default
+  // registers get_order/submit/reject; --mcp-tools selects an exact positive
+  // subset. The lease loop stays warm underneath. stdout is the JSON-RPC
   // channel, so every diagnostic (and the loop's own lines) goes to stderr;
   // stdin is the transport, and its EOF (the session died) fires the final
   // breath.
@@ -304,6 +335,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       hub,
       workflow: target.workflow,
       run: target.run,
+      ...(parsed.mcpTools !== undefined ? { tools: parsed.mcpTools } : {}),
       origin,
       env,
       consumedVerifier: createConsumedVerifier({

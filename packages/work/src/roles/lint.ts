@@ -39,6 +39,11 @@ import { parse as parseYaml } from 'yaml';
 import type { FetchedStep } from '../bundle/types.ts';
 import type { LintFinding } from '../harness/types.ts';
 import { adapterFor, defaultHarnessId } from '../harness/registry.ts';
+import {
+  normalizeStepPermissions,
+  preflightStepPermissions,
+  validateHarnessOptions,
+} from '../harness/permissions.ts';
 import { parseHarnessCarrier } from '../bundle/fetch.ts';
 import { readLatestBundle, resolveCacheDir } from '../bundle/cache.ts';
 import { loadSettings } from '../settings/settings.ts';
@@ -93,10 +98,9 @@ export async function run(args: string[]): Promise<number> {
  * Findings for ONE step: resolve which adapter would run it, then hand that
  * adapter the step's option bag.
  *
- * A step with no `x.harness` bag at all is silent — an empty bag is a completely
- * normal step, and lint has nothing to say about it. That is why the empty-bag
- * check comes BEFORE the unregistered-harness check: a def that names no harness
- * and carries no options is clean even in a build with an empty registry.
+ * A step that omits both the harness id and the `x.harness` bag is silent — lint
+ * has no explicit selection or options to judge. An explicit id is checked even
+ * when no option bag exists, because dispatch would still try to resolve that id.
  *
  * ONE finding is raised HERE rather than by the adapter: the bag-`model` /
  * first-class-`model` conflict. The harness contract's `lintStep(bag, step)`
@@ -112,8 +116,20 @@ export async function run(args: string[]): Promise<number> {
  */
 export function lintOneStep(step: FetchedStep): LintFinding[] {
   const bag = step.harnessOptions;
-  if (bag === undefined) return [];
   const id = step.harness ?? defaultHarnessId();
+
+  // An explicit id is independently lintable: naming an adapter this build does
+  // not have is an error even when the step carries no adapter option fields.
+  // Omission with no bag remains clean because there is nothing to validate.
+  if (step.harness !== undefined && adapterFor(step.harness) === undefined) {
+    return [{
+      severity: 'error',
+      step: step.name,
+      message: `unknown harness '${step.harness}' — this build cannot run it`,
+      field: 'id',
+    }];
+  }
+  if (bag === undefined) return [];
   if (id === undefined) {
     return [{
       severity: 'error',
@@ -130,7 +146,23 @@ export function lintOneStep(step: FetchedStep): LintFinding[] {
       field: 'id',
     }];
   }
-  const findings: LintFinding[] = [...(adapter.lintStep?.(bag, step.name) ?? [])];
+  const permissions = normalizeStepPermissions(bag, step);
+  const findings: LintFinding[] = [
+    ...validateHarnessOptions(bag, step.name),
+    ...preflightStepPermissions(permissions).map((issue) => ({
+      severity: 'error' as const,
+      step: step.name,
+      message: issue.message,
+      ...(issue.field !== undefined ? { field: issue.field } : {}),
+    })),
+    ...adapter.preflight(permissions).map((issue) => ({
+      severity: 'error' as const,
+      step: step.name,
+      message: issue.message,
+      ...(issue.field !== undefined ? { field: issue.field } : {}),
+    })),
+    ...(adapter.lintStep?.(bag, step.name) ?? []),
+  ];
 
   if (step.model !== undefined && 'model' in bag) {
     findings.push({
@@ -141,7 +173,13 @@ export function lintOneStep(step: FetchedStep): LintFinding[] {
     });
   }
 
-  return findings;
+  const seen = new Set<string>();
+  return findings.filter((finding) => {
+    const key = `${finding.severity}\0${finding.step}\0${finding.field ?? ''}\0${finding.message}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /** Load the steps to lint from a yaml def, a json bundle, or a bare name. */

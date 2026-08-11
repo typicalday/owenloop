@@ -3,7 +3,11 @@ import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { normalizeStepPermissions } from '../src/harness/permissions.ts';
+import {
+  normalizeStepPermissions,
+  preflightStepPermissions,
+  validateHarnessOptions,
+} from '../src/harness/permissions.ts';
 import type { FetchedStep } from '../src/bundle/types.ts';
 
 const fixture = (p: string): string =>
@@ -69,10 +73,40 @@ test('tools accept a comma string as well as an array, trimmed, empties dropped'
   assert.deepEqual(got.disallowedTools, ['Write']);
 });
 
-test('an empty tool list omits the key entirely rather than emitting []', () => {
+test('an explicit empty tool list remains distinct from an absent list', () => {
   const got = normalizeStepPermissions({ tools: '  ,  ', disallowedTools: [] });
-  assert.equal('tools' in got, false);
-  assert.equal('disallowedTools' in got, false);
+  assert.deepEqual(got.tools, []);
+  assert.deepEqual(got.disallowedTools, []);
+  assert.equal('tools' in normalizeStepPermissions(undefined), false);
+});
+
+test('reserved policy fields validate types, closed values, and tool overlap', () => {
+  const findings = validateHarnessOptions(
+    {
+      tools: ['Read', 'Write'],
+      disallowedTools: ['Write'],
+      filesystem: 'root-everywhere',
+      network: false,
+      maxTurns: 0,
+      name: 'forbidden',
+      description: 'also forbidden',
+      unknownExtension: { preserved: true },
+    },
+    'builder',
+  );
+  assert.deepEqual(
+    findings.map((finding) => finding.field),
+    ['maxTurns', 'name', 'description', 'filesystem', 'network', 'tools'],
+  );
+  assert.equal(findings.some((finding) => finding.field === 'unknownExtension'), false);
+});
+
+test('old caches with restrictions buried in extensions are refused with prepare guidance', () => {
+  const issues = preflightStepPermissions({
+    extensions: { filesystem: 'read-only', network: 'owenloop-only' },
+  });
+  assert.deepEqual(issues.map((issue) => issue.field), ['filesystem', 'network']);
+  for (const issue of issues) assert.match(issue.message, /rerun `owenloop work prepare`/);
 });
 
 test('non-string entries are dropped from a tools array', () => {

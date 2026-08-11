@@ -40,6 +40,7 @@ import type { AgentEvent } from '../src/harness/contract.ts';
 import type { LintFinding } from '../src/harness/types.ts';
 import type { FetchedStep } from '../src/bundle/types.ts';
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { buildDef } from '../../../src/defs.ts';
 
 const fixture = (p: string): string =>
   readFileSync(fileURLToPath(new URL(`./fixtures/${p}`, import.meta.url)), 'utf8');
@@ -96,6 +97,16 @@ function optionsFor(
   return { options, events };
 }
 
+/** Resolve the complete tool list that the selected hold MCP argv registers.
+ * The hold-role e2e test separately proves the selector controls real tools/list. */
+function mountedOwenloopTools(options: ReturnType<typeof buildClaudeOptions>): string[] {
+  const servers = options.mcpServers as Record<string, { args: string[] }>;
+  const selector = servers['owenloop']!.args.find((arg) => arg.startsWith('--mcp-tools='));
+  return selector === undefined
+    ? ['get_order', 'submit', 'reject']
+    : selector.slice('--mcp-tools='.length).split(',');
+}
+
 // ---------------------------------------------------------------------------
 // Option mapping
 // ---------------------------------------------------------------------------
@@ -107,23 +118,31 @@ test('a full bag maps onto the SDK options, setting BOTH tools and allowedTools'
   // The two options mean different things and the single step-def `tools:` field
   // needs both: availability AND auto-allow. Only one of them is a live bug.
   assert.deepEqual(options.tools, ['Read', 'Edit', 'Bash'], 'tools = the available built-in set');
-  assert.deepEqual(options.allowedTools, ['Read', 'Edit', 'Bash'], 'allowedTools = auto-allowed without a prompt');
+  assert.deepEqual(
+    options.allowedTools,
+    ['Read', 'Edit', 'Bash', 'mcp__owenloop__get_order', 'mcp__owenloop__submit'],
+    'allowedTools = the authored built-ins plus the born-bound control-plane exception',
+  );
 
   assert.equal(options.permissionMode, 'plan');
   assert.equal(options.maxTurns, 40);
   assert.equal(options.model, 'opus', "the step's first-class model reached the SDK");
   assert.equal(options.cwd, '/tmp/work');
 
-  // The bag's own server survives AND the owenloop mount is layered on top.
+  // An explicit tool allow-list is isolated so unlisted settings or MCP tools
+  // cannot widen the surface. The born-bound control plane remains mounted.
   const servers = options.mcpServers as Record<string, Record<string, unknown>>;
-  assert.deepEqual(Object.keys(servers).sort(), ['extra', 'owenloop']);
-  assert.deepEqual(servers['extra'], { command: 'extra-server' });
+  assert.deepEqual(Object.keys(servers), ['owenloop']);
+  assert.deepEqual(options.settingSources, []);
+  assert.equal(options.strictMcpConfig, true);
   assert.deepEqual(servers['owenloop'], {
     type: 'stdio',
     command: MOUNT.command,
-    args: MOUNT.args,
+    args: [...MOUNT.args, '--mcp-tools=get_order,submit'],
     alwaysLoad: true,
   });
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit']);
+  assert.deepEqual(options.disallowedTools, ['mcp__owenloop__reject']);
 });
 
 test('an empty bag leaves every optional key ABSENT, not empty', () => {
@@ -139,6 +158,7 @@ test('an empty bag leaves every optional key ABSENT, not empty', () => {
 
   // The owenloop mount is unconditional — it is how the agent reaches its order.
   assert.deepEqual(Object.keys(options.mcpServers as object), ['owenloop']);
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit', 'reject']);
 });
 
 test('the owenloop mount overwrites a bag that declares its own owenloop server', () => {
@@ -153,6 +173,7 @@ test('the owenloop mount overwrites a bag that declares its own owenloop server'
     alwaysLoad: true,
   });
   assert.deepEqual(servers['extra'], { command: 'x' }, 'the author keeps every other server');
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit', 'reject']);
 });
 
 test("permissionMode 'bypassPermissions' also sets allowDangerouslySkipPermissions; no other mode does", () => {
@@ -219,14 +240,221 @@ test("skills passes through as a string array or the literal 'all', and is dropp
   assert.equal('skills' in optionsFor({ skills: { a: 1 } }).options, false);
 });
 
-test('the three deliberately-unset options stay unset', () => {
-  // Setting any of these silently changes behavior: `settingSources: []` stops
-  // project instruction files loading, `persistSession: false` makes the session
-  // unresumable, `strictMcpConfig` discards the operator's own MCP config.
-  const { options } = optionsFor(bagOf(stepByName('builder')));
+test('an unrestricted bag leaves the three default-sensitive options unset', () => {
+  // Setting any of these silently changes unrestricted behavior:
+  // `settingSources: []` stops project instruction files loading,
+  // `persistSession: false` makes the session unresumable, and
+  // `strictMcpConfig` discards the operator's own MCP config.
+  const { options } = optionsFor(bagOf(stepByName('reviewer')));
   for (const key of ['settingSources', 'persistSession', 'strictMcpConfig', 'forkSession']) {
     assert.equal(key in options, false, `${key} must be left to its default`);
   }
+});
+
+test('an explicit empty tools list disables built-ins while an absent list preserves SDK defaults', () => {
+  const absent = optionsFor({}).options;
+  assert.equal('tools' in absent, false);
+  assert.equal('allowedTools' in absent, false);
+
+  const empty = optionsFor({ tools: [] }).options;
+  assert.deepEqual(empty.tools, []);
+  assert.deepEqual(empty.allowedTools, [
+    'mcp__owenloop__get_order',
+    'mcp__owenloop__submit',
+  ]);
+  assert.deepEqual(empty.settingSources, []);
+  assert.equal(empty.strictMcpConfig, true);
+  assert.deepEqual(mountedOwenloopTools(empty), ['get_order', 'submit']);
+  assert.deepEqual(empty.disallowedTools, ['mcp__owenloop__reject']);
+});
+
+test('a restricted producer gives its synthesized Claude judge no built-in tools', () => {
+  const def = buildDef({
+    name: 'restrictedJudge',
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [{
+      name: 'researcher',
+      consumes: ['question'],
+      produces: [{
+	name: 'report',
+	judges: [{ name: 'completeness', body: 'evaluate', model: 'judge-model' }],
+      }],
+      x: { harness: { id: 'claude-code', tools: [], model: 'bag-model' } },
+    }],
+  });
+  const judge = def.steps.find((step) => step.name.endsWith('.completeness'))!;
+  const bag = judge.x!['harness'] as Record<string, unknown>;
+  const { options } = optionsFor(bag, { step: judge });
+
+  assert.deepEqual(options.tools, [], 'the inherited empty allow-list disables every built-in tool');
+  assert.deepEqual(options.allowedTools, [
+    'mcp__owenloop__get_order',
+    'mcp__owenloop__submit',
+  ]);
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit']);
+  assert.deepEqual(options.disallowedTools, ['mcp__owenloop__reject']);
+  assert.equal(options.model, 'judge-model', 'the judge first-class model wins over inherited x.harness.model');
+});
+
+test('read-only filesystem with unrestricted network keeps audited network readers and isolates other extension surfaces', () => {
+  const { options } = optionsFor({
+    filesystem: 'read-only',
+    network: 'unrestricted',
+    skills: ['external-skill'],
+    mcpServers: { external: { command: 'external-server' } },
+  });
+  assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
+  assert.deepEqual(options.allowedTools, [
+    'Read',
+    'Glob',
+    'Grep',
+    'WebFetch',
+    'WebSearch',
+    'mcp__owenloop__get_order',
+    'mcp__owenloop__submit',
+  ]);
+  assert.deepEqual(options.settingSources, []);
+  assert.equal(options.strictMcpConfig, true);
+  assert.deepEqual(options.skills, []);
+  assert.deepEqual(Object.keys(options.mcpServers as Record<string, unknown>), ['owenloop']);
+});
+
+test('read-only filesystem and owenloop-only network use the intersection of both audited tool sets', () => {
+  const { options } = optionsFor({ filesystem: 'read-only', network: 'owenloop-only' });
+  assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep']);
+  assert.deepEqual(options.allowedTools, [
+    'Read',
+    'Glob',
+    'Grep',
+    'mcp__owenloop__get_order',
+    'mcp__owenloop__submit',
+  ]);
+});
+
+test('owenloop-only network policy excludes Bash, web, delegation, skills, hooks, and external MCP', () => {
+  const { options } = optionsFor({
+    network: 'owenloop-only',
+    disallowedTools: ['Bash'],
+    skills: 'all',
+    hooks: { PreToolUse: [] },
+    mcpServers: { external: { command: 'external-server' } },
+  });
+  const tools = options.tools as string[];
+  for (const forbidden of ['Bash', 'WebFetch', 'WebSearch', 'Agent', 'Task', 'Skill']) {
+    assert.equal(tools.includes(forbidden), false, `${forbidden} must not remain available`);
+  }
+  assert.deepEqual(options.settingSources, []);
+  assert.equal(options.strictMcpConfig, true);
+  assert.deepEqual(options.skills, []);
+  assert.deepEqual(Object.keys(options.mcpServers as Record<string, unknown>), ['owenloop']);
+  assert.ok(
+    (options.allowedTools as string[]).includes('mcp__owenloop__submit'),
+    'the isolated agent must retain auto-allowed access to the born-bound submit tool',
+  );
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit']);
+  assert.deepEqual(options.disallowedTools, ['Bash', 'mcp__owenloop__reject']);
+});
+
+test('Claude preflight refuses direct and wildcard denies of the born-bound control plane', () => {
+  for (const denied of [
+    'mcp__owenloop__submit',
+    'mcp__owenloop',
+    'mcp__owenloop__*',
+    'mcp__*',
+  ]) {
+    const issues = claudeAdapter.preflight(normalizeStepPermissions({
+      disallowedTools: [denied],
+    }));
+    assert.ok(
+      issues.some(
+	(issue) =>
+	  issue.field === 'disallowedTools' &&
+	  issue.message.includes(denied),
+      ),
+      `${denied} must be refused because it blocks get_order/submit`,
+    );
+  }
+});
+
+test('Claude preflight accepts audited network readers with a read-only filesystem and unrestricted network', () => {
+  const issues = claudeAdapter.preflight(normalizeStepPermissions({
+    filesystem: 'read-only',
+    network: 'unrestricted',
+    tools: ['Read', 'WebFetch', 'WebSearch'],
+  }));
+  assert.deepEqual(issues, []);
+});
+
+test('Claude preflight refuses unsupported filesystem and unsafe restricted allow-lists', () => {
+  const issues = claudeAdapter.preflight(normalizeStepPermissions({
+    filesystem: 'workspace-write',
+    network: 'owenloop-only',
+    tools: ['Read', 'Bash', 'WebFetch'],
+  }));
+  assert.ok(issues.some((issue) => issue.field === 'filesystem'));
+  assert.ok(issues.some((issue) => issue.field === 'tools' && issue.message.includes('Bash')));
+
+  const externalMcp = claudeAdapter.preflight(normalizeStepPermissions({
+    tools: ['mcp__external__lookup'],
+  }));
+  assert.ok(
+    externalMcp.some(
+      (issue) =>
+	issue.field === 'tools' &&
+	issue.message.includes('mcp__external__lookup'),
+    ),
+  );
+});
+
+test('resume option construction applies the same isolation policy as cold start', () => {
+  const permissions = normalizeStepPermissions({ network: 'owenloop-only' });
+  const events: AgentEvent[] = [];
+  const options = buildClaudeOptions(
+    { cwd: '/tmp/work', owenloopMcp: MOUNT, permissions },
+    {
+      env: bareEnv(),
+      abortController: new AbortController(),
+      onEvent: (event) => events.push(event),
+      resume: 'session-1',
+    },
+  );
+  assert.equal(options.resume, 'session-1');
+  assert.deepEqual(options.settingSources, []);
+  assert.equal(options.strictMcpConfig, true);
+  assert.deepEqual(Object.keys(options.mcpServers as Record<string, unknown>), ['owenloop']);
+  assert.ok((options.allowedTools as string[]).includes('mcp__owenloop__submit'));
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit']);
+  assert.deepEqual(options.disallowedTools, ['mcp__owenloop__reject']);
+});
+
+test('resume preserves unrestricted network readers under a read-only filesystem policy', () => {
+  const permissions = normalizeStepPermissions({
+    filesystem: 'read-only',
+    network: 'unrestricted',
+  });
+  const options = buildClaudeOptions(
+    { cwd: '/tmp/work', owenloopMcp: MOUNT, permissions },
+    {
+      env: bareEnv(),
+      abortController: new AbortController(),
+      onEvent: () => {},
+      resume: 'session-read-only',
+    },
+  );
+
+  assert.equal(options.resume, 'session-read-only');
+  assert.deepEqual(options.tools, ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
+  assert.deepEqual(options.allowedTools, [
+    'Read',
+    'Glob',
+    'Grep',
+    'WebFetch',
+    'WebSearch',
+    'mcp__owenloop__get_order',
+    'mcp__owenloop__submit',
+  ]);
+  assert.deepEqual(options.settingSources, []);
+  assert.equal(options.strictMcpConfig, true);
 });
 
 test('env and abortController are always set, and stderr forwards to onEvent as progress', () => {

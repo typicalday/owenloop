@@ -38,6 +38,7 @@ import type {
 
 import { register } from './registry.ts';
 import { filterOwenloopEnv } from './child-env.ts';
+import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
 import { ResumeUnavailableError } from './contract.ts';
 import type { LintFinding } from './types.ts';
 import type {
@@ -45,6 +46,7 @@ import type {
   DeliverArgs,
   HarnessAdapter,
   HarnessSessionRef,
+  PermissionIssue,
   StartArgs,
   StepPermissions,
 } from './contract.ts';
@@ -210,6 +212,111 @@ const PERMISSION_MODES: readonly string[] = [
 /** The five-value closed union the SDK types `Options.effort` as. */
 const EFFORT_LEVELS: readonly string[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
+/** Audited built-ins that cannot mutate the filesystem. WebFetch/WebSearch
+ *  can read the unrestricted network without weakening a read-only filesystem. */
+const READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch']);
+/** Audited built-ins allowed when only the network is restricted. */
+const OWENLOOP_ONLY_NETWORK_TOOLS = new Set([
+  'Read',
+  'Glob',
+  'Grep',
+  'Edit',
+  'Write',
+  'NotebookEdit',
+  'TodoWrite',
+  'TaskCreate',
+  'TaskUpdate',
+  'TaskList',
+  'TaskGet',
+]);
+/** The intersection when both restrictions apply: local reads only, with no
+ *  unrestricted-network readers. */
+const READ_ONLY_OWENLOOP_ONLY_NETWORK_TOOLS = [...READ_ONLY_TOOLS]
+  .filter((tool) => OWENLOOP_ONLY_NETWORK_TOOLS.has(tool));
+const BORN_BOUND_OWENLOOP_TOOL_NAMES = ['get_order', 'submit'] as const;
+const BORN_BOUND_OWENLOOP_TOOLS = BORN_BOUND_OWENLOOP_TOOL_NAMES.map(
+  (name) => `mcp__owenloop__${name}`,
+);
+const RESTRICTED_OWENLOOP_DENIED_TOOLS = ['mcp__owenloop__reject'] as const;
+const OWENLOOP_CONTROL_TOOLS = new Set([
+  ...BORN_BOUND_OWENLOOP_TOOLS,
+  'mcp__plugin_owenloop_owenloop__get_order',
+  'mcp__plugin_owenloop_owenloop__submit',
+]);
+const OWENLOOP_CONTROL_DENY_SPECS = new Set([
+  ...OWENLOOP_CONTROL_TOOLS,
+  'mcp__owenloop',
+  'mcp__owenloop__*',
+  'mcp__plugin_owenloop_owenloop',
+  'mcp__plugin_owenloop_owenloop__*',
+  'mcp__*',
+]);
+
+function claudePreflight(permissions: StepPermissions): PermissionIssue[] {
+  const issues: PermissionIssue[] = [];
+  if (permissions.permissionMode !== undefined && !PERMISSION_MODES.includes(permissions.permissionMode)) {
+    issues.push({
+      field: 'permissionMode',
+      message: `permissionMode must be one of ${PERMISSION_MODES.join('|')}`,
+    });
+  }
+  if (permissions.effort !== undefined && !EFFORT_LEVELS.includes(permissions.effort)) {
+    issues.push({ field: 'effort', message: `effort must be one of ${EFFORT_LEVELS.join('|')}` });
+  }
+  if (permissions.filesystem === 'workspace-write') {
+    issues.push({
+      field: 'filesystem',
+      message: "filesystem 'workspace-write' is unsupported by this adapter; use 'read-only' or 'unrestricted'",
+    });
+  }
+
+  const allowed = permissions.tools;
+  if (allowed !== undefined) {
+    const unsupportedMcp = allowed.filter(
+      (tool) => tool.startsWith('mcp__') && !OWENLOOP_CONTROL_TOOLS.has(tool),
+    );
+    if (unsupportedMcp.length > 0) {
+      issues.push({
+	field: 'tools',
+	message:
+	  `external MCP tools cannot be enforced by this adapter's exact allow-list: ` +
+	  unsupportedMcp.join(', '),
+      });
+    }
+  }
+  if (permissions.filesystem === 'read-only' && allowed !== undefined) {
+    const unsafe = allowed.filter(
+      (tool) => !READ_ONLY_TOOLS.has(tool) && !OWENLOOP_CONTROL_TOOLS.has(tool),
+    );
+    if (unsafe.length > 0) {
+      issues.push({
+	field: 'tools',
+	message: `filesystem 'read-only' cannot allow non-read-only tool(s): ${unsafe.join(', ')}`,
+      });
+    }
+  }
+  if (permissions.network === 'owenloop-only' && allowed !== undefined) {
+    const unsafe = allowed.filter(
+      (tool) => !OWENLOOP_ONLY_NETWORK_TOOLS.has(tool) && !OWENLOOP_CONTROL_TOOLS.has(tool),
+    );
+    if (unsafe.length > 0) {
+      issues.push({
+	field: 'tools',
+	message: `network 'owenloop-only' cannot allow network-capable or unaudited tool(s): ${unsafe.join(', ')}`,
+      });
+    }
+  }
+
+  const deniedControl = (permissions.disallowedTools ?? []).filter((tool) => OWENLOOP_CONTROL_DENY_SPECS.has(tool));
+  if (deniedControl.length > 0) {
+    issues.push({
+      field: 'disallowedTools',
+      message: `the born-bound Owenloop control plane must retain get_order/submit access; remove: ${deniedControl.join(', ')}`,
+    });
+  }
+  return issues;
+}
+
 /**
  * The error text a resume against a token the provider does not know is
  * expected to carry. SECONDARY detection only — `deliver` pre-checks with
@@ -231,6 +338,16 @@ function owenloopMount(mount: { command: string; args: string[] }): McpServerCon
   return { type: 'stdio', command: mount.command, args: mount.args, alwaysLoad: true };
 }
 
+/** Restricted sessions register a positive two-tool subset. The selector is
+ * derived from the same names used by `allowedTools`, so the declared exception
+ * and the MCP server's actual `tools/list` cannot drift within this adapter. */
+function restrictedOwenloopMount(mount: { command: string; args: string[] }): McpServerConfig {
+  return owenloopMount({
+    command: mount.command,
+    args: [...mount.args, `--mcp-tools=${BORN_BOUND_OWENLOOP_TOOL_NAMES.join(',')}`],
+  });
+}
+
 /**
  * `mcpServers`, with the owenloop mount layered ON TOP of whatever the step's
  * bag declared. An author's own `owenloop` entry is overwritten, exactly as the
@@ -245,8 +362,7 @@ function mergeMcpServers(
   return { ...base, owenloop: owenloopMount(mount) };
 }
 
-/** Everything `buildClaudeOptions` reads off a start. `deliver` gets only `cwd`
- *  and `owenloopMcp` from the contract, so it passes an empty permission set. */
+/** Everything `buildClaudeOptions` reads for either cold start or resume. */
 export interface ClaudeOptionInputs {
   cwd: string;
   owenloopMcp: { command: string; args: string[] };
@@ -283,11 +399,18 @@ export function buildClaudeOptions(
   extra: ClaudeOptionExtras,
 ): Options {
   const { permissions } = inputs;
+  const isolated =
+    permissions.tools !== undefined ||
+    permissions.filesystem === 'read-only' ||
+    permissions.network === 'owenloop-only';
   const options: Options = {
     cwd: inputs.cwd,
     env: extra.env,
     abortController: extra.abortController,
-    mcpServers: mergeMcpServers(permissions.extensions['mcpServers'], inputs.owenloopMcp),
+    mcpServers: isolated
+      ? { owenloop: restrictedOwenloopMount(inputs.owenloopMcp) }
+      : mergeMcpServers(permissions.extensions['mcpServers'], inputs.owenloopMcp),
+    ...(isolated ? { settingSources: [], strictMcpConfig: true, skills: [] } : {}),
     stderr: (data: string) => {
       extra.onEvent({ kind: 'progress', text: `stderr: ${data.trimEnd()}` });
     },
@@ -340,21 +463,47 @@ export function buildClaudeOptions(
   // every call waiting on a prompt nobody will answer headless; only
   // `allowedTools` fails to restrict the surface the author asked to restrict.
   //
-  // ABSENT means "the step named no tools" and must set NEITHER key: the SDK
-  // reads `tools: []` as "disable all built-in tools", which would yield an
-  // agent with no tools at all.
-  if (permissions.tools !== undefined) {
-    options.tools = [...permissions.tools];
-    options.allowedTools = [...permissions.tools];
+  // ABSENT means "the step named no tools" and normally sets NEITHER key: the
+  // SDK reads `tools: []` as "disable all built-in tools". Isolation is the
+  // exception: the audited built-in list becomes explicit, and `allowedTools`
+  // also auto-allows the born-bound get_order/submit MCP tools so the restricted
+  // agent can inspect and finish its order without an unattended permission prompt.
+  // The restricted MCP child itself registers exactly those two tools; allowedTools
+  // is permission automation, not an MCP visibility filter.
+  let effectiveTools = permissions.tools;
+  if (effectiveTools === undefined && permissions.filesystem === 'read-only') {
+    // Filesystem and network are independent. A read-only filesystem still gets
+    // audited network readers unless the step separately restricts the network.
+    effectiveTools = permissions.network === 'owenloop-only'
+      ? READ_ONLY_OWENLOOP_ONLY_NETWORK_TOOLS
+      : [...READ_ONLY_TOOLS];
+  } else if (effectiveTools === undefined && permissions.network === 'owenloop-only') {
+    effectiveTools = [...OWENLOOP_ONLY_NETWORK_TOOLS];
   }
-  if (permissions.disallowedTools !== undefined) {
+  if (effectiveTools !== undefined) {
+    options.tools = effectiveTools.filter((tool) => !OWENLOOP_CONTROL_TOOLS.has(tool));
+    options.allowedTools = [
+      ...new Set([...effectiveTools, ...BORN_BOUND_OWENLOOP_TOOLS]),
+    ];
+  }
+  if (isolated) {
+    // Defense in depth only: the restricted MCP child does not register `reject`
+    // at all. The deny protects against SDK/tool-surface regressions without being
+    // the visibility boundary.
+    options.disallowedTools = [
+      ...new Set([
+	...(permissions.disallowedTools ?? []),
+	...RESTRICTED_OWENLOOP_DENIED_TOOLS,
+      ]),
+    ];
+  } else if (permissions.disallowedTools !== undefined) {
     options.disallowedTools = [...permissions.disallowedTools];
   }
   // Normalization already guaranteed a positive integer or absence.
   if (permissions.maxTurns !== undefined) options.maxTurns = permissions.maxTurns;
 
   const skills = permissions.extensions['skills'];
-  if (skills === 'all' || (Array.isArray(skills) && skills.every((s) => typeof s === 'string'))) {
+  if (!isolated && (skills === 'all' || (Array.isArray(skills) && skills.every((s) => typeof s === 'string')))) {
     options.skills = skills as string[] | 'all';
   }
 
@@ -372,14 +521,14 @@ export function buildClaudeOptions(
   // Unknown extension keys are ignored in silence — `owenloop work lint` is the place
   // that warns about them.
   //
-  // OPTIONS DELIBERATELY LEFT UNSET, so nobody "helpfully" adds them:
-  //  - `settingSources`: omitted means ALL filesystem settings load, matching the
-  //    CLI's own default and today's behavior. Passing `[]` would silently stop
-  //    project instruction files from loading.
-  //  - `strictMcpConfig`: leaving it unset preserves the operator's project/user
-  //    MCP config, again matching today.
-  //  - `persistSession`: defaults to `true`. Setting it `false` would make the
-  //    session unresumable and break the resume-on-rejection phase outright.
+  // Outside isolation, `settingSources` and `strictMcpConfig` stay unset so the
+  // SDK preserves its normal settings and MCP behavior, including the full
+  // get_order/submit/reject work-holder server. Isolation sets `settingSources: []`
+  // and `strictMcpConfig: true` above, mounts the positive two-tool work-holder
+  // subset, and removes settings, hooks, skills, or external MCP that could bypass
+  // the authored restriction.
+  // `persistSession` always stays unset: its default is `true`, and disabling it
+  // would break resume-on-rejection.
   return options;
 }
 
@@ -412,10 +561,8 @@ const DEFAULT_START_DEPENDENCIES: ClaudeStartDependencies = {
 interface ClaudeSession {
   query: ClaudeQuery;
   abortController: AbortController;
-  /** The RESOLVED options this session started under. Stashed because the
-   *  contract's `deliver` carries only `cwd`+`owenloopMcp`, while permission
-   *  mode, tool lists, model and maxTurns are PER-INVOCATION flags a resumed
-   *  session does not restore. See the note on `deliver`. */
+  /** The resolved start options. Kept for live-session state only;
+   *  `DeliverArgs.permissions` is authoritative when a resume rebuilds options. */
   options: Options;
 }
 
@@ -719,6 +866,8 @@ const KNOWN_FIELDS = new Set([
   'description',
   'tools',
   'disallowedTools',
+  'filesystem',
+  'network',
   'model',
   'permissionMode',
   'maxTurns',
@@ -741,11 +890,6 @@ function typeName(v: unknown): string {
   return typeof v;
 }
 
-function isStringOrStringArray(v: unknown): boolean {
-  if (typeof v === 'string') return true;
-  return Array.isArray(v) && v.every((e) => typeof e === 'string');
-}
-
 /**
  * Check one step's `x.harness` option map against this harness's vocabulary.
  *
@@ -755,7 +899,15 @@ function isStringOrStringArray(v: unknown): boolean {
  * are ERRORS. Never throws — a malformed bag produces findings.
  */
 function lintStep(bag: Record<string, unknown>, step: string): LintFinding[] {
-  const findings: LintFinding[] = [];
+  const findings: LintFinding[] = [
+    ...validateHarnessOptions(bag, step),
+    ...claudePreflight(normalizeStepPermissions(bag)).map((issue) => ({
+      severity: 'error' as const,
+      step,
+      message: issue.message,
+      ...(issue.field !== undefined ? { field: issue.field } : {}),
+    })),
+  ];
   const err = (message: string, field?: string): void => {
     findings.push({ severity: 'error', step, message, ...(field !== undefined ? { field } : {}) });
   };
@@ -779,19 +931,11 @@ function lintStep(bag: Record<string, unknown>, step: string): LintFinding[] {
     }
   };
 
-  check('tools', isStringOrStringArray, 'a string or string[]');
-  check('disallowedTools', isStringOrStringArray, 'a string or string[]');
-  check('model', (v) => typeof v === 'string', 'a string');
-  check('effort', (v) => typeof v === 'string', 'a string');
-  check('skills', (v) => Array.isArray(v) && v.every((e) => typeof e === 'string'), 'a string[]');
+  check('skills', (v) => v === 'all' || (Array.isArray(v) && v.every((e) => typeof e === 'string')), "'all' or a string[]");
   check('background', (v) => typeof v === 'boolean', 'a boolean');
   check('mcpServers', isPlainMap, 'a map');
   check('hooks', isPlainMap, 'a map');
-  check('maxTurns', (v) => typeof v === 'number' && Number.isInteger(v) && v > 0, 'a positive integer');
 
-  if ('permissionMode' in bag && !PERMISSION_MODES.includes(bag['permissionMode'] as string)) {
-    err(`permissionMode must be one of ${PERMISSION_MODES.join('|')}`, 'permissionMode');
-  }
   if ('memory' in bag && !MEMORY_SCOPES.has(bag['memory'] as string)) {
     err(`memory must be one of ${[...MEMORY_SCOPES].join('|')}`, 'memory');
   }
@@ -828,6 +972,7 @@ export const claudeAdapter: HarnessAdapter = {
   // The provider stores the session and resumes it from the opaque token this
   // adapter puts in `HarnessSessionRef.token`.
   resumeTier: 'native-token',
+  preflight: claudePreflight,
   start: startClaude,
   deliver,
   stop,
