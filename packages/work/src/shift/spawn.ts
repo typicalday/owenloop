@@ -3,7 +3,7 @@
  *
  * Every order the shift dispatches becomes a DETACHED
  * `owenloop work exec <workflow>/<run> --origin <url>` child: `detached: true`,
- * stdout ignored, bounded stderr diagnostics, `unref()` — so the child is its own process-group leader and
+ * all stdio ignored, `unref()` — so the child is its own process-group leader and
  * survives the parent's death (SP5-verified kernel reparenting). The shift meters
  * and hands off; the child self-leases (C5). Both ids ride the argv as the
  * composite `<workflow>/<run>` order-id `owenloop work exec` parses, and `--origin`
@@ -13,12 +13,11 @@
  * env is the contract), selecting which Scoped Identity credential slot
  * (agent:<account>) exec reads.
  *
- * `Spawner` is an injected seam; unit tests always fake it and NEVER spawn a
- * real child. The default impl's argv/option construction is factored into the
- * pure `buildSpawnPlan` so a test can assert the exact shape as data.
+ * `Spawner` is an injected seam; most loop tests fake it. The default impl's
+ * argv/option construction is factored into the pure `buildSpawnPlan`, while a
+ * focused lifecycle regression uses harmless local children.
  */
 import { spawn } from 'node:child_process';
-import type { Readable } from 'node:stream';
 
 import { resolveOwenloopBin } from '../owenloop-bin.ts';
 
@@ -65,9 +64,9 @@ export interface SpawnResult {
 /** The spawn seam. Injected; faked in tests. */
 export type Spawner = (spec: SpawnSpec) => SpawnResult;
 
-/** Safe, bounded metadata emitted when a detached worker fails. Only an exec
- * child may contribute a whitelisted, redacted refusal/startup diagnostic.
- * Agent-run stderr is untrusted model/harness output and is never reported. */
+/** Safe, bounded metadata emitted when a detached worker fails. Detached
+ * worker stderr is not attached to Shift: agent-run output is untrusted, and a
+ * parent-owned pipe can kill either worker with EPIPE after Shift exits. */
 export interface WorkerFailure {
   workflow: string;
   run: string;
@@ -86,45 +85,7 @@ export type WorkerFailureReporter = (failure: WorkerFailure) => void;
 export interface SpawnPlan {
   command: string;
   args: string[];
-  options: { detached: true; stdio: ['ignore', 'ignore', 'pipe']; env: NodeJS.ProcessEnv };
-}
-
-const MAX_STDERR_TAIL_BYTES = 16 * 1024;
-const MAX_DIAGNOSTIC_CHARS = 1_024;
-
-function stripControlCharacters(value: string): string {
-  return [...value].filter((character) => {
-    const code = character.codePointAt(0)!;
-    return code === 9 || (code >= 32 && code !== 127);
-  }).join('');
-}
-
-/**
- * Select one deliberately narrow exec-worker diagnostic. The command's own
- * output never reaches the exec child's stderr: `runCommand`
- * (`packages/work/src/exec/runner.ts`) consumes the command's stdout/stderr into
- * `outputHash`/`outputTail`. Even so, only driver-owned startup/refusal lines are
- * matched because later driver lines can quote hub response text.
- *
- * Agent-run stderr must never be passed here. Model and harness progress share
- * that stream and can impersonate any allowlisted-looking prefix.
- */
-export function safeWorkerDiagnostic(stderr: string): string | undefined {
-  const line = stderr
-    .split(/\r?\n/u)
-    .reverse()
-    .map((candidate) => stripControlCharacters(candidate).trim())
-    .find((candidate) =>
-			/^owenloop work exec: instruction refusal \((?:unknown-digest|unknown-step|ambiguous-step|integrity|no-digest|missing-command|unverified-def|origin-policy|unverified-consumed)\) /u.test(candidate)
-      || /^owenloop work exec: (?:instruction store unavailable:|no hub origin|missing required <order-id>)/u.test(candidate),
-    );
-  if (line === undefined) return undefined;
-
-  const redacted = line
-    .replace(/\b(Bearer\s+)[^\s]+/giu, '$1[redacted]')
-    .replace(/\b(api[_-]?key|token|password|secret)(\s*[:=]\s*)[^\s,;]+/giu, '$1$2[redacted]')
-    .replace(/([?&](?:api[_-]?key|token|password|secret)=)[^&\s]+/giu, '$1[redacted]');
-  return redacted.slice(0, MAX_DIAGNOSTIC_CHARS);
+  options: { detached: true; stdio: ['ignore', 'ignore', 'ignore']; env: NodeJS.ProcessEnv };
 }
 
 /**
@@ -176,7 +137,7 @@ export function buildSpawnPlan(
     ],
     options: {
       detached: true,
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['ignore', 'ignore', 'ignore'],
       env: {
 	...process.env,
 	OWENLOOP_ACCOUNT: account,
@@ -212,27 +173,10 @@ export function createDefaultSpawner(
     // start its own vendor process later, but reporting or guessing that
     // executable here would couple the neutral dispatcher to one adapter.
     const executable = `${process.execPath} ${binPath}`;
-    let stderrTail = '';
-    child.stderr?.setEncoding('utf8');
-    child.stderr?.on('data', (chunk: string) => {
-			// Always drain the pipe, but retain bytes only for exec. Agent-run stderr
-			// is untrusted model/harness progress and cannot influence Shift events.
-			if (kind === 'exec') stderrTail = (stderrTail + chunk).slice(-MAX_STDERR_TAIL_BYTES);
-    });
-    // The stderr pipe is a libuv handle owned by THIS process, and `child.unref()`
-    // does not cover it. Left referenced, the Shift's event loop stays alive for
-    // the child's entire lifetime — an `owenloop work shift --once` run would
-    // block until every dispatched worker exited, defeating the detached
-    // hand-off this seam exists to perform. Unref the pipe too: data still
-    // arrives while the Shift is running (its poll loop and daemon socket hold
-    // the loop open), it simply stops being a reason to keep running.
-    //
-    // `ChildProcess.stderr` is typed `Readable`, which declares no `unref`. The
-    // concrete object for a `'pipe'` stdio slot is a `net.Socket`, which does.
-    // Probe rather than assert the type, so a future non-Socket stream is a
-    // silent no-op instead of a TypeError in the dispatch path.
-    const stderrPipe = child.stderr as (Readable & { unref?: () => void }) | null;
-    if (typeof stderrPipe?.unref === 'function') stderrPipe.unref();
+    // No worker stdio slot is a parent-owned pipe. Once Shift exits, a detached
+    // worker may keep writing diagnostics without receiving EPIPE from a vanished
+    // reader. Agent-run stderr is untrusted; exec failures therefore use the same
+    // bounded generic lifecycle message rather than capturing worker output.
     let failureReported = false;
     const report = (exitStatus: number | null, signal: NodeJS.Signals | null, message: string): void => {
       if (failureReported || onFailure === undefined) return;
@@ -252,10 +196,7 @@ export function createDefaultSpawner(
     child.once('error', () => report(null, null, 'worker process failed to start'));
     child.once('exit', (code, signal) => {
       if (code === 0) return;
-			const message = kind === 'exec'
-				? (safeWorkerDiagnostic(stderrTail) ?? 'worker exited without completing successfully')
-				: 'worker exited without completing successfully';
-      report(code, signal, message);
+      report(code, signal, 'worker exited without completing successfully');
     });
     child.unref();
     if (child.pid === undefined) {

@@ -23,6 +23,7 @@
  * production importer; importing this module is what fires the module-scope
  * `register(claudeAdapter)` below and puts the adapter in the runtime registry.
  */
+import { randomUUID } from 'node:crypto';
 import { accessSync, constants, existsSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
@@ -263,6 +264,8 @@ export interface ClaudeOptionExtras {
   env: Record<string, string | undefined>;
   abortController: AbortController;
   onEvent: (e: AgentEvent) => void;
+  /** Preselected UUID for a cold start. Never set on a resume. */
+  sessionId?: string;
   /** Set on a resume only. Never set on a start. */
   resume?: string;
 }
@@ -355,6 +358,7 @@ export function buildClaudeOptions(
     options.skills = skills as string[] | 'all';
   }
 
+  if (extra.sessionId !== undefined) options.sessionId = extra.sessionId;
   if (extra.resume !== undefined) options.resume = extra.resume;
 
   // EXTENSIONS KEYS DELIBERATELY NOT MAPPED, so a reviewer reads intent rather
@@ -383,8 +387,30 @@ export function buildClaudeOptions(
 // The adapter
 // ---------------------------------------------------------------------------
 
+export type ClaudeQuery = AsyncIterable<SDKMessage> & Pick<Query, 'close'>;
+
+export interface ClaudeQueryArgs {
+  prompt: string;
+  options: Options;
+}
+
+export type ClaudeQueryFactory = (args: ClaudeQueryArgs) => ClaudeQuery;
+
+export interface ClaudeStartDependencies {
+  createSessionId: () => string;
+  loadQuery: () => Promise<ClaudeQueryFactory>;
+}
+
+const DEFAULT_START_DEPENDENCIES: ClaudeStartDependencies = {
+  createSessionId: randomUUID,
+  loadQuery: async () => {
+    const { query } = await import('@anthropic-ai/claude-agent-sdk');
+    return (args) => query(args);
+  },
+};
+
 interface ClaudeSession {
-  query: Query;
+  query: ClaudeQuery;
   abortController: AbortController;
   /** The RESOLVED options this session started under. Stashed because the
    *  contract's `deliver` carries only `cwd`+`owenloopMcp`, while permission
@@ -412,9 +438,9 @@ export interface TurnOutcome {
  * Resolves at the `result` message — turn end, per the contract — not at process
  * exit, and regardless of whether the result reports an error.
  *
- * `onInit` fires the instant the session id is known, so `start` can emit
- * `{kind:'started'}` BEFORE it resolves: the caller persists the token on that
- * event, which is what leaves a resumable record behind after a mid-turn crash.
+ * `onInit` fires after a matching `system/init` confirms the preselected cold-
+ * start session id. `startClaude` emits `{kind:'started'}` before query creation;
+ * this callback marks the later provider confirmation, not the persistence gate.
  *
  * PHASE 6, ITEM 1 — EXPORTED, AND TYPED ON `AsyncIterable` RATHER THAN `Query`.
  * This is the one function that maps the SDK's message stream onto this
@@ -429,10 +455,16 @@ export async function consumeTurn(
   q: AsyncIterable<SDKMessage>,
   onEvent: (e: AgentEvent) => void,
   onInit?: (sessionId: string) => void,
+  expectedSessionId?: string,
 ): Promise<TurnOutcome> {
   let sessionId: string | undefined;
   for await (const message of q) {
     if (message.type === 'system' && message.subtype === 'init') {
+      if (expectedSessionId !== undefined && message.session_id !== expectedSessionId) {
+	throw new Error(
+	  `provider session id mismatch: expected ${expectedSessionId}, received ${message.session_id}`,
+	);
+      }
       sessionId = message.session_id;
       // The ONLY place these are observable. The live smoke asserts on the
       // `apiKeySource` here (subscription OAuth vs. an API key), and a later
@@ -471,34 +503,65 @@ function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-async function start(
+export async function startClaude(
   args: StartArgs,
   onEvent: (e: AgentEvent) => void,
+  dependencies: ClaudeStartDependencies = DEFAULT_START_DEPENDENCIES,
 ): Promise<HarnessSessionRef> {
+  // The provider token exists before any SDK work. `started` is synchronous by
+  // contract, so the caller's fsynced active-row append must return before the
+  // query factory can initialize a process or receive prompt bytes.
+  const sessionId = dependencies.createSessionId();
+  const ref: HarnessSessionRef = { harness: HARNESS_ID, token: sessionId };
+  try {
+    onEvent({ kind: 'started', ref });
+  } catch (err) {
+    try {
+      onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
+    } catch {
+      // Preserve the durable-persistence failure that closed the start gate.
+    }
+    throw err;
+  }
+
   const env = buildChildEnv(process.env, { allowApiBilling: allowApiBillingFrom(process.env) });
   const abortController = new AbortController();
-  const options = buildClaudeOptions(args, { env, abortController, onEvent });
+  const options = buildClaudeOptions(args, { env, abortController, onEvent, sessionId });
 
-  // A plain STRING prompt, not an AsyncIterable. Knowingly accepted consequence:
-  // `Query.interrupt()`, `setPermissionMode()` and `setModel()` are documented as
-  // streaming-input-mode only, so `stop()` uses abort + `close()` instead.
-  // Streaming input buys this adapter nothing else. Keep the SDK behind this
-  // call-site boundary so registry/lint/session commands stay SDK-free.
-  const { query } = await import('@anthropic-ai/claude-agent-sdk');
-  const q = query({ prompt: args.brief, options });
+  let q: ClaudeQuery;
+  try {
+    // A plain STRING prompt, not an AsyncIterable. Query construction is the
+    // provider-delivery boundary in the pinned SDK, so it must remain after the
+    // `started` callback above. Streaming input buys this adapter nothing else.
+    const query = await dependencies.loadQuery();
+    q = query({ prompt: args.brief, options });
+  } catch (err) {
+    try {
+      abortController.abort();
+    } catch {
+      // An already-aborted controller is equivalent to success.
+    }
+    onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
+    throw err;
+  }
 
-  let ref: HarnessSessionRef | undefined;
+  SESSIONS.set(sessionId, { query: q, abortController, options });
+  let initVerified = false;
   let outcome: TurnOutcome;
   try {
-    outcome = await consumeTurn(q, onEvent, (sessionId) => {
-      ref = { harness: HARNESS_ID, token: sessionId };
-      SESSIONS.set(sessionId, { query: q, abortController, options });
-      onEvent({ kind: 'started', ref });
-    });
+    outcome = await consumeTurn(
+      q,
+      onEvent,
+      () => {
+	initVerified = true;
+      },
+      sessionId,
+    );
   } catch (err) {
-    // A thrown `started` callback is the caller's durable-session gate refusing
-    // delivery. Tear the provider query down here as well as in the caller's
-    // idempotent `stop`, so the adapter itself cannot continue provider work.
+    // An init mismatch or pre-init failure must not leave the preselected token
+    // resumable. A post-init provider failure keeps the same registry behavior as
+    // before; `stop()` can still find and idempotently close that verified session.
+    if (!initVerified) SESSIONS.delete(sessionId);
     try {
       abortController.abort();
     } catch {
@@ -507,18 +570,27 @@ async function start(
     try {
       q.close();
     } catch {
-      // Preserve the persistence or provider error that caused the abort.
+      // Preserve the provider or session-integrity error that caused the abort.
     }
     onEvent({ kind: 'exited', exitCode: null, error: errText(err) });
     throw err;
   }
 
-  if (ref === undefined) {
-    // No init message means no token. Do NOT invent one — a fabricated token
-    // would be persisted as resumable and fail confusingly much later.
+  if (outcome.sessionId === undefined) {
+    SESSIONS.delete(sessionId);
+    try {
+      abortController.abort();
+    } catch {
+      // An already-aborted controller is equivalent to success.
+    }
+    try {
+      q.close();
+    } catch {
+      // The missing-init error below is authoritative.
+    }
     const why = outcome.sawResult
-      ? 'the turn ended without a session id'
-      : 'the stream ended before a session id arrived';
+      ? 'the turn ended without confirming the supplied session id'
+      : 'the stream ended before confirming the supplied session id';
     onEvent({ kind: 'exited', exitCode: null, error: why });
     throw new Error(`harness start failed: ${why}`);
   }
@@ -756,7 +828,7 @@ export const claudeAdapter: HarnessAdapter = {
   // The provider stores the session and resumes it from the opaque token this
   // adapter puts in `HarnessSessionRef.token`.
   resumeTier: 'native-token',
-  start,
+  start: startClaude,
   deliver,
   stop,
   lintStep,

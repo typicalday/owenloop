@@ -56,27 +56,36 @@ test('whatsNext POSTs to /api/whats_next with bearer header and JSON body', asyn
   assert.deepEqual(res.orders, []);
 });
 
-test('whatsNext preserves authoritative worker and defDigest fields from parsed JSON', async () => {
+test('whatsNext preserves modern defDigest routing with explicit or default worker projection', async () => {
   const captured: Captured[] = [];
-  const order = {
+  const explicitAgent = {
     workflow: 'wf1',
-    run: 'run_1',
+    run: 'run_explicit',
     step: 'builder',
     worker: 'agent',
-    defDigest: 'sha256:order-pinned',
+    defDigest: 'sha256:explicit-agent',
     consumes: {},
     expected_outputs: [],
     feedback: [],
     advisory: {},
     submit_hint: '',
   };
-  const c = client(fakeFetch(captured, { body: { text: 'ok', workflow: 'wf1', orders: [order] } }));
+  const defaultAgent = {
+    ...explicitAgent,
+    run: 'run_default',
+    defDigest: 'sha256:default-agent',
+  };
+  delete (defaultAgent as { worker?: string }).worker;
+  const c = client(fakeFetch(captured, {
+    body: { text: 'ok', workflow: 'wf1', orders: [explicitAgent, defaultAgent] },
+  }));
 
   const response = await c.whatsNext({ workflow: 'wf1' });
 
-  assert.equal(response.orders?.[0]?.worker, 'agent');
-  assert.equal(response.orders?.[0]?.defDigest, 'sha256:order-pinned');
-  assert.deepEqual(response.orders?.[0], order);
+  assert.deepEqual(response.orders?.[0], explicitAgent);
+  assert.equal(response.orders?.[1]?.defDigest, 'sha256:default-agent');
+  assert.equal(Object.prototype.hasOwnProperty.call(response.orders?.[1], 'worker'), false);
+  assert.deepEqual(response.orders?.[1], defaultAgent);
 });
 
 test('whatsNext defaults to an empty body when called with no args', async () => {

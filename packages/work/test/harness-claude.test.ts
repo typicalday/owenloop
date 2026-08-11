@@ -14,9 +14,12 @@
  * than reading `process.env`. Nothing here relies on a CLI being installed or on
  * the runner's environment matching the author's.
  */
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
@@ -27,13 +30,16 @@ import {
   buildClaudeOptions,
   claudeAdapter,
   resolveExecutable,
+  startClaude,
   type ClaudeOptionInputs,
+  type ClaudeQueryFactory,
 } from '../src/harness/claude.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
 import { adapterFor } from '../src/harness/registry.ts';
 import type { AgentEvent } from '../src/harness/contract.ts';
 import type { LintFinding } from '../src/harness/types.ts';
 import type { FetchedStep } from '../src/bundle/types.ts';
+import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 
 const fixture = (p: string): string =>
   readFileSync(fileURLToPath(new URL(`./fixtures/${p}`, import.meta.url)), 'utf8');
@@ -238,6 +244,169 @@ test('env and abortController are always set, and stderr forwards to onEvent as 
 
   options.stderr?.('boom\n');
   assert.deepEqual(events, [{ kind: 'progress', text: 'stderr: boom' }]);
+});
+
+// ---------------------------------------------------------------------------
+// Cold-start durable gate
+// ---------------------------------------------------------------------------
+
+interface LocalQueryProbe {
+  queryCalls: number;
+  closes: number;
+  optionSessionIds: Array<string | undefined>;
+}
+
+function localQueryFactory(
+  promptPath: string,
+  reportedSessionId: string,
+  probe: LocalQueryProbe,
+): ClaudeQueryFactory {
+  const childFixture = fileURLToPath(new URL('./fixtures/claude-query-child.mjs', import.meta.url));
+  return ({ prompt, options }) => {
+    probe.queryCalls++;
+    probe.optionSessionIds.push(options.sessionId);
+    const child = spawn(process.execPath, [childFixture, promptPath, reportedSessionId], {
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    assert.ok(child.stdin !== null && child.stdout !== null);
+    const exited = once(child, 'exit') as Promise<[number | null, NodeJS.Signals | null]>;
+    const lines = createInterface({ input: child.stdout });
+    child.stdin.end(prompt);
+    return {
+      async *[Symbol.asyncIterator](): AsyncIterator<SDKMessage> {
+	for await (const line of lines) yield JSON.parse(line) as SDKMessage;
+	const [code, signal] = await exited;
+	if (code !== 0) throw new Error(`local query child exited with ${String(code)} / ${String(signal)}`);
+      },
+      close(): void {
+	probe.closes++;
+	child.kill('SIGTERM');
+      },
+    };
+  };
+}
+
+const coldStartDirs: string[] = [];
+after(() => {
+  for (const dir of coldStartDirs) rmSync(dir, { recursive: true, force: true });
+});
+
+function coldStartArgs(cwd: string): Parameters<typeof startClaude>[0] {
+  return {
+    brief: 'harmless local prompt bytes',
+    cwd,
+    owenloopMcp: MOUNT,
+    permissions: { extensions: {} },
+  };
+}
+
+test('cold start persists started before the SDK process seam receives prompt bytes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-claude-gate-'));
+  coldStartDirs.push(root);
+  const promptPath = join(root, 'prompt.txt');
+  const probePath = join(root, 'blocked-probe.txt');
+  const sessionId = '11111111-1111-4111-8111-111111111111';
+  const probe: LocalQueryProbe = { queryCalls: 0, closes: 0, optionSessionIds: [] };
+  const observer = spawn(process.execPath, [
+    '-e',
+    "const {existsSync,writeFileSync}=require('node:fs');setTimeout(()=>writeFileSync(process.argv[2],existsSync(process.argv[1])?'present':'absent'),100)",
+    promptPath,
+    probePath,
+  ], { stdio: 'ignore' });
+  const observerExit = once(observer, 'exit');
+  const events: AgentEvent[] = [];
+
+  const ref = await startClaude(
+    coldStartArgs(root),
+    (event) => {
+      events.push(event);
+      if (event.kind !== 'started') return;
+      assert.equal(probe.queryCalls, 0, 'query must not be constructed inside the persistence gate');
+      const deadline = Date.now() + 5_000;
+      const waitBuffer = new Int32Array(new SharedArrayBuffer(4));
+      while (!existsSync(probePath) && Date.now() < deadline) {
+	Atomics.wait(waitBuffer, 0, 0, 25);
+      }
+      assert.equal(existsSync(probePath), true, 'the independent observer ran while persistence was blocked');
+      assert.equal(readFileSync(probePath, 'utf8'), 'absent', 'no prompt reached a process while persistence was blocked');
+      assert.equal(existsSync(promptPath), false);
+    },
+    {
+      createSessionId: () => sessionId,
+      loadQuery: async () => localQueryFactory(promptPath, sessionId, probe),
+    },
+  );
+  await observerExit;
+
+  assert.deepEqual(ref, { harness: 'claude-code', token: sessionId });
+  assert.equal(readFileSync(promptPath, 'utf8'), 'harmless local prompt bytes');
+  assert.equal(probe.queryCalls, 1);
+  assert.deepEqual(probe.optionSessionIds, [sessionId]);
+  assert.deepEqual(events.map((event) => event.kind), ['started', 'progress', 'turn_ended']);
+  await claudeAdapter.stop(ref);
+});
+
+test('a throwing started persistence gate starts no query, process, or prompt delivery', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-claude-gate-'));
+  coldStartDirs.push(root);
+  const promptPath = join(root, 'prompt.txt');
+  let loads = 0;
+  const events: AgentEvent[] = [];
+
+  await assert.rejects(
+    startClaude(
+      coldStartArgs(root),
+      (event) => {
+	events.push(event);
+	if (event.kind === 'started') throw new Error('active fsync failed');
+      },
+      {
+	createSessionId: () => '22222222-2222-4222-8222-222222222222',
+	loadQuery: async () => {
+	  loads++;
+	  return localQueryFactory(promptPath, '22222222-2222-4222-8222-222222222222', {
+	    queryCalls: 0,
+	    closes: 0,
+	    optionSessionIds: [],
+	  });
+	},
+      },
+    ),
+    /active fsync failed/u,
+  );
+
+  assert.equal(loads, 0);
+  assert.equal(existsSync(promptPath), false);
+  assert.deepEqual(events.map((event) => event.kind), ['started', 'exited']);
+});
+
+test('cold start fails closed when provider init does not confirm the supplied session UUID', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'owenloop-claude-gate-'));
+  coldStartDirs.push(root);
+  const promptPath = join(root, 'prompt.txt');
+  const supplied = '33333333-3333-4333-8333-333333333333';
+  const reported = '44444444-4444-4444-8444-444444444444';
+  const probe: LocalQueryProbe = { queryCalls: 0, closes: 0, optionSessionIds: [] };
+  const events: AgentEvent[] = [];
+
+  await assert.rejects(
+    startClaude(
+      coldStartArgs(root),
+      (event) => events.push(event),
+      {
+	createSessionId: () => supplied,
+	loadQuery: async () => localQueryFactory(promptPath, reported, probe),
+      },
+    ),
+    new RegExp(`provider session id mismatch: expected ${supplied}, received ${reported}`),
+  );
+
+  assert.equal(readFileSync(promptPath, 'utf8'), 'harmless local prompt bytes');
+  assert.deepEqual(probe.optionSessionIds, [supplied]);
+  assert.equal(probe.closes, 1);
+  assert.deepEqual(events.map((event) => event.kind), ['started', 'exited']);
+  await claudeAdapter.stop({ harness: 'claude-code', token: supplied });
+  assert.equal(probe.closes, 1, 'a mismatched init was removed from the session registry');
 });
 
 // ---------------------------------------------------------------------------

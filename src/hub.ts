@@ -529,13 +529,26 @@ export function macosKeychain(runner: MacosSecurityRunner = runMacosSecurity): K
 }
 
 /**
- * The default macOS keychain backend. Returns `undefined` off macOS or when
- * `OWENLOOP_NO_KEYCHAIN=1`, so callers use the 0600 credential file instead.
+ * Every locally available Keychain backend, independent of the ordinary-store
+ * override. Defensive logout uses this resolver so `OWENLOOP_NO_KEYCHAIN=1`
+ * cannot hide a credential that would become authoritative again when the
+ * override is removed. An injected backend remains available on every platform;
+ * otherwise only macOS has a platform backend.
+ */
+export function resolveLocalKeychain(injected?: Keychain): Keychain | undefined {
+  if (injected !== undefined) return injected;
+  if (process.platform !== 'darwin') return undefined;
+  return macosKeychain();
+}
+
+/**
+ * The default Keychain selected for ordinary reads and writes. Returns
+ * `undefined` off macOS or when `OWENLOOP_NO_KEYCHAIN=1` selects the 0600 file
+ * store. Logout deliberately uses `resolveLocalKeychain` instead.
  */
 export function defaultKeychain(env: Record<string, string | undefined>): Keychain | undefined {
   if (env.OWENLOOP_NO_KEYCHAIN === '1') return undefined;
-  if (process.platform !== 'darwin') return undefined;
-  return macosKeychain();
+  return resolveLocalKeychain();
 }
 
 /**

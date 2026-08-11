@@ -593,17 +593,20 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	  candidateDefName = defName;
 	  candidateDefHash = bundle.def.hash;
 	} else {
-	  if (
-	    typeof order.worker !== 'string' || order.worker.trim() === '' ||
-	    typeof order.defDigest !== 'string' || order.defDigest.trim() === ''
-	  ) {
+	  if (typeof order.defDigest !== 'string' || order.defDigest.trim() === '') {
 	    opts.err(
-	      `[${wf}/${order.run}] incomplete modern work order: non-empty worker and defDigest are both required — leaving for manual pickup`,
+	      `[${wf}/${order.run}] malformed modern work order: non-empty defDigest is required whenever modern routing metadata is present — leaving for manual pickup`,
 	    );
 	    claimed.add(order.run);
 	    continue;
 	  }
-	  if (order.worker === 'command') {
+
+	  // The deployed projection omits `worker` for the default executor. That
+	  // shape is a modern AGENT order because `defDigest` pins the exact step;
+	  // only an explicitly authored executor produces `worker` on the wire.
+	  if (!workerPresent || order.worker === 'agent') {
+	    kind = 'agent';
+	  } else if (order.worker === 'command') {
 	    kind = 'command';
 	    try {
 	      step = await opts.resolveOrderStep?.(order);
@@ -621,8 +624,12 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	      claimed.add(order.run);
 	      continue;
 	    }
-	  } else if (order.worker === 'agent') {
-	    kind = 'agent';
+	  } else if (typeof order.worker !== 'string' || order.worker.trim() === '') {
+	    opts.err(
+	      `[${wf}/${order.run}] malformed modern work order: worker must be absent, 'agent', or 'command' — leaving for manual pickup`,
+	    );
+	    claimed.add(order.run);
+	    continue;
 	  } else {
 	    opts.err(
 	      `[${wf}/${order.run}] unsupported worker '${order.worker}' — leaving for manual pickup`,

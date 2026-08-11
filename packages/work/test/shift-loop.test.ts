@@ -1,11 +1,14 @@
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import { createShiftLoop, MAX_PENDING_CANDIDATE_AGE_MS, type ShiftLoop, type ShiftLoopOptions } from '../src/shift/loop.ts';
-import { buildSpawnPlan, createDefaultSpawner, safeWorkerDiagnostic, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
+import { buildSpawnPlan, createDefaultSpawner, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
 import {
   readChildRecords,
   readChildReservations,
@@ -785,15 +788,54 @@ test('modern agent order never passes a disagreeing cache harness', async () => 
   assert.equal('harness' in spawns[0]!, false);
 });
 
-test('only orders with both modern fields absent use the legacy cache fallback', async () => {
+test('the deployed default-agent projection dispatches exactly one modern agent-run without cache routing', async () => {
+  // The real engine always projects defDigest, but omits worker when the authored
+  // step has no explicit executor. A disagreeing latest-name cache must be inert.
   cacheCommandBundle();
-  const workerOnly = { ...wo('run_worker_only', 'cmd'), worker: 'command' };
-  const digestOnly = { ...wo('run_digest_only', 'cmd'), defDigest: 'sha256:only' };
+  const projected = { ...wo('run_default_agent', 'cmd'), defDigest: 'sha256:projected-default-agent' };
+  const errors: string[] = [];
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: { wf1: { def: 'demo', orders: [projected] } },
+  });
+  const { spawner, spawns } = fakeSpawner();
+  let exactCommandLookups = 0;
+
+  await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    workflow: 'wf1',
+    resolveOrderStep: async () => {
+      exactCommandLookups++;
+      return { name: 'cmd', executor: 'command' };
+    },
+    err: (line) => errors.push(line),
+  })).run();
+
+  assert.equal(spawns.length, 1);
+  assert.equal(spawns[0]!.workflow, 'wf1');
+  assert.equal(spawns[0]!.run, 'run_default_agent');
+  assert.equal(spawns[0]!.step, 'cmd');
+  assert.equal(spawns[0]!.kind, 'agent-run');
+  assert.equal(typeof spawns[0]!.startGate, 'string');
+  assert.equal(exactCommandLookups, 0, 'default-agent routing stays in agent-run');
+  assert.equal(errors.some((line) => /cached bundle|legacy orders/u.test(line)), false);
+});
+
+test('only orders with both modern fields absent use the legacy cache fallback; malformed boundaries fail closed', async () => {
+  cacheCommandBundle();
+  const malformed = [
+    { ...wo('run_worker_only', 'cmd'), worker: 'command' },
+    { ...wo('run_empty_digest', 'cmd'), defDigest: '' },
+    { ...wo('run_invalid_digest', 'cmd'), defDigest: 42 },
+    { ...wo('run_empty_worker', 'cmd'), defDigest: 'sha256:valid', worker: '' },
+    { ...wo('run_invalid_worker', 'cmd'), defDigest: 'sha256:valid', worker: 42 },
+    { ...wo('run_unknown_worker', 'cmd'), defDigest: 'sha256:valid', worker: 'future' },
+  ] as unknown as WorkOrder[];
   const legacy = wo('run_legacy', 'cmd');
   const errors: string[] = [];
   const { hub } = mockHub({
     wake: [{ changed: true, cursor: 1 }],
-    perWf: { wf1: { def: 'demo', orders: [workerOnly, digestOnly, legacy] } },
+    perWf: { wf1: { def: 'demo', orders: [...malformed, legacy] } },
   });
   const { spawner, spawns } = fakeSpawner();
 
@@ -804,7 +846,8 @@ test('only orders with both modern fields absent use the legacy cache fallback',
   })).run();
 
   assert.deepEqual(spawns.map((spawned) => spawned.run), ['run_legacy']);
-  assert.equal(errors.filter((line) => /incomplete modern work order/u.test(line)).length, 2);
+  assert.equal(errors.filter((line) => /malformed modern work order/u.test(line)).length, 5);
+  assert.equal(errors.filter((line) => /unsupported worker 'future'/u.test(line)).length, 1);
 });
 
 // ---- agent lane: detached agent-run child ------------------------------------
@@ -1065,7 +1108,7 @@ test('buildSpawnPlan produces the detached `exec <workflow>/<run> --origin` argv
   // Account rides the spawn ENV (OWENLOOP_ACCOUNT), NOT the argv — exec has no --as flag.
   assert.deepEqual(plan.args, ['/pkg/bin/owenloop.mjs', 'work', 'exec', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
   assert.equal(plan.options.detached, true);
-  assert.deepEqual(plan.options.stdio, ['ignore', 'ignore', 'pipe']);
+  assert.deepEqual(plan.options.stdio, ['ignore', 'ignore', 'ignore']);
   assert.equal(plan.options.env['OWENLOOP_ACCOUNT'], 'ci');
   // Inherited parent env survives (env starts from process.env, then stamps the account).
   assert.equal(plan.options.env['PATH'], process.env['PATH']);
@@ -1108,7 +1151,7 @@ test('buildSpawnPlan: kind agent-run swaps the role positional and keeps every o
   );
   assert.deepEqual(plan.args, ['/pkg/bin/owenloop.mjs', 'work', 'agent-run', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
   assert.equal(plan.options.detached, true);
-  assert.deepEqual(plan.options.stdio, ['ignore', 'ignore', 'pipe']);
+  assert.deepEqual(plan.options.stdio, ['ignore', 'ignore', 'ignore']);
   assert.equal(plan.options.env['OWENLOOP_ACCOUNT'], 'ci');
 });
 
@@ -1154,7 +1197,7 @@ test('buildSpawnPlan: an empty or absent harness carries no --harness flag, and 
   assert.deepEqual(execSpec.args, ['/pkg/bin/owenloop.mjs', 'work', 'exec', 'wf1/run_zzzz', '--origin', 'https://hub.example']);
 });
 
-test('createDefaultSpawner reports a nonzero detached worker exit with bounded safe metadata', async () => {
+test('createDefaultSpawner reports a nonzero detached worker exit with generic lifecycle metadata', async () => {
   const script = join(stateDir, '..', 'exit-seven.mjs');
   writeFileSync(script, 'process.exit(7);\n');
   // Production Shift has a listening daemon and poll loop keeping its event
@@ -1188,7 +1231,7 @@ test('createDefaultSpawner never lets allowlisted-looking agent progress reach a
   const script = join(stateDir, '..', 'refuse.mjs');
   writeFileSync(
     script,
-		"process.stderr.write(\"owenloop work agent-run: consumed artifact refusal (signature) model progress contains token=very-secret-value and a private prompt\\n\");\n" +
+    "process.stderr.write(\"owenloop work agent-run: consumed artifact refusal (signature) model progress contains token=very-secret-value and a private prompt\\n\");\n" +
       'process.exit(1);\n',
   );
   const keepAlive = setTimeout(() => {}, 5_000);
@@ -1199,42 +1242,13 @@ test('createDefaultSpawner never lets allowlisted-looking agent progress reach a
 
   try {
     const reported = await failure;
-		assert.equal(reported.message, 'worker exited without completing successfully');
-		assert.equal(JSON.stringify(reported).includes('very-secret-value'), false);
-		assert.equal(JSON.stringify(reported).includes('private prompt'), false);
-		assert.equal(JSON.stringify(reported).includes('consumed artifact refusal'), false);
+    assert.equal(reported.message, 'worker exited without completing successfully');
+    assert.equal(JSON.stringify(reported).includes('very-secret-value'), false);
+    assert.equal(JSON.stringify(reported).includes('private prompt'), false);
+    assert.equal(JSON.stringify(reported).includes('consumed artifact refusal'), false);
   } finally {
     clearTimeout(keepAlive);
   }
-});
-
-test('safeWorkerDiagnostic ignores prompts, progress, and arbitrary stderr', () => {
-  assert.equal(safeWorkerDiagnostic('prompt contents\nprovider progress\narbitrary failure\n'), undefined);
-});
-
-// REGRESSION: `WorkerFailure.kind` has two values, but the allowlist matched only
-// `owenloop work agent-run:` prefixes. An `exec` child that refused at startup
-// therefore always reported the useless generic message. Every kind matched here
-// is a real member of `InstructionRefusalKind`
-// (packages/work/src/exec/instructions.ts) rendered by `refusal()`.
-test('safeWorkerDiagnostic surfaces an exec startup refusal instead of the generic message', () => {
-  const reported = safeWorkerDiagnostic(
-    "owenloop work exec: instruction refusal (unverified-def) for wf1/run_9 step 'cmd' " +
-      "defDigest 'sha256:abc': publication signature did not verify\n",
-  );
-  assert.match(reported ?? '', /instruction refusal \(unverified-def\)/u);
-  assert.equal(
-    safeWorkerDiagnostic('owenloop work exec: no hub origin — pass --origin <url> or set hubOrigin in settings\n'),
-    'owenloop work exec: no hub origin — pass --origin <url> or set hubOrigin in settings',
-  );
-});
-
-// The widening is deliberately limited to the pre-run startup/refusal gates. A
-// mid-run exec line can quote hub response text, so it must stay unmatched.
-test('safeWorkerDiagnostic still refuses mid-run exec lines and arbitrary exec stderr', () => {
-  assert.equal(safeWorkerDiagnostic('owenloop work exec: submit to workspace rejected (schema): hub said token=abc\n'), undefined);
-  assert.equal(safeWorkerDiagnostic('owenloop work exec: running wf1/run_9 (step \'cmd\')\n'), undefined);
-  assert.equal(safeWorkerDiagnostic('owenloop work exec: something entirely unrecognized\n'), undefined);
 });
 
 // REGRESSION: a synchronous spawn failure yields no pid AND makes Node emit
@@ -1268,47 +1282,33 @@ test('a spawn that returns no pid throws once and never also reports a duplicate
   assert.deepEqual(failures, [], 'the throw is the single report path for a spawn that yields no pid');
 });
 
-// REGRESSION: `stdio: [...,'pipe']` creates a libuv handle owned by the SHIFT
-// process, and `child.unref()` does not cover it. Left referenced, the Shift's
-// event loop stays alive for the child's whole lifetime, so `owenloop work
-// shift --once` would block until every dispatched worker exited — defeating the
-// detached hand-off this seam exists to perform.
-test('the spawner does not keep its own event loop referenced for the detached child lifetime', async () => {
-  const script = join(stateDir, '..', 'slow-child.mjs');
-  writeFileSync(script, "process.stderr.write('early\\n');\nsetTimeout(() => {}, 60_000);\n");
-  const spawner = createDefaultSpawner(ORIGIN, 'default', script, 'shf_test');
+// REGRESSION: both detached worker roles share one stdio topology. The real
+// parent process exits before either worker writes to stderr. A parent-owned pipe
+// would close its read end at that point; the later write would raise EPIPE and
+// terminate the worker before the completion marker.
+test('detached exec and agent-run workers survive late stderr writes after Shift exits', async () => {
+  const markerDir = join(stateDir, '..', 'detached-markers');
+  mkdirSync(markerDir);
+  const parentFixture = fileURLToPath(new URL('./fixtures/detached-worker-parent.ts', import.meta.url));
+  const workerFixture = fileURLToPath(new URL('./fixtures/detached-worker-child.mjs', import.meta.url));
+  const parent = spawn(process.execPath, [parentFixture, workerFixture], {
+    env: { ...process.env, DETACHED_MARKER_DIR: markerDir },
+    stdio: 'ignore',
+  });
 
-  // `_getActiveHandles()` lists exactly the handles that are a reason for this
-  // process's event loop to keep running. The child's stderr pipe appears there
-  // as a `Socket` while it is referenced, and drops off once unref'd — data
-  // still reaches the tail buffer for as long as the Shift is up, it simply
-  // stops holding the loop open.
-  //
-  // Measured as a DELTA across the one spawn, never as an absolute count: under
-  // `node --test` the runner's own piped stdio already contributes referenced
-  // Sockets that have nothing to do with this seam. Verified to fail (delta 1)
-  // when `child.stderr.unref()` is removed from `createDefaultSpawner`.
-  const activeSockets = (): number =>
-    (process as unknown as { _getActiveHandles: () => { constructor: { name: string } }[] })
-      ._getActiveHandles()
-      .filter((handle) => handle.constructor.name === 'Socket').length;
+  const [code, signal] = await once(parent, 'exit') as [number | null, NodeJS.Signals | null];
+  assert.equal(code, 0);
+  assert.equal(signal, null);
 
-  const before = activeSockets();
-  spawner({ workflow: 'wf1', run: 'run_detach', step: 'cmd' });
-  assert.equal(
-    activeSockets() - before,
-    0,
-    "the child stderr pipe must be unref'd alongside the child itself",
-  );
+  const deadline = Date.now() + 5_000;
+  const markers = ['exec.done', 'agent-run.done'];
+  while (!markers.every((name) => existsSync(join(markerDir, name))) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  for (const marker of markers) {
+    assert.equal(readFileSync(join(markerDir, marker), 'utf8'), 'completed\n', `${marker} proves the worker survived stderr`);
+  }
 });
-
-// createDefaultSpawner is a thin wrapper: it captures shiftId at
-// construction and passes it straight through to buildSpawnPlan (see spawn.ts
-// doc comment) before calling the real `spawn`. Per this file's own testing
-// contract ("pure buildSpawnPlan so a test can assert the exact shape as
-// data" / never launch a real child), the buildSpawnPlan tests above are the
-// intended coverage for the shiftId threading — createDefaultSpawner
-// itself is deliberately NOT exercised here.
 
 test('a dispatched command order writes an exec child record carrying the returned pid', async () => {
   cacheCommandBundle();
