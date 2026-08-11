@@ -18,6 +18,8 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 import {
+  compareStoreText,
+  selectLatestVersion,
   BundleIngestorUnavailableError,
   defDigest,
   DIGEST_RE,
@@ -96,6 +98,103 @@ function resolvingVerifier(opts: { failFor?: Set<string> } = {}): BundleIngestor
 }
 
 // ---- roots -----------------------------------------------------------------------
+
+// ---- version selection --------------------------------------------------------
+
+/** Shorthand candidate: the helper only ever reads version, level, and digest. */
+function candidate(version: string, level: 'project' | 'global', digest: string): {
+  version: string;
+  level: 'project' | 'global';
+  digest: string;
+} {
+  return { version, level, digest: digest.repeat(64).slice(0, 64) };
+}
+
+test('selectLatestVersion: highest SemVer precedence wins, and 0.1.10 beats 0.1.2', () => {
+  const picked = selectLatestVersion([
+    candidate('0.1.2', 'global', 'a'),
+    candidate('0.1.10', 'global', 'b'),
+    candidate('0.1.9', 'global', 'c'),
+  ]);
+  assert.equal(picked.kind, 'selected');
+  assert.equal(picked.kind === 'selected' && picked.winner.version, '0.1.10');
+  assert.equal(picked.shadowed.length, 2);
+});
+
+test('selectLatestVersion: the answer never depends on candidate order', () => {
+  const all = [
+    candidate('0.1.0', 'global', 'a'),
+    candidate('0.1.7', 'global', 'b'),
+    candidate('0.1.6', 'global', 'c'),
+    candidate('0.1.1', 'global', 'd'),
+  ];
+  const orders = [all, [...all].reverse(), [all[1]!, all[3]!, all[0]!, all[2]!]];
+  for (const order of orders) {
+    const picked = selectLatestVersion(order);
+    assert.equal(picked.kind === 'selected' && picked.winner.version, '0.1.7');
+  }
+});
+
+test('selectLatestVersion: a project candidate outranks a HIGHER global one', () => {
+  const picked = selectLatestVersion([
+    candidate('0.9.9', 'global', 'a'),
+    candidate('0.1.0', 'project', 'b'),
+  ]);
+  assert.equal(picked.kind === 'selected' && picked.winner.version, '0.1.0');
+  assert.equal(picked.kind === 'selected' && picked.winner.level, 'project');
+});
+
+test('selectLatestVersion: a release outranks its own prerelease (SemVer §11)', () => {
+  const picked = selectLatestVersion([
+    candidate('2.0.0', 'global', 'a'),
+    candidate('2.0.0-rc.2', 'global', 'b'),
+    candidate('2.0.0-rc.10', 'global', 'c'),
+  ]);
+  assert.equal(picked.kind === 'selected' && picked.winner.version, '2.0.0');
+});
+
+test('selectLatestVersion: SemVer outranks non-SemVer instead of tying', () => {
+  const picked = selectLatestVersion([
+    candidate('nightly', 'global', 'a'),
+    candidate('0.0.1', 'global', 'b'),
+  ]);
+  assert.equal(picked.kind === 'selected' && picked.winner.version, '0.0.1');
+});
+
+test('selectLatestVersion: several unorderable versions fail closed rather than guess', () => {
+  const picked = selectLatestVersion([
+    candidate('nightly', 'global', 'a'),
+    candidate('edge', 'global', 'b'),
+  ]);
+  assert.equal(picked.kind, 'unorderable');
+  assert.equal(picked.shadowed.length, 2, 'both stay reachable by digest');
+});
+
+test('selectLatestVersion: ONE unorderable version still wins — nothing to order', () => {
+  const picked = selectLatestVersion([candidate('nightly', 'global', 'a')]);
+  assert.equal(picked.kind === 'selected' && picked.winner.version, 'nightly');
+});
+
+test('selectLatestVersion: versions differing only in build metadata resolve by digest, not arrival', () => {
+  const a = candidate('1.0.0+alpha', 'global', 'a');
+  const b = candidate('1.0.0+beta', 'global', 'b');
+  const forward = selectLatestVersion([a, b]);
+  const reverse = selectLatestVersion([b, a]);
+  assert.equal(forward.kind, 'selected');
+  assert.equal(
+    forward.kind === 'selected' && forward.winner.digest,
+    reverse.kind === 'selected' && reverse.winner.digest,
+  );
+});
+
+test('compareStoreText: a total codepoint order, independent of host locale', () => {
+  assert.equal(compareStoreText('a', 'b') < 0, true);
+  assert.equal(compareStoreText('b', 'a') > 0, true);
+  assert.equal(compareStoreText('a', 'a'), 0);
+  // `localeCompare` reports these equal under many ICU locales; codepoint order
+  // must not, or two hosts could disagree on how an index is walked.
+  assert.notEqual(compareStoreText('a', 'A'), 0);
+});
 
 test('roots: the project root IS the resolved defs dir', () => {
   const defsDir = tempDir();

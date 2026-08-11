@@ -1082,9 +1082,37 @@ B.
 
 The precedence is explicit: project-local definitions win first, then
 GitHub-`add` installed definitions, then CAS definitions under qualified keys.
-Within the CAS layer, a project bundle holds the normal qualified name and a
-global bundle is the fallback. A shadowed bundle remains reachable under its
-digest-scoped key so an already-pinned execution cannot be retargeted.
+Within the CAS layer, exactly one installed bundle holds the unqualified
+`<package>/<workflow>` name, chosen by two rules in order and never by install
+order:
+
+1. **Level.** If any candidate is named by the *project* index, only project
+   candidates compete. A project pin of `pkg@0.1.0` therefore beats a global
+   install of `pkg@0.9.9`. This holds even when the project's own object bytes
+   are missing and were served by exact-digest fallback from the global store —
+   the index that names the object decides, not where the bytes were read.
+2. **Version.** Among the survivors, the highest canonical SemVer precedence
+   wins (SemVer §11, so `0.1.10` beats `0.1.2` and `1.0.0` beats `1.0.0-rc.1`).
+
+A canonical SemVer version never loses to a non-SemVer one. If two or more
+candidates compete and *none* carries a canonical SemVer version, the selection
+**fails closed**: the unqualified name is left unregistered and a warning names
+the versions involved, because there is no defined precedence to pick by. Call an
+exact `<namespace>/<name>@<version>` coordinate in that case. A single
+non-SemVer version still holds its name — there is nothing to order.
+
+The refusal warning names only the versions that actually competed. A version
+dropped by rule 1 is reported separately as never having competed, since it lost
+on level and was never judged on its version at all. For the same reason,
+precedence warnings say `project-indexed` / `global-indexed`: precedence follows
+the index that named the object, whereas a registration's reported level is the
+store its verified bytes came from, and the two differ under exact-digest
+fallback.
+
+Every version that did not win remains reachable under its digest-scoped key, so
+an already-pinned execution cannot be retargeted, and every exact
+`<namespace>/<name>@<version>` coordinate always resolves to its own object
+regardless of which version currently holds the unqualified name.
 A corrupt CAS index, object, or workflow is skipped with a warning during
 read-side discovery, so it does not make `status` fail. A running workflow keeps
 the definition snapshot from its creation (§28), including the CAS bundle

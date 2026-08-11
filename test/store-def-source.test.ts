@@ -303,8 +303,11 @@ test('WS-6 loader: a project bundle overrides a different global bundle with the
   const coordinateAlias = registrations.find((registration) => registration.key === 'parent/parent@1.0.0');
   assert.equal(coordinateAlias?.bundleDigest, project.digest, 'the full coordinate also obeys project precedence');
 
+  // `kind` is part of the query, not an afterthought: the shadowed global object
+  // also carries a digest-scoped COORDINATE alias whose `bare` is likewise
+  // 'parent', and the assertions below are about the WORKFLOW registration.
   const globalScoped = registrations.find(
-    (r) => r.bundleDigest === global.digest && r.bare === 'parent',
+    (r) => r.bundleDigest === global.digest && r.bare === 'parent' && r.kind === 'workflow',
   );
   assert.ok(globalScoped, 'the shadowed global copy remains available for pinned execution');
   assert.equal(globalScoped.key, `${global.digest}/parent`);
@@ -1022,4 +1025,320 @@ test('WS-6: a def with NO bundle provenance takes the unchanged flat-map path', 
   // A qualified name never falls back to a bare lookup — that fallback is the
   // shadowing this workstream exists to prevent.
   assert.equal(resolveCallsTarget(defs, 'pkg/target', plain), undefined, 'no bare fallback for a qualified key');
+});
+
+// ---- deterministic version selection -----------------------------------------
+
+/**
+ * Which installed version holds an unqualified `package/workflow` name must be
+ * a decision, not a side effect of arrival order.
+ *
+ * Before this section existed the loader took whichever indexed coordinate it
+ * processed FIRST, and it processed them in coordinate-string order — so
+ * `parent/parent` silently meant the OLDEST install (`0.1.0` beat `0.1.7`), and
+ * `0.1.10` beat `0.1.2` because the comparison was lexicographic. A build that
+ * happened to sort by digest instead picked a third answer. Each test below
+ * fails against that behavior.
+ */
+
+/** Install several versions of the same package into ONE store root. */
+async function installVersions(
+  versions: readonly string[],
+  root?: string,
+): Promise<{ root: string; digests: Map<string, string> }> {
+  let current = root;
+  const digests = new Map<string, string>();
+  for (const version of versions) {
+    const installed = await installPair({
+      name: 'parent',
+      version,
+      marker: `V${version}`,
+      ...(current === undefined ? {} : { root: current }),
+    });
+    current = installed.root;
+    digests.set(version, installed.digest);
+  }
+  return { root: current as string, digests };
+}
+
+/** Rewrite index.json with its coordinate keys in an explicitly chosen order. */
+function rewriteIndexKeyOrder(root: string, order: (keys: string[]) => string[]): void {
+  const path = storeIndexPath(root);
+  const index = readWorkflowStoreIndex(path);
+  const reordered: typeof index.entries = {};
+  for (const key of order(Object.keys(index.entries))) reordered[key] = index.entries[key]!;
+  writeWorkflowStoreIndex(path, { version: 1, entries: reordered });
+}
+
+/** The marker body of whichever def holds the unqualified `parent/parent` key. */
+function selectedMarker(registrations: ReturnType<typeof loadCasDefs>): string | undefined {
+  const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
+  return winner?.def.steps[0]!.body.trim();
+}
+
+test('version selection: the HIGHEST SemVer holds the unqualified name, not the first coordinate walked', async () => {
+  const { root, digests } = await installVersions(['0.1.0', '0.1.1', '0.1.6', '0.1.7']);
+  const { registrations } = load(root, emptyGlobalRoot());
+
+  const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
+  assert.ok(winner, 'the unqualified name is registered');
+  assert.equal(winner.bundleDigest, digests.get('0.1.7'), '0.1.7 is the selected version');
+  assert.match(winner.def.steps[0]!.body, /V0\.1\.7/);
+  // The pre-fix loader returned 0.1.0 here: coordinate strings sort ascending and
+  // the first walked coordinate claimed the name.
+  assert.doesNotMatch(winner.def.steps[0]!.body, /V0\.1\.0/, 'the OLDEST version must not win');
+});
+
+test('version selection: 0.1.10 outranks 0.1.2 — SemVer precedence, never string order', async () => {
+  const { root, digests } = await installVersions(['0.1.2', '0.1.10']);
+  const { registrations } = load(root, emptyGlobalRoot());
+
+  const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
+  assert.equal(winner?.bundleDigest, digests.get('0.1.10'));
+});
+
+test('version selection: a prerelease never outranks its own release', async () => {
+  const { root, digests } = await installVersions(['1.0.0-rc.1', '1.0.0']);
+  const { registrations } = load(root, emptyGlobalRoot());
+
+  const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
+  assert.equal(winner?.bundleDigest, digests.get('1.0.0'));
+});
+
+test('version selection: install order, index key order, and digest order do not move the winner', async () => {
+  const forward = await installVersions(['0.1.0', '0.1.1', '0.1.6', '0.1.7']);
+  const reverse = await installVersions(['0.1.7', '0.1.6', '0.1.1', '0.1.0']);
+  const shuffled = await installVersions(['0.1.6', '0.1.0', '0.1.7', '0.1.1']);
+
+  // Digest order is independent of version order by construction: the markers
+  // differ per install, so each root's digests sort differently.
+  rewriteIndexKeyOrder(forward.root, (keys) => [...keys].reverse());
+  rewriteIndexKeyOrder(shuffled.root, (keys) => [...keys].sort());
+
+  for (const installed of [forward, reverse, shuffled]) {
+    const { registrations } = load(installed.root, emptyGlobalRoot());
+    assert.equal(
+      selectedMarker(registrations),
+      'provision V0.1.7',
+      'every arrival order selects the same version',
+    );
+  }
+});
+
+test('version selection: workflow registration order is sorted by qualified name', async () => {
+  // `writeBundleSource` always emits the package's own workflow FIRST, so a
+  // package named `parent` carrying an extra workflow named `aaa` produces a
+  // manifest whose `workflows:` keys are {parent, aaa} — deliberately not
+  // alphabetical. Registration order must not follow that.
+  const sourceDir = writeBundleSource({
+    name: 'parent',
+    version: '1.0.0',
+    workflow: parentYaml('MANIFEST-ORDER'),
+    workflows: {
+      aaa: childYaml('MANIFEST-ORDER').replace('name: child', 'name: aaa'),
+      child: childYaml('MANIFEST-ORDER'),
+    },
+    defaultWorkflow: 'parent',
+  });
+  const manifest = readFileSync(join(sourceDir, 'bundle.yaml'), 'utf8');
+  assert.match(
+    manifest,
+    /workflows:\n {2}parent:.*\n {2}aaa:/u,
+    'fixture must actually list the workflows out of alphabetical order',
+  );
+
+  const installed = await installBundleFixture({ sourceDir });
+  const { registrations } = load(installed.root, emptyGlobalRoot());
+
+  assert.deepEqual(
+    registrations.filter((r) => r.kind === 'workflow').map((r) => r.key),
+    ['parent/aaa', 'parent/child', 'parent/parent'],
+    'workflow registrations come out sorted by qualified name',
+  );
+});
+
+test('version selection: install order moves neither the winner nor the warnings', async () => {
+  // Two installs of the same versions differing only in the order they were
+  // added must produce byte-identical warnings, in the same order, and pick the
+  // same winner.
+  const ordered = await installVersions(['0.1.0', '0.1.7']);
+  const first = load(ordered.root, emptyGlobalRoot());
+
+  const reordered = await installVersions(['0.1.7', '0.1.0']);
+  const second = load(reordered.root, emptyGlobalRoot());
+
+  assert.equal(selectedMarker(first.registrations), selectedMarker(second.registrations));
+  assert.deepEqual(
+    first.registrations.filter((r) => r.kind === 'workflow').map((r) => r.key),
+    second.registrations.filter((r) => r.kind === 'workflow').map((r) => r.key),
+    'registration order itself is stable, not merely the set of keys',
+  );
+  assert.deepEqual(first.warnings, second.warnings, 'warning text and order are identical');
+  assert.equal(first.warnings.length, 2, 'both shadowed workflows of 0.1.0 are reported once each');
+});
+
+test('version selection: a project pin whose BYTES came from global still outranks a higher global version', async () => {
+  // `resolveObject` lets a project-indexed coordinate whose object directory is
+  // missing locally fall through to the SAME digest in the global store. Such an
+  // object reports `level: 'global'` for byte provenance, but the PROJECT index
+  // is what names it, so it must still compete — and win — as a project pin.
+  const pinned = await installVersions(['0.1.0']);
+  const pinnedDigest = pinned.digests.get('0.1.0') as string;
+
+  // The global store holds both the pinned digest (so the fallback can find it)
+  // and a strictly higher version that must NOT be selected.
+  const globalStore = await installPair({ name: 'parent', version: '0.1.0', marker: 'V0.1.0' });
+  assert.equal(globalStore.digest, pinnedDigest, 'fixture stores must index identical bytes');
+  await installPair({ name: 'parent', version: '0.9.9', marker: 'V0.9.9', root: globalStore.root });
+
+  removeInstalledObject(pinned.root, pinnedDigest);
+
+  const { registrations } = load(pinned.root, globalStore.root);
+  const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
+
+  assert.ok(winner, 'the unqualified name is registered');
+  assert.equal(winner.bundleDigest, pinnedDigest, 'the project-indexed 0.1.0 pin holds the name');
+  assert.match(winner.def.steps[0]!.body, /V0\.1\.0/);
+  assert.equal(winner.level, 'global', 'byte provenance is still reported honestly');
+});
+
+test('version selection: a project install outranks a HIGHER global version', async () => {
+  const project = await installVersions(['0.1.0']);
+  const global = await installVersions(['0.1.7']);
+
+  const { registrations } = load(project.root, global.root);
+  const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
+  assert.equal(winner?.level, 'project', 'the project store stays the deterministic override');
+  assert.equal(winner?.bundleDigest, project.digests.get('0.1.0'));
+  // The global copy is shadowed for the bare name but never lost.
+  const shadowed = registrations.find(
+    (r) => r.kind === 'workflow' && r.bare === 'parent'
+      && r.bundleDigest === global.digests.get('0.1.7'),
+  );
+  assert.equal(shadowed?.key, `${global.digests.get('0.1.7')}/parent`);
+});
+
+test('version selection: every EXACT coordinate resolves to its own version, whoever holds the bare name', async () => {
+  const versions = ['0.1.0', '0.1.1', '0.1.6', '0.1.7'];
+  const { root, digests } = await installVersions(versions);
+  const { registrations } = load(root, emptyGlobalRoot());
+
+  for (const version of versions) {
+    const alias = registrations.find((r) => r.key === `parent/parent@${version}`);
+    assert.ok(alias, `coordinate parent/parent@${version} is registered`);
+    assert.equal(alias.bundleDigest, digests.get(version), 'the coordinate keeps its own object');
+    assert.match(alias.def.steps[0]!.body, new RegExp(`V${version.replace(/\./gu, '\\.')}`));
+  }
+});
+
+test('version selection: a shadowed version stays reachable by digest for pinned execution', async () => {
+  const { root, digests } = await installVersions(['0.1.0', '0.1.7']);
+  const { registrations } = load(root, emptyGlobalRoot());
+  const oldDigest = digests.get('0.1.0') as string;
+
+  const scopedWorkflow = registrations.find(
+    (r) => r.kind === 'workflow' && r.key === `${oldDigest}/parent`,
+  );
+  assert.ok(scopedWorkflow, 'the shadowed version keeps a digest-scoped workflow key');
+  assert.match(scopedWorkflow.def.steps[0]!.body, /V0\.1\.0/);
+
+  const scopedCoordinate = registrations.find(
+    (r) => r.kind === 'coordinate' && r.key === `${oldDigest}/parent/parent@0.1.0`,
+  );
+  assert.ok(scopedCoordinate, 'a pinned parent can still follow its lock digest');
+  assert.equal(scopedCoordinate.bundleDigest, oldDigest);
+});
+
+test('version selection: the refusal never calls a level-outranked SemVer version non-SemVer', async () => {
+  // Project-indexed `nightly` and `edge` refuse the name between themselves. A
+  // global `1.0.0` also exists, but it lost on LEVEL and was never judged on its
+  // version — the warning must not sweep it into "none of these is SemVer",
+  // which would send an operator hunting a defect in a valid version string.
+  const project = await installVersions(['nightly', 'edge']);
+  const oneGlobal = await installVersions(['1.0.0']);
+
+  const refusalFor = (globalRoot: string): string => {
+    const { registrations, warnings } = load(project.root, globalRoot);
+    assert.equal(
+      registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow'),
+      undefined,
+      'the unqualified name is still refused',
+    );
+    const line = warnings.find((warning) => warning.includes("'parent/parent' has no selectable"));
+    assert.ok(line, 'the refusal is reported');
+    return line;
+  };
+
+  const singular = refusalFor(oneGlobal.root);
+  // Assert against the competing LIST itself, not the surrounding sentence, so
+  // rewording the message cannot silently turn this into a no-op assertion.
+  const competingList = /competing versions \(([^)]*)\)/u.exec(singular)?.[1];
+  assert.ok(competingList, 'the refusal names the competing versions');
+  assert.deepEqual([...competingList.split(', ')].sort(), ['edge', 'nightly']);
+  assert.ok(
+    !competingList.includes('1.0.0'),
+    'the level-outranked SemVer version is not listed among the non-SemVer competitors',
+  );
+  assert.match(
+    singular,
+    /1 further global-indexed version never competed/u,
+    'the outranked SemVer version is reported separately, with the real reason',
+  );
+
+  // A second outranked version must pluralize rather than read "2 further ... version".
+  const twoGlobal = await installVersions(['1.0.0', '2.0.0']);
+  assert.match(refusalFor(twoGlobal.root), /2 further global-indexed versions never competed/u);
+});
+
+test('version selection: several non-SemVer versions fail closed instead of guessing', async () => {
+  const { root, digests } = await installVersions(['nightly', 'edge']);
+  const { registrations, warnings } = load(root, emptyGlobalRoot());
+
+  assert.equal(
+    registrations.find((r) => r.key === 'parent/parent'),
+    undefined,
+    'no version may claim the unqualified name when none can be ordered',
+  );
+  assert.equal(
+    warnings.some((line) => line.includes("workflow 'parent/parent' has no selectable version")),
+    true,
+    'the refusal is visible, and names the fix',
+  );
+  for (const version of ['nightly', 'edge']) {
+    const digest = digests.get(version) as string;
+    assert.ok(
+      registrations.find((r) => r.kind === 'workflow' && r.key === `${digest}/parent`),
+      `${version} stays reachable by digest`,
+    );
+    assert.ok(
+      registrations.find((r) => r.key === `parent/parent@${version}`),
+      `${version} stays reachable by exact coordinate`,
+    );
+  }
+});
+
+test('version selection: a SINGLE non-SemVer version still holds its name', async () => {
+  const { root, digests } = await installVersions(['nightly']);
+  const { registrations } = load(root, emptyGlobalRoot());
+
+  const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
+  assert.equal(winner?.bundleDigest, digests.get('nightly'), 'nothing to order, so nothing to refuse');
+});
+
+test('version selection: a SemVer version outranks a non-SemVer one rather than tying', async () => {
+  const { root, digests } = await installVersions(['nightly', '0.1.7']);
+  const { registrations } = load(root, emptyGlobalRoot());
+
+  const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
+  assert.equal(winner?.bundleDigest, digests.get('0.1.7'));
+});
+
+test('version selection: the shadowing warning names both versions, not just the digests', async () => {
+  const { root, digests } = await installVersions(['0.1.0', '0.1.7']);
+  const { warnings } = load(root, emptyGlobalRoot());
+
+  const line = warnings.find((w) => w.includes(digests.get('0.1.0') as string));
+  assert.ok(line, 'the shadowed copy is reported');
+  assert.match(line, /version 0\.1\.0/u, 'the shadowed version is named');
+  assert.match(line, /version 0\.1\.7.*is the selected version/u, 'the winning version is named');
 });
