@@ -40,13 +40,6 @@ export interface SpawnSpec {
    *    hosts the step agent itself. This is the ONLY agent path.
    */
   kind?: 'exec' | 'agent-run';
-  /**
-   * The harness id to host the step agent in, for `kind: 'agent-run'` only.
-   * Absent carries no `--harness` flag, leaving the child to resolve the id
-   * from `OWENLOOP_HARNESS`, the step def, or its built-in default. Ignored for
-   * `'exec'` (a command order has no step agent).
-   */
-  harness?: string;
 }
 
 /** The result the loop records: the child's pid. */
@@ -98,11 +91,16 @@ export function resolveOwenloopBin(): string {
  * (advisory only, D8/INV-82). Omitted/empty carries no flag at all.
  *
  * Phase 3 (D6) widens this ONE seam rather than adding a second: `spec.kind`
- * selects the role positional (`exec` vs `agent-run`) and `spec.harness`
- * appends `--harness <id>` on the `agent-run` branch. Everything else — the
+ * selects the role positional (`exec` vs `agent-run`). Everything else — the
  * composite order positional, `--origin`, `--shift`, and every spawn option
  * — is identical for both kinds, so an agent-run child is detached,
  * stdio-ignored, and account-scoped exactly like an exec child.
+ *
+ * The Shift never emits `--harness`. A prepared-cache step is dispatch metadata,
+ * not an operator override; the `agent-run` child resolves its authoritative
+ * inputs in precedence order (`--harness`, `OWENLOOP_HARNESS`, verified runtime
+ * step, registered default). The Shift command has no operator-facing harness
+ * flag, so there is no legitimate CLI override for this seam to carry.
  */
 export function buildSpawnPlan(
   spec: SpawnSpec,
@@ -123,9 +121,6 @@ export function buildSpawnPlan(
       '--origin',
       origin,
       ...(shiftId !== undefined && shiftId !== '' ? ['--shift', shiftId] : []),
-      ...(role === 'agent-run' && spec.harness !== undefined && spec.harness !== ''
-        ? ['--harness', spec.harness]
-        : []),
     ],
     options: { detached: true, stdio: 'ignore', env: { ...process.env, OWENLOOP_ACCOUNT: account } },
   };

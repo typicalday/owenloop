@@ -24,7 +24,7 @@
  *
  * Credential path: owenloop file store (no OWENLOOP_TOKEN), as every drill.
  */
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -113,14 +113,50 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-async function seedCache(): Promise<void> {
-  const tpl: NormalizedStepSpec = { step: 'builder', brief: TPL_CONTENT, permissions: { extensions: {} } };
+interface SeedOptions {
+  cachedHarness?: string;
+  runtimeHarness?: string;
+  maxTurns?: number;
+}
+
+/**
+ * Seed both sources involved in Shift dispatch:
+ *  - the prepared cache, used only to classify and meter the offered order; and
+ *  - the installed runtime definition, verified by `agent-run` before briefing.
+ *
+ * Tests deliberately make their harness ids disagree. Cache metadata must never
+ * be promoted into the child CLI, where it would outrank the environment and the
+ * verified runtime definition.
+ */
+async function seedCache(options: SeedOptions = {}): Promise<void> {
+  const runtimeHarness = options.runtimeHarness ?? 'fake';
+  const permissions = {
+    ...(options.maxTurns !== undefined ? { maxTurns: options.maxTurns } : {}),
+    extensions: {},
+  };
+  const tpl: NormalizedStepSpec = {
+    step: 'builder',
+    brief: TPL_CONTENT,
+    ...(options.cachedHarness !== undefined ? { harness: options.cachedHarness } : {}),
+    permissions,
+  };
+  const cachedStep = {
+    name: 'builder',
+    body: '',
+    ...(options.cachedHarness !== undefined ? { harness: options.cachedHarness } : {}),
+  };
   const bundle: CachedBundle = {
-    def: { name: 'demo', hash: DEMO_HASH, steps: [{ name: 'builder', body: '' }] },
+    def: {
+      name: 'demo',
+      hash: DEMO_HASH,
+      steps: [cachedStep],
+    },
     fetchedAt: 0,
     origin: 'seed',
   };
   writeBundle(cacheDir, bundle, [tpl]);
+  const maxTurnsLine = options.maxTurns !== undefined ? `\n        maxTurns: ${String(options.maxTurns)}` : '';
+  const runtimeHarnessLines = `        id: ${runtimeHarness}${maxTurnsLine}`;
   const workflow = `name: demo
 inputs:
   - name: seed
@@ -135,7 +171,7 @@ steps:
 ${TPL_CONTENT.split('\n').map((line) => `      ${line}`).join('\n')}
     x:
       harness:
-        id: fake
+${runtimeHarnessLines}
 `;
   const sourceDir = writeBundleSource({ name: 'demo', workflow });
   const installed = await installBundleFixture({ sourceDir, root: join(home, '.owenloop', 'workflows') });
@@ -162,7 +198,10 @@ function traceCalls(): Array<Record<string, unknown>> {
     .map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
-function spawnDaemon(origin: string): ShiftChild {
+function spawnDaemon(
+  origin: string,
+  extraEnv: Record<string, string | undefined> = {},
+): ShiftChild {
   // NOTE: the fixture HOME is what makes every default home-relative location
   // observable to the negative assertion below.
   return spawnShift(
@@ -182,8 +221,60 @@ function spawnDaemon(origin: string): ShiftChild {
       OWENLOOP_HARNESS: 'fake',
       OWENLOOP_FAKE_TRACE: tracePath,
       OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'fake', start: { events: [{ kind: 'turn_ended' }] } }),
+      ...extraEnv,
     }),
   );
+}
+
+function stopDaemonAndChildren(daemon: ShiftChild): void {
+  daemon.child.kill('SIGKILL');
+  for (const record of readChildRecords(stateDir)) {
+    try {
+      process.kill(record.pid, 'SIGKILL');
+    } catch {
+      // already gone
+    }
+  }
+}
+
+async function startSingleOrderHub(): Promise<Awaited<ReturnType<typeof startMockHub>>> {
+  let wakes = 0;
+  let getOrders = 0;
+  return startMockHub((verb, body) => {
+    switch (verb) {
+      case 'wake':
+	return { text: '', cursor: 1, changed: wakes++ === 0 };
+      case 'whats_next':
+	if (body?.workflow === undefined) return { text: '', instances: [{ workflow: 'wf1' }] };
+	return { text: '', workflow: 'wf1', def: 'demo', orders: [ORDER] };
+      case 'presence_ping':
+	return { text: '', ok: true, name: 'p', lastSeen: 1 };
+      case 'get_order':
+	return getOrders++ === 0
+	  ? { text: '', workflow: 'wf1', run: 'run_x1234', order: packet(), lease: { claimed: true } }
+	  : { text: '', workflow: 'wf1', run: 'run_x1234', order: packet(), lease: { claimed: false, outcome: 'ok' } };
+      case 'heartbeat':
+	return { text: '', ok: true };
+      default:
+	return { text: '' };
+    }
+  });
+}
+
+async function dispatchOne(daemon: ShiftChild): Promise<void> {
+  await daemon.ready;
+  const response = await daemon.request({ op: 'next', wait_ms: 5_000 });
+  assert.equal(isShiftError(response), false, `next failed: ${JSON.stringify(response)}; stderr:\n${daemon.stderr()}`);
+  if (isShiftError(response) || !('events' in response)) throw new Error('unexpected shift response');
+  assert.equal(response.events.some((event) => event.type === 'dispatched'), true, 'next reports the dispatch event');
+}
+
+function startupProbe(name: string): { bin: string; marker: string } {
+  const marker = join(root, `${name}.started`);
+  const bin = join(root, name);
+  writeFileSync(bin, `#!/bin/sh\nprintf started > ${JSON.stringify(marker)}\nexit 70\n`);
+  chmodSync(bin, 0o755);
+  return { bin, marker };
 }
 
 test('an AGENT order is run by a detached agent-run child, with nothing stamped and no lean order', async () => {
@@ -296,13 +387,76 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
     assert.equal(await daemon.exited, 0, `exit 0 after end, stderr:\n${daemon.stderr()}`);
   } finally {
     server.close();
-    daemon.child.kill('SIGKILL');
-    for (const r of readChildRecords(stateDir)) {
-      try {
-        process.kill(r.pid, 'SIGKILL');
-      } catch {
-        // already gone
-      }
-    }
+    stopDaemonAndChildren(daemon);
+  }
+});
+
+test('Shift leaves OWENLOOP_HARNESS above cached and verified definition harness ids', async () => {
+  await seedCache({ cachedHarness: 'cache-probe', runtimeHarness: 'runtime-probe' });
+  const { origin, server } = await startSingleOrderHub();
+  seedCredentialStore(home, origin);
+  const daemon = spawnDaemon(origin, {
+    OWENLOOP_HARNESS: 'env-probe',
+    OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'env-probe', start: { events: [{ kind: 'turn_ended' }] } }),
+  });
+
+  try {
+    await dispatchOne(daemon);
+    await until(() => traceCalls().some((call) => call['call'] === 'start'), 'the environment-selected harness to start');
+    const start = traceCalls().find((call) => call['call'] === 'start');
+    assert.equal(start?.['harnessId'], 'env-probe');
+  } finally {
+    server.close();
+    stopDaemonAndChildren(daemon);
+  }
+});
+
+test('Shift cache/runtime harness disagreement is resolved from the verified runtime definition', async () => {
+  await seedCache({ cachedHarness: 'cache-probe', runtimeHarness: 'runtime-probe' });
+  const { origin, server } = await startSingleOrderHub();
+  seedCredentialStore(home, origin);
+  const daemon = spawnDaemon(origin, {
+    OWENLOOP_HARNESS: undefined,
+    OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'runtime-probe', start: { events: [{ kind: 'turn_ended' }] } }),
+  });
+
+  try {
+    await dispatchOne(daemon);
+    await until(() => traceCalls().some((call) => call['call'] === 'start'), 'the verified-runtime harness to start');
+    const start = traceCalls().find((call) => call['call'] === 'start');
+    assert.equal(start?.['harnessId'], 'runtime-probe');
+  } finally {
+    server.close();
+    stopDaemonAndChildren(daemon);
+  }
+});
+
+test('Shift environment selection of Codex refuses maxTurns before provider startup and releases', async () => {
+  await seedCache({ cachedHarness: 'claude-code', runtimeHarness: 'claude-code', maxTurns: 9 });
+  const claude = startupProbe('claude-provider-probe');
+  const codex = startupProbe('codex-provider-probe');
+  const { origin, reqs, server } = await startSingleOrderHub();
+  seedCredentialStore(home, origin);
+  const daemon = spawnDaemon(origin, {
+    OWENLOOP_HARNESS: 'codex',
+    OWENLOOP_HARNESS_MODULE: undefined,
+    OWENLOOP_FAKE_TRACE: undefined,
+    OWENLOOP_FAKE_SCRIPT: undefined,
+    OWENLOOP_CLAUDE_BIN: claude.bin,
+    OWENLOOP_CODEX_BIN: codex.bin,
+  });
+
+  try {
+    await dispatchOne(daemon);
+    await until(
+      () => reqs.some((request) => request.verb === 'release'),
+      'the incompatible Codex policy to release the claim',
+    );
+    assert.equal(existsSync(claude.marker), false, 'cached claude-code metadata must not start Claude');
+    assert.equal(existsSync(codex.marker), false, 'Codex preflight must refuse maxTurns before app-server startup');
+    assert.equal(reqs.filter((request) => request.verb === 'release').length, 1);
+  } finally {
+    server.close();
+    stopDaemonAndChildren(daemon);
   }
 });

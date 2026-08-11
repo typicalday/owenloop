@@ -58,6 +58,17 @@ test('parseArgs rejects a second positional and an unknown option', () => {
   assert.match(parseArgs(['a', '--bogus']).error!, /unknown option '--bogus'/);
 });
 
+test('parseArgs rejects empty and whitespace-only explicit harness overrides', () => {
+  for (const args of [
+    ['a', '--harness='],
+    ['a', '--harness', ''],
+    ['a', '--harness=   '],
+    ['a', '--harness', ' \t '],
+  ]) {
+    assert.match(parseArgs(args).error!, /--harness must be a non-empty harness id/, JSON.stringify(args));
+  }
+});
+
 // All four ms knobs share one validator; assert each rejects the same three ways.
 test('parseArgs validates every ms knob as a positive integer', () => {
   for (const flag of ['--heartbeat-interval', '--jump-tolerance', '--submit-grace', '--confirm-interval']) {
@@ -79,7 +90,7 @@ test('parseArgs validates every ms knob as a positive integer', () => {
 test('exitCodeFor maps every outcome to the documented code', () => {
   const zero: AgentRunOutcome[] = ['submitted', 'completed'];
   const one: AgentRunOutcome[] = [
-    'misroute', 'no-template', 'no-harness', 'unverified-consumed', 'no-submit',
+    'misroute', 'no-template', 'no-harness', 'incompatible-harness-policy', 'unverified-consumed', 'no-submit',
     'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'stopped',
   ];
   for (const o of zero) assert.equal(exitCodeFor(o), 0);
@@ -212,6 +223,7 @@ function parkedAdapter(id: string): { adapter: HarnessAdapter; stops: number; st
   const adapter: HarnessAdapter = {
     id,
     resumeTier: 'native-token',
+    preflight: () => [],
     async start(args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef> {
       state.startArgs.push(args);
       onEvent({ kind: 'started', ref });
@@ -272,6 +284,7 @@ function spawningEnvProbe(): { adapter: HarnessAdapter; observed: string[] } {
   const adapter: HarnessAdapter = {
     id: ref.harness,
     resumeTier: 'replay',
+    preflight: () => [],
     async start(_args: StartArgs, onEvent: (e: AgentEvent) => void): Promise<HarnessSessionRef> {
       onEvent({ kind: 'started', ref });
       observed.push(await spawnProbe());
@@ -316,14 +329,9 @@ function useAdapter(a: HarnessAdapter): void {
 
 /** Write a cached bundle whose `builder` step compiles to `TEMPLATE`. */
 /**
- * Seed a cached bundle for DEF/HASH whose single `builder` step is an agent step.
- *
- * `harness` and `permissions` are written into BOTH halves of the cache — the
- * def envelope and the normalized step spec — because that is what `prepare`
- * produces: the def parser lifts `x.harness.id` onto the step, and
- * `normalizeStepPermissions` folds the rest of the bag into `permissions`. The
- * runner reads ONLY the spec (`steps/<step>.json`); the def half is here so the
- * fixture is a faithful `prepare` output rather than a half-written one.
+ * Seed the verified local step plus the matching prepare cache fixture.
+ * Runtime instruction resolution reads `verifiedStep`; the cache remains present
+ * because the role also owns cache/session paths exercised by neighboring tests.
  */
 function seedBundle(seed: { harness?: string; model?: string; permissions?: StepPermissions } = {}): void {
   const harnessKey = seed.harness !== undefined ? { harness: seed.harness } : {};
@@ -636,11 +644,54 @@ test('run() refuses a non-string x.harness.id instead of selecting the default h
   assert.match(result.stderr, /non-string x\.harness\.id/);
 });
 
-test('run() renders the brief from the cached template and passes the step permission bag', async () => {
+test('run() refuses explicit empty and whitespace-only local harness ids instead of selecting the default', async () => {
   const fake: FakeAdapter = createFakeAdapter({ id: 'fake' });
   useAdapter(fake);
-  // `prepare` already normalized `x.harness` into these permissions at cache
-  // time — the runner does not re-read an option bag and has no bag key.
+
+  for (const id of ['', ' \t ']) {
+    seedRawStep({ harness: { id, tools: ['Read'] } });
+    const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+    const err: string[] = [];
+    const code = await run(WIRE, {
+      hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'host:123',
+      cwd: '/work',
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+
+    assert.equal(code, 1, `explicit id ${JSON.stringify(id)} must fail closed`);
+    assert.deepEqual(fake.calls, [], 'the default harness must never start for an invalid explicit id');
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+    assert.match(err.join('\n'), /empty or whitespace-only x\.harness\.id/);
+  }
+});
+
+test('run() refuses invalid reserved fields in the verified local definition', async () => {
+  const result = await runMalformedHarnessCarrier({
+    harness: {
+      id: 'fake',
+      tools: ['Read'],
+      disallowedTools: ['Read'],
+      filesystem: 'root-everywhere',
+      name: 'forbidden',
+    },
+  });
+  assert.equal(result.code, 1);
+  assert.deepEqual(result.calls, []);
+  assert.deepEqual(result.releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.match(result.stderr, /instruction refusal \(harness-policy\)/);
+  assert.match(result.stderr, /filesystem must be one of/);
+  assert.match(result.stderr, /'name' is generated and cannot be set/);
+  assert.match(result.stderr, /tools and disallowedTools overlap: Read/);
+});
+
+test('run() renders the brief from the verified step and passes normalized permissions', async () => {
+  const fake: FakeAdapter = createFakeAdapter({ id: 'fake' });
+  useAdapter(fake);
+  // The local resolver supplies the verified step; the runner validates the raw
+  // carrier and normalizes the permission bag before dispatch.
   seedBundle({ model: 'm-step', permissions: { tools: ['Read'], model: 'm-step', extensions: {} } });
   const { hub } = probeHub({ responses: [agentOrder(), agentOrder({ outcome: 'ok' })], def: DEF });
 
@@ -655,7 +706,7 @@ test('run() renders the brief from the cached template and passes the step permi
     started.args.brief,
     'order: wf1/run1\norigin: https://hub.example\naccount: default\nshift: shf_1',
   );
-  // The permissions ride PRE-NORMALIZED on the step spec — no lookup, no key.
+  // The permissions are normalized from the verified local definition.
   assert.deepEqual(started.args.permissions.tools, ['Read']);
   assert.equal(started.args.permissions.model, 'm-step');
 });
@@ -700,6 +751,136 @@ test('run() fails honestly (exit 1) when --harness names no registered adapter',
   assert.match(text, /fake/); // and what IS registered
   // no-harness releases, so the hub can re-offer the order.
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+});
+
+test('empty OWENLOOP_HARNESS never falls through and releases the held claim', async () => {
+  const fake = createFakeAdapter({ id: 'fake' });
+  useAdapter(fake);
+  seedBundle({ harness: 'fake' });
+
+  for (const value of ['', ' \t ']) {
+    process.env['OWENLOOP_HARNESS'] = value;
+    const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+    const err: string[] = [];
+
+    const code = await run(WIRE, {
+      hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'host:123',
+      cwd: '/work',
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+
+    assert.equal(code, 1, JSON.stringify(value));
+    assert.deepEqual(fake.calls, []);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+    assert.match(err.join('\n'), /<empty OWENLOOP_HARNESS>/);
+  }
+});
+
+test('--harness policy preflight uses the final overridden adapter and refuses before start', async () => {
+  const authored = createFakeAdapter({ id: 'authored' });
+  const overridden = createFakeAdapter({ id: 'overridden' });
+  overridden.preflight = (permissions) =>
+    permissions.network === 'owenloop-only'
+      ? [{ field: 'network', message: "network 'owenloop-only' is unsupported" }]
+      : [];
+  useAdapter(authored);
+  useAdapter(overridden);
+  seedRawStep({ harness: { id: 'authored', network: 'owenloop-only' } });
+  const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+  const err: string[] = [];
+
+  const code = await run([...WIRE, '--harness', 'overridden'], {
+    hub,
+    signalHost: fakeSignalHost().host,
+    holderId: 'host:123',
+    cwd: '/work',
+    out: () => {},
+    err: (line) => err.push(line),
+  });
+
+  assert.equal(code, 1);
+  assert.deepEqual(authored.calls, []);
+  assert.deepEqual(overridden.calls, []);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.match(err.join('\n'), /harness policy refusal.*overridden.*network 'owenloop-only' is unsupported/);
+});
+
+test('Codex filesystem refusal names the restriction and releases the held claim', async () => {
+  process.env['OWENLOOP_CODEX_BIN'] = join(home, 'must-not-start');
+
+  for (const filesystem of ['read-only', 'workspace-write'] as const) {
+    seedRawStep({ harness: { id: 'codex', filesystem } });
+    const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+    const err: string[] = [];
+
+    const code = await run([...WIRE, '--harness', 'codex'], {
+      hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'host:123',
+      cwd: '/work',
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+
+    assert.equal(code, 1, filesystem);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+    assert.match(
+      err.join('\n'),
+      new RegExp(
+	`harness policy refusal.*codex.*filesystem '${filesystem}'.*unsupported.*configuration layers.*outside the thread sandbox`,
+      ),
+    );
+  }
+});
+
+test('CLI and environment overrides selecting Codex refuse maxTurns, start nothing, release, and exit nonzero', async () => {
+  const authored = createFakeAdapter({ id: 'authored-max-turns' });
+  useAdapter(authored);
+  seedRawStep({ harness: { id: authored.id, maxTurns: 9 } });
+  process.env['OWENLOOP_CODEX_BIN'] = join(home, 'must-not-start');
+
+  const scenarios = [
+    {
+      name: '--harness',
+      args: [...WIRE, '--harness', 'codex'],
+      select: () => {
+	process.env['OWENLOOP_HARNESS'] = authored.id;
+      },
+    },
+    {
+      name: 'OWENLOOP_HARNESS',
+      args: WIRE,
+      select: () => {
+	process.env['OWENLOOP_HARNESS'] = 'codex';
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    scenario.select();
+    const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+    const err: string[] = [];
+    const code = await run(scenario.args, {
+      hub,
+      signalHost: fakeSignalHost().host,
+      holderId: 'host:123',
+      cwd: '/work',
+      out: () => {},
+      err: (line) => err.push(line),
+    });
+
+    assert.equal(code, 1, scenario.name);
+    assert.deepEqual(authored.calls, [], `${scenario.name}: the authored adapter must not start`);
+    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }], scenario.name);
+    assert.match(
+      err.join('\n'),
+      /harness policy refusal.*codex.*\(maxTurns\): maxTurns is unsupported.*no thread or turn limit parameter/,
+      scenario.name,
+    );
+  }
 });
 
 test('OWENLOOP_HARNESS outranks the step def, and the step def outranks the default', async () => {

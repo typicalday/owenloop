@@ -32,22 +32,103 @@ run `claude mcp list` to confirm the real names before proceeding.
    draft and ask for help.
 5. **On success:** show the human the returned mermaid diagram and a
    plain-English step list (not the raw YAML) for approval.
-6. **Offer `start_run`** once approved, with any inputs the human already
-   knows they want to seed.
+6. **If any step carries `x.harness`:** ask the human to run `owenloop work lint
+   <workflow-name | path>` in their own shell. This skill grants no Bash tool, so
+   you cannot run the command yourself. Exit `0` is clean or warnings-only; exit
+   `1` means the definition has an error to fix and resubmit through
+   `create_workflow`. Runtime permission preflight remains authoritative because
+   a later CLI or environment override can select a different adapter.
+7. **Offer `start_run`** once approved and free of lint errors, with any inputs
+   the human already knows they want to seed.
 
-## Stamped-agent dispatch (`x.claude-code` bag)
+## Step Agent dispatch and `x.harness`
 
-A step that should be dispatched to a stamped Claude Code subagent (the
-`owenloop` Shift daemon's dispatch path, which the `conduct` and `shift` skills
-attend) carries an `x.claude-code` bag in its def — the frontmatter/prompt
-template the daemon stamps into a per-order agent file. Steps without a valid
-bag are never stamped-dispatched; they fall to the hub's own pickup window
-(conduct's fallback path). When a def is meant for stamped dispatch, validate
-its bags before handing it off: ask the human to run `owenloop work lint
-<workflow-name | path>` in their own shell — this skill grants no Bash tool, so
-you cannot run it yourself. Exit `0` is clean or warnings-only, exit `1` means it
-found an error to fix. This is optional authoring polish, not part of
-`create_workflow`'s own validation.
+`owenloop work agent-run` is the only supported dispatcher for workflow Step
+Agents. The Shift daemon starts an `agent-run` child for each agent order. The
+`conduct` and `shift` skills supervise the Shift daemon; plugin-packaged workers
+do not dispatch workflow steps.
+
+A step carries adapter selection and policy under the fixed, vendor-neutral
+`x.harness` map:
+
+```yaml
+x:
+  harness:
+    id: claude-code
+    tools: [Read, Glob]
+    disallowedTools: [Bash]
+    filesystem: read-only
+    network: owenloop-only
+    permissionMode: default
+    maxTurns: 20
+    model: sonnet
+    effort: high
+```
+
+`id` is optional. When `id` is absent, the runtime may select the registered
+default adapter; `--harness` and `OWENLOOP_HARNESS` overrides take precedence
+over the definition. Keep policy in `x.harness` even when `id` is absent.
+
+The eight neutral fields are:
+
+- `tools`: a comma-separated string or string array. An absent field declares no
+  allow-list. `tools: []` explicitly disables all built-in tools on an adapter
+  that supports tool allow-lists.
+- `disallowedTools`: a comma-separated string or string array. `tools` and
+  `disallowedTools` must not overlap.
+- `filesystem`: `read-only`, `workspace-write`, or `unrestricted`.
+- `network`: `owenloop-only` or `unrestricted`.
+- `permissionMode`: a non-empty adapter-native mode listed below.
+- `maxTurns`: a positive integer.
+- `model`: a non-empty model id. A first-class step `model` field takes
+  precedence when present.
+- `effort`: a non-empty effort value accepted by the selected adapter.
+
+Do not put generated `name` or `description` fields in `x.harness`. Unknown
+keys remain opaque adapter extension data; an adapter may interpret or warn
+about those keys, but unknown keys do not create a neutral security boundary.
+
+### Exact adapter support
+
+| Policy | Claude Code adapter | Codex adapter |
+|---|---|---|
+| absent `tools` | Preserves the normal built-in-tool default unless `filesystem` or `network` requires an audited set. | Supported only because no tool list was authored. |
+| `tools: []` or a non-empty `tools` list | Enforced through both the available and auto-allowed tool sets. Settings, skills, and external MCP are isolated so unlisted tools cannot widen the surface. Authored external MCP tool names are refused. | Refused because Codex cannot enforce a per-thread built-in-tool list. |
+| `disallowedTools` | Enforced. A deny that blocks the born-bound Owenloop `get_order` or `submit` control tools is refused. | Refused. |
+| `filesystem: read-only` | Enforced. With unrestricted network the audited defaults are `Read`, `Glob`, `Grep`, `WebFetch`, and `WebSearch`; with `network: owenloop-only` the defaults narrow to `Read`, `Glob`, and `Grep`. | Refused because app-server configuration layers sit outside the thread sandbox. |
+| `filesystem: workspace-write` | Refused because the adapter cannot prove an exact workspace boundary. | Refused because app-server configuration layers sit outside the thread sandbox. |
+| `filesystem: unrestricted` | Supported. | Supported as sandbox `danger-full-access`; a conflicting vendor `sandbox` extension is refused. |
+| `network: owenloop-only` | Enforced by isolating settings, skills, MCP, and built-in tools while retaining only the born-bound Owenloop control plane. | Refused. |
+| `network: unrestricted` | Supported. | Supported with `filesystem: unrestricted`, or with omitted `filesystem` and sandbox `workspace-write` or `danger-full-access`; refused with sandbox `read-only`. |
+| `permissionMode` | `default`, `acceptEdits`, `bypassPermissions`, `plan`, `dontAsk`, or `auto`. | `untrusted`, `on-request`, or `never`. |
+| `maxTurns` | Enforced. | Refused because Codex app-server has no thread or turn limit parameter. |
+| `model` | Supported. | Supported. |
+| `effort` | `low`, `medium`, `high`, `xhigh`, or `max`. | Passed to Codex `turn/start`; use a value supported by the selected Codex runtime. |
+
+The Claude Code adapter also refuses a `read-only` allow-list containing
+non-read-only tools, an `owenloop-only` allow-list containing network-capable or
+unaudited tools, and any policy that denies the required Owenloop control tools.
+For every restricted Claude Code cold start or resume, the mounted MCP child
+positively registers exactly `get_order` and `submit`. `allowedTools` only
+auto-allows calls; `allowedTools` does not remove registrations from MCP
+`tools/list`. The adapter also denies `mcp__owenloop__reject` as defense in depth.
+Outside Claude Code isolation, the default work-holder MCP child registers
+`get_order`, `submit`, and `reject`.
+
+Every defined Codex `maxTurns` value is refused before cold start or resume. The
+Codex adapter starts no app-server process, and `agent-run` releases the held
+claim and exits non-zero.
+
+### Fail-closed rule
+
+`x.harness` security restrictions are enforced policy. Runtime preflight must
+prove that the final selected adapter can implement every authored restriction
+exactly. An unsupported adapter restriction is refused: no model SDK, CLI, or
+app-server process starts, the worker releases the held claim, and `agent-run`
+exits non-zero with every refusal reason.
+
+`advisory.tools` is model guidance only. `advisory.tools` does not configure an
+adapter, does not remove a provider tool, and is not a security boundary.
 
 ## Rules
 

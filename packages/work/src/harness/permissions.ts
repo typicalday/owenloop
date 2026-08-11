@@ -27,15 +27,29 @@
  * Field rules are carried over from the legacy compile layer's `KNOWN_FIELDS` /
  * `RESERVED_KEYS` / `isStringOrStringArray`; the live copies now sit in this
  * directory's per-harness adapter module (grep them there — `src/adapters/` was
- * deleted in Phase 5, and do not trust a line number). Six of the sixteen are
+ * deleted in Phase 5, and do not trust a line number). Eight of the eighteen are
  * harness-neutral and get lifted; two are reserved and are stripped; the other
  * eight have no neutral meaning and land in `extensions`, along with every key
  * the bag carries that the known list does not mention.
  */
-import type { StepPermissions } from './contract.ts';
+import type { PermissionIssue, StepPermissions } from './contract.ts';
+import type { LintFinding } from './types.ts';
 
-/** The six fields with a harness-neutral meaning — lifted out of the bag. */
-const NEUTRAL_KEYS = ['tools', 'disallowedTools', 'permissionMode', 'maxTurns', 'model', 'effort'] as const;
+/** Fields with a harness-neutral meaning — lifted out of the bag. */
+const NEUTRAL_KEYS = [
+  'tools',
+  'disallowedTools',
+  'filesystem',
+  'network',
+  'permissionMode',
+  'maxTurns',
+  'model',
+  'effort',
+] as const;
+
+const FILESYSTEM_VALUES = new Set(['read-only', 'workspace-write', 'unrestricted']);
+const NETWORK_VALUES = new Set(['owenloop-only', 'unrestricted']);
+const STALE_RESTRICTION_KEYS = ['filesystem', 'network'] as const;
 
 /** Generated/reserved frontmatter keys. Stripped: an adapter must never see an
  *  author's attempt at them. They do NOT reach `extensions`. */
@@ -52,19 +66,17 @@ function isPlainMap(v: unknown): v is Record<string, unknown> {
  * Normalize a tool list. The bag legitimately accepts EITHER a comma-separated
  * string or a string array. A string is split on `,` with each entry trimmed and
  * empties dropped; an array is copied with non-string entries dropped. Returns
- * `undefined` when nothing survives, so the key is ABSENT rather than `[]` —
- * "no `tools` key" and "an empty allow-list" mean different things to a harness.
+ * `[]` when the field was explicitly present but names no tools. This preserves
+ * the security-relevant distinction between an absent allow-list and `tools: []`.
  */
 function toolList(v: unknown): string[] | undefined {
-  let out: string[];
   if (typeof v === 'string') {
-    out = v.split(',').map((s) => s.trim()).filter((s) => s !== '');
-  } else if (Array.isArray(v)) {
-    out = v.filter((e): e is string => typeof e === 'string' && e !== '');
-  } else {
-    return undefined;
+    return v.split(',').map((s) => s.trim()).filter((s) => s !== '');
   }
-  return out.length > 0 ? out : undefined;
+  if (Array.isArray(v)) {
+    return v.filter((e): e is string => typeof e === 'string' && e !== '');
+  }
+  return undefined;
 }
 
 /** A non-empty string, verbatim and unvalidated; otherwise `undefined`. */
@@ -95,7 +107,7 @@ function positiveInt(v: unknown): number | undefined {
  * non-empty string.
  *
  * `extensions` is lossless by construction: every bag key that is neither
- * lifted (the six neutral fields) nor reserved (`name`/`description`) lands
+ * lifted (the eight neutral fields) nor reserved (`name`/`description`) lands
  * there verbatim, including keys the known-field list has never heard of. Lint
  * stays the place that warns about unknown keys.
  *
@@ -122,6 +134,13 @@ export function normalizeStepPermissions(
   const disallowedTools = toolList(src['disallowedTools']);
   if (disallowedTools !== undefined) out.disallowedTools = disallowedTools;
 
+  if (typeof src['filesystem'] === 'string' && FILESYSTEM_VALUES.has(src['filesystem'])) {
+    out.filesystem = src['filesystem'] as StepPermissions['filesystem'];
+  }
+  if (typeof src['network'] === 'string' && NETWORK_VALUES.has(src['network'])) {
+    out.network = src['network'] as StepPermissions['network'];
+  }
+
   const permissionMode = nonEmptyString(src['permissionMode']);
   if (permissionMode !== undefined) out.permissionMode = permissionMode;
 
@@ -136,4 +155,86 @@ export function normalizeStepPermissions(
   if (effort !== undefined) out.effort = effort;
 
   return out;
+}
+
+function typeName(v: unknown): string {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'array';
+  return typeof v;
+}
+
+function isStringOrStringArray(v: unknown): boolean {
+  return typeof v === 'string' || (Array.isArray(v) && v.every((entry) => typeof entry === 'string'));
+}
+
+/**
+ * Validate the reserved, harness-neutral `x.harness` fields before normalization.
+ * Unknown keys remain opaque and produce no finding here.
+ */
+export function validateHarnessOptions(bag: Record<string, unknown>, step: string): LintFinding[] {
+  const findings: LintFinding[] = [];
+  const error = (field: string, message: string): void => {
+    findings.push({ severity: 'error', step, field, message });
+  };
+  const check = (field: string, ok: (value: unknown) => boolean, expected: string): void => {
+    if (field in bag && !ok(bag[field])) {
+      error(field, `${field} must be ${expected}, got ${typeName(bag[field])}`);
+    }
+  };
+
+  check('tools', isStringOrStringArray, 'a string or string[]');
+  check('disallowedTools', isStringOrStringArray, 'a string or string[]');
+  check('permissionMode', (v) => typeof v === 'string' && v !== '', 'a non-empty string');
+  check('model', (v) => typeof v === 'string' && v !== '', 'a non-empty string');
+  check('effort', (v) => typeof v === 'string' && v !== '', 'a non-empty string');
+  check('maxTurns', (v) => typeof v === 'number' && Number.isInteger(v) && v > 0, 'a positive integer');
+
+  for (const key of RESERVED_KEYS) {
+    if (key in bag) error(key, `'${key}' is generated and cannot be set in the bag`);
+  }
+
+  if ('filesystem' in bag && !FILESYSTEM_VALUES.has(bag['filesystem'] as string)) {
+    error('filesystem', `filesystem must be one of ${[...FILESYSTEM_VALUES].join('|')}`);
+  }
+  if ('network' in bag && !NETWORK_VALUES.has(bag['network'] as string)) {
+    error('network', `network must be one of ${[...NETWORK_VALUES].join('|')}`);
+  }
+
+  if (isStringOrStringArray(bag['tools']) && isStringOrStringArray(bag['disallowedTools'])) {
+    const allowed = new Set(toolList(bag['tools']) ?? []);
+    const denied = new Set(toolList(bag['disallowedTools']) ?? []);
+    const overlap = [...allowed].filter((tool) => denied.has(tool)).sort();
+    if (overlap.length > 0) {
+      error('tools', `tools and disallowedTools overlap: ${overlap.join(', ')}`);
+    }
+  }
+
+  return findings;
+}
+
+/**
+ * Validate a normalized permission object at the final dispatch boundary.
+ * The stale-extension check catches caches produced before filesystem/network
+ * became first-class restrictions; running such a cache would silently ignore
+ * the authored restriction.
+ */
+export function preflightStepPermissions(permissions: StepPermissions): PermissionIssue[] {
+  const issues: PermissionIssue[] = [];
+  const overlap = (permissions.tools ?? [])
+    .filter((tool) => (permissions.disallowedTools ?? []).includes(tool))
+    .sort();
+  if (overlap.length > 0) {
+    issues.push({ field: 'tools', message: `tools and disallowedTools overlap: ${overlap.join(', ')}` });
+  }
+  for (const key of STALE_RESTRICTION_KEYS) {
+    if (key in permissions.extensions) {
+      issues.push({
+	field: key,
+	message:
+	  `restriction '${key}' is buried in permissions.extensions from an old cache and would be ignored; ` +
+	  'rerun `owenloop work prepare`',
+      });
+    }
+  }
+  return issues;
 }

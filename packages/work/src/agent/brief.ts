@@ -9,8 +9,10 @@
  *    minus the file. The worker hands the result straight to
  *    `HarnessAdapter.start` as `StartArgs.brief`.
  *  - `buildOwenloopMcp(spec)` — the `{command, args}` stdio mount for owenloop's
- *    own work-holder MCP surface, byte-identical to the `mcpServers.owenloop`
- *    literal the legacy host adapter injects into stamped frontmatter today.
+ *    own full work-holder MCP surface, byte-identical to the
+ *    `mcpServers.owenloop` literal the legacy host adapter injects into stamped
+ *    frontmatter today. A restricted adapter may append the hold role's positive
+ *    tool selector without changing the born-bound identity arguments.
  *
  * WHY THE TOKENS ARE DECLARED HERE AND NOT IMPORTED (plan D4): the legacy
  * host-adapter module under `src/adapters/` is what Phase 5 deletes, and it is
@@ -85,7 +87,9 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
 
 /**
  * The born-bound work-holder mount handed to `HarnessAdapter.start` as
- * `StartArgs.owenloopMcp`. The adapter mounts it verbatim and never builds it.
+ * `StartArgs.owenloopMcp`. The adapter never constructs or changes the bound
+ * identity. A restricted adapter may append the hold role's positive MCP tool
+ * selector before mounting the command.
  *
  * `--shift=<cid>` is ONE argv element, not two. An absent cid then degrades
  * to the single well-formed string `"--shift="` instead of a dangling flag

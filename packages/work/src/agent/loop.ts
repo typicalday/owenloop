@@ -71,6 +71,7 @@ import type {
   StartArgs,
 } from '../harness/contract.ts';
 import { isResumeUnavailable } from '../harness/contract.ts';
+import { preflightStepPermissions } from '../harness/permissions.ts';
 import { orderId, type SessionRecord, type SessionStatus } from '../harness/session-store.ts';
 import {
   buildOwenloopMcp,
@@ -94,6 +95,7 @@ export type AgentRunOutcome =
   | 'misroute' // null packet, or a command order — released, not ours (exit 1)
   | 'no-template' // no cached bundle / no step spec for the step (exit 1)
   | 'no-harness' // the resolved harness id names no registered adapter (exit 1)
+  | 'incompatible-harness-policy' // selected adapter cannot enforce the restrictions (exit 1)
   | 'unverified-consumed' // dynamic values or rejection reasons failed verification (exit 1)
   | 'no-submit' // the turn ended and the confirm grace expired with no outcome (exit 1)
   | 'killed' // a signal aimed at the worker tore the session down + released (exit 1)
@@ -569,6 +571,23 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     // time, so this loop never looks inside an extension bag and never has a bag
     // key — vendor-keyed lookup does not exist in neutral code any more.
     const permissions = step.permissions;
+
+    // Mandatory final-boundary preflight. Common checks run first, followed by
+    // the selected adapter's exact capability check. A refusal starts neither a
+    // cold session nor a resumed provider process; the held claim is released.
+    const policyIssues = [
+      ...preflightStepPermissions(permissions),
+      ...active.preflight(permissions),
+    ];
+    if (policyIssues.length > 0) {
+      for (const issue of policyIssues) {
+	opts.err(
+	  `owenloop work agent-run: harness policy refusal for ${order} on '${resolution.id}'` +
+	    `${issue.field !== undefined ? ` (${issue.field})` : ''}: ${issue.message}`,
+	);
+      }
+      return releaseWith('incompatible-harness-policy', 'incompatible-harness-policy');
+    }
 
     // ---- PHASE 4: resume or cold replay? -----------------------------------
     //

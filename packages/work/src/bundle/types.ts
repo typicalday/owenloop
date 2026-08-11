@@ -144,7 +144,10 @@ export interface FetchedBundle extends FetchedDef {
  *
  * There is no format version and no migration. A hash dir cached before Phase 5
  * simply has no `steps/*.json`; `readStepSpec` fails honestly and the fix is to
- * re-run `owenloop work prepare`.
+ * re-run `owenloop work prepare`. A cache normalized before filesystem/network
+ * became neutral fields may carry those restrictions under
+ * `permissions.extensions`; runtime preflight refuses that shape rather than
+ * ignoring the restriction and tells the operator to rerun prepare.
  */
 export interface NormalizedStepSpec {
   /** The step name — the same string that names the file. */

@@ -96,6 +96,7 @@ function fakeAdapter(id: string, over: Partial<HarnessAdapter> = {}): HarnessAda
     stop: () => Promise.resolve(),
     resumeCommand: (ref: HarnessSessionRef) => ({ command: 'fakebin', args: ['--resume', ref.token] }),
     ...over,
+    preflight: over.preflight ?? (() => []),
   };
 }
 

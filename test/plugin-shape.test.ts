@@ -12,7 +12,7 @@
  * for. Do not mistake a passing test here for a live proof.
  */
 
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -58,17 +58,6 @@ function walkFiles(dir: string): string[] {
   return out;
 }
 
-const GOVERNED_HUB_WORKER_TOOLS = [
-  'mcp__plugin_owenloop_owenloop__submit',
-  'mcp__plugin_owenloop_owenloop__get_status',
-  'mcp__owenloop__submit',
-  'mcp__owenloop__get_status',
-  'WebSearch',
-  'WebFetch',
-  'Read',
-  'Bash',
-];
-
 /** conduct's governed `allowed-tools` set (order-insensitive). The skill
  *  uses only the merged CLI, so the Claude Code frontmatter grants one
  *  tightly scoped Bash prefix. */
@@ -81,6 +70,13 @@ const AUTHOR_ALLOWED_TOOLS = [
   'mcp__owenloop__create_workflow',
   'mcp__owenloop__start_run',
 ];
+
+/** The authoritative author skill plus both committed materializations. */
+const AUTHOR_SKILL_PATHS = [
+  'plugins/_skills/author/SKILL.md',
+  'plugins/claude-code/plugin/skills/author/SKILL.md',
+  'plugins/codex/plugins/owenloop/skills/author/SKILL.md',
+] as const;
 
 /** shift's governed `allowed-tools` set (order-insensitive). The skill
  *  uses only the merged CLI, so the Claude Code frontmatter grants one
@@ -329,24 +325,11 @@ for (const script of ['session-end.sh', 'session-start.sh']) {
   });
 }
 
-const { data: frontmatter } = parseFrontmatter(readText('plugins/claude-code/plugin/agents/owenloop-worker.md'));
-
-test('agents/owenloop-worker.md tools are exactly the governed allowlist (order-insensitive) — INV-39', () => {
-  const tools = splitToolList(frontmatter.tools);
-  assert.deepEqual(new Set(tools), new Set(GOVERNED_HUB_WORKER_TOOLS));
-});
-
-test('agents/owenloop-worker.md does NOT include Agent, Task, Edit, or Write', () => {
-  const tools = splitToolList(frontmatter.tools);
-  for (const forbidden of ['Agent', 'Task', 'Edit', 'Write']) {
-    assert.ok(!((tools)).includes(forbidden));
-  }
-});
-
-test('agents/owenloop-worker.md has no mcpServers/hooks/permissionMode frontmatter keys (Claude Code plugin agent-frontmatter convention)', () => {
-  assert.ok(!('mcpServers' in (frontmatter)));
-  assert.ok(!('hooks' in (frontmatter)));
-  assert.ok(!('permissionMode' in (frontmatter)));
+test('the Claude Code plugin packages no static workflow worker', () => {
+  assert.equal(
+    existsSync(resolve(ROOT, 'plugins/claude-code/plugin/agents/owenloop-worker.md')),
+    false,
+  );
 });
 
 const CLI_COMMANDS = {
@@ -407,6 +390,23 @@ const SKILL_CASES = [
 test('author/SKILL.md exists and references the owenloop tool namespace', () => {
   const content = readText('plugins/claude-code/plugin/skills/author/SKILL.md');
   assert.ok((content).includes('mcp__plugin_owenloop_owenloop__'));
+});
+
+test('all shipped author skills teach the neutral harness carrier and agent-run dispatcher', () => {
+  for (const path of AUTHOR_SKILL_PATHS) {
+    const content = readText(path);
+    assert.ok(content.includes('x.harness'), `${path} must teach x.harness`);
+    assert.ok(content.includes('owenloop work agent-run'), `${path} must name the supported dispatcher`);
+    assert.ok(content.includes('advisory.tools'), `${path} must distinguish advisory tool guidance`);
+    assert.ok(content.includes('not a security boundary'), `${path} must state the advisory boundary`);
+    assert.ok(!content.includes('x.claude-code'), `${path} must not teach the retired carrier`);
+    assert.ok(!content.includes('Stamped-agent dispatch'), `${path} must not teach stamped dispatch`);
+    assert.doesNotMatch(
+      content,
+      /\bstamp(?:ed|s|ing)?\b[\s\S]{0,160}\bper-order agent files?\b/i,
+      `${path} must not instruct the daemon to stamp per-order agent files`,
+    );
+  }
 });
 
 test('author/SKILL.md allowed-tools is exactly the governed set — no Edit/Write, no bare unscoped Bash', () => {

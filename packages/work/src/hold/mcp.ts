@@ -35,10 +35,15 @@ import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
 
+export const HOLD_MCP_TOOL_NAMES = ['get_order', 'submit', 'reject'] as const;
+export type HoldMcpToolName = (typeof HOLD_MCP_TOOL_NAMES)[number];
+
 export interface HoldMcpDeps {
   hub: HubClient;
   workflow: string;
   run: string;
+  /** Positive registration list. Absent exposes the full three-tool server. */
+  tools?: readonly HoldMcpToolName[];
   /** Hub origin used to resolve the local machine signing key. */
   origin?: string;
   principalKeys?: SubmissionKeyManager;
@@ -59,7 +64,7 @@ export interface HoldMcpDeps {
 }
 
 export interface HoldMcpMount {
-  /** The three tools (`get_order`, `submit`, `reject`) for the MCP server. */
+  /** Exactly the selected registrations; full mode has all three tools. */
   tools: ToolRegistration[];
   /** The lease loop kept warm underneath — the role runs and stops it. */
   loop: HoldLoop;
@@ -75,9 +80,11 @@ function orderView(res: GetOrderResponse): unknown {
 }
 
 /**
- * Build the hold MCP mount: the lease loop plus its three tools. The caller (the
- * role) creates the MCP server around `tools`, starts `loop.run()`, and pumps
- * stdin — stopping the loop on stdin EOF.
+ * Build the hold MCP mount: the lease loop plus a positive tool selection. The
+ * default selection is the full `get_order`/`submit`/`reject` surface. A caller
+ * can request an exact subset; future registrations do not enter that subset
+ * unless the caller names them. The role creates the MCP server around `tools`,
+ * starts `loop.run()`, and pumps stdin — stopping the loop on stdin EOF.
  */
 export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
   const { hub, workflow, run } = deps;
@@ -92,7 +99,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
 
   // Set the moment the lease loop's run() settles (lease-lost, completed,
   // released, …): from then on this mount no longer holds the order, so BOTH
-  // tools fast-fail with isError and never touch the hub again (plan section 4
+  // registered tools fast-fail with isError and never touch the hub again (plan section 4
   // — a lost claim must not be worked or double-submitted).
   let terminal: HoldOutcome | undefined;
 
@@ -285,5 +292,11 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     },
   };
 
-  return { tools: [getOrderTool, submitTool, rejectTool], loop };
+  const registrations: Record<HoldMcpToolName, ToolRegistration> = {
+    get_order: getOrderTool,
+    submit: submitTool,
+    reject: rejectTool,
+  };
+  const selected = deps.tools ?? HOLD_MCP_TOOL_NAMES;
+  return { tools: selected.map((name) => registrations[name]), loop };
 }

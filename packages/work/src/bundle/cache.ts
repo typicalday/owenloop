@@ -153,16 +153,20 @@ export function readLatestBundle(cacheDir: string, name: string): CachedBundle |
   return best;
 }
 
+class StaleStepSpecError extends Error {}
+
 /**
  * Read the normalized step spec for `(name, hash, step)`, or `null` when it is
  * absent, unreadable, or not valid JSON. Layout mirrors `writeBundle`:
  * `<cacheDir>/bundles/<name>/<hash>/steps/<step>.json`.
  *
- * Never throws — a missing spec is a normal case the caller reports and moves
- * past (a command step has no spec by design, and a hash dir prepared before
- * Phase 5 has none at all). There is deliberately NO fallback to the legacy
- * `templates/<step>.md`: silently running a stale compiled template would be
- * worse than an honest "re-run `owenloop work prepare`".
+ * A missing or corrupt spec returns `null` — a command step has no spec by
+ * design, and a hash dir prepared before Phase 5 has none at all. The one
+ * deliberate exception is a structurally valid old normalized spec that leaves
+ * `filesystem` or `network` buried under `permissions.extensions`: that cache
+ * throws with an explicit `owenloop work prepare` repair because returning it
+ * would silently discard an authored restriction. There is no fallback to the
+ * legacy `templates/<step>.md`.
  */
 export function readStepSpec(
   cacheDir: string,
@@ -180,8 +184,19 @@ export function readStepSpec(
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8')) as NormalizedStepSpec;
     if (typeof parsed?.step !== 'string' || typeof parsed?.brief !== 'string') return null;
+    const extensions = parsed.permissions?.extensions;
+    if (extensions !== null && typeof extensions === 'object' && !Array.isArray(extensions)) {
+      const stale = ['filesystem', 'network'].filter((key) => key in extensions);
+      if (stale.length > 0) {
+	throw new StaleStepSpecError(
+	  `cached step '${step}' has restriction(s) ${stale.join(', ')} buried in permissions.extensions; ` +
+	    'rerun `owenloop work prepare`',
+	);
+      }
+    }
     return parsed;
-  } catch {
+  } catch (error) {
+    if (error instanceof StaleStepSpecError) throw error;
     return null;
   }
 }

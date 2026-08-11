@@ -119,6 +119,12 @@ test('the mount exposes exactly get_order, reject, and submit, plus the lease lo
   assert.equal(typeof mount.loop.stop, 'function');
 });
 
+test('a positive restricted selection exposes exactly get_order and submit', () => {
+  const { hub } = mockHub({});
+  const mount = createHoldMcp(deps(hub, { tools: ['get_order', 'submit'] }));
+  assert.deepEqual(mount.tools.map((t) => t.name), ['get_order', 'submit']);
+});
+
 // ---- get_order --------------------------------------------------------------
 
 test('get_order (no first contact yet) live-fetches for the bound run and returns a lean view', async () => {

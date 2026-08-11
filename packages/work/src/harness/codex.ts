@@ -63,16 +63,19 @@
  * `{kind:'exited'}` and rejects with the underlying error.
  */
 import { existsSync } from 'node:fs';
-
 import { ResumeUnavailableError } from './contract.ts';
 import type {
   AgentEvent,
   DeliverArgs,
   HarnessAdapter,
   HarnessSessionRef,
+  PermissionIssue,
   StartArgs,
+  StepPermissions,
 } from './contract.ts';
+import type { LintFinding } from './types.ts';
 import { register } from './registry.ts';
+import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
 import { ADMITTED_OWENLOOP_KEYS, filterOwenloopEnv } from './child-env.ts';
 import { JsonRpcError, startStdioRpc, type StdioRpcClient } from './jsonrpc-stdio.ts';
 
@@ -148,26 +151,93 @@ const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-acce
  */
 const DEFAULT_SANDBOX = 'workspace-write';
 
-/**
- * `AskForApproval` values this adapter passes through untouched (the server's
- * own vocabulary). Anything else maps to `'never'`.
- */
+/** `AskForApproval` values this adapter passes through untouched. */
 const NATIVE_APPROVAL_POLICIES = new Set(['untrusted', 'on-request', 'never']);
 
-/**
- * `permissionMode` → `approvalPolicy`.
- *
- * `'never'` is the default for everything unrecognized, and that is a decision:
- * this runs headless with no human on the other end, so any policy that can
- * raise a `requestApproval` server request converts a stalled approval into an
- * order that hangs past the worker's lease. The adapter still answers those
- * requests defensively (see `handleServerRequest`) — belt and braces, because
- * `approvalPolicy` does not govern every request kind.
- */
+const UNRESTRICTED_SANDBOX = 'danger-full-access';
+
+function unsupportedFilesystemMessage(filesystem: 'read-only' | 'workspace-write'): string {
+  return (
+    `filesystem '${filesystem}' is unsupported by this adapter because Codex app-server ` +
+    'configuration layers are outside the thread sandbox'
+  );
+}
+
+const UNSUPPORTED_MAX_TURNS_MESSAGE =
+  'maxTurns is unsupported by this adapter because Codex app-server has no thread or turn limit parameter';
+
+function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
+  const issues: PermissionIssue[] = [];
+  if (permissions.maxTurns !== undefined) {
+    issues.push({ field: 'maxTurns', message: UNSUPPORTED_MAX_TURNS_MESSAGE });
+  }
+  if (permissions.filesystem === 'read-only' || permissions.filesystem === 'workspace-write') {
+    issues.push({
+      field: 'filesystem',
+      message: unsupportedFilesystemMessage(permissions.filesystem),
+    });
+  }
+  if (permissions.tools !== undefined) {
+    issues.push({ field: 'tools', message: 'tool allow-lists are unsupported by this adapter' });
+  }
+  if (permissions.disallowedTools !== undefined) {
+    issues.push({ field: 'disallowedTools', message: 'tool deny-lists are unsupported by this adapter' });
+  }
+  if (permissions.network === 'owenloop-only') {
+    issues.push({
+      field: 'network',
+      message: "network 'owenloop-only' is unsupported by this adapter",
+    });
+  }
+  if (
+    permissions.filesystem === undefined &&
+    permissions.network === 'unrestricted' &&
+    permissions.extensions['sandbox'] === 'read-only'
+  ) {
+    issues.push({
+      field: 'network',
+      message:
+	"network 'unrestricted' cannot be enabled with sandbox 'read-only'; " +
+	"use sandbox 'workspace-write' or 'danger-full-access'",
+    });
+  }
+  if (
+    permissions.permissionMode !== undefined &&
+    !NATIVE_APPROVAL_POLICIES.has(permissions.permissionMode)
+  ) {
+    issues.push({
+      field: 'permissionMode',
+      message: `permissionMode must be one of ${[...NATIVE_APPROVAL_POLICIES].join('|')}`,
+    });
+  }
+  const sandbox = permissions.extensions['sandbox'];
+  if (sandbox !== undefined && (typeof sandbox !== 'string' || !SANDBOX_MODES.has(sandbox))) {
+    issues.push({
+      field: 'sandbox',
+      message: `sandbox must be one of ${[...SANDBOX_MODES].join('|')}`,
+    });
+  }
+  if (
+    permissions.filesystem === 'unrestricted' &&
+    typeof sandbox === 'string' &&
+    SANDBOX_MODES.has(sandbox) &&
+    UNRESTRICTED_SANDBOX !== sandbox
+  ) {
+    issues.push({
+      field: 'sandbox',
+      message:
+	`sandbox '${sandbox}' conflicts with filesystem 'unrestricted' ` +
+	`(which requires '${UNRESTRICTED_SANDBOX}')`,
+    });
+  }
+  return issues;
+}
+
+/** `permissionMode` → `approvalPolicy`, with no invalid-value fallback. */
 function toApprovalPolicy(mode: string | undefined): string {
   if (mode === undefined) return 'never';
   if (NATIVE_APPROVAL_POLICIES.has(mode)) return mode;
-  return 'never';
+  throw new Error(`permissionMode must be one of ${[...NATIVE_APPROVAL_POLICIES].join('|')}`);
 }
 
 function isPlainMap(v: unknown): v is Record<string, unknown> {
@@ -247,8 +317,9 @@ function owenloopMount(mcp: { command: string; args: string[] }): McpServerSpec 
  * Deliberately unmapped, so a reader sees intent rather than oversight:
  *  - `permissions.tools` / `permissions.disallowedTools`: 0.146.0 has no
  *    per-thread built-in-tool allow-list; the sandbox and the approval policy
- *    are the levers it does have.
+ *    are the levers it does have. Adapter preflight refuses both fields.
  *  - `permissions.maxTurns`: no `thread/start` or `turn/start` equivalent.
+ *    Adapter preflight and this direct-call boundary both refuse the field.
  *  - `permissions.effort`: not a `ThreadStartParams` field — it is a
  *    `turn/start` param, so it lands in `buildTurnStartParams`.
  *  - every `extensions` key other than `mcpServers`, `codexConfig` and
@@ -261,7 +332,20 @@ export function buildThreadStartParams(
   args: DeliverArgs,
   onEvent?: (e: AgentEvent) => void,
 ): Record<string, unknown> {
+  // Retained for source compatibility with callers that previously received
+  // fallback diagnostics. Invalid explicit policy now throws instead.
+  void onEvent;
+  if (args.permissions.maxTurns !== undefined) {
+    throw new Error(UNSUPPORTED_MAX_TURNS_MESSAGE);
+  }
   const ext = args.permissions.extensions;
+  const sandbox = resolveSandbox(args.permissions);
+  if (args.permissions.network === 'unrestricted' && sandbox === 'read-only') {
+    throw new Error(
+      "network 'unrestricted' cannot be enabled with sandbox 'read-only'; " +
+	"use sandbox 'workspace-write' or 'danger-full-access'",
+    );
+  }
 
   // The escape hatch: any other config key, without re-opening the contract.
   // `mcp_servers` is merged in AFTER it, so the owenloop mount always wins.
@@ -279,23 +363,19 @@ export function buildThreadStartParams(
   };
 
   const config: Record<string, unknown> = { ...extraConfig, mcp_servers: mcpServers };
+  if (args.permissions.network === 'unrestricted' && sandbox === 'workspace-write') {
+    const authored = isPlainMap(config['sandbox_workspace_write'])
+      ? config['sandbox_workspace_write']
+      : {};
+    config['sandbox_workspace_write'] = { ...authored, network_access: true };
+  }
 
   const params: Record<string, unknown> = {
     cwd: args.cwd,
     config,
     approvalPolicy: toApprovalPolicy(args.permissions.permissionMode),
-    sandbox: resolveSandbox(ext['sandbox'], onEvent),
+    sandbox,
   };
-
-  if (
-    args.permissions.permissionMode !== undefined &&
-    !NATIVE_APPROVAL_POLICIES.has(args.permissions.permissionMode)
-  ) {
-    onEvent?.({
-      kind: 'progress',
-      text: `permissionMode '${args.permissions.permissionMode}' has no approval-policy equivalent; using 'never'`,
-    });
-  }
 
   // Phase 1's precedence rule, verbatim: the per-start override beats the
   // normalized step-def value. Omit the KEY entirely when neither is set —
@@ -307,15 +387,27 @@ export function buildThreadStartParams(
   return params;
 }
 
-/** Validate an `extensions.sandbox` override, dropping anything illegal loudly. */
-function resolveSandbox(raw: unknown, onEvent?: (e: AgentEvent) => void): string {
+/** Resolve supported neutral filesystem policy, then the legacy adapter override. */
+function resolveSandbox(permissions: StepPermissions): string {
+  if (permissions.filesystem === 'read-only' || permissions.filesystem === 'workspace-write') {
+    throw new Error(unsupportedFilesystemMessage(permissions.filesystem));
+  }
+  if (permissions.filesystem === 'unrestricted') {
+    const mapped = UNRESTRICTED_SANDBOX;
+    const raw = permissions.extensions['sandbox'];
+    if (raw !== undefined && raw !== mapped) {
+      throw new Error(
+	`sandbox '${String(raw)}' conflicts with filesystem 'unrestricted' ` +
+	  `(which requires '${mapped}')`,
+      );
+    }
+    return mapped;
+  }
+
+  const raw = permissions.extensions['sandbox'];
   if (raw === undefined) return DEFAULT_SANDBOX;
   if (typeof raw === 'string' && SANDBOX_MODES.has(raw)) return raw;
-  onEvent?.({
-    kind: 'progress',
-    text: `ignoring unrecognized sandbox '${String(raw)}'; using '${DEFAULT_SANDBOX}'`,
-  });
-  return DEFAULT_SANDBOX;
+  throw new Error(`sandbox must be one of ${[...SANDBOX_MODES].join('|')}`);
 }
 
 /**
@@ -347,9 +439,9 @@ export function buildTurnStartParams(
  * `sandbox`, `model` and `config`, and a resumed thread that does not re-supply
  * them reverts to the server's defaults.
  *
- * PHASE 4 CLOSED CONTRACT OBSERVATION 1. `deliver`'s third argument used to carry
- * only `cwd` and `owenloopMcp`, so a resume in a different process from the start
- * (the normal case for a re-offered step) had nothing to rebuild `approvalPolicy`
+ * PHASE 4 CLOSED CONTRACT OBSERVATION 1. `deliver`'s third argument originally
+ * carried only `cwd` and `owenloopMcp`, so a resume in a different process from
+ * the start had nothing to rebuild `approvalPolicy`
  * / `sandbox` / `model` from and silently reverted to server defaults. It now
  * carries the normalized `StepPermissions`, so this function derives the SAME
  * params `buildThreadStartParams` would, and `args` WINS over `base` on every
@@ -916,9 +1008,68 @@ async function runTurn(
   await Promise.all([client.request('turn/start', params, TURN_START_TIMEOUT_MS), gate.promise]);
 }
 
+const KNOWN_FIELDS = new Set([
+  'name',
+  'description',
+  'tools',
+  'disallowedTools',
+  'filesystem',
+  'network',
+  'permissionMode',
+  'maxTurns',
+  'model',
+  'effort',
+  'sandbox',
+  'mcpServers',
+  'codexConfig',
+]);
+
+function lintStep(bag: Record<string, unknown>, step: string): LintFinding[] {
+  const findings: LintFinding[] = [
+    ...validateHarnessOptions(bag, step),
+    ...codexPreflight(normalizeStepPermissions(bag)).map((issue) => ({
+      severity: 'error' as const,
+      step,
+      message: issue.message,
+      ...(issue.field !== undefined ? { field: issue.field } : {}),
+    })),
+  ];
+  const error = (field: string, message: string): void => {
+    findings.push({ severity: 'error', step, field, message });
+  };
+  const warning = (field: string, message: string): void => {
+    findings.push({ severity: 'warning', step, field, message });
+  };
+
+  for (const key of Object.keys(bag)) {
+    if (!KNOWN_FIELDS.has(key)) {
+      warning(key, `unknown field '${key}' — known fields: ${[...KNOWN_FIELDS].join(', ')}`);
+    }
+  }
+  for (const field of ['mcpServers', 'codexConfig'] as const) {
+    if (field in bag && !isPlainMap(bag[field])) error(field, `${field} must be a map`);
+  }
+  if (isPlainMap(bag['mcpServers']) && 'owenloop' in bag['mcpServers']) {
+    warning('mcpServers', 'mcpServers.owenloop is reserved and is replaced by the worker at start');
+  }
+  if (
+    isPlainMap(bag['codexConfig']) &&
+    isPlainMap(bag['codexConfig']['mcp_servers']) &&
+    'owenloop' in bag['codexConfig']['mcp_servers']
+  ) {
+    warning(
+      'codexConfig',
+      'codexConfig.mcp_servers.owenloop is reserved and is replaced by the worker at start',
+    );
+  }
+  return findings;
+}
+
 export const codexAdapter: HarnessAdapter = {
   id: HARNESS_ID,
   resumeTier: 'native-token',
+  preflight: codexPreflight,
+  lintStep,
 
   /**
    * The command a human runs to re-open this thread in an interactive terminal.
@@ -989,13 +1140,6 @@ export const codexAdapter: HarnessAdapter = {
     args: DeliverArgs,
     onEvent: (e: AgentEvent) => void,
   ): Promise<void> {
-    // A rollout records its cwd; a vanished worktree cannot host the resumed
-    // turn, and finding that out from the server takes a spawn plus a handshake.
-    if (!existsSync(args.cwd)) {
-      throw new ResumeUnavailableError(`resume cwd no longer exists: ${args.cwd}`);
-    }
-
-    const gate = createTurnGate(onEvent);
     const previous = SESSIONS.get(ref.token);
     // PHASE 4: the map is no longer the source of truth for thread configuration.
     // `args.permissions` is, and `buildThreadResumeParams` maps it. `startParams`
@@ -1003,6 +1147,18 @@ export const codexAdapter: HarnessAdapter = {
     // miss is now an ordinary cross-process resume rather than a degraded one —
     // which is why the "minimal thread configuration" warning is gone.
     const startParams = previous?.startParams;
+    // Match cold start: validate all thread configuration before checking the
+    // worktree, disposing an existing session, or spawning a replacement
+    // app-server. Unsupported policy is the first direct-call boundary.
+    const resumeParams = buildThreadResumeParams(ref.token, args, startParams, onEvent);
+
+    // A rollout records its cwd; a vanished worktree cannot host the resumed
+    // turn, and finding that out from the server takes a spawn plus a handshake.
+    if (!existsSync(args.cwd)) {
+      throw new ResumeUnavailableError(`resume cwd no longer exists: ${args.cwd}`);
+    }
+
+    const gate = createTurnGate(onEvent);
     if (previous !== undefined) {
       // ALWAYS a fresh app-server, even when this process still holds a live one.
       // A live client's notifications are bound to the gate it was opened with,
@@ -1015,7 +1171,6 @@ export const codexAdapter: HarnessAdapter = {
 
     const { client, reportExit } = await openClient(args.cwd, onEvent, gate);
 
-    const resumeParams = buildThreadResumeParams(ref.token, args, startParams, onEvent);
     try {
       await client.request('thread/resume', resumeParams, SETUP_TIMEOUT_MS);
     } catch (err) {

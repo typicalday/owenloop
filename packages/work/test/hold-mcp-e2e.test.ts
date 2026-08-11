@@ -130,6 +130,23 @@ test('hold --mcp full lifecycle on the wire: heartbeats from birth, closing subm
   }
 });
 
+test('hold --mcp restricted selector registers exactly get_order and submit on tools/list', async () => {
+  const { origin, server } = await startMockHub(hubScript);
+  const mcp = spawnHold(origin, ['--mcp-tools=get_order,submit']);
+  try {
+    await handshake(mcp);
+    const list = await mcp.request('tools/list');
+    const names = (list.result.tools as Array<{ name: string }>).map((tool) => tool.name).sort();
+    assert.deepEqual(names, ['get_order', 'submit']);
+
+    mcp.endStdin();
+    assert.equal(await mcp.exited, 0, `exit 0, stderr:\n${mcp.stderr()}`);
+  } finally {
+    mcp.child.kill('SIGKILL');
+    server.close();
+  }
+});
+
 test('hold --mcp on SIGTERM before any submit: releases on the wire, never submits, exits 0 at stdin EOF', async () => {
   const { origin, reqs, server } = await startMockHub(hubScript);
   const mcp = spawnHold(origin);

@@ -168,9 +168,13 @@ test('the same def with only the key renamed lints clean — the fix is a rename
 
 const step = (over: Partial<FetchedStep>): FetchedStep => ({ name: 's', ...over });
 
-test('a step with no option bag is silent, even before any harness is resolved', () => {
+test('a bagless omission is silent, but a bagless explicit unregistered id is an error', () => {
   assert.deepEqual(lintOneStep(step({})), []);
-  assert.deepEqual(lintOneStep(step({ harness: 'not-registered-at-all' })), []);
+  const f = lintOneStep(step({ harness: 'not-registered-at-all' }));
+  assert.equal(f.length, 1);
+  assert.equal(f[0]!.severity, 'error');
+  assert.equal(f[0]!.field, 'id');
+  assert.match(f[0]!.message, /not-registered-at-all/);
 });
 
 test('a harness-less step is judged by the DEFAULT harness — the one that will run it', () => {
@@ -211,6 +215,23 @@ test('an EMPTY registry is an error finding — lint never pretends it checked',
     for (const a of saved) register(a);
     assert.deepEqual(registeredHarnessIds(), saved.map((a) => a.id));
   }
+});
+
+test('lint reports adapter capability refusals before runtime', () => {
+  const findings = lintOneStep(step({
+    harness: 'codex',
+    harnessOptions: { tools: [], network: 'owenloop-only', maxTurns: 20 },
+  }));
+  assert.ok(findings.some((finding) => finding.field === 'tools' && finding.severity === 'error'));
+  assert.ok(findings.some((finding) => finding.field === 'network' && finding.severity === 'error'));
+  assert.ok(
+    findings.some(
+      (finding) =>
+	finding.field === 'maxTurns' &&
+	finding.severity === 'error' &&
+	/maxTurns is unsupported/.test(finding.message),
+    ),
+  );
 });
 
 test('a bag model alongside a first-class step model is a warning', () => {
