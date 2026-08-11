@@ -62,8 +62,11 @@
  * has forgotten rejects with `ResumeUnavailableError`; every other failure emits
  * `{kind:'exited'}` and rejects with the underlying error.
  */
-import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, symlinkSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
+import { resolveCacheDir } from '../bundle/cache.ts';
 import { ResumeUnavailableError } from './contract.ts';
 import type {
   AgentEvent,
@@ -161,8 +164,71 @@ const FILESYSTEM_SANDBOX: Record<NonNullable<StepPermissions['filesystem']>, str
   unrestricted: 'danger-full-access',
 };
 
-function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
+/** Sandboxes whose filesystem boundary does not cover host-started subprocesses. */
+const RESTRICTED_SANDBOXES = new Set(['read-only', 'workspace-write']);
+/** Codex config keys that can load or launch host-side executable code. */
+const HOST_PROCESS_CONFIG_KEYS = new Set(['notify', 'hook', 'hooks', 'plugin', 'plugins']);
+
+/** Resolve the effective sandbox only when the authored policy is internally valid. */
+function effectiveSandbox(permissions: StepPermissions): string | undefined {
+  try {
+    return resolveSandbox(permissions);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * External MCP, notification, hook, and plugin processes run beside the app-server,
+ * not inside the thread sandbox. A read-only/workspace-write thread therefore
+ * cannot safely carry those definitions. Owenloop's worker-created mount is not
+ * extension data and is added only after this check.
+ */
+function restrictedHostProcessIssues(permissions: StepPermissions): PermissionIssue[] {
+  const sandbox = effectiveSandbox(permissions);
+  if (sandbox === undefined || !RESTRICTED_SANDBOXES.has(sandbox)) return [];
+
   const issues: PermissionIssue[] = [];
+  const ext = permissions.extensions;
+  const bagServers = ext['mcpServers'];
+  if (isPlainMap(bagServers) && Object.keys(bagServers).length > 0) {
+    issues.push({
+      field: 'mcpServers',
+      message:
+	`mcpServers cannot declare external servers with sandbox '${sandbox}'; ` +
+	`only the worker-created '${OWENLOOP_MCP_NAME}' server is allowed`,
+    });
+  }
+
+  const extraConfig = ext['codexConfig'];
+  if (!isPlainMap(extraConfig)) return issues;
+  const configuredServers = extraConfig['mcp_servers'];
+  if (isPlainMap(configuredServers) && Object.keys(configuredServers).length > 0) {
+    issues.push({
+      field: 'codexConfig',
+      message:
+	`codexConfig.mcp_servers cannot declare external servers with sandbox '${sandbox}'; ` +
+	`only the worker-created '${OWENLOOP_MCP_NAME}' server is allowed`,
+    });
+  }
+  for (const key of Object.keys(extraConfig)) {
+    if (!HOST_PROCESS_CONFIG_KEYS.has(key)) continue;
+    issues.push({
+      field: 'codexConfig',
+      message: `codexConfig.${key} cannot configure host executable code with sandbox '${sandbox}'`,
+    });
+  }
+  return issues;
+}
+
+/** Keep pure params builders fail-closed even when a caller skips adapter preflight. */
+function assertNoRestrictedHostProcesses(permissions: StepPermissions): void {
+  const issue = restrictedHostProcessIssues(permissions)[0];
+  if (issue !== undefined) throw new Error(issue.message);
+}
+
+function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
+  const issues: PermissionIssue[] = [...restrictedHostProcessIssues(permissions)];
   if (permissions.tools !== undefined) {
     issues.push({ field: 'tools', message: 'tool allow-lists are unsupported by this adapter' });
   }
@@ -175,7 +241,18 @@ function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
       message: "network 'owenloop-only' is unsupported by this adapter",
     });
   }
-  if (permissions.permissionMode !== undefined && !NATIVE_APPROVAL_POLICIES.has(permissions.permissionMode)) {
+  if (permissions.network === 'unrestricted' && effectiveSandbox(permissions) === 'read-only') {
+    issues.push({
+      field: 'network',
+      message:
+	"network 'unrestricted' cannot be enabled with sandbox 'read-only'; " +
+	"use filesystem 'workspace-write' or 'unrestricted'",
+    });
+  }
+  if (
+    permissions.permissionMode !== undefined &&
+    !NATIVE_APPROVAL_POLICIES.has(permissions.permissionMode)
+  ) {
     issues.push({
       field: 'permissionMode',
       message: `permissionMode must be one of ${[...NATIVE_APPROVAL_POLICIES].join('|')}`,
@@ -306,6 +383,14 @@ export function buildThreadStartParams(
   // fallback diagnostics. Invalid explicit policy now throws instead.
   void onEvent;
   const ext = args.permissions.extensions;
+  const sandbox = resolveSandbox(args.permissions);
+  if (args.permissions.network === 'unrestricted' && sandbox === 'read-only') {
+    throw new Error(
+      "network 'unrestricted' cannot be enabled with sandbox 'read-only'; " +
+	"use filesystem 'workspace-write' or 'unrestricted'",
+    );
+  }
+  assertNoRestrictedHostProcesses(args.permissions);
 
   // The escape hatch: any other config key, without re-opening the contract.
   // `mcp_servers` is merged in AFTER it, so the owenloop mount always wins.
@@ -323,12 +408,22 @@ export function buildThreadStartParams(
   };
 
   const config: Record<string, unknown> = { ...extraConfig, mcp_servers: mcpServers };
+  if (sandbox === 'workspace-write' && args.permissions.network === 'unrestricted') {
+    const authored = isPlainMap(extraConfig['sandbox_workspace_write'])
+      ? extraConfig['sandbox_workspace_write']
+      : {};
+    config['sandbox_workspace_write'] = {
+      ...authored,
+      // Applied after extension config: the authored policy always wins.
+      network_access: true,
+    };
+  }
 
   const params: Record<string, unknown> = {
     cwd: args.cwd,
     config,
     approvalPolicy: toApprovalPolicy(args.permissions.permissionMode),
-    sandbox: resolveSandbox(args.permissions),
+    sandbox,
   };
 
   // Phase 1's precedence rule, verbatim: the per-start override beats the
@@ -359,6 +454,16 @@ function resolveSandbox(permissions: StepPermissions): string {
   if (raw === undefined) return DEFAULT_SANDBOX;
   if (typeof raw === 'string' && SANDBOX_MODES.has(raw)) return raw;
   throw new Error(`sandbox must be one of ${[...SANDBOX_MODES].join('|')}`);
+}
+
+/** Remove process-launching config inherited from an earlier, broader turn. */
+function withoutHostProcessConfig(config: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (key === 'mcp_servers' || HOST_PROCESS_CONFIG_KEYS.has(key)) continue;
+    out[key] = value;
+  }
+  return out;
 }
 
 /**
@@ -409,7 +514,9 @@ export function buildThreadResumeParams(
 ): Record<string, unknown> {
   const fromArgs = buildThreadStartParams(args, onEvent);
 
-  const baseConfig = base !== undefined && isPlainMap(base['config']) ? base['config'] : {};
+  const inheritedConfig = base !== undefined && isPlainMap(base['config']) ? base['config'] : {};
+  const restricted = RESTRICTED_SANDBOXES.has(String(fromArgs['sandbox']));
+  const baseConfig = restricted ? withoutHostProcessConfig(inheritedConfig) : inheritedConfig;
   const argsConfig = isPlainMap(fromArgs['config']) ? fromArgs['config'] : {};
   const baseServers = isPlainMap(baseConfig['mcp_servers']) ? baseConfig['mcp_servers'] : {};
   const argsServers = isPlainMap(argsConfig['mcp_servers']) ? argsConfig['mcp_servers'] : {};
@@ -605,6 +712,64 @@ function resolveBin(): string {
   return process.env['OWENLOOP_CODEX_BIN'] ?? 'codex';
 }
 
+/** The operator's ordinary config/auth/session root before isolation. */
+function configuredCodexHome(env: Record<string, string | undefined>): string | undefined {
+  const explicit = env['CODEX_HOME'];
+  if (explicit !== undefined && explicit.trim() !== '') return resolve(explicit);
+  const home = env['HOME'];
+  if (home !== undefined && home.trim() !== '') return join(resolve(home), '.codex');
+  return undefined;
+}
+
+function pathEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+/**
+ * Create a stable config-free Codex home for one worktree.
+ *
+ * `config.mcp_servers` merges with global config, so a per-thread empty map does
+ * not remove an operator-installed MCP server or plugin hook. Restricted threads
+ * therefore run under a separate `CODEX_HOME` whose stable cwd-derived path keeps
+ * rollout files available to a later process resume. Only `auth.json` is linked
+ * from the operator home; config, plugins, hooks, and MCP declarations are not.
+ */
+function isolatedCodexHome(cwd: string, env: Record<string, string | undefined>): string {
+  const operatorHome = configuredCodexHome(env);
+  const cacheDir = resolveCacheDir(env);
+  const key = createHash('sha256')
+    .update(resolve(cwd))
+    .update('\0')
+    .update(operatorHome ?? '')
+    .digest('hex');
+  const isolated = join(cacheDir, 'harness', HARNESS_ID, key);
+  mkdirSync(isolated, { recursive: true, mode: 0o700 });
+
+  if (operatorHome !== undefined) {
+    const sourceAuth = join(operatorHome, 'auth.json');
+    const isolatedAuth = join(isolated, 'auth.json');
+    if (existsSync(sourceAuth) && !pathEntryExists(isolatedAuth)) {
+      symlinkSync(sourceAuth, isolatedAuth, 'file');
+    }
+  }
+  return isolated;
+}
+
+/** Build the complete child environment, isolating inherited executable config when required. */
+function codexChildEnv(cwd: string, permissions: StepPermissions): Record<string, string | undefined> {
+  const env = filterOwenloopEnv(process.env);
+  if (RESTRICTED_SANDBOXES.has(resolveSandbox(permissions))) {
+    env['CODEX_HOME'] = isolatedCodexHome(cwd, env);
+  }
+  return env;
+}
+
 /**
  * Everything one turn needs to settle: the promise the caller is waiting on,
  * plus the notification/server-request wiring that settles it.
@@ -796,6 +961,7 @@ interface OpenedClient {
 /** Spawn one app-server, complete the handshake, and return the wired client. */
 async function openClient(
   cwd: string,
+  permissions: StepPermissions,
   onEvent: (e: AgentEvent) => void,
   gate: TurnGate,
 ): Promise<OpenedClient> {
@@ -822,8 +988,10 @@ async function openClient(
     //
     // The value is a FULL environment (`process.env` minus the denied names),
     // because supplying `env` to the transport replaces the child's environment
-    // rather than merging into it.
-    env: filterOwenloopEnv(process.env),
+    // rather than merging into it. Restricted sandboxes additionally receive a
+    // stable, config-free CODEX_HOME so global MCP/plugin/hook processes cannot
+    // escape the thread filesystem policy.
+    env: codexChildEnv(cwd, permissions),
     // Every unknown notification lands here and is ignored by `mapNotification`
     // — unsolicited traffic arrives before any request completes, and throwing
     // on one would kill a healthy session.
@@ -1040,7 +1208,7 @@ export const codexAdapter: HarnessAdapter = {
     const startParams = buildThreadStartParams(args, onEvent);
     // Handshake failure disposes the child inside `openClient` — see the catch
     // there. Nothing is spawned and unowned by the time this rejects.
-    const { client, reportExit } = await openClient(args.cwd, onEvent, gate);
+    const { client, reportExit } = await openClient(args.cwd, args.permissions, onEvent, gate);
 
     let threadId: string;
     try {
@@ -1115,7 +1283,7 @@ export const codexAdapter: HarnessAdapter = {
       await previous.client.dispose();
     }
 
-    const { client, reportExit } = await openClient(args.cwd, onEvent, gate);
+    const { client, reportExit } = await openClient(args.cwd, args.permissions, onEvent, gate);
 
     const resumeParams = buildThreadResumeParams(ref.token, args, startParams, onEvent);
     try {
