@@ -40,6 +40,8 @@ import {
 import type { SessionRecord } from '../src/harness/session-store.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket, ReasonEntry } from '../src/hub/types.ts';
+import { normalizeStepPermissions } from '../src/harness/permissions.ts';
+import { buildDef } from '../../../src/defs.ts';
 
 const HOLDER: ContactHolder = { kind: 'exec', id: 'host:99' };
 const CWD = '/work/wf1/run1';
@@ -237,19 +239,28 @@ test('all preconditions hold ⇒ RESUME: deliver on the prior token, delta only,
   assert.match(ran.outs.join('\n'), /attempt 2, resume\)/);
 });
 
-test('policy preflight refuses a resumable order before deliver', async () => {
+test('inherited judge policy preflight refuses a resumable order before deliver', async () => {
   const adapter = createFakeAdapter({ id: 'fake' });
   adapter.preflight = (permissions) =>
     permissions.network === 'owenloop-only'
       ? [{ field: 'network', message: "network 'owenloop-only' is unsupported" }]
       : [];
+  const def = buildDef({
+    name: 'resumeJudgePolicy',
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [{
+      name: 'researcher',
+      consumes: ['question'],
+      produces: [{ name: 'report', judges: [{ name: 'completeness', body: 'evaluate' }] }],
+      x: { harness: { network: 'owenloop-only' } },
+    }],
+  });
+  const judge = def.steps.find((step) => step.name.endsWith('.completeness'))!;
+  const bag = judge.x!['harness'] as Record<string, unknown>;
 
   const ran = await runLoop({
     adapter,
-    permissions: {
-      network: 'owenloop-only',
-      extensions: {},
-    },
+    permissions: normalizeStepPermissions(bag, judge),
   });
 
   assert.equal(ran.outcome, 'incompatible-harness-policy');

@@ -16,6 +16,7 @@ import {
 } from '../src/order-resolver.ts';
 import type { Order } from '../src/types.ts';
 import type { OrderInstructionSource } from '../src/order-resolver.ts';
+import { buildDef } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
 // A verified fixture with DELIBERATE whitespace and newlines in every field —
@@ -205,6 +206,70 @@ test('prompt, command, and routing-shape changes each change the digest', () => 
     ],
   );
   assert.notEqual(defInstructionDigest(consumesChanged), base, 'routing-shape change must change the digest');
+});
+
+test('synthesized judge x carriers participate deterministically in definition identity', () => {
+  const raw = {
+    name: 'judgeDigestFixture',
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [{
+      name: 'researcher',
+      consumes: ['question'],
+      produces: [{
+	name: 'report',
+	judges: [
+	  { name: 'completeness', body: 'evaluate completeness' },
+	  { name: 'rigor', body: 'evaluate rigor' },
+	],
+      }],
+      x: {
+	harness: { id: 'claude-code', tools: [] },
+	vendor: { nested: { value: 1 } },
+      },
+    }],
+  };
+  const first = buildDef(structuredClone(raw));
+  const second = buildDef(structuredClone(raw));
+  const baseline = defInstructionDigest(first);
+
+  assert.equal(defInstructionDigest(second), baseline, 'identical parsed content has one stable digest');
+
+  const producerChanged = structuredClone(first);
+  ((producerChanged.steps[0]!.x!['vendor'] as { nested: { value: number } }).nested).value = 2;
+  assert.notEqual(defInstructionDigest(producerChanged), baseline, 'producer x participates in the digest');
+
+  const judgeChanged = structuredClone(first);
+  const judge = judgeChanged.steps.find((candidate) => candidate.name.endsWith('.completeness'))!;
+  (judge.x!['harness'] as { tools: string[] }).tools.push('Read');
+  assert.notEqual(defInstructionDigest(judgeChanged), baseline, 'inherited judge x participates in the digest');
+});
+
+test('registered synthesized-judge instructions remain pinned after producer and judge mutation', () => {
+  const mutable = buildDef({
+    name: 'judgeSnapshotFixture',
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [{
+      name: 'researcher',
+      consumes: ['question'],
+      produces: [{ name: 'report', judges: [{ name: 'completeness', body: 'original judge prompt' }] }],
+      x: { harness: { tools: [] }, vendor: { nested: { value: 1 } } },
+    }],
+  });
+  const source = createDefInstructionSource();
+  const digest = source.digestOf(mutable);
+  const resolver = new OrderResolver(source);
+  const producer = mutable.steps.find((candidate) => candidate.name === 'researcher')!;
+  const judge = mutable.steps.find((candidate) => candidate.name.endsWith('.completeness'))!;
+
+  (producer.x!['harness'] as { tools: string[] }).tools.push('Bash');
+  ((judge.x!['vendor'] as { nested: { value: number } }).nested).value = 9;
+  judge.body = 'mutated judge prompt';
+
+  assert.equal(
+    resolver.resolve({ defDigest: digest, step: judge.name, key: '' }).prompt,
+    'original judge prompt',
+  );
+  assert.notEqual(defInstructionDigest(mutable), digest, 'caller mutations produce a new identity, not a changed snapshot');
 });
 
 test('workdirFrom changes the instruction digest when its consumed value path changes', () => {

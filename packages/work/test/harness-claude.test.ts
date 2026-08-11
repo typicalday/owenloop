@@ -34,6 +34,7 @@ import { adapterFor } from '../src/harness/registry.ts';
 import type { AgentEvent } from '../src/harness/contract.ts';
 import type { LintFinding } from '../src/harness/types.ts';
 import type { FetchedStep } from '../src/bundle/types.ts';
+import { buildDef } from '../../../src/defs.ts';
 
 const fixture = (p: string): string =>
   readFileSync(fileURLToPath(new URL(`./fixtures/${p}`, import.meta.url)), 'utf8');
@@ -259,6 +260,34 @@ test('an explicit empty tools list disables built-ins while an absent list prese
   assert.equal(empty.strictMcpConfig, true);
   assert.deepEqual(mountedOwenloopTools(empty), ['get_order', 'submit']);
   assert.deepEqual(empty.disallowedTools, ['mcp__owenloop__reject']);
+});
+
+test('a restricted producer gives its synthesized Claude judge no built-in tools', () => {
+  const def = buildDef({
+    name: 'restrictedJudge',
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [{
+      name: 'researcher',
+      consumes: ['question'],
+      produces: [{
+	name: 'report',
+	judges: [{ name: 'completeness', body: 'evaluate', model: 'judge-model' }],
+      }],
+      x: { harness: { id: 'claude-code', tools: [], model: 'bag-model' } },
+    }],
+  });
+  const judge = def.steps.find((step) => step.name.endsWith('.completeness'))!;
+  const bag = judge.x!['harness'] as Record<string, unknown>;
+  const { options } = optionsFor(bag, { step: judge });
+
+  assert.deepEqual(options.tools, [], 'the inherited empty allow-list disables every built-in tool');
+  assert.deepEqual(options.allowedTools, [
+    'mcp__owenloop__get_order',
+    'mcp__owenloop__submit',
+  ]);
+  assert.deepEqual(mountedOwenloopTools(options), ['get_order', 'submit']);
+  assert.deepEqual(options.disallowedTools, ['mcp__owenloop__reject']);
+  assert.equal(options.model, 'judge-model', 'the judge first-class model wins over inherited x.harness.model');
 });
 
 test('read-only filesystem with unrestricted network keeps audited network readers and isolates other extension surfaces', () => {

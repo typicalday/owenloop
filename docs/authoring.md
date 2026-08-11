@@ -329,6 +329,15 @@ regardless of `executor:` — that requirement is orthogonal to this feature and
 applies even to a `executor: command` judge (the field just goes unread by a
 non-agent dispatcher).
 
+Author `x:` on the producer step, not on individual judge entries. Every native
+judge synthesized from that producer inherits the producer's complete parsed
+`x:` map. Each judge receives an independent deep clone, so runner-side
+mutation of the producer or one judge cannot alter a sibling judge. When the
+producer omits `x:`, synthesized judges omit `x:` too. In particular, a
+producer's `x.harness` policy governs both the producer order and every native
+judge order. A judge entry's first-class `model:` remains authoritative over an
+inherited `x.harness.model` value.
+
 Each judge is a real step under the hood — it fires its own Worker order
 through the normal pipeline, with its own throttles (`cadence:`,
 `maxRunsPerDay:`) and retry/timeout behavior. When `researcher` commits

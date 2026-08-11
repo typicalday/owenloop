@@ -6,6 +6,15 @@ The runtime worker resolves the verified workflow definition from the local work
 
 Runtime preflight is authoritative. `owenloop work lint` runs the same common and adapter checks for author feedback, but lint cannot account for a later `--harness` or `OWENLOOP_HARNESS` override.
 
+Native judge entries do not carry a separately authored `x` map. The definition
+compiler deep-clones the producer step's complete parsed `x` map onto every
+synthesized judge step, and generated and persisted judge orders expose that
+map as `Order.x`. The worker therefore reads the current judge's inherited
+`x.harness` from the same verified definition snapshot used for the judge's
+instructions. Final-adapter selection and mandatory preflight apply before
+both judge cold starts and judge resumes. A judge entry's first-class `model`
+continues to win over an inherited `x.harness.model` value.
+
 ## `x.harness` permission fields
 
 The reserved neutral fields are:

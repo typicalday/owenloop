@@ -34,6 +34,7 @@ import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { SignalHost } from '../src/roles/signals.ts';
 import type { InstructionResolver } from '../src/exec/instructions.ts';
 import type { StepDef } from '../../../src/types.ts';
+import { buildDef } from '../../../src/defs.ts';
 
 // ---- arg parsing ------------------------------------------------------------
 
@@ -115,6 +116,9 @@ function agentOrder(o: {
   defDigest?: string;
   workflow?: string;
   run?: string;
+  step?: string;
+  model?: string;
+  x?: Record<string, unknown>;
 } = {}): GetOrderResponse {
   const workflow = o.workflow ?? 'wf1';
   const run = o.run ?? 'run1';
@@ -125,11 +129,13 @@ function agentOrder(o: {
     order: {
       run,
       workflow,
-      step: 'builder',
+      step: o.step ?? 'builder',
       key: 'k',
       inputs: [],
       outputs: [],
       ...(o.worker !== undefined ? { worker: o.worker } : {}),
+      ...(o.model !== undefined ? { model: o.model } : {}),
+      ...(o.x !== undefined ? { x: o.x } : {}),
       defDigest: o.defDigest ?? HASH,
       consumes: {},
       owes: [{ path: 'out', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
@@ -368,6 +374,25 @@ function seedRawStep(x: Record<string, unknown>): void {
     body: TEMPLATE,
     x,
   } as unknown as StepDef;
+}
+
+/** Build and select a real synthesized judge whose policy originates on its producer. */
+function seedSynthesizedJudge(x: Record<string, unknown>): StepDef {
+  const def = buildDef({
+    name: DEF,
+    inputs: [{ name: 'question', seedOwed: true }],
+    steps: [{
+      name: 'researcher',
+      consumes: ['question'],
+      produces: [{
+	name: 'report',
+	judges: [{ name: 'completeness', body: TEMPLATE, model: 'judge-model' }],
+      }],
+      x,
+    }],
+  });
+  verifiedStep = def.steps.find((step) => step.name.endsWith('.completeness'))!;
+  return verifiedStep;
 }
 
 beforeEach(() => {
@@ -836,11 +861,12 @@ test('Codex filesystem refusal names the restriction and releases the held claim
   }
 });
 
-test('CLI and environment overrides selecting Codex refuse maxTurns, start nothing, release, and exit nonzero', async () => {
-  const authored = createFakeAdapter({ id: 'authored-max-turns' });
+test('CLI and environment Codex overrides refuse inherited judge policy before startup, release, and exit nonzero', async () => {
+  const authored = createFakeAdapter({ id: 'authored-judge-policy' });
   useAdapter(authored);
-  seedRawStep({ harness: { id: authored.id, maxTurns: 9 } });
+  const judge = seedSynthesizedJudge({ harness: { id: authored.id, tools: [] } });
   process.env['OWENLOOP_CODEX_BIN'] = join(home, 'must-not-start');
+  const packet = agentOrder({ step: judge.name, model: judge.model, x: judge.x });
 
   const scenarios = [
     {
@@ -861,7 +887,7 @@ test('CLI and environment overrides selecting Codex refuse maxTurns, start nothi
 
   for (const scenario of scenarios) {
     scenario.select();
-    const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+    const { hub, releases } = probeHub({ responses: [packet, noHold('ok')], def: DEF });
     const err: string[] = [];
     const code = await run(scenario.args, {
       hub,
@@ -877,7 +903,7 @@ test('CLI and environment overrides selecting Codex refuse maxTurns, start nothi
     assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }], scenario.name);
     assert.match(
       err.join('\n'),
-      /harness policy refusal.*codex.*\(maxTurns\): maxTurns is unsupported.*no thread or turn limit parameter/,
+      /harness policy refusal.*codex.*\(tools\): tool allow-lists are unsupported/,
       scenario.name,
     );
   }

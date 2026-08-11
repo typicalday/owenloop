@@ -69,6 +69,14 @@ x:
 default adapter; `--harness` and `OWENLOOP_HARNESS` overrides take precedence
 over the definition. Keep policy in `x.harness` even when `id` is absent.
 
+When a producer declares native `judges:`, put `x.harness` on the producer
+step, not on each judge entry. Every synthesized judge automatically inherits
+an independent deep clone of the producer's complete `x` map. An absent
+producer `x` stays absent. A judge entry's first-class `model` still wins over
+an inherited `x.harness.model`. CLI and environment harness overrides still
+select the final adapter, and that final adapter must pass policy preflight
+before either a judge cold start or a judge resume.
+
 The eight neutral fields are:
 
 - `tools`: a comma-separated string or string array. An absent field declares no
