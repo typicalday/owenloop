@@ -308,19 +308,19 @@ function stageRealReplacement(fixture: RealRepairFixture, stagingId: string): st
 }
 
 function assertHardenedRepairTree(fixture: RealRepairFixture): void {
-  assert.equal(statSync(fixture.objectDir).mode & 0o777, 0o555, 'object root is exactly 0555');
+  assert.equal(statSync(fixture.objectDir).mode & 0o7777, 0o555, 'object root is exactly 0555');
   assert.equal(
-    statSync(join(fixture.objectDir, fixture.nestedDirRel)).mode & 0o777,
+    statSync(join(fixture.objectDir, fixture.nestedDirRel)).mode & 0o7777,
     0o555,
     'nested directory is exactly 0555',
   );
   assert.equal(
-    statSync(join(fixture.objectDir, fixture.executableRel)).mode & 0o777,
+    statSync(join(fixture.objectDir, fixture.executableRel)).mode & 0o7777,
     0o555,
     'executable regular file is exactly 0555',
   );
   assert.equal(
-    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o777,
+    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o7777,
     0o444,
     'non-executable regular file is exactly 0444',
   );
@@ -362,6 +362,73 @@ async function assertBrokenRecoveryReinstallsAndThenDedupes(fixture: RealRepairF
   assert.notEqual(statSync(fixture.objectDir).ino, brokenInode, 'repair replaces the broken object directory');
   assertHardenedRepairTree(fixture);
   await assertHealthyReinstallDedupesWithoutReplacement(fixture);
+}
+
+const specialPermissionCases = [
+  { name: 'setuid', bits: 0o4000 },
+  { name: 'setgid', bits: 0o2000 },
+  { name: 'sticky', bits: 0o1000 },
+  { name: 'setuid and setgid', bits: 0o6000 },
+  { name: 'setuid and sticky', bits: 0o5000 },
+  { name: 'setgid and sticky', bits: 0o3000 },
+  { name: 'setuid, setgid, and sticky', bits: 0o7000 },
+] as const;
+
+const specialPermissionTargets = [
+  {
+    name: 'object-root directory',
+    expectedMode: 0o555,
+    diagnosticKind: 'directory',
+    path: (fixture: RealRepairFixture): string => fixture.objectDir,
+  },
+  {
+    name: 'nested directory',
+    expectedMode: 0o555,
+    diagnosticKind: 'directory',
+    path: (fixture: RealRepairFixture): string => join(fixture.objectDir, fixture.nestedDirRel),
+  },
+  {
+    name: 'executable file',
+    expectedMode: 0o555,
+    diagnosticKind: 'regular file',
+    path: (fixture: RealRepairFixture): string => join(fixture.objectDir, fixture.executableRel),
+  },
+  {
+    name: 'non-executable file',
+    expectedMode: 0o444,
+    diagnosticKind: 'regular file',
+    path: (fixture: RealRepairFixture): string => join(fixture.objectDir, fixture.nonExecutableRel),
+  },
+] as const;
+
+async function assertSpecialPermissionRepair(
+  fixture: RealRepairFixture,
+  target: (typeof specialPermissionTargets)[number],
+  permission: (typeof specialPermissionCases)[number],
+): Promise<void> {
+  const targetPath = target.path(fixture);
+  const tamperedMode = target.expectedMode | permission.bits;
+  chmodSync(targetPath, tamperedMode);
+  assert.equal(
+    statSync(targetPath).mode & 0o7777,
+    tamperedMode,
+    'the fixture carries the intended special permission bits',
+  );
+  assert.throws(
+    () => verifyWorkflowObjectSync(fixture.objectDir, fixture.digest, { coordinateRepair: false }),
+    new RegExp(`${target.diagnosticKind} mode is 0${tamperedMode.toString(8)}, expected hardened store mode`),
+  );
+  await assertBrokenRecoveryReinstallsAndThenDedupes(fixture);
+}
+
+for (const target of specialPermissionTargets) {
+  test(`install: special permission bits on the ${target.name} fail verification and trigger repair`, async (t) => {
+    const fixture = await realRepairFixture(`special-mode-${target.name.replaceAll(/[^a-z]+/g, '-')}`);
+
+    for (const permission of specialPermissionCases) {
+      await t.test(permission.name, () => assertSpecialPermissionRepair(fixture, target, permission));
+    }
+  });
 }
 
 // ---- the happy path and the commit order ------------------------------------------
@@ -412,8 +479,8 @@ test('install: a valid bundle installs with the fixed commit order and hardened 
 
   // Object content + HARDENED modes (files 0o444, dirs 0o555, object dir included).
   const objDir = result.objectPath;
-  const fileMode = statSync(join(objDir, 'def.yaml')).mode & 0o777;
-  const dirMode = statSync(objDir).mode & 0o777;
+  const fileMode = statSync(join(objDir, 'def.yaml')).mode & 0o7777;
+  const dirMode = statSync(objDir).mode & 0o7777;
   assert.equal(fileMode, 0o444, 'object files hardened read-only');
   assert.equal(dirMode, 0o555, 'object dir hardened non-writable');
   assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), validDefYaml('widget'));
@@ -682,7 +749,7 @@ test('install: a corrupt same-digest object is repaired from validated staged by
 
   assert.equal(repaired.installed, false, 'repair reuses the existing digest identity');
   assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), validDefYaml('widget'));
-  assert.equal(statSync(join(objDir, 'def.yaml')).mode & 0o777, 0o444);
+  assert.equal(statSync(join(objDir, 'def.yaml')).mode & 0o7777, 0o444);
   assert.equal(readFileSync(storeIndexPath(root), 'utf8'), indexBefore, 'same-digest index bytes stay unchanged');
   assert.deepEqual(repairing.verifies.map((call) => call.objectDir), [objDir, repairing.verifies[1]!.objectDir, objDir]);
   assert.notEqual(repairing.verifies[1]!.objectDir, objDir, 'the staged repair is verified independently');
@@ -744,8 +811,8 @@ test('install: failed replacement verification restores the prior broken object,
   chmodSync(join(objDir, 'def.yaml'), 0o644);
   writeFileSync(join(objDir, 'def.yaml'), 'prior broken object');
   chmodSync(join(objDir, 'def.yaml'), 0o444);
-  assert.equal(statSync(objDir).mode & 0o777, 0o555);
-  assert.equal(statSync(join(objDir, 'nested')).mode & 0o777, 0o555);
+  assert.equal(statSync(objDir).mode & 0o7777, 0o555);
+  assert.equal(statSync(join(objDir, 'nested')).mode & 0o7777, 0o555);
   const indexBefore = readFileSync(storeIndexPath(root), 'utf8');
   const failing = fakeIngestor({ failVerify: (_input, call) => call === 1 || call === 3 });
 
@@ -760,9 +827,9 @@ test('install: failed replacement verification restores the prior broken object,
 
   assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'prior broken object');
   assert.equal(readFileSync(storeIndexPath(root), 'utf8'), indexBefore);
-  assert.equal(statSync(objDir).mode & 0o777, 0o555, 'rollback restores exact object-root mode');
-  assert.equal(statSync(join(objDir, 'nested')).mode & 0o777, 0o555, 'rollback preserves nested hardened mode');
-  assert.equal(statSync(join(objDir, 'def.yaml')).mode & 0o777, 0o444, 'rollback preserves hardened file mode');
+  assert.equal(statSync(objDir).mode & 0o7777, 0o555, 'rollback restores exact object-root mode');
+  assert.equal(statSync(join(objDir, 'nested')).mode & 0o7777, 0o555, 'rollback preserves nested hardened mode');
+  assert.equal(statSync(join(objDir, 'def.yaml')).mode & 0o7777, 0o444, 'rollback preserves hardened file mode');
   assert.ok(!existsSync(journalPath));
   assert.ok(!existsSync(join(root, '.owenloop-staging')));
 });
@@ -1115,7 +1182,7 @@ test('recovery: same-digest repair crash before swap restores the prior object a
   assert.equal(outcome, 'rolled-back');
   assert.equal(statSync(fixture.objectDir).ino, priorInode, 'recovery leaves the prior object in place');
   assert.equal(
-    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o777,
+    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o7777,
     0o644,
     'the prior mode is restored exactly',
   );
@@ -1151,19 +1218,19 @@ test('recovery: same-digest repair crash after backup rename restores exact mode
 
   assert.equal(outcome, 'rolled-back');
   assert.equal(statSync(fixture.objectDir).ino, priorInode, 'recovery restores the retained prior directory');
-  assert.equal(statSync(fixture.objectDir).mode & 0o777, 0o555, 'recovery restores the exact prior root mode');
+  assert.equal(statSync(fixture.objectDir).mode & 0o7777, 0o555, 'recovery restores the exact prior root mode');
   assert.equal(
-    statSync(join(fixture.objectDir, fixture.nestedDirRel)).mode & 0o777,
+    statSync(join(fixture.objectDir, fixture.nestedDirRel)).mode & 0o7777,
     0o555,
     'recovery preserves the nested directory mode',
   );
   assert.equal(
-    statSync(join(fixture.objectDir, fixture.executableRel)).mode & 0o777,
+    statSync(join(fixture.objectDir, fixture.executableRel)).mode & 0o7777,
     0o555,
     'recovery preserves the executable file mode',
   );
   assert.equal(
-    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o777,
+    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o7777,
     0o644,
     'recovery restores the prior non-executable mode exactly',
   );
@@ -1434,7 +1501,7 @@ test('recovery: a durable verified phase never accepts a replacement made writab
 
   assert.ok(existsSync(backupDir), 'the prior object remains retained');
   assert.ok(existsSync(fixture.journalPath), 'the journal remains for explicit recovery');
-  assert.equal(statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o777, 0o644);
+  assert.equal(statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o7777, 0o644);
 });
 
 test('recovery: a v1 journal at a project path is refused without a ledger (fail-closed)', async () => {

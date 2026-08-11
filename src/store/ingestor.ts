@@ -74,18 +74,18 @@ export interface VerifyWorkflowObjectOptions {
 }
 
 function modeString(mode: number): string {
-  return `0${(mode & 0o777).toString(8)}`;
+  return `0${(mode & 0o7777).toString(8)}`;
 }
 
 function assertHardenedDirectory(path: string, mode: number): void {
-  const actual = mode & 0o777;
+  const actual = mode & 0o7777;
   if (actual !== 0o555) {
     refuse(path, `directory mode is ${modeString(actual)}, expected hardened store mode 0555`);
   }
 }
 
 function assertHardenedFile(path: string, mode: number): void {
-  const actual = mode & 0o777;
+  const actual = mode & 0o7777;
   const expected = (actual & 0o111) === 0 ? 0o444 : 0o555;
   if (actual !== expected) {
     refuse(
