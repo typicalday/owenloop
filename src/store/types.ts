@@ -345,7 +345,12 @@ export type ResolutionLevel = 'project' | 'global';
  * qualified names). `String.prototype.localeCompare` is deliberately avoided
  * throughout the store: without an explicit locale its result depends on the
  * host's ICU data, so two machines walking the same index could disagree on
- * order. Codepoint comparison is stable everywhere.
+ * order.
+ *
+ * This is UTF-16 code-unit order (JS `<` on strings), which differs from true
+ * codepoint order for astral characters. That difference does not matter here:
+ * the requirement is a total order identical on every host, not one that
+ * matches any particular alphabet.
  *
  * This orders ENUMERATION only. It never decides which version of a package is
  * the current one — {@link selectLatestVersion} owns that and is the store's
@@ -365,6 +370,11 @@ export function compareStoreText(a: string, b: string): number {
  * back out of a coordinate string — the manifest is the object's own statement
  * of what it is, and the caller has already proven the coordinate agrees with
  * it before building a candidate.
+ *
+ * `level` is the level of the INDEX that named the object, not the store the
+ * object's bytes were read from. A project-indexed object whose bytes were
+ * served from the global store by exact-digest fallback is still a project
+ * candidate: the project index is what pins it.
  */
 export interface VersionSelectionCandidate {
   /** Manifest package version of the bundle supplying this candidate. */
@@ -386,6 +396,10 @@ export interface VersionSelectionCandidate {
  * candidate is returned in `shadowed`. This is fail-closed on purpose: silently
  * picking one of several versions that have no defined precedence is exactly
  * the accidental-order defect this helper exists to remove.
+ *
+ * An EMPTY candidate list also yields `unorderable`, with an empty `shadowed`.
+ * There is no winner to report and nothing to shadow, so a caller that
+ * registers `winner` and every `shadowed` entry correctly registers nothing.
  */
 export type LatestVersionSelection<T> =
   | { kind: 'selected'; winner: T; shadowed: T[] }
@@ -422,7 +436,7 @@ function compareVersionCandidates(a: VersionSelectionCandidate, b: VersionSelect
  *
  * Two rules apply in order, and neither consults arrival order:
  *
- *  1. LEVEL FIRST. If any candidate came from the project store, only project
+ *  1. LEVEL FIRST. If any candidate is named by the project index, only project
  *     candidates compete. This mirrors `resolveWorkflowCoordinate`, where the
  *     project index is the deterministic override: a project install of
  *     `pkg@0.1.0` beats a global install of `pkg@0.9.9`, because the project
@@ -441,10 +455,13 @@ export function selectLatestVersion<T extends VersionSelectionCandidate>(
 ): LatestVersionSelection<T> {
   if (candidates.length === 0) return { kind: 'unorderable', shadowed: [] };
 
-  const competing = candidates.some((candidate) => candidate.level === 'project')
+  const hasProject = candidates.some((candidate) => candidate.level === 'project');
+  const competing = hasProject
     ? candidates.filter((candidate) => candidate.level === 'project')
     : [...candidates];
-  const outranked = candidates.filter((candidate) => !competing.includes(candidate));
+  const outranked = hasProject
+    ? candidates.filter((candidate) => candidate.level !== 'project')
+    : [];
   const ranked = [...competing].sort(compareVersionCandidates);
   const best = ranked[0] as T;
 

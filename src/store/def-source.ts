@@ -148,9 +148,12 @@ function loadObjectDefs(
 		verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false });
 		const manifest = parseManifestBytes(readFileSync(join(objectDir, 'bundle.yaml')));
 		const defs = new Map<string, WorkflowDef>();
-		// Sorted, not YAML key order: this map's iteration order drives registration
-		// and warning order downstream, so it must not depend on how the manifest
-		// author happened to write the file.
+		// Sorted, not YAML key order. `defs` is handed to callers as a Map, whose
+		// iteration order is this insertion order; nothing downstream currently
+		// depends on it (`selectWorkflowRegistrations` re-sorts by qualified name,
+		// and `coordinateTarget` reads `keys()` only when there is exactly one), so
+		// this is defensive: it keeps a public iteration order from tracking how the
+		// manifest author happened to write the file.
 		const manifestWorkflows = Object.entries(manifest.workflows)
 			.sort(([a], [b]) => compareStoreText(a, b));
 		for (const [workflowName, workflowPath] of manifestWorkflows) {
@@ -248,11 +251,23 @@ function coordinateTarget(indexed: IndexedCoordinate, loaded: LoadedObject): Wor
 	return target;
 }
 
-/** One verified object's offer of one workflow under one `package/workflow` name. */
+/**
+ * One verified object's offer of one workflow under one `package/workflow` name.
+ *
+ * The inherited `level` is the level of the INDEX that named this object, which
+ * is what decides precedence. `byteLevel` is the separate question of which
+ * store the verified bytes were actually read from. The two differ in exactly
+ * one supported case: a project-indexed coordinate whose object directory is
+ * missing locally falls through to the SAME digest in the global store
+ * (`resolveObject`). Such an object is still a project pin — the project index
+ * is what names it — so it must compete as `level: 'project'`, while the
+ * registration keeps reporting `byteLevel: 'global'` for provenance.
+ */
 interface WorkflowCandidate extends VersionSelectionCandidate {
 	qualified: string;
 	def: WorkflowDef;
 	packageName: string;
+	byteLevel: ResolutionLevel;
 }
 
 function candidateRegistration(candidate: WorkflowCandidate, key: string): CasDefRegistration {
@@ -263,9 +278,20 @@ function candidateRegistration(candidate: WorkflowCandidate, key: string): CasDe
 		def: candidate.def,
 		bundleDigest: candidate.digest as DefDigest,
 		bundlePackage: candidate.packageName,
-		level: candidate.level,
+		level: candidate.byteLevel,
 		kind: 'workflow',
 	};
+}
+
+/**
+ * A verified object that reached registration, paired with the level of the
+ * index that named it. One object can be named by several coordinates and by
+ * both indexes; `project` always wins that merge, because a project index entry
+ * is the operator's pin regardless of what the global index also says.
+ */
+interface RegisteredObject {
+	loaded: LoadedObject;
+	indexedLevel: ResolutionLevel;
 }
 
 /** `<digest>/<workflow>` — where a version that did not win its name stays reachable. */
@@ -286,14 +312,20 @@ function shadowedWorkflowKey(candidate: WorkflowCandidate): string {
  * itself and are deliberately NOT affected by anything decided here: a pinned
  * parent and an explicit `pkg/name@version` call keep resolving to their own
  * object whichever version currently holds the unqualified name.
+ *
+ * Precedence runs on `indexedLevel` — which index named the object — so a
+ * project pin still outranks a higher global version even when the project's
+ * own object bytes were missing and had to be read from the global store.
  */
 function selectWorkflowRegistrations(
-	objects: readonly LoadedObject[],
+	objects: readonly RegisteredObject[],
 	warn: (line: string) => void,
 ): CasDefRegistration[] {
 	const byQualified = new Map<string, WorkflowCandidate[]>();
-	const ordered = [...objects].sort((a, b) => compareStoreText(a.bundleDigest, b.bundleDigest));
-	for (const loaded of ordered) {
+	const ordered = [...objects].sort(
+		(a, b) => compareStoreText(a.loaded.bundleDigest, b.loaded.bundleDigest),
+	);
+	for (const { loaded, indexedLevel } of ordered) {
 		for (const def of loaded.defs.values()) {
 			const qualified = `${loaded.manifest.package.name}/${def.name}`;
 			const candidate: WorkflowCandidate = {
@@ -301,7 +333,8 @@ function selectWorkflowRegistrations(
 				def,
 				packageName: loaded.manifest.package.name,
 				version: loaded.manifest.package.version,
-				level: loaded.level,
+				level: indexedLevel,
+				byteLevel: loaded.level,
 				digest: loaded.bundleDigest,
 			};
 			const existing = byQualified.get(qualified);
@@ -371,7 +404,7 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 
 	const registrations: CasDefRegistration[] = [];
 	const loadedByDigest = new Map<DefDigest, LoadedObject>();
-	const registeredObjects = new Map<DefDigest, LoadedObject>();
+	const registeredObjects = new Map<DefDigest, RegisteredObject>();
 	const registeredCoordinateKeys = new Set<string>();
 
 	for (const indexed of selected) {
@@ -383,7 +416,14 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 				loadedByDigest.set(digest, loaded);
 			}
 			const target = coordinateTarget(indexed, loaded);
-			registeredObjects.set(loaded.bundleDigest, loaded);
+			// `indexed.level`, not `loaded.level`: the index that NAMED the object
+			// decides precedence, while `loaded.level` only records which store the
+			// verified bytes came from. Project wins the merge when both indexes
+			// name the same object.
+			const alreadyRegistered = registeredObjects.get(loaded.bundleDigest);
+			if (alreadyRegistered?.indexedLevel !== 'project') {
+				registeredObjects.set(loaded.bundleDigest, { loaded, indexedLevel: indexed.level });
+			}
 			if (target === undefined) {
 				if (indexed.registerAlias) {
 					args.warn(

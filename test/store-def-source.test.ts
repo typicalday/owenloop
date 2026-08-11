@@ -1125,9 +1125,42 @@ test('version selection: install order, index key order, and digest order do not
   }
 });
 
+test('version selection: registration order is alphabetical, not manifest workflow key order', async () => {
+  // `writeBundleSource` always emits the package's own workflow FIRST, so a
+  // package named `parent` carrying an extra workflow named `aaa` produces a
+  // manifest whose `workflows:` keys are {parent, aaa} — deliberately not
+  // alphabetical. Registration order must not follow that.
+  const sourceDir = writeBundleSource({
+    name: 'parent',
+    version: '1.0.0',
+    workflow: parentYaml('MANIFEST-ORDER'),
+    workflows: {
+      aaa: childYaml('MANIFEST-ORDER').replace('name: child', 'name: aaa'),
+      child: childYaml('MANIFEST-ORDER'),
+    },
+    defaultWorkflow: 'parent',
+  });
+  const manifest = readFileSync(join(sourceDir, 'bundle.yaml'), 'utf8');
+  assert.match(
+    manifest,
+    /workflows:\n {2}parent:.*\n {2}aaa:/u,
+    'fixture must actually list the workflows out of alphabetical order',
+  );
+
+  const installed = await installBundleFixture({ sourceDir });
+  const { registrations } = load(installed.root, emptyGlobalRoot());
+
+  assert.deepEqual(
+    registrations.filter((r) => r.kind === 'workflow').map((r) => r.key),
+    ['parent/aaa', 'parent/child', 'parent/parent'],
+    'workflow registrations come out sorted by qualified name',
+  );
+});
+
 test('version selection: manifest workflow key order does not move the winner or the warnings', async () => {
-  // `installPair` writes `workflows:` as {parent, child}; a bundle that lists
-  // them the other way must produce identical registrations and warning text.
+  // Two installs of the same versions differing only in the order they were
+  // added must produce byte-identical warnings, in the same order, and pick the
+  // same winner.
   const ordered = await installVersions(['0.1.0', '0.1.7']);
   const first = load(ordered.root, emptyGlobalRoot());
 
@@ -1136,9 +1169,37 @@ test('version selection: manifest workflow key order does not move the winner or
 
   assert.equal(selectedMarker(first.registrations), selectedMarker(second.registrations));
   assert.deepEqual(
-    first.registrations.filter((r) => r.kind === 'workflow').map((r) => r.key).sort(),
-    second.registrations.filter((r) => r.kind === 'workflow').map((r) => r.key).sort(),
+    first.registrations.filter((r) => r.kind === 'workflow').map((r) => r.key),
+    second.registrations.filter((r) => r.kind === 'workflow').map((r) => r.key),
+    'registration order itself is stable, not merely the set of keys',
   );
+  assert.deepEqual(first.warnings, second.warnings, 'warning text and order are identical');
+  assert.equal(first.warnings.length, 2, 'both shadowed workflows of 0.1.0 are reported once each');
+});
+
+test('version selection: a project pin whose BYTES came from global still outranks a higher global version', async () => {
+  // `resolveObject` lets a project-indexed coordinate whose object directory is
+  // missing locally fall through to the SAME digest in the global store. Such an
+  // object reports `level: 'global'` for byte provenance, but the PROJECT index
+  // is what names it, so it must still compete — and win — as a project pin.
+  const pinned = await installVersions(['0.1.0']);
+  const pinnedDigest = pinned.digests.get('0.1.0') as string;
+
+  // The global store holds both the pinned digest (so the fallback can find it)
+  // and a strictly higher version that must NOT be selected.
+  const globalStore = await installPair({ name: 'parent', version: '0.1.0', marker: 'V0.1.0' });
+  assert.equal(globalStore.digest, pinnedDigest, 'fixture stores must index identical bytes');
+  await installPair({ name: 'parent', version: '0.9.9', marker: 'V0.9.9', root: globalStore.root });
+
+  removeInstalledObject(pinned.root, pinnedDigest);
+
+  const { registrations } = load(pinned.root, globalStore.root);
+  const winner = registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow');
+
+  assert.ok(winner, 'the unqualified name is registered');
+  assert.equal(winner.bundleDigest, pinnedDigest, 'the project-indexed 0.1.0 pin holds the name');
+  assert.match(winner.def.steps[0]!.body, /V0\.1\.0/);
+  assert.equal(winner.level, 'global', 'byte provenance is still reported honestly');
 });
 
 test('version selection: a project install outranks a HIGHER global version', async () => {
