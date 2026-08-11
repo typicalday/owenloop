@@ -1101,6 +1101,14 @@ the versions involved, because there is no defined precedence to pick by. Call a
 exact `<namespace>/<name>@<version>` coordinate in that case. A single
 non-SemVer version still holds its name — there is nothing to order.
 
+The refusal warning names only the versions that actually competed. A version
+dropped by rule 1 is reported separately as never having competed, since it lost
+on level and was never judged on its version at all. For the same reason,
+precedence warnings say `project-indexed` / `global-indexed`: precedence follows
+the index that named the object, whereas a registration's reported level is the
+store its verified bytes came from, and the two differ under exact-digest
+fallback.
+
 Every version that did not win remains reachable under its digest-scoped key, so
 an already-pinned execution cannot be retargeted, and every exact
 `<namespace>/<name>@<version>` coordinate always resolves to its own object

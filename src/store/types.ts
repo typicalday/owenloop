@@ -400,10 +400,17 @@ export interface VersionSelectionCandidate {
  * An EMPTY candidate list also yields `unorderable`, with an empty `shadowed`.
  * There is no winner to report and nothing to shadow, so a caller that
  * registers `winner` and every `shadowed` entry correctly registers nothing.
+ *
+ * `unorderable.competing` is the subset of `shadowed` that actually reached the
+ * version comparison — i.e. what survived the level filter. Anything in
+ * `shadowed` but not in `competing` was dropped by LEVEL, never judged on its
+ * version, and a diagnostic must not describe it as if it had been. A global
+ * `1.0.0` sitting behind a project-indexed `nightly` is perfectly good SemVer;
+ * it simply never competed.
  */
 export type LatestVersionSelection<T> =
   | { kind: 'selected'; winner: T; shadowed: T[] }
-  | { kind: 'unorderable'; shadowed: T[] };
+  | { kind: 'unorderable'; shadowed: T[]; competing: T[] };
 
 /**
  * Rank two same-level candidates, BEST FIRST.
@@ -453,7 +460,7 @@ function compareVersionCandidates(a: VersionSelectionCandidate, b: VersionSelect
 export function selectLatestVersion<T extends VersionSelectionCandidate>(
   candidates: readonly T[],
 ): LatestVersionSelection<T> {
-  if (candidates.length === 0) return { kind: 'unorderable', shadowed: [] };
+  if (candidates.length === 0) return { kind: 'unorderable', shadowed: [], competing: [] };
 
   const hasProject = candidates.some((candidate) => candidate.level === 'project');
   const competing = hasProject
@@ -468,7 +475,7 @@ export function selectLatestVersion<T extends VersionSelectionCandidate>(
   // Rule 1 sorts every orderable candidate ahead of every unorderable one, so a
   // non-SemVer `best` proves the whole competing group is unorderable.
   if (!isCanonicalSemver(best.version) && ranked.length > 1) {
-    return { kind: 'unorderable', shadowed: [...ranked, ...outranked] };
+    return { kind: 'unorderable', shadowed: [...ranked, ...outranked], competing: ranked };
   }
   return { kind: 'selected', winner: best, shadowed: [...ranked.slice(1), ...outranked] };
 }

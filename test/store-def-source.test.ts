@@ -1125,7 +1125,7 @@ test('version selection: install order, index key order, and digest order do not
   }
 });
 
-test('version selection: registration order is alphabetical, not manifest workflow key order', async () => {
+test('version selection: workflow registration order is sorted by qualified name', async () => {
   // `writeBundleSource` always emits the package's own workflow FIRST, so a
   // package named `parent` carrying an extra workflow named `aaa` produces a
   // manifest whose `workflows:` keys are {parent, aaa} — deliberately not
@@ -1157,7 +1157,7 @@ test('version selection: registration order is alphabetical, not manifest workfl
   );
 });
 
-test('version selection: manifest workflow key order does not move the winner or the warnings', async () => {
+test('version selection: install order moves neither the winner nor the warnings', async () => {
   // Two installs of the same versions differing only in the order they were
   // added must produce byte-identical warnings, in the same order, and pick the
   // same winner.
@@ -1247,6 +1247,32 @@ test('version selection: a shadowed version stays reachable by digest for pinned
   );
   assert.ok(scopedCoordinate, 'a pinned parent can still follow its lock digest');
   assert.equal(scopedCoordinate.bundleDigest, oldDigest);
+});
+
+test('version selection: the refusal never calls a level-outranked SemVer version non-SemVer', async () => {
+  // Project-indexed `nightly` and `edge` refuse the name between themselves. A
+  // global `1.0.0` also exists, but it lost on LEVEL and was never judged on its
+  // version — the warning must not sweep it into "none of these is SemVer",
+  // which would send an operator hunting a defect in a valid version string.
+  const project = await installVersions(['nightly', 'edge']);
+  const global = await installVersions(['1.0.0']);
+
+  const { registrations, warnings } = load(project.root, global.root);
+
+  assert.equal(
+    registrations.find((r) => r.key === 'parent/parent' && r.kind === 'workflow'),
+    undefined,
+    'the unqualified name is still refused',
+  );
+  const refusal = warnings.find((line) => line.includes("'parent/parent' has no selectable"));
+  assert.ok(refusal, 'the refusal is reported');
+  assert.match(refusal, /competing versions \((nightly, edge|edge, nightly)\)/u);
+  assert.doesNotMatch(refusal, /1\.0\.0.*is canonical SemVer/u);
+  assert.match(
+    refusal,
+    /1 further global-indexed version never competed/u,
+    'the outranked SemVer version is reported separately, with the real reason',
+  );
 });
 
 test('version selection: several non-SemVer versions fail closed instead of guessing', async () => {

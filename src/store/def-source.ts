@@ -349,11 +349,21 @@ function selectWorkflowRegistrations(
 		const selection = selectLatestVersion(candidates);
 
 		if (selection.kind === 'unorderable') {
-			const versions = selection.shadowed.map((candidate) => candidate.version).join(', ');
+			// ONLY the competing versions may be described as non-SemVer. Anything
+			// else in `shadowed` lost on level and was never judged on its version —
+			// saying otherwise sends the operator to inspect a version string that is
+			// perfectly valid.
+			const versions = selection.competing.map((candidate) => candidate.version).join(', ');
+			const outrankedCount = selection.shadowed.length - selection.competing.length;
+			const outrankedNote = outrankedCount === 0
+				? ''
+				: ` (${outrankedCount} further global-indexed version${outrankedCount === 1 ? '' : 's'} ` +
+					`never competed, because a project-indexed version takes precedence)`;
 			warn(
-				`warning: workflow '${qualified}' has no selectable version — none of the installed ` +
+				`warning: workflow '${qualified}' has no selectable version — none of the competing ` +
 					`versions (${versions}) is canonical SemVer, so the unqualified name is refused rather ` +
-					`than resolved by install order; call an exact 'namespace/name@version' coordinate instead`,
+					`than resolved by install order${outrankedNote}; call an exact ` +
+					`'namespace/name@version' coordinate instead`,
 			);
 			for (const candidate of selection.shadowed) {
 				registrations.push(candidateRegistration(candidate, shadowedWorkflowKey(candidate)));
@@ -364,11 +374,15 @@ function selectWorkflowRegistrations(
 		registrations.push(candidateRegistration(selection.winner, qualified));
 		for (const candidate of selection.shadowed) {
 			const key = shadowedWorkflowKey(candidate);
+			// `-indexed`, because this sentence is about PRECEDENCE, which keys on the
+			// index that named the object. The registration's own `level` field
+			// reports the different question of which store the bytes came from, and
+			// the two legitimately disagree under exact-digest fallback.
 			warn(
-				`warning: workflow '${qualified}' from ${candidate.level} bundle ${candidate.digest} ` +
-					`(version ${candidate.version}) does not hold that name — ${selection.winner.level} bundle ` +
-					`${selection.winner.digest} (version ${selection.winner.version}) is the selected version; ` +
-					`this copy stays reachable as '${key}'`,
+				`warning: workflow '${qualified}' from ${candidate.level}-indexed bundle ${candidate.digest} ` +
+					`(version ${candidate.version}) does not hold that name — ${selection.winner.level}-indexed ` +
+					`bundle ${selection.winner.digest} (version ${selection.winner.version}) is the selected ` +
+					`version; this copy stays reachable as '${key}'`,
 			);
 			registrations.push(candidateRegistration(candidate, key));
 		}
