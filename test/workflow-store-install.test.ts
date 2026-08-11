@@ -17,7 +17,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -34,6 +34,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   BundleIngestorUnavailableError,
   createBundleIngestor,
@@ -237,6 +238,51 @@ async function assertLockReleased(lockPath: string, message: string): Promise<vo
 }
 
 const SRC: BundleSource = { kind: 'file', path: '/nonexistent/origin.wnlp' }; // origin data only — never opened by the installer
+const renameModeCrashScript = fileURLToPath(new URL('./fixtures/rename-mode-crash.ts', import.meta.url));
+const recoveryMarkerCrashScript = fileURLToPath(new URL('./fixtures/recovery-marker-crash.ts', import.meta.url));
+
+function killAfterRename(source: string, destination: string, persistedMode?: number): void {
+  const child = spawnSync(
+    process.execPath,
+    [
+      '--experimental-strip-types',
+      renameModeCrashScript,
+      source,
+      destination,
+      ...(persistedMode === undefined ? [] : [String(persistedMode)]),
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.equal(child.signal, 'SIGKILL', child.stderr);
+  assert.equal(child.status, null, child.stderr);
+}
+
+function crashAfterMarker(input: {
+  root: string;
+  markerDir: string;
+  stagingId: string;
+  destination: string;
+  operation: 'install' | 'repair';
+  phase: 'created' | 'prior-recorded';
+}): string {
+  const child = spawnSync(
+    process.execPath,
+    [
+      '--experimental-strip-types',
+      recoveryMarkerCrashScript,
+      input.root,
+      input.markerDir,
+      input.stagingId,
+      input.destination,
+      input.operation,
+      input.phase,
+    ],
+    { encoding: 'utf8' },
+  );
+  assert.equal(child.signal, 'SIGKILL', child.stderr);
+  assert.equal(child.status, null, child.stderr);
+  return child.stdout.trim();
+}
 
 async function indexedObjectForRecovery(name: string): Promise<{
   root: string;
@@ -2405,6 +2451,497 @@ test('recovery: a v1 journal at a project path is refused without a ledger (fail
     /requires the GitHub recovery entry point/,
   );
   assert.ok(existsSync(journalPath), 'journal left as evidence');
+});
+
+// ---- pre-journal marker reconciliation ---------------------------------------------
+
+test('recovery: a repair killed after marker creation removes only its owned staging tree and later repairs cleanly', async () => {
+  const fixture = await realRepairFixture('orphan-marker-created');
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const priorInode = statSync(fixture.objectDir).ino;
+  const stagingId = 'stg_orphan_marker_created';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const unrelated = join(fixture.root, '.owenloop-staging', 'unrelated-staging');
+  mkdirSync(unrelated);
+  writeFileSync(join(unrelated, 'keep.txt'), 'unrelated');
+
+  const markerPath = crashAfterMarker({
+    root: fixture.root,
+    markerDir: fixture.markerDir,
+    stagingId,
+    destination: `objects/sha256/${fixture.digest}`,
+    operation: 'repair',
+    phase: 'created',
+  });
+  assert.ok(existsSync(markerPath));
+
+  assert.equal(
+    await recoverWorkflowStore({
+      root: fixture.root,
+      lockPath: fixture.lockPath,
+      journalPath: fixture.journalPath,
+      recoveryMarkerDir: fixture.markerDir,
+    }),
+    'no-journal',
+  );
+  assert.ok(!existsSync(markerPath), 'the proven orphan marker is removed');
+  assert.ok(!existsSync(stagingDir), 'only the marker-owned staging directory is removed');
+  assert.equal(readFileSync(join(unrelated, 'keep.txt'), 'utf8'), 'unrelated');
+  assert.equal(statSync(fixture.objectDir).ino, priorInode, 'the unchanged prior object is never moved');
+  assertExactRestoredPrior({
+    fixture,
+    priorInode,
+    stagingDir,
+    backupDir: `${stagingDir}-old`,
+    undoDir: `${stagingDir}-undo`,
+  } as DurableRepairRollbackFixture);
+
+  assert.equal(
+    await recoverWorkflowStore({
+      root: fixture.root,
+      lockPath: fixture.lockPath,
+      journalPath: fixture.journalPath,
+      recoveryMarkerDir: fixture.markerDir,
+    }),
+    'no-journal',
+    'repeated reconciliation is idempotent',
+  );
+  assert.equal(readFileSync(join(unrelated, 'keep.txt'), 'utf8'), 'unrelated');
+
+  await assertBrokenRecoveryReinstallsAndThenDedupes(fixture);
+  assert.ok(!existsSync(join(fixture.root, '.owenloop-staging')));
+  assert.equal(readdirSync(fixture.markerDir).length, 0);
+});
+
+test('recovery: repair and install markers killed before journal creation reconcile both identity-recording windows', async () => {
+  const fixture = await realRepairFixture('orphan-marker-prior-recorded');
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const repairStagingId = 'stg_orphan_prior_recorded';
+  const repairStaging = stageRealReplacement(fixture, repairStagingId);
+  const repairMarker = crashAfterMarker({
+    root: fixture.root,
+    markerDir: fixture.markerDir,
+    stagingId: repairStagingId,
+    destination: `objects/sha256/${fixture.digest}`,
+    operation: 'repair',
+    phase: 'prior-recorded',
+  });
+
+  assert.equal(
+    await recoverWorkflowStore({
+      root: fixture.root,
+      lockPath: fixture.lockPath,
+      journalPath: fixture.journalPath,
+      recoveryMarkerDir: fixture.markerDir,
+    }),
+    'no-journal',
+  );
+  assert.ok(!existsSync(repairMarker));
+  assert.ok(!existsSync(repairStaging));
+  assert.equal(statSync(fixture.objectDir).mode & 0o7777, 0o555);
+
+  const fresh = tempStore('owenloop-orphan-install-');
+  const digest = 'c'.repeat(64);
+  const installStagingId = 'stg_orphan_fresh_install';
+  const installStaging = join(fresh.root, '.owenloop-staging', installStagingId);
+  mkdirSync(installStaging, { recursive: true });
+  writeFileSync(join(installStaging, 'staged.txt'), 'staged');
+  const installMarker = crashAfterMarker({
+    root: fresh.root,
+    markerDir: fresh.markerDir,
+    stagingId: installStagingId,
+    destination: `objects/sha256/${digest}`,
+    operation: 'install',
+    phase: 'created',
+  });
+
+  assert.equal(
+    await recoverWorkflowStore({
+      root: fresh.root,
+      lockPath: fresh.lockPath,
+      journalPath: fresh.journalPath,
+      recoveryMarkerDir: fresh.markerDir,
+    }),
+    'no-journal',
+  );
+  assert.ok(!existsSync(installMarker));
+  assert.ok(!existsSync(installStaging));
+  assert.ok(!existsSync(join(fresh.root, '.owenloop-staging')));
+});
+
+test('recovery: orphan reconciliation leaves other-root and unattributable marker evidence untouched', async () => {
+  const current = tempStore('owenloop-orphan-current-');
+  const otherRoot = mkdtempSync(join(tmpdir(), 'owenloop-orphan-other-'));
+  const otherStagingId = 'stg_other_root';
+  const otherStaging = join(otherRoot, '.owenloop-staging', otherStagingId);
+  mkdirSync(otherStaging, { recursive: true });
+  const otherMarker = createRecoveryMarker({
+    root: otherRoot,
+    destSegments: ['objects', 'sha256', 'd'.repeat(64)],
+    stagingId: otherStagingId,
+    markerDir: current.markerDir,
+    operation: 'install',
+    replacementDir: otherStaging,
+  });
+
+  const malformedPath = join(current.markerDir, `mkr_${'e'.repeat(32)}.json`);
+  writeFileSync(malformedPath, '{not json');
+  const symlinkTarget = join(current.markerDir, 'symlink-target.json');
+  writeFileSync(symlinkTarget, '{}');
+  const symlinkPath = join(current.markerDir, `mkr_${'f'.repeat(32)}.json`);
+  symlinkSync(symlinkTarget, symlinkPath);
+  const directoryPath = join(current.markerDir, `mkr_${'1'.repeat(32)}.json`);
+  mkdirSync(directoryPath);
+
+  assert.equal(
+    await recoverWorkflowStore({
+      root: current.root,
+      lockPath: current.lockPath,
+      journalPath: current.journalPath,
+      recoveryMarkerDir: current.markerDir,
+    }),
+    'no-journal',
+  );
+  for (const path of [otherMarker.path, otherStaging, malformedPath, symlinkPath, directoryPath]) {
+    assert.ok(existsSync(path), `${path} remains untouched`);
+  }
+});
+
+test('recovery: malformed, contradictory, and identity-mismatched current-root markers refuse stably', async (t) => {
+  await t.test('schema-invalid current-root marker', async () => {
+    const state = tempStore('owenloop-orphan-invalid-');
+    const stagingId = 'stg_invalid_marker';
+    const staging = join(state.root, '.owenloop-staging', stagingId);
+    mkdirSync(staging, { recursive: true });
+    const marker = createRecoveryMarker({
+      root: state.root,
+      destSegments: ['objects', 'sha256', '2'.repeat(64)],
+      stagingId,
+      markerDir: state.markerDir,
+      operation: 'install',
+      replacementDir: staging,
+    });
+    writeFileSync(marker.path, `${JSON.stringify({ ...marker.record, stagingId: '../escape' }, null, 2)}\n`);
+    const before = snapshotPaths([marker.path, staging]);
+    const recover = () => recoverWorkflowStore({
+      root: state.root,
+      lockPath: state.lockPath,
+      journalPath: state.journalPath,
+      recoveryMarkerDir: state.markerDir,
+    });
+    await assert.rejects(recover(), /attributed to the current root is invalid.*stagingId.*contains a .*segment/s);
+    assert.deepEqual(snapshotPaths([marker.path, staging]), before);
+    await assert.rejects(recover(), /attributed to the current root is invalid.*stagingId.*contains a .*segment/s);
+    assert.deepEqual(snapshotPaths([marker.path, staging]), before);
+  });
+
+  await t.test('contradictory install destination', async () => {
+    const state = tempStore('owenloop-orphan-contradictory-');
+    const digest = '3'.repeat(64);
+    const stagingId = 'stg_contradictory_marker';
+    const staging = join(state.root, '.owenloop-staging', stagingId);
+    const destination = join(state.root, 'objects', 'sha256', digest);
+    mkdirSync(staging, { recursive: true });
+    mkdirSync(destination, { recursive: true });
+    const marker = createRecoveryMarker({
+      root: state.root,
+      destSegments: ['objects', 'sha256', digest],
+      stagingId,
+      markerDir: state.markerDir,
+      operation: 'install',
+      replacementDir: staging,
+    });
+    const before = snapshotPaths([marker.path, staging, destination]);
+    await assert.rejects(
+      recoverWorkflowStore({
+	root: state.root,
+	lockPath: state.lockPath,
+	journalPath: state.journalPath,
+	recoveryMarkerDir: state.markerDir,
+      }),
+      /install recovery marker.*has a destination without a journal/s,
+    );
+    assert.deepEqual(snapshotPaths([marker.path, staging, destination]), before);
+  });
+
+  await t.test('replacement and root identity mismatches', async () => {
+    const state = tempStore('owenloop-orphan-identity-');
+    const digest = '4'.repeat(64);
+    const stagingId = 'stg_identity_marker';
+    const staging = join(state.root, '.owenloop-staging', stagingId);
+    const destination = join(state.root, 'objects', 'sha256', digest);
+    mkdirSync(staging, { recursive: true });
+    mkdirSync(destination, { recursive: true });
+    const marker = createRecoveryMarker({
+      root: state.root,
+      destSegments: ['objects', 'sha256', digest],
+      stagingId,
+      markerDir: state.markerDir,
+      operation: 'repair',
+      replacementDir: staging,
+    });
+    recordRecoveryMarkerPriorIdentity(marker, destination);
+    rmRecursiveForce(staging);
+    mkdirSync(staging);
+    await assert.rejects(
+      recoverWorkflowStore({
+	root: state.root,
+	lockPath: state.lockPath,
+	journalPath: state.journalPath,
+	recoveryMarkerDir: state.markerDir,
+      }),
+      /staging directory does not belong to the transaction/,
+    );
+    assert.ok(existsSync(marker.path));
+    assert.ok(existsSync(staging));
+
+    const raw = JSON.parse(readFileSync(marker.path, 'utf8')) as Record<string, unknown>;
+    writeFileSync(marker.path, `${JSON.stringify({
+      ...raw,
+      rootIdentity: { dev: '0', ino: '0', mode: 0o755 },
+    }, null, 2)}\n`);
+    await assert.rejects(
+      recoverWorkflowStore({
+	root: state.root,
+	lockPath: state.lockPath,
+	journalPath: state.journalPath,
+	recoveryMarkerDir: state.markerDir,
+      }),
+      /does not belong to the current store-root inode/,
+    );
+    assert.ok(existsSync(marker.path));
+  });
+});
+
+test('recovery: orphan reconciliation waits for the same-root install lock', async () => {
+  const state = tempStore('owenloop-orphan-lock-');
+  const stagingId = 'stg_orphan_lock';
+  const staging = join(state.root, '.owenloop-staging', stagingId);
+  mkdirSync(staging, { recursive: true });
+  const marker = createRecoveryMarker({
+    root: state.root,
+    destSegments: ['objects', 'sha256', '5'.repeat(64)],
+    stagingId,
+    markerDir: state.markerDir,
+    operation: 'install',
+    replacementDir: staging,
+  });
+
+  const held = await acquireFileLock(state.lockPath, { waitMs: 1_000, pollMs: 5 });
+  const pending = recoverWorkflowStore({
+    root: state.root,
+    lockPath: state.lockPath,
+    journalPath: state.journalPath,
+    recoveryMarkerDir: state.markerDir,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.ok(existsSync(marker.path), 'the blocked recovery has not touched the marker');
+  assert.ok(existsSync(staging), 'the blocked recovery has not touched staging');
+  releaseFileLock(held);
+
+  assert.equal(await pending, 'no-journal');
+  assert.ok(!existsSync(marker.path));
+  assert.ok(!existsSync(staging));
+});
+
+// ---- process-crash directory-mode recovery -----------------------------------------
+
+test('recovery: process death after destination-to-backup rename restores exact prior modes, then repairs and dedupes', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX mode semantics');
+  const fixture = await realRepairFixture('rename-crash-backup');
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const priorInode = statSync(fixture.objectDir).ino;
+  const stagingId = 'stg_rename_crash_backup';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'applying',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
+  });
+
+  killAfterRename(fixture.objectDir, backupDir);
+  assert.equal(statSync(backupDir).mode & 0o7777, 0o755, 'the killed helper leaves its temporary mode');
+  assert.equal(
+    await recoverWorkflowStore({
+      root: fixture.root,
+      lockPath: fixture.lockPath,
+      journalPath: fixture.journalPath,
+      recoveryMarkerDir: fixture.markerDir,
+    }),
+    'rolled-back',
+  );
+  const recovered = {
+    fixture,
+    priorInode,
+    stagingDir,
+    backupDir,
+    undoDir: `${stagingDir}-undo`,
+    marker,
+  } as DurableRepairRollbackFixture;
+  assertExactRestoredPrior(recovered);
+  assertRollbackDebrisCleared(recovered);
+  assert.equal(
+    await recoverWorkflowStore({
+      root: fixture.root,
+      lockPath: fixture.lockPath,
+      journalPath: fixture.journalPath,
+      recoveryMarkerDir: fixture.markerDir,
+    }),
+    'no-journal',
+  );
+  await assertBrokenRecoveryReinstallsAndThenDedupes(fixture);
+});
+
+test('recovery: process death after staging-to-destination rename rolls repair forward with exact hardened modes', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX mode semantics');
+  const fixture = await realRepairFixture('rename-crash-replacement');
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const stagingId = 'stg_rename_crash_replacement';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'applying',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
+  });
+  renameDirRestoringWrite(fixture.objectDir, backupDir, marker.record.priorIdentity?.mode);
+  killAfterRename(stagingDir, fixture.objectDir, marker.record.replacementIdentity?.mode);
+
+  assert.equal(
+    await recoverWorkflowStore({
+      root: fixture.root,
+      lockPath: fixture.lockPath,
+      journalPath: fixture.journalPath,
+      recoveryMarkerDir: fixture.markerDir,
+    }),
+    'rolled-forward',
+  );
+  assertHardenedRepairTree(fixture);
+  assert.ok(!existsSync(backupDir));
+  assert.ok(!existsSync(marker.path));
+  assert.ok(!existsSync(fixture.journalPath));
+  await assertHealthyReinstallDedupesWithoutReplacement(fixture);
+});
+
+test('recovery: process death after each rollback rename restores exact root and nested modes', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX mode semantics');
+
+  await t.test('staging to undo before phase write', async () => {
+    const fixture = await realRepairFixture('rename-crash-staging-undo');
+    chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+    const priorInode = statSync(fixture.objectDir).ino;
+    const stagingId = 'stg_rename_crash_staging_undo';
+    const stagingDir = stageRealReplacement(fixture, stagingId);
+    const undoDir = `${stagingDir}-undo`;
+    const marker = createCompleteRepairMarker(fixture, stagingId, stagingDir);
+    const rollbackReplacementMode = marker.record.replacementIdentity?.mode;
+    writeAddJournal(fixture.journalPath, {
+      version: 2,
+      phase: 'rollback-started',
+      operation: 'repair',
+      destSegments: ['objects', 'sha256', fixture.digest],
+      stagingId,
+      hadDest: true,
+      root: fixture.root,
+      metadataHash: fixture.metadataHash,
+      recoveryMarkerId: marker.id,
+      rollbackReplacementMode,
+    });
+    killAfterRename(stagingDir, undoDir, rollbackReplacementMode);
+
+    assert.equal(
+      await recoverWorkflowStore({
+	root: fixture.root,
+	lockPath: fixture.lockPath,
+	journalPath: fixture.journalPath,
+	recoveryMarkerDir: fixture.markerDir,
+      }),
+      'rolled-back',
+    );
+    const recovered = {
+      fixture,
+      priorInode,
+      stagingDir,
+      backupDir: `${stagingDir}-old`,
+      undoDir,
+      marker,
+    } as DurableRepairRollbackFixture;
+    assertExactRestoredPrior(recovered);
+    assertRollbackDebrisCleared(recovered);
+  });
+
+  await t.test('replacement destination to undo before phase write', async () => {
+    const input = await durableRepairRollbackFixture('rename-crash-destination-undo');
+    const rollbackReplacementMode = statSync(input.fixture.objectDir).mode & 0o7777;
+    writeAddJournal(input.fixture.journalPath, {
+      ...input.journalBase,
+      phase: 'rollback-started',
+      rollbackReplacementMode,
+    });
+    killAfterRename(input.fixture.objectDir, input.undoDir, rollbackReplacementMode);
+    assert.equal(statSync(input.undoDir).mode & 0o7777, 0o755);
+
+    assert.equal(
+      await recoverWorkflowStore({
+	root: input.fixture.root,
+	lockPath: input.fixture.lockPath,
+	journalPath: input.fixture.journalPath,
+	recoveryMarkerDir: input.fixture.markerDir,
+      }),
+      'rolled-back',
+    );
+    assertExactRestoredPrior(input);
+    assertRollbackDebrisCleared(input);
+  });
+
+  await t.test('retained backup to destination before phase write', async () => {
+    const input = await durableRepairRollbackFixture('rename-crash-backup-restore');
+    parkRepairReplacement(input);
+    const rollbackReplacementMode = statSync(input.undoDir).mode & 0o7777;
+    writeAddJournal(input.fixture.journalPath, {
+      ...input.journalBase,
+      phase: 'rollback-replacement-parked',
+      rollbackReplacementMode,
+    });
+    killAfterRename(input.backupDir, input.fixture.objectDir, input.marker.record.priorIdentity?.mode);
+    assert.equal(statSync(input.fixture.objectDir).mode & 0o7777, 0o755);
+
+    assert.equal(
+      await recoverWorkflowStore({
+	root: input.fixture.root,
+	lockPath: input.fixture.lockPath,
+	journalPath: input.fixture.journalPath,
+	recoveryMarkerDir: input.fixture.markerDir,
+      }),
+      'rolled-back',
+    );
+    assertExactRestoredPrior(input);
+    assertRollbackDebrisCleared(input);
+    assert.equal(
+      await recoverWorkflowStore({
+	root: input.fixture.root,
+	lockPath: input.fixture.lockPath,
+	journalPath: input.fixture.journalPath,
+	recoveryMarkerDir: input.fixture.markerDir,
+      }),
+      'no-journal',
+    );
+  });
 });
 
 // ---- project installs share the project add lock/recovery ordering ------------------

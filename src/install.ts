@@ -472,20 +472,25 @@ export function finalizeInstallCommit(handle: InstallCommitHandle): void {
 }
 
 /**
- * Rename a directory without changing its durable mode. Hardened object roots
- * are 0o555; some filesystems or test doubles require owner-write permission
- * while moving them. Record the exact source mode, add only owner-write for the
- * rename, then restore the recorded mode at the destination. A failed rename
- * restores the recorded mode at the source before the original error escapes.
+ * Rename a real directory while preserving its exact 0o7777 root mode. macOS
+ * requires owner-write on a non-writable directory for rename even though the
+ * source and destination parents are writable. The optional `persistedMode`
+ * comes from durable transaction identity evidence written before the first
+ * chmod; recovery passes that value instead of inferring an original mode from
+ * a path that may still carry the temporary owner-write bit after a crash.
  */
-export function renameDirRestoringWrite(src: string, dst: string): void {
+export function renameDirRestoringWrite(src: string, dst: string, persistedMode?: number): void {
   const sourceStat = lstatSync(src);
   if (sourceStat.isSymbolicLink() || !sourceStat.isDirectory()) {
     throw new Error(`refusing to rename '${src}': source is not a real directory`);
   }
-  const originalMode = sourceStat.mode & 0o7777;
+  const sourceMode = sourceStat.mode & 0o7777;
+  const originalMode = persistedMode ?? sourceMode;
+  if (!Number.isInteger(originalMode) || originalMode < 0 || originalMode > 0o7777) {
+    throw new Error(`refusing to rename '${src}': persisted mode is invalid`);
+  }
   const temporaryMode = originalMode | 0o200;
-  if (temporaryMode !== originalMode) chmodSync(src, temporaryMode);
+  if (sourceMode !== temporaryMode) chmodSync(src, temporaryMode);
   try {
     renameSync(src, dst);
   } catch (renameError) {
@@ -502,24 +507,22 @@ export function renameDirRestoringWrite(src: string, dst: string): void {
     throw renameError;
   }
 
-  if (temporaryMode !== originalMode) {
+  if (temporaryMode === originalMode) return;
+  try {
+    chmodSync(dst, originalMode);
+  } catch (restoreError) {
+    // Do not leave a moved object writable. Best-effort move it back and restore
+    // the persisted source mode; preserve both faults if that rollback fails.
     try {
-      chmodSync(dst, originalMode);
-    } catch (restoreError) {
-      // Do not leave a moved object writable. Best-effort move it back and
-      // restore the source mode; if either recovery step fails, report every
-      // fault so the caller preserves the transaction journal and backup.
-      try {
-	renameSync(dst, src);
-	chmodSync(src, originalMode);
-      } catch (rollbackError) {
-	throw new AggregateError(
-	  [restoreError, rollbackError],
-	  `renamed '${src}' to '${dst}' but could not restore mode ${originalMode.toString(8)} or move it back`,
-	);
-      }
-      throw restoreError;
+      renameSync(dst, src);
+      chmodSync(src, originalMode);
+    } catch (rollbackError) {
+      throw new AggregateError(
+	[restoreError, rollbackError],
+	`renamed '${src}' to '${dst}' but could not restore mode ${originalMode.toString(8)} or move it back`,
+      );
     }
+    throw restoreError;
   }
 }
 
@@ -737,6 +740,8 @@ export interface InstallJournalV2 {
   startedAt?: number;
   /** External transaction marker for a fresh install or identity-backed repair. */
   recoveryMarkerId?: string;
+  /** Exact replacement-root mode captured durably before the first rollback rename. */
+  rollbackReplacementMode?: number;
 }
 
 /** A journal of either version, as read from disk. */
@@ -891,6 +896,17 @@ export function validateInstallJournalV2(parsed: unknown, path: string): Install
     if (markerViolation) return fail(`'recoveryMarkerId' ${markerViolation}`);
   }
   if (
+    parsed.rollbackReplacementMode !== undefined &&
+    (
+      typeof parsed.rollbackReplacementMode !== 'number' ||
+      !Number.isInteger(parsed.rollbackReplacementMode) ||
+      parsed.rollbackReplacementMode < 0 ||
+      parsed.rollbackReplacementMode > 0o7777
+    )
+  ) {
+    return fail("'rollbackReplacementMode' is not an integer 0..4095");
+  }
+  if (
     typeof parsed.phase === 'string' &&
     parsed.phase.startsWith('rollback-') &&
     parsed.recoveryMarkerId === undefined
@@ -931,11 +947,15 @@ export interface RecoveryDirectoryIdentity {
   /** Decimal strings avoid platform-size loss when filesystem ids exceed 32 bits. */
   dev: string;
   ino: string;
+  /** Exact 0o7777 mode, persisted before any transaction rename chmod. */
+  mode?: number;
 }
 
 export interface RecoveryMarkerRecord {
   version: 1;
   root: string;
+  /** Exact store-root identity; absent only on markers written by older releases. */
+  rootIdentity?: RecoveryDirectoryIdentity;
   destSegments: string[];
   stagingId: string;
   hadDest: boolean;
@@ -978,6 +998,12 @@ function validateRecoveryDirectoryIdentity(
   if (typeof value.ino !== 'string' || !/^\d+$/.test(value.ino)) {
     return fail(`'${field}.ino' is not a decimal string`);
   }
+  if (
+    value.mode !== undefined &&
+    (typeof value.mode !== 'number' || !Number.isInteger(value.mode) || value.mode < 0 || value.mode > 0o7777)
+  ) {
+    return fail(`'${field}.mode' is not an integer 0..4095`);
+  }
   return value as unknown as RecoveryDirectoryIdentity;
 }
 
@@ -986,7 +1012,7 @@ function recoveryDirectoryIdentity(path: string, label: string): RecoveryDirecto
   if (st.isSymbolicLink() || !st.isDirectory()) {
     throw new Error(`cannot record ${label} identity at '${path}': path is not a real directory`);
   }
-  return { dev: String(st.dev), ino: String(st.ino) };
+  return { dev: String(st.dev), ino: String(st.ino), mode: Number(st.mode & 0o7777n) };
 }
 
 function validateRecoveryMarker(parsed: unknown, path: string): RecoveryMarkerRecord {
@@ -996,6 +1022,9 @@ function validateRecoveryMarker(parsed: unknown, path: string): RecoveryMarkerRe
   if (!isPlainObject(parsed)) return fail('top-level value is not an object');
   if (parsed.version !== 1) return fail('unsupported marker version');
   if (typeof parsed.root !== 'string' || parsed.root === '') return fail("'root' is not a non-empty string");
+  if (parsed.rootIdentity !== undefined) {
+    validateRecoveryDirectoryIdentity(parsed.rootIdentity, 'rootIdentity', fail);
+  }
   if (!Array.isArray(parsed.destSegments) || parsed.destSegments.length === 0) {
     return fail("'destSegments' is not a non-empty array");
   }
@@ -1057,6 +1086,7 @@ export function createRecoveryMarker(input: {
   const record: RecoveryMarkerRecord = {
     version: 1,
     root: resolve(input.root),
+    rootIdentity: recoveryDirectoryIdentity(input.root, 'store root'),
     destSegments: [...input.destSegments],
     stagingId: input.stagingId,
     hadDest: input.operation === 'repair',
@@ -1192,6 +1222,238 @@ function recoveryRefusal(journalPath: string, detail: string): Error {
   );
 }
 
+function sameRecoveryDirectoryIdentity(
+  left: RecoveryDirectoryIdentity,
+  right: RecoveryDirectoryIdentity,
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function currentRecoveryRootIdentity(defsDir: string, journalPath: string): RecoveryDirectoryIdentity {
+  try {
+    return recoveryDirectoryIdentity(defsDir, 'current store root');
+  } catch (error) {
+    throw recoveryRefusal(journalPath, (error as Error).message);
+  }
+}
+
+function verifyMarkerRootIdentityWhenPresent(
+  marker: RecoveryMarkerRecord,
+  defsDir: string,
+  journalPath: string,
+  markerPath: string,
+): void {
+  if (marker.rootIdentity === undefined) return;
+  const actual = currentRecoveryRootIdentity(defsDir, journalPath);
+  if (!sameRecoveryDirectoryIdentity(marker.rootIdentity, actual)) {
+    throw recoveryRefusal(
+      journalPath,
+      `external recovery marker '${markerPath}' does not belong to the current store-root inode ` +
+	`(expected dev ${marker.rootIdentity.dev} inode ${marker.rootIdentity.ino}, ` +
+	`got dev ${actual.dev} inode ${actual.ino})`,
+    );
+  }
+}
+
+function requireMarkerRootIdentity(
+  marker: RecoveryMarkerRecord,
+  defsDir: string,
+  journalPath: string,
+  markerPath: string,
+): void {
+  if (marker.rootIdentity === undefined) {
+    throw recoveryRefusal(
+      journalPath,
+      `external recovery marker '${markerPath}' for the current root lacks store-root identity evidence`,
+    );
+  }
+  verifyMarkerRootIdentityWhenPresent(marker, defsDir, journalPath, markerPath);
+}
+
+interface OrphanRecoveryMarkerPlan {
+  id: string;
+  path: string;
+  stagingDir: string;
+  stagingIdentity?: RecoveryDirectoryIdentity;
+}
+
+/**
+ * Reconcile markers created before their journal write. Callers hold the
+ * per-store install lock, and this function runs only after proving the current
+ * journal is absent, so no active same-root transaction can own one of these
+ * markers. A marker is removable only when its resolved root plus exact root
+ * inode identify this store and its derived transaction topology still matches
+ * the pre-journal state. Unattributable evidence (other roots, malformed JSON,
+ * unknown filenames, symlinks, and non-files) is preserved untouched.
+ */
+function reconcileOrphanRecoveryMarkers(args: RecoverInterruptedInstallArgs): void {
+  const markerDir = args.recoveryMarkerDir;
+  if (markerDir === undefined) return;
+
+  let markerDirState: 'dir' | 'absent';
+  try {
+    markerDirState = probeDirectoryPath(markerDir, 'recovery marker directory', dirname(markerDir));
+  } catch (error) {
+    throw recoveryRefusal(args.journalPath, (error as Error).message);
+  }
+  if (markerDirState === 'absent') return;
+
+  const root = resolve(args.defsDir);
+  const plans: OrphanRecoveryMarkerPlan[] = [];
+  const entries = readdirSync(markerDir, { withFileTypes: true })
+    .sort((left, right) => Buffer.compare(Buffer.from(left.name, 'utf8'), Buffer.from(right.name, 'utf8')));
+
+  for (const entry of entries) {
+    const match = /^(mkr_[0-9a-f]{32})\.json$/.exec(entry.name);
+    if (match === null || !entry.isFile()) continue;
+    const id = match[1];
+    if (id === undefined) continue;
+    const path = join(markerDir, entry.name);
+
+    let parsed: unknown;
+    try {
+      const raw = readRegularFileNoFollow(path, 'recovery marker');
+      if (raw === undefined) continue;
+      parsed = JSON.parse(Buffer.from(raw).toString('utf8'));
+    } catch {
+      // Without a validated root field, this evidence cannot safely be assigned
+      // to the current root. Preserve it for manual inspection without blocking
+      // unrelated stores that share the external marker directory.
+      continue;
+    }
+    if (!isPlainObject(parsed) || typeof parsed.root !== 'string' || resolve(parsed.root) !== root) {
+      continue;
+    }
+
+    let marker: RecoveryMarkerRecord;
+    try {
+      marker = validateRecoveryMarker(parsed, path);
+    } catch (error) {
+      throw recoveryRefusal(
+	args.journalPath,
+	`external recovery marker '${path}' attributed to the current root is invalid: ${(error as Error).message}`,
+      );
+    }
+    requireMarkerRootIdentity(marker, args.defsDir, args.journalPath, path);
+    if (
+      marker.operation === undefined ||
+      marker.replacementIdentity === undefined
+    ) {
+      throw recoveryRefusal(
+	args.journalPath,
+	`external recovery marker '${path}' lacks complete pre-journal transaction identity evidence`,
+      );
+    }
+
+    const stagingRoot = join(args.defsDir, STAGING_DIRNAME);
+    const stagingDir = join(stagingRoot, marker.stagingId);
+    const backupDir = `${stagingDir}-old`;
+    const undoDir = `${stagingDir}-undo`;
+    const destination = join(args.defsDir, ...marker.destSegments);
+    for (const candidate of [stagingRoot, stagingDir, backupDir, undoDir, destination]) {
+      assertUnderRoot(candidate, args.defsDir, args.journalPath);
+    }
+
+    const state = {
+      staging: probeRecoveryDir(stagingDir, args.journalPath, 'orphan marker staging dir', args.defsDir),
+      backup: probeRecoveryDir(backupDir, args.journalPath, 'orphan marker backup dir', args.defsDir),
+      undo: probeRecoveryDir(undoDir, args.journalPath, 'orphan marker undo dir', args.defsDir),
+      destination: probeRecoveryDir(destination, args.journalPath, 'orphan marker destination', args.defsDir),
+    };
+    if (state.backup !== 'absent' || state.undo !== 'absent') {
+      throw recoveryRefusal(
+	args.journalPath,
+	`external recovery marker '${path}' has destructive transaction residue without a journal ` +
+	  `(backup=${state.backup}, undo=${state.undo})`,
+      );
+    }
+
+    let stagingIdentity: RecoveryDirectoryIdentity | undefined;
+    if (state.staging === 'dir') {
+      try {
+	stagingIdentity = recoveryDirectoryIdentity(stagingDir, 'orphan marker staging directory');
+      } catch (error) {
+	throw recoveryRefusal(args.journalPath, (error as Error).message);
+      }
+      if (!sameRecoveryDirectoryIdentity(stagingIdentity, marker.replacementIdentity)) {
+	throw recoveryRefusal(
+	  args.journalPath,
+	  `external recovery marker '${path}' staging directory does not belong to the transaction ` +
+	    `(expected dev ${marker.replacementIdentity.dev} inode ${marker.replacementIdentity.ino}, ` +
+	    `got dev ${stagingIdentity.dev} inode ${stagingIdentity.ino})`,
+	);
+      }
+    }
+
+    if (marker.operation === 'install') {
+      if (state.destination !== 'absent') {
+	throw recoveryRefusal(
+	  args.journalPath,
+	  `external install recovery marker '${path}' has a destination without a journal; ` +
+	    `refusing to remove either path`,
+	);
+      }
+    } else {
+      if (state.destination !== 'dir') {
+	throw recoveryRefusal(
+	  args.journalPath,
+	  `external repair recovery marker '${path}' has no unchanged prior destination`,
+	);
+      }
+      if (marker.priorIdentity !== undefined) {
+	let actualPrior: RecoveryDirectoryIdentity;
+	try {
+	  actualPrior = recoveryDirectoryIdentity(destination, 'orphan marker prior destination');
+	} catch (error) {
+	  throw recoveryRefusal(args.journalPath, (error as Error).message);
+	}
+	if (!sameRecoveryDirectoryIdentity(actualPrior, marker.priorIdentity)) {
+	  throw recoveryRefusal(
+	    args.journalPath,
+	    `external recovery marker '${path}' prior destination does not belong to the transaction ` +
+	      `(expected dev ${marker.priorIdentity.dev} inode ${marker.priorIdentity.ino}, ` +
+	      `got dev ${actualPrior.dev} inode ${actualPrior.ino})`,
+	  );
+	}
+      }
+    }
+
+    if (plans.some((plan) => plan.stagingDir === stagingDir)) {
+      throw recoveryRefusal(
+	args.journalPath,
+	`multiple external recovery markers claim staging directory '${stagingDir}'`,
+      );
+    }
+    plans.push({ id, path, stagingDir, stagingIdentity });
+  }
+
+  // Validation above is all-or-nothing: contradictory same-root evidence refuses
+  // before any cleanup. Each mutation below is exact and replayable. If a crash
+  // lands after staging removal but before marker removal, the next pass sees an
+  // absent staging path and completes marker cleanup.
+  for (const plan of plans) {
+    if (plan.stagingIdentity !== undefined) {
+      const current = recoveryDirectoryIdentity(plan.stagingDir, 'orphan marker staging directory');
+      if (!sameRecoveryDirectoryIdentity(current, plan.stagingIdentity)) {
+	throw recoveryRefusal(
+	  args.journalPath,
+	  `orphan marker staging directory '${plan.stagingDir}' changed before cleanup`,
+	);
+      }
+      rmRecursiveForce(plan.stagingDir);
+    }
+    removeRecoveryMarker({ id: plan.id, markerDir });
+  }
+
+  const stagingRoot = join(args.defsDir, STAGING_DIRNAME);
+  if (
+    probeRecoveryDir(stagingRoot, args.journalPath, 'staging root', args.defsDir) === 'dir' &&
+    readdirSync(stagingRoot).length === 0
+  ) {
+    rmdirSync(stagingRoot);
+  }
+}
+
 /**
  * `lstat`-probe a recovery path: `'dir'` if it is a real directory, `'absent'`
  * if it does not exist. Fail-closed on anything else — a symlink (SEC-3: a
@@ -1271,8 +1533,10 @@ export type RecoveryOutcome = 'no-journal' | 'rolled-forward' | 'rolled-back';
  * Bring an interrupted install back to a consistent (tree ⇔ metadata) state,
  * then remove the journal. Called by install dispatchers under the root's
  * install lock, BEFORE the stale-staging cleanup (the backups a rollback needs
- * live under the staging root). No journal ⇒ returns immediately (happy path
- * unchanged). Reads BOTH journal versions and dispatches on `version`.
+ * live under the staging root). With no journal, recovery first reconciles only
+ * same-root external markers whose inode evidence and untouched pre-journal
+ * topology prove a crash between marker creation and the journal write, then
+ * returns `no-journal`. Reads BOTH journal versions and dispatches on `version`.
  *
  * Ordinary v1/v2 transactions use the durable metadata write as the commit
  * point. Same-digest v2 repair cannot: the index may already match before the
@@ -1320,7 +1584,10 @@ export type RecoveryOutcome = 'no-journal' | 'rolled-forward' | 'rolled-back';
 export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): RecoveryOutcome {
   const { defsDir, journalPath, lockfilePath } = args;
   const journal = readAddJournal(journalPath);
-  if (journal === null) return 'no-journal'; // no interrupted install — happy path, unchanged.
+  if (journal === null) {
+    reconcileOrphanRecoveryMarkers(args);
+    return 'no-journal';
+  }
 
   // An interrupted install in a DIFFERENT root: recovering "here" would act on
   // paths this invocation was never pointed at, and trusting the recorded
@@ -1405,6 +1672,14 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     } catch (error) {
       throw recoveryRefusal(journalPath, `external recovery marker could not be read: ${(error as Error).message}`);
     }
+    if (marker !== null) {
+      verifyMarkerRootIdentityWhenPresent(
+	marker,
+	defsDir,
+	journalPath,
+	markerFilePath(args.recoveryMarkerDir, journal.recoveryMarkerId),
+      );
+    }
     const markerMatches =
       marker !== null &&
       resolve(marker.root) === resolve(defsDir) &&
@@ -1462,6 +1737,30 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	journalPath,
 	`${label} '${path}' does not belong to this transaction ` +
 	  `(expected dev ${expected.dev} inode ${expected.ino}, got dev ${actual.dev} inode ${actual.ino})`,
+      );
+    }
+  };
+  const restoreIdentityMode = (
+    path: string,
+    expected: RecoveryDirectoryIdentity,
+    label: string,
+  ): void => {
+    if (expected.mode === undefined) return;
+    let actual: RecoveryDirectoryIdentity;
+    try {
+      actual = recoveryDirectoryIdentity(path, label);
+      if (actual.mode !== expected.mode) chmodSync(path, expected.mode);
+      actual = recoveryDirectoryIdentity(path, label);
+    } catch (error) {
+      throw recoveryRefusal(
+	journalPath,
+	`could not restore exact ${label} mode ${expected.mode.toString(8)} at '${path}': ${(error as Error).message}`,
+      );
+    }
+    if (actual.mode !== expected.mode) {
+      throw recoveryRefusal(
+	journalPath,
+	`could not restore exact ${label} mode ${expected.mode.toString(8)} at '${path}'`,
       );
     }
   };
@@ -1770,13 +2069,25 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     }
 
     // A replacement phase may enter rollback only after the complete state table
-    // and marker identities prove the exact safe transition. The durable rollback
-    // machine performs every rename and all later cleanup.
-    writeAddJournal(journalPath, { ...journal, phase: 'rollback-started', operation: 'repair' });
-    return resumeDurableV2RepairRollback(
-      journal as InstallJournalV2 & { operation: 'repair' },
-      'rollback-started',
-    );
+    // and marker identities prove the exact safe transition. Persist the exact
+    // replacement-root mode before the first rollback rename so recovery never
+    // infers that mode from a path left owner-writable by a killed rename.
+    const rollbackReplacementMode = marker.replacementIdentity.mode ?? (() => {
+      const replacementPath = action === 'begin-rollback' ? stagingDir : undoDir;
+      try {
+	return recoveryDirectoryIdentity(replacementPath, 'rollback replacement').mode;
+      } catch (error) {
+	throw recoveryRefusal(journalPath, (error as Error).message);
+      }
+    })();
+    const rollbackJournal: InstallJournalV2 & { operation: 'repair' } = {
+      ...journal,
+      phase: 'rollback-started',
+      operation: 'repair',
+      rollbackReplacementMode,
+    };
+    writeAddJournal(journalPath, rollbackJournal);
+    return resumeDurableV2RepairRollback(rollbackJournal, 'rollback-started');
   };
 
   function resumeDurableV2RepairRollback(
@@ -1786,6 +2097,12 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     const marker = requireRepairMarker();
     const replacementIdentity = marker.replacementIdentity;
     const priorIdentity = marker.priorIdentity;
+    const rollbackReplacementIdentity: RecoveryDirectoryIdentity = {
+      ...replacementIdentity,
+      ...(repairJournal.rollbackReplacementMode === undefined
+	? {}
+	: { mode: repairJournal.rollbackReplacementMode }),
+    };
     let phase = initialPhase;
 
     const states = (): {
@@ -1823,7 +2140,8 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	) {
 	  requireIdentity(stagingDir, replacementIdentity, 'staged replacement');
 	  requireIdentity(dest, priorIdentity, 'unchanged prior destination');
-	  renameDirRestoringWrite(stagingDir, undoDir);
+	  restoreIdentityMode(dest, priorIdentity, 'unchanged prior destination');
+	  renameDirRestoringWrite(stagingDir, undoDir, rollbackReplacementIdentity.mode);
 	  writePhase('rollback-replacement-parked');
 	  continue;
 	}
@@ -1835,7 +2153,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	) {
 	  requireIdentity(stagingDir, replacementIdentity, 'staged replacement');
 	  requireIdentity(backupDir, priorIdentity, 'retained prior object');
-	  renameDirRestoringWrite(stagingDir, undoDir);
+	  renameDirRestoringWrite(stagingDir, undoDir, rollbackReplacementIdentity.mode);
 	  writePhase('rollback-replacement-parked');
 	  continue;
 	}
@@ -1847,7 +2165,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	) {
 	  requireIdentity(dest, replacementIdentity, 'replacement destination');
 	  requireIdentity(backupDir, priorIdentity, 'retained prior object');
-	  renameDirRestoringWrite(dest, undoDir);
+	  renameDirRestoringWrite(dest, undoDir, rollbackReplacementIdentity.mode);
 	  writePhase('rollback-replacement-parked');
 	  continue;
 	}
@@ -1859,6 +2177,20 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	) {
 	  requireIdentity(undoDir, replacementIdentity, 'parked replacement');
 	  requireIdentity(backupDir, priorIdentity, 'retained prior object');
+	  restoreIdentityMode(undoDir, rollbackReplacementIdentity, 'parked replacement');
+	  writePhase('rollback-replacement-parked');
+	  continue;
+	}
+	if (
+	  state.staging === 'absent' &&
+	  state.destination === 'dir' &&
+	  state.backup === 'absent' &&
+	  state.undo === 'dir'
+	) {
+	  requireIdentity(undoDir, replacementIdentity, 'parked replacement');
+	  requireIdentity(dest, priorIdentity, 'unchanged prior destination');
+	  restoreIdentityMode(undoDir, rollbackReplacementIdentity, 'parked replacement');
+	  restoreIdentityMode(dest, priorIdentity, 'unchanged prior destination');
 	  writePhase('rollback-replacement-parked');
 	  continue;
 	}
@@ -1871,13 +2203,16 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	if (state.destination === 'absent' && state.backup === 'dir' && state.undo === 'dir') {
 	  requireIdentity(undoDir, replacementIdentity, 'parked replacement');
 	  requireIdentity(backupDir, priorIdentity, 'retained prior object');
-	  renameDirRestoringWrite(backupDir, dest);
+	  restoreIdentityMode(undoDir, rollbackReplacementIdentity, 'parked replacement');
+	  renameDirRestoringWrite(backupDir, dest, priorIdentity.mode);
 	  writePhase('rollback-prior-restored');
 	  continue;
 	}
 	if (state.destination === 'dir' && state.backup === 'absent' && state.undo === 'dir') {
 	  requireIdentity(dest, priorIdentity, 'restored prior object');
 	  requireIdentity(undoDir, replacementIdentity, 'parked replacement');
+	  restoreIdentityMode(dest, priorIdentity, 'restored prior object');
+	  restoreIdentityMode(undoDir, rollbackReplacementIdentity, 'parked replacement');
 	  writePhase('rollback-prior-restored');
 	  continue;
 	}
@@ -1887,8 +2222,10 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
       if (phase === 'rollback-prior-restored') {
 	if (state.destination !== 'dir' || state.backup !== 'absent') refuseCombination(state);
 	requireIdentity(dest, priorIdentity, 'restored prior object');
+	restoreIdentityMode(dest, priorIdentity, 'restored prior object');
 	if (state.undo === 'dir') {
 	  requireIdentity(undoDir, replacementIdentity, 'parked replacement');
+	  restoreIdentityMode(undoDir, rollbackReplacementIdentity, 'parked replacement');
 	  rmRecursiveForce(undoDir);
 	}
 	writePhase('rollback-complete');
@@ -1904,6 +2241,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	  refuseCombination(state);
 	}
 	requireIdentity(dest, priorIdentity, 'restored prior object');
+	restoreIdentityMode(dest, priorIdentity, 'restored prior object');
 	const currentStagingRoot = probeRecoveryDir(stagingRoot, journalPath, 'staging root', defsDir);
 	if (currentStagingRoot === 'dir' && readdirSync(stagingRoot).length === 0) rmdirSync(stagingRoot);
 	removeAddJournal(journalPath);
@@ -2117,6 +2455,14 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	    marker = readRecoveryMarker(journal.recoveryMarkerId, args.recoveryMarkerDir);
 	  } catch (e) {
 	    throw recoveryRefusal(journalPath, `external recovery marker could not be read: ${(e as Error).message}`);
+	  }
+	  if (marker !== null) {
+	    verifyMarkerRootIdentityWhenPresent(
+	      marker,
+	      defsDir,
+	      journalPath,
+	      markerFilePath(args.recoveryMarkerDir, journal.recoveryMarkerId),
+	    );
 	  }
 	}
 	const markerMatches =

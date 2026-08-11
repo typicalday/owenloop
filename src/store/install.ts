@@ -527,23 +527,41 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       if (recoveryMarker === undefined) {
 	throw new Error('internal error: repair rollback is missing its recovery marker');
       }
+      let rollbackReplacementMode: number | undefined;
       rollbackInstallCommit(committedHandle, {
 	beforeRollback: () => {
-	  writeAddJournal(journalPath, { ...journalBase, phase: 'rollback-started', operation: 'repair' });
+	  rollbackReplacementMode = lstatSync(committedHandle.dest).mode & 0o7777;
+	  writeAddJournal(journalPath, {
+	    ...journalBase,
+	    phase: 'rollback-started',
+	    operation: 'repair',
+	    rollbackReplacementMode,
+	  });
 	},
 	afterDestinationParked: () => {
 	  writeAddJournal(journalPath, {
 	    ...journalBase,
 	    phase: 'rollback-replacement-parked',
 	    operation: 'repair',
+	    rollbackReplacementMode,
 	  });
 	},
 	afterPriorRestored: () => {
-	  writeAddJournal(journalPath, { ...journalBase, phase: 'rollback-prior-restored', operation: 'repair' });
+	  writeAddJournal(journalPath, {
+	    ...journalBase,
+	    phase: 'rollback-prior-restored',
+	    operation: 'repair',
+	    rollbackReplacementMode,
+	  });
 	},
 	cleanupUndo: true,
 	afterUndoCleanup: () => {
-	  writeAddJournal(journalPath, { ...journalBase, phase: 'rollback-complete', operation: 'repair' });
+	  writeAddJournal(journalPath, {
+	    ...journalBase,
+	    phase: 'rollback-complete',
+	    operation: 'repair',
+	    rollbackReplacementMode,
+	  });
 	},
       });
     };
