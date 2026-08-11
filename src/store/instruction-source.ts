@@ -8,7 +8,7 @@
  * in the in-memory cache populated by that prime.
  */
 
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { parseManifestBytes } from '../bundle/manifest.ts';
 import { defInstructionDigest } from '../order-resolver.ts';
@@ -26,6 +26,7 @@ import {
 } from './types.ts';
 import type { DefDigest } from './types.ts';
 import {
+  coordinateDigestRead,
   projectStoreRoot,
   probeStoreRoot,
   resolveWorkflowDigest,
@@ -119,28 +120,31 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
       globalRoot,
       verifier: args.verifier,
     });
-    const manifestPath = join(resolved.objectPath, 'bundle.yaml');
-    const manifest = parseManifestBytes(readFileSync(manifestPath));
-    const loaded = new Map<string, WorkflowDef>();
-    for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
-      const def = loadDefFile(join(resolved.objectPath, workflowPath));
-      if (def.name !== workflowName) {
-        throw new StoreIntegrityError(
-          'object-corrupt',
-          bundleDigest,
-          `workflow '${workflowPath}' has definition name '${def.name}', expected '${workflowName}'`,
-        );
+    const root = dirname(dirname(dirname(resolved.objectPath)));
+    return coordinateDigestRead(root, bundleDigest, () => {
+      const manifestPath = join(resolved.objectPath, 'bundle.yaml');
+      const manifest = parseManifestBytes(readFileSync(manifestPath));
+      const loaded = new Map<string, WorkflowDef>();
+      for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
+	const def = loadDefFile(join(resolved.objectPath, workflowPath));
+	if (def.name !== workflowName) {
+	  throw new StoreIntegrityError(
+	    'object-corrupt',
+	    bundleDigest,
+	    `workflow '${workflowPath}' has definition name '${def.name}', expected '${workflowName}'`,
+	  );
+	}
+	loaded.set(def.name, def);
       }
-      loaded.set(def.name, def);
-    }
-    const finalized = finalizeDefs(loaded);
-    for (const def of finalized.values()) {
-      if (defInstructionDigest(def) === requestedDigest) {
-        cache.set(requestedDigest, { def, bundleDigest, objectPath: resolved.objectPath });
-        return true;
+      const finalized = finalizeDefs(loaded);
+      for (const def of finalized.values()) {
+	if (defInstructionDigest(def) === requestedDigest) {
+	  cache.set(requestedDigest, { def, bundleDigest, objectPath: resolved.objectPath });
+	  return true;
+	}
       }
-    }
-    return false;
+      return false;
+    });
   };
 
   const attemptCandidate = async (
@@ -160,7 +164,7 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
   const evictObject = (bundleDigest: DefDigest, objectPath: string): void => {
     for (const [instructionDigest, cached] of cache) {
       if (cached.bundleDigest === bundleDigest && cached.objectPath === objectPath) {
-				cache.delete(instructionDigest);
+	cache.delete(instructionDigest);
       }
     }
   };
@@ -168,10 +172,14 @@ export function createStoreInstructionSource(args: StoreInstructionSourceArgs): 
   const verifyCached = async (requestedDigest: string): Promise<boolean> => {
     const cached = cache.get(requestedDigest);
     if (cached === undefined) return false;
+    const root = dirname(dirname(dirname(cached.objectPath)));
     try {
-      await args.verifier.verifyInstalledObject({
-				objectDir: cached.objectPath,
-				digest: cached.bundleDigest,
+      await coordinateDigestRead(root, cached.bundleDigest, async () => {
+	const verify = args.verifier.verifyInstalledObjectAfterCoordination ?? args.verifier.verifyInstalledObject;
+	await verify.call(args.verifier, {
+	  objectDir: cached.objectPath,
+	  digest: cached.bundleDigest,
+	});
       });
       return true;
     } catch (error) {

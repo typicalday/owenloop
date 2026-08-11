@@ -145,6 +145,7 @@ import {
   createPreCommitVerifier,
   recoverWorkflowStore,
   storeIndexPath,
+  workflowStoreReplacementRecovery,
   workflowStoreStatePaths,
 } from './store/index.ts';
 import type { BundleIngestor, BundleSource, PreCommitVerifier } from './store/index.ts';
@@ -2733,8 +2734,15 @@ async function dispatchAdd(io: CliIO, args: Args): Promise<number> {
 	journalPath: canonicalState.journalPath,
 	lockfilePath: storeIndexPath(defsDir),
 	recoveryMarkerDir,
+	v2Replacement: workflowStoreReplacementRecovery,
       });
-      recoverInterruptedInstall({ defsDir, journalPath, lockfilePath, recoveryMarkerDir });
+      recoverInterruptedInstall({
+	defsDir,
+	journalPath,
+	lockfilePath,
+	recoveryMarkerDir,
+	v2Replacement: workflowStoreReplacementRecovery,
+      });
     } catch (e) {
       preserveStagingRoot = true;
       throw e;
@@ -3063,8 +3071,15 @@ async function dispatchAddRecover(io: CliIO, args: Args): Promise<number> {
       journalPath: canonicalState.journalPath,
       lockfilePath: storeIndexPath(defsDir),
       recoveryMarkerDir,
+      v2Replacement: workflowStoreReplacementRecovery,
     });
-    const legacyOutcome = recoverInterruptedInstall({ defsDir, journalPath, lockfilePath, recoveryMarkerDir });
+    const legacyOutcome = recoverInterruptedInstall({
+	defsDir,
+	journalPath,
+	lockfilePath,
+	recoveryMarkerDir,
+	v2Replacement: workflowStoreReplacementRecovery,
+      });
     outcome = legacyOutcome !== 'no-journal' ? legacyOutcome : canonicalOutcome;
   } finally {
     for (const handle of locks.reverse()) releaseInstallLock(handle);

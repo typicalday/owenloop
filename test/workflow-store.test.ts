@@ -44,11 +44,15 @@ import {
   StoreIntegrityError,
   StoreNotFoundError,
   StorePathError,
+  waitForDigestRepair,
+  waitForDigestRepairSync,
   workflowCoordinate,
+  workflowStoreStatePaths,
   WorkflowStoreError,
   writeWorkflowStoreIndex,
 } from '../src/store/index.ts';
 import type { BundleIngestor, DefDigest, WorkflowStoreIndex } from '../src/store/index.ts';
+import { writeAddJournal } from '../src/install.ts';
 
 // ---- fixtures --------------------------------------------------------------------
 
@@ -337,6 +341,57 @@ test('resolveWorkflowDigest: a digest present nowhere is object-missing', async 
     resolveWorkflowDigest({ digest: digest('2'), projectRoot: tempDir(), globalRoot: tempDir(), verifier: resolvingVerifier() }),
     (e: unknown) => e instanceof StoreIntegrityError && e.code === 'object-missing'
       && /not present in the project or global workflow store/.test(e.message),
+  );
+});
+
+test('repair coordination: a stale matching journal fails closed after a bounded wait', async () => {
+  const root = tempDir();
+  const d = digest('a');
+  const state = workflowStoreStatePaths(root);
+  writeAddJournal(state.journalPath, {
+    version: 2,
+    phase: 'replacement-swapped',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', d],
+    stagingId: 'stg_stale_repair',
+    hadDest: true,
+    root,
+    metadataHash: 'b'.repeat(64),
+  });
+
+  await assert.rejects(
+    waitForDigestRepair(root, d, { timeoutMs: 20, retryMs: 1 }),
+    (error: unknown) => error instanceof StoreIntegrityError &&
+      error.code === 'object-corrupt' &&
+      /did not reach a stable state within 20ms/.test(error.message),
+  );
+  assert.throws(
+    () => waitForDigestRepairSync(root, d, { timeoutMs: 20, retryMs: 1 }),
+    (error: unknown) => error instanceof StoreIntegrityError &&
+      error.code === 'object-corrupt' &&
+      /must be recovered before this object can be read/.test(error.message),
+  );
+});
+
+test('repair coordination: an operation-less hadDest journal waits before the backup rename', async () => {
+  const root = tempDir();
+  const d = digest('b');
+  const state = workflowStoreStatePaths(root);
+  writeAddJournal(state.journalPath, {
+    version: 2,
+    phase: 'applying',
+    destSegments: ['objects', 'sha256', d],
+    stagingId: 'stg_legacy_repair',
+    hadDest: true,
+    root,
+    metadataHash: 'c'.repeat(64),
+  });
+
+  await assert.rejects(
+    waitForDigestRepair(root, d, { timeoutMs: 20, retryMs: 1 }),
+    (error: unknown) => error instanceof StoreIntegrityError &&
+      error.code === 'object-corrupt' &&
+      /did not reach a stable state within 20ms/.test(error.message),
   );
 });
 

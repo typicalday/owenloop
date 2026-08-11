@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
@@ -35,6 +35,7 @@ import {
   type Lockfile,
 } from '../src/add.ts';
 import { archivePathViolation as sharedArchivePathViolation, DEFAULT_TAR_LIMITS } from '../src/archive.ts';
+import { renameDirRestoringWrite } from '../src/install.ts';
 import { makeGithubTarball } from './helpers.ts';
 
 const SHA_A = 'a'.repeat(40);
@@ -1422,29 +1423,84 @@ test('add: an old-name migration success path installs the hashed dir, removes t
 
 // ---- two-phase commit helpers (unit) -----------------------------------------
 
-test('commitInstall/rollback: round-trips a prior install and a parked old-name dir', () => {
+test('commitInstall/rollback: round-trips a prior install and a parked old-name dir with exact modes', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-commit-'));
   const defsDir = join(dir, 'defs');
   const folder = 'pkg-hashed';
   const dest = join(defsDir, folder);
-  mkdirSync(dest, { recursive: true });
+  mkdirSync(join(dest, 'nested'), { recursive: true });
   writeFileSync(join(dest, 'x.yaml'), 'PREV');
+  writeFileSync(join(dest, 'nested', 'prior.txt'), 'PRIOR NESTED');
+  chmodSync(join(dest, 'x.yaml'), 0o444);
+  chmodSync(join(dest, 'nested', 'prior.txt'), 0o444);
+  chmodSync(join(dest, 'nested'), 0o555);
+  chmodSync(dest, 0o555);
   const oldRel = 'pkg-old';
   const oldDir = join(defsDir, oldRel);
   mkdirSync(oldDir, { recursive: true });
   writeFileSync(join(oldDir, 'y.yaml'), 'OLD');
   const stagingDir = join(defsDir, STAGING_DIRNAME, 'stg1');
-  mkdirSync(stagingDir, { recursive: true });
+  mkdirSync(join(stagingDir, 'nested'), { recursive: true });
   writeFileSync(join(stagingDir, 'x.yaml'), 'NEW');
+  writeFileSync(join(stagingDir, 'nested', 'new.txt'), 'NEW NESTED');
+  chmodSync(join(stagingDir, 'x.yaml'), 0o444);
+  chmodSync(join(stagingDir, 'nested', 'new.txt'), 0o444);
+  chmodSync(join(stagingDir, 'nested'), 0o555);
 
   const handle = commitInstall(defsDir, folder, stagingDir);
   assert.equal(readFileSync(join(dest, 'x.yaml'), 'utf8'), 'NEW', 'new content swapped in');
+  assert.equal(statSync(dest).mode & 0o777, 0o755, 'swap preserves the staged root mode before route-specific hardening');
+  assert.equal(statSync(join(dest, 'nested')).mode & 0o777, 0o555, 'successful swap preserves nested modes');
   parkOldNameDir(handle, defsDir, oldRel);
   assert.ok(!existsSync(oldDir), 'old-name dir parked away');
 
   rollbackInstallCommit(handle);
   assert.equal(readFileSync(join(dest, 'x.yaml'), 'utf8'), 'PREV', 'prior content restored byte-identical');
   assert.equal(readFileSync(join(oldDir, 'y.yaml'), 'utf8'), 'OLD', 'old-name dir re-placed');
+  assert.equal(statSync(dest).mode & 0o777, 0o555, 'rollback restores the exact prior root mode');
+  assert.equal(statSync(join(dest, 'nested')).mode & 0o777, 0o555, 'rollback preserves nested directory mode');
+  assert.equal(statSync(join(dest, 'x.yaml')).mode & 0o777, 0o444, 'rollback preserves prior file mode');
+});
+
+test('renameDirRestoringWrite: a failed rename restores the exact source mode', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-mode-rename-'));
+  const source = join(dir, 'source');
+  const destination = join(dir, 'destination');
+  mkdirSync(join(source, 'nested'), { recursive: true });
+  mkdirSync(destination);
+  writeFileSync(join(destination, 'occupied'), 'blocks replacement');
+  chmodSync(join(source, 'nested'), 0o555);
+  chmodSync(source, 0o555);
+
+  assert.throws(() => renameDirRestoringWrite(source, destination));
+  assert.equal(statSync(source).mode & 0o777, 0o555, 'source root mode is restored after rename failure');
+  assert.equal(statSync(join(source, 'nested')).mode & 0o777, 0o555, 'nested mode never changes');
+  assert.equal(readFileSync(join(destination, 'occupied'), 'utf8'), 'blocks replacement');
+});
+
+test('commitInstall: a throwing after-backup hook restores the prior directory and modes', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-commit-hook-'));
+  const defsDir = join(dir, 'defs');
+  const dest = join(defsDir, 'pkg-hashed');
+  const stagingDir = join(defsDir, STAGING_DIRNAME, 'stg1');
+  mkdirSync(join(dest, 'nested'), { recursive: true });
+  writeFileSync(join(dest, 'nested', 'prior.txt'), 'PRIOR');
+  chmodSync(join(dest, 'nested', 'prior.txt'), 0o444);
+  chmodSync(join(dest, 'nested'), 0o555);
+  chmodSync(dest, 0o555);
+  mkdirSync(stagingDir, { recursive: true });
+  writeFileSync(join(stagingDir, 'replacement.txt'), 'REPLACEMENT');
+
+  assert.throws(
+    () => commitInstall(defsDir, 'pkg-hashed', stagingDir, {
+      afterBackupRename: () => { throw new Error('test hook failed'); },
+    }),
+    /test hook failed/,
+  );
+  assert.equal(readFileSync(join(dest, 'nested', 'prior.txt'), 'utf8'), 'PRIOR');
+  assert.equal(statSync(dest).mode & 0o777, 0o555, 'prior root mode restored');
+  assert.equal(statSync(join(dest, 'nested')).mode & 0o777, 0o555, 'nested mode preserved');
+  assert.equal(existsSync(stagingDir), true, 'replacement remains staged and uncommitted');
 });
 
 test('commitInstall/rollback: a fresh commit rolls back to no destination', () => {
@@ -1855,6 +1911,10 @@ function recoverIn(cwd: string): void {
     defsDir: defsDirOf(cwd),
     journalPath: journalPathOf(cwd),
     lockfilePath: lockfilePath(cwd),
+    // The CLI supplies the real CAS harden/verify adapter. These generic
+    // transaction tests use synthetic directories, so a no-op test adapter
+    // isolates the journal and rename decisions under test.
+    v2Replacement: { harden: () => {}, verify: () => {} },
   });
 }
 /** Create `dir` and drop a file in it — a stand-in for an install/backup dir. */

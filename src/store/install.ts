@@ -64,6 +64,8 @@ import type {
   WorkflowStoreIndex,
 } from './types.ts';
 import { readWorkflowStoreIndex, writeWorkflowStoreIndex } from './index-file.ts';
+import { verifyWorkflowObjectSync } from './ingestor.ts';
+import { defDigest } from './types.ts';
 import { storeIndexPath } from './resolve.ts';
 
 // ---- A1/A2 ports ---------------------------------------------------------------
@@ -98,6 +100,10 @@ export interface BundleIngestor {
     stagingDir: string;
   }): Promise<{ coordinate: WorkflowCoordinate; digest: DefDigest; workflows: string[] }>;
   verifyInstalledObject(input: { objectDir: string; digest: DefDigest }): Promise<void>;
+  /** Optional canonical-only check for a staged pre-swap reconstruction. */
+  verifyStagedObject?(input: { objectDir: string; digest: DefDigest }): Promise<void>;
+  /** Optional installed check used after the caller already coordinated the repair journal. */
+  verifyInstalledObjectAfterCoordination?(input: { objectDir: string; digest: DefDigest }): Promise<void>;
 }
 
 /**
@@ -219,6 +225,17 @@ export function hardenObjectModes(dir: string): void {
   chmodSync(dir, 0o555);
 }
 
+/** Concrete recovery actions for v2 content-addressed replacement journals. */
+export const workflowStoreReplacementRecovery = {
+  harden: hardenObjectModes,
+  verify(objectDir: string, rawDigest: string): void {
+    verifyWorkflowObjectSync(objectDir, defDigest(rawDigest), {
+      coordinateRepair: false,
+      requireHardenedModes: true,
+    });
+  },
+};
+
 // ---- the install transaction -----------------------------------------------------
 
 /**
@@ -304,6 +321,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 	lockfilePath: indexPath,
 	readLedger,
 	recoveryMarkerDir,
+	v2Replacement: workflowStoreReplacementRecovery,
       });
     } catch (e) {
       preserveStagingRoot = true;
@@ -427,7 +445,8 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 	await ingestor.verifyInstalledObject({ objectDir, digest });
       } catch (existingError) {
 	try {
-	  await ingestor.verifyInstalledObject({ objectDir: stagingDir, digest });
+	  const verifyStaged = ingestor.verifyStagedObject ?? ingestor.verifyInstalledObject;
+	  await verifyStaged.call(ingestor, { objectDir: stagingDir, digest });
 	} catch (stagedError) {
 	  throw new StoreIntegrityError(
 	    'object-corrupt',
@@ -469,6 +488,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     const journalBase = {
       version: 2 as const,
       phase: 'applying' as const,
+      operation: repairRequired ? 'repair' as const : objectAlreadyPresent ? 'dedupe' as const : 'install' as const,
       destSegments: ['objects', 'sha256', digest],
       stagingId,
       hadDest: objectAlreadyPresent,
@@ -492,15 +512,31 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
       try {
         handle = commitInstall(root, destRelPath, stagingDir);
       } catch (e) {
-        if (e instanceof RollbackFailedError) preserveStagingRoot = true;
+	if (e instanceof RollbackFailedError) {
+	  preserveStagingRoot = true;
+	} else {
+	  // commitInstall either made no change or restored the displaced object.
+	  // Remove the now-obsolete journal so a later run does not mistake the
+	  // already-restored state for an interrupted repair.
+	  removeAddJournal(journalPath);
+	  if (recoveryMarker !== undefined) removeRecoveryMarker(recoveryMarker);
+	}
         throw e;
       }
       try {
+	if (repairRequired) {
+	  writeAddJournal(journalPath, { ...journalBase, phase: 'replacement-swapped' });
+	}
 	hardenObjectModes(handle.dest);
 	if (repairRequired) {
+	  writeAddJournal(journalPath, { ...journalBase, phase: 'replacement-hardened' });
 	  // Re-check the exact hardened destination before the commit point.
-	  // Canonical 0755 files reconstruct from hardened 0555 execute bits.
-	  await ingestor.verifyInstalledObject({ objectDir: handle.dest, digest });
+	  // Canonical 0755 files reconstruct from hardened 0555 execute bits;
+	  // exact 0444/0555 store modes are verified separately by the adapter.
+	  const verifyInstalled =
+	    ingestor.verifyInstalledObjectAfterCoordination ?? ingestor.verifyInstalledObject;
+	  await verifyInstalled.call(ingestor, { objectDir: handle.dest, digest });
+	  writeAddJournal(journalPath, { ...journalBase, phase: 'replacement-verified' });
 	}
       } catch (e) {
 	try {
@@ -555,9 +591,11 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     }
 
     // The index write is the durable commit point: past here a crash rolls
-    // FORWARD. Record that in the journal, then finalize (discard any
-    // retained backup), clear staging, and drop the journal.
+    // FORWARD. Keep the retained backup if the finalizing phase cannot be written;
+    // a replacement-verified journal can then re-verify and finish recovery.
+    preserveStagingRoot = true;
     writeAddJournal(journalPath, { ...journalBase, phase: 'finalizing' });
+    preserveStagingRoot = false;
     if (handle !== undefined) finalizeInstallCommit(handle);
     rmRecursiveForce(stagingRoot);
     removeAddJournal(journalPath);
@@ -612,6 +650,7 @@ export async function recoverWorkflowStore(args: RecoverWorkflowStoreArgs): Prom
       journalPath: args.journalPath,
       lockfilePath: storeIndexPath(args.root),
       recoveryMarkerDir: args.recoveryMarkerDir,
+      v2Replacement: workflowStoreReplacementRecovery,
     });
   } finally {
     releaseInstallLock(lock);

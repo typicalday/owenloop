@@ -35,6 +35,7 @@ import {
 } from '../src/store/index.ts';
 import type { BundleIngestor, BundleSource, DefDigest, PreCommitVerifier, WorkflowCoordinate } from '../src/store/index.ts';
 import { exampleDefNames } from './helpers.ts';
+import { installBundleFixture, writeBundleSource } from './helpers/store-fixture.ts';
 
 const EXAMPLES = join(import.meta.dirname, '..', 'examples', 'workflows');
 
@@ -2085,6 +2086,25 @@ test('add --recover --global with nothing to recover reports recovered:false', a
 test('add --recover --global rolls a finalizing v2 journal forward (offline)', async () => {
   const { run, home } = makeBundleCli();
   const root = globalStoreRoot(home);
+  const sourceDir = writeBundleSource({
+    name: 'cli-recovery',
+    workflow: [
+      'name: cli-recovery',
+      'inputs:',
+      '  - name: seed',
+      '    seedOwed: true',
+      'steps:',
+      '  - name: runner',
+      '    consumes: [seed]',
+      '    produces: [out]',
+      '    terminal: true',
+      '    executor: command',
+      '    command: \'printf "recovered\\n"\'',
+      '    body: ""',
+      '',
+    ].join('\n'),
+  });
+  const installed = await installBundleFixture({ sourceDir, root });
   const stagingRoot = join(root, '.owenloop-staging');
   const stagingDir = join(stagingRoot, 'stg_cli');
   mkdirSync(stagingDir, { recursive: true });
@@ -2095,12 +2115,13 @@ test('add --recover --global rolls a finalizing v2 journal forward (offline)', a
     JSON.stringify({
       version: 2,
       phase: 'finalizing',
-      destSegments: ['objects', 'sha256', 'f'.repeat(64)],
+      operation: 'repair',
+      destSegments: ['objects', 'sha256', installed.result.digest],
       stagingId: 'stg_cli',
       hadDest: true,
       root,
-      metadataHash: 'a'.repeat(64),
-      label: 'acme/widget@1.0.0',
+      metadataHash: createHash('sha256').update(readFileSync(storeIndexPath(root))).digest('hex'),
+      label: installed.result.coordinate,
     }),
   );
 
@@ -2112,6 +2133,7 @@ test('add --recover --global rolls a finalizing v2 journal forward (offline)', a
     outcome: 'rolled-forward',
     message: 'interrupted install completed (rolled forward)',
   });
+  assert.equal(existsSync(installed.result.objectPath), true, 'verified destination is retained');
   assert.equal(existsSync(stagingRoot), false, 'staging cleared by the roll-forward');
   assert.equal(existsSync(join(root, '.owenloop', ADD_JOURNAL_FILENAME)), false, 'journal removed');
 });

@@ -59,6 +59,9 @@ test('store ingestor: a real packBundle archive installs and verifies as an immu
   assert.deepEqual(installed.result.workflows, ['ingestor-fixture']);
   assert.equal(readFileSync(join(installed.result.objectPath, 'workflow.yaml'), 'utf8'), WORKFLOW);
   assert.equal(readFileSync(join(installed.result.objectPath, 'notes', 'readme.txt'), 'utf8'), 'fixture note\n');
+  assert.equal(statSync(installed.result.objectPath).mode & 0o777, 0o555, 'object root is exactly 0555');
+  assert.equal(statSync(join(installed.result.objectPath, 'notes')).mode & 0o777, 0o555, 'nested directory is exactly 0555');
+  assert.equal(statSync(join(installed.result.objectPath, 'workflow.yaml')).mode & 0o777, 0o444, 'non-executable file is exactly 0444');
 });
 
 test('store ingestor: a compatible runtime declaration installs and verifies', async () => {
@@ -95,8 +98,8 @@ test('store ingestor: runtime-only bundle.yaml mutation or removal fails canonic
 
     await assert.rejects(
       createBundleIngestor().verifyInstalledObject({
-				objectDir: installed.result.objectPath,
-				digest: installed.result.digest,
+	objectDir: installed.result.objectPath,
+	digest: installed.result.digest,
       }),
       /canonical bundle digest mismatch/,
       mutation,
@@ -116,6 +119,23 @@ test('store ingestor: executable identity survives read-only hardening and canon
     objectDir: installed.result.objectPath,
     digest: installed.result.digest,
   });
+});
+
+test('store ingestor: canonical identity can match while writable store modes are rejected', async () => {
+  const installed = await installBundleFixture({ sourceDir: sourceDir() });
+  const target = join(installed.result.objectPath, 'notes', 'readme.txt');
+  chmodSync(target, 0o644);
+
+  verifyWorkflowObjectSync(installed.result.objectPath, installed.result.digest, {
+    requireHardenedModes: false,
+  });
+  await assert.rejects(
+    createBundleIngestor().verifyInstalledObject({
+      objectDir: installed.result.objectPath,
+      digest: installed.result.digest,
+    }),
+    /regular file mode is 0644, expected hardened store mode 0444/,
+  );
 });
 
 test('store ingestor: canonical reconstruction sorts flattened prefix and Unicode paths independently of traversal order', async () => {

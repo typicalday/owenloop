@@ -53,7 +53,13 @@ import { loadDefFile } from '../defs.ts';
 import type { WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import { verifyWorkflowObjectSync } from './ingestor.ts';
-import { probeObjectDir, probeStoreRoot, projectStoreRoot, storeIndexPath } from './resolve.ts';
+import {
+  coordinateDigestReadSync,
+  probeObjectDir,
+  probeStoreRoot,
+  projectStoreRoot,
+  storeIndexPath,
+} from './resolve.ts';
 import { defDigest, objectDirForDigest } from './types.ts';
 import type { DefDigest, ResolutionLevel } from './types.ts';
 
@@ -131,6 +137,8 @@ function indexedDigests(root: string, level: ResolutionLevel, warn: (line: strin
   }
 }
 
+class CasObjectAbsentDuringCoordinatedRead extends Error {}
+
 /**
  * Load every workflow from ONE verified bundle object.
  *
@@ -141,7 +149,7 @@ function loadObjectDefs(
   objectDir: string,
   bundleDigest: DefDigest,
 ): { bundlePackage: string; defs: Map<string, WorkflowDef> } {
-  verifyWorkflowObjectSync(objectDir, bundleDigest);
+  verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false });
   const manifest = parseManifestBytes(readFileSync(join(objectDir, 'bundle.yaml')));
   const defs = new Map<string, WorkflowDef>();
   for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
@@ -209,20 +217,17 @@ export function loadCasDefs(args: LoadCasDefsArgs): CasDefRegistration[] {
       if (seenDigests.has(bundleDigest)) continue;
 
       const objectDir = objectDirForDigest(root, bundleDigest);
-      let present: 'dir' | 'absent';
-      try {
-        present = probeObjectDir(objectDir, bundleDigest, level);
-      } catch (e) {
-        warn(`warning: skipping ${level} workflow object ${bundleDigest}: ${(e as Error).message}`);
-        continue;
-      }
-      // Absent at this level is not an error — the other root may hold it.
-      if (present !== 'dir') continue;
-
       let loaded: { bundlePackage: string; defs: Map<string, WorkflowDef> };
       try {
-        loaded = loadObjectDefs(objectDir, bundleDigest);
+	loaded = coordinateDigestReadSync(root, bundleDigest, () => {
+	  if (probeObjectDir(objectDir, bundleDigest, level) !== 'dir') {
+	    throw new CasObjectAbsentDuringCoordinatedRead();
+	  }
+	  return loadObjectDefs(objectDir, bundleDigest);
+	});
       } catch (e) {
+	// An absent object is not an error — the other root may hold the digest.
+	if (e instanceof CasObjectAbsentDuringCoordinatedRead) continue;
         warn(`warning: skipping ${level} workflow object ${bundleDigest}: ${(e as Error).message}`);
         continue;
       }

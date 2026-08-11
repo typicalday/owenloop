@@ -17,6 +17,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -32,7 +33,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   BundleIngestorUnavailableError,
+  createBundleIngestor,
   defDigest,
+  hardenObjectModes,
   installWorkflowBundle,
   objectDestRelPath,
   PreCommitVerifierUnavailableError,
@@ -40,7 +43,9 @@ import {
   StoreIntegrityError,
   recoverWorkflowStore,
   storeIndexPath,
+  verifyWorkflowObjectSync,
   workflowCoordinate,
+  workflowStoreStatePaths,
 } from '../src/store/index.ts';
 import type {
   BundleIngestor,
@@ -50,7 +55,19 @@ import type {
   WorkflowCoordinate,
 } from '../src/store/index.ts';
 import { ADD_JOURNAL_FILENAME, writeAddJournal } from '../src/add.ts';
-import { canonicalJsonBytes, createRecoveryMarker, sha256Hex } from '../src/install.ts';
+import { unpackBundle } from '../src/bundle/index.ts';
+import {
+  canonicalJsonBytes,
+  commitInstall,
+  createRecoveryMarker,
+  finalizeInstallCommit,
+  removeAddJournal,
+  renameDirRestoringWrite,
+  sha256Hex,
+} from '../src/install.ts';
+import { defInstructionDigest } from '../src/order-resolver.ts';
+import { loadDefFile } from '../src/defs.ts';
+import { installBundleFixture, tempDir, writeBundleSource } from './helpers/store-fixture.ts';
 
 // ---- independent fixture layer ---------------------------------------------------
 
@@ -231,6 +248,120 @@ async function indexedObjectForRecovery(name: string): Promise<{
     objDir: join(root, objectDestRelPath(digest)),
     metadataHash: sha256Hex(canonicalJsonBytes(readWorkflowStoreIndex(storeIndexPath(root)))),
   };
+}
+
+interface RealRepairFixture {
+  root: string;
+  lockPath: string;
+  journalPath: string;
+  markerDir: string;
+  source: BundleSource;
+  packed: Awaited<ReturnType<typeof installBundleFixture>>['packed'];
+  digest: DefDigest;
+  objectDir: string;
+  metadataHash: string;
+  executableRel: string;
+  nonExecutableRel: string;
+  nestedDirRel: string;
+}
+
+async function realRepairFixture(name: string): Promise<RealRepairFixture> {
+  const executableRel = 'bin/run.sh';
+  const nestedDirRel = 'nested/deeper';
+  const nonExecutableRel = `${nestedDirRel}/note.txt`;
+  const sourceDir = writeBundleSource({
+    name,
+    workflow: validDefYaml(name),
+    files: {
+      [executableRel]: '#!/bin/sh\nprintf "ok\\n"\n',
+      [nonExecutableRel]: 'immutable note\n',
+    },
+  });
+  chmodSync(join(sourceDir, executableRel), 0o755);
+  const installed = await installBundleFixture({ sourceDir });
+  const state = workflowStoreStatePaths(installed.root);
+  return {
+    root: installed.root,
+    lockPath: state.lockPath,
+    journalPath: state.journalPath,
+    markerDir: tempDir('owenloop-repair-marker-'),
+    source: installed.source,
+    packed: installed.packed,
+    digest: installed.result.digest,
+    objectDir: installed.result.objectPath,
+    metadataHash: sha256Hex(canonicalJsonBytes(readWorkflowStoreIndex(storeIndexPath(installed.root)))),
+    executableRel,
+    nonExecutableRel,
+    nestedDirRel,
+  };
+}
+
+function stageRealReplacement(fixture: RealRepairFixture, stagingId: string): string {
+  const stagingDir = join(fixture.root, '.owenloop-staging', stagingId);
+  mkdirSync(join(stagingDir, '..'), { recursive: true });
+  unpackBundle(fixture.packed.bytes, stagingDir);
+  verifyWorkflowObjectSync(stagingDir, fixture.digest, {
+    coordinateRepair: false,
+    requireHardenedModes: false,
+  });
+  return stagingDir;
+}
+
+function assertHardenedRepairTree(fixture: RealRepairFixture): void {
+  assert.equal(statSync(fixture.objectDir).mode & 0o777, 0o555, 'object root is exactly 0555');
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.nestedDirRel)).mode & 0o777,
+    0o555,
+    'nested directory is exactly 0555',
+  );
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.executableRel)).mode & 0o777,
+    0o555,
+    'executable regular file is exactly 0555',
+  );
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o777,
+    0o444,
+    'non-executable regular file is exactly 0444',
+  );
+  verifyWorkflowObjectSync(fixture.objectDir, fixture.digest, { coordinateRepair: false });
+}
+
+async function assertHealthyReinstallDedupesWithoutReplacement(fixture: RealRepairFixture): Promise<void> {
+  const inodeBefore = statSync(fixture.objectDir).ino;
+  const second = await installWorkflowBundle({
+    bytes: fixture.packed.bytes,
+    source: fixture.source,
+    root: fixture.root,
+    level: 'project',
+    lockPath: fixture.lockPath,
+    journalPath: fixture.journalPath,
+    recoveryMarkerDir: fixture.markerDir,
+    ingestor: createBundleIngestor(),
+    verifier: fakeVerifier(),
+  });
+  assert.equal(second.installed, false, 'the recovered healthy object takes the dedupe path');
+  assert.equal(statSync(fixture.objectDir).ino, inodeBefore, 'dedupe does not replace the healthy object directory');
+  assertHardenedRepairTree(fixture);
+}
+
+async function assertBrokenRecoveryReinstallsAndThenDedupes(fixture: RealRepairFixture): Promise<void> {
+  const brokenInode = statSync(fixture.objectDir).ino;
+  const repaired = await installWorkflowBundle({
+    bytes: fixture.packed.bytes,
+    source: fixture.source,
+    root: fixture.root,
+    level: 'project',
+    lockPath: fixture.lockPath,
+    journalPath: fixture.journalPath,
+    recoveryMarkerDir: fixture.markerDir,
+    ingestor: createBundleIngestor(),
+    verifier: fakeVerifier(),
+  });
+  assert.equal(repaired.installed, false, 'same-digest reinstall repairs the restored broken object');
+  assert.notEqual(statSync(fixture.objectDir).ino, brokenInode, 'repair replaces the broken object directory');
+  assertHardenedRepairTree(fixture);
+  await assertHealthyReinstallDedupesWithoutReplacement(fixture);
 }
 
 // ---- the happy path and the commit order ------------------------------------------
@@ -598,18 +729,23 @@ test('install: a staged repair verification failure leaves the prior broken obje
   assert.ok(!existsSync(join(root, '.owenloop-staging')));
 });
 
-test('install: failed replacement verification restores the prior broken object and index', async () => {
+test('install: failed replacement verification restores the prior broken object, index, and exact modes', async () => {
   const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
-  const m = makeBundle();
+  const m = makeBundle('widget', {
+    'def.yaml': validDefYaml('widget'),
+    'nested/note.txt': 'nested prior content\n',
+  });
   await installWorkflowBundle({
     bytes: bundleBytes(m), source: SRC, root, level: 'project', lockPath, journalPath,
     recoveryMarkerDir: installMarkerDir,
     ingestor: fakeIngestor(), verifier: fakeVerifier(),
   });
   const objDir = join(root, objectDestRelPath(defDigest(m.digest)));
-  chmodSync(objDir, 0o755);
   chmodSync(join(objDir, 'def.yaml'), 0o644);
   writeFileSync(join(objDir, 'def.yaml'), 'prior broken object');
+  chmodSync(join(objDir, 'def.yaml'), 0o444);
+  assert.equal(statSync(objDir).mode & 0o777, 0o555);
+  assert.equal(statSync(join(objDir, 'nested')).mode & 0o777, 0o555);
   const indexBefore = readFileSync(storeIndexPath(root), 'utf8');
   const failing = fakeIngestor({ failVerify: (_input, call) => call === 1 || call === 3 });
 
@@ -624,6 +760,9 @@ test('install: failed replacement verification restores the prior broken object 
 
   assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'prior broken object');
   assert.equal(readFileSync(storeIndexPath(root), 'utf8'), indexBefore);
+  assert.equal(statSync(objDir).mode & 0o777, 0o555, 'rollback restores exact object-root mode');
+  assert.equal(statSync(join(objDir, 'nested')).mode & 0o777, 0o555, 'rollback preserves nested hardened mode');
+  assert.equal(statSync(join(objDir, 'def.yaml')).mode & 0o777, 0o444, 'rollback preserves hardened file mode');
   assert.ok(!existsSync(journalPath));
   assert.ok(!existsSync(join(root, '.owenloop-staging')));
 });
@@ -709,6 +848,186 @@ test('install: two concurrent installs into one root both land (no lost index up
   assert.equal(idx.entries['acme/beta@1.0.0']?.digest, mB.digest, 'second install recorded — no lost update');
 });
 
+test('readers: every digest-backed path waits across the destination-to-backup rename gap', { timeout: 20_000 }, async () => {
+  const fixture = await realRepairFixture('reader-gap');
+  const requestedDigest = defInstructionDigest(loadDefFile(join(fixture.objectDir, 'workflow.yaml')));
+  const stagingId = 'stg_reader_gap';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const globalRoot = tempDir('owenloop-reader-global-');
+  const controlDir = tempDir('owenloop-reader-control-');
+  const roles = ['resolve', 'instruction-uncached', 'instruction-cached', 'definitions', 'verify'] as const;
+  const sleepWord = new Int32Array(new SharedArrayBuffer(4));
+  const waitForPaths = (paths: string[], label: string, timeoutMs = 5_000): void => {
+    const deadline = Date.now() + timeoutMs;
+    while (!paths.every((path) => existsSync(path))) {
+      if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
+      Atomics.wait(sleepWord, 0, 0, 10);
+    }
+  };
+
+  const storeModule = new URL('../src/store/index.ts', import.meta.url).href;
+  const childScript = `
+    import { existsSync, writeFileSync } from 'node:fs';
+    import { join } from 'node:path';
+    import { setTimeout as delay } from 'node:timers/promises';
+    import {
+      createBundleIngestor,
+      createStoreInstructionSource,
+      loadCasDefs,
+      resolveWorkflowDigest,
+      verifyWorkflowObjectSync,
+    } from ${JSON.stringify(storeModule)};
+
+    const role = process.env.READER_ROLE;
+    const root = process.env.READER_ROOT;
+    const globalRoot = process.env.READER_GLOBAL_ROOT;
+    const digest = process.env.READER_DIGEST;
+    const requestedDigest = process.env.READER_INSTRUCTION_DIGEST;
+    const objectDir = process.env.READER_OBJECT_DIR;
+    const controlDir = process.env.READER_CONTROL_DIR;
+    if (!role || !root || !globalRoot || !digest || !requestedDigest || !objectDir || !controlDir) {
+      throw new Error('reader child is missing required environment');
+    }
+    const waitForFile = async (path) => {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(path)) {
+	if (Date.now() >= deadline) throw new Error('timed out waiting for ' + path);
+	await delay(5);
+      }
+    };
+    const resultPath = join(controlDir, 'result-' + role + '.json');
+    try {
+      const verifier = createBundleIngestor();
+      const instructionSource = role === 'instruction-cached'
+	? createStoreInstructionSource({ projectRoot: root, globalRoot, verifier })
+	: undefined;
+      if (instructionSource !== undefined) {
+	const initial = await instructionSource.prime(requestedDigest);
+	if (initial !== 'resolved') throw new Error('cached reader could not prime before repair');
+	writeFileSync(join(controlDir, 'cached-ready'), 'ready');
+      }
+      await waitForFile(join(controlDir, 'gap-open'));
+      writeFileSync(join(controlDir, 'started-' + role), 'started');
+
+      let detail;
+      if (role === 'resolve') {
+	const resolved = await resolveWorkflowDigest({ digest, projectRoot: root, globalRoot, verifier });
+	detail = { level: resolved.level };
+      } else if (role === 'instruction-uncached') {
+	const source = createStoreInstructionSource({ projectRoot: root, globalRoot, verifier });
+	detail = { status: await source.prime(requestedDigest) };
+      } else if (role === 'instruction-cached') {
+	const status = await instructionSource.prime(requestedDigest);
+	detail = { status, retained: instructionSource.getVerifiedObject(requestedDigest) !== undefined };
+      } else if (role === 'definitions') {
+	const warnings = [];
+	const defs = loadCasDefs({ projectRoot: root, globalRoot, warn: (line) => warnings.push(line) });
+	detail = { count: defs.length, warnings };
+      } else if (role === 'verify') {
+	verifyWorkflowObjectSync(objectDir, digest);
+	detail = { verified: true };
+      } else {
+	throw new Error('unknown reader role ' + role);
+      }
+      writeFileSync(resultPath, JSON.stringify({ ok: true, detail }));
+    } catch (error) {
+      writeFileSync(resultPath, JSON.stringify({ ok: false, error: error?.stack ?? String(error) }));
+      process.exitCode = 1;
+    }
+  `;
+
+  const children = roles.map((role) => {
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', childScript], {
+      env: {
+	...process.env,
+	READER_ROLE: role,
+	READER_ROOT: fixture.root,
+	READER_GLOBAL_ROOT: globalRoot,
+	READER_DIGEST: fixture.digest,
+	READER_INSTRUCTION_DIGEST: requestedDigest,
+	READER_OBJECT_DIR: fixture.objectDir,
+	READER_CONTROL_DIR: controlDir,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    const done = new Promise<void>((resolveChild, rejectChild) => {
+      child.once('error', rejectChild);
+      child.once('exit', (code, signal) => {
+	if (code === 0) resolveChild();
+	else rejectChild(new Error(`${role} reader exited with code ${String(code)} signal ${String(signal)}: ${stderr}`));
+      });
+    });
+    return { role, done };
+  });
+
+  waitForPaths([join(controlDir, 'cached-ready')], 'cached instruction reader to prime');
+  const journalBase = {
+    version: 2 as const,
+    phase: 'applying' as const,
+    operation: 'repair' as const,
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+  };
+  writeAddJournal(fixture.journalPath, journalBase);
+  let hookFailure: Error | undefined;
+  const handle = commitInstall(fixture.root, objectDestRelPath(fixture.digest), stagingDir, {
+    afterBackupRename: () => {
+      writeFileSync(join(controlDir, 'gap-open'), 'open');
+      try {
+	waitForPaths(
+	  roles.map((role) => join(controlDir, `started-${role}`)),
+	  'all readers to enter the rename gap',
+	);
+	Atomics.wait(sleepWord, 0, 0, 100);
+	const early = roles.filter((role) => existsSync(join(controlDir, `result-${role}.json`)));
+	if (early.length > 0) {
+	  hookFailure = new Error(`readers returned while the digest destination was absent: ${early.join(', ')}`);
+	}
+      } catch (error) {
+	hookFailure = error as Error;
+      }
+    },
+  });
+
+  writeAddJournal(fixture.journalPath, { ...journalBase, phase: 'replacement-swapped' });
+  hardenObjectModes(handle.dest);
+  writeAddJournal(fixture.journalPath, { ...journalBase, phase: 'replacement-hardened' });
+  verifyWorkflowObjectSync(handle.dest, fixture.digest, { coordinateRepair: false });
+  writeAddJournal(fixture.journalPath, { ...journalBase, phase: 'replacement-verified' });
+  writeAddJournal(fixture.journalPath, { ...journalBase, phase: 'finalizing' });
+  finalizeInstallCommit(handle);
+  removeAddJournal(fixture.journalPath);
+
+  await Promise.all(children.map((child) => child.done));
+  if (hookFailure !== undefined) throw hookFailure;
+  for (const role of roles) {
+    const result = JSON.parse(readFileSync(join(controlDir, `result-${role}.json`), 'utf8')) as {
+      ok: boolean;
+      detail?: { status?: string; retained?: boolean; count?: number; warnings?: string[]; verified?: boolean };
+      error?: string;
+    };
+    assert.equal(result.ok, true, `${role}: ${result.error ?? 'reader failed'}`);
+    if (role === 'instruction-uncached' || role === 'instruction-cached') {
+      assert.equal(result.detail?.status, 'resolved', `${role} never returns unknown-digest`);
+    }
+    if (role === 'instruction-cached') {
+      assert.equal(result.detail?.retained, true, 'transient repair gap does not evict the valid cache entry');
+    }
+    if (role === 'definitions') {
+      assert.ok((result.detail?.count ?? 0) > 0, 'definition discovery does not skip the valid object');
+      assert.deepEqual(result.detail?.warnings, [], 'definition discovery emits no repair-gap warning');
+    }
+    if (role === 'verify') assert.equal(result.detail?.verified, true);
+  }
+  assertHardenedRepairTree(fixture);
+});
+
 // ---- fail-closed adapters ------------------------------------------------------------
 
 test('install: a missing A1 adapter fails closed before any commit', async () => {
@@ -770,84 +1089,173 @@ test('recovery: crash BEFORE the swap — staged debris cleared, dest never crea
   assert.equal(await recoverWorkflowStore({ root, lockPath, journalPath }), 'no-journal');
 });
 
-test('recovery: same-digest repair crash before swap keeps the indexed prior object', async () => {
-  const { root, lockPath, journalPath, digest, objDir, metadataHash } =
-    await indexedObjectForRecovery('repair-before-swap');
-  chmodSync(objDir, 0o755);
-  chmodSync(join(objDir, 'def.yaml'), 0o644);
-  writeFileSync(join(objDir, 'def.yaml'), 'BROKEN PRIOR');
+test('recovery: same-digest repair crash before swap restores the prior object and permits reinstall', async () => {
+  const fixture = await realRepairFixture('repair-before-swap');
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const priorInode = statSync(fixture.objectDir).ino;
   const stagingId = 'stg_repair_before_swap';
-  const stagedDir = join(root, '.owenloop-staging', stagingId);
-  mkdirSync(stagedDir, { recursive: true });
-  writeFileSync(join(stagedDir, 'def.yaml'), 'CLEAN STAGED');
-  writeAddJournal(journalPath, {
-    version: 2, phase: 'applying',
-    destSegments: ['objects', 'sha256', digest],
-    stagingId, hadDest: true, root, metadataHash,
+  stageRealReplacement(fixture, stagingId);
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'applying',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
   });
 
-  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath });
-
-  assert.equal(outcome, 'rolled-forward');
-  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'BROKEN PRIOR');
-  assert.ok(!existsSync(join(root, '.owenloop-staging')));
-  assert.ok(!existsSync(journalPath));
-});
-
-test('recovery: same-digest repair crash after backup rename restores the indexed prior object', async () => {
-  const { root, lockPath, journalPath, digest, objDir, metadataHash } =
-    await indexedObjectForRecovery('repair-after-backup');
-  chmodSync(objDir, 0o755);
-  chmodSync(join(objDir, 'def.yaml'), 0o644);
-  writeFileSync(join(objDir, 'def.yaml'), 'BROKEN PRIOR');
-  const stagingId = 'stg_repair_after_backup';
-  const stagingRoot = join(root, '.owenloop-staging');
-  const stagedDir = join(stagingRoot, stagingId);
-  const backupDir = join(stagingRoot, `${stagingId}-old`);
-  mkdirSync(stagedDir, { recursive: true });
-  writeFileSync(join(stagedDir, 'def.yaml'), 'CLEAN STAGED');
-  renameSync(objDir, backupDir);
-  writeAddJournal(journalPath, {
-    version: 2, phase: 'applying',
-    destSegments: ['objects', 'sha256', digest],
-    stagingId, hadDest: true, root, metadataHash,
+  const outcome = await recoverWorkflowStore({
+    root: fixture.root,
+    lockPath: fixture.lockPath,
+    journalPath: fixture.journalPath,
   });
-
-  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath });
 
   assert.equal(outcome, 'rolled-back');
-  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'BROKEN PRIOR');
-  assert.ok(!existsSync(stagingRoot));
-  assert.ok(!existsSync(journalPath));
+  assert.equal(statSync(fixture.objectDir).ino, priorInode, 'recovery leaves the prior object in place');
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o777,
+    0o644,
+    'the prior mode is restored exactly',
+  );
+  assert.ok(!existsSync(join(fixture.root, '.owenloop-staging')));
+  assert.ok(!existsSync(fixture.journalPath));
+  await assertBrokenRecoveryReinstallsAndThenDedupes(fixture);
 });
 
-test('recovery: same-digest repair crash after replacement swap keeps the repaired object', async () => {
-  const { root, lockPath, journalPath, digest, objDir, metadataHash } =
-    await indexedObjectForRecovery('repair-after-swap');
-  chmodSync(objDir, 0o755);
-  chmodSync(join(objDir, 'def.yaml'), 0o644);
-  writeFileSync(join(objDir, 'def.yaml'), 'BROKEN PRIOR');
-  const stagingId = 'stg_repair_after_swap';
-  const stagingRoot = join(root, '.owenloop-staging');
-  const stagedDir = join(stagingRoot, stagingId);
-  const backupDir = join(stagingRoot, `${stagingId}-old`);
-  mkdirSync(stagedDir, { recursive: true });
-  writeFileSync(join(stagedDir, 'def.yaml'), 'CLEAN REPLACEMENT');
-  renameSync(objDir, backupDir);
-  renameSync(stagedDir, objDir);
-  writeAddJournal(journalPath, {
-    version: 2, phase: 'applying',
-    destSegments: ['objects', 'sha256', digest],
-    stagingId, hadDest: true, root, metadataHash,
+test('recovery: same-digest repair crash after backup rename restores exact modes and permits reinstall', async () => {
+  const fixture = await realRepairFixture('repair-after-backup');
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const priorInode = statSync(fixture.objectDir).ino;
+  const stagingId = 'stg_repair_after_backup';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  renameDirRestoringWrite(fixture.objectDir, backupDir);
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'applying',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
   });
 
-  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath });
+  const outcome = await recoverWorkflowStore({
+    root: fixture.root,
+    lockPath: fixture.lockPath,
+    journalPath: fixture.journalPath,
+  });
 
-  assert.equal(outcome, 'rolled-forward');
-  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), 'CLEAN REPLACEMENT');
-  assert.ok(!existsSync(stagingRoot));
-  assert.ok(!existsSync(journalPath));
+  assert.equal(outcome, 'rolled-back');
+  assert.equal(statSync(fixture.objectDir).ino, priorInode, 'recovery restores the retained prior directory');
+  assert.equal(statSync(fixture.objectDir).mode & 0o777, 0o555, 'recovery restores the exact prior root mode');
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.nestedDirRel)).mode & 0o777,
+    0o555,
+    'recovery preserves the nested directory mode',
+  );
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.executableRel)).mode & 0o777,
+    0o555,
+    'recovery preserves the executable file mode',
+  );
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o777,
+    0o644,
+    'recovery restores the prior non-executable mode exactly',
+  );
+  assert.ok(!existsSync(join(fixture.root, '.owenloop-staging')));
+  assert.ok(!existsSync(fixture.journalPath));
+  await assertBrokenRecoveryReinstallsAndThenDedupes(fixture);
 });
+
+const repairCrashScenarios = [
+  {
+    // The destination rename completed, but the phase rewrite did not. Recovery
+    // must use operation:'repair', not the unchanged index hash, to resume safely.
+    name: 'immediately after replacement swap before its phase rewrite',
+    phase: 'applying' as const,
+    prepareReplacement: (_fixture: RealRepairFixture): void => {},
+  },
+  {
+    name: 'during partial recursive hardening',
+    phase: 'replacement-swapped' as const,
+    prepareReplacement: (fixture: RealRepairFixture): void => {
+      chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o444);
+      chmodSync(join(fixture.objectDir, fixture.nestedDirRel), 0o555);
+      // The root and executable remain writable. Recovery must rerun the full
+      // recursive hardener instead of trusting the partially changed tree.
+      assert.notEqual(statSync(fixture.objectDir).mode & 0o200, 0, 'object root remains writable mid-harden');
+      assert.notEqual(
+	statSync(join(fixture.objectDir, fixture.executableRel)).mode & 0o200,
+	0,
+	'executable remains writable mid-harden',
+      );
+    },
+  },
+  {
+    name: 'after hardening before post-swap verification',
+    phase: 'replacement-hardened' as const,
+    prepareReplacement: (fixture: RealRepairFixture): void => hardenObjectModes(fixture.objectDir),
+  },
+  {
+    name: 'after successful post-swap verification before final cleanup',
+    phase: 'replacement-verified' as const,
+    prepareReplacement: (fixture: RealRepairFixture): void => {
+      hardenObjectModes(fixture.objectDir);
+      verifyWorkflowObjectSync(fixture.objectDir, fixture.digest, { coordinateRepair: false });
+    },
+  },
+];
+
+for (const scenario of repairCrashScenarios) {
+  test(`recovery: same-digest repair crash ${scenario.name} resumes safely and then dedupes`, async () => {
+    const fixture = await realRepairFixture(`repair-${scenario.phase}`);
+    // The retained prior object has the right canonical bytes but a writable
+    // non-executable file, which is enough to require same-digest repair.
+    chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+    await assert.rejects(
+      createBundleIngestor().verifyInstalledObject({
+	objectDir: fixture.objectDir,
+	digest: fixture.digest,
+      }),
+      /regular file mode is 0644, expected hardened store mode 0444/,
+    );
+
+    const stagingId = `stg_${scenario.phase.replaceAll('-', '_')}`;
+    const stagingDir = stageRealReplacement(fixture, stagingId);
+    const backupDir = `${stagingDir}-old`;
+    renameDirRestoringWrite(fixture.objectDir, backupDir);
+    renameSync(stagingDir, fixture.objectDir);
+    scenario.prepareReplacement(fixture);
+    writeAddJournal(fixture.journalPath, {
+      version: 2,
+      phase: scenario.phase,
+      operation: 'repair',
+      destSegments: ['objects', 'sha256', fixture.digest],
+      stagingId,
+      hadDest: true,
+      root: fixture.root,
+      metadataHash: fixture.metadataHash,
+    });
+
+    const outcome = await recoverWorkflowStore({
+      root: fixture.root,
+      lockPath: fixture.lockPath,
+      journalPath: fixture.journalPath,
+    });
+
+    assert.equal(outcome, 'rolled-forward');
+    assertHardenedRepairTree(fixture);
+    assert.ok(!existsSync(backupDir), 'the retained prior object is deleted only after verification');
+    assert.ok(!existsSync(join(fixture.root, '.owenloop-staging')));
+    assert.ok(!existsSync(fixture.journalPath));
+    await assertHealthyReinstallDedupesWithoutReplacement(fixture);
+  });
+}
 
 test('recovery: symlinked object parents are refused before any recovery mutation', async () => {
   const { root, lockPath, journalPath } = tempStore();
@@ -959,32 +1367,74 @@ test('recovery: crash BETWEEN the swap and the index write — the backup is res
   assert.equal(await recoverWorkflowStore({ root, lockPath, journalPath }), 'no-journal', 'second recovery is a no-op');
 });
 
-test('recovery: crash AFTER the index write (finalizing) — rolls forward, keeps the object, drops the backup', async () => {
-  const { root, lockPath, journalPath } = tempStore();
-  const digest = defDigest('f'.repeat(64));
-  const objDir = join(root, objectDestRelPath(digest));
-  const stagingRoot = join(root, '.owenloop-staging');
-  const stagingId = 'stg_crash3';
-  const backupDir = join(stagingRoot, `${stagingId}-old`);
-  mkdirSync(objDir, { recursive: true });
-  writeFileSync(join(objDir, 'def.yaml'), validDefYaml('done'));
-  mkdirSync(backupDir, { recursive: true });
-  writeFileSync(join(backupDir, 'def.yaml'), 'OLD');
-  writeAddJournal(journalPath, {
-    version: 2, phase: 'finalizing',
-    destSegments: ['objects', 'sha256', digest],
-    stagingId, hadDest: true, root,
-    metadataHash: sha256Hex(canonicalJsonBytes({ version: 1, entries: {} })),
+test('recovery: crash after the repair commit point re-verifies before deleting the backup', async () => {
+  const fixture = await realRepairFixture('repair-finalizing');
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const stagingId = 'stg_repair_finalizing';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  renameDirRestoringWrite(fixture.objectDir, backupDir);
+  renameSync(stagingDir, fixture.objectDir);
+  hardenObjectModes(fixture.objectDir);
+  verifyWorkflowObjectSync(fixture.objectDir, fixture.digest, { coordinateRepair: false });
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'finalizing',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
   });
 
-  const outcome = await recoverWorkflowStore({ root, lockPath, journalPath });
+  const outcome = await recoverWorkflowStore({
+    root: fixture.root,
+    lockPath: fixture.lockPath,
+    journalPath: fixture.journalPath,
+  });
 
   assert.equal(outcome, 'rolled-forward');
-  assert.equal(readFileSync(join(objDir, 'def.yaml'), 'utf8'), validDefYaml('done'), 'installed object kept');
-  assert.ok(!existsSync(backupDir), 'retained backup discarded');
-  assert.ok(!existsSync(stagingRoot), 'staging cleared');
-  assert.ok(!existsSync(journalPath));
-  assert.equal(await recoverWorkflowStore({ root, lockPath, journalPath }), 'no-journal');
+  assertHardenedRepairTree(fixture);
+  assert.ok(!existsSync(backupDir), 'retained backup discarded after re-verification');
+  assert.ok(!existsSync(join(fixture.root, '.owenloop-staging')));
+  assert.ok(!existsSync(fixture.journalPath));
+  assert.equal(
+    await recoverWorkflowStore({ root: fixture.root, lockPath: fixture.lockPath, journalPath: fixture.journalPath }),
+    'no-journal',
+  );
+  await assertHealthyReinstallDedupesWithoutReplacement(fixture);
+});
+
+test('recovery: a durable verified phase never accepts a replacement made writable afterward', async () => {
+  const fixture = await realRepairFixture('repair-verified-tamper');
+  const stagingId = 'stg_repair_verified_tamper';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  renameDirRestoringWrite(fixture.objectDir, backupDir);
+  renameSync(stagingDir, fixture.objectDir);
+  hardenObjectModes(fixture.objectDir);
+  verifyWorkflowObjectSync(fixture.objectDir, fixture.digest, { coordinateRepair: false });
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'replacement-verified',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+  });
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+
+  await assert.rejects(
+    recoverWorkflowStore({ root: fixture.root, lockPath: fixture.lockPath, journalPath: fixture.journalPath }),
+    /failed canonical or hardened-mode verification.*regular file mode is 0644/s,
+  );
+
+  assert.ok(existsSync(backupDir), 'the prior object remains retained');
+  assert.ok(existsSync(fixture.journalPath), 'the journal remains for explicit recovery');
+  assert.equal(statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o777, 0o644);
 });
 
 test('recovery: a v1 journal at a project path is refused without a ledger (fail-closed)', async () => {

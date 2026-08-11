@@ -3,8 +3,8 @@
  * validated staging tree into place atomically: safe staging, the atomic
  * destination→backup / staging→destination swap with a retained backup,
  * finalize/rollback, the atomic metadata write, the per-root install lock, the
- * two durable crash-journal phases, and recovery driven by BOTH the metadata
- * commit state and the actual filesystem state.
+ * base applying/finalizing crash-journal phases, the v2 repair substates, and
+ * recovery driven by durable phase, metadata, and actual filesystem state.
  *
  * Two consumers share it today:
  *   - `src/add.ts` (the GitHub `owenloop add` route): metadata = `installed.json`,
@@ -15,10 +15,13 @@
  *     (`objects/sha256/<digest>`), v2 journal schema (identity = a
  *     metadata-hash match, no route-specific fields).
  *
- * The durable COMMIT POINT of the transaction is the atomic METADATA write.
- * Before it, recovery rolls BACK (restore the previous directory state); after
- * it, recovery rolls FORWARD (finish discarding the retained backup). The
- * journal is removed LAST so recovery stays idempotent (running it again
+ * For v1, fresh v2 installs, and v2 dedupe, the durable COMMIT POINT is the
+ * atomic METADATA write. Same-digest v2 repair is different: the metadata may
+ * already contain the target digest before replacement starts, so a matching
+ * metadata hash is never enough to accept the replacement. Repair recovery
+ * restores the prior backup or resumes recursive hardening plus exact content
+ * and mode verification; only `finalizing` makes the prior backup disposable.
+ * The journal is removed LAST so recovery stays idempotent (running it again
  * changes nothing).
  *
  * The journal is attacker-influenceable input (it may sit in a repo checkout):
@@ -353,6 +356,12 @@ export interface InstallCommitHandle {
   undoDir: string;
 }
 
+/** Deterministic synchronization hook for transaction crash/concurrency tests. */
+export interface CommitInstallOptions {
+  /** Runs after destination → backup and before staging → destination. */
+  afterBackupRename?: () => void;
+}
+
 /**
  * Atomically swap a validated `stagingDir` into place at `root/<destRelPath>`.
  * Both live on the same filesystem by construction (staging is under `root`),
@@ -375,7 +384,12 @@ export interface InstallCommitHandle {
  * the backup back (throwing {@link RollbackFailedError} if even that fails, so
  * the caller can preserve the named copy).
  */
-export function commitInstall(root: string, destRelPath: string, stagingDir: string): InstallCommitHandle {
+export function commitInstall(
+  root: string,
+  destRelPath: string,
+  stagingDir: string,
+  options: CommitInstallOptions = {},
+): InstallCommitHandle {
   const violation = multiSegmentPathViolation(destRelPath);
   if (violation) {
     throw new Error(`refusing to install unsafe destination path '${destRelPath}': ${violation}`);
@@ -414,21 +428,22 @@ export function commitInstall(root: string, destRelPath: string, stagingDir: str
   const backupDir = `${stagingDir}-old`;
   const undoDir = `${stagingDir}-undo`;
   let backedUp = false;
-  if (probeDirectoryPath(dest, 'install destination', root) === 'dir') {
-    // Ownership is verified by the caller before we get here. If this rename
-    // throws, nothing has changed — dest is still the previous install. The
-    // rename restores write modes first: the displaced dir may hold a hardened
-    // CAS object (an index-less object dir being overwritten is rare, but the
-    // move must work when it happens).
-    renameDirRestoringWrite(dest, backupDir);
-    backedUp = true;
-  }
   try {
+    if (probeDirectoryPath(dest, 'install destination', root) === 'dir') {
+      // Ownership is verified by the caller before we get here. If this rename
+      // throws, nothing has changed — dest is still the previous install. The
+      // rename restores write modes first: the displaced dir may hold a hardened
+      // CAS object (an index-less object dir being overwritten is rare, but the
+      // move must work when it happens).
+      renameDirRestoringWrite(dest, backupDir);
+      backedUp = true;
+      options.afterBackupRename?.();
+    }
     renameSync(stagingDir, dest);
   } catch (e) {
     if (backedUp) {
       try {
-        renameSync(backupDir, dest);
+	renameDirRestoringWrite(backupDir, dest);
       } catch (rollbackErr) {
         // Near-impossible (same fs), but if even the rollback fails, name the
         // backup so the previous version is recoverable by hand — and signal
@@ -457,16 +472,55 @@ export function finalizeInstallCommit(handle: InstallCommitHandle): void {
 }
 
 /**
- * Rename a directory that may hold hardened content (a content-addressed
- * object is committed 0o555): restore the write bit first, because rename(2)
- * updates the renamed directory's `..` entry and needs the directory's OWN
- * write permission. Only used on rollback/recovery paths, where the source is
- * the caller's own just-committed or crash-parked copy — never a stored
- * object being served. Throws propagate.
+ * Rename a directory without changing its durable mode. Hardened object roots
+ * are 0o555; some filesystems or test doubles require owner-write permission
+ * while moving them. Record the exact source mode, add only owner-write for the
+ * rename, then restore the recorded mode at the destination. A failed rename
+ * restores the recorded mode at the source before the original error escapes.
  */
-function renameDirRestoringWrite(src: string, dst: string): void {
-  chmodSync(src, 0o755);
-  renameSync(src, dst);
+export function renameDirRestoringWrite(src: string, dst: string): void {
+  const sourceStat = lstatSync(src);
+  if (sourceStat.isSymbolicLink() || !sourceStat.isDirectory()) {
+    throw new Error(`refusing to rename '${src}': source is not a real directory`);
+  }
+  const originalMode = sourceStat.mode & 0o7777;
+  const temporaryMode = originalMode | 0o200;
+  if (temporaryMode !== originalMode) chmodSync(src, temporaryMode);
+  try {
+    renameSync(src, dst);
+  } catch (renameError) {
+    if (temporaryMode !== originalMode) {
+      try {
+	chmodSync(src, originalMode);
+      } catch (restoreError) {
+	throw new AggregateError(
+	  [renameError, restoreError],
+	  `rename of '${src}' to '${dst}' failed and restoring source mode ${originalMode.toString(8)} failed`,
+	);
+      }
+    }
+    throw renameError;
+  }
+
+  if (temporaryMode !== originalMode) {
+    try {
+      chmodSync(dst, originalMode);
+    } catch (restoreError) {
+      // Do not leave a moved object writable. Best-effort move it back and
+      // restore the source mode; if either recovery step fails, report every
+      // fault so the caller preserves the transaction journal and backup.
+      try {
+	renameSync(dst, src);
+	chmodSync(src, originalMode);
+      } catch (rollbackError) {
+	throw new AggregateError(
+	  [restoreError, rollbackError],
+	  `renamed '${src}' to '${dst}' but could not restore mode ${originalMode.toString(8)} or move it back`,
+	);
+      }
+      throw restoreError;
+    }
+  }
 }
 
 /**
@@ -532,9 +586,11 @@ export const releaseInstallLock = releaseFileLock;
 //     commit-point detection matches the `installed.json` ledger on
 //     source+sha+path (with old-name migration corroboration).
 //   - v2 (the CAS route and any future route): identity-free except for the
-//     destination segment set; commit-point detection hashes the CURRENT
-//     metadata bytes against the journal's `metadataHash` — no route-specific
-//     schema (no 40-char sha) is baked into the generic transaction.
+//     destination segment set; ordinary commit-point detection hashes the
+//     CURRENT metadata bytes against the journal's `metadataHash`. Same-digest
+//     repair instead uses explicit replacement phases because the index hash may
+//     match before the replacement starts. No route-specific schema (no 40-char
+//     sha) is baked into the generic transaction.
 //
 // `recoverInterruptedInstall` reads BOTH versions and dispatches on `version`,
 // so `owenloop add --recover` recovers a journal written by an older release
@@ -544,11 +600,10 @@ export const releaseInstallLock = releaseFileLock;
 export const ADD_JOURNAL_FILENAME = 'add.journal';
 
 /**
- * The two durable phases an in-flight install can be caught in. Absent (no
- * file) is the third, happy state. Deliberately coarse — every extra journal
- * rewrite is itself a crash window, and each install step is a single atomic
- * rename, so directory existence/absence recovers the fine-grained progress the
- * two phases don't record.
+ * The two base durable phases shared by v1 and ordinary v2 transactions. Absent
+ * (no file) is the third, happy state. V2 same-digest repair extends these phases
+ * with the substates in {@link InstallJournalV2Phase}; ordinary transactions stay
+ * deliberately coarse because directory existence recovers their progress.
  *
  * - `applying`: written after staging+validation succeed, immediately before
  *   `commitInstall`. The metadata write (the durable commit point) has NOT yet
@@ -560,6 +615,22 @@ export const ADD_JOURNAL_FILENAME = 'add.journal';
  *   FORWARD (finishes discarding the retained backup).
  */
 export type AddJournalPhase = 'applying' | 'finalizing';
+
+/**
+ * Durable v2 repair phases. Each phase is written only after the named step has
+ * completed, so recovery never infers repair completion from unchanged index
+ * bytes. Readers wait while any replacement phase is active and resume only at
+ * `finalizing`, after hardening, canonical verification, hardened-mode
+ * verification, and the metadata commit point have all completed.
+ */
+export type InstallJournalV2Phase =
+  | AddJournalPhase
+  | 'replacement-swapped'
+  | 'replacement-hardened'
+  | 'replacement-verified';
+
+/** The v2 transaction kind; recorded so same-digest repair is never mistaken for dedupe. */
+export type InstallJournalV2Operation = 'install' | 'dedupe' | 'repair';
 
 /**
  * One v1 (GitHub-route) crash-recovery journal record. `folder`, `stagingId`,
@@ -604,7 +675,9 @@ export interface AddJournal {
  */
 export interface InstallJournalV2 {
   version: 2;
-  phase: AddJournalPhase;
+  phase: InstallJournalV2Phase;
+  /** Explicitly separates a same-digest repair from a no-swap dedupe. */
+  operation?: InstallJournalV2Operation;
   /** Destination path segments relative to the root (validated, never joined raw). */
   destSegments: string[];
   /** Basename of this run's staging dir (`stg_<hex>`). Single segment. */
@@ -706,8 +779,38 @@ export function validateInstallJournalV2(parsed: unknown, path: string): Install
   if (parsed.version !== 2) {
     return fail(`unsupported journal version ${JSON.stringify(parsed.version)} (expected 2)`);
   }
-  if (parsed.phase !== 'applying' && parsed.phase !== 'finalizing') {
-    return fail(`unknown phase ${JSON.stringify(parsed.phase)} (expected 'applying' or 'finalizing')`);
+  if (
+    parsed.phase !== 'applying' &&
+    parsed.phase !== 'replacement-swapped' &&
+    parsed.phase !== 'replacement-hardened' &&
+    parsed.phase !== 'replacement-verified' &&
+    parsed.phase !== 'finalizing'
+  ) {
+    return fail(
+      `unknown phase ${JSON.stringify(parsed.phase)} ` +
+	`(expected 'applying', 'replacement-swapped', 'replacement-hardened', ` +
+	`'replacement-verified', or 'finalizing')`,
+    );
+  }
+  if (
+    parsed.operation !== undefined &&
+    parsed.operation !== 'install' &&
+    parsed.operation !== 'dedupe' &&
+    parsed.operation !== 'repair'
+  ) {
+    return fail("'operation' is not 'install', 'dedupe', or 'repair'");
+  }
+  if (typeof parsed.phase === 'string' && parsed.phase.startsWith('replacement-') && parsed.operation !== 'repair') {
+    return fail(`phase '${parsed.phase}' requires operation 'repair'`);
+  }
+  if (parsed.operation === 'repair' && parsed.hadDest !== true) {
+    return fail("operation 'repair' requires 'hadDest' true");
+  }
+  if (parsed.operation === 'dedupe' && parsed.hadDest !== true) {
+    return fail("operation 'dedupe' requires 'hadDest' true");
+  }
+  if (parsed.operation === 'install' && parsed.hadDest !== false) {
+    return fail("operation 'install' requires 'hadDest' false");
   }
   if (!Array.isArray(parsed.destSegments) || parsed.destSegments.length === 0) {
     return fail("'destSegments' is not a non-empty array");
@@ -967,15 +1070,24 @@ function assertUnderRoot(p: string, root: string, journalPath: string): void {
  */
 export type LedgerLookup = (source: string) => { sha: string; path: string } | undefined;
 
+export interface V2ReplacementRecoveryActions {
+  /** Idempotently harden the replacement object recursively. */
+  harden(objectDir: string): void;
+  /** Verify canonical identity and exact hardened store modes. */
+  verify(objectDir: string, digest: string): void;
+}
+
 export interface RecoverInterruptedInstallArgs {
   /** The CURRENT run's resolved root — every mutation path derives from it. */
   defsDir: string;
   /** Path to the crash-recovery journal. */
   journalPath: string;
-  /** Path to the metadata file (v1: `installed.json`) — the commit-point oracle. */
+  /** Metadata path (v1 `installed.json`, v2 `index.json`) used by ordinary commit-point checks. */
   lockfilePath: string;
   /** Directory holding external fresh-install corroboration markers. */
   recoveryMarkerDir?: string;
+  /** CAS repair actions required to resume a swapped v2 replacement safely. */
+  v2Replacement?: V2ReplacementRecoveryActions;
   /** See {@link LedgerLookup}. */
   readLedger?: () => LedgerLookup;
 }
@@ -997,33 +1109,37 @@ export type RecoveryOutcome = 'no-journal' | 'rolled-forward' | 'rolled-back';
  * live under the staging root). No journal ⇒ returns immediately (happy path
  * unchanged). Reads BOTH journal versions and dispatches on `version`.
  *
- * Roll-forward vs roll-back rule: the durable metadata write is the commit
- * point. At or past it, roll FORWARD (finish the discard); before it, roll
- * BACK (restore the previous state). Concretely:
+ * Ordinary v1/v2 transactions use the durable metadata write as the commit
+ * point. Same-digest v2 repair cannot: the index may already match before the
+ * replacement starts, so explicit replacement phases control recovery.
+ * Concretely:
  *
- *  1. `finalizing` ⇒ roll forward: the metadata is durably new; only finalize's
- *     discards may be missing. Clear the retained backup and the staging root.
- *     Trivially idempotent.
- *  2. `applying` + the commit-point test passes (v1: ledger records this exact
- *     source@sha/path; v2: `hash(current metadata bytes) === metadataHash`) ⇒
- *     the commit MAY have landed, but the test alone does not prove it — branch
- *     on disk: dest present ⇒ the swap completed ⇒ roll forward; dest ABSENT ⇒
- *     a same-content re-install crashed inside commitInstall's dest→backup /
- *     staging→dest window and backupDir holds the only copy ⇒ roll back
- *     (restore it) rather than discarding it (which would be silent data loss
- *     against metadata that still records the install).
- *  3. `applying`, commit point not reached ⇒ roll back through the guarded,
- *     idempotent decision table below (mirroring `rollbackInstallCommit`'s
- *     order) — EXCEPT the v1 case-(c) fresh-install discard, which acts on the
- *     journal alone (staging + backup both absent) and so requires LEDGER
- *     corroboration of an interrupted old-name migration
- *     (`installed.path === journal.oldNamePath`) before it will delete an
- *     existing dest; uncorroborated ⇒ refuse fail-closed, mutate nothing, leave
- *     the journal and dest in place (the journal is repo-committable, so a
- *     forged one must never drive a deletion). v2 has no journal-alone
- *     destructive arm: with staging and backup both absent, a v2 recovery
- *     touches nothing and only removes the journal — a forged v2 journal can
- *     never delete a directory.
+ *  1. `finalizing` ⇒ roll forward. V2 first re-verifies the exact destination's
+ *     canonical bytes and hardened modes; only then may recovery discard the
+ *     retained backup and staging root. V1 has no CAS verifier and performs the
+ *     original cleanup behavior.
+ *  2. V2 repair in `applying`, `replacement-swapped`,
+ *     `replacement-hardened`, or `replacement-verified` ⇒ inspect disk state.
+ *     If the swap did not complete, fall through to the rollback table and
+ *     restore the prior backup. If the replacement occupies the destination and
+ *     the prior backup is retained, resume hardening when needed, re-run content
+ *     and exact-mode verification regardless of the recorded verified phase,
+ *     advance to `finalizing`, and only then discard the backup. A matching index
+ *     hash never accepts a repair by itself.
+ *  3. Ordinary `applying` + the commit-point test passes (v1: ledger records
+ *     this exact source@sha/path; v2: `hash(current metadata bytes) ===
+ *     metadataHash`) ⇒ the commit MAY have landed, but the test alone does not
+ *     prove it. Destination present means the swap completed and recovery rolls
+ *     forward. Destination absent means recovery is inside the destination →
+ *     backup / staging → destination window, so recovery restores the backup
+ *     instead of deleting the only copy.
+ *  4. Ordinary `applying`, commit point not reached ⇒ roll back through the
+ *     guarded, idempotent decision table below (mirroring
+ *     `rollbackInstallCommit`'s order) — EXCEPT the v1 case-(c) fresh-install
+ *     discard, which acts on the journal alone and therefore requires ledger
+ *     corroboration of an interrupted old-name migration. V2 has no
+ *     journal-alone destructive arm, so a forged v2 journal cannot delete an
+ *     unrelated destination.
  *
  * Crash-safety of recovery itself: the journal is removed LAST, after all
  * restore/discard renames, and every step is a single atomic rename guarded by
@@ -1132,9 +1248,98 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     removeRecoveryMarkerAfterJournal();
   };
 
-  if (journal.phase === 'finalizing') {
+  const requireV2ReplacementActions = (): V2ReplacementRecoveryActions => {
+    if (args.v2Replacement === undefined) {
+      throw recoveryRefusal(
+	journalPath,
+	'a v2 content-addressed replacement requires canonical and hardened-mode recovery verification',
+      );
+    }
+    return args.v2Replacement;
+  };
+
+  const verifyV2Destination = (): void => {
+    if (journal.version !== 2) return;
+    const digest = journal.destSegments.at(-1);
+    if (digest === undefined) {
+      throw recoveryRefusal(journalPath, 'v2 destination has no digest segment');
+    }
+    try {
+      requireV2ReplacementActions().verify(dest, digest);
+    } catch (e) {
+      throw recoveryRefusal(
+	journalPath,
+	`replacement at '${dest}' failed canonical or hardened-mode verification: ${(e as Error).message}`,
+      );
+    }
+  };
+
+  const resumeV2Repair = (): RecoveryOutcome => {
+    if (journal.version !== 2) {
+      throw recoveryRefusal(journalPath, 'internal recovery error: attempted v2 repair recovery for a v1 journal');
+    }
+    const stagingState = probeRecoveryDir(stagingDir, journalPath, 'staging dir', defsDir);
+    const backupState = probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir);
+    const destState = probeRecoveryDir(dest, journalPath, 'destination', defsDir);
+
+    // A swap that never completed, or a rollback that was interrupted between
+    // its two renames, must restore the retained prior object instead of trying
+    // to commit an absent/partial replacement.
+    if (stagingState === 'dir' || destState === 'absent') {
+      return 'rolled-back';
+    }
+    if (backupState !== 'dir') {
+      throw recoveryRefusal(
+	journalPath,
+	`repair phase '${journal.phase}' has no retained prior-object backup at '${backupDir}'`,
+      );
+    }
+
+    const actions = requireV2ReplacementActions();
+    const digest = journal.destSegments.at(-1);
+    if (digest === undefined) {
+      throw recoveryRefusal(journalPath, 'v2 destination has no digest segment');
+    }
+    if (journal.phase === 'applying' || journal.phase === 'replacement-swapped') {
+      try {
+	actions.harden(dest);
+      } catch (e) {
+	throw recoveryRefusal(journalPath, `could not finish replacement hardening: ${(e as Error).message}`);
+      }
+      writeAddJournal(journalPath, { ...journal, phase: 'replacement-hardened', operation: 'repair' });
+    }
+
+    // Re-run verification even when the durable phase already says verified.
+    // The journal proves ordering, not that the object was not modified after a
+    // crash. No backup is discarded until both invariants pass again now.
+    try {
+      actions.verify(dest, digest);
+    } catch (e) {
+      throw recoveryRefusal(
+	journalPath,
+	`replacement at '${dest}' failed canonical or hardened-mode verification: ${(e as Error).message}`,
+      );
+    }
+    writeAddJournal(journalPath, { ...journal, phase: 'replacement-verified', operation: 'repair' });
+    writeAddJournal(journalPath, { ...journal, phase: 'finalizing', operation: 'repair' });
     rollForward();
     return 'rolled-forward';
+  };
+
+  if (journal.phase === 'finalizing') {
+    // A v2 finalizing journal may be left after the index commit but before the
+    // backup was deleted. Re-verify the exact destination, including immutable
+    // store modes, before accepting it and deleting the retained prior object.
+    verifyV2Destination();
+    rollForward();
+    return 'rolled-forward';
+  }
+
+  if (journal.version === 2 && journal.phase !== 'applying') {
+    const outcome = resumeV2Repair();
+    if (outcome === 'rolled-forward') return outcome;
+    // A swapped-state journal with staging still present or destination absent
+    // falls through to the ordinary rollback table below.
   }
 
   // phase === 'applying': the metadata write may or may not have landed. The
@@ -1163,6 +1368,25 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     const installed = v1Lookup(journal.source);
     commitPointReached =
       installed !== undefined && installed.sha === journal.sha && installed.path === journal.folder;
+  }
+
+  const applyingRepair =
+    journal.version === 2 &&
+    journal.hadDest &&
+    (
+      journal.operation === 'repair' ||
+      (
+	journal.operation === undefined &&
+	commitPointReached &&
+	probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir) === 'dir'
+      )
+    );
+  if (applyingRepair) {
+    const outcome = resumeV2Repair();
+    if (outcome === 'rolled-forward') return outcome;
+    // The swap did not complete. Unchanged same-digest metadata is not a commit
+    // signal for repair; force the guarded rollback table below.
+    commitPointReached = false;
   }
 
   if (commitPointReached) {
@@ -1330,7 +1554,7 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
           `both the parked old-name dir and its original '${oldNameOriginal}' exist`,
         );
       }
-      renameSync(parkedOldName, oldNameOriginal);
+      renameDirRestoringWrite(parkedOldName, oldNameOriginal);
     }
     // parked absent ⇒ already restored (idempotent re-run) — skip.
   }

@@ -8,7 +8,7 @@
  */
 
 import { lstatSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
-import { dirname, join, relative, sep } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { canonicalBundlePathViolation } from '../archive.ts';
 import { unpackBundle } from '../bundle/index.ts';
 import { parseManifestBytes, sha256Hex } from '../bundle/manifest.ts';
@@ -18,6 +18,7 @@ import { StorePathError, workflowCoordinate } from './types.ts';
 import type { WorkflowCoordinate } from './types.ts';
 import type { BundleIngestor, BundleSource } from './install.ts';
 import type { DefDigest } from './types.ts';
+import { coordinateDigestReadSync } from './resolve.ts';
 
 export interface BundleIngestorOptions {
   /** Explicit namespace override for the package-derived store coordinate. */
@@ -62,19 +63,65 @@ function coordinateFor(manifest: BundleManifest, namespace: string): WorkflowCoo
  * for exactly that caller; the async port remains the public contract.
  */
 export interface VerifyWorkflowObjectOptions {
-	/** Optional directory-entry source used by tests to control filesystem order. */
-	readDir?: (directory: string) => string[];
-	/** Optional visit trace used by tests to assert recursive traversal order. */
-	onVisit?: (relativePath: string) => void;
+  /** Optional directory-entry source used by tests to control filesystem order. */
+  readDir?: (directory: string) => string[];
+  /** Optional visit trace used by tests to assert recursive traversal order. */
+  onVisit?: (relativePath: string) => void;
+  /** False only when an async caller already waited on the matching repair journal. */
+  coordinateRepair?: boolean;
+  /** False only for staged pre-swap content; installed objects require exact hardened modes. */
+  requireHardenedModes?: boolean;
 }
 
-export function verifyWorkflowObjectSync(
-	objectDir: string,
-	digest: DefDigest,
-	options: VerifyWorkflowObjectOptions = {},
+function modeString(mode: number): string {
+  return `0${(mode & 0o777).toString(8)}`;
+}
+
+function assertHardenedDirectory(path: string, mode: number): void {
+  const actual = mode & 0o777;
+  if (actual !== 0o555) {
+    refuse(path, `directory mode is ${modeString(actual)}, expected hardened store mode 0555`);
+  }
+}
+
+function assertHardenedFile(path: string, mode: number): void {
+  const actual = mode & 0o777;
+  const expected = (actual & 0o111) === 0 ? 0o444 : 0o555;
+  if (actual !== expected) {
+    refuse(
+      path,
+      `regular file mode is ${modeString(actual)}, expected hardened store mode ${modeString(expected)}`,
+    );
+  }
+}
+
+/** Verify exact immutable store modes independently from canonical identity. */
+export function verifyHardenedWorkflowObjectModesSync(objectDir: string): void {
+  assertDirectory(objectDir);
+  const walk = (directory: string): void => {
+    const directoryStat = lstatSync(directory);
+    assertHardenedDirectory(directory, directoryStat.mode);
+    for (const entry of readdirSync(directory)) {
+      const full = join(directory, entry);
+      const st = lstatSync(full, { throwIfNoEntry: false });
+      if (st === undefined) refuse(full, 'path disappeared during hardened-mode verification');
+      if (st.isSymbolicLink()) refuse(full, 'object contains a symlink');
+      if (st.isDirectory()) walk(full);
+      else if (st.isFile()) assertHardenedFile(full, st.mode);
+      else refuse(full, 'object contains a non-regular filesystem node');
+    }
+  };
+  walk(objectDir);
+}
+
+function verifyWorkflowObjectOnce(
+  objectDir: string,
+  digest: DefDigest,
+  options: VerifyWorkflowObjectOptions,
 ): void {
-	assertDirectory(objectDir);
-	const readDir = options.readDir ?? ((directory: string) => readdirSync(directory));
+  assertDirectory(objectDir);
+  const requireHardenedModes = options.requireHardenedModes !== false;
+  const readDir = options.readDir ?? ((directory: string) => readdirSync(directory));
 
   const manifestPath = join(objectDir, 'bundle.yaml');
   const manifestStat = lstatSync(manifestPath, { throwIfNoEntry: false });
@@ -154,6 +201,23 @@ export function verifyWorkflowObjectSync(
       `canonical bundle digest mismatch (expected content-addressed digest ${digest}, got ${actualDigest})`,
     );
   }
+  if (requireHardenedModes) verifyHardenedWorkflowObjectModesSync(objectDir);
+}
+
+export function verifyWorkflowObjectSync(
+  objectDir: string,
+  digest: DefDigest,
+  options: VerifyWorkflowObjectOptions = {},
+): void {
+  const resolvedObjectDir = resolve(objectDir);
+  const storeRoot = dirname(dirname(dirname(resolvedObjectDir)));
+  const isDigestPath = resolvedObjectDir === join(storeRoot, 'objects', 'sha256', digest);
+  const verify = (): void => verifyWorkflowObjectOnce(objectDir, digest, options);
+  if (options.coordinateRepair === false || !isDigestPath) {
+    verify();
+    return;
+  }
+  coordinateDigestReadSync(storeRoot, digest, verify);
 }
 
 /** Create the real store adapter used by the default CLI and driver paths. */
@@ -184,6 +248,19 @@ export function createBundleIngestor(options: BundleIngestorOptions = {}): Bundl
 
     async verifyInstalledObject(input: { objectDir: string; digest: DefDigest }): Promise<void> {
       verifyWorkflowObjectSync(input.objectDir, input.digest);
+    },
+
+    async verifyStagedObject(input: { objectDir: string; digest: DefDigest }): Promise<void> {
+      verifyWorkflowObjectSync(input.objectDir, input.digest, {
+	coordinateRepair: false,
+	requireHardenedModes: false,
+      });
+    },
+
+    async verifyInstalledObjectAfterCoordination(
+      input: { objectDir: string; digest: DefDigest },
+    ): Promise<void> {
+      verifyWorkflowObjectSync(input.objectDir, input.digest, { coordinateRepair: false });
     },
   };
 }
