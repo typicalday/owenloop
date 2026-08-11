@@ -2883,6 +2883,52 @@ test('v2 journal: readAddJournal accepts and validates it; hostile v2 shapes are
   assert.throws(() => validateAddJournal(base, jp), /unsupported journal version/);
 });
 
+test('v2 journal: rollback phases require repair state and an external recovery marker', () => {
+  const jp = '/tmp/not-a-real-path.journal';
+  const base = {
+    version: 2,
+    phase: 'rollback-started',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', 'd'.repeat(64)],
+    stagingId: 'stg_test',
+    hadDest: true,
+    root: '/some/root',
+    metadataHash: 'e'.repeat(64),
+    recoveryMarkerId: 'recovery_test',
+  } satisfies InstallJournalV2;
+  const rollbackPhases = [
+    'rollback-started',
+    'rollback-replacement-parked',
+    'rollback-prior-restored',
+    'rollback-complete',
+  ] as const;
+
+  for (const phase of rollbackPhases) {
+    assert.deepEqual(validateInstallJournalV2({ ...base, phase }, jp), { ...base, phase });
+    assert.throws(
+      () => validateInstallJournalV2({ ...base, phase, operation: undefined }, jp),
+      /requires operation 'repair'/,
+    );
+    assert.throws(
+      () => validateInstallJournalV2({ ...base, phase, recoveryMarkerId: undefined }, jp),
+      /requires a recovery marker/,
+    );
+  }
+
+  assert.throws(
+    () => validateInstallJournalV2({ ...base, hadDest: false }, jp),
+    /operation 'repair' requires 'hadDest' true/,
+  );
+  assert.throws(
+    () => validateInstallJournalV2({ ...base, operation: 'install' }, jp),
+    /requires operation 'repair'/,
+  );
+  assert.throws(
+    () => validateInstallJournalV2({ ...base, recoveryMarkerId: '../unrelated' }, jp),
+    /recoveryMarkerId.*contains a '\.' or '\.\.' segment/,
+  );
+});
+
 test('v2 journal: readAddJournal dispatches on the raw version field (v2 validated by v2 rules)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-journal-'));
   const jp = join(dir, 'add.journal');

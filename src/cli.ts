@@ -230,7 +230,7 @@ export interface CliIO {
    * is no default accepting verifier. The GitHub repo route never uses it.
    */
   preCommitVerifier?: PreCommitVerifier;
-  /** Optional test/runtime override for the external fresh-install marker directory. */
+  /** Optional test/runtime override for the external install/repair transaction marker directory. */
   recoveryMarkerDir?: string;
   /** Open a URL in the user's browser (login). Default: fire-and-forget `open`/`xdg-open`/`start`. */
   openUrl?: (url: string) => void;
@@ -2379,7 +2379,7 @@ function workflowHome(io: CliIO): string {
 }
 
 /**
- * Resolve the external fresh-install marker directory from injected CLI state.
+ * Resolve the external install/repair marker directory from injected CLI state.
  * A bundle install always needs a concrete directory; no marker API may consult
  * the ambient process home.
  */

@@ -523,20 +523,57 @@ export function renameDirRestoringWrite(src: string, dst: string): void {
   }
 }
 
+/** Durable transition hooks for callers whose rollback needs a crash journal. */
+export interface RollbackInstallCommitOptions {
+  /** Runs before the first rollback rename. A throw leaves the committed swap untouched. */
+  beforeRollback?: () => void;
+  /** Runs after destination → undo and before backup → destination. */
+  afterDestinationParked?: () => void;
+  /** Runs after backup → destination. Only called when a retained backup exists. */
+  afterPriorRestored?: () => void;
+  /** Remove the parked replacement after the prior destination is restored. Default: false. */
+  cleanupUndo?: boolean;
+  /** Runs after the parked replacement has been removed. */
+  afterUndoCleanup?: () => void;
+}
+
 /**
  * Undo a `commitInstall`, restoring the pre-commit directory state. Order
- * matters: (1) park the new content out of `dest` (rename dest → undoDir) —
- * for a fresh install, this alone restores "nothing installed"; (2) if a
- * previous install was displaced, rename its backup back over `dest`. The
- * parked new content under `undoDir` is left for the caller's staging-root
- * cleanup to dispose of. Renames go through {@link renameDirRestoringWrite}:
- * the CAS route hardens objects at their committed location, so `dest` may
- * already be non-writable when a late rollback (the index write failing) runs.
- * Any throw propagates to the caller.
+ * matters: (1) durably record rollback intent when the caller supplies a
+ * `beforeRollback` hook; (2) park the new content out of `dest` (rename dest →
+ * undoDir) — for a fresh install, this alone restores "nothing installed";
+ * (3) if a previous install was displaced, rename its backup back over `dest`;
+ * (4) optionally delete the parked replacement after the prior object is back.
+ *
+ * Every transition hook runs AFTER the transition named by the hook. A hook
+ * failure stops the state machine immediately and leaves the previous durable
+ * journal phase plus the newly observable filesystem state for recovery. The
+ * default options retain the historical generic behavior: no journal hooks and
+ * the undo directory left for the caller's staging-root cleanup.
+ *
+ * Renames go through {@link renameDirRestoringWrite}: the CAS route hardens
+ * objects at their committed location, so `dest` may already be non-writable
+ * when a late rollback (the index write failing) runs. Any throw propagates.
  */
-export function rollbackInstallCommit(handle: InstallCommitHandle): void {
+export function rollbackInstallCommit(
+  handle: InstallCommitHandle,
+  options: RollbackInstallCommitOptions = {},
+): void {
+  options.beforeRollback?.();
+  const undoState = lstatSync(handle.undoDir, { throwIfNoEntry: false });
+  if (undoState !== undefined) {
+    throw new Error(`refusing rollback because undo path '${handle.undoDir}' already exists`);
+  }
   renameDirRestoringWrite(handle.dest, handle.undoDir);
-  if (handle.backupDir) renameDirRestoringWrite(handle.backupDir, handle.dest);
+  options.afterDestinationParked?.();
+  if (handle.backupDir) {
+    renameDirRestoringWrite(handle.backupDir, handle.dest);
+    options.afterPriorRestored?.();
+  }
+  if (options.cleanupUndo) {
+    rmRecursiveForce(handle.undoDir);
+    options.afterUndoCleanup?.();
+  }
 }
 
 // ---- per-root install lock -----------------------------------------------------
@@ -617,17 +654,23 @@ export const ADD_JOURNAL_FILENAME = 'add.journal';
 export type AddJournalPhase = 'applying' | 'finalizing';
 
 /**
- * Durable v2 repair phases. Each phase is written only after the named step has
- * completed, so recovery never infers repair completion from unchanged index
- * bytes. Readers wait while any replacement phase is active and resume only at
- * `finalizing`, after hardening, canonical verification, hardened-mode
- * verification, and the metadata commit point have all completed.
+ * Durable v2 repair phases. Replacement phases roll a valid staged object
+ * forward. Rollback phases restore the retained prior directory through an
+ * explicit state machine: intent, replacement parked, prior restored, debris
+ * removed. Each phase is written only after the named transition has completed.
+ * Readers wait while the digest destination may still move; `finalizing`,
+ * `rollback-prior-restored`, and `rollback-complete` are stable because no later
+ * transition renames the digest destination.
  */
 export type InstallJournalV2Phase =
   | AddJournalPhase
   | 'replacement-swapped'
   | 'replacement-hardened'
-  | 'replacement-verified';
+  | 'replacement-verified'
+  | 'rollback-started'
+  | 'rollback-replacement-parked'
+  | 'rollback-prior-restored'
+  | 'rollback-complete';
 
 /** The v2 transaction kind; recorded so same-digest repair is never mistaken for dedupe. */
 export type InstallJournalV2Operation = 'install' | 'dedupe' | 'repair';
@@ -692,7 +735,7 @@ export interface InstallJournalV2 {
   label?: string;
   /** Journal-write epoch ms — diagnostics only. */
   startedAt?: number;
-  /** External transaction marker for a fresh-install swap with no backup. */
+  /** External transaction marker for a fresh install or identity-backed repair. */
   recoveryMarkerId?: string;
 }
 
@@ -784,12 +827,15 @@ export function validateInstallJournalV2(parsed: unknown, path: string): Install
     parsed.phase !== 'replacement-swapped' &&
     parsed.phase !== 'replacement-hardened' &&
     parsed.phase !== 'replacement-verified' &&
+    parsed.phase !== 'rollback-started' &&
+    parsed.phase !== 'rollback-replacement-parked' &&
+    parsed.phase !== 'rollback-prior-restored' &&
+    parsed.phase !== 'rollback-complete' &&
     parsed.phase !== 'finalizing'
   ) {
     return fail(
       `unknown phase ${JSON.stringify(parsed.phase)} ` +
-	`(expected 'applying', 'replacement-swapped', 'replacement-hardened', ` +
-	`'replacement-verified', or 'finalizing')`,
+	`(expected 'applying', replacement/rollback repair phases, or 'finalizing')`,
     );
   }
   if (
@@ -800,7 +846,10 @@ export function validateInstallJournalV2(parsed: unknown, path: string): Install
   ) {
     return fail("'operation' is not 'install', 'dedupe', or 'repair'");
   }
-  if (typeof parsed.phase === 'string' && parsed.phase.startsWith('replacement-') && parsed.operation !== 'repair') {
+  const repairOnlyPhase =
+    typeof parsed.phase === 'string' &&
+    (parsed.phase.startsWith('replacement-') || parsed.phase.startsWith('rollback-'));
+  if (repairOnlyPhase && parsed.operation !== 'repair') {
     return fail(`phase '${parsed.phase}' requires operation 'repair'`);
   }
   if (parsed.operation === 'repair' && parsed.hadDest !== true) {
@@ -841,6 +890,13 @@ export function validateInstallJournalV2(parsed: unknown, path: string): Install
     const markerViolation = lockfilePathViolation(parsed.recoveryMarkerId);
     if (markerViolation) return fail(`'recoveryMarkerId' ${markerViolation}`);
   }
+  if (
+    typeof parsed.phase === 'string' &&
+    parsed.phase.startsWith('rollback-') &&
+    parsed.recoveryMarkerId === undefined
+  ) {
+    return fail(`phase '${parsed.phase}' requires a recovery marker`);
+  }
   return parsed as unknown as InstallJournalV2;
 }
 
@@ -860,22 +916,35 @@ export function validateAnyInstallJournal(parsed: unknown, path: string): AnyIns
   );
 }
 
-// ---- external fresh-install corroboration -----------------------------------
+// ---- external transaction corroboration -------------------------------------
 //
 // A v2 fresh install can crash after staging has been renamed to its final
 // object path but before the index commit. At that point the journal, index,
 // destination name, and absence of staging/backup are all repository-controlled
-// or ambiguous. The marker below is created with O_EXCL in a directory outside
-// the store root and records the exact transaction identity. Recovery will
-// discard a destination in that otherwise ambiguous state only when the marker
-// matches every journal field exactly.
+// or ambiguous. A same-digest repair also needs evidence that survives directory
+// renames and distinguishes the staged replacement from the retained prior
+// object without verifying the intentionally broken prior object. The marker
+// below is created with O_EXCL outside the store root and records the exact
+// transaction and directory identities used by those recovery decisions.
+
+export interface RecoveryDirectoryIdentity {
+  /** Decimal strings avoid platform-size loss when filesystem ids exceed 32 bits. */
+  dev: string;
+  ino: string;
+}
 
 export interface RecoveryMarkerRecord {
   version: 1;
   root: string;
   destSegments: string[];
   stagingId: string;
-  hadDest: false;
+  hadDest: boolean;
+  /** Absent only on legacy fresh-install markers. */
+  operation?: 'install' | 'repair';
+  /** Root directory identity of the staged replacement, captured before any rename. */
+  replacementIdentity?: RecoveryDirectoryIdentity;
+  /** Root directory identity of the retained prior object, captured after dest → backup. */
+  priorIdentity?: RecoveryDirectoryIdentity;
 }
 
 export interface RecoveryMarkerHandle {
@@ -897,6 +966,29 @@ function markerFilePath(markerDir: string, id: string): string {
   return join(markerDir, `${id}.json`);
 }
 
+function validateRecoveryDirectoryIdentity(
+  value: unknown,
+  field: string,
+  fail: (detail: string) => never,
+): RecoveryDirectoryIdentity {
+  if (!isPlainObject(value)) return fail(`'${field}' is not an object`);
+  if (typeof value.dev !== 'string' || !/^\d+$/.test(value.dev)) {
+    return fail(`'${field}.dev' is not a decimal string`);
+  }
+  if (typeof value.ino !== 'string' || !/^\d+$/.test(value.ino)) {
+    return fail(`'${field}.ino' is not a decimal string`);
+  }
+  return value as unknown as RecoveryDirectoryIdentity;
+}
+
+function recoveryDirectoryIdentity(path: string, label: string): RecoveryDirectoryIdentity {
+  const st = lstatSync(path, { bigint: true });
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error(`cannot record ${label} identity at '${path}': path is not a real directory`);
+  }
+  return { dev: String(st.dev), ino: String(st.ino) };
+}
+
 function validateRecoveryMarker(parsed: unknown, path: string): RecoveryMarkerRecord {
   const fail = (detail: string): never => {
     throw new Error(`invalid recovery marker at ${path}: ${detail}`);
@@ -915,7 +1007,35 @@ function validateRecoveryMarker(parsed: unknown, path: string): RecoveryMarkerRe
   if (typeof parsed.stagingId !== 'string') return fail("'stagingId' is not a string");
   const stagingViolation = lockfilePathViolation(parsed.stagingId);
   if (stagingViolation) return fail(`'stagingId' ${stagingViolation}`);
-  if (parsed.hadDest !== false) return fail("'hadDest' must be false");
+  if (typeof parsed.hadDest !== 'boolean') return fail("'hadDest' is not a boolean");
+  if (
+    parsed.operation !== undefined &&
+    parsed.operation !== 'install' &&
+    parsed.operation !== 'repair'
+  ) {
+    return fail("'operation' is not 'install' or 'repair'");
+  }
+  if (parsed.operation === undefined && parsed.hadDest !== false) {
+    return fail("a legacy marker without 'operation' requires 'hadDest' false");
+  }
+  if (parsed.operation === 'install' && parsed.hadDest !== false) {
+    return fail("operation 'install' requires 'hadDest' false");
+  }
+  if (parsed.operation === 'repair' && parsed.hadDest !== true) {
+    return fail("operation 'repair' requires 'hadDest' true");
+  }
+  if (parsed.replacementIdentity !== undefined) {
+    validateRecoveryDirectoryIdentity(parsed.replacementIdentity, 'replacementIdentity', fail);
+  }
+  if (parsed.priorIdentity !== undefined) {
+    validateRecoveryDirectoryIdentity(parsed.priorIdentity, 'priorIdentity', fail);
+  }
+  if (parsed.priorIdentity !== undefined && parsed.operation !== 'repair') {
+    return fail("'priorIdentity' requires operation 'repair'");
+  }
+  if (parsed.operation === 'repair' && parsed.replacementIdentity === undefined) {
+    return fail("operation 'repair' requires 'replacementIdentity'");
+  }
   return parsed as unknown as RecoveryMarkerRecord;
 }
 
@@ -924,20 +1044,65 @@ export function createRecoveryMarker(input: {
   destSegments: string[];
   stagingId: string;
   markerDir: string;
+  /** Omit for the legacy fresh-install marker shape. */
+  operation?: 'install' | 'repair';
+  /** Required for repair; records the staged replacement before any rename. */
+  replacementDir?: string;
 }): RecoveryMarkerHandle {
   const markerDir = input.markerDir;
   ensureDirectoryPathNoSymlink(markerDir, 'recovery marker directory');
+  if (input.operation === 'repair' && input.replacementDir === undefined) {
+    throw new Error('cannot create a repair recovery marker without the staged replacement directory');
+  }
   const record: RecoveryMarkerRecord = {
     version: 1,
     root: resolve(input.root),
     destSegments: [...input.destSegments],
     stagingId: input.stagingId,
-    hadDest: false,
+    hadDest: input.operation === 'repair',
+    ...(input.operation === undefined ? {} : { operation: input.operation }),
+    ...(input.replacementDir === undefined
+      ? {}
+      : { replacementIdentity: recoveryDirectoryIdentity(input.replacementDir, 'replacement directory') }),
   };
   const id = `mkr_${randomUUID().replaceAll('-', '')}`;
   const path = markerFilePath(markerDir, id);
   writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
   return { id, path, markerDir, record };
+}
+
+/**
+ * Add the retained prior-directory identity after destination → backup. The
+ * marker is outside the store root, so a repository-controlled journal cannot
+ * forge which inode is the prior object or which inode is the replacement.
+ */
+export function recordRecoveryMarkerPriorIdentity(
+  handle: RecoveryMarkerHandle,
+  priorDir: string,
+): RecoveryMarkerHandle {
+  const current = readRecoveryMarker(handle.id, handle.markerDir);
+  if (current === null) throw new Error(`recovery marker '${handle.path}' disappeared`);
+  if (current.operation !== 'repair' || current.hadDest !== true) {
+    throw new Error(`recovery marker '${handle.path}' does not describe a repair`);
+  }
+  if (current.priorIdentity !== undefined) {
+    throw new Error(`recovery marker '${handle.path}' already records a prior object`);
+  }
+  const record: RecoveryMarkerRecord = {
+    ...current,
+    priorIdentity: recoveryDirectoryIdentity(priorDir, 'retained prior directory'),
+  };
+  guardStateFile(handle.path, 'recovery marker');
+  const tmp = `${handle.path}.tmp.${process.pid}.${randomUUID()}`;
+  writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+  try {
+    renameSync(tmp, handle.path);
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
+  handle.record = record;
+  return handle;
 }
 
 export function readRecoveryMarker(id: string, markerDir: string): RecoveryMarkerRecord | null {
@@ -1084,7 +1249,7 @@ export interface RecoverInterruptedInstallArgs {
   journalPath: string;
   /** Metadata path (v1 `installed.json`, v2 `index.json`) used by ordinary commit-point checks. */
   lockfilePath: string;
-  /** Directory holding external fresh-install corroboration markers. */
+  /** Directory holding external install/repair transaction markers. */
   recoveryMarkerDir?: string;
   /** CAS repair actions required to resume a swapped v2 replacement safely. */
   v2Replacement?: V2ReplacementRecoveryActions;
@@ -1229,6 +1394,78 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     }
   };
 
+  const readMatchingV2Marker = (): RecoveryMarkerRecord | null => {
+    if (journal.version !== 2 || journal.recoveryMarkerId === undefined) return null;
+    if (args.recoveryMarkerDir === undefined) {
+      throw recoveryRefusal(journalPath, 'external recovery marker directory was not supplied');
+    }
+    let marker: RecoveryMarkerRecord | null;
+    try {
+      marker = readRecoveryMarker(journal.recoveryMarkerId, args.recoveryMarkerDir);
+    } catch (error) {
+      throw recoveryRefusal(journalPath, `external recovery marker could not be read: ${(error as Error).message}`);
+    }
+    const markerMatches =
+      marker !== null &&
+      resolve(marker.root) === resolve(defsDir) &&
+      marker.stagingId === journal.stagingId &&
+      marker.hadDest === journal.hadDest &&
+      marker.destSegments.length === journal.destSegments.length &&
+      marker.destSegments.every((segment, i) => segment === journal.destSegments[i]);
+    if (!markerMatches) {
+      throw recoveryRefusal(journalPath, 'external recovery marker does not match the journal transaction');
+    }
+    return marker;
+  };
+
+  const requireRepairMarker = (): RecoveryMarkerRecord & {
+    operation: 'repair';
+    replacementIdentity: RecoveryDirectoryIdentity;
+    priorIdentity: RecoveryDirectoryIdentity;
+  } => {
+    if (journal.version !== 2 || journal.operation !== 'repair') {
+      throw recoveryRefusal(journalPath, 'internal recovery error: repair marker requested for a non-repair journal');
+    }
+    const marker = readMatchingV2Marker();
+    if (
+      marker === null ||
+      marker.operation !== 'repair' ||
+      marker.hadDest !== true ||
+      marker.replacementIdentity === undefined ||
+      marker.priorIdentity === undefined
+    ) {
+      throw recoveryRefusal(
+	journalPath,
+	'durable repair rollback state lacks replacement/prior directory identity evidence',
+      );
+    }
+    return marker as RecoveryMarkerRecord & {
+      operation: 'repair';
+      replacementIdentity: RecoveryDirectoryIdentity;
+      priorIdentity: RecoveryDirectoryIdentity;
+    };
+  };
+
+  const requireIdentity = (
+    path: string,
+    expected: RecoveryDirectoryIdentity,
+    label: string,
+  ): void => {
+    let actual: RecoveryDirectoryIdentity;
+    try {
+      actual = recoveryDirectoryIdentity(path, label);
+    } catch (error) {
+      throw recoveryRefusal(journalPath, (error as Error).message);
+    }
+    if (actual.dev !== expected.dev || actual.ino !== expected.ino) {
+      throw recoveryRefusal(
+	journalPath,
+	`${label} '${path}' does not belong to this transaction ` +
+	  `(expected dev ${expected.dev} inode ${expected.ino}, got dev ${actual.dev} inode ${actual.ino})`,
+      );
+    }
+  };
+
   // Roll forward: the metadata is durably new; discard the retained backup (+
   // parked old-name dir, v1) and clear the staging root, then drop the journal.
   // Symlink-guarded before each rm; both dirs live under the staging root, so
@@ -1280,7 +1517,104 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     }
     const stagingState = probeRecoveryDir(stagingDir, journalPath, 'staging dir', defsDir);
     const backupState = probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir);
+    const undoState = probeRecoveryDir(undoDir, journalPath, 'undo dir', defsDir);
     const destState = probeRecoveryDir(dest, journalPath, 'destination', defsDir);
+
+    // Compatibility for a repair rolled back by a release that pre-dates the
+    // durable rollback phases: destination is already the prior object, backup
+    // was consumed, and undo still holds the replacement. The prior object may
+    // be the legacy mode-loss object, so identify the replacement at undo rather
+    // than demanding that destination pass the new installed-object verifier.
+    if (
+      stagingState === 'absent' &&
+      backupState === 'absent' &&
+      undoState === 'dir' &&
+      destState === 'dir'
+    ) {
+      const marker = readMatchingV2Marker();
+      let rollbackMarkerId = journal.recoveryMarkerId;
+      let createdRollbackMarker: RecoveryMarkerHandle | undefined;
+      if (marker !== null) {
+	if (
+	  marker.operation !== 'repair' ||
+	  marker.replacementIdentity === undefined ||
+	  marker.priorIdentity === undefined
+	) {
+	  throw recoveryRefusal(
+	    journalPath,
+	    'legacy repair rollback marker lacks complete replacement/prior identity evidence',
+	  );
+	}
+	requireIdentity(undoDir, marker.replacementIdentity, 'parked replacement');
+	requireIdentity(dest, marker.priorIdentity, 'restored prior object');
+      } else {
+	if (args.recoveryMarkerDir === undefined) {
+	  throw recoveryRefusal(
+	    journalPath,
+	    'legacy completed repair rollback requires the external recovery marker directory',
+	  );
+	}
+	const actions = requireV2ReplacementActions();
+	const digest = journal.destSegments.at(-1);
+	if (digest === undefined) {
+	  throw recoveryRefusal(journalPath, 'v2 destination has no digest segment');
+	}
+	try {
+	  actions.harden(undoDir);
+	  actions.verify(undoDir, digest);
+	} catch (error) {
+	  throw recoveryRefusal(
+	    journalPath,
+	    `could not prove legacy rollback debris at '${undoDir}' is this transaction's replacement: ` +
+	      `${(error as Error).message}`,
+	  );
+	}
+	const rollbackMarker = createRecoveryMarker({
+	  root: defsDir,
+	  destSegments: journal.destSegments,
+	  stagingId: journal.stagingId,
+	  markerDir: args.recoveryMarkerDir,
+	  operation: 'repair',
+	  replacementDir: undoDir,
+	});
+	try {
+	  recordRecoveryMarkerPriorIdentity(rollbackMarker, dest);
+	} catch (error) {
+	  removeRecoveryMarker(rollbackMarker);
+	  throw recoveryRefusal(
+	    journalPath,
+	    `could not record legacy repair rollback identity evidence: ${(error as Error).message}`,
+	  );
+	}
+	createdRollbackMarker = rollbackMarker;
+	rollbackMarkerId = rollbackMarker.id;
+      }
+      if (rollbackMarkerId === undefined || args.recoveryMarkerDir === undefined) {
+	throw recoveryRefusal(journalPath, 'legacy repair rollback could not establish durable identity evidence');
+      }
+      try {
+	writeAddJournal(journalPath, {
+	  ...journal,
+	  phase: 'rollback-prior-restored',
+	  operation: 'repair',
+	  recoveryMarkerId: rollbackMarkerId,
+	});
+      } catch (error) {
+	if (createdRollbackMarker !== undefined) removeRecoveryMarker(createdRollbackMarker);
+	throw error;
+      }
+      rmRecursiveForce(undoDir);
+      writeAddJournal(journalPath, {
+	...journal,
+	phase: 'rollback-complete',
+	operation: 'repair',
+	recoveryMarkerId: rollbackMarkerId,
+      });
+      if (readdirSync(stagingRoot).length === 0) rmdirSync(stagingRoot);
+      removeAddJournal(journalPath);
+      removeRecoveryMarker({ id: rollbackMarkerId, markerDir: args.recoveryMarkerDir });
+      return 'rolled-back';
+    }
 
     // A swap that never completed, or a rollback that was interrupted between
     // its two renames, must restore the retained prior object instead of trying
@@ -1293,6 +1627,20 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
 	journalPath,
 	`repair phase '${journal.phase}' has no retained prior-object backup at '${backupDir}'`,
       );
+    }
+    if (undoState !== 'absent') {
+      throw recoveryRefusal(
+	journalPath,
+	`repair phase '${journal.phase}' has both a retained backup and rollback undo directory`,
+      );
+    }
+    const marker = readMatchingV2Marker();
+    if (marker?.operation === 'repair') {
+      if (marker.replacementIdentity === undefined || marker.priorIdentity === undefined) {
+	throw recoveryRefusal(journalPath, 'repair marker lacks replacement/prior directory identity evidence');
+      }
+      requireIdentity(dest, marker.replacementIdentity, 'replacement destination');
+      requireIdentity(backupDir, marker.priorIdentity, 'retained prior object');
     }
 
     const actions = requireV2ReplacementActions();
@@ -1326,18 +1674,139 @@ export function recoverInterruptedInstall(args: RecoverInterruptedInstallArgs): 
     return 'rolled-forward';
   };
 
+  const resumeDurableV2RepairRollback = (): RecoveryOutcome => {
+    if (journal.version !== 2 || journal.operation !== 'repair') {
+      throw recoveryRefusal(journalPath, 'internal recovery error: attempted repair rollback for a non-repair journal');
+    }
+    const marker = requireRepairMarker();
+    const replacementIdentity = marker.replacementIdentity;
+    const priorIdentity = marker.priorIdentity;
+    let phase = journal.phase;
+
+    const states = (): {
+      staging: 'dir' | 'absent';
+      backup: 'dir' | 'absent';
+      undo: 'dir' | 'absent';
+      destination: 'dir' | 'absent';
+    } => ({
+      staging: probeRecoveryDir(stagingDir, journalPath, 'staging dir', defsDir),
+      backup: probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir),
+      undo: probeRecoveryDir(undoDir, journalPath, 'undo dir', defsDir),
+      destination: probeRecoveryDir(dest, journalPath, 'destination', defsDir),
+    });
+    const refuseCombination = (state: ReturnType<typeof states>): never => {
+      throw recoveryRefusal(
+	journalPath,
+	`repair rollback phase '${phase}' contradicts filesystem state ` +
+	  `(staging=${state.staging}, backup=${state.backup}, undo=${state.undo}, destination=${state.destination})`,
+      );
+    };
+    const writePhase = (next: InstallJournalV2Phase): void => {
+      writeAddJournal(journalPath, { ...journal, phase: next, operation: 'repair' });
+      phase = next;
+    };
+
+    for (;;) {
+      const state = states();
+      if (state.staging !== 'absent') refuseCombination(state);
+
+      if (phase === 'rollback-started') {
+	if (state.destination === 'dir' && state.backup === 'dir' && state.undo === 'absent') {
+	  requireIdentity(dest, replacementIdentity, 'replacement destination');
+	  requireIdentity(backupDir, priorIdentity, 'retained prior object');
+	  renameDirRestoringWrite(dest, undoDir);
+	  writePhase('rollback-replacement-parked');
+	  continue;
+	}
+	if (state.destination === 'absent' && state.backup === 'dir' && state.undo === 'dir') {
+	  requireIdentity(undoDir, replacementIdentity, 'parked replacement');
+	  requireIdentity(backupDir, priorIdentity, 'retained prior object');
+	  writePhase('rollback-replacement-parked');
+	  continue;
+	}
+	refuseCombination(state);
+      }
+
+      if (phase === 'rollback-replacement-parked') {
+	if (state.destination === 'absent' && state.backup === 'dir' && state.undo === 'dir') {
+	  requireIdentity(undoDir, replacementIdentity, 'parked replacement');
+	  requireIdentity(backupDir, priorIdentity, 'retained prior object');
+	  renameDirRestoringWrite(backupDir, dest);
+	  writePhase('rollback-prior-restored');
+	  continue;
+	}
+	if (state.destination === 'dir' && state.backup === 'absent' && state.undo === 'dir') {
+	  requireIdentity(dest, priorIdentity, 'restored prior object');
+	  requireIdentity(undoDir, replacementIdentity, 'parked replacement');
+	  writePhase('rollback-prior-restored');
+	  continue;
+	}
+	refuseCombination(state);
+      }
+
+      if (phase === 'rollback-prior-restored') {
+	if (state.destination !== 'dir' || state.backup !== 'absent') refuseCombination(state);
+	requireIdentity(dest, priorIdentity, 'restored prior object');
+	if (state.undo === 'dir') {
+	  requireIdentity(undoDir, replacementIdentity, 'parked replacement');
+	  rmRecursiveForce(undoDir);
+	}
+	writePhase('rollback-complete');
+	continue;
+      }
+
+      if (phase === 'rollback-complete') {
+	if (
+	  state.destination !== 'dir' ||
+	  state.backup !== 'absent' ||
+	  state.undo !== 'absent'
+	) {
+	  refuseCombination(state);
+	}
+	requireIdentity(dest, priorIdentity, 'restored prior object');
+	const currentStagingRoot = probeRecoveryDir(stagingRoot, journalPath, 'staging root', defsDir);
+	if (currentStagingRoot === 'dir' && readdirSync(stagingRoot).length === 0) rmdirSync(stagingRoot);
+	removeAddJournal(journalPath);
+	removeRecoveryMarkerAfterJournal();
+	return 'rolled-back';
+      }
+
+      throw recoveryRefusal(journalPath, `internal recovery error: unexpected rollback phase '${phase}'`);
+    }
+  };
+
+  if (journal.version === 2 && journal.phase.startsWith('rollback-')) {
+    return resumeDurableV2RepairRollback();
+  }
+
   if (journal.phase === 'finalizing') {
     // A v2 finalizing journal may be left after the index commit but before the
     // backup was deleted. Re-verify the exact destination, including immutable
     // store modes, before accepting it and deleting the retained prior object.
     verifyV2Destination();
+    if (journal.version === 2 && journal.operation === 'repair') {
+      const marker = readMatchingV2Marker();
+      if (marker?.operation === 'repair') {
+	if (marker.replacementIdentity === undefined || marker.priorIdentity === undefined) {
+	  throw recoveryRefusal(journalPath, 'repair marker lacks replacement/prior directory identity evidence');
+	}
+	requireIdentity(dest, marker.replacementIdentity, 'replacement destination');
+	const backupState = probeRecoveryDir(backupDir, journalPath, 'backup dir', defsDir);
+	if (backupState === 'dir') requireIdentity(backupDir, marker.priorIdentity, 'retained prior object');
+	if (probeRecoveryDir(undoDir, journalPath, 'undo dir', defsDir) === 'dir') {
+	  throw recoveryRefusal(journalPath, 'finalizing repair unexpectedly has rollback undo debris');
+	}
+      }
+    }
     rollForward();
     return 'rolled-forward';
   }
 
   if (journal.version === 2 && journal.phase !== 'applying') {
     const outcome = resumeV2Repair();
-    if (outcome === 'rolled-forward') return outcome;
+    if (outcome === 'rolled-forward' || lstatSync(journalPath, { throwIfNoEntry: false }) === undefined) {
+      return outcome;
+    }
     // A swapped-state journal with staging still present or destination absent
     // falls through to the ordinary rollback table below.
   }

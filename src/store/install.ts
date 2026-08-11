@@ -40,6 +40,7 @@ import {
   multiSegmentPathViolation,
   probeDirectoryPath,
   recoverInterruptedInstall,
+  recordRecoveryMarkerPriorIdentity,
   releaseInstallLock,
   removeAddJournal,
   removeRecoveryMarker,
@@ -151,7 +152,7 @@ export interface InstallWorkflowBundleArgs {
   lockPath: string;
   /** Path of the per-root crash-recovery journal. */
   journalPath: string;
-  /** External marker directory for corroborating a fresh swap with no backup. */
+  /** External marker directory for fresh-install corroboration and repair directory identities. */
   recoveryMarkerDir: string;
   /** Bundle-ingest adapter — REQUIRED (fail-closed without it). */
   ingestor: BundleIngestor;
@@ -471,18 +472,21 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     };
     const metadataHash = sha256Hex(canonicalJsonBytes(nextIndex));
 
-    // A fresh swap needs an external corroboration marker because the staging
-    // and backup directories can both be absent after a crash. Repair has a
-    // retained previous destination (`hadDest: true`), and dedupe has no swap,
-    // so neither path needs a marker.
-    const recoveryMarker = objectAlreadyPresent
-      ? undefined
-      : createRecoveryMarker({
+    // Every swap gets an external transaction marker. Fresh installs need the
+    // marker to corroborate an otherwise ambiguous orphan destination. Repairs
+    // additionally record the replacement directory identity now and the prior
+    // directory identity after destination → backup, so rollback recovery never
+    // infers which directory is the legacy prior object from journal text.
+    const recoveryMarker = !objectAlreadyPresent || repairRequired
+      ? createRecoveryMarker({
 	  root,
 	  destSegments: ['objects', 'sha256', digest],
 	  stagingId,
 	  markerDir: recoveryMarkerDir,
-	});
+	  operation: repairRequired ? 'repair' : 'install',
+	  replacementDir: stagingDir,
+	})
+      : undefined;
 
     // Journal (v2, phase `applying`) BEFORE the first destructive step.
     const journalBase = {
@@ -505,12 +509,50 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     }
 
     let handle: InstallCommitHandle | undefined;
+    const rollbackCommittedSwap = (committedHandle: InstallCommitHandle): void => {
+      if (!repairRequired) {
+	rollbackInstallCommit(committedHandle);
+	return;
+      }
+      if (recoveryMarker === undefined) {
+	throw new Error('internal error: repair rollback is missing its recovery marker');
+      }
+      rollbackInstallCommit(committedHandle, {
+	beforeRollback: () => {
+	  writeAddJournal(journalPath, { ...journalBase, phase: 'rollback-started', operation: 'repair' });
+	},
+	afterDestinationParked: () => {
+	  writeAddJournal(journalPath, {
+	    ...journalBase,
+	    phase: 'rollback-replacement-parked',
+	    operation: 'repair',
+	  });
+	},
+	afterPriorRestored: () => {
+	  writeAddJournal(journalPath, { ...journalBase, phase: 'rollback-prior-restored', operation: 'repair' });
+	},
+	cleanupUndo: true,
+	afterUndoCleanup: () => {
+	  writeAddJournal(journalPath, { ...journalBase, phase: 'rollback-complete', operation: 'repair' });
+	},
+      });
+    };
+
     if (!objectAlreadyPresent || repairRequired) {
       // Fresh install and repair use the same atomic swap. For repair,
       // commitInstall quarantines the broken object under the staging root as
       // the retained backup until the unchanged index is durably committed.
       try {
-        handle = commitInstall(root, destRelPath, stagingDir);
+	handle = commitInstall(root, destRelPath, stagingDir, repairRequired
+	  ? {
+	      afterBackupRename: () => {
+		if (recoveryMarker === undefined) {
+		  throw new Error('internal error: repair swap is missing its recovery marker');
+		}
+		recordRecoveryMarkerPriorIdentity(recoveryMarker, `${stagingDir}-old`);
+	      },
+	    }
+	  : {});
       } catch (e) {
 	if (e instanceof RollbackFailedError) {
 	  preserveStagingRoot = true;
@@ -540,7 +582,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
 	}
       } catch (e) {
 	try {
-	  rollbackInstallCommit(handle);
+	  rollbackCommittedSwap(handle);
 	} catch (rollbackError) {
 	  preserveStagingRoot = true;
 	  throw new StoreIntegrityError(
@@ -568,7 +610,7 @@ export async function installWorkflowBundle(args: InstallWorkflowBundleArgs): Pr
     } catch (e) {
       if (handle !== undefined) {
         try {
-          rollbackInstallCommit(handle);
+	  rollbackCommittedSwap(handle);
         } catch (rollbackErr) {
           // Double fault: preserve the parked content and LEAVE the journal
           // (phase `applying`, index not committed) so the next recovery
@@ -625,7 +667,7 @@ export interface RecoverWorkflowStoreArgs {
   lockPath: string;
   /** Path of the root's crash-recovery journal. */
   journalPath: string;
-  /** External marker directory for fresh-install recovery corroboration. */
+  /** External marker directory for install/repair transaction recovery. */
   recoveryMarkerDir?: string;
 }
 

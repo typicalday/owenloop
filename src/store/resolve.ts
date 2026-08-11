@@ -93,9 +93,10 @@ function isMissingDuringJournalRead(error: unknown): boolean {
 
 /**
  * True only while the matching digest is inside the non-stable part of a v2
- * same-digest replacement. `finalizing` is stable: the replacement has been
- * hardened, verified, and passed the metadata commit point, and cleanup never
- * renames the digest path again. An old v2 `applying` journal without
+ * same-digest replacement. `finalizing` is stable after replacement commit;
+ * `rollback-prior-restored` and `rollback-complete` are stable after the exact
+ * prior directory is back. Cleanup after any stable phase never renames the
+ * digest path again. An old v2 `applying` journal without
  * `operation` waits conservatively whenever `hadDest` is true: before the first
  * rename, a repair and a dedupe are indistinguishable, and probing for the backup
  * would leave a race between that probe and destination → backup.
@@ -125,6 +126,26 @@ function digestRepairNeedsWait(root: string, digest: DefDigest): boolean {
     return false;
   }
   if (journal.phase === 'finalizing') return false;
+  if (journal.phase === 'rollback-prior-restored' || journal.phase === 'rollback-complete') {
+    const stagingDir = join(root, '.owenloop-staging', journal.stagingId);
+    const destination = join(root, ...journal.destSegments);
+    try {
+      const destinationStable = probeDirectoryPath(destination, 'workflow object', root) === 'dir';
+      const stagingAbsent = probeDirectoryPath(stagingDir, 'repair staging directory', root) === 'absent';
+      const backupAbsent = probeDirectoryPath(`${stagingDir}-old`, 'repair backup directory', root) === 'absent';
+      const undoAbsent = probeDirectoryPath(`${stagingDir}-undo`, 'repair undo directory', root) === 'absent';
+      if (journal.phase === 'rollback-prior-restored') {
+	return !(destinationStable && stagingAbsent && backupAbsent);
+      }
+      return !(destinationStable && stagingAbsent && backupAbsent && undoAbsent);
+    } catch (error) {
+      throw new StoreIntegrityError(
+	'object-corrupt',
+	digest,
+	`could not validate stable repair rollback state: ${(error as Error).message}`,
+      );
+    }
+  }
   if (journal.operation === 'repair') return true;
   if (journal.operation === 'install' || journal.operation === 'dedupe') return false;
   if (journal.phase !== 'applying') return true;

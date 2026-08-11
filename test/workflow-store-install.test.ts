@@ -24,6 +24,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   renameSync,
   statSync,
   symlinkSync,
@@ -44,6 +45,7 @@ import {
   recoverWorkflowStore,
   storeIndexPath,
   verifyWorkflowObjectSync,
+  waitForDigestRepair,
   workflowCoordinate,
   workflowStoreStatePaths,
 } from '../src/store/index.ts';
@@ -61,8 +63,11 @@ import {
   commitInstall,
   createRecoveryMarker,
   finalizeInstallCommit,
+  recordRecoveryMarkerPriorIdentity,
   removeAddJournal,
   renameDirRestoringWrite,
+  rmRecursiveForce,
+  rollbackInstallCommit,
   sha256Hex,
 } from '../src/install.ts';
 import { defInstructionDigest } from '../src/order-resolver.ts';
@@ -305,6 +310,87 @@ function stageRealReplacement(fixture: RealRepairFixture, stagingId: string): st
     requireHardenedModes: false,
   });
   return stagingDir;
+}
+
+async function durableRepairRollbackFixture(name: string) {
+  const safeName = name.replaceAll(/[^a-z0-9]+/g, '-').replaceAll(/^-|-$/g, '').slice(0, 96);
+  const fixture = await realRepairFixture(safeName);
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const priorInode = statSync(fixture.objectDir).ino;
+  const stagingId = `stg_${name.replaceAll(/[^a-z0-9]+/g, '_')}`;
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  const undoDir = `${stagingDir}-undo`;
+  const marker = createRecoveryMarker({
+    root: fixture.root,
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    markerDir: fixture.markerDir,
+    operation: 'repair',
+    replacementDir: stagingDir,
+  });
+  const journalBase = {
+    version: 2 as const,
+    phase: 'applying' as const,
+    operation: 'repair' as const,
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
+  };
+  writeAddJournal(fixture.journalPath, journalBase);
+  const handle = commitInstall(fixture.root, objectDestRelPath(fixture.digest), stagingDir, {
+    afterBackupRename: () => recordRecoveryMarkerPriorIdentity(marker, backupDir),
+  });
+  hardenObjectModes(handle.dest);
+  return { fixture, priorInode, stagingDir, backupDir, undoDir, marker, journalBase, handle };
+}
+
+type DurableRepairRollbackFixture = Awaited<ReturnType<typeof durableRepairRollbackFixture>>;
+
+function parkRepairReplacement(input: DurableRepairRollbackFixture): void {
+  renameDirRestoringWrite(input.fixture.objectDir, input.undoDir);
+}
+
+function restoreRepairPrior(input: DurableRepairRollbackFixture): void {
+  renameDirRestoringWrite(input.backupDir, input.fixture.objectDir);
+}
+
+function assertExactRestoredPrior(input: DurableRepairRollbackFixture): void {
+  const { fixture } = input;
+  assert.equal(statSync(fixture.objectDir).ino, input.priorInode, 'the exact prior directory inode is restored');
+  assert.equal(statSync(fixture.objectDir).mode & 0o7777, 0o555, 'prior object-root mode is exactly 0555');
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.nestedDirRel)).mode & 0o7777,
+    0o555,
+    'prior nested-directory mode is exactly 0555',
+  );
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.executableRel)).mode & 0o7777,
+    0o555,
+    'prior executable-file mode is exactly 0555',
+  );
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o7777,
+    0o644,
+    'prior non-executable-file mode is restored exactly',
+  );
+  assert.equal(
+    readFileSync(join(fixture.objectDir, fixture.nonExecutableRel), 'utf8'),
+    'immutable note\n',
+    'prior file content is preserved',
+  );
+}
+
+function assertRollbackDebrisCleared(input: DurableRepairRollbackFixture): void {
+  assert.ok(!existsSync(input.fixture.journalPath), 'rollback journal is removed');
+  assert.ok(!existsSync(input.stagingDir), 'staging directory is absent');
+  assert.ok(!existsSync(input.backupDir), 'retained prior backup is consumed');
+  assert.ok(!existsSync(input.undoDir), 'replacement undo debris is removed');
+  assert.ok(!existsSync(join(input.fixture.root, '.owenloop-staging')), 'empty staging root is removed');
+  assert.ok(!existsSync(input.marker.path), 'external transaction marker is removed');
 }
 
 function assertHardenedRepairTree(fixture: RealRepairFixture): void {
@@ -890,6 +976,55 @@ test('install: an index-write failure rolls the object back and restores the pre
 
 // ---- concurrent installs serialize on one root --------------------------------------
 
+test('install: a repair index-write failure restores the exact prior object and clears rollback state', async () => {
+  const fixture = await realRepairFixture('repair-index-write-failure');
+  const indexPath = storeIndexPath(fixture.root);
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const priorInode = statSync(fixture.objectDir).ino;
+  const verifier = fakeVerifier({
+    onVerify: () => {
+      rmRecursiveForce(indexPath);
+      mkdirSync(indexPath);
+    },
+  });
+
+  await assert.rejects(
+    installWorkflowBundle({
+      bytes: fixture.packed.bytes,
+      source: fixture.source,
+      root: fixture.root,
+      level: 'project',
+      lockPath: fixture.lockPath,
+      journalPath: fixture.journalPath,
+      recoveryMarkerDir: fixture.markerDir,
+      ingestor: createBundleIngestor(),
+      verifier,
+    }),
+    /could not record install of .* — install rolled back, previous state restored/,
+  );
+
+  assert.equal(statSync(fixture.objectDir).ino, priorInode, 'rollback restores the exact prior directory inode');
+  assert.equal(statSync(fixture.objectDir).mode & 0o7777, 0o555, 'rollback preserves the prior object-root mode');
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.nestedDirRel)).mode & 0o7777,
+    0o555,
+    'rollback preserves the prior nested-directory mode',
+  );
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.executableRel)).mode & 0o7777,
+    0o555,
+    'rollback preserves the prior executable-file mode',
+  );
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o7777,
+    0o644,
+    'rollback preserves the legacy prior non-executable-file mode',
+  );
+  assert.ok(!existsSync(fixture.journalPath), 'completed rollback removes the journal');
+  assert.ok(!existsSync(join(fixture.root, '.owenloop-staging')), 'completed rollback removes staging debris');
+  assert.deepEqual(readdirSync(fixture.markerDir), [], 'completed rollback removes the external marker');
+});
+
 test('install: two concurrent installs into one root both land (no lost index update)', async () => {
   const { root, lockPath, journalPath, markerDir: installMarkerDir } = tempStore();
   const mA = makeBundle('alpha');
@@ -1323,6 +1458,370 @@ for (const scenario of repairCrashScenarios) {
     await assertHealthyReinstallDedupesWithoutReplacement(fixture);
   });
 }
+
+const durableRollbackBoundaries = [
+  {
+    name: 'after rollback intent before the replacement move',
+    phase: 'rollback-started' as const,
+    prepare: (_input: DurableRepairRollbackFixture): void => {},
+  },
+  {
+    name: 'after the replacement move before its phase write',
+    phase: 'rollback-started' as const,
+    prepare: parkRepairReplacement,
+  },
+  {
+    name: 'after the replacement-parked phase write',
+    phase: 'rollback-replacement-parked' as const,
+    prepare: parkRepairReplacement,
+  },
+  {
+    name: 'after prior restoration before its phase write',
+    phase: 'rollback-replacement-parked' as const,
+    prepare: (input: DurableRepairRollbackFixture): void => {
+      parkRepairReplacement(input);
+      restoreRepairPrior(input);
+    },
+  },
+  {
+    name: 'after the prior-restored phase write before undo cleanup',
+    phase: 'rollback-prior-restored' as const,
+    prepare: (input: DurableRepairRollbackFixture): void => {
+      parkRepairReplacement(input);
+      restoreRepairPrior(input);
+    },
+  },
+  {
+    name: 'after undo cleanup before the rollback-complete phase write',
+    phase: 'rollback-prior-restored' as const,
+    prepare: (input: DurableRepairRollbackFixture): void => {
+      parkRepairReplacement(input);
+      restoreRepairPrior(input);
+      rmRecursiveForce(input.undoDir);
+    },
+  },
+  {
+    name: 'after the rollback-complete phase write before journal cleanup',
+    phase: 'rollback-complete' as const,
+    prepare: (input: DurableRepairRollbackFixture): void => {
+      parkRepairReplacement(input);
+      restoreRepairPrior(input);
+      rmRecursiveForce(input.undoDir);
+    },
+  },
+];
+
+for (const boundary of durableRollbackBoundaries) {
+  test(`recovery: durable repair rollback ${boundary.name} restores exact prior state`, async () => {
+    const input = await durableRepairRollbackFixture(`rollback-boundary-${boundary.phase}-${boundary.name}`);
+    boundary.prepare(input);
+    writeAddJournal(input.fixture.journalPath, { ...input.journalBase, phase: boundary.phase });
+
+    const outcome = await recoverWorkflowStore({
+      root: input.fixture.root,
+      lockPath: input.fixture.lockPath,
+      journalPath: input.fixture.journalPath,
+      recoveryMarkerDir: input.fixture.markerDir,
+    });
+
+    assert.equal(outcome, 'rolled-back');
+    assertExactRestoredPrior(input);
+    assertRollbackDebrisCleared(input);
+    assert.equal(
+      await recoverWorkflowStore({
+	root: input.fixture.root,
+	lockPath: input.fixture.lockPath,
+	journalPath: input.fixture.journalPath,
+	recoveryMarkerDir: input.fixture.markerDir,
+      }),
+      'no-journal',
+      'repeated recovery changes nothing',
+    );
+    await assertBrokenRecoveryReinstallsAndThenDedupes(input.fixture);
+  });
+}
+
+test('recovery: rollback intent write failure leaves both copies for safe repair roll-forward', async () => {
+  const input = await durableRepairRollbackFixture('rollback-intent-write-failure');
+  assert.throws(
+    () => rollbackInstallCommit(input.handle, {
+      beforeRollback: () => {
+	throw new Error('injected rollback intent write failure');
+      },
+      cleanupUndo: true,
+    }),
+    /injected rollback intent write failure/,
+  );
+  assert.ok(existsSync(input.fixture.objectDir), 'replacement remains at destination');
+  assert.ok(existsSync(input.backupDir), 'the only prior object remains retained');
+  assert.ok(!existsSync(input.undoDir), 'rollback did not start without durable intent');
+
+  const outcome = await recoverWorkflowStore({
+    root: input.fixture.root,
+    lockPath: input.fixture.lockPath,
+    journalPath: input.fixture.journalPath,
+    recoveryMarkerDir: input.fixture.markerDir,
+  });
+
+  assert.equal(outcome, 'rolled-forward');
+  assertHardenedRepairTree(input.fixture);
+  assertRollbackDebrisCleared(input);
+  await assertHealthyReinstallDedupesWithoutReplacement(input.fixture);
+});
+
+const rollbackPhaseWriteFailures = [
+  {
+    name: 'replacement-parked phase write',
+    rollback: (input: DurableRepairRollbackFixture): void => rollbackInstallCommit(input.handle, {
+      beforeRollback: () => {
+	writeAddJournal(input.fixture.journalPath, { ...input.journalBase, phase: 'rollback-started' });
+      },
+      afterDestinationParked: () => {
+	throw new Error('injected replacement-parked phase write failure');
+      },
+      cleanupUndo: true,
+    }),
+  },
+  {
+    name: 'prior-restored phase write',
+    rollback: (input: DurableRepairRollbackFixture): void => rollbackInstallCommit(input.handle, {
+      beforeRollback: () => {
+	writeAddJournal(input.fixture.journalPath, { ...input.journalBase, phase: 'rollback-started' });
+      },
+      afterDestinationParked: () => {
+	writeAddJournal(input.fixture.journalPath, {
+	  ...input.journalBase,
+	  phase: 'rollback-replacement-parked',
+	});
+      },
+      afterPriorRestored: () => {
+	throw new Error('injected prior-restored phase write failure');
+      },
+      cleanupUndo: true,
+    }),
+  },
+  {
+    name: 'rollback-complete phase write',
+    rollback: (input: DurableRepairRollbackFixture): void => rollbackInstallCommit(input.handle, {
+      beforeRollback: () => {
+	writeAddJournal(input.fixture.journalPath, { ...input.journalBase, phase: 'rollback-started' });
+      },
+      afterDestinationParked: () => {
+	writeAddJournal(input.fixture.journalPath, {
+	  ...input.journalBase,
+	  phase: 'rollback-replacement-parked',
+	});
+      },
+      afterPriorRestored: () => {
+	writeAddJournal(input.fixture.journalPath, {
+	  ...input.journalBase,
+	  phase: 'rollback-prior-restored',
+	});
+      },
+      cleanupUndo: true,
+      afterUndoCleanup: () => {
+	throw new Error('injected rollback-complete phase write failure');
+      },
+    }),
+  },
+];
+
+for (const failure of rollbackPhaseWriteFailures) {
+  test(`recovery: ${failure.name} failure resumes the durable rollback`, async () => {
+    const input = await durableRepairRollbackFixture(`rollback-phase-failure-${failure.name}`);
+    assert.throws(() => failure.rollback(input), /injected .* phase write failure/);
+
+    const outcome = await recoverWorkflowStore({
+      root: input.fixture.root,
+      lockPath: input.fixture.lockPath,
+      journalPath: input.fixture.journalPath,
+      recoveryMarkerDir: input.fixture.markerDir,
+    });
+
+    assert.equal(outcome, 'rolled-back');
+    assertExactRestoredPrior(input);
+    assertRollbackDebrisCleared(input);
+    await assertBrokenRecoveryReinstallsAndThenDedupes(input.fixture);
+  });
+}
+
+test('recovery: stale legacy replacement phase after completed rollback is cleared without verifying the prior object', async () => {
+  const fixture = await realRepairFixture('legacy-completed-repair-rollback');
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const priorInode = statSync(fixture.objectDir).ino;
+  const stagingId = 'stg_legacy_completed_repair_rollback';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const backupDir = `${stagingDir}-old`;
+  const undoDir = `${stagingDir}-undo`;
+  const handle = commitInstall(fixture.root, objectDestRelPath(fixture.digest), stagingDir);
+  hardenObjectModes(handle.dest);
+  rollbackInstallCommit(handle);
+  assert.ok(existsSync(fixture.objectDir), 'legacy rollback restored the destination');
+  assert.ok(!existsSync(stagingDir), 'legacy rollback consumed staging');
+  assert.ok(!existsSync(backupDir), 'legacy rollback consumed the prior backup');
+  assert.ok(existsSync(undoDir), 'legacy rollback parked the replacement under undo');
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'replacement-swapped',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+  });
+
+  const outcome = await recoverWorkflowStore({
+    root: fixture.root,
+    lockPath: fixture.lockPath,
+    journalPath: fixture.journalPath,
+    recoveryMarkerDir: fixture.markerDir,
+  });
+
+  assert.equal(outcome, 'rolled-back');
+  assert.equal(statSync(fixture.objectDir).ino, priorInode, 'legacy recovery preserves the exact prior directory');
+  assert.equal(
+    statSync(join(fixture.objectDir, fixture.nonExecutableRel)).mode & 0o7777,
+    0o644,
+    'legacy recovery does not require the prior mode-loss object to pass the new verifier',
+  );
+  assert.ok(!existsSync(backupDir));
+  assert.ok(!existsSync(undoDir));
+  assert.ok(!existsSync(fixture.journalPath));
+  assert.ok(!existsSync(join(fixture.root, '.owenloop-staging')));
+  await assertBrokenRecoveryReinstallsAndThenDedupes(fixture);
+});
+
+test('recovery: a stale legacy rollback with incomplete claimed identity evidence is refused', async () => {
+  const fixture = await realRepairFixture('legacy-incomplete-repair-marker');
+  chmodSync(join(fixture.objectDir, fixture.nonExecutableRel), 0o644);
+  const priorInode = statSync(fixture.objectDir).ino;
+  const stagingId = 'stg_legacy_incomplete_repair_marker';
+  const stagingDir = stageRealReplacement(fixture, stagingId);
+  const marker = createRecoveryMarker({
+    root: fixture.root,
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    markerDir: fixture.markerDir,
+    operation: 'repair',
+    replacementDir: stagingDir,
+  });
+  const handle = commitInstall(fixture.root, objectDestRelPath(fixture.digest), stagingDir);
+  hardenObjectModes(handle.dest);
+  rollbackInstallCommit(handle);
+  writeAddJournal(fixture.journalPath, {
+    version: 2,
+    phase: 'replacement-swapped',
+    operation: 'repair',
+    destSegments: ['objects', 'sha256', fixture.digest],
+    stagingId,
+    hadDest: true,
+    root: fixture.root,
+    metadataHash: fixture.metadataHash,
+    recoveryMarkerId: marker.id,
+  });
+
+  await assert.rejects(
+    recoverWorkflowStore({
+      root: fixture.root,
+      lockPath: fixture.lockPath,
+      journalPath: fixture.journalPath,
+      recoveryMarkerDir: fixture.markerDir,
+    }),
+    /marker lacks complete replacement\/prior identity evidence/,
+  );
+
+  assert.equal(statSync(fixture.objectDir).ino, priorInode, 'the exact prior object remains at the destination');
+  assert.ok(existsSync(handle.undoDir), 'the claimed replacement remains untouched');
+  assert.ok(existsSync(fixture.journalPath), 'the contradictory journal remains as evidence');
+  assert.ok(existsSync(marker.path), 'the incomplete marker remains as evidence');
+});
+
+test('readers: repair rollback waits while destination can move and unblocks after exact prior restoration', async () => {
+  const input = await durableRepairRollbackFixture('reader-rollback-coordination');
+  writeAddJournal(input.fixture.journalPath, { ...input.journalBase, phase: 'rollback-started' });
+  let resolved = false;
+  const waiting = waitForDigestRepair(input.fixture.root, input.fixture.digest, {
+    timeoutMs: 2_000,
+    retryMs: 5,
+  }).then(() => { resolved = true; });
+
+  await new Promise<void>((resolveWait) => setTimeout(resolveWait, 30));
+  assert.equal(resolved, false, 'reader remains blocked before the replacement moves');
+  parkRepairReplacement(input);
+  writeAddJournal(input.fixture.journalPath, {
+    ...input.journalBase,
+    phase: 'rollback-replacement-parked',
+  });
+  await new Promise<void>((resolveWait) => setTimeout(resolveWait, 30));
+  assert.equal(resolved, false, 'reader remains blocked while the digest destination is absent');
+
+  restoreRepairPrior(input);
+  writeAddJournal(input.fixture.journalPath, { ...input.journalBase, phase: 'rollback-prior-restored' });
+  await waiting;
+  assert.equal(resolved, true, 'reader unblocks when the exact prior directory is stable');
+  assert.ok(existsSync(input.fixture.journalPath), 'stable rollback cleanup may still have an active journal');
+  assert.ok(existsSync(input.undoDir), 'stable rollback cleanup may still have replacement debris');
+
+  const outcome = await recoverWorkflowStore({
+    root: input.fixture.root,
+    lockPath: input.fixture.lockPath,
+    journalPath: input.fixture.journalPath,
+    recoveryMarkerDir: input.fixture.markerDir,
+  });
+  assert.equal(outcome, 'rolled-back');
+  assertExactRestoredPrior(input);
+  assertRollbackDebrisCleared(input);
+});
+
+test('recovery: rollback identity mismatch is refused without deleting unrelated paths', async () => {
+  const input = await durableRepairRollbackFixture('rollback-identity-mismatch');
+  parkRepairReplacement(input);
+  const unrelated = join(input.fixture.root, '.owenloop-staging', 'unrelated-undo');
+  renameDirRestoringWrite(input.undoDir, unrelated);
+  mkdirSync(input.undoDir);
+  writeFileSync(join(input.undoDir, 'keep.txt'), 'unrelated');
+  writeAddJournal(input.fixture.journalPath, { ...input.journalBase, phase: 'rollback-started' });
+
+  await assert.rejects(
+    recoverWorkflowStore({
+      root: input.fixture.root,
+      lockPath: input.fixture.lockPath,
+      journalPath: input.fixture.journalPath,
+      recoveryMarkerDir: input.fixture.markerDir,
+    }),
+    /parked replacement .* does not belong to this transaction/,
+  );
+
+  assert.equal(readFileSync(join(input.undoDir, 'keep.txt'), 'utf8'), 'unrelated');
+  assert.ok(existsSync(unrelated), 'the actual replacement is preserved outside the journal-derived undo path');
+  assert.ok(existsSync(input.backupDir), 'the only prior object remains retained');
+  assert.ok(existsSync(input.fixture.journalPath), 'contradictory journal remains as evidence');
+});
+
+test('recovery: malformed rollback identity evidence is refused before any mutation', async () => {
+  const input = await durableRepairRollbackFixture('rollback-malformed-marker');
+  writeAddJournal(input.fixture.journalPath, { ...input.journalBase, phase: 'rollback-started' });
+  writeFileSync(input.marker.path, `${JSON.stringify({
+    ...input.marker.record,
+    replacementIdentity: { dev: input.marker.record.replacementIdentity?.dev, ino: 'not-decimal' },
+  }, null, 2)}\n`);
+
+  await assert.rejects(
+    recoverWorkflowStore({
+      root: input.fixture.root,
+      lockPath: input.fixture.lockPath,
+      journalPath: input.fixture.journalPath,
+      recoveryMarkerDir: input.fixture.markerDir,
+    }),
+    /replacementIdentity\.ino.*not a decimal string/,
+  );
+
+  assert.ok(existsSync(input.fixture.objectDir), 'replacement remains at the destination');
+  assert.ok(existsSync(input.backupDir), 'the only prior object remains retained');
+  assert.ok(!existsSync(input.undoDir), 'recovery performs no rollback rename');
+  assert.ok(existsSync(input.fixture.journalPath), 'journal remains as evidence');
+});
 
 test('recovery: symlinked object parents are refused before any recovery mutation', async () => {
   const { root, lockPath, journalPath } = tempStore();
