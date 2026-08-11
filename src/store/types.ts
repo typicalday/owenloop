@@ -26,7 +26,15 @@
  * filesystem path.
  */
 
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
+import { isCanonicalSemver } from '../bundle/runtime.ts';
+
+interface SemverOrderingApi {
+  compare(a: string, b: string): -1 | 0 | 1;
+}
+
+const semver = createRequire(import.meta.url)('semver') as SemverOrderingApi;
 
 /** A lowercase 64-char SHA-256 hex digest — the store's only object identity. */
 export const DIGEST_RE = /^[0-9a-f]{64}$/;
@@ -329,6 +337,124 @@ export type StoreLevel = 'project' | 'global';
 
 /** Where a resolution found its object (human-facing result metadata). */
 export type ResolutionLevel = 'project' | 'global';
+
+// ---- deterministic ordering and version selection -----------------------------
+
+/**
+ * A total, LOCALE-INDEPENDENT order on store text (coordinates, digests,
+ * qualified names). `String.prototype.localeCompare` is deliberately avoided
+ * throughout the store: without an explicit locale its result depends on the
+ * host's ICU data, so two machines walking the same index could disagree on
+ * order. Codepoint comparison is stable everywhere.
+ *
+ * This orders ENUMERATION only. It never decides which version of a package is
+ * the current one — {@link selectLatestVersion} owns that and is the store's
+ * only version-selection rule.
+ */
+export function compareStoreText(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+/**
+ * One competitor for an unqualified `package/workflow` registration: a single
+ * verified bundle object that exports that workflow.
+ *
+ * `version` is the bundle MANIFEST's package version, never a version parsed
+ * back out of a coordinate string — the manifest is the object's own statement
+ * of what it is, and the caller has already proven the coordinate agrees with
+ * it before building a candidate.
+ */
+export interface VersionSelectionCandidate {
+  /** Manifest package version of the bundle supplying this candidate. */
+  version: string;
+  /** Store level that supplied the candidate's verified bytes. */
+  level: ResolutionLevel;
+  /** Verified bundle object digest — unique per object, so the final tiebreak never ties. */
+  digest: string;
+}
+
+/**
+ * The outcome of {@link selectLatestVersion}.
+ *
+ * `selected` — `winner` takes the unqualified name; every entry in `shadowed`
+ * stays reachable only under its digest-scoped key.
+ *
+ * `unorderable` — no candidate may take the unqualified name, because more than
+ * one candidate competes and NONE carries a canonical SemVer version. Every
+ * candidate is returned in `shadowed`. This is fail-closed on purpose: silently
+ * picking one of several versions that have no defined precedence is exactly
+ * the accidental-order defect this helper exists to remove.
+ */
+export type LatestVersionSelection<T> =
+  | { kind: 'selected'; winner: T; shadowed: T[] }
+  | { kind: 'unorderable'; shadowed: T[] };
+
+/**
+ * Rank two same-level candidates, BEST FIRST.
+ *
+ *  1. A canonical SemVer version outranks a non-SemVer one. A version the store
+ *     cannot order never displaces one it can.
+ *  2. Between two canonical SemVer versions, higher SemVer precedence wins
+ *     (SemVer §11 — so `0.1.10` beats `0.1.2`, and `1.0.0` beats `1.0.0-rc.1`).
+ *  3. Otherwise the two are indistinguishable by precedence: either they differ
+ *     only in build metadata, or neither is SemVer at all. Fall through to raw
+ *     text, then to the digest, purely so the answer is STABLE. Neither of those
+ *     last two steps claims to say which version is newer; they exist so the
+ *     result never depends on index insertion, filesystem, or install order.
+ */
+function compareVersionCandidates(a: VersionSelectionCandidate, b: VersionSelectionCandidate): number {
+  const aOrderable = isCanonicalSemver(a.version);
+  const bOrderable = isCanonicalSemver(b.version);
+  if (aOrderable !== bOrderable) return aOrderable ? -1 : 1;
+  if (aOrderable && bOrderable) {
+    const byPrecedence = semver.compare(b.version, a.version);
+    if (byPrecedence !== 0) return byPrecedence;
+  }
+  const byText = compareStoreText(b.version, a.version);
+  if (byText !== 0) return byText;
+  return compareStoreText(a.digest, b.digest);
+}
+
+/**
+ * Choose the ONE candidate that holds an unqualified `package/workflow` name.
+ *
+ * Two rules apply in order, and neither consults arrival order:
+ *
+ *  1. LEVEL FIRST. If any candidate came from the project store, only project
+ *     candidates compete. This mirrors `resolveWorkflowCoordinate`, where the
+ *     project index is the deterministic override: a project install of
+ *     `pkg@0.1.0` beats a global install of `pkg@0.9.9`, because the project
+ *     store is how an operator pins a workspace to a specific definition.
+ *  2. VERSION SECOND, by {@link compareVersionCandidates}, among the candidates
+ *     at that one level.
+ *
+ * When the surviving group holds more than one candidate and none carries a
+ * canonical SemVer version, the result is `unorderable` and the unqualified name
+ * goes unregistered. A SINGLE non-SemVer candidate still wins its name — there
+ * is nothing to order, so refusing it would break `pkg@nightly` installs for no
+ * determinism gain.
+ */
+export function selectLatestVersion<T extends VersionSelectionCandidate>(
+  candidates: readonly T[],
+): LatestVersionSelection<T> {
+  if (candidates.length === 0) return { kind: 'unorderable', shadowed: [] };
+
+  const competing = candidates.some((candidate) => candidate.level === 'project')
+    ? candidates.filter((candidate) => candidate.level === 'project')
+    : [...candidates];
+  const outranked = candidates.filter((candidate) => !competing.includes(candidate));
+  const ranked = [...competing].sort(compareVersionCandidates);
+  const best = ranked[0] as T;
+
+  // Rule 1 sorts every orderable candidate ahead of every unorderable one, so a
+  // non-SemVer `best` proves the whole competing group is unorderable.
+  if (!isCanonicalSemver(best.version) && ranked.length > 1) {
+    return { kind: 'unorderable', shadowed: [...ranked, ...outranked] };
+  }
+  return { kind: 'selected', winner: best, shadowed: [...ranked.slice(1), ...outranked] };
+}
 
 /** One index entry: the digest a coordinate currently records, plus its pin state. */
 export interface WorkflowStoreIndexEntry {

@@ -26,14 +26,17 @@ import {
 	storeIndexPath,
 } from './resolve.ts';
 import {
+	compareStoreText,
 	defDigest,
 	objectDirForDigest,
 	parseWorkflowCoordinate,
+	selectLatestVersion,
 	StoreIntegrityError,
 } from './types.ts';
 import type {
 	DefDigest,
 	ResolutionLevel,
+	VersionSelectionCandidate,
 	WorkflowCoordinate,
 	WorkflowStoreIndexEntry,
 } from './types.ts';
@@ -120,7 +123,7 @@ function readIndexedCoordinates(
 		if (probeStoreRoot(root) !== 'dir') return { entries: [], complete: true };
 		const index = readWorkflowStoreIndex(storeIndexPath(root));
 		const entries = Object.entries(index.entries)
-			.sort(([a], [b]) => a.localeCompare(b))
+			.sort(([a], [b]) => compareStoreText(a, b))
 			.map(([coordinate, entry]) => ({
 				coordinate: coordinate as WorkflowCoordinate,
 				entry,
@@ -145,7 +148,12 @@ function loadObjectDefs(
 		verifyWorkflowObjectSync(objectDir, bundleDigest, { coordinateRepair: false });
 		const manifest = parseManifestBytes(readFileSync(join(objectDir, 'bundle.yaml')));
 		const defs = new Map<string, WorkflowDef>();
-		for (const [workflowName, workflowPath] of Object.entries(manifest.workflows)) {
+		// Sorted, not YAML key order: this map's iteration order drives registration
+		// and warning order downstream, so it must not depend on how the manifest
+		// author happened to write the file.
+		const manifestWorkflows = Object.entries(manifest.workflows)
+			.sort(([a], [b]) => compareStoreText(a, b));
+		for (const [workflowName, workflowPath] of manifestWorkflows) {
 			const def = loadDefFile(join(objectDir, workflowPath));
 			if (def.name !== workflowName) {
 				throw new Error(
@@ -240,6 +248,101 @@ function coordinateTarget(indexed: IndexedCoordinate, loaded: LoadedObject): Wor
 	return target;
 }
 
+/** One verified object's offer of one workflow under one `package/workflow` name. */
+interface WorkflowCandidate extends VersionSelectionCandidate {
+	qualified: string;
+	def: WorkflowDef;
+	packageName: string;
+}
+
+function candidateRegistration(candidate: WorkflowCandidate, key: string): CasDefRegistration {
+	return {
+		key,
+		qualified: candidate.qualified,
+		bare: candidate.def.name,
+		def: candidate.def,
+		bundleDigest: candidate.digest as DefDigest,
+		bundlePackage: candidate.packageName,
+		level: candidate.level,
+		kind: 'workflow',
+	};
+}
+
+/** `<digest>/<workflow>` — where a version that did not win its name stays reachable. */
+function shadowedWorkflowKey(candidate: WorkflowCandidate): string {
+	return `${candidate.digest}/${candidate.def.name}`;
+}
+
+/**
+ * Register every workflow of every verified object, choosing ONE holder per
+ * unqualified `package/workflow` name with {@link selectLatestVersion}.
+ *
+ * This runs AFTER the coordinate walk, not inside it, precisely so the choice
+ * cannot depend on which coordinate the walk reached first. Two versions of the
+ * same package are competitors to be ranked, never a first-claim and a
+ * latecomer.
+ *
+ * Exact coordinate aliases and digest-scoped aliases are registered by the walk
+ * itself and are deliberately NOT affected by anything decided here: a pinned
+ * parent and an explicit `pkg/name@version` call keep resolving to their own
+ * object whichever version currently holds the unqualified name.
+ */
+function selectWorkflowRegistrations(
+	objects: readonly LoadedObject[],
+	warn: (line: string) => void,
+): CasDefRegistration[] {
+	const byQualified = new Map<string, WorkflowCandidate[]>();
+	const ordered = [...objects].sort((a, b) => compareStoreText(a.bundleDigest, b.bundleDigest));
+	for (const loaded of ordered) {
+		for (const def of loaded.defs.values()) {
+			const qualified = `${loaded.manifest.package.name}/${def.name}`;
+			const candidate: WorkflowCandidate = {
+				qualified,
+				def,
+				packageName: loaded.manifest.package.name,
+				version: loaded.manifest.package.version,
+				level: loaded.level,
+				digest: loaded.bundleDigest,
+			};
+			const existing = byQualified.get(qualified);
+			if (existing === undefined) byQualified.set(qualified, [candidate]);
+			else existing.push(candidate);
+		}
+	}
+
+	const registrations: CasDefRegistration[] = [];
+	for (const qualified of [...byQualified.keys()].sort(compareStoreText)) {
+		const candidates = byQualified.get(qualified) as WorkflowCandidate[];
+		const selection = selectLatestVersion(candidates);
+
+		if (selection.kind === 'unorderable') {
+			const versions = selection.shadowed.map((candidate) => candidate.version).join(', ');
+			warn(
+				`warning: workflow '${qualified}' has no selectable version — none of the installed ` +
+					`versions (${versions}) is canonical SemVer, so the unqualified name is refused rather ` +
+					`than resolved by install order; call an exact 'namespace/name@version' coordinate instead`,
+			);
+			for (const candidate of selection.shadowed) {
+				registrations.push(candidateRegistration(candidate, shadowedWorkflowKey(candidate)));
+			}
+			continue;
+		}
+
+		registrations.push(candidateRegistration(selection.winner, qualified));
+		for (const candidate of selection.shadowed) {
+			const key = shadowedWorkflowKey(candidate);
+			warn(
+				`warning: workflow '${qualified}' from ${candidate.level} bundle ${candidate.digest} ` +
+					`(version ${candidate.version}) does not hold that name — ${selection.winner.level} bundle ` +
+					`${selection.winner.digest} (version ${selection.winner.version}) is the selected version; ` +
+					`this copy stays reachable as '${key}'`,
+			);
+			registrations.push(candidateRegistration(candidate, key));
+		}
+	}
+	return registrations;
+}
+
 function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspectionResult {
 	const projectRoot = args.projectRoot === undefined ? undefined : projectStoreRoot(args.projectRoot);
 	const globalRoot = projectStoreRoot(args.globalRoot);
@@ -268,38 +371,8 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 
 	const registrations: CasDefRegistration[] = [];
 	const loadedByDigest = new Map<DefDigest, LoadedObject>();
-	const registeredDigests = new Set<DefDigest>();
+	const registeredObjects = new Map<DefDigest, LoadedObject>();
 	const registeredCoordinateKeys = new Set<string>();
-	const byQualified = new Map<string, CasDefRegistration>();
-
-	const registerObjectWorkflows = (loaded: LoadedObject): void => {
-		if (registeredDigests.has(loaded.bundleDigest)) return;
-		registeredDigests.add(loaded.bundleDigest);
-		for (const def of loaded.defs.values()) {
-			const qualified = `${loaded.manifest.package.name}/${def.name}`;
-			const winner = byQualified.get(qualified);
-			const key = winner === undefined ? qualified : `${loaded.bundleDigest}/${def.name}`;
-			if (winner !== undefined) {
-				args.warn(
-					`warning: workflow '${qualified}' from ${loaded.level} bundle ${loaded.bundleDigest} ` +
-						`does not hold that name — ${winner.level} bundle ${winner.bundleDigest} claimed it first; ` +
-						`this copy stays reachable as '${key}'`,
-				);
-			}
-			const registration: CasDefRegistration = {
-				key,
-				qualified,
-				bare: def.name,
-				def,
-				bundleDigest: loaded.bundleDigest,
-				bundlePackage: loaded.manifest.package.name,
-				level: loaded.level,
-				kind: 'workflow',
-			};
-			if (winner === undefined) byQualified.set(qualified, registration);
-			registrations.push(registration);
-		}
-	};
 
 	for (const indexed of selected) {
 		try {
@@ -310,7 +383,7 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 				loadedByDigest.set(digest, loaded);
 			}
 			const target = coordinateTarget(indexed, loaded);
-			registerObjectWorkflows(loaded);
+			registeredObjects.set(loaded.bundleDigest, loaded);
 			if (target === undefined) {
 				if (indexed.registerAlias) {
 					args.warn(
@@ -357,6 +430,7 @@ function discoverCasDefs(args: LoadCasDefsArgs, tolerant: boolean): CasDefInspec
 		}
 	}
 
+	registrations.push(...selectWorkflowRegistrations([...registeredObjects.values()], args.warn));
 	return { registrations, complete };
 }
 

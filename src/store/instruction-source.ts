@@ -22,6 +22,7 @@ import type { StepDef, WorkflowDef } from '../types.ts';
 import { readWorkflowStoreIndex } from './index-file.ts';
 import {
   StoreIntegrityError,
+  compareStoreText,
   defDigest,
   objectDirForDigest,
 } from './types.ts';
@@ -82,9 +83,13 @@ export interface StoreInstructionSource extends OrderInstructionSource {
 function indexedBundleDigests(root: string): DefDigest[] {
   if (probeStoreRoot(root) !== 'dir') return [];
   const index = readWorkflowStoreIndex(storeIndexPath(root));
+  // Enumeration order only — every candidate is tried and matched by exact
+  // digest, so this never selects a version. It is sorted, and sorted without
+  // `localeCompare`, so the order candidates are inspected (and therefore which
+  // integrity failure is reported first) is identical on every host.
   return Object.values(index.entries)
     .map((entry) => defDigest(entry.digest))
-    .sort((a, b) => a.localeCompare(b));
+    .sort(compareStoreText);
 }
 
 async function verifiedCandidateObject(

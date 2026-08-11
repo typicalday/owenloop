@@ -12,8 +12,10 @@
 
 export {
   COORDINATE_COMPONENT_RE,
+  compareStoreText,
   DIGEST_RE,
   defDigest,
+  selectLatestVersion,
   isDefDigest,
   objectDirForDigest,
   parseWorkflowCoordinate,
@@ -37,8 +39,10 @@ export {
 } from './types.ts';
 export type {
   DefDigest,
+  LatestVersionSelection,
   ResolutionLevel,
   StoreLevel,
+  VersionSelectionCandidate,
   WorkflowCoordinate,
   WorkflowStoreIndex,
   WorkflowStoreIndexEntry,

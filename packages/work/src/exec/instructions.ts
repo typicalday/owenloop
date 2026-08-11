@@ -13,7 +13,7 @@ import { createBundleIngestor, createStoreInstructionSource } from '../../../../
 import type { BundleIngestor, StoreInstructionSource } from '../../../../src/store/index.ts';
 import { readWorkflowStoreIndex } from '../../../../src/store/index-file.ts';
 import { projectStoreRoot, probeStoreRoot, storeIndexPath, globalStoreRoot } from '../../../../src/store/resolve.ts';
-import { parseWorkflowCoordinate } from '../../../../src/store/types.ts';
+import { compareStoreText, parseWorkflowCoordinate } from '../../../../src/store/types.ts';
 import type { StepDef, WorkflowDef } from '../../../../src/types.ts';
 import type { DefPolicy, DefVerdict } from '../../../../src/crypto/verify-publication.ts';
 import { evaluateOriginRule, matchOriginRule } from '../../../../src/crypto/origin-rules.ts';
@@ -259,7 +259,12 @@ export function createStoreInstructionResolver(
     for (const root of uniqueRoots) {
       if (probeStoreRoot(root) !== 'dir') continue;
       const index = readWorkflowStoreIndex(storeIndexPath(root));
-      for (const [coordinate, entry] of Object.entries(index.entries)) {
+      // Sorted, not index key order: `entries[0]` below supplies the rule KEY
+      // named in the refusal message, and the whole list is joined into the
+      // ambiguity message. Both would otherwise vary with JSON key order.
+      const coordinates = Object.keys(index.entries).sort(compareStoreText);
+      for (const coordinate of coordinates) {
+        const entry = index.entries[coordinate]!;
         if (entry.digest !== bundleDigest) continue;
         foundCoordinate = true;
         const { namespace } = parseWorkflowCoordinate(coordinate);
