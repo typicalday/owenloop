@@ -401,6 +401,75 @@ test('run() without --ignore-stdin: stdin EOF triggers stop(stdin-eof) → final
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
 });
 
+/**
+ * The regression that broke every builder order. `agent-run` claims the order
+ * under its own `exec` lease loop and spawns `hold --mcp --never-release` only
+ * to serve the agent's tool calls. That child's stdin is the JSON-RPC
+ * transport, so its EOF says nothing about whether the order is finished — and
+ * releasing on it unclaimed a run the agent was still working, which fast-
+ * failed every later tool call and sent the shift off to re-dispatch the same
+ * order. With `--never-release` the stdin watcher is still installed (the child
+ * must still exit when its parent goes away), the loop still stops, but no
+ * release reaches the hub and the outcome is `stopped`, not `released`.
+ */
+test('run() with --never-release: stdin EOF stops the loop WITHOUT releasing the claim', async () => {
+  process.env['OWENLOOP_TOKEN'] = 'tok';
+  const stdin = fakeStdinHost();
+  const { hub, releases } = roleHub({
+    getOrder: order(true),
+    onHeartbeat: (n) => {
+      if (n === 0) stdin.emitEof();
+    },
+  });
+  const sig = fakeSignalHost();
+  const out: string[] = [];
+
+  const code = await run([...WIRE_ARGS, '--never-release'], {
+    hub,
+    signalHost: sig.host,
+    stdin: stdin.host,
+    out: (line) => out.push(line),
+    err: () => {},
+  });
+
+  assert.equal(code, 0); // 'stopped' is a zero-exit outcome
+  assert.deepEqual(stdin.onCalls.sort(), ['close', 'end']);
+  assert.deepEqual(releases, [], 'the child released a claim it does not own');
+  assert.equal(
+    out.some((l) => /final breath|releasing|released/.test(l)),
+    false,
+    out.join('\n'),
+  );
+});
+
+/** A signal is a fact about this child too — same rule as stdin EOF. */
+test('run() with --never-release: SIGINT stops the loop WITHOUT releasing the claim', async () => {
+  process.env['OWENLOOP_TOKEN'] = 'tok';
+  const sig = fakeSignalHost();
+  const { hub, releases } = roleHub({
+    getOrder: order(true),
+    onHeartbeat: (n) => {
+      if (n === 0) sig.emit('SIGINT');
+    },
+  });
+  const err: string[] = [];
+
+  const code = await run([...WIRE_ARGS, '--never-release', '--ignore-stdin'], {
+    hub,
+    signalHost: sig.host,
+    stdin: fakeStdinHost().host,
+    out: () => {},
+    err: (line) => err.push(line),
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(releases, []);
+  assert.ok(
+    err.some((l) => /SIGINT received — stopping \(claim stays with the holder of record\)/.test(l)),
+    err.join('\n'),
+  );
+});
+
 test('run() signal wiring: hold-role message lines, stop(signal), second SIGINT exits 130', async () => {
   process.env['OWENLOOP_TOKEN'] = 'tok';
   const sig = fakeSignalHost();

@@ -29,6 +29,17 @@
  * closed at spawn (backgrounded/detached use), pass `--ignore-stdin` so hold
  * does not final-breath at birth.
  *
+ * HOLDER OF RECORD: by default this process IS the holder — its final breath
+ * releases the claim. `--never-release` says the opposite: some OTHER process
+ * holds the claim and this one is only along for the ride. `owenloop work
+ * agent-run` is the case that matters — it claims the order under its own
+ * `exec` lease loop and spawns `hold --mcp --never-release` purely to serve the
+ * agent's tool calls. There, a stop is a fact about this child (its stdin
+ * closed, it got a signal), never a fact about the order, so releasing would
+ * strip a live agent of the claim it is still working under. With
+ * `--never-release` every stop path skips the release and the loop settles as
+ * `stopped`; the holder of record decides the order's fate.
+ *
  * Origin/credential resolution mirrors `shift`: origin `--origin` → settings;
  * the bearer comes from owenloop's store via `resolveBearer`, reading the
  * `agent:<account>` slot for `--as <account>` (default `default`, so a hand-run
@@ -42,6 +53,7 @@ import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { createHoldLoop, type HoldOutcome } from '../hold/loop.ts';
+import type { StopOptions } from '../lease/loop.ts';
 import { createHoldMcp, HOLD_MCP_TOOL_NAMES, type HoldMcpToolName } from '../hold/mcp.ts';
 import { createConsumedVerifier } from '../consumed-verifier.ts';
 import { createMcpServer, pumpStdin, type LineStream } from '../mcp/server.ts';
@@ -65,6 +77,8 @@ interface ParsedArgs {
   ignoreStdin: boolean;
   mcp: boolean;
   mcpTools?: HoldMcpToolName[];
+  /** Never hand the claim back — another process is the holder of record. */
+  neverRelease?: boolean;
   error?: string;
 }
 
@@ -106,6 +120,9 @@ export function parseArgs(args: string[]): ParsedArgs {
         break;
       case '--mcp':
         parsed.mcp = true;
+        break;
+      case '--never-release':
+        parsed.neverRelease = true;
         break;
       case '--order':
       case '--workflow':
@@ -324,12 +341,30 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 
   const hub = deps.hub ?? createHubClient({ origin, getToken: async () => token });
 
+  // --never-release: this hold is NOT the holder of record. `owenloop work
+  // agent-run` already claimed the order with its own `exec` lease loop and
+  // spawned this process only to serve the MCP tool surface (see
+  // `agent/brief.ts` buildOwenloopMcp). Under that parent, a stop of ANY kind —
+  // stdin EOF, SIGINT, SIGTERM — is a transport or lifecycle event for THIS
+  // child, not evidence that the order is finished, so it must never call
+  // `release`. Doing so hands the claim back while the agent is still working:
+  // the hub marks the run unclaimed, the mount's terminal guard fast-fails every
+  // subsequent get_order/submit, the agent dies empty-handed, and the shift
+  // re-dispatches the same order to a fresh worker that repeats the whole cycle.
+  // Every stop path below therefore routes through `stopOpts`/`stopTarget`.
+  const stopOpts: StopOptions | undefined = parsed.neverRelease === true ? { release: false } : undefined;
+  const stopTarget = (l: { stop(reason?: string, stopOpts?: StopOptions): void }): { stop(reason?: string): void } => ({
+    stop: (reason?: string) => l.stop(reason, stopOpts),
+  });
+
   // --mcp: run the born-bound work-holder as a stdio MCP server. The default
   // registers get_order/submit/reject; --mcp-tools selects an exact positive
   // subset. The lease loop stays warm underneath. stdout is the JSON-RPC
   // channel, so every diagnostic (and the loop's own lines) goes to stderr;
-  // stdin is the transport, and its EOF (the session died) fires the final
-  // breath.
+  // stdin is the transport, and its EOF ends the mount. Whether that EOF also
+  // releases the claim depends on `--never-release` (see stopOpts above): a
+  // human-launched `hold --mcp` is the holder of record and releases; the
+  // `agent-run` child is not and does not.
   if (parsed.mcp) {
     const mount = createHoldMcp({
       hub,
@@ -356,9 +391,9 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
       write: (msg) => void process.stdout.write(`${JSON.stringify(msg)}\n`),
       err,
     });
-    installSignalHandlers(mount.loop, deps.signalHost ?? process, err, {
+    installSignalHandlers(stopTarget(mount.loop), deps.signalHost ?? process, err, {
       role: 'hold',
-      drainNote: 'final breath',
+      drainNote: parsed.neverRelease === true ? 'stopping (claim stays with the holder of record)' : 'final breath',
       stopReason: 'signal',
     });
     // The MCP server must keep answering until the TRANSPORT ends, not until
@@ -373,7 +408,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     const stdin = (deps.stdin ?? process.stdin) as unknown as LineStream;
     const eof = new Promise<void>((resolve) => {
       pumpStdin(stdin, server, () => {
-        mount.loop.stop('stdin-eof');
+        mount.loop.stop('stdin-eof', stopOpts);
         resolve();
       });
     });
@@ -398,13 +433,13 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     holder,
   });
 
-  installSignalHandlers(loop, deps.signalHost ?? process, err, {
+  installSignalHandlers(stopTarget(loop), deps.signalHost ?? process, err, {
     role: 'hold',
-    drainNote: 'final breath',
+    drainNote: parsed.neverRelease === true ? 'stopping (claim stays with the holder of record)' : 'final breath',
     stopReason: 'signal',
   });
   if (!parsed.ignoreStdin) {
-    watchStdinEof(deps.stdin ?? process.stdin, () => loop.stop('stdin-eof'));
+    watchStdinEof(deps.stdin ?? process.stdin, () => loop.stop('stdin-eof', stopOpts));
   }
 
   const outcome = await loop.run();

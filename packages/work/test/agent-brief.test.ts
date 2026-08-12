@@ -76,8 +76,19 @@ test('buildOwenloopMcp emits the born-bound work-holder argv', () => {
       'default',
       '--shift=shf_abc',
       '--mcp',
+      '--never-release',
     ],
   });
+});
+
+/**
+ * The claim belongs to `agent-run`'s exec loop, not to this child. Dropping
+ * `--never-release` re-opens the defect where the child's stdin EOF released a
+ * run its own agent was still working, and the shift re-dispatched the order.
+ */
+test('buildOwenloopMcp never lets the child release the claim', () => {
+  const { args } = buildOwenloopMcp(spec({ shiftId: 'shf_abc' }));
+  assert.equal(args.includes('--never-release'), true);
 });
 
 test('buildOwenloopMcp cannot be hijacked by a stale owenloop earlier on PATH', () => {

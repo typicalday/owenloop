@@ -97,6 +97,15 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
  * with no value or a null array entry, which is what `hold`'s parser expects.
  * (The shape originated with the deleted stamp path, which had to survive a YAML
  * args array; it is kept because it is still the correct, unambiguous form.)
+ *
+ * `--never-release` is load-bearing. This child runs its own lease loop, but it
+ * is NOT the holder of record: `agent-run`'s `exec` loop already claimed the
+ * order and is the only thing entitled to hand it back. Without the flag the
+ * child's stdin EOF — which in `--mcp` mode is just the harness closing the
+ * JSON-RPC transport — fired a final-breath `release`, unclaiming a run the
+ * agent was still working. The mount's terminal guard then fast-failed every
+ * later get_order/submit, the agent finished with nothing, and the shift
+ * re-dispatched the same order into a fresh worker that did it all again.
  */
 export function buildOwenloopMcp(
   spec: BriefSpec,
@@ -117,6 +126,7 @@ export function buildOwenloopMcp(
       spec.account,
       `--shift=${spec.shiftId ?? ''}`,
       '--mcp',
+      '--never-release',
     ],
   };
 }
