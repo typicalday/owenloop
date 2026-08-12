@@ -1691,7 +1691,7 @@ allowed) re-reads the route table as it stands at that moment.
 - **Adding.** Running `capability bind` on a capability that is **already bound** ADDS the
   named crew — it never displaces a crew already bound. Adding widens who can
   serve the capability, live at the next poll of every in-flight run using it. Re-adding
-  a pair that is already there is a normal success, not an error (`alreadyRouted:
+  a pair that is already there is a normal success, not an error (`alreadyBound:
   true`).
 - **Removing.** Running `capability unbind` removes exactly ONE pair. If the capability still
   has other live routes, it simply routes to a narrower set and nothing pauses.
@@ -1718,9 +1718,9 @@ id; the CLI does no crew lookup and performs no client-side validation of either
 argument (the hub is the enforcement of record).
 
 **Adding is idempotent per pair.** Re-adding a `(capability, crew)` pair that is
-already bound is a normal success — the hub answers `200` with `alreadyRouted:
+already bound is a normal success — the hub answers `200` with `alreadyBound:
 true` and changes nothing (the original row keeps its creator and timestamp).
-`routedCrewCount` reports how many **live** crews the capability binds after the write.
+`boundCrewCount` reports how many **live** crews the capability binds after the write.
 
 ### `capability unbind <capability> <crew>`
 
@@ -1781,7 +1781,7 @@ works. Human progress lines (the two `capability unbind` warnings) go to stderr 
 
 | subcommand | stdout |
 |---|---|
-| `capability bind` | `{ "ok": true, "hub": "<origin>", "capability": "gpu", "crew": "ml-crew", "alreadyRouted": false, "routedCrewCount": 2 }` |
+| `capability bind` | `{ "ok": true, "hub": "<origin>", "capability": "gpu", "crew": "ml-crew", "alreadyBound": false, "boundCrewCount": 2 }` |
 | `capability unbind` | `{ "ok": true, "hub": "<origin>", "capability": "gpu", "crewId": "crw_1", "removed": true, "remainingCrewIds": ["crw_2"] }` |
 | `capability list` | `{ "ok": true, "hub": "<origin>", "routes": [ { "capability": "gpu", "crewId": "crw_1", "crewName": "ml-crew", "createdBy": "u_1", "createdAt": 1738000000000 } ] }` |
 
@@ -1789,9 +1789,9 @@ Every added field carries the **hub's own name**, verbatim — the same words it
 audit log and the web console use — so correlating stdout against them never
 needs a translation step.
 
-- `alreadyRouted` (`capability bind`) — was this exact `(capability, crew)` pair already
+- `alreadyBound` (`capability bind`) — was this exact `(capability, crew)` pair already
   bound before the call? `false` means the pair was created by it.
-- `routedCrewCount` (`capability bind`) — how many **live** crews the capability binds
+- `boundCrewCount` (`capability bind`) — how many **live** crews the capability binds
   after the write. A dangling route routes nothing and is not counted.
 - `removed` (`capability unbind`) — did this call actually remove a pair? `false` is the
   tolerant "it was never bound" case, not an error.

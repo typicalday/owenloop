@@ -4783,7 +4783,7 @@ async function dispatchAgent(io: CliIO, args: Args): Promise<number> {
  * bind MANY crews. `capability bind` on an already-bound capability ADDS a crew; it never
  * displaces one already bound. Re-adding the same pair is a normal 200 no-op, so
  * there is no "already bound" rejection to handle and no client-side pre-check —
- * the response says which happened via `alreadyRouted`, and `routedCrewCount`
+ * the response says which happened via `alreadyBound`, and `boundCrewCount`
  * reports how many LIVE crews the capability binds afterwards.
  *
  * **`capability unbind` removes ONE pair**, which is why `<crew>` is required. Removing
@@ -4926,18 +4926,20 @@ async function dispatchCapability(io: CliIO, args: Args): Promise<number> {
       }
       // The server-echoed capability/crew, not argv: if the hub normalized either,
       // stdout tells the truth about what the hub stored (same precedent as
-      // `agent new` printing the server-resolved crews). `alreadyRouted` and
-      // `routedCrewCount` carry the HUB's own field names verbatim, so an operator
+      // `agent new` printing the server-resolved crews). `alreadyBound` and
+      // `boundCrewCount` carry the HUB's own field names verbatim, so an operator
       // correlating stdout against the hub's audit log never has to translate.
+      // (They were `alreadyRouted`/`routedCrewCount` here, which the hub never
+      // sends — the claim in this comment was the intent, not the behavior.)
       // `createdBy`/`createdAt` are validated but not printed — `capability list` is
       // where a row's provenance belongs.
       print(io, {
         ok: true,
         hub: origin,
-        capability: added.route.capability,
-        crew: added.route.crewName,
-        alreadyRouted: added.alreadyRouted,
-        routedCrewCount: added.routedCrewCount,
+        capability: added.binding.capability,
+        crew: added.binding.crewName,
+        alreadyBound: added.alreadyBound,
+        boundCrewCount: added.boundCrewCount,
       });
       // No stderr line on `bind`: an add never displaces a crew and never parks a
       // capability, so there is no consequence to warn about.

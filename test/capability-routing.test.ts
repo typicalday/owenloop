@@ -14,7 +14,7 @@
  * The invariants these tests pin, beyond the obvious happy paths:
  *   - the routes are `add_capability_route`/`remove_capability_route` and nothing else
  *     (the retired `set_`/`delete_`-prefixed names must never be requested);
- *   - a capability binds MANY crews: `capability bind` is ADDITIVE (`alreadyRouted` says
+ *   - a capability binds MANY crews: `capability bind` is ADDITIVE (`alreadyBound` says
  *     whether the pair was already there) and `capability list` returns MANY rows per
  *     capability, all of which must survive to stdout — nothing may key on `capability`;
  *   - `capability unbind` takes `<capability> <crew>`; the missing `<crew>` is a usage error
@@ -54,8 +54,8 @@ function seedHumanOauth(t: HubIo, over: Partial<Extract<Credential, { kind: 'oau
 }
 
 /**
- * A realistic 200 `add_capability_route` body — `{ text, capability, alreadyRouted,
- * routedCrewCount }`, with `alreadyRouted`/`routedCrewCount` at the BODY's top level
+ * A realistic 200 `add_capability_route` body — `{ text, capability, alreadyBound,
+ * boundCrewCount }`, with `alreadyBound`/`boundCrewCount` at the BODY's top level
  * exactly as the hub spreads them. `over` patches the nested row; `top` patches
  * the body's own fields.
  */
@@ -64,7 +64,7 @@ function addOk(over: Record<string, unknown> = {}, top: Record<string, unknown> 
     status: 200,
     json: {
       text: "Capability 'gpu' bound to crew 'ml-crew' (now 1 crew).",
-      route: {
+      binding: {
         capability: 'gpu',
         crewId: 'crw_1',
         crewName: 'ml-crew',
@@ -72,8 +72,8 @@ function addOk(over: Record<string, unknown> = {}, top: Record<string, unknown> 
         createdAt: 1,
         ...over,
       },
-      alreadyRouted: false,
-      routedCrewCount: 1,
+      alreadyBound: false,
+      boundCrewCount: 1,
       ...top,
     },
   });
@@ -103,9 +103,15 @@ const ROW_B = { capability: 'repo-access', crewId: 'crw_3', crewName: 'build-fle
 /** A DANGLING route: the bound crew row was deleted, so the hub has no name to resolve. */
 const ROW_DANGLING = { capability: 'gpu', crewId: 'crw_gone', crewName: null, createdBy: 'u_1', createdAt: 4 };
 
-/** A realistic 200 `capability_routes` body — `{ text, routes }`. */
+/**
+ * A realistic 200 `capability_routes` body — `{ text, bindings }`. The array key is
+ * `bindings`, NOT `routes`: the endpoint PATH is `capability_routes`, but the hub verb
+ * (`hub-core/src/verbs/manage-capability-routes.ts`) names the payload key `bindings`.
+ * These fixtures asserted `routes` and so agreed with a client that no live hub
+ * could satisfy.
+ */
 function listOk(rows: unknown[] = [ROW_A, ROW_B]): RouteHandler {
-  return () => ({ status: 200, json: { text: `${rows.length} capability route(s).`, routes: rows } });
+  return () => ({ status: 200, json: { text: `${rows.length} capability route(s).`, bindings: rows } });
 }
 
 /** Parse the single JSON document the command wrote to stdout. */
@@ -115,7 +121,7 @@ function stdoutJson(t: HubIo): Record<string, unknown> {
 
 // ---- happy paths ------------------------------------------------------------
 
-test('capability bind: a fresh add POSTs add_capability_route and prints alreadyRouted: false with NO stderr', async () => {
+test('capability bind: a fresh add POSTs add_capability_route and prints alreadyBound: false with NO stderr', async () => {
   const { fetch, calls } = routedFetch({ 'POST /api/add_capability_route': addOk() });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
@@ -137,18 +143,18 @@ test('capability bind: a fresh add POSTs add_capability_route and prints already
     hub: ORIGIN,
     capability: 'gpu',
     crew: 'ml-crew',
-    alreadyRouted: false,
-    routedCrewCount: 1,
+    alreadyBound: false,
+    boundCrewCount: 1,
   });
   assert.equal(stdoutJson(t).text, undefined, 'no raw hub body spread onto stdout');
   assert.deepEqual(t.err, [], 'an add has no consequence to warn about — nothing on stderr');
 });
 
-test('capability bind: a REPEAT add is a normal success — alreadyRouted: true, no stderr, no provenance leak', async () => {
+test('capability bind: a REPEAT add is a normal success — alreadyBound: true, no stderr, no provenance leak', async () => {
   // Capability routing is ADDITIVE and idempotent per (capability, crew) pair: re-adding the same
   // pair is a 200 no-op, not an error, and it never displaces another crew.
   const { fetch, calls } = routedFetch({
-    'POST /api/add_capability_route': addOk({ createdBy: 'u_original', createdAt: 999 }, { alreadyRouted: true, routedCrewCount: 2 }),
+    'POST /api/add_capability_route': addOk({ createdBy: 'u_original', createdAt: 999 }, { alreadyBound: true, boundCrewCount: 2 }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
@@ -170,8 +176,8 @@ test('capability bind: a REPEAT add is a normal success — alreadyRouted: true,
     hub: ORIGIN,
     capability: 'gpu',
     crew: 'ml-crew',
-    alreadyRouted: true,
-    routedCrewCount: 2,
+    alreadyBound: true,
+    boundCrewCount: 2,
   });
   assert.deepEqual(t.err, [], 'a repeat add is silent too');
 });
@@ -285,6 +291,65 @@ test('capability unbind: a tolerant removal that ALSO leaves zero live routes wa
   assert.equal(code, 0, t.err.join('\n'));
   assert.match(t.err.join('\n'), /was not bound/);
   assert.ok(!t.err.join('\n').includes('parked'), 'this call parked nothing — it removed nothing');
+});
+
+test('the two capability payloads are read under the HUB\'s own field names, byte-for-byte', async () => {
+  // REGRESSION GUARD, and the reason it is written from a captured response
+  // rather than from `addOk`/`listOk`: the fixtures and the client agreed with
+  // each other while BOTH disagreed with every deployed hub, so a green suite
+  // proved nothing. These two bodies are copied verbatim from
+  // `api.stg.owenloop.com` and from `hub-core/src/verbs/manage-capability-routes.ts`
+  // (`data: { binding, alreadyBound, boundCrewCount }` and `data: { bindings }`).
+  // If the hub ever renames a field, THIS test fails — not a live delivery run.
+  const { fetch } = routedFetch({
+    'GET /api/capability_routes': () => ({
+      status: 200,
+      json: {
+        text: 'Capability bindings: 1',
+        bindings: [
+          {
+            capability: 'wise',
+            crewId: '62f57657b7db594613ec69cf6565bf17',
+            crewName: 'wise',
+            createdBy: 'user_01KX6GG07VPYX2XA687HEAYT1C',
+            createdAt: 1786139457984,
+          },
+        ],
+      },
+    }),
+    'POST /api/add_capability_route': () => ({
+      status: 200,
+      json: {
+        text: "Capability 'wise' bound to crew 'wise' (now 1 crew).",
+        binding: {
+          capability: 'wise',
+          crewId: '62f57657b7db594613ec69cf6565bf17',
+          crewName: 'wise',
+          createdBy: 'user_01KX6GG07VPYX2XA687HEAYT1C',
+          createdAt: 1786139457984,
+        },
+        alreadyBound: false,
+        boundCrewCount: 1,
+      },
+    }),
+  });
+  const t = makeIo({ fetch });
+  seedHumanOauth(t);
+
+  assert.equal(await mainAsync(['capability', 'list', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  assert.equal((stdoutJson(t).routes as unknown[]).length, 1);
+
+  const t2 = makeIo({ fetch });
+  seedHumanOauth(t2);
+  assert.equal(await mainAsync(['capability', 'bind', 'wise', 'wise', '--hub', HUB], t2.io), 0, t2.err.join('\n'));
+  assert.deepEqual(stdoutJson(t2), {
+    ok: true,
+    hub: ORIGIN,
+    capability: 'wise',
+    crew: 'wise',
+    alreadyBound: false,
+    boundCrewCount: 1,
+  });
 });
 
 test('capability list: GETs capability_routes and prints the guard-narrowed rows', async () => {
@@ -534,14 +599,14 @@ test('capability unbind: a 400 on remove surfaces the hub message, exit 1', asyn
 
 test('capability bind: a 200 with no capability is exit 1, naming the missing field only', async () => {
   const { fetch } = routedFetch({
-    'POST /api/add_capability_route': () => ({ status: 200, json: { text: 'ok', alreadyRouted: false, routedCrewCount: 1 } }),
+    'POST /api/add_capability_route': () => ({ status: 200, json: { text: 'ok', alreadyBound: false, boundCrewCount: 1 } }),
   });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
   const code = await mainAsync(['capability', 'bind', 'gpu', 'ml-crew', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /add_capability_route: malformed success response — missing route/);
+  assert.match(t.err.join('\n'), /add_capability_route: malformed success response — missing binding/);
   assert.deepEqual(t.out, []);
 });
 
@@ -555,29 +620,29 @@ test('capability bind: a capability whose crewName is NULL is exit 1 — an add 
 
   const code = await mainAsync(['capability', 'bind', 'gpu', 'ml-crew', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /add_capability_route: malformed success response — route missing non-empty string crewName/);
+  assert.match(t.err.join('\n'), /add_capability_route: malformed success response — binding missing non-empty string crewName/);
   assert.deepEqual(t.out, []);
 });
 
-test('capability bind: a non-boolean alreadyRouted is exit 1, naming that field', async () => {
-  const { fetch } = routedFetch({ 'POST /api/add_capability_route': addOk({}, { alreadyRouted: 'yes' }) });
+test('capability bind: a non-boolean alreadyBound is exit 1, naming that field', async () => {
+  const { fetch } = routedFetch({ 'POST /api/add_capability_route': addOk({}, { alreadyBound: 'yes' }) });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
   const code = await mainAsync(['capability', 'bind', 'gpu', 'ml-crew', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /add_capability_route: malformed success response — missing boolean alreadyRouted/);
+  assert.match(t.err.join('\n'), /add_capability_route: malformed success response — missing boolean alreadyBound/);
   assert.doesNotMatch(t.err.join('\n'), /yes/, 'the offending VALUE is never echoed');
 });
 
-test('capability bind: a non-number routedCrewCount is exit 1, naming that field', async () => {
-  const { fetch } = routedFetch({ 'POST /api/add_capability_route': addOk({}, { routedCrewCount: '2' }) });
+test('capability bind: a non-number boundCrewCount is exit 1, naming that field', async () => {
+  const { fetch } = routedFetch({ 'POST /api/add_capability_route': addOk({}, { boundCrewCount: '2' }) });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
   const code = await mainAsync(['capability', 'bind', 'gpu', 'ml-crew', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /add_capability_route: malformed success response — missing number routedCrewCount/);
+  assert.match(t.err.join('\n'), /add_capability_route: malformed success response — missing number boundCrewCount/);
 });
 
 test('capability bind: a 200 that is NOT valid JSON is exit 1 with a FIXED message, never the parse error', async () => {
@@ -655,7 +720,7 @@ test('capability list: a malformed row is exit 1, naming the INDEX and field onl
 
   const code = await mainAsync(['capability', 'list', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /capability_routes: malformed response — routes\[2\] missing non-empty string capability/);
+  assert.match(t.err.join('\n'), /capability_routes: malformed response — bindings\[2\] missing non-empty string capability/);
   assert.deepEqual(t.out, []);
 });
 
@@ -667,17 +732,17 @@ test('capability list: a row whose crewName is a non-string, non-null value is e
 
   const code = await mainAsync(['capability', 'list', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /capability_routes: malformed response — routes\[0\] crewName must be a non-empty string or null/);
+  assert.match(t.err.join('\n'), /capability_routes: malformed response — bindings\[0\] crewName must be a non-empty string or null/);
 });
 
-test('capability list: a 200 with no routes array is exit 1', async () => {
+test('capability list: a 200 with no bindings array is exit 1', async () => {
   const { fetch } = routedFetch({ 'GET /api/capability_routes': () => ({ status: 200, json: { text: 'ok' } }) });
   const t = makeIo({ fetch });
   seedHumanOauth(t);
 
   const code = await mainAsync(['capability', 'list', '--hub', HUB], t.io);
   assert.equal(code, 1);
-  assert.match(t.err.join('\n'), /capability_routes: malformed response — expected a `routes` array/);
+  assert.match(t.err.join('\n'), /capability_routes: malformed response — expected a `bindings` array/);
 });
 
 // ---- usage errors: zero network --------------------------------------------
