@@ -16,32 +16,13 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
+import { PLUGIN_FILES } from '../scripts/check-npm-package.mjs';
 import { hostileFileEntry, hostileTarball } from './helpers.ts';
 
-const ROOT = join(import.meta.dirname, '..');
-const PACKAGE_CHECK = join(ROOT, 'scripts/check-npm-package.mjs');
-
-const EXPECTED_PLUGIN_FILES = [
-  'plugins/claude-code/.claude-plugin/marketplace.json',
-  'plugins/claude-code/plugin/.claude-plugin/plugin.json',
-  'plugins/claude-code/plugin/.mcp.json',
-  'plugins/claude-code/plugin/hooks/hooks.json',
-  'plugins/claude-code/plugin/hooks/session-end.sh',
-  'plugins/claude-code/plugin/hooks/session-start.sh',
-  'plugins/claude-code/plugin/skills/author/SKILL.md',
-  'plugins/claude-code/plugin/skills/conduct/SKILL.md',
-  'plugins/claude-code/plugin/skills/shift/SKILL.md',
-  'plugins/codex/.agents/plugins/marketplace.json',
-  'plugins/codex/plugins/owenloop/.codex-plugin/plugin.json',
-  'plugins/codex/plugins/owenloop/.mcp.json',
-  'plugins/codex/plugins/owenloop/hooks/hooks.json',
-  'plugins/codex/plugins/owenloop/hooks/session-end.sh',
-  'plugins/codex/plugins/owenloop/hooks/session-start.sh',
-  'plugins/codex/plugins/owenloop/skills/author/SKILL.md',
-  'plugins/codex/plugins/owenloop/skills/conduct/SKILL.md',
-  'plugins/codex/plugins/owenloop/skills/shift/SKILL.md',
-] as const;
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const PACKAGE_CHECK = fileURLToPath(new URL('../scripts/check-npm-package.mjs', import.meta.url));
 
 const PLUGIN_EXECUTABLES = new Set([
   'plugins/claude-code/plugin/hooks/session-end.sh',
@@ -97,12 +78,15 @@ function packTarball(): Buffer {
   }
 }
 
-function runPackageCheck(tarball: Buffer): { status: number | null; stdout: string; stderr: string } {
+function runPackageCheck(
+  tarball: Buffer,
+  packageCheck = PACKAGE_CHECK,
+): { status: number | null; stdout: string; stderr: string } {
   const directory = mkdtempSync(join(tmpdir(), 'owenloop-package-policy-'));
   const path = join(directory, 'package.tgz');
   writeFileSync(path, tarball);
   try {
-    const result = spawnSync(process.execPath, [PACKAGE_CHECK, path], {
+    const result = spawnSync(process.execPath, [packageCheck, path], {
       cwd: ROOT,
       encoding: 'utf8',
     });
@@ -116,10 +100,13 @@ function runPackageCheck(tarball: Buffer): { status: number | null; stdout: stri
   }
 }
 
-function validPluginTarball(extraBlocks: Buffer[] = []): Buffer {
-  const blocks = EXPECTED_PLUGIN_FILES.flatMap((path) =>
+function validPluginTarball(
+  extraBlocks: Buffer[] = [],
+  modeOverrides: ReadonlyMap<string, number> = new Map(),
+): Buffer {
+  const blocks = PLUGIN_FILES.flatMap((path) =>
     hostileFileEntry(`package/${path}`, '', {
-      mode: PLUGIN_EXECUTABLES.has(path) ? 0o755 : 0o644,
+      mode: modeOverrides.get(path) ?? (PLUGIN_EXECUTABLES.has(path) ? 0o755 : 0o644),
     }),
   );
   return hostileTarball([...blocks, ...extraBlocks]);
@@ -186,7 +173,7 @@ test('npm pack excludes local state, scaffolding, and repo-only files', () => {
 
 test('npm pack ships exactly the Claude Code and Codex consumer plugin files', () => {
   const packed = packedFiles().filter((file) => file.startsWith('plugins/')).sort();
-  assert.deepEqual(packed, [...EXPECTED_PLUGIN_FILES].sort());
+  assert.deepEqual(packed, [...PLUGIN_FILES].sort());
 });
 
 test('the shared npm package validator accepts the actual npm pack tarball', () => {
@@ -195,23 +182,50 @@ test('the shared npm package validator accepts the actual npm pack tarball', () 
   assert.match(result.stdout, /npm package content OK/);
 });
 
-test('the npm package validator rejects plugin source, credentials, traversal, links, modes, and extras', () => {
+test('the npm package validator executes safely from paths containing spaces, #, and %', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'owenloop package #100% - '));
+  const packageCheck = join(directory, 'check npm package #100%.mjs');
+  try {
+    writeFileSync(packageCheck, readFileSync(PACKAGE_CHECK));
+    const result = runPackageCheck(
+      hostileTarball([
+		...PLUGIN_FILES.flatMap((path) =>
+		  hostileFileEntry(`package/${path}`, '', {
+		    mode: PLUGIN_EXECUTABLES.has(path) ? 0o755 : 0o644,
+		  }),
+		),
+		...hostileFileEntry('package/plugins/codex/plugins/owenloop/evil.js', ''),
+      ]),
+      packageCheck,
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /unexpected package path: plugins\/codex\/plugins\/owenloop\/evil\.js/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('the npm package validator rejects plugin source, credentials, traversal, links, and extras', () => {
   const cases = [
     {
       name: 'source-only files',
       blocks: hostileFileEntry('package/plugins/_skills/author/SKILL.md', ''),
+      reason: 'unexpected package path: plugins/_skills/author/SKILL.md',
     },
     {
       name: 'hidden credentials',
       blocks: hostileFileEntry('package/plugins/claude-code/plugin/.env', ''),
+      reason: 'unexpected package path: plugins/claude-code/plugin/.env',
     },
     {
       name: 'local config',
       blocks: hostileFileEntry('package/plugins/codex/plugins/owenloop/.npmrc', ''),
+      reason: 'unexpected package path: plugins/codex/plugins/owenloop/.npmrc',
     },
     {
       name: 'path traversal',
       blocks: hostileFileEntry('package/plugins/claude-code/plugin/../credentials.json', ''),
+      reason: 'unsafe package path: package/plugins/claude-code/plugin/../credentials.json',
     },
     {
       name: 'symlinks',
@@ -219,21 +233,32 @@ test('the npm package validator rejects plugin source, credentials, traversal, l
         linkname: '../../.env',
         typeflag: '2',
       }),
-    },
-    {
-      name: 'unexpected executables',
-      blocks: hostileFileEntry('package/plugins/claude-code/plugin/skills/author/SKILL.md', '', {
-        mode: 0o755,
-      }),
+      reason: 'tar entry is not a regular file: plugins/claude-code/plugin/evil.js (type 2)',
     },
     {
       name: 'arbitrary plugin files',
       blocks: hostileFileEntry('package/plugins/codex/plugins/owenloop/evil.js', ''),
+      reason: 'unexpected package path: plugins/codex/plugins/owenloop/evil.js',
     },
   ] as const;
 
   for (const testCase of cases) {
     const result = runPackageCheck(validPluginTarball(testCase.blocks));
     assert.notEqual(result.status, 0, `${testCase.name} should fail closed`);
+    assert.match(result.stderr, new RegExp(testCase.reason.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   }
+});
+
+test('the npm package validator rejects an unexpected executable mode independently', () => {
+  const result = runPackageCheck(
+    validPluginTarball([], new Map([
+      ['plugins/claude-code/plugin/skills/author/SKILL.md', 0o755],
+    ])),
+  );
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /unexpected mode for plugins\/claude-code\/plugin\/skills\/author\/SKILL\.md: expected 644, got 755/,
+  );
+  assert.doesNotMatch(result.stderr, /duplicate tar path/);
 });

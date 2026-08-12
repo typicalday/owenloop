@@ -1,5 +1,6 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
+import { pathToFileURL } from 'node:url';
 
 /**
  * The two marketplace roots are the consumer-facing plugin package. The
@@ -27,7 +28,6 @@ export const PLUGIN_FILES = Object.freeze([
   'plugins/codex/plugins/owenloop/skills/shift/SKILL.md',
 ]);
 
-const PLUGIN_FILE_SET = new Set(PLUGIN_FILES);
 const PLUGIN_EXECUTABLES = new Set([
   'plugins/claude-code/plugin/hooks/session-end.sh',
   'plugins/claude-code/plugin/hooks/session-start.sh',
@@ -246,4 +246,4 @@ function main() {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) main();
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) main();
