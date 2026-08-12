@@ -1232,27 +1232,37 @@ export interface CapabilityRouteWire {
 /**
  * `POST /api/add_capability_route`'s 200 body, narrowed.
  *
- * NESTED exactly as the wire nests it: the row lives under `route`, while
- * `alreadyRouted` and `routedCrewCount` live at the BODY's top level. A flat
+ * THE FIELD NAMES ARE THE HUB'S, NOT THIS CLI'S. The hub verb
+ * (`hub-core/src/verbs/manage-capability-routes.ts`) returns `binding`,
+ * `alreadyBound` and `boundCrewCount`; it does NOT return `route`,
+ * `alreadyRouted` or `routedCrewCount`, which is what this narrower demanded
+ * until now — so `capability bind` failed against every live hub with
+ * `malformed success response — missing route`. Both repos migrated their
+ * routing vocabulary on the same day and disagreed on the payload names. The
+ * hub is the server of record, so the client mirrors it verbatim: an operator
+ * correlating stdout against the hub's audit log never has to translate.
+ *
+ * NESTED exactly as the wire nests it: the row lives under `binding`, while
+ * `alreadyBound` and `boundCrewCount` live at the BODY's top level. A flat
  * interface would blur where each field actually sits.
  *
- * - `alreadyRouted` — was this exact `(capability, crew)` pair already present? The add
+ * - `alreadyBound` — was this exact `(capability, crew)` pair already present? The add
  *   is ADDITIVE and idempotent per pair, so a repeat is a 200 no-op, not an
- *   error, and `route.createdBy`/`createdAt` then echo the ORIGINAL row.
- * - `routedCrewCount` — how many **LIVE** crews the capability binds AFTER the write. A
+ *   error, and `binding.createdBy`/`createdAt` then echo the ORIGINAL row.
+ * - `boundCrewCount` — how many **LIVE** crews the capability binds AFTER the write. A
  *   route whose crew row was deleted routes nothing and is not counted.
  */
 export interface CapabilityRouteAddedWire {
-  route: CapabilityRouteWire;
-  alreadyRouted: boolean;
-  routedCrewCount: number;
+  binding: CapabilityRouteWire;
+  alreadyBound: boolean;
+  boundCrewCount: number;
 }
 
 /**
  * Validate the five common `CapabilityRouteWire` fields on one row. `prefix` is the
  * endpoint-qualified lead-in the caller wants (e.g.
  * `add_capability_route: malformed success response`) and `where` names the
- * offending position (`route`, or `routes[2]`) — a FIELD/INDEX name only,
+ * offending position (`binding`, or `bindings[2]`) — a FIELD/INDEX name only,
  * never a value.
  *
  * `crewName` is validated LENIENTLY here, unlike the other four fields: absent or
@@ -1293,11 +1303,11 @@ function asCapabilityRouteRow(entry: unknown, prefix: string, where: string): Ca
 
 /**
  * Narrow `POST /api/add_capability_route`'s 200 body
- * (`{ text, route, alreadyRouted, routedCrewCount }`). Throws on anything
+ * (`{ text, binding, alreadyBound, boundCrewCount }`). Throws on anything
  * malformed, naming the offending FIELD only — same discipline as
  * `asAgentIdentities`, so no body value is echoed.
  *
- * `route.crewName` is required to be a NON-NULL non-empty string here, on top
+ * `binding.crewName` is required to be a NON-NULL non-empty string here, on top
  * of `asCapabilityRouteRow`'s lenient check. That is not a contradiction: an add
  * resolves its crew BY NAME, so the crew is live by construction and a `null`
  * name in THIS response is genuinely malformed — whereas a `null` name in a
@@ -1311,20 +1321,20 @@ export function asCapabilityRouteAdded(body: unknown): CapabilityRouteAddedWire 
     throw new Error(`${prefix} — not an object`);
   }
   const b = body as Record<string, unknown>;
-  if (b.route === undefined) {
-    throw new Error(`${prefix} — missing route`);
+  if (b.binding === undefined) {
+    throw new Error(`${prefix} — missing binding`);
   }
-  const route = asCapabilityRouteRow(b.route, prefix, 'route');
-  if (route.crewName === null) {
-    throw new Error(`${prefix} — route missing non-empty string crewName`);
+  const binding = asCapabilityRouteRow(b.binding, prefix, 'binding');
+  if (binding.crewName === null) {
+    throw new Error(`${prefix} — binding missing non-empty string crewName`);
   }
-  if (typeof b.alreadyRouted !== 'boolean') {
-    throw new Error(`${prefix} — missing boolean alreadyRouted`);
+  if (typeof b.alreadyBound !== 'boolean') {
+    throw new Error(`${prefix} — missing boolean alreadyBound`);
   }
-  if (typeof b.routedCrewCount !== 'number') {
-    throw new Error(`${prefix} — missing number routedCrewCount`);
+  if (typeof b.boundCrewCount !== 'number') {
+    throw new Error(`${prefix} — missing number boundCrewCount`);
   }
-  return { route, alreadyRouted: b.alreadyRouted, routedCrewCount: b.routedCrewCount };
+  return { binding, alreadyBound: b.alreadyBound, boundCrewCount: b.boundCrewCount };
 }
 
 /**
@@ -1392,9 +1402,15 @@ export function asCapabilityRouteRemoved(
 }
 
 /**
- * Narrow `GET /api/capability_routes`'s 200 body (`{ text, routes: [...] }`) to a
+ * Narrow `GET /api/capability_routes`'s 200 body (`{ text, bindings: [...] }`) to a
  * typed array. An EMPTY array is valid — that is the "this org has no routes
  * yet" case, not an error.
+ *
+ * THE ARRAY KEY IS `bindings`, WHICH IS THE HUB'S NAME — the endpoint PATH is
+ * `capability_routes` but its payload key is not. This narrower demanded
+ * `routes` until now, so `capability list` failed against every live hub with
+ * `malformed response — expected a \`routes\` array` even on a perfectly good
+ * 200. See `CapabilityRouteAddedWire` for why the client mirrors the hub.
  *
  * Rows are plain `CapabilityRouteWire`, ONE per `(capability, crew)` pair ordered by
  * `capability, crew_id`, so a capability bound to many crews yields MANY rows — the array
@@ -1402,11 +1418,13 @@ export function asCapabilityRouteRemoved(
  * whose `crewName` is `null` is a dangling route and is kept, not dropped.
  */
 export function asCapabilityRoutes(body: unknown): CapabilityRouteWire[] {
-  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).routes)) {
-    throw new Error('capability_routes: malformed response — expected a `routes` array');
+  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).bindings)) {
+    throw new Error('capability_routes: malformed response — expected a `bindings` array');
   }
-  const list = (body as Record<string, unknown>).routes as unknown[];
-  return list.map((entry, i) => asCapabilityRouteRow(entry, 'capability_routes: malformed response', `routes[${i}]`));
+  const list = (body as Record<string, unknown>).bindings as unknown[];
+  return list.map((entry, i) =>
+    asCapabilityRouteRow(entry, 'capability_routes: malformed response', `bindings[${i}]`),
+  );
 }
 
 /**
