@@ -14,6 +14,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { validateTierProfiles, type TierProfiles } from '../agent/model-policy.ts';
 
 /**
  * The settings surface — every knob optional, a missing file loading as `{}`.
@@ -95,6 +96,14 @@ export interface Settings {
   workRepo?: string;
   /** Quality-tier to concrete model mapping; merged over the built-in map. */
   tierMap?: Record<string, string>;
+  /**
+   * Quality-tier to `{ model, efforts, defaultEffort }`. When present this
+   * REPLACES `tierMap` for every tier-named step model — it is not merged with
+   * the built-in map and not merged with `tierMap`, so it must define all four
+   * tiers or the load fails. That is the whole point: `tierMap` merges, which
+   * means a file naming three tiers silently inherits a default for the fourth.
+   */
+  tierProfiles?: Record<string, { model: string; efforts: string[]; defaultEffort: string }>;
   /** Reject count at which the default retry policy escalates. */
   escalateAt?: number;
   /** Extension namespace containing an authored escalation object. */
@@ -114,6 +123,7 @@ export const KNOWN_SETTINGS_KEYS = [
   'workRoot',
   'workRepo',
   'tierMap',
+  'tierProfiles',
   'escalateAt',
   'escalationExtensionKey',
 ] as const;
@@ -192,6 +202,26 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
     }
     for (const value of Object.values(v as Record<string, unknown>)) {
       if (typeof value !== 'string' || value.trim() === '') throw bad('tierMap', 'an object whose values are non-empty strings', v);
+    }
+  }
+  if ('tierProfiles' in obj) {
+    const v = obj['tierProfiles'];
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+      throw bad('tierProfiles', 'an object of { model, efforts, defaultEffort } per tier', v);
+    }
+    for (const [tier, profile] of Object.entries(v as Record<string, unknown>)) {
+      if (typeof profile !== 'object' || profile === null || Array.isArray(profile)) {
+        throw bad(`tierProfiles.${tier}`, 'an object with model, efforts and defaultEffort', profile);
+      }
+    }
+    // Shape is right; now the SEMANTIC rules — completeness, known effort
+    // rungs, defaultEffort actually offered. Deliberately at load time: a crew
+    // whose profiles are wrong should fail when the shift starts, not on the
+    // first order that happens to land on the broken tier, hours later.
+    try {
+      validateTierProfiles(v as TierProfiles);
+    } catch (e) {
+      throw new Error(`invalid settings: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
   if ('escalateAt' in obj) {
