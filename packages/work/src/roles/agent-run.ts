@@ -298,6 +298,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
 
   const modelPolicy: ModelPolicy = createModelPolicy({
     ...(settings.tierMap !== undefined ? { tierMap: settings.tierMap } : {}),
+    ...(settings.tierProfiles !== undefined ? { tierProfiles: settings.tierProfiles } : {}),
     ...(settings.escalateAt !== undefined ? { escalateAt: settings.escalateAt } : {}),
     ...(settings.escalationExtensionKey !== undefined
       ? { escalationExtensionKey: settings.escalationExtensionKey }

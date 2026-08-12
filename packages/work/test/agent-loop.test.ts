@@ -369,7 +369,14 @@ test('the authored tier is resolved through the lane carried on the consumed pla
   // A real express lane, shaped exactly as the engine copies a green `plan`
   // artifact's value into `consumes['plan']`.
   assert.equal((await startArgsFor({ model: 'strong', consumes: { plan: { lane: 'express' } } })).model, 'sonnet');
-  assert.equal((await startArgsFor({ model: 'fast', consumes: { plan: { lane: 'deep' } } })).model, 'opus');
+
+  // SCAFFOLDING: the deep floor is the TOP tier (`strongest` → fable), not
+  // `strong`. Under a `strong` floor the top tier was unreachable by lane —
+  // only a def authoring `strongest` outright could enter it — which made
+  // "deep" mean "second best" and gave the crew no way to say otherwise.
+  // Phase 2 deletes the lane clamp in favour of per-step model arms; until
+  // then, deep means the crew's best tier.
+  assert.equal((await startArgsFor({ model: 'fast', consumes: { plan: { lane: 'deep' } } })).model, 'fable');
 
   // The top tier is pinned against the express cap even when the lane is real.
   assert.equal((await startArgsFor({ model: 'strongest', consumes: { plan: { lane: 'express' } } })).model, 'fable');
