@@ -75,16 +75,13 @@ jobs:
           TARBALL="$(npm pack | tail -n1)"
           echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
 
-      # Gate 3: inspect the tarball contents; fail on any path outside the
-      # allowlist. Every entry in the tgz is prefixed `package/`.
+      # Gate 3: inspect the exact tarball with the repository validator. The
+      # validator keeps the generated dist/docs/workflow trees bounded, uses an
+      # explicit file list for both consumer plugin roots, and rejects links,
+      # traversal, credentials/local state, source files, duplicate paths, and
+      # unexpected modes.
       - name: Gate - inspect tarball contents
-        run: |
-          BAD="$(tar -tzf "$TARBALL" | grep -Ev '^package/(package\.json|README\.md|LICENSE|CHANGELOG\.md|bin/|dist/|docs/|examples/workflows/)' || true)"
-          if [ -n "$BAD" ]; then
-            echo "::error::Unexpected files in tarball:"
-            echo "$BAD"
-            exit 1
-          fi
+        run: node scripts/check-npm-package.mjs "$TARBALL"
 
       # Gate 4: smoke-test that exact tarball -- install into a temp project and
       # run the CLI binary (exercises the compiled dist + node:sqlite path).
