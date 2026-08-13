@@ -2055,15 +2055,25 @@ test('the shift hands the reaper the session store at sessionsPath(cacheDir)', a
   assert.equal(captured.workRoot, workRoot);
 });
 
-// ---- the per-step dispatch brake --------------------------------------------
+// ---- the per-step failure brake ---------------------------------------------
 //
 // Regression cover for the storm observed 2026-08-12: a step that refuses its
 // order and exits WITHOUT submitting is re-offered by the hub under a FRESH run
 // id every time, so every run-keyed guard in this file (liveRuns, workerRuns,
-// claimed, pendingCandidates) misses and the shift respawns without bound. The
-// brake keys on (workflow, step, key) instead — the identity that repeats.
+// claimed, pendingCandidates) misses and the shift respawns without bound.
+//
+// The brake keys on (workflow, step, key) — the identity that repeats — and
+// counts WORKER FAILURES, not dispatches. The distinction is the whole design:
+// one sweep can legitimately offer several distinct runs of one step, and
+// counting dispatches would meter that healthy concurrency. See the
+// 'concurrent runs of one step are never braked' case below, which fails
+// against a dispatch-counting brake.
 
-/** Drive N sweeps of the same step, each under a brand-new run id. */
+/**
+ * Drive repeated sweeps of one step, each under a brand-new run id, with a
+ * controllable clock. `fail(run)` reports that run's child exited non-zero,
+ * exactly as the shift runtime's `reportWorkerFailure` does in production.
+ */
 function stormLoop(runs: string[], monotonic: () => number, step = 'cmd'): {
   loop: ShiftLoop;
   spawns: SpawnSpec[];
@@ -2091,24 +2101,26 @@ function stormLoop(runs: string[], monotonic: () => number, step = 'cmd'): {
   return { loop, spawns, errs, next };
 }
 
-test('a step re-offered under fresh run ids is braked instead of respawned forever', async () => {
+test('a step whose worker keeps failing is braked instead of respawned forever', async () => {
   let monotonic = 0;
-  const runs = ['run_storm01', 'run_storm02', 'run_storm03', 'run_storm04'];
+  const runs = ['run_storm01', 'run_storm02', 'run_storm03'];
   const { loop, spawns, errs, next } = stormLoop(runs, () => monotonic);
 
-  // Dispatch 1 and 2 are immediate (the table opens 0ms, 2000ms): a step that
-  // is genuinely progressing must never pay a penalty on its first attempt.
+  // The first dispatch is free — nothing has failed yet.
   await loop.iterate();
-  next();
-  await loop.iterate();
-  assert.deepEqual(spawns.map((s) => s.run), ['run_storm01', 'run_storm02']);
+  assert.deepEqual(spawns.map((s) => s.run), ['run_storm01']);
 
-  // Dispatch 2 armed a 2s window, so the third offer is refused outright.
+  // Its child exits non-zero. That first failure arms the 2s window.
+  loop.noteWorkerFailure({ run: 'run_storm01' });
   next();
   await loop.iterate();
-  assert.deepEqual(spawns.map((s) => s.run), ['run_storm01', 'run_storm02']);
+  assert.deepEqual(
+    spawns.map((s) => s.run),
+    ['run_storm01'],
+    'a fresh run id of a just-failed step must not respawn immediately',
+  );
   assert.ok(
-    errs.some((line) => line.includes("step 'cmd' has been dispatched") && line.includes('braking')),
+    errs.some((line) => line.includes("step 'cmd' has failed") && line.includes('braking')),
     `a braked dispatch must say so; got ${JSON.stringify(errs)}`,
   );
 
@@ -2116,24 +2128,89 @@ test('a step re-offered under fresh run ids is braked instead of respawned forev
   monotonic = 2_000;
   next();
   await loop.iterate();
-  assert.deepEqual(spawns.map((s) => s.run), ['run_storm01', 'run_storm02', 'run_storm04']);
+  assert.deepEqual(spawns.map((s) => s.run), ['run_storm01', 'run_storm03']);
+});
+
+test('consecutive failures lengthen the window; the delay is not flat', async () => {
+  let monotonic = 0;
+  const runs = ['run_b1', 'run_b2', 'run_b3', 'run_b4'];
+  const { loop, spawns, next } = stormLoop(runs, () => monotonic);
+
+  await loop.iterate();                              // run_b1 spawns
+  loop.noteWorkerFailure({ run: 'run_b1' });         // failure 1 → 2s window
+
+  monotonic = 2_000;
+  next();
+  await loop.iterate();                              // run_b2 spawns
+  loop.noteWorkerFailure({ run: 'run_b2' });         // failure 2 → 8s window
+
+  // 2s past the second failure would have been enough after the FIRST one.
+  monotonic = 4_000;
+  next();
+  await loop.iterate();
+  assert.deepEqual(
+    spawns.map((s) => s.run),
+    ['run_b1', 'run_b2'],
+    'the second failure must arm a longer window than the first',
+  );
+
+  monotonic = 10_000; // 8s past failure 2
+  next();
+  await loop.iterate();
+  assert.deepEqual(spawns.map((s) => s.run), ['run_b1', 'run_b2', 'run_b4']);
+});
+
+test('concurrent runs of one step are never braked — only failures count', async () => {
+  // The case a dispatch-counting brake gets wrong. Five distinct runs of ONE
+  // step, same empty key, offered in a SINGLE sweep, none of which has failed:
+  // this is legitimate concurrency and every one must spawn up to the cap.
+  cacheCommandBundle();
+  const orders = ['run_1', 'run_2', 'run_3', 'run_4', 'run_5'].map((r) => wo(r, 'cmd'));
+  const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: cmdWf(orders) });
+  const { spawner, spawns } = fakeSpawner();
+  await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    workflow: 'wf1',
+    cap: 5,
+    monotonicNow: () => 0,
+  })).run();
+  assert.equal(spawns.length, 5, 'no failure has been reported, so nothing may be braked');
 });
 
 test('a braked candidate is not queued for local dispatch', async () => {
-  let monotonic = 0;
-  const runs = ['run_q01', 'run_q02', 'run_q03'];
+  const monotonic = 0;
+  const runs = ['run_q01', 'run_q02'];
   const { loop, spawns, next } = stormLoop(runs, () => monotonic);
 
   await loop.iterate();
-  next();
-  await loop.iterate();
+  loop.noteWorkerFailure({ run: 'run_q01' });
   next();
   await loop.iterate(); // braked
 
   // A braked candidate that had been queued would be re-dispatched by the very
   // next drain, with no window elapsed — which would defeat the brake entirely.
   await loop.iterate();
-  assert.deepEqual(spawns.map((s) => s.run), ['run_q01', 'run_q02']);
+  assert.deepEqual(spawns.map((s) => s.run), ['run_q01']);
+});
+
+test('a run that ends clears its step’s failure streak', async () => {
+  let monotonic = 0;
+  const runs = ['run_e1', 'run_e2', 'run_e3'];
+  const { loop, spawns, next } = stormLoop(runs, () => monotonic);
+
+  await loop.iterate();
+  loop.noteWorkerFailure({ run: 'run_e1' }); // 2s window armed
+
+  monotonic = 2_000;
+  next();
+  await loop.iterate();                       // run_e2 spawns
+  loop.noteRunEnded('run_e2');                // it PROGRESSED — streak cleared
+
+  // With the streak cleared, a later failure starts again at the SHORTEST
+  // delay rather than inheriting the earlier count.
+  next();
+  await loop.iterate();
+  assert.deepEqual(spawns.map((s) => s.run), ['run_e1', 'run_e2', 'run_e3']);
 });
 
 test('fanned-out keys of one step do not brake each other', async () => {
@@ -2150,8 +2227,13 @@ test('fanned-out keys of one step do not brake each other', async () => {
   }));
 
   await loop.iterate();
+  // 'alpha' fails; 'beta' and 'gamma' are unrelated orders of the same step.
+  loop.noteWorkerFailure({ run: 'run_k1' });
+  await loop.iterate();
 
-  // Three legitimately concurrent orders of one fanned step. Keying the brake
-  // on the step alone would have braked two of them on their FIRST dispatch.
-  assert.deepEqual(spawns.map((s) => s.run), ['run_k1', 'run_k2', 'run_k3']);
+  // Keying the brake on the step alone would have braked beta and gamma too.
+  assert.deepEqual(
+    spawns.map((s) => s.run).slice(0, 3).sort(),
+    ['run_k1', 'run_k2', 'run_k3'],
+  );
 });
