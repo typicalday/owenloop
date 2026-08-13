@@ -502,7 +502,11 @@ test('a failed worker writes a stamped failed record, though nothing in the loop
       ],
       env(),
     );
-    await shift.ready;
+    // A `const` alias so the stderr predicate below can close over the daemon:
+    // `shift` is a module-level `let` that `afterEach` also writes, so TypeScript
+    // will not carry its narrowing into an arrow function.
+    const daemon = shift;
+    await daemon.ready;
     const parked = (await readShiftLogRecords(shiftLogFile(logDir), 'parked', 'shift.log'))[0]!;
 
     hub.dispatchEnabled = true;
@@ -545,18 +549,49 @@ test('a failed worker writes a stamped failed record, though nothing in the loop
     assert.equal(parked.shiftId, dispatched.shiftId, 'and the startup record agrees with both');
     assert.match(String(failure.shiftId), /^shf_/u);
 
-    // The operator watching the foreground shift sees it too, as one line.
-    const reports = shift.stderr().split('\n').filter((line) => line.includes('worker failure'));
-    assert.equal(reports.length, 1, `expected one worker-failure report, got:\n${shift.stderr()}`);
-    assert.ok(reports[0]!.includes('"type":"failed"'), reports[0]);
+    // ── THE OPERATOR'S VIEW, which lands STRICTLY AFTER the record ──
+    //
+    // `reportWorkerFailure` (runtime.ts) appends the `failed` record to
+    // `shift.log` FIRST and writes the human line to its own stderr SECOND, and
+    // that line then has to cross a pipe into this process. So the log record
+    // waited on above is not evidence that the stderr line has arrived, and
+    // reading `daemon.stderr()` here with no wait failed ~7% of runs (4 of 55)
+    // with an empty capture and the message below. Poll for it, exactly the way
+    // this test already polls the log file.
+    const workerFailureReports = (): string[] =>
+      daemon.stderr().split('\n').filter((line) => line.includes('worker failure'));
+    await until(
+      () => workerFailureReports().length > 0,
+      "the shift to report the worker failure on its own stderr",
+      20_000,
+    );
+    // ONE report, not "at least one": `spawn.ts` latches `failureReported` so an
+    // `error` event arriving after `exit` cannot produce a second line. Polling
+    // moved the wait off the count; it did not weaken the count.
+    assert.equal(
+      workerFailureReports().length, 1,
+      `expected one worker-failure report, got:\n${daemon.stderr()}`,
+    );
+    assert.ok(workerFailureReports()[0]!.includes('"type":"failed"'), workerFailureReports()[0]);
 
     // And the daemon is still alive and serving after reporting it.
-    const status = (await shift.request({ op: 'status' })) as { cap?: number };
+    const status = (await daemon.request({ op: 'status' })) as { cap?: number };
     assert.equal(status.cap, 1, JSON.stringify(status));
 
     const ending = runCli(['shift', 'end', '--state-dir', stateDir]);
     assert.equal((await ending.result).code, 0);
-    assert.equal(await shift.exited, 0, shift.stderr());
+    assert.equal(await daemon.exited, 0, daemon.stderr());
+
+    // THE LATCH, re-checked after the writer is gone. The count above was taken
+    // while the shift was still running, so it could only ever have caught a
+    // duplicate that had already arrived. The process has now exited, so no
+    // further report can be PRODUCED — and an unread byte still sitting in the
+    // pipe could only ADD to this count, never remove one. So this recheck can
+    // catch a late duplicate the first one missed, and can never mask one.
+    assert.equal(
+      workerFailureReports().length, 1,
+      `the failure must be reported once for the whole shift, got:\n${daemon.stderr()}`,
+    );
   } finally {
     server.close();
   }
@@ -698,10 +733,19 @@ test('an unwritable --log-dir loses the logs and still COMPLETES the order', asy
     assert.equal(status.cap, 1, JSON.stringify(status));
 
     // Reported ONCE at startup, naming the directory, and saying what it means.
-    const startupReports = shift.stderr().split('\n').filter((line) => line.includes('cannot create shift log directory'));
-    assert.equal(startupReports.length, 1, `expected exactly one report, got:\n${shift.stderr()}`);
-    assert.ok(startupReports[0]!.includes(blockedLogDir), startupReports[0]);
-    assert.ok(startupReports[0]!.includes('continuing with logging disabled'), startupReports[0]);
+    //
+    // WAITED FOR, not sampled. The write happens before the socket binds, so
+    // `await shift.ready` almost always implies it — but "almost always" is how
+    // the worker-failure assertion in this file became a ~7% flake: a stderr
+    // chunk still has to cross a pipe into this process, and no await here
+    // orders that crossing. Polling first costs nothing and cannot mask a
+    // duplicate, because the count is still asserted as exactly one.
+    const startupReports = (): string[] =>
+      shift!.stderr().split('\n').filter((line) => line.includes('cannot create shift log directory'));
+    await until(() => startupReports().length > 0, 'the startup log-directory failure report', 20_000);
+    assert.equal(startupReports().length, 1, `expected exactly one report, got:\n${shift.stderr()}`);
+    assert.ok(startupReports()[0]!.includes(blockedLogDir), startupReports()[0]);
+    assert.ok(startupReports()[0]!.includes('continuing with logging disabled'), startupReports()[0]);
 
     // ── THE ORDER RUNS TO COMPLETION ANYWAY ──
     hub.dispatchEnabled = true;

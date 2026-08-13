@@ -738,6 +738,72 @@ test('hub-error is file-only, so a hub outage cannot flood the bounded socket FI
   assert.equal(reachesSocketConsumer('order-dropped'), true);
 });
 
+test('the published docs agree with FILE_ONLY_EVENTS about what a socket client can receive', () => {
+  // ROUND-4 REGRESSION, and the reason a docs assertion earns its place in a
+  // unit test file. When `hub-error` moved to the file-only side,
+  // `docs/shift-logs.md` was updated and `docs/cli.md` was not, so the two
+  // documents in one diff contradicted each other for a full round. `cli.md` is
+  // the socket client's contract: a client built against its bullet list polls
+  // forever for a record class that structurally cannot arrive. Nothing could
+  // catch that, because both documents were only ever read by people.
+  //
+  // Scope, deliberately narrow: the MACHINE-CHECKABLE claims only — the bullet
+  // list of deliverable types and the count word on the file-only sentence.
+  // Both drifted this round. Everything else in those documents stays prose.
+  const docUrl = (name: string): URL => new URL(`../../../docs/${name}`, import.meta.url);
+  const cli = readFileSync(docUrl('cli.md'), 'utf8');
+  const logs = readFileSync(docUrl('shift-logs.md'), 'utf8');
+  const fileOnly = ALL_EVENT_TYPES.filter((type) => !reachesSocketConsumer(type));
+
+  // Each bullet reads ``- `dispatched`: `{ "type": "dispatched", …``. The
+  // back-reference is load-bearing: it also pins the label to the JSON `type`
+  // beside it, so a bullet relabelled without its example is not a match.
+  const documented = [...cli.matchAll(/^- `([a-z-]+)`: `\{ "type": "\1"/gmu)].map((match) => match[1]!);
+  // WITHOUT THIS the whole test is vacuous: a reworded doc would match nothing
+  // and every `for` below would pass over an empty list.
+  assert.ok(documented.length >= 5, `docs/cli.md event bullets did not parse, got: ${JSON.stringify(documented)}`);
+
+  for (const type of documented) {
+    assert.equal(
+      reachesSocketConsumer(type as ShiftEventBody['type']), true,
+      `docs/cli.md lists '${type}' as deliverable to 'shift next', but FILE_ONLY_EVENTS keeps it off the socket`,
+    );
+  }
+  for (const type of fileOnly) {
+    assert.equal(
+      documented.includes(type), false,
+      `'${type}' is file-only in runtime.ts but docs/cli.md lists it as a 'shift next' record`,
+    );
+  }
+
+  // The other direction: a NEW socket-bound variant must be documented for the
+  // client that will receive it. `gate` is excluded by name because nothing in
+  // `packages/work/src` constructs one — both documents describe it as reserved,
+  // in prose, rather than as a record a client can expect today.
+  for (const type of ALL_EVENT_TYPES) {
+    if (type === 'gate' || fileOnly.includes(type)) continue;
+    assert.ok(documented.includes(type), `'${type}' reaches the socket but docs/cli.md documents no bullet for it`);
+  }
+
+  // The count word, which is the exact token that said "Three" while the code
+  // held four. Asserted in both documents because both state it independently.
+  const words = ['zero', 'one', 'two', 'three', 'four', 'five', 'six'];
+  const expected = words[fileOnly.length]!;
+  const cliCount = /\*\*(\w+) further record types exist in\s+`shift\.log` and are never delivered over the socket\*\*/u.exec(cli);
+  assert.ok(cliCount !== null, 'docs/cli.md no longer states how many record types are file-only');
+  assert.equal(cliCount[1]!.toLowerCase(), expected, `docs/cli.md says '${cliCount[1]!}' file-only types; runtime.ts has ${fileOnly.length}`);
+  const logsCount = /\*\*(\w+) of these are file-only\.\*\*/u.exec(logs);
+  assert.ok(logsCount !== null, 'docs/shift-logs.md no longer states how many record types are file-only');
+  assert.equal(logsCount[1]!.toLowerCase(), expected, `docs/shift-logs.md says '${logsCount[1]!}' file-only types; runtime.ts has ${fileOnly.length}`);
+
+  // And each file-only type is NAMED in both, so the count and the list cannot
+  // drift apart from each other either.
+  for (const type of fileOnly) {
+    assert.ok(cli.includes(`\`${type}\``), `docs/cli.md never names the file-only type '${type}'`);
+    assert.ok(logs.includes(`\`${type}\``), `docs/shift-logs.md never names the file-only type '${type}'`);
+  }
+});
+
 // ── the spawn plan's log destination ───────────────────────────────────────
 
 test('buildSpawnPlan stays pure and carries the log PATH, never a descriptor', () => {

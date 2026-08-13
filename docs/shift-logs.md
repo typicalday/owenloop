@@ -125,6 +125,13 @@ optional `ended` record described below.
 | `shift` | string | the shift's human name |
 | `shiftId` | string | `shf_<uuid>` — the shift **process incarnation** |
 
+On the wire and on disk those four fields sit flat alongside the record's own
+fields, which is all a JSON consumer needs. A consumer that MIRRORS the source
+types should know the split is drawn one field further in: `ShiftEventEnvelope`
+in `packages/work/src/shift/protocol.ts` is `ts`/`shift`/`shiftId` only, and
+`type` is the discriminator on each event body, not part of the envelope type.
+Same bytes, different type decomposition.
+
 Two properties an uploader can rely on:
 
 - **`shiftId` is stable for the life of one process and unique across
@@ -144,7 +151,7 @@ Two properties an uploader can rely on:
 | `parked` | `origin`, `cap`, `serveCrews[]`, `hostname`, `cwd` | the shift started serving; see below |
 | `dispatched` | `workflow`, `run`, `step`, `kind`, `pid` | a worker was spawned |
 | `reaped` | `workflow`, `run`, `kind`, `pid` | a worker exited and was collected |
-| `failed` | `workflow`, `run`, `step`, `kind`, `message`, optional `harness`, `executable`, `exitStatus`, `signal` | a worker died or could not be spawned |
+| `failed` | `workflow`, `run`, `step`, `kind`, `message`, and — from the exit path only — `executable`, `exitStatus`, `signal`, optional `harness` | a worker died or could not be spawned; **two producers, two shapes** — see below |
 | `capacity` | `inFlight`, `cap` | no free slot, so the `whats_next` sweep was deferred — explains a shift running nothing new while work is outstanding. **Edge-triggered**, and emitted only on a *changed* wake — see below |
 | `hub-error` | `op` (`wake`\|`whats_next`), `message`, optional `workflow` | a hub call failed. `workflow` present = the targeted `whats_next` for that one workflow; `workflow` absent with `op: 'whats_next'` = the untargeted inbox call, which aborts the whole sweep. **File-only** — see below |
 | `bundle-miss` | `workflow`, `def` | a legacy order named a def with no cached bundle |
@@ -234,6 +241,42 @@ and `shiftId` alone; `parked` is what those names mean:
 
 `--once` suppresses it, matching the console `parked as …` line: a one-shot
 drain is not a parked shift.
+
+**`serveCrews: []` means EVERY crew, not none.** `owenloop shift start --all`
+maps to the empty array, so an empty list is the widest possible scope rather
+than the narrowest (`packages/work/src/shift/loop.ts`, `setShift`/`getShift`). A
+non-empty list is the crews named on the command line. Anything joining on this
+field must special-case the empty array or it will report the busiest shifts on
+a host as serving nothing.
+
+The value is the one in force AT STARTUP. `clock_in` can change a running
+shift's crew set, and `parked` is written once, so a long-lived shift's current
+scope is not recoverable from this record alone.
+
+### The two `failed` shapes
+
+`failed` has two producers and they do not emit the same fields. A consumer that
+types the record off one of them rejects the other.
+
+- **The exit path** — `reportWorkerFailure` in
+  `packages/work/src/shift/runtime.ts`, reached when a worker process was
+  spawned and then died. It ALWAYS includes `executable`, `exitStatus` and
+  `signal`. `exitStatus` and `signal` are commonly JSON `null` (a process that
+  exits on its own has no signal; one killed by a signal has no exit status), so
+  type them as nullable-and-present, not optional. `harness` is the one
+  genuinely optional field here — present only for an `agent-run` worker.
+- **The spawn-threw path** — `emit()` in `packages/work/src/shift/loop.ts`,
+  reached when `spawn()` itself threw and no process ever existed. It carries
+  `workflow`, `run`, `step`, `kind` and `message` and OMITS `executable`,
+  `exitStatus`, `signal` and `harness` entirely — there was no process to
+  describe.
+
+So `message` is the only failure detail present in both. Treat the four process
+fields as "absent means the worker never started", not as "unknown".
+
+One sentinel to know: on the exit path `step` is `"(unknown)"` — that literal
+string, not `null` or an absent field — when the failure could not be attributed
+to a named step. Anything indexing or joining on `step` must exclude it.
 
 ### The last record, when there is one
 
@@ -477,9 +520,14 @@ state directory still holds its `<run>.json`. Properties that matter:
 4. **14 days** — the default
 
 `0` is a real choice, not "off": it means *reap every completed run's log at the
-next shift startup*. There is no value that disables the sweep. An unparseable
-or negative environment value is ignored and resolution falls through to the
-next source — a typo in an env var must not stop a shift from serving.
+next shift startup*. There is no value that disables the sweep.
+
+The environment variable is accepted only as a **non-negative integer number of
+milliseconds**. An unparseable value, a negative one, and a non-integer one
+(`86400000.5` is dropped, not rounded) are all ignored, and resolution falls
+through to the next source — a typo in an env var must not stop a shift from
+serving. The ignoring is silent, so a shift running on the default after a typo
+looks exactly like a shift running on the default on purpose.
 
 **Never reaped at any age:** `shift.log`, `.owners/`, anything not ending in
 `.log`, and any `*.log` whose basename is not a `run_…` id. The log directory

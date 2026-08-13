@@ -288,23 +288,26 @@ either `exec` or `agent-run`:
 - `dispatched`: `{ "type": "dispatched", "workflow": "...", "run": "...", "step": "...", "kind": "exec", "pid": 123 }`
 - `reaped`: `{ "type": "reaped", "workflow": "...", "run": "...", "kind": "exec", "pid": 123 }`
 - `failed`: `{ "type": "failed", "workflow": "...", "run": "...", "step": "...", "kind": "exec", "message": "..." }`
-- `hub-error`: `{ "type": "hub-error", "op": "whats_next", "workflow": "...", "message": "..." }` — `op` is `wake` or `whats_next`; `workflow` is present only for per-workflow calls
 - `bundle-miss`: `{ "type": "bundle-miss", "workflow": "...", "def": "..." }` — a legacy order named a def with no cached bundle, so it was left for hub pickup
 - `order-dropped`: `{ "type": "order-dropped", "workflow": "...", "run": "...", "step": "...", "reason": "unsupported-worker", "message": "..." }` — the shift refused one order. Match on `reason` (`malformed-digest`, `malformed-worker`, `unsupported-worker`, `verification-failed`, `metadata-unavailable`); display `message`
 - `ended`: `{ "type": "ended" }`, delivered to a parked `next` when `shift end` explicitly shuts down the daemon
 
 Every event above is also appended to `<log-dir>/shift.log` as JSON Lines, which
-is how they survive the daemon. **Three further record types exist in
+is how they survive the daemon. **Four further record types exist in
 `shift.log` and are never delivered over the socket** — `parked`, `capacity`,
-and `event-queue-overflow`.
+`hub-error`, and `event-queue-overflow`.
 
 An idle `shift next` must block until there is work to report, and each of those
-three would satisfy it with news that nothing happened: a startup record, a
-report that the shift is full, or a record about the socket queue itself. The
-first two are also redundant on the wire — the response above already carries
-live `cap`, `free`, and `running`, which is exactly what a `capacity` record
-restates. In `shift.log`, which has no such envelope, they are the only way to
-tell an idle shift from a saturated one. See
+four would satisfy it with news that no work moved: a startup record, a report
+that the shift is full, a failed call to the hub, or a record about the socket
+queue itself. `parked` and `capacity` are also redundant on the wire — the
+response above already carries live `cap`, `free`, and `running`, which is
+exactly what a `capacity` record restates. `hub-error` is level-triggered at the
+poll interval, so an unreachable hub would otherwise fill the 1000-slot socket
+FIFO and evict the `dispatched`, `failed` and `reaped` records a parked client
+is actually waiting for. In `shift.log`, which is append-only and unbounded, all
+four are load-bearing: they are the only way to tell an idle shift from a
+saturated one, and the only record of every failed hub call. See
 [`docs/shift-logs.md`](shift-logs.md).
 
 `gate` is a reserved protocol shape for a future local representation of a

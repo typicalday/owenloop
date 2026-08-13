@@ -98,9 +98,11 @@ export function resolveShiftLogDir(
 /**
  * Resolve worker-log retention in milliseconds: `--log-max-age` >
  * `OWENLOOP_SHIFT_LOG_MAX_AGE_MS` > `settings.shiftLogMaxAgeMs` >
- * `DEFAULT_SHIFT_LOG_MAX_AGE_MS`. An unparseable or negative env value is
- * ignored rather than fatal — a typo in an environment variable must not stop a
- * shift from serving.
+ * `DEFAULT_SHIFT_LOG_MAX_AGE_MS`. The env value is accepted only as a
+ * NON-NEGATIVE INTEGER: unparseable, negative, and non-integer values
+ * (`86400000.5`) are all ignored rather than fatal, and resolution falls through
+ * to the next source — a typo in an environment variable must not stop a shift
+ * from serving.
  */
 export function resolveShiftLogMaxAgeMs(
   flag: number | undefined,
