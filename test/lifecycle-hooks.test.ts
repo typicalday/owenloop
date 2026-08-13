@@ -176,17 +176,71 @@ function ports(f: Fixture): string {
  * A disposable process for the kill tests to signal. `ignoreTerm` installs a
  * no-op SIGTERM handler, which is how a process gets to prove the hook escalates
  * to SIGKILL.
+ *
+ * The child announces readiness on stdout, and `spawnSleeper` does not resolve
+ * until that announcement arrives. Without the handshake there is a startup
+ * race: `spawn()` yields a pid the instant the process is forked, but the child
+ * still has to boot Node and reach `process.on("SIGTERM", ...)`. Inside that
+ * window it carries Node's DEFAULT SIGTERM disposition, which TERMINATES it — so
+ * a SIGTERM landing there kills a sleeper the test believes is immune, the hook
+ * correctly reports the port freed, and the SIGKILL assertion fails. That window
+ * is wide on a loaded CI runner, which is exactly where this failed.
+ *
+ * The `console.log` is sequenced AFTER the handler registration in the same
+ * synchronous script, so "ready" on stdout proves the handler is installed, not
+ * merely that the process exists.
  */
-function spawnSleeper(ignoreTerm: boolean): { pid: number; exited: Promise<NodeJS.Signals | null> } {
-  const script = ignoreTerm
-    ? 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'
-    : 'setInterval(() => {}, 1000);';
-  const child = spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+async function spawnSleeper(ignoreTerm: boolean): Promise<{ pid: number; exited: Promise<NodeJS.Signals | null> }> {
+  const install = ignoreTerm ? 'process.on("SIGTERM", () => {}); ' : '';
+  const script = `${install}console.log("ready"); setInterval(() => {}, 1000);`;
+  const child = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'ignore'] });
   const exited = new Promise<NodeJS.Signals | null>((resolve) => {
     child.on('exit', (_code, signal) => resolve(signal));
   });
   assert.ok(typeof child.pid === 'number', 'sleeper failed to spawn');
+
+  try {
+    await readyWithin(child, 10_000);
+  } catch (err) {
+    try {
+      process.kill(child.pid, 'SIGKILL');
+    } catch {
+      // already gone
+    }
+    throw err;
+  }
+
+  // Readiness is the pipe's only job. Close it and unref the child so that a
+  // sleeper leaked by a failing test cannot hold the runner's event loop open
+  // and turn one assertion failure into a whole-file timeout. `exited` still
+  // fires: unref only stops the handle keeping the loop alive.
+  child.stdout?.destroy();
+  child.unref();
   return { pid: child.pid, exited };
+}
+
+/**
+ * Resolve on the sleeper's first stdout chunk; reject rather than hang if it
+ * never announces itself or dies during startup.
+ */
+function readyWithin(child: ReturnType<typeof spawn>, ms: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => finish(new Error(`sleeper never announced readiness within ${ms}ms`)), ms);
+    const onData = () => finish();
+    const onExit = () => finish(new Error('sleeper exited before announcing readiness'));
+
+    function finish(err?: Error) {
+      clearTimeout(timer);
+      child.stdout?.off('data', onData);
+      child.off('exit', onExit);
+      child.stdout?.resume(); // keep draining so a chatty child can never block
+      if (err) reject(err);
+      else resolve();
+    }
+
+    child.stdout?.on('data', onData);
+    child.on('exit', onExit);
+  });
 }
 
 /** Reject rather than hang if the hook failed to signal the sleeper at all. */
@@ -305,13 +359,13 @@ test('a missing .ports file is a no-op, not an error', () => {
   }
 });
 
-test('a non-numeric registry allocation skips the kill but still reclaims the row', () => {
+test('a non-numeric registry allocation skips the kill but still reclaims the row', async () => {
   // The safety case: nothing derived from a malformed registry may reach `kill`,
   // where a negative value would be read as a process GROUP. The row still has
   // to go — a registry needing cleanup is what this hook is for.
   const f = makeFixture({ ports: 'main 0\nfeature 1\n', registry: 'fixture not-a-number 10 10\n' });
   try {
-    const sleeper = spawnSleeper(false);
+    const sleeper = await spawnSleeper(false);
     try {
       const result = runHook(f, 'feature', { FAKE_LISTENER_PID: String(sleeper.pid) });
       assert.equal(result.status, 0, result.stderr);
@@ -363,9 +417,44 @@ test('skips the kill phase entirely when lsof is unavailable', () => {
   }
 });
 
+/**
+ * Guards the fixture, not the hook — but a fixture bug here is indistinguishable
+ * from a hook bug, so it gets a test of its own.
+ *
+ * `spawnSleeper(true)` promises a process that IGNORES SIGTERM. That promise is
+ * what the SIGKILL-escalation test below rests on, and it used to be false: the
+ * helper returned as soon as `spawn()` yielded a pid, while the child was still
+ * booting Node and had not yet reached `process.on("SIGTERM", ...)`. A SIGTERM
+ * arriving in that window killed it under Node's default disposition, the hook
+ * saw the port freed, never escalated, and the escalation test failed on CI.
+ *
+ * This asserts the property directly: signal the sleeper the instant
+ * `spawnSleeper` resolves and require it to survive. Without the readiness
+ * handshake the SIGTERM lands in the startup window and this fails.
+ */
+test('spawnSleeper(true) resolves only once the sleeper truly ignores SIGTERM', async () => {
+  const sleeper = await spawnSleeper(true);
+  try {
+    process.kill(sleeper.pid, 'SIGTERM');
+
+    const stillRunning = Symbol('still running');
+    const verdict = await Promise.race([
+      sleeper.exited,
+      new Promise<symbol>((resolve) => setTimeout(() => resolve(stillRunning), 500)),
+    ]);
+    assert.equal(verdict, stillRunning, `sleeper died on SIGTERM (signal ${String(verdict)}) — handler was not installed yet`);
+  } finally {
+    try {
+      process.kill(sleeper.pid, 'SIGKILL');
+    } catch {
+      // already gone
+    }
+  }
+});
+
 test('sends SIGTERM to a listener and does not escalate when it exits', async () => {
   const f = makeFixture({ ports: 'main 0\nfeature 1\n' });
-  const sleeper = spawnSleeper(false);
+  const sleeper = await spawnSleeper(false);
   try {
     const result = runHook(f, 'feature', { FAKE_LISTENER_PID: String(sleeper.pid) });
     assert.equal(result.status, 0, result.stderr);
@@ -386,7 +475,7 @@ test('sends SIGTERM to a listener and does not escalate when it exits', async ()
 
 test('escalates to SIGKILL for a listener that ignores SIGTERM', async () => {
   const f = makeFixture({ ports: 'main 0\nfeature 1\n' });
-  const sleeper = spawnSleeper(true);
+  const sleeper = await spawnSleeper(true);
   try {
     const result = runHook(f, 'feature', { FAKE_LISTENER_PID: String(sleeper.pid) });
     assert.equal(result.status, 0, result.stderr);
