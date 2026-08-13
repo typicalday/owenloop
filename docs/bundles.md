@@ -255,15 +255,42 @@ consume-side verification under its hard rule and refuses the whole order when
 the consumed evidence is absent, unverifiable, or invalid, so the environment
 block is built only for an order whose inputs already verified.
 
-## Working directory
+## Working directory for command steps
 
 An order carries a `workdir` when its step declared `workdir:` or
-`workdirFrom:`. A step that declared neither still runs — the command inherits
-the directory the operator was standing in when they ran `owenloop shift start`
-— but owenloop now writes one warning per spawn naming the step, the workflow
-and run ids, and the resolved absolute path it fell back to. A future release
-will require a step to declare that inheritance explicitly; the warning is the
-migration notice, and nothing is enforced today.
+`workdirFrom:`. A command step that declared neither still runs, and the
+command inherits the directory the operator was standing in when they ran
+`owenloop shift start`. Nothing is enforced today: a future release will
+require a step to declare that inheritance explicitly.
+
+**Where the fallback is recorded, and where it is not.** When it fires,
+`owenloop work exec` writes one warning per spawn naming the step, the workflow
+and run ids, and the resolved absolute path. That warning goes to the exec
+worker's own stderr — and under `owenloop shift start` nothing reads that
+stream. `buildSpawnPlan` in `packages/work/src/shift/spawn.ts` launches every
+worker with `stdio: ['ignore', 'ignore', 'ignore']`, so a dispatched worker's
+fd 2 is `/dev/null` and the warning is discarded by the kernel. The receipt
+captures the *command's* streams, not the exec worker's, so it does not carry
+the warning either.
+
+In practice:
+
+| How the step ran | Does an operator see the warning? |
+| --- | --- |
+| `owenloop work exec <workflow>/<run>` run directly | Yes — on stderr |
+| dispatched by `owenloop shift start` | **No** — the worker's stderr is discarded |
+
+Under shift dispatch the launch directory is therefore still substituted
+silently. Do not read the absence of a warning during a shift as evidence that
+a step resolved a `workdir`; read the order's `workdir` field instead. Routing
+this record to a channel a shift operator actually reads is filed as a
+follow-up, and it is a prerequisite for the enforcement release — a migration
+notice nobody receives cannot serve as notice.
+
+This section is about command steps only. An agent step resolves its working
+directory through a different ladder (`packages/work/src/agent/workdir.ts`):
+`OrderPacket.workdir`, then a per-run directory under the work root, then the
+process cwd. It does not use the fallback described here.
 
 ## API results
 

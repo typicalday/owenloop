@@ -468,9 +468,16 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     // Run the command and race it against the lease going terminal.
     // `consumesDir` holds the OWENLOOP_CONSUMES_FILE overflow directory when
     // the serialized inputs did not fit inline. The `finally` below removes it
-    // on every path out of this block — including a spawn that threw — and
-    // never before the child has exited, because a script may read the file
-    // late in its run.
+    // on every path out of this block, including a spawn that threw.
+    //
+    // On the RECEIPT path the removal follows the child's exit, because a
+    // script may read the file late in its run. On the LEASE-TERMINAL path it
+    // does not: `cmd.kill()` (see `exec/runner.ts`) posts SIGTERM, races `done`
+    // against the grace timer, then posts SIGKILL and returns WITHOUT awaiting
+    // `done`, so this unlink can precede full reaping of the killed process
+    // group. That is deliberate and harmless — the run is abandoned and submits
+    // no receipt — but it is not a guarantee to build on. Do not add work here
+    // that assumes the child is gone.
     let consumesDir: string | undefined;
     try {
       let cmd: RunningCommand;
@@ -503,6 +510,17 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         // successors use and `deprovisioner` deletes its own, so both
         // legitimately have no workdir to resolve, and a throw here would break
         // every delivery run the moment it shipped.
+        //
+        // KNOWN LIMIT, do not read this warning as delivered under a shift.
+        // `opts.err` is this process's stderr, and `buildSpawnPlan`
+        // (`src/shift/spawn.ts`) launches every worker with
+        // `stdio: ['ignore', 'ignore', 'ignore']`, so a shift-dispatched exec
+        // writes this line to `/dev/null`. It is observable only when
+        // `owenloop work exec` is run by hand. Routing it to a channel a shift
+        // operator reads is filed separately and is a PREREQUISITE for turning
+        // this into a throw — an unseen warning is not a migration notice.
+        // `docs/bundles.md` ("Working directory for command steps") states the
+        // same limit for bundle authors.
         const cwd = order.workdir ?? opts.cwd;
         if (order.workdir === undefined) {
           opts.err(
