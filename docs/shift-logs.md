@@ -66,12 +66,12 @@ existed. **Losing observability never costs a dispatch.**
 
 ## Permissions
 
-Everything this feature creates is **owner-only**, and the mode is explicit at
+Every file this feature creates is **owner-only**, and the mode is explicit at
 every creation site rather than inherited from the umask:
 
 | Path | Mode | Created by |
 | --- | --- | --- |
-| `<log-dir>/` | `0700` | `prepareShiftLogDir` (`logretention.ts`) |
+| `<log-dir>/` | `0700` *when this feature creates it* — see below | `prepareShiftLogDir` (`logretention.ts`) |
 | `<log-dir>/shift.log` | `0600` | `createShiftLogSink` (`logsink.ts`) |
 | `<log-dir>/<run>.log` | `0600` | `createDefaultSpawner` (`spawn.ts`) |
 | `<log-dir>/.owners/` | `0700` | `registerShiftLogOwner` (`logretention.ts`) |
@@ -88,9 +88,19 @@ because its content is agent-produced artifact data" — applies here unchanged.
 Without an explicit mode these files would be `0666 & ~umask`, which is `0644`
 under the usual `022`: readable by every local account on the machine.
 
-**A mode applies only when the call CREATES the path.** Two consequences worth
+**A mode applies only when the call CREATES the path.** Three consequences worth
 knowing before you rely on it:
 
+- **In the DEFAULT configuration the log directory is `0755`, not `0700`.** With
+  no `--log-dir`, the log directory *is* the state directory, and the state
+  directory is created earlier in the same startup by `ensureStateDir`
+  (`packages/work/src/shift/state.ts`) with `mkdirSync(stateDir, {recursive:
+  true})` and no `mode` — `0755` under the usual umask `022`.
+  `prepareShiftLogDir` then calls `mkdirSync(dir, {mode: 0o700})` on a directory
+  that already exists, which does not chmod it. So on a fresh machine running
+  the defaults, any local account can list the directory and read the run ids in
+  it. **The files inside are still `0600`**, so no log content is exposed — only
+  its filenames. `chmod 700` the state directory if the names matter to you.
 - A `<run>.log`, a `shift.log`, or a `.owners/` directory left behind by a build
   from before this was explicit **keeps its old, wider permissions**. Nothing
   re-chmods an existing path. Fix those with one `chmod` if it matters to you;
@@ -539,17 +549,42 @@ The sweep is best-effort and never throws. A locked, unreadable, or
 concurrently-removed file costs that one entry, not the sweep, and never the
 shift.
 
+### Rolling back leaves the files behind
+
+Downgrading to a build from before this feature is safe but not self-cleaning.
+`shift.log`, every `<run>.log`, and `.owners/` stay in the log directory, and
+under the default configuration that directory is the state directory the older
+build still uses.
+
+- **The old build ignores them.** `readStateRecords` reads only names ending in
+  `.json`, so reconciliation and `owenloop shift status` behave exactly as they
+  did — a `.log` file and the `.owners/` directory are invisible to them.
+- **Nothing removes them.** The retention sweep is part of this feature, so the
+  older build has no reaper. The files persist at whatever size they had reached
+  until an operator deletes them by hand.
+
+Delete `shift.log`, `run_*.log`, and `.owners/` from the log directory if the
+disk matters; leave them if you intend to roll forward again, because a
+re-upgraded shift resumes appending to the same `shift.log`.
+
 ## Notes for an uploader
 
 **Resume by byte offset.** Both file kinds are opened `O_APPEND` and only ever
 grow while a shift is running. Record the offset you have consumed and resume
 from it. This is why `shift.log` is not rotated.
 
-**Interleaving is safe.** Each `shift.log` record is one complete `…\n` string
-written with a **single** `appendFileSync` call. Two shifts sharing a log
-directory both append with `O_APPEND`, so single-call writes cannot interleave
-into a half-line. Lines stay individually parseable and `shiftId` says which
-process wrote each one.
+**Interleaving is safe on a local filesystem.** Each `shift.log` record is one
+complete `…\n` string written with a **single** `appendFileSync` call, and two
+shifts sharing a log directory both append with `O_APPEND`. Lines stay
+individually parseable and `shiftId` says which process wrote each one.
+
+Be precise about where that comes from, because it bounds where it holds: the
+guarantee is a property of an `O_APPEND` `write(2)` to a **regular file on a
+local filesystem**, not of `appendFileSync` itself. `appendFileSync` loops on a
+short write, and a second process can append between iterations of that loop. At
+the sizes involved — one record, bounded at 512 KiB — a local filesystem does
+not short-write, which is why it holds in practice. On NFS it is not promised.
+Parse whole lines either way and carry a trailing fragment forward, as below.
 
 **Durability over throughput.** `shift.log` holds no descriptor between writes:
 every line is on disk before `write()` returns. A buffered stream would lose its
@@ -573,9 +608,11 @@ which is why it is stated as "not yet a record" rather than as an exception to
 the rule above.
 
 **Run as the same user as the shift, or arrange access deliberately.**
-`shift.log` and `<run>.log` are created `0600` and the directory `0700` — see
-[Permissions](#permissions). An uploader under a different account gets `EACCES`
-until an operator widens something on purpose.
+`shift.log` and `<run>.log` are created `0600` — always, in every configuration
+— see [Permissions](#permissions). An uploader under a different account gets
+`EACCES` on the files until an operator widens something on purpose, and it gets
+that even where the *directory* happens to be traversable, which under the
+defaults it is.
 
 ## Flags and settings
 
@@ -585,6 +622,12 @@ until an operator widens something on purpose.
 | `--log-max-age <ms>` | `OWENLOOP_SHIFT_LOG_MAX_AGE_MS` | `shiftLogMaxAgeMs` | `1209600000` (14 days) |
 
 Both flags are accepted by `owenloop shift start` and `owenloop work shift`.
+
+`owenloop work settings` prints `shiftLogDir = (unset)` and
+`shiftLogMaxAgeMs = (unset)` when the settings file names neither. `(unset)`
+there means *this file sets no value*, not *no default applies* — the defaults
+in the table above are the ones in force. Only a few keys (`dispatchCap` and
+friends) carry their built-in default into that listing.
 
 ## Source map
 
