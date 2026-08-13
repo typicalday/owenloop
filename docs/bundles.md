@@ -195,9 +195,11 @@ ambient values, so a nested agent receives its own identity rather than a
 stale parent value.
 
 Run identity is safe to expose because the engine derives it from the worker's
-own `--order` argument. Consumed artifact values are attacker-influenceable and
-are not exposed, and command text is not interpolated; no consume-side gate
-exists for either capability.
+own `--order` argument. Consumed artifact values are attacker-influenceable, so
+they reach a command child only through the environment block described in
+[Consumed inputs for command steps](#consumed-inputs-for-command-steps), and
+only after the consume-side gate below has admitted them. Command text is still
+never interpolated with a consumed value.
 
 `OWENLOOP_BUNDLE_DIR` is read-only. Workers must never write into the directory.
 The workflow store is content-addressed and verifies the installed object again
@@ -205,6 +207,63 @@ when a resolver reads it. A write changes the object bytes, so the next read
 fails the digest or file-integrity check instead of executing the modified
 bundle. Mount or copy enforcement is not part of the current contract;
 documentation is the enforcement boundary for now.
+
+## Consumed inputs for command steps
+
+A command step reads its consumed inputs from the environment, not from its
+working directory. Exactly one of two variables is set on every command spawn,
+and the other is removed:
+
+| Variable | Set when | Value |
+| --- | --- | --- |
+| `OWENLOOP_CONSUMES` | the serialized inputs are **at or under** 65536 bytes (`CONSUMES_INLINE_MAX_BYTES`) | `JSON.stringify(order.consumes)`, inline |
+| `OWENLOOP_CONSUMES_FILE` | the serialized inputs are **strictly larger** | absolute path to a `0600` UTF-8 file holding that same JSON |
+
+The threshold is measured as `Buffer.byteLength(json, 'utf8')`, so a payload of
+multi-byte characters is sized by its real byte length. Both variables are
+always resolved, never left to inheritance: a shift launched from inside another
+command step already carries its parent order's values, and a stale
+`OWENLOOP_CONSUMES_FILE` would name a directory that no longer exists.
+
+Because exactly one is present, the presence of `OWENLOOP_CONSUMES_FILE` is the
+whole discriminator. A reader is four lines:
+
+```js
+const raw = process.env.OWENLOOP_CONSUMES_FILE
+  ? readFileSync(process.env.OWENLOOP_CONSUMES_FILE, 'utf8')
+  : process.env.OWENLOOP_CONSUMES;
+const consumes = JSON.parse(raw ?? '{}');
+```
+
+Rules a script can rely on:
+
+- The JSON parses to the raw `order.consumes` object with no wrapper, version
+  field, or metadata — the same shape the `get_order` MCP tool serves an agent
+  step under `order.consumes`.
+- A step with no consumed inputs still gets `OWENLOOP_CONSUMES`, holding `{}`.
+  Absent therefore means exactly one thing: read `OWENLOOP_CONSUMES_FILE`.
+- An input a step declares but that was never produced is an **omitted key**,
+  not a `null`. Test presence with `'key' in consumes`.
+- The overflow file lives in a private temp directory that owenloop removes
+  after the command exits. Read it during the run; do not stash the path.
+
+These values are attacker-influenceable artifact data, which is why they travel
+only in the environment block. Owenloop never puts a consumed value in argv or
+in command text, and a command step's text is passed to `/bin/sh -c` exactly as
+authored in the verified bundle. Delivery is gated: `resolveCommand` runs
+consume-side verification under its hard rule and refuses the whole order when
+the consumed evidence is absent, unverifiable, or invalid, so the environment
+block is built only for an order whose inputs already verified.
+
+## Working directory
+
+An order carries a `workdir` when its step declared `workdir:` or
+`workdirFrom:`. A step that declared neither still runs — the command inherits
+the directory the operator was standing in when they ran `owenloop shift start`
+— but owenloop now writes one warning per spawn naming the step, the workflow
+and run ids, and the resolved absolute path it fell back to. A future release
+will require a step to declare that inheritance explicitly; the warning is the
+migration notice, and nothing is enforced today.
 
 ## API results
 

@@ -102,11 +102,21 @@ export function buildCommandPlan(
   cwd: string,
   env?: Record<string, string | undefined>,
 ): CommandPlan {
-  // If a future package interpolates consumed values into command text or the
-  // child environment, that path must inherit resolveCommand's consume-side
-  // verification gate before this spawn plan is ever built. OWENLOOP_BUNDLE_DIR,
-  // when supplied by exec/loop.ts, is resolver-derived after that gate and is
-  // not a consumed artifact value.
+  // Consumed values DO reach the child environment: exec/loop.ts delivers the
+  // order's consumed inputs as OWENLOOP_CONSUMES (or OWENLOOP_CONSUMES_FILE).
+  // That path inherits resolveCommand's consume-side verification gate — the
+  // env block is built only after `resolveCommand` returned, and that call
+  // refuses the whole order under `hardRule: true` on absent, unverifiable, or
+  // invalid consumed evidence — so no unverified dynamic value is ever placed
+  // here. OWENLOOP_BUNDLE_DIR is resolver-derived after the same gate and is
+  // not a consumed artifact value at all.
+  //
+  // Command TEXT stays uninterpolated: `command` is the authored bytes from the
+  // verified store, and `/bin/sh -c` expands `$OWENLOOP_CONSUMES` only where the
+  // authored text itself asks for it. A consumed value delivered through the
+  // environment block never becomes shell syntax. Any FUTURE path that puts a
+  // consumed value into command text or argv must re-argue that, and must
+  // likewise sit behind the consume-side gate.
   return {
     command: '/bin/sh',
     args: ['-c', command],

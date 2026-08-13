@@ -1,12 +1,19 @@
 import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 
 import { dsseVerifySubmission, valueDigestHex } from '../../../src/crypto/index.ts';
 import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
 import { resetSshKeygenProbe } from '../../../src/crypto/ssh.ts';
 import type { SshProcessAdapter } from '../../../src/crypto/ssh.ts';
-import { createExecLoop, type ExecLoop, type ExecLoopOptions } from '../src/exec/loop.ts';
+import {
+  createExecLoop,
+  CONSUMES_INLINE_MAX_BYTES,
+  type ExecLoop,
+  type ExecLoopOptions,
+  type ExecOutcome,
+} from '../src/exec/loop.ts';
 import { resetSubmitProofWarningForTests, type SubmissionKeyManager } from '../src/submit-proof.ts';
 import { HubError, type ContactHolder, type GetOrderResponse } from '../src/hub/types.ts';
 import type { HubClient } from '../src/hub/client.ts';
@@ -419,6 +426,216 @@ test('exec passes bundle provenance with the parent environment and removes it w
   }
 });
 
+// ---- consumed inputs on the child environment -------------------------------
+
+/** A command order whose packet carries `consumes` (and optionally `inputs`). */
+function consumingOrder(consumes: Record<string, unknown>, inputs?: string[]): GetOrderResponse {
+  const response = commandOrder({ command: 'read-consumes' });
+  response.order!.consumes = consumes;
+  if (inputs !== undefined) response.order!.inputs = inputs;
+  return response;
+}
+
+/** `consumes` whose serialized form is EXACTLY `target` bytes of ASCII. */
+function consumesOfExactBytes(target: number): Record<string, unknown> {
+  const overhead = Buffer.byteLength(JSON.stringify({ big: '' }), 'utf8');
+  return { big: 'a'.repeat(target - overhead) };
+}
+
+/**
+ * Drive one command order to completion and hand back what it spawned with.
+ *
+ * Only for assertions that survive the command's exit — the env OBJECT is the
+ * one the loop built, so its variables are still readable, but an overflow file
+ * named by `OWENLOOP_CONSUMES_FILE` is gone by the time this resolves. A test
+ * that must read that file drives the fake runner itself.
+ */
+async function envForOrder(
+  response: GetOrderResponse,
+  opts: { extra?: Partial<ExecLoopOptions> } = {},
+): Promise<{ env: Record<string, string | undefined>; cwd: string; outcome: ExecOutcome }> {
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [response], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, opts.extra ?? {}));
+  const p = loop.run();
+  await macrotaskSleep();
+  const start = fr.starts[0]!;
+  fr.resolve(result(0));
+  const outcome = await p;
+  return { env: start.env ?? {}, cwd: start.cwd, outcome };
+}
+
+test('a small consumes payload is delivered inline and the file variable is removed', async () => {
+  const consumes = { proposal: { text: 'ship it' }, workspace: { payload: { worktreePath: '/wt/x' } } };
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [consumingOrder(consumes)], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  const env = fr.starts[0]!.env ?? {};
+  assert.equal(env['OWENLOOP_CONSUMES'], JSON.stringify(consumes));
+  assert.equal('OWENLOOP_CONSUMES_FILE' in env, false);
+  assert.deepEqual(JSON.parse(env['OWENLOOP_CONSUMES']!), consumes);
+  fr.resolve(result(0));
+  assert.equal(await p, 'submitted');
+});
+
+test('an order with no consumed inputs still gets OWENLOOP_CONSUMES holding {}', async () => {
+  // Absent must mean exactly one thing to a script: read the FILE variable.
+  const response = commandOrder();
+  delete (response.order! as unknown as Record<string, unknown>)['consumes'];
+  const { env } = await envForOrder(response);
+  assert.equal(env['OWENLOOP_CONSUMES'], '{}');
+  assert.equal('OWENLOOP_CONSUMES_FILE' in env, false);
+});
+
+test('a declared input that was never produced stays an omitted key, never a null', async () => {
+  const consumes = { proposal: { text: 'only this one landed' } };
+  const { env } = await envForOrder(consumingOrder(consumes, ['proposal', 'planSeed']));
+  const parsed = JSON.parse(env['OWENLOOP_CONSUMES']!) as Record<string, unknown>;
+  assert.deepEqual(parsed, consumes);
+  assert.equal('planSeed' in parsed, false, 'a missing input must not be normalized into a null placeholder');
+});
+
+test('a payload of exactly CONSUMES_INLINE_MAX_BYTES bytes is still delivered inline', async () => {
+  const consumes = consumesOfExactBytes(CONSUMES_INLINE_MAX_BYTES);
+  assert.equal(Buffer.byteLength(JSON.stringify(consumes), 'utf8'), CONSUMES_INLINE_MAX_BYTES);
+  const { env } = await envForOrder(consumingOrder(consumes));
+  assert.equal(Buffer.byteLength(env['OWENLOOP_CONSUMES'] ?? '', 'utf8'), CONSUMES_INLINE_MAX_BYTES);
+  assert.equal('OWENLOOP_CONSUMES_FILE' in env, false, 'the comparison is <=, so the boundary goes inline');
+});
+
+test('one byte over the threshold takes the file path, and the file round-trips', async () => {
+  const consumes = consumesOfExactBytes(CONSUMES_INLINE_MAX_BYTES + 1);
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [consumingOrder(consumes)], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  const env = fr.starts[0]!.env ?? {};
+  const file = env['OWENLOOP_CONSUMES_FILE'];
+  assert.equal(typeof file, 'string');
+  assert.equal('OWENLOOP_CONSUMES' in env, false);
+  // Readable WHILE the command runs — a script may read it late in its run.
+  assert.deepEqual(JSON.parse(readFileSync(file!, 'utf8')), consumes);
+  fr.resolve(result(0));
+  assert.equal(await p, 'submitted');
+});
+
+test('multi-byte content is sized by its BYTE length, not its UTF-16 length', async () => {
+  // The regression guard for measuring with `json.length`: every '€' is one
+  // UTF-16 code unit and three UTF-8 bytes, so a `.length` check passes this
+  // payload straight into an environment variable three times its budget.
+  const consumes = { euros: '€'.repeat(30_000) };
+  const json = JSON.stringify(consumes);
+  assert.ok(json.length <= CONSUMES_INLINE_MAX_BYTES, 'the UTF-16 length must be under the threshold');
+  assert.ok(Buffer.byteLength(json, 'utf8') > CONSUMES_INLINE_MAX_BYTES, 'the UTF-8 byte length must be over it');
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [consumingOrder(consumes)], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  const env = fr.starts[0]!.env ?? {};
+  assert.equal('OWENLOOP_CONSUMES' in env, false);
+  assert.deepEqual(JSON.parse(readFileSync(env['OWENLOOP_CONSUMES_FILE']!, 'utf8')), consumes);
+  fr.resolve(result(0));
+  assert.equal(await p, 'submitted');
+});
+
+test('stale inherited consumes variables are overwritten or deleted in both modes', async () => {
+  const savedInline = process.env['OWENLOOP_CONSUMES'];
+  const savedFile = process.env['OWENLOOP_CONSUMES_FILE'];
+  process.env['OWENLOOP_CONSUMES'] = '{"parent":"stale inline value"}';
+  process.env['OWENLOOP_CONSUMES_FILE'] = '/parent/run/consumes.json';
+  try {
+    const small = { child: 'mine' };
+    const inline = await envForOrder(consumingOrder(small));
+    assert.equal(inline.env['OWENLOOP_CONSUMES'], JSON.stringify(small));
+    assert.equal('OWENLOOP_CONSUMES_FILE' in inline.env, false, 'a stale parent FILE path must be deleted, not inherited');
+
+    const big = consumesOfExactBytes(CONSUMES_INLINE_MAX_BYTES + 1);
+    const overflow = await envForOrder(consumingOrder(big));
+    assert.equal('OWENLOOP_CONSUMES' in overflow.env, false, 'a stale parent inline value must be deleted, not inherited');
+    assert.notEqual(overflow.env['OWENLOOP_CONSUMES_FILE'], '/parent/run/consumes.json');
+  } finally {
+    if (savedInline === undefined) delete process.env['OWENLOOP_CONSUMES'];
+    else process.env['OWENLOOP_CONSUMES'] = savedInline;
+    if (savedFile === undefined) delete process.env['OWENLOOP_CONSUMES_FILE'];
+    else process.env['OWENLOOP_CONSUMES_FILE'] = savedFile;
+  }
+});
+
+test('the overflow directory is removed after the command exits', async () => {
+  const consumes = consumesOfExactBytes(CONSUMES_INLINE_MAX_BYTES + 1);
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [consumingOrder(consumes)], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  const file = fr.starts[0]!.env?.['OWENLOOP_CONSUMES_FILE'];
+  assert.equal(typeof file, 'string');
+  assert.equal(existsSync(file!), true, 'the file must survive for as long as the command runs');
+  fr.resolve(result(0));
+  assert.equal(await p, 'submitted');
+  assert.equal(existsSync(file!), false);
+  assert.equal(existsSync(dirname(file!)), false, 'the whole temp directory goes, not just the file');
+});
+
+test('the overflow directory is removed even when the spawn itself fails', async () => {
+  const consumes = consumesOfExactBytes(CONSUMES_INLINE_MAX_BYTES + 1);
+  const fr = fakeRunner({ throwOnStart: new Error('spawn ENOENT') });
+  const { hub, submits } = mockHub({ getOrder: [consumingOrder(consumes)], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  assert.equal(await loop.run(), 'submitted');
+  const receipt = submits[0]!.value as CommandReceipt;
+  assert.equal(receipt.exitCode, null);
+  const file = fr.starts[0]!.env?.['OWENLOOP_CONSUMES_FILE'];
+  assert.equal(typeof file, 'string');
+  assert.equal(existsSync(dirname(file!)), false);
+});
+
+// ---- the cwd fallback record ------------------------------------------------
+
+test('an order with no workdir warns, naming the step, the run, and the resolved cwd', async () => {
+  const warnings: string[] = [];
+  const { cwd, outcome } = await envForOrder(commandOrder(), { extra: { err: (line) => warnings.push(line) } });
+  assert.equal(outcome, 'submitted');
+  assert.equal(cwd, '/work');
+  const fallback = warnings.filter((line) => /declared neither workdir nor workdirFrom/.test(line));
+  assert.equal(fallback.length, 1, warnings.join('\n'));
+  assert.match(fallback[0]!, /step 'builder'/);
+  assert.match(fallback[0]!, /wf1\/run1/);
+  assert.match(fallback[0]!, /'\/work'/);
+  assert.match(fallback[0]!, /shift launch directory/);
+});
+
+test('an order that carries a workdir spawns there and warns about nothing', async () => {
+  const warnings: string[] = [];
+  const { cwd, outcome } = await envForOrder(commandOrder({ workdir: '/wt/flow-1' }), {
+    extra: { err: (line) => warnings.push(line) },
+  });
+  assert.equal(outcome, 'submitted');
+  assert.equal(cwd, '/wt/flow-1');
+  assert.deepEqual(warnings, []);
+});
+
+test('provisioner/deprovisioner guard: a step with no workdirFrom still spawns in opts.cwd and completes', async () => {
+  // The installed delivery bundle has two steps that deliberately declare no
+  // workdirFrom — `provisioner` CREATES the worktree its successors use, and
+  // `deprovisioner` DELETES its own. The fallback must stay a warning: turning
+  // it into a throw breaks every delivery run. Do not delete this test to make
+  // a future enforcement change pass.
+  const fr = fakeRunner();
+  const { hub, submits } = mockHub({ getOrder: [commandOrder({ command: 'provision' })], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { cwd: '/launch/dir' }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  assert.equal(await p, 'submitted');
+  assert.equal(fr.starts[0]!.cwd, '/launch/dir');
+  assert.equal((submits[0]!.value as CommandReceipt).exitCode, 0);
+});
+
 test('exec producer submit signs its receipt at the hub-issued owed target version', async () => {
   const fr = fakeRunner();
   const response = commandOrder({ command: 'make signed-build' });
@@ -475,8 +692,13 @@ test('exec judge submit falls back unsigned when the machine key is missing', as
   fr.resolve(result(0));
   assert.equal(await p, 'submitted');
   assert.equal(submits[0]!.proof, undefined);
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0]!, /without a proof/);
+  // This order carries no workdir, so the cwd-fallback record is on the same
+  // sink. Pin BOTH lines rather than loosening the count: exactly one proof
+  // warning, exactly one fallback warning, nothing else.
+  const proofWarnings = warnings.filter((line) => /without a proof/.test(line));
+  assert.equal(proofWarnings.length, 1);
+  assert.equal(warnings.filter((line) => /declared neither workdir nor workdirFrom/.test(line)).length, 1);
+  assert.equal(warnings.length, 2, warnings.join('\n'));
 });
 
 test('the runner receives only locally resolved command text, not an extra packet command field', async () => {
