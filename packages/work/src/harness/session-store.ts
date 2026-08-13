@@ -18,9 +18,10 @@
  *
  * FAILURE STANCE, three different answers on purpose:
  *  - READ is fail-open: a missing file reads as `[]` (mirrors `readChildRecords`
- *    in `src/shift/state.ts`), and a corrupt line is skipped and reported
- *    through the injectable `warn` callback, never thrown. A store that cannot
- *    be parsed must degrade a resume into a replay, not break the worker.
+ *    in `src/shift/state.ts`), and an unusable line — corrupt bytes that will
+ *    not parse, or a parsed object that fails the schema — is skipped and
+ *    reported through the injectable `warn` callback, never thrown. A store that
+ *    cannot be parsed must degrade a resume into a replay, not break the worker.
  *  - APPEND PROPAGATES. Unlike the shift's advisory metering records, a lost
  *    session token silently degrades a Phase 4 resume into a cold replay — real
  *    work thrown away — so the caller must see the failure.
@@ -110,7 +111,9 @@ export interface SessionRecord {
 }
 
 export interface SessionStoreOptions {
-  /** Called once per skipped corrupt line. Default writes to stderr. */
+  /** Called once per skipped line — either corrupt bytes that would not parse
+   *  ("skipping corrupt record") or a parsed object that failed the schema
+   *  ("skipping invalid record"). Default writes to stderr. */
   warn?: (line: string) => void;
   /** Test barrier invoked under the writer lock after a retirement snapshot. */
   afterWriterSnapshot?: () => void;
@@ -169,21 +172,43 @@ function isNonEmptyString(v: unknown): v is string {
 }
 
 /**
- * Validate one parsed line. Checks exactly the fields whose absence would make
- * the record unusable for a resume: the three key fields plus the harness and
- * token it exists to carry, and a `status` inside the four literals. Everything
- * else is carried verbatim.
+ * The non-empty-string fields `isSessionRecord` requires, in the order it checks
+ * them. Declared once and kept stable so a record failing several checks always
+ * reports the SAME field, which keeps the skip message deterministic.
+ * `status` is not here — its check is a membership test, not a string test — and
+ * is applied after these, preserving the original check order.
+ */
+const SESSION_RECORD_STRING_FIELDS = ['workflow', 'run', 'step', 'harness', 'token'] as const;
+
+/**
+ * Name of the first field of `v` that fails the `SessionRecord` schema, or
+ * `null` when the record is valid. `'<root>'` means `v` is not a plain object at
+ * all, so no field could be read from it.
+ *
+ * THE SINGLE SOURCE OF TRUTH for record validity: `isSessionRecord` is defined
+ * in terms of this function, so the accept/reject decision and the reported
+ * field name can never drift apart.
+ *
+ * Checks exactly the fields whose absence would make the record unusable for a
+ * resume: the three key fields plus the harness and token it exists to carry,
+ * and a `status` inside the four literals. Everything else is carried verbatim.
+ */
+function firstInvalidSessionRecordField(v: unknown): string | null {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return '<root>';
+  const r = v as Record<string, unknown>;
+  for (const field of SESSION_RECORD_STRING_FIELDS) {
+    if (!isNonEmptyString(r[field])) return field;
+  }
+  if (typeof r['status'] !== 'string' || !STATUSES.has(r['status'])) return 'status';
+  return null;
+}
+
+/**
+ * Validate one parsed line. A type predicate, so a `true` return narrows `v` to
+ * `SessionRecord` at the call site.
  */
 function isSessionRecord(v: unknown): v is SessionRecord {
-  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
-  const r = v as Record<string, unknown>;
-  if (!isNonEmptyString(r['workflow'])) return false;
-  if (!isNonEmptyString(r['run'])) return false;
-  if (!isNonEmptyString(r['step'])) return false;
-  if (!isNonEmptyString(r['harness'])) return false;
-  if (!isNonEmptyString(r['token'])) return false;
-  if (typeof r['status'] !== 'string' || !STATUSES.has(r['status'])) return false;
-  return true;
+  return firstInvalidSessionRecordField(v) === null;
 }
 
 /** Flush a directory entry update where the platform exposes directory fsync. */
@@ -330,7 +355,16 @@ export function readSessions(file: string, opts: SessionStoreOptions = {}): Sess
       continue;
     }
     if (!isSessionRecord(parsed)) {
-      warn(`owenloop work sessions: skipping corrupt record at ${file}:${i + 1}`);
+      // DISTINCT WORDING ON PURPOSE — "invalid", not "corrupt". These bytes
+      // parsed fine; they just failed the schema. 36 records once whose only
+      // fault was an empty `token` were all reported as "corrupt", which sent
+      // debugging after a file-integrity problem that did not exist. The second
+      // pass runs only on this failure branch, so valid records pay nothing.
+      // The field NAME only, never its value — `token` is credential-shaped.
+      const badField = firstInvalidSessionRecordField(parsed) ?? '<unknown>';
+      warn(
+        `owenloop work sessions: skipping invalid record at ${file}:${i + 1}: field "${badField}" failed schema check`,
+      );
       continue;
     }
     out.push(parsed);
