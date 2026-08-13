@@ -31,6 +31,7 @@ import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse } from '../hub/types.ts';
 import type { StopOptions } from '../lease/loop.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
+import { normalizeSubmitValue } from '../submit-value.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
@@ -212,6 +213,12 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
         return textResult({ error: 'submit requires a "value"' }, true);
       }
       const done = args['done'];
+      // Normalize a JSON-encoded string value to the object the hub would
+      // store BEFORE signing it. Signing the string instead makes the hub drop
+      // the proof (it stores normalized bytes the signature does not cover),
+      // silently, on both sides — see `../submit-value.ts`. One value is used
+      // for both the proof and the wire so the two can never diverge.
+      const value = normalizeSubmitValue(args['value']);
       try {
         // Submit is also a dynamic-data boundary. Fetch and gate the bound
         // packet even when no origin was supplied for submit-proof signing;
@@ -231,7 +238,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
             origin: deps.origin,
             order: orderResponse.order,
             path,
-            value: args['value'],
+            value,
             now: deps.now,
             warn: deps.err,
             ...(deps.principalKeys !== undefined ? { principalKeys: deps.principalKeys } : {}),
@@ -243,7 +250,7 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
           workflow,
           run,
           path,
-          value: args['value'],
+          value,
           ...(typeof done === 'boolean' ? { done } : {}),
           ...(proof !== undefined ? { proof } : {}),
           ...holderReq,
