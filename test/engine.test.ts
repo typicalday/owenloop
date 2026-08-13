@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Engine } from '../src/engine.ts';
+import { Engine, ModifierRefusalError } from '../src/engine.ts';
 import type { Order } from '../src/engine.ts';
 import { buildDef, hashDef } from '../src/defs.ts';
 import { createDefInstructionSource } from '../src/order-resolver.ts';
@@ -1722,6 +1722,78 @@ test('§28: the def snapshot pins modifiers: and escalation: across a republish'
   const adopted = store.getWorkflow(wf)?.defSnapshot;
   assert.deepEqual(adopted!.modifiers, ['express', 'deep', 'exhaustive']);
   assert.deepEqual(adopted!.steps[0]!.escalation, { after: 1, modifier: 'exhaustive' });
+});
+
+// ---- createInstance modifier: validated against the pin, stored on the row ---
+
+function gradedDef(modifiers?: string[]): WorkflowDef {
+  return def(
+    'graded',
+    [input('proposal')],
+    [step({ name: 'builder', consumes: ['proposal'], produces: ['pr'], capabilities: ['build'] })],
+    modifiers,
+  );
+}
+
+test('createInstance stores a declared modifier on the run record', () => {
+  const { engine, store } = makeEngine([gradedDef(['express', 'deep'])]);
+  const wf = engine.createInstance('graded', { modifier: 'deep' });
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep');
+});
+
+test('createInstance without a modifier leaves the run record unmodified', () => {
+  const { engine, store } = makeEngine([gradedDef(['express', 'deep'])]);
+  const wf = engine.createInstance('graded');
+  assert.equal(store.getWorkflow(wf)?.modifier, undefined);
+});
+
+test('createInstance refuses a modifier the def does not declare', () => {
+  const { engine } = makeEngine([gradedDef(['express', 'deep'])]);
+  assert.throws(
+    () => engine.createInstance('graded', { modifier: 'exhaustive' }),
+    (e: unknown) =>
+      e instanceof ModifierRefusalError &&
+      e.defName === 'graded' &&
+      e.modifier === 'exhaustive' &&
+      // The declared set travels on the error so the hub can render a usable
+      // 400 instead of "invalid modifier".
+      JSON.stringify(e.declared) === JSON.stringify(['express', 'deep']) &&
+      /not declared by workflow 'graded' \(declared: express, deep\)/.test(e.message),
+  );
+});
+
+test('createInstance refuses any modifier on a def that declares none', () => {
+  // A distinct message: the fix is to add `modifiers:` to the def, not to pick
+  // a different value from a set that does not exist.
+  const { engine } = makeEngine([gradedDef()]);
+  assert.throws(
+    () => engine.createInstance('graded', { modifier: 'deep' }),
+    (e: unknown) =>
+      e instanceof ModifierRefusalError &&
+      e.declared.length === 0 &&
+      /declares no modifiers:, so it cannot be started with modifier 'deep'/.test(e.message),
+  );
+});
+
+test('a refused modifier leaves no partial instance behind', () => {
+  const { engine, store } = makeEngine([gradedDef(['express'])]);
+  assert.throws(() => engine.createInstance('graded', { modifier: 'deep' }), ModifierRefusalError);
+  assert.equal(store.listWorkflows().length, 0, 'the creating transaction rolled back');
+});
+
+test('createInstance validates the modifier against the snapshot it pins, not a later republish', () => {
+  // The vocabulary that legitimizes a modifier and the modifier itself are
+  // stamped on the same row in the same transaction. Republishing the def with
+  // a narrower set afterwards cannot retroactively invalidate a live run.
+  const { engine, store, setDef } = makeMutableEngine([gradedDef(['express', 'deep'])]);
+  const wf = engine.createInstance('graded', { modifier: 'deep' });
+
+  setDef(gradedDef(['express']));
+
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep', 'the live run keeps its modifier');
+  assert.deepEqual(store.getWorkflow(wf)?.defSnapshot?.modifiers, ['express', 'deep'], 'and the set that legitimized it');
+  // A NEW instance resolves the republished def and is held to the narrower set.
+  assert.throws(() => engine.createInstance('graded', { modifier: 'deep' }), ModifierRefusalError);
 });
 
 test('§28: defFor falls back to name-resolution for a legacy row with no snapshot', () => {

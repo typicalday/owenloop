@@ -12,7 +12,7 @@
  * process — software delivery, research, triage — on top of it.
  */
 
-export { CallsPinError, Engine } from './engine.ts';
+export { CallsPinError, Engine, ModifierRefusalError } from './engine.ts';
 export type {
   CommitResult,
   CreateOpts,

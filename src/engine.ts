@@ -296,6 +296,41 @@ export interface CreateOpts {
   provide?: Record<string, Record<string, unknown>>;
   /** Mode 2: parent-coordinate link for a child instance spawned by a calls: step. Persisted to store; used only to cascade the child's outcome back up. */
   producedBy?: { parentWf: string; parentPath: string };
+  /**
+   * The ONE routing modifier this instance carries for its whole life. Must be
+   * a member of the def's declared `modifiers` set — `createInstance` throws
+   * {@link ModifierRefusalError} otherwise, rather than starting a run that
+   * would compose capabilities no crew was ever bound to.
+   *
+   * Absent = an unmodified run: every step is offered on bare capabilities.
+   * Never mutated after creation; an escalated re-offer carries its own target
+   * modifier per-offer without rewriting this.
+   */
+  modifier?: string;
+}
+
+/**
+ * Thrown by `createInstance` when the requested modifier is not in the def's
+ * declared `modifiers` set (including the case of a def that declares none).
+ * Its own class so the hub can map it to a 400 instead of an opaque 500 —
+ * this is a caller mistake, not an engine fault.
+ */
+export class ModifierRefusalError extends Error {
+  readonly defName: string;
+  readonly modifier: string;
+  /** The def's declared modifier set — empty when the def declares none. */
+  readonly declared: string[];
+  constructor(defName: string, modifier: string, declared: string[]) {
+    super(
+      declared.length === 0
+        ? `workflow '${defName}' declares no modifiers:, so it cannot be started with modifier '${modifier}'`
+        : `modifier '${modifier}' is not declared by workflow '${defName}' (declared: ${declared.join(', ')})`,
+    );
+    this.name = 'ModifierRefusalError';
+    this.defName = defName;
+    this.modifier = modifier;
+    this.declared = declared;
+  }
 }
 
 /**
@@ -472,10 +507,21 @@ export class Engine {
     // compatibility case (see defFor), never a choice made here.
     const wfData: {
       def: string; title?: string; params?: Record<string, string>;
-      defSnapshot: WorkflowDef; defHash: string;
+      modifier?: string; defSnapshot: WorkflowDef; defHash: string;
     } = { def: defName, defSnapshot: def, defHash: hashDef(def) };
     if (opts.title !== undefined) wfData.title = opts.title;
     if (opts.params !== undefined) wfData.params = opts.params;
+    // Validated against the SNAPSHOT being pinned on this same row, not
+    // against a live re-resolution — the modifier and the vocabulary that
+    // legitimizes it are stamped together and stay consistent for the life of
+    // the instance, even if the def is republished with a different set.
+    if (opts.modifier !== undefined) {
+      const declared = def.modifiers ?? [];
+      if (!declared.includes(opts.modifier)) {
+        throw new ModifierRefusalError(defName, opts.modifier, declared);
+      }
+      wfData.modifier = opts.modifier;
+    }
     this.store.insertWorkflow(id, wfData, opts.producedBy);
 
     for (const input of def.inputs) {

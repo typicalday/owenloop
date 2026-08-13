@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS workflow (
   def         TEXT NOT NULL,
   title       TEXT,
   params      TEXT NOT NULL DEFAULT '{}',
+  modifier    TEXT,
   created_at  INTEGER NOT NULL
 );
 
@@ -186,8 +187,13 @@ CREATE TABLE IF NOT EXISTS meta (
  * driver ticks cannot each insert a child for the same `calls:` step.
  *
  * Bumped to '9' for immutable artifact payload/version and lifecycle-event history.
+ *
+ * Bumped to '10' for the routing modifier: the `workflow` table gains a
+ * nullable `modifier` column (see `migrate()`). Additive and un-backfilled —
+ * NULL on every existing row means "unmodified run", which is the correct
+ * reading of an instance created before modifiers existed.
  */
-const SCHEMA_VERSION = '9';
+const SCHEMA_VERSION = '10';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -429,6 +435,7 @@ interface WorkflowRowRaw {
   produced_by_path: string | null;
   def_snapshot: string | null;
   def_hash: string | null;
+  modifier: string | null;
   created_at: number;
 }
 
@@ -450,6 +457,10 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
   });
   if (defSnapshot !== undefined) out.defSnapshot = defSnapshot;
   if (r.def_hash !== null) out.defHash = r.def_hash;
+  // NULL (a pre-modifier row, or a run started without one) maps to absent,
+  // never to an empty string — 'unmodified run' and 'modifier ""' must not
+  // become the same thing downstream, where '' would compose 'build:'.
+  if (r.modifier !== null) out.modifier = r.modifier;
   return out;
 }
 
@@ -613,6 +624,14 @@ export class Store {
     if (!wfCols.some((c) => c.name === 'def_hash')) {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN def_hash TEXT`);
     }
+    // Routing modifier: the ONE modifier this instance carries, set once at
+    // creation and never written again. NULL on every pre-existing row, which
+    // is exactly right — an instance created before modifiers existed is an
+    // unmodified run and every step is offered on bare capabilities. No
+    // backfill: there is no value to invent.
+    if (!wfCols.some((c) => c.name === 'modifier')) {
+      this.db.exec(`ALTER TABLE workflow ADD COLUMN modifier TEXT`);
+    }
 
     // Only a genuine pre-v8 -> v8 upgrade may backfill the current projection's
     // reason thread. Re-opening an already-v8 database must not manufacture a
@@ -677,8 +696,8 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO workflow
-           (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, modifier, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -689,6 +708,7 @@ export class Store {
         producedBy?.parentPath ?? null,
         toJson(data.defSnapshot),
         data.defHash ?? null,
+        data.modifier ?? null,
         at,
       );
     return this.getWorkflow(id) as WorkflowRow;
