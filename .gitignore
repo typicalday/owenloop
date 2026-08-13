@@ -10,8 +10,14 @@ dist/
 coverage/
 
 # dev delivery-system scaffolding (local foreman state — not part of the library)
+# `.dev/*` matches only the DIRECT children of .dev, so an ignored directory is
+# never descended into and a negation on a file inside it cannot rescue it. Each
+# tracked subtree therefore needs its own un-ignore on the directory itself.
+# `.dev/hooks/` holds worktree lifecycle hooks: they describe how THIS repo is
+# reclaimed, so they are shared, unlike project.sh and plans/ which stay local.
 .dev/*
 !.dev/checks.sh
+!.dev/hooks/
 
 # planning documents are local working state, never shipped in this public repo
 docs/plans/
