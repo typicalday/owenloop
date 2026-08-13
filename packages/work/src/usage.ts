@@ -56,6 +56,9 @@ Options:
       --jump-tolerance <ms>      wall-gap slack before a tick is treated as a
                                  clock jump / laptop sleep (default 30000)
       --ignore-stdin             don't final-breath on stdin EOF (detached use)
+      --never-release            another process holds the claim; stop without
+                                 releasing it (agent-run spawns its --mcp child
+                                 this way — see hold.ts HOLDER OF RECORD)
       --mcp                      run as a stdio-MCP work-holder: tools get_order /
                                  submit, lease kept warm underneath (mutually
                                  exclusive with --ignore-stdin — stdin is the

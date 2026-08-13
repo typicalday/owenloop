@@ -576,7 +576,9 @@ test('run() builds an MCP mount whose args carry no credential', async () => {
   const mcp = started.args.owenloopMcp;
   assert.deepEqual(mcp, {
     command: process.execPath,
-    args: [resolveOwenloopBin(), 'work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'default', '--shift=shf_1', '--mcp'],
+    // `--never-release`: agent-run's own exec loop is the holder of record, so
+    // this child must never hand the claim back (see buildOwenloopMcp).
+    args: [resolveOwenloopBin(), 'work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'default', '--shift=shf_1', '--mcp', '--never-release'],
   });
   const flat = JSON.stringify(mcp);
   assert.ok(!flat.includes('olp_secret_value'), flat);

@@ -316,7 +316,8 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
   assert.equal(start.args.cwd, '/repo/wt');
   assert.deepEqual(start.args.owenloopMcp, {
     command: process.execPath,
-    args: [resolveOwenloopBin(), 'work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'acct-1', '--shift=shf_1', '--mcp'],
+    // `--never-release`: this loop's own exec lease is the holder of record.
+    args: [resolveOwenloopBin(), 'work', 'hold', '--order', 'wf1/run1', '--origin', 'https://hub.example', '--as', 'acct-1', '--shift=shf_1', '--mcp', '--never-release'],
   });
   // Permissions arrive PRE-NORMALIZED on the step spec — `prepare` already ran
   // `normalizeStepPermissions` over `x.harness`, so this loop passes them
