@@ -443,6 +443,11 @@ explicitly; `--all` serves all Crews for the Scoped Identity. `shift next` waits
 up to 90 seconds by default. For flags, JSON output, daemon behavior, and exit
 codes, see the [`shift` reference](docs/cli.md#shift--foreground-daemon-and-client).
 
+A running shift also writes to disk: its own dispatch record as JSON Lines in
+`shift.log`, and each dispatched worker's stdout and stderr in `<run>.log`. Both
+outlive the shift, which is what makes a postmortem possible after a shift dies.
+See [`docs/shift-logs.md`](docs/shift-logs.md).
+
 **Want to see or drive the machinery yourself?** Everything above goes
 through the same small CLI (`create`, `tick`, `green`, `reject`, …).
 [`docs/cli.md`](docs/cli.md) has the full command reference and a hand-driven
@@ -736,8 +741,10 @@ owenloop is a faithful, decoupled implementation of a dataflow-engine spec.
 firing rule, forward cascade, the reject kinds, the liveness rules, and the concurrency
 model — cross-referenced from the source. [`docs/cli.md`](docs/cli.md) has the full
 command reference, [`docs/authoring.md`](docs/authoring.md) has the full YAML
-grammar, and [`docs/wire-contracts.md`](docs/wire-contracts.md) defines the
-versioned trust-boundary records.
+grammar, [`docs/wire-contracts.md`](docs/wire-contracts.md) defines the
+versioned trust-boundary records, and
+[`docs/shift-logs.md`](docs/shift-logs.md) is the on-disk log contract a shift
+writes and an uploader reads.
 
 ---
 

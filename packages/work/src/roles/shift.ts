@@ -33,6 +33,7 @@ function usage(): void {
     'usage: owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]\n' +
       '                              [--cap <n>] [--max-agents <n>] [--poll-interval <ms>] [--once]\n' +
       '                              [--cache-dir <p>] [--state-dir <p>]\n' +
+      '                              [--log-dir <p>] [--log-max-age <ms>]\n' +
       '       owenloop shift next [--wait <seconds>] [--state-dir <p>]\n' +
       '       owenloop shift status [--state-dir <p>]\n' +
       '       owenloop shift end [--state-dir <p>]\n',
@@ -49,7 +50,10 @@ function intValue(raw: string, flag: string): number | string {
 
 function parseStartArgs(args: string[]): StartArgs {
   const parsed: StartArgs = { crews: [] };
-  const valueFlags = new Set(['--origin', '--as', '--name', '--cap', '--max-agents', '--poll-interval', '--cache-dir', '--state-dir']);
+  const valueFlags = new Set([
+    '--origin', '--as', '--name', '--cap', '--max-agents', '--poll-interval',
+    '--cache-dir', '--state-dir', '--log-dir', '--log-max-age',
+  ]);
   for (let i = 0; i < args.length; i++) {
     const raw = args[i]!;
     const name = raw.startsWith('--') && raw.includes('=') ? raw.slice(0, raw.indexOf('=')) : raw;
@@ -72,7 +76,12 @@ function parseStartArgs(args: string[]): StartArgs {
         parsed.name = value;
       } else if (name === '--cache-dir') parsed.cacheDir = value;
       else if (name === '--state-dir') parsed.stateDir = value;
-      else if (name === '--cap') {
+      else if (name === '--log-dir') parsed.logDir = value;
+      else if (name === '--log-max-age') {
+        const n = intValue(value, '--log-max-age');
+        if (typeof n !== 'number') return { crews: parsed.crews, error: n };
+        parsed.logMaxAgeMs = n;
+      } else if (name === '--cap') {
         const n = intValue(value, '--cap');
         if (typeof n !== 'number') return { crews: parsed.crews, error: n };
         parsed.cap = n;

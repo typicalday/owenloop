@@ -3,7 +3,9 @@
  *
  * Every order the shift dispatches becomes a DETACHED
  * `owenloop work exec <workflow>/<run> --origin <url>` child: `detached: true`,
- * all stdio ignored, `unref()` — so the child is its own process-group leader and
+ * stdin ignored, stdout and stderr appended to `<log-dir>/<run>.log` when the
+ * shift resolved a log directory (and ignored when it did not), `unref()` — so
+ * the child is its own process-group leader and
  * survives the parent's death (SP5-verified kernel reparenting). The shift meters
  * and hands off; the child self-leases (C5). Both ids ride the argv as the
  * composite `<workflow>/<run>` order-id `owenloop work exec` parses, and `--origin`
@@ -18,8 +20,10 @@
  * focused lifecycle regression uses harmless local children.
  */
 import { spawn } from 'node:child_process';
+import { closeSync, openSync } from 'node:fs';
 
 import { resolveOwenloopBin } from '../owenloop-bin.ts';
+import { runLogFile } from './logretention.ts';
 
 export { resolveOwenloopBin } from '../owenloop-bin.ts';
 
@@ -70,9 +74,65 @@ export interface SpawnResult {
 /** The spawn seam. Injected; faked in tests. */
 export type Spawner = (spec: SpawnSpec) => SpawnResult;
 
+/**
+ * Where a detached worker's own stdout and stderr are appended, when the shift
+ * has a log directory. `dir` absent ⇒ workers stay `stdio: ['ignore','ignore',
+ * 'ignore']`, exactly as before this option existed.
+ */
+export interface WorkerLogOptions {
+  /** The resolved log directory. `<dir>/<run>.log` is the destination. */
+  dir: string;
+  /** One-time failure report sink for a log that could not be opened. */
+  err?: (line: string) => void;
+}
+
+/**
+ * Open one worker's log for appending, or give up and return `undefined`.
+ *
+ * A LOG THAT WILL NOT OPEN MUST NEVER FAIL AN ORDER. A full disk, a read-only
+ * directory, or a path an operator deleted underneath the shift costs
+ * observability for that worker and nothing else: the caller falls back to
+ * `'ignore'` on slots 1 and 2 and dispatches anyway.
+ *
+ * `report` is the caller's LATCHED sink — see `createDefaultSpawner`. This
+ * function reports on every failure it sees; the latch that turns that into one
+ * line per shift lives with the spawner, which is the thing whose lifetime the
+ * latch is scoped to.
+ *
+ * MODE 0600, OWNER ONLY. A worker runs authored workflow content, so its
+ * stdout and stderr are attacker-influenceable data and may contain whatever a
+ * step printed — including a token a step echoed. `exec/loop.ts` already writes
+ * its agent-produced artifact JSON with `mode: 0o600` for exactly this reason;
+ * a raw worker log is the same data class and strictly less filtered. Without
+ * an explicit mode `openSync` creates 0666 & ~umask, which is 0644 under the
+ * usual 022 — readable by every local account.
+ *
+ * THE MODE APPLIES ONLY WHEN THE FILE IS CREATED. Append mode never re-chmods,
+ * so a `<run>.log` left behind by a build from before this became explicit
+ * keeps its old permissions. That is deliberate: silently tightening a file an
+ * operator may have already handed to an uploader account is a worse surprise
+ * than a stale-permission file the operator can fix with one `chmod`.
+ */
+function openWorkerLog(path: string, report: (line: string) => void): number | undefined {
+  try {
+    return openSync(path, 'a', 0o600);
+  } catch (e) {
+    report(
+      `owenloop shift: could not open worker log ${path}: ${err(e)} — dispatching with its output discarded`,
+    );
+    return undefined;
+  }
+}
+
+function err(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 /** Safe, bounded metadata emitted when a detached worker fails. Detached
- * worker stderr is not attached to Shift: agent-run output is untrusted, and a
- * parent-owned pipe can kill either worker with EPIPE after Shift exits. */
+ * worker stderr is not attached to Shift as a PIPE: agent-run output is
+ * untrusted, and a parent-owned pipe can kill either worker with EPIPE after
+ * Shift exits. It is appended to a per-run FILE instead — see
+ * `createDefaultSpawner`. */
 export interface WorkerFailure {
   workflow: string;
   run: string;
@@ -87,11 +147,27 @@ export interface WorkerFailure {
 
 export type WorkerFailureReporter = (failure: WorkerFailure) => void;
 
+/**
+ * The stdio topology of a detached worker.
+ *
+ * Slot 0 is always `'ignore'`: a worker reads nothing. Slots 1 and 2 are either
+ * both `'ignore'` (no log destination resolved, or opening it failed) or both
+ * the SAME descriptor number — one file opened once and handed to stdout and
+ * stderr together, which is exactly shell `2>&1`.
+ */
+export type WorkerStdio = ['ignore', 'ignore', 'ignore'] | ['ignore', number, number];
+
 /** The fully-resolved spawn arguments — pure data, asserted directly in tests. */
 export interface SpawnPlan {
   command: string;
   args: string[];
-  options: { detached: true; stdio: ['ignore', 'ignore', 'ignore']; env: NodeJS.ProcessEnv };
+  options: { detached: true; stdio: WorkerStdio; env: NodeJS.ProcessEnv };
+  /**
+   * Absolute path this worker's stdout and stderr should be appended to, when a
+   * log directory is configured. A PATH, never a descriptor: `buildSpawnPlan`
+   * stays pure, and `createDefaultSpawner` does the opening.
+   */
+  logFile?: string;
 }
 
 /**
@@ -122,6 +198,12 @@ export interface SpawnPlan {
  * inputs in precedence order (`--harness`, `OWENLOOP_HARNESS`, verified runtime
  * step, registered default). The Shift command has no operator-facing harness
  * flag, so there is no legitimate CLI override for this seam to carry.
+ *
+ * `logDir` (trailing, after `shiftId`, for the same reason) adds the worker's
+ * log DESTINATION to the plan as `<logDir>/<run>.log`. The plan still carries
+ * `stdio: ['ignore','ignore','ignore']`: opening the file is I/O, this function
+ * is pure, and `createDefaultSpawner` substitutes the descriptors. Omitted ⇒ no
+ * `logFile` key at all, and the plan is byte-identical to the pre-logging shape.
  */
 export function buildSpawnPlan(
   spec: SpawnSpec,
@@ -130,6 +212,7 @@ export function buildSpawnPlan(
   binPath: string,
   execPath: string = process.execPath,
   shiftId?: string,
+  logDir?: string,
 ): SpawnPlan {
   const role = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
   return {
@@ -152,6 +235,7 @@ export function buildSpawnPlan(
 	...(spec.startGate !== undefined ? { OWENLOOP_START_GATE: spec.startGate } : {}),
       },
     },
+    ...(logDir !== undefined && logDir !== '' ? { logFile: runLogFile(logDir, spec.run) } : {}),
   };
 }
 
@@ -169,10 +253,53 @@ export function createDefaultSpawner(
   binPath: string = resolveOwenloopBin(),
   shiftId?: string,
   onFailure?: WorkerFailureReporter,
+  logging?: WorkerLogOptions,
 ): Spawner {
+  // ONE report per shift, not one per dispatch. Every condition that stops a
+  // worker log from opening — a full disk, a read-only log directory, an
+  // operator deleting it underneath a running shift — PERSISTS across the
+  // dispatches that follow, so an unlatched report writes one stderr line per
+  // dispatch for as long as the shift runs. The event sink latches its own
+  // failure report the same way (`logsink.ts`); these are the two failure paths
+  // of the same feature and they make the operator the same promise.
+  let reportedOpenFailure = false;
+  const reportOpenFailure = (line: string): void => {
+    if (reportedOpenFailure) return;
+    reportedOpenFailure = true;
+    logging?.err?.(line);
+  };
   return (spec: SpawnSpec): SpawnResult => {
-    const plan = buildSpawnPlan(spec, origin, account, binPath, process.execPath, shiftId);
-    const child = spawn(plan.command, plan.args, plan.options);
+    const plan = buildSpawnPlan(spec, origin, account, binPath, process.execPath, shiftId, logging?.dir);
+    // Open the log ONCE and hand the SAME descriptor to slots 1 and 2. Opening
+    // it twice would create two independent file offsets, and the two streams
+    // would overwrite each other's bytes — silent corruption no unit test on the
+    // plan can catch. One descriptor used twice is exactly shell `2>&1`.
+    //
+    // ALWAYS APPEND, never truncate. A retried or re-armed run reuses its run
+    // id, and the prior attempt's output is precisely the evidence this feature
+    // exists to keep.
+    const logFd = plan.logFile === undefined
+      ? undefined
+      : openWorkerLog(plan.logFile, reportOpenFailure);
+    const options = logFd === undefined
+      ? plan.options
+      : { ...plan.options, stdio: ['ignore', logFd, logFd] as WorkerStdio };
+    let child;
+    try {
+      child = spawn(plan.command, plan.args, options);
+    } finally {
+      // The parent's copy must go once the child has inherited its own dup, and
+      // it must go even when `spawn` throws. A long-lived shift that leaked one
+      // descriptor per dispatch would eventually hit EMFILE and stop
+      // dispatching entirely.
+      if (logFd !== undefined) {
+        try {
+          closeSync(logFd);
+        } catch {
+          // Nothing useful remains to do with a descriptor that will not close.
+        }
+      }
+    }
     const kind = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
     const harness = kind === 'agent-run'
       ? (spec.harness ?? process.env['OWENLOOP_HARNESS'] ?? 'auto')
@@ -181,10 +308,21 @@ export function createDefaultSpawner(
     // start its own vendor process later, but reporting or guessing that
     // executable here would couple the neutral dispatcher to one adapter.
     const executable = `${process.execPath} ${binPath}`;
-    // No worker stdio slot is a parent-owned pipe. Once Shift exits, a detached
-    // worker may keep writing diagnostics without receiving EPIPE from a vanished
-    // reader. Agent-run stderr is untrusted; exec failures therefore use the same
-    // bounded generic lifecycle message rather than capturing worker output.
+    // THE INVARIANT: no worker stdio slot is ever a PARENT-OWNED PIPE. Once
+    // Shift exits, a detached worker may keep writing diagnostics, and a pipe
+    // whose reader has vanished kills the writer with EPIPE — losing the worker,
+    // not just its output.
+    //
+    // A FILE DESCRIPTOR IS NOT A PIPE, and slots 1 and 2 are now an appended
+    // file: it outlives the parent, needs no live reader, and cannot raise
+    // EPIPE. So the invariant holds unchanged while the bytes are kept.
+    //
+    // "Agent-run stderr is untrusted" also still holds, and still means what it
+    // always meant: worker output is never quoted back as a failure message.
+    // The bounded generic lifecycle message below is what a failure reports.
+    // Untrusted is a reason not to REPEAT those bytes, never a reason to
+    // discard them before an operator can read them — reading them is the whole
+    // point of `<run>.log`.
     let failureReported = false;
     const report = (exitStatus: number | null, signal: NodeJS.Signals | null, message: string): void => {
       if (failureReported || onFailure === undefined) return;

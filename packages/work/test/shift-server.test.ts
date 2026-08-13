@@ -11,10 +11,14 @@ import type { HubClient } from '../src/hub/client.ts';
 import type { ShiftLoop } from '../src/shift/loop.ts';
 import { createShiftDaemon, type ShiftDaemon } from '../src/shift/server.ts';
 import {
+  MAX_EVENT_QUEUE,
   MAX_RESPONSE_LINE_BYTES,
   OVERLAP_ERROR,
   RESPONSE_TRUNCATION_MARKER,
+  stampShiftEvent,
   type GateEvent,
+  type ShiftEvent,
+  type ShiftEventBody,
 } from '../src/shift/protocol.ts';
 import { requestShift } from '../src/shift/client.ts';
 import { rawShiftRequest } from './helpers/shift-client.ts';
@@ -37,6 +41,8 @@ interface Fixture {
   state: FakeState;
   pings: Array<Record<string, unknown>>;
   errors: string[];
+  /** Everything the daemon handed straight to the log sink, bypassing the FIFO. */
+  synthesized: ShiftEvent[];
 }
 
 let roots: string[] = [];
@@ -63,6 +69,8 @@ function fakeHub(pings: Array<Record<string, unknown>>, onPresence?: (request: R
 function fixture(options: {
   socketPath?: string;
   onPresence?: (request: Record<string, unknown>) => Promise<void> | void;
+  /** Throw from the log sink, to drive the overflow report's own failure path. */
+  synthesizedThrows?: boolean;
 } = {}): Fixture {
   const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-server-'));
   roots.push(root);
@@ -71,6 +79,7 @@ function fixture(options: {
   };
   const pings: Array<Record<string, unknown>> = [];
   const errors: string[] = [];
+  const synthesized: ShiftEvent[] = [];
   const loop = {
     run: () => new Promise<number>((resolve) => { state.resolveRun = resolve; }),
     stop: () => {
@@ -101,11 +110,28 @@ function fixture(options: {
     startedAt: 99,
     shiftId: 'shf_test',
     err: (line) => errors.push(line),
+    onSynthesized: (event) => {
+      if (options.synthesizedThrows === true) throw new Error('sink exploded');
+      synthesized.push(event);
+    },
   });
   const run = daemon.run();
-  const value = { root, socketPath, daemon, run, state, pings, errors };
+  const value = { root, socketPath, daemon, run, state, pings, errors, synthesized };
   fixtures.push(value);
   return value;
+}
+
+/**
+ * Stamp an event body with the `{ts, shift, shiftId}` envelope every `ShiftEvent`
+ * now carries.
+ *
+ * In production the loop's `emit()` stamps; here the loop is a fake, so the test
+ * stamps with the SAME identity the fixture gives the daemon (`now: () => 1234`,
+ * shift name `box`, id `shf_test`). Using the fixture's own values is what makes
+ * a stamped expectation comparable to what the daemon returns.
+ */
+function ev(body: ShiftEventBody): ShiftEvent {
+  return stampShiftEvent(body, { name: 'box', id: 'shf_test' }, 1234);
 }
 
 async function waitForPath(path: string): Promise<void> {
@@ -192,19 +218,37 @@ test('status, atomic clock-in validation, attendance, typed gate event drain, an
   assert.equal('name' in clocked && clocked.name, 'shift-b');
   assert.deepEqual(f.state.serveCrews, ['beta']);
 
-  const failed = { type: 'failed' as const, workflow: 'wf1', run: 'r1', step: 's', kind: 'exec' as const, message: 'boom' };
-  const gate: GateEvent = {
+  const failed = ev({ type: 'failed', workflow: 'wf1', run: 'r1', step: 's', kind: 'exec', message: 'boom' });
+  const gate = ev({
     type: 'gate',
     workflow: 'wf_gate',
     run: 'run_gate',
     name: 'approval',
     question: 'Should the gate continue?',
-  };
+  } satisfies GateEvent);
   f.daemon.onEvent(failed);
   f.daemon.onEvent(gate);
   const attended = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
   assert.deepEqual('events' in attended && attended.events, [failed, gate]);
   assert.equal(f.state.attended, 1234);
+
+  // THE DEEPEQUAL ABOVE CANNOT SEE THE ENVELOPE. `ev()` stamps its expectation
+  // with the very `stampShiftEvent` the daemon stamps with, so deleting `ts`,
+  // `shift` or `shiftId` from `protocol.ts` changes BOTH sides of that
+  // comparison at once and it stays green — it pins the BODY, not the wire
+  // contract. These three fields are what a consumer correlates and orders
+  // records by, so spell them out as literals this file owns. 1234 is the
+  // fixture clock, which `new Date(1234).toISOString()` renders as 1.234s past
+  // the epoch.
+  const drained = 'events' in attended ? attended.events : [];
+  assert.deepEqual(
+    drained.map((event) => ({ ts: event.ts, shift: event.shift, shiftId: event.shiftId })),
+    [
+      { ts: '1970-01-01T00:00:01.234Z', shift: 'box', shiftId: 'shf_test' },
+      { ts: '1970-01-01T00:00:01.234Z', shift: 'box', shiftId: 'shf_test' },
+    ],
+    'every drained record carries the full envelope on the wire',
+  );
 
   const started = Date.now();
   const timeout = await requestShift(f.socketPath, { op: 'next', wait_ms: 20 });
@@ -224,7 +268,17 @@ test('only one next parks, overlap preserves exact error, and end wakes the park
   const ending = requestShift(f.socketPath, { op: 'end' });
   const firstResponse = await first.response;
   assert.equal('events' in firstResponse, true);
-  if ('events' in firstResponse) assert.deepEqual(firstResponse.events, [{ type: 'ended' }]);
+  if ('events' in firstResponse) {
+    assert.deepEqual(firstResponse.events, [ev({ type: 'ended' })]);
+    // Same tautology as above, and it matters more here: `ended` is the record
+    // the daemon itself mints to release a parked client, so its envelope is
+    // stamped on a path no loop `emit()` covers.
+    assert.deepEqual(
+      firstResponse.events.map((event) => ({ ts: event.ts, shift: event.shift, shiftId: event.shiftId })),
+      [{ ts: '1970-01-01T00:00:01.234Z', shift: 'box', shiftId: 'shf_test' }],
+      'the daemon-minted ended record carries the full envelope on the wire',
+    );
+  }
   assert.deepEqual(await ending, { ok: true, ended: true });
   assert.equal(await f.run, 0);
   assert.equal(f.state.stopped, true);
@@ -234,7 +288,7 @@ test('event FIFO is bounded at 1000 entries and drops oldest entries with a warn
   const f = fixture();
   await waitForPath(f.socketPath);
   for (let i = 0; i < 1_005; i++) {
-    f.daemon.onEvent({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message: 'x' });
+    f.daemon.onEvent(ev({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message: 'x' }));
   }
   const response = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
   assert.equal('events' in response, true);
@@ -246,6 +300,84 @@ test('event FIFO is bounded at 1000 entries and drops oldest entries with a warn
   await stop(f);
 });
 
+test('queue overflow reports to the log sink at each power of ten, never through the FIFO', async () => {
+  const f = fixture();
+  await waitForPath(f.socketPath);
+
+  // 1,000 events fill the FIFO without evicting anything; each of the next 100
+  // evicts exactly one. So `dropped` climbs 1..100 and crosses three powers of
+  // ten: 1, 10, 100.
+  const total = MAX_EVENT_QUEUE + 100;
+  for (let i = 0; i < total; i++) {
+    f.daemon.onEvent(ev({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message: 'x' }));
+  }
+
+  // Every eviction still writes the free-text warning — that line is unchanged
+  // and unthrottled; only the structured record is rate-limited.
+  assert.equal(f.errors.length, 100);
+  assert.deepEqual([...new Set(f.errors)], ['shift event queue overflow — dropping oldest event']);
+
+  // Three records, at cumulative totals 1, 10 and 100 — not one per eviction,
+  // and not just the first.
+  assert.deepEqual(f.synthesized, [
+    ev({ type: 'event-queue-overflow', dropped: 1 }),
+    ev({ type: 'event-queue-overflow', dropped: 10 }),
+    ev({ type: 'event-queue-overflow', dropped: 100 }),
+  ]);
+  // Spelled out, because deepEqual against `ev()` passes even if BOTH sides
+  // lose the envelope: each record carries `{ts, shift, shiftId}`.
+  for (const record of f.synthesized) {
+    assert.equal(record.ts, new Date(1234).toISOString());
+    assert.equal(record.shift, 'box');
+    assert.equal(record.shiftId, 'shf_test');
+  }
+
+  // The overflow record went to the sink ONLY. Had it been routed through
+  // enqueue(), it would sit in the FIFO and be drained here — and it would have
+  // evicted a real event to make room, under exactly the load that overflowed.
+  const response = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  assert.equal('events' in response, true);
+  if ('events' in response) {
+    assert.equal(response.events.length, MAX_EVENT_QUEUE);
+    assert.equal(response.events.some((event) => event.type === 'event-queue-overflow'), false);
+    // Drop-oldest, so the survivors are the LAST 1,000 of the 1,100 pushed.
+    assert.equal((response.events[0] as { run?: string }).run, 'r100');
+    assert.equal((response.events.at(-1) as { run?: string }).run, `r${total - 1}`);
+  }
+  await stop(f);
+});
+
+test('a throwing log sink cannot kill the overflow path or the daemon', async () => {
+  const f = fixture({ synthesizedThrows: true });
+  await waitForPath(f.socketPath);
+
+  for (let i = 0; i < MAX_EVENT_QUEUE + 10; i++) {
+    f.daemon.onEvent(ev({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message: 'x' }));
+  }
+
+  // The sink threw on both attempted records (dropped 1 and dropped 10). The
+  // failure is reported as free text — turning it into an event would write it
+  // to the sink that just failed.
+  const sinkFailures = f.errors.filter((line) => line.startsWith('shift event sink failed'));
+  assert.deepEqual(sinkFailures, [
+    'shift event sink failed: sink exploded (continuing)',
+    'shift event sink failed: sink exploded (continuing)',
+  ]);
+  // Every eviction was still warned about, and every event still reached the FIFO.
+  assert.equal(f.errors.length - sinkFailures.length, 10);
+
+  // Still serving: the throw propagated out of neither onEvent nor the socket.
+  const response = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
+  assert.equal('events' in response, true);
+  if ('events' in response) assert.equal(response.events.length, MAX_EVENT_QUEUE);
+  assert.deepEqual(await requestShift(f.socketPath, { op: 'status' }), {
+    // `attended_at` is 1234, not null: the `next` above was served, which is
+    // itself the proof the daemon survived the throwing sink.
+    name: 'box', serve_crews: ['alpha'], cap: 3, free: 3, running: 0, attended_at: 1234, started_at: 99,
+  });
+  await stop(f);
+});
+
 test('a legal 1,000-event response with 200-character steps fits the client ceiling', async () => {
   const f = fixture();
   await waitForPath(f.socketPath);
@@ -253,7 +385,7 @@ test('a legal 1,000-event response with 200-character steps fits the client ceil
   const run = `run_${'r'.repeat(32)}`;
   const step = 's'.repeat(200);
   for (let i = 0; i < 1_000; i++) {
-    f.daemon.onEvent({ type: 'dispatched', workflow, run: `${run}_${i}`, step, kind: 'agent-run', pid: 123456 });
+    f.daemon.onEvent(ev({ type: 'dispatched', workflow, run: `${run}_${i}`, step, kind: 'agent-run', pid: 123456 }));
   }
   const response = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
   assert.equal('events' in response, true);
@@ -269,7 +401,7 @@ test('size-aware event drain retains events that exceed one response and preserv
   await waitForPath(f.socketPath);
   const message = 'é'.repeat(150_000);
   for (let i = 0; i < 3; i++) {
-    f.daemon.onEvent({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message });
+    f.daemon.onEvent(ev({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message }));
   }
 
   const first = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
@@ -291,9 +423,9 @@ test('size-aware event drain retains events that exceed one response and preserv
 test('an oversized single event is delivered once with an explicit truncation marker', async () => {
   const f = fixture();
   await waitForPath(f.socketPath);
-  f.daemon.onEvent({
+  f.daemon.onEvent(ev({
     type: 'failed', workflow: 'wf', run: 'r0', step: 's', kind: 'exec', message: '💥'.repeat(200_000),
-  });
+  }));
 
   const response = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
   assert.equal('events' in response, true);

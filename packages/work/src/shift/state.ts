@@ -24,7 +24,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { basename, join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 
 export const DEFAULT_RESERVATION_MAX_AGE_MS = 2 * 60_000;
 
@@ -67,16 +67,40 @@ export interface ReservedChild {
   gatePath: string;
 }
 
+/**
+ * Where this shift's `<run>.json` in-flight records live.
+ *
+ * ALWAYS ABSOLUTE. `--state-dir ./state` is a legal thing for an operator to
+ * type, and while only this process joined paths onto it the relative spelling
+ * was harmless. It stopped being harmless when the log-owner registry
+ * (`logretention.ts`) began WRITING this string into a file that a DIFFERENT
+ * shift process, with a DIFFERENT working directory, reads back and probes for
+ * `<run>.json`: `./state` resolved against the wrong cwd finds no record, the
+ * in-flight gate concludes the run finished, and a live worker's log is
+ * unlinked out from under it. `resolve()` here is what makes the writer, the
+ * reader and the probe agree on ONE spelling, and it is also what keeps
+ * `ownerClaimName`'s hash stable so one shift writes one claim file rather than
+ * one per cwd it was ever started from.
+ */
 export function resolveStateDir(env: Record<string, string | undefined>, override?: string): string {
-  if (override !== undefined && override.trim() !== '') return override;
+  if (override !== undefined && override.trim() !== '') return resolve(override);
   const xdg = env['XDG_STATE_HOME'];
-  if (xdg !== undefined && xdg.trim() !== '') return join(xdg, 'owenloop', 'exec');
+  if (xdg !== undefined && xdg.trim() !== '') return resolve(xdg, 'owenloop', 'exec');
   const home = env['HOME'];
-  if (home !== undefined && home.trim() !== '') return join(home, '.local', 'state', 'owenloop', 'exec');
+  if (home !== undefined && home.trim() !== '') return resolve(home, '.local', 'state', 'owenloop', 'exec');
   throw new Error('cannot locate a state directory: set OWENLOOP_STATE_DIR, XDG_STATE_HOME, or HOME');
 }
 
-function safeRun(run: string): string {
+/**
+ * The run id as it appears in a filename, with every character a path could
+ * misread replaced.
+ *
+ * EXPORTED because the worker log `<run>.log` correlates to the in-flight
+ * record `<run>.json` BY BASENAME. Two sanitizers would be two basenames, and
+ * the correlation an operator and a future uploader both rely on would silently
+ * stop holding for any run id containing an unusual character.
+ */
+export function safeRun(run: string): string {
   return run.replace(/[^A-Za-z0-9_.-]/g, '_');
 }
 

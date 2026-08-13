@@ -511,16 +511,23 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         // legitimately have no workdir to resolve, and a throw here would break
         // every delivery run the moment it shipped.
         //
-        // KNOWN LIMIT, do not read this warning as delivered under a shift.
-        // `opts.err` is this process's stderr, and `buildSpawnPlan`
-        // (`src/shift/spawn.ts`) launches every worker with
-        // `stdio: ['ignore', 'ignore', 'ignore']`, so a shift-dispatched exec
-        // writes this line to `/dev/null`. It is observable only when
-        // `owenloop work exec` is run by hand. Routing it to a channel a shift
-        // operator reads is filed separately and is a PREREQUISITE for turning
-        // this into a throw — an unseen warning is not a migration notice.
-        // `docs/bundles.md` ("Working directory for command steps") states the
-        // same limit for bundle authors.
+        // WHERE THIS LINE ACTUALLY GOES. `opts.err` is this process's stderr.
+        // Run by hand, that is the operator's terminal. Dispatched by
+        // `owenloop shift start`, `createDefaultSpawner` (`src/shift/spawn.ts`)
+        // now attaches fd 1 and fd 2 to `<log-dir>/<run>.log`, so this warning
+        // is on disk under the run id it belongs to and outlives both the
+        // worker and the shift. See `docs/shift-logs.md`.
+        //
+        // It was previously discarded: every worker launched with
+        // `stdio: ['ignore','ignore','ignore']`, so a shift-dispatched exec
+        // wrote this line to `/dev/null`. That was the blocker on turning this
+        // warning into a throw — an unseen warning is not a migration notice.
+        // The delivery half is now done; the enforcement release is still a
+        // separate decision. `docs/bundles.md` ("Working directory for command
+        // steps") tracks the same state for bundle authors.
+        //
+        // The RECEIPT still does not carry it: the receipt captures the
+        // *command's* streams, and this line is the exec worker's own.
         const cwd = order.workdir ?? opts.cwd;
         if (order.workdir === undefined) {
           opts.err(

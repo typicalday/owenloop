@@ -179,7 +179,7 @@ The execution settings file is `$XDG_CONFIG_HOME/owenloop/settings.json` when
 ```text
 owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]
 [--cap <n>] [--max-agents <n>] [--poll-interval <ms>] [--once]
-[--cache-dir <p>] [--state-dir <p>]
+[--cache-dir <p>] [--state-dir <p>] [--log-dir <p>] [--log-max-age <ms>]
 ```
 
 At least one named crew is required unless `--all` is present. `--all` and
@@ -199,6 +199,16 @@ one loop sweep and exits instead of keeping the foreground daemon running.
 | `--once` | run one loop sweep and exit; without it, keep the daemon in the foreground |
 | `--cache-dir <p>` | cache root; precedence is flag, then `OWENLOOP_CACHE_DIR`, then `settings.cacheDir`, then `$XDG_CACHE_HOME/owenloop`, then `$HOME/.cache/owenloop` |
 | `--state-dir <p>` | socket and child-state root; precedence is flag, then `OWENLOOP_STATE_DIR`, then `settings.stateDir`, then `$XDG_STATE_HOME/owenloop/exec`, then `$HOME/.local/state/owenloop/exec`; the socket is `shift.sock` inside this directory |
+| `--log-dir <p>` | where `shift.log` and each `<run>.log` are written; precedence is flag, then `OWENLOOP_SHIFT_LOG_DIR`, then `settings.shiftLogDir`, then the resolved state directory |
+| `--log-max-age <ms>` | worker-log retention, swept once at startup; precedence is flag, then `OWENLOOP_SHIFT_LOG_MAX_AGE_MS`, then `settings.shiftLogMaxAgeMs`, then `1209600000` (14 days). `0` reaps every completed run's log at the next startup; there is no value that disables the sweep, and `shift.log` is never reaped |
+
+**On-disk logs.** A running shift appends its dispatch record to
+`<log-dir>/shift.log` as JSON Lines, and gives each dispatched worker's stdout
+and stderr their own `<log-dir>/<run>.log`. Both files outlive the shift
+process. A log directory that cannot be created costs the logs, never the
+dispatch: the shift reports it once on stderr and serves with logging disabled.
+Full field-by-field contract, retention rules, and uploader notes in
+[`docs/shift-logs.md`](shift-logs.md).
 
 A clean start or `--once` completion exits `0`. `owenloop shift --help` also
 exits `0`. Runtime failures such as credential reads or socket/runtime setup
@@ -260,13 +270,45 @@ returns promptly when an event is queued, the wait expires, or the shift
 explicitly ends. A normal timeout exits `0` and prints the current capacity
 object, for example `{ "cap": 3, "free": 3, "running": 0, "events": [] }`.
 Successful responses use the same capacity shape and may include queued event
-objects. For `dispatched`, `reaped`, and `failed`, `kind` is either `exec` or
-`agent-run`:
+objects.
+
+**Every event carries the same three envelope fields**, in addition to whatever
+its own `type` defines:
+
+| field | meaning |
+|---|---|
+| `ts` | ISO-8601 UTC with milliseconds, e.g. `2026-08-13T18:04:11.412Z` |
+| `shift` | the shift's human name — `clock_in` can change it between events |
+| `shiftId` | `shf_<uuid>`, the shift process incarnation; stable for the process |
+
+The envelope is omitted from the per-type examples below for brevity; it is
+never omitted on the wire. For `dispatched`, `reaped`, and `failed`, `kind` is
+either `exec` or `agent-run`:
 
 - `dispatched`: `{ "type": "dispatched", "workflow": "...", "run": "...", "step": "...", "kind": "exec", "pid": 123 }`
 - `reaped`: `{ "type": "reaped", "workflow": "...", "run": "...", "kind": "exec", "pid": 123 }`
 - `failed`: `{ "type": "failed", "workflow": "...", "run": "...", "step": "...", "kind": "exec", "message": "..." }`
+- `bundle-miss`: `{ "type": "bundle-miss", "workflow": "...", "def": "..." }` — a legacy order named a def with no cached bundle, so it was left for hub pickup
+- `order-dropped`: `{ "type": "order-dropped", "workflow": "...", "run": "...", "step": "...", "reason": "unsupported-worker", "message": "..." }` — the shift refused one order. Match on `reason` (`malformed-digest`, `malformed-worker`, `unsupported-worker`, `verification-failed`, `metadata-unavailable`); display `message`
 - `ended`: `{ "type": "ended" }`, delivered to a parked `next` when `shift end` explicitly shuts down the daemon
+
+Every event above is also appended to `<log-dir>/shift.log` as JSON Lines, which
+is how they survive the daemon. **Four further record types exist in
+`shift.log` and are never delivered over the socket** — `parked`, `capacity`,
+`hub-error`, and `event-queue-overflow`.
+
+An idle `shift next` must block until there is work to report, and each of those
+four would satisfy it with news that no work moved: a startup record, a report
+that the shift is full, a failed call to the hub, or a record about the socket
+queue itself. `parked` and `capacity` are also redundant on the wire — the
+response above already carries live `cap`, `free`, and `running`, which is
+exactly what a `capacity` record restates. `hub-error` is level-triggered at the
+poll interval, so an unreachable hub would otherwise fill the 1000-slot socket
+FIFO and evict the `dispatched`, `failed` and `reaped` records a parked client
+is actually waiting for. In `shift.log`, which is append-only and unbounded, all
+four are load-bearing: they are the only way to tell an idle shift from a
+saturated one, and the only record of every failed hub call. See
+[`docs/shift-logs.md`](shift-logs.md).
 
 `gate` is a reserved protocol shape for a future local representation of a
 pending hub gate. Production code does not construct live hub gate events yet;

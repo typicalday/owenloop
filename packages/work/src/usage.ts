@@ -135,6 +135,14 @@ Options:
                                       bypassed (NOT the primary path)
                OWENLOOP_CACHE_DIR     cache root
                OWENLOOP_STATE_DIR     shift in-flight state dir
+               OWENLOOP_SHIFT_LOG_DIR dir for the shift's shift.log and each
+                                      worker's <run>.log; below --log-dir, above
+                                      settings.shiftLogDir, default the state dir
+               OWENLOOP_SHIFT_LOG_MAX_AGE_MS
+                                      how long a worker's <run>.log is kept, in ms;
+                                      below --log-max-age, above
+                                      settings.shiftLogMaxAgeMs, default 14 days.
+                                      Worker logs only — shift.log is never reaped
                OWENLOOP_SESSION       hold session-holder tag / release drain target
                OWENLOOP_SHIFT_ID  dispatching Shift's self-declared id for
                                       hold/exec/agent-run's --shift (advisory
