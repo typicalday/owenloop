@@ -67,11 +67,11 @@
         "required": ["path", "judgmentRejects", "schemaRejects", "reasons"],
         "properties": {
           "path": { "type": "string" },
-	  "version": {
-	    "type": "integer",
-	    "minimum": 0,
-	    "description": "Current committed artifact version captured by the engine at claim time."
-	  },
+          "version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Target version this claim's next successful producer commit lands (committed version + 1), issued by the engine inside the claim transaction. A producer signs this version in its submission proof and the downstream consumer checks the proof against it."
+          },
           "judgmentRejects": { "type": "integer", "minimum": 0 },
           "schemaRejects": { "type": "integer", "minimum": 0 },
           "reasons": {

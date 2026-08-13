@@ -94,7 +94,9 @@ function commandOrder(o: OrderOpts = {}): GetOrderResponse {
       ...(o.judge !== undefined ? { judge: o.judge } : {}),
       defDigest,
       consumes: {},
-      owes: paths.map((path) => ({ path, version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] })),
+      // `version` is the hub-issued TARGET for the next commit, so a
+      // never-produced output's first target is 1, not 0.
+      owes: paths.map((path) => ({ path, version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] })),
     },
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
   };
@@ -417,7 +419,7 @@ test('exec passes bundle provenance with the parent environment and removes it w
   }
 });
 
-test('exec producer submit remains unsigned without a retry-safe hub-issued version', async () => {
+test('exec producer submit signs its receipt at the hub-issued owed target version', async () => {
   const fr = fakeRunner();
   const response = commandOrder({ command: 'make signed-build' });
   response.order!.consumedFingerprint = { input: 4 };
@@ -433,8 +435,19 @@ test('exec producer submit remains unsigned without a retry-safe hub-issued vers
   fr.resolve(result(0, { outputHash: 'sha256:signed-receipt' }));
   assert.equal(await p, 'submitted');
 
-  assert.equal(submits[0]!.proof, undefined);
-  assert.equal(sshCalls.length, 0, 'claim-time owes[].version must not reach the signer');
+  const proof = submits[0]!.proof;
+  assert.equal(typeof proof, 'string');
+  assert.ok(sshCalls.length > 0, 'the hub-issued target reaches the signer');
+  const verified = await dsseVerifySubmission(JSON.parse(proof as string), {
+    async verify() {
+      return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
+    produced: Array<{ artifact: string; version: number }>;
+  };
+  assert.equal(record.produced[0]!.artifact, 'out');
+  assert.equal(record.produced[0]!.version, 1);
 });
 
 test('exec judge submit falls back unsigned when the machine key is missing', async () => {

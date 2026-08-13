@@ -280,7 +280,29 @@ test('hold-MCP repeated judge approval signs the same fingerprinted version', as
   assert.deepEqual(versions, [7, 7]);
 });
 
-test('hold-MCP producer retry after a lost response remains unsigned instead of guessing the next version', async () => {
+/** Decode each submitted proof and return the artifact version it signed. */
+async function signedVersions(proofs: Array<string | undefined>): Promise<Array<number | undefined>> {
+  const versions: Array<number | undefined> = [];
+  for (const proof of proofs) {
+    if (proof === undefined) {
+      versions.push(undefined);
+      continue;
+    }
+    const verified = await dsseVerifySubmission(JSON.parse(proof), {
+      async verify() {
+	return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
+      },
+    });
+    const record = JSON.parse(verified.payloadBytes.toString('utf8')) as { produced: Array<{ version: number }> };
+    versions.push(record.produced[0]!.version);
+  }
+  return versions;
+}
+
+test('hold-MCP producer retry after a lost response re-signs the same hub-issued target', async () => {
+  // The target rides the immutable order, so a retry of the SAME claim signs
+  // the SAME version. Nothing is guessed forward to compensate for the lost
+  // response — that is what makes the retry safe to repeat.
   const { hub, calls } = mockHub({
     getOrder: producerOrderResponse(),
     submit: [new Error('response lost'), { outcome: 'green', closed: false }],
@@ -300,10 +322,14 @@ test('hold-MCP producer retry after a lost response remains unsigned instead of 
 
   const requests = calls.filter((call) => call.verb === 'submit').map((call) => call.arg as { proof?: string });
   assert.equal(requests.length, 2);
-  assert.ok(requests.every((request) => request.proof === undefined));
+  assert.deepEqual(await signedVersions(requests.map((request) => request.proof)), [4, 4]);
 });
 
-test('hold-MCP unsigned producer commit is not signed later from the same stale claim packet', async () => {
+test('hold-MCP signs a later producer submit at the claim target, never at an advanced guess', async () => {
+  // The first submit goes out unsigned because no machine key resolves yet.
+  // When a key appears mid-claim the next submit signs the target the hub
+  // issued for THIS claim — it does not advance the version to account for the
+  // earlier unsigned commit, which would be a process-local guess.
   let keyAvailable = false;
   const keys: SubmissionKeyManager = {
     ...signingKeys(),
@@ -324,10 +350,10 @@ test('hold-MCP unsigned producer commit is not signed later from the same stale 
 
   const requests = calls.filter((call) => call.verb === 'submit').map((call) => call.arg as { proof?: string });
   assert.equal(requests.length, 2);
-  assert.ok(requests.every((request) => request.proof === undefined));
+  assert.deepEqual(await signedVersions(requests.map((request) => request.proof)), [undefined, 4]);
 });
 
-test('hold-MCP restart does not turn immutable producer claim metadata into version authority', async () => {
+test('hold-MCP restart re-reads the hub-issued target instead of any process-local version state', async () => {
   const { hub, calls } = mockHub({ getOrder: producerOrderResponse(), submit: { outcome: 'green', closed: false } });
   const signingDeps = {
     origin: 'https://hub.example.test',
@@ -343,7 +369,8 @@ test('hold-MCP restart does not turn immutable producer claim metadata into vers
 
   const requests = calls.filter((call) => call.verb === 'submit').map((call) => call.arg as { proof?: string });
   assert.equal(requests.length, 2);
-  assert.ok(requests.every((request) => request.proof === undefined));
+  // A fresh process holds no version state; both reads see the hub's target.
+  assert.deepEqual(await signedVersions(requests.map((request) => request.proof)), [4, 4]);
 });
 
 // W7/D4: when the bound holder is known, submit carries it through unchanged

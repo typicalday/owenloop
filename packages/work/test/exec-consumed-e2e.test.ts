@@ -317,7 +317,7 @@ test('command e2e: unsigned feedback does not block a command with signed consum
   }
 });
 
-test('command e2e: immutable producer claim metadata cannot authorize a signed receipt proof', async () => {
+test('command e2e: a non-positive owed version cannot authorize a signed receipt proof', async () => {
   const fixtureData = await fixture();
   const marker = COMMAND_MARKER;
   rmSync(marker, { force: true });

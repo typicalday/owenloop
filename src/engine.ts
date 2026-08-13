@@ -1738,7 +1738,17 @@ export class Engine {
       const a = arts.get(p);
       return {
         path: p,
-	version: a?.version ?? 0,
+        // The TARGET version this claim's next successful producer commit will
+        // land, not the currently-committed one: `green()` writes
+        // `art.version + 1`, so that is the version a consumer will later see
+        // and check a submission proof against. Issued by the engine inside the
+        // claim transaction and persisted with the immutable order, so every
+        // retry of the same claim reads the same target. Refusal paths that
+        // leave the run open (schema-reject) do NOT bump the artifact, so the
+        // target stays correct across in-claim retries; a path that does commit
+        // closes the run, and a stale target then fails the consumer's version
+        // check — a refusal, never an admitted unverified value.
+        version: (a?.version ?? 0) + 1,
         judgmentRejects: a?.judgmentRejects ?? 0,
         schemaRejects: a?.schemaRejects ?? 0,
         reasons: a?.reasons ?? [],

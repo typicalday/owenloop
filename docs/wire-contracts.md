@@ -85,12 +85,24 @@ lowercase SHA-256 `valueDigest`.
 A driver signs only when the driver can name the exact artifact version without
 inferring mutable coordinator state. A judge approval can use the judged path's
 claim-time `consumedFingerprint` entry because the approval attests that existing
-version and does not allocate a new version. A producer submit requires an exact
-target version issued by a retry-safe hub protocol. Immutable `owes[].version`
-metadata is not sufficient: the metadata becomes stale after a refinement, a
-committed submit whose response is lost, an unsigned commit, or a client process
-restart. Without explicit producer-version authority, built-in clients submit
-the producer value without a proof rather than sign a process-local guess.
+version and does not allocate a new version. A producer submit uses
+`owes[].version`, the target version the hub issues for that owed output: the
+version the next successful commit lands (claim-time committed version + 1), and
+therefore the version the consumer supplies to `verifyConsumed` as
+`expectedVersion`.
+
+The target is retry-safe because the engine computes it inside the claim
+transaction and persists it with the immutable order. Every read of that claim
+returns the same number, so a refinement, a committed submit whose response was
+lost, an unsigned commit, or a client process restart cannot move it. Refusal
+paths that leave the run open do not bump the artifact, and a refinement is a
+new claim with a newly issued target. A stale target fails the consumer's
+version check — a refusal, never an admitted unverified value.
+
+A target counts as authoritative only when it is a positive integer, since the
+smallest commit a producer can land is v1. Given an absent target, a `0`, or a
+non-integer, built-in clients submit the producer value without a proof rather
+than sign a number the consumer is guaranteed to reject.
 
 A consuming driver verifies the envelope before trusting the value. The
 verified signer key must equal `producerKeyId`; the signed `produced[]` entry
@@ -111,19 +123,21 @@ follow-up, not hub-side trust.
 ### Deployed hub compatibility
 
 The schema above is the target wire contract, not evidence that every deployed
-hub carries every optional field. As of 2026-08-10, the production hub drops
-`consumedFingerprint`, `owes[].version`, `owes[].proof`, and `consumesProof` from
-served orders. The production REST and MCP submit paths also do not carry a
-client-supplied `proof` through hub-core. A current client therefore cannot claim
-that a submit proof was accepted, persisted beside a committed artifact version,
-or relayed to a downstream consumer.
+hub carries every optional field. As of 2026-08-12, hub-core projects
+`consumedFingerprint`, `owes[].proof`, and `consumesProof` onto served orders and
+persists a client-supplied submit `proof` beside the committed artifact. It still
+omits `owes[].version`, for two independent reasons: the pinned engine copy under
+`packages/engine-do/vendor/` predates the field, and the served-order projection
+in `packages/hub-core/src/reference-order.ts` allow-lists `path`,
+`judgmentRejects`, `schemaRejects`, `reasons`, and `proof` without it. Both must
+change, and the change must be deployed, before a served order names a target
+version.
 
 Client transport types keep these fields optional so one client remains
-compatible with both the deployed hub and a future version-aware hub. End-to-end
-proof support requires service changes: preserve all four order fields, accept
-and persist submit proofs, return proof-acceptance and committed-version data,
-and provide retry idempotency (running the same submission again changes
-nothing) that survives a lost response and client restart.
+compatible with both a pre-target-semantics hub and a version-aware hub. Against
+a hub that serves no `owes[].version`, a producer submit carries no proof, and a
+command step consuming that artifact refuses it — the hard rule for command
+steps is never relaxed to admit an unverified value.
 
 ## Publication record
 
@@ -288,8 +302,9 @@ as a literal `workdir:` or resolved by the engine from a consumed artifact's
 `defDigest` is a non-empty opaque reference. `inputs` and `outputs` are string
 arrays. `consumes` is an open artifact-path map; `spec` and `x` are opaque
 objects carried through without engine interpretation. `owes` contains the owed
-path, an optional claim-time `version`, judgment/schema rejection counters,
-reason entries, and an optional opaque `proof` string. `cause`, when present, is
+path, an optional target `version` (the version the next successful commit for
+that path lands, issued inside the claim transaction), judgment/schema rejection
+counters, reason entries, and an optional opaque `proof` string. `cause`, when present, is
 `inputsGreen`, `allGreen`, or `idle`.
 
 **Decision A — version cross-check without fingerprint recomputation.** The

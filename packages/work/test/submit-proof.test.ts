@@ -129,12 +129,72 @@ test('buildSubmitProof uses an explicit committed version when provided', async 
   assert.equal(record.produced[0]!.version, 9);
 });
 
-test('buildSubmitProof falls back unsigned when a producer has only immutable claim-time version metadata', async () => {
+test('buildSubmitProof signs a producer submit at the hub-issued owed target version', async () => {
   const warnings: string[] = [];
-  let signingCalls = 0;
   const proof = await buildSubmitProof({
     origin: ORIGIN,
     order: ORDER,
+    path: 'result',
+    value: { ok: true },
+    now: () => 1,
+    warn: (line) => warnings.push(line),
+    principalKeys: keysFor(),
+    sshProcess: fakeSshProcess([]),
+  });
+  assert.ok(proof !== undefined);
+  assert.deepEqual(warnings, []);
+  const envelope = JSON.parse(proof) as { payload: string };
+  const verified = await dsseVerifySubmission(envelope, {
+    async verify() {
+      return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as { produced: Array<{ version: number }> };
+  // ORDER.owes[0].version is the target the engine issued for this claim, not
+  // the currently-committed version — the producer signs it verbatim.
+  assert.equal(record.produced[0]!.version, 4);
+});
+
+test('buildSubmitProof picks the owed target for the submitted path, not the first owed entry', async () => {
+  const twoOutputs: OrderPacket = {
+    ...ORDER,
+    outputs: ['other', 'result'],
+    owes: [
+      { path: 'other', version: 7, judgmentRejects: 0, schemaRejects: 0, reasons: [] },
+      { path: 'result', version: 4, judgmentRejects: 0, schemaRejects: 0, reasons: [] },
+    ],
+  };
+  const proof = await buildSubmitProof({
+    origin: ORIGIN,
+    order: twoOutputs,
+    path: 'result',
+    value: { ok: true },
+    now: () => 1,
+    warn: () => {},
+    principalKeys: keysFor(),
+    sshProcess: fakeSshProcess([]),
+  });
+  assert.ok(proof !== undefined);
+  const envelope = JSON.parse(proof) as { payload: string };
+  const verified = await dsseVerifySubmission(envelope, {
+    async verify() {
+      return { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const };
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as { produced: Array<{ version: number }> };
+  assert.equal(record.produced[0]!.version, 4);
+});
+
+test('buildSubmitProof falls back unsigned when the hub issues no owed target version', async () => {
+  const warnings: string[] = [];
+  let signingCalls = 0;
+  const noTarget: OrderPacket = {
+    ...ORDER,
+    owes: ORDER.owes.map(({ version: _version, ...rest }) => rest),
+  };
+  const proof = await buildSubmitProof({
+    origin: ORIGIN,
+    order: noTarget,
     path: 'result',
     value: { ok: true },
     now: () => 1,

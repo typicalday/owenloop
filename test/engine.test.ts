@@ -111,6 +111,36 @@ test('a firing carries its consumed input handles, claim-time fingerprint, and o
   assert.deepEqual(planner.owes.map((w) => w.path), ['plan']);
 });
 
+test("an owed output's issued version is the target the consumer later checks a proof against", () => {
+  // The producer signs `owes[].version` into its submission proof; the consumer
+  // passes its own claim-time fingerprint to verifyConsumed as expectedVersion.
+  // Those two numbers must be the same one, which is why the engine issues the
+  // target (committed + 1) rather than the currently-committed version.
+  const { engine } = makeEngine([orderShapeDef()]);
+  const wf = engine.createInstance('ordershape', { provide: { proposal: { text: 'x' } } });
+
+  // a never-produced artifact sits at v0, so its first target is v1
+  const planner1 = fire(engine, wf, 'planner', 1000);
+  const target1 = planner1.owes.find((w) => w.path === 'plan')!.version;
+  assert.equal(target1, 1);
+  complete(engine, wf, planner1, { plan: 'v1' });
+
+  const runner1 = fire(engine, wf, 'runner', 2000);
+  assert.equal(runner1.consumedFingerprint!.plan, target1, 'the producer signs what the consumer checks');
+  complete(engine, wf, runner1, { result: 'ok' });
+
+  // a knock-back re-fires the producer under a NEW claim, which issues a fresh
+  // target — the stale one is never reused
+  engine.reject(wf, 'plan', 'runner', 'needs rework');
+  const planner2 = fire(engine, wf, 'planner', 3000);
+  const target2 = planner2.owes.find((w) => w.path === 'plan')!.version;
+  assert.equal(target2, target1 + 1);
+  complete(engine, wf, planner2, { plan: 'v2' });
+
+  const runner2 = fire(engine, wf, 'runner', 4000);
+  assert.equal(runner2.consumedFingerprint!.plan, target2);
+});
+
 test('a missing human input is not fireable, so no claim can emit a negative fingerprint version', () => {
   const missingInputDef = def(
     'missing-input',

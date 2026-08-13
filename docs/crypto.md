@@ -164,13 +164,29 @@ canonical JSON payload with `dsseSignSubmission` under the
 `owenloop-dsse-v1` namespace. The target `proof` request field is the serialized
 DSSE envelope for that one submitted artifact path.
 
-A judge approval may sign the existing judged version from the claim fingerprint.
-A producer submit must not infer a new version from immutable `owes[].version`
-or process-local state. The producer requires a retry-safe, hub-issued target
-version; without one, the driver submits without a proof and warns once per
-process. As of 2026-08-10, the production hub does not carry submit `proof`,
-proof acceptance, authoritative producer-version allocation, or downstream
-proof projection, so owenloop does not claim end-to-end production proof support.
+A judge approval may sign the existing judged version from the claim fingerprint,
+because the approval attests that version and does not allocate a new one.
+
+A producer submit signs `owes[].version`, the target version the hub issues for
+that owed output. The target is the version the next successful commit will
+land (claim-time committed version + 1) — exactly the version the downstream
+consumer passes to `verifyConsumed` as `expectedVersion`. It is never inferred
+from process-local state.
+
+Retry-safety is a property of where the target is computed, not of the client.
+The engine computes it inside the claim transaction and persists it with the
+immutable order, so every read of that claim — a reconnect, a retried submit
+after a lost response, a restarted holder — yields the same number. Engine
+refusal paths that leave the run open (a schema reject) do not bump the
+artifact, so the target survives in-claim retries; a refinement is a new claim
+and receives a newly issued target. A stale target fails the consumer's version
+check, which is a refusal, never an admitted unverified value.
+
+A target is authoritative only when it is a positive integer: the smallest
+commit any producer can land is v1. An absent target, a `0`, or a non-integer
+is treated as no authoritative metadata — the driver submits without a proof
+and warns once per process, rather than signing a number the consumer is
+guaranteed to reject.
 
 The engine does not sign: local `Engine.green` is synchronous and commits inside
 a synchronous store transaction. `owenloop green` remains deliberately unsigned

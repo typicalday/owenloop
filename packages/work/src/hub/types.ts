@@ -202,12 +202,18 @@ export interface OrderPacket {
   consumes: Record<string, unknown>;
   /** Claim-time consumed versions when a compatible hub preserves the map. */
   consumedFingerprint?: Record<string, number>;
-  /** Target-protocol proof map; the deployed hub currently omits this field. */
+  /** Serialized submission proof for the consumed values, projected by a
+   *  proof-aware hub. Absent from any hub that does not store submit proofs;
+   *  consume-side verification then reports the artifact as unproven. */
   consumesProof?: string;
   /** The owed outputs and their reason threads. */
   owes: Array<{
     path: string;
-    /** Claim-time committed version when a version-aware hub projects it. */
+    /** Target version for this output's next successful commit (claim-time
+     *  committed version + 1), issued by a version-aware hub inside the claim
+     *  transaction. This is what a producer signs in its submission proof.
+     *  Absent from a hub that is not version-aware, which leaves the producer
+     *  submit unsigned. */
     version?: number;
     judgmentRejects: number;
     schemaRejects: number;
