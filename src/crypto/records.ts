@@ -338,6 +338,13 @@ export const ORDER_FIELDS = {
   owes: 'required',
   consumesProof: 'optional',
   cause: 'optional',
+  // Routing snapshot of the offer this order was claimed from. `capabilities`
+  // is the COMPOSED list (authored capability + `:<modifier>` where a modifier
+  // applied), `modifier` the value that composed it. Both optional: an
+  // unmodified run on a capability-silent step carries neither, so every order
+  // emitted before this field existed still validates unchanged.
+  capabilities: 'optional',
+  modifier: 'optional',
 } as const satisfies FieldManifest<Order>;
 
 /** Indexed access pins the already-emitted nested Order shape without cloning it. */

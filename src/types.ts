@@ -186,6 +186,25 @@ export interface Order {
   worker?: string;
   /** The artifact stem this order's judge step is verdicting, when present. */
   judge?: string;
+  /**
+   * The COMPOSED routing capabilities this order was offered under — the
+   * step's authored capabilities each suffixed with the run's modifier
+   * (`wise` → `wise:deep`), or the authored names verbatim when the run
+   * carries no modifier. Absent when the step authored none.
+   *
+   * This is the value a claiming crew's bindings are matched against and the
+   * value the shift's settings map is keyed by. It is a snapshot of the offer:
+   * an already-claimed order is never recomposed, so re-reading it later
+   * always shows what the claim was actually judged on.
+   */
+  capabilities?: string[];
+  /**
+   * The modifier this order was composed with. Normally the run's modifier;
+   * on an escalated re-offer, the step's escalation target instead (the run's
+   * own modifier is left alone). Carried separately from `capabilities` so a
+   * brief can surface the requested depth without re-parsing a compound.
+   */
+  modifier?: string;
   /** Opaque config object for a non-agent/non-command worker type (or
    *  alongside a command). Carried through untouched, contents never read. */
   spec?: Record<string, unknown>;
@@ -248,6 +267,16 @@ export interface WorkflowData {
   def: string; // definition name
   title?: string;
   params?: Record<string, string>;
+  /**
+   * The ONE modifier this run carries, validated against the def's declared
+   * `modifiers` set when the run is created and immutable thereafter — no
+   * step, worker or judge can write it (only `start_run` sets it; escalation
+   * overrides it per-offer without changing it here).
+   *
+   * Absent = an unmodified run: every step is offered on bare capabilities.
+   * Deletes with the run, like the rest of the row.
+   */
+  modifier?: string;
   /** Instance-to-definition pinning (§28): the compiled def this instance was
    *  created against, snapshotted verbatim as JSON. Absent on rows created
    *  before this feature shipped — those instances fall back to today's
@@ -338,6 +367,13 @@ export interface ProducePattern {
      *  (or additionally alongside `command`). Shape-checked as a plain map
      *  only (mirrors `x:`'s asExtension contract) — contents never read. */
     spec?: Record<string, unknown>;
+    /** Routing capabilities for this judge's synthesized step. Omitted =
+     *  INHERIT the producing step's `capabilities`, so a judge routes to the
+     *  same grade of crew as the work it judges instead of being claimable by
+     *  anyone. Set explicitly to route a judge somewhere else; an explicit
+     *  empty list is not accepted (it would reopen the def-silent hole
+     *  deliberately, which no author means to do). */
+    capabilities?: string[];
   }>;
 }
 
@@ -366,6 +402,28 @@ export interface EffectDef {
 }
 
 /** A step (step) definition. */
+/**
+ * A step's escalation rule (def-authored, engine-applied).
+ *
+ * There is NO rung order anywhere in this system — `modifier` is an explicit
+ * target drawn from the def's declared `modifiers` set, never "the next one
+ * up". Escalation therefore cannot be expressed as arithmetic on a ladder, and
+ * nothing here is comparable to anything else.
+ *
+ * `after` must be strictly less than the effective `maxAttempts` of every
+ * produce on the owning step. At `judgmentRejects >= maxAttempts` the engine
+ * freezes the artifact (`model.ts` `isStalled`), so an escalation authored at
+ * or past that threshold would re-offer a step that can never run again —
+ * deterministically dead. `validateDef` rejects it rather than accepting a
+ * rule that silently does nothing.
+ */
+export interface EscalationDef {
+  /** Judgment-reject count that triggers the escalated re-offer. */
+  after: number;
+  /** Target modifier, a member of the def's declared `modifiers` set. */
+  modifier: string;
+}
+
 export interface StepDef {
   name: string;
   /** Inputs this step reads — and, by the same declaration, the artifacts it has
@@ -431,8 +489,19 @@ export interface StepDef {
   /** A2: opaque routing capabilities for peer-orchestrator claim filtering. A tick
    *  caller passing a capability filter only claims steps whose capabilities intersect it;
    *  absent (or empty, normalized to absent at parse) = claimable by any caller.
-   *  Distinct from `executor`/`executors` (executor-kind), which this never touches. */
+   *  Distinct from `executor`/`executors` (executor-kind), which this never touches.
+   *
+   *  AUTHORED NAMES ONLY — never a compound. A `:` is rejected at parse
+   *  (`buildStep`) because the suffix position is engine-owned: the engine
+   *  composes `<capability>:<modifier>` at offer time (see
+   *  `WorkflowDef.modifiers` and `Order.capabilities`). */
   capabilities?: string[];
+  /** Per-step escalation rule: after `after` judgment rejections of this
+   *  step's produced artifact, the engine re-offers THIS step composed with
+   *  `modifier` instead of the run's modifier. Step-scoped — the run's own
+   *  modifier is never changed. Absent = the step never escalates and
+   *  rejections run the normal retry path until the stall brake. */
+  escalation?: EscalationDef;
   /** A3 (REL-8): per-step OPT-IN max total lease lifetime override in
    *  milliseconds — the cap on `claimedAt + maxLease` past which renewals can no
    *  longer keep a lease fresh. Overrides the engine `maxLeaseMs`; when both are
@@ -471,6 +540,20 @@ export interface WorkflowDef {
    * that are expanded at load time by `expandIncludes`; the engine always sees a flat list.
    */
   steps: StepDef[];
+  /**
+   * The def's declared modifier vocabulary — an UNORDERED SET of plain names
+   * (e.g. `[express, standard, deep]`). The engine attaches no meaning, no
+   * order and no arithmetic to these values; it only checks membership.
+   *
+   * A run may carry ONE of them (`WorkflowData.modifier`, set at start and
+   * never changed afterwards). At offer time the engine composes each of a
+   * step's capabilities with it — `wise` + `deep` → `wise:deep` — and that
+   * compound is what a crew binding is matched against.
+   *
+   * Absent = this def cannot receive a modifier at all, and every step is
+   * offered on its bare capabilities exactly as before this feature existed.
+   */
+  modifiers?: string[];
   /** Workflow-level public outputs / embedding interface (design doc §5.2).
    *  Declared stems are intentional leaves: lint-exempt from dead-end warnings.
    *  A stem listed here that no step produces is a hard validateDef error. */

@@ -1668,6 +1668,62 @@ test('§28: createInstance stamps a defSnapshot/defHash matching the def used', 
   assert.equal(row.defHash, hashDef(delivery));
 });
 
+test('§28: the def snapshot pins modifiers: and escalation: across a republish', () => {
+  // The routing vocabulary is part of the pinned shape, not a live lookup. A
+  // republish that widens the modifier set or retargets an escalation must not
+  // reach an instance already created against the old def — otherwise a run
+  // in flight could start escalating to a modifier its own capabilities were
+  // never composed against.
+  const original = def(
+    'graded',
+    [input('proposal')],
+    [
+      step({
+        name: 'builder',
+        consumes: ['proposal'],
+        produces: ['pr'],
+        capabilities: ['build'],
+        escalation: { after: 2, modifier: 'deep' },
+      }),
+    ],
+    ['express', 'deep'],
+  );
+  const { engine, store, setDef } = makeMutableEngine([original]);
+  const wf = engine.createInstance('graded');
+
+  const republished = def(
+    'graded',
+    [input('proposal')],
+    [
+      step({
+        name: 'builder',
+        consumes: ['proposal'],
+        produces: ['pr'],
+        capabilities: ['build'],
+        escalation: { after: 1, modifier: 'exhaustive' },
+      }),
+    ],
+    ['express', 'deep', 'exhaustive'],
+  );
+  setDef(republished);
+
+  const pinned = store.getWorkflow(wf)?.defSnapshot;
+  assert.ok(pinned !== undefined, 'instance carries a pin');
+  assert.deepEqual(pinned.modifiers, ['express', 'deep'], 'pinned modifier set is the original one');
+  assert.deepEqual(
+    pinned.steps[0]!.escalation,
+    { after: 2, modifier: 'deep' },
+    'pinned escalation rule is the original one',
+  );
+  assert.notEqual(hashDef(original), hashDef(republished), 'hashDef distinguishes the two vocabularies');
+
+  // adopt() is the explicit opt-in that moves the instance onto the new shape.
+  engine.adopt(wf);
+  const adopted = store.getWorkflow(wf)?.defSnapshot;
+  assert.deepEqual(adopted!.modifiers, ['express', 'deep', 'exhaustive']);
+  assert.deepEqual(adopted!.steps[0]!.escalation, { after: 1, modifier: 'exhaustive' });
+});
+
 test('§28: defFor falls back to name-resolution for a legacy row with no snapshot', () => {
   const { engine, store } = makeMutableEngine([delivery]);
   const wf = 'wf_legacy_test';

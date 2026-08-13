@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce } from '../src/paths.ts';
-import type { ArtifactData, EffectDef, FiringTrigger, GroupDef, InputDef, Order, StepDef, WorkflowDef } from '../src/types.ts';
+import type { ArtifactData, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, Order, StepDef, WorkflowDef } from '../src/types.ts';
 import type { ArtifactMap } from '../src/model.ts';
 
 export interface StepSpec {
@@ -35,6 +35,7 @@ export interface StepSpec {
   idleAfterMs?: number;
   reapTtlMs?: number;
   capabilities?: string[];
+  escalation?: EscalationDef;
   maxLeaseMs?: number;
   x?: Record<string, unknown>;
 }
@@ -61,6 +62,7 @@ export function step(spec: StepSpec): StepDef {
     ...(spec.idleAfterMs !== undefined ? { idleAfterMs: spec.idleAfterMs } : {}),
     ...(spec.reapTtlMs !== undefined ? { reapTtlMs: spec.reapTtlMs } : {}),
     ...(spec.capabilities !== undefined ? { capabilities: spec.capabilities } : {}),
+    ...(spec.escalation !== undefined ? { escalation: spec.escalation } : {}),
     ...(spec.maxLeaseMs !== undefined ? { maxLeaseMs: spec.maxLeaseMs } : {}),
     ...(spec.groups !== undefined ? { groups: spec.groups } : {}),
     ...(spec.x !== undefined ? { x: spec.x } : {}),
@@ -73,8 +75,13 @@ export function step(spec: StepSpec): StepDef {
   };
 }
 
-export function def(name: string, inputs: InputDef[], steps: StepDef[]): WorkflowDef {
-  return { name, engine: 1, inputs, steps };
+export function def(
+  name: string,
+  inputs: InputDef[],
+  steps: StepDef[],
+  modifiers?: string[],
+): WorkflowDef {
+  return { name, engine: 1, inputs, steps, ...(modifiers !== undefined ? { modifiers } : {}) };
 }
 
 /**
