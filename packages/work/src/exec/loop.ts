@@ -39,6 +39,9 @@
  * The role (`src/roles/exec.ts`) maps each `ExecOutcome` to an exit code.
  */
 import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 
 import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
@@ -52,6 +55,24 @@ import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 
 /** sha256 of the empty byte string — the hash for a run with no captured output. */
 const EMPTY_HASH = createHash('sha256').digest('hex');
+
+/**
+ * The largest serialized `consumes` payload delivered inline in
+ * `OWENLOOP_CONSUMES`; anything strictly larger goes to a file named by
+ * `OWENLOOP_CONSUMES_FILE`. Measured with `Buffer.byteLength(json, 'utf8')` —
+ * never `json.length`, which counts UTF-16 code units and under-reports every
+ * multi-byte character.
+ *
+ * 64 KiB, chosen against the binding OS limit rather than a round number:
+ * Linux `execve` enforces `MAX_ARG_STRLEN`, a hard PER-ENTRY cap of 131072
+ * bytes (32 × 4 KiB pages) independent of the total `ARG_MAX`; macOS has no
+ * per-entry cap but shares ~1 MB of `ARG_MAX` across argv AND the whole
+ * environment block, and the child environment here starts from a full
+ * inherited `process.env`. 64 KiB clears the Linux per-entry cap with room for
+ * the `OWENLOOP_CONSUMES=` prefix and leaves the rest of the macOS budget to
+ * the inherited block.
+ */
+export const CONSUMES_INLINE_MAX_BYTES = 65_536;
 
 /** Discriminated result of an exec run; the role maps these to exit codes. */
 export type ExecOutcome =
@@ -106,6 +127,91 @@ export interface ExecLoop {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Put the order's consumed inputs on `childEnv`, and return the temp DIRECTORY
+ * holding the overflow file — or `undefined` when the payload went inline.
+ *
+ * The contract a command script sees, and the reason it is two variables:
+ *
+ *   - `OWENLOOP_CONSUMES` carries `JSON.stringify(order.consumes ?? {})`
+ *     verbatim whenever that fits within `CONSUMES_INLINE_MAX_BYTES`. It is set
+ *     even when there are no consumed inputs — the value is then `{}`, not an
+ *     absent variable.
+ *   - `OWENLOOP_CONSUMES_FILE` names a `0600` UTF-8 file holding that same JSON
+ *     when it does not fit.
+ *
+ * Exactly ONE of the two is present on any spawn, because this function always
+ * assigns one and `delete`s the other. That mutual exclusion is what lets the
+ * presence of `OWENLOOP_CONSUMES_FILE` act as the discriminator with no third
+ * "mode" variable, and it is required anyway by the collision rule below.
+ *
+ * COLLISION RULE (the same reasoning as `OWENLOOP_WORKFLOW`/`OWENLOOP_RUN` at
+ * the spawn site): `childEnv` starts from `process.env`, and a shift can itself
+ * have been launched from inside another command step, so both names may
+ * already carry the PARENT order's values — a stale inputs object in the inline
+ * case, and in the file case a path whose directory has already been removed.
+ * Neither name is ever conditionally assigned.
+ *
+ * The JSON is the raw `order.consumes` object with no envelope, so a command
+ * script and an agent step see the identical shape. Key omission is preserved:
+ * an input that was declared but never produced is ABSENT from the object, not
+ * present as `null`, and a script tests for it with `'key' in consumes`.
+ */
+function deliverConsumes(
+  childEnv: Record<string, string | undefined>,
+  consumes: Record<string, unknown> | undefined,
+): string | undefined {
+  // `order.consumes` arrives JSON-decoded off the wire, so there is no
+  // realistic cycle or BigInt to throw on. The throw is still surfaced rather
+  // than swallowed: leaving the variable unset would push a script back onto
+  // deriving its context from its cwd — the exact failure this delivery exists
+  // to remove — so the caller turns it into a machinery failure and no child is
+  // spawned.
+  let json: string;
+  try {
+    json = JSON.stringify(consumes ?? {});
+  } catch (e) {
+    throw new Error(`cannot serialize the order's consumed inputs for OWENLOOP_CONSUMES: ${errMsg(e)}`);
+  }
+
+  if (Buffer.byteLength(json, 'utf8') <= CONSUMES_INLINE_MAX_BYTES) {
+    childEnv['OWENLOOP_CONSUMES'] = json;
+    delete childEnv['OWENLOOP_CONSUMES_FILE'];
+    return undefined;
+  }
+
+  // `mkdtempSync` rather than a composed run/step/random filename: several
+  // shifts run concurrently on one machine, and this gives a collision-free
+  // `0700` directory without owning a naming scheme. The file is `0600`
+  // because its content is agent-produced artifact data.
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-consumes-'));
+  try {
+    const file = join(dir, 'consumes.json');
+    writeFileSync(file, json, { encoding: 'utf8', mode: 0o600 });
+    childEnv['OWENLOOP_CONSUMES_FILE'] = file;
+    delete childEnv['OWENLOOP_CONSUMES'];
+    return dir;
+  } catch (e) {
+    // The directory exists but the caller will never learn its path, so remove
+    // it here rather than leaking it; the caller's `finally` only covers a
+    // directory this function returned.
+    removeConsumesDir(dir);
+    throw e;
+  }
+}
+
+/** Best-effort removal of an overflow directory; a cleanup failure never fails a step. */
+function removeConsumesDir(dir: string | undefined): void {
+  if (dir === undefined) return;
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // Swallowed on purpose: the child has already exited and its receipt is
+    // authoritative. A temp-directory that outlives the run is a tidiness
+    // problem, not a result.
+  }
 }
 
 export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
@@ -360,43 +466,96 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     }
 
     // Run the command and race it against the lease going terminal.
-    let cmd: RunningCommand;
+    // `consumesDir` holds the OWENLOOP_CONSUMES_FILE overflow directory when
+    // the serialized inputs did not fit inline. The `finally` below removes it
+    // on every path out of this block, including a spawn that threw.
+    //
+    // On the RECEIPT path the removal follows the child's exit, because a
+    // script may read the file late in its run. On the LEASE-TERMINAL path it
+    // does not: `cmd.kill()` (see `exec/runner.ts`) posts SIGTERM, races `done`
+    // against the grace timer, then posts SIGKILL and returns WITHOUT awaiting
+    // `done`, so this unlink can precede full reaping of the killed process
+    // group. That is deliberate and harmless — the run is abandoned and submits
+    // no receipt — but it is not a guarantee to build on. Do not add work here
+    // that assumes the child is gone.
+    let consumesDir: string | undefined;
     try {
-      // spawn's env replaces the child environment. Start from the actual exec
-      // process environment so config-only opts.env cannot strip PATH/HOME, then
-      // explicitly remove bundle provenance for loose definitions.
-      const childEnv: Record<string, string | undefined> = { ...process.env };
-      if (resolvedBundleDir === undefined) delete childEnv['OWENLOOP_BUNDLE_DIR'];
-      else childEnv['OWENLOOP_BUNDLE_DIR'] = resolvedBundleDir;
-      // Run identity is engine-derived from ExecLoopOptions, never a consumed
-      // artifact value, and always present. Overwrite inherited values so a
-      // nested exec sees its own identity rather than its parent's.
-      childEnv['OWENLOOP_WORKFLOW'] = workflow;
-      childEnv['OWENLOOP_RUN'] = runId;
-      const startOptions = { cwd: order.workdir ?? opts.cwd, env: childEnv };
-      cmd = runner.start(resolvedCommand, startOptions);
-    } catch (e) {
-      return submitReceipt(machineryFailure(e), order, resolvedCommand);
-    }
-    running = cmd;
-    opts.out(`owenloop work exec: running ${workflow}/${runId} (step '${order.step}')`);
-
-    const outcome = await Promise.race([
-      cmd.done.then((r) => ({ t: 'done' as const, r })).catch((e: unknown) => ({ t: 'done' as const, r: machineryFailure(e) })),
-      leasePromise.then((o) => ({ t: 'lease' as const, o })),
-    ]);
-
-    if (outcome.t === 'lease') {
-      await cmd.kill(); // no receipt — a submit now would race the re-offer
-      if (signalled) {
-        opts.err(`owenloop work exec: signalled mid-run — killed the command group, released ${workflow}/${runId}`);
-        return 'killed';
+      let cmd: RunningCommand;
+      try {
+        // spawn's env replaces the child environment. Start from the actual exec
+        // process environment so config-only opts.env cannot strip PATH/HOME, then
+        // explicitly remove bundle provenance for loose definitions.
+        const childEnv: Record<string, string | undefined> = { ...process.env };
+        if (resolvedBundleDir === undefined) delete childEnv['OWENLOOP_BUNDLE_DIR'];
+        else childEnv['OWENLOOP_BUNDLE_DIR'] = resolvedBundleDir;
+        // Run identity is engine-derived from ExecLoopOptions, never a consumed
+        // artifact value, and always present. The consumed inputs that follow ARE
+        // artifact values, and they are admitted here only because
+        // `resolveCommand` above already ran the consume-side verification gate
+        // (`hardRule: true`) and refused the order outright on absent,
+        // unverifiable, or invalid evidence. They travel in the environment
+        // block and nowhere else — never in argv and never in the command text,
+        // which is returned verbatim from the verified store and is not
+        // interpolated. All four names below overwrite inherited values so a
+        // nested exec sees its own order rather than its parent's.
+        childEnv['OWENLOOP_WORKFLOW'] = workflow;
+        childEnv['OWENLOOP_RUN'] = runId;
+        consumesDir = deliverConsumes(childEnv, order.consumes);
+        // The order carries no workdir when the step declared neither `workdir:`
+        // nor `workdirFrom:` (the hub resolves `workdirFrom` and ships the
+        // result, so an absent field IS that signal). Substituting the shift's
+        // launch directory silently is how a run ends up operating on an
+        // unintended tree with nothing in the output saying so, hence the
+        // record. It stays a WARNING: `provisioner` creates the worktree its
+        // successors use and `deprovisioner` deletes its own, so both
+        // legitimately have no workdir to resolve, and a throw here would break
+        // every delivery run the moment it shipped.
+        //
+        // KNOWN LIMIT, do not read this warning as delivered under a shift.
+        // `opts.err` is this process's stderr, and `buildSpawnPlan`
+        // (`src/shift/spawn.ts`) launches every worker with
+        // `stdio: ['ignore', 'ignore', 'ignore']`, so a shift-dispatched exec
+        // writes this line to `/dev/null`. It is observable only when
+        // `owenloop work exec` is run by hand. Routing it to a channel a shift
+        // operator reads is filed separately and is a PREREQUISITE for turning
+        // this into a throw — an unseen warning is not a migration notice.
+        // `docs/bundles.md` ("Working directory for command steps") states the
+        // same limit for bundle authors.
+        const cwd = order.workdir ?? opts.cwd;
+        if (order.workdir === undefined) {
+          opts.err(
+            `owenloop work exec: step '${order.step}' (${workflow}/${runId}) declared neither workdir nor ` +
+              `workdirFrom — inheriting the shift launch directory '${resolve(cwd)}' as the command's cwd. ` +
+              'A future release will require a step to declare this inheritance explicitly.',
+          );
+        }
+        const startOptions = { cwd, env: childEnv };
+        cmd = runner.start(resolvedCommand, startOptions);
+      } catch (e) {
+        return submitReceipt(machineryFailure(e), order, resolvedCommand);
       }
-      opts.err(`owenloop work exec: lease ${outcome.o} while the command ran — killed the command, no receipt submitted`);
-      return mapLeaseDuringRun(outcome.o);
-    }
+      running = cmd;
+      opts.out(`owenloop work exec: running ${workflow}/${runId} (step '${order.step}')`);
 
-    return submitReceipt(outcome.r, order, resolvedCommand);
+      const outcome = await Promise.race([
+        cmd.done.then((r) => ({ t: 'done' as const, r })).catch((e: unknown) => ({ t: 'done' as const, r: machineryFailure(e) })),
+        leasePromise.then((o) => ({ t: 'lease' as const, o })),
+      ]);
+
+      if (outcome.t === 'lease') {
+        await cmd.kill(); // no receipt — a submit now would race the re-offer
+        if (signalled) {
+          opts.err(`owenloop work exec: signalled mid-run — killed the command group, released ${workflow}/${runId}`);
+          return 'killed';
+        }
+        opts.err(`owenloop work exec: lease ${outcome.o} while the command ran — killed the command, no receipt submitted`);
+        return mapLeaseDuringRun(outcome.o);
+      }
+
+      return submitReceipt(outcome.r, order, resolvedCommand);
+    } finally {
+      removeConsumesDir(consumesDir);
+    }
   }
 
   function stop(reason?: string): void {
