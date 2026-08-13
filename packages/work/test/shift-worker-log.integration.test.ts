@@ -11,14 +11,14 @@
  * subject under test is the STDIO TOPOLOGY, not what `owenloop work exec` does
  * with it. The script writes a known marker to each stream and exits.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import { createDefaultSpawner } from '../src/shift/spawn.ts';
-import { runLogFile } from '../src/shift/logretention.ts';
+import { runLogFile, sweepShiftLogs } from '../src/shift/logretention.ts';
 
 let root: string;
 let logDir: string;
@@ -91,10 +91,20 @@ test('a re-armed run APPENDS instead of truncating the earlier attempt', async (
   assert.ok(text.includes('try2-out'), text);
 });
 
-test('the log survives removal of the run record — its lifetime is not the record\'s', async () => {
-  // `state.ts` removes `<run>.json` the moment the child completes. A log that
-  // inherited that lifecycle would be readable only while the run is in flight,
-  // which is useless for the postmortem it exists for.
+test('the run record, not the age, decides when a REAL worker\'s log becomes reapable', async () => {
+  // The record and the log are two files in two different directories, and the
+  // only thing that couples them is `sweepShiftLogs` — specifically its default
+  // `hasRecord`, which stats `<state-dir>/<run>.json` for each `<run>.log` it
+  // considers. So the sweep is what this test runs. Creating a record, deleting
+  // it, and re-reading the log proves nothing on its own: `createDefaultSpawner`
+  // never opens the state directory, so no implementation could have coupled
+  // them and the log would survive either way.
+  //
+  // Run at `maxAgeMs: 0`, where EVERY log is old enough. What survives the first
+  // sweep survives because the run is in flight, and nothing else — which is the
+  // orphaned-inode case the gate exists for: unlinking a log a live worker still
+  // holds an fd on makes the bytes unreadable while the filesystem keeps
+  // charging for them.
   const stateDir = join(root, 'state');
   mkdirSync(stateDir, { recursive: true });
   const record = join(stateDir, 'run_gamma.json');
@@ -105,9 +115,16 @@ test('the log survives removal of the run record — its lifetime is not the rec
   const path = runLogFile(logDir, 'run_gamma');
   await waitForContent(path, 'w3-err');
 
+  // ── IN FLIGHT: spared, at zero retention, with real bytes on disk ──
+  const spared = sweepShiftLogs({ dir: logDir, stateDir, now: Date.now(), maxAgeMs: 0 });
+  assert.deepEqual(spared, [], 'a run with a live record must not be reaped at any age');
+  assert.ok(readFileSync(path, 'utf8').includes('w3-err'), 'and its bytes must be untouched');
+
+  // ── RECORD GONE: the same file, the same age, now reapable ──
   rmSync(record);
-  assert.equal(existsSync(record), false);
-  assert.ok(readFileSync(path, 'utf8').includes('w3-err'), 'the log must outlive its run record');
+  const reaped = sweepShiftLogs({ dir: logDir, stateDir, now: Date.now(), maxAgeMs: 0 });
+  assert.deepEqual(reaped, [path], 'removing the record is the ONLY change between the two sweeps');
+  assert.equal(existsSync(path), false);
 });
 
 test('an unopenable log costs the output, never the dispatch', async () => {
@@ -163,30 +180,147 @@ test('the log-open failure latch is per shift, so a new spawner reports again', 
   assert.equal(second.length, 1, second.join('\n'));
 });
 
-test('no log directory reproduces the pre-logging topology exactly', async () => {
-  const spawner = createDefaultSpawner('https://hub', 'acct', fakeBin('w5'), 'shf_1');
-  const result = spawner({ workflow: 'wf1', run: 'run_epsilon', step: 's', kind: 'exec' });
+/**
+ * A stand-in bin that reports its OWN stdio topology, as the KERNEL sees it,
+ * into a side-channel file the test names.
+ *
+ * `fstat` on fd 1 and fd 2 is the only way to observe what the spawner actually
+ * handed the child. Reading `<run>.log` afterwards cannot distinguish "both
+ * slots hold one descriptor onto this file" from "two descriptors onto the same
+ * path", and it cannot observe the no-logging case at all, because there the
+ * whole claim is that nothing was written anywhere.
+ *
+ * The report goes to a side channel rather than to stdout because stdout is the
+ * subject under test — writing the answer through the thing being measured is
+ * exactly what the no-logging case would discard.
+ */
+function probeBin(tag: string, reportPath: string): string {
+  const path = join(root, `probe-${tag}.mjs`);
+  writeFileSync(
+    path,
+    [
+      "import { fstatSync, writeFileSync } from 'node:fs';",
+      'const describe = (fd) => {',
+      '  const s = fstatSync(fd);',
+      // dev+ino as strings: the pair identifies a file on a filesystem, and JSON
+      // has no integer type wide enough to be trusted with a raw inode number.
+      '  return { file: s.isFile(), charDev: s.isCharacterDevice(), id: `${s.dev}:${s.ino}` };',
+      '};',
+      `writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ out: describe(1), err: describe(2) }));`,
+      'process.exit(0);',
+    ].join('\n'),
+  );
+  return path;
+}
 
-  assert.equal(typeof result.pid, 'number');
-  // Nothing is written anywhere: with no `logFile` on the plan the worker keeps
-  // `stdio: ['ignore','ignore','ignore']` and the kernel discards its output.
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  assert.equal(existsSync(runLogFile(logDir, 'run_epsilon')), false);
+interface FdReport {
+  out: { file: boolean; charDev: boolean; id: string };
+  err: { file: boolean; charDev: boolean; id: string };
+}
+
+test('with a log directory the child gets ONE descriptor on fds 1 and 2; without one it gets /dev/null', async () => {
+  // THE CONTRAST IS THE TEST. Both halves spawn the same probe the same way and
+  // differ in exactly one argument — the `logging` option — so every difference
+  // below is attributable to it. Asserting only the second half ("no file
+  // appeared") proves nothing: with no `logging` argument the spawner is never
+  // told where `logDir` is, so no implementation could have written there.
+
+  // ── WITH LOGGING ──
+  const onReport = join(root, 'fd-report-on.json');
+  createDefaultSpawner('https://hub', 'acct', probeBin('on', onReport), 'shf_1', undefined, { dir: logDir })(
+    { workflow: 'wf1', run: 'run_probe_on', step: 's', kind: 'exec' },
+  );
+  const on = JSON.parse(await waitForContent(onReport, '"out"')) as FdReport;
+
+  assert.equal(on.out.file, true, 'fd 1 must be a regular file');
+  assert.equal(on.err.file, true, 'fd 2 must be a regular file');
+  // THE `2>&1` EFFECT: both slots resolve to one file, so a reader of
+  // `<run>.log` gets the worker's diagnostics and its output interleaved in
+  // write order rather than split across two destinations.
+  //
+  // What this pair does NOT prove is that ONE descriptor fills both slots —
+  // `fstat` reports the file, so two separate opens of the same path would
+  // report the same `dev:ino` too. That claim is a property of the PARENT, and
+  // the descriptor-count test at the bottom of this file is what holds it.
+  assert.equal(on.out.id, on.err.id, 'fds 1 and 2 must resolve to the same file');
+  // And that one file is `<log-dir>/<run>.log` — not some other file that merely
+  // happens to be regular.
+  const logStat = statSync(runLogFile(logDir, 'run_probe_on'));
+  assert.equal(on.out.id, `${String(logStat.dev)}:${String(logStat.ino)}`);
+
+  // ── WITHOUT LOGGING: the pre-logging topology, unchanged ──
+  const before = readdirSync(logDir).sort();
+  const offReport = join(root, 'fd-report-off.json');
+  const result = createDefaultSpawner('https://hub', 'acct', probeBin('off', offReport), 'shf_1')(
+    { workflow: 'wf1', run: 'run_epsilon', step: 's', kind: 'exec' },
+  );
+  assert.equal(typeof result.pid, 'number', 'the worker must still be spawned');
+  const off = JSON.parse(await waitForContent(offReport, '"out"')) as FdReport;
+
+  // `stdio: 'ignore'` is /dev/null on POSIX, which is a CHARACTER DEVICE. This
+  // is the assertion that can fail: it is false the moment a descriptor onto a
+  // real file reaches a worker that was never given a log directory.
+  assert.equal(off.out.file, false, 'fd 1 must not be a file when logging is off');
+  assert.equal(off.out.charDev, true, `fd 1 must be /dev/null, got ${JSON.stringify(off.out)}`);
+  assert.equal(off.err.charDev, true, `fd 2 must be /dev/null, got ${JSON.stringify(off.err)}`);
+  // Nothing new anywhere in the log directory, by full listing rather than by
+  // guessing one filename the implementation might have chosen.
+  assert.deepEqual(readdirSync(logDir).sort(), before);
 });
 
+/**
+ * How many file descriptors THIS process currently holds open.
+ *
+ * `/dev/fd` lists the descriptors of the process that reads it — on Linux it is
+ * a symlink to `/proc/self/fd`, on macOS it is served directly. Those are the
+ * two platforms this project's CI runs, and reading it is the only way to
+ * observe `createDefaultSpawner`'s `finally { closeSync(logFd) }` from outside:
+ * the descriptor that block closes is the PARENT's copy, and nothing about the
+ * child or the file on disk reveals whether it was closed.
+ */
+function openDescriptorCount(): number {
+  return readdirSync('/dev/fd').length;
+}
+
 test('dispatching many workers does not leak the parent\'s descriptors', async () => {
-  // The parent's copy of each log descriptor is closed in a `finally`. Leaking
-  // one per dispatch would eventually hit EMFILE and stop dispatch entirely, so
-  // the assertion is that the open-descriptor count does not grow with dispatch
-  // count.
+  // `createDefaultSpawner` opens each worker log in the PARENT with `openSync`,
+  // hands that one descriptor to the child's stdio slots 1 and 2, and closes the
+  // parent's copy in a `finally`. Without that `finally` a long-lived shift
+  // leaks one descriptor per dispatch and eventually cannot dispatch at all —
+  // `openSync` throws EMFILE once the process hits its limit, which on a default
+  // macOS shell is 256.
+  //
+  // Counting descriptors is what makes this test able to fail. Asserting that
+  // the log files exist cannot: they exist whether or not the parent closed
+  // anything.
   const bin = fakeBin('w6');
   const spawner = createDefaultSpawner('https://hub', 'acct', bin, 'shf_1', undefined, { dir: logDir });
-  for (let i = 0; i < 60; i++) {
+
+  // One warm-up dispatch first, so the baseline is taken after `child_process`
+  // has opened whatever it opens once rather than per spawn.
+  spawner({ workflow: 'wf1', run: 'run_warmup', step: 's', kind: 'exec' });
+  const before = openDescriptorCount();
+
+  const DISPATCHES = 60;
+  for (let i = 0; i < DISPATCHES; i++) {
     spawner({ workflow: 'wf1', run: `run_bulk${i}`, step: 's', kind: 'exec' });
   }
-  // A leak of 60 descriptors would already be visible; the real failure mode is
-  // that opening the 61st throws EMFILE on a constrained limit. Reaching here
-  // without a throw, with every log opened, is the check.
-  await waitForContent(runLogFile(logDir, 'run_bulk59'), 'w6-err');
-  assert.equal(existsSync(runLogFile(logDir, 'run_bulk0')), true);
+  const after = openDescriptorCount();
+
+  // Every one of the 60 logs really was opened — `openSync` runs synchronously
+  // in the parent, so the file exists the instant `spawner()` returns, with no
+  // waiting on any child. This is what makes the count below mean something:
+  // 60 descriptors were genuinely opened, so 60 were genuinely closed.
+  for (let i = 0; i < DISPATCHES; i++) {
+    assert.equal(existsSync(runLogFile(logDir, `run_bulk${i}`)), true, `run_bulk${i}.log must have been opened`);
+  }
+
+  // The budget is deliberately far below `DISPATCHES`: a missing `finally` grows
+  // the count by exactly 60, while the ordinary churn of spawning (a transient
+  // descriptor or two the runtime has not yet reclaimed) is single digits.
+  const grew = after - before;
+  assert.ok(
+    grew < 10,
+    `the parent leaked descriptors: ${String(before)} → ${String(after)} (+${String(grew)}) across ${String(DISPATCHES)} dispatches`,
+  );
 });

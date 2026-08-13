@@ -8,19 +8,19 @@
  * will not reproduce on demand) and against a real temp directory, because the
  * whole point of this feature is bytes that survive on a real disk.
  */
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, isAbsolute, join, resolve } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import {
   DEFAULT_SHIFT_LOG_MAX_AGE_MS,
-  LOG_OWNERS_DIR_NAME,
   SHIFT_LOG_NAME,
   isShiftLogReapable,
   isWorkerLogName,
   logOwnersDir,
+  prepareShiftLogDir,
   readShiftLogOwners,
   registerShiftLogOwner,
   resolveShiftLogDir,
@@ -115,6 +115,30 @@ test('resolveShiftLogDir is --log-dir > env > settings > stateDir', () => {
   assert.equal(resolveShiftLogDir(undefined, {}, undefined, '/state'), '/state');
   // A blank at any level is not a choice, so the next level down still applies.
   assert.equal(resolveShiftLogDir('  ', { OWENLOOP_SHIFT_LOG_DIR: ' ' }, '', '/state'), '/state');
+});
+
+test('resolveShiftLogDir returns an ABSOLUTE path at every precedence level', () => {
+  // The log directory is the RENDEZVOUS between shift processes that may have
+  // been started from different working directories, and `.owners` inside it is
+  // read by whichever of them sweeps. Two spellings would be two rendezvous
+  // points: a shift started with `--log-dir ./logs` would write its claim under
+  // one and a shift started with the absolute path would sweep the other,
+  // seeing no claim and unlinking the first shift's live worker logs.
+  const cwd = process.cwd();
+  assert.equal(resolveShiftLogDir('./logs', {}, undefined, '/state'), join(cwd, 'logs'));
+  assert.equal(resolveShiftLogDir(undefined, { OWENLOOP_SHIFT_LOG_DIR: 'logs' }, undefined, '/state'), join(cwd, 'logs'));
+  assert.equal(resolveShiftLogDir(undefined, {}, '../logs', '/state'), resolve(cwd, '../logs'));
+  assert.equal(resolveShiftLogDir(undefined, {}, undefined, 'state'), join(cwd, 'state'));
+  // Spelled as an invariant rather than four equalities: whatever comes back is
+  // absolute, whichever level produced it.
+  for (const produced of [
+    resolveShiftLogDir('./logs', {}, undefined, '/state'),
+    resolveShiftLogDir(undefined, { OWENLOOP_SHIFT_LOG_DIR: 'logs' }, undefined, '/state'),
+    resolveShiftLogDir(undefined, {}, '../logs', '/state'),
+    resolveShiftLogDir(undefined, {}, undefined, 'state'),
+  ]) {
+    assert.equal(isAbsolute(produced), true, `${produced} must be absolute`);
+  }
 });
 
 test('resolveShiftLogMaxAgeMs is --log-max-age > env > settings > 14 days', () => {
@@ -277,26 +301,302 @@ test('readShiftLogOwners returns every claimed state dir plus the caller\'s own'
 
 test('a corrupt owner claim costs only that claimant, never the sweep', () => {
   const shared = join(root, 'corrupt-logs');
-  const stateA = join(root, 'corrupt-a');
-  const stateB = join(root, 'corrupt-b');
+  const own = join(root, 'corrupt-own');
+  const foreign = [join(root, 'corrupt-a'), join(root, 'corrupt-b'), join(root, 'corrupt-c')];
   mkdirSync(shared, { recursive: true });
-  registerShiftLogOwner(shared, stateA);
-  registerShiftLogOwner(shared, stateB);
-  // Truncate one claim to garbage, as a crash mid-write would.
-  const claims = readdirSync(logOwnersDir(shared));
-  assert.equal(claims.length, 2);
-  writeFileSync(join(logOwnersDir(shared), claims[0] ?? ''), 'not json{');
+  const claimPath = new Map(foreign.map((stateDir) => [stateDir, registerShiftLogOwner(shared, stateDir)]));
 
-  const owners = readShiftLogOwners(shared, stateB);
-  assert.ok(owners.includes(stateB), 'the caller\'s own state dir is unconditional');
-  assert.ok(owners.length >= 1 && owners.length <= 2, JSON.stringify(owners));
+  // Corrupt EACH claim in turn, restoring the others first. Claim filenames are
+  // hashes, so `readdirSync` order is not controllable — corrupting only one
+  // would leave open the possibility that it happened to be listed last, where
+  // an outer try/catch loses nothing. Sweeping the corruption across all three
+  // guarantees the first-listed claim is corrupt in at least one round, which is
+  // exactly the case an outer guard fails: it would abandon the loop there and
+  // return the caller's own state dir alone.
+  for (const broken of foreign) {
+    for (const [stateDir, path] of claimPath) {
+      writeFileSync(path, stateDir === broken ? 'not json{' : `${JSON.stringify({ stateDir })}\n`);
+    }
+    const intact = foreign.filter((stateDir) => stateDir !== broken);
+    assert.deepEqual(
+      readShiftLogOwners(shared, own).sort(),
+      [own, ...intact].sort(),
+      `corrupting ${broken} must cost that claimant only`,
+    );
+  }
+
+  // A claim that parses but carries no usable `stateDir` is the same story: it
+  // tells the sweep nothing, and it tells the sweep nothing about the others too.
+  for (const [stateDir, path] of claimPath) writeFileSync(path, `${JSON.stringify({ stateDir })}\n`);
+  for (const useless of ['{}', '{"stateDir":""}', '{"stateDir":"   "}', '{"stateDir":42}', '[]', 'null']) {
+    writeFileSync(claimPath.get(foreign[0]!)!, useless);
+    assert.deepEqual(
+      readShiftLogOwners(shared, own).sort(),
+      [own, foreign[1]!, foreign[2]!].sort(),
+      `claim body ${useless} must be ignored without blinding the sweep`,
+    );
+  }
 });
 
-test('the owner registry is never mistaken for a worker log', () => {
+test('the owner registry round-trips ONE absolute claim per shift, however it was spelled', () => {
+  const shared = join(root, 'abs-logs');
+  mkdirSync(shared, { recursive: true });
+  // A state dir named relative to THIS process's cwd. `resolve()` of it is the
+  // same directory under a different spelling — the situation two shifts started
+  // from different working directories land in.
+  const relative = 'abs-state-rel';
+  const absolute = resolve(relative);
+
+  const first = registerShiftLogOwner(shared, relative);
+  const second = registerShiftLogOwner(shared, absolute);
+  assert.equal(first, second, 'one directory must hash to one claim filename, not one per spelling');
+  assert.deepEqual(readdirSync(logOwnersDir(shared)), [basename(first)], 'exactly one claim file');
+
+  // The bytes on disk are what a DIFFERENT process with a DIFFERENT cwd reads
+  // and joins `<run>.json` onto, so `docs/shift-logs.md`'s published
+  // `{"stateDir":"/abs/path"}` has to be literally true.
+  const body: unknown = JSON.parse(readFileSync(first, 'utf8'));
+  assert.deepEqual(body, { stateDir: absolute });
+  assert.equal(isAbsolute((body as { stateDir: string }).stateDir), true);
+
+  // Both ends resolve, so a claim written by a relative-spelling caller and a
+  // reader asking with the relative spelling still agree on one path.
+  assert.deepEqual(readShiftLogOwners(shared, relative), [absolute]);
+  assert.deepEqual(readShiftLogOwners(shared, absolute), [absolute]);
+
+  // And a claim FILE containing a relative path — written by an older shift, or
+  // by hand — is resolved on the way out rather than handed to the sweep as-is.
+  writeFileSync(first, `${JSON.stringify({ stateDir: relative })}\n`);
+  const other = join(root, 'abs-other');
+  assert.deepEqual(readShiftLogOwners(shared, other).sort(), [other, absolute].sort());
+});
+
+// ── startup preparation (what `runtime.ts` runs before the first dispatch) ──
+
+/**
+ * Write a worker log with a chosen age, so the sweep has something to decide
+ * about. Shared by the `prepareShiftLogDir` branch tests.
+ */
+function agedLog(dir: string, name: string, now: number, ageMs: number): string {
+  const path = join(dir, name);
+  writeFileSync(path, 'x');
+  const seconds = (now - ageMs) / 1000;
+  utimesSync(path, seconds, seconds);
+  return path;
+}
+
+test('prepareShiftLogDir creates, claims and sweeps, and reports what it reaped', () => {
+  const dir = join(root, 'prep-logs');
+  const stateDir = join(root, 'prep-state');
+  mkdirSync(stateDir, { recursive: true });
+  const now = 100 * DAY;
+  const errors: string[] = [];
+
+  // Two equally old worker logs; only one of them has an in-flight `<run>.json`
+  // record in the state directory. That record is the whole gate.
+  mkdirSync(dir, { recursive: true });
+  const stale = agedLog(dir, 'run_stale.log', now, 30 * DAY);
+  const live = agedLog(dir, 'run_live.log', now, 30 * DAY);
+  writeFileSync(join(stateDir, 'run_live.json'), '{}');
+
+  const prepared = prepareShiftLogDir({
+    flagDir: dir, env: {}, stateDir, now, err: (line) => errors.push(line), label: 'owenloop shift',
+  });
+
+  assert.equal(prepared.ready, true);
+  assert.equal(prepared.dir, dir);
+  assert.equal(prepared.maxAgeMs, DEFAULT_SHIFT_LOG_MAX_AGE_MS);
+  assert.deepEqual(prepared.reaped, [stale], 'the completed log aged out; the in-flight one did not');
+  assert.equal(existsSync(stale), false);
+  assert.equal(existsSync(live), true, "a live worker's log must survive its own shift's startup sweep");
+
+  // The claim is written BEFORE the sweep, which is what lets this shift's own
+  // records gate its own sweep on its very first startup.
+  const claims = readdirSync(logOwnersDir(dir));
+  assert.equal(claims.length, 1);
+  assert.deepEqual(JSON.parse(readFileSync(join(logOwnersDir(dir), claims[0]!), 'utf8')), { stateDir });
+
+  assert.deepEqual(errors, [
+    `owenloop shift: reaped 1 worker log(s) older than ${String(DEFAULT_SHIFT_LOG_MAX_AGE_MS)}ms from ${dir}`,
+  ]);
+});
+
+test('prepareShiftLogDir reports and disables logging when the directory cannot be created', () => {
+  // The PARENT of the log directory is a regular file, so `mkdirSync` fails
+  // ENOTDIR. Chosen over a permission bit because it does not depend on the uid
+  // the test runs as — root would sail through a 0o500 directory.
+  const blocker = join(root, 'not-a-dir');
+  writeFileSync(blocker, 'x');
+  const dir = join(blocker, 'logs');
+  const errors: string[] = [];
+
+  const prepared = prepareShiftLogDir({
+    flagDir: dir, env: {}, stateDir: join(root, 'prep-state-2'), now: 0,
+    err: (line) => errors.push(line), label: 'owenloop shift',
+  });
+
+  assert.equal(prepared.ready, false, 'ready:false is what tells runtime.ts to build NO sink');
+  assert.deepEqual(prepared.reaped, []);
+  assert.equal(prepared.dir, dir, 'the resolved path is still reported, so the message can name it');
+  assert.equal(prepared.maxAgeMs, DEFAULT_SHIFT_LOG_MAX_AGE_MS);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0]!, /^owenloop shift: cannot create shift log directory /);
+  assert.match(errors[0]!, /continuing with logging disabled$/);
+  // Nothing was created underneath the blocker, and the blocker is untouched.
+  assert.equal(readFileSync(blocker, 'utf8'), 'x');
+  assert.equal(existsSync(logOwnersDir(dir)), false);
+});
+
+test('prepareShiftLogDir keeps dispatching when the claim cannot be written', () => {
+  const dir = join(root, 'prep-unclaimable');
+  const stateDir = join(root, 'prep-state-3');
+  mkdirSync(dir, { recursive: true });
+  mkdirSync(stateDir, { recursive: true });
+  // `.owners` is a FILE, so `registerShiftLogOwner`'s mkdir fails — again a
+  // uid-independent failure rather than a permission bit.
+  writeFileSync(logOwnersDir(dir), 'x');
+  const now = 100 * DAY;
+  const stale = agedLog(dir, 'run_stale.log', now, 30 * DAY);
+  const errors: string[] = [];
+
+  const prepared = prepareShiftLogDir({
+    flagDir: dir, env: {}, stateDir, now, err: (line) => errors.push(line), label: 'owenloop shift',
+  });
+
+  // ready:TRUE. An unclaimable registry costs retention SAFETY, not dispatch.
+  assert.equal(prepared.ready, true);
+  // And the sweep still ran afterwards — the claim failure did not abort the rest.
+  assert.deepEqual(prepared.reaped, [stale]);
+  assert.equal(existsSync(stale), false);
+  assert.equal(errors.length, 2);
+  assert.match(errors[0]!, /^owenloop shift: cannot record this shift's claim on /);
+  assert.match(errors[0]!, /may reap this one's worker logs$/);
+  assert.match(errors[1]!, /^owenloop shift: reaped 1 worker log\(s\) /);
+});
+
+test('prepareShiftLogDir stays silent when there is nothing to reap', () => {
+  const dir = join(root, 'prep-quiet');
+  const stateDir = join(root, 'prep-state-4');
+  mkdirSync(dir, { recursive: true });
+  mkdirSync(stateDir, { recursive: true });
+  const now = 100 * DAY;
+  agedLog(dir, 'run_fresh.log', now, 1 * DAY);
+  const errors: string[] = [];
+
+  const prepared = prepareShiftLogDir({
+    flagDir: dir, env: {}, stateDir, now, err: (line) => errors.push(line), label: 'owenloop shift',
+  });
+
+  assert.equal(prepared.ready, true);
+  assert.deepEqual(prepared.reaped, []);
+  assert.deepEqual(errors, [], 'a normal startup must not narrate itself');
+});
+
+test('prepareShiftLogDir threads BOTH resolutions, and reports the age it actually used', () => {
+  const stateDir = join(root, 'prep-state-5');
+  mkdirSync(stateDir, { recursive: true });
+  const flagDir = join(root, 'prep-flag');
+  const envDir = join(root, 'prep-env');
+  const settingsDir = join(root, 'prep-settings');
+  const base = { stateDir, now: 100 * DAY, err: () => {}, label: 'owenloop shift' };
+
+  // --log-dir wins, and its --log-max-age with it.
+  const byFlag = prepareShiftLogDir({
+    ...base, flagDir, flagMaxAgeMs: 7,
+    env: { OWENLOOP_SHIFT_LOG_DIR: envDir, OWENLOOP_SHIFT_LOG_MAX_AGE_MS: '8' },
+    settingsLogDir: settingsDir, settingsMaxAgeMs: 9,
+  });
+  assert.deepEqual([byFlag.dir, byFlag.maxAgeMs], [flagDir, 7]);
+
+  const byEnv = prepareShiftLogDir({
+    ...base, env: { OWENLOOP_SHIFT_LOG_DIR: envDir, OWENLOOP_SHIFT_LOG_MAX_AGE_MS: '8' },
+    settingsLogDir: settingsDir, settingsMaxAgeMs: 9,
+  });
+  assert.deepEqual([byEnv.dir, byEnv.maxAgeMs], [envDir, 8]);
+
+  const bySettings = prepareShiftLogDir({ ...base, env: {}, settingsLogDir: settingsDir, settingsMaxAgeMs: 9 });
+  assert.deepEqual([bySettings.dir, bySettings.maxAgeMs], [settingsDir, 9]);
+
+  // Nothing set at all ⇒ logs land in the state dir, beside the `<run>.json`
+  // records they correlate to.
+  const byDefault = prepareShiftLogDir({ ...base, env: {} });
+  assert.deepEqual([byDefault.dir, byDefault.maxAgeMs], [stateDir, DEFAULT_SHIFT_LOG_MAX_AGE_MS]);
+
+  // Each winning directory was actually created, not merely named.
+  for (const created of [flagDir, envDir, settingsDir, stateDir]) {
+    assert.equal(existsSync(created), true, `${created} must exist`);
+  }
+
+  // `maxAgeMs: 0` means "reap every completed log", and the report must quote
+  // the number that was used rather than the default.
+  const errors: string[] = [];
+  const zeroDir = join(root, 'prep-zero');
+  mkdirSync(zeroDir, { recursive: true });
+  agedLog(zeroDir, 'run_new.log', 100 * DAY, 0);
+  const zero = prepareShiftLogDir({
+    ...base, flagDir: zeroDir, flagMaxAgeMs: 0, env: {}, err: (line) => errors.push(line),
+  });
+  assert.equal(zero.maxAgeMs, 0);
+  assert.equal(zero.reaped.length, 1);
+  assert.deepEqual(errors, [`owenloop shift: reaped 1 worker log(s) older than 0ms from ${zeroDir}`]);
+});
+
+test('a REAL sweep at zero retention eats the worker logs and spares the registry', () => {
   // `.owners` sits inside the log directory, which by default IS the state
-  // directory. A sweep that removed by age alone would eat it.
-  assert.equal(isWorkerLogName(LOG_OWNERS_DIR_NAME), false);
-  assert.equal(logOwnersDir('/logs'), join('/logs', LOG_OWNERS_DIR_NAME));
+  // directory, and a sweep that removed by age alone would eat it. The registry
+  // is what tells the NEXT sweep which shifts' in-flight logs to spare, so
+  // losing it silently converts every other shift's live log into a candidate.
+  //
+  // Asserted against a real directory and a real `sweepShiftLogs`, not against
+  // `isWorkerLogName(LOG_OWNERS_DIR_NAME)`. That predicate returns false for
+  // every string not ending in `.log`, so it holds for '.owners' the way it
+  // holds for 'banana' — it cannot distinguish a sweep that protects the
+  // registry from one that never looks at it. Only running the sweep can.
+  const dir = join(root, 'spare-owners');
+  const stateDir = join(root, 'spare-state');
+  mkdirSync(dir, { recursive: true });
+  mkdirSync(stateDir, { recursive: true });
+  const now = 100 * DAY;
+
+  // A claim written by ANOTHER shift, aged well past the retention window along
+  // with everything else here — age is exactly what must not decide its fate.
+  const otherStateDir = join(root, 'spare-other-state');
+  mkdirSync(otherStateDir, { recursive: true });
+  const claim = registerShiftLogOwner(dir, otherStateDir);
+  const ownersPath = logOwnersDir(dir);
+  const old = (now - 100 * DAY) / 1000;
+  utimesSync(claim, old, old);
+  utimesSync(ownersPath, old, old);
+
+  const worker = agedLog(dir, 'run_done.log', now, 100 * DAY);
+  const shiftLog = agedLog(dir, SHIFT_LOG_NAME, now, 100 * DAY);
+
+  const errors: string[] = [];
+  const removed = sweepShiftLogs({ dir, stateDir, now, maxAgeMs: 0, err: (line) => errors.push(line) });
+
+  // EXACTLY the worker log, by name — not "at least one", which a sweep that
+  // also removed the registry would satisfy.
+  assert.deepEqual(removed, [worker]);
+  // AND the sweep never so much as TRIED the registry. This line is what makes
+  // the survival assertions below a property of the code rather than of the
+  // filesystem: `remove` is `rmSync(path, { force: true })`, which throws
+  // ERR_FS_EISDIR on a directory, and the loop's per-entry catch turns that into
+  // a report here. A sweep that stopped skipping `.owners` would leave it on
+  // disk anyway — and leave this line behind as the evidence.
+  assert.deepEqual(errors, [], 'the registry must be skipped, not attempted-and-failed');
+  assert.equal(existsSync(worker), false);
+  assert.equal(existsSync(ownersPath), true, 'the registry directory must survive');
+  assert.equal(existsSync(claim), true, "and so must another shift's claim inside it");
+  assert.deepEqual(
+    JSON.parse(readFileSync(claim, 'utf8')) as unknown,
+    { stateDir: resolve(otherStateDir) },
+    'the claim must be intact, not merely present',
+  );
+  assert.equal(existsSync(shiftLog), true, 'and the shift log the daemon is appending to right now');
+
+  // The registry still answers correctly afterwards, which is the consequence
+  // that actually matters: a NEXT sweep still knows to spare that shift's logs.
+  assert.deepEqual(readShiftLogOwners(dir, stateDir).sort(), [resolve(stateDir), resolve(otherStateDir)].sort());
 });
 
 test('sweepShiftLogs reports an unreadable directory and returns empty', () => {
@@ -316,6 +616,28 @@ test('sweepShiftLogs reports an unreadable directory and returns empty', () => {
 
 // ── which events reach which consumer ──────────────────────────────────────
 
+/**
+ * Every variant of `ShiftEventBody['type']`, listed once so the routing test
+ * below can be exhaustive rather than a sample.
+ *
+ * The two type-level guards underneath are the reason this list is worth
+ * maintaining: adding a variant to `ShiftEventBody` without deciding here
+ * whether it wakes a parked `owenloop shift next` fails `npm run typecheck`,
+ * not some later acceptance test's timing.
+ */
+const ALL_EVENT_TYPES = [
+  'parked', 'capacity', 'event-queue-overflow',
+  'dispatched', 'reaped', 'failed', 'gate', 'ended',
+  'hub-error', 'bundle-miss', 'order-dropped',
+] as const;
+
+/** Fails to compile if the list above names a type that is not a variant. */
+const _noExtraEventTypes: readonly ShiftEventBody['type'][] = ALL_EVENT_TYPES;
+/** Fails to compile if a variant exists that the list above does not name. */
+const _noMissingEventTypes: [Exclude<ShiftEventBody['type'], (typeof ALL_EVENT_TYPES)[number]>] extends [never]
+  ? true
+  : false = true;
+
 test('parked, capacity and overflow are FILE-ONLY; every other event reaches the socket', () => {
   // Load-bearing and otherwise proven only indirectly, through a timing race in
   // `shift-blocking-acceptance.test.ts`. The rule: a parked `owenloop shift
@@ -323,16 +645,29 @@ test('parked, capacity and overflow are FILE-ONLY; every other event reaches the
   // parked, it is at capacity, its queue overflowed — must not be what wakes the
   // client. Those three still reach `shift.log`, which is the durable consumer
   // they were promoted for.
-  for (const type of ['parked', 'capacity', 'event-queue-overflow'] as const) {
+  const fileOnly = ['parked', 'capacity', 'event-queue-overflow'] as const;
+  for (const type of fileOnly) {
     assert.equal(reachesSocketConsumer(type), false, `${type} must not wake a parked next`);
   }
+
   // Everything else is genuine work-shaped news a client asked to be woken for.
-  for (const type of [
-    'dispatched', 'reaped', 'failed', 'gate', 'ended',
-    'hub-error', 'bundle-miss', 'order-dropped',
-  ] as const) {
+  // Derived from `ALL_EVENT_TYPES` rather than written out a second time, so a
+  // new variant lands in exactly one of the two lists and never in neither.
+  const socketBound = ALL_EVENT_TYPES.filter((type) => !(fileOnly as readonly string[]).includes(type));
+  for (const type of socketBound) {
     assert.equal(reachesSocketConsumer(type), true, `${type} must reach a parked next`);
   }
+
+  // `gate` IS in that list and deserves a caveat, because a reader could
+  // otherwise take this test as evidence about live behaviour it does not
+  // provide: `GateEvent` is a RESERVED variant — nothing in `packages/work/src`
+  // constructs one, on this branch or before it. The assertion above is
+  // therefore about the routing DEFAULT, not about any record an operator will
+  // see: `reachesSocketConsumer` is `!FILE_ONLY_EVENTS.has(type)`, so a type
+  // nobody left out of that set is socket-bound the moment a producer appears.
+  // Asserting it here is what makes the eventual producer inherit a decided
+  // route instead of an accidental one.
+  assert.equal(socketBound.includes('gate'), true);
 });
 
 // ── the spawn plan's log destination ───────────────────────────────────────
@@ -429,21 +764,34 @@ test('a write failure is reported ONCE and never throws, and writing keeps being
   assert.equal(errors.length, 1);
 });
 
-test('a real unwritable log directory costs the log, not the process', () => {
-  const dir = join(root, 'readonly');
-  mkdirSync(dir);
-  chmodSync(dir, 0o500);
+test('a real unwritable log destination costs the log, not the process', () => {
+  // The destination's PARENT is a regular file, so every `appendFileSync` fails
+  // ENOTDIR. Chosen over `chmodSync(dir, 0o500)` because permission bits do not
+  // deny root, and root is the default uid in most CI containers — under it the
+  // append would SUCCEED and this test would fail for a reason that has nothing
+  // to do with the code. ENOTDIR is uid-independent.
+  const blocker = join(root, 'not-a-dir-sink');
+  writeFileSync(blocker, 'x');
+  const path = join(blocker, 'shift.log');
   const errors: string[] = [];
-  const sink = createShiftLogSink({ path: join(dir, 'shift.log'), err: (line) => errors.push(line) });
+  const sink = createShiftLogSink({ path, err: (line) => errors.push(line) });
 
   // The assertion is the absence of a throw: a shift whose only defect is that
   // it cannot write a log must still dispatch work.
   sink.write(ev({ type: 'ended' }));
-  chmodSync(dir, 0o700);
 
   assert.equal(errors.length, 1);
-  assert.ok(errors[0]?.includes('failed'), errors[0]);
-  assert.equal(existsSync(join(dir, 'shift.log')), false);
+  assert.ok(errors[0]?.includes(`shift log sink write to ${path} failed`), errors[0]);
+  assert.ok(errors[0]?.includes('continuing without it'), errors[0]);
+  assert.equal(existsSync(path), false);
+  // Nothing was written THROUGH the blocking file either — it is byte-identical.
+  assert.equal(readFileSync(blocker, 'utf8'), 'x');
+
+  // And the report is latched across further failing writes, exactly as the
+  // injected-`append` test above establishes for a synthetic failure.
+  sink.write(ev({ type: 'ended' }));
+  sink.write(ev({ type: 'ended' }));
+  assert.equal(errors.length, 1, errors.join('\n'));
 });
 
 test('an unserializable event costs that record only', () => {

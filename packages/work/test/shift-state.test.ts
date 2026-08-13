@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
@@ -40,6 +40,27 @@ test('resolveStateDir: override → XDG_STATE_HOME → HOME, else throws', () =>
   assert.equal(resolveStateDir({ XDG_STATE_HOME: '/xs', HOME: '/h' }), join('/xs', 'owenloop', 'exec'));
   assert.equal(resolveStateDir({ HOME: '/h' }), join('/h', '.local', 'state', 'owenloop', 'exec'));
   assert.throws(() => resolveStateDir({}), /cannot locate a state directory/);
+});
+
+test('resolveStateDir returns an ABSOLUTE path at every precedence level', () => {
+  // `--state-dir ./state` is a legal thing for an operator to type. While only
+  // this process joined paths onto the result, the relative spelling was
+  // harmless. It stopped being harmless when the log-owner registry began
+  // WRITING this string into a file that a DIFFERENT shift process, with a
+  // DIFFERENT working directory, reads back and probes for `<run>.json`:
+  // `./state` resolved against the wrong cwd finds no record, the in-flight
+  // gate concludes the run finished, and a live worker's log is unlinked.
+  const cwd = process.cwd();
+  assert.equal(resolveStateDir({ HOME: '/h' }, './state'), join(cwd, 'state'));
+  assert.equal(resolveStateDir({ XDG_STATE_HOME: 'xs', HOME: '/h' }), join(cwd, 'xs', 'owenloop', 'exec'));
+  assert.equal(resolveStateDir({ HOME: '../h' }), join(resolve(cwd, '../h'), '.local', 'state', 'owenloop', 'exec'));
+  for (const produced of [
+    resolveStateDir({ HOME: '/h' }, './state'),
+    resolveStateDir({ XDG_STATE_HOME: 'xs', HOME: '/h' }),
+    resolveStateDir({ HOME: '../h' }),
+  ]) {
+    assert.equal(isAbsolute(produced), true, `${produced} must be absolute`);
+  }
 });
 
 test('write then read round-trips a child record', () => {

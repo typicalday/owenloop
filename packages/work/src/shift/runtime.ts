@@ -7,7 +7,6 @@
  * behavior. The retired shift stdio-MCP mount is intentionally absent.
  */
 import { randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { basename, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -18,13 +17,7 @@ import { loadSettings } from '../settings/settings.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createShiftLoop, type ShiftLoop } from './loop.ts';
 import { createShiftLogSink } from './logsink.ts';
-import {
-  registerShiftLogOwner,
-  resolveShiftLogDir,
-  resolveShiftLogMaxAgeMs,
-  shiftLogFile,
-  sweepShiftLogs,
-} from './logretention.ts';
+import { prepareShiftLogDir, shiftLogFile } from './logretention.ts';
 import { stampShiftEvent, type ShiftEvent, type ShiftEventBody } from './protocol.ts';
 import { createDefaultSpawner, type WorkerFailure } from './spawn.ts';
 import { resolveStateDir, ensureStateDir, reconcileInFlight } from './state.ts';
@@ -329,65 +322,29 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
 
   // ── ON-DISK LOGGING ──
   //
-  // Resolved AFTER `ensureStateDir` because the log directory DEFAULTS to the
-  // state directory, and resolved BEFORE the spawner because every dispatch
-  // needs the destination.
+  // Prepared AFTER `ensureStateDir` because the log directory DEFAULTS to the
+  // state directory, and BEFORE the spawner because every dispatch needs the
+  // destination.
   //
-  // Every step below degrades to "no logging" rather than failing the shift. A
-  // shift whose only defect is that it cannot write a log must still dispatch
-  // work; refusing to start would turn an observability feature into an outage.
-  const logDir = resolveShiftLogDir(parsed.logDir, env, settings.shiftLogDir, stateDir);
-  const logMaxAgeMs = resolveShiftLogMaxAgeMs(parsed.logMaxAgeMs, env, settings.shiftLogMaxAgeMs);
-  let logDirReady = true;
-  try {
-    mkdirSync(logDir, { recursive: true });
-  } catch (err) {
-    logDirReady = false;
-    process.stderr.write(
-      `${roleLabel}: cannot create shift log directory ${logDir}: ${errMsg(err)} — ` +
-        'continuing with logging disabled\n',
-    );
-  }
-
-  if (logDirReady) {
-    // Claim the log directory for THIS shift's state directory BEFORE sweeping
-    // it. The claim is what lets any other shift sharing this log directory
-    // consult our in-flight records instead of reaping our live workers' logs —
-    // and, symmetrically, what lets our sweep below see theirs. Writing it first
-    // means our own records gate our own sweep even on the very first startup.
-    //
-    // A failed claim costs retention safety, not dispatch: report once and keep
-    // going, exactly like every other step in this block.
-    try {
-      registerShiftLogOwner(logDir, stateDir);
-    } catch (err) {
-      process.stderr.write(
-        `${roleLabel}: cannot record this shift's claim on ${logDir}: ${errMsg(err)} — ` +
-          'another shift sharing this log directory may reap this one\'s worker logs\n',
-      );
-    }
-
-    // Retention runs once at startup, before any dispatch. `sweepShiftLogs`
-    // never throws by contract; the guard is belt-and-braces so that a future
-    // change to it can never become a startup failure.
-    try {
-      const reaped = sweepShiftLogs({
-        dir: logDir,
-        stateDir,
-        now: Date.now(),
-        maxAgeMs: logMaxAgeMs,
-        err: (line) => process.stderr.write(`${line}\n`),
-      });
-      if (reaped.length > 0) {
-        process.stderr.write(
-          `${roleLabel}: reaped ${String(reaped.length)} worker log(s) older than ` +
-            `${String(logMaxAgeMs)}ms from ${logDir}\n`,
-        );
-      }
-    } catch (err) {
-      process.stderr.write(`${roleLabel}: shift log sweep failed (continuing): ${errMsg(err)}\n`);
-    }
-  }
+  // `prepareShiftLogDir` resolves the directory, creates it, claims it for this
+  // shift's state directory, and sweeps aged-out worker logs — and degrades to
+  // "less logging" rather than failing the shift at every one of those steps.
+  // Its branches are unit-tested directly; what THIS site owns is the wiring:
+  // which flags, settings and environment reach it, and that a `ready: false`
+  // result withholds both the sink and the spawner's log directory.
+  const prepared = prepareShiftLogDir({
+    flagDir: parsed.logDir,
+    flagMaxAgeMs: parsed.logMaxAgeMs,
+    env,
+    settingsLogDir: settings.shiftLogDir,
+    settingsMaxAgeMs: settings.shiftLogMaxAgeMs,
+    stateDir,
+    now: Date.now(),
+    err: (line) => process.stderr.write(`${line}\n`),
+    label: roleLabel,
+  });
+  const logDir = prepared.dir;
+  const logDirReady = prepared.ready;
 
   const logSink = logDirReady
     ? createShiftLogSink({

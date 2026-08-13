@@ -93,12 +93,21 @@ export interface ParkedEvent {
 }
 
 /**
- * No local capacity, so `whats_next` was deferred. Explains a shift that is
- * running nothing new while work remains outstanding.
+ * No local capacity, so the `whats_next` SWEEP was deferred. Explains a shift
+ * that is running nothing new while work remains outstanding.
  *
- * EDGE-TRIGGERED: one record per unbroken stretch at capacity, emitted when the
- * shift ENTERS that state, not once per tick while it stays there. How long the
- * stretch lasted is recoverable from the next record's `ts`.
+ * NOT "the hub was not polled" — `opts.hub.wake(cursor)` runs every tick
+ * regardless of local capacity. Only the follow-up sweep is skipped, so this
+ * record means "there was news and I had nowhere to put it".
+ *
+ * EDGE-TRIGGERED: AT MOST one record per unbroken stretch at capacity, emitted
+ * when the shift ENTERS that state, not once per tick while it stays there. How
+ * long the stretch lasted is recoverable from the next record's `ts`.
+ *
+ * At most, not exactly: the emit sits inside `loop.ts`'s `changed && k <= 0`
+ * branch, so it needs a wake that reports a CHANGED cursor. A shift that fills
+ * up and stays full while the hub reports nothing new produces no record at all,
+ * and the absence of one is not evidence the shift had free slots.
  *
  * FILE-ONLY, for the same reason as `ParkedEvent`. On the socket it is both
  * redundant and harmful: every `ShiftCapacity` response already carries live

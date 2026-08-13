@@ -99,7 +99,7 @@ Two properties an uploader can rely on:
 | `dispatched` | `workflow`, `run`, `step`, `kind`, `pid` | a worker was spawned |
 | `reaped` | `workflow`, `run`, `kind`, `pid` | a worker exited and was collected |
 | `failed` | `workflow`, `run`, `step`, `kind`, `message`, optional `harness`, `executable`, `exitStatus`, `signal` | a worker died or could not be spawned |
-| `capacity` | `inFlight`, `cap` | no free slot, so the hub was not polled — explains an idle shift. **Edge-triggered:** one record per unbroken stretch at capacity, not one per tick |
+| `capacity` | `inFlight`, `cap` | no free slot, so the `whats_next` sweep was deferred — explains a shift running nothing new while work is outstanding. **Edge-triggered**, and emitted only on a *changed* wake — see below |
 | `hub-error` | `op` (`wake`\|`whats_next`), `message`, optional `workflow` | a hub call failed |
 | `bundle-miss` | `workflow`, `def` | a legacy order named a def with no cached bundle |
 | `order-dropped` | `workflow`, `run`, `step`, `reason`, `message` | the shift refused one order and left it for hub pickup |
@@ -238,7 +238,24 @@ fast one.
 
 **One asymmetry to know about.** `capacity` is edge-triggered — one record when
 the shift becomes full, not one per poll — precisely because repetition into a
-never-rotated file actively harms it. `hub-error` deliberately did **not** get
+never-rotated file actively harms it.
+
+Read `capacity` as *at most* one record per at-capacity stretch, not exactly
+one. Two things narrow it, both visible in `packages/work/src/shift/loop.ts`:
+
+- **The hub IS still polled while a shift is full.** `opts.hub.wake(cursor)`
+  runs every tick regardless of local capacity. Only the follow-up `whats_next`
+  sweep is deferred. So a `capacity` record means "there was news and I could
+  not go get it", never "I stopped talking to the hub".
+- **The emit sits inside the `changed && k <= 0` branch.** It fires only on a
+  wake that reports a *changed* cursor. A shift that fills up and stays full
+  while the hub reports nothing new produces **no `capacity` record at all**.
+  The absence of a record is therefore not evidence the shift had free slots.
+
+An uploader should treat `capacity` as a hint about a moment, and derive
+occupancy from `dispatched`/`reaped`/`failed` pairs, which are unconditional.
+
+`hub-error` deliberately did **not** get
 that treatment: it is level-triggered, so a hub that is unreachable for a day
 writes roughly one record per poll interval per workflow (~17k/day at the 5s
 default). The reasoning is that a repeated `capacity` says nothing new, whereas
@@ -342,10 +359,26 @@ state directory still holds its `<run>.json`. Properties that matter:
 - **One file per shift, named by a hash of the state directory it names.** Two
   shifts starting simultaneously each write their own path, so no
   read-modify-write can lose a claim.
-- **A stale claim is harmless.** A retired crew's state directory either no
-  longer exists or holds no records; it contributes no match and costs one
-  `stat`. Erring toward keeping a log costs disk. Erring the other way costs an
-  operator the evidence they went looking for.
+- **A stale claim errs safe, but it is not free.** If the retired shift's state
+  directory no longer exists, or exists and holds no `<run>.json`, the claim
+  contributes no match and costs one `stat` per candidate log. That is the
+  common case and it is genuinely harmless.
+
+  The case to know about is a state directory that **survives with records in
+  it**. `<run>.json` is removed by `reconcileInFlight`, which only ever runs
+  against a state directory a live shift is attending
+  (`packages/work/src/shift/state.ts`). A retired crew's directory that no shift
+  attends again keeps its records indefinitely — and `isShiftLogReapable`
+  returns false whenever `hasRunRecord`, so every matching `<run>.log` becomes
+  permanently un-reapable. The cost is unbounded disk, not one `stat`.
+
+  The direction is deliberate: erring toward keeping a log costs disk, erring
+  the other way costs an operator the evidence they went looking for, and an
+  orphaned inode is unrecoverable while a wasted byte is not. **Operationally**:
+  deleting a retired shift's state directory outright also retires its claim's
+  effect, because a claim naming a directory that does not exist matches
+  nothing. Deleting the claim file alone is not enough if some *other* shift
+  also claims that directory.
 - **A corrupt or unreadable claim costs only its claimant**, never the sweep,
   and the sweeping shift's own state directory is always consulted regardless.
 - If the claim cannot be written, the shift reports one line to its stderr and

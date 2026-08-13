@@ -1082,7 +1082,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     } else if (changed && k <= 0) {
       sweepOwed = true;
       opts.out(`at capacity (${occupied}/${cap} in flight) — deferring whats_next until capacity is free`);
-      // EDGE-TRIGGERED: one record per at-capacity EPISODE, not per tick.
+      // EDGE-TRIGGERED: at most one record per at-capacity EPISODE, not per
+      // tick. At MOST, because this branch needs `changed` — an episode during
+      // which no wake reports a changed cursor produces no record at all. The
+      // absence of one therefore says nothing about occupancy; `dispatched` and
+      // `reaped` are the unconditional pair a reader should count.
       //
       // This branch runs on every changed wake for as long as the shift stays
       // full, which on a busy hub is every poll interval. The console line above
