@@ -15,7 +15,7 @@ import { createHubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
-import { createShiftLoop } from './loop.ts';
+import { createShiftLoop, type ShiftLoop } from './loop.ts';
 import { createDefaultSpawner, type WorkerFailure } from './spawn.ts';
 import { resolveStateDir, ensureStateDir, reconcileInFlight } from './state.ts';
 import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.ts';
@@ -296,6 +296,18 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   const startedAt = now();
   const name = resolveShiftName(parsed.name, { shiftId });
   let daemon: ShiftDaemon | undefined;
+  /**
+   * `loop` is constructed BELOW this function, so it is captured by reference
+   * rather than value — exactly as `daemon` is, and for the same reason. Both
+   * are safe because nothing calls `reportWorkerFailure` until a spawned child
+   * exits, which cannot happen before construction finishes.
+   *
+   * A one-field holder rather than a bare `let`: `let loopRef; loopRef = loop;`
+   * is a single write in the same scope as the declaration, which is exactly
+   * the shape `prefer-const` rejects. The field write is not a rebinding, so
+   * the holder can be `const`.
+   */
+  const loopRef: { current: ShiftLoop | undefined } = { current: undefined };
   const reportWorkerFailure = (failure: WorkerFailure): void => {
     const event = {
       type: 'failed' as const,
@@ -311,6 +323,10 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     };
     daemon?.onEvent(event);
     process.stderr.write(`${roleLabel}: worker failure ${JSON.stringify(event)}\n`);
+    // The third consumer, and the one that changes behaviour: charge the
+    // failure against the step's dispatch brake so a step that fails the same
+    // way forever is re-dispatched on a backoff instead of once per poll.
+    loopRef.current?.noteWorkerFailure(failure);
   };
   const spawner = createDefaultSpawner(origin, account, undefined, shiftId, reportWorkerFailure);
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
@@ -341,6 +357,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     ...(parsed.workflow !== undefined ? { workflow: parsed.workflow } : {}),
     ...(parsed.once === true ? { once: true } : {}),
   });
+  // Close the loop on `reportWorkerFailure`'s forward reference. Assigned
+  // immediately after construction, long before any child can exit.
+  loopRef.current = loop;
 
   if (daemonMode) {
     daemon = createShiftDaemon({
