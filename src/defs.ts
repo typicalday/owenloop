@@ -27,6 +27,9 @@ import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce, parseWorkdirFrom } from './paths.ts';
 import { parseDurationMs, parseDurationSecs } from './util.ts';
 import { assertValidSchema } from './schema.ts';
+// The separator lives with composition/matching (capabilities.ts); the parser
+// only enforces that an AUTHORED name never contains it.
+import { MODIFIER_SEPARATOR } from './capabilities.ts';
 import type { Acceptance, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
@@ -206,19 +209,6 @@ function asStringArray(v: unknown, ctx: string): string[] {
   }
   return v as string[];
 }
-/**
- * The character the engine reserves as the capability/modifier separator.
- *
- * A def author never writes it. `wise:deep` is a value the ENGINE composes at
- * offer time from an authored capability plus the run's modifier, and a crew
- * binding is matched against that composed form. If an author could also write
- * a literal `wise:deep` capability, two different things — an authored name and
- * a composed compound — would be indistinguishable downstream, and the name
- * part of a compound would stop being recoverable by splitting on the first
- * colon. So the position is reserved, and reserving it is enforced here.
- */
-const MODIFIER_SEPARATOR = ':';
-
 /**
  * A routing capability as an author may write it: no separator, no surrounding
  * whitespace, non-empty.

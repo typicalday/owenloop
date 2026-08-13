@@ -34,6 +34,8 @@ import type { ArtifactMap, CascadeOp, ChildStatusSummary, Firing, TimeFacts, Wor
 import { summarizeIssues, validateValue } from './schema.ts';
 import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
+import { claimMatches, composeCapabilities } from './capabilities.ts';
+import type { MatchMode } from './capabilities.ts';
 import { localMidnightMs, nowMs, randId } from './util.ts';
 import type { Store, WorkflowRow } from './store.ts';
 import type {
@@ -1323,8 +1325,42 @@ export class Engine {
    * Pass `{ deep: false }` (CLI `--shallow`) to restore the pre-deep behavior:
    * only this instance's own orders. See `TickResult` for the fold semantics.
    */
-  tick(workflow: string, opts: { now?: number; deep?: boolean; capabilities?: string[] } = {}): TickResult {
-    return this.tickInternal(workflow, opts.now ?? nowMs(), opts.deep ?? true, opts.capabilities ?? [], new Set(), 0);
+  tick(
+    workflow: string,
+    opts: {
+      now?: number;
+      deep?: boolean;
+      /**
+       * The claiming crew's capabilities. OMITTING this is not the same as
+       * passing `[]`: omitted means "no filter presented" (a local operator or
+       * test driver — everything matches, as before capabilities existed),
+       * while `[]` means a crew that serves nothing and therefore matches only
+       * capability-silent steps. See `claimMatches`.
+       */
+      capabilities?: string[];
+      /**
+       * Per-offered-capability claim mode, keyed by the COMPOSED capability
+       * (`wise:deep`), supplied by the caller that can see crew bindings — the
+       * hub. Any capability absent from the map is matched by name part
+       * (`DEFAULT_MATCH_MODE`), which is what a caller with no binding
+       * knowledge should get: the permissive tier. The pure engine never
+       * decides a mode, it only enforces the one it is handed.
+       */
+      matchModes?: Record<string, MatchMode>;
+    } = {},
+  ): TickResult {
+    // `capabilities` is passed through AS GIVEN — an omitted filter (undefined)
+    // and an empty list are different claims. See `claimMatches`.
+    return this.tickInternal(
+      workflow,
+      opts.now ?? nowMs(),
+      opts.deep ?? true,
+      opts.capabilities,
+      new Set(),
+      0,
+      undefined,
+      opts.matchModes ?? {},
+    );
   }
 
   /**
@@ -1370,10 +1406,11 @@ export class Engine {
     workflow: string,
     now: number,
     deep: boolean,
-    capabilities: string[],
+    capabilities: string[] | undefined,
     visited: Set<string>,
     depth: number,
     parentEdge?: { parentWf: string; step: StepDef; callsStem: string },
+    matchModes: Record<string, MatchMode> = {},
   ): TickResult {
     if (depth > this.maxCallDepth) {
       throw new Error(
@@ -1384,7 +1421,10 @@ export class Engine {
     }
     if (visited.has(workflow)) return { workflow, orders: [], reaped: 0, deferred: [] };
     visited.add(workflow);
-    const def = this.defFor(workflow);
+    // ONE run-record read per frame yields both the pinned def and the run's
+    // routing modifier. Each frame reads its OWN instance, so a calls: child is
+    // composed against the child's modifier, never the parent's.
+    const { def, modifier } = this.instanceFor(workflow);
     // M2B: maintain calls: child instances before the normal tick/reap/claim cycle.
     this.maintainCalls(workflow, def, now);
     // B1: set inside the frame tx when the parent↔child consistency guard fires;
@@ -1424,12 +1464,12 @@ export class Engine {
       const timeFacts = this.computeTimeFacts(def, workflow, arts, now);
 
       const firings = eligibleFirings(def, arts, timeFacts);
-      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, capabilities);
+      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, capabilities, modifier, matchModes);
 
       const orders: Order[] = [];
       const allDeferred: DeferredFiring[] = [...deferred];
       for (const f of selected) {
-        const claimed = this.claim(workflow, def, f, arts, now);
+        const claimed = this.claim(workflow, def, f, arts, now, modifier);
         if (claimed === 'in-flight') {
           const d: DeferredFiring = { step: f.step, key: f.key, inputs: f.inputs, outputs: f.outputs, reason: 'in-flight' };
           if (f.index !== undefined) d.index = f.index;
@@ -1462,7 +1502,7 @@ export class Engine {
           parentWf: workflow,
           step,
           callsStem: step.produces[0]!.stem,
-        });
+        }, matchModes);
         // orders: flatten; each Order already carries its own `workflow`.
         result.orders.push(...cr.orders);
         // deferred: stamp child-originated entries with the child id, preserving
@@ -1531,18 +1571,25 @@ export class Engine {
 
   /**
    * Per-step cadence + daily budget + parallel cap over the eligible firings.
-   * A2: `capabilities` is the tick caller's optional claim filter — when non-empty, a
-   * step whose own `capabilities` are also non-empty is only schedulable when the two
-   * intersect; a disjoint step's firings are deferred as `'capability-mismatch'`.
-   * Filtering here (before cadence/budget) means a mismatched firing never
-   * consumes the caller's slots and never perturbs cadence math.
+   *
+   * A2: `capabilities` is the tick caller's claim filter, matched against the
+   * step's OFFERED capabilities — the authored list composed with the run's
+   * `modifier` (`wise` + `deep` → `wise:deep`), which is the same list the
+   * order will carry. `claimMatches` owns the rule; see it for the four cases
+   * (no filter presented, capability-silent step, empty caller list, both
+   * non-empty) and for what `matchModes` changes. A step this caller may not claim has every firing
+   * deferred as `'capability-mismatch'`. Filtering here (before cadence/budget)
+   * means a mismatched firing never consumes the caller's slots and never
+   * perturbs cadence math.
    */
   private applySchedule(
     workflow: string,
     def: WorkflowDef,
     firings: Firing[],
     now: number,
-    capabilities: string[],
+    capabilities: string[] | undefined,
+    modifier: string | undefined,
+    matchModes: Record<string, MatchMode>,
   ): { selected: Firing[]; deferred: DeferredFiring[] } {
     const midnight = localMidnightMs(now);
     const selected: Firing[] = [];
@@ -1558,11 +1605,10 @@ export class Engine {
       const stepFirings = firings.filter((f) => f.step === step.name);
       if (stepFirings.length === 0) continue;
 
-      // A2: caller capability filter vs. step capabilities. Both non-empty and disjoint →
-      // this caller must not claim the step; defer every firing and skip it
-      // before it touches cadence/budget/slot math.
-      if (capabilities.length > 0 && step.capabilities && step.capabilities.length > 0 &&
-          !step.capabilities.some((l) => capabilities.includes(l))) {
+      // A2: caller capability filter vs. the step's COMPOSED offer. Composed
+      // here, not authored, so a caller bound to `wise:deep` is judged against
+      // what the order will actually carry.
+      if (!claimMatches(composeCapabilities(step.capabilities, modifier), capabilities, matchModes)) {
         for (const f of stepFirings) defer(f, 'capability-mismatch');
         continue;
       }
@@ -1661,6 +1707,7 @@ export class Engine {
     f: Firing,
     arts: ArtifactMap,
     now: number,
+    modifier?: string,
   ): Order | 'in-flight' | DeferredClaim | null {
     const existing = this.store.getTask(workflow, f.step, f.key);
     if (existing && existing.status === 'claimed') {
@@ -1685,7 +1732,7 @@ export class Engine {
     // CONFLICT DO UPDATE, no history table), so the issued order is unrecoverable
     // later unless captured here; this persisted packet is the replay/eval/paper
     // trail record (buildOrder is deterministic modulo run id).
-    const order = this.buildOrder(def, workflow, runId, f, arts, fp);
+    const order = this.buildOrder(def, workflow, runId, f, arts, fp, modifier);
     if (typeof order === 'object' && 'deferred' in order) return order;
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
     this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, order, ...(f.cause ? { cause: f.cause } : {}) }, now);
@@ -1719,6 +1766,7 @@ export class Engine {
     f: Firing,
     arts: ArtifactMap,
     consumedFingerprint: Fingerprint,
+    modifier?: string,
   ): Order | DeferredClaim {
     const step = this.step(def, f.step);
     const consumes: Record<string, unknown> = {};
@@ -1814,6 +1862,16 @@ export class Engine {
       owes,
     };
     if (f.index !== undefined) order.index = f.index;
+    // The routing snapshot of THIS offer. `capabilities` is the composed list —
+    // absent on a capability-silent step, since there is nothing to compose
+    // onto. `modifier` is stamped whenever the run carries one, even for a
+    // capability-silent step, so the brief can surface the run's grade of
+    // service regardless of how the step routes. A claimed order is never
+    // recomposed: composition happens per offer, and this record is what the
+    // shift resolved against.
+    const offered = composeCapabilities(step.capabilities, modifier);
+    if (offered.length > 0) order.capabilities = offered;
+    if (modifier !== undefined) order.modifier = modifier;
     if (step.model !== undefined) order.model = step.model;
     if (step.executor !== undefined) order.worker = step.executor;
     if (step.judges !== undefined) order.judge = step.judges;
@@ -3099,15 +3157,28 @@ export class Engine {
     return { workflow: childWf, def: childDef.name, done: cs.done, stalled, debts: cs.debts.length };
   }
 
-  private defFor(workflow: string): WorkflowDef {
+  /**
+   * The two per-instance facts a tick needs, from ONE run-record read: the def
+   * this instance is pinned to, and the routing modifier it carries.
+   *
+   * Offer-time composition needs the modifier inside the claim path, where the
+   * run record was not previously in scope. Reading it here — in the same
+   * `getWorkflow` the def resolution already performs, once per tick frame —
+   * keeps that cost at zero extra reads rather than one per claim.
+   */
+  private instanceFor(workflow: string): { def: WorkflowDef; modifier?: string } {
     const wf = this.store.getWorkflow(workflow);
     if (!wf) throw new Error(`no such workflow instance: ${workflow}`);
     // §28: prefer the pinned snapshot taken at create time (or last `adopt`).
     // Rows created before this feature shipped have no snapshot — fall back
     // to today's name-resolution, unchanged. This is the compatibility path,
     // not an error: an un-pinned instance behaves exactly as it always has.
-    if (wf.defSnapshot !== undefined) return wf.defSnapshot;
-    return this.resolveDef(wf.def);
+    const def = wf.defSnapshot !== undefined ? wf.defSnapshot : this.resolveDef(wf.def);
+    return wf.modifier !== undefined ? { def, modifier: wf.modifier } : { def };
+  }
+
+  private defFor(workflow: string): WorkflowDef {
+    return this.instanceFor(workflow).def;
   }
 
   private step(def: WorkflowDef, name: string): StepDef {
