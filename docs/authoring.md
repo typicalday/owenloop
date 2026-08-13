@@ -197,6 +197,13 @@ interpreted by the engine beyond that. All three (`executor`, `command`,
 like `model` and `workdir`. See [`docs/design.md` §27.4](design.md) for the
 full contract.
 
+A command step's `consumes:` reach the command through its environment, not its
+working directory: `owenloop work exec` sets `OWENLOOP_CONSUMES` with the JSON
+inline, or `OWENLOOP_CONSUMES_FILE` with a path to it once that JSON exceeds
+64 KiB. See [`docs/bundles.md` § Consumed inputs for command
+steps](bundles.md#consumed-inputs-for-command-steps) for the reader snippet and
+the omitted-key rule.
+
 ## `capabilities:` — logical capability tags
 
 `capabilities:` is an optional list of strings on a step naming what that step
