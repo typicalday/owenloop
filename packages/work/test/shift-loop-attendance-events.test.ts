@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -368,32 +369,54 @@ test('a full dispatch cap emits one capacity event carrying both numbers', async
 });
 
 test('the capacity event reports inFlight and cap as DISTINCT numbers', async () => {
-  // The `cap: 0` fixture above makes both numbers zero, so it passes for an
-  // implementation that swaps the two fields or hardcodes either to 0 — the
-  // "carries both numbers" claim is exactly what it cannot prove. Here one LIVE
-  // child fills a cap of 1, so `inFlight` and `cap` are still equal in VALUE but
-  // both nonzero, and a hardcoded 0 in either field fails.
+  // The `cap: 0` fixture above makes BOTH numbers zero, so it stays green for an
+  // implementation that swaps the two fields or hardcodes either one — the
+  // "carries both numbers" claim is exactly what it cannot prove. A one-child,
+  // `cap: 1` fixture is barely better: the two numbers are still equal in VALUE,
+  // so `emit({ inFlight: cap, cap })` also survives it.
+  //
+  // So this fixture drives the two numbers APART: TWO live children against a
+  // cap of 1, which is a real state — the cap is read fresh each tick and an
+  // operator can lower it (or a restart can) while children spawned under the
+  // old cap are still running. The dispatch branch is `changed && k <= 0` with
+  // `k = cap - occupied`, so k = 1 - 2 = -1 still reports at-capacity. The
+  // expectation `inFlight: 2, cap: 1` now fails for a swap, for a hardcode of
+  // either field, and for `inFlight: cap`.
   cacheCommand();
   const events: ShiftEvent[] = [];
   const { hub } = mockHub(true);
-  // `process.pid` is a pid the liveness probe will find alive, which is what
-  // makes this record count against capacity instead of being reaped.
-  writeChildRecord(stateDir, {
-    workflow: 'wf1', run: 'run_live', pid: process.pid, spawnedAt: 0, kind: 'exec',
-  });
-  const loop = createShiftLoop(baseOpts(hub, () => ({ pid: 1000 }), {
-    cap: 1,
-    onEvent: (event) => events.push(event),
-  }));
-  hub.whatsNext = async (req) => req?.workflow === undefined
-    ? { text: '', instances: [{ workflow: 'wf1', def: 'demo', done: false, eligible: 1, blocked: 0, owedSeededInputs: [] }] }
-    : { text: '', workflow: 'wf1', def: 'demo', orders: [order('cmd')] };
+  // Two pids the liveness probe will find ALIVE, which is what makes both
+  // records count against capacity instead of being reaped. `process.pid` is
+  // this test process. The second is a real child we spawn and kill here rather
+  // than a guess like `process.ppid`, whose liveness is a property of how the
+  // suite was launched — a detail this test must not depend on.
+  const live = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], { stdio: 'ignore' });
+  try {
+    await until(() => live.pid !== undefined, 'the probe child reports a pid');
+    writeChildRecord(stateDir, {
+      workflow: 'wf1', run: 'run_live_a', pid: process.pid, spawnedAt: 0, kind: 'exec',
+    });
+    writeChildRecord(stateDir, {
+      workflow: 'wf1', run: 'run_live_b', pid: live.pid!, spawnedAt: 0, kind: 'exec',
+    });
+    const loop = createShiftLoop(baseOpts(hub, () => ({ pid: 1000 }), {
+      cap: 1,
+      onEvent: (event) => events.push(event),
+    }));
+    hub.whatsNext = async (req) => req?.workflow === undefined
+      ? { text: '', instances: [{ workflow: 'wf1', def: 'demo', done: false, eligible: 1, blocked: 0, owedSeededInputs: [] }] }
+      : { text: '', workflow: 'wf1', def: 'demo', orders: [order('cmd')] };
 
-  await loop.iterate();
+    await loop.iterate();
 
-  assert.deepEqual(events.filter((event) => event.type === 'capacity'), [{
-    type: 'capacity', inFlight: 1, cap: 1, ...ENVELOPE,
-  }]);
+    assert.deepEqual(events.filter((event) => event.type === 'capacity'), [{
+      type: 'capacity', inFlight: 2, cap: 1, ...ENVELOPE,
+    }]);
+    // Neither live child was mistaken for a dead one on the way through.
+    assert.deepEqual(events.filter((event) => event.type === 'reaped'), []);
+  } finally {
+    live.kill('SIGKILL');
+  }
 });
 
 test('one unbroken stretch at capacity emits ONE capacity event, not one per tick', async () => {

@@ -49,6 +49,32 @@ function fakeBin(tag: string): string {
   return path;
 }
 
+/**
+ * Block until every pid has exited, or give up after the deadline.
+ *
+ * `process.kill(pid, 0)` sends no signal; it only asks whether the process is
+ * still addressable, throwing ESRCH once it is gone. Workers are spawned
+ * DETACHED, so this test process is not their parent in any way that would
+ * reap them — polling is how it learns they are done. Giving up quietly rather
+ * than failing is deliberate: a straggler is a teardown concern, not the
+ * property under test, and turning it into an assertion would make a slow
+ * machine look like a broken invariant.
+ */
+async function waitForExit(pids: readonly number[]): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  while (Date.now() < deadline && pids.some(alive)) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 async function waitForContent(path: string, needle: string): Promise<string> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
@@ -72,6 +98,20 @@ test("a dispatched worker's stdout AND stderr both land in <run>.log", async () 
   // SAME descriptor to slots 1 and 2, which is exactly shell `2>&1`.
   assert.ok(text.includes('w1-out'), text);
   assert.ok(text.includes('w1-err'), text);
+
+  // AND IT IS OWNER-ONLY. Before this feature a worker's stdout and stderr went
+  // to /dev/null; this is the change that makes them persist, and a worker runs
+  // authored workflow content, so a step that echoes a token puts that token in
+  // this file. `exec/loop.ts` already writes its agent-produced artifact JSON
+  // with `mode: 0o600` for the same reason. Without the explicit mode argument
+  // `openSync` creates 0666 & ~umask — 0644 under the usual 022, readable by
+  // every local account. Masked with 0o777 because the high bits of `st_mode`
+  // are the file type, not permissions.
+  assert.equal(
+    (statSync(path).mode & 0o777).toString(8),
+    '600',
+    'a worker log holds attacker-influenceable output and must not be world-readable',
+  );
 });
 
 test('a re-armed run APPENDS instead of truncating the earlier attempt', async () => {
@@ -89,6 +129,73 @@ test('a re-armed run APPENDS instead of truncating the earlier attempt', async (
 
   assert.ok(text.includes('try1-out'), `the first attempt was lost: ${text}`);
   assert.ok(text.includes('try2-out'), text);
+});
+
+/** One block of the interleaving probe. Big enough that a truncated or
+ *  overwritten file is unmistakable, small enough to stay one `write()`. */
+const BLOCK = 64;
+
+/**
+ * A bin that writes four fixed-size blocks, ALTERNATING between fd 1 and fd 2,
+ * with `writeSync` so the order is the program's and not the runtime's.
+ *
+ * The exact expected file is `A×64 B×64 C×64 D×64` — 256 bytes, in that order.
+ */
+function interleaveBin(): string {
+  const path = join(root, 'bin-interleave.mjs');
+  writeFileSync(
+    path,
+    [
+      "import { writeSync } from 'node:fs';",
+      `writeSync(1, ${JSON.stringify('A'.repeat(BLOCK))});`,
+      `writeSync(2, ${JSON.stringify('B'.repeat(BLOCK))});`,
+      `writeSync(1, ${JSON.stringify('C'.repeat(BLOCK))});`,
+      `writeSync(2, ${JSON.stringify('D'.repeat(BLOCK))});`,
+      'process.exit(0);',
+    ].join('\n'),
+  );
+  return path;
+}
+
+test('fds 1 and 2 share ONE append stream: nothing is overwritten and nothing is lost', async () => {
+  // WHAT THIS PINS THAT `dev:ino` EQUALITY CANNOT. The fd-probe test below
+  // asserts that slots 1 and 2 resolve to the same FILE, which two separate
+  // opens of the same path also satisfy — `fstat` describes the file, not the
+  // descriptor. This test asserts the observable CONSEQUENCE instead: four
+  // alternating writes across the two slots produce all four blocks, in program
+  // order, at exactly the summed length.
+  //
+  // THE MUTATION IT CATCHES. Replace `stdio: ['ignore', logFd, logFd]` with two
+  // descriptors that do not share an append offset — the plain-open case, i.e.
+  // `openSync(path, 'w')` or `openSync(path, 'r+')` twice — and each descriptor
+  // starts at offset 0 and walks forward independently: fd 2's B lands on top of
+  // fd 1's A, fd 2's D lands on top of fd 1's C, and the file is `B×64 D×64`,
+  // 128 bytes. Both the length assertion and the order assertion go red.
+  //
+  // THE MUTATION IT DOES NOT CATCH, stated so nobody reads more into it. Two
+  // SEPARATE `openSync(path, 'a')` calls would still produce the correct bytes,
+  // because O_APPEND makes every individual write seek to end atomically no
+  // matter which description issues it. That variant is wasteful rather than
+  // wrong, and its one real cost — a second descriptor the `finally` does not
+  // close — is what the descriptor-count test at the bottom of this file
+  // catches. Between the two, the pair "open once, close once" is held.
+  const spawner = createDefaultSpawner('https://hub', 'acct', interleaveBin(), 'shf_1', undefined, { dir: logDir });
+  spawner({ workflow: 'wf1', run: 'run_weave', step: 's', kind: 'exec' });
+
+  const path = runLogFile(logDir, 'run_weave');
+  const text = await waitForContent(path, 'D'.repeat(BLOCK));
+
+  const expected = 'A'.repeat(BLOCK) + 'B'.repeat(BLOCK) + 'C'.repeat(BLOCK) + 'D'.repeat(BLOCK);
+  // Length first, because it names the failure: a short file means a write
+  // landed on top of another rather than after it.
+  assert.equal(
+    Buffer.byteLength(text, 'utf8'),
+    4 * BLOCK,
+    `expected ${String(4 * BLOCK)} bytes across four alternating writes, got ${String(Buffer.byteLength(text, 'utf8'))}`,
+  );
+  // Then the exact bytes, which also pins the ORDER: an implementation that
+  // kept every byte but let the two slots race would fail here and pass above.
+  assert.equal(text, expected, 'the four blocks must appear in write order, whole');
 });
 
 test('the run record, not the age, decides when a REAL worker\'s log becomes reapable', async () => {
@@ -239,9 +346,12 @@ test('with a log directory the child gets ONE descriptor on fds 1 and 2; without
   // write order rather than split across two destinations.
   //
   // What this pair does NOT prove is that ONE descriptor fills both slots —
-  // `fstat` reports the file, so two separate opens of the same path would
-  // report the same `dev:ino` too. That claim is a property of the PARENT, and
-  // the descriptor-count test at the bottom of this file is what holds it.
+  // `fstat` reports the FILE, so two separate opens of the same path would
+  // report the same `dev:ino` too. Two other tests carry that weight, and
+  // between them they cover both halves of "open once, close once": the
+  // interleaving test above ('fds 1 and 2 share ONE append stream') fails if the
+  // two slots do not share an append offset, and the descriptor-count test at
+  // the bottom of this file fails if the parent's copy is not closed.
   assert.equal(on.out.id, on.err.id, 'fds 1 and 2 must resolve to the same file');
   // And that one file is `<log-dir>/<run>.log` — not some other file that merely
   // happens to be regular.
@@ -302,10 +412,20 @@ test('dispatching many workers does not leak the parent\'s descriptors', async (
   const before = openDescriptorCount();
 
   const DISPATCHES = 60;
+  const pids: number[] = [];
   for (let i = 0; i < DISPATCHES; i++) {
-    spawner({ workflow: 'wf1', run: `run_bulk${i}`, step: 's', kind: 'exec' });
+    const { pid } = spawner({ workflow: 'wf1', run: `run_bulk${i}`, step: 's', kind: 'exec' });
+    if (typeof pid === 'number') pids.push(pid);
   }
   const after = openDescriptorCount();
+
+  // Let the 60 detached children finish before this test returns. They are
+  // detached, so nothing reaps them automatically, and `afterEach` removes
+  // `root` — including the bin they were launched from — the moment it does.
+  // Waiting here is what keeps that teardown from racing a child that has not
+  // finished starting, which would show up as unrelated noise on a loaded box
+  // rather than as a real failure.
+  await waitForExit(pids);
 
   // Every one of the 60 logs really was opened — `openSync` runs synchronously
   // in the parent, so the file exists the instant `spawner()` returns, with no

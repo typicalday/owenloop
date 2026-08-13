@@ -243,9 +243,14 @@ function ownerClaimName(stateDir: string): string {
  */
 export function registerShiftLogOwner(logDir: string, stateDir: string): string {
   const dir = logOwnersDir(resolve(logDir));
-  mkdirSync(dir, { recursive: true });
+  // 0700 on the registry directory and 0600 on the claim. A claim names an
+  // absolute filesystem path on this host, which is a layout disclosure and not
+  // something every local account needs. Both modes apply at CREATION only, so
+  // an existing `.owners/` from an earlier build keeps its mode — `mkdirSync`
+  // never chmods a directory that is already there.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, ownerClaimName(stateDir));
-  writeFileSync(path, `${JSON.stringify({ stateDir: resolve(stateDir) })}\n`);
+  writeFileSync(path, `${JSON.stringify({ stateDir: resolve(stateDir) })}\n`, { mode: 0o600 });
   return path;
 }
 
@@ -438,7 +443,16 @@ export function prepareShiftLogDir(o: PrepareShiftLogDirOptions): PreparedShiftL
   const dir = resolveShiftLogDir(o.flagDir, o.env, o.settingsLogDir, o.stateDir);
   const maxAgeMs = resolveShiftLogMaxAgeMs(o.flagMaxAgeMs, o.env, o.settingsMaxAgeMs);
   try {
-    mkdirSync(dir, { recursive: true });
+    // 0700 WHEN THIS CALL CREATES THE DIRECTORY. The directory holds worker
+    // logs of authored workflow content, and the files inside are 0600, so a
+    // world-traversable parent would only advertise their names. `mkdirSync`
+    // does NOT chmod a directory that already exists, and that is the escape
+    // hatch for a site that wants a shared drop directory a separate uploader
+    // account can read: pre-create `--log-dir` with the group and mode that
+    // account needs, and this call leaves it exactly as found. The two log
+    // FILES stay 0600 either way — a shared directory is an operator's choice
+    // to make, and it does not make the bytes inside less sensitive.
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
   } catch (err) {
     o.err(
       `${o.label}: cannot create shift log directory ${dir}: ${errMsg(err)} — ` +

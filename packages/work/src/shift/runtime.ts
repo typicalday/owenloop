@@ -44,21 +44,47 @@ const DEFAULT_PRESENCE_MS = 60_000;
  * Record types written to the LOG FILE but never delivered over the socket.
  *
  * The split is not "important vs unimportant" — it is what each consumer is.
- * A record about a UNIT OF WORK (`dispatched`, `reaped`, `failed`,
- * `order-dropped`, `bundle-miss`, `hub-error`, `ended`, `gate`) tells a client
- * something it cannot otherwise learn, so it goes to both sinks. A record about
- * the SHIFT'S OWN CONDITION is different on each side:
+ * A record about a UNIT OF WORK THAT MOVED (`dispatched`, `reaped`, `failed`,
+ * `order-dropped`, `bundle-miss`, `ended`, `gate`) tells a socket client
+ * something it cannot otherwise learn, so it goes to both sinks. Everything
+ * else is about the SHIFT'S OWN CONDITION, and that is different on each side:
  *
  * - On the SOCKET it is redundant or harmful. Every `ShiftCapacity` response
  *   already carries live `cap`, `free`, and `running`, so `capacity` and
  *   `parked` restate on the wire what the response states anyway — while
- *   queueing either one instantly satisfies a parked `owenloop shift next`,
+ *   queueing ANY record instantly satisfies a parked `owenloop shift next`,
  *   which must BLOCK until there is work to report. That is the bug this set
- *   exists to prevent: a shift that is merely full or merely idle would wake
- *   every attending terminal with news of nothing having happened.
+ *   exists to prevent: a shift that is merely full, merely idle, or merely
+ *   unable to reach the hub would wake every attending terminal with news of
+ *   nothing having happened.
  * - In the FILE it is the only record of that condition. The file has no
  *   response envelope, so without these records a reader cannot tell an idle
- *   shift (no orders offered) from a saturated one (orders offered, no slots).
+ *   shift (no orders offered) from a saturated one (orders offered, no slots)
+ *   from a stranded one (hub unreachable, so nothing was ever offered).
+ *
+ * `hub-error` IS IN THIS SET, AND THE REASON IS BOTH HALVES ABOVE.
+ *
+ * A FAILED HUB CALL IS NOT A UNIT OF WORK MOVING. Nothing was dispatched,
+ * reaped, or dropped — the shift failed to ask. So the "a socket client cannot
+ * learn it otherwise" justification for both-sinks does not apply, and the
+ * blocking contract of `shift next` does.
+ *
+ * The volume makes it a correctness problem rather than a style one, because
+ * `hub-error` is LEVEL-TRIGGERED and cannot self-limit. `noteServerBackoff`
+ * (`loop.ts`) sets a backoff only for a `HubError` with `status === 429`; an
+ * unreachable hub (ECONNREFUSED, DNS failure, timeout, HTTP 500) sets none, so
+ * the loop emits one `hub-error` per poll tick for as long as the outage lasts
+ * — about 720/hour per workflow at the 5s default. The socket queue holds
+ * `MAX_EVENT_QUEUE` (1000) records and evicts the OLDEST, so roughly 83 minutes
+ * of outage would evict every `dispatched`, `failed`, and `reaped` record a
+ * parked client actually needs, and every `owenloop shift next` during the
+ * outage would return instantly with a record that is not work.
+ *
+ * `shift.log` is append-only and unbounded, so it still keeps every attempt for
+ * an operator to count and time. Whether the FILE should ALSO collapse a long
+ * outage into fewer records is a separate, open question (idea
+ * W99TXHD9jqwpymifl-5-C) — frequency and routing are independent concerns, and
+ * this set is the one that decides routing.
  *
  * `event-queue-overflow` never reaches `consumeEvent` at all — `server.ts`
  * hands it straight to the log sink through `onSynthesized`, because the queue
@@ -67,6 +93,7 @@ const DEFAULT_PRESENCE_MS = 60_000;
 const FILE_ONLY_EVENTS: ReadonlySet<ShiftEventBody['type']> = new Set([
   'parked',
   'capacity',
+  'hub-error',
   'event-queue-overflow',
 ]);
 

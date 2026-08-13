@@ -98,10 +98,24 @@ export interface WorkerLogOptions {
  * function reports on every failure it sees; the latch that turns that into one
  * line per shift lives with the spawner, which is the thing whose lifetime the
  * latch is scoped to.
+ *
+ * MODE 0600, OWNER ONLY. A worker runs authored workflow content, so its
+ * stdout and stderr are attacker-influenceable data and may contain whatever a
+ * step printed — including a token a step echoed. `exec/loop.ts` already writes
+ * its agent-produced artifact JSON with `mode: 0o600` for exactly this reason;
+ * a raw worker log is the same data class and strictly less filtered. Without
+ * an explicit mode `openSync` creates 0666 & ~umask, which is 0644 under the
+ * usual 022 — readable by every local account.
+ *
+ * THE MODE APPLIES ONLY WHEN THE FILE IS CREATED. Append mode never re-chmods,
+ * so a `<run>.log` left behind by a build from before this became explicit
+ * keeps its old permissions. That is deliberate: silently tightening a file an
+ * operator may have already handed to an uploader account is a worse surprise
+ * than a stale-permission file the operator can fix with one `chmod`.
  */
 function openWorkerLog(path: string, report: (line: string) => void): number | undefined {
   try {
-    return openSync(path, 'a');
+    return openSync(path, 'a', 0o600);
   } catch (e) {
     report(
       `owenloop shift: could not open worker log ${path}: ${err(e)} — dispatching with its output discarded`,

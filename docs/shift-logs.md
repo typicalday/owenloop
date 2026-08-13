@@ -53,8 +53,8 @@ the same basename.
 `packages/work/src/shift/state.ts`), so pointing `--log-dir` at a different
 filesystem moves the logs away from the records and correlation still holds.
 
-The shift creates the directory at startup with `mkdirSync(…, {recursive:
-true})`. If that fails it prints one line to its own stderr —
+The shift creates the directory at startup with `mkdirSync(…, {recursive: true,
+mode: 0o700})`. If that fails it prints one line to its own stderr —
 
 ```
 owenloop shift: cannot create shift log directory <dir>: <reason> — continuing with logging disabled
@@ -63,6 +63,52 @@ owenloop shift: cannot create shift log directory <dir>: <reason> — continuing
 — and serves with no logging at all: no `shift.log`, and every worker launched
 with `stdio: ['ignore','ignore','ignore']` exactly as before this feature
 existed. **Losing observability never costs a dispatch.**
+
+## Permissions
+
+Everything this feature creates is **owner-only**, and the mode is explicit at
+every creation site rather than inherited from the umask:
+
+| Path | Mode | Created by |
+| --- | --- | --- |
+| `<log-dir>/` | `0700` | `prepareShiftLogDir` (`logretention.ts`) |
+| `<log-dir>/shift.log` | `0600` | `createShiftLogSink` (`logsink.ts`) |
+| `<log-dir>/<run>.log` | `0600` | `createDefaultSpawner` (`spawn.ts`) |
+| `<log-dir>/.owners/` | `0700` | `registerShiftLogOwner` (`logretention.ts`) |
+| `<log-dir>/.owners/<hash>` | `0600` | `registerShiftLogOwner` (`logretention.ts`) |
+
+**Why, specifically.** Before this feature a worker's stdout and stderr went to
+`/dev/null`; this is the change that makes them persist. `<run>.log` is raw
+output from authored workflow content, so a step that echoes a token puts that
+token in the file, and `shift.log` quotes hub and workflow messages verbatim in
+its `hub-error` and `order-dropped` records. That is the same data class as the
+receipt artifact `packages/work/src/exec/loop.ts` already writes with
+`mode: 0o600`, and the rule this repository states there — "the file is `0600`
+because its content is agent-produced artifact data" — applies here unchanged.
+Without an explicit mode these files would be `0666 & ~umask`, which is `0644`
+under the usual `022`: readable by every local account on the machine.
+
+**A mode applies only when the call CREATES the path.** Two consequences worth
+knowing before you rely on it:
+
+- A `<run>.log`, a `shift.log`, or a `.owners/` directory left behind by a build
+  from before this was explicit **keeps its old, wider permissions**. Nothing
+  re-chmods an existing path. Fix those with one `chmod` if it matters to you;
+  we do not tighten a file an operator may already have handed to something
+  else.
+- `mkdirSync` does not chmod a directory that already exists, and that is the
+  supported escape hatch for a **shared drop directory**: pre-create
+  `--log-dir` with the owner, group, and mode a separate uploader account
+  needs, and the shift leaves it exactly as it found it.
+
+**The two log files stay `0600` either way.** A shared *directory* is an
+operator's decision to make; it does not make the bytes inside less sensitive.
+So an uploader running as a different account cannot read `shift.log` or
+`<run>.log` out of the box. The intended deployment is an uploader running as
+the **same user as the shift**. If you need a genuinely separate uploader
+account, that is an explicit operator act today — a group-readable ACL on the
+directory plus a deliberate `chmod` of the files, or a small privileged shipper
+— and it is not something this feature arranges for you.
 
 ## `shift.log` — the structured log
 
@@ -100,7 +146,7 @@ Two properties an uploader can rely on:
 | `reaped` | `workflow`, `run`, `kind`, `pid` | a worker exited and was collected |
 | `failed` | `workflow`, `run`, `step`, `kind`, `message`, optional `harness`, `executable`, `exitStatus`, `signal` | a worker died or could not be spawned |
 | `capacity` | `inFlight`, `cap` | no free slot, so the `whats_next` sweep was deferred — explains a shift running nothing new while work is outstanding. **Edge-triggered**, and emitted only on a *changed* wake — see below |
-| `hub-error` | `op` (`wake`\|`whats_next`), `message`, optional `workflow` | a hub call failed |
+| `hub-error` | `op` (`wake`\|`whats_next`), `message`, optional `workflow` | a hub call failed. `workflow` present = the targeted `whats_next` for that one workflow; `workflow` absent with `op: 'whats_next'` = the untargeted inbox call, which aborts the whole sweep. **File-only** — see below |
 | `bundle-miss` | `workflow`, `def` | a legacy order named a def with no cached bundle |
 | `order-dropped` | `workflow`, `run`, `step`, `reason`, `message` | the shift refused one order and left it for hub pickup |
 | `event-queue-overflow` | `dropped` | the socket FIFO evicted events; see below |
@@ -109,7 +155,7 @@ Two properties an uploader can rely on:
 
 `kind` is `'exec' | 'agent-run'`.
 
-**Three of these are file-only.** `parked`, `capacity`, and
+**Four of these are file-only.** `parked`, `capacity`, `hub-error`, and
 `event-queue-overflow` are written to `shift.log` and are never delivered over
 the daemon's Unix socket to `owenloop shift next`. Every other type goes to
 both. The routing rule is `FILE_ONLY_EVENTS` in
@@ -118,8 +164,8 @@ fans out to its two sinks.
 
 The split is not importance. It is what each consumer is:
 
-- A record about a **unit of work** — `dispatched`, `reaped`, `failed`,
-  `order-dropped`, `bundle-miss`, `hub-error`, `ended` — tells a socket client
+- A record about a **unit of work that moved** — `dispatched`, `reaped`,
+  `failed`, `order-dropped`, `bundle-miss`, `ended` — tells a socket client
   something it cannot otherwise learn. Both sinks get it.
 - A record about the **shift's own condition** is redundant or harmful on the
   socket, and load-bearing in the file.
@@ -135,6 +181,28 @@ live `cap`, `free`, and `running` in its own envelope, which is exactly what
 because it connected to that shift's socket (`op: 'status'` answers name,
 crews, and cap on demand).
 
+`hub-error` is file-only for the same reason plus a volume argument that makes
+it a correctness matter rather than a tidiness one. **A failed hub call is not a
+unit of work moving** — nothing was dispatched, reaped, or dropped; the shift
+failed to ask — so it cannot claim the "a socket client cannot learn it
+otherwise" justification, and it is subject to the blocking contract that
+`parked` and `capacity` are subject to.
+
+It is also the one record type that cannot self-limit. `hub-error` is
+**level-triggered**: one record per failed call, for as long as the failure
+lasts. The loop backs off only for HTTP 429 (`noteServerBackoff` requires a
+`HubError` with `status === 429`), so an unreachable hub — `ECONNREFUSED`, DNS
+failure, timeout, HTTP 500 — produces one record per poll tick with nothing
+slowing it down: roughly 720 per hour per workflow at the 5s default. The socket
+FIFO holds 1000 records and evicts the **oldest**, so about 83 minutes of outage
+would evict every `dispatched`, `failed`, and `reaped` record a parked client
+was waiting for, and every `owenloop shift next` during the outage would return
+instantly carrying something that is not work.
+
+The file keeps all of them. `shift.log` is append-only and unbounded, so an
+operator can still count and time every attempt — which was the reason to record
+each one, and it is a reason about the *file*, not about the wire.
+
 `event-queue-overflow` has a second, independent reason: a record placed in the
 queue that just overflowed would evict another event, overflow again, and
 recurse under exactly the load that produced it. It is handed straight to the
@@ -142,9 +210,10 @@ log sink and never enters the fan-out at all.
 
 Nothing is lost, because the file is the consumer with no envelope and no
 context. `shift.log` has no per-response `cap`/`free`/`running`, so without
-these three records a reader cannot tell an **idle** shift (no orders offered)
-from a **saturated** one (orders offered, no slots), nor tell a quiet log from a
-lossy one.
+these four records a reader cannot tell an **idle** shift (no orders offered)
+from a **saturated** one (orders offered, no slots) from a **stranded** one (hub
+unreachable, so nothing was ever offered), nor tell a quiet log from a lossy
+one.
 
 `order-dropped.reason` is the stable machine discriminator and is one of
 `malformed-digest`, `malformed-worker`, `unsupported-worker`,
@@ -256,13 +325,22 @@ An uploader should treat `capacity` as a hint about a moment, and derive
 occupancy from `dispatched`/`reaped`/`failed` pairs, which are unconditional.
 
 `hub-error` deliberately did **not** get
-that treatment: it is level-triggered, so a hub that is unreachable for a day
-writes roughly one record per poll interval per workflow (~17k/day at the 5s
-default). The reasoning is that a repeated `capacity` says nothing new, whereas
-each `hub-error` is a distinct failed attempt an operator may want to count and
-time. If that trade proves wrong in practice, edge-triggering `hub-error` on
-`(op, message)` transitions is the obvious change, and it belongs with the
-rotation decision above rather than ahead of it.
+that treatment **in the file**: it is level-triggered, so a hub that is
+unreachable for a day writes roughly one record per poll interval per workflow
+(~17k/day at the 5s default). The reasoning is that a repeated `capacity` says
+nothing new, whereas each `hub-error` is a distinct failed attempt an operator
+may want to count and time. If that trade proves wrong in practice,
+edge-triggering `hub-error` on `(op, message)` transitions is the obvious
+change, and it belongs with the rotation decision above rather than ahead of it.
+
+Keep the two questions apart, because they have different answers for the same
+record type. **Frequency** is a property of the file: how many records one
+outage writes into an append-only file that is never rotated — still open, as
+above. **Routing** is a property of the wire: whether those records reach a
+parked `owenloop shift next` at all — decided, and the answer is no.
+`hub-error` is in `FILE_ONLY_EVENTS` precisely *because* it is level-triggered
+into a socket queue that is bounded at 1000 and evicts the oldest. Neither
+decision substitutes for the other.
 
 ## `<run>.log` — one worker's raw output
 
@@ -277,6 +355,10 @@ attacker-influenceable data: never echo it into a shell, an HTML page, or a log
 viewer that interprets escape sequences. Untrusted is a reason not to *repeat*
 those bytes, never a reason to discard them.
 
+**Owner-only on disk.** See [Permissions](#permissions) — the file is created
+`0600`, so an uploader that runs as a different account cannot read it until an
+operator decides otherwise.
+
 **Unbounded in size, by design.** No cap and no truncation. A cap would remove
 exactly the pathological run you needed to read. Volume is bounded by age
 instead — see retention.
@@ -288,9 +370,9 @@ top to bottom gives you every attempt in order.
 ### How the bytes get there
 
 `createDefaultSpawner` (`packages/work/src/shift/spawn.ts`) opens the log once
-with `openSync(path, 'a')` and hands **that one descriptor** to stdio slots 1
-and 2 — the same redirection a shell writes as `2>&1`. The parent's copy is
-closed in a `finally` immediately after `spawn` returns.
+with `openSync(path, 'a', 0o600)` and hands **that one descriptor** to stdio
+slots 1 and 2 — the same redirection a shell writes as `2>&1`. The parent's copy
+is closed in a `finally` immediately after `spawn` returns.
 
 Three details that are load-bearing:
 
@@ -434,6 +516,18 @@ anything a workflow author's step printed.
 **A record you cannot parse is a bug to report, not a line to drop silently.**
 The writer bounds and escapes every line; a malformed one means something else
 wrote to the file.
+
+**A trailing line with no `\n` is not yet a record.** Split on `\n` and parse
+only complete lines; carry the remainder into the next read. A live shift may be
+mid-append when you read, and a shift that was killed can leave a final
+fragment. This is the one parse failure that is expected rather than a bug —
+which is why it is stated as "not yet a record" rather than as an exception to
+the rule above.
+
+**Run as the same user as the shift, or arrange access deliberately.**
+`shift.log` and `<run>.log` are created `0600` and the directory `0700` — see
+[Permissions](#permissions). An uploader under a different account gets `EACCES`
+until an operator widens something on purpose.
 
 ## Flags and settings
 

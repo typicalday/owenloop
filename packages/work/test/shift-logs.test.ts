@@ -8,7 +8,7 @@
  * will not reproduce on demand) and against a real temp directory, because the
  * whole point of this feature is bytes that survive on a real disk.
  */
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import assert from 'node:assert/strict';
@@ -51,6 +51,27 @@ function ev(body: ShiftEventBody): ShiftEvent {
 }
 
 const DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * An absolute path that is guaranteed not to exist, INSIDE this test's own temp
+ * root.
+ *
+ * The tests below feed absolute paths to pure path math and to injected-seam
+ * calls, then assert that nothing was created. Earlier revisions used the
+ * literal `/logs` and `/nope` for that, which made two assumptions about the
+ * HOST: that `/logs` does not exist (false on plenty of container images, which
+ * would have failed the test for a reason unrelated to this code) and that a
+ * real `readdirSync('/logs/.owners')` against the machine root is acceptable —
+ * `sweepShiftLogs` calls `readShiftLogOwners` for real unless `stateDirs` is
+ * injected.
+ *
+ * `root` is created fresh by `beforeEach` and removed by `afterEach`, so a path
+ * under it is absolute, absent by construction, and absent because THIS TEST
+ * says so rather than because the machine happened to agree.
+ */
+function absent(name: string): string {
+  return join(root, 'absent', name);
+}
 
 // ── the pure gate ──────────────────────────────────────────────────────────
 
@@ -165,16 +186,17 @@ test('an unparseable OWENLOOP_SHIFT_LOG_MAX_AGE_MS falls through instead of fail
 });
 
 test('shiftLogFile and runLogFile are pure path math over the same sanitizer', () => {
-  assert.equal(shiftLogFile('/logs'), join('/logs', 'shift.log'));
-  assert.equal(runLogFile('/logs', 'run_abc'), join('/logs', 'run_abc.log'));
+  const logs = absent('logs');
+  assert.equal(shiftLogFile(logs), join(logs, 'shift.log'));
+  assert.equal(runLogFile(logs, 'run_abc'), join(logs, 'run_abc.log'));
   // The correlation key is the BASENAME. `<run>.log` and `<run>.json` are
   // sanitized by the same `safeRun`, so a traversal attempt cannot land the log
   // outside the log directory or break the pairing. `safeRun` keeps `.` and `-`
   // and replaces every other character, INCLUDING the separator — which is what
   // makes the result a single flat basename rather than a path.
-  assert.equal(runLogFile('/logs', '../../etc/passwd'), join('/logs', '.._.._etc_passwd.log'));
-  assert.equal(runLogFile('/logs', '/abs/olute').includes('/abs/'), false);
-  assert.equal(existsSync('/logs'), false, 'path math must create nothing');
+  assert.equal(runLogFile(logs, '../../etc/passwd'), join(logs, '.._.._etc_passwd.log'));
+  assert.equal(runLogFile(logs, '/abs/olute').includes('/abs/'), false);
+  assert.equal(existsSync(logs), false, 'path math must create nothing');
 });
 
 // ── the sweep ──────────────────────────────────────────────────────────────
@@ -212,9 +234,10 @@ test('sweepShiftLogs removes only completed worker logs past the age', () => {
 
 test('sweepShiftLogs never throws and costs at most the one file that failed', () => {
   const errors: string[] = [];
+  const dir = absent('logs');
   const removed = sweepShiftLogs({
-    dir: '/logs',
-    stateDir: '/state',
+    dir,
+    stateDir: absent('state'),
     now: 100 * DAY,
     maxAgeMs: 0,
     err: (line) => errors.push(line),
@@ -230,7 +253,7 @@ test('sweepShiftLogs never throws and costs at most the one file that failed', (
   });
 
   // `run_a` died in stat and `run_b` died in unlink; `run_c` still went.
-  assert.deepEqual(removed, [join('/logs', 'run_c.log')]);
+  assert.deepEqual(removed, [join(dir, 'run_c.log')]);
   assert.equal(errors.length, 2);
   assert.ok(errors.every((line) => line.includes('(ignored)')), errors.join('\n'));
 });
@@ -444,7 +467,15 @@ test('prepareShiftLogDir reports and disables logging when the directory cannot 
   assert.match(errors[0]!, /continuing with logging disabled$/);
   // Nothing was created underneath the blocker, and the blocker is untouched.
   assert.equal(readFileSync(blocker, 'utf8'), 'x');
-  assert.equal(existsSync(logOwnersDir(dir)), false);
+  // NOT `existsSync(logOwnersDir(dir))`. Any path UNDER a regular file is false
+  // by construction — `stat()` returns ENOTDIR before it ever reaches the last
+  // component — so that assertion is green no matter what `prepareShiftLogDir`
+  // does, and it proves nothing. These two can actually fail: the blocker must
+  // still be a regular FILE (production code must not unlink it and mkdir over
+  // it), and `root` must hold NOTHING but the blocker (a failed create must not
+  // silently fall back to some other directory).
+  assert.equal(lstatSync(blocker).isFile(), true, 'the blocker must not be replaced by a directory');
+  assert.deepEqual(readdirSync(root), ['not-a-dir'], 'a failed create must leave no directory anywhere');
 });
 
 test('prepareShiftLogDir keeps dispatching when the claim cannot be written', () => {
@@ -577,12 +608,22 @@ test('a REAL sweep at zero retention eats the worker logs and spares the registr
   // EXACTLY the worker log, by name — not "at least one", which a sweep that
   // also removed the registry would satisfy.
   assert.deepEqual(removed, [worker]);
-  // AND the sweep never so much as TRIED the registry. This line is what makes
-  // the survival assertions below a property of the code rather than of the
-  // filesystem: `remove` is `rmSync(path, { force: true })`, which throws
-  // ERR_FS_EISDIR on a directory, and the loop's per-entry catch turns that into
-  // a report here. A sweep that stopped skipping `.owners` would leave it on
-  // disk anyway — and leave this line behind as the evidence.
+  // AND the sweep never so much as TRIED the registry. `remove` is
+  // `rmSync(path, { force: true })`, which throws ERR_FS_EISDIR on a directory,
+  // and the loop's per-entry catch turns that into a report here — so a sweep
+  // that attempted `.owners` and failed would leave the directory on disk
+  // (satisfying the survival assertions below) and leave a line here as the
+  // evidence of the difference.
+  //
+  // BE HONEST ABOUT THE MUTATION THIS DOES AND DOES NOT CATCH. The name check
+  // is deliberately doubled: the sweep loop skips a non-worker name up front,
+  // and `isShiftLogReapable` re-tests the same predicate as its first line
+  // (`isWorkerLogName` is exported precisely so the gate and the sweep cannot
+  // disagree about what they own). Deleting EITHER guard alone therefore
+  // changes nothing observable — the other still refuses `.owners`. It takes
+  // deleting BOTH to reach `remove` on a directory, which is what this
+  // assertion catches. That redundancy is a feature, not an oversight, and the
+  // gate's own truth table above is what pins the single-guard behaviour.
   assert.deepEqual(errors, [], 'the registry must be skipped, not attempted-and-failed');
   assert.equal(existsSync(worker), false);
   assert.equal(existsSync(ownersPath), true, 'the registry directory must survive');
@@ -602,8 +643,8 @@ test('a REAL sweep at zero retention eats the worker logs and spares the registr
 test('sweepShiftLogs reports an unreadable directory and returns empty', () => {
   const errors: string[] = [];
   const removed = sweepShiftLogs({
-    dir: '/nope',
-    stateDir: '/state',
+    dir: absent('nope'),
+    stateDir: absent('state'),
     now: 0,
     maxAgeMs: 0,
     err: (line) => errors.push(line),
@@ -638,14 +679,14 @@ const _noMissingEventTypes: [Exclude<ShiftEventBody['type'], (typeof ALL_EVENT_T
   ? true
   : false = true;
 
-test('parked, capacity and overflow are FILE-ONLY; every other event reaches the socket', () => {
+test('parked, capacity, hub-error and overflow are FILE-ONLY; every other event reaches the socket', () => {
   // Load-bearing and otherwise proven only indirectly, through a timing race in
   // `shift-blocking-acceptance.test.ts`. The rule: a parked `owenloop shift
-  // next` BLOCKS on an idle shift, so a record ABOUT the shift itself — it
-  // parked, it is at capacity, its queue overflowed — must not be what wakes the
-  // client. Those three still reach `shift.log`, which is the durable consumer
-  // they were promoted for.
-  const fileOnly = ['parked', 'capacity', 'event-queue-overflow'] as const;
+  // next` BLOCKS on an idle shift, so a record that is NOT a unit of work
+  // moving — it parked, it is at capacity, it could not reach the hub, its
+  // queue overflowed — must not be what wakes the client. All four still reach
+  // `shift.log`, which is the durable consumer they were promoted for.
+  const fileOnly = ['parked', 'capacity', 'hub-error', 'event-queue-overflow'] as const;
   for (const type of fileOnly) {
     assert.equal(reachesSocketConsumer(type), false, `${type} must not wake a parked next`);
   }
@@ -658,29 +699,57 @@ test('parked, capacity and overflow are FILE-ONLY; every other event reaches the
     assert.equal(reachesSocketConsumer(type), true, `${type} must reach a parked next`);
   }
 
-  // `gate` IS in that list and deserves a caveat, because a reader could
+  // `gate` is in that derived list and deserves a caveat, because a reader could
   // otherwise take this test as evidence about live behaviour it does not
   // provide: `GateEvent` is a RESERVED variant — nothing in `packages/work/src`
-  // constructs one, on this branch or before it. The assertion above is
-  // therefore about the routing DEFAULT, not about any record an operator will
-  // see: `reachesSocketConsumer` is `!FILE_ONLY_EVENTS.has(type)`, so a type
-  // nobody left out of that set is socket-bound the moment a producer appears.
-  // Asserting it here is what makes the eventual producer inherit a decided
-  // route instead of an accidental one.
-  assert.equal(socketBound.includes('gate'), true);
+  // constructs one, on this branch or before it (idea olS9HGgh1V-u9Pzmkl4Z3).
+  // The loop above therefore pins its routing DEFAULT, not any record an
+  // operator will see: `reachesSocketConsumer` is `!FILE_ONLY_EVENTS.has(type)`,
+  // so a type nobody left out of that set is socket-bound the moment a producer
+  // appears. That is the whole point — the eventual producer inherits a decided
+  // route rather than an accidental one. There is deliberately no separate
+  // `socketBound.includes('gate')` assertion: it would compare one file-local
+  // const against another, call no production code, and stay green even if
+  // `gate` were added to `FILE_ONLY_EVENTS`.
+});
+
+test('hub-error is file-only, so a hub outage cannot flood the bounded socket FIFO', () => {
+  // The regression this pins, precisely. `hub-error` is LEVEL-TRIGGERED: one
+  // record per failed hub call, and `noteServerBackoff` only backs off on HTTP
+  // 429, so an unreachable hub (ECONNREFUSED, DNS, timeout, 500) emits one per
+  // poll tick with nothing slowing it down. If those reached the socket queue,
+  // two contracts would break at once: `enqueue` answers a parked `shift next`
+  // the instant ANY event lands, so `next` would stop blocking during an
+  // outage; and the queue evicts the OLDEST at MAX_EVENT_QUEUE, so ~83 minutes
+  // of outage at the 5s default would evict every `dispatched`/`failed`/
+  // `reaped` record a client was actually waiting for.
+  //
+  // Asserted on its own rather than only inside the table test above, because
+  // the two say different things: the table says "the split is total and every
+  // variant is on exactly one side", this says "hub-error specifically is on
+  // the file side, and here is what breaks if it moves".
+  assert.equal(reachesSocketConsumer('hub-error'), false);
+
+  // The contrast that makes it a claim about CATEGORY rather than about volume.
+  // `order-dropped` is emitted from the same sweep, under the same hub trouble,
+  // and it IS socket-bound — because a refused order is a unit of work that
+  // moved (out of this shift's hands), which is exactly what a parked client
+  // cannot learn any other way. A failed hub call moved nothing.
+  assert.equal(reachesSocketConsumer('order-dropped'), true);
 });
 
 // ── the spawn plan's log destination ───────────────────────────────────────
 
 test('buildSpawnPlan stays pure and carries the log PATH, never a descriptor', () => {
   const spec = { workflow: 'wf1', run: 'run_1', step: 's', kind: 'exec' as const };
-  const withLog = buildSpawnPlan(spec, 'https://hub', 'acct', '/bin/owenloop', '/usr/bin/node', 'shf_1', '/logs');
+  const logs = absent('logs');
+  const withLog = buildSpawnPlan(spec, 'https://hub', 'acct', '/bin/owenloop', '/usr/bin/node', 'shf_1', logs);
 
-  assert.equal(withLog.logFile, join('/logs', 'run_1.log'));
+  assert.equal(withLog.logFile, join(logs, 'run_1.log'));
   // The PLAN is still the pre-logging shape. Opening the file is I/O, and this
   // function does none: `createDefaultSpawner` substitutes the descriptors.
   assert.deepEqual(withLog.options.stdio, ['ignore', 'ignore', 'ignore']);
-  assert.equal(existsSync('/logs'), false, 'building a plan must create nothing');
+  assert.equal(existsSync(logs), false, 'building a plan must create nothing');
 
   // No log dir ⇒ no `logFile` key at all, byte-identical to the old plan.
   const without = buildSpawnPlan(spec, 'https://hub', 'acct', '/bin/owenloop', '/usr/bin/node', 'shf_1');
@@ -743,7 +812,7 @@ test('a write failure is reported ONCE and never throws, and writing keeps being
   let attempts = 0;
   let broken = true;
   const sink = createShiftLogSink({
-    path: '/logs/shift.log',
+    path: join(absent('logs'), 'shift.log'),
     err: (line) => errors.push(line),
     append: () => {
       attempts += 1;
@@ -783,9 +852,13 @@ test('a real unwritable log destination costs the log, not the process', () => {
   assert.equal(errors.length, 1);
   assert.ok(errors[0]?.includes(`shift log sink write to ${path} failed`), errors[0]);
   assert.ok(errors[0]?.includes('continuing without it'), errors[0]);
-  assert.equal(existsSync(path), false);
-  // Nothing was written THROUGH the blocking file either — it is byte-identical.
+  // `existsSync(path)` is omitted deliberately: `path` sits UNDER a regular
+  // file, so `stat()` returns ENOTDIR and the answer is false however the sink
+  // behaves. What can actually fail is that the blocker is still a regular file
+  // of the original bytes, and that the sink invented no destination elsewhere.
   assert.equal(readFileSync(blocker, 'utf8'), 'x');
+  assert.equal(lstatSync(blocker).isFile(), true, 'the blocker must not be replaced by a directory');
+  assert.deepEqual(readdirSync(root), ['not-a-dir-sink'], 'a failed sink write must create nothing');
 
   // And the report is latched across further failing writes, exactly as the
   // injected-`append` test above establishes for a synthetic failure.

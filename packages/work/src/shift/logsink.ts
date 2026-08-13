@@ -21,10 +21,20 @@
  * ── WHY ONE SYSCALL PER LINE ──
  *
  * Each record is serialized to a complete `…\n` string and written with a
- * SINGLE `appendFileSync` call. Two shifts sharing a log directory both open
- * with `O_APPEND`, so single-call writes cannot interleave into a half-line;
- * lines stay individually parseable and the `shiftId` on each record says which
- * process wrote it.
+ * SINGLE `appendFileSync` call, and two shifts sharing a log directory both
+ * open with `O_APPEND`, so in practice lines stay individually parseable and
+ * the `shiftId` on each record says which process wrote it.
+ *
+ * BE PRECISE ABOUT WHERE THAT GUARANTEE COMES FROM: it is a property of an
+ * `O_APPEND` `write()` to a REGULAR FILE ON A LOCAL FILESYSTEM, not of
+ * `appendFileSync` itself. `appendFileSync` loops on a short write, and each
+ * iteration of that loop is a separate `write()` a second process could append
+ * between. Under the sizes involved (one JSON Lines record, bounded at
+ * `MAX_RESPONSE_LINE_BYTES`) a local filesystem does not short-write, which is
+ * why the property holds — but a reader on NFS, or one tailing a file being
+ * written by a process that died mid-line, can still see a partial trailing
+ * line. Parse whole lines and treat a trailing fragment as not-yet-written;
+ * `docs/shift-logs.md` states this as the uploader contract.
  *
  * ── WHY A WRITE FAILURE IS NOT AN ERROR THE CALLER SEES ──
  *
@@ -60,7 +70,13 @@ function lineBytes(event: ShiftEvent): number {
 
 export function createShiftLogSink(opts: ShiftLogSinkOptions): ShiftLogSink {
   const append = opts.append ?? ((path: string, line: string) => {
-    appendFileSync(path, line);
+    // MODE 0600, OWNER ONLY, and it takes effect only on the call that CREATES
+    // the file — every later append leaves the existing mode alone. `shift.log`
+    // carries the same class of data as `<run>.log`: `order-dropped` and
+    // `hub-error` records quote hub and workflow messages verbatim, so the file
+    // is owner-only for the same reason `exec/loop.ts` writes its artifact JSON
+    // 0600. Without the option this would be 0666 & ~umask — 0644 in practice.
+    appendFileSync(path, line, { mode: 0o600 });
   });
   let reported = false;
 

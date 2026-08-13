@@ -232,6 +232,24 @@ test('status, atomic clock-in validation, attendance, typed gate event drain, an
   assert.deepEqual('events' in attended && attended.events, [failed, gate]);
   assert.equal(f.state.attended, 1234);
 
+  // THE DEEPEQUAL ABOVE CANNOT SEE THE ENVELOPE. `ev()` stamps its expectation
+  // with the very `stampShiftEvent` the daemon stamps with, so deleting `ts`,
+  // `shift` or `shiftId` from `protocol.ts` changes BOTH sides of that
+  // comparison at once and it stays green — it pins the BODY, not the wire
+  // contract. These three fields are what a consumer correlates and orders
+  // records by, so spell them out as literals this file owns. 1234 is the
+  // fixture clock, which `new Date(1234).toISOString()` renders as 1.234s past
+  // the epoch.
+  const drained = 'events' in attended ? attended.events : [];
+  assert.deepEqual(
+    drained.map((event) => ({ ts: event.ts, shift: event.shift, shiftId: event.shiftId })),
+    [
+      { ts: '1970-01-01T00:00:01.234Z', shift: 'box', shiftId: 'shf_test' },
+      { ts: '1970-01-01T00:00:01.234Z', shift: 'box', shiftId: 'shf_test' },
+    ],
+    'every drained record carries the full envelope on the wire',
+  );
+
   const started = Date.now();
   const timeout = await requestShift(f.socketPath, { op: 'next', wait_ms: 20 });
   assert.ok(Date.now() - started < 500, 'wait timeout is bounded');
@@ -250,7 +268,17 @@ test('only one next parks, overlap preserves exact error, and end wakes the park
   const ending = requestShift(f.socketPath, { op: 'end' });
   const firstResponse = await first.response;
   assert.equal('events' in firstResponse, true);
-  if ('events' in firstResponse) assert.deepEqual(firstResponse.events, [ev({ type: 'ended' })]);
+  if ('events' in firstResponse) {
+    assert.deepEqual(firstResponse.events, [ev({ type: 'ended' })]);
+    // Same tautology as above, and it matters more here: `ended` is the record
+    // the daemon itself mints to release a parked client, so its envelope is
+    // stamped on a path no loop `emit()` covers.
+    assert.deepEqual(
+      firstResponse.events.map((event) => ({ ts: event.ts, shift: event.shift, shiftId: event.shiftId })),
+      [{ ts: '1970-01-01T00:00:01.234Z', shift: 'box', shiftId: 'shf_test' }],
+      'the daemon-minted ended record carries the full envelope on the wire',
+    );
+  }
   assert.deepEqual(await ending, { ok: true, ended: true });
   assert.equal(await f.run, 0);
   assert.equal(f.state.stopped, true);

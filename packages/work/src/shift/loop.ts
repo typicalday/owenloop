@@ -711,6 +711,14 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       } catch (e) {
 	noteServerBackoff(e);
         opts.err(`inbox whats_next failed: ${errMsg(e)}`);
+	// THE THIRD HUB-CALL FAILURE PATH, and the most consequential: this one
+	// aborts the WHOLE sweep, because the shift never learned which
+	// workflows to poll. The targeted `whats_next` below loses one workflow
+	// and the `wake` above loses one tick; this loses everything. It is
+	// recorded on the same terms as the other two, with `workflow` absent —
+	// that omission is what distinguishes the untargeted inbox call from a
+	// per-workflow one, since `HubErrorEvent.workflow` is optional.
+	emit({ type: 'hub-error', op: 'whats_next', message: errMsg(e) });
 	return { dispatched, polled, openRuns, complete: false };
       }
     }

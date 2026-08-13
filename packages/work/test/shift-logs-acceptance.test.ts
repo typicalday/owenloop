@@ -16,7 +16,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -259,6 +259,75 @@ async function readWhenContains(path: string, needle: string, label: string): Pr
   return readFileSync(path, 'utf8');
 }
 
+/**
+ * The COMPLETE JSON Lines records in `text` — every `…\n`-terminated line, with
+ * a trailing fragment dropped.
+ *
+ * WHY A FRAGMENT IS EXPECTED HERE AND NOT A DEFECT. `readWhenContains` reads a
+ * file the shift daemon is still alive and still appending to, and it reads it
+ * twice: once to test the needle, once to return the bytes. A record can be
+ * mid-append between those two reads. `trimEnd().split('\n')` would hand that
+ * half-written line to `JSON.parse` and fail the run for a reason that has
+ * nothing to do with the code under test.
+ *
+ * This is the same rule `docs/shift-logs.md` gives an uploader — "a trailing
+ * line with no `\n` is not yet a record; parse whole lines and carry the
+ * remainder into the next read" — so the test consumes the file the way the
+ * contract says to, rather than the way that happens to work when nothing is
+ * writing.
+ *
+ * It does NOT weaken the "every line is valid JSON" assertion. A complete line
+ * that will not parse still fails; only the not-yet-a-line is skipped.
+ */
+function completeLines(text: string): string[] {
+  const lines = text.split('\n');
+  // `split` puts whatever follows the last `\n` in the final element: `''` when
+  // the text ends cleanly, a partial record when it does not. Either way the
+  // final element is not a complete line, so it goes.
+  lines.pop();
+  return lines;
+}
+
+/**
+ * Every COMPLETE record in `shift.log`, once one of them has `type === type`.
+ *
+ * Waiting on a SUBSTRING is what made the earlier version racy in two separate
+ * ways, and this helper closes both. `readWhenContains(path, '"parked"')`
+ * returns the moment the bytes `{"type":"parked"` hit the file — before the
+ * record's closing brace and newline exist — so the caller could parse a
+ * fragment. And its second `readFileSync` is a different instant from its
+ * probe, so a record could begin appending in between. Waiting on a complete,
+ * PARSED record of the wanted type removes both: the predicate and the returned
+ * value come from the same read, and a partial trailing line simply means "not
+ * yet", which is another poll rather than a failure.
+ *
+ * The JSON Lines contract is still enforced, not relaxed — every complete line
+ * must parse, and a complete line that does not fails the test right here.
+ */
+async function readShiftLogRecords(
+  path: string,
+  type: string,
+  label: string,
+): Promise<Record<string, unknown>[]> {
+  let records: Record<string, unknown>[] = [];
+  await until(
+    () => {
+      if (!existsSync(path)) return false;
+      records = completeLines(readFileSync(path, 'utf8')).map((line, index) => {
+        try {
+          return JSON.parse(line) as Record<string, unknown>;
+        } catch (error) {
+          assert.fail(`${label} line ${index + 1} is not valid JSON: ${line} (${String(error)})`);
+        }
+      });
+      return records.some((record) => record.type === type);
+    },
+    `${label} (${path}) to hold a complete '${type}' record`,
+    20_000,
+  );
+  return records;
+}
+
 test('a shift-dispatched worker\'s output lands in <run>.log and shift.log is JSON Lines', async () => {
   const hub: DispatchHubState = { dispatchEnabled: false, misroute: false, submits: [] };
   const bundle: CachedBundle = {
@@ -281,8 +350,10 @@ test('a shift-dispatched worker\'s output lands in <run>.log and shift.log is JS
     await shift.ready;
 
     // ── shift.log exists and starts self-describing, before any dispatch ──
-    const parkedRaw = await readWhenContains(shiftLogFile(logDir), '"parked"', 'shift.log');
-    const parked = JSON.parse(parkedRaw.trimEnd().split('\n')[0]!) as Record<string, unknown>;
+    // Index 0 deliberately: the claim is that the FIRST record is `parked`, so a
+    // reader holding only the file can resolve every later record's `shift` and
+    // `shiftId`. Finding a `parked` record somewhere would be a weaker claim.
+    const parked = (await readShiftLogRecords(shiftLogFile(logDir), 'parked', 'shift.log'))[0]!;
     assert.equal(parked.type, 'parked');
     assert.equal(parked.origin, origin, 'the first record must name the hub this shift serves');
     assert.equal(parked.cap, 1);
@@ -291,6 +362,16 @@ test('a shift-dispatched worker\'s output lands in <run>.log and shift.log is JS
     assert.equal(typeof parked.cwd, 'string');
     assert.match(String(parked.shiftId), /^shf_/u);
     assert.equal(new Date(String(parked.ts)).toISOString(), parked.ts);
+
+    // ── AND THE DESTINATION IS OWNER-ONLY, END TO END ──
+    // Asserted here rather than only in the unit tests because these modes are
+    // requested at creation and then never re-applied, so what matters is the
+    // mode a REAL shift leaves on disk after really creating the directory and
+    // really appending its first record. `shift.log` quotes hub and workflow
+    // messages verbatim in its `hub-error` and `order-dropped` records, and
+    // `<run>.log` beside it is raw worker output.
+    assert.equal((statSync(logDir).mode & 0o777).toString(8), '700', 'the log directory must be owner-only');
+    assert.equal((statSync(shiftLogFile(logDir)).mode & 0o777).toString(8), '600', 'shift.log must be owner-only');
 
     hub.dispatchEnabled = true;
 
@@ -318,14 +399,7 @@ test('a shift-dispatched worker\'s output lands in <run>.log and shift.log is JS
     // once, below, against the post-run re-read.
 
     // ── shift.log carries the structured dispatch record ──
-    const dispatchedRaw = await readWhenContains(shiftLogFile(logDir), '"dispatched"', 'shift.log');
-    const records = dispatchedRaw.trimEnd().split('\n').map((line, index) => {
-      try {
-        return JSON.parse(line) as Record<string, unknown>;
-      } catch (error) {
-        assert.fail(`shift.log line ${index + 1} is not valid JSON: ${line} (${String(error)})`);
-      }
-    });
+    const records = await readShiftLogRecords(shiftLogFile(logDir), 'dispatched', 'shift.log');
     // EVERY line parses and EVERY line carries the envelope — that is the whole
     // contract an uploader implements against.
     for (const record of records) {
@@ -382,7 +456,13 @@ test('a shift-dispatched worker\'s output lands in <run>.log and shift.log is JS
     );
     const finalShiftLog = readFileSync(shiftLogFile(logDir), 'utf8');
     assert.ok(finalShiftLog.includes('"ended"'), 'the shutdown record must be on disk too');
-    for (const line of finalShiftLog.trimEnd().split('\n')) JSON.parse(line);
+    // THE SHIFT HAS EXITED, so this read is not racing an appender and the file
+    // must be whole: no trailing fragment, every line valid JSON. The
+    // newline-termination assertion is the part that only holds here — the
+    // mid-run reads above legitimately catch a partial record and use
+    // `completeLines` for exactly that reason.
+    assert.ok(finalShiftLog.endsWith('\n'), 'a shift that exited leaves no half-written record');
+    for (const line of completeLines(finalShiftLog)) JSON.parse(line);
 
     assert.ok(reqs.length > 0);
   } finally {
@@ -423,15 +503,13 @@ test('a failed worker writes a stamped failed record, though nothing in the loop
       env(),
     );
     await shift.ready;
-    const parkedRaw = await readWhenContains(shiftLogFile(logDir), '"parked"', 'shift.log');
-    const parked = JSON.parse(parkedRaw.trimEnd().split('\n')[0]!) as Record<string, unknown>;
+    const parked = (await readShiftLogRecords(shiftLogFile(logDir), 'parked', 'shift.log'))[0]!;
 
     hub.dispatchEnabled = true;
 
     // `misroute: true` makes `get_order` serve `order: null`, so the worker
     // releases the claim and exits 1 instead of running the command.
-    const failedRaw = await readWhenContains(shiftLogFile(logDir), '"failed"', 'shift.log');
-    const records = failedRaw.trimEnd().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+    const records = await readShiftLogRecords(shiftLogFile(logDir), 'failed', 'shift.log');
     const failures = records.filter((record) => record.type === 'failed');
     // EXACTLY ONE. `spawn.ts` latches `failureReported`, so an `error` event
     // arriving after an `exit` event must not produce a second record.
@@ -641,7 +719,12 @@ test('an unwritable --log-dir loses the logs and still COMPLETES the order', asy
     );
 
     // ── AND NOTHING WAS WRITTEN ANYWHERE ──
-    assert.equal(existsSync(blockedLogDir), false, 'the unwritable directory must still not exist');
+    // `existsSync(blockedLogDir)` is NOT the assertion to make here: that path
+    // lives under a regular file, so `stat()` fails ENOTDIR and the answer is
+    // false whatever the shift did. The load-bearing checks are that the blocker
+    // is still a regular FILE of the original bytes (nothing unlinked it and
+    // made a directory in its place) and the stray sweep just below.
+    assert.equal(lstatSync(blocker).isFile(), true, 'the blocking file must still be a regular file');
     assert.equal(readFileSync(blocker, 'utf8'), 'x', 'the blocking file must be untouched');
     // Not silently redirected into the state directory either: with `ready:false`
     // the runtime builds NO sink and passes NO log directory, so neither
