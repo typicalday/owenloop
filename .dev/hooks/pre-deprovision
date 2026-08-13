@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+#
+# .dev/hooks/pre-deprovision — reclaim this worktree's port allocation.
+#
+# ## What invokes this, and with what
+#
+# `bin/dev`'s `run_lifecycle_hook` (dev repo, bin/dev:1933-1948) runs it during
+# `dev remove`, with:
+#
+#   - NO positional arguments — identity comes from cwd and nothing else;
+#   - cwd set to the worktree being reclaimed (`<container>/wt/<name>`);
+#   - `DEV_HOME`, `DEV_REPO_ROOT` (= `<container>`), and `DEV_PORTS_REGISTRY`
+#     (= the absolute path of dev's `ports.registry`) exported.
+#
+# It is invoked only when the path is EXECUTABLE — `bin/dev:1936` tests
+# `[[ ! -x "${hook}" ]]` and skips with a warning otherwise. A mode-644 copy of
+# this file is therefore silently inert, which is indistinguishable from the bug
+# it exists to fix. `test/lifecycle-hooks.test.ts` asserts git records 100755.
+#
+# ## Why the work lives here and not in bin/dev
+#
+# `dev remove` deliberately owns neither `.ports` row removal nor process
+# killing (bin/dev:2478, 2536): both are target-repository policy. Do not move
+# either back into `bin/dev` — the whole point of the hook contract is that the
+# repository decides what "reclaim my ports" means.
+#
+# ## The problem being fixed
+#
+# owenloop shipped no `.dev/hooks/` at all, so `dev remove` reclaimed the
+# worktree and left its `.ports` row behind forever. Rows accumulate until
+# `dev create` exhausts the registry's `max_instances` and refuses to allocate.
+# Observed live: 18 reclaimed worktrees, all 18 rows still present.
+#
+# ## Exit status is load-bearing: this hook must ALWAYS exit 0
+#
+# `bin/dev` runs under `set -euo pipefail` and calls this hook as a bare
+# statement (bin/dev:2479). A non-zero exit therefore aborts `dev remove`
+# BEFORE the git worktree is removed — cleanup failure would escalate into
+# "the worktree cannot be reclaimed at all". Hence:
+#
+#   - `set -e` is deliberately OFF; every fallible command is guarded
+#     explicitly with `|| true` or an `if`;
+#   - `set -u` is ON, because an unset-variable typo in a script that sends
+#     SIGKILL is worth catching;
+#   - `trap 'exit 0' EXIT` is the backstop that holds the contract even if
+#     something unanticipated (including a `set -u` trip) aborts the script.
+#     The explicit guards are the plan; the trap is the net.
+#
+# `pipefail` is NOT set: it would make an unguarded pipeline's exit status a
+# failure channel, which is the opposite of what this script wants.
+#
+# ## macOS Bash 3.2
+#
+# `/bin/bash` on macOS is 3.2.57 and a `#!/usr/bin/env bash` shebang may resolve
+# to Homebrew's Bash 5, which hides every 3.2 violation during local testing.
+# The test suite invokes this file through `/bin/bash` explicitly for that
+# reason.
+#
+# The specific 3.2 trap: under `set -u`, expanding an EMPTY array as
+# `"${arr[@]}"` raises "unbound variable" and aborts, where Bash 4.4+ expands it
+# to nothing. `.dev/project.sh` declares `PROJECT_PORTS=()` for owenloop (the
+# library serves nothing, so it allocates no named ports), so that empty array
+# is the live case, not a hypothetical. This script sidesteps the whole class by
+# using NO arrays: port blocks are walked with an integer counter and PID lists
+# are consumed by word-splitting a command substitution. If you add an array
+# here, guard every expansion with `${arr[*]:-}` before expanding `${arr[@]}`.
+
+set -u
+trap 'exit 0' EXIT
+
+say() { printf 'pre-deprovision: %s\n' "$*" >&2; }
+
+# A non-negative decimal integer, and nothing else. This is the guard that keeps
+# a malformed registry from widening a kill: `kill` reads a NEGATIVE argument as
+# a process GROUP, so `kill -TERM -1` would signal every process the user owns.
+# Nothing derived from file content reaches `kill` without passing through here.
+is_uint() {
+  case "${1:-}" in
+    '' | *[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# PIDs LISTENING on exactly this port.
+#
+# `-sTCP:LISTEN` is not decoration. Plain `lsof -ti TCP:<port>` also matches a
+# socket whose REMOTE end is that port — an outbound connection to some
+# unrelated service — which would make this hook kill a bystander. Listening
+# sockets are the only thing that occupies an allocated port.
+#
+# `lsof` exits 1 when nothing matches, hence the `|| true`.
+listener_pids() {
+  lsof -ti "TCP:${1}" -sTCP:LISTEN -nP 2>/dev/null || true
+}
+
+# Signal every listener in [from, to] with $1. Returns 0 if at least one signal
+# was sent, 1 if the range was empty.
+#
+# Each call RE-DERIVES the PID list from lsof rather than reusing an earlier
+# one. That is what makes the SIGKILL pass safe: a process that exits during the
+# grace period releases its PID, the kernel is free to hand that number to an
+# unrelated process, and SIGKILLing a remembered PID would hit whatever inherited
+# it. Asking lsof again narrows that race to the width of a single syscall.
+signal_block() {
+  local sig="$1" from="$2" to="$3"
+  local port pid sent=1
+  port="${from}"
+  while [ "${port}" -le "${to}" ]; do
+    # Unquoted on purpose: lsof prints one PID per line and this splits them.
+    for pid in $(listener_pids "${port}"); do
+      is_uint "${pid}" || continue
+      say "port ${port}: sending SIG${sig} to pid ${pid}"
+      kill -"${sig}" "${pid}" 2>/dev/null || true
+      sent=0
+    done
+    port=$(( port + 1 ))
+  done
+  return "${sent}"
+}
+
+# --- Identity: derived from cwd, never from an argument --------------------
+
+cwd="$(pwd -P 2>/dev/null || true)"
+if [ -z "${cwd}" ]; then
+  say "cwd no longer exists; nothing to reclaim"
+  exit 0
+fi
+
+# Parameter expansion rather than `basename`: it forks nothing, and it keeps the
+# identity step working even on a PATH too bare to resolve an external command.
+name="${cwd##*/}"
+project_root=""
+worktree=""
+
+case "${cwd}" in
+  */wt/*)
+    project_root="$(cd "${cwd}/../.." 2>/dev/null && pwd -P || true)"
+    worktree="${name}"
+    ;;
+  *)
+    if [ "${name}" = "main" ]; then
+      project_root="$(cd "${cwd}/.." 2>/dev/null && pwd -P || true)"
+      worktree="main"
+    fi
+    ;;
+esac
+
+if [ -z "${worktree}" ] || [ -z "${project_root}" ]; then
+  say "cwd ${cwd} is not a recognized worktree layout; nothing to reclaim"
+  exit 0
+fi
+
+# The highest-priority guard, checked before anything reads or writes state.
+# `main` is permanent and its block is the project's stable allocation: dropping
+# its row lets a later `dev create` hand the same ports to a new worktree and
+# collide with main's running services.
+if [ "${worktree}" = "main" ]; then
+  say "refusing to reclaim the main port mapping"
+  exit 0
+fi
+
+project="${project_root##*/}"
+ports_file="${project_root}/.ports"
+
+if [ ! -f "${ports_file}" ]; then
+  say "no ${ports_file}; nothing to reclaim"
+  exit 0
+fi
+
+# --- Project config --------------------------------------------------------
+#
+# Sourced for parity with the reference hook and the target-machine contract, so
+# a future owenloop `.dev/project.sh` that declares cleanup state is visible
+# here. Nothing below reads a variable from it today.
+#
+# `set +u` wraps the source deliberately, a considered deviation from the
+# reference: `.dev/project.sh` is local, gitignored, hand-edited state, and with
+# `set -u` active one unset variable in THAT file would abort THIS script before
+# the `.ports` row is removed — reinstating the exact leak being fixed. The
+# hook's own code stays under `set -u`.
+config="${cwd}/.dev/project.sh"
+if [ ! -f "${config}" ] && [ -f "${project_root}/main/.dev/project.sh" ]; then
+  config="${project_root}/main/.dev/project.sh"
+fi
+if [ -f "${config}" ]; then
+  set +u
+  # shellcheck disable=SC1090
+  . "${config}" || say "could not source ${config}; continuing"
+  set -u
+fi
+
+# --- Port block: registry base + block size, indexed by the .ports row ------
+#
+# `.ports` maps a worktree name to a block INDEX (bin/dev:1866-1872):
+#
+#   main 0
+#   flow-77a6cb0a 1
+#
+# `ports.registry` maps a project to its allocation (`project base block max`).
+# The worktree owns [base + index*block, base + index*block + block - 1].
+#
+# Both lookups compare the FIRST FIELD for full equality, never a substring or a
+# prefix, so a worktree named `api` cannot match a row belonging to `api-v2`.
+# Both take the FIRST match, mirroring `wt_load_port_index`'s documented
+# "duplicates degrade to the oldest assignment" rule (bin/dev:1878-1894).
+
+port_index=""
+while IFS=' ' read -r row_name row_index _rest; do
+  case "${row_name:-}" in '' | \#*) continue ;; esac
+  if [ "${row_name}" = "${worktree}" ]; then
+    port_index="${row_index:-}"
+    break
+  fi
+done < "${ports_file}"
+
+registry="${DEV_PORTS_REGISTRY:-}"
+if [ -z "${registry}" ] && [ -n "${DEV_REPO_ROOT:-}" ]; then
+  registry="${DEV_REPO_ROOT}/ports.registry"
+fi
+if [ -z "${registry}" ] && [ -f "${project_root}/ports.registry" ]; then
+  registry="${project_root}/ports.registry"
+fi
+
+reg_base=""
+reg_block=""
+if [ -n "${registry}" ] && [ -f "${registry}" ]; then
+  while IFS=' ' read -r row_project row_base row_block _row_rest; do
+    case "${row_project:-}" in '' | \#*) continue ;; esac
+    if [ "${row_project}" = "${project}" ]; then
+      reg_base="${row_base:-}"
+      reg_block="${row_block:-}"
+      break
+    fi
+  done < "${registry}"
+fi
+
+# --- Kill listeners, THEN drop the row -------------------------------------
+#
+# This order is deliberate. If the kill phase dies, the row survives and the
+# operation is retryable; dropping the row first would orphan running processes
+# with no record of which ports they hold.
+#
+# A malformed allocation skips the kill entirely and never guesses a range — but
+# it does NOT skip the row removal below, because a registry that still needs
+# cleaning is exactly the case this hook exists for.
+
+if is_uint "${reg_base}" && is_uint "${reg_block}" && is_uint "${port_index}" \
+  && [ "${reg_block}" -gt 0 ]; then
+  from=$(( reg_base + port_index * reg_block ))
+  to=$(( from + reg_block - 1 ))
+  if ! command -v lsof >/dev/null 2>&1; then
+    say "lsof unavailable; skipped process cleanup for ports ${from}-${to}"
+  elif signal_block TERM "${from}" "${to}"; then
+    sleep 1
+    if ! signal_block KILL "${from}" "${to}"; then
+      say "all listeners on ports ${from}-${to} exited after SIGTERM"
+    fi
+  else
+    say "no listeners on ports ${from}-${to}"
+  fi
+else
+  say "invalid numeric port allocation for ${worktree}" \
+    "(base=${reg_base} block=${reg_block} index=${port_index});" \
+    "skipped process cleanup"
+fi
+
+# --- Remove every row for this worktree ------------------------------------
+#
+# Every row, not just the first: an interrupted provision can leave duplicates,
+# and a single leftover keeps the index allocated.
+#
+# Written to a sibling temp file and moved into place, never truncated in
+# place. `mv` within a directory is atomic, so a reader either sees the old
+# registry or the new one; a truncate-then-write that is interrupted leaves a
+# half-written `.ports`, which is worse than the leak being fixed.
+#
+# `awk` compares `$1` for exact string equality, so comments, blank lines, the
+# `main` row and every other worktree's row pass through untouched.
+tmp="${ports_file}.pre-deprovision.$$"
+if awk -v target="${worktree}" '$1 != target { print }' "${ports_file}" > "${tmp}" 2>/dev/null; then
+  if mv "${tmp}" "${ports_file}" 2>/dev/null; then
+    say "removed ${worktree} from ${ports_file}"
+  else
+    say "could not replace ${ports_file}"
+    rm -f "${tmp}" 2>/dev/null || true
+  fi
+else
+  say "could not rewrite ${ports_file}"
+  rm -f "${tmp}" 2>/dev/null || true
+fi
+
+exit 0
