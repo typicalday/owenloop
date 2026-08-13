@@ -93,12 +93,17 @@ export interface WorkerLogOptions {
  * directory, or a path an operator deleted underneath the shift costs
  * observability for that worker and nothing else: the caller falls back to
  * `'ignore'` on slots 1 and 2 and dispatches anyway.
+ *
+ * `report` is the caller's LATCHED sink — see `createDefaultSpawner`. This
+ * function reports on every failure it sees; the latch that turns that into one
+ * line per shift lives with the spawner, which is the thing whose lifetime the
+ * latch is scoped to.
  */
-function openWorkerLog(path: string, logging: WorkerLogOptions | undefined): number | undefined {
+function openWorkerLog(path: string, report: (line: string) => void): number | undefined {
   try {
     return openSync(path, 'a');
   } catch (e) {
-    logging?.err?.(
+    report(
       `owenloop shift: could not open worker log ${path}: ${err(e)} — dispatching with its output discarded`,
     );
     return undefined;
@@ -236,6 +241,19 @@ export function createDefaultSpawner(
   onFailure?: WorkerFailureReporter,
   logging?: WorkerLogOptions,
 ): Spawner {
+  // ONE report per shift, not one per dispatch. Every condition that stops a
+  // worker log from opening — a full disk, a read-only log directory, an
+  // operator deleting it underneath a running shift — PERSISTS across the
+  // dispatches that follow, so an unlatched report writes one stderr line per
+  // dispatch for as long as the shift runs. The event sink latches its own
+  // failure report the same way (`logsink.ts`); these are the two failure paths
+  // of the same feature and they make the operator the same promise.
+  let reportedOpenFailure = false;
+  const reportOpenFailure = (line: string): void => {
+    if (reportedOpenFailure) return;
+    reportedOpenFailure = true;
+    logging?.err?.(line);
+  };
   return (spec: SpawnSpec): SpawnResult => {
     const plan = buildSpawnPlan(spec, origin, account, binPath, process.execPath, shiftId, logging?.dir);
     // Open the log ONCE and hand the SAME descriptor to slots 1 and 2. Opening
@@ -246,7 +264,9 @@ export function createDefaultSpawner(
     // ALWAYS APPEND, never truncate. A retried or re-armed run reuses its run
     // id, and the prior attempt's output is precisely the evidence this feature
     // exists to keep.
-    const logFd = plan.logFile === undefined ? undefined : openWorkerLog(plan.logFile, logging);
+    const logFd = plan.logFile === undefined
+      ? undefined
+      : openWorkerLog(plan.logFile, reportOpenFailure);
     const options = logFd === undefined
       ? plan.options
       : { ...plan.options, stdio: ['ignore', logFd, logFd] as WorkerStdio };

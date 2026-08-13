@@ -85,6 +85,8 @@ Two properties an uploader can rely on:
   processes.** Two shifts sharing a log directory interleave their records into
   one `shift.log`; `shiftId` is how you separate them. It is `''` only for an
   emitter that declared no shift id, which the shipped runtime never does.
+  (Sharing a log directory across shifts with separate state directories is
+  supported for retention too — see [The owner registry](#the-owner-registry--log-dirowners).)
 - **`shift` is NOT stable.** `clock_in` renames a running shift, and each record
   carries the name in force when it was written. Group by `shiftId`, display
   `shift`.
@@ -234,6 +236,17 @@ sequence number, or by moving the whole directory per shift — is open.
 Volume is low: a handful of records per dispatch. This is a slow leak, not a
 fast one.
 
+**One asymmetry to know about.** `capacity` is edge-triggered — one record when
+the shift becomes full, not one per poll — precisely because repetition into a
+never-rotated file actively harms it. `hub-error` deliberately did **not** get
+that treatment: it is level-triggered, so a hub that is unreachable for a day
+writes roughly one record per poll interval per workflow (~17k/day at the 5s
+default). The reasoning is that a repeated `capacity` says nothing new, whereas
+each `hub-error` is a distinct failed attempt an operator may want to count and
+time. If that trade proves wrong in practice, edge-triggering `hub-error` on
+`(op, message)` transitions is the obvious change, and it belongs with the
+rotation decision above rather than ahead of it.
+
 ## `<run>.log` — one worker's raw output
 
 `<log-dir>/<run>.log`, where `<run>` is the run id sanitized by `safeRun`.
@@ -282,6 +295,13 @@ owenloop shift: could not open worker log <path>: <reason> — dispatching with 
 
 — and spawns the worker with its output discarded. The dispatch still happens.
 
+That line is reported **once per shift**, not once per dispatch: every condition
+that stops a log from opening — a full disk, a read-only directory, a log
+directory deleted underneath a running shift — persists across the dispatches
+that follow, so an unlatched report would write one stderr line per dispatch for
+as long as the shift runs. The event sink latches its own failure report the
+same way.
+
 ## Retention
 
 Runs **once, at shift startup**, before any dispatch. It removes **worker logs
@@ -289,13 +309,50 @@ only**.
 
 A `<run>.log` is removed when **both** hold:
 
-1. no `<run>.json` in-flight record exists in the state directory, **and**
+1. no `<run>.json` in-flight record exists in **any state directory that writes
+   logs into this directory** (see *The owner registry* below), **and**
 2. the log's own mtime is at least `maxAge` old.
 
 Condition 1 is not tidiness. A live worker holds an open descriptor on its log;
 on POSIX, unlinking that file leaves the child writing into an orphaned inode —
 bytes produced, charged against the filesystem, and unreadable. The in-flight
 gate is what prevents that data loss.
+
+### The owner registry — `<log-dir>/.owners/`
+
+`OWENLOOP_SHIFT_LOG_DIR` is a single global setting, so pointing several crews'
+shifts at **one** log directory while each crew keeps its **own** state
+directory is a supported and natural layout. It is also what makes condition 1
+non-trivial: a sweeping shift can only see the `<run>.json` records in the state
+directory it owns. Another shift's live `<run>.log` has no record the sweeper can
+see, so a naive sweep would classify it as finished and unlink it — precisely
+the orphaned-inode loss the gate exists to prevent. At the 14-day default that
+needs a worker quiet for 14 days; at a reduced `--log-max-age` it would fire
+against **every** live worker of every other shift.
+
+So each shift, at startup and before it sweeps, writes one claim:
+
+```
+<log-dir>/.owners/<sha256(stateDir)[0:16]>.json   →   {"stateDir":"/abs/path"}
+```
+
+The sweep reads every claim and treats a run as in flight if **any** claimed
+state directory still holds its `<run>.json`. Properties that matter:
+
+- **One file per shift, named by a hash of the state directory it names.** Two
+  shifts starting simultaneously each write their own path, so no
+  read-modify-write can lose a claim.
+- **A stale claim is harmless.** A retired crew's state directory either no
+  longer exists or holds no records; it contributes no match and costs one
+  `stat`. Erring toward keeping a log costs disk. Erring the other way costs an
+  operator the evidence they went looking for.
+- **A corrupt or unreadable claim costs only its claimant**, never the sweep,
+  and the sweeping shift's own state directory is always consulted regardless.
+- If the claim cannot be written, the shift reports one line to its stderr and
+  keeps dispatching — its logs are then at risk from another shift sharing the
+  directory, which is the only reason that line exists.
+
+`.owners/` is not a log. It is never swept, and an uploader should ignore it.
 
 `maxAge` resolution, highest priority first:
 
@@ -309,10 +366,11 @@ next shift startup*. There is no value that disables the sweep. An unparseable
 or negative environment value is ignored and resolution falls through to the
 next source — a typo in an env var must not stop a shift from serving.
 
-**Never reaped at any age:** `shift.log`, anything not ending in `.log`, and any
-`*.log` whose basename is not a `run_…` id. The log directory defaults to the
-state directory, which also holds `shift.sock`, `.dispatch.lock`, and
-atomic-write temporaries; a sweep that removed by age alone would eat them.
+**Never reaped at any age:** `shift.log`, `.owners/`, anything not ending in
+`.log`, and any `*.log` whose basename is not a `run_…` id. The log directory
+defaults to the state directory, which also holds `shift.sock`,
+`.dispatch.lock`, and atomic-write temporaries; a sweep that removed by age
+alone would eat them.
 
 The sweep is best-effort and never throws. A locked, unreadable, or
 concurrently-removed file costs that one entry, not the sweep, and never the

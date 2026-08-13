@@ -128,6 +128,39 @@ test('an unopenable log costs the output, never the dispatch', async () => {
   assert.equal(errors.length, 1, errors.join('\n'));
   assert.ok(errors[0]?.includes('could not open worker log'), errors[0]);
   assert.ok(errors[0]?.includes('discarded'), errors[0]);
+
+  // REPORT ONCE PER SHIFT, NOT ONCE PER DISPATCH. The condition that makes the
+  // open fail — here a log "directory" that is really a file, in production a
+  // full disk or a directory deleted underneath a running shift — persists, so
+  // an unlatched report writes one stderr line for every dispatch the shift ever
+  // makes. Three more dispatches, all failing the same way, must add no lines.
+  for (const run of ['run_delta2', 'run_delta3', 'run_delta4']) {
+    const again = spawner({ workflow: 'wf1', run, step: 's', kind: 'exec' });
+    assert.equal(typeof again.pid, 'number', `${run} must still have been spawned`);
+  }
+  assert.equal(errors.length, 1, `the failure report must be latched: ${errors.join('\n')}`);
+});
+
+test('the log-open failure latch is per shift, so a new spawner reports again', async () => {
+  // The latch lives on the spawner, whose lifetime is the shift's. A DIFFERENT
+  // shift starting against the same broken destination is a new operator-facing
+  // event and must not be silenced by the previous shift's latch.
+  const notADir = join(root, 'not-a-dir-2');
+  writeFileSync(notADir, 'x');
+  const first: string[] = [];
+  const second: string[] = [];
+
+  createDefaultSpawner('https://hub', 'acct', fakeBin('w4b'), 'shf_1', undefined, {
+    dir: notADir,
+    err: (line) => first.push(line),
+  })({ workflow: 'wf1', run: 'run_zeta', step: 's', kind: 'exec' });
+  createDefaultSpawner('https://hub', 'acct', fakeBin('w4c'), 'shf_2', undefined, {
+    dir: notADir,
+    err: (line) => second.push(line),
+  })({ workflow: 'wf1', run: 'run_eta', step: 's', kind: 'exec' });
+
+  assert.equal(first.length, 1, first.join('\n'));
+  assert.equal(second.length, 1, second.join('\n'));
 });
 
 test('no log directory reproduces the pre-logging topology exactly', async () => {

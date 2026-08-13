@@ -19,6 +19,7 @@ import { resolveCacheDir } from '../bundle/cache.ts';
 import { createShiftLoop, type ShiftLoop } from './loop.ts';
 import { createShiftLogSink } from './logsink.ts';
 import {
+  registerShiftLogOwner,
   resolveShiftLogDir,
   resolveShiftLogMaxAgeMs,
   shiftLogFile,
@@ -75,6 +76,18 @@ const FILE_ONLY_EVENTS: ReadonlySet<ShiftEventBody['type']> = new Set([
   'capacity',
   'event-queue-overflow',
 ]);
+
+/**
+ * Does this event type reach the SOCKET consumer (a parked `owenloop shift
+ * next`), or only `shift.log`?
+ *
+ * The routing rule as a pure predicate so it can be asserted directly rather
+ * than only through a daemon's timing. `consumeEvent` is its one production
+ * caller; a `false` here means the record still reaches the file.
+ */
+export function reachesSocketConsumer(type: ShiftEventBody['type']): boolean {
+  return !FILE_ONLY_EVENTS.has(type);
+}
 
 export function resolveCap(flagCap: number | undefined, settingsCap: number | undefined): number {
   return flagCap ?? settingsCap ?? DEFAULT_CAP;
@@ -337,6 +350,23 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   }
 
   if (logDirReady) {
+    // Claim the log directory for THIS shift's state directory BEFORE sweeping
+    // it. The claim is what lets any other shift sharing this log directory
+    // consult our in-flight records instead of reaping our live workers' logs —
+    // and, symmetrically, what lets our sweep below see theirs. Writing it first
+    // means our own records gate our own sweep even on the very first startup.
+    //
+    // A failed claim costs retention safety, not dispatch: report once and keep
+    // going, exactly like every other step in this block.
+    try {
+      registerShiftLogOwner(logDir, stateDir);
+    } catch (err) {
+      process.stderr.write(
+        `${roleLabel}: cannot record this shift's claim on ${logDir}: ${errMsg(err)} — ` +
+          'another shift sharing this log directory may reap this one\'s worker logs\n',
+      );
+    }
+
     // Retention runs once at startup, before any dispatch. `sweepShiftLogs`
     // never throws by contract; the guard is belt-and-braces so that a future
     // change to it can never become a startup failure.
@@ -437,7 +467,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
    * emitter never has to know how many sinks exist.
    */
   const consumeEvent = (event: ShiftEvent): void => {
-    if (daemonMode && !FILE_ONLY_EVENTS.has(event.type)) {
+    if (daemonMode && reachesSocketConsumer(event.type)) {
       try {
         daemon?.onEvent(event);
       } catch (err) {

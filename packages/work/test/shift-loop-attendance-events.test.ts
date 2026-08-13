@@ -303,6 +303,35 @@ test('a full dispatch cap emits one capacity event carrying both numbers', async
   }]);
 });
 
+test('the capacity event reports inFlight and cap as DISTINCT numbers', async () => {
+  // The `cap: 0` fixture above makes both numbers zero, so it passes for an
+  // implementation that swaps the two fields or hardcodes either to 0 — the
+  // "carries both numbers" claim is exactly what it cannot prove. Here one LIVE
+  // child fills a cap of 1, so `inFlight` and `cap` are still equal in VALUE but
+  // both nonzero, and a hardcoded 0 in either field fails.
+  cacheCommand();
+  const events: ShiftEvent[] = [];
+  const { hub } = mockHub(true);
+  // `process.pid` is a pid the liveness probe will find alive, which is what
+  // makes this record count against capacity instead of being reaped.
+  writeChildRecord(stateDir, {
+    workflow: 'wf1', run: 'run_live', pid: process.pid, spawnedAt: 0, kind: 'exec',
+  });
+  const loop = createShiftLoop(baseOpts(hub, () => ({ pid: 1000 }), {
+    cap: 1,
+    onEvent: (event) => events.push(event),
+  }));
+  hub.whatsNext = async (req) => req?.workflow === undefined
+    ? { text: '', instances: [{ workflow: 'wf1', def: 'demo', done: false, eligible: 1, blocked: 0, owedSeededInputs: [] }] }
+    : { text: '', workflow: 'wf1', def: 'demo', orders: [order('cmd')] };
+
+  await loop.iterate();
+
+  assert.deepEqual(events.filter((event) => event.type === 'capacity'), [{
+    type: 'capacity', inFlight: 1, cap: 1, ...ENVELOPE,
+  }]);
+});
+
 test('one unbroken stretch at capacity emits ONE capacity event, not one per tick', async () => {
   // REGRESSION GUARD. This branch runs on every CHANGED wake for as long as the
   // shift stays full, so a level-triggered event floods two durable consumers:
@@ -342,7 +371,11 @@ test('a throwing event sink is reported and never reaches the loop', async () =>
   const errors: string[] = [];
   cacheCommand();
   const { hub } = mockHub(true);
-  const loop = createShiftLoop(baseOpts(hub, () => ({ pid: 4321 }), {
+  const spawned: string[] = [];
+  const loop = createShiftLoop(baseOpts(hub, (spec) => {
+    spawned.push(`${spec.workflow}/${spec.run}#${spec.step ?? ''}`);
+    return { pid: 4321 };
+  }, {
     onEvent: () => { throw new Error('sink exploded'); },
     err: (line) => errors.push(line),
   }));
@@ -358,5 +391,19 @@ test('a throwing event sink is reported and never reaches the loop', async () =>
     errors.join('\n'),
   );
   // And the dispatch it was reporting on still happened.
-  assert.equal(readdirSync(stateDir).some((name) => name.endsWith('.json')), true, 'the order was still dispatched');
+  //
+  // ASSERT ON THE SPAWNER, not on state-dir filenames. The previous assertion
+  // here — "some file in stateDir ends in .json" — could never have failed for
+  // the reason it stated: `loop.ts` takes `.dispatch.lock`, and `lock.ts`
+  // unconditionally writes the sidecar `.dispatch.lock.owner.json` on acquire
+  // and REWRITES rather than unlinks on release, so that file is present after
+  // any reservation attempt, including one that bailed on capacity or
+  // duplication.
+  //
+  // `readChildRecords(stateDir)` is not the fix either, and the reason is worth
+  // recording: pid 4321 is not a live process, so this single `iterate()` both
+  // dispatches the child AND reaps it once liveness fails, leaving zero records
+  // behind. The record's survival is incidental to the fake pid; the spawner
+  // call is the thing that actually means "the order was dispatched".
+  assert.deepEqual(spawned, ['wf1/run_1#cmd']);
 });

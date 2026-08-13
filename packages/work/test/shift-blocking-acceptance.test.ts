@@ -292,10 +292,16 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
     }>(secondResult);
     assert.equal(secondResponse.events.length, 1, JSON.stringify(secondResponse.events));
     const ended = secondResponse.events[0]!;
-    assert.equal(ended.type, 'ended');
-    assert.equal(typeof ended.shift, 'string');
-    assert.match(ended.shiftId ?? '', /^shf_/u);
-    assert.equal(new Date(ended.ts ?? '').toISOString(), ended.ts);
+    // Strip the three unpredictable envelope fields and assert the EXACT shape
+    // of what remains. This keeps the "an `ended` event carries no other
+    // payload" property that a field-by-field check would silently drop if a
+    // future change added a key.
+    const { ts, shift: shiftName, shiftId, ...rest } = ended;
+    assert.deepEqual(rest, { type: 'ended' });
+    assert.equal(typeof shiftName, 'string');
+    assert.notEqual(shiftName, '', 'a real shift always names itself');
+    assert.match(shiftId ?? '', /^shf_/u);
+    assert.equal(new Date(ts ?? '').toISOString(), ts);
 
     const exited = await shift.exited;
     assert.equal(exited, 0, shift.stderr());

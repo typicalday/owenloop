@@ -17,12 +17,18 @@
  * Refusing to reap any log whose `<run>.json` still exists is what prevents
  * that.
  *
+ * "Still exists" means in ANY state directory that writes logs here, not just
+ * the sweeping shift's own — several shifts may share one log directory while
+ * keeping separate per-crew state directories. `LOG_OWNERS_DIR_NAME` below is
+ * how a sweeping shift learns where the other shifts' records live.
+ *
  * Shape mirrors `agent/workdir.ts`: a PURE truth-table gate (`isShiftLogReapable`)
  * a unit test can drive with no filesystem, plus a best-effort sweep
  * (`sweepShiftLogs`) that never throws, because a sweep must not die over one
  * file.
  */
-import { readdirSync, rmSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { safeRun } from './state.ts';
@@ -109,7 +115,10 @@ export interface ShiftLogReapGateInput {
   name: string;
   /** The log file's own last-modification time, in ms. */
   mtimeMs: number;
-  /** Does the matching `<run>.json` in-flight record still exist? */
+  /**
+   * Does the matching `<run>.json` in-flight record still exist in ANY state
+   * directory that logs into this directory? See `LOG_OWNERS_DIR_NAME`.
+   */
   hasRunRecord: boolean;
   now: number;
   maxAgeMs: number;
@@ -158,11 +167,111 @@ export function isWorkerLogName(name: string): boolean {
   return /^run_[A-Za-z0-9_.-]+$/u.test(name.slice(0, -'.log'.length));
 }
 
+/**
+ * Sub-directory of the log directory in which each shift declares WHICH state
+ * directory holds its in-flight `<run>.json` records.
+ *
+ * ── WHY A REGISTRY EXISTS AT ALL ──
+ *
+ * The in-flight gate asks "does `<run>.json` still exist?", and a shift can only
+ * answer that for the state directory it owns. `--log-dir` /
+ * `OWENLOOP_SHIFT_LOG_DIR` is a single global setting, so centralizing several
+ * crews' logs into ONE directory while each crew keeps its own per-crew state
+ * directory is the obvious way to use it. In that layout a sweeping shift sees
+ * another shift's `<run>.log` with no `<run>.json` anywhere IT can see, decides
+ * the run is finished, and unlinks a log a LIVE worker still holds a descriptor
+ * on — the exact orphaned-inode data loss the gate exists to prevent. At the
+ * 14-day default that needs a worker quiet for 14 days; at a reduced
+ * `--log-max-age` it fires against every live worker of every other shift.
+ *
+ * So each shift writes one claim naming its state directory, and the sweep
+ * treats a run as in flight if ANY claimed state directory still holds its
+ * record. One file per shift, named by a hash of the state directory it names,
+ * so two shifts starting at once each write their OWN file and no
+ * read-modify-write can lose a claim.
+ *
+ * A stale claim (a retired crew) is harmless: its state directory either no
+ * longer exists or holds no records, so it contributes no `true` and merely
+ * costs one `stat`. Erring toward keeping a log costs disk; erring the other way
+ * costs an operator the evidence they went looking for.
+ */
+export const LOG_OWNERS_DIR_NAME = '.owners';
+
+/** `<log-dir>/.owners` — pure path math; creates nothing. */
+export function logOwnersDir(logDir: string): string {
+  return join(logDir, LOG_OWNERS_DIR_NAME);
+}
+
+/**
+ * The claim filename for one state directory. A hash, not the path itself:
+ * a state directory path is not a safe filename, and the hash makes each shift's
+ * write land on its own name so concurrent claims cannot clobber each other.
+ */
+function ownerClaimName(stateDir: string): string {
+  return `${createHash('sha256').update(stateDir).digest('hex').slice(0, 16)}.json`;
+}
+
+/**
+ * Declare that `stateDir` holds the in-flight records for the workers logging
+ * into `logDir`. Idempotent — re-run at every shift startup, rewriting the same
+ * path with the same bytes.
+ *
+ * THROWS on failure, deliberately: the caller decides what a shift that cannot
+ * claim its logs should do (see `runtime.ts`, which reports once and keeps
+ * dispatching, because an observability defect must not become an outage).
+ */
+export function registerShiftLogOwner(logDir: string, stateDir: string): string {
+  const dir = logOwnersDir(logDir);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, ownerClaimName(stateDir));
+  writeFileSync(path, `${JSON.stringify({ stateDir })}\n`);
+  return path;
+}
+
+/**
+ * Every state directory that has claimed `logDir`, plus `ownStateDir` — which is
+ * included unconditionally so a sweep is never LESS informed than it was before
+ * the registry existed, even if the claim write failed or the directory is
+ * unreadable.
+ *
+ * Never throws. An absent registry (the default single-shift layout, where no
+ * claim has been written yet) and one unparseable claim both degrade to "that
+ * claim tells me nothing", not to a failed sweep.
+ */
+export function readShiftLogOwners(logDir: string, ownStateDir: string): string[] {
+  const owners = new Set<string>([ownStateDir]);
+  const dir = logOwnersDir(logDir);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [...owners];
+  }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+      const claimed = (parsed as { stateDir?: unknown }).stateDir;
+      if (typeof claimed === 'string' && claimed.trim() !== '') owners.add(claimed);
+    } catch {
+      // One corrupt claim must not blind the sweep to the others. It can only
+      // cost the claimant's own logs, and only if that shift never rewrites it.
+    }
+  }
+  return [...owners];
+}
+
 export interface SweepShiftLogsOptions {
   /** The resolved log directory. */
   dir: string;
-  /** Where `<run>.json` in-flight records live — the state dir. */
+  /** Where THIS shift's `<run>.json` in-flight records live. */
   stateDir: string;
+  /**
+   * Every state directory whose records gate this sweep. Defaults to
+   * `readShiftLogOwners(dir, stateDir)` — this shift's own, plus every other
+   * shift that has claimed the log directory. Injected for tests.
+   */
+  stateDirs?: string[];
   now: number;
   maxAgeMs: number;
   /** Progress/warning sink. */
@@ -201,6 +310,10 @@ export function sweepShiftLogs(o: SweepShiftLogsOptions): string[] {
   const list = o.list ?? ((dir: string) => readdirSync(dir));
   const mtime = o.mtime ?? ((path: string) => statSync(path).mtimeMs);
   const hasRecord = o.hasRecord ?? defaultHasRecord;
+  // A run is in flight if ANY shift that logs here still holds its record — not
+  // just this one. See `LOG_OWNERS_DIR_NAME` for why a single-state-dir probe
+  // silently reaps other shifts' live logs.
+  const stateDirs = o.stateDirs ?? readShiftLogOwners(o.dir, o.stateDir);
   const remove = o.remove ?? ((path: string) => {
     rmSync(path, { force: true });
   });
@@ -222,7 +335,7 @@ export function sweepShiftLogs(o: SweepShiftLogsOptions): string[] {
         !isShiftLogReapable({
           name,
           mtimeMs: mtime(path),
-          hasRunRecord: hasRecord(o.stateDir, name),
+          hasRunRecord: stateDirs.some((stateDir) => hasRecord(stateDir, name)),
           now: o.now,
           maxAgeMs: o.maxAgeMs,
         })

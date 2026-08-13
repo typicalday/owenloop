@@ -8,7 +8,7 @@
  * will not reproduce on demand) and against a real temp directory, because the
  * whole point of this feature is bytes that survive on a real disk.
  */
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -16,9 +16,13 @@ import { afterEach, beforeEach, test } from 'node:test';
 
 import {
   DEFAULT_SHIFT_LOG_MAX_AGE_MS,
+  LOG_OWNERS_DIR_NAME,
   SHIFT_LOG_NAME,
   isShiftLogReapable,
   isWorkerLogName,
+  logOwnersDir,
+  readShiftLogOwners,
+  registerShiftLogOwner,
   resolveShiftLogDir,
   resolveShiftLogMaxAgeMs,
   runLogFile,
@@ -26,6 +30,7 @@ import {
   sweepShiftLogs,
 } from '../src/shift/logretention.ts';
 import { createShiftLogSink } from '../src/shift/logsink.ts';
+import { reachesSocketConsumer } from '../src/shift/runtime.ts';
 import { buildSpawnPlan } from '../src/shift/spawn.ts';
 import {
   MAX_RESPONSE_LINE_BYTES,
@@ -206,6 +211,94 @@ test('sweepShiftLogs never throws and costs at most the one file that failed', (
   assert.ok(errors.every((line) => line.includes('(ignored)')), errors.join('\n'));
 });
 
+// ── the sweep across shifts that share one log directory ───────────────────
+
+test('a shift does not reap another shift\'s LIVE worker log from a shared log dir', () => {
+  // REGRESSION GUARD. `OWENLOOP_SHIFT_LOG_DIR` is one global setting, so
+  // centralizing two crews' logs into one directory while each crew keeps its
+  // own state directory is the obvious way to use it. Before the owner registry,
+  // crew B's sweep resolved the in-flight gate against only B's OWN state
+  // directory: crew A's live `run_alive.log` had no `run_alive.json` anywhere B
+  // could see, so B unlinked a log A's live worker still held a descriptor on —
+  // the exact orphaned-inode data loss the gate exists to prevent.
+  const shared = join(root, 'shared-logs');
+  const stateA = join(root, 'state-a');
+  const stateB = join(root, 'state-b');
+  for (const dir of [shared, stateA, stateB]) mkdirSync(dir, { recursive: true });
+
+  const now = 100 * DAY;
+  // Crew A: one LIVE run (record present) and one FINISHED run (record gone).
+  // Both logs are given the same age, so the ONLY thing separating their fates
+  // is the in-flight record — which lives in crew A's state dir, not B's.
+  for (const name of ['run_alive.log', 'run_done.log']) {
+    const path = join(shared, name);
+    writeFileSync(path, 'a');
+    const seconds = (now - 1 * DAY) / 1000;
+    utimesSync(path, seconds, seconds);
+  }
+  writeFileSync(join(stateA, 'run_alive.json'), '{}');
+  registerShiftLogOwner(shared, stateA);
+  // Crew B sweeps the shared directory with its own, empty state directory.
+  registerShiftLogOwner(shared, stateB);
+
+  // maxAge 0 is the aggressive setting `docs/shift-logs.md` calls a real choice
+  // on a disk-constrained host, and the setting under which this fired against
+  // EVERY live worker of the other shift.
+  const removed = sweepShiftLogs({ dir: shared, stateDir: stateB, now, maxAgeMs: 0 });
+
+  assert.equal(
+    existsSync(join(shared, 'run_alive.log')),
+    true,
+    'crew A\'s live worker log must survive crew B\'s sweep',
+  );
+  // And retention is not merely disabled: the genuinely finished log still goes.
+  assert.deepEqual(removed, [join(shared, 'run_done.log')]);
+});
+
+test('readShiftLogOwners returns every claimed state dir plus the caller\'s own', () => {
+  const shared = join(root, 'owners-logs');
+  const stateA = join(root, 'owners-a');
+  const stateB = join(root, 'owners-b');
+  mkdirSync(shared, { recursive: true });
+
+  assert.deepEqual(
+    readShiftLogOwners(shared, stateA),
+    [stateA],
+    'no registry yet ⇒ exactly the caller\'s own state dir, the pre-registry behaviour',
+  );
+
+  registerShiftLogOwner(shared, stateA);
+  registerShiftLogOwner(shared, stateB);
+  assert.deepEqual(readShiftLogOwners(shared, stateA).sort(), [stateA, stateB].sort());
+  // Re-registering is idempotent: one claim per state dir, keyed by its hash.
+  registerShiftLogOwner(shared, stateA);
+  assert.equal(readShiftLogOwners(shared, stateA).length, 2);
+});
+
+test('a corrupt owner claim costs only that claimant, never the sweep', () => {
+  const shared = join(root, 'corrupt-logs');
+  const stateA = join(root, 'corrupt-a');
+  const stateB = join(root, 'corrupt-b');
+  mkdirSync(shared, { recursive: true });
+  registerShiftLogOwner(shared, stateA);
+  registerShiftLogOwner(shared, stateB);
+  // Truncate one claim to garbage, as a crash mid-write would.
+  const claims = readdirSync(logOwnersDir(shared));
+  assert.equal(claims.length, 2);
+  writeFileSync(join(logOwnersDir(shared), claims[0] ?? ''), 'not json{');
+
+  const owners = readShiftLogOwners(shared, stateB);
+  assert.ok(owners.includes(stateB), 'the caller\'s own state dir is unconditional');
+  assert.ok(owners.length >= 1 && owners.length <= 2, JSON.stringify(owners));
+});
+
+test('the owner registry is never mistaken for a worker log', () => {
+  // `.owners` sits inside the log directory, which by default IS the state
+  // directory. A sweep that removed by age alone would eat it.
+  assert.equal(isWorkerLogName(LOG_OWNERS_DIR_NAME), false);
+  assert.equal(logOwnersDir('/logs'), join('/logs', LOG_OWNERS_DIR_NAME));
+});
+
 test('sweepShiftLogs reports an unreadable directory and returns empty', () => {
   const errors: string[] = [];
   const removed = sweepShiftLogs({
@@ -219,6 +312,27 @@ test('sweepShiftLogs reports an unreadable directory and returns empty', () => {
   assert.deepEqual(removed, []);
   assert.equal(errors.length, 1);
   assert.ok(errors[0]?.includes('could not scan shift logs'), errors[0]);
+});
+
+// ── which events reach which consumer ──────────────────────────────────────
+
+test('parked, capacity and overflow are FILE-ONLY; every other event reaches the socket', () => {
+  // Load-bearing and otherwise proven only indirectly, through a timing race in
+  // `shift-blocking-acceptance.test.ts`. The rule: a parked `owenloop shift
+  // next` BLOCKS on an idle shift, so a record ABOUT the shift itself — it
+  // parked, it is at capacity, its queue overflowed — must not be what wakes the
+  // client. Those three still reach `shift.log`, which is the durable consumer
+  // they were promoted for.
+  for (const type of ['parked', 'capacity', 'event-queue-overflow'] as const) {
+    assert.equal(reachesSocketConsumer(type), false, `${type} must not wake a parked next`);
+  }
+  // Everything else is genuine work-shaped news a client asked to be woken for.
+  for (const type of [
+    'dispatched', 'reaped', 'failed', 'gate', 'ended',
+    'hub-error', 'bundle-miss', 'order-dropped',
+  ] as const) {
+    assert.equal(reachesSocketConsumer(type), true, `${type} must reach a parked next`);
+  }
 });
 
 // ── the spawn plan's log destination ───────────────────────────────────────
