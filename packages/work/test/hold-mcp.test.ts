@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { afterEach, test } from 'node:test';
 import { readFileSync } from 'node:fs';
 
-import { dsseVerifySubmission } from '../../../src/crypto/index.ts';
+import { dsseVerifySubmission, valueDigestHex } from '../../../src/crypto/index.ts';
 import { publicKeyDescriptor } from '../../../src/crypto/keys.ts';
 import { resetSshKeygenProbe } from '../../../src/crypto/ssh.ts';
 import type { SshProcessAdapter } from '../../../src/crypto/ssh.ts';
@@ -230,6 +230,75 @@ test('hold-MCP judge submit attaches a DSSE proof for the fingerprinted artifact
   };
   assert.equal(record.produced[0]!.artifact, 'result');
   assert.deepEqual(record.consumedFingerprint, { result: 2 });
+});
+
+test('a JSON-string producer value is normalized once, so the signed bytes are the stored bytes', async () => {
+  // The live failure this guards: the builder agent submitted `pr` as a
+  // JSON-encoded STRING. The worker signed the string; the hub normalized it to
+  // an object and therefore DROPPED the proof (it cannot claim the signature
+  // covers the bytes it stored). `pr` committed unproven, and the command step
+  // consuming it refused forever with nothing in either log to say why.
+  const orderResponse: GetOrderResponse = {
+    text: '',
+    workflow: 'wf1',
+    run: 'run1',
+    order: {
+      run: 'run1',
+      workflow: 'wf1',
+      step: 'builder',
+      key: '',
+      defDigest: 'def-digest',
+      inputs: ['workspace'],
+      outputs: ['pr'],
+      consumes: { workspace: { path: '/tmp/wt' } },
+      consumedFingerprint: { workspace: 1 },
+      owes: [{ path: 'pr', version: 2, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+    },
+    lease: { claimed: true },
+  };
+  const { hub, calls } = mockHub({ getOrder: orderResponse, submit: { outcome: 'green', closed: false } });
+  const mount = createHoldMcp(deps(hub, {
+    origin: 'https://hub.example.test',
+    principalKeys: signingKeys(),
+    sshProcess: fakeSshProcess(),
+    consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
+  }));
+
+  await tool(mount.tools, 'submit').handler(
+    { path: 'pr', value: '{"prUrl":"https://example.test/145","number":145}', done: true },
+    ctx,
+  );
+
+  const req = calls.find((call) => call.verb === 'submit')!.arg as { value: unknown; proof?: string };
+  // On the wire as an object, so the hub never takes its string branch.
+  assert.deepEqual(req.value, { prUrl: 'https://example.test/145', number: 145 });
+  assert.ok(req.proof !== undefined);
+
+  const verified = await dsseVerifySubmission(JSON.parse(req.proof), {
+    async verify(_bytes, signature) {
+      return signature.toString('utf8') === ARMOR
+        ? { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const }
+        : null;
+    },
+  });
+  const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
+    produced: Array<{ artifact: string; version: number; valueDigest: string }>;
+  };
+  // The proof covers the SAME bytes that went on the wire, at the target
+  // version the hub issued for this owed output. Recomputing the digest from
+  // the wire value is the assertion that actually fails when the producer
+  // signs the string and sends the object.
+  assert.equal(record.produced[0]!.artifact, 'pr');
+  assert.equal(record.produced[0]!.version, 2);
+  assert.equal(record.produced[0]!.valueDigest, valueDigestHex(req.value));
+});
+
+test('an unparseable string value reaches the hub unchanged, for the hub to reject', async () => {
+  const { hub, calls } = mockHub({ submit: { outcome: 'artifact-normalization-failed', closed: false } });
+  const mount = createHoldMcp(deps(hub));
+  await tool(mount.tools, 'submit').handler({ path: 'pr', value: 'not json at all' }, ctx);
+  const req = calls.find((call) => call.verb === 'submit')!.arg as { value: unknown };
+  assert.equal(req.value, 'not json at all');
 });
 
 test('hold-MCP repeated judge approval signs the same fingerprinted version', async () => {
