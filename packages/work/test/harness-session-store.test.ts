@@ -502,6 +502,121 @@ test('compact drops corrupt lines along with superseded ones', () => {
   assert.equal((JSON.parse(onDisk[0]!) as SessionRecord).token, 'v2');
 });
 
+// ---------------------------------------------------------------------------
+// The two skip paths report DIFFERENTLY.
+//
+// Both once emitted the identical "skipping corrupt record" string. An incident
+// followed: 36 records that were perfectly valid JSON, rejected only because
+// their `token` was the empty string, were every one of them reported as if the
+// file were corrupt — sending debugging after a file-integrity problem that did
+// not exist. The tests below pin BOTH messages so a future edit cannot quietly
+// collapse them back into one string.
+// ---------------------------------------------------------------------------
+
+const capture = (): { warnings: string[]; opts: { warn: (line: string) => void } } => {
+  const warnings: string[] = [];
+  return { warnings, opts: { warn: (line) => warnings.push(line) } };
+};
+
+test('a line that will not parse is reported as corrupt', () => {
+  writeFileSync(file, 'not json\n');
+  const { warnings, opts } = capture();
+
+  assert.deepEqual(readSessions(file, opts), []);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0], `owenloop work sessions: skipping corrupt record at ${file}:1`);
+});
+
+test('a parsed record that fails the schema names the field, not "corrupt"', () => {
+  // The 36-record incident verbatim: valid JSON, empty `token`.
+  writeFileSync(file, `${JSON.stringify(rec({ token: '' }))}\n`);
+  const { warnings, opts } = capture();
+
+  assert.deepEqual(readSessions(file, opts), [], 'an empty token is still rejected');
+  assert.equal(warnings.length, 1);
+  assert.equal(
+    warnings[0],
+    `owenloop work sessions: skipping invalid record at ${file}:1: field "token" failed schema check`,
+  );
+});
+
+test('the two skip messages cannot be confused for each other', () => {
+  writeFileSync(file, ['not json', JSON.stringify(rec({ token: '' }))].join('\n') + '\n');
+  const { warnings, opts } = capture();
+
+  assert.deepEqual(readSessions(file, opts), []);
+  assert.equal(warnings.length, 2);
+  const [parseMsg, schemaMsg] = warnings as [string, string];
+
+  // If you are here because you want to merge these strings: read the comment
+  // block above this test first. They are separate on purpose.
+  assert.notEqual(parseMsg, schemaMsg);
+  assert.ok(parseMsg.includes('corrupt'), 'the parse path is the only one saying "corrupt"');
+  assert.ok(!parseMsg.includes('field "'), 'the parse path never names a field');
+  assert.ok(schemaMsg.includes('invalid'), 'the schema path says "invalid"');
+  assert.ok(!schemaMsg.includes('corrupt'), 'the schema path never says "corrupt"');
+});
+
+test('the schema message reports the field name and never the field value', () => {
+  // `token` is credential-shaped, so a distinctive sentinel gives this teeth:
+  // the record fails on `status`, but its token must not reach the log either.
+  const sentinel = 'SENTINEL-TOKEN-MUST-NOT-BE-LOGGED';
+  writeFileSync(file, `${JSON.stringify({ ...rec({ token: sentinel }), status: 'bogus' })}\n`);
+  const { warnings, opts } = capture();
+
+  assert.deepEqual(readSessions(file, opts), []);
+  assert.equal(warnings.length, 1);
+  assert.equal(
+    warnings[0],
+    `owenloop work sessions: skipping invalid record at ${file}:1: field "status" failed schema check`,
+  );
+  assert.ok(!warnings[0]!.includes(sentinel), 'a record value must never reach the log');
+});
+
+test('valid JSON that is not an object reports <root> rather than throwing', () => {
+  writeFileSync(file, ['[]', '3', 'null'].join('\n') + '\n');
+  const { warnings, opts } = capture();
+
+  assert.deepEqual(readSessions(file, opts), []);
+  assert.deepEqual(warnings, [1, 2, 3].map((n) =>
+    `owenloop work sessions: skipping invalid record at ${file}:${n}: field "<root>" failed schema check`,
+  ));
+});
+
+test('a record failing several checks reports the first field in declaration order', () => {
+  // `run` and `harness` are both empty; `run` is checked first, so the message
+  // is deterministic and this test cannot flake on property iteration order.
+  writeFileSync(file, `${JSON.stringify(rec({ run: '', harness: '' }))}\n`);
+  const { warnings, opts } = capture();
+
+  assert.deepEqual(readSessions(file, opts), []);
+  assert.equal(
+    warnings[0],
+    `owenloop work sessions: skipping invalid record at ${file}:1: field "run" failed schema check`,
+  );
+});
+
+test('every field the schema requires is reported by its own name', () => {
+  for (const field of ['workflow', 'run', 'step', 'harness', 'token'] as const) {
+    writeFileSync(file, `${JSON.stringify(rec({ [field]: '' }))}\n`);
+    const { warnings, opts } = capture();
+
+    assert.deepEqual(readSessions(file, opts), [], `an empty ${field} is rejected`);
+    assert.equal(
+      warnings[0],
+      `owenloop work sessions: skipping invalid record at ${file}:1: field "${field}" failed schema check`,
+    );
+  }
+});
+
+test('a valid record still reads back cleanly and silently', () => {
+  writeFileSync(file, `${JSON.stringify(rec({ token: 'ok-1' }))}\n`);
+  const { warnings, opts } = capture();
+
+  assert.deepEqual(readSessions(file, opts).map((r) => r.token), ['ok-1']);
+  assert.deepEqual(warnings, [], 'the refactor must not make valid records warn');
+});
+
 test('appendSession creates the parent directory and propagates a real write failure', () => {
   const nested = join(dir, 'deep', 'sessions.jsonl');
   appendSession(nested, rec({ token: 'nested' }));
