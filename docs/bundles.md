@@ -263,29 +263,43 @@ command inherits the directory the operator was standing in when they ran
 `owenloop shift start`. Nothing is enforced today: a future release will
 require a step to declare that inheritance explicitly.
 
-**Where the fallback is recorded, and where it is not.** When it fires,
-`owenloop work exec` writes one warning per spawn naming the step, the workflow
-and run ids, and the resolved absolute path. That warning goes to the exec
-worker's own stderr — and under `owenloop shift start` nothing reads that
-stream. `buildSpawnPlan` in `packages/work/src/shift/spawn.ts` launches every
-worker with `stdio: ['ignore', 'ignore', 'ignore']`, so a dispatched worker's
-fd 2 is `/dev/null` and the warning is discarded by the kernel. The receipt
-captures the *command's* streams, not the exec worker's, so it does not carry
-the warning either.
+**Where the fallback is recorded.** When it fires, `owenloop work exec` writes
+one warning per spawn naming the step, the workflow and run ids, and the
+resolved absolute path. That warning goes to the exec worker's own stderr.
 
-In practice:
+Where the exec worker's stderr goes depends on how the worker was started:
 
-| How the step ran | Does an operator see the warning? |
+| How the step ran | Where the warning lands |
 | --- | --- |
-| `owenloop work exec <workflow>/<run>` run directly | Yes — on stderr |
-| dispatched by `owenloop shift start` | **No** — the worker's stderr is discarded |
+| `owenloop work exec <workflow>/<run>` run directly | the operator's terminal, on stderr |
+| dispatched by `owenloop shift start` | `<log-dir>/<run>.log`, on disk |
 
-Under shift dispatch the launch directory is therefore still substituted
-silently. Do not read the absence of a warning during a shift as evidence that
-a step resolved a `workdir`; read the order's `workdir` field instead. Routing
-this record to a channel a shift operator actually reads is filed as a
-follow-up, and it is a prerequisite for the enforcement release — a migration
-notice nobody receives cannot serve as notice.
+Under shift dispatch, `createDefaultSpawner` in
+`packages/work/src/shift/spawn.ts` opens `<log-dir>/<run>.log` for append and
+hands that one file descriptor to the worker's stdio slots 1 and 2 — the same
+redirection a shell writes as `2>&1`. The file outlives both the worker and the
+shift. See [`docs/shift-logs.md`](shift-logs.md) for the directory layout,
+`--log-dir` resolution, and retention.
+
+The receipt still does not carry the warning, and that is by design rather than
+a gap: the receipt captures the **command's** streams, and this warning is the
+**exec worker's** own. One destination each, no duplication.
+
+Two consequences worth stating separately:
+
+- Do not read the absence of a warning **in a terminal** during a shift as
+  evidence that a step resolved a `workdir` — under shift dispatch the warning
+  was never going to appear in a terminal. Read `<log-dir>/<run>.log`, or read
+  the order's `workdir` field.
+- If the shift could not open a log (no writable log directory), the warning is
+  discarded exactly as it was before on-disk logging existed. The shift reports
+  that condition once on its own stderr and keeps dispatching.
+
+Delivering this warning to a channel an operator can actually read was the
+blocker on turning the fallback into a hard error. That half is now done. The
+enforcement release — making a command step that declares neither `workdir:`
+nor `workdirFrom:` fail instead of warn — remains a separate decision and has
+not been made.
 
 This section is about command steps only. An agent step resolves its working
 directory through a different ladder (`packages/work/src/agent/workdir.ts`):

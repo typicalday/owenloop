@@ -14,7 +14,10 @@ import {
   MAX_RESPONSE_LINE_BYTES,
   OVERLAP_ERROR,
   RESPONSE_TRUNCATION_MARKER,
+  stampShiftEvent,
   type GateEvent,
+  type ShiftEvent,
+  type ShiftEventBody,
 } from '../src/shift/protocol.ts';
 import { requestShift } from '../src/shift/client.ts';
 import { rawShiftRequest } from './helpers/shift-client.ts';
@@ -108,6 +111,19 @@ function fixture(options: {
   return value;
 }
 
+/**
+ * Stamp an event body with the `{ts, shift, shiftId}` envelope every `ShiftEvent`
+ * now carries.
+ *
+ * In production the loop's `emit()` stamps; here the loop is a fake, so the test
+ * stamps with the SAME identity the fixture gives the daemon (`now: () => 1234`,
+ * shift name `box`, id `shf_test`). Using the fixture's own values is what makes
+ * a stamped expectation comparable to what the daemon returns.
+ */
+function ev(body: ShiftEventBody): ShiftEvent {
+  return stampShiftEvent(body, { name: 'box', id: 'shf_test' }, 1234);
+}
+
 async function waitForPath(path: string): Promise<void> {
   const deadline = Date.now() + 2_000;
   while (!existsSync(path) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
@@ -192,14 +208,14 @@ test('status, atomic clock-in validation, attendance, typed gate event drain, an
   assert.equal('name' in clocked && clocked.name, 'shift-b');
   assert.deepEqual(f.state.serveCrews, ['beta']);
 
-  const failed = { type: 'failed' as const, workflow: 'wf1', run: 'r1', step: 's', kind: 'exec' as const, message: 'boom' };
-  const gate: GateEvent = {
+  const failed = ev({ type: 'failed', workflow: 'wf1', run: 'r1', step: 's', kind: 'exec', message: 'boom' });
+  const gate = ev({
     type: 'gate',
     workflow: 'wf_gate',
     run: 'run_gate',
     name: 'approval',
     question: 'Should the gate continue?',
-  };
+  } satisfies GateEvent);
   f.daemon.onEvent(failed);
   f.daemon.onEvent(gate);
   const attended = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
@@ -224,7 +240,7 @@ test('only one next parks, overlap preserves exact error, and end wakes the park
   const ending = requestShift(f.socketPath, { op: 'end' });
   const firstResponse = await first.response;
   assert.equal('events' in firstResponse, true);
-  if ('events' in firstResponse) assert.deepEqual(firstResponse.events, [{ type: 'ended' }]);
+  if ('events' in firstResponse) assert.deepEqual(firstResponse.events, [ev({ type: 'ended' })]);
   assert.deepEqual(await ending, { ok: true, ended: true });
   assert.equal(await f.run, 0);
   assert.equal(f.state.stopped, true);
@@ -234,7 +250,7 @@ test('event FIFO is bounded at 1000 entries and drops oldest entries with a warn
   const f = fixture();
   await waitForPath(f.socketPath);
   for (let i = 0; i < 1_005; i++) {
-    f.daemon.onEvent({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message: 'x' });
+    f.daemon.onEvent(ev({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message: 'x' }));
   }
   const response = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
   assert.equal('events' in response, true);
@@ -253,7 +269,7 @@ test('a legal 1,000-event response with 200-character steps fits the client ceil
   const run = `run_${'r'.repeat(32)}`;
   const step = 's'.repeat(200);
   for (let i = 0; i < 1_000; i++) {
-    f.daemon.onEvent({ type: 'dispatched', workflow, run: `${run}_${i}`, step, kind: 'agent-run', pid: 123456 });
+    f.daemon.onEvent(ev({ type: 'dispatched', workflow, run: `${run}_${i}`, step, kind: 'agent-run', pid: 123456 }));
   }
   const response = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
   assert.equal('events' in response, true);
@@ -269,7 +285,7 @@ test('size-aware event drain retains events that exceed one response and preserv
   await waitForPath(f.socketPath);
   const message = 'é'.repeat(150_000);
   for (let i = 0; i < 3; i++) {
-    f.daemon.onEvent({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message });
+    f.daemon.onEvent(ev({ type: 'failed', workflow: 'wf', run: `r${i}`, step: 's', kind: 'exec', message }));
   }
 
   const first = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
@@ -291,9 +307,9 @@ test('size-aware event drain retains events that exceed one response and preserv
 test('an oversized single event is delivered once with an explicit truncation marker', async () => {
   const f = fixture();
   await waitForPath(f.socketPath);
-  f.daemon.onEvent({
+  f.daemon.onEvent(ev({
     type: 'failed', workflow: 'wf', run: 'r0', step: 's', kind: 'exec', message: '💥'.repeat(200_000),
-  });
+  }));
 
   const response = await requestShift(f.socketPath, { op: 'next', wait_ms: 0 });
   assert.equal('events' in response, true);

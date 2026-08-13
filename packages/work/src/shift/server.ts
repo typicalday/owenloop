@@ -23,14 +23,16 @@ import {
   MAX_REQUEST_LINE_BYTES,
   MAX_RESPONSE_LINE_BYTES,
   OVERLAP_ERROR,
-  RESPONSE_TRUNCATION_MARKER,
+  stampShiftEvent,
   type ShiftCapacity,
   type ShiftError,
   type ShiftEvent,
+  type ShiftEventBody,
   type ShiftRequest,
   type ShiftResponse,
   type ShiftStatus,
 } from './protocol.ts';
+import { truncateEventToBytes } from './truncate.ts';
 
 export interface ShiftDaemonOptions {
   socketPath: string;
@@ -41,6 +43,19 @@ export interface ShiftDaemonOptions {
   startedAt: number;
   shiftId?: string;
   err: (line: string) => void;
+  /**
+   * Called with each already-stamped event this daemon SYNTHESIZES rather than
+   * receives through `onEvent` — today `event-queue-overflow` and `ended`.
+   *
+   * These two are the only shift events that never pass through `emit()` in
+   * `loop.ts`, so they are the only ones a second consumer would otherwise never
+   * see. In `runtime.ts` this callback is the on-disk log sink, which is what
+   * makes the file and the socket carry the same record set.
+   *
+   * The callback must write somewhere that is NOT this daemon's queue. For
+   * `event-queue-overflow` that is load-bearing: the queue is what overflowed.
+   */
+  onSynthesized?: (event: ShiftEvent) => void;
 }
 
 export interface ShiftDaemon {
@@ -77,44 +92,19 @@ function serializedResponseBytes(response: ShiftCapacity): number {
   return Buffer.byteLength(`${JSON.stringify(response)}\n`, 'utf8');
 }
 
-function truncateUtf8(value: string, maxBytes: number): string {
-  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
-  const markerBytes = Buffer.byteLength(RESPONSE_TRUNCATION_MARKER, 'utf8');
-  if (maxBytes <= markerBytes) return RESPONSE_TRUNCATION_MARKER;
-  let prefix = Buffer.from(value, 'utf8').subarray(0, maxBytes - markerBytes).toString('utf8');
-  while (Buffer.byteLength(prefix, 'utf8') > maxBytes - markerBytes) prefix = prefix.slice(0, -1);
-  return `${prefix}${RESPONSE_TRUNCATION_MARKER}`;
-}
-
 /**
  * A single event can be larger than the response ceiling. It is delivered once
  * with its string fields shortened and an explicit marker instead of blocking
  * every later event in the FIFO forever.
+ *
+ * The algorithm lives in `truncate.ts` and is SHARED with the on-disk log sink,
+ * so the file's line ceiling and the wire's are one rule with one
+ * implementation. Only the byte accounting differs, and that is what the
+ * callback supplies: here, a whole response envelope carrying this one event.
  */
 function truncateEventForResponse(event: ShiftEvent, envelope: Omit<ShiftCapacity, 'events'>): ShiftEvent {
-  const candidate = { ...event } as Record<string, unknown>;
-  const stringKeys = Object.keys(candidate).filter((key) => typeof candidate[key] === 'string' && key !== 'type');
-  const markerBytes = Buffer.byteLength(RESPONSE_TRUNCATION_MARKER, 'utf8');
-
-  while (serializedResponseBytes({ ...envelope, events: [candidate as unknown as ShiftEvent] }) > MAX_RESPONSE_LINE_BYTES) {
-    const key = stringKeys
-      .filter((name) => candidate[name] !== RESPONSE_TRUNCATION_MARKER)
-      .sort((left, right) => Buffer.byteLength(String(candidate[right]), 'utf8') - Buffer.byteLength(String(candidate[left]), 'utf8'))[0];
-    if (key === undefined) break;
-    const value = String(candidate[key]);
-    const currentBytes = Buffer.byteLength(value, 'utf8');
-    const targetBytes = Math.max(markerBytes, Math.floor(currentBytes / 2));
-    const shortened = truncateUtf8(value, targetBytes);
-    candidate[key] = shortened === value ? RESPONSE_TRUNCATION_MARKER : shortened;
-  }
-
-  // The current event union has a fixed envelope plus only string fields. The
-  // marker-only form is a final backstop if a future event shape needs more
-  // reduction than the progressive shortening above provided.
-  if (serializedResponseBytes({ ...envelope, events: [candidate as unknown as ShiftEvent] }) > MAX_RESPONSE_LINE_BYTES) {
-    for (const key of stringKeys) candidate[key] = RESPONSE_TRUNCATION_MARKER;
-  }
-  return candidate as unknown as ShiftEvent;
+  return truncateEventToBytes(event, MAX_RESPONSE_LINE_BYTES, (candidate) =>
+    serializedResponseBytes({ ...envelope, events: [candidate] }));
 }
 
 function fileIdentity(stat: Stats): FileIdentity {
@@ -326,6 +316,30 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
   const shutdownSockets = new Set<Socket>();
   const events: ShiftEvent[] = [];
 
+  /**
+   * How many events the FIFO has evicted since this daemon started, and the
+   * cumulative count at which the NEXT overflow record is written.
+   *
+   * Reporting every eviction is not an option: an unattended shift — no client
+   * ever calls `next`, so nothing ever drains the queue — evicts one event per
+   * event forever, and a per-eviction record would roughly double the volume of
+   * a file this change does not rotate.
+   *
+   * Reporting only the first eviction is not an option either: that record says
+   * `dropped: 1` and is never corrected, so the operator reading the file learns
+   * that loss STARTED and never learns its size.
+   *
+   * So: report at each power of ten (1, 10, 100, 1000, …). At most ~7 records
+   * for any run a real machine can produce, the first arrives immediately, and
+   * every record carries a current cumulative total.
+   */
+  let dropped = 0;
+  let nextOverflowReport = 1;
+
+  /** Attach the `{ts, shift, shiftId}` envelope this daemon is responsible for. */
+  const stamp = (body: ShiftEventBody): ShiftEvent =>
+    stampShiftEvent(body, { name: opts.loop.getShift().name, id: opts.shiftId ?? '' }, opts.now());
+
   const capacity = (): Omit<ShiftCapacity, 'events'> => {
     const cap = opts.loop.getCap();
     const free = opts.loop.freeCapacity();
@@ -380,6 +394,19 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     if (events.length >= MAX_EVENT_QUEUE) {
       events.shift();
       opts.err(`shift event queue overflow — dropping oldest event`);
+      dropped += 1;
+      if (dropped === nextOverflowReport) {
+        nextOverflowReport *= 10;
+        // DIRECT to the caller's sink — never enqueue(). enqueue() feeds the
+        // very queue that just overflowed, so an overflow event routed through
+        // it would evict another event, overflow again, and recurse under
+        // exactly the load that produced the overflow.
+        try {
+          opts.onSynthesized?.(stamp({ type: 'event-queue-overflow', dropped }));
+        } catch (e) {
+          opts.err(`shift event sink failed: ${e instanceof Error ? e.message : String(e)} (continuing)`);
+        }
+      }
     }
     events.push(event);
     if (parked !== undefined) sendParked(capacityResponse());
@@ -500,7 +527,23 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
     if (preserve !== undefined) shutdownSockets.add(preserve);
     if (reason === 'end') {
       if (parked !== undefined) shutdownSockets.add(parked.socket);
-      enqueue({ type: 'ended' });
+      // `ended` is synthesized here rather than received from the loop, so it is
+      // one of the two events `emit()` in loop.ts never stamps. Stamp it once
+      // and hand the SAME record to both consumers, so the socket and the file
+      // agree on its `ts` down to the millisecond.
+      //
+      // Note the narrow meaning, which `docs/shift-logs.md` states for readers
+      // of the file: `ended` is written only for `reason === 'end'` — an
+      // operator ran `owenloop shift end`. A signal or a loop failure ends the
+      // process without one, so a `shift.log` with no trailing `ended` record
+      // describes a shift that stopped some other way, or is still running.
+      const ended = stamp({ type: 'ended' });
+      enqueue(ended);
+      try {
+        opts.onSynthesized?.(ended);
+      } catch (e) {
+        opts.err(`shift event sink failed: ${e instanceof Error ? e.message : String(e)} (continuing)`);
+      }
     } else if (parked !== undefined) {
       // A signal or unexpected loop exit does not synthesize an `ended` event,
       // but it must not leave a client socket holding the process open forever.

@@ -7,6 +7,7 @@
  * behavior. The retired shift stdio-MCP mount is intentionally absent.
  */
 import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { basename, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -16,6 +17,14 @@ import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createShiftLoop, type ShiftLoop } from './loop.ts';
+import { createShiftLogSink } from './logsink.ts';
+import {
+  resolveShiftLogDir,
+  resolveShiftLogMaxAgeMs,
+  shiftLogFile,
+  sweepShiftLogs,
+} from './logretention.ts';
+import { stampShiftEvent, type ShiftEvent, type ShiftEventBody } from './protocol.ts';
 import { createDefaultSpawner, type WorkerFailure } from './spawn.ts';
 import { resolveStateDir, ensureStateDir, reconcileInFlight } from './state.ts';
 import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.ts';
@@ -36,6 +45,36 @@ const DEFAULT_CAP = 3;
 const DEFAULT_POLL_MS = 5_000;
 const DEFAULT_MAX_AGENTS = 4;
 const DEFAULT_PRESENCE_MS = 60_000;
+
+/**
+ * Record types written to the LOG FILE but never delivered over the socket.
+ *
+ * The split is not "important vs unimportant" — it is what each consumer is.
+ * A record about a UNIT OF WORK (`dispatched`, `reaped`, `failed`,
+ * `order-dropped`, `bundle-miss`, `hub-error`, `ended`, `gate`) tells a client
+ * something it cannot otherwise learn, so it goes to both sinks. A record about
+ * the SHIFT'S OWN CONDITION is different on each side:
+ *
+ * - On the SOCKET it is redundant or harmful. Every `ShiftCapacity` response
+ *   already carries live `cap`, `free`, and `running`, so `capacity` and
+ *   `parked` restate on the wire what the response states anyway — while
+ *   queueing either one instantly satisfies a parked `owenloop shift next`,
+ *   which must BLOCK until there is work to report. That is the bug this set
+ *   exists to prevent: a shift that is merely full or merely idle would wake
+ *   every attending terminal with news of nothing having happened.
+ * - In the FILE it is the only record of that condition. The file has no
+ *   response envelope, so without these records a reader cannot tell an idle
+ *   shift (no orders offered) from a saturated one (orders offered, no slots).
+ *
+ * `event-queue-overflow` never reaches `consumeEvent` at all — `server.ts`
+ * hands it straight to the log sink through `onSynthesized`, because the queue
+ * is what overflowed. It is listed here so the category is stated in one place.
+ */
+const FILE_ONLY_EVENTS: ReadonlySet<ShiftEventBody['type']> = new Set([
+  'parked',
+  'capacity',
+  'event-queue-overflow',
+]);
 
 export function resolveCap(flagCap: number | undefined, settingsCap: number | undefined): number {
   return flagCap ?? settingsCap ?? DEFAULT_CAP;
@@ -80,6 +119,10 @@ export interface ParsedArgs {
   maxAgents?: number;
   cacheDir?: string;
   stateDir?: string;
+  /** `--log-dir` — where `shift.log` and `<run>.log` are written. */
+  logDir?: string;
+  /** `--log-max-age` — worker-log retention in milliseconds. `0` reaps eagerly. */
+  logMaxAgeMs?: number;
   error?: string;
 }
 
@@ -117,6 +160,8 @@ export function parseArgs(args: string[]): ParsedArgs {
       case '--workflow':
       case '--poll-interval':
       case '--cache-dir':
+      case '--log-dir':
+      case '--log-max-age':
       case '--state-dir': {
         const r = takeValue(a, i);
         if ('error' in r) return { error: r.error };
@@ -131,7 +176,12 @@ export function parseArgs(args: string[]): ParsedArgs {
         } else if (name === '--workflow') parsed.workflow = r.value;
         else if (name === '--cache-dir') parsed.cacheDir = r.value;
         else if (name === '--state-dir') parsed.stateDir = r.value;
-        else if (name === '--cap') {
+        else if (name === '--log-dir') parsed.logDir = r.value;
+        else if (name === '--log-max-age') {
+          const n = intFlag(r.value, '--log-max-age');
+          if (typeof n !== 'number') return { error: n.error };
+          parsed.logMaxAgeMs = n;
+        } else if (name === '--cap') {
           const n = intFlag(r.value, '--cap');
           if (typeof n !== 'number') return { error: n.error };
           parsed.cap = n;
@@ -157,7 +207,8 @@ function usage(): void {
   process.stderr.write(
     'usage: owenloop work shift [--origin <url>] [--as <account>] [--name <n>] [--serve-crews a,b] [--cap <n>]\n' +
       '                      [--workflow <id>] [--poll-interval <ms>] [--once]\n' +
-      '                      [--max-agents <n>] [--cache-dir <p>] [--state-dir <p>]\n',
+      '                      [--max-agents <n>] [--cache-dir <p>] [--state-dir <p>]\n' +
+      '                      [--log-dir <p>] [--log-max-age <ms>]\n',
   );
 }
 
@@ -263,6 +314,58 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     }
   }
 
+  // ── ON-DISK LOGGING ──
+  //
+  // Resolved AFTER `ensureStateDir` because the log directory DEFAULTS to the
+  // state directory, and resolved BEFORE the spawner because every dispatch
+  // needs the destination.
+  //
+  // Every step below degrades to "no logging" rather than failing the shift. A
+  // shift whose only defect is that it cannot write a log must still dispatch
+  // work; refusing to start would turn an observability feature into an outage.
+  const logDir = resolveShiftLogDir(parsed.logDir, env, settings.shiftLogDir, stateDir);
+  const logMaxAgeMs = resolveShiftLogMaxAgeMs(parsed.logMaxAgeMs, env, settings.shiftLogMaxAgeMs);
+  let logDirReady = true;
+  try {
+    mkdirSync(logDir, { recursive: true });
+  } catch (err) {
+    logDirReady = false;
+    process.stderr.write(
+      `${roleLabel}: cannot create shift log directory ${logDir}: ${errMsg(err)} — ` +
+        'continuing with logging disabled\n',
+    );
+  }
+
+  if (logDirReady) {
+    // Retention runs once at startup, before any dispatch. `sweepShiftLogs`
+    // never throws by contract; the guard is belt-and-braces so that a future
+    // change to it can never become a startup failure.
+    try {
+      const reaped = sweepShiftLogs({
+        dir: logDir,
+        stateDir,
+        now: Date.now(),
+        maxAgeMs: logMaxAgeMs,
+        err: (line) => process.stderr.write(`${line}\n`),
+      });
+      if (reaped.length > 0) {
+        process.stderr.write(
+          `${roleLabel}: reaped ${String(reaped.length)} worker log(s) older than ` +
+            `${String(logMaxAgeMs)}ms from ${logDir}\n`,
+        );
+      }
+    } catch (err) {
+      process.stderr.write(`${roleLabel}: shift log sweep failed (continuing): ${errMsg(err)}\n`);
+    }
+  }
+
+  const logSink = logDirReady
+    ? createShiftLogSink({
+        path: shiftLogFile(logDir),
+        err: (line) => process.stderr.write(`${line}\n`),
+      })
+    : undefined;
+
   const cap = resolveCap(parsed.cap, settings.dispatchCap);
   const maxConcurrentAgents = resolveMaxConcurrentAgents(parsed.maxAgents, settings.maxConcurrentAgents);
   const workRoot = resolveWorkRoot(env, settings.workRoot, cacheDir);
@@ -308,8 +411,55 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
    * the holder can be `const`.
    */
   const loopRef: { current: ShiftLoop | undefined } = { current: undefined };
+
+  /**
+   * Attach the `{ts, shift, shiftId}` envelope. Reads the shift's name LIVE from
+   * the loop rather than closing over the startup `name`, because `clock_in` can
+   * rename a shift mid-run and a record must carry the name in force when it was
+   * produced. Before the loop exists there is nothing to dispatch and therefore
+   * nothing to stamp, so the fallback to `name` is unreachable in practice and
+   * still correct if it is ever reached.
+   */
+  const stamp = (body: ShiftEventBody): ShiftEvent =>
+    stampShiftEvent(body, { name: loopRef.current?.getShift().name ?? name, id: shiftId }, now());
+
+  /**
+   * THE ONE PLACE a shift event fans out to its consumers: the socket daemon
+   * (live, ephemeral, only in daemon mode) and the on-disk log (durable, always
+   * when a log directory resolved).
+   *
+   * Each consumer is wrapped SEPARATELY. A daemon whose FIFO throws must not
+   * cost the file its record, and a full disk must not cost a parked client its
+   * event. Neither failure may reach the loop, which is why nothing rethrows.
+   *
+   * The two consumers do NOT receive the same set: `FILE_ONLY_EVENTS` reaches
+   * the file only. Routing is decided HERE rather than at each emit site so an
+   * emitter never has to know how many sinks exist.
+   */
+  const consumeEvent = (event: ShiftEvent): void => {
+    if (daemonMode && !FILE_ONLY_EVENTS.has(event.type)) {
+      try {
+        daemon?.onEvent(event);
+      } catch (err) {
+        process.stderr.write(`${roleLabel}: shift event queue failed: ${errMsg(err)} (continuing)\n`);
+      }
+    }
+    // `createShiftLogSink.write` already swallows and reports its own failures;
+    // this guard covers a throw from anywhere else in the call.
+    try {
+      logSink?.write(event);
+    } catch (err) {
+      process.stderr.write(`${roleLabel}: shift event sink failed: ${errMsg(err)} (continuing)\n`);
+    }
+  };
+
   const reportWorkerFailure = (failure: WorkerFailure): void => {
-    const event = {
+    // A worker failure is detected by the SPAWNER's `exit`/`error` listener, not
+    // inside the loop's sweep, so it never passes through the loop's `emit()`.
+    // It is stamped here for the same reason `ended` is stamped in `server.ts`:
+    // every record on the wire and in the file carries the same envelope, with
+    // no exceptions a consumer would have to special-case.
+    const event = stamp({
       type: 'failed' as const,
       workflow: failure.workflow,
       run: failure.run,
@@ -320,15 +470,27 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       exitStatus: failure.exitStatus,
       signal: failure.signal,
       message: failure.message,
-    };
-    daemon?.onEvent(event);
+    });
+    consumeEvent(event);
     process.stderr.write(`${roleLabel}: worker failure ${JSON.stringify(event)}\n`);
     // The third consumer, and the one that changes behaviour: charge the
     // failure against the step's dispatch brake so a step that fails the same
     // way forever is re-dispatched on a backoff instead of once per poll.
     loopRef.current?.noteWorkerFailure(failure);
   };
-  const spawner = createDefaultSpawner(origin, account, undefined, shiftId, reportWorkerFailure);
+  const spawner = createDefaultSpawner(
+    origin,
+    account,
+    undefined,
+    shiftId,
+    reportWorkerFailure,
+    // `undefined` when the log directory could not be created, which is what
+    // makes `buildSpawnPlan` emit no `logFile` and the worker launch with its
+    // output discarded exactly as it did before this change.
+    logDirReady
+      ? { dir: logDir, err: (line: string) => process.stderr.write(`${line}\n`) }
+      : undefined,
+  );
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 
   const loop = createShiftLoop({
@@ -339,7 +501,10 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     monotonicNow,
     out: (line) => process.stdout.write(`${line}\n`),
     err: (line) => process.stderr.write(`${line}\n`),
-    ...(daemonMode ? { onEvent: (event) => daemon?.onEvent(event) } : {}),
+    // Previously daemon-mode only, because the socket daemon was the only
+    // consumer. The file sink is a second consumer that exists in BOTH modes, so
+    // the loop now emits whenever either consumer is present.
+    ...(daemonMode || logSink !== undefined ? { onEvent: consumeEvent } : {}),
     cacheDir,
     stateDir,
     cap,
@@ -361,6 +526,39 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   // immediately after construction, long before any child can exit.
   loopRef.current = loop;
 
+  /**
+   * The first record in a shift's log: what this process is, where it is, and
+   * what it will serve. `shift.log` is read on a machine, days later, by someone
+   * who has only the file — so the file must be SELF-DESCRIBING. Every later
+   * record identifies the shift by name and id alone; this one is what those
+   * names resolve to.
+   *
+   * Written by `runtime.ts` rather than the loop because the loop knows its cap
+   * and crews but not the origin it was pointed at, the host, or the launch
+   * directory. Suppressed under `--once`, matching the console `parked as …`
+   * line — a one-shot drain is not a parked shift.
+   *
+   * FILE-ONLY, via `FILE_ONLY_EVENTS` — this goes through `consumeEvent` like
+   * every other record, and `consumeEvent` withholds it from the socket. A
+   * startup record sitting in the daemon's FIFO would make the first `next`
+   * after every start return instantly with a record about the shift itself,
+   * breaking the contract that an idle `next` BLOCKS until there is work to
+   * report; `packages/work/test/shift-blocking-acceptance.test.ts` asserts that
+   * blocking behaviour directly.
+   */
+  const emitParked = (): void => {
+    consumeEvent(
+      stamp({
+        type: 'parked',
+        origin,
+        cap,
+        serveCrews: parsed.serveCrews ?? [],
+        hostname: hostname(),
+        cwd: process.cwd(),
+      }),
+    );
+  };
+
   if (daemonMode) {
     daemon = createShiftDaemon({
       socketPath: options.socketPath ?? join(stateDir, 'shift.sock'),
@@ -371,6 +569,12 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       startedAt,
       shiftId,
       err: (line) => process.stderr.write(`${line}\n`),
+      // The daemon's self-made records (`event-queue-overflow`, `ended`) go
+      // STRAIGHT to the file, never back through `consumeEvent` — `consumeEvent`
+      // feeds `daemon.onEvent`, and the daemon has already put each of these in
+      // its own queue. For `event-queue-overflow` that routing is load-bearing
+      // rather than merely tidy: its queue is the thing that just overflowed.
+      ...(logSink !== undefined ? { onSynthesized: (event: ShiftEvent) => logSink.write(event) } : {}),
     });
     installSignalHandlers(daemon, process, (line) => process.stderr.write(`${line}\n`), {
       role: 'shift',
@@ -379,6 +583,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     });
     if (parsed.once !== true) {
       process.stdout.write(`owenloop shift: parked as '${name}' @ ${origin} (cap ${cap})\n`);
+      emitParked();
     }
     return daemon.run();
   }
@@ -386,6 +591,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   installSignalHandlers(loop, process, (line) => process.stderr.write(`${line}\n`));
   if (parsed.once !== true) {
     process.stdout.write(`owenloop work shift: parked as '${name}' @ ${origin} (cap ${cap})\n`);
+    emitParked();
   }
   return loop.run();
 }

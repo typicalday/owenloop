@@ -270,6 +270,10 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
 
     const secondNext = runCli(['shift', 'next', '--wait', '90', '--state-dir', stateDir]);
     await new Promise((resolve) => setTimeout(resolve, 100));
+    // Also the guard on which records may reach the socket: a shift that is
+    // merely FULL has nothing to report to a parked client, and a `capacity`
+    // record queued here would satisfy this call instantly. That record is
+    // file-only for exactly this reason — see FILE_ONLY_EVENTS in runtime.ts.
     assert.equal(secondNext.child.exitCode, null, 'the second terminal next must park while no event is available');
 
     const presenceBeforeEnd = requests(reqs, 'presence_ping').length;
@@ -280,8 +284,18 @@ test('idle next blocks, dispatch wakes it, a second next parks, and a third term
 
     const secondResult = await secondNext.result;
     assert.equal(secondResult.code, 0, secondResult.stderr);
-    const secondResponse = jsonResult<{ events: Array<{ type: string }> }>(secondResult);
-    assert.deepEqual(secondResponse.events, [{ type: 'ended' }]);
+    // The envelope's `ts`, `shift`, and `shiftId` are produced by a REAL shift
+    // process here, so their values cannot be predicted — only their presence
+    // and shape. The `ended` event is checked field by field for that reason.
+    const secondResponse = jsonResult<{
+      events: Array<{ type: string; ts?: string; shift?: string; shiftId?: string }>;
+    }>(secondResult);
+    assert.equal(secondResponse.events.length, 1, JSON.stringify(secondResponse.events));
+    const ended = secondResponse.events[0]!;
+    assert.equal(ended.type, 'ended');
+    assert.equal(typeof ended.shift, 'string');
+    assert.match(ended.shiftId ?? '', /^shf_/u);
+    assert.equal(new Date(ended.ts ?? '').toISOString(), ended.ts);
 
     const exited = await shift.exited;
     assert.equal(exited, 0, shift.stderr());

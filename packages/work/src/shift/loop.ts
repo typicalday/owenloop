@@ -76,7 +76,12 @@ import {
 import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../agent/workdir.ts';
 import { sessionsPath } from '../harness/session-store.ts';
 import type { Spawner } from './spawn.ts';
-import type { ShiftEvent } from './protocol.ts';
+import {
+  stampShiftEvent,
+  type OrderDroppedEvent,
+  type ShiftEvent,
+  type ShiftEventBody,
+} from './protocol.ts';
 
 export interface ShiftLoopOptions {
   hub: HubClient;
@@ -347,6 +352,15 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   /** A changed wake whose sweep was skipped or failed must be retried after the
    * cursor is adopted; otherwise the next unchanged wake hides that work. */
   let sweepOwed = false;
+  /**
+   * Has the current at-capacity EPISODE already produced a `capacity` event?
+   *
+   * Set when the event fires, cleared the moment a slot is free again, so one
+   * unbroken stretch at capacity yields exactly one record no matter how many
+   * ticks it spans. See the emit site for why the console line next to it is
+   * deliberately NOT edge-triggered.
+   */
+  let atCapReported = false;
   /** Earliest server-approved time for the next polling iteration. */
   let backoffUntil = Number.NEGATIVE_INFINITY;
   /** Bumped whenever a ping starts or is forced due, so a ping that completes
@@ -360,10 +374,24 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     return true;
   }
 
-  function emit(event: ShiftEvent): void {
+  /**
+   * Fan one observation to every consumer, stamped.
+   *
+   * THE SINGLE ENVELOPE-STAMPING POINT for everything the loop observes. Call
+   * sites build a `ShiftEventBody` — payload only — and this function adds the
+   * timestamp and the shift identity, so no construction site can forget them
+   * and no consumer can receive a half-stamped record. `shiftName` is read live
+   * rather than captured, because `clock_in` can rename a shift mid-run and the
+   * record should say what the shift was called when it was written.
+   *
+   * A THROWING CONSUMER MUST NOT KILL THE SHIFT. The report goes to `opts.err`
+   * as free text and stays free text: it is the sink's own failure report, and
+   * turning it into an event would write it to the sink that just failed.
+   */
+  function emit(body: ShiftEventBody): void {
     if (opts.onEvent === undefined) return;
     try {
-      opts.onEvent(event);
+      opts.onEvent(stampShiftEvent(body, { name: shiftName, id: opts.shiftId ?? '' }, opts.now()));
     } catch (e) {
       opts.err(`shift event sink failed: ${errMsg(e)} (continuing)`);
     }
@@ -690,6 +718,27 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // Collect candidates, metering NEW dispatches and deduping in-flight.
     const claimed = new Set<string>();
     const candidates: Candidate[] = [];
+
+    /**
+     * Refuse one order and leave it for the hub pickup window.
+     *
+     * Every refusal below is a DROPPED UNIT OF WORK, not a debug aside: the
+     * shift declines an order the hub already handed it, and until now the only
+     * trace was a stderr line a dispatched shift discards. One helper, so the
+     * console text and the record cannot drift apart, and so a future refusal
+     * cannot be added as text-only by accident. `reason` is the stable machine
+     * discriminator; `message` is the same human text as before, unchanged.
+     */
+    const dropOrder = (
+      workflow: string,
+      order: WorkOrder,
+      reason: OrderDroppedEvent['reason'],
+      message: string,
+    ): void => {
+      opts.err(`[${workflow}/${order.run}] ${message}`);
+      emit({ type: 'order-dropped', workflow, run: order.run, step: order.step, reason, message });
+      claimed.add(order.run);
+    };
     for (const wf of instances) {
       let res;
       const requestStartedAt = monotonicNow();
@@ -708,6 +757,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	const rateLimited = noteServerBackoff(e);
 	complete = false;
         opts.err(`whats_next for ${wf} failed: ${errMsg(e)}`);
+	emit({ type: 'hub-error', op: 'whats_next', workflow: wf, message: errMsg(e) });
 	if (rateLimited) break;
         continue;
       }
@@ -728,6 +778,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
         opts.err(`[${wf}] ${dispatch.warning}`);
       } else if (legacyOrders.length > 0 && bundle === null && defName !== undefined) {
 	opts.err(`no cached bundle for def '${defName}' — run \`owenloop work prepare ${defName}\` (legacy orders left for pickup)`);
+	emit({ type: 'bundle-miss', workflow: wf, def: defName });
       }
       for (const order of orders) {
         if (claimed.has(order.run)) continue; // seen this sweep
@@ -749,10 +800,12 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	  candidateDefHash = bundle.def.hash;
 	} else {
 	  if (typeof order.defDigest !== 'string' || order.defDigest.trim() === '') {
-	    opts.err(
-	      `[${wf}/${order.run}] malformed modern work order: non-empty defDigest is required whenever modern routing metadata is present — leaving for manual pickup`,
+	    dropOrder(
+	      wf,
+	      order,
+	      'malformed-digest',
+	      'malformed modern work order: non-empty defDigest is required whenever modern routing metadata is present — leaving for manual pickup',
 	    );
-	    claimed.add(order.run);
 	    continue;
 	  }
 
@@ -766,30 +819,38 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	    try {
 	      step = await opts.resolveOrderStep?.(order);
 	    } catch (error) {
-	      opts.err(
-		`[${wf}/${order.run}] exact command instructions for digest '${order.defDigest}' failed verification: ${errMsg(error)} — leaving for manual pickup`,
+	      dropOrder(
+		wf,
+		order,
+		'verification-failed',
+		`exact command instructions for digest '${order.defDigest}' failed verification: ${errMsg(error)} — leaving for manual pickup`,
 	      );
-	      claimed.add(order.run);
 	      continue;
 	    }
 	    if (step === undefined) {
-	      opts.err(
-		`[${wf}/${order.run}] exact command routing metadata for digest '${order.defDigest}' is unavailable — leaving for manual pickup`,
+	      dropOrder(
+		wf,
+		order,
+		'metadata-unavailable',
+		`exact command routing metadata for digest '${order.defDigest}' is unavailable — leaving for manual pickup`,
 	      );
-	      claimed.add(order.run);
 	      continue;
 	    }
 	  } else if (typeof order.worker !== 'string' || order.worker.trim() === '') {
-	    opts.err(
-	      `[${wf}/${order.run}] malformed modern work order: worker must be absent, 'agent', or 'command' — leaving for manual pickup`,
+	    dropOrder(
+	      wf,
+	      order,
+	      'malformed-worker',
+	      "malformed modern work order: worker must be absent, 'agent', or 'command' — leaving for manual pickup",
 	    );
-	    claimed.add(order.run);
 	    continue;
 	  } else {
-	    opts.err(
-	      `[${wf}/${order.run}] unsupported worker '${order.worker}' — leaving for manual pickup`,
+	    dropOrder(
+	      wf,
+	      order,
+	      'unsupported-worker',
+	      `unsupported worker '${order.worker}' — leaving for manual pickup`,
 	    );
-	    claimed.add(order.run);
 	    continue;
 	  }
 	}
@@ -980,6 +1041,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     const reserved = inFlight.reserved;
     const occupied = live.length + reserved.length;
     const k = cap - occupied;
+    // Re-arm the at-capacity report the instant a slot frees, independently of
+    // whether this tick goes on to wake or sweep. The next stretch at capacity
+    // is a NEW episode and gets its own record.
+    if (k > 0) atCapReported = false;
 
     // Retry-After suppresses every remaining hub call in the iteration that
     // received it, and every hub call in later iterations before the deadline.
@@ -1004,6 +1069,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     } catch (e) {
       noteServerBackoff(e);
       opts.err(`wake failed: ${errMsg(e)} (retrying next tick)`);
+      emit({ type: 'hub-error', op: 'wake', message: errMsg(e) });
     }
 
     // A changed cursor is not sufficient by itself: if the prior changed tick
@@ -1016,6 +1082,26 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     } else if (changed && k <= 0) {
       sweepOwed = true;
       opts.out(`at capacity (${occupied}/${cap} in flight) — deferring whats_next until capacity is free`);
+      // EDGE-TRIGGERED: one record per at-capacity EPISODE, not per tick.
+      //
+      // This branch runs on every changed wake for as long as the shift stays
+      // full, which on a busy hub is every poll interval. The console line above
+      // is a live tail an operator is watching, and repeating it is how it says
+      // "still stuck" — so it stays level-triggered and unchanged. The event has
+      // one durable consumer that repetition actively harms: `shift.log`, which
+      // this change does not rotate. Entering the state is the fact worth
+      // recording; staying in it is recoverable from the next record's `ts`.
+      //
+      // The record's ROUTING is decided elsewhere, and the two are separate
+      // concerns. `runtime.ts` withholds `capacity` from the socket entirely
+      // (`FILE_ONLY_EVENTS`) because a parked `shift next` must not be woken by
+      // news that nothing happened. Edge-triggering keeps the FILE readable;
+      // that set is what keeps the SOCKET correct. Neither substitutes for the
+      // other — the loop emits, `consumeEvent` decides who hears it.
+      if (!atCapReported) {
+        atCapReported = true;
+        emit({ type: 'capacity', inFlight: occupied, cap });
+      }
     }
 
     const liveAfter = reconcile().live;

@@ -70,7 +70,158 @@ export interface EndedEvent {
   type: 'ended';
 }
 
-export type ShiftEvent = DispatchedEvent | ReapedEvent | FailedEvent | GateEvent | EndedEvent;
+/**
+ * The shift announced its identity and started serving. The FIRST record a
+ * shift writes, so a reader can place every later record on the same machine
+ * without external context. `shift` and `shiftId` are not repeated here: they
+ * are on the envelope of this and every other record.
+ *
+ * FILE-ONLY. Written to `shift.log` and never delivered over the socket. An
+ * idle `owenloop shift next` must BLOCK until there is work to report, and a
+ * startup record sitting in the FIFO would satisfy the first `next` after every
+ * start. A socket client needs none of this — it knows which shift it reached
+ * because it connected to that shift's socket, and `op: 'status'` answers name,
+ * crews, and cap on demand.
+ */
+export interface ParkedEvent {
+  type: 'parked';
+  origin: string;
+  cap: number;
+  serveCrews: string[];
+  hostname: string;
+  cwd: string;
+}
+
+/**
+ * No local capacity, so `whats_next` was deferred. Explains a shift that is
+ * running nothing new while work remains outstanding.
+ *
+ * EDGE-TRIGGERED: one record per unbroken stretch at capacity, emitted when the
+ * shift ENTERS that state, not once per tick while it stays there. How long the
+ * stretch lasted is recoverable from the next record's `ts`.
+ *
+ * FILE-ONLY, for the same reason as `ParkedEvent`. On the socket it is both
+ * redundant and harmful: every `ShiftCapacity` response already carries live
+ * `cap`, `free`, and `running`, so this record restates on the wire what the
+ * response states anyway — and queueing it satisfies a parked `next` with news
+ * that nothing happened. In the file, which has no response envelope, it is the
+ * only thing distinguishing a saturated shift from an idle one.
+ */
+export interface CapacityEvent {
+  type: 'capacity';
+  inFlight: number;
+  cap: number;
+}
+
+/** A hub call failed. `workflow` is present only for per-workflow calls. */
+export interface HubErrorEvent {
+  type: 'hub-error';
+  op: 'wake' | 'whats_next';
+  workflow?: string;
+  message: string;
+}
+
+/** A legacy order named a def with no cached bundle, so it was left for pickup. */
+export interface BundleMissEvent {
+  type: 'bundle-miss';
+  workflow: string;
+  def: string;
+}
+
+/**
+ * The shift refused one order and left it for the hub pickup window. A dropped
+ * unit of work, which is why it is a record and not a debug aside. `reason` is
+ * the stable machine discriminator; `message` is the human text.
+ */
+export interface OrderDroppedEvent {
+  type: 'order-dropped';
+  workflow: string;
+  run: string;
+  step: string;
+  reason:
+    | 'malformed-digest'
+    | 'malformed-worker'
+    | 'unsupported-worker'
+    | 'verification-failed'
+    | 'metadata-unavailable';
+  message: string;
+}
+
+/**
+ * The socket event FIFO overflowed and discarded its oldest event. Written
+ * STRAIGHT to the file sink, never through the loop's `emit()` — `emit()` feeds
+ * the very queue that overflowed, so routing this through it would recurse
+ * under exactly the load that produced it. `dropped` is cumulative for the
+ * shift process, so each record states the running total lost so far.
+ */
+export interface EventQueueOverflowEvent {
+  type: 'event-queue-overflow';
+  dropped: number;
+}
+
+/**
+ * What a construction site builds: the event's own payload, with no identity
+ * and no timestamp. Every consumer receives the stamped `ShiftEvent` instead.
+ */
+export type ShiftEventBody =
+  | DispatchedEvent
+  | ReapedEvent
+  | FailedEvent
+  | GateEvent
+  | EndedEvent
+  | ParkedEvent
+  | CapacityEvent
+  | HubErrorEvent
+  | BundleMissEvent
+  | OrderDroppedEvent
+  | EventQueueOverflowEvent;
+
+/**
+ * The identity every event carries, added once on a shared envelope rather than
+ * per variant.
+ *
+ * This is what makes one record SELF-DESCRIBING: a consumer holding a single
+ * line from an unknown machine can place it in time (`ts`) and attribute it to
+ * one shift process (`shiftId`) with no external context. That property is what
+ * lets the on-disk log, the socket, and a future uploader be three consumers of
+ * ONE contract instead of three shapes.
+ */
+export interface ShiftEventEnvelope {
+  /** ISO-8601 UTC with milliseconds, e.g. `2026-08-13T18:04:11.412Z`. */
+  ts: string;
+  /** The shift's human name — live-mutable via `clock_in`, so it can change between records. */
+  shift: string;
+  /** The shift process incarnation's id (`shf_<uuid>`); `''` when undeclared. Stable for the process. */
+  shiftId: string;
+}
+
+/** A body plus its envelope: what every consumer actually receives. */
+export type ShiftEvent = ShiftEventBody & ShiftEventEnvelope;
+
+/** Who emitted an event. `id` is `''` when the emitter declared no shift id. */
+export interface ShiftIdentity {
+  name: string;
+  id: string;
+}
+
+/**
+ * Stamp a body with its envelope. The ONE place the envelope is constructed —
+ * every emitter (the loop's `emit()`, the daemon's `ended`, the runtime's worker
+ * failures and startup record) routes through here so no consumer can receive a
+ * half-stamped record.
+ */
+export function stampShiftEvent(
+  body: ShiftEventBody,
+  identity: ShiftIdentity,
+  now: number,
+): ShiftEvent {
+  return {
+    ...body,
+    ts: new Date(now).toISOString(),
+    shift: identity.name,
+    shiftId: identity.id,
+  };
+}
 
 export interface ShiftCapacity {
   cap: number;

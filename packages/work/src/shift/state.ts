@@ -76,7 +76,16 @@ export function resolveStateDir(env: Record<string, string | undefined>, overrid
   throw new Error('cannot locate a state directory: set OWENLOOP_STATE_DIR, XDG_STATE_HOME, or HOME');
 }
 
-function safeRun(run: string): string {
+/**
+ * The run id as it appears in a filename, with every character a path could
+ * misread replaced.
+ *
+ * EXPORTED because the worker log `<run>.log` correlates to the in-flight
+ * record `<run>.json` BY BASENAME. Two sanitizers would be two basenames, and
+ * the correlation an operator and a future uploader both rely on would silently
+ * stop holding for any run id containing an unusual character.
+ */
+export function safeRun(run: string): string {
   return run.replace(/[^A-Za-z0-9_.-]/g, '_');
 }
 

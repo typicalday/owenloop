@@ -28,6 +28,10 @@ import { validateTierProfiles, type TierProfiles } from '../agent/model-policy.t
  *     (below `OWENLOOP_STATE_DIR`).
  *   - `dispatchCap`    — shift max in-flight exec children; below `--cap`,
  *     above the built-in default of 3. A positive integer.
+ *   - `shiftLogDir`    — where `shift.log` and `<run>.log` are written; below
+ *     `--log-dir` and `OWENLOOP_SHIFT_LOG_DIR`, above the state dir.
+ *   - `shiftLogMaxAgeMs` — worker-log retention in ms; below `--log-max-age`
+ *     and `OWENLOOP_SHIFT_LOG_MAX_AGE_MS`, above the 14-day default.
  *   - `commandRouting` — who runs `executor: 'command'` steps this machine sees.
  *   - `defPolicy`      — local publication trust policy (`warn` by default).
  */
@@ -40,6 +44,24 @@ export interface Settings {
   stateDir?: string;
   /** Shift dispatch cap (positive integer); fallback below `--cap`, default 3. */
   dispatchCap?: number;
+  /**
+   * Directory holding the shift's own `shift.log` and each worker's `<run>.log`.
+   * Fallback below `--log-dir` and `OWENLOOP_SHIFT_LOG_DIR`; defaults to the
+   * resolved `stateDir`, which puts `<run>.log` beside its `<run>.json`.
+   */
+  shiftLogDir?: string;
+  /**
+   * How long a worker's `<run>.log` is kept, in milliseconds. Fallback below
+   * `--log-max-age` and `OWENLOOP_SHIFT_LOG_MAX_AGE_MS`; defaults to 14 days.
+   *
+   * A NON-NEGATIVE integer, unlike `dispatchCap`, which must be positive: `0`
+   * is meaningful here and means "reap every worker log whose run has
+   * completed, at the next shift startup".
+   *
+   * Applies ONLY to per-worker `<run>.log` files. `shift.log` is never reaped
+   * and never rotated — see `docs/shift-logs.md`.
+   */
+  shiftLogMaxAgeMs?: number;
   /**
    * Who runs `executor: 'command'` steps this machine sees: `'shift'` (default)
    * lets the shift auto-dispatch them; `'manual'` leaves them for a human/
@@ -116,6 +138,8 @@ export const KNOWN_SETTINGS_KEYS = [
   'cacheDir',
   'stateDir',
   'dispatchCap',
+  'shiftLogDir',
+  'shiftLogMaxAgeMs',
   'commandRouting',
   'defPolicy',
   'artifactPolicy',
@@ -180,8 +204,16 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
       `invalid settings file at ${path}: '${key}' must be ${expected}, got ${JSON.stringify(value)}`,
     );
 
-  for (const key of ['hubOrigin', 'cacheDir', 'stateDir', 'workRoot', 'workRepo'] as const) {
+  for (const key of ['hubOrigin', 'cacheDir', 'stateDir', 'shiftLogDir', 'workRoot', 'workRepo'] as const) {
     if (key in obj && typeof obj[key] !== 'string') throw bad(key, 'a string', obj[key]);
+  }
+  if ('shiftLogMaxAgeMs' in obj) {
+    // NON-NEGATIVE, not positive: 0 means "reap every completed run's log at the
+    // next startup", which is a legitimate setting on a disk-constrained host.
+    const v = obj['shiftLogMaxAgeMs'];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+      throw bad('shiftLogMaxAgeMs', 'a non-negative integer', v);
+    }
   }
   if ('dispatchCap' in obj) {
     const v = obj['dispatchCap'];
