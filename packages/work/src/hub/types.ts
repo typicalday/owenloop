@@ -36,7 +36,13 @@ export interface WorkOrder {
   consumedFingerprint?: Record<string, number>;
   owes?: Array<{
     path: string;
-    /** Claim-time committed version when a version-aware hub projects it. */
+    /**
+     * The TARGET version for this owed output when a version-aware hub
+     * projects it: the version the next successful producer commit lands
+     * (claim-time committed version + 1), NOT the currently-committed one.
+     * It is what a producer signs in its submission proof and what a
+     * downstream consumer checks that proof against.
+     */
     version?: number;
     judgmentRejects: number;
     schemaRejects: number;

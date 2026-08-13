@@ -224,6 +224,54 @@ const DEFAULT_MAX_AGENTS = 4;
  */
 export const MAX_PENDING_CANDIDATE_AGE_MS = 90_000;
 
+/**
+ * THE PER-STEP DISPATCH BRAKE.
+ *
+ * Every in-flight guard in this file keys on the RUN id — `liveRuns`,
+ * `workerRuns`, `claimed`, `pendingCandidates`. That is correct for the case
+ * they were written for: one claim, one child. It is blind to the case where a
+ * step fails the same way forever.
+ *
+ * Observed 2026-08-12: `local-check` of one instance was dispatched five-plus
+ * times in seconds under a DIFFERENT run id each time
+ * (run_fd94d88a…, run_5ec4d807…, run_d8cdf03f…, run_67c8e2db…, run_072755ba…).
+ * The child refused its consumed artifact, exited non-zero WITHOUT submitting,
+ * the hub released the claim, and the next poll handed the same step back under
+ * a fresh run id. A fresh run id matches none of the run-keyed guards, so
+ * nothing bounded the respawns.
+ *
+ * So the brake is keyed on the identity that actually repeats — the STEP, as
+ * `(workflow, step, key)` — and it is a rate limit, never a ban: a step that is
+ * genuinely making progress is dispatched immediately the first time and is
+ * only slowed once it is re-offered again and again. `key` is part of the
+ * identity because a fanned-out step has one legitimately concurrent order per
+ * key, and those must not brake each other.
+ */
+const STEP_BRAKE_DELAYS_MS = [0, 2_000, 8_000, 30_000, 120_000, 300_000] as const;
+/**
+ * Forget a step's brake entry once this long has passed since its window
+ * closed. Without this the map grows for the life of the shift, and a step that
+ * stormed hours ago would still be throttled when it is re-offered for an
+ * unrelated, healthy reason.
+ */
+const STEP_BRAKE_FORGET_MS = 1_800_000;
+
+/**
+ * How long to refuse the NEXT dispatch after `count` dispatches of one step.
+ * The first dispatch is always immediate (`count` 1 → 0 ms); past the end of
+ * the table the last entry repeats, so a permanently-failing step settles at
+ * one dispatch per five minutes instead of one per poll.
+ */
+function stepBrakeDelayMs(count: number): number {
+  const index = Math.min(count, STEP_BRAKE_DELAYS_MS.length) - 1;
+  return STEP_BRAKE_DELAYS_MS[index] ?? 0;
+}
+
+/** The identity a storm repeats on. `key` is '' for an unfanned step. */
+function stepBrakeKey(workflow: string, step: string, key: string | undefined): string {
+  return `${workflow}\u0000${step}\u0000${key ?? ''}`;
+}
+
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -308,11 +356,20 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     return result;
   }
 
+  /**
+   * Per-step dispatch history for the brake. Keyed by `(workflow, step, key)`
+   * — see `stepBrakeKey`. `count` is how many times this shift has spawned a
+   * child for that step; `nextAllowedAt` is the monotonic instant the next
+   * spawn becomes permitted.
+   */
+  const stepBrake = new Map<string, { count: number; nextAllowedAt: number }>();
+
   type DispatchResult =
     | 'dispatched'
     | 'duplicate'
     | 'total-capacity'
     | 'agent-capacity'
+    | 'braked'
     | 'failed';
 
   /**
@@ -355,6 +412,25 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 
   function dispatchCandidate(c: Candidate): DispatchResult {
     const childKind = c.kind === 'command' ? 'exec' : 'agent-run';
+    // THE BRAKE. This function is the single choke point every spawn passes
+    // through — both the sweep's dispatch loop and `drainPending` reach a child
+    // only through here — so gating it here cannot be bypassed by either path.
+    // Braking BEFORE `reserveCandidate` means no reservation, no state-dir
+    // write and no lock contention for an order this shift will not run. The
+    // claim already taken by `whats_next` is deliberately left to lapse: the
+    // hub reaps a never-contacted claim after 120s, which throttles the
+    // re-offer rate on the hub side too.
+    const brakeKey = stepBrakeKey(c.workflow, c.order.step, c.order.key);
+    const brake = stepBrake.get(brakeKey);
+    if (brake !== undefined && monotonicNow() < brake.nextAllowedAt) {
+      const waitMs = Math.round(brake.nextAllowedAt - monotonicNow());
+      opts.err(
+	`[${c.workflow}/${c.order.run}] step '${c.order.step}' has been dispatched ` +
+	`${brake.count} times without progressing — braking for ${waitMs}ms and ` +
+	`leaving this claim to lapse`,
+      );
+      return 'braked';
+    }
     let reservation: ChildReservation | undefined;
     let cancel: (() => void) | undefined;
     try {
@@ -378,6 +454,17 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	...(childKind === 'agent-run' ? { step: c.order.step } : {}),
       });
       startReservedChild(opts.stateDir, rec);
+      // Count the spawn and arm the next window. Counted on SPAWN, not on
+      // failure: the shift does not learn a child's exit reason here, and a
+      // step that is re-offered over and over is the storm whether each child
+      // refused, crashed, or was killed. A step that progresses is simply never
+      // re-offered, so its count never grows past the free first dispatch.
+      const priorCount = stepBrake.get(brakeKey)?.count ?? 0;
+      const count = priorCount + 1;
+      stepBrake.set(brakeKey, {
+	count,
+	nextAllowedAt: monotonicNow() + stepBrakeDelayMs(count),
+      });
       emit({
 	type: 'dispatched',
 	workflow: c.workflow,
@@ -482,6 +569,14 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     reserved: ChildReservation[],
   ): Promise<SweepResult> {
     let dispatched = 0;
+    // Forget step-brake entries nobody has touched for STEP_BRAKE_FORGET_MS. A
+    // step that genuinely progressed stops being re-offered, so its entry goes
+    // quiet and must not throttle that step the next time it legitimately runs.
+    // Pruned here (once per sweep) rather than on write, so the map cannot grow
+    // without bound across a long-lived shift.
+    for (const [key, entry] of stepBrake) {
+      if (monotonicNow() - entry.nextAllowedAt > STEP_BRAKE_FORGET_MS) stepBrake.delete(key);
+    }
     /**
      * PHASE 4, for the work-dir reaper only. `polled` is the set of workflows
      * whose `whats_next` SUCCEEDED this sweep — a workflow whose call threw is
@@ -709,6 +804,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       }
     }
 
+    // 'braked' and 'failed' are deliberately NOT queued into pendingCandidates:
+    // both mean this shift is not going to run that order now, and re-queuing a
+    // braked candidate would just re-dispatch it on the next drain, defeating
+    // the brake. The claim lapses through the hub's pickup window instead.
     for (const candidate of candidates) {
       if (discardExpiredCandidate(candidate, false)) continue;
       const result = dispatchCandidate(candidate);

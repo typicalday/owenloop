@@ -2054,3 +2054,104 @@ test('the shift hands the reaper the session store at sessionsPath(cacheDir)', a
   assert.equal(captured.sessionsFile, sessionsPath(cacheDir));
   assert.equal(captured.workRoot, workRoot);
 });
+
+// ---- the per-step dispatch brake --------------------------------------------
+//
+// Regression cover for the storm observed 2026-08-12: a step that refuses its
+// order and exits WITHOUT submitting is re-offered by the hub under a FRESH run
+// id every time, so every run-keyed guard in this file (liveRuns, workerRuns,
+// claimed, pendingCandidates) misses and the shift respawns without bound. The
+// brake keys on (workflow, step, key) instead — the identity that repeats.
+
+/** Drive N sweeps of the same step, each under a brand-new run id. */
+function stormLoop(runs: string[], monotonic: () => number, step = 'cmd'): {
+  loop: ShiftLoop;
+  spawns: SpawnSpec[];
+  errs: string[];
+  next: () => void;
+} {
+  cacheCommandBundle();
+  let i = 0;
+  const orders = [wo(runs[0]!, step)];
+  const { hub } = mockHub({ perWf: cmdWf(orders) });
+  const { spawner, spawns } = fakeSpawner();
+  const errs: string[] = [];
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    monotonicNow: monotonic,
+    // Children never survive the next reconcile, so local capacity is always
+    // free — the brake, not capacity, is what this exercises.
+    isAlive: () => false,
+    err: (line) => errs.push(line),
+  }));
+  const next = (): void => {
+    i += 1;
+    orders[0] = wo(runs[i]!, step);
+  };
+  return { loop, spawns, errs, next };
+}
+
+test('a step re-offered under fresh run ids is braked instead of respawned forever', async () => {
+  let monotonic = 0;
+  const runs = ['run_storm01', 'run_storm02', 'run_storm03', 'run_storm04'];
+  const { loop, spawns, errs, next } = stormLoop(runs, () => monotonic);
+
+  // Dispatch 1 and 2 are immediate (the table opens 0ms, 2000ms): a step that
+  // is genuinely progressing must never pay a penalty on its first attempt.
+  await loop.iterate();
+  next();
+  await loop.iterate();
+  assert.deepEqual(spawns.map((s) => s.run), ['run_storm01', 'run_storm02']);
+
+  // Dispatch 2 armed a 2s window, so the third offer is refused outright.
+  next();
+  await loop.iterate();
+  assert.deepEqual(spawns.map((s) => s.run), ['run_storm01', 'run_storm02']);
+  assert.ok(
+    errs.some((line) => line.includes("step 'cmd' has been dispatched") && line.includes('braking')),
+    `a braked dispatch must say so; got ${JSON.stringify(errs)}`,
+  );
+
+  // ...and it is a rate limit, not a ban: past the window the step runs again.
+  monotonic = 2_000;
+  next();
+  await loop.iterate();
+  assert.deepEqual(spawns.map((s) => s.run), ['run_storm01', 'run_storm02', 'run_storm04']);
+});
+
+test('a braked candidate is not queued for local dispatch', async () => {
+  let monotonic = 0;
+  const runs = ['run_q01', 'run_q02', 'run_q03'];
+  const { loop, spawns, next } = stormLoop(runs, () => monotonic);
+
+  await loop.iterate();
+  next();
+  await loop.iterate();
+  next();
+  await loop.iterate(); // braked
+
+  // A braked candidate that had been queued would be re-dispatched by the very
+  // next drain, with no window elapsed — which would defeat the brake entirely.
+  await loop.iterate();
+  assert.deepEqual(spawns.map((s) => s.run), ['run_q01', 'run_q02']);
+});
+
+test('fanned-out keys of one step do not brake each other', async () => {
+  cacheCommandBundle();
+  const keyed = (run: string, key: string): WorkOrder => ({ ...wo(run, 'cmd'), key });
+  const orders = [keyed('run_k1', 'alpha'), keyed('run_k2', 'beta'), keyed('run_k3', 'gamma')];
+  const { hub } = mockHub({ perWf: cmdWf(orders) });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 10,
+    monotonicNow: () => 0,
+    isAlive: () => false,
+  }));
+
+  await loop.iterate();
+
+  // Three legitimately concurrent orders of one fanned step. Keying the brake
+  // on the step alone would have braked two of them on their FIRST dispatch.
+  assert.deepEqual(spawns.map((s) => s.run), ['run_k1', 'run_k2', 'run_k3']);
+});
