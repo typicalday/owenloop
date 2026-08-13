@@ -18,9 +18,10 @@
  *
  * FAILURE STANCE, three different answers on purpose:
  *  - READ is fail-open: a missing file reads as `[]` (mirrors `readChildRecords`
- *    in `src/shift/state.ts`), and a corrupt line is skipped and reported
- *    through the injectable `warn` callback, never thrown. A store that cannot
- *    be parsed must degrade a resume into a replay, not break the worker.
+ *    in `src/shift/state.ts`), and an unusable line — corrupt bytes that will
+ *    not parse, or a parsed object that fails the schema — is skipped and
+ *    reported through the injectable `warn` callback, never thrown. A store that
+ *    cannot be parsed must degrade a resume into a replay, not break the worker.
  *  - APPEND PROPAGATES. Unlike the shift's advisory metering records, a lost
  *    session token silently degrades a Phase 4 resume into a cold replay — real
  *    work thrown away — so the caller must see the failure.
