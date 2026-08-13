@@ -377,13 +377,20 @@ function submissionFingerprint(order: Order, deps: McpDeps): NonNullable<Order['
 
 /**
  * Resolve a signed submit version from authoritative immutable metadata only.
- * Judge claims name the already-submitted version in their fingerprint. Producer
- * claims do not name a retry-safe target: `owes[].version` is claim-time state and
- * can be stale after a refinement, lost response, unsigned commit, or restart.
+ * Judge claims name the already-submitted version in their fingerprint; the
+ * judge-approve commit does not increment it. Producer claims name
+ * `owes[].version`, the target the engine issued for this owed output inside
+ * the claim transaction — the version the next successful commit lands, and
+ * the version the consumer checks the proof against. See
+ * `outputVersionForSubmission` in packages/work/src/submit-proof.ts for the
+ * retry-safety argument; this is the same rule on the local MCP path.
  */
 function outputVersion(order: Order, path: string): number | undefined {
   if (order.judge === path) return order.consumedFingerprint?.[path];
-  return undefined;
+  const target = order.owes.find((owed) => owed.path === path)?.version;
+  // Only a positive integer is a target this protocol issued; see
+  // outputVersionForSubmission for why 0 submits unsigned instead.
+  return typeof target === 'number' && Number.isInteger(target) && target > 0 ? target : undefined;
 }
 
 function warnMcpUnsigned(deps: McpDeps, reason: string): void {

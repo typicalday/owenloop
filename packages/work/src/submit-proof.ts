@@ -100,12 +100,37 @@ function submissionFingerprint(
 
 /**
  * Resolve the version named by the next submission from authoritative lifecycle
- * metadata only. A judge approval attests the already-submitted version captured
- * in the claim fingerprint and does not increment it. A producer submit requires
- * an explicit target version issued by a retry-safe hub protocol: `owes[].version`
- * is immutable claim-time state and becomes stale after a refinement, lost
- * response, unsigned commit, or holder restart. Without an explicit target,
- * callers must submit without a proof rather than sign a process-local guess.
+ * metadata only — never from a process-local guess.
+ *
+ * Three sources, in precedence order:
+ *
+ *  1. `explicit` — a caller-supplied target, used verbatim.
+ *  2. A judge approval attests the already-submitted version captured in the
+ *     claim fingerprint and does not increment it (the engine's judge-approve
+ *     branch flips acceptance without bumping `version`).
+ *  3. A producer submit uses `owes[].version`, the target the hub issued for
+ *     this owed output inside the claim transaction. It is the version the
+ *     next successful commit lands, which is exactly what the consumer checks
+ *     the proof against.
+ *
+ * Retry-safety comes from the hub, not from this function. The target is
+ * computed once inside the claim transaction and persisted with the immutable
+ * order, so every retry of the same claim — a reconnect, a lost response, a
+ * restarted holder — reads the same number. The engine's refusal paths that
+ * leave the run open (schema-reject) do not bump the artifact, so the target
+ * survives in-claim retries; a refinement is a NEW claim and therefore a newly
+ * issued target. If a target ever did go stale, the consumer's version check
+ * refuses the artifact. The failure mode is a refusal, never an admitted
+ * unverified value.
+ *
+ * A hub that projects no `owes[].version` (pre-version-aware) yields
+ * `undefined`, and the caller submits unsigned rather than signing a guess.
+ *
+ * A target is only authoritative when it is a positive integer: the smallest
+ * commit any producer can land is v1, so 0 (or anything non-integral) is not a
+ * target this protocol issued — it is a pre-target-semantics hub or a corrupt
+ * packet. Both are treated as absent metadata and submit unsigned, rather than
+ * signing a number the consumer is guaranteed to reject.
  */
 export function outputVersionForSubmission(
   order: OrderPacket,
@@ -114,7 +139,8 @@ export function outputVersionForSubmission(
 ): number | undefined {
   if (explicit !== undefined) return explicit;
   if (order.judge === path) return order.consumedFingerprint?.[path];
-  return undefined;
+  const target = order.owes?.find((owed) => owed.path === path)?.version;
+  return typeof target === 'number' && Number.isInteger(target) && target > 0 ? target : undefined;
 }
 
 function errorMessage(error: unknown): string {

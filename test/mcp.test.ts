@@ -271,7 +271,11 @@ test('mcp: judge submit signs the exact judged version from the claim fingerprin
   assert.deepEqual(record.consumedFingerprint, { result: 3 });
 });
 
-test('mcp: repeated producer refinements remain unsigned without a retry-safe hub-issued version', async () => {
+test('mcp: each producer submit signs the owed target the hub issues for that claim', async () => {
+  // Every submit re-reads the immutable order packet, so the signed version
+  // tracks the hub's issued target rather than a process-local counter. The
+  // fake hub advances the target between reads (as a real hub does once the
+  // first commit lands), and the second proof must follow it.
   let orderCalls = 0;
   const submitted: Array<Record<string, unknown>> = [];
   const routes: Record<string, RouteHandler> = {
@@ -294,7 +298,7 @@ test('mcp: repeated producer refinements remain unsigned without a retry-safe hu
             outputs: ['result'],
 	    consumes: {},
 	    consumedFingerprint: {},
-	    owes: [{ path: 'result', version: 0, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+	    owes: [{ path: 'result', version: orderCalls, judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
           },
           lease: { claimed: true },
         },
@@ -324,8 +328,73 @@ test('mcp: repeated producer refinements remain unsigned without a retry-safe hu
   assert.deepEqual(resultJson(frames[2]!), { text: 'ok', outcome: 'green' });
   assert.equal(orderCalls, 2, 'each submit re-reads the immutable order packet');
   assert.equal(submitted.length, 2);
+
+  const signedVersions: number[] = [];
+  for (const body of submitted) {
+    assert.equal(typeof body.proof, 'string');
+    const verified = await dsseVerifySubmission(JSON.parse(body.proof as string), {
+      async verify(_bytes, signature) {
+	return signature.toString('utf8') === ARMOR
+	  ? { keyid: PUBLIC_KEY.keyid, principal: 'machine', format: 'sshsig' as const }
+	  : null;
+      },
+    });
+    const record = JSON.parse(verified.payloadBytes.toString('utf8')) as {
+      produced: Array<{ artifact: string; version: number }>;
+    };
+    assert.equal(record.produced[0]!.artifact, 'result');
+    signedVersions.push(record.produced[0]!.version);
+  }
+  assert.deepEqual(signedVersions, [1, 2]);
+});
+
+test('mcp: a producer submit stays unsigned when the hub issues no owed target version', async () => {
+  const submitted: Array<Record<string, unknown>> = [];
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'POST /api/get_order': () => ({
+      status: 200,
+      json: {
+        text: '',
+        workflow: 'wf1',
+        run: 'run1',
+        order: {
+          run: 'run1',
+          workflow: 'wf1',
+          step: 'producer',
+          key: 'k',
+          defDigest: 'def-digest',
+          inputs: [],
+          outputs: ['result'],
+          consumes: {},
+          consumedFingerprint: {},
+          owes: [{ path: 'result', judgmentRejects: 0, schemaRejects: 0, reasons: [] }],
+        },
+        lease: { claimed: true },
+      },
+    }),
+    'POST /api/submit': (req) => {
+      submitted.push(JSON.parse(req.body ?? '{}') as Record<string, unknown>);
+      return { status: 200, json: { text: 'ok', outcome: 'green' } };
+    },
+  };
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+  const mcpIo = t.io as unknown as {
+    principalKeys?: Pick<PrincipalKeyManager, 'inspect' | 'resolveRef' | 'withSigningKey'>;
+    sshProcess?: SshProcessAdapter;
+  };
+  mcpIo.principalKeys = SIGNING_KEYS;
+  mcpIo.sshProcess = fakeSshProcess();
+
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [
+    INIT,
+    call(3, 'submit', { workflow: 'wf1', run: 'run1', path: 'result', value: { answer: 1 } }),
+  ]);
+  assert.deepEqual(resultJson(frames[1]!), { text: 'ok', outcome: 'green' });
+  assert.equal(submitted.length, 1);
   assert.equal(submitted[0]!.proof, undefined);
-  assert.equal(submitted[1]!.proof, undefined);
 });
 
 test('mcp: a non-2xx REST reply maps to an isError result carrying the body message', async () => {

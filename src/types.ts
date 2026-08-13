@@ -203,7 +203,11 @@ export interface Order {
   /** the owed outputs and their accumulated reason threads (the feedback channel) */
   owes: Array<{
     path: string;
-    /** Current committed artifact version captured by the engine at claim time. */
+    /** The target version this claim's next successful producer commit lands
+     *  (committed version + 1), issued by the engine inside the claim
+     *  transaction. This is the version a producer signs in a submission
+     *  proof and a downstream consumer checks it against. Absent when the hub
+     *  is not version-aware, which leaves the producer submit unsigned. */
     version?: number;
     judgmentRejects: number;
     schemaRejects: number;
