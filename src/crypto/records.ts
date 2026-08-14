@@ -345,6 +345,10 @@ export const ORDER_FIELDS = {
   // emitted before this field existed still validates unchanged.
   capabilities: 'optional',
   modifier: 'optional',
+  // Set only when `modifier` is the step's escalation target rather than the
+  // run's. Covered by the signature like every other routing field: a claim
+  // made on a recovery re-offer must not be replayable as an ordinary one.
+  escalated: 'optional',
 } as const satisfies FieldManifest<Order>;
 
 /** Indexed access pins the already-emitted nested Order shape without cloning it. */

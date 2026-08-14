@@ -22,11 +22,13 @@ import {
   eligibleFirings,
   fingerprintMatches,
   groupBlockingWinner,
+  isEscalated,
   isGreen,
   judgeNameOf,
   maintainDecisions,
   pendingOwed,
   plainConsumes,
+  rejectionEpisode,
   requiredInputs,
   workflowStatus,
 } from './model.ts';
@@ -65,6 +67,36 @@ const DEFAULT_REAP_TTL_MS = 2 * 60 * 60 * 1000; // 2h
  * `maintainCalls` (spawn-time refusal) and `tickInternal` (descent guard).
  */
 const DEFAULT_MAX_CALL_DEPTH = 64;
+
+/**
+ * What one escalation promotion did, as computed for one offer. Engine-internal
+ * bookkeeping: it becomes the `metadata` of the artifact-history record and the
+ * `escalated: true` flag on the order. It is never stored as engine state — the
+ * promotion itself is re-derived on every offer (`routingFor`).
+ */
+interface EscalationRecord {
+  /** The owed output whose reject count crossed the threshold. */
+  path: string;
+  /** The escalation target, i.e. what the offer composed with instead. */
+  to: string;
+  /** The step's authored `escalation.after`, for the record. */
+  after: number;
+  /** The crossing count at the moment of this offer (>= `after`). */
+  judgmentRejects: number;
+  /** Rejection-episode ordinal — see `rejectionEpisode`. Keys the one record. */
+  episode: number;
+  /** The artifact's version when this offer was made, for the history record
+   *  only (the record itself is anchored at version 0 — see
+   *  `recordEscalation`). Taken from the in-tx `arts` snapshot, so writing the
+   *  record costs no extra store read. */
+  atVersion: number;
+  /** The run's own modifier, which this offer did NOT use. Absent on an
+   *  unmodified run: the promotion is from bare capabilities. */
+  from?: string;
+}
+
+/** The artifact-history `action` written when an escalation promotes an offer. */
+const ESCALATION_ACTION = 'escalated';
 
 /**
  * F2: a typed refusal for a produced-value/input-value schema mismatch, thrown
@@ -1464,7 +1496,7 @@ export class Engine {
       const timeFacts = this.computeTimeFacts(def, workflow, arts, now);
 
       const firings = eligibleFirings(def, arts, timeFacts);
-      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, capabilities, modifier, matchModes);
+      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, arts, capabilities, modifier, matchModes);
 
       const orders: Order[] = [];
       const allDeferred: DeferredFiring[] = [...deferred];
@@ -1573,20 +1605,28 @@ export class Engine {
    * Per-step cadence + daily budget + parallel cap over the eligible firings.
    *
    * A2: `capabilities` is the tick caller's claim filter, matched against the
-   * step's OFFERED capabilities — the authored list composed with the run's
-   * `modifier` (`wise` + `deep` → `wise:deep`), which is the same list the
-   * order will carry. `claimMatches` owns the rule; see it for the four cases
-   * (no filter presented, capability-silent step, empty caller list, both
-   * non-empty) and for what `matchModes` changes. A step this caller may not claim has every firing
-   * deferred as `'capability-mismatch'`. Filtering here (before cadence/budget)
-   * means a mismatched firing never consumes the caller's slots and never
-   * perturbs cadence math.
+   * step's OFFERED capabilities — the authored list composed with the modifier
+   * this firing will actually be offered under (`wise` + `deep` → `wise:deep`),
+   * which is the same list the order will carry. `claimMatches` owns the rule;
+   * see it for the four cases (no filter presented, capability-silent step,
+   * empty caller list, both non-empty) and for what `matchModes` changes.
+   * A firing this caller may not claim is deferred as `'capability-mismatch'`.
+   * Filtering here (before cadence/budget) means a mismatched firing never
+   * consumes the caller's slots and never perturbs cadence math.
+   *
+   * The filter is per FIRING, not per step, because §7 escalation is per firing:
+   * on a map step one element may have escalated to `build:deep` while its
+   * siblings are still offered at `build:standard`, and a crew bound to only one
+   * of those must be judged against the compound its own firing carries. With no
+   * escalation authored every firing of a step composes identically, so this
+   * behaves exactly as a per-step filter would.
    */
   private applySchedule(
     workflow: string,
     def: WorkflowDef,
     firings: Firing[],
     now: number,
+    arts: ArtifactMap,
     capabilities: string[] | undefined,
     modifier: string | undefined,
     matchModes: Record<string, MatchMode>,
@@ -1602,16 +1642,20 @@ export class Engine {
     };
 
     for (const step of def.steps) {
-      const stepFirings = firings.filter((f) => f.step === step.name);
-      if (stepFirings.length === 0) continue;
+      const all = firings.filter((f) => f.step === step.name);
+      if (all.length === 0) continue;
 
-      // A2: caller capability filter vs. the step's COMPOSED offer. Composed
+      // A2: caller capability filter vs. this firing's COMPOSED offer. Composed
       // here, not authored, so a caller bound to `wise:deep` is judged against
-      // what the order will actually carry.
-      if (!claimMatches(composeCapabilities(step.capabilities, modifier), capabilities, matchModes)) {
-        for (const f of stepFirings) defer(f, 'capability-mismatch');
-        continue;
+      // what the order will actually carry — including when `deep` came from the
+      // escalation rule rather than the run.
+      const stepFirings: Firing[] = [];
+      for (const f of all) {
+        const offered = composeCapabilities(step.capabilities, this.routingFor(step, f, arts, modifier).modifier);
+        if (claimMatches(offered, capabilities, matchModes)) stepFirings.push(f);
+        else defer(f, 'capability-mismatch');
       }
+      if (stepFirings.length === 0) continue;
 
       const latest = this.store.latestRun(workflow, step.name);
       if (latest && now - latest.createdAt < step.cadenceSecs * 1000) {
@@ -1732,8 +1776,19 @@ export class Engine {
     // CONFLICT DO UPDATE, no history table), so the issued order is unrecoverable
     // later unless captured here; this persisted packet is the replay/eval/paper
     // trail record (buildOrder is deterministic modulo run id).
-    const order = this.buildOrder(def, workflow, runId, f, arts, fp, modifier);
+    // §7: the modifier THIS offer composes with — the run's, or the step's
+    // escalation target. Recomputed here rather than passed down from
+    // `applySchedule` so the offer and the filter read the same function on the
+    // same in-tx `arts` snapshot; nothing between them can move.
+    const routing = this.routingFor(this.step(def, f.step), f, arts, modifier);
+    const order = this.buildOrder(def, workflow, runId, f, arts, fp, routing);
     if (typeof order === 'object' && 'deferred' in order) return order;
+    // One history record per rejection episode. Written HERE, not in
+    // `buildOrder` (which is store-pure) and not on the deferred path (an offer
+    // that never became an order promoted nothing). Idempotence is the store's:
+    // the row id is derived from the episode, so the recomputation this rule
+    // performs on every subsequent offer of the same episode inserts nothing.
+    if (routing.escalation) this.recordEscalation(workflow, f, routing.escalation, now);
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
     this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, order, ...(f.cause ? { cause: f.cause } : {}) }, now);
     this.store.putTask({
@@ -1766,7 +1821,7 @@ export class Engine {
     f: Firing,
     arts: ArtifactMap,
     consumedFingerprint: Fingerprint,
-    modifier?: string,
+    routing: { modifier?: string; escalation?: EscalationRecord } = {},
   ): Order | DeferredClaim {
     const step = this.step(def, f.step);
     const consumes: Record<string, unknown> = {};
@@ -1864,14 +1919,17 @@ export class Engine {
     if (f.index !== undefined) order.index = f.index;
     // The routing snapshot of THIS offer. `capabilities` is the composed list —
     // absent on a capability-silent step, since there is nothing to compose
-    // onto. `modifier` is stamped whenever the run carries one, even for a
-    // capability-silent step, so the brief can surface the run's grade of
-    // service regardless of how the step routes. A claimed order is never
+    // onto. `modifier` is stamped whenever the offer carries one, even for a
+    // capability-silent step, so the brief can surface the grade of service
+    // regardless of how the step routes; on an escalated offer it is the
+    // escalation target, and `escalated` marks it as such so the hub does not
+    // have to diff it against the run record. A claimed order is never
     // recomposed: composition happens per offer, and this record is what the
     // shift resolved against.
-    const offered = composeCapabilities(step.capabilities, modifier);
+    const offered = composeCapabilities(step.capabilities, routing.modifier);
     if (offered.length > 0) order.capabilities = offered;
-    if (modifier !== undefined) order.modifier = modifier;
+    if (routing.modifier !== undefined) order.modifier = routing.modifier;
+    if (routing.escalation !== undefined) order.escalated = true;
     if (step.model !== undefined) order.model = step.model;
     if (step.executor !== undefined) order.worker = step.executor;
     if (step.judges !== undefined) order.judge = step.judges;
@@ -3179,6 +3237,101 @@ export class Engine {
 
   private defFor(workflow: string): WorkflowDef {
     return this.instanceFor(workflow).def;
+  }
+
+  /**
+   * §7: the modifier ONE offer of ONE firing composes with — the run's, or the
+   * step's escalation target when the escalation rule has tripped.
+   *
+   * Derived, never stored. Every offer re-evaluates it from the artifact
+   * counters, which is what makes the transition atomic (there is no separate
+   * write that could half-apply), idempotent (recomputing it changes nothing),
+   * and self-reversing (a human `retry` zeroes `judgmentRejects`, and the very
+   * next offer composes with the run's modifier again).
+   *
+   * The trigger is per OUTPUT PATH: the firing escalates when any path it owes
+   * has taken `escalation.after` judgment rejections. For a plain step that is
+   * its single produce; for a map step each element firing escalates on its own
+   * element's count, so one bad element does not promote the whole step.
+   *
+   * Three cases return the run's modifier untouched:
+   *   - the step authors no `escalation:` block — rejections run the normal
+   *     retry path at the same compound until the stall brake;
+   *   - no owed path has reached the threshold yet;
+   *   - the run's modifier ALREADY equals the escalation target — there is
+   *     nothing to promote, so no `escalated` flag and no history record. A
+   *     `deep` run whose builder escalates to `deep` is a no-op, not an event.
+   *
+   * `escalation` on the result is set ONLY in the case that actually changed
+   * the routing; `claim` writes the history record from it.
+   */
+  private routingFor(
+    step: StepDef,
+    f: Firing,
+    arts: ArtifactMap,
+    runModifier: string | undefined,
+  ): { modifier?: string; escalation?: EscalationRecord } {
+    const rule = step.escalation;
+    if (rule === undefined || rule.modifier === runModifier) {
+      return runModifier !== undefined ? { modifier: runModifier } : {};
+    }
+    // `f.outputs` order is the def's produce order, so the reported path is
+    // deterministic when more than one output has crossed the threshold.
+    const path = f.outputs.find((p) => isEscalated(arts.get(p), rule.after));
+    if (path === undefined) return runModifier !== undefined ? { modifier: runModifier } : {};
+    const art = arts.get(path);
+    const escalation: EscalationRecord = {
+      path,
+      to: rule.modifier,
+      after: rule.after,
+      judgmentRejects: art?.judgmentRejects ?? 0,
+      episode: rejectionEpisode(art),
+      atVersion: art?.version ?? 0,
+    };
+    if (runModifier !== undefined) escalation.from = runModifier;
+    return { modifier: rule.modifier, escalation };
+  }
+
+  /**
+   * Write the ONE artifact-history record for an escalation promotion.
+   *
+   * `version: 0` on purpose. The promotion belongs to the artifact across a
+   * whole rejection episode, not to any single produced version — the episode
+   * spans every attempt from the crossing rejection to the human `retry` that
+   * ends it, and those attempts each produce their own version. Anchoring the
+   * record to a version would either mislabel it or (since the row id mixes in
+   * the version) write one row per version, breaking the once-per-episode
+   * guarantee. `getArtifactHistory` collects version-0 events in its
+   * artifact-level `events` bucket, which is exactly where this belongs; the
+   * version the promotion took effect at is in `metadata.atVersion`.
+   *
+   * The dedupe key is `(step, firing key, episode)`. Step and key are in it
+   * because two different steps can owe the same path in different firings; the
+   * episode ordinal is what makes a SECOND promotion, after a human `retry` and
+   * three fresh rejections, a distinct row rather than a swallowed duplicate.
+   */
+  private recordEscalation(workflow: string, f: Firing, e: EscalationRecord, now: number): void {
+    this.store.recordArtifactEvent({
+      workflow,
+      path: e.path,
+      version: 0,
+      action: ESCALATION_ACTION,
+      actor: 'engine',
+      dedupe: `${ESCALATION_ACTION}:${f.step}:${f.key}:${e.episode}`,
+      timestamp: now,
+      reason: `step '${f.step}' escalated to modifier '${e.to}' after ${e.judgmentRejects} judgment rejection(s)`
+        + ` (threshold ${e.after})`,
+      metadata: {
+        step: f.step,
+        key: f.key,
+        to: e.to,
+        after: e.after,
+        judgmentRejects: e.judgmentRejects,
+        episode: e.episode,
+        atVersion: e.atVersion,
+        ...(e.from !== undefined ? { from: e.from } : {}),
+      },
+    });
   }
 
   private step(def: WorkflowDef, name: string): StepDef {

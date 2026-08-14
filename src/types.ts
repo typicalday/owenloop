@@ -205,6 +205,20 @@ export interface Order {
    * brief can surface the requested depth without re-parsing a compound.
    */
   modifier?: string;
+  /**
+   * `true` when `modifier` above is the step's ESCALATION TARGET rather than
+   * the run's own modifier — i.e. this offer is a recovery re-offer made
+   * after the step's produce accumulated `escalation.after` judgment
+   * rejections. Absent on every ordinary offer.
+   *
+   * The engine decides the transition; this flag is how the decision reaches
+   * the layer that acts on it, instead of that layer re-deriving it by
+   * diffing `modifier` against the run record. The hub reads it to apply the
+   * escalation wait policy (wait-then-fallback, even where the deployment
+   * default is `forever`); a brief reads it to tell the worker it is on the
+   * recovery path.
+   */
+  escalated?: true;
   /** Opaque config object for a non-agent/non-command worker type (or
    *  alongside a command). Carried through untouched, contents never read. */
   spec?: Record<string, unknown>;

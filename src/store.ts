@@ -21,6 +21,7 @@ import type {
   ArtifactEvent,
   ArtifactHistory,
   ArtifactVersion,
+  Author,
   Fingerprint,
   Order,
   ReasonEntry,
@@ -888,6 +889,51 @@ export class Store {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
     ).run(id, event.workflow, event.path, event.version, event.action, event.actor, event.reason ?? null,
       event.kind ?? null, toJson(event.metadata), event.timestamp);
+  }
+
+  /**
+   * Append one engine-authored history record for an artifact, WITHOUT touching
+   * the artifact row.
+   *
+   * `putArtifact` already writes an event per lifecycle change, but only when
+   * the artifact's own data changed. Some engine decisions are about an
+   * artifact without changing it — the escalation transition is the first: the
+   * routing of the next offer changes, the artifact does not. Those need a
+   * record too, and this is the only way to write one.
+   *
+   * **Idempotent by construction.** The row id is derived from
+   * `(workflow, path, version, dedupe)` and the insert is
+   * `ON CONFLICT(id) DO NOTHING`, so a caller that recomputes the same decision
+   * on every tick — as the escalation rule does, since it is derived state and
+   * not a stored flag — writes exactly one row. The caller owns `dedupe`: make
+   * it identify the EPISODE, not the moment.
+   *
+   * Pass `version: 0` for a record that belongs to the artifact as a whole
+   * rather than to one produced version; `getArtifactHistory` surfaces those in
+   * its artifact-level `events` bucket. Detail goes in `metadata`.
+   */
+  recordArtifactEvent(event: {
+    workflow: string;
+    path: string;
+    version: number;
+    action: string;
+    actor: Author;
+    dedupe: string;
+    timestamp: number;
+    reason?: string;
+    metadata?: Record<string, unknown>;
+  }): void {
+    this.insertArtifactEvent({
+      workflow: event.workflow,
+      path: event.path,
+      version: event.version,
+      action: event.action,
+      actor: event.actor,
+      timestamp: event.timestamp,
+      key: event.dedupe,
+      ...(event.reason !== undefined ? { reason: event.reason } : {}),
+      ...(event.metadata !== undefined ? { metadata: event.metadata } : {}),
+    });
   }
 
   /** Returns history for exactly one artifact; list/status reads stay projection-only. */
