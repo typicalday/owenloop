@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3](https://github.com/typicalday/owenloop/compare/v0.5.2...v0.5.3) (2026-08-14)
+
+
+### Features
+
+* let owenloop start pick a run modifier ([#154](https://github.com/typicalday/owenloop/issues/154)) ([a412b5b](https://github.com/typicalday/owenloop/commit/a412b5b334b5fd228d4558b50125e069512bd860))
+* neutral permissionMode vocabulary across harness adapters ([#156](https://github.com/typicalday/owenloop/issues/156)) ([c96340f](https://github.com/typicalday/owenloop/commit/c96340f2d3f910e49838c6fbd68ed817e52f7ddc))
+
 ## [0.5.2](https://github.com/typicalday/owenloop/compare/v0.5.1...v0.5.2) (2026-08-14)
 
 
