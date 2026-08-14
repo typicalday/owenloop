@@ -72,6 +72,12 @@ export interface BriefSpec {
    * repeated rejections, not a first attempt.
    */
   escalated?: boolean;
+  /**
+   * The owed output paths for this order, in packet order — `packet.owes`
+   * mapped to its `path`. Feeds the submit contract; absent or empty renders
+   * the contract without naming any path.
+   */
+  owes?: readonly string[];
 }
 
 /** The composite order id — the only form the hub verbs accept. */
@@ -96,8 +102,52 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
     .join(spec.account)
     .split(SHIFT_TOKEN)
     .join(spec.shiftId ?? '');
-  const routing = renderRoutingLine(spec);
-  return routing === '' ? substituted : `${routing}\n\n${substituted}`;
+  const blocks = [renderRoutingLine(spec), renderSubmitContract(spec), substituted];
+  return blocks.filter((b) => b !== '').join('\n\n');
+}
+
+/**
+ * How an order is COMPLETED, stated to every agent on every run.
+ *
+ * WHY THIS EXISTS. Nothing else ever told an agent that finishing means calling
+ * a tool. The engine mounts the work-holder MCP server and then relies entirely
+ * on the def author's prose; owenloop's own house verb for it is "green <path>
+ * with <value>", which names no tool and is not a phrase any model has seen
+ * before. A strong enough model infers the tool call from the mounted surface
+ * and submits; a weaker one reads the same sentence as "print this JSON",
+ * writes the value into a code fence, and ends its turn. The hub then records
+ * nothing, the confirm grace lapses, and the order is re-offered — so the step
+ * loops forever while every attempt does the work correctly. That is a defect
+ * in what the engine states, not in the def or the model: the engine is the
+ * only party that knows the submit contract, so the engine has to state it.
+ *
+ * WHY IT NAMES THE OWED PATHS. `submit` is per-path and takes the path as an
+ * argument, so "call submit" alone is not actionable — an agent that owes two
+ * outputs and submits one is as stuck as one that submits none. The list comes
+ * from `packet.owes`, which is the hub's own answer to "what does this order
+ * still owe", so it stays correct on a re-offer where some paths are already
+ * paid.
+ *
+ * WHY THE COUNTER-EXAMPLE IS SPELLED OUT. The observed failure is not a refusal
+ * to submit — it is a belief that printing IS submitting. Naming the tool
+ * without ruling out the near-miss leaves that belief intact.
+ *
+ * Vendor-neutral by construction: it names owenloop's own tool and mount, and
+ * no harness. `test/vendor-gate.test.ts` fails any shipped file outside
+ * `src/harness/` that names a vendor.
+ */
+function renderSubmitContract(spec: BriefSpec): string {
+  const owed = (spec.owes ?? []).filter((p) => p !== '');
+  // Nothing owed, nothing to say — the same stance the routing line takes on an
+  // absent modifier. A contract with no path to name would have to write
+  // `<path>` into its own example, which teaches the shape of the call while
+  // leaving the one argument that matters unanswered.
+  if (owed.length === 0) return '';
+  return [
+    `How this order completes: submit your result with the \`submit\` tool on the mounted \`owenloop\` MCP server. You owe ${owed.map((p) => `\`${p}\``).join(', ')} — call it once for each.`,
+    `Example: \`submit({"path": "${owed[0]!}", "value": <the value this brief asks for>})\`.`,
+    'Printing that value as text, or inside a code fence, does NOT submit it — the turn ends, the hub records nothing, and this order is re-offered from scratch. Wherever this brief says "green <path> with <value>", it means exactly this tool call.',
+  ].join('\n');
 }
 
 /**

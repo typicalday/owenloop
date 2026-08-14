@@ -601,6 +601,9 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       // statement about the RUN, and a shift has no say in it.
       ...(packet.modifier !== undefined ? { modifier: packet.modifier } : {}),
       ...(packet.escalated === true ? { escalated: true } : {}),
+      // The hub's own answer to "what does this order still owe", so the submit
+      // contract names the right paths on a re-offer where some are already paid.
+      owes: packet.owes.map((owed) => owed.path),
     };
     // Permissions arrive PRE-NORMALIZED in the spec. `prepare` ran
     // `normalizeStepPermissions` over the step's `x.harness` options at cache

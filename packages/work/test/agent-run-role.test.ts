@@ -733,9 +733,14 @@ test('run() renders the brief from the verified step and passes normalized permi
 
   const started = fake.calls.find((c) => c.kind === 'start');
   assert.ok(started !== undefined && started.kind === 'start');
-  assert.equal(
+  // `endsWith`, not `equal`: `renderBrief` prepends engine-authored blocks (the
+  // routing line, the submit contract) ahead of the authored body. What this
+  // test guards is that the VERIFIED step body is what gets rendered and that
+  // its four tokens are substituted — so the assertion is that the substituted
+  // body is present, intact, and last.
+  assert.ok(
+    started.args.brief.endsWith('order: wf1/run1\norigin: https://hub.example\naccount: default\nshift: shf_1'),
     started.args.brief,
-    'order: wf1/run1\norigin: https://hub.example\naccount: default\nshift: shf_1',
   );
   // The permissions are normalized from the verified local definition.
   assert.deepEqual(started.args.permissions.tools, ['Read']);

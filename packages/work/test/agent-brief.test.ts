@@ -98,6 +98,59 @@ test('renderBrief leaves template text alone when it holds no tokens', () => {
   assert.equal(renderBrief('plain body $& \\1', spec()), 'plain body $& \\1');
 });
 
+// ---- the submit contract -----------------------------------------------------
+//
+// The defect this closes: nothing in a rendered brief ever said that finishing
+// an order means calling a tool. owenloop's house verb is "green <path> with
+// <value>", which names no tool. Observed live on wf_3fbddbd1 — a documenter
+// did its work correctly, printed the artifact JSON in a code fence, ended its
+// turn, and was re-offered; it looped six dispatches that way while a builder
+// on the SAME harness and model at a higher effort submitted fine. The engine
+// is the only party that knows the submit contract, so the engine states it.
+
+test('renderBrief states the submit contract, names every owed path, and rules out printing', () => {
+  const out = renderBrief('body', spec({ owes: ['docs', 'pr'] }));
+  assert.match(out, /`submit` tool on the mounted `owenloop` MCP server/u);
+  // Per-path: `submit` takes the path as an argument, so an agent that owes two
+  // outputs and submits one is as stuck as one that submits none.
+  assert.match(out, /You owe `docs`, `pr` — call it once for each\./u);
+  assert.match(out, /Example: `submit\(\{"path": "docs", "value": <the value this brief asks for>\}\)`\./u);
+  // The failure is a BELIEF that printing is submitting, not a refusal to
+  // submit. Naming the tool without ruling out the near-miss leaves it intact.
+  assert.match(out, /inside a code fence, does NOT submit it/u);
+  assert.match(out, /re-offered from scratch/u);
+  assert.match(out, /"green <path> with <value>", it means exactly this tool call/u);
+  assert.ok(out.endsWith('\n\nbody'), 'the authored body stays last');
+});
+
+test('renderBrief puts the submit contract after the routing line and before the body', () => {
+  const out = renderBrief('body', spec({ modifier: 'deep', owes: ['docs'] }));
+  const routing = out.indexOf('Routing: this run');
+  const contract = out.indexOf('How this order completes:');
+  const body = out.indexOf('body');
+  assert.ok(routing === 0, 'routing stays first');
+  assert.ok(routing < contract && contract < body, `unexpected order: ${out}`);
+});
+
+test('renderBrief writes no submit contract when the order owes nothing', () => {
+  // Same stance the routing line takes on an absent modifier: a contract with
+  // no path to name would put `<path>` in its own example, teaching the shape
+  // of the call while leaving its one load-bearing argument unanswered.
+  assert.equal(renderBrief('body', spec()), 'body');
+  assert.equal(renderBrief('body', spec({ owes: [] })), 'body');
+  assert.equal(renderBrief('body', spec({ owes: [''] })), 'body');
+});
+
+test('renderBrief keeps the example on a real owed path, never a placeholder', () => {
+  const out = renderBrief('body', spec({ owes: ['', 'mergeable'] }));
+  assert.match(out, /"path": "mergeable"/u, 'the first NON-EMPTY owed path is the example');
+  // Scoped to the example line on purpose: the closing sentence quotes the
+  // house verb as "green <path> with <value>", so a whole-brief search for
+  // `<path>` matches prose that is supposed to be there.
+  const example = out.split('\n').find((l) => l.startsWith('Example:')) ?? '';
+  assert.equal(/<path>/.test(example), false, example);
+});
+
 test('buildOwenloopMcp emits the born-bound work-holder argv', () => {
   assert.deepEqual(buildOwenloopMcp(spec({ shiftId: 'shf_abc' }), '/same/bin/owenloop.mjs', '/same/node'), {
     command: '/same/node',
