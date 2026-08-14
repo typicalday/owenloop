@@ -8,7 +8,13 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import { createShiftLoop, MAX_PENDING_CANDIDATE_AGE_MS, type ShiftLoop, type ShiftLoopOptions } from '../src/shift/loop.ts';
-import { buildSpawnPlan, createDefaultSpawner, type SpawnSpec, type Spawner } from '../src/shift/spawn.ts';
+import {
+  buildSpawnPlan,
+  createDefaultSpawner,
+  reportedHarnessId,
+  type SpawnSpec,
+  type Spawner,
+} from '../src/shift/spawn.ts';
 import {
   readChildRecords,
   readChildReservations,
@@ -132,6 +138,9 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
       return { text: '' };
     },
     async reject() { return { text: '', ok: true }; },
+    async reportResolution(req) {
+      return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
+    },
     async whoami() {
       return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' };
     },
@@ -1182,6 +1191,68 @@ test('buildSpawnPlan: agent-run carries --shift but never manufactures a --harne
   assert.equal(plan.args.includes('--harness'), false);
 });
 
+// ---- the harness named on a failure event ------------------------------------
+//
+// The Shift does not CHOOSE the harness — the agent-run child does. These tests
+// pin the report to the child's own precedence in `roles/agent-run.ts`, because
+// the field's only job is to tell an operator which adapter was running when the
+// worker died. A report that disagrees with the child is worse than no field.
+
+test('reportedHarnessId: OWENLOOP_HARNESS OUTRANKS the prepared-cache step harness', () => {
+  // The regression this pins. The old expression was `spec.harness ?? env`,
+  // which is the child's order inverted: an operator who pinned the variable
+  // AND had a cached step harness was told the cached one ran.
+  assert.equal(reportedHarnessId({ harness: 'cached' }, { OWENLOOP_HARNESS: 'pinned' }), 'pinned');
+});
+
+test('reportedHarnessId: a set-but-blank OWENLOOP_HARNESS is reported as the refusal the child raises', () => {
+  // The child does not fall through to the step here — it refuses the whole
+  // config and names the id `<empty OWENLOOP_HARNESS>`. Falling through in the
+  // report would name an adapter that never ran.
+  for (const blank of ['', '   ', '\t']) {
+    assert.equal(
+      reportedHarnessId({ harness: 'cached' }, { OWENLOOP_HARNESS: blank }),
+      '<empty OWENLOOP_HARNESS>',
+    );
+  }
+});
+
+test('reportedHarnessId: with no variable set, the cache step harness is reported', () => {
+  assert.equal(reportedHarnessId({ harness: 'cached' }, {}), 'cached');
+  // An EMPTY step harness counts as absent, exactly as the child treats it.
+  assert.equal(reportedHarnessId({ harness: '' }, {}), '<registered default>');
+});
+
+test('reportedHarnessId: neither input present names the placeholder, not a guess', () => {
+  // The child took the first REGISTERED adapter. The Shift never imports the
+  // adapter composition root, so its own registry is empty and any id it
+  // produced here would be invented.
+  assert.equal(reportedHarnessId({}, {}), '<registered default>');
+});
+
+test('createDefaultSpawner reports the harness from the CHILD spawn env, not this process', async () => {
+  // `plan.options.env` is what the child gets. Resolving against `process.env`
+  // instead would be right only by accident.
+  const script = join(stateDir, '..', 'exit-three.mjs');
+  writeFileSync(script, 'process.exit(3);\n');
+  const keepAlive = setTimeout(() => {}, 5_000);
+  const prior = process.env['OWENLOOP_HARNESS'];
+  process.env['OWENLOOP_HARNESS'] = 'pinned-by-operator';
+  try {
+    const failure = await new Promise<Parameters<NonNullable<Parameters<typeof createDefaultSpawner>[4]>>[0]>(
+      (resolve) => {
+	const spawner = createDefaultSpawner(ORIGIN, 'default', script, 'shf_test', resolve);
+	spawner({ workflow: 'wf1', run: 'run_env_harness', step: 'builder', kind: 'agent-run', harness: 'cached' });
+      },
+    );
+    assert.equal(failure.harness, 'pinned-by-operator');
+  } finally {
+    if (prior === undefined) delete process.env['OWENLOOP_HARNESS'];
+    else process.env['OWENLOOP_HARNESS'] = prior;
+    clearTimeout(keepAlive);
+  }
+});
+
 test('createDefaultSpawner reports a nonzero detached worker exit with generic lifecycle metadata', async () => {
   const script = join(stateDir, '..', 'exit-seven.mjs');
   writeFileSync(script, 'process.exit(7);\n');
@@ -1190,6 +1261,11 @@ test('createDefaultSpawner reports a nonzero detached worker exit with generic l
   // unref'd; Node 22 may otherwise let the isolated test process drain before
   // delivering the child's `exit` event.
   const keepAlive = setTimeout(() => {}, 5_000);
+  // The reported harness now honours `OWENLOOP_HARNESS` above the spec, so an
+  // operator running the suite with that variable exported would otherwise see
+  // this assertion fail for a reason that has nothing to do with the code.
+  const prior = process.env['OWENLOOP_HARNESS'];
+  delete process.env['OWENLOOP_HARNESS'];
   const failure = new Promise<Parameters<NonNullable<Parameters<typeof createDefaultSpawner>[4]>>[0]>((resolve) => {
     const spawner = createDefaultSpawner(ORIGIN, 'default', script, 'shf_test', resolve);
     spawner({ workflow: 'wf1', run: 'run_failed', step: 'builder', kind: 'agent-run', harness: 'codex' });
@@ -1208,6 +1284,7 @@ test('createDefaultSpawner reports a nonzero detached worker exit with generic l
       message: 'worker exited without completing successfully',
     });
   } finally {
+    if (prior !== undefined) process.env['OWENLOOP_HARNESS'] = prior;
     clearTimeout(keepAlive);
   }
 });
@@ -1397,6 +1474,9 @@ test('e2e: iterate() dispatches an agent order, parks quiet, and re-sweeps only 
       return { text: '' };
     },
     async reject() { return { text: '', ok: true }; },
+    async reportResolution(req) {
+      return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
+    },
     async whoami() {
       return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' };
     },
