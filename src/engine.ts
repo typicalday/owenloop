@@ -22,11 +22,13 @@ import {
   eligibleFirings,
   fingerprintMatches,
   groupBlockingWinner,
+  isEscalated,
   isGreen,
   judgeNameOf,
   maintainDecisions,
   pendingOwed,
   plainConsumes,
+  rejectionEpisode,
   requiredInputs,
   workflowStatus,
 } from './model.ts';
@@ -34,6 +36,8 @@ import type { ArtifactMap, CascadeOp, ChildStatusSummary, Firing, TimeFacts, Wor
 import { summarizeIssues, validateValue } from './schema.ts';
 import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
+import { claimMatches, composeCapabilities } from './capabilities.ts';
+import type { MatchMode } from './capabilities.ts';
 import { localMidnightMs, nowMs, randId } from './util.ts';
 import type { Store, WorkflowRow } from './store.ts';
 import type {
@@ -63,6 +67,36 @@ const DEFAULT_REAP_TTL_MS = 2 * 60 * 60 * 1000; // 2h
  * `maintainCalls` (spawn-time refusal) and `tickInternal` (descent guard).
  */
 const DEFAULT_MAX_CALL_DEPTH = 64;
+
+/**
+ * What one escalation promotion did, as computed for one offer. Engine-internal
+ * bookkeeping: it becomes the `metadata` of the artifact-history record and the
+ * `escalated: true` flag on the order. It is never stored as engine state — the
+ * promotion itself is re-derived on every offer (`routingFor`).
+ */
+interface EscalationRecord {
+  /** The owed output whose reject count crossed the threshold. */
+  path: string;
+  /** The escalation target, i.e. what the offer composed with instead. */
+  to: string;
+  /** The step's authored `escalation.after`, for the record. */
+  after: number;
+  /** The crossing count at the moment of this offer (>= `after`). */
+  judgmentRejects: number;
+  /** Rejection-episode ordinal — see `rejectionEpisode`. Keys the one record. */
+  episode: number;
+  /** The artifact's version when this offer was made, for the history record
+   *  only (the record itself is anchored at version 0 — see
+   *  `recordEscalation`). Taken from the in-tx `arts` snapshot, so writing the
+   *  record costs no extra store read. */
+  atVersion: number;
+  /** The run's own modifier, which this offer did NOT use. Absent on an
+   *  unmodified run: the promotion is from bare capabilities. */
+  from?: string;
+}
+
+/** The artifact-history `action` written when an escalation promotes an offer. */
+const ESCALATION_ACTION = 'escalated';
 
 /**
  * F2: a typed refusal for a produced-value/input-value schema mismatch, thrown
@@ -296,6 +330,41 @@ export interface CreateOpts {
   provide?: Record<string, Record<string, unknown>>;
   /** Mode 2: parent-coordinate link for a child instance spawned by a calls: step. Persisted to store; used only to cascade the child's outcome back up. */
   producedBy?: { parentWf: string; parentPath: string };
+  /**
+   * The ONE routing modifier this instance carries for its whole life. Must be
+   * a member of the def's declared `modifiers` set — `createInstance` throws
+   * {@link ModifierRefusalError} otherwise, rather than starting a run that
+   * would compose capabilities no crew was ever bound to.
+   *
+   * Absent = an unmodified run: every step is offered on bare capabilities.
+   * Never mutated after creation; an escalated re-offer carries its own target
+   * modifier per-offer without rewriting this.
+   */
+  modifier?: string;
+}
+
+/**
+ * Thrown by `createInstance` when the requested modifier is not in the def's
+ * declared `modifiers` set (including the case of a def that declares none).
+ * Its own class so the hub can map it to a 400 instead of an opaque 500 —
+ * this is a caller mistake, not an engine fault.
+ */
+export class ModifierRefusalError extends Error {
+  readonly defName: string;
+  readonly modifier: string;
+  /** The def's declared modifier set — empty when the def declares none. */
+  readonly declared: string[];
+  constructor(defName: string, modifier: string, declared: string[]) {
+    super(
+      declared.length === 0
+        ? `workflow '${defName}' declares no modifiers:, so it cannot be started with modifier '${modifier}'`
+        : `modifier '${modifier}' is not declared by workflow '${defName}' (declared: ${declared.join(', ')})`,
+    );
+    this.name = 'ModifierRefusalError';
+    this.defName = defName;
+    this.modifier = modifier;
+    this.declared = declared;
+  }
 }
 
 /**
@@ -472,10 +541,21 @@ export class Engine {
     // compatibility case (see defFor), never a choice made here.
     const wfData: {
       def: string; title?: string; params?: Record<string, string>;
-      defSnapshot: WorkflowDef; defHash: string;
+      modifier?: string; defSnapshot: WorkflowDef; defHash: string;
     } = { def: defName, defSnapshot: def, defHash: hashDef(def) };
     if (opts.title !== undefined) wfData.title = opts.title;
     if (opts.params !== undefined) wfData.params = opts.params;
+    // Validated against the SNAPSHOT being pinned on this same row, not
+    // against a live re-resolution — the modifier and the vocabulary that
+    // legitimizes it are stamped together and stay consistent for the life of
+    // the instance, even if the def is republished with a different set.
+    if (opts.modifier !== undefined) {
+      const declared = def.modifiers ?? [];
+      if (!declared.includes(opts.modifier)) {
+        throw new ModifierRefusalError(defName, opts.modifier, declared);
+      }
+      wfData.modifier = opts.modifier;
+    }
     this.store.insertWorkflow(id, wfData, opts.producedBy);
 
     for (const input of def.inputs) {
@@ -1277,8 +1357,42 @@ export class Engine {
    * Pass `{ deep: false }` (CLI `--shallow`) to restore the pre-deep behavior:
    * only this instance's own orders. See `TickResult` for the fold semantics.
    */
-  tick(workflow: string, opts: { now?: number; deep?: boolean; capabilities?: string[] } = {}): TickResult {
-    return this.tickInternal(workflow, opts.now ?? nowMs(), opts.deep ?? true, opts.capabilities ?? [], new Set(), 0);
+  tick(
+    workflow: string,
+    opts: {
+      now?: number;
+      deep?: boolean;
+      /**
+       * The claiming crew's capabilities. OMITTING this is not the same as
+       * passing `[]`: omitted means "no filter presented" (a local operator or
+       * test driver — everything matches, as before capabilities existed),
+       * while `[]` means a crew that serves nothing and therefore matches only
+       * capability-silent steps. See `claimMatches`.
+       */
+      capabilities?: string[];
+      /**
+       * Per-offered-capability claim mode, keyed by the COMPOSED capability
+       * (`wise:deep`), supplied by the caller that can see crew bindings — the
+       * hub. Any capability absent from the map is matched by name part
+       * (`DEFAULT_MATCH_MODE`), which is what a caller with no binding
+       * knowledge should get: the permissive tier. The pure engine never
+       * decides a mode, it only enforces the one it is handed.
+       */
+      matchModes?: Record<string, MatchMode>;
+    } = {},
+  ): TickResult {
+    // `capabilities` is passed through AS GIVEN — an omitted filter (undefined)
+    // and an empty list are different claims. See `claimMatches`.
+    return this.tickInternal(
+      workflow,
+      opts.now ?? nowMs(),
+      opts.deep ?? true,
+      opts.capabilities,
+      new Set(),
+      0,
+      undefined,
+      opts.matchModes ?? {},
+    );
   }
 
   /**
@@ -1324,10 +1438,11 @@ export class Engine {
     workflow: string,
     now: number,
     deep: boolean,
-    capabilities: string[],
+    capabilities: string[] | undefined,
     visited: Set<string>,
     depth: number,
     parentEdge?: { parentWf: string; step: StepDef; callsStem: string },
+    matchModes: Record<string, MatchMode> = {},
   ): TickResult {
     if (depth > this.maxCallDepth) {
       throw new Error(
@@ -1338,7 +1453,10 @@ export class Engine {
     }
     if (visited.has(workflow)) return { workflow, orders: [], reaped: 0, deferred: [] };
     visited.add(workflow);
-    const def = this.defFor(workflow);
+    // ONE run-record read per frame yields both the pinned def and the run's
+    // routing modifier. Each frame reads its OWN instance, so a calls: child is
+    // composed against the child's modifier, never the parent's.
+    const { def, modifier } = this.instanceFor(workflow);
     // M2B: maintain calls: child instances before the normal tick/reap/claim cycle.
     this.maintainCalls(workflow, def, now);
     // B1: set inside the frame tx when the parent↔child consistency guard fires;
@@ -1378,12 +1496,12 @@ export class Engine {
       const timeFacts = this.computeTimeFacts(def, workflow, arts, now);
 
       const firings = eligibleFirings(def, arts, timeFacts);
-      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, capabilities);
+      const { selected, deferred } = this.applySchedule(workflow, def, firings, now, arts, capabilities, modifier, matchModes);
 
       const orders: Order[] = [];
       const allDeferred: DeferredFiring[] = [...deferred];
       for (const f of selected) {
-        const claimed = this.claim(workflow, def, f, arts, now);
+        const claimed = this.claim(workflow, def, f, arts, now, modifier);
         if (claimed === 'in-flight') {
           const d: DeferredFiring = { step: f.step, key: f.key, inputs: f.inputs, outputs: f.outputs, reason: 'in-flight' };
           if (f.index !== undefined) d.index = f.index;
@@ -1416,7 +1534,7 @@ export class Engine {
           parentWf: workflow,
           step,
           callsStem: step.produces[0]!.stem,
-        });
+        }, matchModes);
         // orders: flatten; each Order already carries its own `workflow`.
         result.orders.push(...cr.orders);
         // deferred: stamp child-originated entries with the child id, preserving
@@ -1485,18 +1603,33 @@ export class Engine {
 
   /**
    * Per-step cadence + daily budget + parallel cap over the eligible firings.
-   * A2: `capabilities` is the tick caller's optional claim filter — when non-empty, a
-   * step whose own `capabilities` are also non-empty is only schedulable when the two
-   * intersect; a disjoint step's firings are deferred as `'capability-mismatch'`.
+   *
+   * A2: `capabilities` is the tick caller's claim filter, matched against the
+   * step's OFFERED capabilities — the authored list composed with the modifier
+   * this firing will actually be offered under (`wise` + `deep` → `wise:deep`),
+   * which is the same list the order will carry. `claimMatches` owns the rule;
+   * see it for the four cases (no filter presented, capability-silent step,
+   * empty caller list, both non-empty) and for what `matchModes` changes.
+   * A firing this caller may not claim is deferred as `'capability-mismatch'`.
    * Filtering here (before cadence/budget) means a mismatched firing never
    * consumes the caller's slots and never perturbs cadence math.
+   *
+   * The filter is per FIRING, not per step, because §7 escalation is per firing:
+   * on a map step one element may have escalated to `build:deep` while its
+   * siblings are still offered at `build:standard`, and a crew bound to only one
+   * of those must be judged against the compound its own firing carries. With no
+   * escalation authored every firing of a step composes identically, so this
+   * behaves exactly as a per-step filter would.
    */
   private applySchedule(
     workflow: string,
     def: WorkflowDef,
     firings: Firing[],
     now: number,
-    capabilities: string[],
+    arts: ArtifactMap,
+    capabilities: string[] | undefined,
+    modifier: string | undefined,
+    matchModes: Record<string, MatchMode>,
   ): { selected: Firing[]; deferred: DeferredFiring[] } {
     const midnight = localMidnightMs(now);
     const selected: Firing[] = [];
@@ -1509,17 +1642,20 @@ export class Engine {
     };
 
     for (const step of def.steps) {
-      const stepFirings = firings.filter((f) => f.step === step.name);
-      if (stepFirings.length === 0) continue;
+      const all = firings.filter((f) => f.step === step.name);
+      if (all.length === 0) continue;
 
-      // A2: caller capability filter vs. step capabilities. Both non-empty and disjoint →
-      // this caller must not claim the step; defer every firing and skip it
-      // before it touches cadence/budget/slot math.
-      if (capabilities.length > 0 && step.capabilities && step.capabilities.length > 0 &&
-          !step.capabilities.some((l) => capabilities.includes(l))) {
-        for (const f of stepFirings) defer(f, 'capability-mismatch');
-        continue;
+      // A2: caller capability filter vs. this firing's COMPOSED offer. Composed
+      // here, not authored, so a caller bound to `wise:deep` is judged against
+      // what the order will actually carry — including when `deep` came from the
+      // escalation rule rather than the run.
+      const stepFirings: Firing[] = [];
+      for (const f of all) {
+        const offered = composeCapabilities(step.capabilities, this.routingFor(step, f, arts, modifier).modifier);
+        if (claimMatches(offered, capabilities, matchModes)) stepFirings.push(f);
+        else defer(f, 'capability-mismatch');
       }
+      if (stepFirings.length === 0) continue;
 
       const latest = this.store.latestRun(workflow, step.name);
       if (latest && now - latest.createdAt < step.cadenceSecs * 1000) {
@@ -1615,6 +1751,7 @@ export class Engine {
     f: Firing,
     arts: ArtifactMap,
     now: number,
+    modifier?: string,
   ): Order | 'in-flight' | DeferredClaim | null {
     const existing = this.store.getTask(workflow, f.step, f.key);
     if (existing && existing.status === 'claimed') {
@@ -1639,8 +1776,19 @@ export class Engine {
     // CONFLICT DO UPDATE, no history table), so the issued order is unrecoverable
     // later unless captured here; this persisted packet is the replay/eval/paper
     // trail record (buildOrder is deterministic modulo run id).
-    const order = this.buildOrder(def, workflow, runId, f, arts, fp);
+    // §7: the modifier THIS offer composes with — the run's, or the step's
+    // escalation target. Recomputed here rather than passed down from
+    // `applySchedule` so the offer and the filter read the same function on the
+    // same in-tx `arts` snapshot; nothing between them can move.
+    const routing = this.routingFor(this.step(def, f.step), f, arts, modifier);
+    const order = this.buildOrder(def, workflow, runId, f, arts, fp, routing);
     if (typeof order === 'object' && 'deferred' in order) return order;
+    // One history record per rejection episode. Written HERE, not in
+    // `buildOrder` (which is store-pure) and not on the deferred path (an offer
+    // that never became an order promoted nothing). Idempotence is the store's:
+    // the row id is derived from the episode, so the recomputation this rule
+    // performs on every subsequent offer of the same episode inserts nothing.
+    if (routing.escalation) this.recordEscalation(workflow, f, routing.escalation, now);
     // Stamp the run with the tick's clock so cadence/budget compare on one clock.
     this.store.insertRun(runId, { workflow, step: f.step, key: f.key, fingerprint: fp, order, ...(f.cause ? { cause: f.cause } : {}) }, now);
     this.store.putTask({
@@ -1673,6 +1821,7 @@ export class Engine {
     f: Firing,
     arts: ArtifactMap,
     consumedFingerprint: Fingerprint,
+    routing: { modifier?: string; escalation?: EscalationRecord } = {},
   ): Order | DeferredClaim {
     const step = this.step(def, f.step);
     const consumes: Record<string, unknown> = {};
@@ -1768,6 +1917,19 @@ export class Engine {
       owes,
     };
     if (f.index !== undefined) order.index = f.index;
+    // The routing snapshot of THIS offer. `capabilities` is the composed list —
+    // absent on a capability-silent step, since there is nothing to compose
+    // onto. `modifier` is stamped whenever the offer carries one, even for a
+    // capability-silent step, so the brief can surface the grade of service
+    // regardless of how the step routes; on an escalated offer it is the
+    // escalation target, and `escalated` marks it as such so the hub does not
+    // have to diff it against the run record. A claimed order is never
+    // recomposed: composition happens per offer, and this record is what the
+    // shift resolved against.
+    const offered = composeCapabilities(step.capabilities, routing.modifier);
+    if (offered.length > 0) order.capabilities = offered;
+    if (routing.modifier !== undefined) order.modifier = routing.modifier;
+    if (routing.escalation !== undefined) order.escalated = true;
     if (step.model !== undefined) order.model = step.model;
     if (step.executor !== undefined) order.worker = step.executor;
     if (step.judges !== undefined) order.judge = step.judges;
@@ -3053,15 +3215,123 @@ export class Engine {
     return { workflow: childWf, def: childDef.name, done: cs.done, stalled, debts: cs.debts.length };
   }
 
-  private defFor(workflow: string): WorkflowDef {
+  /**
+   * The two per-instance facts a tick needs, from ONE run-record read: the def
+   * this instance is pinned to, and the routing modifier it carries.
+   *
+   * Offer-time composition needs the modifier inside the claim path, where the
+   * run record was not previously in scope. Reading it here — in the same
+   * `getWorkflow` the def resolution already performs, once per tick frame —
+   * keeps that cost at zero extra reads rather than one per claim.
+   */
+  private instanceFor(workflow: string): { def: WorkflowDef; modifier?: string } {
     const wf = this.store.getWorkflow(workflow);
     if (!wf) throw new Error(`no such workflow instance: ${workflow}`);
     // §28: prefer the pinned snapshot taken at create time (or last `adopt`).
     // Rows created before this feature shipped have no snapshot — fall back
     // to today's name-resolution, unchanged. This is the compatibility path,
     // not an error: an un-pinned instance behaves exactly as it always has.
-    if (wf.defSnapshot !== undefined) return wf.defSnapshot;
-    return this.resolveDef(wf.def);
+    const def = wf.defSnapshot !== undefined ? wf.defSnapshot : this.resolveDef(wf.def);
+    return wf.modifier !== undefined ? { def, modifier: wf.modifier } : { def };
+  }
+
+  private defFor(workflow: string): WorkflowDef {
+    return this.instanceFor(workflow).def;
+  }
+
+  /**
+   * §7: the modifier ONE offer of ONE firing composes with — the run's, or the
+   * step's escalation target when the escalation rule has tripped.
+   *
+   * Derived, never stored. Every offer re-evaluates it from the artifact
+   * counters, which is what makes the transition atomic (there is no separate
+   * write that could half-apply), idempotent (recomputing it changes nothing),
+   * and self-reversing (a human `retry` zeroes `judgmentRejects`, and the very
+   * next offer composes with the run's modifier again).
+   *
+   * The trigger is per OUTPUT PATH: the firing escalates when any path it owes
+   * has taken `escalation.after` judgment rejections. For a plain step that is
+   * its single produce; for a map step each element firing escalates on its own
+   * element's count, so one bad element does not promote the whole step.
+   *
+   * Three cases return the run's modifier untouched:
+   *   - the step authors no `escalation:` block — rejections run the normal
+   *     retry path at the same compound until the stall brake;
+   *   - no owed path has reached the threshold yet;
+   *   - the run's modifier ALREADY equals the escalation target — there is
+   *     nothing to promote, so no `escalated` flag and no history record. A
+   *     `deep` run whose builder escalates to `deep` is a no-op, not an event.
+   *
+   * `escalation` on the result is set ONLY in the case that actually changed
+   * the routing; `claim` writes the history record from it.
+   */
+  private routingFor(
+    step: StepDef,
+    f: Firing,
+    arts: ArtifactMap,
+    runModifier: string | undefined,
+  ): { modifier?: string; escalation?: EscalationRecord } {
+    const rule = step.escalation;
+    if (rule === undefined || rule.modifier === runModifier) {
+      return runModifier !== undefined ? { modifier: runModifier } : {};
+    }
+    // `f.outputs` order is the def's produce order, so the reported path is
+    // deterministic when more than one output has crossed the threshold.
+    const path = f.outputs.find((p) => isEscalated(arts.get(p), rule.after));
+    if (path === undefined) return runModifier !== undefined ? { modifier: runModifier } : {};
+    const art = arts.get(path);
+    const escalation: EscalationRecord = {
+      path,
+      to: rule.modifier,
+      after: rule.after,
+      judgmentRejects: art?.judgmentRejects ?? 0,
+      episode: rejectionEpisode(art),
+      atVersion: art?.version ?? 0,
+    };
+    if (runModifier !== undefined) escalation.from = runModifier;
+    return { modifier: rule.modifier, escalation };
+  }
+
+  /**
+   * Write the ONE artifact-history record for an escalation promotion.
+   *
+   * `version: 0` on purpose. The promotion belongs to the artifact across a
+   * whole rejection episode, not to any single produced version — the episode
+   * spans every attempt from the crossing rejection to the human `retry` that
+   * ends it, and those attempts each produce their own version. Anchoring the
+   * record to a version would either mislabel it or (since the row id mixes in
+   * the version) write one row per version, breaking the once-per-episode
+   * guarantee. `getArtifactHistory` collects version-0 events in its
+   * artifact-level `events` bucket, which is exactly where this belongs; the
+   * version the promotion took effect at is in `metadata.atVersion`.
+   *
+   * The dedupe key is `(step, firing key, episode)`. Step and key are in it
+   * because two different steps can owe the same path in different firings; the
+   * episode ordinal is what makes a SECOND promotion, after a human `retry` and
+   * three fresh rejections, a distinct row rather than a swallowed duplicate.
+   */
+  private recordEscalation(workflow: string, f: Firing, e: EscalationRecord, now: number): void {
+    this.store.recordArtifactEvent({
+      workflow,
+      path: e.path,
+      version: 0,
+      action: ESCALATION_ACTION,
+      actor: 'engine',
+      dedupe: `${ESCALATION_ACTION}:${f.step}:${f.key}:${e.episode}`,
+      timestamp: now,
+      reason: `step '${f.step}' escalated to modifier '${e.to}' after ${e.judgmentRejects} judgment rejection(s)`
+        + ` (threshold ${e.after})`,
+      metadata: {
+        step: f.step,
+        key: f.key,
+        to: e.to,
+        after: e.after,
+        judgmentRejects: e.judgmentRejects,
+        episode: e.episode,
+        atVersion: e.atVersion,
+        ...(e.from !== undefined ? { from: e.from } : {}),
+      },
+    });
   }
 
   private step(def: WorkflowDef, name: string): StepDef {

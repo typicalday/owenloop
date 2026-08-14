@@ -338,6 +338,17 @@ export const ORDER_FIELDS = {
   owes: 'required',
   consumesProof: 'optional',
   cause: 'optional',
+  // Routing snapshot of the offer this order was claimed from. `capabilities`
+  // is the COMPOSED list (authored capability + `:<modifier>` where a modifier
+  // applied), `modifier` the value that composed it. Both optional: an
+  // unmodified run on a capability-silent step carries neither, so every order
+  // emitted before this field existed still validates unchanged.
+  capabilities: 'optional',
+  modifier: 'optional',
+  // Set only when `modifier` is the step's escalation target rather than the
+  // run's. Covered by the signature like every other routing field: a claim
+  // made on a recovery re-offer must not be replayable as an ordinary one.
+  escalated: 'optional',
 } as const satisfies FieldManifest<Order>;
 
 /** Indexed access pins the already-emitted nested Order shape without cloning it. */

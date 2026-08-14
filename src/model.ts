@@ -194,6 +194,51 @@ export function isHeld(a: ArtifactData | undefined): boolean {
   return a.reasons.length > 0 && a.reasons[a.reasons.length - 1]!.kind === 'invalidated-irreversible';
 }
 
+/**
+ * §7 escalation trigger: has this artifact been judgment-rejected at least
+ * `after` times in the CURRENT rejection episode?
+ *
+ * Reads `judgmentRejects`, the same counter `isStalled` reads and the same one
+ * `retry` zeroes — so "current episode" needs no separate bookkeeping: a human
+ * `retry` resets the counter and the trigger goes false again by itself.
+ *
+ * The state this tests is derived, never stored. Every offer of the step
+ * re-evaluates it, so the transition cannot half-apply, cannot be lost, and
+ * cannot be applied twice to one offer. It is deliberately independent of
+ * `acceptance`: unlike `isStalled` (which describes a FROZEN artifact and must
+ * only be true while it is sitting rejected), this describes the routing of the
+ * NEXT offer, and by the time that offer is built the artifact has been re-armed
+ * to `owed`.
+ *
+ * `after` comes from the step's authored `escalation.after`. Install validation
+ * (`defs.ts` R2) guarantees `after < effectiveMaxAttempts`, so there is always a
+ * window between "escalate" and "freeze" in which the escalated attempt runs.
+ */
+export function isEscalated(a: ArtifactData | undefined, after: number): boolean {
+  return !!a && a.judgmentRejects >= after;
+}
+
+/**
+ * Which rejection episode this artifact is in: 0 before any human `retry`, 1
+ * after the first, and so on.
+ *
+ * `retry` is the only lever that ends an episode (it zeroes `judgmentRejects`),
+ * and it appends a `'retry'` entry to the append-only reason thread — so
+ * counting those entries yields a monotonic episode ordinal with no new column
+ * and no new state to keep consistent.
+ *
+ * Used to key an escalation's ONE history record per episode. It is not used to
+ * decide anything: the trigger above reads the counter, which is authoritative.
+ * If the thread and the counter ever disagreed, the ordinal would only mislabel
+ * a history row, never change routing.
+ */
+export function rejectionEpisode(a: ArtifactData | undefined): number {
+  if (!a) return 0;
+  let n = 0;
+  for (const r of a.reasons) if (r.action === 'retry') n++;
+  return n;
+}
+
 /** Resolve the effective maxAttempts for a specific produce, falling back to
  *  the owning step's default (§6). `produce` may be undefined if the artifact
  *  couldn't be matched to a produce pattern (defensive; should not happen for

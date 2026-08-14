@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Engine } from '../src/engine.ts';
+import { Engine, ModifierRefusalError } from '../src/engine.ts';
 import type { Order } from '../src/engine.ts';
 import { buildDef, hashDef } from '../src/defs.ts';
 import { createDefInstructionSource } from '../src/order-resolver.ts';
@@ -1666,6 +1666,134 @@ test('§28: createInstance stamps a defSnapshot/defHash matching the def used', 
   assert.ok(row !== undefined);
   assert.deepEqual(row.defSnapshot, delivery);
   assert.equal(row.defHash, hashDef(delivery));
+});
+
+test('§28: the def snapshot pins modifiers: and escalation: across a republish', () => {
+  // The routing vocabulary is part of the pinned shape, not a live lookup. A
+  // republish that widens the modifier set or retargets an escalation must not
+  // reach an instance already created against the old def — otherwise a run
+  // in flight could start escalating to a modifier its own capabilities were
+  // never composed against.
+  const original = def(
+    'graded',
+    [input('proposal')],
+    [
+      step({
+        name: 'builder',
+        consumes: ['proposal'],
+        produces: ['pr'],
+        capabilities: ['build'],
+        escalation: { after: 2, modifier: 'deep' },
+      }),
+    ],
+    ['express', 'deep'],
+  );
+  const { engine, store, setDef } = makeMutableEngine([original]);
+  const wf = engine.createInstance('graded');
+
+  const republished = def(
+    'graded',
+    [input('proposal')],
+    [
+      step({
+        name: 'builder',
+        consumes: ['proposal'],
+        produces: ['pr'],
+        capabilities: ['build'],
+        escalation: { after: 1, modifier: 'exhaustive' },
+      }),
+    ],
+    ['express', 'deep', 'exhaustive'],
+  );
+  setDef(republished);
+
+  const pinned = store.getWorkflow(wf)?.defSnapshot;
+  assert.ok(pinned !== undefined, 'instance carries a pin');
+  assert.deepEqual(pinned.modifiers, ['express', 'deep'], 'pinned modifier set is the original one');
+  assert.deepEqual(
+    pinned.steps[0]!.escalation,
+    { after: 2, modifier: 'deep' },
+    'pinned escalation rule is the original one',
+  );
+  assert.notEqual(hashDef(original), hashDef(republished), 'hashDef distinguishes the two vocabularies');
+
+  // adopt() is the explicit opt-in that moves the instance onto the new shape.
+  engine.adopt(wf);
+  const adopted = store.getWorkflow(wf)?.defSnapshot;
+  assert.deepEqual(adopted!.modifiers, ['express', 'deep', 'exhaustive']);
+  assert.deepEqual(adopted!.steps[0]!.escalation, { after: 1, modifier: 'exhaustive' });
+});
+
+// ---- createInstance modifier: validated against the pin, stored on the row ---
+
+function gradedDef(modifiers?: string[]): WorkflowDef {
+  return def(
+    'graded',
+    [input('proposal')],
+    [step({ name: 'builder', consumes: ['proposal'], produces: ['pr'], capabilities: ['build'] })],
+    modifiers,
+  );
+}
+
+test('createInstance stores a declared modifier on the run record', () => {
+  const { engine, store } = makeEngine([gradedDef(['express', 'deep'])]);
+  const wf = engine.createInstance('graded', { modifier: 'deep' });
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep');
+});
+
+test('createInstance without a modifier leaves the run record unmodified', () => {
+  const { engine, store } = makeEngine([gradedDef(['express', 'deep'])]);
+  const wf = engine.createInstance('graded');
+  assert.equal(store.getWorkflow(wf)?.modifier, undefined);
+});
+
+test('createInstance refuses a modifier the def does not declare', () => {
+  const { engine } = makeEngine([gradedDef(['express', 'deep'])]);
+  assert.throws(
+    () => engine.createInstance('graded', { modifier: 'exhaustive' }),
+    (e: unknown) =>
+      e instanceof ModifierRefusalError &&
+      e.defName === 'graded' &&
+      e.modifier === 'exhaustive' &&
+      // The declared set travels on the error so the hub can render a usable
+      // 400 instead of "invalid modifier".
+      JSON.stringify(e.declared) === JSON.stringify(['express', 'deep']) &&
+      /not declared by workflow 'graded' \(declared: express, deep\)/.test(e.message),
+  );
+});
+
+test('createInstance refuses any modifier on a def that declares none', () => {
+  // A distinct message: the fix is to add `modifiers:` to the def, not to pick
+  // a different value from a set that does not exist.
+  const { engine } = makeEngine([gradedDef()]);
+  assert.throws(
+    () => engine.createInstance('graded', { modifier: 'deep' }),
+    (e: unknown) =>
+      e instanceof ModifierRefusalError &&
+      e.declared.length === 0 &&
+      /declares no modifiers:, so it cannot be started with modifier 'deep'/.test(e.message),
+  );
+});
+
+test('a refused modifier leaves no partial instance behind', () => {
+  const { engine, store } = makeEngine([gradedDef(['express'])]);
+  assert.throws(() => engine.createInstance('graded', { modifier: 'deep' }), ModifierRefusalError);
+  assert.equal(store.listWorkflows().length, 0, 'the creating transaction rolled back');
+});
+
+test('createInstance validates the modifier against the snapshot it pins, not a later republish', () => {
+  // The vocabulary that legitimizes a modifier and the modifier itself are
+  // stamped on the same row in the same transaction. Republishing the def with
+  // a narrower set afterwards cannot retroactively invalidate a live run.
+  const { engine, store, setDef } = makeMutableEngine([gradedDef(['express', 'deep'])]);
+  const wf = engine.createInstance('graded', { modifier: 'deep' });
+
+  setDef(gradedDef(['express']));
+
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep', 'the live run keeps its modifier');
+  assert.deepEqual(store.getWorkflow(wf)?.defSnapshot?.modifiers, ['express', 'deep'], 'and the set that legitimized it');
+  // A NEW instance resolves the republished def and is held to the narrower set.
+  assert.throws(() => engine.createInstance('graded', { modifier: 'deep' }), ModifierRefusalError);
 });
 
 test('§28: defFor falls back to name-resolution for a legacy row with no snapshot', () => {

@@ -1852,8 +1852,11 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         const tickOpts: { now?: number; deep?: boolean; capabilities?: string[] } = {};
         if (now !== undefined) tickOpts.now = now;
         if (flag(args, 'shallow')) tickOpts.deep = false;
-        // A2: repeatable --capability narrows the claim to steps whose capabilities
-        // intersect the caller's; absent = claim everything (today's behavior).
+        // A2: repeatable --capability narrows the claim to steps the caller's
+        // capabilities match. Absent = no filter presented, so a local operator
+        // still claims everything — NOT the same as presenting an empty list,
+        // which is a crew that serves nothing and matches only capability-silent
+        // steps. Only set the key when the operator actually named capabilities.
         const capabilities = all(args, 'capability');
         if (capabilities.length > 0) tickOpts.capabilities = capabilities;
         print(io, engine.tick(wf, tickOpts));

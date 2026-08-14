@@ -21,6 +21,7 @@ import type {
   ArtifactEvent,
   ArtifactHistory,
   ArtifactVersion,
+  Author,
   Fingerprint,
   Order,
   ReasonEntry,
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS workflow (
   def         TEXT NOT NULL,
   title       TEXT,
   params      TEXT NOT NULL DEFAULT '{}',
+  modifier    TEXT,
   created_at  INTEGER NOT NULL
 );
 
@@ -186,8 +188,13 @@ CREATE TABLE IF NOT EXISTS meta (
  * driver ticks cannot each insert a child for the same `calls:` step.
  *
  * Bumped to '9' for immutable artifact payload/version and lifecycle-event history.
+ *
+ * Bumped to '10' for the routing modifier: the `workflow` table gains a
+ * nullable `modifier` column (see `migrate()`). Additive and un-backfilled —
+ * NULL on every existing row means "unmodified run", which is the correct
+ * reading of an instance created before modifiers existed.
  */
-const SCHEMA_VERSION = '9';
+const SCHEMA_VERSION = '10';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -429,6 +436,7 @@ interface WorkflowRowRaw {
   produced_by_path: string | null;
   def_snapshot: string | null;
   def_hash: string | null;
+  modifier: string | null;
   created_at: number;
 }
 
@@ -450,6 +458,10 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
   });
   if (defSnapshot !== undefined) out.defSnapshot = defSnapshot;
   if (r.def_hash !== null) out.defHash = r.def_hash;
+  // NULL (a pre-modifier row, or a run started without one) maps to absent,
+  // never to an empty string — 'unmodified run' and 'modifier ""' must not
+  // become the same thing downstream, where '' would compose 'build:'.
+  if (r.modifier !== null) out.modifier = r.modifier;
   return out;
 }
 
@@ -613,6 +625,14 @@ export class Store {
     if (!wfCols.some((c) => c.name === 'def_hash')) {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN def_hash TEXT`);
     }
+    // Routing modifier: the ONE modifier this instance carries, set once at
+    // creation and never written again. NULL on every pre-existing row, which
+    // is exactly right — an instance created before modifiers existed is an
+    // unmodified run and every step is offered on bare capabilities. No
+    // backfill: there is no value to invent.
+    if (!wfCols.some((c) => c.name === 'modifier')) {
+      this.db.exec(`ALTER TABLE workflow ADD COLUMN modifier TEXT`);
+    }
 
     // Only a genuine pre-v8 -> v8 upgrade may backfill the current projection's
     // reason thread. Re-opening an already-v8 database must not manufacture a
@@ -677,8 +697,8 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO workflow
-           (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, modifier, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -689,6 +709,7 @@ export class Store {
         producedBy?.parentPath ?? null,
         toJson(data.defSnapshot),
         data.defHash ?? null,
+        data.modifier ?? null,
         at,
       );
     return this.getWorkflow(id) as WorkflowRow;
@@ -868,6 +889,51 @@ export class Store {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`,
     ).run(id, event.workflow, event.path, event.version, event.action, event.actor, event.reason ?? null,
       event.kind ?? null, toJson(event.metadata), event.timestamp);
+  }
+
+  /**
+   * Append one engine-authored history record for an artifact, WITHOUT touching
+   * the artifact row.
+   *
+   * `putArtifact` already writes an event per lifecycle change, but only when
+   * the artifact's own data changed. Some engine decisions are about an
+   * artifact without changing it — the escalation transition is the first: the
+   * routing of the next offer changes, the artifact does not. Those need a
+   * record too, and this is the only way to write one.
+   *
+   * **Idempotent by construction.** The row id is derived from
+   * `(workflow, path, version, dedupe)` and the insert is
+   * `ON CONFLICT(id) DO NOTHING`, so a caller that recomputes the same decision
+   * on every tick — as the escalation rule does, since it is derived state and
+   * not a stored flag — writes exactly one row. The caller owns `dedupe`: make
+   * it identify the EPISODE, not the moment.
+   *
+   * Pass `version: 0` for a record that belongs to the artifact as a whole
+   * rather than to one produced version; `getArtifactHistory` surfaces those in
+   * its artifact-level `events` bucket. Detail goes in `metadata`.
+   */
+  recordArtifactEvent(event: {
+    workflow: string;
+    path: string;
+    version: number;
+    action: string;
+    actor: Author;
+    dedupe: string;
+    timestamp: number;
+    reason?: string;
+    metadata?: Record<string, unknown>;
+  }): void {
+    this.insertArtifactEvent({
+      workflow: event.workflow,
+      path: event.path,
+      version: event.version,
+      action: event.action,
+      actor: event.actor,
+      timestamp: event.timestamp,
+      key: event.dedupe,
+      ...(event.reason !== undefined ? { reason: event.reason } : {}),
+      ...(event.metadata !== undefined ? { metadata: event.metadata } : {}),
+    });
   }
 
   /** Returns history for exactly one artifact; list/status reads stay projection-only. */

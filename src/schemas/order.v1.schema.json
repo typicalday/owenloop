@@ -101,6 +101,20 @@
       }
     },
     "consumesProof": { "type": "string" },
-    "cause": { "type": "string", "enum": ["inputsGreen", "allGreen", "idle"] }
+    "cause": { "type": "string", "enum": ["inputsGreen", "allGreen", "idle"] },
+    "capabilities": {
+      "type": "array",
+      "description": "The composed routing capabilities this order was offered under: each authored step capability, suffixed ':<modifier>' where a modifier applied. A snapshot of the offer — a claimed order is never recomposed.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "modifier": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The modifier that composed 'capabilities'. Normally the run's modifier; on an escalated re-offer, the escalating step's target. Absent means the order was offered on bare capabilities."
+    },
+    "escalated": {
+      "const": true,
+      "description": "Present only when 'modifier' is the step's escalation target rather than the run's own modifier — a recovery re-offer after escalation.after judgment rejections. Absent on every ordinary offer; never false."
+    }
   }
 }

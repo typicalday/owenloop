@@ -27,7 +27,10 @@ import { parse as parseYaml } from 'yaml';
 import { parseConsume, parseProduce, parseWorkdirFrom } from './paths.ts';
 import { parseDurationMs, parseDurationSecs } from './util.ts';
 import { assertValidSchema } from './schema.ts';
-import type { Acceptance, EffectDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
+// The separator lives with composition/matching (capabilities.ts); the parser
+// only enforces that an AUTHORED name never contains it.
+import { MODIFIER_SEPARATOR } from './capabilities.ts';
+import type { Acceptance, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
 
@@ -79,8 +82,9 @@ interface RawJudge {
   executor?: unknown;
   command?: unknown;
   spec?: unknown;
+  capabilities?: unknown;
 }
-const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay', 'executor', 'command', 'spec'] as const;
+const RAW_JUDGE_KEYS = ['name', 'body', 'bodyFile', 'model', 'inputs', 'cadence', 'maxRunsPerDay', 'executor', 'command', 'spec', 'capabilities'] as const;
 
 interface RawStep {
   name?: unknown;
@@ -118,6 +122,8 @@ interface RawStep {
   command?: unknown;
   /** Optional opaque config object for a non-agent/non-command executor type. */
   spec?: unknown;
+  /** Per-step escalation rule: `{ after: <n>, modifier: <declared value> }`. */
+  escalation?: unknown;
 }
 /** Keys valid on a normal (non-calls:, non-include:) step entry. */
 const RAW_STEP_KEYS = [
@@ -125,6 +131,7 @@ const RAW_STEP_KEYS = [
   'maxRunsPerDay', 'parallel', 'maxAttempts', 'maxSchemaFailures', 'model',
   'workdir', 'workdirFrom', 'terminal', 'effect', 'on', 'idleAfter', 'body', 'bodyFile',
   'calls', 'reapTtl', 'capabilities', 'maxLease', 'x', 'executor', 'command', 'spec',
+  'escalation',
 ] as const;
 
 /** Duck-typed sniffer for a raw calls: directive (Mode 2). */
@@ -161,8 +168,10 @@ interface RawDef {
   x?: unknown;
   /** Optional def-level allow-list of executor values (typo guard for step/judge `executor:`). */
   executors?: unknown;
+  /** Optional declared modifier vocabulary (unordered set of plain names). */
+  modifiers?: unknown;
 }
-const RAW_DEF_KEYS = ['name', 'title', 'description', 'inputs', 'steps', 'outputs', 'invariants', 'engine', 'x', 'executors'] as const;
+const RAW_DEF_KEYS = ['name', 'title', 'description', 'inputs', 'steps', 'outputs', 'invariants', 'engine', 'x', 'executors', 'modifiers'] as const;
 
 // ---- defaults ----------------------------------------------------------------
 
@@ -200,6 +209,78 @@ function asStringArray(v: unknown, ctx: string): string[] {
   }
   return v as string[];
 }
+/**
+ * A routing capability as an author may write it: no separator, no surrounding
+ * whitespace, non-empty.
+ *
+ * Deliberately NOT a full charset rule. Capability names are opaque routing
+ * labels shared with a hub whose own validation is length + non-empty + no
+ * `personal:` prefix; imposing a charset here would reject names that already
+ * bind successfully today. The one new restriction is the reserved separator.
+ */
+function assertAuthoredCapability(value: string, ctx: string): void {
+  if (value.trim().length === 0) {
+    throw new DefError(`${ctx}: capability names must not be empty or whitespace`);
+  }
+  if (value.includes(MODIFIER_SEPARATOR)) {
+    throw new DefError(
+      `${ctx}: capability '${value}' must not contain '${MODIFIER_SEPARATOR}' — ` +
+      'the suffix position is reserved for the modifier the engine composes at offer time ' +
+      "(a run carrying 'deep' turns the authored capability 'wise' into 'wise:deep')",
+    );
+  }
+}
+
+/**
+ * Parse the def-level `modifiers:` block into a validated, order-insensitive
+ * set of plain names.
+ *
+ * Order is NOT preserved as meaning: the list is a vocabulary, and nothing in
+ * the engine compares two modifiers or treats one as higher than another. The
+ * array shape is only YAML's way of writing a set.
+ */
+function parseModifiers(v: unknown, ctx: string): string[] {
+  const values = asStringArray(v, ctx);
+  if (values.length === 0) {
+    throw new DefError(`${ctx} must list at least one modifier, or be omitted entirely`);
+  }
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (value.trim().length === 0) {
+      throw new DefError(`${ctx}: modifier names must not be empty or whitespace`);
+    }
+    if (value.includes(MODIFIER_SEPARATOR)) {
+      throw new DefError(
+        `${ctx}: modifier '${value}' must not contain '${MODIFIER_SEPARATOR}' — ` +
+        'it is the separator the engine composes with',
+      );
+    }
+    if (seen.has(value)) throw new DefError(`${ctx}: duplicate modifier '${value}'`);
+    seen.add(value);
+  }
+  return values;
+}
+
+/** Parse a step's `escalation:` block. Cross-checks against the def's declared
+ *  modifier set and the step's effective maxAttempts happen in `validateDef`,
+ *  which is the first place that sees the whole def. */
+function parseEscalation(v: unknown, ctx: string): EscalationDef {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) {
+    throw new DefError(`${ctx} must be a mapping of { after, modifier }`);
+  }
+  const raw = v as Record<string, unknown>;
+  assertNoUnknownKeys(raw, ['after', 'modifier'] as const, ctx);
+  if (raw['after'] === undefined) throw new DefError(`${ctx} must set 'after'`);
+  if (raw['modifier'] === undefined) throw new DefError(`${ctx} must set 'modifier'`);
+  const after = asNumber(raw['after'], 0, `${ctx}.after`);
+  if (!Number.isInteger(after) || after < 1) {
+    throw new DefError(`${ctx}.after must be a positive integer (rejection count that triggers the escalated re-offer)`);
+  }
+  const modifier = asString(raw['modifier'], `${ctx}.modifier`);
+  if (modifier.trim().length === 0) throw new DefError(`${ctx}.modifier must not be empty`);
+  return { after, modifier };
+}
+
 function asNumber(v: unknown, fallback: number, ctx: string): number {
   if (v === undefined) return fallback;
   if (typeof v !== 'number' || !Number.isFinite(v)) throw new DefError(`${ctx} must be a number`);
@@ -383,6 +464,16 @@ function parseJudges(v: unknown, ctx: string, baseDir?: string): NonNullable<Pro
     if (raw.executor !== undefined) judge.executor = asString(raw.executor, `judge '${name}'.executor`);
     if (raw.command !== undefined) judge.command = asString(raw.command, `judge '${name}'.command`);
     if (raw.spec !== undefined) judge.spec = asExtension(raw.spec, `judge '${name}'.spec`);
+    if (raw.capabilities !== undefined) {
+      const caps = asStringArray(raw.capabilities, `judge '${name}'.capabilities`);
+      if (caps.length === 0) {
+        throw new DefError(
+          `judge '${name}'.capabilities must not be empty — omit the key to inherit the producing step's capabilities`,
+        );
+      }
+      for (const cap of caps) assertAuthoredCapability(cap, `judge '${name}'.capabilities`);
+      judge.capabilities = caps;
+    }
     return judge;
   });
 }
@@ -694,6 +785,7 @@ export function buildDef(raw: unknown, source?: string, baseDir?: string): Workf
   }
   if (r.x !== undefined) def.x = asExtension(r.x, `workflow '${name}'.x`);
   if (r.executors !== undefined) def.executors = asStringArray(r.executors, `workflow '${name}'.executors`);
+  if (r.modifiers !== undefined) def.modifiers = parseModifiers(r.modifiers, `workflow '${name}'.modifiers`);
   return def;
 }
 
@@ -920,6 +1012,7 @@ function synthesizeJudgeSteps(
   pat: ProducePattern,
   producerConsumeStems: string[],
   producerX?: Record<string, unknown>,
+  producerCapabilities?: string[],
 ): StepDef[] {
   if (!pat.judges || pat.judges.length === 0) return [];
   return pat.judges.map((j): StepDef => {
@@ -944,6 +1037,15 @@ function synthesizeJudgeSteps(
     // carrier. Clone per judge so neither producer nor sibling mutations can
     // alter another synthesized step. Absence stays absence: no empty x bag.
     if (producerX !== undefined) step.x = structuredClone(producerX);
+    // Routing: an explicit judge `capabilities:` wins; otherwise the judge
+    // INHERITS the producer's. Without inheritance every synthesized judge
+    // would be capability-silent, and a capability-silent step bypasses the
+    // claim filter entirely — any polling crew could claim the judge that
+    // gates work routed deliberately to one crew. Copied, not shared, so a
+    // later mutation of either step cannot reach the other (same contract as
+    // the `x` clone above).
+    if (j.capabilities !== undefined) step.capabilities = [...j.capabilities];
+    else if (producerCapabilities !== undefined) step.capabilities = [...producerCapabilities];
     if (j.model !== undefined) step.model = j.model;
     if (j.executor !== undefined) step.executor = j.executor;
     if (j.command !== undefined) step.command = j.command;
@@ -1091,7 +1193,11 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
   // any caller), mirroring the groups.length > 0 pattern below.
   if (rl.capabilities !== undefined) {
     const ls = asStringArray(rl.capabilities, `step '${name}'.capabilities`);
+    for (const cap of ls) assertAuthoredCapability(cap, `step '${name}'.capabilities`);
     if (ls.length > 0) step.capabilities = ls;
+  }
+  if (rl.escalation !== undefined) {
+    step.escalation = parseEscalation(rl.escalation, `step '${name}'.escalation`);
   }
   // A3: per-step max total lease lifetime (duration string, same as reapTtl).
   if (rl.maxLease !== undefined) {
@@ -1105,7 +1211,9 @@ function buildStep(rl: RawStep, i: number, baseDir?: string): StepDef[] {
     }
   }
   const producerConsumeStems = consumes.map((c) => c.stem);
-  const judgeSteps = producesPatterns.flatMap((p) => synthesizeJudgeSteps(name, p, producerConsumeStems, step.x));
+  const judgeSteps = producesPatterns.flatMap((p) =>
+    synthesizeJudgeSteps(name, p, producerConsumeStems, step.x, step.capabilities),
+  );
   return [step, ...judgeSteps];
 }
 
@@ -1456,6 +1564,82 @@ export function validateDef(def: WorkflowDef): string[] {
           errors.push(`step '${l.name}': stem '${stem}' is claimed by more than one group`);
         }
         claimedStems.add(stem);
+      }
+    }
+  }
+
+  // ---- routing modifiers and escalation ------------------------------------
+  //
+  // Three separate rules, each with its own precondition. They are grouped
+  // because they all read `def.modifiers`, not because they are one check.
+  //
+  //   R1  escalation.modifier must be a member of the def's declared set, and
+  //       a step may not carry `escalation:` at all in a def that declares no
+  //       `modifiers:` — there is no target vocabulary for it to draw from.
+  //   R2  escalation.after must be strictly less than the effective maxAttempts
+  //       of EVERY produce on the step. At judgmentRejects >= maxAttempts the
+  //       engine freezes the artifact (`model.ts` isStalled), so a rule
+  //       authored at or past that threshold re-offers a step that can never
+  //       run again. Taking the MINIMUM across produces is the conservative
+  //       reading: the step is dead as soon as its shortest-fused produce
+  //       freezes, whatever the others allow.
+  //   R3  in a def that declares `modifiers:`, every command step must author
+  //       `capabilities`. A capability-silent step bypasses the claim filter
+  //       (`engine.ts` A2) entirely, so any polling crew could claim it —
+  //       and, under composition, it would never receive a modifier suffix
+  //       either, silently opting out of the routing the def just declared.
+  //
+  //       SCOPED DELIBERATELY to modifier-declaring defs. The plan document
+  //       states this rule unconditionally, but every def that predates
+  //       modifiers (examples/workflows/command-executor.yaml among them) has
+  //       capability-silent command steps, and the same document promises
+  //       "defs without `modifiers:` run exactly as today". Opting into the
+  //       new routing vocabulary is what turns the stricter rule on.
+  const declaredModifiers = new Set(def.modifiers ?? []);
+  for (const l of def.steps) {
+    if (l.escalation === undefined) continue;
+    if (declaredModifiers.size === 0) {
+      errors.push(
+        `step '${l.name}': escalation is set but workflow '${def.name}' declares no modifiers:; ` +
+        'escalation.modifier must name a declared modifier',
+      );
+    } else if (!declaredModifiers.has(l.escalation.modifier)) {
+      errors.push(
+        `step '${l.name}': escalation.modifier '${l.escalation.modifier}' is not in workflow ` +
+        `'${def.name}'.modifiers (${[...declaredModifiers].join(', ')})`,
+      );
+    }
+    // An escalated re-offer is the same step's capabilities composed with the
+    // target modifier. A step with no capabilities composes nothing, so the
+    // re-offer would be byte-identical to the original offer: a rule that can
+    // never route anywhere new.
+    if (l.capabilities === undefined || l.capabilities.length === 0) {
+      errors.push(
+        `step '${l.name}': escalation is set but the step authors no capabilities; ` +
+        'an escalated re-offer composes <capability>:<modifier>, so there is nothing to escalate',
+      );
+    }
+    const attemptCeilings = l.produces.length > 0
+      ? l.produces.map((p) => p.maxAttempts ?? l.maxAttempts)
+      : [l.maxAttempts];
+    const ceiling = Math.min(...attemptCeilings);
+    if (l.escalation.after >= ceiling) {
+      errors.push(
+        `step '${l.name}': escalation.after (${l.escalation.after}) must be strictly less than ` +
+        `the step's effective maxAttempts (${ceiling}); at ${ceiling} rejections the artifact freezes, ` +
+        'so the escalated re-offer could never run',
+      );
+    }
+  }
+  if (declaredModifiers.size > 0) {
+    for (const l of def.steps) {
+      if ((l.executor ?? 'agent') !== 'command') continue;
+      if (l.capabilities === undefined || l.capabilities.length === 0) {
+        errors.push(
+          `step '${l.name}': workflow '${def.name}' declares modifiers:, so every command step must ` +
+          'author capabilities: — a capability-silent step is claimable by any crew and never ' +
+          'receives a modifier',
+        );
       }
     }
   }

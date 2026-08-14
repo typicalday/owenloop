@@ -2777,6 +2777,321 @@ test('parseDef rejects a non-string entry in capabilities:', () => {
   );
 });
 
+// ---- modifiers: and escalation: (routing vocabulary) -------------------------
+//
+// A modifier is a plain name a run carries; the engine composes it onto each
+// authored capability at offer time as '<capability>:<modifier>'. Nothing here
+// is ordered — `modifiers` is a SET, and escalation names an explicit target,
+// never "the next rung up".
+
+test('parseDef parses a top-level modifiers: set into WorkflowDef.modifiers', () => {
+  const d = parseDef({
+    name: 'graded',
+    modifiers: ['express', 'standard', 'deep'],
+    inputs: [{ name: 'seed' }],
+    steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], capabilities: ['build'] }],
+  });
+  assert.deepEqual(d.modifiers, ['express', 'standard', 'deep']);
+});
+
+test('parseDef leaves modifiers absent when the def declares none', () => {
+  const d = parseDef({
+    name: 'plain',
+    inputs: [{ name: 'seed' }],
+    steps: [{ name: 'run', consumes: ['seed'], produces: ['out'] }],
+  });
+  assert.equal(d.modifiers, undefined);
+});
+
+test('parseDef rejects an empty modifiers: [] (omit the key instead)', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'graded',
+        modifiers: [],
+        inputs: [{ name: 'seed' }],
+        steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], capabilities: ['build'] }],
+      }),
+    (e: unknown) => e instanceof DefError && /must list at least one modifier, or be omitted entirely/.test((e as Error).message),
+  );
+});
+
+test('parseDef rejects a duplicate modifier (a set, not a list)', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'graded',
+        modifiers: ['deep', 'deep'],
+        inputs: [{ name: 'seed' }],
+        steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], capabilities: ['build'] }],
+      }),
+    (e: unknown) => e instanceof DefError && /duplicate modifier 'deep'/.test((e as Error).message),
+  );
+});
+
+test("parseDef rejects ':' in a modifier name — it is the separator the engine composes with", () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'graded',
+        modifiers: ['deep:er'],
+        inputs: [{ name: 'seed' }],
+        steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], capabilities: ['build'] }],
+      }),
+    (e: unknown) => e instanceof DefError && /modifier 'deep:er' must not contain ':'/.test((e as Error).message),
+  );
+});
+
+test("parseDef rejects ':' in an authored capability name — the suffix position is the engine's", () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'graded',
+        inputs: [{ name: 'seed' }],
+        steps: [{ name: 'run', consumes: ['seed'], produces: ['out'], capabilities: ['build:deep'] }],
+      }),
+    (e: unknown) => e instanceof DefError && /capability 'build:deep' must not contain ':'/.test((e as Error).message),
+  );
+});
+
+test('parseDef parses step escalation: { after, modifier }', () => {
+  const d = parseDef({
+    name: 'graded',
+    modifiers: ['deep'],
+    inputs: [{ name: 'seed' }],
+    steps: [{
+      name: 'run',
+      consumes: ['seed'],
+      produces: ['out'],
+      capabilities: ['build'],
+      escalation: { after: 2, modifier: 'deep' },
+    }],
+  });
+  assert.deepEqual(d.steps[0]!.escalation, { after: 2, modifier: 'deep' });
+});
+
+test('parseDef rejects escalation.modifier that is not in the declared modifiers set', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'graded',
+        modifiers: ['express', 'deep'],
+        inputs: [{ name: 'seed' }],
+        steps: [{
+          name: 'run',
+          consumes: ['seed'],
+          produces: ['out'],
+          capabilities: ['build'],
+          escalation: { after: 2, modifier: 'thorough' },
+        }],
+      }),
+    (e: unknown) => e instanceof DefError && /escalation\.modifier 'thorough' is not in workflow 'graded'\.modifiers \(express, deep\)/.test((e as Error).message),
+  );
+});
+
+test('parseDef rejects escalation: in a def that declares no modifiers:', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'plain',
+        inputs: [{ name: 'seed' }],
+        steps: [{
+          name: 'run',
+          consumes: ['seed'],
+          produces: ['out'],
+          capabilities: ['build'],
+          escalation: { after: 2, modifier: 'deep' },
+        }],
+      }),
+    (e: unknown) => e instanceof DefError && /escalation is set but workflow 'plain' declares no modifiers:/.test((e as Error).message),
+  );
+});
+
+test('parseDef rejects escalation.after >= the step default maxAttempts (3) — the artifact freezes first', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'graded',
+        modifiers: ['deep'],
+        inputs: [{ name: 'seed' }],
+        steps: [{
+          name: 'run',
+          consumes: ['seed'],
+          produces: ['out'],
+          capabilities: ['build'],
+          escalation: { after: 3, modifier: 'deep' },
+        }],
+      }),
+    (e: unknown) => e instanceof DefError && /escalation\.after \(3\) must be strictly less than the step's effective maxAttempts \(3\)/.test((e as Error).message),
+  );
+});
+
+test('parseDef measures escalation.after against the MINIMUM per-produce maxAttempts', () => {
+  // The step allows 5 attempts, but the `tight` produce overrides to 2. The
+  // step is dead once `tight` freezes, so 2 is the ceiling that applies.
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'graded',
+        modifiers: ['deep'],
+        inputs: [{ name: 'seed' }],
+        steps: [{
+          name: 'run',
+          consumes: ['seed'],
+          maxAttempts: 5,
+          produces: ['loose', { name: 'tight', maxAttempts: 2 }],
+          capabilities: ['build'],
+          escalation: { after: 4, modifier: 'deep' },
+        }],
+      }),
+    (e: unknown) => e instanceof DefError && /escalation\.after \(4\) must be strictly less than the step's effective maxAttempts \(2\)/.test((e as Error).message),
+  );
+});
+
+test('parseDef rejects escalation: on a capability-silent step (nothing to compose)', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'graded',
+        modifiers: ['deep'],
+        inputs: [{ name: 'seed' }],
+        steps: [{
+          name: 'run',
+          consumes: ['seed'],
+          produces: ['out'],
+          escalation: { after: 2, modifier: 'deep' },
+        }],
+      }),
+    (e: unknown) => e instanceof DefError && /escalation is set but the step authors no capabilities/.test((e as Error).message),
+  );
+});
+
+test('parseDef rejects a malformed escalation: block', () => {
+  for (const bad of [
+    { after: 0, modifier: 'deep' },
+    { after: 1.5, modifier: 'deep' },
+    { after: 1 },
+    { modifier: 'deep' },
+    { after: 1, modifier: 'deep', extra: true },
+    'deep',
+  ]) {
+    assert.throws(
+      () =>
+        parseDef({
+          name: 'graded',
+          modifiers: ['deep'],
+          inputs: [{ name: 'seed' }],
+          steps: [{
+            name: 'run',
+            consumes: ['seed'],
+            produces: ['out'],
+            capabilities: ['build'],
+            escalation: bad,
+          }],
+        }),
+      (e: unknown) => e instanceof DefError,
+      `escalation ${JSON.stringify(bad)} should be rejected`,
+    );
+  }
+});
+
+test('a modifier-declaring def requires every command step to author capabilities', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'graded',
+        modifiers: ['deep'],
+        inputs: [{ name: 'seed' }],
+        steps: [
+          { name: 'run', consumes: ['seed'], produces: ['out'], executor: 'command', command: './check.sh' },
+        ],
+      }),
+    (e: unknown) => e instanceof DefError && /declares modifiers:, so every command step must author capabilities:/.test((e as Error).message),
+  );
+});
+
+test('a def WITHOUT modifiers: still accepts a capability-silent command step (compatibility)', () => {
+  const d = parseDef({
+    name: 'plain',
+    inputs: [{ name: 'seed' }],
+    steps: [
+      { name: 'run', consumes: ['seed'], produces: ['out'], executor: 'command', command: './check.sh' },
+    ],
+  });
+  assert.equal(d.steps[0]!.capabilities, undefined);
+});
+
+// ---- judge capability inheritance -------------------------------------------
+//
+// A synthesized judge step that authored no capabilities would be
+// capability-silent, and a capability-silent step bypasses the claim filter
+// entirely — any polling crew could claim the judge gating work that was
+// deliberately routed to one crew.
+
+test('a synthesized judge step INHERITS the producing step capabilities', () => {
+  const d = parseDef({
+    name: 'judged',
+    inputs: [{ name: 'seed' }],
+    steps: [{
+      name: 'run',
+      consumes: ['seed'],
+      capabilities: ['wise'],
+      produces: [{ name: 'out', judges: [{ name: 'gate', body: 'judge it' }] }],
+    }],
+  });
+  const judge = d.steps.find((s) => s.judges === 'out');
+  assert.ok(judge, 'judge step was synthesized');
+  assert.deepEqual(judge.capabilities, ['wise']);
+  // copied, not shared — mutating one must not reach the other
+  assert.notEqual(judge.capabilities, d.steps[0]!.capabilities);
+});
+
+test('an explicit judge capabilities: overrides inheritance', () => {
+  const d = parseDef({
+    name: 'judged',
+    inputs: [{ name: 'seed' }],
+    steps: [{
+      name: 'run',
+      consumes: ['seed'],
+      capabilities: ['build'],
+      produces: [{ name: 'out', judges: [{ name: 'gate', body: 'judge it', capabilities: ['wise'] }] }],
+    }],
+  });
+  const judge = d.steps.find((s) => s.judges === 'out');
+  assert.deepEqual(judge!.capabilities, ['wise']);
+});
+
+test('an explicitly EMPTY judge capabilities: [] is rejected (omit it to inherit)', () => {
+  assert.throws(
+    () =>
+      parseDef({
+        name: 'judged',
+        inputs: [{ name: 'seed' }],
+        steps: [{
+          name: 'run',
+          consumes: ['seed'],
+          capabilities: ['build'],
+          produces: [{ name: 'out', judges: [{ name: 'gate', body: 'judge it', capabilities: [] }] }],
+        }],
+      }),
+    (e: unknown) => e instanceof DefError && /omit the key to inherit the producing step's capabilities/.test((e as Error).message),
+  );
+});
+
+test('a capability-silent producer leaves its judge capability-silent too (unchanged behavior)', () => {
+  const d = parseDef({
+    name: 'judged',
+    inputs: [{ name: 'seed' }],
+    steps: [{
+      name: 'run',
+      consumes: ['seed'],
+      produces: [{ name: 'out', judges: [{ name: 'gate', body: 'judge it' }] }],
+    }],
+  });
+  const judge = d.steps.find((s) => s.judges === 'out');
+  assert.equal(judge!.capabilities, undefined);
+});
+
 test('parseDef parses step maxLease: duration string into StepDef.maxLeaseMs', () => {
   const d = parseDef({
     name: 'clamped',
