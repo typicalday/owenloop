@@ -640,6 +640,52 @@ const CASES: Case[] = [
     },
   },
   {
+    // The neutral vocabulary exists so ONE authored step can run on either
+    // adapter. Each vendor spells these three positions differently and each
+    // adapter refuses the other's spelling; the neutral words are what a def
+    // writes instead. This asserts the Codex half of all three translations —
+    // the Claude half is the companion test in `harness-claude.test.ts`.
+    //
+    // The distinctions are load-bearing: `auto-safe` must NOT collapse into
+    // `never`. `on-request` can still stop and ask, and a def that picked
+    // `auto-safe` asked for exactly that.
+    //
+    // Silent, like C5: translating a neutral value is not a diagnostic event.
+    name: 'C5a full-access translates to approvalPolicy never, silently',
+    bag: { permissionMode: 'full-access' },
+    expect(p, events) {
+      assert.equal(p['approvalPolicy'], 'never');
+      assert.equal(events.length, 0);
+    },
+  },
+  {
+    name: 'C5b auto-safe translates to on-request, not never',
+    bag: { permissionMode: 'auto-safe' },
+    expect(p, events) {
+      assert.equal(p['approvalPolicy'], 'on-request');
+      assert.equal(events.length, 0);
+    },
+  },
+  {
+    name: 'C5c ask translates to untrusted',
+    bag: { permissionMode: 'ask' },
+    expect(p, events) {
+      assert.equal(p['approvalPolicy'], 'untrusted');
+      assert.equal(events.length, 0);
+    },
+  },
+  {
+    // The approval axis and the sandbox axis are independent: `full-access`
+    // says nobody approves, NOT that nothing is fenced. A def that wants an
+    // unfenced filesystem states that separately.
+    name: 'C5d full-access leaves the sandbox to the filesystem field',
+    bag: { permissionMode: 'full-access' },
+    expect(p) {
+      assert.equal(p['approvalPolicy'], 'never');
+      assert.equal(p['sandbox'], 'workspace-write', 'the default sandbox, not danger-full-access');
+    },
+  },
+  {
     name: 'C6 extra MCP servers merge in, and owenloop wins a name clash',
     bag: {
       filesystem: 'unrestricted',
@@ -766,6 +812,38 @@ test('C10b Codex refuses explicit neutral filesystem restrictions', () => {
       new RegExp(`filesystem '${filesystem}'.*unsupported`),
     );
   }
+});
+
+/**
+ * The regression this locks: `permissionMode: bypassPermissions` — another
+ * adapter's never-prompt word — was refused here with
+ * `incompatible-harness-policy`, which pinned every mutating delivery step to
+ * one vendor. The neutral values must NOT be refused; the other adapter's
+ * vendor word must still be, because accepting it would mean this adapter
+ * silently guessing at another vendor's vocabulary.
+ */
+test('C10b2 preflight accepts every neutral mode and still refuses another vendor vocabulary', () => {
+  for (const mode of ['ask', 'auto-safe', 'full-access']) {
+    assert.deepEqual(
+      codexAdapter.preflight(normalizeStepPermissions({ permissionMode: mode })),
+      [],
+      `${mode} must be accepted`,
+    );
+  }
+
+  const foreign = codexAdapter.preflight(
+    normalizeStepPermissions({ permissionMode: 'bypassPermissions' }),
+  );
+  assert.deepEqual(foreign.map((issue) => issue.field), ['permissionMode']);
+  assert.match(foreign[0]?.message ?? '', /permissionMode must be one of .*full-access/);
+
+  assert.throws(
+    () => buildThreadStartParams({
+      ...deliverArgs(),
+      permissions: normalizeStepPermissions({ permissionMode: 'bypassPermissions' }),
+    }),
+    /permissionMode must be one of/,
+  );
 });
 
 test('C10c preflight refuses tool and Owenloop-only network restrictions Codex cannot enforce', () => {

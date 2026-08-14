@@ -89,7 +89,11 @@ export interface StepPermissions {
   filesystem?: FilesystemPermission;
   /** Network authority requested by the workflow definition. */
   network?: NetworkPermission;
-  /** Opaque adapter permission mode. Each adapter validates its own vocabulary. */
+  /**
+   * Adapter permission mode. Each adapter validates its own vocabulary, PLUS the
+   * neutral values every adapter must either translate or refuse — see
+   * `NEUTRAL_PERMISSION_MODES`.
+   */
   permissionMode?: string;
   /** Only ever a positive integer; anything else was dropped in normalization. */
   maxTurns?: number;
@@ -99,6 +103,76 @@ export interface StepPermissions {
    *  adapter reads its own keys. REQUIRED — always present, possibly `{}` — so
    *  no adapter needs a null check. */
   extensions: Record<string, unknown>;
+}
+
+/**
+ * The HARNESS-NEUTRAL `permissionMode` vocabulary: three distinct positions on
+ * ONE axis — how much a step may do before a human is consulted.
+ *
+ * WHY THIS EXISTS. `permissionMode` sits in `NEUTRAL_KEYS` (see
+ * `./permissions.ts`) alongside `filesystem` and `network`, but it did not
+ * behave like them. `filesystem: unrestricted` is an INTENT the step states and
+ * each adapter translates into its own dialect — one shipped adapter turns it
+ * into that vendor's own sandbox setting. `permissionMode` had no translation
+ * layer at all: the authored string went to the adapter verbatim, and the
+ * shipped adapters accept DISJOINT vocabularies for the same ideas, each
+ * refusing the other's at preflight. A step therefore had to name one vendor's
+ * word, which pinned it to that vendor as surely as an explicit `id:` would
+ * have. That is exactly the pin the neutral-key contract exists to prevent.
+ *
+ * THE THREE POSITIONS ARE NOT INTERCHANGEABLE. Both shipped harnesses draw the
+ * same three distinctions, so collapsing any two would lose a real one:
+ *
+ * - `ask` — the harness consults a human before anything beyond trivially safe
+ *   reads. The human is the gate.
+ * - `auto-safe` — a model-side classifier judges each action: it proceeds on
+ *   ordinary work and consults a human only when an action is potentially
+ *   dangerous. The classifier is the gate; a human is the exception path.
+ * - `full-access` — nothing is gated. The harness never consults a human, and
+ *   a failed action is simply reported back to the model.
+ *
+ * `auto-safe` is NOT a milder `full-access`: it can still stop and ask. A
+ * headless step that must not stall wants `full-access`, and the two exist
+ * separately so that choice is stated rather than inferred.
+ *
+ * `ask` and `auto-safe` are meaningful only where something can answer a
+ * prompt. In a Shift-dispatched run nothing can, so a prompt is a stall: the
+ * Step Agent stops mid-turn, submits nothing, and the hub re-arms the step into
+ * a retry storm whose every worker dies in the same place. That is a reason for
+ * a definition author to choose `full-access` for unattended steps, not a
+ * reason for an adapter to silently upgrade one value into another.
+ *
+ * WHAT AN ADAPTER OWES THIS VOCABULARY. For each value an adapter must either
+ * map it onto the vendor mode with the same meaning, or refuse it in
+ * `preflight` with a `PermissionIssue` naming `permissionMode`. Refusing is a
+ * legitimate answer and fails closed: the worker releases its claim and starts
+ * no model process. Mapping a value onto a mode that grants MORE than the value
+ * describes is never legitimate.
+ *
+ * VENDOR VALUES ARE UNCHANGED. Each adapter still accepts its own native
+ * vocabulary and still refuses every other adapter's. These values are an
+ * ADDITION, so no already-published definition changes meaning.
+ */
+export const NEUTRAL_PERMISSION_MODES = Object.freeze([
+  'ask',
+  'auto-safe',
+  'full-access',
+] as const);
+
+export type NeutralPermissionMode = (typeof NEUTRAL_PERMISSION_MODES)[number];
+
+/**
+ * An adapter's neutral-vocabulary translation table.
+ *
+ * EXHAUSTIVE BY TYPE, and that is the point: adding a fourth neutral value
+ * breaks compilation in every adapter until each one decides what it means
+ * there. `null` is the explicit "this adapter has no equivalent" decision and
+ * makes `preflight` refuse — distinct from an adapter that simply forgot.
+ */
+export type NeutralPermissionModeMap = Readonly<Record<NeutralPermissionMode, string | null>>;
+
+export function isNeutralPermissionMode(value: string): value is NeutralPermissionMode {
+  return (NEUTRAL_PERMISSION_MODES as readonly string[]).includes(value);
 }
 
 /** One fail-closed adapter preflight refusal. */

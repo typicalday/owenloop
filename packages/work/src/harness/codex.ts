@@ -63,12 +63,13 @@
  * `{kind:'exited'}` and rejects with the underlying error.
  */
 import { existsSync } from 'node:fs';
-import { ResumeUnavailableError } from './contract.ts';
+import { ResumeUnavailableError, NEUTRAL_PERMISSION_MODES, isNeutralPermissionMode } from './contract.ts';
 import type {
   AgentEvent,
   DeliverArgs,
   HarnessAdapter,
   HarnessSessionRef,
+  NeutralPermissionModeMap,
   PermissionIssue,
   StartArgs,
   StepPermissions,
@@ -154,6 +155,38 @@ const DEFAULT_SANDBOX = 'workspace-write';
 /** `AskForApproval` values this adapter passes through untouched. */
 const NATIVE_APPROVAL_POLICIES = new Set(['untrusted', 'on-request', 'never']);
 
+/**
+ * This adapter's neutral-vocabulary translation. Every value maps: Codex's
+ * `AskForApproval` draws all three distinctions itself, so none is refused here.
+ *
+ * - `ask` → `untrusted` (`AskForApproval::UnlessTrusted`). It escalates every
+ *   command to the user except a small trusted read-only allowlist — `ls`,
+ *   `cat`, `sed`. The allowlist is why this is "consults a human before
+ *   anything beyond trivially safe reads" rather than a literal every-call
+ *   prompt, which is exactly how the neutral value is worded.
+ * - `auto-safe` → `on-request`. The model decides when to escalate. That is the
+ *   model-side-judgment position, matching the neutral value's meaning.
+ * - `full-access` → `never`. Never asks; a failed command is returned to the
+ *   model instead of raising a prompt.
+ *
+ * SEPARATE AXIS, DELIBERATELY. None of these touches `sandbox`. What the step
+ * may REACH comes from neutral `filesystem` (and the legacy `sandbox`
+ * extension); this field only decides who approves reaching it. `full-access`
+ * therefore means "never ask", not "unsandboxed" — a step wanting both states
+ * both.
+ */
+const NEUTRAL_TO_APPROVAL_POLICY: NeutralPermissionModeMap = Object.freeze({
+  'ask': 'untrusted',
+  'auto-safe': 'on-request',
+  'full-access': 'never',
+});
+
+/** Values `codexPreflight` accepts: this adapter's own set plus the neutral vocabulary. */
+const ACCEPTED_APPROVAL_POLICIES = new Set<string>([
+  ...NATIVE_APPROVAL_POLICIES,
+  ...NEUTRAL_PERMISSION_MODES,
+]);
+
 const UNRESTRICTED_SANDBOX = 'danger-full-access';
 
 function unsupportedFilesystemMessage(filesystem: 'read-only' | 'workspace-write'): string {
@@ -201,14 +234,25 @@ function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
 	"use sandbox 'workspace-write' or 'danger-full-access'",
     });
   }
-  if (
-    permissions.permissionMode !== undefined &&
-    !NATIVE_APPROVAL_POLICIES.has(permissions.permissionMode)
-  ) {
-    issues.push({
-      field: 'permissionMode',
-      message: `permissionMode must be one of ${[...NATIVE_APPROVAL_POLICIES].join('|')}`,
-    });
+  const authoredMode = permissions.permissionMode;
+  if (authoredMode !== undefined) {
+    if (!ACCEPTED_APPROVAL_POLICIES.has(authoredMode)) {
+      issues.push({
+        field: 'permissionMode',
+        message: `permissionMode must be one of ${[...ACCEPTED_APPROVAL_POLICIES].join('|')}`,
+      });
+    } else if (
+      isNeutralPermissionMode(authoredMode) &&
+      NEUTRAL_TO_APPROVAL_POLICY[authoredMode] === null
+    ) {
+      // Unreachable today — every neutral value maps here. Kept because the
+      // table's `null` arm is a real contract option, and a refusal that only
+      // exists once someone uses it is a refusal nobody has tested.
+      issues.push({
+        field: 'permissionMode',
+        message: `permissionMode '${authoredMode}' is unsupported by this adapter`,
+      });
+    }
   }
   const sandbox = permissions.extensions['sandbox'];
   if (sandbox !== undefined && (typeof sandbox !== 'string' || !SANDBOX_MODES.has(sandbox))) {
@@ -236,8 +280,13 @@ function codexPreflight(permissions: StepPermissions): PermissionIssue[] {
 /** `permissionMode` → `approvalPolicy`, with no invalid-value fallback. */
 function toApprovalPolicy(mode: string | undefined): string {
   if (mode === undefined) return 'never';
+  if (isNeutralPermissionMode(mode)) {
+    const mapped = NEUTRAL_TO_APPROVAL_POLICY[mode];
+    if (mapped !== null) return mapped;
+    throw new Error(`permissionMode '${mode}' is unsupported by this adapter`);
+  }
   if (NATIVE_APPROVAL_POLICIES.has(mode)) return mode;
-  throw new Error(`permissionMode must be one of ${[...NATIVE_APPROVAL_POLICIES].join('|')}`);
+  throw new Error(`permissionMode must be one of ${[...ACCEPTED_APPROVAL_POLICIES].join('|')}`);
 }
 
 function isPlainMap(v: unknown): v is Record<string, unknown> {

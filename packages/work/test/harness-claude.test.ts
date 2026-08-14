@@ -192,6 +192,56 @@ test("permissionMode 'bypassPermissions' also sets allowDangerouslySkipPermissio
   }
 });
 
+/**
+ * The claude half of the neutral translation. Its companion lives in
+ * `harness-codex.test.ts` (C5a–C5d / C10b2): the SAME authored value must yield
+ * codex's approval policy there and an SDK permission mode here, which is what
+ * lets one delivery step run on either harness.
+ *
+ * Two assertions are load-bearing.
+ *
+ * `full-access` must carry the companion danger flag, because it translates to
+ * `bypassPermissions` BEFORE the pairing rule and therefore inherits it;
+ * translating after the rule would produce a mode the SDK ignores, and a
+ * headless step that stalls on a prompt nobody answers.
+ *
+ * `auto-safe` must NOT carry that flag. It is a genuinely different position —
+ * a classifier decides, and a dangerous call still stops and asks — so a def
+ * that asked for `auto-safe` and silently got the never-ask mode would have had
+ * its gate removed without saying so.
+ */
+test('each neutral permissionMode translates to its SDK mode, and only full-access carries the danger flag', () => {
+  const cases: Array<{ neutral: string; sdk: string; danger: boolean }> = [
+    { neutral: 'ask', sdk: 'default', danger: false },
+    { neutral: 'auto-safe', sdk: 'auto', danger: false },
+    { neutral: 'full-access', sdk: 'bypassPermissions', danger: true },
+  ];
+
+  for (const { neutral, sdk, danger } of cases) {
+    const { options, events } = optionsFor({ permissionMode: neutral });
+    assert.equal(options.permissionMode, sdk, `${neutral} translates to ${sdk}`);
+    assert.equal(
+      'allowDangerouslySkipPermissions' in options,
+      danger,
+      `${neutral} danger-flag expectation`,
+    );
+    assert.deepEqual(events, [], `translating ${neutral} is not a diagnostic`);
+
+    assert.deepEqual(
+      claudeAdapter.preflight(normalizeStepPermissions({ permissionMode: neutral })),
+      [],
+      `${neutral} must pass preflight`,
+    );
+  }
+
+  // The other adapter's vendor word stays refused: accepting it would mean this
+  // adapter guessing at another vendor's vocabulary rather than the def naming
+  // an intent.
+  const foreign = claudeAdapter.preflight(normalizeStepPermissions({ permissionMode: 'never' }));
+  assert.deepEqual(foreign.map((issue) => issue.field), ['permissionMode']);
+  assert.match(foreign[0]?.message ?? '', /permissionMode must be one of .*full-access/);
+});
+
 test('an out-of-union permissionMode is dropped with a progress event, not passed through', () => {
   const { options, events } = optionsFor({ permissionMode: 'yolo' });
   assert.equal('permissionMode' in options, false);

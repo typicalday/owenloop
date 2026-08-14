@@ -227,7 +227,11 @@ test('runtime minVersion and features use AND semantics', () => {
   });
   assert.equal(missingFeature.versionSatisfied, true);
   assert.equal(missingFeature.compatible, false);
-  assert.deepEqual(missingFeature.unsupportedFeatures, [SUPPORTED_RUNTIME_FEATURES[1]]);
+  // `slice(1)`, not a literal index: the environment above advertises exactly
+  // one feature, so EVERY other advertised feature must come back unsupported.
+  // Pinning a single index would silently stop testing the tail the day a third
+  // feature is added.
+  assert.deepEqual(missingFeature.unsupportedFeatures, [...SUPPORTED_RUNTIME_FEATURES].slice(1));
 
   const lowVersion = evaluateRuntimeCompatibility(requirements, {
     version: '0.4.9',

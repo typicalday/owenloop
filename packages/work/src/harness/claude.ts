@@ -39,13 +39,14 @@ import type {
 import { register } from './registry.ts';
 import { filterOwenloopEnv } from './child-env.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
-import { ResumeUnavailableError } from './contract.ts';
+import { ResumeUnavailableError, NEUTRAL_PERMISSION_MODES, isNeutralPermissionMode } from './contract.ts';
 import type { LintFinding } from './types.ts';
 import type {
   AgentEvent,
   DeliverArgs,
   HarnessAdapter,
   HarnessSessionRef,
+  NeutralPermissionModeMap,
   PermissionIssue,
   StartArgs,
   StepPermissions,
@@ -209,6 +210,53 @@ const PERMISSION_MODES: readonly string[] = [
   'auto',
 ];
 
+/**
+ * This adapter's neutral-vocabulary translation. Every value maps: this harness
+ * draws all three distinctions itself, so none of them is refused here.
+ *
+ * - `ask` → `default`. The SDK's `default` routes each unapproved tool to the
+ *   `canUseTool` callback — a human decision point — and denies when no callback
+ *   is wired. That is the "human is the gate" position.
+ * - `auto-safe` → `auto`. `auto` is the SDK's model-classifier mode: it decides
+ *   per call and escalates the ones it judges dangerous. NOT `acceptEdits`,
+ *   which auto-approves filesystem operations by category and applies no
+ *   judgment to anything else, and NOT `dontAsk`, which DENIES an unapproved
+ *   tool rather than consulting anyone — silently narrower than what the step
+ *   asked for.
+ * - `full-access` → `bypassPermissions`. The only SDK mode that runs tools with
+ *   no prompt at all, and the one the companion flag below exists for.
+ *
+ * `plan` has no neutral spelling on purpose: it is a different axis (what the
+ * agent may DO — explore only) rather than who approves.
+ */
+const NEUTRAL_TO_SDK_MODE: NeutralPermissionModeMap = Object.freeze({
+  'ask': 'default',
+  'auto-safe': 'auto',
+  'full-access': 'bypassPermissions',
+});
+
+/** Values `preflight` accepts: the SDK's own union plus the neutral vocabulary. */
+const ACCEPTED_PERMISSION_MODES: readonly string[] = [
+  ...PERMISSION_MODES,
+  ...NEUTRAL_PERMISSION_MODES,
+];
+
+/**
+ * Authored `permissionMode` → the SDK mode to send.
+ *
+ * Total by construction: an out-of-union value returns `undefined` and the
+ * caller drops it with a diagnostic, preserving the pre-existing behavior for a
+ * bag that lint never saw. A neutral value this adapter refuses (a `null` in the
+ * table) also returns `undefined`, and `preflight` has already refused it.
+ */
+function toSdkPermissionMode(mode: string): PermissionMode | undefined {
+  if (isNeutralPermissionMode(mode)) {
+    const mapped = NEUTRAL_TO_SDK_MODE[mode];
+    return mapped === null ? undefined : (mapped as PermissionMode);
+  }
+  return PERMISSION_MODES.includes(mode) ? (mode as PermissionMode) : undefined;
+}
+
 /** The five-value closed union the SDK types `Options.effort` as. */
 const EFFORT_LEVELS: readonly string[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -254,11 +302,22 @@ const OWENLOOP_CONTROL_DENY_SPECS = new Set([
 
 function claudePreflight(permissions: StepPermissions): PermissionIssue[] {
   const issues: PermissionIssue[] = [];
-  if (permissions.permissionMode !== undefined && !PERMISSION_MODES.includes(permissions.permissionMode)) {
-    issues.push({
-      field: 'permissionMode',
-      message: `permissionMode must be one of ${PERMISSION_MODES.join('|')}`,
-    });
+  const authoredMode = permissions.permissionMode;
+  if (authoredMode !== undefined) {
+    if (!ACCEPTED_PERMISSION_MODES.includes(authoredMode)) {
+      issues.push({
+        field: 'permissionMode',
+        message: `permissionMode must be one of ${ACCEPTED_PERMISSION_MODES.join('|')}`,
+      });
+    } else if (isNeutralPermissionMode(authoredMode) && NEUTRAL_TO_SDK_MODE[authoredMode] === null) {
+      // Unreachable today — every neutral value maps here. Kept because the
+      // table's `null` arm is a real contract option, and a refusal that only
+      // exists once someone uses it is a refusal nobody has tested.
+      issues.push({
+        field: 'permissionMode',
+        message: `permissionMode '${authoredMode}' is unsupported by this adapter`,
+      });
+    }
   }
   if (permissions.effort !== undefined && !EFFORT_LEVELS.includes(permissions.effort)) {
     issues.push({ field: 'effort', message: `effort must be one of ${EFFORT_LEVELS.join('|')}` });
@@ -441,8 +500,12 @@ export function buildClaudeOptions(
   }
 
   if (permissions.permissionMode !== undefined) {
-    if (PERMISSION_MODES.includes(permissions.permissionMode)) {
-      const mode = permissions.permissionMode as PermissionMode;
+    // Neutral `full-access` lands here as `bypassPermissions`, so the companion
+    // flag below covers it too — that is the point of translating BEFORE the
+    // pairing rather than after it. Neutral `auto-safe` lands as `auto` and
+    // deliberately does NOT get the flag: it is still allowed to stop and ask.
+    const mode = toSdkPermissionMode(permissions.permissionMode);
+    if (mode !== undefined) {
       options.permissionMode = mode;
       // 'bypassPermissions' is IGNORED by the SDK without this companion flag.
       // Missing it is a silent downgrade to prompting, which in a headless run
@@ -451,7 +514,7 @@ export function buildClaudeOptions(
     } else {
       extra.onEvent({
         kind: 'progress',
-        text: `dropped unknown permissionMode '${permissions.permissionMode}' (expected one of ${PERMISSION_MODES.join('|')})`,
+        text: `dropped unknown permissionMode '${permissions.permissionMode}' (expected one of ${ACCEPTED_PERMISSION_MODES.join('|')})`,
       });
     }
   }
