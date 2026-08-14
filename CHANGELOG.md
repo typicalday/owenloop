@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2](https://github.com/typicalday/owenloop/compare/v0.5.1...v0.5.2) (2026-08-14)
+
+
+### Features
+
+* durable on-disk shift logs (shift.log + per-run worker logs) ([#150](https://github.com/typicalday/owenloop/issues/150)) ([ad95862](https://github.com/typicalday/owenloop/commit/ad9586292b2d977f3c0be3f2f005c537eba03bfc))
+* pass consumed inputs to command steps and warn on cwd fallback ([#149](https://github.com/typicalday/owenloop/issues/149)) ([76f0783](https://github.com/typicalday/owenloop/commit/76f0783201eb93b8af8ece4c8910952bec781b61))
+* per-crew tier profiles with model and effort resolution ([#140](https://github.com/typicalday/owenloop/issues/140)) ([98d96bb](https://github.com/typicalday/owenloop/commit/98d96bbeaf3e17e0aa097389b766248f78e87451))
+* route agent orders by composed capability instead of model tiers ([#152](https://github.com/typicalday/owenloop/issues/152)) ([a48068b](https://github.com/typicalday/owenloop/commit/a48068b547e16d1db763e3bc739c8277ae1fb628))
+* routing modifiers, capability composition, and escalation in the engine ([#151](https://github.com/typicalday/owenloop/issues/151)) ([6d440a9](https://github.com/typicalday/owenloop/commit/6d440a951bc15bd961e4004c4652f6e87c88560c))
+
+
+### Bug Fixes
+
+* brake a shift step on worker failure, not on dispatch count ([#146](https://github.com/typicalday/owenloop/issues/146)) ([2b4c0c6](https://github.com/typicalday/owenloop/commit/2b4c0c657173c114377daa432b878a8dd12d0c05))
+* distinguish a corrupt session record from a schema-invalid one ([#145](https://github.com/typicalday/owenloop/issues/145)) ([c65416b](https://github.com/typicalday/owenloop/commit/c65416b523efa5784a2e8f173ac44bd6b77435b0))
+* issue a retry-safe owed target version so producer submits can sign ([#143](https://github.com/typicalday/owenloop/issues/143)) ([1a27f65](https://github.com/typicalday/owenloop/commit/1a27f65eb2abdba50f52931fd08c99ae3b3d2df6))
+* measure escalation.after against the highest per-produce maxAttempts ([#153](https://github.com/typicalday/owenloop/issues/153)) ([0d654f9](https://github.com/typicalday/owenloop/commit/0d654f9e593ecdbc10a50cad8f59a5a73036016f))
+* normalize a JSON-string submit value before signing it ([#147](https://github.com/typicalday/owenloop/issues/147)) ([2f67b12](https://github.com/typicalday/owenloop/commit/2f67b12453631ca9425ea66050eeb9afbbd32817))
+* read the capability payloads under the hub's own field names ([#142](https://github.com/typicalday/owenloop/issues/142)) ([eb53609](https://github.com/typicalday/owenloop/commit/eb536093f4202afdd491269e7aab07bb60e21a1f))
+* stop the agent-run MCP hold child from releasing its parent's claim ([#144](https://github.com/typicalday/owenloop/issues/144)) ([4b46fa8](https://github.com/typicalday/owenloop/commit/4b46fa84c15074924a937ff0954ee967bf4a1523))
+
 ## [0.5.1](https://github.com/typicalday/owenloop/compare/v0.5.0...v0.5.1) (2026-08-12)
 
 
