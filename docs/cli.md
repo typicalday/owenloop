@@ -1261,7 +1261,7 @@ checks both journal locations and dispatches by journal version; a v2 store
 journal uses `index.json` metadata and a v1 GitHub journal uses
 `installed.json` ledger corroboration.
 
-## Hub (`login` / `connect` / `push` / `start` / `cancel` / `publish` / `logout`)
+## Hub (`login` / `connect` / `push` / `start` / `cancel` / `instance` / `publish` / `logout`)
 
 These commands authenticate, publish, and start workflows on a hosted **hub** (default
 `https://api.owenloop.com`). `login` and `logout` retain the generic resolver:
@@ -1353,6 +1353,48 @@ Three properties come from the hub verb, not from this command:
   instance's distinct `cancelled` status and an `action: 'cancel'` audit row.
   `cancel` prints the status rather than the receipt outcome, so its output does
   not imply the run failed on its own.
+
+### `instance show` — read a hub instance's live state
+
+`owenloop instance show <workflow>` sends `GET /api/status/:wf` and prints the
+instance's state: `done`, the `debts` it still owes, the steps that are
+`eligible` or `blocked`, the runs `inFlight`, and `defDrift`.
+
+It answers the question no other local command can: **why is this run not
+moving?** Two of its fields are the entire diagnosis, and both are invisible
+from the outside because each one looks exactly like an idle shift:
+
+- **`defDrift: true`** — a hub instance is PINNED to the def version it started
+  on. Publishing a new bundle does not affect a run already in flight. This is
+  the field that explains "I fixed the def and republished, and the run still
+  does the old thing."
+- **`waitingOnCapabilities`** — a step whose capability has no crew bound is
+  never offered to anyone. Present only when something is actually parked;
+  `getStatus` omits the field otherwise, and `instance show` omits it too rather
+  than printing `[]`, which would read as "asked, and the answer is none."
+
+Naming, because two obvious names were already taken by different commands:
+
+- `owenloop status` is the **local** engine's status and takes `--db`. It has no
+  hub credential and rejects `--hub`.
+- `owenloop runs <workflow>` already lists runs from the **local** sqlite store.
+
+`instance` is the hub's own word for a started workflow (`setInstanceStatus`,
+`listInstancesWithStatus`, `cancel_run`'s "already-terminal instance"), so the
+hub object and the local object keep separate commands instead of one command
+whose meaning flips on a flag.
+
+**Only `show` exists, and that is a hub limitation.** `getStatus` is the one
+instance-read verb with a REST route. `listInstancesWithStatus` (which would
+back `instance list`) and `listReceipts` / `getReceiptDetail` (where a
+reviewer's reject reason actually lives) are exposed only over tRPC for the
+console. Reaching either from the CLI requires new routes in
+`apps/hub-edge/src/api/routes.ts` and a hub deploy. The subcommand form exists
+so they can arrive as `instance list` without renaming anything.
+
+Like `cancel`, it reads the `human` slot, never consults `--as`, and resolves
+the hub through the project binding so an ambient `OWENLOOP_HUB` cannot redirect
+the read to a different control plane.
 
 **Publishing hub resolution.** `connect`, `push`, and `publish` resolve their
 target in this order:

@@ -1406,6 +1406,10 @@ ${' '.repeat(41)}the run carries no modifier and its steps are offered on BARE c
 ${' '.repeat(41)}cancel a running instance on the bound hub (human credential; agents cannot cancel).
 ${' '.repeat(41)}Closes every open lease so the run stops being re-offered, and records the
 ${' '.repeat(41)}terminal status \`cancelled\`. Cancelling an already-terminal instance is a no-op.
+  instance show <workflow> [--hub <url>]
+${' '.repeat(41)}print one instance's live state on the bound hub: whether it is done, what it
+${' '.repeat(41)}owes, which steps are eligible or blocked, which runs are in flight, and whether
+${' '.repeat(41)}the loaded def has drifted from the version the instance is pinned to.
   agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --shift = --scopes work,run)
   capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
   capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
@@ -1500,6 +1504,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as', 'bundle')],
   ['start', cmdOpts('hub', 'crew', 'title', 'provide', 'modifier')],
   ['cancel', cmdOpts('hub', 'reason')],
+  ['instance', cmdOpts('hub')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
   ['crew', cmdOpts('hub', 'kind', 'owner')],
@@ -4575,6 +4580,111 @@ async function dispatchCancel(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
+ * `owenloop instance` — read a HUB instance's live state from the terminal.
+ *
+ * The read counterpart to `start` and `cancel`. Two naming constraints forced
+ * this word, and both are collisions with commands that already exist:
+ *
+ *  - NOT `status`. `owenloop status` is the LOCAL engine's status and takes
+ *    `--db`; it has no hub credential and rejects `--hub`.
+ *  - NOT `runs`. `owenloop runs <workflow> [--open]` already lists runs out of
+ *    the LOCAL sqlite store. Reusing it would have silently rerouted a local
+ *    command to the network.
+ *
+ * `instance` is the hub's own term for a started workflow — `setInstanceStatus`,
+ * `listInstancesWithStatus`, and `cancel_run`'s own "already-terminal instance"
+ * all use it — so a hub instance and a local run stay distinct objects with
+ * distinct commands rather than one command whose meaning flips on a flag.
+ *
+ * Only `show` exists today, and that is a hub limitation rather than a design
+ * choice. `getStatus` is the one instance-read verb with a REST route
+ * (`GET /api/status/:wf`). The verb that lists instances,
+ * `listInstancesWithStatus`, and the two that carry receipt bodies —
+ * `listReceipts` and `getReceiptDetail`, which is where a reviewer's reject
+ * reason actually lives — are exposed only over tRPC for the console. Adding
+ * `instance list`, or any command that can print WHY a step was rejected,
+ * therefore requires new routes on `apps/hub-edge/src/api/routes.ts` and a hub
+ * deploy; it is not something this CLI can reach today. The subcommand form
+ * exists so those arrive as `instance list` without renaming anything.
+ *
+ * Like `cancel`, this reads the `human` slot and never consults `--as`, and it
+ * resolves the hub through `resolveStartHub` so an ambient `OWENLOOP_HUB` can
+ * never silently redirect the read to a different control plane than the one
+ * the project is bound to.
+ */
+async function dispatchInstance(io: CliIO, args: Args): Promise<number> {
+  const USAGE_FORMS = 'usage: owenloop instance show <workflow> [--hub <url>]';
+
+  const sub = args.positionals[1];
+  if (sub !== 'show') {
+    throw new CliError(`unknown instance subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
+  }
+  const workflow = args.positionals[2];
+  if (workflow === undefined || workflow === '') {
+    throw new CliError(`missing required argument: workflow (${USAGE_FORMS})`);
+  }
+
+  const origin = resolveStartHub(io, args);
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  // The workflow id is a path segment, so it must be encoded — an id carrying a
+  // slash would otherwise silently address a different route.
+  const path = `/api/status/${encodeURIComponent(workflow)}`;
+  const { res, cred: used } = await authedGet(io, origin, slot, cred, path);
+  if (res.status === 401) assertAuthOk(res, used, origin);
+  if (!res.ok) {
+    const message = await hubRequestMessage(res);
+    throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+  }
+
+  let body: unknown;
+  try {
+    body = (await res.json()) as unknown;
+  } catch {
+    throw new CliError('get_status: malformed success response — body is not valid JSON');
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new CliError('get_status: malformed success response — body is not an object');
+  }
+  const wire = body as Record<string, unknown>;
+  // `done` is the one field every status carries and the one a script branches
+  // on, so its absence means we are not looking at a status at all. Refuse
+  // rather than print a shape that reads as "not done".
+  if (typeof wire.done !== 'boolean') {
+    throw new CliError('get_status: malformed success response — missing done flag');
+  }
+
+  const arrayOr = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+  print(io, {
+    ok: true,
+    hub: origin,
+    workflow,
+    done: wire.done,
+    // Owed inputs the instance is waiting on, each with its acceptance and
+    // whether the engine considers it stalled.
+    debts: arrayOr(wire.debts),
+    // Steps that could be dispatched now, and steps whose preconditions are not
+    // met yet. A run that is neither done nor eligible nor in flight is stuck.
+    eligible: arrayOr(wire.eligible),
+    blocked: arrayOr(wire.blocked),
+    inFlight: arrayOr(wire.inFlight),
+    // True when the def loaded on the hub has moved on from the snapshot this
+    // instance is pinned to. A pinned instance never picks up the new version,
+    // so this is the field that explains "I published a fix and the run still
+    // does the old thing".
+    defDrift: wire.defDrift === true,
+    // Present only when a step's capability has no crew bound to it, which
+    // looks identical to "nothing is picking this up" from the outside.
+    ...(Array.isArray(wire.waitingOnCapabilities) ? { waitingOnCapabilities: wire.waitingOnCapabilities } : {}),
+  });
+  return 0;
+}
+
+/**
  * `owenloop mcp` — serve the human control plane to a local MCP host over stdio.
  * A thin adapter: read the optional `--hub <url>` flag and hand `io` (which
  * satisfies the module's `McpIo`) to `runMcpCommand`, which resolves the origin,
@@ -6609,7 +6719,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'cancel', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'cancel', 'instance', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -6657,6 +6767,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
 	return await dispatchStart(io, args);
       case 'cancel':
         return await dispatchCancel(io, args);
+      case 'instance':
+        return await dispatchInstance(io, args);
       case 'agent':
         return await dispatchAgent(io, args);
       case 'capability':
