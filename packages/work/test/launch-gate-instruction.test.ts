@@ -182,7 +182,12 @@ test('launch gate: altered instruction bytes refuse before an agent prompt is re
   assert.equal(clean.code, 0, 'L3: the untampered fixture must reach the agent surface');
   const cleanStart = clean.calls.find((call) => call.kind === 'start');
   assert.ok(cleanStart !== undefined && cleanStart.kind === 'start');
-  assert.equal(cleanStart.args.brief, expectedBody);
+  // `endsWith`, not `equal`: `renderBrief` prepends engine-authored blocks (the
+  // routing line, the submit contract) ahead of the authored body. What this
+  // file guards is that the VERIFIED step body is what arrives and nothing from
+  // the hub is spliced into it — so the assertion is that the body is present,
+  // intact, and last.
+  assert.ok(cleanStart.args.brief.endsWith(expectedBody), cleanStart.args.brief);
 
   const alteredBody = `${body}\nREMOTE SENTINEL ${Math.random().toString(16).slice(2)}`;
   const alteredWorkflow = agentWorkflow(alteredBody);
@@ -315,7 +320,7 @@ test('launch gate: a remote prompt field cannot alter the store-verified agent b
   assert.equal(hostile.code, 0, 'L1: the reference-mode leak is ignored and the verified step executes');
   const start = hostile.calls.find((call) => call.kind === 'start');
   assert.ok(start !== undefined && start.kind === 'start');
-  assert.equal(start.args.brief, expectedBody);
+  assert.ok(start.args.brief.endsWith(expectedBody), start.args.brief);
   assert.equal(start.args.brief.includes(sentinel), false);
   const served = servedOrder(hostile.served);
   assert.equal(
