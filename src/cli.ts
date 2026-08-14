@@ -1402,6 +1402,10 @@ ${' '.repeat(41)}start a published workflow on the bound hub (human credential)
 ${' '.repeat(41)}--modifier names one value from the def's declared \`modifiers:\` set; every
 ${' '.repeat(41)}step's capability is then offered as \`<capability>:<modifier>\`. Omit it and
 ${' '.repeat(41)}the run carries no modifier and its steps are offered on BARE capabilities.
+  cancel <workflow> [--reason <text>] [--hub <url>]
+${' '.repeat(41)}cancel a running instance on the bound hub (human credential; agents cannot cancel).
+${' '.repeat(41)}Closes every open lease so the run stops being re-offered, and records the
+${' '.repeat(41)}terminal status \`cancelled\`. Cancelling an already-terminal instance is a no-op.
   agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --shift = --scopes work,run)
   capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
   capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
@@ -1495,6 +1499,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['trust', cmdOpts('force', 'key', 'principal', 'pools', 'labels', 'namespaces', 'delegate', 'signing-key', 'output', 'reason', 'effective-from')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as', 'bundle')],
   ['start', cmdOpts('hub', 'crew', 'title', 'provide', 'modifier')],
+  ['cancel', cmdOpts('hub', 'reason')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
   ['crew', cmdOpts('hub', 'kind', 'owner')],
@@ -4342,11 +4347,11 @@ async function dispatchPush(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
- * Resolve the hub for `start` without ever falling through to the production
- * default or an ambient `OWENLOOP_HUB`. A connected project supplies the
- * durable default. `--hub` is allowed for an unbound directory, but must agree
- * with an existing binding so a copied command cannot silently start a run on
- * the wrong control plane.
+ * Resolve the hub for the per-run commands (`start`, `cancel`) without ever
+ * falling through to the production default or an ambient `OWENLOOP_HUB`. A
+ * connected project supplies the durable default. `--hub` is allowed for an
+ * unbound directory, but must agree with an existing binding so a copied
+ * command cannot silently start — or cancel — a run on the wrong control plane.
  */
 function resolveStartHub(io: CliIO, args: Args): string {
   const binding = readHubBinding(hubBindingPath(io.cwd));
@@ -4479,6 +4484,92 @@ async function dispatchStart(io: CliIO, args: Args): Promise<number> {
     ...(modifier !== undefined ? { modifier } : {}),
     ...(Array.isArray(wire.stampedCrews) ? { stampedCrews: wire.stampedCrews } : {}),
     ...(Array.isArray(wire.validatedCrews) ? { validatedCrews: wire.validatedCrews } : {}),
+  });
+  return 0;
+}
+
+/**
+ * `owenloop cancel` — stop a running instance from the terminal.
+ *
+ * The counterpart to `start`, and the only local way out of a run that can no
+ * longer make progress: a step whose worktree was deleted, or an instance
+ * pinned to a def version its shift can no longer satisfy. Without this, such a
+ * run is re-offered forever and permanently occupies one of a shift's dispatch
+ * slots, because nothing else on this machine can move it to a terminal state.
+ *
+ * Three properties of the hub verb this command deliberately surfaces rather
+ * than hides (`hub-core/src/verbs/cancel-run.ts`):
+ *
+ *  - It is HUMAN-ROLE-ONLY. `cancel_run` has no agent-scope entry, so an agent
+ *    credential is refused by the hub. This command therefore never consults
+ *    `--as` and always reads the `human` slot — offering `--as` would only
+ *    produce a 403 further down.
+ *  - It is IDEMPOTENT. Cancelling an instance that already reached a terminal
+ *    state returns `cancelled: false` plus that state, and writes nothing. That
+ *    is a success, not an error, so it exits 0 — a retried cancel must not look
+ *    like a failure.
+ *  - Its receipt records `outcome: 'failed'`, because the receipt union is only
+ *    `done|failed`. The true cancel fact lives in the instance's distinct
+ *    `cancelled` status and an `action: 'cancel'` audit row. We print the
+ *    status, not the receipt outcome, so the output does not imply the run
+ *    failed on its own.
+ */
+async function dispatchCancel(io: CliIO, args: Args): Promise<number> {
+  const workflow = need(args, 1, 'workflow');
+  if (args.missingOptionValues.has('reason')) {
+    throw new CliError('missing value for --reason: expected --reason <text>');
+  }
+  const reason = last(args, 'reason');
+  if (reason !== undefined && reason.trim() === '') {
+    throw new CliError('invalid empty value for --reason: expected --reason <text>');
+  }
+
+  const origin = resolveStartHub(io, args);
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  const request = {
+    workflow,
+    ...(reason !== undefined ? { reason } : {}),
+  };
+
+  const { res, cred: used } = await authedPost(io, origin, slot, cred, '/api/cancel_run', request);
+  if (res.status === 401) assertAuthOk(res, used, origin);
+  if (!res.ok) {
+    const message = await hubRequestMessage(res);
+    throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+  }
+
+  let body: unknown;
+  try {
+    body = (await res.json()) as unknown;
+  } catch {
+    throw new CliError('cancel_run: malformed success response — body is not valid JSON');
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new CliError('cancel_run: malformed success response — body is not an object');
+  }
+  const wire = body as Record<string, unknown>;
+  if (typeof wire.cancelled !== 'boolean') {
+    throw new CliError('cancel_run: malformed success response — missing cancelled flag');
+  }
+
+  print(io, {
+    ok: true,
+    hub: origin,
+    workflow,
+    cancelled: wire.cancelled,
+    // Present only on the already-terminal path, where the hub reports the state
+    // it found instead of the one it set. On the cancelling path the status is
+    // `cancelled` by construction, so we state it rather than inventing a field
+    // the hub did not send.
+    status: typeof wire.status === 'string' ? wire.status : 'cancelled',
+    // The runs whose leases were closed. Absent on the no-op path.
+    ...(Array.isArray(wire.closedRuns) ? { closedRuns: wire.closedRuns } : {}),
+    ...(reason !== undefined ? { reason } : {}),
   });
   return 0;
 }
@@ -6518,7 +6609,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'cancel', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -6564,6 +6655,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchPush(io, args);
       case 'start':
 	return await dispatchStart(io, args);
+      case 'cancel':
+        return await dispatchCancel(io, args);
       case 'agent':
         return await dispatchAgent(io, args);
       case 'capability':
