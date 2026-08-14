@@ -2922,13 +2922,36 @@ test('parseDef rejects escalation.after >= the step default maxAttempts (3) — 
           escalation: { after: 3, modifier: 'deep' },
         }],
       }),
-    (e: unknown) => e instanceof DefError && /escalation\.after \(3\) must be strictly less than the step's effective maxAttempts \(3\)/.test((e as Error).message),
+    (e: unknown) => e instanceof DefError && /escalation\.after \(3\) must be strictly less than the step's highest per-produce maxAttempts \(3\)/.test((e as Error).message),
   );
 });
 
-test('parseDef measures escalation.after against the MINIMUM per-produce maxAttempts', () => {
-  // The step allows 5 attempts, but the `tight` produce overrides to 2. The
-  // step is dead once `tight` freezes, so 2 is the ceiling that applies.
+test('parseDef measures escalation.after against the HIGHEST per-produce maxAttempts', () => {
+  // The step allows 5 attempts; the `tight` produce overrides down to 2. The
+  // step is NOT dead when `tight` freezes: eligibleFirings drops a frozen
+  // output from the firing and still offers the step for `loose`, and
+  // routingFor tests the trigger over that same surviving output list. So the
+  // reachable ceiling is 5 (loose), not 2 (tight), and after: 4 is legal.
+  const def = parseDef({
+    name: 'graded',
+    modifiers: ['deep'],
+    inputs: [{ name: 'seed' }],
+    steps: [{
+      name: 'run',
+      consumes: ['seed'],
+      maxAttempts: 5,
+      produces: ['loose', { name: 'tight', maxAttempts: 2 }],
+      capabilities: ['build'],
+      escalation: { after: 4, modifier: 'deep' },
+    }],
+  });
+  assert.deepEqual(def.steps[0]!.escalation, { after: 4, modifier: 'deep' });
+});
+
+test('parseDef rejects escalation.after == the HIGHEST per-produce maxAttempts', () => {
+  // One rung past the previous test: at 5 judgment rejects `loose` is stalled
+  // too, so every output of the step is frozen and no firing survives to carry
+  // the escalated re-offer.
   assert.throws(
     () =>
       parseDef({
@@ -2941,10 +2964,10 @@ test('parseDef measures escalation.after against the MINIMUM per-produce maxAtte
           maxAttempts: 5,
           produces: ['loose', { name: 'tight', maxAttempts: 2 }],
           capabilities: ['build'],
-          escalation: { after: 4, modifier: 'deep' },
+          escalation: { after: 5, modifier: 'deep' },
         }],
       }),
-    (e: unknown) => e instanceof DefError && /escalation\.after \(4\) must be strictly less than the step's effective maxAttempts \(2\)/.test((e as Error).message),
+    (e: unknown) => e instanceof DefError && /escalation\.after \(5\) must be strictly less than the step's highest per-produce maxAttempts \(5\)/.test((e as Error).message),
   );
 });
 

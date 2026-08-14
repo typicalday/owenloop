@@ -1619,15 +1619,35 @@ export function validateDef(def: WorkflowDef): string[] {
         'an escalated re-offer composes <capability>:<modifier>, so there is nothing to escalate',
       );
     }
+    // The rule is REACHABILITY: at least one owed output must be able to sit at
+    // `after` judgment rejects while still being re-offered. That is a MAX over
+    // the per-produce caps, not a MIN, because the engine evaluates the trigger
+    // per owed path and drops frozen paths from the firing rather than killing
+    // the firing:
+    //
+    //   - eligibleFirings (model.ts) filters a step's outputs to the ones that
+    //     are still debt AND not frozen, and emits the firing when that filtered
+    //     list is non-empty. A step producing `plan` (cap 6) and `consult`
+    //     (cap 2) keeps firing for `plan` after `consult` has stalled.
+    //   - routingFor (engine.ts) then tests `f.outputs.find((p) => isEscalated(
+    //     arts.get(p), rule.after))` — the SAME filtered list. One live path over
+    //     the threshold is enough to route.
+    //
+    // So the shortest-fused produce freezing does not end the step, and a
+    // MIN ceiling would reject a def whose escalation is plainly reachable
+    // through a longer-fused produce. The `>=` is still right at the MAX: an
+    // artifact with `judgmentRejects >= cap` is stalled (isStalled, model.ts),
+    // therefore frozen, therefore filtered out of `f.outputs` before routingFor
+    // ever looks at it — so `after` equal to the highest cap can never fire.
     const attemptCeilings = l.produces.length > 0
       ? l.produces.map((p) => p.maxAttempts ?? l.maxAttempts)
       : [l.maxAttempts];
-    const ceiling = Math.min(...attemptCeilings);
+    const ceiling = Math.max(...attemptCeilings);
     if (l.escalation.after >= ceiling) {
       errors.push(
         `step '${l.name}': escalation.after (${l.escalation.after}) must be strictly less than ` +
-        `the step's effective maxAttempts (${ceiling}); at ${ceiling} rejections the artifact freezes, ` +
-        'so the escalated re-offer could never run',
+        `the step's highest per-produce maxAttempts (${ceiling}); at ${ceiling} rejections every ` +
+        'output has frozen, so the escalated re-offer could never run',
       );
     }
   }
