@@ -14,6 +14,15 @@ const semver = createRequire(import.meta.url)('semver') as SemverApi;
 export const SUPPORTED_RUNTIME_FEATURES = Object.freeze([
   'harness-policy-enforcement.v1',
   'native-judge-policy-inheritance.v1',
+  // A def may write `x.harness.permissionMode` as one of the three neutral
+  // values (`ask`, `auto-safe`, `full-access`) and every adapter translates it
+  // into the vendor mode with the same meaning, or refuses it at preflight.
+  // A def that uses one MUST require this id: on a CLI that predates it, every
+  // adapter refuses the neutral value as out-of-vocabulary, so the step fails
+  // closed — correct, but with a message about a bad permission mode rather
+  // than about an old runtime. Requiring the id moves the diagnosis to the
+  // bundle check, before any order is offered.
+  'neutral-approval-modes.v1',
 ] as const);
 
 export interface RuntimeCompatibilityEnvironment {
