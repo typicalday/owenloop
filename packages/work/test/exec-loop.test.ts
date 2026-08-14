@@ -188,6 +188,10 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[]; submits: Submit
       if (item instanceof Error) throw item;
       return { text: item.text ?? 'reject', ok: item.ok ?? true, ...(item.closed !== undefined ? { closed: item.closed } : {}) };
     },
+    async reportResolution(req) {
+      calls.push({ verb: 'report_resolution', arg: req });
+      return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
+    },
     async whoami() {
       return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' };
     },

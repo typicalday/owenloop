@@ -29,6 +29,8 @@ import type {
   ReleaseResponse,
   RejectRequest,
   RejectResponse,
+  ReportResolutionRequest,
+  ReportResolutionResponse,
   SubmitRequest,
   SubmitResponse,
   WakeResponse,
@@ -53,6 +55,12 @@ export interface HubClient {
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
   reject(req: RejectRequest): Promise<RejectResponse>;
+  /**
+   * Plan §6: record what this shift resolved the order's compound capability to,
+   * BEFORE the harness launches. Idempotent on the hub by order id, so a
+   * re-dispatch no-ops rather than overwriting the first (pre-spend) record.
+   */
+  reportResolution(req: ReportResolutionRequest): Promise<ReportResolutionResponse>;
   whoami(): Promise<WhoamiResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
   wake(cursor?: number): Promise<WakeResponse>;
@@ -126,6 +134,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     release: (req) => post<ReleaseResponse>('release', req),
     submit: (req) => post<SubmitResponse>('submit', req),
     reject: (req) => post<RejectResponse>('reject', req),
+    reportResolution: (req) => post<ReportResolutionResponse>('report_resolution', req),
     whoami: () => get<WhoamiResponse>('whoami'),
     // Cursor is an opaque non-negative integer; omit it entirely to bootstrap
     // (the hub treats missing/invalid as a `changed: true` first sweep).

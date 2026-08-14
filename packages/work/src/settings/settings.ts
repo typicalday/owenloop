@@ -14,7 +14,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { validateTierProfiles, type TierProfiles } from '../agent/model-policy.ts';
+import { type CapabilityModelRow, validateCapabilityModels } from '../agent/capability-model.ts';
 
 /**
  * The settings surface — every knob optional, a missing file loading as `{}`.
@@ -116,20 +116,18 @@ export interface Settings {
    * of the MACHINE running the shift, not of the workflow.
    */
   workRepo?: string;
-  /** Quality-tier to concrete model mapping; merged over the built-in map. */
-  tierMap?: Record<string, string>;
   /**
-   * Quality-tier to `{ model, efforts, defaultEffort }`. When present this
-   * REPLACES `tierMap` for every tier-named step model — it is not merged with
-   * the built-in map and not merged with `tierMap`, so it must define all four
-   * tiers or the load fails. That is the whole point: `tierMap` merges, which
-   * means a file naming three tiers silently inherits a default for the fourth.
+   * How THIS machine serves each capability: a flat map from capability to
+   * `{model, effort}`, keyed by the composed capability (`wise:deep`) or by the
+   * bare name (`wise`). See `src/agent/capability-model.ts` for the lookup rule
+   * and for why this replaced `tierMap`/`tierProfiles` outright.
+   *
+   * Carry a bare row per capability the shift's crews serve. The bare row is
+   * what makes a hub name-match fallback order resolvable — the hub can stamp
+   * `wise:deep` on an order claimed by a crew bound only to `wise:standard`,
+   * and that shift has no `wise:deep` row by construction.
    */
-  tierProfiles?: Record<string, { model: string; efforts: string[]; defaultEffort: string }>;
-  /** Reject count at which the default retry policy escalates. */
-  escalateAt?: number;
-  /** Extension namespace containing an authored escalation object. */
-  escalationExtensionKey?: string;
+  capabilityModels?: Record<string, CapabilityModelRow>;
 }
 
 /** The known settings keys, in the order `owenloop work settings` prints them. */
@@ -146,11 +144,19 @@ export const KNOWN_SETTINGS_KEYS = [
   'maxConcurrentAgents',
   'workRoot',
   'workRepo',
-  'tierMap',
-  'tierProfiles',
-  'escalateAt',
-  'escalationExtensionKey',
+  'capabilityModels',
 ] as const;
+
+/**
+ * Keys owenloop still RECOGNIZES but no longer acts on. Each one produces a
+ * warning naming what replaced it, and is excluded from `unrecognized` so the
+ * same key is not also reported as a likely typo.
+ *
+ * Distinct from `tierMap`/`tierProfiles`, which are a hard error: ignoring
+ * those would leave the shift with no capability map and refuse every order,
+ * whereas ignoring these changes nothing about how a shift runs.
+ */
+export const RETIRED_IGNORED_KEYS = ['escalateAt', 'escalationExtensionKey'] as const;
 
 /**
  * A validated load: the typed `settings` (unknown keys retained for forward
@@ -161,6 +167,20 @@ export interface ValidatedSettings {
   settings: Settings;
   /** Keys present in the file that owenloop does not recognize. */
   unrecognized: string[];
+  /**
+   * Non-fatal findings from validation, in the order they were noticed.
+   *
+   * A SEPARATE CHANNEL FROM `unrecognized` because it answers a different
+   * question. `unrecognized` says "owenloop does not know this key at all,
+   * probably a typo"; a warning says "the key is known, but something about it
+   * is worth your attention" — today, only `RETIRED_IGNORED_KEYS`: a key
+   * owenloop still recognizes and no longer acts on.
+   *
+   * Callers decide what to do with these. `owenloop work settings` prints them;
+   * the shift prints them once at startup. Nothing here ever blocks a load —
+   * anything that should block throws instead.
+   */
+  warnings: string[];
 }
 
 /** The result of inspecting the settings file: where it is, whether it exists, and its validated contents. */
@@ -199,6 +219,7 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
     throw new Error(`invalid settings file at ${path}: expected a JSON object, got ${got}`);
   }
   const obj = raw as Record<string, unknown>;
+  const warnings: string[] = [];
   const bad = (key: string, expected: string, value: unknown): Error =>
     new Error(
       `invalid settings file at ${path}: '${key}' must be ${expected}, got ${JSON.stringify(value)}`,
@@ -227,45 +248,52 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
       throw bad('maxConcurrentAgents', 'a positive integer', v);
     }
   }
-  if ('tierMap' in obj) {
-    const v = obj['tierMap'];
-    if (typeof v !== 'object' || v === null || Array.isArray(v)) {
-      throw bad('tierMap', 'an object whose values are non-empty strings', v);
-    }
-    for (const value of Object.values(v as Record<string, unknown>)) {
-      if (typeof value !== 'string' || value.trim() === '') throw bad('tierMap', 'an object whose values are non-empty strings', v);
+  // RETIRED KEYS ARE A HARD ERROR, NOT AN IGNORED ONE. A file still naming
+  // `tierMap` or `tierProfiles` describes a routing scheme that no longer
+  // exists; passing it over as an unrecognized key would start the shift with
+  // NO capability map at all, and every agent order would then be refused at
+  // dispatch with a message about capabilities the operator never wrote.
+  for (const retired of ['tierMap', 'tierProfiles'] as const) {
+    if (retired in obj) {
+      throw new Error(
+        `invalid settings file at ${path}: '${retired}' was removed — tiers are replaced by ` +
+          `'capabilityModels', a flat map from capability to { model, effort } ` +
+          `(e.g. {"capabilityModels": {"wise:deep": {"model": "<model-id>", "effort": "xhigh"}}}). ` +
+          `Depth now rides on the capability's modifier suffix, not on a tier rung.`,
+      );
     }
   }
-  if ('tierProfiles' in obj) {
-    const v = obj['tierProfiles'];
+  if ('capabilityModels' in obj) {
+    const v = obj['capabilityModels'];
     if (typeof v !== 'object' || v === null || Array.isArray(v)) {
-      throw bad('tierProfiles', 'an object of { model, efforts, defaultEffort } per tier', v);
+      throw bad('capabilityModels', 'an object of { model, effort } per capability', v);
     }
-    for (const [tier, profile] of Object.entries(v as Record<string, unknown>)) {
-      if (typeof profile !== 'object' || profile === null || Array.isArray(profile)) {
-        throw bad(`tierProfiles.${tier}`, 'an object with model, efforts and defaultEffort', profile);
-      }
-    }
-    // Shape is right; now the SEMANTIC rules — completeness, known effort
-    // rungs, defaultEffort actually offered. Deliberately at load time: a crew
-    // whose profiles are wrong should fail when the shift starts, not on the
-    // first order that happens to land on the broken tier, hours later.
+    // Row shape and effort validity are checked at LOAD, not at resolution: a
+    // shift whose map is wrong should fail when it starts, not on the first
+    // order that happens to land on the broken row, hours later.
     try {
-      validateTierProfiles(v as TierProfiles);
+      validateCapabilityModels(v as Record<string, unknown>);
     } catch (e) {
-      throw new Error(`invalid settings: ${e instanceof Error ? e.message : String(e)}`);
+      throw new Error(`invalid settings file at ${path}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  if ('escalateAt' in obj) {
-    const v = obj['escalateAt'];
-    if (typeof v !== 'number' || !Number.isInteger(v) || v <= 0) {
-      throw bad('escalateAt', 'a positive integer', v);
-    }
-  }
-  if ('escalationExtensionKey' in obj) {
-    const v = obj['escalationExtensionKey'];
-    if (typeof v !== 'string' || v.trim() === '') {
-      throw bad('escalationExtensionKey', 'a non-empty string', v);
+  // RETIRED, BUT ONLY A WARNING — a different case from `tierMap` above, and the
+  // difference is what happens if the key is silently ignored.
+  //
+  // These two configured the WORKER-LOCAL escalation that bumped an order's
+  // model after N judgment rejections. Escalation is now entirely the engine's:
+  // it re-offers the step composed with the def's `escalation.modifier`, and the
+  // shift resolves that new compound like any other. So a file still carrying
+  // these describes a mechanism that no longer runs — but escalation itself
+  // still happens, correctly, without them. Ignoring them changes no behavior;
+  // it only leaves the operator believing a knob does something. A warning says
+  // exactly that, and does not stop a shift from starting.
+  for (const retired of RETIRED_IGNORED_KEYS) {
+    if (retired in obj) {
+      warnings.push(
+        `'${retired}' no longer does anything and is ignored — retry escalation moved into the engine, ` +
+          `which re-offers a rejected step at the def's 'escalation.modifier'. Remove the key.`,
+      );
     }
   }
   if ('commandRouting' in obj) {
@@ -285,9 +313,13 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
     }
   }
 
-  const known = new Set<string>(KNOWN_SETTINGS_KEYS);
+  // The retired-but-warned keys count as KNOWN for this purpose. They are not
+  // typos — owenloop recognizes them perfectly well and has already said, in a
+  // warning, that they no longer take effect. Listing them again under
+  // "unrecognized keys (ignored — likely typos)" would contradict that.
+  const known = new Set<string>([...KNOWN_SETTINGS_KEYS, ...RETIRED_IGNORED_KEYS]);
   const unrecognized = Object.keys(obj).filter((k) => !known.has(k));
-  return { settings: obj as Settings, unrecognized };
+  return { settings: obj as Settings, unrecognized, warnings };
 }
 
 /**
@@ -299,7 +331,7 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
  */
 export function inspectSettings(env: Record<string, string | undefined>): SettingsInspection {
   const path = settingsPath(env);
-  if (!existsSync(path)) return { path, exists: false, settings: {}, unrecognized: [] };
+  if (!existsSync(path)) return { path, exists: false, settings: {}, unrecognized: [], warnings: [] };
   const raw = readFileSync(path, 'utf8');
   let parsed: unknown;
   try {

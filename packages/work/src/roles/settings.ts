@@ -12,17 +12,20 @@
  * the file is malformed JSON or a known key has the wrong type · 2 on stray
  * args (there are no options in v1).
  */
-import { DEFAULT_TIER_MAP } from '../agent/model-policy.ts';
 import { inspectSettings, KNOWN_SETTINGS_KEYS } from '../settings/settings.ts';
 
-/** Built-in defaults shown for knobs absent from the file (else `unset`). */
+/**
+ * Built-in defaults shown for knobs absent from the file (else `unset`).
+ *
+ * `capabilityModels` is deliberately absent: it HAS no built-in default. A shift
+ * with no row for an order's capability refuses that order rather than falling
+ * back to some default model, so printing a default here would describe
+ * behaviour that does not exist.
+ */
 const DEFAULT_NOTE: Partial<Record<(typeof KNOWN_SETTINGS_KEYS)[number], string>> = {
   dispatchCap: '3',
   commandRouting: 'shift',
   defPolicy: 'warn',
-  tierMap: JSON.stringify(DEFAULT_TIER_MAP),
-  escalateAt: '3',
-  escalationExtensionKey: 'delivery',
 };
 
 function errMsg(err: unknown): string {
@@ -54,7 +57,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 1;
   }
 
-  const { path, exists, settings, unrecognized } = inspection;
+  const { path, exists, settings, unrecognized, warnings } = inspection;
   out(`settings file: ${path}`);
   out(`exists: ${exists ? 'yes' : 'no'}`);
   out('');
@@ -71,6 +74,14 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   if (unrecognized.length > 0) {
     out('');
     out(`unrecognized keys (ignored — likely typos): ${unrecognized.join(', ')}`);
+  }
+  // Warnings are keys owenloop still recognizes but no longer acts on. They do
+  // not fail the load and so do not change the exit code; a shift that starts on
+  // this file starts fine. They print because the alternative is the operator
+  // continuing to believe a dead knob does something.
+  if (warnings.length > 0) {
+    out('');
+    for (const warning of warnings) out(`warning: ${warning}`);
   }
   return 0;
 }

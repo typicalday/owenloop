@@ -76,6 +76,9 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
       return { text: '' };
     },
     async reject() { return { text: '', ok: true }; },
+    async reportResolution(req) {
+      return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
+    },
     async whoami() {
       return { text: '', orgId: '', orgName: '', actor: { id: '', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' };
     },

@@ -115,43 +115,101 @@ test('loadSettings: each C6 knob loads with its value', () => {
   }
 });
 
-test('loadSettings: model policy knobs load with their values', () => {
+test('loadSettings: capabilityModels loads as a flat capability → { model, effort } map', () => {
   const xdg = withSettingsFile(
     JSON.stringify({
-      tierMap: { strong: 'custom-strong' },
-      escalateAt: 5,
-      escalationExtensionKey: 'delivery-extra',
+      capabilityModels: {
+        'build:deep': { model: 'claude-opus-5', effort: 'xhigh' },
+        build: { model: 'claude-sonnet-5', effort: 'high' },
+      },
     }),
   );
   try {
     const s = loadSettings({ XDG_CONFIG_HOME: xdg });
-    assert.deepEqual(s.tierMap, { strong: 'custom-strong' });
-    assert.equal(s.escalateAt, 5);
-    assert.equal(s.escalationExtensionKey, 'delivery-extra');
-    assert.ok(KNOWN_SETTINGS_KEYS.includes('tierMap'));
-    assert.ok(KNOWN_SETTINGS_KEYS.includes('escalateAt'));
-    assert.ok(KNOWN_SETTINGS_KEYS.includes('escalationExtensionKey'));
+    assert.deepEqual(s.capabilityModels, {
+      'build:deep': { model: 'claude-opus-5', effort: 'xhigh' },
+      build: { model: 'claude-sonnet-5', effort: 'high' },
+    });
+    assert.ok(KNOWN_SETTINGS_KEYS.includes('capabilityModels'));
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
 });
 
-test('loadSettings: model policy knobs reject invalid values', () => {
+test('loadSettings: capabilityModels rejects malformed rows at LOAD time, not at dispatch', () => {
+  // Every one of these would otherwise surface as a vendor API error in the
+  // middle of somebody's order, hours after the file was edited.
   const cases: Array<[string, unknown, RegExp]> = [
-    ['tierMap', { strong: '' }, /'tierMap' must be an object whose values are non-empty strings/],
-    ['tierMap', [], /'tierMap' must be an object whose values are non-empty strings/],
-    ['escalateAt', 0, /'escalateAt' must be a positive integer/],
-    ['escalateAt', 1.5, /'escalateAt' must be a positive integer/],
-    ['escalationExtensionKey', '  ', /'escalationExtensionKey' must be a non-empty string/],
-    ['escalationExtensionKey', 4, /'escalationExtensionKey' must be a non-empty string/],
+    ['not an object', 'nope', /'capabilityModels' must be an object/],
+    ['an array', [], /'capabilityModels' must be an object/],
+    ['an empty capability key', { '': { model: 'claude-opus-5', effort: 'high' } }, /may not be empty/u],
+    ['a non-object row', { build: 'claude-opus-5' }, /build/u],
+    ['an empty model', { build: { model: '', effort: 'high' } }, /model/u],
+    ['an off-ladder effort', { build: { model: 'some-model', effort: 'turbo' } }, /turbo/u],
+    ['a missing effort', { build: { model: 'some-model' } }, /effort/u],
   ];
-  for (const [key, value, expected] of cases) {
-    const xdg = withSettingsFile(JSON.stringify({ [key]: value }));
+  for (const [label, value, expected] of cases) {
+    const xdg = withSettingsFile(JSON.stringify({ capabilityModels: value }));
     try {
-      assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), expected, `${key} should be rejected`);
+      assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), expected, `${label} should be rejected`);
     } finally {
       rmSync(xdg, { recursive: true, force: true });
     }
+  }
+});
+
+test('loadSettings: any model id loads — owenloop never gatekeeps which models exist', () => {
+  // The effort must be a real rung, but WHICH model serves a capability is the
+  // operator's call and their harness's business. A model released after this
+  // build shipped is the expected case, not an error, and there is no warning
+  // for it either: owenloop has nothing true to say about it.
+  const xdg = withSettingsFile(
+    JSON.stringify({ capabilityModels: { wise: { model: 'some-brand-new-model', effort: 'max' } } }),
+  );
+  try {
+    const i = inspectSettings({ XDG_CONFIG_HOME: xdg });
+    assert.deepEqual(i.warnings, []);
+    assert.deepEqual(i.settings.capabilityModels?.['wise'], { model: 'some-brand-new-model', effort: 'max' });
+  } finally {
+    rmSync(xdg, { recursive: true, force: true });
+  }
+});
+
+test('loadSettings: the retired tier keys are a HARD ERROR, naming their replacement', () => {
+  // Not merely unrecognized. Passing `tierMap` over silently would start the
+  // shift with NO capability map, and every agent order would then be refused
+  // at dispatch citing capabilities the operator never wrote.
+  for (const retired of ['tierMap', 'tierProfiles'] as const) {
+    const xdg = withSettingsFile(JSON.stringify({ [retired]: { strong: 'custom-strong' } }));
+    try {
+      assert.throws(
+        () => loadSettings({ XDG_CONFIG_HOME: xdg }),
+        new RegExp(`'${retired}' was removed .* 'capabilityModels'`, 'su'),
+        `${retired} should be a hard error`,
+      );
+    } finally {
+      rmSync(xdg, { recursive: true, force: true });
+    }
+  }
+});
+
+test('loadSettings: the retired escalation keys only WARN — ignoring them changes no behavior', () => {
+  // The opposite case from `tierMap`. Retry escalation moved INTO the engine,
+  // which re-offers a rejected step at the def's `escalation.modifier`. So a
+  // file still carrying these describes a mechanism that no longer runs, but
+  // escalation itself still happens correctly without them.
+  const xdg = withSettingsFile(JSON.stringify({ escalateAt: 5, escalationExtensionKey: 'delivery-extra' }));
+  try {
+    const i = inspectSettings({ XDG_CONFIG_HOME: xdg });
+    assert.equal(i.warnings.length, 2);
+    assert.ok(i.warnings.every((w) => w.includes('no longer does anything')));
+    assert.ok(i.warnings.some((w) => w.includes('escalateAt')));
+    assert.ok(i.warnings.some((w) => w.includes('escalationExtensionKey')));
+    // Warnings are NOT unrecognized keys: the file means something real, it
+    // just no longer takes effect.
+    assert.deepEqual(i.unrecognized, []);
+  } finally {
+    rmSync(xdg, { recursive: true, force: true });
   }
 });
 
