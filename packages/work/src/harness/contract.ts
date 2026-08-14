@@ -131,9 +131,28 @@ export interface StepPermissions {
  * - `full-access` — nothing is gated. The harness never consults a human, and
  *   a failed action is simply reported back to the model.
  *
- * `auto-safe` is NOT a milder `full-access`: it can still stop and ask. A
- * headless step that must not stall wants `full-access`, and the two exist
- * separately so that choice is stated rather than inferred.
+ * `auto-safe` is NOT a milder `full-access`: the position it names still has a
+ * human exception path. A headless step that must not stall wants
+ * `full-access`, and the two exist separately so that choice is stated rather
+ * than inferred.
+ *
+ * WHAT `auto-safe` COSTS YOU TODAY, MEASURED. The three positions above
+ * describe the vocabulary, not a guarantee about how far any given classifier
+ * actually goes before it consults someone. On one shipped adapter the
+ * classifier was probed with five actions — among them a recursive delete on an
+ * absolute path outside the session working directory, an outbound network
+ * request, and a read of a file outside that directory — and it consulted the
+ * host on none of them and reported no auto-denial for any of them; four ran.
+ * On the other, the position that maps to `auto-safe` keys its judgment on
+ * filesystem access being restricted, so a step that also declares
+ * `filesystem: unrestricted` moves it close to `full-access` as well.
+ *
+ * The practical consequence for a definition author: choosing `auto-safe`
+ * because you want a person consulted on the dangerous cases may get you
+ * neither the prompt nor a record that one was skipped. Choose `ask` when a
+ * human decision genuinely has to happen, and `full-access` when it genuinely
+ * must not. Treat `auto-safe` as the classifier's own judgment with no
+ * guaranteed appeal, not as a supervised `full-access`.
  *
  * `ask` and `auto-safe` are meaningful only where something can answer a
  * prompt. In a Shift-dispatched run nothing can, so a prompt is a stall: the

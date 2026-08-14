@@ -218,11 +218,24 @@ const PERMISSION_MODES: readonly string[] = [
  *   `canUseTool` callback — a human decision point — and denies when no callback
  *   is wired. That is the "human is the gate" position.
  * - `auto-safe` → `auto`. `auto` is the SDK's model-classifier mode: it decides
- *   per call and escalates the ones it judges dangerous. NOT `acceptEdits`,
- *   which auto-approves filesystem operations by category and applies no
- *   judgment to anything else, and NOT `dontAsk`, which DENIES an unapproved
- *   tool rather than consulting anyone — silently narrower than what the step
- *   asked for.
+ *   per call, with no prompt. NOT `acceptEdits`, which auto-approves filesystem
+ *   operations by category and applies no judgment to anything else, and NOT
+ *   `dontAsk`, which DENIES an unapproved tool rather than consulting anyone —
+ *   silently narrower than what the step asked for.
+ *
+ *   MEASURED against SDK 0.3.220, `canUseTool` wired throughout: the classifier
+ *   consulted the host on NONE of five probe commands, and emitted no
+ *   `permission_denied` system message for any of them. Four ran, including
+ *   `rm -rf` on an ABSOLUTE path outside the session cwd (verified by the
+ *   target directory being gone afterwards), a `curl` to the public internet,
+ *   and a read of a file under `$HOME` outside cwd.
+ *
+ *   So `auto` does not, in practice, escalate to whoever hosts the session.
+ *   Wiring `canUseTool` does not give `auto-safe` a human exception path — the
+ *   callback is simply never reached. Anything that needs a person in the loop
+ *   has to run under `ask`, whose `default` mode does route to the callback
+ *   (measured on the same SDK build, including calls originating inside a
+ *   subagent, which arrive carrying that subagent's `agentID`).
  * - `full-access` → `bypassPermissions`. The only SDK mode that runs tools with
  *   no prompt at all, and the one the companion flag below exists for.
  *
