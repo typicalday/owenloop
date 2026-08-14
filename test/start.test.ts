@@ -82,12 +82,17 @@ test('start: bound-project happy path posts inputs and crew with the human crede
   });
 });
 
-test('start: missing or empty crew/title values fail before credential and network access', async () => {
+test('start: missing or empty crew/title/modifier values fail before credential and network access', async () => {
   const cases = [
     { argv: ['start', 'newhire-onboarding', '--crew'], error: /missing value for --crew/u },
     { argv: ['start', 'newhire-onboarding', '--title'], error: /missing value for --title/u },
+    { argv: ['start', 'newhire-onboarding', '--modifier'], error: /missing value for --modifier/u },
     { argv: ['start', 'newhire-onboarding', '--crew='], error: /invalid empty value for --crew/u },
     { argv: ['start', 'newhire-onboarding', '--title='], error: /invalid empty value for --title/u },
+    // `--modifier=` is a usage error, NOT a silent unmodified run. The REST
+    // route reads `''` as omitted, so forwarding a blank value would start a
+    // run at bare capabilities while the operator believes they picked a depth.
+    { argv: ['start', 'newhire-onboarding', '--modifier='], error: /invalid empty value for --modifier/u },
   ] as const;
 
   for (const fixture of cases) {
@@ -119,6 +124,37 @@ test('start: missing or empty crew/title values fail before credential and netwo
     assert.equal(credentialAccesses, 0, `${fixture.argv.join(' ')} must not access credentials`);
     assert.equal(calls.length, 0, `${fixture.argv.join(' ')} must not access the network`);
   }
+});
+
+/**
+ * `--modifier` is the only way a human picks a run's depth from the CLI. It
+ * reaches the hub as the request body's `modifier`, which `start_run` validates
+ * against the def's declared `modifiers:` set and stores on the instance; the
+ * engine then composes every step's capability into `<capability>:<modifier>`.
+ *
+ * The companion assertion lives in the happy-path test above, which `deepEqual`s
+ * both the body and the printed object for a run started WITHOUT the flag: no
+ * `modifier` key in either. That pins the omitted case as "unmodified run, bare
+ * capabilities" rather than "modifier: undefined", which is a different request.
+ */
+test('start: --modifier forwards the run modifier and echoes it back', async () => {
+  const { fetch, calls } = routedFetch({
+    'POST /api/start_run': () => ({ status: 200, json: STARTED }),
+  });
+  const t = makeIo({ fetch });
+  bind(t);
+
+  const code = await mainAsync(['start', 'newhire-onboarding', '--modifier', 'deep'], t.io);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(JSON.parse(calls[0]!.body ?? '{}'), {
+    workflow_name: 'newhire-onboarding',
+    modifier: 'deep',
+  });
+  // Echoed from the request: `start_run`'s response carries no `modifier`
+  // field, and a value outside the def's declared set is a 400 before any
+  // instance exists — so a printed modifier can only be one the hub accepted.
+  assert.equal(JSON.parse(t.out.join('\n')).modifier, 'deep');
 });
 
 test('start: an explicit literal title "true" remains a valid value', async () => {

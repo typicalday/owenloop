@@ -1397,8 +1397,11 @@ Commands:
   push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--hub <origin>] [--as <slot>]
     publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (server-diffed, idempotent)
                                          --as names the credential slot: human (default), agent, or agent:<account>
-  start <defName> [--provide name=json ...] [--crew <name>] [--title <text>] [--hub <url>]
+  start <defName> [--provide name=json ...] [--crew <name>] [--title <text>] [--modifier <name>] [--hub <url>]
 ${' '.repeat(41)}start a published workflow on the bound hub (human credential)
+${' '.repeat(41)}--modifier names one value from the def's declared \`modifiers:\` set; every
+${' '.repeat(41)}step's capability is then offered as \`<capability>:<modifier>\`. Omit it and
+${' '.repeat(41)}the run carries no modifier and its steps are offered on BARE capabilities.
   agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --shift = --scopes work,run)
   capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
   capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
@@ -1491,7 +1494,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['publish', cmdOpts('unsigned', 'output', 'source', 'hub')],
   ['trust', cmdOpts('force', 'key', 'principal', 'pools', 'labels', 'namespaces', 'delegate', 'signing-key', 'output', 'reason', 'effective-from')],
   ['push', cmdOpts('dry-run', 'force', 'hub', 'as', 'bundle')],
-  ['start', cmdOpts('hub', 'crew', 'title', 'provide')],
+  ['start', cmdOpts('hub', 'crew', 'title', 'provide', 'modifier')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
   ['crew', cmdOpts('hub', 'kind', 'owner')],
@@ -4395,7 +4398,7 @@ async function hubRequestMessage(res: Response): Promise<string | undefined> {
  */
 async function dispatchStart(io: CliIO, args: Args): Promise<number> {
   const defName = need(args, 1, 'defName');
-  const requiredTextOption = (key: 'crew' | 'title', label: string): string | undefined => {
+  const requiredTextOption = (key: 'crew' | 'title' | 'modifier', label: string): string | undefined => {
     if (args.missingOptionValues.has(key)) {
       throw new CliError(`missing value for --${key}: expected --${key} <${label}>`);
     }
@@ -4408,6 +4411,13 @@ async function dispatchStart(io: CliIO, args: Args): Promise<number> {
   // Validate request-only options before project binding, Keychain, or network access.
   const crew = requiredTextOption('crew', 'name');
   const title = requiredTextOption('title', 'text');
+  // The run's ONE routing modifier. Validated by the hub against the def's
+  // declared `modifiers:` set (a value outside it is a 400 `modifier_refused`),
+  // so the CLI only enforces the shape every other text option enforces:
+  // `--modifier` with no value, or with an empty one, is a usage error rather
+  // than a silent unmodified run. Omitting the flag entirely IS the unmodified
+  // run — that is the difference `requiredTextOption` preserves.
+  const modifier = requiredTextOption('modifier', 'name');
   const origin = resolveStartHub(io, args);
   const slot: CredentialSlotSelector = { principal: 'human' };
   const cred = readCredential(io, origin, slot);
@@ -4421,6 +4431,10 @@ async function dispatchStart(io: CliIO, args: Args): Promise<number> {
     ...(Object.keys(provide).length > 0 ? { provide } : {}),
     ...(crew !== undefined ? { default_crew: crew } : {}),
     ...(title !== undefined ? { title } : {}),
+    // Spread-conditional, not `modifier` outright: the route reads `''` and
+    // absent as the same thing, but sending an explicit `undefined` would put a
+    // `modifier` key in the JSON body with a null value. Omitted means omitted.
+    ...(modifier !== undefined ? { modifier } : {}),
   };
 
   const { res, cred: used } = await authedPost(io, origin, slot, cred, '/api/start_run', request);
@@ -4456,6 +4470,13 @@ async function dispatchStart(io: CliIO, args: Args): Promise<number> {
     workflow: wire.workflow,
     def: wire.def,
     status: wire.status,
+    // Echoed from the REQUEST, not the response — `start_run` returns no
+    // `modifier` field. That is not an assumption about what the hub stored: a
+    // value outside the def's declared `modifiers:` set is refused with a 400
+    // before any instance exists, so reaching this line at all proves the hub
+    // accepted exactly this value. Printed only when the flag was passed, so an
+    // unmodified run's output is byte-identical to what it was before.
+    ...(modifier !== undefined ? { modifier } : {}),
     ...(Array.isArray(wire.stampedCrews) ? { stampedCrews: wire.stampedCrews } : {}),
     ...(Array.isArray(wire.validatedCrews) ? { validatedCrews: wire.validatedCrews } : {}),
   });
