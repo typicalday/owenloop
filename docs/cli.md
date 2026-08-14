@@ -1261,7 +1261,7 @@ checks both journal locations and dispatches by journal version; a v2 store
 journal uses `index.json` metadata and a v1 GitHub journal uses
 `installed.json` ledger corroboration.
 
-## Hub (`login` / `connect` / `push` / `start` / `publish` / `logout`)
+## Hub (`login` / `connect` / `push` / `start` / `cancel` / `publish` / `logout`)
 
 These commands authenticate, publish, and start workflows on a hosted **hub** (default
 `https://api.owenloop.com`). `login` and `logout` retain the generic resolver:
@@ -1324,6 +1324,35 @@ their live hub bindings. `--title <text>` is display-only. Both `--crew` and
 usage errors before credential or network access. The command does not claim,
 dispatch, close, or otherwise drive work—the standing Shift discovers the run
 through its normal crew inbox.
+
+### `cancel` — stop a running instance
+
+`owenloop cancel <workflow>` sends `POST /api/cancel_run` and prints whether the
+instance was cancelled, its resulting status, and the runs whose leases were
+closed. `--reason <text>` is optional and recorded on the hub's audit row; like
+`--crew`/`--title` on `start`, a bare `--reason` or `--reason=` is a local usage
+error before credential or network access. Hub resolution matches `start`: the
+project binding wins, and an explicit `--hub` must agree with it.
+
+This is the counterpart to `start`, and the only local way out of a run that can
+no longer make progress — a step whose worktree was deleted, or an instance
+pinned to a def version its shift can no longer satisfy. Such a run is otherwise
+re-offered forever and permanently occupies one of a shift's dispatch slots,
+because nothing else on the machine can move it to a terminal state.
+
+Three properties come from the hub verb, not from this command:
+
+- **Human-role-only.** `cancel_run` has no agent-scope entry, so an agent
+  credential is refused by the hub. `cancel` therefore always reads the `human`
+  credential slot and does not accept `--as`.
+- **Idempotent.** Cancelling an instance that already reached a terminal state
+  writes nothing and returns `cancelled: false` plus the state it found. That is
+  a success and exits 0 — a retried cancel must not look like a failure.
+- **Receipt says `failed`.** The receipt `outcome` union is only `done|failed`,
+  so a cancel composes its receipt as `failed`. The true cancel fact lives in the
+  instance's distinct `cancelled` status and an `action: 'cancel'` audit row.
+  `cancel` prints the status rather than the receipt outcome, so its output does
+  not imply the run failed on its own.
 
 **Publishing hub resolution.** `connect`, `push`, and `publish` resolve their
 target in this order:
