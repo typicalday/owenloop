@@ -210,6 +210,82 @@ dispatch: the shift reports it once on stderr and serves with logging disabled.
 Full field-by-field contract, retention rules, and uploader notes in
 [`docs/shift-logs.md`](shift-logs.md).
 
+**One harness per shift.** A shift has no per-order harness switch and no
+`--harness` flag. It never puts `--harness` on a worker's command line; each
+`agent-run` child resolves its own adapter, in this order:
+
+1. its own `--harness` flag — which a shift never supplies;
+2. `OWENLOOP_HARNESS` in the environment the child inherits, which is the
+   shift's environment;
+3. the `harness:` field on the verified step definition;
+4. the first registered adapter.
+
+Rank 2 is the operator's control. Export `OWENLOOP_HARNESS` in the shell that
+starts the shift and every agent order that shift dispatches runs on that
+adapter. To run two adapters at once, start two shifts:
+
+```bash
+OWENLOOP_HARNESS=claude-code XDG_CONFIG_HOME=~/.config/owenloop-shifts/claude owenloop shift start build --state-dir ~/.local/state/owenloop/claude
+```
+
+```bash
+OWENLOOP_HARNESS=codex XDG_CONFIG_HOME=~/.config/owenloop-shifts/codex owenloop shift start build --state-dir ~/.local/state/owenloop/codex
+```
+
+Both shifts may serve the SAME crew. The hub does not route by harness — it
+offers an order to any shift whose crew is bound to the order's capability, and
+whichever shift claims it first runs it on its own adapter.
+
+**Per-shift `XDG_CONFIG_HOME` is not optional when the adapters differ.** The
+settings file resolves from `XDG_CONFIG_HOME` (see above), and it carries
+`capabilityModels` — a map of composed capability to `{model, effort}` whose
+model ids are strings the SHIFT'S OWN adapter accepts. Two shifts on different
+adapters need different model ids for the same capability, so they need
+different settings files, so they need different `XDG_CONFIG_HOME` values. A
+shared config directory would give both shifts one adapter's model ids, and the
+shift holding the wrong adapter fails at the vendor API on its first order.
+
+Give each shift its own `--state-dir` as well. The state directory holds the
+control socket (`shift.sock`), and a second shift starting against a socket
+another shift already owns is refused.
+
+**`capabilityModels` — which model serves which capability.** The hub decides
+WHAT grade of work an order is; it composes the step's capability with the run's
+depth modifier and stamps the result on the order (`builder` at the `deep`
+modifier becomes `builder:deep`). It never decides which model serves that
+grade. That decision is local, and this map is where the operator makes it:
+
+```json
+{
+  "capabilityModels": {
+    "builder:deep": { "model": "claude-opus-5", "effort": "xhigh" },
+    "builder": { "model": "claude-sonnet-5", "effort": "high" },
+    "wise": { "model": "claude-fable-5", "effort": "xhigh" }
+  }
+}
+```
+
+Lookup runs two passes over the order's capabilities: every EXACT composed key
+first, then every BARE name part. `builder:deep` takes the first row above;
+`builder:express` has no exact row and falls back to the `builder` row.
+`effort` must be one of `low`, `medium`, `high`, `xhigh`, `max`. The model id is
+never checked against a list — owenloop keeps no registry of which models exist,
+so a model released after your owenloop build still works.
+
+A capability with no exact row and no bare row is REFUSED, not run on a default:
+the worker releases the claim, reports the refusal to the hub, and exits `1`. An
+order carrying no capabilities at all is not refused — it runs on the adapter's
+own default model, which is how capability-silent steps have always run.
+
+**Migrating from `tierMap` / `tierProfiles`.** Both keys are removed. A settings
+file that still contains either one fails to load with an error naming
+`capabilityModels`; the shift does not start. This is deliberate — a shift that
+ignored the old keys would have no capability map at all and would refuse every
+order it claimed, hours later and far from the cause. Rewrite the tier rungs as
+capability rows: whatever `tierProfiles.strongest` pointed at becomes the
+`{model, effort}` of your `:deep` rows, and whatever `standard` pointed at
+becomes the bare rows.
+
 A clean start or `--once` completion exits `0`. `owenloop shift --help` also
 exits `0`. Runtime failures such as credential reads or socket/runtime setup
 exit `1`. Usage and

@@ -21,7 +21,7 @@ import {
 import { ACCOUNT_TOKEN, SHIFT_TOKEN, ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 import { createFakeAdapter } from '../src/harness/fake.ts';
-import { createModelPolicy } from '../src/agent/model-policy.ts';
+import type { CapabilityModelMap } from '../src/agent/capability-model.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
 import { ResumeUnavailableError } from '../src/harness/contract.ts';
 import type { SessionRecord } from '../src/harness/session-store.ts';
@@ -46,12 +46,18 @@ interface OrderOpts {
   worker?: string;
   claimed?: boolean;
   outcome?: string;
-  /** Consumed input artifact values, keyed by path — `plan` carries the lane. */
+  /** Consumed input artifact values, keyed by path. */
   consumes?: Record<string, unknown>;
-  /** Owed outputs; their `judgmentRejects` drive retry escalation. */
+  /** Owed outputs, with their standing reject counts. */
   owes?: Array<{ path: string; judgmentRejects?: number }>;
-  /** Extension bag — the authored escalation ladder lives under a namespace. */
+  /** Extension bag. */
   x?: Record<string, unknown>;
+  /** The composed capabilities the engine offered this step under. */
+  capabilities?: string[];
+  /** The run's routing modifier, as `start_run` recorded it. */
+  modifier?: string;
+  /** Set by the engine when it re-offered this step at its escalation target. */
+  escalated?: boolean;
 }
 
 /** A get_order response carrying an agent order packet. */
@@ -69,6 +75,9 @@ function agentOrder(o: OrderOpts = {}): GetOrderResponse {
       outputs: [],
       ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
       ...(o.model !== undefined ? { model: o.model } : {}),
+      ...(o.capabilities !== undefined ? { capabilities: o.capabilities } : {}),
+      ...(o.modifier !== undefined ? { modifier: o.modifier } : {}),
+      ...(o.escalated !== undefined ? { escalated: o.escalated } : {}),
       ...(o.worker !== undefined ? { worker: o.worker } : {}),
       defDigest: 'test-agent-digest',
       ...(o.x !== undefined ? { x: o.x } : {}),
@@ -124,6 +133,17 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
       return { text: '' };
     },
     async reject() { return { text: '', ok: true }; },
+    async reportResolution(req) {
+      calls.push({ verb: 'report_resolution', arg: req });
+      return {
+        text: '',
+        workflow: req.workflow,
+        run: req.run,
+        step: 'builder',
+        recorded: true,
+        claimed: true,
+      };
+    },
     async whoami() {
       return {
         text: '',
@@ -209,7 +229,7 @@ interface BuildOpts {
   submitGraceMs?: number;
   shiftId?: string;
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
-  modelPolicy?: AgentRunLoopOptions['modelPolicy'];
+  capabilityModels?: CapabilityModelMap;
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
   dirExists?: AgentRunLoopOptions['dirExists'];
@@ -233,7 +253,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     loadStep: b.loadStep ?? (async () => (b.spec === undefined ? baseSpec() : b.spec)),
     resolveAdapter: () => resolution,
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
-    ...(b.modelPolicy === undefined ? {} : { modelPolicy: b.modelPolicy }),
+    ...(b.capabilityModels === undefined ? {} : { capabilityModels: b.capabilityModels }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
     ...(b.dirExists === undefined ? {} : { dirExists: b.dirExists }),
@@ -327,18 +347,31 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
   assert.deepEqual(start.args.permissions.extensions, { custom: 1 });
   // The step spec's model rides inside the permissions...
   assert.equal(start.args.permissions.model, 'm-step');
-  // ...while the order packet's model is the per-start override.
-  assert.equal(start.args.model, 'm-override');
+  // ...and the packet's own `model` field is DELIBERATELY not the override any
+  // more. It carries the def's authored tier NAME from the retired scheme
+  // (`strong`, `m-override`), which is not a vendor model id; putting it on the
+  // wire would send a nonexistent model to the harness. The per-start override
+  // now comes only from a `capabilityModels` row, and this order carries no
+  // capabilities to match one with.
+  assert.equal(start.args.model, undefined);
 });
 
-// ---- tier resolution from real packet data ----------------------------------
+// ---- capability routing from real packet data -------------------------------
 //
-// `model-policy.test.ts` covers the algorithm by calling `pickModel` with
-// literal arguments. These tests cover the WIRING instead: that the loop pulls
-// the lane out of `consumes.plan.lane`, the reject count out of `owes[]`, and
-// the escalation ladder out of the extension bag, and hands all three to the
-// resolver. Without them, the packet readers are the only unexercised part of
-// the path, and an escalation bug that only appears UNDER a lane ships green.
+// `capability-model.test.ts` covers the RESOLVER by calling
+// `resolveCapabilityModel` with literal arguments. These tests cover the
+// WIRING instead: that the loop reads `packet.capabilities`, hands them to the
+// settings map, puts the winning row on the harness `start` args, tells the hub
+// what it picked, and refuses the order outright when no row matches. Without
+// them the packet reader is the only unexercised part of the path, and a shift
+// that silently ran every order on the harness default would ship green.
+
+/** The map a real `capabilityModels` settings block produces. */
+const MAP: CapabilityModelMap = {
+  'build:deep': { model: 'claude-opus-5', effort: 'xhigh' },
+  build: { model: 'claude-sonnet-5', effort: 'high' },
+  wise: { model: 'claude-fable-5', effort: 'xhigh' },
+};
 
 /**
  * Resolve one order packet all the way to the harness `start` args.
@@ -348,13 +381,13 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
  * these tests are about, so it is satisfied with a pass-through that admits the
  * packet unchanged; the refusal behavior has its own tests further down.
  */
-async function startArgsFor(o: OrderOpts): Promise<StartArgs> {
+async function startArgsFor(o: OrderOpts, map: CapabilityModelMap = MAP): Promise<StartArgs> {
   const adapter = createFakeAdapter();
   const { hub } = mockHub({ getOrder: [agentOrder(o), agentOrder({ claimed: false, outcome: 'green' })] });
   const h = buildOpts({
     hub,
     adapter,
-    modelPolicy: createModelPolicy(),
+    capabilityModels: map,
     consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
   });
   await createAgentRunLoop(h.opts).run();
@@ -363,129 +396,146 @@ async function startArgsFor(o: OrderOpts): Promise<StartArgs> {
   return start.args;
 }
 
-test('the authored tier is resolved through the lane carried on the consumed plan artifact', async () => {
-  // No lane anywhere: the tier resolves, nothing clamps.
-  assert.equal((await startArgsFor({ model: 'strong' })).model, 'opus');
-
-  // A real express lane, shaped exactly as the engine copies a green `plan`
-  // artifact's value into `consumes['plan']`.
-  assert.equal((await startArgsFor({ model: 'strong', consumes: { plan: { lane: 'express' } } })).model, 'sonnet');
-
-  // SCAFFOLDING: the deep floor is the TOP tier (`strongest` → fable), not
-  // `strong`. Under a `strong` floor the top tier was unreachable by lane —
-  // only a def authoring `strongest` outright could enter it — which made
-  // "deep" mean "second best" and gave the crew no way to say otherwise.
-  // Phase 2 deletes the lane clamp in favour of per-step model arms; until
-  // then, deep means the crew's best tier.
-  assert.equal((await startArgsFor({ model: 'fast', consumes: { plan: { lane: 'deep' } } })).model, 'fable');
-
-  // The top tier is pinned against the express cap even when the lane is real.
-  assert.equal((await startArgsFor({ model: 'strongest', consumes: { plan: { lane: 'express' } } })).model, 'fable');
+test('an exact compound row serves the order, and its model and effort ride to the harness', async () => {
+  const args = await startArgsFor({ capabilities: ['build:deep'], modifier: 'deep' });
+  assert.equal(args.model, 'claude-opus-5');
+  assert.equal(args.effort, 'xhigh');
 });
 
-test('a malformed lane on the plan artifact fails open to no clamp', async () => {
-  // Fail-open is deliberate: a bad plan artifact must never stop an agent from
-  // running. Every one of these yields `undefined`, i.e. no lane adjustment.
-  for (const plan of [
-    { lane: 'EXPRESS' }, // wrong case is not a lane
-    { lane: 'turbo' }, // unknown string
-    { lane: 42 }, // wrong type
-    { lane: null },
-    {}, // key absent
-    'express', // the artifact value is not an object
-    null,
-    ['express'], // arrays are not lane carriers
-  ]) {
-    const args = await startArgsFor({ model: 'strong', consumes: { plan } });
-    assert.equal(args.model, 'opus', `expected no clamp for plan=${JSON.stringify(plan)}`);
-  }
-
-  // A packet with no `plan` key at all is the planner's own firing.
-  assert.equal((await startArgsFor({ model: 'strong', consumes: {} })).model, 'opus');
+test('a compound with no exact row falls back to the bare capability name', async () => {
+  // `build:express` has no row of its own; the bare `build` row covers every
+  // modifier the operator did not call out.
+  const args = await startArgsFor({ capabilities: ['build:express'], modifier: 'express' });
+  assert.equal(args.model, 'claude-sonnet-5');
+  assert.equal(args.effort, 'high');
 });
 
-test('reject escalation beats the express cap on a real packet, and consult paths do not count', async () => {
-  const express = { plan: { lane: 'express' } };
+test('an exact row on a LATER capability beats a bare row on an earlier one', async () => {
+  // Both passes run across the whole list before the other is tried. Resolving
+  // capability-by-capability instead would hand this order to `build`'s bare
+  // row and never see that `wise` was named exactly.
+  const args = await startArgsFor({ capabilities: ['build:express', 'wise'] });
+  assert.equal(args.model, 'claude-fable-5');
+  assert.equal(args.effort, 'xhigh');
+});
 
-  // The delivery line's reviewer step is authored `strong:4`. Under an express
-  // lane it starts clamped, bumps effort at the threshold, and escalates the
-  // model at twice the threshold — it never gets stuck at the cap.
-  const cold = await startArgsFor({ model: 'strong:4', consumes: express, owes: [{ path: 'verdict' }] });
-  assert.equal(cold.model, 'sonnet');
-  assert.equal(cold.effort, 'xhigh');
+test('an order carrying no capabilities runs on the harness default, not a guessed model', async () => {
+  // Not a failure. A def with no `modifiers:` may author capability-silent
+  // steps, and those have always run at whatever model the harness itself
+  // defaults to. The loop says so on stderr rather than inventing a row.
+  const args = await startArgsFor({ modifier: undefined });
+  assert.equal(args.model, undefined);
+  assert.equal(args.effort, undefined);
+});
 
-  const bumped = await startArgsFor({
-    model: 'strong:4',
-    consumes: express,
-    owes: [{ path: 'verdict', judgmentRejects: 3 }],
+test('an order whose capabilities match no row is REFUSED, never run on a default model', async () => {
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ capabilities: ['paint:deep'] })] });
+  const h = buildOpts({ hub, adapter, capabilityModels: MAP });
+
+  const outcome = await createAgentRunLoop(h.opts).run();
+
+  assert.equal(outcome, 'unresolvable-capability');
+  assert.equal(adapter.calls.filter((c) => c.kind === 'start').length, 0, 'no harness turn was started');
+  assert.equal(calls.filter((c) => c.verb === 'release').length, 1, 'the lease went back for another shift to try');
+  assert.ok(h.errs.some((l) => l.includes('no settings row') && l.includes('paint:deep')));
+});
+
+test('a shift with NO capabilityModels at all refuses a capability-bearing order', async () => {
+  // The map has no built-in default on purpose: a shift that never declared
+  // what serves what must say so on its first order, not run everything on a
+  // hardcoded model and look like it worked.
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder({ capabilities: ['build:deep'] })] });
+  const h = buildOpts({ hub, adapter });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'unresolvable-capability');
+  assert.equal(adapter.calls.filter((c) => c.kind === 'start').length, 0);
+});
+
+test('the resolution is reported to the hub BEFORE the harness turn starts', async () => {
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({
+    getOrder: [agentOrder({ capabilities: ['build:deep'] }), agentOrder({ claimed: false, outcome: 'green' })],
   });
-  assert.equal(bumped.model, 'sonnet');
-  assert.equal(bumped.effort, 'max');
+  const h = buildOpts({ hub, adapter, capabilityModels: MAP });
 
-  const escalated = await startArgsFor({
-    model: 'strong:4',
-    consumes: express,
-    owes: [{ path: 'verdict', judgmentRejects: 6 }],
+  await createAgentRunLoop(h.opts).run();
+
+  const report = calls.find((c) => c.verb === 'report_resolution');
+  assert.ok(report !== undefined, 'the hub was told what this shift picked');
+  assert.deepEqual(report.arg, {
+    workflow: 'wf1',
+    run: 'run1',
+    resolution: {
+      capability: 'build:deep',
+      match: 'exact',
+      model: 'claude-opus-5',
+      effort: 'xhigh',
+      harness: 'fake',
+    },
   });
-  assert.equal(escalated.model, 'opus');
-  assert.equal(escalated.effort, 'max');
-
-  // With no effort suffix to bump, reaching the threshold escalates the model
-  // straight away — still under the express lane that clamped it.
-  assert.equal(
-    (await startArgsFor({ model: 'strong', consumes: express, owes: [{ path: 'pr', judgmentRejects: 3 }] })).model,
-    'opus',
-  );
-
-  // The count is the MAX across owed outputs, but consult paths are excluded:
-  // an occasional mentor round would otherwise escalate every later firing.
-  assert.equal(
-    (
-      await startArgsFor({
-        model: 'strong',
-        consumes: express,
-        owes: [
-          { path: 'pr', judgmentRejects: 0 },
-          { path: 'consultRequest', judgmentRejects: 9 },
-          { path: 'planConsult', judgmentRejects: 9 },
-        ],
-      })
-    ).model,
-    'sonnet',
-  );
 });
 
-test('the authored escalation ladder is read from the packet extension bag', async () => {
-  const express = { plan: { lane: 'express' } };
-  const bag = { delivery: { escalation: { model: 'strongest', attempts: 2 } } };
+test('a bare-row hit reports match `bare`, and a refusal reports match `refused`', async () => {
+  const bare = await reportFor({ capabilities: ['build:express'] }, MAP);
+  assert.equal(bare?.match, 'bare');
+  // The BARE NAME, not the compound — the hub records what actually served.
+  assert.equal(bare?.capability, 'build');
 
-  // Below the authored threshold: rung 1 is the step's own model, lane-adjusted.
-  assert.equal(
-    (await startArgsFor({ model: 'strong', consumes: express, x: bag, owes: [{ path: 'pr', judgmentRejects: 1 }] }))
-      .model,
-    'sonnet',
-  );
+  const refused = await reportFor({ capabilities: ['paint:deep'] }, MAP);
+  assert.equal(refused?.match, 'refused');
+  assert.equal(refused?.capability, 'paint:deep');
+  assert.equal(refused?.model, undefined, 'a refusal names no model — none was chosen');
+});
 
-  // At the authored threshold: rung 2 is the authored model, pinned against
-  // the lane — the express cap does not pull it back down.
-  assert.equal(
-    (await startArgsFor({ model: 'strong', consumes: express, x: bag, owes: [{ path: 'pr', judgmentRejects: 2 }] }))
-      .model,
-    'fable',
-  );
+test('an order with no capabilities reports nothing — there was no routing decision', async () => {
+  assert.equal(await reportFor({}, MAP), undefined);
+});
 
-  // A malformed bag fails open to the default staged rule, same as the lane.
-  assert.equal(
-    (
-      await startArgsFor({
-        model: 'strong',
-        consumes: express,
-        x: { delivery: { escalation: 'nope' } },
-        owes: [{ path: 'pr', judgmentRejects: 3 }],
-      })
-    ).model,
-    'opus',
-  );
+test('a failing report_resolution is logged and the order runs anyway', async () => {
+  // Observability must never be able to stop work. The hub verb's own contract
+  // says the same on its side; this is the client half of that promise.
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({
+    getOrder: [agentOrder({ capabilities: ['build:deep'] }), agentOrder({ claimed: false, outcome: 'green' })],
+  });
+  hub.reportResolution = async (): Promise<never> => {
+    throw new HubError(500, 'report_resolution blew up');
+  };
+  const h = buildOpts({ hub, adapter, capabilityModels: MAP });
+
+  await createAgentRunLoop(h.opts).run();
+
+  assert.equal(adapter.calls.filter((c) => c.kind === 'start').length, 1, 'the turn still ran');
+  assert.ok(h.errs.some((l) => l.includes('reporting the resolution') && l.includes('continuing')));
+});
+
+/** Run one order and return the `resolution` payload the loop reported, if any. */
+async function reportFor(
+  o: OrderOpts,
+  map: CapabilityModelMap,
+): Promise<Record<string, unknown> | undefined> {
+  const { hub, calls } = mockHub({ getOrder: [agentOrder(o), agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({ hub, adapter: createFakeAdapter(), capabilityModels: map });
+  await createAgentRunLoop(h.opts).run();
+  const report = calls.find((c) => c.verb === 'report_resolution');
+  if (report === undefined) return undefined;
+  return (report.arg as { resolution: Record<string, unknown> }).resolution;
+}
+
+test('the run modifier reaches the brief, and an engine escalation says so', async () => {
+  const plain = await startArgsFor({ capabilities: ['build:deep'], modifier: 'deep' });
+  assert.match(plain.brief, /^Routing: this run was started at the 'deep' depth modifier\.$/mu);
+  assert.ok(!plain.brief.includes('RE-OFFERED'), 'a first pass is not announced as a recovery attempt');
+
+  const escalated = await startArgsFor({ capabilities: ['build:deep'], modifier: 'deep', escalated: true });
+  assert.match(escalated.brief, /RE-OFFERED at a deeper modifier/u);
+
+  // No modifier on the packet means no routing line at all — a run started
+  // without one is not "at the default depth", it is depth-less.
+  const none = await startArgsFor({ capabilities: ['build:deep'] });
+  assert.ok(!none.brief.includes('Routing:'));
 });
 
 // ---- the invariant: the hub decides, never the harness -----------------------

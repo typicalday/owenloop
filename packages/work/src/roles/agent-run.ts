@@ -80,7 +80,7 @@ import { hostname } from 'node:os';
 
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createAgentRunLoop, type AdapterResolution, type AgentRunOutcome } from '../agent/loop.ts';
-import { createModelPolicy, type ModelPolicy } from '../agent/model-policy.ts';
+import type { CapabilityModelMap } from '../agent/capability-model.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
@@ -202,6 +202,7 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
     case 'no-template':
     case 'no-harness':
     case 'incompatible-harness-policy':
+    case 'unresolvable-capability':
     case 'unverified-consumed':
     case 'session-store-failed':
     case 'no-submit':
@@ -296,14 +297,12 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 1;
   }
 
-  const modelPolicy: ModelPolicy = createModelPolicy({
-    ...(settings.tierMap !== undefined ? { tierMap: settings.tierMap } : {}),
-    ...(settings.tierProfiles !== undefined ? { tierProfiles: settings.tierProfiles } : {}),
-    ...(settings.escalateAt !== undefined ? { escalateAt: settings.escalateAt } : {}),
-    ...(settings.escalationExtensionKey !== undefined
-      ? { escalationExtensionKey: settings.escalationExtensionKey }
-      : {}),
-  });
+  // Passed through verbatim. `loadSettings` already validated every row (shape,
+  // effort on the ladder, effort accepted by a known model), so there is nothing
+  // left to normalize here — and nothing to default: an absent map means the
+  // loop refuses capability-bearing orders, which is the intended answer for a
+  // shift that never declared what serves what.
+  const capabilityModels: CapabilityModelMap | undefined = settings.capabilityModels;
 
   const origin = parsed.origin ?? settings.hubOrigin;
   if (origin === undefined || origin.trim() === '') {
@@ -544,7 +543,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     cwd: workCwd,
     loadStep,
     resolveAdapter,
-    modelPolicy,
+    ...(capabilityModels !== undefined ? { capabilityModels } : {}),
     consumedVerifier,
     appendSession: writeSession,
     nextAttempt: (workflow, run, step) => {

@@ -60,7 +60,7 @@ import { existsSync } from 'node:fs';
 
 import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
-import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.ts';
+import type { ContactHolder, GetOrderResponse, OrderPacket, ResolutionPayload } from '../hub/types.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import type {
@@ -81,12 +81,10 @@ import {
   type BriefSpec,
 } from './brief.ts';
 import {
-  pickModel,
-  type ModelEscalation,
-  type ModelLane,
-  type ModelPolicy,
-  type PickModelResult,
-} from './model-policy.ts';
+  resolveCapabilityModel,
+  type CapabilityModelMap,
+  type CapabilityResolution,
+} from './capability-model.ts';
 
 /** Discriminated result of one worker life; the role maps these to exit codes. */
 export type AgentRunOutcome =
@@ -96,6 +94,7 @@ export type AgentRunOutcome =
   | 'no-template' // no cached bundle / no step spec for the step (exit 1)
   | 'no-harness' // the resolved harness id names no registered adapter (exit 1)
   | 'incompatible-harness-policy' // selected adapter cannot enforce the restrictions (exit 1)
+  | 'unresolvable-capability' // no settings row for the order's capabilities (exit 1)
   | 'unverified-consumed' // dynamic values or rejection reasons failed verification (exit 1)
   | 'session-store-failed' // durable active-row gate failed before provider work (exit 1)
   | 'no-submit' // the turn ended and the confirm grace expired with no outcome (exit 1)
@@ -156,8 +155,18 @@ export interface AgentRunLoopOptions {
   cwd: string;
   loadStep: StepLoader;
   resolveAdapter: AdapterResolver;
-  /** Resolve authored model tiers and retry escalation before dispatch. */
-  modelPolicy?: ModelPolicy;
+  /**
+   * THIS MACHINE'S capability → `{model, effort}` map, straight from the
+   * settings file (plan §5). The loop resolves the order's composed capabilities
+   * against it before dispatch and REFUSES the order when nothing matches —
+   * there is no default model here, by design.
+   *
+   * Absent (or empty) means the shift declared no map at all, which makes every
+   * capability-bearing order unresolvable. That is deliberate: a shift that
+   * forgot its map should say so on the first order, not run everything on a
+   * hardcoded model.
+   */
+  capabilityModels?: CapabilityModelMap;
   /** Gate dynamic values and rejection reasons before any prompt rendering. */
   consumedVerifier?: ConsumedVerifier;
   /** Append one session record. Wired to `appendSession` by the role. */
@@ -229,63 +238,42 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-function laneFromPacket(packet: OrderPacket): ModelLane | undefined {
-  const plan = packet.consumes?.['plan'];
-  if (plan === null || typeof plan !== 'object' || Array.isArray(plan)) return undefined;
-  const lane = (plan as Record<string, unknown>)['lane'];
-  return lane === 'express' || lane === 'standard' || lane === 'deep' ? lane : undefined;
-}
-
-function escalationFromPacket(packet: OrderPacket, extensionKey: string): ModelEscalation | undefined {
-  const extension = packet.x?.[extensionKey];
-  if (extension === null || typeof extension !== 'object' || Array.isArray(extension)) return undefined;
-  if (!('escalation' in extension)) return undefined;
-  const raw = (extension as Record<string, unknown>)['escalation'];
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const bag = raw as Record<string, unknown>;
-  const model = typeof bag['model'] === 'string' && bag['model'] !== '' ? bag['model'] : undefined;
-  const attempts =
-    typeof bag['attempts'] === 'number' && Number.isInteger(bag['attempts']) && bag['attempts'] > 0
-      ? bag['attempts']
-      : undefined;
-  return {
-    ...(model !== undefined ? { model } : {}),
-    ...(attempts !== undefined ? { attempts } : {}),
-  };
-}
+/**
+ * How this order's model was decided.
+ *
+ *   `resolved`  — a settings row matched; `resolution` names it, plus the model
+ *                 and effort the harness starts with.
+ *   `refused`   — the order named capabilities and NONE of them, exact or bare,
+ *                 has a row. The order is handed back; nothing launches. Plan
+ *                 §5: "never a silent default model".
+ *   `unrouted`  — the order named NO capabilities at all, so there is nothing to
+ *                 look up. This is not a failure: a def that declares no
+ *                 `modifiers:` may author capability-silent steps, and those
+ *                 have always run at the harness's own default model. The loop
+ *                 passes no model and no effort, exactly as it did for a step
+ *                 with no authored tier before this scheme existed.
+ */
+export type OrderRouting =
+  | { kind: 'resolved'; resolution: CapabilityResolution }
+  | { kind: 'refused'; capabilities: readonly string[] }
+  | { kind: 'unrouted' };
 
 /**
- * The reject depth driving retry escalation: the max across the step's owed
- * outputs, with consult paths excluded.
+ * Resolve an order's composed capabilities against this machine's map.
  *
- * The exclusion matters. A consult artifact's rejects are the mentor handing
- * advice back for another round, not a signal that this producer is stuck — and
- * they ride a separate per-produce attempt budget for exactly that reason.
- * Counting them would let one ordinary mentor round escalate the model on every
- * later firing of the step, permanently, on a producer that was never failing.
+ * ONLY `packet.capabilities` is consulted. `packet.model` — the def's authored
+ * tier name under the retired scheme — is deliberately ignored: a tier is an
+ * abstract rung with no meaning left, and reading it as a model id would put a
+ * literal `strong` on the wire to a vendor.
  */
-function judgmentRejectsFromPacket(packet: OrderPacket): number {
-  let max = 0;
-  for (const owed of packet.owes) {
-    const path = String(owed.path ?? '');
-    if (path === 'consultRequest' || path.endsWith('Consult')) continue;
-    const rejects = owed.judgmentRejects;
-    if (typeof rejects === 'number' && Number.isFinite(rejects) && rejects > max) max = rejects;
-  }
-  return max;
-}
-
-function modelForPacket(packet: OrderPacket, policy: ModelPolicy | undefined): PickModelResult | undefined {
-  if (packet.model === undefined) return undefined;
-  if (policy === undefined) return { model: packet.model };
-  return pickModel(
-    packet.model,
-    laneFromPacket(packet),
-    judgmentRejectsFromPacket(packet),
-    policy,
-    undefined,
-    escalationFromPacket(packet, policy.escalationExtensionKey),
-  );
+export function resolveOrderRouting(
+  packet: OrderPacket,
+  map: CapabilityModelMap | undefined,
+): OrderRouting {
+  const capabilities = packet.capabilities ?? [];
+  if (capabilities.length === 0) return { kind: 'unrouted' };
+  const resolution = map === undefined ? undefined : resolveCapabilityModel(map, capabilities);
+  return resolution === undefined ? { kind: 'refused', capabilities } : { kind: 'resolved', resolution };
 }
 
 /**
@@ -479,6 +467,40 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
   }
 
+  /**
+   * Tell the hub what this shift resolved the order to (plan §6), before the
+   * harness launches.
+   *
+   * BEST EFFORT, ALWAYS. A hub that is unreachable, older than the verb, or
+   * simply erroring must never be able to stop work the shift is otherwise
+   * ready to do — the report is observability, not a gate, and the hub's own
+   * verb says so. A failure is logged and swallowed.
+   *
+   * An `unrouted` order is not reported at all: the payload's `capability` is
+   * required and non-empty on the hub side, and there is no capability to name.
+   */
+  async function reportResolution(routing: OrderRouting, harness: string): Promise<void> {
+    if (routing.kind === 'unrouted') return;
+    const payload: ResolutionPayload =
+      routing.kind === 'resolved'
+        ? {
+            capability: routing.resolution.capability,
+            match: routing.resolution.match,
+            model: routing.resolution.model,
+            effort: routing.resolution.effort,
+            harness,
+          }
+        : // The refusal names the capability the order was OFFERED under — the
+          // first one — because that is the row an operator has to add. Model
+          // and effort are absent: nothing was selected.
+          { capability: routing.capabilities[0] ?? '', match: 'refused', harness };
+    try {
+      await opts.hub.reportResolution({ workflow, run: runId, resolution: payload });
+    } catch (e) {
+      opts.err(`owenloop work agent-run: reporting the resolution for ${order} failed (continuing): ${errMsg(e)}`);
+    }
+  }
+
   /** Release and finish. Used by every path that hands the order back. */
   async function releaseWith(reason: string, outcome: AgentRunOutcome): Promise<AgentRunOutcome> {
     lease.stop(reason);
@@ -575,6 +597,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       origin: opts.origin,
       account: opts.account,
       ...(opts.shiftId !== undefined ? { shiftId: opts.shiftId } : {}),
+      // Straight from the packet, not from settings: the modifier is the hub's
+      // statement about the RUN, and a shift has no say in it.
+      ...(packet.modifier !== undefined ? { modifier: packet.modifier } : {}),
+      ...(packet.escalated === true ? { escalated: true } : {}),
     };
     // Permissions arrive PRE-NORMALIZED in the spec. `prepare` ran
     // `normalizeStepPermissions` over the step's `x.harness` options at cache
@@ -597,6 +623,44 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 	);
       }
       return releaseWith('incompatible-harness-policy', 'incompatible-harness-policy');
+    }
+
+    // ---- ROUTING: which model serves this order, and telling the hub --------
+    //
+    // DELIBERATELY THE LAST GATE BEFORE DISPATCH, and deliberately AFTER every
+    // launch gate above (misroute, consumed verification, step spec, adapter,
+    // harness policy). Plan §3: the launch gates block on a malformed order
+    // before model selection is even attempted, so a refusal never has to be
+    // explained in terms of a model the order was never going to reach.
+    const routing = resolveOrderRouting(packet, opts.capabilityModels);
+
+    // Plan §6: the record must exist BEFORE tokens are spent, which is why this
+    // is a dedicated verb and not a field on the next heartbeat. It is reported
+    // on the refusal path too — a refusal is a true observation of what this
+    // shift resolved, and the whole point of the report is that the hub can say
+    // why an order did or did not run.
+    await reportResolution(routing, resolution.id);
+
+    if (routing.kind === 'refused') {
+      opts.err(
+        `owenloop work agent-run: no settings row for ${order} — the order's capabilities ` +
+          `[${routing.capabilities.join(', ')}] match neither an exact row nor a bare name row in ` +
+          `'capabilityModels'. Add a row for one of them (a bare row such as ` +
+          `'${routing.capabilities[0]?.split(':')[0] ?? ''}' covers every modifier) and restart the shift. ` +
+          `Releasing — this shift will not pick a model it was not told to use.`,
+      );
+      return releaseWith('unresolvable-capability', 'unresolvable-capability');
+    }
+    if (routing.kind === 'unrouted') {
+      opts.err(
+        `owenloop work agent-run: ${order} carries no capabilities, so no settings row applies — ` +
+          `running on '${resolution.id}''s own default model.`,
+      );
+    } else {
+      opts.out(
+        `owenloop work agent-run: ${order} resolved '${routing.resolution.capability}' ` +
+          `(${routing.resolution.match} row) → ${routing.resolution.model} at ${routing.resolution.effort}`,
+      );
     }
 
     // ---- PHASE 4: resume or cold replay? -----------------------------------
@@ -664,7 +728,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
 
     const owenloopMcp = buildOwenloopMcp(spec);
-    const resolvedModel = modelForPacket(packet, opts.modelPolicy);
+    const resolvedModel =
+      routing.kind === 'resolved'
+        ? { model: routing.resolution.model, effort: routing.resolution.effort }
+        : undefined;
     const deliverArgs: DeliverArgs = {
       cwd: recordCwd,
       owenloopMcp,

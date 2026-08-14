@@ -52,6 +52,10 @@ export interface SpawnSpec {
    * Optional safe lifecycle-reporting label for an `agent-run` child. This field
    * never becomes `--harness`; the child resolves the authoritative harness from
    * CLI/environment/verified runtime definition precedence.
+   *
+   * It is ONE INPUT to the reported label, not the label itself, and it is the
+   * LOWER-ranked one: `reportedHarnessId` puts the child's `OWENLOOP_HARNESS`
+   * above it, because the child does.
    */
   harness?: string;
   /** Closed start gate created by the durable Shift reservation. */
@@ -146,6 +150,50 @@ export interface WorkerFailure {
 }
 
 export type WorkerFailureReporter = (failure: WorkerFailure) => void;
+
+/**
+ * The harness id to REPORT on an agent-run worker failure — a best-effort
+ * mirror of the id the CHILD resolved, never an independent decision.
+ *
+ * It mirrors `resolveAdapter` in `roles/agent-run.ts`, minus the `--harness`
+ * rank the Shift never emits:
+ *
+ *   1. `OWENLOOP_HARNESS` when the variable is SET. Set-but-blank is not a
+ *      fall-through: the child refuses that config outright and names it
+ *      `<empty OWENLOOP_HARNESS>`, so the failure event says the same thing.
+ *   2. `spec.harness` — the prepared-cache step's `harness` field — when it is
+ *      a non-empty string. An empty string counts as absent, matching the
+ *      child.
+ *   3. Otherwise the child took the first REGISTERED adapter. This process
+ *      cannot name it: the Shift is a neutral dispatcher and never imports the
+ *      adapter composition root, so its own registry is empty and asking it
+ *      would answer `undefined`. Report the placeholder instead.
+ *
+ * WHY THE ORDER MATTERS. It used to read `spec.harness ?? OWENLOOP_HARNESS`,
+ * which is the child's precedence INVERTED. An operator who pinned
+ * `OWENLOOP_HARNESS` on a shift whose cached step also named a harness got a
+ * failure event naming the harness that did NOT run — the single most
+ * misleading field in the record, since the harness is the first thing an
+ * operator reaches for when a worker dies.
+ *
+ * BEST-EFFORT IS DELIBERATE at rank 2. A modern agent order carries no
+ * `spec.harness` at all (the child reads the verified, order-pinned step), so
+ * rank 2 only ever fires on the legacy cache path. The alternative — the Shift
+ * verifying the order digest itself purely to label a failure — would duplicate
+ * the child's whole resolution for a diagnostic string.
+ *
+ * `env` is the environment the CHILD is spawned with (`plan.options.env`), not
+ * this process's — they differ, and the child's is the one that decided.
+ */
+export function reportedHarnessId(
+  spec: Pick<SpawnSpec, 'harness'>,
+  env: NodeJS.ProcessEnv,
+): string {
+  const fromEnv = env['OWENLOOP_HARNESS'];
+  if (fromEnv !== undefined) return fromEnv.trim() === '' ? '<empty OWENLOOP_HARNESS>' : fromEnv;
+  if (spec.harness !== undefined && spec.harness !== '') return spec.harness;
+  return '<registered default>';
+}
 
 /**
  * The stdio topology of a detached worker.
@@ -301,9 +349,7 @@ export function createDefaultSpawner(
       }
     }
     const kind = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
-    const harness = kind === 'agent-run'
-      ? (spec.harness ?? process.env['OWENLOOP_HARNESS'] ?? 'auto')
-      : undefined;
+    const harness = kind === 'agent-run' ? reportedHarnessId(spec, plan.options.env) : undefined;
     // This process is the executable Shift actually launched. The harness may
     // start its own vendor process later, but reporting or guessing that
     // executable here would couple the neutral dispatcher to one adapter.

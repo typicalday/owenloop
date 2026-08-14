@@ -198,6 +198,29 @@ export interface OrderPacket {
   outputs: string[];
   /** Opaque location hint — the worker's cwd when set. */
   workdir?: string;
+  /**
+   * THE COMPOSED CAPABILITIES this order was offered under, in the step's
+   * authored order — `['build:deep']` for a `build` step on a `deep` run. This
+   * is the key into the shift's `capabilityModels` map (see
+   * `src/agent/capability-model.ts`), and therefore what decides which model and
+   * effort run. Absent from a pre-modifier hub, which is why the worker treats
+   * an empty list as "nothing to resolve against" and refuses rather than
+   * guessing.
+   */
+  capabilities?: string[];
+  /** The run's routing modifier (`deep`), as the caller asked for at start_run. */
+  modifier?: string;
+  /**
+   * `true` when the engine re-offered this step at its escalation target instead
+   * of the run's own modifier. The worker does not act on it; it goes in the
+   * brief so the agent knows it is on the recovery path.
+   */
+  escalated?: boolean;
+  /**
+   * DEPRECATED, and no longer read by the agent loop. The def's authored tier
+   * name (`strong`) from the pre-modifier scheme. The hub still projects it for
+   * older workers; this one resolves from `capabilities` alone.
+   */
   model?: string;
   /** Worker kind; `'command'` for command orders, absent means agent. */
   worker?: string;
@@ -258,6 +281,45 @@ export interface HeartbeatRequest {
 }
 
 export type HeartbeatResponse = HubResponse;
+
+// ---- report_resolution ------------------------------------------------------
+
+/**
+ * Which settings row served the order, mirroring hub-core's `ResolutionMatch`.
+ * `refused` is a real, reportable outcome: the shift found no row and will not
+ * launch anything, and that is exactly the fact worth recording.
+ */
+export type ResolutionMatch = 'exact' | 'bare' | 'refused';
+
+export interface ResolutionPayload {
+  /** The settings key that matched (`build:deep`, or `build` on a bare match). */
+  capability: string;
+  match: ResolutionMatch;
+  /** Absent on `refused`, and on a command order, which selects no model. */
+  model?: string;
+  effort?: string;
+  harness?: string;
+}
+
+export interface ReportResolutionRequest {
+  workflow: string;
+  run: string;
+  resolution: ResolutionPayload;
+}
+
+/**
+ * The hub is idempotent by order id: `recorded: false` means a report for this
+ * run already stood and was left unchanged. `claimed` is the live lease state,
+ * disclosed and never enforced — a `false` here means the order is no longer
+ * this worker's to run.
+ */
+export interface ReportResolutionResponse extends HubResponse {
+  workflow: string;
+  run: string;
+  step: string;
+  recorded: boolean;
+  claimed: boolean;
+}
 
 // ---- release ----------------------------------------------------------------
 

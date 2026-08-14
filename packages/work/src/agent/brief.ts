@@ -60,6 +60,18 @@ export interface BriefSpec {
   origin: string;
   account: string;
   shiftId?: string;
+  /**
+   * The run's routing modifier (`express` | `standard` | `deep` — whatever the
+   * def declared), as the caller asked for at `start_run`. Absent on a run
+   * started without one.
+   */
+  modifier?: string;
+  /**
+   * `true` when the engine re-offered THIS step at its escalation target
+   * instead of the run's own modifier — the step is on the recovery path after
+   * repeated rejections, not a first attempt.
+   */
+  escalated?: boolean;
 }
 
 /** The composite order id — the only form the hub verbs accept. */
@@ -75,7 +87,7 @@ function composite(spec: BriefSpec): string {
  * (no accidental `$&` expansion from template text the author controls).
  */
 export function renderBrief(templateContent: string, spec: BriefSpec): string {
-  return templateContent
+  const substituted = templateContent
     .split(ORDER_TOKEN)
     .join(composite(spec))
     .split(ORIGIN_TOKEN)
@@ -84,6 +96,38 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
     .join(spec.account)
     .split(SHIFT_TOKEN)
     .join(spec.shiftId ?? '');
+  const routing = renderRoutingLine(spec);
+  return routing === '' ? substituted : `${routing}\n\n${substituted}`;
+}
+
+/**
+ * The run's depth, stated to the agent in one line, PREPENDED rather than
+ * substituted into a token.
+ *
+ * A token would only reach agents whose def author remembered to write it, and
+ * the whole point of the modifier is that the SAME step body runs at three
+ * different depths — the author has one template and cannot mark every place
+ * depth matters. Prepending puts it in front of every agent on every run at no
+ * cost to existing bundles.
+ *
+ * It is deliberately DESCRIPTIVE, not directive: it tells the agent what depth
+ * the run was started at and leaves the interpretation to the step's own body.
+ * The modifier already decided the model and effort before this line was
+ * written; restating it as an order ("think harder") would be the brief trying
+ * to do the router's job.
+ *
+ * Empty string when the run carries no modifier — a run started without one has
+ * nothing true to say here, and a line reading "modifier: none" would invite an
+ * agent to reason about an absence that means nothing.
+ */
+function renderRoutingLine(spec: BriefSpec): string {
+  if (spec.modifier === undefined || spec.modifier === '') return '';
+  const escalated =
+    spec.escalated === true
+      ? ' This step was RE-OFFERED at a deeper modifier after repeated rejections of its output —' +
+        ' it is a recovery attempt, not a first pass.'
+      : '';
+  return `Routing: this run was started at the '${spec.modifier}' depth modifier.${escalated}`;
 }
 
 /**
