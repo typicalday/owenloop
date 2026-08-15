@@ -930,6 +930,67 @@ test('a runner that throws at start submits a machinery-failure receipt', async 
   assert.equal((submits[0]!.value as CommandReceipt).error, 'cannot fork');
 });
 
+// ---- operator-declared work roots -------------------------------------------
+//
+// The policy the OPERATOR of this machine set, not the hub. Refusing is a
+// RELEASE, never a submit: the order is valid, this machine is simply not
+// configured to host it, and the pickup window must be able to hand it to a
+// machine that is.
+
+test('no declared roots means no restriction — an order workdir anywhere runs', async () => {
+  const fr = fakeRunner();
+  const { hub, submits } = mockHub({
+    getOrder: [commandOrder({ workdir: '/somewhere/else' })],
+    submit: ['green'],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  assert.equal(await p, 'submitted');
+  assert.equal(fr.starts[0]!.cwd, '/somewhere/else');
+  assert.equal(submits.length, 1);
+});
+
+test('an order workdir outside every declared root is released, never run', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder({ workdir: '/elsewhere/proj' })] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { allowedWorkdirRoots: ['/allowed'] }));
+  assert.equal(await loop.run(), 'workdir-denied');
+  assert.equal(fr.starts.length, 0);
+  assert.equal(submits.length, 0);
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+test('an order workdir inside a declared root runs normally', async () => {
+  const fr = fakeRunner();
+  const { hub } = mockHub({
+    getOrder: [commandOrder({ workdir: '/allowed/proj/wt/x' })],
+    submit: ['green'],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { allowedWorkdirRoots: ['/allowed'] }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  assert.equal(await p, 'submitted');
+  assert.equal(fr.starts[0]!.cwd, '/allowed/proj/wt/x');
+});
+
+test('an order that names NO workdir is never denied, whatever the roots are', async () => {
+  // The fallback is this worker's own launch directory, which the operator
+  // chose when they started the shift. Bounding an operator's own choice by
+  // that same operator's roots would deny every step that legitimately
+  // declares neither `workdir:` nor `workdirFrom:` — `deprovisioner` included.
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { allowedWorkdirRoots: ['/allowed'] }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0));
+  assert.equal(await p, 'submitted');
+  assert.equal(fr.starts[0]!.cwd, '/work');
+});
+
 // ---- misroute (not exec's to fail) ------------------------------------------
 
 test('a null order packet is a misroute — release, no run, no submit', async () => {

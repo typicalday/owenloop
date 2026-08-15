@@ -34,6 +34,7 @@ function usage(): void {
       '                              [--cap <n>] [--max-agents <n>] [--poll-interval <ms>] [--once]\n' +
       '                              [--cache-dir <p>] [--state-dir <p>]\n' +
       '                              [--log-dir <p>] [--log-max-age <ms>]\n' +
+      '                              [--work-root <dir>]...   restrict this shift to these directories\n' +
       '       owenloop shift next [--wait <seconds>] [--state-dir <p>]\n' +
       '       owenloop shift status [--state-dir <p>]\n' +
       '       owenloop shift end [--state-dir <p>]\n',
@@ -52,7 +53,7 @@ function parseStartArgs(args: string[]): StartArgs {
   const parsed: StartArgs = { crews: [] };
   const valueFlags = new Set([
     '--origin', '--as', '--name', '--cap', '--max-agents', '--poll-interval',
-    '--cache-dir', '--state-dir', '--log-dir', '--log-max-age',
+    '--cache-dir', '--state-dir', '--log-dir', '--log-max-age', '--work-root',
   ]);
   for (let i = 0; i < args.length; i++) {
     const raw = args[i]!;
@@ -93,6 +94,12 @@ function parseStartArgs(args: string[]): StartArgs {
         const n = intValue(value, '--poll-interval');
         if (typeof n !== 'number') return { crews: parsed.crews, error: n };
         parsed.pollIntervalMs = n;
+      } else if (name === '--work-root') {
+        // REPEATABLE — one directory per occurrence. See `ParsedArgs.workRoots`
+        // in `src/shift/runtime.ts` for why this accumulates instead of taking
+        // a separated list, and `src/agent/workdir.ts` for how this differs
+        // from the singular `workRoot` setting.
+        (parsed.workRoots ??= []).push(value);
       }
       continue;
     }

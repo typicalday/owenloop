@@ -39,6 +39,15 @@ test('resolveStateDirOverride: flag > OWENLOOP_STATE_DIR > settings; else undefi
 // meaning: no flag → serveCrews undefined, which run() resolves to `[]` at the
 // call site (`parsed.serveCrews ?? []`), and the hub reads empty as "serve ALL
 // the actor's crews" — i.e. the default is serve-all, NOT serve-none.
+test('parseArgs --work-root: REPEATABLE and accumulating, unlike every other value flag', () => {
+  // Repeatable rather than comma-split, because a directory path may legally
+  // contain a comma and an operator should never have to know that.
+  assert.equal(parseArgs([]).workRoots, undefined);
+  assert.deepEqual(parseArgs(['--work-root', '/a']).workRoots, ['/a']);
+  assert.deepEqual(parseArgs(['--work-root', '/a', '--work-root', '/b']).workRoots, ['/a', '/b']);
+  assert.deepEqual(parseArgs(['--work-root=/a', '--work-root=/b']).workRoots, ['/a', '/b']);
+});
+
 test('parseArgs --serve-crews: comma-split, trim, drop-empties; no flag ⇒ undefined (→ [] at call site)', () => {
   // no flag: undefined here; run() turns this into [] via `parsed.serveCrews ?? []`.
   assert.equal(parseArgs([]).serveCrews, undefined);

@@ -189,6 +189,7 @@ The same directory holds `credentials.json`, `allowed_signers`, `org-root.pub`,
 owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]
 [--cap <n>] [--max-agents <n>] [--poll-interval <ms>] [--once]
 [--cache-dir <p>] [--state-dir <p>] [--log-dir <p>] [--log-max-age <ms>]
+[--work-root <dir>]...
 ```
 
 At least one named crew is required unless `--all` is present. `--all` and
@@ -209,6 +210,7 @@ one loop sweep and exits instead of keeping the foreground daemon running.
 | `--cache-dir <p>` | cache root; precedence is flag, then `OWENLOOP_CACHE_DIR`, then `settings.cacheDir`, then `$XDG_CACHE_HOME/owenloop`, then `$HOME/.cache/owenloop` |
 | `--state-dir <p>` | socket and child-state root; precedence is flag, then `OWENLOOP_STATE_DIR`, then `settings.stateDir`, then `$XDG_STATE_HOME/owenloop/exec`, then `$HOME/.local/state/owenloop/exec`; the socket is `shift.sock` inside this directory |
 | `--log-dir <p>` | where `shift.log` and each `<run>.log` are written; precedence is flag, then `OWENLOOP_SHIFT_LOG_DIR`, then `settings.shiftLogDir`, then the resolved state directory |
+| `--work-root <dir>` | **repeatable.** restrict this machine to orders whose working directory is inside one of these roots; precedence is the flags, then `OWENLOOP_ALLOWED_WORKDIR_ROOTS` (a `:`-separated list), then `settings.allowedWorkdirRoots`. Each rung REPLACES the one below it rather than extending it. No rung set anywhere ⇒ **no restriction**, which is the default |
 | `--log-max-age <ms>` | worker-log retention, swept once at startup; precedence is flag, then `OWENLOOP_SHIFT_LOG_MAX_AGE_MS`, then `settings.shiftLogMaxAgeMs`, then `1209600000` (14 days). `0` reaps every completed run's log at the next startup; there is no value that disables the sweep, and `shift.log` is never reaped |
 
 **On-disk logs.** A running shift appends its dispatch record to
@@ -218,6 +220,38 @@ process. A log directory that cannot be created costs the logs, never the
 dispatch: the shift reports it once on stderr and serves with logging disabled.
 Full field-by-field contract, retention rules, and uploader notes in
 [`docs/shift-logs.md`](shift-logs.md).
+
+**Where a shift will do work.** A shift is not bound to a project: it is an
+orchestrator that runs whatever its crews are offered. `--work-root` is how the
+person who owns the machine bounds that — it is a **local** policy, declared at
+the shift, and the hub is never asked and never informed in advance.
+
+The check happens in the WORKER, not in dispatch. The shift's `whats_next` sweep
+receives a `WorkOrder`, which carries no working directory at all; only the
+`OrderPacket` a worker fetches with `get_order` has one. So `owenloop work exec`
+and `owenloop work agent-run` each resolve the roots themselves — from
+`OWENLOOP_ALLOWED_WORKDIR_ROOTS`, which the shift exports into every child it
+spawns, or from the settings file when run by hand — and refuse there.
+
+A refusal is a **release**, not a failure. The order is valid; this machine is
+simply not configured to host that tree. The worker releases its claim, exits
+non-zero, and writes one line to `<log-dir>/<run>.log` naming the directory and
+the roots. The order returns to the hub's pickup window, where a machine that
+*is* configured for that tree can take it.
+
+Only a workdir the ORDER names is checked. A step that declares neither
+`workdir:` nor `workdirFrom:` falls back to a directory the operator already
+controls — the shift's own launch directory for a command step, or
+`<workRoot>/<workflow>/<run>/` for an agent step — and is never denied.
+
+`--work-root` is not `--work-root`'s neighbour `workRoot`. `workRoot` (settings,
+`OWENLOOP_WORK_ROOT`) is the ONE directory owenloop **creates** per-run
+directories under. `--work-root` / `allowedWorkdirRoots` is the SET of
+directories an order is **allowed to name**. Neither derives from the other.
+
+```bash
+owenloop shift start build --work-root ~/code --work-root /srv/work
+```
 
 **One harness per shift.** A shift has no per-order harness switch and no
 `--harness` flag. It never puts `--harness` on a worker's command line; each
