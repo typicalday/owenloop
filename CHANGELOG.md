@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5](https://github.com/typicalday/owenloop/compare/v0.5.4...v0.5.5) (2026-08-15)
+
+
+### Features
+
+* give every step agent a channel to ask a human ([#168](https://github.com/typicalday/owenloop/issues/168)) ([fa9e5f0](https://github.com/typicalday/owenloop/commit/fa9e5f08d3a9f55c6e95cc504966a6389ec699c4))
+* let a shift operator declare where work may happen ([#166](https://github.com/typicalday/owenloop/issues/166)) ([71e9412](https://github.com/typicalday/owenloop/commit/71e9412c534ba826490dc62464989b47a6f551fe))
+
 ## [0.5.4](https://github.com/typicalday/owenloop/compare/v0.5.3...v0.5.4) (2026-08-15)
 
 
