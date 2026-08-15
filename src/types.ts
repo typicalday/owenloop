@@ -48,8 +48,20 @@ export type Author = 'engine' | 'human' | string; // a step name, or these speci
  *  - `invalidated-irreversible`: the artifact was rejected-and-held because its inputs
  *    moved and its producer step declared `effect: { idempotent: false, onInvalidate: 'escalate' }`.
  *    The producer is NOT auto-eligible to re-fire; a human must intervene (retry / fix upstream).
+ *  - `question`: the producing step ASKED a human and stopped, via `Engine.ask`.
+ *    Holds exactly like `invalidated-irreversible` — the producer is not auto-eligible,
+ *    so the step does not spin re-answering its own unanswered question — but it is a
+ *    separate kind because the CAUSE is different and the audit trail should say so:
+ *    nothing moved upstream, an agent decided it could not proceed honestly.
+ *    Counts toward NO stall budget. A question is not a failed attempt.
  */
-export type RejectKind = 'judgment' | 'structural' | 'validation' | 'invalidated-irreversible' | 'exclusive';
+export type RejectKind =
+  | 'judgment'
+  | 'structural'
+  | 'validation'
+  | 'invalidated-irreversible'
+  | 'question'
+  | 'exclusive';
 
 export type ReasonAction =
   | 'reject'
@@ -57,6 +69,7 @@ export type ReasonAction =
   | 'skip'
   | 'reopen'
   | 'retry'
+  | 'ask'
   | 'born-rejected'
   | 'schema-reject'
   | 'pinned';

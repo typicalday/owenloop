@@ -138,6 +138,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
       return { text: '' };
     },
     async reject() { return { text: '', ok: true }; },
+    async ask() { return { text: '', ok: true }; },
     async reportResolution(req) {
       return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
     },
@@ -1474,6 +1475,7 @@ test('e2e: iterate() dispatches an agent order, parks quiet, and re-sweeps only 
       return { text: '' };
     },
     async reject() { return { text: '', ok: true }; },
+    async ask() { return { text: '', ok: true }; },
     async reportResolution(req) {
       return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
     },

@@ -37,6 +37,7 @@ function mockHub(wakeChanged = false): { hub: HubClient; pings: Array<Record<str
     async release() { return { text: '' }; },
     async submit() { return { text: '' }; },
     async reject() { return { text: '', ok: true }; },
+    async ask() { return { text: '', ok: true }; },
     async reportResolution(req) {
       return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
     },
@@ -142,6 +143,7 @@ test('attendance recorded DURING an in-flight ping still forces the very next pi
     async release() { return { text: '' }; },
     async submit() { return { text: '' }; },
     async reject() { return { text: '', ok: true }; },
+    async ask() { return { text: '', ok: true }; },
     async reportResolution(req) {
       return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
     },

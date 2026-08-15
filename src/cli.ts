@@ -1448,7 +1448,9 @@ ${' '.repeat(41)}the loaded def has drifted from the version the instance is pin
   reject <wf> <path> --by <author> --text <msg>
   retract <wf> <path> --by <author> --text <msg>
   skip <wf> <path> --by <author> --text <msg>
-  retry <wf> <path> [--by <author>] [--text <guidance>]   clear a §6 stall
+  retry <wf> <path> [--by <author>] [--text <guidance>]   clear a §6 stall, or ANSWER an ask
+  ask <wf> <path> <question> [--by <author>]   hold an owed artifact on a question for a human
+  inbox                                  every held question across all instances, with its answer command
   heartbeat <wf> <run> [--now <ms>]    touch liveness timestamp on an open run
   close <wf> <run> [--outcome ok|no_work|failed|skipped] [--summary s]
   delete <wf> [--recursive]              refuse if children exist unless --recursive (cascades)
@@ -1535,6 +1537,8 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['retract', cmdOpts('by', 'text')],
   ['skip', cmdOpts('by', 'text')],
   ['retry', cmdOpts('by', 'text')],
+  ['ask', cmdOpts('by', 'question')],
+  ['inbox', cmdOpts()],
   ['close', cmdOpts('outcome', 'summary')],
   ['heartbeat', cmdOpts('now')],
   ['delete', cmdOpts('recursive')],
@@ -2151,6 +2155,53 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         const path = need(args, 2, 'path');
         engine.retry(wf, path, last(args, 'by') ?? 'human', last(args, 'text') ?? 'retry: stall cleared');
         print(io, { ok: true, action: 'retry', path });
+        return 0;
+      }
+      case 'ask': {
+        // The escalation verb: the producing step stops and asks a human about
+        // the artifact IT owes. The answer is a plain `retry --text "<answer>"`
+        // — deliberately no `answer` verb, because `retry` already appends a
+        // structural reason, which is exactly what clears the hold and delivers
+        // the text to the next attempt.
+        const wf = need(args, 1, 'workflow');
+        const path = need(args, 2, 'path');
+        const question = need(args, 3, 'question');
+        engine.ask(wf, path, last(args, 'by') ?? 'human', question);
+        print(io, { ok: true, action: 'ask', path, question });
+        return 0;
+      }
+      case 'inbox': {
+        // THE OPERATOR SURFACE for `ask`. Without it the channel is write-only:
+        // a step can raise a question and nothing ever displays it, which is
+        // the exact failure this whole change exists to end. Reads the LOCAL db
+        // across every instance (no workflow argument) because a person asking
+        // "is anything waiting on me?" does not know which instance to name.
+        //
+        // Each row carries the ready-to-paste release command, because the
+        // answer path (`retry --text`) is not guessable from the question.
+        const rows: Array<Record<string, unknown>> = [];
+        for (const w of store.listWorkflows()) {
+          let st: ReturnType<Engine['status']>;
+          try {
+            st = engine.status(w.id);
+          } catch {
+            // An instance whose def no longer resolves cannot be asked about;
+            // skip it rather than aborting the sweep (same stance as `--all`).
+            continue;
+          }
+          for (const d of st.debts) {
+            if (d.question === undefined) continue;
+            rows.push({
+              workflow: w.id,
+              def: w.def,
+              title: w.title ?? null,
+              path: d.path,
+              question: d.question,
+              answer: `owenloop retry ${w.id} ${d.path} --text "<your answer>"`,
+            });
+          }
+        }
+        print(io, rows);
         return 0;
       }
       case 'close': {

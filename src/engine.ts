@@ -401,7 +401,7 @@ export type EngineEvent =
       workflow: string;
       run?: string;
       path: string;
-      action: 'green' | 'emit' | 'seal' | 'reject' | 'retract' | 'skip' | 'retry' | 'provide';
+      action: 'green' | 'emit' | 'seal' | 'reject' | 'retract' | 'skip' | 'retry' | 'provide' | 'ask';
       outcome?: CommitResult['outcome'] | EmitResult['outcome'];
     }
   | { type: 'closed'; workflow: string; run: string; outcome: 'ok' | 'no_work' | 'failed' | 'skipped' }
@@ -2582,11 +2582,87 @@ export class Engine {
   }
 
   /**
+   * ESCALATION: a producing step stops and asks a human, instead of guessing.
+   *
+   * WHY THIS IS A SEPARATE VERB AND NOT A FLAVOUR OF `reject`. `reject` is a
+   * *verdict on a built version* — it refuses any artifact that is not `green`
+   * or `submitted` (see the guard in `reject()`), because bumping
+   * `judgmentRejects` on a never-built `owed` artifact would burn stall budget
+   * with zero build attempts and silently freeze the producer. `ask` targets
+   * exactly that state: the artifact the asking step still OWES and has decided
+   * it cannot honestly build. Different precondition, different counter policy,
+   * different author — so, a different method.
+   *
+   * WHAT IT CLOSES. Before this verb a step agent that could not proceed had two
+   * options, and both were observed damaging real runs:
+   *   1. Submit something it did not believe. The artifact greens and every
+   *      downstream step builds on a fabrication.
+   *   2. End its turn without submitting. The task re-arms, a fresh worker
+   *      starts from the same missing information, and the step retries until
+   *      it hits the stall cap — burning budget to relearn the same blocker.
+   * Neither ever reaches a person. `ask` is the third option.
+   *
+   * MECHANICS. The artifact moves `owed` → `rejected` with a trailing reason of
+   * kind `'question'`. `isHeld` (model.ts) recognises that kind, so `frozen()`
+   * is true and the engine stops re-arming the producer — no retry storm. NO
+   * counter moves: `judgmentRejects` and `schemaRejects` are untouched, because
+   * a question is not a failed attempt and must not consume stall budget.
+   *
+   * THE ANSWER IS `retry`. There is deliberately no `answer` verb. A human runs
+   * `owenloop retry <workflow> <path> --text "<answer>"`, which appends a
+   * `'structural'` reason — clearing held-ness automatically, since `isHeld`
+   * reads only the LAST entry — re-arms the artifact to `owed`, and leaves the
+   * answer sitting on the reason thread that the next fresh worker reads in its
+   * order. Two ways into held, one way out.
+   *
+   * AUTHORITY. Not `assertAuthority`: that follows the CONSUME edge (who may
+   * invalidate someone else's work), and this is the opposite direction — the
+   * producer speaking about its own debt. So the rule is that `by` must be the
+   * artifact's own producer (or `human`/`engine`).
+   */
+  ask(workflow: string, path: string, by: Author, question: string): void {
+    const def = this.defFor(workflow);
+    this.store.tx(() => {
+      const art = this.store.getArtifact(workflow, path);
+      if (!art) throw new Error(`cannot ask about unknown artifact: ${path}`);
+      if (by !== 'human' && by !== 'engine' && art.producer !== by) {
+        throw new Error(
+          `${by} has no authority to ask about ${path} (it is produced by '${art.producer}'). ` +
+            `\`ask\` is the producer speaking about its own debt; to send someone else's work back, use \`reject\`.`,
+        );
+      }
+      // A question is only meaningful about work not yet delivered. On a
+      // `green`/`submitted` artifact the honest move is `reject` (there is a
+      // version to have an opinion about); on `retracted`/`skipped` there is no
+      // live debt left to answer.
+      if (art.acceptance !== 'owed' && art.acceptance !== 'rejected') {
+        throw new Error(
+          `cannot ask about '${path}' in state '${art.acceptance}': ` +
+            `\`ask\` records a blocker on work still owed (owed|rejected)`,
+        );
+      }
+      this.store.putArtifact({
+        ...art,
+        acceptance: 'rejected',
+        reasons: [...art.reasons, reason('ask', 'question', by, question, art.version)],
+      });
+      this.settle(workflow, def);
+    });
+    this.fire({ type: 'commit', workflow, path, action: 'ask' });
+    this.fireSettled(workflow);
+  }
+
+  /**
    * Human stall-clearing lever (§6): reset an artifact's judgment-reject count
    * and re-arm it to `owed`, optionally appending a line of guiding context that
    * rides to the next producer on the order's `owes` thread. This is how a
    * stalled (capped-out) artifact gets unstuck and steered, rather than thrashing
    * forever or being abandoned. For a stuck collection member, `retract` instead.
+   *
+   * This is ALSO the answer path for `ask` above — `retry --text "<answer>"`
+   * appends a `'structural'` reason, which clears held-ness and delivers the
+   * answer to the next worker on the same thread. There is no separate
+   * `answer` verb by design.
    */
   retry(workflow: string, path: string, by: Author = 'human', text = 'retry: stall cleared'): void {
     const def = this.defFor(workflow);

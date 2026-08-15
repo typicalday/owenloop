@@ -97,6 +97,7 @@ function fakeHub(reply: ReleaseResponse | Error): { hub: HubClient; releases: Re
       return { text: '' };
     },
     async reject() { return { text: '', ok: true }; },
+    async ask() { return { text: '', ok: true }; },
     async reportResolution(req) {
       return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
     },

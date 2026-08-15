@@ -183,15 +183,39 @@ export function isStalled(a: ArtifactData | undefined, cap: number): boolean {
 export function isSchemaStalled(a: ArtifactData | undefined, cap: number): boolean {
   return !!a && cap > 0 && a.acceptance === 'rejected' && a.schemaRejects >= cap;
 }
+/** Reason kinds that hold an artifact: the producer is not auto-eligible to re-fire. */
+const HOLDING_KINDS: ReadonlySet<string> = new Set(['invalidated-irreversible', 'question']);
+
 /**
- * True if the artifact is held (non-idempotent escalate) — rejected-and-held,
- * producer not auto-eligible to re-fire. Detected by the last reasons entry
- * having kind='invalidated-irreversible'. A retry call appends a 'structural'
- * entry, which clears the held condition automatically.
+ * True if the artifact is held — rejected-and-held, producer not auto-eligible
+ * to re-fire. Detected by the last reasons entry having a holding kind. A retry
+ * call appends a 'structural' entry, which clears the held condition
+ * automatically, so `retry --text '<answer>'` is the release for both kinds.
+ *
+ * TWO WAYS IN, ONE WAY OUT.
+ *  - `invalidated-irreversible`: the engine held it because an input moved under
+ *    a non-idempotent producer.
+ *  - `question`: the producing STEP held it, via `Engine.ask`, because it could
+ *    not proceed honestly and needs a human. Without this second kind an agent
+ *    has no way to stop: its only alternatives are to submit something it does
+ *    not believe (which greens and silently poisons every downstream step) or to
+ *    end its turn without submitting (which re-arms the step into a retry storm
+ *    whose every worker fails identically). Both were observed in production.
  */
 export function isHeld(a: ArtifactData | undefined): boolean {
   if (!a || a.acceptance !== 'rejected') return false;
-  return a.reasons.length > 0 && a.reasons[a.reasons.length - 1]!.kind === 'invalidated-irreversible';
+  return a.reasons.length > 0 && HOLDING_KINDS.has(a.reasons[a.reasons.length - 1]!.kind);
+}
+
+/**
+ * The open question on a held artifact, if it is held by `ask`. Returns the
+ * question text so an operator-facing read can print WHAT is being asked
+ * instead of only that something is stuck — the whole point of the channel.
+ */
+export function openQuestion(a: ArtifactData | undefined): string | undefined {
+  if (!a || a.acceptance !== 'rejected' || a.reasons.length === 0) return undefined;
+  const last = a.reasons[a.reasons.length - 1]!;
+  return last.kind === 'question' ? last.text : undefined;
 }
 
 /**
@@ -1090,10 +1114,18 @@ export interface WorkflowStatus {
   debts: Array<{
     path: string;
     acceptance: Acceptance;
-    kind: 'judgment' | 'structural' | 'validation' | 'unbuilt' | 'invalidated-irreversible';
+    kind: 'judgment' | 'structural' | 'validation' | 'unbuilt' | 'invalidated-irreversible' | 'question';
     /** §6/§18/held: rejected past its producer's cap, or held — the engine won't re-arm it */
     stalled: boolean;
     reason?: string;
+    /**
+     * The open question, when `kind === 'question'` — the producing step called
+     * `Engine.ask` and stopped waiting on a human. Same string as `reason`,
+     * surfaced under its own name so an operator-facing reader can filter for
+     * "what is waiting on ME" without pattern-matching a kind. Absent on every
+     * other debt shape.
+     */
+    question?: string;
     /**
      * Consecutive trailing `failed` runs for this debt's producer (crash-step
      * signal). Enriched by `engine.status()` from the run log — `workflowStatus`
@@ -1151,25 +1183,40 @@ export function workflowStatus(def: WorkflowDef, arts: ArtifactMap): WorkflowSta
   for (const a of arts.values()) {
     if (!DEBT_STATES.has(a.acceptance)) continue;
     const last = a.reasons[a.reasons.length - 1];
-    const kind: 'judgment' | 'structural' | 'validation' | 'unbuilt' | 'invalidated-irreversible' = last
+    const kind: 'judgment' | 'structural' | 'validation' | 'unbuilt' | 'invalidated-irreversible' | 'question' = last
       ? last.kind === 'judgment'
         ? 'judgment'
         : last.kind === 'validation'
           ? 'validation'
           : last.kind === 'invalidated-irreversible'
             ? 'invalidated-irreversible'
-            : 'structural'
+            : last.kind === 'question'
+              ? 'question'
+              : 'structural'
       : 'unbuilt';
     const prod = stepByName(def, a.producer);
     const producePat = prod && produceOwning(prod, a.path);
     // Held artifacts (isHeld) surface as stalled: true — they require human intervention.
+    //
+    // `isHeld` is deliberately OUTSIDE the `prod &&` guard that the two counter
+    // caps sit inside. Those caps are read off a producer STEP, so they are
+    // meaningless without one — but held-ness is read off the artifact's own
+    // reason thread and is just as real for a `producer: human` input. Keeping
+    // it inside the guard meant a human-produced artifact could never be
+    // reported stalled no matter how many times it was rejected, so a run
+    // waiting on a PERSON was indistinguishable from any other owed row. That
+    // is the single thing an operator most needs told.
     const stalled =
-      !!prod &&
-      (isStalled(a, effectiveMaxAttempts(prod, producePat)) ||
-        isSchemaStalled(a, effectiveMaxSchemaFailures(prod, producePat)) ||
-        isHeld(a));
+      isHeld(a) ||
+      (!!prod &&
+        (isStalled(a, effectiveMaxAttempts(prod, producePat)) ||
+          isSchemaStalled(a, effectiveMaxSchemaFailures(prod, producePat))));
     const entry: WorkflowStatus['debts'][number] = { path: a.path, acceptance: a.acceptance, kind, stalled };
     if (last) entry.reason = last.text;
+    // The question text is already in `reason`, but a caller filtering for
+    // "what is waiting on me" should not have to infer it from a kind string.
+    const q = openQuestion(a);
+    if (q !== undefined) entry.question = q;
     debts.push(entry);
   }
   debts.sort((x, y) => x.path.localeCompare(y.path));
@@ -1371,14 +1418,24 @@ export function buildTrace(
         if (e.action === 'retry') totalRetries++;
       }
 
-      // Check stall: need the producer step's caps
+      // Check stall. Two independent sources, and they are checked separately
+      // on purpose:
+      //  1. The two counter caps — read off the PRODUCER STEP, so they can only
+      //     be evaluated when there is a producer step to read them off.
+      //  2. Held-ness — read off the artifact's own reason thread, so it is
+      //     just as true for a `producer: human` input. Checking it inside the
+      //     `if (producerStep)` block (as this did until 2026-08-15) meant an
+      //     artifact a PERSON owes could never appear in `stalledArtifacts`,
+      //     which is exactly the row a trace reader is looking for.
+      let stalled = isHeld(art);
       const producerStep = def.steps.find((l) => l.name === art.producer);
-      if (producerStep) {
+      if (!stalled && producerStep) {
         const producePat = produceOwning(producerStep, art.path);
         const stallJ = isStalled(art, effectiveMaxAttempts(producerStep, producePat));
         const stallS = isSchemaStalled(art, effectiveMaxSchemaFailures(producerStep, producePat));
-        if (stallJ || stallS) stalledArtifacts.push(art.path);
+        stalled = stallJ || stallS;
       }
+      if (stalled) stalledArtifacts.push(art.path);
 
       const bio: ArtifactBiography = {
         path: art.path,

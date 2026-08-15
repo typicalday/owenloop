@@ -341,8 +341,10 @@ export {
   eligibleFirings,
   graphToDot,
   graphToMermaid,
+  isHeld,
   isStalled,
   modelCheck,
+  openQuestion,
   workflowStatus,
 } from './model.ts';
 export type { ArtifactMap, Blocker, Firing, TimeFacts, WorkflowStatus } from './model.ts';
