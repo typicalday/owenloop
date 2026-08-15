@@ -1845,17 +1845,40 @@ export class Engine {
 
     let resolvedWorkdir: string | undefined;
     if (step.workdirFrom !== undefined) {
-      const parsed = parseWorkdirFrom(step.workdirFrom, step.consumes);
+      const parsed = parseWorkdirFrom(step.workdirFrom, step.consumes, def.inputs.map((i) => i.name));
       if (!parsed) {
         return unresolved(
-          `workdirFrom '${step.workdirFrom}': expected a consumed stem followed by a non-empty dotted value path`,
+          `workdirFrom '${step.workdirFrom}': expected a consumed or declared-input stem followed by a non-empty dotted value path`,
         );
       }
       if (parsed.mode !== 'plain') {
         return unresolved(`workdirFrom '${step.workdirFrom}': source stem '${parsed.stem}' is not a plain consume`);
       }
 
-      let value: unknown = consumes[parsed.stem];
+      // A CONSUMED stem reads out of the firing's resolved consume map, exactly
+      // as before. An INPUT stem the step does not consume is not in that map,
+      // so it reads out of the instance's artifact table instead.
+      //
+      // The green check is what makes this an ordering edge without a consume.
+      // `unresolved` defers the firing rather than failing it, so a step whose
+      // workdir comes from a still-owed input simply is not offered yet and is
+      // reconsidered on the next tick — the same wait a consume would have
+      // produced, without putting the value in `order.consumes` (where the
+      // command launch gate would hard-refuse it for having no producer
+      // signature: a human seed has none). See `paths.ts`'s parseWorkdirFrom
+      // header for why an input-authored cwd is admissible at all.
+      let value: unknown;
+      if (parsed.source === 'consume') {
+        value = consumes[parsed.stem];
+      } else {
+        const art = arts.get(parsed.stem);
+        if (art === undefined || art.acceptance !== 'green') {
+          return unresolved(
+            `workdirFrom '${step.workdirFrom}': input '${parsed.stem}' is not green yet`,
+          );
+        }
+        value = art.value;
+      }
       const segments = parsed.path.split('.');
       for (let i = 0; i < segments.length; i++) {
         const segment = segments[i]!;

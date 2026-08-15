@@ -86,21 +86,69 @@ export interface WorkdirFromParts {
   stem: string;
   path: string;
   mode: ConsumeMode;
+  /**
+   * Where the stem was found, which decides where the ENGINE reads the value.
+   *
+   *   - `consume` — the stem names one of the step's own consumes. The value
+   *     comes out of the resolved consume map for the firing.
+   *   - `input`   — the stem names one of the DEFINITION's declared inputs and
+   *     the step does not consume it. The value comes out of the instance's
+   *     artifact table, and the firing defers while that input is still owed.
+   *
+   * A consume always wins: the loop below tries consumes first at every split
+   * boundary, so a step that genuinely consumes an input keeps the old
+   * behaviour and nothing about an existing def changes meaning.
+   */
+  source: 'consume' | 'input';
 }
 
 /**
- * Split a workdirFrom expression by the longest prefix that names one of the
- * step's own consumes. Artifact stems may contain dots, so the consume list is
- * the closed grammar that makes the split deterministic at def-load time.
+ * Split a workdirFrom expression by the longest prefix that names either one of
+ * the step's own consumes or one of the definition's declared inputs. Artifact
+ * stems may contain dots, so those two name lists are the closed grammar that
+ * makes the split deterministic at def-load time.
+ *
+ * ## Why an input stem is admissible, when the value becomes a filesystem path
+ *
+ * `validateDef` used to require the stem be a plain CONSUME, on the stated
+ * grounds that the value must have "passed the engine's consume-side
+ * verification gate before a worker can cd into it". That reasoning does not
+ * survive contact with what actually crosses the wire:
+ *
+ *   - The engine resolves `workdirFrom` ITSELF, inside the claim transaction
+ *     (`engine.ts`, `emitOrder`), and ships the resolved STRING as
+ *     `OrderPacket.workdir` — declared in `packages/work/src/hub/types.ts` as an
+ *     "Opaque location hint — the worker's cwd when set".
+ *   - Nothing verifies that field. `consumesProof` covers `order.consumes`
+ *     entries and only those (`consumed-verifier.ts`, `parseProofMap`), and the
+ *     command worker takes `order.workdir ?? opts.cwd` with no check at all
+ *     (`packages/work/src/exec/loop.ts`).
+ *
+ * So the consume gate never protected the cwd at runtime — by the time the
+ * value reaches a worker it is an unverified string in an unverified field
+ * either way. The old rule constrained who may AUTHOR the value (a producer
+ * step) rather than what a worker will trust, and this widens that authorship
+ * to include the human who starts the run. Both are inside the same trust
+ * boundary: principals authorized to start or serve runs on this hub.
+ *
+ * What actually bounds the cwd is machine-side and belongs to the operator, not
+ * to the def — a shift refuses an order whose workdir falls outside the roots
+ * its operator declared. That check is the runtime protection; this grammar is
+ * an authoring question.
  */
-export function parseWorkdirFrom(raw: string, consumes: readonly ConsumePattern[]): WorkdirFromParts | null {
+export function parseWorkdirFrom(
+  raw: string,
+  consumes: readonly ConsumePattern[],
+  inputs: readonly string[] = [],
+): WorkdirFromParts | null {
   const r = raw.trim();
   for (let boundary = r.lastIndexOf('.'); boundary > 0; boundary = r.lastIndexOf('.', boundary - 1)) {
     const stem = r.slice(0, boundary);
     const path = r.slice(boundary + 1);
     if (path.length === 0) continue;
     const consume = consumes.find((c) => c.stem === stem);
-    if (consume) return { raw: r, stem, path, mode: consume.mode };
+    if (consume) return { raw: r, stem, path, mode: consume.mode, source: 'consume' };
+    if (inputs.includes(stem)) return { raw: r, stem, path, mode: 'plain', source: 'input' };
   }
   return null;
 }

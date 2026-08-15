@@ -178,6 +178,44 @@ test('workdirFrom resolves a nested consumed value into the reference order with
   assert.equal(store.listRuns(wf)[0]!.order?.workdir, ' ./repo/worktree ');
 });
 
+test('workdirFrom resolves a declared input the step does not consume, and defers until it is provided', () => {
+  // The delivery shape: a command step that creates the worktree cannot consume
+  // anything (a human seed carries no producer signature, and the command-order
+  // consumed gate hard-refuses that), so the run-supplied project root reaches
+  // it as the resolved cwd instead.
+  const dynamic = def(
+    'input-workdir',
+    [input('target', { seedOwed: true })],
+    [step({
+      name: 'provisioner',
+      consumes: [],
+      produces: ['workspace'],
+      workdirFrom: 'target.path',
+      body: 'SENTINEL input workdir prompt',
+    })],
+  );
+  const { engine, store } = makeEngine([dynamic]);
+  const wf = engine.createInstance('input-workdir');
+
+  // Owed: the step is otherwise eligible, so the ONLY thing holding it is the
+  // input. It must defer rather than fire with no workdir, and must not burn a
+  // run, a task claim, or budget while it waits.
+  const first = engine.tick(wf, { now: 1000 });
+  assert.deepEqual(first.orders, []);
+  assert.equal(first.deferred.length, 1);
+  assert.equal(first.deferred[0]!.reason, 'workdir-unresolved');
+  assert.match(first.deferred[0]!.detail ?? '', /input 'target' is not green yet/);
+  assert.equal(store.listRuns(wf).length, 0);
+
+  // Provided: the same step now fires with the input's value as its cwd, and
+  // the value does NOT appear in order.consumes — it never became a consume.
+  engine.provideInput(wf, 'target', { path: '/Users/alex/code/dev' });
+  const order = fire(engine, wf, 'provisioner', 2000);
+  assert.equal(order.workdir, '/Users/alex/code/dev');
+  assert.deepEqual(order.consumes, {});
+  assert.equal(store.listRuns(wf)[0]!.order?.workdir, '/Users/alex/code/dev');
+});
+
 test('workdirFrom defers unresolved values without emitting an order, run, task, budget use, or parallel claim', () => {
   const cases: Array<{ label: string; workspace: Record<string, unknown>; detail: RegExp }> = [
     {

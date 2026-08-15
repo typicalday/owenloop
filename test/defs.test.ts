@@ -62,14 +62,16 @@ test('workdir and workdirFrom are mutually exclusive', () => {
   );
 });
 
-test('workdirFrom requires a consumed plain stem and a dotted value path', () => {
+test('workdirFrom requires a declared stem and a dotted value path', () => {
   assert.throws(
     () => parseDef({
       name: 'workdir-missing-stem',
       inputs: [{ name: 'workspace' }],
       steps: [{ name: 'builder', consumes: ['workspace'], produces: ['pr'], workdirFrom: 'other.payload.path' }],
     }),
-    (e: unknown) => e instanceof DefError && /workdirFrom stem 'other' is not in consumes/.test(e.message),
+    (e: unknown) =>
+      e instanceof DefError &&
+      /workdirFrom stem 'other' is neither in consumes nor a declared input/.test(e.message),
   );
   assert.throws(
     () => parseDef({
@@ -126,7 +128,66 @@ test('workdirFrom uses the longest consumed-stem prefix for dotted artifact path
     stem: 'a.b',
     path: 'c',
     mode: 'plain',
+    source: 'consume',
   });
+});
+
+test('workdirFrom accepts a declared input the step does not consume', () => {
+  // The reason this form exists: a COMMAND step cannot consume a human-supplied
+  // seed at all (the consumed-artifact gate refuses a value with no producer
+  // signature), so naming the input here is the only way a run-supplied project
+  // root can reach a step that has no consumes.
+  const parsed = parseDef({
+    name: 'workdir-input',
+    inputs: [{ name: 'target' }],
+    steps: [{ name: 'provisioner', consumes: [], produces: ['workspace'], workdirFrom: 'target.path' }],
+  });
+  const stepDef = parsed.steps[0]!;
+  assert.deepEqual(parseWorkdirFrom(stepDef.workdirFrom!, stepDef.consumes, ['target']), {
+    raw: 'target.path',
+    stem: 'target',
+    path: 'path',
+    mode: 'plain',
+    source: 'input',
+  });
+});
+
+test('workdirFrom prefers a consume over a same-named input', () => {
+  // Precedence matters: an existing def whose step consumes the input it takes
+  // its workdir from must keep reading out of the firing's consume map, not out
+  // of the instance artifact table, or its per-firing binding would be lost.
+  const parsed = parseDef({
+    name: 'workdir-precedence',
+    inputs: [{ name: 'workspace' }],
+    steps: [{ name: 'builder', consumes: ['workspace'], produces: ['pr'], workdirFrom: 'workspace.path' }],
+  });
+  const stepDef = parsed.steps[0]!;
+  assert.deepEqual(parseWorkdirFrom(stepDef.workdirFrom!, stepDef.consumes, ['workspace']), {
+    raw: 'workspace.path',
+    stem: 'workspace',
+    path: 'path',
+    mode: 'plain',
+    source: 'consume',
+  });
+});
+
+test('workdirFrom rejects a bare declared-input stem with no value path', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'workdir-bare-input',
+      inputs: [{ name: 'target' }],
+      steps: [{ name: 'provisioner', consumes: [], produces: ['workspace'], workdirFrom: 'target' }],
+    }),
+    (e: unknown) => e instanceof DefError && /non-empty value path/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({
+      name: 'workdir-bare-dotted-input',
+      inputs: [{ name: 'a.b' }],
+      steps: [{ name: 'provisioner', consumes: [], produces: ['workspace'], workdirFrom: 'a.b' }],
+    }),
+    (e: unknown) => e instanceof DefError && /non-empty value path/.test(e.message),
+  );
 });
 
 test('parseDef parses cadence durations to seconds', () => {
@@ -2648,6 +2709,77 @@ test('Mode 1 include: prefixStep prefixes a workdirFrom stem but preserves its v
     const builder = parent.steps.find((s) => s.name === 'kid.builder')!;
     assert.equal(builder.workdirFrom, 'kid.workspace.payload.worktreePath');
     assert.equal(builder.consumes[0]!.stem, 'kid.workspace');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Mode 1 include: a workdirFrom stem naming an unmapped child input is hoisted with the prefix', () => {
+  const dir = mktempDefsDir();
+  try {
+    writeFileSync(
+      join(dir, 'child.yaml'),
+      [
+        'name: child',
+        'inputs:',
+        '  - name: target',
+        'steps:',
+        '  - name: provisioner',
+        '    consumes: []',
+        '    produces: [workspace]',
+        '    workdirFrom: target.path',
+      ].join('\n'),
+    );
+    writeFileSync(
+      join(dir, 'parent.yaml'),
+      ['name: parent', 'steps:', '  - include: child', '    as: kid'].join('\n'),
+    );
+    const parent = loadDefs(dir).get('parent')!;
+    const provisioner = parent.steps.find((s) => s.name === 'kid.provisioner')!;
+    // Unmapped: the child input is hoisted as 'kid.target', so the stem moves with it.
+    assert.equal(provisioner.workdirFrom, 'kid.target.path');
+    assert.ok(parent.inputs.some((i) => i.name === 'kid.target'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Mode 1 include: a workdirFrom stem naming a MAPPED child input follows the mapping', () => {
+  const dir = mktempDefsDir();
+  try {
+    writeFileSync(
+      join(dir, 'child.yaml'),
+      [
+        'name: child',
+        'inputs:',
+        '  - name: target',
+        'steps:',
+        '  - name: provisioner',
+        '    consumes: []',
+        '    produces: [workspace]',
+        '    workdirFrom: target.path',
+      ].join('\n'),
+    );
+    writeFileSync(
+      join(dir, 'parent.yaml'),
+      [
+        'name: parent',
+        'inputs:',
+        '  - name: root',
+        'steps:',
+        '  - include: child',
+        '    as: kid',
+        '    inputs:',
+        '      target: root',
+      ].join('\n'),
+    );
+    const parent = loadDefs(dir).get('parent')!;
+    const provisioner = parent.steps.find((s) => s.name === 'kid.provisioner')!;
+    // Mapped: 'kid.target' is replaced by the outer artifact, so the stem must
+    // point at 'root' — leaving 'kid.target' would name a stem the expanded
+    // definition no longer has.
+    assert.equal(provisioner.workdirFrom, 'root.path');
+    assert.ok(!parent.inputs.some((i) => i.name === 'kid.target'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

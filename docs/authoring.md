@@ -113,36 +113,61 @@ a literal model id. Pin an exact model when you need reproducibility — just
 know the def is now host-specific, on purpose. Omit `model:` entirely and the
 dispatcher uses its default.
 
-## `workdirFrom:` — resolve a local workdir from a consumed value
+## `workdirFrom:` — resolve a local workdir from a consumed value or a declared input
 
-`workdirFrom:` sets the existing `Order.workdir` from a nested field in a green,
-plain consumed artifact. The grammar is `<consumedStem>.<dotted.value.path>`:
+`workdirFrom:` sets the existing `Order.workdir` from a nested field in a green
+artifact. The grammar is `<stem>.<dotted.value.path>`, and the stem may name
+either one of the step's own plain consumes or one of the definition's declared
+inputs:
 
 ```yaml
+inputs:
+  - name: target          # where the run should do its work
+    seedOwed: true
 steps:
   - name: provisioner
-    consumes: [proposal]
+    consumes: []          # a command step that creates the worktree
     produces: [workspace]
+    workdirFrom: target.path
   - name: builder
     consumes: [workspace]
     produces: [pr]
     workdirFrom: workspace.payload.worktreePath
 ```
 
-The stem named before the dotted value path must also appear in the step's
-`consumes:` list, and the consume must be plain rather than map (`[$i]`) or
-reduce (`[*]`). The engine resolves the longest consumed-stem prefix when an
+A consume always wins when a stem could be read either way, so a step that
+consumes the artifact it takes its workdir from keeps reading out of that
+firing's consume binding. The consume must be plain rather than map (`[$i]`) or
+reduce (`[*]`). The engine resolves the longest matching stem prefix when an
 artifact stem itself contains dots. `workdir:` and `workdirFrom:` are mutually
 exclusive.
 
-At order-build time the engine walks the consumed value using the dotted path.
+Reach for the **input** form when the step cannot consume the value. The clearest
+case is a `command` step: command orders are gated with the hard consumed-artifact
+rule, which refuses any consumed value that carries no producer signature — and a
+human-supplied seed input never has one. Naming the input in `workdirFrom:`
+routes the value through `Order.workdir`, a spawn parameter the engine resolves
+itself, rather than through `consumes`. This is also the only way a
+run-supplied value reaches a `command:` string's context, because a command's
+argv is passed to `/bin/sh -c` verbatim and is never interpolated.
+
+Naming an input creates an ordering edge without a consume: while that input is
+still owed, the firing defers with `workdir-unresolved` and detail
+`input '<name>' is not green yet`, exactly as a consume would have made it wait.
+The value does not appear in `Order.consumes`.
+
+At order-build time the engine walks the resolved value using the dotted path.
 A missing field, non-object intermediate, array, non-string final value, empty
 string, or whitespace-only string defers the firing with reason
 `workdir-unresolved`; the engine emits no order and inserts no run. The engine
 passes a valid path through unchanged: the engine does not resolve or normalize
 a relative path and does not change the worker's current-directory semantics.
 The producer and worker must therefore run on the same machine. A permanently
-unresolvable path remains deferred until the producer supplies a valid value.
+unresolvable path remains deferred until a valid value arrives.
+
+`Order.workdir` is an opaque location hint that no proof covers, whichever form
+produced it. What bounds where a worker may actually run is machine-side and
+belongs to the operator running the shift, not to the definition.
 
 ## `executor:` — declaring the executor
 
@@ -269,10 +294,12 @@ indirection. Two consequences of the local filter are worth stating plainly:
   permanently unclaimed step is caught rather than silently stuck.
 
 A `workdirFrom` firing can also remain deferred forever with
-`workdir-unresolved`. That reason means the producing step has not supplied a
-usable nested path: the value is missing, has an invalid shape, or is not a
-non-empty string. Fix the producing step or its artifact value; changing the
-consumer's worker does not bypass the engine's workdir resolution check.
+`workdir-unresolved`. That reason means no usable nested path has been supplied:
+the artifact is not green yet, or its value is missing, has an invalid shape, or
+is not a non-empty string. Fix whoever supplies that artifact — the producing
+step for a consumed stem, or the human starting the run for a declared input.
+Changing the consumer's worker does not bypass the engine's workdir resolution
+check.
 
 `capabilities:` is distinct from [`executor:`](#executor--declaring-the-executor):
 `executor:` says what *kind* of executor should run an order once it's claimed;
