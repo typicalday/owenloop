@@ -136,30 +136,35 @@ export interface StepPermissions {
  * `full-access`, and the two exist separately so that choice is stated rather
  * than inferred.
  *
- * WHAT `auto-safe` COSTS YOU TODAY, MEASURED. The three positions above
- * describe the vocabulary, not a guarantee about how far any given classifier
- * actually goes before it consults someone. On one shipped adapter the
- * classifier was probed with five actions — among them a recursive delete on an
- * absolute path outside the session working directory, an outbound network
- * request, and a read of a file outside that directory — and it consulted the
- * host on none of them and reported no auto-denial for any of them; four ran.
- * On the other, the position that maps to `auto-safe` keys its judgment on
+ * WHO ACTUALLY DOES THE GATING, AND WHAT IT COSTS. The three positions above
+ * describe the vocabulary, not a guarantee about how far any given VENDOR
+ * classifier goes before it consults someone — and measurement showed the
+ * vendor classifiers do not, in practice, consult anyone. One was probed with
+ * five actions, among them a recursive delete on an absolute path outside the
+ * session working directory, an outbound network request, and a read of a file
+ * outside that directory; it consulted the host on none of them and reported no
+ * auto-denial for any of them, and four ran. The other keys its judgment on
  * filesystem access being restricted, so a step that also declares
  * `filesystem: unrestricted` moves it close to `full-access` as well.
  *
- * The practical consequence for a definition author: choosing `auto-safe`
- * because you want a person consulted on the dangerous cases may get you
- * neither the prompt nor a record that one was skipped. Choose `ask` when a
- * human decision genuinely has to happen, and `full-access` when it genuinely
- * must not. Treat `auto-safe` as the classifier's own judgment with no
- * guaranteed appeal, not as a supervised `full-access`.
+ * So `auto-safe` is NOT implemented by handing the decision to a vendor
+ * classifier and hoping. An adapter that can intercept its harness's tool calls
+ * gates them itself (see `./gatekeeper.ts`) — path containment against the
+ * step's own working directory, plus a short deny-list of destructive shell
+ * patterns — which is a blunter instrument than a model-side classifier and the
+ * only one of the two that can actually escalate. An adapter that CANNOT
+ * intercept owes this vocabulary the other legitimate answer: refuse the value
+ * in `preflight`, per "WHAT AN ADAPTER OWES THIS VOCABULARY" below.
  *
- * `ask` and `auto-safe` are meaningful only where something can answer a
- * prompt. In a Shift-dispatched run nothing can, so a prompt is a stall: the
- * Step Agent stops mid-turn, submits nothing, and the hub re-arms the step into
- * a retry storm whose every worker dies in the same place. That is a reason for
- * a definition author to choose `full-access` for unattended steps, not a
- * reason for an adapter to silently upgrade one value into another.
+ * `ask` and `auto-safe` name positions where something is consulted. In a
+ * Shift-dispatched run no person is watching at the moment of the call, so the
+ * consultation cannot be synchronous: an adapter refuses the call and routes the
+ * agent to the `ask` MCP tool, which freezes the owed artifact and puts the
+ * question on a human's attention feed with an answer path back into the next
+ * attempt. What an adapter must never do is leave the call waiting on a prompt
+ * nobody will answer — that is a stall, and the hub re-arms the step into a
+ * retry storm whose every worker dies in the same place. Nor may it silently
+ * upgrade one value into another to avoid the problem.
  *
  * WHAT AN ADAPTER OWES THIS VOCABULARY. For each value an adapter must either
  * map it onto the vendor mode with the same meaning, or refuse it in

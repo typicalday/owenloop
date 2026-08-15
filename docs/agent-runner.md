@@ -59,8 +59,8 @@ A cache created by an older CLI may contain `filesystem` or `network` under `per
 | `network: owenloop-only` | supported through isolated settings, skills, MCP, and built-in tools | refused |
 | `network: unrestricted` | supported | supported with `filesystem: unrestricted`, or with an omitted filesystem field and legacy sandbox `workspace-write` / `danger-full-access`; legacy sandbox `read-only` is refused because Codex has no independent read-only network control |
 | `maxTurns` | enforced by the SDK | refused; Codex app-server has no thread or turn limit parameter |
-| `permissionMode: ask` | translated to `default` | translated to `approvalPolicy: untrusted` |
-| `permissionMode: auto-safe` | translated to `auto`, without the danger companion flag | translated to `approvalPolicy: on-request` |
+| `permissionMode: ask` | translated to `default`, with the adapter's gatekeeper set to `human-gate` | translated to `approvalPolicy: untrusted` |
+| `permissionMode: auto-safe` | translated to `default` (NOT the SDK's `auto`, which never reaches the permission callback), with the adapter's gatekeeper set to `classifier`; no danger companion flag | translated to `approvalPolicy: on-request` |
 | `permissionMode: full-access` | translated to `bypassPermissions` plus the SDK's `allowDangerouslySkipPermissions` companion flag | translated to `approvalPolicy: never` |
 | another adapter's `permissionMode` value | refused; the Claude Code adapter accepts only its own SDK union plus the three neutral values | refused; the Codex adapter accepts only `untrusted`, `on-request`, `never`, plus the three neutral values |
 
@@ -81,12 +81,24 @@ The neutral vocabulary is three positions on one axis, and both shipped harnesse
 | Neutral value | What is the gate | Claude Code | Codex |
 |---|---|---|---|
 | `ask` | a human, before anything beyond trivially safe reads | `default` | `untrusted` |
-| `auto-safe` | a model-side classifier; it proceeds on ordinary work and consults a human only when an action is potentially dangerous | `auto` | `on-request` |
+| `auto-safe` | a classifier; it proceeds on ordinary work and escalates only when an action is potentially dangerous | `default` + the adapter's gatekeeper | `on-request` |
 | `full-access` | nothing; the harness never consults a human and a failed action is reported back to the model | `bypassPermissions` + `allowDangerouslySkipPermissions` | `never` |
 
-`auto-safe` is not a milder `full-access`. It can still stop and ask, which is the whole point of it, so an adapter must never map it onto a never-ask mode. The two exist separately so a definition states the choice rather than having it inferred.
+`auto-safe` is not a milder `full-access`. It can still escalate, which is the whole point of it, so an adapter must never map it onto a never-ask mode. The two exist separately so a definition states the choice rather than having it inferred.
 
-`ask` and `auto-safe` are meaningful only where something can answer a prompt. In a Shift-dispatched run nothing can today, so a prompt is a stall: the Step Agent stops mid-turn, submits nothing, and the hub re-arms the step into a retry storm whose every worker dies in the same place. That is a reason for a definition author to choose `full-access` for headless steps, not a reason for an adapter to silently upgrade one value into another.
+### Who does the gating, and how a headless step escalates
+
+The vendor classifiers do not, in practice, consult anyone. The SDK's `auto` mode was probed with five actions — among them a recursive delete on an absolute path outside the session working directory, an outbound network request, and a read of a file outside that directory. It consulted the host on none of them, auto-denied none of them, and four ran. `auto` also never reaches the SDK's `canUseTool` callback, so no host-side wiring can give it an exception path.
+
+The Claude Code adapter therefore does not delegate `auto-safe` to `auto`. Both `ask` and `auto-safe` translate to `default`, the one SDK mode that routes every unapproved tool call to `canUseTool`, and the adapter's own gatekeeper decides:
+
+- **Path containment.** A tool call naming a path outside the step's working directory escalates, under either policy. This is decidable and is the check that catches the probes above.
+- **A shell deny-list.** Under `auto-safe`, `Bash` escalates on a short list of destructive or exfiltrating patterns (`sudo`, recursive force-delete, device writes, ownership changes, `curl`/`wget` carrying a request body, changes to what runs on the machine outside the step). It is a deny-list, not a proof: an obfuscated command gets past it. A step whose every command must be reviewed says `ask`, which escalates all of them without consulting the list.
+- **Policy.** `ask` allows only a contained read and escalates everything else. `auto-safe` allows ordinary work and escalates what the two checks above establish. The worker-owned `owenloop` MCP mount is allowed under both, because gating it would remove a stuck step's ability to say so.
+
+An escalation in a Shift-dispatched run cannot be a synchronous prompt — no person is watching at the moment of the call, and a call left waiting is a stall that re-arms the step into a retry storm. The adapter denies the call and routes the agent to the `ask` MCP tool, which freezes the owed artifact, closes the run without burning further attempts, and puts the question on a human's attention feed with an answer path back into the next attempt. The denial is also emitted as a progress event, so an operator can see a gate that fired.
+
+A step that names no `permissionMode` at all reaches the SDK's `default` and is gated under the `classifier` policy. Before the gatekeeper existed such a step was denied wholesale — `default` denies when no callback is wired — silently and finally, with nobody prompted and nothing recorded.
 
 For each neutral value an adapter must either map it onto the vendor mode with the same meaning, or refuse it in preflight. Refusal is a legitimate answer and fails closed: the worker releases its claim and starts no model process. Mapping a value onto a mode that grants more than the value describes is never legitimate.
 
