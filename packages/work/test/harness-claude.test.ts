@@ -209,11 +209,18 @@ test("permissionMode 'bypassPermissions' also sets allowDangerouslySkipPermissio
  * a classifier decides, and a dangerous call still stops and asks — so a def
  * that asked for `auto-safe` and silently got the never-ask mode would have had
  * its gate removed without saying so.
+ *
+ * `auto-safe` translating to `default` rather than to the SDK's `auto` is the
+ * third. `auto` never reaches `canUseTool`, so under it the "and a human is the
+ * exception path" half of the position cannot happen at all; `default` is the
+ * only mode that routes to the callback. `ask` and `auto-safe` therefore share
+ * an SDK mode and differ by `GatePolicy`, which is what the two policy tests
+ * below pin.
  */
 test('each neutral permissionMode translates to its SDK mode, and only full-access carries the danger flag', () => {
   const cases: Array<{ neutral: string; sdk: string; danger: boolean }> = [
     { neutral: 'ask', sdk: 'default', danger: false },
-    { neutral: 'auto-safe', sdk: 'auto', danger: false },
+    { neutral: 'auto-safe', sdk: 'default', danger: false },
     { neutral: 'full-access', sdk: 'bypassPermissions', danger: true },
   ];
 

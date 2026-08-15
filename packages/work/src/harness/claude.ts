@@ -28,6 +28,7 @@ import { accessSync, constants, existsSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 import type {
+  CanUseTool,
   EffortLevel,
   McpServerConfig,
   Options,
@@ -36,6 +37,8 @@ import type {
   SDKMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 
+import type { GatePolicy, GateVerdict } from './gatekeeper.ts';
+import { classifyToolCall } from './gatekeeper.ts';
 import { register } from './registry.ts';
 import { filterOwenloopEnv } from './child-env.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
@@ -217,25 +220,33 @@ const PERMISSION_MODES: readonly string[] = [
  * - `ask` → `default`. The SDK's `default` routes each unapproved tool to the
  *   `canUseTool` callback — a human decision point — and denies when no callback
  *   is wired. That is the "human is the gate" position.
- * - `auto-safe` → `auto`. `auto` is the SDK's model-classifier mode: it decides
- *   per call, with no prompt. NOT `acceptEdits`, which auto-approves filesystem
- *   operations by category and applies no judgment to anything else, and NOT
- *   `dontAsk`, which DENIES an unapproved tool rather than consulting anyone —
- *   silently narrower than what the step asked for.
+ * - `auto-safe` → `default`, with this adapter's own gatekeeper in the
+ *   `canUseTool` callback. NOT the SDK's `auto`, and that is the substance of
+ *   this mapping rather than a detail of it.
  *
- *   MEASURED against SDK 0.3.220, `canUseTool` wired throughout: the classifier
- *   consulted the host on NONE of five probe commands, and emitted no
- *   `permission_denied` system message for any of them. Four ran, including
- *   `rm -rf` on an ABSOLUTE path outside the session cwd (verified by the
- *   target directory being gone afterwards), a `curl` to the public internet,
- *   and a read of a file under `$HOME` outside cwd.
+ *   MEASURED against SDK 0.3.220, `canUseTool` wired throughout: `auto`'s
+ *   model-side classifier consulted the host on NONE of five probe commands and
+ *   emitted no `permission_denied` system message for any of them. Four ran,
+ *   including `rm -rf` on an ABSOLUTE path outside the session cwd (verified by
+ *   the target directory being gone afterwards), a `curl` to the public
+ *   internet, and a read of a file under `$HOME` outside cwd.
  *
- *   So `auto` does not, in practice, escalate to whoever hosts the session.
- *   Wiring `canUseTool` does not give `auto-safe` a human exception path — the
- *   callback is simply never reached. Anything that needs a person in the loop
- *   has to run under `ask`, whose `default` mode does route to the callback
- *   (measured on the same SDK build, including calls originating inside a
- *   subagent, which arrive carrying that subagent's `agentID`).
+ *   So `auto` never reaches the callback and cannot escalate to anyone. The
+ *   position `auto-safe` names — a classifier gates, a human is the exception
+ *   path — is therefore not something `auto` can be configured into; it has to
+ *   be built on the one mode that does route to the callback. `default` is that
+ *   mode (measured on the same SDK build, including calls originating inside a
+ *   subagent, which arrive carrying that subagent's `agentID`), so `auto-safe`
+ *   and `ask` now share it and differ by the `GatePolicy` handed to the
+ *   gatekeeper. The trade is deliberate: `auto` classifies with a model and this
+ *   adapter classifies with path containment plus a short deny-list, which is
+ *   the blunter instrument — but it is the only one of the two that can put a
+ *   person in the loop, which is the whole of what the position promises.
+ *
+ *   NOT `acceptEdits`, which auto-approves filesystem operations by category and
+ *   applies no judgment to anything else, and NOT `dontAsk`, which DENIES an
+ *   unapproved tool rather than consulting anyone — silently narrower than what
+ *   the step asked for.
  * - `full-access` → `bypassPermissions`. The only SDK mode that runs tools with
  *   no prompt at all, and the one the companion flag below exists for.
  *
@@ -244,7 +255,7 @@ const PERMISSION_MODES: readonly string[] = [
  */
 const NEUTRAL_TO_SDK_MODE: NeutralPermissionModeMap = Object.freeze({
   'ask': 'default',
-  'auto-safe': 'auto',
+  'auto-safe': 'default',
   'full-access': 'bypassPermissions',
 });
 
@@ -268,6 +279,96 @@ function toSdkPermissionMode(mode: string): PermissionMode | undefined {
     return mapped === null ? undefined : (mapped as PermissionMode);
   }
   return PERMISSION_MODES.includes(mode) ? (mode as PermissionMode) : undefined;
+}
+
+/**
+ * How hard the gatekeeper gates, from the mode the step ACTUALLY AUTHORED.
+ *
+ * Derived from the authored string rather than from the translated SDK mode
+ * because the translation is deliberately lossy in exactly the place that
+ * matters: `ask` and `auto-safe` both become `default`, and the whole difference
+ * between them now lives here.
+ *
+ * WHY AN UNSET MODE CLASSIFIES RATHER THAN DENYING. A step that names no
+ * `permissionMode` gets the SDK's own `default`, which routes to the callback.
+ * Before a callback existed that meant the SDK denied every unapproved call —
+ * silently, finally, with nobody prompted and nothing recorded. Treating the
+ * unset case as `classifier` is not a widening of what those steps were promised;
+ * it is the first time they get anything at all. The same reasoning covers a
+ * step that named the vendor's `default` or `acceptEdits`.
+ *
+ * `dontAsk` is the one value that keeps its narrow meaning: it is documented as
+ * "deny if not pre-approved", so it maps to the policy that denies rather than
+ * being folded into the classifier. The SDK short-circuits that mode before the
+ * callback, so this is a statement of intent more than a live path — but a
+ * future SDK that does route it must not find it silently widened here.
+ */
+export function gatePolicyFor(authoredMode: string | undefined): GatePolicy {
+  if (authoredMode === 'ask') return 'human-gate';
+  if (authoredMode === 'dontAsk') return 'deny-unapproved';
+  return 'classifier';
+}
+
+/**
+ * What an escalated call tells the agent.
+ *
+ * This is the whole of the "human exception path" today, and it is a ROUTE
+ * rather than an answer: no person is watching a headless run at the moment the
+ * call is made, so the honest thing is to refuse the call and name the channel
+ * that does reach one. `ask` is that channel — it freezes the owed artifact,
+ * closes the run cheaply instead of burning attempts against a wall, and puts a
+ * question on the operator's attention feed with an answer path back into the
+ * next attempt.
+ *
+ * The message names the specific reason and tells the agent both of its real
+ * options, because the wrong outcome here is an agent that reads a denial as
+ * "try a different phrasing" and grinds through its attempt budget. Most
+ * escalations have an ordinary alternative — the same work done inside the
+ * step's own directory — and the message says so before it points at `ask`.
+ */
+function escalationMessage(reason: string): string {
+  return [
+    `Denied: ${reason}.`,
+    'Nobody is watching this run to approve it, so this call cannot be granted here and rephrasing it will not change that.',
+    'If the work has an equivalent inside your own working directory, do that instead.',
+    'If it does not — if you genuinely cannot finish what you owe without this — call the `ask` tool on the mounted `owenloop` MCP server and state what you need and why. That reaches a person, and their answer comes back to you on your next attempt. Do not guess, and do not submit work that pretends this succeeded.',
+  ].join(' ');
+}
+
+/**
+ * The `canUseTool` callback, wired on every start.
+ *
+ * WIRED UNCONDITIONALLY, including under `bypassPermissions`, where the SDK
+ * never consults it. A callback that is present but unreached costs nothing; a
+ * callback wired only under the modes we predict will reach it is one SDK change
+ * away from restoring the silent deny-everything behavior this exists to end.
+ *
+ * FAIL-CLOSED, deliberately. A throw inside this callback would leave the SDK
+ * with no `control_response` and the tool blocked forever — permission prompts
+ * have no park deadline. So the classification is wrapped: anything unexpected
+ * becomes a denial with the same routing message rather than a hang.
+ */
+function buildCanUseTool(
+  cwd: string,
+  policy: GatePolicy,
+  onEvent: (e: AgentEvent) => void,
+): CanUseTool {
+  return async (toolName, input, options) => {
+    let verdict: GateVerdict;
+    try {
+      verdict = classifyToolCall({ toolName, input, workdir: cwd, blockedPath: options.blockedPath }, policy);
+    } catch (err) {
+      verdict = { decision: 'escalate', reason: `the gatekeeper could not judge this call (${errText(err)})` };
+    }
+    if (verdict.decision === 'allow') return { behavior: 'allow' };
+    // Recorded as well as returned: a denial the operator cannot see is how the
+    // pre-callback behavior stayed invisible for as long as it did.
+    onEvent({
+      kind: 'progress',
+      text: `permission escalation: ${toolName} denied — ${verdict.reason}`,
+    });
+    return { behavior: 'deny', message: escalationMessage(verdict.reason) };
+  };
 }
 
 /** The five-value closed union the SDK types `Options.effort` as. */
@@ -492,6 +593,14 @@ export function buildClaudeOptions(
     stderr: (data: string) => {
       extra.onEvent({ kind: 'progress', text: `stderr: ${data.trimEnd()}` });
     },
+    // Set here, before the `permissionMode` block below, because it is not
+    // conditional on that block running: a step naming no mode at all is exactly
+    // the case that used to reach the SDK's `default` and be denied wholesale.
+    canUseTool: buildCanUseTool(
+      inputs.cwd,
+      gatePolicyFor(permissions.permissionMode),
+      extra.onEvent,
+    ),
   };
 
   // Omit the key entirely when nothing resolves — see `resolveExecutable`.
@@ -521,8 +630,10 @@ export function buildClaudeOptions(
   if (permissions.permissionMode !== undefined) {
     // Neutral `full-access` lands here as `bypassPermissions`, so the companion
     // flag below covers it too — that is the point of translating BEFORE the
-    // pairing rather than after it. Neutral `auto-safe` lands as `auto` and
-    // deliberately does NOT get the flag: it is still allowed to stop and ask.
+    // pairing rather than after it. Neutral `ask` and `auto-safe` both land as
+    // `default` and deliberately do NOT get the flag: `default` is the mode that
+    // routes to `canUseTool`, which is where the difference between those two
+    // positions is actually drawn (see `gatePolicyFor`).
     const mode = toSdkPermissionMode(permissions.permissionMode);
     if (mode !== undefined) {
       options.permissionMode = mode;
