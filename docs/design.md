@@ -964,8 +964,26 @@ verdict, so the worker issues neither verb and the reap path re-offers the order
 Command receipts may also carry a bounded JSON payload emitted by a stdout line
 beginning with `##owenloop:payload##`. The last marker line wins, and the 64 KiB
 JSON-text cap protects the runner because the runner does not buffer full stdout.
-A valid plain-step payload reject is delivered only after every owed receipt has
-been submitted. The reject request contains `workflow`, `run`, `path`, and `text`;
+A valid plain-step payload reject is delivered BEFORE any owed receipt is
+submitted. The hub refuses a reject from a run whose claim has closed, and a
+step's last owed submit is what closes it — so the reverse order made every
+reject from a single-owed-path step undeliverable. What follows the reject
+depends on the hub's own answer, in its `closed` field:
+
+- `closed: true` — the rejected path was one of this firing's consumed inputs,
+  so the hub closed the run `no_work`. The owed paths stay debts and the step
+  re-fires against the rebuilt input. No receipt is submitted: an artifact
+  derived from an input the same command just declared bad is what the engine's
+  dead-input cascade would discard anyway. This is also why the ordering cannot
+  born-reject a later submit — there is no later submit.
+- `closed: false` — the rejected path was not consumed by this firing, so the
+  claim and the consume fingerprint are both intact and every owed receipt is
+  submitted normally.
+
+A reject that is refused or throws submits nothing at all, so a gate can never
+green the path its own reject was protesting.
+
+The reject request contains `workflow`, `run`, `path`, and `text`;
 the hub derives the rejecting actor and the client cannot provide `by`.
 
 This worker transport does not change `assertAuthority`: the engine continues to

@@ -772,21 +772,25 @@ test('a non-zero exit still submits a receipt carrying the exit code (outcome su
   assert.equal((submits[0]!.value as CommandReceipt).exitCode, 3);
 });
 
-test('a plain command submits every receipt before delivering a payload reject', async () => {
+test('a payload reject that leaves the claim open lands FIRST, then every owed receipt', async () => {
   const fr = fakeRunner();
   const { hub, calls, submits } = mockHub({
     getOrder: [commandOrder({ owes: ['a', 'b'] })],
     submit: ['green', 'green'],
+    // closed:false ⇒ the rejected path was not one of this firing's consumed
+    // inputs, so the claim and the consume fingerprint both survive it.
     reject: [{ ok: true, closed: false }],
   });
   const loop = createExecLoop(baseOpts(hub, fr.runner));
   const p = loop.run();
   await macrotaskSleep();
   fr.resolve(result(0, { payloadLine: '{"reject":{"path":"input","text":"upstream is invalid"}}' }));
-  assert.equal(await p, 'rejected');
+  assert.equal(await p, 'submitted');
   assert.deepEqual(submits.map((s) => s.path), ['a', 'b']);
   const verbs = calls.filter((call) => call.verb === 'submit' || call.verb === 'reject').map((call) => call.verb);
-  assert.deepEqual(verbs, ['submit', 'submit', 'reject']);
+  // Reject first. The hub refuses a reject from a run whose claim has closed,
+  // and the last owed submit is what closes it.
+  assert.deepEqual(verbs, ['reject', 'submit', 'submit']);
   assert.deepEqual(only(calls, 'reject')[0]!.arg, {
     workflow: 'wf1',
     run: 'run1',
@@ -796,22 +800,31 @@ test('a plain command submits every receipt before delivering a payload reject',
   assert.equal((only(calls, 'reject')[0]!.arg as Record<string, unknown>)['by'], undefined);
 });
 
-test('a closed payload reject stops without releasing the already-closed claim', async () => {
+test('a payload reject that closes the run submits NOTHING and leaves the owed paths as debts', async () => {
   const fr = fakeRunner();
-  const { hub, calls } = mockHub({
-    getOrder: [commandOrder()],
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder({ owes: ['mergeable'] })],
     submit: ['green'],
+    // closed:true ⇒ the rejected path WAS a consumed input, so the hub closed
+    // the run `no_work`. This is the delivery gate's shape: merge-gate consumes
+    // `pr` and owes `mergeable`.
     reject: [{ ok: true, closed: true }],
   });
   const loop = createExecLoop(baseOpts(hub, fr.runner));
   const p = loop.run();
   await macrotaskSleep();
-  fr.resolve(result(0, { payloadLine: '{"reject":{"path":"input","text":"bad value"}}' }));
+  fr.resolve(result(0, { payloadLine: '{"reject":{"path":"pr","text":"CI is failing"}}' }));
   assert.equal(await p, 'rejected');
-  assert.equal(only(calls, 'release').length, 0);
+  // THE REGRESSION THIS PINS. Under submit-then-reject this run greened
+  // `mergeable` and only then discovered its `pr` reject was unenforceable
+  // against a closed claim, so a gate that refused to confirm the PR handed
+  // `merger` a green anyway (observed on run_ecfedb23a84194e446159e67).
+  assert.equal(submits.length, 0, 'a gate that rejects must not also green its own output');
+  assert.equal(only(calls, 'reject').length, 1);
+  assert.equal(only(calls, 'release').length, 0, 'the hub already closed the run');
 });
 
-test('a payload reject failure is distinct and releases the claim after receipts land', async () => {
+test('a payload reject failure is distinct, submits nothing, and releases the claim', async () => {
   const fr = fakeRunner();
   const { hub, calls, submits } = mockHub({
     getOrder: [commandOrder()],
@@ -823,8 +836,26 @@ test('a payload reject failure is distinct and releases the claim after receipts
   await macrotaskSleep();
   fr.resolve(result(0, { payloadLine: '{"reject":{"path":"input","text":"bad value"}}' }));
   assert.equal(await p, 'reject-failed');
-  assert.equal(submits.length, 1);
+  // A reject that did not land must never be followed by a receipt that greens
+  // the very path the reject was protesting.
+  assert.equal(submits.length, 0);
   assert.equal(only(calls, 'reject').length, 1);
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+test('a REFUSED payload reject submits nothing and releases the claim', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    submit: ['green'],
+    reject: [{ ok: false, text: 'reject: wf1/run1 is not currently held by an open claim — nothing was rejected.' }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, { payloadLine: '{"reject":{"path":"input","text":"bad value"}}' }));
+  assert.equal(await p, 'reject-failed');
+  assert.equal(submits.length, 0);
   assert.equal(only(calls, 'release').length, 1);
 });
 
