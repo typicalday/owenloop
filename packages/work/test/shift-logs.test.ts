@@ -823,6 +823,23 @@ test('buildSpawnPlan stays pure and carries the log PATH, never a descriptor', (
   assert.deepEqual(buildSpawnPlan(spec, 'https://hub', 'acct', '/bin/owenloop', '/usr/bin/node', 'shf_1', ''), without);
 });
 
+test('buildSpawnPlan carries the operator work roots in the child spawn ENV', () => {
+  const spec = { workflow: 'wf1', run: 'run_1', step: 's', kind: 'exec' as const };
+  const base = ['https://hub', 'acct', '/bin/owenloop', '/usr/bin/node', 'shf_1', undefined] as const;
+
+  // `:`-separated, like PATH, and in the spawn env rather than argv — the same
+  // contract as OWENLOOP_ACCOUNT, and for the same reason: neither `owenloop work
+  // exec` nor `owenloop work agent-run` has an operator-facing flag for it.
+  const withRoots = buildSpawnPlan(spec, ...base, ['/Users/me/code', '/srv/work']);
+  assert.equal(withRoots.options.env?.['OWENLOOP_ALLOWED_WORKDIR_ROOTS'], '/Users/me/code:/srv/work');
+
+  // Omitted or empty sets NO variable, so the child falls through to its own
+  // settings-file resolution and the plan is byte-identical to the old shape.
+  const without = buildSpawnPlan(spec, ...base);
+  assert.equal('OWENLOOP_ALLOWED_WORKDIR_ROOTS' in (without.options.env ?? {}), false);
+  assert.deepEqual(buildSpawnPlan(spec, ...base, []), without);
+});
+
 // ── the JSON Lines sink ────────────────────────────────────────────────────
 
 test('the sink writes one parseable JSON Lines record per event, in order', () => {

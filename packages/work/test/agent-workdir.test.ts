@@ -24,9 +24,11 @@ import { afterEach, beforeEach, test } from 'node:test';
 import {
   ensureWorkDir,
   isUnderWorkRoot,
+  isWorkdirAllowed,
   isWorkDirReapable,
   listWorkDirs,
   reapWorkDir,
+  resolveAllowedWorkdirRoots,
   resolveWorkRepo,
   resolveWorkRoot,
   runWorkDir,
@@ -188,6 +190,59 @@ test('isUnderWorkRoot admits descendants, and rejects the root itself, siblings,
   assert.equal(isUnderWorkRoot('/w/wf1/../../etc', '/w'), false);
   // ...and a prefix match is not a containment match: `/workshop` is not in `/w`.
   assert.equal(isUnderWorkRoot('/workshop/run1', '/w'), false);
+});
+
+// ---- operator-declared work roots -------------------------------------------
+//
+// A DIFFERENT question from `workRoot`, and the two are deliberately not
+// related: `workRoot` is the ONE directory owenloop creates run directories
+// under; `allowedWorkdirRoots` is the SET of directories an ORDER is allowed to
+// name as its working directory. Nothing derives one from the other.
+
+test('resolveAllowedWorkdirRoots: env REPLACES settings, and every root comes back absolute', () => {
+  // The env var is `:`-separated, like PATH, because that is the shape
+  // `owenloop shift start` can hand a detached child through the spawn env.
+  assert.deepEqual(
+    resolveAllowedWorkdirRoots({ OWENLOOP_ALLOWED_WORKDIR_ROOTS: '/a:/b' }, ['/from/settings'], '/cwd'),
+    ['/a', '/b'],
+  );
+  assert.deepEqual(resolveAllowedWorkdirRoots({}, ['/from/settings'], '/cwd'), ['/from/settings']);
+
+  // Empty entries and surrounding whitespace are dropped, not turned into '/'.
+  assert.deepEqual(
+    resolveAllowedWorkdirRoots({ OWENLOOP_ALLOWED_WORKDIR_ROOTS: ' /a : : /b ' }, undefined, '/cwd'),
+    ['/a', '/b'],
+  );
+
+  // A relative root resolves against the SUPPLIED cwd, never process.cwd().
+  assert.deepEqual(
+    resolveAllowedWorkdirRoots({ OWENLOOP_ALLOWED_WORKDIR_ROOTS: 'code' }, undefined, '/home/me'),
+    ['/home/me/code'],
+  );
+
+  // An unset or blank env var falls THROUGH to settings rather than clearing it.
+  assert.deepEqual(resolveAllowedWorkdirRoots({ OWENLOOP_ALLOWED_WORKDIR_ROOTS: '  ' }, ['/s'], '/cwd'), ['/s']);
+  assert.deepEqual(resolveAllowedWorkdirRoots({}, undefined, '/cwd'), []);
+});
+
+test('isWorkdirAllowed: no roots means NO restriction, and the root itself counts as inside', () => {
+  // DEFAULT-OPEN. Every shift running today declared nothing, and default-closed
+  // would silently stop all of them.
+  assert.equal(isWorkdirAllowed('/anywhere/at/all', []), true);
+
+  // INCLUSIVE OF THE ROOT — the opposite of `isUnderWorkRoot`, which excludes
+  // the root because it guards a DELETION. This guards permission to WORK in a
+  // directory, and an operator who names `/code` means `/code` too.
+  assert.equal(isWorkdirAllowed('/code', ['/code']), true);
+  assert.equal(isWorkdirAllowed('/code/proj/wt/x', ['/code']), true);
+
+  assert.equal(isWorkdirAllowed('/elsewhere', ['/code']), false);
+  // A prefix match is not a containment match.
+  assert.equal(isWorkdirAllowed('/codex/proj', ['/code']), false);
+  // `..` cannot smuggle a path out: both sides are resolved first.
+  assert.equal(isWorkdirAllowed('/code/../etc', ['/code']), false);
+  // ANY root admitting it is enough.
+  assert.equal(isWorkdirAllowed('/srv/app', ['/code', '/srv']), true);
 });
 
 // ---- ensureWorkDir -----------------------------------------------------------

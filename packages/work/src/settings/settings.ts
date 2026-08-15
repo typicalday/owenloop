@@ -13,7 +13,7 @@
  * own store (the CredentialReader seam) — there is deliberately no token knob.
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { owenloopConfigDir } from '../../../../src/config-dir.ts';
 import { type CapabilityModelRow, validateCapabilityModels } from '../agent/capability-model.ts';
 
@@ -118,6 +118,25 @@ export interface Settings {
    */
   workRepo?: string;
   /**
+   * The directories a shift on THIS machine may accept as an order's working
+   * directory. Absolute paths; a directory permits itself and everything under
+   * it.
+   *
+   * NOT `workRoot` (above) UNDER A DIFFERENT NAME. `workRoot` is a directory
+   * owenloop writes per-run subdirectories INTO. This is a list of directories
+   * a HUB-SUPPLIED `OrderPacket.workdir` is allowed to name. See
+   * `src/agent/workdir.ts` for the side-by-side table and the full rationale.
+   *
+   * UNSET OR EMPTY MEANS NO RESTRICTION, which is what every shift running
+   * today does. Default-closed would refuse work on upgrade, silently, on
+   * machines whose operator never asked for a boundary.
+   *
+   * Overridden by `OWENLOOP_ALLOWED_WORKDIR_ROOTS` (PATH-style, `:`-separated)
+   * and by `owenloop shift start --work-root <dir>` (repeatable). The override
+   * REPLACES this list; it does not extend it.
+   */
+  allowedWorkdirRoots?: string[];
+  /**
    * How THIS machine serves each capability: a flat map from capability to
    * `{model, effort}`, keyed by the composed capability (`wise:deep`) or by the
    * bare name (`wise`). See `src/agent/capability-model.ts` for the lookup rule
@@ -145,6 +164,7 @@ export const KNOWN_SETTINGS_KEYS = [
   'maxConcurrentAgents',
   'workRoot',
   'workRepo',
+  'allowedWorkdirRoots',
   'capabilityModels',
 ] as const;
 
@@ -266,6 +286,29 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
           `(e.g. {"capabilityModels": {"wise:deep": {"model": "<model-id>", "effort": "xhigh"}}}). ` +
           `Depth now rides on the capability's modifier suffix, not on a tier rung.`,
       );
+    }
+  }
+  if ('allowedWorkdirRoots' in obj) {
+    // ABSOLUTE PATHS ONLY, and that is the one rule worth a hard error rather
+    // than a warning. A relative entry would resolve against whatever directory
+    // the shift process happened to start in — the very "wherever the shift was
+    // launched" assumption this key exists to remove — so a boundary written
+    // relatively would move with the launch directory and permit a different
+    // set of paths on every start.
+    const v = obj['allowedWorkdirRoots'];
+    if (!Array.isArray(v) || v.some((entry) => typeof entry !== 'string')) {
+      throw bad('allowedWorkdirRoots', 'an array of absolute directory paths', v);
+    }
+    for (const entry of v as string[]) {
+      if (entry.trim() === '') {
+        throw bad('allowedWorkdirRoots', 'an array of NON-EMPTY absolute directory paths', v);
+      }
+      if (!isAbsolute(entry)) {
+        throw new Error(
+          `invalid settings file at ${path}: 'allowedWorkdirRoots' entry ${JSON.stringify(entry)} must be an ` +
+            `absolute path — a relative root would resolve against whatever directory the shift was launched in`,
+        );
+      }
     }
   }
   if ('capabilityModels' in obj) {

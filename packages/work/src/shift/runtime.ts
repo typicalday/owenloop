@@ -8,7 +8,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 import { createHubClient } from '../hub/client.ts';
@@ -22,7 +22,11 @@ import { stampShiftEvent, type ShiftEvent, type ShiftEventBody } from './protoco
 import { createDefaultSpawner, type WorkerFailure } from './spawn.ts';
 import { resolveStateDir, ensureStateDir, reconcileInFlight } from './state.ts';
 import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.ts';
-import { resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
+import {
+  resolveAllowedWorkdirRoots,
+  resolveWorkRepo,
+  resolveWorkRoot,
+} from '../agent/workdir.ts';
 import { installSignalHandlers, type SignalHost } from '../roles/signals.ts';
 import { createShiftDaemon, type ShiftDaemon } from './server.ts';
 import {
@@ -156,6 +160,13 @@ export interface ParsedArgs {
   logDir?: string;
   /** `--log-max-age` — worker-log retention in milliseconds. `0` reaps eagerly. */
   logMaxAgeMs?: number;
+  /**
+   * `--work-root <dir>` — REPEATABLE. Each occurrence adds one directory the
+   * shift may accept as an order's working directory; passing none leaves the
+   * shift unrestricted. Distinct from `settings.workRoot` (singular), which is
+   * where owenloop CREATES per-run directories — see `src/agent/workdir.ts`.
+   */
+  workRoots?: string[];
   error?: string;
 }
 
@@ -195,6 +206,7 @@ export function parseArgs(args: string[]): ParsedArgs {
       case '--cache-dir':
       case '--log-dir':
       case '--log-max-age':
+      case '--work-root':
       case '--state-dir': {
         const r = takeValue(a, i);
         if ('error' in r) return { error: r.error };
@@ -226,6 +238,12 @@ export function parseArgs(args: string[]): ParsedArgs {
           const n = intFlag(r.value, '--poll-interval');
           if (typeof n !== 'number') return { error: n.error };
           parsed.pollIntervalMs = n;
+        } else if (name === '--work-root') {
+          // ACCUMULATES rather than overwrites — one directory per occurrence
+          // is what makes a multi-project boundary expressible at all. A shift
+          // that may work in two projects needs two roots, and there is no
+          // separator that is safe inside a path on every platform.
+          (parsed.workRoots ??= []).push(r.value);
         }
         break;
       }
@@ -241,7 +259,7 @@ function usage(): void {
     'usage: owenloop work shift [--origin <url>] [--as <account>] [--name <n>] [--serve-crews a,b] [--cap <n>]\n' +
       '                      [--workflow <id>] [--poll-interval <ms>] [--once]\n' +
       '                      [--max-agents <n>] [--cache-dir <p>] [--state-dir <p>]\n' +
-      '                      [--log-dir <p>] [--log-max-age <ms>]\n',
+      '                      [--log-dir <p>] [--log-max-age <ms>] [--work-root <dir>]...\n',
   );
 }
 
@@ -384,6 +402,24 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   const maxConcurrentAgents = resolveMaxConcurrentAgents(parsed.maxAgents, settings.maxConcurrentAgents);
   const workRoot = resolveWorkRoot(env, settings.workRoot, cacheDir);
   const workRepo = resolveWorkRepo(env, settings.workRepo);
+  /**
+   * The operator's filesystem boundary, resolved once here so the loop receives
+   * an already-absolute list and does no precedence work of its own.
+   *
+   * Precedence is `--work-root` (repeatable) > `OWENLOOP_ALLOWED_WORKDIR_ROOTS`
+   * > `settings.allowedWorkdirRoots` > none. Each rung REPLACES the one below
+   * rather than adding to it: a narrowing control that could only ever widen
+   * would not be a safety control at all.
+   *
+   * Relative entries resolve against THIS process's cwd, which is where the
+   * operator typed the flag. `settings.allowedWorkdirRoots` cannot be relative
+   * — `validateSettings` rejects that at load, because a stored boundary that
+   * moves with the launch directory is the exact failure this key removes.
+   */
+  const allowedWorkdirRoots =
+    parsed.workRoots !== undefined && parsed.workRoots.length > 0
+      ? parsed.workRoots.map((entry) => resolve(process.cwd(), entry))
+      : resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd());
   const hub = createHubClient({ origin, getToken: async () => token });
   const now = () => Date.now();
   const monotonicNow = () => performance.now();
@@ -504,6 +540,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     logDirReady
       ? { dir: logDir, err: (line: string) => process.stderr.write(`${line}\n`) }
       : undefined,
+    allowedWorkdirRoots,
   );
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 

@@ -35,6 +35,7 @@ import { hostname } from 'node:os';
 
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
+import { resolveAllowedWorkdirRoots } from '../agent/workdir.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { createExecLoop, type ExecOutcome } from '../exec/loop.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
@@ -133,6 +134,7 @@ export function exitCodeFor(outcome: ExecOutcome): number {
     case 'judge-rejected':
       return 0;
     case 'misroute':
+    case 'workdir-denied':
     case 'unresolved-instructions':
     case 'killed':
     case 'lease-lost':
@@ -214,6 +216,12 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   const cwd = deps.cwd ?? process.cwd();
+  // Machine policy, resolved from the SAME two sources the shift resolves it
+  // from: `OWENLOOP_ALLOWED_WORKDIR_ROOTS` (which `owenloop shift start` exports
+  // when the operator passed `--work-root`) then the settings file. An
+  // independently launched `owenloop work exec` therefore honours the settings
+  // file on its own, with no shift involved.
+  const allowedWorkdirRoots = resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, cwd);
   let instructions = deps.instructions;
   if (instructions === undefined) {
     try {
@@ -251,6 +259,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     holder,
     instructions,
     cwd,
+    allowedWorkdirRoots,
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     now: () => Date.now(),
     out,

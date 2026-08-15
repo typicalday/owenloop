@@ -46,6 +46,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
+import { isWorkdirAllowed } from '../agent/workdir.ts';
 import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.ts';
@@ -82,6 +83,7 @@ export type ExecOutcome =
   | 'submitted' // receipt delivered to every owed path (exit 0)
   | 'completed' // the order already finished at first contact (exit 0)
   | 'misroute' // null / non-command packet — released, not our failure (exit 1)
+  | 'workdir-denied' // the order named a cwd outside this machine's declared roots — released (exit 1)
   | 'unresolved-instructions' // local-store instruction refusal — released, never spawned (exit 1)
   | 'killed' // a signal aimed at exec killed the command + released (exit 1)
   | 'lease-lost' // the lease went terminal while the command ran (exit 1)
@@ -112,6 +114,18 @@ export interface ExecLoopOptions {
   instructions: InstructionResolver;
   /** cwd for the command when the order packet carries no `workdir`. */
   cwd: string;
+  /**
+   * The directories this MACHINE's operator declared as places work may happen,
+   * already resolved to absolute paths by `resolveAllowedWorkdirRoots`.
+   *
+   * NOT `workRoot`. `workRoot` is the single directory owenloop CREATES worktrees
+   * under; this is the set of directories an ORDER is permitted to name as its
+   * cwd. They answer different questions and neither derives from the other.
+   *
+   * UNSET or EMPTY means NO RESTRICTION — the pre-existing behaviour, and the
+   * only default that does not break every shift already running.
+   */
+  allowedWorkdirRoots?: string[];
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   random?: () => number;
@@ -585,6 +599,41 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       lease.stop('misroute'); // targeted release — not exec's to fail
       await leasePromise;
       return 'misroute';
+    }
+
+    // MACHINE POLICY, checked before any instruction is resolved and long before
+    // anything is spawned. The operator who started this shift named the
+    // directories work may happen in (`owenloop shift start --work-root`, or
+    // `allowedWorkdirRoots` in settings); an order naming anything else is
+    // refused HERE, in the worker, because the worker is the only process that
+    // ever sees `OrderPacket.workdir` — the shift's `whats_next` sweep receives
+    // a `WorkOrder`, which has no such field.
+    //
+    // RELEASED, not failed. This is not a defect in the order and not a failure
+    // of the work: it is one machine declining work it was not configured to
+    // host. A targeted release returns the order to the hub's pickup window so a
+    // differently-configured machine can take it, exactly like `misroute`.
+    // Submitting a failure receipt instead would kill a run that is perfectly
+    // valid somewhere else.
+    //
+    // ONLY an order-NAMED workdir is checked. An order that declares none
+    // inherits this worker's own launch directory, which the operator chose
+    // themselves when they started the shift — bounding an operator's own
+    // choice by the operator's own roots protects nobody and would deny every
+    // step that legitimately declares no workdir.
+    if (
+      order.workdir !== undefined &&
+      !isWorkdirAllowed(order.workdir, opts.allowedWorkdirRoots ?? [])
+    ) {
+      const roots = (opts.allowedWorkdirRoots ?? []).join(', ');
+      opts.err(
+        `owenloop work exec: step '${order.step}' (${workflow}/${runId}) names workdir ` +
+          `'${order.workdir}', which is outside every work root this machine declared (${roots}) — ` +
+          'releasing for the pickup window',
+      );
+      lease.stop('workdir-denied'); // targeted release — local policy, not a failure
+      await leasePromise;
+      return 'workdir-denied';
     }
 
     let resolvedCommand: string;

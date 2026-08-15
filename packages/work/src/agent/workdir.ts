@@ -90,6 +90,94 @@ export function isUnderWorkRoot(dir: string, workRoot: string): boolean {
   return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
 }
 
+/**
+ * ── OPERATOR-DECLARED WORKDIR ROOTS ─────────────────────────────────────────
+ *
+ * A SEPARATE MECHANISM FROM `workRoot` ABOVE, and the two are easy to confuse,
+ * so state the difference once:
+ *
+ * | | `workRoot` (singular) | `allowedWorkdirRoots` (plural) |
+ * |---|---|---|
+ * | what it is | a directory owenloop WRITES INTO | a list of directories orders may NAME |
+ * | who supplies the path | this machine's operator | the run, via `OrderPacket.workdir` |
+ * | what it does | holds `<workflow>/<run>/` per-run dirs | permits or refuses a cwd |
+ * | unset means | default to `<cacheDir>/work` | NO RESTRICTION |
+ *
+ * WHY THIS EXISTS. `OrderPacket.workdir` is an opaque location hint the HUB
+ * supplies and the worker obeys (`src/exec/loop.ts`, `src/agent/loop.ts`). Since
+ * a def may set it from a declared INPUT — `workdirFrom: target.path`, the
+ * grammar owenloop 0.5.4 added — the string can originate with whoever started
+ * the run, and a shift is not project-bound. So without a local check, a run on
+ * the hub picks any absolute path on the operator's machine as a working
+ * directory.
+ *
+ * The boundary belongs to the MACHINE'S OWNER, not to the hub: the person who
+ * starts a shift decides which directories that shift may work in. That is why
+ * the declaration is a `shift start` flag / settings key / env var and never a
+ * def field, a hub policy, or anything a run can influence.
+ *
+ * DEFAULT-OPEN, DELIBERATELY. An empty list means every path is allowed, which
+ * preserves the behaviour of every shift running today. Making it default-closed
+ * would break every existing shift on upgrade, and — worse — would do so as a
+ * silent refusal of work the hub believes was accepted.
+ *
+ * INCLUSIVE OF THE ROOT ITSELF, unlike `isUnderWorkRoot`. An operator who
+ * declares `/Users/alex/code/dev` means "this project", and `target.path` for
+ * that project IS that exact directory. `isUnderWorkRoot` excludes `dir ===
+ * root` because there it guards a DELETION and the root must survive; here it
+ * guards a cwd, and there is nothing to protect the root from.
+ */
+
+/** Split a PATH-style (`:`-separated) list of directories, dropping empties. */
+function splitRootList(raw: string): string[] {
+  return raw
+    .split(':')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== '');
+}
+
+/**
+ * Resolve the declared roots: `OWENLOOP_ALLOWED_WORKDIR_ROOTS` >
+ * `settings.allowedWorkdirRoots` > none. Mirrors `resolveWorkRoot`'s precedence
+ * shape, so there is one rule to remember across this file.
+ *
+ * The env var is PATH-style `:`-separated because it names a list of
+ * directories and that is the convention every operator already knows for one.
+ * It REPLACES the settings list rather than adding to it — a narrowing override
+ * that could only ever widen would not be a usable safety control.
+ *
+ * Every entry is resolved to an absolute path against `cwd`, so a relative
+ * declaration means what the operator saw when they typed it.
+ */
+export function resolveAllowedWorkdirRoots(
+  env: Record<string, string | undefined>,
+  settingsRoots: string[] | undefined,
+  cwd: string,
+): string[] {
+  const override = env['OWENLOOP_ALLOWED_WORKDIR_ROOTS'];
+  const raw =
+    override !== undefined && override.trim() !== ''
+      ? splitRootList(override)
+      : (settingsRoots ?? []).map((entry) => entry.trim()).filter((entry) => entry !== '');
+  return raw.map((entry) => resolve(cwd, entry));
+}
+
+/**
+ * Is `workdir` inside (or equal to) one of `roots`?
+ *
+ * An EMPTY `roots` returns true for every path — that is the unrestricted
+ * default, not an accident, and it is why callers can pass the resolved list
+ * unconditionally instead of branching on whether the operator declared one.
+ */
+export function isWorkdirAllowed(workdir: string, roots: string[]): boolean {
+  if (roots.length === 0) return true;
+  const target = resolve(workdir);
+  return roots.some((root) => {
+    const rel = relative(resolve(root), target);
+    return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  });
+}
+
 export interface EnsureWorkDirOptions {
   workRoot: string;
   workflow: string;

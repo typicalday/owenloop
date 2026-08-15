@@ -109,6 +109,39 @@ test('loadSettings: malformed JSON throws a clear, path-named error', () => {
   }
 });
 
+// ---- allowedWorkdirRoots ----------------------------------------------------
+
+test('loadSettings: allowedWorkdirRoots loads as an array of absolute paths', () => {
+  const xdg = withSettingsFile(JSON.stringify({ allowedWorkdirRoots: ['/Users/me/code', '/srv/work'] }));
+  try {
+    assert.deepEqual(loadSettings({ XDG_CONFIG_HOME: xdg }).allowedWorkdirRoots, ['/Users/me/code', '/srv/work']);
+  } finally {
+    rmSync(xdg, { recursive: true, force: true });
+  }
+});
+
+test('loadSettings: allowedWorkdirRoots rejects non-arrays, non-strings, blanks, and relative paths', () => {
+  // A RELATIVE root is rejected rather than resolved, because the directory it
+  // would resolve against is whichever one the shift happened to be launched
+  // in — so the same settings file would grant different permissions depending
+  // on where the operator was standing.
+  const cases: Array<[string, unknown, RegExp]> = [
+    ['a bare string', '/code', /'allowedWorkdirRoots' must be an array/],
+    ['an object', { a: 1 }, /'allowedWorkdirRoots' must be an array/],
+    ['a non-string entry', ['/code', 7], /'allowedWorkdirRoots' must be an array/],
+    ['a blank entry', ['/code', '  '], /NON-EMPTY/],
+    ['a relative entry', ['code'], /must be an absolute path/],
+  ];
+  for (const [label, value, expected] of cases) {
+    const xdg = withSettingsFile(JSON.stringify({ allowedWorkdirRoots: value }));
+    try {
+      assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), expected, `${label} should be rejected`);
+    } finally {
+      rmSync(xdg, { recursive: true, force: true });
+    }
+  }
+});
+
 // ---- C6: the full knob surface + validation --------------------------------
 
 test('loadSettings: each C6 knob loads with its value', () => {

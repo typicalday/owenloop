@@ -91,7 +91,12 @@ import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/r
 import { parseHarnessCarrier } from '../bundle/fetch.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from '../harness/permissions.ts';
 import { appendSession, latestFor, sessionsPath, type SessionRecord } from '../harness/session-store.ts';
-import { ensureWorkDir, resolveWorkRepo, resolveWorkRoot } from '../agent/workdir.ts';
+import {
+  ensureWorkDir,
+  resolveAllowedWorkdirRoots,
+  resolveWorkRepo,
+  resolveWorkRoot,
+} from '../agent/workdir.ts';
 import type { ContactHolder, OrderPacket } from '../hub/types.ts';
 import { resolveShiftId, resolveTarget } from './hold.ts';
 import { installSignalHandlers, type SignalHost } from './signals.ts';
@@ -199,6 +204,7 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
     case 'completed':
       return 0;
     case 'misroute':
+    case 'workdir-denied':
     case 'no-template':
     case 'no-harness':
     case 'incompatible-harness-policy':
@@ -541,6 +547,13 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     account,
     ...(shiftId !== undefined ? { shiftId } : {}),
     cwd: workCwd,
+    // Machine policy, resolved from the SAME two sources the shift resolves it
+    // from: `OWENLOOP_ALLOWED_WORKDIR_ROOTS` (which `owenloop shift start`
+    // exports when the operator passed `--work-root`) then the settings file.
+    // Resolved against `process.cwd()`, not `workCwd`: a relative root in the
+    // env means "relative to where this process was launched", and `workCwd`
+    // may be a directory owenloop just created under the cache root.
+    allowedWorkdirRoots: resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd()),
     loadStep,
     resolveAdapter,
     ...(capabilityModels !== undefined ? { capabilityModels } : {}),

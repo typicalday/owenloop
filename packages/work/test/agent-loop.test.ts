@@ -221,6 +221,7 @@ interface Harnessed {
 }
 
 interface BuildOpts {
+  allowedWorkdirRoots?: string[];
   hub: HubClient;
   adapter?: HarnessAdapter;
   resolution?: AdapterResolution;
@@ -254,6 +255,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     resolveAdapter: () => resolution,
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
     ...(b.capabilityModels === undefined ? {} : { capabilityModels: b.capabilityModels }),
+    ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
     ...(b.dirExists === undefined ? {} : { dirExists: b.dirExists }),
@@ -772,6 +774,47 @@ test('first contact: a 403 maps to ownership-error', async () => {
   const h = buildOpts({ hub, adapter });
 
   assert.equal(await createAgentRunLoop(h.opts).run(), 'ownership-error');
+});
+
+// ---- operator-declared work roots -------------------------------------------
+//
+// The policy the OPERATOR of this machine set, not the hub. A denial is a
+// RELEASE and it lands BEFORE the step spec is loaded and before any provider
+// session opens, so a machine that was never configured to host this tree
+// spends nothing on it.
+
+test('a packet workdir outside every declared root is released before any session opens', async () => {
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ workdir: '/elsewhere/proj' })] });
+  const h = buildOpts({ hub, adapter, allowedWorkdirRoots: ['/allowed'] });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'workdir-denied');
+  assert.deepEqual(adapter.calls, []);
+  assert.equal(h.records.length, 0);
+  assert.ok(verbs(calls).includes('release'));
+});
+
+test('a packet workdir inside a declared root proceeds normally', async () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({
+    getOrder: [agentOrder({ workdir: '/allowed/proj/wt' }), agentOrder({ claimed: false, outcome: 'green' })],
+  });
+  const h = buildOpts({ hub, adapter, allowedWorkdirRoots: ['/allowed'] });
+
+  await createAgentRunLoop(h.opts).run();
+  assert.equal(h.records[0]!.cwd, '/allowed/proj/wt');
+});
+
+test('a packet that names NO workdir is never denied, whatever the roots are', async () => {
+  // The fallback is `<workRoot>/<workflow>/<run>/` — a directory owenloop
+  // ITSELF created under the operator's own cache root. Denying that would deny
+  // every agent order on any machine that declared a root at all.
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder(), agentOrder({ claimed: false, outcome: 'green' })] });
+  const h = buildOpts({ hub, adapter, allowedWorkdirRoots: ['/allowed'] });
+
+  await createAgentRunLoop(h.opts).run();
+  assert.equal(h.records[0]!.cwd, '/fallback/cwd');
 });
 
 // ---- release-and-hand-back paths --------------------------------------------

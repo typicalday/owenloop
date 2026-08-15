@@ -247,6 +247,16 @@ export interface SpawnPlan {
  * step, registered default). The Shift command has no operator-facing harness
  * flag, so there is no legitimate CLI override for this seam to carry.
  *
+ * `allowedWorkdirRoots` (trailing, for the same reason) rides the child's spawn
+ * env as `OWENLOOP_ALLOWED_WORKDIR_ROOTS`, a `:`-separated list — the same
+ * "spawn env is the contract" shape as `OWENLOOP_ACCOUNT`, and for the same
+ * reason: neither `owenloop work exec` nor `owenloop work agent-run` has an
+ * operator-facing flag for it. It carries the roots the SHIFT resolved, so an
+ * operator's `owenloop shift start --work-root` reaches a detached child that
+ * would otherwise only see the settings file. Empty or omitted sets no variable
+ * at all, so the child falls through to its own settings-file resolution and
+ * the plan stays byte-identical to the pre-policy shape.
+ *
  * `logDir` (trailing, after `shiftId`, for the same reason) adds the worker's
  * log DESTINATION to the plan as `<logDir>/<run>.log`. The plan still carries
  * `stdio: ['ignore','ignore','ignore']`: opening the file is I/O, this function
@@ -261,6 +271,7 @@ export function buildSpawnPlan(
   execPath: string = process.execPath,
   shiftId?: string,
   logDir?: string,
+  allowedWorkdirRoots?: string[],
 ): SpawnPlan {
   const role = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
   return {
@@ -281,6 +292,9 @@ export function buildSpawnPlan(
 	...process.env,
 	OWENLOOP_ACCOUNT: account,
 	...(spec.startGate !== undefined ? { OWENLOOP_START_GATE: spec.startGate } : {}),
+	...(allowedWorkdirRoots !== undefined && allowedWorkdirRoots.length > 0
+	  ? { OWENLOOP_ALLOWED_WORKDIR_ROOTS: allowedWorkdirRoots.join(':') }
+	  : {}),
       },
     },
     ...(logDir !== undefined && logDir !== '' ? { logFile: runLogFile(logDir, spec.run) } : {}),
@@ -302,6 +316,7 @@ export function createDefaultSpawner(
   shiftId?: string,
   onFailure?: WorkerFailureReporter,
   logging?: WorkerLogOptions,
+  allowedWorkdirRoots?: string[],
 ): Spawner {
   // ONE report per shift, not one per dispatch. Every condition that stops a
   // worker log from opening — a full disk, a read-only log directory, an
@@ -317,7 +332,16 @@ export function createDefaultSpawner(
     logging?.err?.(line);
   };
   return (spec: SpawnSpec): SpawnResult => {
-    const plan = buildSpawnPlan(spec, origin, account, binPath, process.execPath, shiftId, logging?.dir);
+    const plan = buildSpawnPlan(
+      spec,
+      origin,
+      account,
+      binPath,
+      process.execPath,
+      shiftId,
+      logging?.dir,
+      allowedWorkdirRoots,
+    );
     // Open the log ONCE and hand the SAME descriptor to slots 1 and 2. Opening
     // it twice would create two independent file offsets, and the two streams
     // would overwrite each other's bytes — silent corruption no unit test on the

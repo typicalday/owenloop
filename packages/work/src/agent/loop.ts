@@ -58,6 +58,8 @@
  */
 import { existsSync } from 'node:fs';
 
+import { isWorkdirAllowed } from './workdir.ts';
+
 import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket, ResolutionPayload } from '../hub/types.ts';
@@ -91,6 +93,7 @@ export type AgentRunOutcome =
   | 'submitted' // the hub reported an outcome — the agent's submit landed (exit 0)
   | 'completed' // the order had already finished at first contact (exit 0)
   | 'misroute' // null packet, or a command order — released, not ours (exit 1)
+  | 'workdir-denied' // the order named a cwd outside this machine's declared roots — released (exit 1)
   | 'no-template' // no cached bundle / no step spec for the step (exit 1)
   | 'no-harness' // the resolved harness id names no registered adapter (exit 1)
   | 'incompatible-harness-policy' // selected adapter cannot enforce the restrictions (exit 1)
@@ -153,6 +156,15 @@ export interface AgentRunLoopOptions {
   shiftId?: string;
   /** cwd for the step agent when the order packet carries no `workdir`. */
   cwd: string;
+  /**
+   * The directories this MACHINE's operator declared as places work may happen,
+   * already resolved to absolute paths by `resolveAllowedWorkdirRoots`.
+   *
+   * NOT `workRoot`. `workRoot` is the single directory owenloop CREATES worktrees
+   * under; this is the set of directories an ORDER is permitted to name as its
+   * cwd. UNSET or EMPTY means NO RESTRICTION.
+   */
+  allowedWorkdirRoots?: string[];
   loadStep: StepLoader;
   resolveAdapter: AdapterResolver;
   /**
@@ -559,6 +571,35 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
 
     stepName = packet.step;
     recordCwd = packet.workdir ?? opts.cwd;
+
+    // MACHINE POLICY. The operator who started this shift named the directories
+    // work may happen in (`owenloop shift start --work-root`, or
+    // `allowedWorkdirRoots` in settings). This worker is one of only two
+    // processes that ever sees `OrderPacket.workdir` — the shift's `whats_next`
+    // sweep receives a `WorkOrder`, which carries no such field — so the check
+    // belongs here and cannot be hoisted into dispatch.
+    //
+    // RELEASED, not failed, and BEFORE the step spec is loaded or any provider
+    // session is opened. Declining work this machine was not configured to host
+    // is not a failure of the work: the targeted release returns the order to
+    // the hub's pickup window, where a differently-configured machine can take
+    // it. `misroute` takes the same shape for the same reason.
+    //
+    // ONLY an order-NAMED workdir is checked. When the packet names none this
+    // worker uses `<workRoot>/<workflow>/<run>/` — a directory owenloop ITSELF
+    // created under the operator's own cache root — and denying that would deny
+    // every agent order on a machine that declared any root at all.
+    if (
+      packet.workdir !== undefined &&
+      !isWorkdirAllowed(packet.workdir, opts.allowedWorkdirRoots ?? [])
+    ) {
+      const roots = (opts.allowedWorkdirRoots ?? []).join(', ');
+      opts.err(
+        `owenloop work agent-run: step '${packet.step}' (${order}) names workdir '${packet.workdir}', ` +
+          `which is outside every work root this machine declared (${roots}) — releasing for the pickup window`,
+      );
+      return releaseWith('workdir-denied', 'workdir-denied');
+    }
 
     // The step spec. No bundle / no spec ⇒ we cannot brief anybody; release so
     // the order lapses back through the hub's pickup window.
