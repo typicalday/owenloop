@@ -316,6 +316,48 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     }
   }
 
+  /**
+   * Relay the child's own output to this process's stderr when the command did
+   * not succeed.
+   *
+   * ## Why this exists
+   *
+   * Until this was added, a command step that failed produced a worker log that
+   * named the failure and said NOTHING about its cause. The runner captures the
+   * last 4 KiB of combined stdout+stderr as `outputTail` and puts it in the
+   * receipt — but a receipt only reaches a human if the submit is ACCEPTED, and
+   * the most common command-step failure is precisely the one where it is not:
+   * the script dies before printing a payload line, so the receipt has no
+   * `payload` key and `merge`'s schema rejects it. The one artifact carrying the
+   * diagnosis was discarded by the same event that made it necessary.
+   *
+   * Measured on `wf_40bd0c3f6783f9d31291d74d`: the `merger` step failed four
+   * times across two shifts and one foreground `owenloop work exec`, and every
+   * one of those logs contained the same three lines — holding, running,
+   * schema-rejected — with no trace of what the child said. Reproducing the
+   * script by hand outside the engine was the only way to see its stderr.
+   *
+   * `outputTail` is already capped at 4 KiB by the runner, so this cannot flood
+   * a log. Each line is prefixed so the child's words are never mistaken for
+   * exec's own.
+   */
+  function relayChildOutput(result: CommandResult, step: string): void {
+    if (result.exitCode === 0 && result.error === undefined) return;
+    const how =
+      result.error !== undefined
+        ? `could not be run (${result.error})`
+        : result.signal !== undefined
+          ? `was killed by ${result.signal}`
+          : `exited ${result.exitCode}`;
+    opts.err(`owenloop work exec: the command for step '${step}' ${how}; its last output follows`);
+    const tail = result.outputTail.replace(/\n+$/, '');
+    if (tail === '') {
+      opts.err('  (the command produced no output)');
+      return;
+    }
+    for (const line of tail.split('\n')) opts.err(`  | ${line}`);
+  }
+
   /** Build the receipt and submit it to every owed path. */
   async function submitReceipt(result: CommandResult, order: OrderPacket, resolvedCommand: string): Promise<ExecOutcome> {
     if (signalled) {
@@ -328,6 +370,10 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       await leasePromise;
       return 'killed';
     }
+
+    // Before any of the branches below decide what to do about the failure.
+    // Every one of them is reachable with a useless log otherwise.
+    relayChildOutput(result, order.step);
 
     const parsedPayload = parsePayloadLine(result.payloadLine, result.payloadOverCap);
     if (order.judge !== undefined) {

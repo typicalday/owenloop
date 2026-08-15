@@ -1083,3 +1083,82 @@ test('no receipt when the killed command settles BEFORE the release resolves the
   assert.equal(only(calls, 'release').length, 1);
   assert.ok(fr.state.kills >= 1);
 });
+
+// ---- child output relay -----------------------------------------------------
+//
+// The regression guard for `wf_40bd0c3f6783f9d31291d74d`, where a `merger`
+// command step failed four times and every log said only "holding / running /
+// schema-rejected". `outputTail` reaches a human through the receipt only when
+// the submit is ACCEPTED, and the commonest command-step failure is the one
+// where it is not: the script dies before printing a payload line, so the
+// receipt carries no `payload` and the owed path's schema rejects it. The one
+// record of the cause was thrown away by the same event that created the need
+// for it.
+
+test('a non-zero exit relays the child output to stderr before anything else decides', async () => {
+  const errs: string[] = [];
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['schema-rejected'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { err: (line) => errs.push(line) }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(1, { outputTail: 'merge: typicalday/dev#136 is CLOSED\n' }));
+
+  assert.equal(await p, 'submit-rejected');
+  // The header names the step and how it ended; the body carries the child's words.
+  assert.ok(
+    errs.some((l) => l.includes("the command for step 'builder' exited 1")),
+    `expected a failure header, got ${JSON.stringify(errs)}`,
+  );
+  assert.ok(
+    errs.some((l) => l === '  | merge: typicalday/dev#136 is CLOSED'),
+    `expected the relayed tail, got ${JSON.stringify(errs)}`,
+  );
+  // The relay must land BEFORE the rejection line, or a reader scrolling to the
+  // first error still sees the symptom without the cause.
+  const relayAt = errs.findIndex((l) => l.startsWith('  | '));
+  const rejectAt = errs.findIndex((l) => l.includes('rejected'));
+  assert.ok(relayAt >= 0 && rejectAt > relayAt, `relay must precede the rejection: ${JSON.stringify(errs)}`);
+});
+
+test('a machinery failure relays the machinery error, not a bare exit code', async () => {
+  const errs: string[] = [];
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { err: (line) => errs.push(line) }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(null, { error: 'spawn ENOENT' }));
+
+  assert.equal(await p, 'submitted');
+  assert.ok(
+    errs.some((l) => l.includes('could not be run (spawn ENOENT)')),
+    `expected the machinery error, got ${JSON.stringify(errs)}`,
+  );
+  // No output at all is stated, not silently skipped — "the log is empty"
+  // and "the child said nothing" are different diagnoses.
+  assert.ok(
+    errs.some((l) => l === '  (the command produced no output)'),
+    `expected the no-output note, got ${JSON.stringify(errs)}`,
+  );
+});
+
+test('a successful command relays nothing', async () => {
+  const errs: string[] = [];
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { err: (line) => errs.push(line) }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, { outputTail: 'built 42 targets' }));
+
+  assert.equal(await p, 'submitted');
+  // Asserted against the relay's own two shapes rather than an empty `errs`:
+  // the loop emits an unrelated workdir-inheritance warning on this fixture,
+  // and folding that into the assertion would make it fail for the wrong reason.
+  assert.deepEqual(
+    errs.filter((l) => l.startsWith('  ') || l.includes('its last output follows')),
+    [],
+    'a green run must not spray its output into the log',
+  );
+});
