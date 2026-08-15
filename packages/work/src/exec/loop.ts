@@ -20,9 +20,12 @@
  *  3. RUN + RACE — the runner shells the command out while the lease loop runs.
  *     Whichever settles first wins (plan decision 9):
  *       - an ordinary command settles (any exit code, or a machinery error) ⇒
- *         build a receipt and `submit` it to every owed path. A payload reject
- *         follows those submits. Exit 0 means the receipt/reject delivery won;
- *         the receipt's exit code still carries the command result.
+ *         build a receipt. A payload reject is delivered FIRST (the hub refuses
+ *         a reject once the claim has closed, and the last owed submit is what
+ *         closes it); then `submit` the receipt to every owed path, unless that
+ *         reject closed the run, in which case the owed paths stay debts. Exit 0
+ *         means the receipt/reject delivery won; the receipt's exit code still
+ *         carries the command result.
  *       - a judge command exits 0 ⇒ submit its receipt; a non-zero exit ⇒ send
  *         `reject` for `order.judge` without a receipt; signal or machinery
  *         failure ⇒ no verdict, leave the claim for the reap path.
@@ -86,10 +89,10 @@ export type ExecOutcome =
   | 'hub-unreachable' // transient failures spanned the window (exit 1)
   | 'submit-rejected' // a submit returned a non-green/submitted outcome (exit 1)
   | 'submit-failed' // a submit threw (exit 1)
-  | 'rejected' // a payload directive was delivered after all submits (exit 0)
+  | 'rejected' // a payload reject landed and closed the run; owed paths stay debts (exit 0)
   | 'judge-rejected' // a judge delivered a non-zero verdict through reject (exit 0)
   | 'judge-no-verdict' // a judge ended with machinery/signal failure (exit 1)
-  | 'reject-failed' // the receipt landed but its follow-up reject failed (exit 1)
+  | 'reject-failed' // a reject was refused or threw; nothing was submitted (exit 1)
   | 'stopped'; // stop() arrived before the hold was established (exit 1)
 
 export interface ExecLoopOptions {
@@ -317,6 +320,60 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   }
 
   /**
+   * Deliver a PAYLOAD reject before the owed submits, and say whether this
+   * worker is finished.
+   *
+   * The distinction from `issueReject` is the third outcome. A judge reject is
+   * always the end of the run; a payload reject may leave the claim open, and
+   * when it does the owed receipts still have to land. So this returns either a
+   * terminal `ExecOutcome` or the sentinel `'continue'`.
+   *
+   *   refused / threw   → terminal. `issueReject` has already logged it and
+   *                       settled the lease. Nothing is submitted: a reject that
+   *                       did not land must not be followed by a receipt that
+   *                       greens the path the reject was protesting.
+   *   landed, closed    → terminal `'rejected'`. The rejected path was consumed
+   *                       by this firing, the hub closed the run `no_work`, and
+   *                       the owed paths stay debts for the next firing.
+   *   landed, still open → `'continue'`. The rejected path was not consumed
+   *                       here, so the claim and the consume fingerprint are
+   *                       both intact and every owed submit proceeds normally.
+   *
+   * `closed` is read from the hub's own response rather than re-derived from the
+   * order, because the consumed-input test lives in the hub
+   * (`reject-artifact.ts` checks `runRow.fingerprint`, which is what the engine
+   * recorded at claim time — not what the def declares the step consumes).
+   */
+  async function relayPayloadReject(path: string, text: string, owed: number): Promise<ExecOutcome | 'continue'> {
+    let res;
+    try {
+      res = await hub.reject({ workflow, run: runId, path, text });
+    } catch (e) {
+      opts.err(`owenloop work exec: reject of ${path} failed: ${errMsg(e)}`);
+      // Nothing has been submitted yet, so unlike the post-submit case there
+      // are no committed receipts to reason about. Release and let the step be
+      // re-offered.
+      lease.stop('reject-failed');
+      await leasePromise;
+      return 'reject-failed';
+    }
+    if (res.ok !== true) {
+      opts.err(`owenloop work exec: reject of ${path} was refused: ${res.text}`);
+      lease.stop('reject-failed', res.closed === true ? { release: false } : undefined);
+      await leasePromise;
+      return 'reject-failed';
+    }
+    if (res.closed === true) {
+      opts.out(`owenloop work exec: rejected ${path} — run closed, ${owed} owed path(s) left as debts`);
+      lease.stop('rejected', { release: false });
+      await leasePromise;
+      return 'rejected';
+    }
+    opts.out(`owenloop work exec: rejected ${path} (not consumed by this firing) — submitting owed receipts`);
+    return 'continue';
+  }
+
+  /**
    * Relay the child's own output to this process's stderr when the command did
    * not succeed.
    *
@@ -406,6 +463,54 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       step: order.step,
     }, parsedPayload);
 
+    // ---- the payload reject goes FIRST, and it is not an ordering nicety ----
+    //
+    // It used to run after every owed submit, on the reasoning that "all owed
+    // submissions must land before invalidating a consumed input; rejection
+    // moves the consume fingerprint and would born-reject later submits from
+    // this run". The second half of that sentence is true. The first half made
+    // the reject UNDELIVERABLE, because the submits it waited on are what kill
+    // the claim it needs.
+    //
+    // The hub refuses a reject from a run whose claim has closed
+    // (`hub-core/src/verbs/reject-artifact.ts`: `held` requires
+    // `runRow.outcome === undefined`, and the refusal is explicit —
+    // "is not currently held by an open claim — nothing was rejected"). A step's
+    // last owed submit closes the run. So for the single-owed-path case — which
+    // is every gate in the delivery workflow — submit-then-reject could only
+    // ever produce the pair observed on `run_ecfedb23a84194e446159e67`:
+    //
+    //     submitted receipt to mergeable (green)
+    //     reject of pr was refused: ... is not currently held by an open claim
+    //
+    // The gate greened its own output and its reject evaporated, so `merger`
+    // proceeded on a PR the gate had explicitly refused to confirm. The def-side
+    // cascade that was supposed to un-green `mergeable` never fired, because it
+    // hangs off a `pr` rejection that never happened.
+    //
+    // Rejecting first is correct in both directions, and which one applies is
+    // the hub's answer, not a guess:
+    //
+    //   `closed: true`  — the rejected path WAS one of this firing's consumed
+    //     inputs, so the hub closed the run `no_work` (not `failed`: no attempt
+    //     is burned). The owed paths stay debts and the step re-fires against the
+    //     rebuilt input. Skipping the submits here is not a loss — an artifact
+    //     derived from an input this same command just declared bad is exactly
+    //     what the engine's dead-input cascade would have thrown away anyway.
+    //     This is also the branch that makes the old born-reject warning moot:
+    //     there are no later submits to born-reject.
+    //
+    //   `closed: false` — the rejected path was NOT consumed by this firing, so
+    //     the claim is still open and the fingerprint has not moved. Fall through
+    //     and submit every owed path exactly as before.
+    //
+    // A REFUSED reject now submits nothing. That is the point: previously the
+    // receipt had already landed and greened a path whose gate had failed.
+    if (order.judge === undefined && parsedPayload.reject !== undefined) {
+      const rejected = await relayPayloadReject(parsedPayload.reject.path, parsedPayload.reject.text, order.owes.length);
+      if (rejected !== 'continue') return rejected;
+    }
+
     for (const owe of order.owes) {
       let res;
       try {
@@ -450,13 +555,6 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         return 'submit-rejected';
       }
       opts.out(`owenloop work exec: submitted receipt to ${owe.path} (${outcome})`);
-    }
-
-    if (order.judge === undefined && parsedPayload.reject !== undefined) {
-      // All owed submissions must land before invalidating a consumed input;
-      // rejection moves the consume fingerprint and would born-reject later
-      // submits from this run.
-      return issueReject(parsedPayload.reject.path, parsedPayload.reject.text, 'rejected');
     }
 
     // Every owed path landed — the run has closed, so stop WITHOUT releasing.
