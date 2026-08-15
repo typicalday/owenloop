@@ -405,6 +405,39 @@ export interface RejectResponse extends HubResponse {
   closed?: boolean;
 }
 
+// ---- ask --------------------------------------------------------------------
+
+/**
+ * ESCALATION: the claiming worker cannot honestly build what it owes and stops
+ * to ask a person. `path` is one of the order's OWED paths — unlike `reject`,
+ * whose `path` is somebody else's delivered work, this is the worker's own debt.
+ *
+ * `by` is absent for the same reason it is absent on `reject`: the hub derives
+ * the actor from the claiming run's step, so a worker cannot ask on another
+ * step's behalf. `question` is what the human is being asked; `context` is
+ * optional supporting detail (what the worker already tried, which files it
+ * read) that rides the same reason-thread entry so the answering human does not
+ * have to reconstruct it from logs.
+ */
+export interface AskRequest {
+  workflow: string;
+  run: string;
+  path: string;
+  question: string;
+  context?: string;
+}
+
+/**
+ * The ask verb's flattened envelope. `closed` reports whether the escalation
+ * closed the worker's run — it does, always: a worker that has asked has
+ * nothing further to do on this order, and holding the lease open would only
+ * let it expire into a reap.
+ */
+export interface AskResponse extends HubResponse {
+  ok: boolean;
+  closed?: boolean;
+}
+
 // ---- whoami -----------------------------------------------------------------
 
 export interface WhoamiResponse extends HubResponse {

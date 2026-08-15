@@ -294,7 +294,13 @@ const OWENLOOP_ONLY_NETWORK_TOOLS = new Set([
  *  unrestricted-network readers. */
 const READ_ONLY_OWENLOOP_ONLY_NETWORK_TOOLS = [...READ_ONLY_TOOLS]
   .filter((tool) => OWENLOOP_ONLY_NETWORK_TOOLS.has(tool));
-const BORN_BOUND_OWENLOOP_TOOL_NAMES = ['get_order', 'submit'] as const;
+// The tools a born-bound step agent gets no matter how restricted it is.
+// `ask` is here for the same reason `submit` is: without it a restricted agent
+// has no legal way to END. It could previously only submit (fabricating when it
+// did not know) or fall silent (re-arming the step into a retry storm). `ask` is
+// about the agent's OWN owed artifact, so unlike `reject` it grants no authority
+// over anyone else's work and there is no reason to withhold it under isolation.
+const BORN_BOUND_OWENLOOP_TOOL_NAMES = ['get_order', 'submit', 'ask'] as const;
 const BORN_BOUND_OWENLOOP_TOOLS = BORN_BOUND_OWENLOOP_TOOL_NAMES.map(
   (name) => `mcp__owenloop__${name}`,
 );

@@ -133,6 +133,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
       return { text: '' };
     },
     async reject() { return { text: '', ok: true }; },
+    async ask() { return { text: '', ok: true }; },
     async reportResolution(req) {
       calls.push({ verb: 'report_resolution', arg: req });
       return {

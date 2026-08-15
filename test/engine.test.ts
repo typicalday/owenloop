@@ -2026,3 +2026,95 @@ test('§28: adopt throws when the live def no longer resolves at all (unlike sta
   removeDef('delivery');
   assert.throws(() => engine.adopt(wf), /no def: delivery/);
 });
+
+// ---- ask: the human-escalation channel ---------------------------------------
+//
+// The whole point of these tests is the SHAPE of the hold, not the plumbing: a
+// step that asks must stop firing, must not burn its retry budget, must surface
+// to an operator, and must be released by a plain `retry` carrying the answer.
+
+test('ask holds the asking step: the artifact goes rejected, the step stops firing, and no counter moves', () => {
+  const { engine, store } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery', { provide: { proposal: { goal: 'ship it' } } });
+
+  const planner = fire(engine, wf, 'planner', 1000);
+  engine.ask(wf, 'plan', 'planner', 'Which repo is `target` supposed to point at? The proposal names two.');
+  engine.close(wf, planner.run, 'no_work');
+
+  const plan = store.getArtifact(wf, 'plan')!;
+  assert.equal(plan.acceptance, 'rejected');
+  // A question is not a failed attempt. If either counter moved, an asking step
+  // would eventually hit its stall cap purely by asking — which would make the
+  // channel unusable for exactly the steps that need it most.
+  assert.equal(plan.judgmentRejects, 0, 'ask must not burn judgment budget');
+  assert.equal(plan.schemaRejects, 0, 'ask must not burn schema budget');
+
+  const last = plan.reasons[plan.reasons.length - 1]!;
+  assert.equal(last.action, 'ask');
+  assert.equal(last.kind, 'question');
+  assert.equal(last.by, 'planner');
+  assert.match(last.text, /Which repo/);
+
+  // Held: the producer is NOT re-armed, so no retry storm.
+  assert.deepEqual(
+    engine.tick(wf, { now: 2000 }).orders.map((o) => o.step),
+    [],
+    'a held step must not be re-offered',
+  );
+});
+
+test('a held question surfaces on status as a stalled debt carrying the question text', () => {
+  const { engine } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery', { provide: { proposal: {} } });
+
+  const planner = fire(engine, wf, 'planner', 1000);
+  engine.ask(wf, 'plan', 'planner', 'the proposal contradicts itself');
+  engine.close(wf, planner.run, 'no_work');
+
+  const debt = engine.status(wf).debts.find((d) => d.path === 'plan')!;
+  assert.equal(debt.kind, 'question', 'a question must not masquerade as a structural reject');
+  assert.equal(debt.stalled, true, 'a run waiting on a person is stalled — that is the signal an operator reads');
+  assert.equal(debt.question, 'the proposal contradicts itself');
+});
+
+test('retry --text is the answer path: it clears the hold and puts the answer on the next order', () => {
+  const { engine } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery', { provide: { proposal: {} } });
+
+  const planner = fire(engine, wf, 'planner', 1000);
+  engine.ask(wf, 'plan', 'planner', 'which repo?');
+  engine.close(wf, planner.run, 'no_work');
+
+  // No `answer` verb exists on purpose — `retry` appends a structural reason,
+  // and `isHeld` reads only the LAST entry, so the hold clears as a side effect
+  // of the same call that delivers the answer.
+  engine.retry(wf, 'plan', 'human', 'typicalday/owenloop-delivery');
+
+  const planner2 = fire(engine, wf, 'planner', 2000);
+  const owed = planner2.owes.find((o) => o.path === 'plan')!;
+  const texts = owed.reasons.map((r) => r.text);
+  assert.ok(texts.includes('which repo?'), 'the question stays on the thread as context');
+  assert.ok(texts.includes('typicalday/owenloop-delivery'), 'the answer rides to the next attempt');
+});
+
+test('ask refuses a step asking about work it does not produce — that is what reject is for', () => {
+  const { engine } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery', { provide: { proposal: {} } });
+
+  complete(engine, wf, fire(engine, wf, 'planner', 1000), { plan: 'v1' });
+  fire(engine, wf, 'builder', 2000);
+
+  assert.throws(
+    () => engine.ask(wf, 'plan', 'builder', 'this plan makes no sense'),
+    /no authority to ask about plan/,
+  );
+});
+
+test('ask refuses an artifact that is already built — a delivered version is rejected, not questioned', () => {
+  const { engine } = makeEngine([delivery]);
+  const wf = engine.createInstance('delivery', { provide: { proposal: {} } });
+
+  complete(engine, wf, fire(engine, wf, 'planner', 1000), { plan: 'v1' });
+
+  assert.throws(() => engine.ask(wf, 'plan', 'planner', 'too late'), /cannot ask about 'plan' in state 'green'/);
+});

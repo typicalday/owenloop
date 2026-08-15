@@ -188,6 +188,10 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[]; submits: Submit
       if (item instanceof Error) throw item;
       return { text: item.text ?? 'reject', ok: item.ok ?? true, ...(item.closed !== undefined ? { closed: item.closed } : {}) };
     },
+    async ask(req) {
+      calls.push({ verb: 'ask', arg: req });
+      return { text: 'ask', ok: true };
+    },
     async reportResolution(req) {
       calls.push({ verb: 'report_resolution', arg: req });
       return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };

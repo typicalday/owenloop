@@ -4,7 +4,7 @@
  * A born-bound work-holder: the D2 stamped Step Agent's frontmatter declares
  * `mcpServers.owenloop = owenloop work hold --order <wf>/<run> --origin <url> --mcp`,
  * so when the Step Agent session boots it launches THIS as a stdio MCP server. The
- * server exposes three bare tools the model uses to do its order:
+ * server exposes four bare tools the model uses to do its order:
  *   - `get_order` → the order packet (prompt, inputs, owed outputs) for the run
  *     this holder is bound to. No ids are arguments — they came in on argv, never
  *     through the model.
@@ -14,6 +14,15 @@
  *   - `reject`    → invalidate a consumed artifact through the claiming step's
  *     server-derived authority; the client never supplies `by`. A CLOSED reject
  *     also stops the lease loop without releasing the already-closed claim.
+ *   - `ask`       → stop and escalate to a human about an OWED output path. The
+ *     third exit. `submit` and `reject` both assume the worker can finish; until
+ *     `ask` existed a worker that genuinely could not had only two moves, and
+ *     both damaged the run: submit something it did not believe (greens a
+ *     fabrication that every downstream step then builds on), or end its turn
+ *     silently (the task re-arms and a fresh worker relearns the same blocker
+ *     until the stall cap). `ask` holds the artifact with no counter movement
+ *     and surfaces the question to an operator, who answers with
+ *     `owenloop retry <workflow> <path> --text "<answer>"`.
  *
  * Underneath the tools, the SAME lease loop the CLI `hold` runs keeps the order's
  * lease warm: `createHoldMcp` builds the loop with `onOrder` wired to capture the
@@ -36,7 +45,7 @@ import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 import type { ConsumedVerifier } from '../consumed-verifier.ts';
 import { createHoldLoop, type HoldLoop, type HoldOutcome } from './loop.ts';
 
-export const HOLD_MCP_TOOL_NAMES = ['get_order', 'submit', 'reject'] as const;
+export const HOLD_MCP_TOOL_NAMES = ['get_order', 'submit', 'reject', 'ask'] as const;
 export type HoldMcpToolName = (typeof HOLD_MCP_TOOL_NAMES)[number];
 
 export interface HoldMcpDeps {
@@ -298,10 +307,69 @@ export function createHoldMcp(deps: HoldMcpDeps): HoldMcpMount {
     },
   };
 
+  const askTool: ToolRegistration = {
+    name: 'ask',
+    description:
+      'Stop and ask a human about an output path you OWE, when you cannot produce it honestly — a required input is missing, wrong, or contradictory, or the order asks for a decision only a person can make. Use this INSTEAD of submitting a guess and INSTEAD of ending your turn without submitting: a guess greens and poisons every step downstream, and ending silently just re-runs this same step until it burns its retry budget. Asking does not count as a failure and costs you no attempts. The step is held until a human answers; your run ends here.',
+    inputSchema: {
+      type: 'object',
+      required: ['path', 'question'],
+      properties: {
+        path: {
+          type: 'string',
+          description: 'The owed output path you are blocked on (one of the `owes` paths from get_order).',
+        },
+        question: {
+          type: 'string',
+          description:
+            'The specific question for the human. State what decision or fact you need, not just that you are stuck — this is the whole message they receive.',
+        },
+        context: {
+          type: 'string',
+          description:
+            'Optional: what you already tried, what you read, and why it was not enough. Saves the human from reconstructing it from logs.',
+        },
+      },
+      additionalProperties: false,
+    },
+    handler: async (args) => {
+      const gone = terminalGuard();
+      if (gone !== undefined) return gone;
+      const path = args['path'];
+      const question = args['question'];
+      const context = args['context'];
+      if (typeof path !== 'string' || path.trim() === '') {
+        return textResult({ error: 'ask requires a non-empty string "path"' }, true);
+      }
+      if (typeof question !== 'string' || question.trim() === '') {
+        return textResult({ error: 'ask requires a non-empty string "question"' }, true);
+      }
+      if (context !== undefined && typeof context !== 'string') {
+        return textResult({ error: 'ask "context" must be a string when present' }, true);
+      }
+      try {
+        const res = await hub.ask({
+          workflow,
+          run,
+          path,
+          question,
+          ...(typeof context === 'string' && context.trim() !== '' ? { context } : {}),
+        });
+        // Asking ENDS the run. Same shape as submit/reject's closed branch:
+        // stop without releasing, because the hub already closed the claim.
+        if (res.closed === true) loop.stop('asked', { release: false });
+        return textResult({ ok: res.ok, closed: res.closed ?? false, text: res.text });
+      } catch (e) {
+        return textResult({ error: errMsg(e) }, true);
+      }
+    },
+  };
+
   const registrations: Record<HoldMcpToolName, ToolRegistration> = {
     get_order: getOrderTool,
     submit: submitTool,
     reject: rejectTool,
+    ask: askTool,
   };
   const selected = deps.tools ?? HOLD_MCP_TOOL_NAMES;
   return { tools: selected.map((name) => registrations[name]), loop };

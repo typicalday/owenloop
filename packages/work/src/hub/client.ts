@@ -19,6 +19,8 @@
  */
 import { HubError } from './types.ts';
 import type {
+  AskRequest,
+  AskResponse,
   GetOrderRequest,
   GetOrderResponse,
   HeartbeatRequest,
@@ -55,6 +57,13 @@ export interface HubClient {
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
   submit(req: SubmitRequest): Promise<SubmitResponse>;
   reject(req: RejectRequest): Promise<RejectResponse>;
+  /**
+   * ESCALATION: the worker stops and asks a human about an artifact it OWES.
+   * Distinct from `reject`, which is a verdict on somebody else's delivered
+   * work. Holds the artifact (no counter moves) until a human answers with
+   * `owenloop retry <workflow> <path> --text "<answer>"`.
+   */
+  ask(req: AskRequest): Promise<AskResponse>;
   /**
    * Plan §6: record what this shift resolved the order's compound capability to,
    * BEFORE the harness launches. Idempotent on the hub by order id, so a
@@ -134,6 +143,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     release: (req) => post<ReleaseResponse>('release', req),
     submit: (req) => post<SubmitResponse>('submit', req),
     reject: (req) => post<RejectResponse>('reject', req),
+    ask: (req) => post<AskResponse>('ask', req),
     reportResolution: (req) => post<ReportResolutionResponse>('report_resolution', req),
     whoami: () => get<WhoamiResponse>('whoami'),
     // Cursor is an opaque non-negative integer; omit it entirely to bootstrap

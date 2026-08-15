@@ -23,6 +23,7 @@ interface HubCfg {
   getOrder?: GetOrderResponse | Error;
   submit?: { outcome?: string; closed?: boolean } | Error | Array<{ outcome?: string; closed?: boolean } | Error>;
   reject?: { ok?: boolean; closed?: boolean } | Error;
+  ask?: { ok?: boolean; closed?: boolean } | Error;
 }
 
 const PUB_TEXT = readFileSync(new URL('../../../test/fixtures/crypto/fixture-key.pub', import.meta.url), 'utf8');
@@ -77,6 +78,12 @@ function mockHub(cfg: HubCfg): { hub: HubClient; calls: Call[] } {
       if (s instanceof Error) throw s;
       return { text: 'ok', ok: s.ok ?? true, closed: s.closed };
     },
+    async ask(req: unknown) {
+      calls.push({ verb: 'ask', arg: req });
+      const s = cfg.ask ?? { ok: true };
+      if (s instanceof Error) throw s;
+      return { text: 'ok', ok: s.ok ?? true, closed: s.closed };
+    },
     async heartbeat() {
       return { text: '' };
     },
@@ -126,10 +133,10 @@ function producerOrderResponse(): GetOrderResponse {
 
 // ---- shape ------------------------------------------------------------------
 
-test('the mount exposes exactly get_order, reject, and submit, plus the lease loop', () => {
+test('the mount exposes exactly ask, get_order, reject, and submit, plus the lease loop', () => {
   const { hub } = mockHub({});
   const mount = createHoldMcp(deps(hub));
-  assert.deepEqual(mount.tools.map((t) => t.name).sort(), ['get_order', 'reject', 'submit']);
+  assert.deepEqual(mount.tools.map((t) => t.name).sort(), ['ask', 'get_order', 'reject', 'submit']);
   const reject = tool(mount.tools, 'reject');
   assert.deepEqual(reject.inputSchema, {
     type: 'object',
@@ -549,9 +556,77 @@ test('reject surfaces a hub failure as an isError result', async () => {
   assert.match(parse(res).error, /reject offline/);
 });
 
+// ---- ask ---------------------------------------------------------------------
+//
+// `ask` is the third exit from a step. `submit` and `reject` both assume the
+// worker can finish; `ask` is what a worker that CANNOT finish calls instead of
+// fabricating a value or falling silent. These tests pin the three properties
+// that make it usable: the hub derives the asker (no client `by`), the run ends,
+// and a malformed call never reaches the hub.
+
+test('ask posts the bound workflow/run plus path/question/context and never accepts client by', async () => {
+  const { hub, calls } = mockHub({ ask: { ok: true, closed: false } });
+  const mount = createHoldMcp(deps(hub));
+  const res = await tool(mount.tools, 'ask').handler(
+    { path: 'plan', question: 'which repo?', context: 'the proposal names two', by: 'forged' },
+    ctx,
+  );
+  assert.deepEqual(parse(res), { ok: true, closed: false, text: 'ok' });
+  assert.deepEqual(calls, [{
+    verb: 'ask',
+    arg: { workflow: 'wf1', run: 'run1', path: 'plan', question: 'which repo?', context: 'the proposal names two' },
+  }]);
+  assert.equal((calls[0]!.arg as Record<string, unknown>)['by'], undefined);
+});
+
+test('ask omits an absent or blank context rather than sending an empty string', async () => {
+  const { hub, calls } = mockHub({});
+  const mount = createHoldMcp(deps(hub));
+  await tool(mount.tools, 'ask').handler({ path: 'plan', question: 'which repo?' }, ctx);
+  await tool(mount.tools, 'ask').handler({ path: 'plan', question: 'which repo?', context: '   ' }, ctx);
+  for (const c of calls) {
+    assert.equal((c.arg as Record<string, unknown>)['context'], undefined);
+  }
+});
+
+test('ask validates path and question before touching the hub', async () => {
+  const { hub, calls } = mockHub({});
+  const mount = createHoldMcp(deps(hub));
+  const noPath = await tool(mount.tools, 'ask').handler({ question: 'which repo?' }, ctx);
+  const noQuestion = await tool(mount.tools, 'ask').handler({ path: 'plan' }, ctx);
+  const blankQuestion = await tool(mount.tools, 'ask').handler({ path: 'plan', question: '  ' }, ctx);
+  const badContext = await tool(mount.tools, 'ask').handler({ path: 'plan', question: 'q', context: 7 }, ctx);
+  for (const r of [noPath, noQuestion, blankQuestion, badContext]) {
+    assert.equal((r as { isError?: boolean }).isError, true);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('a CLOSED ask stops the lease loop without releasing — asking ENDS the run', async () => {
+  const { hub } = mockHub({ ask: { ok: true, closed: true } });
+  const mount = createHoldMcp(deps(hub));
+  const stops: Array<{ reason?: string; opts?: unknown }> = [];
+  const realStop = mount.loop.stop;
+  mount.loop.stop = ((reason?: string, opts?: unknown) => {
+    stops.push({ reason, opts });
+    return realStop.call(mount.loop, reason as never, opts as never);
+  }) as typeof mount.loop.stop;
+
+  await tool(mount.tools, 'ask').handler({ path: 'plan', question: 'which repo?' }, ctx);
+  assert.deepEqual(stops, [{ reason: 'asked', opts: { release: false } }]);
+});
+
+test('ask surfaces a hub failure as an isError result', async () => {
+  const { hub } = mockHub({ ask: new Error('ask offline') });
+  const mount = createHoldMcp(deps(hub));
+  const res = await tool(mount.tools, 'ask').handler({ path: 'plan', question: 'q' }, ctx);
+  assert.equal((res as { isError?: boolean }).isError, true);
+  assert.match(parse(res).error, /ask offline/);
+});
+
 // ---- terminal fast-fail (reviewer regression: lease-lost must stop the tools) --
 
-test('once the lease is lost, ALL THREE tools fast-fail with isError and NO hub call', async () => {
+test('once the lease is lost, ALL FOUR tools fast-fail with isError and NO hub call', async () => {
   // First contact sees an unclaimed lease with no outcome → run() = lease-lost.
   const { hub, calls } = mockHub({
     getOrder: { text: '', workflow: 'wf1', run: 'run1', order: null, lease: { claimed: false } },
@@ -569,6 +644,9 @@ test('once the lease is lost, ALL THREE tools fast-fail with isError and NO hub 
   const r = await tool(mount.tools, 'reject').handler({ path: 'input', text: 'bad' }, ctx);
   assert.equal((r as { isError?: boolean }).isError, true);
   assert.match(parse(r).error, /no longer held/);
+  const a = await tool(mount.tools, 'ask').handler({ path: 'pr', question: 'which repo?' }, ctx);
+  assert.equal((a as { isError?: boolean }).isError, true);
+  assert.match(parse(a).error, /no longer held/);
   assert.equal(calls.length, before, 'a terminated hold makes NO further hub calls');
 });
 

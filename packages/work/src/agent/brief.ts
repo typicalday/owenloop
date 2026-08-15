@@ -102,7 +102,12 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
     .join(spec.account)
     .split(SHIFT_TOKEN)
     .join(spec.shiftId ?? '');
-  const blocks = [renderRoutingLine(spec), renderSubmitContract(spec), substituted];
+  const blocks = [
+    renderRoutingLine(spec),
+    renderSubmitContract(spec),
+    renderEscalationContract(spec),
+    substituted,
+  ];
   return blocks.filter((b) => b !== '').join('\n\n');
 }
 
@@ -147,6 +152,57 @@ function renderSubmitContract(spec: BriefSpec): string {
     `How this order completes: submit your result with the \`submit\` tool on the mounted \`owenloop\` MCP server. You owe ${owed.map((p) => `\`${p}\``).join(', ')} — call it once for each.`,
     `Example: \`submit({"path": "${owed[0]!}", "value": <the value this brief asks for>})\`.`,
     'Printing that value as text, or inside a code fence, does NOT submit it — the turn ends, the hub records nothing, and this order is re-offered from scratch. Wherever this brief says "green <path> with <value>", it means exactly this tool call.',
+  ].join('\n');
+}
+
+/**
+ * What an agent does when it CANNOT complete the order, stated to every agent on
+ * every run, right after the submit contract.
+ *
+ * WHY THIS EXISTS. The submit contract closes one hole (an agent that finished
+ * but did not know how to say so). This closes the opposite one: an agent that
+ * did NOT finish and has no legal way to say so. Until `ask` shipped there were
+ * exactly two exits from a step, and a blocked agent had to pick the less
+ * damaging:
+ *   - Submit anyway. The artifact goes green on a value the agent does not
+ *     believe, and every downstream step builds on it. Observed on a real run:
+ *     a planner that could read nothing produced a confident, fictional plan and
+ *     a builder started executing it.
+ *   - End the turn without submitting. The lease lapses, the task re-arms, and a
+ *     fresh worker starts from the identical missing information. It repeats
+ *     until the stall cap, spending a full model run per attempt to relearn the
+ *     same blocker, and no human is ever told.
+ * Neither reaches a person. Both were watched happening. The tool is the fix and
+ * this paragraph is what makes the tool reachable — a mounted tool nobody is
+ * told about is dead code.
+ *
+ * WHY IT NAMES THE COST. Models are heavily biased toward producing an answer,
+ * and an escalation path that reads as failure will not be taken. So the text
+ * states the two facts that make asking the correct move rather than the
+ * cowardly one: it costs no attempts, and guessing is worse than asking.
+ *
+ * WHY IT STATES THE BAR. "Ask whenever unsure" would turn every ambiguity into a
+ * human interrupt and the channel would be ignored within a day. The bar is
+ * concrete: ask when the missing thing cannot be recovered by working — reading
+ * the repo, running a read-only command, re-reading the inputs — because those
+ * are exactly the cases where another attempt cannot help.
+ *
+ * Rendered only when the order owes something, for the same reason the submit
+ * contract is: `ask` takes an owed path as its argument, and a contract that has
+ * to write `<path>` into its own example teaches the call shape while leaving
+ * the one argument that matters unanswered.
+ *
+ * Vendor-neutral by construction — names owenloop's own tool and mount only.
+ */
+function renderEscalationContract(spec: BriefSpec): string {
+  const owed = (spec.owes ?? []).filter((p) => p !== '');
+  if (owed.length === 0) return '';
+  return [
+    `If you CANNOT produce what this order asks for, do not guess and do not end your turn silently — call the \`ask\` tool on the same \`owenloop\` MCP server and stop.`,
+    `Example: \`ask({"path": "${owed[0]!}", "question": "<the specific decision or fact you need from a person>", "context": "<what you already tried>"})\`.`,
+    'Ask when the thing you are missing cannot be recovered by working: a required input is absent, wrong, or contradicts another input; the order asks for a judgment only the operator can make; or you cannot reach something the order depends on. Do NOT ask for anything you could resolve by reading the repository, re-reading your inputs, or running a read-only command — do that first.',
+    'Asking costs you nothing: it is not a failed attempt, it consumes none of this step\'s retry budget, and it is the correct outcome when the honest answer is "I do not know". Submitting a value you do not believe is worse than asking — it goes green and every later step builds on it. Ending your turn without submitting is worse than asking — this step simply re-runs with the same information missing, and no person is ever told.',
+    'After you ask, your run is over. A human answers on the same artifact and a fresh attempt starts with their answer attached.',
   ].join('\n');
 }
 
