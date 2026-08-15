@@ -109,7 +109,7 @@ test('renderBrief leaves template text alone when it holds no tokens', () => {
 // is the only party that knows the submit contract, so the engine states it.
 
 test('renderBrief states the submit contract, names every owed path, and rules out printing', () => {
-  const out = renderBrief('body', spec({ owes: ['docs', 'pr'] }));
+  const out = renderBrief('body', spec({ owes: [{ path: 'docs' }, { path: 'pr' }] }));
   assert.match(out, /`submit` tool on the mounted `owenloop` MCP server/u);
   // Per-path: `submit` takes the path as an argument, so an agent that owes two
   // outputs and submits one is as stuck as one that submits none.
@@ -124,7 +124,7 @@ test('renderBrief states the submit contract, names every owed path, and rules o
 });
 
 test('renderBrief puts the submit contract after the routing line and before the body', () => {
-  const out = renderBrief('body', spec({ modifier: 'deep', owes: ['docs'] }));
+  const out = renderBrief('body', spec({ modifier: 'deep', owes: [{ path: 'docs' }] }));
   const routing = out.indexOf('Routing: this run');
   const contract = out.indexOf('How this order completes:');
   const body = out.indexOf('body');
@@ -138,17 +138,142 @@ test('renderBrief writes no submit contract when the order owes nothing', () => 
   // of the call while leaving its one load-bearing argument unanswered.
   assert.equal(renderBrief('body', spec()), 'body');
   assert.equal(renderBrief('body', spec({ owes: [] })), 'body');
-  assert.equal(renderBrief('body', spec({ owes: [''] })), 'body');
+  assert.equal(renderBrief('body', spec({ owes: [{ path: '' }] })), 'body');
 });
 
 test('renderBrief keeps the example on a real owed path, never a placeholder', () => {
-  const out = renderBrief('body', spec({ owes: ['', 'mergeable'] }));
+  const out = renderBrief('body', spec({ owes: [{ path: '' }, { path: 'mergeable' }] }));
   assert.match(out, /"path": "mergeable"/u, 'the first NON-EMPTY owed path is the example');
   // Scoped to the example line on purpose: the closing sentence quotes the
   // house verb as "green <path> with <value>", so a whole-brief search for
   // `<path>` matches prose that is supposed to be there.
   const example = out.split('\n').find((l) => l.startsWith('Example:')) ?? '';
   assert.equal(/<path>/.test(example), false, example);
+});
+
+// ---- the input contract ------------------------------------------------------
+//
+// The defect this closes: an agent's INPUTS live on the hub behind `get_order`,
+// a tool it is mounted with and was never told about. A template that says
+// "review the plan" therefore gives no stated way to obtain the plan, and the
+// two things an agent does instead are both silent — look in an empty working
+// directory, or write what a plan would plausibly say. Observed live: a planner
+// with an empty cwd produced a fully-fabricated plan and a builder started
+// executing it.
+
+test('renderBrief tells the agent its inputs come from get_order on the mounted server', () => {
+  const out = renderBrief('body', spec({ owes: [{ path: 'plan' }] }));
+  assert.match(out, /call the `get_order` tool on the mounted `owenloop` MCP server/u);
+  assert.match(out, /takes no arguments/u);
+  // The three things the packet holds, named — an agent told only "call
+  // get_order" has no reason to believe its inputs are in the answer.
+  assert.match(out, /inputs you were given \(`consumes`\)/u);
+  assert.match(out, /output paths you owe/u);
+  assert.match(out, /reason thread/u);
+});
+
+test('the input contract ranks the packet above the brief and routes a missing input to ask', () => {
+  const out = renderBrief('body', spec({ owes: [{ path: 'plan' }] }));
+  // Which copy wins, stated — otherwise a re-offered agent has to guess between
+  // a brief rendered once at dispatch and a live packet carrying newer reasons.
+  assert.match(out, /where the two disagree, the packet is right/u);
+  // The whole point: an absent input becomes a question, not a fabrication.
+  assert.match(out, /Do not invent it and do not proceed on an assumption: use `ask`/u);
+});
+
+test('the input contract comes before the submit contract and after the routing line', () => {
+  const out = renderBrief('body', spec({ modifier: 'deep', owes: [{ path: 'plan' }] }));
+  const routing = out.indexOf('Routing: this run');
+  const inputs = out.indexOf('Before you start:');
+  const submit = out.indexOf('How this order completes:');
+  const escalation = out.indexOf('If you CANNOT produce');
+  const body = out.indexOf('body');
+  // Read in the order an agent needs them: what depth am I at, where is my work,
+  // how do I finish, how do I bail.
+  assert.ok(routing === 0, `routing must stay first: ${out}`);
+  assert.ok(routing < inputs, `unexpected order: ${out}`);
+  assert.ok(inputs < submit, `unexpected order: ${out}`);
+  assert.ok(submit < escalation, `unexpected order: ${out}`);
+  assert.ok(escalation < body, `unexpected order: ${out}`);
+});
+
+test('the input contract is silent when the order owes nothing', () => {
+  // It closes by sending the agent to `ask`, and `ask` is only described when
+  // there is an owed path for it to name. Rendering this alone would point at a
+  // section that is not there.
+  assert.equal(renderBrief('body', spec({ owes: [] })), 'body');
+  assert.equal(renderBrief('body', spec({ owes: [{ path: '' }] })), 'body');
+});
+
+// ---- the attempt history ------------------------------------------------------
+//
+// The rejection delta already tells a re-offered agent WHAT was wrong with its
+// last submission. Nothing told it that the retrying is BOUNDED — so every
+// attempt looks like the first, and an agent has no reason to ever switch from
+// retrying to asking. The counters have been on the packet all along.
+
+test('renderBrief reports prior rejections per path, separating judgment from schema', () => {
+  const out = renderBrief(
+    'body',
+    spec({ owes: [{ path: 'plan', judgmentRejects: 2, schemaRejects: 1 }] }),
+  );
+  assert.match(out, /Attempt history for this order/u);
+  assert.match(out, /`plan`: 2 rejected on judgment/u);
+  assert.match(out, /1 rejected on schema/u);
+  // The two counters mean opposite things: judgment is a reader disagreeing with
+  // content that was well-formed; schema is the engine refusing the shape before
+  // anybody read it. Merged into one number, an agent revises prose that was
+  // never read.
+  assert.match(out, /a reader disagreed with the value/u);
+  assert.match(out, /the fix is the STRUCTURE of what you submit, not its wording/u);
+});
+
+test('the attempt history states the budget is finite and points at ask', () => {
+  const out = renderBrief('body', spec({ owes: [{ path: 'plan', judgmentRejects: 3 }] }));
+  assert.match(out, /This retrying is bounded\./u);
+  assert.match(out, /stops re-arming this step entirely/u);
+  assert.match(out, /`ask` instead of resubmitting/u);
+  // NEVER a cap number. `maxAttempts`/`maxSchemaFailures` are resolved per
+  // produce from the def and are NOT on the order packet — an agent told it has
+  // "2 of 5" left when it has 2 of 3 keeps grinding, which is worse than being
+  // told nothing.
+  assert.equal(/\bof \d+\b|\bout of \d+\b|\d+ remaining/u.test(out), false, out);
+});
+
+test('the attempt history is silent on a first attempt', () => {
+  // A hub that projects no counters is not a hub reporting zero — it is a hub
+  // with nothing to say. Either way "0 previous rejections" costs tokens to say
+  // nothing, and on an unprojected packet it would be a lie to an agent on its
+  // fourth attempt.
+  const fresh = renderBrief('body', spec({ owes: [{ path: 'plan' }] }));
+  assert.equal(/Attempt history/u.test(fresh), false, fresh);
+  const zeroed = renderBrief(
+    'body',
+    spec({ owes: [{ path: 'plan', judgmentRejects: 0, schemaRejects: 0 }] }),
+  );
+  assert.equal(/Attempt history/u.test(zeroed), false, zeroed);
+});
+
+test('the attempt history sits between the submit and escalation contracts', () => {
+  const out = renderBrief('body', spec({ owes: [{ path: 'plan', judgmentRejects: 1 }] }));
+  const submit = out.indexOf('How this order completes:');
+  const history = out.indexOf('Attempt history for this order');
+  const escalation = out.indexOf('If you CANNOT produce');
+  // "here is how much rope you have left" lands immediately before "here is the
+  // exit", so the count is read as an input to that decision rather than as
+  // scolding.
+  assert.ok(submit < history && history < escalation, `unexpected order: ${out}`);
+});
+
+test('the attempt history skips a path with no history while reporting one that has it', () => {
+  const out = renderBrief(
+    'body',
+    spec({ owes: [{ path: 'clean' }, { path: 'dirty', judgmentRejects: 2 }] }),
+  );
+  assert.match(out, /`dirty`: 2 rejected on judgment/u);
+  assert.equal(/`clean`: \d/u.test(out), false, out);
+  // Both paths still owed, so both are still named by the submit contract.
+  assert.match(out, /You owe `clean`, `dirty`/u);
 });
 
 test('buildOwenloopMcp emits the born-bound work-holder argv', () => {

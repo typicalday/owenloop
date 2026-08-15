@@ -403,7 +403,12 @@ test('nothing new to say ⇒ COLD START with a bare brief, not a resume that say
   assert.deepEqual(kinds(adapter), ['start', 'stop']);
   const s = adapter.calls.find((x) => x.kind === 'start');
   assert.ok(s !== undefined && s.kind === 'start');
-  assert.ok(!s.args.brief.includes('was rejected'), 'no empty rejection section');
+  // Pinned to `renderRejection`'s actual section header, not the looser
+  // substring 'was rejected' this used to search for: the ordinary brief now
+  // carries an input contract whose text includes the phrase "why any previous
+  // attempt was rejected", which is a permanent, correct part of every brief and
+  // is not a rejection section.
+  assert.ok(!s.args.brief.includes('Your submission for'), 'no empty rejection section');
   assert.match(ran.outs.join('\n'), /attempt 2, cold start\)/);
   // The watermark is carried FORWARD, never reset — a cold start with no new
   // feedback must not make already-delivered reasons look undelivered.

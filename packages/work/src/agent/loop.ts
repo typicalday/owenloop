@@ -251,6 +251,41 @@ function errMsg(e: unknown): string {
 }
 
 /**
+ * The owed outputs the brief renders its submit contract, attempt history and
+ * escalation contract from.
+ *
+ * `packet.owes` is the RIGHT source and is used whenever it has anything in it:
+ * it is the hub's live answer to "what does this order still owe", so on a
+ * re-offer where some paths are already paid it names only the ones left, and it
+ * is the only source carrying the reject counters.
+ *
+ * THE FALLBACK, and why it is not defensive noise. `owes` reaching this function
+ * empty is a real, reachable state, not a can't-happen: the hub's order
+ * projection (`projectReferenceOrder`) is a deliberate allow-list that emits
+ * `owes: []` for any persisted row whose `owes` is not an array — every order
+ * written before the engine emitted the field. `packet.outputs` is projected
+ * from the same row and names the same paths, minus the counters. Preferring an
+ * empty `owes` over a populated `outputs` would render a brief with NO submit
+ * contract and NO escalation contract — silently reproducing, on exactly the old
+ * runs least able to cope with it, the defect both contracts exist to close. So:
+ * fall back to the paths, and let the attempt history stay silent because there
+ * are genuinely no counters to report.
+ *
+ * An order that owes nothing under BOTH fields renders neither contract, which
+ * is correct — there is no path for `submit` or `ask` to name.
+ */
+function briefOwes(packet: OrderPacket): BriefSpec['owes'] {
+  if (packet.owes.length > 0) {
+    return packet.owes.map((owed) => ({
+      path: owed.path,
+      judgmentRejects: owed.judgmentRejects,
+      schemaRejects: owed.schemaRejects,
+    }));
+  }
+  return packet.outputs.map((path) => ({ path }));
+}
+
+/**
  * How this order's model was decided.
  *
  *   `resolved`  — a settings row matched; `resolution` names it, plus the model
@@ -642,9 +677,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       // statement about the RUN, and a shift has no say in it.
       ...(packet.modifier !== undefined ? { modifier: packet.modifier } : {}),
       ...(packet.escalated === true ? { escalated: true } : {}),
-      // The hub's own answer to "what does this order still owe", so the submit
-      // contract names the right paths on a re-offer where some are already paid.
-      owes: packet.owes.map((owed) => owed.path),
+      owes: briefOwes(packet),
     };
     // Permissions arrive PRE-NORMALIZED in the spec. `prepare` ran
     // `normalizeStepPermissions` over the step's `x.harness` options at cache

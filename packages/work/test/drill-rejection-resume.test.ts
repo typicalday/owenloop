@@ -291,8 +291,12 @@ test('a re-offered rejection resumes the prior session in a NEW process and send
     );
     const start = afterFirst.find((c) => c.call === 'start')!;
     assert.match(String(start['brief']), new RegExp(BRIEF_BODY), 'the compiled brief reached the step agent');
+    // Pinned to `renderRejection`'s actual section header rather than the looser
+    // substring 'was rejected': every ordinary brief now carries an input
+    // contract reading "why any previous attempt was rejected", which is not a
+    // rejection section.
     assert.ok(
-      !String(start['brief']).includes('was rejected'),
+      !String(start['brief']).includes('Your submission for'),
       'a first firing carries no rejection section — there is nothing to report yet',
     );
 
@@ -441,7 +445,7 @@ test('a SECOND re-offer with no new reasons does not spend a resume turn saying 
     assert.deepEqual(calls.map((c) => c.call), ['start', 'start'], 'no deliver — a resume that says nothing is never sent');
     const start2 = calls[1]!;
     assert.ok(
-      !String(start2['brief']).includes('was rejected'),
+      !String(start2['brief']).includes('Your submission for'),
       'and the brief carries no empty rejection section either',
     );
     assert.equal(
