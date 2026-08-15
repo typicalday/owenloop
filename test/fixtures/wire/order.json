@@ -30,6 +30,18 @@
             "fromVersion": 1
           }
         ],
+        "schema": {
+          "type": "object",
+          "required": [
+            "url"
+          ],
+          "properties": {
+            "url": {
+              "type": "string"
+            }
+          }
+        },
+        "schemaAppliesTo": "value",
         "proof": "serialized-dsse-envelope"
       }
     ],
@@ -128,6 +140,54 @@
         "owes": []
       },
       "keyword": "minimum"
+    },
+    {
+      "name": "unknown-schema-applies-to",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build-instance",
+        "step": "producer",
+        "key": "producer",
+        "defDigest": "injected-digest",
+        "inputs": [],
+        "outputs": [],
+        "consumes": {},
+        "owes": [
+          {
+            "path": "result",
+            "judgmentRejects": 0,
+            "schemaRejects": 0,
+            "reasons": [],
+            "schema": { "type": "object" },
+            "schemaAppliesTo": "seal"
+          }
+        ]
+      },
+      "keyword": "enum"
+    },
+    {
+      "name": "non-schema-schema",
+      "value": {
+        "run": "run-build-7",
+        "workflow": "build-instance",
+        "step": "producer",
+        "key": "producer",
+        "defDigest": "injected-digest",
+        "inputs": [],
+        "outputs": [],
+        "consumes": {},
+        "owes": [
+          {
+            "path": "result",
+            "judgmentRejects": 0,
+            "schemaRejects": 0,
+            "reasons": [],
+            "schema": "type: object",
+            "schemaAppliesTo": "value"
+          }
+        ]
+      },
+      "keyword": "oneOf"
     }
   ]
 }

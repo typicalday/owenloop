@@ -182,6 +182,12 @@ const OPEN_OBJECT_POINTERS = new Set([
   '#/properties/spec',
   '#/properties/x',
   '#/properties/consumes',
+  // An owed path's projected JSON Schema. Open because its keys are JSON Schema
+  // KEYWORDS — `type`, `required`, `properties`, and whatever else the def
+  // author wrote — not a fixed wire shape this repo controls. Closing it would
+  // mean enumerating a schema dialect inside a wire contract, and every new
+  // keyword a def used would be rejected in transit.
+  '#/properties/owes/items/properties/schema/oneOf/0',
 ]);
 
 function escapeJsonPointer(value: string): string {

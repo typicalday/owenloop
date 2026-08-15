@@ -280,8 +280,18 @@ function briefOwes(packet: OrderPacket): BriefSpec['owes'] {
       path: owed.path,
       judgmentRejects: owed.judgmentRejects,
       schemaRejects: owed.schemaRejects,
+      // Spread rather than assigned, so an absent schema stays absent instead
+      // of becoming an explicit `undefined`. The shape contract keys off
+      // `schema !== undefined`, and a hub that does not project the field must
+      // read as "nothing to say", never as "no constraint".
+      ...(owed.schema !== undefined
+        ? { schema: owed.schema, schemaAppliesTo: owed.schemaAppliesTo }
+        : {}),
     }));
   }
+  // The `outputs` fallback carries paths only — no counters and no schema. A
+  // hub old enough to project no `owes` is old enough to project no schema
+  // either, so there is nothing lost here that was ever available.
   return packet.outputs.map((path) => ({ path }));
 }
 

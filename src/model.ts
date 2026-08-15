@@ -16,6 +16,7 @@ import {
   isMemberOf,
   parseElement,
   sealPath,
+  sealStem,
 } from './paths.ts';
 import { DEBT_STATES, OUTSTANDING_STATES, SETTLED_STATES } from './types.ts';
 import type {
@@ -32,6 +33,7 @@ import type {
   GraphNode,
   GraphNodeState,
   InvariantPredicate,
+  JsonSchema,
   StepDef,
   ProducePattern,
   RejectKind,
@@ -296,6 +298,60 @@ function produceOwning(step: StepDef, path: string): ProducePattern | undefined 
     if (p.stem === path) return p;
   }
   return undefined;
+}
+
+/**
+ * The JSON Schema the engine will enforce on an OWED path, plus what that
+ * schema governs — for projection onto the order packet (`Order.owes[]`).
+ *
+ * This is a read of the definition for the producer's benefit; it decides
+ * nothing. Enforcement stays where it already is, and this function's whole
+ * job is to return the same schema those sites will apply, so an order never
+ * advertises a shape the commit path would not check. Each branch names the
+ * site it mirrors:
+ *
+ *  1. MAP CHILD (`stem[3].suffix`) → the map produce's schema, governing the
+ *     element value. Mirrors `engine.ts` `produceSchema()`'s map branch, which
+ *     `green()` calls on the element.
+ *  2. COLLECTION SEAL (`stem` + the seal suffix) → the collection produce's
+ *     schema, governing EACH MEMBER. Mirrors `engine.ts`'s `emit` path, which
+ *     looks the schema up by `p.kind === 'collection' && p.stem === stem` and
+ *     validates the member being emitted. The owed path is the seal because
+ *     `plainOutputs()` pushes `sealPath(stem)` for a collection — the seal is
+ *     what the step discharges, the members are what the schema describes.
+ *     Reporting `appliesTo: 'member'` is the whole reason this function returns
+ *     a discriminator instead of a bare schema.
+ *  3. SINGLETON → the singleton produce's schema, governing the submitted
+ *     value. Mirrors `produceSchema()`'s singleton branch.
+ *
+ * Map is tested before singleton because a map produce's `stem` and a
+ * singleton's can be spelled the same; only the owed path's index token tells
+ * them apart, and `parseElement` is the thing that reads it.
+ *
+ * Returns undefined when the produce declares no schema, which is the common
+ * case — the engine then accepts any JSON, and the order should say nothing
+ * rather than imply a constraint that does not exist.
+ */
+export function owedSchema(
+  step: StepDef,
+  path: string,
+): { schema: JsonSchema; appliesTo: 'value' | 'member' } | undefined {
+  const el = parseElement(path);
+  if (el && el.suffix !== '') {
+    const mp = step.produces.find(
+      (p) => p.kind === 'map' && p.stem === el.stem && p.suffix === el.suffix,
+    );
+    return mp?.schema === undefined ? undefined : { schema: mp.schema, appliesTo: 'value' };
+  }
+
+  const sealed = sealStem(path);
+  if (sealed !== null) {
+    const cp = step.produces.find((p) => p.kind === 'collection' && p.stem === sealed);
+    return cp?.schema === undefined ? undefined : { schema: cp.schema, appliesTo: 'member' };
+  }
+
+  const sp = step.produces.find((p) => p.kind === 'singleton' && p.stem === path);
+  return sp?.schema === undefined ? undefined : { schema: sp.schema, appliesTo: 'value' };
 }
 
 /** An artifact is frozen (no firing re-arms it) when either stall trips or it is held. */

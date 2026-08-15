@@ -345,3 +345,70 @@ test('buildOwenloopMcp carries no credential', () => {
   assert.equal(flat.includes(token), false);
   assert.equal(/token|bearer|secret|password|api[-_]?key/i.test(flat), false, `credential-shaped text in the mount: ${flat}`);
 });
+
+// ---------------------------------------------------------------------------
+// The shape contract — the schema an owed value must satisfy, stated up front.
+// ---------------------------------------------------------------------------
+
+const PR_SCHEMA = {
+  type: 'object',
+  required: ['url', 'title'],
+  properties: { url: { type: 'string' }, title: { type: 'string' } },
+};
+
+test('the brief states the schema of a constrained owed path before the agent produces one', () => {
+  const out = renderBrief('body', spec({ owes: [{ path: 'pr', schema: PR_SCHEMA, schemaAppliesTo: 'value' }] }));
+  assert.match(out, /The shape of what you owe:/);
+  assert.match(out, /The value you submit to `pr` must satisfy this JSON Schema\./);
+  // The schema is printed WHOLE. A clipped `required` array is not a smaller
+  // requirement, it is a different and wrong one — an agent that reads a
+  // truncated one confidently omits a field.
+  assert.ok(out.includes(JSON.stringify(PR_SCHEMA, null, 2)), 'the schema is rendered in full, verbatim');
+  assert.match(out, /spends one of this order's limited schema attempts/);
+});
+
+test('a collection`s shape contract is stated against MEMBERS, not the sealed path', () => {
+  // The owed path is the seal; the schema is checked per member on emit. Saying
+  // "the value you submit to `source[]`" here would describe the wrong object.
+  const out = renderBrief(
+    'body',
+    spec({ owes: [{ path: 'source[]', schema: PR_SCHEMA, schemaAppliesTo: 'member' }] }),
+  );
+  assert.match(out, /Each member you emit into `source\[\]` must satisfy this JSON Schema/);
+  assert.match(out, /checked per member, NOT against the sealed collection itself/);
+  assert.ok(!/The value you submit to `source\[\]`/.test(out), 'must not describe the seal as the constrained value');
+});
+
+test('the brief says nothing about shape when no owed path declares a schema', () => {
+  // Most produces declare none, and for those the engine accepts any JSON. A
+  // blanket "no schema declared" line would be worse than silence: a hub too
+  // old to project the field is indistinguishable from a produce with no
+  // schema, and only one of those justifies telling an agent it is
+  // unconstrained. Neither gets that claim.
+  const out = renderBrief('body', spec({ owes: [{ path: 'pr', judgmentRejects: 1, schemaRejects: 2 }] }));
+  assert.ok(!/The shape of what you owe/.test(out), 'no shape section without a declared schema');
+  assert.ok(!/JSON Schema/.test(out), 'no shape claim of any kind');
+});
+
+test('the shape contract covers only the constrained paths in a mixed order', () => {
+  const out = renderBrief(
+    'body',
+    spec({
+      owes: [
+        { path: 'pr', schema: PR_SCHEMA, schemaAppliesTo: 'value' },
+        { path: 'notes' },
+      ],
+    }),
+  );
+  assert.match(out, /The value you submit to `pr` must satisfy/);
+  assert.ok(!/`notes` must satisfy/.test(out), 'an unconstrained path draws no shape line');
+});
+
+test('a `false` schema is stated rather than suppressed', () => {
+  // `false` is a JSON Schema that rejects every value. Suppressing it — the
+  // slip a truthiness check produces — would leave an agent burning its whole
+  // refusal budget against a path nothing can satisfy, with no way to see why.
+  const out = renderBrief('body', spec({ owes: [{ path: 'pr', schema: false, schemaAppliesTo: 'value' }] }));
+  assert.match(out, /The value you submit to `pr` must satisfy this JSON Schema/);
+  assert.match(out, /```json\nfalse\n```/);
+});

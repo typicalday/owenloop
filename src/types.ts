@@ -258,6 +258,40 @@ export interface Order {
     judgmentRejects: number;
     schemaRejects: number;
     reasons: ReasonEntry[];
+    /**
+     * The JSON Schema the engine will enforce on this output at commit time,
+     * copied verbatim off the owning produce entry. Absent when that produce
+     * declares none — the common case, and the engine then accepts any JSON.
+     *
+     * WHY IT IS ON THE ORDER. `schemaRejects` and the `'schema'` reason entries
+     * already travel here, so a producer is told AFTER the fact that the shape
+     * it submitted was wrong, and told the cap it is burning down. It was never
+     * told the shape. A re-offered agent reading "your last submission failed
+     * its schema" has the same information it had the first time and no more,
+     * which is why the same malformed shape gets resubmitted until the counter
+     * stalls the step. This closes that: the requirement is stated up front,
+     * from the same declaration the refusal will be measured against.
+     *
+     * It is a COPY, not a reference. The order is immutable once written
+     * (`RunData.order`), so this is the schema as it stood at claim time; a def
+     * edited mid-run leaves the projected schema and the enforced one able to
+     * disagree, exactly as `defDigest` already records for the rest of the
+     * order.
+     */
+    schema?: JsonSchema;
+    /**
+     * What `schema` governs. Present exactly when `schema` is.
+     *
+     * - `'value'` — the submitted value itself. Singleton produces, and one
+     *   element of a map produce.
+     * - `'member'` — EACH member emitted into this collection. NOT the seal
+     *   value at the path this entry names. A collection's owed path is its
+     *   seal (`model.ts` `plainOutputs` pushes `sealPath(stem)`), while the
+     *   declared schema is checked per member on `emit`, so projecting it
+     *   without this discriminator would tell a producer to shape the seal
+     *   like a member.
+     */
+    schemaAppliesTo?: 'value' | 'member';
     /** Opaque proof/signature placeholder for future WP-A4-signed reason
      *  threads. Data-only today: no cryptographic code attaches or verifies
      *  it — the slot exists so signed dynamic data can land without changing

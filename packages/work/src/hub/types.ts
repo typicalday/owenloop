@@ -247,6 +247,23 @@ export interface OrderPacket {
     judgmentRejects: number;
     schemaRejects: number;
     reasons: ReasonEntry[];
+    /**
+     * The JSON Schema the engine will enforce on this output at commit time,
+     * projected off the owning produce entry by a schema-aware hub. Absent
+     * when the produce declares none (the common case — any JSON is accepted),
+     * and absent from every hub too old to project the field at all. Those two
+     * cases are indistinguishable here on purpose: both mean "this worker was
+     * told no shape", and the brief says nothing either way rather than
+     * claiming an output is unconstrained when it may not be.
+     */
+    schema?: unknown;
+    /**
+     * What `schema` governs — `'value'` for the submitted value itself
+     * (singleton produce, or one element of a map produce), `'member'` for
+     * each member emitted into a collection rather than the seal value the
+     * path names. Projected together with `schema` and meaningless without it.
+     */
+    schemaAppliesTo?: 'value' | 'member';
     /** Target-protocol reason-thread proof; the deployed hub may omit it. */
     proof?: string;
   }>;
