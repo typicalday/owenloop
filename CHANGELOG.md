@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4](https://github.com/typicalday/owenloop/compare/v0.5.3...v0.5.4) (2026-08-15)
+
+
+### Features
+
+* add `owenloop cancel` to stop a running hub instance ([#158](https://github.com/typicalday/owenloop/issues/158)) ([76ccc75](https://github.com/typicalday/owenloop/commit/76ccc75cf4b1c9312484e691663f9e5c9e1ebe9a))
+* add `owenloop instance show` to read a hub run's live state ([#161](https://github.com/typicalday/owenloop/issues/161)) ([9ab7cec](https://github.com/typicalday/owenloop/commit/9ab7cec6f72dc79c11c2c7079174f9581ff97304))
+* let workdirFrom name a declared input, not only a consume ([#165](https://github.com/typicalday/owenloop/issues/165)) ([fff886b](https://github.com/typicalday/owenloop/commit/fff886b86c097a1b85de745faa322cf92d0e5615))
+* state the submit contract in every rendered brief ([#160](https://github.com/typicalday/owenloop/issues/160)) ([f62430d](https://github.com/typicalday/owenloop/commit/f62430d1febc77597cafb25e8b2928f1ab7e7fb3))
+
+
+### Bug Fixes
+
+* deliver a payload reject before the owed submits, not after ([#164](https://github.com/typicalday/owenloop/issues/164)) ([b38b709](https://github.com/typicalday/owenloop/commit/b38b709aededd0ebef2684f8c64abb8fe68226de))
+* relay a failed command step's own output to the exec log ([#162](https://github.com/typicalday/owenloop/issues/162)) ([d40595d](https://github.com/typicalday/owenloop/commit/d40595dbfe40bfbf6f5d729296189e5b88424eec))
+* scope owenloop's config dir without hijacking XDG_CONFIG_HOME ([#163](https://github.com/typicalday/owenloop/issues/163)) ([72838b4](https://github.com/typicalday/owenloop/commit/72838b45e3fb6f52038001148bca62f879a90efc))
+
 ## [0.5.3](https://github.com/typicalday/owenloop/compare/v0.5.2...v0.5.3) (2026-08-14)
 
 
