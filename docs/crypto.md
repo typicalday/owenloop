@@ -523,17 +523,16 @@ sidecar is checked against the bundle digest and the local `allowed_signers`
 trust root. Origin verification is separate: `verifyOrigin` returns `absent`
 when the origin sidecar is missing, `verified` only after DSSE signature, schema,
 signer-key, and bundle-digest checks pass, and `unverifiable` or `invalid` for
-the corresponding failures. The trust-root path is
-`$XDG_CONFIG_HOME/owenloop/allowed_signers` when
-`XDG_CONFIG_HOME` is non-blank, or `$HOME/.config/owenloop/allowed_signers`
-otherwise. A missing or malformed trust root produces the distinct
+the corresponding failures. The trust-root path is `<config>/allowed_signers`, where `<config>` is
+`$OWENLOOP_CONFIG_DIR` when set to a non-blank absolute path, else
+`$XDG_CONFIG_HOME/owenloop` when `XDG_CONFIG_HOME` is non-blank, else
+`$HOME/.config/owenloop`. A missing or malformed trust root produces the distinct
 `unverifiable` verdict; a present signature that fails verification produces
 `invalid`.
 
 The execution and install policy is `defPolicy`, with built-in default `warn`.
-Set `defPolicy` in the JSON settings file at
-`$XDG_CONFIG_HOME/owenloop/settings.json` (or
-`$HOME/.config/owenloop/settings.json`), for example:
+Set `defPolicy` in the JSON settings file at `<config>/settings.json` (same
+ladder as the trust root above), for example:
 
 ```json
 {
@@ -713,7 +712,8 @@ whole organization.
 ### Local anchor and envelope files
 
 The optional filesystem loader derives paths from injected environment state:
-`XDG_CONFIG_HOME` wins over `HOME`; there is no ambient home-directory lookup.
+`OWENLOOP_CONFIG_DIR` wins over `XDG_CONFIG_HOME`, which wins over `HOME`;
+there is no ambient home-directory lookup.
 The local layout is:
 
 ```text

@@ -109,6 +109,14 @@ export const ADMITTED_OWENLOOP_KEYS: ReadonlySet<string> = new Set([
   'OWENLOOP_NO_KEYCHAIN',
   // `holdSession` — src/roles/hold.ts. The fallback when `--session` is absent.
   'OWENLOOP_SESSION',
+  // `owenloopConfigDir` — src/config-dir.ts. Scopes owenloop's OWN config
+  // directory (`settings.json`, `credentials.json`, `allowed_signers`) without
+  // touching `XDG_CONFIG_HOME`, which the rest of the operator's toolchain also
+  // reads. A path, not credential material — but the credential FILE backend
+  // resolves under it (`readStoredCredential` → `configDir` → src/hub.ts), so a
+  // mount that does not see this variable falls back to `XDG_CONFIG_HOME` and
+  // reads a DIFFERENT credential store than the shift that spawned it.
+  'OWENLOOP_CONFIG_DIR',
 ]);
 
 /** The namespace this filter governs. Nothing outside it is ever touched. */

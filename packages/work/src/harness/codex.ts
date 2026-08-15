@@ -308,6 +308,14 @@ export interface McpServerSpec {
 const MOUNT_ENV_KEEP = ['HOME', 'XDG_CONFIG_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME'] as const;
 
 /**
+ * `OWENLOOP_CONFIG_DIR` rides the `OWENLOOP_*` allowlist below rather than this
+ * list, but it belongs to the same job: without it a mount whose parent scoped
+ * owenloop's config with `OWENLOOP_CONFIG_DIR` would fall back to
+ * `XDG_CONFIG_HOME` and read a DIFFERENT settings file than the shift that
+ * spawned it.
+ */
+
+/**
  * The environment for the owenloop mount, forwarded from THIS process.
  *
  * MEASURED, not assumed: `codex app-server` 0.146.0 does NOT give an MCP server

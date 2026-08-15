@@ -170,9 +170,18 @@ accepted `shift next` records attendance and makes the next presence ping due,
 but attendance is advisory and observability-only. Attendance never changes
 routing, dispatch, or lease behavior.
 
-The execution settings file is `$XDG_CONFIG_HOME/owenloop/settings.json` when
-`XDG_CONFIG_HOME` is set to a non-blank value; otherwise it is
-`$HOME/.config/owenloop/settings.json`.
+<a id="config-dir"></a>
+The execution settings file is `<config>/settings.json`. Throughout this
+document `<config>` is owenloop's own config directory, resolved from the
+environment by this ladder, highest first:
+
+1. `$OWENLOOP_CONFIG_DIR` when set to a non-blank ABSOLUTE path — used verbatim,
+   with no `owenloop` segment appended;
+2. `$XDG_CONFIG_HOME/owenloop` when `XDG_CONFIG_HOME` is non-blank;
+3. `$HOME/.config/owenloop`.
+
+The same directory holds `credentials.json`, `allowed_signers`, `org-root.pub`,
+`roster/`, and `revocations/`.
 
 ### `shift start <crew...>`
 
@@ -225,25 +234,46 @@ starts the shift and every agent order that shift dispatches runs on that
 adapter. To run two adapters at once, start two shifts:
 
 ```bash
-OWENLOOP_HARNESS=claude-code XDG_CONFIG_HOME=~/.config/owenloop-shifts/claude owenloop shift start build --state-dir ~/.local/state/owenloop/claude
+OWENLOOP_HARNESS=claude-code OWENLOOP_CONFIG_DIR=~/.config/owenloop-shifts/claude/owenloop owenloop shift start build --state-dir ~/.local/state/owenloop/claude
 ```
 
 ```bash
-OWENLOOP_HARNESS=codex XDG_CONFIG_HOME=~/.config/owenloop-shifts/codex owenloop shift start build --state-dir ~/.local/state/owenloop/codex
+OWENLOOP_HARNESS=codex OWENLOOP_CONFIG_DIR=~/.config/owenloop-shifts/codex/owenloop owenloop shift start build --state-dir ~/.local/state/owenloop/codex
 ```
 
 Both shifts may serve the SAME crew. The hub does not route by harness — it
 offers an order to any shift whose crew is bound to the order's capability, and
 whichever shift claims it first runs it on its own adapter.
 
-**Per-shift `XDG_CONFIG_HOME` is not optional when the adapters differ.** The
-settings file resolves from `XDG_CONFIG_HOME` (see above), and it carries
+**A per-shift config directory is not optional when the adapters differ.** The
+settings file resolves from the config directory (see above), and it carries
 `capabilityModels` — a map of composed capability to `{model, effort}` whose
 model ids are strings the SHIFT'S OWN adapter accepts. Two shifts on different
 adapters need different model ids for the same capability, so they need
-different settings files, so they need different `XDG_CONFIG_HOME` values. A
-shared config directory would give both shifts one adapter's model ids, and the
-shift holding the wrong adapter fails at the vendor API on its first order.
+different settings files, so they need different config directories. A shared
+config directory would give both shifts one adapter's model ids, and the shift
+holding the wrong adapter fails at the vendor API on its first order.
+
+**Use `OWENLOOP_CONFIG_DIR` for this, not `XDG_CONFIG_HOME`.** Both resolve the
+settings file, and `OWENLOOP_CONFIG_DIR` wins — but `XDG_CONFIG_HOME` is a
+machine-wide contract that `gh`, `git`, `gcloud`, `npm`, and most of the rest of
+a developer's toolchain also read, and a shift spreads its ENTIRE environment
+into every worker it dispatches, which passes it on to every command step's
+child process. Scoping a shift with `XDG_CONFIG_HOME` therefore relocates the
+configuration of every tool the workflow's own scripts shell out to. Measured,
+not theorized: on one delivery run this stranded `gh`'s stored credential, and
+the workflow's merge gate spent its full 40-minute wall clock deferring on a CI
+probe that could not authenticate, followed by four consecutive merge failures
+reading `could not resolve a pull request handle for the branch`. Nothing was
+wrong with either script. `OWENLOOP_CONFIG_DIR` scopes owenloop and only
+owenloop.
+
+`OWENLOOP_CONFIG_DIR` names the owenloop config directory ITSELF — the directory
+that directly holds `settings.json`, `credentials.json`, and `allowed_signers`.
+No `owenloop` path segment is appended to it, unlike the `XDG_CONFIG_HOME` rung.
+It must be an ABSOLUTE path: a relative one would resolve against whatever
+working directory a step happens to have, and `workdirFrom` gives every step its
+own.
 
 Give each shift its own `--state-dir` as well. The state directory holds the
 control socket (`shift.sock`), and a second shift starting against a socket
@@ -449,9 +479,8 @@ only the root `owenloop shift` command; `owenloop work` has no standing-daemon a
 `hold --mcp` remains because the machine-attached hold mount still exists.
 Run `owenloop work --help` for the full role-specific usage.
 
-The execution settings file is `$XDG_CONFIG_HOME/owenloop/settings.json` when
-`XDG_CONFIG_HOME` is set to a non-blank value; otherwise it is
-`$HOME/.config/owenloop/settings.json`.
+The execution settings file is `<config>/settings.json` (see
+[the config-directory ladder](#config-dir)).
 
 | subcommand | what it does |
 |---|---|
@@ -816,9 +845,8 @@ signed or explicitly unsigned sidecar.
 ### Definition publication policy
 
 `defPolicy` is the local execution and installation policy for workflow
-publication signatures. The settings file is
-`$XDG_CONFIG_HOME/owenloop/settings.json` when `XDG_CONFIG_HOME` is non-blank,
-otherwise `$HOME/.config/owenloop/settings.json`. To set the policy in the
+publication signatures. The settings file is `<config>/settings.json` (see
+[the config-directory ladder](#config-dir)). To set the policy in the
 settings file, write a JSON object such as:
 
 ```json
@@ -1022,9 +1050,8 @@ when `defPolicy=off`, and only then runs the origin check. Unsigned,
 unverifiable, or invalid publication evidence never reaches the shell. An
 origin mode of `off` and every policy-floor preset leave that gate unchanged.
 
-The local SSHSIG trust root is
-`$XDG_CONFIG_HOME/owenloop/allowed_signers`, or
-`$HOME/.config/owenloop/allowed_signers` when `XDG_CONFIG_HOME` is blank. A
+The local SSHSIG trust root is `<config>/allowed_signers` (see
+[the config-directory ladder](#config-dir)). A
 missing or malformed trust root is `unverifiable`, not `unsigned`.
 
 ### The two store roots
@@ -1405,9 +1432,8 @@ target in this order:
    - with the file credential backend, exactly one origin containing a valid
      human-slot credential is selected automatically;
    - Keychain and external-command credential backends cannot enumerate their
-     origins, so the validated `hubOrigin` in
-     `$XDG_CONFIG_HOME/owenloop/settings.json` (or
-     `~/.config/owenloop/settings.json`) is used, and the requested credential
+     origins, so the validated `hubOrigin` in `<config>/settings.json` (see
+     [the config-directory ladder](#config-dir)) is used, and the requested credential
      slot must exist there before the command proceeds.
 4. If nothing safe resolves, the command exits 2 without network or publication
    output effects.
@@ -1480,7 +1506,7 @@ empty `agent:ci` fails rather than quietly pushing as you. `logout` without
 (`security`, service `owenloop:<hub origin>`, one item per slot, with the slot
 name as the account) with the secret fed over stdin, never on the command line.
 Elsewhere — or with `OWENLOOP_NO_KEYCHAIN=1` — it falls back to a `0600` file at
-`$XDG_CONFIG_HOME/owenloop/credentials.json` (or `~/.config/owenloop/…`) inside
+`<config>/credentials.json` (see [the config-directory ladder](#config-dir)) inside
 a `0700` directory, keyed `hubs[origin][slot]`. Either way the token is never
 written into the repo or a `.env`. `login`'s JSON reports `storage: "keychain" |
 "file"` and `kind`, and prints **no token value** to stdout/stderr. A credential

@@ -33,9 +33,29 @@ test('settingsPath: XDG_CONFIG_HOME wins over HOME when set and non-empty', () =
   );
 });
 
-test('settingsPath: throws when neither HOME nor XDG_CONFIG_HOME is usable', () => {
-  assert.throws(() => settingsPath({}), /set HOME or XDG_CONFIG_HOME/);
-  assert.throws(() => settingsPath({ HOME: '', XDG_CONFIG_HOME: '' }), /set HOME or XDG_CONFIG_HOME/);
+test('settingsPath: OWENLOOP_CONFIG_DIR wins over XDG_CONFIG_HOME and HOME', () => {
+  // The variable an operator running SEVERAL shifts should set. `XDG_CONFIG_HOME`
+  // reaches every worker and every command-step child, so scoping owenloop with
+  // it also relocates `gh`, `git`, and `gcloud` for the workflow's own scripts.
+  assert.equal(
+    settingsPath({ OWENLOOP_CONFIG_DIR: '/srv/utility/owenloop', XDG_CONFIG_HOME: '/xdg', HOME: '/home/u' }),
+    join('/srv/utility/owenloop', 'settings.json'),
+  );
+  // No `owenloop` segment is appended to it, unlike the XDG rung.
+  assert.equal(settingsPath({ OWENLOOP_CONFIG_DIR: '/cfg' }), join('/cfg', 'settings.json'));
+  // Blank reads as unset, so the ladder falls through.
+  assert.equal(
+    settingsPath({ OWENLOOP_CONFIG_DIR: '  ', XDG_CONFIG_HOME: '/xdg' }),
+    join('/xdg', 'owenloop', 'settings.json'),
+  );
+});
+
+test('settingsPath: throws when no rung of the ladder is usable', () => {
+  assert.throws(() => settingsPath({}), /set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/);
+  assert.throws(
+    () => settingsPath({ HOME: '', XDG_CONFIG_HOME: '' }),
+    /set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/,
+  );
 });
 
 test('loadSettings: absent file yields {}', () => {

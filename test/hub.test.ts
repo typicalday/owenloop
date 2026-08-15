@@ -116,10 +116,13 @@ test('randomState yields distinct url-safe tokens', () => {
 
 // ---- config dir derives from env, never process.env --------------------------
 
-test('configDir prefers XDG_CONFIG_HOME, falls back to HOME/.config, else throws', () => {
+test('configDir prefers OWENLOOP_CONFIG_DIR, then XDG_CONFIG_HOME, then HOME/.config, else throws', () => {
+  // `OWENLOOP_CONFIG_DIR` is used VERBATIM — no `owenloop` segment is appended,
+  // unlike the XDG rung. See src/config-dir.ts for why the variable exists.
+  assert.equal(configDir({ OWENLOOP_CONFIG_DIR: '/cfg', XDG_CONFIG_HOME: '/x', HOME: '/home/me' }), '/cfg');
   assert.equal(configDir({ XDG_CONFIG_HOME: '/x' }), join('/x', 'owenloop'));
   assert.equal(configDir({ HOME: '/home/me' }), join('/home/me', '.config', 'owenloop'));
-  assert.throws(() => configDir({}), /set HOME or XDG_CONFIG_HOME/);
+  assert.throws(() => configDir({}), /set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/);
 });
 
 // ---- macOS Keychain status handling ------------------------------------------

@@ -33,7 +33,7 @@ test('allowed_signers path falls back to HOME when XDG_CONFIG_HOME is blank', ()
 test('allowed_signers path refuses when neither environment root is present', () => {
   assert.throws(
     () => allowedSignersPath({}),
-    /cannot locate an allowed_signers path: set HOME or XDG_CONFIG_HOME/,
+    /cannot locate an allowed_signers path: .*set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/,
   );
 });
 

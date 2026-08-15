@@ -14,6 +14,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { owenloopConfigDir } from '../../../../src/config-dir.ts';
 import { type CapabilityModelRow, validateCapabilityModels } from '../agent/capability-model.ts';
 
 /**
@@ -190,17 +191,21 @@ export interface SettingsInspection extends ValidatedSettings {
 }
 
 /**
- * Resolve the settings file path from the caller's env:
- * `$XDG_CONFIG_HOME/owenloop/settings.json` when `XDG_CONFIG_HOME` is set and
- * non-empty, else `$HOME/.config/owenloop/settings.json`. Throws when neither
- * is available rather than guessing a home directory.
+ * Resolve the settings file path from the caller's env, through the one shared
+ * ladder in `src/config-dir.ts`: `$OWENLOOP_CONFIG_DIR/settings.json` when
+ * `OWENLOOP_CONFIG_DIR` is set and non-blank (it must be absolute), else
+ * `$XDG_CONFIG_HOME/owenloop/settings.json`, else
+ * `$HOME/.config/owenloop/settings.json`. Throws when no rung yields a value
+ * rather than guessing a home directory.
+ *
+ * `OWENLOOP_CONFIG_DIR` is the variable an operator running SEVERAL shifts on
+ * one machine should reach for. Setting `XDG_CONFIG_HOME` per shift also works,
+ * but a shift spreads its whole environment into every worker and every command
+ * step's child, so relocating `XDG_CONFIG_HOME` relocates the config of `gh`,
+ * `git`, `gcloud`, and everything else those steps shell out to.
  */
 export function settingsPath(env: Record<string, string | undefined>): string {
-  const xdg = env.XDG_CONFIG_HOME;
-  if (xdg !== undefined && xdg.trim() !== '') return join(xdg, 'owenloop', 'settings.json');
-  const home = env.HOME;
-  if (home !== undefined && home.trim() !== '') return join(home, '.config', 'owenloop', 'settings.json');
-  throw new Error('cannot locate a settings directory: set HOME or XDG_CONFIG_HOME');
+  return join(owenloopConfigDir(env), 'settings.json');
 }
 
 /**

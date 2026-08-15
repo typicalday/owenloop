@@ -22,7 +22,7 @@ import {
   isAdmittedChildEnvKey,
 } from '../src/harness/child-env.ts';
 
-test('the admitted set is exactly the nine names with a reachable child consumer', () => {
+test('the admitted set is exactly the ten names with a reachable child consumer', () => {
   // Pinned as a LIST, not a count: growing this set is a deliberate act that
   // must show up in a diff next to the consumer that justifies it.
   assert.deepEqual(
@@ -30,6 +30,7 @@ test('the admitted set is exactly the nine names with a reachable child consumer
     [
       'OWENLOOP_BUNDLE_DIR',
       'OWENLOOP_CACHE_DIR',
+      'OWENLOOP_CONFIG_DIR',
       'OWENLOOP_CREDENTIAL_COMMAND',
       'OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS',
       'OWENLOOP_NO_KEYCHAIN',
@@ -68,10 +69,11 @@ test('everything outside the OWENLOOP_ namespace passes through untouched', () =
   assert.deepEqual(filterOwenloopEnv(source), source);
 });
 
-test('inside the namespace the nine admitted inputs survive and everything else is denied', () => {
+test('inside the namespace the ten admitted inputs survive and everything else is denied', () => {
   const out = filterOwenloopEnv({
     OWENLOOP_BUNDLE_DIR: '/bundle',
     OWENLOOP_CACHE_DIR: '/cache',
+    OWENLOOP_CONFIG_DIR: '/srv/utility/owenloop',
     OWENLOOP_SHIFT_ID: 'cond-1',
     OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
     OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
@@ -91,6 +93,7 @@ test('inside the namespace the nine admitted inputs survive and everything else 
   assert.deepEqual(out, {
     OWENLOOP_BUNDLE_DIR: '/bundle',
     OWENLOOP_CACHE_DIR: '/cache',
+    OWENLOOP_CONFIG_DIR: '/srv/utility/owenloop',
     OWENLOOP_SHIFT_ID: 'cond-1',
     OWENLOOP_CREDENTIAL_COMMAND: '/bin/credential-helper',
     OWENLOOP_CREDENTIAL_COMMAND_TIMEOUT_MS: '2500',
@@ -117,6 +120,7 @@ test('isAdmittedChildEnvKey agrees with the filter, name by name', () => {
     'CLAUDE_CODE_OAUTH_TOKEN',
     'OWENLOOP_BUNDLE_DIR',
     'OWENLOOP_CACHE_DIR',
+    'OWENLOOP_CONFIG_DIR',
     'OWENLOOP_RUN',
     'OWENLOOP_SHIFT_ID',
     'OWENLOOP_CREDENTIAL_COMMAND',
