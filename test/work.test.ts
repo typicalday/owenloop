@@ -30,8 +30,15 @@ test('owenloopSettingsPath: XDG_CONFIG_HOME wins over HOME', () => {
   assert.equal(owenloopSettingsPath({ HOME: home }), join(home, '.config', 'owenloop', 'settings.json'));
 });
 
-test('owenloopSettingsPath: throws when neither HOME nor XDG_CONFIG_HOME is set', () => {
-  assert.throws(() => owenloopSettingsPath({}), /HOME or XDG_CONFIG_HOME/);
+test('owenloopSettingsPath: throws when no rung of the config ladder is usable', () => {
+  assert.throws(() => owenloopSettingsPath({}), /set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/);
+});
+
+test('owenloopSettingsPath: OWENLOOP_CONFIG_DIR wins over XDG_CONFIG_HOME and HOME', () => {
+  assert.equal(
+    owenloopSettingsPath({ OWENLOOP_CONFIG_DIR: '/cfg', XDG_CONFIG_HOME: '/x', HOME: '/home/me' }),
+    join('/cfg', 'settings.json'),
+  );
 });
 
 test('writeOwenloopHubOrigin: merge-write preserves every unknown key byte-for-byte', () => {

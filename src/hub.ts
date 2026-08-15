@@ -70,6 +70,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { owenloopConfigDir } from './config-dir.ts';
 import { hashDef, parseDef } from './defs.ts';
 import { mkdirRefusingSymlink } from './util.ts';
 
@@ -341,13 +342,13 @@ export function parseCredential(raw: unknown): Credential | null {
   return null;
 }
 
-/** The user-level config dir (never the project dir). Derives from the caller's env. */
+/**
+ * The user-level config dir (never the project dir). Derives from the caller's
+ * env via the one shared ladder in `config-dir.ts`:
+ * `OWENLOOP_CONFIG_DIR` > `$XDG_CONFIG_HOME/owenloop` > `$HOME/.config/owenloop`.
+ */
 export function configDir(env: Record<string, string | undefined>): string {
-  const xdg = env.XDG_CONFIG_HOME;
-  if (xdg && xdg.trim() !== '') return join(xdg, 'owenloop');
-  const home = env.HOME;
-  if (home && home.trim() !== '') return join(home, '.config', 'owenloop');
-  throw new Error('cannot locate a config directory: set HOME or XDG_CONFIG_HOME');
+  return owenloopConfigDir(env);
 }
 
 export function credentialFilePath(env: Record<string, string | undefined>): string {

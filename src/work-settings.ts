@@ -2,8 +2,9 @@
  * execution settings file writer — the ONE place the root `owenloop` CLI writes
  * into the execution-side settings file.
  *
- * `owenloop work` reads its settings from `$XDG_CONFIG_HOME/owenloop/
- * settings.json` (else `$HOME/.config/owenloop/settings.json`) and, by design,
+ * `owenloop work` reads its settings from `$OWENLOOP_CONFIG_DIR/settings.json`
+ * (else `$XDG_CONFIG_HOME/owenloop/settings.json`, else
+ * `$HOME/.config/owenloop/settings.json`) and, by design,
  * NEVER writes them — the root CLI's `setup` command is the writer, so a fresh
  * `owenloop setup` can point `owenloop work` at the hub it just authenticated
  * against.
@@ -25,20 +26,25 @@
 
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { owenloopConfigDir } from './config-dir.ts';
 import { writeFileAtomic } from './hub.ts';
 import { CliError } from './util.ts';
 
 /**
- * The execution settings file path for this environment. `XDG_CONFIG_HOME` (when
- * set and non-blank) wins over `HOME`, matching owenloop's own resolution and
- * the owenloop credential store's `configDir`. Throws when neither is set.
+ * The execution settings file path for this environment, through the one shared
+ * ladder in `config-dir.ts`: `OWENLOOP_CONFIG_DIR` (absolute, used verbatim)
+ * wins over `$XDG_CONFIG_HOME/owenloop`, which wins over
+ * `$HOME/.config/owenloop`. Throws as a `CliError` when no rung yields a value,
+ * so the CLI reports it as an operator error rather than a crash.
  */
 export function owenloopSettingsPath(env: Record<string, string | undefined>): string {
-  const xdg = env.XDG_CONFIG_HOME;
-  if (xdg && xdg.trim() !== '') return join(xdg, 'owenloop', 'settings.json');
-  const home = env.HOME;
-  if (home && home.trim() !== '') return join(home, '.config', 'owenloop', 'settings.json');
-  throw new CliError('cannot locate a config directory for execution settings: set HOME or XDG_CONFIG_HOME');
+  try {
+    return join(owenloopConfigDir(env), 'settings.json');
+  } catch (err) {
+    throw new CliError(
+      `cannot locate a config directory for execution settings: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 /**
