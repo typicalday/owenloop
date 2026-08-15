@@ -4,6 +4,14 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6](https://github.com/typicalday/owenloop/compare/v0.5.5...v0.5.6) (2026-08-15)
+
+
+### Features
+
+* gate tool calls so ask actually asks and auto-safe actually classifies ([#171](https://github.com/typicalday/owenloop/issues/171)) ([f1e95f5](https://github.com/typicalday/owenloop/commit/f1e95f5990f73399c5542cf2d103e16761792a64))
+* tell every step agent where its inputs are and how much rope is left ([#169](https://github.com/typicalday/owenloop/issues/169)) ([47d0485](https://github.com/typicalday/owenloop/commit/47d0485f44ac893c9d2870f7afe31b8a4c42ca92))
+
 ## [0.5.5](https://github.com/typicalday/owenloop/compare/v0.5.4...v0.5.5) (2026-08-15)
 
 
