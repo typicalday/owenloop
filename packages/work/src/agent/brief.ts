@@ -73,16 +73,48 @@ export interface BriefSpec {
    */
   escalated?: boolean;
   /**
-   * The owed output paths for this order, in packet order — `packet.owes`
-   * mapped to its `path`. Feeds the submit contract; absent or empty renders
-   * the contract without naming any path.
+   * The owed outputs for this order, in packet order. Feeds the submit contract
+   * (which names every path) and the attempt history (which reads the two reject
+   * counters); absent or empty renders neither.
+   *
+   * The caller is responsible for the FALLBACK: `packet.owes` is the hub's live
+   * answer to "what does this order still owe" and is the right source, but a
+   * hub old enough to project no `owes` array at all leaves it empty while
+   * `packet.outputs` still names the same paths. See `agent/loop.ts` — an empty
+   * list here silently deletes both contracts, which is the exact failure they
+   * were written to close.
    */
-  owes?: readonly string[];
+  owes?: readonly OwedBrief[];
+}
+
+/**
+ * One owed output as the brief sees it: the path, plus how many times a prior
+ * submission to it was knocked back.
+ *
+ * Both counters are optional because a hub that does not project them is not a
+ * hub reporting zero — it is a hub with nothing to say, and the attempt history
+ * stays silent rather than telling an agent on its fourth attempt that this is
+ * its first.
+ */
+export interface OwedBrief {
+  path: string;
+  /** Consumer/judge verdicts against a submitted value (`packet.owes[].judgmentRejects`). */
+  judgmentRejects?: number;
+  /** Engine refusals of a malformed value against the path's declared JSON
+   *  Schema (`packet.owes[].schemaRejects`). */
+  schemaRejects?: number;
 }
 
 /** The composite order id — the only form the hub verbs accept. */
 function composite(spec: BriefSpec): string {
   return `${spec.workflow}/${spec.run}`;
+}
+
+/** The owed paths worth naming: every non-empty `path`, in packet order. An
+ *  empty string is not a path a `submit` or `ask` call could be made against, so
+ *  it is dropped here once rather than guarded at each use. */
+function owedPaths(spec: BriefSpec): string[] {
+  return (spec.owes ?? []).map((o) => o.path).filter((p) => p !== '');
 }
 
 /**
@@ -104,11 +136,119 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
     .join(spec.shiftId ?? '');
   const blocks = [
     renderRoutingLine(spec),
+    renderInputContract(spec),
     renderSubmitContract(spec),
+    renderAttemptHistory(spec),
     renderEscalationContract(spec),
     substituted,
   ];
   return blocks.filter((b) => b !== '').join('\n\n');
+}
+
+/**
+ * Where this order's INPUTS are, stated to every agent on every run.
+ *
+ * WHY THIS EXISTS. The brief and the mounted work-holder are two halves of one
+ * order and nothing ever joined them. The brief is a rendered template; the
+ * order's actual data — the resolved `consumes` map, the owed paths, each path's
+ * reason thread — lives on the hub behind `get_order`, a tool the agent is
+ * mounted with and was never told about. So an agent whose template says "review
+ * the plan" has no stated way to obtain the plan, and the two things it does
+ * instead are both silent: it looks in its working directory and finds nothing,
+ * or it writes what a plan would plausibly say. Observed live: a planner whose
+ * working directory was empty produced a confident, fully-fabricated plan, and a
+ * builder began executing it. The working-directory half of that run was a
+ * separate defect and is fixed; this half is not, and it is the half that turns
+ * "I have no inputs" into fiction rather than into a question.
+ *
+ * WHEN IT RENDERS. On the same condition as the submit and escalation contracts
+ * — the order owes at least one named path — even though `get_order` itself
+ * takes no arguments and could always be stated. Two reasons, both concrete:
+ * this block's closing sentence sends the agent to `ask`, and `ask` is only
+ * described when there is an owed path for it to name, so an unconditional
+ * version would point at a section that is not there; and an order owing nothing
+ * has no work to orient for. The tool it names is always mounted — every agent
+ * order gets the full work-holder surface, because `buildOwenloopMcp` passes no
+ * tool selector.
+ *
+ * WHY IT RANKS `get_order` ABOVE THE BRIEF. The brief is rendered once at
+ * dispatch and is a summary; the packet is live and authoritative, and on a
+ * re-offer it carries reason threads this text cannot. Telling the agent which
+ * of the two wins removes the judgement call.
+ *
+ * WHY THE LAST LINE POINTS AT `ask`. Naming the source of inputs without saying
+ * what to do when an input is missing from it just relocates the guess.
+ *
+ * Vendor-neutral by construction: names owenloop's own tool and mount, no
+ * harness. `test/vendor-gate.test.ts` enforces this.
+ */
+function renderInputContract(spec: BriefSpec): string {
+  if (owedPaths(spec).length === 0) return '';
+  return [
+    'Before you start: call the `get_order` tool on the mounted `owenloop` MCP server. It takes no arguments and returns THIS order in full — the inputs you were given (`consumes`), the exact output paths you owe, and each path\'s reason thread, including why any previous attempt was rejected.',
+    'That packet is authoritative. This brief is a summary of it, rendered once when the order was dispatched; where the two disagree, the packet is right.',
+    'If something you need is not in what `get_order` returns and you cannot recover it by working — reading the repository, re-reading your inputs, running a read-only command — then it was not given to you. Do not invent it and do not proceed on an assumption: use `ask` (below).',
+  ].join('\n');
+}
+
+/**
+ * How much rope is left, stated only when some has already been used.
+ *
+ * WHY THIS EXISTS, GIVEN THE REJECTION DELTA ALREADY SHIPS. `renderRejection` /
+ * `renderReplayBrief` tell a re-offered agent WHAT was wrong with its last
+ * submission. Neither tells it that the retrying is BOUNDED. Those are different
+ * facts and they drive different behaviour: the reasons make an agent revise,
+ * and revising is right up until the point where the blocker is not something
+ * revision can fix — at which point the agent needs to know that grinding out
+ * one more attempt is not free. Without a count, every attempt looks like the
+ * first one, so an agent has no reason to ever switch from retrying to asking,
+ * and the step burns its whole budget rediscovering the same blocker. The
+ * counter is the input to that decision and the packet has carried it all along.
+ *
+ * WHY IT DOES NOT NAME THE CAP. The cap is `maxAttempts` / `maxSchemaFailures`,
+ * resolved per-produce from the def (`model.ts`'s `effectiveMaxAttempts`), and
+ * the order packet does not carry it. Rendering a guessed number would be worse
+ * than rendering none: an agent told it has "2 of 5" left when it has 2 of 3
+ * will keep grinding. So this states the counts, which are true, and states that
+ * the budget is finite, which is also true, and states neither more precisely
+ * than the packet allows.
+ *
+ * WHY IT SEPARATES THE TWO COUNTERS. They mean opposite things to the agent. A
+ * judgment reject is a reader disagreeing with the CONTENT of a value that was
+ * otherwise well-formed. A schema reject is the engine refusing the SHAPE before
+ * anybody read it — rewriting the content again cannot help, and the fix is the
+ * structure of what was submitted. Reporting them as one number would send an
+ * agent to revise prose that was never read.
+ *
+ * Silent when every counter is zero or absent: a first attempt has no history,
+ * and "0 previous rejections" is a sentence that costs tokens to say nothing.
+ */
+function renderAttemptHistory(spec: BriefSpec): string {
+  const lines: string[] = [];
+  for (const owed of spec.owes ?? []) {
+    if (owed.path === '') continue;
+    const judgment = owed.judgmentRejects ?? 0;
+    const schema = owed.schemaRejects ?? 0;
+    if (judgment === 0 && schema === 0) continue;
+    const parts: string[] = [];
+    if (judgment > 0) {
+      parts.push(
+        `${judgment} rejected on judgment (a reader disagreed with the value — see its reason thread via \`get_order\`)`,
+      );
+    }
+    if (schema > 0) {
+      parts.push(
+        `${schema} rejected on schema (the value did not match the declared shape — the fix is the STRUCTURE of what you submit, not its wording)`,
+      );
+    }
+    lines.push(`- \`${owed.path}\`: ${parts.join('; ')}.`);
+  }
+  if (lines.length === 0) return '';
+  return [
+    'Attempt history for this order — previous submissions that were knocked back:',
+    ...lines,
+    'This retrying is bounded. After enough rejections on a path the engine stops re-arming this step entirely and it sits until a person intervenes, so a further attempt that repeats the last one costs a real attempt and gains nothing. If you now believe the blocker is something another attempt cannot fix, `ask` instead of resubmitting.',
+  ].join('\n');
 }
 
 /**
@@ -142,7 +282,7 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
  * `src/harness/` that names a vendor.
  */
 function renderSubmitContract(spec: BriefSpec): string {
-  const owed = (spec.owes ?? []).filter((p) => p !== '');
+  const owed = owedPaths(spec);
   // Nothing owed, nothing to say — the same stance the routing line takes on an
   // absent modifier. A contract with no path to name would have to write
   // `<path>` into its own example, which teaches the shape of the call while
@@ -195,7 +335,7 @@ function renderSubmitContract(spec: BriefSpec): string {
  * Vendor-neutral by construction — names owenloop's own tool and mount only.
  */
 function renderEscalationContract(spec: BriefSpec): string {
-  const owed = (spec.owes ?? []).filter((p) => p !== '');
+  const owed = owedPaths(spec);
   if (owed.length === 0) return '';
   return [
     `If you CANNOT produce what this order asks for, do not guess and do not end your turn silently — call the \`ask\` tool on the same \`owenloop\` MCP server and stop.`,
