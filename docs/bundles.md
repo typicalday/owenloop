@@ -263,6 +263,15 @@ command inherits the directory the operator was standing in when they ran
 `owenloop shift start`. Nothing is enforced today: a future release will
 require a step to declare that inheritance explicitly.
 
+`workdirFrom:` is how a run tells a command step *where* to work. Its stem may
+name a declared input, not only a consumed artifact, and that is the only
+channel a run-supplied value has into a command step: `consumes:` is refused for
+a human seed by the hard consumed-artifact gate above, and the `command:` string
+reaches `/bin/sh -c` as authored bytes with no interpolation. A command step
+that would otherwise be pinned to the one directory its shift was started in can
+therefore take a project root per run — see
+[authoring.md](authoring.md#workdirfrom--resolve-a-local-workdir-from-a-consumed-value-or-a-declared-input).
+
 **Where the fallback is recorded.** When it fires, `owenloop work exec` writes
 one warning per spawn naming the step, the workflow and run ids, and the
 resolved absolute path. That warning goes to the exec worker's own stderr.

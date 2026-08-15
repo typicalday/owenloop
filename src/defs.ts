@@ -795,8 +795,15 @@ export function buildDef(raw: unknown, source?: string, baseDir?: string): Workf
  * Prefix all names/stems in a StepDef with `${prefix}.`. Pure — returns a new StepDef.
  * Rewrites: step name, consume stems, produce stems, generates stems, invalidates, and
  * effect.onInvalidate step-name strings (but not 'pin'/'escalate').
+ *
+ * `defInputs` is the INCLUDED definition's declared input names, unprefixed. A
+ * `workdirFrom` stem may name one of those instead of one of the step's own
+ * consumes, and that stem is prefixed exactly like a consume stem is, because
+ * an unmapped child input is hoisted into the parent under `${prefix}.${name}`.
+ * Omitting the list would leave such a stem unparseable here and therefore
+ * silently unprefixed, pointing at a stem the expanded definition does not have.
  */
-function prefixStep(step: StepDef, prefix: string): StepDef {
+function prefixStep(step: StepDef, prefix: string, defInputs: readonly string[] = []): StepDef {
   const prefixStem = (stem: string): string => `${prefix}.${stem}`;
 
   const newConsumes = step.consumes.map((c) => {
@@ -841,11 +848,12 @@ function prefixStep(step: StepDef, prefix: string): StepDef {
   // workflow) — it must be prefixed to keep pointing at the (now-prefixed) produce.
   const newJudges = step.judges !== undefined ? prefixStem(step.judges) : undefined;
 
-  // workdirFrom names a local consumed stem followed by a dotted value path.
-  // Prefix only the stem; the value path is a field path inside the consumed value.
+  // workdirFrom names a local consumed stem or a declared input of the included
+  // definition, followed by a dotted value path. Prefix only the stem; the value
+  // path is a field path inside that artifact's value.
   let newWorkdirFrom = step.workdirFrom;
   if (step.workdirFrom !== undefined) {
-    const parsed = parseWorkdirFrom(step.workdirFrom, step.consumes);
+    const parsed = parseWorkdirFrom(step.workdirFrom, step.consumes, defInputs);
     if (parsed) newWorkdirFrom = `${prefixStem(parsed.stem)}.${parsed.path}`;
   }
 
@@ -927,7 +935,8 @@ export function expandIncludes(
       }
 
       // (e) prefix child steps
-      const prefixedSteps = child.steps.map((l) => prefixStep(l, inc.as));
+      const childInputList = child.inputs.map((inp) => inp.name);
+      const prefixedSteps = child.steps.map((l) => prefixStep(l, inc.as, childInputList));
 
       // (f) handle inputs: mapped inputs become internal edges; unmapped are hoisted
       const inputRewrites = new Map<string, string>(); // prefixed-stem -> outer artifact
@@ -943,6 +952,7 @@ export function expandIncludes(
       }
 
       // Apply input rewrites to prefixed steps
+      const prefixedChildInputStems = child.inputs.map((inp) => `${inc.as}.${inp.name}`);
       const rewrittenSteps = prefixedSteps.map((l) => {
         const rewrittenConsumes = l.consumes.map((c) => {
           const outer = inputRewrites.get(c.stem);
@@ -952,7 +962,18 @@ export function expandIncludes(
           }
           return c;
         });
-        return { ...l, consumes: rewrittenConsumes };
+        // A workdirFrom stem naming a MAPPED child input has to follow the same
+        // rewrite its consumes just took, or it would keep pointing at the
+        // child-local stem that this expansion just replaced. Split against the
+        // pre-rewrite consumes plus every prefixed child input, because the stem
+        // may be either and both are subject to the mapping.
+        let rewrittenWorkdirFrom = l.workdirFrom;
+        if (l.workdirFrom !== undefined) {
+          const parsed = parseWorkdirFrom(l.workdirFrom, l.consumes, prefixedChildInputStems);
+          const outer = parsed ? inputRewrites.get(parsed.stem) : undefined;
+          if (parsed && outer !== undefined) rewrittenWorkdirFrom = `${outer}.${parsed.path}`;
+        }
+        return { ...l, consumes: rewrittenConsumes, workdirFrom: rewrittenWorkdirFrom };
       });
 
       resultSteps.push(...rewrittenSteps);
@@ -1249,10 +1270,13 @@ export function validateDef(def: WorkflowDef): string[] {
     if (l.workdirFrom === undefined) continue;
 
     const raw = l.workdirFrom.trim();
-    const bareConsume = l.consumes.find((c) => c.stem === raw);
-    if (bareConsume) {
+    // A stem that is itself dotted (`a.b`) would otherwise split into `a` + `b`
+    // and report a confusing missing-stem error, so name the real mistake first:
+    // the expression is a bare artifact name with no value path after it.
+    const bareStem = l.consumes.some((c) => c.stem === raw) || inputNames.has(raw);
+    if (bareStem) {
       errors.push(
-        `step '${l.name}': workdirFrom must use '<consumedStem>.<dotted.path>' with a non-empty value path`,
+        `step '${l.name}': workdirFrom must use '<stem>.<dotted.path>' with a non-empty value path`,
       );
       continue;
     }
@@ -1260,20 +1284,36 @@ export function validateDef(def: WorkflowDef): string[] {
     const valuePath = firstDot >= 0 ? raw.slice(firstDot + 1) : '';
     if (firstDot <= 0 || valuePath.length === 0) {
       errors.push(
-        `step '${l.name}': workdirFrom must use '<consumedStem>.<dotted.path>' with a non-empty value path`,
+        `step '${l.name}': workdirFrom must use '<stem>.<dotted.path>' with a non-empty value path`,
       );
       continue;
     }
 
-    // Security boundary: a workdirFrom value becomes a filesystem path. The
-    // source stem must be a plain consumed artifact so its value has passed the
-    // engine's consume-side verification gate before a worker can cd into it.
-    const parsed = parseWorkdirFrom(raw, l.consumes);
+    // A workdirFrom value becomes a filesystem path, so the stem must name
+    // something this def actually declares: one of the step's own plain
+    // consumes, or one of the definition's declared inputs.
+    //
+    // The input form exists because a COMMAND step cannot consume a human seed
+    // at all — `exec/instructions.ts` gates command orders with `hardRule:
+    // true`, and `consumed-verifier.ts` refuses any consumed value lacking a
+    // producer signature, which a human-supplied input never has. Naming the
+    // input here routes it through `OrderPacket.workdir` instead, which is a
+    // spawn parameter rather than shell text or a consumed artifact.
+    //
+    // This deliberately relaxes an earlier rule that demanded a CONSUME, on the
+    // stated grounds that the value must pass the consume-side gate "before a
+    // worker can cd into it". That protection was not real: the engine resolves
+    // this expression itself and ships a plain string as `OrderPacket.workdir`,
+    // an explicitly "opaque location hint" that no proof covers and that the
+    // command worker uses unverified. See `paths.ts`'s parseWorkdirFrom header
+    // for the full argument, and note that the runtime bound on a worker's cwd
+    // is the operator's declared work roots, not this check.
+    const parsed = parseWorkdirFrom(raw, l.consumes, [...inputNames]);
     if (!parsed) {
       const stem = raw.slice(0, firstDot);
       errors.push(
-        `step '${l.name}': workdirFrom stem '${stem}' is not in consumes; ` +
-        'a step may only take its workdir from an artifact it consumes',
+        `step '${l.name}': workdirFrom stem '${stem}' is neither in consumes nor a declared input; ` +
+        "a step may only take its workdir from an artifact it consumes or from one of the definition's inputs",
       );
     } else if (parsed.mode !== 'plain') {
       errors.push(
