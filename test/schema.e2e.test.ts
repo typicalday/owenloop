@@ -238,3 +238,82 @@ test('schema e2e: the bundled `intake` example runs its documented walkthrough',
   assert.match(r.stderr, /input 'request' failed schema/);
   ow.cleanup();
 });
+
+test('schema e2e: the order tells a producer the shape it owes, before it produces anything', () => {
+  // The gap this closes. `schemaRejects` and the `validation` reasons already
+  // ride the order, so a producer learns AFTER the fact that its shape was
+  // wrong and how much of its refusal budget is gone — but never learns the
+  // shape. On the retry it holds exactly what it held the first time, so the
+  // cheapest failure in the system is also the one it is least equipped to
+  // avoid. These assertions pin that the requirement now travels with the debt.
+  const ow = harness();
+  const wf = ow('create', 'schemacheck', '--provide', `spec=${J({ goal: 'ship it' })}`).workflow;
+
+  // 1. SINGLETON — the schema governs the value submitted to the path itself.
+  const pl = claim(ow, wf, 'planner');
+  const planOwe = pl.owes.find((o: any) => o.path === 'plan');
+  assert.deepEqual(
+    planOwe.schema,
+    {
+      type: 'object',
+      required: ['steps'],
+      properties: { steps: { type: 'integer', minimum: 1 } },
+      additionalProperties: false,
+    },
+    'the planner is handed `plan`s declared schema verbatim, not a summary of it',
+  );
+  assert.equal(planOwe.schemaAppliesTo, 'value');
+  ow('green', wf, pl.run, 'plan', '--value', J({ steps: 3 }));
+  ow('close', wf, pl.run);
+
+  // 2. COLLECTION — the owed path is the SEAL, but the schema is enforced per
+  //    member on `emit`. Advertising it as a `value` constraint would tell the
+  //    gatherer to shape the seal like a source, which is the wrong thing.
+  const g = claim(ow, wf, 'gather');
+  const sourceOwe = g.owes.find((o: any) => o.path.startsWith('source'));
+  assert.ok(sourceOwe, `expected an owed source path, got: [${g.owes.map((o: any) => o.path).join(', ')}]`);
+  assert.deepEqual(sourceOwe.schema, {
+    type: 'object',
+    required: ['url'],
+    properties: { url: { type: 'string', minLength: 1 } },
+    additionalProperties: false,
+  });
+  assert.equal(sourceOwe.schemaAppliesTo, 'member');
+  ow('emit', wf, g.run, '--items', J([{ url: 'http://a' }]));
+  ow('seal', wf, g.run);
+  ow('close', wf, g.run);
+
+  // 3. NO SCHEMA — `report` declares none, so the engine accepts any JSON and
+  //    the order must stay silent. Absent, not null, and not an empty object:
+  //    an unconstrained output should carry no shape claim at all.
+  const s = claim(ow, wf, 'synth');
+  const reportOwe = s.owes.find((o: any) => o.path === 'report');
+  assert.equal(reportOwe.schema, undefined);
+  assert.equal(reportOwe.schemaAppliesTo, undefined);
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(reportOwe, 'schema'),
+    'an unconstrained output carries no `schema` key at all',
+  );
+  ow.cleanup();
+});
+
+test('schema e2e: the projected schema is the same one the engine then enforces', () => {
+  // The projection is a read of the definition for the producer's benefit and
+  // decides nothing, so its only real obligation is agreement: a value the
+  // advertised schema accepts must green, and one it rejects must be refused by
+  // the engine. A projection that drifted from the enforcement site would be
+  // worse than no projection, because the agent would trust it.
+  const ow = harness();
+  const wf = ow('create', 'schemacheck', '--provide', `spec=${J({ goal: 'ship it' })}`).workflow;
+  const pl = claim(ow, wf, 'planner');
+  const advertised = pl.owes.find((o: any) => o.path === 'plan').schema;
+
+  // `steps: 'three'` is a string where the advertised schema demands an integer.
+  const bad = ow.any('green', wf, pl.run, 'plan', '--value', J({ steps: 'three' }));
+  assert.equal(bad.outcome, 'schema-rejected', 'the advertised constraint is really enforced');
+  assert.equal(advertised.properties.steps.type, 'integer');
+
+  // And the shape the advertisement describes is accepted.
+  assert.equal(ow('green', wf, pl.run, 'plan', '--value', J({ steps: 3 })).outcome, 'green');
+  ow.cleanup();
+});

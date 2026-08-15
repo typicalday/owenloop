@@ -49,7 +49,12 @@ interface OrderOpts {
   /** Consumed input artifact values, keyed by path. */
   consumes?: Record<string, unknown>;
   /** Owed outputs, with their standing reject counts. */
-  owes?: Array<{ path: string; judgmentRejects?: number }>;
+  owes?: Array<{
+    path: string;
+    judgmentRejects?: number;
+    schema?: unknown;
+    schemaAppliesTo?: 'value' | 'member';
+  }>;
   /** Extension bag. */
   x?: Record<string, unknown>;
   /** The composed capabilities the engine offered this step under. */
@@ -87,6 +92,7 @@ function agentOrder(o: OrderOpts = {}): GetOrderResponse {
         judgmentRejects: w.judgmentRejects ?? 0,
         schemaRejects: 0,
         reasons: [],
+        ...(w.schema !== undefined ? { schema: w.schema, schemaAppliesTo: w.schemaAppliesTo } : {}),
       })),
     },
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
@@ -1063,4 +1069,61 @@ test('a plain Error and a ResumeUnavailableError take the SAME settle path — n
     assert.deepEqual(statuses(h.records), ['active', 'turn-ended', 'dead'], shape.label);
     assert.ok(verbs(calls).includes('release'), shape.label);
   }
+});
+
+// ---- the shape contract reaches the harness ---------------------------------
+
+test('a declared owed schema travels from the order packet into the rendered brief', () => {
+  // The renderer and the projection are each covered on their own; this pins
+  // the seam BETWEEN them. `briefOwes` is module-private and reshapes the
+  // packet's owes into the brief spec, so a field the engine projects and the
+  // renderer knows how to print still reaches nobody unless it is copied here.
+  // That omission is silent — nothing fails, the agent is just never told the
+  // shape, which is the exact defect this whole change exists to close.
+  const schema = { type: 'object', required: ['url'], properties: { url: { type: 'string' } } };
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({
+    getOrder: [agentOrder({ owes: [{ path: 'pr', schema, schemaAppliesTo: 'value' }] })],
+  });
+  const h = buildOpts({ hub, adapter });
+
+  return createAgentRunLoop(h.opts)
+    .run()
+    .then(() => {
+      const start = adapter.calls.find((c) => c.kind === 'start');
+      assert.ok(start && start.kind === 'start', 'the adapter was started');
+      assert.match(start.args.brief, /The value you submit to `pr` must satisfy this JSON Schema\./);
+      assert.ok(start.args.brief.includes(JSON.stringify(schema, null, 2)), 'the schema arrives whole');
+    });
+});
+
+test('a collection member schema keeps its `member` wording end to end', () => {
+  const schema = { type: 'object', required: ['url'] };
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({
+    getOrder: [agentOrder({ owes: [{ path: 'source[]', schema, schemaAppliesTo: 'member' }] })],
+  });
+  const h = buildOpts({ hub, adapter });
+
+  return createAgentRunLoop(h.opts)
+    .run()
+    .then(() => {
+      const start = adapter.calls.find((c) => c.kind === 'start');
+      assert.ok(start && start.kind === 'start');
+      assert.match(start.args.brief, /Each member you emit into `source\[\]` must satisfy this JSON Schema/);
+    });
+});
+
+test('an order whose owes declare no schema renders no shape claim', () => {
+  const adapter = createFakeAdapter();
+  const { hub } = mockHub({ getOrder: [agentOrder({ owes: [{ path: 'pr' }] })] });
+  const h = buildOpts({ hub, adapter });
+
+  return createAgentRunLoop(h.opts)
+    .run()
+    .then(() => {
+      const start = adapter.calls.find((c) => c.kind === 'start');
+      assert.ok(start && start.kind === 'start');
+      assert.ok(!/JSON Schema/.test(start.args.brief), 'silence, not a claim of being unconstrained');
+    });
 });

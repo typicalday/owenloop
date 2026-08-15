@@ -96,6 +96,15 @@
               }
             }
           },
+          "schema": {
+            "description": "The JSON Schema the engine will enforce on this owed path at commit time, copied verbatim off the owning produce entry. Absent when that produce declares none, which is the common case and means any JSON is accepted. A JSON Schema is either a keyword object or a bare boolean, so both forms are admitted here.",
+            "oneOf": [{ "type": "object" }, { "type": "boolean" }]
+          },
+          "schemaAppliesTo": {
+            "description": "What `schema` governs. Present exactly when `schema` is. `value` — the value submitted to this path (a singleton produce, or one element of a map produce). `member` — each member emitted into this collection, NOT the seal value the path names; a collection's owed path is its seal while its declared schema is checked per member on emit.",
+            "type": "string",
+            "enum": ["value", "member"]
+          },
           "proof": { "type": "string" }
         }
       }

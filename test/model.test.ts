@@ -9,12 +9,14 @@ import {
   stepMode,
   maintainDecisions,
   members,
+  owedSchema,
   pendingOwed,
   requiredInputs,
   settleInMemory,
   workflowStatus,
 } from '../src/model.ts';
 import { buildDef } from '../src/defs.ts';
+import { sealPath } from '../src/paths.ts';
 import { arts, def, input, step } from './helpers.ts';
 
 // The software-delivery wiring (§9), used across several tests.
@@ -798,4 +800,100 @@ test('per-produce maxSchemaFailures: 0 override disables the schema stall even w
     false,
     'consultRequest has an explicit maxSchemaFailures: 0 override — schema stall must stay disabled regardless of reject count',
   );
+});
+
+// ---------------------------------------------------------------------------
+// owedSchema — projecting a declared produce schema onto an OWED path.
+//
+// The invariant every test below is really asserting: what the order advertises
+// for a path must be the same schema the engine will actually enforce on the
+// value submitted to that path. `owedSchema` decides nothing; it only has to
+// mirror the three enforcement sites, so each test names the shape whose
+// enforcement it stands for.
+// ---------------------------------------------------------------------------
+
+const PR_SCHEMA = { type: 'object', required: ['url'], properties: { url: { type: 'string' } } };
+const SOURCE_SCHEMA = { type: 'object', required: ['title'] };
+const DOSSIER_SCHEMA = { type: 'object', required: ['findings'] };
+
+test('owedSchema: a singleton produce projects its schema, governing the submitted value', () => {
+  const s = step({ name: 'builder', consumes: ['plan'], produces: ['pr'] });
+  s.produces[0]!.schema = PR_SCHEMA;
+  assert.deepEqual(owedSchema(s, 'pr'), { schema: PR_SCHEMA, appliesTo: 'value' });
+});
+
+test('owedSchema: a collection produce projects its schema against MEMBERS, keyed by the seal path', () => {
+  const s = step({ name: 'gather', consumes: ['question'], produces: ['gather.source[]'] });
+  s.produces[0]!.schema = SOURCE_SCHEMA;
+  // The owed path for a collection is the SEAL, because that is what
+  // `plainOutputs` pushes and therefore what the firing owes. The declared
+  // schema is nonetheless checked per member on `emit`, never against the seal
+  // value — which is exactly why the projection carries a discriminator.
+  assert.deepEqual(owedSchema(s, sealPath('gather.source')), {
+    schema: SOURCE_SCHEMA,
+    appliesTo: 'member',
+  });
+  // The bare stem is not an owed path for a collection produce, and must not
+  // be mistaken for a singleton of the same name.
+  assert.equal(owedSchema(s, 'gather.source'), undefined);
+});
+
+test('owedSchema: a map produce projects its schema onto each element path, governing that element', () => {
+  const s = step({
+    name: 'research',
+    consumes: ['scope.target[$i]'],
+    produces: ['scope.target[$i].dossier'],
+  });
+  s.produces[0]!.schema = DOSSIER_SCHEMA;
+  assert.deepEqual(owedSchema(s, 'scope.target[0].dossier'), {
+    schema: DOSSIER_SCHEMA,
+    appliesTo: 'value',
+  });
+  assert.deepEqual(owedSchema(s, 'scope.target[7].dossier'), {
+    schema: DOSSIER_SCHEMA,
+    appliesTo: 'value',
+  });
+});
+
+test('owedSchema: a produce that declares no schema projects nothing', () => {
+  // The common case. The engine accepts any JSON here, so the order must say
+  // nothing rather than imply a constraint that does not exist.
+  const s = step({ name: 'builder', consumes: ['plan'], produces: ['pr', 'notes'] });
+  s.produces[0]!.schema = PR_SCHEMA;
+  assert.deepEqual(owedSchema(s, 'pr'), { schema: PR_SCHEMA, appliesTo: 'value' });
+  assert.equal(owedSchema(s, 'notes'), undefined);
+});
+
+test('owedSchema: a path this step does not produce projects nothing', () => {
+  const s = step({ name: 'builder', consumes: ['plan'], produces: ['pr'] });
+  s.produces[0]!.schema = PR_SCHEMA;
+  assert.equal(owedSchema(s, 'verdict'), undefined);
+  assert.equal(owedSchema(s, 'pr.child'), undefined);
+});
+
+test('owedSchema: a map produce and a same-named singleton stay distinct', () => {
+  // `scope.target[$i].dossier` and a singleton literally named `scope.target`
+  // can coexist; only the index token in the OWED path tells the two apart, so
+  // this pins that the map branch is tested before the singleton branch.
+  const s = step({
+    name: 'mixed',
+    consumes: ['brief'],
+    produces: ['scope.target[$i].dossier', 'summary'],
+  });
+  s.produces[0]!.schema = DOSSIER_SCHEMA;
+  s.produces[1]!.schema = PR_SCHEMA;
+  assert.deepEqual(owedSchema(s, 'scope.target[2].dossier'), {
+    schema: DOSSIER_SCHEMA,
+    appliesTo: 'value',
+  });
+  assert.deepEqual(owedSchema(s, 'summary'), { schema: PR_SCHEMA, appliesTo: 'value' });
+});
+
+test('owedSchema: a `false` schema projects, because `false` is a JSON Schema that rejects everything', () => {
+  // Guards the obvious implementation slip: testing truthiness instead of
+  // `=== undefined`. A produce declaring `schema: false` refuses every value,
+  // and an agent being told that up front is the entire point of the field.
+  const s = step({ name: 'builder', consumes: ['plan'], produces: ['pr'] });
+  s.produces[0]!.schema = false;
+  assert.deepEqual(owedSchema(s, 'pr'), { schema: false, appliesTo: 'value' });
 });

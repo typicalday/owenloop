@@ -358,6 +358,19 @@ export const ORDER_OWED_FIELDS = {
   judgmentRejects: 'required',
   schemaRejects: 'required',
   reasons: 'required',
+  // The declared JSON Schema for this owed path and what it governs, projected
+  // off the owning produce entry. Optional because most produces declare no
+  // schema, so every order emitted before this field existed still validates
+  // unchanged — and an order for an unconstrained output carries neither key
+  // rather than a null.
+  //
+  // These are DERIVED, not dynamic: both come from the definition, whose
+  // identity the order already pins in `defDigest`. Listing them here is about
+  // the wire shape being complete, not about adding anything the signature did
+  // not already cover — a tampered schema is a tampered def, and the digest is
+  // what catches that.
+  schema: 'optional',
+  schemaAppliesTo: 'optional',
   proof: 'optional',
 } as const satisfies FieldManifest<Order['owes'][number]>;
 

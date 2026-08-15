@@ -103,6 +103,18 @@ export interface OwedBrief {
   /** Engine refusals of a malformed value against the path's declared JSON
    *  Schema (`packet.owes[].schemaRejects`). */
   schemaRejects?: number;
+  /**
+   * The JSON Schema the engine will enforce on this path at commit time
+   * (`packet.owes[].schema`). Optional for the same reason the counters are: a
+   * hub that does not project it is not a hub reporting "no constraint", so the
+   * shape contract stays silent rather than telling an agent its output is
+   * unconstrained when it may not be.
+   */
+  schema?: unknown;
+  /** What `schema` governs (`packet.owes[].schemaAppliesTo`) — `'value'` for the
+   *  submitted value itself, `'member'` for each member emitted into a
+   *  collection. Read only when `schema` is present. */
+  schemaAppliesTo?: 'value' | 'member';
 }
 
 /** The composite order id — the only form the hub verbs accept. */
@@ -138,6 +150,7 @@ export function renderBrief(templateContent: string, spec: BriefSpec): string {
     renderRoutingLine(spec),
     renderInputContract(spec),
     renderSubmitContract(spec),
+    renderShapeContract(spec),
     renderAttemptHistory(spec),
     renderEscalationContract(spec),
     substituted,
@@ -292,6 +305,57 @@ function renderSubmitContract(spec: BriefSpec): string {
     `How this order completes: submit your result with the \`submit\` tool on the mounted \`owenloop\` MCP server. You owe ${owed.map((p) => `\`${p}\``).join(', ')} — call it once for each.`,
     `Example: \`submit({"path": "${owed[0]!}", "value": <the value this brief asks for>})\`.`,
     'Printing that value as text, or inside a code fence, does NOT submit it — the turn ends, the hub records nothing, and this order is re-offered from scratch. Wherever this brief says "green <path> with <value>", it means exactly this tool call.',
+  ].join('\n');
+}
+
+/**
+ * The SHAPE each owed value must have, stated before the agent produces one.
+ *
+ * WHY THIS EXISTS. The attempt history already tells a re-offered agent that its
+ * last submission failed its schema, and how many refusals remain before the
+ * step freezes. It never tells it the schema. So the agent on attempt two knows
+ * only that something about the shape was wrong, holds exactly the information
+ * it held on attempt one, and the most available move is to resubmit a near
+ * variant — which is how a step burns its whole `maxSchemaFailures` budget on
+ * one misunderstanding. The counter and the reasons are the symptom channel;
+ * this is the requirement channel, and only one of them was wired.
+ *
+ * A schema refusal is also the CHEAPEST failure to prevent and the most
+ * pointless to suffer: the engine rejects the value structurally, so no
+ * consumer and no judge ever sees it, no reviewer time is spent, and the agent
+ * learns nothing it could not have been told for free at dispatch.
+ *
+ * WHEN IT RENDERS. Only for owed paths whose produce actually declares a
+ * schema. Most do not, and for those the engine accepts any JSON — so silence
+ * here is correct, and a blanket "no schema declared" line would be worse than
+ * nothing: a hub too old to project the field looks identical to a produce with
+ * no schema, and only one of those two justifies telling an agent its output is
+ * unconstrained. Neither gets that claim.
+ *
+ * WHY IT PRINTS THE SCHEMA WHOLE. A truncated JSON Schema is not a smaller
+ * requirement, it is a different and wrong one — an agent that reads a clipped
+ * `required` array will confidently omit a field. If a schema is large, large
+ * is what the contract is.
+ *
+ * WHY `member` IS SPELLED OUT. A collection's owed path is its seal, but the
+ * declared schema is checked against each member emitted into it, never against
+ * the seal value. Printing the schema under the seal path without that sentence
+ * would tell the agent to shape the wrong thing.
+ */
+function renderShapeContract(spec: BriefSpec): string {
+  const constrained = (spec.owes ?? []).filter((o) => o.path !== '' && o.schema !== undefined);
+  if (constrained.length === 0) return '';
+  const blocks = constrained.map((o) => {
+    const governs =
+      o.schemaAppliesTo === 'member'
+        ? `Each member you emit into \`${o.path}\` must satisfy this JSON Schema — it is checked per member, NOT against the sealed collection itself.`
+        : `The value you submit to \`${o.path}\` must satisfy this JSON Schema.`;
+    return `${governs}\n\`\`\`json\n${JSON.stringify(o.schema, null, 2)}\n\`\`\``;
+  });
+  return [
+    'The shape of what you owe:',
+    ...blocks,
+    'The engine checks these at submit time, before any consumer or judge sees the value. A value that does not match is refused structurally — it is not reviewed, not partially accepted, and the refusal spends one of this order\'s limited schema attempts. Match the schema exactly rather than submitting something close and waiting to be told.',
   ].join('\n');
 }
 

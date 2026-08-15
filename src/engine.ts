@@ -26,6 +26,7 @@ import {
   isGreen,
   judgeNameOf,
   maintainDecisions,
+  owedSchema,
   pendingOwed,
   plainConsumes,
   rejectionEpisode,
@@ -1908,8 +1909,12 @@ export class Engine {
     const defDigest = this.instructionSource.digestOf(def);
     const owes = f.outputs.map((p) => {
       const a = arts.get(p);
+      const declared = owedSchema(step, p);
       return {
         path: p,
+        ...(declared !== undefined
+          ? { schema: declared.schema, schemaAppliesTo: declared.appliesTo }
+          : {}),
         // The TARGET version this claim's next successful producer commit will
         // land, not the currently-committed one: `green()` writes
         // `art.version + 1`, so that is the version a consumer will later see
