@@ -64,6 +64,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { acquireFileLockSync, releaseFileLock } from '../../../../src/lock.ts';
+import { defaultIsAlive, type Liveness } from '../shift/state.ts';
 
 /** Where a step attempt is in its life. */
 export type SessionStatus = 'active' | 'turn-ended' | 'submitted' | 'dead';
@@ -83,6 +84,14 @@ export interface SessionRecord {
   attempt: number;
   /** Adapter id (`HarnessSessionRef.harness`). */
   harness: string;
+  /** PID of the agent-run worker that owns the active session, when recorded. */
+  pid?: number;
+  /** Stable shift name in force when the worker was dispatched, when recorded. */
+  shiftName?: string;
+  /** Stable owner key; explicit shift names use the name, unnamed shifts use stateDir. */
+  shiftOwner?: string;
+  /** Per-boot shift incarnation that dispatched the worker, for diagnostics. */
+  shiftId?: string;
   /** Provider-native session token (`HarnessSessionRef.token`). Machine-local. */
   token: string;
   cwd: string;
@@ -115,6 +124,8 @@ export interface SessionStoreOptions {
    *  ("skipping corrupt record") or a parsed object that failed the schema
    *  ("skipping invalid record"). Default writes to stderr. */
   warn?: (line: string) => void;
+  /** Optional debug sink for conservative reconciliation skips. */
+  debug?: (line: string) => void;
   /** Test barrier invoked under the writer lock after a retirement snapshot. */
   afterWriterSnapshot?: () => void;
   /** Compaction threshold in bytes, checked after each append. Default 2 MB. */
@@ -562,8 +573,8 @@ export function markRunSessionsDead(
  * provider-side session is intact. A reboot does not invalidate one. Leaving
  * those rows alone is precisely what "resume still works after a reboot" means.
  *
- * So ONLY `active` rows are eligible, and only for runs absent from
- * `liveRunIds`.
+ * So ONLY `active` rows are eligible, and each candidate is checked against its
+ * recorded owner and worker PID before any retirement row is appended.
  *
  * ── WHY RETIRING AN ORPHANED `active` ROW IS THE RIGHT DIRECTION TO BE WRONG ──
  *
@@ -572,16 +583,33 @@ export function markRunSessionsDead(
  * would carry a model that believes work happened which did not. The cost of
  * retiring it is one cold replay. The cost of resuming it is silent divergence.
  *
- * ── KNOWN FALSE POSITIVE, STATED RATHER THAN ENGINEERED AROUND ───────────────
+ * ── WHY THE RUN-ID SET THIS REPLACED WAS UNSAFE ──────────────────────────────
  *
- * An `owenloop work agent-run` started BY HAND, outside the shift, has no child record
- * in the shift state dir, so a shift booting at that moment sees its `active` row
- * as orphaned and retires it. The cost is one cold replay on a hand-run debugging
- * session. Two things keep it small: the caller invokes this at BOOT only, which
- * narrows the window to an instant, and every retirement is returned so the
- * caller can log it with its `(workflow, run, step)`. Do NOT add a pid field to
- * `SessionRecord` to close this — the record is deliberately machine-portable
- * metadata, and the shift state dir is already the system of record for liveness.
+ * This used to take `liveRunIds` — the run ids with a live `agent-run` child in
+ * the BOOTING shift's state dir — and retire every `active` row outside it. That
+ * is correct only on a machine running exactly one shift. It does not: the
+ * sessions store is per-CACHE-DIR and therefore machine-wide, while a state dir
+ * is per-shift. So shift A booting saw shift B's currently-running workers as
+ * orphans and killed their resumable sessions out from under them, mid-turn.
+ * A prior version of this comment told the next reader NOT to put a pid on
+ * `SessionRecord`, on the grounds that the shift state dir was already the
+ * system of record for liveness. That was the mistaken premise: one shift's
+ * state dir is evidence about ONE shift, and this file is read by all of them.
+ *
+ * ── FAIL-SAFE OWNERSHIP AND LIVENESS ─────────────────────────────────────────
+ *
+ * Boot-time reconciliation is allowed to retire an `active` row only when the
+ * row names this shift, carries a valid worker PID, and that PID is provably
+ * gone. Missing or foreign ownership, an unknown PID, a live PID, and any
+ * liveness ambiguity all leave the row untouched. A stale row is cheaper than
+ * destroying a live resumable session, so the predicate intentionally errs in
+ * that direction.
+ *
+ * A CONSEQUENCE WORTH KNOWING: every row written before this landed has no
+ * `pid` and no owner, so none of them is ever retired. That is the fail-safe
+ * direction and it costs nothing — an un-retired stale row is one failed resume
+ * that falls back to a cold replay, which is what retiring it would have caused
+ * anyway.
  *
  * IDEMPOTENT: the rows it appends are `dead`, so a second call finds nothing
  * `active` left and appends nothing.
@@ -589,14 +617,81 @@ export function markRunSessionsDead(
  * FAILURE STANCE: `appendSession` propagates, and so does this — same as
  * `markRunSessionsDead`.
  *
- * @param liveRunIds run ids with a live `agent-run` child RIGHT NOW. A run in
- *   this set is skipped whatever its status.
+ * @param context the booting shift's ownership and harness identity plus the
+ *   injectable PID liveness probe.
  * @returns the records that were retired, as they were BEFORE retirement, so the
  *   caller can log what it took away.
  */
+export interface SessionReconcileContext {
+  /** Public shift name in force when this shift booted. */
+  shiftName: string;
+  /** Stable owner key; falls back to `shiftName` for older callers/records. */
+  shiftOwner?: string;
+  /** Configured harness guard, when this shift has one. */
+  harness?: string;
+  /** PID probe; defaults to the existing shift-state probe. */
+  isAlive?: Liveness;
+}
+
+export interface RetireDecision {
+  retire: boolean;
+  reason: string;
+}
+
+/**
+ * Decide whether one active session row is safe to retire.
+ *
+ * The function is deliberately independent of the JSONL writer. Callers can
+ * exercise the safety predicate with a deterministic PID probe, while the
+ * production path uses `process.kill(pid, 0)` through `defaultIsAlive`.
+ */
+export function shouldRetireSession(
+  record: SessionRecord,
+  context: SessionReconcileContext,
+): RetireDecision {
+  const recordOwner = record.shiftOwner ?? record.shiftName;
+  const contextOwner = context.shiftOwner ?? context.shiftName;
+  if (typeof recordOwner !== 'string' || recordOwner.trim() === '') {
+    return { retire: false, reason: 'session has no owning shift name' };
+  }
+  if (typeof contextOwner !== 'string' || contextOwner.trim() === '') {
+    return { retire: false, reason: 'booting shift has no stable owner key' };
+  }
+  if (recordOwner !== contextOwner) {
+    return {
+      retire: false,
+      reason: `session belongs to shift '${recordOwner}', not '${contextOwner}'`,
+    };
+  }
+  const pid = record.pid;
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
+    return { retire: false, reason: 'session has no valid worker pid' };
+  }
+
+  const isAlive = context.isAlive ?? defaultIsAlive;
+  let alive: boolean;
+  try {
+    alive = isAlive(pid);
+  } catch {
+    return { retire: false, reason: `worker pid ${String(pid)} liveness is unknown` };
+  }
+  if (alive) {
+    return { retire: false, reason: `worker pid ${String(pid)} is alive` };
+  }
+
+  if (context.harness !== undefined && context.harness !== '' && record.harness !== context.harness) {
+    return {
+      retire: false,
+      reason: `harness mismatch: session uses '${record.harness}', shift uses '${context.harness}'`,
+    };
+  }
+
+  return { retire: true, reason: `worker pid ${String(pid)} is confirmed dead` };
+}
+
 export function reconcileActiveSessions(
   file: string,
-  liveRunIds: ReadonlySet<string>,
+  context: SessionReconcileContext,
   now: number,
   opts: SessionStoreOptions = {},
 ): SessionRecord[] {
@@ -610,7 +705,19 @@ export function reconcileActiveSessions(
     const retired: SessionRecord[] = [];
     for (const rec of newest.values()) {
       if (rec.status !== 'active') continue; // a completed turn is still resumable
-      if (liveRunIds.has(rec.run)) continue; // its worker is alive; the row is true
+      const decision = shouldRetireSession(rec, context);
+      if (!decision.retire) {
+        opts.debug?.(
+          `owenloop work sessions: skipped orphan reconciliation for ${rec.workflow}/${rec.run} ` +
+            `step '${rec.step}': ${decision.reason}`,
+        );
+        if (decision.reason.startsWith('harness mismatch:')) {
+          (opts.warn ?? defaultWarn)(
+            `owenloop work sessions: refusing to retire ${rec.workflow}/${rec.run} step '${rec.step}': ${decision.reason}`,
+          );
+        }
+        continue;
+      }
       appendSessionUnlocked(file, { ...rec, status: 'dead', updatedAt: now }, opts);
       retired.push(rec);
     }

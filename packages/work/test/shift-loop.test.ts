@@ -1197,6 +1197,25 @@ test('buildSpawnPlan: agent-run carries --shift but never manufactures a --harne
   assert.equal(plan.args.includes('--harness'), false);
 });
 
+test('buildSpawnPlan carries the live shift ownership name in the agent child environment', () => {
+  const plan = buildSpawnPlan(
+    {
+      workflow: 'wf1',
+      run: 'run_zzzz',
+      kind: 'agent-run',
+      shiftName: 'shift-A',
+      shiftOwner: '/state/shift-a',
+    },
+    'https://hub.example',
+    'ci',
+    '/pkg/bin/owenloop.mjs',
+    '/usr/bin/node',
+  );
+
+  assert.equal(plan.options.env['OWENLOOP_SHIFT_NAME'], 'shift-A');
+  assert.equal(plan.options.env['OWENLOOP_SHIFT_OWNER'], '/state/shift-a');
+});
+
 // ---- the harness named on a failure event ------------------------------------
 //
 // The Shift does not CHOOSE the harness — the agent-run child does. These tests
