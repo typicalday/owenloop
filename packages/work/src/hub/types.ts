@@ -455,6 +455,99 @@ export interface AskResponse extends HubResponse {
   closed?: boolean;
 }
 
+// ---- tool approvals ---------------------------------------------------------
+
+/**
+ * The DETERMINISTIC TOOL-APPROVAL gate — the fine-grained sibling of `ask`, and
+ * deliberately not the same mechanism.
+ *
+ * `ask` is a worker declaring it cannot honestly build what it OWES: it freezes
+ * the artifact, CLOSES the run, and its answer reaches a FRESH worker. This is a
+ * worker mid-flight needing yes/no on ONE tool call: the session is alive and
+ * stays alive, the run does not close, no attempt is burnt, and the answer comes
+ * back to the very same blocked call.
+ *
+ * ONE VERB SERVES BOTH RAISE AND POLL. `toolUseId` is the harness's own id for
+ * the blocked call, so a repeat of this request is unambiguously the same
+ * question rather than a new one — the hub re-reads the existing row instead of
+ * opening a second. A worker therefore raises and polls with identical calls and
+ * never has to track whether it already asked.
+ *
+ * `step` is ABSENT for the same reason it is absent on `ask` and `reject`: the
+ * hub derives it from the claiming run's row, so a worker cannot raise an
+ * approval stamped to another step.
+ */
+export interface RequestApprovalRequest {
+  workflow: string;
+  run: string;
+  /** The harness's id for the blocked call. The approval's identity, with `run`. */
+  tool_use_id: string;
+  /** The tool the harness was about to invoke, e.g. `Bash`. */
+  tool_name: string;
+  /** The call's arguments. A non-string is JSON-stringified by the hub edge. */
+  tool_input: unknown;
+  /** Why the gatekeeper would not allow this on its own — written for a person. */
+  reason: string;
+  /** The harness's own one-line rendering of the prompt, when it supplies one. */
+  title?: string;
+}
+
+/** `pending` is the only state a worker waits on. An unrecognized stored state
+ *  reads as `expired` hub-side, never `pending`. */
+export type ApprovalState = 'pending' | 'approved' | 'denied' | 'expired';
+
+/** One approval as the hub reports it. */
+export interface ApprovalView {
+  workflow: string;
+  run: string;
+  toolUseId: string;
+  /** Derived hub-side from the claiming run — never what the caller said. */
+  step: string;
+  toolName: string;
+  reason: string;
+  title: string;
+  state: ApprovalState;
+  requestedAt: number;
+  decidedAt: number | null;
+  decidedBy: string | null;
+  note: string | null;
+}
+
+/**
+ * `ok: false` with `reason: 'not-held'` means the claim this approval belonged
+ * to is gone — the worker's lease ended while it waited. That is a REFUSAL, not
+ * a denial: nothing was written, and there is no longer anyone the answer could
+ * come back to.
+ */
+export interface RequestApprovalResponse extends HubResponse {
+  ok: boolean;
+  reason?: string;
+  approval?: ApprovalView;
+}
+
+/** The human half. Not called by a worker — an agent token is deliberately
+ *  refused this verb, because an agent that could answer its own approval could
+ *  approve every call it was just refused. */
+export interface AnswerApprovalRequest {
+  workflow: string;
+  run: string;
+  tool_use_id: string;
+  decision: 'approve' | 'deny';
+  note?: string;
+}
+
+export interface AnswerApprovalResponse extends HubResponse {
+  ok: boolean;
+  reason?: string;
+  approval?: ApprovalView;
+}
+
+/** Only approvals whose worker is STILL holding its lease — a question nobody
+ *  is waiting on is not shown, because answering it would do nothing. */
+export interface ListPendingApprovalsResponse extends HubResponse {
+  approvals: ApprovalView[];
+}
+
 // ---- whoami -----------------------------------------------------------------
 
 export interface WhoamiResponse extends HubResponse {

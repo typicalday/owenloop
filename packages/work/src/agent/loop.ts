@@ -60,6 +60,8 @@ import { existsSync } from 'node:fs';
 
 import { isWorkdirAllowed } from './workdir.ts';
 
+import { createApprovalRequester } from './approvals.ts';
+
 import { createLeaseLoop, type LeaseOutcome } from '../lease/loop.ts';
 import type { HubClient } from '../hub/client.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket, ResolutionPayload } from '../hub/types.ts';
@@ -815,6 +817,22 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
 
     const owenloopMcp = buildOwenloopMcp(spec);
+    /**
+     * The human approval channel for this session's escalated tool calls.
+     *
+     * Built HERE, not by an adapter, because only the worker knows which run the
+     * session is serving — and the run is what the hub stamps the approval to.
+     * Waiting inside a `canUseTool` callback is safe precisely because
+     * `lease.run()` below is started and never awaited: its heartbeat timer is
+     * independent of the harness process, so a blocked tool call cannot let this
+     * claim be reaped out from under the question.
+     */
+    const approvals = createApprovalRequester({
+      client: opts.hub,
+      workflow: opts.workflow,
+      run: opts.run,
+      onEvent: (e) => opts.out(`owenloop work agent-run: approval ${e.kind} — ${e.text}`),
+    });
     const resolvedModel =
       routing.kind === 'resolved'
         ? { model: routing.resolution.model, effort: routing.resolution.effort }
@@ -823,6 +841,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       cwd: recordCwd,
       owenloopMcp,
       permissions,
+      approvals,
       ...(resolvedModel ?? {}),
     };
     /** Built lazily: a cold start after a refused resume needs a FRESH one. */
@@ -838,6 +857,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       cwd: recordCwd,
       owenloopMcp,
       permissions,
+      approvals,
       ...(resolvedModel ?? {}),
     });
 

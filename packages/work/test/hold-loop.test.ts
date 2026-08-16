@@ -77,6 +77,11 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[] } {
     },
     async reject() { return { text: '', ok: true }; },
     async ask() { return { text: '', ok: true }; },
+    // The tool-approval gate is not exercised by these tests; a fake that never
+    // opens an approval, and a non-answer is a denial.
+    async requestApproval() { return { text: '', ok: false }; },
+    async answerApproval() { return { text: '', ok: false }; },
+    async listPendingApprovals() { return { text: '', approvals: [] }; },
     async reportResolution(req) {
       return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
     },

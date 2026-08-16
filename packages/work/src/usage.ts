@@ -15,6 +15,11 @@ Usage:
   owenloop work lint <workflow-name | path>   lint x.harness option bags in a def
   owenloop work sessions [--all] [--json]     list this machine's recorded harness
                                          sessions and how to re-open them
+  owenloop work approvals [--json]            every tool call a worker is blocked on
+                                         RIGHT NOW, waiting for a person
+  owenloop work approvals approve|deny <wf>/<run> <tool-use-id> [--note <text>]
+                                         answer one; the answer goes back to the
+                                         still-blocked call, not to a later attempt
   owenloop work release --session <id> [options]  drain a session's held claims
   owenloop work settings                      print the resolved settings file
   owenloop work join <code> [--hub <origin>] [--as <account>]

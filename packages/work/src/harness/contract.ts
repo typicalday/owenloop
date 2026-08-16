@@ -206,6 +206,56 @@ export interface PermissionIssue {
   message: string;
 }
 
+/**
+ * ONE escalated tool call, as the adapter hands it to the approval channel.
+ *
+ * `toolUseId` is the HARNESS's own id for the blocked call. It is the approval's
+ * identity, which is what makes a repeat of the same request the same question
+ * rather than a second one — an adapter that polls does so by re-sending an
+ * identical request.
+ */
+export interface ApprovalRequest {
+  toolUseId: string;
+  toolName: string;
+  /** The call's arguments, as the harness presented them. */
+  toolInput: unknown;
+  /** Why the gatekeeper would not allow the call on its own. Shown to a person. */
+  reason: string;
+  /** The harness's own one-line rendering of the prompt, when it has one. */
+  title?: string;
+  /** Aborts the wait when the harness gives up on the call (session teardown). */
+  signal?: AbortSignal;
+}
+
+/**
+ * What came back. `note` is the deciding person's own words, when they left any.
+ *
+ * THERE IS NO THIRD OUTCOME. A timeout, a hub error, a lease that ended while
+ * the worker waited — every one of them is `denied`, with a `reason` an adapter
+ * can put in front of the agent. The alternative would be an adapter that has to
+ * decide what "no answer" means at the moment it is least able to, and the
+ * failure mode of guessing wrong is a tool call that runs because nobody said
+ * no.
+ */
+export interface ApprovalOutcome {
+  decision: 'approved' | 'denied';
+  /** Why, when the decision was not a person's explicit yes. */
+  reason?: string;
+  note?: string;
+}
+
+/**
+ * The channel an adapter uses to ask a PERSON about one tool call and wait.
+ *
+ * Supplied by the worker, not built by an adapter: it is the worker that holds
+ * the hub client and knows which run this session is serving. An adapter that
+ * receives no requester keeps its pre-existing behavior — refuse the call and
+ * route the agent to `ask` — which is why this is optional rather than required.
+ * Nothing about the shape is vendor-specific; every harness that can intercept a
+ * tool call can use it.
+ */
+export type ApprovalRequester = (req: ApprovalRequest) => Promise<ApprovalOutcome>;
+
 /** Everything an adapter needs to launch one step agent. */
 export interface StartArgs {
   /** The fully rendered step prompt. */
@@ -245,6 +295,12 @@ export interface StartArgs {
   owenloopMcp: { command: string; args: string[] };
   /** Normalized from the step def by `normalizeStepPermissions`. */
   permissions: StepPermissions;
+  /**
+   * The human approval channel for escalated tool calls, when this deployment
+   * has one. ABSENT means the adapter's existing refuse-and-route-to-`ask`
+   * behavior stands — that is a supported deployment, not a degraded one.
+   */
+  approvals?: ApprovalRequester;
 }
 
 /**
@@ -274,7 +330,7 @@ export interface StartArgs {
  * miss.
  */
 export type DeliverArgs = Pick<StartArgs, 'cwd' | 'owenloopMcp' | 'permissions'> &
-  Pick<StartArgs, 'model' | 'effort'>;
+  Pick<StartArgs, 'model' | 'effort' | 'approvals'>;
 
 /**
  * One harness implementation.
