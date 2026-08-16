@@ -39,12 +39,24 @@ import {
   type ShiftEvent,
   type ShiftEventBody,
 } from '../src/shift/protocol.ts';
+import { stripAmbientOwenloopEnv } from './helpers/ambient-env.ts';
 
 let root: string;
+let restoreEnv: () => void;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'owenloop-shift-logs-'));
+  // `buildSpawnPlan` builds the child environment as `{...process.env, ...}`, so
+  // the plan this file asserts on is a function of the AMBIENT environment. Under
+  // an owenloop shift the parent process already carries OWENLOOP_* variables the
+  // operator never typed — OWENLOOP_ALLOWED_WORKDIR_ROOTS among them — and the
+  // "sets NO variable" assertions below would read the operator's value and fail.
+  // CI never sees that, because a clean runner has the namespace unset.
+  restoreEnv = stripAmbientOwenloopEnv();
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => {
+  restoreEnv();
+  rmSync(root, { recursive: true, force: true });
+});
 
 function ev(body: ShiftEventBody): ShiftEvent {
   return stampShiftEvent(body, { name: 'box', id: 'shf_test' }, 1_700_000_000_000);

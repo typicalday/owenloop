@@ -31,6 +31,7 @@ import { readChildRecords } from '../src/shift/state.ts';
 import { logOwnersDir, registerShiftLogOwner, runLogFile, shiftLogFile } from '../src/shift/logretention.ts';
 import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
 import { startMockHub, until } from './helpers/mcp-stdio-client.ts';
+import { strippedOwenloopEnv } from './helpers/ambient-env.ts';
 
 const BIN = fileURLToPath(new URL('../../../bin/owenloop.mjs', import.meta.url));
 const TOKEN = 'tok-shift-logs-acceptance';
@@ -142,17 +143,17 @@ afterEach(async () => {
 
 function env(): Record<string, string | undefined> {
   return {
+    // `runCli` spreads process.env into the child, so every ambient OWENLOOP_*
+    // variable reaches the CLI under test unless this object overrides it. Deny
+    // the namespace first, then set back what the fixture wants — the miss that
+    // bit was OWENLOOP_CONFIG_DIR, which sits ABOVE $XDG_CONFIG_HOME/owenloop in
+    // the config-dir ladder (`configDir` in src/hub.ts) and so outranks the
+    // XDG_CONFIG_HOME below. Every owenloop shift exports a slice of the
+    // namespace, so a miss is red on an agent-driven build and green in CI.
+    ...strippedOwenloopEnv(),
     HOME: home,
     OWENLOOP_TOKEN: TOKEN,
     XDG_CONFIG_HOME: configDir,
-    // `runCli` spreads process.env into the child, and the config-dir ladder is
-    // OWENLOOP_CONFIG_DIR > $XDG_CONFIG_HOME/owenloop > $HOME/.config/owenloop
-    // (`configDir` in src/hub.ts) — so an ambient OWENLOOP_CONFIG_DIR OUTRANKS
-    // the XDG_CONFIG_HOME above and the child reads the developer's REAL config
-    // dir. `undefined` makes Node drop the key from the child env entirely.
-    // Every owenloop shift exports it, so the suite is red on an agent-driven
-    // build and green in CI, where the variable is unset.
-    OWENLOOP_CONFIG_DIR: undefined,
     NODE_NO_WARNINGS: '1',
   };
 }
