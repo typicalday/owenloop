@@ -214,6 +214,27 @@ test('an adapter with no resumeCommand renders a dash; one that throws does too'
   }
 });
 
+test('a record with no session token renders a dash, not a command that cannot work', () => {
+  // The fourth reason there is no resume command, and the newest one: the worker
+  // writes a record BEFORE the harness emits `started`, so a launch that died
+  // leaves a row with an empty token. That row is valid and is listed — but
+  // handing its empty token to an adapter would print a paste-ready command that
+  // resumes nothing, which is worse for an operator than printing nothing.
+  const willing = fakeAdapter('fake-willing', {
+    resumeCommand: (ref: HarnessSessionRef) => ({ command: 'cli', args: ['resume', ref.token] }),
+  });
+  register(willing);
+  try {
+    const row = rec({ run: 'r', step: 's', status: 'active', harness: 'fake-willing' });
+    assert.equal(resumeCommandFor({ ...row, token: '' }), undefined);
+    // The same adapter and the same row DO produce one once a token exists, so
+    // the dash above is the token's doing and not a broken fixture.
+    assert.equal(resumeCommandFor({ ...row, token: 'tok-1' }), 'cli resume tok-1');
+  } finally {
+    unregister('fake-willing');
+  }
+});
+
 test('the resume command is shell-quoted so an operator can paste it', () => {
   const spaced = fakeAdapter('fake-spaced', {
     resumeCommand: (ref: HarnessSessionRef) => ({

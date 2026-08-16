@@ -106,14 +106,20 @@ function shellQuote(s: string): string {
 /**
  * The resume command for one record, or `undefined` when there is none.
  *
- * Three separate reasons there may be none, all rendered the same way in the
- * table because the operator's next move is identical in each: the record names
+ * Four separate reasons there may be none, all rendered the same way in the
+ * table because the operator's next move is identical in each: the record
+ * carries no session token, so there is nothing to resume INTO; the record names
  * a harness this build does not register (an old row after an adapter was
  * removed); the adapter registers but implements no interactive resume; or the
  * adapter threw. The throw is caught rather than propagated because this is a
  * LISTING — one bad row must not take down the other rows with it.
  */
 export function resumeCommandFor(rec: SessionRecord): string | undefined {
+  // An empty token is a real, readable record: the worker writes one before the
+  // harness emits `started`, so a launch that died still leaves proof it existed.
+  // Handing that empty string to `resumeCommand` would print a command that
+  // cannot work, which is worse than printing nothing.
+  if (rec.token === '') return undefined;
   const adapter = adapterFor(rec.harness);
   if (adapter?.resumeCommand === undefined) return undefined;
   try {

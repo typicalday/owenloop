@@ -76,7 +76,12 @@ import type {
 } from '../harness/contract.ts';
 import { isResumeUnavailable } from '../harness/contract.ts';
 import { preflightStepPermissions } from '../harness/permissions.ts';
-import { orderId, type SessionRecord, type SessionStatus } from '../harness/session-store.ts';
+import {
+  orderId,
+  type SessionRecord,
+  type SessionStatus,
+  type SessionTaskRef,
+} from '../harness/session-store.ts';
 import {
   buildOwenloopMcp,
   renderBrief,
@@ -189,12 +194,17 @@ export interface AgentRunLoopOptions {
   consumedVerifier?: ConsumedVerifier;
   /** Append one session record. Wired to `appendSession` by the role. */
   appendSession: (rec: SessionRecord) => void;
-  /** The attempt number for this `(workflow, run, step)`. Wired to `latestFor`. */
-  nextAttempt: (workflow: string, run: string, step: string) => number;
   /**
-   * PHASE 4 — the last session record for this `(workflow, run, step)`, or `null`
-   * when the step has never run here. Wired to `latestFor(sessionsFile, ...)` by
-   * the role, the same reader `nextAttempt` already uses.
+   * The attempt number for this engine TASK — `(workflow, step, key)`, not
+   * `(workflow, run, step)`. Wired to `latestForTask`. Keyed on the task because
+   * the hub re-mints `run` on every firing: keyed on the run this could only ever
+   * return 1, and it did, for every firing this machine has ever executed.
+   */
+  nextAttempt: (task: SessionTaskRef) => number;
+  /**
+   * PHASE 4 — the last session record for this engine TASK, or `null` when the
+   * task has never run here. Wired to `latestForTask(sessionsFile, ...)` by the
+   * role, the same reader `nextAttempt` already uses.
    *
    * It is what makes a resume possible at all: the prior `token` to resume, the
    * `harness` that minted it, the `cwd` it is scoped to, and the
@@ -202,7 +212,7 @@ export interface AgentRunLoopOptions {
    * heard. Absent (or returning `null`) ⇒ every firing is a cold start, which is
    * exactly the pre-Phase-4 behaviour.
    */
-  latestSession?: (workflow: string, run: string, step: string) => SessionRecord | null;
+  latestSession?: (task: SessionTaskRef) => SessionRecord | null;
   /**
    * Does this directory still exist? Injected for the same reason every other
    * side effect here is: a unit test drives the "the work dir was reaped, so the
@@ -389,6 +399,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
   let sessionRef: HarnessSessionRef | undefined;
   let adapterId = '';
   let stepName = '';
+  /** `OrderPacket.key`, set beside `stepName` when the packet arrives. Typed
+   *  `undefined`-until-known rather than defaulted to `''`, because `''` is the
+   *  REAL key of an unfanned step and must not double as "not known yet". */
+  let stepKey: string | undefined;
   let attempt = 1;
   let createdAt = 0;
   let recordCwd = opts.cwd;
@@ -435,6 +449,12 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       workflow,
       run: runId,
       step: stepName,
+      // Written whenever the packet is known — which, given the guard above, is
+      // always. The conditional spread exists so the field is OMITTED rather
+      // than forged if that ever stops being true: an absent `key` means "cannot
+      // be attributed to a task" and costs a cold start, while a wrong `key`
+      // would hand a worker another task's session.
+      ...(stepKey !== undefined ? { key: stepKey } : {}),
       order,
       attempt,
       harness: sessionRef?.harness ?? adapterId,
@@ -625,6 +645,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     }
 
     stepName = packet.step;
+    stepKey = packet.key;
     recordCwd = packet.workdir ?? opts.cwd;
 
     // MACHINE POLICY. The operator who started this shift named the directories
@@ -685,7 +706,12 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
      *  stays `HarnessAdapter | undefined` for `teardown`/`stop`. */
     const active: HarnessAdapter = resolution.adapter;
 
-    attempt = opts.nextAttempt(workflow, runId, packet.step);
+    /** This firing's engine task. Built once, from the packet, and used for both
+     *  the attempt count and the Phase 4 resume lookup so the two can never
+     *  disagree about which history they are reading. */
+    const task: SessionTaskRef = { workflow, step: packet.step, key: packet.key };
+
+    attempt = opts.nextAttempt(task);
 
     const spec: BriefSpec = {
       workflow,
@@ -766,7 +792,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     // resume preconditions. `renderRejection` reads `packet.owes[].reasons`
     // filtered to `at > prev.deliveredReasonAt` — the packet's `owes` IS the set
     // of paths being re-armed, so no extra path filter is needed here.
-    const prev = opts.latestSession?.(workflow, runId, packet.step) ?? null;
+    const prev = opts.latestSession?.(task) ?? null;
     const dirExists = opts.dirExists ?? existsSync;
     const delta = renderRejection({
       packet,
@@ -787,6 +813,14 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     //   dirExists(prev.cwd)            a reaped work dir invalidates the session
     //   delta.message !== ''           nothing new to say — a resume that says
     //                                  nothing spends a turn communicating nothing
+    //
+    // ON `prev.cwd === recordCwd` NOW THAT `prev` CAN ACTUALLY BE FOUND. An order
+    // carrying an explicit `packet.workdir` names the same directory on every
+    // firing, so this passes and the resume happens. An order with no `workdir`
+    // falls back to `<workRoot>/<workflow>/<run>` (see `agent/workdir.ts`), which
+    // moves with the run id — so this declines and the firing starts cold. That
+    // is the guard doing its job, not a leftover: the previous session's files
+    // genuinely are in a directory this firing is not working in.
     const resumable =
       prev !== null &&
       prev.token !== '' &&
