@@ -388,8 +388,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
   }
 
   /**
-   * Relay the child's own output to this process's stderr when the command did
-   * not succeed.
+   * Relay the child's own output unconditionally: to this process's stdout
+   * when the command succeeds, and stderr otherwise.
    *
    * ## Why this exists
    *
@@ -408,25 +408,47 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
    * schema-rejected — with no trace of what the child said. Reproducing the
    * script by hand outside the engine was the only way to see its stderr.
    *
-   * `outputTail` is already capped at 4 KiB by the runner, so this cannot flood
-   * a log. Each line is prefixed so the child's words are never mistaken for
-   * exec's own.
+   * The success half matters because a non-judge command step has no exit-code
+   * failure channel: a deferral is expressed as exit 0 and no payload.
+   * `merge-gate` does exactly that on its `cadence: 2m` re-offer. Before this
+   * relay, every deferral produced three identical log lines and no reason; the
+   * measured 40-minute case is recorded in `src/config-dir.ts:19-26`.
+   *
+   * Silence is printed rather than skipped because "this gate printed nothing"
+   * is itself the diagnosis, and an absent line is indistinguishable from the
+   * bug this relay fixes.
+   *
+   * `outputTail` is capped at 4 KiB by the runner (`runner.ts:40`), and a
+   * delivery run has roughly eleven command steps, so the worst case is about
+   * 44 KiB per run. That cap is why no volume knob exists: a knob would let a
+   * machine silently reintroduce this exact bug. Each line is prefixed so the
+   * child's words are never mistaken for exec's own.
    */
   function relayChildOutput(result: CommandResult, step: string): void {
-    if (result.exitCode === 0 && result.error === undefined) return;
-    const how =
-      result.error !== undefined
-        ? `could not be run (${result.error})`
-        : result.signal !== undefined
-          ? `was killed by ${result.signal}`
-          : `exited ${result.exitCode}`;
-    opts.err(`owenloop work exec: the command for step '${step}' ${how}; its last output follows`);
+    const succeeded = result.exitCode === 0 && result.error === undefined;
+    // TWO CHANNELS ON PURPOSE, and this is not tidiness to be refactored away.
+    // `opts.err` is the channel a reader treats as trouble; routing a green
+    // step's routine output there would make every successful step look like a
+    // problem. A successful command's output is a RECORD, a failed one's is a
+    // DIAGNOSIS. Do not unify them.
+    const write = succeeded ? opts.out : opts.err;
+    if (succeeded) {
+      write(`owenloop work exec: the command for step '${step}' succeeded; its output follows`);
+    } else {
+      const how =
+        result.error !== undefined
+          ? `could not be run (${result.error})`
+          : result.signal !== undefined
+            ? `was killed by ${result.signal}`
+            : `exited ${result.exitCode}`;
+      write(`owenloop work exec: the command for step '${step}' ${how}; its last output follows`);
+    }
     const tail = result.outputTail.replace(/\n+$/, '');
     if (tail === '') {
-      opts.err('  (the command produced no output)');
+      write('  (the command produced no output)');
       return;
     }
-    for (const line of tail.split('\n')) opts.err(`  | ${line}`);
+    for (const line of tail.split('\n')) write(`  | ${line}`);
   }
 
   /** Build the receipt and submit it to every owed path. */

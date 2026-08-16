@@ -292,7 +292,9 @@ shift. See [`docs/shift-logs.md`](shift-logs.md) for the directory layout,
 
 The receipt still does not carry the warning, and that is by design rather than
 a gap: the receipt captures the **command's** streams, and this warning is the
-**exec worker's** own. One destination each, no duplication.
+**exec worker's** own. The reverse is not symmetric: the worker also relays the
+command's captured tail into its own output, so a command's last 4 KiB appears
+in both the receipt and `<run>.log`. See [docs/shift-logs.md](shift-logs.md).
 
 Two consequences worth stating separately:
 

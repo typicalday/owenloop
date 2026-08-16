@@ -27,13 +27,29 @@ Do not collapse these — the rest of this page depends on telling them apart.
    stderr are what `<run>.log` holds.
 3. **The command a worker runs** — the `command:` text of a command step,
    executed by the worker under `/bin/sh -c`. **Its** streams are captured into
-   the receipt the worker submits to the hub. They are **not** in `<run>.log`.
+   the receipt the worker submits to the hub, and the worker relays the captured
+   tail (≤4 KiB) into its own output so a copy reaches `<run>.log`.
 
-So a `<run>.log` holds the worker's own diagnostics — "holding this order",
-"running this step", the `workdir` fallback warning, a crash stack — and not the
-command's output. One destination each, no duplication. `packages/work/test/
-shift-logs-acceptance.test.ts` asserts both halves, the presence and the
-absence.
+The worker never **inherits** the command's streams. Every relayed line carries
+the literal `  | ` prefix. Both the receipt and `<run>.log` contain the
+captured tail; full streams are represented only by the receipt's output hash
+and stdout/stderr byte counts.
+
+| Command outcome | Worker channel | Header |
+| --- | --- | --- |
+| exit 0 and no machinery error | stdout | `… the command for step 'X' succeeded; its output follows` |
+| anything else | stderr | `… the command for step 'X' exited N` / `was killed by …` / `could not be run (…)`; `its last output follows` |
+
+Under shift dispatch fd 1 and fd 2 both point at the same file, so the header —
+not the channel — is what tells these outcomes apart in `<run>.log`. The two
+channels still matter: stderr is what a reader treats as trouble, and routine
+success output there would make every green step look like a problem.
+
+A command that printed nothing gets `  (the command produced no output)` on both
+paths, because a gate that prints nothing is itself a diagnosis. The relay is
+unconditional and has no off switch.
+`packages/work/test/shift-logs-acceptance.test.ts` asserts that the marker
+appears in `<run>.log` exactly once, as `  | <marker>`.
 
 ## Where the directory is
 
