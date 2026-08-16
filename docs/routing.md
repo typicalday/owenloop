@@ -53,12 +53,13 @@ wrong:
 2. **A capability never names a machine.** Nothing in the definition or the hub
    knows what hardware or CLI exists.
 3. **Certifying a crew is a promise about every member.** Binding `build:deep`
-   to the crew `wise` says: *every shift that serves the wise crew can do deep
-   build work.* If one member cannot, the binding is wrong.
+   to the crew `openai` says: *every shift that serves the openai crew can do
+   deep build work.* If one member cannot, the binding is wrong.
 4. **The mapping is many-to-many, both directions.** One capability can be
    bound to several crews. One crew can be bound to several capabilities. One
-   shift can serve several crews (`owenloop shift start build wise` takes a
-   list).
+   shift can serve several crews (`owenloop shift start anthropic openai`
+   takes a list). On the staging hub every shift serves exactly one crew, so
+   this shows the shape of the argument rather than a shift that exists today.
 
 ---
 
@@ -111,6 +112,8 @@ steps:
     capabilities: [wise]
   - name: builder
     capabilities: [build]
+  - name: reviewer
+    capabilities: [review]
   - name: provisioner
     capabilities: [utility]
 ```
@@ -122,45 +125,108 @@ This file names jobs. It names no models, no crews, no machines.
 A table inside the hub, one row per `(capability string, crew)` pair. Written
 with `owenloop capability bind <capability> <crew>`.
 
-The staging hub's current rows:
+The staging hub's current rows are exactly these sixteen:
 
 | capability | crew |
 |---|---|
-| `build` | build |
-| `build:standard` | build |
-| `build:deep` | **wise** |
-| `wise` | wise |
-| `wise:standard` | wise |
-| `utility` | utility |
-| `utility:standard` | utility |
+| `wise` | `anthropic` |
+| `wise:express` | `anthropic` |
+| `wise:standard` | `anthropic` |
+| `wise:deep` | `anthropic` |
+| `build` | `openai` |
+| `build:express` | `openai` |
+| `build:standard` | `openai` |
+| `build:deep` | `openai` |
+| `review` | `openai` |
+| `review:express` | `openai` |
+| `review:standard` | `openai` |
+| `review:deep` | `openai` |
+| `utility` | `openai` |
+| `utility:express` | `openai` |
+| `utility:standard` | `openai` |
+| `utility:deep` | `openai` |
 
-Note row 3. `build:deep` is certified to the **wise** crew, not the build crew.
-That is deliberate and it is the whole point of the design: the build crew runs
-on OpenAI models and the operator wants deep build work on an Anthropic model
-instead. The *job* is still a build job. Only the *team* is different.
+The live table gives the `anthropic` crew one job family and its modifiers:
+the four `wise` strings. It gives the `openai` crew three job families and
+their modifiers: `build`, `review`, and `utility`. A crew name says which
+team; a capability says which job. Nothing in `anthropic` or `openai` tells
+you what job it does, and that is correct — the crew name is not supposed to.
+
+A capability can still be certified to a crew whose name has nothing to do with
+the job. If an operator wanted deep build work on Anthropic models, the
+operator would run:
+
+```bash
+owenloop capability bind build:deep anthropic
+owenloop capability unbind build:deep openai
+```
+
+The *job* is still a build job. Only the *team* changes.
+
+These are two commands, not one. `capability bind` on an already-bound
+capability **adds** a crew; it never replaces one. With only the bind,
+`build:deep` would be certified to both `openai` and `anthropic`, and
+which crew's shift claims a given order would be a race. The unbind is what
+makes it a move. This is verified by `src/cli.ts:5079` and independently by
+`docs/authoring.md:254`.
+
+That hypothetical move also needs a rate-card change. The `anthropic` shift's
+rate card carries only the four `wise` rows, so after the rebind it would find
+no row for `build:deep`, refuse the order with `unresolvable-capability`,
+and the hub would re-offer it. The operator must add a `build:deep` row to
+the `anthropic` card as part of the same move.
 
 ### 3c. The shift's `settings.json` — "what do I run it on?"
 
-A file on the machine where the shift runs, e.g.
-`~/.config/owenloop-shifts/wise/owenloop/settings.json`:
+A file on the machine where the `anthropic` shift runs:
+`~/.config/owenloop-shifts/anthropic/owenloop/settings.json`
 
 ```json
 {
   "hubOrigin": "https://api.stg.owenloop.com",
   "capabilityModels": {
+    "wise":          { "model": "claude-opus-5",  "effort": "xhigh" },
     "wise:express":  { "model": "claude-opus-5",  "effort": "high"  },
     "wise:standard": { "model": "claude-opus-5",  "effort": "xhigh" },
-    "wise:deep":     { "model": "claude-fable-5", "effort": "xhigh" },
-    "wise":          { "model": "claude-opus-5",  "effort": "xhigh" },
-    "build:deep":    { "model": "claude-opus-5",  "effort": "xhigh" }
+    "wise:deep":     { "model": "claude-fable-5", "effort": "xhigh" }
   }
 }
 ```
 
-This is the **rate card**. It is the only place a model name appears anywhere in
-the routing path. It is local to one machine and one operator, which is the
-point — the person who owns the hardware and the API keys decides what runs
-there.
+This card has exactly four rows: the four `wise` strings that the table above
+certifies to the `anthropic` crew.
+
+The `openai` shifts use this file:
+`~/.config/owenloop-shifts/openai/owenloop/settings.json`
+
+```json
+{
+  "hubOrigin": "https://api.stg.owenloop.com",
+  "capabilityModels": {
+    "build":            { "model": "gpt-5.6-terra", "effort": "xhigh" },
+    "build:express":    { "model": "gpt-5.6-terra", "effort": "xhigh" },
+    "build:standard":   { "model": "gpt-5.6-terra", "effort": "xhigh" },
+    "build:deep":       { "model": "gpt-5.6-terra", "effort": "xhigh" },
+    "review":           { "model": "gpt-5.6-sol",   "effort": "xhigh" },
+    "review:express":   { "model": "gpt-5.6-sol",   "effort": "xhigh" },
+    "review:standard":  { "model": "gpt-5.6-sol",   "effort": "xhigh" },
+    "review:deep":      { "model": "gpt-5.6-sol",   "effort": "xhigh" },
+    "utility":          { "model": "gpt-5.6-luna",  "effort": "high"  },
+    "utility:express":  { "model": "gpt-5.6-luna",  "effort": "high"  },
+    "utility:standard": { "model": "gpt-5.6-luna",  "effort": "high"  },
+    "utility:deep":     { "model": "gpt-5.6-luna",  "effort": "high"  }
+  }
+}
+```
+
+This card has twelve rows, matching the twelve capabilities the table certifies
+to the `openai` crew. Both openai shifts carry it byte-identically; section 7
+explains why that identity is mandatory rather than tidy.
+
+These are the **rate cards**. They are the only place a model name appears
+anywhere in the routing path. Each is local to one machine and one operator,
+which is the point — the person who owns the hardware and the API keys decides
+what runs there.
 
 ---
 
@@ -172,20 +238,24 @@ mean five different things, and they are routinely confused with each other.
 ```
 env OWENLOOP_CONFIG_DIR=~/.config/owenloop-shifts/openai/owenloop \
     OWENLOOP_HARNESS=codex \
-  owenloop shift start build \
+  owenloop shift start openai \
     --origin https://api.stg.owenloop.com \
-    --as shift-build \
-    --name openai \
-    --state-dir ~/.local/state/owenloop-shifts/openai
+    --as shift-openai-1 \
+    --name openai-1 \
+    --state-dir ~/.local/state/owenloop-shifts/openai-1
 ```
 
 | Name | What it selects | In the example |
 |---|---|---|
 | **CONFIG_DIR** | which `settings.json` — i.e. which rate card | `.../openai/owenloop` |
-| **crew** (positional) | which crew's jobs this shift serves | `build` |
-| **`--as`** | which stored credential to authenticate with | `shift-build` |
-| **`--name`** | a display label for this shift | `openai` |
+| **crew** (positional) | which crew's jobs this shift serves | `openai` |
+| **`--as`** | which stored credential to authenticate with | `shift-openai-1` |
+| **`--name`** | a display label for this shift | `openai-1` |
 | **`OWENLOOP_HARNESS`** | which CLI actually drives the model | `codex` |
+
+The crew (`openai`) is what the hub routes on; the display name
+(`openai-1`) is a label for a human reading a shift list. They are different
+fields and they are allowed to look alike.
 
 **The harness is set only by the environment variable.** It is not in the
 definition, not in the hub, not derived from the model name. `codex` drives the
@@ -216,19 +286,28 @@ updates it.
 
 **Step 2 — a shift asks for work.**
 
-The wise shift calls the hub verb `whats_next`, authenticating as account
-`shift-wise`.
+The `openai-1` shift calls the hub verb `whats_next`, authenticating as
+account `shift-openai-1`.
 
 **Step 3 — the hub works out what this caller can do.**
 
 The hub does *not* read anything the shift sent about its abilities. Instead:
 
-- it looks up which crews the account `shift-wise` belongs to;
+- it looks up which crews the account `shift-openai-1` belongs to;
 - it reads every `capability_routes` row for those crews;
 - the resulting list of capability strings is the caller's capability set.
 
 The function is `listCapabilitiesForCrews(storage, memberCrewIds)`. For the
-wise shift on staging that yields `['build:deep', 'wise', 'wise:standard']`.
+`openai-1` shift on staging that yields this set:
+
+```
+['build', 'build:deep', 'build:express', 'build:standard',
+ 'review', 'review:deep', 'review:express', 'review:standard',
+ 'utility', 'utility:deep', 'utility:express', 'utility:standard']
+```
+
+The strings are shown alphabetically for readability; their order is not
+significant.
 
 This is why point 3 in section 1 matters: **eligibility comes entirely from
 crew membership.** A shift cannot claim, declare, or negotiate a capability.
@@ -251,26 +330,31 @@ this exact string?* "Live" means the `capability_routes` row exists **and** the
 crew it names still exists — a row pointing at a deleted crew is dangling and
 counts as nothing.
 
-- `build:deep` has a live row (crew `wise`) → match mode **`exact`**. Only
+- `build:deep` has a live row (crew `openai`) → match mode **`exact`**. Only
   crews certified for the exact string `build:deep` may claim.
 - If it had no live row → see section 9.
 
 **Step 6 — the match.**
 
-`claimMatches(offered, caller, modes)`. Offered is `['build:deep']`. The wise
-shift's caller set contains `build:deep`. Under `exact` mode that is a match.
-The order is handed to the wise shift, with `order.capabilities = ['build:deep']`.
+`claimMatches(offered, caller, modes)`. Offered is `['build:deep']`. The
+`openai-1` shift's caller set contains `build:deep`. Under `exact` mode
+that is a match. The order is handed to `openai-1`, with
+`order.capabilities = ['build:deep']`.
 
-The build shift, whose caller set is `['build', 'build:standard']`, does **not**
-match — it is not certified for `build:deep`. That is the correct outcome, and
-it is what stops a deep build job landing on the OpenAI shift.
+The `anthropic` shift, whose caller set is
+`['wise', 'wise:deep', 'wise:express', 'wise:standard']`, does **not** match
+— it is not certified for `build:deep`. That is the correct outcome, and it
+is what stops a deep build job landing on the Anthropic shift. The two caller
+sets do not overlap at all, which is exactly what it looks like when
+eligibility comes entirely from crew membership and the crews are named after
+teams.
 
 **Step 7 — the shift picks the model.**
 
-The wise shift reads `order.capabilities` — `['build:deep']` — and looks it up
-in its own `capabilityModels`:
+The `openai-1` shift reads `order.capabilities` — `['build:deep']` — and
+looks it up in its own `capabilityModels`:
 
-1. Try the **exact compound**: `build:deep` → `{model: claude-opus-5, effort: xhigh}`. Found.
+1. Try the **exact compound**: `build:deep` → `{model: gpt-5.6-terra, effort: xhigh}`. Found.
 2. If not found, try the **bare name part**: `build`.
 3. If neither is found, the shift **refuses the order** with
    `unresolvable-capability` and the hub re-offers it.
@@ -280,8 +364,8 @@ rate for a job does not guess a model.
 
 **Step 8 — the harness runs it.**
 
-`OWENLOOP_HARNESS=claude-code` for the wise shift, so the Anthropic CLI is
-spawned with model `claude-opus-5` and effort `xhigh`.
+`OWENLOOP_HARNESS=codex` for the openai shifts, so the Codex CLI is spawned
+with model `gpt-5.6-terra` and effort `xhigh`.
 
 Valid efforts, in order: `low`, `medium`, `high`, `xhigh`, `max`.
 
@@ -305,20 +389,32 @@ layer states only what it actually knows.
 
 ## 7. Two shifts, one crew — and when that is wrong
 
-Because a crew is a team, you can put a codex shift and a claude-code shift in
-the same crew. Both become eligible for that crew's jobs. Each reads its own
-`settings.json`, so they can run entirely different models.
+The `openai` crew has exactly two shifts: `openai-1` and `openai-2`.
+Both run codex and carry the same rate card. Because a crew is a team, both
+become eligible for that crew's jobs.
 
 **This works, with one consequence you must accept: which member gets the order
 is a race.** First claim wins. The hub does not choose between eligible
 members.
 
-That is fine for a job where you genuinely do not care — a generic `coder`
-posting where either model is acceptable.
+That is fine for a job where you genuinely do not care which member claims it
+— a generic `coder` posting where either shift is acceptable.
 
-It is exactly wrong for `build:deep`, where the entire point was "this specific
-one must be Opus." If you want a guarantee about *which model*, you need a crew
-whose members all run that model, and you certify that crew for the compound.
+Two shifts serving one crew must carry identical rate cards. Crew membership is
+what makes a shift eligible, and both members are eligible for every capability
+the crew is certified for. If `openai-2` were missing a row that
+`openai-1` has, the hub would eventually hand `openai-2` an order it cannot
+price; `openai-2` would refuse with `unresolvable-capability`; the hub would
+re-offer the order. That is the claim-refuse-reoffer loop, and nothing about it
+is visible from the hub side — the routing table is identical in both cases.
+This is why section 3c says both openai cards are byte-identical.
+
+It is exactly wrong for `wise:deep`, where the entire point is "this specific
+one must be claude-fable-5." `wise:deep` is certified to `anthropic`, and
+the anthropic card serves it with `claude-fable-5`, a different model from
+every other `wise` row. If you want a guarantee about *which model*, you need
+a crew whose members all run that model, and you certify that crew for the
+compound.
 
 One more failure mode: a step can declare a permission policy an adapter cannot
 enforce (see `x.harness` in a step definition). A member on the wrong harness
@@ -502,10 +598,11 @@ Each of these has actually happened. Each has a one-line correction.
 
 | Mistake | Correction |
 |---|---|
+| "Name the crew after the job it performs — call the crew that builds `build`." | A crew is named after the **team**, never after the job. When `build` is both a capability and a crew name the two lookups become invisible, and the reader cannot tell the hub-side routing table (`capability_routes`) from the shift-side rate card (`capabilityModels`). Name crews `anthropic` and `openai`. |
 | "The capability says which model to use." | It says which *job*. The model comes from the shift's local `settings.json`, at the very last step. |
-| "`build:deep` belongs to the wise crew." | No — `build:deep` is *certified to* the wise crew. Certify a second crew for it and both are eligible. Nothing owns it. |
+| "`build:deep` belongs to the openai crew." | No — `build:deep` is *certified to* the `openai` crew. Certify a second crew for it and both are eligible. Nothing owns it. |
 | "A shift declares its capabilities." | It declares its **crew**. The hub derives capabilities from crew membership via `listCapabilitiesForCrews`. |
-| "The OpenAI shift has no `build:deep`, so serve it something else." | Do not serve it at all. Certify the crew that *can* do it. That is what the binding is for. |
+| "The shift that is clocked in has no rate for `build:deep`, so serve it something else." | Do not serve it at all. Certify the crew that *can* do it. That is what the binding is for. |
 | "`--modifier` defaults to standard." | Omitting it means **no modifier**. Steps are offered on bare authored capabilities. |
 | "A modifier means 'more effort'." | To the engine it is an opaque string. All meaning lives in the shift's `capabilityModels` map. |
 | "A planner can decide the run needs to go deeper." | It can *say so*. It cannot change the run's modifier — no code path does. |
@@ -524,18 +621,18 @@ delivery.yaml          steps: [{ name: builder, capabilities: [build] }]
                             |
    engine composes          build  +  deep  ->  "build:deep"
                             |
-   hub reads capability_routes:   build:deep -> crew "wise"
+   hub reads capability_routes:   build:deep -> crew "openai"
                             |
    hub derives caller set from the asking shift's crew memberships
                             |
    match: exact  ->  only crews certified for "build:deep" may claim
                             |
-   the wise shift claims; order.capabilities = ["build:deep"]
+   the openai-1 shift claims; order.capabilities = ["build:deep"]
                             |
    shift reads its own settings.json capabilityModels:
-       "build:deep": { model: claude-opus-5, effort: xhigh }
+       "build:deep": { model: gpt-5.6-terra, effort: xhigh }
                             |
-   OWENLOOP_HARNESS=claude-code spawns that model at that effort
+   OWENLOOP_HARNESS=codex spawns that model at that effort
 ```
 
 If the lookup at step 3 finds nobody: the order **holds** and an alert is
