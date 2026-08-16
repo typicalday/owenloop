@@ -170,11 +170,13 @@ which crew's shift claims a given order would be a race. The unbind is what
 makes it a move. This is verified by `src/cli.ts:5079` and independently by
 `docs/authoring.md:254`.
 
-That hypothetical move also needs a rate-card change. The `anthropic` shift's
-rate card carries only the four `wise` rows, so after the rebind it would find
-no row for `build:deep`, refuse the order with `unresolvable-capability`,
-and the hub would re-offer it. The operator must add a `build:deep` row to
-the `anthropic` card as part of the same move.
+That hypothetical move also needs a rate-card change. The shift first looks
+for an exact `build:deep` row and then may fall back to a bare `build` row.
+The `anthropic` card shown here has neither row, so after the rebind it would
+refuse the order with `unresolvable-capability`, and the hub would re-offer it.
+If the card had a bare `build` row, the shift would run that row's potentially
+different model and effort instead. The operator must add an intentional
+`build:deep` row to the `anthropic` card as part of the same move.
 
 ### 3c. The shift's `settings.json` — "what do I run it on?"
 
@@ -389,7 +391,7 @@ layer states only what it actually knows.
 
 ## 7. Two shifts, one crew — and when that is wrong
 
-The `openai` crew has exactly two shifts: `openai-1` and `openai-2`.
+The `openai` crew has exactly two staging shifts: `openai-1` and `openai-2`.
 Both run codex and carry the same rate card. Because a crew is a team, both
 become eligible for that crew's jobs.
 
@@ -400,14 +402,21 @@ members.
 That is fine for a job where you genuinely do not care which member claims it
 — a generic `coder` posting where either shift is acceptable.
 
-Two shifts serving one crew must carry identical rate cards. Crew membership is
-what makes a shift eligible, and both members are eligible for every capability
-the crew is certified for. If `openai-2` were missing a row that
-`openai-1` has, the hub would eventually hand `openai-2` an order it cannot
-price; `openai-2` would refuse with `unresolvable-capability`; the hub would
-re-offer the order. That is the claim-refuse-reoffer loop, and nothing about it
-is visible from the hub side — the routing table is identical in both cases.
-This is why section 3c says both openai cards are byte-identical.
+For this staging pair, the two `openai` shifts must carry byte-identical rate
+cards. Crew membership is what makes a shift eligible, and both members are
+eligible for every capability the crew is certified for. If `openai-2` were
+missing a row that `openai-1` has, the hub would eventually hand `openai-2` an
+order it cannot price; `openai-2` would refuse with
+`unresolvable-capability`; the hub would re-offer the order. That is the
+claim-refuse-reoffer loop, and nothing about it is visible from the hub side —
+the routing table is identical in both cases. This is why section 3c says both
+openai cards are byte-identical.
+
+This is a property of these two shifts sharing the `codex` adapter, not a
+universal rule for every pair of shifts serving one crew. Shifts on different
+adapters may use different model ids and separate settings directories; the
+invariant is that every eligible shift must be able to resolve every capability
+the crew is certified for.
 
 It is exactly wrong for `wise:deep`, where the entire point is "this specific
 one must be claude-fable-5." `wise:deep` is certified to `anthropic`, and
