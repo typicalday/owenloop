@@ -113,7 +113,12 @@
     "cause": { "type": "string", "enum": ["inputsGreen", "allGreen", "idle"] },
     "capabilities": {
       "type": "array",
-      "description": "The composed routing capabilities this order was offered under: each authored step capability, suffixed ':<modifier>' where a modifier applied. A snapshot of the offer — a claimed order is never recomposed.",
+      "description": "The composed routing capabilities this order was offered under: each authored step capability, suffixed ':<modifier>' where a modifier applied. A snapshot of the offer — a claimed order is never recomposed. When 'reroutedFrom' is present this holds the reroute target instead, because this is the capability actually being served.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "reroutedFrom": {
+      "type": "array",
+      "description": "The composed capabilities this order WOULD have been offered under, present only when a reroute rule substituted something else into 'capabilities'. Absent on every ordinary offer, so its presence is itself the signal that the order is not running on the capability its definition asked for.",
       "items": { "type": "string", "minLength": 1 }
     },
     "modifier": {

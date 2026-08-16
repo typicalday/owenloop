@@ -345,6 +345,12 @@ export const ORDER_FIELDS = {
   // emitted before this field existed still validates unchanged.
   capabilities: 'optional',
   modifier: 'optional',
+  // Set only when a caller-supplied reroute rule replaced the composed offer,
+  // holding what the def actually asked for. Signed like the rest of the
+  // routing snapshot for the same reason `escalated` is: an order served on a
+  // substituted capability must not be replayable as one that was served on
+  // the capability it requested.
+  reroutedFrom: 'optional',
   // Set only when `modifier` is the step's escalation target rather than the
   // run's. Covered by the signature like every other routing field: a claim
   // made on a recovery re-offer must not be replayable as an ordinary one.

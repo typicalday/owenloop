@@ -20,7 +20,12 @@ import { Engine } from '../src/engine.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { StepDef, WorkflowDef } from '../src/types.ts';
-import { capabilityName, claimMatches, composeCapabilities } from '../src/capabilities.ts';
+import {
+  applyCapabilityRewrites,
+  capabilityName,
+  claimMatches,
+  composeCapabilities,
+} from '../src/capabilities.ts';
 import { def, input, step } from './helpers.ts';
 
 function makeEngine(defs: WorkflowDef[]): { engine: Engine; store: Store } {
@@ -346,4 +351,143 @@ test('a claimed order is never recomposed — the stamped offer is the record', 
   const t2 = engine.tick(wf, { now: 1, capabilities: ['build:deep'] });
   assert.equal(t2.orders.length, 0);
   assert.ok(t2.deferred.some((d) => d.reason === 'in-flight'));
+});
+
+// ---- capability rewrites: the caller reroutes, the engine substitutes -------
+
+test('applyCapabilityRewrites: no matching rule leaves the offer untouched', () => {
+  const r = applyCapabilityRewrites(['build:express'], { 'wise:express': 'wise:standard' });
+  assert.deepEqual(r.offered, ['build:express']);
+  assert.equal(r.reroutedFrom, undefined, 'absent when nothing changed');
+});
+
+test('applyCapabilityRewrites: a rule substitutes and records what it replaced', () => {
+  const r = applyCapabilityRewrites(['build:express', 'wise:express'], {
+    'build:express': 'build:standard',
+  });
+  assert.deepEqual(r.offered, ['build:standard', 'wise:express']);
+  assert.deepEqual(r.reroutedFrom, ['build:express', 'wise:express'], 'the whole original offer');
+});
+
+test('applyCapabilityRewrites: a rewrite is a single hop, never chased', () => {
+  // `b` also has a rule, but a target is never itself looked up: the caller is
+  // responsible for resolving a chain before handing the map over.
+  const r = applyCapabilityRewrites(['a:x'], { 'a:x': 'b:x', 'b:x': 'c:x' });
+  assert.deepEqual(r.offered, ['b:x']);
+});
+
+test('applyCapabilityRewrites: two capabilities rerouted onto one target collapse', () => {
+  const r = applyCapabilityRewrites(['build:express', 'wise:express'], {
+    'build:express': 'utility',
+    'wise:express': 'utility',
+  });
+  assert.deepEqual(r.offered, ['utility']);
+});
+
+test('applyCapabilityRewrites: an identity rule is not a reroute', () => {
+  const r = applyCapabilityRewrites(['build:express'], { 'build:express': 'build:express' });
+  assert.deepEqual(r.offered, ['build:express']);
+  assert.equal(r.reroutedFrom, undefined);
+});
+
+test('applyCapabilityRewrites: an untouched offer is returned verbatim, duplicates included', () => {
+  // Dedup is a consequence of REROUTING, not a tidy-up applied on the way past.
+  // `defs.ts` validates each authored capability but never rejects a duplicate,
+  // and `composeCapabilities` preserves that multiplicity — so deduplicating an
+  // offer no rule touched would silently change `order.capabilities` for a
+  // caller that supplied no rewrites at all.
+  const none = applyCapabilityRewrites(['a:x', 'a:x'], {});
+  assert.deepEqual(none.offered, ['a:x', 'a:x'], 'byte-for-byte when no rule fires');
+  assert.equal(none.reroutedFrom, undefined);
+
+  const identity = applyCapabilityRewrites(['a:x', 'a:x'], { 'a:x': 'a:x' });
+  assert.deepEqual(identity.offered, ['a:x', 'a:x'], 'an identity rule is not a change either');
+  assert.equal(identity.reroutedFrom, undefined);
+
+  // ...but once a rule DOES fire, collapsing onto one target is the point.
+  const fired = applyCapabilityRewrites(['a:x', 'a:x'], { 'a:x': 'b:x' });
+  assert.deepEqual(fired.offered, ['b:x'], 'the rewritten offer still collapses');
+  assert.deepEqual(fired.reroutedFrom, ['a:x', 'a:x'], 'the whole original offer, duplicates and all');
+});
+
+test('a step authoring a duplicate capability stamps it unchanged when no rewrites are supplied', () => {
+  // The observable half of the rule above: adding the rewrite pass to the stamp
+  // path must not alter what an ordinary tick records. Without the verbatim
+  // return this stamps ['dup:deep'] and the order's routing snapshot silently
+  // stops matching what the def asked for.
+  const dupDef = def(
+    'dupGraded',
+    [input('proposal')],
+    [step({ name: 'builder', consumes: ['proposal'], produces: ['pr'], capabilities: ['dup', 'dup'] })],
+    ['deep'],
+  );
+  const { engine } = makeEngine([dupDef]);
+  const wf = engine.createInstance('dupGraded', { modifier: 'deep' });
+
+  const t = engine.tick(wf, { now: 0 });
+  assert.equal(t.orders.length, 1);
+  assert.deepEqual(t.orders[0]!.capabilities, ['dup:deep', 'dup:deep'], 'multiplicity preserved');
+  assert.equal(t.orders[0]!.reroutedFrom, undefined, 'no rule fired, so no reroute record');
+});
+
+test('a rewritten offer is matched and stamped as the reroute target', () => {
+  // The whole point: a crew serving only `build:standard`/`wise:standard` claims
+  // an `express` run, and the ORDER says `standard` — which is what the shift
+  // resolves its model against.
+  const { engine } = makeEngine([gradedDef()]);
+  const wf = engine.createInstance('graded', { modifier: 'express' });
+
+  const rewrites = { 'build:express': 'build:standard', 'wise:express': 'wise:standard' };
+  const t = engine.tick(wf, {
+    now: 0,
+    capabilities: ['build:standard', 'wise:standard'],
+    matchModes: { 'build:standard': 'exact', 'wise:standard': 'exact' },
+    capabilityRewrites: rewrites,
+  });
+
+  assert.equal(t.orders.length, 1);
+  const order = t.orders[0]!;
+  assert.deepEqual(order.capabilities, ['build:standard', 'wise:standard'], 'served capability');
+  assert.deepEqual(order.reroutedFrom, ['build:express', 'wise:express'], 'requested capability');
+});
+
+test('a reroute never rewrites the run modifier', () => {
+  // The instance keeps the grade of service it was started with. Only the offer
+  // moved, and the order still reports the modifier that was asked for.
+  const { engine, store } = makeEngine([gradedDef()]);
+  const wf = engine.createInstance('graded', { modifier: 'express' });
+
+  const t = engine.tick(wf, {
+    now: 0,
+    capabilities: ['build:standard'],
+    capabilityRewrites: { 'build:express': 'build:standard' },
+  });
+  assert.equal(t.orders[0]!.modifier, 'express');
+  assert.equal(store.getWorkflow(wf)?.modifier, 'express', 'the stored run record is untouched');
+});
+
+test('the filter and the stamped order apply the same rewrite', () => {
+  // A crew presenting only the PRE-rewrite capability must not claim: what is
+  // matched is what gets stamped, or a shift would receive an order whose
+  // capability it never agreed to serve.
+  const { engine } = makeEngine([gradedDef()]);
+  const wf = engine.createInstance('graded', { modifier: 'express' });
+
+  const t = engine.tick(wf, {
+    now: 0,
+    capabilities: ['build:express'],
+    matchModes: { 'build:standard': 'exact', 'wise:standard': 'exact' },
+    capabilityRewrites: { 'build:express': 'build:standard', 'wise:express': 'wise:standard' },
+  });
+  assert.equal(t.orders.length, 0);
+  assert.equal(t.deferred.filter((d) => d.reason === 'capability-mismatch').length, 1);
+});
+
+test('no rewrites supplied is byte-for-byte the pre-rewrite behavior', () => {
+  const { engine } = makeEngine([gradedDef()]);
+  const wf = engine.createInstance('graded', { modifier: 'deep' });
+
+  const t = engine.tick(wf, { now: 0, capabilities: ['build:deep'] });
+  assert.deepEqual(t.orders[0]!.capabilities, ['build:deep', 'wise:deep']);
+  assert.equal(t.orders[0]!.reroutedFrom, undefined);
 });

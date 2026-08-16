@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
 import { run as prepare } from '../src/roles/prepare.ts';
+import { stripAmbientOwenloopEnv } from './helpers/ambient-env.ts';
 
 // prepare is driven IN-PROCESS (not via spawnSync): the mock hub is an
 // in-process node:http server, and a synchronous child (spawnSync) would freeze
@@ -20,16 +21,36 @@ const DEMO = JSON.parse(fixture('demo-def.json')) as Record<string, unknown>;
 
 let cacheDir: string;
 let homeDir: string;
-const ENV_KEYS = ['HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'OWENLOOP_CACHE_DIR', 'OWENLOOP_TOKEN', 'OWENLOOP_ACCOUNT', 'OWENLOOP_NO_KEYCHAIN'];
+// OWENLOOP_CONFIG_DIR is in the list for hermeticity, not because the fixture
+// sets it: the config-dir ladder is OWENLOOP_CONFIG_DIR > $XDG_CONFIG_HOME/owenloop
+// > $HOME/.config/owenloop (`configDir` in src/hub.ts), so an ambient value
+// OUTRANKS the XDG_CONFIG_HOME below and prepare reads the developer's REAL
+// config dir — finding a real `hubOrigin` where the fixture wants none, and a
+// real credential where the fixture wants an empty store. Every owenloop shift
+// exports it, so the suite is red on an agent-driven build and green in CI,
+// where the variable is unset. Listing it here deletes it in `beforeEach` and
+// restores it in `afterEach` along with the rest.
+/**
+ * The NON-`OWENLOOP_*` variables this fixture manages by name. The whole
+ * `OWENLOOP_*` namespace is denied wholesale by `stripAmbientOwenloopEnv`
+ * instead of being enumerated here — enumerating it is what let
+ * `OWENLOOP_CONFIG_DIR` through, and it outranks the `XDG_CONFIG_HOME` set below.
+ */
+const ENV_KEYS = ['HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME'];
 let savedEnv: Record<string, string | undefined>;
+let restoreOwenloopEnv: () => void;
 
 beforeEach(() => {
   cacheDir = mkdtempSync(join(tmpdir(), 'owenloop-prep-cache-'));
   homeDir = mkdtempSync(join(tmpdir(), 'owenloop-prep-home-'));
   savedEnv = {};
   for (const k of ENV_KEYS) savedEnv[k] = process.env[k];
-  // A clean, fixture-controlled env: no ambient HOME/XDG/token leakage.
+  // A clean, fixture-controlled env: no ambient HOME/XDG leakage...
   for (const k of ENV_KEYS) delete process.env[k];
+  // ...and no ambient OWENLOOP_* leakage either. Denied as a namespace, then set
+  // back below, so a variable a future phase adds is hermetic on the day it
+  // lands rather than the day someone debugs a red suite on a shift-run build.
+  restoreOwenloopEnv = stripAmbientOwenloopEnv();
   process.env['HOME'] = homeDir;
   process.env['XDG_CONFIG_HOME'] = homeDir; // settings live under <homeDir>/owenloop/
   process.env['OWENLOOP_CACHE_DIR'] = cacheDir;
@@ -39,6 +60,7 @@ beforeEach(() => {
   process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
 });
 afterEach(() => {
+  restoreOwenloopEnv();
   for (const k of ENV_KEYS) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];

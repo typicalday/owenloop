@@ -78,6 +78,63 @@ export function composeCapabilities(
   return authored.map((c) => `${c}${MODIFIER_SEPARATOR}${modifier}`);
 }
 
+/**
+ * A reroute decision the caller has already made, keyed by the composed
+ * capability the engine would otherwise offer.
+ *
+ * `{ 'build:express': 'build:standard' }` means: when this offer composes to
+ * `build:express`, offer `build:standard` instead. The engine attaches no
+ * meaning to either side and performs no lookup — it substitutes the string it
+ * is handed, exactly like `matchModes`, and for the same reason: deciding a
+ * reroute requires reading `capability_routes`, which the pure engine has never
+ * seen.
+ *
+ * SINGLE HOP, BY CONTRACT. A rewrite target is never itself looked up in the
+ * map. A caller with a multi-step rule chain resolves the whole chain and hands
+ * the engine the final answer, so a cycle is impossible here rather than merely
+ * bounded.
+ */
+export type CapabilityRewrites = Readonly<Record<string, string>>;
+
+/**
+ * Substitute a caller's reroute decisions into a composed offer.
+ *
+ * Returns the offer to use plus — only when something actually changed — the
+ * list it replaced. The two are kept as SEPARATE fields rather than folded into
+ * one, because a rerouted order has two different true answers to "which
+ * capability is this?": the one being served (`offered`, which is what a shift
+ * resolves its model against) and the one that was asked for (`reroutedFrom`,
+ * which is what an operator wrote in the def). Collapsing them would make an
+ * order's routing history unrecoverable.
+ *
+ * Duplicates are removed FROM A REWRITTEN OFFER: two authored capabilities may
+ * reroute onto the same target, and an offer listing it twice would
+ * double-count in nothing but would read as a mistake.
+ *
+ * An offer no rule touched is returned VERBATIM, duplicates included. A step
+ * may author `capabilities: ['a', 'a']` — `defs.ts` validates each entry but
+ * never checks for duplicates — and `composeCapabilities` preserves that
+ * multiplicity, so deduplicating an untouched offer would change the stamped
+ * `order.capabilities` for a caller that supplied no rewrites at all. Dedup is
+ * a consequence of rerouting, not a tidy-up applied on the way past: with no
+ * applicable rule, this function returns byte-for-byte what it was handed.
+ */
+export function applyCapabilityRewrites(
+  offered: readonly string[],
+  rewrites: CapabilityRewrites,
+): { offered: string[]; reroutedFrom?: string[] } {
+  if (offered.length === 0) return { offered: [] };
+  let changed = false;
+  const out: string[] = [];
+  for (const c of offered) {
+    const target = rewrites[c];
+    const next = target ?? c;
+    if (target !== undefined && target !== c) changed = true;
+    if (!out.includes(next)) out.push(next);
+  }
+  return changed ? { offered: out, reroutedFrom: [...offered] } : { offered: [...offered] };
+}
+
 /** True when one caller capability satisfies one offered capability under `mode`. */
 function matchesOne(offered: string, caller: string, mode: MatchMode): boolean {
   return mode === 'exact' ? caller === offered : capabilityName(caller) === capabilityName(offered);

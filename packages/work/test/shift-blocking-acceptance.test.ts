@@ -21,6 +21,7 @@ import { readChildRecords } from '../src/shift/state.ts';
 import { OVERLAP_ERROR } from '../src/shift/protocol.ts';
 import { spawnShift, type ShiftChild } from './helpers/shift-client.ts';
 import { startMockHub, until, type HubReq } from './helpers/mcp-stdio-client.ts';
+import { strippedOwenloopEnv } from './helpers/ambient-env.ts';
 
 const BIN = fileURLToPath(new URL('../../../bin/owenloop.mjs', import.meta.url));
 const TOKEN = 'tok-shift-blocking-acceptance';
@@ -127,6 +128,14 @@ afterEach(async () => {
 
 function env(): Record<string, string | undefined> {
   return {
+    // `runCli` spreads process.env into the child, so every ambient OWENLOOP_*
+    // variable reaches the CLI under test unless this object overrides it. Deny
+    // the namespace first, then set back what the fixture wants — the miss that
+    // bit was OWENLOOP_CONFIG_DIR, which sits ABOVE $XDG_CONFIG_HOME/owenloop in
+    // the config-dir ladder (`configDir` in src/hub.ts) and so outranks the
+    // XDG_CONFIG_HOME below. Every owenloop shift exports a slice of the
+    // namespace, so a miss is red on an agent-driven build and green in CI.
+    ...strippedOwenloopEnv(),
     HOME: home,
     OWENLOOP_TOKEN: TOKEN,
     XDG_CONFIG_HOME: configDir,

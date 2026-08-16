@@ -30,6 +30,8 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { strippedOwenloopEnv } from './ambient-env.ts';
+
 /** The throwaway agent token every drill seeds and then asserts on the wire. */
 export const DRILL_TOKEN = 'drill_agent_tok';
 
@@ -96,15 +98,30 @@ export function seedCredentialStore(
  * store lookup misses and the child exits 2 before any hub contact. Drills that
  * need a non-default account seed that slot and pass `--as`/`OWENLOOP_ACCOUNT`
  * explicitly via `extra`.
+ *
+ * Rather than name each hostile variable, the whole `OWENLOOP_*` namespace is
+ * denied first (`strippedOwenloopEnv`) and the drill's own values are applied on
+ * top. Naming them was the old spelling and it kept coming up short — the miss
+ * that bit hardest was `OWENLOOP_CONFIG_DIR`, which sits ABOVE
+ * `$XDG_CONFIG_HOME/owenloop` in the config-dir ladder (`configDir` in
+ * `src/hub.ts`) and so outranks the `XDG_CONFIG_HOME` this fixture sets. Every
+ * owenloop shift exports a slice of the namespace, which is exactly the
+ * environment an agent-driven build runs the suite in — the child would read the
+ * developer's REAL config dir, find no credential for the drill's ephemeral
+ * `http://127.0.0.1:<port>` origin, and exit 2. CI never noticed: the `check`
+ * job runs on ubuntu-latest with the whole namespace unset.
+ *
+ * Order matters. The strip is spread FIRST, so the explicit values below and the
+ * caller's `extra` both win over it.
  */
 export function fixtureEnv(home: string, extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
   return {
+    ...strippedOwenloopEnv(),
     HOME: home,
     XDG_CONFIG_HOME: home,
     OWENLOOP_NO_KEYCHAIN: '1',
     OWENLOOP_TOKEN: undefined, // WO-6.1: never the override — the store path IS the drill
     OWENLOOP_SESSION: '',
-    OWENLOOP_ACCOUNT: undefined, // hermeticity: never inherit an ambient account (would miss the seeded agent:default slot)
     ...extra,
   };
 }

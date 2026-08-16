@@ -209,8 +209,25 @@ export interface Order {
    * value the shift's settings map is keyed by. It is a snapshot of the offer:
    * an already-claimed order is never recomposed, so re-reading it later
    * always shows what the claim was actually judged on.
+   *
+   * When `reroutedFrom` is present this field holds the REROUTE TARGET, not
+   * what the def composed. That is deliberate: this is the capability being
+   * served, so it is the one a shift must resolve its model against.
    */
   capabilities?: string[];
+  /**
+   * The composed capabilities this order WOULD have been offered under, present
+   * only when a caller-supplied reroute rule substituted something else into
+   * `capabilities` above.
+   *
+   * Absent on every ordinary offer, so its presence is itself the signal that
+   * the order is not running on the capability its def asked for. Kept separate
+   * from `capabilities` rather than replacing it because both facts are true at
+   * once and an operator needs each for a different question: `capabilities`
+   * answers "what is serving this", `reroutedFrom` answers "what did we ask
+   * for". A single field could only ever answer one.
+   */
+  reroutedFrom?: string[];
   /**
    * The modifier this order was composed with. Normally the run's modifier;
    * on an escalated re-offer, the step's escalation target instead (the run's
@@ -226,10 +243,13 @@ export interface Order {
    *
    * The engine decides the transition; this flag is how the decision reaches
    * the layer that acts on it, instead of that layer re-deriving it by
-   * diffing `modifier` against the run record. The hub reads it to apply the
-   * escalation wait policy (wait-then-fallback, even where the deployment
-   * default is `forever`); a brief reads it to tell the worker it is on the
-   * recovery path.
+   * diffing `modifier` against the run record. A brief reads it to tell the
+   * worker it is on the recovery path.
+   *
+   * An escalated offer gets NO special wait or fallback treatment. It routes by
+   * exactly the same rules as any other offer, because "this run is recovering"
+   * is not evidence that its operator wants a lower grade of service — see
+   * `wait-policy.ts` in the hub.
    */
   escalated?: true;
   /** Opaque config object for a non-agent/non-command worker type (or

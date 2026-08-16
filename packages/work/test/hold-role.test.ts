@@ -11,6 +11,7 @@ import type { HoldOutcome } from '../src/hold/loop.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { GetOrderResponse } from '../src/hub/types.ts';
 import type { SignalHost, StdinHost } from '../src/roles/signals.ts';
+import { stripAmbientOwenloopEnv } from './helpers/ambient-env.ts';
 
 /**
  * Seed a hermetic owenloop v2 credential file at `<configHome>/owenloop/
@@ -192,9 +193,15 @@ beforeEach(() => {
   // ambient token/session leaking in from the developer's or CI runner's env.
   process.env['HOME'] = home;
   process.env['XDG_CONFIG_HOME'] = home;
-  delete process.env['OWENLOOP_TOKEN'];
-  delete process.env['OWENLOOP_SESSION'];
-  delete process.env['OWENLOOP_ACCOUNT'];
+  // Deny the whole OWENLOOP_* namespace, then set back only what this suite
+  // wants. Naming the variables to delete was the old spelling and it was wrong
+  // by construction — it covered OWENLOOP_TOKEN / _SESSION / _ACCOUNT and missed
+  // OWENLOOP_CONFIG_DIR, which OUTRANKS the XDG_CONFIG_HOME set above in the
+  // config-dir ladder (`configDir` in src/hub.ts) and sent the credential lookup
+  // to the developer's REAL config dir instead of the temp `home`. Every owenloop
+  // shift exports a slice of the namespace, so a miss is red on an agent-driven
+  // build and green in CI, where the whole namespace is unset.
+  stripAmbientOwenloopEnv();
   // Hermetic credential store: force owenloop's file backend (no real keychain
   // shell-out) so an unseeded store reads as absent → the refuse path.
   process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
