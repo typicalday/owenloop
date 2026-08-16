@@ -17,8 +17,8 @@ Section 9 (**When nobody is certified**) describes a rule that is CHANGING.
 Both the old rule and the new rule are stated, and it is marked which is which,
 because a deployment running an older hub still does the old thing.
 
-Section 10 (**Reroute rules**) describes a feature being built. It is marked as
-such.
+Section 10 (**Reroute rules**) describes a feature whose engine, hub and CLI
+halves are now in place; the MCP surface is not. It is marked as such.
 
 ---
 
@@ -411,8 +411,9 @@ system does not assume it.
 
 ## 10. Reroute rules — saying "yes, substitute" on purpose
 
-*(Being built. The engine half is in `owenloop`; the hub half and the CLI/MCP
-surfaces follow.)*
+*(The engine half is in `owenloop`, the hub half is in `owenloop-service`, and
+the CLI surface is `owenloop routing rule` — see
+[Routing](cli.md#routing) in the CLI reference. The MCP surface follows.)*
 
 Holding is the right default, but sometimes the operator genuinely does want a
 substitution — "if nobody is serving `build:express` right now, `build:standard`
@@ -463,6 +464,35 @@ moved.
 the hub walks the chain and hands the engine the final answer. The engine
 performs exactly one substitution and never looks a target up again, so a cycle
 is impossible there rather than merely bounded.
+
+### How an operator states and inspects all of this
+
+The rules and the alerts are two separate command surfaces on one hub org — see
+[Routing](cli.md#routing) in the CLI reference for flags, output shape and exit
+codes.
+
+| what you want | command |
+|---|---|
+| write the rule `build:express -> build:standard` | `owenloop routing rule add build:express build:standard` |
+| put a rule ahead of the ones already there | `owenloop routing rule add build:express build --position 0` |
+| see the rules in the order the hub tries them | `owenloop routing rule list` |
+| take one rule back | `owenloop routing rule rm build:express build:standard` |
+| see every hold, reroute, wait and fallback org-wide | `owenloop routing alerts` |
+| see one run's routing timeline | `owenloop routing show <workflow>` |
+
+**Three cautions the command names do not carry on their own.**
+
+1. **A reroute rule is not a binding.** `routing rule add` writes a
+   `capability_reroutes` row, which names no crew and grants nobody access.
+   `capability bind` writes a `capability_routes` row, which does. A reroute
+   only reaches a crew if its **target** capability has a live binding of its
+   own, so adding a rule cannot by itself widen who may claim work.
+2. **`routing rule list` order is meaning, not presentation.** Rows are grouped
+   by source capability and ordered by ascending `position` — the first row for
+   a capability is the first target the hub attempts.
+3. **Removing the last rule for a capability restores holding.** With no rule
+   left, an unbound compound waits again, exactly as section 9b describes. The
+   CLI prints `remainingTargets: []` and says so on stderr.
 
 ---
 
