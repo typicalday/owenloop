@@ -81,6 +81,22 @@ export interface SessionRecord {
    *  contract lists it and Phase 6's `owenloop work sessions` display prints it.
    *  ALWAYS build it with `orderId()` so the two can never drift. */
   order: string;
+  /**
+   * `OrderPacket.key` — the fan-out key of the engine task this firing served.
+   *
+   * WHY IT IS HERE, AND WHY IT IS OPTIONAL. `run` identifies ONE FIRING and is
+   * minted fresh every time the engine claims the step, so `(workflow, run,
+   * step)` can never name the same work twice. `(workflow, step, key)` is the
+   * engine's own task identity — the `UNIQUE (workflow, step, key)` on its
+   * `task` table — and is the only triple here that survives a re-offer. See
+   * `latestForTask`.
+   *
+   * OPTIONAL because every row written before this field existed lacks it. Such
+   * a row is never attributed to a task (`latestForTask` skips it) rather than
+   * being guessed at. `''` is a REAL key — an unfanned step — so the absence
+   * must be tested as `undefined`, never as falsy.
+   */
+  key?: string;
   attempt: number;
   /** Adapter id (`HarnessSessionRef.harness`). */
   harness: string;
@@ -186,10 +202,12 @@ function isNonEmptyString(v: unknown): v is string {
  * The non-empty-string fields `isSessionRecord` requires, in the order it checks
  * them. Declared once and kept stable so a record failing several checks always
  * reports the SAME field, which keeps the skip message deterministic.
- * `status` is not here — its check is a membership test, not a string test — and
- * is applied after these, preserving the original check order.
+ *
+ * `token` is NOT here — see `firstInvalidSessionRecordField`. `status` is not
+ * here either: its check is a membership test, not a string test, and is applied
+ * after these, preserving the original check order.
  */
-const SESSION_RECORD_STRING_FIELDS = ['workflow', 'run', 'step', 'harness', 'token'] as const;
+const SESSION_RECORD_STRING_FIELDS = ['workflow', 'run', 'step', 'harness'] as const;
 
 /**
  * Name of the first field of `v` that fails the `SessionRecord` schema, or
@@ -200,9 +218,43 @@ const SESSION_RECORD_STRING_FIELDS = ['workflow', 'run', 'step', 'harness', 'tok
  * in terms of this function, so the accept/reject decision and the reported
  * field name can never drift apart.
  *
- * Checks exactly the fields whose absence would make the record unusable for a
- * resume: the three key fields plus the harness and token it exists to carry,
- * and a `status` inside the four literals. Everything else is carried verbatim.
+ * Checks exactly the fields whose absence would make the record unusable: the
+ * three key fields, the harness that says which vendor the row belongs to, a
+ * `token` that is a string, and a `status` inside the four literals. Everything
+ * else is carried verbatim.
+ *
+ * ── WHY AN EMPTY `token` IS VALID, THOUGH IT ONCE WAS NOT ────────────────────
+ *
+ * `token` must be a STRING, but it may be EMPTY. The writer produces an empty
+ * one deliberately: `agent/loop.ts` appends a record before the harness emits
+ * its `started` event, so that a harness which dies on launch still leaves proof
+ * the attempt existed and died. Its own comment says so. Requiring the token to
+ * be non-empty here threw exactly those records away — the reader discarded the
+ * evidence the writer went out of its way to leave.
+ *
+ * The cost was not only the lost rows. Every such line was reported on stdout as
+ * `field "token" failed schema check`, once per reading process. On this machine
+ * that was ~94 lines printed by each of three shifts on every boot: ~280 warning
+ * lines about records that were behaving exactly as designed, drowning the
+ * warnings that meant something.
+ *
+ * Nothing downstream is harmed by admitting them, because every consumer already
+ * expected the empty case and guarded for it BEFORE this change:
+ *   - `agent/loop.ts` requires `prev.token !== ''` to resume, with a comment
+ *     naming this exact case ("the record predates its `started` event").
+ *   - `roles/sessions.ts` renders no resume command for one.
+ *   - `shouldRetireSession` reads `pid`/owner/`status` and never the token.
+ *
+ * The guard in the loop is in fact PROOF of the intent: it is unreachable code
+ * unless records with an empty token can be read back.
+ *
+ * ── WHY `key` IS CHECKED ONLY WHEN PRESENT ───────────────────────────────────
+ *
+ * `key` was added after rows already existed, so ABSENT is legal and means "this
+ * row predates the field". PRESENT-BUT-NOT-A-STRING is not legal: it would be a
+ * row nobody wrote, and `latestForTask` would silently mis-key it. `''` is a
+ * perfectly good key — it is what an unfanned step carries — so emptiness is
+ * never the test here.
  */
 function firstInvalidSessionRecordField(v: unknown): string | null {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return '<root>';
@@ -210,6 +262,11 @@ function firstInvalidSessionRecordField(v: unknown): string | null {
   for (const field of SESSION_RECORD_STRING_FIELDS) {
     if (!isNonEmptyString(r[field])) return field;
   }
+  // Checked after `harness` and before `status`, which is where it sat when it
+  // was a non-empty check, so a record failing several fields still reports the
+  // same one it always did.
+  if (typeof r['token'] !== 'string') return 'token';
+  if (r['key'] !== undefined && typeof r['key'] !== 'string') return 'key';
   if (typeof r['status'] !== 'string' || !STATUSES.has(r['status'])) return 'status';
   return null;
 }
@@ -372,6 +429,11 @@ export function readSessions(file: string, opts: SessionStoreOptions = {}): Sess
       // debugging after a file-integrity problem that did not exist. The second
       // pass runs only on this failure branch, so valid records pay nothing.
       // The field NAME only, never its value — `token` is credential-shaped.
+      //
+      // Those empty-`token` records are no longer invalid at all — the schema
+      // admits them now (see `firstInvalidSessionRecordField`). Reaching this
+      // branch therefore means something genuinely wrong with the record, which
+      // is what makes the line worth printing.
       const badField = firstInvalidSessionRecordField(parsed) ?? '<unknown>';
       warn(
         `owenloop work sessions: skipping invalid record at ${file}:${i + 1}: field "${badField}" failed schema check`,
@@ -384,9 +446,19 @@ export function readSessions(file: string, opts: SessionStoreOptions = {}): Sess
 }
 
 /**
- * The newest record for `(workflow, run, step)`, or `null` when the file is
- * missing or holds no match. Scans forward and keeps the LAST match (last-wins).
- * Side-effect-free — it never writes, never compacts, and never throws.
+ * The newest record for `(workflow, run, step)` — that is, for ONE FIRING of one
+ * step — or `null` when the file is missing or holds no match. Scans forward and
+ * keeps the LAST match (last-wins). Side-effect-free: it never writes, never
+ * compacts, and never throws.
+ *
+ * ── THIS IS THE PER-FIRING LOOKUP. IT CANNOT FIND A PREVIOUS FIRING. ─────────
+ *
+ * The hub mints a fresh `run` id every time it claims a step. Two firings of the
+ * same step therefore NEVER share a `run`, so this function can only ever return
+ * a record written during the very firing that is asking. Use it for questions
+ * that really are about one firing — "did THIS firing already take a work dir?",
+ * "which sessions belong to the run I am tearing down?" — and never to ask "has
+ * this step run before?". That second question is `latestForTask`.
  */
 export function latestFor(
   file: string,
@@ -398,6 +470,56 @@ export function latestFor(
   let best: SessionRecord | null = null;
   for (const rec of readSessions(file)) {
     if (keyOf(rec.workflow, rec.run, rec.step) === want) best = rec;
+  }
+  return best;
+}
+
+/**
+ * The engine's own identity for a unit of work: one STEP of one WORKFLOW at one
+ * fan-out KEY. The hub enforces `UNIQUE (workflow, step, key)` on its task table,
+ * which is what makes this triple stable across re-offers where `run` is not.
+ */
+export interface SessionTaskRef {
+  workflow: string;
+  step: string;
+  /** `OrderPacket.key`. `''` for a step that does not fan out — a real value,
+   *  not a missing one. */
+  key: string;
+}
+
+/** Identity of an engine TASK. Same JSON-array encoding as `keyOf`, and for the
+ *  same reason: no combination of field values can collide into one key. */
+function taskKeyOf(task: SessionTaskRef): string {
+  return JSON.stringify([task.workflow, task.step, task.key]);
+}
+
+/**
+ * The newest record for an engine TASK — the last session recorded for this
+ * step at this key, no matter which firing wrote it — or `null` when there is
+ * none. Last-wins, side-effect-free, same as `latestFor`.
+ *
+ * ── WHY THIS EXISTS ALONGSIDE `latestFor` ────────────────────────────────────
+ *
+ * `latestFor` keys on `run`, which the hub re-mints per firing, so it answers
+ * "what happened during THIS firing?". Resume needs the opposite question: "did
+ * a previous firing of this same step leave a session I can re-enter?" Only
+ * `(workflow, step, key)` survives long enough to answer that.
+ *
+ * ── WHY A ROW WITHOUT `key` NEVER MATCHES ────────────────────────────────────
+ *
+ * Rows written before `key` existed carry no task identity at all. Guessing one
+ * — treating absent as `''`, say — would attribute an unfanned row and a fanned
+ * row to the same task and hand a worker someone else's session. Skipping them
+ * costs only a cold start on the first firing after upgrade, which is the safe
+ * direction to be wrong in. The test is `=== undefined`, because `''` is a real
+ * key that must match.
+ */
+export function latestForTask(file: string, task: SessionTaskRef): SessionRecord | null {
+  const want = taskKeyOf(task);
+  let best: SessionRecord | null = null;
+  for (const rec of readSessions(file)) {
+    if (rec.key === undefined) continue;
+    if (taskKeyOf({ workflow: rec.workflow, step: rec.step, key: rec.key }) === want) best = rec;
   }
   return best;
 }

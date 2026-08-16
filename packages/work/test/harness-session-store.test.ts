@@ -21,6 +21,7 @@ import {
   appendSession,
   compact,
   latestFor,
+  latestForTask,
   markRunSessionsDead,
   orderId,
   readSessions,
@@ -225,6 +226,80 @@ test('latestFor returns null for a missing file and for an unknown key', () => {
   appendSession(file, rec());
   assert.equal(latestFor(file, 'wf_1', 'run_1', 'documenter'), null);
   assert.equal(latestFor(file, 'wf_9', 'run_1', 'builder'), null);
+});
+
+test('latestForTask finds the previous firing, which latestFor structurally cannot', () => {
+  // The hub mints a fresh run id every time it claims a step, so these two rows
+  // are the SAME step of the SAME workflow at the SAME fan-out key, offered
+  // twice. This is the exact shape every re-offer on this machine has.
+  appendSession(file, rec({ run: 'run_1', key: '', token: 'tok-first', updatedAt: 1000 }));
+  appendSession(file, rec({ run: 'run_2', key: '', token: 'tok-second', updatedAt: 2000 }));
+
+  const task = { workflow: 'wf_1', step: 'builder', key: '' };
+  assert.equal(latestForTask(file, task)?.token, 'tok-second', 'last-wins across firings');
+  assert.equal(latestForTask(file, task)?.run, 'run_2');
+
+  // And the contrast that is the whole point of keeping both functions: asked
+  // about the SECOND firing's run id, the per-firing lookup sees only the second
+  // firing's own row. It can never reach back to the first.
+  assert.equal(latestFor(file, 'wf_1', 'run_2', 'builder')?.token, 'tok-second');
+  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.token, 'tok-first');
+});
+
+test('latestForTask separates two fan-out keys of the same step', () => {
+  // Same workflow, same step, two shards. Attributing one shard's session to the
+  // other would hand a worker a session that was working on different material.
+  appendSession(file, rec({ run: 'run_1', key: 'shard-a', token: 'tok-a', updatedAt: 1000 }));
+  appendSession(file, rec({ run: 'run_2', key: 'shard-b', token: 'tok-b', updatedAt: 2000 }));
+
+  assert.equal(latestForTask(file, { workflow: 'wf_1', step: 'builder', key: 'shard-a' })?.token, 'tok-a');
+  assert.equal(latestForTask(file, { workflow: 'wf_1', step: 'builder', key: 'shard-b' })?.token, 'tok-b');
+  // The unfanned key is a third, distinct task — not a wildcard over the others.
+  assert.equal(latestForTask(file, { workflow: 'wf_1', step: 'builder', key: '' }), null);
+});
+
+test('latestForTask never matches a row written before `key` existed', () => {
+  // No `key` at all: this row cannot be attributed to any task, so it must not be
+  // attributed to the unfanned one. Guessing here would resume a worker into a
+  // session belonging to some other shard of the same step.
+  const old = rec({ run: 'run_1', token: 'tok-old' });
+  delete (old as Partial<SessionRecord>).key;
+  appendSession(file, old);
+
+  assert.equal(latestForTask(file, { workflow: 'wf_1', step: 'builder', key: '' }), null);
+  // The row is still perfectly readable — it is only unattributable.
+  assert.equal(readSessions(file).length, 1);
+  assert.equal(latestFor(file, 'wf_1', 'run_1', 'builder')?.token, 'tok-old');
+});
+
+test('latestForTask returns null for a missing file and for an unknown task', () => {
+  assert.equal(latestForTask(join(dir, 'nope.jsonl'), { workflow: 'wf_1', step: 'builder', key: '' }), null);
+  appendSession(file, rec({ key: '' }));
+  assert.equal(latestForTask(file, { workflow: 'wf_1', step: 'documenter', key: '' }), null);
+  assert.equal(latestForTask(file, { workflow: 'wf_9', step: 'builder', key: '' }), null);
+});
+
+test('a `key` that is present but not a string is rejected, and reported as `key`', () => {
+  // Absent is legal (a pre-`key` row). Present-and-wrong-type is a row nobody
+  // wrote, and admitting it would let `latestForTask` mis-key it.
+  for (const bad of [42, null, {}] as const) {
+    const record = { ...rec(), key: bad } as unknown as SessionRecord;
+    writeFileSync(file, `${JSON.stringify(record)}\n`);
+    const { warnings, opts } = capture();
+    assert.deepEqual(readSessions(file, opts), [], `key ${String(bad)} is rejected`);
+    assert.equal(
+      warnings[0],
+      `owenloop work sessions: skipping invalid record at ${file}:1: field "key" failed schema check`,
+    );
+  }
+});
+
+test('an EMPTY key is valid — it is what an unfanned step carries', () => {
+  const unfanned = rec({ key: '' });
+  writeFileSync(file, `${JSON.stringify(unfanned)}\n`);
+  const { warnings, opts } = capture();
+  assert.deepEqual(readSessions(file, opts), [unfanned]);
+  assert.deepEqual(warnings, [], "'' is a real key, not a missing one");
 });
 
 test('readSessions on a missing file is [] (fail-open)', () => {
@@ -539,11 +614,12 @@ test('a line that will not parse is reported as corrupt', () => {
 });
 
 test('a parsed record that fails the schema names the field, not "corrupt"', () => {
-  // The 36-record incident verbatim: valid JSON, empty `token`.
-  writeFileSync(file, `${JSON.stringify(rec({ token: '' }))}\n`);
+  // Valid JSON, and a `token` that is not a string at all. NOT an EMPTY token —
+  // that is a valid record now, and the test below this one is why.
+  writeFileSync(file, `${JSON.stringify(rec({ token: 42 as unknown as string }))}\n`);
   const { warnings, opts } = capture();
 
-  assert.deepEqual(readSessions(file, opts), [], 'an empty token is still rejected');
+  assert.deepEqual(readSessions(file, opts), [], 'a non-string token is rejected');
   assert.equal(warnings.length, 1);
   assert.equal(
     warnings[0],
@@ -551,8 +627,26 @@ test('a parsed record that fails the schema names the field, not "corrupt"', () 
   );
 });
 
+test('an EMPTY token is a valid record, because the writer means it', () => {
+  // `agent/loop.ts` appends a record before the harness emits `started`, so a
+  // harness that dies on launch still leaves proof the attempt existed. Rejecting
+  // these threw that proof away AND printed ~94 warning lines per reading process
+  // — roughly 280 per boot across three shifts — about records behaving exactly
+  // as designed. The resume path guards `prev.token !== ''` separately, which is
+  // dead code unless these can be read back.
+  const empty = rec({ token: '' });
+  writeFileSync(file, `${JSON.stringify(empty)}\n`);
+  const { warnings, opts } = capture();
+
+  assert.deepEqual(readSessions(file, opts), [empty]);
+  assert.deepEqual(warnings, [], 'a record the writer intended must not be reported as invalid');
+});
+
 test('the two skip messages cannot be confused for each other', () => {
-  writeFileSync(file, ['not json', JSON.stringify(rec({ token: '' }))].join('\n') + '\n');
+  writeFileSync(
+    file,
+    ['not json', JSON.stringify(rec({ token: 42 as unknown as string }))].join('\n') + '\n',
+  );
   const { warnings, opts } = capture();
 
   assert.deepEqual(readSessions(file, opts), []);
@@ -608,7 +702,9 @@ test('a record failing several checks reports the first field in declaration ord
 });
 
 test('every field the schema requires is reported by its own name', () => {
-  for (const field of ['workflow', 'run', 'step', 'harness', 'token'] as const) {
+  // `token` is NOT in this list: it must be a string, but it may be empty, so an
+  // empty one is not a failure to report. Its wrong-type case is covered below.
+  for (const field of ['workflow', 'run', 'step', 'harness'] as const) {
     writeFileSync(file, `${JSON.stringify(rec({ [field]: '' }))}\n`);
     const { warnings, opts } = capture();
 
@@ -616,6 +712,23 @@ test('every field the schema requires is reported by its own name', () => {
     assert.equal(
       warnings[0],
       `owenloop work sessions: skipping invalid record at ${file}:1: field "${field}" failed schema check`,
+    );
+  }
+});
+
+test('a token that is not a string at all is still reported as `token`', () => {
+  // The check moved, so this pins that it did not move OUT: a missing token, or
+  // one of the wrong type, must still be caught and still be named `token` —
+  // only the empty-string case became legal.
+  for (const bad of [undefined, null, 42, {}] as const) {
+    const record = { ...rec(), token: bad } as unknown as Parameters<typeof appendSession>[1];
+    writeFileSync(file, `${JSON.stringify(record)}\n`);
+    const { warnings, opts } = capture();
+
+    assert.deepEqual(readSessions(file, opts), [], `token ${String(bad)} is rejected`);
+    assert.equal(
+      warnings[0],
+      `owenloop work sessions: skipping invalid record at ${file}:1: field "token" failed schema check`,
     );
   }
 });

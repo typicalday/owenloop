@@ -20,6 +20,9 @@
  */
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   createAgentRunLoop,
@@ -37,7 +40,12 @@ import {
   type ResumeTier,
   type StepPermissions,
 } from '../src/harness/contract.ts';
-import type { SessionRecord } from '../src/harness/session-store.ts';
+import {
+  appendSession,
+  latestForTask,
+  sessionsPath,
+  type SessionRecord,
+} from '../src/harness/session-store.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import type { ContactHolder, GetOrderResponse, OrderPacket, ReasonEntry } from '../src/hub/types.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
@@ -62,12 +70,16 @@ interface OrderOpts {
   workdir?: string;
   claimed?: boolean;
   outcome?: string;
+  /** The hub mints a fresh run id on every claim. Overridable so a test can
+   *  offer the SAME task twice the way the hub actually does. */
+  run?: string;
 }
 
 /** A re-offered AGENT order: owed path `out`, with a reason thread. */
 function rejectedOrder(o: OrderOpts = {}): GetOrderResponse {
+  const run = o.run ?? 'run1';
   const packet: OrderPacket = {
-    run: 'run1',
+    run,
     workflow: 'wf1',
     step: 'builder',
     key: 'k',
@@ -88,7 +100,7 @@ function rejectedOrder(o: OrderOpts = {}): GetOrderResponse {
   return {
     text: '',
     workflow: 'wf1',
-    run: 'run1',
+    run,
     order: packet,
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
   };
@@ -164,6 +176,14 @@ interface RunOpts {
   dirExists?: (p: string) => boolean;
   resumeTier?: ResumeTier;
   permissions?: StepPermissions;
+  /** The loop's own run id. Must match the offered packet's run. */
+  run?: string;
+  /**
+   * Path to a REAL `sessions.jsonl`. When set, the three session hooks are wired
+   * to the shipped store functions instead of the constant stubs, so the test
+   * exercises the actual keying rather than a fixture's answer.
+   */
+  store?: string;
 }
 
 interface Ran {
@@ -186,7 +206,7 @@ async function runLoop(o: RunOpts = {}): Promise<Ran> {
   const opts: AgentRunLoopOptions = {
     hub: mockHub(o.responses ?? [rejectedOrder(), rejectedOrder({ claimed: false, outcome: 'green' })]),
     workflow: 'wf1',
-    run: 'run1',
+    run: o.run ?? 'run1',
     holder: HOLDER,
     origin: 'https://hub.example',
     account: 'acct-1',
@@ -201,9 +221,21 @@ async function runLoop(o: RunOpts = {}): Promise<Ran> {
     // boundary. Admit the synthetic rejection thread so the loop can reach
     // the resume paths under test.
     consumedVerifier: async (order) => ({ ok: true as const, order, warnings: [] }),
-    appendSession: (rec) => records.push(rec),
-    nextAttempt: () => 2,
-    latestSession: () => (o.prev === undefined ? priorSession() : o.prev),
+    appendSession: (rec) => {
+      records.push(rec);
+      if (o.store !== undefined) appendSession(o.store, rec);
+    },
+    nextAttempt: (task) => {
+      if (o.store === undefined) return 2;
+      const prev = latestForTask(o.store, task);
+      return prev === null ? 1 : prev.attempt + 1;
+    },
+    latestSession: (task) =>
+      o.store !== undefined
+        ? latestForTask(o.store, task)
+        : o.prev === undefined
+          ? priorSession()
+          : o.prev,
     dirExists: o.dirExists ?? ((): boolean => true),
     sleep: macrotaskSleep,
     now: () => 1_000,
@@ -246,6 +278,62 @@ test('all preconditions hold ⇒ RESUME: deliver on the prior token, delta only,
   // The log says resume, and says how much was new.
   assert.match(ran.errs.join('\n'), /resuming session tok-prior .* with 1 new rejection reason \(no brief re-sent\)/);
   assert.match(ran.outs.join('\n'), /attempt 2, resume\)/);
+});
+
+test('a re-offer under a FRESH run id still finds its predecessor and resumes', async () => {
+  // THE REGRESSION THIS FILE'S FIXTURE COULD NOT CATCH. Every other test here
+  // stubs `latestSession` with a constant, so it proves what the loop DOES with a
+  // predecessor, never whether the real store can FIND one. This test wires the
+  // shipped `latestForTask` over a real `sessions.jsonl` and offers the same
+  // engine task twice, each time under a different run id — which is exactly what
+  // the hub does, because it mints a fresh run on every claim.
+  //
+  // Keyed on `(workflow, run, step)` the second firing found nothing, every
+  // firing was attempt 1, and the whole resume path above was unreachable in
+  // production. Keyed on `(workflow, step, key)` it finds the first firing's row.
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-resume-key-'));
+  const store = sessionsPath(dir);
+  try {
+    // FIRING ONE — nothing recorded yet, so this must be a cold start.
+    const first = createFakeAdapter({ id: 'fake', token: 'tok-session-1' });
+    const one = await runLoop({
+      adapter: first,
+      store,
+      run: 'run1',
+      responses: [rejectedOrder({ run: 'run1' }), rejectedOrder({ run: 'run1', claimed: false, outcome: 'green' })],
+    });
+    assert.deepEqual(kinds(first), ['start', 'stop'], 'first firing has no session to resume into');
+    assert.equal(one.records[0]!.attempt, 1);
+    assert.equal(one.records[0]!.key, 'k', 'the row carries the task key that makes it findable');
+
+    // FIRING TWO — same workflow, same step, same key, DIFFERENT run. A newer
+    // reason, because a resume with nothing new to say is declined on purpose.
+    const second = createFakeAdapter({ id: 'fake', token: 'tok-session-2' });
+    const two = await runLoop({
+      adapter: second,
+      store,
+      run: 'run2',
+      responses: [
+        rejectedOrder({ run: 'run2', reasons: [reason(500, 'the null check is still missing'), reason(900, 'and now the retry is unbounded')] }),
+        rejectedOrder({ run: 'run2', claimed: false, outcome: 'green' }),
+      ],
+    });
+
+    assert.deepEqual(kinds(second), ['deliver', 'stop'], 'the second firing RESUMES');
+    const d = second.calls.find((c) => c.kind === 'deliver');
+    assert.ok(d !== undefined && d.kind === 'deliver');
+    assert.deepEqual(d.ref, { harness: 'fake', token: 'tok-session-1' }, "firing one's token");
+    assert.ok(!d.message.includes('# brief'), 'the brief is not re-sent');
+    // Only the reason firing one had not already heard.
+    assert.match(d.message, /and now the retry is unbounded/);
+    assert.ok(!d.message.includes('the null check is still missing'), 'already delivered in firing one');
+
+    assert.equal(two.records[0]!.attempt, 2, 'the attempt count crosses the run boundary too');
+    assert.equal(two.records[0]!.run, 'run2', 'while the row still records the run it was written under');
+    assert.equal(latestForTask(store, { workflow: 'wf1', step: 'builder', key: 'k' })?.run, 'run2');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('inherited judge policy preflight refuses a resumable order before deliver', async () => {

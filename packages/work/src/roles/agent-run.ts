@@ -90,7 +90,12 @@ import { loadSettings } from '../settings/settings.ts';
 import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/registry.ts';
 import { parseHarnessCarrier } from '../bundle/fetch.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from '../harness/permissions.ts';
-import { appendSession, latestFor, sessionsPath, type SessionRecord } from '../harness/session-store.ts';
+import {
+  appendSession,
+  latestForTask,
+  sessionsPath,
+  type SessionRecord,
+} from '../harness/session-store.ts';
 import {
   ensureWorkDir,
   resolveAllowedWorkdirRoots,
@@ -563,13 +568,18 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     ...(capabilityModels !== undefined ? { capabilityModels } : {}),
     consumedVerifier,
     appendSession: writeSession,
-    nextAttempt: (workflow, run, step) => {
-      const prev = latestFor(sessionsFile, workflow, run, step);
+    // Both readers key on the engine TASK — `(workflow, step, key)` — and not on
+    // `(workflow, run, step)`. The hub mints a fresh run id every time it claims
+    // a step, so a run-keyed lookup can only ever see records written by the
+    // firing that is asking: `nextAttempt` returned 1 forever and `latestSession`
+    // returned null forever, which made the whole resume path unreachable.
+    nextAttempt: (task) => {
+      const prev = latestForTask(sessionsFile, task);
       return prev === null ? 1 : prev.attempt + 1;
     },
     // PHASE 4: the same reader `nextAttempt` uses, handed to the loop whole so
     // it can decide resume vs cold replay. Reads only; the loop is what writes.
-    latestSession: (workflow, run, step) => latestFor(sessionsFile, workflow, run, step),
+    latestSession: (task) => latestForTask(sessionsFile, task),
     sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     now: () => Date.now(),
     out,
