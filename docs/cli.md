@@ -177,9 +177,12 @@ but attendance is advisory and observability-only. Attendance never changes
 routing, dispatch, or lease behavior.
 
 <a id="config-dir"></a>
-The execution settings file is `$HOME/.owenloop/settings.json`. The same
-directory holds `credentials.json`, `allowed_signers`, `org-root.pub`,
-`roster/`, and `revocations/`.
+By default, the execution settings file is `$HOME/.owenloop/settings.json`.
+For test or throwaway isolation, `OWENLOOP_CONFIG_DIR` may name an absolute
+directory used verbatim; `XDG_CONFIG_HOME` is not consulted. In the paths below,
+`<config>` means the resolved owenloop config directory. The same directory
+holds `credentials.json`, `allowed_signers`, `org-root.pub`, `roster/`, and
+`revocations/`.
 
 ### `shift start <crew...>`
 

@@ -523,8 +523,10 @@ sidecar is checked against the bundle digest and the local `allowed_signers`
 trust root. Origin verification is separate: `verifyOrigin` returns `absent`
 when the origin sidecar is missing, `verified` only after DSSE signature, schema,
 signer-key, and bundle-digest checks pass, and `unverifiable` or `invalid` for
-the corresponding failures. The trust-root path is
-`$HOME/.owenloop/allowed_signers`. A missing or malformed trust root produces the distinct
+the corresponding failures. The trust-root path is `<config>/allowed_signers`,
+where `<config>` is `$HOME/.owenloop` by default or the absolute
+`OWENLOOP_CONFIG_DIR` override. `XDG_CONFIG_HOME` is not consulted. A missing
+or malformed trust root produces the distinct
 `unverifiable` verdict; a present signature that fails verification produces
 `invalid`.
 
@@ -709,14 +711,16 @@ whole organization.
 
 ### Local anchor and envelope files
 
-The optional filesystem loader derives paths from the local home directory. The
-local layout is:
+The optional filesystem loader derives paths from the shared owenloop config
+directory (`$HOME/.owenloop` by default, or the absolute
+`OWENLOOP_CONFIG_DIR` override). `XDG_CONFIG_HOME` is not consulted. The local
+layout is:
 
 ```text
-$HOME/.owenloop/org-root.pub                     # public anchor, 0644
-$HOME/.owenloop/org-root                         # private anchor, 0600
-$HOME/.owenloop/roster/<sha256hex(keyid)>.grant.dsse
-$HOME/.owenloop/revocations/<sha256hex(keyid)>.revocation.dsse
+<config>/org-root.pub                     # public anchor, 0644
+<config>/org-root                         # private anchor, 0600
+<config>/roster/<sha256hex(keyid)>.grant.dsse
+<config>/revocations/<sha256hex(keyid)>.revocation.dsse
 ```
 
 The root key is stored outside `PrincipalKeyManager` because the root is not a
