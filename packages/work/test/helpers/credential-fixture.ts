@@ -96,6 +96,16 @@ export function seedCredentialStore(
  * store lookup misses and the child exits 2 before any hub contact. Drills that
  * need a non-default account seed that slot and pass `--as`/`OWENLOOP_ACCOUNT`
  * explicitly via `extra`.
+ *
+ * `OWENLOOP_CONFIG_DIR` is dropped for the same reason, and it is the one that
+ * bites hardest: the config-dir ladder is `OWENLOOP_CONFIG_DIR` >
+ * `$XDG_CONFIG_HOME/owenloop` > `$HOME/.config/owenloop` (`configDir` in
+ * `src/hub.ts`), so an ambient value OUTRANKS the `XDG_CONFIG_HOME` this
+ * fixture sets. Every owenloop shift exports it, which is exactly the
+ * environment an agent-driven build runs the suite in — the child would then
+ * read the developer's REAL config dir, find no credential for the drill's
+ * ephemeral `http://127.0.0.1:<port>` origin, and exit 2. CI never noticed:
+ * the `check` job runs on ubuntu-latest with the variable unset.
  */
 export function fixtureEnv(home: string, extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
   return {
@@ -105,6 +115,7 @@ export function fixtureEnv(home: string, extra: Record<string, string | undefine
     OWENLOOP_TOKEN: undefined, // WO-6.1: never the override — the store path IS the drill
     OWENLOOP_SESSION: '',
     OWENLOOP_ACCOUNT: undefined, // hermeticity: never inherit an ambient account (would miss the seeded agent:default slot)
+    OWENLOOP_CONFIG_DIR: undefined, // hermeticity: outranks XDG_CONFIG_HOME, so an ambient value would read the real config dir
     ...extra,
   };
 }

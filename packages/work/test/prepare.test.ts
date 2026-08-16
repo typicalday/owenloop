@@ -20,7 +20,25 @@ const DEMO = JSON.parse(fixture('demo-def.json')) as Record<string, unknown>;
 
 let cacheDir: string;
 let homeDir: string;
-const ENV_KEYS = ['HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'OWENLOOP_CACHE_DIR', 'OWENLOOP_TOKEN', 'OWENLOOP_ACCOUNT', 'OWENLOOP_NO_KEYCHAIN'];
+// OWENLOOP_CONFIG_DIR is in the list for hermeticity, not because the fixture
+// sets it: the config-dir ladder is OWENLOOP_CONFIG_DIR > $XDG_CONFIG_HOME/owenloop
+// > $HOME/.config/owenloop (`configDir` in src/hub.ts), so an ambient value
+// OUTRANKS the XDG_CONFIG_HOME below and prepare reads the developer's REAL
+// config dir — finding a real `hubOrigin` where the fixture wants none, and a
+// real credential where the fixture wants an empty store. Every owenloop shift
+// exports it, so the suite is red on an agent-driven build and green in CI,
+// where the variable is unset. Listing it here deletes it in `beforeEach` and
+// restores it in `afterEach` along with the rest.
+const ENV_KEYS = [
+  'HOME',
+  'XDG_CONFIG_HOME',
+  'XDG_CACHE_HOME',
+  'OWENLOOP_CACHE_DIR',
+  'OWENLOOP_CONFIG_DIR',
+  'OWENLOOP_TOKEN',
+  'OWENLOOP_ACCOUNT',
+  'OWENLOOP_NO_KEYCHAIN',
+];
 let savedEnv: Record<string, string | undefined>;
 
 beforeEach(() => {

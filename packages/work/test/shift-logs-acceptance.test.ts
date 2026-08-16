@@ -145,6 +145,14 @@ function env(): Record<string, string | undefined> {
     HOME: home,
     OWENLOOP_TOKEN: TOKEN,
     XDG_CONFIG_HOME: configDir,
+    // `runCli` spreads process.env into the child, and the config-dir ladder is
+    // OWENLOOP_CONFIG_DIR > $XDG_CONFIG_HOME/owenloop > $HOME/.config/owenloop
+    // (`configDir` in src/hub.ts) — so an ambient OWENLOOP_CONFIG_DIR OUTRANKS
+    // the XDG_CONFIG_HOME above and the child reads the developer's REAL config
+    // dir. `undefined` makes Node drop the key from the child env entirely.
+    // Every owenloop shift exports it, so the suite is red on an agent-driven
+    // build and green in CI, where the variable is unset.
+    OWENLOOP_CONFIG_DIR: undefined,
     NODE_NO_WARNINGS: '1',
   };
 }

@@ -195,6 +195,13 @@ beforeEach(() => {
   delete process.env['OWENLOOP_TOKEN'];
   delete process.env['OWENLOOP_SESSION'];
   delete process.env['OWENLOOP_ACCOUNT'];
+  // The config-dir ladder is OWENLOOP_CONFIG_DIR > $XDG_CONFIG_HOME/owenloop >
+  // $HOME/.config/owenloop (`configDir` in src/hub.ts), so an ambient
+  // OWENLOOP_CONFIG_DIR OUTRANKS the XDG_CONFIG_HOME set above and the credential
+  // lookup reads the developer's REAL config dir instead of the temp `home`.
+  // Every owenloop shift exports it, so the suite is red on an agent-driven
+  // build and green in CI, where the variable is unset.
+  delete process.env['OWENLOOP_CONFIG_DIR'];
   // Hermetic credential store: force owenloop's file backend (no real keychain
   // shell-out) so an unseeded store reads as absent → the refuse path.
   process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
