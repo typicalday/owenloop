@@ -157,6 +157,9 @@ import type { BundleIngestor, BundleSource, PreCommitVerifier } from './store/in
 import {
   asAgentIdentities,
   asCreateWorkflowOk,
+  asCapabilityRerouteAdded,
+  asCapabilityRerouteRemoved,
+  asCapabilityReroutes,
   asCapabilityRouteAdded,
   asCapabilityRouteRemoved,
   asCapabilityRoutes,
@@ -165,6 +168,8 @@ import {
   asCrewMemberAdded,
   asCrewMemberRemoved,
   asCrews,
+  asRoutingAlerts,
+  asRunRouting,
   asWhoami,
   computeServerDiff,
   credentialBackend,
@@ -1414,6 +1419,16 @@ ${' '.repeat(41)}the loaded def has drifted from the version the instance is pin
   capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
   capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
   capability list [--hub <url>]               list the hub org's capability routes
+  routing alerts [--workflow <wf>] [--limit <n>] [--hub <url>]
+${' '.repeat(41)}list the hub org's routing alerts — newest first org-wide; --workflow scopes to
+${' '.repeat(41)}one run and flips to oldest first. A \`binding-gap\` alert means the hub HELD an
+${' '.repeat(41)}offer because its compound capability had no live crew binding.
+  routing show <workflow> [--hub <url>]
+${' '.repeat(41)}print one HUB run's routing: modifier, wait policy, alerts, resolution reports
+${' '.repeat(41)}and escalations. Unrelated to the local \`show\`, which reads a def from sqlite.
+  routing rule list [--hub <url>]           list the org's capability reroute rules in the order the hub tries them
+  routing rule add <capability> <target> [--position <n>] [--hub <url>]   add one reroute rule — offer <capability> as <target> when it has no live crew binding (admin; idempotent per pair; no --position appends)
+  routing rule rm <capability> <target> [--hub <url>]   remove one reroute rule (admin; a rule that was never there is a no-op)
   crew list [--hub <url>]                  list the hub org's crews with their members (includes the orphan crew once one exists)
   crew new <name> --kind personal|shared [--owner <memberId>] [--hub <url>]   create a crew on the hub org (admin, or own personal crew; human credential)
   crew rm <crewId> [--hub <url>]           delete a crew; work stamped to it moves to the org's orphan crew
@@ -1509,6 +1524,11 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['instance', cmdOpts('hub')],
   ['agent', cmdOpts('crews', 'hub', 'scopes', 'shift')],
   ['capability', cmdOpts('hub')],
+  // Per-TOP-LEVEL-command allowlist, not per-subcommand: `--position` on
+  // `routing alerts` is meaningless but accepted and ignored, exactly as
+  // `--kind` is on `crew list`. Policing flags per subcommand is deliberately
+  // not built here.
+  ['routing', cmdOpts('hub', 'workflow', 'limit', 'position')],
   ['crew', cmdOpts('hub', 'kind', 'owner')],
   ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'crews', 'scopes', 'reuse-ssh-key')],
   ['doctor', cmdOpts('hub')],
@@ -5266,6 +5286,367 @@ async function dispatchCapability(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
+ * `owenloop routing alerts|show|rule list|rule add|rule rm` — read the hub's LIVE
+ * routing state, and administer the org's **capability reroute rules**.
+ *
+ * | subcommand | endpoint | auth principal |
+ * |---|---|---|
+ * | `routing alerts [--workflow <wf>] [--limit <n>]` | `GET /api/routing_alerts` | human (any role) |
+ * | `routing show <workflow>` | `GET /api/run_routing/:wf` | human (any role) |
+ * | `routing rule list` | `GET /api/capability_reroutes` | human (any role) |
+ * | `routing rule add <capability> <target> [--position <n>]` | `POST /api/add_capability_reroute` | human (admin role) |
+ * | `routing rule rm <capability> <target>` | `POST /api/remove_capability_reroute` | human (admin role) |
+ *
+ * **Three different objects share the word "routing" in this CLI. They are not
+ * interchangeable, and only one of them grants anybody work:**
+ *
+ *  - A **capability route** (`owenloop capability bind`) is a `(capability, crew)`
+ *    BINDING. It is the only one of the three that makes a crew eligible to claim
+ *    work.
+ *  - A **capability reroute rule** (`owenloop routing rule add`) is an ordered
+ *    SUBSTITUTION — "when `<capability>` has no live crew binding, offer the work
+ *    as `<target>` instead". It names no crew and grants nobody access; whether
+ *    the target can actually be served is a `capability bind` question.
+ *  - A **routing alert** (`owenloop routing alerts`) is an immutable EVENT row the
+ *    hub wrote about one offer at one instant. `kind: 'binding-gap'` is the one to
+ *    watch: a step's compound capability (e.g. `build:express`) had no live crew
+ *    binding, so the hub HELD the offer rather than silently falling back to
+ *    name matching. Holding is the intended behavior; the alert is how a human
+ *    finds out it happened.
+ *
+ * **`routing show <workflow>` is NOT the local `show` command.** `owenloop show`
+ * reads a workflow DEFINITION out of the local sqlite store and takes no `--hub`;
+ * `routing show` reads one STARTED RUN's routing state off the hub. They share no
+ * code path, and this deliberately did not arrive as a `--hub` flag on the local
+ * command — the same separation `instance show` keeps.
+ *
+ * **Two orderings are SEMANTIC and are never re-sorted client-side.** `routing
+ * alerts` unscoped returns the org's alerts NEWEST-FIRST (an inbox); adding
+ * `--workflow` scopes to one run AND flips to OLDEST-FIRST (a timeline). `routing
+ * rule list` returns rules in the order the hub TRIES them. Sorting any of these
+ * for looks would misreport what the hub actually does.
+ *
+ * **`rule add` can fail where `rule rm` cannot** — the deliberate asymmetry
+ * `capability bind`/`unbind` already has. `rule add` is idempotent per
+ * `(capability, target)` pair (a repeat is a 200 no-op reporting
+ * `alreadyPresent: true`), but the hub rejects a rule it considers invalid — a
+ * capability rerouted to itself, a malformed name — with a 400 whose `message` is
+ * surfaced verbatim, exit 1. `rule rm` answers a tolerant 200 `removed: false`
+ * when there was no such rule, which is exit 0 plus a stderr line. None of the
+ * hub's name rules are re-implemented here: the hub is the enforcement of record,
+ * the same stance the capability family takes.
+ *
+ * `routing show` on a workflow id this org does not own does NOT come back with a
+ * descriptive message: the hub verb throws an untyped error that its edge maps to
+ * HTTP 500 `{"error":"internal_error","message":"internal server error"}`, and
+ * that generic message is what this command prints (exit 1) — the same thing
+ * `instance show` does with the same hub behavior. The ladder below surfaces
+ * whatever `message` the hub sends, so a future typed 404 needs no change here.
+ *
+ * Exit codes: 0 ok — including `rule rm`'s tolerant `removed: false`; 1
+ * runtime/hub error (a 400 on `rule add`, a 403 for a non-admin on `rule
+ * add`/`rule rm`, an unknown workflow on `show`, a malformed 2xx, a network
+ * timeout); 2 the hub is unresolvable; 3 the human credential is absent or
+ * irrecoverable (the error names `owenloop login --hub <origin>`).
+ */
+async function dispatchRouting(io: CliIO, args: Args): Promise<number> {
+  const USAGE_FORMS =
+    'usage: owenloop routing alerts [--workflow <wf>] [--limit <n>] [--hub <url>]' +
+    ' | owenloop routing show <workflow> [--hub <url>]' +
+    ' | owenloop routing rule list [--hub <url>]' +
+    ' | owenloop routing rule add <capability> <target> [--position <n>] [--hub <url>]' +
+    ' | owenloop routing rule rm <capability> <target> [--hub <url>]';
+
+  // --- validation: everything below runs BEFORE any I/O, so a usage error on a
+  //     multi-hub machine reports the usage problem (exit 1), not exit 2.
+  const sub = args.positionals[1];
+  if (sub !== 'alerts' && sub !== 'show' && sub !== 'rule') {
+    throw new CliError(`unknown routing subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
+  }
+
+  let workflow = ''; // `show` only
+  let ruleSub: 'list' | 'add' | 'rm' | '' = ''; // `rule` only
+  let capability = ''; // `rule add` / `rule rm`
+  let target = ''; // `rule add` / `rule rm`
+  let workflowFilter: string | undefined; // `alerts` only
+  let limit: number | undefined; // `alerts` only
+  let position: number | undefined; // `rule add` only
+
+  if (sub === 'show') {
+    const rawWorkflow = args.positionals[2];
+    if (rawWorkflow === undefined || rawWorkflow === '') {
+      throw new CliError(`missing required argument: <workflow> (${USAGE_FORMS})`);
+    }
+    workflow = rawWorkflow;
+  } else if (sub === 'alerts') {
+    // `--workflow` with no value, or with an empty one, is a usage error rather
+    // than a silent org-wide listing. The hub treats `workflow=` as absent, so
+    // accepting an empty value would print `"workflow": ""` over an UNSCOPED
+    // result set — stdout claiming a filter that was never applied. OMITTING the
+    // flag entirely is the org-wide listing; that difference is preserved.
+    // (`dispatchStart`'s `requiredTextOption` makes the same distinction.)
+    if (args.missingOptionValues.has('workflow')) {
+      throw new CliError('missing value for --workflow: expected --workflow <wf>');
+    }
+    const rawFilter = last(args, 'workflow');
+    if (rawFilter !== undefined && rawFilter.trim() === '') {
+      throw new CliError('invalid empty value for --workflow: expected --workflow <wf>');
+    }
+    workflowFilter = rawFilter;
+    // `numOpt` throws a CliError on a non-numeric value — including a bare
+    // `--limit`, which the parser records as the string 'true'. This is flag
+    // hygiene, not a copy of hub semantics: the hub silently DROPS a
+    // non-positive-integer `limit` and applies its own default, which would
+    // report a page size the operator never asked for.
+    limit = numOpt(args, 'limit');
+  } else {
+    // Two-level subcommand, the `crew member add|rm` shape.
+    const rawRuleSub = args.positionals[2];
+    if (rawRuleSub !== 'list' && rawRuleSub !== 'add' && rawRuleSub !== 'rm') {
+      throw new CliError(`unknown routing rule subcommand '${rawRuleSub ?? ''}' — ${USAGE_FORMS}`);
+    }
+    ruleSub = rawRuleSub;
+    if (ruleSub === 'add' || ruleSub === 'rm') {
+      // Both are required for BOTH verbs: one call writes or clears exactly ONE
+      // `(capability, target)` rule, and a capability-only `rm` would drop every
+      // substitution the operator ever wrote for that source.
+      const rawCapability = args.positionals[3];
+      if (rawCapability === undefined || rawCapability === '') {
+        throw new CliError(`missing required argument: <capability> (${USAGE_FORMS})`);
+      }
+      capability = rawCapability;
+      const rawTarget = args.positionals[4];
+      if (rawTarget === undefined || rawTarget === '') {
+        throw new CliError(`missing required argument: <target> (${USAGE_FORMS})`);
+      }
+      target = rawTarget;
+      // Omitting `--position` APPENDS the rule; a non-numeric value is a
+      // client-side CliError for the same reason `--limit` is.
+      if (ruleSub === 'add') position = numOpt(args, 'position');
+    }
+    // No client-side charset validation of `capability` or `target` — the hub is
+    // the enforcement of record, the same stance `capability bind` takes.
+  }
+
+  const origin = resolveAgentHub(io, args, 'manage routing on');
+  const slot: CredentialSlotSelector = { principal: 'human' };
+
+  // The human bearer for the resolved origin. Absent → exit 3 with the same
+  // remedy wording `capability` uses.
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  try {
+    /**
+     * The ONE GET ladder all three reads share, so they can never drift apart in
+     * what they accept. It is `dispatchInstance`'s ladder — a 401 through
+     * `assertAuthOk`, then the hub's typed `message` surfaced VERBATIM for any
+     * other non-2xx — deliberately NOT `capability list`'s bare `assertAuthOk`,
+     * whose own comment freezes that generic wording to that command. `prefix` is
+     * the endpoint-qualified lead-in the narrower for this endpoint also uses, so
+     * a non-JSON body reports a FIXED string rather than V8's `SyntaxError`,
+     * which embeds a verbatim snippet of the raw body.
+     */
+    const readJson = async (path: string, prefix: string): Promise<unknown> => {
+      const { res, cred: used } = await authedGet(io, origin, slot, cred, path);
+      if (res.status === 401) assertAuthOk(res, used, origin);
+      if (!res.ok) {
+        const message = await hubRequestMessage(res);
+        throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+      }
+      try {
+        return (await res.json()) as unknown;
+      } catch {
+        throw new CliError(`${prefix} — body is not valid JSON`);
+      }
+    };
+
+    if (sub === 'alerts') {
+      // Both query params are optional and are sent ONLY when the operator asked
+      // for them, so the default request carries no `?` at all and the hub
+      // applies its own page size.
+      const qs = new URLSearchParams();
+      if (workflowFilter !== undefined) qs.set('workflow', workflowFilter);
+      if (limit !== undefined) qs.set('limit', String(limit));
+      const query = qs.toString();
+      const body = await readJson(
+        `/api/routing_alerts${query === '' ? '' : `?${query}`}`,
+        'routing_alerts: malformed response',
+      );
+      let alerts;
+      try {
+        alerts = asRoutingAlerts(body);
+      } catch (e) {
+        throw new CliError((e as Error).message);
+      }
+      // The guard's output — a whitelisted typed array — never the raw body, and
+      // in RECEIVED order (see the ordering paragraph above). The `workflow` key
+      // is echoed back only when a filter was applied, so a script can tell an
+      // oldest-first timeline from a newest-first inbox without re-reading argv.
+      print(io, {
+        ok: true,
+        hub: origin,
+        ...(workflowFilter === undefined ? {} : { workflow: workflowFilter }),
+        alerts,
+      });
+      return 0;
+    }
+
+    if (sub === 'show') {
+      // The workflow id is a path segment, so it must be encoded — an id carrying
+      // a slash would otherwise silently address a different route
+      // (`dispatchInstance`'s precedent).
+      const body = await readJson(
+        `/api/run_routing/${encodeURIComponent(workflow)}`,
+        'run_routing: malformed success response',
+      );
+      let wire;
+      try {
+        wire = asRunRouting(body);
+      } catch (e) {
+        throw new CliError((e as Error).message);
+      }
+      print(io, {
+        ok: true,
+        hub: origin,
+        // The SERVER-echoed id, not argv — the `capability bind` precedent.
+        workflow: wire.workflow,
+        defName: wire.defName,
+        // OMITTED, never `null` or `''`: the absence of this key is how stdout
+        // says "this run was started without a modifier". An empty string would
+        // read as "a modifier named nothing", which is not a state that exists.
+        ...(wire.modifier === undefined ? {} : { modifier: wire.modifier }),
+        waitPolicy: wire.waitPolicy,
+        alerts: wire.alerts,
+        resolutionReports: wire.resolutionReports,
+        escalations: wire.escalations,
+      });
+      return 0;
+    }
+
+    if (ruleSub === 'list') {
+      const body = await readJson('/api/capability_reroutes', 'capability_reroutes: malformed response');
+      let reroutes;
+      try {
+        reroutes = asCapabilityReroutes(body);
+      } catch (e) {
+        throw new CliError((e as Error).message);
+      }
+      // Printed in the hub's own try-order and never re-sorted: the array order
+      // IS which substitution the hub attempts first. Each row also carries its
+      // `position`, so a reader can check that ordering for themselves.
+      print(io, { ok: true, hub: origin, reroutes });
+      return 0;
+    }
+
+    // `rule add` and `rule rm` share one POST ladder. The bodies differ by exactly
+    // one optional field — `position`, add-only — because each call writes or
+    // clears exactly one `(capability, target)` rule. Only the path, the guard,
+    // and the printed shape differ.
+    const endpoint = ruleSub === 'add' ? 'add_capability_reroute' : 'remove_capability_reroute';
+    // The `position` KEY is omitted entirely when the flag is absent — that is
+    // what tells the hub to APPEND. Sending `null` or `0` would each mean
+    // something else.
+    const payload =
+      ruleSub === 'add' && position !== undefined ? { capability, target, position } : { capability, target };
+    const { res } = await authedPost(io, origin, slot, cred, `/api/${endpoint}`, payload);
+
+    if (res.status === 401) {
+      // A 401 that survived `authedPost`'s one refresh-and-retry. The human slot
+      // never holds an agent kind, so `assertAuthOk`'s non-agent wording applies;
+      // the catch below upgrades this to exit 3.
+      throw new CliError('credential rejected by the hub — run `owenloop login`');
+    }
+    if (!res.ok) {
+      // Surface the hub's typed `message` VERBATIM — this is how a rule the hub
+      // refuses (400 `capability_reroute_invalid`) and a non-admin 403 both
+      // surface uniformly. `hubRequestMessage` reads only the typed `message`
+      // field, so raw body text is never included.
+      const message = await hubRequestMessage(res);
+      throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+    }
+
+    let body: unknown;
+    try {
+      body = (await res.json()) as unknown;
+    } catch {
+      // A FIXED string — never V8's SyntaxError message, which embeds a verbatim
+      // snippet of the raw body.
+      throw new CliError(`${endpoint}: malformed success response — body is not valid JSON`);
+    }
+
+    if (ruleSub === 'add') {
+      let added;
+      try {
+        added = asCapabilityRerouteAdded(body);
+      } catch (e) {
+        throw new CliError((e as Error).message);
+      }
+      // SERVER-echoed capability/target/position, not argv. `position` especially:
+      // omitting `--position` appends, so the rank printed here is usually one the
+      // operator never typed. `alreadyPresent` and `ruleCount` carry the HUB's own
+      // field names verbatim, so an operator correlating stdout against the hub's
+      // audit log never has to translate. `createdAt` is validated but not printed
+      // — `routing rule list` is where a row's provenance belongs (the
+      // `capability bind` precedent).
+      print(io, {
+        ok: true,
+        hub: origin,
+        capability: added.reroute.capability,
+        target: added.reroute.target,
+        position: added.reroute.position,
+        alreadyPresent: added.alreadyPresent,
+        ruleCount: added.ruleCount,
+      });
+      // No stderr line on `add`: the write is idempotent per pair, so
+      // `alreadyPresent: true` is a normal no-op, and an add never removes a rule
+      // or parks a capability. There is no consequence to warn about.
+      return 0;
+    }
+
+    // `rule rm`: the guard proves the 2xx really was the remove verb's answer.
+    // `removedWire` (not `removed`) so `removedWire.removed` reads unambiguously —
+    // the naming `dispatchCapability` and `dispatchCrew` already use.
+    let removedWire;
+    try {
+      removedWire = asCapabilityRerouteRemoved(body);
+    } catch (e) {
+      throw new CliError((e as Error).message);
+    }
+    print(io, {
+      ok: true,
+      hub: origin,
+      capability: removedWire.capability,
+      target: removedWire.target,
+      removed: removedWire.removed,
+      remainingTargets: removedWire.remainingTargets,
+    });
+    // stderr only, so `| jq` on stdout is unaffected — mirroring `capability
+    // unbind`, which narrates its tolerant-false case and its notable side effect
+    // the same way.
+    if (!removedWire.removed) {
+      io.err(`${removedWire.capability} had no reroute to '${removedWire.target}' — nothing was removed`);
+    } else if (removedWire.remainingTargets.length === 0) {
+      io.err(
+        `${removedWire.capability}: no reroute rules remain — it now HOLDS whenever it has no live crew binding`,
+      );
+    }
+    return 0;
+  } catch (e) {
+    // A refresh-failure-family error (the human oauth is irrecoverable, or a 401
+    // survived the refresh-and-retry) is exit 3 with the login remedy; every
+    // other CliError propagates as-is — a network timeout stays exit 1, because a
+    // flaky network is not an irrecoverable credential.
+    if (e instanceof CliError && /run `owenloop login`/.test(e.message)) {
+      throw new CliError(`${e.message} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+    }
+    throw e;
+  }
+}
+
+/**
  * `owenloop crew list|new|rm|member add|member rm` — administer hub crews.
  * Modeled directly on `dispatchCapability`: same validate-before-I/O discipline,
  * same helpers (`resolveAgentHub`, `readCredential`, `authedGet`/`authedPost`,
@@ -6770,7 +7151,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'cancel', 'instance', 'agent', 'capability', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'cancel', 'instance', 'agent', 'capability', 'routing', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -6824,6 +7205,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchAgent(io, args);
       case 'capability':
         return await dispatchCapability(io, args);
+      case 'routing':
+        return await dispatchRouting(io, args);
       case 'crew':
         return await dispatchCrew(io, args);
       case 'setup':

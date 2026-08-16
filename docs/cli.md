@@ -60,6 +60,11 @@ for the full breakdown.
 | `capability bind <capability> <crew> [--hub <url>]` | add a crew to a workflow capability on the hub org — a capability may route to many crews (admin; human credential) — see [Capability routes](#capability-routes) |
 | `capability unbind <capability> <crew> [--hub <url>]` | remove one `(capability, crew)` route — see [Capability routes](#capability-routes) |
 | `capability list [--hub <url>]` | list the hub org's capability routes — see [Capability routes](#capability-routes) |
+| `routing alerts [--workflow <wf>] [--limit <n>] [--hub <url>]` | list the hub org's routing alerts — every hold, reroute, wait and fallback the hub recorded — see [Routing](#routing) |
+| `routing show <workflow> [--hub <url>]` | print one **hub run's** routing: modifier, wait policy, alerts, resolution reports and escalations — see [Routing](#routing) |
+| `routing rule list [--hub <url>]` | list the org's capability **reroute rules**, in the order the hub tries them — see [Routing](#routing) |
+| `routing rule add <capability> <target> [--position <n>] [--hub <url>]` | add one reroute rule — offer `<capability>` as `<target>` when it has no live crew binding (admin; human credential) — see [Routing](#routing) |
+| `routing rule rm <capability> <target> [--hub <url>]` | remove one reroute rule — see [Routing](#routing) |
 | `crew list [--hub <url>]` | list the hub org's crews with their members (includes the orphan crew once one exists) — see [Crews](#crews) |
 | `crew new <name> --kind personal\|shared [--owner <memberId>] [--hub <url>]` | create a crew on the hub org (admin, or own personal crew; human credential) — see [Crews](#crews) |
 | `crew rm <crewId> [--hub <url>]` | delete a crew; work stamped to it moves to the org's orphan crew — see [Crews](#crews) |
@@ -2062,6 +2067,237 @@ needs a translation step.
 |---|---|
 | `0` | the crew was added to the capability (or was already bound), the route was removed (or was already absent), or the routes were listed |
 | `1` | runtime or hub error — an unknown crew name (`capability bind` only; `capability unbind` answers a tolerant `removed: false` instead), a capability that fails the hub's name rules, a `403` for a non-admin, a malformed response, or a network timeout |
+| `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
+| `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
+
+## Routing
+
+`owenloop routing` reads and edits the hub's **live routing** state — what the
+hub did when it tried to reach a crew, and the operator's standing instructions
+for what to do when it cannot. [Routing](routing.md) is the conceptual guide;
+this section is the command surface.
+
+**Three different objects share the word "routing". They are not
+interchangeable:**
+
+| object | what it is | where it lives | which command |
+|---|---|---|---|
+| **capability route** | a `(capability, crew)` **binding** — the row that grants a crew the right to be offered that capability's work | `capability_routes` on the hub org | [`capability bind`/`unbind`/`list`](#capability-routes) |
+| **capability reroute rule** | an ordered operator statement — "when `<capability>` has no live crew binding, offer it as `<target>` instead" | `capability_reroutes` on the hub org | `routing rule list`/`add`/`rm` |
+| **routing alert** | an immutable **event row** the hub wrote when it held, rerouted, waited or fell back | `routing_alerts` on the hub org | `routing alerts`, and `routing show` for one run |
+
+**A reroute rule is not a binding.** It names no crew, grants nobody access, and
+has no live/dangling distinction. It only says which *other capability name* the
+hub may substitute — and the substitution only reaches a crew if that target
+capability has a live binding of its own. Adding a reroute rule can therefore
+never widen who may claim work by itself; the widening, if any, already exists in
+`capability_routes`.
+
+**A `binding-gap` alert means the hub HELD an offer** because its compound
+capability (`<capability>:<modifier>`, e.g. `build:express`) had no live crew
+binding, and it found no usable reroute target either. Holding is the deliberate
+default — the hub no longer silently falls back to the bare capability name — so
+these alerts are the record of work that is waiting rather than work that ran on
+the wrong grade. See [Routing §9b](routing.md#9b-the-new-rule-what-is-being-built).
+
+### `routing alerts`
+
+`GET /api/routing_alerts`, authenticated as your **human** credential. Lists the
+org's routing alerts. An org that has never held, rerouted, waited or fallen
+back is a normal success (exit 0) with an empty `alerts` array.
+
+**The array order is the hub's answer and is never re-sorted here, and the two
+orderings are different:**
+
+- **No `--workflow`** — an org-wide inbox, **newest first**. This is the "what is
+  wrong right now" view.
+- **`--workflow <wf>`** — one run's alerts, **oldest first**. This is a
+  chronological timeline: hold, then wait, then reroute, in the order the hub
+  decided them.
+
+Passing `--workflow` is what flips the ordering, so a script that pages through
+both must not assume one direction. The value is echoed back on stdout as
+`workflow` precisely so a reader can tell the two views apart without
+re-inspecting argv.
+
+`--limit <n>` caps how many rows the hub returns. Omit it and the hub applies
+its own default page size. The hub **silently ignores** a limit it cannot use (a
+non-integer, zero, or a negative) and answers with its default instead — so the
+CLI rejects a `--limit` that is not a number **before** any request, rather than
+reporting a page size you never asked for.
+
+A row's `modifier`, `step` and `detail` are legitimately `null` — an org-level
+event carrying no step or no modifier is a real state, not a defect — and they
+are printed as `null` rather than dropped. `detail` is an opaque per-kind
+metadata string the CLI forwards verbatim and never parses.
+
+### `routing show <workflow>`
+
+`GET /api/run_routing/<workflow>`, authenticated as your **human** credential.
+Prints the complete routing picture for ONE hub run: its modifier, its wait
+policy, its own alerts, its resolution reports (which rule matched for each step)
+and its escalations.
+
+**This is not the local `show` command.** `owenloop show <wf>` dumps the raw
+artifacts of a **local** instance out of the local sqlite database and never
+touches a hub. `owenloop routing show <workflow>` takes a **hub** workflow id and
+reads hub state. They share four letters and nothing else.
+
+`modifier` is **omitted entirely** for a run started without one. The key's
+absence is how stdout says "no modifier" — an empty string is never printed,
+because a modifier named nothing is not a state the hub can hold.
+
+**An unknown or foreign workflow id gets a generic error today.** The hub's verb
+raises an untyped error for a run this org does not own or that does not exist,
+and its edge maps that to `HTTP 500` with the message `internal server error`.
+The CLI prints whatever message the hub sends, so a future typed `404` will
+surface as a useful sentence with no change here — but do not read today's
+`internal server error` as a hub defect; it is what "no such run for you" looks
+like on this endpoint right now.
+
+`resolutionReports` and `escalations` belong to adjacent subsystems. Their rows
+are checked to be objects and then forwarded **verbatim**, so a field added on
+the hub widens what this command prints instead of breaking it.
+
+### `routing rule list`
+
+`GET /api/capability_reroutes`, authenticated as your **human** credential. Lists
+the org's reroute rules. An org with no rules is a normal success (exit 0) with
+an empty `reroutes` array.
+
+**The array order is semantic: it is the order the hub TRIES the substitutions
+in**, and it is never re-sorted here. Rows are grouped by source `capability` and
+ascending `position` within each group, so the first row for a capability is the
+first target the hub attempts. Re-sorting this list client-side — even
+alphabetically, even "for readability" — would misreport which substitution
+actually happens.
+
+### `routing rule add <capability> <target>`
+
+`POST /api/add_capability_reroute`, authenticated as your **human** credential;
+requires the **admin** role on the hub. Adds one ordered rule: when
+`<capability>` has no live crew binding, the hub may offer the work as
+`<target>` instead.
+
+The CLI performs no client-side validation of either argument — the hub is the
+enforcement of record. It rejects a rule whose `capability` and `target` are
+equal (`400 capability_reroute_invalid`), and the CLI surfaces that message
+verbatim.
+
+**`--position <n>` sets the rule's rank among the rules for that same
+`<capability>`,** counting from `0` — lower is tried first. **Omitting
+`--position` APPENDS** the rule after the source capability's existing rules. The
+flag is omitted from the request body entirely when you do not pass it; sending
+`0` would mean "try this first", which is a different instruction.
+
+**Adding is idempotent per `(capability, target)` pair.** Re-adding a pair that
+already exists is a normal success — the hub answers `200` with `alreadyPresent:
+true` and changes nothing (the original row keeps its position and timestamp).
+`ruleCount` reports how many rules the source capability has after the write.
+
+Chains are resolved **by the hub**, not by this CLI and not by the engine: if
+`a → b` and `b → c` both exist, the hub walks the chain and hands the engine one
+final substitution.
+
+### `routing rule rm <capability> <target>`
+
+`POST /api/remove_capability_reroute`, authenticated as your **human**
+credential; requires the **admin** role on the hub. Removes the ONE
+`(capability, target)` rule you name. `<target>` is **required**: a capability
+may have several reroute rules, so a capability-only removal would delete more
+than you asked for.
+
+**`rm` is idempotent, and unlike `add` it cannot fail on a bad pair.** Removing a
+rule that is not there is a normal success — the hub answers `200` with
+`removed: false` rather than a `404` — and the CLI prints a full document plus a
+stderr line saying nothing was removed. A script can call `routing rule rm`
+unconditionally without first checking whether the rule exists.
+
+**Removing the last rule for a capability makes it HOLD again.** `remainingTargets:
+[]` on stdout is that signal, and stderr says so in words: with no rule left, an
+offer for that capability with no live crew binding waits instead of
+substituting. Nothing is lost — the held work resumes as soon as a crew binds
+the capability or a rule is added back.
+
+### Flags, hub resolution, output and exits
+
+**Flags.** `--hub <url>` on every subcommand; `--workflow <wf>` and `--limit <n>`
+on `routing alerts`; `--position <n>` on `routing rule add` (plus the global
+`--db`/`--defs`). The allowlist is per top-level command, so `--position` on
+`routing alerts` is accepted and ignored rather than rejected — the same
+looseness `crew list` has with `--kind`.
+
+**Which hub gets acted on (`--hub`).** Resolution is the same narrow ladder
+`capability bind` uses, and for the same reason — a reroute rule written against
+the wrong org moves in-flight work and is not undone by a retry:
+
+1. `--hub <origin>` if given (normalized the same way as everywhere else).
+2. Otherwise the **one** hub your credential *file* stores — if exactly one is
+   present, it's used.
+3. Otherwise the command **exits 2** naming both remedies (pass `--hub`, or log
+   in to exactly one hub); when more than one hub is stored their origins are
+   listed back so you can pick.
+
+This does **not** fall back to `OWENLOOP_HUB` or the built-in default hub, and
+hub enumeration is **file-store only**: the keychain and the external-command
+backend cannot list their entries, so on such a machine step 2 cannot enumerate
+the store and you must pass `--hub`.
+
+**Printed JSON.** stdout is exactly one whitelisted JSON document per
+invocation, built from named fields — never a raw hub body — so `| jq` always
+works. Human progress lines (the two `routing rule rm` warnings) go to stderr
+only.
+
+| subcommand | stdout |
+|---|---|
+| `routing alerts` | `{ "ok": true, "hub": "<origin>", "workflow": "wf_1", "alerts": [ { "id": "ral_1", "at": 1738000000000, "workflow": "wf_1", "kind": "binding-gap", "capability": "build:express", "modifier": "express", "step": "builder", "detail": null } ] }` |
+| `routing show` | `{ "ok": true, "hub": "<origin>", "workflow": "wf_1", "defName": "delivery", "modifier": "express", "waitPolicy": { "wait": "forever" }, "alerts": [ … ], "resolutionReports": [ … ], "escalations": [ … ] }` |
+| `routing rule list` | `{ "ok": true, "hub": "<origin>", "reroutes": [ { "capability": "build:express", "target": "build:standard", "position": 0, "createdAt": 1738000000000 } ] }` |
+| `routing rule add` | `{ "ok": true, "hub": "<origin>", "capability": "build:express", "target": "build:standard", "position": 0, "alreadyPresent": false, "ruleCount": 2 }` |
+| `routing rule rm` | `{ "ok": true, "hub": "<origin>", "capability": "build:express", "target": "build:standard", "removed": true, "remainingTargets": ["build"] }` |
+
+Every field carries the **hub's own name**, verbatim — the same words its audit
+log and the web console use — so correlating stdout against them never needs a
+translation step.
+
+- `workflow` (`routing alerts`) — present **only** when you passed `--workflow`,
+  so its presence alone means the list is scoped and oldest-first. An empty
+  `--workflow ''` is rejected as a usage error rather than sent, because the hub
+  treats an empty value as absent and would answer org-wide under a stdout
+  claiming a filter.
+- `kind` (`routing alerts`, `routing show`) — the hub's own event name
+  (`binding-gap`, `reroute`, and others). It is forwarded verbatim and
+  deliberately **not** narrowed to a fixed set, so a kind the hub adds later
+  prints rather than breaks the command.
+- `modifier` (`routing show`) — **absent**, not `null`, for a run started without
+  a modifier. On an alert row the same field IS `null`-able, because an alert
+  that concerns no modified capability is a real event.
+- `waitPolicy` (`routing show`) — `{ "wait": "forever" }`, or
+  `{ "wait": "<duration>", "then": "fallback" }` for a timed policy. `then` is
+  absent on the forever form.
+- `position` (`routing rule list`, `routing rule add`) — the rule's rank among
+  the rules for the same source capability, from `0`; lower is tried first. On
+  `routing rule add` it is the rank the **hub** stored, which is routinely one
+  you never typed, because omitting `--position` appends.
+- `alreadyPresent` (`routing rule add`) — was this exact `(capability, target)`
+  pair already a rule before the call? `false` means the call created it.
+- `ruleCount` (`routing rule add`) — how many reroute rules the source capability
+  has after the write.
+- `removed` (`routing rule rm`) — did this call actually remove a rule? `false`
+  is the tolerant "it was never there" case, not an error.
+- `remainingTargets` (`routing rule rm`) — the targets the capability can still
+  be substituted with. `[]` means the capability now **HOLDS** whenever it has no
+  live crew binding: `jq '.remainingTargets | length == 0'`.
+- `capability` and `target` are the values the **hub** echoed back, not your
+  argv: if the hub normalized either, stdout tells the truth about what was
+  stored.
+
+**Exit codes.**
+
+| code | meaning |
+|---|---|
+| `0` | the alerts, run routing or rules were listed; the rule was added (or was already present); the rule was removed (or was already absent) |
+| `1` | usage error (an unknown subcommand, a missing `<workflow>`/`<capability>`/`<target>`, a non-numeric `--limit`, an empty `--workflow`) or a runtime or hub error — a self-referential rule, a `403` for a non-admin, an unknown workflow (see `routing show` above), a malformed response, or a network timeout |
 | `2` | the hub couldn't be resolved (no `--hub` and not exactly one stored hub) |
 | `3` | the human credential is missing or irrecoverable — the error names the remedy `owenloop login --hub <origin>` |
 

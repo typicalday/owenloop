@@ -1429,6 +1429,404 @@ export function asCapabilityRoutes(body: unknown): CapabilityRouteWire[] {
 }
 
 /**
+ * One **routing alert** as the hub reports it — an org-scoped record that the
+ * hub made a routing decision an operator needs to know about.
+ *
+ * A routing alert is NOT a capability route and NOT a capability reroute rule:
+ * a route and a reroute are both operator-owned CONFIGURATION rows, while an
+ * alert is an immutable EVENT the hub wrote about one offer at one instant. The
+ * three families share the word "routing" and nothing else.
+ *
+ * The alert that matters most is `kind: 'binding-gap'`: a step's composed
+ * capability (e.g. `build:express`) had no LIVE crew binding, so the hub HELD
+ * the offer instead of falling back to name matching. Holding is the intended
+ * behavior; this row is how a human learns it happened.
+ *
+ * `kind` is `'binding-gap' | 'wait-start' | 'fallback' | 'reroute'` on the wire
+ * today, but is deliberately NOT narrowed to that union — the same stance
+ * `CrewWire.kind` takes. The hub verbs are the enforcement of record, and a kind
+ * added there later must widen what the CLI PRINTS, never break the command.
+ *
+ * `capability` is always the COMPOUND the offer used (`build:express`), not the
+ * bare authored capability.
+ *
+ * `detail` is a JSON metadata string the hub composed for the console. It is
+ * forwarded VERBATIM as a string and never parsed here: parsing it would make
+ * this CLI a second consumer of an internal shape that no contract pins.
+ *
+ * `modifier`, `step` and `detail` are `string | null` — a `null` is the hub's
+ * own answer ("this alert has no step", "this run carries no modifier"), not a
+ * defect, so all three are validated leniently exactly like
+ * `CapabilityRouteWire.crewName`.
+ *
+ * Non-secret: the row names a workflow, a capability and a step — never a token.
+ */
+export interface RoutingAlertWire {
+  id: string;
+  at: number;
+  workflow: string;
+  kind: string;
+  capability: string;
+  modifier: string | null;
+  step: string | null;
+  detail: string | null;
+}
+
+/**
+ * Validate the eight `RoutingAlertWire` fields on one row. `prefix` is the
+ * endpoint-qualified lead-in the caller wants (e.g.
+ * `routing_alerts: malformed response`) and `where` names the offending
+ * position (`alerts[2]`) — a FIELD/INDEX name only, never a value.
+ *
+ * Shared by BOTH endpoints that carry alert rows (`GET /api/routing_alerts` and
+ * `GET /api/run_routing/:wf`), so the two can never drift apart in what they
+ * accept — the same reason `asCapabilityRouteRow` is shared by its three
+ * callers.
+ */
+function asRoutingAlertRow(entry: unknown, prefix: string, where: string): RoutingAlertWire {
+  if (typeof entry !== 'object' || entry === null) {
+    throw new Error(`${prefix} — ${where} is not an object`);
+  }
+  const e = entry as Record<string, unknown>;
+  for (const field of ['id', 'workflow', 'kind', 'capability'] as const) {
+    if (typeof e[field] !== 'string' || e[field] === '') {
+      throw new Error(`${prefix} — ${where} missing non-empty string ${field}`);
+    }
+  }
+  if (typeof e.at !== 'number') {
+    throw new Error(`${prefix} — ${where} missing number at`);
+  }
+  // Lenient exactly like `asCapabilityRouteRow`'s `crewName`: absent or `null`
+  // both mean "the hub has nothing to report here", which is a normal answer for
+  // all three of these fields.
+  const nullableString = (field: 'modifier' | 'step' | 'detail'): string | null => {
+    const value = e[field];
+    if (value === undefined || value === null) return null;
+    if (typeof value !== 'string' || value === '') {
+      throw new Error(`${prefix} — ${where} ${field} must be a non-empty string or null`);
+    }
+    return value;
+  };
+  return {
+    id: e.id as string,
+    at: e.at,
+    workflow: e.workflow as string,
+    kind: e.kind as string,
+    capability: e.capability as string,
+    modifier: nullableString('modifier'),
+    step: nullableString('step'),
+    detail: nullableString('detail'),
+  };
+}
+
+/**
+ * Narrow `GET /api/routing_alerts`' 200 body (`{ text, alerts: [...] }`) to a
+ * typed array. An EMPTY array is valid — "this org has recorded no routing
+ * alerts" is a normal, and in fact the desirable, answer.
+ *
+ * **The array is forwarded IN WIRE ORDER and must never be re-sorted.** The
+ * order is meaningful and it is not the same order in both modes: unscoped the
+ * hub returns the org's alerts NEWEST-FIRST (an inbox), while `?workflow=`
+ * scopes to one run AND flips to OLDEST-FIRST (a timeline). A client-side sort
+ * would destroy whichever of the two the operator asked for.
+ */
+export function asRoutingAlerts(body: unknown): RoutingAlertWire[] {
+  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).alerts)) {
+    throw new Error('routing_alerts: malformed response — expected an `alerts` array');
+  }
+  const list = (body as Record<string, unknown>).alerts as unknown[];
+  return list.map((entry, i) => asRoutingAlertRow(entry, 'routing_alerts: malformed response', `alerts[${i}]`));
+}
+
+/**
+ * `GET /api/run_routing/:wf`'s 200 body, narrowed — one run's routing state with
+ * the three adjacent subsystems that explain it joined in at read time.
+ *
+ * `modifier` is OPTIONAL and its ABSENCE is the signal: a run started without
+ * `--modifier` carries no modifier at all, and the hub omits the key rather than
+ * sending `''` or `null`. The key is therefore omitted from the narrowed value
+ * too, never defaulted — an empty string here would read as "a modifier named
+ * nothing", which is not a state the system has.
+ *
+ * **Validation depth is deliberately uneven, and the split is the point:**
+ *
+ *  - `workflow`, `defName`, `modifier`, `waitPolicy.wait` and every `alerts[]`
+ *    row are THIS feature's own vocabulary, so they are validated in full.
+ *  - `resolutionReports[]` and `escalations[]` are rows belonging to the shift
+ *    -resolution and engine-escalation subsystems, joined here for reading only.
+ *    Each entry is object-checked and then forwarded VERBATIM (the same stance
+ *    `instance show` takes for its joined arrays), so an additive change to
+ *    either subsystem widens what this command prints instead of breaking it.
+ *
+ * All three arrays must nonetheless be PRESENT. That is the
+ * `asCapabilityRouteRemoved.remainingCrewIds` lesson applied again: defaulting
+ * an absent array to `[]` would assert "nothing is degraded on this run" — the
+ * reassuring reading — off a malformed body, and reassurance is exactly the
+ * answer a reader must not be given by accident.
+ *
+ * `waitPolicy.then` is forwarded verbatim when present for the same reason the
+ * joined rows are: its shape is the wait subsystem's to define.
+ */
+export interface RunRoutingWire {
+  workflow: string;
+  defName: string;
+  modifier?: string;
+  waitPolicy: { wait: string; then?: unknown };
+  alerts: RoutingAlertWire[];
+  resolutionReports: unknown[];
+  escalations: unknown[];
+}
+
+/**
+ * Narrow `GET /api/run_routing/:wf`'s 200 body. Throws on anything malformed,
+ * naming the offending FIELD or INDEX only — no body value is ever echoed.
+ *
+ * Uses the `malformed success response` wording rather than `malformed
+ * response`, matching `get_status`, the other single-resource GET: a body that
+ * fails here arrived with a 2xx, and saying so distinguishes it from the hub
+ * having refused the request outright.
+ */
+export function asRunRouting(body: unknown): RunRoutingWire {
+  const prefix = 'run_routing: malformed success response';
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    throw new Error(`${prefix} — not an object`);
+  }
+  const b = body as Record<string, unknown>;
+  for (const field of ['workflow', 'defName'] as const) {
+    if (typeof b[field] !== 'string' || b[field] === '') {
+      throw new Error(`${prefix} — missing non-empty string ${field}`);
+    }
+  }
+  // ABSENT is legitimate (an unmodified run) and is preserved as absent. `''` is
+  // NOT legitimate — the hub omits the key instead — so it is malformed here
+  // rather than silently normalized to "no modifier".
+  let modifier: string | undefined;
+  if (b.modifier !== undefined) {
+    if (typeof b.modifier !== 'string' || b.modifier === '') {
+      throw new Error(`${prefix} — modifier must be a non-empty string when present`);
+    }
+    modifier = b.modifier;
+  }
+  if (typeof b.waitPolicy !== 'object' || b.waitPolicy === null || Array.isArray(b.waitPolicy)) {
+    throw new Error(`${prefix} — waitPolicy is not an object`);
+  }
+  const waitPolicyWire = b.waitPolicy as Record<string, unknown>;
+  if (typeof waitPolicyWire.wait !== 'string' || waitPolicyWire.wait === '') {
+    throw new Error(`${prefix} — waitPolicy missing non-empty string wait`);
+  }
+  const waitPolicy: { wait: string; then?: unknown } = { wait: waitPolicyWire.wait };
+  if (waitPolicyWire.then !== undefined) waitPolicy.then = waitPolicyWire.then;
+
+  if (!Array.isArray(b.alerts)) {
+    throw new Error(`${prefix} — missing array alerts`);
+  }
+  const alerts = (b.alerts as unknown[]).map((entry, i) => asRoutingAlertRow(entry, prefix, `alerts[${i}]`));
+
+  // Object-checked and forwarded verbatim — see the interface's doc comment for
+  // why these two are not deep-validated and why their PRESENCE is still required.
+  const joined = (field: 'resolutionReports' | 'escalations'): unknown[] => {
+    const value = b[field];
+    if (!Array.isArray(value)) {
+      throw new Error(`${prefix} — missing array ${field}`);
+    }
+    return (value as unknown[]).map((entry, i) => {
+      if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+        throw new Error(`${prefix} — ${field}[${i}] is not an object`);
+      }
+      return entry;
+    });
+  };
+
+  return {
+    workflow: b.workflow as string,
+    defName: b.defName as string,
+    ...(modifier === undefined ? {} : { modifier }),
+    waitPolicy,
+    alerts,
+    resolutionReports: joined('resolutionReports'),
+    escalations: joined('escalations'),
+  };
+}
+
+/**
+ * One **capability reroute rule** as the hub reports it — an operator-defined,
+ * ORDERED statement that reads "when `<capability>` has no LIVE crew binding,
+ * offer the work as `<target>` instead".
+ *
+ * **A reroute is NOT a binding.** It names no crew, grants nobody access, and
+ * certifies nothing. It only renames the capability an already-unbound offer
+ * goes out under, so the claiming shift resolves the TARGET's model rather than
+ * silently falling back to a bare-name row. Whether the target can actually be
+ * served is a separate, `capability_routes` question, and there is deliberately
+ * no liveness column on this row to imply otherwise.
+ *
+ * `position` is the rule's rank WITHIN its source capability: the hub walks a
+ * source's rules in ascending `position` and takes the first target that has a
+ * live binding.
+ *
+ * Non-secret: the row names two capability strings and when the rule was written.
+ */
+export interface CapabilityRerouteWire {
+  capability: string;
+  target: string;
+  position: number;
+  createdAt: number;
+}
+
+/**
+ * Validate the four common `CapabilityRerouteWire` fields on one row. `prefix`
+ * is the endpoint-qualified lead-in and `where` names the offending position
+ * (`reroute`, or `reroutes[2]`) — a FIELD/INDEX name only, never a value.
+ *
+ * No field here is nullable: unlike a capability route, a reroute rule names no
+ * crew, so it has no dangling case to represent.
+ */
+function asCapabilityRerouteRow(entry: unknown, prefix: string, where: string): CapabilityRerouteWire {
+  if (typeof entry !== 'object' || entry === null) {
+    throw new Error(`${prefix} — ${where} is not an object`);
+  }
+  const e = entry as Record<string, unknown>;
+  for (const field of ['capability', 'target'] as const) {
+    if (typeof e[field] !== 'string' || e[field] === '') {
+      throw new Error(`${prefix} — ${where} missing non-empty string ${field}`);
+    }
+  }
+  for (const field of ['position', 'createdAt'] as const) {
+    if (typeof e[field] !== 'number') {
+      throw new Error(`${prefix} — ${where} missing number ${field}`);
+    }
+  }
+  return {
+    capability: e.capability as string,
+    target: e.target as string,
+    position: e.position as number,
+    createdAt: e.createdAt as number,
+  };
+}
+
+/**
+ * Narrow `GET /api/capability_reroutes`' 200 body (`{ text, reroutes: [...] }`)
+ * to a typed array. An EMPTY array is valid — "this org has configured no
+ * reroute rules", which is the default and correct state for most orgs.
+ *
+ * THE ARRAY KEY IS `reroutes`. It is neither `bindings` (what the sibling
+ * `capability_routes` endpoint uses) nor `rules` (what the feature is called in
+ * prose). Guessing that key is precisely how `capability list` shipped broken
+ * TWICE — see `asCapabilityRoutes` — so it is copied from
+ * `hub-core/src/verbs/list-capability-reroutes.ts` rather than inferred.
+ *
+ * **Rows arrive in the order the hub TRIES them** (`capability`, then
+ * `position`, then `target`) and are forwarded exactly as received. The order is
+ * SEMANTIC: it is the sequence in which a source's targets are attempted.
+ * Re-sorting it — in this function, in a caller, or in a test fixture — would
+ * silently misreport which substitution happens first.
+ */
+export function asCapabilityReroutes(body: unknown): CapabilityRerouteWire[] {
+  if (typeof body !== 'object' || body === null || !Array.isArray((body as Record<string, unknown>).reroutes)) {
+    throw new Error('capability_reroutes: malformed response — expected a `reroutes` array');
+  }
+  const list = (body as Record<string, unknown>).reroutes as unknown[];
+  return list.map((entry, i) =>
+    asCapabilityRerouteRow(entry, 'capability_reroutes: malformed response', `reroutes[${i}]`),
+  );
+}
+
+/**
+ * `POST /api/add_capability_reroute`'s 200 body, narrowed.
+ *
+ * NESTED exactly as the wire nests it: the row lives under `reroute`, while
+ * `alreadyPresent` and `ruleCount` live at the BODY's top level — the same shape
+ * (and the same reason for mirroring it literally) as `CapabilityRouteAddedWire`.
+ *
+ * - `alreadyPresent` — was this exact `(capability, target)` pair already a
+ *   rule? The add is idempotent per pair, so a repeat is a 200 no-op rather than
+ *   an error, and `reroute.createdAt` then echoes the ORIGINAL row.
+ * - `ruleCount` — how many rules the SOURCE capability has after the write.
+ */
+export interface CapabilityRerouteAddedWire {
+  reroute: CapabilityRerouteWire;
+  alreadyPresent: boolean;
+  ruleCount: number;
+}
+
+/**
+ * Narrow `POST /api/add_capability_reroute`'s 200 body
+ * (`{ text, reroute, alreadyPresent, ruleCount }`), naming the offending field
+ * only — the same discipline as `asCapabilityRouteAdded`.
+ *
+ * There is no layered non-null check here of the kind `asCapabilityRouteAdded`
+ * applies to `binding.crewName`: a reroute row has no nullable field, because it
+ * resolves no crew.
+ */
+export function asCapabilityRerouteAdded(body: unknown): CapabilityRerouteAddedWire {
+  const prefix = 'add_capability_reroute: malformed success response';
+  if (typeof body !== 'object' || body === null) {
+    throw new Error(`${prefix} — not an object`);
+  }
+  const b = body as Record<string, unknown>;
+  if (b.reroute === undefined) {
+    throw new Error(`${prefix} — missing reroute`);
+  }
+  const reroute = asCapabilityRerouteRow(b.reroute, prefix, 'reroute');
+  if (typeof b.alreadyPresent !== 'boolean') {
+    throw new Error(`${prefix} — missing boolean alreadyPresent`);
+  }
+  if (typeof b.ruleCount !== 'number') {
+    throw new Error(`${prefix} — missing number ruleCount`);
+  }
+  return { reroute, alreadyPresent: b.alreadyPresent, ruleCount: b.ruleCount };
+}
+
+/**
+ * Narrow `POST /api/remove_capability_reroute`'s 200 body
+ * (`{ text, capability, target, removed, remainingTargets }`).
+ *
+ * `removed` must be a BOOLEAN — this guard is how the CLI proves the 2xx really
+ * was the remove verb's answer. BOTH values are deliberate hub responses:
+ *   - `true`  — the `(capability, target)` rule existed and is now gone;
+ *   - `false` — there was no such rule, so there was nothing to do. The hub
+ *     answers 200, never a 404 (the same tolerance `remove_capability_route`
+ *     has), and that is what makes `routing rule rm` idempotent.
+ *
+ * `remainingTargets` is deliberately STRICT — PRESENT, an array, and every
+ * element a non-empty string. This is the identical asymmetry argued at
+ * `asCapabilityRouteRemoved`: defaulting an absent array to `[]` would assert
+ * "this capability now HOLDS whenever it is unbound" — the alarming reading, and
+ * exactly the signal an operator acts on — off a malformed body. Unlike the
+ * capability-route family there is no nullable field to balance it against, so
+ * every field here is strict.
+ *
+ * The stdout shape built from this is documented in `docs/cli.md` under Routing.
+ */
+export function asCapabilityRerouteRemoved(
+  body: unknown,
+): { capability: string; target: string; removed: boolean; remainingTargets: string[] } {
+  const prefix = 'remove_capability_reroute: malformed success response';
+  if (typeof body !== 'object' || body === null) {
+    throw new Error(`${prefix} — not an object`);
+  }
+  const b = body as Record<string, unknown>;
+  if (typeof b.removed !== 'boolean') {
+    throw new Error(`${prefix} — missing boolean removed`);
+  }
+  for (const field of ['capability', 'target'] as const) {
+    if (typeof b[field] !== 'string' || b[field] === '') {
+      throw new Error(`${prefix} — missing non-empty string ${field}`);
+    }
+  }
+  if (!Array.isArray(b.remainingTargets)) {
+    throw new Error(`${prefix} — missing array remainingTargets`);
+  }
+  const remainingTargets = (b.remainingTargets as unknown[]).map((entry, i) => {
+    if (typeof entry !== 'string' || entry === '') {
+      throw new Error(`${prefix} — remainingTargets[${i}] is not a non-empty string`);
+    }
+    return entry;
+  });
+  return { capability: b.capability as string, target: b.target as string, removed: b.removed, remainingTargets };
+}
+
+/**
  * A **crew** as the hub reports it — an org-scoped queue that agent work is
  * stamped to. `kind` is `'personal' | 'shared' | 'orphan'` on the wire, but is
  * deliberately NOT narrowed to that union here: `'orphan'` is a real value
