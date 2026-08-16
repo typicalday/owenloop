@@ -60,6 +60,10 @@ export interface SpawnSpec {
   harness?: string;
   /** Closed start gate created by the durable Shift reservation. */
   startGate?: string;
+  /** Stable shift name in force when this worker was dispatched. */
+  shiftName?: string;
+  /** Stable owner key for session reconciliation. */
+  shiftOwner?: string;
 }
 
 /** The result the loop records plus best-effort pre-start cancellation handles. */
@@ -292,6 +296,12 @@ export function buildSpawnPlan(
 	...process.env,
 	OWENLOOP_ACCOUNT: account,
 	...(spec.startGate !== undefined ? { OWENLOOP_START_GATE: spec.startGate } : {}),
+	...(spec.shiftName !== undefined && spec.shiftName !== ''
+	  ? { OWENLOOP_SHIFT_NAME: spec.shiftName }
+	  : {}),
+	...(spec.shiftOwner !== undefined && spec.shiftOwner !== ''
+	  ? { OWENLOOP_SHIFT_OWNER: spec.shiftOwner }
+	  : {}),
 	...(allowedWorkdirRoots !== undefined && allowedWorkdirRoots.length > 0
 	  ? { OWENLOOP_ALLOWED_WORKDIR_ROOTS: allowedWorkdirRoots.join(':') }
 	  : {}),

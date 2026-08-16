@@ -341,6 +341,15 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     return 1;
   }
 
+  const now = () => Date.now();
+  const shiftId = `shf_${randomUUID()}`;
+  const startedAt = now();
+  const name = resolveShiftName(parsed.name, { shiftId });
+  // Explicit names are the human/stable identity. Unnamed shifts deliberately
+  // keep their per-boot public suffix for presence uniqueness, so their durable
+  // state directory is the stable owner key used by session reconciliation.
+  const shiftOwner = parsed.name ?? stateDir;
+
   try {
     ensureStateDir(stateDir);
   } catch (err) {
@@ -348,15 +357,28 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     return 1;
   }
   {
-    const liveRunIds = new Set(
-      reconcileInFlight(stateDir).live.filter((r) => r.kind === 'agent-run').map((r) => r.run),
-    );
+    // Reconcile the Shift's own dispatch records for capacity housekeeping. The
+    // session sweep below must use the session row's PID and ownership fields,
+    // not this run-id set, because every Shift on the machine shares the store.
+    reconcileInFlight(stateDir);
     try {
-      const retired = reconcileActiveSessions(sessionsPath(cacheDir), liveRunIds, Date.now());
+      const configuredHarness = env['OWENLOOP_HARNESS'];
+      const retired = reconcileActiveSessions(
+        sessionsPath(cacheDir),
+        {
+          shiftName: name,
+          shiftOwner,
+          ...(configuredHarness !== undefined && configuredHarness.trim() !== ''
+            ? { harness: configuredHarness }
+            : {}),
+        },
+        Date.now(),
+      );
       for (const rec of retired) {
         process.stderr.write(
           `${roleLabel}: retired orphaned session ${rec.workflow}/${rec.run} step '${rec.step}' ` +
-            `(harness '${rec.harness}', attempt ${String(rec.attempt ?? 1)}) — its worker is gone, ` +
+            `(harness '${rec.harness}', attempt ${String(rec.attempt ?? 1)}, ` +
+            `shift '${String(rec.shiftName)}', pid ${String(rec.pid)} confirmed dead) — its worker is gone, ` +
             'so the next attempt replays cold\n',
         );
       }
@@ -421,7 +443,6 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       ? parsed.workRoots.map((entry) => resolve(process.cwd(), entry))
       : resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd());
   const hub = createHubClient({ origin, getToken: async () => token });
-  const now = () => Date.now();
   const monotonicNow = () => performance.now();
   const home = [env.HOME, env.USERPROFILE].find(
     (value) => value !== undefined && value.trim() !== '',
@@ -445,9 +466,6 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     if (await instructionSource.prime(order.defDigest) !== 'resolved') return undefined;
     return instructionSource.getVerifiedStep(order.defDigest, order.step);
   };
-  const shiftId = `shf_${randomUUID()}`;
-  const startedAt = now();
-  const name = resolveShiftName(parsed.name, { shiftId });
   let daemon: ShiftDaemon | undefined;
   /**
    * `loop` is constructed BELOW this function, so it is captured by reference
@@ -561,6 +579,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     cap,
     serveCrews: parsed.serveCrews ?? [],
     name,
+    shiftOwner,
     commandRouting: settings.commandRouting,
     resolveOrderStep,
     pollIntervalMs,

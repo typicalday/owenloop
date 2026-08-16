@@ -108,6 +108,8 @@ export interface ShiftLoopOptions {
   /** Shift name for presence. INITIAL value only — live-mutable via
    *  `ShiftLoop.setShift` (MCP `clock_in`). */
   name: string;
+  /** Stable owner key for session records; unlike `name`, it is not clocked in. */
+  shiftOwner?: string;
   /**
    * W7: this Shift process incarnation's self-declared id (`shf_<uuid>`)
    * and process start time — carried on presence pings (attribution/
@@ -523,6 +525,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	run: c.order.run,
 	step: c.order.step,
 	...(childKind === 'agent-run' ? { kind: 'agent-run' as const } : {}),
+	...(childKind === 'agent-run' ? { shiftName } : {}),
+	...(childKind === 'agent-run' && opts.shiftOwner !== undefined ? { shiftOwner: opts.shiftOwner } : {}),
 	startGate: reserved.gatePath,
       });
       cancel = spawned.cancel ?? spawned.terminate;

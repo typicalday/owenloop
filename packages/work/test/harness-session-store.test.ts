@@ -26,6 +26,7 @@ import {
   readSessions,
   reconcileActiveSessions,
   sessionsPath,
+  shouldRetireSession,
   type SessionRecord,
 } from '../src/harness/session-store.ts';
 import {
@@ -110,6 +111,16 @@ function startBarrierAppendWorker(target: string, record: SessionRecord): {
     },
     done,
   };
+}
+
+function exitedPid(): Promise<number> {
+  const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  const pid = child.pid;
+  assert.ok(pid !== undefined, 'the dead-pid fixture must have a PID');
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('exit', () => resolve(pid));
+  });
 }
 
 test('sessionsPath and orderId build the two derived strings', () => {
@@ -706,11 +717,15 @@ test('markRunSessionsDead cannot shadow a completed append that reaches the held
 });
 
 test('reconcileActiveSessions retires only newest orphaned active rows', () => {
-  appendSession(file, rec({ run: 'orphan', order: orderId('wf_1', 'orphan'), status: 'active' }));
+  appendSession(file, rec({ run: 'orphan', order: orderId('wf_1', 'orphan'), status: 'active', shiftName: 'A', pid: 101 }));
   appendSession(file, rec({ run: 'complete', order: orderId('wf_1', 'complete'), status: 'submitted' }));
-  appendSession(file, rec({ run: 'live', order: orderId('wf_1', 'live'), status: 'active' }));
+  appendSession(file, rec({ run: 'live', order: orderId('wf_1', 'live'), status: 'active', shiftName: 'A', pid: 202 }));
 
-  const retired = reconcileActiveSessions(file, new Set(['live']), 5000);
+  const retired = reconcileActiveSessions(file, {
+    shiftName: 'A',
+    harness: 'fake',
+    isAlive: (pid) => pid === 202,
+  }, 5000);
 
   assert.deepEqual(retired.map((record) => record.run), ['orphan']);
   assert.equal(latestFor(file, 'wf_1', 'orphan', 'builder')?.status, 'dead');
@@ -719,15 +734,88 @@ test('reconcileActiveSessions retires only newest orphaned active rows', () => {
 });
 
 test('reconcileActiveSessions cannot shadow a submitted append from its retirement snapshot', async () => {
-  appendSession(file, rec({ status: 'active', token: 'active-before-reconcile' }));
+  appendSession(file, rec({ status: 'active', token: 'active-before-reconcile', shiftName: 'A', pid: 101 }));
   const completed = rec({ status: 'turn-ended', token: 'completed-during-reconcile', updatedAt: 6000 });
   const worker = startBarrierAppendWorker(file, completed);
 
-  const retired = reconcileActiveSessions(file, new Set(), 5000, {
+  const retired = reconcileActiveSessions(file, {
+    shiftName: 'A',
+    harness: 'fake',
+    isAlive: () => false,
+  }, 5000, {
     afterWriterSnapshot: worker.waitUntilAppendAttempted,
   });
   await worker.done;
 
   assert.deepEqual(retired.map((record) => record.token), ['active-before-reconcile']);
   assert.deepEqual(latestFor(file, 'wf_1', 'run_1', 'builder'), completed);
+});
+
+test('shouldRetireSession fails safe for foreign, live, incomplete, and mismatched rows', () => {
+  const base = rec({ shiftName: 'A', pid: 4242, harness: 'fake' });
+  const dead = { isAlive: () => false };
+  const live = { isAlive: () => true };
+
+  assert.equal(shouldRetireSession(base, { shiftName: 'B', harness: 'codex', ...dead }).retire, false);
+  assert.equal(shouldRetireSession({ ...base, shiftName: undefined }, { shiftName: 'A', harness: 'fake', ...dead }).retire, false);
+  assert.equal(shouldRetireSession({ ...base, pid: undefined }, { shiftName: 'A', harness: 'fake', ...dead }).retire, false);
+  assert.equal(shouldRetireSession(base, { shiftName: 'A', harness: 'fake', ...live }).retire, false);
+  assert.equal(shouldRetireSession(base, { shiftName: 'A', harness: 'codex', ...dead }).retire, false);
+  assert.equal(shouldRetireSession({ ...base, shiftId: 'shf_previous-incarnation' }, { shiftName: 'A', harness: 'fake', ...dead }).retire, true);
+});
+
+test('a booting sibling leaves a live session untouched and emits no retire warning', () => {
+  const original = rec({
+    status: 'active',
+    shiftName: 'A',
+    shiftId: 'shf_a',
+    pid: process.pid,
+    harness: 'fake',
+  });
+  appendSession(file, original);
+  const warnings: string[] = [];
+
+  const retired = reconcileActiveSessions(file, {
+    shiftName: 'B',
+    harness: 'codex',
+  }, 5000, {
+    warn: (line) => warnings.push(line),
+  });
+
+  assert.deepEqual(retired, []);
+  assert.deepEqual(latestFor(file, original.workflow, original.run, original.step), original);
+  assert.deepEqual(warnings, [], 'a foreign live record must not produce a retire warning');
+});
+
+test('an owned dead session is retired, while a dead harness mismatch warns and survives', async () => {
+  const pid = await exitedPid();
+  const original = rec({
+    status: 'active',
+    shiftName: 'A',
+    shiftId: 'shf_previous-incarnation',
+    pid,
+    harness: 'fake',
+  });
+  appendSession(file, original);
+  const retired = reconcileActiveSessions(file, { shiftName: 'A', harness: 'fake' }, 5000);
+
+  assert.deepEqual(retired, [original]);
+  assert.deepEqual(latestFor(file, original.workflow, original.run, original.step), {
+    ...original,
+    status: 'dead',
+    updatedAt: 5000,
+  });
+
+  const mismatchFile = join(dir, 'mismatch.jsonl');
+  const mismatch = { ...original, run: 'run_mismatch', order: orderId(original.workflow, 'run_mismatch') };
+  appendSession(mismatchFile, mismatch);
+  const warnings: string[] = [];
+  const mismatchRetired = reconcileActiveSessions(mismatchFile, { shiftName: 'A', harness: 'codex' }, 5000, {
+    warn: (line) => warnings.push(line),
+  });
+
+  assert.deepEqual(mismatchRetired, []);
+  assert.deepEqual(latestFor(mismatchFile, mismatch.workflow, mismatch.run, mismatch.step), mismatch);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /harness mismatch/u);
 });

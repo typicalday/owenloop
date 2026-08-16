@@ -384,6 +384,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   await loadHarnessModule(env['OWENLOOP_HARNESS_MODULE'], err);
 
   const shiftId = resolveShiftId(parsed.shift, env);
+  const shiftName = env['OWENLOOP_SHIFT_NAME'];
+  const shiftOwner = env['OWENLOOP_SHIFT_OWNER'];
   const holder: ContactHolder = {
     kind: 'exec',
     id: deps.holderId ?? `${hostname()}:${process.pid}`,
@@ -546,6 +548,8 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     origin,
     account,
     ...(shiftId !== undefined ? { shiftId } : {}),
+    ...(shiftName !== undefined && shiftName !== '' ? { shiftName } : {}),
+    ...(shiftOwner !== undefined && shiftOwner !== '' ? { shiftOwner } : {}),
     cwd: workCwd,
     // Machine policy, resolved from the SAME two sources the shift resolves it
     // from: `OWENLOOP_ALLOWED_WORKDIR_ROOTS` (which `owenloop shift start`

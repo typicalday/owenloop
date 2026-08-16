@@ -156,6 +156,10 @@ export interface AgentRunLoopOptions {
   account: string;
   /** Advisory Shift attribution — rides `--shift=<cid>` (may be absent). */
   shiftId?: string;
+  /** Stable Shift ownership name — persisted on every session row when present. */
+  shiftName?: string;
+  /** Stable Shift owner key — survives generated per-boot public names. */
+  shiftOwner?: string;
   /** cwd for the step agent when the order packet carries no `workdir`. */
   cwd: string;
   /**
@@ -434,6 +438,10 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       order,
       attempt,
       harness: sessionRef?.harness ?? adapterId,
+      pid: process.pid,
+      ...(opts.shiftName !== undefined && opts.shiftName !== '' ? { shiftName: opts.shiftName } : {}),
+      ...(opts.shiftOwner !== undefined && opts.shiftOwner !== '' ? { shiftOwner: opts.shiftOwner } : {}),
+      ...(opts.shiftId !== undefined && opts.shiftId !== '' ? { shiftId: opts.shiftId } : {}),
       token: sessionRef?.token ?? '',
       cwd: recordCwd,
       status,

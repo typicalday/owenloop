@@ -241,6 +241,8 @@ interface BuildOpts {
   loadStep?: AgentRunLoopOptions['loadStep'];
   submitGraceMs?: number;
   shiftId?: string;
+  shiftName?: string;
+  shiftOwner?: string;
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
   capabilityModels?: CapabilityModelMap;
   appendSession?: AgentRunLoopOptions['appendSession'];
@@ -262,6 +264,8 @@ function buildOpts(b: BuildOpts): Harnessed {
     origin: 'https://hub.example',
     account: 'acct-1',
     ...(b.shiftId !== undefined ? { shiftId: b.shiftId } : {}),
+    ...(b.shiftName !== undefined ? { shiftName: b.shiftName } : {}),
+    ...(b.shiftOwner !== undefined ? { shiftOwner: b.shiftOwner } : {}),
     cwd: '/fallback/cwd',
     loadStep: b.loadStep ?? (async () => (b.spec === undefined ? baseSpec() : b.spec)),
     resolveAdapter: () => resolution,
@@ -311,7 +315,7 @@ test('happy path: the turn ends, the confirm poll sees the hub outcome, and the 
 test('the session record carries the resolved harness, its token, the packet cwd, and the injected attempt', async () => {
   const adapter = createFakeAdapter({ id: 'fake', token: 'tok-77' });
   const { hub } = mockHub({ getOrder: [agentOrder({ workdir: '/repo/wt' }), agentOrder({ claimed: false, outcome: 'green' })] });
-  const h = buildOpts({ hub, adapter });
+  const h = buildOpts({ hub, adapter, shiftId: 'shf_test', shiftName: 'shift-A', shiftOwner: '/state/shift-a' });
 
   await createAgentRunLoop(h.opts).run();
 
@@ -323,6 +327,10 @@ test('the session record carries the resolved harness, its token, the packet cwd
   assert.equal(first.order, 'wf1/run1');
   assert.equal(first.step, 'builder');
   assert.equal(first.createdAt, 1_000);
+  assert.equal(first.pid, process.pid);
+  assert.equal(first.shiftName, 'shift-A');
+  assert.equal(first.shiftOwner, '/state/shift-a');
+  assert.equal(first.shiftId, 'shf_test');
 });
 
 test('the brief is rendered and the work-holder mount is born bound to this order', async () => {
