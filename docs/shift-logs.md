@@ -31,8 +31,9 @@ Do not collapse these — the rest of this page depends on telling them apart.
    tail (≤4 KiB) into its own output so a copy reaches `<run>.log`.
 
 The worker never **inherits** the command's streams. Every relayed line carries
-the literal `  | ` prefix, and the child's full output exists only in the
-receipt.
+the literal `  | ` prefix. Both the receipt and `<run>.log` contain the
+captured tail; full streams are represented only by the receipt's output hash
+and stdout/stderr byte counts.
 
 | Command outcome | Worker channel | Header |
 | --- | --- | --- |

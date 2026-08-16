@@ -447,8 +447,9 @@ test('a shift-dispatched worker\'s output lands in <run>.log and shift.log is JS
     //
     // `owenloop work exec` does not INHERIT the command's streams, it CAPTURES
     // them into the receipt it submits to the hub and RELAYS the captured tail
-    // through its own stdout. So `<run>.log` contains a prefixed copy while the
-    // receipt contains the command's full output.
+    // through its own stdout. Both the receipt and `<run>.log` contain that
+    // tail; full streams are represented only by the receipt's hash and
+    // stdout/stderr byte counts.
     //
     // THIS READ IS THE ONE THAT CAN FAIL, and the ordering above is why. The
     // run record is gone (the worker exited) and the shift itself has exited,
