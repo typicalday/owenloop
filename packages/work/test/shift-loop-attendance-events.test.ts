@@ -38,6 +38,11 @@ function mockHub(wakeChanged = false): { hub: HubClient; pings: Array<Record<str
     async submit() { return { text: '' }; },
     async reject() { return { text: '', ok: true }; },
     async ask() { return { text: '', ok: true }; },
+    // The tool-approval gate is not exercised by these tests; a fake that never
+    // opens an approval, and a non-answer is a denial.
+    async requestApproval() { return { text: '', ok: false }; },
+    async answerApproval() { return { text: '', ok: false }; },
+    async listPendingApprovals() { return { text: '', approvals: [] }; },
     async reportResolution(req) {
       return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
     },
@@ -144,6 +149,11 @@ test('attendance recorded DURING an in-flight ping still forces the very next pi
     async submit() { return { text: '' }; },
     async reject() { return { text: '', ok: true }; },
     async ask() { return { text: '', ok: true }; },
+    // The tool-approval gate is not exercised by these tests; a fake that never
+    // opens an approval, and a non-answer is a denial.
+    async requestApproval() { return { text: '', ok: false }; },
+    async answerApproval() { return { text: '', ok: false }; },
+    async listPendingApprovals() { return { text: '', approvals: [] }; },
     async reportResolution(req) {
       return { text: '', workflow: req.workflow, run: req.run, step: '', recorded: true, claimed: true };
     },

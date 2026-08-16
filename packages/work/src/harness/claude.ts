@@ -43,6 +43,7 @@ import { register } from './registry.ts';
 import { filterOwenloopEnv } from './child-env.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from './permissions.ts';
 import { ResumeUnavailableError, NEUTRAL_PERMISSION_MODES, isNeutralPermissionMode } from './contract.ts';
+import type { ApprovalRequester } from './contract.ts';
 import type { LintFinding } from './types.ts';
 import type {
   AgentEvent,
@@ -336,6 +337,24 @@ function escalationMessage(reason: string): string {
 }
 
 /**
+ * What a call refused BY A PERSON, or by a wait that ran out, tells the agent.
+ *
+ * Kept distinct from `escalationMessage` because the two say different true
+ * things. That one says nobody was asked; this one says somebody was, and the
+ * answer was no. Telling an agent "nobody is watching" right after a person
+ * declined would be a lie that invites it to keep trying, so the routing advice
+ * is the same but the first sentence is not.
+ */
+function decisionMessage(reason: string, note: string | undefined): string {
+  return [
+    `Denied: ${reason}.`,
+    ...(note !== undefined && note !== '' ? [`They said: ${note}`] : []),
+    'This was a decision, not a missing approver — repeating the call will reach the same answer.',
+    'If the work has an equivalent inside your own working directory, do that instead. If it does not, call the `ask` tool on the mounted `owenloop` MCP server and state what you need and why. Do not guess, and do not submit work that pretends this succeeded.',
+  ].join(' ');
+}
+
+/**
  * The `canUseTool` callback, wired on every start.
  *
  * WIRED UNCONDITIONALLY, including under `bypassPermissions`, where the SDK
@@ -346,12 +365,28 @@ function escalationMessage(reason: string): string {
  * FAIL-CLOSED, deliberately. A throw inside this callback would leave the SDK
  * with no `control_response` and the tool blocked forever — permission prompts
  * have no park deadline. So the classification is wrapped: anything unexpected
- * becomes a denial with the same routing message rather than a hang.
+ * becomes a denial with the same routing message rather than a hang. The same
+ * rule governs the approval channel below: it is awaited inside a `try`, and a
+ * requester that throws denies rather than hangs.
+ *
+ * THE APPROVAL CHANNEL, when `approvals` is supplied. An escalated call is put
+ * to a PERSON and this callback waits for their answer, which is only safe
+ * because the same absence of a park deadline that makes a throw fatal makes a
+ * long wait harmless — and because the worker's lease heartbeat runs on its own
+ * timer, so a blocked callback does not let the claim be reaped. `options.
+ * toolUseID` is what makes the wait resumable and the question single: it is the
+ * harness's own id for this exact call, so a re-sent request is the same
+ * question rather than a second one.
+ *
+ * WITHOUT a requester — and for every outcome that is not an explicit approval —
+ * the behavior is exactly what it was before: deny, and name `ask` as the
+ * channel that does reach someone.
  */
 function buildCanUseTool(
   cwd: string,
   policy: GatePolicy,
   onEvent: (e: AgentEvent) => void,
+  approvals?: ApprovalRequester,
 ): CanUseTool {
   return async (toolName, input, options) => {
     let verdict: GateVerdict;
@@ -361,6 +396,44 @@ function buildCanUseTool(
       verdict = { decision: 'escalate', reason: `the gatekeeper could not judge this call (${errText(err)})` };
     }
     if (verdict.decision === 'allow') return { behavior: 'allow' };
+
+    if (approvals !== undefined) {
+      onEvent({
+        kind: 'progress',
+        text: `permission escalation: ${toolName} raised for approval — ${verdict.reason}`,
+      });
+      let outcome;
+      try {
+        outcome = await approvals({
+          toolUseId: options.toolUseID,
+          toolName,
+          toolInput: input,
+          reason: verdict.reason,
+          ...(options.title !== undefined ? { title: options.title } : {}),
+          ...(options.signal !== undefined ? { signal: options.signal } : {}),
+        });
+      } catch (err) {
+        // The requester owns its own failure modes and is documented never to
+        // throw. If it does anyway, that is a bug in it, not a reason to leave
+        // the harness with no answer.
+        onEvent({
+          kind: 'progress',
+          text: `permission escalation: ${toolName} denied — the approval channel failed (${errText(err)})`,
+        });
+        return { behavior: 'deny', message: escalationMessage(verdict.reason) };
+      }
+      if (outcome.decision === 'approved') {
+        onEvent({
+          kind: 'progress',
+          text: `permission escalation: ${toolName} approved by a human`,
+        });
+        return { behavior: 'allow' };
+      }
+      const why = outcome.reason ?? verdict.reason;
+      onEvent({ kind: 'progress', text: `permission escalation: ${toolName} denied — ${why}` });
+      return { behavior: 'deny', message: decisionMessage(why, outcome.note) };
+    }
+
     // Recorded as well as returned: a denial the operator cannot see is how the
     // pre-callback behavior stayed invisible for as long as it did.
     onEvent({
@@ -550,6 +623,9 @@ export interface ClaudeOptionInputs {
   /** Per-start override; wins over `permissions.effort`. */
   effort?: string;
   permissions: StepPermissions;
+  /** The human approval channel, when this deployment has one. Absent keeps the
+   *  refuse-and-route-to-`ask` behavior — see `buildCanUseTool`. */
+  approvals?: ApprovalRequester;
 }
 
 /** The non-declarative bits a caller supplies per invocation. */
@@ -600,6 +676,7 @@ export function buildClaudeOptions(
       inputs.cwd,
       gatePolicyFor(permissions.permissionMode),
       extra.onEvent,
+      inputs.approvals,
     ),
   };
 

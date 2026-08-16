@@ -19,8 +19,13 @@
  */
 import { HubError } from './types.ts';
 import type {
+  AnswerApprovalRequest,
+  AnswerApprovalResponse,
   AskRequest,
   AskResponse,
+  ListPendingApprovalsResponse,
+  RequestApprovalRequest,
+  RequestApprovalResponse,
   GetOrderRequest,
   GetOrderResponse,
   HeartbeatRequest,
@@ -64,6 +69,18 @@ export interface HubClient {
    * `owenloop retry <workflow> <path> --text "<answer>"`.
    */
   ask(req: AskRequest): Promise<AskResponse>;
+  /**
+   * TOOL APPROVAL — raise AND poll, one idempotent call. The worker is mid-flight
+   * and needs yes/no on ONE tool call; unlike `ask`, the session stays alive, the
+   * run does not close, and the answer comes back to the very same blocked call.
+   * Repeating the call with the same `tool_use_id` re-reads the existing row.
+   */
+  requestApproval(req: RequestApprovalRequest): Promise<RequestApprovalResponse>;
+  /** The HUMAN half — the operator CLI, never a worker. An agent token is
+   *  refused this verb by the hub's RBAC, deliberately. */
+  answerApproval(req: AnswerApprovalRequest): Promise<AnswerApprovalResponse>;
+  /** Every approval a worker is currently blocked on, org-wide. */
+  listPendingApprovals(): Promise<ListPendingApprovalsResponse>;
   /**
    * Plan §6: record what this shift resolved the order's compound capability to,
    * BEFORE the harness launches. Idempotent on the hub by order id, so a
@@ -144,6 +161,9 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     submit: (req) => post<SubmitResponse>('submit', req),
     reject: (req) => post<RejectResponse>('reject', req),
     ask: (req) => post<AskResponse>('ask', req),
+    requestApproval: (req) => post<RequestApprovalResponse>('request_approval', req),
+    answerApproval: (req) => post<AnswerApprovalResponse>('answer_approval', req),
+    listPendingApprovals: () => post<ListPendingApprovalsResponse>('list_pending_approvals', {}),
     reportResolution: (req) => post<ReportResolutionResponse>('report_resolution', req),
     whoami: () => get<WhoamiResponse>('whoami'),
     // Cursor is an opaque non-negative integer; omit it entirely to bootstrap

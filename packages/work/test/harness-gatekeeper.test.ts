@@ -27,6 +27,7 @@ import {
 } from '../src/harness/gatekeeper.ts';
 import { buildClaudeOptions, gatePolicyFor } from '../src/harness/claude.ts';
 import { normalizeStepPermissions } from '../src/harness/permissions.ts';
+import type { ApprovalRequest, ApprovalRequester } from '../src/harness/contract.ts';
 
 const WORKDIR = resolve('/tmp/owenloop-gatekeeper-fixture/run');
 
@@ -39,12 +40,17 @@ function verdict(c: Partial<GateCall> & Pick<GateCall, 'toolName'>, policy: Gate
 }
 
 /** Build the options a real start would produce, with the callback wired. */
-function optionsWith(permissionMode: string | undefined, onEvent: (t: string) => void = () => {}) {
+function optionsWith(
+  permissionMode: string | undefined,
+  onEvent: (t: string) => void = () => {},
+  approvals?: ApprovalRequester,
+) {
   return buildClaudeOptions(
     {
       cwd: WORKDIR,
       owenloopMcp: { command: 'node', args: [] },
       permissions: normalizeStepPermissions(permissionMode === undefined ? {} : { permissionMode }),
+      ...(approvals !== undefined ? { approvals } : {}),
     },
     {
       env: {},
@@ -304,4 +310,122 @@ test('the callback fails closed: an unjudgeable call denies rather than hanging'
   const result = await askCallback(optionsWith('auto-safe'), 'Write', hostile);
   assert.equal(result.behavior, 'deny');
   assert.match(result.behavior === 'deny' ? result.message : '', /could not judge this call/u);
+});
+
+// ---------------------------------------------------------------------------
+// The approval channel. `approvals` is OPTIONAL, and its absence is a supported
+// deployment rather than a degraded one — which is why the first assertion in
+// this block is that nothing changes when it is not supplied.
+//
+// These tests drive the callback with a hand-written requester rather than a
+// real one, because what is under test here is the BRANCH: which outcome maps
+// to allow, which to deny, and which message each denial carries. Whether the
+// requester itself polls the hub correctly is `agent-approvals.test.ts`.
+// ---------------------------------------------------------------------------
+
+/** A requester that answers however the case wants, recording what it was asked. */
+function requester(
+  answer: ApprovalRequester,
+): { fn: ApprovalRequester; seen: ApprovalRequest[] } {
+  const seen: ApprovalRequest[] = [];
+  return {
+    seen,
+    fn: async (req) => {
+      seen.push(req);
+      return answer(req);
+    },
+  };
+}
+
+test('with no requester the escalation path is byte-for-byte what it was before', async () => {
+  const denied = await askCallback(optionsWith('auto-safe'), 'Write', { file_path: '/etc/hosts', content: 'x' });
+  assert.equal(denied.behavior, 'deny');
+  const message = denied.behavior === 'deny' ? denied.message : '';
+  assert.match(message, /Nobody is watching this run to approve it/u);
+  assert.doesNotMatch(message, /This was a decision/u, 'nobody was asked, so it must not claim somebody answered');
+});
+
+test('an approved escalation runs the call, and the person is asked about the exact blocked call', async () => {
+  const events: string[] = [];
+  const approvals = requester(async () => ({ decision: 'approved', note: 'fine, it is a fixture host file' }));
+  const options = optionsWith('auto-safe', (t) => events.push(t), approvals.fn);
+
+  const result = await askCallback(options, 'Write', { file_path: '/etc/hosts', content: 'x' });
+  assert.equal(result.behavior, 'allow', 'a human yes is the only thing that turns a denial into an allow');
+
+  assert.equal(approvals.seen.length, 1, 'one escalated call is one question');
+  const asked = approvals.seen[0]!;
+  // `toolUseID` is the harness's id for THIS call. Carrying it through is what
+  // makes a re-sent request the same question rather than a second one, and what
+  // lets the answer come back to the call that is still blocked.
+  assert.equal(asked.toolUseId, 'toolu_fixture');
+  assert.equal(asked.toolName, 'Write');
+  assert.match(asked.reason, /\/etc\/hosts/u, 'the person sees what actually triggered it, not a generic label');
+  assert.deepEqual(asked.toolInput, { file_path: '/etc/hosts', content: 'x' });
+
+  assert.equal(
+    events.some((t) => t.startsWith('permission escalation: Write raised for approval')),
+    true,
+    'a worker blocked on a person must look blocked in the log, not hung',
+  );
+  assert.equal(
+    events.some((t) => t === 'permission escalation: Write approved by a human'),
+    true,
+  );
+});
+
+test('an allowed call never reaches the approval channel', async () => {
+  const approvals = requester(async () => ({ decision: 'approved' }));
+  const options = optionsWith('auto-safe', () => {}, approvals.fn);
+
+  const result = await askCallback(options, 'Read', { file_path: join(WORKDIR, 'README.md') });
+  assert.equal(result.behavior, 'allow');
+  assert.deepEqual(approvals.seen, [], 'asking a person about a call the classifier already cleared is noise');
+});
+
+test('a human denial says a person decided, and carries their note back to the agent', async () => {
+  const events: string[] = [];
+  const approvals = requester(async () => ({
+    decision: 'denied',
+    reason: 'a person denied this call',
+    note: 'use the fixture copy under the workdir',
+  }));
+  const options = optionsWith('auto-safe', (t) => events.push(t), approvals.fn);
+
+  const result = await askCallback(options, 'Write', { file_path: '/etc/hosts', content: 'x' });
+  assert.equal(result.behavior, 'deny');
+  const message = result.behavior === 'deny' ? result.message : '';
+  assert.match(message, /a person denied this call/u);
+  assert.match(message, /They said: use the fixture copy under the workdir/u);
+  assert.match(message, /This was a decision, not a missing approver/u);
+  assert.doesNotMatch(
+    message,
+    /Nobody is watching this run/u,
+    'telling an agent nobody was asked right after a person said no is a lie that invites a retry storm',
+  );
+  assert.equal(events.some((t) => t.startsWith('permission escalation: Write denied')), true);
+});
+
+test('a requester that throws denies rather than hanging, and falls back to the no-approver wording', async () => {
+  // The failure this guards is the worst one available: a callback that never
+  // returns leaves the tool blocked forever, because permission prompts have no
+  // park deadline. A broken approval channel must degrade to the behavior that
+  // existed before the channel did.
+  const events: string[] = [];
+  const options = optionsWith(
+    'auto-safe',
+    (t) => events.push(t),
+    async () => {
+      throw new Error('hub unreachable');
+    },
+  );
+
+  const result = await askCallback(options, 'Write', { file_path: '/etc/hosts', content: 'x' });
+  assert.equal(result.behavior, 'deny');
+  assert.match(result.behavior === 'deny' ? result.message : '', /Nobody is watching this run/u);
+  assert.equal(
+    events.some((t) => t.includes('the approval channel failed (hub unreachable)')),
+    true,
+    'the operator has to be able to tell a broken channel from a person saying no',
+  );
 });
