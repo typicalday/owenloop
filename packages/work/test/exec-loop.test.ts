@@ -1194,7 +1194,8 @@ test('no receipt when the killed command settles BEFORE the release resolves the
 // where it is not: the script dies before printing a payload line, so the
 // receipt carries no `payload` and the owed path's schema rejects it. The one
 // record of the cause was thrown away by the same event that created the need
-// for it.
+// for it. The same loss affected a deferring gate: it exits 0 with no payload,
+// so its output must be relayed on stdout and even its silence recorded.
 
 test('a non-zero exit relays the child output to stderr before anything else decides', async () => {
   const errs: string[] = [];
@@ -1244,22 +1245,66 @@ test('a machinery failure relays the machinery error, not a bare exit code', asy
   );
 });
 
-test('a successful command relays nothing', async () => {
+test('a successful command relays its output on out, and never on err', async () => {
+  const outs: string[] = [];
   const errs: string[] = [];
   const fr = fakeRunner();
   const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
-  const loop = createExecLoop(baseOpts(hub, fr.runner, { err: (line) => errs.push(line) }));
+  const loop = createExecLoop(baseOpts(hub, fr.runner, {
+    out: (line) => outs.push(line),
+    err: (line) => errs.push(line),
+  }));
   const p = loop.run();
   await macrotaskSleep();
-  fr.resolve(result(0, { outputTail: 'built 42 targets' }));
+  fr.resolve(result(0, { outputTail: 'merge-gate: CI still pending (2 of 5 checks running)\n' }));
 
   assert.equal(await p, 'submitted');
-  // Asserted against the relay's own two shapes rather than an empty `errs`:
-  // the loop emits an unrelated workdir-inheritance warning on this fixture,
-  // and folding that into the assertion would make it fail for the wrong reason.
+  assert.ok(
+    outs.some((l) => l === "owenloop work exec: the command for step 'builder' succeeded; its output follows"),
+    `expected the success header, got ${JSON.stringify(outs)}`,
+  );
+  assert.ok(
+    outs.some((l) => l === '  | merge-gate: CI still pending (2 of 5 checks running)'),
+    `expected the relayed tail, got ${JSON.stringify(outs)}`,
+  );
+  // The record must precede the submit on this path too: a submit the hub then
+  // schema-rejects must not be able to take the output down with it.
+  const relayAt = outs.findIndex((l) => l.startsWith('  | '));
+  const submitAt = outs.findIndex((l) => l.includes('submitted receipt'));
+  assert.ok(relayAt >= 0 && submitAt > relayAt, `relay must precede the submit: ${JSON.stringify(outs)}`);
+  // PRESERVED VERBATIM from 'a successful command relays nothing'. This is the
+  // guard that the two channels stay separate: routine success output must
+  // never enter the channel the worker log and the shift read as trouble.
   assert.deepEqual(
     errs.filter((l) => l.startsWith('  ') || l.includes('its last output follows')),
     [],
-    'a green run must not spray its output into the log',
+    'a green run must not spray its output into the trouble channel',
   );
+});
+
+test('a successful command that printed nothing records the silence', async () => {
+  const outs: string[] = [];
+  const errs: string[] = [];
+  const fr = fakeRunner();
+  const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, {
+    out: (line) => outs.push(line),
+    err: (line) => errs.push(line),
+  }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0)); // the `result` helper defaults outputTail to ''
+
+  assert.equal(await p, 'submitted');
+  assert.ok(
+    outs.some((l) => l === "owenloop work exec: the command for step 'builder' succeeded; its output follows"),
+    `expected the success header, got ${JSON.stringify(outs)}`,
+  );
+  // "this gate printed nothing" IS the diagnosis in the deferring merge-gate
+  // case, so an absent line would be indistinguishable from the old bug.
+  assert.ok(
+    outs.some((l) => l === '  (the command produced no output)'),
+    `expected the no-output note, got ${JSON.stringify(outs)}`,
+  );
+  assert.deepEqual(errs.filter((l) => l.startsWith('  ')), [], 'silence is a record, not a diagnosis');
 });

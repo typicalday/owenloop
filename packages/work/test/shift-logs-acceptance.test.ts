@@ -443,25 +443,26 @@ test('a shift-dispatched worker\'s output lands in <run>.log and shift.log is JS
       'the worker log must survive both its run record and the shift',
     );
 
-    // ── AND THE COMMAND'S OWN OUTPUT IS DELIBERATELY NOT HERE ──
+    // ── THE COMMAND'S CAPTURED OUTPUT IS RELAYED, NOT INHERITED ──
     //
     // `owenloop work exec` does not INHERIT the command's streams, it CAPTURES
-    // them into the receipt it submits to the hub. So `<run>.log` holds exactly
-    // the worker's own diagnostics and the receipt holds exactly the command's
-    // output — one destination each, no duplication.
+    // them into the receipt it submits to the hub and RELAYS the captured tail
+    // through its own stdout. So `<run>.log` contains a prefixed copy while the
+    // receipt contains the command's full output.
     //
     // THIS READ IS THE ONE THAT CAN FAIL, and the ordering above is why. The
     // run record is gone (the worker exited) and the shift itself has exited,
     // so `echo ${MARKER}` provably ran and every byte either stream was ever
     // going to receive has been written and flushed. A future change that made
     // the worker inherit the command's streams instead of capturing them would
-    // double every command's output and break receipt fidelity; asserted here
-    // that change FAILS this test, asserted before the command ran it would
-    // merely have flaked.
-    assert.equal(
-      finalWorkerLog.includes(MARKER),
-      false,
-      `the command's captured output must stay in the receipt, not the log: ${finalWorkerLog}`,
+    // put the bytes in unprefixed and double them; the exact shape asserted
+    // here rules that out. Asserted before the command ran, it would merely
+    // have flaked.
+    const markerLines = finalWorkerLog.split('\n').filter((line) => line.includes(MARKER));
+    assert.deepEqual(
+      markerLines,
+      [`  | ${MARKER}`],
+      `the command's output must appear exactly once, relayed and prefixed: ${finalWorkerLog}`,
     );
     const finalShiftLog = readFileSync(shiftLogFile(logDir), 'utf8');
     assert.ok(finalShiftLog.includes('"ended"'), 'the shutdown record must be on disk too');
