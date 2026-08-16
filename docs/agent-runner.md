@@ -2,9 +2,9 @@
 
 `owenloop work agent-run` is the only supported dispatcher for workflow Step Agents. The Shift daemon starts `agent-run` children for agent orders. Plugins and skills supervise the Shift daemon; plugins do not package or dispatch a static workflow-worker agent.
 
-The runtime worker resolves the verified workflow definition from the local workflow store, selects the final harness after CLI and environment overrides, and runs permission preflight before either a cold start or a resume. A policy refusal starts no model SDK, CLI, or app-server process. The worker prints every refusal reason, releases the held claim, and exits non-zero.
+The runtime worker resolves the verified workflow definition from the local workflow store, selects the final harness after crew-roster selection and any CLI debug override, and runs permission preflight before either a cold start or a resume. A policy refusal starts no model SDK, CLI, or app-server process. The worker prints every refusal reason, releases the held claim, and exits non-zero.
 
-Runtime preflight is authoritative. `owenloop work lint` runs the same common and adapter checks for author feedback, but lint cannot account for a later `--harness` or `OWENLOOP_HARNESS` override.
+Runtime preflight is authoritative. `owenloop work lint` runs the same common and adapter checks for author feedback, but lint cannot account for a later `--harness` override or a selected crew-roster candidate.
 
 Native judge entries do not carry a separately authored `x` map. The definition
 compiler deep-clones the producer step's complete parsed `x` map onto every

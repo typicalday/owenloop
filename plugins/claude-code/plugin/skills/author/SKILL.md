@@ -66,8 +66,7 @@ x:
 ```
 
 `id` is optional. When `id` is absent, the runtime may select the registered
-default adapter; `--harness` and `OWENLOOP_HARNESS` overrides take precedence
-over the definition. Keep policy in `x.harness` even when `id` is absent.
+default adapter; a selected crew-roster candidate takes precedence; `--harness` is a local debug override. Keep policy in `x.harness` even when `id` is absent.
 
 When a producer declares native `judges:`, put `x.harness` on the producer
 step, not on each judge entry. Every synthesized judge automatically inherits

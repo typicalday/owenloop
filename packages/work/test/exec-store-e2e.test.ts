@@ -234,7 +234,7 @@ steps:
     // A real spawn must still resolve node from the actual parent PATH.
     const narrowEnvRun = await startHub(order(requested, 'printf "remote command must not run\\n"'));
     try {
-      const narrowEnv = { XDG_CONFIG_HOME: tempDir('owenloop-exec-narrow-config-') };
+      const narrowEnv = { HOME: tempDir('owenloop-exec-narrow-config-') };
       assert.equal(await makeLoop(narrowEnvRun.origin, resolver, narrowEnv).run(), 'submitted');
       const submit = narrowEnvRun.reqs.find((request) => request.verb === 'submit');
       assert.ok(submit !== undefined);

@@ -21,7 +21,7 @@ const TOKEN = 'tok-e2e';
 
 let configDir: string;
 beforeEach(() => {
-  // Isolate settings: a temp XDG_CONFIG_HOME means the child sees NO settings
+  // Isolate settings: a temp HOME means the child sees NO settings
   // file — origin comes only from --origin, token only from OWENLOOP_TOKEN.
   configDir = mkdtempSync(join(tmpdir(), 'owenloop-hold-e2e-'));
 });
@@ -30,7 +30,7 @@ afterEach(() => {
 });
 
 function childEnv(): Record<string, string | undefined> {
-  return { OWENLOOP_TOKEN: TOKEN, XDG_CONFIG_HOME: configDir, OWENLOOP_SESSION: '' };
+  return { OWENLOOP_TOKEN: TOKEN, HOME: configDir, OWENLOOP_CONFIG_DIR: undefined, OWENLOOP_SESSION: '' };
 }
 
 function of(reqs: HubReq[], verb: string): HubReq[] {

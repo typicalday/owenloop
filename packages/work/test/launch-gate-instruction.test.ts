@@ -92,9 +92,7 @@ async function runAgent(
   homes.push(home);
   const env: Record<string, string | undefined> = {
     HOME: home,
-    XDG_CONFIG_HOME: home,
     OWENLOOP_NO_KEYCHAIN: '1',
-    OWENLOOP_HARNESS: id,
   };
   const errors: string[] = [];
   const hub = await startHostileHub({

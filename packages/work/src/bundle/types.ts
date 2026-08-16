@@ -63,9 +63,9 @@ export interface FetchedStep {
    * LIFTED by `validateFetchedDef` from `x.harness.id`, or from a top-level
    * `harness` key when the def carries one (top-level WINS — forward compat for
    * an owenloop grammar that promotes the field). Declaration only: nothing
-   * validates the id here; `src/roles/agent-run.ts` resolves it, ranking BELOW
-   * `--harness` and `OWENLOOP_HARNESS`, and fails honestly when the id names no
-   * registered adapter.
+   * validates the id here; `src/roles/agent-run.ts` uses it after a selected
+   * roster candidate and an explicit `--harness`, and fails honestly when the
+   * id names no registered adapter.
    */
   harness?: string;
   /**

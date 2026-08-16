@@ -57,7 +57,7 @@ export const CREW_A_AUTH = `Bearer ${CREW_A_TOKEN}`;
 export const CREW_B_AUTH = `Bearer ${CREW_B_TOKEN}`;
 
 /**
- * Seed owenloop's v2 file backend under `<home>/owenloop/credentials.json` with
+ * Seed owenloop's v2 file backend under `<home>/.owenloop/credentials.json` with
  * an `agent:<account>` slot for `origin`. Keyed to the EXACT origin (dynamic
  * port), so call this AFTER `startMockHub`. `token` is a throwaway literal —
  * never a real key; no secret is committed.
@@ -73,7 +73,7 @@ export function seedCredentialStore(
   token: string = DRILL_TOKEN,
   account: string = 'default',
 ): void {
-  const dir = join(home, 'owenloop');
+  const dir = join(home, '.owenloop');
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'credentials.json'),
@@ -102,9 +102,9 @@ export function seedCredentialStore(
  * Rather than name each hostile variable, the whole `OWENLOOP_*` namespace is
  * denied first (`strippedOwenloopEnv`) and the drill's own values are applied on
  * top. Naming them was the old spelling and it kept coming up short — the miss
- * that bit hardest was `OWENLOOP_CONFIG_DIR`, which sits ABOVE
- * `$XDG_CONFIG_HOME/owenloop` in the config-dir ladder (`configDir` in
- * `src/hub.ts`) and so outranks the `XDG_CONFIG_HOME` this fixture sets. Every
+ * that bit hardest was `OWENLOOP_CONFIG_DIR`, which sits ABOVE `$HOME/.owenloop`
+ * in the config-dir ladder (`configDir` in `src/hub.ts`) and so outranks this
+ * fixture's isolated HOME. Every
  * owenloop shift exports a slice of the namespace, which is exactly the
  * environment an agent-driven build runs the suite in — the child would read the
  * developer's REAL config dir, find no credential for the drill's ephemeral
@@ -118,7 +118,6 @@ export function fixtureEnv(home: string, extra: Record<string, string | undefine
   return {
     ...strippedOwenloopEnv(),
     HOME: home,
-    XDG_CONFIG_HOME: home,
     OWENLOOP_NO_KEYCHAIN: '1',
     OWENLOOP_TOKEN: undefined, // WO-6.1: never the override — the store path IS the drill
     OWENLOOP_SESSION: '',

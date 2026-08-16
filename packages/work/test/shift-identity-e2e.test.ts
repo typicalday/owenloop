@@ -26,7 +26,7 @@ let cacheDirB: string;
 let stateDirB: string;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'owenloop-shift-e2e-'));
-  configDir = join(root, 'config'); // isolates settings via XDG_CONFIG_HOME
+  configDir = join(root, 'config'); // isolated HOME for settings
   cacheDirA = join(root, 'cache-a');
   stateDirA = join(root, 'state-a');
   cacheDirB = join(root, 'cache-b');
@@ -47,7 +47,7 @@ function spawnIdenticalShift(origin: string, cacheDir: string, stateDir: string)
       'crew-initial', '--origin', origin, '--cap', '3', '--poll-interval', '25',
       '--cache-dir', cacheDir, '--state-dir', stateDir,
     ],
-    { OWENLOOP_TOKEN: TOKEN, XDG_CONFIG_HOME: configDir },
+    { OWENLOOP_TOKEN: TOKEN, HOME: configDir, OWENLOOP_CONFIG_DIR: undefined },
   );
 }
 

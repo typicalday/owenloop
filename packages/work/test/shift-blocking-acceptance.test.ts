@@ -34,7 +34,6 @@ interface CommandResult {
 let root: string;
 let home: string;
 let localDefDigest = '';
-let configDir: string;
 let cacheDir: string;
 let stateDir: string;
 let shift: ShiftChild | undefined;
@@ -43,7 +42,6 @@ let commands: CommandResult[];
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'owenloop-shift-blocking-'));
   home = join(root, 'home');
-  configDir = join(root, 'config');
   cacheDir = join(root, 'cache');
   stateDir = join(root, 'state');
   shift = undefined;
@@ -67,7 +65,7 @@ steps:
     sourceDir,
     root: join(home, '.owenloop', 'workflows'),
     home,
-    configHome: configDir,
+    configHome: home,
   });
   const loaded = loadDefFile(join(installed.result.objectPath, 'workflow.yaml'));
   const definition = finalizeDefs(new Map([[loaded.name, loaded]])).get(loaded.name);
@@ -131,14 +129,11 @@ function env(): Record<string, string | undefined> {
     // `runCli` spreads process.env into the child, so every ambient OWENLOOP_*
     // variable reaches the CLI under test unless this object overrides it. Deny
     // the namespace first, then set back what the fixture wants — the miss that
-    // bit was OWENLOOP_CONFIG_DIR, which sits ABOVE $XDG_CONFIG_HOME/owenloop in
-    // the config-dir ladder (`configDir` in src/hub.ts) and so outranks the
-    // XDG_CONFIG_HOME below. Every owenloop shift exports a slice of the
-    // namespace, so a miss is red on an agent-driven build and green in CI.
+    // bit was OWENLOOP_CONFIG_DIR. The fixture supplies a fully isolated HOME
+    // so no ambient configuration can affect its shift.
     ...strippedOwenloopEnv(),
     HOME: home,
     OWENLOOP_TOKEN: TOKEN,
-    XDG_CONFIG_HOME: configDir,
     NODE_NO_WARNINGS: '1',
   };
 }

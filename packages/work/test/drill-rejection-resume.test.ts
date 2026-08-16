@@ -211,11 +211,6 @@ function runAgent(origin: string): Promise<{ code: number | null; stderr: string
           OWENLOOP_CACHE_DIR: cacheDir,
           OWENLOOP_WORK_ROOT: workRoot,
           OWENLOOP_HARNESS_MODULE: FAKE_HARNESS,
-          // The composition root registers the real vendor adapters on import, so
-          // the first-registered default is one of those. Name the fixture
-          // adapter at the `OWENLOOP_HARNESS` rank instead of relying on import
-          // order, which is not a property this drill is asserting.
-          OWENLOOP_HARNESS: 'fake',
           OWENLOOP_FAKE_TRACE: tracePath,
           OWENLOOP_FAKE_SCRIPT: JSON.stringify({
             id: 'fake',

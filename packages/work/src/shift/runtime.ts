@@ -362,16 +362,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     // not this run-id set, because every Shift on the machine shares the store.
     reconcileInFlight(stateDir);
     try {
-      const configuredHarness = env['OWENLOOP_HARNESS'];
       const retired = reconcileActiveSessions(
         sessionsPath(cacheDir),
-        {
-          shiftName: name,
-          shiftOwner,
-          ...(configuredHarness !== undefined && configuredHarness.trim() !== ''
-            ? { harness: configuredHarness }
-            : {}),
-        },
+        { shiftName: name, shiftOwner },
         Date.now(),
       );
       for (const rec of retired) {
@@ -533,7 +526,6 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       run: failure.run,
       step: failure.step ?? '(unknown)',
       kind: failure.kind,
-      ...(failure.harness !== undefined ? { harness: failure.harness } : {}),
       executable: failure.executable,
       exitStatus: failure.exitStatus,
       signal: failure.signal,
@@ -559,6 +551,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       ? { dir: logDir, err: (line: string) => process.stderr.write(`${line}\n`) }
       : undefined,
     allowedWorkdirRoots,
+    parsed.serveCrews,
   );
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 

@@ -3,8 +3,8 @@
  *
  * ## The problem this exists to close
  *
- * A fixture makes itself hermetic by pointing owenloop at a temp `HOME` /
- * `XDG_CONFIG_HOME` and then neutralizing the handful of `OWENLOOP_*` variables
+ * A fixture makes itself hermetic by pointing owenloop at a temp `HOME` and
+ * then neutralizing the handful of `OWENLOOP_*` variables
  * it happens to know about. That is an ALLOWLIST OF THINGS TO REMOVE, and it is
  * wrong by construction: it is complete only for the variables that existed when
  * the fixture was written, and only for the ones its author thought of.
@@ -18,11 +18,11 @@
  *
  * Three separate variables have already bitten in exactly this way:
  *
- *   - `OWENLOOP_CONFIG_DIR` outranks `XDG_CONFIG_HOME` in the config-dir ladder
+ *   - `OWENLOOP_CONFIG_DIR` outranks `HOME` in the config-dir ladder
  *     (`configDir`, src/hub.ts), so credential and settings lookups read the
  *     operator's REAL config dir instead of the fixture's temp one.
- *   - `OWENLOOP_HARNESS` outranks the step def's harness (`agent-run.ts`), so a
- *     dispatched worker runs an adapter the test never asked for.
+ *   - `OWENLOOP_SERVE_CREWS` is the shift-to-worker roster handoff, so an
+ *     ambient value could select a crew the test never asked for.
  *   - `OWENLOOP_ALLOWED_WORKDIR_ROOTS` arrives through `buildSpawnPlan`'s
  *     `{...process.env}` spread, so a test asserting that the plan sets NO such
  *     variable sees the operator's value and fails.
@@ -35,7 +35,7 @@
  * discipline `src/harness/child-env.ts` already applies to harness children —
  * "deny-by-default WITHIN the namespace" — pointed at test fixtures instead.
  *
- * Nothing OUTSIDE the namespace is touched. `HOME`, `XDG_CONFIG_HOME`,
+ * Nothing OUTSIDE the namespace is touched. `HOME`,
  * `PATH`, `NODE_*` and the rest are the fixture's business, not this module's.
  *
  * ## Ordering is load-bearing

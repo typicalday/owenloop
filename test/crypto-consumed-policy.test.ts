@@ -84,9 +84,9 @@ function rootOrder(overrides: Partial<OrderPacket> = {}): OrderPacket {
 
 function trustRootEnv(): Record<string, string | undefined> {
   const config = mkdtempSync(join(tmpdir(), 'owenloop-consumed-policy-'));
-  mkdirSync(join(config, 'owenloop'), { recursive: true });
-  writeFileSync(join(config, 'owenloop', 'org-root.pub'), root.publicKey);
-  return { XDG_CONFIG_HOME: config };
+  mkdirSync(join(config, '.owenloop'), { recursive: true });
+  writeFileSync(join(config, '.owenloop', 'org-root.pub'), root.publicKey);
+  return { HOME: config };
 }
 
 function signerForPrincipal({ allowedSignersText }: { allowedSignersText: string }) {
@@ -302,10 +302,10 @@ test('one fixed consumer-clock sample governs every consumed path', async () => 
   const env = trustRootEnv();
   const order = producerOrder();
   const grants = [grantBytes()];
-  mkdirSync(join(env.XDG_CONFIG_HOME!, 'owenloop', 'roster'), { recursive: true });
-  writeFileSync(join(env.XDG_CONFIG_HOME!, 'owenloop', 'roster', 'producer.grant.dsse'), grants[0]!);
-  mkdirSync(join(env.XDG_CONFIG_HOME!, 'owenloop', 'revocations'), { recursive: true });
-  writeFileSync(join(env.XDG_CONFIG_HOME!, 'owenloop', 'revocations', 'producer.revocation.dsse'), revocationBytes(101));
+  mkdirSync(join(env.HOME!, '.owenloop', 'roster'), { recursive: true });
+  writeFileSync(join(env.HOME!, '.owenloop', 'roster', 'producer.grant.dsse'), grants[0]!);
+  mkdirSync(join(env.HOME!, '.owenloop', 'revocations'), { recursive: true });
+  writeFileSync(join(env.HOME!, '.owenloop', 'revocations', 'producer.revocation.dsse'), revocationBytes(101));
 
   let nowCalls = 0;
   const verifier = createConsumedVerifier({
@@ -324,8 +324,8 @@ test('one fixed consumer-clock sample governs every consumed path', async () => 
 
 test('chain validation is memoized per producer key and fixed clock within one gate call', async () => {
   const env = trustRootEnv();
-  mkdirSync(join(env.XDG_CONFIG_HOME!, 'owenloop', 'roster'), { recursive: true });
-  writeFileSync(join(env.XDG_CONFIG_HOME!, 'owenloop', 'roster', 'producer.grant.dsse'), grantBytes());
+  mkdirSync(join(env.HOME!, '.owenloop', 'roster'), { recursive: true });
+  writeFileSync(join(env.HOME!, '.owenloop', 'roster', 'producer.grant.dsse'), grantBytes());
   let verificationCalls = 0;
   const countingSigner = ({ allowedSignersText }: { allowedSignersText: string }) => {
     const publicKey = allowedSignersText.trim().split(/\s+/).slice(1).join(' ');
@@ -350,7 +350,7 @@ test('chain validation is memoized per producer key and fixed clock within one g
 });
 
 test('missing-org-root warnings are latched once per order and resettable', async () => {
-  const env = { XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'owenloop-consumed-no-root-')) };
+  const env = { HOME: mkdtempSync(join(tmpdir(), 'owenloop-consumed-no-root-')) };
   const value = 'value';
   const order = rootOrder({
     run: 'run-warning',

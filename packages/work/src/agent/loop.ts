@@ -90,10 +90,11 @@ import {
   type BriefSpec,
 } from './brief.ts';
 import {
-  resolveCapabilityModel,
-  type CapabilityModelMap,
-  type CapabilityResolution,
+  resolveCapabilityCandidates,
+  selectCandidate,
+  type CapabilityMatch,
 } from './capability-model.ts';
+import type { MergedRoster } from '../settings/roster.ts';
 
 /** Discriminated result of one worker life; the role maps these to exit codes. */
 export type AgentRunOutcome =
@@ -130,9 +131,10 @@ export type StepLoader = (order: OrderPacket) => Promise<NormalizedStepSpec | nu
  * The outcome of resolving which adapter hosts this step agent.
  *
  * The loop never reads a registry and never names a harness: the role
- * (`src/roles/agent-run.ts`, the composition root) owns the precedence
- * `--harness` > `OWENLOOP_HARNESS` > the step def's `harness` field > the
- * built-in default, and hands back the id it picked plus the adapter, if any.
+ * (`src/roles/agent-run.ts`, the composition root) owns the precedence:
+ * selected roster candidate > `--harness` > step harness > registered
+ * default. The selected harness is supplied separately because routing decides
+ * it before adapter resolution.
  * `registered` is only ever used to make the failure message actionable.
  */
 export interface AdapterResolution {
@@ -141,8 +143,11 @@ export interface AdapterResolution {
   registered: string[];
 }
 
-/** `stepHarness` is the step def's `harness` field, the third precedence rank. */
-export type AdapterResolver = (stepHarness: string | undefined) => AdapterResolution;
+/** The two harness inputs are rank 1 (roster) and rank 3 (step definition). */
+export type AdapterResolver = (
+  chosenHarness: string | undefined,
+  stepHarness: string | undefined,
+) => AdapterResolution;
 
 /** Default confirm-phase cadence: one `get_order` per second. */
 export const DEFAULT_CONFIRM_INTERVAL_MS = 1_000;
@@ -179,17 +184,17 @@ export interface AgentRunLoopOptions {
   loadStep: StepLoader;
   resolveAdapter: AdapterResolver;
   /**
-   * THIS MACHINE'S capability → `{model, effort}` map, straight from the
-   * settings file (plan §5). The loop resolves the order's composed capabilities
-   * against it before dispatch and REFUSES the order when nothing matches —
-   * there is no default model here, by design.
-   *
-   * Absent (or empty) means the shift declared no map at all, which makes every
-   * capability-bearing order unresolvable. That is deliberate: a shift that
-   * forgot its map should say so on the first order, not run everything on a
-   * hardcoded model.
+   * Merged crew rosters, in shift-start crew order. A hand-run worker and a
+   * shift started with `--all` receive exactly one machine-global roster.
+   * The Phase 1 crew selection is interim: Phase 2 replaces it with crews
+   * stamped by the hub on the order.
    */
-  capabilityModels?: CapabilityModelMap;
+  rosters?: readonly MergedRoster[];
+  /**
+   * Phase-1 availability is adapter-registry membership at the composition
+   * root. A real binary/credential probe needs new adapter-contract surface.
+   */
+  harnessAvailable: (harnessId: string) => boolean;
   /** Gate dynamic values and rejection reasons before any prompt rendering. */
   consumedVerifier?: ConsumedVerifier;
   /** Append one session record. Wired to `appendSession` by the role. */
@@ -327,8 +332,21 @@ function briefOwes(packet: OrderPacket): BriefSpec['owes'] {
  *                 with no authored tier before this scheme existed.
  */
 export type OrderRouting =
-  | { kind: 'resolved'; resolution: CapabilityResolution }
-  | { kind: 'refused'; capabilities: readonly string[] }
+  | {
+      kind: 'resolved';
+      capability: string;
+      match: CapabilityMatch;
+      harness: string;
+      model: string;
+      effort: string;
+    }
+  | {
+      kind: 'refused';
+      capabilities: readonly string[];
+      reason: 'harness-policy' | 'unresolvable-capability';
+      offered?: readonly string[];
+      stepHarness?: string;
+    }
   | { kind: 'unrouted' };
 
 /**
@@ -341,12 +359,44 @@ export type OrderRouting =
  */
 export function resolveOrderRouting(
   packet: OrderPacket,
-  map: CapabilityModelMap | undefined,
+  rosters: readonly MergedRoster[] | undefined,
+  stepHarness: string | undefined,
+  isAvailable: (harnessId: string) => boolean,
 ): OrderRouting {
   const capabilities = packet.capabilities ?? [];
   if (capabilities.length === 0) return { kind: 'unrouted' };
-  const resolution = map === undefined ? undefined : resolveCapabilityModel(map, capabilities);
-  return resolution === undefined ? { kind: 'refused', capabilities } : { kind: 'resolved', resolution };
+  let firstHarnessPolicy: { offered: readonly string[]; stepHarness: string | undefined } | undefined;
+  for (const roster of rosters ?? []) {
+    const candidates = resolveCapabilityCandidates(
+      Object.fromEntries(Object.entries(roster).map(([capability, entry]) => [capability, entry.candidates])),
+      capabilities,
+    );
+    if (candidates === undefined) continue;
+    const outcome = selectCandidate(candidates.candidates, stepHarness, isAvailable);
+    if (outcome.kind === 'selected') {
+      return {
+        kind: 'resolved',
+        capability: candidates.capability,
+        match: candidates.match,
+        harness: outcome.candidate.harness,
+        model: outcome.candidate.model,
+        effort: outcome.candidate.effort,
+      };
+    }
+    if (outcome.kind === 'harness-policy' && firstHarnessPolicy === undefined) {
+      firstHarnessPolicy = { offered: outcome.offered, stepHarness };
+    }
+  }
+  if (firstHarnessPolicy !== undefined) {
+    return {
+      kind: 'refused',
+      capabilities,
+      reason: 'harness-policy',
+      offered: firstHarnessPolicy.offered,
+      ...(firstHarnessPolicy.stepHarness !== undefined ? { stepHarness: firstHarnessPolicy.stepHarness } : {}),
+    };
+  }
+  return { kind: 'refused', capabilities, reason: 'unresolvable-capability' };
 }
 
 /**
@@ -566,21 +616,21 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
    * An `unrouted` order is not reported at all: the payload's `capability` is
    * required and non-empty on the hub side, and there is no capability to name.
    */
-  async function reportResolution(routing: OrderRouting, harness: string): Promise<void> {
+  async function reportResolution(routing: OrderRouting): Promise<void> {
     if (routing.kind === 'unrouted') return;
     const payload: ResolutionPayload =
       routing.kind === 'resolved'
         ? {
-            capability: routing.resolution.capability,
-            match: routing.resolution.match,
-            model: routing.resolution.model,
-            effort: routing.resolution.effort,
-            harness,
+            capability: routing.capability,
+            match: routing.match,
+            model: routing.model,
+            effort: routing.effort,
+            harness: routing.harness,
           }
         : // The refusal names the capability the order was OFFERED under — the
           // first one — because that is the row an operator has to add. Model
           // and effort are absent: nothing was selected.
-          { capability: routing.capabilities[0] ?? '', match: 'refused', harness };
+          { capability: routing.capabilities[0] ?? '', match: 'refused' };
     try {
       await opts.hub.reportResolution({ workflow, run: runId, resolution: payload });
     } catch (e) {
@@ -694,7 +744,31 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
      *  closures below. This const carries the narrowing across. */
     const step: NormalizedStepSpec = material;
 
-    const resolution = opts.resolveAdapter(step.harness);
+    // ---- ROUTING: select a roster candidate before resolving an adapter ----
+    //
+    // Phase 1's crew order is interim. Phase 2 replaces these locally supplied
+    // rosters with crew stamps the hub puts on each offer.
+    const routing = resolveOrderRouting(packet, opts.rosters, step.harness, opts.harnessAvailable);
+    await reportResolution(routing);
+    if (routing.kind === 'refused') {
+      if (routing.reason === 'harness-policy') {
+        opts.err(
+          `owenloop work agent-run: step '${packet.step}' declares harness '${routing.stepHarness ?? ''}', ` +
+            `but its roster candidates offer [${(routing.offered ?? []).join(', ')}] — releasing`,
+        );
+        return releaseWith('incompatible-harness-policy', 'incompatible-harness-policy');
+      }
+      opts.err(
+        `owenloop work agent-run: no crew roster row for ${order} — the order's capabilities ` +
+          `[${routing.capabilities.join(', ')}] match neither an exact row nor a bare name row in 'roster'. ` +
+          `Add a candidate array for one of them and restart the shift. Releasing — this shift will not pick ` +
+          `a model it was not told to use.`,
+      );
+      return releaseWith('unresolvable-capability', 'unresolvable-capability');
+    }
+
+    const chosenHarnessId = routing.kind === 'resolved' ? routing.harness : undefined;
+    const resolution = opts.resolveAdapter(chosenHarnessId, step.harness);
     adapterId = resolution.id;
     if (resolution.adapter === undefined) {
       const known = resolution.registered.length > 0 ? resolution.registered.join(', ') : '<none>';
@@ -710,7 +784,6 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
      *  the attempt count and the Phase 4 resume lookup so the two can never
      *  disagree about which history they are reading. */
     const task: SessionTaskRef = { workflow, step: packet.step, key: packet.key };
-
     attempt = opts.nextAttempt(task);
 
     const spec: BriefSpec = {
@@ -719,21 +792,14 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       origin: opts.origin,
       account: opts.account,
       ...(opts.shiftId !== undefined ? { shiftId: opts.shiftId } : {}),
-      // Straight from the packet, not from settings: the modifier is the hub's
-      // statement about the RUN, and a shift has no say in it.
       ...(packet.modifier !== undefined ? { modifier: packet.modifier } : {}),
       ...(packet.escalated === true ? { escalated: true } : {}),
       owes: briefOwes(packet),
     };
-    // Permissions arrive PRE-NORMALIZED in the spec. `prepare` ran
-    // `normalizeStepPermissions` over the step's `x.harness` options at cache
-    // time, so this loop never looks inside an extension bag and never has a bag
-    // key — vendor-keyed lookup does not exist in neutral code any more.
     const permissions = step.permissions;
 
     // Mandatory final-boundary preflight. Common checks run first, followed by
-    // the selected adapter's exact capability check. A refusal starts neither a
-    // cold session nor a resumed provider process; the held claim is released.
+    // the selected adapter's exact capability check.
     const policyIssues = [
       ...preflightStepPermissions(permissions),
       ...active.preflight(permissions),
@@ -748,41 +814,15 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       return releaseWith('incompatible-harness-policy', 'incompatible-harness-policy');
     }
 
-    // ---- ROUTING: which model serves this order, and telling the hub --------
-    //
-    // DELIBERATELY THE LAST GATE BEFORE DISPATCH, and deliberately AFTER every
-    // launch gate above (misroute, consumed verification, step spec, adapter,
-    // harness policy). Plan §3: the launch gates block on a malformed order
-    // before model selection is even attempted, so a refusal never has to be
-    // explained in terms of a model the order was never going to reach.
-    const routing = resolveOrderRouting(packet, opts.capabilityModels);
-
-    // Plan §6: the record must exist BEFORE tokens are spent, which is why this
-    // is a dedicated verb and not a field on the next heartbeat. It is reported
-    // on the refusal path too — a refusal is a true observation of what this
-    // shift resolved, and the whole point of the report is that the hub can say
-    // why an order did or did not run.
-    await reportResolution(routing, resolution.id);
-
-    if (routing.kind === 'refused') {
-      opts.err(
-        `owenloop work agent-run: no settings row for ${order} — the order's capabilities ` +
-          `[${routing.capabilities.join(', ')}] match neither an exact row nor a bare name row in ` +
-          `'capabilityModels'. Add a row for one of them (a bare row such as ` +
-          `'${routing.capabilities[0]?.split(':')[0] ?? ''}' covers every modifier) and restart the shift. ` +
-          `Releasing — this shift will not pick a model it was not told to use.`,
-      );
-      return releaseWith('unresolvable-capability', 'unresolvable-capability');
-    }
     if (routing.kind === 'unrouted') {
       opts.err(
-        `owenloop work agent-run: ${order} carries no capabilities, so no settings row applies — ` +
-          `running on '${resolution.id}''s own default model.`,
+        `owenloop work agent-run: ${order} carries no capabilities, so no crew roster row applies — ` +
+          `running on '${resolution.id}'s own default model.`,
       );
     } else {
       opts.out(
-        `owenloop work agent-run: ${order} resolved '${routing.resolution.capability}' ` +
-          `(${routing.resolution.match} row) → ${routing.resolution.model} at ${routing.resolution.effort}`,
+        `owenloop work agent-run: ${order} resolved '${routing.capability}' (${routing.match} row) → ` +
+          `${routing.harness}/${routing.model} at ${routing.effort}`,
       );
     }
 
@@ -875,9 +915,12 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
       run: opts.run,
       onEvent: (e) => opts.out(`owenloop work agent-run: approval ${e.kind} — ${e.text}`),
     });
+    // A resolved crew-roster candidate wins over the step's authored harness,
+    // model, and effort. The harness was already selected above; these values
+    // keep the established rule for the adapter start arguments.
     const resolvedModel =
       routing.kind === 'resolved'
-        ? { model: routing.resolution.model, effort: routing.resolution.effort }
+        ? { model: routing.model, effort: routing.effort }
         : undefined;
     const deliverArgs: DeliverArgs = {
       cwd: recordCwd,

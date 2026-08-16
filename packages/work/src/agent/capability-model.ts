@@ -1,58 +1,34 @@
 /**
- * Resolve an order's COMPOSED CAPABILITY to the model and reasoning effort this
- * machine runs it at.
+ * Resolve an order's COMPOSED CAPABILITY to the local crew roster that serves
+ * it. The hub decides what grade of work an order is; the machine decides
+ * which locally available harness, model, and effort serve that grade.
  *
- * The hub decides WHAT grade of work an order is (`builder` composed with the
- * run's `deep` modifier → `builder:deep`). It never decides which model serves
- * that grade. That decision is local to the operator's machine, because it is a
- * statement about accounts, quotas and taste — three things a shared workflow
- * definition has no business asserting.
- *
- * So the settings file carries a flat map from capability to `{model, effort}`:
+ * A crew roster is a capability-to-candidate-list table. It is deliberately
+ * local: accounts, quotas, and operator preference do not belong in a shared
+ * workflow definition. The candidates are ordered so an operator can express
+ * a preferred harness with a deterministic fallback:
  *
  * ```json
  * {
- *   "capabilityModels": {
- *     "wise:deep":  { "model": "<model-id>", "effort": "xhigh" },
- *     "build:deep": { "model": "<model-id>", "effort": "xhigh" },
- *     "wise":       { "model": "<model-id>", "effort": "high" }
+ *   "roster": {
+ *     "wise:deep": [
+ *       { "harness": "<harness-id>", "model": "<model-id>", "effort": "xhigh" }
+ *     ]
  *   }
  * }
  * ```
  *
- * `<model-id>` is whatever string the shift's harness accepts as a model. This
- * module never enumerates real model ids: it ships as neutral runtime, and
- * `test/vendor-gate.test.ts` forbids a harness vendor's names here. `README.md`
- * and `docs/` carry worked examples with real ids.
+ * The one behavior worth carrying out of the retired tier code is EFFORT
+ * VALIDITY CHECKING. It happens at settings load and checks only the neutral
+ * start contract's five rungs.
  *
- * THIS REPLACES `tierMap`/`tierProfiles` OUTRIGHT. A tier was an abstract rung
- * (`fast`/`standard`/`strong`/`strongest`) that a machine then mapped to a
- * model, and the tier ladder could not express the thing the operator actually
- * wanted: "Luna at low effort" and "Fable at max effort" are different routes,
- * but the ladder welded model choice and depth into one ordered axis, so one
- * could not vary without the other. A capability is just a name. What serves it
- * is a local lookup, and depth rides on the capability's modifier suffix rather
- * than on a rung.
- *
- * The one behavior worth carrying out of the tier code is EFFORT VALIDITY
- * CHECKING, which now happens at settings load rather than at resolution time.
- * It checks the effort against `EFFORT_LADDER` — the neutral start contract's
- * own five rungs — and nothing else.
- *
- * IT DELIBERATELY DOES NOT CHECK EFFORT AGAINST THE MODEL. Doing that would
- * require a table of real model ids in this file, which the vendor gate forbids
- * and which this repository has no ground truth for anyway. Look at what the
- * harness adapters in `src/harness/` actually enforce: one validates effort
- * against a closed union that is a property of THE HARNESS — every model that
- * harness runs accepts the same rungs — and the other passes effort through
- * without validating it at all. Neither knows a per-model constraint, so a
- * table here would be either a restatement of `EFFORT_LADDER` under
- * model-shaped keys, or an invention that blocks a valid operator config. The
- * real per-harness check belongs on the adapter contract; see the follow-up
- * noted in `validateCapabilityModels`.
- *
- * The old snap-up/ceiling-refusal logic in `resolveEffort` is gone with the
- * ladder it resolved through: there is no abstract rung left to snap.
+ * IT DELIBERATELY DOES NOT CHECK EFFORT AGAINST THE MODEL. That would require a
+ * table of model identifiers which this repository has no ground truth for.
+ * Harnesses may validate effort as a harness-wide property or pass it through;
+ * neither case establishes a per-model constraint. A table here would either
+ * restate `EFFORT_LADDER` under model-shaped keys or invent a restriction that
+ * rejects a valid operator config. A future per-harness check belongs on the
+ * adapter contract, not in this neutral shape module.
  */
 
 /** Reasoning rungs the neutral start contract accepts, weakest to strongest. */
@@ -74,101 +50,109 @@ export function capabilityNamePart(capability: string): string {
   return at === -1 ? capability : capability.slice(0, at);
 }
 
-/** One settings row: the model that serves a capability, and how hard it thinks. */
-export interface CapabilityModelRow {
+/** One ordered candidate in a crew roster row. */
+export interface RosterCandidate {
+  harness: string;
   model: string;
   effort: string;
 }
 
-/** The settings map, keyed by composed capability (`wise:deep`) or bare name (`wise`). */
-export type CapabilityModelMap = Readonly<Record<string, CapabilityModelRow>>;
+/** A crew roster keyed by composed capability (`wise:deep`) or bare name (`wise`). */
+export type Roster = Readonly<Record<string, readonly RosterCandidate[]>>;
 
-/** Thrown when the capability map is unusable. Never silently repaired. */
-export class CapabilityModelError extends Error {}
+/** Thrown when the crew roster is unusable. Never silently repaired. */
+export class RosterError extends Error {}
 
 function isEffort(value: string): value is Effort {
   return (EFFORT_LADDER as readonly string[]).includes(value);
 }
 
 /**
- * Validate the map, throwing on the first unusable row. Returns nothing: every
- * fault this function can see is certainly wrong.
+ * Validate a crew roster, throwing on the first unusable row. Every fault this
+ * function catches is certainly wrong: an empty capability, an old object row,
+ * an empty candidate list, or a candidate missing any required part would make
+ * routing ambiguous hours after the configuration mistake.
  *
- * WHAT IT CATCHES — a capability key that is empty, a row that is not an object,
- * a missing or empty `model`, and an `effort` that is not one of
- * `EFFORT_LADDER`. Each is wrong under every harness and every model, and a
- * shift that started anyway would refuse or misroute its first matching order
- * hours later, far from the typo.
- *
- * WHAT IT DOES NOT CATCH — an effort a particular MODEL or HARNESS rejects, and
- * a model id that does not exist. Neither is knowable here (see this module's
- * header). FOLLOW-UP: `HarnessAdapter` is the right owner for the first one —
- * an adapter that validates effort against a closed union could declare that
- * union, and a composition root could check every row against every registered
- * adapter at shift start. Until then those faults surface at the vendor API on
- * the first order that lands on the bad row.
+ * It intentionally does not judge whether a model id exists or whether a
+ * particular model accepts an effort; see this module's header.
  */
-export function validateCapabilityModels(
-  map: Readonly<Record<string, unknown>>,
-  ctx = 'capabilityModels',
+export function validateRoster(
+  roster: Readonly<Record<string, unknown>>,
+  ctx = 'roster',
 ): void {
-  for (const [capability, raw] of Object.entries(map)) {
+  for (const [capability, rawCandidates] of Object.entries(roster)) {
     if (capability.trim() === '') {
-      throw new CapabilityModelError(`${ctx}: a capability key may not be empty`);
+      throw new RosterError(`${ctx}: a capability key may not be empty`);
     }
-    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-      throw new CapabilityModelError(
-        `${ctx}['${capability}'] must be an object with 'model' and 'effort', got ${JSON.stringify(raw)}`,
+    if (!Array.isArray(rawCandidates)) {
+      throw new RosterError(
+        `${ctx}['${capability}'] must be a non-empty array of { harness: "<harness-id>", model: "<model-id>", effort: "high" }, got ${JSON.stringify(rawCandidates)}`,
       );
     }
-    const row = raw as Record<string, unknown>;
-    const model = row['model'];
-    if (typeof model !== 'string' || model.trim() === '') {
-      throw new CapabilityModelError(`${ctx}['${capability}'].model must be a non-empty string`);
+    if (rawCandidates.length === 0) {
+      throw new RosterError(`${ctx}['${capability}'] must be a non-empty array of candidates`);
     }
-    const effort = row['effort'];
-    if (typeof effort !== 'string' || !isEffort(effort)) {
-      throw new CapabilityModelError(
-        `${ctx}['${capability}'].effort must be one of ${EFFORT_LADDER.join(', ')}, got ${JSON.stringify(effort)}`,
-      );
+    for (const [index, rawCandidate] of rawCandidates.entries()) {
+      const entryCtx = `${ctx}['${capability}'][${index}]`;
+      if (typeof rawCandidate !== 'object' || rawCandidate === null || Array.isArray(rawCandidate)) {
+        throw new RosterError(
+          `${entryCtx} must be an object with exactly 'harness', 'model', and 'effort', got ${JSON.stringify(rawCandidate)}`,
+        );
+      }
+      const candidate = rawCandidate as Record<string, unknown>;
+      const keys = Object.keys(candidate);
+      const unknown = keys.filter((key) => !['harness', 'model', 'effort'].includes(key));
+      if (unknown.length > 0) {
+        throw new RosterError(`${entryCtx} has unknown key(s): ${unknown.join(', ')}`);
+      }
+      for (const key of ['harness', 'model'] as const) {
+        if (typeof candidate[key] !== 'string' || candidate[key].trim() === '') {
+          throw new RosterError(`${entryCtx}.${key} must be a non-empty string`);
+        }
+      }
+      const effort = candidate['effort'];
+      if (typeof effort !== 'string' || !isEffort(effort)) {
+        throw new RosterError(
+          `${entryCtx}.effort must be one of ${EFFORT_LADDER.join(', ')}, got ${JSON.stringify(effort)}`,
+        );
+      }
     }
   }
 }
 
-/** Which row served the order: its exact compound, or the bare name fallback. */
+/** Which roster row served the order: its exact compound, or the bare name fallback. */
 export type CapabilityMatch = 'exact' | 'bare';
 
-export interface CapabilityResolution {
+export interface CapabilityCandidates {
   /** The capability the winning row was keyed by (`wise:deep` or `wise`). */
   capability: string;
   match: CapabilityMatch;
-  model: string;
-  effort: string;
+  candidates: readonly RosterCandidate[];
 }
 
 /**
- * Resolve an order's capabilities against the map: exact compound row first,
- * then the bare name-part row, else `undefined` (the caller REFUSES the order —
- * never a default model).
+ * Resolve an order's capabilities against the merged roster: exact compound
+ * row first, then the bare name-part row, else `undefined` (the caller
+ * refuses the order — never a default model).
  *
  * TWO PASSES ACROSS ALL CAPABILITIES, NOT ONE PASS PER CAPABILITY. A step may
  * author several capabilities, and the hub's claim gate is itself exact-first
- * across the set (§4/§5: "lookup mirrors the claim rule"). Resolving capability
- * by capability instead would let a bare row on the FIRST capability beat an
- * exact row on the second — the shift would run a `builder:deep` order at the
- * bare `builder` grade purely because of authoring order.
+ * across the set. Resolving capability by capability instead would let a bare
+ * row on the first capability beat an exact row on the second — the shift
+ * would run a deep order at the bare grade purely because of authoring order.
  *
- * The bare row is what makes a NAME-MATCH FALLBACK order resolvable at all: the
- * hub stamps `wise:deep` on an order that a crew bound only to `wise:standard`
- * then claims, and that shift has no `wise:deep` row by construction.
+ * The bare row is what makes a name-match fallback order resolvable at all:
+ * the hub can stamp `wise:deep` on an order that a crew bound only to
+ * `wise:standard` then claims, and that shift has no `wise:deep` row by
+ * construction.
  */
-export function resolveCapabilityModel(
-  map: CapabilityModelMap,
+export function resolveCapabilityCandidates(
+  roster: Roster,
   capabilities: readonly string[],
-): CapabilityResolution | undefined {
+): CapabilityCandidates | undefined {
   for (const capability of capabilities) {
-    const row = map[capability];
-    if (row !== undefined) return { capability, match: 'exact', model: row.model, effort: row.effort };
+    const candidates = roster[capability];
+    if (candidates !== undefined) return { capability, match: 'exact', candidates };
   }
   for (const capability of capabilities) {
     const name = capabilityNamePart(capability);
@@ -176,8 +160,35 @@ export function resolveCapabilityModel(
     // tried that key, and reporting it as a `bare` match would misreport an
     // exact hit as a fallback in the resolution record.
     if (name === capability) continue;
-    const row = map[name];
-    if (row !== undefined) return { capability: name, match: 'bare', model: row.model, effort: row.effort };
+    const candidates = roster[name];
+    if (candidates !== undefined) return { capability: name, match: 'bare', candidates };
   }
   return undefined;
+}
+
+export type SelectionOutcome =
+  | { kind: 'selected'; candidate: RosterCandidate }
+  | { kind: 'harness-policy'; offered: readonly string[] }
+  | { kind: 'none-available'; offered: readonly string[] };
+
+/**
+ * Select the first usable candidate in roster order. A non-empty step harness
+ * is a policy constraint; it narrows candidates before availability is tested.
+ */
+export function selectCandidate(
+  candidates: readonly RosterCandidate[],
+  stepHarness: string | undefined,
+  isAvailable: (harnessId: string) => boolean,
+): SelectionOutcome {
+  const survivors =
+    stepHarness !== undefined && stepHarness !== ''
+      ? candidates.filter((candidate) => candidate.harness === stepHarness)
+      : candidates;
+  if (survivors.length === 0) {
+    return { kind: 'harness-policy', offered: candidates.map((candidate) => candidate.harness) };
+  }
+  for (const candidate of survivors) {
+    if (isAvailable(candidate.harness)) return { kind: 'selected', candidate };
+  }
+  return { kind: 'none-available', offered: survivors.map((candidate) => candidate.harness) };
 }

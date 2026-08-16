@@ -17,12 +17,12 @@ import type { SignalHost } from '../src/roles/signals.ts';
 import { stripAmbientOwenloopEnv } from './helpers/ambient-env.ts';
 
 /**
- * Seed a hermetic owenloop v2 credential file at `<configHome>/owenloop/
+ * Seed a hermetic owenloop v2 credential file at `<home>/.owenloop/
  * credentials.json`, storing `token` in the `agent:<account>` slot for `origin`
  * — the real file backend `readStoredCredential` reads under OWENLOOP_NO_KEYCHAIN.
  */
-function seedAgentKeys(configHome: string, origin: string, slots: Record<string, string>): void {
-  const dir = join(configHome, 'owenloop');
+function seedAgentKeys(home: string, origin: string, slots: Record<string, string>): void {
+  const dir = join(home, '.owenloop');
   mkdirSync(dir, { recursive: true });
   const hubs: Record<string, Record<string, unknown>> = { [origin]: {} };
   for (const [account, token] of Object.entries(slots)) {
@@ -118,12 +118,11 @@ beforeEach(() => {
   savedEnv = { ...process.env };
   home = mkdtempSync(join(tmpdir(), 'owenloop-exec-home-'));
   process.env['HOME'] = home;
-  process.env['XDG_CONFIG_HOME'] = home;
   // Deny the whole OWENLOOP_* namespace, then set back only what this suite
   // wants. Naming the variables to delete was the old spelling and it was wrong
   // by construction — it covered OWENLOOP_TOKEN / _ACCOUNT / _SHIFT_ID and missed
-  // OWENLOOP_CONFIG_DIR, which OUTRANKS the XDG_CONFIG_HOME set above in the
-  // config-dir ladder (`configDir` in src/hub.ts) and sent the credential lookup
+  // OWENLOOP_CONFIG_DIR, which OUTRANKS this fixture's HOME in the config-dir
+  // ladder (`configDir` in src/hub.ts) and sent the credential lookup
   // to the developer's REAL config dir instead of the temp `home`. Every owenloop
   // shift exports a slice of the namespace, so a miss is red on an agent-driven
   // build and green in CI, where the whole namespace is unset.
@@ -161,11 +160,11 @@ test('run() refuses the default instruction resolver when HOME and USERPROFILE a
     err: (line) => err.push(line),
   });
   assert.equal(code, 1);
-  assert.match(err.join('\\n'), /instruction store unavailable: cannot locate the global workflow store: set HOME or USERPROFILE/);
+  assert.match(err.join('\\n'), /cannot locate a config directory: set OWENLOOP_CONFIG_DIR or HOME/);
 });
 
 test('run() exits 2 with the refuse message when no Scoped Identity key is stored', async () => {
-  // No OWENLOOP_TOKEN override + a hermetic empty file store (temp HOME/XDG,
+  // No OWENLOOP_TOKEN override + a hermetic empty file store (temp HOME,
   // OWENLOOP_NO_KEYCHAIN forces the file backend) ⇒ the agent slot is absent.
   const err: string[] = [];
   const code = await run(['wf1/run1', '--origin', 'https://hub.example'], { err: (l) => err.push(l) });

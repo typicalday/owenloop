@@ -222,7 +222,7 @@ async function runAgent(
   const errors: string[] = [];
   const home = tempDir('owenloop-launch-gate-value-agent-home-');
   homes.push(home);
-  const env = { ...trust.env, HOME: home, OWENLOOP_HARNESS: id };
+  const env = { ...trust.env, HOME: home, OWENLOOP_CONFIG_DIR: trust.configHome };
   const hub = await startHostileHub({ order: response, tamper: terminalAfterFirst(mutate) });
   try {
     const instructions = createStoreInstructionResolver({

@@ -213,13 +213,6 @@ function spawnDaemon(
     fixtureEnv(home, {
       OWENLOOP_CACHE_DIR: cacheDir, // the child gets no --cache-dir flag; env is the channel
       OWENLOOP_HARNESS_MODULE: FAKE_HARNESS,
-      // PHASE 4 made the composition root import the real adapters, so the
-      // registry is no longer empty and the FIRST-REGISTERED default is no
-      // longer the module this seam loads. The drill therefore NAMES the
-      // harness it means, at the `OWENLOOP_HARNESS` rank — which is also the
-      // honest shape: a drill that silently inherited whatever happened to be
-      // imported first was passing for a reason it never asserted.
-      OWENLOOP_HARNESS: 'fake',
       OWENLOOP_FAKE_TRACE: tracePath,
       OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'fake', start: { events: [{ kind: 'turn_ended' }] } }),
       ...extraEnv,
@@ -393,32 +386,11 @@ test('an AGENT order is run by a detached agent-run child, with nothing stamped 
   }
 });
 
-test('Shift leaves OWENLOOP_HARNESS above cached and verified definition harness ids', async () => {
-  await seedCache({ cachedHarness: 'cache-probe', runtimeHarness: 'runtime-probe' });
-  const { origin, server } = await startSingleOrderHub();
-  seedCredentialStore(home, origin);
-  const daemon = spawnDaemon(origin, {
-    OWENLOOP_HARNESS: 'env-probe',
-    OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'env-probe', start: { events: [{ kind: 'turn_ended' }] } }),
-  });
-
-  try {
-    await dispatchOne(daemon);
-    await until(() => traceCalls().some((call) => call['call'] === 'start'), 'the environment-selected harness to start');
-    const start = traceCalls().find((call) => call['call'] === 'start');
-    assert.equal(start?.['harnessId'], 'env-probe');
-  } finally {
-    server.close();
-    stopDaemonAndChildren(daemon);
-  }
-});
-
 test('Shift cache/runtime harness disagreement is resolved from the verified runtime definition', async () => {
   await seedCache({ cachedHarness: 'cache-probe', runtimeHarness: 'runtime-probe' });
   const { origin, server } = await startSingleOrderHub();
   seedCredentialStore(home, origin);
   const daemon = spawnDaemon(origin, {
-    OWENLOOP_HARNESS: undefined,
     OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'runtime-probe', start: { events: [{ kind: 'turn_ended' }] } }),
   });
 
@@ -433,14 +405,13 @@ test('Shift cache/runtime harness disagreement is resolved from the verified run
   }
 });
 
-test('Shift environment selection of Codex refuses maxTurns before provider startup and releases', async () => {
-  await seedCache({ cachedHarness: 'claude-code', runtimeHarness: 'claude-code', maxTurns: 9 });
+test('Shift verified Codex selection refuses maxTurns before provider startup and releases', async () => {
+  await seedCache({ cachedHarness: 'claude-code', runtimeHarness: 'codex', maxTurns: 9 });
   const claude = startupProbe('claude-provider-probe');
   const codex = startupProbe('codex-provider-probe');
   const { origin, reqs, server } = await startSingleOrderHub();
   seedCredentialStore(home, origin);
   const daemon = spawnDaemon(origin, {
-    OWENLOOP_HARNESS: 'codex',
     OWENLOOP_HARNESS_MODULE: undefined,
     OWENLOOP_FAKE_TRACE: undefined,
     OWENLOOP_FAKE_SCRIPT: undefined,

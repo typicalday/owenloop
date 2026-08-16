@@ -21,7 +21,7 @@ import {
 import { ACCOUNT_TOKEN, SHIFT_TOKEN, ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { resolveOwenloopBin } from '../src/owenloop-bin.ts';
 import { createFakeAdapter } from '../src/harness/fake.ts';
-import type { CapabilityModelMap } from '../src/agent/capability-model.ts';
+import type { MergedRoster } from '../src/settings/roster.ts';
 import type { AgentEvent, HarnessAdapter, HarnessSessionRef, StartArgs } from '../src/harness/contract.ts';
 import { ResumeUnavailableError } from '../src/harness/contract.ts';
 import type { SessionRecord } from '../src/harness/session-store.ts';
@@ -244,7 +244,7 @@ interface BuildOpts {
   shiftName?: string;
   shiftOwner?: string;
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
-  capabilityModels?: CapabilityModelMap;
+  rosters?: readonly MergedRoster[];
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
   dirExists?: AgentRunLoopOptions['dirExists'];
@@ -269,8 +269,9 @@ function buildOpts(b: BuildOpts): Harnessed {
     cwd: '/fallback/cwd',
     loadStep: b.loadStep ?? (async () => (b.spec === undefined ? baseSpec() : b.spec)),
     resolveAdapter: () => resolution,
+    harnessAvailable: (id) => id === 'fake',
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
-    ...(b.capabilityModels === undefined ? {} : { capabilityModels: b.capabilityModels }),
+    ...(b.rosters === undefined ? {} : { rosters: b.rosters }),
     ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
@@ -373,7 +374,7 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
   // more. It carries the def's authored tier NAME from the retired scheme
   // (`strong`, `m-override`), which is not a vendor model id; putting it on the
   // wire would send a nonexistent model to the harness. The per-start override
-  // now comes only from a `capabilityModels` row, and this order carries no
+  // now comes only from a `roster` row, and this order carries no
   // capabilities to match one with.
   assert.equal(start.args.model, undefined);
 });
@@ -381,18 +382,18 @@ test('the brief is rendered and the work-holder mount is born bound to this orde
 // ---- capability routing from real packet data -------------------------------
 //
 // `capability-model.test.ts` covers the RESOLVER by calling
-// `resolveCapabilityModel` with literal arguments. These tests cover the
+// `resolveCapabilityCandidates` with literal arguments. These tests cover the
 // WIRING instead: that the loop reads `packet.capabilities`, hands them to the
 // settings map, puts the winning row on the harness `start` args, tells the hub
 // what it picked, and refuses the order outright when no row matches. Without
 // them the packet reader is the only unexercised part of the path, and a shift
 // that silently ran every order on the harness default would ship green.
 
-/** The map a real `capabilityModels` settings block produces. */
-const MAP: CapabilityModelMap = {
-  'build:deep': { model: 'claude-opus-5', effort: 'xhigh' },
-  build: { model: 'claude-sonnet-5', effort: 'high' },
-  wise: { model: 'claude-fable-5', effort: 'xhigh' },
+/** A merged crew roster produced by the composition root. */
+const MAP: MergedRoster = {
+  'build:deep': { candidates: [{ harness: 'fake', model: 'claude-opus-5', effort: 'xhigh' }], source: 'test' },
+  build: { candidates: [{ harness: 'fake', model: 'claude-sonnet-5', effort: 'high' }], source: 'test' },
+  wise: { candidates: [{ harness: 'fake', model: 'claude-fable-5', effort: 'xhigh' }], source: 'test' },
 };
 
 /**
@@ -403,13 +404,13 @@ const MAP: CapabilityModelMap = {
  * these tests are about, so it is satisfied with a pass-through that admits the
  * packet unchanged; the refusal behavior has its own tests further down.
  */
-async function startArgsFor(o: OrderOpts, map: CapabilityModelMap = MAP): Promise<StartArgs> {
+async function startArgsFor(o: OrderOpts, map: MergedRoster = MAP): Promise<StartArgs> {
   const adapter = createFakeAdapter();
   const { hub } = mockHub({ getOrder: [agentOrder(o), agentOrder({ claimed: false, outcome: 'green' })] });
   const h = buildOpts({
     hub,
     adapter,
-    capabilityModels: map,
+    rosters: [map],
     consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
   });
   await createAgentRunLoop(h.opts).run();
@@ -453,17 +454,17 @@ test('an order carrying no capabilities runs on the harness default, not a guess
 test('an order whose capabilities match no row is REFUSED, never run on a default model', async () => {
   const adapter = createFakeAdapter();
   const { hub, calls } = mockHub({ getOrder: [agentOrder({ capabilities: ['paint:deep'] })] });
-  const h = buildOpts({ hub, adapter, capabilityModels: MAP });
+  const h = buildOpts({ hub, adapter, rosters: [MAP] });
 
   const outcome = await createAgentRunLoop(h.opts).run();
 
   assert.equal(outcome, 'unresolvable-capability');
   assert.equal(adapter.calls.filter((c) => c.kind === 'start').length, 0, 'no harness turn was started');
   assert.equal(calls.filter((c) => c.verb === 'release').length, 1, 'the lease went back for another shift to try');
-  assert.ok(h.errs.some((l) => l.includes('no settings row') && l.includes('paint:deep')));
+  assert.ok(h.errs.some((l) => l.includes('no crew roster row') && l.includes('paint:deep')));
 });
 
-test('a shift with NO capabilityModels at all refuses a capability-bearing order', async () => {
+test('a shift with NO roster at all refuses a capability-bearing order', async () => {
   // The map has no built-in default on purpose: a shift that never declared
   // what serves what must say so on its first order, not run everything on a
   // hardcoded model and look like it worked.
@@ -480,7 +481,7 @@ test('the resolution is reported to the hub BEFORE the harness turn starts', asy
   const { hub, calls } = mockHub({
     getOrder: [agentOrder({ capabilities: ['build:deep'] }), agentOrder({ claimed: false, outcome: 'green' })],
   });
-  const h = buildOpts({ hub, adapter, capabilityModels: MAP });
+  const h = buildOpts({ hub, adapter, rosters: [MAP] });
 
   await createAgentRunLoop(h.opts).run();
 
@@ -525,7 +526,7 @@ test('a failing report_resolution is logged and the order runs anyway', async ()
   hub.reportResolution = async (): Promise<never> => {
     throw new HubError(500, 'report_resolution blew up');
   };
-  const h = buildOpts({ hub, adapter, capabilityModels: MAP });
+  const h = buildOpts({ hub, adapter, rosters: [MAP] });
 
   await createAgentRunLoop(h.opts).run();
 
@@ -536,10 +537,10 @@ test('a failing report_resolution is logged and the order runs anyway', async ()
 /** Run one order and return the `resolution` payload the loop reported, if any. */
 async function reportFor(
   o: OrderOpts,
-  map: CapabilityModelMap,
+  map: MergedRoster,
 ): Promise<Record<string, unknown> | undefined> {
   const { hub, calls } = mockHub({ getOrder: [agentOrder(o), agentOrder({ claimed: false, outcome: 'green' })] });
-  const h = buildOpts({ hub, adapter: createFakeAdapter(), capabilityModels: map });
+  const h = buildOpts({ hub, adapter: createFakeAdapter(), rosters: [map] });
   await createAgentRunLoop(h.opts).run();
   const report = calls.find((c) => c.verb === 'report_resolution');
   if (report === undefined) return undefined;

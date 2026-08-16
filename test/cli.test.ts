@@ -16,6 +16,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -63,12 +64,12 @@ function makeCli(opts: { defs?: string; setDbEnv?: boolean } = {}) {
 /** A hermetic async CLI for offline trust-record commands. */
 function makeTrustCli() {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-trust-cli-'));
-  const config = join(home, 'config');
+  const config = join(home, '.owenloop');
   const out: string[] = [];
   const err: string[] = [];
   const io: CliIO = {
     cwd: home,
-    env: { HOME: home, XDG_CONFIG_HOME: config },
+    env: { HOME: home },
     out: (s) => out.push(s),
     err: (s) => err.push(s),
   };
@@ -180,7 +181,7 @@ test('trust init, grant, and revoke mint offline DSSE records under the injected
   assert.equal(grant.code, 0, grant.err);
   const grantResult = grant.json();
   assert.match(grantResult.keyid, /^SHA256:[A-Za-z0-9+/]{43}$/);
-  assert.equal(grantResult.path.startsWith(join(config, 'owenloop', 'roster')), true);
+  assert.equal(grantResult.path.startsWith(join(config, 'roster')), true);
   const grantEnvelope = JSON.parse(readFileSync(grantResult.path, 'utf8'));
   assert.equal(grantEnvelope.payloadType, 'application/vnd.owenloop.enrollment-grant.v1+json');
   const grantRecord = JSON.parse(Buffer.from(grantEnvelope.payload, 'base64').toString('utf8'));
@@ -207,14 +208,14 @@ test('trust init, grant, and revoke mint offline DSSE records under the injected
   const revokeResult = revoke.json();
   assert.equal(revokeResult.revokedKey, grantResult.keyid);
   assert.equal(revokeResult.backdated, true);
-  assert.equal(revokeResult.path.startsWith(join(config, 'owenloop', 'revocations')), true);
+  assert.equal(revokeResult.path.startsWith(join(config, 'revocations')), true);
   const revokeEnvelope = JSON.parse(readFileSync(revokeResult.path, 'utf8'));
   assert.equal(revokeEnvelope.payloadType, 'application/vnd.owenloop.revocation.v1+json');
   const revokeRecord = JSON.parse(Buffer.from(revokeEnvelope.payload, 'base64').toString('utf8'));
   assert.equal(revokeRecord.reason, 'test rotation');
   assert.equal(revokeRecord.effectiveFrom, 0);
-  assert.equal(readdirSync(join(config, 'owenloop', 'roster')).length, 1);
-  assert.equal(readdirSync(join(config, 'owenloop', 'revocations')).length, 1);
+  assert.equal(readdirSync(join(config, 'roster')).length, 1);
+  assert.equal(readdirSync(join(config, 'revocations')).length, 1);
 });
 
 // ---- unknown-option rejection (before any side effect) ----------------------
@@ -275,6 +276,40 @@ test('COMMAND_OPTIONS covers exactly the commands USAGE advertises', () => {
   const tableKeys = new Set(COMMAND_OPTIONS.keys());
   tableKeys.delete('help'); // help is an entry point, not a USAGE line
   assert.deepEqual([...tableKeys].sort(), [...advertised].sort());
+});
+
+test('roster show prints merged candidates, provenance, and absent layers', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-cli-'));
+  try {
+    const config = join(home, '.owenloop');
+    const crews = join(config, 'crews');
+    mkdirSync(crews, { recursive: true });
+    writeFileSync(
+      join(config, 'settings.json'),
+      JSON.stringify({ roster: { build: [{ harness: 'global', model: 'g', effort: 'high' }] } }),
+    );
+    writeFileSync(
+      join(crews, 'delivery.json'),
+      JSON.stringify({ roster: { build: [{ harness: 'crew', model: 'c', effort: 'xhigh' }] } }),
+    );
+    const out: string[] = [];
+    const err: string[] = [];
+    assert.equal(
+      main(['roster', 'show', 'delivery'], {
+        cwd: home,
+        env: { HOME: home },
+        out: (line) => out.push(line),
+        err: (line) => err.push(line),
+      }),
+      0,
+    );
+    assert.equal(err.length, 0);
+    assert.match(out.join('\n'), /build:/u);
+    assert.match(out.join('\n'), /harness=crew.*from machine crews\/delivery\.json/u);
+    assert.match(out.join('\n'), /machine settings\.json: found/u);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('every ASYNC_COMMANDS member has a COMMAND_OPTIONS entry (no unreachable async verb)', () => {

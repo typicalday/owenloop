@@ -6,10 +6,10 @@ import { test } from 'node:test';
 
 import { settingsPath, loadSettings, validateSettings, inspectSettings, KNOWN_SETTINGS_KEYS } from '../src/settings/settings.ts';
 
-/** Write a settings.json under a fresh temp XDG dir; returns the XDG root. */
+/** Write a settings.json under a fresh temporary HOME; returns that HOME. */
 function withSettingsFile(contents: string): string {
   const xdg = mkdtempSync(join(tmpdir(), 'owenloop-settings-'));
-  const dir = join(xdg, 'owenloop');
+  const dir = join(xdg, '.owenloop');
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'settings.json'), contents);
   return xdg;
@@ -18,44 +18,33 @@ function withSettingsFile(contents: string): string {
 // Every fixture materializes its OWN ambient state (temp HOME / XDG dir it
 // creates) — never the developer's or CI runner's real home.
 
-test('settingsPath: XDG_CONFIG_HOME wins over HOME when set and non-empty', () => {
+test('settingsPath: XDG_CONFIG_HOME is ignored and HOME supplies the default', () => {
   assert.equal(
     settingsPath({ XDG_CONFIG_HOME: '/xdg', HOME: '/home/u' }),
-    join('/xdg', 'owenloop', 'settings.json'),
+    join('/home/u', '.owenloop', 'settings.json'),
   );
   assert.equal(
     settingsPath({ XDG_CONFIG_HOME: '  ', HOME: '/home/u' }),
-    join('/home/u', '.config', 'owenloop', 'settings.json'),
+    join('/home/u', '.owenloop', 'settings.json'),
   );
-  assert.equal(
-    settingsPath({ HOME: '/home/u' }),
-    join('/home/u', '.config', 'owenloop', 'settings.json'),
-  );
+  assert.equal(settingsPath({ HOME: '/home/u' }), join('/home/u', '.owenloop', 'settings.json'));
 });
 
-test('settingsPath: OWENLOOP_CONFIG_DIR wins over XDG_CONFIG_HOME and HOME', () => {
-  // The variable an operator running SEVERAL shifts should set. `XDG_CONFIG_HOME`
-  // reaches every worker and every command-step child, so scoping owenloop with
-  // it also relocates `gh`, `git`, and `gcloud` for the workflow's own scripts.
+test('settingsPath: OWENLOOP_CONFIG_DIR wins over HOME', () => {
   assert.equal(
     settingsPath({ OWENLOOP_CONFIG_DIR: '/srv/utility/owenloop', XDG_CONFIG_HOME: '/xdg', HOME: '/home/u' }),
     join('/srv/utility/owenloop', 'settings.json'),
   );
-  // No `owenloop` segment is appended to it, unlike the XDG rung.
   assert.equal(settingsPath({ OWENLOOP_CONFIG_DIR: '/cfg' }), join('/cfg', 'settings.json'));
-  // Blank reads as unset, so the ladder falls through.
   assert.equal(
-    settingsPath({ OWENLOOP_CONFIG_DIR: '  ', XDG_CONFIG_HOME: '/xdg' }),
-    join('/xdg', 'owenloop', 'settings.json'),
+    settingsPath({ OWENLOOP_CONFIG_DIR: '  ', XDG_CONFIG_HOME: '/xdg', HOME: '/home/u' }),
+    join('/home/u', '.owenloop', 'settings.json'),
   );
 });
 
 test('settingsPath: throws when no rung of the ladder is usable', () => {
-  assert.throws(() => settingsPath({}), /set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/);
-  assert.throws(
-    () => settingsPath({ HOME: '', XDG_CONFIG_HOME: '' }),
-    /set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/,
-  );
+  assert.throws(() => settingsPath({}), /set OWENLOOP_CONFIG_DIR or HOME/);
+  assert.throws(() => settingsPath({ HOME: '', XDG_CONFIG_HOME: '' }), /set OWENLOOP_CONFIG_DIR or HOME/);
 });
 
 test('loadSettings: absent file yields {}', () => {
@@ -70,10 +59,10 @@ test('loadSettings: absent file yields {}', () => {
 test('loadSettings: present file is parsed', () => {
   const xdg = mkdtempSync(join(tmpdir(), 'owenloop-settings-'));
   try {
-    const dir = join(xdg, 'owenloop');
+    const dir = join(xdg, '.owenloop');
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'settings.json'), JSON.stringify({ hello: 'world' }));
-    assert.deepEqual(loadSettings({ XDG_CONFIG_HOME: xdg }), { hello: 'world' } as Record<string, unknown>);
+    assert.deepEqual(loadSettings({ HOME: xdg }), { hello: 'world' } as Record<string, unknown>);
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
@@ -82,10 +71,10 @@ test('loadSettings: present file is parsed', () => {
 test('loadSettings: commandRouting passes through when set', () => {
   const xdg = mkdtempSync(join(tmpdir(), 'owenloop-settings-'));
   try {
-    const dir = join(xdg, 'owenloop');
+    const dir = join(xdg, '.owenloop');
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'settings.json'), JSON.stringify({ commandRouting: 'manual' }));
-    assert.equal(loadSettings({ XDG_CONFIG_HOME: xdg }).commandRouting, 'manual');
+    assert.equal(loadSettings({ HOME: xdg }).commandRouting, 'manual');
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
@@ -94,11 +83,11 @@ test('loadSettings: commandRouting passes through when set', () => {
 test('loadSettings: malformed JSON throws a clear, path-named error', () => {
   const xdg = mkdtempSync(join(tmpdir(), 'owenloop-settings-'));
   try {
-    const dir = join(xdg, 'owenloop');
+    const dir = join(xdg, '.owenloop');
     mkdirSync(dir, { recursive: true });
     const file = join(dir, 'settings.json');
     writeFileSync(file, '{ not json');
-    assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), (err: unknown) => {
+    assert.throws(() => loadSettings({ HOME: xdg }), (err: unknown) => {
       assert.ok(err instanceof Error);
       assert.match(err.message, /malformed settings file/);
       assert.match(err.message, new RegExp(file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
@@ -114,7 +103,7 @@ test('loadSettings: malformed JSON throws a clear, path-named error', () => {
 test('loadSettings: allowedWorkdirRoots loads as an array of absolute paths', () => {
   const xdg = withSettingsFile(JSON.stringify({ allowedWorkdirRoots: ['/Users/me/code', '/srv/work'] }));
   try {
-    assert.deepEqual(loadSettings({ XDG_CONFIG_HOME: xdg }).allowedWorkdirRoots, ['/Users/me/code', '/srv/work']);
+    assert.deepEqual(loadSettings({ HOME: xdg }).allowedWorkdirRoots, ['/Users/me/code', '/srv/work']);
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
@@ -135,7 +124,7 @@ test('loadSettings: allowedWorkdirRoots rejects non-arrays, non-strings, blanks,
   for (const [label, value, expected] of cases) {
     const xdg = withSettingsFile(JSON.stringify({ allowedWorkdirRoots: value }));
     try {
-      assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), expected, `${label} should be rejected`);
+      assert.throws(() => loadSettings({ HOME: xdg }), expected, `${label} should be rejected`);
     } finally {
       rmSync(xdg, { recursive: true, force: true });
     }
@@ -156,7 +145,7 @@ test('loadSettings: each C6 knob loads with its value', () => {
     }),
   );
   try {
-    const s = loadSettings({ XDG_CONFIG_HOME: xdg });
+    const s = loadSettings({ HOME: xdg });
     assert.equal(s.hubOrigin, 'https://hub.example');
     assert.equal(s.cacheDir, '/c');
     assert.equal(s.stateDir, '/s');
@@ -168,81 +157,51 @@ test('loadSettings: each C6 knob loads with its value', () => {
   }
 });
 
-test('loadSettings: capabilityModels loads as a flat capability → { model, effort } map', () => {
+test('loadSettings: roster loads as capability → ordered candidates', () => {
   const xdg = withSettingsFile(
     JSON.stringify({
-      capabilityModels: {
-        'build:deep': { model: 'claude-opus-5', effort: 'xhigh' },
-        build: { model: 'claude-sonnet-5', effort: 'high' },
+      roster: {
+        'build:deep': [{ harness: 'first', model: 'large', effort: 'xhigh' }],
+        build: [{ harness: 'second', model: 'small', effort: 'high' }],
       },
     }),
   );
   try {
-    const s = loadSettings({ XDG_CONFIG_HOME: xdg });
-    assert.deepEqual(s.capabilityModels, {
-      'build:deep': { model: 'claude-opus-5', effort: 'xhigh' },
-      build: { model: 'claude-sonnet-5', effort: 'high' },
+    const s = loadSettings({ HOME: xdg });
+    assert.deepEqual(s.roster, {
+      'build:deep': [{ harness: 'first', model: 'large', effort: 'xhigh' }],
+      build: [{ harness: 'second', model: 'small', effort: 'high' }],
     });
-    assert.ok(KNOWN_SETTINGS_KEYS.includes('capabilityModels'));
+    assert.ok(KNOWN_SETTINGS_KEYS.includes('roster'));
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
 });
 
-test('loadSettings: capabilityModels rejects malformed rows at LOAD time, not at dispatch', () => {
-  // Every one of these would otherwise surface as a vendor API error in the
-  // middle of somebody's order, hours after the file was edited.
+test('loadSettings: roster rejects malformed candidates at load time', () => {
   const cases: Array<[string, unknown, RegExp]> = [
-    ['not an object', 'nope', /'capabilityModels' must be an object/],
-    ['an array', [], /'capabilityModels' must be an object/],
-    ['an empty capability key', { '': { model: 'claude-opus-5', effort: 'high' } }, /may not be empty/u],
-    ['a non-object row', { build: 'claude-opus-5' }, /build/u],
-    ['an empty model', { build: { model: '', effort: 'high' } }, /model/u],
-    ['an off-ladder effort', { build: { model: 'some-model', effort: 'turbo' } }, /turbo/u],
-    ['a missing effort', { build: { model: 'some-model' } }, /effort/u],
+    ['not an object', 'nope', /'roster' must be a JSON object/],
+    ['old object row', { build: { model: 'm', effort: 'high' } }, /array/u],
+    ['empty candidate array', { build: [] }, /non-empty array/u],
+    ['missing harness', { build: [{ model: 'm', effort: 'high' }] }, /harness/u],
+    ['off-ladder effort', { build: [{ harness: 'h', model: 'm', effort: 'turbo' }] }, /turbo/u],
   ];
   for (const [label, value, expected] of cases) {
-    const xdg = withSettingsFile(JSON.stringify({ capabilityModels: value }));
+    const xdg = withSettingsFile(JSON.stringify({ roster: value }));
     try {
-      assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), expected, `${label} should be rejected`);
+      assert.throws(() => loadSettings({ HOME: xdg }), expected, label);
     } finally {
       rmSync(xdg, { recursive: true, force: true });
     }
   }
 });
 
-test('loadSettings: any model id loads — owenloop never gatekeeps which models exist', () => {
-  // The effort must be a real rung, but WHICH model serves a capability is the
-  // operator's call and their harness's business. A model released after this
-  // build shipped is the expected case, not an error, and there is no warning
-  // for it either: owenloop has nothing true to say about it.
-  const xdg = withSettingsFile(
-    JSON.stringify({ capabilityModels: { wise: { model: 'some-brand-new-model', effort: 'max' } } }),
-  );
+test('loadSettings: legacy capabilityModels is a hard error showing roster candidates', () => {
+  const xdg = withSettingsFile(JSON.stringify({ capabilityModels: { build: { model: 'm', effort: 'high' } } }));
   try {
-    const i = inspectSettings({ XDG_CONFIG_HOME: xdg });
-    assert.deepEqual(i.warnings, []);
-    assert.deepEqual(i.settings.capabilityModels?.['wise'], { model: 'some-brand-new-model', effort: 'max' });
+    assert.throws(() => loadSettings({ HOME: xdg }), /capabilityModels.*replaced by 'roster'.*harness/su);
   } finally {
     rmSync(xdg, { recursive: true, force: true });
-  }
-});
-
-test('loadSettings: the retired tier keys are a HARD ERROR, naming their replacement', () => {
-  // Not merely unrecognized. Passing `tierMap` over silently would start the
-  // shift with NO capability map, and every agent order would then be refused
-  // at dispatch citing capabilities the operator never wrote.
-  for (const retired of ['tierMap', 'tierProfiles'] as const) {
-    const xdg = withSettingsFile(JSON.stringify({ [retired]: { strong: 'custom-strong' } }));
-    try {
-      assert.throws(
-        () => loadSettings({ XDG_CONFIG_HOME: xdg }),
-        new RegExp(`'${retired}' was removed .* 'capabilityModels'`, 'su'),
-        `${retired} should be a hard error`,
-      );
-    } finally {
-      rmSync(xdg, { recursive: true, force: true });
-    }
   }
 });
 
@@ -253,7 +212,7 @@ test('loadSettings: the retired escalation keys only WARN — ignoring them chan
   // escalation itself still happens correctly without them.
   const xdg = withSettingsFile(JSON.stringify({ escalateAt: 5, escalationExtensionKey: 'delivery-extra' }));
   try {
-    const i = inspectSettings({ XDG_CONFIG_HOME: xdg });
+    const i = inspectSettings({ HOME: xdg });
     assert.equal(i.warnings.length, 2);
     assert.ok(i.warnings.every((w) => w.includes('no longer does anything')));
     assert.ok(i.warnings.some((w) => w.includes('escalateAt')));
@@ -269,7 +228,7 @@ test('loadSettings: the retired escalation keys only WARN — ignoring them chan
 test('loadSettings: absent knobs default to undefined (empty file)', () => {
   const xdg = withSettingsFile('{}');
   try {
-    const s = loadSettings({ XDG_CONFIG_HOME: xdg });
+    const s = loadSettings({ HOME: xdg });
     assert.equal(s.hubOrigin, undefined);
     assert.equal(s.stateDir, undefined);
     assert.equal(s.dispatchCap, undefined);
@@ -281,9 +240,9 @@ test('loadSettings: absent knobs default to undefined (empty file)', () => {
 
 test('loadSettings: a wrong-typed known key errors, naming key + path', () => {
   const xdg = withSettingsFile(JSON.stringify({ hubOrigin: 42 }));
-  const file = join(xdg, 'owenloop', 'settings.json');
+  const file = join(xdg, '.owenloop', 'settings.json');
   try {
-    assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), (err: unknown) => {
+    assert.throws(() => loadSettings({ HOME: xdg }), (err: unknown) => {
       assert.ok(err instanceof Error);
       assert.match(err.message, /'hubOrigin' must be a string/);
       assert.match(err.message, new RegExp(file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
@@ -299,7 +258,7 @@ test('loadSettings: dispatchCap rejects 0, negative, and non-integer', () => {
     const xdg = withSettingsFile(JSON.stringify({ dispatchCap: bad }));
     try {
       assert.throws(
-        () => loadSettings({ XDG_CONFIG_HOME: xdg }),
+        () => loadSettings({ HOME: xdg }),
         /'dispatchCap' must be a positive integer/,
         `dispatchCap ${bad} should be rejected`,
       );
@@ -312,7 +271,7 @@ test('loadSettings: dispatchCap rejects 0, negative, and non-integer', () => {
 test('loadSettings: commandRouting rejects an unknown literal', () => {
   const xdg = withSettingsFile(JSON.stringify({ commandRouting: 'nope' }));
   try {
-    assert.throws(() => loadSettings({ XDG_CONFIG_HOME: xdg }), /'commandRouting' must be 'shift' or 'manual'/);
+    assert.throws(() => loadSettings({ HOME: xdg }), /'commandRouting' must be 'shift' or 'manual'/);
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
@@ -351,7 +310,7 @@ test('inspectSettings: reports path + exists:false for a missing file', () => {
 test('inspectSettings: reports exists:true + validated contents + unrecognized', () => {
   const xdg = withSettingsFile(JSON.stringify({ dispatchCap: 9, mystery: true }));
   try {
-    const i = inspectSettings({ XDG_CONFIG_HOME: xdg });
+    const i = inspectSettings({ HOME: xdg });
     assert.equal(i.exists, true);
     assert.equal(i.settings.dispatchCap, 9);
     assert.deepEqual(i.unrecognized, ['mystery']);
@@ -367,7 +326,7 @@ test('loadSettings: maxConcurrentAgents rejects 0, negative, and non-integer', (
     const xdg = withSettingsFile(JSON.stringify({ maxConcurrentAgents: bad }));
     try {
       assert.throws(
-        () => loadSettings({ XDG_CONFIG_HOME: xdg }),
+        () => loadSettings({ HOME: xdg }),
         /'maxConcurrentAgents' must be a positive integer/,
         `maxConcurrentAgents ${JSON.stringify(bad)} should be rejected`,
       );
@@ -382,7 +341,7 @@ test('loadSettings: maxConcurrentAgents rejects 0, negative, and non-integer', (
 test('the deleted stamp-path settings keys are reported as unrecognized', () => {
   const xdg = withSettingsFile(JSON.stringify({ agentsDir: '/a', runnerDispatch: true }));
   try {
-    assert.deepEqual(inspectSettings({ XDG_CONFIG_HOME: xdg }).unrecognized.sort(), ['agentsDir', 'runnerDispatch']);
+    assert.deepEqual(inspectSettings({ HOME: xdg }).unrecognized.sort(), ['agentsDir', 'runnerDispatch']);
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
@@ -391,7 +350,7 @@ test('the deleted stamp-path settings keys are reported as unrecognized', () => 
 test('KNOWN_SETTINGS_KEYS carries maxConcurrentAgents, so it is not "unrecognized"', () => {
   const xdg = withSettingsFile(JSON.stringify({ maxConcurrentAgents: 4 }));
   try {
-    assert.deepEqual(inspectSettings({ XDG_CONFIG_HOME: xdg }).unrecognized, []);
+    assert.deepEqual(inspectSettings({ HOME: xdg }).unrecognized, []);
     assert.ok(KNOWN_SETTINGS_KEYS.includes('maxConcurrentAgents'));
   } finally {
     rmSync(xdg, { recursive: true, force: true });
@@ -402,7 +361,7 @@ test('loadSettings: defPolicy accepts enforce, warn, and off', () => {
   for (const defPolicy of ['enforce', 'warn', 'off'] as const) {
     const xdg = withSettingsFile(JSON.stringify({ defPolicy }));
     try {
-      assert.equal(loadSettings({ XDG_CONFIG_HOME: xdg }).defPolicy, defPolicy);
+      assert.equal(loadSettings({ HOME: xdg }).defPolicy, defPolicy);
     } finally {
       rmSync(xdg, { recursive: true, force: true });
     }
@@ -414,7 +373,7 @@ test('loadSettings: defPolicy rejects an unknown value and wrong types', () => {
     const xdg = withSettingsFile(JSON.stringify({ defPolicy }));
     try {
       assert.throws(
-		() => loadSettings({ XDG_CONFIG_HOME: xdg }),
+		() => loadSettings({ HOME: xdg }),
 		/'defPolicy' must be 'enforce', 'warn', or 'off'/,
       );
     } finally {
@@ -427,7 +386,7 @@ test('KNOWN_SETTINGS_KEYS carries defPolicy and absent defPolicy remains undefin
   const xdg = withSettingsFile('{}');
   try {
     assert.ok(KNOWN_SETTINGS_KEYS.includes('defPolicy'));
-    assert.equal(loadSettings({ XDG_CONFIG_HOME: xdg }).defPolicy, undefined);
+    assert.equal(loadSettings({ HOME: xdg }).defPolicy, undefined);
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }

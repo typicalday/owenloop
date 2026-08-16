@@ -17,7 +17,7 @@ import { inspectSettings, KNOWN_SETTINGS_KEYS } from '../settings/settings.ts';
 /**
  * Built-in defaults shown for knobs absent from the file (else `unset`).
  *
- * `capabilityModels` is deliberately absent: it HAS no built-in default. A shift
+ * `roster` is deliberately absent: it HAS no built-in default. A shift
  * with no row for an order's capability refuses that order rather than falling
  * back to some default model, so printing a default here would describe
  * behaviour that does not exist.

@@ -116,13 +116,13 @@ test('randomState yields distinct url-safe tokens', () => {
 
 // ---- config dir derives from env, never process.env --------------------------
 
-test('configDir prefers OWENLOOP_CONFIG_DIR, then XDG_CONFIG_HOME, then HOME/.config, else throws', () => {
+test('configDir prefers OWENLOOP_CONFIG_DIR, then HOME/.owenloop, else throws', () => {
   // `OWENLOOP_CONFIG_DIR` is used VERBATIM — no `owenloop` segment is appended,
-  // unlike the XDG rung. See src/config-dir.ts for why the variable exists.
+  // unlike the HOME default. See src/config-dir.ts for why the variable exists.
   assert.equal(configDir({ OWENLOOP_CONFIG_DIR: '/cfg', XDG_CONFIG_HOME: '/x', HOME: '/home/me' }), '/cfg');
-  assert.equal(configDir({ XDG_CONFIG_HOME: '/x' }), join('/x', 'owenloop'));
-  assert.equal(configDir({ HOME: '/home/me' }), join('/home/me', '.config', 'owenloop'));
-  assert.throws(() => configDir({}), /set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/);
+  assert.equal(configDir({ XDG_CONFIG_HOME: '/x', HOME: '/home/me' }), join('/home/me', '.owenloop'));
+  assert.equal(configDir({ HOME: '/home/me' }), join('/home/me', '.owenloop'));
+  assert.throws(() => configDir({}), /set OWENLOOP_CONFIG_DIR or HOME/);
 });
 
 // ---- macOS Keychain status handling ------------------------------------------
@@ -263,7 +263,7 @@ test('writeCredentialFile round-trips and enforces 0600 file / 0700 dir', () => 
   assert.deepEqual(readBack.hubs['https://api.owenloop.com']?.human, cred);
 
   assert.equal(statSync(path).mode & 0o777, 0o600, 'credential file is 0600');
-  assert.equal(statSync(join(home, '.config', 'owenloop')).mode & 0o777, 0o700, 'config dir is 0700');
+  assert.equal(statSync(join(home, '.owenloop')).mode & 0o777, 0o700, 'config dir is 0700');
 });
 
 test('readCredentialFile: a missing file is an empty store', () => {

@@ -15,7 +15,7 @@
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
@@ -60,14 +60,16 @@ test('parseArgs rejects a second positional and an unknown option', () => {
   assert.match(parseArgs(['a', '--bogus']).error!, /unknown option '--bogus'/);
 });
 
-test('parseArgs rejects empty and whitespace-only explicit harness overrides', () => {
+test('parseArgs preserves empty and whitespace-only harness overrides for roster fallback', () => {
   for (const args of [
     ['a', '--harness='],
     ['a', '--harness', ''],
     ['a', '--harness=   '],
     ['a', '--harness', ' \t '],
   ]) {
-    assert.match(parseArgs(args).error!, /--harness must be a non-empty harness id/, JSON.stringify(args));
+    const parsed = parseArgs(args);
+    assert.equal(parsed.error, undefined, JSON.stringify(args));
+    assert.equal(parsed.harness?.trim(), '');
   }
 });
 
@@ -119,6 +121,7 @@ function agentOrder(o: {
   run?: string;
   step?: string;
   model?: string;
+  capabilities?: string[];
   x?: Record<string, unknown>;
 } = {}): GetOrderResponse {
   const workflow = o.workflow ?? 'wf1';
@@ -136,6 +139,7 @@ function agentOrder(o: {
       outputs: [],
       ...(o.worker !== undefined ? { worker: o.worker } : {}),
       ...(o.model !== undefined ? { model: o.model } : {}),
+      capabilities: o.capabilities ?? ['build'],
       ...(o.x !== undefined ? { x: o.x } : {}),
       defDigest: o.defDigest ?? HASH,
       consumes: {},
@@ -377,6 +381,11 @@ function seedBundle(seed: { harness?: string; model?: string; permissions?: Step
   );
 }
 
+/** Replace the machine-global roster for a test that needs a specific rank. */
+function writeRoster(roster: Record<string, Array<{ harness: string; model: string; effort: string }>>): void {
+  writeFileSync(join(home, '.owenloop', 'settings.json'), JSON.stringify({ roster }));
+}
+
 /** Seed the verified-step seam with raw x contents, including malformed carriers. */
 function seedRawStep(x: Record<string, unknown>): void {
   verifiedStep = {
@@ -412,18 +421,18 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'owenloop-agentrun-home-'));
   cacheDir = join(home, 'cache');
   process.env['HOME'] = home;
-  process.env['XDG_CONFIG_HOME'] = home;
+  delete process.env['OWENLOOP_CONFIG_DIR'];
+  delete process.env['XDG_CONFIG_HOME'];
+  mkdirSync(join(home, '.owenloop'), { recursive: true });
+  writeFileSync(
+    join(home, '.owenloop', 'settings.json'),
+    JSON.stringify({ roster: { build: [{ harness: 'fake', model: 'test-model', effort: 'high' }] } }),
+  );
   process.env['OWENLOOP_CACHE_DIR'] = cacheDir;
   delete process.env['OWENLOOP_BUNDLE_DIR'];
   delete process.env['OWENLOOP_TOKEN'];
   delete process.env['OWENLOOP_ACCOUNT'];
   delete process.env['OWENLOOP_SHIFT_ID'];
-  // PHASE 4 wired the real adapters into the composition root, so importing this
-  // role now fills the registry and the FIRST-REGISTERED default is a real
-  // vendor adapter that would try to spawn a real process. Every test below that
-  // does not itself exercise harness precedence pins the fixture adapter at the
-  // `OWENLOOP_HARNESS` rank; the precedence tests clear or override it.
-  process.env['OWENLOOP_HARNESS'] = 'fake';
   delete process.env['OWENLOOP_HARNESS_MODULE'];
   process.env['OWENLOOP_NO_KEYCHAIN'] = '1';
 });
@@ -521,14 +530,13 @@ test('run() sets agent child identity and overrides ambient values in a real spa
   const runId = 'run-agent-identity';
   const savedWorkflow = process.env['OWENLOOP_WORKFLOW'];
   const savedRun = process.env['OWENLOOP_RUN'];
-  const savedHarness = process.env['OWENLOOP_HARNESS'];
   process.env['OWENLOOP_WORKFLOW'] = 'wf-ambient-leak';
   process.env['OWENLOOP_RUN'] = 'run-ambient-leak';
-  process.env['OWENLOOP_HARNESS'] = 'env-probe';
 
   try {
     const probe = spawningEnvProbe();
     useAdapter(probe.adapter);
+    writeRoster({ build: [{ harness: 'env-probe', model: 'test-model', effort: 'high' }] });
     seedBundle();
     const { hub } = probeHub({
       responses: [agentOrder({ workflow, run: runId }), agentOrder({ workflow, run: runId, outcome: 'ok' })],
@@ -547,8 +555,6 @@ test('run() sets agent child identity and overrides ambient values in a real spa
     else process.env['OWENLOOP_WORKFLOW'] = savedWorkflow;
     if (savedRun === undefined) delete process.env['OWENLOOP_RUN'];
     else process.env['OWENLOOP_RUN'] = savedRun;
-    if (savedHarness === undefined) delete process.env['OWENLOOP_HARNESS'];
-    else process.env['OWENLOOP_HARNESS'] = savedHarness;
   }
 });
 
@@ -777,64 +783,56 @@ test('run() records the session in <cacheDir>/sessions.jsonl', async () => {
 
 // ---- adapter resolution -----------------------------------------------------
 
-test('run() fails honestly (exit 1) when --harness names no registered adapter', async () => {
+test('run() refuses unresolvable capability when every roster candidate is unavailable', async () => {
   useAdapter(createFakeAdapter({ id: 'fake' }));
+  writeRoster({ build: [{ harness: 'nope', model: 'test-model', effort: 'high' }] });
   seedBundle();
   const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
   const err: string[] = [];
 
-  const code = await run([...WIRE, '--harness', 'nope'], {
+  const code = await run(WIRE, {
     hub, signalHost: fakeSignalHost().host, holderId: 'host:123', cwd: '/work', out: () => {}, err: (l) => err.push(l),
   });
 
   assert.equal(code, 1);
   const text = err.join('\n');
-  assert.match(text, /nope/); // names the id it could not resolve
-  assert.match(text, /fake/); // and what IS registered
-  // no-harness releases, so the hub can re-offer the order.
+  assert.match(text, /no crew roster row/);
+  assert.match(text, /build/);
+  // An unavailable candidate releases, so the hub can re-offer the order.
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
 });
 
-test('empty OWENLOOP_HARNESS never falls through and releases the held claim', async () => {
+test('blank --harness falls through to the selected roster candidate', async () => {
   const fake = createFakeAdapter({ id: 'fake' });
   useAdapter(fake);
   seedBundle({ harness: 'fake' });
 
   for (const value of ['', ' \t ']) {
-    process.env['OWENLOOP_HARNESS'] = value;
     const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
-    const err: string[] = [];
 
-    const code = await run(WIRE, {
+    const code = await run([...WIRE, `--harness=${value}`], {
       hub,
       signalHost: fakeSignalHost().host,
       holderId: 'host:123',
       cwd: '/work',
       out: () => {},
-      err: (line) => err.push(line),
+      err: () => {},
     });
 
-    assert.equal(code, 1, JSON.stringify(value));
-    assert.deepEqual(fake.calls, []);
-    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
-    assert.match(err.join('\n'), /<empty OWENLOOP_HARNESS>/);
+    assert.equal(code, 0, JSON.stringify(value));
+    assert.equal(fake.calls.some((call) => call.kind === 'start'), true);
+    assert.deepEqual(releases, []);
+    fake.calls.length = 0;
   }
 });
 
-test('--harness policy preflight uses the final overridden adapter and refuses before start', async () => {
-  const authored = createFakeAdapter({ id: 'authored' });
-  const overridden = createFakeAdapter({ id: 'overridden' });
-  overridden.preflight = (permissions) =>
-    permissions.network === 'owenloop-only'
-      ? [{ field: 'network', message: "network 'owenloop-only' is unsupported" }]
-      : [];
-  useAdapter(authored);
-  useAdapter(overridden);
-  seedRawStep({ harness: { id: 'authored', network: 'owenloop-only' } });
-  const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+test('blank --harness with no selected roster candidate refuses without choosing the default', async () => {
+  writeRoster({});
+  seedBundle();
+  const { hub, releases } = probeHub({ responses: [agentOrder({ capabilities: [] }), noHold('ok')], def: DEF });
   const err: string[] = [];
 
-  const code = await run([...WIRE, '--harness', 'overridden'], {
+  const code = await run([...WIRE, '--harness='], {
     hub,
     signalHost: fakeSignalHost().host,
     holderId: 'host:123',
@@ -844,21 +842,47 @@ test('--harness policy preflight uses the final overridden adapter and refuses b
   });
 
   assert.equal(code, 1);
-  assert.deepEqual(authored.calls, []);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.match(err.join('\n'), /no adapter registered for harness ''/);
+});
+
+test('roster-selected harness policy preflight refuses before start', async () => {
+  const overridden = createFakeAdapter({ id: 'overridden' });
+  overridden.preflight = (permissions) =>
+    permissions.network === 'owenloop-only'
+      ? [{ field: 'network', message: "network 'owenloop-only' is unsupported" }]
+      : [];
+  useAdapter(overridden);
+  writeRoster({ build: [{ harness: 'overridden', model: 'test-model', effort: 'high' }] });
+  seedRawStep({ harness: { id: 'overridden', network: 'owenloop-only' } });
+  const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
+  const err: string[] = [];
+
+  const code = await run(WIRE, {
+    hub,
+    signalHost: fakeSignalHost().host,
+    holderId: 'host:123',
+    cwd: '/work',
+    out: () => {},
+    err: (line) => err.push(line),
+  });
+
+  assert.equal(code, 1);
   assert.deepEqual(overridden.calls, []);
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
   assert.match(err.join('\n'), /harness policy refusal.*overridden.*network 'owenloop-only' is unsupported/);
 });
 
-test('Codex filesystem refusal names the restriction and releases the held claim', async () => {
+test('selected Codex candidate refusal names the restriction and releases the held claim', async () => {
   process.env['OWENLOOP_CODEX_BIN'] = join(home, 'must-not-start');
+  writeRoster({ build: [{ harness: 'codex', model: 'test-model', effort: 'high' }] });
 
   for (const filesystem of ['read-only', 'workspace-write'] as const) {
     seedRawStep({ harness: { id: 'codex', filesystem } });
     const { hub, releases } = probeHub({ responses: [agentOrder(), noHold('ok')], def: DEF });
     const err: string[] = [];
 
-    const code = await run([...WIRE, '--harness', 'codex'], {
+    const code = await run(WIRE, {
       hub,
       signalHost: fakeSignalHost().host,
       holderId: 'host:123',
@@ -878,73 +902,49 @@ test('Codex filesystem refusal names the restriction and releases the held claim
   }
 });
 
-test('CLI and environment Codex overrides refuse inherited judge policy before startup, release, and exit nonzero', async () => {
-  const authored = createFakeAdapter({ id: 'authored-judge-policy' });
-  useAdapter(authored);
-  const judge = seedSynthesizedJudge({ harness: { id: authored.id, tools: [] } });
+test('a roster-selected Codex candidate refuses inherited judge policy before startup', async () => {
+  const judge = seedSynthesizedJudge({ harness: { id: 'codex', tools: [] } });
   process.env['OWENLOOP_CODEX_BIN'] = join(home, 'must-not-start');
   const packet = agentOrder({ step: judge.name, model: judge.model, x: judge.x });
 
-  const scenarios = [
-    {
-      name: '--harness',
-      args: [...WIRE, '--harness', 'codex'],
-      select: () => {
-	process.env['OWENLOOP_HARNESS'] = authored.id;
-      },
-    },
-    {
-      name: 'OWENLOOP_HARNESS',
-      args: WIRE,
-      select: () => {
-	process.env['OWENLOOP_HARNESS'] = 'codex';
-      },
-    },
-  ];
+  writeRoster({ build: [{ harness: 'codex', model: 'test-model', effort: 'high' }] });
+  const { hub, releases } = probeHub({ responses: [packet, noHold('ok')], def: DEF });
+  const err: string[] = [];
+  const code = await run(WIRE, {
+    hub,
+    signalHost: fakeSignalHost().host,
+    holderId: 'host:123',
+    cwd: '/work',
+    out: () => {},
+    err: (line) => err.push(line),
+  });
 
-  for (const scenario of scenarios) {
-    scenario.select();
-    const { hub, releases } = probeHub({ responses: [packet, noHold('ok')], def: DEF });
-    const err: string[] = [];
-    const code = await run(scenario.args, {
-      hub,
-      signalHost: fakeSignalHost().host,
-      holderId: 'host:123',
-      cwd: '/work',
-      out: () => {},
-      err: (line) => err.push(line),
-    });
-
-    assert.equal(code, 1, scenario.name);
-    assert.deepEqual(authored.calls, [], `${scenario.name}: the authored adapter must not start`);
-    assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }], scenario.name);
-    assert.match(
-      err.join('\n'),
-      /harness policy refusal.*codex.*\(tools\): tool allow-lists are unsupported/,
-      scenario.name,
-    );
-  }
+  assert.equal(code, 1);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.match(err.join('\n'), /harness policy refusal.*codex.*\(tools\): tool allow-lists are unsupported/);
 });
 
-test('OWENLOOP_HARNESS outranks the step def, and the step def outranks the default', async () => {
+test('selected roster candidates outrank CLI and step harnesses; CLI outranks the step harness', async () => {
   const chosen = createFakeAdapter({ id: 'chosen' });
   const other = createFakeAdapter({ id: 'other' });
   useAdapter(chosen);
   useAdapter(other);
-  seedBundle({ harness: 'other' });
 
-  // env wins over the step def
-  process.env['OWENLOOP_HARNESS'] = 'chosen';
+  // The candidate wins even when the caller supplies a CLI fallback.
+  writeRoster({ build: [{ harness: 'chosen', model: 'test-model', effort: 'high' }] });
+  seedRawStep({});
   const a = probeHub({ responses: [agentOrder(), agentOrder({ outcome: 'ok' })], def: DEF });
-  assert.equal(await run(WIRE, { hub: a.hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: () => {} }), 0);
+  assert.equal(await run([...WIRE, '--harness', 'other'], { hub: a.hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: () => {} }), 0);
   assert.equal(chosen.calls.length > 0, true);
   assert.equal(other.calls.length, 0);
 
-  // with no env, the step def's `harness` decides
-  delete process.env['OWENLOOP_HARNESS'];
-  const b = probeHub({ responses: [agentOrder(), agentOrder({ outcome: 'ok' })], def: DEF });
-  assert.equal(await run(WIRE, { hub: b.hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: () => {} }), 0);
-  assert.equal(other.calls.length > 0, true);
+  // Without a candidate, the CLI fallback wins over the verified step harness.
+  writeRoster({});
+  seedBundle({ harness: 'other' });
+  chosen.calls.length = 0;
+  const b = probeHub({ responses: [agentOrder({ capabilities: [] }), agentOrder({ capabilities: [], outcome: 'ok' })], def: DEF });
+  assert.equal(await run([...WIRE, '--harness', 'chosen'], { hub: b.hub, signalHost: fakeSignalHost().host, holderId: 'h:1', cwd: '/w', out: () => {}, err: () => {} }), 0);
+  assert.equal(chosen.calls.length > 0, true);
 });
 
 /**

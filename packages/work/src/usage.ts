@@ -86,8 +86,9 @@ Options:
       --workflow <wf>            required when the order-id is a bare run id
       --origin <url>             hub origin (else settings.hubOrigin)
       --harness <id>             which registered harness hosts the step agent
-                                 (else env OWENLOOP_HARNESS, else the step def's
-                                 'harness' field, else the first registered one)
+                                 (below a selected roster candidate; else the
+                                 step def's 'harness' field, then the first
+                                 registered one)
       --shift <id>           dispatching Shift's self-declared id (else
                                  env OWENLOOP_SHIFT_ID); advisory only
       --heartbeat-interval <ms>  lease renew cadence (default 60000)
@@ -152,8 +153,6 @@ Options:
                OWENLOOP_SHIFT_ID  dispatching Shift's self-declared id for
                                       hold/exec/agent-run's --shift (advisory
                                       only, never for auth/routing/dispatch)
-               OWENLOOP_HARNESS       agent-run harness id; below --harness, above
-                                      the step def's 'harness' field
                OWENLOOP_WORK_ROOT     root for per-RUN agent work dirs
                                       (<workRoot>/<workflow>/<run>); above
                                       settings.workRoot, default <cacheDir>/work.

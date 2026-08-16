@@ -39,7 +39,7 @@ test('SIGINT and SIGTERM clean each foreground shift socket without an end ping'
 	  'crew-signal', '--origin', origin, '--poll-interval', '25',
 	  '--cache-dir', cacheDir, '--state-dir', stateDir,
 	],
-        { OWENLOOP_TOKEN: TOKEN, XDG_CONFIG_HOME: configDir, NODE_NO_WARNINGS: '1' },
+        { OWENLOOP_TOKEN: TOKEN, HOME: configDir, OWENLOOP_CONFIG_DIR: undefined, NODE_NO_WARNINGS: '1' },
       );
       children.push(shift);
       await shift.ready;

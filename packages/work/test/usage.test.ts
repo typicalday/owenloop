@@ -60,7 +60,7 @@ test('USAGE documents the agent-run role, its harness flag, and the hub-is-truth
   assert.match(USAGE, /--confirm-interval <ms>/);
   // The invariant, stated where an operator will actually read it.
   assert.match(USAGE, /Task completion comes from the HUB, never/);
-  assert.match(USAGE, /OWENLOOP_HARNESS\b/);
+  assert.match(USAGE, /selected roster candidate/);
 });
 
 test('USAGE documents --max-agents and maxConcurrentAgents, and no deleted stamp-path knob', () => {

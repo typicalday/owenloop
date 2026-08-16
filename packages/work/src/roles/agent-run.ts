@@ -80,13 +80,13 @@ import { hostname } from 'node:os';
 
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createAgentRunLoop, type AdapterResolution, type AgentRunOutcome } from '../agent/loop.ts';
-import type { CapabilityModelMap } from '../agent/capability-model.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
+import { machineRosterLayers, mergeRosterLayers } from '../settings/roster.ts';
 import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/registry.ts';
 import { parseHarnessCarrier } from '../bundle/fetch.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from '../harness/permissions.ts';
@@ -170,7 +170,6 @@ export function parseArgs(args: string[]): ParsedArgs {
         else if (name === '--origin') parsed.origin = r.value;
         else if (name === '--shift') parsed.shift = r.value;
 	else if (name === '--harness') {
-	  if (r.value.trim() === '') return { error: '--harness must be a non-empty harness id' };
 	  parsed.harness = r.value;
 	} else {
           const n = positiveMs(name, r.value);
@@ -262,8 +261,8 @@ export interface RunDeps {
  * adapter at all. What it still buys is the ability for a drill to register a
  * FAKE adapter inside a real spawned child without the child reaching for a
  * real CLI. Production leaves the variable unset and this is a no-op. Drills
- * that use it also pin `OWENLOOP_HARNESS=fake`, because the statically
- * imported real adapters now occupy the front of the registry and would
+ * that use it select a fake adapter through a roster candidate, because the
+ * statically imported real adapters occupy the front of the registry and would
  * otherwise win the `defaultHarnessId()` tie-break. A failed import is
  * reported and then ignored — resolution proceeds and fails honestly with
  * `'no-harness'` if nothing ended up registered.
@@ -308,12 +307,24 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 1;
   }
 
-  // Passed through verbatim. `loadSettings` already validated every row (shape,
-  // effort on the ladder, effort accepted by a known model), so there is nothing
-  // left to normalize here — and nothing to default: an absent map means the
-  // loop refuses capability-bearing orders, which is the intended answer for a
-  // shift that never declared what serves what.
-  const capabilityModels: CapabilityModelMap | undefined = settings.capabilityModels;
+  // Phase 1 interim rule: choose crew rosters in the order the shift was
+  // started with. Phase 2 replaces this handoff with crews stamped by the hub
+  // on each offer. A hand-run worker and a shift started with --all see only
+  // the machine-global settings layer.
+  const servedCrews = (env['OWENLOOP_SERVE_CREWS'] ?? '')
+    .split(',')
+    .map((crew) => crew.trim())
+    .filter((crew) => crew !== '');
+  let rosters;
+  try {
+    rosters =
+      servedCrews.length > 0
+        ? servedCrews.map((crew) => mergeRosterLayers(machineRosterLayers(env, crew)))
+        : [mergeRosterLayers(machineRosterLayers(env, undefined))];
+  } catch (e) {
+    err(`owenloop work agent-run: ${errMsg(e)}`);
+    return 1;
+  }
 
   const origin = parsed.origin ?? settings.hubOrigin;
   if (origin === undefined || origin.trim() === '') {
@@ -398,34 +409,26 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   };
 
   /**
-   * Adapter id precedence: `--harness` > `OWENLOOP_HARNESS` > the step def's
-   * `harness` field > the first registered adapter. Every rank is a plain
-   * string comparison — nothing here knows what any id MEANS.
+   * The winning roster candidate is deliberately above the debug --harness
+   * flag: it extends the existing rule that resolved routing wins over a
+   * step's authored model and effort. Every rank is a plain string comparison.
    */
-  const envHarness = env['OWENLOOP_HARNESS'];
-  const resolveAdapter = (stepHarness: string | undefined): AdapterResolution => {
-    let id: string;
-    if (parsed.harness !== undefined) {
-      id = parsed.harness;
-    } else if (envHarness !== undefined) {
-      // Definition and default selection are lower precedence. An explicit empty
-      // environment override is invalid; it must not silently fall through.
-      if (envHarness.trim() === '') {
-	return {
-	  id: '<empty OWENLOOP_HARNESS>',
-	  registered: registeredHarnessIds(),
-	};
-      }
-      id = envHarness;
-    } else {
-      id =
-	(stepHarness !== undefined && stepHarness !== '' ? stepHarness : undefined) ??
-	defaultHarnessId() ??
-	'';
-    }
+  const resolveAdapter = (
+    chosenHarness: string | undefined,
+    stepHarness: string | undefined,
+  ): AdapterResolution => {
+    const id =
+      chosenHarness ??
+      parsed.harness ??
+      (stepHarness !== undefined && stepHarness !== '' ? stepHarness : undefined) ??
+      defaultHarnessId() ??
+      '';
     const adapter = id !== '' ? adapterFor(id) : undefined;
     return {
-      id: id !== '' ? id : '<none>',
+      // Keep an explicit blank `--harness` visible to the refusal instead of
+      // silently treating it as an absent override and selecting the default.
+      // A roster candidate still outranks it at the line above.
+      id: id !== '' || parsed.harness !== undefined ? id : '<none>',
       ...(adapter !== undefined ? { adapter } : {}),
       registered: registeredHarnessIds(),
     };
@@ -565,7 +568,10 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     allowedWorkdirRoots: resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd()),
     loadStep,
     resolveAdapter,
-    ...(capabilityModels !== undefined ? { capabilityModels } : {}),
+    rosters,
+    // Phase-1 availability means registry membership. A real binary or
+    // credential probe requires new HarnessAdapter contract surface.
+    harnessAvailable: (id) => adapterFor(id) !== undefined,
     consumedVerifier,
     appendSession: writeSession,
     // Both readers key on the engine TASK — `(workflow, step, key)` — and not on

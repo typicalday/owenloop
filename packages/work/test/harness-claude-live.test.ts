@@ -18,7 +18,7 @@
  *
  * AMBIENT STATE IS MATERIALIZED HERE, NOT ASSUMED. The mounted holder child
  * inherits the environment this adapter builds from `process.env`, so the test
- * sets `OWENLOOP_TOKEN` / `XDG_CONFIG_HOME` (a temp dir of its own) on
+ * sets `OWENLOOP_TOKEN` / `HOME` (a temp dir of its own) on
  * `process.env` for the duration and restores them afterwards. Nothing depends
  * on the runner's own settings file or token.
  */
@@ -120,11 +120,13 @@ async function rig(script: (verb: string) => unknown = hubScript): Promise<Rig> 
   // process.env, so these must be on process.env — set here, restored on close.
   const saved = {
     OWENLOOP_TOKEN: process.env['OWENLOOP_TOKEN'],
-    XDG_CONFIG_HOME: process.env['XDG_CONFIG_HOME'],
+    HOME: process.env['HOME'],
+    OWENLOOP_CONFIG_DIR: process.env['OWENLOOP_CONFIG_DIR'],
     OWENLOOP_SESSION: process.env['OWENLOOP_SESSION'],
   };
   process.env['OWENLOOP_TOKEN'] = TOKEN;
-  process.env['XDG_CONFIG_HOME'] = configDir;
+  process.env['HOME'] = configDir;
+  delete process.env['OWENLOOP_CONFIG_DIR'];
   process.env['OWENLOOP_SESSION'] = '';
 
   const events: AgentEvent[] = [];

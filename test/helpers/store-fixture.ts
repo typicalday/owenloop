@@ -138,7 +138,7 @@ export async function installSignedBundleFixture(args: {
   const publicKey = publicKeyDescriptor(readFileSync(`${keyPath}.pub`, 'utf8'));
   const principal = 'fixture-publisher';
   const configHome = args.configHome ?? args.home;
-  const allowedDir = join(configHome, 'owenloop');
+  const allowedDir = join(configHome, '.owenloop');
   mkdirSync(allowedDir, { recursive: true, mode: 0o700 });
   writeFileSync(join(allowedDir, 'allowed_signers'), `${principal} ${publicKey.openSshPublicKey}\n`, { mode: 0o600 });
 
@@ -154,8 +154,7 @@ export async function installSignedBundleFixture(args: {
   writeFileSync(`${sourcePath}.dsse`, canonicalJsonBytes(signed.envelope), { mode: 0o600 });
 
   const env = {
-    HOME: args.home,
-    XDG_CONFIG_HOME: configHome,
+    HOME: configHome,
     ...(args.env ?? {}),
   };
   const installed = await installBundleFixture({

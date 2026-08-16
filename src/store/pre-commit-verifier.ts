@@ -88,7 +88,7 @@ function resolvePolicyValue(
     return envValue;
   }
 
-  // A missing HOME/XDG_CONFIG_HOME means there is no settings file to read;
+  // A missing HOME means there is no settings file to read;
   // the built-in default remains usable. Any other settings read/parse error is
   // surfaced rather than weakened into the least restrictive policy.
   let path: string;

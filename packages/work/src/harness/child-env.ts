@@ -111,11 +111,10 @@ export const ADMITTED_OWENLOOP_KEYS: ReadonlySet<string> = new Set([
   'OWENLOOP_SESSION',
   // `owenloopConfigDir` — src/config-dir.ts. Scopes owenloop's OWN config
   // directory (`settings.json`, `credentials.json`, `allowed_signers`) without
-  // touching `XDG_CONFIG_HOME`, which the rest of the operator's toolchain also
-  // reads. A path, not credential material — but the credential FILE backend
-  // resolves under it (`readStoredCredential` → `configDir` → src/hub.ts), so a
-  // mount that does not see this variable falls back to `XDG_CONFIG_HOME` and
-  // reads a DIFFERENT credential store than the shift that spawned it.
+  // touching the rest of the operator's toolchain. A path, not credential
+  // material — but the credential file backend resolves under it
+  // (`readStoredCredential` → `configDir` → src/hub.ts), so a mount that does
+  // not see this variable reads a different credential store than its shift.
   'OWENLOOP_CONFIG_DIR',
 ]);
 

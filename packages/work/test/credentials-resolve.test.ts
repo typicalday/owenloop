@@ -25,7 +25,7 @@ afterEach(() => {
 
 /** Seed the agent:<account> slots for `origin` into the hermetic file store. */
 function seed(origin: string, slots: Record<string, string>): void {
-  const dir = join(home, 'owenloop');
+  const dir = join(home, '.owenloop');
   mkdirSync(dir, { recursive: true });
   const hubs: Record<string, Record<string, unknown>> = { [origin]: {} };
   for (const [account, token] of Object.entries(slots)) {
@@ -36,7 +36,7 @@ function seed(origin: string, slots: Record<string, string>): void {
 
 /** A hermetic env pointing owenloop's file store at our temp HOME. */
 function env(extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
-  return { HOME: home, XDG_CONFIG_HOME: home, OWENLOOP_NO_KEYCHAIN: '1', ...extra };
+  return { HOME: home, OWENLOOP_NO_KEYCHAIN: '1', ...extra };
 }
 
 const ORIGIN = 'https://hub.example';
