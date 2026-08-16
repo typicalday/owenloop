@@ -32,13 +32,14 @@ export type {
 // Routing capabilities: offer-time composition and the claim-side match. The
 // hub imports these to reason about the same compounds the engine composes.
 export {
+  applyCapabilityRewrites,
   capabilityName,
   claimMatches,
   composeCapabilities,
   DEFAULT_MATCH_MODE,
   MODIFIER_SEPARATOR,
 } from './capabilities.ts';
-export type { MatchMode } from './capabilities.ts';
+export type { CapabilityRewrites, MatchMode } from './capabilities.ts';
 
 export { createEngine } from './factory.ts';
 export type { CreateEngineOpts, CreatedEngine } from './factory.ts';
