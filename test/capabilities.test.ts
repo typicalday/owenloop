@@ -390,6 +390,46 @@ test('applyCapabilityRewrites: an identity rule is not a reroute', () => {
   assert.equal(r.reroutedFrom, undefined);
 });
 
+test('applyCapabilityRewrites: an untouched offer is returned verbatim, duplicates included', () => {
+  // Dedup is a consequence of REROUTING, not a tidy-up applied on the way past.
+  // `defs.ts` validates each authored capability but never rejects a duplicate,
+  // and `composeCapabilities` preserves that multiplicity — so deduplicating an
+  // offer no rule touched would silently change `order.capabilities` for a
+  // caller that supplied no rewrites at all.
+  const none = applyCapabilityRewrites(['a:x', 'a:x'], {});
+  assert.deepEqual(none.offered, ['a:x', 'a:x'], 'byte-for-byte when no rule fires');
+  assert.equal(none.reroutedFrom, undefined);
+
+  const identity = applyCapabilityRewrites(['a:x', 'a:x'], { 'a:x': 'a:x' });
+  assert.deepEqual(identity.offered, ['a:x', 'a:x'], 'an identity rule is not a change either');
+  assert.equal(identity.reroutedFrom, undefined);
+
+  // ...but once a rule DOES fire, collapsing onto one target is the point.
+  const fired = applyCapabilityRewrites(['a:x', 'a:x'], { 'a:x': 'b:x' });
+  assert.deepEqual(fired.offered, ['b:x'], 'the rewritten offer still collapses');
+  assert.deepEqual(fired.reroutedFrom, ['a:x', 'a:x'], 'the whole original offer, duplicates and all');
+});
+
+test('a step authoring a duplicate capability stamps it unchanged when no rewrites are supplied', () => {
+  // The observable half of the rule above: adding the rewrite pass to the stamp
+  // path must not alter what an ordinary tick records. Without the verbatim
+  // return this stamps ['dup:deep'] and the order's routing snapshot silently
+  // stops matching what the def asked for.
+  const dupDef = def(
+    'dupGraded',
+    [input('proposal')],
+    [step({ name: 'builder', consumes: ['proposal'], produces: ['pr'], capabilities: ['dup', 'dup'] })],
+    ['deep'],
+  );
+  const { engine } = makeEngine([dupDef]);
+  const wf = engine.createInstance('dupGraded', { modifier: 'deep' });
+
+  const t = engine.tick(wf, { now: 0 });
+  assert.equal(t.orders.length, 1);
+  assert.deepEqual(t.orders[0]!.capabilities, ['dup:deep', 'dup:deep'], 'multiplicity preserved');
+  assert.equal(t.orders[0]!.reroutedFrom, undefined, 'no rule fired, so no reroute record');
+});
+
 test('a rewritten offer is matched and stamped as the reroute target', () => {
   // The whole point: a crew serving only `build:standard`/`wise:standard` claims
   // an `express` run, and the ORDER says `standard` — which is what the shift

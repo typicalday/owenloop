@@ -48,7 +48,73 @@
     "consumesProof": "serialized-consume-proof",
     "cause": "inputsGreen"
   },
+  "additionalValid": [
+    {
+      "run": "run-build-8",
+      "workflow": "build-instance",
+      "step": "builder",
+      "key": "builder",
+      "defDigest": "injected-digest",
+      "inputs": ["plan"],
+      "outputs": ["pr"],
+      "consumes": { "plan": { "text": "land it" } },
+      "owes": [{ "path": "pr", "judgmentRejects": 0, "schemaRejects": 0, "reasons": [] }],
+      "capabilities": ["build:standard", "wise:standard"],
+      "modifier": "express",
+      "reroutedFrom": ["build:express", "wise:express"]
+    },
+    {
+      "run": "run-build-9",
+      "workflow": "build-instance",
+      "step": "builder",
+      "key": "builder",
+      "defDigest": "injected-digest",
+      "inputs": ["plan"],
+      "outputs": ["pr"],
+      "consumes": { "plan": { "text": "retry deeper" } },
+      "owes": [{ "path": "pr", "judgmentRejects": 1, "schemaRejects": 0, "reasons": [] }],
+      "capabilities": ["build:deep"],
+      "modifier": "deep",
+      "escalated": true
+    }
+  ],
   "invalid": [
+    {
+      "name": "empty-reroutedFrom-entry",
+      "value": {
+        "run": "run-build-8",
+        "workflow": "build-instance",
+        "step": "builder",
+        "key": "builder",
+        "defDigest": "injected-digest",
+        "inputs": ["plan"],
+        "outputs": ["pr"],
+        "consumes": { "plan": { "text": "land it" } },
+        "owes": [{ "path": "pr", "judgmentRejects": 0, "schemaRejects": 0, "reasons": [] }],
+        "capabilities": ["build:standard"],
+        "modifier": "express",
+        "reroutedFrom": [""]
+      },
+      "keyword": "minLength"
+    },
+    {
+      "name": "escalated-false",
+      "value": {
+        "run": "run-build-9",
+        "workflow": "build-instance",
+        "step": "builder",
+        "key": "builder",
+        "defDigest": "injected-digest",
+        "inputs": ["plan"],
+        "outputs": ["pr"],
+        "consumes": { "plan": { "text": "retry deeper" } },
+        "owes": [{ "path": "pr", "judgmentRejects": 1, "schemaRejects": 0, "reasons": [] }],
+        "capabilities": ["build:deep"],
+        "modifier": "deep",
+        "escalated": false
+      },
+      "keyword": "const"
+    },
     {
       "name": "missing-owes",
       "value": {

@@ -107,9 +107,17 @@ export type CapabilityRewrites = Readonly<Record<string, string>>;
  * which is what an operator wrote in the def). Collapsing them would make an
  * order's routing history unrecoverable.
  *
- * Duplicates are removed: two authored capabilities may reroute onto the same
- * target, and an offer listing it twice would double-count in nothing but would
- * read as a mistake.
+ * Duplicates are removed FROM A REWRITTEN OFFER: two authored capabilities may
+ * reroute onto the same target, and an offer listing it twice would
+ * double-count in nothing but would read as a mistake.
+ *
+ * An offer no rule touched is returned VERBATIM, duplicates included. A step
+ * may author `capabilities: ['a', 'a']` — `defs.ts` validates each entry but
+ * never checks for duplicates — and `composeCapabilities` preserves that
+ * multiplicity, so deduplicating an untouched offer would change the stamped
+ * `order.capabilities` for a caller that supplied no rewrites at all. Dedup is
+ * a consequence of rerouting, not a tidy-up applied on the way past: with no
+ * applicable rule, this function returns byte-for-byte what it was handed.
  */
 export function applyCapabilityRewrites(
   offered: readonly string[],
@@ -124,7 +132,7 @@ export function applyCapabilityRewrites(
     if (target !== undefined && target !== c) changed = true;
     if (!out.includes(next)) out.push(next);
   }
-  return changed ? { offered: out, reroutedFrom: [...offered] } : { offered: out };
+  return changed ? { offered: out, reroutedFrom: [...offered] } : { offered: [...offered] };
 }
 
 /** True when one caller capability satisfies one offered capability under `mode`. */
