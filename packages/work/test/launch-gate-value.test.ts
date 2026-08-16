@@ -177,6 +177,7 @@ function agentOrder(args: {
   run: string;
   reasons: ReasonEntry[];
   proof: string;
+  version: number;
 }): GetOrderResponse {
   const packet: OrderPacket = {
     run: args.run,
@@ -187,7 +188,7 @@ function agentOrder(args: {
     outputs: [],
     defDigest: args.defDigest,
     consumes: {},
-    owes: [{ path: 'out', judgmentRejects: 1, schemaRejects: 0, reasons: args.reasons, proof: args.proof }],
+    owes: [{ path: 'out', version: args.version, judgmentRejects: 1, schemaRejects: 0, reasons: args.reasons, proof: args.proof }],
   };
   return { text: '', workflow: packet.workflow, run: args.run, order: packet, lease: { claimed: true } };
 }
@@ -222,7 +223,7 @@ async function runAgent(
   const errors: string[] = [];
   const home = tempDir('owenloop-launch-gate-value-agent-home-');
   homes.push(home);
-  const env = { ...trust.env, HOME: home, OWENLOOP_CONFIG_DIR: trust.configHome };
+  const env = { ...trust.env, HOME: home, OWENLOOP_CONFIG_DIR: join(trust.configHome, '.owenloop') };
   const hub = await startHostileHub({ order: response, tamper: terminalAfterFirst(mutate) });
   try {
     const instructions = createStoreInstructionResolver({
@@ -376,7 +377,7 @@ test('launch gate: a forged judge rejection reason is refused before an agent pr
   const clean = await runAgent(
     installed,
     trust,
-    agentOrder({ defDigest: installed.defDigest, run: 'run-reason-clean', reasons: [cleanReason], proof }),
+    agentOrder({ defDigest: installed.defDigest, run: 'run-reason-clean', reasons: [cleanReason], proof, version: 1 }),
   );
   assert.equal(clean.code, 0, `L3: a correctly signed rejection thread must reach the prompt surface: ${clean.errors.join('\\n')}`);
   const cleanStart = clean.calls.find((call) => call.kind === 'start');
@@ -386,7 +387,7 @@ test('launch gate: a forged judge rejection reason is refused before an agent pr
   const hostile = await runAgent(
     installed,
     trust,
-    agentOrder({ defDigest: installed.defDigest, run: 'run-reason-forged', reasons: [forgedReason], proof }),
+    agentOrder({ defDigest: installed.defDigest, run: 'run-reason-forged', reasons: [forgedReason], proof, version: 1 }),
     (path, bodyValue) => bodyValue,
   );
   assert.equal(hostile.code, 1);

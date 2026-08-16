@@ -401,7 +401,7 @@ test('OWENLOOP_ACCOUNT names the slot in the refuse hint (agent:ci)', async () =
 test('with no OWENLOOP_TOKEN, prepare authenticates with the agent slot token from the store', async () => {
   const { server, origin } = await startHub(() => enrichedBody(DEMO));
   // Seed the agent:default slot for this origin; drop the override.
-  const dir = join(homeDir, 'owenloop');
+  const dir = join(homeDir, '.owenloop');
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'credentials.json'),
@@ -420,7 +420,7 @@ test('with no OWENLOOP_TOKEN, prepare authenticates with the agent slot token fr
 test('prepare reads hubOrigin from settings when --origin is omitted', async () => {
   const { server, origin } = await startHub(() => enrichedBody(DEMO));
   try {
-    const cfgDir = join(homeDir, 'owenloop');
+    const cfgDir = join(homeDir, '.owenloop');
     mkdirSync(cfgDir, { recursive: true });
     writeFileSync(join(cfgDir, 'settings.json'), JSON.stringify({ hubOrigin: origin }));
     const r = await runPrepare(['demo']);

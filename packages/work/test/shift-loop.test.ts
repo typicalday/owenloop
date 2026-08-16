@@ -1347,7 +1347,14 @@ test('detached exec and agent-run workers survive late stderr writes after Shift
 
   const deadline = Date.now() + 5_000;
   const markers = ['exec.done', 'agent-run.done'];
-  while (!markers.every((name) => existsSync(join(markerDir, name))) && Date.now() < deadline) {
+  const completed = (name: string): boolean => {
+    try {
+      return readFileSync(join(markerDir, name), 'utf8') === 'completed\n';
+    } catch {
+      return false;
+    }
+  };
+  while (!markers.every(completed) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   for (const marker of markers) {

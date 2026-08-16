@@ -67,11 +67,11 @@ function fixture(): { home: string; env: Record<string, string | undefined> } {
 }
 
 function credentialsPath(home: string): string {
-  return join(home, 'owenloop', 'credentials.json');
+  return join(home, '.owenloop', 'credentials.json');
 }
 
 function settingsFilePath(home: string): string {
-  return join(home, 'owenloop', 'settings.json');
+  return join(home, '.owenloop', 'settings.json');
 }
 
 interface CredentialFileShape {
@@ -94,7 +94,7 @@ function readSettingsFile(home: string): SettingsFileShape {
 
 function writeSettings(home: string, value: unknown): void {
   const path = settingsFilePath(home);
-  mkdirSync(join(home, 'owenloop'), { recursive: true });
+  mkdirSync(join(home, '.owenloop'), { recursive: true });
   writeFileSync(path, JSON.stringify(value));
 }
 
