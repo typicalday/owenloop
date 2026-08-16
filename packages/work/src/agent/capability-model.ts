@@ -130,6 +130,11 @@ export interface CapabilityCandidates {
   candidates: readonly RosterCandidate[];
 }
 
+/** Read only a declared roster row; inherited Object.prototype names are never capabilities. */
+function ownCandidates(roster: Roster, capability: string): readonly RosterCandidate[] | undefined {
+  return Object.prototype.hasOwnProperty.call(roster, capability) ? roster[capability] : undefined;
+}
+
 /**
  * Resolve an order's capabilities against the merged roster: exact compound
  * row first, then the bare name-part row, else `undefined` (the caller
@@ -151,7 +156,7 @@ export function resolveCapabilityCandidates(
   capabilities: readonly string[],
 ): CapabilityCandidates | undefined {
   for (const capability of capabilities) {
-    const candidates = roster[capability];
+    const candidates = ownCandidates(roster, capability);
     if (candidates !== undefined) return { capability, match: 'exact', candidates };
   }
   for (const capability of capabilities) {
@@ -160,7 +165,7 @@ export function resolveCapabilityCandidates(
     // tried that key, and reporting it as a `bare` match would misreport an
     // exact hit as a fallback in the resolution record.
     if (name === capability) continue;
-    const candidates = roster[name];
+    const candidates = ownCandidates(roster, name);
     if (candidates !== undefined) return { capability: name, match: 'bare', candidates };
   }
   return undefined;

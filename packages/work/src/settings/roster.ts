@@ -34,11 +34,14 @@ export type MergedRoster = Readonly<Record<string, MergedRosterEntry>>;
 
 /** Merge key-by-key. `layers` is ordered STRONGEST FIRST. */
 export function mergeRosterLayers(layers: readonly RosterLayer[]): MergedRoster {
-  const merged: Record<string, MergedRosterEntry> = {};
+  // Capability names are arbitrary strings, including Object.prototype names.
+  // A null prototype keeps every own key routable and makes `__proto__` data,
+  // rather than a request to mutate the result's prototype.
+  const merged = Object.create(null) as Record<string, MergedRosterEntry>;
   for (const layer of layers) {
     if (layer.roster === undefined) continue;
     for (const [capability, candidates] of Object.entries(layer.roster)) {
-      if (merged[capability] === undefined) {
+      if (!Object.prototype.hasOwnProperty.call(merged, capability)) {
         // Candidate arrays are atomic: a winning layer replaces every weaker
         // candidate, never concatenating or element-merging with it.
         merged[capability] = { candidates, source: layer.source };

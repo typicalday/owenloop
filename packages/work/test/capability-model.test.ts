@@ -59,6 +59,19 @@ test('no roster row resolves to undefined', () => {
   assert.equal(resolveCapabilityCandidates({}, []), undefined);
 });
 
+test('lookup accepts own prototype-colliding rows and ignores inherited ones', () => {
+  const roster = Object.create(null) as Record<string, readonly { harness: string; model: string; effort: string }[]>;
+  roster['__proto__'] = [{ harness: 'proto', model: 'proto-model', effort: 'high' }];
+  roster['constructor'] = [{ harness: 'constructor', model: 'constructor-model', effort: 'high' }];
+  roster['toString'] = [{ harness: 'stringify', model: 'stringify-model', effort: 'high' }];
+
+  for (const capability of ['__proto__', 'constructor', 'toString']) {
+    assert.equal(resolveCapabilityCandidates(roster, [capability])?.capability, capability);
+  }
+  assert.equal(resolveCapabilityCandidates({}, ['constructor']), undefined);
+  assert.equal(resolveCapabilityCandidates({}, ['toString']), undefined);
+});
+
 test('validateRoster rejects old and malformed candidate shapes', () => {
   const cases: Array<[string, Record<string, unknown>, RegExp]> = [
     ['empty capability', { '': [{ harness: 'h', model: 'm', effort: 'high' }] }, /may not be empty/u],

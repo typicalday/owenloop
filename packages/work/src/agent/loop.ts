@@ -93,6 +93,7 @@ import {
   resolveCapabilityCandidates,
   selectCandidate,
   type CapabilityMatch,
+  type Roster,
 } from './capability-model.ts';
 import type { MergedRoster } from '../settings/roster.ts';
 
@@ -367,10 +368,14 @@ export function resolveOrderRouting(
   if (capabilities.length === 0) return { kind: 'unrouted' };
   let firstHarnessPolicy: { offered: readonly string[]; stepHarness: string | undefined } | undefined;
   for (const roster of rosters ?? []) {
-    const candidates = resolveCapabilityCandidates(
-      Object.fromEntries(Object.entries(roster).map(([capability, entry]) => [capability, entry.candidates])),
-      capabilities,
-    );
+    // Preserve arbitrary capability names through the boundary between the
+    // provenance-bearing merged roster and the candidate-only selector.
+    const candidateRows = Object.create(null) as Record<string, readonly import('./capability-model.ts').RosterCandidate[]>;
+    for (const capability of Object.keys(roster)) {
+      if (!Object.prototype.hasOwnProperty.call(roster, capability)) continue;
+      candidateRows[capability] = roster[capability]!.candidates;
+    }
+    const candidates = resolveCapabilityCandidates(candidateRows as Roster, capabilities);
     if (candidates === undefined) continue;
     const outcome = selectCandidate(candidates.candidates, stepHarness, isAvailable);
     if (outcome.kind === 'selected') {

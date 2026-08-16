@@ -1243,6 +1243,28 @@ test('buildSpawnPlan passes shift crews to agent-run in command-line order only'
   assert.equal(command.options.env['OWENLOOP_SERVE_CREWS'], undefined);
 });
 
+test('buildSpawnPlan clears an ambient crew handoff for --all agent workers', () => {
+  const previous = process.env['OWENLOOP_SERVE_CREWS'];
+  process.env['OWENLOOP_SERVE_CREWS'] = 'stale-crew';
+  try {
+    const plan = buildSpawnPlan(
+      { workflow: 'wf1', run: 'run_zzzz', kind: 'agent-run' },
+      'https://hub.example',
+      'ci',
+      '/pkg/bin/owenloop.mjs',
+      '/usr/bin/node',
+      undefined,
+      undefined,
+      undefined,
+      [],
+    );
+    assert.equal('OWENLOOP_SERVE_CREWS' in plan.options.env, false);
+  } finally {
+    if (previous === undefined) delete process.env['OWENLOOP_SERVE_CREWS'];
+    else process.env['OWENLOOP_SERVE_CREWS'] = previous;
+  }
+});
+
 test('createDefaultSpawner reports a nonzero detached worker exit with generic lifecycle metadata', async () => {
   const script = join(stateDir, '..', 'exit-seven.mjs');
   writeFileSync(script, 'process.exit(7);\n');
@@ -1347,6 +1369,8 @@ test('detached exec and agent-run workers survive late stderr writes after Shift
 
   const deadline = Date.now() + 5_000;
   const markers = ['exec.done', 'agent-run.done'];
+  // A marker's directory entry can become visible before its synchronous write
+  // has emitted every byte, so wait for the completion contract itself.
   const completed = (name: string): boolean => {
     try {
       return readFileSync(join(markerDir, name), 'utf8') === 'completed\n';

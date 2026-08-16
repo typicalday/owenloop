@@ -31,6 +31,19 @@ test('mergeRosterLayers keeps the first complete row and accepts arbitrary layer
   assert.deepEqual(merged.final, { candidates: candidate('global', 'fourth-layer-model'), source: 'hub global' });
 });
 
+test('mergeRosterLayers preserves prototype-colliding capability keys as own rows', () => {
+  const roster = Object.create(null) as Record<string, ReturnType<typeof candidate>>;
+  roster['__proto__'] = candidate('proto', 'proto-model');
+  roster['constructor'] = candidate('constructor', 'constructor-model');
+  roster['toString'] = candidate('stringify', 'stringify-model');
+
+  const merged = mergeRosterLayers([{ source: 'machine', roster }]);
+  assert.equal(Object.getPrototypeOf(merged), null);
+  assert.deepEqual(merged['__proto__'], { candidates: candidate('proto', 'proto-model'), source: 'machine' });
+  assert.deepEqual(merged['constructor'], { candidates: candidate('constructor', 'constructor-model'), source: 'machine' });
+  assert.deepEqual(merged['toString'], { candidates: candidate('stringify', 'stringify-model'), source: 'machine' });
+});
+
 test('machineRosterLayers prefers a present crew roster and retains absent paths', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-'));
   try {

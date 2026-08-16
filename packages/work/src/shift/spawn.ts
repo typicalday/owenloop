@@ -223,6 +223,23 @@ export function buildSpawnPlan(
   serveCrews?: string[],
 ): SpawnPlan {
   const role = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
+  // `OWENLOOP_SERVE_CREWS` is Shift-owned routing plumbing, never ambient
+  // configuration. A child for --all must not inherit a stale named-crew list
+  // from the Shift process that launched it.
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  delete env['OWENLOOP_SERVE_CREWS'];
+  env['OWENLOOP_ACCOUNT'] = account;
+  if (spec.startGate !== undefined) env['OWENLOOP_START_GATE'] = spec.startGate;
+  if (spec.shiftName !== undefined && spec.shiftName !== '') env['OWENLOOP_SHIFT_NAME'] = spec.shiftName;
+  if (spec.shiftOwner !== undefined && spec.shiftOwner !== '') env['OWENLOOP_SHIFT_OWNER'] = spec.shiftOwner;
+  if (allowedWorkdirRoots !== undefined && allowedWorkdirRoots.length > 0) {
+    env['OWENLOOP_ALLOWED_WORKDIR_ROOTS'] = allowedWorkdirRoots.join(':');
+  }
+  // Shift-internal roster handoff only. It is deliberately not passed to the
+  // harness child and is absent for command workers.
+  if (role === 'agent-run' && serveCrews !== undefined && serveCrews.length > 0) {
+    env['OWENLOOP_SERVE_CREWS'] = serveCrews.join(',');
+  }
   return {
     command: execPath,
     args: [
@@ -237,25 +254,7 @@ export function buildSpawnPlan(
     options: {
       detached: true,
       stdio: ['ignore', 'ignore', 'ignore'],
-      env: {
-	...process.env,
-	OWENLOOP_ACCOUNT: account,
-	...(spec.startGate !== undefined ? { OWENLOOP_START_GATE: spec.startGate } : {}),
-	...(spec.shiftName !== undefined && spec.shiftName !== ''
-	  ? { OWENLOOP_SHIFT_NAME: spec.shiftName }
-	  : {}),
-	...(spec.shiftOwner !== undefined && spec.shiftOwner !== ''
-	  ? { OWENLOOP_SHIFT_OWNER: spec.shiftOwner }
-	  : {}),
-	...(allowedWorkdirRoots !== undefined && allowedWorkdirRoots.length > 0
-	  ? { OWENLOOP_ALLOWED_WORKDIR_ROOTS: allowedWorkdirRoots.join(':') }
-	  : {}),
-	// Shift-internal roster handoff only. It is deliberately not passed to the
-	// harness child and is absent for command workers.
-	...(role === 'agent-run' && serveCrews !== undefined && serveCrews.length > 0
-	  ? { OWENLOOP_SERVE_CREWS: serveCrews.join(',') }
-	  : {}),
-      },
+      env,
     },
     ...(logDir !== undefined && logDir !== '' ? { logFile: runLogFile(logDir, spec.run) } : {}),
   };
