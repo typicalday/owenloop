@@ -66,6 +66,7 @@ import { existsSync } from 'node:fs';
 import { ResumeUnavailableError, NEUTRAL_PERMISSION_MODES, isNeutralPermissionMode } from './contract.ts';
 import type {
   AgentEvent,
+  ApprovalRequester,
   DeliverArgs,
   HarnessAdapter,
   HarnessSessionRef,
@@ -802,16 +803,135 @@ function createTurnGate(onEvent: (e: AgentEvent) => void): TurnGate {
 }
 
 /**
+ * The four approval requests this adapter can put in front of a PERSON, and the
+ * exact reply each one takes. Read off `codex app-server generate-ts` for the
+ * running binary — the two shapes are NOT interchangeable:
+ *
+ *   - the v2 `item/*` pair answers `{decision:'accept'|'decline'}`
+ *     (`CommandExecutionApprovalDecision` / `FileChangeApprovalDecision`)
+ *   - the legacy pair answers `ReviewDecision`, where a refusal is the tagged
+ *     `{denied:{rejection}}` and therefore CARRIES TEXT back to the model
+ *
+ * `kind` prefixes the approval's id so two different requests that happen to
+ * share an `itemId` can never be one approval.
+ *
+ * WHY `acceptForSession` / `approved_for_session` APPEAR NOWHERE. A person
+ * answered one question about one command. Turning that into a standing grant
+ * for the rest of the session would approve calls nobody was ever shown, which
+ * is the opposite of what this gate is for.
+ *
+ * `item/permissions/requestApproval` is deliberately ABSENT: its reply is a
+ * `GrantedPermissionProfile` plus a `turn|session` scope, not a yes/no. Granting
+ * it means SYNTHESIZING a filesystem/network permission set, and there is no
+ * question a person could be shown that maps onto that. It stays refused below.
+ */
+interface ApprovalShape {
+  kind: string;
+  /** What the operator sees in the `owenloop work approvals` list. */
+  toolName: string;
+  /** `true` for the legacy `ReviewDecision` pair. */
+  legacy: boolean;
+}
+
+const BRIDGEABLE_APPROVALS: Record<string, ApprovalShape> = Object.freeze({
+  'item/commandExecution/requestApproval': { kind: 'exec', toolName: 'command', legacy: false },
+  'item/fileChange/requestApproval': { kind: 'file', toolName: 'file-change', legacy: false },
+  'execCommandApproval': { kind: 'exec', toolName: 'command', legacy: true },
+  'applyPatchApproval': { kind: 'patch', toolName: 'file-change', legacy: true },
+});
+
+/** Join a legacy `command: string[]` (or pass a v2 `command: string`) for display. */
+function commandText(value: unknown): string | undefined {
+  if (Array.isArray(value)) {
+    const parts = value.filter((p): p is string => typeof p === 'string');
+    return parts.length > 0 ? parts.join(' ') : undefined;
+  }
+  return str(value);
+}
+
+/**
+ * Turn one approval request into the question a person will actually read.
+ *
+ * The identity (`toolUseId`) has to be stable for the life of the call and
+ * unique among live calls, because the hub keys the approval on it. `itemId` /
+ * `callId` is that identity; `approvalId` is appended when present, since one
+ * item can raise several callbacks (the zsh-exec-bridge case) and collapsing
+ * them would let one answer decide two commands.
+ *
+ * `toolInput` is trimmed rather than forwarded whole. The raw params carry full
+ * file diffs and policy-amendment proposals, and a hub row nobody can read is
+ * not evidence — the command and the paths are what the decision turns on.
+ */
+function describeApproval(
+  shape: ApprovalShape,
+  params: unknown,
+): { toolUseId: string; toolName: string; toolInput: unknown; reason: string; title: string } {
+  const p = asMap(params);
+  const base = str(p['itemId']) ?? str(p['callId']) ?? 'unknown';
+  const callback = str(p['approvalId']);
+  const toolUseId = `${shape.kind}:${base}${callback !== undefined ? `:${callback}` : ''}`;
+
+  const command = commandText(p['command']);
+  const cwd = str(p['cwd']);
+  const files = Object.keys(asMap(p['fileChanges']));
+  const grantRoot = str(p['grantRoot']);
+
+  const detail =
+    command !== undefined
+      ? command
+      : files.length > 0
+        ? `writes ${files.join(', ')}`
+        : grantRoot !== undefined
+          ? `writes under ${grantRoot}`
+          : 'a change this harness would not make on its own';
+
+  return {
+    toolUseId,
+    toolName: shape.toolName,
+    toolInput: {
+      ...(command !== undefined ? { command } : {}),
+      ...(cwd !== undefined ? { cwd } : {}),
+      ...(files.length > 0 ? { files } : {}),
+      ...(grantRoot !== undefined ? { grantRoot } : {}),
+    },
+    // The harness's own words when it supplied them. When it did not, say WHY
+    // this arrived rather than inventing a hazard nobody assessed: the step's
+    // approval policy is what escalated it.
+    reason:
+      str(p['reason']) ??
+      "the step's approval policy escalated this call instead of running it unattended",
+    title: cap(detail),
+  };
+}
+
+/**
  * Answer every server→client request. An unanswered one hangs the turn past the
  * worker's lease, which is the single worst outcome available in this file.
  *
- * Exactly ONE thing is auto-approved — a tool call on owenloop's own MCP mount,
- * see the `mcpServer/elicitation/request` case. Everything else is refused:
- * under `approvalPolicy:'never'` a command/file approval request should not
- * arrive at all; if one does, throwing (which the client turns into a JSON-RPC
- * error reply) is a loud, non-hanging failure, whereas inventing an approval the
- * policy said would never be asked for is a security decision this adapter is
- * not authorized to make.
+ * TWO THINGS CAN BE GRANTED WITHOUT A PERSON, and only two.
+ *
+ *   1. A tool call on owenloop's own MCP mount — see the
+ *      `mcpServer/elicitation/request` case.
+ *   2. Nothing else.
+ *
+ * WHAT CHANGED WHEN THE APPROVAL CHANNEL LANDED. The four requests in
+ * `BRIDGEABLE_APPROVALS` used to be refused with a throw, on the reasoning that
+ * "inventing an approval the policy said would never be asked for is a security
+ * decision this adapter is not authorized to make". That reasoning still holds
+ * exactly — and it is why `approvals` is the ONLY thing that changes it. With a
+ * requester wired in, this adapter is no longer inventing anything: it is
+ * relaying a question to a person and replying with THEIR answer. With no
+ * requester, the old refusal is what still happens, byte for byte.
+ *
+ * A REFUSAL IS NEVER A HANG. Every path here replies: an approval becomes
+ * `accept`/`approved`, and a denial, a deadline, an unreachable hub, or a
+ * requester that throws all become `decline`/`denied` plus a `progress` line
+ * naming the cause. On the legacy pair the person's reason travels back to the
+ * model inside `{denied:{rejection}}`; the v2 decision enum has no message
+ * field, so there the reason reaches the log and not the model.
+ *
+ * `item/permissions/requestApproval` is still refused unconditionally — see
+ * `BRIDGEABLE_APPROVALS` for why a permission profile is not a yes/no question.
  *
  * `item/tool/requestUserInput` and every non-owenloop elicitation emit
  * `needs_input` and then throw: the Phase 1 contract deliberately has no reply
@@ -819,8 +939,36 @@ function createTurnGate(onEvent: (e: AgentEvent) => void): TurnGate {
  * error reply surfaces to the model as a failed tool call — the least-wrong
  * behavior available (contract observation 3).
  */
-function handleServerRequest(onEvent: (e: AgentEvent) => void) {
+export function handleServerRequest(
+  onEvent: (e: AgentEvent) => void,
+  approvals?: ApprovalRequester,
+) {
   return async (method: string, params: unknown): Promise<unknown> => {
+    const shape = BRIDGEABLE_APPROVALS[method];
+    if (shape !== undefined && approvals !== undefined) {
+      const ask = describeApproval(shape, params);
+      let denial = 'the approval channel produced no answer';
+      try {
+        const outcome = await approvals(ask);
+        if (outcome.decision === 'approved') {
+          onEvent({ kind: 'progress', text: `approved '${method}': ${ask.title}` });
+          return shape.legacy ? { decision: 'approved' } : { decision: 'accept' };
+        }
+        denial = outcome.note !== undefined && outcome.note !== ''
+          ? `${outcome.reason ?? 'denied'} — ${outcome.note}`
+          : (outcome.reason ?? 'denied');
+      } catch (err) {
+        // The requester is contracted to always answer, so this is a defect in
+        // it rather than an expected path. It still cannot be allowed to hang
+        // the turn: a broken channel denies, exactly like a silent one.
+        denial = `the approval channel failed: ${describe(err)}`;
+      }
+      onEvent({ kind: 'progress', text: `denied '${method}': ${cap(denial)}` });
+      return shape.legacy
+        ? { decision: { denied: { rejection: denial } } }
+        : { decision: 'decline' };
+    }
+
     switch (method) {
       case 'item/tool/requestUserInput': {
         const questions = asMap(params)['questions'];
@@ -860,14 +1008,27 @@ function handleServerRequest(onEvent: (e: AgentEvent) => void) {
         throw new Error('owenloop hosts this session headlessly and cannot answer an elicitation');
       }
 
-      case 'item/commandExecution/requestApproval':
-      case 'item/fileChange/requestApproval':
-      case 'item/permissions/requestApproval':
-      case 'applyPatchApproval':
-      case 'execCommandApproval': {
+      case 'item/permissions/requestApproval': {
+        // Refused even WITH an approval channel: the reply is a permission
+        // profile, not a decision, so there is no question a person could be
+        // shown whose answer this would be.
         onEvent({
           kind: 'progress',
-          text: `refusing '${method}': owenloop runs with approvalPolicy 'never' and does not grant approvals`,
+          text: `refusing '${method}': granting it means synthesizing a permission profile, not answering a question`,
+        });
+        throw new Error(`'${method}' is not answerable by a headless host`);
+      }
+
+      case 'item/commandExecution/requestApproval':
+      case 'item/fileChange/requestApproval':
+      case 'applyPatchApproval':
+      case 'execCommandApproval': {
+        // Only reachable with NO approval channel wired in — with one, the
+        // branch above this switch handled it. Unchanged from before the
+        // channel existed: this adapter does not invent an approval.
+        onEvent({
+          kind: 'progress',
+          text: `refusing '${method}': no approval channel is wired to this session, so nobody can grant it`,
         });
         throw new Error(`'${method}' is not answerable by a headless host`);
       }
@@ -904,6 +1065,7 @@ async function openClient(
   cwd: string,
   onEvent: (e: AgentEvent) => void,
   gate: TurnGate,
+  approvals?: ApprovalRequester,
 ): Promise<OpenedClient> {
   let exitReported = false;
   const reportExit = (exitCode: number | null, error: string | undefined): void => {
@@ -934,7 +1096,12 @@ async function openClient(
     // — unsolicited traffic arrives before any request completes, and throwing
     // on one would kill a healthy session.
     onNotification: (method, params) => gate.onNotification(method, params),
-    onServerRequest: handleServerRequest(onEvent),
+    // A blocked approval parks INSIDE this handler, for as long as it takes a
+    // person to answer. That is safe here and nowhere else in this file: the
+    // transport fires each server request without awaiting it (`void (async …)`
+    // in `jsonrpc-stdio.ts`), so the reader keeps draining notifications, and no
+    // timeout wraps a server request the way `client.request` wraps ours.
+    onServerRequest: handleServerRequest(onEvent, approvals),
     onStderr: (line) => onEvent({ kind: 'progress', text: cap(line) }),
     onExit: (code, signal) => {
       reportExit(code, signal === null ? undefined : `killed by ${signal}`);
@@ -1146,7 +1313,7 @@ export const codexAdapter: HarnessAdapter = {
     const startParams = buildThreadStartParams(args, onEvent);
     // Handshake failure disposes the child inside `openClient` — see the catch
     // there. Nothing is spawned and unowned by the time this rejects.
-    const { client, reportExit } = await openClient(args.cwd, onEvent, gate);
+    const { client, reportExit } = await openClient(args.cwd, onEvent, gate, args.approvals);
 
     let threadId: string;
     try {
@@ -1226,7 +1393,7 @@ export const codexAdapter: HarnessAdapter = {
       await previous.client.dispose();
     }
 
-    const { client, reportExit } = await openClient(args.cwd, onEvent, gate);
+    const { client, reportExit } = await openClient(args.cwd, onEvent, gate, args.approvals);
 
     try {
       await client.request('thread/resume', resumeParams, SETUP_TIMEOUT_MS);
