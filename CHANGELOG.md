@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.7](https://github.com/typicalday/owenloop/compare/v0.5.6...v0.5.7) (2026-08-16)
+
+
+### Features
+
+* bridge an escalated tool call to a human approval and back ([#174](https://github.com/typicalday/owenloop/issues/174)) ([aa60594](https://github.com/typicalday/owenloop/commit/aa6059445dc95fcd3f0a810ecfbdada2f687aa9c))
+* let a codex step's escalated call reach the same human approval gate ([#175](https://github.com/typicalday/owenloop/issues/175)) ([e43ca74](https://github.com/typicalday/owenloop/commit/e43ca74bf51485a499cf6f254c6a7a34fd4a1a5d))
+* tell a step agent the shape it owes, before it produces one ([#172](https://github.com/typicalday/owenloop/issues/172)) ([54461b4](https://github.com/typicalday/owenloop/commit/54461b490f5617931cd1751db08885873ec9cbe7))
+
+
+### Bug Fixes
+
+* stop one shift from killing another shift's live agent sessions ([#176](https://github.com/typicalday/owenloop/issues/176)) ([82d9d82](https://github.com/typicalday/owenloop/commit/82d9d82f84121749c32e7a67b36b9506a51020b2))
+
 ## [0.5.6](https://github.com/typicalday/owenloop/compare/v0.5.5...v0.5.6) (2026-08-15)
 
 
