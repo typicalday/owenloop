@@ -344,6 +344,35 @@ test('setup preserves a codec-looking historical nested legacy roster and materi
   assert.equal(JSON.parse(readFileSync(codecPath, 'utf8')).crew, codecCrew, 'the separately materialized codec file declares its owner');
 });
 
+test('setup preserves an owned historical codec roster while materializing its literal alias independently', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const delivery = 'delivery';
+  const encodedFilename = encodeCrewRosterFilename(delivery);
+  const alias = `.owenloop-encoded-rosters/${encodedFilename.slice(0, -'.json'.length)}`;
+  const historical = join(t.io.env.HOME!, '.owenloop', 'crews', '.owenloop-encoded-rosters', encodedFilename);
+  const deliveryContents = '{"crew":"delivery","roster":{"build":[{"harness":"codex","model":"delivery","effort":"high"}]}}\n';
+  mkdirSync(dirname(historical), { recursive: true });
+  writeFileSync(historical, deliveryContents);
+
+  assert.equal(
+    await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', `${delivery},${alias}`], t.io),
+    0,
+    t.err.join('\n'),
+  );
+
+  const aliasPath = crewRosterPath(t.io.env, alias);
+  assert.notEqual(aliasPath, historical);
+  assert.equal(readFileSync(historical, 'utf8'), deliveryContents, 'the delivery codec roster remains untouched');
+  assert.equal(JSON.parse(readFileSync(aliasPath, 'utf8')).crew, alias, 'setup materializes an independent alias roster');
+  const summary = JSON.parse(t.out.join('\n')) as { steps: Array<{ step: string; action: string; detail: string }>; doctor: { checks: Array<{ label: string }> } };
+  assert.ok(summary.steps.some((step) => step.step === 'crew rosters' && step.action === 'skipped' && step.detail.endsWith(`/crews/.owenloop-encoded-rosters/${encodedFilename}`)));
+  assert.ok(summary.steps.some((step) => step.step === 'crew rosters' && step.action === 'done' && step.detail === `${alias}: ${aliasPath}`));
+  assert.ok(summary.doctor.checks.some((check) => check.label === `crew roster (${delivery})`));
+  assert.ok(summary.doctor.checks.some((check) => check.label === `crew roster (${alias})`), 'doctor reports the independently materialized alias');
+});
+
 test('setup: fresh machine interactive — injected prompt names the agent; empty answer accepts the hostname prefill', async () => {
   // (a) a typed name.
   {

@@ -230,6 +230,39 @@ test('a codec-looking pre-upgrade nested legacy roster keeps its own crew identi
   }
 });
 
+test('an owned historical codec roster cannot alias its literal historical filename crew', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-historical-alias-'));
+  try {
+    const env = { HOME: home };
+    const delivery = 'delivery';
+    const encodedFilename = encodeCrewRosterFilename(delivery);
+    const alias = `.owenloop-encoded-rosters/${encodedFilename.slice(0, -'.json'.length)}`;
+    const historical = join(home, '.owenloop', 'crews', '.owenloop-encoded-rosters', encodedFilename);
+    mkdirSync(dirname(historical), { recursive: true });
+    writeFileSync(historical, JSON.stringify({ crew: delivery, roster: { build: candidate('historical', 'delivery-model') } }));
+
+    // `delivery` still selects the historical codec file. The distinct hub
+    // crew whose literal legacy spelling reaches the same pathname instead
+    // receives its own current codec target.
+    assert.equal(crewRosterPath(env, delivery), historical);
+    const aliasPath = crewRosterPath(env, alias);
+    assert.notEqual(aliasPath, historical);
+    assert.equal(aliasPath, join(encodedCrewRosterDir(env), encodeCrewRosterFilename(alias)));
+    mkdirSync(dirname(aliasPath), { recursive: true });
+    writeFileSync(aliasPath, JSON.stringify({ crew: alias, roster: { build: candidate('current', 'alias-model') } }));
+
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, delivery)).build?.candidates[0]?.model, 'delivery-model');
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, alias)).build?.candidates[0]?.model, 'alias-model');
+    assert.deepEqual(
+      discoverCrewRosterFiles(env).map((file) => `${file.crew}\0${file.path}`).sort(),
+      [`${delivery}\0${historical}`, `${alias}\0${aliasPath}`].sort(),
+      'doctor discovery agrees with the resolver about both independent owners',
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('codec-directory discovery keeps a 64-character unowned child as a legacy roster', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-codec-boundary-'));
   try {

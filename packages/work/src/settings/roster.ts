@@ -7,7 +7,7 @@
  */
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import {
   type Roster,
@@ -195,6 +195,26 @@ function isOwnedCodecRoster(path: string, crew: string): boolean {
   return crewNameFromEncodedRosterFile(path) === crew;
 }
 
+/**
+ * Return the owner of a codec file placed directly in one codec directory.
+ *
+ * The historical directory predates the namespace reservation and remains a
+ * possible prefix of a hub-valid nested legacy crew. Its directory name and a
+ * reversible basename therefore never establish ownership alone; the file's
+ * declared identity must also reproduce its canonical codec path. Keeping
+ * this check beside resolution prevents a literal legacy name that happens to
+ * spell a historical codec path from aliasing the codec file's true crew.
+ */
+function codecOwnerAtDirectoryRoot(
+  env: Record<string, string | undefined>,
+  codecDir: string,
+  path: string,
+): string | undefined {
+  if (!samePath(dirname(path), codecDir)) return undefined;
+  const crew = crewNameFromEncodedRosterFile(path);
+  return crew !== undefined && samePath(encodedCrewRosterPathIn(env, crew, codecDir), path) ? crew : undefined;
+}
+
 function isWindowsNativePathComponent(component: string): boolean {
   const hasControlCharacter = [...component].some((char) => char.codePointAt(0)! < 0x20);
   return component !== '' && component !== '.' && component !== '..' &&
@@ -345,12 +365,20 @@ export function discoverCrewRosterFiles(env: Record<string, string | undefined>)
 export function crewRosterPath(env: Record<string, string | undefined>, crew: string): string {
   const dir = crewRosterDir(env);
   const legacy = legacyCrewRosterPath(dir, crew);
-  if (legacy !== undefined && existsSync(legacy)) return legacy;
+  const historicalDir = historicalEncodedCrewRosterDir(env);
+  if (legacy !== undefined && existsSync(legacy)) {
+    // A root-level historical codec file is owned by its recorded crew, not by
+    // the distinct literal crew whose old join-normalized legacy path happens
+    // to spell that filename. Unowned files in the same directory remain
+    // preserved legacy paths, just like every other nested legacy file.
+    const historicalOwner = codecOwnerAtDirectoryRoot(env, historicalDir, legacy);
+    if (historicalOwner === undefined || historicalOwner === crew) return legacy;
+  }
 
   // Retain only historical files that declare this exact codec ownership.
   // A basename that merely decodes to `crew` can be a pre-upgrade nested
   // legacy crew, and must never be stolen from it.
-  const historical = encodedCrewRosterPathIn(env, crew, historicalEncodedCrewRosterDir(env));
+  const historical = encodedCrewRosterPathIn(env, crew, historicalDir);
   if (existsSync(historical) && isOwnedCodecRoster(historical, crew)) return historical;
 
   const encoded = encodedCrewRosterPath(env, crew);

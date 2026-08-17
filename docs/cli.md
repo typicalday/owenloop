@@ -341,7 +341,10 @@ legacy tree such as `crews/foo/bar.json` for crew `foo/bar` — remain readable
 and take precedence, so upgrading never replaces a hand-edited strongest layer
 with an empty skeleton. The short-lived feature-branch directory
 `.owenloop-encoded-rosters/` is treated as codec storage only when a file
-declares the matching `crew`; otherwise it remains a legacy nested path.
+declares the codec basename's exact `crew`; otherwise it remains a legacy
+nested path. A literal crew name that spells an owned historical codec file is
+distinct from that file's declared owner and receives its own current codec
+path, never an alias of the historical strongest layer.
 Routing probes only its requested crew paths. Doctor combines global file
 diagnostics with the verified agent's crew list, so a malformed bounded hash
 file is reported rather than silently disappearing. Traversal-shaped hub crew
