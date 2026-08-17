@@ -110,23 +110,45 @@ const WINDOWS_RESERVED_BASENAMES = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..
 
 /**
  * Path-segment-safe filename codec for crews that cannot use their legacy
- * literal filename. Short names retain the reversible form. Extremely large
+ * literal filename. Its lowercase-hex alphabet is stable under filesystem
+ * case folding: distinct UTF-8 crew names therefore cannot alias after a
+ * case-insensitive filesystem has accepted the first spelling. Extremely large
  * names use a fixed-size content-addressed form; setup writes the crew name in
  * the file's note, while ordinary safe names remain literal for rollback.
  */
 export function encodeCrewRosterFilename(crew: string): string {
+  const reversible = `${CREW_ROSTER_FILENAME_PREFIX}${Buffer.from(crew, 'utf8').toString('hex')}.json`;
+  if (Buffer.byteLength(reversible, 'utf8') <= MAX_CREW_ROSTER_FILENAME_BYTES) return reversible;
+  return `${CREW_ROSTER_HASH_FILENAME_PREFIX}${createHash('sha256').update(crew, 'utf8').digest('hex')}.json`;
+}
+
+/** The initial feature-branch codec used case-folding-unsafe base64url names. */
+function legacyEncodeCrewRosterFilename(crew: string): string {
   const reversible = `${CREW_ROSTER_FILENAME_PREFIX}${Buffer.from(crew, 'utf8').toString('base64url')}.json`;
   if (Buffer.byteLength(reversible, 'utf8') <= MAX_CREW_ROSTER_FILENAME_BYTES) return reversible;
   return `${CREW_ROSTER_HASH_FILENAME_PREFIX}${createHash('sha256').update(crew, 'utf8').digest('base64url')}.json`;
 }
 
-/** Decode only an exact codec output; ordinary legacy basenames stay literal. */
+/** Both generations are accepted only when the file's recorded owner agrees. */
+function codecFilenameMatchesCrew(filename: string, crew: string): boolean {
+  return filename === encodeCrewRosterFilename(crew) || filename === legacyEncodeCrewRosterFilename(crew);
+}
+
+/** Decode only an exact reversible codec output; ordinary legacy basenames stay literal. */
 export function decodeCrewRosterFilename(filename: string): string | undefined {
   if (!filename.startsWith(CREW_ROSTER_FILENAME_PREFIX) || !filename.endsWith('.json')) return undefined;
   const encoded = filename.slice(CREW_ROSTER_FILENAME_PREFIX.length, -'.json'.length);
+  if (/^[0-9a-f]+$/u.test(encoded) && encoded.length % 2 === 0) {
+    try {
+      const crew = Buffer.from(encoded, 'hex').toString('utf8');
+      if (encodeCrewRosterFilename(crew) === filename) return crew;
+    } catch {
+      // Fall through to the legacy decoder below.
+    }
+  }
   try {
     const crew = Buffer.from(encoded, 'base64url').toString('utf8');
-    return encodeCrewRosterFilename(crew) === filename ? crew : undefined;
+    return legacyEncodeCrewRosterFilename(crew) === filename ? crew : undefined;
   } catch {
     return undefined;
   }
@@ -154,7 +176,7 @@ export function crewNameFromEncodedRosterFile(path: string): string | undefined 
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
     const crew = (parsed as Record<string, unknown>)['crew'];
-    return typeof crew === 'string' && encodeCrewRosterFilename(crew) === filename ? crew : undefined;
+    return typeof crew === 'string' && codecFilenameMatchesCrew(filename, crew) ? crew : undefined;
   } catch {
     return undefined;
   }
@@ -187,12 +209,59 @@ function encodedCrewRosterPathIn(
   return containedCrewPath(dir, encodeCrewRosterFilename(crew));
 }
 
+/** Current plus pre-case-folding codec targets, in migration preference order. */
+function encodedCrewRosterPathsIn(
+  env: Record<string, string | undefined>,
+  crew: string,
+  dir: string,
+): string[] {
+  const filenames = [encodeCrewRosterFilename(crew), legacyEncodeCrewRosterFilename(crew)];
+  return [...new Set(filenames)].map((filename) => containedCrewPath(dir, filename));
+}
+
 function encodedCrewRosterPath(env: Record<string, string | undefined>, crew: string): string {
   return encodedCrewRosterPathIn(env, crew, encodedCrewRosterDir(env));
 }
 
-function isOwnedCodecRoster(path: string, crew: string): boolean {
-  return crewNameFromEncodedRosterFile(path) === crew;
+/**
+ * The filesystem operations needed to prove a legacy spelling is exact.
+ * The optional seam lets regression tests emulate an exists() lookup on a
+ * case-insensitive filesystem while retaining the directory's actual spelling.
+ */
+export interface CrewRosterFilesystem {
+  pathExists(path: string): boolean;
+  directoryEntries(path: string): readonly string[];
+}
+
+const LOCAL_CREW_ROSTER_FILESYSTEM: CrewRosterFilesystem = {
+  pathExists: existsSync,
+  directoryEntries: (path) => readdirSync(path),
+};
+
+/**
+ * `existsSync` folds case on APFS/NTFS. Before preserving an old literal file,
+ * walk its contained path and require every on-disk component to have exactly
+ * the requested spelling. This is what makes Delivery and delivery distinct
+ * crew identities even after either one was created first.
+ */
+function hasExactContainedPath(
+  root: string,
+  path: string,
+  filesystem: CrewRosterFilesystem,
+): boolean {
+  if (!filesystem.pathExists(path)) return false;
+  const fromRoot = relative(root, path);
+  if (fromRoot === '' || fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) return false;
+  let current = root;
+  for (const component of fromRoot.split(sep)) {
+    try {
+      if (!filesystem.directoryEntries(current).includes(component)) return false;
+    } catch {
+      return false;
+    }
+    current = join(current, component);
+  }
+  return true;
 }
 
 /**
@@ -212,7 +281,33 @@ function codecOwnerAtDirectoryRoot(
 ): string | undefined {
   if (!samePath(dirname(path), codecDir)) return undefined;
   const crew = crewNameFromEncodedRosterFile(path);
-  return crew !== undefined && samePath(encodedCrewRosterPathIn(env, crew, codecDir), path) ? crew : undefined;
+  return crew !== undefined && codecFilenameMatchesCrew(basename(path), crew) ? crew : undefined;
+}
+
+/**
+ * Return an owned codec target with its exact filesystem spelling. The current
+ * namespace is codec-only for a full codec basename, so an unowned file there
+ * is a corrupt/colliding strongest layer and must fail closed instead of being
+ * mistaken for an existing roster of the requested crew by setup or agent-run.
+ */
+function ownedCodecRosterPath(
+  env: Record<string, string | undefined>,
+  crew: string,
+  codecDir: string,
+  filesystem: CrewRosterFilesystem,
+  strictOwnership: boolean,
+): string | undefined {
+  const root = crewRosterDir(env);
+  for (const path of encodedCrewRosterPathsIn(env, crew, codecDir)) {
+    if (!hasExactContainedPath(root, path, filesystem)) continue;
+    const owner = codecOwnerAtDirectoryRoot(env, codecDir, path);
+    if (owner === crew) return path;
+    if (strictOwnership) {
+      const found = owner === undefined ? 'no valid recorded crew' : JSON.stringify(owner);
+      throw new Error(`invalid crew roster at ${path}: codec file is owned by ${found}, expected ${JSON.stringify(crew)}`);
+    }
+  }
+  return undefined;
 }
 
 function isWindowsNativePathComponent(component: string): boolean {
@@ -303,7 +398,7 @@ function classifyCodecDirectoryFile(
   const crew = relative(codecDir, path) === basename(path)
     ? crewNameFromEncodedRosterFile(path)
     : undefined;
-  if (crew !== undefined && samePath(encodedCrewRosterPathIn(env, crew, codecDir), path)) {
+  if (crew !== undefined && codecFilenameMatchesCrew(basename(path), crew)) {
     return { crew, path, kind: 'encoded' };
   }
 
@@ -362,11 +457,19 @@ export function discoverCrewRosterFiles(env: Record<string, string | undefined>)
  * data, never path segments, and every target has an explicit containment
  * proof.
  */
-export function crewRosterPath(env: Record<string, string | undefined>, crew: string): string {
+export function crewRosterPath(
+  env: Record<string, string | undefined>,
+  crew: string,
+  filesystem: CrewRosterFilesystem = LOCAL_CREW_ROSTER_FILESYSTEM,
+): string {
   const dir = crewRosterDir(env);
   const legacy = legacyCrewRosterPath(dir, crew);
+  // A case-folded sibling counts as occupied even when it is not an exact
+  // legacy match. Returning that literal spelling would make setup's later
+  // EEXIST look like an operator roster for this different crew.
+  const legacyOccupied = legacy !== undefined && filesystem.pathExists(legacy);
   const historicalDir = historicalEncodedCrewRosterDir(env);
-  if (legacy !== undefined && existsSync(legacy)) {
+  if (legacy !== undefined && hasExactContainedPath(dir, legacy, filesystem)) {
     // A root-level historical codec file is owned by its recorded crew, not by
     // the distinct literal crew whose old join-normalized legacy path happens
     // to spell that filename. Unowned files in the same directory remain
@@ -378,15 +481,14 @@ export function crewRosterPath(env: Record<string, string | undefined>, crew: st
   // Retain only historical files that declare this exact codec ownership.
   // A basename that merely decodes to `crew` can be a pre-upgrade nested
   // legacy crew, and must never be stolen from it.
-  const historical = encodedCrewRosterPathIn(env, crew, historicalDir);
-  if (existsSync(historical) && isOwnedCodecRoster(historical, crew)) return historical;
+  const historical = ownedCodecRosterPath(env, crew, historicalDir, filesystem, false);
+  if (historical !== undefined) return historical;
 
+  const encodedDir = encodedCrewRosterDir(env);
+  const ownedEncoded = ownedCodecRosterPath(env, crew, encodedDir, filesystem, true);
+  if (ownedEncoded !== undefined) return ownedEncoded;
   const encoded = encodedCrewRosterPath(env, crew);
-  // Probe the deterministic codec target even when corrupt: machineRosterLayers
-  // must parse and fail closed rather than hiding a malformed strongest-layer
-  // file behind an absent layer.
-  if (existsSync(encoded)) return encoded;
-  return isNativeCrewRosterFilename(crew) ? legacy! : encoded;
+  return isNativeCrewRosterFilename(crew) && !legacyOccupied ? legacy! : encoded;
 }
 
 /**

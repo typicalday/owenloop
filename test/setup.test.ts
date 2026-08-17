@@ -46,6 +46,17 @@ const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
 const PACKAGE_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
 
+const CASE_FOLDING_FILESYSTEM = (() => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-case-fold-probe-'));
+  try {
+    const lower = join(dir, 'delivery');
+    writeFileSync(lower, '');
+    return existsSync(join(dir, 'Delivery'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
+
 function sshKeygenWorks(): boolean {
   try {
     execFileSync('ssh-keygen', ['-Y', 'find-principals'], { stdio: 'ignore', timeout: 5_000 });
@@ -199,6 +210,25 @@ test('setup: existing crew roster is never overwritten', async () => {
     false,
     'an interrupted/exclusive install cleans its complete temporary file when an existing roster wins',
   );
+});
+
+test('setup materializes case-variant crews independently on a case-folding filesystem', { skip: !CASE_FOLDING_FILESYSTEM }, async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const crews = ['Delivery', 'delivery'];
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crews.join(',')], t.io), 0, t.err.join('\n'));
+  const paths = crews.map((crew) => crewRosterPath(t.io.env, crew));
+  assert.notEqual(paths[0], paths[1], 'neither crew treats the other case variant as its existing strongest layer');
+  assert.equal(paths.filter((path) => dirname(path) === join(t.io.env.HOME!, '.owenloop', 'crews')).length, 1, 'the first exact legacy spelling stays literal');
+  assert.equal(paths.filter((path) => dirname(path) === encodedCrewRosterDir(t.io.env)).length, 1, 'the case variant receives an isolated codec roster');
+  for (const [index, crew] of crews.entries()) {
+    assert.equal(JSON.parse(readFileSync(paths[index]!, 'utf8')).crew, crew, `${crew} has its own recorded strongest-layer identity`);
+  }
+  const summary = JSON.parse(t.out.join('\n')) as { steps: Array<{ step: string; action: string }> };
+  assert.equal(summary.steps.filter((step) => step.step === 'crew rosters' && step.action === 'done').length, 2, 'setup created two independent skeletons instead of skipping one');
+  assertNoOlp(t);
 });
 
 test('setup crew materialization only skips a verified target, not an unrelated EEXIST', () => {

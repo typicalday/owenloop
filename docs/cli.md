@@ -325,9 +325,12 @@ Crew names are data, not filesystem paths. A fresh safe crew keeps the literal
 `~/.owenloop/crews/<crew>.json` filename for rollback compatibility. Unsafe or
 too-wide names use the dedicated codec-only
 `~/.owenloop/crews/.owenloop-machine-roster-codec-namespace-reserved-v1-ownership/`
-directory: short names use a reversible `crew--<base64url>.json` basename,
+directory: short names use a reversible `crew--<lowercase-hex>.json` basename,
 while names too wide for one filesystem component use a bounded
-`crew-hash--…` basename. Every codec file records its exact `crew` identity in
+`crew-hash--…` basename. The current codec uses lowercase hexadecimal (not
+base64url), so distinct crew names remain distinct on case-insensitive
+filesystems; explicitly owned older base64url files remain readable during
+migration. Every codec file records its exact `crew` identity in
 the JSON document, so a reversible basename alone can never claim an old
 legacy file. Do not derive either filename by hand. The reserved directory
 itself can be the prefix of a valid 64-character nested legacy crew name, so a
@@ -338,8 +341,9 @@ Existing safe legacy
 `<crew>.json` files — including names containing spaces, colons, percent
 signs, Unicode, and (on POSIX) backslashes — plus any lexically contained
 legacy tree such as `crews/foo/bar.json` for crew `foo/bar` — remain readable
-and take precedence, so upgrading never replaces a hand-edited strongest layer
-with an empty skeleton. The short-lived feature-branch directory
+and take precedence only when their on-disk spelling exactly matches the crew,
+so `Delivery` and `delivery` cannot silently share one strongest layer on a
+case-insensitive filesystem. The short-lived feature-branch directory
 `.owenloop-encoded-rosters/` is treated as codec storage only when a file
 declares the codec basename's exact `crew`; otherwise it remains a legacy
 nested path. A literal crew name that spells an owned historical codec file is

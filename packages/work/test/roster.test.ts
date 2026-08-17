@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import assert from 'node:assert/strict';
@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import {
   crewNameFromEncodedRosterFilename,
   crewNameFromRosterFilename,
+  type CrewRosterFilesystem,
   discoverCrewRosterFiles,
   crewRosterPath,
   decodeCrewRosterFilename,
@@ -19,6 +20,19 @@ import {
 } from '../src/settings/roster.ts';
 
 const candidate = (harness: string, model: string) => [{ harness, model, effort: 'high' }] as const;
+
+/** Emulates case-folding exists() while preserving the directory's real names. */
+const caseInsensitiveFilesystem = (): CrewRosterFilesystem => ({
+  pathExists: (path) => {
+    try {
+      const wanted = basename(path).toLowerCase();
+      return readdirSync(dirname(path)).some((entry) => entry.toLowerCase() === wanted);
+    } catch {
+      return false;
+    }
+  },
+  directoryEntries: (path) => readdirSync(path),
+});
 
 test('mergeRosterLayers keeps the first complete row and accepts arbitrary layer count', () => {
   const layers: RosterLayer[] = [
@@ -116,6 +130,71 @@ test('a POSIX legacy roster with a literal backslash remains the strongest layer
 
     assert.equal(crewRosterPath({ HOME: home }, crew), legacy, 'the host-valid existing legacy file wins over a new codec target');
     assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.model, 'backslash-model');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('case-folding filesystems preserve only an exactly spelled legacy crew file', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-case-fold-'));
+  try {
+    const env = { HOME: home };
+    const crews = join(home, '.owenloop', 'crews');
+    const lower = 'delivery';
+    const upper = 'Delivery';
+    const lowerPath = join(crews, `${lower}.json`);
+    mkdirSync(crews, { recursive: true });
+    writeFileSync(lowerPath, JSON.stringify({ roster: { build: candidate('lower', 'lower-model') } }));
+
+    const filesystem = caseInsensitiveFilesystem();
+    assert.equal(crewRosterPath(env, lower, filesystem), lowerPath, 'the original exact legacy spelling remains readable');
+    const upperPath = crewRosterPath(env, upper, filesystem);
+    assert.equal(upperPath, join(encodedCrewRosterDir(env), encodeCrewRosterFilename(upper)), 'a case-folded sibling is not accepted as Delivery');
+    assert.notEqual(upperPath, lowerPath);
+    mkdirSync(dirname(upperPath), { recursive: true });
+    writeFileSync(upperPath, JSON.stringify({ crew: upper, roster: { build: candidate('upper', 'upper-model') } }));
+
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, lower)).build?.candidates[0]?.model, 'lower-model');
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, upper)).build?.candidates[0]?.model, 'upper-model');
+    assert.deepEqual(
+      discoverCrewRosterFiles(env).map((file) => file.crew).sort(),
+      [lower, upper].sort(),
+      'doctor discovery retains both distinct hub crew identities',
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('case-folding filesystem seam isolates legacy base64url codec collisions', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-codec-case-fold-'));
+  try {
+    const env = { HOME: home };
+    const first = '//G';
+    const second = '//a';
+    const firstLegacyFilename = `crew--${Buffer.from(first, 'utf8').toString('base64url')}.json`;
+    const secondLegacyFilename = `crew--${Buffer.from(second, 'utf8').toString('base64url')}.json`;
+    assert.notEqual(firstLegacyFilename, secondLegacyFilename);
+    assert.equal(firstLegacyFilename.toLowerCase(), secondLegacyFilename.toLowerCase(), 'the retired base64url names collide under case folding');
+
+    const firstPath = join(encodedCrewRosterDir(env), firstLegacyFilename);
+    mkdirSync(dirname(firstPath), { recursive: true });
+    writeFileSync(firstPath, JSON.stringify({ crew: first, roster: { build: candidate('first', 'first-model') } }));
+
+    const filesystem = caseInsensitiveFilesystem();
+    assert.equal(crewRosterPath(env, first, filesystem), firstPath, 'an owned old codec roster remains a migration target');
+    const secondPath = crewRosterPath(env, second, filesystem);
+    assert.equal(secondPath, join(encodedCrewRosterDir(env), encodeCrewRosterFilename(second)));
+    assert.notEqual(secondPath.toLowerCase(), firstPath.toLowerCase(), 'the modern codec has no case-folding alias');
+    writeFileSync(secondPath, JSON.stringify({ crew: second, roster: { build: candidate('second', 'second-model') } }));
+
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, first)).build?.candidates[0]?.model, 'first-model');
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, second)).build?.candidates[0]?.model, 'second-model');
+    assert.deepEqual(
+      discoverCrewRosterFiles(env).map((file) => file.crew).sort(),
+      [first, second].sort(),
+      'doctor discovery agrees with isolated routing ownership',
+    );
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -316,7 +395,7 @@ test('traversal-shaped crews use the confined reversible filename codec', () => 
     assert.equal(relative(crews, path).startsWith('..'), false);
     assert.equal(path, join(encodedCrewRosterDir({ HOME: home }), encodeCrewRosterFilename(crew)));
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, JSON.stringify({ roster: { build: candidate('confined', 'model') } }));
+    writeFileSync(path, JSON.stringify({ crew, roster: { build: candidate('confined', 'model') } }));
     assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.harness, 'confined');
   } finally {
     rmSync(home, { recursive: true, force: true });
