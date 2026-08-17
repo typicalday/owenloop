@@ -1031,11 +1031,15 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     ) {
       try {
 	await opts.syncRosters();
-	lastRosterSync = monotonicNow();
       } catch (e) {
 	rateLimitedThisIteration = noteServerBackoff(e);
 	opts.err(`roster sync failed: ${errMsg(e)} (continuing)`);
 	emit({ type: 'hub-error', op: 'roster_sync', message: `roster sync failed: ${errMsg(e)} (continuing)` });
+      } finally {
+	// This is a periodic attempt cadence, not a success-only retry loop. A
+	// persistent non-429 failure must not make every 5s poll issue two more
+	// hub calls and append another durable failure record.
+	lastRosterSync = monotonicNow();
       }
     }
 

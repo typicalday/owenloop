@@ -322,8 +322,10 @@ showing its found/absent layers and registered versus missing candidate
 harnesses.
 
 Crew names are data, not filesystem paths. New setup skeletons use the
-reversible `crew--<base64url>.json` codec beneath `~/.owenloop/crews/`; do not
-derive that filename by hand. Existing safe legacy `<crew>.json` files —
+reversible `crew--<base64url>.json` codec inside the dedicated
+`~/.owenloop/crews/.owenloop-encoded-rosters/` directory; do not derive that
+filename by hand. The separate directory is deliberately disjoint from every
+legacy root-level crew filename. Existing safe legacy `<crew>.json` files —
 including names containing spaces, colons, percent signs, or Unicode — remain
 readable and take precedence, so upgrading never replaces a hand-edited
 strongest layer with an empty skeleton. `owenloop doctor` decodes codec names

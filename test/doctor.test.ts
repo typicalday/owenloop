@@ -16,6 +16,7 @@ import { dirname, join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { kcHuman, kcKey, makeIdentityHub, makeIo, routedFetch } from './hubkit.ts';
 import { owenloopSettingsPath } from '../src/work-settings.ts';
+import { crewRosterPath, encodeCrewRosterFilename } from '../packages/work/src/settings/roster.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
@@ -188,6 +189,31 @@ test('doctor: all green → every line ✓, exit 0, and a strict zero-write', as
   assert.doesNotMatch(err, /Update available: 2\.2\.0/, 'only the first CLI version output line is reported');
 
   assert.deepEqual([...t.store.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)), before, 'doctor performed no writes');
+  assertNoOlpErr(t);
+});
+
+test('doctor keeps a codec-looking legacy crew literal and separately inspects the encoded crew', async () => {
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: ['ops'], token: { plaintext: 'olp_live' } }] });
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, env: { PATH: pathDir(false) } });
+  seedHuman(t.store);
+  seedAgentSlot(t.store, 'worker', 'olp_live');
+  writeSettings(t.io.env, ORIGIN);
+
+  const delivery = 'delivery';
+  const literalLegacyCrew = encodeCrewRosterFilename(delivery).slice(0, -'.json'.length);
+  const legacyPath = join(t.io.env.HOME!, '.owenloop', 'crews', `${literalLegacyCrew}.json`);
+  mkdirSync(dirname(legacyPath), { recursive: true });
+  writeFileSync(legacyPath, JSON.stringify({ roster: {} }));
+  const encodedPath = crewRosterPath(t.io.env, delivery);
+  mkdirSync(dirname(encodedPath), { recursive: true });
+  writeFileSync(encodedPath, JSON.stringify({ roster: {} }));
+
+  assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  const err = t.err.join('\n');
+  assert.match(err, /crew roster \(delivery\)/u);
+  assert.ok(err.includes(`crew roster (${literalLegacyCrew})`));
+  assert.doesNotMatch(err, /%253A/u, 'diagnostics never encode an already encoded-looking legacy name twice');
   assertNoOlpErr(t);
 });
 

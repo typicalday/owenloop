@@ -82,6 +82,11 @@ export function crewRosterDir(env: Record<string, string | undefined>): string {
 }
 
 const CREW_ROSTER_FILENAME_PREFIX = 'crew--';
+// This is a directory, not a filename prefix, so the codec namespace cannot
+// overlap any legacy one-segment `crews/<crew>.json` filename. In particular,
+// `delivery` and a legacy crew literally named `crew--ZGVsaXZlcnk` remain two
+// distinct files.
+const CREW_ROSTER_ENCODED_DIR = '.owenloop-encoded-rosters';
 
 /** Reversible, path-segment-safe filename codec for newly materialized crews. */
 export function encodeCrewRosterFilename(crew: string): string {
@@ -100,11 +105,14 @@ export function decodeCrewRosterFilename(filename: string): string | undefined {
   }
 }
 
-/** Map a filename from either the reversible codec or the legacy layout to its crew. */
+/** Map a root-level legacy filename to its literal crew name. */
 export function crewNameFromRosterFilename(filename: string): string | undefined {
-  const decoded = decodeCrewRosterFilename(filename);
-  if (decoded !== undefined) return decoded;
   return filename.endsWith('.json') ? filename.slice(0, -'.json'.length) : undefined;
+}
+
+/** Map a filename within the codec-only directory back to its crew name. */
+export function crewNameFromEncodedRosterFilename(filename: string): string | undefined {
+  return decodeCrewRosterFilename(filename);
 }
 
 function containedCrewPath(dir: string, filename: string): string {
@@ -115,6 +123,15 @@ function containedCrewPath(dir: string, filename: string): string {
     throw new Error(`unsafe crew roster path for ${JSON.stringify(filename)}`);
   }
   return path;
+}
+
+/** Directory reserved for the reversible codec; disjoint from legacy files. */
+export function encodedCrewRosterDir(env: Record<string, string | undefined>): string {
+  return containedCrewPath(crewRosterDir(env), CREW_ROSTER_ENCODED_DIR);
+}
+
+function encodedCrewRosterPath(env: Record<string, string | undefined>, crew: string): string {
+  return containedCrewPath(encodedCrewRosterDir(env), encodeCrewRosterFilename(crew));
 }
 
 /** A pre-codec file is safe to preserve only when its raw name is one segment. */
@@ -130,14 +147,15 @@ function legacyCrewRosterPath(dir: string, crew: string): string | undefined {
  * same resolver, so it cannot create an empty encoded duplicate over an existing
  * strongest-layer override.
  *
- * New files use `encodeCrewRosterFilename`; hub names are always data, never
- * path segments, and every target has an explicit containment proof.
+ * New files use a codec-only subdirectory plus `encodeCrewRosterFilename`; hub
+ * names are always data, never path segments, and every target has an explicit
+ * containment proof. Root-level files always retain legacy semantics.
  */
 export function crewRosterPath(env: Record<string, string | undefined>, crew: string): string {
   const dir = crewRosterDir(env);
   const legacy = legacyCrewRosterPath(dir, crew);
   if (legacy !== undefined && existsSync(legacy)) return legacy;
-  return containedCrewPath(dir, encodeCrewRosterFilename(crew));
+  return encodedCrewRosterPath(env, crew);
 }
 
 /**

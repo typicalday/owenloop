@@ -204,7 +204,7 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { loadSettings, settingsPath as executionSettingsPath } from '../packages/work/src/settings/settings.ts';
-import { crewNameFromRosterFilename, crewRosterDir, crewRosterPath, effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
+import { crewNameFromEncodedRosterFilename, crewNameFromRosterFilename, crewRosterDir, crewRosterPath, encodedCrewRosterDir, effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
 import { readHubRosterCache, syncHubRosterCache } from '../packages/work/src/settings/hub-roster-cache.ts';
 import type { HubClient } from '../packages/work/src/hub/client.ts';
 import type { GetRostersResponse, WhoamiResponse } from '../packages/work/src/hub/types.ts';
@@ -1762,7 +1762,19 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
     throw new CliError(`unknown roster subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
   }
 
+  // `COMMAND_OPTIONS` admits the union of every roster flag. Narrow it again
+  // by command form before even an offline read or credential lookup, so a
+  // typo never looks like a successful command that silently ignored intent.
+  const assertFormOptions = (allowed: readonly string[]): void => {
+    const allowedSet = new Set(allowed);
+    const disallowed = [...args.options.keys()].filter((option) => !allowedSet.has(option));
+    if (disallowed.length > 0) {
+      throw new CliError(`${disallowed.map((option) => `--${option}`).join(', ')} ${disallowed.length === 1 ? 'is' : 'are'} not valid for this roster command (${USAGE_FORMS})`);
+    }
+  };
+
   if (sub === 'show') {
+    assertFormOptions([]);
     if (args.positionals.length > 3) throw new CliError(USAGE_FORMS);
     const crew = args.positionals[2];
     const settings = loadSettings(io.env);
@@ -1794,14 +1806,6 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
     return 0;
   }
 
-  if (sub !== 'sync' && last(args, 'as') !== undefined) {
-    throw new CliError(`--as is only valid for roster sync (${USAGE_FORMS})`);
-  }
-  const crewOption = last(args, 'crew');
-  if (crewOption !== undefined && (args.missingOptionValues.has('crew') || crewOption.trim() === '')) {
-    throw new CliError(`--crew requires a non-empty crew name (${USAGE_FORMS})`);
-  }
-
   let orgSub: 'get' | 'put' | 'rm' | undefined;
   let registrySub: 'get' | 'put' | undefined;
   let capability = '';
@@ -1817,6 +1821,7 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
     }
     const maxPositionals = orgSub === 'get' ? 2 : 4;
     if (args.positionals.length > maxPositionals) throw new CliError(USAGE_FORMS);
+    assertFormOptions(orgSub === 'get' ? ['hub'] : orgSub === 'put' ? ['hub', 'crew', 'candidate'] : ['hub', 'crew']);
     if (orgSub === 'put' && all(args, 'candidate').length === 0) throw new CliError(`missing required --candidate (${USAGE_FORMS})`);
   } else if (sub === 'registry') {
     const nested = args.positionals[2];
@@ -1826,12 +1831,20 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
     if (registrySub === 'put') {
       harness = args.positionals[3] ?? '';
       if (harness.trim() === '') throw new CliError(`missing required argument: <harness> (${USAGE_FORMS})`);
-      if (all(args, 'model').length === 0) throw new CliError(`missing required --model (${USAGE_FORMS})`);
     }
     const maxPositionals = registrySub === 'get' ? 2 : 4;
     if (args.positionals.length > maxPositionals) throw new CliError(USAGE_FORMS);
+    assertFormOptions(registrySub === 'get' ? ['hub'] : ['hub', 'display-name', 'model']);
+    if (registrySub === 'put' && all(args, 'model').length === 0) throw new CliError(`missing required --model (${USAGE_FORMS})`);
   } else if (args.positionals.length > 2) {
     throw new CliError(USAGE_FORMS);
+  } else {
+    assertFormOptions(['hub', 'as']);
+  }
+
+  const crewOption = last(args, 'crew');
+  if (crewOption !== undefined && (args.missingOptionValues.has('crew') || crewOption.trim() === '')) {
+    throw new CliError(`--crew requires a non-empty crew name (${USAGE_FORMS})`);
   }
 
   const origin = resolveAgentHub(io, args, sub === 'sync' ? 'sync rosters from' : 'manage rosters on');
@@ -7214,17 +7227,20 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     io.err(`! crew rosters: ${detail}`);
     steps.push({ step: 'crew rosters', action: 'noted', detail });
   } else {
-    const crewsDir = crewRosterDir(io.env);
-    mkdirSync(crewsDir, { recursive: true });
     for (const crew of agentCrews) {
       const path = crewRosterPath(io.env, crew);
-      if (existsSync(path)) {
-	io.err(`✓ crew roster ${crew}: existing file left untouched`);
-	steps.push({ step: 'crew rosters', action: 'skipped', detail: `${crew}: ${path}` });
-      } else {
-	writeFileSync(path, `${JSON.stringify({ note: `machine-local overrides for crew ${crew}; wins over settings.json and hub rosters — see docs/cli.md`, roster: {} }, null, 2)}\n`, 'utf8');
+      // `wx` is the consent rule, not merely a race optimization: an operator
+      // or another setup process may create the strongest-layer file after we
+      // decide what to materialize, and that must never be truncated.
+      try {
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, `${JSON.stringify({ note: `machine-local overrides for crew ${crew}; wins over settings.json and hub rosters — see docs/cli.md`, roster: {} }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
 	io.err(`✓ crew roster ${crew}: created`);
 	steps.push({ step: 'crew rosters', action: 'done', detail: `${crew}: ${path}` });
+      } catch (error) {
+	if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+	io.err(`✓ crew roster ${crew}: existing file left untouched`);
+	steps.push({ step: 'crew rosters', action: 'skipped', detail: `${crew}: ${path}` });
       }
     }
   }
@@ -7431,14 +7447,20 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
   // membership predicate the worker uses is intentionally reused here.
   try {
     const crewsDir = crewRosterDir(io.env);
-    const crews = existsSync(crewsDir)
+    const legacyCrews = existsSync(crewsDir)
       ? readdirSync(crewsDir, { withFileTypes: true })
           .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
 	  .map((entry) => crewNameFromRosterFilename(entry.name))
 	  .filter((crew): crew is string => crew !== undefined)
-	  .filter((crew, index, all) => all.indexOf(crew) === index)
-          .sort()
       : [];
+    const encodedDir = encodedCrewRosterDir(io.env);
+    const encodedCrews = existsSync(encodedDir)
+      ? readdirSync(encodedDir, { withFileTypes: true })
+	  .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+	  .map((entry) => crewNameFromEncodedRosterFilename(entry.name))
+	  .filter((crew): crew is string => crew !== undefined)
+      : [];
+    const crews = [...new Set([...legacyCrews, ...encodedCrews])].sort();
     for (const crew of crews) {
       try {
 	const settings = loadSettings(io.env);

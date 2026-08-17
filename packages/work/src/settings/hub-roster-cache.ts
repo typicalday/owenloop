@@ -52,6 +52,17 @@ export function sanitizeOrgIdForFilename(orgId: string): string {
   return encodeURIComponent(orgId);
 }
 
+/**
+ * An on-disk cache key must be injective, not merely path-safe. The historical
+ * origin sanitizer remains exported for diagnostics/backward compatibility,
+ * but it deliberately cannot be the key: distinct origins can sanitize to the
+ * same string. Base64url encodes the UTF-8 bytes reversibly without a path
+ * separator, so origin, org, and account can coexist unambiguously.
+ */
+function cacheKeySegment(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64url');
+}
+
 function containedChildPath(dir: string, filename: string): string {
   const root = resolve(dir);
   const path = resolve(root, filename);
@@ -62,10 +73,10 @@ function containedChildPath(dir: string, filename: string): string {
   return path;
 }
 
-export function hubRosterCachePath(env: Env, origin: string, orgId: string): string {
+export function hubRosterCachePath(env: Env, origin: string, orgId: string, account = 'default'): string {
   return containedChildPath(
     hubRosterCacheDir(env),
-    `${sanitizeOriginForFilename(origin)}--${sanitizeOrgIdForFilename(orgId)}.json`,
+    `cache-v1--${cacheKeySegment(origin)}--${cacheKeySegment(orgId)}--${cacheKeySegment(account)}.json`,
   );
 }
 
@@ -151,7 +162,9 @@ export function writeHubRosterCache(
   const verified = parseEntry(entry);
   const dir = hubRosterCacheDir(env);
   mkdirSync(dir, { recursive: true });
-  const path = hubRosterCachePath(env, verified.origin, verified.orgId);
+  // Account is part of the key as well as the reader's validity predicate:
+  // two agent accounts can be attached to the same hub org concurrently.
+  const path = hubRosterCachePath(env, verified.origin, verified.orgId, verified.account);
   const temp = `${path}.${(options.tempSuffix ?? randomUUID)()}.tmp`;
   writeFileSync(temp, `${JSON.stringify(verified, null, 2)}\n`, 'utf8');
   renameSync(temp, path);

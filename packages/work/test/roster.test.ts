@@ -1,13 +1,15 @@
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  crewNameFromEncodedRosterFilename,
   crewNameFromRosterFilename,
   crewRosterPath,
   decodeCrewRosterFilename,
+  encodedCrewRosterDir,
   encodeCrewRosterFilename,
   machineRosterLayers,
   mergeRosterLayers,
@@ -73,7 +75,7 @@ test('machineRosterLayers prefers a present crew roster and retains absent paths
 
     const absent = machineRosterLayers({ HOME: home }, 'absent');
     assert.equal(absent[0]?.roster, undefined);
-    assert.equal(absent[0]?.path, join(crews, encodeCrewRosterFilename('absent')));
+    assert.equal(absent[0]?.path, join(encodedCrewRosterDir({ HOME: home }), encodeCrewRosterFilename('absent')));
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -90,12 +92,13 @@ test('crew filename codec round-trips new names while preserving every safe lega
       const resolved = crewRosterPath({ HOME: home }, crew);
       assert.equal(resolved, legacy, `upgrade keeps legacy ${crew} in place`);
       assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.model, crew);
-      assert.equal(existsSync(join(crews, encodeCrewRosterFilename(crew))), false, `no duplicate created for ${crew}`);
+      assert.equal(existsSync(join(encodedCrewRosterDir({ HOME: home }), encodeCrewRosterFilename(crew))), false, `no duplicate created for ${crew}`);
       const encoded = encodeCrewRosterFilename(crew);
       assert.equal(decodeCrewRosterFilename(encoded), crew);
-      assert.equal(crewNameFromRosterFilename(encoded), crew);
+      assert.equal(crewNameFromEncodedRosterFilename(encoded), crew);
     }
     assert.equal(crewNameFromRosterFilename('percent%crew.json'), 'percent%crew', 'a legacy percent is never decoded twice');
+    assert.equal(crewNameFromRosterFilename(encodeCrewRosterFilename('delivery')), encodeCrewRosterFilename('delivery').slice(0, -'.json'.length), 'root-level codec-looking names retain legacy semantics');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -109,9 +112,33 @@ test('traversal-shaped crews use the confined reversible filename codec', () => 
     const crew = '../../package';
     const path = crewRosterPath({ HOME: home }, crew);
     assert.equal(relative(crews, path).startsWith('..'), false);
-    assert.equal(path, join(crews, encodeCrewRosterFilename(crew)));
+    assert.equal(path, join(encodedCrewRosterDir({ HOME: home }), encodeCrewRosterFilename(crew)));
+    mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({ roster: { build: candidate('confined', 'model') } }));
     assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.harness, 'confined');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('codec storage namespace cannot collide with a legacy crew named like an encoded filename', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-namespace-'));
+  try {
+    const crews = join(home, '.owenloop', 'crews');
+    mkdirSync(crews, { recursive: true });
+    const delivery = 'delivery';
+    const legacyNamedLikeCodec = encodeCrewRosterFilename(delivery).slice(0, -'.json'.length);
+    const legacyPath = join(crews, `${legacyNamedLikeCodec}.json`);
+    writeFileSync(legacyPath, JSON.stringify({ roster: { build: candidate('legacy', 'legacy-model') } }));
+
+    const deliveryPath = crewRosterPath({ HOME: home }, delivery);
+    const legacyCrewPath = crewRosterPath({ HOME: home }, legacyNamedLikeCodec);
+    assert.notEqual(deliveryPath, legacyCrewPath);
+    assert.equal(legacyCrewPath, legacyPath);
+    mkdirSync(dirname(deliveryPath), { recursive: true });
+    writeFileSync(deliveryPath, JSON.stringify({ roster: { build: candidate('encoded', 'delivery-model') } }));
+    assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, delivery)).build?.candidates[0]?.model, 'delivery-model');
+    assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, legacyNamedLikeCodec)).build?.candidates[0]?.model, 'legacy-model');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

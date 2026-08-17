@@ -69,6 +69,25 @@ test('roster sync reports a missing default agent slot and still refuses an expl
   assert.match(t2.err.join('\n'), /requires an agent credential/u);
 });
 
+test('each roster form rejects flags belonging to another form before credentials or hub I/O', async () => {
+  const cases = [
+    ['roster', 'show', '--hub', ORIGIN],
+    ['roster', 'org', '--candidate', 'codex:gpt-5:high'],
+    ['roster', 'org', 'put', 'build', '--model', 'gpt-5:high'],
+    ['roster', 'org', 'rm', 'build', '--candidate', 'codex:gpt-5:high'],
+    ['roster', 'registry', '--crew', 'delivery'],
+    ['roster', 'registry', 'put', 'codex', '--candidate', 'codex:gpt-5:high'],
+    ['roster', 'sync', '--model', 'gpt-5:high'],
+  ];
+  for (const args of cases) {
+    const { fetch, calls } = routedFetch({});
+    const t = makeIo({ fetch });
+    assert.equal(await mainAsync(args, t.io), 1, args.join(' '));
+    assert.match(t.err.join('\n'), /not valid for this roster command/u);
+    assert.equal(calls.length, 0, `${args.join(' ')} must fail before hub I/O`);
+  }
+});
+
 test('roster mutations reject malformed or wrong-verb 2xx responses', async () => {
   const cases: Array<{ endpoint: string; args: string[]; body: unknown }> = [
     {

@@ -353,6 +353,7 @@ test('a shift-start roster refresh failure is durable in shift.log and remains f
     );
     await shift.ready;
     const records = await readShiftLogRecords(shiftLogFile(logDir), 'hub-error', 'shift.log');
+    assert.equal(records[0]?.type, 'parked', JSON.stringify(records));
     const failure = records.find((record) => record.type === 'hub-error' && record.op === 'roster_sync');
     assert.ok(failure !== undefined, JSON.stringify(records));
     assert.match(String(failure.message), /^roster sync failed at shift start: /u);

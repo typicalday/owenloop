@@ -517,15 +517,15 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   };
 
   // The agent-run child must stay completely offline. Refresh before entering
-  // the park loop, but let an unavailable hub degrade to machine layers. Use
-  // the existing FILE_ONLY `hub-error` event so the outcome survives stderr
-  // and cannot wake a parked socket client.
+  // the park loop, but let an unavailable hub degrade to machine layers. The
+  // durable error is buffered until after `parked`: a parked shift's first log
+  // record is its self-describing identity, even when this refresh fails.
+  let startupRosterSyncFailure: string | undefined;
   try {
     await syncHubRosterCache({ client: hub, env, origin, account });
   } catch (error) {
-    const line = `roster sync failed at shift start: ${errMsg(error)} (continuing)`;
-    consumeEvent(stamp({ type: 'hub-error', op: 'roster_sync', message: line }));
-    process.stderr.write(`${roleLabel}: ${line}\n`);
+    startupRosterSyncFailure = `roster sync failed at shift start: ${errMsg(error)} (continuing)`;
+    process.stderr.write(`${roleLabel}: ${startupRosterSyncFailure}\n`);
   }
 
   const reportWorkerFailure = (failure: WorkerFailure): void => {
@@ -638,6 +638,12 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     );
   };
 
+  const emitStartupRosterSyncFailure = (): void => {
+    if (startupRosterSyncFailure === undefined) return;
+    consumeEvent(stamp({ type: 'hub-error', op: 'roster_sync', message: startupRosterSyncFailure }));
+    startupRosterSyncFailure = undefined;
+  };
+
   if (daemonMode) {
     daemon = createShiftDaemon({
       socketPath: options.socketPath ?? join(stateDir, 'shift.sock'),
@@ -663,6 +669,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     if (parsed.once !== true) {
       process.stdout.write(`owenloop shift: parked as '${name}' @ ${origin} (cap ${cap})\n`);
       emitParked();
+      emitStartupRosterSyncFailure();
+    } else {
+      emitStartupRosterSyncFailure();
     }
     return daemon.run();
   }
@@ -671,6 +680,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   if (parsed.once !== true) {
     process.stdout.write(`owenloop work shift: parked as '${name}' @ ${origin} (cap ${cap})\n`);
     emitParked();
+    emitStartupRosterSyncFailure();
+  } else {
+    emitStartupRosterSyncFailure();
   }
   return loop.run();
 }

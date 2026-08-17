@@ -100,7 +100,6 @@ test('absent, mismatched, and corrupt caches are harmless misses; cache writes p
     writeHubRosterCache(env, entry({ orgId: 'old-org' }));
     writeHubRosterCache(env, entry({ orgId: 'new-org' }));
     assert.equal(readHubRosterCache(env, origin, 'default').kind, 'hit');
-    assert.equal(hubRosterCachePath(env, origin, 'old-org').includes('old-org'), true);
     assert.equal(existsSync(hubRosterCachePath(env, origin, 'old-org')), false);
     assert.equal(readdirSync(hubRosterCacheDir(env)).some((name) => name.endsWith('.tmp')), false);
   });
@@ -150,6 +149,34 @@ test('different accounts and invalid roster shapes are harmless cache misses', (
     const invalid = readHubRosterCache(env, origin, 'default');
     assert.equal(invalid.kind, 'miss');
     assert.match(invalid.reason, /invalid roster shape/u);
+  });
+});
+
+test('same-org accounts and sanitizer-colliding origins retain distinct cache snapshots', () => {
+  withHome((_home, env) => {
+    const accountA = 'agent-a';
+    const accountB = 'agent-b';
+    writeHubRosterCache(env, entry({ account: accountA, global: { build: candidate('a', 'a-model') } }));
+    writeHubRosterCache(env, entry({ account: accountB, global: { build: candidate('b', 'b-model') } }));
+
+    const pathA = hubRosterCachePath(env, origin, 'org_1', accountA);
+    const pathB = hubRosterCachePath(env, origin, 'org_1', accountB);
+    assert.notEqual(pathA, pathB);
+    assert.equal(existsSync(pathA), true);
+    assert.equal(existsSync(pathB), true);
+    const readA = readHubRosterCache(env, origin, accountA);
+    const readB = readHubRosterCache(env, origin, accountB);
+    assert.equal(readA.kind, 'hit');
+    assert.equal(readB.kind, 'hit');
+    if (readA.kind === 'hit' && readB.kind === 'hit') {
+      assert.equal(readA.data.global.build?.[0]?.harness, 'a');
+      assert.equal(readB.data.global.build?.[0]?.harness, 'b');
+    }
+
+    const collisionA = hubRosterCachePath(env, 'https://hub.example/a', 'org_1', 'default');
+    const collisionB = hubRosterCachePath(env, 'https://hub.example?a', 'org_1', 'default');
+    assert.equal(sanitizeOriginForFilename('https://hub.example/a'), sanitizeOriginForFilename('https://hub.example?a'));
+    assert.notEqual(collisionA, collisionB, 'the actual key is injective even where legacy sanitization is not');
   });
 });
 

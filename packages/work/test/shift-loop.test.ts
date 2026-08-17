@@ -566,6 +566,29 @@ test('a roster cache refresh failure logs continuing and does not stop dispatch'
   ]);
 });
 
+test('a failed roster refresh advances its cadence instead of retrying on every poll', async () => {
+  const { hub } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+  const { spawner } = fakeSpawner();
+  const holder: { loop?: ShiftLoop } = {};
+  let now = 0;
+  let sleeps = 0;
+  let attempts = 0;
+  const sleep = async (): Promise<void> => {
+    sleeps++;
+    now = sleeps === 1 ? 5 : sleeps === 2 ? 6 : 7;
+    if (sleeps >= 3) holder.loop!.stop();
+  };
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    sleep,
+    monotonicNow: () => now,
+    rosterSyncIntervalMs: 5,
+    syncRosters: async () => { attempts++; throw new Error('hub unavailable'); },
+  }));
+  holder.loop = loop;
+  assert.equal(await loop.run(), 0);
+  assert.equal(attempts, 1, 'the next two polls are still inside the 5ms attempt cadence');
+});
+
 test('a rate-limited roster refresh suppresses the due presence ping for that iteration', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
