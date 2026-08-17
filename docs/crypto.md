@@ -729,18 +729,21 @@ is never returned by the library or placed in an envelope. `loadGrants` and
 `loadRevocations` return raw envelope bytes to the pure validator and refuse
 symlinked or non-regular files.
 
-If `<config>/grants` has zero `*.grant.dsse` entries and is absent or is a
-non-symlink directory whose existing entries are all regular, non-symlink files
-while the pre-rename
+If `<config>/grants` has zero `*.grant.dsse` entries while the pre-rename
 `<config>/roster` is a readable, non-symlink directory of regular files that
 holds grants, owenloop refuses rather than treating the machine as unenrolled.
-It never reads or moves that legacy directory; the operator must run the
-shell-quoted command printed in that refusal — structurally,
-`mkdir -p <config>/grants && for grant in <config>/roster/?* <config>/roster/.[!.]* <config>/roster/..?*; do [ -f "$grant" ] || continue; case "$grant" in *.grant.dsse) mv "$grant" <config>/grants/ || exit $?;; esac; done`
-— and restart running owenloop shift daemons. If either directory is a file or
-symlink, cannot be inspected, or contains a non-regular entry, owenloop prints
-no migration command: repair the named path by hand before retrying the
-migration.
+It never reads or moves that legacy directory. When `<config>/grants` is
+absent, the shell-quoted remediation is structurally
+`mv <config>/roster <config>/grants`; this whole-directory rename preserves
+every accepted grant filename, including dot-prefixed names. When a grants path
+already exists, the printed remediation is instead
+`rmdir <config>/grants && mv <config>/roster <config>/grants`. It moves only if
+that path is an empty real directory; otherwise `rmdir` fails without moving
+anything, and the operator must inspect `<config>/grants` by hand before
+retrying. In either case, restart running owenloop shift daemons after a
+successful migration. If the legacy source is a file or symlink, cannot be
+inspected, or contains a non-regular entry, owenloop prints no migration
+command: repair the named source path by hand before retrying the migration.
 
 ## Admin-signed policy floors
 

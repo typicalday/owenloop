@@ -130,40 +130,17 @@ function inspectLegacyGrantsSource(path: string): LegacyGrantsInspection {
   return { grantCount, problem: undefined };
 }
 
-/**
- * A migration command is safe only for an absent destination or a real
- * directory whose entries are all regular files. This never reads envelope
- * bytes; it merely prevents an instruction from silently nesting them.
- */
-function inspectGrantsDestination(path: string): GrantsDirectoryProblem | undefined {
+/** Use lstat so a live or dangling symlink is never mistaken for absence. */
+function grantsPathIsAbsent(path: string): boolean {
   let stat;
   try {
     stat = lstatSync(path, { throwIfNoEntry: false });
-  } catch (error) {
-    return inspectionError(path, 'cannot inspect grants destination', error);
+  } catch {
+    // The existing-path command begins with rmdir, which safely refuses when
+    // this probe cannot establish absence.
+    return false;
   }
-  if (stat === undefined) return undefined;
-  if (stat.isSymbolicLink()) return { path, reason: 'grants destination is a symlink' };
-  if (!stat.isDirectory()) return { path, reason: 'grants destination is not a directory' };
-
-  let entries: string[];
-  try {
-    entries = readdirSync(path);
-  } catch (error) {
-    return inspectionError(path, 'cannot inspect grants destination', error);
-  }
-  for (const name of entries) {
-    const entryPath = join(path, name);
-    let entry;
-    try {
-      entry = lstatSync(entryPath);
-    } catch (error) {
-      return inspectionError(entryPath, 'cannot inspect grants destination entry', error);
-    }
-    if (entry.isSymbolicLink()) return { path: entryPath, reason: 'grants destination entry is a symlink' };
-    if (!entry.isFile()) return { path: entryPath, reason: 'grants destination entry is not a regular file' };
-  }
-  return undefined;
+  return stat === undefined;
 }
 
 function sourceManualRepairMessage(
@@ -182,33 +159,22 @@ function migrationMessage(
   legacyCount: number,
   quotedGrantsPath: string,
   quotedLegacyPath: string,
+  destinationIsAbsent: boolean,
 ): string {
-  // POSIX pathname expansion omits leading-dot names. These three patterns
-  // enumerate every eligible top-level directory entry without ever matching
-  // `.` or `..`: ordinary names, dot names whose second character is not a
-  // dot (including `.grant.dsse`), and names beginning with two or more dots.
-  // The case filter then selects exactly the suffix accepted by the inspector
-  // and loader. The source inspector has already established the entries are
-  // regular non-symlink files; the file test only skips unmatched patterns.
-  // Do not continue after a failed move: a partial migration must stay loud.
-  const command = `mkdir -p ${quotedGrantsPath} && for grant in ${quotedLegacyPath}/?* ${quotedLegacyPath}/.[!.]* ${quotedLegacyPath}/..?*; do ` +
-    `[ -f "$grant" ] || continue; case "$grant" in *.grant.dsse) mv "$grant" ${quotedGrantsPath}/ || exit $?;; esac; done`;
+  // Renaming the whole inspected source directory preserves every accepted
+  // filename by construction, including all dot-prefixed names. If a grants
+  // path already exists, rmdir permits the rename only into an empty real
+  // directory, preventing mv from nesting roster beneath grants.
+  const command = destinationIsAbsent
+    ? `mv ${quotedLegacyPath} ${quotedGrantsPath}`
+    : `rmdir ${quotedGrantsPath} && mv ${quotedLegacyPath} ${quotedGrantsPath}`;
   return `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
     `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
     `cryptographic material for you. Run:  ${command}  ` +
-    'then restart every running owenloop shift daemon.';
-}
-
-function destinationManualRepairMessage(
-  grantsPath: string,
-  legacyPath: string,
-  legacyCount: number,
-  destinationProblem: GrantsDirectoryProblem,
-): string {
-  return `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
-    `but '${legacyPath}' holds ${legacyCount}. The grants destination is unsafe: ${destinationProblem.reason}: ` +
-    `'${destinationProblem.path}'. Repair that path by hand before migrating; owenloop will not move your ` +
-    'cryptographic material for you.';
+    'then restart every running owenloop shift daemon.' +
+    (destinationIsAbsent
+      ? ''
+      : ` If rmdir refuses, inspect '${grantsPath}' by hand before migrating; owenloop will not move your cryptographic material for you.`);
 }
 
 /** Thrown when legacy grants are stranded or cannot be safely inspected. */
@@ -217,8 +183,6 @@ export class StrandedLegacyGrantsError extends Error {
   readonly grantsPath: string;
   readonly legacyPath: string;
   readonly legacyCount: number;
-  readonly destinationPath: string | undefined;
-  readonly destinationReason: string | undefined;
   readonly sourcePath: string | undefined;
   readonly sourceReason: string | undefined;
 
@@ -226,25 +190,21 @@ export class StrandedLegacyGrantsError extends Error {
     grantsPath: string,
     legacyPath: string,
     legacyCount: number,
-    destinationProblem: GrantsDirectoryProblem | undefined,
     sourceProblem: GrantsDirectoryProblem | undefined = undefined,
+    destinationIsAbsent = false,
   ) {
     const quotedGrantsPath = quotePosixShellArgument(grantsPath);
     const quotedLegacyPath = quotePosixShellArgument(legacyPath);
     let message: string;
     if (sourceProblem !== undefined) {
       message = sourceManualRepairMessage(grantsPath, legacyPath, sourceProblem);
-    } else if (destinationProblem === undefined) {
-      message = migrationMessage(grantsPath, legacyPath, legacyCount, quotedGrantsPath, quotedLegacyPath);
     } else {
-      message = destinationManualRepairMessage(grantsPath, legacyPath, legacyCount, destinationProblem);
+      message = migrationMessage(grantsPath, legacyPath, legacyCount, quotedGrantsPath, quotedLegacyPath, destinationIsAbsent);
     }
     super(message);
     this.grantsPath = grantsPath;
     this.legacyPath = legacyPath;
     this.legacyCount = legacyCount;
-    this.destinationPath = destinationProblem?.path;
-    this.destinationReason = destinationProblem?.reason;
     this.sourcePath = sourceProblem?.path;
     this.sourceReason = sourceProblem?.reason;
   }
@@ -261,12 +221,17 @@ export function assertNoStrandedLegacyGrants(env: Record<string, string | undefi
       grants,
       legacy,
       inspection.grantCount,
-      inspectGrantsDestination(grants),
       inspection.problem,
     );
   }
   if (inspection.grantCount > 0) {
-    throw new StrandedLegacyGrantsError(grants, legacy, inspection.grantCount, inspectGrantsDestination(grants));
+    throw new StrandedLegacyGrantsError(
+      grants,
+      legacy,
+      inspection.grantCount,
+      undefined,
+      grantsPathIsAbsent(grants),
+    );
   }
 }
 

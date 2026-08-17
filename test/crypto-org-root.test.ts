@@ -20,13 +20,10 @@ function temp(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-function runPrintedMigration(
-  error: StrandedLegacyGrantsError,
-  shellEnv: Record<string, string | undefined> = process.env,
-): void {
+function runPrintedMigration(error: StrandedLegacyGrantsError): void {
   const match = error.message.match(/Run:  (.+)  then restart/);
   assert.ok(match !== null, error.message);
-  execFileSync('/bin/sh', ['-c', match[1]!], { env: shellEnv });
+  execFileSync('/bin/sh', ['-c', match[1]!]);
 }
 
 function strandedError(env: Record<string, string | undefined>): StrandedLegacyGrantsError {
@@ -54,6 +51,24 @@ function assertInvalidLegacySource(env: Record<string, string | undefined>, path
   assertManualRepair(error, path);
   assert.match(error.message, /legacy grants source/);
   assert.equal(existsSync(grantsDir(env)), false);
+  assert.throws(() => loadGrants(env), StrandedLegacyGrantsError);
+}
+
+function assertRmdirMigration(error: StrandedLegacyGrantsError, grants: string): void {
+  assert.match(error.message, /Run:  rmdir /);
+  assert.ok(error.message.includes(grants), error.message);
+  assert.match(error.message, /If rmdir refuses, inspect/);
+}
+
+function assertRmdirRefusesWithoutNesting(
+  env: Record<string, string | undefined>,
+  legacyGrant: string,
+): void {
+  const error = strandedError(env);
+  assertRmdirMigration(error, grantsDir(env));
+  assert.throws(() => runPrintedMigration(error));
+  assert.equal(existsSync(legacyGrant), true);
+  assert.equal(existsSync(join(grantsDir(env), 'roster')), false);
   assert.throws(() => loadGrants(env), StrandedLegacyGrantsError);
 }
 
@@ -134,6 +149,7 @@ test('loadGrants migration command moves every accepted ordinary and dot-prefixe
   assert.match(error.message, new RegExp(`'${grantsDir(env)}'`));
   assert.match(error.message, new RegExp(`'${legacy}'`));
   runPrintedMigration(error);
+  assert.equal(existsSync(legacy), false);
   assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), [
     'exact-suffix-grant',
     'hidden-grant',
@@ -141,41 +157,47 @@ test('loadGrants migration command moves every accepted ordinary and dot-prefixe
   ]);
 });
 
-test('loadGrants migration command aborts without moving later grants after a move failure', () => {
-  const home = temp('owenloop-org-legacy-mv-failure-');
+test('loadGrants migration command moves the legacy directory in one rename', () => {
+  const home = temp('owenloop-org-legacy-rename-');
   const env = { HOME: home };
   const legacy = join(home, '.owenloop', 'roster');
   mkdirSync(legacy, { recursive: true });
   writeFileSync(join(legacy, 'a.grant.dsse'), 'first-grant');
   writeFileSync(join(legacy, 'b.grant.dsse'), 'later-grant');
-  const fakeBin = temp('owenloop-org-fake-mv-');
-  writeFileSync(
-    join(fakeBin, 'mv'),
-    '#!/bin/sh\ncase "$1" in\n  */a.grant.dsse) exit 42;;\nesac\nexec /bin/mv "$@"\n',
-    { mode: 0o755 },
-  );
 
   const error = strandedError(env);
-  assert.throws(
-    () => runPrintedMigration(error, { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}` }),
-  );
-  assert.equal(existsSync(join(legacy, 'a.grant.dsse')), true);
-  assert.equal(existsSync(join(legacy, 'b.grant.dsse')), true);
-  assert.equal(existsSync(join(grantsDir(env), 'b.grant.dsse')), false);
+  assert.match(error.message, /Run:  mv /);
+  runPrintedMigration(error);
+  assert.equal(existsSync(legacy), false);
+  assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), ['first-grant', 'later-grant']);
 });
 
-test('loadGrants refuses when the new directory has no grants and legacy grants exist', () => {
+test('loadGrants migration command replaces an empty existing grants directory', () => {
   const home = temp('owenloop-org-legacy-empty-new-');
   const env = { HOME: home };
   mkdirSync(grantsDir(env), { recursive: true });
-  writeFileSync(join(grantsDir(env), 'README'), 'no grants here');
   const legacy = join(home, '.owenloop', 'roster');
   mkdirSync(legacy, { recursive: true });
   writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
 
   const error = strandedError(env);
+  assertRmdirMigration(error, grantsDir(env));
   runPrintedMigration(error);
+  assert.equal(existsSync(legacy), false);
   assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), ['legacy-grant']);
+});
+
+test('loadGrants migration command leaves a nonempty grantless destination untouched', () => {
+  const home = temp('owenloop-org-legacy-nonempty-new-');
+  const env = { HOME: home };
+  mkdirSync(grantsDir(env), { recursive: true });
+  writeFileSync(join(grantsDir(env), 'README'), 'inspect this first');
+  const legacy = join(home, '.owenloop', 'roster');
+  const legacyGrant = join(legacy, 'legacy.grant.dsse');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(legacyGrant, 'legacy-grant');
+
+  assertRmdirRefusesWithoutNesting(env, legacyGrant);
 });
 
 test('loadGrants prints an executable migration command for config paths containing apostrophes', () => {
@@ -190,7 +212,7 @@ test('loadGrants prints an executable migration command for config paths contain
   assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), ['legacy-grant']);
 });
 
-test('loadGrants requires manual repair when the grants destination is a regular file', () => {
+test('loadGrants rmdir guard refuses a grants destination that is a regular file', () => {
   const home = temp('owenloop-org-legacy-broken-new-');
   const env = { HOME: home };
   mkdirSync(join(home, '.owenloop'), { recursive: true });
@@ -199,25 +221,23 @@ test('loadGrants requires manual repair when the grants destination is a regular
   mkdirSync(legacy);
   writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
 
-  assertManualRepair(strandedError(env), grantsDir(env));
-  assert.throws(() => loadGrants(env), StrandedLegacyGrantsError);
+  assertRmdirRefusesWithoutNesting(env, join(legacy, 'legacy.grant.dsse'));
 });
 
-test('loadGrants requires manual repair when the grants destination has a child directory', () => {
+test('loadGrants rmdir guard refuses a grants destination with a child directory', () => {
   const home = temp('owenloop-org-legacy-child-directory-');
   const env = { HOME: home };
   const grants = grantsDir(env);
-  const child = join(grants, 'roster');
+  const child = join(grants, 'leftover-directory');
   mkdirSync(child, { recursive: true });
   const legacy = join(home, '.owenloop', 'roster');
   mkdirSync(legacy);
   writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
 
-  assertManualRepair(strandedError(env), child);
-  assert.throws(() => loadGrants(env), StrandedLegacyGrantsError);
+  assertRmdirRefusesWithoutNesting(env, join(legacy, 'legacy.grant.dsse'));
 });
 
-test('loadGrants requires manual repair when the grants destination has a foreign symlink', () => {
+test('loadGrants rmdir guard refuses a grants destination with a foreign symlink', () => {
   const home = temp('owenloop-org-legacy-foreign-symlink-');
   const env = { HOME: home };
   const grants = grantsDir(env);
@@ -230,11 +250,10 @@ test('loadGrants requires manual repair when the grants destination has a foreig
   mkdirSync(legacy);
   writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
 
-  assertManualRepair(strandedError(env), foreign);
-  assert.throws(() => loadGrants(env), StrandedLegacyGrantsError);
+  assertRmdirRefusesWithoutNesting(env, join(legacy, 'legacy.grant.dsse'));
 });
 
-test('loadGrants requires manual repair when the grants destination is a symlink', () => {
+test('loadGrants rmdir guard refuses a symlinked grants destination', () => {
   const home = temp('owenloop-org-legacy-symlinked-destination-');
   const env = { HOME: home };
   const root = join(home, '.owenloop');
@@ -246,8 +265,21 @@ test('loadGrants requires manual repair when the grants destination is a symlink
   mkdirSync(legacy);
   writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
 
-  assertManualRepair(strandedError(env), grantsDir(env));
-  assert.throws(() => loadGrants(env), StrandedLegacyGrantsError);
+  assertRmdirRefusesWithoutNesting(env, join(legacy, 'legacy.grant.dsse'));
+});
+
+test('loadGrants rmdir guard refuses a dangling symlinked grants destination', () => {
+  const home = temp('owenloop-org-legacy-dangling-grants-');
+  const env = { HOME: home };
+  const root = join(home, '.owenloop');
+  mkdirSync(root, { recursive: true });
+  symlinkSync(join(home, 'missing-grants-target'), grantsDir(env));
+  assert.equal(existsSync(grantsDir(env)), false);
+  const legacy = join(root, 'roster');
+  mkdirSync(legacy);
+  writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
+
+  assertRmdirRefusesWithoutNesting(env, join(legacy, 'legacy.grant.dsse'));
 });
 
 test('loadGrants uses only populated new grants when both directories contain grants', () => {
