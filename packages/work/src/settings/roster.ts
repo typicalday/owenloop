@@ -96,11 +96,15 @@ const CREW_ROSTER_HASH_FILENAME_PREFIX = 'crew-hash--';
 // POSIX filesystems commonly cap a path component at 255 bytes. Leave margin
 // below that limit so the codec cannot turn a hub-valid crew into ENAMETOOLONG.
 const MAX_CREW_ROSTER_FILENAME_BYTES = 240;
-// This is a directory, not a filename prefix, so the codec namespace cannot
-// overlap any legacy one-segment `crews/<crew>.json` filename. In particular,
-// `delivery` and a legacy crew literally named `crew--ZGVsaXZlcnk` remain two
-// distinct files.
-const CREW_ROSTER_ENCODED_DIR = '.owenloop-encoded-rosters';
+// This was the first codec directory used on the feature branch. It can name a
+// valid pre-codec nested legacy crew, so files in it need an explicit `crew`
+// owner before they are treated as codec files.
+const HISTORICAL_CREW_ROSTER_ENCODED_DIR = '.owenloop-encoded-rosters';
+// Hub crew names are at most 64 characters. This 62-character directory plus
+// '/' plus even the shortest codec basename exceeds that limit, making the new
+// codec namespace provably disjoint from every valid legacy `<crew>.json`
+// path while remaining far below the filesystem component limit.
+const CREW_ROSTER_ENCODED_DIR = '.owenloop-machine-roster-codec-namespace-reserved-v1-ownership';
 const WINDOWS_RESERVED_BASENAMES = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
 
 /**
@@ -138,17 +142,13 @@ export function crewNameFromEncodedRosterFilename(filename: string): string | un
 }
 
 /**
- * Return the crew identity stored by a codec-only roster. Reversible codec
- * names carry their identity in the basename; bounded hash names carry it in
- * the JSON document because a hash is intentionally not reversible. Checking
- * that the recorded identity resolves back to this filename prevents a stale
- * or hand-edited document from making doctor inspect a different crew.
+ * Return the authoritative crew identity stored by a codec-only roster.
+ * Reversible basenames are deliberately not authority by themselves: an old
+ * nested legacy path can have the same basename. Every codec file therefore
+ * carries the crew it owns, and that identity must reproduce the basename.
  */
 export function crewNameFromEncodedRosterFile(path: string): string | undefined {
   const filename = basename(path);
-  const decoded = decodeCrewRosterFilename(filename);
-  if (decoded !== undefined) return decoded;
-  if (!filename.startsWith(CREW_ROSTER_HASH_FILENAME_PREFIX) || !filename.endsWith('.json')) return undefined;
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
     if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
@@ -174,8 +174,24 @@ export function encodedCrewRosterDir(env: Record<string, string | undefined>): s
   return containedCrewPath(crewRosterDir(env), CREW_ROSTER_ENCODED_DIR);
 }
 
+function historicalEncodedCrewRosterDir(env: Record<string, string | undefined>): string {
+  return containedCrewPath(crewRosterDir(env), HISTORICAL_CREW_ROSTER_ENCODED_DIR);
+}
+
+function encodedCrewRosterPathIn(
+  env: Record<string, string | undefined>,
+  crew: string,
+  dir: string,
+): string {
+  return containedCrewPath(dir, encodeCrewRosterFilename(crew));
+}
+
 function encodedCrewRosterPath(env: Record<string, string | undefined>, crew: string): string {
-  return containedCrewPath(encodedCrewRosterDir(env), encodeCrewRosterFilename(crew));
+  return encodedCrewRosterPathIn(env, crew, encodedCrewRosterDir(env));
+}
+
+function isOwnedCodecRoster(path: string, crew: string): boolean {
+  return crewNameFromEncodedRosterFile(path) === crew;
 }
 
 function isWindowsNativePathComponent(component: string): boolean {
@@ -235,13 +251,13 @@ function walkCrewRosterFiles(
   root: string,
   current: string,
   visit: (path: string) => void,
-  skipDirectory?: string,
+  skipDirectories?: ReadonlySet<string>,
 ): void {
   for (const entry of readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
     const path = join(current, entry.name);
     if (entry.isDirectory()) {
-      if (current === root && entry.name === skipDirectory) continue;
-      walkCrewRosterFiles(root, path, visit, skipDirectory);
+      if (current === root && skipDirectories?.has(entry.name)) continue;
+      walkCrewRosterFiles(root, path, visit, skipDirectories);
     } else if (entry.isFile() && entry.name.endsWith('.json')) {
       visit(path);
     }
@@ -249,51 +265,53 @@ function walkCrewRosterFiles(
 }
 
 /**
- * Discover the same set of on-disk files that `machineRosterLayers` can use.
- *
- * This is intentionally the one source of truth for both the resolver and
- * doctor: literal root files, contained pre-codec nested files, reversible
- * codec files, and bounded hash files (whose JSON records the crew identity)
- * all enter through this function. A future naming rule cannot make doctor
- * omit a file the resolver reads without changing this shared function.
+ * Discover crew roster files for global doctor diagnostics. Routing never calls
+ * this function: it directly probes only the requested crew's legacy and codec
+ * targets, so an unrelated unreadable or racing subtree cannot refuse an
+ * agent-run before settings and hub layers get a chance to participate.
  */
 export function discoverCrewRosterFiles(env: Record<string, string | undefined>): CrewRosterFile[] {
   const root = crewRosterDir(env);
   if (!existsSync(root)) return [];
   const found: CrewRosterFile[] = [];
 
-  // Legacy is scanned first so an existing literal/nested operator file keeps
-  // the precedence promised by `crewRosterPath` over a later codec target.
+  const historicalDir = historicalEncodedCrewRosterDir(env);
+  const encodedDir = encodedCrewRosterDir(env);
+
+  // Literal/nested legacy files are independent of codec parsing. Keep both
+  // codec directories out of this pass; the historical one is considered
+  // below, where an explicit owner distinguishes its valid old legacy files
+  // from feature-branch codec files.
   walkCrewRosterFiles(root, root, (path) => {
     const crew = legacyCrewNameForPath(root, path);
     if (crew !== undefined) found.push({ crew, path, kind: 'legacy' });
-  }, CREW_ROSTER_ENCODED_DIR);
+  }, new Set([HISTORICAL_CREW_ROSTER_ENCODED_DIR, CREW_ROSTER_ENCODED_DIR]));
 
-  const encodedDir = encodedCrewRosterDir(env);
-  if (!existsSync(encodedDir)) return found;
-  walkCrewRosterFiles(encodedDir, encodedDir, (path) => {
-    // Codec files only live at the codec root. A nested or malformed file in
-    // this directory is still a pre-existing contained legacy file and must
-    // remain discoverable rather than disappearing during an upgrade.
-    const crew = relative(encodedDir, path) === basename(path)
-      ? crewNameFromEncodedRosterFile(path)
-      : undefined;
-    if (crew !== undefined && samePath(encodedCrewRosterPath(env, crew), path)) {
-      found.push({ crew, path, kind: 'encoded' });
-      return;
-    }
-    const legacyCrew = legacyCrewNameForPath(root, path);
-    if (legacyCrew !== undefined) found.push({ crew: legacyCrew, path, kind: 'legacy' });
-  });
+  if (existsSync(historicalDir)) {
+    walkCrewRosterFiles(historicalDir, historicalDir, (path) => {
+	  const crew = relative(historicalDir, path) === basename(path)
+	    ? crewNameFromEncodedRosterFile(path)
+	    : undefined;
+      if (crew !== undefined && samePath(encodedCrewRosterPathIn(env, crew, historicalDir), path)) {
+	    found.push({ crew, path, kind: 'encoded' });
+	    return;
+      }
+      const legacyCrew = legacyCrewNameForPath(root, path);
+      if (legacyCrew !== undefined) found.push({ crew: legacyCrew, path, kind: 'legacy' });
+    });
+  }
+
+  if (existsSync(encodedDir)) {
+    walkCrewRosterFiles(encodedDir, encodedDir, (path) => {
+	  const crew = relative(encodedDir, path) === basename(path)
+	    ? crewNameFromEncodedRosterFile(path)
+	    : undefined;
+      if (crew !== undefined && samePath(encodedCrewRosterPath(env, crew), path)) {
+	    found.push({ crew, path, kind: 'encoded' });
+      }
+    });
+  }
   return found;
-}
-
-/** Find one discovered roster, preserving legacy's upgrade precedence. */
-export function findCrewRosterFile(
-  env: Record<string, string | undefined>,
-  crew: string,
-): CrewRosterFile | undefined {
-  return discoverCrewRosterFiles(env).find((file) => file.crew === crew);
 }
 
 /**
@@ -311,13 +329,19 @@ export function findCrewRosterFile(
  */
 export function crewRosterPath(env: Record<string, string | undefined>, crew: string): string {
   const dir = crewRosterDir(env);
-  const existing = findCrewRosterFile(env, crew);
-  if (existing !== undefined) return existing.path;
   const legacy = legacyCrewRosterPath(dir, crew);
-  // Earlier builds of this feature used the reversible codec for every new
-  // crew. Retain an already-materialized file through the upgrade before
-  // choosing today's literal-or-bounded representation.
+  if (legacy !== undefined && existsSync(legacy)) return legacy;
+
+  // Retain only historical files that declare this exact codec ownership.
+  // A basename that merely decodes to `crew` can be a pre-upgrade nested
+  // legacy crew, and must never be stolen from it.
+  const historical = encodedCrewRosterPathIn(env, crew, historicalEncodedCrewRosterDir(env));
+  if (existsSync(historical) && isOwnedCodecRoster(historical, crew)) return historical;
+
   const encoded = encodedCrewRosterPath(env, crew);
+  // The new namespace cannot be a valid legacy crew path. Probe it even when
+  // corrupt: machineRosterLayers must parse and fail closed rather than hiding
+  // a malformed strongest-layer file behind an absent layer.
   if (existsSync(encoded)) return encoded;
   return isNativeCrewRosterFilename(crew) ? legacy! : encoded;
 }

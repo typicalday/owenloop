@@ -217,6 +217,26 @@ test('doctor keeps a codec-looking legacy crew literal and separately inspects t
   assertNoOlpErr(t);
 });
 
+test('doctor seeds verified agent crews so a malformed bounded-hash roster is reported', async () => {
+  const crew = `../${'語'.repeat(61)}`;
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: [crew], token: { plaintext: 'olp_live' } }] });
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, env: { PATH: pathDir(false) } });
+  seedHuman(t.store);
+  seedAgentSlot(t.store, 'worker', 'olp_live');
+  writeSettings(t.io.env, ORIGIN);
+
+  const path = crewRosterPath(t.io.env, crew);
+  assert.match(path, /crew-hash--/u);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, '{"crew":');
+
+  assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  const err = t.err.join('\n');
+  assert.ok(err.includes(`✗ crew roster (${crew}): invalid crew roster at ${path}`), 'doctor reports the same malformed strongest-layer target agent-run would fail closed on');
+  assertNoOlpErr(t);
+});
+
 /** doctor prints its report to stderr and a JSON summary to stdout — scan both for leaks. */
 function assertNoOlpErr(t: { out: string[]; err: string[] }): void {
   assert.doesNotMatch([...t.out, ...t.err].join('\n'), /olp_/, 'no olp_ token on stdout/stderr');

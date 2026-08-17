@@ -7,7 +7,7 @@
  * cache would turn an ordinary hub outage into an order refusal.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { type Roster, validateRoster } from '../agent/capability-model.ts';
@@ -238,6 +238,10 @@ export interface HubRosterCacheWriteOptions {
   remove?: (path: string) => void;
   /** Test seam; the production default makes concurrent writers distinct. */
   tempSuffix?: () => string;
+  /** Test seam for a partial/failed temp-file write after exclusive creation. */
+  writeTemp?: (fd: number, contents: string) => void;
+  /** Test seam for a failed rename after the complete temp file is closed. */
+  rename?: (from: string, to: string) => void;
 }
 
 /** Atomically write a verified snapshot, then drop a prior org snapshot for
@@ -254,8 +258,36 @@ export function writeHubRosterCache(
   // two agent accounts can be attached to the same hub org concurrently.
   const path = hubRosterCachePath(env, verified.origin, verified.orgId, verified.account);
   const temp = `${path}.${(options.tempSuffix ?? randomUUID)()}.tmp`;
-  writeFileSync(temp, `${JSON.stringify(verified, null, 2)}\n`, 'utf8');
-  renameSync(temp, path);
+  const contents = `${JSON.stringify(verified, null, 2)}\n`;
+  let tempOwned = false;
+  let fd: number | undefined;
+  try {
+    // Exclusive creation establishes ownership before a cleanup path can touch
+    // the name. A UUID collision must leave the other writer's temp intact.
+    fd = openSync(temp, 'wx', 0o600);
+    tempOwned = true;
+    (options.writeTemp ?? ((openFd: number, text: string) => writeFileSync(openFd, text, 'utf8')))(fd, contents);
+    closeSync(fd);
+    fd = undefined;
+    (options.rename ?? renameSync)(temp, path);
+  } catch (error) {
+    if (fd !== undefined) {
+	  try {
+	    closeSync(fd);
+	  } catch {
+	    // Preserve the original write/rename failure; cleanup below still runs.
+	  }
+    }
+    if (tempOwned) {
+	  try {
+	    rmSync(temp, { force: true });
+	  } catch {
+	    // A later refresh can retry. Never replace the I/O failure that caused
+	    // this owned-temp cleanup with a less useful cleanup failure.
+	  }
+    }
+    throw error;
+  }
 
   for (const name of readdirSync(dir)) {
     const sibling = join(dir, name);

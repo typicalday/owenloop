@@ -324,20 +324,25 @@ harnesses.
 Crew names are data, not filesystem paths. A fresh safe crew keeps the literal
 `~/.owenloop/crews/<crew>.json` filename for rollback compatibility. Unsafe or
 too-wide names use the dedicated codec-only
-`~/.owenloop/crews/.owenloop-encoded-rosters/` directory: short names use a
-reversible `crew--<base64url>.json` basename, while names too wide for one
-filesystem component use a bounded `crew-hash--…` basename and record their
-exact `crew` identity inside the JSON document. Do not derive either filename
-by hand. The separate directory is deliberately disjoint from every legacy
-root-level crew filename. Existing safe legacy `<crew>.json` files — including
-names containing spaces, colons, percent signs, Unicode, and (on POSIX)
-backslashes — plus any lexically contained legacy tree such as
-`crews/foo/bar.json` for crew `foo/bar` — remain readable and take precedence,
-so upgrading never replaces a hand-edited strongest layer with an empty
-skeleton. `owenloop doctor` and routing use the same roster-file discovery:
-doctor walks contained legacy paths, decodes reversible codec names, and
-verifies the recorded identity for bounded hash names before inspecting them.
-Traversal-shaped hub crew names stay confined to the `crews/` directory.
+`~/.owenloop/crews/.owenloop-machine-roster-codec-namespace-reserved-v1-ownership/`
+directory: short names use a reversible `crew--<base64url>.json` basename,
+while names too wide for one filesystem component use a bounded
+`crew-hash--…` basename. Every codec file records its exact `crew` identity in
+the JSON document, so a reversible basename alone can never claim an old
+legacy file. Do not derive either filename by hand. The directory name is long
+enough that it cannot be part of any valid legacy crew name, making the new
+codec namespace disjoint from legacy paths. Existing safe legacy
+`<crew>.json` files — including names containing spaces, colons, percent
+signs, Unicode, and (on POSIX) backslashes — plus any lexically contained
+legacy tree such as `crews/foo/bar.json` for crew `foo/bar` — remain readable
+and take precedence, so upgrading never replaces a hand-edited strongest layer
+with an empty skeleton. The short-lived feature-branch directory
+`.owenloop-encoded-rosters/` is treated as codec storage only when a file
+declares the matching `crew`; otherwise it remains a legacy nested path.
+Routing probes only its requested crew paths. Doctor combines global file
+diagnostics with the verified agent's crew list, so a malformed bounded hash
+file is reported rather than silently disappearing. Traversal-shaped hub crew
+names stay confined to the `crews/` directory.
 
 A clean start or `--once` completion exits `0`. `owenloop shift --help` also
 exits `0`. Runtime failures such as credential reads or socket/runtime setup

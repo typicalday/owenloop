@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, relative } from 'node:path';
 import { test } from 'node:test';
@@ -134,6 +134,44 @@ test('cache reads choose the newest valid matching snapshot after an interrupted
     assert.equal(read.kind, 'hit');
     assert.equal(read.data.orgId, 'new-org');
     assert.equal(read.data.fetchedAt, 200);
+  });
+});
+
+test('cache writes exclusively own and clean partial or failed-rename temp files', () => {
+  withHome((_home, env) => {
+    const path = hubRosterCachePath(env, origin, 'org_1');
+    const temp = `${path}.occupied.tmp`;
+    mkdirSync(hubRosterCacheDir(env), { recursive: true });
+    writeFileSync(temp, 'another writer owns this');
+    assert.throws(
+      () => writeHubRosterCache(env, entry(), { tempSuffix: () => 'occupied' }),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === 'EEXIST',
+    );
+    assert.equal(readFileSync(temp, 'utf8'), 'another writer owns this', 'a colliding temp was never ours to clean');
+
+    const partialTemp = `${path}.partial.tmp`;
+    assert.throws(
+      () => writeHubRosterCache(env, entry(), {
+	tempSuffix: () => 'partial',
+	writeTemp: (fd, contents) => {
+	  writeFileSync(fd, contents.slice(0, 8), 'utf8');
+	  throw new Error('disk full');
+	},
+      }),
+      /disk full/u,
+    );
+    assert.equal(existsSync(partialTemp), false, 'an owned partial temp is cleaned');
+
+    const renameTemp = `${path}.rename-failed.tmp`;
+    assert.throws(
+      () => writeHubRosterCache(env, entry(), {
+	tempSuffix: () => 'rename-failed',
+	rename: () => { throw new Error('rename refused'); },
+      }),
+      /rename refused/u,
+    );
+    assert.equal(existsSync(renameTemp), false, 'an owned complete temp is cleaned when rename fails');
+    assert.equal(existsSync(path), false, 'no cache snapshot is installed after either failed attempt');
   });
 });
 

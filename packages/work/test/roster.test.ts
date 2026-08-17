@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative } from 'node:path';
 import assert from 'node:assert/strict';
@@ -150,6 +150,54 @@ test('shared roster discovery makes nested legacy files visible to both doctor a
     assert.equal(crewRosterPath({ HOME: home }, crew), discovered[0]!.path);
     assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.model, 'nested-model');
   } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a codec-looking pre-upgrade nested legacy roster keeps its own crew identity', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-codec-migration-'));
+  try {
+    const env = { HOME: home };
+    const crews = join(home, '.owenloop', 'crews');
+    const decodedCrew = 'foo/bar';
+    const encodedFilename = encodeCrewRosterFilename(decodedCrew);
+    const legacyCrew = `.owenloop-encoded-rosters/${encodedFilename.slice(0, -'.json'.length)}`;
+    const legacyPath = join(crews, `${legacyCrew}.json`);
+    mkdirSync(dirname(legacyPath), { recursive: true });
+    writeFileSync(legacyPath, JSON.stringify({ roster: { build: candidate('legacy', 'legacy-model') } }));
+
+    // The historical directory and reversible basename are not proof that this
+    // pre-upgrade nested file belongs to foo/bar. It remains the literal crew.
+    assert.equal(crewRosterPath(env, legacyCrew), legacyPath);
+    const codecPath = crewRosterPath(env, decodedCrew);
+    assert.equal(codecPath, join(encodedCrewRosterDir(env), encodedFilename));
+    assert.notEqual(codecPath, legacyPath);
+    mkdirSync(dirname(codecPath), { recursive: true });
+    writeFileSync(codecPath, JSON.stringify({ crew: decodedCrew, roster: { build: candidate('codec', 'codec-model') } }));
+
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, legacyCrew)).build?.candidates[0]?.model, 'legacy-model');
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, decodedCrew)).build?.candidates[0]?.model, 'codec-model');
+    assert.deepEqual(
+      discoverCrewRosterFiles(env).map((file) => `${file.crew}\0${file.path}`).sort(),
+      [`${legacyCrew}\0${legacyPath}`, `${decodedCrew}\0${codecPath}`].sort(),
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('routing directly probes one crew without traversing unrelated roster subtrees', { skip: process.platform === 'win32' }, () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-direct-probe-'));
+  const unreadable = join(home, '.owenloop', 'crews', 'unreadable');
+  try {
+    const crews = join(home, '.owenloop', 'crews');
+    mkdirSync(unreadable, { recursive: true });
+    writeFileSync(join(crews, 'delivery.json'), JSON.stringify({ roster: { build: candidate('machine', 'model') } }));
+    chmodSync(unreadable, 0o000);
+
+    assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, 'delivery')).build?.candidates[0]?.harness, 'machine');
+  } finally {
+    chmodSync(unreadable, 0o700);
     rmSync(home, { recursive: true, force: true });
   }
 });

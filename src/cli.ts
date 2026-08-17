@@ -7676,35 +7676,39 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
     }
   }
 
-  // Crew-roster diagnostics are informational per crew. Discovery and the
-  // worker's strongest-layer resolver deliberately share one function, so a
-  // nested legacy path or a bounded codec file cannot be routable yet absent
-  // from doctor.
+  // Crew-roster diagnostics are informational per crew. Global disk discovery
+  // complements the verified agent's authoritative crew list: a malformed
+  // bounded-hash file cannot decode its own identity, but the worker still
+  // resolves that requested deterministic target and must fail closed on it.
+  const crewNames = new Set<string>();
   try {
-    const crews = [...new Set(discoverCrewRosterFiles(io.env).map((file) => file.crew))].sort();
-    for (const crew of crews) {
-      try {
+    for (const file of discoverCrewRosterFiles(io.env)) crewNames.add(file.crew);
+  } catch (error) {
+    record('crew roster discovery', false, error instanceof Error ? error.message : String(error), false);
+  }
+  if (agentProbe.verified?.identity !== undefined) {
+    for (const crew of agentProbe.verified.identity.crews) crewNames.add(crew);
+  }
+  for (const crew of [...crewNames].sort()) {
+    try {
 	const settings = loadSettings(io.env);
 	const layers = effectiveRosterLayers(io.env, crew, { origin: settings.hubOrigin, account: io.env.OWENLOOP_ACCOUNT ?? 'default' });
-        const merged = mergeRosterLayers(layers);
-        const found = layers
-          .map((layer) => `${layer.source}=${layer.roster === undefined ? 'absent' : 'found'}`)
-          .join(', ');
-        const harnesses = [...new Set(Object.values(merged).flatMap((entry) => entry.candidates.map((candidate) => candidate.harness)))];
-        const present = harnesses.filter((id) => adapterFor(id) !== undefined);
-        const missing = harnesses.filter((id) => adapterFor(id) === undefined);
-        record(
-          `crew roster (${crew})`,
-          true,
-          `layers: ${found}; harnesses present: ${present.join(', ') || 'none'}; missing: ${missing.join(', ') || 'none'}`,
-          false,
-        );
-      } catch (error) {
-        record(`crew roster (${crew})`, false, error instanceof Error ? error.message : String(error), false);
-      }
+      const merged = mergeRosterLayers(layers);
+      const found = layers
+	.map((layer) => `${layer.source}=${layer.roster === undefined ? 'absent' : 'found'}`)
+	.join(', ');
+      const harnesses = [...new Set(Object.values(merged).flatMap((entry) => entry.candidates.map((candidate) => candidate.harness)))];
+      const present = harnesses.filter((id) => adapterFor(id) !== undefined);
+      const missing = harnesses.filter((id) => adapterFor(id) === undefined);
+      record(
+	`crew roster (${crew})`,
+	true,
+	`layers: ${found}; harnesses present: ${present.join(', ') || 'none'}; missing: ${missing.join(', ') || 'none'}`,
+	false,
+      );
+    } catch (error) {
+      record(`crew roster (${crew})`, false, error instanceof Error ? error.message : String(error), false);
     }
-  } catch (error) {
-    record('crew roster', false, error instanceof Error ? error.message : String(error), false);
   }
 
   // plugins (rendered; non-core while PLUGIN_CHECK_FATAL is false)
