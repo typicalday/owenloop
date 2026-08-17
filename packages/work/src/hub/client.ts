@@ -38,6 +38,8 @@ import type {
   ReleaseResponse,
   RejectRequest,
   RejectResponse,
+  RetryArtifactRequest,
+  RetryArtifactResponse,
   ReportResolutionRequest,
   ReportResolutionResponse,
   SubmitRequest,
@@ -68,9 +70,20 @@ export interface HubClient {
    * ESCALATION: the worker stops and asks a human about an artifact it OWES.
    * Distinct from `reject`, which is a verdict on somebody else's delivered
    * work. Holds the artifact (no counter moves) until a human answers with
-   * `owenloop retry <workflow> <path> --text "<answer>"`.
+   * `owenloop retry <workflow> <path> --text "<answer>"`, or with
+   * `retryArtifact` on this client.
    */
   ask(req: AskRequest): Promise<AskResponse>;
+  /**
+   * The HUMAN half of the escalation channel and the answer to `ask` above:
+   * re-arm a stalled or rejected artifact to `owed`, resetting its reject
+   * counters. `text` rides to the next producer on the artifact's reason
+   * thread. Omit `text` for a bare stall-clear — the engine supplies its own
+   * default, so do NOT default it here. Human-only by hub RBAC; an agent
+   * token is refused. Optional on this interface for the same reason
+   * `getRosters` is: it was added after the existing HubClient fakes.
+   */
+  retryArtifact?(req: RetryArtifactRequest): Promise<RetryArtifactResponse>;
   /**
    * TOOL APPROVAL — raise AND poll, one idempotent call. The worker is mid-flight
    * and needs yes/no on ONE tool call; unlike `ask`, the session stays alive, the
@@ -168,6 +181,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     submit: (req) => post<SubmitResponse>('submit', req),
     reject: (req) => post<RejectResponse>('reject', req),
     ask: (req) => post<AskResponse>('ask', req),
+    retryArtifact: (req) => post<RetryArtifactResponse>('retry_artifact', req),
     requestApproval: (req) => post<RequestApprovalResponse>('request_approval', req),
     answerApproval: (req) => post<AnswerApprovalResponse>('answer_approval', req),
     listPendingApprovals: () => post<ListPendingApprovalsResponse>('list_pending_approvals', {}),

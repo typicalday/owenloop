@@ -99,7 +99,7 @@ for the full breakdown.
 | `reject <wf> <path> --by <author> --text <msg>` | reject an output (re-arms its producer) |
 | `retract <wf> <path> --by <author> --text <msg>` | drop a collection member |
 | `skip <wf> <path> --by <author> --text <msg>` | a step declines its own output |
-| `retry <wf> <path> [--by a] [--text guidance]` | clear a stall, reset the counter |
+| `retry <wf> <path> [--by a] [--text guidance] [--hub <url>]` | clear a stall and reset the counter, or answer an `ask` — `--hub` targets a hub-hosted run |
 | `close <wf> <run> [--outcome ok\|no_work\|failed\|skipped] [--summary s]` | release a claimed job |
 | `delete <wf>` | delete an instance and all its rows |
 | `adopt <wf>` | re-pin an instance to the current definition and settle any new debts |
@@ -2791,7 +2791,7 @@ or set, not from inference.
 
 ### Tools
 
-The server exposes 19 baseline tools mirroring the hub's own MCP toolset, plus
+The server exposes 20 baseline tools mirroring the hub's own MCP toolset, plus
 `create_agent`, plus four [crew](#crews) tools (`list_crews`, `create_crew`,
 `add_crew_member`, `remove_crew_member`) that do not mirror the hub's own MCP
 toolset. Each baseline tool's result is the hub REST response as one text
@@ -2802,6 +2802,7 @@ block; a non-2xx response comes back as an error result.
 | `whats_next` | tick a workflow and get the next work order(s), or the inbox of started instances |
 | `submit` | submit a work order output |
 | `reject_artifact` | send an upstream artifact back to its producer with a reason |
+| `retry_artifact` | re-arm a stalled or rejected artifact to owed — the human stall-clear, and the answer path for a worker's `ask` |
 | `provide_input` | answer a human gate — provide a value for a seeded/owed input |
 | `start_run` | create a new instance from a definition name |
 | `create_workflow` | parse + load a workflow def YAML (the authoring hard gate) |
@@ -2950,7 +2951,9 @@ owenloop reject $wf pr --by reviewer --text "tests are missing"
 That re-arms `builder` with the reason attached to its next job. Do it past
 `builder`'s `maxAttempts` and `pr` **stalls** — owenloop stops re-arming it
 and waits for a human. `owenloop retry $wf pr --text "use the new fixture"`
-clears the stall and resets the counter.
+clears the stall and resets the counter. `retry --text` is also the answer
+path for a step that escalated with `ask`; pass `--hub <url>` to answer an
+ask on a hub-hosted run.
 
 ## `reap`, `runs`, and `status.inFlight` — observing and clearing in-flight work
 
