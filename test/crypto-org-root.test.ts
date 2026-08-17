@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +18,12 @@ import {
 
 function temp(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
+}
+
+function runPrintedMigration(error: StrandedLegacyGrantsError): void {
+  const match = error.message.match(/Run:  (.+)  then restart/);
+  assert.ok(match !== null, error.message);
+  execFileSync('/bin/sh', ['-c', match[1]!]);
 }
 
 test('org-root paths use HOME/.owenloop and ignore XDG_CONFIG_HOME', () => {
@@ -90,13 +97,20 @@ test('loadGrants refuses when legacy grants are stranded and the new directory i
   mkdirSync(legacy, { recursive: true });
   writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
 
+  let error: StrandedLegacyGrantsError | undefined;
   assert.throws(
     () => loadGrants(env),
-    (error: unknown) => error instanceof StrandedLegacyGrantsError
-      && error.message.includes(grantsDir(env))
-      && error.message.includes(legacy)
-      && error.message.includes('mv '),
+    (thrown: unknown) => {
+      if (!(thrown instanceof StrandedLegacyGrantsError)) return false;
+      error = thrown;
+      return true;
+    },
   );
+  assert.ok(error !== undefined);
+  assert.match(error.message, new RegExp(`'${grantsDir(env)}'`));
+  assert.match(error.message, new RegExp(`'${legacy}'`));
+  runPrintedMigration(error);
+  assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), ['legacy-grant']);
 });
 
 test('loadGrants refuses when the new directory has no grants and legacy grants exist', () => {
@@ -106,6 +120,29 @@ test('loadGrants refuses when the new directory has no grants and legacy grants 
   writeFileSync(join(grantsDir(env), 'README'), 'no grants here');
   const legacy = join(home, '.owenloop', 'roster');
   mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
+
+  let error: StrandedLegacyGrantsError | undefined;
+  assert.throws(
+    () => loadGrants(env),
+    (thrown: unknown) => {
+      if (!(thrown instanceof StrandedLegacyGrantsError)) return false;
+      error = thrown;
+      return true;
+    },
+  );
+  assert.ok(error !== undefined);
+  runPrintedMigration(error);
+  assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), ['legacy-grant']);
+});
+
+test('loadGrants reports stranded legacy grants before a structurally broken destination', () => {
+  const home = temp('owenloop-org-legacy-broken-new-');
+  const env = { HOME: home };
+  mkdirSync(join(home, '.owenloop'), { recursive: true });
+  writeFileSync(grantsDir(env), 'not a directory');
+  const legacy = join(home, '.owenloop', 'roster');
+  mkdirSync(legacy);
   writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
 
   assert.throws(() => loadGrants(env), StrandedLegacyGrantsError);

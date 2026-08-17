@@ -732,8 +732,8 @@ symlinked or non-regular files.
 If `<config>/grants` is absent or contains no `*.grant.dsse` files while the
 pre-rename `<config>/roster` holds grants, owenloop refuses rather than treating
 the machine as unenrolled. It never reads or moves that legacy directory; the
-operator must run `mv '<config>/roster' '<config>/grants'` and restart running
-owenloop shift daemons.
+operator must run `mkdir -p '<config>/grants' && mv '<config>/roster'/*.grant.dsse '<config>/grants'/`
+and restart running owenloop shift daemons.
 
 ## Admin-signed policy floors
 

@@ -77,7 +77,7 @@ export class StrandedLegacyGrantsError extends Error {
     super(
       `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
       `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
-      `cryptographic material for you. Run:  mv '${legacyPath}' '${grantsPath}'  ` +
+      `cryptographic material for you. Run:  mkdir -p '${grantsPath}' && mv '${legacyPath}'/*.grant.dsse '${grantsPath}'/  ` +
       'then restart every running owenloop shift daemon.',
     );
     this.grantsPath = grantsPath;
@@ -134,9 +134,8 @@ function loadEnvelopeDirectory(path: string, suffix: string, label: string): Uin
 
 /** Load sorted `.grant.dsse` bytes from the injected grants directory. */
 export function loadGrants(env: Record<string, string | undefined>): Uint8Array[] {
-  const grants = loadEnvelopeDirectory(grantsDir(env), '.grant.dsse', 'grants');
-  if (grants.length === 0) assertNoStrandedLegacyGrants(env);
-  return grants;
+  assertNoStrandedLegacyGrants(env);
+  return loadEnvelopeDirectory(grantsDir(env), '.grant.dsse', 'grants');
 }
 
 /** Load sorted `.revocation.dsse` bytes from the injected revocation directory. */
