@@ -31,6 +31,8 @@ export interface WorkOrder {
   key?: string;
   index?: number;
   defDigest?: string;
+  /** The composed capabilities the hub offered this order under. */
+  capabilities?: string[];
   /**
    * THE CREWS THE HUB MATCHED for this order's capabilities, in match order.
    * Hub → worker; this is not `serve_crews`, which travels worker → hub to

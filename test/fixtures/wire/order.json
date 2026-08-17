@@ -76,9 +76,39 @@
       "capabilities": ["build:deep"],
       "modifier": "deep",
       "escalated": true
+    },
+    {
+      "run": "run-build-10",
+      "workflow": "build-instance",
+      "step": "builder",
+      "key": "builder",
+      "defDigest": "injected-digest",
+      "inputs": ["plan"],
+      "outputs": ["pr"],
+      "consumes": { "plan": { "text": "resolve stamped crews" } },
+      "owes": [{ "path": "pr", "judgmentRejects": 0, "schemaRejects": 0, "reasons": [] }],
+      "capabilities": ["build:standard"],
+      "crews": ["openai", "anthropic"]
     }
   ],
   "invalid": [
+    {
+      "name": "empty-crew-entry",
+      "value": {
+	"run": "run-build-10",
+	"workflow": "build-instance",
+	"step": "builder",
+	"key": "builder",
+	"defDigest": "injected-digest",
+	"inputs": ["plan"],
+	"outputs": ["pr"],
+	"consumes": { "plan": { "text": "reject blank crew" } },
+	"owes": [{ "path": "pr", "judgmentRejects": 0, "schemaRejects": 0, "reasons": [] }],
+	"capabilities": ["build:standard"],
+	"crews": [""]
+      },
+      "keyword": "minLength"
+    },
     {
       "name": "empty-reroutedFrom-entry",
       "value": {

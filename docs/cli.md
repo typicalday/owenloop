@@ -263,13 +263,19 @@ owenloop shift start build --work-root ~/code --work-root /srv/work
 **Crew roster selection.** A selected roster candidate decides
 the harness, model, and effort for an agent order. Its precedence is:
 
-1. the first available candidate in the first matching crew roster;
+1. the first available candidate in the first matching crew roster named in
+   the hub-stamped `order.crews` sequence;
 2. `owenloop work agent-run --harness` (a local debug override);
 3. the verified step's `x.harness.id`;
 4. the first registered adapter.
 
-The shift passes its start crews to each agent worker internally. The complete
-strongest-first cascade is: machine `~/.owenloop/crews/<crew>.json`, machine
+The shift advertises its start crews to the hub only through worker → hub
+`serve_crews`; it passes no crews to agent workers. For a capability-bearing
+order, the worker resolves rosters only from the hub-stamped `order.crews` list,
+in that stamped order. If the stamp is missing, empty, malformed, or cannot be
+resolved locally, the worker refuses and releases the order rather than falling
+back to the shift's start crews. The complete strongest-first cascade for each
+stamped crew is: machine `~/.owenloop/crews/<crew>.json`, machine
 `~/.owenloop/settings.json` `roster`, the cached hub row for that crew, then
 the cached hub org-global row. Hub rows live in a separate
 `~/.owenloop/hub-rosters/` cache directory — never in the D5 trust
