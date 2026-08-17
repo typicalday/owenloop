@@ -12,11 +12,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
 import { kcHuman, kcKey, makeIdentityHub, makeIo, routedFetch } from './hubkit.ts';
 import { owenloopSettingsPath } from '../src/work-settings.ts';
-import { crewRosterPath, encodeCrewRosterFilename } from '../packages/work/src/settings/roster.ts';
+import { crewRosterPath, encodedCrewRosterDir, encodeCrewRosterFilename } from '../packages/work/src/settings/roster.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
@@ -234,6 +234,28 @@ test('doctor seeds verified agent crews so a malformed bounded-hash roster is re
   assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
   const err = t.err.join('\n');
   assert.ok(err.includes(`✗ crew roster (${crew}): invalid crew roster at ${path}`), 'doctor reports the same malformed strongest-layer target agent-run would fail closed on');
+  assertNoOlpErr(t);
+});
+
+test('doctor reports a boundary-length legacy roster inside the reserved codec directory', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-doctor-codec-boundary-'));
+  const codecDir = encodedCrewRosterDir({ HOME: home });
+  const crew = `${basename(codecDir)}/x`;
+  assert.equal(crew.length, 64, 'the legacy spelling is within the hub crew-name limit');
+  const { routes } = makeIdentityHub({ identities: [{ id: 'agent_w', name: 'worker', crews: [crew], token: { plaintext: 'olp_live' } }] });
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, env: { HOME: home, PATH: pathDir(false) } });
+  seedHuman(t.store);
+  seedAgentSlot(t.store, 'worker', 'olp_live');
+  writeSettings(t.io.env, ORIGIN);
+
+  const path = join(codecDir, 'x.json');
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ roster: {} }));
+  assert.equal(crewRosterPath(t.io.env, crew), path);
+
+  assert.equal(await mainAsync(['doctor', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  assert.ok(t.err.join('\n').includes(`✓ crew roster (${crew})`));
   assertNoOlpErr(t);
 });
 

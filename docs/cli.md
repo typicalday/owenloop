@@ -329,9 +329,12 @@ directory: short names use a reversible `crew--<base64url>.json` basename,
 while names too wide for one filesystem component use a bounded
 `crew-hash--…` basename. Every codec file records its exact `crew` identity in
 the JSON document, so a reversible basename alone can never claim an old
-legacy file. Do not derive either filename by hand. The directory name is long
-enough that it cannot be part of any valid legacy crew name, making the new
-codec namespace disjoint from legacy paths. Existing safe legacy
+legacy file. Do not derive either filename by hand. The reserved directory
+itself can be the prefix of a valid 64-character nested legacy crew name, so a
+file inside it is codec storage only when its JSON `crew` identity reproduces
+its codec basename; a shorter unowned child remains a legacy path. A complete
+codec path is nevertheless too long to be a hub-valid legacy crew name.
+Existing safe legacy
 `<crew>.json` files — including names containing spaces, colons, percent
 signs, Unicode, and (on POSIX) backslashes — plus any lexically contained
 legacy tree such as `crews/foo/bar.json` for crew `foo/bar` — remain readable

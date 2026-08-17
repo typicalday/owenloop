@@ -137,6 +137,32 @@ test('a contained nested-slash legacy roster remains the strongest layer after u
   }
 });
 
+test('normalized contained legacy crew paths keep their pre-codec strongest roster', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-normalized-legacy-'));
+  try {
+    const env = { HOME: home };
+    const crews = join(home, '.owenloop', 'crews');
+    mkdirSync(crews, { recursive: true });
+    const cases = [
+      { crew: 'foo/../bar', legacy: join(crews, 'bar.json') },
+      { crew: 'foo/./bar', legacy: join(crews, 'foo', 'bar.json') },
+      { crew: 'foo//bar', legacy: join(crews, 'foo', 'bar.json') },
+    ];
+    for (const { legacy } of cases) {
+      mkdirSync(dirname(legacy), { recursive: true });
+      writeFileSync(legacy, JSON.stringify({ roster: { build: candidate('legacy', 'normalized-model') } }));
+    }
+
+    for (const { crew, legacy } of cases) {
+      assert.equal(crewRosterPath(env, crew), legacy, `${crew} preserves its existing normalized legacy target`);
+      assert.equal(mergeRosterLayers(machineRosterLayers(env, crew)).build?.candidates[0]?.model, 'normalized-model');
+      assert.equal(existsSync(join(encodedCrewRosterDir(env), encodeCrewRosterFilename(crew))), false, `${crew} does not select an empty encoded duplicate`);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('shared roster discovery makes nested legacy files visible to both doctor and the resolver', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-discovery-'));
   try {
@@ -181,6 +207,25 @@ test('a codec-looking pre-upgrade nested legacy roster keeps its own crew identi
       discoverCrewRosterFiles(env).map((file) => `${file.crew}\0${file.path}`).sort(),
       [`${legacyCrew}\0${legacyPath}`, `${decodedCrew}\0${codecPath}`].sort(),
     );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('codec-directory discovery keeps a 64-character unowned child as a legacy roster', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-codec-boundary-'));
+  try {
+    const env = { HOME: home };
+    const codecDir = encodedCrewRosterDir(env);
+    const crew = `${basename(codecDir)}/x`;
+    assert.equal(crew.length, 64, 'boundary crew remains hub-valid');
+    const legacy = join(codecDir, 'x.json');
+    mkdirSync(codecDir, { recursive: true });
+    writeFileSync(legacy, JSON.stringify({ roster: { build: candidate('legacy', 'boundary-model') } }));
+
+    assert.equal(crewRosterPath(env, crew), legacy, 'resolver preserves the contained legacy file');
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, crew)).build?.candidates[0]?.model, 'boundary-model');
+    assert.deepEqual(discoverCrewRosterFiles(env), [{ crew, path: legacy, kind: 'legacy' }], 'doctor discovery uses the same ownership classification');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
