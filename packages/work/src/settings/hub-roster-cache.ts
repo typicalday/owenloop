@@ -6,7 +6,7 @@
  * stale hub rows still lose to every machine-owned row, while rejecting an old
  * cache would turn an ordinary hub outage into an order refusal.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
@@ -81,11 +81,18 @@ export function sanitizeOrgIdForFilename(orgId: string): string {
  * An on-disk cache key must be injective, not merely path-safe. The historical
  * origin sanitizer remains exported for diagnostics/backward compatibility,
  * but it deliberately cannot be the key: distinct origins can sanitize to the
- * same string. Base64url encodes the UTF-8 bytes reversibly without a path
- * separator, so origin, org, and account can coexist unambiguously.
+ * same string. A fixed-size digest avoids both those collisions and a
+ * filesystem component overflow for a valid long origin. The file body is
+ * still fully parsed and matched, so the digest is only an index.
  */
-function cacheKeySegment(value: string): string {
-  return Buffer.from(value, 'utf8').toString('base64url');
+function cacheKey(origin: string, orgId: string, account: string): string {
+  return createHash('sha256')
+    .update(origin, 'utf8')
+    .update('\0', 'utf8')
+    .update(orgId, 'utf8')
+    .update('\0', 'utf8')
+    .update(account, 'utf8')
+    .digest('base64url');
 }
 
 function containedChildPath(dir: string, filename: string): string {
@@ -101,7 +108,7 @@ function containedChildPath(dir: string, filename: string): string {
 export function hubRosterCachePath(env: Env, origin: string, orgId: string, account = 'default'): string {
   return containedChildPath(
     hubRosterCacheDir(env),
-    `cache-v1--${cacheKeySegment(origin)}--${cacheKeySegment(orgId)}--${cacheKeySegment(account)}.json`,
+    `cache-v1--${cacheKey(origin, orgId, account)}.json`,
   );
 }
 

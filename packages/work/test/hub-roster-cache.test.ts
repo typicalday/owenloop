@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { basename, join, relative } from 'node:path';
 import { test } from 'node:test';
 
 import { explainRosterShadows, effectiveRosterLayers, mergeRosterLayers } from '../src/settings/roster.ts';
@@ -92,6 +92,8 @@ test('absent, mismatched, and corrupt caches are harmless misses; cache writes p
     assert.equal(mismatch.kind, 'miss');
     assert.match(mismatch.reason, /cache is for origin/u);
 
+    rmSync(hubRosterCacheDir(env), { recursive: true, force: true });
+    mkdirSync(hubRosterCacheDir(env), { recursive: true });
     const corruptPath = hubRosterCachePath(env, origin, 'bad');
     writeFileSync(corruptPath, '{"version":');
     const corrupt = readHubRosterCache(env, origin, 'default');
@@ -210,6 +212,18 @@ test('a cache path that is not a readable directory is a harmless miss', () => {
 
 test('cache filename sanitization keys an origin without trusting the filename', () => {
   assert.equal(sanitizeOriginForFilename('HTTPS://Hub.Example.com/x'), 'https---hub.example.com-x');
+});
+
+test('a long normalized origin still produces a bounded cache filename and a readable snapshot', () => {
+  withHome((_home, env) => {
+    const longOrigin = `https://${'a'.repeat(180)}.example.test`;
+    const path = hubRosterCachePath(env, longOrigin, 'org_1', 'default');
+    assert.ok(Buffer.byteLength(basename(path), 'utf8') <= 255, 'cache filename must fit one filesystem component');
+    writeHubRosterCache(env, entry({ origin: longOrigin }));
+    const read = readHubRosterCache(env, longOrigin, 'default');
+    assert.equal(read.kind, 'hit');
+    if (read.kind === 'hit') assert.equal(read.path, path);
+  });
 });
 
 test('a never-settling roster refresh is aborted and bounded', async () => {

@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
@@ -75,7 +75,7 @@ test('machineRosterLayers prefers a present crew roster and retains absent paths
 
     const absent = machineRosterLayers({ HOME: home }, 'absent');
     assert.equal(absent[0]?.roster, undefined);
-    assert.equal(absent[0]?.path, join(encodedCrewRosterDir({ HOME: home }), encodeCrewRosterFilename('absent')));
+    assert.equal(absent[0]?.path, join(crews, 'absent.json'));
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -116,6 +116,23 @@ test('traversal-shaped crews use the confined reversible filename codec', () => 
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, JSON.stringify({ roster: { build: candidate('confined', 'model') } }));
     assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.harness, 'confined');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('maximum-width Unicode crews keep a bounded, rollback-safe literal filename', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-unicode-'));
+  try {
+    const crews = join(home, '.owenloop', 'crews');
+    mkdirSync(crews, { recursive: true });
+    const crew = '語'.repeat(64);
+    const path = crewRosterPath({ HOME: home }, crew);
+    assert.equal(path, join(crews, `${crew}.json`), 'safe existing naming remains readable by older versions');
+    assert.ok(Buffer.byteLength(basename(path), 'utf8') <= 240, 'the materialized component fits common filesystem limits');
+    assert.ok(Buffer.byteLength(encodeCrewRosterFilename(crew), 'utf8') <= 240, 'the fallback codec is bounded too');
+    writeFileSync(path, JSON.stringify({ roster: { build: candidate('unicode', 'model') } }));
+    assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.harness, 'unicode');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

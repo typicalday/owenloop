@@ -6,6 +6,7 @@
  * `agent/capability-model.ts`.
  */
 import { existsSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import {
@@ -82,15 +83,26 @@ export function crewRosterDir(env: Record<string, string | undefined>): string {
 }
 
 const CREW_ROSTER_FILENAME_PREFIX = 'crew--';
+const CREW_ROSTER_HASH_FILENAME_PREFIX = 'crew-hash--';
+// POSIX filesystems commonly cap a path component at 255 bytes. Leave margin
+// below that limit so the codec cannot turn a hub-valid crew into ENAMETOOLONG.
+const MAX_CREW_ROSTER_FILENAME_BYTES = 240;
 // This is a directory, not a filename prefix, so the codec namespace cannot
 // overlap any legacy one-segment `crews/<crew>.json` filename. In particular,
 // `delivery` and a legacy crew literally named `crew--ZGVsaXZlcnk` remain two
 // distinct files.
 const CREW_ROSTER_ENCODED_DIR = '.owenloop-encoded-rosters';
 
-/** Reversible, path-segment-safe filename codec for newly materialized crews. */
+/**
+ * Path-segment-safe filename codec for crews that cannot use their legacy
+ * literal filename. Short names retain the reversible form. Extremely large
+ * names use a fixed-size content-addressed form; setup writes the crew name in
+ * the file's note, while ordinary safe names remain literal for rollback.
+ */
 export function encodeCrewRosterFilename(crew: string): string {
-  return `${CREW_ROSTER_FILENAME_PREFIX}${Buffer.from(crew, 'utf8').toString('base64url')}.json`;
+  const reversible = `${CREW_ROSTER_FILENAME_PREFIX}${Buffer.from(crew, 'utf8').toString('base64url')}.json`;
+  if (Buffer.byteLength(reversible, 'utf8') <= MAX_CREW_ROSTER_FILENAME_BYTES) return reversible;
+  return `${CREW_ROSTER_HASH_FILENAME_PREFIX}${createHash('sha256').update(crew, 'utf8').digest('base64url')}.json`;
 }
 
 /** Decode only an exact codec output; ordinary legacy basenames stay literal. */
@@ -134,9 +146,9 @@ function encodedCrewRosterPath(env: Record<string, string | undefined>, crew: st
   return containedCrewPath(encodedCrewRosterDir(env), encodeCrewRosterFilename(crew));
 }
 
-/** A pre-codec file is safe to preserve only when its raw name is one segment. */
+/** A literal roster is rollback-safe only when it fits one filesystem component. */
 function legacyCrewRosterPath(dir: string, crew: string): string | undefined {
-  if (crew.includes('/') || crew.includes('\\')) return undefined;
+  if (crew.includes('/') || crew.includes('\\') || crew.includes('\0') || Buffer.byteLength(`${crew}.json`, 'utf8') > MAX_CREW_ROSTER_FILENAME_BYTES) return undefined;
   return containedCrewPath(dir, `${crew}.json`);
 }
 
@@ -155,7 +167,12 @@ export function crewRosterPath(env: Record<string, string | undefined>, crew: st
   const dir = crewRosterDir(env);
   const legacy = legacyCrewRosterPath(dir, crew);
   if (legacy !== undefined && existsSync(legacy)) return legacy;
-  return encodedCrewRosterPath(env, crew);
+  // Earlier builds of this feature used the reversible codec for every new
+  // crew. Retain an already-materialized file through the upgrade before
+  // choosing today's literal-or-bounded representation.
+  const encoded = encodedCrewRosterPath(env, crew);
+  if (existsSync(encoded)) return encoded;
+  return legacy ?? encoded;
 }
 
 /**

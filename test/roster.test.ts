@@ -40,6 +40,23 @@ test('roster org and registry GET their live read endpoints with a human credent
   assert.equal(calls.filter((call) => call.pathname === '/api/harness_models')[0]!.method, 'GET');
 });
 
+test('roster org preserves an own __proto__ capability and rejects array rosters', async () => {
+  const protoRoster = JSON.parse(
+    '{"global":{"__proto__":[{"harness":"codex","model":"gpt-5","effort":"high"}]},"crews":[]}',
+  ) as unknown;
+  const { fetch } = routedFetch({ 'GET /api/rosters': () => ({ status: 200, json: protoRoster }) });
+  const t = makeIo({ fetch });
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(human));
+  assert.equal(await mainAsync(['roster', 'org', '--hub', ORIGIN], t.io), 0, t.err.join('\n'));
+  const output = JSON.parse(t.out.join('\n')) as { rosters: { global: Record<string, unknown> } };
+  assert.deepEqual(output.rosters.global['__proto__'], [{ harness: 'codex', model: 'gpt-5', effort: 'high' }]);
+
+  const malformed = makeIo({ fetch: routedFetch({ 'GET /api/rosters': () => ({ status: 200, json: { global: [], crews: [] } }) }).fetch });
+  malformed.store.set(kcHuman(ORIGIN), JSON.stringify(human));
+  assert.equal(await mainAsync(['roster', 'org', '--hub', ORIGIN], malformed.io), 1);
+  assert.match(malformed.err.join('\n'), /roster must be an object/u);
+});
+
 test('roster read verbs reject malformed 2xx bodies and preserve credential exit code 3', async () => {
   for (const [args, route, body] of [
     [['roster', 'org', '--hub', ORIGIN], 'GET /api/rosters', { global: {}, crews: [{}] }],
@@ -110,6 +127,11 @@ test('each roster form rejects flags belonging to another form before credential
     assert.match(t.err.join('\n'), /not valid for this roster command/u);
     assert.equal(calls.length, 0, `${args.join(' ')} must fail before hub I/O`);
   }
+});
+
+test('roster forms retain global --db and --defs options while narrowing their own flags', async () => {
+  const t = makeIo({ fetch: routedFetch({}).fetch });
+  assert.equal(await mainAsync(['roster', 'show', '--db', 'ignored.db', '--defs', 'ignored-defs'], t.io), 0, t.err.join('\n'));
 });
 
 test('roster mutations reject malformed or wrong-verb 2xx responses', async () => {

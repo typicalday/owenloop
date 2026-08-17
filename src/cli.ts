@@ -1751,7 +1751,9 @@ function validateRosterMutationSuccess(endpoint: string, body: unknown): RosterM
 function validateRosterRows(value: unknown, prefix: string): Record<string, Array<{ harness: string; model: string; effort: string }>> {
   const row = recordOf(value);
   if (row === null) throw new CliError(`${prefix} — roster must be an object`);
-  const result: Record<string, Array<{ harness: string; model: string; effort: string }>> = {};
+  // Hub capability names may legally collide with Object.prototype (notably
+  // `__proto__`). A normal object assignment would mutate/drop that row.
+  const result = Object.create(null) as Record<string, Array<{ harness: string; model: string; effort: string }>>;
   for (const [capability, candidates] of Object.entries(row)) {
     if (!Array.isArray(candidates)) throw new CliError(`${prefix} — ${capability} must be an array`);
     result[capability] = candidates.map((candidate, index) => {
@@ -1817,7 +1819,10 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
   // by command form before even an offline read or credential lookup, so a
   // typo never looks like a successful command that silently ignored intent.
   const assertFormOptions = (allowed: readonly string[]): void => {
-    const allowedSet = new Set(allowed);
+    // `--db` and `--defs` are global CLI options. They are admitted before
+    // dispatch for every command and must remain accepted here too; this
+    // narrower check is only for roster-form-specific flags.
+    const allowedSet = new Set([...GLOBAL_OPTIONS, ...allowed]);
     const disallowed = [...args.options.keys()].filter((option) => !allowedSet.has(option));
     if (disallowed.length > 0) {
       throw new CliError(`${disallowed.map((option) => `--${option}`).join(', ')} ${disallowed.length === 1 ? 'is' : 'are'} not valid for this roster command (${USAGE_FORMS})`);
@@ -6330,6 +6335,52 @@ interface SetupStep {
   detail: string;
 }
 
+export interface CrewRosterInstallOptions {
+  /** Test seam for a temporary-name collision before target installation. */
+  tempName?: () => string;
+}
+
+/**
+ * Install a fully-written strongest-layer roster without replacing an
+ * operator's file. Only EEXIST from the final exclusive link is interpreted
+ * as an existing target; failures creating its parent or temporary file stay
+ * failures instead of being misreported as a harmless skip.
+ */
+export function installCrewRosterIfAbsent(
+  path: string,
+  contents: string,
+  options: CrewRosterInstallOptions = {},
+): 'created' | 'existing' {
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true });
+  const temp = join(dir, options.tempName?.() ?? `.${randomUUID()}.roster.tmp`);
+  let tempWritten = false;
+  try {
+    writeFileSync(temp, contents, { encoding: 'utf8', flag: 'wx' });
+    tempWritten = true;
+    try {
+      linkSync(temp, path);
+      return 'created';
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      // EEXIST is meaningful only for the target installation. Verify that it
+      // is a real roster file before calling it an intentional operator file.
+      let target;
+      try {
+	target = lstatSync(path);
+      } catch {
+	throw error;
+      }
+      if (!target.isFile()) throw new Error(`crew roster target exists but is not a regular file: ${path}`);
+      return 'existing';
+    }
+  } finally {
+    if (tempWritten) {
+      try { unlinkSync(temp); } catch { /* target installation already decided; cleanup is best-effort */ }
+    }
+  }
+}
+
 /** One doctor check line: a ✓/✗ label + a distinct detail/remedy. */
 interface DoctorCheck {
   label: string;
@@ -6669,7 +6720,7 @@ export function resolveBundledMarketplaceRoot(harness: HarnessId): string | null
 }
 
 function recordOf(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : null;
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
 function normalizedPluginVersion(value: unknown): string | null {
@@ -7290,19 +7341,14 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
       // Write a complete private temp first, then install it with link(2): the
       // link is exclusive (EEXIST leaves an operator file untouched), while a
       // short write can only leave a removable temp, never a corrupt roster.
-      try {
-	mkdirSync(dirname(path), { recursive: true });
-	const temp = join(dirname(path), `.${randomUUID()}.roster.tmp`);
-	try {
-	  writeFileSync(temp, `${JSON.stringify({ note: `machine-local overrides for crew ${crew}; wins over settings.json and hub rosters — see docs/cli.md`, roster: {} }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
-	  linkSync(temp, path);
-	} finally {
-	  try { unlinkSync(temp); } catch { /* the completed target is already safe; cleanup is best-effort */ }
-	}
+      const installed = installCrewRosterIfAbsent(
+	path,
+	`${JSON.stringify({ note: `machine-local overrides for crew ${crew}; wins over settings.json and hub rosters — see docs/cli.md`, roster: {} }, null, 2)}\n`,
+	);
+	if (installed === 'created') {
 	io.err(`✓ crew roster ${crew}: created`);
 	steps.push({ step: 'crew rosters', action: 'done', detail: `${crew}: ${path}` });
-      } catch (error) {
-	if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+	} else {
 	io.err(`✓ crew roster ${crew}: existing file left untouched`);
 	steps.push({ step: 'crew rosters', action: 'skipped', detail: `${crew}: ${path}` });
       }

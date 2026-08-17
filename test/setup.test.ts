@@ -18,11 +18,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { mainAsync, sanitizeAgentName, lastActiveMs, formatLastActive, resolveBundledMarketplaceRoot } from '../src/cli.ts';
+import { installCrewRosterIfAbsent, mainAsync, sanitizeAgentName, lastActiveMs, formatLastActive, resolveBundledMarketplaceRoot } from '../src/cli.ts';
 import type { AgentIdentitySummary } from '../src/hub.ts';
 import { asAgentIdentities, asRekeyAgentTokenOk } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
@@ -199,6 +199,36 @@ test('setup: existing crew roster is never overwritten', async () => {
     false,
     'an interrupted/exclusive install cleans its complete temporary file when an existing roster wins',
   );
+});
+
+test('setup crew materialization only skips a verified target, not an unrelated EEXIST', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-setup-roster-install-'));
+  try {
+    const path = crewRosterPath({ HOME: home }, 'ops');
+    mkdirSync(dirname(path), { recursive: true });
+
+    // A pre-existing temporary name means the complete-file write did not
+    // start. It must fail rather than falsely claiming the target was skipped.
+    const collision = join(dirname(path), '.collision.roster.tmp');
+    writeFileSync(collision, 'occupied');
+    assert.throws(
+      () => installCrewRosterIfAbsent(path, '{"roster":{}}\n', { tempName: () => '.collision.roster.tmp' }),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === 'EEXIST',
+    );
+    assert.equal(existsSync(path), false);
+    rmSync(collision);
+
+    // EEXIST from the final link is only an existing roster when that target
+    // is an actual file; a directory must not be reported as a safe skip.
+    mkdirSync(path);
+    assert.throws(
+      () => installCrewRosterIfAbsent(path, '{"roster":{}}\n'),
+      /target exists but is not a regular file/u,
+    );
+    assert.equal(readdirSync(dirname(path)).some((entry) => entry.endsWith('.roster.tmp')), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('setup confines traversal-shaped hub crew names to encoded roster filenames', async () => {
