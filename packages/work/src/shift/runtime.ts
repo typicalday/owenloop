@@ -14,6 +14,7 @@ import { performance } from 'node:perf_hooks';
 import { createHubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
+import { syncHubRosterCache } from '../settings/hub-roster-cache.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createShiftLoop, type ShiftLoop } from './loop.ts';
 import { createShiftLogSink } from './logsink.ts';
@@ -43,6 +44,7 @@ const DEFAULT_CAP = 3;
 const DEFAULT_POLL_MS = 5_000;
 const DEFAULT_MAX_AGENTS = 4;
 const DEFAULT_PRESENCE_MS = 60_000;
+const DEFAULT_ROSTER_SYNC_MS = 15 * 60_000;
 
 /**
  * Record types written to the LOG FILE but never delivered over the socket.
@@ -436,6 +438,13 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       ? parsed.workRoots.map((entry) => resolve(process.cwd(), entry))
       : resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd());
   const hub = createHubClient({ origin, getToken: async () => token });
+  // The agent-run child must stay completely offline. Refresh before entering
+  // the park loop, but let an unavailable hub degrade to machine layers.
+  try {
+    await syncHubRosterCache({ client: hub, env, origin, account });
+  } catch (error) {
+    process.stderr.write(`${roleLabel}: roster sync failed at shift start: ${errMsg(error)} (continuing)\n`);
+  }
   const monotonicNow = () => performance.now();
   const home = [env.HOME, env.USERPROFILE].find(
     (value) => value !== undefined && value.trim() !== '',
@@ -577,6 +586,8 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     resolveOrderStep,
     pollIntervalMs,
     presenceIntervalMs: DEFAULT_PRESENCE_MS,
+    rosterSyncIntervalMs: DEFAULT_ROSTER_SYNC_MS,
+    syncRosters: () => syncHubRosterCache({ client: hub, env, origin, account }),
     maxConcurrentAgents,
     workRoot,
     ...(workRepo !== undefined ? { workRepo } : {}),

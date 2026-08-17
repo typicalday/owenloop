@@ -564,6 +564,31 @@ export interface WhoamiResponse extends HubResponse {
   email?: string;
 }
 
+// ---- org rosters ------------------------------------------------------------
+
+/** One model choice in an org-owned roster row. */
+export interface RosterCandidateWire {
+  harness: string;
+  model: string;
+  effort: string;
+}
+
+/** The agent-readable org roster cascade. */
+export interface GetRostersResponse extends HubResponse {
+  global: Record<string, RosterCandidateWire[]>;
+  crews: Array<{
+    crewId: string;
+    crewName: string | null;
+    roster: Record<string, RosterCandidateWire[]>;
+  }>;
+}
+
+/** The hub's current harness/model registry, for roster administration. */
+export interface ListHarnessModelsResponse extends HubResponse {
+  harnesses: Array<{ harness: string; displayName: string }>;
+  models: Array<{ harness: string; model: string; efforts: string[]; updatedAt: number; updatedBy: string }>;
+}
+
 // ---- errors -----------------------------------------------------------------
 
 /**

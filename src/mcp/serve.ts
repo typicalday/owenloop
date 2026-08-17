@@ -400,7 +400,7 @@ function warnMcpUnsigned(deps: McpDeps, reason: string): void {
 }
 
 /**
- * The 17 baseline tools — names, descriptions, and schemas mirror the hub's own
+ * The 19 baseline tools — names, descriptions, and schemas mirror the hub's own
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
  * to an H3 `/api/*` REST mirror. Descriptions say "Scoped Identity" for the identity
  * (wire names keep `agent`), never "tool" (model-doc §0/§10).
@@ -631,6 +631,20 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
         "Your principal's registered Shifts, each with an online/offline flag (derived at read time from its last ping, ~3 min), how long since it was last seen, the crews it serves (returned as `crews`; an empty list means every crew this principal belongs to, not none), and the reporting process incarnation (`shiftId`/`startedAt`) when the hub recorded one.",
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       handler: passthrough(deps, () => ({ method: 'GET', path: '/api/shifts' })),
+    },
+    {
+      name: 'get_rosters',
+      description:
+	"The org's roster cascade: one org-global capability table plus optional per-crew tables. These rows select harness/model/effort after the hub has already routed work to a crew.",
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      handler: passthrough(deps, () => ({ method: 'GET', path: '/api/rosters' })),
+    },
+    {
+      name: 'list_harness_models',
+      description:
+	"The hub's known harnesses and model snapshots, including each model's supported effort values. Read-only; roster writes stay in the terminal CLI.",
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      handler: passthrough(deps, () => ({ method: 'GET', path: '/api/harness_models' })),
     },
     {
       name: 'wake',

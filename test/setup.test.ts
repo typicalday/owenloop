@@ -18,7 +18,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -137,7 +137,7 @@ async function runPluginSetup(
 
 // ---- Flow A: fresh machine ---------------------------------------------------
 
-test('setup: fresh machine, scripted --new-agent runs steps 2-7 in order and converges', async () => {
+test('setup: fresh machine, scripted --new-agent runs steps 2-8 in order and converges', async () => {
   const { routes } = makeIdentityHub();
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch, onOpenUrl: driveCallback() });
@@ -147,7 +147,7 @@ test('setup: fresh machine, scripted --new-agent runs steps 2-7 in order and con
 
   // Step banners appear in order on stderr.
   const errText = t.err.join('\n');
-  const order = ['[1/7]', '[2/7]', '[3/7]', '[4/7]', '[5/7]', '[6/7]', '[7/7]'];
+  const order = ['[1/8]', '[2/8]', '[3/8]', '[4/8]', '[5/8]', '[6/8]', '[7/8]', '[8/8]'];
   let last = -1;
   for (const marker of order) {
     const at = errText.indexOf(marker);
@@ -170,6 +170,9 @@ test('setup: fresh machine, scripted --new-agent runs steps 2-7 in order and con
   // owenloop settings written with hubOrigin = the hub.
   const settings = JSON.parse(readFileSync(owenloopSettingsPath(t.io.env), 'utf8'));
   assert.equal(settings.hubOrigin, ORIGIN);
+  const rosterFile = join(t.io.env.HOME!, '.owenloop', 'crews', 'personal-alex.json');
+  assert.equal(existsSync(rosterFile), true, 'setup materializes an empty strongest-layer roster for the agent crew');
+  assert.deepEqual(JSON.parse(readFileSync(rosterFile, 'utf8')).roster, {});
 
   // Machine-readable summary on stdout; doctor ran.
   const summary = JSON.parse(t.out.join('\n'));
@@ -178,6 +181,18 @@ test('setup: fresh machine, scripted --new-agent runs steps 2-7 in order and con
   assert.ok(Array.isArray(summary.doctor.checks) && summary.doctor.checks.length >= 5, 'doctor checks present');
 
   assertNoOlp(t);
+});
+
+test('setup: existing crew roster is never overwritten', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', 'ops'], t.io), 0, t.err.join('\n'));
+  const path = join(t.io.env.HOME!, '.owenloop', 'crews', 'ops.json');
+  const custom = '{"roster":{"build":[{"harness":"codex","model":"local","effort":"high"}]}}\n';
+  writeFileSync(path, custom);
+  assert.equal(await mainAsync(['setup', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  assert.equal(readFileSync(path, 'utf8'), custom);
 });
 
 test('setup: fresh machine interactive — injected prompt names the agent; empty answer accepts the hostname prefill', async () => {
@@ -507,7 +522,7 @@ test('setup plugin: missing bundled root prints instructions and performs no ins
   assertNoOlp(t);
 });
 
-// ---- signing keys: the [4/7] step -------------------------------------------
+// ---- signing keys: the [4/8] step -------------------------------------------
 
 /** The three canonical refs setup must ensure, for the fake hub's identity model
  *  (human actor `user_abc`, machine `local`, and the minted agent's hub id). */
@@ -519,7 +534,7 @@ function expectedRefs(origin: string, agentId: string) {
   ];
 }
 
-test('setup: [4/7] ensures exactly the three canonical refs in human→machine→agent order', async () => {
+test('setup: [4/8] ensures exactly the three canonical refs in human→machine→agent order', async () => {
   const { routes } = makeIdentityHub();
   const { fetch } = routedFetch(routes);
   const t = makeIo({ fetch, onOpenUrl: driveCallback() });

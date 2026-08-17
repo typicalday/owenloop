@@ -127,6 +127,10 @@ export interface ShiftLoopOptions {
   resolveOrderStep?: (order: WorkOrder) => Promise<FetchedStep | undefined>;
   pollIntervalMs: number;
   presenceIntervalMs: number;
+  /** Weak hub-roster cache refresh cadence; undefined disables refresh. */
+  rosterSyncIntervalMs?: number;
+  /** Daemon-owned cache write, injected so failure cannot kill the loop. */
+  syncRosters?: () => Promise<void>;
   /**
    * Max concurrent `agent-run` children (default 4). A SECOND budget, applied
    * ON TOP OF `cap` — never a replacement for it. An agent turn is long and
@@ -342,6 +346,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   // Park state persists across `iterate()` calls (the MCP park reuses it).
   let cursor: number | undefined;
   let lastPresence = Number.NEGATIVE_INFINITY;
+  // Runtime performs the required shift-start refresh before creating this
+  // loop. Start this cadence now so it is not immediately fetched twice.
+  let lastRosterSync = monotonicNow();
   let attendedAt: number | undefined;
   /**
    * Orders returned by `whats_next` are already claimed. If the hub returns more
@@ -1013,6 +1020,23 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   async function iteration(): Promise<number> {
     const backoffActiveAtStart = monotonicNow() < backoffUntil;
     let rateLimitedThisIteration = false;
+
+    // Hub roster cache refresh is low-priority operational work. Its absence is
+    // always a degraded read for children, never a reason to stop dispatch.
+    if (
+      !backoffActiveAtStart &&
+      opts.syncRosters !== undefined &&
+      opts.rosterSyncIntervalMs !== undefined &&
+      monotonicNow() - lastRosterSync >= opts.rosterSyncIntervalMs
+    ) {
+      try {
+	await opts.syncRosters();
+	lastRosterSync = monotonicNow();
+      } catch (e) {
+	rateLimitedThisIteration = noteServerBackoff(e);
+	opts.err(`roster sync failed: ${errMsg(e)} (continuing)`);
+      }
+    }
 
     // Presence when due (starts immediately — this shift exists to conduct).
     // A server backoff suppresses every hub poll, including presence, while local

@@ -7,7 +7,7 @@
  * `realHttpServer` — no ambient network, no real keychain.
  *
  * The load-bearing assertions:
- *   - the handshake advertises the 22 baseline+create_agent+crew tools;
+ *   - the handshake advertises the 24 baseline+create_agent+crew tools;
  *     `stage_enrollment` is gated (Decision 7);
  *   - a `tools/call` becomes ONE authenticated `/api/*` request and the REST
  *     reply maps to a tool result (2xx → body, non-2xx → isError);
@@ -126,7 +126,7 @@ function resultJson(frame: Frame): unknown {
 
 // ---- handshake + tool advertising -------------------------------------------
 
-test('mcp: handshake advertises 22 tools (17 baseline + create_agent + 4 crew tools); stage_enrollment is hidden when the probe 404s', async () => {
+test('mcp: handshake advertises 24 tools (19 baseline + create_agent + 4 crew tools); stage_enrollment is hidden when the probe 404s', async () => {
   // Probe hits POST /api/stage_enrollment → 404 (route unregistered) → hidden.
   const routes: Record<string, RouteHandler> = { 'POST /api/stage_enrollment': () => ({ status: 404, json: { error: 'not_found' } }) };
   const { fetch } = routedFetch(routes);
@@ -139,11 +139,11 @@ test('mcp: handshake advertises 22 tools (17 baseline + create_agent + 4 crew to
   assert.notEqual(serverInfo.version, '0.0.1');
   assert.equal(serverInfo.version, PACKAGE_VERSION);
   const names = frames[1]!.result!.tools!.map((x) => x.name);
-  assert.equal(names.length, 22, names.join(','));
+  assert.equal(names.length, 24, names.join(','));
   assert.ok(names.includes('create_agent'));
   assert.ok(!names.includes('stage_enrollment'));
-  // Sanity: the 17 baseline names are all present.
-  for (const n of ['whats_next', 'submit', 'reject_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'wake']) {
+  // Sanity: the 19 baseline names are all present.
+  for (const n of ['whats_next', 'submit', 'reject_artifact', 'provide_input', 'start_run', 'create_workflow', 'get_workflow', 'list_workflows', 'get_status', 'heartbeat', 'get_order', 'release', 'publish_event', 'list_subscriptions', 'presence_ping', 'list_shifts', 'get_rosters', 'list_harness_models', 'wake']) {
     assert.ok(names.includes(n), `missing ${n}`);
   }
   // The four crew tools are all present.
@@ -201,6 +201,22 @@ test('mcp: a baseline tool call becomes ONE authenticated POST and maps the 2xx 
   assert.equal(whats.length, 1, 'exactly one hub call for the tool');
   assert.equal(whats[0]!.authorization, 'Bearer mcpat_human', 'the human bearer rode the Authorization header');
   assert.deepEqual(JSON.parse(whats[0]!.body!), { workflow: 'wf' });
+});
+
+test('mcp: get_rosters and list_harness_models are authenticated GET passthroughs', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/stage_enrollment': () => ({ status: 404, json: {} }),
+    'GET /api/rosters': () => ({ status: 200, json: { global: {}, crews: [] } }),
+    'GET /api/harness_models': () => ({ status: 200, json: { harnesses: [], models: [] } }),
+  };
+  const { fetch, calls } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  seedHuman(t);
+  const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'get_rosters'), call(4, 'list_harness_models')]);
+  assert.deepEqual(resultJson(frames[1]!), { global: {}, crews: [] });
+  assert.deepEqual(resultJson(frames[2]!), { harnesses: [], models: [] });
+  assert.equal(calls.filter((row) => row.pathname === '/api/rosters')[0]!.method, 'GET');
+  assert.equal(calls.filter((row) => row.pathname === '/api/harness_models')[0]!.method, 'GET');
 });
 
 test('mcp: judge submit signs the exact judged version from the claim fingerprint', async () => {

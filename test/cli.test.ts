@@ -278,7 +278,7 @@ test('COMMAND_OPTIONS covers exactly the commands USAGE advertises', () => {
   assert.deepEqual([...tableKeys].sort(), [...advertised].sort());
 });
 
-test('roster show prints merged candidates, provenance, and absent layers', () => {
+test('roster show prints merged candidates, provenance, and absent layers', async () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-cli-'));
   try {
     const config = join(home, '.owenloop');
@@ -295,7 +295,7 @@ test('roster show prints merged candidates, provenance, and absent layers', () =
     const out: string[] = [];
     const err: string[] = [];
     assert.equal(
-      main(['roster', 'show', 'delivery'], {
+      await mainAsync(['roster', 'show', 'delivery'], {
         cwd: home,
         env: { HOME: home },
         out: (line) => out.push(line),

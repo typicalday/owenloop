@@ -23,6 +23,8 @@ import type {
   AnswerApprovalResponse,
   AskRequest,
   AskResponse,
+  GetRostersResponse,
+  ListHarnessModelsResponse,
   ListPendingApprovalsResponse,
   RequestApprovalRequest,
   RequestApprovalResponse,
@@ -88,6 +90,10 @@ export interface HubClient {
    */
   reportResolution(req: ReportResolutionRequest): Promise<ReportResolutionResponse>;
   whoami(): Promise<WhoamiResponse>;
+  /** Read the org's roster cascade using this caller's scoped identity. */
+  getRosters?(): Promise<GetRostersResponse>;
+  /** Read the hub's known harness/model registry. */
+  listHarnessModels?(): Promise<ListHarnessModelsResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
   wake(cursor?: number): Promise<WakeResponse>;
   /** B4 Shift presence register/refresh. */
@@ -166,6 +172,8 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     listPendingApprovals: () => post<ListPendingApprovalsResponse>('list_pending_approvals', {}),
     reportResolution: (req) => post<ReportResolutionResponse>('report_resolution', req),
     whoami: () => get<WhoamiResponse>('whoami'),
+    getRosters: () => get<GetRostersResponse>('rosters'),
+    listHarnessModels: () => get<ListHarnessModelsResponse>('harness_models'),
     // Cursor is an opaque non-negative integer; omit it entirely to bootstrap
     // (the hub treats missing/invalid as a `changed: true` first sweep).
     wake: (cursor) =>

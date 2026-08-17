@@ -73,7 +73,13 @@ for the full breakdown.
 | `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]` | onboard this machine: may store human and Scoped Identity credentials, ensure the three principal signing keys, relay the machine enrollment grant, write only execution-settings `hubOrigin`, and converge the bundled plugins for Claude Code and Codex — see [`setup`](#setup--onboard-a-machine) |
 | `enrollments [--hub <url>]` | read and locally classify the hub's relayed machine enrollment grants; never creates keys or writes the roster — see [`enrollments`](#enrollments--inspect-machine-enrollment) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
-| `roster show [crew]` | print the merged **crew roster** and the provenance of every selected candidate layer |
+| `roster show [crew]` | print the offline merged **crew roster**, all inspected machine and cached-hub layers, winner provenance, cache age, and shadowed rows |
+| `roster org [--hub <url>]` | read the live hub org-global and per-crew rosters (human credential) |
+| `roster org put <capability> --candidate <harness>:<model>:<effort>… [--crew <name>] [--hub <url>]` | replace one org-global or named crew roster row (human admin credential) |
+| `roster org rm <capability> [--crew <name>] [--hub <url>]` | remove one org-global or named crew roster row (human admin credential) |
+| `roster registry [--hub <url>]` | read the hub's known harnesses, models, and efforts (human credential) |
+| `roster registry put <harness> --model <model>:<effort,effort…>… [--display-name <text>] [--hub <url>]` | replace one harness's full hub model snapshot (human admin credential) |
+| `roster sync [--hub <url>] [--as agent\|agent:<account>]` | refresh the local hub-roster cache explicitly with the same agent credential a shift uses |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
 | `work <subcommand> [options]` | run the execution-side CLI companion — see [`work`](#work--execution-side-cli-companion) |
@@ -264,14 +270,24 @@ the harness, model, and effort for an agent order. Its precedence is:
 3. the verified step's `x.harness.id`;
 4. the first registered adapter.
 
-The shift passes its start crews to each agent worker internally. A named crew
-uses `~/.owenloop/crews/<crew>.json` above the machine-global
-`~/.owenloop/settings.json` `roster` key. Each capability row is atomic:
+The shift passes its start crews to each agent worker internally. The complete
+strongest-first cascade is: machine `~/.owenloop/crews/<crew>.json`, machine
+`~/.owenloop/settings.json` `roster`, the cached hub row for that crew, then
+the cached hub org-global row. Hub rows live in a separate
+`~/.owenloop/hub-rosters/` cache directory — never in the D5 trust
+`~/.owenloop/roster/` directory. Each capability row is atomic:
 the stronger layer replaces the weaker candidate array, and candidates are
 tried in listed order. A step's `x.harness.id` is a policy constraint: a row
 whose candidates do not include it is released as
 `incompatible-harness-policy`; no available candidate is
 `unresolvable-capability`.
+
+The shift refreshes that hub cache at startup and periodically while parked;
+`owenloop roster sync` is the manual repair path. Failed refreshes never stop a
+shift or refuse an order: a missing or corrupt cache becomes an explicitly
+reported absent layer and the machine rows keep routing. `owenloop roster show`
+is offline by design, so it prints exactly the layers an `agent-run` child can
+see, including fetch age and any lower-priority rows shadowed by a winner.
 
 ```json
 {
@@ -2733,7 +2749,7 @@ or set, not from inference.
 
 ### Tools
 
-The server exposes 17 baseline tools mirroring the hub's own MCP toolset, plus
+The server exposes 19 baseline tools mirroring the hub's own MCP toolset, plus
 `create_agent`, plus four [crew](#crews) tools (`list_crews`, `create_crew`,
 `add_crew_member`, `remove_crew_member`) that do not mirror the hub's own MCP
 toolset. Each baseline tool's result is the hub REST response as one text

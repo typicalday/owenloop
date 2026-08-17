@@ -546,6 +546,21 @@ test('a presence failure does not kill the loop', async () => {
   assert.equal(count(calls, 'wake'), 1); // reached wake despite the presence throw
 });
 
+test('a roster cache refresh failure logs continuing and does not stop dispatch', async () => {
+  const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+  const { spawner } = fakeSpawner();
+  const errors: string[] = [];
+  const code = await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    rosterSyncIntervalMs: 0,
+    syncRosters: async () => { throw new Error('hub unavailable'); },
+    err: (line) => errors.push(line),
+  })).run();
+  assert.equal(code, 0);
+  assert.equal(count(calls, 'wake'), 1);
+  assert.match(errors.join('\n'), /roster sync failed: hub unavailable \(continuing\)/u);
+});
+
 // ---- metering (command lane) ------------------------------------------------
 
 test('over-cap command orders are metered: cap 3 of 5 offered spawn', async () => {

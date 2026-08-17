@@ -204,7 +204,10 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { loadSettings, settingsPath as executionSettingsPath } from '../packages/work/src/settings/settings.ts';
-import { machineRosterLayers, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
+import { effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
+import { readHubRosterCache, syncHubRosterCache } from '../packages/work/src/settings/hub-roster-cache.ts';
+import type { HubClient } from '../packages/work/src/hub/client.ts';
+import type { GetRostersResponse, WhoamiResponse } from '../packages/work/src/hub/types.ts';
 import { adapterFor } from '../packages/work/src/harness/registry.ts';
 import '../packages/work/src/harnesses.ts';
 import { owenloopConfigDir } from './config-dir.ts';
@@ -286,7 +289,7 @@ export interface CliIO {
   /** Optional resolver override for hermetic tests of a missing bundled marketplace. */
   resolveBundledMarketplaceRoot?: (harness: HarnessId) => string | null;
   /**
-   * The principal signing-key manager for `setup`'s `[4/7] signing keys` step.
+   * The principal signing-key manager for `setup`'s `[4/8] signing keys` step.
    * Injectable so setup tests never reach the developer's real `ssh-keygen`,
    * Keychain, libsecret, SSH agent, or `$HOME` (`makeFakePrincipalKeys` in
    * test/hubkit.ts). Default: a real `PrincipalKeyManager` over `io.env`.
@@ -1441,7 +1444,17 @@ ${' '.repeat(41)}and escalations. Unrelated to the local \`show\`, which reads a
   crew member rm <crewId> <principalId> [--hub <url>]   remove a principal from a crew
   setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]   converge this machine's install: human login, agent credential, signing keys, owenloop settings, plugins (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
-  roster show [crew]                      print a merged crew roster and its layer provenance (read-only)
+  roster show [crew]                      print the offline four-layer roster cascade and provenance
+    roster org [--hub <url>]              read the live hub org-global and per-crew rosters (human credential)
+    roster org put <capability> --candidate <harness>:<model>:<effort> [--crew <name>] [--hub <url>]
+${' '.repeat(41)}replace one hub roster row (human admin credential)
+    roster org rm <capability> [--crew <name>] [--hub <url>]
+${' '.repeat(41)}remove one hub roster row (human admin credential)
+    roster registry [--hub <url>]         list hub harnesses, models, and supported efforts (human credential)
+    roster registry put <harness> --model <model>:<effort,effort…> [--display-name <text>] [--hub <url>]
+${' '.repeat(41)}replace a harness's hub model snapshot (human admin credential)
+    roster sync [--hub <url>] [--as agent|agent:<account>]
+${' '.repeat(41)}refresh the local hub-rosters cache with an agent credential
   enrollments [--hub <url>]               list the hub's relayed machine enrollment grants (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   work <subcommand> [args]                run execution-side shift/hold/exec/agent-run/... commands
@@ -1538,7 +1551,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['crew', cmdOpts('hub', 'kind', 'owner')],
   ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'crews', 'scopes', 'reuse-ssh-key')],
   ['doctor', cmdOpts('hub')],
-  ['roster', cmdOpts()],
+  ['roster', cmdOpts('hub', 'crew', 'candidate', 'display-name', 'model', 'as')],
   ['enrollments', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
   ['work', cmdOpts()],
@@ -1644,35 +1657,199 @@ function preflight(command: string, args: Args, io: CliIO): number | undefined {
   return undefined;
 }
 
-function dispatchRoster(io: CliIO, args: Args): number {
-  if (args.positionals[1] !== 'show' || args.positionals.length > 3) {
-    throw new CliError('usage: owenloop roster show [crew]');
+function rosterAge(fetchedAt: number): string {
+  const seconds = Math.max(0, Math.floor((Date.now() - fetchedAt) / 1_000));
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3_600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86_400) return `${Math.floor(seconds / 3_600)}h ago`;
+  return `${Math.floor(seconds / 86_400)}d ago`;
+}
+
+function parseRosterCandidate(value: string): { harness: string; model: string; effort: string } {
+  const first = value.indexOf(':');
+  const lastColon = value.lastIndexOf(':');
+  if (first <= 0 || lastColon <= first || lastColon === value.length - 1) {
+    throw new CliError(`invalid --candidate '${value}' — expected <harness>:<model>:<effort>`);
   }
-  const crew = args.positionals[2];
-  const layers = machineRosterLayers(io.env, crew);
-  const merged = mergeRosterLayers(layers);
-  const hasRoster = layers.some((layer) => layer.roster !== undefined);
-  if (!hasRoster) {
-    io.out(
-      crew === undefined
-        ? 'no machine-global crew roster found'
-        : `no roster layers found for crew ${crew}`,
-    );
-  } else {
+  const harness = value.slice(0, first);
+  const model = value.slice(first + 1, lastColon);
+  const effort = value.slice(lastColon + 1);
+  if (harness.trim() === '' || model.trim() === '' || effort.trim() === '') {
+    throw new CliError(`invalid --candidate '${value}' — every candidate part must be non-empty`);
+  }
+  return { harness, model, effort };
+}
+
+function parseRegistryModel(value: string): { model: string; efforts: string[] } {
+  const colon = value.lastIndexOf(':');
+  if (colon <= 0 || colon === value.length - 1) {
+    throw new CliError(`invalid --model '${value}' — expected <model>:<effort,effort…>`);
+  }
+  const model = value.slice(0, colon);
+  const efforts = value.slice(colon + 1).split(',').map((part) => part.trim()).filter((part) => part !== '');
+  if (model.trim() === '' || efforts.length === 0) throw new CliError(`invalid --model '${value}' — model and efforts are required`);
+  return { model, efforts };
+}
+
+/** `roster` uses the same authenticated REST ladders as `routing`; show stays
+ * fully offline so it reports exactly what an agent-run child would route. */
+async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
+  const USAGE_FORMS =
+    'usage: owenloop roster show [crew] | owenloop roster org [--hub <url>] | ' +
+    'owenloop roster org put <capability> [--crew <name>] --candidate <harness>:<model>:<effort>… [--hub <url>] | ' +
+    'owenloop roster org rm <capability> [--crew <name>] [--hub <url>] | ' +
+    'owenloop roster registry [--hub <url>] | owenloop roster registry put <harness> [--display-name <text>] --model <model>:<effort,effort…>… [--hub <url>] | ' +
+    'owenloop roster sync [--hub <url>] [--as agent|agent:<account>]';
+  const sub = args.positionals[1];
+  if (sub !== 'show' && sub !== 'org' && sub !== 'registry' && sub !== 'sync') {
+    throw new CliError(`unknown roster subcommand '${sub ?? ''}' — ${USAGE_FORMS}`);
+  }
+
+  if (sub === 'show') {
+    if (args.positionals.length > 3) throw new CliError(USAGE_FORMS);
+    const crew = args.positionals[2];
+    const settings = loadSettings(io.env);
+    const account = io.env.OWENLOOP_ACCOUNT ?? 'default';
+    const layers = effectiveRosterLayers(io.env, crew, { origin: settings.hubOrigin, account });
+    const merged = mergeRosterLayers(layers);
+    const cache = settings.hubOrigin === undefined ? undefined : readHubRosterCache(io.env, settings.hubOrigin, account);
+    if (Object.keys(merged).length === 0) io.out(crew === undefined ? 'no roster layers found' : `no roster rows found for crew ${crew}`);
     for (const capability of Object.keys(merged).sort()) {
       const entry = merged[capability]!;
       io.out(`${capability}:`);
       for (const [index, candidate] of entry.candidates.entries()) {
-        io.out(
-          `  [${index}] harness=${candidate.harness} model=${candidate.model} effort=${candidate.effort} from ${entry.source}`,
-        );
+	io.out(`  [${index}] harness=${candidate.harness} model=${candidate.model} effort=${candidate.effort} from ${entry.source}`);
       }
     }
+    io.out('layers inspected:');
+    for (const layer of layers) {
+      const age = layer.source.startsWith('hub ') && cache?.kind === 'hit' ? `; ${rosterAge(cache.data.fetchedAt)}` : '';
+      io.out(`  ${layer.source}: ${layer.roster === undefined ? 'absent' : 'found'}${layer.path === undefined ? '' : ` (${layer.path})`}${age}`);
+    }
+    const shadows = explainRosterShadows(layers);
+    const shadowed = Object.entries(shadows).filter(([, detail]) => detail.shadowed.length > 0).sort(([a], [b]) => a.localeCompare(b));
+    if (shadowed.length > 0) {
+      io.out('shadowed:');
+      for (const [capability, detail] of shadowed) {
+	io.out(`  ${capability}: ${detail.winner} wins; ${detail.shadowed.map((row) => `${row.source} (${row.candidateCount} candidate${row.candidateCount === 1 ? '' : 's'})`).join(', ')} shadowed`);
+      }
+    }
+    return 0;
   }
-  io.out('layers inspected:');
-  for (const layer of layers) {
-    io.out(`  ${layer.source}: ${layer.roster === undefined ? 'absent' : 'found'}${layer.path === undefined ? '' : ` (${layer.path})`}`);
+
+  if (sub !== 'sync' && last(args, 'as') !== undefined) {
+    throw new CliError(`--as is only valid for roster sync (${USAGE_FORMS})`);
   }
+  const crewOption = last(args, 'crew');
+  if (crewOption !== undefined && (args.missingOptionValues.has('crew') || crewOption.trim() === '')) {
+    throw new CliError(`--crew requires a non-empty crew name (${USAGE_FORMS})`);
+  }
+
+  let orgSub: 'get' | 'put' | 'rm' | undefined;
+  let registrySub: 'get' | 'put' | undefined;
+  let capability = '';
+  let harness = '';
+  if (sub === 'org') {
+    const nested = args.positionals[2];
+    if (nested === undefined) orgSub = 'get';
+    else if (nested === 'put' || nested === 'rm') orgSub = nested;
+    else throw new CliError(`unknown roster org subcommand '${nested}' — ${USAGE_FORMS}`);
+    if (orgSub === 'put' || orgSub === 'rm') {
+      capability = args.positionals[3] ?? '';
+      if (capability.trim() === '') throw new CliError(`missing required argument: <capability> (${USAGE_FORMS})`);
+    }
+    const maxPositionals = orgSub === 'get' ? 2 : 4;
+    if (args.positionals.length > maxPositionals) throw new CliError(USAGE_FORMS);
+    if (orgSub === 'put' && all(args, 'candidate').length === 0) throw new CliError(`missing required --candidate (${USAGE_FORMS})`);
+  } else if (sub === 'registry') {
+    const nested = args.positionals[2];
+    if (nested === undefined) registrySub = 'get';
+    else if (nested === 'put') registrySub = 'put';
+    else throw new CliError(`unknown roster registry subcommand '${nested}' — ${USAGE_FORMS}`);
+    if (registrySub === 'put') {
+      harness = args.positionals[3] ?? '';
+      if (harness.trim() === '') throw new CliError(`missing required argument: <harness> (${USAGE_FORMS})`);
+      if (all(args, 'model').length === 0) throw new CliError(`missing required --model (${USAGE_FORMS})`);
+    }
+    const maxPositionals = registrySub === 'get' ? 2 : 4;
+    if (args.positionals.length > maxPositionals) throw new CliError(USAGE_FORMS);
+  } else if (args.positionals.length > 2) {
+    throw new CliError(USAGE_FORMS);
+  }
+
+  const origin = resolveAgentHub(io, args, sub === 'sync' ? 'sync rosters from' : 'manage rosters on');
+  const slot: CredentialSlotSelector = sub === 'sync' ? resolveSlot(args) : { principal: 'human' };
+  if (sub === 'sync' && slot.principal !== 'agent') {
+    throw new CliError(`roster sync requires an agent credential — pass --as agent or --as agent:<account> (${USAGE_FORMS})`);
+  }
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) throw new CliError(emptySlotMessage(origin, slot), { exitCode: 3 });
+
+  const getJson = async (path: string, prefix: string): Promise<unknown> => {
+    const { res, cred: used } = await authedGet(io, origin, slot, cred, path);
+    if (res.status === 401) assertAuthOk(res, used, origin);
+    if (!res.ok) throw new CliError((await hubRequestMessage(res)) ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+    try {
+      return await res.json() as unknown;
+    } catch {
+      throw new CliError(`${prefix}: malformed response — body is not valid JSON`);
+    }
+  };
+
+  if (sub === 'sync') {
+    const account = slot.principal === 'agent' ? slot.account ?? 'default' : 'default';
+    // Use the same sync helper as shift start and periodic refresh. The local
+    // adapter preserves the CLI's credential-refresh/error ladder rather than
+    // bypassing it with a second raw-fetch implementation.
+    const cacheClient = {
+      whoami: async () => getJson('/api/whoami', 'whoami') as Promise<WhoamiResponse>,
+      getRosters: async () => getJson('/api/rosters', 'rosters') as Promise<GetRostersResponse>,
+    } as HubClient;
+    await syncHubRosterCache({
+      client: cacheClient,
+      env: io.env,
+      origin,
+      account,
+    });
+    const cache = readHubRosterCache(io.env, origin, account);
+    if (cache.kind !== 'hit') throw new CliError(`roster sync wrote no readable cache: ${cache.reason}`);
+    print(io, { ok: true, hub: origin, cachePath: cache.path, fetchedAt: cache.data.fetchedAt });
+    return 0;
+  }
+
+  if (sub === 'org' && orgSub === 'get') {
+    print(io, { ok: true, hub: origin, rosters: await getJson('/api/rosters', 'rosters') });
+    return 0;
+  }
+  if (sub === 'registry' && registrySub === 'get') {
+    print(io, { ok: true, hub: origin, registry: await getJson('/api/harness_models', 'harness_models') });
+    return 0;
+  }
+
+  let endpoint: string;
+  let payload: Record<string, unknown>;
+  if (sub === 'org' && orgSub === 'put') {
+    endpoint = 'put_roster';
+    payload = { capability, candidates: all(args, 'candidate').map(parseRosterCandidate), ...(crewOption === undefined ? {} : { crew: crewOption }) };
+  } else if (sub === 'org') {
+    endpoint = 'delete_roster_row';
+    payload = { capability, ...(crewOption === undefined ? {} : { crew: crewOption }) };
+  } else {
+    endpoint = 'put_harness_models';
+    const displayName = last(args, 'display-name');
+    if (displayName !== undefined && (args.missingOptionValues.has('display-name') || displayName.trim() === '')) throw new CliError('--display-name must not be empty');
+    payload = { harness, models: all(args, 'model').map(parseRegistryModel), ...(displayName === undefined ? {} : { displayName }) };
+  }
+  const { res } = await authedPost(io, origin, slot, cred, `/api/${endpoint}`, payload);
+  if (res.status === 401) throw new CliError('credential rejected by the hub — run `owenloop login`', { exitCode: 3 });
+  if (!res.ok) throw new CliError((await hubRequestMessage(res)) ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+  let body: unknown;
+  try {
+    body = await res.json() as unknown;
+  } catch {
+    throw new CliError(`${endpoint}: malformed success response — body is not valid JSON`);
+  }
+  print(io, { ok: true, hub: origin, result: body });
   return 0;
 }
 
@@ -1682,8 +1859,6 @@ function dispatch(command: string, io: CliIO, args: Args): number {
     io.out(USAGE);
     return 0;
   }
-
-  if (command === 'roster') return dispatchRoster(io, args);
 
   if (command === 'lint') {
     const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
@@ -6711,7 +6886,7 @@ async function registerMachineEnrollment(
 }
 
 /**
- * `owenloop setup` — converge this machine's install in seven probe→(skip|act)
+ * `owenloop setup` — converge this machine's install in eight probe→(skip|act)
  * steps, idempotently: a second run performs ZERO writes (no store mutation, no
  * key generation, no settings write, no browser, no mint/rekey/register POST).
  * Each ACT is reached only through its probe failing.
@@ -6805,8 +6980,8 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   const origin = resolveSetupHub(io, args);
   const steps: SetupStep[] = [];
 
-  // --- [1/7] inspect: zero writes, best-effort probes ---
-  io.err('[1/7] inspect');
+  // --- [1/8] inspect: zero writes, best-effort probes ---
+  io.err('[1/8] inspect');
   io.err(`  human credential: ${readCredential(io, origin, { principal: 'human' }) !== null ? 'present' : 'none — will log in'}`);
   const inspectSettingsPath = owenloopSettingsPath(io.env);
   let settingsNote: string;
@@ -6832,8 +7007,8 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   );
   steps.push({ step: 'inspect', action: 'done', detail: 'probed local state' });
 
-  // --- [2/7] human login: the hard gate that makes step 3's rekey legal ---
-  io.err('[2/7] human login');
+  // --- [2/8] human login: the hard gate that makes step 3's rekey legal ---
+  io.err('[2/8] human login');
   let humanCred = readCredential(io, origin, { principal: 'human' });
   let humanIdentity: WhoamiIdentity;
   if (humanCred !== null) {
@@ -6859,8 +7034,8 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     steps.push({ step: 'human login', action: 'done', detail: `signed in as ${humanIdentity.email ?? humanIdentity.actor.id}` });
   }
 
-  // --- [3/7] agent ---
-  io.err('[3/7] agent');
+  // --- [3/8] agent ---
+  io.err('[3/8] agent');
   const { res: idRes } = await authedGet(io, origin, { principal: 'human' }, humanCred, '/api/agent_identities');
   if (idRes.status === 403) {
     throw new CliError('setup needs an admin credential to manage Scoped Identities (hub returned 403)');
@@ -6873,12 +7048,14 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   const probe = await probeAgentSlots(io, origin, [...candidateNames], identities);
 
   let agentAccount: string;
+  let agentCrews: string[] | undefined;
   // The stable principal id for the agent signing key: the hub's agent actor
   // id (`agentId`), which rekey preserves and mint mints fresh.
   let agentPrincipalId: string;
   if (probe.verified !== null) {
     agentAccount = probe.verified.name;
     agentPrincipalId = probe.verified.actorId;
+    agentCrews = probe.verified.identity?.crews;
     const crewsStr = probe.verified.identity ? ` (crews: ${probe.verified.identity.crews.join(', ') || 'none'})` : '';
     io.err(`✓ agent: ${agentAccount}${crewsStr}`);
     steps.push({ step: 'agent', action: 'skipped', detail: `agent:${agentAccount} verified` });
@@ -6911,6 +7088,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
       const result = await mintAgentCredential(io, origin, { principal: 'human' }, humanCred, { name: action.name, crews, scopes });
       agentAccount = action.name;
       agentPrincipalId = result.agentId;
+      agentCrews = result.crews;
       io.err(`✓ agent: minted agent:${agentAccount} (crews: ${result.crews.join(', ') || 'none'}; scopes: ${result.scopes.join(', ')})`);
       steps.push({ step: 'agent', action: 'done', detail: `minted agent:${agentAccount}` });
     } else {
@@ -6922,10 +7100,10 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     }
   }
 
-  // --- [4/7] signing keys: human → machine → agent, idempotently ---
+  // --- [4/8] signing keys: human → machine → agent, idempotently ---
   // Prints kind + state + backend ONLY. Never key bytes, fingerprints,
   // secret-store values, or reused private-key paths.
-  io.err('[4/7] signing keys');
+  io.err('[4/8] signing keys');
   const keys = io.principalKeys ?? new PrincipalKeyManager({ env: io.env });
   const humanRef: PrincipalKeyRef = { origin, kind: 'human', id: humanIdentity.actor.id };
   const machineRef: PrincipalKeyRef = { origin, kind: 'machine', id: 'local' };
@@ -6950,8 +7128,8 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   io.err(`${enrollment.action === 'noted' ? '!' : '✓'} enrollment: ${enrollment.detail}`);
   steps.push(enrollment);
 
-  // --- [5/7] owenloop settings ---
-  io.err('[5/7] owenloop settings');
+  // --- [5/8] owenloop settings ---
+  io.err('[5/8] owenloop settings');
   const settingsPath = owenloopSettingsPath(io.env);
   const existingSettings = readOwenloopSettingsRaw(settingsPath); // corrupt file → hard CliError (never clobber)
   const currentHub = existingSettings && typeof existingSettings.hubOrigin === 'string' ? existingSettings.hubOrigin : undefined;
@@ -6967,8 +7145,30 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     io.err(`non-default agent account — run owenloop work with OWENLOOP_ACCOUNT=${agentAccount}`);
   }
 
-  // --- [6/7] plugin (non-fatal) ---
-  io.err('[6/7] plugin');
+  // --- [6/8] crew rosters ---
+  io.err('[6/8] crew rosters');
+  if (agentCrews === undefined || agentCrews.length === 0) {
+    const detail = 'no crews known for this agent';
+    io.err(`! crew rosters: ${detail}`);
+    steps.push({ step: 'crew rosters', action: 'noted', detail });
+  } else {
+    const crewsDir = join(owenloopConfigDir(io.env), 'crews');
+    mkdirSync(crewsDir, { recursive: true });
+    for (const crew of agentCrews) {
+      const path = join(crewsDir, `${crew}.json`);
+      if (existsSync(path)) {
+	io.err(`✓ crew roster ${crew}: existing file left untouched`);
+	steps.push({ step: 'crew rosters', action: 'skipped', detail: `${crew}: ${path}` });
+      } else {
+	writeFileSync(path, `${JSON.stringify({ note: `machine-local overrides for crew ${crew}; wins over settings.json and hub rosters — see docs/cli.md`, roster: {} }, null, 2)}\n`, 'utf8');
+	io.err(`✓ crew roster ${crew}: created`);
+	steps.push({ step: 'crew rosters', action: 'done', detail: `${crew}: ${path}` });
+      }
+    }
+  }
+
+  // --- [7/8] plugin (non-fatal) ---
+  io.err('[7/8] plugin');
   for (const pluginState of probePlugin(io)) {
     const outcome = installPluginStep(io, pluginState);
     const marker = outcome.action === 'noted' ? '!' : '✓';
@@ -6976,8 +7176,8 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     steps.push({ step: `plugin (${pluginState.id})`, ...outcome });
   }
 
-  // --- [7/7] doctor pass ---
-  io.err('[7/7] doctor');
+  // --- [8/8] doctor pass ---
+  io.err('[8/8] doctor');
   const doctor = await runDoctor(io, origin);
 
   print(io, { ok: doctor.ok, hub: origin, steps, doctor: { ok: doctor.ok, checks: doctor.checks } });
@@ -7177,7 +7377,8 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
       : [];
     for (const crew of crews) {
       try {
-        const layers = machineRosterLayers(io.env, crew);
+	const settings = loadSettings(io.env);
+	const layers = effectiveRosterLayers(io.env, crew, { origin: settings.hubOrigin, account: io.env.OWENLOOP_ACCOUNT ?? 'default' });
         const merged = mergeRosterLayers(layers);
         const found = layers
           .map((layer) => `${layer.source}=${layer.roster === undefined ? 'absent' : 'found'}`)
@@ -7248,7 +7449,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'cancel', 'instance', 'agent', 'capability', 'routing', 'crew', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'cancel', 'instance', 'agent', 'capability', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -7306,6 +7507,8 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
         return await dispatchRouting(io, args);
       case 'crew':
         return await dispatchCrew(io, args);
+      case 'roster':
+	return await dispatchRoster(io, args);
       case 'setup':
         return await dispatchSetup(io, args);
       case 'doctor':

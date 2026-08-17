@@ -61,6 +61,14 @@ wrong:
    takes a list). On the staging hub every shift serves exactly one crew, so
    this shows the shape of the argument rather than a shift that exists today.
 
+The final model choice is a separate **roster** cascade. A shift refreshes the
+hub organization rosters into its local disk cache, then the spawned
+`agent-run` child reads that cache offline. For a named crew the strongest-first
+layers are machine `crews/<crew>.json`, machine `settings.json`, cached hub
+crew roster, and cached hub org-global roster. The cached hub layers are
+deliberately weakest; an unavailable cache is visible in `owenloop roster show`
+but never makes a shift or order fail when a machine row can route it.
+
 ---
 
 ## 2. The three vocabularies, precisely
