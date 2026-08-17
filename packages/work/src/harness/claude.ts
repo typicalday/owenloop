@@ -34,8 +34,11 @@ import type {
   Options,
   PermissionMode,
   Query,
+  SDKAssistantMessage,
   SDKMessage,
+  SDKUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
+import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources';
 
 import type { GatePolicy, GateVerdict } from './gatekeeper.ts';
 import { classifyToolCall } from './gatekeeper.ts';
@@ -849,6 +852,97 @@ export interface TurnOutcome {
   sawResult: boolean;
 }
 
+/** Trim a progress line to something a log can hold. Mirrors the codex adapter's
+ *  convention deliberately — the two adapters' logs are read side by side, so
+ *  they truncate the same way. Kept local because this adapter must stay in one
+ *  allowlisted file. */
+const PROGRESS_TEXT_CAP = 2_000;
+
+function cap(text: string): string {
+  return text.length > PROGRESS_TEXT_CAP ? `${text.slice(0, PROGRESS_TEXT_CAP)}…` : text;
+}
+
+/** Mark messages produced inside a Task-tool subagent. A flat log cannot
+ *  otherwise tell a subagent's work from the main agent's. */
+function origin(parentToolUseId: string | null): string {
+  return parentToolUseId === null ? '' : `[subagent ${parentToolUseId}] `;
+}
+
+/** Flatten a tool_result body to loggable text. Non-text parts are named, not
+ *  rendered — an image block has no useful string form. */
+function toolResultText(content: ToolResultBlockParam['content']): string {
+  if (content === undefined) return '(no content)';
+  if (typeof content === 'string') return content;
+  return content.map((part) => (part.type === 'text' ? part.text : `(${part.type})`)).join('\n');
+}
+
+/** One progress line per content block of an assistant message.
+ *
+ * TOOL INPUTS ARE NEVER LOGGED. A `tool_use` block's `input` can hold a Bash
+ * command line carrying a secret. Only `name` and `id` are emitted — the same
+ * two fields the codex adapter reveals for `item/started mcpToolCall`. */
+function emitAssistant(message: SDKAssistantMessage, onEvent: (e: AgentEvent) => void): void {
+  const from = origin(message.parent_tool_use_id);
+  if (message.error !== undefined) {
+    onEvent({ kind: 'progress', text: `${from}assistant error: ${message.error}` });
+  }
+  for (const block of message.message.content) {
+    switch (block.type) {
+      case 'text':
+        onEvent({ kind: 'progress', text: cap(`${from}assistant: ${block.text}`) });
+        break;
+      case 'thinking':
+        onEvent({ kind: 'progress', text: cap(`${from}thinking: ${block.thinking}`) });
+        break;
+      case 'redacted_thinking':
+        onEvent({ kind: 'progress', text: `${from}thinking: (redacted)` });
+        break;
+      case 'tool_use':
+      case 'mcp_tool_use':
+        onEvent({ kind: 'progress', text: `${from}tool_use ${block.name} ${block.id}` });
+        break;
+      default:
+        // Server-tool results, container uploads, compaction markers and any
+        // block the vendor adds later. Naming the type keeps the line useful
+        // without guessing at a shape this version does not define.
+        onEvent({ kind: 'progress', text: `${from}${block.type} block` });
+    }
+  }
+}
+
+/** One progress line per content block of a user message — which on this path
+ * means tool results coming back, plus any synthetic user text.
+ *
+ * Tool RESULTS are logged (capped); tool INPUTS are not. A result is what the
+ * tool produced, and the codex adapter already logs the equivalent command
+ * output. */
+function emitUser(message: SDKUserMessage, onEvent: (e: AgentEvent) => void): void {
+  const from = origin(message.parent_tool_use_id);
+  const content = message.message.content;
+  if (typeof content === 'string') {
+    onEvent({ kind: 'progress', text: cap(`${from}user: ${content}`) });
+    return;
+  }
+  for (const block of content) {
+    switch (block.type) {
+      case 'text':
+        onEvent({ kind: 'progress', text: cap(`${from}user: ${block.text}`) });
+        break;
+      case 'tool_result': {
+        const flag = block.is_error === true ? ' (error)' : '';
+        const body = toolResultText(block.content);
+        onEvent({
+          kind: 'progress',
+          text: cap(`${from}tool_result ${block.tool_use_id}${flag}: ${body}`),
+        });
+        break;
+      }
+      default:
+        onEvent({ kind: 'progress', text: `${from}${block.type} block` });
+    }
+  }
+}
+
 /**
  * Drive the SDK message stream to TURN END and map it onto `AgentEvent`s.
  *
@@ -908,9 +1002,20 @@ export async function consumeTurn(
       }
       onEvent({ kind: 'turn_ended' });
       return { sessionId, sawResult: true };
+    } else if (message.type === 'assistant') {
+      emitAssistant(message, onEvent);
+    } else if (message.type === 'user') {
+      emitUser(message, onEvent);
     }
     // `needs_input` is NEVER emitted: this SDK path has no blocking-question
     // channel that maps to it, and the contract has no reply channel by design.
+    // `stream_event` is deliberately NOT mapped. The SDK only emits it when
+    // `Options.includePartialMessages` is set, and `buildClaudeOptions` never
+    // sets it — so the branch would be unreachable today, and if it ever
+    // became reachable it would duplicate the text the `assistant` message
+    // already carries. Unrecognized types stay silent by design: the vendor
+    // adds message kinds between releases, and a mapping that threw on one
+    // would turn a routine CLI upgrade into a failed order.
   }
   return { sessionId, sawResult: false };
 }
