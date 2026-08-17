@@ -11,6 +11,7 @@ import {
   decodeCrewRosterFilename,
   encodedCrewRosterDir,
   encodeCrewRosterFilename,
+  isNativeCrewRosterFilename,
   machineRosterLayers,
   mergeRosterLayers,
   type RosterLayer,
@@ -117,6 +118,30 @@ test('a POSIX legacy roster with a literal backslash remains the strongest layer
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+test('a contained nested-slash legacy roster remains the strongest layer after upgrade', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-nested-'));
+  try {
+    const crew = 'foo/bar';
+    const legacy = join(home, '.owenloop', 'crews', 'foo', 'bar.json');
+    mkdirSync(dirname(legacy), { recursive: true });
+    writeFileSync(legacy, JSON.stringify({ roster: { build: candidate('legacy', 'nested-model') } }));
+
+    assert.equal(crewRosterPath({ HOME: home }, crew), legacy, 'an existing contained hierarchy is a legacy migration target');
+    assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.model, 'nested-model');
+    assert.equal(existsSync(join(encodedCrewRosterDir({ HOME: home }), encodeCrewRosterFilename(crew))), false, 'setup must not create an empty encoded duplicate');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('new literal crew roster names obey Windows component rules', () => {
+  assert.equal(isNativeCrewRosterFilename('delivery', 'win32'), true);
+  assert.equal(isNativeCrewRosterFilename('personal:alex', 'win32'), false, 'a colon would select an ADS path');
+  assert.equal(isNativeCrewRosterFilename('CON', 'win32'), false, 'reserved DOS device names are not files');
+  assert.equal(isNativeCrewRosterFilename('LPT9', 'win32'), false, 'the complete reserved-device set is rejected');
+  assert.equal(isNativeCrewRosterFilename('personal:alex', 'darwin'), true, 'a POSIX filename keeps rollback compatibility');
 });
 
 test('traversal-shaped crews use the confined reversible filename codec', () => {

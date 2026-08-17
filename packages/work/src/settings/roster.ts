@@ -92,6 +92,7 @@ const MAX_CREW_ROSTER_FILENAME_BYTES = 240;
 // `delivery` and a legacy crew literally named `crew--ZGVsaXZlcnk` remain two
 // distinct files.
 const CREW_ROSTER_ENCODED_DIR = '.owenloop-encoded-rosters';
+const WINDOWS_RESERVED_BASENAMES = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
 
 /**
  * Path-segment-safe filename codec for crews that cannot use their legacy
@@ -168,16 +169,35 @@ function encodedCrewRosterPath(env: Record<string, string | undefined>, crew: st
   return containedCrewPath(encodedCrewRosterDir(env), encodeCrewRosterFilename(crew));
 }
 
-/** A literal roster is rollback-safe only when it fits one filesystem component. */
+function isWindowsNativePathComponent(component: string): boolean {
+  const hasControlCharacter = [...component].some((char) => char.codePointAt(0)! < 0x20);
+  return component !== '' && component !== '.' && component !== '..' &&
+    !hasControlCharacter && !/[<>:"|?*]/u.test(component) && !/[. ]$/u.test(component) &&
+    !WINDOWS_RESERVED_BASENAMES.test(component);
+}
+
+/**
+ * Whether this crew can be CREATED as one literal filename. This is separate
+ * from legacy discovery: a pre-codec nested `crews/foo/bar.json` is a valid
+ * POSIX/Windows path to preserve, but a new `foo/bar` roster must use the
+ * codec-only directory instead of growing a hand-edited subtree.
+ */
+export function isNativeCrewRosterFilename(crew: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (crew === '' || crew.includes('/') || crew.includes('\\') || crew.includes('\0') || Buffer.byteLength(`${crew}.json`, 'utf8') > MAX_CREW_ROSTER_FILENAME_BYTES) return false;
+  return platform !== 'win32' || isWindowsNativePathComponent(crew);
+}
+
+/** A contained deployed legacy path may be preserved even when new files encode it. */
 function legacyCrewRosterPath(dir: string, crew: string): string | undefined {
-  if (crew.includes('/') || crew.includes('\0') || Buffer.byteLength(`${crew}.json`, 'utf8') > MAX_CREW_ROSTER_FILENAME_BYTES) return undefined;
-  // On POSIX, `\\` is a literal filename character. Let the host path parser
-  // decide whether it is safe, then preserve an existing legacy file when it
-  // remains lexically contained. On Windows the containment check rejects a
-  // backslash that would escape into another path segment.
+  if (crew === '' || crew.includes('\0')) return undefined;
+  const segments = crew.split(process.platform === 'win32' ? /[\\/]/u : /\//u);
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..' ||
+    (process.platform === 'win32' && !isWindowsNativePathComponent(segment)))) return undefined;
   try {
     return containedCrewPath(dir, `${crew}.json`);
   } catch {
+    // A traversal-shaped name that would leave `crews/` is never a legacy
+    // migration target; it receives an encoded path below.
     return undefined;
   }
 }
@@ -204,7 +224,7 @@ export function crewRosterPath(env: Record<string, string | undefined>, crew: st
   // choosing today's literal-or-bounded representation.
   const encoded = encodedCrewRosterPath(env, crew);
   if (existsSync(encoded)) return encoded;
-  return legacy ?? encoded;
+  return isNativeCrewRosterFilename(crew) ? legacy! : encoded;
 }
 
 /**

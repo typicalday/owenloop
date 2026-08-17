@@ -13,6 +13,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { type Roster, validateRoster } from '../agent/capability-model.ts';
 import type { HubClient } from '../hub/client.ts';
 import { owenloopConfigDir } from '../../../../src/config-dir.ts';
+import { normalizeOrigin } from '../../../../src/hub.ts';
 import type { RosterLayer } from './roster.ts';
 
 export interface HubRosterCacheCrew {
@@ -60,6 +61,10 @@ export async function withHubRosterSyncTimeout<T>(
     return await Promise.race([run(controller.signal), timeout]);
   } finally {
     if (timer !== undefined) clearTimeout(timer);
+    // A composite refresh can reject as soon as one request fails while a
+    // sibling fetch is still waiting. Always cancel on settlement so that
+    // sibling cannot outlive this refresh (and accumulate across polls).
+    if (!controller.signal.aborted) controller.abort(new Error('hub roster sync finished'));
   }
 }
 
@@ -106,9 +111,10 @@ function containedChildPath(dir: string, filename: string): string {
 }
 
 export function hubRosterCachePath(env: Env, origin: string, orgId: string, account = 'default'): string {
+  const canonicalOrigin = normalizeOrigin(origin);
   return containedChildPath(
     hubRosterCacheDir(env),
-    `cache-v1--${cacheKey(origin, orgId, account)}.json`,
+    `cache-v1--${cacheKey(canonicalOrigin, orgId, account)}.json`,
   );
 }
 
@@ -130,6 +136,12 @@ function parseEntry(value: unknown): HubRosterCacheEntry {
   if (row['version'] !== 1) throw new Error(`unsupported cache version ${String(row['version'])}`);
   for (const key of ['origin', 'orgId', 'orgName', 'account'] as const) {
     if (typeof row[key] !== 'string' || row[key].trim() === '') throw new Error(`invalid cache ${key}`);
+  }
+  let origin: string;
+  try {
+    origin = normalizeOrigin(row['origin'] as string);
+  } catch (error) {
+    throw new Error(`invalid cache origin: ${message(error)}`);
   }
   if (typeof row['fetchedAt'] !== 'number' || !Number.isFinite(row['fetchedAt'])) {
     throw new Error('invalid cache fetchedAt');
@@ -164,7 +176,7 @@ function parseEntry(value: unknown): HubRosterCacheEntry {
   }
   return {
     version: 1,
-    origin: row['origin'] as string,
+    origin,
     orgId: row['orgId'] as string,
     orgName: row['orgName'] as string,
     account: row['account'] as string,
@@ -229,6 +241,12 @@ export function writeHubRosterCache(
 export function readHubRosterCache(env: Env, origin: string, account: string): HubRosterCacheRead {
   const dir = hubRosterCacheDir(env);
   if (!existsSync(dir)) return { kind: 'miss', path: dir, reason: `no cache file at ${dir}` };
+  let expectedOrigin: string;
+  try {
+    expectedOrigin = normalizeOrigin(origin);
+  } catch (error) {
+    return { kind: 'miss', path: dir, reason: `invalid cache origin: ${message(error)}` };
+  }
   let firstReason: string | undefined;
   let names: string[];
   try {
@@ -247,33 +265,30 @@ export function readHubRosterCache(env: Env, origin: string, account: string): H
       firstReason ??= `unreadable JSON: ${message(error)}`;
       continue;
     }
-    const row = asRecord(raw);
-    if (row !== undefined && typeof row['origin'] === 'string' && row['origin'] !== origin) {
-      firstReason ??= `cache is for origin ${row['origin']}, expected ${origin}`;
-      continue;
-    }
-    if (row !== undefined && typeof row['account'] === 'string' && row['account'] !== account) {
-      firstReason ??= `cache is for account ${row['account']}, expected ${account}`;
-      continue;
-    }
-    if (row !== undefined && row['version'] !== 1) {
-      firstReason ??= `unsupported cache version ${String(row['version'])}`;
-      continue;
-    }
+    let entry: HubRosterCacheEntry;
     try {
-      const entry = parseEntry(raw);
-      if (
-	newest === undefined ||
-	entry.fetchedAt > newest.data.fetchedAt ||
-	(entry.fetchedAt === newest.data.fetchedAt && path < newest.path)
-      ) {
-	newest = { kind: 'hit', path, data: entry };
-      }
+      entry = parseEntry(raw);
     } catch (error) {
       const detail = message(error);
       firstReason ??= detail.startsWith('unsupported cache version') || detail.startsWith('invalid roster shape:')
 	? detail
 	: `invalid roster shape: ${detail}`;
+      continue;
+    }
+    if (entry.origin !== expectedOrigin) {
+      firstReason ??= `cache is for origin ${entry.origin}, expected ${expectedOrigin}`;
+      continue;
+    }
+    if (entry.account !== account) {
+      firstReason ??= `cache is for account ${entry.account}, expected ${account}`;
+      continue;
+    }
+    if (
+      newest === undefined ||
+      entry.fetchedAt > newest.data.fetchedAt ||
+      (entry.fetchedAt === newest.data.fetchedAt && path < newest.path)
+    ) {
+      newest = { kind: 'hit', path, data: entry };
     }
   }
   if (newest !== undefined) return newest;

@@ -176,9 +176,9 @@ test('same-org accounts and sanitizer-colliding origins retain distinct cache sn
       assert.equal(readB.data.global.build?.[0]?.harness, 'b');
     }
 
-    const collisionA = hubRosterCachePath(env, 'https://hub.example/a', 'org_1', 'default');
-    const collisionB = hubRosterCachePath(env, 'https://hub.example?a', 'org_1', 'default');
-    assert.equal(sanitizeOriginForFilename('https://hub.example/a'), sanitizeOriginForFilename('https://hub.example?a'));
+    const collisionA = hubRosterCachePath(env, 'https://hub.example-a', 'org_1', 'default');
+    const collisionB = hubRosterCachePath(env, 'https://hub.example/a', 'org_1', 'default');
+    assert.equal(sanitizeOriginForFilename('https://hub.example-a'), sanitizeOriginForFilename('https://hub.example/a'));
     assert.notEqual(collisionA, collisionB, 'the actual key is injective even where legacy sanitization is not');
   });
 });
@@ -214,6 +214,18 @@ test('cache filename sanitization keys an origin without trusting the filename',
   assert.equal(sanitizeOriginForFilename('HTTPS://Hub.Example.com/x'), 'https---hub.example.com-x');
 });
 
+test('cache reads and paths canonicalize equivalent hub-origin spellings', () => {
+  withHome((_home, env) => {
+    const trailing = `${origin}/`;
+    assert.equal(hubRosterCachePath(env, origin, 'org_1'), hubRosterCachePath(env, trailing, 'org_1'));
+    writeHubRosterCache(env, entry({ origin: trailing }));
+    const read = readHubRosterCache(env, origin, 'default');
+    assert.equal(read.kind, 'hit');
+    if (read.kind === 'hit') assert.equal(read.data.origin, origin);
+    assert.equal(effectiveRosterLayers(env, 'delivery', { origin: trailing, account: 'default' })[2]?.roster?.crew?.[0]?.harness, 'hub-crew');
+  });
+});
+
 test('a long normalized origin still produces a bounded cache filename and a readable snapshot', () => {
   withHome((_home, env) => {
     const longOrigin = `https://${'a'.repeat(180)}.example.test`;
@@ -233,6 +245,20 @@ test('a never-settling roster refresh is aborted and bounded', async () => {
       signal.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true });
     }), 1),
     /aborted|timed out/u,
+  );
+  assert.equal(aborted, true);
+});
+
+test('an immediate roster-refresh failure aborts its still-pending sibling', async () => {
+  let aborted = false;
+  await assert.rejects(
+    withHubRosterSyncTimeout((signal) => Promise.all([
+      Promise.reject(new Error('whoami failed')),
+      new Promise<void>((_resolve, reject) => {
+	signal.addEventListener('abort', () => { aborted = true; reject(signal.reason); }, { once: true });
+      }),
+    ]), 1_000),
+    /whoami failed/u,
   );
   assert.equal(aborted, true);
 });
