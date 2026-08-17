@@ -321,6 +321,15 @@ file). `owenloop doctor` adds one line for each present crew roster file,
 showing its found/absent layers and registered versus missing candidate
 harnesses.
 
+Crew names are data, not filesystem paths. New setup skeletons use the
+reversible `crew--<base64url>.json` codec beneath `~/.owenloop/crews/`; do not
+derive that filename by hand. Existing safe legacy `<crew>.json` files —
+including names containing spaces, colons, percent signs, or Unicode — remain
+readable and take precedence, so upgrading never replaces a hand-edited
+strongest layer with an empty skeleton. `owenloop doctor` decodes codec names
+before inspecting them, and traversal-shaped hub crew names stay confined to
+the `crews/` directory.
+
 A clean start or `--once` completion exits `0`. `owenloop shift --help` also
 exits `0`. Runtime failures such as credential reads or socket/runtime setup
 exit `1`. Usage and

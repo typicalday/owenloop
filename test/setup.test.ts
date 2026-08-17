@@ -40,6 +40,7 @@ import { owenloopSettingsPath } from '../src/work-settings.ts';
 import { encodeBase64, PAYLOAD_TYPE_ENROLLMENT_GRANT } from '../src/crypto/dsse.ts';
 import { publicKeyDescriptor } from '../src/crypto/keys.ts';
 import { buildEnrollmentGrant, DEFAULT_MACHINE_SCOPE } from '../src/crypto/enrollment.ts';
+import { crewRosterPath } from '../packages/work/src/settings/roster.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
@@ -170,7 +171,7 @@ test('setup: fresh machine, scripted --new-agent runs steps 2-8 in order and con
   // owenloop settings written with hubOrigin = the hub.
   const settings = JSON.parse(readFileSync(owenloopSettingsPath(t.io.env), 'utf8'));
   assert.equal(settings.hubOrigin, ORIGIN);
-  const rosterFile = join(t.io.env.HOME!, '.owenloop', 'crews', 'personal-alex.json');
+  const rosterFile = crewRosterPath(t.io.env, 'personal-alex');
   assert.equal(existsSync(rosterFile), true, 'setup materializes an empty strongest-layer roster for the agent crew');
   assert.deepEqual(JSON.parse(readFileSync(rosterFile, 'utf8')).roster, {});
 
@@ -188,7 +189,7 @@ test('setup: existing crew roster is never overwritten', async () => {
   const { fetch } = routedFetch(routes);
   const t = makeIo({ fetch, onOpenUrl: driveCallback() });
   assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', 'ops'], t.io), 0, t.err.join('\n'));
-  const path = join(t.io.env.HOME!, '.owenloop', 'crews', 'ops.json');
+  const path = crewRosterPath(t.io.env, 'ops');
   const custom = '{"roster":{"build":[{"harness":"codex","model":"local","effort":"high"}]}}\n';
   writeFileSync(path, custom);
   assert.equal(await mainAsync(['setup', '--hub', HUB], t.io), 0, t.err.join('\n'));
@@ -201,7 +202,7 @@ test('setup confines traversal-shaped hub crew names to encoded roster filenames
   const t = makeIo({ fetch, onOpenUrl: driveCallback() });
   const crew = '../../package';
   assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crew], t.io), 0, t.err.join('\n'));
-  const confined = join(t.io.env.HOME!, '.owenloop', 'crews', `${encodeURIComponent(crew)}.json`);
+  const confined = crewRosterPath(t.io.env, crew);
   assert.equal(existsSync(confined), true, 'the encoded file stays inside crews/');
   assert.equal(existsSync(join(t.io.env.HOME!, 'package.json')), false, 'no traversal-shaped crew may escape config/crews');
 });

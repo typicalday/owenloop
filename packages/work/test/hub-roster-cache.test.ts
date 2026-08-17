@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { test } from 'node:test';
 
 import { explainRosterShadows, effectiveRosterLayers, mergeRosterLayers } from '../src/settings/roster.ts';
@@ -9,6 +9,7 @@ import {
   hubRosterCacheDir,
   hubRosterCachePath,
   readHubRosterCache,
+  sanitizeOrgIdForFilename,
   sanitizeOriginForFilename,
   writeHubRosterCache,
 } from '../src/settings/hub-roster-cache.ts';
@@ -101,7 +102,54 @@ test('absent, mismatched, and corrupt caches are harmless misses; cache writes p
     assert.equal(readHubRosterCache(env, origin, 'default').kind, 'hit');
     assert.equal(hubRosterCachePath(env, origin, 'old-org').includes('old-org'), true);
     assert.equal(existsSync(hubRosterCachePath(env, origin, 'old-org')), false);
-    assert.equal(existsSync(`${hubRosterCachePath(env, origin, 'new-org')}.tmp`), false);
+    assert.equal(readdirSync(hubRosterCacheDir(env)).some((name) => name.endsWith('.tmp')), false);
+  });
+});
+
+test('cache filenames confine traversal-shaped org ids beneath hub-rosters', () => {
+  withHome((home, env) => {
+    const orgId = 'org/../../credentials';
+    const path = hubRosterCachePath(env, origin, orgId);
+    assert.equal(sanitizeOrgIdForFilename(orgId), 'org%2F..%2F..%2Fcredentials');
+    assert.equal(relative(hubRosterCacheDir(env), path).startsWith('..'), false);
+    writeHubRosterCache(env, entry({ orgId }));
+    assert.equal(existsSync(path), true);
+    assert.equal(existsSync(join(home, '.owenloop', 'credentials.json')), false);
+  });
+});
+
+test('cache reads choose the newest valid matching snapshot after an interrupted repoint', () => {
+  withHome((_home, env) => {
+    writeHubRosterCache(env, entry({ orgId: 'old-org', fetchedAt: 100 }));
+    assert.throws(
+      () => writeHubRosterCache(env, entry({ orgId: 'new-org', fetchedAt: 200 }), { remove: () => { throw new Error('unlink refused'); } }),
+      /unlink refused/u,
+    );
+    assert.equal(existsSync(hubRosterCachePath(env, origin, 'old-org')), true, 'the failed prune leaves both snapshots');
+    const read = readHubRosterCache(env, origin, 'default');
+    assert.equal(read.kind, 'hit');
+    assert.equal(read.data.orgId, 'new-org');
+    assert.equal(read.data.fetchedAt, 200);
+  });
+});
+
+test('different accounts and invalid roster shapes are harmless cache misses', () => {
+  withHome((_home, env) => {
+    writeHubRosterCache(env, entry({ account: 'other' }));
+    const accountMismatch = readHubRosterCache(env, origin, 'default');
+    assert.equal(accountMismatch.kind, 'miss');
+    assert.match(accountMismatch.reason, /cache is for account other/u);
+  });
+  withHome((_home, env) => {
+    const dir = hubRosterCacheDir(env);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      hubRosterCachePath(env, origin, 'invalid-roster'),
+      JSON.stringify(entry({ orgId: 'invalid-roster', global: { build: [] } })),
+    );
+    const invalid = readHubRosterCache(env, origin, 'default');
+    assert.equal(invalid.kind, 'miss');
+    assert.match(invalid.reason, /invalid roster shape/u);
   });
 });
 

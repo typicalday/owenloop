@@ -204,7 +204,7 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { loadSettings, settingsPath as executionSettingsPath } from '../packages/work/src/settings/settings.ts';
-import { crewRosterDir, crewRosterPath, effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
+import { crewNameFromRosterFilename, crewRosterDir, crewRosterPath, effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
 import { readHubRosterCache, syncHubRosterCache } from '../packages/work/src/settings/hub-roster-cache.ts';
 import type { HubClient } from '../packages/work/src/hub/client.ts';
 import type { GetRostersResponse, WhoamiResponse } from '../packages/work/src/hub/types.ts';
@@ -7430,11 +7430,13 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
   // Crew-roster diagnostics are informational per crew. The same registry
   // membership predicate the worker uses is intentionally reused here.
   try {
-    const crewsDir = join(owenloopConfigDir(io.env), 'crews');
+    const crewsDir = crewRosterDir(io.env);
     const crews = existsSync(crewsDir)
       ? readdirSync(crewsDir, { withFileTypes: true })
           .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
-          .map((entry) => entry.name.slice(0, -'.json'.length))
+	  .map((entry) => crewNameFromRosterFilename(entry.name))
+	  .filter((crew): crew is string => crew !== undefined)
+	  .filter((crew, index, all) => all.indexOf(crew) === index)
           .sort()
       : [];
     for (const crew of crews) {

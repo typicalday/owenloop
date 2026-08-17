@@ -96,3 +96,29 @@ test('roster mutations reject malformed or wrong-verb 2xx responses', async () =
     assert.match(t.err.join('\n'), new RegExp(`${scenario.endpoint}: malformed success response`, 'u'));
   }
 });
+
+test('roster org put, org rm, and registry put accept only their proven success shapes', async () => {
+  const routes: Record<string, RouteHandler> = {
+    'POST /api/put_roster': () => ({
+      status: 200,
+      json: { crewId: 'crew_1', crewName: 'delivery', capability: 'build', candidates: [{ harness: 'codex', model: 'gpt-5', effort: 'high' }], warnings: ['model is deprecated'] },
+    }),
+    'POST /api/delete_roster_row': () => ({ status: 200, json: { crewId: null, capability: 'build', removed: true } }),
+    'POST /api/put_harness_models': () => ({
+      status: 200,
+      json: { harness: 'codex', displayName: 'Codex', models: [{ model: 'gpt-5', efforts: ['high'], updatedAt: 1, updatedBy: 'member_1' }] },
+    }),
+  };
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch });
+  t.store.set(kcHuman(ORIGIN), JSON.stringify(human));
+
+  assert.equal(await mainAsync(['roster', 'org', 'put', 'build', '--crew', 'delivery', '--candidate', 'codex:gpt-5:high', '--hub', ORIGIN], t.io), 0, t.err.join('\n'));
+  assert.deepEqual(JSON.parse(t.out.pop()!).result, { crewId: 'crew_1', crewName: 'delivery', capability: 'build', candidates: [{ harness: 'codex', model: 'gpt-5', effort: 'high' }], warnings: ['model is deprecated'] });
+
+  assert.equal(await mainAsync(['roster', 'org', 'rm', 'build', '--hub', ORIGIN], t.io), 0, t.err.join('\n'));
+  assert.deepEqual(JSON.parse(t.out.pop()!).result, { crewId: null, capability: 'build', removed: true });
+
+  assert.equal(await mainAsync(['roster', 'registry', 'put', 'codex', '--display-name', 'Codex', '--model', 'gpt-5:high', '--hub', ORIGIN], t.io), 0, t.err.join('\n'));
+  assert.deepEqual(JSON.parse(t.out.pop()!).result, { harness: 'codex', displayName: 'Codex', models: [{ model: 'gpt-5', efforts: ['high'], updatedAt: 1, updatedBy: 'member_1' }] });
+});

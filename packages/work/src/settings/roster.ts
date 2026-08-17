@@ -81,21 +81,63 @@ export function crewRosterDir(env: Record<string, string | undefined>): string {
   return join(owenloopConfigDir(env), 'crews');
 }
 
-/**
- * Resolve an untrusted crew name to one file beneath `crews/`.
- *
- * Hub crew names permit ordinary display characters such as `/` and `..`.
- * They are data, never path segments: encode them first, then verify the
- * resolved target is still within the directory before any read or write.
- */
-export function crewRosterPath(env: Record<string, string | undefined>, crew: string): string {
-  const dir = resolve(crewRosterDir(env));
-  const path = resolve(dir, `${encodeURIComponent(crew)}.json`);
-  const fromDir = relative(dir, path);
-  if (fromDir === '' || fromDir === '..' || fromDir.startsWith(`..${sep}`) || isAbsolute(fromDir)) {
-    throw new Error(`unsafe crew roster path for ${JSON.stringify(crew)}`);
+const CREW_ROSTER_FILENAME_PREFIX = 'crew--';
+
+/** Reversible, path-segment-safe filename codec for newly materialized crews. */
+export function encodeCrewRosterFilename(crew: string): string {
+  return `${CREW_ROSTER_FILENAME_PREFIX}${Buffer.from(crew, 'utf8').toString('base64url')}.json`;
+}
+
+/** Decode only an exact codec output; ordinary legacy basenames stay literal. */
+export function decodeCrewRosterFilename(filename: string): string | undefined {
+  if (!filename.startsWith(CREW_ROSTER_FILENAME_PREFIX) || !filename.endsWith('.json')) return undefined;
+  const encoded = filename.slice(CREW_ROSTER_FILENAME_PREFIX.length, -'.json'.length);
+  try {
+    const crew = Buffer.from(encoded, 'base64url').toString('utf8');
+    return encodeCrewRosterFilename(crew) === filename ? crew : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Map a filename from either the reversible codec or the legacy layout to its crew. */
+export function crewNameFromRosterFilename(filename: string): string | undefined {
+  const decoded = decodeCrewRosterFilename(filename);
+  if (decoded !== undefined) return decoded;
+  return filename.endsWith('.json') ? filename.slice(0, -'.json'.length) : undefined;
+}
+
+function containedCrewPath(dir: string, filename: string): string {
+  const root = resolve(dir);
+  const path = resolve(root, filename);
+  const fromRoot = relative(root, path);
+  if (fromRoot === '' || fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    throw new Error(`unsafe crew roster path for ${JSON.stringify(filename)}`);
   }
   return path;
+}
+
+/** A pre-codec file is safe to preserve only when its raw name is one segment. */
+function legacyCrewRosterPath(dir: string, crew: string): string | undefined {
+  if (crew.includes('/') || crew.includes('\\')) return undefined;
+  return containedCrewPath(dir, `${crew}.json`);
+}
+
+/**
+ * Resolve an untrusted crew name to one file beneath `crews/`, preserving a
+ * pre-codec operator file when it exists. This makes an upgrade non-destructive
+ * for names such as spaces, colons, percent signs, and Unicode; setup uses this
+ * same resolver, so it cannot create an empty encoded duplicate over an existing
+ * strongest-layer override.
+ *
+ * New files use `encodeCrewRosterFilename`; hub names are always data, never
+ * path segments, and every target has an explicit containment proof.
+ */
+export function crewRosterPath(env: Record<string, string | undefined>, crew: string): string {
+  const dir = crewRosterDir(env);
+  const legacy = legacyCrewRosterPath(dir, crew);
+  if (legacy !== undefined && existsSync(legacy)) return legacy;
+  return containedCrewPath(dir, encodeCrewRosterFilename(crew));
 }
 
 /**

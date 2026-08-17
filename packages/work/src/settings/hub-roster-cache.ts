@@ -6,8 +6,9 @@
  * stale hub rows still lose to every machine-owned row, while rejecting an old
  * cache would turn an ordinary hub outage into an order refusal.
  */
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { type Roster, validateRoster } from '../agent/capability-model.ts';
 import type { HubClient } from '../hub/client.ts';
@@ -46,8 +47,26 @@ export function sanitizeOriginForFilename(origin: string): string {
   return origin.toLowerCase().replace(/[^a-z0-9.-]/g, '-');
 }
 
+/** Org ids are hub data, so they are filename-encoded rather than interpolated. */
+export function sanitizeOrgIdForFilename(orgId: string): string {
+  return encodeURIComponent(orgId);
+}
+
+function containedChildPath(dir: string, filename: string): string {
+  const root = resolve(dir);
+  const path = resolve(root, filename);
+  const fromRoot = relative(root, path);
+  if (fromRoot === '' || fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    throw new Error(`unsafe hub roster cache path for ${JSON.stringify(filename)}`);
+  }
+  return path;
+}
+
 export function hubRosterCachePath(env: Env, origin: string, orgId: string): string {
-  return join(hubRosterCacheDir(env), `${sanitizeOriginForFilename(origin)}--${orgId}.json`);
+  return containedChildPath(
+    hubRosterCacheDir(env),
+    `${sanitizeOriginForFilename(origin)}--${sanitizeOrgIdForFilename(orgId)}.json`,
+  );
 }
 
 function message(error: unknown): string {
@@ -115,26 +134,44 @@ function parseEntry(value: unknown): HubRosterCacheEntry {
   };
 }
 
+export interface HubRosterCacheWriteOptions {
+  /** Test seam for an unlink failure after the new snapshot has landed. */
+  remove?: (path: string) => void;
+  /** Test seam; the production default makes concurrent writers distinct. */
+  tempSuffix?: () => string;
+}
+
 /** Atomically write a verified snapshot, then drop a prior org snapshot for
  * the same origin/account pair so a re-pointed token cannot be served stale. */
-export function writeHubRosterCache(env: Env, entry: HubRosterCacheEntry): void {
+export function writeHubRosterCache(
+  env: Env,
+  entry: HubRosterCacheEntry,
+  options: HubRosterCacheWriteOptions = {},
+): void {
   const verified = parseEntry(entry);
   const dir = hubRosterCacheDir(env);
   mkdirSync(dir, { recursive: true });
   const path = hubRosterCachePath(env, verified.origin, verified.orgId);
-  const temp = `${path}.tmp`;
+  const temp = `${path}.${(options.tempSuffix ?? randomUUID)()}.tmp`;
   writeFileSync(temp, `${JSON.stringify(verified, null, 2)}\n`, 'utf8');
   renameSync(temp, path);
 
   for (const name of readdirSync(dir)) {
     const sibling = join(dir, name);
     if (sibling === path || !name.endsWith('.json')) continue;
+    let other: HubRosterCacheEntry;
     try {
-      const other = parseEntry(JSON.parse(readFileSync(sibling, 'utf8')) as unknown);
-      if (other.origin === verified.origin && other.account === verified.account && other.orgId !== verified.orgId) rmSync(sibling);
+      other = parseEntry(JSON.parse(readFileSync(sibling, 'utf8')) as unknown);
     } catch {
       // A malformed unrelated file stays visible to an operator; it cannot make
       // a successful new snapshot fail.
+      continue;
+    }
+    if (other.origin === verified.origin && other.account === verified.account && other.orgId !== verified.orgId) {
+      // Deliberately outside the parse catch. Once the new snapshot has landed,
+      // a failed prune must surface to the caller rather than masquerading as a
+      // completed repoint; readers still select the newer valid file below.
+      (options.remove ?? ((candidate: string) => rmSync(candidate)))(sibling);
     }
   }
 }
@@ -155,6 +192,7 @@ export function readHubRosterCache(env: Env, origin: string, account: string): H
     return { kind: 'miss', path: dir, reason: `unreadable cache directory: ${message(error)}` };
   }
   if (names.length === 0) return { kind: 'miss', path: dir, reason: `no cache file at ${dir}` };
+  let newest: Extract<HubRosterCacheRead, { kind: 'hit' }> | undefined;
   for (const name of names) {
     const path = join(dir, name);
     let raw: unknown;
@@ -179,7 +217,13 @@ export function readHubRosterCache(env: Env, origin: string, account: string): H
     }
     try {
       const entry = parseEntry(raw);
-      return { kind: 'hit', path, data: entry };
+      if (
+	newest === undefined ||
+	entry.fetchedAt > newest.data.fetchedAt ||
+	(entry.fetchedAt === newest.data.fetchedAt && path < newest.path)
+      ) {
+	newest = { kind: 'hit', path, data: entry };
+      }
     } catch (error) {
       const detail = message(error);
       firstReason ??= detail.startsWith('unsupported cache version') || detail.startsWith('invalid roster shape:')
@@ -187,6 +231,7 @@ export function readHubRosterCache(env: Env, origin: string, account: string): H
 	: `invalid roster shape: ${detail}`;
     }
   }
+  if (newest !== undefined) return newest;
   return { kind: 'miss', path: dir, reason: firstReason ?? `no cache file at ${dir}` };
 }
 
