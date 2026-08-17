@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.8](https://github.com/typicalday/owenloop/compare/v0.5.7...v0.5.8) (2026-08-17)
+
+
+### Features
+
+* add layered crew roster routing ([#186](https://github.com/typicalday/owenloop/issues/186)) ([9fc1a55](https://github.com/typicalday/owenloop/commit/9fc1a55447bc48806d5b8775a9bdd5340f9258b8))
+* add owenloop routing command group for alerts and reroute rules ([#182](https://github.com/typicalday/owenloop/issues/182)) ([012a16a](https://github.com/typicalday/owenloop/commit/012a16a97f01b2c98691403a2a8a9eba201ef889))
+* let the offer caller reroute a composed capability ([#181](https://github.com/typicalday/owenloop/issues/181)) ([7240e61](https://github.com/typicalday/owenloop/commit/7240e61ee4263290d9eb1adfea96c3659a657ca9))
+
+
+### Bug Fixes
+
+* key session resume on the engine task, not on the per-firing run id ([#177](https://github.com/typicalday/owenloop/issues/177)) ([f1d4fbb](https://github.com/typicalday/owenloop/commit/f1d4fbbccab3048558a5319293e87bb3bcff22e8))
+* relay a command step's output to the worker log on success too ([#185](https://github.com/typicalday/owenloop/issues/185)) ([618a3e0](https://github.com/typicalday/owenloop/commit/618a3e0309d79bb680f521c19fc183934f6f7bf8))
+* surface a hub instance's terminal status in `instance show` ([#187](https://github.com/typicalday/owenloop/issues/187)) ([42e53bd](https://github.com/typicalday/owenloop/commit/42e53bd809bfe8e93a27ffa2941b8a89b0161bcc))
+
 ## [0.5.7](https://github.com/typicalday/owenloop/compare/v0.5.6...v0.5.7) (2026-08-16)
 
 
