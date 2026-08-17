@@ -183,12 +183,16 @@ function migrationMessage(
   quotedGrantsPath: string,
   quotedLegacyPath: string,
 ): string {
-  // POSIX pathname expansion omits leading-dot names for `*.grant.dsse`, so
-  // enumerate a second dot-prefixed pattern. The source inspector has already
-  // established that every entry is a regular, non-symlink file; the file test
-  // only skips either unmatched pattern when it did not expand.
-  const command = `mkdir -p ${quotedGrantsPath} && for grant in ${quotedLegacyPath}/*.grant.dsse ${quotedLegacyPath}/.*.grant.dsse; do ` +
-    `[ -f "$grant" ] || continue; mv "$grant" ${quotedGrantsPath}/; done`;
+  // POSIX pathname expansion omits leading-dot names. These three patterns
+  // enumerate every eligible top-level directory entry without ever matching
+  // `.` or `..`: ordinary names, dot names whose second character is not a
+  // dot (including `.grant.dsse`), and names beginning with two or more dots.
+  // The case filter then selects exactly the suffix accepted by the inspector
+  // and loader. The source inspector has already established the entries are
+  // regular non-symlink files; the file test only skips unmatched patterns.
+  // Do not continue after a failed move: a partial migration must stay loud.
+  const command = `mkdir -p ${quotedGrantsPath} && for grant in ${quotedLegacyPath}/?* ${quotedLegacyPath}/.[!.]* ${quotedLegacyPath}/..?*; do ` +
+    `[ -f "$grant" ] || continue; case "$grant" in *.grant.dsse) mv "$grant" ${quotedGrantsPath}/ || exit $?;; esac; done`;
   return `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
     `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
     `cryptographic material for you. Run:  ${command}  ` +

@@ -321,6 +321,46 @@ test('trust grant does not create grants when the legacy source cannot be read',
   assert.deepEqual(readdirSync(legacy), ['producer.grant.dsse']);
 });
 
+test('trust grant does not create grants when a legacy source entry cannot be inspected', async () => {
+  const { run, config } = makeTrustCli();
+  const init = await run('trust', 'init');
+  assert.equal(init.code, 0, init.err);
+  const initRecord = init.json();
+  const legacy = join(config, 'roster');
+  const entry = join(legacy, 'producer.grant.dsse');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(entry, 'legacy grant');
+  // readdirSync still succeeds, but lstatSync of the returned entry fails.
+  chmodSync(legacy, 0o400);
+
+  let grant: Awaited<ReturnType<typeof run>>;
+  try {
+    grant = await run(
+      'trust',
+      'grant',
+      '--key',
+      initRecord.publicKey,
+      '--principal',
+      'machine:worker',
+      '--pools',
+      'marketing',
+      '--labels',
+      'billing',
+      '--namespaces',
+      'default',
+      '--delegate',
+      '0',
+    );
+  } finally {
+    chmodSync(legacy, 0o700);
+  }
+  assert.equal(grant!.code, 1);
+  assert.match(grant!.err, /cannot inspect legacy grants source entry/);
+  assert.doesNotMatch(grant!.err, /Run:/);
+  assert.equal(existsSync(join(config, 'grants')), false);
+  assert.deepEqual(readdirSync(legacy), ['producer.grant.dsse']);
+});
+
 // ---- unknown-option rejection (before any side effect) ----------------------
 
 test('a misspelled option on a sync command exits 1, names the offender, suggests the fix', () => {

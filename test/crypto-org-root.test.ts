@@ -20,10 +20,13 @@ function temp(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-function runPrintedMigration(error: StrandedLegacyGrantsError): void {
+function runPrintedMigration(
+  error: StrandedLegacyGrantsError,
+  shellEnv: Record<string, string | undefined> = process.env,
+): void {
   const match = error.message.match(/Run:  (.+)  then restart/);
   assert.ok(match !== null, error.message);
-  execFileSync('/bin/sh', ['-c', match[1]!]);
+  execFileSync('/bin/sh', ['-c', match[1]!], { env: shellEnv });
 }
 
 function strandedError(env: Record<string, string | undefined>): StrandedLegacyGrantsError {
@@ -118,19 +121,47 @@ test('loaders return sorted matching envelope bytes and ignore unrelated regular
   assert.deepEqual(loadRevocations(env).map((value) => Buffer.from(value).toString()), ['rev-a', 'rev-b']);
 });
 
-test('loadGrants refuses when legacy grants are stranded and the new directory is absent', () => {
+test('loadGrants migration command moves every accepted ordinary and dot-prefixed legacy grant', () => {
   const home = temp('owenloop-org-legacy-');
   const env = { HOME: home };
   const legacy = join(home, '.owenloop', 'roster');
   mkdirSync(legacy, { recursive: true });
-  writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
+  writeFileSync(join(legacy, 'ordinary.grant.dsse'), 'ordinary-grant');
   writeFileSync(join(legacy, '.hidden.grant.dsse'), 'hidden-grant');
+  writeFileSync(join(legacy, '.grant.dsse'), 'exact-suffix-grant');
 
   const error = strandedError(env);
   assert.match(error.message, new RegExp(`'${grantsDir(env)}'`));
   assert.match(error.message, new RegExp(`'${legacy}'`));
   runPrintedMigration(error);
-  assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), ['hidden-grant', 'legacy-grant']);
+  assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), [
+    'exact-suffix-grant',
+    'hidden-grant',
+    'ordinary-grant',
+  ]);
+});
+
+test('loadGrants migration command aborts without moving later grants after a move failure', () => {
+  const home = temp('owenloop-org-legacy-mv-failure-');
+  const env = { HOME: home };
+  const legacy = join(home, '.owenloop', 'roster');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, 'a.grant.dsse'), 'first-grant');
+  writeFileSync(join(legacy, 'b.grant.dsse'), 'later-grant');
+  const fakeBin = temp('owenloop-org-fake-mv-');
+  writeFileSync(
+    join(fakeBin, 'mv'),
+    '#!/bin/sh\ncase "$1" in\n  */a.grant.dsse) exit 42;;\nesac\nexec /bin/mv "$@"\n',
+    { mode: 0o755 },
+  );
+
+  const error = strandedError(env);
+  assert.throws(
+    () => runPrintedMigration(error, { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ''}` }),
+  );
+  assert.equal(existsSync(join(legacy, 'a.grant.dsse')), true);
+  assert.equal(existsSync(join(legacy, 'b.grant.dsse')), true);
+  assert.equal(existsSync(join(grantsDir(env), 'b.grant.dsse')), false);
 });
 
 test('loadGrants refuses when the new directory has no grants and legacy grants exist', () => {
