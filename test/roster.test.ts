@@ -40,6 +40,30 @@ test('roster org and registry GET their live read endpoints with a human credent
   assert.equal(calls.filter((call) => call.pathname === '/api/harness_models')[0]!.method, 'GET');
 });
 
+test('roster read verbs reject malformed 2xx bodies and preserve credential exit code 3', async () => {
+  for (const [args, route, body] of [
+    [['roster', 'org', '--hub', ORIGIN], 'GET /api/rosters', { global: {}, crews: [{}] }],
+    [['roster', 'registry', '--hub', ORIGIN], 'GET /api/harness_models', { harnesses: [{}], models: [] }],
+  ] as const) {
+    const t = makeIo({ fetch: routedFetch({ [route]: () => ({ status: 200, json: body }) }).fetch });
+    t.store.set(kcHuman(ORIGIN), JSON.stringify(human));
+    assert.equal(await mainAsync([...args], t.io), 1);
+    assert.equal(t.out.length, 0);
+    assert.match(t.err.join('\n'), /malformed success response/u);
+  }
+  for (const [args, route, token] of [
+    [['roster', 'org', '--hub', ORIGIN], 'GET /api/rosters', human],
+    [['roster', 'registry', '--hub', ORIGIN], 'GET /api/harness_models', human],
+    [['roster', 'sync', '--hub', ORIGIN], 'GET /api/whoami', agent],
+  ] as const) {
+    const routes: Record<string, RouteHandler> = { [route]: () => ({ status: 401, json: { message: 'nope' } }) };
+    if (args[1] === 'sync') routes['GET /api/rosters'] = () => ({ status: 200, json: { global: {}, crews: [] } });
+    const t = makeIo({ fetch: routedFetch(routes).fetch });
+    t.store.set(args[1] === 'sync' ? kcKey(ORIGIN, { principal: 'agent' }) : kcHuman(ORIGIN), JSON.stringify(token));
+    assert.equal(await mainAsync([...args], t.io), 3, `${args.join(' ')}: ${t.err.join('\n')}`);
+  }
+});
+
 test('roster sync defaults to the default agent slot and writes a readable local cache', async () => {
   const routes: Record<string, RouteHandler> = {
     'GET /api/whoami': () => ({ status: 200, json: { orgId: 'org_1', orgName: 'Example', actor: {}, tokenStatus: 'active', authMethod: 'token' } }),

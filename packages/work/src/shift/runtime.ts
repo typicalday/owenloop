@@ -14,7 +14,7 @@ import { performance } from 'node:perf_hooks';
 import { createHubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
-import { syncHubRosterCache } from '../settings/hub-roster-cache.ts';
+import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createShiftLoop, type ShiftLoop } from './loop.ts';
 import { createShiftLogSink } from './logsink.ts';
@@ -522,7 +522,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   // record is its self-describing identity, even when this refresh fails.
   let startupRosterSyncFailure: string | undefined;
   try {
-    await syncHubRosterCache({ client: hub, env, origin, account });
+    await withHubRosterSyncTimeout((signal) => syncHubRosterCache({ client: hub, env, origin, account, signal }));
   } catch (error) {
     startupRosterSyncFailure = `roster sync failed at shift start: ${errMsg(error)} (continuing)`;
     process.stderr.write(`${roleLabel}: ${startupRosterSyncFailure}\n`);
@@ -592,7 +592,8 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     pollIntervalMs,
     presenceIntervalMs: DEFAULT_PRESENCE_MS,
     rosterSyncIntervalMs: DEFAULT_ROSTER_SYNC_MS,
-    syncRosters: () => syncHubRosterCache({ client: hub, env, origin, account }),
+    rosterSyncTimeoutMs: DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS,
+    syncRosters: (signal) => syncHubRosterCache({ client: hub, env, origin, account, signal }),
     maxConcurrentAgents,
     workRoot,
     ...(workRepo !== undefined ? { workRepo } : {}),

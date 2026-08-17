@@ -18,10 +18,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { mainAsync, sanitizeAgentName, lastActiveMs, formatLastActive, resolveBundledMarketplaceRoot } from '../src/cli.ts';
 import type { AgentIdentitySummary } from '../src/hub.ts';
 import { asAgentIdentities, asRekeyAgentTokenOk } from '../src/hub.ts';
@@ -194,6 +194,11 @@ test('setup: existing crew roster is never overwritten', async () => {
   writeFileSync(path, custom);
   assert.equal(await mainAsync(['setup', '--hub', HUB], t.io), 0, t.err.join('\n'));
   assert.equal(readFileSync(path, 'utf8'), custom);
+  assert.equal(
+    readdirSync(dirname(path)).some((entry) => entry.endsWith('.roster.tmp')),
+    false,
+    'an interrupted/exclusive install cleans its complete temporary file when an existing roster wins',
+  );
 });
 
 test('setup confines traversal-shaped hub crew names to encoded roster filenames', async () => {

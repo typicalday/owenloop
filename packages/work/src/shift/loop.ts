@@ -74,6 +74,7 @@ import {
   type Liveness,
 } from './state.ts';
 import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../agent/workdir.ts';
+import { withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { sessionsPath } from '../harness/session-store.ts';
 import type { Spawner } from './spawn.ts';
 import {
@@ -129,8 +130,10 @@ export interface ShiftLoopOptions {
   presenceIntervalMs: number;
   /** Weak hub-roster cache refresh cadence; undefined disables refresh. */
   rosterSyncIntervalMs?: number;
+  /** Upper bound for one low-priority refresh attempt. */
+  rosterSyncTimeoutMs?: number;
   /** Daemon-owned cache write, injected so failure cannot kill the loop. */
-  syncRosters?: () => Promise<void>;
+  syncRosters?: (signal: AbortSignal) => Promise<void>;
   /**
    * Max concurrent `agent-run` children (default 4). A SECOND budget, applied
    * ON TOP OF `cap` — never a replacement for it. An agent turn is long and
@@ -1030,7 +1033,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       monotonicNow() - lastRosterSync >= opts.rosterSyncIntervalMs
     ) {
       try {
-	await opts.syncRosters();
+	await withHubRosterSyncTimeout((signal) => opts.syncRosters!(signal), opts.rosterSyncTimeoutMs);
       } catch (e) {
 	rateLimitedThisIteration = noteServerBackoff(e);
 	opts.err(`roster sync failed: ${errMsg(e)} (continuing)`);

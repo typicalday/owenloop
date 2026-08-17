@@ -11,6 +11,7 @@ import {
   readHubRosterCache,
   sanitizeOrgIdForFilename,
   sanitizeOriginForFilename,
+  withHubRosterSyncTimeout,
   writeHubRosterCache,
 } from '../src/settings/hub-roster-cache.ts';
 
@@ -209,4 +210,15 @@ test('a cache path that is not a readable directory is a harmless miss', () => {
 
 test('cache filename sanitization keys an origin without trusting the filename', () => {
   assert.equal(sanitizeOriginForFilename('HTTPS://Hub.Example.com/x'), 'https---hub.example.com-x');
+});
+
+test('a never-settling roster refresh is aborted and bounded', async () => {
+  let aborted = false;
+  await assert.rejects(
+    withHubRosterSyncTimeout((signal) => new Promise<void>((_resolve, reject) => {
+      signal.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true });
+    }), 1),
+    /aborted|timed out/u,
+  );
+  assert.equal(aborted, true);
 });

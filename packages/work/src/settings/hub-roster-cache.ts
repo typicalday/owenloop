@@ -38,6 +38,31 @@ export type HubRosterCacheRead =
 
 type Env = Record<string, string | undefined>;
 
+export const DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS = 10_000;
+
+/** Bound a refresh even when a test seam or non-fetch client ignores abort. */
+export async function withHubRosterSyncTimeout<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  timeoutMs = DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(`hub roster sync timed out after ${timeoutMs}ms`);
+      // Abort carries the same terminal error so an abort-aware transport and
+      // the explicit race report one stable, useful timeout outcome.
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([run(controller.signal), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 export function hubRosterCacheDir(env: Env): string {
   return join(owenloopConfigDir(env), 'hub-rosters');
 }
@@ -278,9 +303,10 @@ export async function syncHubRosterCache(deps: {
   env: Env;
   origin: string;
   account: string;
+  signal?: AbortSignal;
 }): Promise<void> {
   if (deps.client.getRosters === undefined) throw new Error('hub client does not support get_rosters');
-  const [identity, rosters] = await Promise.all([deps.client.whoami(), deps.client.getRosters()]);
+  const [identity, rosters] = await Promise.all([deps.client.whoami(deps.signal), deps.client.getRosters(deps.signal)]);
   writeHubRosterCache(deps.env, {
     version: 1,
     origin: deps.origin,

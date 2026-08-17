@@ -566,6 +566,24 @@ test('a roster cache refresh failure logs continuing and does not stop dispatch'
   ]);
 });
 
+test('a never-settling roster refresh times out and the shift still reaches normal work', async () => {
+  const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+  const { spawner } = fakeSpawner();
+  let aborted = false;
+  const errors: string[] = [];
+  const code = await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    rosterSyncIntervalMs: 0,
+    rosterSyncTimeoutMs: 1,
+    syncRosters: (signal) => new Promise<void>((_resolve, reject) => signal.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true })),
+    err: (line) => errors.push(line),
+  })).run();
+  assert.equal(code, 0);
+  assert.equal(aborted, true);
+  assert.equal(count(calls, 'wake'), 1);
+  assert.match(errors.join('\n'), /aborted|timed out/u);
+});
+
 test('a failed roster refresh advances its cadence instead of retrying on every poll', async () => {
   const { hub } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();

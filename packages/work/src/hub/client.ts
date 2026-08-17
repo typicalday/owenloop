@@ -89,9 +89,9 @@ export interface HubClient {
    * re-dispatch no-ops rather than overwriting the first (pre-spend) record.
    */
   reportResolution(req: ReportResolutionRequest): Promise<ReportResolutionResponse>;
-  whoami(): Promise<WhoamiResponse>;
+  whoami(signal?: AbortSignal): Promise<WhoamiResponse>;
   /** Read the org's roster cascade using this caller's scoped identity. */
-  getRosters?(): Promise<GetRostersResponse>;
+  getRosters?(signal?: AbortSignal): Promise<GetRostersResponse>;
   /** Read the hub's known harness/model registry. */
   listHarnessModels?(): Promise<ListHarnessModelsResponse>;
   /** B5 cheap wake pre-check; `cursor` rides the query string only when set. */
@@ -150,11 +150,12 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     return parse<T>(res);
   }
 
-  async function get<T>(verb: string, query?: string): Promise<T> {
+  async function get<T>(verb: string, query?: string, signal?: AbortSignal): Promise<T> {
     const url = query !== undefined && query !== '' ? `${base}/api/${verb}?${query}` : `${base}/api/${verb}`;
     const res = await fetchImpl(url, {
       method: 'GET',
       headers: await authHeaders(),
+      ...(signal === undefined ? {} : { signal }),
     });
     return parse<T>(res);
   }
@@ -171,8 +172,8 @@ export function createHubClient(opts: HubClientOptions): HubClient {
     answerApproval: (req) => post<AnswerApprovalResponse>('answer_approval', req),
     listPendingApprovals: () => post<ListPendingApprovalsResponse>('list_pending_approvals', {}),
     reportResolution: (req) => post<ReportResolutionResponse>('report_resolution', req),
-    whoami: () => get<WhoamiResponse>('whoami'),
-    getRosters: () => get<GetRostersResponse>('rosters'),
+    whoami: (signal) => get<WhoamiResponse>('whoami', undefined, signal),
+    getRosters: (signal) => get<GetRostersResponse>('rosters', undefined, signal),
     listHarnessModels: () => get<ListHarnessModelsResponse>('harness_models'),
     // Cursor is an opaque non-negative integer; omit it entirely to bootstrap
     // (the hub treats missing/invalid as a `changed: true` first sweep).

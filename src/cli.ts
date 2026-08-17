@@ -33,7 +33,7 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -78,7 +78,7 @@ import {
 } from './credentials.ts';
 import { PrincipalKeyManager } from './crypto/keys.ts';
 import type { PrincipalKeyRef } from './crypto/keys.ts';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   DSSE_SSH_NAMESPACE,
   decodeBase64Strict,
@@ -1748,6 +1748,57 @@ function validateRosterMutationSuccess(endpoint: string, body: unknown): RosterM
   return { harness: row.harness, displayName: row.displayName, models };
 }
 
+function validateRosterRows(value: unknown, prefix: string): Record<string, Array<{ harness: string; model: string; effort: string }>> {
+  const row = recordOf(value);
+  if (row === null) throw new CliError(`${prefix} — roster must be an object`);
+  const result: Record<string, Array<{ harness: string; model: string; effort: string }>> = {};
+  for (const [capability, candidates] of Object.entries(row)) {
+    if (!Array.isArray(candidates)) throw new CliError(`${prefix} — ${capability} must be an array`);
+    result[capability] = candidates.map((candidate, index) => {
+      const item = recordOf(candidate);
+      if (item === null || ['harness', 'model', 'effort'].some((field) => typeof item[field] !== 'string' || item[field] === '')) {
+	throw new CliError(`${prefix} — ${capability}[${index}] must contain non-empty harness, model, and effort`);
+      }
+      return { harness: item.harness as string, model: item.model as string, effort: item.effort as string };
+    });
+  }
+  return result;
+}
+
+function validateGetRostersSuccess(body: unknown): { global: Record<string, Array<{ harness: string; model: string; effort: string }>>; crews: Array<{ crewId: string; crewName: string | null; roster: Record<string, Array<{ harness: string; model: string; effort: string }>> }> } {
+  const prefix = 'rosters: malformed success response';
+  const row = recordOf(body);
+  if (row === null || !Array.isArray(row.crews)) throw new CliError(`${prefix} — expected global object and crews array`);
+  return {
+    global: validateRosterRows(row.global, prefix),
+    crews: row.crews.map((crew, index) => {
+      const item = recordOf(crew);
+      if (item === null || typeof item.crewId !== 'string' || item.crewId === '' || !(typeof item.crewName === 'string' || item.crewName === null)) {
+	throw new CliError(`${prefix} — crews[${index}] has an invalid identity`);
+      }
+      return { crewId: item.crewId, crewName: item.crewName, roster: validateRosterRows(item.roster, `${prefix} — crews[${index}].roster`) };
+    }),
+  };
+}
+
+function validateHarnessModelsSuccess(body: unknown): { harnesses: Array<{ harness: string; displayName: string }>; models: Array<{ harness: string; model: string; efforts: string[]; updatedAt: number; updatedBy: string }> } {
+  const prefix = 'harness_models: malformed success response';
+  const row = recordOf(body);
+  if (row === null || !Array.isArray(row.harnesses) || !Array.isArray(row.models)) throw new CliError(`${prefix} — expected harnesses and models arrays`);
+  return {
+    harnesses: row.harnesses.map((harness, index) => {
+      const item = recordOf(harness);
+      if (item === null || typeof item.harness !== 'string' || item.harness === '' || typeof item.displayName !== 'string' || item.displayName === '') throw new CliError(`${prefix} — harnesses[${index}] is invalid`);
+      return { harness: item.harness, displayName: item.displayName };
+    }),
+    models: row.models.map((model, index) => {
+      const item = recordOf(model);
+      if (item === null || typeof item.harness !== 'string' || item.harness === '' || typeof item.model !== 'string' || item.model === '' || !Array.isArray(item.efforts) || item.efforts.some((effort) => typeof effort !== 'string' || effort === '') || typeof item.updatedAt !== 'number' || !Number.isFinite(item.updatedAt) || typeof item.updatedBy !== 'string' || item.updatedBy === '') throw new CliError(`${prefix} — models[${index}] is invalid`);
+      return { harness: item.harness, model: item.model, efforts: item.efforts as string[], updatedAt: item.updatedAt, updatedBy: item.updatedBy };
+    }),
+  };
+}
+
 /** `roster` uses the same authenticated REST ladders as `routing`; show stays
  * fully offline so it reports exactly what an agent-run child would route. */
 async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
@@ -1861,7 +1912,14 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
 
   const getJson = async (path: string, prefix: string): Promise<unknown> => {
     const { res, cred: used } = await authedGet(io, origin, slot, cred, path);
-    if (res.status === 401) assertAuthOk(res, used, origin);
+    if (res.status === 401) {
+      throw new CliError(
+	used.kind === 'agent'
+	  ? 'token revoked or invalid — re-mint it in the console or run `owenloop login`'
+	  : 'credential rejected by the hub — run `owenloop login`',
+	{ exitCode: 3 },
+      );
+    }
     if (!res.ok) throw new CliError((await hubRequestMessage(res)) ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
     try {
       return await res.json() as unknown;
@@ -1892,11 +1950,11 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
   }
 
   if (sub === 'org' && orgSub === 'get') {
-    print(io, { ok: true, hub: origin, rosters: await getJson('/api/rosters', 'rosters') });
+    print(io, { ok: true, hub: origin, rosters: validateGetRostersSuccess(await getJson('/api/rosters', 'rosters')) });
     return 0;
   }
   if (sub === 'registry' && registrySub === 'get') {
-    print(io, { ok: true, hub: origin, registry: await getJson('/api/harness_models', 'harness_models') });
+    print(io, { ok: true, hub: origin, registry: validateHarnessModelsSuccess(await getJson('/api/harness_models', 'harness_models')) });
     return 0;
   }
 
@@ -7229,12 +7287,18 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
   } else {
     for (const crew of agentCrews) {
       const path = crewRosterPath(io.env, crew);
-      // `wx` is the consent rule, not merely a race optimization: an operator
-      // or another setup process may create the strongest-layer file after we
-      // decide what to materialize, and that must never be truncated.
+      // Write a complete private temp first, then install it with link(2): the
+      // link is exclusive (EEXIST leaves an operator file untouched), while a
+      // short write can only leave a removable temp, never a corrupt roster.
       try {
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify({ note: `machine-local overrides for crew ${crew}; wins over settings.json and hub rosters — see docs/cli.md`, roster: {} }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+	const temp = join(dirname(path), `.${randomUUID()}.roster.tmp`);
+	try {
+	  writeFileSync(temp, `${JSON.stringify({ note: `machine-local overrides for crew ${crew}; wins over settings.json and hub rosters — see docs/cli.md`, roster: {} }, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+	  linkSync(temp, path);
+	} finally {
+	  try { unlinkSync(temp); } catch { /* the completed target is already safe; cleanup is best-effort */ }
+	}
 	io.err(`✓ crew roster ${crew}: created`);
 	steps.push({ step: 'crew rosters', action: 'done', detail: `${crew}: ${path}` });
       } catch (error) {
