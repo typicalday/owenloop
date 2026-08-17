@@ -21,11 +21,11 @@
  *   - `OWENLOOP_CONFIG_DIR` outranks `HOME` in the config-dir ladder
  *     (`configDir`, src/hub.ts), so credential and settings lookups read the
  *     operator's REAL config dir instead of the fixture's temp one.
- *   - `OWENLOOP_SERVE_CREWS` is the shift-to-worker roster handoff, so an
- *     ambient value could select a crew the test never asked for.
  *   - `OWENLOOP_ALLOWED_WORKDIR_ROOTS` arrives through `buildSpawnPlan`'s
  *     `{...process.env}` spread, so a test asserting that the plan sets NO such
  *     variable sees the operator's value and fails.
+ *   - `OWENLOOP_SERVE_CREWS` was the removed shift-to-worker roster handoff;
+ *     an ambient value could once select a crew the test never asked for.
  *
  * ## The rule, and why it is a denylist of the namespace instead
  *

@@ -344,6 +344,7 @@ export const ORDER_FIELDS = {
   // unmodified run on a capability-silent step carries neither, so every order
   // emitted before this field existed still validates unchanged.
   capabilities: 'optional',
+  crews: 'optional',
   modifier: 'optional',
   // Set only when a caller-supplied reroute rule replaced the composed offer,
   // holding what the def actually asked for. Signed like the rest of the

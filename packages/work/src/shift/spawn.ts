@@ -220,25 +220,15 @@ export function buildSpawnPlan(
   shiftId?: string,
   logDir?: string,
   allowedWorkdirRoots?: string[],
-  serveCrews?: string[],
 ): SpawnPlan {
   const role = spec.kind === 'agent-run' ? 'agent-run' : 'exec';
-  // `OWENLOOP_SERVE_CREWS` is Shift-owned routing plumbing, never ambient
-  // configuration. A child for --all must not inherit a stale named-crew list
-  // from the Shift process that launched it.
   const env: NodeJS.ProcessEnv = { ...process.env };
-  delete env['OWENLOOP_SERVE_CREWS'];
   env['OWENLOOP_ACCOUNT'] = account;
   if (spec.startGate !== undefined) env['OWENLOOP_START_GATE'] = spec.startGate;
   if (spec.shiftName !== undefined && spec.shiftName !== '') env['OWENLOOP_SHIFT_NAME'] = spec.shiftName;
   if (spec.shiftOwner !== undefined && spec.shiftOwner !== '') env['OWENLOOP_SHIFT_OWNER'] = spec.shiftOwner;
   if (allowedWorkdirRoots !== undefined && allowedWorkdirRoots.length > 0) {
     env['OWENLOOP_ALLOWED_WORKDIR_ROOTS'] = allowedWorkdirRoots.join(':');
-  }
-  // Shift-internal roster handoff only. It is deliberately not passed to the
-  // harness child and is absent for command workers.
-  if (role === 'agent-run' && serveCrews !== undefined && serveCrews.length > 0) {
-    env['OWENLOOP_SERVE_CREWS'] = serveCrews.join(',');
   }
   return {
     command: execPath,
@@ -276,7 +266,6 @@ export function createDefaultSpawner(
   onFailure?: WorkerFailureReporter,
   logging?: WorkerLogOptions,
   allowedWorkdirRoots?: string[],
-  serveCrews?: string[],
 ): Spawner {
   // ONE report per shift, not one per dispatch. Every condition that stops a
   // worker log from opening — a full disk, a read-only log directory, an
@@ -301,7 +290,6 @@ export function createDefaultSpawner(
       shiftId,
       logging?.dir,
       allowedWorkdirRoots,
-      serveCrews,
     );
     // Open the log ONCE and hand the SAME descriptor to slots 1 and 2. Opening
     // it twice would create two independent file offsets, and the two streams

@@ -97,6 +97,13 @@ export function composeCapabilities(
 export type CapabilityRewrites = Readonly<Record<string, string>>;
 
 /**
+ * Crews matched per SERVED capability, supplied by the caller that owns the
+ * routing table. Keys are post-reroute capability strings; values are crew
+ * names in match order. Hub → worker; unrelated to `serve_crews`.
+ */
+export type CrewStamps = Readonly<Record<string, readonly string[]>>;
+
+/**
  * Substitute a caller's reroute decisions into a composed offer.
  *
  * Returns the offer to use plus — only when something actually changed — the

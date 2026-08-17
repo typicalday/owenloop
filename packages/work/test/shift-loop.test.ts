@@ -1289,56 +1289,6 @@ test('buildSpawnPlan carries the live shift ownership name in the agent child en
   assert.equal(plan.options.env['OWENLOOP_SHIFT_OWNER'], '/state/shift-a');
 });
 
-test('buildSpawnPlan passes shift crews to agent-run in command-line order only', () => {
-  const agent = buildSpawnPlan(
-    { workflow: 'wf1', run: 'run_zzzz', kind: 'agent-run' },
-    'https://hub.example',
-    'ci',
-    '/pkg/bin/owenloop.mjs',
-    '/usr/bin/node',
-    undefined,
-    undefined,
-    undefined,
-    ['first', 'second'],
-  );
-  assert.equal(agent.options.env['OWENLOOP_SERVE_CREWS'], 'first,second');
-
-  const command = buildSpawnPlan(
-    { workflow: 'wf1', run: 'run_zzzz' },
-    'https://hub.example',
-    'ci',
-    '/pkg/bin/owenloop.mjs',
-    '/usr/bin/node',
-    undefined,
-    undefined,
-    undefined,
-    ['first'],
-  );
-  assert.equal(command.options.env['OWENLOOP_SERVE_CREWS'], undefined);
-});
-
-test('buildSpawnPlan clears an ambient crew handoff for --all agent workers', () => {
-  const previous = process.env['OWENLOOP_SERVE_CREWS'];
-  process.env['OWENLOOP_SERVE_CREWS'] = 'stale-crew';
-  try {
-    const plan = buildSpawnPlan(
-      { workflow: 'wf1', run: 'run_zzzz', kind: 'agent-run' },
-      'https://hub.example',
-      'ci',
-      '/pkg/bin/owenloop.mjs',
-      '/usr/bin/node',
-      undefined,
-      undefined,
-      undefined,
-      [],
-    );
-    assert.equal('OWENLOOP_SERVE_CREWS' in plan.options.env, false);
-  } finally {
-    if (previous === undefined) delete process.env['OWENLOOP_SERVE_CREWS'];
-    else process.env['OWENLOOP_SERVE_CREWS'] = previous;
-  }
-});
-
 test('createDefaultSpawner reports a nonzero detached worker exit with generic lifecycle metadata', async () => {
   const script = join(stateDir, '..', 'exit-seven.mjs');
   writeFileSync(script, 'process.exit(7);\n');

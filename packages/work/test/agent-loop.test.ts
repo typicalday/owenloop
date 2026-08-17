@@ -59,6 +59,10 @@ interface OrderOpts {
   x?: Record<string, unknown>;
   /** The composed capabilities the engine offered this step under. */
   capabilities?: string[];
+  /** The hub's ordered crew stamp for a capability-bearing order. */
+  crews?: string[];
+  /** Exercise the explicit missing-stamp protocol failure. */
+  omitCrewStamp?: boolean;
   /** The run's routing modifier, as `start_run` recorded it. */
   modifier?: string;
   /** Set by the engine when it re-offered this step at its escalation target. */
@@ -80,7 +84,12 @@ function agentOrder(o: OrderOpts = {}): GetOrderResponse {
       outputs: [],
       ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
       ...(o.model !== undefined ? { model: o.model } : {}),
-      ...(o.capabilities !== undefined ? { capabilities: o.capabilities } : {}),
+      ...(o.capabilities !== undefined
+		? {
+			capabilities: o.capabilities,
+			...(o.omitCrewStamp ? {} : { crews: o.crews ?? ['test-crew'] }),
+		}
+		: {}),
       ...(o.modifier !== undefined ? { modifier: o.modifier } : {}),
       ...(o.escalated !== undefined ? { escalated: o.escalated } : {}),
       ...(o.worker !== undefined ? { worker: o.worker } : {}),
@@ -244,7 +253,7 @@ interface BuildOpts {
   shiftName?: string;
   shiftOwner?: string;
   consumedVerifier?: AgentRunLoopOptions['consumedVerifier'];
-  rosters?: readonly MergedRoster[];
+  resolveCrewRosters?: AgentRunLoopOptions['resolveCrewRosters'];
   appendSession?: AgentRunLoopOptions['appendSession'];
   latestSession?: AgentRunLoopOptions['latestSession'];
   dirExists?: AgentRunLoopOptions['dirExists'];
@@ -271,7 +280,7 @@ function buildOpts(b: BuildOpts): Harnessed {
     resolveAdapter: () => resolution,
     harnessAvailable: (id) => id === 'fake',
     ...(b.consumedVerifier === undefined ? {} : { consumedVerifier: b.consumedVerifier }),
-    ...(b.rosters === undefined ? {} : { rosters: b.rosters }),
+    resolveCrewRosters: b.resolveCrewRosters ?? (() => ({ ok: true, rosters: [] })),
     ...(b.allowedWorkdirRoots === undefined ? {} : { allowedWorkdirRoots: b.allowedWorkdirRoots }),
     appendSession: b.appendSession ?? ((rec) => records.push(rec)),
     ...(b.latestSession === undefined ? {} : { latestSession: b.latestSession }),
@@ -290,6 +299,8 @@ function buildOpts(b: BuildOpts): Harnessed {
 
 const statuses = (records: SessionRecord[]): string[] => records.map((r) => r.status);
 const verbs = (calls: Call[]): string[] => calls.map((c) => c.verb);
+const resolvedRosters = (rosters: readonly MergedRoster[]): AgentRunLoopOptions['resolveCrewRosters'] =>
+  () => ({ ok: true, rosters });
 
 // ---- happy path -------------------------------------------------------------
 
@@ -410,7 +421,7 @@ async function startArgsFor(o: OrderOpts, map: MergedRoster = MAP): Promise<Star
   const h = buildOpts({
     hub,
     adapter,
-    rosters: [map],
+    resolveCrewRosters: resolvedRosters([map]),
     consumedVerifier: async (order) => ({ ok: true, order, warnings: [] }),
   });
   await createAgentRunLoop(h.opts).run();
@@ -454,7 +465,7 @@ test('an order carrying no capabilities runs on the harness default, not a guess
 test('an order whose capabilities match no row is REFUSED, never run on a default model', async () => {
   const adapter = createFakeAdapter();
   const { hub, calls } = mockHub({ getOrder: [agentOrder({ capabilities: ['paint:deep'] })] });
-  const h = buildOpts({ hub, adapter, rosters: [MAP] });
+  const h = buildOpts({ hub, adapter, resolveCrewRosters: resolvedRosters([MAP]) });
 
   const outcome = await createAgentRunLoop(h.opts).run();
 
@@ -476,12 +487,102 @@ test('a shift with NO roster at all refuses a capability-bearing order', async (
   assert.equal(adapter.calls.filter((c) => c.kind === 'start').length, 0);
 });
 
+test('a capability-bearing order without a crew stamp is released loudly, never routed', async () => {
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({
+    getOrder: [agentOrder({ capabilities: ['build:deep'], omitCrewStamp: true })],
+  });
+  let resolverCalls = 0;
+  const h = buildOpts({
+    hub,
+    adapter,
+    resolveCrewRosters: () => {
+      resolverCalls += 1;
+      return { ok: true, rosters: [MAP] };
+    },
+  });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'unstamped-order');
+  assert.equal(resolverCalls, 0);
+  assert.equal(adapter.calls.filter((c) => c.kind === 'start').length, 0);
+  assert.equal(calls.filter((c) => c.verb === 'release').length, 1);
+  assert.ok(h.errs.some((line) => line.includes('NO crews stamp') && line.includes('no fallback')));
+});
+
+test('empty and malformed crew stamps are released without silently repairing them', async () => {
+  for (const crews of [[], ['ok', '  ']]) {
+    const adapter = createFakeAdapter();
+    const { hub } = mockHub({ getOrder: [agentOrder({ capabilities: ['build:deep'], crews })] });
+    let resolverCalls = 0;
+    const h = buildOpts({
+      hub,
+      adapter,
+      resolveCrewRosters: () => {
+			resolverCalls += 1;
+			return { ok: true, rosters: [MAP] };
+      },
+    });
+
+    assert.equal(await createAgentRunLoop(h.opts).run(), 'unstamped-order');
+    assert.equal(resolverCalls, 0, JSON.stringify(crews));
+    assert.equal(adapter.calls.filter((c) => c.kind === 'start').length, 0);
+    assert.ok(h.errs.some((line) => line.includes(JSON.stringify(crews))));
+  }
+});
+
+test('an unresolvable stamped crew is released with its name and resolution error', async () => {
+  const adapter = createFakeAdapter();
+  const { hub, calls } = mockHub({ getOrder: [agentOrder({ capabilities: ['build:deep'], crews: ['openai'] })] });
+  const h = buildOpts({
+    hub,
+    adapter,
+    resolveCrewRosters: () => ({ ok: false, crew: 'openai', detail: 'invalid crew roster at /tmp/openai.json' }),
+  });
+
+  assert.equal(await createAgentRunLoop(h.opts).run(), 'unresolvable-crew');
+  assert.equal(adapter.calls.filter((c) => c.kind === 'start').length, 0);
+  assert.equal(calls.filter((c) => c.verb === 'release').length, 1);
+  assert.ok(h.errs.some((line) => line.includes('openai') && line.includes('invalid crew roster')));
+});
+
+test('the stamped crew order is the roster-resolution sequence', async () => {
+  const a: MergedRoster = {
+    build: { candidates: [{ harness: 'fake', model: 'from-a', effort: 'high' }], source: 'a' },
+  };
+  const b: MergedRoster = {
+    build: { candidates: [{ harness: 'fake', model: 'from-b', effort: 'high' }], source: 'b' },
+  };
+  const byCrew: Record<string, MergedRoster> = { a, b };
+
+  for (const [crews, model] of [[['a', 'b'], 'from-a'], [['b', 'a'], 'from-b']] as const) {
+    const adapter = createFakeAdapter();
+    const { hub } = mockHub({
+      getOrder: [agentOrder({ capabilities: ['build'], crews: [...crews] }), agentOrder({ claimed: false, outcome: 'green' })],
+    });
+    let received: readonly string[] | undefined;
+    const h = buildOpts({
+      hub,
+      adapter,
+      resolveCrewRosters: (stamp) => {
+			received = stamp;
+			return { ok: true, rosters: stamp.map((crew) => byCrew[crew]!) };
+      },
+    });
+
+    assert.equal(await createAgentRunLoop(h.opts).run(), 'submitted');
+    const start = adapter.calls.find((call) => call.kind === 'start');
+    assert.ok(start !== undefined && start.kind === 'start');
+    assert.equal(start.args.model, model);
+    assert.deepEqual(received, crews);
+  }
+});
+
 test('the resolution is reported to the hub BEFORE the harness turn starts', async () => {
   const adapter = createFakeAdapter();
   const { hub, calls } = mockHub({
     getOrder: [agentOrder({ capabilities: ['build:deep'] }), agentOrder({ claimed: false, outcome: 'green' })],
   });
-  const h = buildOpts({ hub, adapter, rosters: [MAP] });
+  const h = buildOpts({ hub, adapter, resolveCrewRosters: resolvedRosters([MAP]) });
 
   await createAgentRunLoop(h.opts).run();
 
@@ -526,7 +627,7 @@ test('a failing report_resolution is logged and the order runs anyway', async ()
   hub.reportResolution = async (): Promise<never> => {
     throw new HubError(500, 'report_resolution blew up');
   };
-  const h = buildOpts({ hub, adapter, rosters: [MAP] });
+  const h = buildOpts({ hub, adapter, resolveCrewRosters: resolvedRosters([MAP]) });
 
   await createAgentRunLoop(h.opts).run();
 
@@ -540,7 +641,7 @@ async function reportFor(
   map: MergedRoster,
 ): Promise<Record<string, unknown> | undefined> {
   const { hub, calls } = mockHub({ getOrder: [agentOrder(o), agentOrder({ claimed: false, outcome: 'green' })] });
-  const h = buildOpts({ hub, adapter: createFakeAdapter(), rosters: [map] });
+  const h = buildOpts({ hub, adapter: createFakeAdapter(), resolveCrewRosters: resolvedRosters([map]) });
   await createAgentRunLoop(h.opts).run();
   const report = calls.find((c) => c.verb === 'report_resolution');
   if (report === undefined) return undefined;

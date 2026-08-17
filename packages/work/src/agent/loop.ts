@@ -106,6 +106,8 @@ export type AgentRunOutcome =
   | 'no-template' // no cached bundle / no step spec for the step (exit 1)
   | 'no-harness' // the resolved harness id names no registered adapter (exit 1)
   | 'incompatible-harness-policy' // selected adapter cannot enforce the restrictions (exit 1)
+  | 'unstamped-order' // a capability-bearing order had no usable hub crew stamp (exit 1)
+  | 'unresolvable-crew' // a stamped crew's local roster could not be read (exit 1)
   | 'unresolvable-capability' // no settings row for the order's capabilities (exit 1)
   | 'unverified-consumed' // dynamic values or rejection reasons failed verification (exit 1)
   | 'session-store-failed' // durable active-row gate failed before provider work (exit 1)
@@ -150,6 +152,18 @@ export type AdapterResolver = (
   stepHarness: string | undefined,
 ) => AdapterResolution;
 
+/** Outcome of turning a STAMPED crew name list into merged rosters. */
+export type CrewRosterResolution =
+  | { ok: true; rosters: readonly MergedRoster[] }
+  | { ok: false; crew: string; detail: string };
+
+/**
+ * Turns the crews the HUB STAMPED on an order into merged rosters, in the
+ * stamped order. Injected by the role so the loop stays free of filesystem and
+ * environment reads.
+ */
+export type CrewRosterResolver = (crews: readonly string[]) => CrewRosterResolution;
+
 /** Default confirm-phase cadence: one `get_order` per second. */
 export const DEFAULT_CONFIRM_INTERVAL_MS = 1_000;
 /** Default confirm-phase bound: give the hub 15s to show the submit's outcome. */
@@ -185,12 +199,10 @@ export interface AgentRunLoopOptions {
   loadStep: StepLoader;
   resolveAdapter: AdapterResolver;
   /**
-   * Merged crew rosters, in shift-start crew order. A hand-run worker and a
-   * shift started with `--all` receive exactly one machine-global roster.
-   * The Phase 1 crew selection is interim: Phase 2 replaces it with crews
-   * stamped by the hub on the order.
+   * Resolves the crews the hub stamped on the order. REQUIRED — this loop has
+   * no crew source other than the order's stamp.
    */
-  rosters?: readonly MergedRoster[];
+  resolveCrewRosters: CrewRosterResolver;
   /**
    * Phase-1 availability is adapter-registry membership at the composition
    * root. A real binary/credential probe needs new adapter-contract surface.
@@ -344,9 +356,11 @@ export type OrderRouting =
   | {
       kind: 'refused';
       capabilities: readonly string[];
-      reason: 'harness-policy' | 'unresolvable-capability';
+      reason: 'harness-policy' | 'unstamped-order' | 'unresolvable-crew' | 'unresolvable-capability';
       offered?: readonly string[];
       stepHarness?: string;
+      crew?: string;
+      detail?: string;
     }
   | { kind: 'unrouted' };
 
@@ -360,14 +374,49 @@ export type OrderRouting =
  */
 export function resolveOrderRouting(
   packet: OrderPacket,
-  rosters: readonly MergedRoster[] | undefined,
+  resolveCrewRosters: CrewRosterResolver,
   stepHarness: string | undefined,
   isAvailable: (harnessId: string) => boolean,
 ): OrderRouting {
   const capabilities = packet.capabilities ?? [];
   if (capabilities.length === 0) return { kind: 'unrouted' };
+  const stamp = packet.crews;
+  if (stamp === undefined) {
+    return {
+      kind: 'refused',
+      capabilities,
+      reason: 'unstamped-order',
+      detail: 'the order carries no crews field',
+    };
+  }
+  if (!Array.isArray(stamp) || stamp.length === 0) {
+    return {
+      kind: 'refused',
+      capabilities,
+      reason: 'unstamped-order',
+      detail: `unusable crews stamp (${JSON.stringify(stamp)})`,
+    };
+  }
+  if (stamp.some((crew) => typeof crew !== 'string' || crew.trim() === '')) {
+    return {
+      kind: 'refused',
+      capabilities,
+      reason: 'unstamped-order',
+      detail: `unusable crews stamp (${JSON.stringify(stamp)})`,
+    };
+  }
+  const resolved = resolveCrewRosters(stamp);
+  if (!resolved.ok) {
+    return {
+      kind: 'refused',
+      capabilities,
+      reason: 'unresolvable-crew',
+      crew: resolved.crew,
+      detail: resolved.detail,
+    };
+  }
   let firstHarnessPolicy: { offered: readonly string[]; stepHarness: string | undefined } | undefined;
-  for (const roster of rosters ?? []) {
+  for (const roster of resolved.rosters) {
     // Preserve arbitrary capability names through the boundary between the
     // provenance-bearing merged roster and the candidate-only selector.
     const candidateRows = Object.create(null) as Record<string, readonly import('./capability-model.ts').RosterCandidate[]>;
@@ -750,10 +799,7 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
     const step: NormalizedStepSpec = material;
 
     // ---- ROUTING: select a roster candidate before resolving an adapter ----
-    //
-    // Phase 1's crew order is interim. Phase 2 replaces these locally supplied
-    // rosters with crew stamps the hub puts on each offer.
-    const routing = resolveOrderRouting(packet, opts.rosters, step.harness, opts.harnessAvailable);
+    const routing = resolveOrderRouting(packet, opts.resolveCrewRosters, step.harness, opts.harnessAvailable);
     await reportResolution(routing);
     if (routing.kind === 'refused') {
       if (routing.reason === 'harness-policy') {
@@ -762,6 +808,18 @@ export function createAgentRunLoop(opts: AgentRunLoopOptions): AgentRunLoop {
             `but its roster candidates offer [${(routing.offered ?? []).join(', ')}] — releasing`,
         );
         return releaseWith('incompatible-harness-policy', 'incompatible-harness-policy');
+      }
+      if (routing.reason === 'unstamped-order') {
+		opts.err(packet.crews === undefined
+			? `owenloop work agent-run: order ${order} was offered under capabilities [${routing.capabilities.join(', ')}] but carries NO crews stamp. This worker resolves crew rosters only from the hub's offer-time stamp; there is no fallback to the crews this shift was started with. The hub at ${opts.origin} must stamp crews on every capability-bearing order. Releasing.`
+			: `owenloop work agent-run: order ${order} was offered under capabilities [${routing.capabilities.join(', ')}] but carries an unusable crews stamp (${JSON.stringify(packet.crews)}). Expected a non-empty array of non-empty crew names. This worker resolves crew rosters only from the hub's offer-time stamp; there is no fallback to the crews this shift was started with. The hub at ${opts.origin} must stamp crews on every capability-bearing order. Releasing.`);
+		return releaseWith('unstamped-order', 'unstamped-order');
+      }
+      if (routing.reason === 'unresolvable-crew') {
+		opts.err(
+			`owenloop work agent-run: order ${order} is stamped with crews [${packet.crews!.join(', ')}], but crew '${routing.crew}' cannot be resolved on this machine: ${routing.detail}. Releasing.`,
+		);
+		return releaseWith('unresolvable-crew', 'unresolvable-crew');
       }
       opts.err(
         `owenloop work agent-run: no crew roster row for ${order} — the order's capabilities ` +

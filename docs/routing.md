@@ -217,14 +217,14 @@ candidate is `unresolvable-capability`.
 
 A shift start command names its crews, credentials, display identity, and
 state directory. It no longer carries an operator-selected harness or a
-per-shift config directory. The shift passes its positional crews to agent
-children internally; they try matching merged crew rosters in command-line
-order. This is an interim Phase-1 rule until the hub stamps matched crews on
-the order.
+per-shift config directory. Its crews are the worker → hub
+`serve_crews` narrowing advertisement; the shift passes NO crews to agent
+children. For a capability-bearing order, the hub stamps its matched crews on
+the order and the agent resolves those rosters in the stamped order.
 
 | Name | What it selects |
 |---|---|
-| **crew** (positional) | which crew rosters the shift serves |
+| **crew** (positional) | worker → hub `serve_crews` offer scope; the hub-stamped `order.crews` resolves the agent worker's roster sequence |
 | **`--as`** | which stored credential to authenticate with |
 | **`--name`** | a display label for this shift |
 | **`--state-dir`** | local socket and child-state storage |
@@ -314,18 +314,20 @@ sets do not overlap at all, which is exactly what it looks like when
 eligibility comes entirely from crew membership and the crews are named after
 teams.
 
-**Step 7 — the shift picks the model.**
+**Step 7 — the worker picks the model.**
 
-The `openai-1` shift reads `order.capabilities` — `['build:deep']` — and
-looks it up in its merged crew roster:
+The agent reads `order.capabilities` — `['build:deep']` — plus the hub →
+worker `order.crews` stamp, and resolves those merged crew rosters in order:
 
 1. Try the **exact compound**: `build:deep` → an ordered candidate array. Found.
 2. If not found, try the **bare name part**: `build`.
-3. If neither is found, the shift **refuses the order** with
+3. If neither is found, the worker **refuses the order** with
    `unresolvable-capability` and the hub re-offers it.
 
-That third case is a real, deliberate refusal, not a crash. A shift that has no
-rate for a job does not guess a model.
+An absent, empty, malformed, or unreadable crew stamp is also refused and
+released; there is no fallback to the crews the shift was started with. These
+are real, deliberate refusals, not crashes. A worker that has no rate for a job
+does not guess a model.
 
 **Step 8 — the harness runs it.**
 
@@ -574,6 +576,7 @@ Each of these has actually happened. Each has a one-line correction.
 | "The capability says which model to use." | It says which *job*. The model comes from the shift's local `settings.json`, at the very last step. |
 | "`build:deep` belongs to the openai crew." | No — `build:deep` is *certified to* the `openai` crew. Certify a second crew for it and both are eligible. Nothing owns it. |
 | "A shift declares its capabilities." | It declares its **crew**. The hub derives capabilities from crew membership via `listCapabilitiesForCrews`. |
+| "The shift's positional crews decide an agent worker's roster." | No. They only advertise worker → hub `serve_crews`; the hub-stamped `order.crews` list resolves each capability-bearing order's roster sequence. |
 | "The shift that is clocked in has no rate for `build:deep`, so serve it something else." | Do not serve it at all. Certify the crew that *can* do it. That is what the binding is for. |
 | "`--modifier` defaults to standard." | Omitting it means **no modifier**. Steps are offered on bare authored capabilities. |
 | "A modifier means 'more effort'." | To the engine it is an opaque string. All meaning lives in the shift's `roster` map. |
@@ -600,8 +603,9 @@ delivery.yaml          steps: [{ name: builder, capabilities: [build] }]
    match: exact  ->  only crews certified for "build:deep" may claim
                             |
    the openai-1 shift claims; order.capabilities = ["build:deep"]
+   order.crews = ["openai"]
                             |
-   shift merges its crew roster:
+   agent resolves the stamped crew roster:
        "build:deep": [{ harness: codex, model: gpt-5.6-terra, effort: xhigh }]
                             |
    the selected candidate spawns that model at that effort

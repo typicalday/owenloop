@@ -79,14 +79,19 @@ import '../harnesses.ts';
 import { hostname } from 'node:os';
 
 import { resolveCacheDir } from '../bundle/cache.ts';
-import { createAgentRunLoop, type AdapterResolution, type AgentRunOutcome } from '../agent/loop.ts';
+import {
+  createAgentRunLoop,
+  type AdapterResolution,
+  type AgentRunOutcome,
+  type CrewRosterResolution,
+} from '../agent/loop.ts';
 import { createDefaultStoreInstructionResolver, type InstructionResolver } from '../exec/instructions.ts';
 import { createConsumedVerifier, type ConsumedVerifier } from '../consumed-verifier.ts';
 import type { NormalizedStepSpec } from '../bundle/types.ts';
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
-import { effectiveRosterLayers, mergeRosterLayers } from '../settings/roster.ts';
+import { effectiveRosterLayers, mergeRosterLayers, type MergedRoster } from '../settings/roster.ts';
 import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/registry.ts';
 import { parseHarnessCarrier } from '../bundle/fetch.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from '../harness/permissions.ts';
@@ -212,6 +217,8 @@ export function exitCodeFor(outcome: AgentRunOutcome): number {
     case 'no-template':
     case 'no-harness':
     case 'incompatible-harness-policy':
+    case 'unstamped-order':
+    case 'unresolvable-crew':
     case 'unresolvable-capability':
     case 'unverified-consumed':
     case 'session-store-failed':
@@ -307,14 +314,6 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     return 1;
   }
 
-  // Phase 1 interim rule: choose crew rosters in the order the shift was
-  // started with. Phase 2 replaces this handoff with crews stamped by the hub
-  // on each offer. A hand-run worker and a shift started with --all see only
-  // the machine-global settings layer.
-  const servedCrews = (env['OWENLOOP_SERVE_CREWS'] ?? '')
-    .split(',')
-    .map((crew) => crew.trim())
-    .filter((crew) => crew !== '');
   const origin = parsed.origin ?? settings.hubOrigin;
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work agent-run: no hub origin — pass --origin <url> or set hubOrigin in settings');
@@ -374,19 +373,19 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   const account = workerEnv['OWENLOOP_ACCOUNT'] ?? 'default';
-  // The child performs no roster network call. It has the origin/account needed
-  // to read the daemon-maintained disk cache, and a missing/corrupt hub cache
-  // becomes visible absent layers rather than refusing otherwise-routable work.
-  let rosters;
-  try {
-    rosters =
-      servedCrews.length > 0
-	? servedCrews.map((crew) => mergeRosterLayers(effectiveRosterLayers(env, crew, { origin, account })))
-	: [mergeRosterLayers(effectiveRosterLayers(env, undefined, { origin, account }))];
-  } catch (e) {
-    err(`owenloop work agent-run: ${errMsg(e)}`);
-    return 1;
-  }
+  // The crews the HUB STAMPED on the order decide which rosters apply, so this
+  // runs per order inside the loop — the stamp does not exist at process start.
+  const resolveCrewRosters = (crews: readonly string[]): CrewRosterResolution => {
+    const rosters: MergedRoster[] = [];
+    for (const crew of crews) {
+      try {
+				rosters.push(mergeRosterLayers(effectiveRosterLayers(env, crew, { origin, account })));
+      } catch (e) {
+				return { ok: false, crew, detail: errMsg(e) };
+      }
+    }
+    return { ok: true, rosters };
+  };
   let hub = deps.hub;
   if (hub === undefined) {
     const bearer = await resolveBearer({ origin, account, env: workerEnv });
@@ -570,7 +569,7 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     allowedWorkdirRoots: resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd()),
     loadStep,
     resolveAdapter,
-    rosters,
+    resolveCrewRosters,
     // Phase-1 availability means registry membership. A real binary or
     // credential probe requires new HarnessAdapter contract surface.
     harnessAvailable: (id) => adapterFor(id) !== undefined,

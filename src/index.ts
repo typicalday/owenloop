@@ -39,7 +39,7 @@ export {
   DEFAULT_MATCH_MODE,
   MODIFIER_SEPARATOR,
 } from './capabilities.ts';
-export type { CapabilityRewrites, MatchMode } from './capabilities.ts';
+export type { CapabilityRewrites, CrewStamps, MatchMode } from './capabilities.ts';
 
 export { createEngine } from './factory.ts';
 export type { CreateEngineOpts, CreatedEngine } from './factory.ts';

@@ -216,6 +216,12 @@ export interface Order {
    */
   capabilities?: string[];
   /**
+   * Ordered crews the offering side matched for this order's capabilities.
+   * Absent when the caller supplied no stamps. Hub → worker, NOT the separate
+   * worker → hub `serve_crews` narrowing advertisement.
+   */
+  crews?: string[];
+  /**
    * The composed capabilities this order WOULD have been offered under, present
    * only when a caller-supplied reroute rule substituted something else into
    * `capabilities` above.

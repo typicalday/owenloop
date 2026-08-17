@@ -116,6 +116,11 @@
       "description": "The composed routing capabilities this order was offered under: each authored step capability, suffixed ':<modifier>' where a modifier applied. A snapshot of the offer — a claimed order is never recomposed. When 'reroutedFrom' is present this holds the reroute target instead, because this is the capability actually being served.",
       "items": { "type": "string", "minLength": 1 }
     },
+    "crews": {
+      "type": "array",
+      "description": "The ordered crews the offering side matched for this capability-bearing order. Hub → worker; unlike worker → hub serve_crews, this snapshot decides which local roster resolves the order.",
+      "items": { "type": "string", "minLength": 1 }
+    },
     "reroutedFrom": {
       "type": "array",
       "description": "The composed capabilities this order WOULD have been offered under, present only when a reroute rule substituted something else into 'capabilities'. Absent on every ordinary offer, so its presence is itself the signal that the order is not running on the capability its definition asked for.",
