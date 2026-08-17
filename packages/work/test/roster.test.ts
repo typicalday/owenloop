@@ -231,3 +231,23 @@ test('machineRosterLayers names an invalid crew file path', () => {
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test('machineRosterLayers fails closed for a malformed bounded-hash crew roster', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-hash-invalid-'));
+  try {
+    // This hub-valid name is unsafe as a literal path and too wide for the
+    // reversible codec, so its filename is a non-reversible bounded hash.
+    const crew = `../${'語'.repeat(61)}`;
+    const path = crewRosterPath({ HOME: home }, crew);
+    assert.match(basename(path), /^crew-hash--.*\.json$/u);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, '{"crew":');
+
+    assert.throws(
+      () => machineRosterLayers({ HOME: home }, crew),
+      /invalid crew roster at .*crew-hash--.*\.json/u,
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

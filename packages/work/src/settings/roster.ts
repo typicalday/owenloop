@@ -332,12 +332,17 @@ export function machineRosterLayers(
 ): RosterLayer[] {
   const layers: RosterLayer[] = [];
   if (crew !== undefined) {
-    const existing = findCrewRosterFile(env, crew);
-    const path = existing?.path ?? crewRosterPath(env, crew);
+    // Do not use discovery as the read gate. Bounded hash filenames need the
+    // JSON's `crew` field for doctor to associate them with their intended
+    // name, but that field is unavailable precisely when a truncated/corrupt
+    // strongest-layer file must fail closed. The requested crew resolves its
+    // own deterministic target, and any existing target is always parsed by
+    // readCrewRoster.
+    const path = crewRosterPath(env, crew);
     layers.push({
       source: `machine crews/${crew}.json`,
       path,
-      ...(existing !== undefined ? { roster: readCrewRoster(path) } : {}),
+      ...(existsSync(path) ? { roster: readCrewRoster(path) } : {}),
     });
   }
   const path = join(owenloopConfigDir(env), 'settings.json');

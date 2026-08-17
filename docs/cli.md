@@ -2436,7 +2436,7 @@ lines (the tolerant-false notices, the transfer summary) go to stderr only.
 
 ## `setup` — onboard a machine
 
-`owenloop setup` is the one-shot onboarding command. It runs seven ordered steps.
+`owenloop setup` is the one-shot onboarding command. It runs eight ordered steps.
 Depending on the machine state, setup may store the human credential, mint or
 rekey and store a Scoped Identity credential, ensure the three principal
 signing keys, relay a signed machine enrollment grant, and write only
@@ -2463,7 +2463,15 @@ plugin version already installed performs no plugin writes. The steps:
 5. **execution settings** — write only `hubOrigin` into the execution settings
    file so the local Step Agent talks to this hub, preserving every other key
    (skipped when `hubOrigin` already matches).
-6. **plugin** — probe and converge the bundled `owenloop` plugin separately
+6. **crew rosters** — for every crew known to the verified or newly minted
+   Scoped Identity, materialize a local strongest-layer skeleton at its resolved
+   `crews/<crew>.json` path. Each new file contains a descriptive `note`, its
+   exact `crew` identity when needed by the bounded filename codec, and
+   `"roster": {}`, so the machine initially inherits the weaker settings and
+   hub layers. Setup never overwrites an existing acceptable crew-roster file:
+   it reports that file as skipped and leaves its bytes untouched. If setup does
+   not know any crews for the identity, it records a non-fatal noted result.
+7. **plugin** — probe and converge the bundled `owenloop` plugin separately
    for Claude Code and Codex. When the installed plugin is missing or its
    version differs from the CLI package, setup adds the bundled marketplace
    when needed and installs or updates the plugin. Claude Code uses
@@ -2474,10 +2482,10 @@ plugin version already installed performs no plugin writes. The steps:
    **Non-fatal:** a missing harness or failed convergence is reported as
    `noted` and never fails setup. If the bundled marketplace root is
    unavailable, setup prints manual commands instead.
-7. **doctor** — a final [`doctor`](#doctor--check-a-machines-install) pass over
+8. **doctor** — a final [`doctor`](#doctor--check-a-machines-install) pass over
    the same surfaces, whose result becomes setup's exit code.
 
-Progress lines (the `[n/7]` headers and `✓`/`✗` marks) go to **stderr**; the
+Progress lines (the `[n/8]` headers and `✓`/`✗` marks) go to **stderr**; the
 final machine-readable summary — `{ ok, hub, steps, doctor }` — goes to
 **stdout**.
 

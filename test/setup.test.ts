@@ -1,7 +1,7 @@
 /**
  * `owenloop setup` — the idempotent converger (identity model §7 Flow A/B),
  * driven in-process through `mainAsync` against the stateful `makeIdentityHub`
- * fake. Proves: the seven steps run in order, a fresh machine mints/logs in, a
+ * fake. Proves: the eight steps run in order, a fresh machine mints/logs in, a
  * SECOND run performs zero writes (idempotency), the signing-keys step creates
  * the three principal keys exactly once and honors `--reuse-ssh-key` for the
  * human key only, the succession prompt (Flow B) renders verbatim framing and
