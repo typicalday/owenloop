@@ -224,7 +224,10 @@ export function isNativeCrewRosterFilename(crew: string, platform: NodeJS.Platfo
 function legacyCrewRosterPath(dir: string, crew: string): string | undefined {
   if (crew === '' || crew.includes('\0')) return undefined;
   try {
-    return containedCrewPath(dir, `${crew}.json`);
+    // Preserve the literal pre-codec construction before proving containment.
+    // Unlike resolve(), join() treats a leading separator in the crew as a
+    // nested path below `dir`, so `/bar` retains an existing `crews/bar.json`.
+    return containedCrewPath(dir, join(dir, `${crew}.json`));
   } catch {
     // A traversal-shaped name that would leave `crews/` is never a legacy
     // migration target; it receives an encoded path below.

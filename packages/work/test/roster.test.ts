@@ -163,6 +163,24 @@ test('normalized contained legacy crew paths keep their pre-codec strongest rost
   }
 });
 
+test('a leading-separator legacy crew retains its pre-codec strongest roster', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-leading-separator-'));
+  try {
+    const env = { HOME: home };
+    const crews = join(home, '.owenloop', 'crews');
+    const crew = '/bar';
+    const legacy = join(crews, 'bar.json');
+    mkdirSync(crews, { recursive: true });
+    writeFileSync(legacy, JSON.stringify({ roster: { build: candidate('legacy', 'leading-separator-model') } }));
+
+    assert.equal(crewRosterPath(env, crew), legacy, 'the old join-normalized target remains selected');
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, crew)).build?.candidates[0]?.model, 'leading-separator-model');
+    assert.equal(existsSync(join(encodedCrewRosterDir(env), encodeCrewRosterFilename(crew))), false, 'no encoded duplicate is selected for an existing legacy roster');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('shared roster discovery makes nested legacy files visible to both doctor and the resolver', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-discovery-'));
   try {

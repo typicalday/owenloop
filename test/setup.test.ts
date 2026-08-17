@@ -40,7 +40,7 @@ import { owenloopSettingsPath } from '../src/work-settings.ts';
 import { encodeBase64, PAYLOAD_TYPE_ENROLLMENT_GRANT } from '../src/crypto/dsse.ts';
 import { publicKeyDescriptor } from '../src/crypto/keys.ts';
 import { buildEnrollmentGrant, DEFAULT_MACHINE_SCOPE } from '../src/crypto/enrollment.ts';
-import { crewRosterPath, encodeCrewRosterFilename } from '../packages/work/src/settings/roster.ts';
+import { crewRosterPath, encodedCrewRosterDir, encodeCrewRosterFilename } from '../packages/work/src/settings/roster.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
@@ -303,6 +303,23 @@ test('setup final doctor pass discovers a preserved nested legacy crew roster', 
   const summary = JSON.parse(t.out.join('\n')) as { steps: Array<{ step: string; action: string; detail: string }>; doctor: { checks: Array<{ label: string }> } };
   assert.ok(summary.steps.some((step) => step.step === 'crew rosters' && step.action === 'skipped' && step.detail.endsWith('/crews/foo/bar.json')));
   assert.ok(summary.doctor.checks.some((check) => check.label === `crew roster (${crew})`), 'doctor sees the same nested legacy roster the resolver selects');
+});
+
+test('setup preserves a leading-separator legacy roster without creating an encoded duplicate', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const crew = '/bar';
+  const legacy = join(t.io.env.HOME!, '.owenloop', 'crews', 'bar.json');
+  const contents = '{"roster":{"build":[{"harness":"codex","model":"legacy","effort":"high"}]}}\n';
+  mkdirSync(dirname(legacy), { recursive: true });
+  writeFileSync(legacy, contents);
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crew], t.io), 0, t.err.join('\n'));
+  const summary = JSON.parse(t.out.join('\n')) as { steps: Array<{ step: string; action: string; detail: string }> };
+  assert.ok(summary.steps.some((step) => step.step === 'crew rosters' && step.action === 'skipped' && step.detail.endsWith('/crews/bar.json')));
+  assert.equal(readFileSync(legacy, 'utf8'), contents, 'the old strongest layer remains byte-identical');
+  assert.equal(existsSync(join(encodedCrewRosterDir(t.io.env), encodeCrewRosterFilename(crew))), false, 'setup did not materialize an encoded duplicate');
 });
 
 test('setup preserves a codec-looking historical nested legacy roster and materializes its distinct codec crew', async () => {
