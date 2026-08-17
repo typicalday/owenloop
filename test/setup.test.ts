@@ -352,7 +352,7 @@ test('setup preserves a leading-separator legacy roster without creating an enco
   assert.equal(existsSync(join(encodedCrewRosterDir(t.io.env), encodeCrewRosterFilename(crew))), false, 'setup did not materialize an encoded duplicate');
 });
 
-test('setup preserves a codec-looking historical nested legacy roster and materializes its distinct codec crew', async () => {
+test('setup preserves a codec-looking nested legacy roster and materializes its distinct codec crew', async () => {
   const { routes } = makeIdentityHub();
   const { fetch } = routedFetch(routes);
   const t = makeIo({ fetch, onOpenUrl: driveCallback() });
@@ -374,33 +374,31 @@ test('setup preserves a codec-looking historical nested legacy roster and materi
   assert.equal(JSON.parse(readFileSync(codecPath, 'utf8')).crew, codecCrew, 'the separately materialized codec file declares its owner');
 });
 
-test('setup preserves an owned historical codec roster while materializing its literal alias independently', async () => {
-  const { routes } = makeIdentityHub();
-  const { fetch } = routedFetch(routes);
-  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
-  const delivery = 'delivery';
-  const encodedFilename = encodeCrewRosterFilename(delivery);
-  const alias = `.owenloop-encoded-rosters/${encodedFilename.slice(0, -'.json'.length)}`;
-  const historical = join(t.io.env.HOME!, '.owenloop', 'crews', '.owenloop-encoded-rosters', encodedFilename);
-  const deliveryContents = '{"crew":"delivery","roster":{"build":[{"harness":"codex","model":"delivery","effort":"high"}]}}\n';
-  mkdirSync(dirname(historical), { recursive: true });
-  writeFileSync(historical, deliveryContents);
+test('setup materializes aliasing hub crews independently in both orders', async () => {
+  // `bar` and `foo/../bar` join-normalize onto the same legacy path. Setup
+  // stamps the owning crew into every file it creates, so whichever crew
+  // materializes first must not hand its strongest layer to the second.
+  for (const order of [['bar', 'foo/../bar'], ['foo/../bar', 'bar']]) {
+    const { routes } = makeIdentityHub();
+    const { fetch } = routedFetch(routes);
+    const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+    assert.equal(
+      await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', order.join(',')], t.io),
+      0,
+      t.err.join('\n'),
+    );
 
-  assert.equal(
-    await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', `${delivery},${alias}`], t.io),
-    0,
-    t.err.join('\n'),
-  );
-
-  const aliasPath = crewRosterPath(t.io.env, alias);
-  assert.notEqual(aliasPath, historical);
-  assert.equal(readFileSync(historical, 'utf8'), deliveryContents, 'the delivery codec roster remains untouched');
-  assert.equal(JSON.parse(readFileSync(aliasPath, 'utf8')).crew, alias, 'setup materializes an independent alias roster');
-  const summary = JSON.parse(t.out.join('\n')) as { steps: Array<{ step: string; action: string; detail: string }>; doctor: { checks: Array<{ label: string }> } };
-  assert.ok(summary.steps.some((step) => step.step === 'crew rosters' && step.action === 'skipped' && step.detail.endsWith(`/crews/.owenloop-encoded-rosters/${encodedFilename}`)));
-  assert.ok(summary.steps.some((step) => step.step === 'crew rosters' && step.action === 'done' && step.detail === `${alias}: ${aliasPath}`));
-  assert.ok(summary.doctor.checks.some((check) => check.label === `crew roster (${delivery})`));
-  assert.ok(summary.doctor.checks.some((check) => check.label === `crew roster (${alias})`), 'doctor reports the independently materialized alias');
+    const barPath = crewRosterPath(t.io.env, 'bar');
+    const aliasPath = crewRosterPath(t.io.env, 'foo/../bar');
+    assert.notEqual(aliasPath, barPath, `order ${order.join(',')}: aliasing crews own distinct files`);
+    assert.equal(barPath, join(t.io.env.HOME!, '.owenloop', 'crews', 'bar.json'));
+    assert.equal(aliasPath, join(encodedCrewRosterDir(t.io.env), encodeCrewRosterFilename('foo/../bar')));
+    assert.equal(JSON.parse(readFileSync(barPath, 'utf8')).crew, 'bar', `order ${order.join(',')}: bar's file declares bar`);
+    assert.equal(JSON.parse(readFileSync(aliasPath, 'utf8')).crew, 'foo/../bar', `order ${order.join(',')}: the alias file declares its own crew`);
+    const summary = JSON.parse(t.out.join('\n')) as { doctor: { checks: Array<{ label: string }> } };
+    assert.ok(summary.doctor.checks.some((check) => check.label === 'crew roster (bar)'));
+    assert.ok(summary.doctor.checks.some((check) => check.label === 'crew roster (foo/../bar)'), 'doctor reports both independent rosters');
+  }
 });
 
 test('setup: fresh machine interactive — injected prompt names the agent; empty answer accepts the hostname prefill', async () => {

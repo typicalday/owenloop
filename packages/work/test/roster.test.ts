@@ -166,69 +166,14 @@ test('case-folding filesystems preserve only an exactly spelled legacy crew file
   }
 });
 
-test('case-folding filesystem seam isolates legacy base64url codec collisions', () => {
-  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-codec-case-fold-'));
-  try {
-    const env = { HOME: home };
-    const first = '//G';
-    const second = '//a';
-    const firstLegacyFilename = `crew--${Buffer.from(first, 'utf8').toString('base64url')}.json`;
-    const secondLegacyFilename = `crew--${Buffer.from(second, 'utf8').toString('base64url')}.json`;
-    assert.notEqual(firstLegacyFilename, secondLegacyFilename);
-    assert.equal(firstLegacyFilename.toLowerCase(), secondLegacyFilename.toLowerCase(), 'the retired base64url names collide under case folding');
-
-    const firstPath = join(encodedCrewRosterDir(env), firstLegacyFilename);
-    mkdirSync(dirname(firstPath), { recursive: true });
-    writeFileSync(firstPath, JSON.stringify({ crew: first, roster: { build: candidate('first', 'first-model') } }));
-
-    const filesystem = caseInsensitiveFilesystem();
-    assert.equal(crewRosterPath(env, first, filesystem), firstPath, 'an owned old codec roster remains a migration target');
-    const secondPath = crewRosterPath(env, second, filesystem);
-    assert.equal(secondPath, join(encodedCrewRosterDir(env), encodeCrewRosterFilename(second)));
-    assert.notEqual(secondPath.toLowerCase(), firstPath.toLowerCase(), 'the modern codec has no case-folding alias');
-    writeFileSync(secondPath, JSON.stringify({ crew: second, roster: { build: candidate('second', 'second-model') } }));
-
-    assert.equal(mergeRosterLayers(machineRosterLayers(env, first)).build?.candidates[0]?.model, 'first-model');
-    assert.equal(mergeRosterLayers(machineRosterLayers(env, second)).build?.candidates[0]?.model, 'second-model');
-    assert.deepEqual(
-      discoverCrewRosterFiles(env).map((file) => file.crew).sort(),
-      [first, second].sort(),
-      'doctor discovery agrees with isolated routing ownership',
-    );
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
-});
-
-test('disjoint codec generations never probe a legacy base64url file as a hexadecimal crew', () => {
-  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-codec-generation-'));
-  try {
-    const env = { HOME: home };
-    const legacyCrew = 'ێ4';
-    const currentCrew = '$@';
-    const legacyFilename = `crew--${Buffer.from(legacyCrew, 'utf8').toString('base64url')}.json`;
-    assert.equal(legacyFilename, 'crew--2440.json', 'the deployed legacy codec uses the base64url payload from the migration report');
-    assert.equal(encodeCrewRosterFilename(currentCrew), 'crew-hex--2440.json', 'the current hexadecimal payload is structurally namespaced');
-
-    const legacyPath = join(encodedCrewRosterDir(env), legacyFilename);
-    mkdirSync(dirname(legacyPath), { recursive: true });
-    writeFileSync(legacyPath, JSON.stringify({ crew: legacyCrew, roster: { build: candidate('legacy', 'legacy-model') } }));
-
-    assert.equal(crewRosterPath(env, legacyCrew), legacyPath, 'the owned old codec file remains readable');
-    const currentPath = crewRosterPath(env, currentCrew);
-    assert.equal(currentPath, join(home, '.owenloop', 'crews', `${currentCrew}.json`), 'the safe current crew reaches its literal fallback without probing the old owner');
-    writeFileSync(currentPath, JSON.stringify({ roster: { build: candidate('current', 'current-model') } }));
-
-    assert.equal(mergeRosterLayers(machineRosterLayers(env, legacyCrew)).build?.candidates[0]?.model, 'legacy-model');
-    assert.equal(mergeRosterLayers(machineRosterLayers(env, currentCrew)).build?.candidates[0]?.model, 'current-model');
-    assert.deepEqual(
-      discoverCrewRosterFiles(env).map((file) => file.crew).sort(),
-      [legacyCrew, currentCrew].sort(),
-      'doctor discovers both independent strongest-layer owners',
-    );
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
+test('the hexadecimal codec cannot alias distinct crews under case folding', () => {
+  const first = '//G';
+  const second = '//a';
+  const firstFilename = encodeCrewRosterFilename(first);
+  const secondFilename = encodeCrewRosterFilename(second);
+  assert.notEqual(firstFilename, secondFilename);
+  assert.notEqual(firstFilename.toLowerCase(), secondFilename.toLowerCase(), 'lowercase-hex payloads stay distinct after case folding');
+  assert.equal(firstFilename, firstFilename.toLowerCase(), 'the codec emits nothing for a filesystem to fold');
 });
 
 test('a contained nested-slash legacy roster remains the strongest layer after upgrade', () => {
@@ -320,8 +265,8 @@ test('a codec-looking pre-upgrade nested legacy roster keeps its own crew identi
     mkdirSync(dirname(legacyPath), { recursive: true });
     writeFileSync(legacyPath, JSON.stringify({ roster: { build: candidate('legacy', 'legacy-model') } }));
 
-    // The historical directory and reversible basename are not proof that this
-    // pre-upgrade nested file belongs to foo/bar. It remains the literal crew.
+    // A codec-shaped basename inside an ordinary nested legacy directory is
+    // not proof that the file belongs to foo/bar. It remains the literal crew.
     assert.equal(crewRosterPath(env, legacyCrew), legacyPath);
     const codecPath = crewRosterPath(env, decodedCrew);
     assert.equal(codecPath, join(encodedCrewRosterDir(env), encodedFilename));
@@ -340,34 +285,91 @@ test('a codec-looking pre-upgrade nested legacy roster keeps its own crew identi
   }
 });
 
-test('an owned historical codec roster cannot alias its literal historical filename crew', () => {
-  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-historical-alias-'));
+test('a setup-stamped legacy roster is not preserved for a distinct aliasing crew', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-owner-alias-'));
   try {
     const env = { HOME: home };
-    const delivery = 'delivery';
-    const encodedFilename = encodeCrewRosterFilename(delivery);
-    const alias = `.owenloop-encoded-rosters/${encodedFilename.slice(0, -'.json'.length)}`;
-    const historical = join(home, '.owenloop', 'crews', '.owenloop-encoded-rosters', encodedFilename);
-    mkdirSync(dirname(historical), { recursive: true });
-    writeFileSync(historical, JSON.stringify({ crew: delivery, roster: { build: candidate('historical', 'delivery-model') } }));
+    const crews = join(home, '.owenloop', 'crews');
+    const owner = 'bar';
+    const alias = 'foo/../bar';
+    mkdirSync(crews, { recursive: true });
+    // Setup records the owning crew in every file it materializes.
+    const ownerPath = crewRosterPath(env, owner);
+    assert.equal(ownerPath, join(crews, 'bar.json'));
+    writeFileSync(ownerPath, JSON.stringify({ crew: owner, roster: { build: candidate('owner', 'owner-model') } }));
 
-    // `delivery` still selects the historical codec file. The distinct hub
-    // crew whose literal legacy spelling reaches the same pathname instead
-    // receives its own current codec target.
-    assert.equal(crewRosterPath(env, delivery), historical);
+    // The aliasing crew join-normalizes onto the same legacy path but must not
+    // inherit bar's strongest layer; it receives its own codec target.
     const aliasPath = crewRosterPath(env, alias);
-    assert.notEqual(aliasPath, historical);
+    assert.notEqual(aliasPath, ownerPath);
     assert.equal(aliasPath, join(encodedCrewRosterDir(env), encodeCrewRosterFilename(alias)));
     mkdirSync(dirname(aliasPath), { recursive: true });
-    writeFileSync(aliasPath, JSON.stringify({ crew: alias, roster: { build: candidate('current', 'alias-model') } }));
+    writeFileSync(aliasPath, JSON.stringify({ crew: alias, roster: { build: candidate('alias', 'alias-model') } }));
 
-    assert.equal(mergeRosterLayers(machineRosterLayers(env, delivery)).build?.candidates[0]?.model, 'delivery-model');
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, owner)).build?.candidates[0]?.model, 'owner-model');
     assert.equal(mergeRosterLayers(machineRosterLayers(env, alias)).build?.candidates[0]?.model, 'alias-model');
-    assert.deepEqual(
-      discoverCrewRosterFiles(env).map((file) => `${file.crew}\0${file.path}`).sort(),
-      [`${delivery}\0${historical}`, `${alias}\0${aliasPath}`].sort(),
-      'doctor discovery agrees with the resolver about both independent owners',
-    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('aliasing crews stay isolated in the reverse materialization order', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-owner-alias-reverse-'));
+  try {
+    const env = { HOME: home };
+    const crews = join(home, '.owenloop', 'crews');
+    const alias = 'foo/../bar';
+    const owner = 'bar';
+    mkdirSync(crews, { recursive: true });
+    // The aliasing crew materializes first: with no existing legacy file to
+    // preserve, its non-native name goes straight to the codec directory.
+    const aliasPath = crewRosterPath(env, alias);
+    assert.equal(aliasPath, join(encodedCrewRosterDir(env), encodeCrewRosterFilename(alias)));
+    mkdirSync(dirname(aliasPath), { recursive: true });
+    writeFileSync(aliasPath, JSON.stringify({ crew: alias, roster: { build: candidate('alias', 'alias-model') } }));
+
+    const ownerPath = crewRosterPath(env, owner);
+    assert.equal(ownerPath, join(crews, 'bar.json'), 'bar keeps its literal file untouched by the alias');
+    writeFileSync(ownerPath, JSON.stringify({ crew: owner, roster: { build: candidate('owner', 'owner-model') } }));
+
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, owner)).build?.candidates[0]?.model, 'owner-model');
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, alias)).build?.candidates[0]?.model, 'alias-model');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('an ownerless pre-codec operator roster keeps join semantics for every alias', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-ownerless-legacy-'));
+  try {
+    const env = { HOME: home };
+    const crews = join(home, '.owenloop', 'crews');
+    mkdirSync(crews, { recursive: true });
+    const path = join(crews, 'bar.json');
+    // A pre-codec operator file records no crew identity.
+    writeFileSync(path, JSON.stringify({ roster: { build: candidate('operator', 'operator-model') } }));
+
+    assert.equal(crewRosterPath(env, 'bar'), path);
+    assert.equal(crewRosterPath(env, 'foo/../bar'), path, 'an ownerless file preserves the pre-codec join behavior');
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, 'foo/../bar')).build?.candidates[0]?.model, 'operator-model');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('a corrupt preserved legacy roster fails closed instead of falling to a codec target', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-corrupt-legacy-'));
+  try {
+    const env = { HOME: home };
+    const crews = join(home, '.owenloop', 'crews');
+    mkdirSync(crews, { recursive: true });
+    const path = join(crews, 'bar.json');
+    writeFileSync(path, '{"crew":');
+
+    // An unparseable file makes no ownership claim; the resolver still selects
+    // it so the read errors instead of silently using an empty codec roster.
+    assert.equal(crewRosterPath(env, 'bar'), path);
+    assert.throws(() => machineRosterLayers(env, 'bar'), /invalid crew roster at .*bar\.json/u);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
