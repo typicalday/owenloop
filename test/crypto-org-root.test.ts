@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -44,6 +44,14 @@ function assertManualRepair(error: StrandedLegacyGrantsError, path: string): voi
   assert.doesNotMatch(error.message, /Run:/);
   assert.ok(error.message.includes(path), error.message);
   assert.match(error.message, /Repair .* by hand/);
+}
+
+function assertInvalidLegacySource(env: Record<string, string | undefined>, path: string): void {
+  const error = strandedError(env);
+  assertManualRepair(error, path);
+  assert.match(error.message, /legacy grants source/);
+  assert.equal(existsSync(grantsDir(env)), false);
+  assert.throws(() => loadGrants(env), StrandedLegacyGrantsError);
 }
 
 test('org-root paths use HOME/.owenloop and ignore XDG_CONFIG_HOME', () => {
@@ -237,11 +245,48 @@ test('loadGrants returns an empty list when legacy has no grant envelopes', () =
   assert.deepEqual(loadGrants(env), []);
 });
 
-test('loadGrants ignores an unreadable legacy path used only as a diagnostic hint', () => {
+test('loadGrants requires manual repair when the legacy source is not a directory', () => {
   const home = temp('owenloop-org-legacy-file-');
   const env = { HOME: home };
+  const legacy = join(home, '.owenloop', 'roster');
   mkdirSync(join(home, '.owenloop'), { recursive: true });
-  writeFileSync(join(home, '.owenloop', 'roster'), 'not a directory');
+  writeFileSync(legacy, 'not a directory');
 
-  assert.deepEqual(loadGrants(env), []);
+  assertInvalidLegacySource(env, legacy);
+});
+
+test('loadGrants requires manual repair when the legacy source is a symlink', () => {
+  const home = temp('owenloop-org-legacy-symlink-');
+  const env = { HOME: home };
+  const legacy = join(home, '.owenloop', 'roster');
+  const target = join(home, 'legacy-target');
+  mkdirSync(target, { recursive: true });
+  writeFileSync(join(target, 'legacy.grant.dsse'), 'legacy-grant');
+  mkdirSync(join(home, '.owenloop'), { recursive: true });
+  symlinkSync(target, legacy);
+
+  assertInvalidLegacySource(env, legacy);
+});
+
+test('loadGrants requires manual repair when a legacy grant entry is a symlink', () => {
+  const home = temp('owenloop-org-legacy-grant-symlink-');
+  const env = { HOME: home };
+  const legacy = join(home, '.owenloop', 'roster');
+  const target = join(home, 'legacy-target');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(target, 'legacy-grant');
+  const entry = join(legacy, 'legacy.grant.dsse');
+  symlinkSync(target, entry);
+
+  assertInvalidLegacySource(env, entry);
+});
+
+test('loadGrants requires manual repair when a legacy grant entry is a directory', () => {
+  const home = temp('owenloop-org-legacy-grant-directory-');
+  const env = { HOME: home };
+  const legacy = join(home, '.owenloop', 'roster');
+  const entry = join(legacy, 'legacy.grant.dsse');
+  mkdirSync(entry, { recursive: true });
+
+  assertInvalidLegacySource(env, entry);
 });

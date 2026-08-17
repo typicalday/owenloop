@@ -251,6 +251,37 @@ test('trust grant refuses when legacy grants have not been migrated', async () =
   assert.equal(existsSync(join(config, 'grants')), false);
 });
 
+test('trust grant does not create grants when the legacy source is invalid', async () => {
+  const { run, config } = makeTrustCli();
+  const init = await run('trust', 'init');
+  assert.equal(init.code, 0, init.err);
+  const initRecord = init.json();
+  const invalidGrant = join(config, 'roster', 'producer.grant.dsse');
+  mkdirSync(invalidGrant, { recursive: true });
+
+  const grant = await run(
+    'trust',
+    'grant',
+    '--key',
+    initRecord.publicKey,
+    '--principal',
+    'machine:worker',
+    '--pools',
+    'marketing',
+    '--labels',
+    'billing',
+    '--namespaces',
+    'default',
+    '--delegate',
+    '0',
+  );
+  assert.equal(grant.code, 1);
+  assert.match(grant.err, /legacy grants source entry is not a regular file/);
+  assert.match(grant.err, /producer\.grant\.dsse/);
+  assert.doesNotMatch(grant.err, /Run:/);
+  assert.equal(existsSync(join(config, 'grants')), false);
+});
+
 // ---- unknown-option rejection (before any side effect) ----------------------
 
 test('a misspelled option on a sync command exits 1, names the offender, suggests the fix', () => {

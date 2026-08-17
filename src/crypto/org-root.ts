@@ -47,18 +47,12 @@ export function grantsDir(env: Record<string, string | undefined>): string {
   return join(orgRootDir(env), 'grants');
 }
 
-/** The pre-rename grants directory. Probed only to refuse; never read. */
+/** The pre-rename grants directory. Inspected only to refuse; never read. */
 function legacyGrantsDir(env: Record<string, string | undefined>): string {
   return join(orgRootDir(env), 'roster');
 }
 
-/**
- * Count entries named `*.grant.dsse`, by name only, never throwing.
- *
- * This is a diagnostic hint, not a resolution target. Counting by name
- * regardless of entry type ensures even a symlinked legacy entry signals that
- * the operator has grants that require an explicit migration.
- */
+/** Count entries named `*.grant.dsse` without making the new path a loader. */
 function countGrantFiles(dir: string): number {
   try {
     return readdirSync(dir).filter((name) => name.endsWith('.grant.dsse')).length;
@@ -67,12 +61,17 @@ function countGrantFiles(dir: string): number {
   }
 }
 
-interface GrantsDestinationProblem {
+interface GrantsDirectoryProblem {
   path: string;
   reason: string;
 }
 
-function inspectionError(path: string, action: string, error: unknown): GrantsDestinationProblem {
+interface LegacyGrantsInspection {
+  grantCount: number;
+  problem: GrantsDirectoryProblem | undefined;
+}
+
+function inspectionError(path: string, action: string, error: unknown): GrantsDirectoryProblem {
   return {
     path,
     reason: `${action}: ${error instanceof Error ? error.message : String(error)}`,
@@ -85,11 +84,58 @@ function quotePosixShellArgument(value: string): string {
 }
 
 /**
+ * Inspect the legacy source without reading envelopes. A migration command is
+ * safe only when its source has the regular-file structure the old loader
+ * accepted; otherwise an operator must repair it by hand.
+ */
+function inspectLegacyGrantsSource(path: string): LegacyGrantsInspection {
+  let stat;
+  try {
+    stat = lstatSync(path, { throwIfNoEntry: false });
+  } catch (error) {
+    return { grantCount: 0, problem: inspectionError(path, 'cannot inspect legacy grants source', error) };
+  }
+  if (stat === undefined) return { grantCount: 0, problem: undefined };
+  if (stat.isSymbolicLink()) {
+    return { grantCount: 0, problem: { path, reason: 'legacy grants source is a symlink' } };
+  }
+  if (!stat.isDirectory()) {
+    return { grantCount: 0, problem: { path, reason: 'legacy grants source is not a directory' } };
+  }
+
+  let entries: string[];
+  try {
+    entries = readdirSync(path);
+  } catch (error) {
+    return { grantCount: 0, problem: inspectionError(path, 'cannot inspect legacy grants source', error) };
+  }
+
+  let grantCount = 0;
+  for (const name of entries) {
+    const entryPath = join(path, name);
+    let entry;
+    try {
+      entry = lstatSync(entryPath);
+    } catch (error) {
+      return { grantCount: 0, problem: inspectionError(entryPath, 'cannot inspect legacy grants source entry', error) };
+    }
+    if (entry.isSymbolicLink()) {
+      return { grantCount: 0, problem: { path: entryPath, reason: 'legacy grants source entry is a symlink' } };
+    }
+    if (!entry.isFile()) {
+      return { grantCount: 0, problem: { path: entryPath, reason: 'legacy grants source entry is not a regular file' } };
+    }
+    if (name.endsWith('.grant.dsse')) grantCount += 1;
+  }
+  return { grantCount, problem: undefined };
+}
+
+/**
  * A migration command is safe only for an absent destination or a real
  * directory whose entries are all regular files. This never reads envelope
  * bytes; it merely prevents an instruction from silently nesting them.
  */
-function inspectGrantsDestination(path: string): GrantsDestinationProblem | undefined {
+function inspectGrantsDestination(path: string): GrantsDirectoryProblem | undefined {
   let stat;
   try {
     stat = lstatSync(path, { throwIfNoEntry: false });
@@ -120,7 +166,42 @@ function inspectGrantsDestination(path: string): GrantsDestinationProblem | unde
   return undefined;
 }
 
-/** Thrown when grants exist only under the pre-rename directory. */
+function sourceManualRepairMessage(
+  grantsPath: string,
+  legacyPath: string,
+  sourceProblem: GrantsDirectoryProblem,
+): string {
+  return `enrollment grants cannot be safely inspected in the pre-rename directory '${legacyPath}': ` +
+    `${sourceProblem.reason}: '${sourceProblem.path}'. '${grantsPath}' holds no *.grant.dsse files. ` +
+    'Repair that path by hand before migrating; owenloop will not move your cryptographic material for you.';
+}
+
+function migrationMessage(
+  grantsPath: string,
+  legacyPath: string,
+  legacyCount: number,
+  quotedGrantsPath: string,
+  quotedLegacyPath: string,
+): string {
+  return `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
+    `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
+    `cryptographic material for you. Run:  mkdir -p ${quotedGrantsPath} && mv ${quotedLegacyPath}/*.grant.dsse ${quotedGrantsPath}/  ` +
+    'then restart every running owenloop shift daemon.';
+}
+
+function destinationManualRepairMessage(
+  grantsPath: string,
+  legacyPath: string,
+  legacyCount: number,
+  destinationProblem: GrantsDirectoryProblem,
+): string {
+  return `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
+    `but '${legacyPath}' holds ${legacyCount}. The grants destination is unsafe: ${destinationProblem.reason}: ` +
+    `'${destinationProblem.path}'. Repair that path by hand before migrating; owenloop will not move your ` +
+    'cryptographic material for you.';
+}
+
+/** Thrown when legacy grants are stranded or cannot be safely inspected. */
 export class StrandedLegacyGrantsError extends Error {
   override readonly name = 'StrandedLegacyGrantsError';
   readonly grantsPath: string;
@@ -128,42 +209,55 @@ export class StrandedLegacyGrantsError extends Error {
   readonly legacyCount: number;
   readonly destinationPath: string | undefined;
   readonly destinationReason: string | undefined;
+  readonly sourcePath: string | undefined;
+  readonly sourceReason: string | undefined;
 
   constructor(
     grantsPath: string,
     legacyPath: string,
     legacyCount: number,
-    destinationProblem: GrantsDestinationProblem | undefined,
+    destinationProblem: GrantsDirectoryProblem | undefined,
+    sourceProblem: GrantsDirectoryProblem | undefined = undefined,
   ) {
     const quotedGrantsPath = quotePosixShellArgument(grantsPath);
     const quotedLegacyPath = quotePosixShellArgument(legacyPath);
-    const message = destinationProblem === undefined
-      ? `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
-        `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
-      `cryptographic material for you. Run:  mkdir -p ${quotedGrantsPath} && mv ${quotedLegacyPath}/*.grant.dsse ${quotedGrantsPath}/  ` +
-        'then restart every running owenloop shift daemon.'
-      : `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
-        `but '${legacyPath}' holds ${legacyCount}. The grants destination is unsafe: ${destinationProblem.reason}: ` +
-        `'${destinationProblem.path}'. Repair that path by hand before migrating; owenloop will not move your ` +
-        'cryptographic material for you.';
-    super(
-      message,
-    );
+    let message: string;
+    if (sourceProblem !== undefined) {
+      message = sourceManualRepairMessage(grantsPath, legacyPath, sourceProblem);
+    } else if (destinationProblem === undefined) {
+      message = migrationMessage(grantsPath, legacyPath, legacyCount, quotedGrantsPath, quotedLegacyPath);
+    } else {
+      message = destinationManualRepairMessage(grantsPath, legacyPath, legacyCount, destinationProblem);
+    }
+    super(message);
     this.grantsPath = grantsPath;
     this.legacyPath = legacyPath;
     this.legacyCount = legacyCount;
     this.destinationPath = destinationProblem?.path;
     this.destinationReason = destinationProblem?.reason;
+    this.sourcePath = sourceProblem?.path;
+    this.sourceReason = sourceProblem?.reason;
   }
 }
 
-/** Refuse when the new grants directory is empty and the old one is not. */
+/** Refuse when legacy grants are stranded or cannot be safely inspected. */
 export function assertNoStrandedLegacyGrants(env: Record<string, string | undefined>): void {
   const grants = grantsDir(env);
   if (countGrantFiles(grants) > 0) return;
   const legacy = legacyGrantsDir(env);
-  const count = countGrantFiles(legacy);
-  if (count > 0) throw new StrandedLegacyGrantsError(grants, legacy, count, inspectGrantsDestination(grants));
+  const inspection = inspectLegacyGrantsSource(legacy);
+  if (inspection.problem !== undefined) {
+    throw new StrandedLegacyGrantsError(
+      grants,
+      legacy,
+      inspection.grantCount,
+      inspectGrantsDestination(grants),
+      inspection.problem,
+    );
+  }
+  if (inspection.grantCount > 0) {
+    throw new StrandedLegacyGrantsError(grants, legacy, inspection.grantCount, inspectGrantsDestination(grants));
+  }
 }
 
 /** `<config>/revocations`, containing revocation envelopes. */
