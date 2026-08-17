@@ -231,6 +231,37 @@ test('setup crew materialization only skips a verified target, not an unrelated 
   }
 });
 
+test('crew roster installation probes existing targets before any temporary write and cleans partial temps', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-setup-roster-write-safety-'));
+  try {
+    const path = crewRosterPath({ HOME: home }, 'ops');
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, '{"roster":{}}\n');
+    assert.equal(
+      installCrewRosterIfAbsent(path, '{"roster":{"build":[]}}\n', { tempName: () => { throw new Error('must not name a temp for an existing target'); } }),
+      'existing',
+    );
+
+    const fresh = crewRosterPath({ HOME: home }, 'new-ops');
+    const partial = join(dirname(fresh), '.partial.roster.tmp');
+    assert.throws(
+      () => installCrewRosterIfAbsent(fresh, '{"roster":{}}\n', {
+	tempName: () => '.partial.roster.tmp',
+	writeTemp: (temp, contents) => {
+	  writeFileSync(temp, contents.slice(0, 8), { flag: 'wx' });
+	  const error = Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+	  throw error;
+	},
+      }),
+      /disk full/u,
+    );
+    assert.equal(existsSync(partial), false, 'a failed short write leaves no partial setup temp');
+    assert.equal(existsSync(fresh), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('setup confines traversal-shaped hub crew names to encoded roster filenames', async () => {
   const { routes } = makeIdentityHub();
   const { fetch } = routedFetch(routes);
@@ -257,6 +288,21 @@ test('setup records a bounded hash roster identity so its immediate doctor pass 
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).crew, crew, 'the bounded filename has a machine-readable crew identity');
   const summary = JSON.parse(t.out.join('\n')) as { doctor: { checks: Array<{ label: string }> } };
   assert.ok(summary.doctor.checks.some((check) => check.label === `crew roster (${crew})`), 'setup\'s final doctor pass sees the newly-created hashed roster');
+});
+
+test('setup final doctor pass discovers a preserved nested legacy crew roster', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const crew = 'foo/bar';
+  const legacy = join(t.io.env.HOME!, '.owenloop', 'crews', 'foo', 'bar.json');
+  mkdirSync(dirname(legacy), { recursive: true });
+  writeFileSync(legacy, '{"roster":{}}\n');
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crew], t.io), 0, t.err.join('\n'));
+  const summary = JSON.parse(t.out.join('\n')) as { steps: Array<{ step: string; action: string; detail: string }>; doctor: { checks: Array<{ label: string }> } };
+  assert.ok(summary.steps.some((step) => step.step === 'crew rosters' && step.action === 'skipped' && step.detail.endsWith('/crews/foo/bar.json')));
+  assert.ok(summary.doctor.checks.some((check) => check.label === `crew roster (${crew})`), 'doctor sees the same nested legacy roster the resolver selects');
 });
 
 test('setup: fresh machine interactive — injected prompt names the agent; empty answer accepts the hostname prefill', async () => {

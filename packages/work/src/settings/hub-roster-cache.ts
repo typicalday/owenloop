@@ -40,6 +40,47 @@ export type HubRosterCacheRead =
 type Env = Record<string, string | undefined>;
 
 export const DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS = 10_000;
+const MAX_HUB_IDENTIFIER_LENGTH = 200;
+const MAX_HUB_CAPABILITY_LENGTH = 64;
+const MAX_HUB_CREW_LENGTH = 64;
+const MAX_HUB_CANDIDATES = 32;
+const HUB_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+function isHubIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_HUB_IDENTIFIER_LENGTH && value.trim() === value;
+}
+
+function isHubCapability(value: string): boolean {
+  return value.length > 0 && value.length <= MAX_HUB_CAPABILITY_LENGTH && value.trim() === value && !value.startsWith('personal:');
+}
+
+function isHubCrewName(value: unknown): value is string {
+  // Slash, backslash, and dot segments are valid hub data. The filesystem
+  // resolver handles them later; this wire validator only mirrors the hub's
+  // trimmed/non-empty/max-length crew rule.
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_HUB_CREW_LENGTH && value.trim() === value;
+}
+
+function validateHubRoster(roster: Record<string, unknown>, context: string): Roster {
+  validateRoster(roster, context);
+  for (const [capability, candidates] of Object.entries(roster)) {
+    if (!isHubCapability(capability)) throw new Error(`${context}: invalid capability`);
+    if (!Array.isArray(candidates) || candidates.length > MAX_HUB_CANDIDATES) {
+      throw new Error(`${context}: invalid candidate count`);
+    }
+    const seen = new Set<string>();
+    for (const candidate of candidates) {
+      const row = candidate as Record<string, unknown>;
+      if (!isHubIdentifier(row['harness']) || !isHubIdentifier(row['model']) || !HUB_EFFORTS.has(row['effort'] as string)) {
+	throw new Error(`${context}: invalid candidate`);
+      }
+      const key = JSON.stringify([row['harness'], row['model'], row['effort']]);
+      if (seen.has(key)) throw new Error(`${context}: duplicate candidate`);
+      seen.add(key);
+    }
+  }
+  return roster as Roster;
+}
 
 /** Bound a refresh even when a test seam or non-fetch client ignores abort. */
 export async function withHubRosterSyncTimeout<T>(
@@ -134,9 +175,12 @@ function parseEntry(value: unknown): HubRosterCacheEntry {
   const row = asRecord(value);
   if (row === undefined) throw new Error('cache root must be an object');
   if (row['version'] !== 1) throw new Error(`unsupported cache version ${String(row['version'])}`);
-  for (const key of ['origin', 'orgId', 'orgName', 'account'] as const) {
+  for (const key of ['origin', 'orgId', 'account'] as const) {
     if (typeof row[key] !== 'string' || row[key].trim() === '') throw new Error(`invalid cache ${key}`);
   }
+  // The deployed whoami/roster contract permits an unnamed organization. Do
+  // not turn its deliberate empty display name into a failed cache refresh.
+  if (typeof row['orgName'] !== 'string') throw new Error('invalid cache orgName');
   let origin: string;
   try {
     origin = normalizeOrigin(row['origin'] as string);
@@ -160,16 +204,16 @@ function parseEntry(value: unknown): HubRosterCacheEntry {
   const crews = row['crews'];
   if (!Array.isArray(crews)) throw new Error('invalid roster shape: crews must be an array');
   try {
-    validateRoster(global, 'global');
+    validateHubRoster(global, 'global');
     for (const [index, rawCrew] of crews.entries()) {
       const crew = asRecord(rawCrew);
-      if (crew === undefined || typeof crew['crewId'] !== 'string' ||
-	  !(typeof crew['crewName'] === 'string' || crew['crewName'] === null)) {
+      if (crew === undefined || typeof crew['crewId'] !== 'string' || crew['crewId'] === '' ||
+	  !(isHubCrewName(crew['crewName']) || crew['crewName'] === null)) {
 	throw new Error(`crews[${index}] must have crewId and crewName`);
       }
       const roster = asRecord(crew['roster']);
       if (roster === undefined) throw new Error(`crews[${index}].roster must be an object`);
-      validateRoster(roster, `crews[${index}].roster`);
+      validateHubRoster(roster, `crews[${index}].roster`);
     }
   } catch (error) {
     throw new Error(`invalid roster shape: ${message(error)}`);

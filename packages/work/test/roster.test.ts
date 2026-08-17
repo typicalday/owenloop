@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import {
   crewNameFromEncodedRosterFilename,
   crewNameFromRosterFilename,
+  discoverCrewRosterFiles,
   crewRosterPath,
   decodeCrewRosterFilename,
   encodedCrewRosterDir,
@@ -131,6 +132,23 @@ test('a contained nested-slash legacy roster remains the strongest layer after u
     assert.equal(crewRosterPath({ HOME: home }, crew), legacy, 'an existing contained hierarchy is a legacy migration target');
     assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.model, 'nested-model');
     assert.equal(existsSync(join(encodedCrewRosterDir({ HOME: home }), encodeCrewRosterFilename(crew))), false, 'setup must not create an empty encoded duplicate');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('shared roster discovery makes nested legacy files visible to both doctor and the resolver', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-discovery-'));
+  try {
+    const crew = 'foo/bar';
+    const legacy = join(home, '.owenloop', 'crews', 'foo', 'bar.json');
+    mkdirSync(dirname(legacy), { recursive: true });
+    writeFileSync(legacy, JSON.stringify({ roster: { build: candidate('legacy', 'nested-model') } }));
+
+    const discovered = discoverCrewRosterFiles({ HOME: home });
+    assert.deepEqual(discovered, [{ crew, path: legacy, kind: 'legacy' }]);
+    assert.equal(crewRosterPath({ HOME: home }, crew), discovered[0]!.path);
+    assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.model, 'nested-model');
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

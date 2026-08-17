@@ -29,7 +29,7 @@ test('roster org put surfaces an unprivileged hub refusal without a write-shaped
 
 test('roster org and registry GET their live read endpoints with a human credential', async () => {
   const routes: Record<string, RouteHandler> = {
-    'GET /api/rosters': () => ({ status: 200, json: { global: {}, crews: [] } }),
+    'GET /api/rosters': () => ({ status: 200, json: { global: {}, crews: [{ crewId: 'crew_1', crewName: 'foo/bar\\..', roster: {} }] } }),
     'GET /api/harness_models': () => ({ status: 200, json: { harnesses: [{ harness: 'codex', displayName: '' }], models: [] } }),
   };
   const { fetch, calls } = routedFetch(routes);
@@ -41,6 +41,8 @@ test('roster org and registry GET their live read endpoints with a human credent
   assert.equal(calls.filter((call) => call.pathname === '/api/harness_models')[0]!.method, 'GET');
   const registry = JSON.parse(t.out.at(-1)!) as { registry: { harnesses: Array<{ displayName: string }> } };
   assert.equal(registry.registry.harnesses[0]?.displayName, '', 'the service permits an intentionally blank display name');
+  const org = JSON.parse(t.out[0]!) as { rosters: { crews: Array<{ crewName: string }> } };
+  assert.equal(org.rosters.crews[0]?.crewName, 'foo/bar\\..', 'slash, backslash, and dot segments are hub data, not client path syntax');
 });
 
 test('roster org preserves an own __proto__ capability and rejects array rosters', async () => {
@@ -194,7 +196,13 @@ test('roster org put, org rm, and registry put accept only their proven success 
 test('roster payload and sync-slot syntax fail before any credential lookup or hub request', async () => {
   const cases = [
     ['roster', 'org', 'put', 'build', '--candidate', 'not-a-candidate', '--hub', ORIGIN],
+    ['roster', 'org', 'put', 'build', '--candidate', 'codex:gpt-5:not-an-effort', '--hub', ORIGIN],
+    ['roster', 'org', 'put', 'build', '--candidate', ' codex:gpt-5:high', '--hub', ORIGIN],
+    ['roster', 'org', 'put', 'build', '--candidate', 'codex:gpt-5:high', '--candidate', 'codex:gpt-5:high', '--hub', ORIGIN],
+    ['roster', 'org', 'put', 'x'.repeat(65), '--candidate', 'codex:gpt-5:high', '--hub', ORIGIN],
     ['roster', 'registry', 'put', 'codex', '--model', 'not-a-model', '--hub', ORIGIN],
+    ['roster', 'registry', 'put', 'codex', '--model', 'gpt-5:high,', '--hub', ORIGIN],
+    ['roster', 'registry', 'put', 'codex', '--display-name', 'x'.repeat(201), '--model', 'gpt-5:high', '--hub', ORIGIN],
     ['roster', 'registry', 'put', 'codex', '--display-name', '--model', 'gpt-5:high', '--hub', ORIGIN],
     ['roster', 'sync', '--as', 'agent:', '--hub', ORIGIN],
   ];

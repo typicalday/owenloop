@@ -78,7 +78,7 @@ for the full breakdown.
 | `roster org put <capability> --candidate <harness>:<model>:<effort>… [--crew <name>] [--hub <url>]` | replace one org-global or named crew roster row (human admin credential) |
 | `roster org rm <capability> [--crew <name>] [--hub <url>]` | remove one org-global or named crew roster row (human admin credential) |
 | `roster registry [--hub <url>]` | read the hub's known harnesses, models, and efforts (human credential) |
-| `roster registry put <harness> --model <model>:<effort,effort…>… [--display-name <text>] [--hub <url>]` | replace one harness's full hub model snapshot (human admin credential) |
+| `roster registry put <harness> [--model <model>:<effort,effort…>]… [--display-name <text>] [--hub <url>]` | replace one harness's full hub model snapshot (human admin credential); omit every `--model` to clear it |
 | `roster sync [--hub <url>] [--as agent\|agent:<account>]` | refresh the local hub-roster cache explicitly with the same agent credential a shift uses |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
@@ -331,11 +331,13 @@ exact `crew` identity inside the JSON document. Do not derive either filename
 by hand. The separate directory is deliberately disjoint from every legacy
 root-level crew filename. Existing safe legacy `<crew>.json` files — including
 names containing spaces, colons, percent signs, Unicode, and (on POSIX)
-backslashes — remain readable and take precedence, so upgrading never replaces
-a hand-edited strongest layer with an empty skeleton. `owenloop doctor` decodes
-reversible names and verifies the recorded identity for bounded hash names
-before inspecting them; traversal-shaped hub crew names stay confined to the
-`crews/` directory.
+backslashes — plus any lexically contained legacy tree such as
+`crews/foo/bar.json` for crew `foo/bar` — remain readable and take precedence,
+so upgrading never replaces a hand-edited strongest layer with an empty
+skeleton. `owenloop doctor` and routing use the same roster-file discovery:
+doctor walks contained legacy paths, decodes reversible codec names, and
+verifies the recorded identity for bounded hash names before inspecting them.
+Traversal-shaped hub crew names stay confined to the `crews/` directory.
 
 A clean start or `--once` completion exits `0`. `owenloop shift --help` also
 exits `0`. Runtime failures such as credential reads or socket/runtime setup

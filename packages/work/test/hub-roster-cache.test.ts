@@ -11,9 +11,11 @@ import {
   readHubRosterCache,
   sanitizeOrgIdForFilename,
   sanitizeOriginForFilename,
+  syncHubRosterCache,
   withHubRosterSyncTimeout,
   writeHubRosterCache,
 } from '../src/settings/hub-roster-cache.ts';
+import type { HubClient } from '../src/hub/client.ts';
 
 const candidate = (harness: string, model: string) => [{ harness, model, effort: 'high' }];
 const origin = 'https://hub.example.test';
@@ -153,6 +155,23 @@ test('different accounts and invalid roster shapes are harmless cache misses', (
     assert.equal(invalid.kind, 'miss');
     assert.match(invalid.reason, /invalid roster shape/u);
   });
+});
+
+test('an empty organization display name survives cache sync and read', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-hub-roster-empty-org-'));
+  try {
+    const env = { HOME: home };
+    const client = {
+      whoami: async () => ({ text: '', orgId: 'org_1', orgName: '', actor: { id: 'agent_1', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' }),
+      getRosters: async () => ({ text: '', global: { build: candidate('hub', 'model') }, crews: [] }),
+    } as unknown as HubClient;
+    await syncHubRosterCache({ client, env, origin, account: 'default' });
+    const cached = readHubRosterCache(env, origin, 'default');
+    assert.equal(cached.kind, 'hit');
+    if (cached.kind === 'hit') assert.equal(cached.data.orgName, '');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('same-org accounts and sanitizer-colliding origins retain distinct cache snapshots', () => {

@@ -5,7 +5,7 @@
  * strongest-first cascade. Shape validation and capability lookup remain in
  * `agent/capability-model.ts`.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
@@ -25,6 +25,15 @@ export interface RosterLayer {
   path?: string;
   /** Absent when the layer does not exist on this machine. */
   roster?: Roster;
+}
+
+/** One on-disk strongest-layer roster the resolver can actually select. */
+export interface CrewRosterFile {
+  /** The exact hub crew name represented by this file. */
+  crew: string;
+  path: string;
+  /** Literal/nested legacy path, or the dedicated codec namespace. */
+  kind: 'legacy' | 'encoded';
 }
 
 export interface MergedRosterEntry {
@@ -190,6 +199,11 @@ export function isNativeCrewRosterFilename(crew: string, platform: NodeJS.Platfo
 /** A contained deployed legacy path may be preserved even when new files encode it. */
 function legacyCrewRosterPath(dir: string, crew: string): string | undefined {
   if (crew === '' || crew.includes('\0')) return undefined;
+  // On Windows a backslash is a path separator, not an ordinary filename
+  // character. Preserve deployed slash-separated legacy trees there, but
+  // encode a hub name that contains a literal backslash so distinct hub names
+  // cannot alias one legacy target.
+  if (process.platform === 'win32' && crew.includes('\\')) return undefined;
   const segments = crew.split(process.platform === 'win32' ? /[\\/]/u : /\//u);
   if (segments.some((segment) => segment === '' || segment === '.' || segment === '..' ||
     (process.platform === 'win32' && !isWindowsNativePathComponent(segment)))) return undefined;
@@ -200,6 +214,86 @@ function legacyCrewRosterPath(dir: string, crew: string): string | undefined {
     // migration target; it receives an encoded path below.
     return undefined;
   }
+}
+
+function samePath(a: string, b: string): boolean {
+  return resolve(a) === resolve(b);
+}
+
+function legacyCrewNameForPath(root: string, path: string): string | undefined {
+  const relativePath = relative(root, path);
+  if (!relativePath.endsWith('.json')) return undefined;
+  // Hub crew names use `/` even on Windows; legacy paths use the current
+  // platform separator. This is the only representation conversion, and the
+  // final round trip through `legacyCrewRosterPath` proves containment.
+  const crew = relativePath.slice(0, -'.json'.length).split(sep).join('/');
+  const resolved = legacyCrewRosterPath(root, crew);
+  return resolved !== undefined && samePath(resolved, path) ? crew : undefined;
+}
+
+function walkCrewRosterFiles(
+  root: string,
+  current: string,
+  visit: (path: string) => void,
+  skipDirectory?: string,
+): void {
+  for (const entry of readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+    const path = join(current, entry.name);
+    if (entry.isDirectory()) {
+      if (current === root && entry.name === skipDirectory) continue;
+      walkCrewRosterFiles(root, path, visit, skipDirectory);
+    } else if (entry.isFile() && entry.name.endsWith('.json')) {
+      visit(path);
+    }
+  }
+}
+
+/**
+ * Discover the same set of on-disk files that `machineRosterLayers` can use.
+ *
+ * This is intentionally the one source of truth for both the resolver and
+ * doctor: literal root files, contained pre-codec nested files, reversible
+ * codec files, and bounded hash files (whose JSON records the crew identity)
+ * all enter through this function. A future naming rule cannot make doctor
+ * omit a file the resolver reads without changing this shared function.
+ */
+export function discoverCrewRosterFiles(env: Record<string, string | undefined>): CrewRosterFile[] {
+  const root = crewRosterDir(env);
+  if (!existsSync(root)) return [];
+  const found: CrewRosterFile[] = [];
+
+  // Legacy is scanned first so an existing literal/nested operator file keeps
+  // the precedence promised by `crewRosterPath` over a later codec target.
+  walkCrewRosterFiles(root, root, (path) => {
+    const crew = legacyCrewNameForPath(root, path);
+    if (crew !== undefined) found.push({ crew, path, kind: 'legacy' });
+  }, CREW_ROSTER_ENCODED_DIR);
+
+  const encodedDir = encodedCrewRosterDir(env);
+  if (!existsSync(encodedDir)) return found;
+  walkCrewRosterFiles(encodedDir, encodedDir, (path) => {
+    // Codec files only live at the codec root. A nested or malformed file in
+    // this directory is still a pre-existing contained legacy file and must
+    // remain discoverable rather than disappearing during an upgrade.
+    const crew = relative(encodedDir, path) === basename(path)
+      ? crewNameFromEncodedRosterFile(path)
+      : undefined;
+    if (crew !== undefined && samePath(encodedCrewRosterPath(env, crew), path)) {
+      found.push({ crew, path, kind: 'encoded' });
+      return;
+    }
+    const legacyCrew = legacyCrewNameForPath(root, path);
+    if (legacyCrew !== undefined) found.push({ crew: legacyCrew, path, kind: 'legacy' });
+  });
+  return found;
+}
+
+/** Find one discovered roster, preserving legacy's upgrade precedence. */
+export function findCrewRosterFile(
+  env: Record<string, string | undefined>,
+  crew: string,
+): CrewRosterFile | undefined {
+  return discoverCrewRosterFiles(env).find((file) => file.crew === crew);
 }
 
 /**
@@ -217,8 +311,9 @@ function legacyCrewRosterPath(dir: string, crew: string): string | undefined {
  */
 export function crewRosterPath(env: Record<string, string | undefined>, crew: string): string {
   const dir = crewRosterDir(env);
+  const existing = findCrewRosterFile(env, crew);
+  if (existing !== undefined) return existing.path;
   const legacy = legacyCrewRosterPath(dir, crew);
-  if (legacy !== undefined && existsSync(legacy)) return legacy;
   // Earlier builds of this feature used the reversible codec for every new
   // crew. Retain an already-materialized file through the upgrade before
   // choosing today's literal-or-bounded representation.
@@ -237,11 +332,12 @@ export function machineRosterLayers(
 ): RosterLayer[] {
   const layers: RosterLayer[] = [];
   if (crew !== undefined) {
-    const path = crewRosterPath(env, crew);
+    const existing = findCrewRosterFile(env, crew);
+    const path = existing?.path ?? crewRosterPath(env, crew);
     layers.push({
       source: `machine crews/${crew}.json`,
       path,
-      ...(existsSync(path) ? { roster: readCrewRoster(path) } : {}),
+      ...(existing !== undefined ? { roster: readCrewRoster(path) } : {}),
     });
   }
   const path = join(owenloopConfigDir(env), 'settings.json');

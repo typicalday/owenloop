@@ -204,7 +204,7 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { loadSettings, settingsPath as executionSettingsPath } from '../packages/work/src/settings/settings.ts';
-import { crewNameFromEncodedRosterFile, crewNameFromRosterFilename, crewRosterDir, crewRosterPath, encodedCrewRosterDir, effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
+import { discoverCrewRosterFiles, crewRosterPath, effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
 import { readHubRosterCache, syncHubRosterCache } from '../packages/work/src/settings/hub-roster-cache.ts';
 import type { HubClient } from '../packages/work/src/hub/client.ts';
 import type { GetRostersResponse, WhoamiResponse } from '../packages/work/src/hub/types.ts';
@@ -1451,7 +1451,7 @@ ${' '.repeat(41)}replace one hub roster row (human admin credential)
     roster org rm <capability> [--crew <name>] [--hub <url>]
 ${' '.repeat(41)}remove one hub roster row (human admin credential)
     roster registry [--hub <url>]         list hub harnesses, models, and supported efforts (human credential)
-    roster registry put <harness> --model <model>:<effort,effort…> [--display-name <text>] [--hub <url>]
+    roster registry put <harness> [--model <model>:<effort,effort…>]… [--display-name <text>] [--hub <url>]
 ${' '.repeat(41)}replace a harness's hub model snapshot (human admin credential)
     roster sync [--hub <url>] [--as agent|agent:<account>]
 ${' '.repeat(41)}refresh the local hub-rosters cache with an agent credential
@@ -1665,29 +1665,87 @@ function rosterAge(fetchedAt: number): string {
   return `${Math.floor(seconds / 86_400)}d ago`;
 }
 
+// Keep these wire checks aligned with hub-core's roster and harness verbs.
+// This CLI is a separately deployable client, so it mirrors the public
+// contract rather than importing the service implementation.
+const MAX_ROSTER_IDENTIFIER_LENGTH = 200;
+const MAX_ROSTER_CAPABILITY_LENGTH = 64;
+const MAX_ROSTER_CANDIDATES = 32;
+const MAX_HARNESS_MODELS = 256;
+const ROSTER_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+function isRosterIdentifier(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_ROSTER_IDENTIFIER_LENGTH && value.trim() === value;
+}
+
+function parseRosterIdentifier(value: string, label: string): string {
+  if (!isRosterIdentifier(value)) {
+    throw new CliError(`${label} must be a trimmed, non-empty string of at most ${MAX_ROSTER_IDENTIFIER_LENGTH} characters`);
+  }
+  return value;
+}
+
+function parseRosterCapability(value: string): string {
+  const capability = value.trim();
+  if (capability === '') throw new CliError('capability must not be empty');
+  if (capability.length > MAX_ROSTER_CAPABILITY_LENGTH) {
+    throw new CliError(`capability must be at most ${MAX_ROSTER_CAPABILITY_LENGTH} characters`);
+  }
+  if (capability.startsWith('personal:')) throw new CliError("capability must not start with the reserved prefix 'personal:'");
+  return capability;
+}
+
+function isRosterCapability(value: unknown): value is string {
+  return typeof value === 'string' && value === value.trim() && value.length > 0 &&
+    value.length <= MAX_ROSTER_CAPABILITY_LENGTH && !value.startsWith('personal:');
+}
+
+function isRosterCrewName(value: unknown): value is string {
+  // `personal:<id>`, slash, backslash, and `..` are all valid hub names. Only
+  // the service's ordinary non-empty, trimmed, 64-character crew invariant is
+  // relevant at this transport boundary.
+  return typeof value === 'string' && value === value.trim() && value.length > 0 && value.length <= 64;
+}
+
+function isRosterEffort(value: unknown): value is string {
+  return typeof value === 'string' && ROSTER_EFFORTS.has(value);
+}
+
+function parseRosterDisplayName(value: string): string {
+  if (value.length > MAX_ROSTER_IDENTIFIER_LENGTH) {
+    throw new CliError(`displayName must be a string of at most ${MAX_ROSTER_IDENTIFIER_LENGTH} characters`);
+  }
+  return value;
+}
+
 function parseRosterCandidate(value: string): { harness: string; model: string; effort: string } {
   const first = value.indexOf(':');
   const lastColon = value.lastIndexOf(':');
   if (first <= 0 || lastColon <= first || lastColon === value.length - 1) {
     throw new CliError(`invalid --candidate '${value}' — expected <harness>:<model>:<effort>`);
   }
-  const harness = value.slice(0, first);
-  const model = value.slice(first + 1, lastColon);
+  const harness = parseRosterIdentifier(value.slice(0, first), 'candidate harness');
+  const model = parseRosterIdentifier(value.slice(first + 1, lastColon), 'candidate model');
   const effort = value.slice(lastColon + 1);
-  if (harness.trim() === '' || model.trim() === '' || effort.trim() === '') {
-    throw new CliError(`invalid --candidate '${value}' — every candidate part must be non-empty`);
+  if (!isRosterEffort(effort)) {
+    throw new CliError(`invalid --candidate '${value}' — effort must be one of low, medium, high, xhigh, max`);
   }
   return { harness, model, effort };
 }
 
 function parseRegistryModel(value: string): { model: string; efforts: string[] } {
   const colon = value.lastIndexOf(':');
-  if (colon <= 0 || colon === value.length - 1) {
+  if (colon <= 0) {
     throw new CliError(`invalid --model '${value}' — expected <model>:<effort,effort…>`);
   }
-  const model = value.slice(0, colon);
-  const efforts = value.slice(colon + 1).split(',').map((part) => part.trim()).filter((part) => part !== '');
-  if (model.trim() === '' || efforts.length === 0) throw new CliError(`invalid --model '${value}' — model and efforts are required`);
+  const model = parseRosterIdentifier(value.slice(0, colon), 'model');
+  const rawEfforts = value.slice(colon + 1);
+  // The service permits an empty effort list. A malformed member (including
+  // `high,`) still fails before hub/credential I/O, matching its `isEffort`.
+  const efforts = rawEfforts === '' ? [] : rawEfforts.split(',');
+  if (efforts.some((effort) => !isRosterEffort(effort))) {
+    throw new CliError(`invalid --model '${value}' — efforts must be drawn from low, medium, high, xhigh, max`);
+  }
   return { model, efforts };
 }
 
@@ -1710,13 +1768,13 @@ function validateRosterMutationSuccess(endpoint: string, body: unknown): RosterM
   if (endpoint === 'put_roster') {
     const crewId = nullableId(row.crewId, prefix, 'crewId');
     const crewName = nullableId(row.crewName, prefix, 'crewName');
-    if (typeof row.capability !== 'string' || row.capability === '') throw new CliError(`${prefix} — missing non-empty string capability`);
+    if (!isRosterCapability(row.capability)) throw new CliError(`${prefix} — missing valid capability`);
     if (!Array.isArray(row.candidates)) throw new CliError(`${prefix} — missing array candidates`);
     const candidates = row.candidates.map((candidate, index) => {
       const value = recordOf(candidate);
       if (value === null) throw new CliError(`${prefix} — candidates[${index}] is not an object`);
-      for (const field of ['harness', 'model', 'effort'] as const) {
-	if (typeof value[field] !== 'string' || value[field] === '') throw new CliError(`${prefix} — candidates[${index}] missing non-empty string ${field}`);
+      if (!isRosterIdentifier(value.harness) || !isRosterIdentifier(value.model) || !isRosterEffort(value.effort)) {
+	throw new CliError(`${prefix} — candidates[${index}] has an invalid harness, model, or effort`);
       }
       return { harness: value.harness as string, model: value.model as string, effort: value.effort as string };
     });
@@ -1727,18 +1785,20 @@ function validateRosterMutationSuccess(endpoint: string, body: unknown): RosterM
   }
   if (endpoint === 'delete_roster_row') {
     const crewId = nullableId(row.crewId, prefix, 'crewId');
-    if (typeof row.capability !== 'string' || row.capability === '') throw new CliError(`${prefix} — missing non-empty string capability`);
+    if (!isRosterCapability(row.capability)) throw new CliError(`${prefix} — missing valid capability`);
     if (typeof row.removed !== 'boolean') throw new CliError(`${prefix} — missing boolean removed`);
     return { crewId, capability: row.capability, removed: row.removed };
   }
-  if (typeof row.harness !== 'string' || row.harness === '') throw new CliError(`${prefix} — missing non-empty string harness`);
-  if (typeof row.displayName !== 'string') throw new CliError(`${prefix} — missing string displayName`);
+  if (!isRosterIdentifier(row.harness)) throw new CliError(`${prefix} — missing valid harness`);
+  if (typeof row.displayName !== 'string' || row.displayName.length > MAX_ROSTER_IDENTIFIER_LENGTH) {
+    throw new CliError(`${prefix} — displayName must be a string of at most ${MAX_ROSTER_IDENTIFIER_LENGTH} characters`);
+  }
   if (!Array.isArray(row.models)) throw new CliError(`${prefix} — missing array models`);
   const models = row.models.map((model, index) => {
     const value = recordOf(model);
     if (value === null) throw new CliError(`${prefix} — models[${index}] is not an object`);
-    if (typeof value.model !== 'string' || value.model === '') throw new CliError(`${prefix} — models[${index}] missing non-empty string model`);
-    if (!Array.isArray(value.efforts) || value.efforts.some((effort) => typeof effort !== 'string' || effort === '')) {
+    if (!isRosterIdentifier(value.model)) throw new CliError(`${prefix} — models[${index}] missing valid model`);
+    if (!Array.isArray(value.efforts) || value.efforts.some((effort) => !isRosterEffort(effort))) {
       throw new CliError(`${prefix} — models[${index}] missing array efforts`);
     }
     if (typeof value.updatedAt !== 'number' || !Number.isFinite(value.updatedAt)) throw new CliError(`${prefix} — models[${index}] missing finite number updatedAt`);
@@ -1755,11 +1815,12 @@ function validateRosterRows(value: unknown, prefix: string): Record<string, Arra
   // `__proto__`). A normal object assignment would mutate/drop that row.
   const result = Object.create(null) as Record<string, Array<{ harness: string; model: string; effort: string }>>;
   for (const [capability, candidates] of Object.entries(row)) {
+    if (!isRosterCapability(capability)) throw new CliError(`${prefix} — invalid capability ${JSON.stringify(capability)}`);
     if (!Array.isArray(candidates)) throw new CliError(`${prefix} — ${capability} must be an array`);
     result[capability] = candidates.map((candidate, index) => {
       const item = recordOf(candidate);
-      if (item === null || ['harness', 'model', 'effort'].some((field) => typeof item[field] !== 'string' || item[field] === '')) {
-	throw new CliError(`${prefix} — ${capability}[${index}] must contain non-empty harness, model, and effort`);
+      if (item === null || !isRosterIdentifier(item.harness) || !isRosterIdentifier(item.model) || !isRosterEffort(item.effort)) {
+	throw new CliError(`${prefix} — ${capability}[${index}] must contain valid harness, model, and effort`);
       }
       return { harness: item.harness as string, model: item.model as string, effort: item.effort as string };
     });
@@ -1775,7 +1836,7 @@ function validateGetRostersSuccess(body: unknown): { global: Record<string, Arra
     global: validateRosterRows(row.global, prefix),
     crews: row.crews.map((crew, index) => {
       const item = recordOf(crew);
-      if (item === null || typeof item.crewId !== 'string' || item.crewId === '' || !(typeof item.crewName === 'string' || item.crewName === null)) {
+      if (item === null || typeof item.crewId !== 'string' || item.crewId === '' || !(isRosterCrewName(item.crewName) || item.crewName === null)) {
 	throw new CliError(`${prefix} — crews[${index}] has an invalid identity`);
       }
       return { crewId: item.crewId, crewName: item.crewName, roster: validateRosterRows(item.roster, `${prefix} — crews[${index}].roster`) };
@@ -1790,12 +1851,12 @@ function validateHarnessModelsSuccess(body: unknown): { harnesses: Array<{ harne
   return {
     harnesses: row.harnesses.map((harness, index) => {
       const item = recordOf(harness);
-      if (item === null || typeof item.harness !== 'string' || item.harness === '' || typeof item.displayName !== 'string') throw new CliError(`${prefix} — harnesses[${index}] is invalid`);
+      if (item === null || !isRosterIdentifier(item.harness) || typeof item.displayName !== 'string' || item.displayName.length > MAX_ROSTER_IDENTIFIER_LENGTH) throw new CliError(`${prefix} — harnesses[${index}] is invalid`);
       return { harness: item.harness, displayName: item.displayName };
     }),
     models: row.models.map((model, index) => {
       const item = recordOf(model);
-      if (item === null || typeof item.harness !== 'string' || item.harness === '' || typeof item.model !== 'string' || item.model === '' || !Array.isArray(item.efforts) || item.efforts.some((effort) => typeof effort !== 'string' || effort === '') || typeof item.updatedAt !== 'number' || !Number.isFinite(item.updatedAt) || typeof item.updatedBy !== 'string' || item.updatedBy === '') throw new CliError(`${prefix} — models[${index}] is invalid`);
+      if (item === null || !isRosterIdentifier(item.harness) || !isRosterIdentifier(item.model) || !Array.isArray(item.efforts) || item.efforts.some((effort) => !isRosterEffort(effort)) || typeof item.updatedAt !== 'number' || !Number.isFinite(item.updatedAt) || typeof item.updatedBy !== 'string' || item.updatedBy === '') throw new CliError(`${prefix} — models[${index}] is invalid`);
       return { harness: item.harness, model: item.model, efforts: item.efforts as string[], updatedAt: item.updatedAt, updatedBy: item.updatedBy };
     }),
   };
@@ -1808,7 +1869,7 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
     'usage: owenloop roster show [crew] | owenloop roster org [--hub <url>] | ' +
     'owenloop roster org put <capability> [--crew <name>] --candidate <harness>:<model>:<effort>… [--hub <url>] | ' +
     'owenloop roster org rm <capability> [--crew <name>] [--hub <url>] | ' +
-    'owenloop roster registry [--hub <url>] | owenloop roster registry put <harness> [--display-name <text>] --model <model>:<effort,effort…>… [--hub <url>] | ' +
+    'owenloop roster registry [--hub <url>] | owenloop roster registry put <harness> [--display-name <text>] [--model <model>:<effort,effort…>]… [--hub <url>] | ' +
     'owenloop roster sync [--hub <url>] [--as agent|agent:<account>]';
   const sub = args.positionals[1];
   if (sub !== 'show' && sub !== 'org' && sub !== 'registry' && sub !== 'sync') {
@@ -1872,8 +1933,7 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
     else if (nested === 'put' || nested === 'rm') orgSub = nested;
     else throw new CliError(`unknown roster org subcommand '${nested}' — ${USAGE_FORMS}`);
     if (orgSub === 'put' || orgSub === 'rm') {
-      capability = args.positionals[3] ?? '';
-      if (capability.trim() === '') throw new CliError(`missing required argument: <capability> (${USAGE_FORMS})`);
+      capability = parseRosterCapability(args.positionals[3] ?? '');
     }
     const maxPositionals = orgSub === 'get' ? 2 : 4;
     if (args.positionals.length > maxPositionals) throw new CliError(USAGE_FORMS);
@@ -1884,14 +1944,10 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
     if (nested === undefined) registrySub = 'get';
     else if (nested === 'put') registrySub = 'put';
     else throw new CliError(`unknown roster registry subcommand '${nested}' — ${USAGE_FORMS}`);
-    if (registrySub === 'put') {
-      harness = args.positionals[3] ?? '';
-      if (harness.trim() === '') throw new CliError(`missing required argument: <harness> (${USAGE_FORMS})`);
-    }
+    if (registrySub === 'put') harness = parseRosterIdentifier(args.positionals[3] ?? '', 'harness');
     const maxPositionals = registrySub === 'get' ? 2 : 4;
     if (args.positionals.length > maxPositionals) throw new CliError(USAGE_FORMS);
     assertFormOptions(registrySub === 'get' ? ['hub'] : ['hub', 'display-name', 'model']);
-    if (registrySub === 'put' && all(args, 'model').length === 0) throw new CliError(`missing required --model (${USAGE_FORMS})`);
   } else if (args.positionals.length > 2) {
     throw new CliError(USAGE_FORMS);
   } else {
@@ -1902,6 +1958,9 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
   if (crewOption !== undefined && (args.missingOptionValues.has('crew') || crewOption.trim() === '')) {
     throw new CliError(`--crew requires a non-empty crew name (${USAGE_FORMS})`);
   }
+  if (crewOption !== undefined && !isRosterCrewName(crewOption)) {
+    throw new CliError('--crew must be a trimmed, non-empty crew name of at most 64 characters');
+  }
 
   // Finish every command-local parse before resolving a hub or consulting the
   // credential backend. An invalid payload is a usage error, not a reason to
@@ -1910,16 +1969,35 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
   let parsedModels: Array<{ model: string; efforts: string[] }> | undefined;
   let parsedDisplayName: string | undefined;
   if (sub === 'org' && orgSub === 'put') {
-    parsedCandidates = all(args, 'candidate').map(parseRosterCandidate);
+    const rawCandidates = all(args, 'candidate');
+    if (rawCandidates.length > MAX_ROSTER_CANDIDATES) {
+      throw new CliError(`--candidate may be supplied at most ${MAX_ROSTER_CANDIDATES} times`);
+    }
+    parsedCandidates = rawCandidates.map(parseRosterCandidate);
+    const candidateKeys = new Set<string>();
+    for (const candidate of parsedCandidates) {
+      const key = JSON.stringify([candidate.harness, candidate.model, candidate.effort]);
+      if (candidateKeys.has(key)) throw new CliError('duplicate --candidate harness, model, and effort triple');
+      candidateKeys.add(key);
+    }
   }
   if (sub === 'registry' && registrySub === 'put') {
-    parsedDisplayName = last(args, 'display-name');
-    if (parsedDisplayName !== undefined && args.missingOptionValues.has('display-name')) {
+    const displayNames = all(args, 'display-name');
+    if (displayNames.length > 1) throw new CliError('--display-name may be supplied at most once');
+    if (displayNames.length > 0 && args.missingOptionValues.has('display-name')) {
       throw new CliError('--display-name requires a value');
     }
-    // The hub contract permits the empty string (for a deliberately blank
-    // display label), so only a missing flag value is malformed here.
-    parsedModels = all(args, 'model').map(parseRegistryModel);
+    if (displayNames.length === 1) parsedDisplayName = parseRosterDisplayName(displayNames[0]!);
+    const rawModels = all(args, 'model');
+    if (rawModels.length > MAX_HARNESS_MODELS) throw new CliError(`--model may be supplied at most ${MAX_HARNESS_MODELS} times`);
+    // A zero-model full snapshot is a supported way to clear the advisory
+    // registry. An empty display label is likewise a deliberate service value.
+    parsedModels = rawModels.map(parseRegistryModel);
+    const modelNames = new Set<string>();
+    for (const model of parsedModels) {
+      if (modelNames.has(model.model)) throw new CliError(`duplicate --model '${model.model}'`);
+      modelNames.add(model.model);
+    }
   }
 
   // `roster sync` is an agent-owned cache refresh. Unlike the other roster
@@ -6356,6 +6434,21 @@ interface SetupStep {
 export interface CrewRosterInstallOptions {
   /** Test seam for a temporary-name collision before target installation. */
   tempName?: () => string;
+  /** Test seam for a short/failed temporary write after the file was created. */
+  writeTemp?: (path: string, contents: string) => void;
+}
+
+/** Probe before any mkdir or temporary write. An existing operator file is a
+ * successful no-op; every other existing filesystem object remains an error. */
+function hasExistingCrewRosterTarget(path: string): boolean {
+  try {
+    const target = lstatSync(path);
+    if (!target.isFile()) throw new Error(`crew roster target exists but is not a regular file: ${path}`);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 /**
@@ -6369,13 +6462,31 @@ export function installCrewRosterIfAbsent(
   contents: string,
   options: CrewRosterInstallOptions = {},
 ): 'created' | 'existing' {
+  // This is deliberately before mkdir/temp creation: a setup rerun must be a
+  // zero-write no-op even in a read-only or full directory.
+  if (hasExistingCrewRosterTarget(path)) return 'existing';
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true });
   const temp = join(dir, options.tempName?.() ?? `.${randomUUID()}.roster.tmp`);
   let tempWritten = false;
   try {
-    writeFileSync(temp, contents, { encoding: 'utf8', flag: 'wx' });
-    tempWritten = true;
+    try {
+      (options.writeTemp ?? ((candidate, body) => writeFileSync(candidate, body, { encoding: 'utf8', flag: 'wx' })))(temp, contents);
+      tempWritten = true;
+    } catch (error) {
+      // `writeFileSync` can throw after creating a partial file (ENOSPC,
+      // interruption). EEXIST is the one exception: that temp was never ours
+      // and must not be removed. Every other failed write gets its partial
+      // cleanup before the error reaches setup.
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+	try {
+	  unlinkSync(temp);
+	} catch {
+	  // Nothing was created, or cleanup has no recovery path.
+	}
+      }
+      throw error;
+    }
     try {
       linkSync(temp, path);
       return 'created';
@@ -6383,13 +6494,7 @@ export function installCrewRosterIfAbsent(
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
       // EEXIST is meaningful only for the target installation. Verify that it
       // is a real roster file before calling it an intentional operator file.
-      let target;
-      try {
-	target = lstatSync(path);
-      } catch {
-	throw error;
-      }
-      if (!target.isFile()) throw new Error(`crew roster target exists but is not a regular file: ${path}`);
+      if (!hasExistingCrewRosterTarget(path)) throw error;
       return 'existing';
     }
   } finally {
@@ -7571,24 +7676,12 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
     }
   }
 
-  // Crew-roster diagnostics are informational per crew. The same registry
-  // membership predicate the worker uses is intentionally reused here.
+  // Crew-roster diagnostics are informational per crew. Discovery and the
+  // worker's strongest-layer resolver deliberately share one function, so a
+  // nested legacy path or a bounded codec file cannot be routable yet absent
+  // from doctor.
   try {
-    const crewsDir = crewRosterDir(io.env);
-    const legacyCrews = existsSync(crewsDir)
-      ? readdirSync(crewsDir, { withFileTypes: true })
-          .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
-	  .map((entry) => crewNameFromRosterFilename(entry.name))
-	  .filter((crew): crew is string => crew !== undefined)
-      : [];
-    const encodedDir = encodedCrewRosterDir(io.env);
-    const encodedCrews = existsSync(encodedDir)
-      ? readdirSync(encodedDir, { withFileTypes: true })
-	  .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
-	  .map((entry) => crewNameFromEncodedRosterFile(join(encodedDir, entry.name)))
-	  .filter((crew): crew is string => crew !== undefined)
-      : [];
-    const crews = [...new Set([...legacyCrews, ...encodedCrews])].sort();
+    const crews = [...new Set(discoverCrewRosterFiles(io.env).map((file) => file.crew))].sort();
     for (const crew of crews) {
       try {
 	const settings = loadSettings(io.env);
