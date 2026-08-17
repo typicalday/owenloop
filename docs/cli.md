@@ -1374,6 +1374,8 @@ Three properties come from the hub verb, not from this command:
 `owenloop instance show <workflow>` sends `GET /api/status/:wf` and prints the
 instance's state: `done`, the `debts` it still owes, the steps that are
 `eligible` or `blocked`, the runs `inFlight`, and `defDrift`.
+It also prints the hub's liveness verdict as `instanceStatus` and `terminal`
+when the hub provides those fields.
 
 It answers the question no other local command can: **why is this run not
 moving?** Two of its fields are the entire diagnosis, and both are invisible
@@ -1387,6 +1389,13 @@ from the outside because each one looks exactly like an idle shift:
   never offered to anyone. Present only when something is actually parked;
   `getStatus` omits the field otherwise, and `instance show` omits it too rather
   than printing `[]`, which would read as "asked, and the answer is none."
+- **`instanceStatus` and `terminal`** — the hub's liveness verdict. `terminal: true`
+  means the instance will receive no further dispatch; failed and
+  cancelled instances can therefore be terminal even when `done` is false.
+  A terminal instance also writes an advisory to stderr, while the JSON state
+  remains on stdout. These fields are omitted when an older hub does not send
+  them; an explicit `terminal: false` is preserved as the hub's affirmative
+  live answer.
 
 Naming, because two obvious names were already taken by different commands:
 
