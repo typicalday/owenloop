@@ -6,7 +6,7 @@
         "mcp"
       ],
       "env": {
-        "OWENLOOP_PLUGIN_VERSION": "0.5.7"
+        "OWENLOOP_PLUGIN_VERSION": "0.5.8"
       },
       "env_vars": [
         "HOME",
