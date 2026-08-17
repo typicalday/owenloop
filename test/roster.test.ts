@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { mainAsync } from '../src/cli.ts';
+import type { Keychain } from '../src/cli.ts';
 import { kcHuman, kcKey, makeIo, routedFetch } from './hubkit.ts';
 import type { RouteHandler } from './hubkit.ts';
 
@@ -29,7 +30,7 @@ test('roster org put surfaces an unprivileged hub refusal without a write-shaped
 test('roster org and registry GET their live read endpoints with a human credential', async () => {
   const routes: Record<string, RouteHandler> = {
     'GET /api/rosters': () => ({ status: 200, json: { global: {}, crews: [] } }),
-    'GET /api/harness_models': () => ({ status: 200, json: { harnesses: [], models: [] } }),
+    'GET /api/harness_models': () => ({ status: 200, json: { harnesses: [{ harness: 'codex', displayName: '' }], models: [] } }),
   };
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch });
@@ -38,6 +39,8 @@ test('roster org and registry GET their live read endpoints with a human credent
   assert.equal(await mainAsync(['roster', 'registry', '--hub', ORIGIN], t.io), 0, t.err.join('\n'));
   assert.equal(calls.filter((call) => call.pathname === '/api/rosters')[0]!.method, 'GET');
   assert.equal(calls.filter((call) => call.pathname === '/api/harness_models')[0]!.method, 'GET');
+  const registry = JSON.parse(t.out.at(-1)!) as { registry: { harnesses: Array<{ displayName: string }> } };
+  assert.equal(registry.registry.harnesses[0]?.displayName, '', 'the service permits an intentionally blank display name');
 });
 
 test('roster org preserves an own __proto__ capability and rejects array rosters', async () => {
@@ -171,7 +174,7 @@ test('roster org put, org rm, and registry put accept only their proven success 
     'POST /api/delete_roster_row': () => ({ status: 200, json: { crewId: null, capability: 'build', removed: true } }),
     'POST /api/put_harness_models': () => ({
       status: 200,
-      json: { harness: 'codex', displayName: 'Codex', models: [{ model: 'gpt-5', efforts: ['high'], updatedAt: 1, updatedBy: 'member_1' }] },
+      json: { harness: 'codex', displayName: '', models: [{ model: 'gpt-5', efforts: ['high'], updatedAt: 1, updatedBy: 'member_1' }] },
     }),
   };
   const { fetch } = routedFetch(routes);
@@ -184,6 +187,28 @@ test('roster org put, org rm, and registry put accept only their proven success 
   assert.equal(await mainAsync(['roster', 'org', 'rm', 'build', '--hub', ORIGIN], t.io), 0, t.err.join('\n'));
   assert.deepEqual(JSON.parse(t.out.pop()!).result, { crewId: null, capability: 'build', removed: true });
 
-  assert.equal(await mainAsync(['roster', 'registry', 'put', 'codex', '--display-name', 'Codex', '--model', 'gpt-5:high', '--hub', ORIGIN], t.io), 0, t.err.join('\n'));
-  assert.deepEqual(JSON.parse(t.out.pop()!).result, { harness: 'codex', displayName: 'Codex', models: [{ model: 'gpt-5', efforts: ['high'], updatedAt: 1, updatedBy: 'member_1' }] });
+  assert.equal(await mainAsync(['roster', 'registry', 'put', 'codex', '--display-name', '', '--model', 'gpt-5:high', '--hub', ORIGIN], t.io), 0, t.err.join('\n'));
+  assert.deepEqual(JSON.parse(t.out.pop()!).result, { harness: 'codex', displayName: '', models: [{ model: 'gpt-5', efforts: ['high'], updatedAt: 1, updatedBy: 'member_1' }] });
+});
+
+test('roster payload and sync-slot syntax fail before any credential lookup or hub request', async () => {
+  const cases = [
+    ['roster', 'org', 'put', 'build', '--candidate', 'not-a-candidate', '--hub', ORIGIN],
+    ['roster', 'registry', 'put', 'codex', '--model', 'not-a-model', '--hub', ORIGIN],
+    ['roster', 'registry', 'put', 'codex', '--display-name', '--model', 'gpt-5:high', '--hub', ORIGIN],
+    ['roster', 'sync', '--as', 'agent:', '--hub', ORIGIN],
+  ];
+  for (const args of cases) {
+    let credentialAccesses = 0;
+    const keychain: Keychain = {
+      get: () => { credentialAccesses++; return null; },
+      set: () => { credentialAccesses++; },
+      delete: () => { credentialAccesses++; },
+    };
+    const { fetch, calls } = routedFetch({});
+    const t = makeIo({ fetch, keychain });
+    assert.equal(await mainAsync(args, t.io), 1, args.join(' '));
+    assert.equal(credentialAccesses, 0, `${args.join(' ')} must not access credentials`);
+    assert.equal(calls.length, 0, `${args.join(' ')} must not call the hub`);
+  }
 });

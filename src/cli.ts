@@ -204,7 +204,7 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { loadSettings, settingsPath as executionSettingsPath } from '../packages/work/src/settings/settings.ts';
-import { crewNameFromEncodedRosterFilename, crewNameFromRosterFilename, crewRosterDir, crewRosterPath, encodedCrewRosterDir, effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
+import { crewNameFromEncodedRosterFile, crewNameFromRosterFilename, crewRosterDir, crewRosterPath, encodedCrewRosterDir, effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
 import { readHubRosterCache, syncHubRosterCache } from '../packages/work/src/settings/hub-roster-cache.ts';
 import type { HubClient } from '../packages/work/src/hub/client.ts';
 import type { GetRostersResponse, WhoamiResponse } from '../packages/work/src/hub/types.ts';
@@ -1732,7 +1732,7 @@ function validateRosterMutationSuccess(endpoint: string, body: unknown): RosterM
     return { crewId, capability: row.capability, removed: row.removed };
   }
   if (typeof row.harness !== 'string' || row.harness === '') throw new CliError(`${prefix} — missing non-empty string harness`);
-  if (typeof row.displayName !== 'string' || row.displayName === '') throw new CliError(`${prefix} — missing non-empty string displayName`);
+  if (typeof row.displayName !== 'string') throw new CliError(`${prefix} — missing string displayName`);
   if (!Array.isArray(row.models)) throw new CliError(`${prefix} — missing array models`);
   const models = row.models.map((model, index) => {
     const value = recordOf(model);
@@ -1790,7 +1790,7 @@ function validateHarnessModelsSuccess(body: unknown): { harnesses: Array<{ harne
   return {
     harnesses: row.harnesses.map((harness, index) => {
       const item = recordOf(harness);
-      if (item === null || typeof item.harness !== 'string' || item.harness === '' || typeof item.displayName !== 'string' || item.displayName === '') throw new CliError(`${prefix} — harnesses[${index}] is invalid`);
+      if (item === null || typeof item.harness !== 'string' || item.harness === '' || typeof item.displayName !== 'string') throw new CliError(`${prefix} — harnesses[${index}] is invalid`);
       return { harness: item.harness, displayName: item.displayName };
     }),
     models: row.models.map((model, index) => {
@@ -1903,7 +1903,25 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
     throw new CliError(`--crew requires a non-empty crew name (${USAGE_FORMS})`);
   }
 
-  const origin = resolveAgentHub(io, args, sub === 'sync' ? 'sync rosters from' : 'manage rosters on');
+  // Finish every command-local parse before resolving a hub or consulting the
+  // credential backend. An invalid payload is a usage error, not a reason to
+  // run an external credential helper or mask it as a missing credential.
+  let parsedCandidates: Array<{ harness: string; model: string; effort: string }> | undefined;
+  let parsedModels: Array<{ model: string; efforts: string[] }> | undefined;
+  let parsedDisplayName: string | undefined;
+  if (sub === 'org' && orgSub === 'put') {
+    parsedCandidates = all(args, 'candidate').map(parseRosterCandidate);
+  }
+  if (sub === 'registry' && registrySub === 'put') {
+    parsedDisplayName = last(args, 'display-name');
+    if (parsedDisplayName !== undefined && args.missingOptionValues.has('display-name')) {
+      throw new CliError('--display-name requires a value');
+    }
+    // The hub contract permits the empty string (for a deliberately blank
+    // display label), so only a missing flag value is malformed here.
+    parsedModels = all(args, 'model').map(parseRegistryModel);
+  }
+
   // `roster sync` is an agent-owned cache refresh. Unlike the other roster
   // verbs, its omitted `--as` deliberately means the default agent slot.
   const slot: CredentialSlotSelector = sub === 'sync'
@@ -1912,6 +1930,8 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
   if (sub === 'sync' && slot.principal !== 'agent') {
     throw new CliError(`roster sync requires an agent credential — pass --as agent or --as agent:<account> (${USAGE_FORMS})`);
   }
+
+  const origin = resolveAgentHub(io, args, sub === 'sync' ? 'sync rosters from' : 'manage rosters on');
   const cred = readCredential(io, origin, slot);
   if (cred === null) throw new CliError(emptySlotMessage(origin, slot), { exitCode: 3 });
 
@@ -1967,15 +1987,13 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
   let payload: Record<string, unknown>;
   if (sub === 'org' && orgSub === 'put') {
     endpoint = 'put_roster';
-    payload = { capability, candidates: all(args, 'candidate').map(parseRosterCandidate), ...(crewOption === undefined ? {} : { crew: crewOption }) };
+    payload = { capability, candidates: parsedCandidates!, ...(crewOption === undefined ? {} : { crew: crewOption }) };
   } else if (sub === 'org') {
     endpoint = 'delete_roster_row';
     payload = { capability, ...(crewOption === undefined ? {} : { crew: crewOption }) };
   } else {
     endpoint = 'put_harness_models';
-    const displayName = last(args, 'display-name');
-    if (displayName !== undefined && (args.missingOptionValues.has('display-name') || displayName.trim() === '')) throw new CliError('--display-name must not be empty');
-    payload = { harness, models: all(args, 'model').map(parseRegistryModel), ...(displayName === undefined ? {} : { displayName }) };
+    payload = { harness, models: parsedModels!, ...(parsedDisplayName === undefined ? {} : { displayName: parsedDisplayName }) };
   }
   const { res } = await authedPost(io, origin, slot, cred, `/api/${endpoint}`, payload);
   if (res.status === 401) throw new CliError('credential rejected by the hub — run `owenloop login`', { exitCode: 3 });
@@ -7343,7 +7361,7 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
       // short write can only leave a removable temp, never a corrupt roster.
       const installed = installCrewRosterIfAbsent(
 	path,
-	`${JSON.stringify({ note: `machine-local overrides for crew ${crew}; wins over settings.json and hub rosters — see docs/cli.md`, roster: {} }, null, 2)}\n`,
+	`${JSON.stringify({ crew, note: `machine-local overrides for crew ${crew}; wins over settings.json and hub rosters — see docs/cli.md`, roster: {} }, null, 2)}\n`,
 	);
 	if (installed === 'created') {
 	io.err(`✓ crew roster ${crew}: created`);
@@ -7567,7 +7585,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
     const encodedCrews = existsSync(encodedDir)
       ? readdirSync(encodedDir, { withFileTypes: true })
 	  .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
-	  .map((entry) => crewNameFromEncodedRosterFilename(entry.name))
+	  .map((entry) => crewNameFromEncodedRosterFile(join(encodedDir, entry.name)))
 	  .filter((crew): crew is string => crew !== undefined)
       : [];
     const crews = [...new Set([...legacyCrews, ...encodedCrews])].sort();

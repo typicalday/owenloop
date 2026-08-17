@@ -104,6 +104,21 @@ test('crew filename codec round-trips new names while preserving every safe lega
   }
 });
 
+test('a POSIX legacy roster with a literal backslash remains the strongest layer after upgrade', { skip: process.platform === 'win32' }, () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-backslash-'));
+  try {
+    const crew = 'foo\\bar';
+    const legacy = join(home, '.owenloop', 'crews', `${crew}.json`);
+    mkdirSync(dirname(legacy), { recursive: true });
+    writeFileSync(legacy, JSON.stringify({ roster: { build: candidate('legacy', 'backslash-model') } }));
+
+    assert.equal(crewRosterPath({ HOME: home }, crew), legacy, 'the host-valid existing legacy file wins over a new codec target');
+    assert.equal(mergeRosterLayers(machineRosterLayers({ HOME: home }, crew)).build?.candidates[0]?.model, 'backslash-model');
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('traversal-shaped crews use the confined reversible filename codec', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-codec-'));
   try {

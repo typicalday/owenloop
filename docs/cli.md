@@ -321,16 +321,21 @@ file). `owenloop doctor` adds one line for each present crew roster file,
 showing its found/absent layers and registered versus missing candidate
 harnesses.
 
-Crew names are data, not filesystem paths. New setup skeletons use the
-reversible `crew--<base64url>.json` codec inside the dedicated
-`~/.owenloop/crews/.owenloop-encoded-rosters/` directory; do not derive that
-filename by hand. The separate directory is deliberately disjoint from every
-legacy root-level crew filename. Existing safe legacy `<crew>.json` files —
-including names containing spaces, colons, percent signs, or Unicode — remain
-readable and take precedence, so upgrading never replaces a hand-edited
-strongest layer with an empty skeleton. `owenloop doctor` decodes codec names
-before inspecting them, and traversal-shaped hub crew names stay confined to
-the `crews/` directory.
+Crew names are data, not filesystem paths. A fresh safe crew keeps the literal
+`~/.owenloop/crews/<crew>.json` filename for rollback compatibility. Unsafe or
+too-wide names use the dedicated codec-only
+`~/.owenloop/crews/.owenloop-encoded-rosters/` directory: short names use a
+reversible `crew--<base64url>.json` basename, while names too wide for one
+filesystem component use a bounded `crew-hash--…` basename and record their
+exact `crew` identity inside the JSON document. Do not derive either filename
+by hand. The separate directory is deliberately disjoint from every legacy
+root-level crew filename. Existing safe legacy `<crew>.json` files — including
+names containing spaces, colons, percent signs, Unicode, and (on POSIX)
+backslashes — remain readable and take precedence, so upgrading never replaces
+a hand-edited strongest layer with an empty skeleton. `owenloop doctor` decodes
+reversible names and verifies the recorded identity for bounded hash names
+before inspecting them; traversal-shaped hub crew names stay confined to the
+`crews/` directory.
 
 A clean start or `--once` completion exits `0`. `owenloop shift --help` also
 exits `0`. Runtime failures such as credential reads or socket/runtime setup
@@ -2784,6 +2789,8 @@ block; a non-2xx response comes back as an error result.
 | `list_subscriptions` | the org's contract subscriptions |
 | `presence_ping` | register/refresh this Shift's presence — name, crews served (empty/omitted `serve_crews` means every crew this principal belongs to), and optionally which process incarnation is reporting (`shift_id`/`started_at`); observability only, a separate mechanism from the `heartbeat` lease tool above |
 | `list_shifts` | your principal's registered Shifts — online/offline derived at read time from last ping, crews served (returned as `crews`; empty means every crew this principal belongs to), and each one's reporting incarnation (`shiftId`/`startedAt`) when the hub recorded one |
+| `get_rosters` | read the org-global and per-crew capability rosters available to this principal |
+| `list_harness_models` | read the org's registered harnesses, models, and supported efforts |
 | `wake` | cheap "has anything changed since cursor X" pre-check for a polling loop |
 | `create_agent` | create a NEW Scoped Identity and store its credential locally — **never returns the token** |
 | `list_crews` | list the org's crews, each with its member rows inline — a plain passthrough, no filtering |

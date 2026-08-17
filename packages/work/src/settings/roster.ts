@@ -7,7 +7,7 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import {
   type Roster,
@@ -127,6 +127,28 @@ export function crewNameFromEncodedRosterFilename(filename: string): string | un
   return decodeCrewRosterFilename(filename);
 }
 
+/**
+ * Return the crew identity stored by a codec-only roster. Reversible codec
+ * names carry their identity in the basename; bounded hash names carry it in
+ * the JSON document because a hash is intentionally not reversible. Checking
+ * that the recorded identity resolves back to this filename prevents a stale
+ * or hand-edited document from making doctor inspect a different crew.
+ */
+export function crewNameFromEncodedRosterFile(path: string): string | undefined {
+  const filename = basename(path);
+  const decoded = decodeCrewRosterFilename(filename);
+  if (decoded !== undefined) return decoded;
+  if (!filename.startsWith(CREW_ROSTER_HASH_FILENAME_PREFIX) || !filename.endsWith('.json')) return undefined;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+    const crew = (parsed as Record<string, unknown>)['crew'];
+    return typeof crew === 'string' && encodeCrewRosterFilename(crew) === filename ? crew : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function containedCrewPath(dir: string, filename: string): string {
   const root = resolve(dir);
   const path = resolve(root, filename);
@@ -148,8 +170,16 @@ function encodedCrewRosterPath(env: Record<string, string | undefined>, crew: st
 
 /** A literal roster is rollback-safe only when it fits one filesystem component. */
 function legacyCrewRosterPath(dir: string, crew: string): string | undefined {
-  if (crew.includes('/') || crew.includes('\\') || crew.includes('\0') || Buffer.byteLength(`${crew}.json`, 'utf8') > MAX_CREW_ROSTER_FILENAME_BYTES) return undefined;
-  return containedCrewPath(dir, `${crew}.json`);
+  if (crew.includes('/') || crew.includes('\0') || Buffer.byteLength(`${crew}.json`, 'utf8') > MAX_CREW_ROSTER_FILENAME_BYTES) return undefined;
+  // On POSIX, `\\` is a literal filename character. Let the host path parser
+  // decide whether it is safe, then preserve an existing legacy file when it
+  // remains lexically contained. On Windows the containment check rejects a
+  // backslash that would escape into another path segment.
+  try {
+    return containedCrewPath(dir, `${crew}.json`);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -159,9 +189,11 @@ function legacyCrewRosterPath(dir: string, crew: string): string | undefined {
  * same resolver, so it cannot create an empty encoded duplicate over an existing
  * strongest-layer override.
  *
- * New files use a codec-only subdirectory plus `encodeCrewRosterFilename`; hub
- * names are always data, never path segments, and every target has an explicit
- * containment proof. Root-level files always retain legacy semantics.
+ * A new name that is safe as a single native path component remains a literal
+ * root-level file for rollback compatibility. Unsafe or too-wide names use the
+ * codec-only subdirectory plus `encodeCrewRosterFilename`; hub names are always
+ * data, never path segments, and every target has an explicit containment
+ * proof.
  */
 export function crewRosterPath(env: Record<string, string | undefined>, crew: string): string {
   const dir = crewRosterDir(env);
