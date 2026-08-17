@@ -136,6 +136,19 @@ test('reject POSTs /api/reject without a client-supplied by field', async () => 
   assert.equal(res.closed, false);
 });
 
+test('retryArtifact POSTs the human stall-clear body without run or by', async () => {
+  const captured: Captured[] = [];
+  const c = client(fakeFetch(captured, { body: { text: 'retried', ok: true, closed: false } }));
+  const res = await c.retryArtifact!({ workflow: 'wf1', path: 'pr', text: 'use the fixture' });
+  assert.equal(captured[0]!.method, 'POST');
+  assert.equal(captured[0]!.url, 'https://hub.example/api/retry_artifact');
+  assert.deepEqual(captured[0]!.body, { workflow: 'wf1', path: 'pr', text: 'use the fixture' });
+  assert.equal((captured[0]!.body as Record<string, unknown>)['run'], undefined);
+  assert.equal((captured[0]!.body as Record<string, unknown>)['by'], undefined);
+  assert.equal(res.ok, true);
+  assert.equal(res.closed, false);
+});
+
 test('whoami GETs /api/whoami', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'ok', orgId: 'o1', orgName: 'Org', actor: { id: 'a', kind: 'agent', role: 'agent', scopes: [] }, tokenStatus: 'active', authMethod: 'token' } }));

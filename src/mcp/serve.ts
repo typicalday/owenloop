@@ -400,13 +400,13 @@ function warnMcpUnsigned(deps: McpDeps, reason: string): void {
 }
 
 /**
- * The 19 baseline tools — names, descriptions, and schemas mirror the hub's own
+ * The 20 baseline tools — names, descriptions, and schemas mirror the hub's own
  * HTTP-MCP toolset (owenloop-service `apps/hub-edge/src/mcp/tools.ts`); each maps
  * to an H3 `/api/*` REST mirror. Descriptions say "Scoped Identity" for the identity
  * (wire names keep `agent`), never "tool" (model-doc §0/§10).
  *
  * This is not the server's whole tool list. `runMcpCommand` assembles the full
- * set: these 17, plus `createAgentTool`, plus the four crew tools from
+ * set: these 20, plus `createAgentTool`, plus the four crew tools from
  * `buildCrewTools` (below — deliberately NOT folded in here, since they do not
  * mirror the hub's own MCP toolset), plus the conditionally-registered
  * `stageEnrollmentTool`.
@@ -466,6 +466,20 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
         additionalProperties: false,
       },
       handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/reject_artifact', body: a })),
+    },
+    {
+      name: 'retry_artifact',
+      description:
+	"The human stall-clearing lever: re-arm a stalled or rejected artifact to 'owed', resetting its " +
+	'reject counters. This is also the answer path for a worker that escalated with `ask` — `text` ' +
+	"rides to the next producer on the artifact's reason thread. Omit `text` for a bare stall-clear.",
+      inputSchema: {
+	type: 'object',
+	properties: { workflow: { type: 'string' }, path: { type: 'string' }, text: { type: 'string' } },
+	required: ['workflow', 'path'],
+	additionalProperties: false,
+      },
+      handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/retry_artifact', body: a })),
     },
     {
       name: 'provide_input',
@@ -742,7 +756,7 @@ function createAgentTool(deps: McpDeps): ToolRegistration {
   };
 }
 
-/** Tool 19 (gated) — `stage_enrollment`: a plain passthrough (join codes are transcript-legal per model-doc §6). */
+/** Tool 20 (gated) — `stage_enrollment`: a plain passthrough (join codes are transcript-legal per model-doc §6). */
 function stageEnrollmentTool(deps: McpDeps): ToolRegistration {
   return {
     name: 'stage_enrollment',

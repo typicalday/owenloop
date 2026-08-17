@@ -1482,7 +1482,7 @@ ${' '.repeat(41)}refresh the local hub-rosters cache with an agent credential
   reject <wf> <path> --by <author> --text <msg>
   retract <wf> <path> --by <author> --text <msg>
   skip <wf> <path> --by <author> --text <msg>
-  retry <wf> <path> [--by <author>] [--text <guidance>]   clear a §6 stall, or ANSWER an ask
+  retry <wf> <path> [--by <author>] [--text <guidance>] [--hub <url>]   clear a §6 stall, or ANSWER an ask
   ask <wf> <path> <question> [--by <author>]   hold an owed artifact on a question for a human
   inbox                                  every held question across all instances, with its answer command
   heartbeat <wf> <run> [--now <ms>]    touch liveness timestamp on an open run
@@ -1576,7 +1576,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['reject', cmdOpts('by', 'text')],
   ['retract', cmdOpts('by', 'text')],
   ['skip', cmdOpts('by', 'text')],
-  ['retry', cmdOpts('by', 'text')],
+  ['retry', cmdOpts('by', 'text', 'hub')],
   ['ask', cmdOpts('by', 'question')],
   ['inbox', cmdOpts()],
   ['close', cmdOpts('outcome', 'summary')],
@@ -5101,6 +5101,47 @@ async function dispatchCancel(io: CliIO, args: Args): Promise<number> {
 }
 
 /**
+ * `owenloop retry --hub` — the human stall-clear / answer path for a hub-hosted
+ * run. Local retry remains synchronous in `main()`; this dispatch owns only
+ * the network half so direct synchronous callers keep their existing contract.
+ */
+async function dispatchRetry(io: CliIO, args: Args): Promise<number> {
+  const workflow = need(args, 1, 'workflow');
+  const path = need(args, 2, 'path');
+  if (args.options.has('by')) {
+    throw new CliError('owenloop retry: --by cannot be combined with --hub — the hub attributes the retry to the authenticated human principal');
+  }
+  if (args.missingOptionValues.has('text')) {
+    throw new CliError('missing value for --text: expected --text <guidance>');
+  }
+  const text = last(args, 'text');
+  if (text !== undefined && text.trim() === '') {
+    throw new CliError('invalid empty value for --text: expected --text <guidance>');
+  }
+
+  const origin = resolveStartHub(io, args);
+  const slot: CredentialSlotSelector = { principal: 'human' };
+  const cred = readCredential(io, origin, slot);
+  if (cred === null) {
+    throw new CliError(`no human credential for ${origin} — run: owenloop login --hub ${origin}`, { exitCode: 3 });
+  }
+
+  const request = { workflow, path, ...(text !== undefined ? { text } : {}) };
+  const { res, cred: used } = await authedPost(io, origin, slot, cred, '/api/retry_artifact', request);
+  if (res.status === 401) assertAuthOk(res, used, origin);
+  if (!res.ok) {
+    const message = await hubRequestMessage(res);
+    throw new CliError(message ?? `hub ${origin} rejected the request (HTTP ${res.status})`);
+  }
+
+  // The hub owns the response body contract. Any successful response has
+  // completed the state transition, so expose a stable CLI receipt instead of
+  // assuming fields the server has not promised this client.
+  print(io, { ok: true, action: 'retry', path, workflow, hub: origin });
+  return 0;
+}
+
+/**
  * `owenloop instance` — read a HUB instance's live state from the terminal.
  *
  * The read counterpart to `start` and `cancel`. Two naming constraints forced
@@ -7760,7 +7801,7 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
  * the async path, so every existing command and test keeps working exactly as
  * before.
  */
-export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'cancel', 'instance', 'agent', 'capability', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
+export const ASYNC_COMMANDS = new Set(['add', 'login', 'logout', 'connect', 'publish', 'trust', 'push', 'start', 'cancel', 'retry', 'instance', 'agent', 'capability', 'routing', 'crew', 'roster', 'setup', 'doctor', 'enrollments', 'mcp', 'shift']);
 
 export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promise<number> {
   // Delegate execution-side and shift argv tails before root parsing. Their
@@ -7808,6 +7849,11 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
 	return await dispatchStart(io, args);
       case 'cancel':
         return await dispatchCancel(io, args);
+      case 'retry':
+	// Local engine store unless --hub; only the hub half is async, and
+	// main()'s own `case 'retry'` stays the local implementation so the
+	// synchronous callers of main() keep working.
+	return args.options.has('hub') ? await dispatchRetry(io, args) : main(argv, io);
       case 'instance':
         return await dispatchInstance(io, args);
       case 'agent':

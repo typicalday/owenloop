@@ -422,6 +422,26 @@ export interface RejectResponse extends HubResponse {
   closed?: boolean;
 }
 
+// ---- retry artifact ---------------------------------------------------------
+
+/**
+ * The HUMAN stall-clearing lever and answer path for ask. Re-arms a stalled or
+ * rejected artifact to owed, resetting its reject counters. text rides to the
+ * next producer on the artifact's reason thread; omit it for a bare
+ * stall-clear so the engine supplies its own default.
+ */
+export interface RetryArtifactRequest {
+  workflow: string;
+  path: string;
+  text?: string;
+}
+
+/** The retry-artifact verb's flattened response envelope. */
+export interface RetryArtifactResponse extends HubResponse {
+  ok: boolean;
+  closed?: boolean;
+}
+
 // ---- ask --------------------------------------------------------------------
 
 /**
