@@ -11,7 +11,6 @@ import { createShiftLoop, MAX_PENDING_CANDIDATE_AGE_MS, type ShiftLoop, type Shi
 import {
   buildSpawnPlan,
   createDefaultSpawner,
-  reportedHarnessId,
   type SpawnSpec,
   type Spawner,
 } from '../src/shift/spawn.ts';
@@ -1216,65 +1215,53 @@ test('buildSpawnPlan carries the live shift ownership name in the agent child en
   assert.equal(plan.options.env['OWENLOOP_SHIFT_OWNER'], '/state/shift-a');
 });
 
-// ---- the harness named on a failure event ------------------------------------
-//
-// The Shift does not CHOOSE the harness — the agent-run child does. These tests
-// pin the report to the child's own precedence in `roles/agent-run.ts`, because
-// the field's only job is to tell an operator which adapter was running when the
-// worker died. A report that disagrees with the child is worse than no field.
+test('buildSpawnPlan passes shift crews to agent-run in command-line order only', () => {
+  const agent = buildSpawnPlan(
+    { workflow: 'wf1', run: 'run_zzzz', kind: 'agent-run' },
+    'https://hub.example',
+    'ci',
+    '/pkg/bin/owenloop.mjs',
+    '/usr/bin/node',
+    undefined,
+    undefined,
+    undefined,
+    ['first', 'second'],
+  );
+  assert.equal(agent.options.env['OWENLOOP_SERVE_CREWS'], 'first,second');
 
-test('reportedHarnessId: OWENLOOP_HARNESS OUTRANKS the prepared-cache step harness', () => {
-  // The regression this pins. The old expression was `spec.harness ?? env`,
-  // which is the child's order inverted: an operator who pinned the variable
-  // AND had a cached step harness was told the cached one ran.
-  assert.equal(reportedHarnessId({ harness: 'cached' }, { OWENLOOP_HARNESS: 'pinned' }), 'pinned');
+  const command = buildSpawnPlan(
+    { workflow: 'wf1', run: 'run_zzzz' },
+    'https://hub.example',
+    'ci',
+    '/pkg/bin/owenloop.mjs',
+    '/usr/bin/node',
+    undefined,
+    undefined,
+    undefined,
+    ['first'],
+  );
+  assert.equal(command.options.env['OWENLOOP_SERVE_CREWS'], undefined);
 });
 
-test('reportedHarnessId: a set-but-blank OWENLOOP_HARNESS is reported as the refusal the child raises', () => {
-  // The child does not fall through to the step here — it refuses the whole
-  // config and names the id `<empty OWENLOOP_HARNESS>`. Falling through in the
-  // report would name an adapter that never ran.
-  for (const blank of ['', '   ', '\t']) {
-    assert.equal(
-      reportedHarnessId({ harness: 'cached' }, { OWENLOOP_HARNESS: blank }),
-      '<empty OWENLOOP_HARNESS>',
-    );
-  }
-});
-
-test('reportedHarnessId: with no variable set, the cache step harness is reported', () => {
-  assert.equal(reportedHarnessId({ harness: 'cached' }, {}), 'cached');
-  // An EMPTY step harness counts as absent, exactly as the child treats it.
-  assert.equal(reportedHarnessId({ harness: '' }, {}), '<registered default>');
-});
-
-test('reportedHarnessId: neither input present names the placeholder, not a guess', () => {
-  // The child took the first REGISTERED adapter. The Shift never imports the
-  // adapter composition root, so its own registry is empty and any id it
-  // produced here would be invented.
-  assert.equal(reportedHarnessId({}, {}), '<registered default>');
-});
-
-test('createDefaultSpawner reports the harness from the CHILD spawn env, not this process', async () => {
-  // `plan.options.env` is what the child gets. Resolving against `process.env`
-  // instead would be right only by accident.
-  const script = join(stateDir, '..', 'exit-three.mjs');
-  writeFileSync(script, 'process.exit(3);\n');
-  const keepAlive = setTimeout(() => {}, 5_000);
-  const prior = process.env['OWENLOOP_HARNESS'];
-  process.env['OWENLOOP_HARNESS'] = 'pinned-by-operator';
+test('buildSpawnPlan clears an ambient crew handoff for --all agent workers', () => {
+  const previous = process.env['OWENLOOP_SERVE_CREWS'];
+  process.env['OWENLOOP_SERVE_CREWS'] = 'stale-crew';
   try {
-    const failure = await new Promise<Parameters<NonNullable<Parameters<typeof createDefaultSpawner>[4]>>[0]>(
-      (resolve) => {
-	const spawner = createDefaultSpawner(ORIGIN, 'default', script, 'shf_test', resolve);
-	spawner({ workflow: 'wf1', run: 'run_env_harness', step: 'builder', kind: 'agent-run', harness: 'cached' });
-      },
+    const plan = buildSpawnPlan(
+      { workflow: 'wf1', run: 'run_zzzz', kind: 'agent-run' },
+      'https://hub.example',
+      'ci',
+      '/pkg/bin/owenloop.mjs',
+      '/usr/bin/node',
+      undefined,
+      undefined,
+      undefined,
+      [],
     );
-    assert.equal(failure.harness, 'pinned-by-operator');
+    assert.equal('OWENLOOP_SERVE_CREWS' in plan.options.env, false);
   } finally {
-    if (prior === undefined) delete process.env['OWENLOOP_HARNESS'];
-    else process.env['OWENLOOP_HARNESS'] = prior;
-    clearTimeout(keepAlive);
+    if (previous === undefined) delete process.env['OWENLOOP_SERVE_CREWS'];
+    else process.env['OWENLOOP_SERVE_CREWS'] = previous;
   }
 });
 
@@ -1286,14 +1273,9 @@ test('createDefaultSpawner reports a nonzero detached worker exit with generic l
   // unref'd; Node 22 may otherwise let the isolated test process drain before
   // delivering the child's `exit` event.
   const keepAlive = setTimeout(() => {}, 5_000);
-  // The reported harness now honours `OWENLOOP_HARNESS` above the spec, so an
-  // operator running the suite with that variable exported would otherwise see
-  // this assertion fail for a reason that has nothing to do with the code.
-  const prior = process.env['OWENLOOP_HARNESS'];
-  delete process.env['OWENLOOP_HARNESS'];
   const failure = new Promise<Parameters<NonNullable<Parameters<typeof createDefaultSpawner>[4]>>[0]>((resolve) => {
     const spawner = createDefaultSpawner(ORIGIN, 'default', script, 'shf_test', resolve);
-    spawner({ workflow: 'wf1', run: 'run_failed', step: 'builder', kind: 'agent-run', harness: 'codex' });
+    spawner({ workflow: 'wf1', run: 'run_failed', step: 'builder', kind: 'agent-run' });
   });
 
   try {
@@ -1302,14 +1284,12 @@ test('createDefaultSpawner reports a nonzero detached worker exit with generic l
       run: 'run_failed',
       step: 'builder',
       kind: 'agent-run',
-      harness: 'codex',
       executable: `${process.execPath} ${script}`,
       exitStatus: 7,
       signal: null,
       message: 'worker exited without completing successfully',
     });
   } finally {
-    if (prior !== undefined) process.env['OWENLOOP_HARNESS'] = prior;
     clearTimeout(keepAlive);
   }
 });
@@ -1324,7 +1304,7 @@ test('createDefaultSpawner never lets allowlisted-looking agent progress reach a
   const keepAlive = setTimeout(() => {}, 5_000);
   const failure = new Promise<Parameters<NonNullable<Parameters<typeof createDefaultSpawner>[4]>>[0]>((resolve) => {
     const spawner = createDefaultSpawner(ORIGIN, 'default', script, 'shf_test', resolve);
-    spawner({ workflow: 'delivery', run: 'run_1', step: 'builder', kind: 'agent-run', harness: 'codex' });
+    spawner({ workflow: 'delivery', run: 'run_1', step: 'builder', kind: 'agent-run' });
   });
 
   try {
@@ -1389,7 +1369,16 @@ test('detached exec and agent-run workers survive late stderr writes after Shift
 
   const deadline = Date.now() + 5_000;
   const markers = ['exec.done', 'agent-run.done'];
-  while (!markers.every((name) => existsSync(join(markerDir, name))) && Date.now() < deadline) {
+  // A marker's directory entry can become visible before its synchronous write
+  // has emitted every byte, so wait for the completion contract itself.
+  const completed = (name: string): boolean => {
+    try {
+      return readFileSync(join(markerDir, name), 'utf8') === 'completed\n';
+    } catch {
+      return false;
+    }
+  };
+  while (!markers.every(completed) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   for (const marker of markers) {

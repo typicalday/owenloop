@@ -33,20 +33,20 @@ test('OWENLOOP_CONFIG_DIR has NO "owenloop" segment appended', () => {
   assert.equal(owenloopConfigDir({ OWENLOOP_CONFIG_DIR: '/cfg' }), '/cfg');
 });
 
-test('XDG_CONFIG_HOME wins over HOME and appends the owenloop segment', () => {
-  assert.equal(owenloopConfigDir({ XDG_CONFIG_HOME: '/xdg', HOME: '/home/u' }), '/xdg/owenloop');
+test('XDG_CONFIG_HOME is ignored in favor of HOME', () => {
+  assert.equal(owenloopConfigDir({ XDG_CONFIG_HOME: '/xdg', HOME: '/home/u' }), '/home/u/.owenloop');
 });
 
 test('HOME is the last rung', () => {
-  assert.equal(owenloopConfigDir({ HOME: '/home/u' }), '/home/u/.config/owenloop');
+  assert.equal(owenloopConfigDir({ HOME: '/home/u' }), '/home/u/.owenloop');
 });
 
 test('blank and whitespace-only values are treated as unset at every rung', () => {
   assert.equal(
     owenloopConfigDir({ OWENLOOP_CONFIG_DIR: '  ', XDG_CONFIG_HOME: '/xdg', HOME: '/home/u' }),
-    '/xdg/owenloop',
+    '/home/u/.owenloop',
   );
-  assert.equal(owenloopConfigDir({ OWENLOOP_CONFIG_DIR: '', XDG_CONFIG_HOME: '  ', HOME: '/home/u' }), '/home/u/.config/owenloop');
+  assert.equal(owenloopConfigDir({ OWENLOOP_CONFIG_DIR: '', XDG_CONFIG_HOME: '  ', HOME: '/home/u' }), '/home/u/.owenloop');
 });
 
 test('a relative OWENLOOP_CONFIG_DIR is a hard error naming the variable', () => {
@@ -58,8 +58,8 @@ test('a relative OWENLOOP_CONFIG_DIR is a hard error naming the variable', () =>
   );
 });
 
-test('an empty environment throws and names all three variables', () => {
-  assert.throws(() => owenloopConfigDir({}), /set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/);
+test('an empty environment names the two usable configuration sources', () => {
+  assert.throws(() => owenloopConfigDir({}), /set OWENLOOP_CONFIG_DIR or HOME/);
 });
 
 test('owenloopConfigFile joins segments under the resolved directory', () => {
@@ -84,7 +84,7 @@ test('owenloopSettingsPath reports an unusable environment as a CliError', () =>
   assert.throws(() => owenloopSettingsPath({}), (err: unknown) => {
     assert.ok(err instanceof Error);
     assert.match(err.message, /cannot locate a config directory for execution settings/);
-    assert.match(err.message, /set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/);
+    assert.match(err.message, /set OWENLOOP_CONFIG_DIR or HOME/);
     return true;
   });
 });

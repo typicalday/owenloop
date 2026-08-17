@@ -159,9 +159,9 @@ function pathExists(path: string): boolean {
 
 function trustEnv(): Record<string, string | undefined> {
   const config = mkdtempSync(join(tmpdir(), 'owenloop-exec-consumed-trust-'));
-  mkdirSync(join(config, 'owenloop'), { recursive: true });
-  writeFileSync(join(config, 'owenloop', 'org-root.pub'), ROOT_PUBLIC_KEY);
-  return { XDG_CONFIG_HOME: config };
+  mkdirSync(join(config, '.owenloop'), { recursive: true });
+  writeFileSync(join(config, '.owenloop', 'org-root.pub'), ROOT_PUBLIC_KEY);
+  return { HOME: config };
 }
 
 function signerForPrincipal({ allowedSignersText }: { allowedSignersText: string }) {

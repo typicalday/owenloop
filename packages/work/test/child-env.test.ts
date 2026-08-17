@@ -84,7 +84,7 @@ test('inside the namespace the ten admitted inputs survive and everything else i
     OWENLOOP_TOKEN: 'tok',
     OWENLOOP_ACCOUNT: 'acct',
     OWENLOOP_STATE_DIR: '/state',
-    OWENLOOP_HARNESS: 'x',
+    OWENLOOP_SERVE_CREWS: 'first,second',
     OWENLOOP_CREDENTIAL_ORIGIN: 'https://helper.example',
     OWENLOOP_CREDENTIAL_SLOT: 'agent:holder',
     // The case that matters most: a name nobody has thought of yet.
@@ -132,6 +132,7 @@ test('isAdmittedChildEnvKey agrees with the filter, name by name', () => {
     'OWENLOOP_INVENTED_NEXT_PHASE',
     'OWENLOOP_CREDENTIAL_ORIGIN',
     'OWENLOOP_CREDENTIAL_SLOT',
+    'OWENLOOP_SERVE_CREWS',
     'OWENLOOPISH',
   ]) {
     const survived = key in filterOwenloopEnv({ [key]: 'v' });

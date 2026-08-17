@@ -73,6 +73,7 @@ for the full breakdown.
 | `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]` | onboard this machine: may store human and Scoped Identity credentials, ensure the three principal signing keys, relay the machine enrollment grant, write only execution-settings `hubOrigin`, and converge the bundled plugins for Claude Code and Codex — see [`setup`](#setup--onboard-a-machine) |
 | `enrollments [--hub <url>]` | read and locally classify the hub's relayed machine enrollment grants; never creates keys or writes the roster — see [`enrollments`](#enrollments--inspect-machine-enrollment) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
+| `roster show [crew]` | print the merged **crew roster** and the provenance of every selected candidate layer |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
 | `work <subcommand> [options]` | run the execution-side CLI companion — see [`work`](#work--execution-side-cli-companion) |
@@ -176,17 +177,12 @@ but attendance is advisory and observability-only. Attendance never changes
 routing, dispatch, or lease behavior.
 
 <a id="config-dir"></a>
-The execution settings file is `<config>/settings.json`. Throughout this
-document `<config>` is owenloop's own config directory, resolved from the
-environment by this ladder, highest first:
-
-1. `$OWENLOOP_CONFIG_DIR` when set to a non-blank ABSOLUTE path — used verbatim,
-   with no `owenloop` segment appended;
-2. `$XDG_CONFIG_HOME/owenloop` when `XDG_CONFIG_HOME` is non-blank;
-3. `$HOME/.config/owenloop`.
-
-The same directory holds `credentials.json`, `allowed_signers`, `org-root.pub`,
-`roster/`, and `revocations/`.
+By default, the execution settings file is `$HOME/.owenloop/settings.json`.
+For test or throwaway isolation, `OWENLOOP_CONFIG_DIR` may name an absolute
+directory used verbatim; `XDG_CONFIG_HOME` is not consulted. In the paths below,
+`<config>` means the resolved owenloop config directory. The same directory
+holds `credentials.json`, `allowed_signers`, `org-root.pub`, `roster/`, and
+`revocations/`.
 
 ### `shift start <crew...>`
 
@@ -258,102 +254,56 @@ directories an order is **allowed to name**. Neither derives from the other.
 owenloop shift start build --work-root ~/code --work-root /srv/work
 ```
 
-**One harness per shift.** A shift has no per-order harness switch and no
-`--harness` flag. It never puts `--harness` on a worker's command line; each
-`agent-run` child resolves its own adapter, in this order:
+**Crew roster selection.** “Roster” in this section means the **crew
+roster** for capability routing, not the unrelated trust roster of signed
+enrollment grants in `~/.owenloop/roster/`. A selected roster candidate decides
+the harness, model, and effort for an agent order. Its precedence is:
 
-1. its own `--harness` flag — which a shift never supplies;
-2. `OWENLOOP_HARNESS` in the environment the child inherits, which is the
-   shift's environment;
-3. the `harness:` field on the verified step definition;
+1. the first available candidate in the first matching crew roster;
+2. `owenloop work agent-run --harness` (a local debug override);
+3. the verified step's `x.harness.id`;
 4. the first registered adapter.
 
-Rank 2 is the operator's control. Export `OWENLOOP_HARNESS` in the shell that
-starts the shift and every agent order that shift dispatches runs on that
-adapter. To run two adapters at once, start two shifts:
-
-```bash
-OWENLOOP_HARNESS=claude-code OWENLOOP_CONFIG_DIR=~/.config/owenloop-shifts/claude/owenloop owenloop shift start build --state-dir ~/.local/state/owenloop/claude
-```
-
-```bash
-OWENLOOP_HARNESS=codex OWENLOOP_CONFIG_DIR=~/.config/owenloop-shifts/codex/owenloop owenloop shift start build --state-dir ~/.local/state/owenloop/codex
-```
-
-Both shifts may serve the SAME crew. The hub does not route by harness — it
-offers an order to any shift whose crew is bound to the order's capability, and
-whichever shift claims it first runs it on its own adapter.
-
-**A per-shift config directory is not optional when the adapters differ.** The
-settings file resolves from the config directory (see above), and it carries
-`capabilityModels` — a map of composed capability to `{model, effort}` whose
-model ids are strings the SHIFT'S OWN adapter accepts. Two shifts on different
-adapters need different model ids for the same capability, so they need
-different settings files, so they need different config directories. A shared
-config directory would give both shifts one adapter's model ids, and the shift
-holding the wrong adapter fails at the vendor API on its first order.
-
-**Use `OWENLOOP_CONFIG_DIR` for this, not `XDG_CONFIG_HOME`.** Both resolve the
-settings file, and `OWENLOOP_CONFIG_DIR` wins — but `XDG_CONFIG_HOME` is a
-machine-wide contract that `gh`, `git`, `gcloud`, `npm`, and most of the rest of
-a developer's toolchain also read, and a shift spreads its ENTIRE environment
-into every worker it dispatches, which passes it on to every command step's
-child process. Scoping a shift with `XDG_CONFIG_HOME` therefore relocates the
-configuration of every tool the workflow's own scripts shell out to. Measured,
-not theorized: on one delivery run this stranded `gh`'s stored credential, and
-the workflow's merge gate spent its full 40-minute wall clock deferring on a CI
-probe that could not authenticate, followed by four consecutive merge failures
-reading `could not resolve a pull request handle for the branch`. Nothing was
-wrong with either script. `OWENLOOP_CONFIG_DIR` scopes owenloop and only
-owenloop.
-
-`OWENLOOP_CONFIG_DIR` names the owenloop config directory ITSELF — the directory
-that directly holds `settings.json`, `credentials.json`, and `allowed_signers`.
-No `owenloop` path segment is appended to it, unlike the `XDG_CONFIG_HOME` rung.
-It must be an ABSOLUTE path: a relative one would resolve against whatever
-working directory a step happens to have, and `workdirFrom` gives every step its
-own.
-
-Give each shift its own `--state-dir` as well. The state directory holds the
-control socket (`shift.sock`), and a second shift starting against a socket
-another shift already owns is refused.
-
-**`capabilityModels` — which model serves which capability.** The hub decides
-WHAT grade of work an order is; it composes the step's capability with the run's
-depth modifier and stamps the result on the order (`builder` at the `deep`
-modifier becomes `builder:deep`). It never decides which model serves that
-grade. That decision is local, and this map is where the operator makes it:
+The shift passes its start crews to each agent worker internally. A named crew
+uses `~/.owenloop/crews/<crew>.json` above the machine-global
+`~/.owenloop/settings.json` `roster` key. Each capability row is atomic:
+the stronger layer replaces the weaker candidate array, and candidates are
+tried in listed order. A step's `x.harness.id` is a policy constraint: a row
+whose candidates do not include it is released as
+`incompatible-harness-policy`; no available candidate is
+`unresolvable-capability`.
 
 ```json
 {
-  "capabilityModels": {
-    "builder:deep": { "model": "claude-opus-5", "effort": "xhigh" },
-    "builder": { "model": "claude-sonnet-5", "effort": "high" },
-    "wise": { "model": "claude-fable-5", "effort": "xhigh" }
+  "roster": {
+    "builder:deep": [
+      { "harness": "claude-code", "model": "claude-opus-5", "effort": "xhigh" },
+      { "harness": "codex", "model": "gpt-5.6-sol", "effort": "xhigh" }
+    ],
+    "builder": [
+      { "harness": "codex", "model": "gpt-5.6-terra", "effort": "high" }
+    ]
   }
 }
 ```
 
-Lookup runs two passes over the order's capabilities: every EXACT composed key
-first, then every BARE name part. `builder:deep` takes the first row above;
-`builder:express` has no exact row and falls back to the `builder` row.
-`effort` must be one of `low`, `medium`, `high`, `xhigh`, `max`. The model id is
-never checked against a list — owenloop keeps no registry of which models exist,
-so a model released after your owenloop build still works.
+The array form is required even with one candidate. There is no migration path:
+the retired key is rejected at settings load. Exact composed capability lookup
+runs across the order's whole capability list before bare-name lookup, so an
+exact row is never shadowed by an earlier bare row.
 
-A capability with no exact row and no bare row is REFUSED, not run on a default:
-the worker releases the claim, reports the refusal to the hub, and exits `1`. An
-order carrying no capabilities at all is not refused — it runs on the adapter's
-own default model, which is how capability-silent steps have always run.
+`~/.owenloop/config.json` and `~/.owenloop/settings.json` intentionally
+remain separate. The control-plane `config.json` carries `hub`, is written by
+`owenloop login`, and is read by `owenloop mcp`. The execution-plane
+`settings.json` carries `hubOrigin` and the machine-global crew roster, is
+written by `owenloop setup`, and is read by `owenloop work`. They answer
+different callers and neither reads the other.
 
-**Migrating from `tierMap` / `tierProfiles`.** Both keys are removed. A settings
-file that still contains either one fails to load with an error naming
-`capabilityModels`; the shift does not start. This is deliberate — a shift that
-ignored the old keys would have no capability map at all and would refuse every
-order it claimed, hours later and far from the cause. Rewrite the tier rungs as
-capability rows: whatever `tierProfiles.strongest` pointed at becomes the
-`{model, effort}` of your `:deep` rows, and whatever `standard` pointed at
-becomes the bare rows.
+`owenloop roster show [crew]` prints the merged roster, every candidate's
+winning-layer provenance, and every layer inspected (including an absent crew
+file). `owenloop doctor` adds one line for each present crew roster file,
+showing its found/absent layers and registered versus missing candidate
+harnesses.
 
 A clean start or `--once` completion exits `0`. `owenloop shift --help` also
 exits `0`. Runtime failures such as credential reads or socket/runtime setup
@@ -554,8 +504,7 @@ An absent `x.harness.tools` field preserves the adapter's default tool surface;
 `tools: []` is an explicit empty allow-list. The two forms are not equivalent.
 Invalid reserved fields and overlapping `tools` / `disallowedTools` are refused.
 `owenloop work lint` runs the same common and adapter checks, but runtime
-preflight remains authoritative because `--harness` or `OWENLOOP_HARNESS` can
-select a different adapter after lint. See [Agent runner and harness policy](agent-runner.md)
+preflight remains authoritative because roster availability and `--harness` can select a different adapter after lint. See [Agent runner and harness policy](agent-runner.md)
 for the capability matrix and the born-bound Owenloop control-plane exception.
 
 **Harness-session durability.** `agent-run` records the provider session in the
@@ -1359,7 +1308,7 @@ owenloop login --hub https://hub.example
 owenloop connect --hub https://hub.example
 owenloop push newhire-onboarding
 OWENLOOP_ACCOUNT=default owenloop work prepare newhire-onboarding --origin https://hub.example
-OWENLOOP_HARNESS=codex owenloop shift start openai --origin https://hub.example --as default
+owenloop shift start openai --origin https://hub.example --as default
 ```
 
 Starting another run does not repeat installation, publication, preparation,
@@ -1667,7 +1616,7 @@ credential above is verified and stored, `login` makes one more best-effort
 write: it records the hub origin it just authenticated against in
 `~/.owenloop/config.json` (`{"version": 1, "hub": "<origin>"}` — never a
 secret, just the origin). This file is separate from both the credential store
-above and from `owenloop setup`'s `~/.config/owenloop/settings.json`; its only
+above and from `owenloop setup`'s `~/.owenloop/settings.json`; its only
 reader is `owenloop mcp`'s [origin resolution](#choosing-the-hub-origin),
 which needs to know your hub without enumerating the credential store (the
 Keychain and external-command backends can't be listed at all — see below). A

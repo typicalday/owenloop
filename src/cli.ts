@@ -33,7 +33,7 @@
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
  */
 
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -204,6 +204,10 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { loadSettings, settingsPath as executionSettingsPath } from '../packages/work/src/settings/settings.ts';
+import { machineRosterLayers, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
+import { adapterFor } from '../packages/work/src/harness/registry.ts';
+import '../packages/work/src/harnesses.ts';
+import { owenloopConfigDir } from './config-dir.ts';
 import { owenloopSettingsPath, readOwenloopSettingsRaw, writeOwenloopHubOrigin } from './work-settings.ts';
 import { globalConfigPath, writeGlobalConfig } from './global-config.ts';
 import { canonicalJsonBytes, defaultRecoveryMarkerDir, ensureDirectoryPathNoSymlink, guardStateFile } from './install.ts';
@@ -1436,6 +1440,7 @@ ${' '.repeat(41)}and escalations. Unrelated to the local \`show\`, which reads a
   crew member rm <crewId> <principalId> [--hub <url>]   remove a principal from a crew
   setup [--hub <url>] [--new-agent <name> | --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]   converge this machine's install: human login, agent credential, signing keys, owenloop settings, plugins (idempotent)
   doctor [--hub <url>]                    check this machine's owenloop install and report each piece (read-only)
+  roster show [crew]                      print a merged crew roster and its layer provenance (read-only)
   enrollments [--hub <url>]               list the hub's relayed machine enrollment grants (read-only)
   mcp [--hub <url>]                       serve the hub control plane over stdio MCP (spawned by MCP hosts, not run by humans)
   work <subcommand> [args]                run execution-side shift/hold/exec/agent-run/... commands
@@ -1532,6 +1537,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['crew', cmdOpts('hub', 'kind', 'owner')],
   ['setup', cmdOpts('hub', 'new-agent', 'replace-agent', 'crews', 'scopes', 'reuse-ssh-key')],
   ['doctor', cmdOpts('hub')],
+  ['roster', cmdOpts()],
   ['enrollments', cmdOpts('hub')],
   ['mcp', cmdOpts('hub')],
   ['work', cmdOpts()],
@@ -1637,12 +1643,46 @@ function preflight(command: string, args: Args, io: CliIO): number | undefined {
   return undefined;
 }
 
+function dispatchRoster(io: CliIO, args: Args): number {
+  if (args.positionals[1] !== 'show' || args.positionals.length > 3) {
+    throw new CliError('usage: owenloop roster show [crew]');
+  }
+  const crew = args.positionals[2];
+  const layers = machineRosterLayers(io.env, crew);
+  const merged = mergeRosterLayers(layers);
+  const hasRoster = layers.some((layer) => layer.roster !== undefined);
+  if (!hasRoster) {
+    io.out(
+      crew === undefined
+        ? 'no machine-global crew roster found'
+        : `no roster layers found for crew ${crew}`,
+    );
+  } else {
+    for (const capability of Object.keys(merged).sort()) {
+      const entry = merged[capability]!;
+      io.out(`${capability}:`);
+      for (const [index, candidate] of entry.candidates.entries()) {
+        io.out(
+          `  [${index}] harness=${candidate.harness} model=${candidate.model} effort=${candidate.effort} from ${entry.source}`,
+        );
+      }
+    }
+  }
+  io.out('layers inspected:');
+  for (const layer of layers) {
+    io.out(`  ${layer.source}: ${layer.roster === undefined ? 'absent' : 'found'}${layer.path === undefined ? '' : ` (${layer.path})`}`);
+  }
+  return 0;
+}
+
 function dispatch(command: string, io: CliIO, args: Args): number {
   // help and lint need no store
   if (command === 'help' || command === '--help' || command === '-h') {
     io.out(USAGE);
     return 0;
   }
+
+  if (command === 'roster') return dispatchRoster(io, args);
 
   if (command === 'lint') {
     const defsDir = last(args, 'defs') ?? io.env.OWENLOOP_DEFS ?? join(io.cwd, 'workflows');
@@ -7102,7 +7142,41 @@ async function runDoctor(io: CliIO, origin: string): Promise<DoctorResult> {
     }
   }
 
-  // 6–7. plugins (rendered; non-core while PLUGIN_CHECK_FATAL is false)
+  // Crew-roster diagnostics are informational per crew. The same registry
+  // membership predicate the worker uses is intentionally reused here.
+  try {
+    const crewsDir = join(owenloopConfigDir(io.env), 'crews');
+    const crews = existsSync(crewsDir)
+      ? readdirSync(crewsDir, { withFileTypes: true })
+          .filter((entry) => entry.isFile() && entry.name.endsWith('.json'))
+          .map((entry) => entry.name.slice(0, -'.json'.length))
+          .sort()
+      : [];
+    for (const crew of crews) {
+      try {
+        const layers = machineRosterLayers(io.env, crew);
+        const merged = mergeRosterLayers(layers);
+        const found = layers
+          .map((layer) => `${layer.source}=${layer.roster === undefined ? 'absent' : 'found'}`)
+          .join(', ');
+        const harnesses = [...new Set(Object.values(merged).flatMap((entry) => entry.candidates.map((candidate) => candidate.harness)))];
+        const present = harnesses.filter((id) => adapterFor(id) !== undefined);
+        const missing = harnesses.filter((id) => adapterFor(id) === undefined);
+        record(
+          `crew roster (${crew})`,
+          true,
+          `layers: ${found}; harnesses present: ${present.join(', ') || 'none'}; missing: ${missing.join(', ') || 'none'}`,
+          false,
+        );
+      } catch (error) {
+        record(`crew roster (${crew})`, false, error instanceof Error ? error.message : String(error), false);
+      }
+    }
+  } catch (error) {
+    record('crew roster', false, error instanceof Error ? error.message : String(error), false);
+  }
+
+  // plugins (rendered; non-core while PLUGIN_CHECK_FATAL is false)
   for (const pluginState of probePlugin(io)) {
     const config = HARNESS_CONFIGS[pluginState.id];
     if (!pluginState.cliFound) {

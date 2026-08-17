@@ -126,14 +126,11 @@ function startShiftProcess(c: Shift, origin: string, account: string, crew: stri
       '--cap', '3', '--poll-interval', '25',
       '--cache-dir', c.cacheDir, '--state-dir', c.stateDir,
     ],
-    // The agent-run children this shift spawns must reach a HARNESS. Point the
-    // registry seam at the scripted fake and NAME it, exactly as the runner
-    // drills do — a drill that inherited whichever adapter happened to register
-    // first would be passing for a reason it never asserted. `hang: true` keeps
-    // each child alive and holding its slot for the duration of the assertions.
+    // The agent-run children load the scripted fake through the registry seam.
+    // Their fixture definitions name that adapter; `hang: true` keeps each child
+    // alive and holding its slot for the duration of the assertions.
     fixtureEnv(c.home, {
       OWENLOOP_HARNESS_MODULE: FAKE_HARNESS,
-      OWENLOOP_HARNESS: 'fake',
       OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'fake', hang: true }),
     }),
   );

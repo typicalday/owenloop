@@ -18,7 +18,7 @@ function childEnv(dir: string, trace: string): NodeJS.ProcessEnv {
   return {
     ...process.env,
     HOME: dir,
-    XDG_CONFIG_HOME: join(dir, 'config'),
+    OWENLOOP_CONFIG_DIR: undefined,
     NODE_OPTIONS: '',
     OWENLOOP_DB: join(dir, 'state.db'),
     OWENLOOP_DEFS: join(dir, 'defs'),

@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, statSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mainAsync } from '../src/cli.ts';
@@ -189,7 +189,8 @@ test('login: a global config write failure warns but does not fail a successful 
   });
   const t = makeIo({ fetch, stdin: 'olp_tok' });
   const redirectTarget = mkdtempSync(join(tmpdir(), 'owenloop-login-config-target-'));
-  symlinkSync(redirectTarget, join(t.home, '.owenloop'));
+  mkdirSync(join(t.home, '.owenloop'));
+  symlinkSync(redirectTarget, join(t.home, '.owenloop', 'config.json'));
 
   const code = await mainAsync(['login', '--hub', HUB, '--with-token'], t.io);
   assert.equal(code, 0, t.err.join('\n'));

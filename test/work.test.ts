@@ -2,7 +2,7 @@
  * `src/work-settings.ts` — the owenloop CLI's key-preserving writer for the EXECUTION
  * `owenloop` tool's `settings.json`. Proves: only `hubOrigin` changes (every
  * other key byte-identical), a corrupt file is a hard error that never clobbers,
- * a missing directory is created, `XDG_CONFIG_HOME` wins over `HOME`, and the
+ * a missing directory is created, HOME supplies the default, and the
  * written file never contains an `olp_` token (nothing secret is ever in scope).
  */
 
@@ -21,17 +21,16 @@ function freshHome(): string {
   return mkdtempSync(join(tmpdir(), 'owenloop-owenloop-home-'));
 }
 
-test('owenloopSettingsPath: XDG_CONFIG_HOME wins over HOME', () => {
+test('owenloopSettingsPath: HOME supplies the default and ignores XDG_CONFIG_HOME', () => {
   const home = freshHome();
   const xdg = freshHome();
-  assert.equal(owenloopSettingsPath({ HOME: home, XDG_CONFIG_HOME: xdg }), join(xdg, 'owenloop', 'settings.json'));
-  // Blank XDG falls back to HOME.
-  assert.equal(owenloopSettingsPath({ HOME: home, XDG_CONFIG_HOME: '   ' }), join(home, '.config', 'owenloop', 'settings.json'));
-  assert.equal(owenloopSettingsPath({ HOME: home }), join(home, '.config', 'owenloop', 'settings.json'));
+  assert.equal(owenloopSettingsPath({ HOME: home, XDG_CONFIG_HOME: xdg }), join(home, '.owenloop', 'settings.json'));
+  assert.equal(owenloopSettingsPath({ HOME: home, XDG_CONFIG_HOME: '   ' }), join(home, '.owenloop', 'settings.json'));
+  assert.equal(owenloopSettingsPath({ HOME: home }), join(home, '.owenloop', 'settings.json'));
 });
 
 test('owenloopSettingsPath: throws when no rung of the config ladder is usable', () => {
-  assert.throws(() => owenloopSettingsPath({}), /set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME/);
+  assert.throws(() => owenloopSettingsPath({}), /set OWENLOOP_CONFIG_DIR or HOME/);
 });
 
 test('owenloopSettingsPath: OWENLOOP_CONFIG_DIR wins over XDG_CONFIG_HOME and HOME', () => {

@@ -11,12 +11,12 @@ import type { HubClient } from '../src/hub/client.ts';
 import { HubError, type ReleaseRequest, type ReleaseResponse } from '../src/hub/types.ts';
 
 /**
- * Seed a hermetic owenloop v2 credential file at `<configHome>/owenloop/
+ * Seed a hermetic owenloop v2 credential file at `<home>/.owenloop/
  * credentials.json`, storing `token` in the `agent:<account>` slot for `origin`
  * — the real file backend `readStoredCredential` reads under OWENLOOP_NO_KEYCHAIN.
  */
-function seedAgentKeys(configHome: string, origin: string, slots: Record<string, string>): void {
-  const dir = join(configHome, 'owenloop');
+function seedAgentKeys(home: string, origin: string, slots: Record<string, string>): void {
+  const dir = join(home, '.owenloop');
   mkdirSync(dir, { recursive: true });
   const hubs: Record<string, Record<string, unknown>> = { [origin]: {} };
   for (const [account, token] of Object.entries(slots)) {
@@ -258,10 +258,9 @@ test('with no OWENLOOP_TOKEN, release authenticates with the agent slot token fr
   const { server, origin, auths } = await startRecordingHub();
   const home = mkdtempSync(join(tmpdir(), 'owenloop-release-store-'));
   seedAgentKeys(home, origin, { default: 'olp_from_store' });
-  // No override; hermetic file backend; XDG points the store at our seeded file.
+  // No override; hermetic file backend points the store at our seeded file.
   const env: Record<string, string | undefined> = {
     HOME: home,
-    XDG_CONFIG_HOME: home,
     OWENLOOP_NO_KEYCHAIN: '1',
     OWENLOOP_TOKEN: undefined,
   };
@@ -282,7 +281,6 @@ test('OWENLOOP_ACCOUNT selects a different agent slot (ci token, not default)', 
   seedAgentKeys(home, origin, { default: 'tok_default', ci: 'tok_ci' });
   const env: Record<string, string | undefined> = {
     HOME: home,
-    XDG_CONFIG_HOME: home,
     OWENLOOP_NO_KEYCHAIN: '1',
     OWENLOOP_TOKEN: undefined,
     OWENLOOP_ACCOUNT: 'ci',

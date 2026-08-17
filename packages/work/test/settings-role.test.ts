@@ -6,7 +6,7 @@ import { test } from 'node:test';
 
 import { run } from '../src/roles/settings.ts';
 
-// Every fixture materializes its OWN temp HOME/XDG — never the real one.
+// Every fixture materializes its own temporary HOME — never the real one.
 
 /** Run the settings role capturing stdout/stderr lines and the exit code. */
 async function runRole(
@@ -19,12 +19,12 @@ async function runRole(
   return { code, out: out.join('\n'), err: err.join('\n') };
 }
 
-/** Create a temp XDG root holding the given settings.json contents. */
-function xdgWith(contents: string): string {
-  const xdg = mkdtempSync(join(tmpdir(), 'owenloop-settings-role-'));
-  mkdirSync(join(xdg, 'owenloop'), { recursive: true });
-  writeFileSync(join(xdg, 'owenloop', 'settings.json'), contents);
-  return xdg;
+/** Create a temp HOME holding the given settings.json contents. */
+function homeWith(contents: string): string {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-settings-role-'));
+  mkdirSync(join(home, '.owenloop'), { recursive: true });
+  writeFileSync(join(home, '.owenloop', 'settings.json'), contents);
+  return home;
 }
 
 test('prints path, exists:no, and defaults when no file exists (exit 0)', async () => {
@@ -45,7 +45,7 @@ test('prints path, exists:no, and defaults when no file exists (exit 0)', async 
 });
 
 test('prints each known knob with its value + (settings) provenance', async () => {
-  const xdg = xdgWith(
+  const home = homeWith(
     JSON.stringify({
       hubOrigin: 'https://hub.example',
       dispatchCap: 5,
@@ -55,7 +55,7 @@ test('prints each known knob with its value + (settings) provenance', async () =
     }),
   );
   try {
-    const { code, out } = await runRole([], { XDG_CONFIG_HOME: xdg });
+    const { code, out } = await runRole([], { HOME: home });
     assert.equal(code, 0);
     assert.match(out, /exists: yes/);
     assert.match(out, /hubOrigin = https:\/\/hub\.example {2}\(settings\)/);
@@ -64,40 +64,40 @@ test('prints each known knob with its value + (settings) provenance', async () =
     assert.match(out, /defPolicy = enforce {2}\(settings\)/);
     assert.match(out, /maxConcurrentAgents = 2 {2}\(settings\)/);
   } finally {
-    rmSync(xdg, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('surfaces unrecognized keys without failing (exit 0)', async () => {
-  const xdg = xdgWith(JSON.stringify({ hubOrigin: 'https://h', typo: 1, huh: 'x' }));
+  const home = homeWith(JSON.stringify({ hubOrigin: 'https://h', typo: 1, huh: 'x' }));
   try {
-    const { code, out } = await runRole([], { XDG_CONFIG_HOME: xdg });
+    const { code, out } = await runRole([], { HOME: home });
     assert.equal(code, 0);
     assert.match(out, /unrecognized keys .*: (typo, huh|huh, typo)/);
   } finally {
-    rmSync(xdg, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('exits 1 on malformed JSON, naming the file on stderr', async () => {
-  const xdg = xdgWith('{ not json');
+  const home = homeWith('{ not json');
   try {
-    const { code, err } = await runRole([], { XDG_CONFIG_HOME: xdg });
+    const { code, err } = await runRole([], { HOME: home });
     assert.equal(code, 1);
     assert.match(err, /malformed settings file/);
   } finally {
-    rmSync(xdg, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
 test('exits 1 on an invalid known-key type', async () => {
-  const xdg = xdgWith(JSON.stringify({ dispatchCap: -3 }));
+  const home = homeWith(JSON.stringify({ dispatchCap: -3 }));
   try {
-    const { code, err } = await runRole([], { XDG_CONFIG_HOME: xdg });
+    const { code, err } = await runRole([], { HOME: home });
     assert.equal(code, 1);
     assert.match(err, /'dispatchCap' must be a positive integer/);
   } finally {
-    rmSync(xdg, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
   }
 });
 

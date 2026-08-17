@@ -83,9 +83,9 @@ function makeVerifier(args: {
   originPolicy?: 'enforce' | 'warn' | 'off';
   originRules?: Record<string, 'git' | 'console' | 'agent' | 'any'>;
 }) {
-  const env = { XDG_CONFIG_HOME: args.cwd };
+  const env = { HOME: args.cwd };
   if (args.allowedSigners !== undefined) {
-    const path = join(args.cwd, 'owenloop', 'allowed_signers');
+    const path = join(args.cwd, '.owenloop', 'allowed_signers');
     mkdirSync(join(path, '..'), { recursive: true });
     writeFileSync(path, args.allowedSigners);
   }
@@ -213,7 +213,7 @@ test('install policy: exact signed evidence is retained outside the object and r
   assert.deepEqual(warnings, []);
 
   const execution = createExecutionDefinitionVerifier({
-    env: { XDG_CONFIG_HOME: cwd },
+    env: { HOME: cwd },
     signerForPrincipal: ({ principal, allowedSignersText }) => {
       assert.equal(principal, 'publisher');
       assert.equal(allowedSignersText, ALLOWED);
@@ -229,7 +229,7 @@ test('install policy: exact signed evidence is retained outside the object and r
     principal: 'publisher',
   });
 
-  writeFileSync(join(cwd, 'owenloop', 'allowed_signers'), 'malformed trust root');
+  writeFileSync(join(cwd, '.owenloop', 'allowed_signers'), 'malformed trust root');
   const afterTrustRootChange = await execution({ bundleDigest: DIGEST, objectPath });
   assert.equal(afterTrustRootChange.kind, 'unverifiable');
   assert.deepEqual(readFileSync(evidencePath), sidecar);

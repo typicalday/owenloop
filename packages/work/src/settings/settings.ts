@@ -15,7 +15,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { owenloopConfigDir } from '../../../../src/config-dir.ts';
-import { type CapabilityModelRow, validateCapabilityModels } from '../agent/capability-model.ts';
+import { type Roster, validateRoster } from '../agent/capability-model.ts';
 
 /**
  * The settings surface — every knob optional, a missing file loading as `{}`.
@@ -137,17 +137,11 @@ export interface Settings {
    */
   allowedWorkdirRoots?: string[];
   /**
-   * How THIS machine serves each capability: a flat map from capability to
-   * `{model, effort}`, keyed by the composed capability (`wise:deep`) or by the
-   * bare name (`wise`). See `src/agent/capability-model.ts` for the lookup rule
-   * and for why this replaced `tierMap`/`tierProfiles` outright.
-   *
-   * Carry a bare row per capability the shift's crews serve. The bare row is
-   * what makes a hub name-match fallback order resolvable — the hub can stamp
-   * `wise:deep` on an order claimed by a crew bound only to `wise:standard`,
-   * and that shift has no `wise:deep` row by construction.
+   * Machine-global crew roster: each capability maps to an ordered list of
+   * `{harness, model, effort}` candidates. A crew-specific roster file can
+   * replace individual capability rows above this layer.
    */
-  capabilityModels?: Record<string, CapabilityModelRow>;
+  roster?: Roster;
 }
 
 /** The known settings keys, in the order `owenloop work settings` prints them. */
@@ -165,7 +159,7 @@ export const KNOWN_SETTINGS_KEYS = [
   'workRoot',
   'workRepo',
   'allowedWorkdirRoots',
-  'capabilityModels',
+  'roster',
 ] as const;
 
 /**
@@ -173,9 +167,9 @@ export const KNOWN_SETTINGS_KEYS = [
  * warning naming what replaced it, and is excluded from `unrecognized` so the
  * same key is not also reported as a likely typo.
  *
- * Distinct from `tierMap`/`tierProfiles`, which are a hard error: ignoring
- * those would leave the shift with no capability map and refuse every order,
- * whereas ignoring these changes nothing about how a shift runs.
+ * Distinct from unrecognized keys, which are surfaced as likely typos. These
+ * are recognized legacy settings whose removal leaves current shift behavior
+ * unchanged, so they remain a warning rather than a load failure.
  */
 export const RETIRED_IGNORED_KEYS = ['escalateAt', 'escalationExtensionKey'] as const;
 
@@ -214,15 +208,9 @@ export interface SettingsInspection extends ValidatedSettings {
  * Resolve the settings file path from the caller's env, through the one shared
  * ladder in `src/config-dir.ts`: `$OWENLOOP_CONFIG_DIR/settings.json` when
  * `OWENLOOP_CONFIG_DIR` is set and non-blank (it must be absolute), else
- * `$XDG_CONFIG_HOME/owenloop/settings.json`, else
- * `$HOME/.config/owenloop/settings.json`. Throws when no rung yields a value
- * rather than guessing a home directory.
- *
- * `OWENLOOP_CONFIG_DIR` is the variable an operator running SEVERAL shifts on
- * one machine should reach for. Setting `XDG_CONFIG_HOME` per shift also works,
- * but a shift spreads its whole environment into every worker and every command
- * step's child, so relocating `XDG_CONFIG_HOME` relocates the config of `gh`,
- * `git`, `gcloud`, and everything else those steps shell out to.
+ * `$HOME/.owenloop/settings.json`. Throws when no rung yields a value rather
+ * than guessing a home directory. `OWENLOOP_CONFIG_DIR` remains for tests and
+ * throwaway isolation, not normal operator configuration.
  */
 export function settingsPath(env: Record<string, string | undefined>): string {
   return join(owenloopConfigDir(env), 'settings.json');
@@ -273,21 +261,6 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
       throw bad('maxConcurrentAgents', 'a positive integer', v);
     }
   }
-  // RETIRED KEYS ARE A HARD ERROR, NOT AN IGNORED ONE. A file still naming
-  // `tierMap` or `tierProfiles` describes a routing scheme that no longer
-  // exists; passing it over as an unrecognized key would start the shift with
-  // NO capability map at all, and every agent order would then be refused at
-  // dispatch with a message about capabilities the operator never wrote.
-  for (const retired of ['tierMap', 'tierProfiles'] as const) {
-    if (retired in obj) {
-      throw new Error(
-        `invalid settings file at ${path}: '${retired}' was removed — tiers are replaced by ` +
-          `'capabilityModels', a flat map from capability to { model, effort } ` +
-          `(e.g. {"capabilityModels": {"wise:deep": {"model": "<model-id>", "effort": "xhigh"}}}). ` +
-          `Depth now rides on the capability's modifier suffix, not on a tier rung.`,
-      );
-    }
-  }
   if ('allowedWorkdirRoots' in obj) {
     // ABSOLUTE PATHS ONLY, and that is the one rule worth a hard error rather
     // than a warning. A relative entry would resolve against whatever directory
@@ -312,21 +285,24 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
     }
   }
   if ('capabilityModels' in obj) {
-    const v = obj['capabilityModels'];
+    throw new Error(
+      `invalid settings file at ${path}: 'capabilityModels' was replaced by 'roster'. ` +
+        `Use {"roster":{"wise":[{"harness":"<harness-id>","model":"<model-id>","effort":"high"}]}}.`,
+    );
+  }
+  if ('roster' in obj) {
+    const v = obj['roster'];
     if (typeof v !== 'object' || v === null || Array.isArray(v)) {
-      throw bad('capabilityModels', 'an object of { model, effort } per capability', v);
+      throw bad('roster', 'a JSON object mapping capabilities to candidate arrays', v);
     }
-    // Row shape and effort validity are checked at LOAD, not at resolution: a
-    // shift whose map is wrong should fail when it starts, not on the first
-    // order that happens to land on the broken row, hours later.
     try {
-      validateCapabilityModels(v as Record<string, unknown>);
+      validateRoster(v as Record<string, unknown>, 'roster');
     } catch (e) {
       throw new Error(`invalid settings file at ${path}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  // RETIRED, BUT ONLY A WARNING — a different case from `tierMap` above, and the
-  // difference is what happens if the key is silently ignored.
+  // RETIRED, BUT ONLY A WARNING. The difference is what happens if the key is
+  // silently ignored.
   //
   // These two configured the WORKER-LOCAL escalation that bumped an order's
   // model after N judgment rejections. Escalation is now entirely the engine's:

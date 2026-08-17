@@ -48,7 +48,7 @@
  * Secret hygiene is a hard rule here: credentials never land in the repo or a
  * plaintext `.env`. The 0600 file backend below (dir 0700) lives under the
  * user's config dir, never the project; all paths derive from the
- * caller-supplied `env` (HOME / XDG_CONFIG_HOME), never `process.env` directly,
+ * caller-supplied `env` (HOME), never `process.env` directly,
  * so tests fixture `$HOME` and never touch ambient machine state. Both this
  * file and `.owenloop/hub.json` are written via `writeFileAtomic` — temp file
  * in the same dir + rename, refusing a symlinked destination (SEC-3). The
@@ -249,7 +249,7 @@ export type CredentialSlotSelector =
   | { principal: 'agent'; account?: string };
 
 /**
- * The credential file (`~/.config/owenloop/credentials.json`), v2: origin →
+ * The credential file (`~/.owenloop/credentials.json`), v2: origin →
  * slot → credential. `version` is `2`; a file carrying any other version reads
  * as an EMPTY store (see `readCredentialFile`) — that is how entries under the
  * older one-slot-per-origin keying become invisible without any migration code.
@@ -345,7 +345,7 @@ export function parseCredential(raw: unknown): Credential | null {
 /**
  * The user-level config dir (never the project dir). Derives from the caller's
  * env via the one shared ladder in `config-dir.ts`:
- * `OWENLOOP_CONFIG_DIR` > `$XDG_CONFIG_HOME/owenloop` > `$HOME/.config/owenloop`.
+ * `OWENLOOP_CONFIG_DIR` > `$HOME/.owenloop`.
  */
 export function configDir(env: Record<string, string | undefined>): string {
   return owenloopConfigDir(env);
@@ -723,7 +723,7 @@ export function credentialBackend(
  * credential it wants.
  */
 export type ReadStoredCredentialOpts = CredentialSlotSelector & {
-  /** Environment to consult (OWENLOOP_NO_KEYCHAIN, HOME/XDG_CONFIG_HOME). Default: `process.env`. */
+  /** Environment to consult (OWENLOOP_NO_KEYCHAIN, HOME). Default: `process.env`. */
   env?: Record<string, string | undefined>;
   /** Injectable keychain backend (tests / embedding hosts). Ignored when OWENLOOP_NO_KEYCHAIN=1. */
   keychain?: Keychain;
@@ -760,7 +760,7 @@ export type ReadStoredCredentialOpts = CredentialSlotSelector & {
  * keychain → file. A keychain-backed read NEVER falls through to the file (that
  * fallback was the REL-6 shadowing bug), and a corrupt entry reads as absent
  * (`null`) on either store — never as a reason to consult the other. The file
- * backend derives its path from the supplied `env` (HOME / XDG_CONFIG_HOME),
+ * backend derives its path from the supplied `env` (HOME),
  * never `process.env` directly, so a caller passing `opts.env` stays hermetic;
  * only the top-level default falls back to `process.env`.
  *

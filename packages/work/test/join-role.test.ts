@@ -62,16 +62,16 @@ function fixture(): { home: string; env: Record<string, string | undefined> } {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-join-'));
   return {
     home,
-    env: { HOME: home, XDG_CONFIG_HOME: home, OWENLOOP_NO_KEYCHAIN: '1' },
+    env: { HOME: home, OWENLOOP_NO_KEYCHAIN: '1' },
   };
 }
 
 function credentialsPath(home: string): string {
-  return join(home, 'owenloop', 'credentials.json');
+  return join(home, '.owenloop', 'credentials.json');
 }
 
 function settingsFilePath(home: string): string {
-  return join(home, 'owenloop', 'settings.json');
+  return join(home, '.owenloop', 'settings.json');
 }
 
 interface CredentialFileShape {
@@ -94,7 +94,7 @@ function readSettingsFile(home: string): SettingsFileShape {
 
 function writeSettings(home: string, value: unknown): void {
   const path = settingsFilePath(home);
-  mkdirSync(join(home, 'owenloop'), { recursive: true });
+  mkdirSync(join(home, '.owenloop'), { recursive: true });
   writeFileSync(path, JSON.stringify(value));
 }
 
@@ -323,7 +323,7 @@ test('unchanged: pre-seeded settings matching the stub origin resolves without -
 
 test('recordHubOrigin: written / unchanged (normalized-equal) / conflict, preserving unknown keys', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-provision-'));
-  const env = { HOME: home, XDG_CONFIG_HOME: home };
+  const env = { HOME: home };
   try {
     const w = recordHubOrigin(env, 'https://h.example');
     assert.equal(w.outcome, 'written');
@@ -347,7 +347,7 @@ test('recordHubOrigin: written / unchanged (normalized-equal) / conflict, preser
 
 test('recordHubOrigin: a written merge preserves unknown keys already in the file', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-provision-'));
-  const env = { HOME: home, XDG_CONFIG_HOME: home };
+  const env = { HOME: home };
   try {
     writeSettings(home, { dispatchCap: 5 });
     const r = recordHubOrigin(env, 'https://h.example');

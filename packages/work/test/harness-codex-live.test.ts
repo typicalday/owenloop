@@ -131,7 +131,7 @@ function liveDeliverArgs(cwd: string, origin: string): DeliverArgs {
 /**
  * The mount child's environment. `HarnessMcpMount` is `{command, args}` — it has
  * no `env` field, and Phase 2B may not widen the contract — so the adapter
- * forwards `OWENLOOP_*` and the XDG vars from ITS OWN environment onto the
+ * forwards `OWENLOOP_*` and selected base environment vars from ITS OWN environment onto the
  * mount (see `mountEnv` in `src/harness/codex.ts`). This test therefore sets
  * them on `process.env` and restores them, exactly as the runner's process
  * would already carry them.
@@ -143,7 +143,8 @@ function withChildEnv(t: { after(fn: () => void): void }, configDir: string): vo
     Object.assign(process.env, saved);
   });
   process.env['OWENLOOP_TOKEN'] = TOKEN;
-  process.env['XDG_CONFIG_HOME'] = configDir;
+  process.env['HOME'] = configDir;
+  delete process.env['OWENLOOP_CONFIG_DIR'];
   process.env['OWENLOOP_SESSION'] = '';
 }
 
@@ -153,7 +154,7 @@ function of(reqs: HubReq[], verb: string): HubReq[] {
 
 test('live: a real turn drives the real owenloop mount, and deliver resumes the same thread', { skip }, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-codex-live-'));
-  // A temp XDG_CONFIG_HOME means the hold child sees NO settings file: origin
+  // A temp HOME means the hold child sees NO settings file: origin
   // comes only from `--origin`, token only from `OWENLOOP_TOKEN`.
   const configDir = mkdtempSync(join(tmpdir(), 'owenloop-codex-live-cfg-'));
   t.after(() => {

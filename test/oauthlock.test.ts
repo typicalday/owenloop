@@ -1,7 +1,7 @@
 /**
  * Concurrency-safe OAuth refresh + the credential WRITE surface
  * (`src/credentials.ts`). Proves the lockfile protocol
- * (`~/.config/owenloop/credentials.lock`, via `src/lock.ts`) turns "two
+ * (`~/.owenloop/credentials.lock`, via `src/lock.ts`) turns "two
  * refreshes race" into "the loser adopts the winner's rotated token" instead of
  * stranding a dead refresh token (the silent-logout bug the lock exists to
  * prevent), plus the store/delete write path and the barrel exports.

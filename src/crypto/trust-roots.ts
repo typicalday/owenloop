@@ -2,8 +2,8 @@
  * Resolution of the local SSHSIG trust root used for workflow publications.
  *
  * The path is derived only from injected environment state, through the shared
- * `owenloopConfigDir` ladder (`OWENLOOP_CONFIG_DIR` > `XDG_CONFIG_HOME` >
- * `HOME`); no ambient home directory lookup is allowed here. An absent file is
+ * `owenloopConfigDir` ladder (`OWENLOOP_CONFIG_DIR` > `HOME`); no ambient
+ * home directory lookup is allowed here. An absent file is
  * a normal result so the
  * publication verifier can classify it as `unverifiable` instead of confusing
  * a missing trust root with an unsigned bundle.

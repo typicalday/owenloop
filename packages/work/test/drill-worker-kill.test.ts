@@ -131,13 +131,6 @@ function spawnDaemon(origin: string): ShiftChild {
     fixtureEnv(home, {
       OWENLOOP_CACHE_DIR: cacheDir,
       OWENLOOP_HARNESS_MODULE: FAKE_HARNESS,
-      // PHASE 4 made the composition root import the real adapters, so the
-      // registry is no longer empty and the FIRST-REGISTERED default is no
-      // longer the module this seam loads. The drill therefore NAMES the
-      // harness it means, at the `OWENLOOP_HARNESS` rank — which is also the
-      // honest shape: a drill that silently inherited whatever happened to be
-      // imported first was passing for a reason it never asserted.
-      OWENLOOP_HARNESS: 'fake',
       OWENLOOP_FAKE_TRACE: tracePath,
       // hang: the turn never ends on its own — only the signal can end this run.
       OWENLOOP_FAKE_SCRIPT: JSON.stringify({ id: 'fake', hang: true }),

@@ -523,16 +523,16 @@ sidecar is checked against the bundle digest and the local `allowed_signers`
 trust root. Origin verification is separate: `verifyOrigin` returns `absent`
 when the origin sidecar is missing, `verified` only after DSSE signature, schema,
 signer-key, and bundle-digest checks pass, and `unverifiable` or `invalid` for
-the corresponding failures. The trust-root path is `<config>/allowed_signers`, where `<config>` is
-`$OWENLOOP_CONFIG_DIR` when set to a non-blank absolute path, else
-`$XDG_CONFIG_HOME/owenloop` when `XDG_CONFIG_HOME` is non-blank, else
-`$HOME/.config/owenloop`. A missing or malformed trust root produces the distinct
+the corresponding failures. The trust-root path is `<config>/allowed_signers`,
+where `<config>` is `$HOME/.owenloop` by default or the absolute
+`OWENLOOP_CONFIG_DIR` override. `XDG_CONFIG_HOME` is not consulted. A missing
+or malformed trust root produces the distinct
 `unverifiable` verdict; a present signature that fails verification produces
 `invalid`.
 
 The execution and install policy is `defPolicy`, with built-in default `warn`.
-Set `defPolicy` in the JSON settings file at `<config>/settings.json` (same
-ladder as the trust root above), for example:
+Set `defPolicy` in the JSON settings file at `$HOME/.owenloop/settings.json`,
+for example:
 
 ```json
 {
@@ -711,16 +711,16 @@ whole organization.
 
 ### Local anchor and envelope files
 
-The optional filesystem loader derives paths from injected environment state:
-`OWENLOOP_CONFIG_DIR` wins over `XDG_CONFIG_HOME`, which wins over `HOME`;
-there is no ambient home-directory lookup.
-The local layout is:
+The optional filesystem loader derives paths from the shared owenloop config
+directory (`$HOME/.owenloop` by default, or the absolute
+`OWENLOOP_CONFIG_DIR` override). `XDG_CONFIG_HOME` is not consulted. The local
+layout is:
 
 ```text
-<config>/owenloop/org-root.pub                     # public anchor, 0644
-<config>/owenloop/org-root                         # private anchor, 0600
-<config>/owenloop/roster/<sha256hex(keyid)>.grant.dsse
-<config>/owenloop/revocations/<sha256hex(keyid)>.revocation.dsse
+<config>/org-root.pub                     # public anchor, 0644
+<config>/org-root                         # private anchor, 0600
+<config>/roster/<sha256hex(keyid)>.grant.dsse
+<config>/revocations/<sha256hex(keyid)>.revocation.dsse
 ```
 
 The root key is stored outside `PrincipalKeyManager` because the root is not a

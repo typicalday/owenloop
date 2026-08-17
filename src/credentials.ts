@@ -10,7 +10,7 @@
  *
  * **Concurrency safety (the reason this module exists):** the refresh-and-persist
  * critical section is serialized by a lockfile next to the store
- * (`~/.config/owenloop/credentials.lock`, via `src/lock.ts`). Multiple long-lived
+ * (`~/.owenloop/credentials.lock`, via `src/lock.ts`). Multiple long-lived
  * processes sharing one slot (the `mcp` server case) would otherwise race a
  * refresh — both read the old refresh token, both rotate it server-side, and the
  * loser persists a now-dead token, causing a silent logout an hour later. The

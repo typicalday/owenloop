@@ -72,12 +72,12 @@ function makeKey(directory: string, name: string, principal: TrustKey['principal
 export function makeTrustFixture(prefix = 'owenloop-launch-gate-trust-'): TrustFixture {
   const directory = mkdtempSync(join(tmpdir(), prefix));
   const configHome = join(directory, 'config');
-  mkdirSync(join(configHome, 'owenloop'), { recursive: true, mode: 0o700 });
+  mkdirSync(join(configHome, '.owenloop'), { recursive: true, mode: 0o700 });
 
   const root = makeKey(directory, 'org-root', { kind: 'machine', id: 'org-root' });
   const producer = makeKey(directory, 'producer', { kind: 'machine', id: 'producer' });
   const alternate = makeKey(directory, 'alternate', { kind: 'agent', id: 'alternate' });
-  writeFileSync(join(configHome, 'owenloop', 'org-root.pub'), root.publicKey, { mode: 0o600 });
+  writeFileSync(join(configHome, '.owenloop', 'org-root.pub'), root.publicKey, { mode: 0o600 });
 
   return {
     root,
@@ -86,8 +86,7 @@ export function makeTrustFixture(prefix = 'owenloop-launch-gate-trust-'): TrustF
     directory,
     configHome,
     env: {
-      HOME: join(directory, 'home'),
-      XDG_CONFIG_HOME: configHome,
+      HOME: configHome,
       OWENLOOP_NO_KEYCHAIN: '1',
     },
   };
@@ -182,7 +181,7 @@ export function submissionProof(args: {
 }
 
 export function installProducerGrant(fixture: TrustFixture, scope: GrantScope = unrestrictedScope): void {
-  const roster = join(fixture.configHome, 'owenloop', 'roster');
+  const roster = join(fixture.configHome, '.owenloop', 'roster');
   mkdirSync(roster, { recursive: true, mode: 0o700 });
   writeFileSync(
     join(roster, 'producer.grant.dsse'),
@@ -192,7 +191,7 @@ export function installProducerGrant(fixture: TrustFixture, scope: GrantScope = 
 }
 
 export function installAlternateGrant(fixture: TrustFixture, scope: GrantScope = unrestrictedScope): void {
-  const roster = join(fixture.configHome, 'owenloop', 'roster');
+  const roster = join(fixture.configHome, '.owenloop', 'roster');
   mkdirSync(roster, { recursive: true, mode: 0o700 });
   writeFileSync(
     join(roster, 'alternate.grant.dsse'),
@@ -207,7 +206,7 @@ export function installRevocation(fixture: TrustFixture, args: {
   effectiveFrom: number;
   issuedAt?: number;
 }): void {
-  const directory = join(fixture.configHome, 'owenloop', 'revocations');
+  const directory = join(fixture.configHome, '.owenloop', 'revocations');
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const revokedBy = args.revokedBy ?? fixture.root;
   writeFileSync(

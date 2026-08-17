@@ -12,8 +12,7 @@
  * real installs (macOS defaults to the keychain backend).
  *
  * This is deliberately a SEPARATE file from `src/work-settings.ts`'s
- * `~/.config/owenloop/settings.json` (or `$XDG_CONFIG_HOME/owenloop/settings.json`
- * when set). That file belongs to the EXECUTION plane: `owenloop setup` is its
+ * `~/.owenloop/settings.json`. That file belongs to the EXECUTION plane: `owenloop setup` is its
  * sole writer, and `owenloop work` role resolution and pre-commit verification
  * are its readers. This file belongs to the CONTROL plane: `owenloop login`
  * writes it, `owenloop mcp` reads it. Nothing reconciles the two if they
@@ -22,11 +21,9 @@
  * the two files answer different questions ("what hub does an agent shift run
  * against" vs. "what hub does the human's MCP session talk to") for two
  * independently-evolving call paths, and forcing one file to answer both would
- * couple them for no benefit. This file is also HOME-rooted, not XDG-aware,
- * unlike `settings.json`: `owenloop mcp` is a human-facing control-plane
- * process, and there is no separate "XDG vs. HOME" precedence to resolve here
- * — the caller supplies `home` directly (see `globalConfigPath`), mirroring
- * how `src/cli.ts`'s `workflowHome` resolves the same value.
+ * couple them for no benefit. Both files are HOME-rooted siblings in the same
+ * directory; their control-plane versus execution-plane responsibilities, not
+ * their location, keep them separate.
  *
  * Never holds a secret: `hub` is an origin URL, nothing else. A read failure
  * of any kind (file absent, invalid JSON, wrong shape, blank `hub`, or a

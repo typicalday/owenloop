@@ -4,17 +4,11 @@
  * `allowed_signers`, `org-root.pub`, `roster/`, and `revocations/`.
  *
  * WHY THIS MODULE EXISTS. Until now four call sites each re-derived the same
- * ladder — `$XDG_CONFIG_HOME/owenloop` else `$HOME/.config/owenloop` — and
- * `XDG_CONFIG_HOME` was therefore the ONLY lever an operator had for pointing
- * one owenloop process at a different settings file than another. That lever is
- * not owenloop's to take. `XDG_CONFIG_HOME` is a machine-wide contract that
- * `gh`, `git`, `gcloud`, `npm`, and most of the rest of a developer's toolchain
- * also read, and `owenloop shift start` spreads its whole environment into
- * every worker it dispatches (`shift/spawn.ts`), which in turn passes it to
- * every command step's child process (`exec/` sets exactly three variables of
- * its own on top). So an operator running two shifts with different
- * `capabilityModels` had to set `XDG_CONFIG_HOME` per shift, and that silently
- * relocated the config of every other tool the workflow's scripts shell out to.
+ * ladder, which made it too easy for each subsystem to resolve a different
+ * directory. Owenloop now owns exactly one default: `$HOME/.owenloop`.
+ * Operators who need isolation can set the explicit, owenloop-specific
+ * `OWENLOOP_CONFIG_DIR`, without changing the configuration roots of unrelated
+ * tools that a workflow may invoke.
  *
  * MEASURED, not theorized. On run `wf_8b2abe6b` the delivery line's `merge-gate`
  * and `merger` steps both failed inside their `gh` probes, because `gh` looked
@@ -27,18 +21,19 @@
  *
  * THE FIX IS AN OWENLOOP-SPECIFIC VARIABLE. `OWENLOOP_CONFIG_DIR` names the
  * owenloop config directory ITSELF — no `owenloop` path segment is appended to
- * it — so an operator can scope owenloop's config per process while leaving
+ * it — so tests and throwaway experiments can scope owenloop's config while leaving
  * `XDG_CONFIG_HOME` alone for everything else:
  *
- *     OWENLOOP_CONFIG_DIR=~/.config/owenloop-shifts/utility/owenloop \
- *       owenloop shift start utility …
+ *     OWENLOOP_CONFIG_DIR=/tmp/owenloop-test owenloop work settings
  *
  * PRECEDENCE, highest first:
  *   1. `OWENLOOP_CONFIG_DIR`  → used verbatim
- *   2. `XDG_CONFIG_HOME`      → `<xdg>/owenloop`
- *   3. `HOME`                 → `<home>/.config/owenloop`
- * Blank or whitespace-only values are treated as unset at every rung, matching
- * the behaviour the four previous copies already had for `XDG_CONFIG_HOME`.
+ *   2. `HOME`                 → `<home>/.owenloop`
+ * Blank or whitespace-only values are treated as unset at every rung.
+ *
+ * `OWENLOOP_CONFIG_DIR` is no longer an operator-facing knob. It survives
+ * only for test and throwaway isolation; normal operation uses the HOME-rooted
+ * directory above.
  *
  * ABSOLUTE PATHS ONLY. A relative `OWENLOOP_CONFIG_DIR` would resolve against
  * whatever the current working directory happens to be, and a worker's cwd
@@ -77,11 +72,9 @@ export function owenloopConfigDir(env: Record<string, string | undefined>): stri
     }
     return explicit;
   }
-  const xdg = present(env.XDG_CONFIG_HOME);
-  if (xdg !== undefined) return join(xdg, 'owenloop');
   const home = present(env.HOME);
-  if (home !== undefined) return join(home, '.config', 'owenloop');
-  throw new Error('cannot locate a config directory: set OWENLOOP_CONFIG_DIR, XDG_CONFIG_HOME, or HOME');
+  if (home !== undefined) return join(home, '.owenloop');
+  throw new Error('cannot locate a config directory: set OWENLOOP_CONFIG_DIR or HOME');
 }
 
 /** A file inside owenloop's config directory. */

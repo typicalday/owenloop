@@ -201,9 +201,9 @@ export interface OrderPacket {
   /**
    * THE COMPOSED CAPABILITIES this order was offered under, in the step's
    * authored order — `['build:deep']` for a `build` step on a `deep` run. This
-   * is the key into the shift's `capabilityModels` map (see
-   * `src/agent/capability-model.ts`), and therefore what decides which model and
-   * effort run. Absent from a pre-modifier hub, which is why the worker treats
+   * is the key into the shift's merged crew roster (see
+   * `src/agent/capability-model.ts`), and therefore what decides which
+   * harness, model, and effort run. Absent from a pre-modifier hub, which is why the worker treats
    * an empty list as "nothing to resolve against" and refuses rather than
    * guessing.
    */

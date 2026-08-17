@@ -65,7 +65,7 @@ function originSidecar(kind: 'git' | 'console' | 'agent'): Uint8Array {
 }
 
 function setup(cwd: string, allowedSigners = ALLOWED): void {
-  const config = join(cwd, 'owenloop');
+  const config = join(cwd, '.owenloop');
   mkdirSync(config, { recursive: true });
   writeFileSync(join(config, 'allowed_signers'), allowedSigners);
 }
@@ -100,7 +100,7 @@ function verifier(cwd: string, options: {
   if (options.allowed !== '') setup(cwd, options.allowed ?? ALLOWED);
   return createPreCommitVerifier({
     cwd,
-    env: { XDG_CONFIG_HOME: cwd },
+    env: { HOME: cwd },
     policy: options.policy ?? 'off',
     ...(options.originPolicy === undefined ? {} : { originPolicy: options.originPolicy }),
     originRules: options.originRules ?? { prod: 'git' },
@@ -138,7 +138,7 @@ test('origin evidence is retained and re-verified at execution', async () => {
   const evidencePath = join(cwd, '.owenloop', 'origins', `${DIGEST}.dsse`);
   assert.deepEqual(readFileSync(evidencePath), sidecar);
   const execution = createExecutionOriginVerifier({
-    env: { XDG_CONFIG_HOME: cwd },
+    env: { HOME: cwd },
     signerForPrincipal: ({ principal, allowedSignersText }) => {
       assert.equal(principal, 'publisher');
       assert.equal(allowedSignersText, ALLOWED);

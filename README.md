@@ -487,12 +487,9 @@ hub's own def hashes. `owenloop agent new
 Setting up a machine from scratch? `owenloop setup` may sign you in as a human
 and, when needed, mint or rekey and store a Scoped Identity. Setup writes only
 `hubOrigin` into the execution settings file, preserving the other keys. The
-file is `$OWENLOOP_CONFIG_DIR/settings.json` when `OWENLOOP_CONFIG_DIR` is set
-to a non-blank absolute path; otherwise `$XDG_CONFIG_HOME/owenloop/settings.json`
-when `XDG_CONFIG_HOME` is non-blank; otherwise
-`$HOME/.config/owenloop/settings.json`. Prefer `OWENLOOP_CONFIG_DIR` when
-running several shifts on one machine — `XDG_CONFIG_HOME` also relocates `gh`,
-`git`, and `gcloud` for every command step the shift dispatches. For
+file is `$HOME/.owenloop/settings.json` by default (`OWENLOOP_CONFIG_DIR` can
+provide an absolute isolated directory; `XDG_CONFIG_HOME` is not consulted).
+For
 a non-default account,
 setup only prints the `OWENLOOP_ACCOUNT=<name>` instruction. Setup probes and,
 when needed, converges the bundled `owenloop` plugins for Claude Code and Codex.
