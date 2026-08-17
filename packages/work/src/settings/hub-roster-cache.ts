@@ -72,6 +72,15 @@ function parseEntry(value: unknown): HubRosterCacheEntry {
   if (typeof row['fetchedAt'] !== 'number' || !Number.isFinite(row['fetchedAt'])) {
     throw new Error('invalid cache fetchedAt');
   }
+  // `Date` accepts finite values outside its TimeClip range, but `toISOString`
+  // then throws. The timestamp is displayed while constructing hub layers, so
+  // make that display operation part of cache validation rather than letting a
+  // corrupt disk cache escape the deliberately non-throwing reader.
+  try {
+    new Date(row['fetchedAt']).toISOString();
+  } catch {
+    throw new Error('invalid cache fetchedAt');
+  }
   const global = asRecord(row['global']);
   if (global === undefined) throw new Error('invalid roster shape: global must be an object');
   const crews = row['crews'];
@@ -139,7 +148,12 @@ export function readHubRosterCache(env: Env, origin: string, account: string): H
   const dir = hubRosterCacheDir(env);
   if (!existsSync(dir)) return { kind: 'miss', path: dir, reason: `no cache file at ${dir}` };
   let firstReason: string | undefined;
-  const names = readdirSync(dir).filter((name) => name.endsWith('.json')).sort();
+  let names: string[];
+  try {
+    names = readdirSync(dir).filter((name) => name.endsWith('.json')).sort();
+  } catch (error) {
+    return { kind: 'miss', path: dir, reason: `unreadable cache directory: ${message(error)}` };
+  }
   if (names.length === 0) return { kind: 'miss', path: dir, reason: `no cache file at ${dir}` };
   for (const name of names) {
     const path = join(dir, name);

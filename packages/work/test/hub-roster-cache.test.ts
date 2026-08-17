@@ -105,6 +105,33 @@ test('absent, mismatched, and corrupt caches are harmless misses; cache writes p
   });
 });
 
+test('an out-of-range fetchedAt is a harmless cache miss instead of a later display-time throw', () => {
+  withHome((home, env) => {
+    const dir = hubRosterCacheDir(env);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      hubRosterCachePath(env, origin, 'out-of-range'),
+      JSON.stringify(entry({ orgId: 'out-of-range', fetchedAt: 1e300 })),
+    );
+
+    const read = readHubRosterCache(env, origin, 'default');
+    assert.equal(read.kind, 'miss');
+    assert.match(read.reason, /invalid cache fetchedAt/u);
+    assert.doesNotThrow(() => effectiveRosterLayers(env, 'delivery', { origin, account: 'default' }));
+  });
+});
+
+test('a cache path that is not a readable directory is a harmless miss', () => {
+  withHome((home, env) => {
+    mkdirSync(join(home, '.owenloop'), { recursive: true });
+    writeFileSync(hubRosterCacheDir(env), 'not a directory');
+    const read = readHubRosterCache(env, origin, 'default');
+    assert.equal(read.kind, 'miss');
+    assert.match(read.reason, /unreadable cache directory/u);
+    assert.doesNotThrow(() => effectiveRosterLayers(env, 'delivery', { origin, account: 'default' }));
+  });
+});
+
 test('cache filename sanitization keys an origin without trusting the filename', () => {
   assert.equal(sanitizeOriginForFilename('HTTPS://Hub.Example.com/x'), 'https---hub.example.com-x');
 });

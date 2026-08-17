@@ -1035,6 +1035,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       } catch (e) {
 	rateLimitedThisIteration = noteServerBackoff(e);
 	opts.err(`roster sync failed: ${errMsg(e)} (continuing)`);
+	emit({ type: 'hub-error', op: 'roster_sync', message: `roster sync failed: ${errMsg(e)} (continuing)` });
       }
     }
 
@@ -1043,6 +1044,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // reconciliation and queued dispatch continue below.
     if (
       !backoffActiveAtStart &&
+	!rateLimitedThisIteration &&
       monotonicNow() - lastPresence >= opts.presenceIntervalMs
     ) {
       // `setShift` and `noteAttended` force the next ping by setting

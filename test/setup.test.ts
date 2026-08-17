@@ -195,6 +195,17 @@ test('setup: existing crew roster is never overwritten', async () => {
   assert.equal(readFileSync(path, 'utf8'), custom);
 });
 
+test('setup confines traversal-shaped hub crew names to encoded roster filenames', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const crew = '../../package';
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crew], t.io), 0, t.err.join('\n'));
+  const confined = join(t.io.env.HOME!, '.owenloop', 'crews', `${encodeURIComponent(crew)}.json`);
+  assert.equal(existsSync(confined), true, 'the encoded file stays inside crews/');
+  assert.equal(existsSync(join(t.io.env.HOME!, 'package.json')), false, 'no traversal-shaped crew may escape config/crews');
+});
+
 test('setup: fresh machine interactive — injected prompt names the agent; empty answer accepts the hostname prefill', async () => {
   // (a) a typed name.
   {

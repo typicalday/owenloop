@@ -6,7 +6,7 @@
  * `agent/capability-model.ts`.
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import {
   type Roster,
@@ -76,6 +76,28 @@ function readCrewRoster(path: string): Roster {
   return roster as Roster;
 }
 
+/** The directory containing operator-owned strongest-layer crew files. */
+export function crewRosterDir(env: Record<string, string | undefined>): string {
+  return join(owenloopConfigDir(env), 'crews');
+}
+
+/**
+ * Resolve an untrusted crew name to one file beneath `crews/`.
+ *
+ * Hub crew names permit ordinary display characters such as `/` and `..`.
+ * They are data, never path segments: encode them first, then verify the
+ * resolved target is still within the directory before any read or write.
+ */
+export function crewRosterPath(env: Record<string, string | undefined>, crew: string): string {
+  const dir = resolve(crewRosterDir(env));
+  const path = resolve(dir, `${encodeURIComponent(crew)}.json`);
+  const fromDir = relative(dir, path);
+  if (fromDir === '' || fromDir === '..' || fromDir.startsWith(`..${sep}`) || isAbsolute(fromDir)) {
+    throw new Error(`unsafe crew roster path for ${JSON.stringify(crew)}`);
+  }
+  return path;
+}
+
 /**
  * The machine's layers for one crew, strongest first. When no crew is known,
  * only the machine-global `settings.json` roster participates.
@@ -84,17 +106,16 @@ export function machineRosterLayers(
   env: Record<string, string | undefined>,
   crew: string | undefined,
 ): RosterLayer[] {
-  const configDir = owenloopConfigDir(env);
   const layers: RosterLayer[] = [];
   if (crew !== undefined) {
-    const path = join(configDir, 'crews', `${crew}.json`);
+    const path = crewRosterPath(env, crew);
     layers.push({
       source: `machine crews/${crew}.json`,
       path,
       ...(existsSync(path) ? { roster: readCrewRoster(path) } : {}),
     });
   }
-  const path = join(configDir, 'settings.json');
+  const path = join(owenloopConfigDir(env), 'settings.json');
   const settings = loadSettings(env);
   layers.push({
     source: 'machine settings.json',

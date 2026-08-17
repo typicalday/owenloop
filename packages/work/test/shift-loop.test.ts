@@ -550,15 +550,33 @@ test('a roster cache refresh failure logs continuing and does not stop dispatch'
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
   const errors: string[] = [];
+  const events: Array<{ type: string; op?: string; message?: string }> = [];
   const code = await createShiftLoop(baseOpts(hub, spawner, {
     once: true,
     rosterSyncIntervalMs: 0,
     syncRosters: async () => { throw new Error('hub unavailable'); },
     err: (line) => errors.push(line),
+    onEvent: (event) => events.push(event),
   })).run();
   assert.equal(code, 0);
   assert.equal(count(calls, 'wake'), 1);
   assert.match(errors.join('\n'), /roster sync failed: hub unavailable \(continuing\)/u);
+  assert.deepEqual(events.filter((event) => event.type === 'hub-error'), [
+    { type: 'hub-error', op: 'roster_sync', message: 'roster sync failed: hub unavailable (continuing)', ts: new Date(0).toISOString(), shift: 'box', shiftId: '' },
+  ]);
+});
+
+test('a rate-limited roster refresh suppresses the due presence ping for that iteration', async () => {
+  const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+  const { spawner } = fakeSpawner();
+  const code = await createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    rosterSyncIntervalMs: 0,
+    syncRosters: async () => { throw new HubError(429, 'slow down', 'rate_limited', 60_000); },
+  })).run();
+  assert.equal(code, 0);
+  assert.equal(count(calls, 'presence'), 0, 'Retry-After suppresses all later hub calls in this iteration');
+  assert.equal(count(calls, 'wake'), 0, 'the existing backoff guard still suppresses the poll');
 });
 
 // ---- metering (command lane) ------------------------------------------------

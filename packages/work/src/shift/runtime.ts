@@ -438,13 +438,6 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       ? parsed.workRoots.map((entry) => resolve(process.cwd(), entry))
       : resolveAllowedWorkdirRoots(env, settings.allowedWorkdirRoots, process.cwd());
   const hub = createHubClient({ origin, getToken: async () => token });
-  // The agent-run child must stay completely offline. Refresh before entering
-  // the park loop, but let an unavailable hub degrade to machine layers.
-  try {
-    await syncHubRosterCache({ client: hub, env, origin, account });
-  } catch (error) {
-    process.stderr.write(`${roleLabel}: roster sync failed at shift start: ${errMsg(error)} (continuing)\n`);
-  }
   const monotonicNow = () => performance.now();
   const home = [env.HOME, env.USERPROFILE].find(
     (value) => value !== undefined && value.trim() !== '',
@@ -522,6 +515,18 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       process.stderr.write(`${roleLabel}: shift event sink failed: ${errMsg(err)} (continuing)\n`);
     }
   };
+
+  // The agent-run child must stay completely offline. Refresh before entering
+  // the park loop, but let an unavailable hub degrade to machine layers. Use
+  // the existing FILE_ONLY `hub-error` event so the outcome survives stderr
+  // and cannot wake a parked socket client.
+  try {
+    await syncHubRosterCache({ client: hub, env, origin, account });
+  } catch (error) {
+    const line = `roster sync failed at shift start: ${errMsg(error)} (continuing)`;
+    consumeEvent(stamp({ type: 'hub-error', op: 'roster_sync', message: line }));
+    process.stderr.write(`${roleLabel}: ${line}\n`);
+  }
 
   const reportWorkerFailure = (failure: WorkerFailure): void => {
     // A worker failure is detected by the SPAWNER's `exit`/`error` listener, not

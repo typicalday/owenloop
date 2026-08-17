@@ -204,7 +204,7 @@ import type {
   WhoamiIdentity,
 } from './hub.ts';
 import { loadSettings, settingsPath as executionSettingsPath } from '../packages/work/src/settings/settings.ts';
-import { effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
+import { crewRosterDir, crewRosterPath, effectiveRosterLayers, explainRosterShadows, mergeRosterLayers } from '../packages/work/src/settings/roster.ts';
 import { readHubRosterCache, syncHubRosterCache } from '../packages/work/src/settings/hub-roster-cache.ts';
 import type { HubClient } from '../packages/work/src/hub/client.ts';
 import type { GetRostersResponse, WhoamiResponse } from '../packages/work/src/hub/types.ts';
@@ -1691,6 +1691,63 @@ function parseRegistryModel(value: string): { model: string; efforts: string[] }
   return { model, efforts };
 }
 
+type RosterMutationSuccess =
+  | { crewId: string | null; crewName: string | null; capability: string; candidates: Array<{ harness: string; model: string; effort: string }>; warnings: string[] }
+  | { crewId: string | null; capability: string; removed: boolean }
+  | { harness: string; displayName: string; models: Array<{ model: string; efforts: string[]; updatedAt: number; updatedBy: string }> };
+
+function nullableId(value: unknown, prefix: string, field: string): string | null {
+  if (value === null) return null;
+  if (typeof value !== 'string' || value === '') throw new CliError(`${prefix} — ${field} must be a non-empty string or null`);
+  return value;
+}
+
+/** Narrow each mutation response before stdout claims the write succeeded. */
+function validateRosterMutationSuccess(endpoint: string, body: unknown): RosterMutationSuccess {
+  const prefix = `${endpoint}: malformed success response`;
+  const row = recordOf(body);
+  if (row === null) throw new CliError(`${prefix} — not an object`);
+  if (endpoint === 'put_roster') {
+    const crewId = nullableId(row.crewId, prefix, 'crewId');
+    const crewName = nullableId(row.crewName, prefix, 'crewName');
+    if (typeof row.capability !== 'string' || row.capability === '') throw new CliError(`${prefix} — missing non-empty string capability`);
+    if (!Array.isArray(row.candidates)) throw new CliError(`${prefix} — missing array candidates`);
+    const candidates = row.candidates.map((candidate, index) => {
+      const value = recordOf(candidate);
+      if (value === null) throw new CliError(`${prefix} — candidates[${index}] is not an object`);
+      for (const field of ['harness', 'model', 'effort'] as const) {
+	if (typeof value[field] !== 'string' || value[field] === '') throw new CliError(`${prefix} — candidates[${index}] missing non-empty string ${field}`);
+      }
+      return { harness: value.harness as string, model: value.model as string, effort: value.effort as string };
+    });
+    if (!Array.isArray(row.warnings) || row.warnings.some((warning) => typeof warning !== 'string')) {
+      throw new CliError(`${prefix} — missing array warnings`);
+    }
+    return { crewId, crewName, capability: row.capability, candidates, warnings: row.warnings as string[] };
+  }
+  if (endpoint === 'delete_roster_row') {
+    const crewId = nullableId(row.crewId, prefix, 'crewId');
+    if (typeof row.capability !== 'string' || row.capability === '') throw new CliError(`${prefix} — missing non-empty string capability`);
+    if (typeof row.removed !== 'boolean') throw new CliError(`${prefix} — missing boolean removed`);
+    return { crewId, capability: row.capability, removed: row.removed };
+  }
+  if (typeof row.harness !== 'string' || row.harness === '') throw new CliError(`${prefix} — missing non-empty string harness`);
+  if (typeof row.displayName !== 'string' || row.displayName === '') throw new CliError(`${prefix} — missing non-empty string displayName`);
+  if (!Array.isArray(row.models)) throw new CliError(`${prefix} — missing array models`);
+  const models = row.models.map((model, index) => {
+    const value = recordOf(model);
+    if (value === null) throw new CliError(`${prefix} — models[${index}] is not an object`);
+    if (typeof value.model !== 'string' || value.model === '') throw new CliError(`${prefix} — models[${index}] missing non-empty string model`);
+    if (!Array.isArray(value.efforts) || value.efforts.some((effort) => typeof effort !== 'string' || effort === '')) {
+      throw new CliError(`${prefix} — models[${index}] missing array efforts`);
+    }
+    if (typeof value.updatedAt !== 'number' || !Number.isFinite(value.updatedAt)) throw new CliError(`${prefix} — models[${index}] missing finite number updatedAt`);
+    if (typeof value.updatedBy !== 'string' || value.updatedBy === '') throw new CliError(`${prefix} — models[${index}] missing non-empty string updatedBy`);
+    return { model: value.model, efforts: value.efforts as string[], updatedAt: value.updatedAt, updatedBy: value.updatedBy };
+  });
+  return { harness: row.harness, displayName: row.displayName, models };
+}
+
 /** `roster` uses the same authenticated REST ladders as `routing`; show stays
  * fully offline so it reports exactly what an agent-run child would route. */
 async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
@@ -1778,7 +1835,11 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
   }
 
   const origin = resolveAgentHub(io, args, sub === 'sync' ? 'sync rosters from' : 'manage rosters on');
-  const slot: CredentialSlotSelector = sub === 'sync' ? resolveSlot(args) : { principal: 'human' };
+  // `roster sync` is an agent-owned cache refresh. Unlike the other roster
+  // verbs, its omitted `--as` deliberately means the default agent slot.
+  const slot: CredentialSlotSelector = sub === 'sync'
+    ? (!args.options.has('as') ? { principal: 'agent' } : resolveSlot(args))
+    : { principal: 'human' };
   if (sub === 'sync' && slot.principal !== 'agent') {
     throw new CliError(`roster sync requires an agent credential — pass --as agent or --as agent:<account> (${USAGE_FORMS})`);
   }
@@ -1849,7 +1910,8 @@ async function dispatchRoster(io: CliIO, args: Args): Promise<number> {
   } catch {
     throw new CliError(`${endpoint}: malformed success response — body is not valid JSON`);
   }
-  print(io, { ok: true, hub: origin, result: body });
+  const result = validateRosterMutationSuccess(endpoint, body);
+  print(io, { ok: true, hub: origin, result });
   return 0;
 }
 
@@ -7152,10 +7214,10 @@ async function dispatchSetup(io: CliIO, args: Args): Promise<number> {
     io.err(`! crew rosters: ${detail}`);
     steps.push({ step: 'crew rosters', action: 'noted', detail });
   } else {
-    const crewsDir = join(owenloopConfigDir(io.env), 'crews');
+    const crewsDir = crewRosterDir(io.env);
     mkdirSync(crewsDir, { recursive: true });
     for (const crew of agentCrews) {
-      const path = join(crewsDir, `${crew}.json`);
+      const path = crewRosterPath(io.env, crew);
       if (existsSync(path)) {
 	io.err(`✓ crew roster ${crew}: existing file left untouched`);
 	steps.push({ step: 'crew rosters', action: 'skipped', detail: `${crew}: ${path}` });

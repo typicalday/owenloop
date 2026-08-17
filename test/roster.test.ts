@@ -40,7 +40,7 @@ test('roster org and registry GET their live read endpoints with a human credent
   assert.equal(calls.filter((call) => call.pathname === '/api/harness_models')[0]!.method, 'GET');
 });
 
-test('roster sync uses the agent slot and writes a readable local cache', async () => {
+test('roster sync defaults to the default agent slot and writes a readable local cache', async () => {
   const routes: Record<string, RouteHandler> = {
     'GET /api/whoami': () => ({ status: 200, json: { orgId: 'org_1', orgName: 'Example', actor: {}, tokenStatus: 'active', authMethod: 'token' } }),
     'GET /api/rosters': () => ({ status: 200, json: { global: { build: [{ harness: 'codex', model: 'gpt-5', effort: 'high' }] }, crews: [] } }),
@@ -50,7 +50,7 @@ test('roster sync uses the agent slot and writes a readable local cache', async 
   try {
     const t = makeIo({ fetch, env: { HOME: home } });
     t.store.set(kcKey(ORIGIN, { principal: 'agent' }), JSON.stringify(agent));
-    const code = await mainAsync(['roster', 'sync', '--hub', ORIGIN, '--as', 'agent'], t.io);
+    const code = await mainAsync(['roster', 'sync', '--hub', ORIGIN], t.io);
     assert.equal(code, 0, t.err.join('\n'));
     assert.match(t.out.join('\n'), /cachePath/u);
     const auth = calls.filter((call) => call.pathname === '/api/rosters')[0]!.authorization;
@@ -60,10 +60,39 @@ test('roster sync uses the agent slot and writes a readable local cache', async 
   }
 });
 
-test('roster sync refuses a missing or human slot with exit 3 or usage failure', async () => {
+test('roster sync reports a missing default agent slot and still refuses an explicit human slot', async () => {
   const t = makeIo({ fetch: routedFetch({}).fetch });
-  assert.equal(await mainAsync(['roster', 'sync', '--hub', ORIGIN], t.io), 1);
-  assert.match(t.err.join('\n'), /requires an agent credential/u);
+  assert.equal(await mainAsync(['roster', 'sync', '--hub', ORIGIN], t.io), 3);
+  assert.match(t.err.join('\n'), /slot `agent:default`/u);
   const t2 = makeIo({ fetch: routedFetch({}).fetch });
-  assert.equal(await mainAsync(['roster', 'sync', '--hub', ORIGIN, '--as', 'agent'], t2.io), 3);
+  assert.equal(await mainAsync(['roster', 'sync', '--hub', ORIGIN, '--as', 'human'], t2.io), 1);
+  assert.match(t2.err.join('\n'), /requires an agent credential/u);
+});
+
+test('roster mutations reject malformed or wrong-verb 2xx responses', async () => {
+  const cases: Array<{ endpoint: string; args: string[]; body: unknown }> = [
+    {
+      endpoint: 'put_roster',
+      args: ['roster', 'org', 'put', 'build', '--candidate', 'codex:gpt-5:high', '--hub', ORIGIN],
+      body: { crewId: null, capability: 'build', removed: true },
+    },
+    {
+      endpoint: 'delete_roster_row',
+      args: ['roster', 'org', 'rm', 'build', '--hub', ORIGIN],
+      body: {},
+    },
+    {
+      endpoint: 'put_harness_models',
+      args: ['roster', 'registry', 'put', 'codex', '--model', 'gpt-5:high', '--hub', ORIGIN],
+      body: { crewId: null, crewName: null, capability: 'build', candidates: [], warnings: [] },
+    },
+  ];
+  for (const scenario of cases) {
+    const { fetch } = routedFetch({ [`POST /api/${scenario.endpoint}`]: () => ({ status: 200, json: scenario.body }) });
+    const t = makeIo({ fetch });
+    t.store.set(kcHuman(ORIGIN), JSON.stringify(human));
+    assert.equal(await mainAsync(scenario.args, t.io), 1, scenario.endpoint);
+    assert.equal(t.out.length, 0, `${scenario.endpoint} must not print ok:true for malformed success`);
+    assert.match(t.err.join('\n'), new RegExp(`${scenario.endpoint}: malformed success response`, 'u'));
+  }
 });
