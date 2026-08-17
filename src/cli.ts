@@ -107,7 +107,8 @@ import {
   orgRootPublicKeyPath,
   resolveOrgRoot,
   revocationsDir,
-  rosterDir,
+  assertNoStrandedLegacyGrants,
+  grantsDir,
 } from './crypto/org-root.ts';
 import { runMcpCommand } from './mcp/serve.ts';
 import type { LineStream } from './mcp/server.ts';
@@ -1244,6 +1245,11 @@ async function dispatchTrust(io: CliIO, args: Args): Promise<number> {
       throw new CliError(`owenloop trust grant: ${error instanceof Error ? error.message : String(error)}`);
     }
     const signer = signingKeyInfo(io, signingPath);
+    try {
+      assertNoStrandedLegacyGrants(io.env);
+    } catch (error) {
+      throw new CliError(`owenloop trust grant: ${error instanceof Error ? error.message : String(error)}`);
+    }
     const record: EnrollmentGrantRecord = {
       newKey: {
         keyid: newKey.keyid,
@@ -1259,7 +1265,7 @@ async function dispatchTrust(io: CliIO, args: Args): Promise<number> {
     const sshSigner = createSshSigner({ namespace: DSSE_SSH_NAMESPACE, signKeyPath: signer.path });
     try {
       const signed = await dsseSignEnrollmentGrant(Buffer.from(canonicalJsonBytes(record)), sshSigner);
-      const output = trustEnvelopeOutput(args, io.cwd, join(rosterDir(io.env), `${trustKeyHash(newKey.keyid)}.grant.dsse`));
+      const output = trustEnvelopeOutput(args, io.cwd, join(grantsDir(io.env), `${trustKeyHash(newKey.keyid)}.grant.dsse`));
       writeTrustEnvelope(output, signed.envelope);
       print(io, { ok: true, path: output, keyid: newKey.keyid, grantedBy: signer.keyid, principal, validFrom: record.validFrom });
     } finally {

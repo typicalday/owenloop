@@ -298,12 +298,72 @@ test('hard-rule consumers refuse absent evidence even when artifact policy is of
   if (!result.ok) assert.match(result.reason, /no-proof/);
 });
 
+test('stranded legacy grants refuse the consumed gate even with artifactPolicy off', async () => {
+  const env = trustRootEnv();
+  const legacy = join(env.HOME!, '.owenloop', 'roster');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, 'producer.grant.dsse'), grantBytes());
+  const verifier = createConsumedVerifier({
+    env,
+    artifactPolicy: 'off',
+    now: () => 100,
+    signerForPrincipal,
+  });
+  const result = await verifier(producerOrder(), { hardRule: false });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.match(result.reason, /\.owenloop[/\\]grants/);
+    assert.match(result.reason, /\.owenloop[/\\]roster/);
+  }
+});
+
+test('an invalid legacy grant source refuses the consumed gate even with artifactPolicy off', async () => {
+  const env = trustRootEnv();
+  const legacy = join(env.HOME!, '.owenloop', 'roster');
+  const invalidGrant = join(legacy, 'producer.grant.dsse');
+  mkdirSync(invalidGrant, { recursive: true });
+  const verifier = createConsumedVerifier({
+    env,
+    artifactPolicy: 'off',
+    now: () => 100,
+    signerForPrincipal,
+  });
+  const result = await verifier(producerOrder(), { hardRule: false });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.match(result.reason, /legacy grants source entry is not a regular file/);
+    assert.match(result.reason, /producer\.grant\.dsse/);
+    assert.doesNotMatch(result.reason, /Run:/);
+  }
+});
+
+test('structurally invalid grants refuse the consumed gate even with artifactPolicy off', async () => {
+  const env = trustRootEnv();
+  const grants = join(env.HOME!, '.owenloop', 'grants');
+  mkdirSync(grants, { recursive: true });
+  writeFileSync(join(grants, 'producer.grant.dsse'), grantBytes());
+  mkdirSync(join(grants, 'roster'));
+  mkdirSync(join(env.HOME!, '.owenloop', 'roster'));
+  const verifier = createConsumedVerifier({
+    env,
+    artifactPolicy: 'off',
+    now: () => 100,
+    signerForPrincipal,
+  });
+  const result = await verifier(producerOrder(), { hardRule: false });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.match(result.reason, /grants entry is not a regular file/);
+    assert.match(result.reason, /\.owenloop[/\\]grants[/\\]roster/);
+  }
+});
+
 test('one fixed consumer-clock sample governs every consumed path', async () => {
   const env = trustRootEnv();
   const order = producerOrder();
   const grants = [grantBytes()];
-  mkdirSync(join(env.HOME!, '.owenloop', 'roster'), { recursive: true });
-  writeFileSync(join(env.HOME!, '.owenloop', 'roster', 'producer.grant.dsse'), grants[0]!);
+  mkdirSync(join(env.HOME!, '.owenloop', 'grants'), { recursive: true });
+  writeFileSync(join(env.HOME!, '.owenloop', 'grants', 'producer.grant.dsse'), grants[0]!);
   mkdirSync(join(env.HOME!, '.owenloop', 'revocations'), { recursive: true });
   writeFileSync(join(env.HOME!, '.owenloop', 'revocations', 'producer.revocation.dsse'), revocationBytes(101));
 
@@ -324,8 +384,8 @@ test('one fixed consumer-clock sample governs every consumed path', async () => 
 
 test('chain validation is memoized per producer key and fixed clock within one gate call', async () => {
   const env = trustRootEnv();
-  mkdirSync(join(env.HOME!, '.owenloop', 'roster'), { recursive: true });
-  writeFileSync(join(env.HOME!, '.owenloop', 'roster', 'producer.grant.dsse'), grantBytes());
+  mkdirSync(join(env.HOME!, '.owenloop', 'grants'), { recursive: true });
+  writeFileSync(join(env.HOME!, '.owenloop', 'grants', 'producer.grant.dsse'), grantBytes());
   let verificationCalls = 0;
   const countingSigner = ({ allowedSignersText }: { allowedSignersText: string }) => {
     const publicKey = allowedSignersText.trim().split(/\s+/).slice(1).join(' ');

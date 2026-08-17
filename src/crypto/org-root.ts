@@ -1,11 +1,12 @@
 /**
  * Local filesystem paths and loaders for an organization's enrollment anchor.
  *
- * The module derives every path from an injected environment, with
- * XDG_CONFIG_HOME taking precedence over HOME. The loader only returns raw
- * envelope bytes; chain.ts remains a pure verifier and does not know this
- * layout. This module deliberately does not transport registrations, contact a
- * hub, or expose private key bytes.
+ * The module derives every path from an injected environment: an absolute
+ * OWENLOOP_CONFIG_DIR wins, otherwise paths live below $HOME/.owenloop;
+ * XDG_CONFIG_HOME is ignored. The loader only returns raw envelope bytes;
+ * chain.ts remains a pure verifier and does not know this layout. This module
+ * deliberately does not transport registrations, contact a hub, or expose
+ * private key bytes.
  */
 
 import { lstatSync, readdirSync, readFileSync } from 'node:fs';
@@ -27,26 +28,214 @@ export type OrgRootResolution = OrgRootPresent | OrgRootAbsent;
 
 function orgRootDir(env: Record<string, string | undefined>): string {
   // allowedSignersPath is the established injected-env resolver. Its dirname
-  // is exactly <config>/owenloop for both XDG_CONFIG_HOME and HOME fallback.
+  // is exactly <config>.
   return dirname(allowedSignersPath(env));
 }
 
-/** `<config>/owenloop/org-root.pub`, the public local trust anchor. */
+/** `<config>/org-root.pub`, the public local trust anchor. */
 export function orgRootPublicKeyPath(env: Record<string, string | undefined>): string {
   return join(orgRootDir(env), 'org-root.pub');
 }
 
-/** `<config>/owenloop/org-root`, the private anchor path. */
+/** `<config>/org-root`, the private anchor path. */
 export function orgRootPrivateKeyPath(env: Record<string, string | undefined>): string {
   return join(orgRootDir(env), 'org-root');
 }
 
-/** `<config>/owenloop/roster`, containing enrollment-grant envelopes. */
-export function rosterDir(env: Record<string, string | undefined>): string {
+/** `<config>/grants`, containing enrollment-grant envelopes. */
+export function grantsDir(env: Record<string, string | undefined>): string {
+  return join(orgRootDir(env), 'grants');
+}
+
+/** The pre-rename grants directory. Inspected only to refuse; never read. */
+function legacyGrantsDir(env: Record<string, string | undefined>): string {
   return join(orgRootDir(env), 'roster');
 }
 
-/** `<config>/owenloop/revocations`, containing revocation envelopes. */
+/** Count entries named `*.grant.dsse` without making the new path a loader. */
+function countGrantFiles(dir: string): number {
+  try {
+    return readdirSync(dir).filter((name) => name.endsWith('.grant.dsse')).length;
+  } catch {
+    return 0;
+  }
+}
+
+interface GrantsDirectoryProblem {
+  path: string;
+  reason: string;
+}
+
+interface LegacyGrantsInspection {
+  grantCount: number;
+  problem: GrantsDirectoryProblem | undefined;
+}
+
+function inspectionError(path: string, action: string, error: unknown): GrantsDirectoryProblem {
+  return {
+    path,
+    reason: `${action}: ${error instanceof Error ? error.message : String(error)}`,
+  };
+}
+
+/** Encode one arbitrary path as a POSIX shell argument. */
+function quotePosixShellArgument(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * Inspect the legacy source without reading envelopes. A migration command is
+ * safe only when its source has the regular-file structure the old loader
+ * accepted; otherwise an operator must repair it by hand.
+ */
+function inspectLegacyGrantsSource(path: string): LegacyGrantsInspection {
+  let stat;
+  try {
+    stat = lstatSync(path, { throwIfNoEntry: false });
+  } catch (error) {
+    return { grantCount: 0, problem: inspectionError(path, 'cannot inspect legacy grants source', error) };
+  }
+  if (stat === undefined) return { grantCount: 0, problem: undefined };
+  if (stat.isSymbolicLink()) {
+    return { grantCount: 0, problem: { path, reason: 'legacy grants source is a symlink' } };
+  }
+  if (!stat.isDirectory()) {
+    return { grantCount: 0, problem: { path, reason: 'legacy grants source is not a directory' } };
+  }
+
+  let entries: string[];
+  try {
+    entries = readdirSync(path);
+  } catch (error) {
+    return { grantCount: 0, problem: inspectionError(path, 'cannot inspect legacy grants source', error) };
+  }
+
+  let grantCount = 0;
+  for (const name of entries) {
+    const entryPath = join(path, name);
+    let entry;
+    try {
+      entry = lstatSync(entryPath);
+    } catch (error) {
+      return { grantCount: 0, problem: inspectionError(entryPath, 'cannot inspect legacy grants source entry', error) };
+    }
+    if (entry.isSymbolicLink()) {
+      return { grantCount: 0, problem: { path: entryPath, reason: 'legacy grants source entry is a symlink' } };
+    }
+    if (!entry.isFile()) {
+      return { grantCount: 0, problem: { path: entryPath, reason: 'legacy grants source entry is not a regular file' } };
+    }
+    if (name.endsWith('.grant.dsse')) grantCount += 1;
+  }
+  return { grantCount, problem: undefined };
+}
+
+/** Use lstat so a live or dangling symlink is never mistaken for absence. */
+function grantsPathIsAbsent(path: string): boolean {
+  let stat;
+  try {
+    stat = lstatSync(path, { throwIfNoEntry: false });
+  } catch {
+    // The existing-path command begins with rmdir, which safely refuses when
+    // this probe cannot establish absence.
+    return false;
+  }
+  return stat === undefined;
+}
+
+function sourceManualRepairMessage(
+  grantsPath: string,
+  legacyPath: string,
+  sourceProblem: GrantsDirectoryProblem,
+): string {
+  return `enrollment grants cannot be safely inspected in the pre-rename directory '${legacyPath}': ` +
+    `${sourceProblem.reason}: '${sourceProblem.path}'. '${grantsPath}' holds no *.grant.dsse files. ` +
+    'Repair that path by hand before migrating; owenloop will not move your cryptographic material for you.';
+}
+
+function migrationMessage(
+  grantsPath: string,
+  legacyPath: string,
+  legacyCount: number,
+  quotedGrantsPath: string,
+  quotedLegacyPath: string,
+  destinationIsAbsent: boolean,
+): string {
+  // Renaming the whole inspected source directory preserves every accepted
+  // filename by construction, including all dot-prefixed names. If a grants
+  // path already exists, rmdir permits the rename only into an empty real
+  // directory, preventing mv from nesting roster beneath grants.
+  const command = destinationIsAbsent
+    ? `mv ${quotedLegacyPath} ${quotedGrantsPath}`
+    : `rmdir ${quotedGrantsPath} && mv ${quotedLegacyPath} ${quotedGrantsPath}`;
+  return `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
+    `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
+    `cryptographic material for you. Run:  ${command}  ` +
+    'then restart every running owenloop shift daemon.' +
+    (destinationIsAbsent
+      ? ''
+      : ` If rmdir refuses, inspect '${grantsPath}' by hand before migrating; owenloop will not move your cryptographic material for you.`);
+}
+
+/** Thrown when legacy grants are stranded or cannot be safely inspected. */
+export class StrandedLegacyGrantsError extends Error {
+  override readonly name = 'StrandedLegacyGrantsError';
+  readonly grantsPath: string;
+  readonly legacyPath: string;
+  readonly legacyCount: number;
+  readonly sourcePath: string | undefined;
+  readonly sourceReason: string | undefined;
+
+  constructor(
+    grantsPath: string,
+    legacyPath: string,
+    legacyCount: number,
+    sourceProblem: GrantsDirectoryProblem | undefined = undefined,
+    destinationIsAbsent = false,
+  ) {
+    const quotedGrantsPath = quotePosixShellArgument(grantsPath);
+    const quotedLegacyPath = quotePosixShellArgument(legacyPath);
+    let message: string;
+    if (sourceProblem !== undefined) {
+      message = sourceManualRepairMessage(grantsPath, legacyPath, sourceProblem);
+    } else {
+      message = migrationMessage(grantsPath, legacyPath, legacyCount, quotedGrantsPath, quotedLegacyPath, destinationIsAbsent);
+    }
+    super(message);
+    this.grantsPath = grantsPath;
+    this.legacyPath = legacyPath;
+    this.legacyCount = legacyCount;
+    this.sourcePath = sourceProblem?.path;
+    this.sourceReason = sourceProblem?.reason;
+  }
+}
+
+/** Refuse when legacy grants are stranded or cannot be safely inspected. */
+export function assertNoStrandedLegacyGrants(env: Record<string, string | undefined>): void {
+  const grants = grantsDir(env);
+  if (countGrantFiles(grants) > 0) return;
+  const legacy = legacyGrantsDir(env);
+  const inspection = inspectLegacyGrantsSource(legacy);
+  if (inspection.problem !== undefined) {
+    throw new StrandedLegacyGrantsError(
+      grants,
+      legacy,
+      inspection.grantCount,
+      inspection.problem,
+    );
+  }
+  if (inspection.grantCount > 0) {
+    throw new StrandedLegacyGrantsError(
+      grants,
+      legacy,
+      inspection.grantCount,
+      undefined,
+      grantsPathIsAbsent(grants),
+    );
+  }
+}
+
+/** `<config>/revocations`, containing revocation envelopes. */
 export function revocationsDir(env: Record<string, string | undefined>): string {
   return join(orgRootDir(env), 'revocations');
 }
@@ -83,9 +272,10 @@ function loadEnvelopeDirectory(path: string, suffix: string, label: string): Uin
   return result;
 }
 
-/** Load sorted `.grant.dsse` bytes from the injected roster directory. */
-export function loadRoster(env: Record<string, string | undefined>): Uint8Array[] {
-  return loadEnvelopeDirectory(rosterDir(env), '.grant.dsse', 'roster');
+/** Load sorted `.grant.dsse` bytes from the injected grants directory. */
+export function loadGrants(env: Record<string, string | undefined>): Uint8Array[] {
+  assertNoStrandedLegacyGrants(env);
+  return loadEnvelopeDirectory(grantsDir(env), '.grant.dsse', 'grants');
 }
 
 /** Load sorted `.revocation.dsse` bytes from the injected revocation directory. */

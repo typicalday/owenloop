@@ -187,9 +187,6 @@ different model and effort instead. The operator must add an intentional
 `build:deep` row to the `anthropic` card as part of the same move.
 
 ### 3c. The crew roster — “what can this machine run?”
-
-“Roster” in this document means the **crew roster** used for capability
-routing, never the trust roster of signed grants in `~/.owenloop/roster/`.
 A machine's global fallback lives under the `roster` key in
 `~/.owenloop/settings.json`; a named crew's stronger layer is
 `~/.owenloop/crews/<crew>.json`. Both files use the same top-level shape:

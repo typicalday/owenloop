@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   cpSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -182,7 +183,7 @@ test('trust init, grant, and revoke mint offline DSSE records under the injected
   assert.equal(grant.code, 0, grant.err);
   const grantResult = grant.json();
   assert.match(grantResult.keyid, /^SHA256:[A-Za-z0-9+/]{43}$/);
-  assert.equal(grantResult.path.startsWith(join(config, 'roster')), true);
+  assert.equal(grantResult.path.startsWith(join(config, 'grants')), true);
   const grantEnvelope = JSON.parse(readFileSync(grantResult.path, 'utf8'));
   assert.equal(grantEnvelope.payloadType, 'application/vnd.owenloop.enrollment-grant.v1+json');
   const grantRecord = JSON.parse(Buffer.from(grantEnvelope.payload, 'base64').toString('utf8'));
@@ -215,8 +216,149 @@ test('trust init, grant, and revoke mint offline DSSE records under the injected
   const revokeRecord = JSON.parse(Buffer.from(revokeEnvelope.payload, 'base64').toString('utf8'));
   assert.equal(revokeRecord.reason, 'test rotation');
   assert.equal(revokeRecord.effectiveFrom, 0);
-  assert.equal(readdirSync(join(config, 'roster')).length, 1);
+  assert.equal(readdirSync(join(config, 'grants')).length, 1);
   assert.equal(readdirSync(join(config, 'revocations')).length, 1);
+});
+
+test('trust grant refuses when legacy grants have not been migrated', async () => {
+  const { run, config } = makeTrustCli();
+  const init = await run('trust', 'init');
+  assert.equal(init.code, 0, init.err);
+  const initRecord = init.json();
+  const legacy = join(config, 'roster');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, 'producer.grant.dsse'), 'legacy grant');
+
+  const grant = await run(
+    'trust',
+    'grant',
+    '--key',
+    initRecord.publicKey,
+    '--principal',
+    'machine:worker',
+    '--pools',
+    'marketing',
+    '--labels',
+    'billing',
+    '--namespaces',
+    'default',
+    '--delegate',
+    '0',
+  );
+  assert.equal(grant.code, 1);
+  assert.match(grant.err, /\.owenloop[/\\]grants/);
+  assert.match(grant.err, /\.owenloop[/\\]roster/);
+  assert.match(grant.err, /mv /);
+  assert.equal(existsSync(join(config, 'grants')), false);
+});
+
+test('trust grant does not create grants when the legacy source is invalid', async () => {
+  const { run, config } = makeTrustCli();
+  const init = await run('trust', 'init');
+  assert.equal(init.code, 0, init.err);
+  const initRecord = init.json();
+  const invalidGrant = join(config, 'roster', 'producer.grant.dsse');
+  mkdirSync(invalidGrant, { recursive: true });
+
+  const grant = await run(
+    'trust',
+    'grant',
+    '--key',
+    initRecord.publicKey,
+    '--principal',
+    'machine:worker',
+    '--pools',
+    'marketing',
+    '--labels',
+    'billing',
+    '--namespaces',
+    'default',
+    '--delegate',
+    '0',
+  );
+  assert.equal(grant.code, 1);
+  assert.match(grant.err, /legacy grants source entry is not a regular file/);
+  assert.match(grant.err, /producer\.grant\.dsse/);
+  assert.doesNotMatch(grant.err, /Run:/);
+  assert.equal(existsSync(join(config, 'grants')), false);
+});
+
+test('trust grant does not create grants when the legacy source cannot be read', async () => {
+  const { run, config } = makeTrustCli();
+  const init = await run('trust', 'init');
+  assert.equal(init.code, 0, init.err);
+  const initRecord = init.json();
+  const legacy = join(config, 'roster');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, 'producer.grant.dsse'), 'legacy grant');
+  chmodSync(legacy, 0o000);
+
+  let grant: Awaited<ReturnType<typeof run>>;
+  try {
+    grant = await run(
+      'trust',
+      'grant',
+      '--key',
+      initRecord.publicKey,
+      '--principal',
+      'machine:worker',
+      '--pools',
+      'marketing',
+      '--labels',
+      'billing',
+      '--namespaces',
+      'default',
+      '--delegate',
+      '0',
+    );
+  } finally {
+    chmodSync(legacy, 0o700);
+  }
+  assert.equal(grant!.code, 1);
+  assert.match(grant!.err, /cannot inspect legacy grants source/);
+  assert.doesNotMatch(grant!.err, /Run:/);
+  assert.equal(existsSync(join(config, 'grants')), false);
+  assert.deepEqual(readdirSync(legacy), ['producer.grant.dsse']);
+});
+
+test('trust grant does not create grants when a legacy source entry cannot be inspected', async () => {
+  const { run, config } = makeTrustCli();
+  const init = await run('trust', 'init');
+  assert.equal(init.code, 0, init.err);
+  const initRecord = init.json();
+  const legacy = join(config, 'roster');
+  const entry = join(legacy, 'producer.grant.dsse');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(entry, 'legacy grant');
+  // readdirSync still succeeds, but lstatSync of the returned entry fails.
+  chmodSync(legacy, 0o400);
+
+  let grant: Awaited<ReturnType<typeof run>>;
+  try {
+    grant = await run(
+      'trust',
+      'grant',
+      '--key',
+      initRecord.publicKey,
+      '--principal',
+      'machine:worker',
+      '--pools',
+      'marketing',
+      '--labels',
+      'billing',
+      '--namespaces',
+      'default',
+      '--delegate',
+      '0',
+    );
+  } finally {
+    chmodSync(legacy, 0o700);
+  }
+  assert.equal(grant!.code, 1);
+  assert.match(grant!.err, /cannot inspect legacy grants source entry/);
+  assert.doesNotMatch(grant!.err, /Run:/);
+  assert.equal(existsSync(join(config, 'grants')), false);
+  assert.deepEqual(readdirSync(legacy), ['producer.grant.dsse']);
 });
 
 // ---- unknown-option rejection (before any side effect) ----------------------

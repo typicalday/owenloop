@@ -17,7 +17,7 @@ import {
 } from '../../../src/store/pre-commit-verifier.ts';
 import {
   loadRevocations,
-  loadRoster,
+  loadGrants,
   resolveOrgRoot,
 } from '../../../src/crypto/org-root.ts';
 import {
@@ -161,21 +161,13 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
     let revocations: Uint8Array[];
     try {
       root = resolveOrgRoot(args.env);
-      grants = loadRoster(args.env);
+      grants = loadGrants(args.env);
       revocations = loadRevocations(args.env);
     } catch (error) {
-      const reason = `prerequisite: local producer trust material could not be loaded: ${errorText(error)}`;
-      const warnings: string[] = [];
-      for (const path of Object.keys(order.consumes)) {
-        const result = policyOutcome(order, opts.hardRule, policy, path, { kind: 'unverifiable', reason }, warnings);
-        if (result !== undefined) return result;
-      }
-      for (const owed of order.owes) {
-        if (owed.reasons.length === 0 && owed.proof === undefined) continue;
-        const result = policyOutcome(order, opts.hardRule, policy, owed.path, { kind: 'unverifiable', reason }, warnings);
-        if (result !== undefined) return result;
-      }
-      return { ok: true, order, warnings };
+      return {
+        ok: false,
+        reason: `consumed artifact gate refusal for ${order.workflow}/${order.run} step '${order.step}': local producer trust material could not be loaded: ${errorText(error)}`,
+      };
     }
 
     const prerequisite = root.kind === 'absent'

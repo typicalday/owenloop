@@ -719,15 +719,31 @@ layout is:
 ```text
 <config>/org-root.pub                     # public anchor, 0644
 <config>/org-root                         # private anchor, 0600
-<config>/roster/<sha256hex(keyid)>.grant.dsse
+<config>/grants/<sha256hex(keyid)>.grant.dsse
 <config>/revocations/<sha256hex(keyid)>.revocation.dsse
 ```
 
 The root key is stored outside `PrincipalKeyManager` because the root is not a
 hub-scoped principal key. The containing directory is `0700`; the private root
-is never returned by the library or placed in an envelope. `loadRoster` and
+is never returned by the library or placed in an envelope. `loadGrants` and
 `loadRevocations` return raw envelope bytes to the pure validator and refuse
 symlinked or non-regular files.
+
+If `<config>/grants` has zero `*.grant.dsse` entries while the pre-rename
+`<config>/roster` is a readable, non-symlink directory of regular files that
+holds grants, owenloop refuses rather than treating the machine as unenrolled.
+It never reads or moves that legacy directory. When `<config>/grants` is
+absent, the shell-quoted remediation is structurally
+`mv <config>/roster <config>/grants`; this whole-directory rename preserves
+every accepted grant filename, including dot-prefixed names. When a grants path
+already exists, the printed remediation is instead
+`rmdir <config>/grants && mv <config>/roster <config>/grants`. It moves only if
+that path is an empty real directory; otherwise `rmdir` fails without moving
+anything, and the operator must inspect `<config>/grants` by hand before
+retrying. In either case, restart running owenloop shift daemons after a
+successful migration. If the legacy source is a file or symlink, cannot be
+inspected, or contains a non-regular entry, owenloop prints no migration
+command: repair the named source path by hand before retrying the migration.
 
 ## Admin-signed policy floors
 

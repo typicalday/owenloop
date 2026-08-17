@@ -187,7 +187,7 @@ By default, the execution settings file is `$HOME/.owenloop/settings.json`.
 For test or throwaway isolation, `OWENLOOP_CONFIG_DIR` may name an absolute
 directory used verbatim; `XDG_CONFIG_HOME` is not consulted. In the paths below,
 `<config>` means the resolved owenloop config directory. The same directory
-holds `credentials.json`, `allowed_signers`, `org-root.pub`, `roster/`, and
+holds `credentials.json`, `allowed_signers`, `org-root.pub`, `grants/`, and
 `revocations/`.
 
 ### `shift start <crew...>`
@@ -260,9 +260,7 @@ directories an order is **allowed to name**. Neither derives from the other.
 owenloop shift start build --work-root ~/code --work-root /srv/work
 ```
 
-**Crew roster selection.** “Roster” in this section means the **crew
-roster** for capability routing, not the unrelated trust roster of signed
-enrollment grants in `~/.owenloop/roster/`. A selected roster candidate decides
+**Crew roster selection.** A selected roster candidate decides
 the harness, model, and effort for an agent order. Its precedence is:
 
 1. the first available candidate in the first matching crew roster;
@@ -275,7 +273,7 @@ strongest-first cascade is: machine `~/.owenloop/crews/<crew>.json`, machine
 `~/.owenloop/settings.json` `roster`, the cached hub row for that crew, then
 the cached hub org-global row. Hub rows live in a separate
 `~/.owenloop/hub-rosters/` cache directory — never in the D5 trust
-`~/.owenloop/roster/` directory. Each capability row is atomic:
+`~/.owenloop/grants/` directory. Each capability row is atomic:
 the stronger layer replaces the weaker candidate array, and candidates are
 tried in listed order. A step's `x.harness.id` is a policy constraint: a row
 whose candidates do not include it is released as
