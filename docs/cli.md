@@ -325,12 +325,13 @@ Crew names are data, not filesystem paths. A fresh safe crew keeps the literal
 `~/.owenloop/crews/<crew>.json` filename for rollback compatibility. Unsafe or
 too-wide names use the dedicated codec-only
 `~/.owenloop/crews/.owenloop-machine-roster-codec-namespace-reserved-v1-ownership/`
-directory: short names use a reversible `crew--<lowercase-hex>.json` basename,
+directory: short names use a reversible `crew-hex--<lowercase-hex>.json` basename,
 while names too wide for one filesystem component use a bounded
-`crew-hash--…` basename. The current codec uses lowercase hexadecimal (not
-base64url), so distinct crew names remain distinct on case-insensitive
-filesystems; explicitly owned older base64url files remain readable during
-migration. Every codec file records its exact `crew` identity in
+`crew-hex-hash--…` basename. The current codec's distinct `crew-hex--` prefix
+and lowercase hexadecimal payload keep it disjoint from older base64url files
+and stable on case-insensitive filesystems; explicitly owned older
+`crew--<base64url>.json` files remain readable during migration. Every codec
+file records its exact `crew` identity in
 the JSON document, so a reversible basename alone can never claim an old
 legacy file. Do not derive either filename by hand. The reserved directory
 itself can be the prefix of a valid 64-character nested legacy crew name, so a

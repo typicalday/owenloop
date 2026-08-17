@@ -91,8 +91,14 @@ export function crewRosterDir(env: Record<string, string | undefined>): string {
   return join(owenloopConfigDir(env), 'crews');
 }
 
-const CREW_ROSTER_FILENAME_PREFIX = 'crew--';
-const CREW_ROSTER_HASH_FILENAME_PREFIX = 'crew-hash--';
+// Generation prefixes are deliberately disjoint. A lowercase-hex payload can
+// itself be valid base64url (for example `$@` → `2440` and the old crew `ێ4`
+// → `2440`), so changing only the alphabet would make a valid old codec file
+// look like the new crew's target.
+const CREW_ROSTER_FILENAME_PREFIX = 'crew-hex--';
+const CREW_ROSTER_HASH_FILENAME_PREFIX = 'crew-hex-hash--';
+const LEGACY_CREW_ROSTER_FILENAME_PREFIX = 'crew--';
+const LEGACY_CREW_ROSTER_HASH_FILENAME_PREFIX = 'crew-hash--';
 // POSIX filesystems commonly cap a path component at 255 bytes. Leave margin
 // below that limit so the codec cannot turn a hub-valid crew into ENAMETOOLONG.
 const MAX_CREW_ROSTER_FILENAME_BYTES = 240;
@@ -124,9 +130,9 @@ export function encodeCrewRosterFilename(crew: string): string {
 
 /** The initial feature-branch codec used case-folding-unsafe base64url names. */
 function legacyEncodeCrewRosterFilename(crew: string): string {
-  const reversible = `${CREW_ROSTER_FILENAME_PREFIX}${Buffer.from(crew, 'utf8').toString('base64url')}.json`;
+  const reversible = `${LEGACY_CREW_ROSTER_FILENAME_PREFIX}${Buffer.from(crew, 'utf8').toString('base64url')}.json`;
   if (Buffer.byteLength(reversible, 'utf8') <= MAX_CREW_ROSTER_FILENAME_BYTES) return reversible;
-  return `${CREW_ROSTER_HASH_FILENAME_PREFIX}${createHash('sha256').update(crew, 'utf8').digest('base64url')}.json`;
+  return `${LEGACY_CREW_ROSTER_HASH_FILENAME_PREFIX}${createHash('sha256').update(crew, 'utf8').digest('base64url')}.json`;
 }
 
 /** Both generations are accepted only when the file's recorded owner agrees. */
@@ -136,16 +142,20 @@ function codecFilenameMatchesCrew(filename: string, crew: string): boolean {
 
 /** Decode only an exact reversible codec output; ordinary legacy basenames stay literal. */
 export function decodeCrewRosterFilename(filename: string): string | undefined {
-  if (!filename.startsWith(CREW_ROSTER_FILENAME_PREFIX) || !filename.endsWith('.json')) return undefined;
-  const encoded = filename.slice(CREW_ROSTER_FILENAME_PREFIX.length, -'.json'.length);
-  if (/^[0-9a-f]+$/u.test(encoded) && encoded.length % 2 === 0) {
+  if (!filename.endsWith('.json')) return undefined;
+  if (filename.startsWith(CREW_ROSTER_FILENAME_PREFIX)) {
+    const encoded = filename.slice(CREW_ROSTER_FILENAME_PREFIX.length, -'.json'.length);
+    if (!/^[0-9a-f]+$/u.test(encoded) || encoded.length % 2 !== 0) return undefined;
     try {
       const crew = Buffer.from(encoded, 'hex').toString('utf8');
       if (encodeCrewRosterFilename(crew) === filename) return crew;
     } catch {
-      // Fall through to the legacy decoder below.
+      return undefined;
     }
+    return undefined;
   }
+  if (!filename.startsWith(LEGACY_CREW_ROSTER_FILENAME_PREFIX)) return undefined;
+  const encoded = filename.slice(LEGACY_CREW_ROSTER_FILENAME_PREFIX.length, -'.json'.length);
   try {
     const crew = Buffer.from(encoded, 'base64url').toString('utf8');
     return legacyEncodeCrewRosterFilename(crew) === filename ? crew : undefined;

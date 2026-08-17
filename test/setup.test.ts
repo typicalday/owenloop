@@ -314,7 +314,7 @@ test('setup records a bounded hash roster identity so its immediate doctor pass 
   assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crew], t.io), 0, t.err.join('\n'));
 
   const path = crewRosterPath(t.io.env, crew);
-  assert.match(path, /crew-hash--/u);
+  assert.match(path, /crew-hex-hash--/u);
   assert.equal(JSON.parse(readFileSync(path, 'utf8')).crew, crew, 'the bounded filename has a machine-readable crew identity');
   const summary = JSON.parse(t.out.join('\n')) as { doctor: { checks: Array<{ label: string }> } };
   assert.ok(summary.doctor.checks.some((check) => check.label === `crew roster (${crew})`), 'setup\'s final doctor pass sees the newly-created hashed roster');

@@ -227,7 +227,7 @@ test('doctor seeds verified agent crews so a malformed bounded-hash roster is re
   writeSettings(t.io.env, ORIGIN);
 
   const path = crewRosterPath(t.io.env, crew);
-  assert.match(path, /crew-hash--/u);
+  assert.match(path, /crew-hex-hash--/u);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, '{"crew":');
 

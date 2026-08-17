@@ -200,6 +200,37 @@ test('case-folding filesystem seam isolates legacy base64url codec collisions', 
   }
 });
 
+test('disjoint codec generations never probe a legacy base64url file as a hexadecimal crew', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-codec-generation-'));
+  try {
+    const env = { HOME: home };
+    const legacyCrew = 'ێ4';
+    const currentCrew = '$@';
+    const legacyFilename = `crew--${Buffer.from(legacyCrew, 'utf8').toString('base64url')}.json`;
+    assert.equal(legacyFilename, 'crew--2440.json', 'the deployed legacy codec uses the base64url payload from the migration report');
+    assert.equal(encodeCrewRosterFilename(currentCrew), 'crew-hex--2440.json', 'the current hexadecimal payload is structurally namespaced');
+
+    const legacyPath = join(encodedCrewRosterDir(env), legacyFilename);
+    mkdirSync(dirname(legacyPath), { recursive: true });
+    writeFileSync(legacyPath, JSON.stringify({ crew: legacyCrew, roster: { build: candidate('legacy', 'legacy-model') } }));
+
+    assert.equal(crewRosterPath(env, legacyCrew), legacyPath, 'the owned old codec file remains readable');
+    const currentPath = crewRosterPath(env, currentCrew);
+    assert.equal(currentPath, join(home, '.owenloop', 'crews', `${currentCrew}.json`), 'the safe current crew reaches its literal fallback without probing the old owner');
+    writeFileSync(currentPath, JSON.stringify({ roster: { build: candidate('current', 'current-model') } }));
+
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, legacyCrew)).build?.candidates[0]?.model, 'legacy-model');
+    assert.equal(mergeRosterLayers(machineRosterLayers(env, currentCrew)).build?.candidates[0]?.model, 'current-model');
+    assert.deepEqual(
+      discoverCrewRosterFiles(env).map((file) => file.crew).sort(),
+      [legacyCrew, currentCrew].sort(),
+      'doctor discovers both independent strongest-layer owners',
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test('a contained nested-slash legacy roster remains the strongest layer after upgrade', () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-nested-'));
   try {
@@ -462,13 +493,13 @@ test('machineRosterLayers fails closed for a malformed bounded-hash crew roster'
     // reversible codec, so its filename is a non-reversible bounded hash.
     const crew = `../${'語'.repeat(61)}`;
     const path = crewRosterPath({ HOME: home }, crew);
-    assert.match(basename(path), /^crew-hash--.*\.json$/u);
+    assert.match(basename(path), /^crew-hex-hash--.*\.json$/u);
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, '{"crew":');
 
     assert.throws(
       () => machineRosterLayers({ HOME: home }, crew),
-      /invalid crew roster at .*crew-hash--.*\.json/u,
+      /invalid crew roster at .*crew-hex-hash--.*\.json/u,
     );
   } finally {
     rmSync(home, { recursive: true, force: true });
