@@ -353,6 +353,39 @@ test('a claimed order is never recomposed — the stamped offer is the record', 
   assert.ok(t2.deferred.some((d) => d.reason === 'in-flight'));
 });
 
+test('crew stamps are copied onto the offered order and absent without caller input', () => {
+  const { engine } = makeEngine([gradedDef()]);
+  const wf = engine.createInstance('graded', { modifier: 'deep' });
+
+  const stamped = engine.tick(wf, {
+    now: 0,
+    capabilities: ['build:deep'],
+    crewStamps: { 'build:deep': ['openai'] },
+  }).orders[0]!;
+  assert.deepEqual(stamped.crews, ['openai']);
+
+  const { engine: unstampedEngine } = makeEngine([gradedDef()]);
+  const unstampedWf = unstampedEngine.createInstance('graded', { modifier: 'deep' });
+  const unstamped = unstampedEngine.tick(unstampedWf, { now: 0, capabilities: ['build:deep'] }).orders[0]!;
+  assert.equal(unstamped.crews, undefined);
+});
+
+test('crew stamps union each offered capability in offer order without duplicates', () => {
+  const { engine } = makeEngine([gradedDef()]);
+  const wf = engine.createInstance('graded', { modifier: 'deep' });
+  const order = engine.tick(wf, {
+    now: 0,
+    capabilities: ['build:deep'],
+    crewStamps: {
+      'build:deep': ['openai', 'shared'],
+      'wise:deep': ['shared', 'anthropic'],
+    },
+  }).orders[0]!;
+
+  assert.deepEqual(order.capabilities, ['build:deep', 'wise:deep']);
+  assert.deepEqual(order.crews, ['openai', 'shared', 'anthropic']);
+});
+
 // ---- capability rewrites: the caller reroutes, the engine substitutes -------
 
 test('applyCapabilityRewrites: no matching rule leaves the offer untouched', () => {
@@ -449,6 +482,25 @@ test('a rewritten offer is matched and stamped as the reroute target', () => {
   const order = t.orders[0]!;
   assert.deepEqual(order.capabilities, ['build:standard', 'wise:standard'], 'served capability');
   assert.deepEqual(order.reroutedFrom, ['build:express', 'wise:express'], 'requested capability');
+  assert.deepEqual(order.crews, undefined, 'no stamps supplied');
+});
+
+test('crew stamps key on the post-rewrite served capability', () => {
+  const { engine } = makeEngine([gradedDef()]);
+  const wf = engine.createInstance('graded', { modifier: 'express' });
+
+  const order = engine.tick(wf, {
+    now: 0,
+    capabilities: ['build:standard'],
+    capabilityRewrites: { 'build:express': 'build:standard', 'wise:express': 'wise:standard' },
+    crewStamps: {
+      'build:express': ['wrong'],
+      'build:standard': ['openai'],
+    },
+  }).orders[0]!;
+
+  assert.deepEqual(order.capabilities, ['build:standard', 'wise:standard']);
+  assert.deepEqual(order.crews, ['openai']);
 });
 
 test('a reroute never rewrites the run modifier', () => {

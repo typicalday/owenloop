@@ -565,7 +565,6 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       ? { dir: logDir, err: (line: string) => process.stderr.write(`${line}\n`) }
       : undefined,
     allowedWorkdirRoots,
-    parsed.serveCrews,
   );
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 

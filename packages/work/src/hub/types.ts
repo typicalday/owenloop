@@ -31,6 +31,12 @@ export interface WorkOrder {
   key?: string;
   index?: number;
   defDigest?: string;
+  /**
+   * THE CREWS THE HUB MATCHED for this order's capabilities, in match order.
+   * Hub → worker; this is not `serve_crews`, which travels worker → hub to
+   * narrow the orders a shift wants.
+   */
+  crews?: string[];
   /** Authoritative worker lane on modern whats_next responses. */
   worker?: string;
   consumedFingerprint?: Record<string, number>;
@@ -208,6 +214,24 @@ export interface OrderPacket {
    * guessing.
    */
   capabilities?: string[];
+  /**
+   * THE CREWS THE HUB MATCHED for this order's capabilities, in match order.
+   *
+   * Hub → worker. This is the hub's answer to "whose roster decides the model
+   * for this order", computed at offer time from `capability_routes`. The
+   * worker resolves each named crew's merged roster IN THIS ORDER and takes the
+   * first crew that carries a row for one of `capabilities`.
+   *
+   * NOT `serve_crews`. `serve_crews` travels the other way — worker → hub,
+   * on `whats_next`/`presence_ping` — and narrows WHICH ORDERS THIS SHIFT
+   * WANTS. This field narrows WHICH ROSTER DECIDES an order the shift already
+   * has.
+   *
+   * Optional on the wire because a hub that predates the stamp sends nothing.
+   * It is NOT optional in effect: a worker built from this commit REFUSES every
+   * capability-bearing order that arrives without it. There is no fallback.
+   */
+  crews?: string[];
   /** The run's routing modifier (`deep`), as the caller asked for at start_run. */
   modifier?: string;
   /**

@@ -217,6 +217,7 @@ async function runLoop(o: RunOpts = {}): Promise<Ran> {
       permissions: o.permissions ?? { extensions: {} },
     }),
     resolveAdapter: () => resolution,
+    resolveCrewRosters: () => ({ ok: true, rosters: [] }),
     harnessAvailable: (id) => id === 'fake',
     // This fixture exercises resume rendering, not the consume-side trust
     // boundary. Admit the synthetic rejection thread so the loop can reach

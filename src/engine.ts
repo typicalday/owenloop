@@ -38,7 +38,7 @@ import { summarizeIssues, validateValue } from './schema.ts';
 import type { SchemaIssue } from './schema.ts';
 import { hashDef } from './defs.ts';
 import { applyCapabilityRewrites, claimMatches, composeCapabilities } from './capabilities.ts';
-import type { CapabilityRewrites } from './capabilities.ts';
+import type { CapabilityRewrites, CrewStamps } from './capabilities.ts';
 import type { MatchMode } from './capabilities.ts';
 import { localMidnightMs, nowMs, randId } from './util.ts';
 import type { Store, WorkflowRow } from './store.ts';
@@ -1394,6 +1394,12 @@ export class Engine {
        * record still shows the grade of service that was requested.
        */
       capabilityRewrites?: CapabilityRewrites;
+      /**
+       * Per-offered-capability crews matched by the caller that owns routing
+       * bindings. The pure engine cannot compute this; it stamps the supplied
+       * match result onto the order that is actually served.
+       */
+      crewStamps?: CrewStamps;
     } = {},
   ): TickResult {
     // `capabilities` is passed through AS GIVEN — an omitted filter (undefined)
@@ -1408,6 +1414,7 @@ export class Engine {
       undefined,
       opts.matchModes ?? {},
       opts.capabilityRewrites ?? {},
+      opts.crewStamps ?? {},
     );
   }
 
@@ -1460,6 +1467,7 @@ export class Engine {
     parentEdge?: { parentWf: string; step: StepDef; callsStem: string },
     matchModes: Record<string, MatchMode> = {},
     capabilityRewrites: CapabilityRewrites = {},
+    crewStamps: CrewStamps = {},
   ): TickResult {
     if (depth > this.maxCallDepth) {
       throw new Error(
@@ -1518,7 +1526,7 @@ export class Engine {
       const orders: Order[] = [];
       const allDeferred: DeferredFiring[] = [...deferred];
       for (const f of selected) {
-        const claimed = this.claim(workflow, def, f, arts, now, modifier, capabilityRewrites);
+				const claimed = this.claim(workflow, def, f, arts, now, modifier, capabilityRewrites, crewStamps);
         if (claimed === 'in-flight') {
           const d: DeferredFiring = { step: f.step, key: f.key, inputs: f.inputs, outputs: f.outputs, reason: 'in-flight' };
           if (f.index !== undefined) d.index = f.index;
@@ -1551,7 +1559,7 @@ export class Engine {
           parentWf: workflow,
           step,
           callsStem: step.produces[0]!.stem,
-        }, matchModes, capabilityRewrites);
+		}, matchModes, capabilityRewrites, crewStamps);
         // orders: flatten; each Order already carries its own `workflow`.
         result.orders.push(...cr.orders);
         // deferred: stamp child-originated entries with the child id, preserving
@@ -1774,6 +1782,7 @@ export class Engine {
     now: number,
     modifier?: string,
     capabilityRewrites: CapabilityRewrites = {},
+    crewStamps: CrewStamps = {},
   ): Order | 'in-flight' | DeferredClaim | null {
     const existing = this.store.getTask(workflow, f.step, f.key);
     if (existing && existing.status === 'claimed') {
@@ -1803,7 +1812,7 @@ export class Engine {
     // `applySchedule` so the offer and the filter read the same function on the
     // same in-tx `arts` snapshot; nothing between them can move.
     const routing = this.routingFor(this.step(def, f.step), f, arts, modifier);
-    const order = this.buildOrder(def, workflow, runId, f, arts, fp, routing, capabilityRewrites);
+    const order = this.buildOrder(def, workflow, runId, f, arts, fp, routing, capabilityRewrites, crewStamps);
     if (typeof order === 'object' && 'deferred' in order) return order;
     // One history record per rejection episode. Written HERE, not in
     // `buildOrder` (which is store-pure) and not on the deferred path (an offer
@@ -1845,6 +1854,7 @@ export class Engine {
     consumedFingerprint: Fingerprint,
     routing: { modifier?: string; escalation?: EscalationRecord } = {},
     capabilityRewrites: CapabilityRewrites = {},
+    crewStamps: CrewStamps = {},
   ): Order | DeferredClaim {
     const step = this.step(def, f.step);
     const consumes: Record<string, unknown> = {};
@@ -1981,6 +1991,14 @@ export class Engine {
       capabilityRewrites,
     );
     if (offered.length > 0) order.capabilities = offered;
+    const crews: string[] = [];
+    for (const capability of offered) {
+      if (!Object.prototype.hasOwnProperty.call(crewStamps, capability)) continue;
+      for (const crew of crewStamps[capability] ?? []) {
+				if (!crews.includes(crew)) crews.push(crew);
+      }
+    }
+    if (crews.length > 0) order.crews = crews;
     // Only when a rewrite actually fired. `reroutedFrom` is absent on every
     // ordinary offer, so its presence alone tells a reader the order is not
     // running on the capability its def asked for.

@@ -95,7 +95,8 @@ test('exitCodeFor maps every outcome to the documented code', () => {
   const zero: AgentRunOutcome[] = ['submitted', 'completed'];
   const one: AgentRunOutcome[] = [
     'misroute', 'no-template', 'no-harness', 'incompatible-harness-policy', 'unverified-consumed',
-    'session-store-failed', 'no-submit', 'killed', 'lease-lost', 'ownership-error', 'hub-unreachable', 'stopped',
+    'unstamped-order', 'unresolvable-crew', 'session-store-failed', 'no-submit', 'killed', 'lease-lost',
+    'ownership-error', 'hub-unreachable', 'stopped',
   ];
   for (const o of zero) assert.equal(exitCodeFor(o), 0);
   for (const o of one) assert.equal(exitCodeFor(o), 1);
@@ -122,6 +123,7 @@ function agentOrder(o: {
   step?: string;
   model?: string;
   capabilities?: string[];
+  crews?: string[];
   x?: Record<string, unknown>;
 } = {}): GetOrderResponse {
   const workflow = o.workflow ?? 'wf1';
@@ -140,6 +142,7 @@ function agentOrder(o: {
       ...(o.worker !== undefined ? { worker: o.worker } : {}),
       ...(o.model !== undefined ? { model: o.model } : {}),
       capabilities: o.capabilities ?? ['build'],
+      crews: o.crews ?? ['test-crew'],
       ...(o.x !== undefined ? { x: o.x } : {}),
       defDigest: o.defDigest ?? HASH,
       consumes: {},
@@ -800,6 +803,62 @@ test('run() refuses unresolvable capability when every roster candidate is unava
   assert.match(text, /build/);
   // An unavailable candidate releases, so the hub can re-offer the order.
   assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+});
+
+test('run() resolves the roster layer selected by the order crew stamp', async () => {
+  const fake = createFakeAdapter({ id: 'fake' });
+  useAdapter(fake);
+  seedBundle();
+  mkdirSync(join(home, '.owenloop', 'crews'), { recursive: true });
+  writeFileSync(
+    join(home, '.owenloop', 'crews', 'delivery.json'),
+    JSON.stringify({ roster: { build: [{ harness: 'fake', model: 'crew-model', effort: 'xhigh' }] } }),
+  );
+  const { hub } = probeHub({ responses: [agentOrder({ crews: ['delivery'] }), noHold('ok')], def: DEF });
+
+  assert.equal(await run(WIRE, {
+    hub, signalHost: fakeSignalHost().host, holderId: 'host:123', cwd: '/work', out: () => {}, err: () => {},
+  }), 0);
+  const start = fake.calls.find((call) => call.kind === 'start');
+  assert.ok(start !== undefined && start.kind === 'start');
+  assert.equal(start.args.model, 'crew-model');
+});
+
+test('run() releases a stamped crew whose roster file is corrupt', async () => {
+  useAdapter(createFakeAdapter({ id: 'fake' }));
+  seedBundle();
+  mkdirSync(join(home, '.owenloop', 'crews'), { recursive: true });
+  const crewPath = join(home, '.owenloop', 'crews', 'broken.json');
+  writeFileSync(crewPath, '{ this is not json');
+  const { hub, releases } = probeHub({ responses: [agentOrder({ crews: ['broken'] })], def: DEF });
+  const err: string[] = [];
+
+  assert.equal(await run(WIRE, {
+    hub, signalHost: fakeSignalHost().host, holderId: 'host:123', cwd: '/work', out: () => {}, err: (line) => err.push(line),
+  }), 1);
+  assert.deepEqual(releases, [{ workflow: 'wf1', run: 'run1' }]);
+  assert.match(err.join('\n'), /broken/);
+  assert.ok(err.join('\n').includes(crewPath));
+});
+
+test('run() ignores the deleted shift crew environment handoff', async () => {
+  const fake = createFakeAdapter({ id: 'fake' });
+  useAdapter(fake);
+  seedBundle();
+  mkdirSync(join(home, '.owenloop', 'crews'), { recursive: true });
+  writeFileSync(
+    join(home, '.owenloop', 'crews', 'stamped.json'),
+    JSON.stringify({ roster: { build: [{ harness: 'fake', model: 'stamped-model', effort: 'high' }] } }),
+  );
+  process.env['OWENLOOP_SERVE_CREWS'] = 'ghost';
+  const { hub } = probeHub({ responses: [agentOrder({ crews: ['stamped'] }), noHold('ok')], def: DEF });
+
+  assert.equal(await run(WIRE, {
+    hub, signalHost: fakeSignalHost().host, holderId: 'host:123', cwd: '/work', out: () => {}, err: () => {},
+  }), 0);
+  const start = fake.calls.find((call) => call.kind === 'start');
+  assert.ok(start !== undefined && start.kind === 'start');
+  assert.equal(start.args.model, 'stamped-model');
 });
 
 test('blank --harness falls through to the selected roster candidate', async () => {
