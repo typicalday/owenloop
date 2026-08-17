@@ -733,9 +733,10 @@ If `<config>/grants` is absent or is a non-symlink directory whose existing
 entries are all regular, non-symlink files while the pre-rename
 `<config>/roster` holds grants, owenloop refuses rather than treating the
 machine as unenrolled. It never reads or moves that legacy directory; the
-operator must run
-`mkdir -p '<config>/grants' && mv '<config>/roster'/*.grant.dsse '<config>/grants'/`
-and restart running owenloop shift daemons. If the destination is a file, a
+operator must run the shell-quoted command printed in that refusal —
+structurally, `mkdir -p <config>/grants && mv <config>/roster/*.grant.dsse
+<config>/grants/` — and restart running owenloop shift daemons. If the
+destination is a file, a
 symlink, or contains a non-regular entry, owenloop prints no migration command:
 repair that path by hand before retrying the migration.
 

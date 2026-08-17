@@ -138,6 +138,18 @@ test('loadGrants refuses when the new directory has no grants and legacy grants 
   assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), ['legacy-grant']);
 });
 
+test('loadGrants prints an executable migration command for config paths containing apostrophes', () => {
+  const config = temp("owenloop-org-apostrophe-'");
+  const env = { OWENLOOP_CONFIG_DIR: config };
+  const legacy = join(config, 'roster');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
+
+  const error = strandedError(env);
+  runPrintedMigration(error);
+  assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), ['legacy-grant']);
+});
+
 test('loadGrants requires manual repair when the grants destination is a regular file', () => {
   const home = temp('owenloop-org-legacy-broken-new-');
   const env = { HOME: home };

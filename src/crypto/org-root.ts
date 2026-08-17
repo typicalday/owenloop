@@ -79,6 +79,11 @@ function inspectionError(path: string, action: string, error: unknown): GrantsDe
   };
 }
 
+/** Encode one arbitrary path as a POSIX shell argument. */
+function quotePosixShellArgument(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 /**
  * A migration command is safe only for an absent destination or a real
  * directory whose entries are all regular files. This never reads envelope
@@ -130,10 +135,12 @@ export class StrandedLegacyGrantsError extends Error {
     legacyCount: number,
     destinationProblem: GrantsDestinationProblem | undefined,
   ) {
+    const quotedGrantsPath = quotePosixShellArgument(grantsPath);
+    const quotedLegacyPath = quotePosixShellArgument(legacyPath);
     const message = destinationProblem === undefined
       ? `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
         `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
-        `cryptographic material for you. Run:  mkdir -p '${grantsPath}' && mv '${legacyPath}'/*.grant.dsse '${grantsPath}'/  ` +
+      `cryptographic material for you. Run:  mkdir -p ${quotedGrantsPath} && mv ${quotedLegacyPath}/*.grant.dsse ${quotedGrantsPath}/  ` +
         'then restart every running owenloop shift daemon.'
       : `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
         `but '${legacyPath}' holds ${legacyCount}. The grants destination is unsafe: ${destinationProblem.reason}: ` +
