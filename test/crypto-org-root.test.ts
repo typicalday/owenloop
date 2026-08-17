@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -124,12 +124,13 @@ test('loadGrants refuses when legacy grants are stranded and the new directory i
   const legacy = join(home, '.owenloop', 'roster');
   mkdirSync(legacy, { recursive: true });
   writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
+  writeFileSync(join(legacy, '.hidden.grant.dsse'), 'hidden-grant');
 
   const error = strandedError(env);
   assert.match(error.message, new RegExp(`'${grantsDir(env)}'`));
   assert.match(error.message, new RegExp(`'${legacy}'`));
   runPrintedMigration(error);
-  assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), ['legacy-grant']);
+  assert.deepEqual(loadGrants(env).map((value) => Buffer.from(value).toString()), ['hidden-grant', 'legacy-grant']);
 });
 
 test('loadGrants refuses when the new directory has no grants and legacy grants exist', () => {
@@ -289,4 +290,63 @@ test('loadGrants requires manual repair when a legacy grant entry is a directory
   mkdirSync(entry, { recursive: true });
 
   assertInvalidLegacySource(env, entry);
+});
+
+test('loadGrants requires manual repair when reading the legacy source fails', () => {
+  const home = temp('owenloop-org-legacy-unreadable-');
+  const env = { HOME: home };
+  const legacy = join(home, '.owenloop', 'roster');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
+  chmodSync(legacy, 0o000);
+
+  try {
+    const error = strandedError(env);
+    assertManualRepair(error, legacy);
+    assert.match(error.message, /cannot inspect legacy grants source/);
+  } finally {
+    chmodSync(legacy, 0o700);
+  }
+  assert.equal(existsSync(grantsDir(env)), false);
+});
+
+test('loadGrants requires manual repair when locating the legacy source fails', () => {
+  const home = temp('owenloop-org-legacy-source-unsearchable-');
+  const env = { HOME: home };
+  const root = join(home, '.owenloop');
+  const legacy = join(root, 'roster');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, 'legacy.grant.dsse'), 'legacy-grant');
+  // Missing search permission on the parent makes the source lstatSync fail.
+  chmodSync(root, 0o600);
+
+  try {
+    const error = strandedError(env);
+    assertManualRepair(error, legacy);
+    assert.match(error.message, /cannot inspect legacy grants source/);
+  } finally {
+    chmodSync(root, 0o700);
+  }
+  assert.equal(existsSync(grantsDir(env)), false);
+});
+
+test('loadGrants requires manual repair when inspecting a legacy source entry fails', () => {
+  const home = temp('owenloop-org-legacy-entry-unreadable-');
+  const env = { HOME: home };
+  const legacy = join(home, '.owenloop', 'roster');
+  const entry = join(legacy, 'legacy.grant.dsse');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(entry, 'legacy-grant');
+  // Read permission permits readdirSync, but the missing search permission
+  // makes lstatSync of the returned child fail.
+  chmodSync(legacy, 0o400);
+
+  try {
+    const error = strandedError(env);
+    assertManualRepair(error, entry);
+    assert.match(error.message, /cannot inspect legacy grants source entry/);
+  } finally {
+    chmodSync(legacy, 0o700);
+  }
+  assert.equal(existsSync(grantsDir(env)), false);
 });

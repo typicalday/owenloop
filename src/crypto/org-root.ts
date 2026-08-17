@@ -183,9 +183,15 @@ function migrationMessage(
   quotedGrantsPath: string,
   quotedLegacyPath: string,
 ): string {
+  // POSIX pathname expansion omits leading-dot names for `*.grant.dsse`, so
+  // enumerate a second dot-prefixed pattern. The source inspector has already
+  // established that every entry is a regular, non-symlink file; the file test
+  // only skips either unmatched pattern when it did not expand.
+  const command = `mkdir -p ${quotedGrantsPath} && for grant in ${quotedLegacyPath}/*.grant.dsse ${quotedLegacyPath}/.*.grant.dsse; do ` +
+    `[ -f "$grant" ] || continue; mv "$grant" ${quotedGrantsPath}/; done`;
   return `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
     `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
-    `cryptographic material for you. Run:  mkdir -p ${quotedGrantsPath} && mv ${quotedLegacyPath}/*.grant.dsse ${quotedGrantsPath}/  ` +
+    `cryptographic material for you. Run:  ${command}  ` +
     'then restart every running owenloop shift daemon.';
 }
 
