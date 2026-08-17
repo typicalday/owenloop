@@ -729,11 +729,15 @@ is never returned by the library or placed in an envelope. `loadGrants` and
 `loadRevocations` return raw envelope bytes to the pure validator and refuse
 symlinked or non-regular files.
 
-If `<config>/grants` is absent or contains no `*.grant.dsse` files while the
-pre-rename `<config>/roster` holds grants, owenloop refuses rather than treating
-the machine as unenrolled. It never reads or moves that legacy directory; the
-operator must run `mkdir -p '<config>/grants' && mv '<config>/roster'/*.grant.dsse '<config>/grants'/`
-and restart running owenloop shift daemons.
+If `<config>/grants` is absent or is a non-symlink directory whose existing
+entries are all regular, non-symlink files while the pre-rename
+`<config>/roster` holds grants, owenloop refuses rather than treating the
+machine as unenrolled. It never reads or moves that legacy directory; the
+operator must run
+`mkdir -p '<config>/grants' && mv '<config>/roster'/*.grant.dsse '<config>/grants'/`
+and restart running owenloop shift daemons. If the destination is a file, a
+symlink, or contains a non-regular entry, owenloop prints no migration command:
+repair that path by hand before retrying the migration.
 
 ## Admin-signed policy floors
 

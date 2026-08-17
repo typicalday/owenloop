@@ -67,23 +67,86 @@ function countGrantFiles(dir: string): number {
   }
 }
 
+interface GrantsDestinationProblem {
+  path: string;
+  reason: string;
+}
+
+function inspectionError(path: string, action: string, error: unknown): GrantsDestinationProblem {
+  return {
+    path,
+    reason: `${action}: ${error instanceof Error ? error.message : String(error)}`,
+  };
+}
+
+/**
+ * A migration command is safe only for an absent destination or a real
+ * directory whose entries are all regular files. This never reads envelope
+ * bytes; it merely prevents an instruction from silently nesting them.
+ */
+function inspectGrantsDestination(path: string): GrantsDestinationProblem | undefined {
+  let stat;
+  try {
+    stat = lstatSync(path, { throwIfNoEntry: false });
+  } catch (error) {
+    return inspectionError(path, 'cannot inspect grants destination', error);
+  }
+  if (stat === undefined) return undefined;
+  if (stat.isSymbolicLink()) return { path, reason: 'grants destination is a symlink' };
+  if (!stat.isDirectory()) return { path, reason: 'grants destination is not a directory' };
+
+  let entries: string[];
+  try {
+    entries = readdirSync(path);
+  } catch (error) {
+    return inspectionError(path, 'cannot inspect grants destination', error);
+  }
+  for (const name of entries) {
+    const entryPath = join(path, name);
+    let entry;
+    try {
+      entry = lstatSync(entryPath);
+    } catch (error) {
+      return inspectionError(entryPath, 'cannot inspect grants destination entry', error);
+    }
+    if (entry.isSymbolicLink()) return { path: entryPath, reason: 'grants destination entry is a symlink' };
+    if (!entry.isFile()) return { path: entryPath, reason: 'grants destination entry is not a regular file' };
+  }
+  return undefined;
+}
+
 /** Thrown when grants exist only under the pre-rename directory. */
 export class StrandedLegacyGrantsError extends Error {
   override readonly name = 'StrandedLegacyGrantsError';
   readonly grantsPath: string;
   readonly legacyPath: string;
   readonly legacyCount: number;
+  readonly destinationPath: string | undefined;
+  readonly destinationReason: string | undefined;
 
-  constructor(grantsPath: string, legacyPath: string, legacyCount: number) {
+  constructor(
+    grantsPath: string,
+    legacyPath: string,
+    legacyCount: number,
+    destinationProblem: GrantsDestinationProblem | undefined,
+  ) {
+    const message = destinationProblem === undefined
+      ? `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
+        `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
+        `cryptographic material for you. Run:  mkdir -p '${grantsPath}' && mv '${legacyPath}'/*.grant.dsse '${grantsPath}'/  ` +
+        'then restart every running owenloop shift daemon.'
+      : `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
+        `but '${legacyPath}' holds ${legacyCount}. The grants destination is unsafe: ${destinationProblem.reason}: ` +
+        `'${destinationProblem.path}'. Repair that path by hand before migrating; owenloop will not move your ` +
+        'cryptographic material for you.';
     super(
-      `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
-      `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
-      `cryptographic material for you. Run:  mkdir -p '${grantsPath}' && mv '${legacyPath}'/*.grant.dsse '${grantsPath}'/  ` +
-      'then restart every running owenloop shift daemon.',
+      message,
     );
     this.grantsPath = grantsPath;
     this.legacyPath = legacyPath;
     this.legacyCount = legacyCount;
+    this.destinationPath = destinationProblem?.path;
+    this.destinationReason = destinationProblem?.reason;
   }
 }
 
@@ -93,7 +156,7 @@ export function assertNoStrandedLegacyGrants(env: Record<string, string | undefi
   if (countGrantFiles(grants) > 0) return;
   const legacy = legacyGrantsDir(env);
   const count = countGrantFiles(legacy);
-  if (count > 0) throw new StrandedLegacyGrantsError(grants, legacy, count);
+  if (count > 0) throw new StrandedLegacyGrantsError(grants, legacy, count, inspectGrantsDestination(grants));
 }
 
 /** `<config>/revocations`, containing revocation envelopes. */

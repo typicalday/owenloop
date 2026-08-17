@@ -314,7 +314,27 @@ test('stranded legacy grants refuse the consumed gate even with artifactPolicy o
   if (!result.ok) {
     assert.match(result.reason, /\.owenloop[/\\]grants/);
     assert.match(result.reason, /\.owenloop[/\\]roster/);
-    assert.match(result.reason, /mv /);
+  }
+});
+
+test('structurally invalid grants refuse the consumed gate even with artifactPolicy off', async () => {
+  const env = trustRootEnv();
+  const grants = join(env.HOME!, '.owenloop', 'grants');
+  mkdirSync(grants, { recursive: true });
+  writeFileSync(join(grants, 'producer.grant.dsse'), grantBytes());
+  mkdirSync(join(grants, 'roster'));
+  mkdirSync(join(env.HOME!, '.owenloop', 'roster'));
+  const verifier = createConsumedVerifier({
+    env,
+    artifactPolicy: 'off',
+    now: () => 100,
+    signerForPrincipal,
+  });
+  const result = await verifier(producerOrder(), { hardRule: false });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.match(result.reason, /grants entry is not a regular file/);
+    assert.match(result.reason, /\.owenloop[/\\]grants[/\\]roster/);
   }
 });
 

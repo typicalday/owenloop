@@ -19,7 +19,6 @@ import {
   loadRevocations,
   loadGrants,
   resolveOrgRoot,
-  StrandedLegacyGrantsError,
 } from '../../../src/crypto/org-root.ts';
 import {
   verifyConsumed,
@@ -165,24 +164,10 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
       grants = loadGrants(args.env);
       revocations = loadRevocations(args.env);
     } catch (error) {
-      if (error instanceof StrandedLegacyGrantsError) {
-	return {
-	  ok: false,
-	  reason: `consumed artifact gate refusal for ${order.workflow}/${order.run} step '${order.step}': ${error.message}`,
-	};
-      }
-      const reason = `prerequisite: local producer trust material could not be loaded: ${errorText(error)}`;
-      const warnings: string[] = [];
-      for (const path of Object.keys(order.consumes)) {
-        const result = policyOutcome(order, opts.hardRule, policy, path, { kind: 'unverifiable', reason }, warnings);
-        if (result !== undefined) return result;
-      }
-      for (const owed of order.owes) {
-        if (owed.reasons.length === 0 && owed.proof === undefined) continue;
-        const result = policyOutcome(order, opts.hardRule, policy, owed.path, { kind: 'unverifiable', reason }, warnings);
-        if (result !== undefined) return result;
-      }
-      return { ok: true, order, warnings };
+      return {
+        ok: false,
+        reason: `consumed artifact gate refusal for ${order.workflow}/${order.run} step '${order.step}': local producer trust material could not be loaded: ${errorText(error)}`,
+      };
     }
 
     const prerequisite = root.kind === 'absent'
