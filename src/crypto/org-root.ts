@@ -1,11 +1,12 @@
 /**
  * Local filesystem paths and loaders for an organization's enrollment anchor.
  *
- * The module derives every path from an injected environment, with
- * XDG_CONFIG_HOME taking precedence over HOME. The loader only returns raw
- * envelope bytes; chain.ts remains a pure verifier and does not know this
- * layout. This module deliberately does not transport registrations, contact a
- * hub, or expose private key bytes.
+ * The module derives every path from an injected environment: an absolute
+ * OWENLOOP_CONFIG_DIR wins, otherwise paths live below $HOME/.owenloop;
+ * XDG_CONFIG_HOME is ignored. The loader only returns raw envelope bytes;
+ * chain.ts remains a pure verifier and does not know this layout. This module
+ * deliberately does not transport registrations, contact a hub, or expose
+ * private key bytes.
  */
 
 import { lstatSync, readdirSync, readFileSync } from 'node:fs';
