@@ -117,6 +117,87 @@ test('instance show: omits waitingOnCapabilities entirely when the hub omits it'
   assert.equal('waitingOnCapabilities' in JSON.parse(t.out.join('\n')), false);
 });
 
+// A failed terminal instance must be unmistakable to both JSON consumers and
+// an operator reading the command's terminal output.
+test('instance show: surfaces a terminal instance status without corrupting JSON', async () => {
+  const { fetch } = routedFetch({
+    [`GET /api/status/${WORKFLOW}`]: () => ({
+      status: 200,
+      json: { ...STATUS, instanceStatus: 'failed', terminal: true },
+    }),
+  });
+  const t = makeIo({ fetch });
+  bind(t);
+
+  const code = await mainAsync(['instance', 'show', WORKFLOW], t.io);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  const printed = JSON.parse(t.out.join('\n')) as Record<string, unknown>;
+  assert.equal(printed.instanceStatus, 'failed');
+  assert.equal(printed.terminal, true);
+  assert.match(t.err.join('\n'), /wf_stuck/u);
+  assert.match(t.err.join('\n'), /failed/u);
+  assert.match(t.err.join('\n'), /TERMINAL/u);
+});
+
+// An older hub has no liveness verdict. The CLI must not invent a reassuring
+// live answer or turn that compatible response into an error.
+test('instance show: omits terminal fields an older hub did not send', async () => {
+  const { fetch } = routedFetch({
+    [`GET /api/status/${WORKFLOW}`]: () => ({ status: 200, json: STATUS }),
+  });
+  const t = makeIo({ fetch });
+  bind(t);
+
+  const code = await mainAsync(['instance', 'show', WORKFLOW], t.io);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  const printed = JSON.parse(t.out.join('\n')) as Record<string, unknown>;
+  assert.equal('instanceStatus' in printed, false);
+  assert.equal('terminal' in printed, false);
+  assert.equal(printed.done, false);
+  assert.doesNotMatch(t.err.join('\n'), /TERMINAL/u);
+});
+
+// Explicit false is distinct from omission: the hub has affirmatively said the
+// instance is live, so the status must remain visible without a terminal banner.
+test('instance show: preserves an explicit live terminal false', async () => {
+  const { fetch } = routedFetch({
+    [`GET /api/status/${WORKFLOW}`]: () => ({
+      status: 200,
+      json: { ...STATUS, instanceStatus: 'running', terminal: false },
+    }),
+  });
+  const t = makeIo({ fetch });
+  bind(t);
+
+  const code = await mainAsync(['instance', 'show', WORKFLOW], t.io);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  const printed = JSON.parse(t.out.join('\n')) as Record<string, unknown>;
+  assert.equal(printed.instanceStatus, 'running');
+  assert.equal(printed.terminal, false);
+  assert.doesNotMatch(t.err.join('\n'), /TERMINAL/u);
+});
+
+// Hub-owned status vocabulary can grow. A new terminal label must be forwarded
+// rather than rejected by a stale CLI enum.
+test('instance show: forwards a future terminal status verbatim', async () => {
+  const { fetch } = routedFetch({
+    [`GET /api/status/${WORKFLOW}`]: () => ({
+      status: 200,
+      json: { ...STATUS, instanceStatus: 'paused', terminal: true },
+    }),
+  });
+  const t = makeIo({ fetch });
+  bind(t);
+
+  const code = await mainAsync(['instance', 'show', WORKFLOW], t.io);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal((JSON.parse(t.out.join('\n')) as Record<string, unknown>).instanceStatus, 'paused');
+});
+
 test('instance show: a done instance reports done true', async () => {
   const { fetch } = routedFetch({
     [`GET /api/status/${WORKFLOW}`]: () => ({

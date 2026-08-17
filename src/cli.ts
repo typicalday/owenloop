@@ -1418,7 +1418,8 @@ ${' '.repeat(41)}terminal status \`cancelled\`. Cancelling an already-terminal i
   instance show <workflow> [--hub <url>]
 ${' '.repeat(41)}print one instance's live state on the bound hub: whether it is done, what it
 ${' '.repeat(41)}owes, which steps are eligible or blocked, which runs are in flight, and whether
-${' '.repeat(41)}the loaded def has drifted from the version the instance is pinned to.
+${' '.repeat(41)}the loaded def has drifted from the version the instance is pinned to, and whether
+${' '.repeat(41)}the instance has reached a terminal status.
   agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]   mint a new Scoped Identity on the hub and store its token in slot agent:<name> (the token is never printed; --shift = --scopes work,run)
   capability bind <capability> <crew> [--hub <url>]   add a crew to a workflow capability on the hub org — a capability may bind many crews (admin; human credential)
   capability unbind <capability> <crew> [--hub <url>]  remove one (capability, crew) route
@@ -4770,10 +4771,23 @@ async function dispatchInstance(io: CliIO, args: Args): Promise<number> {
   }
 
   const arrayOr = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+  // The hub's terminal INSTANCE STATUS verdict is optional on the wire: older
+  // hubs predate these fields. Absent means absent — neither value is defaulted,
+  // because `terminal: false` and `instanceStatus: 'unknown'` are real answers.
+  // The status vocabulary belongs to the hub, so a future non-empty string is
+  // forwarded verbatim instead of being rejected by a CLI-owned enum.
+  const instanceStatus =
+    typeof wire.instanceStatus === 'string' && wire.instanceStatus !== '' ? wire.instanceStatus : undefined;
+  const terminal = typeof wire.terminal === 'boolean' ? wire.terminal : undefined;
   print(io, {
     ok: true,
     hub: origin,
     workflow,
+    // These answer whether the instance is alive; `done` is the engine's
+    // completion flag, and failed or cancelled instances are terminal without
+    // being done.
+    ...(instanceStatus === undefined ? {} : { instanceStatus }),
+    ...(terminal === undefined ? {} : { terminal }),
     done: wire.done,
     // Owed inputs the instance is waiting on, each with its acceptance and
     // whether the engine considers it stalled.
@@ -4792,6 +4806,15 @@ async function dispatchInstance(io: CliIO, args: Args): Promise<number> {
     // looks identical to "nothing is picking this up" from the outside.
     ...(Array.isArray(wire.waitingOnCapabilities) ? { waitingOnCapabilities: wire.waitingOnCapabilities } : {}),
   });
+  // The hub owns this mapping; do not derive terminality from its status label.
+  // stderr preserves the JSON stdout contract while still reaching an operator
+  // who is piping it to another command.
+  if (terminal === true) {
+    const terminalMessage =
+      `instance ${workflow} is ${instanceStatus ?? 'in a terminal state'} — TERMINAL. ` +
+      'The hub will dispatch nothing further for it; an empty `eligible` here is a finished run, not an idle shift.';
+    io.err(terminalMessage);
+  }
   return 0;
 }
 
