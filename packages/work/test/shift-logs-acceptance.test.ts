@@ -199,6 +199,8 @@ interface DispatchHubState {
   misroute: boolean;
   /** Every `submit` the hub received, in order. */
   submits: Array<Record<string, unknown> | undefined>;
+  /** Make the shift-start roster refresh return an unusable identity. */
+  rosterSyncFails?: boolean;
 }
 
 /**
@@ -211,6 +213,12 @@ function dispatchHub(state: DispatchHubState): (verb: string, body: Record<strin
   const order = orderPacket();
   let orderVisible = true;
   return (verb, body) => {
+    if (verb === 'whoami') {
+      return state.rosterSyncFails === true
+	? { text: '' }
+	: { text: '', orgId: 'org_logging', orgName: 'Logging', actor: {}, tokenStatus: 'active', authMethod: 'token' };
+    }
+    if (verb === 'rosters') return { text: '', global: {}, crews: [] };
     if (verb === 'presence_ping') return { text: '', ok: true, name: String(body?.['name'] ?? 'shift'), lastSeen: Date.now() };
     if (verb === 'wake') return { text: '', cursor: state.dispatchEnabled ? 2 : 1, changed: state.dispatchEnabled };
     if (verb === 'whats_next') {
@@ -331,6 +339,37 @@ async function readShiftLogRecords(
   );
   return records;
 }
+
+test('a shift-start roster refresh failure is durable in shift.log and remains file-only', async () => {
+  const hub: DispatchHubState = { dispatchEnabled: false, misroute: false, submits: [], rosterSyncFails: true };
+  const { origin, server } = await startMockHub(dispatchHub(hub));
+  try {
+    shift = spawnShift(
+      [
+	'crew-logging', '--origin', origin, '--cap', '1', '--poll-interval', '25',
+	'--cache-dir', cacheDir, '--state-dir', stateDir, '--log-dir', logDir,
+      ],
+      env(),
+    );
+    await shift.ready;
+    const records = await readShiftLogRecords(shiftLogFile(logDir), 'hub-error', 'shift.log');
+    assert.equal(records[0]?.type, 'parked', JSON.stringify(records));
+    const failure = records.find((record) => record.type === 'hub-error' && record.op === 'roster_sync');
+    assert.ok(failure !== undefined, JSON.stringify(records));
+    assert.match(String(failure.message), /^roster sync failed at shift start: /u);
+    assert.match(String(failure.message), /\(continuing\)$/u);
+
+    // `hub-error` is FILE_ONLY: it must not make the daemon unhealthy or turn
+    // a normal status request into a queued work event.
+    const status = (await shift.request({ op: 'status' })) as { cap?: number };
+    assert.equal(status.cap, 1);
+    const ending = runCli(['shift', 'end', '--state-dir', stateDir]);
+    assert.equal((await ending.result).code, 0);
+    assert.equal(await shift.exited, 0, shift.stderr());
+  } finally {
+    server.close();
+  }
+});
 
 test('a shift-dispatched worker\'s output lands in <run>.log and shift.log is JSON Lines', async () => {
   const hub: DispatchHubState = { dispatchEnabled: false, misroute: false, submits: [] };

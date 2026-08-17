@@ -86,7 +86,7 @@ import type { NormalizedStepSpec } from '../bundle/types.ts';
 import { createHubClient, type HubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
-import { machineRosterLayers, mergeRosterLayers } from '../settings/roster.ts';
+import { effectiveRosterLayers, mergeRosterLayers } from '../settings/roster.ts';
 import { adapterFor, defaultHarnessId, registeredHarnessIds } from '../harness/registry.ts';
 import { parseHarnessCarrier } from '../bundle/fetch.ts';
 import { normalizeStepPermissions, validateHarnessOptions } from '../harness/permissions.ts';
@@ -315,17 +315,6 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
     .split(',')
     .map((crew) => crew.trim())
     .filter((crew) => crew !== '');
-  let rosters;
-  try {
-    rosters =
-      servedCrews.length > 0
-        ? servedCrews.map((crew) => mergeRosterLayers(machineRosterLayers(env, crew)))
-        : [mergeRosterLayers(machineRosterLayers(env, undefined))];
-  } catch (e) {
-    err(`owenloop work agent-run: ${errMsg(e)}`);
-    return 1;
-  }
-
   const origin = parsed.origin ?? settings.hubOrigin;
   if (origin === undefined || origin.trim() === '') {
     err('owenloop work agent-run: no hub origin — pass --origin <url> or set hubOrigin in settings');
@@ -385,6 +374,19 @@ export async function run(args: string[], deps: RunDeps = {}): Promise<number> {
   }
 
   const account = workerEnv['OWENLOOP_ACCOUNT'] ?? 'default';
+  // The child performs no roster network call. It has the origin/account needed
+  // to read the daemon-maintained disk cache, and a missing/corrupt hub cache
+  // becomes visible absent layers rather than refusing otherwise-routable work.
+  let rosters;
+  try {
+    rosters =
+      servedCrews.length > 0
+	? servedCrews.map((crew) => mergeRosterLayers(effectiveRosterLayers(env, crew, { origin, account })))
+	: [mergeRosterLayers(effectiveRosterLayers(env, undefined, { origin, account }))];
+  } catch (e) {
+    err(`owenloop work agent-run: ${errMsg(e)}`);
+    return 1;
+  }
   let hub = deps.hub;
   if (hub === undefined) {
     const bearer = await resolveBearer({ origin, account, env: workerEnv });

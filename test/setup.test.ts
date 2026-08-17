@@ -1,7 +1,7 @@
 /**
  * `owenloop setup` — the idempotent converger (identity model §7 Flow A/B),
  * driven in-process through `mainAsync` against the stateful `makeIdentityHub`
- * fake. Proves: the seven steps run in order, a fresh machine mints/logs in, a
+ * fake. Proves: the eight steps run in order, a fresh machine mints/logs in, a
  * SECOND run performs zero writes (idempotency), the signing-keys step creates
  * the three principal keys exactly once and honors `--reuse-ssh-key` for the
  * human key only, the succession prompt (Flow B) renders verbatim framing and
@@ -18,11 +18,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { mainAsync, sanitizeAgentName, lastActiveMs, formatLastActive, resolveBundledMarketplaceRoot } from '../src/cli.ts';
+import { dirname, join } from 'node:path';
+import { installCrewRosterIfAbsent, mainAsync, sanitizeAgentName, lastActiveMs, formatLastActive, resolveBundledMarketplaceRoot } from '../src/cli.ts';
 import type { AgentIdentitySummary } from '../src/hub.ts';
 import { asAgentIdentities, asRekeyAgentTokenOk } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
@@ -40,10 +40,22 @@ import { owenloopSettingsPath } from '../src/work-settings.ts';
 import { encodeBase64, PAYLOAD_TYPE_ENROLLMENT_GRANT } from '../src/crypto/dsse.ts';
 import { publicKeyDescriptor } from '../src/crypto/keys.ts';
 import { buildEnrollmentGrant, DEFAULT_MACHINE_SCOPE } from '../src/crypto/enrollment.ts';
+import { crewRosterPath, encodedCrewRosterDir, encodeCrewRosterFilename } from '../packages/work/src/settings/roster.ts';
 
 const HUB = 'http://127.0.0.1:9';
 const ORIGIN = 'http://127.0.0.1:9';
 const PACKAGE_VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version;
+
+const CASE_FOLDING_FILESYSTEM = (() => {
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-case-fold-probe-'));
+  try {
+    const lower = join(dir, 'delivery');
+    writeFileSync(lower, '');
+    return existsSync(join(dir, 'Delivery'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+})();
 
 function sshKeygenWorks(): boolean {
   try {
@@ -137,7 +149,7 @@ async function runPluginSetup(
 
 // ---- Flow A: fresh machine ---------------------------------------------------
 
-test('setup: fresh machine, scripted --new-agent runs steps 2-7 in order and converges', async () => {
+test('setup: fresh machine, scripted --new-agent runs steps 2-8 in order and converges', async () => {
   const { routes } = makeIdentityHub();
   const { fetch, calls } = routedFetch(routes);
   const t = makeIo({ fetch, onOpenUrl: driveCallback() });
@@ -147,7 +159,7 @@ test('setup: fresh machine, scripted --new-agent runs steps 2-7 in order and con
 
   // Step banners appear in order on stderr.
   const errText = t.err.join('\n');
-  const order = ['[1/7]', '[2/7]', '[3/7]', '[4/7]', '[5/7]', '[6/7]', '[7/7]'];
+  const order = ['[1/8]', '[2/8]', '[3/8]', '[4/8]', '[5/8]', '[6/8]', '[7/8]', '[8/8]'];
   let last = -1;
   for (const marker of order) {
     const at = errText.indexOf(marker);
@@ -170,6 +182,9 @@ test('setup: fresh machine, scripted --new-agent runs steps 2-7 in order and con
   // owenloop settings written with hubOrigin = the hub.
   const settings = JSON.parse(readFileSync(owenloopSettingsPath(t.io.env), 'utf8'));
   assert.equal(settings.hubOrigin, ORIGIN);
+  const rosterFile = crewRosterPath(t.io.env, 'personal-alex');
+  assert.equal(existsSync(rosterFile), true, 'setup materializes an empty strongest-layer roster for the agent crew');
+  assert.deepEqual(JSON.parse(readFileSync(rosterFile, 'utf8')).roster, {});
 
   // Machine-readable summary on stdout; doctor ran.
   const summary = JSON.parse(t.out.join('\n'));
@@ -178,6 +193,212 @@ test('setup: fresh machine, scripted --new-agent runs steps 2-7 in order and con
   assert.ok(Array.isArray(summary.doctor.checks) && summary.doctor.checks.length >= 5, 'doctor checks present');
 
   assertNoOlp(t);
+});
+
+test('setup: existing crew roster is never overwritten', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', 'ops'], t.io), 0, t.err.join('\n'));
+  const path = crewRosterPath(t.io.env, 'ops');
+  const custom = '{"roster":{"build":[{"harness":"codex","model":"local","effort":"high"}]}}\n';
+  writeFileSync(path, custom);
+  assert.equal(await mainAsync(['setup', '--hub', HUB], t.io), 0, t.err.join('\n'));
+  assert.equal(readFileSync(path, 'utf8'), custom);
+  assert.equal(
+    readdirSync(dirname(path)).some((entry) => entry.endsWith('.roster.tmp')),
+    false,
+    'an interrupted/exclusive install cleans its complete temporary file when an existing roster wins',
+  );
+});
+
+test('setup materializes case-variant crews independently on a case-folding filesystem', { skip: !CASE_FOLDING_FILESYSTEM }, async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const crews = ['Delivery', 'delivery'];
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crews.join(',')], t.io), 0, t.err.join('\n'));
+  const paths = crews.map((crew) => crewRosterPath(t.io.env, crew));
+  assert.notEqual(paths[0], paths[1], 'neither crew treats the other case variant as its existing strongest layer');
+  assert.equal(paths.filter((path) => dirname(path) === join(t.io.env.HOME!, '.owenloop', 'crews')).length, 1, 'the first exact legacy spelling stays literal');
+  assert.equal(paths.filter((path) => dirname(path) === encodedCrewRosterDir(t.io.env)).length, 1, 'the case variant receives an isolated codec roster');
+  for (const [index, crew] of crews.entries()) {
+    assert.equal(JSON.parse(readFileSync(paths[index]!, 'utf8')).crew, crew, `${crew} has its own recorded strongest-layer identity`);
+  }
+  const summary = JSON.parse(t.out.join('\n')) as { steps: Array<{ step: string; action: string }> };
+  assert.equal(summary.steps.filter((step) => step.step === 'crew rosters' && step.action === 'done').length, 2, 'setup created two independent skeletons instead of skipping one');
+  assertNoOlp(t);
+});
+
+test('setup crew materialization only skips a verified target, not an unrelated EEXIST', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-setup-roster-install-'));
+  try {
+    const path = crewRosterPath({ HOME: home }, 'ops');
+    mkdirSync(dirname(path), { recursive: true });
+
+    // A pre-existing temporary name means the complete-file write did not
+    // start. It must fail rather than falsely claiming the target was skipped.
+    const collision = join(dirname(path), '.collision.roster.tmp');
+    writeFileSync(collision, 'occupied');
+    assert.throws(
+      () => installCrewRosterIfAbsent(path, '{"roster":{}}\n', { tempName: () => '.collision.roster.tmp' }),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === 'EEXIST',
+    );
+    assert.equal(existsSync(path), false);
+    rmSync(collision);
+
+    // EEXIST from the final link is only an existing roster when that target
+    // is an actual file; a directory must not be reported as a safe skip.
+    mkdirSync(path);
+    assert.throws(
+      () => installCrewRosterIfAbsent(path, '{"roster":{}}\n'),
+      /target exists but is not a regular file/u,
+    );
+    assert.equal(readdirSync(dirname(path)).some((entry) => entry.endsWith('.roster.tmp')), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('crew roster installation probes existing targets before any temporary write and cleans partial temps', () => {
+  const home = mkdtempSync(join(tmpdir(), 'owenloop-setup-roster-write-safety-'));
+  try {
+    const path = crewRosterPath({ HOME: home }, 'ops');
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, '{"roster":{}}\n');
+    assert.equal(
+      installCrewRosterIfAbsent(path, '{"roster":{"build":[]}}\n', { tempName: () => { throw new Error('must not name a temp for an existing target'); } }),
+      'existing',
+    );
+
+    const fresh = crewRosterPath({ HOME: home }, 'new-ops');
+    const partial = join(dirname(fresh), '.partial.roster.tmp');
+    assert.throws(
+      () => installCrewRosterIfAbsent(fresh, '{"roster":{}}\n', {
+	tempName: () => '.partial.roster.tmp',
+	writeTemp: (temp, contents) => {
+	  writeFileSync(temp, contents.slice(0, 8), { flag: 'wx' });
+	  const error = Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+	  throw error;
+	},
+      }),
+      /disk full/u,
+    );
+    assert.equal(existsSync(partial), false, 'a failed short write leaves no partial setup temp');
+    assert.equal(existsSync(fresh), false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test('setup confines traversal-shaped hub crew names to encoded roster filenames', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const crew = '../../package';
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crew], t.io), 0, t.err.join('\n'));
+  const confined = crewRosterPath(t.io.env, crew);
+  assert.equal(existsSync(confined), true, 'the encoded file stays inside crews/');
+  assert.equal(existsSync(join(t.io.env.HOME!, 'package.json')), false, 'no traversal-shaped crew may escape config/crews');
+});
+
+test('setup records a bounded hash roster identity so its immediate doctor pass inspects a long unsafe crew', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  // 64 code points is hub-valid; the slash makes it unsafe as a literal path
+  // and the multibyte payload makes its reversible basename exceed one path
+  // component, exercising the bounded hash branch.
+  const crew = `../${'語'.repeat(61)}`;
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crew], t.io), 0, t.err.join('\n'));
+
+  const path = crewRosterPath(t.io.env, crew);
+  assert.match(path, /crew-hex-hash--/u);
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).crew, crew, 'the bounded filename has a machine-readable crew identity');
+  const summary = JSON.parse(t.out.join('\n')) as { doctor: { checks: Array<{ label: string }> } };
+  assert.ok(summary.doctor.checks.some((check) => check.label === `crew roster (${crew})`), 'setup\'s final doctor pass sees the newly-created hashed roster');
+});
+
+test('setup final doctor pass discovers a preserved nested legacy crew roster', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const crew = 'foo/bar';
+  const legacy = join(t.io.env.HOME!, '.owenloop', 'crews', 'foo', 'bar.json');
+  mkdirSync(dirname(legacy), { recursive: true });
+  writeFileSync(legacy, '{"roster":{}}\n');
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crew], t.io), 0, t.err.join('\n'));
+  const summary = JSON.parse(t.out.join('\n')) as { steps: Array<{ step: string; action: string; detail: string }>; doctor: { checks: Array<{ label: string }> } };
+  assert.ok(summary.steps.some((step) => step.step === 'crew rosters' && step.action === 'skipped' && step.detail.endsWith('/crews/foo/bar.json')));
+  assert.ok(summary.doctor.checks.some((check) => check.label === `crew roster (${crew})`), 'doctor sees the same nested legacy roster the resolver selects');
+});
+
+test('setup preserves a leading-separator legacy roster without creating an encoded duplicate', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const crew = '/bar';
+  const legacy = join(t.io.env.HOME!, '.owenloop', 'crews', 'bar.json');
+  const contents = '{"roster":{"build":[{"harness":"codex","model":"legacy","effort":"high"}]}}\n';
+  mkdirSync(dirname(legacy), { recursive: true });
+  writeFileSync(legacy, contents);
+
+  assert.equal(await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', crew], t.io), 0, t.err.join('\n'));
+  const summary = JSON.parse(t.out.join('\n')) as { steps: Array<{ step: string; action: string; detail: string }> };
+  assert.ok(summary.steps.some((step) => step.step === 'crew rosters' && step.action === 'skipped' && step.detail.endsWith('/crews/bar.json')));
+  assert.equal(readFileSync(legacy, 'utf8'), contents, 'the old strongest layer remains byte-identical');
+  assert.equal(existsSync(join(encodedCrewRosterDir(t.io.env), encodeCrewRosterFilename(crew))), false, 'setup did not materialize an encoded duplicate');
+});
+
+test('setup preserves a codec-looking nested legacy roster and materializes its distinct codec crew', async () => {
+  const { routes } = makeIdentityHub();
+  const { fetch } = routedFetch(routes);
+  const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+  const codecCrew = 'foo/bar';
+  const legacyCrew = `.owenloop-encoded-rosters/${encodeCrewRosterFilename(codecCrew).slice(0, -'.json'.length)}`;
+  const legacyPath = join(t.io.env.HOME!, '.owenloop', 'crews', `${legacyCrew}.json`);
+  const legacyContents = '{"roster":{"build":[{"harness":"codex","model":"legacy","effort":"high"}]}}\n';
+  mkdirSync(dirname(legacyPath), { recursive: true });
+  writeFileSync(legacyPath, legacyContents);
+
+  assert.equal(
+    await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', `${legacyCrew},${codecCrew}`], t.io),
+    0,
+    t.err.join('\n'),
+  );
+  const codecPath = crewRosterPath(t.io.env, codecCrew);
+  assert.notEqual(codecPath, legacyPath);
+  assert.equal(readFileSync(legacyPath, 'utf8'), legacyContents, 'the legacy strongest layer is never repurposed or overwritten');
+  assert.equal(JSON.parse(readFileSync(codecPath, 'utf8')).crew, codecCrew, 'the separately materialized codec file declares its owner');
+});
+
+test('setup materializes aliasing hub crews independently in both orders', async () => {
+  // `bar` and `foo/../bar` join-normalize onto the same legacy path. Setup
+  // stamps the owning crew into every file it creates, so whichever crew
+  // materializes first must not hand its strongest layer to the second.
+  for (const order of [['bar', 'foo/../bar'], ['foo/../bar', 'bar']]) {
+    const { routes } = makeIdentityHub();
+    const { fetch } = routedFetch(routes);
+    const t = makeIo({ fetch, onOpenUrl: driveCallback() });
+    assert.equal(
+      await mainAsync(['setup', '--hub', HUB, '--new-agent', 'buildbox', '--crews', order.join(',')], t.io),
+      0,
+      t.err.join('\n'),
+    );
+
+    const barPath = crewRosterPath(t.io.env, 'bar');
+    const aliasPath = crewRosterPath(t.io.env, 'foo/../bar');
+    assert.notEqual(aliasPath, barPath, `order ${order.join(',')}: aliasing crews own distinct files`);
+    assert.equal(barPath, join(t.io.env.HOME!, '.owenloop', 'crews', 'bar.json'));
+    assert.equal(aliasPath, join(encodedCrewRosterDir(t.io.env), encodeCrewRosterFilename('foo/../bar')));
+    assert.equal(JSON.parse(readFileSync(barPath, 'utf8')).crew, 'bar', `order ${order.join(',')}: bar's file declares bar`);
+    assert.equal(JSON.parse(readFileSync(aliasPath, 'utf8')).crew, 'foo/../bar', `order ${order.join(',')}: the alias file declares its own crew`);
+    const summary = JSON.parse(t.out.join('\n')) as { doctor: { checks: Array<{ label: string }> } };
+    assert.ok(summary.doctor.checks.some((check) => check.label === 'crew roster (bar)'));
+    assert.ok(summary.doctor.checks.some((check) => check.label === 'crew roster (foo/../bar)'), 'doctor reports both independent rosters');
+  }
 });
 
 test('setup: fresh machine interactive — injected prompt names the agent; empty answer accepts the hostname prefill', async () => {
@@ -507,7 +728,7 @@ test('setup plugin: missing bundled root prints instructions and performs no ins
   assertNoOlp(t);
 });
 
-// ---- signing keys: the [4/7] step -------------------------------------------
+// ---- signing keys: the [4/8] step -------------------------------------------
 
 /** The three canonical refs setup must ensure, for the fake hub's identity model
  *  (human actor `user_abc`, machine `local`, and the minted agent's hub id). */
@@ -519,7 +740,7 @@ function expectedRefs(origin: string, agentId: string) {
   ];
 }
 
-test('setup: [4/7] ensures exactly the three canonical refs in human→machine→agent order', async () => {
+test('setup: [4/8] ensures exactly the three canonical refs in human→machine→agent order', async () => {
   const { routes } = makeIdentityHub();
   const { fetch } = routedFetch(routes);
   const t = makeIo({ fetch, onOpenUrl: driveCallback() });

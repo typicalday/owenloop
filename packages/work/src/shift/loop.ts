@@ -74,6 +74,7 @@ import {
   type Liveness,
 } from './state.ts';
 import { DEFAULT_WORK_DIR_TTL_MS, sweepWorkDirs as sweepWorkDirsImpl } from '../agent/workdir.ts';
+import { withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { sessionsPath } from '../harness/session-store.ts';
 import type { Spawner } from './spawn.ts';
 import {
@@ -127,6 +128,12 @@ export interface ShiftLoopOptions {
   resolveOrderStep?: (order: WorkOrder) => Promise<FetchedStep | undefined>;
   pollIntervalMs: number;
   presenceIntervalMs: number;
+  /** Weak hub-roster cache refresh cadence; undefined disables refresh. */
+  rosterSyncIntervalMs?: number;
+  /** Upper bound for one low-priority refresh attempt. */
+  rosterSyncTimeoutMs?: number;
+  /** Daemon-owned cache write, injected so failure cannot kill the loop. */
+  syncRosters?: (signal: AbortSignal) => Promise<void>;
   /**
    * Max concurrent `agent-run` children (default 4). A SECOND budget, applied
    * ON TOP OF `cap` — never a replacement for it. An agent turn is long and
@@ -342,6 +349,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   // Park state persists across `iterate()` calls (the MCP park reuses it).
   let cursor: number | undefined;
   let lastPresence = Number.NEGATIVE_INFINITY;
+  // Runtime performs the required shift-start refresh before creating this
+  // loop. Start this cadence now so it is not immediately fetched twice.
+  let lastRosterSync = monotonicNow();
   let attendedAt: number | undefined;
   /**
    * Orders returned by `whats_next` are already claimed. If the hub returns more
@@ -1014,11 +1024,34 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     const backoffActiveAtStart = monotonicNow() < backoffUntil;
     let rateLimitedThisIteration = false;
 
+    // Hub roster cache refresh is low-priority operational work. Its absence is
+    // always a degraded read for children, never a reason to stop dispatch.
+    if (
+      !backoffActiveAtStart &&
+      opts.syncRosters !== undefined &&
+      opts.rosterSyncIntervalMs !== undefined &&
+      monotonicNow() - lastRosterSync >= opts.rosterSyncIntervalMs
+    ) {
+      try {
+	await withHubRosterSyncTimeout((signal) => opts.syncRosters!(signal), opts.rosterSyncTimeoutMs);
+      } catch (e) {
+	rateLimitedThisIteration = noteServerBackoff(e);
+	opts.err(`roster sync failed: ${errMsg(e)} (continuing)`);
+	emit({ type: 'hub-error', op: 'roster_sync', message: `roster sync failed: ${errMsg(e)} (continuing)` });
+      } finally {
+	// This is a periodic attempt cadence, not a success-only retry loop. A
+	// persistent non-429 failure must not make every 5s poll issue two more
+	// hub calls and append another durable failure record.
+	lastRosterSync = monotonicNow();
+      }
+    }
+
     // Presence when due (starts immediately — this shift exists to conduct).
     // A server backoff suppresses every hub poll, including presence, while local
     // reconciliation and queued dispatch continue below.
     if (
       !backoffActiveAtStart &&
+	!rateLimitedThisIteration &&
       monotonicNow() - lastPresence >= opts.presenceIntervalMs
     ) {
       // `setShift` and `noteAttended` force the next ping by setting

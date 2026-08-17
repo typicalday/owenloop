@@ -145,6 +145,18 @@ test('whoami GETs /api/whoami', async () => {
   assert.equal(res.orgId, 'o1');
 });
 
+test('getRosters and listHarnessModels map to their GET endpoints', async () => {
+  const captured: Captured[] = [];
+  const c = client(fakeFetch(captured, { body: { text: 'ok', global: {}, crews: [] } }));
+  const rosters = await c.getRosters!();
+  await c.listHarnessModels!();
+  assert.equal(captured[0]!.method, 'GET');
+  assert.equal(captured[0]!.url, 'https://hub.example/api/rosters');
+  assert.equal(captured[1]!.method, 'GET');
+  assert.equal(captured[1]!.url, 'https://hub.example/api/harness_models');
+  assert.deepEqual(rosters.global, {});
+});
+
 test('wake GETs /api/wake with the cursor in the query string when set', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'cursor=7 changed=true', cursor: 7, changed: true } }));

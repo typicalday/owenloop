@@ -14,6 +14,7 @@ import { performance } from 'node:perf_hooks';
 import { createHubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
+import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createShiftLoop, type ShiftLoop } from './loop.ts';
 import { createShiftLogSink } from './logsink.ts';
@@ -43,6 +44,7 @@ const DEFAULT_CAP = 3;
 const DEFAULT_POLL_MS = 5_000;
 const DEFAULT_MAX_AGENTS = 4;
 const DEFAULT_PRESENCE_MS = 60_000;
+const DEFAULT_ROSTER_SYNC_MS = 15 * 60_000;
 
 /**
  * Record types written to the LOG FILE but never delivered over the socket.
@@ -514,6 +516,18 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     }
   };
 
+  // The agent-run child must stay completely offline. Refresh before entering
+  // the park loop, but let an unavailable hub degrade to machine layers. The
+  // durable error is buffered until after `parked`: a parked shift's first log
+  // record is its self-describing identity, even when this refresh fails.
+  let startupRosterSyncFailure: string | undefined;
+  try {
+    await withHubRosterSyncTimeout((signal) => syncHubRosterCache({ client: hub, env, origin, account, signal }));
+  } catch (error) {
+    startupRosterSyncFailure = `roster sync failed at shift start: ${errMsg(error)} (continuing)`;
+    process.stderr.write(`${roleLabel}: ${startupRosterSyncFailure}\n`);
+  }
+
   const reportWorkerFailure = (failure: WorkerFailure): void => {
     // A worker failure is detected by the SPAWNER's `exit`/`error` listener, not
     // inside the loop's sweep, so it never passes through the loop's `emit()`.
@@ -577,6 +591,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     resolveOrderStep,
     pollIntervalMs,
     presenceIntervalMs: DEFAULT_PRESENCE_MS,
+    rosterSyncIntervalMs: DEFAULT_ROSTER_SYNC_MS,
+    rosterSyncTimeoutMs: DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS,
+    syncRosters: (signal) => syncHubRosterCache({ client: hub, env, origin, account, signal }),
     maxConcurrentAgents,
     workRoot,
     ...(workRepo !== undefined ? { workRepo } : {}),
@@ -622,6 +639,12 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     );
   };
 
+  const emitStartupRosterSyncFailure = (): void => {
+    if (startupRosterSyncFailure === undefined) return;
+    consumeEvent(stamp({ type: 'hub-error', op: 'roster_sync', message: startupRosterSyncFailure }));
+    startupRosterSyncFailure = undefined;
+  };
+
   if (daemonMode) {
     daemon = createShiftDaemon({
       socketPath: options.socketPath ?? join(stateDir, 'shift.sock'),
@@ -647,6 +670,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     if (parsed.once !== true) {
       process.stdout.write(`owenloop shift: parked as '${name}' @ ${origin} (cap ${cap})\n`);
       emitParked();
+      emitStartupRosterSyncFailure();
+    } else {
+      emitStartupRosterSyncFailure();
     }
     return daemon.run();
   }
@@ -655,6 +681,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
   if (parsed.once !== true) {
     process.stdout.write(`owenloop work shift: parked as '${name}' @ ${origin} (cap ${cap})\n`);
     emitParked();
+    emitStartupRosterSyncFailure();
+  } else {
+    emitStartupRosterSyncFailure();
   }
   return loop.run();
 }

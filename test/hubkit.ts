@@ -362,7 +362,7 @@ export interface MakeIoOpts {
   /** Optional resolver seam for the missing-bundled-marketplace setup case. */
   resolveBundledMarketplaceRoot?: (harness: HarnessId) => string | null;
   /**
-   * Signing-key manager seam for setup's `[4/7] signing keys` step. Default: a
+   * Signing-key manager seam for setup's `[4/8] signing keys` step. Default: a
    * fresh in-memory fake (`makeFakePrincipalKeys`) so setup tests never touch the
    * real ssh-keygen/Keychain/agent/$HOME. Pass `'real'` to opt into the real
    * `PrincipalKeyManager` (only for tests that deliberately exercise it with a

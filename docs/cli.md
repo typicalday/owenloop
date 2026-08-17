@@ -73,7 +73,13 @@ for the full breakdown.
 | `setup [--hub <url>] [--new-agent <name> \| --replace-agent <name>] [--crews <a,b>] [--scopes <a,b>] [--reuse-ssh-key <path>]` | onboard this machine: may store human and Scoped Identity credentials, ensure the three principal signing keys, relay the machine enrollment grant, write only execution-settings `hubOrigin`, and converge the bundled plugins for Claude Code and Codex — see [`setup`](#setup--onboard-a-machine) |
 | `enrollments [--hub <url>]` | read and locally classify the hub's relayed machine enrollment grants; never creates keys or writes the roster — see [`enrollments`](#enrollments--inspect-machine-enrollment) |
 | `doctor [--hub <url>]` | read-only check of this machine's owenloop install, one ✓/✗ line per piece — see [`doctor`](#doctor--check-a-machines-install) |
-| `roster show [crew]` | print the merged **crew roster** and the provenance of every selected candidate layer |
+| `roster show [crew]` | print the offline merged **crew roster**, all inspected machine and cached-hub layers, winner provenance, cache age, and shadowed rows |
+| `roster org [--hub <url>]` | read the live hub org-global and per-crew rosters (human credential) |
+| `roster org put <capability> --candidate <harness>:<model>:<effort>… [--crew <name>] [--hub <url>]` | replace one org-global or named crew roster row (human admin credential) |
+| `roster org rm <capability> [--crew <name>] [--hub <url>]` | remove one org-global or named crew roster row (human admin credential) |
+| `roster registry [--hub <url>]` | read the hub's known harnesses, models, and efforts (human credential) |
+| `roster registry put <harness> [--model <model>:<effort,effort…>]… [--display-name <text>] [--hub <url>]` | replace one harness's full hub model snapshot (human admin credential); omit every `--model` to clear it |
+| `roster sync [--hub <url>] [--as agent\|agent:<account>]` | refresh the local hub-roster cache explicitly with the same agent credential a shift uses |
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
 | `work <subcommand> [options]` | run the execution-side CLI companion — see [`work`](#work--execution-side-cli-companion) |
@@ -264,14 +270,24 @@ the harness, model, and effort for an agent order. Its precedence is:
 3. the verified step's `x.harness.id`;
 4. the first registered adapter.
 
-The shift passes its start crews to each agent worker internally. A named crew
-uses `~/.owenloop/crews/<crew>.json` above the machine-global
-`~/.owenloop/settings.json` `roster` key. Each capability row is atomic:
+The shift passes its start crews to each agent worker internally. The complete
+strongest-first cascade is: machine `~/.owenloop/crews/<crew>.json`, machine
+`~/.owenloop/settings.json` `roster`, the cached hub row for that crew, then
+the cached hub org-global row. Hub rows live in a separate
+`~/.owenloop/hub-rosters/` cache directory — never in the D5 trust
+`~/.owenloop/roster/` directory. Each capability row is atomic:
 the stronger layer replaces the weaker candidate array, and candidates are
 tried in listed order. A step's `x.harness.id` is a policy constraint: a row
 whose candidates do not include it is released as
 `incompatible-harness-policy`; no available candidate is
 `unresolvable-capability`.
+
+The shift refreshes that hub cache at startup and periodically while parked;
+`owenloop roster sync` is the manual repair path. Failed refreshes never stop a
+shift or refuse an order: a missing or corrupt cache becomes an explicitly
+reported absent layer and the machine rows keep routing. `owenloop roster show`
+is offline by design, so it prints exactly the layers an `agent-run` child can
+see, including fetch age and any lower-priority rows shadowed by a winner.
 
 ```json
 {
@@ -304,6 +320,40 @@ winning-layer provenance, and every layer inspected (including an absent crew
 file). `owenloop doctor` adds one line for each present crew roster file,
 showing its found/absent layers and registered versus missing candidate
 harnesses.
+
+Crew names are data, not filesystem paths. A fresh safe crew keeps the literal
+`~/.owenloop/crews/<crew>.json` filename for rollback compatibility. Unsafe or
+too-wide names use the dedicated codec-only
+`~/.owenloop/crews/.owenloop-machine-roster-codec-namespace-reserved-v1-ownership/`
+directory: short names use a reversible `crew-hex--<lowercase-hex>.json` basename,
+while names too wide for one filesystem component use a bounded
+`crew-hex-hash--…` basename. The current codec's distinct `crew-hex--` prefix
+and lowercase hexadecimal payload keep it disjoint from older base64url files
+and stable on case-insensitive filesystems; explicitly owned older
+`crew--<base64url>.json` files remain readable during migration. Every codec
+file records its exact `crew` identity in
+the JSON document, so a reversible basename alone can never claim an old
+legacy file. Do not derive either filename by hand. The reserved directory
+itself can be the prefix of a valid 64-character nested legacy crew name, so a
+file inside it is codec storage only when its JSON `crew` identity reproduces
+its codec basename; a shorter unowned child remains a legacy path. A complete
+codec path is nevertheless too long to be a hub-valid legacy crew name.
+Existing safe legacy
+`<crew>.json` files — including names containing spaces, colons, percent
+signs, Unicode, and (on POSIX) backslashes — plus any lexically contained
+legacy tree such as `crews/foo/bar.json` for crew `foo/bar` — remain readable
+and take precedence only when their on-disk spelling exactly matches the crew,
+so `Delivery` and `delivery` cannot silently share one strongest layer on a
+case-insensitive filesystem. The short-lived feature-branch directory
+`.owenloop-encoded-rosters/` is treated as codec storage only when a file
+declares the codec basename's exact `crew`; otherwise it remains a legacy
+nested path. A literal crew name that spells an owned historical codec file is
+distinct from that file's declared owner and receives its own current codec
+path, never an alias of the historical strongest layer.
+Routing probes only its requested crew paths. Doctor combines global file
+diagnostics with the verified agent's crew list, so a malformed bounded hash
+file is reported rather than silently disappearing. Traversal-shaped hub crew
+names stay confined to the `crews/` directory.
 
 A clean start or `--once` completion exits `0`. `owenloop shift --help` also
 exits `0`. Runtime failures such as credential reads or socket/runtime setup
@@ -2402,7 +2452,7 @@ lines (the tolerant-false notices, the transfer summary) go to stderr only.
 
 ## `setup` — onboard a machine
 
-`owenloop setup` is the one-shot onboarding command. It runs seven ordered steps.
+`owenloop setup` is the one-shot onboarding command. It runs eight ordered steps.
 Depending on the machine state, setup may store the human credential, mint or
 rekey and store a Scoped Identity credential, ensure the three principal
 signing keys, relay a signed machine enrollment grant, and write only
@@ -2429,7 +2479,15 @@ plugin version already installed performs no plugin writes. The steps:
 5. **execution settings** — write only `hubOrigin` into the execution settings
    file so the local Step Agent talks to this hub, preserving every other key
    (skipped when `hubOrigin` already matches).
-6. **plugin** — probe and converge the bundled `owenloop` plugin separately
+6. **crew rosters** — for every crew known to the verified or newly minted
+   Scoped Identity, materialize a local strongest-layer skeleton at its resolved
+   `crews/<crew>.json` path. Each new file contains a descriptive `note`, its
+   exact `crew` identity when needed by the bounded filename codec, and
+   `"roster": {}`, so the machine initially inherits the weaker settings and
+   hub layers. Setup never overwrites an existing acceptable crew-roster file:
+   it reports that file as skipped and leaves its bytes untouched. If setup does
+   not know any crews for the identity, it records a non-fatal noted result.
+7. **plugin** — probe and converge the bundled `owenloop` plugin separately
    for Claude Code and Codex. When the installed plugin is missing or its
    version differs from the CLI package, setup adds the bundled marketplace
    when needed and installs or updates the plugin. Claude Code uses
@@ -2440,10 +2498,10 @@ plugin version already installed performs no plugin writes. The steps:
    **Non-fatal:** a missing harness or failed convergence is reported as
    `noted` and never fails setup. If the bundled marketplace root is
    unavailable, setup prints manual commands instead.
-7. **doctor** — a final [`doctor`](#doctor--check-a-machines-install) pass over
+8. **doctor** — a final [`doctor`](#doctor--check-a-machines-install) pass over
    the same surfaces, whose result becomes setup's exit code.
 
-Progress lines (the `[n/7]` headers and `✓`/`✗` marks) go to **stderr**; the
+Progress lines (the `[n/8]` headers and `✓`/`✗` marks) go to **stderr**; the
 final machine-readable summary — `{ ok, hub, steps, doctor }` — goes to
 **stdout**.
 
@@ -2733,7 +2791,7 @@ or set, not from inference.
 
 ### Tools
 
-The server exposes 17 baseline tools mirroring the hub's own MCP toolset, plus
+The server exposes 19 baseline tools mirroring the hub's own MCP toolset, plus
 `create_agent`, plus four [crew](#crews) tools (`list_crews`, `create_crew`,
 `add_crew_member`, `remove_crew_member`) that do not mirror the hub's own MCP
 toolset. Each baseline tool's result is the hub REST response as one text
@@ -2757,6 +2815,8 @@ block; a non-2xx response comes back as an error result.
 | `list_subscriptions` | the org's contract subscriptions |
 | `presence_ping` | register/refresh this Shift's presence — name, crews served (empty/omitted `serve_crews` means every crew this principal belongs to), and optionally which process incarnation is reporting (`shift_id`/`started_at`); observability only, a separate mechanism from the `heartbeat` lease tool above |
 | `list_shifts` | your principal's registered Shifts — online/offline derived at read time from last ping, crews served (returned as `crews`; empty means every crew this principal belongs to), and each one's reporting incarnation (`shiftId`/`startedAt`) when the hub recorded one |
+| `get_rosters` | read the org-global and per-crew capability rosters available to this principal |
+| `list_harness_models` | read the org's registered harnesses, models, and supported efforts |
 | `wake` | cheap "has anything changed since cursor X" pre-check for a polling loop |
 | `create_agent` | create a NEW Scoped Identity and store its credential locally — **never returns the token** |
 | `list_crews` | list the org's crews, each with its member rows inline — a plain passthrough, no filtering |

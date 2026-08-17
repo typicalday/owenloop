@@ -70,7 +70,7 @@ child stderr is never interpolated into error text.
 | `machine` | the literal `"local"` |
 | `agent` | the agent identity id |
 
-`owenloop setup` step `[4/7] signing keys` ensures all three, in that order,
+`owenloop setup` step `[4/8] signing keys` ensures all three, in that order,
 idempotently: a second run performs zero writes.
 
 **One backend is selected once and never error-fallback.** A fallback after a

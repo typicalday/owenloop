@@ -27,6 +27,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { ASYNC_COMMANDS, classifyAddSource, COMMAND_OPTIONS, defaultIO, main, mainAsync, USAGE } from '../src/cli.ts';
 import type { CliIO } from '../src/cli.ts';
 import { ADD_JOURNAL_FILENAME } from '../src/add.ts';
+import { writeHubRosterCache } from '../packages/work/src/settings/hub-roster-cache.ts';
 import {
   defDigest,
   globalStoreRoot,
@@ -278,7 +279,7 @@ test('COMMAND_OPTIONS covers exactly the commands USAGE advertises', () => {
   assert.deepEqual([...tableKeys].sort(), [...advertised].sort());
 });
 
-test('roster show prints merged candidates, provenance, and absent layers', () => {
+test('roster show prints all four layers, cache age, shadowing, and degraded absence reasons', async () => {
   const home = mkdtempSync(join(tmpdir(), 'owenloop-roster-cli-'));
   try {
     const config = join(home, '.owenloop');
@@ -286,20 +287,36 @@ test('roster show prints merged candidates, provenance, and absent layers', () =
     mkdirSync(crews, { recursive: true });
     writeFileSync(
       join(config, 'settings.json'),
-      JSON.stringify({ roster: { build: [{ harness: 'global', model: 'g', effort: 'high' }] } }),
+      JSON.stringify({ hubOrigin: 'https://hub.example.test', roster: { build: [{ harness: 'global', model: 'g', effort: 'high' }] } }),
     );
     writeFileSync(
       join(crews, 'delivery.json'),
       JSON.stringify({ roster: { build: [{ harness: 'crew', model: 'c', effort: 'xhigh' }] } }),
     );
+    writeHubRosterCache(
+      { HOME: home },
+      {
+	version: 1,
+	origin: 'https://hub.example.test',
+	orgId: 'org_1',
+	orgName: 'Example',
+	account: 'default',
+	fetchedAt: Date.now() - 3_600_000,
+	global: {
+	  build: [{ harness: 'hub-global', model: 'g', effort: 'high' }],
+	  globalOnly: [{ harness: 'hub-global', model: 'only', effort: 'high' }],
+	},
+	crews: [{ crewId: 'crew_1', crewName: 'delivery', roster: { build: [{ harness: 'hub-crew', model: 'c', effort: 'high' }] } }],
+      },
+    );
     const out: string[] = [];
     const err: string[] = [];
     assert.equal(
-      main(['roster', 'show', 'delivery'], {
-        cwd: home,
-        env: { HOME: home },
-        out: (line) => out.push(line),
-        err: (line) => err.push(line),
+      await mainAsync(['roster', 'show', 'delivery'], {
+		cwd: home,
+		env: { HOME: home },
+		out: (line) => out.push(line),
+		err: (line) => err.push(line),
       }),
       0,
     );
@@ -307,6 +324,25 @@ test('roster show prints merged candidates, provenance, and absent layers', () =
     assert.match(out.join('\n'), /build:/u);
     assert.match(out.join('\n'), /harness=crew.*from machine crews\/delivery\.json/u);
     assert.match(out.join('\n'), /machine settings\.json: found/u);
+    assert.match(out.join('\n'), /hub crew delivery .*: found/u);
+    assert.match(out.join('\n'), /hub org-global .*: found/u);
+    assert.match(out.join('\n'), /; 1h ago/u);
+    assert.match(out.join('\n'), /shadowed:/u);
+    assert.match(out.join('\n'), /hub crew delivery .*shadowed/u);
+
+    rmSync(join(config, 'hub-rosters'), { recursive: true, force: true });
+    out.length = 0;
+    assert.equal(
+      await mainAsync(['roster', 'show', 'delivery'], {
+		cwd: home,
+		env: { HOME: home },
+		out: (line) => out.push(line),
+		err: (line) => err.push(line),
+      }),
+      0,
+    );
+    assert.match(out.join('\n'), /hub crew delivery \(unavailable: no cache file/u);
+    assert.match(out.join('\n'), /hub org-global \(unavailable: no cache file/u);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
