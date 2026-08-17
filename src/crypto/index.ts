@@ -214,13 +214,14 @@ export {
 } from './scope.ts';
 export type { ScopeAxis } from './scope.ts';
 export {
-  loadRoster,
+  loadGrants,
   loadRevocations,
   orgRootPrivateKeyPath,
   orgRootPublicKeyPath,
   resolveOrgRoot,
   revocationsDir,
-  rosterDir,
+  grantsDir,
+  StrandedLegacyGrantsError,
 } from './org-root.ts';
 export type { OrgRootAbsent, OrgRootPresent, OrgRootResolution } from './org-root.ts';
 

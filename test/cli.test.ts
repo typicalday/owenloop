@@ -182,7 +182,7 @@ test('trust init, grant, and revoke mint offline DSSE records under the injected
   assert.equal(grant.code, 0, grant.err);
   const grantResult = grant.json();
   assert.match(grantResult.keyid, /^SHA256:[A-Za-z0-9+/]{43}$/);
-  assert.equal(grantResult.path.startsWith(join(config, 'roster')), true);
+  assert.equal(grantResult.path.startsWith(join(config, 'grants')), true);
   const grantEnvelope = JSON.parse(readFileSync(grantResult.path, 'utf8'));
   assert.equal(grantEnvelope.payloadType, 'application/vnd.owenloop.enrollment-grant.v1+json');
   const grantRecord = JSON.parse(Buffer.from(grantEnvelope.payload, 'base64').toString('utf8'));
@@ -215,8 +215,40 @@ test('trust init, grant, and revoke mint offline DSSE records under the injected
   const revokeRecord = JSON.parse(Buffer.from(revokeEnvelope.payload, 'base64').toString('utf8'));
   assert.equal(revokeRecord.reason, 'test rotation');
   assert.equal(revokeRecord.effectiveFrom, 0);
-  assert.equal(readdirSync(join(config, 'roster')).length, 1);
+  assert.equal(readdirSync(join(config, 'grants')).length, 1);
   assert.equal(readdirSync(join(config, 'revocations')).length, 1);
+});
+
+test('trust grant refuses when legacy grants have not been migrated', async () => {
+  const { run, config } = makeTrustCli();
+  const init = await run('trust', 'init');
+  assert.equal(init.code, 0, init.err);
+  const initRecord = init.json();
+  const legacy = join(config, 'roster');
+  mkdirSync(legacy, { recursive: true });
+  writeFileSync(join(legacy, 'producer.grant.dsse'), 'legacy grant');
+
+  const grant = await run(
+    'trust',
+    'grant',
+    '--key',
+    initRecord.publicKey,
+    '--principal',
+    'machine:worker',
+    '--pools',
+    'marketing',
+    '--labels',
+    'billing',
+    '--namespaces',
+    'default',
+    '--delegate',
+    '0',
+  );
+  assert.equal(grant.code, 1);
+  assert.match(grant.err, /\.owenloop[/\\]grants/);
+  assert.match(grant.err, /\.owenloop[/\\]roster/);
+  assert.match(grant.err, /mv /);
+  assert.equal(existsSync(join(config, 'grants')), false);
 });
 
 // ---- unknown-option rejection (before any side effect) ----------------------

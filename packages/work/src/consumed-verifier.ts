@@ -17,8 +17,9 @@ import {
 } from '../../../src/store/pre-commit-verifier.ts';
 import {
   loadRevocations,
-  loadRoster,
+  loadGrants,
   resolveOrgRoot,
+  StrandedLegacyGrantsError,
 } from '../../../src/crypto/org-root.ts';
 import {
   verifyConsumed,
@@ -161,9 +162,15 @@ export function createConsumedVerifier(args: CreateConsumedVerifierArgs): Consum
     let revocations: Uint8Array[];
     try {
       root = resolveOrgRoot(args.env);
-      grants = loadRoster(args.env);
+      grants = loadGrants(args.env);
       revocations = loadRevocations(args.env);
     } catch (error) {
+      if (error instanceof StrandedLegacyGrantsError) {
+	return {
+	  ok: false,
+	  reason: `consumed artifact gate refusal for ${order.workflow}/${order.run} step '${order.step}': ${error.message}`,
+	};
+      }
       const reason = `prerequisite: local producer trust material could not be loaded: ${errorText(error)}`;
       const warnings: string[] = [];
       for (const path of Object.keys(order.consumes)) {

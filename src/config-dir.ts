@@ -1,7 +1,7 @@
 /**
  * The ONE resolver for owenloop's own user-level config directory — the
  * directory that directly holds `settings.json`, `credentials.json`,
- * `allowed_signers`, `org-root.pub`, `roster/`, and `revocations/`.
+ * `allowed_signers`, `org-root.pub`, `grants/`, and `revocations/`.
  *
  * WHY THIS MODULE EXISTS. Until now four call sites each re-derived the same
  * ladder, which made it too easy for each subsystem to resolve a different

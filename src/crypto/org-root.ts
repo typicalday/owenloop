@@ -27,26 +27,75 @@ export type OrgRootResolution = OrgRootPresent | OrgRootAbsent;
 
 function orgRootDir(env: Record<string, string | undefined>): string {
   // allowedSignersPath is the established injected-env resolver. Its dirname
-  // is exactly <config>/owenloop for both XDG_CONFIG_HOME and HOME fallback.
+  // is exactly <config>.
   return dirname(allowedSignersPath(env));
 }
 
-/** `<config>/owenloop/org-root.pub`, the public local trust anchor. */
+/** `<config>/org-root.pub`, the public local trust anchor. */
 export function orgRootPublicKeyPath(env: Record<string, string | undefined>): string {
   return join(orgRootDir(env), 'org-root.pub');
 }
 
-/** `<config>/owenloop/org-root`, the private anchor path. */
+/** `<config>/org-root`, the private anchor path. */
 export function orgRootPrivateKeyPath(env: Record<string, string | undefined>): string {
   return join(orgRootDir(env), 'org-root');
 }
 
-/** `<config>/owenloop/roster`, containing enrollment-grant envelopes. */
-export function rosterDir(env: Record<string, string | undefined>): string {
+/** `<config>/grants`, containing enrollment-grant envelopes. */
+export function grantsDir(env: Record<string, string | undefined>): string {
+  return join(orgRootDir(env), 'grants');
+}
+
+/** The pre-rename grants directory. Probed only to refuse; never read. */
+function legacyGrantsDir(env: Record<string, string | undefined>): string {
   return join(orgRootDir(env), 'roster');
 }
 
-/** `<config>/owenloop/revocations`, containing revocation envelopes. */
+/**
+ * Count entries named `*.grant.dsse`, by name only, never throwing.
+ *
+ * This is a diagnostic hint, not a resolution target. Counting by name
+ * regardless of entry type ensures even a symlinked legacy entry signals that
+ * the operator has grants that require an explicit migration.
+ */
+function countGrantFiles(dir: string): number {
+  try {
+    return readdirSync(dir).filter((name) => name.endsWith('.grant.dsse')).length;
+  } catch {
+    return 0;
+  }
+}
+
+/** Thrown when grants exist only under the pre-rename directory. */
+export class StrandedLegacyGrantsError extends Error {
+  override readonly name = 'StrandedLegacyGrantsError';
+  readonly grantsPath: string;
+  readonly legacyPath: string;
+  readonly legacyCount: number;
+
+  constructor(grantsPath: string, legacyPath: string, legacyCount: number) {
+    super(
+      `enrollment grants are stranded in the pre-rename directory: '${grantsPath}' holds no *.grant.dsse files, ` +
+      `but '${legacyPath}' holds ${legacyCount}. owenloop reads only '${grantsPath}' and will not move your ` +
+      `cryptographic material for you. Run:  mv '${legacyPath}' '${grantsPath}'  ` +
+      'then restart every running owenloop shift daemon.',
+    );
+    this.grantsPath = grantsPath;
+    this.legacyPath = legacyPath;
+    this.legacyCount = legacyCount;
+  }
+}
+
+/** Refuse when the new grants directory is empty and the old one is not. */
+export function assertNoStrandedLegacyGrants(env: Record<string, string | undefined>): void {
+  const grants = grantsDir(env);
+  if (countGrantFiles(grants) > 0) return;
+  const legacy = legacyGrantsDir(env);
+  const count = countGrantFiles(legacy);
+  if (count > 0) throw new StrandedLegacyGrantsError(grants, legacy, count);
+}
+
+/** `<config>/revocations`, containing revocation envelopes. */
 export function revocationsDir(env: Record<string, string | undefined>): string {
   return join(orgRootDir(env), 'revocations');
 }
@@ -83,9 +132,11 @@ function loadEnvelopeDirectory(path: string, suffix: string, label: string): Uin
   return result;
 }
 
-/** Load sorted `.grant.dsse` bytes from the injected roster directory. */
-export function loadRoster(env: Record<string, string | undefined>): Uint8Array[] {
-  return loadEnvelopeDirectory(rosterDir(env), '.grant.dsse', 'roster');
+/** Load sorted `.grant.dsse` bytes from the injected grants directory. */
+export function loadGrants(env: Record<string, string | undefined>): Uint8Array[] {
+  const grants = loadEnvelopeDirectory(grantsDir(env), '.grant.dsse', 'grants');
+  if (grants.length === 0) assertNoStrandedLegacyGrants(env);
+  return grants;
 }
 
 /** Load sorted `.revocation.dsse` bytes from the injected revocation directory. */

@@ -719,15 +719,21 @@ layout is:
 ```text
 <config>/org-root.pub                     # public anchor, 0644
 <config>/org-root                         # private anchor, 0600
-<config>/roster/<sha256hex(keyid)>.grant.dsse
+<config>/grants/<sha256hex(keyid)>.grant.dsse
 <config>/revocations/<sha256hex(keyid)>.revocation.dsse
 ```
 
 The root key is stored outside `PrincipalKeyManager` because the root is not a
 hub-scoped principal key. The containing directory is `0700`; the private root
-is never returned by the library or placed in an envelope. `loadRoster` and
+is never returned by the library or placed in an envelope. `loadGrants` and
 `loadRevocations` return raw envelope bytes to the pure validator and refuse
 symlinked or non-regular files.
+
+If `<config>/grants` is absent or contains no `*.grant.dsse` files while the
+pre-rename `<config>/roster` holds grants, owenloop refuses rather than treating
+the machine as unenrolled. It never reads or moves that legacy directory; the
+operator must run `mv '<config>/roster' '<config>/grants'` and restart running
+owenloop shift daemons.
 
 ## Admin-signed policy floors
 

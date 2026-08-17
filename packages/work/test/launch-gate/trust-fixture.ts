@@ -181,20 +181,20 @@ export function submissionProof(args: {
 }
 
 export function installProducerGrant(fixture: TrustFixture, scope: GrantScope = unrestrictedScope): void {
-  const roster = join(fixture.configHome, '.owenloop', 'roster');
-  mkdirSync(roster, { recursive: true, mode: 0o700 });
+  const grants = join(fixture.configHome, '.owenloop', 'grants');
+  mkdirSync(grants, { recursive: true, mode: 0o700 });
   writeFileSync(
-    join(roster, 'producer.grant.dsse'),
+    join(grants, 'producer.grant.dsse'),
     grantEnvelope(fixture.producer, fixture.root.keyid, scope),
     { mode: 0o600 },
   );
 }
 
 export function installAlternateGrant(fixture: TrustFixture, scope: GrantScope = unrestrictedScope): void {
-  const roster = join(fixture.configHome, '.owenloop', 'roster');
-  mkdirSync(roster, { recursive: true, mode: 0o700 });
+  const grants = join(fixture.configHome, '.owenloop', 'grants');
+  mkdirSync(grants, { recursive: true, mode: 0o700 });
   writeFileSync(
-    join(roster, 'alternate.grant.dsse'),
+    join(grants, 'alternate.grant.dsse'),
     grantEnvelope(fixture.alternate, fixture.root.keyid, scope),
     { mode: 0o600 },
   );
