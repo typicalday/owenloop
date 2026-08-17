@@ -49,7 +49,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import type { SDKAssistantMessage, SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
 import { codexAdapter } from '../src/harness/codex.ts';
 import { consumeTurn } from '../src/harness/claude.ts';
@@ -354,7 +354,7 @@ async function* asStream(messages: readonly SDKMessage[]): AsyncIterable<SDKMess
 /** The session id every message in the recording carries. */
 const CLAUDE_SESSION = '03030303-0303-4030-8030-030303030303';
 
-test('the recorded SDK stream maps to exactly one progress line and one turn_ended', async () => {
+test('the recorded SDK stream maps the init line, the assistant turn, and turn_ended', async () => {
   const events: AgentEvent[] = [];
   const inits: string[] = [];
   const outcome = await consumeTurn(
@@ -370,35 +370,40 @@ test('the recorded SDK stream maps to exactly one progress line and one turn_end
   assert.deepEqual(outcome, { sessionId: CLAUDE_SESSION, sawResult: true });
   assert.deepEqual(
     events.map((e) => e.kind),
-    ['progress', 'turn_ended'],
+    ['progress', 'progress', 'turn_ended'],
+  );
+  assert.ok(
+    claudeMessages().some((m) => m.type === 'assistant'),
+    'a successful turn always carries the model turn itself',
   );
 
   // The init line is the ONLY place the vendor's version and credential source
   // are observable, and both are load-bearing: the version drives the upgrade
   // workflow in `docs/agent-runner.md`, and `apiKeySource` is how an operator
   // tells a subscription-OAuth run from one that is billing an API key.
-  const text = progress(events);
-  assert.match(text, /cliVersion=2\.1\.220/);
-  assert.match(text, /apiKeySource=none/);
-  assert.match(text, /model=claude-opus-5/);
-  assert.match(text, /permissionMode=bypassPermissions/);
+  const initText = events[0]?.kind === 'progress' ? events[0].text : '';
+  assert.match(initText, /cliVersion=2\.1\.220/);
+  assert.match(initText, /apiKeySource=none/);
+  assert.match(initText, /model=claude-opus-5/);
+  assert.match(initText, /permissionMode=bypassPermissions/);
   // `mcp_servers` is read field-by-field, so a rename would surface as
   // `undefined=undefined` here rather than as a silent blank in production.
-  assert.match(text, /mcp=\[owenloop=pending\]/);
+  assert.match(initText, /mcp=\[owenloop=pending\]/);
+  assert.match(events[1]?.kind === 'progress' ? events[1].text : '', /^assistant: /);
 });
 
-test('message types the mapping does not know are ignored, not thrown on', async () => {
+test('message types outside the mapped set are ignored, not thrown on', async () => {
   const messages = claudeMessages();
   const unmapped = messages.filter(
-    (m) => m.type !== 'result' && !(m.type === 'system' && m.subtype === 'init'),
+    (m) =>
+      m.type !== 'result' &&
+      m.type !== 'assistant' &&
+      m.type !== 'user' &&
+      !(m.type === 'system' && m.subtype === 'init'),
   );
   // Guard the guard: if a re-recording ever contained ONLY init and result this
   // test would pass while testing nothing.
   assert.ok(unmapped.length >= 3, `recording carries ${unmapped.length} unmapped messages`);
-  assert.ok(
-    messages.some((m) => m.type === 'assistant'),
-    'a successful turn always carries the model turn itself',
-  );
 
   const events: AgentEvent[] = [];
   await consumeTurn(asStream(unmapped), (e) => events.push(e));
@@ -407,6 +412,76 @@ test('message types the mapping does not know are ignored, not thrown on', async
   // threw on an unrecognized type would turn a routine CLI upgrade into a
   // failed order, so silence is the required behavior, not an oversight.
   assert.deepEqual(events, []);
+});
+
+test('tool calls log their name and id, never their secret-bearing inputs', async () => {
+  // DERIVED, NOT RECORDED. The recording proves the adapter handles a real SDK
+  // stream, but carries no tool call or tool result. These messages retain the
+  // recording's actual assistant envelope while adding the security-critical
+  // content blocks the recording cannot provide.
+  const messages = claudeMessages();
+  const assistant = messages.find((m): m is SDKAssistantMessage => m.type === 'assistant');
+  assert.ok(assistant, 'recording carries an assistant message to derive from');
+  const resultAt = messages.findIndex((m) => m.type === 'result');
+  assert.ok(resultAt >= 0, 'recording carries a result message after the assistant turn');
+
+  const toolAssistant: SDKAssistantMessage = {
+    ...assistant,
+    message: {
+      ...assistant.message,
+      content: [
+        { type: 'text', text: 'running the check', citations: null },
+        {
+          type: 'tool_use',
+          id: 'toolu_fixture_1',
+          name: 'Bash',
+          input: { command: 'echo SENTINEL_MUST_NOT_APPEAR' },
+        },
+      ],
+    },
+  };
+  const toolResult: SDKUserMessage = {
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'toolu_fixture_1', content: 'ok' }],
+    },
+    parent_tool_use_id: null,
+  };
+  messages.splice(resultAt, 0, toolAssistant, toolResult);
+
+  const events: AgentEvent[] = [];
+  await consumeTurn(asStream(messages), (e) => events.push(e));
+
+  const text = progress(events);
+  assert.match(text, /tool_use Bash toolu_fixture_1/);
+  assert.match(text, /tool_result toolu_fixture_1/);
+  assert.equal(
+    text.includes('SENTINEL_MUST_NOT_APPEAR'),
+    false,
+    'a secret-bearing tool argument reached the worker log',
+  );
+  assert.equal(text.includes('command'), false, 'a tool input field reached the worker log');
+});
+
+test('assistant progress text is capped and labels subagent output', async () => {
+  const assistant = claudeMessages().find((m): m is SDKAssistantMessage => m.type === 'assistant');
+  assert.ok(assistant, 'recording carries an assistant message to derive from');
+  const longAssistant: SDKAssistantMessage = {
+    ...assistant,
+    parent_tool_use_id: 'toolu_parent_1',
+    message: {
+      ...assistant.message,
+      content: [{ type: 'text', text: 'x'.repeat(5_000), citations: null }],
+    },
+  };
+  const events: AgentEvent[] = [];
+  await consumeTurn(asStream([longAssistant]), (e) => events.push(e));
+
+  const text = events[0]?.kind === 'progress' ? events[0].text : '';
+  assert.match(text, /^\[subagent toolu_parent_1\] assistant: /);
+  assert.ok(text.length < 2_100, `expected capped progress text, got ${text.length} characters`);
+  assert.ok(text.endsWith('…'));
 });
 
 test('a stream that ends before the result reports sawResult false and emits no turn_ended', async () => {
@@ -458,7 +533,7 @@ test('a failed result emits exited BEFORE turn_ended, carrying the errors', asyn
   // sequence, so the cause must arrive before the turn closes.
   assert.deepEqual(
     events.map((e) => e.kind),
-    ['progress', 'exited', 'turn_ended'],
+    ['progress', 'progress', 'exited', 'turn_ended'],
   );
   const exited = events.find((e) => e.kind === 'exited');
   assert.equal(exited?.kind === 'exited' ? exited.exitCode : 'wrong kind', null);
