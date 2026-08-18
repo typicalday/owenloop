@@ -1,6 +1,6 @@
 # `.wnlp` bundle format
 
-A `.wnlp` file packages one versioned package namespace, one or more named workflow definitions, and the regular files those definitions reference. The physical format is a gzip-compressed POSIX/PAX tar archive. Packing the same source bytes and canonical executable-bit choices produces identical archive bytes.
+A `.wnlp` file packages one versioned package namespace, one or more named workflow definitions, and the regular files those definitions reference. The physical format is a gzip-compressed POSIX/PAX tar archive. Packing the same source bytes and canonical executable-bit choices produces an identical uncompressed canonical tar and therefore an identical bundle digest. The gzip wrapper's compressed payload depends on the zlib implementation linked by the running Node process and is not part of the bundle identity.
 
 The bundle APIs are independent of the local workflow store and the network:
 
@@ -135,7 +135,7 @@ For every regular file:
 - Every entry's data padding, including the padding after a `PaxHeader` data record, is zero-filled.
 - The archive ends with exactly two zero blocks and no bytes after the terminator.
 
-The gzip wrapper uses compression level 9 and has no optional filename, comment, or extra fields. Gzip mtime bytes are zero, and gzip header byte 9 (the OS byte) is explicitly forced to zero so Darwin and Linux produce the same bytes.
+The gzip wrapper uses compression level 9 and has no optional filename, comment, or extra fields. Its magic, CM, FLG, MTIME, and OS ranges (bytes 0-1, 2, 3, 4-7, and 9) are fixed; mtime is zero and header byte 9 (the OS byte) is explicitly forced to zero. XFL (byte 8) comes from the linked zlib implementation and is intentionally not normalized. The compressed payload itself varies with the linked zlib implementation and is not the bundle identity; see the def digest above.
 
 The canonical tar contains regular-file entries only. Parent directories are implied by `/`-separated file paths and are never emitted as tar entries. The strict reader rejects archive symlink, hardlink, device, FIFO, socket, directory, and unknown entry types. The packer rejects source symlinks and non-regular filesystem nodes. Absolute paths, `.` segments, and `..` traversal are refused rather than normalized.
 

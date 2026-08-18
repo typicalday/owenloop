@@ -177,10 +177,15 @@ export function buildCanonicalTar(files: CanonicalFile[], limits: TarLimits = DE
 }
 
 /**
- * Gzip `tar` with fixed options and a normalized header: no FEXTRA/FNAME/
- * FCOMMENT, mtime bytes zeroed, OS byte forced to 0. Node's zlib reports
- * OS 19 on Darwin and embeds the clock in mtime by default — patch both so
- * the output is byte-identical across platforms and times.
+ * Gzip `tar` with fixed options and controlled header ranges: magic (bytes
+ * 0-1), CM (2), FLG (3), MTIME (4-7), and OS (9). No FEXTRA/FNAME/FCOMMENT
+ * fields are emitted. Node's zlib reports OS 19 on Darwin and embeds the clock
+ * in mtime by default, so patch bytes 4-7 and 9 to fixed values. XFL (byte 8)
+ * is supplied by zlib and deliberately left unnormalized.
+ *
+ * The compressed DEFLATE payload is not normalized: linked zlib builds can
+ * emit different valid streams for the same input. Bundle identity is the
+ * SHA-256 digest of the uncompressed canonical tar.
  */
 export function gzipDeterministic(tar: Uint8Array): Buffer {
   const gz = gzipSync(Buffer.from(tar), { level: BUNDLE_GZIP_LEVEL });

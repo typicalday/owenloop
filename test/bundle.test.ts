@@ -16,7 +16,7 @@ import {
   unpackBundle,
 } from '../src/bundle/index.ts';
 import { manifestToBytes, parseManifestBytes } from '../src/bundle/manifest.ts';
-import { buildCanonicalTar, collectSourceFiles } from '../src/bundle/tar.ts';
+import { BUNDLE_GZIP_LEVEL, buildCanonicalTar, collectSourceFiles, gzipDeterministic } from '../src/bundle/tar.ts';
 import { hostileData, hostileFileEntry, hostileHeader, hostilePaxBlocks, hostilePaxPathRecord, hostileTarball } from './helpers.ts';
 
 const ROOT = join(import.meta.dirname, '..');
@@ -84,13 +84,55 @@ test('manifest parser rejects duplicate keys, aliases, merges, tags, and prototy
   );
 });
 
-test('golden source packs to byte-identical archive and digest', () => {
+test('golden source packs to the byte-identical canonical archive and digest', () => {
   const packed = packBundle(SOURCE);
   assert.equal(packed.digest, GOLDEN_JSON.digest);
   assert.deepEqual(packed.entries, GOLDEN_JSON.entries);
-  assert.deepEqual(Buffer.from(packed.bytes), readFileSync(GOLDEN));
+
+  // This pins every byte the packer lays down: USTAR headers, canonical modes,
+  // PAX path records, ordering, padding, and the two-block terminator. The gzip
+  // DEFLATE stream is not compared because linked zlib implementations may
+  // encode this same canonical tar differently; bundle identity is its SHA-256.
+  assert.deepEqual(gunzipSync(packed.bytes), gunzipSync(readFileSync(GOLDEN)));
+
+  // Pin the header ranges Owenloop controls: magic/CM/FLG (bytes 0-3), MTIME
+  // (bytes 4-7), and OS (byte 9). XFL (byte 8) is zlib-owned and unnormalized.
+  const header = Buffer.from(packed.bytes.subarray(0, 10));
+  assert.deepEqual(header.subarray(0, 4), Buffer.from([0x1f, 0x8b, 0x08, 0x00]));
+  assert.deepEqual(header.subarray(4, 8), Buffer.alloc(4));
+  assert.equal(header[9], 0);
 
   const inspected = inspectBundle(packed.bytes);
+  assert.equal(inspected.digest, GOLDEN_JSON.digest);
+  assert.deepEqual(inspected.entries, GOLDEN_JSON.entries);
+});
+
+test('gzip uses the documented compression level and header normalization', () => {
+  const tar = gunzipSync(readFileSync(GOLDEN));
+  assert.equal(BUNDLE_GZIP_LEVEL, 9);
+
+  // This catches a hardcoded gzip level that drifts from the exported constant
+  // without re-pinning XFL (byte 8), which is owned by the linked zlib build.
+  const expected = gzipSync(tar, { level: BUNDLE_GZIP_LEVEL });
+  expected[4] = 0;
+  expected[5] = 0;
+  expected[6] = 0;
+  expected[7] = 0;
+  expected[9] = 0;
+  assert.deepEqual(gzipDeterministic(tar), expected);
+});
+
+test('bundle identity survives a different gzip compression of the same canonical tar', () => {
+  // Never re-pin this vector to one zlib build's DEFLATE output: compression of
+  // the same tar may differ while its bundle digest, entries, and manifest do not.
+  const golden = readFileSync(GOLDEN);
+  const tar = gunzipSync(golden);
+  const recompressed = gzipSync(tar, { level: 1 });
+
+  assert.notDeepEqual(Buffer.from(recompressed), golden);
+  assert.equal(digestBundle(recompressed).digest, GOLDEN_JSON.digest);
+
+  const inspected = inspectBundle(recompressed);
   assert.equal(inspected.digest, GOLDEN_JSON.digest);
   assert.deepEqual(inspected.entries, GOLDEN_JSON.entries);
 });
