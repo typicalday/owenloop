@@ -269,13 +269,18 @@ the harness, model, and effort for an agent order. Its precedence is:
 3. the verified step's `x.harness.id`;
 4. the first registered adapter.
 
-The shift advertises its start crews to the hub only through worker → hub
-`serve_crews`; it passes no crews to agent workers. For a capability-bearing
-order, the worker resolves rosters only from the hub-stamped `order.crews` list,
-in that stamped order. If the stamp is missing, empty, malformed, or cannot be
-resolved locally, the worker refuses and releases the order rather than falling
-back to the shift's start crews. The complete strongest-first cascade for each
-stamped crew is: machine `~/.owenloop/crews/<crew>.json`, machine
+The shift advertises its start crews through worker → hub `serve_crews` and
+its derived serving set through `serve_capabilities`. The latter is the raw
+key union from the roster cascade (bare names and exact compounds are both
+preserved), recomputed at startup and on the roughly 15-minute roster refresh;
+it is not operator-set. **Today's hub ignores `serve_capabilities`; the
+hub-side intersect ships separately.** The shift passes no crews to agent
+workers. For a capability-bearing order, the worker resolves rosters only from
+the hub-stamped `order.crews` list, in that stamped order. If the stamp is
+missing, empty, malformed, or cannot be resolved locally, the worker refuses
+and releases the order rather than falling back to the shift's start crews. The
+complete strongest-first cascade for each stamped crew is: machine
+`~/.owenloop/crews/<crew>.json`, machine
 `~/.owenloop/settings.json` `roster`, the cached hub row for that crew, then
 the cached hub org-global row. Hub rows live in a separate
 `~/.owenloop/hub-rosters/` cache directory — never in the D5 trust
@@ -2803,7 +2808,7 @@ block; a non-2xx response comes back as an error result.
 
 | tool | what it does |
 |---|---|
-| `whats_next` | tick a workflow and get the next work order(s), or the inbox of started instances |
+| `whats_next` | tick a workflow and get the next work order(s), or the inbox of started instances; optional `serve_capabilities` accepts raw advertised keys |
 | `submit` | submit a work order output |
 | `reject_artifact` | send an upstream artifact back to its producer with a reason |
 | `retry_artifact` | re-arm a stalled or rejected artifact to owed — the human stall-clear, and the answer path for a worker's `ask` |
@@ -2818,7 +2823,7 @@ block; a non-2xx response comes back as an error result.
 | `release` | give back a claim so its order is re-offered without waiting out the reap TTL |
 | `publish_event` | publish an event against a contract, starting one run per matched subscription |
 | `list_subscriptions` | the org's contract subscriptions |
-| `presence_ping` | register/refresh this Shift's presence — name, crews served (empty/omitted `serve_crews` means every crew this principal belongs to), and optionally which process incarnation is reporting (`shift_id`/`started_at`); observability only, a separate mechanism from the `heartbeat` lease tool above |
+| `presence_ping` | register/refresh this Shift's presence — name, crews served (empty/omitted `serve_crews` means every crew this principal belongs to), optional raw `serve_capabilities`, and optionally which process incarnation is reporting (`shift_id`/`started_at`); observability only, a separate mechanism from the `heartbeat` lease tool above |
 | `list_shifts` | your principal's registered Shifts — online/offline derived at read time from last ping, crews served (returned as `crews`; empty means every crew this principal belongs to), and each one's reporting incarnation (`shiftId`/`startedAt`) when the hub recorded one |
 | `get_rosters` | read the org-global and per-crew capability rosters available to this principal |
 | `list_harness_models` | read the org's registered harnesses, models, and supported efforts |

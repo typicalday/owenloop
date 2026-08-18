@@ -135,6 +135,11 @@ export interface ShiftLoopOptions {
   /** Daemon-owned cache write, injected so failure cannot kill the loop. */
   syncRosters?: (signal: AbortSignal) => Promise<void>;
   /**
+   * Compute the serving set for the live serve crews. Kept injectable so the
+   * loop does no filesystem work; absent means the legitimate empty set.
+   */
+  computeServeCapabilities?: (crews: readonly string[]) => string[];
+  /**
    * Max concurrent `agent-run` children (default 4). A SECOND budget, applied
    * ON TOP OF `cap` — never a replacement for it. An agent turn is long and
    * memory-heavy where a command is short, so the two cannot share one number.
@@ -195,6 +200,8 @@ export interface ShiftLoop {
    *  the next ping and the next sweep will carry. Empty `serveCrews` means ALL of
    *  this identity's crews, never none. */
   getShift(): { name: string; serveCrews: string[] };
+  /** The derived serving set currently advertised to the hub. */
+  getServeCapabilities(): string[];
   /** Set the live shift identity (the socket `clock_in` operation). A field left ABSENT is
    *  left unchanged; `serveCrews: []` explicitly means "all crews". Also makes the
    *  next presence ping due immediately, so the new identity reaches the hub on the
@@ -345,6 +352,26 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   // nor a caller of getShift/setShift can mutate the other's state afterward.
   let shiftName = opts.name;
   let serveCrews = [...opts.serveCrews];
+  let serveCapabilities: string[] = [];
+  let initial = true;
+
+  function refreshServeCapabilities(): void {
+    if (opts.computeServeCapabilities === undefined) return;
+    let next: string[];
+    try {
+      next = [...opts.computeServeCapabilities(serveCrews)];
+    } catch {
+      return; // Keep the last known-good advertisement on a transient failure.
+    }
+    const changed =
+      next.length !== serveCapabilities.length ||
+      next.some((capability, index) => capability !== serveCapabilities[index]);
+    serveCapabilities = next;
+    if (changed && !initial) opts.out(`serving ${next.length === 0 ? '(nothing)' : next.join(', ')}`);
+  }
+
+  refreshServeCapabilities();
+  initial = false;
 
   // Park state persists across `iterate()` calls (the MCP park reuses it).
   let cursor: number | undefined;
@@ -720,7 +747,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       instances = [opts.workflow];
     } else {
       try {
-        const inbox = await opts.hub.whatsNext();
+	const inbox = await opts.hub.whatsNext({ serve_capabilities: [...serveCapabilities] });
         instances = (inbox.instances ?? []).map((i) => i.workflow);
       } catch (e) {
 	noteServerBackoff(e);
@@ -765,7 +792,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       let res;
       const requestStartedAt = monotonicNow();
       try {
-        res = await opts.hub.whatsNext({ workflow: wf, serve_crews: serveCrews });
+	res = await opts.hub.whatsNext({
+	  workflow: wf,
+	  serve_crews: serveCrews,
+	  serve_capabilities: [...serveCapabilities],
+	});
       } catch (e) {
 	if (isNonServableRace(e)) {
 	  // Treat the targeted call as a successful empty observation for the
@@ -1043,6 +1074,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	// persistent non-429 failure must not make every 5s poll issue two more
 	// hub calls and append another durable failure record.
 	lastRosterSync = monotonicNow();
+	refreshServeCapabilities();
       }
     }
 
@@ -1065,6 +1097,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
         await opts.hub.presencePing({
           name: shiftName,
           serve_crews: serveCrews,
+	  serve_capabilities: [...serveCapabilities],
           ...(opts.shiftId !== undefined ? { shift_id: opts.shiftId } : {}),
           ...(opts.startedAt !== undefined ? { started_at: opts.startedAt } : {}),
           ...(attendedAt !== undefined ? { attended_at: attendedAt } : {}),
@@ -1206,9 +1239,13 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       cap = next;
     },
     getShift: () => ({ name: shiftName, serveCrews: [...serveCrews] }),
+    getServeCapabilities: () => [...serveCapabilities],
     setShift: (next: { name?: string; serveCrews?: string[] }) => {
       if (next.name !== undefined) shiftName = next.name;
-      if (next.serveCrews !== undefined) serveCrews = [...next.serveCrews];
+      if (next.serveCrews !== undefined) {
+	serveCrews = [...next.serveCrews];
+	refreshServeCapabilities();
+      }
       lastPresence = Number.NEGATIVE_INFINITY; // D6: next iterate() pings immediately
       presenceGeneration++; // survive an in-flight ping completing after this
       return { name: shiftName, serveCrews: [...serveCrews] };

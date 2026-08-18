@@ -218,9 +218,14 @@ candidate is `unresolvable-capability`.
 A shift start command names its crews, credentials, display identity, and
 state directory. It no longer carries an operator-selected harness or a
 per-shift config directory. Its crews are the worker → hub
-`serve_crews` narrowing advertisement; the shift passes NO crews to agent
-children. For a capability-bearing order, the hub stamps its matched crews on
-the order and the agent resolves those rosters in the stamped order.
+`serve_crews` narrowing advertisement. It also sends a derived
+`serve_capabilities` advertisement: the sorted raw keys from its effective
+merged rosters, with bare names and exact compounds mixed. `[]` means
+"clocked in, serving nothing." This can only narrow offers; it never grants
+authority, and the shift passes NO crews to agent children. **Today's hub
+ignores `serve_capabilities`; the hub-side intersect ships separately.** For a
+capability-bearing order, the hub stamps its matched crews on the order and the
+agent resolves those rosters in the stamped order.
 
 | Name | What it selects |
 |---|---|
@@ -252,11 +257,15 @@ updates it.
 **Step 2 — a shift asks for work.**
 
 The `openai-1` shift calls the hub verb `whats_next`, authenticating as
-account `shift-openai-1`.
+account `shift-openai-1`. Alongside its `serve_crews` scope it sends
+`serve_capabilities`: raw keys from the merged roster cascade. A bare key is
+not expanded locally, because the shift does not know the modifier vocabulary.
 
-**Step 3 — the hub works out what this caller can do.**
+**Step 3 — the hub works out what this caller is authorized to do today.**
 
-The hub does *not* read anything the shift sent about its abilities. Instead:
+Today's hub still ignores the shift's `serve_capabilities` field. The
+hub-side intersect-before-match is a separately shipped follow-up. Instead,
+the current hub:
 
 - it looks up which crews the account `shift-openai-1` belongs to;
 - it reads every `capability_routes` row for those crews;
@@ -274,8 +283,9 @@ The function is `listCapabilitiesForCrews(storage, memberCrewIds)`. For the
 The strings are shown alphabetically for readability; their order is not
 significant.
 
-This is why point 3 in section 1 matters: **eligibility comes entirely from
-crew membership.** A shift cannot claim, declare, or negotiate a capability.
+This is why point 3 in section 1 matters: **authority comes entirely from crew
+membership.** A shift can advertise a local offer filter, but cannot claim,
+declare, or negotiate authority for a capability.
 
 **Step 4 — the engine composes the posting.**
 
@@ -575,7 +585,7 @@ Each of these has actually happened. Each has a one-line correction.
 | "Name the crew after the job it performs — call the crew that builds `build`." | A crew is named after the **team**, never after the job. When `build` is both a capability and a crew name the two lookups become invisible, and the reader cannot tell the hub-side routing table (`capability_routes`) from the shift-side rate card (`roster`). Name crews `anthropic` and `openai`. |
 | "The capability says which model to use." | It says which *job*. The model comes from the shift's local `settings.json`, at the very last step. |
 | "`build:deep` belongs to the openai crew." | No — `build:deep` is *certified to* the `openai` crew. Certify a second crew for it and both are eligible. Nothing owns it. |
-| "A shift declares its capabilities." | It declares its **crew**. The hub derives capabilities from crew membership via `listCapabilitiesForCrews`. |
+| "A shift declares its capabilities." | A shift now advertises raw merged-roster keys as an offer filter, but that never grants authority. Authority remains crew-derived, and the worker's refusal backstop is unchanged. Today's hub ignores the field; the intersect ships separately. |
 | "The shift's positional crews decide an agent worker's roster." | No. They only advertise worker → hub `serve_crews`; the hub-stamped `order.crews` list resolves each capability-bearing order's roster sequence. |
 | "The shift that is clocked in has no rate for `build:deep`, so serve it something else." | Do not serve it at all. Certify the crew that *can* do it. That is what the binding is for. |
 | "`--modifier` defaults to standard." | Omitting it means **no modifier**. Steps are offered on bare authored capabilities. |
@@ -599,6 +609,8 @@ delivery.yaml          steps: [{ name: builder, capabilities: [build] }]
    hub reads capability_routes:   build:deep -> crew "openai"
                             |
    hub derives caller set from the asking shift's crew memberships
+   shift sends serve_crews plus raw merged-roster serve_capabilities
+   (today's hub ignores serve_capabilities; the intersect ships separately)
                             |
    match: exact  ->  only crews certified for "build:deep" may claim
                             |

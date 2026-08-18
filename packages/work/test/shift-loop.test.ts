@@ -255,18 +255,52 @@ test('changed:true ⇒ sweep and spawn a command order (no shift-side get_order)
 const perWfWhatsNext = (calls: Call[]): unknown =>
   calls.find((c) => c.verb === 'whats_next' && (c.arg as { workflow?: string } | undefined)?.workflow === 'wf1')?.arg;
 
-test('whats_next carries serve_crews: default [] reaches the per-instance wire arg', async () => {
+test('whats_next carries serve_crews and the default empty serving set per instance', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { orders: [] } } });
   const { spawner } = fakeSpawner();
   await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', serveCrews: [] })).run();
-  assert.deepEqual(perWfWhatsNext(calls), { workflow: 'wf1', serve_crews: [] });
+  assert.deepEqual(perWfWhatsNext(calls), { workflow: 'wf1', serve_crews: [], serve_capabilities: [] });
 });
 
-test('whats_next carries serve_crews: a narrowed subset reaches the per-instance wire arg', async () => {
+test('whats_next carries serve_crews and the default empty serving set for a narrowed shift', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: { wf1: { orders: [] } } });
   const { spawner } = fakeSpawner();
   await createShiftLoop(baseOpts(hub, spawner, { once: true, workflow: 'wf1', serveCrews: ['a'] })).run();
-  assert.deepEqual(perWfWhatsNext(calls), { workflow: 'wf1', serve_crews: ['a'] });
+  assert.deepEqual(perWfWhatsNext(calls), { workflow: 'wf1', serve_crews: ['a'], serve_capabilities: [] });
+});
+
+test('the computed serving set is sent on inbox, targeted, and presence requests', async () => {
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    inbox: ['wf1'],
+    perWf: { wf1: { orders: [] } },
+  });
+  const { spawner } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    once: true,
+    computeServeCapabilities: () => ['build', 'review:deep'],
+  }));
+
+  await loop.run();
+
+  const inbox = calls.find((call) => call.verb === 'whats_next' && (call.arg as { workflow?: string }).workflow === undefined);
+  const targeted = perWfWhatsNext(calls);
+  const presence = calls.find((call) => call.verb === 'presence');
+  assert.deepEqual(inbox?.arg, { serve_capabilities: ['build', 'review:deep'] });
+  assert.deepEqual(targeted, {
+    workflow: 'wf1',
+    serve_crews: [],
+    serve_capabilities: ['build', 'review:deep'],
+  });
+  assert.deepEqual(presence?.arg, {
+    name: 'box',
+    serve_crews: [],
+    serve_capabilities: ['build', 'review:deep'],
+  });
+
+  const exposed = loop.getServeCapabilities();
+  exposed.pop();
+  assert.deepEqual(loop.getServeCapabilities(), ['build', 'review:deep']);
 });
 
 test('monotonic cursor adoption across ticks', async () => {
@@ -472,7 +506,7 @@ for (const wallJump of [-1_000_000_000, 1_000_000_000]) {
 
 // ---- presence cadence -------------------------------------------------------
 
-test('presence pings on its own cadence, carrying name + serve crews', async () => {
+test('presence pings on its own cadence, carrying name, serve crews, and serving set', async () => {
   const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
   const { spawner } = fakeSpawner();
   let t = 0;
@@ -495,7 +529,7 @@ test('presence pings on its own cadence, carrying name + serve crews', async () 
   await loop.run();
   const pings = calls.filter((c) => c.verb === 'presence');
   assert.equal(pings.length, 2); // t=0 and t=60000, not the t=30000 tick
-  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_crews: ['x'] });
+  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_crews: ['x'], serve_capabilities: [] });
 });
 
 for (const wallJump of [-1_000_000_000, 1_000_000_000]) {
@@ -534,7 +568,7 @@ test('presence carries shift_id + started_at when the role sets them', async () 
   ).run();
   const pings = calls.filter((c) => c.verb === 'presence');
   assert.equal(pings.length, 1);
-  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_crews: [], shift_id: 'shf_abc', started_at: 12345 });
+  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_crews: [], serve_capabilities: [], shift_id: 'shf_abc', started_at: 12345 });
 });
 
 test('a presence failure does not kill the loop', async () => {
@@ -547,23 +581,60 @@ test('a presence failure does not kill the loop', async () => {
 });
 
 test('a roster cache refresh failure logs continuing and does not stop dispatch', async () => {
-  const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
-  const { spawner } = fakeSpawner();
-  const errors: string[] = [];
-  const events: Array<{ type: string; op?: string; message?: string }> = [];
-  const code = await createShiftLoop(baseOpts(hub, spawner, {
-    once: true,
-    rosterSyncIntervalMs: 0,
-    syncRosters: async () => { throw new Error('hub unavailable'); },
-    err: (line) => errors.push(line),
-    onEvent: (event) => events.push(event),
-  })).run();
-  assert.equal(code, 0);
-  assert.equal(count(calls, 'wake'), 1);
-  assert.match(errors.join('\n'), /roster sync failed: hub unavailable \(continuing\)/u);
-  assert.deepEqual(events.filter((event) => event.type === 'hub-error'), [
-    { type: 'hub-error', op: 'roster_sync', message: 'roster sync failed: hub unavailable (continuing)', ts: new Date(0).toISOString(), shift: 'box', shiftId: '' },
-  ]);
+	const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+	const { spawner } = fakeSpawner();
+	const errors: string[] = [];
+	const events: Array<{ type: string; op?: string; message?: string }> = [];
+	let revision = 'before';
+	const code = await createShiftLoop(baseOpts(hub, spawner, {
+		once: true,
+		rosterSyncIntervalMs: 0,
+		syncRosters: async () => {
+			revision = 'after';
+			throw new Error('hub unavailable');
+		},
+		computeServeCapabilities: () => [revision],
+		err: (line) => errors.push(line),
+		onEvent: (event) => events.push(event),
+	})).run();
+	assert.equal(code, 0);
+	assert.equal(count(calls, 'wake'), 1);
+	assert.deepEqual(calls.find((call) => call.verb === 'presence')?.arg, {
+		name: 'box',
+		serve_crews: [],
+		serve_capabilities: ['after'],
+	});
+	assert.match(errors.join('\n'), /roster sync failed: hub unavailable \(continuing\)/u);
+	assert.deepEqual(events.filter((event) => event.type === 'hub-error'), [
+		{ type: 'hub-error', op: 'roster_sync', message: 'roster sync failed: hub unavailable (continuing)', ts: new Date(0).toISOString(), shift: 'box', shiftId: '' },
+	]);
+});
+
+test('a throwing serving-set computation retains the last advertisement and does not stop the loop', async () => {
+	const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+	const { spawner } = fakeSpawner();
+	let failCompute = false;
+	const loop = createShiftLoop(baseOpts(hub, spawner, {
+		once: true,
+		rosterSyncIntervalMs: 0,
+		syncRosters: async () => {},
+		computeServeCapabilities: () => {
+			if (failCompute) throw new Error('bad roster');
+			return ['last-good'];
+		},
+	}));
+
+	failCompute = true;
+	const code = await loop.run();
+
+	assert.equal(code, 0);
+	assert.deepEqual(loop.getServeCapabilities(), ['last-good']);
+	assert.deepEqual(calls.find((call) => call.verb === 'presence')?.arg, {
+		name: 'box',
+		serve_crews: [],
+		serve_capabilities: ['last-good'],
+	});
+	assert.equal(count(calls, 'wake'), 1);
 });
 
 test('a never-settling roster refresh times out and the shift still reaches normal work', async () => {
@@ -1122,16 +1193,24 @@ test('getCap/setCap/freeCapacity expose the live cap', async () => {
 
 // ---- shift identity surface (MCP clock_in, shifts.md §8 item 4) ------------
 
-test('setShift updates the live name/serveCrews; the next presence ping carries them', async () => {
-  const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
-  const { spawner } = fakeSpawner();
-  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
-  await loop.iterate(); // first iterate always pings (lastPresence starts at -Infinity)
-  loop.setShift({ name: 'shiftB', serveCrews: ['project-bar'] });
-  await loop.iterate(); // setShift reset the presence timer, so this pings again immediately
-  const pings = calls.filter((c) => c.verb === 'presence');
-  assert.equal(pings.length, 2);
-  assert.deepEqual(pings[1]!.arg, { name: 'shiftB', serve_crews: ['project-bar'] });
+test('setShift updates the live name, crews, and serving set on the next presence ping', async () => {
+	const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+	const { spawner } = fakeSpawner();
+	const loop = createShiftLoop(baseOpts(hub, spawner, {
+		workflow: 'wf1',
+		computeServeCapabilities: (crews) => crews.length === 0 ? ['all'] : [`for-${crews[0]!}`],
+	}));
+	await loop.iterate(); // first iterate always pings (lastPresence starts at -Infinity)
+	loop.setShift({ name: 'shiftB', serveCrews: ['project-bar'] });
+	await loop.iterate(); // setShift reset the presence timer, so this pings again immediately
+	const pings = calls.filter((c) => c.verb === 'presence');
+	assert.equal(pings.length, 2);
+	assert.deepEqual(pings[1]!.arg, {
+		name: 'shiftB',
+		serve_crews: ['project-bar'],
+		serve_capabilities: ['for-project-bar'],
+	});
+	assert.deepEqual(loop.getServeCapabilities(), ['for-project-bar']);
 });
 
 test('after setShift({serveCrews}), the per-instance whats_next carries the new serveCrews', async () => {
@@ -1142,7 +1221,52 @@ test('after setShift({serveCrews}), the per-instance whats_next carries the new 
   loop.setShift({ serveCrews: ['project-bar'] });
   await loop.iterate();
   const wn = calls.filter((c) => c.verb === 'whats_next');
-  assert.deepEqual(wn[wn.length - 1]!.arg, { workflow: 'wf1', serve_crews: ['project-bar'] });
+  assert.deepEqual(wn[wn.length - 1]!.arg, { workflow: 'wf1', serve_crews: ['project-bar'], serve_capabilities: [] });
+});
+
+test('setShift recomputes the serving set immediately and logs only the change', () => {
+  const { hub } = mockHub({});
+  const { spawner } = fakeSpawner();
+  const output: string[] = [];
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    computeServeCapabilities: (crews) => crews.length === 0 ? ['all'] : [`for-${crews[0]!}`],
+    out: (line) => output.push(line),
+  }));
+
+  assert.deepEqual(loop.getServeCapabilities(), ['all']);
+  loop.setShift({ serveCrews: ['project-bar'] });
+  assert.deepEqual(loop.getServeCapabilities(), ['for-project-bar']);
+  assert.deepEqual(output, ['serving for-project-bar']);
+});
+
+test('roster refresh recomputes the serving set before the next hub requests', async () => {
+	const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 0 }], perWf: { wf1: { orders: [] } } });
+	const { spawner } = fakeSpawner();
+	let monotonic = 0;
+	let revision = 'before';
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    monotonicNow: () => monotonic,
+    presenceIntervalMs: 60_000,
+    rosterSyncIntervalMs: 10,
+    computeServeCapabilities: () => [revision],
+    syncRosters: async () => { revision = 'after'; },
+  }));
+
+	assert.deepEqual(loop.getServeCapabilities(), ['before']);
+	monotonic = 10;
+	await loop.iterate();
+	assert.deepEqual(loop.getServeCapabilities(), ['after']);
+	assert.deepEqual(calls.find((call) => call.verb === 'presence')?.arg, {
+		name: 'box',
+		serve_crews: [],
+		serve_capabilities: ['after'],
+	});
+	assert.deepEqual(perWfWhatsNext(calls), {
+		workflow: 'wf1',
+		serve_crews: [],
+		serve_capabilities: ['after'],
+	});
 });
 
 test('setShift is a partial update: an omitted field leaves that part of the shift unchanged (via getShift() and the next ping)', async () => {
@@ -1156,7 +1280,7 @@ test('setShift is a partial update: an omitted field leaves that part of the shi
 
   await loop.iterate();
   const pings = calls.filter((c) => c.verb === 'presence');
-  assert.deepEqual(pings[0]!.arg, { name: 'z', serve_crews: ['y'] });
+  assert.deepEqual(pings[0]!.arg, { name: 'z', serve_crews: ['y'], serve_capabilities: [] });
 });
 
 test('setShift makes the next presence ping due immediately, even mid-cadence (control: a plain tick does not ping early)', async () => {
@@ -1191,7 +1315,7 @@ test('setShift({serveCrews: []}) sends serve_crews: [] on the wire, not omitted'
   loop.setShift({ serveCrews: [] });
   await loop.iterate();
   const pings = calls.filter((c) => c.verb === 'presence');
-  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_crews: [] });
+  assert.deepEqual(pings[0]!.arg, { name: 'box', serve_crews: [], serve_capabilities: [] });
 });
 
 // ---- spawn seam -------------------------------------------------------------

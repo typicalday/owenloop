@@ -15,6 +15,12 @@ export interface WhatsNextRequest {
   workflow?: string;
   /** Server-side filter for which serve crews this caller will accept. */
   serve_crews?: string[];
+  /**
+   * Capability keys in this shift's effective merged rosters. Keys are raw:
+   * bare names and exact compounds may be mixed; the hub applies bare-name
+   * matching. An empty array legitimately means the shift serves nothing.
+   */
+  serve_capabilities: string[];
 }
 
 /**
@@ -127,6 +133,12 @@ export interface WakeResponse extends HubResponse {
 export interface PresencePingRequest {
   name: string;
   serve_crews?: string[];
+  /**
+   * Capability keys in this shift's effective merged rosters. Keys are raw:
+   * bare names and exact compounds may be mixed; the hub applies bare-name
+   * matching. An empty array legitimately means the shift serves nothing.
+   */
+  serve_capabilities: string[];
   shift_id?: string;
   started_at?: number;
   /** Epoch-millisecond timestamp of the last accepted local shift attendance. */

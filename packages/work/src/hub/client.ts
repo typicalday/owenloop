@@ -60,7 +60,7 @@ export interface HubClientOptions {
 }
 
 export interface HubClient {
-  whatsNext(req?: WhatsNextRequest): Promise<WhatsNextResponse>;
+  whatsNext(req: WhatsNextRequest): Promise<WhatsNextResponse>;
   getOrder(req: GetOrderRequest): Promise<GetOrderResponse>;
   heartbeat(req: HeartbeatRequest): Promise<HeartbeatResponse>;
   release(req: ReleaseRequest): Promise<ReleaseResponse>;
@@ -174,7 +174,7 @@ export function createHubClient(opts: HubClientOptions): HubClient {
   }
 
   return {
-    whatsNext: (req = {}) => post<WhatsNextResponse>('whats_next', req),
+    whatsNext: (req) => post<WhatsNextResponse>('whats_next', req),
     getOrder: (req) => post<GetOrderResponse>('get_order', req),
     heartbeat: (req) => post<HeartbeatResponse>('heartbeat', req),
     release: (req) => post<ReleaseResponse>('release', req),
