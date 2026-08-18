@@ -84,13 +84,40 @@ test('manifest parser rejects duplicate keys, aliases, merges, tags, and prototy
   );
 });
 
-test('golden source packs to byte-identical archive and digest', () => {
+test('golden source packs to the byte-identical canonical archive and digest', () => {
   const packed = packBundle(SOURCE);
   assert.equal(packed.digest, GOLDEN_JSON.digest);
   assert.deepEqual(packed.entries, GOLDEN_JSON.entries);
-  assert.deepEqual(Buffer.from(packed.bytes), readFileSync(GOLDEN));
+
+  // This pins every byte the packer lays down: USTAR headers, canonical modes,
+  // PAX path records, ordering, padding, and the two-block terminator. The gzip
+  // DEFLATE stream is not compared because linked zlib implementations may
+  // encode this same canonical tar differently; bundle identity is its SHA-256.
+  assert.deepEqual(gunzipSync(packed.bytes), gunzipSync(readFileSync(GOLDEN)));
+
+  // gzipDeterministic normalizes these container fields. XFL (byte 8) remains
+  // zlib's compression-strength hint and is deliberately not part of this vector.
+  const header = Buffer.from(packed.bytes.subarray(0, 10));
+  assert.deepEqual(header.subarray(0, 4), Buffer.from([0x1f, 0x8b, 0x08, 0x00]));
+  assert.deepEqual(header.subarray(4, 8), Buffer.alloc(4));
+  assert.equal(header[9], 0);
 
   const inspected = inspectBundle(packed.bytes);
+  assert.equal(inspected.digest, GOLDEN_JSON.digest);
+  assert.deepEqual(inspected.entries, GOLDEN_JSON.entries);
+});
+
+test('bundle identity survives a different gzip compression of the same canonical tar', () => {
+  // Never re-pin this vector to one zlib build's DEFLATE output: compression of
+  // the same tar may differ while its bundle digest, entries, and manifest do not.
+  const golden = readFileSync(GOLDEN);
+  const tar = gunzipSync(golden);
+  const recompressed = gzipSync(tar, { level: 1 });
+
+  assert.notDeepEqual(Buffer.from(recompressed), golden);
+  assert.equal(digestBundle(recompressed).digest, GOLDEN_JSON.digest);
+
+  const inspected = inspectBundle(recompressed);
   assert.equal(inspected.digest, GOLDEN_JSON.digest);
   assert.deepEqual(inspected.entries, GOLDEN_JSON.entries);
 });

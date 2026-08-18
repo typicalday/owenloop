@@ -140,7 +140,9 @@ test('runtime absence preserves the existing canonical manifest bytes and golden
   const packed = packBundle(SOURCE);
   assert.equal(packed.manifest.runtime, undefined);
   assert.equal(packed.digest, GOLDEN_JSON.digest);
-  assert.deepEqual(Buffer.from(packed.bytes), readFileSync(GOLDEN));
+  // Compare the canonical tar, not zlib's non-portable DEFLATE stream. See the
+  // golden-vector test in bundle.test.ts for the gzip-container checks.
+  assert.deepEqual(gunzipSync(packed.bytes), gunzipSync(readFileSync(GOLDEN)));
 });
 
 test('canonical bundle admission rejects complete-segment file-prefix collisions before writes', async () => {
