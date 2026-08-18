@@ -155,3 +155,20 @@ test('computeServeCapabilities keeps machine layers when no hub origin is config
 		);
 	});
 });
+
+test('computeServeCapabilities remains total when the cache path cannot be resolved', () => {
+	const warnings: string[] = [];
+	let serving: string[] | undefined;
+
+	assert.doesNotThrow(() => {
+		serving = computeServeCapabilities({
+			env: { OWENLOOP_CONFIG_DIR: 'relative-config-dir' },
+			crews: [],
+			hub: { origin, account },
+			warn: (message) => warnings.push(message),
+		});
+	});
+
+	assert.deepEqual(serving, []);
+	assert.ok(warnings.some((message) => message.includes('could not read cached hub rosters')));
+});

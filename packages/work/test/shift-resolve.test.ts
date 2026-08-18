@@ -1,13 +1,17 @@
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  assertShiftDaemonPlatform,
-  resolveCap,
-  resolveStateDirOverride,
-  resolveMaxConcurrentAgents,
-  resolveShiftName,
-  parseArgs,
+	assertShiftDaemonPlatform,
+	resolveCap,
+	resolveStateDirOverride,
+	resolveMaxConcurrentAgents,
+	resolveShiftName,
+	parseArgs,
+	runShiftRuntime,
 } from '../src/shift/runtime.ts';
 
 test('public Shift daemon fails explicitly on Windows while direct Shift remains the fallback', () => {
@@ -118,7 +122,52 @@ test('parseArgs rejects a blank --name (both forms) at parse time', () => {
 // point being that an operator running an old command line is told, not silently
 // given a different behaviour.
 test('the deleted stamp-path flags are unknown options, not silently ignored', () => {
-  for (const flag of ['--no-stamp', '--runner-dispatch', '--settle-margin', '--agents-dir']) {
-    assert.match(parseArgs([flag]).error ?? '', /unknown option/, `${flag} must be rejected`);
-  }
+	for (const flag of ['--no-stamp', '--runner-dispatch', '--settle-margin', '--agents-dir']) {
+		assert.match(parseArgs([flag]).error ?? '', /unknown option/, `${flag} must be rejected`);
+	}
+});
+
+test('runtime writes a corrupt-roster serving warning as one terminated stderr record', async () => {
+	const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-serving-warning-'));
+	const previous = {
+		home: process.env.HOME,
+		configDir: process.env.OWENLOOP_CONFIG_DIR,
+		token: process.env.OWENLOOP_TOKEN,
+	};
+	const originalStderrWrite = process.stderr.write;
+	let stderr = '';
+
+	try {
+		const crewDir = join(root, '.owenloop', 'crews');
+		mkdirSync(crewDir, { recursive: true });
+		writeFileSync(join(crewDir, 'broken.json'), '{not json');
+		process.env.HOME = root;
+		delete process.env.OWENLOOP_CONFIG_DIR;
+		process.env.OWENLOOP_TOKEN = 'shift-runtime-test-token';
+		process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+			stderr += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+			return true;
+		}) as typeof process.stderr.write;
+
+		assert.equal(await runShiftRuntime({
+			origin: 'http://127.0.0.1:1',
+			serveCrews: ['broken'],
+			once: true,
+			cacheDir: join(root, 'cache'),
+			stateDir: join(root, 'state'),
+		}), 0);
+
+		const warning = stderr.split('\n').find((line) => line.includes('could not compute serving capabilities for "broken"'));
+		assert.ok(warning, `missing serving warning in stderr: ${stderr}`);
+		assert.equal(warning.includes('\\n'), false, 'the warning must end at a real newline');
+	} finally {
+		process.stderr.write = originalStderrWrite;
+		if (previous.home === undefined) delete process.env.HOME;
+		else process.env.HOME = previous.home;
+		if (previous.configDir === undefined) delete process.env.OWENLOOP_CONFIG_DIR;
+		else process.env.OWENLOOP_CONFIG_DIR = previous.configDir;
+		if (previous.token === undefined) delete process.env.OWENLOOP_TOKEN;
+		else process.env.OWENLOOP_TOKEN = previous.token;
+		rmSync(root, { recursive: true, force: true });
+	}
 });

@@ -11,7 +11,19 @@ type Env = NodeJS.ProcessEnv;
 type Hub = { origin: string | undefined; account: string };
 
 function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
+	try {
+		return error instanceof Error ? error.message : String(error);
+	} catch {
+		return 'unknown error';
+	}
+}
+
+function reportWarning(warn: ((message: string) => void) | undefined, message: string): void {
+	try {
+		warn?.(message);
+	} catch {
+		// A diagnostic callback must not violate this module's totality contract.
+	}
 }
 
 function servingSetForCrewUnsafe(env: Env, crew: string | undefined, hub: Hub): string[] {
@@ -36,7 +48,6 @@ export function computeServeCapabilities(opts: {
 	/** One line per unreadable crew. Optional; default no-op. */
 	warn?: (message: string) => void;
 }): string[] {
-	const warn = opts.warn ?? (() => {});
 	const scopes = new Set<string>();
 
 	if (opts.crews.length > 0) {
@@ -45,14 +56,18 @@ export function computeServeCapabilities(opts: {
 		try {
 			for (const file of discoverCrewRosterFiles(opts.env)) scopes.add(file.crew);
 		} catch (error) {
-			warn(`could not discover local crew rosters: ${errorMessage(error)}`);
+			reportWarning(opts.warn, `could not discover local crew rosters: ${errorMessage(error)}`);
 		}
 		if (opts.hub.origin !== undefined && opts.hub.origin.trim() !== '') {
-			const cached = readHubRosterCache(opts.env, opts.hub.origin, opts.hub.account);
-			if (cached.kind === 'hit') {
-				for (const crew of cached.data.crews) {
-					if (crew.crewName !== null) scopes.add(crew.crewName);
+			try {
+				const cached = readHubRosterCache(opts.env, opts.hub.origin, opts.hub.account);
+				if (cached.kind === 'hit') {
+					for (const crew of cached.data.crews) {
+						if (crew.crewName !== null) scopes.add(crew.crewName);
+					}
 				}
+			} catch (error) {
+				reportWarning(opts.warn, `could not read cached hub rosters: ${errorMessage(error)}`);
 			}
 		}
 	}
@@ -63,7 +78,7 @@ export function computeServeCapabilities(opts: {
 		try {
 			for (const capability of servingSetForCrewUnsafe(opts.env, crew, opts.hub)) result.add(capability);
 		} catch (error) {
-			warn(`could not compute serving capabilities for ${crew === undefined ? 'crew-independent layers' : JSON.stringify(crew)}: ${errorMessage(error)}`);
+			reportWarning(opts.warn, `could not compute serving capabilities for ${crew === undefined ? 'crew-independent layers' : JSON.stringify(crew)}: ${errorMessage(error)}`);
 		}
 	}
 	return [...result].sort();

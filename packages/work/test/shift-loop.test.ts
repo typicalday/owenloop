@@ -581,23 +581,60 @@ test('a presence failure does not kill the loop', async () => {
 });
 
 test('a roster cache refresh failure logs continuing and does not stop dispatch', async () => {
-  const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
-  const { spawner } = fakeSpawner();
-  const errors: string[] = [];
-  const events: Array<{ type: string; op?: string; message?: string }> = [];
-  const code = await createShiftLoop(baseOpts(hub, spawner, {
-    once: true,
-    rosterSyncIntervalMs: 0,
-    syncRosters: async () => { throw new Error('hub unavailable'); },
-    err: (line) => errors.push(line),
-    onEvent: (event) => events.push(event),
-  })).run();
-  assert.equal(code, 0);
-  assert.equal(count(calls, 'wake'), 1);
-  assert.match(errors.join('\n'), /roster sync failed: hub unavailable \(continuing\)/u);
-  assert.deepEqual(events.filter((event) => event.type === 'hub-error'), [
-    { type: 'hub-error', op: 'roster_sync', message: 'roster sync failed: hub unavailable (continuing)', ts: new Date(0).toISOString(), shift: 'box', shiftId: '' },
-  ]);
+	const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+	const { spawner } = fakeSpawner();
+	const errors: string[] = [];
+	const events: Array<{ type: string; op?: string; message?: string }> = [];
+	let revision = 'before';
+	const code = await createShiftLoop(baseOpts(hub, spawner, {
+		once: true,
+		rosterSyncIntervalMs: 0,
+		syncRosters: async () => {
+			revision = 'after';
+			throw new Error('hub unavailable');
+		},
+		computeServeCapabilities: () => [revision],
+		err: (line) => errors.push(line),
+		onEvent: (event) => events.push(event),
+	})).run();
+	assert.equal(code, 0);
+	assert.equal(count(calls, 'wake'), 1);
+	assert.deepEqual(calls.find((call) => call.verb === 'presence')?.arg, {
+		name: 'box',
+		serve_crews: [],
+		serve_capabilities: ['after'],
+	});
+	assert.match(errors.join('\n'), /roster sync failed: hub unavailable \(continuing\)/u);
+	assert.deepEqual(events.filter((event) => event.type === 'hub-error'), [
+		{ type: 'hub-error', op: 'roster_sync', message: 'roster sync failed: hub unavailable (continuing)', ts: new Date(0).toISOString(), shift: 'box', shiftId: '' },
+	]);
+});
+
+test('a throwing serving-set computation retains the last advertisement and does not stop the loop', async () => {
+	const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+	const { spawner } = fakeSpawner();
+	let failCompute = false;
+	const loop = createShiftLoop(baseOpts(hub, spawner, {
+		once: true,
+		rosterSyncIntervalMs: 0,
+		syncRosters: async () => {},
+		computeServeCapabilities: () => {
+			if (failCompute) throw new Error('bad roster');
+			return ['last-good'];
+		},
+	}));
+
+	failCompute = true;
+	const code = await loop.run();
+
+	assert.equal(code, 0);
+	assert.deepEqual(loop.getServeCapabilities(), ['last-good']);
+	assert.deepEqual(calls.find((call) => call.verb === 'presence')?.arg, {
+		name: 'box',
+		serve_crews: [],
+		serve_capabilities: ['last-good'],
+	});
+	assert.equal(count(calls, 'wake'), 1);
 });
 
 test('a never-settling roster refresh times out and the shift still reaches normal work', async () => {
@@ -1156,16 +1193,24 @@ test('getCap/setCap/freeCapacity expose the live cap', async () => {
 
 // ---- shift identity surface (MCP clock_in, shifts.md §8 item 4) ------------
 
-test('setShift updates the live name/serveCrews; the next presence ping carries them', async () => {
-  const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
-  const { spawner } = fakeSpawner();
-  const loop = createShiftLoop(baseOpts(hub, spawner, { workflow: 'wf1' }));
-  await loop.iterate(); // first iterate always pings (lastPresence starts at -Infinity)
-  loop.setShift({ name: 'shiftB', serveCrews: ['project-bar'] });
-  await loop.iterate(); // setShift reset the presence timer, so this pings again immediately
-  const pings = calls.filter((c) => c.verb === 'presence');
-  assert.equal(pings.length, 2);
-  assert.deepEqual(pings[1]!.arg, { name: 'shiftB', serve_crews: ['project-bar'], serve_capabilities: [] });
+test('setShift updates the live name, crews, and serving set on the next presence ping', async () => {
+	const { hub, calls } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
+	const { spawner } = fakeSpawner();
+	const loop = createShiftLoop(baseOpts(hub, spawner, {
+		workflow: 'wf1',
+		computeServeCapabilities: (crews) => crews.length === 0 ? ['all'] : [`for-${crews[0]!}`],
+	}));
+	await loop.iterate(); // first iterate always pings (lastPresence starts at -Infinity)
+	loop.setShift({ name: 'shiftB', serveCrews: ['project-bar'] });
+	await loop.iterate(); // setShift reset the presence timer, so this pings again immediately
+	const pings = calls.filter((c) => c.verb === 'presence');
+	assert.equal(pings.length, 2);
+	assert.deepEqual(pings[1]!.arg, {
+		name: 'shiftB',
+		serve_crews: ['project-bar'],
+		serve_capabilities: ['for-project-bar'],
+	});
+	assert.deepEqual(loop.getServeCapabilities(), ['for-project-bar']);
 });
 
 test('after setShift({serveCrews}), the per-instance whats_next carries the new serveCrews', async () => {
@@ -1194,11 +1239,11 @@ test('setShift recomputes the serving set immediately and logs only the change',
   assert.deepEqual(output, ['serving for-project-bar']);
 });
 
-test('roster refresh recomputes the serving set after the sync attempt', async () => {
-  const { hub } = mockHub({ wake: [{ changed: false, cursor: 0 }] });
-  const { spawner } = fakeSpawner();
-  let monotonic = 0;
-  let revision = 'before';
+test('roster refresh recomputes the serving set before the next hub requests', async () => {
+	const { hub, calls } = mockHub({ wake: [{ changed: true, cursor: 0 }], perWf: { wf1: { orders: [] } } });
+	const { spawner } = fakeSpawner();
+	let monotonic = 0;
+	let revision = 'before';
   const loop = createShiftLoop(baseOpts(hub, spawner, {
     workflow: 'wf1',
     monotonicNow: () => monotonic,
@@ -1208,10 +1253,20 @@ test('roster refresh recomputes the serving set after the sync attempt', async (
     syncRosters: async () => { revision = 'after'; },
   }));
 
-  assert.deepEqual(loop.getServeCapabilities(), ['before']);
-  monotonic = 10;
-  await loop.iterate();
-  assert.deepEqual(loop.getServeCapabilities(), ['after']);
+	assert.deepEqual(loop.getServeCapabilities(), ['before']);
+	monotonic = 10;
+	await loop.iterate();
+	assert.deepEqual(loop.getServeCapabilities(), ['after']);
+	assert.deepEqual(calls.find((call) => call.verb === 'presence')?.arg, {
+		name: 'box',
+		serve_crews: [],
+		serve_capabilities: ['after'],
+	});
+	assert.deepEqual(perWfWhatsNext(calls), {
+		workflow: 'wf1',
+		serve_crews: [],
+		serve_capabilities: ['after'],
+	});
 });
 
 test('setShift is a partial update: an omitted field leaves that part of the shift unchanged (via getShift() and the next ping)', async () => {

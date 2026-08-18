@@ -598,7 +598,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       env,
       crews,
       hub: { origin, account },
-      warn: (message) => process.stderr.write(`${roleLabel}: shift: ${message}\\n`),
+      warn: (message) => process.stderr.write(`${roleLabel}: shift: ${message}\n`),
     }),
     maxConcurrentAgents,
     workRoot,
