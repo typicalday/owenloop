@@ -6,8 +6,9 @@
 #   plan + provision → build → review → document → check → merge → clean up
 #
 # This is the grown-up sibling of delivery.yaml (which teaches the wiring in
-# four steps). It's the line the authors actually run their own changes down,
-# genericized: full artifact schemas, tiered models, honest escalation, and —
+# four steps). It's modeled on the line the authors actually run their own
+# changes down, genericized and trimmed: full artifact schemas, tiered models,
+# honest escalation, and —
 # the part most pipelines get wrong — the machine lifecycle as first-class
 # steps. `provisioner` stands up the branch/worktree BEFORE the builder starts
 # and owns it as the `workspace` artifact; `deprovisioner` reclaims it AFTER

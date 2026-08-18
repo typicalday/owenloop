@@ -2924,7 +2924,8 @@ interactively.
 
 The [`examples/workflows`](../examples/workflows) folder has a workflow per
 idea: [`delivery`](../examples/workflows/delivery.yaml) (a review knock-back
-loop), [`ship`](../examples/workflows/ship.yaml) (delivery grown up: the full
+loop — a teaching example, not the production line),
+[`ship`](../examples/workflows/ship.yaml) (delivery grown up: the full
 production line with provisioned workspaces, an adversarial reviewer, a doc
 pass, and teardown owned as a step),
 [`research`](../examples/workflows/research.yaml) (collections),
@@ -2958,7 +2959,7 @@ wf=$(owenloop create delivery \
 run=$(owenloop tick $wf | jq -r '.orders[0].run')   # claim the planner job
 owenloop green $wf $run plan --value '{"plan":"…"}'  # report its output
 
-owenloop status $wf                            # owed / eligible / blocked / done
+owenloop status $wf                            # done / debts / eligible / blocked / pending / inFlight
 ```
 
 **A knock-back.** When the reviewer's job comes up, instead of greening its

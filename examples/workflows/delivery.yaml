@@ -1,23 +1,40 @@
-# Software-delivery wiring.
+# Software-delivery wiring — a TEACHING EXAMPLE, not a production workflow.
 #
-# A linear pipeline where each step consumes the previous one's output and owes
-# the next. The interesting dynamics are the *knock-backs*: the reviewer can
-# reject the PR (re-arming the builder), and any upstream change cascades
-# forward — a re-planned `plan` invalidates the `pr`, its `verdict`, and the
-# `merge` automatically (the forward cascade, §7). The `merge` is terminal: once
-# green it is a destructive completion and can never be re-armed (§15.2).
+# This file exists to show the engine's core dynamics in the fewest possible
+# steps. It is NOT the delivery line this project's authors actually run, and
+# it is not a copy of any deployed definition. The real one is a separately
+# published workflow bundle named `owenloop-delivery`: an order of magnitude
+# larger, with provisioner/deprovisioner lifecycle steps, a merge gate, mentor
+# consults, capability routing and run modifiers. For an in-repo definition
+# shaped like a real production line, read `ship.yaml` next door.
 #
-# Drive it (the "wiring" / worker step):
+# What this one teaches: a linear pipeline where each step consumes the
+# previous one's output and owes the next. The interesting dynamics are the
+# *knock-backs* — the reviewer can reject the PR (re-arming the builder), and
+# any upstream change cascades forward: a re-planned `plan` invalidates the
+# `pr`, its `verdict`, and the `merge` automatically (the forward cascade, §7).
+# The `merge` is terminal: once green it is a destructive completion and can
+# never be re-armed (§15.2).
+#
+# Drive it (play every Step Agent yourself):
+#   export OWENLOOP_DEFS=examples/workflows
+#   export OWENLOOP_DB=/tmp/owenloop-delivery-demo.db
+#
 #   wf=$(owenloop create delivery --provide proposal='{"text":"add dark mode"}' | jq -r .workflow)
-#   owenloop tick $wf          # -> an order for `planner`
-#   owenloop green $wf <run> plan --value '{"plan":"..."}'
-#   ...                       # tick/green down the chain
+#   run=$(owenloop tick $wf | jq -r '.orders[0].run')   # -> the `planner` order
+#   owenloop green $wf $run plan --value '{"plan":"..."}'
+#   owenloop close $wf $run
+#   ...                        # tick/green/close down the chain
 #   owenloop reject $wf pr --by reviewer --text "tests missing"   # knock-back
-#   owenloop status $wf        # debts / eligible / blocked
+#   owenloop status $wf        # done / debts / eligible / blocked / pending / inFlight
 
 name: delivery
-title: Software delivery
-description: Plan → build → review → merge, with reviewer knock-backs.
+title: Software delivery (teaching example)
+description: >-
+  Plan → build → review → merge, with reviewer knock-backs. A minimal wiring
+  written to teach the engine's dynamics — not the production delivery line
+  (that is the separately published `owenloop-delivery` bundle); see ship.yaml
+  for a production-shaped definition.
 outputs: [merge]
 
 inputs:

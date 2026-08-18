@@ -453,8 +453,10 @@ through the same small CLI (`create`, `tick`, `green`, `reject`, …).
 [`docs/cli.md`](docs/cli.md) has the full command reference and a hand-driven
 walkthrough of a pipeline — including a rejection knock-back and a stall —
 and [`examples/workflows`](examples/workflows) has seventeen runnable defs, from a
-minimal review loop ([`delivery`](examples/workflows/delivery.yaml)) to a
-full production line ([`ship`](examples/workflows/ship.yaml)), a
+minimal review loop written to teach the wiring
+([`delivery`](examples/workflows/delivery.yaml) — a four-step example, not the
+production line) to a production-shaped pipeline
+([`ship`](examples/workflows/ship.yaml)), a
 collections-heavy research pipeline
 ([`research`](examples/workflows/research.yaml)), and a compiler that turns
 live vendor docs into a new gate-checked def
