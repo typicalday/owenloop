@@ -385,6 +385,24 @@ sign, the parsed payload is part of the receipt value covered by the DSSE
 submission proof. Current producer command receipts are unsigned because the
 deployed hub does not supply a retry-safe target version.
 
+When a valid payload contains a plain-step `reject`, the command worker sends
+the directive's `text` as the reject reason and, when command output is
+available, appends the captured tail in this form:
+
+```text
+<text>
+
+--- command output (last <N> bytes) ---
+<tail>
+```
+
+The tail is the last 4 KiB of combined stdout-then-stderr output, decoded as
+lossy UTF-8, with trailing newline characters removed before the byte count is
+computed. `N` is the UTF-8 byte count of that trimmed tail. An empty tail leaves
+the directive's text unchanged. The payload marker line is not removed from
+the tail. This augmentation applies to payload rejects; judge rejects retain
+their existing text-selection behavior.
+
 A worker rejects an artifact through the `reject` verb. The request is exactly:
 
 ```json
