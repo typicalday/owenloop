@@ -15,6 +15,7 @@ import { createHubClient } from '../hub/client.ts';
 import { resolveBearer } from '../credentials/resolve.ts';
 import { loadSettings } from '../settings/settings.ts';
 import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
+import { computeServeCapabilities } from '../settings/serving.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
 import { createShiftLoop, type ShiftLoop } from './loop.ts';
 import { createShiftLogSink } from './logsink.ts';
@@ -593,6 +594,12 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     rosterSyncIntervalMs: DEFAULT_ROSTER_SYNC_MS,
     rosterSyncTimeoutMs: DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS,
     syncRosters: (signal) => syncHubRosterCache({ client: hub, env, origin, account, signal }),
+    computeServeCapabilities: (crews) => computeServeCapabilities({
+      env,
+      crews,
+      hub: { origin, account },
+      warn: (message) => process.stderr.write(`${roleLabel}: shift: ${message}\\n`),
+    }),
     maxConcurrentAgents,
     workRoot,
     ...(workRepo !== undefined ? { workRepo } : {}),

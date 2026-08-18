@@ -419,7 +419,17 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
         'THE verb. With workflow: ticks it and returns the next work order(s), or a status summary if none. Without workflow: the inbox of started instances. Serves only YOUR OWN runs by default. Pass serve_crews to partition your own runs further (intersects with each step\'s capabilities; absent or [] = no capability filter). serve_crews is ignored in inbox mode (no workflow).',
       inputSchema: {
         type: 'object',
-        properties: { workflow: { type: 'string' }, serve_crews: { type: 'array', items: { type: 'string' } } },
+	properties: {
+	  workflow: { type: 'string' },
+	  serve_crews: { type: 'array', items: { type: 'string' } },
+	  serve_capabilities: {
+	    type: 'array',
+	    items: { type: 'string' },
+	    description:
+	      'Capability keys this caller serves, raw (bare names and exact compounds). ' +
+	      'Shifts compute this from their effective rosters; other callers normally omit it.',
+	  },
+	},
         additionalProperties: false,
       },
       handler: passthrough(deps, (a) => ({ method: 'POST', path: '/api/whats_next', body: a })),
@@ -631,6 +641,13 @@ function buildBaselineTools(deps: McpDeps): ToolRegistration[] {
         properties: {
           name: { type: 'string' },
           serve_crews: { type: 'array', items: { type: 'string' } },
+	  serve_capabilities: {
+	    type: 'array',
+	    items: { type: 'string' },
+	    description:
+	      'Capability keys this caller serves, raw (bare names and exact compounds). ' +
+	      'Shifts compute this from their effective rosters; other callers normally omit it.',
+	  },
           shift_id: { type: 'string' },
           started_at: { type: 'number' },
         },

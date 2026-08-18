@@ -44,14 +44,14 @@ function client(fetchImpl: typeof fetch, getToken = async () => 'tok-123') {
 test('whatsNext POSTs to /api/whats_next with bearer header and JSON body', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'ok', orders: [] } }));
-  const res = await c.whatsNext({ workflow: 'wf1', serve_crews: ['a'] });
+  const res = await c.whatsNext({ workflow: 'wf1', serve_crews: ['a'], serve_capabilities: ['build', 'build:deep'] });
 
   const req = captured[0]!;
   assert.equal(req.method, 'POST');
   assert.equal(req.url, 'https://hub.example/api/whats_next');
   assert.equal(req.headers['authorization'], 'Bearer tok-123');
   assert.equal(req.headers['content-type'], 'application/json');
-  assert.deepEqual(req.body, { workflow: 'wf1', serve_crews: ['a'] });
+  assert.deepEqual(req.body, { workflow: 'wf1', serve_crews: ['a'], serve_capabilities: ['build', 'build:deep'] });
   assert.equal(res.text, 'ok');
   assert.deepEqual(res.orders, []);
 });
@@ -80,7 +80,7 @@ test('whatsNext preserves modern defDigest routing with explicit or default work
     body: { text: 'ok', workflow: 'wf1', orders: [explicitAgent, defaultAgent] },
   }));
 
-  const response = await c.whatsNext({ workflow: 'wf1' });
+  const response = await c.whatsNext({ workflow: 'wf1', serve_capabilities: [] });
 
   assert.deepEqual(response.orders?.[0], explicitAgent);
   assert.equal(response.orders?.[1]?.defDigest, 'sha256:default-agent');
@@ -88,11 +88,11 @@ test('whatsNext preserves modern defDigest routing with explicit or default work
   assert.deepEqual(response.orders?.[1], defaultAgent);
 });
 
-test('whatsNext defaults to an empty body when called with no args', async () => {
+test('whatsNext sends the required empty serving-set advertisement', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'ok' } }));
-  await c.whatsNext();
-  assert.deepEqual(captured[0]!.body, {});
+  await c.whatsNext({ serve_capabilities: [] });
+  assert.deepEqual(captured[0]!.body, { serve_capabilities: [] });
 });
 
 test('getOrder and heartbeat pass the holder tag through', async () => {
@@ -193,11 +193,11 @@ test('wake omits the query string entirely when cursor is undefined (bootstrap)'
 test('presencePing POSTs /api/presence_ping with name and serve_crews', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'presence recorded for box', ok: true, name: 'box', lastSeen: 123 } }));
-  const res = await c.presencePing({ name: 'box', serve_crews: ['a', 'b'] });
+  const res = await c.presencePing({ name: 'box', serve_crews: ['a', 'b'], serve_capabilities: ['build'] });
 
   assert.equal(captured[0]!.method, 'POST');
   assert.equal(captured[0]!.url, 'https://hub.example/api/presence_ping');
-  assert.deepEqual(captured[0]!.body, { name: 'box', serve_crews: ['a', 'b'] });
+  assert.deepEqual(captured[0]!.body, { name: 'box', serve_crews: ['a', 'b'], serve_capabilities: ['build'] });
   assert.equal(res.ok, true);
   assert.equal(res.name, 'box');
   assert.equal(res.lastSeen, 123);
@@ -271,10 +271,10 @@ test('default fetch path works end to end against a real node:http server', asyn
   try {
     const port = (server.address() as AddressInfo).port;
     const c = createHubClient({ origin: `http://127.0.0.1:${port}`, getToken: async () => 'live-tok' });
-    const res = (await c.whatsNext({ workflow: 'wf1' })) as { text: string; echoAuth: string; echoBody: unknown };
+    const res = (await c.whatsNext({ workflow: 'wf1', serve_capabilities: [] })) as { text: string; echoAuth: string; echoBody: unknown };
     assert.equal(res.text, 'live');
     assert.equal(res.echoAuth, 'Bearer live-tok');
-    assert.deepEqual(res.echoBody, { workflow: 'wf1' });
+    assert.deepEqual(res.echoBody, { workflow: 'wf1', serve_capabilities: [] });
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
@@ -283,7 +283,7 @@ test('default fetch path works end to end against a real node:http server', asyn
 test('presencePing forwards attended_at using the exact snake_case wire field', async () => {
   const captured: Captured[] = [];
   const c = client(fakeFetch(captured, { body: { text: 'presence recorded', ok: true, name: 'box', lastSeen: 123 } }));
-  await c.presencePing({ name: 'box', serve_crews: [], attended_at: 456789 });
-  assert.deepEqual(captured[0]!.body, { name: 'box', serve_crews: [], attended_at: 456789 });
+  await c.presencePing({ name: 'box', serve_crews: [], serve_capabilities: [], attended_at: 456789 });
+  assert.deepEqual(captured[0]!.body, { name: 'box', serve_crews: [], serve_capabilities: [], attended_at: 456789 });
   assert.equal((captured[0]!.body as Record<string, unknown>)['attendedAt'], undefined);
 });

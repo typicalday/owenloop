@@ -91,6 +91,7 @@ function fixture(options: {
     getCap: () => state.cap,
     setCap: (cap: number) => { state.cap = cap; },
     getShift: () => ({ name: state.name, serveCrews: [...state.serveCrews] }),
+    getServeCapabilities: () => ['build'],
     setShift: (next: { name?: string; serveCrews?: string[] }) => {
       if (next.name !== undefined) state.name = next.name;
       if (next.serveCrews !== undefined) state.serveCrews = [...next.serveCrews];
@@ -458,6 +459,7 @@ test('end lets the daemon process exit while a responded client stops reading', 
     "  freeCapacity: () => 0,",
     "  getCap: () => 0,",
     "  getShift: () => ({ name: 'box', serveCrews: ['alpha'] }),",
+    "  getServeCapabilities: () => [],",
     "  setShift: () => ({ name: 'box', serveCrews: ['alpha'] }),",
     "  noteAttended: () => {},",
     "  getAttendedAt: () => undefined,",
@@ -553,6 +555,7 @@ test('end sends one attendance-clearing ping and leaves detached children alone'
   assert.deepEqual(await requestShift(f.socketPath, { op: 'end' }), { ok: true, ended: true });
   assert.equal(f.pings.length, 1);
   assert.equal(f.pings[0]!.attended_at, undefined);
+  assert.deepEqual(f.pings[0]!.serve_capabilities, ['build']);
   assert.equal(f.state.childAlive, true);
 });
 

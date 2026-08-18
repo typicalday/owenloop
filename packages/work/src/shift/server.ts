@@ -491,6 +491,7 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
       await opts.hub.presencePing({
         name: shift.name,
         serve_crews: shift.serveCrews,
+	serve_capabilities: opts.loop.getServeCapabilities(),
         ...(opts.shiftId !== undefined ? { shift_id: opts.shiftId } : {}),
         started_at: opts.startedAt,
         // Deliberately omit attended_at. The merged hub contract interprets
