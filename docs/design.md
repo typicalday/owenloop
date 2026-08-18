@@ -970,6 +970,13 @@ step's last owed submit is what closes it — so the reverse order made every
 reject from a single-owed-path step undeliverable. What follows the reject
 depends on the hub's own answer, in its `closed` field:
 
+The payload reject's `text` starts with the script's reason. When the command
+has a non-empty captured output tail, the worker appends a labeled
+`--- command output (last N bytes) ---` section containing the last 4 KiB of
+combined stdout-then-stderr output (lossy UTF-8, with trailing newlines
+trimmed before counting bytes). An empty tail adds nothing, and the payload
+marker line is retained. Judge rejects are not changed by this formatting.
+
 - `closed: true` — the rejected path was one of this firing's consumed inputs,
   so the hub closed the run `no_work`. The owed paths stay debts and the step
   re-fires against the rebuilt input. No receipt is submitted: an artifact
