@@ -11,8 +11,11 @@ import {
 	resolveMaxConcurrentAgents,
 	resolveShiftName,
 	parseArgs,
+	reconcileStartupState,
 	runShiftRuntime,
 } from '../src/shift/runtime.ts';
+import { createLockedRemovalCallbacks } from '../src/shift/loop.ts';
+import { readChildRecords, reconcileInFlight, writeChildRecord } from '../src/shift/state.ts';
 
 test('public Shift daemon fails explicitly on Windows while direct Shift remains the fallback', () => {
   assert.throws(
@@ -37,6 +40,57 @@ test('resolveStateDirOverride: flag > OWENLOOP_STATE_DIR > settings; else undefi
   assert.equal(resolveStateDirOverride(undefined, { OWENLOOP_STATE_DIR: '/env' }, '/settings'), '/env');
   assert.equal(resolveStateDirOverride(undefined, {}, '/settings'), '/settings');
   assert.equal(resolveStateDirOverride(undefined, {}, undefined), undefined);
+});
+
+test('startup reconciliation cannot reap a re-dispatched shared-state record', () => {
+	const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-startup-race-'));
+	const stateDir = join(root, 'state');
+	const firstPid = 111;
+	const replacementPid = 222;
+	try {
+		writeChildRecord(stateDir, {
+			workflow: 'wf1',
+			run: 'run_startup_race',
+			pid: firstPid,
+			spawnedAt: 0,
+			kind: 'agent-run',
+		});
+		const isAlive = (pid: number): boolean => pid === replacementPid;
+		let injected = false;
+		let competingReaped = 0;
+		const startup = reconcileStartupState(stateDir, () => assert.fail('startup reconciliation must not defer'), {
+			isAlive,
+			dispatchLockOptions: {
+				beforeOpen: () => {
+					if (injected) return;
+					injected = true;
+					const competing = reconcileInFlight(stateDir, {
+						isAlive,
+						...createLockedRemovalCallbacks(stateDir),
+					});
+					competingReaped += competing.reaped.length;
+					writeChildRecord(stateDir, {
+						workflow: 'wf1',
+						run: 'run_startup_race',
+						pid: replacementPid,
+						spawnedAt: 1,
+						kind: 'agent-run',
+					});
+				},
+			},
+		});
+
+		assert.equal(startup?.reaped.length, 0, 'the startup sweep did not remove the replacement');
+		assert.equal(competingReaped, 1, 'exactly one reconciler removed the stale record');
+		assert.deepEqual(readChildRecords(stateDir).map((record) => record.pid), [replacementPid]);
+		const current = reconcileInFlight(stateDir, {
+			isAlive,
+			...createLockedRemovalCallbacks(stateDir),
+		});
+		assert.equal(current.live.length + current.reserved.length, 1, 'the replacement keeps its capacity slot');
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 // WO-4.3 serve-crew SELECTION contract, pinned at the parse layer. The wire

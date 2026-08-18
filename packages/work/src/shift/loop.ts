@@ -75,6 +75,7 @@ import {
   ensureStateDir,
   type ChildRecord,
   type ChildReservation,
+  type ReconcileOptions,
   type ReservedChild,
   type Liveness,
 } from './state.ts';
@@ -172,6 +173,53 @@ export interface ShiftLoopOptions {
   /** PHASE 4 — injected in tests so the reaper can be exercised without a
    *  filesystem. Defaults to `sweepWorkDirs` from `src/agent/workdir.ts`. */
   sweepWorkDirs?: typeof sweepWorkDirsImpl;
+}
+
+export interface LockedRemovalOptions {
+  dispatchLockOptions?: Pick<AcquireFileLockOpts, 'beforeOpen'>;
+  waitMs?: number;
+  label?: string;
+}
+
+/**
+ * Remove one child record while holding the same lock that serializes durable
+ * reservation creation. The record is deliberately re-read by
+ * `removeChildRecord` only after acquisition, so a stale observer cannot erase
+ * a newer dispatch for the same run.
+ */
+export function removeChildRecordUnderDispatchLock(
+  stateDir: string,
+  run: string,
+  recordOptions?: { pid?: number },
+  options: LockedRemovalOptions = {},
+): boolean {
+  const dispatchLock = acquireFileLockSync(join(stateDir, '.dispatch.lock'), {
+    ...options.dispatchLockOptions,
+    waitMs: options.waitMs ?? 30_000,
+    label: options.label ?? 'owenloop Shift dispatch-state removal',
+  });
+  try {
+    return removeChildRecord(stateDir, run, recordOptions);
+  } finally {
+    releaseFileLock(dispatchLock);
+  }
+}
+
+/**
+ * Reconciliation callbacks for every unlocked Shift daemon path. Keep these
+ * together with the lock-held removal primitive so startup and the poll loop
+ * cannot silently diverge.
+ */
+export function createLockedRemovalCallbacks(
+  stateDir: string,
+  options: LockedRemovalOptions = {},
+): Pick<ReconcileOptions, 'removeAbandonedReservation' | 'removeDeadChild'> {
+  return {
+    removeAbandonedReservation: (reservation) =>
+      removeChildRecordUnderDispatchLock(stateDir, reservation.run, undefined, options),
+    removeDeadChild: (record) =>
+      removeChildRecordUnderDispatchLock(stateDir, record.run, { pid: record.pid }, options),
+  };
 }
 
 /** What one `sweep()` produced. `polled`/`openRuns` exist for the Phase 4
@@ -470,35 +518,28 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     });
   }
 
+  const lockedRemovalCallbacks = createLockedRemovalCallbacks(opts.stateDir, {
+    dispatchLockOptions: opts.dispatchLockOptions,
+  });
+
   function removeRecordUnderDispatchLock(
     run: string,
-    options?: { pid?: number },
+    recordOptions?: { pid?: number },
     waitMs = 30_000,
     label = 'owenloop Shift dispatch-state removal',
   ): boolean {
-    const dispatchLock = acquireDispatchLock(waitMs, label);
-    try {
-      // Re-read and guard only after the same lock that protects reservation
-      // creation is held. A stale liveness probe must never unlink a record a
-      // different Shift just wrote for a re-dispatch of this run.
-      return removeChildRecord(opts.stateDir, run, options);
-    } finally {
-      releaseFileLock(dispatchLock);
-    }
-  }
-
-  function removeReconciledRecord(record: ChildRecord | ChildReservation): boolean {
-    return 'pid' in record
-      ? removeRecordUnderDispatchLock(record.run, { pid: record.pid })
-      : removeRecordUnderDispatchLock(record.run);
+    return removeChildRecordUnderDispatchLock(opts.stateDir, run, recordOptions, {
+      dispatchLockOptions: opts.dispatchLockOptions,
+      waitMs,
+      label,
+    });
   }
 
   function reconcile() {
     const result = reconcileInFlight(opts.stateDir, {
       ...(isAlive !== undefined ? { isAlive } : {}),
       now: opts.now(),
-      removeAbandonedReservation: removeReconciledRecord,
-      removeDeadChild: removeReconciledRecord,
+      ...lockedRemovalCallbacks,
     });
     for (const rec of result.reaped) {
       emit({
