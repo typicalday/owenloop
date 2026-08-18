@@ -12,6 +12,7 @@ import {
   HUB_PICKUP_WINDOW_MS,
   MAX_PENDING_CANDIDATE_AGE_MS,
   STEP_BRAKE_DELAYS_MS,
+  withDispatchLock,
   type ShiftLoop,
   type ShiftLoopOptions,
 } from '../src/shift/loop.ts';
@@ -1802,6 +1803,137 @@ test('two shared-state loops keep a finalized replacement when a stale reservati
   assert.equal(existsSync(replacementGate), true, 'the replacement gate survives the stale reaper');
   assert.equal(second.freeCapacity(), 0, 'the finalized replacement retains the only capacity slot');
   assert.deepEqual(firstErrors, [], 'the stale observer did not report an abandonment it did not remove');
+});
+
+test('a stale live gate settler cannot overwrite a replacement reservation after child exit', () => {
+  const firstPid = 111;
+  const stale = reserveChild(stateDir, {
+    workflow: 'wf1',
+    run: 'run_live_gate_reservation_race',
+    reservedAt: 0,
+    childKind: 'agent-run',
+    step: 'builder',
+  });
+  const firstChild = finalizeChildReservation(stateDir, stale.reservation, {
+    pid: firstPid,
+    spawnedAt: 0,
+    kind: 'agent-run',
+    step: 'builder',
+  });
+  const { hub: firstHub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { hub: secondHub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { spawner } = fakeSpawner();
+  let replacement: ReturnType<typeof reserveChild> | undefined;
+  let injected = false;
+  const second = createShiftLoop(baseOpts(secondHub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    isAlive: (pid) => pid === firstPid,
+  }));
+  const first = createShiftLoop(baseOpts(firstHub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    isAlive: (pid) => pid === firstPid,
+    dispatchLockOptions: {
+	beforeOpen: () => {
+	  if (injected) return;
+	  injected = true;
+	  second.noteChildExited({
+	    workflow: firstChild.workflow,
+	    run: firstChild.run,
+	    kind: 'agent-run',
+	    pid: firstChild.pid,
+	  });
+	  withDispatchLock(stateDir, {}, () => {
+	    replacement = reserveChild(stateDir, {
+	      workflow: 'wf1',
+	      run: firstChild.run,
+	      reservedAt: 0,
+	      childKind: 'agent-run',
+	      step: 'builder',
+	    });
+	  });
+	},
+    },
+  }));
+
+  first.freeCapacity();
+
+  assert.deepEqual(readChildReservations(stateDir), [replacement!.reservation]);
+  assert.equal(existsSync(replacement!.gatePath), true, 'the replacement gate survives stale settlement');
+  assert.equal(second.freeCapacity(), 0, 'the replacement reservation retains the only capacity slot');
+});
+
+test('a stale live gate settler cannot overwrite a finalized replacement after child exit', () => {
+  const firstPid = 111;
+  const replacementPid = 222;
+  const stale = reserveChild(stateDir, {
+    workflow: 'wf1',
+    run: 'run_live_gate_finalized_race',
+    reservedAt: 0,
+    childKind: 'agent-run',
+    step: 'builder',
+  });
+  const firstChild = finalizeChildReservation(stateDir, stale.reservation, {
+    pid: firstPid,
+    spawnedAt: 0,
+    kind: 'agent-run',
+    step: 'builder',
+  });
+  const { hub: firstHub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { hub: secondHub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { spawner } = fakeSpawner();
+  let replacementGate = '';
+  let replacementToken = '';
+  let injected = false;
+  const isAlive = (pid: number): boolean => pid === firstPid || pid === replacementPid;
+  const second = createShiftLoop(baseOpts(secondHub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    isAlive,
+  }));
+  const first = createShiftLoop(baseOpts(firstHub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    isAlive,
+    dispatchLockOptions: {
+	beforeOpen: () => {
+	  if (injected) return;
+	  injected = true;
+	  second.noteChildExited({
+	    workflow: firstChild.workflow,
+	    run: firstChild.run,
+	    kind: 'agent-run',
+	    pid: firstChild.pid,
+	  });
+	  withDispatchLock(stateDir, {}, () => {
+	    const replacement = reserveChild(stateDir, {
+	      workflow: 'wf1',
+	      run: firstChild.run,
+	      reservedAt: Date.now(),
+	      childKind: 'agent-run',
+	      step: 'builder',
+	    });
+	    const child = finalizeChildReservation(stateDir, replacement.reservation, {
+	      pid: replacementPid,
+	      spawnedAt: 1,
+	      kind: 'agent-run',
+	      step: 'builder',
+	    });
+	    startReservedChild(stateDir, child);
+	    replacementGate = replacement.gatePath;
+	    replacementToken = replacement.reservation.token;
+	  });
+	},
+    },
+  }));
+
+  first.freeCapacity();
+
+  assert.deepEqual(readChildRecords(stateDir).map((record) => record.pid), [replacementPid]);
+  assert.equal(readChildRecords(stateDir)[0]?.gateToken, replacementToken, 'the replacement handoff survives stale settlement');
+  assert.equal(existsSync(replacementGate), true, 'the replacement gate survives stale settlement');
+  assert.equal(second.freeCapacity(), 0, 'the finalized replacement retains the only capacity slot');
 });
 
 test('two shared-state loops keep a replacement record when a stale reaper races it', () => {

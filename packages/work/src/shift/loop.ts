@@ -72,6 +72,7 @@ import {
   reserveChild,
   startReservedChild,
   removeChildRecord,
+  settleChildGate,
   ensureStateDir,
   type ChildRecord,
   type ChildReservation,
@@ -222,12 +223,14 @@ export function removeChildRecordUnderDispatchLock(
 export function createLockedRemovalCallbacks(
   stateDir: string,
   options: LockedRemovalOptions = {},
-): Pick<ReconcileOptions, 'removeAbandonedReservation' | 'removeDeadChild'> {
+): Pick<ReconcileOptions, 'removeAbandonedReservation' | 'removeDeadChild' | 'settleLiveChild'> {
   return {
     removeAbandonedReservation: (reservation) =>
       withDispatchLock(stateDir, options, () => cancelReservedChild(stateDir, reservation)),
     removeDeadChild: (record) =>
       withDispatchLock(stateDir, options, () => removeChildRecord(stateDir, record.run, { pid: record.pid })),
+    settleLiveChild: (record) =>
+      withDispatchLock(stateDir, options, () => settleChildGate(stateDir, record)),
   };
 }
 

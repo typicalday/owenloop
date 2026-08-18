@@ -454,6 +454,36 @@ export interface ReconcileOptions {
    * serialize the read/guard/unlink sequence with a later re-dispatch.
    */
   removeDeadChild?: (record: ChildRecord) => boolean;
+  /**
+   * Finish a persisted PID record's start-gate handoff. The Shift daemon uses
+   * this to serialize the re-read/identity-check/write sequence with a later
+   * re-dispatch; standalone state callers intentionally retain the direct
+   * settlement default.
+   */
+  settleLiveChild?: (record: ChildRecord) => ChildRecord | undefined;
+}
+
+/**
+ * Open and clear a persisted child's start gate only if the record is still
+ * the same PID and gate-token pair the reconciler observed. A re-dispatch can
+ * replace either identity between an unlocked observation and this settlement;
+ * in that case it owns the record and nothing is changed.
+ */
+export function settleChildGate(stateDir: string, record: ChildRecord): ChildRecord | undefined {
+  if (record.gateToken === undefined) return record;
+  const current = readOneStateRecord(recordFile(stateDir, record.run));
+  if (
+    current === undefined ||
+    isReservation(current) ||
+    current.pid !== record.pid ||
+    current.gateToken !== record.gateToken
+  ) return undefined;
+
+  signalGate(gateFile(stateDir, current.gateToken), 'start', true);
+  const settled = { ...current };
+  delete settled.gateToken;
+  writeStateRecord(stateDir, settled);
+  return settled;
 }
 
 /**
@@ -502,11 +532,8 @@ export function reconcileInFlight(stateDir: string, arg?: Liveness | ReconcileOp
     if (record.gateToken !== undefined) {
       // A restart after PID persistence but before the parent opened the gate can
       // safely finish the handoff: the durable PID record is the prerequisite.
-      signalGate(gateFile(stateDir, record.gateToken), 'start', true);
-      const settled = { ...record };
-      delete settled.gateToken;
-      writeStateRecord(stateDir, settled);
-      live.push(settled);
+      const settled = options.settleLiveChild === undefined ? settleChildGate(stateDir, record) : options.settleLiveChild(record);
+      if (settled !== undefined) live.push(settled);
     } else {
       live.push(record);
     }
