@@ -257,6 +257,7 @@ export interface OrderRuntimeVars {
   run: string;
   key: string;
   index?: number;
+  modifier?: string;
 }
 
 /**
@@ -283,6 +284,7 @@ export function substituteOrderVars(
       case 'STEP': return opts.step ?? m;
       case 'KEY': return runtime.key;
       case 'INDEX': return runtime.index === undefined ? '' : String(runtime.index);
+      case 'MODIFIER': return runtime.modifier ?? m;
       // Intentionally step-generic: a single firing can discharge multiple
       // outputs (order.outputs) at once, so there is no single produce to
       // resolve a per-produce maxAttempts override against here. This
@@ -337,7 +339,13 @@ export class OrderResolver {
       ...instructions,
       prompt: substituteOrderVars(
         resolved.prompt,
-        { workflow: order.workflow, run: order.run, key: order.key, ...(order.index !== undefined ? { index: order.index } : {}) },
+				{
+					workflow: order.workflow,
+					run: order.run,
+					key: order.key,
+					...(order.index !== undefined ? { index: order.index } : {}),
+					...(order.modifier !== undefined ? { modifier: order.modifier } : {}),
+				},
         { step: order.step, maxAttempts },
       ),
     };

@@ -117,6 +117,25 @@ test('runtime placeholder materialization matches the pre-reference substitution
   assert.equal(mapped.prompt, 'k=gather.src[3].formatcheck i=3 cap=2');
 });
 
+test('MODIFIER resolves from an order when present and remains literal when absent', () => {
+  const source: OrderInstructionSource = {
+    digestOf: () => 'modifier-digest',
+    lookup: () => ({
+      status: 'resolved' as const,
+      instructions: { prompt: 'modifier=${MODIFIER}', maxAttempts: 3 },
+    }),
+  };
+  const resolver = new OrderResolver(source);
+  assert.equal(
+    resolver.resolveOrder(orderOf({ defDigest: 'modifier-digest', modifier: 'deep' })).prompt,
+    'modifier=deep',
+  );
+  assert.equal(
+    resolver.resolveOrder(orderOf({ defDigest: 'modifier-digest' })).prompt,
+    'modifier=${MODIFIER}',
+  );
+});
+
 test('an unknown digest throws UnknownDefDigestError — no name fallback, no empty instructions', () => {
   const source = createDefInstructionSource([fixtureDef]);
   const resolver = new OrderResolver(source);

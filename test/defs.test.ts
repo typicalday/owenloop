@@ -307,7 +307,7 @@ test('buildDef rejects consumes that are not a list of strings', () => {
 test('buildDef rejects a produce entry that is neither a string nor a { name, schema }', () => {
   assert.throws(
     () => buildDef({ name: 'bad', inputs: [{ name: 'a' }], steps: [{ name: 'x', consumes: ['a'], produces: [42] }] }),
-    /must be a string or a \{ name, schema, judges, maxAttempts, maxSchemaFailures \} mapping/,
+    /must be a string or a \{ name, schema, judges, maxAttempts, maxSchemaFailures, bind \} mapping/,
   );
 });
 
@@ -1504,7 +1504,7 @@ test('generates: invalid entry (non-string/non-object) throws DefError', () => {
       inputs: [{ name: 'q' }],
       steps: [{ name: 'a', consumes: ['q'], generates: [42], terminal: true }],
     }),
-    (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema, judges, maxAttempts, maxSchemaFailures \} mapping/.test((e as Error).message),
+    (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema, judges, maxAttempts, maxSchemaFailures, bind \} mapping/.test((e as Error).message),
   );
 });
 
@@ -3174,6 +3174,74 @@ test('a def WITHOUT modifiers: still accepts a capability-silent command step (c
     ],
   });
   assert.equal(d.steps[0]!.capabilities, undefined);
+});
+
+test('produce bind normalizes scalar and mapping forms', () => {
+  const d = parseDef({
+    name: 'bound',
+    modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [{
+      name: 'init',
+      consumes: ['proposal'],
+      capabilities: ['utility'],
+      produces: [
+				{ name: 'modifier', bind: 'modifier' },
+				{ name: 'dossier', bind: { to: 'meta.customer', from: 'payload.customerId' } },
+      ],
+    }],
+  });
+  assert.deepEqual(d.steps[0]!.produces[0]!.bind, { to: 'modifier', from: 'value' });
+  assert.deepEqual(d.steps[0]!.produces[1]!.bind, { to: 'meta.customer', from: 'payload.customerId' });
+});
+
+test('produce bind rejects invalid targets, paths, duplicate modifier writers, and undeclared modifiers', () => {
+  const base = {
+    name: 'bound',
+    inputs: [{ name: 'proposal' }],
+    steps: [{ name: 'init', consumes: ['proposal'], produces: [{ name: 'out', bind: 'modifier' }] }],
+  };
+  assert.throws(
+    () => parseDef(base),
+    (e: unknown) => e instanceof DefError && /binds modifier but workflow 'bound' declares no modifiers/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({
+      ...base,
+      modifiers: ['deep'],
+      steps: [{ name: 'init', consumes: ['proposal'], produces: [{ name: 'out', bind: { to: 'meta.', from: 'payload..value' } }] }],
+    }),
+    (e: unknown) => e instanceof DefError && /bind.to 'meta.'/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({
+      ...base,
+      modifiers: ['deep'],
+      steps: [{
+				name: 'init',
+				consumes: ['proposal'],
+				produces: [{ name: 'one', bind: 'modifier' }, { name: 'two', bind: 'modifier' }],
+      }],
+    }),
+    (e: unknown) => e instanceof DefError && /binds modifier more than once/.test(e.message),
+  );
+});
+
+test('lintDef warns capability-bearing branches that are not downstream of a modifier bind', () => {
+  const d = parseDef({
+    name: 'boundlint',
+    modifiers: ['deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [
+      { name: 'init', consumes: ['proposal'], produces: [{ name: 'modifier', bind: 'modifier' }], capabilities: ['utility'] },
+      { name: 'planner', consumes: ['modifier'], produces: ['plan'], capabilities: ['wise'] },
+      { name: 'parallel', consumes: ['proposal'], produces: ['other'], capabilities: ['build'] },
+    ],
+  });
+  const { errors, warnings } = lintDef(d);
+  assert.deepEqual(errors, []);
+  assert.ok(warnings.some((w) => /step 'parallel'.*not downstream of artifact 'modifier'/.test(w)), warnings.join('\n'));
+  assert.ok(!warnings.some((w) => /step 'planner'.*not downstream/.test(w)), warnings.join('\n'));
 });
 
 // ---- judge capability inheritance -------------------------------------------
