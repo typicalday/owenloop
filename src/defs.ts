@@ -30,7 +30,7 @@ import { assertValidSchema } from './schema.ts';
 // The separator lives with composition/matching (capabilities.ts); the parser
 // only enforces that an AUTHORED name never contains it.
 import { MODIFIER_SEPARATOR } from './capabilities.ts';
-import type { Acceptance, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
+import type { Acceptance, ConsumePattern, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
 
@@ -1559,6 +1559,16 @@ export function validateDef(def: WorkflowDef): string[] {
     if (l.produces.length !== 1) {
       errors.push(`calls: step '${l.name}' must produce exactly one output (got ${l.produces.length})`);
     }
+    // A calls: outcome is published by the composition machinery rather than
+    // accepted through green(), so it has no transactional bind write path.
+    // Refuse it at definition load instead of allowing a silently stale route.
+    for (const produce of l.produces) {
+      if (produce.bind !== undefined) {
+				errors.push(
+					`calls: step '${l.name}' produce '${produce.raw}' declares bind, which is not supported on calls: outcomes`,
+				);
+      }
+    }
     // (b) callsInputs VALUES must be real parent artifacts (inputs or step-produced stems)
     for (const [, parentArtifact] of Object.entries(l.callsInputs ?? {})) {
       if (!producerOf.has(parentArtifact)) {
@@ -1942,15 +1952,31 @@ function danglingReduceSuffixWarnings(def: WorkflowDef): string[] {
   return warnings;
 }
 
+/**
+ * Whether a consume can receive a value produced by this exact pattern.
+ *
+ * Keeping map suffixes here is essential: `items[$i].review` does not make a
+ * consumer of `items[*].analysis` (or bare `items[*]`) downstream merely
+ * because both lanes share the `items` stem.
+ */
+function consumesProducedPattern(consume: ConsumePattern, produce: ProducePattern): boolean {
+  if (consume.stem !== produce.stem) return false;
+  if (produce.kind === 'singleton') return consume.mode === 'plain';
+  if (produce.kind === 'collection') {
+    return consume.mode !== 'plain' && consume.suffix === '';
+  }
+  return consume.mode !== 'plain' && consume.suffix === produce.suffix;
+}
+
 /** Warn when routed work can run before the artifact that writes the modifier. */
 function unroutedCapabilityWarnings(def: WorkflowDef): string[] {
   let bindingStep: StepDef | undefined;
-  let boundArtifact: string | undefined;
+  let boundArtifact: ProducePattern | undefined;
   for (const step of def.steps) {
     const bound = step.produces.find((p) => p.bind?.to === 'modifier');
     if (bound !== undefined) {
       bindingStep = step;
-      boundArtifact = bound.stem;
+      boundArtifact = bound;
       break;
     }
   }
@@ -1959,15 +1985,15 @@ function unroutedCapabilityWarnings(def: WorkflowDef): string[] {
   // Forward graph closure from the bound artifact. The binding step itself is
   // exempt, but its unbound sibling outputs must not make a branch downstream.
   const reachedSteps = new Set<string>([bindingStep.name]);
-  const reachedArtifacts = new Set<string>([boundArtifact]);
+  const reachedArtifacts: ProducePattern[] = [boundArtifact];
   let changed = true;
   while (changed) {
     changed = false;
     for (const step of def.steps) {
       if (reachedSteps.has(step.name)) continue;
-      if (!step.consumes.some((consume) => reachedArtifacts.has(consume.stem))) continue;
+      if (!step.consumes.some((consume) => reachedArtifacts.some((produce) => consumesProducedPattern(consume, produce)))) continue;
       reachedSteps.add(step.name);
-      for (const produce of step.produces) reachedArtifacts.add(produce.stem);
+      reachedArtifacts.push(...step.produces);
       changed = true;
     }
   }
@@ -1977,7 +2003,7 @@ function unroutedCapabilityWarnings(def: WorkflowDef): string[] {
     if (step.capabilities === undefined || step.capabilities.length === 0) continue;
     if (reachedSteps.has(step.name)) continue;
     warnings.push(
-      `step '${step.name}' declares capabilities (${step.capabilities.join(', ')}) but is not downstream of artifact '${boundArtifact}' bound to modifier`,
+      `step '${step.name}' declares capabilities (${step.capabilities.join(', ')}) but is not downstream of artifact '${boundArtifact.raw}' bound to modifier`,
     );
   }
   return warnings;

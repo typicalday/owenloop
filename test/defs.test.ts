@@ -3239,6 +3239,24 @@ test('produce bind rejects invalid targets, paths, duplicate modifier writers, a
   );
 });
 
+test('calls outcomes reject bind because their acceptance bypasses green()', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'bound-calls',
+      modifiers: ['deep'],
+      inputs: [{ name: 'proposal' }],
+      steps: [{
+				name: 'delegate',
+				calls: 'child',
+				inputs: { proposal: 'proposal' },
+				produces: [{ name: 'outcome', bind: 'modifier' }],
+      }],
+    }),
+    (e: unknown) => e instanceof DefError
+      && /calls: step 'delegate' produce 'outcome' declares bind.*not supported on calls: outcomes/.test(e.message),
+  );
+});
+
 test('lintDef warns capability-bearing branches that are not downstream of a modifier bind', () => {
   const d = parseDef({
     name: 'boundlint',
@@ -3262,6 +3280,34 @@ test('lintDef warns capability-bearing branches that are not downstream of a mod
   assert.ok(warnings.some((w) => /step 'sibling-consumer'.*not downstream of artifact 'modifier'/.test(w)), warnings.join('\n'));
   assert.ok(!warnings.some((w) => /step 'planner'.*not downstream/.test(w)), warnings.join('\n'));
   assert.ok(!warnings.some((w) => /step 'init'.*not downstream/.test(w)), warnings.join('\n'));
+});
+
+test('lintDef distinguishes a bound map suffix from sibling and collection lanes', () => {
+  const d = parseDef({
+    name: 'bound-map-lint',
+    modifiers: ['deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [
+      { name: 'gather', consumes: ['proposal'], produces: ['items[]'], capabilities: ['utility'] },
+      {
+				name: 'assess',
+				consumes: ['items[$i]'],
+				produces: [
+					{ name: 'items[$i].analysis', bind: { to: 'meta.analysis', from: 'analysis' } },
+					{ name: 'items[$i].review', bind: 'modifier' },
+				],
+				capabilities: ['utility'],
+      },
+      { name: 'reviewer', consumes: ['items[*].review'], produces: ['review-summary'], capabilities: ['review'] },
+      { name: 'analyst', consumes: ['items[*].analysis'], produces: ['analysis-summary'], capabilities: ['analysis'] },
+      { name: 'collector', consumes: ['items[*]'], produces: ['collected'], capabilities: ['build'] },
+    ],
+  });
+  const { errors, warnings } = lintDef(d);
+  assert.deepEqual(errors, []);
+  assert.ok(!warnings.some((w) => /step 'reviewer'.*not downstream/.test(w)), warnings.join('\n'));
+  assert.ok(warnings.some((w) => /step 'analyst'.*not downstream of artifact 'items\[\$i\]\.review'/.test(w)), warnings.join('\n'));
+  assert.ok(warnings.some((w) => /step 'collector'.*not downstream of artifact 'items\[\$i\]\.review'/.test(w)), warnings.join('\n'));
 });
 
 // ---- judge capability inheritance -------------------------------------------
