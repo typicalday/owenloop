@@ -1430,8 +1430,18 @@ test('createDefaultSpawner reports a nonzero detached worker exit with generic l
   // unref'd; Node 22 may otherwise let the isolated test process drain before
   // delivering the child's `exit` event.
   const keepAlive = setTimeout(() => {}, 5_000);
+  const exits: WorkerExit[] = [];
   const failure = new Promise<Parameters<NonNullable<Parameters<typeof createDefaultSpawner>[4]>>[0]>((resolve) => {
-    const spawner = createDefaultSpawner(ORIGIN, 'default', script, 'shf_test', resolve);
+    const spawner = createDefaultSpawner(
+      ORIGIN,
+      'default',
+      script,
+      'shf_test',
+      resolve,
+      undefined,
+      undefined,
+      (exit) => exits.push(exit),
+    );
     spawner({ workflow: 'wf1', run: 'run_failed', step: 'builder', kind: 'agent-run' });
   });
 
@@ -1446,6 +1456,11 @@ test('createDefaultSpawner reports a nonzero detached worker exit with generic l
       signal: null,
       message: 'worker exited without completing successfully',
     });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(exits.length, 1, 'the independent exit latch emits once even for a nonzero exit');
+    assert.equal(exits[0]!.exitStatus, 7);
+    assert.equal(exits[0]!.signal, null);
+    assert.ok(exits[0]!.pid > 0);
   } finally {
     clearTimeout(keepAlive);
   }
@@ -1456,6 +1471,7 @@ test('createDefaultSpawner reports a clean agent-run exit without a worker failu
   writeFileSync(script, 'process.exit(0);\n');
   const keepAlive = setTimeout(() => {}, 5_000);
   const failures: unknown[] = [];
+  const exits: WorkerExit[] = [];
   const exit = new Promise<WorkerExit>((resolve) => {
     const spawner = createDefaultSpawner(
       ORIGIN,
@@ -1465,7 +1481,10 @@ test('createDefaultSpawner reports a clean agent-run exit without a worker failu
       (failure) => failures.push(failure),
       undefined,
       undefined,
-      resolve,
+      (reported) => {
+	exits.push(reported);
+	resolve(reported);
+      },
     );
     spawner({ workflow: 'wf1', run: 'run_completed', step: 'builder', kind: 'agent-run' });
   });
@@ -1480,6 +1499,8 @@ test('createDefaultSpawner reports a clean agent-run exit without a worker failu
     assert.equal(reported.signal, null);
     assert.ok(reported.pid > 0);
     assert.deepEqual(failures, []);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(exits.length, 1, 'a clean exit is reported exactly once');
   } finally {
     clearTimeout(keepAlive);
   }
@@ -1630,6 +1651,12 @@ test('a mid-turn completion releases capacity even when the pid probe stays aliv
   assert.equal(loop.freeCapacity(), 0);
   const record = readChildRecords(stateDir)[0]!;
 
+  loop.noteChildExited({
+    workflow: 'wf1',
+    run: record.run,
+    kind: 'agent-run',
+    pid: record.pid,
+  });
   loop.noteChildExited({
     workflow: 'wf1',
     run: record.run,
