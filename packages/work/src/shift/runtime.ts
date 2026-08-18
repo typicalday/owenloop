@@ -21,7 +21,7 @@ import { createShiftLoop, type ShiftLoop } from './loop.ts';
 import { createShiftLogSink } from './logsink.ts';
 import { prepareShiftLogDir, shiftLogFile } from './logretention.ts';
 import { stampShiftEvent, type ShiftEvent, type ShiftEventBody } from './protocol.ts';
-import { createDefaultSpawner, type WorkerFailure } from './spawn.ts';
+import { createDefaultSpawner, type WorkerExit, type WorkerFailure } from './spawn.ts';
 import { resolveStateDir, ensureStateDir, reconcileInFlight } from './state.ts';
 import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.ts';
 import {
@@ -553,6 +553,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     // way forever is re-dispatched on a backoff instead of once per poll.
     loopRef.current?.noteWorkerFailure(failure);
   };
+  const reportWorkerExit = (exit: WorkerExit): void => {
+    loopRef.current?.noteChildExited(exit);
+  };
   const spawner = createDefaultSpawner(
     origin,
     account,
@@ -566,6 +569,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       ? { dir: logDir, err: (line: string) => process.stderr.write(`${line}\n`) }
       : undefined,
     allowedWorkdirRoots,
+    reportWorkerExit,
   );
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 
