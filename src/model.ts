@@ -116,6 +116,11 @@ export function judgeNameOf(step: StepDef): string {
 export function mapProduce(step: StepDef): ProducePattern | undefined {
   return step.produces.find((p) => p.kind === 'map');
 }
+
+/** All per-element outputs a map step owns for each input index. */
+export function mapProduces(step: StepDef): ProducePattern[] {
+  return step.produces.filter((p) => p.kind === 'map');
+}
 /**
  * The concrete input artifact a map element binds on for index `i`. Normally the
  * bare collection member `stem[i]`. But when the map consume carries a suffix
@@ -541,15 +546,15 @@ export function pendingOwed(def: WorkflowDef, arts: ArtifactMap): ArtifactData[]
     const mode = stepMode(step);
     if (mode === 'map') {
       const mc = mapConsume(step);
-      const mp = mapProduce(step);
-      if (!mc || !mp) continue;
+      const mps = mapProduces(step);
+      if (!mc || mps.length === 0) continue;
       // the bare members fix the index space; a child is owed only once that
       // index's actual consumed input (bare member, or its suffixed child) greens
       for (const m of members(arts, mc.stem)) {
         const el = parseElement(m.path);
         if (!el) continue;
         if (!isGreen(arts.get(mapInputPath(mc, el.index)))) continue;
-        ensure(bindProduce(mp, el.index), step.name);
+	for (const mp of mps) ensure(bindProduce(mp, el.index), step.name);
       }
     } else {
       for (const p of singletonProduces(step)) ensure(p.stem, step.name);
@@ -726,8 +731,8 @@ export function eligibleFirings(
       } else if (mode === 'map') {
         if (plainSatisfied) {
           const mc = mapConsume(step);
-          const mp = mapProduce(step);
-          if (mc && mp) {
+	  const mps = mapProduces(step);
+	  if (mc && mps.length > 0) {
             for (const m of members(arts, mc.stem)) {
               const el = parseElement(m.path);
               if (!el) continue;
@@ -735,24 +740,24 @@ export function eligibleFirings(
               // suffixed child when this map chains off another map's output.
               const inPath = mapInputPath(mc, el.index);
               if (!isGreen(arts.get(inPath))) continue;
-              const outPath = bindProduce(mp, el.index);
-              const outArt = arts.get(outPath);
-              // group: membership is singleton-only (§26.3), so a map-produce outPath can
-              // never be a group member today — this check is defensive, not reachable,
-              // and exists so a future relaxation of the singleton-only restriction can't
-              // silently reopen the eligibility/commit-check gap this file fixes.
-              if (
-                !isDebt(outArt) ||
-                (!opts?.ignoreFreeze && frozen(outArt, step)) ||
-                groupBlockingWinner(def, arts, outPath) !== undefined
-              )
-                continue;
+	      const outputs = mps
+		.map((mp) => bindProduce(mp, el.index))
+		.filter((outPath) => {
+		  const outArt = arts.get(outPath);
+		  // Group membership is singleton-only (§26.3), so a map-produce
+		  // path cannot be a group member today. Keep the defensive check
+		  // so a future relaxation cannot reopen the eligibility/commit gap.
+		  return isDebt(outArt)
+		    && (opts?.ignoreFreeze || !frozen(outArt, step))
+		    && groupBlockingWinner(def, arts, outPath) === undefined;
+		});
+	      if (outputs.length === 0) continue;
               firings.push({
                 step: step.name,
                 key: m.path,
                 index: el.index,
                 inputs: [inPath, ...plainPaths],
-                outputs: [outPath],
+		outputs,
               });
             }
           }
@@ -910,7 +915,7 @@ export function canEverFire(step: StepDef, def: WorkflowDef, reachable?: Set<str
     case 'reduce':
       return singletonProduces(step).length > 0;
     case 'map':
-      return !!mapProduce(step) && !!mapConsume(step);
+      return mapProduces(step).length > 0 && !!mapConsume(step);
     case 'plain':
       return plainOutputs(step).length > 0;
     default:
@@ -1330,11 +1335,11 @@ function stepOwesSomething(def: WorkflowDef, step: StepDef, arts: ArtifactMap): 
   const mode = stepMode(step);
   if (mode === 'map') {
     const mc = mapConsume(step);
-    const mp = mapProduce(step);
-    if (!mc || !mp) return false;
+    const mps = mapProduces(step);
+    if (!mc || mps.length === 0) return false;
     return members(arts, mc.stem).some((m) => {
       const el = parseElement(m.path);
-      return el ? isDebt(arts.get(bindProduce(mp, el.index))) : false;
+      return el !== null && mps.some((mp) => isDebt(arts.get(bindProduce(mp, el.index))));
     });
   }
   return plainOutputs(step).some((p) => isDebt(arts.get(p)));
@@ -1360,12 +1365,12 @@ function blockingInputs(def: WorkflowDef, step: StepDef, arts: ArtifactMap): str
   // a map child that owes but can't fire is blocked on its per-element input
   // (its bare member, or — for a chained map — the suffixed child upstream owes)
   const mc = mapConsume(step);
-  const mp = mapProduce(step);
-  if (mc && mp) {
+  const mps = mapProduces(step);
+  if (mc && mps.length > 0) {
     for (const m of members(arts, mc.stem)) {
       const el = parseElement(m.path);
       if (!el) continue;
-      if (!isDebt(arts.get(bindProduce(mp, el.index)))) continue;
+      if (!mps.some((mp) => isDebt(arts.get(bindProduce(mp, el.index))))) continue;
       const inPath = mapInputPath(mc, el.index);
       if (!isGreen(arts.get(inPath))) out.push(inPath);
     }
@@ -1432,8 +1437,7 @@ export function buildTrace(
     const stems: string[] = [];
     for (const p of singletonProduces(step)) stems.push(p.stem);
     for (const p of collectionProduces(step)) stems.push(p.stem);
-    const mp = mapProduce(step);
-    if (mp) stems.push(mp.raw); // use the raw pattern (e.g. "gather.source[$i].check")
+    for (const mp of mapProduces(step)) stems.push(mp.raw); // use raw patterns (e.g. "gather.source[$i].check")
     stepProducedStems.set(step.name, stems);
   }
 

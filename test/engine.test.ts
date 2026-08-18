@@ -1866,6 +1866,7 @@ test('a map output applies only its own bind when sibling map outputs share a st
   engine.close(wf, gather.run);
 
   const assess = fire(engine, wf, 'assess', 2);
+  assert.deepEqual(assess.outputs, ['items[0].analysis', 'items[0].review']);
   assert.equal(
     engine.green(wf, assess.run, 'items[0].review', { modifier: 'deep', analysis: 'wrong-target' }).outcome,
     'green',
