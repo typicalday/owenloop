@@ -181,6 +181,24 @@ export interface LockedRemovalOptions {
   label?: string;
 }
 
+/** Run a state mutation while holding the lock that serializes dispatch state. */
+export function withDispatchLock<T>(
+  stateDir: string,
+  options: LockedRemovalOptions = {},
+  fn: () => T,
+): T {
+  const dispatchLock = acquireFileLockSync(join(stateDir, '.dispatch.lock'), {
+    ...options.dispatchLockOptions,
+    waitMs: options.waitMs ?? 30_000,
+    label: options.label ?? 'owenloop Shift dispatch-state removal',
+  });
+  try {
+    return fn();
+  } finally {
+    releaseFileLock(dispatchLock);
+  }
+}
+
 /**
  * Remove one child record while holding the same lock that serializes durable
  * reservation creation. The record is deliberately re-read by
@@ -193,16 +211,7 @@ export function removeChildRecordUnderDispatchLock(
   recordOptions?: { pid?: number },
   options: LockedRemovalOptions = {},
 ): boolean {
-  const dispatchLock = acquireFileLockSync(join(stateDir, '.dispatch.lock'), {
-    ...options.dispatchLockOptions,
-    waitMs: options.waitMs ?? 30_000,
-    label: options.label ?? 'owenloop Shift dispatch-state removal',
-  });
-  try {
-    return removeChildRecord(stateDir, run, recordOptions);
-  } finally {
-    releaseFileLock(dispatchLock);
-  }
+  return withDispatchLock(stateDir, options, () => removeChildRecord(stateDir, run, recordOptions));
 }
 
 /**
@@ -216,9 +225,9 @@ export function createLockedRemovalCallbacks(
 ): Pick<ReconcileOptions, 'removeAbandonedReservation' | 'removeDeadChild'> {
   return {
     removeAbandonedReservation: (reservation) =>
-      removeChildRecordUnderDispatchLock(stateDir, reservation.run, undefined, options),
+      withDispatchLock(stateDir, options, () => cancelReservedChild(stateDir, reservation)),
     removeDeadChild: (record) =>
-      removeChildRecordUnderDispatchLock(stateDir, record.run, { pid: record.pid }, options),
+      withDispatchLock(stateDir, options, () => removeChildRecord(stateDir, record.run, { pid: record.pid })),
   };
 }
 
@@ -1381,7 +1390,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	runBrakeKey.delete(run);
 	stepBrake.delete(brakeKey);
       }
-      removeRecordUnderDispatchLock(run);
+	// The hub's closed-run report is authoritative but carries no record identity.
+	removeRecordUnderDispatchLock(run);
     },
     noteChildExited: (exit: { workflow: string; run: string; kind: 'exec' | 'agent-run'; pid: number }) => {
       pendingCandidates.delete(exit.run);

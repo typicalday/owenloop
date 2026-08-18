@@ -23,10 +23,12 @@ import {
   type WorkerExit,
 } from '../src/shift/spawn.ts';
 import {
+  finalizeChildReservation,
   readChildRecords,
   readChildReservations,
   removeChildRecord,
   reserveChild,
+  startReservedChild,
   ShiftStateRecordError,
   writeChildRecord,
 } from '../src/shift/state.ts';
@@ -1691,6 +1693,115 @@ test('a stale child exit report cannot free a later dispatch of the same run', a
   loop.noteChildExited({ workflow: 'wf1', run: first.run, kind: 'agent-run', pid: first.pid });
   assert.deepEqual(readChildRecords(stateDir).map((record) => record.pid), [first.pid + 1]);
   assert.equal(loop.freeCapacity(), 0, 'the later child still owns the only slot');
+});
+
+test('two shared-state loops keep a replacement reservation when a stale reaper races it', () => {
+  const now = 120_001;
+  const stale = reserveChild(stateDir, {
+    workflow: 'wf1',
+    run: 'run_reservation_reaper_race',
+    reservedAt: 0,
+    childKind: 'agent-run',
+    step: 'builder',
+  });
+  const { hub: firstHub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { hub: secondHub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { spawner } = fakeSpawner();
+  const firstErrors: string[] = [];
+  let replacement: ReturnType<typeof reserveChild> | undefined;
+  let injected = false;
+  const second = createShiftLoop(baseOpts(secondHub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    now: () => now,
+  }));
+  const first = createShiftLoop(baseOpts(firstHub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    now: () => now,
+    err: (line) => firstErrors.push(line),
+    dispatchLockOptions: {
+	beforeOpen: () => {
+	  if (injected) return;
+	  injected = true;
+	  assert.equal(second.freeCapacity(), 1, 'the other Shift removed the stale reservation first');
+	  replacement = reserveChild(stateDir, {
+	    workflow: 'wf1',
+	    run: stale.reservation.run,
+	    reservedAt: now,
+	    childKind: 'agent-run',
+	    step: 'builder',
+	  });
+	},
+    },
+  }));
+
+  first.freeCapacity();
+
+  assert.deepEqual(readChildReservations(stateDir), [replacement!.reservation]);
+  assert.equal(existsSync(replacement!.gatePath), true, 'the replacement gate survives the stale reaper');
+  assert.equal(second.freeCapacity(), 0, 'the replacement reservation retains the only capacity slot');
+  assert.deepEqual(firstErrors, [], 'the stale observer did not report an abandonment it did not remove');
+});
+
+test('two shared-state loops keep a finalized replacement when a stale reservation reaper races it', () => {
+  const now = 120_001;
+  const replacementPid = 222;
+  const stale = reserveChild(stateDir, {
+    workflow: 'wf1',
+    run: 'run_finalized_reservation_reaper_race',
+    reservedAt: 0,
+    childKind: 'agent-run',
+    step: 'builder',
+  });
+  const { hub: firstHub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { hub: secondHub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { spawner } = fakeSpawner();
+  const firstErrors: string[] = [];
+  let replacementGate = '';
+  let injected = false;
+  const second = createShiftLoop(baseOpts(secondHub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    now: () => now,
+    isAlive: (pid) => pid === replacementPid,
+  }));
+  const first = createShiftLoop(baseOpts(firstHub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    now: () => now,
+    isAlive: (pid) => pid === replacementPid,
+    err: (line) => firstErrors.push(line),
+    dispatchLockOptions: {
+	beforeOpen: () => {
+	  if (injected) return;
+	  injected = true;
+	  assert.equal(second.freeCapacity(), 1, 'the other Shift removed the stale reservation first');
+	  const replacement = reserveChild(stateDir, {
+	    workflow: 'wf1',
+	    run: stale.reservation.run,
+	    reservedAt: now,
+	    childKind: 'agent-run',
+	    step: 'builder',
+	  });
+	  const child = finalizeChildReservation(stateDir, replacement.reservation, {
+	    pid: replacementPid,
+	    spawnedAt: now,
+	    kind: 'agent-run',
+	    step: 'builder',
+	  });
+	  startReservedChild(stateDir, child);
+	  replacementGate = replacement.gatePath;
+	},
+    },
+  }));
+
+  first.freeCapacity();
+
+  assert.deepEqual(readChildRecords(stateDir).map((record) => record.pid), [replacementPid]);
+  assert.equal(existsSync(replacementGate), true, 'the replacement gate survives the stale reaper');
+  assert.equal(second.freeCapacity(), 0, 'the finalized replacement retains the only capacity slot');
+  assert.deepEqual(firstErrors, [], 'the stale observer did not report an abandonment it did not remove');
 });
 
 test('two shared-state loops keep a replacement record when a stale reaper races it', () => {

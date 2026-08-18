@@ -4,7 +4,9 @@ import { isAbsolute, join, resolve } from 'node:path';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
+import { createLockedRemovalCallbacks } from '../src/shift/loop.ts';
 import {
+  cancelReservedChild,
   defaultIsAlive,
   finalizeChildReservation,
   readChildRecords,
@@ -296,6 +298,30 @@ test('reserveChild exclusively deduplicates the same run and removes the losing 
   }), /EEXIST/u);
   assert.equal(readdirSync(dir).filter((name) => name.endsWith('.gate')).length, 1);
   assert.equal(readChildReservations(dir).length, 1);
+});
+
+test('locked stale-reservation removal does not cancel a replacement record', () => {
+  const stale = reserveChild(dir, {
+    workflow: 'wf1',
+    run: 'run_replaced_reservation',
+    reservedAt: 0,
+    childKind: 'agent-run',
+    step: 'builder',
+  });
+  assert.equal(cancelReservedChild(dir, stale.reservation), true);
+  const replacement = reserveChild(dir, {
+    workflow: 'wf1',
+    run: stale.reservation.run,
+    reservedAt: 1,
+    childKind: 'agent-run',
+    step: 'builder',
+  });
+
+  const removed = createLockedRemovalCallbacks(dir).removeAbandonedReservation!(stale.reservation);
+
+  assert.equal(removed, false);
+  assert.deepEqual(readChildReservations(dir), [replacement.reservation]);
+  assert.equal(existsSync(replacement.gatePath), true);
 });
 
 test('a restart finishes a PID-persisted start-gate handoff and settles the child record', () => {
