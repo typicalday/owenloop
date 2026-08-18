@@ -135,7 +135,7 @@ For every regular file:
 - Every entry's data padding, including the padding after a `PaxHeader` data record, is zero-filled.
 - The archive ends with exactly two zero blocks and no bytes after the terminator.
 
-The gzip wrapper uses compression level 9 and has no optional filename, comment, or extra fields. Gzip mtime bytes are zero, and gzip header byte 9 (the OS byte) is explicitly forced to zero so the gzip header bytes are identical across platforms. The compressed payload itself varies with the linked zlib implementation and is not the bundle identity; see the def digest above.
+The gzip wrapper uses compression level 9 and has no optional filename, comment, or extra fields. Its magic, CM, FLG, MTIME, and OS ranges (bytes 0-1, 2, 3, 4-7, and 9) are fixed; mtime is zero and header byte 9 (the OS byte) is explicitly forced to zero. XFL (byte 8) comes from the linked zlib implementation and is intentionally not normalized. The compressed payload itself varies with the linked zlib implementation and is not the bundle identity; see the def digest above.
 
 The canonical tar contains regular-file entries only. Parent directories are implied by `/`-separated file paths and are never emitted as tar entries. The strict reader rejects archive symlink, hardlink, device, FIFO, socket, directory, and unknown entry types. The packer rejects source symlinks and non-regular filesystem nodes. Absolute paths, `.` segments, and `..` traversal are refused rather than normalized.
 
