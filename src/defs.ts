@@ -1659,6 +1659,10 @@ export function validateDef(def: WorkflowDef): string[] {
     for (const p of l.produces) {
       const bind = p.bind;
       if (bind === undefined) continue;
+      if (p.kind === 'collection') {
+		errors.push(`step '${l.name}' produce '${p.raw}' bind is not supported on collection produces`);
+		continue;
+      }
       if (bind.to === 'modifier') {
 				if (declaredModifiers.size === 0) {
 					errors.push(

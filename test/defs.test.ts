@@ -3225,6 +3225,18 @@ test('produce bind rejects invalid targets, paths, duplicate modifier writers, a
     }),
     (e: unknown) => e instanceof DefError && /binds modifier more than once/.test(e.message),
   );
+  assert.throws(
+    () => parseDef({
+      name: 'collection-bind',
+      inputs: [{ name: 'proposal' }],
+      steps: [{
+		name: 'gather',
+		consumes: ['proposal'],
+		produces: [{ name: 'items[]', bind: { to: 'meta.count', from: 'count' } }],
+      }],
+    }),
+    (e: unknown) => e instanceof DefError && /bind is not supported on collection produces/.test(e.message),
+  );
 });
 
 test('lintDef warns capability-bearing branches that are not downstream of a modifier bind', () => {

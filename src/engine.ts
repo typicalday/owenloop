@@ -2032,9 +2032,18 @@ export class Engine {
   /** Return the binding declaration that owns this artifact path, if any. */
   private artifactBind(def: WorkflowDef, art: ArtifactData): ArtifactBind | undefined {
     const step = def.steps.find((candidate) => candidate.name === art.producer);
+    if (step === undefined) return undefined;
     const element = parseElement(art.path);
-    const stem = element?.stem ?? art.path;
-    return step?.produces.find((produce) => produce.stem === stem)?.bind;
+    if (element !== null) {
+      return step.produces.find(
+		(produce) => produce.kind === 'map'
+		  && produce.stem === element.stem
+		  && produce.suffix === element.suffix,
+      )?.bind;
+    }
+    return step.produces.find(
+      (produce) => produce.kind === 'singleton' && produce.stem === art.path,
+    )?.bind;
   }
 
   /** Resolve a declared object-only bind path against an accepted artifact value. */
@@ -2086,11 +2095,16 @@ export class Engine {
     const bind = this.artifactBind(def, art);
     if (bind === undefined) return;
     const value = this.boundValue(art.path, bind, acceptedValue);
+    const routing = this.store.getWorkflow(workflow);
+    if (routing === undefined) throw new Error(`cannot bind routing for unknown workflow '${workflow}'`);
+    let prior: unknown;
     if (bind.to === 'modifier') {
       this.assertBoundModifier(def, value);
+      prior = routing.modifier;
       this.store.setWorkflowRouting(workflow, { modifier: value });
     } else {
       const key = bind.to.slice('meta.'.length);
+      prior = routing.meta?.[key];
       this.store.setWorkflowRouting(workflow, { meta: { [key]: value } });
     }
     this.store.recordArtifactEvent({
@@ -2099,10 +2113,12 @@ export class Engine {
       version: 0,
       action: BIND_ACTION,
       actor: 'engine',
-      dedupe: `${BIND_ACTION}:${art.path}:${bind.to}`,
+      dedupe: `${BIND_ACTION}:${art.path}:v${art.version}`,
       timestamp: now,
-      reason: `artifact '${art.path}' bound ${bind.to}: '${bind.from}' -> '${bind.to}'`,
-      metadata: { from: bind.from, to: bind.to },
+      reason: `artifact '${art.path}' bound ${bind.to}`,
+      // JSON has no undefined value, so null faithfully records an unbound
+      // target while preserving both sides of every accepted routing write.
+      metadata: { from: prior ?? null, to: value },
     });
   }
 

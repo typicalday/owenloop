@@ -1790,6 +1790,31 @@ function boundArtifactDef(): WorkflowDef {
   });
 }
 
+function boundMapArtifactDef(): WorkflowDef {
+  return parseDef({
+    name: 'bound-map-artifact',
+    modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [
+      {
+		name: 'gather',
+		consumes: ['proposal'],
+		produces: ['items[]'],
+		capabilities: ['utility'],
+      },
+      {
+		name: 'assess',
+		consumes: ['items[$i]'],
+		produces: [
+		  { name: 'items[$i].analysis', bind: { to: 'meta.analysis', from: 'analysis' } },
+		  { name: 'items[$i].review', bind: { to: 'modifier', from: 'modifier' } },
+		],
+		capabilities: ['utility'],
+      },
+    ],
+  });
+}
+
 test('accepted bound artifacts update modifier and metadata with one event per bind', () => {
   const { engine, store } = makeEngine([boundArtifactDef()]);
   const wf = engine.createInstance('bound-artifact', { modifier: 'standard' });
@@ -1803,10 +1828,56 @@ test('accepted bound artifacts update modifier and metadata with one event per b
     const events = store.getArtifactHistory(wf, path)?.events.filter((event) => event.action === 'bound') ?? [];
     assert.equal(events.length, 1);
     assert.deepEqual(events[0]?.metadata, {
-      from: path === 'modifier' ? 'payload.value' : 'payload.customer',
-      to: path === 'modifier' ? 'modifier' : 'meta.customer',
+      from: path === 'modifier' ? 'standard' : null,
+      to: path === 'modifier' ? 'deep' : 'acme',
     });
   }
+});
+
+test('re-accepted bound artifacts record each routing sync with old and accepted values', () => {
+  const { engine, store } = makeEngine([boundArtifactDef()]);
+  const wf = engine.createInstance('bound-artifact', { modifier: 'standard' });
+  const initial = fire(engine, wf, 'init', 1);
+  assert.equal(engine.green(wf, initial.run, 'modifier', { payload: { value: 'deep' } }).outcome, 'green');
+  assert.equal(engine.green(wf, initial.run, 'dossier', { payload: { customer: 'acme' } }).outcome, 'green');
+  engine.close(wf, initial.run);
+
+  assert.equal(engine.reject(wf, 'modifier', 'human', 'try the default again').outcome, 'rejected');
+  const retry = fire(engine, wf, 'init', 2);
+  assert.equal(engine.green(wf, retry.run, 'modifier', { payload: { value: 'standard' } }).outcome, 'green');
+
+  const events = store.getArtifactHistory(wf, 'modifier')?.events.filter((event) => event.action === 'bound') ?? [];
+  assert.equal(events.length, 2);
+  assert.deepEqual(events.map((event) => event.metadata), [
+    { from: 'standard', to: 'deep' },
+    { from: 'deep', to: 'standard' },
+  ]);
+});
+
+test('a map output applies only its own bind when sibling map outputs share a stem', () => {
+  const { engine, store } = makeEngine([boundMapArtifactDef()]);
+  const wf = engine.createInstance('bound-map-artifact', {
+    modifier: 'standard',
+    provide: { proposal: { text: 'evaluate' } },
+  });
+  const gather = fire(engine, wf, 'gather', 1);
+  engine.emit(wf, gather.run, [{ value: { source: 'one' } }]);
+  engine.seal(wf, gather.run, {});
+  engine.close(wf, gather.run);
+
+  const assess = fire(engine, wf, 'assess', 2);
+  assert.equal(
+    engine.green(wf, assess.run, 'items[0].review', { modifier: 'deep', analysis: 'wrong-target' }).outcome,
+    'green',
+  );
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep');
+  assert.equal(store.getWorkflow(wf)?.meta, undefined);
+
+  assert.equal(
+    engine.green(wf, assess.run, 'items[0].analysis', { modifier: 'standard', analysis: 'verified' }).outcome,
+    'green',
+  );
+  assert.deepEqual(store.getWorkflow(wf)?.meta, { analysis: 'verified' });
 });
 
 test('invalid bound modifier is schema-rejected for producers and refused for human acceptance', () => {
