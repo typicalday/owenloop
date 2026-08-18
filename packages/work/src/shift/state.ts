@@ -369,8 +369,9 @@ export function startReservedChild(stateDir: string, record: ChildRecord): void 
 }
 
 /** Cancel a gated child and remove the matching reservation/record. */
-export function cancelReservedChild(stateDir: string, reservation: ChildReservation): void {
+export function cancelReservedChild(stateDir: string, reservation: ChildReservation): boolean {
   const path = gateFile(stateDir, reservation.token);
+  let removed = false;
   try {
     signalGate(path, 'cancel', true);
   } finally {
@@ -382,8 +383,12 @@ export function cancelReservedChild(stateDir: string, reservation: ChildReservat
     const matchesFinalized = current !== undefined &&
       !isReservation(current) &&
       current.gateToken === reservation.token;
-    if (matchesReservation || matchesFinalized) durableRemove(recordFile(stateDir, reservation.run));
+    if (matchesReservation || matchesFinalized) {
+      durableRemove(recordFile(stateDir, reservation.run));
+      removed = true;
+    }
   }
+  return removed;
 }
 
 /**
@@ -402,10 +407,7 @@ export function removeChildRecord(
   // A late exit report must never remove a record written by a re-dispatch of
   // the same run. Reservations have no pid, so they are likewise newer owners.
   if (options?.pid !== undefined && (isReservation(current) || current.pid !== options.pid)) return false;
-  if (current !== undefined && isReservation(current)) {
-    cancelReservedChild(stateDir, current);
-    return true;
-  }
+  if (current !== undefined && isReservation(current)) return cancelReservedChild(stateDir, current);
   if (current?.gateToken !== undefined) {
     const gatePath = gateFile(stateDir, current.gateToken);
     try {
@@ -441,6 +443,17 @@ export interface ReconcileOptions {
   isAlive?: Liveness;
   now?: number;
   reservationMaxAgeMs?: number;
+  /**
+   * Called before a stale reservation is removed. The Shift loop uses this to
+   * share its dispatch lock with reservation creation; standalone state callers
+   * intentionally retain the direct removal default.
+   */
+  removeAbandonedReservation?: (reservation: ChildReservation) => boolean;
+  /**
+   * Called before a dead child record is removed. The Shift loop uses this to
+   * serialize the read/guard/unlink sequence with a later re-dispatch.
+   */
+  removeDeadChild?: (record: ChildRecord) => boolean;
 }
 
 /**
@@ -475,14 +488,14 @@ export function reconcileInFlight(stateDir: string, arg?: Liveness | ReconcileOp
 	reserved.push(record);
 	continue;
       }
-      cancelReservedChild(stateDir, record);
-      abandoned.push(record);
+      const removed = options.removeAbandonedReservation?.(record) ?? cancelReservedChild(stateDir, record);
+      if (removed) abandoned.push(record);
       continue;
     }
 
     if (!isAlive(record.pid)) {
-      removeChildRecord(stateDir, record.run);
-      reaped.push(record);
+      const removed = options.removeDeadChild?.(record) ?? removeChildRecord(stateDir, record.run, { pid: record.pid });
+      if (removed) reaped.push(record);
       continue;
     }
 

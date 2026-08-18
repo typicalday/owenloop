@@ -54,7 +54,12 @@
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
-import { acquireFileLockSync, releaseFileLock } from '../../../../src/lock.ts';
+import {
+  acquireFileLockSync,
+  FileLockTimeoutError,
+  releaseFileLock,
+  type AcquireFileLockOpts,
+} from '../../../../src/lock.ts';
 import { readDispatchBundle } from '../bundle/cache.ts';
 import type { HubClient } from '../hub/client.ts';
 import { HubError, type WorkOrder } from '../hub/types.ts';
@@ -162,6 +167,8 @@ export interface ShiftLoopOptions {
   once?: boolean;
   /** Injectable liveness probe (tests). */
   isAlive?: Liveness;
+  /** Test seam for deterministic races at the shared dispatch lock. */
+  dispatchLockOptions?: Pick<AcquireFileLockOpts, 'beforeOpen'>;
   /** PHASE 4 — injected in tests so the reaper can be exercised without a
    *  filesystem. Defaults to `sweepWorkDirs` from `src/agent/workdir.ts`. */
   sweepWorkDirs?: typeof sweepWorkDirsImpl;
@@ -455,10 +462,43 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     }
   }
 
+  function acquireDispatchLock(waitMs: number, label: string) {
+    return acquireFileLockSync(join(opts.stateDir, '.dispatch.lock'), {
+      ...opts.dispatchLockOptions,
+      waitMs,
+      label,
+    });
+  }
+
+  function removeRecordUnderDispatchLock(
+    run: string,
+    options?: { pid?: number },
+    waitMs = 30_000,
+    label = 'owenloop Shift dispatch-state removal',
+  ): boolean {
+    const dispatchLock = acquireDispatchLock(waitMs, label);
+    try {
+      // Re-read and guard only after the same lock that protects reservation
+      // creation is held. A stale liveness probe must never unlink a record a
+      // different Shift just wrote for a re-dispatch of this run.
+      return removeChildRecord(opts.stateDir, run, options);
+    } finally {
+      releaseFileLock(dispatchLock);
+    }
+  }
+
+  function removeReconciledRecord(record: ChildRecord | ChildReservation): boolean {
+    return 'pid' in record
+      ? removeRecordUnderDispatchLock(record.run, { pid: record.pid })
+      : removeRecordUnderDispatchLock(record.run);
+  }
+
   function reconcile() {
     const result = reconcileInFlight(opts.stateDir, {
       ...(isAlive !== undefined ? { isAlive } : {}),
       now: opts.now(),
+      removeAbandonedReservation: removeReconciledRecord,
+      removeDeadChild: removeReconciledRecord,
     });
     for (const rec of result.reaped) {
       emit({
@@ -518,10 +558,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    */
   function reserveCandidate(c: Candidate): ReservedChild | Exclude<DispatchResult, 'dispatched' | 'failed'> {
     const childKind = c.kind === 'command' ? 'exec' : 'agent-run';
-    const dispatchLock = acquireFileLockSync(join(opts.stateDir, '.dispatch.lock'), {
-      waitMs: 30_000,
-      label: 'owenloop Shift dispatch',
-    });
+    const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
     try {
       const fresh = reconcileInFlight(opts.stateDir, {
 	...(isAlive === undefined ? {} : { isAlive }),
@@ -589,15 +626,21 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	startGate: reserved.gatePath,
       });
       cancel = spawned.cancel ?? spawned.terminate;
-      const rec = finalizeChildReservation(opts.stateDir, reservation, {
-	pid: spawned.pid,
-	spawnedAt: opts.now(),
-	kind: childKind,
-	...(childKind === 'agent-run' && c.defName !== undefined ? { def: c.defName } : {}),
-	...(childKind === 'agent-run' && c.defHash !== undefined ? { hash: c.defHash } : {}),
-	...(childKind === 'agent-run' ? { step: c.order.step } : {}),
-      });
-      startReservedChild(opts.stateDir, rec);
+      const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
+      let rec: ChildRecord;
+      try {
+	rec = finalizeChildReservation(opts.stateDir, reservation, {
+	  pid: spawned.pid,
+	  spawnedAt: opts.now(),
+	  kind: childKind,
+	  ...(childKind === 'agent-run' && c.defName !== undefined ? { def: c.defName } : {}),
+	  ...(childKind === 'agent-run' && c.defHash !== undefined ? { hash: c.defHash } : {}),
+	  ...(childKind === 'agent-run' ? { step: c.order.step } : {}),
+	});
+	startReservedChild(opts.stateDir, rec);
+      } finally {
+	releaseFileLock(dispatchLock);
+      }
       // Remember which step this run belongs to, so a later worker failure —
       // which names the run but not the fan-out key — can be charged to the
       // right brake key. NOTHING is counted here: a dispatch is not evidence of
@@ -621,7 +664,12 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       cancel?.();
       if (reservation !== undefined) {
 	try {
-	  cancelReservedChild(opts.stateDir, reservation);
+	  const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
+	  try {
+	    cancelReservedChild(opts.stateDir, reservation);
+	  } finally {
+	    releaseFileLock(dispatchLock);
+	  }
 	} catch (cleanupError) {
 	  opts.err(
 	    `[${c.workflow}/${c.order.run}] failed to cancel dispatch reservation: ${errMsg(cleanupError)}`,
@@ -1292,16 +1340,24 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	runBrakeKey.delete(run);
 	stepBrake.delete(brakeKey);
       }
-      removeChildRecord(opts.stateDir, run);
+      removeRecordUnderDispatchLock(run);
     },
     noteChildExited: (exit: { workflow: string; run: string; kind: 'exec' | 'agent-run'; pid: number }) => {
       pendingCandidates.delete(exit.run);
       let removed = false;
       try {
-	removed = removeChildRecord(opts.stateDir, exit.run, { pid: exit.pid });
+	removed = removeRecordUnderDispatchLock(
+	  exit.run,
+	  { pid: exit.pid },
+	  1_000,
+	  'owenloop Shift exit reaper',
+	);
       } catch (e) {
+	const retry = e instanceof FileLockTimeoutError
+	  ? ' (the pid reconciliation will retry)'
+	  : '';
 	opts.err(
-	  `[${exit.workflow}/${exit.run}] failed to free the dispatch slot after the worker exited: ${errMsg(e)}`,
+	  `[${exit.workflow}/${exit.run}] failed to free the dispatch slot after the worker exited: ${errMsg(e)}${retry}`,
 	);
 	return;
       }

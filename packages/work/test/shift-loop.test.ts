@@ -1693,6 +1693,56 @@ test('a stale child exit report cannot free a later dispatch of the same run', a
   assert.equal(loop.freeCapacity(), 0, 'the later child still owns the only slot');
 });
 
+test('two shared-state loops keep a replacement record when a stale reaper races it', () => {
+  const firstPid = 111;
+  const replacementPid = 222;
+  writeChildRecord(stateDir, {
+    workflow: 'wf1',
+    run: 'run_reaper_race',
+    pid: firstPid,
+    spawnedAt: 0,
+    kind: 'agent-run',
+  });
+  const { hub: firstHub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { hub: secondHub } = mockHub({ wake: [{ changed: false, cursor: 1 }] });
+  const { spawner } = fakeSpawner();
+  const reaped: string[] = [];
+  const isAlive = (pid: number): boolean => pid === replacementPid;
+  let injected = false;
+  const second = createShiftLoop(baseOpts(secondHub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    isAlive,
+    onEvent: (event) => reaped.push(event.type),
+  }));
+  const first = createShiftLoop(baseOpts(firstHub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    isAlive,
+    onEvent: (event) => reaped.push(event.type),
+    dispatchLockOptions: {
+	beforeOpen: () => {
+	  if (injected) return;
+	  injected = true;
+	  assert.equal(second.freeCapacity(), 1, 'the other Shift reaped the stale record first');
+	  writeChildRecord(stateDir, {
+	    workflow: 'wf1',
+	    run: 'run_reaper_race',
+	    pid: replacementPid,
+	    spawnedAt: 1,
+	    kind: 'agent-run',
+	  });
+	},
+    },
+  }));
+
+  first.freeCapacity();
+
+  assert.deepEqual(readChildRecords(stateDir).map((record) => record.pid), [replacementPid]);
+  assert.equal(second.freeCapacity(), 0, 'the replacement worker retains the only capacity slot');
+  assert.deepEqual(reaped, ['reaped'], 'only the Shift that removed the stale record emits reaped');
+});
+
 // ---- role-level signal wiring (through the loop seam) -----------------------
 
 test('signal wiring: first signal stops the loop once; second hard-exits 130', () => {
