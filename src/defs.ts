@@ -1952,10 +1952,10 @@ function unroutedCapabilityWarnings(def: WorkflowDef): string[] {
   }
   if (bindingStep === undefined || boundArtifact === undefined) return [];
 
-  // Forward graph closure from the producing step. A consumer is downstream
-  // when it has a consume edge from any artifact produced along this path.
+  // Forward graph closure from the bound artifact. The binding step itself is
+  // exempt, but its unbound sibling outputs must not make a branch downstream.
   const reachedSteps = new Set<string>([bindingStep.name]);
-  const reachedArtifacts = new Set<string>(bindingStep.produces.map((p) => p.stem));
+  const reachedArtifacts = new Set<string>([boundArtifact]);
   let changed = true;
   while (changed) {
     changed = false;

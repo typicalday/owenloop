@@ -1,6 +1,9 @@
 import { readFileSync } from 'node:fs';
 
-type Feedback = Array<{ path?: unknown; reasons?: Array<{ requested?: unknown }> }>;
+type Feedback = Array<{
+  path?: unknown;
+  reasons?: Array<{ at?: unknown; action?: unknown; requested?: unknown }>;
+}>;
 
 function usage(message: string): number {
   process.stderr.write(`owenloop util modifier-init: ${message}\n`);
@@ -17,13 +20,23 @@ function feedbackRequested(env: Record<string, string | undefined>): string | un
   if (raw === undefined) return undefined;
   const feedback = JSON.parse(raw) as Feedback;
   if (!Array.isArray(feedback)) throw new Error('OWENLOOP_FEEDBACK must be a JSON feedback array');
-  for (const owed of [...feedback].reverse()) {
+  let newest: { requested: string; at: number; position: number } | undefined;
+  let position = 0;
+  for (const owed of feedback) {
     if (!Array.isArray(owed.reasons)) continue;
-    for (const reason of [...owed.reasons].reverse()) {
-      if (typeof reason.requested === 'string') return reason.requested;
+    const rejection = [...owed.reasons].reverse().find((reason) => reason.action === 'reject');
+    position++;
+    if (typeof rejection?.requested !== 'string') continue;
+    const at = typeof rejection.at === 'number' ? rejection.at : Number.NEGATIVE_INFINITY;
+    if (
+      newest === undefined
+      || at > newest.at
+      || (at === newest.at && position > newest.position)
+    ) {
+      newest = { requested: rejection.requested, at, position };
     }
   }
-  return undefined;
+  return newest?.requested;
 }
 
 /** Resolve requested feedback first, then the order modifier hint, then default. */

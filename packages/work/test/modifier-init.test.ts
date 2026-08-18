@@ -13,7 +13,7 @@ test('modifier-init resolves requested feedback before the modifier hint and def
       OWENLOOP_MODIFIER: 'express',
       OWENLOOP_FEEDBACK: JSON.stringify([{
         path: 'modifier',
-        reasons: [{ requested: 'deep' }],
+		reasons: [{ at: 1, action: 'reject', requested: 'deep' }],
       }]),
     },
   );
@@ -24,7 +24,7 @@ test('modifier-init falls back from hint to default and supports feedback files'
   const dir = mkdtempSync(join(tmpdir(), 'owenloop-modifier-init-'));
   try {
     const file = join(dir, 'feedback.json');
-    writeFileSync(file, JSON.stringify([{ reasons: [{ requested: 'deep' }] }]));
+    writeFileSync(file, JSON.stringify([{ reasons: [{ at: 1, action: 'reject', requested: 'deep' }] }]));
     assert.deepEqual(
       resolveModifierInit(['--default', 'standard'], { OWENLOOP_FEEDBACK_FILE: file, OWENLOOP_MODIFIER: 'express' }),
       { value: 'deep' },
@@ -37,6 +37,23 @@ test('modifier-init falls back from hint to default and supports feedback files'
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('modifier-init does not revive requested values from an older rejection episode', () => {
+  const result = resolveModifierInit(
+    ['--default', 'standard'],
+    {
+      OWENLOOP_MODIFIER: 'express',
+      OWENLOOP_FEEDBACK: JSON.stringify([{
+		path: 'modifier',
+		reasons: [
+		  { at: 1, action: 'reject', requested: 'deep' },
+		  { at: 2, action: 'reject' },
+		],
+      }]),
+    },
+  );
+  assert.deepEqual(result, { value: 'express' });
 });
 
 test('modifier-init requires a default and refuses non-word output', () => {

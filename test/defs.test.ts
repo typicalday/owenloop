@@ -3233,15 +3233,23 @@ test('lintDef warns capability-bearing branches that are not downstream of a mod
     modifiers: ['deep'],
     inputs: [{ name: 'proposal' }],
     steps: [
-      { name: 'init', consumes: ['proposal'], produces: [{ name: 'modifier', bind: 'modifier' }], capabilities: ['utility'] },
+      {
+		name: 'init',
+		consumes: ['proposal'],
+		produces: [{ name: 'modifier', bind: 'modifier' }, 'sibling'],
+		capabilities: ['utility'],
+      },
       { name: 'planner', consumes: ['modifier'], produces: ['plan'], capabilities: ['wise'] },
+      { name: 'sibling-consumer', consumes: ['sibling'], produces: ['sibling-result'], capabilities: ['build'] },
       { name: 'parallel', consumes: ['proposal'], produces: ['other'], capabilities: ['build'] },
     ],
   });
   const { errors, warnings } = lintDef(d);
   assert.deepEqual(errors, []);
   assert.ok(warnings.some((w) => /step 'parallel'.*not downstream of artifact 'modifier'/.test(w)), warnings.join('\n'));
+  assert.ok(warnings.some((w) => /step 'sibling-consumer'.*not downstream of artifact 'modifier'/.test(w)), warnings.join('\n'));
   assert.ok(!warnings.some((w) => /step 'planner'.*not downstream/.test(w)), warnings.join('\n'));
+  assert.ok(!warnings.some((w) => /step 'init'.*not downstream/.test(w)), warnings.join('\n'));
 });
 
 // ---- judge capability inheritance -------------------------------------------
