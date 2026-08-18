@@ -369,8 +369,9 @@ export function startReservedChild(stateDir: string, record: ChildRecord): void 
 }
 
 /** Cancel a gated child and remove the matching reservation/record. */
-export function cancelReservedChild(stateDir: string, reservation: ChildReservation): void {
+export function cancelReservedChild(stateDir: string, reservation: ChildReservation): boolean {
   const path = gateFile(stateDir, reservation.token);
+  let removed = false;
   try {
     signalGate(path, 'cancel', true);
   } finally {
@@ -382,8 +383,12 @@ export function cancelReservedChild(stateDir: string, reservation: ChildReservat
     const matchesFinalized = current !== undefined &&
       !isReservation(current) &&
       current.gateToken === reservation.token;
-    if (matchesReservation || matchesFinalized) durableRemove(recordFile(stateDir, reservation.run));
+    if (matchesReservation || matchesFinalized) {
+      durableRemove(recordFile(stateDir, reservation.run));
+      removed = true;
+    }
   }
+  return removed;
 }
 
 /**
@@ -391,13 +396,18 @@ export function cancelReservedChild(stateDir: string, reservation: ChildReservat
  * is cancelled first so an external run-ended signal cannot leave a worker gate
  * behind that later opens without a capacity record.
  */
-export function removeChildRecord(stateDir: string, run: string): void {
+export function removeChildRecord(
+  stateDir: string,
+  run: string,
+  options?: { pid?: number },
+): boolean {
   const path = recordFile(stateDir, run);
   const current = readOneStateRecord(path);
-  if (current !== undefined && isReservation(current)) {
-    cancelReservedChild(stateDir, current);
-    return;
-  }
+  if (current === undefined) return false;
+  // A late exit report must never remove a record written by a re-dispatch of
+  // the same run. Reservations have no pid, so they are likewise newer owners.
+  if (options?.pid !== undefined && (isReservation(current) || current.pid !== options.pid)) return false;
+  if (current !== undefined && isReservation(current)) return cancelReservedChild(stateDir, current);
   if (current?.gateToken !== undefined) {
     const gatePath = gateFile(stateDir, current.gateToken);
     try {
@@ -407,6 +417,7 @@ export function removeChildRecord(stateDir: string, run: string): void {
     }
   }
   durableRemove(path);
+  return true;
 }
 
 export type Liveness = (pid: number) => boolean;
@@ -432,6 +443,47 @@ export interface ReconcileOptions {
   isAlive?: Liveness;
   now?: number;
   reservationMaxAgeMs?: number;
+  /**
+   * Called before a stale reservation is removed. The Shift loop uses this to
+   * share its dispatch lock with reservation creation; standalone state callers
+   * intentionally retain the direct removal default.
+   */
+  removeAbandonedReservation?: (reservation: ChildReservation) => boolean;
+  /**
+   * Called before a dead child record is removed. The Shift loop uses this to
+   * serialize the read/guard/unlink sequence with a later re-dispatch.
+   */
+  removeDeadChild?: (record: ChildRecord) => boolean;
+  /**
+   * Finish a persisted PID record's start-gate handoff. The Shift daemon uses
+   * this to serialize the re-read/identity-check/write sequence with a later
+   * re-dispatch; standalone state callers intentionally retain the direct
+   * settlement default.
+   */
+  settleLiveChild?: (record: ChildRecord) => ChildRecord | undefined;
+}
+
+/**
+ * Open and clear a persisted child's start gate only if the record is still
+ * the same PID and gate-token pair the reconciler observed. A re-dispatch can
+ * replace either identity between an unlocked observation and this settlement;
+ * in that case it owns the record and nothing is changed.
+ */
+export function settleChildGate(stateDir: string, record: ChildRecord): ChildRecord | undefined {
+  if (record.gateToken === undefined) return record;
+  const current = readOneStateRecord(recordFile(stateDir, record.run));
+  if (
+    current === undefined ||
+    isReservation(current) ||
+    current.pid !== record.pid ||
+    current.gateToken !== record.gateToken
+  ) return undefined;
+
+  signalGate(gateFile(stateDir, current.gateToken), 'start', true);
+  const settled = { ...current };
+  delete settled.gateToken;
+  writeStateRecord(stateDir, settled);
+  return settled;
 }
 
 /**
@@ -466,25 +518,22 @@ export function reconcileInFlight(stateDir: string, arg?: Liveness | ReconcileOp
 	reserved.push(record);
 	continue;
       }
-      cancelReservedChild(stateDir, record);
-      abandoned.push(record);
+      const removed = options.removeAbandonedReservation?.(record) ?? cancelReservedChild(stateDir, record);
+      if (removed) abandoned.push(record);
       continue;
     }
 
     if (!isAlive(record.pid)) {
-      removeChildRecord(stateDir, record.run);
-      reaped.push(record);
+      const removed = options.removeDeadChild?.(record) ?? removeChildRecord(stateDir, record.run, { pid: record.pid });
+      if (removed) reaped.push(record);
       continue;
     }
 
     if (record.gateToken !== undefined) {
       // A restart after PID persistence but before the parent opened the gate can
       // safely finish the handoff: the durable PID record is the prerequisite.
-      signalGate(gateFile(stateDir, record.gateToken), 'start', true);
-      const settled = { ...record };
-      delete settled.gateToken;
-      writeStateRecord(stateDir, settled);
-      live.push(settled);
+      const settled = options.settleLiveChild === undefined ? settleChildGate(stateDir, record) : options.settleLiveChild(record);
+      if (settled !== undefined) live.push(settled);
     } else {
       live.push(record);
     }

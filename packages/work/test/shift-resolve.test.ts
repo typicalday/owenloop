@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -11,8 +11,20 @@ import {
 	resolveMaxConcurrentAgents,
 	resolveShiftName,
 	parseArgs,
+	reconcileStartupState,
 	runShiftRuntime,
 } from '../src/shift/runtime.ts';
+import { createLockedRemovalCallbacks, withDispatchLock } from '../src/shift/loop.ts';
+import {
+  finalizeChildReservation,
+  removeChildRecord,
+  readChildRecords,
+  readChildReservations,
+  reconcileInFlight,
+  reserveChild,
+  startReservedChild,
+  writeChildRecord,
+} from '../src/shift/state.ts';
 
 test('public Shift daemon fails explicitly on Windows while direct Shift remains the fallback', () => {
   assert.throws(
@@ -37,6 +49,270 @@ test('resolveStateDirOverride: flag > OWENLOOP_STATE_DIR > settings; else undefi
   assert.equal(resolveStateDirOverride(undefined, { OWENLOOP_STATE_DIR: '/env' }, '/settings'), '/env');
   assert.equal(resolveStateDirOverride(undefined, {}, '/settings'), '/settings');
   assert.equal(resolveStateDirOverride(undefined, {}, undefined), undefined);
+});
+
+test('startup reconciliation cannot reap a re-dispatched shared-state record', () => {
+	const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-startup-race-'));
+	const stateDir = join(root, 'state');
+	const firstPid = 111;
+	const replacementPid = 222;
+	try {
+		writeChildRecord(stateDir, {
+			workflow: 'wf1',
+			run: 'run_startup_race',
+			pid: firstPid,
+			spawnedAt: 0,
+			kind: 'agent-run',
+		});
+		const isAlive = (pid: number): boolean => pid === replacementPid;
+		let injected = false;
+		let competingReaped = 0;
+		const startup = reconcileStartupState(stateDir, () => assert.fail('startup reconciliation must not defer'), {
+			isAlive,
+			dispatchLockOptions: {
+				beforeOpen: () => {
+					if (injected) return;
+					injected = true;
+					const competing = reconcileInFlight(stateDir, {
+						isAlive,
+						...createLockedRemovalCallbacks(stateDir),
+					});
+					competingReaped += competing.reaped.length;
+					writeChildRecord(stateDir, {
+						workflow: 'wf1',
+						run: 'run_startup_race',
+						pid: replacementPid,
+						spawnedAt: 1,
+						kind: 'agent-run',
+					});
+				},
+			},
+		});
+
+		assert.equal(startup?.reaped.length, 0, 'the startup sweep did not remove the replacement');
+		assert.equal(competingReaped, 1, 'exactly one reconciler removed the stale record');
+		assert.deepEqual(readChildRecords(stateDir).map((record) => record.pid), [replacementPid]);
+		const current = reconcileInFlight(stateDir, {
+			isAlive,
+			...createLockedRemovalCallbacks(stateDir),
+		});
+		assert.equal(current.live.length + current.reserved.length, 1, 'the replacement keeps its capacity slot');
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('startup reconciliation cannot cancel a replacement shared-state reservation', () => {
+	const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-startup-reservation-race-'));
+	const stateDir = join(root, 'state');
+	const stale = reserveChild(stateDir, {
+		workflow: 'wf1',
+		run: 'run_startup_reservation_race',
+		reservedAt: 0,
+		childKind: 'agent-run',
+		step: 'builder',
+	});
+	try {
+		let injected = false;
+		let competingAbandoned = 0;
+		let replacement: ReturnType<typeof reserveChild> | undefined;
+		const startup = reconcileStartupState(stateDir, () => assert.fail('startup reconciliation must not defer'), {
+			dispatchLockOptions: {
+				beforeOpen: () => {
+					if (injected) return;
+					injected = true;
+					const competing = reconcileInFlight(stateDir, {
+						...createLockedRemovalCallbacks(stateDir),
+					});
+					competingAbandoned += competing.abandoned.length;
+					replacement = reserveChild(stateDir, {
+						workflow: 'wf1',
+						run: stale.reservation.run,
+						reservedAt: Date.now(),
+						childKind: 'agent-run',
+						step: 'builder',
+					});
+				},
+			},
+		});
+
+		assert.equal(startup?.abandoned.length, 0, 'the startup sweep did not cancel the replacement');
+		assert.equal(competingAbandoned, 1, 'exactly one reconciler cancelled the stale reservation');
+		assert.deepEqual(readChildReservations(stateDir), [replacement!.reservation]);
+		assert.equal(existsSync(replacement!.gatePath), true, 'the replacement gate survives the startup reaper');
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('startup reconciliation cannot reap a finalized replacement from a stale reservation', () => {
+	const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-startup-finalized-race-'));
+	const stateDir = join(root, 'state');
+	const replacementPid = 222;
+	const stale = reserveChild(stateDir, {
+		workflow: 'wf1',
+		run: 'run_startup_finalized_reservation_race',
+		reservedAt: 0,
+		childKind: 'agent-run',
+		step: 'builder',
+	});
+	try {
+		let injected = false;
+		let competingAbandoned = 0;
+		let replacementGate = '';
+		const startup = reconcileStartupState(stateDir, () => assert.fail('startup reconciliation must not defer'), {
+			isAlive: (pid) => pid === replacementPid,
+			dispatchLockOptions: {
+				beforeOpen: () => {
+					if (injected) return;
+					injected = true;
+					const competing = reconcileInFlight(stateDir, {
+						isAlive: (pid) => pid === replacementPid,
+						...createLockedRemovalCallbacks(stateDir),
+					});
+					competingAbandoned += competing.abandoned.length;
+					const replacement = reserveChild(stateDir, {
+						workflow: 'wf1',
+						run: stale.reservation.run,
+						reservedAt: Date.now(),
+						childKind: 'agent-run',
+						step: 'builder',
+					});
+					const child = finalizeChildReservation(stateDir, replacement.reservation, {
+						pid: replacementPid,
+						spawnedAt: Date.now(),
+						kind: 'agent-run',
+						step: 'builder',
+					});
+					startReservedChild(stateDir, child);
+					replacementGate = replacement.gatePath;
+				},
+			},
+		});
+
+		assert.equal(startup?.abandoned.length, 0, 'the startup sweep did not reap the replacement');
+		assert.equal(competingAbandoned, 1, 'exactly one reconciler cancelled the stale reservation');
+		assert.deepEqual(readChildRecords(stateDir).map((record) => record.pid), [replacementPid]);
+		assert.equal(existsSync(replacementGate), true, 'the replacement gate survives the startup reaper');
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('startup gate settlement cannot overwrite a replacement reservation after child exit', () => {
+	const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-startup-live-gate-reservation-race-'));
+	const stateDir = join(root, 'state');
+	const firstPid = 111;
+	const stale = reserveChild(stateDir, {
+		workflow: 'wf1',
+		run: 'run_startup_live_gate_reservation_race',
+		reservedAt: 0,
+		childKind: 'agent-run',
+		step: 'builder',
+	});
+	const firstChild = finalizeChildReservation(stateDir, stale.reservation, {
+		pid: firstPid,
+		spawnedAt: 0,
+		kind: 'agent-run',
+		step: 'builder',
+	});
+	try {
+		let injected = false;
+		let replacement: ReturnType<typeof reserveChild> | undefined;
+		const startup = reconcileStartupState(stateDir, () => assert.fail('startup reconciliation must not defer'), {
+			isAlive: (pid) => pid === firstPid,
+			dispatchLockOptions: {
+				beforeOpen: () => {
+					if (injected) return;
+					injected = true;
+					withDispatchLock(stateDir, {}, () => {
+						assert.equal(removeChildRecord(stateDir, firstChild.run, { pid: firstChild.pid }), true);
+						replacement = reserveChild(stateDir, {
+							workflow: 'wf1',
+							run: firstChild.run,
+							reservedAt: Date.now(),
+							childKind: 'agent-run',
+							step: 'builder',
+						});
+					});
+				},
+			},
+		});
+
+		assert.deepEqual(startup?.live, [], 'the stale observer did not retain the exited child');
+		assert.deepEqual(readChildReservations(stateDir), [replacement!.reservation]);
+		assert.equal(existsSync(replacement!.gatePath), true, 'the replacement gate survives stale settlement');
+		const current = reconcileInFlight(stateDir, {
+			isAlive: (pid) => pid === firstPid,
+			...createLockedRemovalCallbacks(stateDir),
+		});
+		assert.equal(current.live.length + current.reserved.length, 1, 'the replacement retains capacity');
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test('startup gate settlement cannot overwrite a finalized replacement after child exit', () => {
+	const root = mkdtempSync(join(tmpdir(), 'owenloop-shift-startup-live-gate-finalized-race-'));
+	const stateDir = join(root, 'state');
+	const firstPid = 111;
+	const replacementPid = 222;
+	const stale = reserveChild(stateDir, {
+		workflow: 'wf1',
+		run: 'run_startup_live_gate_finalized_race',
+		reservedAt: 0,
+		childKind: 'agent-run',
+		step: 'builder',
+	});
+	const firstChild = finalizeChildReservation(stateDir, stale.reservation, {
+		pid: firstPid,
+		spawnedAt: 0,
+		kind: 'agent-run',
+		step: 'builder',
+	});
+	try {
+		let injected = false;
+		let replacementToken = '';
+		const isAlive = (pid: number): boolean => pid === firstPid || pid === replacementPid;
+		const startup = reconcileStartupState(stateDir, () => assert.fail('startup reconciliation must not defer'), {
+			isAlive,
+			dispatchLockOptions: {
+				beforeOpen: () => {
+					if (injected) return;
+					injected = true;
+					withDispatchLock(stateDir, {}, () => {
+						assert.equal(removeChildRecord(stateDir, firstChild.run, { pid: firstChild.pid }), true);
+						const replacement = reserveChild(stateDir, {
+							workflow: 'wf1',
+							run: firstChild.run,
+							reservedAt: 1,
+							childKind: 'agent-run',
+							step: 'builder',
+						});
+						const child = finalizeChildReservation(stateDir, replacement.reservation, {
+							pid: replacementPid,
+							spawnedAt: 1,
+							kind: 'agent-run',
+							step: 'builder',
+						});
+						startReservedChild(stateDir, child);
+						replacementToken = replacement.reservation.token;
+					});
+				},
+			},
+		});
+
+		assert.deepEqual(startup?.live, [], 'the stale observer did not retain the exited child');
+		assert.deepEqual(readChildRecords(stateDir).map((record) => record.pid), [replacementPid]);
+		assert.equal(readChildRecords(stateDir)[0]?.gateToken, replacementToken, 'the replacement handoff remains intact');
+		const current = reconcileInFlight(stateDir, {
+			isAlive,
+			...createLockedRemovalCallbacks(stateDir),
+		});
+		assert.equal(current.live.length, 1, 'the finalized replacement retains capacity');
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 // WO-4.3 serve-crew SELECTION contract, pinned at the parse layer. The wire

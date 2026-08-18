@@ -145,6 +145,23 @@ export interface WorkerFailure {
 export type WorkerFailureReporter = (failure: WorkerFailure) => void;
 
 /**
+ * A dispatched worker process ENDED. Fired for every terminal outcome —
+ * a clean exit (including an agent-run that completed mid-turn and exited 0),
+ * a nonzero exit, a signal kill, and a failure to spawn. The shift frees the
+ * dispatch slot from this, so it must never be conditional on the exit code.
+ */
+export interface WorkerExit {
+  workflow: string;
+  run: string;
+  kind: 'exec' | 'agent-run';
+  pid: number;
+  exitStatus: number | null;
+  signal: NodeJS.Signals | null;
+}
+
+export type WorkerExitReporter = (exit: WorkerExit) => void;
+
+/**
  * The stdio topology of a detached worker.
  *
  * Slot 0 is always `'ignore'`: a worker reads nothing. Slots 1 and 2 are either
@@ -266,6 +283,7 @@ export function createDefaultSpawner(
   onFailure?: WorkerFailureReporter,
   logging?: WorkerLogOptions,
   allowedWorkdirRoots?: string[],
+  onExit?: WorkerExitReporter,
 ): Spawner {
   // ONE report per shift, not one per dispatch. Every condition that stops a
   // worker log from opening — a full disk, a read-only log directory, an
@@ -342,6 +360,7 @@ export function createDefaultSpawner(
     // discard them before an operator can read them — reading them is the whole
     // point of `<run>.log`.
     let failureReported = false;
+    let exitReported = false;
     const report = (exitStatus: number | null, signal: NodeJS.Signals | null, message: string): void => {
       if (failureReported || onFailure === undefined) return;
       failureReported = true;
@@ -356,8 +375,17 @@ export function createDefaultSpawner(
 	message,
       });
     };
-    child.once('error', () => report(null, null, 'worker process failed to start'));
+    const reportExit = (exitStatus: number | null, signal: NodeJS.Signals | null): void => {
+      if (exitReported || onExit === undefined || child.pid === undefined) return;
+      exitReported = true;
+      onExit({ workflow: spec.workflow, run: spec.run, kind, pid: child.pid, exitStatus, signal });
+    };
+    child.once('error', () => {
+      report(null, null, 'worker process failed to start');
+      reportExit(null, null);
+    });
     child.once('exit', (code, signal) => {
+      reportExit(code, signal);
       if (code === 0) return;
       report(code, signal, 'worker exited without completing successfully');
     });
@@ -375,6 +403,7 @@ export function createDefaultSpawner(
       // registered above fires afterwards and emits a SECOND `failed` event —
       // two daemon events for one dispatch attempt.
       failureReported = true;
+      exitReported = true;
       throw new Error(`spawn of 'owenloop work ${kind} ${spec.workflow}/${spec.run}' returned no pid`);
     }
     const kill = (): void => {

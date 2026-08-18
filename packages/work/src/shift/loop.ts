@@ -54,7 +54,12 @@
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
-import { acquireFileLockSync, releaseFileLock } from '../../../../src/lock.ts';
+import {
+  acquireFileLockSync,
+  FileLockTimeoutError,
+  releaseFileLock,
+  type AcquireFileLockOpts,
+} from '../../../../src/lock.ts';
 import { readDispatchBundle } from '../bundle/cache.ts';
 import type { HubClient } from '../hub/client.ts';
 import { HubError, type WorkOrder } from '../hub/types.ts';
@@ -67,9 +72,11 @@ import {
   reserveChild,
   startReservedChild,
   removeChildRecord,
+  settleChildGate,
   ensureStateDir,
   type ChildRecord,
   type ChildReservation,
+  type ReconcileOptions,
   type ReservedChild,
   type Liveness,
 } from './state.ts';
@@ -162,9 +169,69 @@ export interface ShiftLoopOptions {
   once?: boolean;
   /** Injectable liveness probe (tests). */
   isAlive?: Liveness;
+  /** Test seam for deterministic races at the shared dispatch lock. */
+  dispatchLockOptions?: Pick<AcquireFileLockOpts, 'beforeOpen'>;
   /** PHASE 4 — injected in tests so the reaper can be exercised without a
    *  filesystem. Defaults to `sweepWorkDirs` from `src/agent/workdir.ts`. */
   sweepWorkDirs?: typeof sweepWorkDirsImpl;
+}
+
+export interface LockedRemovalOptions {
+  dispatchLockOptions?: Pick<AcquireFileLockOpts, 'beforeOpen'>;
+  waitMs?: number;
+  label?: string;
+}
+
+/** Run a state mutation while holding the lock that serializes dispatch state. */
+export function withDispatchLock<T>(
+  stateDir: string,
+  options: LockedRemovalOptions = {},
+  fn: () => T,
+): T {
+  const dispatchLock = acquireFileLockSync(join(stateDir, '.dispatch.lock'), {
+    ...options.dispatchLockOptions,
+    waitMs: options.waitMs ?? 30_000,
+    label: options.label ?? 'owenloop Shift dispatch-state removal',
+  });
+  try {
+    return fn();
+  } finally {
+    releaseFileLock(dispatchLock);
+  }
+}
+
+/**
+ * Remove one child record while holding the same lock that serializes durable
+ * reservation creation. The record is deliberately re-read by
+ * `removeChildRecord` only after acquisition, so a stale observer cannot erase
+ * a newer dispatch for the same run.
+ */
+export function removeChildRecordUnderDispatchLock(
+  stateDir: string,
+  run: string,
+  recordOptions?: { pid?: number },
+  options: LockedRemovalOptions = {},
+): boolean {
+  return withDispatchLock(stateDir, options, () => removeChildRecord(stateDir, run, recordOptions));
+}
+
+/**
+ * Reconciliation callbacks for every unlocked Shift daemon path. Keep these
+ * together with the lock-held removal primitive so startup and the poll loop
+ * cannot silently diverge.
+ */
+export function createLockedRemovalCallbacks(
+  stateDir: string,
+  options: LockedRemovalOptions = {},
+): Pick<ReconcileOptions, 'removeAbandonedReservation' | 'removeDeadChild' | 'settleLiveChild'> {
+  return {
+    removeAbandonedReservation: (reservation) =>
+      withDispatchLock(stateDir, options, () => cancelReservedChild(stateDir, reservation)),
+    removeDeadChild: (record) =>
+      withDispatchLock(stateDir, options, () => removeChildRecord(stateDir, record.run, { pid: record.pid })),
+    settleLiveChild: (record) =>
+      withDispatchLock(stateDir, options, () => settleChildGate(stateDir, record)),
+  };
 }
 
 /** What one `sweep()` produced. `polled`/`openRuns` exist for the Phase 4
@@ -222,6 +289,17 @@ export interface ShiftLoop {
    */
   noteRunEnded(run: string): void;
   /**
+   * A dispatched worker process ENDED. Frees the dispatch slot it held on every
+   * terminal outcome, including a mid-turn completion that exits 0. This is the
+   * primary release path; reconciliation remains the crash/restart backstop.
+   */
+  noteChildExited(exit: {
+    workflow: string;
+    run: string;
+    kind: 'exec' | 'agent-run';
+    pid: number;
+  }): void;
+  /**
    * A dispatched child exited non-zero. Charges one failure against that run's
    * STEP and arms the brake window — see `STEP_BRAKE_DELAYS_MS`.
    *
@@ -254,11 +332,16 @@ interface Candidate {
 
 /** The `maxConcurrentAgents` fallback when the option is absent. */
 const DEFAULT_MAX_AGENTS = 4;
+/** The hub reaps a never-contacted claim after this long. Every client-side
+ * re-offer latency must stay strictly under it. */
+export const HUB_PICKUP_WINDOW_MS = 120_000;
+/** Headroom for a detached child to make first contact after dispatch. */
+const CHILD_FIRST_CONTACT_MARGIN_MS = 30_000;
 /**
  * The hub reaps a never-contacted claim after 120 seconds. Stop local queueing
  * after 90 seconds so a detached child retains 30 seconds to make first contact.
  */
-export const MAX_PENDING_CANDIDATE_AGE_MS = 90_000;
+export const MAX_PENDING_CANDIDATE_AGE_MS = HUB_PICKUP_WINDOW_MS - CHILD_FIRST_CONTACT_MARGIN_MS;
 
 /**
  * THE PER-STEP FAILURE BRAKE.
@@ -293,12 +376,12 @@ export const MAX_PENDING_CANDIDATE_AGE_MS = 90_000;
  * It is a rate limit, never a ban. A step that has not failed is dispatched
  * with zero delay, however many orders arrive for it at once.
  */
-const STEP_BRAKE_DELAYS_MS = [2_000, 8_000, 30_000, 120_000, 300_000] as const;
+export const STEP_BRAKE_DELAYS_MS = [2_000, 8_000, 30_000, 60_000, 90_000] as const;
 
 /**
  * Treat a failure this long after the previous one as the start of a NEW
  * streak, resetting the count to zero first. Comfortably longer than the
- * longest delay in the table (300s), so a step failing at maximum backoff never
+ * longest delay in the table (90s), so a step failing at maximum backoff never
  * decays out of it, while an isolated transient long after an old streak starts
  * again at the shortest delay instead of inheriting a stale penalty.
  */
@@ -316,7 +399,7 @@ const STEP_BRAKE_FORGET_MS = 1_800_000;
  * worker failures. `count` is at least 1 at every call site (this is reached
  * only from the failure path), so the FIRST failure already costs 2s; past the
  * end of the table the last entry repeats, so a permanently-failing step
- * settles at one dispatch per five minutes instead of one per poll.
+ * settles at one dispatch per 90 seconds instead of one per poll.
  */
 function stepBrakeDelayMs(count: number): number {
   const index = Math.min(count, STEP_BRAKE_DELAYS_MS.length) - 1;
@@ -391,6 +474,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   /** A changed wake whose sweep was skipped or failed must be retried after the
    * cursor is adopted; otherwise the next unchanged wake hides that work. */
   let sweepOwed = false;
+  /** Earliest monotonic time at which a braked step becomes dispatchable again.
+   * Drives a sweep without a hub cursor move, so a brake never waits forever. */
+  let brakeSweepDueAt: number | undefined;
   /**
    * Has the current at-capacity EPISODE already produced a `capacity` event?
    *
@@ -436,10 +522,36 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     }
   }
 
+  function acquireDispatchLock(waitMs: number, label: string) {
+    return acquireFileLockSync(join(opts.stateDir, '.dispatch.lock'), {
+      ...opts.dispatchLockOptions,
+      waitMs,
+      label,
+    });
+  }
+
+  const lockedRemovalCallbacks = createLockedRemovalCallbacks(opts.stateDir, {
+    dispatchLockOptions: opts.dispatchLockOptions,
+  });
+
+  function removeRecordUnderDispatchLock(
+    run: string,
+    recordOptions?: { pid?: number },
+    waitMs = 30_000,
+    label = 'owenloop Shift dispatch-state removal',
+  ): boolean {
+    return removeChildRecordUnderDispatchLock(opts.stateDir, run, recordOptions, {
+      dispatchLockOptions: opts.dispatchLockOptions,
+      waitMs,
+      label,
+    });
+  }
+
   function reconcile() {
     const result = reconcileInFlight(opts.stateDir, {
       ...(isAlive !== undefined ? { isAlive } : {}),
       now: opts.now(),
+      ...lockedRemovalCallbacks,
     });
     for (const rec of result.reaped) {
       emit({
@@ -499,10 +611,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    */
   function reserveCandidate(c: Candidate): ReservedChild | Exclude<DispatchResult, 'dispatched' | 'failed'> {
     const childKind = c.kind === 'command' ? 'exec' : 'agent-run';
-    const dispatchLock = acquireFileLockSync(join(opts.stateDir, '.dispatch.lock'), {
-      waitMs: 30_000,
-      label: 'owenloop Shift dispatch',
-    });
+    const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
     try {
       const fresh = reconcileInFlight(opts.stateDir, {
 	...(isAlive === undefined ? {} : { isAlive }),
@@ -549,6 +658,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	`${brake.count} time(s) in a row — braking for ${waitMs}ms and ` +
 	`leaving this claim to lapse`,
       );
+      brakeSweepDueAt = brakeSweepDueAt === undefined
+	? brake.nextAllowedAt
+	: Math.min(brakeSweepDueAt, brake.nextAllowedAt);
       return 'braked';
     }
     let reservation: ChildReservation | undefined;
@@ -567,15 +679,21 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	startGate: reserved.gatePath,
       });
       cancel = spawned.cancel ?? spawned.terminate;
-      const rec = finalizeChildReservation(opts.stateDir, reservation, {
-	pid: spawned.pid,
-	spawnedAt: opts.now(),
-	kind: childKind,
-	...(childKind === 'agent-run' && c.defName !== undefined ? { def: c.defName } : {}),
-	...(childKind === 'agent-run' && c.defHash !== undefined ? { hash: c.defHash } : {}),
-	...(childKind === 'agent-run' ? { step: c.order.step } : {}),
-      });
-      startReservedChild(opts.stateDir, rec);
+      const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
+      let rec: ChildRecord;
+      try {
+	rec = finalizeChildReservation(opts.stateDir, reservation, {
+	  pid: spawned.pid,
+	  spawnedAt: opts.now(),
+	  kind: childKind,
+	  ...(childKind === 'agent-run' && c.defName !== undefined ? { def: c.defName } : {}),
+	  ...(childKind === 'agent-run' && c.defHash !== undefined ? { hash: c.defHash } : {}),
+	  ...(childKind === 'agent-run' ? { step: c.order.step } : {}),
+	});
+	startReservedChild(opts.stateDir, rec);
+      } finally {
+	releaseFileLock(dispatchLock);
+      }
       // Remember which step this run belongs to, so a later worker failure —
       // which names the run but not the fan-out key — can be charged to the
       // right brake key. NOTHING is counted here: a dispatch is not evidence of
@@ -599,7 +717,12 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       cancel?.();
       if (reservation !== undefined) {
 	try {
-	  cancelReservedChild(opts.stateDir, reservation);
+	  const dispatchLock = acquireDispatchLock(30_000, 'owenloop Shift dispatch');
+	  try {
+	    cancelReservedChild(opts.stateDir, reservation);
+	  } finally {
+	    releaseFileLock(dispatchLock);
+	  }
 	} catch (cleanupError) {
 	  opts.err(
 	    `[${c.workflow}/${c.order.run}] failed to cancel dispatch reservation: ${errMsg(cleanupError)}`,
@@ -1154,7 +1277,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // had no local capacity, or its sweep failed, the adopted cursor will be
     // unchanged next time. `sweepOwed` preserves that unconsumed work signal.
     let swept: SweepResult | undefined;
-    if (wakeSucceeded && (changed || sweepOwed) && k > 0) {
+    const brakeDue = brakeSweepDueAt !== undefined && monotonicNow() >= brakeSweepDueAt;
+    if (wakeSucceeded && (changed || sweepOwed || brakeDue) && k > 0) {
+      // Clear before awaiting: a new brake armed during sweep must survive.
+      if (brakeDue) brakeSweepDueAt = undefined;
       swept = await sweep(k, live, reserved);
       sweepOwed = !swept.complete;
     } else if (changed && k <= 0) {
@@ -1267,7 +1393,36 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	runBrakeKey.delete(run);
 	stepBrake.delete(brakeKey);
       }
-      removeChildRecord(opts.stateDir, run);
+	// The hub's closed-run report is authoritative but carries no record identity.
+	removeRecordUnderDispatchLock(run);
+    },
+    noteChildExited: (exit: { workflow: string; run: string; kind: 'exec' | 'agent-run'; pid: number }) => {
+      pendingCandidates.delete(exit.run);
+      let removed = false;
+      try {
+	removed = removeRecordUnderDispatchLock(
+	  exit.run,
+	  { pid: exit.pid },
+	  1_000,
+	  'owenloop Shift exit reaper',
+	);
+      } catch (e) {
+	const retry = e instanceof FileLockTimeoutError
+	  ? ' (the pid reconciliation will retry)'
+	  : '';
+	opts.err(
+	  `[${exit.workflow}/${exit.run}] failed to free the dispatch slot after the worker exited: ${errMsg(e)}${retry}`,
+	);
+	return;
+      }
+      if (!removed) return;
+      emit({
+	type: 'reaped',
+	workflow: exit.workflow,
+	run: exit.run,
+	kind: exit.kind,
+	pid: exit.pid,
+      });
     },
     noteWorkerFailure: (failure: { run: string }) => {
       const brakeKey = runBrakeKey.get(failure.run);

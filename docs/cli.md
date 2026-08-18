@@ -385,6 +385,17 @@ version loops sharing the directory are configured with different total or
 agent caps, each loop enforces its own configured limits under the shared lock.
 Use identical cap settings for every loop sharing a state directory.
 
+Reconciliation uses that same lock and re-checks record identity before it
+changes anything: an abandoned reservation must still match the observed
+reservation token, a dead child must still have the observed PID, and a
+persisted start gate must still match both the observed PID and gate token. If
+another loop re-dispatches the same run while a stale scan is waiting for the
+lock, the replacement record and gate are preserved and no `abandoned` or
+`reaped` event is reported. Startup reconciliation defers briefly when the
+lock is busy and the poll loop retries it. A worker exit notification releases
+its PID record on every terminal outcome, including a clean exit with status
+`0`; reconciliation remains the crash/restart backstop.
+
 Canonical `*.json` child and reservation records are capacity-bearing state.
 Missing records are benign, including a record that disappears between listing
 and read. A truncated, malformed, or unreadable canonical record is not benign:

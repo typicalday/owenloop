@@ -17,12 +17,13 @@ import { loadSettings } from '../settings/settings.ts';
 import { DEFAULT_HUB_ROSTER_SYNC_TIMEOUT_MS, syncHubRosterCache, withHubRosterSyncTimeout } from '../settings/hub-roster-cache.ts';
 import { computeServeCapabilities } from '../settings/serving.ts';
 import { resolveCacheDir } from '../bundle/cache.ts';
-import { createShiftLoop, type ShiftLoop } from './loop.ts';
+import { createLockedRemovalCallbacks, createShiftLoop, type ShiftLoop } from './loop.ts';
 import { createShiftLogSink } from './logsink.ts';
 import { prepareShiftLogDir, shiftLogFile } from './logretention.ts';
 import { stampShiftEvent, type ShiftEvent, type ShiftEventBody } from './protocol.ts';
-import { createDefaultSpawner, type WorkerFailure } from './spawn.ts';
-import { resolveStateDir, ensureStateDir, reconcileInFlight } from './state.ts';
+import { createDefaultSpawner, type WorkerExit, type WorkerFailure } from './spawn.ts';
+import { resolveStateDir, ensureStateDir, reconcileInFlight, type Liveness, type Reconciliation } from './state.ts';
+import { FileLockTimeoutError, type AcquireFileLockOpts } from '../../../../src/lock.ts';
 import { reconcileActiveSessions, sessionsPath } from '../harness/session-store.ts';
 import {
   resolveAllowedWorkdirRoots,
@@ -270,6 +271,35 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * Reconcile startup state under the same per-removal dispatch lock as the live
+ * loop. A busy neighbour is recoverable: the first poll-loop iteration retries
+ * shortly, whereas failing the entire Shift startup would strand its work.
+ */
+export function reconcileStartupState(
+  stateDir: string,
+  report: (line: string) => void,
+  options: {
+    dispatchLockOptions?: Pick<AcquireFileLockOpts, 'beforeOpen'>;
+    isAlive?: Liveness;
+  } = {},
+): Reconciliation | undefined {
+  try {
+    return reconcileInFlight(stateDir, {
+      ...(options.isAlive === undefined ? {} : { isAlive: options.isAlive }),
+      ...createLockedRemovalCallbacks(stateDir, {
+	dispatchLockOptions: options.dispatchLockOptions,
+	waitMs: 1_000,
+	label: 'owenloop Shift startup reaper',
+      }),
+    });
+  } catch (error) {
+    if (!(error instanceof FileLockTimeoutError)) throw error;
+    report(`startup dispatch-state reconciliation deferred: ${errMsg(error)} (the poll-loop reconciliation will retry)`);
+    return undefined;
+  }
+}
+
 export interface ShiftRuntimeOptions {
   /** Build the Unix-socket shift daemon around the same loop instead of self-driving directly. */
   daemon?: boolean;
@@ -363,7 +393,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     // Reconcile the Shift's own dispatch records for capacity housekeeping. The
     // session sweep below must use the session row's PID and ownership fields,
     // not this run-id set, because every Shift on the machine shares the store.
-    reconcileInFlight(stateDir);
+    reconcileStartupState(stateDir, (line) => process.stderr.write(`${roleLabel}: ${line}\n`));
     try {
       const retired = reconcileActiveSessions(
         sessionsPath(cacheDir),
@@ -553,6 +583,9 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
     // way forever is re-dispatched on a backoff instead of once per poll.
     loopRef.current?.noteWorkerFailure(failure);
   };
+  const reportWorkerExit = (exit: WorkerExit): void => {
+    loopRef.current?.noteChildExited(exit);
+  };
   const spawner = createDefaultSpawner(
     origin,
     account,
@@ -566,6 +599,7 @@ export async function runShiftRuntime(parsed: ParsedArgs, options: ShiftRuntimeO
       ? { dir: logDir, err: (line: string) => process.stderr.write(`${line}\n`) }
       : undefined,
     allowedWorkdirRoots,
+    reportWorkerExit,
   );
   const pollIntervalMs = parsed.pollIntervalMs ?? DEFAULT_POLL_MS;
 
