@@ -147,6 +147,30 @@ function errMsg(e: unknown): string {
 }
 
 /**
+ * Append the child's captured output to a payload reject reason when it gives
+ * the consumer diagnosis that the script's one-line reason cannot.
+ *
+ * A reject consumer receives only this text. The same `outputTail` already
+ * reaches the worker log through `relayChildOutput` and the receipt through
+ * `receipt.ts`, but a step that consumes a rejected artifact sees neither:
+ * a delivery builder otherwise learns only that local checks failed. Matching
+ * `relayChildOutput`'s trailing-newline trim makes the log and reject carry
+ * identical bytes, while the label prevents the child's words from being
+ * mistaken for the script's reason.
+ *
+ * Scripts normally print their `##owenloop:payload##` directive to stdout, so
+ * that marker remains in the tail just as it does in `relayChildOutput`.
+ * Stripping it here would duplicate the runner's bounded marker scanner. The
+ * runner caps the tail at 4 KiB, and a large final payload can crowd out its
+ * diagnostics; that pre-existing limit belongs in the runner, not this relay.
+ */
+function withCommandOutput(text: string, outputTail: string): string {
+  const tail = outputTail.replace(/\n+$/, '');
+  if (tail === '') return text;
+  return `${text}\n\n--- command output (last ${Buffer.byteLength(tail, 'utf8')} bytes) ---\n${tail}`;
+}
+
+/**
  * Put the order's consumed inputs on `childEnv`, and return the temp DIRECTORY
  * holding the overflow file — or `undefined` when the payload went inline.
  *
@@ -337,6 +361,10 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
    * Deliver a PAYLOAD reject before the owed submits, and say whether this
    * worker is finished.
    *
+   * Its text is the script's reason plus a labeled child-output tail. That
+   * tail makes a reject actionable for a consumer that never sees the receipt,
+   * where the runner's output would otherwise be the only diagnosis.
+   *
    * The distinction from `issueReject` is the third outcome. A judge reject is
    * always the end of the run; a payload reject may leave the claim open, and
    * when it does the owed receipts still have to land. So this returns either a
@@ -358,10 +386,16 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
    * (`reject-artifact.ts` checks `runRow.fingerprint`, which is what the engine
    * recorded at claim time — not what the def declares the step consumes).
    */
-  async function relayPayloadReject(path: string, text: string, owed: number): Promise<ExecOutcome | 'continue'> {
+  async function relayPayloadReject(
+    path: string,
+    text: string,
+    outputTail: string,
+    owed: number,
+  ): Promise<ExecOutcome | 'continue'> {
+    const body = withCommandOutput(text, outputTail);
     let res;
     try {
-      res = await hub.reject({ workflow, run: runId, path, text });
+      res = await hub.reject({ workflow, run: runId, path, text: body });
     } catch (e) {
       opts.err(`owenloop work exec: reject of ${path} failed: ${errMsg(e)}`);
       // Nothing has been submitted yet, so unlike the post-submit case there
@@ -543,7 +577,12 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     // A REFUSED reject now submits nothing. That is the point: previously the
     // receipt had already landed and greened a path whose gate had failed.
     if (order.judge === undefined && parsedPayload.reject !== undefined) {
-      const rejected = await relayPayloadReject(parsedPayload.reject.path, parsedPayload.reject.text, order.owes.length);
+      const rejected = await relayPayloadReject(
+        parsedPayload.reject.path,
+        parsedPayload.reject.text,
+        result.outputTail,
+        order.owes.length,
+      );
       if (rejected !== 'continue') return rejected;
     }
 

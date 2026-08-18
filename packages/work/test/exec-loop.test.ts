@@ -809,6 +809,79 @@ test('a payload reject that leaves the claim open lands FIRST, then every owed r
   assert.equal((only(calls, 'reject')[0]!.arg as Record<string, unknown>)['by'], undefined);
 });
 
+test('a payload reject carries the child command output tail', async () => {
+  const fr = fakeRunner();
+  const { hub, calls } = mockHub({
+    getOrder: [commandOrder({ owes: ['a'] })],
+    submit: ['green'],
+    reject: [{ ok: true, closed: false }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, {
+    payloadLine: '{"reject":{"path":"checks","text":"local checks failed"}}',
+    outputTail: 'FAIL test/foo.test.ts\n  expected 1 got 2\n\n',
+  }));
+  assert.equal(await p, 'submitted');
+  assert.deepEqual(only(calls, 'reject')[0]!.arg, {
+    workflow: 'wf1',
+    run: 'run1',
+    path: 'checks',
+    text: 'local checks failed\n\n--- command output (last 40 bytes) ---\nFAIL test/foo.test.ts\n  expected 1 got 2',
+  });
+});
+
+test('an empty child output tail appends nothing to a payload reject', async () => {
+  const fr = fakeRunner();
+  const { hub, calls } = mockHub({
+    getOrder: [commandOrder({ owes: ['a'] })],
+    submit: ['green'],
+    reject: [{ ok: true, closed: false }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, {
+    payloadLine: '{"reject":{"path":"input","text":"upstream is invalid"}}',
+    outputTail: '\n\n',
+  }));
+  assert.equal(await p, 'submitted');
+  assert.deepEqual(only(calls, 'reject')[0]!.arg, {
+    workflow: 'wf1',
+    run: 'run1',
+    path: 'input',
+    text: 'upstream is invalid',
+  });
+  assert.ok(
+    !String((only(calls, 'reject')[0]!.arg as Record<string, unknown>)['text']).includes('--- command output'),
+    'silence must not add a separator',
+  );
+});
+
+test('the appended tail reports BYTES, not characters', async () => {
+  const fr = fakeRunner();
+  const { hub, calls } = mockHub({
+    getOrder: [commandOrder({ owes: ['a'] })],
+    submit: ['green'],
+    reject: [{ ok: true, closed: false }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(0, {
+    payloadLine: '{"reject":{"path":"input","text":"bad value"}}',
+    outputTail: 'é\n',
+  }));
+  assert.equal(await p, 'submitted');
+  assert.deepEqual(only(calls, 'reject')[0]!.arg, {
+    workflow: 'wf1',
+    run: 'run1',
+    path: 'input',
+    text: 'bad value\n\n--- command output (last 2 bytes) ---\né',
+  });
+});
+
 test('a payload reject that closes the run submits NOTHING and leaves the owed paths as debts', async () => {
   const fr = fakeRunner();
   const { hub, calls, submits } = mockHub({
