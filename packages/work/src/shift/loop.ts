@@ -222,6 +222,17 @@ export interface ShiftLoop {
    */
   noteRunEnded(run: string): void;
   /**
+   * A dispatched worker process ENDED. Frees the dispatch slot it held on every
+   * terminal outcome, including a mid-turn completion that exits 0. This is the
+   * primary release path; reconciliation remains the crash/restart backstop.
+   */
+  noteChildExited(exit: {
+    workflow: string;
+    run: string;
+    kind: 'exec' | 'agent-run';
+    pid: number;
+  }): void;
+  /**
    * A dispatched child exited non-zero. Charges one failure against that run's
    * STEP and arms the brake window — see `STEP_BRAKE_DELAYS_MS`.
    *
@@ -254,11 +265,16 @@ interface Candidate {
 
 /** The `maxConcurrentAgents` fallback when the option is absent. */
 const DEFAULT_MAX_AGENTS = 4;
+/** The hub reaps a never-contacted claim after this long. Every client-side
+ * re-offer latency must stay strictly under it. */
+export const HUB_PICKUP_WINDOW_MS = 120_000;
+/** Headroom for a detached child to make first contact after dispatch. */
+const CHILD_FIRST_CONTACT_MARGIN_MS = 30_000;
 /**
  * The hub reaps a never-contacted claim after 120 seconds. Stop local queueing
  * after 90 seconds so a detached child retains 30 seconds to make first contact.
  */
-export const MAX_PENDING_CANDIDATE_AGE_MS = 90_000;
+export const MAX_PENDING_CANDIDATE_AGE_MS = HUB_PICKUP_WINDOW_MS - CHILD_FIRST_CONTACT_MARGIN_MS;
 
 /**
  * THE PER-STEP FAILURE BRAKE.
@@ -293,12 +309,12 @@ export const MAX_PENDING_CANDIDATE_AGE_MS = 90_000;
  * It is a rate limit, never a ban. A step that has not failed is dispatched
  * with zero delay, however many orders arrive for it at once.
  */
-const STEP_BRAKE_DELAYS_MS = [2_000, 8_000, 30_000, 120_000, 300_000] as const;
+export const STEP_BRAKE_DELAYS_MS = [2_000, 8_000, 30_000, 60_000, 90_000] as const;
 
 /**
  * Treat a failure this long after the previous one as the start of a NEW
  * streak, resetting the count to zero first. Comfortably longer than the
- * longest delay in the table (300s), so a step failing at maximum backoff never
+ * longest delay in the table (90s), so a step failing at maximum backoff never
  * decays out of it, while an isolated transient long after an old streak starts
  * again at the shortest delay instead of inheriting a stale penalty.
  */
@@ -316,7 +332,7 @@ const STEP_BRAKE_FORGET_MS = 1_800_000;
  * worker failures. `count` is at least 1 at every call site (this is reached
  * only from the failure path), so the FIRST failure already costs 2s; past the
  * end of the table the last entry repeats, so a permanently-failing step
- * settles at one dispatch per five minutes instead of one per poll.
+ * settles at one dispatch per 90 seconds instead of one per poll.
  */
 function stepBrakeDelayMs(count: number): number {
   const index = Math.min(count, STEP_BRAKE_DELAYS_MS.length) - 1;
@@ -391,6 +407,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   /** A changed wake whose sweep was skipped or failed must be retried after the
    * cursor is adopted; otherwise the next unchanged wake hides that work. */
   let sweepOwed = false;
+  /** Earliest monotonic time at which a braked step becomes dispatchable again.
+   * Drives a sweep without a hub cursor move, so a brake never waits forever. */
+  let brakeSweepDueAt: number | undefined;
   /**
    * Has the current at-capacity EPISODE already produced a `capacity` event?
    *
@@ -549,6 +568,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	`${brake.count} time(s) in a row — braking for ${waitMs}ms and ` +
 	`leaving this claim to lapse`,
       );
+      brakeSweepDueAt = brakeSweepDueAt === undefined
+	? brake.nextAllowedAt
+	: Math.min(brakeSweepDueAt, brake.nextAllowedAt);
       return 'braked';
     }
     let reservation: ChildReservation | undefined;
@@ -1154,7 +1176,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // had no local capacity, or its sweep failed, the adopted cursor will be
     // unchanged next time. `sweepOwed` preserves that unconsumed work signal.
     let swept: SweepResult | undefined;
-    if (wakeSucceeded && (changed || sweepOwed) && k > 0) {
+    const brakeDue = brakeSweepDueAt !== undefined && monotonicNow() >= brakeSweepDueAt;
+    if (wakeSucceeded && (changed || sweepOwed || brakeDue) && k > 0) {
+      // Clear before awaiting: a new brake armed during sweep must survive.
+      if (brakeDue) brakeSweepDueAt = undefined;
       swept = await sweep(k, live, reserved);
       sweepOwed = !swept.complete;
     } else if (changed && k <= 0) {
@@ -1268,6 +1293,26 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	stepBrake.delete(brakeKey);
       }
       removeChildRecord(opts.stateDir, run);
+    },
+    noteChildExited: (exit: { workflow: string; run: string; kind: 'exec' | 'agent-run'; pid: number }) => {
+      pendingCandidates.delete(exit.run);
+      let removed = false;
+      try {
+	removed = removeChildRecord(opts.stateDir, exit.run, { pid: exit.pid });
+      } catch (e) {
+	opts.err(
+	  `[${exit.workflow}/${exit.run}] failed to free the dispatch slot after the worker exited: ${errMsg(e)}`,
+	);
+	return;
+      }
+      if (!removed) return;
+      emit({
+	type: 'reaped',
+	workflow: exit.workflow,
+	run: exit.run,
+	kind: exit.kind,
+	pid: exit.pid,
+      });
     },
     noteWorkerFailure: (failure: { run: string }) => {
       const brakeKey = runBrakeKey.get(failure.run);

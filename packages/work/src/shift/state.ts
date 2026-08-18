@@ -391,12 +391,20 @@ export function cancelReservedChild(stateDir: string, reservation: ChildReservat
  * is cancelled first so an external run-ended signal cannot leave a worker gate
  * behind that later opens without a capacity record.
  */
-export function removeChildRecord(stateDir: string, run: string): void {
+export function removeChildRecord(
+  stateDir: string,
+  run: string,
+  options?: { pid?: number },
+): boolean {
   const path = recordFile(stateDir, run);
   const current = readOneStateRecord(path);
+  if (current === undefined) return false;
+  // A late exit report must never remove a record written by a re-dispatch of
+  // the same run. Reservations have no pid, so they are likewise newer owners.
+  if (options?.pid !== undefined && (isReservation(current) || current.pid !== options.pid)) return false;
   if (current !== undefined && isReservation(current)) {
     cancelReservedChild(stateDir, current);
-    return;
+    return true;
   }
   if (current?.gateToken !== undefined) {
     const gatePath = gateFile(stateDir, current.gateToken);
@@ -407,6 +415,7 @@ export function removeChildRecord(stateDir: string, run: string): void {
     }
   }
   durableRemove(path);
+  return true;
 }
 
 export type Liveness = (pid: number) => boolean;

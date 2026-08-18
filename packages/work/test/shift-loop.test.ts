@@ -7,12 +7,20 @@ import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 
-import { createShiftLoop, MAX_PENDING_CANDIDATE_AGE_MS, type ShiftLoop, type ShiftLoopOptions } from '../src/shift/loop.ts';
+import {
+  createShiftLoop,
+  HUB_PICKUP_WINDOW_MS,
+  MAX_PENDING_CANDIDATE_AGE_MS,
+  STEP_BRAKE_DELAYS_MS,
+  type ShiftLoop,
+  type ShiftLoopOptions,
+} from '../src/shift/loop.ts';
 import {
   buildSpawnPlan,
   createDefaultSpawner,
   type SpawnSpec,
   type Spawner,
+  type WorkerExit,
 } from '../src/shift/spawn.ts';
 import {
   readChildRecords,
@@ -28,6 +36,7 @@ import type { CachedBundle } from '../src/bundle/types.ts';
 import type { NormalizedStepSpec } from '../src/bundle/types.ts';
 import { ORDER_TOKEN, ORIGIN_TOKEN } from '../src/agent/brief.ts';
 import { installSignalHandlers, type SignalHost } from '../src/roles/signals.ts';
+import { exitCodeFor } from '../src/roles/agent-run.ts';
 import type { HubClient } from '../src/hub/client.ts';
 import { HubError, type InboxInstance, type WorkOrder } from '../src/hub/types.ts';
 
@@ -1442,6 +1451,40 @@ test('createDefaultSpawner reports a nonzero detached worker exit with generic l
   }
 });
 
+test('createDefaultSpawner reports a clean agent-run exit without a worker failure', async () => {
+  const script = join(stateDir, '..', 'exit-zero.mjs');
+  writeFileSync(script, 'process.exit(0);\n');
+  const keepAlive = setTimeout(() => {}, 5_000);
+  const failures: unknown[] = [];
+  const exit = new Promise<WorkerExit>((resolve) => {
+    const spawner = createDefaultSpawner(
+      ORIGIN,
+      'default',
+      script,
+      'shf_test',
+      (failure) => failures.push(failure),
+      undefined,
+      undefined,
+      resolve,
+    );
+    spawner({ workflow: 'wf1', run: 'run_completed', step: 'builder', kind: 'agent-run' });
+  });
+
+  try {
+    assert.equal(exitCodeFor('submitted'), 0, 'a mid-turn completion takes this clean-exit path');
+    const reported = await exit;
+    assert.equal(reported.workflow, 'wf1');
+    assert.equal(reported.run, 'run_completed');
+    assert.equal(reported.kind, 'agent-run');
+    assert.equal(reported.exitStatus, 0);
+    assert.equal(reported.signal, null);
+    assert.ok(reported.pid > 0);
+    assert.deepEqual(failures, []);
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
+
 test('createDefaultSpawner never lets allowlisted-looking agent progress reach a failure event', async () => {
   const script = join(stateDir, '..', 'refuse.mjs');
   writeFileSync(
@@ -1567,6 +1610,60 @@ test('noteRunEnded frees the dispatch slot immediately (closed-submit end-of-run
   loop.noteRunEnded('run_x1234');
   assert.equal(loop.freeCapacity(), 3, 'the dispatch slot freed immediately');
   assert.equal(readChildRecords(stateDir).length, 0, 'the in-flight record is gone');
+});
+
+test('a mid-turn completion releases capacity even when the pid probe stays alive', async () => {
+  cacheBuilderStep();
+  const orders = [wo('run_mid_turn', 'builder')];
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }, { changed: true, cursor: 2 }],
+    perWf: agentWf(orders),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    maxConcurrentAgents: 1,
+  }));
+
+  assert.equal(await loop.iterate(), 1);
+  assert.equal(loop.freeCapacity(), 0);
+  const record = readChildRecords(stateDir)[0]!;
+
+  loop.noteChildExited({
+    workflow: 'wf1',
+    run: record.run,
+    kind: 'agent-run',
+    pid: record.pid,
+  });
+  assert.equal(loop.freeCapacity(), 1);
+  assert.equal(readChildRecords(stateDir).length, 0);
+
+  orders[0] = wo('run_mid_turn_next', 'builder');
+  assert.equal(await loop.iterate(), 1, 'the shift accepts a new order after the clean child exit');
+  assert.deepEqual(spawns.map((spec) => spec.run), ['run_mid_turn', 'run_mid_turn_next']);
+});
+
+test('a stale child exit report cannot free a later dispatch of the same run', async () => {
+  cacheBuilderStep();
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_reoffered', 'builder')]),
+  });
+  const { spawner } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    maxConcurrentAgents: 1,
+  }));
+
+  await loop.iterate();
+  const first = readChildRecords(stateDir)[0]!;
+  writeChildRecord(stateDir, { ...first, pid: first.pid + 1 });
+
+  loop.noteChildExited({ workflow: 'wf1', run: first.run, kind: 'agent-run', pid: first.pid });
+  assert.deepEqual(readChildRecords(stateDir).map((record) => record.pid), [first.pid + 1]);
+  assert.equal(loop.freeCapacity(), 0, 'the later child still owns the only slot');
 });
 
 // ---- role-level signal wiring (through the loop seam) -----------------------
@@ -2322,16 +2419,22 @@ test('the shift hands the reaper the session store at sessionsPath(cacheDir)', a
  * controllable clock. `fail(run)` reports that run's child exited non-zero,
  * exactly as the shift runtime's `reportWorkerFailure` does in production.
  */
-function stormLoop(runs: string[], monotonic: () => number, step = 'cmd'): {
+function stormLoop(
+  runs: string[],
+  monotonic: () => number,
+  step = 'cmd',
+  wake?: WakeStep[],
+): {
   loop: ShiftLoop;
   spawns: SpawnSpec[];
   errs: string[];
+  calls: Call[];
   next: () => void;
 } {
   cacheCommandBundle();
   let i = 0;
   const orders = [wo(runs[0]!, step)];
-  const { hub } = mockHub({ perWf: cmdWf(orders) });
+  const { hub, calls } = mockHub({ perWf: cmdWf(orders), ...(wake !== undefined ? { wake } : {}) });
   const { spawner, spawns } = fakeSpawner();
   const errs: string[] = [];
   const loop = createShiftLoop(baseOpts(hub, spawner, {
@@ -2346,8 +2449,12 @@ function stormLoop(runs: string[], monotonic: () => number, step = 'cmd'): {
     i += 1;
     orders[0] = wo(runs[i]!, step);
   };
-  return { loop, spawns, errs, next };
+  return { loop, spawns, errs, calls, next };
 }
+
+test('every brake delay remains inside the hub pickup window', () => {
+  assert.ok(Math.max(...STEP_BRAKE_DELAYS_MS) < HUB_PICKUP_WINDOW_MS);
+});
 
 test('a step whose worker keeps failing is braked instead of respawned forever', async () => {
   let monotonic = 0;
@@ -2439,6 +2546,36 @@ test('a braked candidate is not queued for local dispatch', async () => {
   // next drain, with no window elapsed — which would defeat the brake entirely.
   await loop.iterate();
   assert.deepEqual(spawns.map((s) => s.run), ['run_q01']);
+});
+
+test('a brake expiry sweeps again even when wake reports no change', async () => {
+  let monotonic = 0;
+  const { loop, spawns, calls, next } = stormLoop(
+    ['run_alarm_a', 'run_alarm_b'],
+    () => monotonic,
+    'cmd',
+    [
+      { changed: true, cursor: 1 },
+      { changed: true, cursor: 2 },
+      { changed: false, cursor: 2 },
+    ],
+  );
+
+  await loop.iterate();
+  loop.noteWorkerFailure({ run: 'run_alarm_a' });
+  next();
+  await loop.iterate(); // run_alarm_b is braked and arms the 2s re-sweep.
+  assert.deepEqual(spawns.map((spec) => spec.run), ['run_alarm_a']);
+  assert.equal(count(calls, 'whats_next'), 2);
+
+  await loop.iterate();
+  assert.equal(count(calls, 'whats_next'), 2, 'an unchanged wake must not sweep before the brake expires');
+  assert.deepEqual(spawns.map((spec) => spec.run), ['run_alarm_a']);
+
+  monotonic = 2_000;
+  await loop.iterate();
+  assert.equal(count(calls, 'whats_next'), 3, 'the due brake triggers its own sweep');
+  assert.deepEqual(spawns.map((spec) => spec.run), ['run_alarm_a', 'run_alarm_b']);
 });
 
 test('a run that ends clears its step’s failure streak', async () => {
