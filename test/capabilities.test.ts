@@ -21,6 +21,7 @@ import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { StepDef, WorkflowDef } from '../src/types.ts';
 import {
+  applyCapabilityMappings,
   applyCapabilityRewrites,
   capabilityName,
   claimMatches,
@@ -542,4 +543,223 @@ test('no rewrites supplied is byte-for-byte the pre-rewrite behavior', () => {
   const t = engine.tick(wf, { now: 0, capabilities: ['build:deep'] });
   assert.deepEqual(t.orders[0]!.capabilities, ['build:deep', 'wise:deep']);
   assert.equal(t.orders[0]!.reroutedFrom, undefined);
+});
+
+// ---- mapping: the AUTHORED name → the org's own capability name ------------
+//
+// A def installed from elsewhere must be scoped by default: repo A's `coding`
+// and repo B's `coding` are unrelated until someone links them deliberately.
+// That is expressed as a per-run map from the AUTHORED capability to the org
+// capability, applied BEFORE composition, so one entry covers every grade the
+// step can be offered at. The full chain is now:
+//
+//     authored → mapped → composed with the modifier → rewritten → offered
+//
+// Mapping and rewriting stay separate inputs on purpose: a mapping is keyed by
+// the authored name and runs first, a rewrite is keyed by the composed string
+// and runs last, and the reroute mechanism already owns the rewrite key space.
+// The engine enforces both and chooses neither.
+
+test('applyCapabilityMappings: an authored list no entry touches is returned BY REFERENCE', () => {
+  // Reference identity, not just deep equality, is the property that makes an
+  // absent map exact identity rather than merely equivalent: composition
+  // downstream receives the very array it received before this pass existed.
+  // Without it an ordinary tick would start deduping a step that authored
+  // ['dup','dup'] and silently change what the order stamps.
+  const authored = ['a', 'a'];
+  const mapped = applyCapabilityMappings(authored, {});
+  assert.equal(mapped, authored, 'the identical array, not a copy');
+  assert.deepEqual(mapped, ['a', 'a'], 'multiplicity preserved');
+
+  assert.equal(applyCapabilityMappings(undefined, {}), undefined, 'a capability-silent step stays silent');
+  const empty: string[] = [];
+  assert.equal(applyCapabilityMappings(empty, { a: 'b' }), empty, 'an empty list falls straight through');
+});
+
+test('applyCapabilityMappings: an identity entry is not a change', () => {
+  const authored = ['a', 'a'];
+  const mapped = applyCapabilityMappings(authored, { a: 'a' });
+  assert.equal(mapped, authored, 'mapping a name onto itself leaves the list untouched');
+  assert.deepEqual(mapped, ['a', 'a']);
+});
+
+test('applyCapabilityMappings: a firing entry maps, and two names onto one target collapse', () => {
+  assert.deepEqual(applyCapabilityMappings(['a', 'b'], { a: 'x', b: 'x' }), ['x']);
+  assert.deepEqual(applyCapabilityMappings(['a', 'a'], { a: 'x' }), ['x'], 'dedup is a consequence of mapping');
+});
+
+test('applyCapabilityMappings: a mapping is a single hop, never chased', () => {
+  // `b` also has an entry, but a target is never itself looked up: the caller
+  // resolves any chain before handing the map over. Same contract as a rewrite.
+  assert.deepEqual(applyCapabilityMappings(['a'], { a: 'b', b: 'c' }), ['b']);
+});
+
+test('applyCapabilityMappings: an unmapped name in a partly-mapped list passes through', () => {
+  assert.deepEqual(
+    applyCapabilityMappings(['build', 'wise'], { build: 'repo-a-flow.build' }),
+    ['repo-a-flow.build', 'wise'],
+  );
+});
+
+test('applyCapabilityMappings: lookup is by OWN property', () => {
+  // Keys are arbitrary authored words. An authored `constructor` must resolve
+  // to "no entry", not to an inherited Object.prototype member.
+  const authored = ['constructor', 'toString'];
+  assert.equal(applyCapabilityMappings(authored, {}), authored, 'no inherited member fires');
+});
+
+// A def authoring the bare `coding` capability at two grades — the third-party
+// shape a mapping exists to scope.
+const codingDef = (): WorkflowDef => def(
+  'coding',
+  [input('proposal')],
+  [step({ name: 'builder', consumes: ['proposal'], produces: ['pr'], capabilities: ['coding'] })],
+  ['express', 'deep'],
+);
+
+test('capability mapping: no mapping supplied is byte-for-byte the pre-mapping behavior', () => {
+  const { engine } = makeEngine([gradedDef()]);
+  const wf = engine.createInstance('graded', { modifier: 'deep' });
+
+  const absent = engine.tick(wf, { now: 0, capabilities: ['build:deep'] });
+  assert.equal(absent.orders.length, 1);
+  assert.deepEqual(absent.orders[0]!.capabilities, ['build:deep', 'wise:deep']);
+  assert.equal(absent.orders[0]!.reroutedFrom, undefined);
+
+  // An empty map must be indistinguishable from an absent one.
+  const { engine: e2 } = makeEngine([gradedDef()]);
+  const wf2 = e2.createInstance('graded', { modifier: 'deep' });
+  const empty = e2.tick(wf2, { now: 0, capabilities: ['build:deep'], capabilityMappings: {} });
+  assert.equal(empty.orders.length, 1);
+  assert.deepEqual(empty.orders[0]!.capabilities, ['build:deep', 'wise:deep']);
+  assert.equal(empty.orders[0]!.reroutedFrom, undefined);
+});
+
+test('capability mapping: the mapping applies BEFORE the modifier composes', () => {
+  // The whole point of keying on the authored name: ONE entry serves every
+  // grade, because the modifier is attached after the substitution.
+  const { engine } = makeEngine([codingDef()]);
+  const wf = engine.createInstance('coding', { modifier: 'deep' });
+
+  const t = engine.tick(wf, {
+    now: 0,
+    capabilities: ['repo-a-flow.coding:deep'],
+    capabilityMappings: { coding: 'repo-a-flow.coding' },
+  });
+
+  assert.equal(t.orders.length, 1);
+  const order = t.orders[0]!;
+  assert.deepEqual(order.capabilities, ['repo-a-flow.coding:deep']);
+  assert.ok(!order.capabilities!.includes('coding:deep'), 'not composed from the authored name');
+  assert.ok(!order.capabilities!.includes('repo-a-flow.coding'), 'not mapped after composition either');
+  assert.equal(order.reroutedFrom, undefined, 'a mapping is not a reroute');
+  assert.equal(order.modifier, 'deep');
+});
+
+test('capability mapping: the filter and the stamped order apply the same mapping', () => {
+  // A crew presenting the PRE-mapping capability must not claim: what is
+  // matched is what gets stamped, or a shift would receive an order carrying a
+  // capability it never agreed to serve. This is what pins the filter site and
+  // the stamp site against drifting apart.
+  const { engine } = makeEngine([codingDef()]);
+  const wf = engine.createInstance('coding', { modifier: 'deep' });
+
+  const t = engine.tick(wf, {
+    now: 0,
+    capabilities: ['coding:deep'],
+    matchModes: { 'repo-a-flow.coding:deep': 'exact' },
+    capabilityMappings: { coding: 'repo-a-flow.coding' },
+  });
+
+  assert.equal(t.orders.length, 0);
+  assert.equal(t.deferred.filter((d) => d.reason === 'capability-mismatch').length, 1);
+});
+
+test('capability mapping: a mapping and a reroute coexist in one tick, in that order', () => {
+  // The rewrite is keyed by the POST-mapping composed string, and the reroute
+  // record it leaves is the post-mapping, pre-rewrite offer.
+  const { engine, store } = makeEngine([codingDef()]);
+  const wf = engine.createInstance('coding', { modifier: 'express' });
+
+  const t = engine.tick(wf, {
+    now: 0,
+    capabilities: ['repo-a-flow.coding:standard'],
+    capabilityMappings: { coding: 'repo-a-flow.coding' },
+    capabilityRewrites: { 'repo-a-flow.coding:express': 'repo-a-flow.coding:standard' },
+  });
+
+  assert.equal(t.orders.length, 1);
+  const order = t.orders[0]!;
+  assert.deepEqual(order.capabilities, ['repo-a-flow.coding:standard'], 'served capability');
+  assert.deepEqual(order.reroutedFrom, ['repo-a-flow.coding:express'], 'post-mapping, pre-rewrite');
+  assert.equal(order.modifier, 'express', 'neither pass rewrites the grade that was asked for');
+  assert.equal(store.getWorkflow(wf)?.modifier, 'express', 'the stored run record is untouched');
+});
+
+test('capability mapping: an unmapped authored capability in a partly-mapped def passes through', () => {
+  const { engine } = makeEngine([gradedDef()]);
+  const wf = engine.createInstance('graded', { modifier: 'deep' });
+
+  const t = engine.tick(wf, {
+    now: 0,
+    capabilities: ['repo-a-flow.build:deep', 'wise:deep'],
+    capabilityMappings: { build: 'repo-a-flow.build' },
+  });
+
+  assert.equal(t.orders.length, 1);
+  assert.deepEqual(t.orders[0]!.capabilities, ['repo-a-flow.build:deep', 'wise:deep']);
+});
+
+// A calls: pair whose child authors the bare name a mapping scopes. Separate
+// from childLabeledDef/parentCallsDef so neither test perturbs the other.
+const mappedChildDef: WorkflowDef = {
+  ...def(
+    'mappedChild',
+    [],
+    [step({ name: 'runner', produces: ['outcome'], capabilities: ['coding'] })],
+  ),
+  outputs: ['outcome'],
+};
+
+const mappedParentDef: WorkflowDef = def(
+  'mappedParent',
+  [],
+  [
+    {
+      ...step({ name: 'deliver', produces: ['delivered'] }),
+      calls: 'mappedChild',
+      callsInputs: {},
+      consumes: [],
+    } as StepDef,
+  ],
+);
+
+test('capability mapping: the deep tick threads the mapping into a calls: child', () => {
+  // The descent re-passes every routing input explicitly and each one defaults
+  // to {} in the signature, so an omitted argument there type-checks silently.
+  // Only a real deep tick catches it.
+  const { engine, store } = makeEngine([mappedChildDef, mappedParentDef]);
+  const parentWf = engine.createInstance('mappedParent');
+  const mappings = { coding: 'repo-a-flow.coding' };
+
+  // A crew presenting the PRE-mapping name must not claim the child's runner.
+  const t1 = engine.tick(parentWf, { now: 0, capabilities: ['coding'], capabilityMappings: mappings });
+  const child = store.findChildByParent(parentWf, 'delivered');
+  assert.ok(child, 'child instance is spawned regardless of the capability filter');
+  assert.ok(t1.orders.every((o) => o.step !== 'runner'), 'the unmapped name does not claim the child runner');
+  const mismatch = t1.deferred.find((d) => d.reason === 'capability-mismatch' && d.step === 'runner');
+  assert.ok(mismatch, 'the child runner is reported deferred');
+  assert.equal(mismatch!.workflow, child!.id, 'the deferral is stamped with the child workflow id');
+
+  // A crew presenting the MAPPED name claims it, and the child's order carries
+  // the mapped capability — proving the map reached the descended frame.
+  const t2 = engine.tick(parentWf, {
+    now: 1,
+    capabilities: ['repo-a-flow.coding'],
+    capabilityMappings: mappings,
+  });
+  const runnerOrder = t2.orders.find((o) => o.step === 'runner');
+  assert.ok(runnerOrder, 'the mapped name claims the child runner');
+  assert.equal(runnerOrder!.workflow, child!.id);
+  assert.deepEqual(runnerOrder!.capabilities, ['repo-a-flow.coding']);
 });

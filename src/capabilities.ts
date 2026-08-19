@@ -1,18 +1,23 @@
 /**
  * Routing capabilities: composition at offer time, and the claim-side match.
  *
- * Three vocabularies meet here and must not be confused:
+ * Four vocabularies meet here and must not be confused:
  *
  *   - **Authored capability** — what a def writes on a step (`wise`). Never
  *     contains the separator; the parser rejects one that does.
+ *   - **Org capability** — the name this org actually routes on, which for a
+ *     def installed from elsewhere may be a scoped form of the authored name.
+ *     Substituted for the authored one BEFORE composition, and only when the
+ *     caller supplies a mapping; absent a mapping the two are the same string.
  *   - **Modifier** — the ONE plain name a run carries (`deep`). Optional. The
  *     engine attaches no meaning, no order and no arithmetic to it.
- *   - **Compound capability** — `<authored>:<modifier>` (`wise:deep`), composed
- *     by the engine when it builds an order. Only the engine composes it.
+ *   - **Compound capability** — `<org>:<modifier>` (`wise:deep`), composed by
+ *     the engine when it builds an order. Only the engine composes it.
  *
- * Nothing here reads the store, the def or the clock. Composition is a pure
- * function of (authored capabilities, modifier); matching is a pure function of
- * (offered capabilities, caller capabilities, per-capability match mode).
+ * Nothing here reads the store, the def or the clock. Mapping is a pure
+ * function of (authored capabilities, mappings); composition is a pure function
+ * of (capabilities, modifier); matching is a pure function of (offered
+ * capabilities, caller capabilities, per-capability match mode).
  */
 
 /**
@@ -79,6 +84,42 @@ export function composeCapabilities(
 }
 
 /**
+ * A per-run substitution from an AUTHORED capability to the capability string
+ * this org actually routes on, applied BEFORE composition.
+ *
+ * `{ coding: 'repo-a-flow.coding' }` means: wherever a step of this run
+ * authored `coding`, offer the org's `repo-a-flow.coding` instead — so under
+ * modifier `deep` the offer composes to `repo-a-flow.coding:deep`, never
+ * `coding:deep`. Two vocabularies meet in one entry: the KEY is the authored
+ * name a def wrote, the VALUE is the name the org's crews are bound to.
+ *
+ * The reason it exists: a def that entered the org from a third party must be
+ * scoped by default, because two unrelated defs may both author `coding` and
+ * nothing should make them share crews by accident. Scoping is expressed as a
+ * mapping rather than a def edit so the def content stays byte-exact with its
+ * source and re-installs cleanly.
+ *
+ * The engine ENFORCES a mapping, it never CHOOSES one — same doctrine as
+ * `matchModes` and `capabilityRewrites`, and for the same reason: choosing
+ * means reading an install-scoped routing table the pure engine has never seen.
+ * The caller that owns that table hands the map down per tick.
+ *
+ * DISTINCT FROM `CapabilityRewrites`, which must not be reused for this. A
+ * mapping is applied BEFORE composition and is keyed by the AUTHORED name, so
+ * one entry covers every modifier including escalation targets and the
+ * no-modifier case. A rewrite is applied AFTER composition and is keyed by the
+ * COMPOSED string, so the same intent would need one entry per
+ * (capability x modifier) pair, and would collide with the reroute decisions
+ * that already own that key space. Both may apply within a single tick, in
+ * that order: authored → mapped → composed → rewritten → offered.
+ *
+ * SINGLE HOP, BY CONTRACT, exactly as for a rewrite: a mapped value is never
+ * itself looked up in the map, and is never inspected or validated. The caller
+ * resolves any chain and validates any target before calling.
+ */
+export type CapabilityMappings = Readonly<Record<string, string>>;
+
+/**
  * A reroute decision the caller has already made, keyed by the composed
  * capability the engine would otherwise offer.
  *
@@ -102,6 +143,45 @@ export type CapabilityRewrites = Readonly<Record<string, string>>;
  * names in match order. Hub → worker; unrelated to `serve_crews`.
  */
 export type CrewStamps = Readonly<Record<string, readonly string[]>>;
+
+/**
+ * Substitute a caller's capability mappings into a step's AUTHORED list, before
+ * that list is composed with the run's modifier. See `CapabilityMappings` for
+ * what a mapping is and why it is not a rewrite.
+ *
+ * An authored list no entry applies to is returned BY REFERENCE — the identical
+ * array, not a copy — and `undefined` and `[]` fall straight through. That is
+ * what makes an absent or empty map exact identity rather than merely
+ * equivalent: with `{}` the composition downstream receives byte-for-byte what
+ * it received before this pass existed, so no caller can observe the pass at
+ * all. It also preserves multiplicity, which matters: a step may author
+ * `capabilities: ['a', 'a']` (the parser validates each entry but never rejects
+ * a duplicate) and an untouched offer must still stamp both.
+ *
+ * Duplicates ARE removed once an entry actually fires, mirroring
+ * `applyCapabilityRewrites`: two authored names may map onto one org name, and
+ * an offer listing it twice would read as a mistake. Dedup is a consequence of
+ * mapping, never a tidy-up applied on the way past.
+ *
+ * Lookup is by OWN property. Keys here are arbitrary authored words, so a step
+ * authoring `constructor` or `toString` must resolve to "no entry" rather than
+ * to an inherited `Object.prototype` member.
+ */
+export function applyCapabilityMappings(
+  authored: readonly string[] | undefined,
+  mappings: CapabilityMappings,
+): readonly string[] | undefined {
+  if (authored === undefined || authored.length === 0) return authored;
+  let changed = false;
+  const out: string[] = [];
+  for (const c of authored) {
+    const target = Object.prototype.hasOwnProperty.call(mappings, c) ? mappings[c] : undefined;
+    const next = target ?? c;
+    if (target !== undefined && target !== c) changed = true;
+    if (!out.includes(next)) out.push(next);
+  }
+  return changed ? out : authored;
+}
 
 /**
  * Substitute a caller's reroute decisions into a composed offer.
