@@ -11,7 +11,8 @@ the system. Every term is defined before it is used. Nothing is left implicit.
 
 ## 0. Status of this document
 
-Sections 1 through 8 describe behavior that is live today.
+Sections 1 through 8 describe behavior that is live today, with one
+explicitly marked exception inside section 8a.
 
 Section 9 (**When nobody is certified**) describes a rule that is CHANGING.
 Both the old rule and the new rule are stated, and it is marked which is which,
@@ -84,7 +85,9 @@ colon.
   capabilities: [build]      # <- authored capability
 ```
 
-**Modifier** — one word, chosen once per run. The engine attaches *no meaning*
+**Modifier** — one word, carried by the run instance. The starter supplies the
+initial value; after that, a def-declared artifact bind is the only thing that
+can change it (section 8a). The engine attaches *no meaning*
 to it. `deep` is not "more" than `express` as far as any code is concerned;
 they are just two different strings. A definition declares which ones it
 accepts:
@@ -439,25 +442,134 @@ Four properties, all easy to get wrong:
 The order carries a marker, `order.escalated = true`, so a reader can tell an
 escalated re-offer from an ordinary one.
 
-Escalation still does not rewrite the run's stored modifier. A separate,
-def-declared `bind: modifier` is the engine's only post-start writer: it turns
-an accepted artifact into the next routing value. A planner can reject that
-artifact with `--requested <modifier>` (or the equivalent rejection path); the
-producer can then re-emit the requested value, and downstream work is offered
-with the synchronized modifier.
+Escalation moves one offer. It never rewrites the run's stored modifier. There
+is a separate mechanism that does, and it is the only one.
 
-The binding is ordinary dataflow, not a hidden reroute. Only steps downstream
-of the bound artifact are guaranteed to wait for its synchronized value. Claims
-already in flight finish under the modifier stamped on their orders; later
-offers compose from the new instance value. The artifact's version and reason
-history records the rejected value, feedback, and replacement, while the order
-records the modifier actually used for each firing.
+### 8a. The modifier bind — the engine's only post-start writer
 
-For a command producer, remember that the accepted artifact value is the whole
-`CommandReceipt`. If the command emits a payload marker such as
-`##owenloop:payload## {"value":"deep"}`, use
-`bind: {to: modifier, from: payload.value}`; a bare `from: value` would look for
-a top-level field on the receipt.
+A workflow definition can declare that one artifact **carries** the run's
+modifier. When that artifact is accepted, the engine writes its value onto the
+run instance. The declaration lives on the produce:
+
+```yaml
+modifiers: [express, standard, deep]
+
+steps:
+  - name: init
+    executor: command
+    capabilities: [init]
+    command: >-
+      value="$(owenloop util modifier-init --default standard)" &&
+      node -e 'console.log("##owenloop:payload##" +
+        JSON.stringify({value: process.argv[1]}))' "$value"
+    produces:
+      - name: modifier
+        bind: { to: modifier, from: payload.value }
+```
+
+Read: *when `modifier` is accepted, set the run's modifier to the `payload.value`
+field of the accepted value.* The full authoring grammar — the short form, the
+`meta.<key>` target family, the dot-path rules — is in
+[`docs/authoring.md`](authoring.md#bind--write-an-accepted-artifact-into-run-state).
+What follows is what the mechanism *means* for routing.
+
+Five properties, in the order they matter:
+
+1. **A `modifier` bind requires the def to declare `modifiers:`.** Without it,
+   loading the definition fails: `step '<step>' produce '<stem>' binds modifier
+   but workflow '<def>' declares no modifiers:` (`src/defs.ts`). A definition may
+   bind `modifier` at most once — a second one is
+   `workflow '<def>' binds modifier more than once`. The only other legal target
+   family is `bind: meta.<key>`, which writes non-routing instance metadata and
+   never touches capability composition. Binding is available on singleton and
+   per-element (map) produces; it is refused on collection produces and on
+   `calls:` outcomes.
+
+2. **The engine is the only writer.** No agent, step, worker, judge, or human
+   writes the run's modifier directly. The write goes through one private engine
+   method, `applyArtifactBind` (`src/engine.ts`), into one store method,
+   `setWorkflowRouting` (`src/store.ts`) — and those are the only two production
+   call sites of that store method under `src/`. There is no verb, flag, or MCP
+   call that sets it. `--modifier` at `start_run` supplies the initial value and
+   nothing after that.
+
+3. **The write happens inside the artifact-acceptance transaction.** The
+   modifier changes **if and only if** the bound artifact reaches green — by a
+   producer commit on a produce with no judges, by the last judge's approval, or
+   by a human `green`. All three branches run inside the same `store.tx()` that
+   writes the artifact, so acceptance and the routing write commit together or
+   neither happens. A submission still waiting on judges has synchronized
+   nothing. An out-of-set or multi-word value is refused before its accepted value
+   or green transition is written: a producer commit records the artifact as
+   `rejected`, comes back `schema-rejected`, and burns a schema attempt; a human
+   `green` throws `ModifierRefusalError` — the same refusal `start_run` uses.
+
+4. **The lever for changing it is rejecting the bound artifact with
+   `requested:`.**
+
+   ```bash
+   owenloop reject <wf> modifier --by planner --text "this needs deep review" \
+     --requested deep
+   ```
+
+   The engine validates `deep` against the definition's declared `modifiers:` at
+   **reject** time, not later: an undeclared or whitespace-bearing value throws
+   `ModifierRefusalError` and nothing is written at all. A `--requested` on an
+   artifact that is not bound to `modifier` is refused outright. The validated
+   value is then carried on the rejection's reason entry, and reaches the
+   producer's next order as `owes[].reasons[].requested` — and, for a command
+   step, through `OWENLOOP_FEEDBACK` (see
+   [`docs/bundles.md`](bundles.md#rejection-feedback-and-modifier-context)).
+   `requested` is a **request to the producer**, not a write. The producer
+   re-emits; only the acceptance of that new value moves the run.
+
+   **Who may pull the lever is the ordinary authority rule, unchanged.** `human`
+   and `engine` may always reject. A judge step may reject only the stem named in
+   its own `judges:` marker. Any other step may reject only an artifact it
+   declares in `consumes:`. So a planner that is meant to ask for a different
+   grade must declare `consumes: [modifier]` in the definition; a planner with no
+   such edge cannot reject it and can only say so in its plan document.
+
+5. **The record of what changed is the artifact history.** Each accepted sync
+   writes exactly one artifact event: `action: bound`, `actor: engine`,
+   `version: 0`, `metadata: { from, to }`, where `from` is `null` when the target
+   had no prior value. `Store.getArtifactHistory(workflow, path)` surfaces those
+   in its artifact-level `events` bucket. The event is idempotent by
+   construction, keyed on the accepted artifact version, so one acceptance can
+   only ever produce one row. The second half of the record is per-offer:
+   `order.modifier` is stamped on every order, so an order always says which
+   grade that firing actually ran under.
+
+**What the binding does not do.** It is ordinary dataflow, not a hidden reroute.
+The engine reads the run's current modifier at tick time and composes each offer
+from it, so claims already in flight finish under the modifier stamped on their
+own orders, and only offers composed *after* the sync see the new value. A
+capability-bearing step that is not downstream of the bound artifact can
+therefore be offered on the old grade. `lintDef` warns about exactly that:
+`step '<name>' declares capabilities (…) but is not downstream of artifact
+'<path>' bound to modifier`. If a step must run at the synchronized grade, wire
+the dependency explicitly — make it consume the bound artifact.
+
+**Escalation and the bind are separate mechanisms over related state.**
+Escalation is derived per offer from a reject count and leaves the stored
+modifier alone. The bind rewrites the stored modifier; that value can determine
+whether an otherwise eligible escalation target differs and therefore whether
+escalation applies. A run can do both. An escalated offer stamps the escalation
+target on `order.modifier` for that one firing; the next ordinary offer composes
+from the run's stored value again — whatever the last accepted bind left there.
+
+**Command producers: bind the payload, not the receipt.** A command step's
+accepted artifact value is the whole `CommandReceipt`. The short form
+`bind: modifier` is shorthand for `{to: modifier, from: value}`, which would hand
+the engine the receipt object where it expects a modifier string, and be refused.
+Have the command emit a payload marker — `##owenloop:payload##{"value":"deep"}` —
+and bind `from: payload.value`.
+
+> **Not shipped.** The routing plan also calls for a hub-side routing alert of
+> kind `modifier-changed`, raised on each sync so an operator sees it. It exists
+> in neither `owenloop` nor `owenloop-service` today. When it lands it is a
+> notification for operator attention — the artifact history above stays the
+> system of record, and an alert must never be read as one.
 
 ---
 
@@ -607,7 +719,8 @@ Each of these has actually happened. Each has a one-line correction.
 | "The shift that is clocked in has no rate for `build:deep`, so serve it something else." | Do not serve it at all. Certify the crew that *can* do it. That is what the binding is for. |
 | "`--modifier` defaults to standard." | Omitting it means **no modifier**. Steps are offered on bare authored capabilities. |
 | "A modifier means 'more effort'." | To the engine it is an opaque string. All meaning lives in the shift's `roster` map. |
-| "A planner can decide the run needs to go deeper." | It rejects the bound modifier artifact with `requested: deep`; its producer re-emits the value and the engine synchronizes the run. |
+| "A planner can decide the run needs to go deeper." | Only where the definition declares `modifiers:`, binds an artifact to `modifier`, and the planner **consumes** that artifact. Then it rejects it with `--requested deep`, the producer re-emits, and the **engine** — never the planner — writes the run's modifier when that artifact is accepted. With no such wiring the planner can still only say so in its plan document (section 8a). |
+| "The bind means my step writes the run's modifier." | No step writes it. The engine does, inside the acceptance transaction of the bound artifact. `--requested` on a reject is a validated *request* to that artifact's producer, not a write — and it is refused outright on any artifact that is not bound to `modifier`. |
 | "Escalation upgrades the run." | It re-offers **one step**, temporarily. The run's stored modifier is untouched. |
 | "If nobody serves the compound, close enough is fine." | Not any more. It holds and alerts. Substitution is something the operator configures on purpose (section 10). |
 | "Two harnesses in one crew gives me control over which model runs." | It gives you *either* model. First claim wins. Use separate crews when you need a guarantee. |
