@@ -458,7 +458,10 @@ steps:
   - name: init
     executor: command
     capabilities: [init]
-    command: owenloop util modifier-init --default standard
+    command: >-
+      value="$(owenloop util modifier-init --default standard)" &&
+      node -e 'console.log("##owenloop:payload##" +
+        JSON.stringify({value: process.argv[1]}))' "$value"
     produces:
       - name: modifier
         bind: { to: modifier, from: payload.value }
@@ -485,8 +488,8 @@ Five properties, in the order they matter:
 2. **The engine is the only writer.** No agent, step, worker, judge, or human
    writes the run's modifier directly. The write goes through one private engine
    method, `applyArtifactBind` (`src/engine.ts`), into one store method,
-   `setWorkflowRouting` (`src/store.ts`) — and those are the only two call sites
-   of that store method in the whole codebase. There is no verb, flag, or MCP
+   `setWorkflowRouting` (`src/store.ts`) — and those are the only two production
+   call sites of that store method under `src/`. There is no verb, flag, or MCP
    call that sets it. `--modifier` at `start_run` supplies the initial value and
    nothing after that.
 
@@ -496,10 +499,10 @@ Five properties, in the order they matter:
    by a human `green`. All three branches run inside the same `store.tx()` that
    writes the artifact, so acceptance and the routing write commit together or
    neither happens. A submission still waiting on judges has synchronized
-   nothing. An out-of-set or multi-word value is refused *before* the artifact
-   row is written: a producer commit comes back `schema-rejected` and burns a
-   schema attempt; a human `green` throws `ModifierRefusalError` — the same
-   refusal `start_run` uses.
+   nothing. An out-of-set or multi-word value is refused before its accepted value
+   or green transition is written: a producer commit records the artifact as
+   `rejected`, comes back `schema-rejected`, and burns a schema attempt; a human
+   `green` throws `ModifierRefusalError` — the same refusal `start_run` uses.
 
 4. **The lever for changing it is rejecting the bound artifact with
    `requested:`.**
@@ -520,12 +523,12 @@ Five properties, in the order they matter:
    `requested` is a **request to the producer**, not a write. The producer
    re-emits; only the acceptance of that new value moves the run.
 
-   **Who may pull the lever is the ordinary authority rule, unchanged.** A judge
-   step may reject only the stem named in its own `judges:` marker. Any other
-   step may reject only an artifact it declares in `consumes:`. So a planner that
-   is meant to ask for a different grade must declare `consumes: [modifier]` in
-   the definition; a planner with no such edge cannot reject it and can only say
-   so in its plan document.
+   **Who may pull the lever is the ordinary authority rule, unchanged.** `human`
+   and `engine` may always reject. A judge step may reject only the stem named in
+   its own `judges:` marker. Any other step may reject only an artifact it
+   declares in `consumes:`. So a planner that is meant to ask for a different
+   grade must declare `consumes: [modifier]` in the definition; a planner with no
+   such edge cannot reject it and can only say so in its plan document.
 
 5. **The record of what changed is the artifact history.** Each accepted sync
    writes exactly one artifact event: `action: bound`, `actor: engine`,
@@ -547,12 +550,13 @@ therefore be offered on the old grade. `lintDef` warns about exactly that:
 '<path>' bound to modifier`. If a step must run at the synchronized grade, wire
 the dependency explicitly — make it consume the bound artifact.
 
-**Escalation and the bind are different mechanisms and do not interact.**
+**Escalation and the bind are separate mechanisms over related state.**
 Escalation is derived per offer from a reject count and leaves the stored
-modifier alone; the bind rewrites the stored modifier and leaves escalation's
-rule alone. A run can do both. An escalated offer stamps the escalation target on
-`order.modifier` for that one firing; the next ordinary offer composes from the
-run's stored value again — whatever the last accepted bind left there.
+modifier alone. The bind rewrites the stored modifier; that value can determine
+whether an otherwise eligible escalation target differs and therefore whether
+escalation applies. A run can do both. An escalated offer stamps the escalation
+target on `order.modifier` for that one firing; the next ordinary offer composes
+from the run's stored value again — whatever the last accepted bind left there.
 
 **Command producers: bind the payload, not the receipt.** A command step's
 accepted artifact value is the whole `CommandReceipt`. The short form
