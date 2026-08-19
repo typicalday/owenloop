@@ -1224,7 +1224,11 @@ test('concurrency: a born-rejected (CAS-stale) run auto-releases its lease — n
   complete(engine, wf, fire(engine, wf, 'planner', 2500), { plan: 'v2' });
   const res = engine.green(wf, builder.run, 'pr', { built: 'on v1' });
   assert.equal(res.outcome, 'born-rejected');
-  assert.equal(store.getRun(builder.run)?.outcome, 'no_work', 'born-reject auto-closes the run');
+  assert.equal(
+    store.getRun(builder.run)?.outcome,
+    'released',
+    'born-reject auto-closes the run as a returned lease, not as work that found nothing',
+  );
   assert.equal(store.getTask(wf, 'builder', '')?.status, 'idle', 'born-reject re-arms the task');
   const builder2 = fire(engine, wf, 'builder', 3000);          // NO manual close()
   assert.notEqual(builder2.run, builder.run, 'fresh run id on next tick');

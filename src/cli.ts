@@ -27,7 +27,7 @@
  *   owenloop retract <wf> <path> --by <author> --text <msg>
  *   owenloop skip    <wf> <path> --by <author> --text <msg>
  *   owenloop retry   <wf> <path> [--by <author>] [--text <guidance>]   clear a stall
- *   owenloop close <wf> <run> [--outcome ok|no_work|failed|skipped] [--summary s]
+ *   owenloop close <wf> <run> [--outcome ok|no_work|released|failed|skipped] [--summary s]
  *   owenloop delete <wf> [--recursive]
  *
  * Global: --db <path> (env OWENLOOP_DB), --defs <dir> (env OWENLOOP_DEFS).
@@ -1505,7 +1505,7 @@ ${' '.repeat(41)}refresh the local hub-rosters cache with an agent credential
   ask <wf> <path> <question> [--by <author>]   hold an owed artifact on a question for a human
   inbox                                  every held question across all instances, with its answer command
   heartbeat <wf> <run> [--now <ms>]    touch liveness timestamp on an open run
-  close <wf> <run> [--outcome ok|no_work|failed|skipped] [--summary s]
+  close <wf> <run> [--outcome ok|no_work|released|failed|skipped] [--summary s]
   delete <wf> [--recursive]              refuse if children exist unless --recursive (cascades)
 
 Environment: OWENLOOP_DB, OWENLOOP_DEFS`;
@@ -2704,7 +2704,7 @@ function dispatch(command: string, io: CliIO, args: Args): number {
       case 'close': {
         const wf = need(args, 1, 'workflow');
         const run = need(args, 2, 'run');
-        const outcome = (last(args, 'outcome') ?? 'ok') as 'ok' | 'no_work' | 'failed' | 'skipped';
+        const outcome = (last(args, 'outcome') ?? 'ok') as 'ok' | 'no_work' | 'released' | 'failed' | 'skipped';
         // close has no outcome discriminator: engine throws on real errors, so {ok:true} is always accurate here.
         engine.close(wf, run, outcome, last(args, 'summary'));
         print(io, { ok: true, run, outcome });

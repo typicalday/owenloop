@@ -344,7 +344,31 @@ export interface RunData {
   workflow: string;
   step: string;
   key?: string; // binding key of the claimed firing ("" for plain/reduce)
-  outcome?: 'ok' | 'no_work' | 'failed' | 'skipped';
+  /**
+   * How the run ended, or `undefined` while it is still open.
+   *
+   * `no_work` and `released` are NOT the same thing, and the difference is
+   * load-bearing for the daily budget and the cadence gate:
+   *
+   * - `no_work` — the step RAN and had nothing to produce. A `merge-gate` that
+   *   polled CI and found it still pending, an `ask` that handed the question
+   *   to a human, a holder that rejected its input. Work happened; these runs
+   *   spend budget and restart the cadence clock, which is exactly how a
+   *   `cadenceSecs` poll stays throttled.
+   * - `released` — the LEASE WAS RETURNED UNUSED. Nothing ran. A server already
+   *   at its agent cap handing the claim straight back, a pickup window that
+   *   lapsed with no first contact, a born-reject re-arm. These must not spend
+   *   budget and must not touch cadence: they are not firings, they are claims
+   *   that were withdrawn.
+   *
+   * Conflating them stalled a live run. Six capacity handbacks against a step
+   * declaring `maxRunsPerDay: 6` spent the whole allowance before it executed
+   * once; the engine then deferred it `daily-budget` until local midnight while
+   * its artifact still read `attemptsUsed: 0`, because the release path already
+   * declines to bump attempts for precisely this reason. A released lease is
+   * not an attempt. It is not a run, either.
+   */
+  outcome?: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped';
   summary?: string;
   sessionId?: string;
   /** the version of every consumed input at claim time (§12.2 commit CAS) */
@@ -767,7 +791,7 @@ export interface TimelineEvent {
   endedAt: number;           // run.updatedAt (ms since epoch, last mutation)
   step: string;              // step name
   key: string;               // binding key ("" for plain/reduce, element path for map)
-  outcome: string | undefined; // 'ok' | 'no_work' | 'failed' | 'skipped' | undefined (open)
+  outcome: string | undefined; // 'ok' | 'no_work' | 'released' | 'failed' | 'skipped' | undefined (open)
   summary: string | undefined;
   sessionId: string | undefined;
   /**
@@ -822,7 +846,7 @@ export interface WorkflowTrace {
   artifacts: ArtifactBiography[];
   summary: {
     totalRuns: number;
-    byOutcome: Record<string, number>; // 'ok'|'no_work'|'failed'|'skipped'|'open' → count
+    byOutcome: Record<string, number>; // 'ok'|'no_work'|'released'|'failed'|'skipped'|'open' → count
     totalRejects: number;              // sum of all reasons with action 'reject'|'born-rejected'|'schema-reject' across all artifacts
     totalRetries: number;              // sum of all reasons with action 'retry' across all artifacts
     stalledArtifacts: string[];        // paths of artifacts that are currently stalled (acceptance=rejected AND judgmentRejects≥producer.maxAttempts OR schemaRejects≥producer.maxSchemaFailures)
