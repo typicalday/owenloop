@@ -410,7 +410,7 @@ export type EngineEvent =
       action: 'green' | 'emit' | 'seal' | 'reject' | 'retract' | 'skip' | 'retry' | 'provide' | 'ask';
       outcome?: CommitResult['outcome'] | EmitResult['outcome'];
     }
-  | { type: 'closed'; workflow: string; run: string; outcome: 'ok' | 'no_work' | 'failed' | 'skipped' }
+  | { type: 'closed'; workflow: string; run: string; outcome: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped' }
   | { type: 'settled'; workflow: string; done: boolean; eligible: string[] };
 
 /** A synchronous observer of {@link EngineEvent}s. */
@@ -2397,7 +2397,7 @@ export class Engine {
     });
     this.fire({ type: 'commit', workflow, run, path: result.path, action: 'green', outcome: result.outcome });
     if (result.outcome === 'born-rejected') {
-      this.fire({ type: 'closed', workflow, run, outcome: 'no_work' });
+      this.fire({ type: 'closed', workflow, run, outcome: 'released' });
     }
     this.fireSettled(workflow);
     // M2B cascade-up prompt: if this workflow has a producedBy link, trigger parent maintainCalls.
@@ -2498,7 +2498,7 @@ export class Engine {
     });
     this.fire({ type: 'commit', workflow, run, path: stem, action: 'emit', outcome: result.outcome });
     if (result.outcome === 'born-rejected') {
-      this.fire({ type: 'closed', workflow, run, outcome: 'no_work' });
+      this.fire({ type: 'closed', workflow, run, outcome: 'released' });
     }
     this.fireSettled(workflow);
     return result;
@@ -2537,7 +2537,7 @@ export class Engine {
     });
     this.fire({ type: 'commit', workflow, run, path: result.path, action: 'seal', outcome: result.outcome });
     if (result.outcome === 'born-rejected') {
-      this.fire({ type: 'closed', workflow, run, outcome: 'no_work' });
+      this.fire({ type: 'closed', workflow, run, outcome: 'released' });
     }
     this.fireSettled(workflow);
     return result;
@@ -2678,7 +2678,7 @@ export class Engine {
       ...(result.outcome === 'born-rejected' ? { outcome: 'born-rejected' as const } : {}),
     });
     if (result.outcome === 'born-rejected' && releasedRun !== undefined) {
-      this.fire({ type: 'closed', workflow, run: releasedRun, outcome: 'no_work' });
+      this.fire({ type: 'closed', workflow, run: releasedRun, outcome: 'released' });
     }
     this.fireSettled(workflow);
     return result;
@@ -2953,11 +2953,11 @@ export class Engine {
   // ---- run lifecycle ---------------------------------------------------------
 
   /** Close a run (audit/budget) and release its lease so the task can re-arm. */
-  close(workflow: string, run: string, outcome: 'ok' | 'no_work' | 'failed' | 'skipped' = 'ok', summary?: string): void {
+  close(workflow: string, run: string, outcome: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped' = 'ok', summary?: string): void {
     this.store.tx(() => {
       const r = this.store.getRun(run);
       if (!r) throw new Error(`no such run: ${run}`);
-      const patch: { outcome: 'ok' | 'no_work' | 'failed' | 'skipped'; summary?: string } = { outcome };
+      const patch: { outcome: 'ok' | 'no_work' | 'released' | 'failed' | 'skipped'; summary?: string } = { outcome };
       if (summary !== undefined) patch.summary = summary;
       this.store.updateRun(run, patch);
       const task = this.store.getTask(workflow, r.step, r.key ?? '');
@@ -3441,15 +3441,19 @@ export class Engine {
   }
 
   /**
-   * §12.2 born-reject lease release: close the run (`no_work`) and re-arm its
+   * §12.2 born-reject lease release: close the run (`released`) and re-arm its
    * task to `idle` so the firing is immediately re-claimable next tick. Runs
    * inside the caller's open tx (plain store write, no nested tx). Unlike reap()
-   * it does NOT bump attempts — a CAS-stale born-reject is not lease churn. The
+   * it does NOT bump attempts — a CAS-stale born-reject is not lease churn. For
+   * the same reason the outcome is `released` and not `no_work`: the step never
+   * ran, so the run must not spend the daily budget or restart the cadence
+   * clock either. `no_work` is reserved for a step that DID run and had nothing
+   * to produce, which is a firing and does spend both. The
    * `closed` event is fired by the caller AFTER the tx commits (post-commit
    * ordering), matching public close().
    */
   private releaseLeaseOnBornReject(workflow: string, run: string): void {
-    this.store.updateRun(run, { outcome: 'no_work' });
+    this.store.updateRun(run, { outcome: 'released' });
     const r = this.store.getRun(run);
     if (!r) return;
     const task = this.store.getTask(workflow, r.step, r.key ?? '');

@@ -1323,3 +1323,88 @@ test('legacy/foreign id rows are addressed by natural key, not recomputed id', (
 
   s.close();
 });
+
+// ---- a released lease is not a run, for budget or for cadence ---------------
+// `released` marks a lease that was handed straight back: the step never ran.
+// The three producers are a capacity release (a server already at its agent
+// cap), a lapsed pickup window, and a born-reject re-arm. All three burn a run
+// id and nothing else.
+//
+// `no_work` is the opposite case and stays counted — the step DID run and found
+// nothing to produce. A `merge-gate` polling CI is the canonical one: if its
+// runs stopped spending budget and stopped restarting the cadence clock, a
+// throttled poller would poll flat out.
+//
+// Conflating the two was a live stall. A server sitting at its agent ceiling
+// released a `maxRunsPerDay: 6` planner six times in a row; the budget hit zero
+// and the engine deferred the step `daily-budget` until local midnight — with
+// its artifact still at `attemptsUsed: 0`, because the release path already
+// declines to bump attempts for exactly this reason. Two budgets measuring the
+// same thing disagreed, and the wrong one was the one with no work behind it.
+
+test('countRuns: released leases do not spend the daily budget', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const runs = [randId('run'), randId('run'), randId('run')];
+  for (const r of runs) s.insertRun(r, { workflow: wf, step: 'planner' });
+  assert.equal(s.countRuns(wf, 'planner', 0), 3, 'open runs count — the step is live');
+
+  s.updateRun(runs[0]!, { outcome: 'released' });
+  s.updateRun(runs[1]!, { outcome: 'released' });
+  assert.equal(s.countRuns(wf, 'planner', 0), 1, 'two handbacks spend nothing');
+
+  s.updateRun(runs[2]!, { outcome: 'ok' });
+  assert.equal(s.countRuns(wf, 'planner', 0), 1, 'the one run that worked still counts');
+});
+
+test('countRuns: a step released on every claim never exhausts its budget', () => {
+  const s = mem();
+  const wf = randId('wf');
+  // The exact live shape: six consecutive capacity handbacks against a step
+  // whose maxRunsPerDay is 6. Before the fix this left budget === 0.
+  for (let i = 0; i < 6; i += 1) {
+    const r = randId('run');
+    s.insertRun(r, { workflow: wf, step: 'planner' });
+    s.updateRun(r, { outcome: 'released' });
+  }
+  assert.equal(s.countRuns(wf, 'planner', 0), 0, 'six handbacks leave the full allowance');
+});
+
+test('countRuns: every other closed outcome still counts, no_work included', () => {
+  const s = mem();
+  const wf = randId('wf');
+  for (const outcome of ['ok', 'no_work', 'failed', 'skipped'] as const) {
+    const r = randId('run');
+    s.insertRun(r, { workflow: wf, step: 'builder' });
+    s.updateRun(r, { outcome });
+  }
+  assert.equal(s.countRuns(wf, 'builder', 0), 4, 'only a released lease is exempt');
+});
+
+test('latestRun: a released lease does not restart the cadence clock', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const released = randId('run');
+  s.insertRun(released, { workflow: wf, step: 'merge-gate' });
+  assert.equal(s.latestRun(wf, 'merge-gate')?.id, released, 'an open claim is the latest run');
+
+  s.updateRun(released, { outcome: 'released' });
+  assert.equal(
+    s.latestRun(wf, 'merge-gate'),
+    undefined,
+    'once released it is not a run at all — cadence sees no prior firing',
+  );
+});
+
+test('latestRun: a no_work run is still the cadence anchor', () => {
+  const s = mem();
+  const wf = randId('wf');
+  const polled = randId('run');
+  s.insertRun(polled, { workflow: wf, step: 'merge-gate' });
+  s.updateRun(polled, { outcome: 'no_work' });
+  assert.equal(
+    s.latestRun(wf, 'merge-gate')?.id,
+    polled,
+    'a poll that found CI still pending did run — it throttles the next one',
+  );
+});

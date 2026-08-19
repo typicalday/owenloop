@@ -1172,26 +1172,48 @@ export class Store {
     return r ? mapRun(r) : undefined;
   }
 
-  /** How many runs of this step since `sinceMs` (for the daily budget window). */
+  /**
+   * How many runs of this step since `sinceMs` (for the daily budget window).
+   *
+   * `released` RUNS ARE EXCLUDED — a lease returned unused is not a firing. See
+   * `RunData.outcome` for why this is not the same as `no_work`, which stays
+   * counted because the step did run.
+   */
   countRuns(workflow: string, step: string, sinceMs: number): number {
     const row = this.db
-      .prepare('SELECT COUNT(*) AS n FROM run WHERE workflow = ? AND step = ? AND created_at >= ?')
+      .prepare(
+        'SELECT COUNT(*) AS n FROM run WHERE workflow = ? AND step = ? AND created_at >= ?'
+          + " AND (outcome IS NULL OR outcome != 'released')",
+      )
       .get(workflow, step, sinceMs) as { n: number };
     return row.n;
   }
 
-  /** The most recent run of this step, if any (for cadence gating). */
+  /**
+   * The most recent run of this step, if any (for cadence gating).
+   *
+   * `released` runs are excluded for the same reason `countRuns` excludes them:
+   * a lease handed straight back did not fire the step, so it must not restart
+   * the cadence clock. Without this a server that claims and releases on every
+   * sweep holds a throttled step off indefinitely — each handback pushes the
+   * next eligible time further out than the sweep interval that produced it.
+   */
   latestRun(workflow: string, step: string): RunRow | undefined {
     const r = this.db
-      .prepare('SELECT * FROM run WHERE workflow = ? AND step = ? ORDER BY created_at DESC LIMIT 1')
+      .prepare(
+        "SELECT * FROM run WHERE workflow = ? AND step = ? AND (outcome IS NULL OR outcome != 'released')"
+          + ' ORDER BY created_at DESC LIMIT 1',
+      )
       .get(workflow, step) as RunRowRaw | undefined;
     return r ? mapRun(r) : undefined;
   }
 
   /**
    * Count of consecutive trailing `failed` runs for this step+key — the
-   * crash-step signal. Any closed run that is NOT `failed` (ok/no_work/skipped)
-   * breaks the streak; still-open runs (outcome NULL) are ignored.
+   * crash-step signal. Any closed run that is NOT `failed`
+   * (ok/no_work/released/skipped) breaks the streak; still-open runs (outcome
+   * NULL) are ignored. `released` breaks it exactly as `no_work` did before the
+   * two were split, so the crash-step signal is unchanged by that split.
    */
   recentFailedRuns(workflow: string, step: string, key: string = ''): number {
     const rows = this.db
