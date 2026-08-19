@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node
 import { parseProduce, parseWorkdirFrom } from '../src/paths.ts';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildDef, DefError, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, validateDef } from '../src/defs.ts';
+import { buildDef, cancelCleanupSteps, DefError, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, loadDefsUnfinalized, parseDef, validateDef } from '../src/defs.ts';
 import type { DefLoadFailure } from '../src/defs.ts';
 import { def, input, step } from './helpers.ts';
 
@@ -1951,6 +1951,175 @@ test('validateDef does not flag a correct evaluator with generates: and no consu
     ],
   }));
   assert.ok(!errors.some((e) => e.includes('must not declare consumes')), errors.join('; '));
+});
+
+// ---- onCancel: cleanup declarations -----------------------------------------
+
+test('parseDef: onCancel preserves its explicit plain consume subset, including []', () => {
+  const marked = parseDef({
+    name: 'cleanup',
+    inputs: [{ name: 'merge' }, { name: 'workspace' }],
+    steps: [{
+      name: 'deprovisioner',
+      consumes: ['merge', 'workspace'],
+      generates: ['cleanup'],
+      onCancel: { consumes: ['workspace'] },
+    }],
+  });
+  assert.deepEqual(marked.steps[0]!.onCancel, { consumes: ['workspace'] });
+
+  const empty = parseDef({
+    name: 'empty-cleanup',
+    steps: [{ name: 'notifier', produces: ['notice'], onCancel: { consumes: [] } }],
+  });
+  assert.deepEqual(empty.steps[0]!.onCancel, { consumes: [] });
+});
+
+test('parseDef: defs without onCancel preserve field absence', () => {
+  const parsed = parseDef(delivery);
+  assert.ok(parsed.steps.every((stepDef) => stepDef.onCancel === undefined));
+  assert.ok(parsed.steps.every((stepDef) => !Object.hasOwn(stepDef, 'onCancel')));
+});
+
+test('parseDef: malformed onCancel blocks name the step and construct', () => {
+  const raw = (onCancel: unknown) => ({
+    name: 'malformed-cleanup',
+    inputs: [{ name: 'workspace' }],
+    steps: [{
+      name: 'x',
+      consumes: ['workspace'],
+      produces: ['out'],
+      onCancel,
+    }],
+  });
+  const expectFailure = (onCancel: unknown, pattern: RegExp) => {
+    assert.throws(
+      () => parseDef(raw(onCancel)),
+      (error: unknown) => error instanceof DefError && pattern.test(error.message),
+    );
+  };
+
+  expectFailure(true, /step 'x'\.onCancel must be a mapping of \{ consumes \}/);
+  expectFailure(['workspace'], /step 'x'\.onCancel must be a mapping of \{ consumes \}/);
+  expectFailure({}, /step 'x'\.onCancel must set 'consumes'/);
+  expectFailure({ consume: ['workspace'] }, /step 'x'\.onCancel: unknown key 'consume'/);
+  expectFailure({ consumes: 'workspace' }, /step 'x'\.onCancel\.consumes must be a list of strings/);
+});
+
+test('validateDef: onCancel must name unique plain consumes declared by its step', () => {
+  const unknown = validateDef(buildDef({
+    name: 'unknown-cancel-consume',
+    inputs: [{ name: 'seed' }],
+    steps: [{ name: 'x', consumes: ['seed'], produces: ['out'], onCancel: { consumes: ['nope'] } }],
+  }));
+  assert.ok(unknown.some((error) => /step 'x': onCancel\.consumes names 'nope'/.test(error)), unknown.join('; '));
+
+  for (const [pattern, mode] of [['src[*]', 'reduce'], ['src[$i]', 'map']] as const) {
+    const errors = validateDef(buildDef({
+      name: `bad-${mode}-cleanup`,
+      inputs: [{ name: 'src' }],
+      steps: [{ name: 'x', consumes: [pattern], produces: ['out'], onCancel: { consumes: ['src'] } }],
+    }));
+    assert.ok(
+      errors.some((error) => error.includes(`step 'x': onCancel.consumes names 'src'`) && error.includes(`consumes in ${mode} mode`)),
+      errors.join('; '),
+    );
+  }
+
+  const duplicate = validateDef(buildDef({
+    name: 'duplicate-cancel-consume',
+    inputs: [{ name: 'workspace' }],
+    steps: [{
+      name: 'x',
+      consumes: ['workspace'],
+      produces: ['out'],
+      onCancel: { consumes: ['workspace', 'workspace'] },
+    }],
+  }));
+  assert.ok(duplicate.some((error) => /step 'x': onCancel\.consumes lists 'workspace' more than once/.test(error)), duplicate.join('; '));
+});
+
+test('parseDef: onCancel stays refused on calls steps and on: typo errors direct authors to it', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'calls-cleanup',
+      steps: [{
+        name: 'delegate',
+        calls: 'child',
+        produces: ['out'],
+        onCancel: { consumes: [] },
+      }],
+    }),
+    (error: unknown) => error instanceof DefError && /steps\[0\] \(calls: step\): unknown key 'onCancel'/.test(error.message),
+  );
+  assert.throws(
+    () => parseDef({
+      name: 'cancelled-trigger',
+      inputs: [{ name: 'seed' }],
+      steps: [{ name: 'x', consumes: ['seed'], produces: ['out'], on: ['cancelled'] }],
+    }),
+    (error: unknown) => error instanceof DefError && error.message.includes('onCancel'),
+  );
+});
+
+test('validateDef: allGreen cleanup permits only an empty cancel consume set', () => {
+  assert.doesNotThrow(() => parseDef({
+    name: 'all-green-cleanup',
+    steps: [{ name: 'x', on: ['allGreen'], generates: ['out'], onCancel: { consumes: [] } }],
+  }));
+
+  const errors = validateDef(buildDef({
+    name: 'bad-all-green-cleanup',
+    inputs: [{ name: 'seed' }],
+    steps: [{
+      name: 'x',
+      on: ['allGreen'],
+      produces: ['out'],
+      onCancel: { consumes: ['seed'] },
+    }],
+  }));
+  assert.ok(errors.some((error) => /step 'x': onCancel\.consumes names 'seed'/.test(error)), errors.join('; '));
+});
+
+test('parseDef: terminal and onCancel are deliberately compatible', () => {
+  assert.doesNotThrow(() => parseDef({
+    name: 'terminal-cleanup',
+    inputs: [{ name: 'workspace' }],
+    steps: [{
+      name: 'x',
+      consumes: ['workspace'],
+      produces: ['out'],
+      terminal: true,
+      onCancel: { consumes: ['workspace'] },
+    }],
+  }));
+});
+
+test('cancelCleanupSteps selects marked steps in definition order', () => {
+  const marked = parseDef({
+    name: 'cleanup-selector',
+    inputs: [{ name: 'seed' }],
+    steps: [
+      { name: 'first', consumes: ['seed'], produces: ['a'], onCancel: { consumes: ['seed'] } },
+      { name: 'middle', consumes: ['a'], produces: ['b'] },
+      { name: 'last', consumes: ['b'], produces: ['out'], onCancel: { consumes: ['b'] } },
+    ],
+  });
+  assert.deepEqual(cancelCleanupSteps(marked).map((stepDef) => stepDef.name), ['first', 'last']);
+  assert.deepEqual(cancelCleanupSteps(parseDef(delivery)), []);
+});
+
+test('hashDef: onCancel changes only defs that declare it', () => {
+  const omitted = parseDef({
+    name: 'hash-cleanup',
+    steps: [{ name: 'x', produces: ['out'] }],
+  });
+  const declared = parseDef({
+    name: 'hash-cleanup',
+    steps: [{ name: 'x', produces: ['out'], onCancel: { consumes: [] } }],
+  });
+  assert.equal(Object.hasOwn(omitted.steps[0]!, 'onCancel'), false);
+  assert.notEqual(hashDef(omitted), hashDef(declared));
 });
 
 // (f11) on: ['unknown_token'] → hard DefError from buildStep (unchanged)

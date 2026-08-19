@@ -133,7 +133,7 @@ export type {
   WorkflowStoreStatePaths,
 } from './store/index.ts';
 
-export { buildDef, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, resolveCallsTarget, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
+export { buildDef, cancelCleanupSteps, DefError, expandIncludes, finalizeDefs, hashDef, lintDef, loadDefFile, loadDefs, loadDefsRaw, parseDef, resolveCallsTarget, SUPPORTED_ENGINE_VERSION, validateDef } from './defs.ts';
 export { credentialSlot, hashDefForHub, keychainServiceFor, normalizeOrigin, readStoredCredential } from './hub.ts';
 export type { Credential, CredentialSlotSelector, Keychain, ReadStoredCredentialOpts } from './hub.ts';
 export type { DefLoadFailure } from './defs.ts';
@@ -409,6 +409,7 @@ export type {
   InvariantPredicate,
   InvariantViolation,
   JsonSchema,
+  OnCancelDef,
   StepDef,
   ProducePattern,
   ReasonEntry,
