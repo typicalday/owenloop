@@ -1155,21 +1155,38 @@ export function capabilityPublishReportText(entries: CapabilityPublishReportEntr
 }
 
 /**
- * Narrow `GET /api/capability_mappings`'s 200 body (`{ ok: true, mappings: {…} }`)
- * to a plain `authored → org` record. An EMPTY object is valid — that is "this
- * def has no recorded mapping", not an error.
+ * Narrow `GET /api/capability_mappings`'s 200 body to a plain `authored → org`
+ * record. An EMPTY result is valid — that is "this def has no recorded
+ * mapping", not an error.
  *
- * See `src/capability-mapping-client.ts` for why this endpoint is
- * CLI-PROPOSED and not implemented by any shipped hub yet.
+ * TWO BODY SHAPES ARE ACCEPTED, because the shipped hub and this CLI arrived at
+ * the endpoint from opposite ends:
+ *
+ *  - `{ mappings: { <authored>: <org>, … } }` — the compact map this module
+ *    originally proposed. One def, one function from authored name.
+ *  - `{ mappings: [ { defName, authored, target, … }, … ] }` — the ROW ARRAY
+ *    `owenloop-service` ships, whose read is a console listing that may span
+ *    every def and carries provenance columns this caller does not need.
+ *
+ * Both collapse to the same record. Tolerating both is deliberate and is not
+ * temporary compatibility scaffolding: the row array is the hub's answer to a
+ * broader question (`what has this org remapped, anywhere`) and will keep its
+ * shape, while an older hub that only ever spoke the compact map must not start
+ * failing. A caller reading one def passes `defName` so a hub that ignores the
+ * `?def=` filter cannot fold another def's rows into the answer — the array
+ * carries `defName` precisely so that check is possible.
+ *
+ * Neither shape's VALUES are ever echoed in an error, only the position.
  */
-export function asCapabilityMappings(body: unknown): Record<string, string> {
+export function asCapabilityMappings(body: unknown, defName?: string): Record<string, string> {
   const prefix = 'capability_mappings: malformed success response';
   if (typeof body !== 'object' || body === null) {
     throw new Error(`${prefix} — not an object`);
   }
   const raw = (body as Record<string, unknown>).mappings;
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
-    throw new Error(`${prefix} — expected a \`mappings\` object`);
+  if (Array.isArray(raw)) return capabilityMappingsFromRows(raw, prefix, defName);
+  if (typeof raw !== 'object' || raw === null) {
+    throw new Error(`${prefix} — expected a \`mappings\` object or array`);
   }
   const out: Record<string, string> = {};
   const entries = Object.entries(raw as Record<string, unknown>);
@@ -1182,6 +1199,44 @@ export function asCapabilityMappings(body: unknown): Record<string, string> {
       throw new Error(`${prefix} — mappings[${i}] must map to a non-empty string`);
     }
     out[authored] = target;
+  }
+  return out;
+}
+
+/**
+ * The row-array half of `asCapabilityMappings`.
+ *
+ * A row whose `defName` is a string naming a DIFFERENT def is SKIPPED, not
+ * rejected: an unfiltered listing is a well-formed answer to a filtered
+ * question, just a broader one, and refusing it would fail a correct hub. A row
+ * carrying no `defName` at all is kept — only a positive mismatch excludes.
+ *
+ * A LATER ROW WINS over an earlier one for the same authored name. The hub keys
+ * this table `(def_name, authored)`, so within one def a duplicate cannot
+ * happen; across defs the `defName` filter above is what separates them. This
+ * rule therefore only ever settles a body that already contradicts itself, and
+ * settling it deterministically beats throwing.
+ */
+function capabilityMappingsFromRows(
+  rows: unknown[],
+  prefix: string,
+  defName: string | undefined,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (typeof row !== 'object' || row === null || Array.isArray(row)) {
+      throw new Error(`${prefix} — mappings[${i}] is not an object`);
+    }
+    const r = row as Record<string, unknown>;
+    if (defName !== undefined && typeof r.defName === 'string' && r.defName !== defName) continue;
+    if (typeof r.authored !== 'string' || r.authored === '') {
+      throw new Error(`${prefix} — mappings[${i}] has no non-empty \`authored\``);
+    }
+    if (typeof r.target !== 'string' || r.target === '') {
+      throw new Error(`${prefix} — mappings[${i}] has no non-empty \`target\``);
+    }
+    out[r.authored] = r.target;
   }
   return out;
 }

@@ -1,39 +1,46 @@
 /**
- * The two hub endpoints `owenloop install` needs and **no shipped hub
- * implements yet** — deliberately confined to this one file.
+ * The two hub endpoints `owenloop install` needs, deliberately confined to this
+ * one file.
  *
  * ## Read this before changing a path or a body key
  *
- * These endpoint names are **CLI-PROPOSED**. `owenloop-service` at `d655b26`
- * (PR #222) shipped the READ / RESOLVE / REPORT half of capability mappings and
- * nothing else. Its own source says so, in
- * `packages/hub-core/src/capability-mappings-table.ts`:
+ * The READ half is LIVE. `owenloop-service` ships
+ * `GET /api/capability_mappings` (optional `?def=<name>`), backed by the
+ * `capability_mappings` table PR #222 built and the offer-time resolver that
+ * consumes it. Its body is a ROW ARRAY, not the compact map this file first
+ * proposed — `asCapabilityMappings` accepts both and the difference is
+ * explained there, not here.
  *
- * > NO VERB WRITES THIS TABLE YET, BY DESIGN. `owenloop install` is the first
- * > real writer and lives in the `owenloop` CLI repository, a later ship.
+ * The WRITE half `install` needs is STILL MISSING, and the gap is narrower than
+ * it looks. The hub ships `POST /api/set_capability_mapping` — SINGULAR, ONE
+ * ROW per call, `{defName, authored, target}` — which is the right shape for an
+ * operator repointing one capability by hand. `install` needs the PLURAL
+ * `POST /api/set_capability_mappings` `{def, mappings}` instead, and the plural
+ * is not sugar over N singular calls:
  *
- * The service authors assumed the CLI would be the writer, but the CLI speaks
- * HTTP to the hub edge and cannot reach the OrgDO's SQLite. There is today:
+ *  - **One transaction or none.** `install` publishes the def the instant this
+ *    returns. A loop that fails on its fourth capability leaves three rows
+ *    written and then either publishes a half-scoped def or must unwind writes
+ *    it cannot unwind atomically. The whole reason the mapping is recorded
+ *    BEFORE the publish is that a failure must leave NOTHING applied.
+ *  - **One audit act.** An install remaps a def's whole vocabulary in one
+ *    operator decision. N audit rows for one act is a worse record of it.
  *
- *  - no endpoint that WRITES `capability_mappings`, and
- *  - no endpoint that READS a def's mappings back.
+ * `POST /api/create_workflow`'s input surface is `yaml`, `bundle_digest`,
+ * `owner_crew_id`. An extra body key on it would be **silently ignored, not
+ * rejected** — the mapping would vanish with no error, the worst available
+ * failure mode. That is why the mapping travels as its own call and why this
+ * module is a single reconciliation point.
  *
- * `POST /api/create_workflow`'s complete input surface is still `yaml`,
- * `bundle_digest`, `owner_crew_id`. An extra body key on it would be **silently
- * ignored, not rejected** — the mapping would vanish with no error, which is
- * the worst available failure mode. That is why the mapping travels as its own
- * call and why this module exists as a single reconciliation point: when the
- * service ships the writer it must either adopt these two names and bodies, or
- * this file changes and nothing else does.
- *
- * ## Contract this module proposes
+ * ## Contract
  *
  * ```
- * GET  /api/capability_mappings?def=<name>
- *      200 { ok: true, mappings: { <authored>: <orgName>, … } }
+ * GET  /api/capability_mappings?def=<name>          ← LIVE
+ *      200 { mappings: [ { defName, authored, target, … }, … ] }
+ *      200 { ok: true, mappings: { <authored>: <orgName>, … } }   (older hubs)
  *      404 | 501  → the hub does not implement it
  *
- * POST /api/set_capability_mappings
+ * POST /api/set_capability_mappings                 ← NOT YET SHIPPED
  *      body { def: <name>, mappings: { <authored>: <orgName>, … } }
  *      200 { ok: true }
  *      404 | 501  → the hub does not implement it
@@ -58,7 +65,6 @@
  * a malformed JSON body is a FIXED string, never V8's `SyntaxError` (which
  * embeds a snippet of the body).
  */
-
 import { asCapabilityMappings } from './hub.ts';
 import { CliError } from './util.ts';
 
@@ -68,9 +74,9 @@ export interface CapabilityMappingTransport {
   post(path: string, body: unknown): Promise<Response>;
 }
 
-/** Read half of the proposed contract. */
+/** Read half of the contract — shipped. */
 export const CAPABILITY_MAPPINGS_READ_PATH = '/api/capability_mappings';
-/** Write half of the proposed contract — the verb no shipped hub has. */
+/** Write half of the contract — the PLURAL verb no shipped hub has yet. */
 export const CAPABILITY_MAPPINGS_WRITE_PATH = '/api/set_capability_mappings';
 
 /**
@@ -136,7 +142,7 @@ export async function fetchCapabilityMappings(
     throw new CliError('capability_mappings: malformed success response — body is not valid JSON');
   }
   try {
-    return asCapabilityMappings(body);
+    return asCapabilityMappings(body, defName);
   } catch (e) {
     throw new CliError((e as Error).message);
   }
@@ -161,8 +167,10 @@ export async function recordCapabilityMappings(
   if (isUnimplemented(res.status)) {
     throw new CliError(
       `hub ${origin} does not implement POST ${CAPABILITY_MAPPINGS_WRITE_PATH} (HTTP ${res.status}) — ` +
-        'it cannot record a capability mapping, so this def was NOT published. ' +
-        'The mapping writer has to ship in owenloop-service first; until it does, ' +
+        'it cannot record a def\'s mapping in one transaction, so this def was NOT published. ' +
+        'This hub may still have the SINGULAR /api/set_capability_mapping, which writes one row per ' +
+        'call; install does not use it, because a partial write followed by a publish is exactly the ' +
+        'half-applied state recording-before-publishing exists to prevent. Until the batch verb ships, ' +
         'only an identity mapping (every capability keeping its authored name) can be installed.',
       { exitCode: 2 },
     );

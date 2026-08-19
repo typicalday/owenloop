@@ -583,12 +583,66 @@ test('asCapabilityMappings: narrows a well-formed table and refuses a malformed 
   assert.deepEqual(asCapabilityMappings({ ok: true, mappings: { review: 'code-review' } }), { review: 'code-review' });
   assert.deepEqual(asCapabilityMappings({ ok: true, mappings: {} }), {});
   assert.throws(() => asCapabilityMappings({ ok: true }), /capability_mappings: malformed success response/);
-  assert.throws(() => asCapabilityMappings({ ok: true, mappings: [] }), /expected a `mappings` object/);
+  assert.throws(() => asCapabilityMappings({ ok: true, mappings: 7 }), /expected a `mappings` object or array/);
   try {
     asCapabilityMappings({ ok: true, mappings: { 'secret-authored': 7 } });
     assert.fail('expected a throw');
   } catch (e) {
     assert.match((e as Error).message, /mappings\[0\]/, 'the position is named');
+    assert.doesNotMatch((e as Error).message, /secret-authored/, 'the body value is not echoed');
+  }
+});
+
+test('asCapabilityMappings: reads the hub row array as well as the compact map', () => {
+  // The shape `owenloop-service`'s GET /api/capability_mappings actually returns:
+  // one row per (defName, authored), carrying provenance this caller ignores.
+  assert.deepEqual(
+    asCapabilityMappings({
+      mappings: [
+        { defName: 'their-flow', authored: 'review', target: 'their-flow.review', createdBy: 'm_1', createdAt: 1 },
+        { defName: 'their-flow', authored: 'coding', target: 'coding', createdBy: 'm_1', createdAt: 1 },
+      ],
+    }),
+    { review: 'their-flow.review', coding: 'coding' },
+    'provenance columns are dropped, authored → target is kept',
+  );
+  assert.deepEqual(asCapabilityMappings({ mappings: [] }), {}, 'an empty listing is not an error');
+});
+
+test('asCapabilityMappings: a row array is filtered by defName, so an unfiltered listing still answers one def', () => {
+  const body = {
+    mappings: [
+      { defName: 'their-flow', authored: 'review', target: 'their-flow.review' },
+      { defName: 'other-flow', authored: 'review', target: 'other-flow.review' },
+      { authored: 'triage', target: 'their-flow.triage' },
+    ],
+  };
+  assert.deepEqual(
+    asCapabilityMappings(body, 'their-flow'),
+    { review: 'their-flow.review', triage: 'their-flow.triage' },
+    "another def's row is skipped; a row carrying no defName is kept",
+  );
+  assert.deepEqual(
+    asCapabilityMappings(body),
+    { review: 'other-flow.review', triage: 'their-flow.triage' },
+    'with no filter the whole listing collapses and a later row wins',
+  );
+});
+
+test('asCapabilityMappings: a malformed row names its position and never echoes it', () => {
+  assert.throws(
+    () => asCapabilityMappings({ mappings: [{ authored: 'review', target: 'x' }, 'not-an-object'] }),
+    /mappings\[1\] is not an object/,
+  );
+  assert.throws(
+    () => asCapabilityMappings({ mappings: [{ authored: '', target: 'x' }] }),
+    /mappings\[0\] has no non-empty `authored`/,
+  );
+  try {
+    asCapabilityMappings({ mappings: [{ authored: 'secret-authored', target: '' }] });
+    assert.fail('expected a throw');
+  } catch (e) {
+    assert.match((e as Error).message, /mappings\[0\] has no non-empty `target`/);
     assert.doesNotMatch((e as Error).message, /secret-authored/, 'the body value is not echoed');
   }
 });
