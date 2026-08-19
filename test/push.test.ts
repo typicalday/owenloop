@@ -1421,3 +1421,60 @@ test('push: an empty slot errors naming the slot, sending nothing', async () => 
   assert.match(t.err.join('\n'), /no stored credential for .* in slot `agent:ci`/);
   assert.equal(calls.length, 0, 'nothing sent, and no fallback to the human slot');
 });
+
+// ---- capability mappings (`--map`) ------------------------------------------
+
+/** `validDef`, plus authored capabilities on its single step. */
+function capDef(name: string, capabilities: string[]): string {
+  return [
+    `name: ${name}`,
+    'inputs:',
+    '  - name: seed',
+    '    seedOwed: true',
+    'steps:',
+    '  - name: worker',
+    '    consumes: [seed]',
+    '    produces: [out]',
+    `    capabilities: [${capabilities.join(', ')}]`,
+    '    terminal: true',
+    '    maxSchemaFailures: 0',
+    '',
+  ].join('\n');
+}
+
+test('push: capabilities join the ORG vocabulary unmapped, and the hub report is echoed', async () => {
+  const hub = makeFakeHub([], { capabilityRoutes: [{ capability: 'review', crewId: 'crew_1', crewName: 'reviewers' }] });
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': capDef('foo', ['review']) });
+  bind(t);
+
+  const code = await mainAsync(['push'], t.io);
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.match(t.err.join('\n'), /foo: Capabilities — review: bound \(reviewers\)/, 'no scoping — push shares');
+  assert.deepEqual((JSON.parse(t.out.join('\n')) as { capabilities: unknown }).capabilities, {
+    foo: [{ capability: 'review', status: 'bound', crews: ['reviewers'] }],
+  });
+  assert.equal(
+    calls.filter((call) => call.pathname === '/api/set_capability_mappings').length,
+    0,
+    'push records nothing by default — an org-authored def is already in the org vocabulary',
+  );
+});
+
+test('push --map fails closed against a hub with no mapping writer — nothing published', async () => {
+  const hub = makeFakeHub([], { mappingsUnsupported: true });
+  const { fetch, calls } = routedFetch(hub.routes);
+  const t = makeIo({ fetch });
+  writeDefs(t.cwd, { 'foo.yaml': capDef('foo', ['review']) });
+  bind(t);
+
+  const code = await mainAsync(['push', '--map', 'review=code-review'], t.io);
+  assert.equal(code, 2, t.err.join('\n'));
+  assert.match(t.err.join('\n'), /set_capability_mappings/, 'names the verb the hub is missing');
+  assert.equal(
+    calls.filter((call) => call.pathname === '/api/create_workflow').length,
+    0,
+    'record-then-publish: a mapping that cannot be recorded stops the push',
+  );
+});

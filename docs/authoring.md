@@ -311,6 +311,52 @@ check.
 `capabilities:` says *which* caller may claim it in the first place — a tick filter
 locally, a bound crew on a hub.
 
+### The trust boundary: publishing shares, installing scopes
+
+`push` and `install` both put a def on your hub, and they treat its capabilities
+differently on purpose.
+
+`owenloop push` publishes defs **your org authored**. Their capabilities join the
+org's **shared** vocabulary as written: two of your own defs that both author
+`review` deliberately mean the same `review`, served by the same crews. That is
+the whole value of a shared vocabulary.
+
+`owenloop install <owner>/<repo>` publishes a def **someone else authored**. An
+outside author writing `review` is not making your org's claim, so every
+capability an installed def authors becomes `<def-name>.<capability>` —
+`analyzer.review`, not `review` — unless you say otherwise, once, at install
+time. Scoping is the default because the failure it prevents is silent: an
+outside def entering the shared vocabulary starts drawing orders from the crews
+already bound to that name.
+
+Link deliberately, when you actually mean it. If your `reviewers` crew genuinely
+should serve the installed def's `review`, answer the install prompt with
+`code-review` (or whatever your org calls it), or pass
+`--map review=code-review`. Then the org name it takes is the one your crews are
+already bound to, and it draws from them by design rather than by collision.
+
+**Never edit a def's content to get the mapping you want.** The mapping is
+org-side data, recorded against `(def, authored-name)` on your hub; the def stays
+byte-for-byte as its author wrote it, so upstream updates keep applying. Editing
+`capabilities:` in a def you did not author forks it.
+
+Four names, in the order the engine derives them:
+
+| Vocabulary | Where it comes from |
+| --- | --- |
+| **authored** | what the def's YAML says, e.g. `review` |
+| **mapped** | the org name a capability mapping gives it, e.g. `analyzer.review` |
+| **composed** | the mapped name plus the run's modifier, e.g. `analyzer.review:deep` |
+| **offered** | the composed name after any capability reroute rewrites it |
+
+The two rewrite points key on different halves and fire at different times.
+**Mappings key on the AUTHORED name and apply BEFORE composition** — they answer
+"what does this def's `review` mean here". **Reroutes key on the COMPOSED string
+and apply AFTER composition** — they answer "where should `analyzer.review:deep`
+go right now". A reroute is therefore the operational lever (move traffic
+today); a mapping is the identity decision (what this def's capability *is* in
+your org).
+
 ## `produces:` vs `generates:`
 
 A stem under `produces:` is expected to be consumed downstream — owenloop's lint warns

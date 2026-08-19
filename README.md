@@ -481,7 +481,11 @@ against the hub before it's ever stored), `owenloop connect` binds the project
 to a hub, and `owenloop push` publishes your defs. Use `owenloop push --bundle
 <bundle.wnlp>` after `owenloop publish` when execution must be pinned to the
 exact signed bundle digest; plain YAML pushes remain idempotent against the
-hub's own def hashes. `owenloop agent new
+hub's own def hashes. To publish an *outside* repo's defs, `owenloop install
+<owner>/<repo>` scopes every capability they author to `<defName>.<capability>`
+unless you deliberately map it onto a name your crews already serve — see
+[`install`](docs/cli.md#install--publish-an-outside-repos-defs-under-scoped-capabilities).
+`owenloop agent new
 <name>` mints a Scoped Identity on the hub and stores its token in slot
 `agent:<name>` without ever printing it. See the
 [Hub](docs/cli.md#hub-login--connect--push--logout) section in `docs/cli.md`.

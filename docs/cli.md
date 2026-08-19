@@ -52,7 +52,8 @@ for the full breakdown.
 | `bundle digest <bundle.wnlp>` | print the SHA-256 digest of the uncompressed canonical tar — see [Bundles](#bundles) |
 | `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>] [--as <slot>]` | verify a resolved hub credential and record an optional per-project override in `.owenloop/hub.json` |
-| `push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--hub <url>] [--as <slot>]` | publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (idempotent against the hub's own def hashes) |
+| `push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--map <authored>=<org>] [--dry-run] [--hub <url>] [--as <slot>]` | publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (idempotent against the hub's own def hashes) |
+| `install <owner>/<repo>[@ref] [<defName>...] [--map <authored>=<org>] [--accept-defaults] [--dry-run] [--hub <url>] [--as <slot>]` | publish an OUTSIDE repo's defs to your hub under SCOPED capabilities (`<defName>.<capability>` by default) — records the mapping BEFORE it publishes, and never writes into local `workflows/` — see below |
 | `start <defName> [--provide name=json …] [--crew <name>] [--title <text>] [--modifier <name>] [--scope <label>] [--priority <low\|normal\|high>] [--hub <url>]` | start a published workflow on the bound hub with the human credential |
 | `publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned] [--hub <url>]` | pack a canonical workflow bundle and publish a signed publication sidecar, with an optional signed origin sidecar, or an explicitly unsigned marker |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
@@ -1842,6 +1843,18 @@ On a `401`, an OAuth credential is refreshed once and the request retried; an
 agent (`olp_`) token has no refresh path, so a `401` is a hard "re-mint it"
 error.
 
+**`--map <authored>=<org>`** (repeatable) records a capability mapping for the
+defs being pushed, before any of them is published. It is the same mechanism
+[`install`](#install--publish-an-outside-repos-defs-under-scoped-capabilities)
+uses, exposed here for the case where an org-authored def's capability should
+resolve to a different org name — `push` itself scopes nothing, because a def
+you authored is already in your org's vocabulary. Only the non-identity entries
+a given def actually authors are written for it; a `--map` naming a capability
+no selected def authors is an error. Because the write precedes the publish, a
+hub with no mapping writer fails the push with nothing sent (exit 2), and no
+shipped hub implements that write yet — so `--map` is currently a
+fail-closed declaration of intent.
+
 **Include and bodyFile limitations.** A def whose file uses `include:` is
 refused (`uses include:, not hub-pushable`): the hub's `create_workflow`
 parses the raw YAML without include expansion, and a re-serialized expanded
@@ -1849,6 +1862,73 @@ def isn't round-trippable. A def using `bodyFile:` is refused the same way
 (`uses bodyFile:, not hub-pushable`) — there's no checkout `baseDir` to
 resolve the external file against once the YAML leaves this machine. Inline
 both before pushing.
+
+### `install` — publish an outside repo's defs under scoped capabilities
+
+```text
+owenloop install <owner>/<repo>[@ref] [<defName>...] [--map <authored>=<org>] [--accept-defaults] [--dry-run] [--hub <origin>] [--as <slot>]
+```
+
+`install` is a **sibling of [`push`](#push--publish-local-defs-to-the-resolved-hub), not of [`add`](#add--installing-shared-workflow-defs-from-github)**. It
+publishes to your hub. It never writes into the local `workflows/` directory —
+`add` owns local installation, with its install lock, crash journal and atomic
+swap, and duplicating that here would be a second implementation of the same
+transaction. The outside repo is materialized into a temp directory, used, and
+deleted.
+
+**Sources.** Only `owner/repo[@ref]` (a public GitHub repo) is an install source
+today. A local `.wnlp` bundle or an `http(s)` URL is refused, naming the two
+commands that do cover it: `owenloop add <source>` to install into the local
+store, then `owenloop push --bundle <bundle.wnlp>` to publish it.
+
+**Capabilities are scoped by default.** `push` publishes defs you authored, so
+their capabilities join your org's shared vocabulary as written. A def from an
+unrelated author making the same claim is not the same claim, so every
+capability an installed def authors becomes `<defName>.<capability>` —
+`analyzer.review`, not `review`. A def name can never contain a dot and the def
+parser reserves only `:`, so the dot splits the two halves unambiguously and
+needs no new separator or escaping. The def's content is never edited: the
+mapping is org-side data recorded against `(def, authored-name)` on the hub, so
+upstream updates keep applying.
+
+**Deciding the vocabulary,** highest precedence first: `--map <authored>=<org>`
+(repeatable); a mapping this hub already holds for that def, carried forward
+unchanged; `--accept-defaults`, which takes the scoped name for everything;
+otherwise one prompt per capability, prefilled with the scoped name, printed
+after the org's live vocabulary so a decision to link is an informed one. A
+`--map` naming a capability no selected def authors is an error, never a silent
+no-op. A mapping target containing `:` is refused — that suffix position is
+reserved for the run modifier the engine composes at offer time.
+
+**The non-interactive guard fires before the first hub request.** A piped run
+with neither `--map` nor `--accept-defaults` exits 1 naming both flags, with an
+empty request log — never after a mapping read has already happened.
+
+**Record, then publish, and that ordering is the point.** Publishing first would
+put an unscoped third-party def into your org's vocabulary for the window
+between the two calls — exactly the trust-boundary breach this verb exists to
+prevent. A hub that cannot record the mapping therefore fails the command with
+**nothing published**. Identity entries are skipped (the hub's resolver drops
+them anyway), as are entries the hub already holds.
+
+**No shipped hub implements the mapping write yet.** Until one does, only the
+identity case completes end to end — where every capability keeps its authored
+name there is nothing to record, so the write is skipped and the publish
+proceeds. Every other case stops at the missing verb with exit 2, before any
+`create_workflow` call.
+
+Everything downstream of the mapping is `push`'s machinery, unchanged: the same
+all-or-nothing lint/validate/`check` gate across every selected def, the same
+`GET /api/workflows` server diff, the same topological `calls:` ordering with
+dependency skips, the same `401` refresh-once and `429` batch halt. `--dry-run`
+reports `mapped` and `wouldRecord` alongside the usual plan and writes nothing.
+stdout is machine-parseable JSON; the mapping decisions, the diff, and the hub's
+capability report go to stderr.
+
+Exit codes: 0 ok; 1 a runtime or hub error (a validation-gate refusal, a per-def
+rejection, a refused source kind, an invalid `--map`, or a credential the hub
+rejects after its one refresh — as in `push`); 2 the hub is unresolvable or does
+not implement the mapping write; 3 no credential is stored for the slot.
 
 ### `publish` — pack and publish a workflow bundle
 

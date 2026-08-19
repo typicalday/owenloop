@@ -970,6 +970,34 @@ export function computeServerDiff<T extends { name: string; hash: string }>(
 
 // ---- API response shape guards ----------------------------------------------
 
+/**
+ * One line of the hub's capability publish report — what the org's capability
+ * vocabulary looks like for the def that was just published, computed hub-side
+ * AFTER the write transaction.
+ *
+ * Mirrors `owenloop-service`'s `CapabilityPublishReportEntry`
+ * (`packages/hub-core/src/capability-publish-report.ts`). It is a WIRE shape
+ * read from the hub, not a local model: the hub verb is the enforcement of
+ * record and this is the client's narrowed copy of it.
+ *
+ * `authored` is emitted by the hub ONLY when a mapping changed the def author's
+ * spelling into a different org name (identity mappings are dropped by the
+ * hub's resolver), so its PRESENCE is a reliable signal that a non-identity
+ * mapping already exists for that authored name.
+ */
+export interface CapabilityPublishReportEntry {
+  /** The ORG name — what an operator would type into `capability bind`. */
+  capability: string;
+  /** The def author's spelling, present ONLY when a mapping changed it. */
+  authored?: string;
+  status: 'new' | 'shared' | 'bound';
+  /** `bound` only: the NAMES of the crews serving it today, sorted. */
+  crews?: string[];
+  /** Other def names resolving to this same org name, sorted. Present for
+   *  `shared`, and also alongside `bound` when both facts hold. */
+  sharedWith?: string[];
+}
+
 /** Success shape of `POST /api/create_workflow`. */
 export interface CreateWorkflowOk {
   ok: true;
@@ -979,6 +1007,16 @@ export interface CreateWorkflowOk {
   /** `true` when the posted content's hash equals the latest stored version
    *  (server-side idempotent no-op) — no new version was minted. */
   unchanged?: boolean;
+  /**
+   * The org capability vocabulary this def resolves to, as the hub computed it.
+   *
+   * `undefined` and `[]` are DIFFERENT answers and are deliberately kept apart:
+   * `undefined` is a hub older than the report (it sent no field at all), while
+   * `[]` is a current hub saying "this def authors no capabilities". A hub that
+   * sends the field sends it on every `ok:true` branch, the `unchanged:true`
+   * no-op included, so the distinction is reliable.
+   */
+  capabilityReport?: CapabilityPublishReportEntry[];
 }
 
 /**
@@ -1036,6 +1074,115 @@ export function asCreateWorkflowOk(body: unknown, expectedName: string): CreateW
   }
   const out: CreateWorkflowOk = { ok: true, name: b.name, version: b.version, hash: b.hash };
   if (b.unchanged === true) out.unchanged = true;
+  if (b.capabilityReport !== undefined) {
+    out.capabilityReport = asCapabilityPublishReport(b.capabilityReport, 'create_workflow: malformed success response');
+  }
+  return out;
+}
+
+/**
+ * Narrow a `capabilityReport` payload to typed entries, or throw.
+ *
+ * Called ONLY when the field is present: an ABSENT field is a hub older than
+ * the report and must stay `undefined` rather than fail the push (see
+ * `CreateWorkflowOk.capabilityReport`). A PRESENT field, on the other hand, is
+ * validated strictly (REL-9) — a malformed report is a malformed response, not
+ * something to coerce to a default.
+ *
+ * Unknown extra fields on an entry are IGNORED, not rejected: the hub may add
+ * facts to the report and an older CLI must keep pushing.
+ *
+ * Every message names the offending FIELD and INDEX only, never a body value.
+ */
+function asCapabilityPublishReport(value: unknown, prefix: string): CapabilityPublishReportEntry[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${prefix} — capabilityReport is not an array`);
+  }
+  return value.map((raw, i) => {
+    const where = `capabilityReport[${i}]`;
+    if (typeof raw !== 'object' || raw === null) {
+      throw new Error(`${prefix} — ${where} is not an object`);
+    }
+    const e = raw as Record<string, unknown>;
+    if (typeof e.capability !== 'string' || e.capability === '') {
+      throw new Error(`${prefix} — ${where} missing non-empty string capability`);
+    }
+    if (e.status !== 'new' && e.status !== 'shared' && e.status !== 'bound') {
+      throw new Error(`${prefix} — ${where} status must be one of new, shared, bound`);
+    }
+    const entry: CapabilityPublishReportEntry = { capability: e.capability, status: e.status };
+    if (e.authored !== undefined) {
+      if (typeof e.authored !== 'string' || e.authored === '') {
+        throw new Error(`${prefix} — ${where} authored must be a non-empty string when present`);
+      }
+      entry.authored = e.authored;
+    }
+    for (const field of ['crews', 'sharedWith'] as const) {
+      const list = e[field];
+      if (list === undefined) continue;
+      if (!Array.isArray(list) || list.some((v) => typeof v !== 'string' || v === '')) {
+        throw new Error(`${prefix} — ${where} ${field} must be an array of non-empty strings when present`);
+      }
+      entry[field] = list as string[];
+    }
+    return entry;
+  });
+}
+
+/**
+ * The one human line a pusher reads after `owenloop push` / `owenloop install`.
+ *
+ * Deliberately a COPY of the hub's `capabilityPublishReportText`, not an import
+ * of it: the CLI does not depend on `owenloop-service`, and the wire contract
+ * that binds the two is the ENTRY SHAPE above, not the sentence. Empty string
+ * for a def that authors no capabilities, so the caller appends nothing rather
+ * than a dangling header.
+ *
+ * `authored → capability` whenever the hub reported an `authored` spelling —
+ * that arrow is how an operator sees a mapping took effect.
+ *
+ * Goes to STDERR. Stdout is the machine JSON.
+ */
+export function capabilityPublishReportText(entries: CapabilityPublishReportEntry[]): string {
+  if (entries.length === 0) return '';
+  const parts = entries.map((entry) => {
+    const name = entry.authored === undefined ? entry.capability : `${entry.authored} → ${entry.capability}`;
+    if (entry.status === 'bound') return `${name}: bound (${(entry.crews ?? []).join(', ')})`;
+    if (entry.status === 'shared') return `${name}: shared with ${(entry.sharedWith ?? []).join(', ')}`;
+    return `${name}: new — nothing serves it yet`;
+  });
+  return `Capabilities — ${parts.join('; ')}.`;
+}
+
+/**
+ * Narrow `GET /api/capability_mappings`'s 200 body (`{ ok: true, mappings: {…} }`)
+ * to a plain `authored → org` record. An EMPTY object is valid — that is "this
+ * def has no recorded mapping", not an error.
+ *
+ * See `src/capability-mapping-client.ts` for why this endpoint is
+ * CLI-PROPOSED and not implemented by any shipped hub yet.
+ */
+export function asCapabilityMappings(body: unknown): Record<string, string> {
+  const prefix = 'capability_mappings: malformed success response';
+  if (typeof body !== 'object' || body === null) {
+    throw new Error(`${prefix} — not an object`);
+  }
+  const raw = (body as Record<string, unknown>).mappings;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new Error(`${prefix} — expected a \`mappings\` object`);
+  }
+  const out: Record<string, string> = {};
+  const entries = Object.entries(raw as Record<string, unknown>);
+  for (let i = 0; i < entries.length; i++) {
+    const [authored, target] = entries[i]!;
+    if (authored === '') {
+      throw new Error(`${prefix} — mappings[${i}] has an empty authored key`);
+    }
+    if (typeof target !== 'string' || target === '') {
+      throw new Error(`${prefix} — mappings[${i}] must map to a non-empty string`);
+    }
+    out[authored] = target;
+  }
   return out;
 }
 
