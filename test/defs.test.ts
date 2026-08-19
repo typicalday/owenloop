@@ -3357,11 +3357,25 @@ test('produce bind normalizes scalar and mapping forms', () => {
       produces: [
 				{ name: 'modifier', bind: 'modifier' },
 				{ name: 'dossier', bind: { to: 'meta.customer', from: 'payload.customerId' } },
+				{ name: 'dossier2', bind: 'meta.customer' },
       ],
     }],
   });
-  assert.deepEqual(d.steps[0]!.produces[0]!.bind, { to: 'modifier', from: 'value' });
+  assert.deepEqual(d.steps[0]!.produces[0]!.bind, { to: 'modifier', from: 'modifier' });
   assert.deepEqual(d.steps[0]!.produces[1]!.bind, { to: 'meta.customer', from: 'payload.customerId' });
+  assert.deepEqual(d.steps[0]!.produces[2]!.bind, { to: 'meta.customer', from: 'customer' });
+  const omittedFrom = parseDef({
+    name: 'bound-omitted-from',
+    modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [{
+      name: 'init',
+      consumes: ['proposal'],
+      capabilities: ['utility'],
+      produces: [{ name: 'modifier', bind: { to: 'modifier' } }],
+    }],
+  });
+  assert.deepEqual(omittedFrom.steps[0]!.produces[0]!.bind, { to: 'modifier', from: 'modifier' });
 });
 
 test('produce bind rejects invalid targets, paths, duplicate modifier writers, and undeclared modifiers', () => {
@@ -3381,6 +3395,16 @@ test('produce bind rejects invalid targets, paths, duplicate modifier writers, a
       steps: [{ name: 'init', consumes: ['proposal'], produces: [{ name: 'out', bind: { to: 'meta.', from: 'payload..value' } }] }],
     }),
     (e: unknown) => e instanceof DefError && /bind.to 'meta.'/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({
+      ...base,
+      modifiers: ['deep'],
+      steps: [{ name: 'init', consumes: ['proposal'], produces: [{ name: 'out', bind: 'meta.' }] }],
+    }),
+    (e: unknown) => e instanceof DefError
+      && /bind.to 'meta.'/.test(e.message)
+      && /bind.from ''/.test(e.message),
   );
   assert.throws(
     () => parseDef({

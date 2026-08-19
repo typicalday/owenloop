@@ -41,7 +41,7 @@ steps:
           properties: { plan: { type: string } }
         # maxAttempts: 2       # optional; overrides the step's maxAttempts (below)
         # maxSchemaFailures: 1 #   just for this produce — see design.md §6
-        # bind: modifier       # accepted value writes through to run routing
+        # bind: modifier       # accepted value's `modifier` key writes through to run routing
     body: |                    # the prompt; runtime placeholders are filled in when available
       Read the proposal and produce a `plan`.
     bodyFile: path/to.md       # load body from a file, relative to this workflow's dir (must resolve inside it); mutually exclusive with body
@@ -327,7 +327,9 @@ acceptance transaction. The artifact's own version and event history remains the
 record of the value and any later rejection; the bind adds the engine's sync
 event.
 
-The short form binds the whole accepted value:
+The short form reads the accepted object's key named after the final segment of
+the target. Here, the producer submits an object such as
+`{ modifier: 'deep' }`; `bind: modifier` reads its `modifier` key.
 
 ```yaml
 modifiers: [express, standard, deep]
@@ -339,9 +341,11 @@ steps:
 ```
 
 The mapping form selects a dotted object path. It is equivalent to the short
-form when `from` is omitted:
+form when `from` is omitted: `bind: { to: meta.customer }` reads the
+accepted object's `customer` key.
 
 ```yaml
+      - { name: customer, bind: { to: meta.customer } }
       - name: decision
         bind: { to: modifier, from: payload.value }
 ```
@@ -354,8 +358,9 @@ The two supported target families are:
 - `meta.<key>` — writes any JSON value into non-routing instance metadata.
   Metadata never changes capability composition or routing.
 
-`from` is a dot-separated path through object keys; arrays, escaping, and array
-indexes are not part of this grammar. A missing path is a submit-time refusal.
+`from` is always a dot-separated path through object keys; there is no
+whole-value form. Arrays, escaping, and array indexes are not part of this
+grammar. A missing path is a submit-time refusal.
 Bindings are supported on singleton and map produces, not collection produces.
 Only a green acceptance applies the bind: a producer submission that is waiting
 for judges has not synchronized the run yet.

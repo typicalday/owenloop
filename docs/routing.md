@@ -560,10 +560,10 @@ from the run's stored value again — whatever the last accepted bind left there
 
 **Command producers: bind the payload, not the receipt.** A command step's
 accepted artifact value is the whole `CommandReceipt`. The short form
-`bind: modifier` is shorthand for `{to: modifier, from: value}`, which would hand
-the engine the receipt object where it expects a modifier string, and be refused.
-Have the command emit a payload marker — `##owenloop:payload##{"value":"deep"}` —
-and bind `from: payload.value`.
+`bind: modifier` is shorthand for `{to: modifier, from: modifier}`. A
+`CommandReceipt` has no top-level `modifier` key, so that derived path does
+not resolve and the submit is refused. Have the command emit a payload marker —
+`##owenloop:payload##{"value":"deep"}` — and bind `from: payload.value`.
 
 > **Not shipped.** The routing plan also calls for a hub-side routing alert of
 > kind `modifier-changed`, raised on each sync so an operator sees it. It exists

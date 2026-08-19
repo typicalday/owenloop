@@ -8,6 +8,7 @@ import type { OrderInstructionSource } from '../src/order-resolver.ts';
 import { openStore } from '../src/store.ts';
 import type { Store } from '../src/store.ts';
 import type { StepDef, WorkflowDef } from '../src/types.ts';
+import { normalizeSubmitValue } from '../packages/work/src/submit-value.ts';
 import { assertReferenceContract, def, input, step } from './helpers.ts';
 
 // ---- fixtures & harness ------------------------------------------------------
@@ -79,6 +80,21 @@ function fire(engine: Engine, wf: string, stepName: string, now: number): Order 
 function complete(engine: Engine, wf: string, o: Order, value: Record<string, unknown> = {}, opts: { terminal?: boolean } = {}): void {
   for (const out of o.outputs) engine.green(wf, o.run, out, value, opts);
   engine.close(wf, o.run);
+}
+
+/**
+ * Reproduce hub-core submit: normalize a raw agent value, require the plain
+ * object the hub permits, then commit it through the real engine.
+ */
+function hubSubmit(
+  engine: Engine, wf: string, run: string, path: string, raw: unknown,
+): ReturnType<Engine['green']> {
+  const value = normalizeSubmitValue(raw);
+  assert.ok(
+    typeof value === 'object' && value !== null && !Array.isArray(value),
+    `the hub refuses a submit value that does not normalize to a plain object: ${JSON.stringify(raw)}`,
+  );
+  return engine.green(wf, run, path, value as Record<string, unknown>);
 }
 
 // ---- the happy path ----------------------------------------------------------
@@ -1815,6 +1831,95 @@ function boundMapArtifactDef(): WorkflowDef {
   });
 }
 
+function shorthandBoundDef(): WorkflowDef {
+  return parseDef({
+    name: 'shorthand-bound',
+    modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [{
+      name: 'init',
+      consumes: ['proposal'],
+      produces: [
+				{ name: 'modifier', bind: 'modifier' },
+				{ name: 'dossier', bind: 'meta.customer' },
+      ],
+      capabilities: ['utility'],
+    }],
+  });
+}
+
+test('bind: modifier shorthand syncs the run modifier through the hub submit path', () => {
+  const { engine, store } = makeEngine([shorthandBoundDef()]);
+  const wf = engine.createInstance('shorthand-bound', { modifier: 'standard' });
+  const init = fire(engine, wf, 'init', 1);
+
+  assert.equal(hubSubmit(engine, wf, init.run, 'modifier', { modifier: 'deep' }).outcome, 'green');
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep');
+  const events = store.getArtifactHistory(wf, 'modifier')?.events.filter((event) => event.action === 'bound') ?? [];
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0]?.metadata, { from: 'standard', to: 'deep' });
+});
+
+test('bind: modifier shorthand also accepts a JSON-encoded hub submit value', () => {
+  const { engine, store } = makeEngine([shorthandBoundDef()]);
+  const wf = engine.createInstance('shorthand-bound', { modifier: 'standard' });
+  const init = fire(engine, wf, 'init', 1);
+
+  assert.equal(hubSubmit(engine, wf, init.run, 'modifier', '{"modifier":"deep"}').outcome, 'green');
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep');
+  const events = store.getArtifactHistory(wf, 'modifier')?.events.filter((event) => event.action === 'bound') ?? [];
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0]?.metadata, { from: 'standard', to: 'deep' });
+});
+
+test('a bare modifier word cannot reach the engine through the hub path', () => {
+  const { engine } = makeEngine([shorthandBoundDef()]);
+  const wf = engine.createInstance('shorthand-bound', { modifier: 'standard' });
+  const init = fire(engine, wf, 'init', 1);
+
+  assert.equal(normalizeSubmitValue('deep'), 'deep');
+  assert.throws(
+    () => hubSubmit(engine, wf, init.run, 'modifier', 'deep'),
+    /does not normalize to a plain object/,
+  );
+});
+
+test('bind: meta.customer shorthand writes the selected key, not the whole value', () => {
+  const { engine, store } = makeEngine([shorthandBoundDef()]);
+  const wf = engine.createInstance('shorthand-bound', { modifier: 'standard' });
+  const init = fire(engine, wf, 'init', 1);
+
+  assert.equal(
+    hubSubmit(engine, wf, init.run, 'dossier', { customer: 'acme', note: 'ignored' }).outcome,
+    'green',
+  );
+  assert.deepEqual(store.getWorkflow(wf)?.meta, { customer: 'acme' });
+});
+
+test('a shorthand bind refuses a missing derived path without changing the instance', () => {
+  const { engine, store } = makeEngine([shorthandBoundDef()]);
+  const wf = engine.createInstance('shorthand-bound', { modifier: 'standard' });
+  const init = fire(engine, wf, 'init', 1);
+
+  const result = hubSubmit(engine, wf, init.run, 'modifier', { payload: { value: 'deep' } });
+  assert.equal(result.outcome, 'schema-rejected');
+  assert.match(result.reason ?? '', /bind\.from 'modifier' cannot be resolved/);
+  assert.equal(store.getWorkflow(wf)?.modifier, 'standard');
+});
+
+test('shorthand binds still enforce the declared modifier invariant', () => {
+  const { engine, store } = makeEngine([shorthandBoundDef()]);
+  const wf = engine.createInstance('shorthand-bound', { modifier: 'standard' });
+  const init = fire(engine, wf, 'init', 1);
+
+  assert.equal(hubSubmit(engine, wf, init.run, 'modifier', { modifier: 'two words' }).outcome, 'schema-rejected');
+  assert.equal(store.getWorkflow(wf)?.modifier, 'standard');
+  assert.throws(
+    () => engine.green(wf, 'human', 'modifier', { modifier: 'not-declared' }),
+    ModifierRefusalError,
+  );
+});
+
 test('accepted bound artifacts update modifier and metadata with one event per bind', () => {
   const { engine, store } = makeEngine([boundArtifactDef()]);
   const wf = engine.createInstance('bound-artifact', { modifier: 'standard' });
@@ -1848,9 +1953,11 @@ test('re-accepted bound artifacts record each routing sync with old and accepted
 
   const events = store.getArtifactHistory(wf, 'modifier')?.events.filter((event) => event.action === 'bound') ?? [];
   assert.equal(events.length, 2);
-  assert.deepEqual(events.map((event) => event.metadata), [
-    { from: 'standard', to: 'deep' },
-    { from: 'deep', to: 'standard' },
+  // Both commits can land within the same millisecond, where history's
+  // deterministic ID tie-breaker is not a chronology guarantee.
+  assert.deepEqual(events.map((event) => JSON.stringify(event.metadata)).sort(), [
+    JSON.stringify({ from: 'deep', to: 'standard' }),
+    JSON.stringify({ from: 'standard', to: 'deep' }),
   ]);
 });
 
