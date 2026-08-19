@@ -142,6 +142,7 @@ test('loadSettings: each C6 knob loads with its value', () => {
       dispatchCap: 7,
       commandRouting: 'manual',
       maxConcurrentAgents: 2,
+      execReserve: 1,
     }),
   );
   try {
@@ -152,6 +153,7 @@ test('loadSettings: each C6 knob loads with its value', () => {
     assert.equal(s.dispatchCap, 7);
     assert.equal(s.commandRouting, 'manual');
     assert.equal(s.maxConcurrentAgents, 2);
+    assert.equal(s.execReserve, 1);
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
@@ -336,6 +338,29 @@ test('loadSettings: maxConcurrentAgents rejects 0, negative, and non-integer', (
   }
 });
 
+test('loadSettings: execReserve accepts 0 and rejects negative or non-integer values', () => {
+  for (const value of [0, 1, 2]) {
+    const xdg = withSettingsFile(JSON.stringify({ execReserve: value }));
+    try {
+      assert.equal(loadSettings({ HOME: xdg }).execReserve, value);
+    } finally {
+      rmSync(xdg, { recursive: true, force: true });
+    }
+  }
+  for (const bad of [-1, 1.5, '1']) {
+    const xdg = withSettingsFile(JSON.stringify({ execReserve: bad }));
+    try {
+      assert.throws(
+	() => loadSettings({ HOME: xdg }),
+	/'execReserve' must be a non-negative integer/,
+	`execReserve ${JSON.stringify(bad)} should be rejected`,
+      );
+    } finally {
+      rmSync(xdg, { recursive: true, force: true });
+    }
+  }
+});
+
 /** The deleted stamp-path keys must now read as UNRECOGNIZED, not be silently
  *  accepted — an operator with a stale settings file gets told. */
 test('the deleted stamp-path settings keys are reported as unrecognized', () => {
@@ -347,11 +372,12 @@ test('the deleted stamp-path settings keys are reported as unrecognized', () => 
   }
 });
 
-test('KNOWN_SETTINGS_KEYS carries maxConcurrentAgents, so it is not "unrecognized"', () => {
-  const xdg = withSettingsFile(JSON.stringify({ maxConcurrentAgents: 4 }));
+test('KNOWN_SETTINGS_KEYS carries agent budget knobs, so they are not "unrecognized"', () => {
+  const xdg = withSettingsFile(JSON.stringify({ maxConcurrentAgents: 4, execReserve: 1 }));
   try {
     assert.deepEqual(inspectSettings({ HOME: xdg }).unrecognized, []);
     assert.ok(KNOWN_SETTINGS_KEYS.includes('maxConcurrentAgents'));
+    assert.ok(KNOWN_SETTINGS_KEYS.includes('execReserve'));
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }

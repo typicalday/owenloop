@@ -29,7 +29,9 @@
  * adopted wake still needs a sweep. Orders already returned by `whats_next`
  * are already claimed, so over-cap orders enter an in-memory queue and dispatch
  * as soon as local child capacity frees; waiting for another hub wake would
- * strand those claims until pickup expiry.
+ * strand those claims until pickup expiry. The agent lane is additionally
+ * bounded by `cap − execReserve`, preserving room for an exec order while
+ * agents are saturated.
  *
  * RESILIENCE: presence/wake/whats_next failures are logged and never kill the
  * loop. `stop()` flips a flag checked between awaits; the in-flight sweep
@@ -108,7 +110,8 @@ export interface ShiftLoopOptions {
   onEvent?: (event: ShiftEvent) => void;
   cacheDir: string;
   stateDir: string;
-  /** Max concurrent in-flight orders (exec + agent-run children). */
+  /** Max concurrent in-flight orders (exec + agent-run children), including
+   *  any slots reserved from the agent lane for exec work. */
   cap: number;
   /** Serve crews this shift accepts (sent to presence + whats_next). INITIAL
    *  value only — live-mutable via the `ShiftLoop.setShift` (MCP `clock_in`). */
@@ -148,10 +151,19 @@ export interface ShiftLoopOptions {
   computeServeCapabilities?: (crews: readonly string[]) => string[];
   /**
    * Max concurrent `agent-run` children (default 4). A SECOND budget, applied
-   * ON TOP OF `cap` — never a replacement for it. An agent turn is long and
-   * memory-heavy where a command is short, so the two cannot share one number.
+   * INSIDE `cap` — never a replacement for it. The effective budget also
+   * accounts for `execReserve`. An agent turn is long and memory-heavy where
+   * a command is short, so the two cannot share one number.
    */
   maxConcurrentAgents?: number;
+  /**
+   * Slots INSIDE `cap` that `agent-run` children may never occupy, so an
+   * exec/command order always has somewhere to land (default 1).
+   *
+   * A scheduling control, not a capacity one: it never raises the total child
+   * ceiling. Clamped to `cap - 1` so it cannot consume the whole cap.
+   */
+  execReserve?: number;
   /**
    * PHASE 4 — the root under which per-RUN agent work directories live
    * (`<workRoot>/<workflow>/<run>/`). ABSENT DISABLES THE REAPER entirely: with
@@ -261,6 +273,8 @@ export interface ShiftLoop {
   freeCapacity(): number;
   /** Live dispatch-cap used by status and next responses. */
   getCap(): number;
+  /** Live agent-lane ceiling after the exec reserve is applied. */
+  agentCeiling(): number;
   /** Adjust the live dispatch cap for internal callers and tests. */
   setCap(cap: number): void;
   /** The shift's live identity: the presence name and the crew scope (`serve_crews`)
@@ -332,6 +346,8 @@ interface Candidate {
 
 /** The `maxConcurrentAgents` fallback when the option is absent. */
 const DEFAULT_MAX_AGENTS = 4;
+/** The `execReserve` fallback when the option is absent. */
+const DEFAULT_EXEC_RESERVE = 1;
 /** The hub reaps a never-contacted claim after this long. Every client-side
  * re-offer latency must stay strictly under it. */
 export const HUB_PICKUP_WINDOW_MS = 120_000;
@@ -428,6 +444,24 @@ function isNonServableRace(e: unknown): boolean {
 export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   let stopped = false;
   let cap = opts.cap;
+
+  /**
+   * The agent lane's live budget. Recomputed per call because `setCap`
+   * rewrites `cap` at runtime.
+   */
+  function agentLane(): { ceiling: number; requested: number; reserve: number } {
+    const requested = opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS;
+    const reserve = Math.min(
+      opts.execReserve ?? DEFAULT_EXEC_RESERVE,
+      Math.max(0, cap - 1),
+    );
+    return {
+      ceiling: Math.max(0, Math.min(requested, cap - reserve)),
+      requested,
+      reserve,
+    };
+  }
+
   const isAlive = opts.isAlive;
   const monotonicNow = opts.monotonicNow ?? performance.now.bind(performance);
   // Live shift identity (MCP `clock_in`, D3-D7 of the plan). Seeded from opts,
@@ -625,7 +659,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       if (childKind === 'agent-run') {
 	const agents = fresh.live.filter((record) => record.kind === 'agent-run').length +
 	  fresh.reserved.filter((record) => record.childKind === 'agent-run').length;
-	if (agents >= (opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS)) return 'agent-capacity';
+	if (agents >= agentLane().ceiling) return 'agent-capacity';
       }
       return reserveChild(opts.stateDir, {
 	workflow: c.workflow,
@@ -758,8 +792,8 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     let remaining = cap - live.length - reserved.length;
     if (remaining <= 0 || pendingCandidates.size === 0) return 0;
 
-    const maxAgents = opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS;
-    let agentRoom = maxAgents -
+    const { ceiling } = agentLane();
+    let agentRoom = ceiling -
       live.filter((r) => r.kind === 'agent-run').length -
       reserved.filter((r) => r.childKind === 'agent-run').length;
     const liveRuns = new Set([...live.map((r) => r.run), ...reserved.map((r) => r.run)]);
@@ -848,8 +882,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     // The agent lane's SECOND budget (D7). Counted from live records and durable
     // reservations, so a crash between reservation and spawn cannot overbook it.
     // A child or reservation that is reaped frees the slot on the next reconcile.
-    const maxAgents = opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS;
-    let agentRoom = maxAgents -
+    const { ceiling, requested, reserve } = agentLane();
+    const agentCapLabel = reserve > 0 && ceiling < requested
+      ? `${ceiling}, ${requested} requested minus a ${reserve}-slot exec reserve`
+      : `${ceiling}`;
+    let agentRoom = ceiling -
       live.filter((r) => r.kind === 'agent-run').length -
       reserved.filter((r) => r.childKind === 'agent-run').length;
     /**
@@ -1084,12 +1121,21 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	  continue;
 	}
 
+	if (ceiling === 0) {
+	  dropOrder(
+	    wf,
+	    order,
+	    'agent-lane-closed',
+	    'this shift runs no agent-run children (agent ceiling 0) — leaving for the pickup window',
+	  );
+	  continue;
+	}
 	if (!reoffer && remaining <= 0) {
 	  pendingCandidates.set(order.run, candidate);
 	  opts.out(`[${wf}/${order.run}] at the dispatch cap (${cap}) — queued for local dispatch`);
 	} else if (!reoffer && agentRoom <= 0) {
 	  pendingCandidates.set(order.run, candidate);
-	  opts.out(`[${wf}/${order.run}] at the agent-run cap (${maxAgents}) — queued for local dispatch`);
+	  opts.out(`[${wf}/${order.run}] at the agent-run cap (${agentCapLabel}) — queued for local dispatch`);
 	} else {
 	  if (!reoffer) {
 	    remaining--;
@@ -1116,7 +1162,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	pendingCandidates.set(candidate.order.run, candidate);
 	const limit = result === 'total-capacity'
 	  ? `dispatch cap (${cap})`
-	  : `agent-run cap (${opts.maxConcurrentAgents ?? DEFAULT_MAX_AGENTS})`;
+	  : `agent-run cap (${agentCapLabel})`;
 	opts.out(
 	  `[${candidate.workflow}/${candidate.order.run}] lost a shared-capacity race at the ${limit} — queued for local dispatch`,
 	);
@@ -1361,6 +1407,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       return cap - current.live.length - current.reserved.length;
     },
     getCap: () => cap,
+    agentCeiling: () => agentLane().ceiling,
     setCap: (next: number) => {
       cap = next;
     },

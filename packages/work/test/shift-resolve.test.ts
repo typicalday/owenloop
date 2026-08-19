@@ -9,6 +9,7 @@ import {
 	resolveCap,
 	resolveStateDirOverride,
 	resolveMaxConcurrentAgents,
+	resolveExecReserve,
 	resolveShiftName,
 	parseArgs,
 	reconcileStartupState,
@@ -349,6 +350,12 @@ test('resolveMaxConcurrentAgents: --max-agents beats settings.maxConcurrentAgent
   assert.equal(resolveMaxConcurrentAgents(9, 2), 9);
 });
 
+test('resolveExecReserve: --exec-reserve beats settings.execReserve beats the default 1', () => {
+  assert.equal(resolveExecReserve(undefined, undefined), 1);
+  assert.equal(resolveExecReserve(undefined, 2), 2);
+  assert.equal(resolveExecReserve(0, 2), 0);
+});
+
 test('parseArgs reads --max-agents; absent leaves it undefined', () => {
   const on = parseArgs(['--max-agents', '6']);
   assert.equal(on.error, undefined);
@@ -358,6 +365,17 @@ test('parseArgs reads --max-agents; absent leaves it undefined', () => {
 
   assert.match(parseArgs(['--max-agents', 'abc']).error!, /--max-agents must be a non-negative integer/);
   assert.match(parseArgs(['--max-agents']).error!, /missing value/);
+});
+
+test('parseArgs reads --exec-reserve; absent leaves it undefined', () => {
+  const on = parseArgs(['--exec-reserve', '2']);
+  assert.equal(on.error, undefined);
+  assert.equal(on.execReserve, 2);
+  assert.equal(parseArgs(['--exec-reserve=0']).execReserve, 0);
+  assert.equal(parseArgs([]).execReserve, undefined);
+
+  assert.match(parseArgs(['--exec-reserve', 'abc']).error!, /--exec-reserve must be a non-negative integer/);
+  assert.match(parseArgs(['--exec-reserve']).error!, /missing value/);
 });
 
 // ---- session-unique shift name (shifts.md §6/§8 item 4) --------------------

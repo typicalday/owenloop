@@ -220,6 +220,20 @@ function cacheCommandBundle(): void {
   writeBundle(cacheDir, bundle, []);
 }
 
+/** Cache a legacy bundle with both dispatch lanes represented. */
+function cacheMixedBundle(): void {
+  const bundle: CachedBundle = {
+    def: {
+      name: 'demo',
+      hash: DEMO_HASH,
+      steps: [{ name: 'builder', body: '' }, { name: 'cmd', executor: 'command' }],
+    },
+    fetchedAt: Date.now(),
+    origin: 'x',
+  };
+  writeBundle(cacheDir, bundle, []);
+}
+
 const BRIEF_BODY = `run ${ORDER_TOKEN} @ ${ORIGIN_TOKEN}\n`;
 
 /** Cache a bundle whose 'builder' step is an AGENT step with a real brief. */
@@ -2152,6 +2166,151 @@ test('maxConcurrentAgents caps agent-run dispatch on top of the global cap', asy
   assert.match(out.join('\n'), /at the agent-run cap \(2\)/);
 });
 
+// ---- exec reserve -----------------------------------------------------------
+
+test('the default exec reserve keeps one cap slot reachable by command work', async () => {
+  cacheMixedBundle();
+  const orders = [
+    wo('run_agent_1', 'builder'),
+    wo('run_agent_2', 'builder'),
+    wo('run_agent_3', 'builder'),
+    wo('run_command', 'cmd'),
+  ];
+  const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: cmdWf(orders) });
+  const { spawner, spawns } = fakeSpawner();
+  const out: string[] = [];
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    maxConcurrentAgents: 3,
+    out: (line) => out.push(line),
+  }));
+
+  assert.equal(loop.agentCeiling(), 2);
+  assert.equal(await loop.iterate(), 3);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_agent_1', 'run_agent_2', 'run_command']);
+  assert.match(out.join('\n'), /agent-run cap \(2, 3 requested minus a 1-slot exec reserve\)/);
+});
+
+test('a full agent lane does not defer whats_next while command capacity remains', async () => {
+  cacheCommandBundle();
+  writeChildRecord(stateDir, {
+    workflow: 'wf1', run: 'run_agent_1', pid: process.pid, spawnedAt: 0, kind: 'agent-run', step: 'builder',
+  });
+  writeChildRecord(stateDir, {
+    workflow: 'wf1', run: 'run_agent_2', pid: process.pid, spawnedAt: 0, kind: 'agent-run', step: 'builder',
+  });
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: cmdWf([wo('run_command', 'cmd')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const out: string[] = [];
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    out: (line) => out.push(line),
+  }));
+
+  assert.equal(loop.agentCeiling(), 2);
+  assert.equal(await loop.iterate(), 1);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_command']);
+  assert.equal(out.some((line) => line.includes('deferring whats_next')), false);
+});
+
+test('execReserve 0 restores the previous agent-only cap behavior', async () => {
+  cacheBuilderStep();
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_agent_1', 'builder'), wo('run_agent_2', 'builder'), wo('run_agent_3', 'builder')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    maxConcurrentAgents: 3,
+    execReserve: 0,
+  }));
+
+  assert.equal(loop.agentCeiling(), 3);
+  assert.equal(await loop.iterate(), 3);
+  assert.equal(spawns.length, 3);
+});
+
+test('the reserve clamp keeps a cap-1 shift able to dispatch an agent', async () => {
+  cacheBuilderStep();
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_agent_1', 'builder')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    maxConcurrentAgents: 4,
+  }));
+
+  assert.equal(loop.agentCeiling(), 1);
+  assert.equal(await loop.iterate(), 1);
+  assert.equal(spawns.length, 1);
+});
+
+test('a larger reserve remains inside cap while command work fills the held slots', async () => {
+  cacheMixedBundle();
+  const orders = [
+    wo('run_agent_1', 'builder'),
+    wo('run_agent_2', 'builder'),
+    wo('run_command_1', 'cmd'),
+    wo('run_command_2', 'cmd'),
+  ];
+  const { hub } = mockHub({ wake: [{ changed: true, cursor: 1 }], perWf: cmdWf(orders) });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    maxConcurrentAgents: 3,
+    execReserve: 2,
+  }));
+
+  assert.equal(loop.agentCeiling(), 1);
+  assert.equal(await loop.iterate(), 3);
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_agent_1', 'run_command_1', 'run_command_2']);
+});
+
+test('a zero agent ceiling drops agent work instead of holding its claim', async () => {
+  cacheBuilderStep();
+  const events: import('../src/shift/protocol.ts').ShiftEvent[] = [];
+  const errors: string[] = [];
+  const { hub } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_agent_1', 'builder')]),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    maxConcurrentAgents: 0,
+    onEvent: (event) => events.push(event),
+    err: (line) => errors.push(line),
+  }));
+
+  assert.equal(loop.agentCeiling(), 0);
+  assert.equal(await loop.iterate(), 0);
+  assert.equal(spawns.length, 0);
+  assert.deepEqual(events.map((event) => event.type === 'order-dropped' ? event.reason : event.type), ['agent-lane-closed']);
+  assert.match(errors.join('\n'), /agent ceiling 0/);
+});
+
+test('agentCeiling follows live dispatch-cap changes', () => {
+  const { hub } = mockHub({});
+  const { spawner } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    cap: 3,
+    maxConcurrentAgents: 4,
+  }));
+
+  assert.equal(loop.agentCeiling(), 2);
+  loop.setCap(1);
+  assert.equal(loop.agentCeiling(), 1);
+  loop.setCap(5);
+  assert.equal(loop.agentCeiling(), 4);
+});
+
 test('a claimed order queued by the agent cap dispatches after a child exits without a new hub wake', async () => {
   cacheBuilderStep();
   const orders = [wo('run_first', 'builder'), wo('run_second', 'builder')];
@@ -2624,6 +2783,7 @@ test('a fresh same-run reservation consumes capacity and suppresses a hub re-off
   const dispatched = await createShiftLoop(baseOpts(hub, spawner, {
     workflow: 'wf1',
     cap: 2,
+    execReserve: 0,
   })).iterate();
 
   assert.equal(dispatched, 1);

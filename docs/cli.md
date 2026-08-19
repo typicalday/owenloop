@@ -195,7 +195,7 @@ holds `credentials.json`, `allowed_signers`, `org-root.pub`, `grants/`, and
 
 ```text
 owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]
-[--cap <n>] [--max-agents <n>] [--poll-interval <ms>] [--once]
+[--cap <n>] [--max-agents <n>] [--exec-reserve <n>] [--poll-interval <ms>] [--once]
 [--cache-dir <p>] [--state-dir <p>] [--log-dir <p>] [--log-max-age <ms>]
 [--work-root <dir>]...
 ```
@@ -213,6 +213,7 @@ one loop sweep and exits instead of keeping the foreground daemon running.
 | `--name <n>` | use this shift name; otherwise generate one from the host and current directory with a process/shift suffix |
 | `--cap <n>` | dispatch capacity; precedence is flag, then `settings.dispatchCap`, then `3` |
 | `--max-agents <n>` | concurrent agent limit; precedence is flag, then `settings.maxConcurrentAgents`, then `4` |
+| `--exec-reserve <n>` | slots inside `--cap` that `agent-run` children may never occupy, so an exec/command order always has room; precedence is flag, then `settings.execReserve`, then `1`. Clamped to `cap - 1`, so a `--cap 1` shift gets no reserve. `0` disables the reserve and lets agents fill the whole cap. This does not raise the total child ceiling — `--cap` still bounds every child. |
 | `--poll-interval <ms>` | loop polling interval; defaults to `5000` milliseconds |
 | `--once` | run one loop sweep and exit; without it, keep the daemon in the foreground |
 | `--cache-dir <p>` | cache root; precedence is flag, then `OWENLOOP_CACHE_DIR`, then `settings.cacheDir`, then `$XDG_CACHE_HOME/owenloop`, then `$HOME/.cache/owenloop` |
@@ -455,7 +456,7 @@ either `exec` or `agent-run`:
 - `reaped`: `{ "type": "reaped", "workflow": "...", "run": "...", "kind": "exec", "pid": 123 }`
 - `failed`: `{ "type": "failed", "workflow": "...", "run": "...", "step": "...", "kind": "exec", "message": "..." }`
 - `bundle-miss`: `{ "type": "bundle-miss", "workflow": "...", "def": "..." }` — a legacy order named a def with no cached bundle, so it was left for hub pickup
-- `order-dropped`: `{ "type": "order-dropped", "workflow": "...", "run": "...", "step": "...", "reason": "unsupported-worker", "message": "..." }` — the shift refused one order. Match on `reason` (`malformed-digest`, `malformed-worker`, `unsupported-worker`, `verification-failed`, `metadata-unavailable`); display `message`
+- `order-dropped`: `{ "type": "order-dropped", "workflow": "...", "run": "...", "step": "...", "reason": "unsupported-worker", "message": "..." }` — the shift refused one order. Match on `reason` (`malformed-digest`, `malformed-worker`, `unsupported-worker`, `verification-failed`, `metadata-unavailable`, `agent-lane-closed`); display `message`. `agent-lane-closed` means the shift's effective agent ceiling is structurally zero, so it leaves the claim for the hub pickup window instead of holding work it cannot run.
 - `ended`: `{ "type": "ended" }`, delivered to a parked `next` when `shift end` explicitly shuts down the daemon
 
 Every event above is also appended to `<log-dir>/shift.log` as JSON Lines, which
@@ -500,11 +501,13 @@ owenloop shift status [--state-dir <p>]
 With a daemon, status exits `0` and prints:
 
 ```json
-{ "name": "host/project#abc123", "serve_crews": ["alpha"], "cap": 3, "free": 3, "running": 0, "attended_at": null, "started_at": 1738000000000 }
+{ "name": "host/project#abc123", "serve_crews": ["alpha"], "cap": 3, "free": 3, "running": 0, "agent_ceiling": 2, "attended_at": null, "started_at": 1738000000000 }
 ```
 
-`attended_at` remains `null` until the first accepted `next` request. Without a
-daemon, status is still a successful question: it exits `0` and prints
+`agent_ceiling` is the effective maximum number of `agent-run` children after
+applying `--max-agents`, `--cap`, and `--exec-reserve`; command and exec work
+may still use any free slot inside `cap`. `attended_at` remains `null` until the
+first accepted `next` request. Without a daemon, status is still a successful question: it exits `0` and prints
 `{ "status": "no daemon", "socket": "<path>" }`. Invalid arguments exit `2`;
 other client/runtime errors exit `1`.
 

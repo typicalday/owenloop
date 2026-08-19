@@ -34,6 +34,7 @@ import { type Roster, validateRoster } from '../agent/capability-model.ts';
  *   - `shiftLogMaxAgeMs` — worker-log retention in ms; below `--log-max-age`
  *     and `OWENLOOP_SHIFT_LOG_MAX_AGE_MS`, above the 14-day default.
  *   - `commandRouting` — who runs `executor: 'command'` steps this machine sees.
+ *   - `execReserve`    — slots within dispatch cap reserved from agent work.
  *   - `defPolicy`      — local publication trust policy (`warn` by default).
  */
 export interface Settings {
@@ -88,6 +89,13 @@ export interface Settings {
    * both. Fallback below `--max-agents`.
    */
   maxConcurrentAgents?: number;
+  /**
+   * Slots inside `dispatchCap` that `agent-run` children may not occupy, so
+   * an exec/command order always has room. A non-negative integer: `0`
+   * disables the reserve and restores the pre-reserve behavior. Fallback below
+   * `--exec-reserve`; default 1.
+   */
+  execReserve?: number;
   /**
    * Phase 4 — the root under which per-RUN agent working directories live.
    *
@@ -156,6 +164,7 @@ export const KNOWN_SETTINGS_KEYS = [
   'defPolicy',
   'artifactPolicy',
   'maxConcurrentAgents',
+  'execReserve',
   'workRoot',
   'workRepo',
   'allowedWorkdirRoots',
@@ -259,6 +268,12 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
     const v = obj['maxConcurrentAgents'];
     if (typeof v !== 'number' || !Number.isInteger(v) || v <= 0) {
       throw bad('maxConcurrentAgents', 'a positive integer', v);
+    }
+  }
+  if ('execReserve' in obj) {
+    const v = obj['execReserve'];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+      throw bad('execReserve', 'a non-negative integer', v);
     }
   }
   if ('allowedWorkdirRoots' in obj) {

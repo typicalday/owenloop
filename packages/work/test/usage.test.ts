@@ -63,10 +63,12 @@ test('USAGE documents the agent-run role, its harness flag, and the hub-is-truth
   assert.match(USAGE, /selected roster candidate/);
 });
 
-test('USAGE documents --max-agents and maxConcurrentAgents, and no deleted stamp-path knob', () => {
+test('USAGE documents the agent and exec budgets, and no deleted stamp-path knob', () => {
   assert.match(USAGE, /--max-agents <n>/);
   assert.match(USAGE, /default 4; else settings\.maxConcurrentAgents/);
-  assert.match(USAGE, /maxConcurrentAgents, workRoot/);
+  assert.match(USAGE, /--exec-reserve <n>/);
+  assert.match(USAGE, /default 1; else settings\.execReserve; 0 disables/);
+  assert.match(USAGE, /maxConcurrentAgents, execReserve, workRoot/);
   // Phase 5 deleted the stamp path; its flags, env var, and settings keys must
   // not survive in the one place operators read to learn what exists.
   for (const gone of ['--runner-dispatch', '--no-stamp', '--settle-margin', '--agents-dir', 'OWENLOOP_AGENTS_DIR', 'runnerDispatch', 'agentsDir']) {
