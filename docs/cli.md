@@ -1926,9 +1926,9 @@ stdout is machine-parseable JSON; the mapping decisions, the diff, and the hub's
 capability report go to stderr.
 
 Exit codes: 0 ok; 1 a runtime or hub error (a validation-gate refusal, a per-def
-rejection, a refused source kind, an invalid `--map`); 2 the hub is unresolvable
-or does not implement the mapping write; 3 the credential for the slot is absent
-or irrecoverable.
+rejection, a refused source kind, an invalid `--map`, or a credential the hub
+rejects after its one refresh — as in `push`); 2 the hub is unresolvable or does
+not implement the mapping write; 3 no credential is stored for the slot.
 
 ### `publish` — pack and publish a workflow bundle
 
