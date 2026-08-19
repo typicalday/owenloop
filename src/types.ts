@@ -300,11 +300,12 @@ export interface Order {
      * stalls the step. This closes that: the requirement is stated up front,
      * from the same declaration the refusal will be measured against.
      *
-     * It is a COPY, not a reference. The order is immutable once written
-     * (`RunData.order`), so this is the schema as it stood at claim time; a def
-     * edited mid-run leaves the projected schema and the enforced one able to
-     * disagree, exactly as `defDigest` already records for the rest of the
-     * order.
+     * It is a COPY, not a reference. Nothing rewrites the schema on a persisted
+     * order — `Store.restampOrderTarget`, the one post-claim writer, touches
+     * only `owes[].version` — so this is the schema as it stood at claim time;
+     * a def edited mid-run leaves the projected schema and the enforced one
+     * able to disagree, exactly as `defDigest` already records for the rest of
+     * the order.
      */
     schema?: JsonSchema;
     /**
