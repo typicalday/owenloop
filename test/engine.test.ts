@@ -1953,9 +1953,11 @@ test('re-accepted bound artifacts record each routing sync with old and accepted
 
   const events = store.getArtifactHistory(wf, 'modifier')?.events.filter((event) => event.action === 'bound') ?? [];
   assert.equal(events.length, 2);
-  assert.deepEqual(events.map((event) => event.metadata), [
-    { from: 'standard', to: 'deep' },
-    { from: 'deep', to: 'standard' },
+  // Both commits can land within the same millisecond, where history's
+  // deterministic ID tie-breaker is not a chronology guarantee.
+  assert.deepEqual(events.map((event) => JSON.stringify(event.metadata)).sort(), [
+    JSON.stringify({ from: 'deep', to: 'standard' }),
+    JSON.stringify({ from: 'standard', to: 'deep' }),
   ]);
 });
 
