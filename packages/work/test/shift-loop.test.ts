@@ -2346,10 +2346,69 @@ test('a cap-1 shift releases an extra agent claim rather than keeping it locally
     true,
   );
 
+  // The released claim is unfinished business, so the next tick sweeps even
+  // though the cursor did NOT change. Before this was wired, a capacity release
+  // left ready work with nothing to bring it back: a child exiting locally is
+  // not a hub event, and with no local queue the order is not retained here
+  // either — so the shift sat idle holding the capacity it had just freed.
   alive.delete(1000);
-  assert.equal(await loop.iterate(), 0);
-  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
-  assert.equal(count(calls, 'whats_next'), 1);
+  assert.equal(await loop.iterate(), 1);
+  assert.equal(count(calls, 'whats_next'), 2, 'the unchanged cursor did not suppress the re-poll');
+  // `perWf` is a fixed list with no claim state, so the re-poll is answered
+  // with the same two orders and the first one dispatches again. A real hub
+  // would have the released order at the head instead. What this asserts is
+  // that the freed slot DID go back to the hub and DID dispatch — the run name
+  // is the mock's, not the behaviour's.
+  assert.equal(spawns.length, 2, 'the freed slot dispatched rather than idling');
+});
+
+test('a capacity release re-arms the sweep; a closed agent lane does not', async () => {
+  cacheBuilderStep();
+  // Two shifts, identical in every way that matters to the second tick: the
+  // cursor is UNCHANGED and there is free capacity. They differ only in WHY the
+  // first tick handed the claim back. Only the transient reason should send the
+  // shift back to the hub.
+  const capacity = mockHub({
+    wake: [{ changed: true, cursor: 1 }, { changed: false, cursor: 1 }],
+    perWf: agentWf([wo('run_first', 'builder'), wo('run_second', 'builder')]),
+  });
+  const alive = new Set<number>();
+  let pid = 2000;
+  const capacityLoop = createShiftLoop(baseOpts(capacity.hub, (spec) => {
+    void spec;
+    alive.add(pid);
+    return { pid: pid++ };
+  }, {
+    workflow: 'wf1',
+    cap: 1,
+    maxConcurrentAgents: 4,
+    isAlive: (candidatePid) => alive.has(candidatePid),
+  }));
+  await capacityLoop.iterate();
+  alive.clear();
+  await capacityLoop.iterate();
+  assert.equal(
+    count(capacity.calls, 'whats_next'),
+    2,
+    'dispatch-cap-full is transient: capacity can free, so the order is worth re-polling for',
+  );
+
+  const laneClosed = mockHub({
+    wake: [{ changed: true, cursor: 1 }, { changed: false, cursor: 1 }],
+    perWf: agentWf([wo('run_agent_1', 'builder')]),
+  });
+  const laneClosedLoop = createShiftLoop(baseOpts(laneClosed.hub, fakeSpawner().spawner, {
+    workflow: 'wf1',
+    maxConcurrentAgents: 0,
+  }));
+  await laneClosedLoop.iterate();
+  await laneClosedLoop.iterate();
+  assert.equal(
+    count(laneClosed.calls, 'whats_next'),
+    1,
+    'agent-lane-closed is a standing configuration, not a transient shortage — '
+      + 're-arming it would poll the hub every tick forever and never dispatch',
+  );
 });
 
 test('an agent-lane cap releases an undispatchable agent claim', async () => {
