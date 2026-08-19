@@ -240,7 +240,8 @@ function assertAuthoredCapability(value: string, ctx: string): void {
  *
  * Order is NOT preserved as meaning: the list is a vocabulary, and nothing in
  * the engine compares two modifiers or treats one as higher than another. The
- * array shape is only YAML's way of writing a set.
+ * array shape is only YAML's way of writing a set. The vocabulary is fixed
+ * here; every downstream gate checks membership in it and nothing else.
  */
 function parseModifiers(v: unknown, ctx: string): string[] {
   const values = asStringArray(v, ctx);
@@ -251,6 +252,13 @@ function parseModifiers(v: unknown, ctx: string): string[] {
   for (const value of values) {
     if (value.trim().length === 0) {
       throw new DefError(`${ctx}: modifier names must not be empty or whitespace`);
+    }
+    if (/\s/.test(value)) {
+      throw new DefError(
+	`${ctx}: modifier '${value}' must not contain whitespace — ` +
+	'a modifier is composed onto every authored capability as ' +
+	`'<capability>${MODIFIER_SEPARATOR}<modifier>' and travels as a routing key`,
+      );
     }
     if (value.includes(MODIFIER_SEPARATOR)) {
       throw new DefError(
