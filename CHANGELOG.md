@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.9](https://github.com/typicalday/owenloop/compare/v0.5.8...v0.5.9) (2026-08-19)
+
+
+### Features
+
+* add --scope and --priority to owenloop start, default MCP scope to repo name ([#205](https://github.com/typicalday/owenloop/issues/205)) ([1270885](https://github.com/typicalday/owenloop/commit/12708856d837b6bba40c8294ad62d76940b3944a))
+* add hub retry artifact controls ([#191](https://github.com/typicalday/owenloop/issues/191)) ([2afcaf6](https://github.com/typicalday/owenloop/commit/2afcaf6321ab952be7c7895e4e85907efd4965e5))
+* bind artifact values to run modifier and meta, with deterministic init ([#200](https://github.com/typicalday/owenloop/issues/200)) ([ca7c402](https://github.com/typicalday/owenloop/commit/ca7c4026ff60816987dca43dfca492610dc43b09))
+* declare cleanup steps for cancelled runs ([#204](https://github.com/typicalday/owenloop/issues/204)) ([bc3d1ef](https://github.com/typicalday/owenloop/commit/bc3d1ef94ca177cafa37c697709c26bef6d3a59d))
+* **shift:** advertise serving capabilities ([#194](https://github.com/typicalday/owenloop/issues/194)) ([4ff4010](https://github.com/typicalday/owenloop/commit/4ff4010c57ba91c4b12cab812d0cbd2cc4b33b75))
+* stamp matched crews on orders and resolve worker rosters from the stamp ([#193](https://github.com/typicalday/owenloop/issues/193)) ([aceae05](https://github.com/typicalday/owenloop/commit/aceae055d72eb54a0da8b5edb87b4ce3caddebe5))
+* sync hub org rosters into the shift cache and merge them as the weakest layers ([#190](https://github.com/typicalday/owenloop/issues/190)) ([643e2fd](https://github.com/typicalday/owenloop/commit/643e2fdfe93c4b6d9dd80cd15a211c275b130918))
+
+
+### Bug Fixes
+
+* carry the child command output tail into a payload reject ([#197](https://github.com/typicalday/owenloop/issues/197)) ([e3ee61f](https://github.com/typicalday/owenloop/commit/e3ee61fbc51598d883a310e33b84abafb399aa98))
+* do not hold hub claims a shift cannot dispatch ([#209](https://github.com/typicalday/owenloop/issues/209)) ([5b61433](https://github.com/typicalday/owenloop/commit/5b61433cab384107f5cf126253e0fd1b3c62e0c2))
+* escalate failed command diagnostics through ask ([#203](https://github.com/typicalday/owenloop/issues/203)) ([583d4c3](https://github.com/typicalday/owenloop/commit/583d4c34772d32035b7067abc71620bf46143acc))
+* log claude adapter turn activity ([#188](https://github.com/typicalday/owenloop/issues/188)) ([c9ba76a](https://github.com/typicalday/owenloop/commit/c9ba76a8948dd5dc0733a204313374322f2fa22f))
+* make the bind shorthand resolve a key path instead of the whole value ([#206](https://github.com/typicalday/owenloop/issues/206)) ([03ac38c](https://github.com/typicalday/owenloop/commit/03ac38ca2066cf6e23592f693e484601efdd6ebb))
+* make the modifier vocabulary consistent across parse, start, and bind ([#210](https://github.com/typicalday/owenloop/issues/210)) ([afd33a6](https://github.com/typicalday/owenloop/commit/afd33a6d5f49525e3e7e65a8df481af6b53c1a55))
+* reserve dispatch capacity for exec orders ([#207](https://github.com/typicalday/owenloop/issues/207)) ([91c6a66](https://github.com/typicalday/owenloop/commit/91c6a66869b5b2c06c9db228818c6bb19c7ede9e))
+* **shift:** release exited workers and resweep braked steps ([#196](https://github.com/typicalday/owenloop/issues/196)) ([1b23815](https://github.com/typicalday/owenloop/commit/1b238153caf5d4dacdce7731c06b64830dbe15ce))
+
 ## [0.5.8](https://github.com/typicalday/owenloop/compare/v0.5.7...v0.5.8) (2026-08-17)
 
 
