@@ -514,6 +514,15 @@ function parseGroup(v: RawGroup, ctx: string): GroupDef {
 }
 
 /**
+ * The `from` a bind gets when its author omits one: the final segment of
+ * `to`. A shorthand `bind: modifier` therefore reads the accepted
+ * object's `modifier` key, while `bind: meta.customer` reads `customer`.
+ */
+function defaultBindFrom(to: string): string {
+  return to.slice(to.lastIndexOf('.') + 1);
+}
+
+/**
  * Parse a step's `produces` list. Each entry is either a bare pattern string
  * (`plan`, `gather.source[]`), a mapping `{ name, schema, judges, maxAttempts,
  * maxSchemaFailures }` attaching a JSON Schema the produced value must satisfy
@@ -560,16 +569,16 @@ function parseProduces(v: unknown, ctx: string, baseDir?: string): { patterns: P
         pat.maxSchemaFailures = v;
       }
       if (raw.bind !== undefined) {
-				// Object keys only: bind.from is a dot-separated object path, with no
-				// array indexing or escaping. Engine acceptance refuses a missing path.
+				// bind.from is always a dot-separated object path. When omitted, it
+				// defaults to the final segment of bind.to; missing paths are refused.
 				if (typeof raw.bind === 'string') {
-					pat.bind = { to: raw.bind, from: 'value' };
+					pat.bind = { to: raw.bind, from: defaultBindFrom(raw.bind) };
 				} else if (typeof raw.bind === 'object' && raw.bind !== null && !Array.isArray(raw.bind)) {
 					const bind = raw.bind as { to?: unknown; from?: unknown };
 					assertNoUnknownKeys(bind, ['to', 'from'], `produce '${name}'.bind`);
 					const to = asString(bind.to, `produce '${name}'.bind.to`);
 					const from = bind.from === undefined
-						? 'value'
+						? defaultBindFrom(to)
 						: asString(bind.from, `produce '${name}'.bind.from`);
 					pat.bind = { to, from };
 				} else {

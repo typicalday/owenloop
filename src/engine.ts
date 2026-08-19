@@ -2049,9 +2049,8 @@ export class Engine {
     )?.bind;
   }
 
-  /** Resolve a declared object-only bind path against an accepted artifact value. */
+  /** Resolve a declared dot-path of object keys against an accepted artifact value. */
   private boundValue(path: string, bind: ArtifactBind, acceptedValue: unknown): unknown {
-    if (bind.from === 'value') return acceptedValue;
     let current: unknown = acceptedValue;
     for (const key of bind.from.split('.')) {
       if (
