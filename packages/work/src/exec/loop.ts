@@ -430,8 +430,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
    *
    * The distinction from `issueReject` is the third outcome. A judge reject is
    * always the end of the run; a payload reject may leave the claim open, and
-   * when it does the owed receipts still have to land. So this returns either a
-   * terminal `ExecOutcome` or the sentinel `'continue'`.
+   * when it does the caller decides whether the command result may deliver
+   * owed receipts. So this returns either a terminal `ExecOutcome` or the
+   * sentinel `'continue'`.
    *
    *   refused / threw   → terminal. `issueReject` has already logged it and
    *                       settled the lease. Nothing is submitted: a reject that
@@ -442,7 +443,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
    *                       the owed paths stay debts for the next firing.
    *   landed, still open → `'continue'`. The rejected path was not consumed
    *                       here, so the claim and the consume fingerprint are
-   *                       both intact and every owed submit proceeds normally.
+   *                       both intact. A successful command may submit its
+   *                       owed receipts; a failed command escalates instead.
    *
    * `closed` is read from the hub's own response rather than re-derived from the
    * order, because the consumed-input test lives in the hub
@@ -480,7 +482,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       await leasePromise;
       return 'rejected';
     }
-    opts.out(`owenloop work exec: rejected ${path} (not consumed by this firing) — submitting owed receipts`);
+    opts.out(`owenloop work exec: rejected ${path} (not consumed by this firing) — claim remains open`);
     return 'continue';
   }
 
@@ -505,11 +507,12 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
    * schema-rejected — with no trace of what the child said. Reproducing the
    * script by hand outside the engine was the only way to see its stderr.
    *
-   * The success half matters because a non-judge command step has no exit-code
-   * failure channel: a deferral is expressed as exit 0 and no payload.
-   * `merge-gate` does exactly that on its `cadence: 2m` re-offer. Before this
-   * relay, every deferral produced three identical log lines and no reason; the
-   * measured 40-minute case is recorded in `src/config-dir.ts:19-26`.
+   * The success half matters because a non-judge command can defer with exit 0
+   * and no payload. Failed commands now escalate through `ask`, but
+   * `merge-gate` still uses that exit-0 deferral on its `cadence: 2m`
+   * re-offer. Before this relay, every deferral produced three identical log
+   * lines and no reason; the measured 40-minute case is recorded in
+   * `src/config-dir.ts:19-26`.
    *
    * Silence is printed rather than skipped because "this gate printed nothing"
    * is itself the diagnosis, and an absent line is indistinguishable from the
@@ -697,7 +700,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     //
     //   `closed: false` — the rejected path was NOT consumed by this firing, so
     //     the claim is still open and the fingerprint has not moved. Fall through
-    //     and submit every owed path exactly as before.
+    //     to the command-result gate: a success submits every owed path, while a
+    //     failure escalates through ask and submits nothing.
     //
     // A REFUSED reject now submits nothing. That is the point: previously the
     // receipt had already landed and greened a path whose gate had failed.

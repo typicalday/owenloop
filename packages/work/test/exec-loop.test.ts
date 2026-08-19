@@ -950,12 +950,13 @@ test('a closing payload reject beats the failure gate', async () => {
 });
 
 test('a non-closing payload reject is followed by failure escalation', async () => {
+  const outs: string[] = [];
   const fr = fakeRunner();
   const { hub, calls, submits } = mockHub({
     getOrder: [commandOrder()],
     reject: [{ ok: true, closed: false }],
   });
-  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { out: (line) => outs.push(line) }));
   const p = loop.run();
   await macrotaskSleep();
   fr.resolve(result(1, { payloadLine: '{"reject":{"path":"input","text":"upstream is invalid"}}' }));
@@ -964,6 +965,11 @@ test('a non-closing payload reject is followed by failure escalation', async () 
   assert.equal(submits.length, 0);
   assert.equal(only(calls, 'reject').length, 1);
   assert.equal(only(calls, 'ask').length, 1);
+  assert.ok(outs.some((line) => line.includes('claim remains open')));
+  assert.ok(
+    outs.every((line) => !line.includes('submitting owed receipts')),
+    `failed command must not promise a submit: ${JSON.stringify(outs)}`,
+  );
 });
 
 test('a payload reject that leaves the claim open lands FIRST, then every owed receipt', async () => {
