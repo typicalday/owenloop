@@ -43,6 +43,9 @@ Options:
       --once                     bootstrap wake + one sweep, then exit (demo/e2e)
       --max-agents <n>           max in-flight agent-run children, separate from
                                  --cap (default 4; else settings.maxConcurrentAgents)
+		--exec-reserve <n>         slots inside --cap that agent-run children may
+					not occupy, so exec orders always have room
+					(default 1; else settings.execReserve; 0 disables)
       --cache-dir/--state-dir <p>   override the resolved dirs
 
   hold options:
@@ -109,7 +112,7 @@ Options:
   settings (no options in v1):
       prints the resolved settings file path, whether it exists, each known
       knob (hubOrigin, cacheDir, stateDir, dispatchCap, commandRouting,
-      maxConcurrentAgents, workRoot, workRepo) with its value + provenance,
+      maxConcurrentAgents, execReserve, workRoot, workRepo) with its value + provenance,
       and any unrecognized keys.
       settings.dispatchCap/stateDir are the lowest-precedence
       fallbacks for shift's --cap/--state-dir. NO secrets ever

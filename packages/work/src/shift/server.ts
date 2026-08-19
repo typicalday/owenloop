@@ -352,6 +352,7 @@ export function createShiftDaemon(opts: ShiftDaemonOptions): ShiftDaemon {
       name: shift.name,
       serve_crews: shift.serveCrews,
       ...capacity(),
+      agent_ceiling: opts.loop.agentCeiling(),
       attended_at: opts.loop.getAttendedAt() ?? null,
       started_at: opts.startedAt,
     };

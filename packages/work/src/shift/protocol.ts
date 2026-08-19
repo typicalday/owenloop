@@ -152,7 +152,8 @@ export interface OrderDroppedEvent {
     | 'malformed-worker'
     | 'unsupported-worker'
     | 'verification-failed'
-    | 'metadata-unavailable';
+    | 'metadata-unavailable'
+    | 'agent-lane-closed';
   message: string;
 }
 
@@ -245,6 +246,7 @@ export interface ShiftStatus {
   cap: number;
   free: number;
   running: number;
+  agent_ceiling: number;
   attended_at: number | null;
   started_at: number;
 }

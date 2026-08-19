@@ -36,6 +36,7 @@ test('prints path, exists:no, and defaults when no file exists (exit 0)', async 
     assert.match(out, /exists: no/);
     // Knobs with a built-in default print it; the rest print (unset).
     assert.match(out, /dispatchCap = 3 {2}\(default\)/);
+    assert.match(out, /execReserve = 1 {2}\(default\)/);
     assert.match(out, /commandRouting = shift {2}\(default\)/);
     assert.match(out, /defPolicy = warn {2}\(default\)/);
     assert.match(out, /hubOrigin = \(unset\)/);
@@ -52,6 +53,7 @@ test('prints each known knob with its value + (settings) provenance', async () =
       commandRouting: 'manual',
       defPolicy: 'enforce',
       maxConcurrentAgents: 2,
+      execReserve: 0,
     }),
   );
   try {
@@ -63,6 +65,7 @@ test('prints each known knob with its value + (settings) provenance', async () =
     assert.match(out, /commandRouting = manual {2}\(settings\)/);
     assert.match(out, /defPolicy = enforce {2}\(settings\)/);
     assert.match(out, /maxConcurrentAgents = 2 {2}\(settings\)/);
+    assert.match(out, /execReserve = 0 {2}\(settings\)/);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

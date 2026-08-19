@@ -31,7 +31,7 @@ interface StartArgs extends ParsedArgs {
 function usage(): void {
   process.stderr.write(
     'usage: owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]\n' +
-      '                              [--cap <n>] [--max-agents <n>] [--poll-interval <ms>] [--once]\n' +
+      '                              [--cap <n>] [--max-agents <n>] [--exec-reserve <n>] [--poll-interval <ms>] [--once]\n' +
       '                              [--cache-dir <p>] [--state-dir <p>]\n' +
       '                              [--log-dir <p>] [--log-max-age <ms>]\n' +
       '                              [--work-root <dir>]...   restrict this shift to these directories\n' +
@@ -52,7 +52,7 @@ function intValue(raw: string, flag: string): number | string {
 function parseStartArgs(args: string[]): StartArgs {
   const parsed: StartArgs = { crews: [] };
   const valueFlags = new Set([
-    '--origin', '--as', '--name', '--cap', '--max-agents', '--poll-interval',
+    '--origin', '--as', '--name', '--cap', '--max-agents', '--exec-reserve', '--poll-interval',
     '--cache-dir', '--state-dir', '--log-dir', '--log-max-age', '--work-root',
   ]);
   for (let i = 0; i < args.length; i++) {
@@ -90,6 +90,10 @@ function parseStartArgs(args: string[]): StartArgs {
         const n = intValue(value, '--max-agents');
         if (typeof n !== 'number') return { crews: parsed.crews, error: n };
         parsed.maxAgents = n;
+      } else if (name === '--exec-reserve') {
+	const n = intValue(value, '--exec-reserve');
+	if (typeof n !== 'number') return { crews: parsed.crews, error: n };
+	parsed.execReserve = n;
       } else if (name === '--poll-interval') {
         const n = intValue(value, '--poll-interval');
         if (typeof n !== 'number') return { crews: parsed.crews, error: n };

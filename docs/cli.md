@@ -195,7 +195,7 @@ holds `credentials.json`, `allowed_signers`, `org-root.pub`, `grants/`, and
 
 ```text
 owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]
-[--cap <n>] [--max-agents <n>] [--poll-interval <ms>] [--once]
+[--cap <n>] [--max-agents <n>] [--exec-reserve <n>] [--poll-interval <ms>] [--once]
 [--cache-dir <p>] [--state-dir <p>] [--log-dir <p>] [--log-max-age <ms>]
 [--work-root <dir>]...
 ```
@@ -213,6 +213,7 @@ one loop sweep and exits instead of keeping the foreground daemon running.
 | `--name <n>` | use this shift name; otherwise generate one from the host and current directory with a process/shift suffix |
 | `--cap <n>` | dispatch capacity; precedence is flag, then `settings.dispatchCap`, then `3` |
 | `--max-agents <n>` | concurrent agent limit; precedence is flag, then `settings.maxConcurrentAgents`, then `4` |
+| `--exec-reserve <n>` | slots inside `--cap` that `agent-run` children may never occupy, so an exec/command order always has room; precedence is flag, then `settings.execReserve`, then `1`. Clamped to `cap - 1`, so a `--cap 1` shift gets no reserve. `0` disables the reserve and lets agents fill the whole cap. This does not raise the total child ceiling — `--cap` still bounds every child. |
 | `--poll-interval <ms>` | loop polling interval; defaults to `5000` milliseconds |
 | `--once` | run one loop sweep and exit; without it, keep the daemon in the foreground |
 | `--cache-dir <p>` | cache root; precedence is flag, then `OWENLOOP_CACHE_DIR`, then `settings.cacheDir`, then `$XDG_CACHE_HOME/owenloop`, then `$HOME/.cache/owenloop` |
