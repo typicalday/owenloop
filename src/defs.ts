@@ -30,7 +30,7 @@ import { assertValidSchema } from './schema.ts';
 // The separator lives with composition/matching (capabilities.ts); the parser
 // only enforces that an AUTHORED name never contains it.
 import { MODIFIER_SEPARATOR } from './capabilities.ts';
-import type { Acceptance, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
+import type { Acceptance, ConsumePattern, EffectDef, EscalationDef, FiringTrigger, GroupDef, InputDef, InvariantDef, InvariantPredicate, JsonSchema, StepDef, ProducePattern, WorkflowDef } from './types.ts';
 
 // ---- raw (pre-validation) YAML shapes ---------------------------------------
 
@@ -55,8 +55,9 @@ interface RawProduce {
   maxAttempts?: unknown;
   /** §6/§18 per-produce override of the step's maxSchemaFailures. */
   maxSchemaFailures?: unknown;
+  bind?: unknown;
 }
-const RAW_PRODUCE_KEYS = ['name', 'schema', 'judges', 'maxAttempts', 'maxSchemaFailures'] as const;
+const RAW_PRODUCE_KEYS = ['name', 'schema', 'judges', 'maxAttempts', 'maxSchemaFailures', 'bind'] as const;
 
 /** §26: a `group:` entry in a `produces:` list — spans multiple sibling stems, not a produce itself. */
 interface RawGroup {
@@ -542,10 +543,27 @@ function parseProduces(v: unknown, ctx: string, baseDir?: string): { patterns: P
         if (v < 0) throw new DefError(`produce '${name}'.maxSchemaFailures must be a non-negative number`);
         pat.maxSchemaFailures = v;
       }
+      if (raw.bind !== undefined) {
+				// Object keys only: bind.from is a dot-separated object path, with no
+				// array indexing or escaping. Engine acceptance refuses a missing path.
+				if (typeof raw.bind === 'string') {
+					pat.bind = { to: raw.bind, from: 'value' };
+				} else if (typeof raw.bind === 'object' && raw.bind !== null && !Array.isArray(raw.bind)) {
+					const bind = raw.bind as { to?: unknown; from?: unknown };
+					assertNoUnknownKeys(bind, ['to', 'from'], `produce '${name}'.bind`);
+					const to = asString(bind.to, `produce '${name}'.bind.to`);
+					const from = bind.from === undefined
+						? 'value'
+						: asString(bind.from, `produce '${name}'.bind.from`);
+					pat.bind = { to, from };
+				} else {
+					throw new DefError(`produce '${name}'.bind must be a string or a { to, from } mapping`);
+				}
+      }
       patterns.push(pat);
       return;
     }
-    throw new DefError(`${ctx}[${i}] must be a string or a { name, schema, judges, maxAttempts, maxSchemaFailures } mapping`);
+    throw new DefError(`${ctx}[${i}] must be a string or a { name, schema, judges, maxAttempts, maxSchemaFailures, bind } mapping`);
   });
   return { patterns, groups };
 }
@@ -1541,6 +1559,16 @@ export function validateDef(def: WorkflowDef): string[] {
     if (l.produces.length !== 1) {
       errors.push(`calls: step '${l.name}' must produce exactly one output (got ${l.produces.length})`);
     }
+    // A calls: outcome is published by the composition machinery rather than
+    // accepted through green(), so it has no transactional bind write path.
+    // Refuse it at definition load instead of allowing a silently stale route.
+    for (const produce of l.produces) {
+      if (produce.bind !== undefined) {
+				errors.push(
+					`calls: step '${l.name}' produce '${produce.raw}' declares bind, which is not supported on calls: outcomes`,
+				);
+      }
+    }
     // (b) callsInputs VALUES must be real parent artifacts (inputs or step-produced stems)
     for (const [, parentArtifact] of Object.entries(l.callsInputs ?? {})) {
       if (!producerOf.has(parentArtifact)) {
@@ -1636,6 +1664,39 @@ export function validateDef(def: WorkflowDef): string[] {
   //       "defs without `modifiers:` run exactly as today". Opting into the
   //       new routing vocabulary is what turns the stricter rule on.
   const declaredModifiers = new Set(def.modifiers ?? []);
+  const modifierBinds: Array<{ step: string; artifact: string }> = [];
+  for (const l of def.steps) {
+    for (const p of l.produces) {
+      const bind = p.bind;
+      if (bind === undefined) continue;
+      if (p.kind === 'collection') {
+		errors.push(`step '${l.name}' produce '${p.raw}' bind is not supported on collection produces`);
+		continue;
+      }
+      if (bind.to === 'modifier') {
+				if (declaredModifiers.size === 0) {
+					errors.push(
+						`step '${l.name}' produce '${p.stem}' binds modifier but workflow '${def.name}' declares no modifiers:`,
+					);
+				}
+				modifierBinds.push({ step: l.name, artifact: p.stem });
+      } else if (!/^meta\.[A-Za-z_][A-Za-z0-9_-]*$/.test(bind.to)) {
+				errors.push(
+					`step '${l.name}' produce '${p.stem}' bind.to '${bind.to}' must be 'modifier' or 'meta.<key>'`,
+				);
+      }
+      if (!/^[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*$/.test(bind.from)) {
+				errors.push(
+					`step '${l.name}' produce '${p.stem}' bind.from '${bind.from}' must be a non-empty dot-path of identifier segments`,
+				);
+      }
+    }
+  }
+  if (modifierBinds.length > 1) {
+    errors.push(
+      `workflow '${def.name}' binds modifier more than once: ${modifierBinds.map((b) => `'${b.step}.${b.artifact}'`).join(', ')}`,
+    );
+  }
   for (const l of def.steps) {
     if (l.escalation === undefined) continue;
     if (declaredModifiers.size === 0) {
@@ -1892,6 +1953,63 @@ function danglingReduceSuffixWarnings(def: WorkflowDef): string[] {
 }
 
 /**
+ * Whether a consume can receive a value produced by this exact pattern.
+ *
+ * Keeping map suffixes here is essential: `items[$i].review` does not make a
+ * consumer of `items[*].analysis` (or bare `items[*]`) downstream merely
+ * because both lanes share the `items` stem.
+ */
+function consumesProducedPattern(consume: ConsumePattern, produce: ProducePattern): boolean {
+  if (consume.stem !== produce.stem) return false;
+  if (produce.kind === 'singleton') return consume.mode === 'plain';
+  if (produce.kind === 'collection') {
+    return consume.mode !== 'plain' && consume.suffix === '';
+  }
+  return consume.mode !== 'plain' && consume.suffix === produce.suffix;
+}
+
+/** Warn when routed work can run before the artifact that writes the modifier. */
+function unroutedCapabilityWarnings(def: WorkflowDef): string[] {
+  let bindingStep: StepDef | undefined;
+  let boundArtifact: ProducePattern | undefined;
+  for (const step of def.steps) {
+    const bound = step.produces.find((p) => p.bind?.to === 'modifier');
+    if (bound !== undefined) {
+      bindingStep = step;
+      boundArtifact = bound;
+      break;
+    }
+  }
+  if (bindingStep === undefined || boundArtifact === undefined) return [];
+
+  // Forward graph closure from the bound artifact. The binding step itself is
+  // exempt, but its unbound sibling outputs must not make a branch downstream.
+  const reachedSteps = new Set<string>([bindingStep.name]);
+  const reachedArtifacts: ProducePattern[] = [boundArtifact];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const step of def.steps) {
+      if (reachedSteps.has(step.name)) continue;
+      if (!step.consumes.some((consume) => reachedArtifacts.some((produce) => consumesProducedPattern(consume, produce)))) continue;
+      reachedSteps.add(step.name);
+      reachedArtifacts.push(...step.produces);
+      changed = true;
+    }
+  }
+
+  const warnings: string[] = [];
+  for (const step of def.steps) {
+    if (step.capabilities === undefined || step.capabilities.length === 0) continue;
+    if (reachedSteps.has(step.name)) continue;
+    warnings.push(
+      `step '${step.name}' declares capabilities (${step.capabilities.join(', ')}) but is not downstream of artifact '${boundArtifact.raw}' bound to modifier`,
+    );
+  }
+  return warnings;
+}
+
+/**
  * Static lint over a workflow definition. Returns both the hard errors from
  * `validateDef` (which `parseDef` / `loadDefFile` would throw on) and
  * non-fatal warnings (dead-end outputs, dangling suffixed-reduce wiring).
@@ -1904,7 +2022,7 @@ function danglingReduceSuffixWarnings(def: WorkflowDef): string[] {
 export function lintDef(def: WorkflowDef): { errors: string[]; warnings: string[] } {
   const errors = validateDef(def);
   const warnings = errors.length === 0
-    ? [...deadEndWarnings(def), ...danglingReduceSuffixWarnings(def)]
+    ? [...deadEndWarnings(def), ...danglingReduceSuffixWarnings(def), ...unroutedCapabilityWarnings(def)]
     : [];
   return { errors, warnings };
 }

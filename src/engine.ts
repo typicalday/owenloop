@@ -43,6 +43,7 @@ import type { MatchMode } from './capabilities.ts';
 import { localMidnightMs, nowMs, randId } from './util.ts';
 import type { Store, WorkflowRow } from './store.ts';
 import type {
+  ArtifactBind,
   ArtifactData,
   Author,
   Fingerprint,
@@ -99,6 +100,7 @@ interface EscalationRecord {
 
 /** The artifact-history `action` written when an escalation promotes an offer. */
 const ESCALATION_ACTION = 'escalated';
+const BIND_ACTION = 'bound';
 
 /**
  * F2: a typed refusal for a produced-value/input-value schema mismatch, thrown
@@ -333,14 +335,16 @@ export interface CreateOpts {
   /** Mode 2: parent-coordinate link for a child instance spawned by a calls: step. Persisted to store; used only to cascade the child's outcome back up. */
   producedBy?: { parentWf: string; parentPath: string };
   /**
-   * The ONE routing modifier this instance carries for its whole life. Must be
-   * a member of the def's declared `modifiers` set — `createInstance` throws
+   * The ONE routing modifier this instance carries at a time. Must be a member
+   * of the def's declared `modifiers` set — `createInstance` throws
    * {@link ModifierRefusalError} otherwise, rather than starting a run that
-   * would compose capabilities no crew was ever bound to.
+   * would compose capabilities no crew was ever bound to. After creation, the
+   * engine may replace it only through a def-declared artifact bind during
+   * acceptance.
    *
    * Absent = an unmodified run: every step is offered on bare capabilities.
-   * Never mutated after creation; an escalated re-offer carries its own target
-   * modifier per-offer without rewriting this.
+   * An escalated re-offer carries its own target modifier per-offer without
+   * rewriting this stored value.
    */
   modifier?: string;
 }
@@ -549,8 +553,9 @@ export class Engine {
     if (opts.params !== undefined) wfData.params = opts.params;
     // Validated against the SNAPSHOT being pinned on this same row, not
     // against a live re-resolution — the modifier and the vocabulary that
-    // legitimizes it are stamped together and stay consistent for the life of
-    // the instance, even if the def is republished with a different set.
+    // legitimizes it are stamped together. Later bound-artifact writes still
+    // validate against this pinned vocabulary, even if the def is republished
+    // with a different set.
     if (opts.modifier !== undefined) {
       const declared = def.modifiers ?? [];
       if (!declared.includes(opts.modifier)) {
@@ -2027,6 +2032,99 @@ export class Engine {
     return this.resolver.resolveOrder(order);
   }
 
+  /** Return the binding declaration that owns this artifact path, if any. */
+  private artifactBind(def: WorkflowDef, art: ArtifactData): ArtifactBind | undefined {
+    const step = def.steps.find((candidate) => candidate.name === art.producer);
+    if (step === undefined) return undefined;
+    const element = parseElement(art.path);
+    if (element !== null) {
+      return step.produces.find(
+		(produce) => produce.kind === 'map'
+		  && produce.stem === element.stem
+		  && produce.suffix === element.suffix,
+      )?.bind;
+    }
+    return step.produces.find(
+      (produce) => produce.kind === 'singleton' && produce.stem === art.path,
+    )?.bind;
+  }
+
+  /** Resolve a declared object-only bind path against an accepted artifact value. */
+  private boundValue(path: string, bind: ArtifactBind, acceptedValue: unknown): unknown {
+    if (bind.from === 'value') return acceptedValue;
+    let current: unknown = acceptedValue;
+    for (const key of bind.from.split('.')) {
+      if (
+				current === null ||
+				typeof current !== 'object' ||
+				Array.isArray(current) ||
+				!Object.prototype.hasOwnProperty.call(current, key)
+      ) {
+				throw new Error(`artifact '${path}' bind.from '${bind.from}' cannot be resolved from its accepted value`);
+      }
+      current = (current as Record<string, unknown>)[key];
+    }
+    return current;
+  }
+
+  /** Reuse the start-run modifier refusal shape for accepted bound values. */
+  private assertBoundModifier(def: WorkflowDef, value: unknown): asserts value is string {
+    const declared = def.modifiers ?? [];
+    if (typeof value !== 'string' || /\s/.test(value) || !declared.includes(value)) {
+      const rendered = typeof value === 'string' ? value : JSON.stringify(value) ?? String(value);
+      throw new ModifierRefusalError(def.name, rendered, declared);
+    }
+  }
+
+  /** Validate extraction before an acceptance branch changes an artifact. */
+  private validateArtifactBind(def: WorkflowDef, art: ArtifactData, acceptedValue: unknown): void {
+    const bind = this.artifactBind(def, art);
+    if (bind === undefined) return;
+    const value = this.boundValue(art.path, bind, acceptedValue);
+    if (bind.to === 'modifier') this.assertBoundModifier(def, value);
+  }
+
+  /**
+   * Persist a declared instance-routing write and its single artifact-level
+   * audit event. Call only from an already-accepted branch inside its tx.
+   */
+  private applyArtifactBind(
+    workflow: string,
+    def: WorkflowDef,
+    art: ArtifactData,
+    acceptedValue: unknown,
+    now: number,
+  ): void {
+    const bind = this.artifactBind(def, art);
+    if (bind === undefined) return;
+    const value = this.boundValue(art.path, bind, acceptedValue);
+    const routing = this.store.getWorkflow(workflow);
+    if (routing === undefined) throw new Error(`cannot bind routing for unknown workflow '${workflow}'`);
+    let prior: unknown;
+    if (bind.to === 'modifier') {
+      this.assertBoundModifier(def, value);
+      prior = routing.modifier;
+      this.store.setWorkflowRouting(workflow, { modifier: value });
+    } else {
+      const key = bind.to.slice('meta.'.length);
+      prior = routing.meta?.[key];
+      this.store.setWorkflowRouting(workflow, { meta: { [key]: value } });
+    }
+    this.store.recordArtifactEvent({
+      workflow,
+      path: art.path,
+      version: 0,
+      action: BIND_ACTION,
+      actor: 'engine',
+      dedupe: `${BIND_ACTION}:${art.path}:v${art.version}`,
+      timestamp: now,
+      reason: `artifact '${art.path}' bound ${bind.to}`,
+      // JSON has no undefined value, so null faithfully records an unbound
+      // target while preserving both sides of every accepted routing write.
+      metadata: { from: prior ?? null, to: value },
+    });
+  }
+
   // ---- producer commits ------------------------------------------------------
 
   /**
@@ -2098,7 +2196,9 @@ export class Engine {
         };
         const producer = def.steps.find((l) => l.name === art.producer);
         if (opts.terminal || producer?.terminal) next.terminal = true;
+				this.validateArtifactBind(def, next, value);
 	this.store.putArtifact(next, { action: 'green', actor: 'human', reason: 'human green' });
+				this.applyArtifactBind(workflow, def, next, value, nowMs());
         this.settle(workflow, def);
         return { path, outcome: 'green' };
       });
@@ -2140,7 +2240,9 @@ export class Engine {
           const producer = def.steps.find((l) => l.name === art.producer);
           const next: ArtifactData = { ...art, acceptance: 'green', approvals };
           if (producer?.terminal) next.terminal = true;
+					this.validateArtifactBind(def, next, art.value);
 	  this.store.putArtifact(next, { action: 'judge-approved', actor: jName, reason: 'all judges approved' });
+					this.applyArtifactBind(workflow, def, next, art.value, nowMs());
           this.settle(workflow, def);
           return { path: judgedStem, outcome: 'green' };
         }
@@ -2198,6 +2300,19 @@ export class Engine {
           return { path, outcome: 'schema-rejected', reason: text, issues: check.issues };
         }
       }
+      try {
+				this.validateArtifactBind(def, art, value);
+      } catch (e) {
+				const text = `artifact bind validation failed: ${e instanceof Error ? e.message : String(e)}`;
+				this.store.putArtifact({
+					...art,
+					acceptance: 'rejected',
+					schemaRejects: art.schemaRejects + 1,
+					reasons: [...art.reasons, reason('schema-reject', 'validation', 'engine', text, art.version)],
+				});
+				this.settle(workflow, def);
+				return { path, outcome: 'schema-rejected', reason: text };
+      }
 
       // §24 §4.4/§4.8: when this produce declares judges, the commit lands
       // `submitted` (not `green`) and the version bumps here — CAS re-arms on
@@ -2218,11 +2333,12 @@ export class Engine {
       // output terminal in its definition, or the caller may force it per-commit.
       const producer = def.steps.find((l) => l.name === art.producer);
       if (!hasJudges && (opts.terminal || producer?.terminal)) next.terminal = true;
-      this.store.putArtifact(next, {
-	action: hasJudges ? 'submitted' : 'produced',
-	actor: r.step,
-	reason: hasJudges ? 'submitted for judgment' : 'producer green',
-      });
+	this.store.putArtifact(next, {
+	  action: hasJudges ? 'submitted' : 'produced',
+	  actor: r.step,
+	  reason: hasJudges ? 'submitted for judgment' : 'producer green',
+	});
+      if (!hasJudges) this.applyArtifactBind(workflow, def, next, value, nowMs());
       this.settle(workflow, def);
       return { path, outcome: hasJudges ? 'submitted' : 'green' };
     });
@@ -2400,7 +2516,13 @@ export class Engine {
    * See `docs/design.md` §24.9 for the full writeup and operator mitigations
    * (`parallel: 1`, a generous `reapTtl:` on slow judge steps).
    */
-  reject(workflow: string, path: string, by: Author, text: string): { outcome: 'rejected' | 'born-rejected'; reason?: string } {
+  reject(
+    workflow: string,
+    path: string,
+    by: Author,
+    text: string,
+    requested?: string,
+  ): { outcome: 'rejected' | 'born-rejected'; reason?: string } {
     const def = this.defFor(workflow);
     this.assertAuthority(def, by, path, 'reject');
 
@@ -2412,7 +2534,14 @@ export class Engine {
     // verb-guard rule below that a verdict needs a built version).
     const producingStep = def.steps.find((s) => s.produces.some((p) => p.stem === path));
     if (producingStep?.calls) {
-      return this.rejectCallsArtifact(workflow, def, producingStep, path, by, text);
+      const bind = producingStep.produces.find((p) => p.stem === path)?.bind;
+      if (requested !== undefined) {
+				if (bind?.to !== 'modifier') {
+					throw new Error(`requested modifier is only valid when artifact '${path}' binds to modifier`);
+				}
+				this.assertBoundModifier(def, requested);
+      }
+      return this.rejectCallsArtifact(workflow, def, producingStep, path, by, text, requested);
     }
 
     const judgeStep = def.steps.find((s) => s.name === by);
@@ -2422,6 +2551,13 @@ export class Engine {
     const result = this.store.tx((): { outcome: 'rejected' | 'born-rejected'; reason?: string } => {
       const art = this.store.getArtifact(workflow, path);
       if (!art) throw new Error(`cannot reject unknown artifact: ${path}`);
+      if (requested !== undefined) {
+				const bind = this.artifactBind(def, art);
+				if (bind?.to !== 'modifier') {
+					throw new Error(`requested modifier is only valid when artifact '${path}' binds to modifier`);
+				}
+				this.assertBoundModifier(def, requested);
+      }
 
       if (judgedStem !== undefined) {
         // A judge's reject targets the judged stem, mirroring green()'s
@@ -2470,7 +2606,7 @@ export class Engine {
         acceptance: 'rejected',
         judgmentRejects: art.judgmentRejects + 1,
         approvals: undefined,
-        reasons: [...art.reasons, reason('reject', 'judgment', by, text, art.version)],
+				reasons: [...art.reasons, reason('reject', 'judgment', by, text, art.version, requested)],
       });
       this.settle(workflow, def);
       return { outcome: 'rejected' };
@@ -2509,6 +2645,7 @@ export class Engine {
     callsStem: string,
     by: Author,
     text: string,
+    requested?: string,
   ): { outcome: 'rejected' | 'born-rejected'; reason?: string } {
     const child = this.store.findChildByParent(parentWf, callsStem);
     if (!child) {
@@ -2537,7 +2674,7 @@ export class Engine {
         acceptance: 'rejected',
         judgmentRejects: childArt.judgmentRejects + 1,
         approvals: undefined,
-        reasons: [...childArt.reasons, reason('reject', 'judgment', `parent:${by}` as Author, text, childArt.version)],
+				reasons: [...childArt.reasons, reason('reject', 'judgment', `parent:${by}` as Author, text, childArt.version, requested)],
       });
       this.settle(child.id, childDef);
 
@@ -3585,8 +3722,9 @@ function reason(
   by: Author,
   text: string,
   fromVersion: number,
+  requested?: string,
 ): ReasonEntry {
-  return { at: nowMs(), action, kind, by, text, fromVersion };
+  return { at: nowMs(), action, kind, by, text, fromVersion, ...(requested !== undefined ? { requested } : {}) };
 }
 
 function nextIndex(arts: ArtifactMap, stem: string): number {

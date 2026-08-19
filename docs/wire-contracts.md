@@ -306,7 +306,9 @@ arrays. `consumes` is an open artifact-path map; `spec` and `x` are opaque
 objects carried through without engine interpretation. `owes` contains the owed
 path, an optional target `version` (the version the next successful commit for
 that path lands, issued inside the claim transaction), judgment/schema rejection
-counters, reason entries, and an optional opaque `proof` string. `cause`, when present, is
+counters, reason entries, and an optional opaque `proof` string. A reason entry
+may also carry optional `requested`, the validated replacement value requested
+when rejecting an artifact bound to the run's modifier. `cause`, when present, is
 `inputsGreen`, `allGreen`, or `idle`.
 
 **Decision A — version cross-check without fingerprint recomputation.** The

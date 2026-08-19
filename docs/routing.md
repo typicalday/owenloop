@@ -32,7 +32,7 @@ Use this mapping instead. It is exact, not a loose analogy.
 | Term | Think of it as | Who writes it | Where it lives |
 |---|---|---|---|
 | **capability** | a **job posting** | the workflow author | the workflow definition file (`delivery.yaml`) |
-| **modifier** | the **grade on the posting** | the person starting the run | chosen once at `start_run`, stored on the instance |
+| **modifier** | the **grade on the posting** | the starter at `start_run`, then the engine through a declared artifact bind | the run instance; an optional bound artifact is the writer |
 | **crew** | a **team certified for that posting** | the hub operator | the hub's `capability_routes` table |
 | **shift** | a **team member clocking in** | whoever runs the machine | a local `settings.json` on that machine |
 
@@ -250,9 +250,11 @@ owenloop start delivery --modifier deep \
   --provide target='{"path":"/Users/alex/code/owenloop"}'
 ```
 
-The hub creates an instance and stores `modifier = "deep"` on it. **This value
-is set once and never changes for the life of the run.** There is no verb that
-updates it.
+The hub creates an instance and stores `modifier = "deep"` on it as the run's
+initial hint. A def may later declare one artifact with `bind: modifier`; when
+that artifact is accepted, the engine synchronizes the instance's modifier in
+the same acceptance transaction. There is still no general-purpose verb that
+lets a worker write the column.
 
 **Step 2 — a shift asks for work.**
 
@@ -437,10 +439,25 @@ Four properties, all easy to get wrong:
 The order carries a marker, `order.escalated = true`, so a reader can tell an
 escalated re-offer from an ordinary one.
 
-**A planner cannot upgrade the run's grade.** That feature does not exist. The
-modifier is set at `start_run` and there is no code path that updates it. A
-planner that thinks the human picked the wrong depth says so in its plan
-document; it does not reroute itself.
+Escalation still does not rewrite the run's stored modifier. A separate,
+def-declared `bind: modifier` is the engine's only post-start writer: it turns
+an accepted artifact into the next routing value. A planner can reject that
+artifact with `--requested <modifier>` (or the equivalent rejection path); the
+producer can then re-emit the requested value, and downstream work is offered
+with the synchronized modifier.
+
+The binding is ordinary dataflow, not a hidden reroute. Only steps downstream
+of the bound artifact are guaranteed to wait for its synchronized value. Claims
+already in flight finish under the modifier stamped on their orders; later
+offers compose from the new instance value. The artifact's version and reason
+history records the rejected value, feedback, and replacement, while the order
+records the modifier actually used for each firing.
+
+For a command producer, remember that the accepted artifact value is the whole
+`CommandReceipt`. If the command emits a payload marker such as
+`##owenloop:payload## {"value":"deep"}`, use
+`bind: {to: modifier, from: payload.value}`; a bare `from: value` would look for
+a top-level field on the receipt.
 
 ---
 
@@ -590,7 +607,7 @@ Each of these has actually happened. Each has a one-line correction.
 | "The shift that is clocked in has no rate for `build:deep`, so serve it something else." | Do not serve it at all. Certify the crew that *can* do it. That is what the binding is for. |
 | "`--modifier` defaults to standard." | Omitting it means **no modifier**. Steps are offered on bare authored capabilities. |
 | "A modifier means 'more effort'." | To the engine it is an opaque string. All meaning lives in the shift's `roster` map. |
-| "A planner can decide the run needs to go deeper." | It can *say so*. It cannot change the run's modifier — no code path does. |
+| "A planner can decide the run needs to go deeper." | It rejects the bound modifier artifact with `requested: deep`; its producer re-emits the value and the engine synchronizes the run. |
 | "Escalation upgrades the run." | It re-offers **one step**, temporarily. The run's stored modifier is untouched. |
 | "If nobody serves the compound, close enough is fine." | Not any more. It holds and alerts. Substitution is something the operator configures on purpose (section 10). |
 | "Two harnesses in one crew gives me control over which model runs." | It gives you *either* model. First claim wins. Use separate crews when you need a guarantee. |
@@ -602,7 +619,9 @@ Each of these has actually happened. Each has a one-line correction.
 ```
 delivery.yaml          steps: [{ name: builder, capabilities: [build] }]
                             |
-   owenloop start --modifier deep     (stored once, never changes)
+   owenloop start --modifier standard (initial hint; a bind may later change it)
+                            |
+   bound artifact accepted -> engine syncs the run modifier (audited in its history)
                             |
    engine composes          build  +  deep  ->  "build:deep"
                             |

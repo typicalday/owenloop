@@ -83,6 +83,7 @@ for the full breakdown.
 | `mcp [--hub <url>]` | serve the hub control plane to a local MCP host over stdio — spawned by MCP hosts, not run by humans — see [`mcp`](#mcp--stdio-control-plane-server-for-mcp-hosts) |
 | `shift start <crew...>`, `shift next`, `shift status`, `shift end` | run the foreground shift daemon and its local clients — see [`shift`](#shift--foreground-daemon-and-client) |
 | `work <subcommand> [options]` | run the execution-side CLI companion — see [`work`](#work--execution-side-cli-companion) |
+| `util modifier-init --default <value>` | choose a modifier from rejection feedback, the order hint, or a default; intended for command steps |
 | `trust init\|grant\|revoke` | create and sign local enrollment trust records offline — see [`trust`](#trust--local-enrollment-trust) |
 | `create <def> [--title t] [--provide name=json …] [--param k=v …]` | start an instance; prints `{workflow}` |
 | `provide <wf> <name> [--value json]` | supply a seeded input after the fact |
@@ -552,6 +553,28 @@ The execution settings file is `<config>/settings.json` (see
 | `release --session <id> [options]` | drain a session's held claims |
 | `settings` | print the resolved execution settings file |
 | `join <code> [--hub <origin>] [--as <account>]` | redeem a join code and store the Scoped Identity credential |
+| `util modifier-init --default <value>` | print the requested modifier from `OWENLOOP_FEEDBACK`, else `OWENLOOP_MODIFIER`, else the required default |
+
+### `util modifier-init`
+
+`owenloop util modifier-init --default <value>` is a deterministic helper for
+a command step that produces a bound modifier artifact. It prints one value and
+does no model or harness work. Its precedence is:
+
+1. the newest `reject` reason carrying `requested` in `OWENLOOP_FEEDBACK`;
+2. the current order modifier in `OWENLOOP_MODIFIER`;
+3. the required `--default` value.
+
+The helper accepts a single-word result only. It reads feedback inline from
+`OWENLOOP_FEEDBACK` or from the temporary path in `OWENLOOP_FEEDBACK_FILE`,
+using the same 64 KiB threshold and collision rule as consumed inputs. Exit 0
+prints the value; exit 2 is a usage error; exit 3 means the feedback could not
+be parsed or the resolved value was invalid.
+
+The helper prints the selected word as ordinary stdout. A command artifact is
+submitted as the full `CommandReceipt`; if a workflow binds a field inside a
+command payload, the command must emit the `##owenloop:payload##` JSON marker and
+the bind must name that field (for example, `from: payload.value`).
 
 ### `work agent-run` — the only Step Agent dispatcher
 
@@ -3027,6 +3050,12 @@ refuses it. The result JSON is always written to stdout; the human-readable
 reason goes to stderr. A successful call exits 0 — a Step Agent should treat a
 non-zero exit as a failure, not a success.
 
+For a bound modifier artifact, local `reject` also accepts
+`--requested <modifier>`. The engine checks that the requested value is one of
+the workflow's declared modifiers and carries it in the artifact's next reason
+thread, where a deterministic producer such as `util modifier-init` can read it.
+The flag is only valid for an artifact bound to `modifier`.
+
 ## What a job looks like
 
 `tick` returns `{ workflow, orders, reaped }`. Each order is a **reference
@@ -3047,6 +3076,7 @@ them.
   "inputs":  ["plan"],
   "outputs": ["pr"],
   "worker":  "command",    // the authored step's executor:, mapped verbatim (absent = 'agent')
+  "modifier": "standard",  // modifier used for this offer; absent when unmodified
   "consumes": { "plan": { /* the accepted input value */ } },
   "owes": [                // the feedback channel
     { "path": "pr", "judgmentRejects": 2, "schemaRejects": 0,
@@ -3060,7 +3090,7 @@ A worker first **resolves the reference**: the `(defDigest, step, key)`
 boundary maps the order to the exact authored instructions from the worker's
 trusted local definition source — the same resolver the embedded engine and
 the CLI use. Resolution returns the authored `prompt` (with
-`${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MAX_ATTEMPTS}`
+`${WORKFLOW}`/`${RUN}`/`${STEP}`/`${KEY}`/`${INDEX}`/`${MODIFIER}`/`${MAX_ATTEMPTS}`
 materialized), the authored `command` if the step has one, and nothing
 fabricated. If the worker's source does not know the digest — the definition
 was never delivered, or the current on-disk definition no longer matches the

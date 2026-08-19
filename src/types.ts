@@ -86,6 +86,8 @@ export interface ReasonEntry {
   text: string;
   /** version the artifact was at when this entry was written (provenance) */
   fromVersion?: number;
+  /** Machine-readable correction supplied when rejecting a bound artifact. */
+  requested?: string;
 }
 
 /**
@@ -356,14 +358,18 @@ export interface WorkflowData {
   params?: Record<string, string>;
   /**
    * The ONE modifier this run carries, validated against the def's declared
-   * `modifiers` set when the run is created and immutable thereafter — no
-   * step, worker or judge can write it (only `start_run` sets it; escalation
-   * overrides it per-offer without changing it here).
+   * `modifiers` set when the run is created. The starter supplies the initial
+   * value; after that, only the engine may replace it while accepting an
+   * artifact whose def-declared bind targets `modifier`. No step, worker, or
+   * judge writes it directly; escalation still overrides it per-offer without
+   * changing the stored value.
    *
    * Absent = an unmodified run: every step is offered on bare capabilities.
    * Deletes with the run, like the rest of the row.
    */
   modifier?: string;
+  /** Engine-written, non-routing metadata populated by artifact binds. */
+  meta?: Record<string, unknown>;
   /** Instance-to-definition pinning (§28): the compiled def this instance was
    *  created against, snapshotted verbatim as JSON. Absent on rows created
    *  before this feature shipped — those instances fall back to today's
@@ -412,6 +418,12 @@ export interface GroupDef {
   of: string[];
 }
 
+/** A normalized artifact-to-instance routing write declared on a produce. */
+export interface ArtifactBind {
+  to: string;
+  from: string;
+}
+
 /** A parsed produce declaration. */
 export interface ProducePattern {
   raw: string;
@@ -421,6 +433,8 @@ export interface ProducePattern {
   suffix: string;
   /** optional JSON Schema the produced value must satisfy at commit time (§19) */
   schema?: JsonSchema;
+  /** Optional normalized artifact-to-instance write applied on acceptance. */
+  bind?: ArtifactBind;
   /** §6/§18 per-produce override of the step's maxAttempts (judgment-reject
    *  stall cap). Falls back to the owning step's maxAttempts when absent —
    *  see model.ts effectiveMaxAttempts(). Only meaningful on {name,...}

@@ -1579,7 +1579,7 @@ export const COMMAND_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> = new Map
   ['green', cmdOpts('value', 'terminal')],
   ['emit', cmdOpts('items')],
   ['seal', cmdOpts('value')],
-  ['reject', cmdOpts('by', 'text')],
+  ['reject', cmdOpts('by', 'text', 'requested')],
   ['retract', cmdOpts('by', 'text')],
   ['skip', cmdOpts('by', 'text')],
   ['retry', cmdOpts('by', 'text', 'hub')],
@@ -2602,8 +2602,9 @@ function dispatch(command: string, io: CliIO, args: Args): number {
         const path = need(args, 2, 'path');
         const by = needOpt(args, 'by');
         const text = needOpt(args, 'text');
-        const rejectRes = engine.reject(wf, path, by, text);
-        print(io, { ok: true, action: 'reject', path, outcome: rejectRes.outcome });
+				const requested = last(args, 'requested');
+				const rejectRes = engine.reject(wf, path, by, text, requested);
+				print(io, { ok: true, action: 'reject', path, outcome: rejectRes.outcome, ...(requested !== undefined ? { requested } : {}) });
         // §24.4/§4.6: a judge's reject can itself be born-rejected by the CAS
         // guard (stale verdict against a submission that already moved on) —
         // mirror the 'green' handler above: that is a failure, not a success,
@@ -7814,11 +7815,15 @@ export async function mainAsync(argv: string[], io: CliIO = defaultIO()): Promis
   // roles own their option grammars, including repeated/value forms that the
   // engine parser must not consume. These dynamic imports are cold-start
   // boundaries: ordinary root commands never evaluate execution adapters.
-  if (argv[0] === 'work' || argv[0] === 'shift') {
+  if (argv[0] === 'work' || argv[0] === 'shift' || argv[0] === 'util') {
     try {
       if (argv[0] === 'work') {
         const { mainAsync: runWork } = await import('../packages/work/src/main.ts');
         return await runWork(argv.slice(1));
+      }
+      if (argv[0] === 'util') {
+				const { mainAsync: runWork } = await import('../packages/work/src/main.ts');
+				return await runWork(['util', ...argv.slice(1)]);
       }
       const { run: runShift } = await import('../packages/work/src/roles/shift.ts');
       return await runShift(argv.slice(1));

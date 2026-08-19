@@ -307,7 +307,7 @@ test('buildDef rejects consumes that are not a list of strings', () => {
 test('buildDef rejects a produce entry that is neither a string nor a { name, schema }', () => {
   assert.throws(
     () => buildDef({ name: 'bad', inputs: [{ name: 'a' }], steps: [{ name: 'x', consumes: ['a'], produces: [42] }] }),
-    /must be a string or a \{ name, schema, judges, maxAttempts, maxSchemaFailures \} mapping/,
+    /must be a string or a \{ name, schema, judges, maxAttempts, maxSchemaFailures, bind \} mapping/,
   );
 });
 
@@ -1504,7 +1504,7 @@ test('generates: invalid entry (non-string/non-object) throws DefError', () => {
       inputs: [{ name: 'q' }],
       steps: [{ name: 'a', consumes: ['q'], generates: [42], terminal: true }],
     }),
-    (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema, judges, maxAttempts, maxSchemaFailures \} mapping/.test((e as Error).message),
+    (e: unknown) => e instanceof DefError && /must be a string or a \{ name, schema, judges, maxAttempts, maxSchemaFailures, bind \} mapping/.test((e as Error).message),
   );
 });
 
@@ -3174,6 +3174,140 @@ test('a def WITHOUT modifiers: still accepts a capability-silent command step (c
     ],
   });
   assert.equal(d.steps[0]!.capabilities, undefined);
+});
+
+test('produce bind normalizes scalar and mapping forms', () => {
+  const d = parseDef({
+    name: 'bound',
+    modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [{
+      name: 'init',
+      consumes: ['proposal'],
+      capabilities: ['utility'],
+      produces: [
+				{ name: 'modifier', bind: 'modifier' },
+				{ name: 'dossier', bind: { to: 'meta.customer', from: 'payload.customerId' } },
+      ],
+    }],
+  });
+  assert.deepEqual(d.steps[0]!.produces[0]!.bind, { to: 'modifier', from: 'value' });
+  assert.deepEqual(d.steps[0]!.produces[1]!.bind, { to: 'meta.customer', from: 'payload.customerId' });
+});
+
+test('produce bind rejects invalid targets, paths, duplicate modifier writers, and undeclared modifiers', () => {
+  const base = {
+    name: 'bound',
+    inputs: [{ name: 'proposal' }],
+    steps: [{ name: 'init', consumes: ['proposal'], produces: [{ name: 'out', bind: 'modifier' }] }],
+  };
+  assert.throws(
+    () => parseDef(base),
+    (e: unknown) => e instanceof DefError && /binds modifier but workflow 'bound' declares no modifiers/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({
+      ...base,
+      modifiers: ['deep'],
+      steps: [{ name: 'init', consumes: ['proposal'], produces: [{ name: 'out', bind: { to: 'meta.', from: 'payload..value' } }] }],
+    }),
+    (e: unknown) => e instanceof DefError && /bind.to 'meta.'/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({
+      ...base,
+      modifiers: ['deep'],
+      steps: [{
+				name: 'init',
+				consumes: ['proposal'],
+				produces: [{ name: 'one', bind: 'modifier' }, { name: 'two', bind: 'modifier' }],
+      }],
+    }),
+    (e: unknown) => e instanceof DefError && /binds modifier more than once/.test(e.message),
+  );
+  assert.throws(
+    () => parseDef({
+      name: 'collection-bind',
+      inputs: [{ name: 'proposal' }],
+      steps: [{
+		name: 'gather',
+		consumes: ['proposal'],
+		produces: [{ name: 'items[]', bind: { to: 'meta.count', from: 'count' } }],
+      }],
+    }),
+    (e: unknown) => e instanceof DefError && /bind is not supported on collection produces/.test(e.message),
+  );
+});
+
+test('calls outcomes reject bind because their acceptance bypasses green()', () => {
+  assert.throws(
+    () => parseDef({
+      name: 'bound-calls',
+      modifiers: ['deep'],
+      inputs: [{ name: 'proposal' }],
+      steps: [{
+				name: 'delegate',
+				calls: 'child',
+				inputs: { proposal: 'proposal' },
+				produces: [{ name: 'outcome', bind: 'modifier' }],
+      }],
+    }),
+    (e: unknown) => e instanceof DefError
+      && /calls: step 'delegate' produce 'outcome' declares bind.*not supported on calls: outcomes/.test(e.message),
+  );
+});
+
+test('lintDef warns capability-bearing branches that are not downstream of a modifier bind', () => {
+  const d = parseDef({
+    name: 'boundlint',
+    modifiers: ['deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [
+      {
+		name: 'init',
+		consumes: ['proposal'],
+		produces: [{ name: 'modifier', bind: 'modifier' }, 'sibling'],
+		capabilities: ['utility'],
+      },
+      { name: 'planner', consumes: ['modifier'], produces: ['plan'], capabilities: ['wise'] },
+      { name: 'sibling-consumer', consumes: ['sibling'], produces: ['sibling-result'], capabilities: ['build'] },
+      { name: 'parallel', consumes: ['proposal'], produces: ['other'], capabilities: ['build'] },
+    ],
+  });
+  const { errors, warnings } = lintDef(d);
+  assert.deepEqual(errors, []);
+  assert.ok(warnings.some((w) => /step 'parallel'.*not downstream of artifact 'modifier'/.test(w)), warnings.join('\n'));
+  assert.ok(warnings.some((w) => /step 'sibling-consumer'.*not downstream of artifact 'modifier'/.test(w)), warnings.join('\n'));
+  assert.ok(!warnings.some((w) => /step 'planner'.*not downstream/.test(w)), warnings.join('\n'));
+  assert.ok(!warnings.some((w) => /step 'init'.*not downstream/.test(w)), warnings.join('\n'));
+});
+
+test('lintDef distinguishes a bound map suffix from sibling and collection lanes', () => {
+  const d = parseDef({
+    name: 'bound-map-lint',
+    modifiers: ['deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [
+      { name: 'gather', consumes: ['proposal'], produces: ['items[]'], capabilities: ['utility'] },
+      {
+				name: 'assess',
+				consumes: ['items[$i]'],
+				produces: [
+					{ name: 'items[$i].analysis', bind: { to: 'meta.analysis', from: 'analysis' } },
+					{ name: 'items[$i].review', bind: 'modifier' },
+				],
+				capabilities: ['utility'],
+      },
+      { name: 'reviewer', consumes: ['items[*].review'], produces: ['review-summary'], capabilities: ['review'] },
+      { name: 'analyst', consumes: ['items[*].analysis'], produces: ['analysis-summary'], capabilities: ['analysis'] },
+      { name: 'collector', consumes: ['items[*]'], produces: ['collected'], capabilities: ['build'] },
+    ],
+  });
+  const { errors, warnings } = lintDef(d);
+  assert.deepEqual(errors, []);
+  assert.ok(!warnings.some((w) => /step 'reviewer'.*not downstream/.test(w)), warnings.join('\n'));
+  assert.ok(warnings.some((w) => /step 'analyst'.*not downstream of artifact 'items\[\$i\]\.review'/.test(w)), warnings.join('\n'));
+  assert.ok(warnings.some((w) => /step 'collector'.*not downstream of artifact 'items\[\$i\]\.review'/.test(w)), warnings.join('\n'));
 });
 
 // ---- judge capability inheritance -------------------------------------------

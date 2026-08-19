@@ -92,7 +92,8 @@
                 },
                 "by": { "type": "string" },
                 "text": { "type": "string" },
-                "fromVersion": { "type": "integer", "minimum": 0 }
+								"fromVersion": { "type": "integer", "minimum": 0 },
+								"requested": { "type": "string" }
               }
             }
           },

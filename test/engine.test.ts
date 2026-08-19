@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Engine, ModifierRefusalError } from '../src/engine.ts';
 import type { Order } from '../src/engine.ts';
-import { buildDef, hashDef } from '../src/defs.ts';
+import { buildDef, hashDef, parseDef } from '../src/defs.ts';
 import { createDefInstructionSource } from '../src/order-resolver.ts';
 import type { OrderInstructionSource } from '../src/order-resolver.ts';
 import { openStore } from '../src/store.ts';
@@ -1772,6 +1772,140 @@ function gradedDef(modifiers?: string[]): WorkflowDef {
     modifiers,
   );
 }
+
+function boundArtifactDef(): WorkflowDef {
+  return parseDef({
+    name: 'bound-artifact',
+    modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [{
+      name: 'init',
+      consumes: ['proposal'],
+      produces: [
+				{ name: 'modifier', bind: { to: 'modifier', from: 'payload.value' } },
+				{ name: 'dossier', bind: { to: 'meta.customer', from: 'payload.customer' } },
+      ],
+      capabilities: ['utility'],
+    }],
+  });
+}
+
+function boundMapArtifactDef(): WorkflowDef {
+  return parseDef({
+    name: 'bound-map-artifact',
+    modifiers: ['standard', 'deep'],
+    inputs: [{ name: 'proposal' }],
+    steps: [
+      {
+		name: 'gather',
+		consumes: ['proposal'],
+		produces: ['items[]'],
+		capabilities: ['utility'],
+      },
+      {
+		name: 'assess',
+		consumes: ['items[$i]'],
+		produces: [
+		  { name: 'items[$i].analysis', bind: { to: 'meta.analysis', from: 'analysis' } },
+		  { name: 'items[$i].review', bind: { to: 'modifier', from: 'modifier' } },
+		],
+		capabilities: ['utility'],
+      },
+    ],
+  });
+}
+
+test('accepted bound artifacts update modifier and metadata with one event per bind', () => {
+  const { engine, store } = makeEngine([boundArtifactDef()]);
+  const wf = engine.createInstance('bound-artifact', { modifier: 'standard' });
+  const init = fire(engine, wf, 'init', 1);
+  const value = { payload: { value: 'deep', customer: 'acme' } };
+  assert.equal(engine.green(wf, init.run, 'modifier', value).outcome, 'green');
+  assert.equal(engine.green(wf, init.run, 'dossier', value).outcome, 'green');
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep');
+  assert.deepEqual(store.getWorkflow(wf)?.meta, { customer: 'acme' });
+  for (const path of ['modifier', 'dossier']) {
+    const events = store.getArtifactHistory(wf, path)?.events.filter((event) => event.action === 'bound') ?? [];
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0]?.metadata, {
+      from: path === 'modifier' ? 'standard' : null,
+      to: path === 'modifier' ? 'deep' : 'acme',
+    });
+  }
+});
+
+test('re-accepted bound artifacts record each routing sync with old and accepted values', () => {
+  const { engine, store } = makeEngine([boundArtifactDef()]);
+  const wf = engine.createInstance('bound-artifact', { modifier: 'standard' });
+  const initial = fire(engine, wf, 'init', 1);
+  assert.equal(engine.green(wf, initial.run, 'modifier', { payload: { value: 'deep' } }).outcome, 'green');
+  assert.equal(engine.green(wf, initial.run, 'dossier', { payload: { customer: 'acme' } }).outcome, 'green');
+  engine.close(wf, initial.run);
+
+  assert.equal(engine.reject(wf, 'modifier', 'human', 'try the default again').outcome, 'rejected');
+  const retry = fire(engine, wf, 'init', 2);
+  assert.equal(engine.green(wf, retry.run, 'modifier', { payload: { value: 'standard' } }).outcome, 'green');
+
+  const events = store.getArtifactHistory(wf, 'modifier')?.events.filter((event) => event.action === 'bound') ?? [];
+  assert.equal(events.length, 2);
+  assert.deepEqual(events.map((event) => event.metadata), [
+    { from: 'standard', to: 'deep' },
+    { from: 'deep', to: 'standard' },
+  ]);
+});
+
+test('a map output applies only its own bind when sibling map outputs share a stem', () => {
+  const { engine, store } = makeEngine([boundMapArtifactDef()]);
+  const wf = engine.createInstance('bound-map-artifact', {
+    modifier: 'standard',
+    provide: { proposal: { text: 'evaluate' } },
+  });
+  const gather = fire(engine, wf, 'gather', 1);
+  engine.emit(wf, gather.run, [{ value: { source: 'one' } }]);
+  engine.seal(wf, gather.run, {});
+  engine.close(wf, gather.run);
+
+  const assess = fire(engine, wf, 'assess', 2);
+  assert.deepEqual(assess.outputs, ['items[0].analysis', 'items[0].review']);
+  assert.equal(
+    engine.green(wf, assess.run, 'items[0].review', { modifier: 'deep', analysis: 'wrong-target' }).outcome,
+    'green',
+  );
+  assert.equal(store.getWorkflow(wf)?.modifier, 'deep');
+  assert.equal(store.getWorkflow(wf)?.meta, undefined);
+
+  assert.equal(
+    engine.green(wf, assess.run, 'items[0].analysis', { modifier: 'standard', analysis: 'verified' }).outcome,
+    'green',
+  );
+  assert.deepEqual(store.getWorkflow(wf)?.meta, { analysis: 'verified' });
+});
+
+test('invalid bound modifier is schema-rejected for producers and refused for human acceptance', () => {
+  const { engine, store } = makeEngine([boundArtifactDef()]);
+  const wf = engine.createInstance('bound-artifact', { modifier: 'standard' });
+  const init = fire(engine, wf, 'init', 1);
+  const rejected = engine.green(wf, init.run, 'modifier', { payload: { value: 'two words' } });
+  assert.equal(rejected.outcome, 'schema-rejected');
+  assert.equal(store.getWorkflow(wf)?.modifier, 'standard');
+  assert.throws(
+    () => engine.green(wf, 'human', 'modifier', { payload: { value: 'not-declared' } }),
+    ModifierRefusalError,
+  );
+});
+
+test('requested modifier feedback is validated and retained on bound-artifact rejection', () => {
+  const { engine, store } = makeEngine([boundArtifactDef()]);
+  const wf = engine.createInstance('bound-artifact', { modifier: 'standard' });
+  const init = fire(engine, wf, 'init', 1);
+  engine.green(wf, init.run, 'modifier', { payload: { value: 'standard' } });
+  engine.reject(wf, 'modifier', 'human', 'use deeper review', 'deep');
+  assert.equal(store.getArtifact(wf, 'modifier')?.reasons.at(-1)?.requested, 'deep');
+  assert.throws(
+    () => engine.reject(wf, 'modifier', 'human', 'bad request', 'two words'),
+    ModifierRefusalError,
+  );
+});
 
 test('createInstance stores a declared modifier on the run record', () => {
   const { engine, store } = makeEngine([gradedDef(['express', 'deep'])]);

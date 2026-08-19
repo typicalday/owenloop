@@ -316,6 +316,7 @@ export interface ReasonEntry {
   by: string;
   text: string;
   fromVersion?: number;
+  requested?: string;
 }
 
 export interface GetOrderResponse extends HubResponse {

@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS workflow (
   title       TEXT,
   params      TEXT NOT NULL DEFAULT '{}',
   modifier    TEXT,
+  meta        TEXT,
   created_at  INTEGER NOT NULL
 );
 
@@ -193,8 +194,11 @@ CREATE TABLE IF NOT EXISTS meta (
  * nullable `modifier` column (see `migrate()`). Additive and un-backfilled —
  * NULL on every existing row means "unmodified run", which is the correct
  * reading of an instance created before modifiers existed.
+ *
+ * Bumped to '11' for bound artifacts: the `workflow` table gains nullable
+ * JSON `meta` for non-routing `meta.<key>` artifact binds.
  */
-const SCHEMA_VERSION = '10';
+const SCHEMA_VERSION = '11';
 
 /** Thrown by the `Store` constructor when the on-disk `schema_version` is
  *  newer than this binary's `SCHEMA_VERSION` — the operator needs to
@@ -437,6 +441,7 @@ interface WorkflowRowRaw {
   def_snapshot: string | null;
   def_hash: string | null;
   modifier: string | null;
+  meta: string | null;
   created_at: number;
 }
 
@@ -462,6 +467,12 @@ function mapWorkflow(r: WorkflowRowRaw): WorkflowRow {
   // never to an empty string — 'unmodified run' and 'modifier ""' must not
   // become the same thing downstream, where '' would compose 'build:'.
   if (r.modifier !== null) out.modifier = r.modifier;
+  const meta = fromJson<Record<string, unknown> | undefined>(r.meta, undefined, {
+    table: 'workflow',
+    id: r.id,
+    column: 'meta',
+  });
+  if (meta !== undefined) out.meta = meta;
   return out;
 }
 
@@ -625,13 +636,17 @@ export class Store {
     if (!wfCols.some((c) => c.name === 'def_hash')) {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN def_hash TEXT`);
     }
-    // Routing modifier: the ONE modifier this instance carries, set once at
-    // creation and never written again. NULL on every pre-existing row, which
-    // is exactly right — an instance created before modifiers existed is an
-    // unmodified run and every step is offered on bare capabilities. No
+    // Routing modifier: the ONE modifier this instance carries. The starter
+    // supplies its initial value; a def-declared artifact bind may later update
+    // it through the engine's routing writer. NULL on every pre-existing row,
+    // which is exactly right — an instance created before modifiers existed is
+    // an unmodified run and every step is offered on bare capabilities. No
     // backfill: there is no value to invent.
     if (!wfCols.some((c) => c.name === 'modifier')) {
       this.db.exec(`ALTER TABLE workflow ADD COLUMN modifier TEXT`);
+    }
+    if (!wfCols.some((c) => c.name === 'meta')) {
+      this.db.exec(`ALTER TABLE workflow ADD COLUMN meta TEXT`);
     }
 
     // Only a genuine pre-v8 -> v8 upgrade may backfill the current projection's
@@ -697,8 +712,8 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO workflow
-           (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, modifier, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					 (id, def, title, params, produced_by_wf, produced_by_path, def_snapshot, def_hash, modifier, meta, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -710,6 +725,7 @@ export class Store {
         toJson(data.defSnapshot),
         data.defHash ?? null,
         data.modifier ?? null,
+				toJson(data.meta),
         at,
       );
     return this.getWorkflow(id) as WorkflowRow;
@@ -724,6 +740,25 @@ export class Store {
     this.db
       .prepare('UPDATE workflow SET def_snapshot = ?, def_hash = ? WHERE id = ?')
       .run(JSON.stringify(snapshot), hash, id);
+  }
+
+  /** Apply an engine-authored routing patch without rewriting authored params. */
+  setWorkflowRouting(id: string, patch: { modifier?: string; meta?: Record<string, unknown> }): void {
+    const assignments: string[] = [];
+    const values: string[] = [];
+    if (patch.modifier !== undefined) {
+      assignments.push('modifier = ?');
+      values.push(patch.modifier);
+    }
+    if (patch.meta !== undefined) {
+      const current = this.getWorkflow(id);
+      if (current === undefined) throw new Error(`cannot update routing for unknown workflow '${id}'`);
+      assignments.push('meta = ?');
+      values.push(JSON.stringify({ ...(current.meta ?? {}), ...patch.meta }));
+    }
+    if (assignments.length === 0) return;
+    values.push(id);
+    this.db.prepare(`UPDATE workflow SET ${assignments.join(', ')} WHERE id = ?`).run(...values);
   }
 
   getWorkflow(id: string): WorkflowRow | undefined {

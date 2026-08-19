@@ -243,6 +243,44 @@ function deliverConsumes(
   }
 }
 
+/**
+ * Deliver the owed-artifact reason threads to a command child. The same
+ * inline-or-file collision rule as consumes applies: a nested command must
+ * never inherit stale feedback from its parent order.
+ */
+function deliverFeedback(
+  childEnv: Record<string, string | undefined>,
+  feedback: Array<{ path: string; reasons: unknown[] }> | undefined,
+): string | undefined {
+  if (feedback === undefined) {
+    delete childEnv['OWENLOOP_FEEDBACK'];
+    delete childEnv['OWENLOOP_FEEDBACK_FILE'];
+    return undefined;
+  }
+  let json: string;
+  try {
+    json = JSON.stringify(feedback);
+  } catch (e) {
+    throw new Error(`cannot serialize the order's feedback for OWENLOOP_FEEDBACK: ${errMsg(e)}`);
+  }
+  if (Buffer.byteLength(json, 'utf8') <= CONSUMES_INLINE_MAX_BYTES) {
+    childEnv['OWENLOOP_FEEDBACK'] = json;
+    delete childEnv['OWENLOOP_FEEDBACK_FILE'];
+    return undefined;
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'owenloop-consumes-'));
+  try {
+    const file = join(dir, 'feedback.json');
+    writeFileSync(file, json, { encoding: 'utf8', mode: 0o600 });
+    childEnv['OWENLOOP_FEEDBACK_FILE'] = file;
+    delete childEnv['OWENLOOP_FEEDBACK'];
+    return dir;
+  } catch (e) {
+    removeConsumesDir(dir);
+    throw e;
+  }
+}
+
 /** Best-effort removal of an overflow directory; a cleanup failure never fails a step. */
 function removeConsumesDir(dir: string | undefined): void {
   if (dir === undefined) return;
@@ -733,6 +771,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     // no receipt — but it is not a guarantee to build on. Do not add work here
     // that assumes the child is gone.
     let consumesDir: string | undefined;
+    let feedbackDir: string | undefined;
     try {
       let cmd: RunningCommand;
       try {
@@ -755,6 +794,12 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         childEnv['OWENLOOP_WORKFLOW'] = workflow;
         childEnv['OWENLOOP_RUN'] = runId;
         consumesDir = deliverConsumes(childEnv, order.consumes);
+				const feedback = order.owes
+					.filter((owe) => owe.reasons.length > 0)
+					.map((owe) => ({ path: owe.path, reasons: owe.reasons }));
+				feedbackDir = deliverFeedback(childEnv, feedback.length > 0 ? feedback : undefined);
+				if (order.modifier === undefined) delete childEnv['OWENLOOP_MODIFIER'];
+				else childEnv['OWENLOOP_MODIFIER'] = order.modifier;
         // The order carries no workdir when the step declared neither `workdir:`
         // nor `workdirFrom:` (the hub resolves `workdirFrom` and ships the
         // result, so an absent field IS that signal). Substituting the shift's
@@ -816,6 +861,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       return submitReceipt(outcome.r, order, resolvedCommand);
     } finally {
       removeConsumesDir(consumesDir);
+      removeConsumesDir(feedbackDir);
     }
   }
 

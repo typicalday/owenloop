@@ -33,6 +33,7 @@ const ROLES: Record<string, RoleLoader> = {
   join: () => import('./roles/join.ts'),
   sessions: () => import('./roles/sessions.ts'),
   approvals: () => import('./roles/approvals.ts'),
+  util: () => import('./roles/util.ts'),
 };
 
 export async function mainAsync(argv: string[]): Promise<number> {

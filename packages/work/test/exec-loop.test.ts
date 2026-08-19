@@ -75,6 +75,8 @@ interface OrderOpts {
   owes?: string[];
   claimed?: boolean;
   outcome?: string;
+  modifier?: string;
+  reasons?: Array<{ at: number; action: string; kind: string; by: string; text: string; requested?: string }>;
 }
 
 const testCommands = new Map<string, string>();
@@ -98,12 +100,13 @@ function commandOrder(o: OrderOpts = {}): GetOrderResponse {
       outputs: [],
       ...(o.workdir !== undefined ? { workdir: o.workdir } : {}),
       worker: o.worker ?? 'command',
+      ...(o.modifier !== undefined ? { modifier: o.modifier } : {}),
       ...(o.judge !== undefined ? { judge: o.judge } : {}),
       defDigest,
       consumes: {},
       // `version` is the hub-issued TARGET for the next commit, so a
       // never-produced output's first target is 1, not 0.
-      owes: paths.map((path) => ({ path, version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: [] })),
+      owes: paths.map((path) => ({ path, version: 1, judgmentRejects: 0, schemaRejects: 0, reasons: o.reasons ?? [] })),
     },
     lease: { claimed: o.claimed ?? true, ...(o.outcome !== undefined ? { outcome: o.outcome } : {}) },
   };
@@ -500,6 +503,62 @@ test('an order with no consumed inputs still gets OWENLOOP_CONSUMES holding {}',
   const { env } = await envForOrder(response);
   assert.equal(env['OWENLOOP_CONSUMES'], '{}');
   assert.equal('OWENLOOP_CONSUMES_FILE' in env, false);
+});
+
+test('command children receive modifier and structured feedback, while first attempts clear stale values', async () => {
+  const reason = {
+    at: 1,
+    action: 'reject',
+    kind: 'judgment',
+    by: 'planner',
+    text: 'needs deeper review',
+    requested: 'deep',
+  };
+  const delivered = await envForOrder(commandOrder({ modifier: 'deep', reasons: [reason] }));
+  assert.equal(delivered.env['OWENLOOP_MODIFIER'], 'deep');
+  assert.deepEqual(JSON.parse(delivered.env['OWENLOOP_FEEDBACK']!), [{ path: 'out', reasons: [reason] }]);
+  assert.equal('OWENLOOP_FEEDBACK_FILE' in delivered.env, false);
+
+  const savedModifier = process.env['OWENLOOP_MODIFIER'];
+  const savedFeedback = process.env['OWENLOOP_FEEDBACK'];
+  const savedFeedbackFile = process.env['OWENLOOP_FEEDBACK_FILE'];
+  process.env['OWENLOOP_MODIFIER'] = 'stale';
+  process.env['OWENLOOP_FEEDBACK'] = 'stale';
+  process.env['OWENLOOP_FEEDBACK_FILE'] = '/parent/feedback.json';
+  try {
+    const first = await envForOrder(commandOrder());
+    assert.equal('OWENLOOP_MODIFIER' in first.env, false);
+    assert.equal('OWENLOOP_FEEDBACK' in first.env, false);
+    assert.equal('OWENLOOP_FEEDBACK_FILE' in first.env, false);
+  } finally {
+    if (savedModifier === undefined) delete process.env['OWENLOOP_MODIFIER'];
+    else process.env['OWENLOOP_MODIFIER'] = savedModifier;
+    if (savedFeedback === undefined) delete process.env['OWENLOOP_FEEDBACK'];
+    else process.env['OWENLOOP_FEEDBACK'] = savedFeedback;
+    if (savedFeedbackFile === undefined) delete process.env['OWENLOOP_FEEDBACK_FILE'];
+    else process.env['OWENLOOP_FEEDBACK_FILE'] = savedFeedbackFile;
+  }
+});
+
+test('large command feedback follows the same file-delivery convention as consumes', async () => {
+  const fr = fakeRunner();
+  const { hub } = mockHub({
+    getOrder: [commandOrder({
+      reasons: [{ at: 1, action: 'reject', kind: 'judgment', by: 'planner', text: 'x'.repeat(CONSUMES_INLINE_MAX_BYTES), requested: 'deep' }],
+    })],
+    submit: ['green'],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const running = loop.run();
+  await macrotaskSleep();
+  const env = fr.starts[0]!.env ?? {};
+  assert.equal('OWENLOOP_FEEDBACK' in env, false);
+  assert.deepEqual(
+    JSON.parse(readFileSync(env['OWENLOOP_FEEDBACK_FILE']!, 'utf8')),
+    [{ path: 'out', reasons: [{ at: 1, action: 'reject', kind: 'judgment', by: 'planner', text: 'x'.repeat(CONSUMES_INLINE_MAX_BYTES), requested: 'deep' }] }],
+  );
+  fr.resolve(result(0));
+  assert.equal(await running, 'submitted');
 });
 
 test('a declared input that was never produced stays an omitted key, never a null', async () => {

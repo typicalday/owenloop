@@ -388,6 +388,7 @@ export const ORDER_REASON_FIELDS = {
   by: 'required',
   text: 'required',
   fromVersion: 'optional',
+  requested: 'optional',
 } as const satisfies FieldManifest<Order['owes'][number]['reasons'][number]>;
 
 /** Bind every record definition in this package to a frozen DSSE media type. */
