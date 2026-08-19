@@ -2423,6 +2423,39 @@ test('a release failure is observable without interrupting dispatch', async () =
   );
 });
 
+test('a rate-limited release backs off later hub polling', async () => {
+  cacheBuilderStep();
+  let monotonic = 0;
+  const events: import('../src/shift/protocol.ts').ShiftEvent[] = [];
+  const { hub, calls } = mockHub({
+    wake: [{ changed: true, cursor: 1 }],
+    perWf: agentWf([wo('run_first', 'builder'), wo('run_second', 'builder')]),
+    releaseError: new HubError(429, 'slow down', 'rate_limited', 23_000),
+  });
+  const { spawner, spawns } = fakeSpawner();
+  const loop = createShiftLoop(baseOpts(hub, spawner, {
+    workflow: 'wf1',
+    cap: 1,
+    monotonicNow: () => monotonic,
+    onEvent: (event) => events.push(event),
+  }));
+
+  await loop.iterate();
+  await Promise.resolve();
+  await Promise.resolve();
+  const callsBeforeBackoff = calls.length;
+
+  monotonic = 1;
+  await loop.iterate();
+
+  assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
+  assert.equal(calls.length, callsBeforeBackoff, 'a release Retry-After suppresses later hub polling');
+  assert.equal(
+    events.some((event) => event.type === 'hub-error' && event.op === 'release'),
+    true,
+  );
+});
+
 test('a re-offer with a live child is never released', async () => {
   cacheBuilderStep();
   writeChildRecord(stateDir, {
@@ -2647,9 +2680,9 @@ test('persisted child timestamps use wall time rather than the monotonic clock',
   assert.equal(readChildRecords(stateDir)[0]?.spawnedAt, 123_456_789);
 });
 
-test('a queued claim is released when its local hold expires', async () => {
+test('queued claims release at their hold deadline even while capacity remains saturated', async () => {
   cacheBuilderStep();
-  const orders = [wo('run_first', 'builder'), wo('run_stale', 'builder')];
+  const orders = [wo('run_first', 'builder'), wo('run_stale', 'builder'), wo('run_stale_2', 'builder')];
   const { hub, calls } = mockHub({
     wake: [
       { changed: true, cursor: 1 },
@@ -2684,7 +2717,6 @@ test('a queued claim is released when its local hold expires', async () => {
   assert.equal(await loop.iterate(), 1);
   assert.deepEqual(spawns.map((spawn) => spawn.run), ['run_first']);
 
-  alive.delete(1000);
   monotonic = 30_000;
 
   assert.equal(await loop.iterate(), 0);
@@ -2693,10 +2725,11 @@ test('a queued claim is released when its local hold expires', async () => {
   assert.equal(count(calls, 'whats_next'), 1, 'classifying the stale local candidate does not require another hub sweep');
   assert.deepEqual(calls.filter((call) => call.verb === 'release').map((call) => call.arg), [
     { workflow: 'wf1', run: 'run_stale' },
+    { workflow: 'wf1', run: 'run_stale_2' },
   ]);
   assert.equal(
-    events.some((event) => event.type === 'order-dropped' && event.reason === 'claim-expired'),
-    true,
+    events.filter((event) => event.type === 'order-dropped' && event.reason === 'claim-expired').length,
+    2,
   );
 });
 

@@ -578,6 +578,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
    */
   function releaseClaim(workflow: string, run: string): void {
     void opts.hub.release({ workflow, run }).catch((e) => {
+      noteServerBackoff(e);
       const message = errMsg(e);
       opts.err(
 		`[${workflow}/${run}] release failed: ${message} — leaving the hub pickup window to re-offer it`,
@@ -829,7 +830,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
   /** Dispatch already-claimed orders when local child capacity becomes free. */
   function drainPending(live: ChildRecord[], reserved: ChildReservation[]): number {
     let remaining = cap - live.length - reserved.length;
-    if (remaining <= 0 || pendingCandidates.size === 0) return 0;
+    if (pendingCandidates.size === 0) return 0;
 
     const { ceiling } = agentLane();
     let agentRoom = ceiling -
@@ -839,7 +840,6 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     let dispatched = 0;
 
     for (const [run, candidate] of pendingCandidates) {
-      if (remaining <= 0) break;
       if (discardExpiredCandidate(candidate, true)) {
 	pendingCandidates.delete(run);
 	continue;
@@ -848,6 +848,9 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	pendingCandidates.delete(run);
 	continue;
       }
+      // Even at full capacity, keep scanning so a configured local hold is a
+      // real deadline rather than one deferred until another child exits.
+      if (remaining <= 0) continue;
       // The agent lane's second budget can be full while the dispatch cap still
       // has room. Skip this entry and KEEP it queued (a command entry further
       // down the map is still dispatchable) — `continue`, never `break`, so one
@@ -855,8 +858,14 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       if (candidate.kind === 'agent' && agentRoom <= 0) continue;
 
       const result = dispatchCandidate(candidate);
-      if (result === 'total-capacity') break;
-      if (result === 'agent-capacity') continue;
+      if (result === 'total-capacity') {
+	remaining = 0;
+	continue;
+      }
+      if (result === 'agent-capacity') {
+	agentRoom = 0;
+	continue;
+      }
       pendingCandidates.delete(run);
       if (result !== 'dispatched') continue;
 
