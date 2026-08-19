@@ -68,7 +68,9 @@ test('USAGE documents the agent and exec budgets, and no deleted stamp-path knob
   assert.match(USAGE, /default 4; else settings\.maxConcurrentAgents/);
   assert.match(USAGE, /--exec-reserve <n>/);
   assert.match(USAGE, /default 1; else settings\.execReserve; 0 disables/);
-  assert.match(USAGE, /maxConcurrentAgents, execReserve, workRoot/);
+  assert.match(USAGE, /--local-queue-hold <ms>/);
+  assert.match(USAGE, /default 0; else\s+settings\.localQueueHoldMs; capped at 90000/);
+  assert.match(USAGE, /maxConcurrentAgents, execReserve, localQueueHoldMs, workRoot/);
   // Phase 5 deleted the stamp path; its flags, env var, and settings keys must
   // not survive in the one place operators read to learn what exists.
   for (const gone of ['--runner-dispatch', '--no-stamp', '--settle-margin', '--agents-dir', 'OWENLOOP_AGENTS_DIR', 'runnerDispatch', 'agentsDir']) {

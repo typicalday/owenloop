@@ -97,6 +97,11 @@ export interface Settings {
    */
   execReserve?: number;
   /**
+   * How long a shift may retain an undispatchable claim locally before
+   * returning it to the hub. Default 0: never retain it locally.
+   */
+  localQueueHoldMs?: number;
+  /**
    * Phase 4 — the root under which per-RUN agent working directories live.
    *
    * An `agent-run` child works in `<workRoot>/<workflow>/<run>/`, created on
@@ -165,6 +170,7 @@ export const KNOWN_SETTINGS_KEYS = [
   'artifactPolicy',
   'maxConcurrentAgents',
   'execReserve',
+  'localQueueHoldMs',
   'workRoot',
   'workRepo',
   'allowedWorkdirRoots',
@@ -274,6 +280,12 @@ export function validateSettings(raw: unknown, path: string): ValidatedSettings 
     const v = obj['execReserve'];
     if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
       throw bad('execReserve', 'a non-negative integer', v);
+    }
+  }
+  if ('localQueueHoldMs' in obj) {
+    const v = obj['localQueueHoldMs'];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+      throw bad('localQueueHoldMs', 'a non-negative integer', v);
     }
   }
   if ('allowedWorkdirRoots' in obj) {

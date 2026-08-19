@@ -195,7 +195,7 @@ holds `credentials.json`, `allowed_signers`, `org-root.pub`, `grants/`, and
 
 ```text
 owenloop shift start <crew...> [--all] [--origin <url>] [--as <account>] [--name <n>]
-[--cap <n>] [--max-agents <n>] [--exec-reserve <n>] [--poll-interval <ms>] [--once]
+[--cap <n>] [--max-agents <n>] [--exec-reserve <n>] [--local-queue-hold <ms>] [--poll-interval <ms>] [--once]
 [--cache-dir <p>] [--state-dir <p>] [--log-dir <p>] [--log-max-age <ms>]
 [--work-root <dir>]...
 ```
@@ -214,6 +214,7 @@ one loop sweep and exits instead of keeping the foreground daemon running.
 | `--cap <n>` | dispatch capacity; precedence is flag, then `settings.dispatchCap`, then `3` |
 | `--max-agents <n>` | concurrent agent limit; precedence is flag, then `settings.maxConcurrentAgents`, then `4` |
 | `--exec-reserve <n>` | slots inside `--cap` that `agent-run` children may never occupy, so an exec/command order always has room; precedence is flag, then `settings.execReserve`, then `1`. Clamped to `cap - 1`, so a `--cap 1` shift gets no reserve. `0` disables the reserve and lets agents fill the whole cap. This does not raise the total child ceiling — `--cap` still bounds every child. |
+| `--local-queue-hold <ms>` | how long to retain a claim this shift cannot dispatch before returning it to the hub; precedence is flag, then `settings.localQueueHoldMs`, then `0`. The value is clamped to 90 seconds. `0` means the shift never holds an undispatchable claim locally, so another daemon can be offered it immediately. |
 | `--poll-interval <ms>` | loop polling interval; defaults to `5000` milliseconds |
 | `--once` | run one loop sweep and exit; without it, keep the daemon in the foreground |
 | `--cache-dir <p>` | cache root; precedence is flag, then `OWENLOOP_CACHE_DIR`, then `settings.cacheDir`, then `$XDG_CACHE_HOME/owenloop`, then `$HOME/.cache/owenloop` |
@@ -456,7 +457,7 @@ either `exec` or `agent-run`:
 - `reaped`: `{ "type": "reaped", "workflow": "...", "run": "...", "kind": "exec", "pid": 123 }`
 - `failed`: `{ "type": "failed", "workflow": "...", "run": "...", "step": "...", "kind": "exec", "message": "..." }`
 - `bundle-miss`: `{ "type": "bundle-miss", "workflow": "...", "def": "..." }` — a legacy order named a def with no cached bundle, so it was left for hub pickup
-- `order-dropped`: `{ "type": "order-dropped", "workflow": "...", "run": "...", "step": "...", "reason": "unsupported-worker", "message": "..." }` — the shift refused one order. Match on `reason` (`malformed-digest`, `malformed-worker`, `unsupported-worker`, `verification-failed`, `metadata-unavailable`, `agent-lane-closed`); display `message`. `agent-lane-closed` means the shift's effective agent ceiling is structurally zero, so it leaves the claim for the hub pickup window instead of holding work it cannot run.
+- `order-dropped`: `{ "type": "order-dropped", "workflow": "...", "run": "...", "step": "...", "reason": "unsupported-worker", "message": "..." }` — the shift refused one order. Match on `reason` (`malformed-digest`, `malformed-worker`, `unsupported-worker`, `verification-failed`, `metadata-unavailable`, `agent-lane-closed`, `dispatch-cap-full`, `agent-cap-full`, `claim-expired`); display `message`. The capacity, expiry, and `agent-lane-closed` reasons return the claim to the hub; malformed and unsupported reasons leave it for the pickup window.
 - `ended`: `{ "type": "ended" }`, delivered to a parked `next` when `shift end` explicitly shuts down the daemon
 
 Every event above is also appended to `<log-dir>/shift.log` as JSON Lines, which

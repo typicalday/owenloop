@@ -42,12 +42,15 @@ test('parseNextArgs defaults to 90 seconds and converts finite non-negative seco
   assert.match(parseNextArgs(['--bogus']).error!, /unknown option/);
 });
 
-test('state-dir and start parser preserve explicit crews, exec reserve, and reject no crews', () => {
+test('state-dir and start parser preserve explicit crews, queue hold, exec reserve, and reject no crews', () => {
   assert.deepEqual(parseStateDirArgs(['--state-dir=/tmp/state']), { stateDir: '/tmp/state' });
   assert.deepEqual(parseStartArgs(['alpha', 'alpha', ' beta ']).serveCrews, ['alpha', 'beta']);
   assert.equal(parseStartArgs(['alpha', '--exec-reserve', '0']).execReserve, 0);
   assert.equal(parseStartArgs(['alpha', '--exec-reserve=2']).execReserve, 2);
   assert.match(parseStartArgs(['alpha', '--exec-reserve', '-1']).error!, /non-negative integer/);
+  assert.equal(parseStartArgs(['alpha', '--local-queue-hold', '0']).localQueueHoldMs, 0);
+  assert.equal(parseStartArgs(['alpha', '--local-queue-hold=25']).localQueueHoldMs, 25);
+  assert.match(parseStartArgs(['alpha', '--local-queue-hold', '-1']).error!, /non-negative integer/);
   assert.deepEqual(parseStartArgs(['--all']).serveCrews, []);
   assert.match(parseStartArgs([]).error!, /at least one crew.*--all/);
   assert.match(parseStartArgs(['--all', 'alpha']).error!, /cannot be combined/);

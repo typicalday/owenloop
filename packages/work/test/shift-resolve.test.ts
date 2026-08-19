@@ -10,6 +10,7 @@ import {
 	resolveStateDirOverride,
 	resolveMaxConcurrentAgents,
 	resolveExecReserve,
+	resolveLocalQueueHoldMs,
 	resolveShiftName,
 	parseArgs,
 	reconcileStartupState,
@@ -356,6 +357,12 @@ test('resolveExecReserve: --exec-reserve beats settings.execReserve beats the de
   assert.equal(resolveExecReserve(0, 2), 0);
 });
 
+test('resolveLocalQueueHoldMs: flag beats settings.localQueueHoldMs beats the default 0', () => {
+  assert.equal(resolveLocalQueueHoldMs(undefined, undefined), 0);
+  assert.equal(resolveLocalQueueHoldMs(undefined, 2_000), 2_000);
+  assert.equal(resolveLocalQueueHoldMs(0, 2_000), 0);
+});
+
 test('parseArgs reads --max-agents; absent leaves it undefined', () => {
   const on = parseArgs(['--max-agents', '6']);
   assert.equal(on.error, undefined);
@@ -376,6 +383,17 @@ test('parseArgs reads --exec-reserve; absent leaves it undefined', () => {
 
   assert.match(parseArgs(['--exec-reserve', 'abc']).error!, /--exec-reserve must be a non-negative integer/);
   assert.match(parseArgs(['--exec-reserve']).error!, /missing value/);
+});
+
+test('parseArgs reads --local-queue-hold; absent leaves it undefined', () => {
+  const on = parseArgs(['--local-queue-hold', '2000']);
+  assert.equal(on.error, undefined);
+  assert.equal(on.localQueueHoldMs, 2_000);
+  assert.equal(parseArgs(['--local-queue-hold=0']).localQueueHoldMs, 0);
+  assert.equal(parseArgs([]).localQueueHoldMs, undefined);
+
+  assert.match(parseArgs(['--local-queue-hold', 'abc']).error!, /--local-queue-hold must be a non-negative integer/);
+  assert.match(parseArgs(['--local-queue-hold']).error!, /missing value/);
 });
 
 // ---- session-unique shift name (shifts.md §6/§8 item 4) --------------------

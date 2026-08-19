@@ -143,6 +143,7 @@ test('loadSettings: each C6 knob loads with its value', () => {
       commandRouting: 'manual',
       maxConcurrentAgents: 2,
       execReserve: 1,
+      localQueueHoldMs: 1_000,
     }),
   );
   try {
@@ -154,6 +155,7 @@ test('loadSettings: each C6 knob loads with its value', () => {
     assert.equal(s.commandRouting, 'manual');
     assert.equal(s.maxConcurrentAgents, 2);
     assert.equal(s.execReserve, 1);
+    assert.equal(s.localQueueHoldMs, 1_000);
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
@@ -361,6 +363,29 @@ test('loadSettings: execReserve accepts 0 and rejects negative or non-integer va
   }
 });
 
+test('loadSettings: localQueueHoldMs accepts 0 and rejects negative or non-integer values', () => {
+  for (const value of [0, 1, 2]) {
+    const xdg = withSettingsFile(JSON.stringify({ localQueueHoldMs: value }));
+    try {
+      assert.equal(loadSettings({ HOME: xdg }).localQueueHoldMs, value);
+    } finally {
+      rmSync(xdg, { recursive: true, force: true });
+    }
+  }
+  for (const bad of [-1, 1.5, '1']) {
+    const xdg = withSettingsFile(JSON.stringify({ localQueueHoldMs: bad }));
+    try {
+      assert.throws(
+	() => loadSettings({ HOME: xdg }),
+	/'localQueueHoldMs' must be a non-negative integer/,
+	`localQueueHoldMs ${JSON.stringify(bad)} should be rejected`,
+      );
+    } finally {
+      rmSync(xdg, { recursive: true, force: true });
+    }
+  }
+});
+
 /** The deleted stamp-path keys must now read as UNRECOGNIZED, not be silently
  *  accepted — an operator with a stale settings file gets told. */
 test('the deleted stamp-path settings keys are reported as unrecognized', () => {
@@ -373,11 +398,12 @@ test('the deleted stamp-path settings keys are reported as unrecognized', () => 
 });
 
 test('KNOWN_SETTINGS_KEYS carries agent budget knobs, so they are not "unrecognized"', () => {
-  const xdg = withSettingsFile(JSON.stringify({ maxConcurrentAgents: 4, execReserve: 1 }));
+  const xdg = withSettingsFile(JSON.stringify({ maxConcurrentAgents: 4, execReserve: 1, localQueueHoldMs: 0 }));
   try {
     assert.deepEqual(inspectSettings({ HOME: xdg }).unrecognized, []);
     assert.ok(KNOWN_SETTINGS_KEYS.includes('maxConcurrentAgents'));
     assert.ok(KNOWN_SETTINGS_KEYS.includes('execReserve'));
+    assert.ok(KNOWN_SETTINGS_KEYS.includes('localQueueHoldMs'));
   } finally {
     rmSync(xdg, { recursive: true, force: true });
   }
