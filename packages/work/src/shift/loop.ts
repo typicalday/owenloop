@@ -262,6 +262,24 @@ interface SweepResult {
   openRuns: Set<string>;
   /** False when inbox or any per-workflow `whats_next` call failed. */
   complete: boolean;
+  /**
+   * True when this sweep handed a claim back because the shift was FULL — the
+   * `dispatch-cap-full` and `agent-cap-full` releases, and nothing else.
+   *
+   * It exists because a capacity release is the one refusal that leaves REAL,
+   * READY work unclaimed with no event to bring it back. The hub does not
+   * re-offer on a local child's exit (that is not a hub event), and with
+   * `localQueueHoldMs() === 0` the order is not retained in
+   * `pendingCandidates` either, so the next sweep only happens if the cursor
+   * happens to change. On a single-server-capability topology nothing else is
+   * moving, the cursor does not change, and the order starves indefinitely.
+   *
+   * `agent-lane-closed` is deliberately NOT counted. A shift with an agent
+   * ceiling of 0 will never dispatch that order no matter how much capacity
+   * frees, so re-arming the sweep for it would poll the hub every tick forever
+   * and never make progress.
+   */
+  releasedForCapacity: boolean;
 }
 
 export interface ShiftLoop {
@@ -924,6 +942,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     const polled = new Set<string>();
     const openRuns = new Set<string>();
     let complete = true;
+    let releasedForCapacity = false;
     let remaining = budget;
     const liveRuns = new Set([...live.map((r) => r.run), ...reserved.map((r) => r.run)]);
 
@@ -968,7 +987,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
 	// that omission is what distinguishes the untargeted inbox call from a
 	// per-workflow one, since `HubErrorEvent.workflow` is optional.
 	emit({ type: 'hub-error', op: 'whats_next', message: errMsg(e) });
-	return { dispatched, polled, openRuns, complete: false };
+	return { dispatched, polled, openRuns, complete: false, releasedForCapacity };
       }
     }
 
@@ -1009,6 +1028,10 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
     ): void => {
       dropOrder(workflow, order, reason, message);
       releaseClaim(workflow, order.run);
+      // Re-arm the next sweep, but only for the two TRANSIENT reasons — see
+      // `SweepResult.releasedForCapacity` for why `agent-lane-closed` is not
+      // one of them.
+      if (reason === 'dispatch-cap-full' || reason === 'agent-cap-full') releasedForCapacity = true;
     };
     for (const wf of instances) {
       let res;
@@ -1268,7 +1291,7 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       }
     }
 
-    return { dispatched, polled, openRuns, complete };
+    return { dispatched, polled, openRuns, complete, releasedForCapacity };
   }
 
   /**
@@ -1427,7 +1450,11 @@ export function createShiftLoop(opts: ShiftLoopOptions): ShiftLoop {
       // Clear before awaiting: a new brake armed during sweep must survive.
       if (brakeDue) brakeSweepDueAt = undefined;
       swept = await sweep(k, live, reserved);
-      sweepOwed = !swept.complete;
+      // A COMPLETE sweep that handed work back for capacity is still unfinished
+      // business. Without this the assignment below would clear the very signal
+      // the release just raised, and the released order would wait for a cursor
+      // change that a single-capability topology never produces.
+      sweepOwed = !swept.complete || swept.releasedForCapacity;
     } else if (changed && k <= 0) {
       sweepOwed = true;
       opts.out(`at capacity (${occupied}/${cap} in flight) — deferring whats_next until capacity is free`);
