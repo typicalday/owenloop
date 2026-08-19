@@ -207,6 +207,12 @@ export interface Order {
    * (`wise` → `wise:deep`), or the authored names verbatim when the run
    * carries no modifier. Absent when the step authored none.
    *
+   * A caller may also supply a capability MAPPING, which substitutes its own
+   * capability name for the authored one before the modifier is attached. Such
+   * an order carries no in-band marker — unlike a reroute, nothing here says a
+   * mapping fired. The authored name stays recoverable through `defDigest`,
+   * which pins the def that wrote it.
+   *
    * This is the value a claiming crew's bindings are matched against and the
    * value the shift's settings map is keyed by. It is a snapshot of the offer:
    * an already-claimed order is never recomposed, so re-reading it later

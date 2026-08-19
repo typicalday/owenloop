@@ -1654,9 +1654,11 @@ export class Engine {
    * Per-step cadence + daily budget + parallel cap over the eligible firings.
    *
    * A2: `capabilities` is the tick caller's claim filter, matched against the
-   * step's OFFERED capabilities — the authored list composed with the modifier
-   * this firing will actually be offered under (`wise` + `deep` → `wise:deep`),
-   * which is the same list the order will carry. `claimMatches` owns the rule;
+   * step's OFFERED capabilities — the authored list mapped onto the caller's
+   * own capability names, composed with the modifier this firing will actually
+   * be offered under (`wise` + `deep` → `wise:deep`), then rewritten by any
+   * reroute the caller decided on, which is the same list the order will carry.
+   * `claimMatches` owns the rule;
    * see it for the four cases (no filter presented, capability-silent step,
    * empty caller list, both non-empty) and for what `matchModes` changes.
    * A firing this caller may not claim is deferred as `'capability-mismatch'`.
