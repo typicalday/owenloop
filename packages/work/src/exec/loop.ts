@@ -19,13 +19,12 @@
  *     misroute, and no child process is started.
  *  3. RUN + RACE — the runner shells the command out while the lease loop runs.
  *     Whichever settles first wins (plan decision 9):
- *       - an ordinary command settles (any exit code, or a machinery error) ⇒
- *         build a receipt. A payload reject is delivered FIRST (the hub refuses
- *         a reject once the claim has closed, and the last owed submit is what
- *         closes it); then `submit` the receipt to every owed path, unless that
- *         reject closed the run, in which case the owed paths stay debts. Exit 0
- *         means the receipt/reject delivery won; the receipt's exit code still
- *         carries the command result.
+ *       - an ordinary command settles ⇒ build a receipt. A payload reject is
+ *         delivered FIRST (the hub refuses a reject once the claim has closed,
+ *         and the last owed submit is what closes it). A successful command
+ *         submits that receipt to every owed path; a failed command raises an
+ *         operator question with the receipt as diagnostic context and submits
+ *         nothing.
  *       - a judge command exits 0 ⇒ submit its receipt; a non-zero exit ⇒ send
  *         `reject` for `order.judge` without a receipt; signal or machinery
  *         failure ⇒ no verdict, leave the claim for the reap path.
@@ -53,7 +52,7 @@ import type { ContactHolder, GetOrderResponse, OrderPacket } from '../hub/types.
 import type { CommandRunner, CommandResult, RunningCommand } from './runner.ts';
 import type { InstructionResolver } from './instructions.ts';
 import { parsePayloadLine } from './payload.ts';
-import { buildReceipt } from './receipt.ts';
+import { buildReceipt, type CommandReceipt } from './receipt.ts';
 import { buildSubmitProof, type SubmissionKeyManager } from '../submit-proof.ts';
 import type { SshProcessAdapter } from '../../../../src/crypto/ssh.ts';
 
@@ -91,6 +90,8 @@ export type ExecOutcome =
   | 'hub-unreachable' // transient failures spanned the window (exit 1)
   | 'submit-rejected' // a submit returned a non-green/submitted outcome (exit 1)
   | 'submit-failed' // a submit threw (exit 1)
+  | 'command-failed' // non-zero exit; a question was raised on the owed path (exit 1)
+  | 'ask-failed' // the command failed and the question could not be delivered (exit 1)
   | 'rejected' // a payload reject landed and closed the run; owed paths stay debts (exit 0)
   | 'judge-rejected' // a judge delivered a non-zero verdict through reject (exit 0)
   | 'judge-no-verdict' // a judge ended with machinery/signal failure (exit 1)
@@ -144,6 +145,30 @@ export interface ExecLoop {
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+interface CommandOutcomeFields {
+  exitCode: number | null;
+  signal?: string;
+  error?: string;
+}
+
+/**
+ * The one predicate that decides both how child output is logged and whether
+ * its receipt may be submitted.
+ *
+ * runner.ts reports a signalled child with `exitCode: null`, so a separate
+ * signal check is unnecessary.
+ */
+function commandSucceeded(result: CommandOutcomeFields): boolean {
+  return result.exitCode === 0 && result.error === undefined;
+}
+
+/** How a command failed, as an English predicate. */
+function describeCommandFailure(result: CommandOutcomeFields): string {
+  if (result.error !== undefined) return `could not be run (${result.error})`;
+  if (result.signal !== undefined) return `was killed by ${result.signal}`;
+  return `exited ${result.exitCode}`;
 }
 
 /**
@@ -495,9 +520,9 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
    * 44 KiB per run. That cap is why no volume knob exists: a knob would let a
    * machine silently reintroduce this exact bug. Each line is prefixed so the
    * child's words are never mistaken for exec's own.
-   */
+  */
   function relayChildOutput(result: CommandResult, step: string): void {
-    const succeeded = result.exitCode === 0 && result.error === undefined;
+    const succeeded = commandSucceeded(result);
     // TWO CHANNELS ON PURPOSE, and this is not tidiness to be refactored away.
     // `opts.err` is the channel a reader treats as trouble; routing a green
     // step's routine output there would make every successful step look like a
@@ -507,13 +532,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     if (succeeded) {
       write(`owenloop work exec: the command for step '${step}' succeeded; its output follows`);
     } else {
-      const how =
-        result.error !== undefined
-          ? `could not be run (${result.error})`
-          : result.signal !== undefined
-            ? `was killed by ${result.signal}`
-            : `exited ${result.exitCode}`;
-      write(`owenloop work exec: the command for step '${step}' ${how}; its last output follows`);
+      write(`owenloop work exec: the command for step '${step}' ${describeCommandFailure(result)}; its last output follows`);
     }
     const tail = result.outputTail.replace(/\n+$/, '');
     if (tail === '') {
@@ -523,8 +542,76 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
     for (const line of tail.split('\n')) write(`  | ${line}`);
   }
 
-  /** Build the receipt and submit it to every owed path. */
-  async function submitReceipt(result: CommandResult, order: OrderPacket, resolvedCommand: string): Promise<ExecOutcome> {
+  /** The operator-facing failure text shown by `owenloop inbox`. */
+  function failureQuestion(receipt: CommandReceipt, path: string, resolvedCommand: string): string {
+    const head =
+      `the command for step '${receipt.step}' ${describeCommandFailure(receipt)}, ` +
+      `so '${path}' was not produced and no receipt was submitted.\n` +
+      `command: ${resolvedCommand}\n` +
+      `exit code: ${receipt.exitCode ?? 'none'}` +
+      (receipt.signal !== undefined ? `, signal: ${receipt.signal}` : '') +
+      (receipt.error !== undefined ? `, error: ${receipt.error}` : '') +
+      `\noutput: ${receipt.stdoutBytes} stdout byte(s), ${receipt.stderrBytes} stderr byte(s), ` +
+      `hash ${receipt.outputHash}`;
+    return withCommandOutput(head, receipt.outputTail);
+  }
+
+  /**
+   * A failed command does not green anything. Raise a question on its own owed
+   * path and retain the receipt as diagnostic context instead.
+   */
+  async function escalateCommandFailure(
+    receipt: CommandReceipt,
+    order: OrderPacket,
+    resolvedCommand: string,
+  ): Promise<ExecOutcome> {
+    // run() returns misroute when order.owes is empty, so this index is safe.
+    const path = order.owes[0]!.path;
+    const how = describeCommandFailure(receipt);
+
+    opts.err(
+      `owenloop work exec: the command for step '${order.step}' ${how} — ` +
+	`no receipt will be submitted; escalating on ${path}`,
+    );
+    // ask closes the run, so one firing can raise only one question. The
+    // remaining owed paths stay debts for the next firing.
+    if (order.owes.length > 1) {
+      const rest = order.owes.slice(1).map((owe) => owe.path).join(', ');
+      opts.err(
+	`owenloop work exec: ${order.owes.length - 1} other owed path(s) were not escalated ` +
+	  `because ask closes the run: ${rest}`,
+      );
+    }
+
+    let res;
+    try {
+      res = await hub.ask({
+	workflow,
+	run: runId,
+	path,
+	question: failureQuestion(receipt, path, resolvedCommand),
+	context: JSON.stringify(receipt),
+      });
+    } catch (e) {
+      opts.err(`owenloop work exec: ask on ${path} failed: ${errMsg(e)}`);
+      lease.stop('ask-failed');
+      await leasePromise;
+      return 'ask-failed';
+    }
+    if (res.ok !== true) {
+      opts.err(`owenloop work exec: ask on ${path} was refused: ${res.text}`);
+      lease.stop('ask-failed', res.closed === true ? { release: false } : undefined);
+      await leasePromise;
+      return 'ask-failed';
+    }
+    opts.out(`owenloop work exec: asked ${path} — the artifact is held for a human and nothing was greened`);
+    lease.stop('command-failed', res.closed === true ? { release: false } : undefined);
+    await leasePromise;
+    return 'command-failed';
+  }
+
+  /** Build the command receipt, then deliver, reject, or escalate it. */
+  async function deliverCommandResult(result: CommandResult, order: OrderPacket, resolvedCommand: string): Promise<ExecOutcome> {
     if (signalled) {
       // The operator killed the work and the command settled before the lease
       // (the release HTTP round-trip is slower than a TERM'd child dying), so
@@ -623,6 +710,8 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
       );
       if (rejected !== 'continue') return rejected;
     }
+
+    if (!commandSucceeded(result)) return escalateCommandFailure(receipt, order, resolvedCommand);
 
     for (const owe of order.owes) {
       let res;
@@ -838,7 +927,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         const startOptions = { cwd, env: childEnv };
         cmd = runner.start(resolvedCommand, startOptions);
       } catch (e) {
-        return submitReceipt(machineryFailure(e), order, resolvedCommand);
+	return deliverCommandResult(machineryFailure(e), order, resolvedCommand);
       }
       running = cmd;
       opts.out(`owenloop work exec: running ${workflow}/${runId} (step '${order.step}')`);
@@ -858,7 +947,7 @@ export function createExecLoop(opts: ExecLoopOptions): ExecLoop {
         return mapLeaseDuringRun(outcome.o);
       }
 
-      return submitReceipt(outcome.r, order, resolvedCommand);
+      return deliverCommandResult(outcome.r, order, resolvedCommand);
     } finally {
       removeConsumesDir(consumesDir);
       removeConsumesDir(feedbackDir);

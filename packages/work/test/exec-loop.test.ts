@@ -142,6 +142,7 @@ interface MockCfg {
   heartbeat?: (n: number) => void;
   submit?: Array<string | Error>;
   reject?: Array<{ ok?: boolean; closed?: boolean; text?: string } | Error>;
+  ask?: Array<{ ok?: boolean; closed?: boolean; text?: string } | Error>;
   release?: () => Promise<{ text: string }>;
 }
 
@@ -152,6 +153,7 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[]; submits: Submit
   let hbIdx = 0;
   let subIdx = 0;
   let rejectIdx = 0;
+  let askIdx = 0;
 
   const hub: HubClient = {
     async getOrder(req) {
@@ -193,7 +195,11 @@ function mockHub(cfg: MockCfg): { hub: HubClient; calls: Call[]; submits: Submit
     },
     async ask(req) {
       calls.push({ verb: 'ask', arg: req });
-      return { text: 'ask', ok: true };
+      const s = cfg.ask ?? [{ ok: true, closed: true }];
+      const item = s[Math.min(askIdx, s.length - 1)]!;
+      askIdx++;
+      if (item instanceof Error) throw item;
+      return { text: item.text ?? 'ask', ok: item.ok ?? true, ...(item.closed !== undefined ? { closed: item.closed } : {}) };
     },
     // The tool-approval gate is not exercised by these tests; a fake that never
     // opens an approval, and a non-answer is a denial.
@@ -656,10 +662,11 @@ test('the overflow directory is removed after the command exits', async () => {
 test('the overflow directory is removed even when the spawn itself fails', async () => {
   const consumes = consumesOfExactBytes(CONSUMES_INLINE_MAX_BYTES + 1);
   const fr = fakeRunner({ throwOnStart: new Error('spawn ENOENT') });
-  const { hub, submits } = mockHub({ getOrder: [consumingOrder(consumes)], submit: ['green'] });
+  const { hub, calls, submits } = mockHub({ getOrder: [consumingOrder(consumes)] });
   const loop = createExecLoop(baseOpts(hub, fr.runner));
-  assert.equal(await loop.run(), 'submitted');
-  const receipt = submits[0]!.value as CommandReceipt;
+  assert.equal(await loop.run(), 'command-failed');
+  assert.equal(submits.length, 0);
+  const receipt = JSON.parse((only(calls, 'ask')[0]!.arg as Record<string, unknown>)['context'] as string) as CommandReceipt;
   assert.equal(receipt.exitCode, null);
   const file = fr.starts[0]!.env?.['OWENLOOP_CONSUMES_FILE'];
   assert.equal(typeof file, 'string');
@@ -820,24 +827,143 @@ test('uses the order workdir as the command cwd when the packet carries one', as
 
 test('submits a receipt to EVERY owed path, in order', async () => {
   const fr = fakeRunner();
-  const { hub, submits } = mockHub({ getOrder: [commandOrder({ owes: ['a', 'b', 'c'] })], submit: ['green', 'submitted', 'green'] });
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder({ owes: ['a', 'b', 'c'] })], submit: ['green', 'submitted', 'green'] });
   const loop = createExecLoop(baseOpts(hub, fr.runner));
   const p = loop.run();
   await macrotaskSleep();
   fr.resolve(result(0));
   assert.equal(await p, 'submitted');
   assert.deepEqual(submits.map((s) => s.path), ['a', 'b', 'c']);
+  assert.equal(only(calls, 'ask').length, 0);
 });
 
-test('a non-zero exit still submits a receipt carrying the exit code (outcome submitted)', async () => {
+test('a non-zero exit submits nothing and raises a question on the owed path', async () => {
   const fr = fakeRunner();
-  const { hub, submits } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()] });
   const loop = createExecLoop(baseOpts(hub, fr.runner));
   const p = loop.run();
   await macrotaskSleep();
   fr.resolve(result(3));
-  assert.equal(await p, 'submitted');
-  assert.equal((submits[0]!.value as CommandReceipt).exitCode, 3);
+  assert.equal(await p, 'command-failed');
+  assert.equal(submits.length, 0, 'a failed command must never green its artifact');
+  assert.equal(only(calls, 'ask').length, 1);
+  assert.equal(only(calls, 'release').length, 0, 'ask closed the run');
+});
+
+test('a failed command carries its exit code and output tail to the operator', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder({ owes: ['input'] })] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(64, { outputTail: 'terraform: no such provider' }));
+
+  assert.equal(await p, 'command-failed');
+  assert.equal(submits.length, 0);
+  const ask = only(calls, 'ask')[0]!.arg as Record<string, unknown>;
+  assert.equal(ask['path'], 'input');
+  assert.match(ask['question'] as string, /exit code: 64/);
+  assert.match(ask['question'] as string, /terraform: no such provider/);
+  const receipt = JSON.parse(ask['context'] as string) as CommandReceipt;
+  assert.equal(receipt.exitCode, 64);
+  assert.match(receipt.outputTail, /terraform: no such provider/);
+});
+
+test('a killed child escalates with its signal named', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(null, { signal: 'SIGKILL' }));
+
+  assert.equal(await p, 'command-failed');
+  assert.equal(submits.length, 0);
+  const ask = only(calls, 'ask')[0]!.arg as Record<string, unknown>;
+  assert.match(ask['question'] as string, /was killed by SIGKILL/);
+});
+
+test('a failed command with multiple owed paths asks only the first and names the rest', async () => {
+  const errs: string[] = [];
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder({ owes: ['a', 'b'] })] });
+  const loop = createExecLoop(baseOpts(hub, fr.runner, { err: (line) => errs.push(line) }));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(1));
+
+  assert.equal(await p, 'command-failed');
+  assert.equal(submits.length, 0);
+  assert.equal((only(calls, 'ask')[0]!.arg as Record<string, unknown>)['path'], 'a');
+  assert.ok(errs.some((line) => line.includes('b') && line.includes('not escalated')));
+});
+
+test('a refused ask is distinct from a command failure whose question landed', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    ask: [{ ok: false, text: 'ask: run is not held' }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(1));
+
+  assert.equal(await p, 'ask-failed');
+  assert.equal(submits.length, 0);
+  assert.equal(only(calls, 'ask').length, 1);
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+test('a throwing ask is distinct and releases the claim', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    ask: [new Error('hub offline')],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(1));
+
+  assert.equal(await p, 'ask-failed');
+  assert.equal(submits.length, 0);
+  assert.equal(only(calls, 'ask').length, 1);
+  assert.equal(only(calls, 'release').length, 1);
+});
+
+test('a closing payload reject beats the failure gate', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    reject: [{ ok: true, closed: true }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(1, { payloadLine: '{"reject":{"path":"input","text":"upstream is invalid"}}' }));
+
+  assert.equal(await p, 'rejected');
+  assert.equal(submits.length, 0);
+  assert.equal(only(calls, 'reject').length, 1);
+  assert.equal(only(calls, 'ask').length, 0);
+});
+
+test('a non-closing payload reject is followed by failure escalation', async () => {
+  const fr = fakeRunner();
+  const { hub, calls, submits } = mockHub({
+    getOrder: [commandOrder()],
+    reject: [{ ok: true, closed: false }],
+  });
+  const loop = createExecLoop(baseOpts(hub, fr.runner));
+  const p = loop.run();
+  await macrotaskSleep();
+  fr.resolve(result(1, { payloadLine: '{"reject":{"path":"input","text":"upstream is invalid"}}' }));
+
+  assert.equal(await p, 'command-failed');
+  assert.equal(submits.length, 0);
+  assert.equal(only(calls, 'reject').length, 1);
+  assert.equal(only(calls, 'ask').length, 1);
 });
 
 test('a payload reject that leaves the claim open lands FIRST, then every owed receipt', async () => {
@@ -1019,6 +1145,7 @@ test('a judge with a non-zero exit rejects its judge path and submits no receipt
     text: 'assertion failed',
   });
   assert.equal(only(calls, 'release').length, 1);
+  assert.equal(only(calls, 'ask').length, 0);
 });
 
 test('a judge machinery failure issues neither submit nor reject and leaves the claim unreleased', async () => {
@@ -1032,6 +1159,7 @@ test('a judge machinery failure issues neither submit nor reject and leaves the 
   assert.equal(submits.length, 0);
   assert.equal(only(calls, 'reject').length, 0);
   assert.equal(only(calls, 'release').length, 0);
+  assert.equal(only(calls, 'ask').length, 0);
 });
 
 test('a zero-exit judge submits its receipt and ignores a payload reject directive', async () => {
@@ -1047,28 +1175,35 @@ test('a zero-exit judge submits its receipt and ignores a payload reject directi
   assert.equal(await p, 'submitted');
   assert.equal(submits.length, 1);
   assert.equal(only(calls, 'reject').length, 0);
+  assert.equal(only(calls, 'ask').length, 0);
 });
 
-test('a machinery failure (runner done rejects) submits a null-exit receipt', async () => {
+test('a machinery failure from runner completion escalates instead of submitting', async () => {
   const fr = fakeRunner();
-  const { hub, submits } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()] });
   const loop = createExecLoop(baseOpts(hub, fr.runner));
   const p = loop.run();
   await macrotaskSleep();
   fr.reject(new Error('spawn EACCES'));
-  assert.equal(await p, 'submitted');
-  const receipt = submits[0]!.value as CommandReceipt;
+  assert.equal(await p, 'command-failed');
+  assert.equal(submits.length, 0);
+  const ask = only(calls, 'ask')[0]!.arg as Record<string, unknown>;
+  assert.match(ask['question'] as string, /could not be run \(spawn EACCES\)/);
+  assert.match(ask['question'] as string, /exit code: none/);
+  const receipt = JSON.parse(ask['context'] as string) as CommandReceipt;
   assert.equal(receipt.exitCode, null);
   assert.equal(receipt.error, 'spawn EACCES');
 });
 
-test('a runner that throws at start submits a machinery-failure receipt', async () => {
+test('a runner that throws at start escalates its machinery failure', async () => {
   const fr = fakeRunner({ throwOnStart: new Error('cannot fork') });
-  const { hub, submits } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const { hub, calls, submits } = mockHub({ getOrder: [commandOrder()] });
   const loop = createExecLoop(baseOpts(hub, fr.runner));
-  assert.equal(await loop.run(), 'submitted');
-  assert.equal((submits[0]!.value as CommandReceipt).exitCode, null);
-  assert.equal((submits[0]!.value as CommandReceipt).error, 'cannot fork');
+  assert.equal(await loop.run(), 'command-failed');
+  assert.equal(submits.length, 0);
+  const receipt = JSON.parse((only(calls, 'ask')[0]!.arg as Record<string, unknown>)['context'] as string) as CommandReceipt;
+  assert.equal(receipt.exitCode, null);
+  assert.equal(receipt.error, 'cannot fork');
 });
 
 // ---- operator-declared work roots -------------------------------------------
@@ -1321,24 +1456,20 @@ test('no receipt when the killed command settles BEFORE the release resolves the
 //
 // The regression guard for `wf_40bd0c3f6783f9d31291d74d`, where a `merger`
 // command step failed four times and every log said only "holding / running /
-// schema-rejected". `outputTail` reaches a human through the receipt only when
-// the submit is ACCEPTED, and the commonest command-step failure is the one
-// where it is not: the script dies before printing a payload line, so the
-// receipt carries no `payload` and the owed path's schema rejects it. The one
-// record of the cause was thrown away by the same event that created the need
-// for it. The same loss affected a deferring gate: it exits 0 with no payload,
-// so its output must be relayed on stdout and even its silence recorded.
+// schema-rejected". A failed command now relays `outputTail` to stderr and
+// carries it to the operator with `hub.ask`, while a deferring success still
+// relays its output on stdout.
 
 test('a non-zero exit relays the child output to stderr before anything else decides', async () => {
   const errs: string[] = [];
   const fr = fakeRunner();
-  const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['schema-rejected'] });
+  const { hub } = mockHub({ getOrder: [commandOrder()] });
   const loop = createExecLoop(baseOpts(hub, fr.runner, { err: (line) => errs.push(line) }));
   const p = loop.run();
   await macrotaskSleep();
   fr.resolve(result(1, { outputTail: 'merge: typicalday/dev#136 is CLOSED\n' }));
 
-  assert.equal(await p, 'submit-rejected');
+  assert.equal(await p, 'command-failed');
   // The header names the step and how it ended; the body carries the child's words.
   assert.ok(
     errs.some((l) => l.includes("the command for step 'builder' exited 1")),
@@ -1348,23 +1479,23 @@ test('a non-zero exit relays the child output to stderr before anything else dec
     errs.some((l) => l === '  | merge: typicalday/dev#136 is CLOSED'),
     `expected the relayed tail, got ${JSON.stringify(errs)}`,
   );
-  // The relay must land BEFORE the rejection line, or a reader scrolling to the
+  // The relay must land BEFORE the escalation line, or a reader scrolling to the
   // first error still sees the symptom without the cause.
   const relayAt = errs.findIndex((l) => l.startsWith('  | '));
-  const rejectAt = errs.findIndex((l) => l.includes('rejected'));
-  assert.ok(relayAt >= 0 && rejectAt > relayAt, `relay must precede the rejection: ${JSON.stringify(errs)}`);
+  const escalationAt = errs.findIndex((l) => l.includes('escalating on'));
+  assert.ok(relayAt >= 0 && escalationAt > relayAt, `relay must precede escalation: ${JSON.stringify(errs)}`);
 });
 
 test('a machinery failure relays the machinery error, not a bare exit code', async () => {
   const errs: string[] = [];
   const fr = fakeRunner();
-  const { hub } = mockHub({ getOrder: [commandOrder()], submit: ['green'] });
+  const { hub } = mockHub({ getOrder: [commandOrder()] });
   const loop = createExecLoop(baseOpts(hub, fr.runner, { err: (line) => errs.push(line) }));
   const p = loop.run();
   await macrotaskSleep();
   fr.resolve(result(null, { error: 'spawn ENOENT' }));
 
-  assert.equal(await p, 'submitted');
+  assert.equal(await p, 'command-failed');
   assert.ok(
     errs.some((l) => l.includes('could not be run (spawn ENOENT)')),
     `expected the machinery error, got ${JSON.stringify(errs)}`,

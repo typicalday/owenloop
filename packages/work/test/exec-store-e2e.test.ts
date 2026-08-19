@@ -52,6 +52,7 @@ async function startHub(order: GetOrderResponse): Promise<{ origin: string; reqs
       res.setHeader('content-type', 'application/json');
       if (verb === 'get_order') res.end(JSON.stringify(order));
       else if (verb === 'submit') res.end(JSON.stringify({ text: '', outcome: 'green' }));
+      else if (verb === 'ask') res.end(JSON.stringify({ text: '', ok: true, closed: true }));
       else res.end(JSON.stringify({ text: '' }));
     });
   });
@@ -254,10 +255,13 @@ steps:
     process.env['OWENLOOP_BUNDLE_DIR'] = '/ambient/leaked/bundle';
     const loose = await startHub(order('loose-def', 'ignored remote command'));
     try {
-      assert.equal(await makeLoop(loose.origin, looseResolver).run(), 'submitted');
-      const submit = loose.reqs.find((request) => request.verb === 'submit');
-      assert.ok(submit !== undefined);
-      const receipt = submit.body?.['value'] as CommandReceipt;
+      assert.equal(await makeLoop(loose.origin, looseResolver).run(), 'command-failed');
+      assert.equal(loose.reqs.filter((request) => request.verb === 'submit').length, 0);
+      const ask = loose.reqs.find((request) => request.verb === 'ask');
+      assert.ok(ask !== undefined);
+      assert.match(ask.body?.['question'] as string, /exit code: 64/);
+      assert.match(ask.body?.['question'] as string, /this workflow must run from an installed bundle/);
+      const receipt = JSON.parse(ask.body?.['context'] as string) as CommandReceipt;
       assert.equal(receipt.exitCode, 64, receipt.outputTail);
       assert.match(receipt.outputTail, /this workflow must run from an installed bundle/);
     } finally {
