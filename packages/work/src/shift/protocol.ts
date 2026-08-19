@@ -122,7 +122,7 @@ export interface CapacityEvent {
   cap: number;
 }
 
-/** A hub call failed. `workflow` is present only for per-workflow whats_next calls. */
+/** A hub call failed. `workflow` is present for per-workflow whats_next and release calls. */
 export interface HubErrorEvent {
   type: 'hub-error';
   op: 'wake' | 'whats_next' | 'roster_sync' | 'release';
