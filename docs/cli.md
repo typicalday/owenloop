@@ -53,7 +53,7 @@ for the full breakdown.
 | `login [--hub <url>] [--with-token] [--as <slot>]` | authenticate the CLI against a hub — loopback OAuth, or `--with-token` from stdin — see [Hub](#hub-login--connect--push--logout) |
 | `connect [--hub <url>] [--as <slot>]` | verify a resolved hub credential and record an optional per-project override in `.owenloop/hub.json` |
 | `push [<defName>...] [--bundle <bundle.wnlp>] [--force] [--dry-run] [--hub <url>] [--as <slot>]` | publish local workflow defs, or exact bundle-backed defs, to the safely resolved hub (idempotent against the hub's own def hashes) |
-| `start <defName> [--provide name=json …] [--crew <name>] [--title <text>] [--hub <url>]` | start a published workflow on the bound hub with the human credential |
+| `start <defName> [--provide name=json …] [--crew <name>] [--title <text>] [--modifier <name>] [--scope <label>] [--priority <low\|normal\|high>] [--hub <url>]` | start a published workflow on the bound hub with the human credential |
 | `publish <source-dir> [--output <bundle.wnlp>] [--source <json>] [--unsigned] [--hub <url>]` | pack a canonical workflow bundle and publish a signed publication sidecar, with an optional signed origin sidecar, or an explicitly unsigned marker |
 | `logout [--hub <url>] [--as <slot>]` | delete the stored credential for a hub |
 | `agent new <name> [--crews <a,b>] [--scopes <a,b>] [--shift] [--hub <url>]` | mint a new Scoped Identity on the hub and store its token in slot `agent:<name>` — the token is never printed; `--shift` = `--scopes work,run` — see [Hub](#hub-login--connect--push--logout) |
@@ -1432,6 +1432,17 @@ their live hub bindings. `--title <text>` is display-only. Both `--crew` and
 usage errors before credential or network access. The command does not claim,
 dispatch, close, or otherwise drive work—the standing Shift discovers the run
 through its normal crew inbox.
+
+`--scope <label>` is forwarded as the run's `scope`: a free routing label
+recorded on the instance, with no registry and no fixed set of values. Omit it
+and the run carries no scope. `--priority <low|normal|high>` is forwarded as the
+run's `priority`; omit it and the hub applies `normal`. A value outside
+`low|normal|high` is a local usage error before any credential or network
+access, not a forwarded request. Like `--crew`/`--title`, a bare
+`--scope`/`--priority` or a `--scope=`/`--priority=` is a local usage error.
+Both are recorded at start only and are never writable afterwards. Do not
+confuse `--scope` (this routing label) with `--scopes` on `agent new`/`setup`,
+which lists an agent token's authorization scopes.
 
 ### `cancel` — stop a running instance
 
@@ -2847,7 +2858,7 @@ block; a non-2xx response comes back as an error result.
 | `reject_artifact` | send an upstream artifact back to its producer with a reason |
 | `retry_artifact` | re-arm a stalled or rejected artifact to owed — the human stall-clear, and the answer path for a worker's `ask` |
 | `provide_input` | answer a human gate — provide a value for a seeded/owed input |
-| `start_run` | create a new instance from a definition name |
+| `start_run` | create a new instance from a definition name; optional `scope` (free routing label, defaults to the session's repo name) and `priority` (`low\|normal\|high`) |
 | `create_workflow` | parse + load a workflow def YAML (the authoring hard gate) |
 | `get_workflow` | fetch one loaded definition |
 | `list_workflows` | names, titles, step counts, and def hash/version of every loaded def |
@@ -2877,6 +2888,19 @@ built from scratch. It refuses a name that is already taken (the hub's error
 message is surfaced verbatim; error bodies never carry tokens). If the store
 write fails, the result says so and tells you to revoke/re-key the agent from
 the console.
+
+`start_run`'s `scope` has one default the CLI does not have: when the caller
+supplies no `scope`, the server fills in the session's repository name, taken
+from the `origin` remote's URL (its last path segment, trailing `.git`
+removed) — `owenloop` for
+`https://github.com/typicalday/owenloop.git`. It is read from the remote rather
+than the directory name so that every worktree of one repo reports the same
+scope. It is a default, never an override: an explicitly supplied `scope` is
+always forwarded unchanged. When no repository name can be determined — not a
+git checkout, no `origin` remote, an unparseable URL — the server sends no
+`scope` at all rather than guessing a label. Two repositories with the same
+name under different owners therefore share a scope; pass an explicit `scope`
+to tell them apart.
 
 **The four crew tools** (`list_crews`, `create_crew`, `add_crew_member`,
 `remove_crew_member`) cover the same four operations as the [`crew` CLI

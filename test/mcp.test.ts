@@ -44,7 +44,7 @@ import { storeCredential } from '../src/credentials.ts';
 import { DEFAULT_HUB } from '../src/hub.ts';
 import type { Credential } from '../src/hub.ts';
 import { globalConfigPath, writeGlobalConfig } from '../src/global-config.ts';
-import { resolveMcpOrigin } from '../src/mcp/serve.ts';
+import { resolveMcpOrigin, resolveRepoScope } from '../src/mcp/serve.ts';
 import { kcHuman, kcKey, makeIo, OAUTH_METADATA, realHttpServer, routedFetch } from './hubkit.ts';
 import type { HubIo, RouteHandler } from './hubkit.ts';
 
@@ -119,6 +119,11 @@ const LIST = JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
 const call = (id: number, name: string, args: Record<string, unknown> = {}): string =>
   JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } });
 
+const fakeGit = (url: string) => (cmd: string, args: string[]) =>
+  cmd === 'git' && args[args.length - 1] === 'origin'
+    ? { status: 0, stdout: `${url}\n`, stderr: '' }
+    : { status: 1, stdout: '', stderr: 'not a git repository\n' };
+
 /** The parsed JSON of a tool result's single text block. */
 function resultJson(frame: Frame): unknown {
   return JSON.parse(frame.result!.content![0]!.text);
@@ -180,6 +185,89 @@ test('mcp: stage_enrollment gating — env override 1 shows it, 0 hides it, and 
     seedHuman(t);
     const { frames } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, LIST]);
     assert.ok(frames[1]!.result!.tools!.some((x) => x.name === 'stage_enrollment'), 'a 400 (route present) enables the tool');
+  }
+});
+
+test('mcp: start_run defaults scope to the session repo name', async () => {
+  const { fetch, calls } = routedFetch({
+    'POST /api/start_run': () => ({ status: 200, json: { ok: true } }),
+  });
+  const t = makeIo({
+    fetch,
+    env: { OWENLOOP_MCP_ENROLLMENT: '0' },
+    runCommand: fakeGit('https://github.com/typicalday/owenloop.git'),
+  });
+  seedHuman(t);
+
+  const { code } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'start_run', { workflow_name: 'd' })]);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(JSON.parse(calls[0]!.body!), { workflow_name: 'd', scope: 'owenloop' });
+});
+
+test('mcp: an explicit start_run scope beats the repo-name default', async () => {
+  const { fetch, calls } = routedFetch({
+    'POST /api/start_run': () => ({ status: 200, json: { ok: true } }),
+  });
+  const t = makeIo({
+    fetch,
+    env: { OWENLOOP_MCP_ENROLLMENT: '0' },
+    runCommand: fakeGit('https://github.com/typicalday/owenloop.git'),
+  });
+  seedHuman(t);
+
+  const { code } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'start_run', { workflow_name: 'd', scope: 'other' })]);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.deepEqual(JSON.parse(calls[0]!.body!), { workflow_name: 'd', scope: 'other' });
+});
+
+test('mcp: a missing or failing repo probe sends no start_run scope', async () => {
+  for (const runCommand of [
+    undefined,
+    () => ({ status: 1, stdout: '', stderr: 'not a git repository\n' }),
+  ]) {
+    const { fetch, calls } = routedFetch({
+      'POST /api/start_run': () => ({ status: 200, json: { ok: true } }),
+    });
+    const t = makeIo({ fetch, env: { OWENLOOP_MCP_ENROLLMENT: '0' }, runCommand });
+    seedHuman(t);
+
+    const { code } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'start_run', { workflow_name: 'd' })]);
+
+    assert.equal(code, 0, t.err.join('\n'));
+    const body = JSON.parse(calls[0]!.body!) as Record<string, unknown>;
+    assert.ok(!('scope' in body));
+  }
+});
+
+test('mcp: start_run priority rides through unchanged', async () => {
+  const { fetch, calls } = routedFetch({
+    'POST /api/start_run': () => ({ status: 200, json: { ok: true } }),
+  });
+  const t = makeIo({ fetch, env: { OWENLOOP_MCP_ENROLLMENT: '0' } });
+  seedHuman(t);
+
+  const { code } = await driveMcp(t, ['mcp', '--hub', ORIGIN], [INIT, call(3, 'start_run', { workflow_name: 'd', priority: 'high' })]);
+
+  assert.equal(code, 0, t.err.join('\n'));
+  assert.equal((JSON.parse(calls[0]!.body!) as Record<string, unknown>).priority, 'high');
+});
+
+test('mcp: resolveRepoScope parses only valid origin repo names', () => {
+  const cases = [
+    { url: 'https://github.com/typicalday/owenloop.git', expected: 'owenloop' },
+    { url: 'git@github.com:typicalday/owenloop.git', expected: 'owenloop' },
+    { url: 'ssh://git@github.com/o/r.git', expected: 'r' },
+    { url: 'https://github.com/o/r', expected: 'r' },
+    { url: 'https://github.com/o/r/', expected: 'r' },
+    { url: '', expected: undefined },
+    { url: 'https://github.com/o/r with space', expected: undefined },
+  ] as const;
+
+  for (const fixture of cases) {
+    const t = makeIo({ runCommand: fakeGit(fixture.url) });
+    assert.equal(resolveRepoScope(t.io), fixture.expected, fixture.url);
   }
 });
 
